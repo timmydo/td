@@ -1282,18 +1282,21 @@ columns; the tile sizes are written in four bytes, and the sequence
 header claims the least level whose picture size, tile count and tile
 columns admit the frame. `av1::av1c` and the colour constants are the
 configuration the container repeats, from the same values the sequence
-header writes. The transforms are the spec's integer butterflies from
-generated stage tables, so the reconstruction the encoder keeps is what
-any conforming decoder shows; `tests/av1.rs` holds that to dav1d when
+header writes. The transforms are the spec's integer butterflies, each
+a table of stages that `butterfly!` expands to straight code over fixed
+arrays, so the reconstruction the encoder keeps is what any conforming
+decoder shows; `tests/av1.rs` holds that to dav1d when
 one is named (`TD_TEST_DAV1D`), and holds three small streams to the
 hashes of bytes dav1d decoded, so a change to any emitted symbol is
 verified against the decoder before the hash moves. It is fed rows like
 the JPEG encoder and codes a superblock row when one is complete, so
-the export band rules hold; a frame is at most 16384 on an axis. Angle
-deltas, a better distortion measure, straight-line transforms and
+the export band rules hold; a frame is at most 16384 on an axis. A
+block's prediction edges are read once per plane and every mode is
+predicted from them. Angle deltas, a better distortion measure and
 per-tile scratch buffers in place of the per-trial allocations are the
-performance and fidelity follow-ups; a 24-megapixel export takes tens
-of seconds on one thread and a few on eight.
+performance and fidelity follow-ups; a 24-megapixel export takes over
+ten seconds on one thread and a few on eight (`tests/av1.rs`'s
+`bench`).
 
 The AVIF (`avif::file`) is the least HEIF file the format asks for and
 every reader expects: `ftyp` with the `avif` brand and `mif1`, `miaf`

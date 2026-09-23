@@ -1554,11 +1554,12 @@ impl Tile {
         };
         // Luma: every mode screened by its residual's magnitude, the
         // closest few coded in full.
+        let edges = self.pred_edges(0, at);
         let mut screened: Vec<(u64, u8, Vec<u8>)> = MODES
             .iter()
             .map(|&mode| {
                 let mut pred = vec![0u8; side * side];
-                self.predict(0, at, mode, &mut pred);
+                predict_block(mode, &edges, &mut pred);
                 (self.sad(0, at, &pred), mode, pred)
             })
             .collect();
@@ -1581,13 +1582,14 @@ impl Tile {
         leaf.eob[0] = luma.eob;
         // Chroma: both planes share a mode.
         let n = side / 2;
+        let (edges_u, edges_v) = (self.pred_edges(1, at), self.pred_edges(2, at));
         let mut screened: Vec<(u64, u8, Vec<u8>)> = MODES
             .iter()
             .map(|&mode| {
                 let mut pred = vec![0u8; n * n * 2];
                 let (u, v) = pred.split_at_mut(n * n);
-                self.predict(1, at, mode, u);
-                self.predict(2, at, mode, v);
+                predict_block(mode, &edges_u, u);
+                predict_block(mode, &edges_v, v);
                 let total = self.sad(1, at, u) + self.sad(2, at, v);
                 (total, mode, pred)
             })
@@ -1729,8 +1731,9 @@ impl Tile {
             let q = if pos == 0 { dc } else { ac };
             let round = if pos == 0 { q / 2 } else { q * 3 / 8 };
             let magnitude = (i64::from(coeff.unsigned_abs()) << shift) + round;
-            let level = (magnitude / q).min(0xFFFF) as i32;
-            if level != 0 {
+            // Most fall under a step: no division for a zero level.
+            if magnitude >= q {
+                let level = (magnitude / q).min(0xFFFF) as i32;
                 eob = c + 1;
                 if let Some(slot) = levels.get_mut(pos) {
                     *slot = if coeff < 0 { -level } else { level };
@@ -1778,20 +1781,28 @@ impl Tile {
 
     // ------------------------------------------------------ prediction
 
-    /// The spec's intra prediction (7.11.2) of a plane of the block into
-    /// `out`, from the reconstruction so far.
-    fn predict(&self, plane: usize, at: At, mode: u8, out: &mut [u8]) {
+    /// The edges the spec's intra prediction (7.11.2) of a plane of the
+    /// block reads from the reconstruction so far, which every mode
+    /// shares.
+    fn pred_edges(&self, plane: usize, at: At) -> Edges {
         let sub = usize::from(plane > 0);
         let n = at.side() >> sub;
         let units = n / MI;
         let (mi_row, mi_col) = (at.mi_row, at.mi_col);
         let x = (mi_col * MI) >> sub;
         let y = ((mi_row - self.band_mi_row) * MI) >> sub;
-        let Some(band) = self.recon.get(plane) else {
-            return;
-        };
         let have_left = self.avail_left(mi_col);
         let have_above = self.avail_up(mi_row);
+        let mut edges = Edges {
+            n,
+            have_above,
+            have_left,
+            above: [128; 65],
+            left: [128; 65],
+        };
+        let Some(band) = self.recon.get(plane) else {
+            return edges;
+        };
         let sb_x4 = ((mi_col % SB_MI) >> sub) as isize;
         let sb_y4 = ((mi_row % SB_MI) >> sub) as isize;
         let have_above_right = self
@@ -1807,8 +1818,7 @@ impl Tile {
         let max_y = ((self.mi_rows * MI) >> sub) - 1 - ((self.band_mi_row * MI) >> sub);
         // Band rows are the plane's rows plus one: row 0 is the row above.
         let px = |xx: usize, band_row: usize| band.at(xx, band_row);
-        let mut above = [128u8; 65];
-        let mut left = [128u8; 65];
+        let Edges { above, left, .. } = &mut edges;
         let base = 1 << (8 - 1);
         if !have_above && have_left {
             above.fill(px(x - 1, y + 1));
@@ -1841,9 +1851,7 @@ impl Tile {
         };
         above[0] = corner;
         left[0] = corner;
-        // `above[1 + i]` is the spec's `AboveRow[i]`, `above[0]` its
-        // `AboveRow[-1]`; the same for the left column.
-        predict_block(mode, n, have_above, have_left, &above, &left, out);
+        edges
     }
 
     // --------------------------------------------------------- symbols
@@ -2010,6 +2018,7 @@ impl Tile {
         }
         // Levels in reverse scan order.
         let scan = size.scan();
+        let (row_shift, col_mask) = (n.ilog2(), n - 1);
         let level_at = |row: usize, col: usize| -> i32 {
             if row >= n || col >= n {
                 return 0;
@@ -2018,7 +2027,7 @@ impl Tile {
         };
         for c in (0..eob).rev() {
             let pos = usize::from(scan.get(c).copied().unwrap_or(0));
-            let (row, col) = (pos / n, pos % n);
+            let (row, col) = (pos >> row_shift, pos & col_mask);
             let level = level_at(row, col);
             if c == eob - 1 {
                 let ctx = if c == 0 {
@@ -2288,24 +2297,38 @@ fn eob_group_start(t: usize) -> usize {
 
 // --------------------------------------------------- prediction kernels
 
-/// The spec's prediction of an `n` square from the edges: `above[1..]`
-/// is `AboveRow`, `left[1..]` `LeftCol`, and both hold the corner at 0.
-fn predict_block(
-    mode: u8,
+/// A plane's prediction edges for an `n` square: `above[1 + i]` is the
+/// spec's `AboveRow[i]`, `above[0]` its `AboveRow[-1]`, the corner; the
+/// same for the left column.
+struct Edges {
     n: usize,
     have_above: bool,
     have_left: bool,
-    above: &[u8; 65],
-    left: &[u8; 65],
-    out: &mut [u8],
-) {
+    above: [u8; 65],
+    left: [u8; 65],
+}
+
+/// Fills an `n` square row by row with `value(i, j)`, clamped to a
+/// pixel.
+fn fill(out: &mut [u8], n: usize, value: impl Fn(usize, usize) -> i32) {
+    for (i, row) in out.chunks_exact_mut(n).enumerate() {
+        for (j, slot) in row.iter_mut().enumerate() {
+            *slot = value(i, j).clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// The spec's prediction of an `n` square from the edges.
+fn predict_block(mode: u8, edges: &Edges, out: &mut [u8]) {
+    let Edges {
+        n,
+        have_above,
+        have_left,
+        ref above,
+        ref left,
+    } = *edges;
     let a = |i: isize| i32::from(above.get((i + 1) as usize).copied().unwrap_or(128));
     let l = |i: isize| i32::from(left.get((i + 1) as usize).copied().unwrap_or(128));
-    let set = |out: &mut [u8], i: usize, j: usize, v: i32| {
-        if let Some(slot) = out.get_mut(i * n + j) {
-            *slot = v.clamp(0, 255) as u8;
-        }
-    };
     match mode {
         DC_PRED => {
             let v = if have_above && have_left {
@@ -2327,118 +2350,99 @@ fn predict_block(
             let weight = |i: usize| i32::from(w.get(i).copied().unwrap_or(0));
             let below = l(n as isize - 1);
             let right = a(n as isize - 1);
-            for i in 0..n {
-                for j in 0..n {
-                    let v = match mode {
-                        SMOOTH_PRED => {
-                            let s = weight(i) * a(j as isize)
-                                + (256 - weight(i)) * below
-                                + weight(j) * l(i as isize)
-                                + (256 - weight(j)) * right;
-                            (s + 256) >> 9
-                        }
-                        SMOOTH_V_PRED => {
-                            let s = weight(i) * a(j as isize) + (256 - weight(i)) * below;
-                            (s + 128) >> 8
-                        }
-                        _ => {
-                            let s = weight(j) * l(i as isize) + (256 - weight(j)) * right;
-                            (s + 128) >> 8
-                        }
-                    };
-                    set(out, i, j, v);
-                }
+            match mode {
+                SMOOTH_PRED => fill(out, n, |i, j| {
+                    let s = weight(i) * a(j as isize)
+                        + (256 - weight(i)) * below
+                        + weight(j) * l(i as isize)
+                        + (256 - weight(j)) * right;
+                    (s + 256) >> 9
+                }),
+                SMOOTH_V_PRED => fill(out, n, |i, j| {
+                    let s = weight(i) * a(j as isize) + (256 - weight(i)) * below;
+                    (s + 128) >> 8
+                }),
+                _ => fill(out, n, |i, j| {
+                    let s = weight(j) * l(i as isize) + (256 - weight(j)) * right;
+                    (s + 128) >> 8
+                }),
             }
         }
         PAETH_PRED => {
             let corner = a(-1);
-            for i in 0..n {
-                for j in 0..n {
-                    let (top, side) = (a(j as isize), l(i as isize));
-                    let base = top + side - corner;
-                    let (p_left, p_top, p_corner) = (
-                        (base - side).abs(),
-                        (base - top).abs(),
-                        (base - corner).abs(),
-                    );
-                    let v = if p_left <= p_top && p_left <= p_corner {
-                        side
-                    } else if p_top <= p_corner {
-                        top
-                    } else {
-                        corner
-                    };
-                    set(out, i, j, v);
+            fill(out, n, |i, j| {
+                let (top, side) = (a(j as isize), l(i as isize));
+                let base = top + side - corner;
+                let (p_left, p_top, p_corner) = (
+                    (base - side).abs(),
+                    (base - top).abs(),
+                    (base - corner).abs(),
+                );
+                if p_left <= p_top && p_left <= p_corner {
+                    side
+                } else if p_top <= p_corner {
+                    top
+                } else {
+                    corner
                 }
-            }
+            });
         }
         _ => {
             let angle = mode_angle(mode);
             let round5 = |v: i32| (v + 16) >> 5;
             if angle == 90 {
-                for i in 0..n {
-                    for j in 0..n {
-                        set(out, i, j, a(j as isize));
+                if let Some(top) = above.get(1..=n) {
+                    for row in out.chunks_exact_mut(n) {
+                        row.copy_from_slice(top);
                     }
                 }
             } else if angle == 180 {
-                for i in 0..n {
-                    for j in 0..n {
-                        set(out, i, j, l(i as isize));
-                    }
+                for (row, &side) in out.chunks_exact_mut(n).zip(left.iter().skip(1)) {
+                    row.fill(side);
                 }
             } else if angle < 90 {
                 let dx = derivative(angle);
                 let max_base = 2 * n as isize - 1;
-                for i in 0..n {
+                fill(out, n, |i, j| {
                     let idx = (i as i32 + 1) * dx;
                     let shift = (idx >> 1) & 0x1F;
-                    for j in 0..n {
-                        let base = (idx >> 6) as isize + j as isize;
-                        let v = if base < max_base {
-                            round5(a(base) * (32 - shift) + a(base + 1) * shift)
-                        } else {
-                            a(max_base)
-                        };
-                        set(out, i, j, v);
+                    let base = (idx >> 6) as isize + j as isize;
+                    if base < max_base {
+                        round5(a(base) * (32 - shift) + a(base + 1) * shift)
+                    } else {
+                        a(max_base)
                     }
-                }
+                });
             } else if angle < 180 {
                 let dx = derivative(180 - angle);
                 let dy = derivative(angle - 90);
-                for i in 0..n {
-                    for j in 0..n {
-                        let idx = ((j as i32) << 6) - (i as i32 + 1) * dx;
-                        let base = idx >> 6;
-                        let v = if base >= -1 {
-                            let shift = (idx >> 1) & 0x1F;
-                            let b = base as isize;
-                            round5(a(b) * (32 - shift) + a(b + 1) * shift)
-                        } else {
-                            let idx = ((i as i32) << 6) - (j as i32 + 1) * dy;
-                            let base = (idx >> 6) as isize;
-                            let shift = (idx >> 1) & 0x1F;
-                            round5(l(base) * (32 - shift) + l(base + 1) * shift)
-                        };
-                        set(out, i, j, v);
+                fill(out, n, |i, j| {
+                    let idx = ((j as i32) << 6) - (i as i32 + 1) * dx;
+                    let base = idx >> 6;
+                    if base >= -1 {
+                        let shift = (idx >> 1) & 0x1F;
+                        let b = base as isize;
+                        round5(a(b) * (32 - shift) + a(b + 1) * shift)
+                    } else {
+                        let idx = ((i as i32) << 6) - (j as i32 + 1) * dy;
+                        let base = (idx >> 6) as isize;
+                        let shift = (idx >> 1) & 0x1F;
+                        round5(l(base) * (32 - shift) + l(base + 1) * shift)
                     }
-                }
+                });
             } else {
                 let dy = derivative(270 - angle);
                 let max_base = 2 * n as isize - 1;
-                for j in 0..n {
+                fill(out, n, |i, j| {
                     let idx = (j as i32 + 1) * dy;
                     let shift = (idx >> 1) & 0x1F;
-                    for i in 0..n {
-                        let base = (idx >> 6) as isize + i as isize;
-                        let v = if base < max_base {
-                            round5(l(base) * (32 - shift) + l(base + 1) * shift)
-                        } else {
-                            l(max_base)
-                        };
-                        set(out, i, j, v);
+                    let base = (idx >> 6) as isize + i as isize;
+                    if base < max_base {
+                        round5(l(base) * (32 - shift) + l(base + 1) * shift)
+                    } else {
+                        l(max_base)
                     }
-                }
+                });
             }
         }
     }
@@ -2991,34 +2995,41 @@ mod tests {
         }
         above[0] = 77;
         left[0] = 77;
+        let edges = |have_above, have_left| Edges {
+            n: 4,
+            have_above,
+            have_left,
+            above,
+            left,
+        };
         let mut out = [0u8; 16];
-        predict_block(V_PRED, 4, true, true, &above, &left, &mut out);
+        predict_block(V_PRED, &edges(true, true), &mut out);
         assert_eq!(&out[..4], &above[1..5]);
         assert_eq!(&out[12..], &above[1..5]);
-        predict_block(H_PRED, 4, true, true, &above, &left, &mut out);
+        predict_block(H_PRED, &edges(true, true), &mut out);
         assert_eq!(out[0], left[1]);
         assert_eq!(out[15], left[4]);
-        predict_block(DC_PRED, 4, true, true, &above, &left, &mut out);
+        predict_block(DC_PRED, &edges(true, true), &mut out);
         let sum: u32 = above[1..5]
             .iter()
             .chain(&left[1..5])
             .map(|&v| u32::from(v))
             .sum();
         assert!(out.iter().all(|&v| u32::from(v) == (sum + 4) / 8));
-        predict_block(DC_PRED, 4, false, false, &above, &left, &mut out);
+        predict_block(DC_PRED, &edges(false, false), &mut out);
         assert!(out.iter().all(|&v| v == 128));
-        predict_block(DC_PRED, 4, false, true, &above, &left, &mut out);
+        predict_block(DC_PRED, &edges(false, true), &mut out);
         let sum: u32 = left[1..5].iter().map(|&v| u32::from(v)).sum();
         assert!(out.iter().all(|&v| u32::from(v) == (sum + 2) / 4));
         // D45 walks up and right: row i, column j is AboveRow[i + j + 1].
-        predict_block(D45_PRED, 4, true, true, &above, &left, &mut out);
+        predict_block(D45_PRED, &edges(true, true), &mut out);
         for i in 0..4 {
             for j in 0..4 {
                 assert_eq!(out[i * 4 + j], above[i + j + 2], "{i} {j}");
             }
         }
         // D135 walks down and right from the corner.
-        predict_block(D135_PRED, 4, true, true, &above, &left, &mut out);
+        predict_block(D135_PRED, &edges(true, true), &mut out);
         for i in 0..4 {
             for j in 0..4 {
                 let want = if j >= i { above[j - i] } else { left[i - j] };
@@ -3026,7 +3037,7 @@ mod tests {
             }
         }
         // Paeth picks the neighbour closest to the gradient guess.
-        predict_block(PAETH_PRED, 4, true, true, &above, &left, &mut out);
+        predict_block(PAETH_PRED, &edges(true, true), &mut out);
         let (top, side, corner) = (i32::from(above[1]), i32::from(left[1]), 77);
         let base = top + side - corner;
         let want = if (base - side).abs() <= (base - top).abs()
@@ -3040,7 +3051,7 @@ mod tests {
         };
         assert_eq!(i32::from(out[0]), want);
         // Smooth blends towards the far edges.
-        predict_block(SMOOTH_PRED, 4, true, true, &above, &left, &mut out);
+        predict_block(SMOOTH_PRED, &edges(true, true), &mut out);
         // The weight at the first of four is 255; the rest of 256 goes
         // to the far edge.
         let want = (255 * i32::from(above[1])
