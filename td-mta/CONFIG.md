@@ -6,7 +6,7 @@ This document owns the configuration syntax. `config::syntax` implements
 bounded framing and statement decoding only. The resource stanza schema below
 additionally builds checked resource plans. The other typed fields, snapshot
 builder, reference validation, protected file access, effective output, and
-CLI remain M04b2b/M04b2c/M04b3/M05/M19 work as assigned in IMPLEMENTATION.md.
+CLI remain M04b2c/M04b3/M05/M19 work as assigned in IMPLEMENTATION.md.
 A syntactically accepted statement is not a valid service configuration.
 DESIGN.md §6 owns the administration contract; RESOURCES.md owns the aggregate
 memory budget.
@@ -252,3 +252,146 @@ Resource codes are `config_duplicate_section`, `config_duplicate_field`,
 `config_out_of_range`, `config_resource_plan`, `config_admission_plan`, and
 `config_timeout_plan`. These supplement the syntax codes above; CLI output
 remains unimplemented.
+
+## Local recipient routing
+
+M04b2b implements a typed routing candidate and immutable lookup view in
+`config::routing`. It does not implement the whole stanza dispatcher, SMTP
+commands, live reload, authentication or mailbox creation. M04b2c must bind
+these target routing stanzas to that candidate:
+
+```text
+[account "0123456789abcdef0123456789abcdef"]
+[domain "example.test"]
+[alias "me@example.test"]
+account = "0123456789abcdef0123456789abcdef"
+```
+
+Account labels and alias targets are canonical AccountId strings, independent
+of mail paths. The sole account stanza declares its stable ID. Domain labels
+are served DNS names; alias labels are full addresses, and each alias requires
+exactly one `account` assignment. No folder/forwarding/catch-all fields exist.
+The outer schema rejects absent labels, duplicate or unknown fields and any
+second account stanza. Other account/identity fields belong to M04b2c; these
+examples are a routing fragment, not a complete runnable configuration.
+The helper accepts typed AccountId values and does not parse those labels.
+
+Exactly one account and at least one served domain are required before a
+routing view exists. Account declaration may follow aliases. Every alias must
+reference the sole account and a declared domain. Conflicting or redundant
+canonical domain/alias declarations are errors, including duplicate aliases
+targeting the same account. Ordinary local-part case remains significant;
+domain case does not. No routing decision uses a display name or filesystem
+path. Alias acceptance does not authorize outbound sending.
+
+### Address spelling and canonical keys
+
+Configured aliases use ASCII SMTP mailbox spelling with a DNS domain, without
+angle brackets, source routes, comments or header display-name syntax. Quoted
+local parts are decoded before comparison; equivalent spellings within the
+length bounds share a key. Local parts retain case except reserved postmaster.
+This follows the comparison rules in
+[RFC 5321 §4.1.2](https://datatracker.ietf.org/doc/html/rfc5321#section-4.1.2);
+this helper is not a complete SMTP command/path parser.
+
+The td-mta limits are 254 bytes for the full supplied address and 64 bytes for
+its serialized local part, including any quotes/escapes. The decoded local
+part must be nonempty. Unquoted local parts are nonempty dot-separated atoms;
+quoted local parts allow printable ASCII and quoted pairs for printable ASCII.
+Controls, non-ASCII local parts, empty atoms and malformed quoting are refused.
+No trimming or Unicode normalization is performed.
+
+Served domains are nonempty ASCII labels of 1..63 bytes, containing letters,
+digits and interior hyphens, separated by dots. Reject empty labels, trailing
+dots, leading/trailing hyphens, underscores, address literals and all-digit
+final labels. ASCII-fold
+to lowercase. The served-domain ceiling is 243 bytes so its mandatory
+`postmaster@DOMAIN` address fits the existing 254-byte envelope bound. These
+are local configuration constraints, not DNS resolution or ownership proof.
+
+The temporary lookup key is decoded local bytes, one NUL separator and the
+folded domain. Persistent cells store the local bytes and a domain index. Input local parts cannot contain NUL, so the separator is
+unambiguous even when a quoted local part contains `@`. This byte key is
+private metadata, not an SMTP address or a string to display verbatim.
+Reserved postmaster local parts are folded before duplicate detection too.
+Keep the original accepted SMTP envelope separately when receipt is implemented;
+the routing key does not replace that inspection record.
+
+### Postmaster and refusal behavior
+
+Every served domain routes any case of postmaster to the sole account, and
+the domainless `Postmaster` form does so as well. These routes are implicit
+and cannot be disabled. An explicit postmaster alias is permitted but must
+pass the same domain/account checks; it adds no forwarding authority.
+Quoted equivalent local forms with a served domain receive the same reserved
+handling. The domainless exception is only the unquoted `Postmaster` token
+(case-insensitive), as in RFC 5321 §4.1.1.3; quoted domainless forms do not
+resolve. No other domainless address resolves. The command parser owns
+angle-bracket removal and validates the full SMTP command before lookup.
+
+All other addresses require an exact canonical alias. A `+` is an ordinary
+literal local-part character: it matches only when that exact alias exists.
+No implicit tag stripping, catch-all, forwarding or nonlocal delivery occurs.
+`resolve` returns no route for unsupported, malformed or unconfigured spellings;
+this is not an SMTP syntax verdict. The protocol layer owns its reply codes.
+Lookup returns only AccountId. Inbox provisioning, durable delivery, envelope
+preservation and pinning this configuration for a transaction remain later
+milestones; v1 delivery still files once in the account's Inbox.
+
+### Storage and construction
+
+The caller supplies initialized storage: at most 256 domain cells of 16 bytes,
+4096 alias cells of 32 bytes, and 320 KiB routing text. The text partition is
+within the existing 512 KiB snapshot text/secret arena, leaving 192 KiB for
+other configured text and decoded credential material. It is not an extra
+allocation. The 4 KiB domain table comes from the snapshot's 384 KiB descriptor
+region; the alias table uses its existing 128 KiB reservation. Smaller caller
+regions are allowed (including zero alias cells), but at least one domain
+cell and one text byte are required. No operation grows these regions.
+The conservative text bound is 256 × 243 + 4096 × 64 = 324352 bytes, below
+320 KiB. All count and string limits therefore fit the full reservation;
+smaller supplied regions can exhaust text before cell counts.
+
+Each domain is stored once. An alias cell holds an eight-byte local-text
+reference, its 16-byte target AccountId, four-byte line, two-byte column and
+one-byte domain index, with padding within 32 bytes. A domain cell holds an
+eight-byte text reference, line, column, declaration flag and original index,
+within 16 bytes. Cells have opaque fields and an EMPTY initializer. Only the
+builder's used prefixes are live; reusing an arena cannot reactivate old
+cells. The constructor checks layout and storage ceilings before mutation.
+Text references stay private to the builder/view and cannot cross arenas.
+
+Construction interns canonical domains with a bounded linear search of at
+most 256 cells, including domains first mentioned by aliases. A pending
+reference consumes a domain cell but does not make the domain served: an
+explicit domain declaration is still required. Aliases and declarations can
+arrive in either order. Repeated domain declarations fail immediately;
+repeated alias keys fail at finish. No operation allocates.
+
+The first insertion failure poisons the candidate; further methods and finish
+return it. Finishing consumes the builder, validates references and targets,
+sorts the domain table in place, remaps alias indices through 256 bytes of
+stack scratch, then sorts aliases by domain index and local bytes and checks
+duplicates. No view is returned on failure. Immutable borrows of the used
+regions exclude rebuilding in the same storage. Runtime generation lifetime
+and publication remain M19.
+
+Lookup uses at most 254 bytes of stack key scratch plus checked binary
+searches of domains and aliases; it neither allocates nor scans the full
+alias table. Private offsets are checked before reads. Lookup does not mutate
+counters or invoke files/network services. No normal Debug output exposes
+routing text. Fixed errors carry source locations without supplied names or
+addresses. Domain duplicates report the earlier declaration; alias duplicates
+report the lower source coordinate as the previous site. If a typed caller
+supplies coincident coordinates, both reported sites are equal. Private text
+offsets break alias sorting ties after source coordinates without extra cell
+metadata; the parser has no includes or synthetic macro locations. Missing
+mandatory declarations have no source location. Buffer tails are private and
+not erased; no zeroization claim is made.
+
+Stable routing codes are `config_route_capacity`, `config_route_invalid_domain`,
+`config_route_invalid_address`, `config_route_second_account`,
+`config_route_missing_account`, `config_route_missing_domain`,
+`config_route_duplicate_domain`, `config_route_duplicate_alias`,
+`config_route_unknown_domain`, `config_route_unknown_account`, and
+`config_route_invariant`.

@@ -219,9 +219,11 @@ Split at these concrete boundaries before dependent milestones start:
   NetworkLimits declarations. Reject duplicate sections/fields, unknown keys
   and wrong types; consume candidates through memory, admission and timeout
   planners. This is resource validation only, not a full configuration check.
-- **M04b2b:** freeze routing field schema and descriptor ceilings in CONFIG.md;
-  build bounded immutable account/domain/alias candidates and resolve local
-  recipient routes, including reserved postmaster handling.
+- **M04b2b:** implemented typed bounded account/domain/alias candidates and
+  immutable local-recipient lookup in `config/routing.rs`. CONFIG.md owns the
+  target stanza binding, canonical keys, reserved postmaster behavior and
+  byte layout/partition ceilings. Stanza dispatch and complete snapshot
+  integration remain M04b2c; this view has no store/protocol authority.
 - **M04b2c:** freeze remaining identity/listener/relay/certificate schemas and
   build complete immutable candidates in the two bounded snapshots. Integrate
   syntax, schema version, resource plans and all configured references;

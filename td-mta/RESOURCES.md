@@ -307,8 +307,14 @@ in-memory queue. Scratch/queue bounds apply even with configured larger pools.
 Each 1 MiB configuration snapshot permits a 512 KiB text/secret arena,
 4096 alias descriptors of at most 32 bytes (128 KiB), and 384 KiB for domain,
 identity/device/endpoint descriptors, resource plans, indices and ownership
-metadata. Combined arena bytes still bound configurations with many long
-values. Build a new snapshot from the bounded stream scratch; do not keep an
+metadata. Routing uses 320 KiB of the text arena, leaving 192 KiB for other
+configured text and decoded credential material. Its 256 domain descriptors
+use 4 KiB of the descriptor region; each alias descriptor remains 32 bytes.
+Domains are stored once and aliases retain local text plus domain indices.
+Their conservative text bound is 324352 bytes, below the 320 KiB reservation.
+These partitions are not extra allocations. Combined arena bytes still bound
+other configured text. Build a new snapshot from the bounded stream scratch;
+do not keep an
 extra file-sized input copy beside both snapshots. CONFIG.md bounds the
 physical input at 2 MiB, streamed through the control worker's existing 64 KiB
 configuration region: 16 KiB input chunk, 8 KiB physical line, 4 KiB decoded
