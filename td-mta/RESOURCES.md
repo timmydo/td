@@ -317,6 +317,13 @@ Concrete implementations must fit these contracts before enabling service.
 
 ## Evidence
 
+M04c1's `admission.rs` validates the separate u64 disk/work plan and capacity
+relationships in ADMISSION.md. It consumes an already validated ResourcePlan
+without changing this RAM ledger. Logical upload/queue quotas may be smaller
+than message_bytes; admission must enforce the intersection of logical quota,
+raw-body quota and actual free capacity for each operation. These settings do
+not guarantee that any particular upload/submission can currently fit.
+
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
 buffers and atomic text formatting. They neither allocate backing storage nor
 grow it. Arena regions are disjoint Rust borrows; reuse requires their lifetimes

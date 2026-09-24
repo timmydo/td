@@ -1,10 +1,14 @@
 # Disk admission, bounded work and request retention
 
 This is the normative companion to [RESOURCES.md](RESOURCES.md),
-[API.md](API.md) and [STORAGE.md](STORAGE.md). M02c3b freezes the policies;
-M04 implements checked configuration, M05/M08 implement disk admission and
-maintenance, and M13 implements request retention. No running admission
-coordinator or filesystem probe is claimed by this document.
+[API.md](API.md) and [STORAGE.md](STORAGE.md). M02c3b freezes the policies.
+M04c1 implements checked disk/work configuration in
+[src/admission.rs](src/admission.rs); it produces an immutable plan from an
+already validated ResourcePlan, DiskLimits, WorkLimits and explicit ViewMode.
+It validates capacity relationships without allocating pools or inspecting
+the filesystem. M04c2/M04c3 own meters, timers and reservation accounting;
+M05/M08 supply physical probes, persistence and maintenance. M13 owns request
+retention. No running admission coordinator or filesystem probe is claimed.
 
 ## 1. Disk accounting
 
@@ -46,7 +50,9 @@ Per-request retention must be at least
 `32 * json_bytes + 4096 * json_methods + 64 KiB`, a conservative bound for
 mandatory framing/errors and escaped initial creation-map copies. Count actual
 request reservations, not this entire startup ceiling, against aggregate use.
-Other new byte/count caps must be positive. Changing quotas does not enlarge
+The live metadata cap must fit all empty table headers (1232 bytes), and
+the cache cap must fit the 1 KiB GC cursor reserve. Other new byte/count
+caps must be positive. Changing quotas does not enlarge
 any RAM pool. Quota reductions below current
 use fail configuration validation rather than delete existing data.
 Logical upload/queue quotas are independent policy ceilings: they may be
@@ -491,6 +497,15 @@ for an uncommitted object. Creation references and result references are
 separate mechanisms and both need exact retention.
 
 ## 5. Required evidence
+
+M04c1 tests pin numeric default/derived caps, exact response and checkpoint
+quota boundaries, larger-metadata maintenance requirements, one-view refusal
+for online background work, logical subquotas below the per-object ceiling,
+invalid ranges/fixed overhead floors and helper-level arithmetic overflow.
+Current configuration ranges prevent plan-level overflow. Disk quota changes leave the
+RAM plan unchanged. These tests do not establish observed-use reconciliation,
+safe quota reduction, live reservations, filesystem availability or runtime
+work charging; those remain the implementation gates below.
 
 M04/M05/M08/M13 add tests at their real execution boundaries, not document-only
 assertions: concurrent quota reservations cannot overbook; failed publications

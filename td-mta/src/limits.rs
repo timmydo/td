@@ -187,14 +187,6 @@ impl Limits {
                 self.json_methods <= self.json_tokens,
                 "method count exceeds token capacity",
             ),
-            (
-                self.upload_disk_bytes >= self.message_bytes,
-                "upload quota cannot fit one blob",
-            ),
-            (
-                self.queue_disk_bytes >= self.message_bytes,
-                "queue quota cannot fit one message",
-            ),
         ] {
             if !valid {
                 return Err(ResourceError::Inconsistent(rule));
@@ -520,20 +512,6 @@ mod tests {
                     ..defaults
                 },
                 "MIME depth exceeds part capacity",
-            ),
-            (
-                Limits {
-                    upload_disk_bytes: 1,
-                    ..defaults
-                },
-                "upload quota cannot fit one blob",
-            ),
-            (
-                Limits {
-                    queue_disk_bytes: 1,
-                    ..defaults
-                },
-                "queue quota cannot fit one message",
             ),
             (
                 Limits {
