@@ -7,8 +7,9 @@ M04c1 implements checked disk/work configuration in
 already validated ResourcePlan, DiskLimits, WorkLimits and explicit
 ViewMode. It validates capacity relationships without allocating pools or
 inspecting the filesystem. M04c2 supplies pure charged meters and timer
-budgets in `src/admission/work.rs` and `src/admission/timers.rs`. M04c3 owns
-reservation accounting. M05/M08 supply physical probes, persistence and
+budgets in `src/admission/work.rs` and `src/admission/timers.rs`. M04c3a
+supplies pure physical-space arithmetic in `src/admission/space.rs`. M04c3b
+owns reservation accounting. M05/M08 supply physical probes, persistence and
 maintenance. M13 owns request retention. No running admission coordinator or
 filesystem probe is claimed.
 
@@ -147,6 +148,27 @@ charge to those counters. A newer probe can reconcile older completed growth;
 never credit deletion before a probe observes the freed space. This may count
 some concurrent growth twice, conservatively, but cannot count it as free twice.
 Use space available to an unprivileged user, not privileged reserved blocks.
+Before granting, also check that completed plus pending, checkpoint and new
+reserved growth fits the monotonic counter domain, including inode counts
+when the physical inode probe is unsupported. Exhaustion refuses before I/O;
+never wrap a counter after an admitted write has already happened.
+
+The implemented space evaluator consumes one filesystem's successful probe,
+its captured completed counters, current counters, protected checkpoint
+capacity for the resulting state (including the new request) and a new
+request rounded per file. The request retains its rounding unit; a probe
+reporting a different unit refuses evaluation. It returns remaining bytes
+and explicit available/unsupported inode headroom. It mutates no state and
+grants no lease. The coordinator must match the open filesystem identity and
+fresh probe, reject probe failure, and atomically install all passing
+reservations and the resulting checkpoint reserve before another evaluation.
+All namespaces on that filesystem share counters. The file-growth helper
+assumes the old allocation was already charged; shrinking or deleting a file
+gives no immediate physical credit. Round each file separately. A partial or
+failed write retains its pending charge until the coordinator accounts for
+its completed growth; unused reservation release cannot release written/orphan
+bytes. Ordinary byte/inode shortage, including a floor larger than available
+space, remains distinct from exhausted monotonic counters.
 
 A free-space probe must use the actual open store/filesystem identity, not a
 shell utility or a client-supplied path. Safe std currently supplies no portable
@@ -166,6 +188,13 @@ and the filesystem metadata floor are separate. This is a conservative streaming
 merge upper bound; replaced rows and tombstones can only reduce the output.
 Keep this reserve distinct from admitted body/WAL/response completion charges.
 It is reusable checkpoint capacity, not a new full reservation per client.
+The checkpoint helper returns an unrounded total. When individual output
+lengths are not yet known, bound the sum of per-file rounded lengths by
+`round_up(total, unit) + (file_count - 1) * unit`, with checked arithmetic.
+Count every prospective file, including all eleven tables, manifest and
+CURRENT temporary; reserve new directory/file inodes separately. This padding
+is required even when an allocation unit exceeds the 1 MiB format allowance.
+The RoundedGrowth total-bound constructor implements this conservative bound.
 Transfer outstanding leases to the new journal during the existing checkpoint
 barrier; they keep their charges and identities and acquire no sequence early.
 
@@ -533,6 +562,14 @@ SMTP recipient/block/fence budgets, independently raised phases/work limits
 and Tick overflow. They
 do not exercise sockets, scheduler priority, cancellation or allocation/RSS.
 Those remain tests at the consumers below.
+
+M04c3a fake-sample tests pin per-file rounding, exact byte/inode floors,
+pending/last-checkpoint preservation, completion transitions concurrent with
+a probe, fresh-probe reconciliation, unsupported inodes, counter regression,
+pre-effect counter headroom (including pending/checkpoint growth), allocation
+unit matching, multi-file rounding slack and the journal-operation correction. These are
+arithmetic tests, not evidence of fresh probe matching, reservation ownership,
+atomic live grants, orphan recovery or an actual filesystem adapter.
 
 M04/M05/M08/M13 add tests at their real execution boundaries, not document-only
 assertions: concurrent quota reservations cannot overbook; failed publications

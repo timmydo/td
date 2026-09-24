@@ -218,8 +218,11 @@ Split at these concrete boundaries before dependent milestones start:
 - **M04c2:** charged work meters in `admission/work.rs` and checked
   network/attempt deadline budgets in `admission/timers.rs`; consumers own
   actual state transitions, idle resets and scheduling enforcement.
-- **M04c3:** filesystem reservation accounting with injected probe samples;
-  actual filesystem probes remain M05's boundary.
+- **M04c3a:** checked physical-space arithmetic in `admission/space.rs`,
+  including concurrent-probe correction and checkpoint completion capacity.
+- **M04c3b:** bounded reservation ownership, atomic logical/physical accounting,
+  fresh probe matching and written/orphan transitions using M04c3a. Actual
+  filesystem probes remain M05's boundary; persistence remains M08's.
 - **M04d:** typed bounded event/status records, escaping and redaction.
 
 All parts gate M04 consumers. Individual helper modules are not a running

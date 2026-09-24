@@ -330,6 +330,11 @@ sampling, fixed scheduling steps, protocol transitions, nested-budget charging
 and completion of admitted durable work. These helpers do not establish
 whole-process memory usage or execution-time enforcement.
 
+M04c3a's space evaluator uses scalar counters and injected probe samples. It
+protects pending and checkpoint capacity in its arithmetic, including writes
+completed during a probe. M04c3b still owns live reservation records, atomic
+installation, probe identity/freshness and written/orphan transitions.
+
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
 buffers and atomic text formatting. They neither allocate backing storage nor
 grow it. Arena regions are disjoint Rust borrows; reuse requires their lifetimes

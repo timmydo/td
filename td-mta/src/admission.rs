@@ -45,6 +45,7 @@ macro_rules! settings {
     };
 }
 
+pub mod space;
 pub mod timers;
 pub mod work;
 
