@@ -311,9 +311,17 @@ Split at these concrete boundaries before dependent milestones start:
     logging severity. Inline metadata and owner-bound path references fit
     existing workspace/headroom. Hostname/origin staging, raw stanza validation
     and whole-file EOF remain the dispatcher; no files or network operations.
-  - **M04b2c3d2:** bounded stanza dispatcher with strict version, section,
-    label, field, type, duplicate and required/forbidden rules. Reject duplicate
-    singleton headers before any field staging, including hostname/origin.
+  - **M04b2c3d2a:** implemented `config/stanza.rs`: static section/field/type
+    catalog and one reusable pending non-resource stanza. Copy decoded text,
+    retain presence and key/value coordinates, refuse unknown/duplicate/type
+    and unconditional missing-field errors. Complete representation fits
+    13 KiB; resource stanzas still use their existing direct builder. This is
+    staging, not label semantics, a whole parser, EOF or runtime authority.
+  - **M04b2c3d2b:** wire the stanza dispatcher to typed builders with strict
+    version, label content, scalar semantics and conditional required/forbidden
+    rules. Reject duplicate singleton headers before any field staging,
+    including hostname/origin. Reject labels on resource sections before
+    invoking their direct resource builder.
     Reuse one pending variant within SCHEMA.md's 13 KiB reservation; avoid
     a whole-file AST or duplicate alias arena. Before typed certificate
     conversion, enforce CONFIG.md's files-mode required chain/key and

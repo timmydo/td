@@ -544,13 +544,25 @@ retained text for the larger variants is:
 
 | Pending stanza | Text bytes before bookkeeping |
 | --- | ---: |
-| Identity: display name, email and two signature paths | 12540 |
+| Identity: label/account IDs, display name, email and two signature paths | 12604 |
 | Paths: three root paths | 12285 |
-| Relay: host, username and two paths | 8687 |
+| Relay: host, username, transport and two paths | 8704 |
 | ACME: directory, contact and CA path | 8445 |
-| Files certificate: label and two paths | 8254 |
+| Files certificate: label, mode and two paths | 8259 |
+| Identity address: label, kind, display name and email | 4390 |
+| Account: label, username and display name | 4382 |
 | Gateway: label, CA path and two hex pins | 4287 |
-| Listener: label, server name, two profile names and bind | 488 |
+| Server: hostname, raw origin and two address hints | 561 |
+| Domain: label, MX host, policy mode and certificate name | 557 |
+| Gateway listener: label, kind, server name, two profile names and bind | 500 |
+
+`config::stanza::Pending` implements this shared pending region with 12672
+text bytes, eight typed field cells, source coordinates and one label span.
+The complete representation is compile-time bounded to 13 KiB. Text counts
+above include raw IDs and enum spellings until typed handoff; scalar integers
+and booleans are inline. Resource stanzas use the existing resource builder
+and do not accumulate another pending field array. This helper stages only
+one non-resource stanza and grants no schema, EOF or publication authority.
 
 Relay and certificate/ACME variants individually fit within 9 KiB including
 bookkeeping; the shared 13 KiB reservation also accommodates identity and

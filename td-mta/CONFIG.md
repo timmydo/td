@@ -954,8 +954,8 @@ The caller supplies 1..16 cells of at most 128 bytes, within the existing 2
 KiB listener partition; the builder fits 128 bytes of builder workspace. The
 complete borrowed records header fits 128 bytes of global headroom. These
 layout ceilings are checked at compile time. Text uses the shared 192 KiB
-region. A pending listener's label, server name, certificate/gateway labels
-and bind text total at most 488 bytes, within the existing shared
+region. A pending gateway listener's label, kind, server name,
+certificate/gateway labels and bind text total at most 500 bytes, within the existing shared
 pending-stanza reservation. Every used cell is fully written; reused cells
 beyond the current prefix remain inaccessible. Records bind to the text
 owner, and each compact read verifies it through the shared helper. Live
@@ -1106,3 +1106,64 @@ Fixed `config_globals_` errors retain only static field names, a related
 root field for overlap and source coordinates, with an empty source chain.
 Inputs, settings, builders and views redact Debug output. Trusted accessors
 expose values explicitly; nothing grants file or publication authority.
+
+## Pending source stanzas
+
+M04b2c3d2a implements `config::stanza` as the bounded staging part of the
+source dispatcher. Its catalog recognizes the fifteen non-resource section
+names and delegates the four resource names to the existing resource schema.
+Known names, field names, scalar classes, unconditional required fields and
+label classes are static. Resource stanzas are refused by the pending-buffer
+API so the dispatcher must send them directly to `config::resources`; their
+larger field set never acquires a second pending array. Before that handoff,
+the dispatcher must explicitly reject a label on each resource header:
+the resource builder has no label parameter and cannot perform that check.
+
+A Pending value holds exactly one non-resource stanza. `begin` is permitted
+initially or after a successful `finish`; it cannot overwrite an unfinished
+stanza. It requires or forbids a label according to section, bounds label
+length by its class and copies it. Label content is not yet an ID, profile,
+DNS or mailbox proof; typed handoff must validate that content. Assignments
+accept only known fields of the catalog's scalar class. They retain both key
+and value coordinates, detect duplicates before type checks, and preserve
+omitted, false and empty-text distinctions. Text is copied before the physical
+line/decoded-string buffer can be reused, and each text value retains the
+4096-byte syntax ceiling. No default is applied here.
+
+`finish` checks every unconditional required field, returning a borrowed
+stanza with explicit label/field access. An accessor key outside that
+section's catalog returns Invariant, so a dispatcher typo cannot masquerade
+as an omitted field and select a default. Certificate mode-specific fields,
+listener role-specific fields and other semantic/range/reference checks
+remain typed dispatch and the existing helpers. A pending stanza is neither
+complete configuration validity nor EOF evidence. The whole dispatcher must
+still own version=1, singleton-header rejection before staging, typed
+handoffs and failure propagation; the whole loader must own actual EOF.
+
+After successful finish, the next begin reuses storage, clears all field
+presence and exposes only its new text prefix. Rust borrowing prevents reuse
+while a stanza view exists. Calling assign or finish in the wrong phase, or
+any label/field/type/presence/capacity failure, retains the first error and
+prevents future reuse; discard the candidate. The outer dispatcher must also
+discard on a typed handoff/reader error after this helper succeeded. There
+is no clear-error or partial-publication API.
+
+The full Pending representation fits the existing shared 13 KiB workspace:
+12672 text bytes, eight compact typed cells and header/coordinates. The
+largest valid identity needs 12604 text bytes, including both raw IDs,
+display name, email and two signature paths; all three root paths need
+12285. Maximum counts do not authorize oversized individual values. Invalid
+semantic text can exhaust the shared region before later semantic checks;
+a capacity failure is not evidence of field validity. Appends check the
+entire range before modifying bytes or the used prefix. No heap storage,
+whole-file AST or second alias-text arena is introduced. Combined loader
+workspace checks remain required in M04b2c3d4.
+
+Fixed `config_stanza_` errors disclose only static section/field context and
+source coordinates. Unknown raw names are never echoed. Duplicate fields
+report both key locations; type and text-length errors report the value
+location; missing fields report the section location. A begin call made
+before finishing reports the incoming section at its supplied coordinate.
+Pending buffers, stanza views and entries redact Debug output, and errors
+have an empty source chain. Explicit accessors expose trusted pending values. This helper performs no files,
+network, crypto or runtime publication.

@@ -11,6 +11,7 @@ pub mod outbound;
 pub mod policy;
 pub mod resources;
 pub mod routing;
+pub mod stanza;
 pub mod stream;
 pub mod syntax;
 pub mod text;
