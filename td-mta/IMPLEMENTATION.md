@@ -268,12 +268,29 @@ Split at these concrete boundaries before dependent milestones start:
     forward aliases and domain sorting. Canonical MX defaults share one global
     hostname; mode/age/certificate syntax and provenance are retained for c's
     listener and certificate graph. No DNS/policy publication is enabled.
-  - **M04b2c3c:** bounded resolver/relay/certificate/gateway/listener candidates
-    and their reference graph. Enforce role-specific fields, origin/port/certificate
-    required-name derivation, gateway pins/prefixes, no public plaintext fixture,
-    session-pool totals and bind conflicts. Test direct, gateway and combined
-    profiles entirely offline, including incompatible and dangling policies.
-    Provider verification remains M03/M07/M18; M11 owns actual socket policy.
+  - **M04b2c3c1:** implemented typed resolver/relay records in
+    `config/outbound.rs`: one to four numeric resolvers retain fallback order,
+    with unique profile names and binary endpoints. Exactly one relay has a
+    canonical DNS host, nonzero port, printable username, mandatory password
+    path, optional CA path and an explicit TLS transport choice. Shared text
+    owner checks protect live/frozen views; sticky failures prevent incomplete
+    records. Inline metadata fits 1 KiB of global settings/headroom, with no
+    extra text arena. File loading, DNS, authentication and TLS remain later
+    integrations; stanza dispatch/EOF remain d.
+  - **M04b2c3c2:** bounded gateway/prefix records: unique profiles, private CA
+    paths, current/next leaf pins, ordered forward peer rows, binary duplicate
+    rejection and per-policy/global prefix ceilings. Preserve staged policies;
+    c4 verifies consumers. No TLS peer authorization before M07/M12.
+  - **M04b2c3c3:** bounded certificate profiles and ACME settings: strict
+    mode-specific fields, explicit terms acceptance, protected material paths,
+    directory origin/contact validation. Provider verification remains M03/M07;
+    managed issuance and policy publication remain M18.
+  - **M04b2c3c4:** listener records and the complete reference graph. Enforce
+    role-specific fields, origin/port/certificate required-name derivation,
+    profile consumption, gateway peer requirements, no public plaintext
+    fixture, session-pool totals and bind conflicts. Test direct, gateway and
+    combined profiles entirely offline, including incompatible and dangling
+    policies. M11 owns actual socket policy.
   - **M04b2c3d:** single whole-loader entry point owning its candidate and reader
     operation. Require root version, actual EOF, all mandatory sections and
     resource plans. Hold one pending stanza; avoid a whole-file AST or duplicate

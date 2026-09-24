@@ -112,7 +112,11 @@ paths.
 Each resolver has exactly one required `address` field, a numeric socket
 address with shortest unsigned decimal port 1..65535. It identifies the
 UDP/TCP DNS server; it is not a bind. Reject duplicate numeric endpoints,
-mapped IPv6 and zone IDs. Resolver stanza order sets fallback order. V1 uses these explicit endpoints only, never
+mapped IPv6, zone IDs, unspecified addresses, multicast, the IPv4 limited
+broadcast address and obsolete IPv4-compatible IPv6 addresses. IPv6 loopback
+`::1` remains valid. These are destination rules; generic bind addresses and
+gateway CIDR ranges have their own rules. Resolver stanza order sets fallback
+order. V1 uses these explicit endpoints only, never
 ambient NSS, `/etc/resolv.conf` or automatically selected public resolvers. A
 loopback resolver requires an actual service at that endpoint; configuration
 does not provide one. Tests name their local fixture address explicitly.
@@ -483,6 +487,19 @@ usage before enabling this path. Stack arrays borrow the snapshot only within
 finalization, do not escape, and are dropped before moving/publishing the
 owning snapshot. No typed reinterpretation of byte arenas, self-reference or
 extra allocation is required.
+
+Resolver/relay records use at most 1 KiB of the global settings/headroom
+partition, including their four inline resolver cells, relay fields and text
+owner. Their builder has a separate 1 KiB ceiling within the 36 KiB builder
+workspace; moving its records into the candidate does not create another
+persistent copy. The pending relay stanza also reserves 9 KiB within that
+workspace: its four retained text fields total at most 8687 bytes (243-byte
+host, 254-byte username and two 4095-byte paths), plus field presence and
+coordinates. This pending storage is shared with other stanza variants;
+it is not an additional reservation per section. M04b2c3d must enforce the
+combined 36 KiB size ceiling. All names, hostnames, usernames and unresolved file paths
+use the existing 192 KiB non-routing text region. These structural records
+perform no DNS lookup or protected-file read and grant no network authority.
 
 The loader owns one pending stanza in the 36 KiB builder workspace. In
 particular, retain only one alias label (at most 254 bytes) until its required

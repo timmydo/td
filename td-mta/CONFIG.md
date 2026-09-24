@@ -727,7 +727,7 @@ field diagnostics. Named `DEFAULT_PREFERENCE` and
 `DEFAULT_MAX_AGE_SECONDS` constants are shared by input defaults and
 empty cells. Profile existence, certificate verification, port/SNI
 compatibility and direct versus gateway MX classification belong to
-M04b2c3c/M07/M18.
+M04b2c3c3/c4 and M07/M18.
 
 Finalization first validates local routing, then confirms a policy for
 every routing domain. It validates and stores one canonical global
@@ -768,3 +768,44 @@ certificate references, generate DNS or MTA-STS bodies/IDs, serve HTTPS,
 or publish a runtime snapshot. Those consumers must pass the remaining
 schema, protected-input and provider checks before any externally
 visible action.
+
+
+## Structural resolver and relay records
+
+M04b2c3c1 implements `config::outbound` for complete typed inputs. It retains
+one to four explicitly configured numeric DNS destinations in stanza order,
+with unique profile names and binary endpoint values. SCHEMA.md's destination
+restrictions supplement the general socket parser; no ambient resolver lookup
+or reachability check occurs. Exactly one relay is required, with lowercase
+DNS hostname, port 1..65535, mandatory password path and optional CA path.
+Relay usernames preserve case and printable ASCII spaces/colons, unlike
+account usernames; the limit is 254 bytes. Transport is either implicit TLS
+or required STARTTLS. `Transport::name` supplies the canonical schema spelling.
+No plaintext/downgrade option exists.
+
+Resolver and relay cells are inline in their records, with a compile-time
+1 KiB ceiling charged to global settings/headroom. The builder has a separate
+1 KiB ceiling within existing builder workspace. SCHEMA.md budgets the pending
+relay stanza's retained inputs within that same workspace. Every string uses
+the shared non-routing text builder. Constructors bind its owner, mutations
+verify it, and compact reads recheck it inside the text module. Live views
+allow path inspection before later protected-input appends; frozen views
+require the same owner. Resolved protected inputs and runtime publication
+remain later integrations.
+
+The first mutation error poisons subsequent calls and finalization. Field
+validation precedes text writes; a later capacity failure may retain earlier
+appended fields, but the failed builder can never produce records. Missing
+resolvers or relay refuse finalization. Duplicate declarations/endpoints
+retain both coordinates, including when the table is already full. Checking
+at most four existing cells preserves that more specific diagnostic before
+reporting capacity. Successful resolver and relay views retain their stanza
+coordinates for downstream diagnostics.
+
+Errors have fixed `config_outbound_` codes and an empty source chain. Distinct
+`config_outbound_password_path` and `config_outbound_ca_path` codes identify
+lexical path failures. M04b2c3d adds static field context and assignment
+coordinates; these typed helpers receive stanza locations. Inputs, builders,
+records and views redact Debug output. Explicit accessors expose data only to
+trusted callers. No helper reads a protected file, resolves DNS, authenticates
+to a relay or verifies a TLS peer; these records are structural candidates.
