@@ -1167,3 +1167,57 @@ before finishing reports the incoming section at its supplied coordinate.
 Pending buffers, stanza views and entries redact Debug output, and errors
 have an empty source chain. Explicit accessors expose trusted pending values. This helper performs no files,
 network, crypto or runtime publication.
+
+
+## Typed source dispatch
+
+M04b2c3d2b implements `config::dispatch`. It accepts borrowed syntax
+statements, copies one pending stanza and sends completed inputs to every
+typed builder above. The first nonempty statement must be integer
+`version = 1`; reject other root fields, repeated version and unknown
+sections. All ten singleton headers are checked before staging their fields,
+including server hostname/origin. Resource headers explicitly forbid labels
+and use their existing direct scalar builder. Other labels receive their
+role's ID, profile, DNS or mailbox validation during typed handoff.
+
+The pending catalog enforces unconditional fields, scalar classes and
+unknown/duplicate fields. Handoff preserves omitted/empty/false values and
+passes every declared optional field to its semantic helper. Certificate
+mode conversion first enforces all four prescribed chain/key required and
+forbidden codes; it cannot discard forbidden raw fields when constructing a
+typed variant. Listener helpers receive all five role-sensitive fields.
+References may precede declarations; resolver order remains source order.
+
+`finish_stanzas` consumes the dispatcher and closes supplied statements: it
+requires version/server, finishes globals and resource planners using the
+selected view mode, then identities, routing/policies, outbound settings,
+certificates, gateway peers, listeners and the certificate/name graph. It
+returns borrowed `Parsed` records and a matching read-only text view. This
+method does not operate a reader and is explicitly not evidence of actual
+EOF. M04b2c3d4 must call it only after the owned reader operation reaches
+EOF. Protected files, TLS/provider readiness and runtime publication remain
+later stages. Public structural records cannot authorize any of them.
+
+The caller supplies every table, both text arenas and one Pending. Dispatch
+uses no heap allocation or whole-file AST. It stages only the bounded server
+hostname/origin and coordinates until their final canonical copies are
+written by policy/graph finalization. A compile-time guard covers the
+dispatcher and Pending within the existing 36 KiB workspace; this is not a
+peak-stack proof including called frames. The separate 28 KiB stream region
+and complete loader/call-frame measurement remain d4. Private owned storage
+and sealed table headers remain d3.
+
+The first accept error is sticky and consuming finish refuses it. Partial
+table/text writes remain private and charged until the caller discards the
+failed candidate; no rollback or partial result is exposed. Tests retain an
+independent previous structural configuration across failed replacements;
+active-generation publication tests remain M19.
+
+Errors preserve typed helper causes, including duplicate/related coordinates,
+and add static section/field context with value coordinates during handoff
+where the failing field is identifiable. Label and declaration errors retain
+stanza coordinates. Cross-reference/finalizer errors retain their existing
+record coordinates; discarded stanzas are not retained as a source map.
+Unknown input names and supplied values are never echoed, error source chains
+are empty, and builders/tables/results redact Debug. Explicit record accessors
+expose values for trusted consumers.

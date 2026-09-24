@@ -317,7 +317,8 @@ Split at these concrete boundaries before dependent milestones start:
     and unconditional missing-field errors. Complete representation fits
     13 KiB; resource stanzas still use their existing direct builder. This is
     staging, not label semantics, a whole parser, EOF or runtime authority.
-  - **M04b2c3d2b:** wire the stanza dispatcher to typed builders with strict
+  - **M04b2c3d2b:** implemented `config/dispatch.rs`: connect the reusable
+    stanza buffer to typed builders with strict
     version, label content, scalar semantics and conditional required/forbidden
     rules. Reject duplicate singleton headers before any field staging,
     including hostname/origin. Reject labels on resource sections before
@@ -327,6 +328,10 @@ Split at these concrete boundaries before dependent milestones start:
     conversion, enforce CONFIG.md's files-mode required chain/key and
     ACME-mode forbidden chain/key codes. Test the full presence matrix for
     both modes and every unknown/duplicate/type/missing/forbidden refusal.
+    `finish_stanzas` closes resources and references over supplied statements
+    only; its borrowed result does not prove reader EOF or confer authority.
+    Typed handoff errors preserve helper causes and add static source context.
+    Builder plus Pending fits 36 KiB; d4 still measures concurrent call frames.
   - **M04b2c3d3:** private owned candidate storage and sealed table headers.
     Consume borrowed builders before moving their enclosing storage; keep
     backing tables, used prefixes and text owner together. No public loose

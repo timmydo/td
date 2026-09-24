@@ -3,8 +3,8 @@
 ## Status and ownership
 
 This document specifies the complete v1 operator schema to implement in
-M04b2c3. The existing helpers do not implement this loader or make a service
-runnable. CONFIG.md owns physical syntax, resource fields, local routing and
+M04b2c3. Typed statement dispatch now closes structural references, but
+owned whole-reader loading and a runnable service remain unimplemented. CONFIG.md owns physical syntax, resource fields, local routing and
 stream completion. API.md owns visible identity encoding. This document owns
 the remaining fields, cross-references and candidate construction. Protected
 file loading and redacted effective output remain M04b3/M05; M19 owns
