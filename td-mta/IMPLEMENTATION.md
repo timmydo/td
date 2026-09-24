@@ -201,13 +201,14 @@ A clean fixture builds without undeclared ambient host toolchain inputs.
 
 ## M04 — Bounded primitives, configuration, and event records
 
-**Depends on:** M02. **Own:** `bounded`, `config`, `event`, `limits` modules.
+**Depends on:** M02. **Own:** `bounded`, `ownership`, `config`, `event`,
+`limits` and `admission` modules.
 
 Split at these concrete boundaries before dependent milestones start:
 
 - **M04a1:** caller-owned byte arenas, wire buffers and atomic bounded text
   formatting in `bounded.rs`; fixed capacity and explicit work/ownership.
-- **M04a2:** fixed queues and checked reusable slot ownership, including
+- **M04a2:** `ownership.rs` fixed queues and checked reusable slots, including
   stale completions, cross-pool tokens, saturation and generation exhaustion.
 - **M04b:** stanza grammar, immutable configuration, alias/identity resolution,
   secret-file references and redacted effective output, using the committed

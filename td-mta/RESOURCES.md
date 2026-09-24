@@ -332,6 +332,37 @@ Tests cover every small compaction overlap, direct-I/O count errors, exact
 capacity, coexistence of arena regions and UTF-8/format rollback. Allocation
 instrumentation and measured whole-process bounds remain M23 requirements.
 
+M04a2's `ownership.rs` adds caller-owned fixed FIFO cells and slot bookkeeping.
+Queue backing cells include Option layout; the final scheduler must measure
+its actual entry types against the 32-byte reservation. SlotState uses at most
+eight bytes and SlotId at most sixteen on tested targets. IDs have a process-
+wide nonzero u64 generation, issued once and never reset when pools are dropped
+or rebuilt. Ticket issuance tries one atomic compare/exchange: contention
+returns a temporary error without reserving a slot, and exhaustion permanently
+refuses issuance before wraparound. Generations do not authorize account data
+and cannot be persisted or accepted from peers.
+
+These primitives add no worker, locks or payload ownership enforcement.
+M11's scheduler uses this lock protocol: briefly lock the pool and resolve the
+token to locate its payload lock, then release the pool lock before acquiring
+the payload lock. With that payload lock held, briefly acquire the pool lock
+again and revalidate the complete token before accessing the payload. Reject a
+stale token and release both locks without touching payload data. Never wait
+for a payload lock while holding the pool lock. A live worker retains payload
+ownership across its I/O, releasing the pool lock first. Release/reuse requires
+the payload lock and then the pool lock; a main-thread deadline or cancellation
+cannot free a worker-owned slot. Main uses try_lock and defers busy slots as
+specified above. SlotPool::resolve is the only public index accessor, but its
+returned integer cannot itself enforce this scheduler protocol.
+
+Reserve completion credits before effects and never drop a durable result on
+queue saturation. Releasing/dropping bookkeeping does not clear or cancel its
+separately owned payload. Queue drop destroys pending values in FIFO order;
+lifecycle code must drain admitted durable work before doing so. Tests check
+FIFO saturation/wraparound, value ownership, stale/foreign and rebuilt-pool
+rejection, concurrent unique issuance and finite exhaustion. Actual lock and
+I/O scheduling race tests remain M11's implementation gate.
+
 The unit cases exercise malformed/canonical IDs, unsupported configuration
 versions, invalid pool relationships, arithmetic overflow, insufficient
 memory, expansion beyond the default budget, and streaming quotas independent

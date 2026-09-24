@@ -5,6 +5,7 @@ pub mod bounded;
 pub mod format;
 pub mod ids;
 pub mod limits;
+pub mod ownership;
 pub mod ports;
 pub mod sync;
 pub mod wire;
