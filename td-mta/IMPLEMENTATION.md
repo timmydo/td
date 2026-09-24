@@ -215,7 +215,9 @@ Split at these concrete boundaries before dependent milestones start:
   buffer APIs.
 - **M04c1:** checked u64 disk/work settings and capacity-derived maintenance
   validation in `admission.rs`; configuration uses this committed plan.
-- **M04c2:** charged work meters and checked network/attempt deadline budgets.
+- **M04c2:** charged work meters in `admission/work.rs` and checked
+  network/attempt deadline budgets in `admission/timers.rs`; consumers own
+  actual state transitions, idle resets and scheduling enforcement.
 - **M04c3:** filesystem reservation accounting with injected probe samples;
   actual filesystem probes remain M05's boundary.
 - **M04d:** typed bounded event/status records, escaping and redaction.

@@ -4,11 +4,13 @@ This is the normative companion to [RESOURCES.md](RESOURCES.md),
 [API.md](API.md) and [STORAGE.md](STORAGE.md). M02c3b freezes the policies.
 M04c1 implements checked disk/work configuration in
 [src/admission.rs](src/admission.rs); it produces an immutable plan from an
-already validated ResourcePlan, DiskLimits, WorkLimits and explicit ViewMode.
-It validates capacity relationships without allocating pools or inspecting
-the filesystem. M04c2/M04c3 own meters, timers and reservation accounting;
-M05/M08 supply physical probes, persistence and maintenance. M13 owns request
-retention. No running admission coordinator or filesystem probe is claimed.
+already validated ResourcePlan, DiskLimits, WorkLimits and explicit
+ViewMode. It validates capacity relationships without allocating pools or
+inspecting the filesystem. M04c2 supplies pure charged meters and timer
+budgets in `src/admission/work.rs` and `src/admission/timers.rs`. M04c3 owns
+reservation accounting. M05/M08 supply physical probes, persistence and
+maintenance. M13 owns request retention. No running admission coordinator or
+filesystem probe is claimed.
 
 ## 1. Disk accounting
 
@@ -188,6 +190,15 @@ read/written, records examined and output bytes. Charge repeated reads and
 merge passes again. Stop on the first exhausted dimension. A counter never
 wraps, and partial scans are never returned as complete query/search results.
 
+The implemented Meter charges I/O bytes, records, output bytes and GC
+unlinks atomically before a bounded step. A rejected charge consumes no
+counters and permanently stops that meter at its first refusal, including
+deadline expiry. Charge failed/repeated operations too. Construct a meter
+with validated job limits and the minimum of all enclosing deadlines. It
+neither refunds durable effects nor cancels I/O; callers keep completion
+reservations for work whose effects already started. This helper does not
+implement scheduler step limits.
+
 A CPU/I/O scheduling step handles at most 64 KiB or 256 records before yielding
 and checking cancellation/deadlines. One issued filesystem operation can block
 past the deadline; do not promise kernel-I/O cancellation or spawn a replacement
@@ -315,6 +326,15 @@ milliseconds, not a five-millisecond network timeout.
 Timers may be raised to at most 16 times their default; lowering them is not a
 v1 option. The 60-second online control lease, five-second HTTP-01 lifetime,
 one-hour event lifetime and connection request/transaction counts are fixed.
+The timer plan stores each configurable phase separately. The 120-second
+HTTP transfer minimum and 30-second base term can each be raised up to 16
+times their defaults; the configured minimum rate is 4096..65536 bytes/second.
+The offline 1800-second transfer minimum is separately configurable in its
+16-times range. A checked helper converts seconds to absolute Tick deadlines;
+the caller applies every enclosing lease and does not renew absolute timers.
+These helpers calculate budgets only; protocol state machines own phase
+transitions, progress/idle handling, fixed lifetimes and operation counts.
+
 Event closeafter/ping follow RFC 8620 within that lifetime; quiet subscriptions
 are not timed out as idle HTTP bodies. Inbound SMTP session lifetime is also
 one hour; prefer closing at a transaction boundary and never acknowledge
@@ -506,6 +526,13 @@ Current configuration ranges prevent plan-level overflow. Disk quota changes lea
 RAM plan unchanged. These tests do not establish observed-use reconciliation,
 safe quota reduction, live reservations, filesystem availability or runtime
 work charging; those remain the implementation gates below.
+
+M04c2 tests pin exact counter exhaustion, atomic/sticky refusal, absolute
+expiry, HTTP ceiling division and slow-rate budgets, outer exchange sums,
+SMTP recipient/block/fence budgets, independently raised phases/work limits
+and Tick overflow. They
+do not exercise sockets, scheduler priority, cancellation or allocation/RSS.
+Those remain tests at the consumers below.
 
 M04/M05/M08/M13 add tests at their real execution boundaries, not document-only
 assertions: concurrent quota reservations cannot overbook; failed publications

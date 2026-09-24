@@ -23,8 +23,9 @@ state codecs; [QUEUE.md](QUEUE.md) freezes future queue/restart/JMAP semantics.
 [CASES.md](CASES.md) names the protocol acceptance oracles still to implement.
 M04's `bounded` and `ownership` modules provide caller-owned buffer/queue/slot
 primitives. Its `admission` module validates disk/work settings and derived
-capacity requirements. They do not instantiate service pools, coordinate live
-disk reservations or implement protocol handlers.
+capacity requirements and supplies charged work meters and timer budgets.
+They do not instantiate service pools, coordinate live disk reservations or
+implement protocol handlers.
 
 The initial deployment is one person's approximately 1 GB of mail, multiple
 domains, and explicit aliases on each domain pointing into one account's

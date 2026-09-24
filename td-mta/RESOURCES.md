@@ -324,6 +324,12 @@ than message_bytes; admission must enforce the intersection of logical quota,
 raw-body quota and actual free capacity for each operation. These settings do
 not guarantee that any particular upload/submission can currently fit.
 
+M04c2's admission work/timer helpers charge fixed scalar counters and compute
+checked deadline budgets without allocation. Runtime callers own clock
+sampling, fixed scheduling steps, protocol transitions, nested-budget charging
+and completion of admitted durable work. These helpers do not establish
+whole-process memory usage or execution-time enforcement.
+
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
 buffers and atomic text formatting. They neither allocate backing storage nor
 grow it. Arena regions are disjoint Rust borrows; reuse requires their lifetimes
