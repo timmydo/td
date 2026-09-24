@@ -473,8 +473,8 @@ not proof of safe operator-file bytes or protected ancestors.
 including equality; `/a` overlaps `/a/b`, not `/a-other`. Root `/` overlaps
 any absolute path. Symlink aliases and descriptor identity remain M05 checks.
 
-DNS helpers only validate; they do not return folded storage. The later
-snapshot text builder owns shared lowercase copying, and callers must fold
+DNS helpers only validate; they do not return folded storage. `config::text`
+owns shared lowercase copying, and callers must fold
 names before canonical storage or compare with ASCII case folding. Both DNS
 ceilings intentionally return `config_value_dns_name`; the outer loader adds
 static field/role context when reporting a complete schema error.
@@ -513,7 +513,7 @@ They do not normalize arbitrary URLs or interpret them through another URL
 library. Fixed error codes are `config_endpoint_origin`, `config_endpoint_uri`,
 `config_endpoint_address` and `config_endpoint_prefix`. The whole loader adds
 static field/role context and physical locations; this mapping remains
-unimplemented until M04b2c3a3/d. Errors have no source chain.
+unimplemented until M04b2c3d. Errors have no source chain.
 
 `HttpsUri::parse` accepts at most 4096 ASCII bytes: lowercase `https://`, a
 243-byte DNS host, optional shortest decimal port 1..65535, and a bounded
@@ -553,3 +553,59 @@ URI/origin/prefix Debug output is redacted. Explicit value accessors and std
 socket-address results expose their values to trusted callers; they are not
 safe logging substitutes. Persistent compact cells, combined arena ownership,
 reference binding and runtime publication remain later M04 work.
+
+
+## Bounded configuration text storage
+
+M04b2c3a3 implements `config::text` as a caller-backed byte builder and
+immutable borrowed view. The caller supplies at most 192 KiB for non-routing
+text and decoded credentials, within the existing 512 KiB snapshot text
+reservation. Routing retains its separate 320 KiB partition. Smaller regions,
+including empty storage, are valid; no operation allocates or grows them.
+This helper does not own an entire snapshot, read files, check the schema or
+publish configuration.
+
+An append either copies the whole value and advances the written prefix, or
+leaves both the prefix and all backing bytes unchanged. Empty values consume
+no text bytes. Raw append accepts arbitrary bytes; `text` separately checks
+UTF-8 for the selected value. `append_dns` and `append_certificate_name` use
+the shared 243/253-byte grammars and copy lowercase ASCII, without retaining
+a second canonical string. Raw append performs no normalization or secret
+validation.
+
+Offsets and lengths are private checked `u32` pairs, eight bytes total.
+Public opaque handles add a process-local ownership ticket, for a total of
+16 bytes. These handles are transient API references, not the compact fields
+of persisted/configured descriptor cells. The remaining typed snapshot
+builders must keep eight-byte spans private under their enclosing arena
+owner; they must not charge 16-byte handles as eight-byte fields or serialize
+the process-local ticket. Typed cell construction and whole-snapshot ownership
+remain M04b2c3b/c/d. Those increments must extend `text.rs` with
+config-private span conversion and reads: bind each typed table to its arena
+owner, verify that owner before converting handles or reading compact spans,
+and keep raw span fields unavailable to external callers.
+
+A constructor makes one atomic attempt to claim a never-reused ownership
+number; it returns `config_text_contended` if another constructor races it.
+The single control worker constructs candidates; another caller must treat
+contention as a retryable operational condition, not an invalid configuration.
+It may retry in a later bounded step. Unit tests that construct builders share
+`text::TEST_CONSTRUCTION_LOCK`; separate integration-test processes have
+independent issuers. Never reset the issuer to isolate a test. Exhaustion
+refuses new builders before counter wrap. Relaxed atomics provide uniqueness only, not
+synchronization of text access. Every read checks owner identity and the
+written prefix before exposing bytes, including empty values. Dropping and
+rebuilding on the same backing memory does not revive old handles. Private
+range checks also reject overflow and slices beyond the written prefix.
+
+`freeze` consumes the builder and borrows only its written prefix immutably.
+There is no reset or hidden allocation, and no lifetime can outlast the
+caller's backing storage. Builder/view/handle Debug output is redacted.
+Errors are fixed `config_text_capacity`, `config_text_reference`,
+`config_text_utf8`, `config_text_dns_name`, `config_text_owner_exhausted` or
+`config_text_contended`, with empty source chains. `config_text_dns_name`
+serves both DNS-host and derived certificate-name validation. Static schema
+field/role and source-location wrapping remain the complete loader's responsibility.
+Explicit read accessors reveal bytes to trusted callers; neither dropping nor
+freezing scrubs storage. Protected secret loading and erasure belong to the
+owning candidate/runtime work, not this borrowed helper.

@@ -246,10 +246,13 @@ Split at these concrete boundaries before dependent milestones start:
     origin/request-target output. Shared DNS syntax plus the HTTPS numeric-host
     restriction, strict port/zone rules and mapped-peer membership are tested.
     These are value helpers only, with no network or provider authority.
-  - **M04b2c3a3:** private snapshot text/index storage. Reuse a1/a2 values;
-    centralize canonical DNS storage, checked text-reference ranges and fixed
-    diagnostic mapping. Prove actual descriptor layouts and both text-region
-    ceilings without file/network I/O or a self-referential owning object.
+  - **M04b2c3a3:** implemented caller-backed non-routing text in
+    `config/text.rs`: private eight-byte spans, opaque owner-checked handles,
+    checked written-prefix access, lowercase DNS/certificate copying and an
+    immutable borrowed view. The 192 KiB ceiling complements routing's 320 KiB
+    reservation. No owning snapshot, file/network I/O or publication is added.
+    Typed compact cells remain b/c; the whole loader's d increment owns combined
+    storage and static field/source-location diagnostic wrapping.
   - **M04b2c3b:** bounded account/identity/address and domain-policy candidates.
     Support forward references, list declaration order, null/empty/name
     distinctions, default materialization, signature-file references and sorted

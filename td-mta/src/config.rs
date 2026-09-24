@@ -5,4 +5,5 @@ pub mod resources;
 pub mod routing;
 pub mod stream;
 pub mod syntax;
+pub mod text;
 pub mod values;
