@@ -188,6 +188,8 @@ Event streams use main's normal nonblocking output scheduling and one coalesced
 state notification per slot; they hold no read view or body worker between
 emissions. Health uses a bounded cached snapshot. The control worker can update
 that snapshot without making every health poll wait for an ACME/DNS request.
+The diagnostic encoding bounds below assign cached encoded output, two fixed
+observation/output pairs and a minimal unavailable frame within that region.
 Only one sort/search job leases the shared sort buffer at a time. Long background
 views share one permit under ADMISSION.md: backup and outbound body transfer
 cannot together occupy both default views. Backup uses an existing view and
@@ -431,3 +433,24 @@ existing 16 KiB log output partition; inspection uses 4 KiB of the separate
 Both append complete records atomically. These
 encoders do not allocate the planned queue or implement the runtime log sink;
 [OBSERVABILITY.md](OBSERVABILITY.md) defines their schema and disclosure limits.
+
+M04d2 implements a caller-backed event queue of at most 384 cells. Construction
+checks both the actual 256-byte cell ceiling and 96 KiB total before borrowing
+storage. Queue loss accounting and fixed metadata fit the existing 16 KiB
+rotation/drop/emergency partition. No sink or runtime synchronization exists
+yet. Status JSON fits 4 KiB; the snapshot and at most 16 disk observations
+fit 2 KiB. Layout/maximum-field tests pin both. The existing 16 KiB health
+region contains two 4 KiB encoded slots, two 2 KiB observation cells, 2 KiB
+emergency output and 2 KiB ownership/pin descriptors. Control receives exclusive
+ownership of one inactive pair, encodes its complete line, and returns a checked
+completion before main publishes it. Main never borrows the worker-owned pair;
+health polling sends the previous immutable cache in at most 2 KiB chunks per
+turn without waiting for ACME/DNS. Pinned slots cannot be overwritten, and no
+third pair may be allocated. Slot saturation delays an update or refuses a
+request. A missing/stale cache or failed worker uses the fixed empty-metric
+`encode_unavailable` frame, which fits the 2 KiB main framing limit, in the
+separate emergency output slot. M19 owns freshness, transfer/publication and
+pinning; none is implemented by this encoder. Offline commands may encode into
+administrative scratch. Counters saturate explicitly and missing observations
+remain unknown. These are caller-owned helpers, not evidence of a running or
+measured service.

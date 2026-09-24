@@ -7,6 +7,9 @@ use crate::{
 };
 use std::{fmt, fmt::Write, num::NonZeroU64};
 
+pub mod health;
+pub mod queue;
+
 pub const SCHEMA_VERSION: u16 = 1;
 pub const MAX_EVENT_BYTES: usize = 1024;
 pub const MAX_INSPECTION_BYTES: usize = 4096;
@@ -469,7 +472,7 @@ mod tests {
             submission: None,
         }
     }
-    fn fullest() -> Context {
+    pub(super) fn fullest() -> Context {
         Context {
             boot: BootId::from_bytes([255; 16]),
             utc_ms: Some(i64::MIN),

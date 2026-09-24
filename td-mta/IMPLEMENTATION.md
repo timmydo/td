@@ -253,8 +253,13 @@ Split at these concrete boundaries before dependent milestones start:
   in `observability.rs`, including stable JSON Lines fields, redaction by
   default event shape, bounded UTF-8 truncation and ASCII JSON escaping.
   [OBSERVABILITY.md](OBSERVABILITY.md) owns the versioned record schema.
-- **M04d2:** bounded event queue, suppression counters and typed health/status
-  snapshots; runtime sink/rotation and aggregation remain M19.
+- **M04d2:** implemented bounded event queue/loss counters in
+  `observability/queue.rs` and typed status snapshots in `observability/health.rs`.
+  Local readiness is independent of relay/CA health. Unknown metrics and
+  unsupported inode probes remain explicit. Full status encoding fits 4 KiB;
+  a minimal unavailable frame fits main's 2 KiB framing turn. Runtime
+  sink/rotation, cached publication, synchronized aggregation and rate-limited
+  fallback remain M19.
 
 All parts gate M04 consumers. Individual helper modules are not a running
 allocator, scheduler, admission coordinator or service.

@@ -647,8 +647,9 @@ record and retry locally. Explicit deletion/retention operations reclaim data.
 ## 12. Logs and observability
 
 [OBSERVABILITY.md](OBSERVABILITY.md) specifies the implemented M04d1 event
-and explicit inspection encoders. Runtime queueing, status aggregation and
-file output remain separate increments.
+and explicit inspection encoders and M04d2 fixed event queue/loss counters
+and bounded status snapshots. Runtime synchronization, status aggregation
+and file output remain M19.
 
 Emit versioned JSON Lines with bounded event sizes, fixed event codes, severity,
 UTC time, process boot ID, config generation, connection/request ID, transaction
@@ -667,7 +668,9 @@ Expose counters for accepted/refused mail, TLS/plain sessions, active slots,
 limit refusals, queue age/depth, unknown outcomes, disk headroom, dropped logs,
 index lag, authentication failures and certificate expiry/renewal. `status`
 distinguishes serving, degraded, recovering and refusing mutations. Readiness
-depends on local storage/config/listeners, not a healthy smart host or CA.
+requires valid local configuration, usable storage, configured listeners,
+an open writer admission gate and completed recovery. Smart-host or CA health
+does not determine readiness.
 Agent-facing output clearly separates facts, recommended actions, and untrusted
 data. No API executes instructions obtained from messages or logs.
 
