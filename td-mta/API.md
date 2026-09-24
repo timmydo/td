@@ -318,6 +318,46 @@ Unchanged visible identities produce the same digest. Identity/changes with
 the exact current token returns an empty change result; any other string
 returns cannotCalculateChanges. Identity/set is read-only with normal
 preconditions/notFound and forbidden errors. Restore still changes its epoch.
+`config::identity` implements the canonical preimage encoder. Its borrowed
+`Identity`/`Address` values preserve visible strings and ordered arrays exactly;
+the caller materializes defaults and supplies identities in strictly ascending
+raw-ID order. Duplicate or descending IDs fail. V1 `mayDelete` is encoded as
+false, with no caller override. The codec does not validate mailbox syntax,
+authorize From addresses, bind an account, load files or publish a state token.
+Empty snapshots are encodable for the empty digest oracle; service-required
+identity declarations belong to the full configuration schema.
+
+Representation ceilings are 64 identities, 16 addresses per replyTo/bcc array,
+4096 UTF-8 bytes per name, 254 bytes per email, and 16384 bytes per signature.
+The configuration line parser still caps decoded strings at 4096 bytes;
+M04b2c2 must define bounded signature-file references for larger/multiline
+values, with protected-file validation in M04b3/M05. This encoder provides no
+way around that input grammar.
+The total encoded preimage is at most 192 KiB, including prefixes/counts. These
+are simultaneous upper bounds, not a guarantee that every maximum combination
+fits. Text borrows the snapshot's existing non-routing text region; the encoder
+reserves no additional arena. The future loader must also fit identity
+metadata and every other non-routing value inside RESOURCES.md's snapshot.
+
+`encoded_len` validates all representation bounds and ordering. `write_preimage`
+performs that complete check before any sink call, then streams the encoding
+without heap allocation or a full preimage copy. Length prefixes use UTF-8 byte
+counts. Null arrays and empty arrays, and null address names and empty names,
+remain distinct. A sink failure ends emission immediately; its partial digest
+or output must be discarded, with no state publication. The trusted sink owns
+its own allocation/failure behavior. Sink calls never contain empty slices.
+Default error Display/Debug and value Debug do not expose identity text; typed
+sink errors remain accessible through the enum and error source, whose
+explicit inspection is the trusted caller's responsibility. Validation reports
+the first refusal in encoding traversal order; no cross-field diagnostic
+precedence is promised. M07 owns hashing with the
+real provider, and M15 owns state-token publication from a pinned snapshot.
+
+Stable representation codes are `identity_preimage_count`,
+`identity_preimage_address_count`, `identity_preimage_text_limit`,
+`identity_preimage_size_limit` and `identity_preimage_order`. They identify
+codec refusals; the schema/CLI must supply configuration source locations.
+
 Identity digest oracles (literal preimages; M07 verifies with the real
 provider, M04 verifies the canonical encoder):
 

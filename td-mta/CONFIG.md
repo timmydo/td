@@ -6,7 +6,7 @@ This document owns the configuration syntax. `config::syntax` implements
 bounded framing and statement decoding only. The resource stanza schema below
 additionally builds checked resource plans. The other typed fields, snapshot
 builder, reference validation, protected file access, effective output, and
-CLI remain M04b2c/M04b3/M05/M19 work as assigned in IMPLEMENTATION.md.
+CLI remain M04b2c2/M04b3/M05/M19 work as assigned in IMPLEMENTATION.md.
 A syntactically accepted statement is not a valid service configuration.
 DESIGN.md §6 owns the administration contract; RESOURCES.md owns the aggregate
 memory budget.
@@ -257,7 +257,7 @@ remains unimplemented.
 
 M04b2b implements a typed routing candidate and immutable lookup view in
 `config::routing`. It does not implement the whole stanza dispatcher, SMTP
-commands, live reload, authentication or mailbox creation. M04b2c must bind
+commands, live reload, authentication or mailbox creation. M04b2c2 must bind
 these target routing stanzas to that candidate:
 
 ```text
@@ -272,7 +272,7 @@ of mail paths. The sole account stanza declares its stable ID. Domain labels
 are served DNS names; alias labels are full addresses, and each alias requires
 exactly one `account` assignment. No folder/forwarding/catch-all fields exist.
 The outer schema rejects absent labels, duplicate or unknown fields and any
-second account stanza. Other account/identity fields belong to M04b2c; these
+second account stanza. Other account/identity fields belong to M04b2c2; these
 examples are a routing fragment, not a complete runnable configuration.
 The helper accepts typed AccountId values and does not parse those labels.
 
@@ -395,3 +395,12 @@ Stable routing codes are `config_route_capacity`, `config_route_invalid_domain`,
 `config_route_duplicate_domain`, `config_route_duplicate_alias`,
 `config_route_unknown_domain`, `config_route_unknown_account`, and
 `config_route_invariant`.
+
+## Visible identity preimages
+
+`config::identity` supplies the bounded canonical encoder specified in
+[API.md](API.md), preserving all visible identity properties for the eventual
+configuration fingerprint. It borrows validated text and requires sorted,
+unique identity IDs. This helper does not bind identity stanzas, materialize
+defaults, authorize sending or hash/publish state. The complete schema loader
+remains M04b2c2; the crypto provider and JMAP integration remain M07/M15.
