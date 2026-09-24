@@ -230,7 +230,7 @@ concrete structures require a ledger amendment before admission is enabled.
 | Read cursor/value, 128 KiB/view | 64 KiB value; 1 KiB key; 63 KiB cursors, history streaming, sparse-index lookups and checksums |
 | Outbound scratch, 128 KiB | 64 KiB body transfer; 16 KiB reply assembly; 16 KiB SMTP/TLS handoff state; 32 KiB frame-planning/ID/diagnostic scratch |
 | DNS/control, 512 KiB | 128 KiB resolver + 384 KiB control as detailed below |
-| Log, 128 KiB | 96 KiB queued fixed events; 16 KiB encoder/output; 16 KiB rotation/drop counters and emergency status |
+| Log, 128 KiB | 384 queued fixed event cells of at most 256 bytes (96 KiB); 16 KiB encoder/output; 16 KiB rotation/drop counters and emergency status |
 | Cold reload, 2 MiB | Two immutable configuration snapshots of at most 1 MiB each, including referenced credential data; reject a third live generation |
 
 The resolver's 128 KiB includes 128 cache entries of at most 384 bytes
@@ -418,3 +418,16 @@ memory, expansion beyond the default budget, and streaming quotas independent
 of resident reservations. No claim about runtime allocation count, TLS or RSS
 is made by these tests. Both host and sandbox cargo rosters discover the
 standalone crate from its manifest; no manual crate list is needed.
+
+## Diagnostic encoding bounds
+
+M04d1's `observability::Event` holds fixed typed fields with no heap or borrowed
+peer text. Its actual `Option<Event>` layout fits each planned 256-byte queue
+cell; tests pin this ceiling. Event JSON Lines fit 1024 bytes. Explicit
+authorized inspection borrows at most 256 UTF-8 source bytes and emits at most
+4096 bytes, including worst-case escaping and its envelope. Events use the
+existing 16 KiB log output partition; inspection uses 4 KiB of the separate
+64 KiB administrative output region, never the log buffer or event queue.
+Both append complete records atomically. These
+encoders do not allocate the planned queue or implement the runtime log sink;
+[OBSERVABILITY.md](OBSERVABILITY.md) defines their schema and disclosure limits.

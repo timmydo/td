@@ -44,7 +44,8 @@ macro_rules! object_ids {
         pub struct $name([u8; 16]);
 
         impl $name {
-            /// The entropy adapter and exclusive publication check own generation.
+            /// The entropy adapter owns generation; persisted objects also need
+            /// the store's exclusive publication check.
             pub const fn from_bytes(bytes: [u8; 16]) -> Self { Self(bytes) }
 
             pub const fn as_bytes(&self) -> &[u8; 16] { &self.0 }
@@ -74,7 +75,8 @@ object_ids!(
     IdentityId,
     DeviceId,
     StoreEpoch,
-    InstanceId
+    InstanceId,
+    BootId
 );
 
 /// Carries scope across internal APIs; callers must still check authorization.

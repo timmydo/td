@@ -201,7 +201,7 @@ A clean fixture builds without undeclared ambient host toolchain inputs.
 
 ## M04 — Bounded primitives, configuration, and event records
 
-**Depends on:** M02. **Own:** `bounded`, `ownership`, `config`, `event`,
+**Depends on:** M02. **Own:** `bounded`, `ownership`, `config`, `observability`,
 `limits` and `admission` modules.
 
 Split at these concrete boundaries before dependent milestones start:
@@ -249,7 +249,12 @@ Split at these concrete boundaries before dependent milestones start:
   of client lease saturation. Partial/unselected output keeps its charges. M05
   supplies descriptor-backed probes and cleanup proof; M08 owns persistence,
   exact metadata state and view/writer pin authority.
-- **M04d:** typed bounded event/status records, escaping and redaction.
+- **M04d1:** implemented typed bounded event and explicit inspection encoders
+  in `observability.rs`, including stable JSON Lines fields, redaction by
+  default event shape, bounded UTF-8 truncation and ASCII JSON escaping.
+  [OBSERVABILITY.md](OBSERVABILITY.md) owns the versioned record schema.
+- **M04d2:** bounded event queue, suppression counters and typed health/status
+  snapshots; runtime sink/rotation and aggregation remain M19.
 
 All parts gate M04 consumers. Individual helper modules are not a running
 allocator, scheduler, admission coordinator or service.

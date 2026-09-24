@@ -646,6 +646,10 @@ record and retry locally. Explicit deletion/retention operations reclaim data.
 
 ## 12. Logs and observability
 
+[OBSERVABILITY.md](OBSERVABILITY.md) specifies the implemented M04d1 event
+and explicit inspection encoders. Runtime queueing, status aggregation and
+file output remain separate increments.
+
 Emit versioned JSON Lines with bounded event sizes, fixed event codes, severity,
 UTC time, process boot ID, config generation, connection/request ID, transaction
 sequence and submission ID when relevant. Escape/control-character encode all
