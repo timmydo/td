@@ -210,9 +210,18 @@ Split at these concrete boundaries before dependent milestones start:
   formatting in `bounded.rs`; fixed capacity and explicit work/ownership.
 - **M04a2:** `ownership.rs` fixed queues and checked reusable slots, including
   stale completions, cross-pool tokens, saturation and generation exhaustion.
-- **M04b:** stanza grammar, immutable configuration, alias/identity resolution,
-  secret-file references and redacted effective output, using the committed
-  buffer APIs.
+- **M04b1:** implemented bounded physical-line framing and literal stanza
+  syntax in `config/syntax.rs`; [CONFIG.md](CONFIG.md) owns the grammar,
+  limits and redacted diagnostics. This accepts statements, not effective
+  configurations. No file access or schema validation is implemented.
+- **M04b2:** freeze typed field schema/defaults and descriptor ceilings in
+  CONFIG.md; build immutable candidates in the two bounded snapshots, reject
+  duplicate/unknown fields, resolve account/domain/alias/identity references,
+  and validate the committed resource plan.
+- **M04b3:** protected-file reference requirements and redacted effective
+  configuration library output. Actual trusted file opening and permission
+  evidence use M05 adapters; no successful full `config check` before that
+  integration. M19 owns atomic runtime generation publication.
 - **M04c1:** checked u64 disk/work settings and capacity-derived maintenance
   validation in `admission.rs`; configuration uses this committed plan.
 - **M04c2:** charged work meters in `admission/work.rs` and checked
@@ -264,7 +273,7 @@ Split at these concrete boundaries before dependent milestones start:
 All parts gate M04 consumers. Individual helper modules are not a running
 allocator, scheduler, admission coordinator or service.
 Checked local/wire identifiers already exist from M01/M02; M04a2 owns the
-additional runtime slot tokens, and M04b validates configured references.
+additional runtime slot tokens, and M04b2 validates configured references.
 
 Implement reusable buffers/arenas, bounded formatting, fixed-capacity queues,
 and checked identifiers. Implement the documented stanza grammar, immutable

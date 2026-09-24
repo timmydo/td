@@ -342,6 +342,8 @@ files but is not advertised as general TOML. Reject duplicate/unknown keys,
 invalid UTF-8, embedded NUL, conflicting aliases, dangling account references,
 and incompatible listener policies. No includes, environment expansion, shell
 evaluation, arbitrary hooks, or network-loaded configuration.
+[CONFIG.md](CONFIG.md) specifies the implemented bounded syntax foundation;
+typed schema, complete candidate validation and command wiring remain planned.
 
 Separate operator configuration (`/etc/td-mta/`) from service-managed data
 (`/var/lib/td-mta/`), runtime control (`/run/td-mta/`), and logs

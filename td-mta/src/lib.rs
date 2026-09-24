@@ -3,6 +3,7 @@
 
 pub mod admission;
 pub mod bounded;
+pub mod config;
 pub mod format;
 pub mod ids;
 pub mod limits;
