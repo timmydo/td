@@ -277,10 +277,13 @@ Split at these concrete boundaries before dependent milestones start:
     records. Inline metadata fits 1 KiB of global settings/headroom, with no
     extra text arena. File loading, DNS, authentication and TLS remain later
     integrations; stanza dispatch/EOF remain d.
-  - **M04b2c3c2:** bounded gateway/prefix records: unique profiles, private CA
-    paths, current/next leaf pins, ordered forward peer rows, binary duplicate
-    rejection and per-policy/global prefix ceilings. Preserve staged policies;
-    c4 verifies consumers. No TLS peer authorization before M07/M12.
+  - **M04b2c3c2:** implemented `config/gateway.rs`: unique profile records,
+    private CA paths, strict current/next leaf pins, ordered forward peer rows,
+    binary duplicate rejection and per-policy/global prefix ceilings. Caller
+    cells fit the existing 4 KiB gateway and 4 KiB prefix reservations. Owner
+    checks and sticky failure protect live/frozen views and reused backing.
+    Staged policies may have no peers; c4 validates consumers and requires peers
+    for used gateways. No TLS peer authorization before M07/M12.
   - **M04b2c3c3:** bounded certificate profiles and ACME settings: strict
     mode-specific fields, explicit terms acceptance, protected material paths,
     directory origin/contact validation. Provider verification remains M03/M07;

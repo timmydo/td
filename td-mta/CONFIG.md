@@ -809,3 +809,51 @@ coordinates; these typed helpers receive stanza locations. Inputs, builders,
 records and views redact Debug output. Explicit accessors expose data only to
 trusted callers. No helper reads a protected file, resolves DNS, authenticates
 to a relay or verifies a TLS peer; these records are structural candidates.
+
+
+## Structural gateway policy records
+
+M04b2c3c2 implements `config::gateway`, using at most 16 caller-owned gateway
+cells of 256 bytes and 128 peer-prefix cells of 32 bytes, within the existing
+4 KiB reservations for each. Compile-time layout checks enforce those ceilings.
+Smaller regions, including zero cells for a configuration with no gateways,
+are accepted; overflow refuses without growing either region. Text uses the
+existing non-routing arena. The builder interns at most 16 profile names,
+including forward peer targets, and retains first-reference/declaration
+coordinates. Each newly interned cell is fully initialized for this build;
+only used prefixes are readable when storage is reused.
+
+Complete gateway inputs validate the lexical private-CA path and current leaf
+SHA-256 pin, plus an optional different rotation pin. Pins decode exactly 64
+lowercase hexadecimal characters into 32 bytes; their type does not assert
+that any certificate has been hashed or verified. No protected file is opened.
+Profile names are stored once. Each gateway retains at most eight indices into
+the common prefix table, preserving peer stanza order and gateway association.
+CIDRs use the shared binary prefix parser; equivalent IPv6 spellings within a
+policy are duplicates with both coordinates. Overlapping prefixes are allowed,
+and different policies may use the same prefix. Unused peer-index entries hold
+an out-of-range sentinel, so an internal count error cannot silently select
+another policy's first prefix. Public access still checks the used count.
+
+Finalization rejects any undeclared forward target. Declared, unused policies
+may have no peers; the listener graph in M04b2c3c4 must require at least one
+peer for each consumed gateway. Indexed gateway/peer access is checked and
+returns no item past the used prefix. Neither pin equality nor prefix
+membership creates gateway authority: current configured policy, private
+chain trust, validity, client-auth usage and leaf-pin verification are all
+required by M07/M12 before a verified gateway identity exists.
+
+Mutations bind to the shared text owner, and immutable live/frozen views
+require that same owner. Each compact text read rechecks it. Any mutation
+failure is sticky, including partial text exhaustion; subsequent calls and
+finalization return the first error. Profile syntax is checked first, then a
+repeated gateway declaration, then its fields. Peer input checks the profile
+before the CIDR. Duplicate-prefix checks precede capacity checks to retain the
+previous entry's coordinate even when a table is full. A new forward target
+may consume its bounded name/cell before discovering peer capacity exhaustion;
+the entire failed candidate must be discarded. Fixed `config_gateway_` codes carry
+coordinates, duplicate prior coordinates and no input bytes, with an empty
+source chain. Inputs/builders/records/views and pins redact Debug output;
+explicit accessors are trusted data. Backing bytes are not scrubbed. Whole
+stanza dispatch, field diagnostics, EOF, protected inputs and runtime
+publication remain later milestones.

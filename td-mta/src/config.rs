@@ -1,5 +1,6 @@
 //! Configuration foundations. Syntax alone is not an effective configuration.
 pub mod endpoint;
+pub mod gateway;
 pub mod identities;
 pub mod identity;
 pub mod outbound;
