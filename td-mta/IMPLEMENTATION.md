@@ -306,19 +306,33 @@ Split at these concrete boundaries before dependent milestones start:
     deduplicated names share non-routing text. Tests exercise direct, gateway,
     combined and fixture ingress entirely offline. No provider or network
     authority; whole-file dispatch and actual EOF remain d.
-  - **M04b2c3d:** single whole-loader entry point owning its candidate and reader
-    operation. Require root version, actual EOF, all mandatory sections and
-    resource plans. Hold one pending stanza in SCHEMA.md's shared 13 KiB
-    variant reservation; measure all concurrent state within the 36 KiB builder
-    workspace. Avoid a whole-file AST or duplicate alias arena. Return only a structural candidate, with no runtime
-    authority. Before constructing certificate typed inputs, reject missing
-    chain/key fields in files mode and either supplied path in ACME mode,
-    using CONFIG.md's fixed required/forbidden codes. Test both modes against
-    every presence combination, plus complete fixtures, every
-    unknown/duplicate/type/missing/forbidden refusal, late read/handler failure,
-    exhausted text/descriptors and unchanged
+  - **M04b2c3d1:** implemented `config/globals.rs`: server planning flag and
+    explicit numeric address hints, lexical disjoint roots/defaults and fixed
+    logging severity. Inline metadata and owner-bound path references fit
+    existing workspace/headroom. Hostname/origin staging, raw stanza validation
+    and whole-file EOF remain the dispatcher; no files or network operations.
+  - **M04b2c3d2:** bounded stanza dispatcher with strict version, section,
+    label, field, type, duplicate and required/forbidden rules. Reject duplicate
+    singleton headers before any field staging, including hostname/origin.
+    Reuse one pending variant within SCHEMA.md's 13 KiB reservation; avoid
+    a whole-file AST or duplicate alias arena. Before typed certificate
+    conversion, enforce CONFIG.md's files-mode required chain/key and
+    ACME-mode forbidden chain/key codes. Test the full presence matrix for
+    both modes and every unknown/duplicate/type/missing/forbidden refusal.
+  - **M04b2c3d3:** private owned candidate storage and sealed table headers.
+    Consume borrowed builders before moving their enclosing storage; keep
+    backing tables, used prefixes and text owner together. No public loose
+    rebinding, self-reference, extra snapshot copy or unsafe conversion.
+    Prove every concrete snapshot partition fits its existing reservation.
+  - **M04b2c3d4:** integrate d1-d3 in one whole-loader entry point owning its
+    candidate and reader operation. Drive the d2 version/stanza rules through
+    actual EOF, require all mandatory sections, and finalize resource plans
+    and references. Measure all concurrent pending/global/builder state within
+    the 36 KiB workspace. Return only a structural candidate, with no runtime
+    authority. Test complete source fixtures and integrated schema refusals,
+    late read/handler failures, exhausted text/descriptors and unchanged
     caller-held prior validated configuration; M19 tests active generations.
-    Concrete size checks must fit all snapshot/scratch partitions before M04b3/M19 consume the candidate.
+    All combined snapshot/scratch proofs precede M04b3/M19 consumption.
 - **M04b3:** protected-file reference requirements and redacted effective
   configuration library output. Actual trusted file opening and permission
   evidence use M05 adapters; no successful full `config check` before that

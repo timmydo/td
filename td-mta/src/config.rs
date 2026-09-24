@@ -2,6 +2,7 @@
 pub mod certificate;
 pub mod endpoint;
 pub mod gateway;
+pub mod globals;
 pub mod graph;
 pub mod identities;
 pub mod identity;

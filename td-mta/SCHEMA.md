@@ -85,6 +85,12 @@ omitted when all its fields have defaults.
 | `public_ipv4` | IP text, absent | Optional IPv4 address for `dns-plan`; never infer it from a wildcard/private bind |
 | `public_ipv6` | IP text, absent | Optional IPv6 address for `dns-plan` |
 
+Public address hints must be numeric values of the stated family. Reject
+unspecified/multicast values, IPv4 limited broadcast, IPv4-mapped IPv6 and
+obsolete IPv4-compatible IPv6; retain IPv6 loopback ::1. Private and loopback
+addresses are allowed for explicit fixtures. These checks do not prove
+public routing or DNS ownership.
+
 The public address fields do not bind sockets or configure interfaces. Missing
 addresses make `dns-plan` report missing address inputs, not invent records or
 perform a network lookup. Outbound source-address selection remains the OS's
@@ -523,6 +529,12 @@ scratch within the existing control-worker stack allowance. The whole
 loader stages at most 258 raw origin bytes plus its source coordinate in
 builder workspace until binding stores the canonical origin. Concrete
 combined layout and peak stack checks remain required before publication.
+
+Global options and lexical-root records fit 128 bytes of global headroom;
+their builder fits 256 bytes of existing workspace. Numeric address hints,
+flags and severity are inline, while roots use shared non-routing text.
+Hostname and origin are staged separately for their existing single
+canonical copies in domain-policy and graph records.
 
 The loader owns one pending stanza within that same 36 KiB builder
 workspace. Reserve 13 KiB for the largest pending variant, including text

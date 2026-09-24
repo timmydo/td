@@ -1048,3 +1048,61 @@ coordinates, with a related-setting coordinate where applicable. Display,
 Debug and the empty error-source chain reveal no operator values; trusted
 accessors expose settings explicitly. The whole dispatcher supplies any
 additional static stanza/field context from those coordinates.
+
+
+## Global options and lexical roots
+
+M04b2c3d1 implements `config::globals` for the remaining typed global
+options. Its server input carries online-background planning and optional
+IPv4/IPv6 publication hints. The whole dispatcher separately requires and
+stages hostname and JMAP origin for their single canonical copies in the
+domain-policy and graph records. A successful global-options helper alone
+therefore does not establish a complete server stanza, EOF or configuration.
+
+Online-background defaults true and selects the existing OnlineBackground
+plan; false selects ForegroundOnly. Numeric address hints are parsed in
+their requested family, bounded to 15 IPv4 or 45 IPv6 source bytes. Reject
+hostnames, zones, brackets and socket-address syntax. Preserve the binary
+address without DNS discovery, public-reachability inference or interface
+configuration. Reject unspecified and multicast addresses, IPv4 limited
+broadcast, mapped IPv6 and obsolete IPv4-compatible IPv6 spellings. Private
+and loopback addresses remain allowed for explicit fixtures, including ::1;
+acceptance does not prove public reachability. Destination and bind helpers
+retain their own role-specific rules.
+
+Roots default to `/var/lib/td-mta`, `/run/td-mta` and `/var/log/td-mta`.
+Each supplied path receives lexical validation, then all three pairs must
+be disjoint by slash-delimited components. Equality, either nesting
+direction and root `/` overlap fail; `/data` and `/data-other` do not overlap.
+Validate every root and all pairs before appending any path. When only one
+side of an overlap is supplied, identify that operator field and name the
+default root as the related field; when both are supplied, use the fixed
+runtime/data, logs/data, logs/runtime pair order. Defaults are
+applied only to omitted fields, never to invalid supplied text. They are
+appended once when an explicit paths stanza completes or, for an absent
+stanza, at finalization. Trusted ancestor and resolved-descriptor checks
+remain M05. No path is opened here.
+
+Logging accepts only `info`, `warning` or `error`, defaulting to Info. The
+helper accepts an omitted severity for an explicit empty logging section,
+retaining its coordinate and duplicate detection. One default constant is
+used for absent sections and omitted fields. No raw input or credential
+logging switch is introduced. Within this helper, singleton duplication
+precedes its own field parsing and retains both declaration coordinates.
+The whole dispatcher must reject duplicate singleton headers before staging
+any fields, especially hostname/origin, and owns unknown fields, repeated
+fields, labels, types and all mandatory server fields. Finalization requires
+the server-options input and installs absent path/logging defaults.
+
+All path bytes use the shared non-routing arena; a builder fits 256 bytes
+of existing workspace, and records fit 128 bytes of global headroom.
+Compile-time guards enforce those ceilings. Server flags, numeric hints,
+severity and coordinates are inline. Paths retain compact owner-checked
+references. Every mutation verifies the arena owner and makes its first
+error sticky; consuming finalization refuses that error. Partial text
+exhaustion can charge earlier roots but cannot return records. Live/frozen
+views accept only the matching owner and check each compact read again.
+Fixed `config_globals_` errors retain only static field names, a related
+root field for overlap and source coordinates, with an empty source chain.
+Inputs, settings, builders and views redact Debug output. Trusted accessors
+expose values explicitly; nothing grants file or publication authority.
