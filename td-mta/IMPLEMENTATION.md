@@ -227,11 +227,18 @@ Split at these concrete boundaries before dependent milestones start:
   frames, dedicated append tickets and simulated writer-barrier transitions.
   Rollover preserves outstanding leases and stays closed for physical admission.
   M08 supplies trusted selected/committed state and exact metadata accounting.
-- **M04c3b3:** fresh filesystem probe matching and atomic physical/logical
-  reservation/effect accounting using the preceding helpers. Building
-  checkpoints transfer protected capacity without double charging; admission
-  stays closed until a fresh probe supports the next checkpoint. M05 supplies
-  descriptor-backed probes and cleanup proof; M08 owns persistence/view pins.
+- **M04c3b3a:** bounded filesystem registry and probe observations consumed
+  once in `admission/filesystems.rs`; adapter identity and actual probes remain M05.
+  This matches probe data without installing any physical reservation.
+- **M04c3b3b:** compose writer preparation with same-cell physical reservations,
+  fresh probe assessment, checked extensions and atomic effect/cancel updates.
+  Every filesystem delta is prevalidated before any logical installation.
+  Existing leases remain bounded by 64 combined 128-byte records.
+- **M04c3b3c:** transfer protected checkpoint capacity to building reservations
+  without double charging, account overlapping checkpoint quota, and keep
+  admission closed until a fresh probe protects the next checkpoint. M05
+  supplies descriptor-backed probes and cleanup proof; M08 owns persistence,
+  exact metadata state and view/writer pin authority.
 - **M04d:** typed bounded event/status records, escaping and redaction.
 
 All parts gate M04 consumers. Individual helper modules are not a running

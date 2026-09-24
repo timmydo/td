@@ -293,8 +293,10 @@ materialize one lookup key at a time within existing parser/read scratch.
 The 128 KiB queue/state reservation has eight 64-entry input queues and one
 512-entry completion queue, all with 32-byte entries (32 KiB total), a
 128-entry due-recipient window with 128-byte entries (16 KiB), 64 reservation
-records with 128-byte entries (8 KiB), and a remaining 72 KiB for timers,
-slot generations, bounded generation pins, queue heads and counters. A
+records with 128-byte entries (8 KiB), sixteen filesystem records including
+slot generations at no more than 128 bytes each (2 KiB), and a remaining
+70 KiB for timers, other pools' slot generations, bounded generation pins,
+queue heads and counters. A
 reservation record stores references/charges; it does not embed a frame.
 The window can be refilled from the disk due-time index, never from a full
 in-memory queue. Scratch/queue bounds apply even with configured larger pools.
@@ -344,6 +346,14 @@ growth. Its checkpoint barrier preserves pending frame ownership and does
 not reopen on selection. M04c3b3 still owns atomic physical coupling, transfer
 of checkpoint capacity and probe identity/freshness. M05/M08 own actual
 written/orphan cleanup, writer/view locking and publication authority.
+
+M04c3b3a's filesystem table borrows its backing cells and SlotStates from
+that 2 KiB partition; saturation refuses without allocation. Probe tickets
+and observations live in caller-owned job scratch, not the 32-byte queue
+entry itself. Queue entries carry references to owned job payloads. Matching
+an observation grants no capacity. Counter changes in its unit tests are
+injected fixture state; the runtime counter transitions arrive with physical
+coupling in M04c3b3b/M04c3b3c.
 
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
 buffers and atomic text formatting. They neither allocate backing storage nor

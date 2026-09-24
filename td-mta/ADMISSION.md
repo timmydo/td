@@ -12,8 +12,10 @@ supplies pure physical-space arithmetic in `src/admission/space.rs`. M04c3b1
 supplies fixed logical leases and linear effect tickets in
 `src/admission/logical.rs`, using `src/admission/quota.rs`. M04c3b2 supplies
 the scalar writer/checkpoint ledger in `src/admission/writer.rs`. M04c3b3
-owns the composed physical reservation coordinator. M05/M08 supply physical
-probes, persistence and maintenance.
+owns the composed physical reservation coordinator. Its first increment,
+M04c3b3a, supplies bounded filesystem registration and linear probe matching
+in `src/admission/filesystems.rs`. M05/M08 supply physical probes, persistence
+and maintenance.
 M13 owns request retention. No running admission coordinator or filesystem
 probe is claimed.
 
@@ -327,6 +329,59 @@ An online backup writes to an explicitly chosen external destination, with
 independent free-space checks and a bounded output reservation. Its output is
 outside store quotas; source generation/body pins still count normally. Do not
 create a backup hardlink farm or silently use the active store as its target.
+
+### Filesystem registration and probe matching
+
+M04c3b3a keeps at most sixteen caller-backed filesystem entries. All configured
+namespaces sharing available-space capacity must receive the same BackingKey
+from the trusted adapter and use the same registered FilesystemId. Duplicate
+keys reuse a slot; an inconsistent allocation unit refuses. The key is an
+adapter-assigned value, not a pathname or a promise that a kernel device number
+alone identifies shared capacity. M05 must establish it from pinned descriptors
+and account for mount aliases. No actual identity discovery happens here.
+Registration uses checked process-wide slot generations, so a retired,
+reconstructed or foreign registry's identifier cannot authorize a new entry.
+
+The registry captures monotonic completed growth before a worker begins the
+probe, retaining its start Tick as well as its deadline. A non-Clone ProbeTicket
+becomes a non-Clone Observation only after a
+successful adapter result with a nonzero allocation unit. Failed probes produce
+no observation. Multiple probes can overlap and finish out of order; no
+latest-only serial rejects an otherwise valid earlier sample. The consumer
+removes an observation from its caller-owned Option on every attempt, including
+refusal. It matches the live filesystem identifier, deadline and pinned unit,
+and refuses regressed completed byte or inode counters. Deadline equality is
+expired, and a current Tick before the captured start is invalid. Unsupported
+inode reporting remains explicit in the sample. The composed coordinator must
+clamp the probe window to `admission_wait_seconds` and the enclosing deadline;
+an arbitrary request deadline is not a probe freshness bound.
+
+A CheckedSample retains identity, start/deadline, captured counters and sample. It
+is matched data, never a lease or I/O permission. The composed atomic grant
+must consume it by value and recheck its identity, deadline, allocation unit
+and counter ordering under the same exclusive coordinator state that installs
+the reservation. Checkpoint reopening requires a probe begun after selection,
+with an ordering fence owned by the barrier; equal millisecond Tick values alone
+cannot establish that order. M04c3b3c must implement that fence rather than
+reuse a pre-selection sample with an unexpired request deadline.
+Precompute every filesystem counter/reference update before
+installing lease cells; publish those updates infallibly only after successful
+logical installation. Failed multi-filesystem grants discard all their samples.
+No public counter-mutation or admission operation is supplied by this increment.
+
+Filesystem retirement refuses pending growth, protected checkpoint capacity
+or any live lease reference, including a lease with zero physical growth.
+Outstanding probes own no capacity; retiring/re-registering makes their old
+identifiers stale. Completed counters may reset only with that new identity
+and a fresh probe. M05's owner detaches every configured path alias before
+retiring their shared entry; registration does not count path attachments.
+Dropping the registry leaves occupied cells and prevents accidental table reuse.
+An orderly reset reconciles effects through the live coordinator before drop.
+An abandoned coordinator requires full store reconciliation under LOCK before
+fresh bookkeeping is constructed; inspecting or blindly clearing old cells is
+not reconciliation. The guard is not an integrity boundary against the trusted
+backing-memory owner.
+Unexpected post-acquisition bookkeeping failures poison the registry.
 
 ## 3. Work budgets and deadlines
 
@@ -706,6 +761,13 @@ accounting tests, not filesystem publication or view-pin evidence. Additional
 cases pin append-ticket replay, one successful transaction per frame lease,
 barrier expiry handling, stopped completion handling, dropped/uncertain
 barriers, committed-only selection bounds and exact closed-quota fits.
+
+M04c3b3a tests cover registry/constructor bounds, occupied state, reconstruction,
+poisoned refusal, alias deduplication, stale/foreign identity, single observation
+consumption, overlapping probes, start/deadline metadata and both counter
+regressions. Counter changes are injected fixture state to exercise retirement
+and probe matching. These tests perform no filesystem syscall, real identity
+derivation, live growth accounting or atomic physical/logical grant.
 
 M04/M05/M08/M13 add tests at their real execution boundaries, not document-only
 assertions: concurrent quota reservations cannot overbook; failed publications

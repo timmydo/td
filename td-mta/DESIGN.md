@@ -27,7 +27,8 @@ capacity requirements and supplies charged work meters, timer budgets and
 physical-space arithmetic for injected probe samples. Fixed logical leases
 add grouped quota checks and effect tickets. The scalar writer ledger derives
 checkpoint needs from that same quota ledger and models a closed writer
-barrier; physical coupling remains M04c3b3 work.
+barrier. A bounded filesystem registry matches linear probe observations;
+physical coupling remains M04c3b3b/M04c3b3c work.
 They do not instantiate service pools, coordinate live disk reservations or
 implement protocol handlers.
 
