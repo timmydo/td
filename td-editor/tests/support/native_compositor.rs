@@ -1991,19 +1991,9 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
     let collapsed = format!("1,{source_revision},0,1,1,1,0,72,0,lf");
     source.wait_field("state", "tab", &collapsed);
-    let empty_copy = td_editor::control::hex(b"Nothing selected to copy.");
-    assert_ne!(
-        field(&source.ok("prompt-state"), "notice"),
-        Some(empty_copy.as_str())
-    );
-    copy_clipboard_text(&mut compositor, profile);
-    source.wait_field("prompt-state", "notice", &empty_copy);
-    source.wait_field("state", "tab", &collapsed);
-    source.wait_tab(source_revision, "b");
-    assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
     source.wait_field("clipboard-state", "device", "1");
     source.wait_field("clipboard-state", "source-bytes", &text.len().to_string());
-    // The destination must still receive the original offer, not empty text.
+    // The destination must still receive the immutable original offer.
     // Reveal tiling before mapping the destination. The reply fences the
     // compositor layout change; no intermediate source frame is sampled.
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");

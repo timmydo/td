@@ -2926,6 +2926,10 @@ impl Window {
         };
         let doc = self.ui.editor().document(tab).map_err(error)?;
         let (undo, redo) = doc.history_depth();
+        let can_copy = self.client.input().focused
+            && self.client.clipboard()
+            && self.clipboard.outgoing.is_none()
+            && crate::clipboard::capture_range(doc).is_ok_and(|range| !range.is_empty());
         let data = crate::menu::Data {
             target: Target {
                 tab,
@@ -2950,10 +2954,8 @@ impl Window {
             auto_fill: doc.auto_fill(),
             wrap: self.ui.tab_view(tab).map_err(error)?.soft_wrap,
             line_numbers: self.ui.line_numbers(),
-            copy: self.client.input().focused
-                && self.client.clipboard()
-                && self.clipboard.outgoing.is_none()
-                && !doc.selection().range().is_empty(),
+            cut: !doc.viewing() && can_copy,
+            copy: can_copy,
             copy_path: self.client.input().focused
                 && self.client.clipboard()
                 && self.clipboard.outgoing.is_none()
@@ -4818,25 +4820,40 @@ impl Window {
             self.notify("Full file path offered to clipboard.");
             return Ok(());
         }
+        if name == "cut"
+            && self.ui.editor().revision_point(tab, revision).is_ok()
+            && self.ui.editor().document(tab).is_ok_and(|doc| doc.viewing())
+        {
+            self.notify("Cut unavailable in this view.");
+            return Ok(());
+        }
         let snapshot = match crate::clipboard::Snapshot::capture(self.ui.editor(), tab, revision) {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => {
-                self.notify("Nothing selected to copy.");
+                self.notify(if name == "cut" {
+                    "Nothing to cut."
+                } else {
+                    "Nothing to copy."
+                });
                 return Ok(());
             }
             Err(e) => {
-                self.notify(format!("Copy refused: {e}"));
+                self.notify(format!("{} refused: {e}", if name == "cut" { "Cut" } else { "Copy" }));
                 return Ok(());
             }
         };
         self.offer_clipboard(snapshot.text(), serial)?;
         if name == "cut" {
             match self.ui.dispatch(Event::Cut(snapshot)) {
-                Ok(_) => self.notify("Cut offered to clipboard; Undo restores the selection."),
+                Ok(_) => self.notify("Cut offered to clipboard; Undo restores the text."),
                 Err(e) => self.notify(format!("Copied, but Cut refused: {e}")),
             }
         } else {
-            self.notify("Selection offered to clipboard.");
+            self.notify(if snapshot.whole_line() {
+                "Line offered to clipboard."
+            } else {
+                "Selection offered to clipboard."
+            });
         }
         Ok(())
     }
@@ -6215,6 +6232,34 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_unselected_ctrl_x_cuts_the_whole_line() {
+        let (mut w, peer, keyboard, device) = clipboard_fixture();
+        w.ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 0,
+            command: crate::model::Command::Select(crate::model::Selection::default()),
+        })
+        .unwrap();
+        w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
+        key(&mut w, keyboard, 45);
+        let source = w.client.source().unwrap();
+        assert_eq!(w.clipboard.text.as_deref(), Some("é abc\n"));
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "");
+        assert_eq!(w.ui.editor().document(1).unwrap().history_depth(), (1, 0));
+        assert!(drain(&peer)
+            .0
+            .contains(&message(device, 1, &[source, 1])));
+        w.ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 1,
+            command: crate::model::Command::Undo,
+        })
+        .unwrap();
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
+        assert_eq!(w.ui.editor().document(1).unwrap().selection().caret, 0);
+    }
+
+    #[test]
     fn clipboard_copy_requires_serial_and_optional_global_and_pointer_menu_uses_press() {
         let (mut w, peer, _keyboard, device) = clipboard_fixture();
         w.clipboard_request("cut", 1, 0).unwrap();
@@ -6495,7 +6540,7 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_empty_or_oversized_copy_preserves_the_existing_source() {
+    fn clipboard_line_copy_replaces_source_and_oversized_copy_preserves_it() {
         let (mut w, peer, keyboard, _) = clipboard_fixture();
         w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
         key(&mut w, keyboard, 46);
@@ -6508,8 +6553,41 @@ mod tests {
         })
         .unwrap();
         key(&mut w, keyboard, 46);
-        assert!(w.notice.as_ref().unwrap().contains("Nothing selected"));
-        assert_eq!(w.client.source().unwrap(), source);
+        assert!(w.notice.as_ref().unwrap().contains("Line offered"));
+        let line_source = w.client.source().unwrap();
+        assert_ne!(line_source, source);
+        assert_eq!(w.clipboard.text.as_deref(), Some("é abc\n"));
+        drain(&peer);
+        w.ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 0,
+            command: crate::model::Command::Select(crate::model::Selection {
+                anchor: "é abc\n".len(),
+                caret: "é abc\n".len(),
+            }),
+        })
+        .unwrap();
+        key(&mut w, keyboard, 46);
+        assert!(w.notice.as_ref().unwrap().contains("Nothing to copy"));
+        assert_eq!(w.client.source(), Some(line_source));
+        key(&mut w, keyboard, 45);
+        assert!(w.notice.as_ref().unwrap().contains("Nothing to cut"));
+        assert_eq!(w.client.source(), Some(line_source));
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
+        assert!(drain(&peer).0.is_empty());
+        w.ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 0,
+            command: crate::model::Command::Select(crate::model::Selection::default()),
+        })
+        .unwrap();
+        w.ui.dispatch(Event::ReadOnly { tab: 1, enabled: true })
+            .unwrap();
+        key(&mut w, keyboard, 45);
+        assert!(w.notice.as_ref().unwrap().contains("Cut unavailable"));
+        assert_eq!(w.client.source(), Some(line_source));
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
+        assert!(drain(&peer).0.is_empty());
         let large = vec![b'x'; crate::clipboard::MAX_BYTES + 1];
         w.ui.dispatch(Event::Load(&large)).unwrap();
         w.ui.dispatch(Event::Edit {
@@ -6523,8 +6601,14 @@ mod tests {
         .unwrap();
         key(&mut w, keyboard, 46);
         assert!(w.notice.as_ref().unwrap().contains("Copy refused: limit"));
-        assert_eq!(w.client.source().unwrap(), source);
-        assert_eq!(w.clipboard.text.as_deref().unwrap(), "é");
+        assert_eq!(w.client.source().unwrap(), line_source);
+        assert_eq!(w.clipboard.text.as_deref(), Some("é abc\n"));
+        assert!(drain(&peer).0.is_empty());
+        w.ui.dispatch(Event::ReadOnly { tab: 2, enabled: true })
+            .unwrap();
+        key(&mut w, keyboard, 45);
+        assert!(w.notice.as_ref().unwrap().contains("Cut unavailable"));
+        assert_eq!(w.client.source(), Some(line_source));
         assert!(drain(&peer).0.is_empty());
         assert_eq!(w.ui.editor().document(2).unwrap().text().as_bytes(), large);
     }

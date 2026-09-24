@@ -45,16 +45,18 @@ is overwritten by the next save. A draft larger than the document view's
 ceiling (16 MiB) is retained but not opened, and the log says so. Cut,
 copy and paste are Ctrl-X, Ctrl-C and Ctrl-V (Ctrl-A selects all): a
 selection made in any text, a message's view or an error's, is copied to
-the system clipboard and kept in td-mail's own kill ring, a cut one too,
-and a paste into a draft takes the system clipboard's text when it has
-any and the kill ring's otherwise. The clipboard's text arrives a moment
-later, into the draft it was asked for while that draft is still the one
+the system clipboard and kept in td-mail's own kill ring, a cut one too.
+With no selection in a draft, Copy or Cut takes the caret's whole line;
+read-only message and help views still require a selection. A paste into a
+draft takes the system clipboard's text when it has any, and the kill ring's
+otherwise. The clipboard's text arrives a moment later, into the draft it
+was asked for while that draft is still the one
 being edited; closed, under its save question or replaced by another
 draft, it goes nowhere. A refused copy or paste (a selection past the
 clipboard's 1 MiB ceiling, a paste still arriving, a paste that failed
 or was cancelled) is said in the status row until the next key; a held
-key repeats the kill ring's copy or paste only; and a compositor without
-a clipboard leaves the kill ring as the whole of it, silently. Nothing
+key repeats the kill ring's copy or paste only, never a cut; and a compositor
+without a clipboard leaves the kill ring as the whole of it, silently. Nothing
 here deletes the draft or its attachment sidecar, and the log records
 both paths. D on the mailbox list (the Drafts label) lists the drafts
 retained and, after them, those sent to `sent` beside them, each newest

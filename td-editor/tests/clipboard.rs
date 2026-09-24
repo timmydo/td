@@ -5,6 +5,7 @@
 )]
 
 use td_editor::clipboard::{Paste, Snapshot, MAX_BYTES};
+use td_editor::keys::Profile;
 use td_editor::model::{Command, Selection};
 use td_editor::ui::{Controller, Event, Outcome};
 use td_editor::Error;
@@ -113,11 +114,12 @@ fn fragmented_paste_normalizes_crlf_without_changing_file_mode_or_auto_filling()
 
 #[test]
 fn empty_copy_empty_paste_and_dropped_partial_transfer_do_not_delete_selection() {
-    let mut ui = loaded(b"keep");
+    let ui = loaded(b"");
     let (tab, revision) = target(&ui);
     assert!(Snapshot::capture(ui.editor(), tab, revision)
         .unwrap()
         .is_none());
+    let mut ui = loaded(b"keep");
     select(&mut ui, 0, 4);
     let before = state(&ui);
     let empty = paste(&ui, b"");
@@ -125,6 +127,112 @@ fn empty_copy_empty_paste_and_dropped_partial_transfer_do_not_delete_selection()
     drop(paste(&ui, b"partial"));
     drop(snapshot(&ui));
     assert_eq!(state(&ui), before);
+}
+
+#[test]
+fn unselected_copy_and_cut_take_the_logical_line_with_its_newline() {
+    let mut ui = loaded("é one\nsecond line\nlast".as_bytes());
+    select(&mut ui, 8, 8);
+    let original = state(&ui);
+    let captured = snapshot(&ui);
+    assert!(captured.whole_line());
+    assert_eq!(captured.text().as_ref(), "second line\n");
+    assert_eq!(state(&ui), original, "copy leaves the caret and text alone");
+    ui.dispatch(Event::Cut(captured)).unwrap();
+    let (tab, _) = target(&ui);
+    let doc = ui.editor().document(tab).unwrap();
+    assert_eq!(doc.text(), "é one\nlast");
+    assert_eq!(doc.selection(), Selection { anchor: 7, caret: 7 });
+    assert_eq!(doc.history_depth(), (1, 0));
+    edit(&mut ui, Command::Undo);
+    let doc = ui.editor().document(tab).unwrap();
+    assert_eq!(doc.text(), "é one\nsecond line\nlast");
+    assert_eq!(doc.selection(), Selection { anchor: 8, caret: 8 });
+
+    select(&mut ui, "é one\nsecond line\n".len() + 1, "é one\nsecond line\n".len() + 1);
+    let captured = snapshot(&ui);
+    assert_eq!(captured.text().as_ref(), "last");
+    ui.dispatch(Event::Cut(captured)).unwrap();
+    assert_eq!(ui.editor().document(tab).unwrap().text(), "é one\nsecond line\n");
+    let (tab, revision) = target(&ui);
+    assert!(Snapshot::capture(ui.editor(), tab, revision)
+        .unwrap()
+        .is_none(), "the final empty line has no bytes to copy");
+}
+
+#[test]
+fn public_cut_range_rejects_invalid_byte_spans_without_editing() {
+    let mut ui = loaded("aé\n".as_bytes());
+    let before = state(&ui);
+    let after_multibyte = "aé".len();
+    for (range, expected) in [
+        (after_multibyte..2, Error::InvalidPosition),
+        (1..2, Error::InvalidPosition),
+        (0..5, Error::InvalidPosition),
+    ] {
+        let (tab, revision) = target(&ui);
+        assert_eq!(
+            ui.dispatch(Event::Edit {
+                tab,
+                revision,
+                command: Command::CutRange(range),
+            }),
+            Err(expected)
+        );
+        assert_eq!(state(&ui), before);
+    }
+    let (tab, revision) = target(&ui);
+    assert_eq!(
+        ui.dispatch(Event::Edit {
+            tab,
+            revision,
+            command: Command::CutRange(3..3),
+        }),
+        Err(Error::InvalidArgument)
+    );
+    assert_eq!(state(&ui), before);
+}
+
+#[test]
+fn cutting_an_unselected_blank_middle_line_removes_only_its_newline() {
+    let mut ui = loaded(b"foo\n\nbar");
+    select(&mut ui, 4, 4);
+    let captured = snapshot(&ui);
+    assert_eq!(captured.text().as_ref(), "\n");
+    ui.dispatch(Event::Cut(captured)).unwrap();
+    let (tab, _) = target(&ui);
+    assert_eq!(ui.editor().document(tab).unwrap().text(), "foo\nbar");
+    edit(&mut ui, Command::Undo);
+    assert_eq!(ui.editor().document(tab).unwrap().text(), "foo\n\nbar");
+}
+
+#[test]
+fn emacs_active_empty_mark_uses_the_caret_line_for_copy_and_cut() {
+    let mut ui = loaded(b"one\ntwo\n");
+    ui.dispatch(Event::Profile(Profile::Emacs)).unwrap();
+    select(&mut ui, 5, 5);
+    let (tab, revision) = target(&ui);
+    assert_eq!(
+        ui.dispatch(Event::Key {
+            tab,
+            revision,
+            chord: "C-Space",
+        }),
+        Ok(Outcome::Changed)
+    );
+    for (chord, name) in [("M-w", "copy"), ("C-w", "cut")] {
+        assert!(matches!(
+            ui.dispatch(Event::Key {
+                tab,
+                revision,
+                chord,
+            }),
+            Ok(Outcome::Request { name: requested, .. }) if requested == name
+        ));
+        assert_eq!(snapshot(&ui).text().as_ref(), "two\n");
+    }
+    ui.dispatch(Event::Cut(snapshot(&ui))).unwrap();
+    assert_eq!(ui.editor().document(tab).unwrap().text(), "one\n");
 }
 
 #[test]

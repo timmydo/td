@@ -542,6 +542,18 @@ impl App {
         let Some((tab, revision)) = self.pane_target() else {
             return;
         };
+        // Reader scrolling need not move the caret; an unselected Copy must
+        // not publish a line that may be outside the visible article.
+        if self
+            .pane
+            .editor()
+            .document(tab)
+            .is_ok_and(|doc| doc.selection().range().is_empty())
+        {
+            self.note = Some("Nothing selected to copy".to_string());
+            self.pending_redraw = true;
+            return;
+        }
         match Snapshot::capture(self.pane.editor(), tab, revision) {
             Ok(Some(snapshot)) => self.copy = Some(snapshot.text()),
             Ok(None) => {

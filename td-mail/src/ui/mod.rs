@@ -1436,12 +1436,13 @@ impl Handler for Session {
                     self.surface = surface;
                     self.redraw();
                 }
-                // A repeat, a held key, has no press for the clipboard to
-                // take a selection at, and a paste it asked is still
-                // arriving: the chord is the kill ring's alone.
+                // A repeated Cut must not delete the next line. Other
+                // repeats remain kill-ring-only while Paste is pending.
                 Input::Key { chord, repeat } => {
-                    self.chord(chord);
-                    if repeat {
+                    if !(repeat && chord == "C-x") {
+                        self.chord(chord);
+                    }
+                    if repeat && chord != "C-x" {
                         self.asks = std::mem::take(&mut self.asks)
                             .into_iter()
                             .filter_map(|ask| match ask {
@@ -2993,6 +2994,9 @@ mod frame_tests {
         // The help, read-only: its whole text is copied out.
         key(&mut session, "?");
         assert_eq!(session.title(), "Help");
+        key_with(&mut session, "C-c", &mut board);
+        assert!(board.copies.is_empty(), "reader copy needs a selection");
+        assert!(session.pane.killed().is_none());
         key_with(&mut session, "C-a", &mut board);
         key_with(&mut session, "C-c", &mut board);
         assert_eq!(board.copies.len(), 1);
@@ -3155,6 +3159,31 @@ mod frame_tests {
         key(&mut session, "n");
         assert_eq!(session.stack.depth(), 1);
         let _ = std::fs::remove_dir_all(&draft_dir);
+    }
+
+    #[test]
+    fn repeated_cut_does_not_delete_successive_draft_lines() {
+        let (mut session, _cmd_rx, _resp_tx) = session(true);
+        let mut board = Board::new();
+        key(&mut session, "c");
+        let original = text(&session);
+        let first = original.split_inclusive('\n').next().unwrap_or(&original);
+        key_with(&mut session, "C-Home", &mut board);
+        key_with(&mut session, "C-x", &mut board);
+        let after_cut = text(&session);
+        assert_eq!(after_cut, original.strip_prefix(first).unwrap_or(""));
+        assert_eq!(board.copies.len(), 1);
+        assert_eq!(board.copies[0].as_ref(), first);
+        session.input(
+            Input::Key {
+                chord: "C-x",
+                repeat: true,
+            },
+            &mut board,
+        );
+        assert_eq!(text(&session), after_cut);
+        assert_eq!(board.copies.len(), 1);
+        assert_eq!(session.pane.killed().as_deref(), Some(first));
     }
 
     /// The Folder label opens a dropdown of the folder actions under it,

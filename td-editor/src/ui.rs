@@ -48,7 +48,7 @@ pub enum Event<'a> {
     },
     /// Complete a successful EOF transfer; admission rechecks its selection.
     Paste(crate::clipboard::Paste),
-    /// Delete only the captured selection, after the adapter retains its copy.
+    /// Delete the captured selection or line after the adapter retains its copy.
     Cut(crate::clipboard::Snapshot),
     Key {
         tab: TabId,

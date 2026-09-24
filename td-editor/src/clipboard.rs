@@ -1,7 +1,9 @@
 //! Bounded, selection-bound clipboard transactions. No transport or clock.
 
-use crate::model::{Command, Editor, RevisionPoint, Selection, TabId};
+use crate::model::{Command, Document, Editor, RevisionPoint, Selection, TabId};
+use crate::text;
 use crate::{Error, Result};
+use std::ops::Range;
 use std::sync::Arc;
 
 pub const MAX_BYTES: usize = 1024 * 1024;
@@ -35,8 +37,9 @@ impl Anchor {
     }
 }
 
-/// Immutable selected text. Capture does not edit or claim system ownership.
-/// Empty selection returns None: it must not replace the existing clipboard.
+/// Immutable selected text, or the caret's logical line when unselected.
+/// Capture does not edit or claim system ownership. An empty final line
+/// returns None and leaves existing clipboard ownership untouched.
 /// A snapshot cannot authorize discarding a dirty tab:
 /// ```compile_fail
 /// fn cannot_discard(snapshot: td_editor::clipboard::Snapshot) {
@@ -45,26 +48,43 @@ impl Anchor {
 /// ```
 pub struct Snapshot {
     anchor: Anchor,
+    range: Range<usize>,
+    line: bool,
     text: Arc<str>,
+}
+
+pub(crate) fn capture_range(doc: &Document) -> Result<Range<usize>> {
+    let selection = doc.selection();
+    let range = selection.range();
+    if !range.is_empty() {
+        return Ok(range);
+    }
+    let mut line = text::line(doc.text(), selection.caret)?;
+    if doc.text().as_bytes().get(line.end) == Some(&b'\n') {
+        line.end = line.end.checked_add(1).ok_or(Error::Exhausted)?;
+    }
+    Ok(line)
 }
 
 impl Snapshot {
     pub fn capture(editor: &Editor, tab: TabId, revision: u64) -> Result<Option<Self>> {
         let anchor = Anchor::capture(editor, tab, revision)?;
-        let range = anchor.selection.range();
+        let doc = editor.document(tab)?;
+        let range = capture_range(doc)?;
         if range.is_empty() {
             return Ok(None);
         }
         if range.len() > MAX_BYTES {
             return Err(Error::Limit);
         }
-        let text = editor
-            .document(tab)?
+        let text = doc
             .text()
-            .get(range)
+            .get(range.clone())
             .ok_or(Error::InvalidPosition)?;
         Ok(Some(Self {
+            line: anchor.selection.range().is_empty(),
             anchor,
+            range,
             text: Arc::from(text),
         }))
     }
@@ -74,12 +94,17 @@ impl Snapshot {
         Arc::clone(&self.text)
     }
 
+    /// Whether this snapshot came from a collapsed selection at the caret.
+    pub fn whole_line(&self) -> bool {
+        self.line
+    }
+
     pub(crate) fn cut(self, editor: &Editor) -> Result<(TabId, u64, Command)> {
         self.anchor.check(editor)?;
         Ok((
             self.anchor.point.tab,
             self.anchor.point.revision,
-            Command::Insert(String::new()),
+            Command::CutRange(self.range),
         ))
     }
 }

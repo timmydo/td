@@ -349,9 +349,9 @@ impl Pane {
         })
     }
 
-    /// The selection into the kill ring and out of the document: whether
-    /// one was, or why the selection could not be captured (past the
-    /// clipboard's ceiling).
+    /// The selection, or current line when unselected, into the kill ring
+    /// and out of the document. Returns whether text was cut, or why it
+    /// could not be captured (past the clipboard's ceiling).
     pub fn cut(&mut self) -> Result<bool, String> {
         if !self.editable() {
             return Ok(false);
@@ -367,9 +367,16 @@ impl Pane {
         Ok(true)
     }
 
-    /// The selection into the kill ring: whether one was kept, or why it
-    /// could not be captured.
+    /// The selection, or a draft's current line when unselected, into the
+    /// kill ring: whether text was kept, or why it could not be captured.
     pub fn copy(&mut self) -> Result<bool, String> {
+        if self
+            .target()
+            .and_then(|(tab, _)| self.controller.editor().document(tab).ok())
+            .is_some_and(|doc| doc.read_only() && doc.selection().range().is_empty())
+        {
+            return Ok(false);
+        }
         match self.selection()? {
             Some(snapshot) => {
                 self.kill = Some(snapshot.text());
@@ -379,7 +386,7 @@ impl Pane {
         }
     }
 
-    /// The kill ring's text: the last selection cut or copied.
+    /// The kill ring's text: the last selection or line cut or copied.
     pub fn killed(&self) -> Option<Arc<str>> {
         self.kill.clone()
     }
@@ -520,9 +527,8 @@ impl Pane {
         Ok(self.event(Event::Paste(paste)) == Outcome::Changed)
     }
 
-    /// The shown document's selection, bounded as the editor's clipboard
-    /// bounds it; none when nothing is selected, and the reason when it
-    /// cannot be captured.
+    /// The shown document's selection or caret line, bounded as the editor's
+    /// clipboard bounds it; none when the document has no text at the caret.
     fn selection(&self) -> Result<Option<Snapshot>, String> {
         let Some((tab, revision)) = self.target() else {
             return Ok(None);
@@ -946,6 +952,47 @@ mod tests {
         assert_eq!(pane.editor().document(tab).unwrap().revision(), revision);
     }
 
+    #[test]
+    fn draft_pane_copies_and_cuts_the_current_line_without_a_selection() {
+        let mut pane = Pane::new().unwrap();
+        assert_eq!(pane.copy(), Ok(false));
+        assert_eq!(pane.cut(), Ok(false));
+        assert_eq!(pane.paste(), Ok(false));
+        let mut draft = None;
+        pane.edit(&mut draft, "line-clipboard", || {
+            "first\nsecond\n".to_string()
+        });
+        let tab = pane.tab().unwrap();
+        assert_eq!(pane.chord("C-End"), Outcome::Changed);
+        assert_eq!(pane.copy(), Ok(false));
+        assert_eq!(pane.cut(), Ok(false));
+        assert_eq!(pane.paste(), Ok(false));
+        assert_eq!(pane.chord("C-Home"), Outcome::Changed);
+        assert_eq!(pane.chord("Down"), Outcome::Changed);
+        let before = pane.editor().document(tab).unwrap().selection();
+        assert!(before.range().is_empty());
+        assert!(matches!(
+            pane.chord("C-c"),
+            Outcome::Request { name: "copy", .. }
+        ));
+        assert_eq!(pane.copy(), Ok(true));
+        assert_eq!(pane.killed().unwrap().as_ref(), "second\n");
+        assert_eq!(pane.editor().document(tab).unwrap().selection(), before);
+        assert!(matches!(
+            pane.chord("C-x"),
+            Outcome::Request { name: "cut", .. }
+        ));
+        assert_eq!(pane.cut(), Ok(true));
+        assert_eq!(pane.editor().document(tab).unwrap().text(), "first\n");
+        assert_eq!(pane.killed().unwrap().as_ref(), "second\n");
+        assert_eq!(pane.chord("C-z"), Outcome::Changed);
+        assert_eq!(
+            pane.editor().document(tab).unwrap().text(),
+            "first\nsecond\n"
+        );
+        assert_eq!(pane.editor().document(tab).unwrap().selection(), before);
+    }
+
     /// A draft is loaded once for its key, editable and auto-filled; the
     /// kill ring carries a selection between documents; and the draft
     /// handle reads the document's state, marks it saved and gives it up.
@@ -978,13 +1025,10 @@ mod tests {
         ));
         assert_eq!(pane.editor().document(tab).unwrap().text(), "To: \nx");
         assert!(Draft::new(&mut pane, Some(tab)).dirty());
-        // Nothing selected: nothing cut, copied or pasted.
-        assert_eq!(pane.cut(), Ok(false));
-        assert_eq!(pane.copy(), Ok(false));
-        assert_eq!(pane.paste(), Ok(false));
         // A selection copied from a read-only text is pasted into the draft.
         let mut text = None;
         pane.show(&mut text, "t", 40, || "quoted".to_string());
+        assert_eq!(pane.copy(), Ok(false), "a reader needs a selection");
         assert_eq!(pane.chord("C-a"), Outcome::Changed);
         assert!(matches!(
             pane.chord("C-c"),

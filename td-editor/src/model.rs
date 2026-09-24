@@ -168,6 +168,8 @@ pub enum Motion {
 pub enum Command {
     Select(Selection),
     Insert(String),
+    /// Delete a captured clipboard range without changing the selection first.
+    CutRange(Range<usize>),
     Type(char),
     Backspace,
     Delete,
@@ -514,6 +516,24 @@ impl Editor {
                     fill::Edit {
                         range,
                         insert,
+                        anchor: at,
+                        caret: at,
+                    },
+                )?;
+            }
+            Command::CutRange(range) => {
+                if range.start > range.end {
+                    return Err(Error::InvalidPosition);
+                }
+                if range.is_empty() {
+                    return Err(Error::InvalidArgument);
+                }
+                let at = range.start;
+                self.edit(
+                    id,
+                    fill::Edit {
+                        range,
+                        insert: String::new(),
                         anchor: at,
                         caret: at,
                     },

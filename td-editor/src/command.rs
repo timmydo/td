@@ -188,6 +188,7 @@ mod tests {
             wrap: false,
             line_numbers: true,
             auto_fill: false,
+            cut: false,
             copy: false,
             copy_path: false,
             paste: false,

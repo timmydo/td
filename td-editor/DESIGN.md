@@ -2273,11 +2273,13 @@ ownership; the native adapter below supplies protocol and descriptor policy.
 
 `Snapshot::capture` requires the active tab and expected text revision.
 It captures the directed selection, editor-instance identity and at most
-1 MiB of selected UTF-8 bytes as an immutable shared string. Empty selection
-returns None and must leave any existing clipboard ownership untouched.
-Oversized selection is refused before copying bytes. Subsequent edits do
-not change a retained snapshot. Debug output reports identity fields and
-byte counts, never the selected text.
+1 MiB of UTF-8 bytes as an immutable shared string. A nonempty selection
+captures exactly that range. A collapsed selection captures the caret's
+logical line, including its terminating newline if present. The final empty
+line after a trailing newline, or an empty document, returns None and leaves
+existing clipboard ownership untouched. An oversized range is refused
+before copying bytes. Subsequent edits do not change a retained snapshot.
+Debug output reports identity fields and byte counts, never the text.
 
 `Paste::begin` captures the same active tab/revision/selection binding.
 Incoming chunks are collected up to 1 MiB of raw transfer bytes, counting
@@ -2293,24 +2295,30 @@ editor-instance identity, active tab, exact revision and the original
 directed selection before any editing. A changed text revision returns
 `stale-revision`; another editor, inactive target or different selection
 returns `invalid-argument`; a closed target returns `missing-tab`.
-Selection is compared by value: moving away
-and back without editing satisfies that value check; a native adapter must
+Selection is compared by value: moving away and back without editing
+satisfies that value check; a native adapter must
 separately cancel on focus/target transitions. Text edit followed by Undo
 still has a newer revision and cannot revive an old transfer.
 
-Cut deletes only the captured nonempty range. The adapter retains the shared
-snapshot for serving before dispatching Cut; a refusal leaves the document
-intact and may still leave a useful copy. This token is not a compositor
-ownership acknowledgement. Paste validates complete UTF-8 and uses ordinary
+Cut deletes only the captured nonempty range, including the line terminator
+for a line capture. The adapter retains the shared snapshot for serving
+before dispatching Cut; a refusal leaves the document intact and may still
+leave a useful copy. This token is not a compositor ownership
+acknowledgement. Paste validates complete UTF-8 and uses ordinary
 Insert admission, normalizing CRLF and rejecting unsupported controls or an
 initial BOM in the resulting document. It cannot change file BOM/line-ending
 mode and does not invoke Auto Fill. Empty paste is Ignored rather than
 deleting the selection. Each text-changing paste or Cut is one ordinary
-undo transaction, with the original selection restored on Undo. Pasting
-identical text follows ordinary Insert's no-op rule: collapse the selection
-without changing revision, dirty state or history. That selection-only change
-is not undoable; Undo still refers to the previous text transaction. Existing
-document/history budgets, revision/content counters and controller generation
+undo transaction, with the original selection restored on Undo. Pasting an
+unselected copied line inserts its captured bytes at the caret; it does not
+infer a linewise destination. Emacs C-w/M-w use the same collapsed-range
+rule, including when the mark is active at the caret. Native Cut on a
+read-only view refuses before changing the clipboard.
+Pasting identical text follows ordinary Insert's no-op rule: collapse the
+selection without changing revision, dirty state or history. That
+selection-only change is not undoable; Undo still refers to the previous
+text transaction. Existing document/history budgets, revision/content
+counters and controller generation
 admission apply before mutation. Rejected operations preserve view and input
 state as well as text; accepted operations reset input and reveal the caret.
 Like semantic Edit, these controller events do not require keyboard focus.
@@ -2408,12 +2416,12 @@ Windows Ctrl+C/Ctrl+X/Ctrl+V, Emacs M-w/C-w/C-y and Edit menu Copy/Cut/Paste
 reach the same adapter. Copy/Cut require keyboard focus and the serial from
 the current actual translated key press or left-button menu press. Synthetic
 requests without that serial refuse ownership changes. Repeats never acquire
-ownership or start transfers. Empty selection preserves the existing source;
-oversized selection refuses before copying. The client's fresh source
-becomes the selection at that input serial; the editor retains the immutable
-snapshot behind it and then admits Cut through the controller. Wayland
-provides no ownership acknowledgement; feedback says the selection was
-offered. Undo restores a successful Cut.
+ownership or start transfers. A collapsed selection offers the caret's line
+unless it is the final empty line; oversized captures refuse before copying.
+The client's fresh source becomes the selection at that input serial; the
+editor retains the immutable snapshot behind it and then admits Cut through
+the controller. Wayland provides no ownership acknowledgement; feedback says
+the selection or line was offered. Undo restores a successful Cut.
 
 The window owns at most one source snapshot, one outgoing writer and one
 incoming transfer. Copy/Cut refuse while a writer is pending, bounding
@@ -3152,11 +3160,9 @@ Both cases retain the source/destination capture fences and owner-exit
 refusal, profile-specific collapse and saved-byte checks above. Offered
 feedback means local publication, not compositor acknowledgement; the
 actual inter-client transfer independently proves the usable selection.
-All four clipboard cases also issue native Copy with a collapsed source
-selection after saving `b`. Fresh no-selection feedback fences this
-no-op before exact revision, selection, text and disk checks. The second
-editor must still paste the original UTF-8 snapshot, proving that empty
-Copy preserves both prior Copy and prior Cut ownership in each profile.
+The core and mail pane tests cover collapsed-selection line Copy and Cut,
+including the line terminator, preserved caret on Copy, and one-step Undo
+after Cut.
 All four cases opt into the compositor's separate clipboard-transfer hold
 grant. Before successful Paste, arm hold 1 for the focused destination and
 route Paste, then require compositor `held` and editor `incoming=1` with

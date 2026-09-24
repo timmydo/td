@@ -234,6 +234,7 @@ pub(crate) struct Data {
     pub(crate) wrap: bool,
     pub(crate) line_numbers: bool,
     pub(crate) auto_fill: bool,
+    pub(crate) cut: bool,
     pub(crate) copy: bool,
     pub(crate) copy_path: bool,
     pub(crate) paste: bool,
@@ -272,7 +273,8 @@ impl Data {
             Item::SortName | Item::SortSize | Item::SortModified | Item::SortReverse => {
                 self.directory
             }
-            Item::Cut | Item::Copy => self.copy,
+            Item::Cut => self.cut,
+            Item::Copy => self.copy,
             Item::CopyPath => self.copy_path,
             Item::Paste => self.paste,
             Item::Dictionary | Item::Open | Item::Save | Item::SaveAs => self.file_window,
@@ -468,6 +470,7 @@ mod tests {
             wrap: true,
             line_numbers: true,
             auto_fill: false,
+            cut: false,
             copy: false,
             copy_path: false,
             paste: false,
@@ -535,6 +538,16 @@ mod tests {
         assert!(menu.checked(Item::Windows));
         assert!(!menu.checked(Item::Emacs));
         assert!(menu.checked(Item::LineNumbers));
+    }
+
+    #[test]
+    fn cut_can_be_disabled_while_copy_remains_available() {
+        let mut available = data();
+        available.copy = true;
+        assert!(available.enabled(Item::Copy));
+        assert!(!available.enabled(Item::Cut));
+        available.cut = true;
+        assert!(available.enabled(Item::Cut));
     }
 
     #[test]

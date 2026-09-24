@@ -246,10 +246,11 @@ mapping, key-profile conflicts and generated edits against a scalar-vector
 reference. It also launches the real replay executable without a display.
 
 `clipboard.rs` supplies tested, display-independent copy snapshots and
-selection-bound Cut/Paste admission through the controller. Paste collects
-at most 1 MiB of raw bytes; oversized, malformed or stale transfers cannot
-partially edit a document. The experimental native window now connects these
-operations to core Wayland data-device v3 when the compositor supplies it.
+selection-bound Cut/Paste admission through the controller. With no selection,
+Copy and Cut take the current logical line and its terminating newline.
+Paste collects at most 1 MiB of raw bytes; oversized, malformed or stale
+transfers cannot partially edit a document. The experimental native window
+connects these operations to core Wayland data-device v3 when supplied.
 
 `spelling.rs` supplies strict English word-list parsing and chunked,
 revision-bound whole-document scans. `files::read_dictionary` reads only a
@@ -582,12 +583,12 @@ Separate Copy cases use Windows Ctrl+C and Emacs M-w, check unchanged
 selection/revision/text/disk before replacing the source, and prove the
 original snapshot still pastes in the other editor. No Cut replaces the
 Copy offer in these cases; both retain owner-exit and pixel checks.
-All four clipboard variants also try Copy with no selection: the prior
-snapshot must remain available to the other editor, with source state
-and saved bytes unchanged.
-They also hold one native Paste at the compositor before source delivery,
-confirm `incoming=1`, and cancel via Escape or Emacs C-g. Only then is the
-descriptor released: fresh source send-failure feedback fences its encounter
+Core and mail pane tests cover Copy and Cut with no selection: both take the
+current logical line, and Cut remains undoable in one step.
+The four native clipboard variants also hold one Paste at the compositor
+before source delivery, confirm `incoming=1`, and cancel via Escape or
+Emacs C-g. Only then is the descriptor released: fresh source send-failure
+feedback fences its encounter
 with the closed receiver. Cancellation preserves both documents and disk
 bytes, and a fresh Paste still succeeds. The opt-in hold has a deadline;
 tests do not rely on a large payload being slow. Cancellation and producer
