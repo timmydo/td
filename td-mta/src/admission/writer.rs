@@ -200,6 +200,79 @@ impl<'a> WriterLedger<'a> {
         ledger.checkpoint_need()?;
         Ok(ledger)
     }
+    pub(super) fn build_need(&self) -> Result<CheckpointNeed, Error> {
+        self.open()?;
+        if self.appending.is_some() {
+            return Err(Error::Busy);
+        }
+        self.leases.project_rollover()?;
+        self.need_from(&Usage::default())
+    }
+    pub(super) fn start_build(&mut self) -> Result<(), Error> {
+        let need = self.build_need()?;
+        self.leases.reserve_checkpoint(need.generation_bytes())?;
+        self.phase = Phase::Barrier;
+        Ok(())
+    }
+    pub(super) fn complete_build_io(&mut self, bytes: u64) -> Result<(), Error> {
+        if !matches!(self.phase, Phase::Barrier | Phase::Stopped) {
+            return Err(Error::Closed);
+        }
+        self.leases.complete_checkpoint(bytes)?;
+        Ok(())
+    }
+    pub(super) fn abandon_build(&mut self, unused: u64, untouched: bool) -> Result<(), Error> {
+        if self.phase != Phase::Barrier {
+            return Err(Error::Closed);
+        }
+        self.leases.release_checkpoint(unused, false)?;
+        self.phase = if untouched {
+            Phase::Open
+        } else {
+            Phase::AwaitingSpace
+        };
+        Ok(())
+    }
+    pub(super) fn select_build(
+        &mut self,
+        selected: u64,
+        bound: u64,
+        unused: u64,
+    ) -> Result<(), Error> {
+        let was_barrier = self.phase == Phase::Barrier;
+        self.phase = Phase::Stopped;
+        if !was_barrier {
+            return Err(Error::Invalid);
+        }
+        self.validate_selection(selected, bound)?;
+        self.leases.release_checkpoint(unused, true)?;
+        self.selected_tables = selected;
+        self.phase = Phase::AwaitingSpace;
+        Ok(())
+    }
+    fn validate_selection(&self, selected: u64, bound: u64) -> Result<(), Error> {
+        if selected
+            < super::widen(
+                format::TABLE_COUNT * format::TABLE_HEADER_BYTES,
+                "empty tables",
+            )?
+            || selected > self.plan.disk().live_metadata_bytes
+            || selected > bound
+        {
+            return Err(Error::Invalid);
+        }
+        Ok(())
+    }
+    pub(super) fn stop(&mut self) {
+        self.phase = Phase::Stopped;
+    }
+    pub(super) fn reopen(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::AwaitingSpace {
+            return Err(Error::Closed);
+        }
+        self.phase = Phase::Open;
+        Ok(())
+    }
     pub(super) fn plan(&self) -> &'a Plan {
         self.plan
     }
@@ -562,16 +635,8 @@ impl Checkpoint<'_, '_> {
         // The adapter reports an already durable selection. Any inconsistency
         // now needs recovery, not another attempt against the old journal.
         self.ledger.phase = Phase::Stopped;
-        if selected_tables
-            < super::widen(
-                format::TABLE_COUNT * format::TABLE_HEADER_BYTES,
-                "empty tables",
-            )?
-            || selected_tables > self.ledger.plan.disk().live_metadata_bytes
-            || selected_tables > self.selected_bound
-        {
-            return Err(Error::Invalid);
-        }
+        self.ledger
+            .validate_selection(selected_tables, self.selected_bound)?;
         self.ledger.leases.rollover()?;
         self.ledger.selected_tables = selected_tables;
         self.ledger.phase = Phase::AwaitingSpace;

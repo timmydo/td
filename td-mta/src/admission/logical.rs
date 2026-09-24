@@ -176,6 +176,35 @@ impl<'a> Leases<'a> {
         self.slots.available()
     }
 
+    pub(super) fn reserve_checkpoint(&mut self, bytes: u64) -> Result<(), Error> {
+        self.healthy()?;
+        if self.pending(Kind::CheckpointBytes)? != 0 {
+            return Err(Error::Busy);
+        }
+        let mut extra = Usage::default();
+        extra.add(Kind::CheckpointBytes, bytes)?;
+        self.quotas = self.quotas.with_reservation(extra).map_err(Error::Quota)?;
+        Ok(())
+    }
+    pub(super) fn complete_checkpoint(&mut self, bytes: u64) -> Result<(), Error> {
+        self.healthy()?;
+        let mut used = Usage::default();
+        used.add(Kind::CheckpointBytes, bytes)?;
+        self.quotas.complete(used)?;
+        Ok(())
+    }
+    pub(super) fn release_checkpoint(&mut self, unused: u64, rollover: bool) -> Result<(), Error> {
+        self.healthy()?;
+        let mut next = self.quotas.clone();
+        let mut release = Usage::default();
+        release.add(Kind::CheckpointBytes, unused)?;
+        next.release_unused(release)?;
+        if rollover {
+            next = next.with_rollover().map_err(Error::Quota)?;
+        }
+        self.quotas = next;
+        Ok(())
+    }
     pub(super) fn quotas(&self) -> &Quotas {
         &self.quotas
     }

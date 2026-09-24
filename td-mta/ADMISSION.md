@@ -15,8 +15,9 @@ the scalar writer/checkpoint ledger in `src/admission/writer.rs`. M04c3b3
 owns the composed physical reservation coordinator. Its first increment,
 M04c3b3a, supplies bounded filesystem registration and linear probe matching
 in `src/admission/filesystems.rs`. M04c3b3b composes atomic admission and effect
-accounting in `src/admission/coordinator.rs`; checkpoint transfer/reopening
-remain M04c3b3c2. M04c3b3c1 adds causal probe fences in the registry.
+accounting in `src/admission/coordinator.rs`. M04c3b3c1 adds causal probe
+fences in the registry; M04c3b3c2 adds conditional checkpoint transfer and
+reopening in `src/admission/coordinator/checkpoint.rs`.
 M05/M08 supply physical probes, persistence and maintenance.
 M13 owns request retention. No running admission coordinator or filesystem
 probe is claimed.
@@ -220,11 +221,13 @@ selected table length must fit the committed-only output bound and
 live-metadata cap; uncommitted reservations cannot explain selected output.
 Invalid selection leaves counters unchanged and stops the writer, because
 the adapter reported an already durable on-disk change. Success enters
-AwaitingSpace; there is deliberately no public reopen operation. M04c3b3 must
-first establish a fresh probe and protect capacity for the next checkpoint.
-Checkpoint building/retention quota and physical transfer are not implemented
-by this scalar barrier. M08's exact live-metadata updates, selected identities,
-publication proof and cleanup authority are also still required.
+AwaitingSpace; the standalone scalar barrier has no public reopen operation.
+Runtime integration uses the composed coordinator's building reservations and
+post-fence physical admission. The standalone scalar barrier itself does not
+reserve building/retention quota or transfer physical capacity. Both paths
+share selection-bound validation and the quota rollover projection. M08's
+exact live-metadata updates, selected identities, publication proof and cleanup
+authority are also still required.
 
 ## 2. Free space and completion reserves
 
@@ -458,9 +461,73 @@ Cancellation and short journal completion may leave checkpoint protection
 conservatively high; the next fresh admission recomputes it. No deletion credit
 or used-quota cleanup is inferred from freeing a lease.
 
-Checkpoint building reservations, quota overlap, selection and reopening are
-not exposed by this coordinator yet. M04c3b3c2 must transfer protected capacity
-and enforce post-selection probe ordering before adding those operations.
+### Checkpoint attempt implementation
+
+M04c3b3c2 keeps one dedicated checkpoint attempt outside the 64 client lease
+cells. Its record and checked attempt sequence fit 512 bytes in the existing
+control arena. A full client table cannot prevent checkpoint reservation.
+An opaque, non-Clone token pairs the fixed generation-filesystem identity with
+the checked attempt sequence; stale or foreign tokens change nothing. The
+registry is owned privately, so another coordinator cannot share that identity.
+An abandoned token keeps admission closed; the service must retain tokens or
+restart/reconcile under LOCK. It cannot infer zero effects from their loss.
+
+Before `begin_build`, M08 holds the actual writer/view barrier and proves pin
+eligibility. The coordinator refuses an in-flight append and checks closed
+journal caps. It derives building output from selected tables and committed
+frames/operations only, bounded by the protected reserve which also includes
+pending frames. It transfers this generation bound plus the fresh journal
+header from protected capacity to pending growth. Shared filesystem amounts
+are aggregated in the same projection. No additional probe, floor or duplicate
+physical charge is needed because total reserved capacity does not increase.
+The same transition reserves CheckpointBytes alongside all already used,
+selected, retired and orphan output. Quota refusal leaves both physical state
+and writer phase unchanged. Existing journal lease identities and reservations
+are retained; new grants, extensions and appends remain closed. Existing raw
+I/O and lease cancellation remain available directly through the coordinator.
+
+The attempt's deadline is the enclosing deadline intersected with the configured
+checkpoint wall-clock limit. One linear build I/O ticket at a time bounds new
+generation bytes and rounded generation/header growth. Completion stages both
+filesystems and the shared quota ledger before publication. A proven result
+charges its exact bounded amounts; uncertainty charges the plan and marks the
+attempt unsuitable for selection. Invalid proof keeps the effect pinned.
+Already admitted I/O can report completion after its deadline or a writer stop.
+The worker owns proof that reported I/O has finished; these counters do not
+validate file contents or authorize publication.
+
+Before any selection, a quiescent zero-effect abort restores the transferred
+capacity and releases its unused quota, reopening the unchanged writer.
+After any written or uncertain effect, abort retains completed growth and used
+checkpoint/orphan bytes, releases only unused reservations, invalidates probes
+and enters AwaitingSpace on the old selected generation. Cleanup credit still
+requires M05/M08's object and unlink proofs. An abandoned fresh journal header
+is outside logical generation and selected/closed journal byte quotas: its
+rounded bytes and inode remain charged as completed physical growth, and
+fresh probes include the orphan. M05/M08 must reconcile these private files
+before retry loops can claim bounded orphan retention. Losing an I/O ticket
+leaves the attempt busy; expiry cannot supply a worker-quiescence proof.
+
+`select_build` reports an already durable, validated selection from M08. The
+accounting guard requires no in-flight/uncertain build I/O, charged generation
+bytes covering the selected tables, all generation file/directory inodes,
+rounded growth covering charged output, and a fully charged fresh journal
+header. These are accounting consistency checks, not a serialization proof.
+Selection releases unused building reservations, retains used output including
+old selected/retired generations, rolls committed frames and the old header
+into closed-journal quota, resets only committed active usage, and advances
+the probe epoch in the same exclusive transition. Outstanding journal parts
+keep their identities and rounded physical reservations. A matching but invalid
+selection report or an uncertain selection stops the writer and retains the
+attempt for reconciliation; a foreign token cannot stop another coordinator.
+
+Successful selection enters AwaitingSpace. `reopen_after_checkpoint` consumes
+fresh samples for both metadata locations, derives protection from the new
+selected baseline and unchanged outstanding frames, and assesses floors and
+completed growth before opening admission. A pre-selection probe refuses even
+at the same Tick, whether it was still running or already matched. Failure
+leaves admission closed with counters unchanged. Exact live-metadata updates,
+actual CURRENT publication, view pins and authoritative cleanup remain M08.
 
 ## 3. Work budgets and deadlines
 
@@ -863,6 +930,15 @@ publication, and epoch exhaustion preserves the registry. Successful and
 refused fences preserve identities, capacity and live
 references, within the existing sixteen-entry memory bound. Checkpoint
 publication and reopening are not exercised by these registry tests.
+
+M04c3b3c2 tests cover checkpoint admission with all client cells occupied,
+overlapping quota refusal, unchanged total physical protection on shared and
+separate filesystems, raw completion/cancellation while closed, committed and
+reserved journal rollover, same-Tick stale probes, failed/retried reopening,
+partial and uncertain aborts retaining orphan charges, invalid/foreign effects,
+lost tokens, deadline/sequence exhaustion and inconsistent durable reports.
+The dedicated state has a 512-byte layout assertion. These remain injected
+accounting tests; they perform no actual file write, sync, selection or unlink.
 
 M04/M05/M08/M13 add tests at their real execution boundaries, not document-only
 assertions: concurrent quota reservations cannot overbook; failed publications

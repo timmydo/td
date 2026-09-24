@@ -318,6 +318,31 @@ impl Stage<'_, '_> {
             .ok_or(Error::EpochExhausted)?;
         Ok(())
     }
+    pub(super) fn transfer_checkpoint(
+        &mut self,
+        id: FilesystemId,
+        amount: RoundedGrowth,
+        restore: bool,
+    ) -> Result<(), Error> {
+        let entry = self.entry(id)?;
+        if amount.allocation_unit() != entry.record.unit.get() {
+            return Err(Error::UnitChanged);
+        }
+        let (pending, checkpoint) = if restore {
+            (
+                growth_sub(entry.record.counters.pending, amount.amount())?,
+                growth_add(entry.record.counters.checkpoint, amount.amount())?,
+            )
+        } else {
+            (
+                growth_add(entry.record.counters.pending, amount.amount())?,
+                growth_sub(entry.record.counters.checkpoint, amount.amount())?,
+            )
+        };
+        entry.record.counters.pending = pending;
+        entry.record.counters.checkpoint = checkpoint;
+        Ok(())
+    }
     fn entry(&mut self, id: FilesystemId) -> Result<&mut Staged, Error> {
         let (index, _) = self.registry.record(id)?;
         self.entries

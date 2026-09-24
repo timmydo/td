@@ -243,9 +243,10 @@ Split at these concrete boundaries before dependent milestones start:
   `admission/filesystems.rs`. Earlier tickets and already matched samples
   refuse at the same Tick; no capacity or identity changes. The registry
   fence alone does not implement checkpoint publication or reopening.
-- **M04c3b3c2:** transfer protected checkpoint capacity to building reservations
-  without double charging, account overlapping checkpoint quota, and keep
-  admission closed until a fresh probe protects the next checkpoint. M05
+- **M04c3b3c2:** implemented protected-to-building capacity transfer, overlapping
+  checkpoint quota, closed writer transitions and post-fence probe reopening in
+  `admission/coordinator/checkpoint.rs`. One fixed attempt record is independent
+  of client lease saturation. Partial/unselected output keeps its charges. M05
   supplies descriptor-backed probes and cleanup proof; M08 owns persistence,
   exact metadata state and view/writer pin authority.
 - **M04d:** typed bounded event/status records, escaping and redaction.

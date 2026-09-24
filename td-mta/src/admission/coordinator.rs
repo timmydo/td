@@ -16,6 +16,8 @@ use crate::{
     ports::{Deadline, Tick},
 };
 
+pub mod checkpoint;
+
 pub type Samples = [Option<CheckedSample>; MAX_FILESYSTEMS];
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -116,6 +118,8 @@ pub struct Coordinator<'a> {
     generation_fs: FilesystemId,
     journal_fs: FilesystemId,
     initialized: bool,
+    build: Option<checkpoint::Build>,
+    build_sequence: u64,
 }
 impl<'a> Coordinator<'a> {
     /// Both metadata locations must already be registered against pinned roots.
@@ -137,6 +141,8 @@ impl<'a> Coordinator<'a> {
             generation_fs,
             journal_fs,
             initialized: false,
+            build: None,
+            build_sequence: 0,
         })
     }
     pub fn state(&self) -> State {
@@ -489,8 +495,8 @@ mod tests {
         limits::Limits,
         ownership::{self, SlotState},
     };
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
-    fn plan() -> Result<Plan, super::super::Error> {
+    pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
+    pub(super) fn plan() -> Result<Plan, super::super::Error> {
         DiskLimits::default().plan(
             &Limits::default()
                 .plan()
@@ -499,10 +505,10 @@ mod tests {
             ViewMode::OnlineBackground,
         )
     }
-    fn deadline() -> Deadline {
+    pub(super) fn deadline() -> Deadline {
         Deadline::after(Tick(0), 100000).unwrap()
     }
-    fn growth(unit: u64, bytes: u64, inodes: u64) -> RoundedGrowth {
+    pub(super) fn growth(unit: u64, bytes: u64, inodes: u64) -> RoundedGrowth {
         RoundedGrowth::from_files(
             unit,
             &[FileGrowth {
@@ -513,7 +519,13 @@ mod tests {
         )
         .unwrap()
     }
-    fn request(id: FilesystemId, unit: u64, logical: u64, bytes: u64, inodes: u64) -> Request {
+    pub(super) fn request(
+        id: FilesystemId,
+        unit: u64,
+        logical: u64,
+        bytes: u64,
+        inodes: u64,
+    ) -> Request {
         Request {
             logical: [
                 Charge {
@@ -528,10 +540,21 @@ mod tests {
             growth: growth(unit, bytes, inodes),
         }
     }
-    fn with_coordinator(
+    pub(super) fn with_coordinator(
         p: &Plan,
         unit: u64,
         distinct: bool,
+        run: impl FnOnce(&mut Coordinator<'_>, &[FilesystemId]) -> TestResult,
+    ) -> TestResult {
+        let mut used = Usage::default();
+        used.add(Kind::LiveMetadataBytes, 1232)?;
+        with_recovered(p, unit, distinct, used, run)
+    }
+    pub(super) fn with_recovered(
+        p: &Plan,
+        unit: u64,
+        distinct: bool,
+        used: Usage,
         run: impl FnOnce(&mut Coordinator<'_>, &[FilesystemId]) -> TestResult,
     ) -> TestResult {
         let mut ls = [const { SlotState::EMPTY }; 64];
@@ -555,21 +578,19 @@ mod tests {
             }
             ids.push(id.ok_or("registry contention")?);
         }
-        let mut used = Usage::default();
-        used.add(Kind::LiveMetadataBytes, 1232)?;
         let writer = WriterLedger::new(p, 1232, used, &mut ls, &mut lc)?;
         let mut coordinator =
             Coordinator::new(writer, registry, ids[0], *ids.get(1).unwrap_or(&ids[0]))?;
         run(&mut coordinator, &ids)
     }
-    fn samples(c: &Coordinator<'_>, ids: &[FilesystemId], now: Tick) -> Samples {
+    pub(super) fn samples(c: &Coordinator<'_>, ids: &[FilesystemId], now: Tick) -> Samples {
         let mut samples: Samples = std::array::from_fn(|_| None);
         for (slot, id) in samples.iter_mut().zip(ids) {
             *slot = Some(sample(c, *id, u64::MAX, Inodes::Available(u64::MAX), now));
         }
         samples
     }
-    fn sample(
+    pub(super) fn sample(
         c: &Coordinator<'_>,
         id: FilesystemId,
         bytes: u64,
@@ -588,11 +609,11 @@ mod tests {
         );
         c.consume_observation(id, &mut observation, now).unwrap()
     }
-    fn initialize(c: &mut Coordinator<'_>, ids: &[FilesystemId]) -> TestResult {
+    pub(super) fn initialize(c: &mut Coordinator<'_>, ids: &[FilesystemId]) -> TestResult {
         c.initialize(&mut samples(c, &ids[..ids.len().min(2)], Tick(0)), Tick(0))?;
         Ok(())
     }
-    fn grant(
+    pub(super) fn grant(
         c: &mut Coordinator<'_>,
         ids: &[FilesystemId],
         requests: &[Request],

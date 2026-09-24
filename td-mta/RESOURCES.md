@@ -294,9 +294,10 @@ The 128 KiB queue/state reservation has eight 64-entry input queues and one
 512-entry completion queue, all with 32-byte entries (32 KiB total), a
 128-entry due-recipient window with 128-byte entries (16 KiB), 64 reservation
 records with 128-byte entries (8 KiB), sixteen filesystem records including
-slot generations at no more than 128 bytes each (2 KiB), and a remaining
-70 KiB for timers, other pools' slot generations, bounded generation pins,
-queue heads and counters. A
+slot generations at no more than 128 bytes each (2 KiB), one dedicated
+checkpoint-attempt record plus sequence counter (at most 512 bytes), and a
+remaining 71,168 bytes for timers, other pools' slot generations, bounded
+generation pins, queue heads and counters. A
 reservation record stores references/charges; it does not embed a frame.
 The window can be refilled from the disk due-time index, never from a full
 in-memory queue. Scratch/queue bounds apply even with configured larger pools.
@@ -346,8 +347,12 @@ growth. Its checkpoint barrier preserves pending frame ownership and does
 not reopen on selection. M04c3b3b couples quota and filesystem changes using
 a fixed sixteen-entry stack projection and at most eight staged lease records.
 It consumes/rechecks probes at admission and publishes prevalidated filesystem
-changes only after logical installation succeeds. M04c3b3c still owns transfer
-of checkpoint capacity and fresh-probe reopening. M05/M08 own actual
+changes only after logical installation succeeds. M04c3b3c2 transfers protected
+capacity to one dedicated checkpoint attempt, so a full client lease table
+cannot starve its reservation. Building quota stays in the same Quotas ledger.
+Attempt and I/O tokens live in owned job scratch; dropping one pins admission
+or its effect until reconciliation. Transfers and completions use fixed stack
+projections. M05/M08 own actual
 written/orphan cleanup, writer/view locking and publication authority.
 
 M04c3b3a's filesystem table borrows its backing cells and SlotStates from
