@@ -500,6 +500,56 @@ location for label failures. It does not fabricate an internal byte offset.
 This lower-level diagnostic does not carry a field name; the whole loader
 wraps it with a closed static field/role identifier to satisfy SCHEMA.md.
 Diagnostics contain no input text and have an empty error-source chain.
-Unknown fields, duplicate references, URI/bind/CIDR parsing and snapshot text
-ownership remain later M04b2c3 work; these helpers cannot produce a complete
+Unknown fields, duplicate references and snapshot text ownership remain
+later M04b2c3 work; these helpers cannot produce a complete
 validated configuration.
+
+## Numeric endpoints and HTTPS values
+
+M04b2c3a2 implements `config::endpoint`. These are bounded, allocation-free
+value helpers, not a resolver, listener, TLS verifier or complete schema loader.
+They use the common DNS grammar above and SCHEMA.md's HTTPS authority profile.
+They do not normalize arbitrary URLs or interpret them through another URL
+library. Fixed error codes are `config_endpoint_origin`, `config_endpoint_uri`,
+`config_endpoint_address` and `config_endpoint_prefix`. The whole loader adds
+static field/role context and physical locations; this mapping remains
+unimplemented until M04b2c3a3/d. Errors have no source chain.
+
+`HttpsUri::parse` accepts at most 4096 ASCII bytes: lowercase `https://`, a
+243-byte DNS host, optional shortest decimal port 1..65535, and a bounded
+RFC 3986 path/query with checked percent triplets. It refuses userinfo,
+fragments, backslashes, controls, spaces, non-ASCII URI text, address literals,
+and the hex-number final labels excluded by SCHEMA.md. The original URI and
+host spelling remain borrowed unchanged; `same_origin` compares host with ASCII
+case folding and effective port (443 when absent). Preserve `raw()` for consumers
+such as JWS. `write_request_target` preserves path/query bytes and supplies `/`
+for an empty path, including before a query. It never percent-decodes or changes
+escape case, and retains literal or percent-encoded dot segments verbatim.
+No path authorization follows from this helper. Same-origin validation is a comparison helper, not proof of a CA's
+authority or permission to follow an endpoint.
+
+`Origin::parse` further allows only an absent path or one terminal `/`, with
+no query. Its canonical writer emits lowercase host, omits port 443 and omits
+the terminal slash. `HttpsUri::origin` exposes its origin, and both types
+share `Origin::same_origin` for comparisons. The host accessor still returns the original borrowed case.
+Both writers append to `bounded::TextBuffer` atomically: a capacity failure
+restores visible length, not overwritten tail bytes. Their private formatting
+implementations do bounded work and allocate nothing.
+
+`numeric_endpoint` parses at most 53 bytes into a std `SocketAddr`, rejects
+zero/noncanonical ports, mapped IPv6 and every zone spelling (including `%0`).
+IPv6 uses brackets. No bind-family policy or network action follows from that
+value; SCHEMA.md's IPv6 runtime adapter gate remains in force.
+
+`Prefix::parse` accepts at most 49 bytes of numeric CIDR text, requires zero
+host bits and shortest decimal lengths 1..32 or 1..128, and refuses mapped
+IPv6 prefixes. It retains a binary network and prefix length; equivalent IPv6
+spellings compare equal. Membership maps mapped-IPv6 socket peers to IPv4
+before checking, so only an IPv4 prefix can admit them. Receipt storage must
+still retain the original socket peer. No prefix alone proves gateway authority;
+current policy, TLS identity and local-recipient checks remain required.
+
+URI/origin/prefix Debug output is redacted. Explicit value accessors and std
+socket-address results expose their values to trusted callers; they are not
+safe logging substitutes. Persistent compact cells, combined arena ownership,
+reference binding and runtime publication remain later M04 work.

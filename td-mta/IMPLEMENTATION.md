@@ -241,13 +241,15 @@ Split at these concrete boundaries before dependent milestones start:
     a shared mailbox key preserving sender local case. Routing alone retains
     its postmaster folding. Fixed diagnostics attach parser source locations.
     No URI/network-value parser or owning snapshot is implemented here.
-  - **M04b2c3a2:** remaining checked common value parsing and private snapshot
-    text/index storage. Cover origins/directory URIs, numeric
-    binds/CIDRs and text/index ownership. Reuse a1's mailbox/path/DNS grammar;
-    URI authorities add SCHEMA.md's numeric-host spelling restriction. Freeze
-    new error codes and source mapping. Prove every field length, malformed spelling,
-    text-reference range and actual descriptor layout without filesystem/network
-    I/O.
+  - **M04b2c3a2:** implemented `config/endpoint.rs`: numeric sockets/CIDRs,
+    bounded HTTPS URIs/origins, preserved URI spelling and atomic canonical
+    origin/request-target output. Shared DNS syntax plus the HTTPS numeric-host
+    restriction, strict port/zone rules and mapped-peer membership are tested.
+    These are value helpers only, with no network or provider authority.
+  - **M04b2c3a3:** private snapshot text/index storage. Reuse a1/a2 values;
+    centralize canonical DNS storage, checked text-reference ranges and fixed
+    diagnostic mapping. Prove actual descriptor layouts and both text-region
+    ceilings without file/network I/O or a self-referential owning object.
   - **M04b2c3b:** bounded account/identity/address and domain-policy candidates.
     Support forward references, list declaration order, null/empty/name
     distinctions, default materialization, signature-file references and sorted

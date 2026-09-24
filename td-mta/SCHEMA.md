@@ -34,7 +34,7 @@ echo input bytes.
 | Server/listener/relay/MX/URI-authority DNS name | At most 243 bytes, matching the routing-domain bound |
 | Derived certificate DNS name | At most 253 bytes; includes `mta-sts.` plus a served domain |
 | IP address | Numeric IPv4 or IPv6; no zone ID or hostname lookup |
-| Bind address | Numeric socket address including port 1..65535; IPv6 uses brackets |
+| Bind address | Numeric socket address with shortest unsigned decimal port 1..65535; IPv6 uses brackets |
 | Absolute path | 1..4095 UTF-8 bytes; leading `/`; no NUL, empty interior component, `.` or `..`; trailing `/` only for root `/` |
 | Boolean/integer | CONFIG.md literal grammar, with field ranges below |
 
@@ -53,15 +53,17 @@ URI-authority DNS names use the 243-byte bound above. These
 authority/port/scheme rules also apply to the ACME URI. URI authorities also
 reject a final label consisting of `0x`/`0X` and zero or more hex digits: URL
 clients can reinterpret those as numeric IPv4 components. This is an HTTPS
-authority restriction, not a change to SMTP routing DNS names. M04b2c3a2 must
-enforce it before exposing URI/origin helpers. The
+authority restriction, not a change to SMTP routing DNS names.
+`config::endpoint` enforces it for URI/origin helpers. The
 [URL host parsing rules](https://url.spec.whatwg.org/#ends-in-a-number) motivate
 this stricter authority profile.
 
 An ACME directory URI also uses HTTPS and a DNS authority, but may have a path
 and query. Its ASCII path/query must follow RFC 3986 character and
 percent-triplet syntax; reject fragments, userinfo, backslashes, spaces and
-controls. An empty path is `/` for HTTP requests. Preserve the validated URI's
+controls. Literal and percent-encoded dot segments remain verbatim; no path
+authorization is inferred from them. An empty path is `/` for HTTP requests.
+Preserve the validated URI's
 spelling for the consumer, separately from its folded TLS hostname and checked
 numeric port. JWS endpoint handling remains M18 and must not reinterpret URI
 identity. [URI syntax](https://datatracker.ietf.org/doc/html/rfc3986) supplies
@@ -108,9 +110,9 @@ paths.
 ### `[resolver "NAME"]` — 1..4 required
 
 Each resolver has exactly one required `address` field, a numeric socket
-address with port 1..65535. It identifies the UDP/TCP DNS server; it is not a
-bind. Reject duplicate numeric endpoints, mapped IPv6 and zone IDs. Resolver
-stanza order sets fallback order. V1 uses these explicit endpoints only, never
+address with shortest unsigned decimal port 1..65535. It identifies the
+UDP/TCP DNS server; it is not a bind. Reject duplicate numeric endpoints,
+mapped IPv6 and zone IDs. Resolver stanza order sets fallback order. V1 uses these explicit endpoints only, never
 ambient NSS, `/etc/resolv.conf` or automatically selected public resolvers. A
 loopback resolver requires an actual service at that endpoint; configuration
 does not provide one. Tests name their local fixture address explicitly.
