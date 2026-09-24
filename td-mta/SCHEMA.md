@@ -50,7 +50,13 @@ slash means the same origin. Canonical output folds the hostname, omits port
 ports are 1..65535 in shortest unsigned decimal spelling: reject empty, zero,
 leading-zero or signed ports. JMAP origin text is at most 4096 bytes;
 URI-authority DNS names use the 243-byte bound above. These
-authority/port/scheme rules also apply to the ACME URI.
+authority/port/scheme rules also apply to the ACME URI. URI authorities also
+reject a final label consisting of `0x`/`0X` and zero or more hex digits: URL
+clients can reinterpret those as numeric IPv4 components. This is an HTTPS
+authority restriction, not a change to SMTP routing DNS names. M04b2c3a2 must
+enforce it before exposing URI/origin helpers. The
+[URL host parsing rules](https://url.spec.whatwg.org/#ends-in-a-number) motivate
+this stricter authority profile.
 
 An ACME directory URI also uses HTTPS and a DNS authority, but may have a path
 and query. Its ASCII path/query must follow RFC 3986 character and
@@ -207,7 +213,7 @@ sending authority.
 | --- | --- | --- |
 | `account` | Object ID text, required | Sole account ID |
 | `name` | Text, empty | At most 4096 UTF-8 bytes |
-| `email` | SMTP mailbox text, required | ASCII mailbox spelling and 254/64-byte limits from CONFIG.md; no domainless form |
+| `email` | SMTP mailbox text, required | ASCII mailbox spelling and 254-byte address/64-byte local/243-byte domain limits from CONFIG.md; no domainless form |
 | `reply_to` | Boolean, false | false means null; true means a present ordered list |
 | `bcc` | Boolean, false | false means null; true means a present ordered list |
 | `text_signature_file` | Absolute path, absent | Absent materializes an empty signature |
@@ -298,7 +304,7 @@ unlabelled `[acme]` singleton with these fields:
 | Field | Type/default | Constraint |
 | --- | --- | --- |
 | `directory` | HTTPS URI text, required | At most 4096 ASCII bytes |
-| `contact` | SMTP mailbox text, required | Operator contact; encoded as a mailto contact by M18 |
+| `contact` | SMTP mailbox text, required | Same 254/64/243-byte mailbox limits; encoded as a mailto contact by M18 |
 | `terms_accepted` | Boolean, false | Must be true to enable orders |
 | `ca_file` | Absolute path, absent | Protected trust override for the directory HTTPS connection |
 

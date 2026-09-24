@@ -457,3 +457,49 @@ configuration fingerprint. It borrows validated text and requires sorted,
 unique identity IDs. This helper does not bind identity stanzas, materialize
 defaults, authorize sending or hash/publish state. The complete schema loader
 remains M04b2c3; the crypto provider and JMAP integration remain M07/M15.
+
+## Common scalar values
+
+M04b2c3a1 implements `config::values`, the shared scalar grammar for later
+stanza builders. It validates profile names, configured DNS names, derived
+certificate names and lexical absolute paths against SCHEMA.md. It does no
+filesystem access, DNS lookup, reference resolution or authorization. Profile
+names are at most 64 bytes, ordinary endpoint/routing DNS names 243 bytes,
+derived certificate names 253 bytes, and paths 4095 UTF-8 bytes. The source
+parser still owns control-character restrictions; path validation alone is
+not proof of safe operator-file bytes or protected ancestors.
+
+`paths_overlap` first validates both paths, then compares whole components
+including equality; `/a` overlaps `/a/b`, not `/a-other`. Root `/` overlaps
+any absolute path. Symlink aliases and descriptor identity remain M05 checks.
+
+DNS helpers only validate; they do not return folded storage. The later
+snapshot text builder owns shared lowercase copying, and callers must fold
+names before canonical storage or compare with ASCII case folding. Both DNS
+ceilings intentionally return `config_value_dns_name`; the outer loader adds
+static field/role context when reporting a complete schema error.
+
+`mailbox_key` applies the same 243-byte domain ceiling to every configured
+mailbox, including identities, reply-to/BCC entries and ACME contacts. It
+reuses the routing mailbox grammar and writes into a caller's
+254-byte array. The returned prefix is decoded local bytes, a NUL separator,
+and the lowercase ASCII domain. Local case is preserved, including postmaster.
+Only inbound routing applies its reserved case-insensitive postmaster rule;
+from-address authorization must not inherit that exception. This key is not an
+SMTP command/path parser, a header address parser, or permission to send. A
+syntactically valid star local part remains representable here; the identity
+builder separately rejects wildcard sending identities as SCHEMA.md requires.
+Failed parsing may leave partial bytes; only a successful returned prefix is
+valid, and no operation scrubs the caller's backing storage.
+
+The helpers allocate nothing and return fixed codes `config_value_profile_name`,
+`config_value_dns_name`, `config_value_absolute_path` and
+`config_value_mailbox`. `Code::at` attaches a caller-supplied physical location:
+the whole loader uses assignment `value_location`, or the labelled section's
+location for label failures. It does not fabricate an internal byte offset.
+This lower-level diagnostic does not carry a field name; the whole loader
+wraps it with a closed static field/role identifier to satisfy SCHEMA.md.
+Diagnostics contain no input text and have an empty error-source chain.
+Unknown fields, duplicate references, URI/bind/CIDR parsing and snapshot text
+ownership remain later M04b2c3 work; these helpers cannot produce a complete
+validated configuration.

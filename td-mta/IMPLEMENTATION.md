@@ -236,11 +236,16 @@ Split at these concrete boundaries before dependent milestones start:
 - **M04b2c3:** SCHEMA.md specifies the complete operator schema and the
   remaining snapshot partition. Its implementation is split below; none of
   these loaders is implemented by the schema document.
-  - **M04b2c3a:** checked common value parsing and private snapshot text/index
-    storage. Cover profile names, DNS names, origins/directory URIs, numeric
-    binds/CIDRs and lexical absolute paths. Share existing mailbox comparison
-    semantics; do not create conflicting address parsers. Freeze fixed error
-    codes and source mapping. Prove every field length, malformed spelling,
+  - **M04b2c3a1:** implemented common scalar values in `config/values.rs`:
+    profile/DNS/certificate-name/path checks, component-wise root overlap and
+    a shared mailbox key preserving sender local case. Routing alone retains
+    its postmaster folding. Fixed diagnostics attach parser source locations.
+    No URI/network-value parser or owning snapshot is implemented here.
+  - **M04b2c3a2:** remaining checked common value parsing and private snapshot
+    text/index storage. Cover origins/directory URIs, numeric
+    binds/CIDRs and text/index ownership. Reuse a1's mailbox/path/DNS grammar;
+    URI authorities add SCHEMA.md's numeric-host spelling restriction. Freeze
+    new error codes and source mapping. Prove every field length, malformed spelling,
     text-reference range and actual descriptor layout without filesystem/network
     I/O.
   - **M04b2c3b:** bounded account/identity/address and domain-policy candidates.
@@ -250,8 +255,8 @@ Split at these concrete boundaries before dependent milestones start:
     references, defaults and missing/duplicate/conflicting targets. Protected
     input materialization and preimage invocation belong to M04b3, which reserves
     borrowed views within 80 KiB of the existing control-worker stack.
-  - **M04b2c3c:** bounded relay/certificate/gateway/listener candidates and their
-    reference graph. Enforce role-specific fields, origin/port/certificate
+  - **M04b2c3c:** bounded resolver/relay/certificate/gateway/listener candidates
+    and their reference graph. Enforce role-specific fields, origin/port/certificate
     required-name derivation, gateway pins/prefixes, no public plaintext fixture,
     session-pool totals and bind conflicts. Test direct, gateway and combined
     profiles entirely offline, including incompatible and dangling policies.

@@ -6,8 +6,7 @@ use std::{cmp::Ordering, fmt, num::NonZeroU32};
 pub const MAX_DOMAINS: usize = 256;
 pub const MAX_ALIASES: usize = 4096;
 pub const MAX_TEXT_BYTES: usize = 320 * 1024;
-pub const MAX_DOMAIN_BYTES: usize = 243; // The mandatory postmaster address fits 254.
-const MAX_LOCAL_BYTES: usize = 64;
+pub const MAX_DOMAIN_BYTES: usize = super::values::MAX_DOMAIN_BYTES; // The mandatory postmaster address fits 254.
 const ORIGIN: Location = Location {
     line: NonZeroU32::MIN,
     column: 1,
@@ -135,111 +134,23 @@ impl DomainSlot {
     }
 }
 fn domain_valid(input: &str) -> bool {
-    !input.is_empty()
-        && input.len() <= MAX_DOMAIN_BYTES
-        && input.is_ascii()
-        && input
-            .rsplit('.')
-            .next()
-            .is_some_and(|label| !label.bytes().all(|b| b.is_ascii_digit()))
-        && input.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .as_bytes()
-                    .last()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
+    super::values::dns_name(input).is_ok()
 }
-fn atext(b: u8) -> bool {
-    b.is_ascii_alphanumeric()
-        || matches!(
-            b,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'/'
-                | b'='
-                | b'?'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'{'
-                | b'|'
-                | b'}'
-                | b'~'
-        )
-}
-fn put(output: &mut [u8], length: &mut usize, byte: u8) -> Result<(), Code> {
-    *output.get_mut(*length).ok_or(Code::InvalidAddress)? = byte;
-    *length = length.checked_add(1).ok_or(Code::InvalidAddress)?;
-    Ok(())
-}
-/// Internal canonical key: decoded local part, NUL separator, folded domain.
-/// This is not a message-header or complete SMTP path parser.
+/// Inbound routing alone folds the reserved postmaster local part.
 fn address_key<'a>(input: &str, output: &'a mut [u8; MAX_ADDRESS]) -> Result<&'a [u8], Code> {
-    if input.len() > MAX_ADDRESS || !input.is_ascii() {
-        return Err(Code::InvalidAddress);
-    }
-    let (local, domain) = input.rsplit_once('@').ok_or(Code::InvalidAddress)?;
-    if !domain_valid(domain) || local.is_empty() || local.len() > MAX_LOCAL_BYTES {
-        return Err(Code::InvalidAddress);
-    }
-    let mut length = 0;
-    if let Some(body) = local.strip_prefix('"') {
-        let body = body.strip_suffix('"').ok_or(Code::InvalidAddress)?;
-        let mut bytes = body.bytes();
-        while let Some(byte) = bytes.next() {
-            let byte = if byte == b'\\' {
-                let escaped = bytes.next().ok_or(Code::InvalidAddress)?;
-                if !(32..=126).contains(&escaped) {
-                    return Err(Code::InvalidAddress);
-                }
-                escaped
-            } else {
-                if !(32..=126).contains(&byte) || byte == b'"' {
-                    return Err(Code::InvalidAddress);
-                }
-                byte
-            };
-            put(output, &mut length, byte)?;
-        }
-        if length == 0 {
-            return Err(Code::InvalidAddress);
-        }
-    } else {
-        if !local
-            .split('.')
-            .all(|atom| !atom.is_empty() && atom.bytes().all(atext))
-        {
-            return Err(Code::InvalidAddress);
-        }
-        for byte in local.bytes() {
-            put(output, &mut length, byte)?;
-        }
-    }
-    let decoded = output.get_mut(..length).ok_or(Code::InvalidAddress)?;
-    if decoded.eq_ignore_ascii_case(b"postmaster") {
-        decoded.make_ascii_lowercase();
-    }
-    put(output, &mut length, 0)?;
-    for byte in domain.bytes() {
-        put(output, &mut length, byte.to_ascii_lowercase())?;
+    let key = super::values::mailbox_key(input, output).map_err(|_| Code::InvalidAddress)?;
+    let length = key.len();
+    let separator = key
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or(Code::InvalidAddress)?;
+    let local = output.get_mut(..separator).ok_or(Code::InvalidAddress)?;
+    if local.eq_ignore_ascii_case(b"postmaster") {
+        local.make_ascii_lowercase();
     }
     output.get(..length).ok_or(Code::InvalidAddress)
 }
+
 fn key_parts(key: &[u8]) -> Result<(&[u8], &[u8]), Error> {
     let split = key.iter().position(|b| *b == 0).ok_or_else(invariant)?;
     let after = split.checked_add(1).ok_or_else(invariant)?;
@@ -570,6 +481,7 @@ impl Routing<'_> {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::config::values::MAX_LOCAL_BYTES;
     const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
     fn at(line: u32) -> Location {
         Location {
