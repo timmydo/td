@@ -10,9 +10,10 @@ inspecting the filesystem. M04c2 supplies pure charged meters and timer
 budgets in `src/admission/work.rs` and `src/admission/timers.rs`. M04c3a
 supplies pure physical-space arithmetic in `src/admission/space.rs`. M04c3b1
 supplies fixed logical leases and linear effect tickets in
-`src/admission/logical.rs`, using `src/admission/quota.rs`. M04c3b2/M04c3b3
-own the derived writer/checkpoint ledger and composed physical reservation
-coordinator. M05/M08 supply physical probes, persistence and maintenance.
+`src/admission/logical.rs`, using `src/admission/quota.rs`. M04c3b2 supplies
+the scalar writer/checkpoint ledger in `src/admission/writer.rs`. M04c3b3
+owns the composed physical reservation coordinator. M05/M08 supply physical
+probes, persistence and maintenance.
 M13 owns request retention. No running admission coordinator or filesystem
 probe is claimed.
 
@@ -164,6 +165,63 @@ Unexpected internal failures after slot acquisition poison the table and stop
 new work; ordinary refusal rolls back without changing live charges.
 No syscall, publication or authoritative cleanup is implemented here.
 
+### Writer ledger implementation
+
+M04c3b2's WriterLedger owns the logical lease table, selected table-length
+baseline and scalar writer phase. It reads committed journal frames from the
+same ledger's used buckets and outstanding frames from its pending buckets;
+there is no duplicate journal counter. Recovery supplies the selected lengths
+and used quotas from one trusted snapshot. Active bytes exclude the 96-byte
+segment header. Zero committed frame bytes and zero operations must agree.
+
+Preparation checks all logical caps and derives the checkpoint bound from
+selected tables plus committed, pending and candidate frame bytes/operations.
+A prepared request holds an exclusive ledger borrow through the future physical
+assessment; dropping it changes nothing. Installation rechecks its deadline
+and atomically acquires the logical cells. A framed job appends one dedicated
+frame cell to at most seven ordinary cells. Generic requests/effects reject
+active/closed journal, checkpoint and live-metadata quota kinds even at zero
+amount; these require writer or maintenance transitions. This increment does
+not yet expose extensions through WriterLedger; the composed coordinator must
+add physically checked ordinary/frame extensions before consumers use it.
+
+Only one dedicated append ticket may be in flight. Its actual byte/operation
+amounts must fit the reserved ceilings; both ceilings and actual counts must
+fit the minimum encoded size for that many operations. M08 still validates
+the serialized frame. Proven durable completion moves exactly those amounts
+from pending to used and atomically releases the unused frame remainder.
+A frame reservation permits only one successful transaction; separated appends
+cannot reuse its rounded physical budget. Proven no-write completion leaves
+the reservation unchanged and permits retry. An uncertain
+append keeps its ticket busy and pending and stops writer admission: the active
+EOF may have a torn tail, so checkpoint rollover is unsafe before recovery.
+Losing an append ticket also pins the writer. No generic effect can consume a
+frame cell. An already consumed append ticket cannot stop a later retry on
+the same frame; every result validates ticket liveness before changing phase.
+
+A simulated checkpoint barrier refuses while an append is in flight and checks
+closed-journal byte/segment caps before closing all new admission. It protects
+the future logical transfer by excluding concurrent writer changes, without
+posting a duplicate pending charge. Existing non-journal effects can finish
+and outstanding jobs can resolve parts, enumerate expired leases and cancel
+through the barrier. Read accessors remain available. Proven abort before any
+selection reopens unchanged; a dropped barrier stops the writer. Uncertain
+selection also stops the writer. Actual writer/view locking and pin eligibility remain M08.
+
+After trusted durable selection, one quota transition adds the old active
+journal's 96-byte header plus committed frame bytes to closed-journal usage,
+adds one closed segment, and clears only committed active bytes/operations.
+Outstanding frame reservations and their identifiers stay unchanged. The new
+selected table length must fit the committed-only output bound and
+live-metadata cap; uncommitted reservations cannot explain selected output.
+Invalid selection leaves counters unchanged and stops the writer, because
+the adapter reported an already durable on-disk change. Success enters
+AwaitingSpace; there is deliberately no public reopen operation. M04c3b3 must
+first establish a fresh probe and protect capacity for the next checkpoint.
+Checkpoint building/retention quota and physical transfer are not implemented
+by this scalar barrier. M08's exact live-metadata updates, selected identities,
+publication proof and cleanup authority are also still required.
+
 ## 2. Free space and completion reserves
 
 Keep 128 MiB of filesystem free space above all outstanding reservations, and
@@ -246,8 +304,16 @@ Count every prospective file, including all eleven tables, manifest and
 CURRENT temporary; reserve new directory/file inodes separately. This padding
 is required even when an allocation unit exceeds the 1 MiB format allowance.
 The RoundedGrowth total-bound constructor implements this conservative bound.
-Transfer outstanding leases to the new journal during the existing checkpoint
-barrier; they keep their charges and identities and acquire no sequence early.
+In addition to the thirteen generation files and fourteen file/directory
+inodes, protect a fresh active journal: round its 96-byte header separately
+and reserve one more inode. Closing the old journal changes its logical quota
+category, without physical growth from the rename itself. Transfer outstanding
+leases to the new journal during the checkpoint barrier; they keep their
+charges and identities and acquire no sequence early. Transferable WAL leases
+reserve `round_up(frame_bytes, unit)` independently of the old active EOF;
+its available trailing block cannot be assumed to exist at the new journal's
+EOF. The bound `round_up(x + n) - round_up(x) <= round_up(n)` preserves capacity
+across that rebase. M04c3b3 enforces these physical reservations and transfers.
 
 Maintenance, cache rebuilds, logging and new requests cannot borrow the space
 needed to finish admitted commits or the last permitted checkpoint. If retiring
@@ -630,7 +696,16 @@ of startup use above a cap. Expiry enumeration covers short output buffers and
 busy non-root members; overflow and disabled extensions preserve the book.
 These tests exercise logical state transitions;
 physical coupling, writer barriers, actual cleanup and live probes remain
-M04c3b2/M04c3b3/M05/M08 gates.
+M04c3b3/M05/M08 gates.
+
+M04c3b2 tests derive checkpoint bounds from used/pending/candidate counters,
+exercise serialized proven/uncertain appends, reject generic writer-quota
+bypasses, check barrier abort/refusal and closed-journal caps, and preserve
+outstanding IDs/charges across scalar rollover. These are conditional
+accounting tests, not filesystem publication or view-pin evidence. Additional
+cases pin append-ticket replay, one successful transaction per frame lease,
+barrier expiry handling, stopped completion handling, dropped/uncertain
+barriers, committed-only selection bounds and exact closed-quota fits.
 
 M04/M05/M08/M13 add tests at their real execution boundaries, not document-only
 assertions: concurrent quota reservations cannot overbook; failed publications

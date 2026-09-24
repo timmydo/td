@@ -223,8 +223,10 @@ Split at these concrete boundaries before dependent milestones start:
 - **M04c3b1:** fixed logical quota groups and linear effect tickets in
   `admission/quota.rs` and `admission/logical.rs`; no physical I/O permission.
 - **M04c3b2:** coordinator-owned selected/journal scalar ledger and derived
-  checkpoint capacity, including reserved candidate frames and simulated
-  writer-barrier transitions. M08 supplies trusted selected/committed state.
+  checkpoint capacity in `admission/writer.rs`, including reserved candidate
+  frames, dedicated append tickets and simulated writer-barrier transitions.
+  Rollover preserves outstanding leases and stays closed for physical admission.
+  M08 supplies trusted selected/committed state and exact metadata accounting.
 - **M04c3b3:** fresh filesystem probe matching and atomic physical/logical
   reservation/effect accounting using the preceding helpers. Building
   checkpoints transfer protected capacity without double charging; admission

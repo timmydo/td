@@ -337,9 +337,13 @@ atomic grouped quota checks and linear effect tickets. Its cell plus slot
 bookkeeping fits 80 bytes on the current target, leaving 48 of the existing
 128 bytes for the composed physical record; M04c3b3 must pin the actual
 combined layout before enabling physical admission. No replacement cells
-are allocated on saturation. M04c3b2/M04c3b3 still own the derived checkpoint
-ledger, atomic physical coupling and probe identity/freshness. M05/M08 own
-actual written/orphan cleanup authority.
+are allocated on saturation. M04c3b2's scalar writer ledger wraps this same
+table; each framed job uses one of its cells for journal bytes/operations.
+Prepared requests and quota projections use fixed stack arrays, with no heap
+growth. Its checkpoint barrier preserves pending frame ownership and does
+not reopen on selection. M04c3b3 still owns atomic physical coupling, transfer
+of checkpoint capacity and probe identity/freshness. M05/M08 own actual
+written/orphan cleanup, writer/view locking and publication authority.
 
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
 buffers and atomic text formatting. They neither allocate backing storage nor

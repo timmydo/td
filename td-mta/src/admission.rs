@@ -50,6 +50,7 @@ pub mod quota;
 pub mod space;
 pub mod timers;
 pub mod work;
+pub mod writer;
 
 settings! { DiskLimits {
     body_bytes: 4 * GIB, 1, 1024 * GIB;

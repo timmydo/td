@@ -152,6 +152,35 @@ impl Quotas {
         }
         Ok(next)
     }
+    /// Called only at the writer barrier. Header bytes were already written;
+    /// this is a logical category transfer, never new physical growth.
+    pub(super) fn with_rollover(&self) -> Result<Self, Kind> {
+        let mut next = self.clone();
+        let bytes = self
+            .used
+            .get(Kind::ActiveJournalBytes)
+            .map_err(|_| Kind::ActiveJournalBytes)?;
+        let operations = self
+            .used
+            .get(Kind::ActiveJournalOperations)
+            .map_err(|_| Kind::ActiveJournalOperations)?;
+        let header = super::widen(crate::format::JOURNAL_HEADER_BYTES, "journal header")
+            .map_err(|_| Kind::ClosedJournalBytes)?;
+        let closed = bytes.checked_add(header).ok_or(Kind::ClosedJournalBytes)?;
+        next.used
+            .add(Kind::ClosedJournalBytes, closed)
+            .map_err(|_| Kind::ClosedJournalBytes)?;
+        next.used
+            .add(Kind::ClosedJournalSegments, 1)
+            .map_err(|_| Kind::ClosedJournalSegments)?;
+        next.used
+            .subtract(Kind::ActiveJournalBytes, bytes)
+            .map_err(|_| Kind::ActiveJournalBytes)?;
+        next.used
+            .subtract(Kind::ActiveJournalOperations, operations)
+            .map_err(|_| Kind::ActiveJournalOperations)?;
+        next.with_reservation(Usage::default())
+    }
     // Private transitions to be wired to checked live lease entries. No public
     // release-by-kind or public constructed reservation can authorize effects.
     pub(super) fn complete(&mut self, used: Usage) -> Result<(), Error> {

@@ -163,6 +163,34 @@ impl<'a> Leases<'a> {
         self.slots.available()
     }
 
+    pub(super) fn quotas(&self) -> &Quotas {
+        &self.quotas
+    }
+    pub(super) fn project(&self, requests: &[Charges]) -> Result<Quotas, Error> {
+        self.healthy()?;
+        if requests.is_empty() || requests.len() > MAX_GROUP_CELLS {
+            return Err(Error::Invalid);
+        }
+        if requests.len() > self.slots.available() {
+            return Err(Error::Full);
+        }
+        let mut extra = Usage::default();
+        for charges in requests {
+            for charge in charges {
+                extra.add(charge.kind, charge.amount)?;
+            }
+        }
+        self.quotas.with_reservation(extra).map_err(Error::Quota)
+    }
+    pub(super) fn project_rollover(&self) -> Result<Quotas, Error> {
+        self.healthy()?;
+        self.quotas.with_rollover().map_err(Error::Quota)
+    }
+    pub(super) fn rollover(&mut self) -> Result<(), Error> {
+        self.quotas = self.project_rollover()?;
+        Ok(())
+    }
+
     /// Atomic across up to eight records. Duplicate kinds add across the group.
     /// This reserves logical budgets only; the full coordinator couples it to
     /// fresh physical probes and its derived checkpoint reserve before effects.
@@ -191,13 +219,7 @@ impl<'a> Leases<'a> {
         if requests.len() > self.slots.available() {
             return Err(Error::Full);
         }
-        let mut extra = Usage::default();
-        for charges in requests {
-            for charge in charges {
-                extra.add(charge.kind, charge.amount)?;
-            }
-        }
-        let next = self.quotas.with_reservation(extra).map_err(Error::Quota)?;
+        let next = self.project(requests)?;
         let mut issued = [None; MAX_GROUP_CELLS];
         for ordinal in 0..requests.len() {
             let id = match acquire(&mut self.slots, ordinal) {
@@ -363,6 +385,28 @@ impl<'a> Leases<'a> {
         ticket: &mut EffectTicket,
         result: EffectResult,
     ) -> Result<(), Error> {
+        self.complete_effect_inner(ticket, result, false)
+    }
+    pub(super) fn check_effect(&self, ticket: &EffectTicket) -> Result<(), Error> {
+        let part = ticket.part.ok_or(Error::InactiveTicket)?;
+        if !self.record(part)?.1.busy {
+            return Err(Error::Invalid);
+        }
+        Ok(())
+    }
+    pub(super) fn complete_frame(
+        &mut self,
+        ticket: &mut EffectTicket,
+        result: EffectResult,
+    ) -> Result<(), Error> {
+        self.complete_effect_inner(ticket, result, true)
+    }
+    fn complete_effect_inner(
+        &mut self,
+        ticket: &mut EffectTicket,
+        result: EffectResult,
+        release_remainder: bool,
+    ) -> Result<(), Error> {
         let part = ticket.part.ok_or(Error::InactiveTicket)?;
         let (index, mut record) = self.record(part)?;
         if !record.busy {
@@ -391,6 +435,14 @@ impl<'a> Leases<'a> {
         }
         let mut next = self.quotas.clone();
         next.complete(used)?;
+        if release_remainder {
+            let mut unused = Usage::default();
+            for charge in record.charges() {
+                unused.add(charge.kind, charge.amount)?;
+            }
+            next.release_unused(unused)?;
+            record.amounts.fill(0);
+        }
         record.busy = false;
         let cell = self.cells.get_mut(index).ok_or(Error::Stale)?;
         cell.record = Some(record);
