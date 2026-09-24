@@ -857,3 +857,61 @@ source chain. Inputs/builders/records/views and pins redact Debug output;
 explicit accessors are trusted data. Backing bytes are not scrubbed. Whole
 stanza dispatch, field diagnostics, EOF, protected inputs and runtime
 publication remain later milestones.
+
+
+## Structural certificate and ACME records
+
+M04b2c3c3 implements `config::certificate` for complete typed certificate
+profiles and optional ACME settings. The caller supplies 1..16 cells of at
+most 128 bytes in the existing 2 KiB profile reservation. The complete
+borrowed records header, including the ACME singleton, fits 128 bytes of
+global settings/headroom; the builder fits 256 bytes of existing builder
+workspace. These are compile-time ceilings. All text uses the shared 192 KiB
+region. Records hold references to operator paths, never raw keys, chains,
+parsed roots or provider objects; those belong to the separate
+certificate-generation budget and protected/provider validation.
+
+A typed profile input is either ACME or files with both chain and key paths.
+Paths receive lexical validation only. The future M04b2c3d whole stanza
+dispatcher must reject missing or forbidden operator fields before
+constructing this typed input. In files mode, missing chain/key fields use
+`config_certificate_chain_required` / `config_certificate_key_required`; in
+ACME mode, supplied chain/key fields use
+`config_certificate_chain_forbidden` / `config_certificate_key_forbidden`.
+These four dispatcher codes are specified here but remain unimplemented
+until M04b2c3d; it must test every field-presence combination for both
+modes. It may never discard a forbidden field during conversion to
+`ProfileInput::Acme`. Names are unique profile labels and retain declaration
+order. Mode names are the canonical `acme` and `files` spellings. Every
+newly used cell is fully written, and unused cells are not exposed after
+storage reuse.
+
+ACME settings may precede profile declarations. They require a valid bounded
+HTTPS directory URI, SMTP mailbox contact, explicit accepted terms and an
+optional lexical CA path. Keep directory URI and contact spelling unchanged;
+`HttpsUri` supplies the configured origin. M18 owns mailto percent encoding,
+same-origin enforcement for operational URLs, account creation and issuance.
+No automatic terms-link fetch or network request occurs here. Finalization
+requires at least one profile and an ACME section exactly when an ACME-mode
+profile exists. Missing settings report the first ACME profile; an unused
+ACME section reports its own coordinate. Files-only profiles need no ACME
+settings. With zero profiles, the missing-profile error takes precedence
+even when an ACME section exists. Profile consumption, required-name sets,
+SNI conflicts and the ACME HTTP-01 requirement remain M04b2c3c4b checks; c4a
+owns listener role fields and the HTTP-01 bind port.
+
+Profile checks run in this order: name syntax, duplicate declaration, path
+syntax, then available capacity, before any text writes. This retains the
+prior declaration coordinate for a duplicate even on a full table.
+
+Mutations verify arena ownership and retain the first error. A later text
+capacity failure may leave earlier appended fields charged, but finalization
+cannot return records. Immutable live/frozen views require matching owners;
+every compact text read checks ownership again. Indexed access returns no
+item past the used prefix. Stanza coordinates remain available in successful
+views. Fixed `config_certificate_` codes distinguish chain, key and CA path
+errors, directory/contact errors, terms refusal, duplicates and missing
+references. They carry no raw values and have an empty source chain. Debug
+output is redacted; explicit view accessors expose trusted data. No helper
+establishes EOF, trusted file ownership, usable certificate material or
+runtime authority.

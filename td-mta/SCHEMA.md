@@ -501,6 +501,16 @@ combined 36 KiB size ceiling. All names, hostnames, usernames and unresolved fil
 use the existing 192 KiB non-routing text region. These structural records
 perform no DNS lookup or protected-file read and grant no network authority.
 
+Certificate profile cells use their separate 2 KiB partition. The complete
+borrowed records header, including the ACME singleton, fits 128 bytes of
+global settings/headroom, and its builder fits 256 bytes of builder
+workspace. A pending ACME stanza shares the 9 KiB pending-text reservation:
+directory, contact and CA path total at most 8445 bytes, plus field
+bookkeeping. A files-mode profile's two paths plus its 64-byte label total
+at most 8254 bytes. These variants reuse the pending stanza region rather
+than adding concurrent per-section buffers. Combined whole-loader layout
+checks remain mandatory.
+
 The loader owns one pending stanza in the 36 KiB builder workspace. In
 particular, retain only one alias label (at most 254 bytes) until its required
 account field is known, then hand it to the routing builder; never duplicate

@@ -284,22 +284,33 @@ Split at these concrete boundaries before dependent milestones start:
     checks and sticky failure protect live/frozen views and reused backing.
     Staged policies may have no peers; c4 validates consumers and requires peers
     for used gateways. No TLS peer authorization before M07/M12.
-  - **M04b2c3c3:** bounded certificate profiles and ACME settings: strict
-    mode-specific fields, explicit terms acceptance, protected material paths,
-    directory origin/contact validation. Provider verification remains M03/M07;
-    managed issuance and policy publication remain M18.
-  - **M04b2c3c4:** listener records and the complete reference graph. Enforce
-    role-specific fields, origin/port/certificate required-name derivation,
-    profile consumption, gateway peer requirements, no public plaintext
-    fixture, session-pool totals and bind conflicts. Test direct, gateway and
-    combined profiles entirely offline, including incompatible and dangling
-    policies. M11 owns actual socket policy.
+  - **M04b2c3c3:** implemented `config/certificate.rs`: bounded unique
+    profiles, typed ACME/files modes, lexical material paths, accepted terms,
+    preserved directory/contact spelling and ACME presence exactly when used.
+    Cells fit the existing 2 KiB profile reservation; small ACME globals and
+    builders fit existing headroom/workspace. Owner checks and sticky failure
+    protect live/frozen views. M04b2c3d must reject mode-specific required and
+    forbidden operator fields before constructing typed inputs. Provider verification
+    remains M03/M07; managed issuance and policy publication remain M18.
+  - **M04b2c3c4a:** listener records: role-specific required/forbidden fields,
+    no public plaintext fixture, HTTP-01 port, SMTP pool totals and bind
+    conflicts. Require SMTP and HTTPS roles. Preserve literal fields and
+    references for the graph below. M11 owns actual socket policy.
+  - **M04b2c3c4b:** complete reference graph: origin/port/certificate required
+    names, profile consumption, gateway peer requirements, ACME HTTP-01,
+    MTA-STS SNI mapping and direct-versus-upstream MX classification. Test
+    direct, gateway and combined profiles entirely offline, including
+    incompatible and dangling policies. No provider or network authority.
   - **M04b2c3d:** single whole-loader entry point owning its candidate and reader
     operation. Require root version, actual EOF, all mandatory sections and
     resource plans. Hold one pending stanza; avoid a whole-file AST or duplicate
     alias arena. Return only a structural candidate, with no runtime
-    authority. Test complete fixtures, every unknown/duplicate/type/missing
-    refusal, late read/handler failure, exhausted text/descriptors and unchanged
+    authority. Before constructing certificate typed inputs, reject missing
+    chain/key fields in files mode and either supplied path in ACME mode,
+    using CONFIG.md's fixed required/forbidden codes. Test both modes against
+    every presence combination, plus complete fixtures, every
+    unknown/duplicate/type/missing/forbidden refusal, late read/handler failure,
+    exhausted text/descriptors and unchanged
     caller-held prior validated configuration; M19 tests active generations.
     Concrete size checks must fit all snapshot/scratch partitions before M04b3/M19 consume the candidate.
 - **M04b3:** protected-file reference requirements and redacted effective
