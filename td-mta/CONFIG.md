@@ -915,3 +915,58 @@ references. They carry no raw values and have an empty source chain. Debug
 output is redacted; explicit view accessors expose trusted data. No helper
 establishes EOF, trusted file ownership, usable certificate material or
 runtime authority.
+
+## Structural listener records
+
+M04b2c3c4a implements `config::listener` for complete typed listener inputs.
+The five kinds are direct SMTP, gateway SMTP, HTTPS, HTTP-01 and an explicit
+plaintext loopback SMTP fixture. Required and forbidden fields follow
+SCHEMA.md's role matrix; a missing field and a supplied forbidden field have
+distinct fixed codes and a static field identifier. Direct/gateway server
+names receive shared DNS validation and lowercase storage. Certificate and
+gateway references receive profile-name validation only; their existence and
+compatibility are M04b2c3c4b checks. The source dispatcher still owns
+unknown fields, duplicates within a stanza, scalar types and reader EOF.
+
+Each bind is a parsed numeric socket endpoint. Loopback fixtures require
+127.0.0.0/8 or ::1, and HTTP-01 requires port 80. Duplicate listener names
+and conflicting binds retain both declaration coordinates. On the same
+address family and port, identical addresses or either unspecified address
+conflict. Separate IPv4 and IPv6 binds are structurally distinct. This does
+not establish IPV6_V6ONLY: runtime must still refuse IPv6 startup until M11
+supplies its audited socket adapter, as SCHEMA.md requires. No socket is
+opened here.
+
+SMTP roles require nonzero session and per-peer counts; per-peer cannot
+exceed the listener session limit. Checked integer conversion prevents
+truncation. Finalization checks each against the supplied checked
+ResourcePlan, sums all SMTP session limits within the global pool, and
+requires at least one SMTP and one HTTPS listener. A sum overrun reports
+SessionLimit and the first listener whose addition exceeded the pool. The
+explicit loopback fixture counts toward both the SMTP role requirement and
+the shared pool; SMTP plus HTTP-01 still fails the HTTPS requirement.
+Non-SMTP roles cannot carry those fields. HTTPS and HTTP-01 retain their
+existing shared runtime pools; no per-listener pool is allocated.
+JMAP-origin ports, ACME HTTP-01 availability, certificate consumers, SNI
+names, gateway peer requirements and MX classification remain c4b checks.
+
+The caller supplies 1..16 cells of at most 128 bytes, within the existing 2
+KiB listener partition; the builder fits 128 bytes of builder workspace. The
+complete borrowed records header fits 128 bytes of global headroom. These
+layout ceilings are checked at compile time. Text uses the shared 192 KiB
+region. A pending listener's label, server name, certificate/gateway labels
+and bind text total at most 488 bytes, within the existing shared
+pending-stanza reservation. Every used cell is fully written; reused cells
+beyond the current prefix remain inaccessible. Records bind to the text
+owner, and each compact read verifies it through the shared helper. Live
+views permit later protected-input appends after borrowed text is released.
+
+Profile/duplicate checks precede cell-capacity refusal and remaining field
+validation, which precedes text writes. A capacity error does not imply that
+remaining endpoint or role fields have been validated. A later text capacity
+error can retain charged partial bytes; all mutation failures are sticky and
+prevent finalization. Fixed `config_listener_` codes and Field names
+disclose only static schema context and source coordinates, with no
+error-source chain. Inputs/builders/records/ views redact Debug output.
+Trusted accessors expose declared settings and coordinates; these records
+grant no socket, TLS, gateway or SMTP authority.

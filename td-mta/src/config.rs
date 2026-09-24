@@ -4,6 +4,7 @@ pub mod endpoint;
 pub mod gateway;
 pub mod identities;
 pub mod identity;
+pub mod listener;
 pub mod outbound;
 pub mod policy;
 pub mod resources;

@@ -292,10 +292,12 @@ Split at these concrete boundaries before dependent milestones start:
     protect live/frozen views. M04b2c3d must reject mode-specific required and
     forbidden operator fields before constructing typed inputs. Provider verification
     remains M03/M07; managed issuance and policy publication remain M18.
-  - **M04b2c3c4a:** listener records: role-specific required/forbidden fields,
-    no public plaintext fixture, HTTP-01 port, SMTP pool totals and bind
-    conflicts. Require SMTP and HTTPS roles. Preserve literal fields and
-    references for the graph below. M11 owns actual socket policy.
+  - **M04b2c3c4a:** implemented `config/listener.rs`: role-specific required
+    and forbidden fields, loopback-only plaintext fixture, HTTP-01 port, checked
+    SMTP pool totals and same-family bind conflicts. Require SMTP and HTTPS
+    roles. Caller cells fit the 2 KiB listener reservation; owner-checked views
+    retain declared fields, references and coordinates for the graph below.
+    No socket is opened; IPv6 startup still needs M11's audited socket policy.
   - **M04b2c3c4b:** complete reference graph: origin/port/certificate required
     names, profile consumption, gateway peer requirements, ACME HTTP-01,
     MTA-STS SNI mapping and direct-versus-upstream MX classification. Test
@@ -303,8 +305,9 @@ Split at these concrete boundaries before dependent milestones start:
     incompatible and dangling policies. No provider or network authority.
   - **M04b2c3d:** single whole-loader entry point owning its candidate and reader
     operation. Require root version, actual EOF, all mandatory sections and
-    resource plans. Hold one pending stanza; avoid a whole-file AST or duplicate
-    alias arena. Return only a structural candidate, with no runtime
+    resource plans. Hold one pending stanza in SCHEMA.md's shared 13 KiB
+    variant reservation; measure all concurrent state within the 36 KiB builder
+    workspace. Avoid a whole-file AST or duplicate alias arena. Return only a structural candidate, with no runtime
     authority. Before constructing certificate typed inputs, reject missing
     chain/key fields in files mode and either supplied path in ACME mode,
     using CONFIG.md's fixed required/forbidden codes. Test both modes against

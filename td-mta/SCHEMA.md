@@ -488,34 +488,56 @@ finalization, do not escape, and are dropped before moving/publishing the
 owning snapshot. No typed reinterpretation of byte arenas, self-reference or
 extra allocation is required.
 
-Resolver/relay records use at most 1 KiB of the global settings/headroom
-partition, including their four inline resolver cells, relay fields and text
-owner. Their builder has a separate 1 KiB ceiling within the 36 KiB builder
-workspace; moving its records into the candidate does not create another
-persistent copy. The pending relay stanza also reserves 9 KiB within that
-workspace: its four retained text fields total at most 8687 bytes (243-byte
-host, 254-byte username and two 4095-byte paths), plus field presence and
-coordinates. This pending storage is shared with other stanza variants;
-it is not an additional reservation per section. M04b2c3d must enforce the
-combined 36 KiB size ceiling. All names, hostnames, usernames and unresolved file paths
-use the existing 192 KiB non-routing text region. These structural records
-perform no DNS lookup or protected-file read and grant no network authority.
+Resolver/relay records use at most 1 KiB of global settings/headroom,
+including four inline resolver cells, relay fields and their text owner.
+Their builder fits 1 KiB of the existing 36 KiB builder workspace. Moving
+records into the candidate does not create another persistent copy. All
+names, usernames and unresolved paths use the shared 192 KiB non-routing
+text region.
 
-Certificate profile cells use their separate 2 KiB partition. The complete
+Certificate profile cells use their separate 2 KiB partition. Their complete
 borrowed records header, including the ACME singleton, fits 128 bytes of
-global settings/headroom, and its builder fits 256 bytes of builder
-workspace. A pending ACME stanza shares the 9 KiB pending-text reservation:
-directory, contact and CA path total at most 8445 bytes, plus field
-bookkeeping. A files-mode profile's two paths plus its 64-byte label total
-at most 8254 bytes. These variants reuse the pending stanza region rather
-than adding concurrent per-section buffers. Combined whole-loader layout
-checks remain mandatory.
+global headroom, and the builder fits 256 bytes of builder workspace.
+Listener cells use their separate 2 KiB partition; their builder and
+borrowed records header each fit 128 bytes in the corresponding
+workspace/headroom. Gateway cells and peer cells use their separate 4 KiB
+partitions; reserve 128 bytes each for their builder and borrowed records
+header in workspace/headroom. These gateway header reservations are enforced
+by the combined layout check in M04b2c3d; current gateway host tests check
+the builder size. Structural helpers perform no DNS lookup, protected-file
+read or network operation.
 
-The loader owns one pending stanza in the 36 KiB builder workspace. In
-particular, retain only one alias label (at most 254 bytes) until its required
-account field is known, then hand it to the routing builder; never duplicate
-all alias spellings into the non-routing text arena. Resource builder state
-uses its existing 4 KiB allowance within that workspace.
+The loader owns one pending stanza within that same 36 KiB builder
+workspace. Reserve 13 KiB for the largest pending variant, including text
+and field bookkeeping. Reuse this region between stanzas; do not allocate
+one buffer per section or add the per-variant footprints together. Maximum
+retained text for the larger variants is:
+
+| Pending stanza | Text bytes before bookkeeping |
+| --- | ---: |
+| Identity: display name, email and two signature paths | 12540 |
+| Paths: three root paths | 12285 |
+| Relay: host, username and two paths | 8687 |
+| ACME: directory, contact and CA path | 8445 |
+| Files certificate: label and two paths | 8254 |
+| Gateway: label, CA path and two hex pins | 4287 |
+| Listener: label, server name, two profile names and bind | 488 |
+
+Relay and certificate/ACME variants individually fit within 9 KiB including
+bookkeeping; the shared 13 KiB reservation also accommodates identity and
+root-path variants. Decoded protected-file contents are loaded later into
+the candidate's text/material budgets, never into this pending
+operator-stanza buffer. M04b2c3d must measure the complete pending
+representation and all concurrent builder/header/global staging state
+against the combined 36 KiB ceiling before use. This partition does not
+increase the existing 64 KiB parser scratch reservation.
+
+Retain only one alias label (at most 254 bytes) until its account field is
+known, then hand it to the routing builder; never duplicate all alias
+spellings into non-routing text. The resource builder uses its existing 4
+KiB allowance within the same workspace. Static whole-loader fields such as
+the staged server hostname also count against that workspace, outside the
+reusable pending variant.
 
 The public whole-loader entry point owns the candidate and stream operation as
 one call. It must not accept an unrelated Summary as EOF evidence. On any
