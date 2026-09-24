@@ -317,6 +317,21 @@ Concrete implementations must fit these contracts before enabling service.
 
 ## Evidence
 
+M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
+buffers and atomic text formatting. They neither allocate backing storage nor
+grow it. Arena regions are disjoint Rust borrows; reuse requires their lifetimes
+to end. Wire consume/clear and failed formatting do not erase old bytes.
+Secret owners must enforce their own erasure/lifetime policy. Callers charge
+copy/compaction/format work and provide storage from the ledger, rather than
+requesting replacement storage when a helper reports capacity exhaustion.
+Only bounded trusted Display implementations may be used on hot paths.
+Reserve their maximum work before formatting, including failed attempts;
+TextBuffer's visible byte length is not a formatter-transition counter.
+Its byte view avoids revalidating UTF-8 when sending already encoded output.
+Tests cover every small compaction overlap, direct-I/O count errors, exact
+capacity, coexistence of arena regions and UTF-8/format rollback. Allocation
+instrumentation and measured whole-process bounds remain M23 requirements.
+
 The unit cases exercise malformed/canonical IDs, unsupported configuration
 versions, invalid pool relationships, arithmetic overflow, insufficient
 memory, expansion beyond the default budget, and streaming quotas independent

@@ -1,6 +1,7 @@
 //! Service foundations only: no listeners, protocol handlers or capabilities.
 #![forbid(unsafe_code)]
 
+pub mod bounded;
 pub mod format;
 pub mod ids;
 pub mod limits;

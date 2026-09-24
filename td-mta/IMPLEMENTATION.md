@@ -203,6 +203,24 @@ A clean fixture builds without undeclared ambient host toolchain inputs.
 
 **Depends on:** M02. **Own:** `bounded`, `config`, `event`, `limits` modules.
 
+Split at these concrete boundaries before dependent milestones start:
+
+- **M04a1:** caller-owned byte arenas, wire buffers and atomic bounded text
+  formatting in `bounded.rs`; fixed capacity and explicit work/ownership.
+- **M04a2:** fixed queues and checked reusable slot ownership, including
+  stale completions, cross-pool tokens, saturation and generation exhaustion.
+- **M04b:** stanza grammar, immutable configuration, alias/identity resolution,
+  secret-file references and redacted effective output, using the committed
+  buffer APIs.
+- **M04c:** checked disk/work settings and filesystem reservation accounting;
+  actual filesystem probes remain M05's boundary.
+- **M04d:** typed bounded event/status records, escaping and redaction.
+
+All parts gate M04 consumers. Individual helper modules are not a running
+allocator, scheduler, admission coordinator or service.
+Checked local/wire identifiers already exist from M01/M02; M04a2 owns the
+additional runtime slot tokens, and M04b validates configured references.
+
 Implement reusable buffers/arenas, bounded formatting, fixed-capacity queues,
 and checked identifiers. Implement the documented stanza grammar, immutable
 effective configuration, alias/identity resolution and secret-file references.
