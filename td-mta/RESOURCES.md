@@ -110,7 +110,7 @@ storage contract. SMTP retains room for at least 100 recipients. Disabled event
 streams may use zero slots; mandatory pools and byte budgets cannot be zero.
 The bounds are startup validation, not protocol error mappings or proof that
 all combinations meet standards. ADMISSION.md fixes operation work limits;
-M02c3c adds parser/search field limits. M13 publishes only limits that its
+POLICY.md adds parser/search field limits. M13 publishes only limits that its
 admission code actually enforces.
 
 ## Fixed execution ownership
@@ -261,7 +261,34 @@ This bounds simple slot pinning, not distributed denial of service.
 The six decode stages count nested transfer-decoding boundaries, separately
 from MIME structural depth. WIRE.md already refuses a seventh stage as
 notParsable while preserving raw download. MIME descriptors do not each own
-a decoder ring. M02c3c freezes the liberal/strict input decoding details.
+a decoder ring. POLICY.md freezes the input decoding details. Each 8 KiB stage
+reserves 6 KiB for bytes and 2 KiB for eight checkpoints of at most 256 bytes.
+A checkpoint records encoded/decoded positions and small decoder state; it
+never copies a ring. Retain the checkpoint before each buffer fill and those
+needed by the at-most-six nested lookahead users. Restoration discards buffered
+bytes and replays from the saved source state, not from the root file origin.
+Short whitespace runs use their resident ring directly. Long-run QP lookahead
+restores the whole bounded source-state chain and resumes after the known run;
+it cannot repeatedly search from the same position. M06 must prove linear
+replay in run length at the fixed six-stage ceiling, including refills and
+simultaneous nested lookahead. Every replay byte/transition is charged.
+
+The 32 KiB conversion region has this fixed simultaneous partition: 2 KiB NFC
+segment cells (256 cells), 1 KiB class counts, 1 KiB NFC source checkpoints,
+16 KiB Unicode token scalars, 8 KiB u16 KMP prefix entries, 2 KiB for 64 token
+descriptors, and 2 KiB decoder/HTML/snippet state. Simple lowercase maps one
+scalar to one scalar, even when UTF-8 lengths change. Compile and evaluate
+one token at a time, at most 4096 scalars; reuse the pattern/prefix arrays for
+the next token and charge rescans. Token descriptors retain request/spool
+extents rather than copies. Store matched-token bits in those descriptors.
+NFC and a matcher may run together within this partition; do not allocate a
+whole-query automaton. HTML retains bounded lexical state, not an element
+tree or arbitrary attribute string. Snippet context/escaping uses the 2 KiB
+state area in phases; exact match spans use the separately admitted disk file
+in POLICY.md. Fairness yields after at most 256 decoder/matcher transitions,
+including prefix fallback work, not just after successful input consumption.
+Thread candidate rings retain 64 source extents, not 64 owned 1004-byte IDs;
+materialize one lookup key at a time within existing parser/read scratch.
 
 The 128 KiB queue/state reservation has eight 64-entry input queues and one
 512-entry completion queue, all with 32-byte entries (32 KiB total), a
@@ -284,9 +311,9 @@ Exact stanza/field limits and snapshot structs are M04's implementation gate.
 
 This ledger does not budget whole earlier JMAP responses, generic JSON trees,
 or all MIME body values in memory. ADMISSION.md defines bounded private response
-spools/result references and their work/disk admission. M02c3c defines parser,
-charset/search/thread policies and the fixture inventory. Those remaining
-contracts still gate every M02 consumer.
+spools/result references and their work/disk admission. POLICY.md defines
+parser/charset/search/thread policies and CASES.md the fixture inventory.
+Concrete implementations must fit these contracts before enabling service.
 
 ## Evidence
 

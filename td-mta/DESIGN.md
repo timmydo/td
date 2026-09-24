@@ -18,6 +18,9 @@ implemented by those codecs. [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.
 [API.md](API.md) defines the compiling M02c2 adapter contracts and implemented
 state codecs; [QUEUE.md](QUEUE.md) freezes future queue/restart/JMAP semantics.
+[POLICY.md](POLICY.md) freezes message interpretation, threading and queries;
+[UNICODE.md](UNICODE.md) pins approved Unicode data and bounded normalization;
+[CASES.md](CASES.md) names the protocol acceptance oracles still to implement.
 
 The initial deployment is one person's approximately 1 GB of mail, multiple
 domains, and explicit aliases on each domain pointing into one account's
@@ -90,6 +93,12 @@ state machines, storage, JMAP methods, queue policy, config, and administration.
 Use a small `td-mta-runtime/` package to link that library with TLS/crypto and
 provide the installed binary named `td-mta`. This is a compile-time boundary;
 the operator installs one executable, with no td-net helper requirement.
+
+The core may contain owned tables generated from the approved, checksummed
+Unicode 17.0 inputs in UNICODE.md. They add no Cargo dependency or runtime data
+fetch. M06 owns reproducible offline generation, the complete license notice,
+official conformance vectors and bounded NFC implementation. This is a named
+data dependency, not permission to import a Unicode or mail parsing library.
 
 The runtime package is a proposed named exception to the current std-only
 roster. Before creating its manifest, amend AGENTS.md and both lock/gate paths
@@ -484,8 +493,9 @@ UTF-8/ASCII and a documented initial legacy-charset set. Unrenderable text is
 reported through JMAP's encoding/problem semantics and raw bytes remain
 downloadable; raw storage does not depend on rendering success. Pathological
 messages hitting processing limits expose a typed error without killing the
-service or hiding an accepted raw message. Define exact MIME/property coverage
-and fixtures before claiming the Mail capability.
+service or hiding an accepted raw message. POLICY.md defines decoding,
+charsets, opaque-message access and property behavior; CASES.md names their
+independent fixtures. Their implementation still gates the Mail capability.
 
 ## 10. HTTP and JMAP
 

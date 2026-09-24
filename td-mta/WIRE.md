@@ -70,8 +70,8 @@ digits. Tags: 00 identity, 01 base64, 02 quoted-printable. Unknown
 content-transfer encodings use JMAP's identity-decoding rule and tag 00;
 their original header remains available. Future locator versions/tags cannot
 be silently reinterpreted. Issued blob IDs always identify the same decoded
-octets, including malformed base64/QP handling. M02c3 freezes that decoding
-policy before any IDs are issued. Later parser/decoder changes that alter
+octets, including malformed base64/QP handling. POLICY.md section 3 freezes
+that decoding before any IDs are issued. Later parser/decoder changes that alter
 bytes require a new locator version and preservation of the old version's
 decoding for its live parents; they cannot assign different contents to an
 old ID.
@@ -79,8 +79,12 @@ old ID.
 The locator ranges over the encoded body bytes in the immutable parent file,
 excluding MIME delimiters. In particular, the CRLF immediately preceding a
 multipart boundary belongs to the delimiter under RFC 2046 section 5.1.1;
-exclude those two bytes from the preceding part's length. For a
-non-multipart root body, ordinary final body bytes including a final CRLF
+exclude those two bytes from the preceding part's length. For a bare-LF file
+under POLICY.md's liberal parsing, exclude that one LF instead; a bare CR is
+data, not a delimiter line ending. This never loosens SMTP's CRLF framing.
+Boundary-prefix collisions use POLICY.md's outermost-first rule, and the
+resulting extents are frozen by these locator versions. For a non-multipart
+root body, ordinary final body bytes including a final CRLF
 remain included. Decoded lengths do not enter the locator. Offset plus
 length must not overflow u64. Zero length is legal at a valid body boundary.
 `checked_end(parent_length)` also refuses an extent past the file; that
@@ -168,5 +172,5 @@ unchanged. Production codecs allocate no memory and use checked
 slicing/arithmetic. These tests prove neither parent access checks nor
 parser matching; M06/M13-M15 must exercise those with actual MIME and
 account fixtures. API.md now owns state/error mappings and adapter contracts;
-QUEUE.md owns queue transitions. Work budgets and the remaining M02c wire
-fixture inventory belong to M02c3.
+QUEUE.md owns queue transitions. ADMISSION.md owns work budgets; POLICY.md and
+CASES.md freeze interpretation and the remaining wire fixture inventory.

@@ -7,6 +7,8 @@ tests. M02 freezes wire/error fixtures; M13-M17 implement them; M22/M24 prove
 real-client compatibility and standards coverage before release. API.md and
 QUEUE.md fix state/error and submission policies; these do not implement the
 endpoints inventoried below.
+[POLICY.md](POLICY.md) fixes interpretation, query and thread choices;
+[CASES.md](CASES.md) maps every surface below to stable acceptance case IDs.
 
 Normative references: [RFC 8620](https://www.rfc-editor.org/rfc/rfc8620.html)
 and [RFC 8621](https://www.rfc-editor.org/rfc/rfc8621.html). Section numbers in
@@ -33,8 +35,9 @@ limits, including 32 MiB uploads and 256-object get/set windows.
 | Request/response envelope | `using`, ordered `methodCalls`/`methodResponses`, invocation IDs, `createdIds`, `sessionState` | 8620 §§3.2-3.4 | M13: ordered partial success and capability opt-in |
 | Shared method behavior | account authorization, defaults, unknown arguments, creation/result references, error types, state checks, set patches and per-object outcomes | 8620 §§3.5-3.10, 5.1-5.6 | M13-M16: earlier successes survive later errors |
 
-M02 must pin supported collation/search behavior and all variable-length
-limits. Unsupported optional behavior gets the standard error where permitted;
+POLICY.md pins supported collation/search behavior and parser/query limits;
+ADMISSION.md and RESOURCES.md bound storage, work and resident capacity.
+Unsupported optional behavior gets the standard error where permitted;
 mandatory properties/methods cannot disappear behind a client-only subset.
 [WIRE.md](WIRE.md) fixes the wire-ID mapping: generated IDs use type letters
 plus canonical storage hex; MIME parts use distinct checked locators. The
@@ -71,7 +74,7 @@ properties, conditional states, boundary limits and unknown account IDs.
 | `Email/query` | 8621 §4.4 | M14 | Filter operators, declared sort, anchors/positions, totals and thread collapse |
 | `Email/queryChanges` | 8621 §4.5 | M14 | Stable state/delta with collapse, or permitted `cannotCalculateChanges` |
 | `Email/set` | 8621 §4.6 | M15 | Structured creation, immutable-property refusal, keyword/membership patches, destroy |
-| `Email/copy` | 8621 §4.7 | M15 | Copy permissions, source errors and destroy-original semantics |
+| `Email/copy` | 8621 §4.7 | M15 | Same-account invalidArguments and unavailable-account errors; successful cross-account copy is unreachable in v1 |
 | `Email/import` | 8621 §4.8 | M15 | Raw authorized blob, folders, dates, keywords and malformed input |
 | `Email/parse` | 8621 §4.9 | M14/M15 | Authorized uploaded/part blobs, `parsed`, `notParsable`, `notFound` |
 | `SearchSnippet/get` | 8621 §5.1 | M14 | Actual matches, escaping/highlighting, absent email IDs |
@@ -142,12 +145,41 @@ Required sort comparators are Mailbox `sortOrder` and `name`, Email
 `receivedAt`, and EmailSubmission `emailId`, `threadId` and `sentAt` (8621
 §§2.3, 4.4.2, 7.3). The last spelling is exactly as printed in §7.3, although
 the submission object property is `sendAt`; QUEUE.md supports both comparator
-spellings against immutable sendAt, without adding an object property. M02c3
-adds their wire fixtures and selects additional comparators
-and collation behavior, with standard `unsupportedFilter`/`unsupportedSort`
+spellings against immutable sendAt, without adding an object property. POLICY.md
+selects additional comparators and collation behavior, with standard
+`unsupportedFilter`/`unsupportedSort`
 errors (8620 §5.5). ReceivedAt ascending/descending with an ID tie break is
 also required by td-mail. Required standards behavior remains a release gate
 even where the current client does not exercise it.
+
+## Deliberate v1 interpretation limits
+
+POLICY.md specifies these choices and their independent CASES.md oracles:
+
+- Support the required receivedAt sort and recommended size sort. The other
+  RFC 8621 section 4.4.2 recommended Email comparators are deferred to keep
+  comparator/index work small for the initial client. Return unsupportedSort,
+  and do not advertise them. This is a deliberate choice against those SHOULD
+  recommendations, not a claim that they are implemented.
+- Search has simple lowercase matching, with no canonical-equivalence or
+  full-case-folding promise. Header Text's mandatory NFC and bodyValues'
+  original decoded scalar spelling remain distinct. Fixtures pin both.
+- Charset aliases and HTML named entities use the finite POLICY.md sets.
+  Unknown labels/references follow its explicit fallback. Original bodies
+  remain downloadable; no full charset registry or HTML renderer is claimed.
+- Accepted mail may exceed interpretation limits. Default Email/get batches
+  can fail, while explicit stored-metadata/top-level-header projections and
+  raw download remain available as applicable. M14/M22 must implement td-mail's
+  bounded isolation/placeholder recovery and show content-search failure
+  honestly. Third-party MUAs without that recovery may not display such mail.
+  SearchSnippet uses its standard per-email null/null fallback.
+- Email/copy cannot succeed with one account: RFC 8620 requires a distinct
+  source and destination. Test invalidArguments/fromAccountNotFound/
+  accountNotFound; never invent a same-account successful copy or run an
+  implicit destroy. Blob/copy's separate contract remains supported.
+
+These quality/resource choices do not omit mandatory method handlers. Read
+the exact policies before interpreting a missing optional feature as success.
 
 ## Current td-mail call inventory
 
@@ -200,11 +232,16 @@ state handling, before absence is meaningful. An omitted match must not become
 evidence that a send never happened. Include a fixture with more than 256
 matching submissions and the sought submission beyond the first page.
 
+POLICY.md adds a third client acceptance gap: Email/get's method-level failure
+on one opaque message must not hide a whole listing. M14/M22 add bounded
+metadata fallback, per-ID isolation and raw download/export, without inventing
+empty successful body data. A failing body search remains a visible failure.
+
 ## Release evidence
 
 For each table row, the owning increment records the fixture/test and its
-positive, refusal and restart observations. M02 supplies a traceable case ID
-for each property group and exceptional wire mapping; later implementation
+positive, refusal and restart observations. CASES.md supplies a traceable case
+ID for each property group and exceptional wire mapping; later implementation
 must split grouped rows when their coverage differs. Capability enablement
 requires every mandatory row, not just the current client inventory. External
 push registration refusal, read-only identities and uncomputable query changes

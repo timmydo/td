@@ -4,7 +4,8 @@
 
 Read `DESIGN.md`, root `AGENTS.md`, and `DEVELOPMENT.md` before work.
 Service-facing tasks also read `RESOURCES.md` and `ADMISSION.md`, including
-their named milestone-specific evidence. Storage tasks read `STORAGE.md`.
+their named milestone-specific evidence. Message/query tasks read `POLICY.md`,
+`UNICODE.md` and `CASES.md`. Storage tasks read `STORAGE.md`.
 This plan
 describes future implementation; none of its tasks are complete merely because
 this file exists. Its scope is the personal service specified in the design.
@@ -84,10 +85,14 @@ M08 or M16 without an experienced reviewer checking transaction semantics.
 
 ## Interfaces to freeze before parallel implementation
 
-These names describe responsibilities; M02 writes exact Rust signatures and
-ownership/lifetime/error rules in the corresponding modules before consumers.
-Avoid a framework-sized trait hierarchy; only nondeterministic or external
-boundaries need adapters.
+These names describe responsibilities. M02 freezes the nondeterministic/store
+adapter signatures and ownership/error rules in ports.rs, plus format/state
+codecs and the normative protocol contracts. The owning milestone below
+introduces each deterministic parser, buffer or dispatcher API before its
+dependent milestones begin. For example, M06 consumes M04's committed arena
+API, then M10 consumes M06's committed MIME API. Avoid empty placeholder traits
+for these internal algorithms; only nondeterministic or external boundaries
+need adapters. The dependency edges are the shared-interface handoff gate.
 
 | Boundary | Inputs / outputs | Owner |
 | --- | --- | --- |
@@ -143,8 +148,9 @@ writing production mail or advertising capabilities.
   APIs in `ports.rs`/`sync.rs`, API.md and QUEUE.md. **M02c3** is completed
   in three independently reviewed parts: **M02c3a** accounts for transaction/
   reply staging and fixed worker/pool ownership; **M02c3b** freezes disk/work/
-  maintenance budgets and request/result retention in ADMISSION.md; **M02c3c** freezes
-  thread/search/MIME policies and the traceable wire fixture inventory.
+  maintenance budgets and request/result retention in ADMISSION.md; **M02c3c**
+  freezes thread/search/MIME policies in POLICY.md, approved data and bounded
+  NFC in UNICODE.md, and the traceable wire fixture inventory in CASES.md.
   None relaxes the M02 dependency gate for protocol consumers.
 
 **Depends on:** M01. **Own:** module interfaces, format specification and golden
@@ -254,6 +260,12 @@ multipart scanning, transfer decoding and part offsets. Implement documented
 charset coverage and error/opaque-body representation. Add deterministic MIME
 serialization for structured outgoing email, including attachment streaming,
 boundary generation through Entropy, reply headers and Bcc separation.
+Provision UNICODE.md's approved checksummed sources before offline tests; add
+the std-only generator, committed compact tables, complete Unicode license,
+reproducibility gate and every official NFC vector. Implement the fixed-memory
+fast/resident-replay algorithm with charged work. Search case mappings
+come from the same pin. No allocating library or ambient Unicode version may
+replace these contracts. Record static table size within process headroom.
 
 **Acceptance:** fragmented input, nested multiparts, malformed encodings, huge
 headers, cyclic-looking boundary data and unsupported charsets do not panic or
@@ -261,6 +273,8 @@ grow working memory. Part downloads match original bytes/decoded content as
 specified; forged locators and parent-deletion/reuse races follow STORAGE §3.1. Round-trip fixtures prove From/To/Cc/Bcc and attachment behavior.
 Raw-message retention does not depend on rendering success. Do not reuse an
 allocating client parser merely because it is already std-only.
+CASES.md H01-H06/M01-M10 and UNICODE.md's adversarial replay/failure cases are
+required independent oracles, including exact malformed-transfer blob bytes.
 
 ## M07 — TLS and cryptographic runtime adapter
 
@@ -415,6 +429,10 @@ Cover td-mail's actual query filters and raw/custom header/body requests, stable
 pagination/date ordering, decoded text search, mailbox counts, threads, blob
 downloads and state changes. Build additional disk indexes only when measured
 search work needs them; maintain bounded fallback with explicit timeout errors.
+Implement POLICY.md's exact search scope, supported sort/collation choices,
+query-state interpretation version and CASES.md's property-level oracles.
+Add td-mail's bounded metadata fallback/per-ID isolation for Email/get
+interpretation failures; one opaque message must not hide an entire listing.
 
 **Acceptance:** compare results to independently specified corpus expectations,
 not a test that calls the same filter implementation. Query total, order,
@@ -429,7 +447,9 @@ required write semantics, upload lifetime and attachment linkage.
 
 Implement mailbox create/rename/move/delete, keyword and membership changes,
 email destruction, structured MIME construction, upload attachment references,
-state preconditions and per-object errors. Protect immutable submitted blobs
+state preconditions and per-object errors. Email/copy has only the standard
+single-account refusal outcomes frozen in POLICY.md; do not invent a successful
+same-account copy. Protect immutable submitted blobs
 even when email objects are changed/deleted. Read-only identity config supplies
 Identity/get and required refusal semantics; local management edits identities.
 

@@ -299,8 +299,9 @@ arrays, equal states and false. Retention loss forces explicit resynchronization
 
 V1 queries return canCalculateChanges=false; /queryChanges returns the standard
 cannotCalculateChanges for supported well-formed queries. They do not rerun a
-query and pretend its changed ordering is a delta. M02c3 specifies queryState
-binding, bounded sort/work and wire fixtures.
+query and pretend its changed ordering is a delta. POLICY.md specifies the
+queryState encoding and bounded sort/search semantics; CASES.md names the
+wire fixtures. The queryState codec is still owned by M14/M16.
 
 Identity data comes from one atomically selected validated configuration
 snapshot, outside the mail journal. Digest preimage is ASCII td-mta-identities-v1

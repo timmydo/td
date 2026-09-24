@@ -150,14 +150,16 @@ Thread assignment does not depend on disposable indexes or rescanning every
 body. Store at most one anchor per email: its first syntactically valid
 Message-ID within a 1004-byte ceiling (four-byte length plus ID plus 16-byte
 email ID fits the key limit). Header ID matching is byte-exact after parsing
-away delimiters/outer whitespace. Absent or oversize IDs produce no anchor;
+away delimiters and grammatical CFWS. Absent or oversize IDs produce no anchor;
 raw headers remain unchanged. Examine at most the last 32 References IDs,
-nearest first, then bounded In-Reply-To IDs. Use the first ID with a live
+nearest first, then bounded In-Reply-To IDs, then the email's own anchor ID.
+Use the first ID with a live
 anchor; duplicate anchors select the lexicographically smallest email ID.
 Join that email's persisted thread. If no candidate resolves, create a fresh
 thread. Existing email/thread assignments are immutable, even when a later
-arrival connects two conversations. M02 pins malformed-header behavior and
-fixtures. Resource/I/O failure is an explicit temporary error, not permission
+arrival connects two conversations. POLICY.md section 5 pins malformed and
+repeated-field behavior; CASES.md T01-T04 pin the fixture outcomes.
+Resource/I/O failure is an explicit temporary error, not permission
 to silently choose a different thread. Authoritative anchor lookup remains
 available without a cache, using bounded-work sorted-table access.
 
