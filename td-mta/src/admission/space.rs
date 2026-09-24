@@ -113,6 +113,48 @@ pub struct RoundedGrowth {
     unit: std::num::NonZeroU64,
 }
 impl RoundedGrowth {
+    pub(super) fn checked_add(self, other: Self) -> Result<Self, Error> {
+        if self.unit != other.unit {
+            return Err(Error::Inconsistent("allocation unit mismatch"));
+        }
+        Ok(Self {
+            unit: self.unit,
+            amount: Growth {
+                bytes: add(self.amount.bytes, other.amount.bytes, "physical byte sum")?,
+                inodes: add(
+                    self.amount.inodes,
+                    other.amount.inodes,
+                    "physical inode sum",
+                )?,
+            },
+        })
+    }
+    pub(super) fn checked_sub(self, other: Self) -> Result<Self, Error> {
+        if self.unit != other.unit {
+            return Err(Error::Inconsistent("allocation unit mismatch"));
+        }
+        Ok(Self {
+            unit: self.unit,
+            amount: Growth {
+                bytes: self
+                    .amount
+                    .bytes
+                    .checked_sub(other.amount.bytes)
+                    .ok_or(Error::Inconsistent("physical byte underflow"))?,
+                inodes: self
+                    .amount
+                    .inodes
+                    .checked_sub(other.amount.inodes)
+                    .ok_or(Error::Inconsistent("physical inode underflow"))?,
+            },
+        })
+    }
+    pub(super) fn zeroed(self) -> Self {
+        Self {
+            unit: self.unit,
+            amount: Growth::default(),
+        }
+    }
     /// Include new file/directory entries separately in `new_inodes`.
     /// The caller bounds the slice and charges the work of visiting every file.
     pub fn from_files(unit: u64, files: &[FileGrowth], new_inodes: u64) -> Result<Self, Error> {

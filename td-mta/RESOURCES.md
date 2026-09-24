@@ -335,25 +335,28 @@ whole-process memory usage or execution-time enforcement.
 M04c3a's space evaluator uses scalar counters and injected probe samples. It
 protects pending and checkpoint capacity in its arithmetic, including writes
 completed during a probe. M04c3b1 supplies fixed logical reservation records,
-atomic grouped quota checks and linear effect tickets. Its cell plus slot
-bookkeeping fits 80 bytes on the current target, leaving 48 of the existing
-128 bytes for the composed physical record; M04c3b3 must pin the actual
-combined layout before enabling physical admission. No replacement cells
+atomic grouped quota checks and linear effect tickets. M04c3b3b adds a physical
+filesystem binding and remaining rounded growth to the same cell. The combined
+cell plus slot fits 128 bytes, enforced by a layout test; no second reservation
+table is allocated. No replacement cells
 are allocated on saturation. M04c3b2's scalar writer ledger wraps this same
 table; each framed job uses one of its cells for journal bytes/operations.
 Prepared requests and quota projections use fixed stack arrays, with no heap
 growth. Its checkpoint barrier preserves pending frame ownership and does
-not reopen on selection. M04c3b3 still owns atomic physical coupling, transfer
-of checkpoint capacity and probe identity/freshness. M05/M08 own actual
+not reopen on selection. M04c3b3b couples quota and filesystem changes using
+a fixed sixteen-entry stack projection and at most eight staged lease records.
+It consumes/rechecks probes at admission and publishes prevalidated filesystem
+changes only after logical installation succeeds. M04c3b3c still owns transfer
+of checkpoint capacity and fresh-probe reopening. M05/M08 own actual
 written/orphan cleanup, writer/view locking and publication authority.
 
 M04c3b3a's filesystem table borrows its backing cells and SlotStates from
 that 2 KiB partition; saturation refuses without allocation. Probe tickets
 and observations live in caller-owned job scratch, not the 32-byte queue
 entry itself. Queue entries carry references to owned job payloads. Matching
-an observation grants no capacity. Counter changes in its unit tests are
-injected fixture state; the runtime counter transitions arrive with physical
-coupling in M04c3b3b/M04c3b3c.
+an observation grants no capacity. The composed coordinator tests drive
+physical counter transitions using injected samples and completion proofs.
+They establish accounting bounds, not runtime filesystem behavior or RSS.
 
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
 buffers and atomic text formatting. They neither allocate backing storage nor

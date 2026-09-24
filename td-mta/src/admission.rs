@@ -45,6 +45,7 @@ macro_rules! settings {
     };
 }
 
+pub mod coordinator;
 pub mod filesystems;
 pub mod logical;
 pub mod quota;

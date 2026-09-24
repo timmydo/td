@@ -230,10 +230,14 @@ Split at these concrete boundaries before dependent milestones start:
 - **M04c3b3a:** bounded filesystem registry and probe observations consumed
   once in `admission/filesystems.rs`; adapter identity and actual probes remain M05.
   This matches probe data without installing any physical reservation.
-- **M04c3b3b:** compose writer preparation with same-cell physical reservations,
+- **M04c3b3b:** implemented writer preparation with same-cell physical
+  reservations,
   fresh probe assessment, checked extensions and atomic effect/cancel updates.
   Every filesystem delta is prevalidated before any logical installation.
   Existing leases remain bounded by 64 combined 128-byte records.
+  `admission/coordinator.rs` starts closed until baseline checkpoint capacity
+  passes fresh probes; ordinary extensions and one-shot journal appends use
+  the same atomic logical/physical accounting. No platform I/O is implemented.
 - **M04c3b3c:** transfer protected checkpoint capacity to building reservations
   without double charging, account overlapping checkpoint quota, and keep
   admission closed until a fresh probe protects the next checkpoint. M05

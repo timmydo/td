@@ -14,7 +14,9 @@ supplies fixed logical leases and linear effect tickets in
 the scalar writer/checkpoint ledger in `src/admission/writer.rs`. M04c3b3
 owns the composed physical reservation coordinator. Its first increment,
 M04c3b3a, supplies bounded filesystem registration and linear probe matching
-in `src/admission/filesystems.rs`. M05/M08 supply physical probes, persistence
+in `src/admission/filesystems.rs`. M04c3b3b composes atomic admission and effect
+accounting in `src/admission/coordinator.rs`; checkpoint transfer/reopening
+remain M04c3b3c. M05/M08 supply physical probes, persistence
 and maintenance.
 M13 owns request retention. No running admission coordinator or filesystem
 probe is claimed.
@@ -183,9 +185,9 @@ assessment; dropping it changes nothing. Installation rechecks its deadline
 and atomically acquires the logical cells. A framed job appends one dedicated
 frame cell to at most seven ordinary cells. Generic requests/effects reject
 active/closed journal, checkpoint and live-metadata quota kinds even at zero
-amount; these require writer or maintenance transitions. This increment does
-not yet expose extensions through WriterLedger; the composed coordinator must
-add physically checked ordinary/frame extensions before consumers use it.
+amount; these require writer or maintenance transitions. The composed
+coordinator supplies physically checked extensions for ordinary parts. A frame
+reserves its full ceiling at initial admission and cannot be extended.
 
 Only one dedicated append ticket may be in flight. Its actual byte/operation
 amounts must fit the reserved ceilings; both ceilings and actual counts must
@@ -353,7 +355,8 @@ refusal. It matches the live filesystem identifier, deadline and pinned unit,
 and refuses regressed completed byte or inode counters. Deadline equality is
 expired, and a current Tick before the captured start is invalid. Unsupported
 inode reporting remains explicit in the sample. The composed coordinator must
-clamp the probe window to `admission_wait_seconds` and the enclosing deadline;
+clamp the probe window to `WorkLimits::admission_seconds` and the enclosing
+deadline;
 an arbitrary request deadline is not a probe freshness bound.
 
 A CheckedSample retains identity, start/deadline, captured counters and sample. It
@@ -367,7 +370,8 @@ reuse a pre-selection sample with an unexpired request deadline.
 Precompute every filesystem counter/reference update before
 installing lease cells; publish those updates infallibly only after successful
 logical installation. Failed multi-filesystem grants discard all their samples.
-No public counter-mutation or admission operation is supplied by this increment.
+The registry itself exposes no public counter mutation; the composed
+coordinator owns its accounting transitions.
 
 Filesystem retirement refuses pending growth, protected checkpoint capacity
 or any live lease reference, including a lease with zero physical growth.
@@ -382,6 +386,64 @@ fresh bookkeeping is constructed; inspecting or blindly clearing old cells is
 not reconciliation. The guard is not an integrity boundary against the trusted
 backing-memory owner.
 Unexpected post-acquisition bookkeeping failures poison the registry.
+
+### Combined reservation implementation
+
+M04c3b3b's Coordinator owns the writer ledger and filesystem registry with no
+mutable escape to either. Its metadata filesystem identities are fixed at
+construction; the entire registered filesystem set is fixed in this increment,
+including log/scratch mounts. Registration/retirement remain standalone
+registry operations until configuration integration supplies an owned route.
+It accepts only a pristine logical lease table; recovered usage
+and selected lengths still come from one trusted startup snapshot. It starts
+closed, then initializes only after fresh samples cover the separately rounded
+generation output and fresh journal header. Metadata locations sharing one
+filesystem aggregate their demand before applying that filesystem's floor.
+
+Each ordinary request supplies four logical charges and one rounded physical
+budget bound to a registered filesystem. One group has at most eight parts,
+including its optional last, dedicated journal part. The physical binding is
+stored in the same lease cell. The adapter owns the proof that these budgets
+cover the proposed objects and categories. This API does not infer file
+identity, make syscalls or prove serialized journal contents.
+
+Admission consumes all supplied CheckedSamples, including on refusal. It
+rechecks identity, allocation unit, start/deadline, maximum probe age and
+completed counter ordering while holding both ledgers exclusively. Every
+requested filesystem and both metadata locations require exactly one sample;
+duplicate, unnecessary or missing samples refuse. Slot-generation contention
+also discards all samples without publishing charges; the scheduler retries
+with new probes on a later turn. The assessment uses old
+pending growth, the resulting checkpoint reserve and new growth once each.
+A fixed filesystem projection validates byte/inode additions and lease
+references before logical installation. Logical installation precomputes all
+records and returned tokens before publication. The final filesystem publish
+has no fallible operation. No successful logical grant can escape without its
+physical reservation, and ordinary failures publish neither ledger.
+
+Ordinary extensions use fresh samples and the same staging rule without
+allocating a new cell or reference. Frame reservations cover one complete
+transaction and use a rounded frame-length ceiling independent of active EOF.
+A proven synchronized append charges actual rounded growth and releases all
+unused logical/physical frame capacity together. Proven no-write permits retry;
+uncertain append keeps its pending capacity and busy ticket and stops the
+writer.
+The dedicated frame cannot be extended or reused after a successful append.
+
+Ordinary I/O uses linear tickets bounding both logical and physical effects.
+Proven completion charges only reported bounded effects; uncertain completion
+charges the whole plan. Invalid proof leaves both ledgers and the live ticket
+unchanged. Existing I/O can finish after expiry or a writer stop. Cancellation
+refuses busy groups and releases unused growth plus one filesystem reference
+per cell. Used/orphan charges and monotonic completed growth remain. Fully
+spent or zero-growth cells retain their filesystem reference until cancellation.
+Cancellation and short journal completion may leave checkpoint protection
+conservatively high; the next fresh admission recomputes it. No deletion credit
+or used-quota cleanup is inferred from freeing a lease.
+
+Checkpoint building reservations, quota overlap, selection and reopening are
+not exposed by this coordinator yet. M04c3b3c must transfer protected capacity
+and enforce post-selection probe ordering before adding those operations.
 
 ## 3. Work budgets and deadlines
 
@@ -768,6 +830,14 @@ consumption, overlapping probes, start/deadline metadata and both counter
 regressions. Counter changes are injected fixture state to exercise retirement
 and probe matching. These tests perform no filesystem syscall, real identity
 derivation, live growth accounting or atomic physical/logical grant.
+
+M04c3b3b tests exercise coupled grants on shared and distinct filesystems,
+late shortage with no publication, completed growth during a probe, consumed
+expired/over-age and unnecessary samples, partial/uncertain effects,
+invalid and foreign tickets,
+quota failure after physical extension staging, one-shot frame completion,
+writer-stop accounting and all 64 cells including physical bindings. These use
+injected probes and effect proofs; real filesystem effects remain M05/M08.
 
 M04/M05/M08/M13 add tests at their real execution boundaries, not document-only
 assertions: concurrent quota reservations cannot overbook; failed publications

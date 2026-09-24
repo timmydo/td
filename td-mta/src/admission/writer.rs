@@ -1,8 +1,10 @@
 //! Scalar writer admission. M05/M08 supply filesystem and publication authority;
 //! this state machine alone never authorizes I/O or a checkpoint selection.
+use super::space::RoundedGrowth;
 use super::{
     logical::{
-        self, Cell, Charges, EffectResult, EffectTicket, LeaseId, Leases, PartId, MAX_GROUP_CELLS,
+        self, Cell, Charges, EffectResult, EffectTicket, LeaseId, Leases, PartId, Physical,
+        MAX_GROUP_CELLS,
     },
     quota::{Charge, Kind, Usage},
     space, Plan,
@@ -198,6 +200,45 @@ impl<'a> WriterLedger<'a> {
         ledger.checkpoint_need()?;
         Ok(ledger)
     }
+    pub(super) fn plan(&self) -> &'a Plan {
+        self.plan
+    }
+    pub(super) fn pristine(&self) -> bool {
+        self.phase == Phase::Open && self.appending.is_none() && self.leases.is_empty()
+    }
+    pub(super) fn physical(&self, part: PartId) -> Result<Physical, Error> {
+        Ok(self.leases.physical(part)?)
+    }
+    pub(super) fn frame_part(frame: FrameId) -> PartId {
+        frame.0
+    }
+    pub(super) fn physical_group(
+        &self,
+        lease: LeaseId,
+    ) -> Result<[Option<Physical>; MAX_GROUP_CELLS], Error> {
+        Ok(self.leases.physical_group(lease)?)
+    }
+    pub(super) fn extend_bound(
+        &mut self,
+        part: PartId,
+        amounts: [u64; 4],
+        extra: RoundedGrowth,
+        now: Tick,
+    ) -> Result<(), Error> {
+        self.open()?;
+        ordinary(&self.leases.remaining(part)?)?;
+        Ok(self.leases.extend_bound(part, amounts, extra, now)?)
+    }
+    pub(super) fn complete_bound(
+        &mut self,
+        ticket: &mut EffectTicket,
+        result: EffectResult,
+        physical: RoundedGrowth,
+    ) -> Result<(), Error> {
+        Ok(self
+            .leases
+            .complete_bound(ticket, result, physical, false)?)
+    }
     pub fn phase(&self) -> Phase {
         self.phase
     }
@@ -338,6 +379,22 @@ impl<'a> WriterLedger<'a> {
         ticket: &mut AppendTicket,
         result: AppendResult,
     ) -> Result<(), Error> {
+        self.complete_append_inner(ticket, result, None)
+    }
+    pub(super) fn complete_append_bound(
+        &mut self,
+        ticket: &mut AppendTicket,
+        result: AppendResult,
+        physical: Option<RoundedGrowth>,
+    ) -> Result<(), Error> {
+        self.complete_append_inner(ticket, result, physical)
+    }
+    fn complete_append_inner(
+        &mut self,
+        ticket: &mut AppendTicket,
+        result: AppendResult,
+        physical: Option<RoundedGrowth>,
+    ) -> Result<(), Error> {
         self.open()?;
         if self.appending != Some(ticket.frame) {
             return Err(Error::Invalid);
@@ -353,7 +410,14 @@ impl<'a> WriterLedger<'a> {
                 return Ok(());
             }
         };
-        if result == AppendResult::Synced {
+        if let Some(physical) = physical {
+            self.leases.complete_bound(
+                &mut ticket.effect,
+                effect,
+                physical,
+                result == AppendResult::Synced,
+            )?;
+        } else if result == AppendResult::Synced {
             self.leases.complete_frame(&mut ticket.effect, effect)?;
         } else {
             self.leases.complete_effect(&mut ticket.effect, effect)?;
@@ -412,29 +476,23 @@ impl Prepared<'_, '_> {
     /// The caller must first pass the composed physical-space gate. This helper
     /// installs logical state only; CAS refusal leaves all counters unchanged.
     pub fn install(self, now: Tick) -> Result<Grant, Error> {
-        let lease = self.ledger.leases.reserve(
+        self.install_inner(None, now)
+    }
+    pub(super) fn install_bound(self, physical: &[Physical], now: Tick) -> Result<Grant, Error> {
+        self.install_inner(Some(physical), now)
+    }
+    fn install_inner(self, physical: Option<&[Physical]>, now: Tick) -> Result<Grant, Error> {
+        let issued = self.ledger.leases.reserve_group(
             self.charges.get(..self.count).ok_or(Error::Invalid)?,
+            physical,
+            self.has_frame,
             self.deadline,
             now,
         )?;
-        let frame = if self.has_frame {
-            let ordinal = self
-                .count
-                .checked_sub(1)
-                .and_then(|v| u16::try_from(v).ok());
-            let part = ordinal.and_then(|n| self.ledger.leases.part(lease, n).ok());
-            let Some(part) = part else {
-                // No effects started; release the installed group if it remains
-                // consistent. Either way stop after this internal violation.
-                let _release = self.ledger.leases.cancel(lease);
-                self.ledger.phase = Phase::Stopped;
-                return Err(Error::Stopped);
-            };
-            Some(FrameId(part))
-        } else {
-            None
-        };
-        Ok(Grant { lease, frame })
+        Ok(Grant {
+            lease: issued.lease,
+            frame: issued.frame.map(FrameId),
+        })
     }
 }
 

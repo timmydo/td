@@ -1,6 +1,7 @@
 //! Bounded filesystem identity and linear probe matching. No probe syscall or
 //! physical grant is implemented here; M05 supplies trusted backing identities.
-use super::space::{Counters, Growth, Sample};
+use super::space::{self, Counters, Growth, RoundedGrowth, Sample};
+use super::{logical::Physical, Plan};
 use crate::{
     ownership::{self, SlotId, SlotPool, SlotState},
     ports::{self, Deadline, Tick},
@@ -28,12 +29,16 @@ pub enum Error {
     Poisoned,
     Slot(ownership::Error),
     Probe(ports::Error),
+    Accounting(super::Error),
+    Space(space::Refusal),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Slot(e) => e.fmt(f),
             Self::Probe(e) => e.fmt(f),
+            Self::Accounting(e) => e.fmt(f),
+            Self::Space(e) => e.fmt(f),
             Self::Invalid => f.write_str("invalid filesystem registration or probe"),
             Self::Full => f.write_str("filesystem registry exhausted"),
             Self::Stale => f.write_str("stale or foreign filesystem identity"),
@@ -51,6 +56,8 @@ impl std::error::Error for Error {
         match self {
             Self::Slot(e) => Some(e),
             Self::Probe(e) => Some(e),
+            Self::Accounting(e) => Some(e),
+            Self::Space(e) => Some(e),
             _ => None,
         }
     }
@@ -61,6 +68,16 @@ impl From<ownership::Error> for Error {
     }
 }
 
+impl From<super::Error> for Error {
+    fn from(e: super::Error) -> Self {
+        Self::Accounting(e)
+    }
+}
+impl From<space::Refusal> for Error {
+    fn from(e: space::Refusal) -> Self {
+        Self::Space(e)
+    }
+}
 #[derive(Clone, Copy, Debug)]
 struct Record {
     id: FilesystemId,
@@ -182,6 +199,24 @@ impl<'a> Registry<'a> {
         cell.record = None;
         Ok(())
     }
+    pub(super) fn stage(&mut self) -> Result<Stage<'_, 'a>, Error> {
+        self.healthy()?;
+        let mut entries = [None; MAX_FILESYSTEMS];
+        for (out, cell) in entries.iter_mut().zip(self.cells.iter()) {
+            if let Some(record) = cell.record {
+                *out = Some(Staged {
+                    record,
+                    requested: RoundedGrowth::from_files(record.unit.get(), &[], 0)?,
+                    needs_probe: false,
+                    observed: false,
+                });
+            }
+        }
+        Ok(Stage {
+            registry: self,
+            entries,
+        })
+    }
     pub fn counters(&self, id: FilesystemId) -> Result<Counters, Error> {
         Ok(self.record(id)?.1.counters)
     }
@@ -239,6 +274,173 @@ impl<'a> Registry<'a> {
             sample: observation.sample,
         })
     }
+}
+
+#[derive(Clone, Copy)]
+struct Staged {
+    record: Record,
+    requested: RoundedGrowth,
+    needs_probe: bool,
+    observed: bool,
+}
+pub(super) struct Stage<'b, 'a> {
+    registry: &'b mut Registry<'a>,
+    entries: [Option<Staged>; MAX_FILESYSTEMS],
+}
+impl Stage<'_, '_> {
+    fn entry(&mut self, id: FilesystemId) -> Result<&mut Staged, Error> {
+        let (index, _) = self.registry.record(id)?;
+        self.entries
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .ok_or(Error::Invalid)
+    }
+    pub(super) fn protect(
+        &mut self,
+        id: FilesystemId,
+        reserve: RoundedGrowth,
+    ) -> Result<(), Error> {
+        let entry = self.entry(id)?;
+        if reserve.allocation_unit() != entry.record.unit.get() {
+            return Err(Error::UnitChanged);
+        }
+        entry.record.counters.checkpoint = reserve.amount();
+        entry.needs_probe = true;
+        Ok(())
+    }
+    pub(super) fn add_pending(
+        &mut self,
+        physical: Physical,
+        new_reference: bool,
+    ) -> Result<(), Error> {
+        let entry = self.entry(physical.filesystem)?;
+        if physical.remaining.allocation_unit() != entry.record.unit.get() {
+            return Err(Error::UnitChanged);
+        }
+        let requested = entry.requested.checked_add(physical.remaining)?;
+        let pending = growth_add(entry.record.counters.pending, physical.remaining.amount())?;
+        let references = entry
+            .record
+            .lease_references
+            .checked_add(u16::from(new_reference))
+            .ok_or(Error::Invalid)?;
+        if usize::from(references) > super::logical::MAX_LEASE_CELLS {
+            return Err(Error::Invalid);
+        }
+        entry.requested = requested;
+        entry.record.counters.pending = pending;
+        entry.record.lease_references = references;
+        entry.needs_probe = true;
+        Ok(())
+    }
+    pub(super) fn assess(
+        &mut self,
+        plan: &Plan,
+        samples: [Option<CheckedSample>; MAX_FILESYSTEMS],
+        now: Tick,
+    ) -> Result<(), Error> {
+        let milliseconds = super::mul(plan.work().admission_seconds, 1000, "probe window")?;
+        for checked in samples.into_iter().flatten() {
+            let id = checked.filesystem();
+            let (_, original) = self.registry.record(id)?;
+            let entry = self.entry(id)?;
+            if !entry.needs_probe || entry.observed {
+                return Err(Error::Invalid);
+            }
+            if now < checked.started() {
+                return Err(Error::Invalid);
+            }
+            let maximum = Deadline::after(checked.started(), milliseconds).map_err(Error::Probe)?;
+            if checked.deadline().expired(now) || maximum.expired(now) {
+                return Err(Error::Expired);
+            }
+            if checked.sample().allocation_unit != original.unit.get() {
+                return Err(Error::UnitChanged);
+            }
+            let counters = Counters {
+                checkpoint: entry.record.counters.checkpoint,
+                ..original.counters
+            };
+            space::assess(
+                plan,
+                checked.sample(),
+                checked.captured(),
+                counters,
+                entry.requested,
+            )?;
+            entry.observed = true;
+        }
+        if self
+            .entries
+            .iter()
+            .flatten()
+            .any(|e| e.needs_probe && !e.observed)
+        {
+            return Err(Error::Missing);
+        }
+        Ok(())
+    }
+    pub(super) fn finish(
+        &mut self,
+        physical: Physical,
+        actual: RoundedGrowth,
+        release_remainder: bool,
+    ) -> Result<(), Error> {
+        physical.remaining.checked_sub(actual)?;
+        let entry = self.entry(physical.filesystem)?;
+        if actual.allocation_unit() != entry.record.unit.get() {
+            return Err(Error::UnitChanged);
+        }
+        let debit = if release_remainder {
+            physical.remaining.amount()
+        } else {
+            actual.amount()
+        };
+        let pending = growth_sub(entry.record.counters.pending, debit)?;
+        let completed = growth_add(entry.record.counters.completed, actual.amount())?;
+        entry.record.counters.pending = pending;
+        entry.record.counters.completed = completed;
+        Ok(())
+    }
+    pub(super) fn release(&mut self, physical: Physical) -> Result<(), Error> {
+        let entry = self.entry(physical.filesystem)?;
+        if physical.remaining.allocation_unit() != entry.record.unit.get() {
+            return Err(Error::UnitChanged);
+        }
+        let pending = growth_sub(entry.record.counters.pending, physical.remaining.amount())?;
+        let references = entry
+            .record
+            .lease_references
+            .checked_sub(1)
+            .ok_or(Error::Invalid)?;
+        entry.record.counters.pending = pending;
+        entry.record.lease_references = references;
+        Ok(())
+    }
+    /// The exclusive borrow keeps the validated cell layout and identities fixed.
+    pub(super) fn publish(self) {
+        for (cell, entry) in self.registry.cells.iter_mut().zip(self.entries) {
+            cell.record = entry.map(|e| e.record);
+        }
+    }
+}
+fn growth_add(a: Growth, b: Growth) -> Result<Growth, super::Error> {
+    Ok(Growth {
+        bytes: super::add(a.bytes, b.bytes, "physical byte counter")?,
+        inodes: super::add(a.inodes, b.inodes, "physical inode counter")?,
+    })
+}
+fn growth_sub(a: Growth, b: Growth) -> Result<Growth, super::Error> {
+    Ok(Growth {
+        bytes: a
+            .bytes
+            .checked_sub(b.bytes)
+            .ok_or(super::Error::Inconsistent("physical byte underflow"))?,
+        inodes: a
+            .inodes
+            .checked_sub(b.inodes)
+            .ok_or(super::Error::Inconsistent("physical inode underflow"))?,
+    })
 }
 
 #[derive(Debug)]
