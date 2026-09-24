@@ -688,5 +688,83 @@ iterators. They do not promise an exact item count on an internal error.
 Only the used cell prefixes are live. M04b3 must build the existing
 encoder's borrowed arrays in its reserved stack workspace after
 protected signature loading; this increment adds no duplicate array or
-preimage buffer. Domain policy records remain M04b2c3b2; combined
-ownership and publication remain M04b2c3d/M19.
+preimage buffer. Domain policies are described below; combined ownership
+and publication remain M04b2c3d/M19.
+
+
+## Domain policies bound to local routing
+
+M04b2c3b2 implements `config::policy`, a typed wrapper that owns a fresh
+routing builder and its policy cells. It forwards account/alias
+declarations and binds each domain policy to the exact routing insertion
+index. No API accepts an unrelated routing table or a caller-supplied
+domain index. Aliases can still precede domain declarations. Routing
+keeps each canonical domain name once; policy cells do not duplicate
+those names into non-routing text.
+
+The caller supplies routing's existing text/domain/alias regions, at
+most 256 policy cells, and the shared non-routing text builder. The
+policy-cell layout is checked at compile time against its 64-byte
+ceiling, within the existing 16 KiB metadata reservation. Constructor
+checks refuse empty or oversized policy-cell regions, then reset each
+cell's current-build presence flag. Old field bytes may remain in unused
+cells; only a successful current declaration marks a cell present. A
+smaller policy region can exhaust before routing does; that failure
+invalidates the candidate.
+
+Complete typed policy inputs carry optional MX hostname, preference,
+MTA-STS mode, max age and optional certificate profile. `Input::default`
+supplies SCHEMA.md's absent MX, preference 10, mode off, age 86400 and
+absent certificate. Explicit MX names use the shared DNS grammar and
+lowercase copying. Preference must fit 0..65535; max age must fit
+0..31557600, including while mode is off. A syntactically valid
+certificate profile is required exactly when mode is testing, enforce or
+none, and forbidden when off. None and off remain distinct. The codes
+`config_policy_certificate_required`,
+`config_policy_certificate_forbidden` and `config_policy_profile`
+distinguish missing/forbidden references from profile-name syntax for
+field diagnostics. Named `DEFAULT_PREFERENCE` and
+`DEFAULT_MAX_AGE_SECONDS` constants are shared by input defaults and
+empty cells. Profile existence, certificate verification, port/SNI
+compatibility and direct versus gateway MX classification belong to
+M04b2c3c/M07/M18.
+
+Finalization first validates local routing, then confirms a policy for
+every routing domain. It validates and stores one canonical global
+server hostname for all default MX values. The whole dispatcher can
+stage the at-most-243-byte hostname in its existing builder workspace
+until this handoff; other server consumers use the resulting shared
+value. M04b2c3d still owns the `[server].hostname` field binding: it
+passes that assignment's location and wraps DNS/text errors with its
+static server-field context, distinct from a per-domain `mx_host` call.
+This helper owns the canonical storage, not the operator field's schema
+dispatch. No per-domain default hostname copy is retained. Explicit MX
+provenance remains in each policy even when its name equals the global
+hostname: later listener checks must preserve SCHEMA.md's
+explicit-versus-default distinction.
+
+Routing sorting retains each domain's original insertion index.
+Immutable policy access uses that mapping, so policy associations
+survive sorting and forward alias interning. The records enclose their
+routing table rather than accepting one at read time.
+`Routing::domain_name` provides checked canonical name access; the
+insertion-index bridge stays private to configuration code.
+Local-recipient lookup retains the routing module's existing behavior.
+
+Each operation touching non-routing text verifies its arena owner.
+Records accept only an owner-matching live borrowed or frozen text view,
+and every compact read rechecks ownership inside `text.rs`. Live views
+permit later protected-input appends after their borrowed values are no
+longer used. A first mutation failure is sticky across
+domain/account/alias calls and finalization. Finalization errors return
+no records. Fixed `config_policy_` codes, nested fixed routing codes and
+source coordinates never echo supplied values; duplicate declarations
+retain both coordinates. Debug output for policy
+inputs/builders/records/views is redacted. Explicit accessors remain
+trusted-caller data.
+
+This increment does not parse complete configuration files, resolve
+certificate references, generate DNS or MTA-STS bodies/IDs, serve HTTPS,
+or publish a runtime snapshot. Those consumers must pass the remaining
+schema, protected-input and provider checks before any externally
+visible action.

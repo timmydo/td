@@ -238,6 +238,9 @@ impl<'a> Builder<'a> {
         Ok(())
     }
     pub fn domain(&mut self, name: &str, at: Location) -> Result<(), Error> {
+        self.domain_index(name, at).map(|_| ())
+    }
+    pub(super) fn domain_index(&mut self, name: &str, at: Location) -> Result<u8, Error> {
         if let Some(e) = self.failure {
             return Err(e);
         }
@@ -272,7 +275,7 @@ impl<'a> Builder<'a> {
         self.domain_count = self.domain_count.checked_add(1).ok_or_else(invariant)?;
         Ok(index)
     }
-    fn domain_inner(&mut self, name: &str, at: Location) -> Result<(), Error> {
+    fn domain_inner(&mut self, name: &str, at: Location) -> Result<u8, Error> {
         if !domain_valid(name) {
             return Err(error(Code::InvalidDomain, Some(at)));
         }
@@ -294,7 +297,7 @@ impl<'a> Builder<'a> {
         row.declared = true;
         row.line = at.line;
         row.column = at.column;
-        Ok(())
+        Ok(index)
     }
 
     pub fn alias(&mut self, address: &str, account: AccountId, at: Location) -> Result<(), Error> {
@@ -444,6 +447,19 @@ impl Routing<'_> {
     pub fn domain_count(&self) -> usize {
         self.domains.len()
     }
+    pub fn domain_name(&self, index: usize) -> Result<Option<&str>, Error> {
+        let Some(row) = self.domains.get(index) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            std::str::from_utf8(row.key.get(self.text)?).map_err(|_| invariant())?,
+        ))
+    }
+    pub(super) fn original_domain_index(&self, index: usize) -> Result<usize, Error> {
+        Ok(usize::from(
+            self.domains.get(index).ok_or_else(invariant)?.original,
+        ))
+    }
     pub fn alias_count(&self) -> usize {
         self.aliases.len()
     }
@@ -505,6 +521,10 @@ mod tests {
         let routes = b.finish().unwrap();
         assert_eq!(routes.account(), ACCOUNT);
         assert_eq!(routes.domain_count(), 2);
+        assert_eq!(routes.domain_name(0), Ok(Some("example.test")));
+        assert_eq!(routes.domain_name(1), Ok(Some("other.test")));
+        assert_eq!(routes.domain_name(2), Ok(None));
+        assert_eq!(routes.domain_name(usize::MAX), Ok(None));
         assert_eq!(routes.alias_count(), 4);
         for address in [
             "User@example.test",

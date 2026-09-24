@@ -2,6 +2,7 @@
 pub mod endpoint;
 pub mod identities;
 pub mod identity;
+pub mod policy;
 pub mod resources;
 pub mod routing;
 pub mod stream;

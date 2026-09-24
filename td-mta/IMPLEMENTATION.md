@@ -251,8 +251,9 @@ Split at these concrete boundaries before dependent milestones start:
     checked written-prefix access, lowercase DNS/certificate copying and an
     immutable borrowed view. The 192 KiB ceiling complements routing's 320 KiB
     reservation. No owning snapshot, file/network I/O or publication is added.
-    Typed compact cells remain b/c; the whole loader's d increment owns combined
-    storage and static field/source-location diagnostic wrapping.
+    Identity/domain cells are implemented below; network cells remain c.
+    The whole loader's d increment owns combined storage and static
+    field/source-location diagnostic wrapping.
   - **M04b2c3b1:** implemented typed account/identity/address candidates in
     `config/identities.rs`: compact cells, shared arena ownership checks,
     forward references, ordered lists, null/empty distinctions, raw visible
@@ -262,10 +263,11 @@ Split at these concrete boundaries before dependent milestones start:
     append without freezing early. Stanza dispatch/EOF remain d; protected
     signature materialization and preimage invocation remain M04b3, using its
     80 KiB borrowed-view reservation within the control-worker stack.
-  - **M04b2c3b2:** domain-policy candidates in the existing 16 KiB partition.
-    Bind routing domains, MX defaults and MTA-STS mode/age/certificate fields;
-    retain explicit-versus-default MX provenance for c's listener checks.
-    Test case-folded names, policy field bounds and off/enabled constraints.
+  - **M04b2c3b2:** implemented `config/policy.rs` in the existing 16 KiB
+    partition. The builder owns routing and preserves policy association across
+    forward aliases and domain sorting. Canonical MX defaults share one global
+    hostname; mode/age/certificate syntax and provenance are retained for c's
+    listener and certificate graph. No DNS/policy publication is enabled.
   - **M04b2c3c:** bounded resolver/relay/certificate/gateway/listener candidates
     and their reference graph. Enforce role-specific fields, origin/port/certificate
     required-name derivation, gateway pins/prefixes, no public plaintext fixture,
