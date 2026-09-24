@@ -330,7 +330,7 @@ identity declarations belong to the full configuration schema.
 Representation ceilings are 64 identities, 16 addresses per replyTo/bcc array,
 4096 UTF-8 bytes per name, 254 bytes per email, and 16384 bytes per signature.
 The configuration line parser still caps decoded strings at 4096 bytes;
-M04b2c2 must define bounded signature-file references for larger/multiline
+M04b2c3 must define bounded signature-file references for larger/multiline
 values, with protected-file validation in M04b3/M05. This encoder provides no
 way around that input grammar.
 The total encoded preimage is at most 192 KiB, including prefixes/counts. These

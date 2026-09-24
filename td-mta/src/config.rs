@@ -2,4 +2,5 @@
 pub mod identity;
 pub mod resources;
 pub mod routing;
+pub mod stream;
 pub mod syntax;

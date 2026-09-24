@@ -2,11 +2,12 @@
 
 ## Scope
 
-This document owns the configuration syntax. `config::syntax` implements
-bounded framing and statement decoding only. The resource stanza schema below
+This document owns configuration syntax and its bounded parsing helpers.
+`config::syntax` implements framing and statement decoding; `config::stream`
+drives a trusted reader through EOF. The resource stanza schema below
 additionally builds checked resource plans. The other typed fields, snapshot
 builder, reference validation, protected file access, effective output, and
-CLI remain M04b2c2/M04b3/M05/M19 work as assigned in IMPLEMENTATION.md.
+CLI remain M04b2c3/M04b3/M05/M19 work as assigned in IMPLEMENTATION.md.
 A syntactically accepted statement is not a valid service configuration.
 DESIGN.md §6 owns the administration contract; RESOURCES.md owns the aggregate
 memory budget.
@@ -118,6 +119,57 @@ state. Construction of the candidate uses its already budgeted snapshot; there
 is no whole-file input copy or allocated syntax tree. This increment does not
 instantiate the control worker, open files, read credentials, or prove
 ownership/permissions. M05 supplies the trusted filesystem boundary.
+
+## Reader completion and statement dispatch
+
+M04b2c2 implements `config::stream::read` over a trusted `std::io::Read`
+adapter and a statement handler. It uses the first 28 KiB of caller-owned
+scratch: 16 KiB input, 8 KiB physical line and 4 KiB decoded string. This is
+within the 64 KiB control-worker partition above, leaving 36 KiB for builder
+state. Additional supplied scratch is untouched. Insufficient scratch refuses
+before calling the reader or handler. The driver allocates nothing; trusted
+reader and handler implementations own their own allocation/blocking behavior.
+
+Read each nonempty chunk completely through the framer, parse each complete
+line, and pass nonempty statements in order to the handler. Comments and blank
+lines count as physical lines but do not call the handler. Borrowed statements
+are valid only during that call; retained values must be copied into bounded
+candidate storage. The handler must stage changes only. The caller of `read`
+must discard that entire candidate whenever `read` returns Err, including
+failures after the last successful callback. Successful prefix callbacks never
+authorize publication, file writes or listener changes.
+
+Only `Ok(0)` from a read into the nonempty input buffer marks EOF. Short reads
+continue; errors, including `UnexpectedEof` and `WouldBlock`, refuse. At EOF,
+parse and dispatch any final unterminated line and require the framer to finish
+before returning a Summary with consumed bytes, physical lines and nonempty
+statement count. Empty input completes syntactically, leaving mandatory schema
+requirements to the loader. Summary is an observation, not a publication token
+or a proof of schema validity, file identity, permissions or immutable contents.
+M05 must supply the actual trusted regular-file adapter; this helper relies on
+its reader's truthful EOF and does not open paths itself.
+
+At most 32 Interrupted read errors are retried across the entire operation;
+progress does not reset that allowance. The 33rd refuses. Combined with the
+input ceiling, there are at most 2097185 reader calls, even with one-byte
+progress. This bounds retries/work, not elapsed time inside a blocking reader.
+All other read errors stop immediately. A reader reporting more bytes than
+its supplied buffer holds is refused. No handler or reader is called after a
+failure; syntactic diagnostics retain their original source locations.
+
+Fixed driver codes are `config_stream_capacity`, `config_stream_read`,
+`config_stream_interrupted_limit`, `config_stream_invalid_read_count`,
+`config_stream_invariant` and `config_stream_handler`. Syntax refusals use the
+existing syntax codes. Read failures retain only the fixed ErrorKind, dropping
+custom I/O error text. Display reports only the fixed read-error code;
+Debug or typed matching additionally reveals its ErrorKind. Default driver
+Display/Debug does not print handler errors. The error source chain is empty;
+explicit enum matching retains the typed handler error for the trusted schema
+caller. This also avoids duplicating a syntax diagnostic in chained reports.
+The entire scratch partition, not only unused tails, retains bytes after
+success or failure. Keep it private and
+never dump it as a diagnostic. Inline secrets are not supported; this driver
+does not read protected credential files or claim zeroization.
 
 ## Diagnostics and disclosure
 
@@ -257,7 +309,7 @@ remains unimplemented.
 
 M04b2b implements a typed routing candidate and immutable lookup view in
 `config::routing`. It does not implement the whole stanza dispatcher, SMTP
-commands, live reload, authentication or mailbox creation. M04b2c2 must bind
+commands, live reload, authentication or mailbox creation. M04b2c3 must bind
 these target routing stanzas to that candidate:
 
 ```text
@@ -272,7 +324,7 @@ of mail paths. The sole account stanza declares its stable ID. Domain labels
 are served DNS names; alias labels are full addresses, and each alias requires
 exactly one `account` assignment. No folder/forwarding/catch-all fields exist.
 The outer schema rejects absent labels, duplicate or unknown fields and any
-second account stanza. Other account/identity fields belong to M04b2c2; these
+second account stanza. Other account/identity fields belong to M04b2c3; these
 examples are a routing fragment, not a complete runnable configuration.
 The helper accepts typed AccountId values and does not parse those labels.
 
@@ -403,4 +455,4 @@ Stable routing codes are `config_route_capacity`, `config_route_invalid_domain`,
 configuration fingerprint. It borrows validated text and requires sorted,
 unique identity IDs. This helper does not bind identity stanzas, materialize
 defaults, authorize sending or hash/publish state. The complete schema loader
-remains M04b2c2; the crypto provider and JMAP integration remain M07/M15.
+remains M04b2c3; the crypto provider and JMAP integration remain M07/M15.

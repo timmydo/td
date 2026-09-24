@@ -223,13 +223,17 @@ Split at these concrete boundaries before dependent milestones start:
   immutable local-recipient lookup in `config/routing.rs`. CONFIG.md owns the
   target stanza binding, canonical keys, reserved postmaster behavior and
   byte layout/partition ceilings. Stanza dispatch and complete snapshot
-  integration remain M04b2c2; this view has no store/protocol authority.
+  integration remain M04b2c3; this view has no store/protocol authority.
 - **M04b2c1:** implemented the canonical visible-identity preimage encoder in
   `config/identity.rs`, including sorted unique IDs, every visible property,
   nullable ordered addresses and checked representation bounds. API.md owns
   its exact encoding. It streams to a caller sink after whole-input validation;
   it is not a full identity loader, digest provider or publication path.
-- **M04b2c2:** freeze remaining identity/listener/relay/certificate schemas and
+- **M04b2c2:** implemented the bounded reader/statement driver in
+  `config/stream.rs`. Reuse parser scratch, require actual reader EOF and a
+  finished framer, bound interrupted reads, and reject read/handler errors.
+  No schema, file trust or publication authority follows from its Summary.
+- **M04b2c3:** freeze remaining identity/listener/relay/certificate schemas and
   build complete immutable candidates in the two bounded snapshots. Integrate
   syntax, schema version, resource plans and all configured references;
   reject unknown/duplicate fields, missing required values and incompatible
@@ -289,7 +293,7 @@ Split at these concrete boundaries before dependent milestones start:
 All parts gate M04 consumers. Individual helper modules are not a running
 allocator, scheduler, admission coordinator or service.
 Checked local/wire identifiers already exist from M01/M02; M04a2 owns the
-additional runtime slot tokens, and M04b2b/M04b2c2 validate configured references.
+additional runtime slot tokens, and M04b2b/M04b2c3 validate configured references.
 
 Implement reusable buffers/arenas, bounded formatting, fixed-capacity queues,
 and checked identifiers. Implement the documented stanza grammar, immutable
