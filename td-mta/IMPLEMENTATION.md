@@ -233,15 +233,44 @@ Split at these concrete boundaries before dependent milestones start:
   `config/stream.rs`. Reuse parser scratch, require actual reader EOF and a
   finished framer, bound interrupted reads, and reject read/handler errors.
   No schema, file trust or publication authority follows from its Summary.
-- **M04b2c3:** freeze remaining identity/listener/relay/certificate schemas and
-  build complete immutable candidates in the two bounded snapshots. Integrate
-  syntax, schema version, resource plans and all configured references;
-  reject unknown/duplicate fields, missing required values and incompatible
-  policies before publication.
+- **M04b2c3:** SCHEMA.md specifies the complete operator schema and the
+  remaining snapshot partition. Its implementation is split below; none of
+  these loaders is implemented by the schema document.
+  - **M04b2c3a:** checked common value parsing and private snapshot text/index
+    storage. Cover profile names, DNS names, origins/directory URIs, numeric
+    binds/CIDRs and lexical absolute paths. Share existing mailbox comparison
+    semantics; do not create conflicting address parsers. Freeze fixed error
+    codes and source mapping. Prove every field length, malformed spelling,
+    text-reference range and actual descriptor layout without filesystem/network
+    I/O.
+  - **M04b2c3b:** bounded account/identity/address and domain-policy candidates.
+    Support forward references, list declaration order, null/empty/name
+    distinctions, default materialization, signature-file references and sorted
+    unique IDs. Fit the 8/64/16 KiB descriptor regions. Test unresolved signature
+    references, defaults and missing/duplicate/conflicting targets. Protected
+    input materialization and preimage invocation belong to M04b3, which reserves
+    borrowed views within 80 KiB of the existing control-worker stack.
+  - **M04b2c3c:** bounded relay/certificate/gateway/listener candidates and their
+    reference graph. Enforce role-specific fields, origin/port/certificate
+    required-name derivation, gateway pins/prefixes, no public plaintext fixture,
+    session-pool totals and bind conflicts. Test direct, gateway and combined
+    profiles entirely offline, including incompatible and dangling policies.
+    Provider verification remains M03/M07/M18; M11 owns actual socket policy.
+  - **M04b2c3d:** single whole-loader entry point owning its candidate and reader
+    operation. Require root version, actual EOF, all mandatory sections and
+    resource plans. Hold one pending stanza; avoid a whole-file AST or duplicate
+    alias arena. Return only a structural candidate, with no runtime
+    authority. Test complete fixtures, every unknown/duplicate/type/missing
+    refusal, late read/handler failure, exhausted text/descriptors and unchanged
+    caller-held prior validated configuration; M19 tests active generations.
+    Concrete size checks must fit all snapshot/scratch partitions before M04b3/M19 consume the candidate.
 - **M04b3:** protected-file reference requirements and redacted effective
   configuration library output. Actual trusted file opening and permission
   evidence use M05 adapters; no successful full `config check` before that
-  integration. M19 owns atomic runtime generation publication.
+  integration. Consume a structural candidate, resolve signatures/credentials
+  within its remaining text capacity, materialize identities with bounded
+  injected protected-input fixtures, then encode from temporary borrowed views.
+  Any late failure drops the candidate. M19 owns atomic runtime publication.
 - **M04c1:** checked u64 disk/work settings and capacity-derived maintenance
   validation in `admission.rs`; configuration uses this committed plan.
 - **M04c2:** charged work meters in `admission/work.rs` and checked
@@ -424,15 +453,18 @@ and bounded outbound HTTP transport shared by ACME and migration.
 Implement A/AAAA/CNAME resolution through configured resolvers, bounded DNS
 compression/name parsing, cache TTLs, query entropy, UDP truncation/TCP fallback,
 timeouts and response-source/question validation. Read only documented resolver
-configuration; no ambient NSS modules or uncancelable per-request threads.
+configuration: SCHEMA.md's explicit numeric resolver endpoints, not ambient
+resolv.conf/NSS modules or uncancelable per-request threads. ACME operational
+URLs remain on the directory origin; offline migration has one bounded explicit
+source-origin endpoint slot.
 Implement HTTPS requests/streaming responses with capped headers, framing,
 redirect policy, fixed trust settings, and total deadlines.
 
 **Acceptance:** local DNS/HTTPS fixtures cover compressed-name loops, malformed
 lengths, unrelated replies, TCP fallback, chain limits, expiration, slow peers,
 HTTP ambiguity and connection cleanup. Provider/domain failures are typed and
-bounded. No MX resolution or SPF/TXT evaluator in v1. OS DNS configuration is
-runtime data, never permission to use public DNS during automated tests.
+bounded. No MX resolution or SPF/TXT evaluator in v1. Resolver endpoints are
+explicit runtime data, never permission to use public DNS during automated tests.
 
 ## M10 — SMTP core with durable local delivery
 

@@ -84,11 +84,18 @@ configured memory budget does not preserve the default RSS claim.
 - Eight worker stacks fund the fixed roles below; no worker/thread may appear
   outside this count without a ledger amendment. The main stack allowance is a
   resident budget,
-  not a claim that the host's virtual stack mapping is one MiB.
+  not a claim that the host's virtual stack mapping is one MiB. The control
+  worker reserves 80 KiB of its existing 256 KiB stack for temporary borrowed
+  identity views, leaving 176 KiB for all other live frames/copies/provider work;
+  actual target layouts and peak stack usage must pass before this path runs.
 - TLS sessions include SMTP, HTTPS and outgoing delivery slots; handshake
   scratch is additional. The handshake cap is global in this profile.
   HTTP-01/administration must use the existing fixed control/I/O reservations;
   they cannot silently add another general connection pool.
+- Each 1 MiB certificate generation includes every server profile and parsed
+  relay/ACME/gateway trust object, retained raw bytes and allocation overhead.
+  SCHEMA.md's per-input caps do not enlarge this aggregate. Renew a complete
+  generation, retaining at most old and replacement; no per-profile side cache.
 - Certificate overlap, reload overlap, allocator bookkeeping, executable
   pages and main/worker stacks all count at peak coexistence. RSS tests must
   validate the allowances; this ledger is not an OS memory limiter.
@@ -238,7 +245,10 @@ concrete structures require a ledger amendment before admission is enabled.
 The resolver's 128 KiB includes 128 cache entries of at most 384 bytes
 (48 KiB), a 64 KiB packet/TCP buffer and 16 KiB question/name/alias-chain,
 address-result and cursor state. Cache keys are configured endpoint index plus
-configuration generation, not copied DNS names/CNAME chains. Entries retain
+configuration generation, not copied DNS names/CNAME chains. SCHEMA.md selects
+1..4 explicit numeric resolver endpoints and restricts ACME operational URLs to
+the directory origin. Offline migration may own one additional bounded endpoint
+slot for its explicit source origin, released at job exit. Entries retain
 only the final address set and minimum chain/address TTL. A job returns at
 most 16 addresses. Do not
 allocate one packet/name buffer per waiting lookup. Expired entries are
@@ -314,8 +324,7 @@ Domains are stored once and aliases retain local text plus domain indices.
 Their conservative text bound is 324352 bytes, below the 320 KiB reservation.
 These partitions are not extra allocations. Combined arena bytes still bound
 other configured text. Build a new snapshot from the bounded stream scratch;
-do not keep an
-extra file-sized input copy beside both snapshots. CONFIG.md bounds the
+do not keep an extra file-sized input copy beside both snapshots. CONFIG.md bounds the
 physical input at 2 MiB, streamed through the control worker's existing 64 KiB
 configuration region: 16 KiB input chunk, 8 KiB physical line, 4 KiB decoded
 string, and 36 KiB parser/builder working state. The scalar resource builder
@@ -324,7 +333,13 @@ four sections of at most 64 fields each. No input-sized syntax tree is
 retained. Certificate/key provider
 allocations belong to their separate TLS/certificate entries. Pin old snapshots
 only for bounded operation lifetimes and reauthorize Access as API.md specifies.
-Exact stanza/field limits and snapshot structs are M04's implementation gate.
+SCHEMA.md fixes the remaining target stanza/field ceilings and the 384 KiB
+metadata partition. Temporary borrowed identity views use 80 KiB of the existing
+256 KiB control-worker stack, outside the snapshot owner, as SCHEMA.md specifies.
+Those target
+structs are not implemented yet; their concrete size and capacity checks remain
+M04's implementation gate. The 228 KiB remainder is within the same reservation,
+not additional process memory.
 
 This ledger does not budget whole earlier JMAP responses, generic JSON trees,
 or all MIME body values in memory. ADMISSION.md defines bounded private response

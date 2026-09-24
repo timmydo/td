@@ -5,8 +5,9 @@
 This document owns configuration syntax and its bounded parsing helpers.
 `config::syntax` implements framing and statement decoding; `config::stream`
 drives a trusted reader through EOF. The resource stanza schema below
-additionally builds checked resource plans. The other typed fields, snapshot
-builder, reference validation, protected file access, effective output, and
+additionally builds checked resource plans. [SCHEMA.md](SCHEMA.md) specifies
+the remaining complete operator schema and
+snapshot partitions. Its loader, protected file access, effective output and
 CLI remain M04b2c3/M04b3/M05/M19 work as assigned in IMPLEMENTATION.md.
 A syntactically accepted statement is not a valid service configuration.
 DESIGN.md §6 owns the administration contract; RESOURCES.md owns the aggregate
@@ -324,7 +325,7 @@ of mail paths. The sole account stanza declares its stable ID. Domain labels
 are served DNS names; alias labels are full addresses, and each alias requires
 exactly one `account` assignment. No folder/forwarding/catch-all fields exist.
 The outer schema rejects absent labels, duplicate or unknown fields and any
-second account stanza. Other account/identity fields belong to M04b2c3; these
+second account stanza. Other account/identity fields are specified in SCHEMA.md; these
 examples are a routing fragment, not a complete runnable configuration.
 The helper accepts typed AccountId values and does not parse those labels.
 

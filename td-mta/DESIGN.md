@@ -158,7 +158,8 @@ for example `mx.example.net`, with A/AAAA records for reachable addresses.
 Internet SMTP uses port 25 with STARTTLS; port 25 is not a plaintext fallback
 after trying port 465. The receiving listener offers TLS 1.2/1.3 with the
 provider's reviewed cipher defaults. It accepts plaintext delivery for peers
-that do not negotiate TLS, as selected by the operator for compatibility.
+that do not negotiate TLS; selecting the direct role chooses this v1
+compatibility policy. There is no separate plaintext-toggle setting.
 Once STARTTLS begins, a failed handshake closes the connection; it never
 continues that session in plaintext. Reset SMTP state after successful TLS.
 
@@ -343,8 +344,10 @@ invalid UTF-8, embedded NUL, conflicting aliases, dangling account references,
 and incompatible listener policies. No includes, environment expansion, shell
 evaluation, arbitrary hooks, or network-loaded configuration.
 [CONFIG.md](CONFIG.md) specifies the implemented bounded syntax and resource
-stanzas, plus typed local routing candidates and immutable lookup. Other typed
-fields, complete candidate validation and command wiring remain planned.
+stanzas, typed local routing, reader completion and identity preimage helpers.
+[SCHEMA.md](SCHEMA.md) specifies the remaining complete operator schema and
+snapshot partitions. Its typed loader, complete candidate validation and
+command wiring remain planned.
 
 Separate operator configuration (`/etc/td-mta/`) from service-managed data
 (`/var/lib/td-mta/`), runtime control (`/run/td-mta/`), and logs
@@ -365,7 +368,7 @@ Planned commands, with stable JSON output and exit codes:
 | `serve` | Foreground service, no daemonization |
 | `status --json`, `doctor --json` | Health, bounds, certificates, storage, queue; no mutation |
 | `dns-plan` | Expected records and MTA-STS policy; no DNS changes |
-| `reload` | Validate complete candidate, then atomically install or retain old config |
+| `reload` | Validate candidate, report bounded pending issuance if needed, then atomically install or retain old config; SCHEMA.md owns cancellation/deadline rules |
 | `queue list`, `queue inspect ID` | Paginated status and redacted reasons |
 | `queue retry ID`, `queue cancel ID` | Named, journaled operation; never repeat accepted recipients |
 | `device create`, `device revoke ID` | Local credential administration |
@@ -482,6 +485,10 @@ Reject unknown/nonlocal recipients at RCPT. Resolve accepted aliases to stable
 account IDs and deduplicate delivery to the same account within one transaction;
 retain the accepted envelope recipients for inspection. Delivery decisions are
 pinned for that transaction rather than changing halfway through a reload.
+Gateway admission revocation is a separate commit-time fence: SCHEMA.md defines
+which trust/pin/prefix changes temporarily refuse an uncommitted transaction
+and require reconnecting. Recipient routing remains pinned; it cannot extend
+revoked gateway authority.
 Every v1 inbound delivery files once in the account's Inbox, including when
 several accepted aliases match. Aliases select accounts, not folders; alias
 names remain envelope metadata. Provision exactly one Inbox before receipt
