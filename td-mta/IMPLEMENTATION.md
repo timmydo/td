@@ -238,7 +238,12 @@ Split at these concrete boundaries before dependent milestones start:
   `admission/coordinator.rs` starts closed until baseline checkpoint capacity
   passes fresh probes; ordinary extensions and one-shot journal appends use
   the same atomic logical/physical accounting. No platform I/O is implemented.
-- **M04c3b3c:** transfer protected checkpoint capacity to building reservations
+- **M04c3b3c1:** implemented a checked registry-wide probe epoch and atomic
+  invalidation in
+  `admission/filesystems.rs`. Earlier tickets and already matched samples
+  refuse at the same Tick; no capacity or identity changes. The registry
+  fence alone does not implement checkpoint publication or reopening.
+- **M04c3b3c2:** transfer protected checkpoint capacity to building reservations
   without double charging, account overlapping checkpoint quota, and keep
   admission closed until a fresh probe protects the next checkpoint. M05
   supplies descriptor-backed probes and cleanup proof; M08 owns persistence,

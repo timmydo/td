@@ -16,8 +16,8 @@ owns the composed physical reservation coordinator. Its first increment,
 M04c3b3a, supplies bounded filesystem registration and linear probe matching
 in `src/admission/filesystems.rs`. M04c3b3b composes atomic admission and effect
 accounting in `src/admission/coordinator.rs`; checkpoint transfer/reopening
-remain M04c3b3c. M05/M08 supply physical probes, persistence
-and maintenance.
+remain M04c3b3c2. M04c3b3c1 adds causal probe fences in the registry.
+M05/M08 supply physical probes, persistence and maintenance.
 M13 owns request retention. No running admission coordinator or filesystem
 probe is claimed.
 
@@ -354,24 +354,41 @@ removes an observation from its caller-owned Option on every attempt, including
 refusal. It matches the live filesystem identifier, deadline and pinned unit,
 and refuses regressed completed byte or inode counters. Deadline equality is
 expired, and a current Tick before the captured start is invalid. Unsupported
-inode reporting remains explicit in the sample. The composed coordinator must
-clamp the probe window to `WorkLimits::admission_seconds` and the enclosing
-deadline;
-an arbitrary request deadline is not a probe freshness bound.
+inode reporting remains explicit in the sample. The composed coordinator
+must clamp the probe window to `WorkLimits::admission_seconds` and the
+enclosing deadline; an arbitrary request deadline is not a probe freshness
+bound.
 
-A CheckedSample retains identity, start/deadline, captured counters and sample. It
-is matched data, never a lease or I/O permission. The composed atomic grant
-must consume it by value and recheck its identity, deadline, allocation unit
-and counter ordering under the same exclusive coordinator state that installs
-the reservation. Checkpoint reopening requires a probe begun after selection,
-with an ordering fence owned by the barrier; equal millisecond Tick values alone
-cannot establish that order. M04c3b3c must implement that fence rather than
-reuse a pre-selection sample with an unexpired request deadline.
-Precompute every filesystem counter/reference update before
-installing lease cells; publish those updates infallibly only after successful
-logical installation. Failed multi-filesystem grants discard all their samples.
-The registry itself exposes no public counter mutation; the composed
-coordinator owns its accounting transitions.
+A CheckedSample retains identity, epoch, start/deadline, captured counters
+and sample. It is matched data, never a lease or I/O permission. The
+composed atomic grant must consume it by value and recheck its identity,
+epoch, deadline, allocation unit and counter ordering under the same
+exclusive coordinator state that installs the reservation. Checkpoint
+reopening requires a probe begun after selection, with an ordering fence
+owned by the barrier; equal millisecond Tick values alone cannot establish
+that order. M04c3b3c1 supplies this registry fence through
+`invalidate_probes`: it advances one checked registry-wide probe epoch
+atomically. All tickets retain the epoch captured before sampling. Both
+observation consumption and final physical assessment reject a different
+epoch, including observations already matched before the fence. A staged
+assessment uses its projected epoch, so an uncommitted fence cannot admit an
+old sample through that projection. Probes begun within one epoch may still
+complete out of order. Epoch exhaustion refuses without changing the
+registry; there is no wraparound or partial invalidation. The fence changes
+no identity, capacity counter or lease reference.
+
+M04c3b3c2 must invoke this fence after accounting for durable selection,
+while admission remains closed, and require successful post-fence probes
+before reopening. A failed fence cannot permit reopening. The standalone
+registry operation establishes ordering only; it does not publish a
+checkpoint, grant capacity, or establish the caller's selection/worker
+authority. M05 must take the actual space sample after issuing the ticket,
+not attach cached probe data to a ticket issued after the fence. Precompute
+every filesystem counter/reference update before installing lease cells;
+publish those updates infallibly only after successful logical installation.
+Failed multi-filesystem grants discard all their samples. The registry
+itself exposes no public capacity-counter mutation; the composed coordinator
+owns its accounting transitions.
 
 Filesystem retirement refuses pending growth, protected checkpoint capacity
 or any live lease reference, including a lease with zero physical growth.
@@ -442,7 +459,7 @@ conservatively high; the next fresh admission recomputes it. No deletion credit
 or used-quota cleanup is inferred from freeing a lease.
 
 Checkpoint building reservations, quota overlap, selection and reopening are
-not exposed by this coordinator yet. M04c3b3c must transfer protected capacity
+not exposed by this coordinator yet. M04c3b3c2 must transfer protected capacity
 and enforce post-selection probe ordering before adding those operations.
 
 ## 3. Work budgets and deadlines
@@ -838,6 +855,14 @@ invalid and foreign tickets,
 quota failure after physical extension staging, one-shot frame completion,
 writer-stop accounting and all 64 cells including physical bindings. These use
 injected probes and effect proofs; real filesystem effects remain M05/M08.
+
+M04c3b3c1 tests reject both unfinished probes and already matched samples
+across a fence at an identical Tick. Fresh probes at that same Tick remain
+usable and can finish out of order. A staged fence refuses old samples before
+publication, and epoch exhaustion preserves the registry. Successful and
+refused fences preserve identities, capacity and live
+references, within the existing sixteen-entry memory bound. Checkpoint
+publication and reopening are not exercised by these registry tests.
 
 M04/M05/M08/M13 add tests at their real execution boundaries, not document-only
 assertions: concurrent quota reservations cannot overbook; failed publications

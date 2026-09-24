@@ -26,6 +26,8 @@ pub enum Error {
     Missing,
     UnitChanged,
     CounterRegression,
+    Superseded,
+    EpochExhausted,
     Poisoned,
     Slot(ownership::Error),
     Probe(ports::Error),
@@ -47,6 +49,8 @@ impl std::fmt::Display for Error {
             Self::Missing => f.write_str("filesystem observation already consumed or missing"),
             Self::UnitChanged => f.write_str("filesystem allocation unit changed"),
             Self::CounterRegression => f.write_str("filesystem growth counters regressed"),
+            Self::Superseded => f.write_str("filesystem probe predates the current fence"),
+            Self::EpochExhausted => f.write_str("filesystem probe epoch exhausted"),
             Self::Poisoned => f.write_str("filesystem accounting stopped"),
         }
     }
@@ -98,6 +102,7 @@ pub struct Registry<'a> {
     slots: SlotPool<'a>,
     cells: &'a mut [Cell],
     poisoned: bool,
+    probe_epoch: u64,
 }
 impl<'a> Registry<'a> {
     pub fn new(states: &'a mut [SlotState], cells: &'a mut [Cell]) -> Result<Self, Error> {
@@ -111,6 +116,7 @@ impl<'a> Registry<'a> {
             slots: SlotPool::new(states)?,
             cells,
             poisoned: false,
+            probe_epoch: 0,
         })
     }
     fn healthy(&self) -> Result<(), Error> {
@@ -212,10 +218,22 @@ impl<'a> Registry<'a> {
                 });
             }
         }
+        let probe_epoch = self.probe_epoch;
         Ok(Stage {
             registry: self,
             entries,
+            probe_epoch,
         })
+    }
+    /// Establish a causal fence: only probes started after this transition can
+    /// be consumed or admitted. It changes no capacity or filesystem identity.
+    /// A checkpoint owner invokes this after accounting for durable selection;
+    /// the fence alone neither selects a generation nor reopens admission.
+    pub fn invalidate_probes(&mut self) -> Result<(), Error> {
+        let mut stage = self.stage()?;
+        stage.invalidate_probes()?;
+        stage.publish();
+        Ok(())
     }
     pub fn counters(&self, id: FilesystemId) -> Result<Counters, Error> {
         Ok(self.record(id)?.1.counters)
@@ -238,6 +256,7 @@ impl<'a> Registry<'a> {
         Ok(ProbeTicket {
             id,
             captured: record.counters.completed,
+            epoch: self.probe_epoch,
             started: now,
             deadline,
         })
@@ -254,6 +273,9 @@ impl<'a> Registry<'a> {
         let (_, record) = self.record(id)?;
         if observation.ticket.id != id {
             return Err(Error::Stale);
+        }
+        if observation.ticket.epoch != self.probe_epoch {
+            return Err(Error::Superseded);
         }
         if now < observation.ticket.started {
             return Err(Error::Invalid);
@@ -286,8 +308,16 @@ struct Staged {
 pub(super) struct Stage<'b, 'a> {
     registry: &'b mut Registry<'a>,
     entries: [Option<Staged>; MAX_FILESYSTEMS],
+    probe_epoch: u64,
 }
 impl Stage<'_, '_> {
+    pub(super) fn invalidate_probes(&mut self) -> Result<(), Error> {
+        self.probe_epoch = self
+            .probe_epoch
+            .checked_add(1)
+            .ok_or(Error::EpochExhausted)?;
+        Ok(())
+    }
     fn entry(&mut self, id: FilesystemId) -> Result<&mut Staged, Error> {
         let (index, _) = self.registry.record(id)?;
         self.entries
@@ -343,6 +373,9 @@ impl Stage<'_, '_> {
         for checked in samples.into_iter().flatten() {
             let id = checked.filesystem();
             let (_, original) = self.registry.record(id)?;
+            if checked.ticket.epoch != self.probe_epoch {
+                return Err(Error::Superseded);
+            }
             let entry = self.entry(id)?;
             if !entry.needs_probe || entry.observed {
                 return Err(Error::Invalid);
@@ -419,6 +452,7 @@ impl Stage<'_, '_> {
     }
     /// The exclusive borrow keeps the validated cell layout and identities fixed.
     pub(super) fn publish(self) {
+        self.registry.probe_epoch = self.probe_epoch;
         for (cell, entry) in self.registry.cells.iter_mut().zip(self.entries) {
             cell.record = entry.map(|e| e.record);
         }
@@ -448,6 +482,7 @@ fn growth_sub(a: Growth, b: Growth) -> Result<Growth, super::Error> {
 pub struct ProbeTicket {
     id: FilesystemId,
     captured: Growth,
+    epoch: u64,
     started: Tick,
     deadline: Deadline,
 }
@@ -873,6 +908,133 @@ mod tests {
         let replacement = register(&mut rebuilt, 1)?;
         assert_ne!(replacement, id);
         assert_eq!(rebuilt.counters(id), Err(Error::Stale));
+        Ok(())
+    }
+    #[test]
+    fn probe_fence_rejects_pre_fence_tickets_and_checked_samples_at_the_same_tick(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            admission::{DiskLimits, ViewMode, WorkLimits},
+            limits::Limits,
+        };
+        let plan = DiskLimits::default().plan(
+            &Limits::default().plan()?,
+            WorkLimits::default(),
+            ViewMode::OnlineBackground,
+        )?;
+        let mut states = [const { SlotState::EMPTY }; 2];
+        let mut cells = [const { Cell::EMPTY }; 2];
+        let mut registry = Registry::new(&mut states, &mut cells)?;
+        let id = register(&mut registry, 1)?;
+        let other = register(&mut registry, 2)?;
+        let old = registry.begin_probe(id, deadline()?, Tick(1))?;
+        let mut early = Some(
+            registry
+                .begin_probe(other, deadline()?, Tick(1))?
+                .complete(Ok(sample(u64::MAX)))?,
+        );
+        let checked = registry.consume(other, &mut early, Tick(1))?;
+        let before = [registry.counters(id)?, registry.counters(other)?];
+        let mut staged_observation = Some(
+            registry
+                .begin_probe(other, deadline()?, Tick(1))?
+                .complete(Ok(sample(u64::MAX)))?,
+        );
+        let staged_sample = registry.consume(other, &mut staged_observation, Tick(1))?;
+        {
+            let mut input = std::array::from_fn(|_| None);
+            *input.first_mut().ok_or("sample slot")? = Some(staged_sample);
+            let mut stage = registry.stage()?;
+            stage.invalidate_probes()?;
+            stage.protect(other, RoundedGrowth::from_files(4096, &[], 0)?)?;
+            assert_eq!(stage.assess(&plan, input, Tick(1)), Err(Error::Superseded));
+        }
+        assert_eq!(registry.probe_epoch, 0);
+        registry.invalidate_probes()?;
+        let mut old = Some(old.complete(Ok(sample(u64::MAX)))?);
+        assert!(matches!(
+            registry.consume(id, &mut old, Tick(1)),
+            Err(Error::Superseded)
+        ));
+        assert!(old.is_none());
+        let mut input: [Option<CheckedSample>; MAX_FILESYSTEMS] = std::array::from_fn(|_| None);
+        *input.first_mut().ok_or("sample slot")? = Some(checked);
+        {
+            let mut stage = registry.stage()?;
+            stage.protect(other, RoundedGrowth::from_files(4096, &[], 0)?)?;
+            assert_eq!(stage.assess(&plan, input, Tick(1)), Err(Error::Superseded));
+        }
+        let first = registry.begin_probe(id, deadline()?, Tick(1))?;
+        let second = registry.begin_probe(id, deadline()?, Tick(1))?;
+        for ticket in [second, first] {
+            let mut observation = Some(ticket.complete(Ok(sample(u64::MAX)))?);
+            let checked = registry.consume(id, &mut observation, Tick(1))?;
+            let mut input = std::array::from_fn(|_| None);
+            *input.first_mut().ok_or("sample slot")? = Some(checked);
+            let mut stage = registry.stage()?;
+            stage.protect(id, RoundedGrowth::from_files(4096, &[], 0)?)?;
+            stage.assess(&plan, input, Tick(1))?;
+        }
+        assert_eq!([registry.counters(id)?, registry.counters(other)?], before);
+        assert_eq!(register(&mut registry, 1)?, id);
+        Ok(())
+    }
+    #[test]
+    fn epoch_exhaustion_preserves_identities_and_capacity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut states = [const { SlotState::EMPTY }; 2];
+        let mut cells = [const { Cell::EMPTY }; 2];
+        let mut registry = Registry::new(&mut states, &mut cells)?;
+        let first = register(&mut registry, 1)?;
+        let last = register(&mut registry, 2)?;
+        let first_index = registry.record(first)?.0;
+        let last_index = registry.record(last)?.0;
+        assert!(first_index < last_index);
+        let a = registry
+            .cells
+            .get_mut(first_index)
+            .and_then(|c| c.record.as_mut())
+            .ok_or("first")?;
+        a.lease_references = 1;
+        a.counters = Counters {
+            completed: Growth {
+                bytes: 4096,
+                inodes: 1,
+            },
+            pending: Growth {
+                bytes: 8192,
+                inodes: 2,
+            },
+            checkpoint: Growth {
+                bytes: 12288,
+                inodes: 3,
+            },
+        };
+        registry.probe_epoch = u64::MAX;
+        let before = registry.record(first)?.1;
+        let old = registry.begin_probe(first, deadline()?, Tick(1))?;
+        assert_eq!(registry.invalidate_probes(), Err(Error::EpochExhausted));
+        assert_eq!(registry.probe_epoch, u64::MAX);
+        assert_eq!(registry.counters(first)?, before.counters);
+        assert_eq!(
+            registry.record(first)?.1.lease_references,
+            before.lease_references
+        );
+        let mut old = Some(old.complete(Ok(sample(u64::MAX)))?);
+        let checked = registry.consume(first, &mut old, Tick(1))?;
+        assert_eq!(checked.filesystem(), first);
+        // Successful fences also preserve live physical ownership.
+        registry.probe_epoch = 0;
+        registry.invalidate_probes()?;
+        assert_eq!(registry.probe_epoch, 1);
+        assert_eq!(registry.begin_probe(first, deadline()?, Tick(1))?.epoch, 1);
+        assert_eq!(registry.begin_probe(last, deadline()?, Tick(1))?.epoch, 1);
+        assert_eq!(registry.counters(first)?, before.counters);
+        assert_eq!(
+            registry.record(first)?.1.lease_references,
+            before.lease_references
+        );
+        assert_eq!(registry.unregister(first), Err(Error::Busy));
         Ok(())
     }
 }

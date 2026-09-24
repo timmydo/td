@@ -357,6 +357,9 @@ entry itself. Queue entries carry references to owned job payloads. Matching
 an observation grants no capacity. The composed coordinator tests drive
 physical counter transitions using injected samples and completion proofs.
 They establish accounting bounds, not runtime filesystem behavior or RSS.
+M04c3b3c1 stores one probe epoch on the registry and copies it into the fixed
+stack projection. The filesystem record/slot size is unchanged, and no per-probe
+table is allocated. Invalidation retains capacity and lease ownership.
 
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
 buffers and atomic text formatting. They neither allocate backing storage nor

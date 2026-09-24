@@ -29,8 +29,9 @@ add grouped quota checks and effect tickets. The scalar writer ledger derives
 checkpoint needs from that same quota ledger and models a closed writer
 barrier. A bounded filesystem registry matches linear probe observations.
 The composed coordinator atomically couples logical and physical reservations,
-effects and cancellation. Checkpoint capacity transfer and reopening remain
-M04c3b3c work.
+effects and cancellation. Checked epochs invalidate pre-fence probes even
+when their timestamps match later probes. Checkpoint capacity transfer and
+reopening remain M04c3b3c2 work.
 They do not instantiate service pools, perform live disk I/O or
 implement protocol handlers.
 
