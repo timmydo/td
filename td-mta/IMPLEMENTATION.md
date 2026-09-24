@@ -214,10 +214,19 @@ Split at these concrete boundaries before dependent milestones start:
   syntax in `config/syntax.rs`; [CONFIG.md](CONFIG.md) owns the grammar,
   limits and redacted diagnostics. This accepts statements, not effective
   configurations. No file access or schema validation is implemented.
-- **M04b2:** freeze typed field schema/defaults and descriptor ceilings in
-  CONFIG.md; build immutable candidates in the two bounded snapshots, reject
-  duplicate/unknown fields, resolve account/domain/alias/identity references,
-  and validate the committed resource plan.
+- **M04b2a:** implemented integer resource stanza decoding in
+  `config/resources.rs`, reusing the existing Limits/DiskLimits/WorkLimits/
+  NetworkLimits declarations. Reject duplicate sections/fields, unknown keys
+  and wrong types; consume candidates through memory, admission and timeout
+  planners. This is resource validation only, not a full configuration check.
+- **M04b2b:** freeze routing field schema and descriptor ceilings in CONFIG.md;
+  build bounded immutable account/domain/alias candidates and resolve local
+  recipient routes, including reserved postmaster handling.
+- **M04b2c:** freeze remaining identity/listener/relay/certificate schemas and
+  build complete immutable candidates in the two bounded snapshots. Integrate
+  syntax, schema version, resource plans and all configured references;
+  reject unknown/duplicate fields, missing required values and incompatible
+  policies before publication.
 - **M04b3:** protected-file reference requirements and redacted effective
   configuration library output. Actual trusted file opening and permission
   evidence use M05 adapters; no successful full `config check` before that
@@ -273,7 +282,7 @@ Split at these concrete boundaries before dependent milestones start:
 All parts gate M04 consumers. Individual helper modules are not a running
 allocator, scheduler, admission coordinator or service.
 Checked local/wire identifiers already exist from M01/M02; M04a2 owns the
-additional runtime slot tokens, and M04b2 validates configured references.
+additional runtime slot tokens, and M04b2b/M04b2c validate configured references.
 
 Implement reusable buffers/arenas, bounded formatting, fixed-capacity queues,
 and checked identifiers. Implement the documented stanza grammar, immutable

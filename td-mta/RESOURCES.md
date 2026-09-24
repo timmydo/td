@@ -312,8 +312,10 @@ values. Build a new snapshot from the bounded stream scratch; do not keep an
 extra file-sized input copy beside both snapshots. CONFIG.md bounds the
 physical input at 2 MiB, streamed through the control worker's existing 64 KiB
 configuration region: 16 KiB input chunk, 8 KiB physical line, 4 KiB decoded
-string, and 36 KiB parser/builder working state. No input-sized syntax tree
-is retained. Certificate/key provider
+string, and 36 KiB parser/builder working state. The scalar resource builder
+fits within 4 KiB of that working state, including fixed source locations for
+four sections of at most 64 fields each. No input-sized syntax tree is
+retained. Certificate/key provider
 allocations belong to their separate TLS/certificate entries. Pin old snapshots
 only for bounded operation lifetimes and reauthorize Access as API.md specifies.
 Exact stanza/field limits and snapshot structs are M04's implementation gate.

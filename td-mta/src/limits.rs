@@ -44,19 +44,30 @@ impl fmt::Display for ResourceError {
 impl std::error::Error for ResourceError {}
 
 macro_rules! limits {
-    ($($field:ident: $default:expr, $min:expr, $max:expr;)+) => {
+    (configurable { $($field:ident: $default:expr, $min:expr, $max:expr;)+ } fixed { $($fixed:ident: $value:expr;)+ }) => {
         /// Untrusted configuration values. Use `plan` before allocating resources.
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        pub struct Limits { $(pub $field: usize,)+ }
+        pub struct Limits { $(pub $field: usize,)+ $(pub $fixed: usize,)+ }
 
         impl Default for Limits {
-            fn default() -> Self { Self { $($field: $default,)+ } }
+            fn default() -> Self { Self { $($field: $default,)+ $($fixed: $value,)+ } }
         }
 
         impl Limits {
+            pub(crate) const CONFIG_FIELDS: &'static [&'static str] = &[$(stringify!($field),)+];
+            // Cold bounded string dispatch keeps declarations in one place.
+            pub(crate) fn set_config(&mut self, index: usize, value: usize) -> bool {
+                match Self::CONFIG_FIELDS.get(index).copied() {
+                    $(Some(stringify!($field)) => { self.$field = value; true },)+
+                    _ => false,
+                }
+            }
             fn validate_ranges(&self) -> Result<(), ResourceError> {
                 $(if !($min..=$max).contains(&self.$field) {
                     return Err(ResourceError::OutOfRange { field: stringify!($field), min: $min, max: $max });
+                })+
+                $(if self.$fixed != $value {
+                    return Err(ResourceError::OutOfRange { field: stringify!($fixed), min: $value, max: $value });
                 })+
                 Ok(())
             }
@@ -65,38 +76,42 @@ macro_rules! limits {
 }
 
 limits! {
-    smtp_sessions: 8, 1, 32;
-    smtp_per_peer: 2, 1, 32;
-    https_connections: 8, 1, 32;
-    tls_handshakes: 2, 1, 8;
-    event_streams: 2, 0, 8;
-    outbound_deliveries: 1, 1, 1;
-    body_jobs: 2, 1, 8;
-    storage_views: 2, 1, 8;
-    message_bytes: 32 * MIB, 1, 128 * MIB;
-    header_bytes: 256 * KIB, 1, MIB;
-    mime_depth: 32, 1, 64;
-    mime_parts: 1024, 1, 4096;
-    smtp_recipients: 100, 100, 1000;
-    json_bytes: MIB, 1, 4 * MIB;
-    json_methods: 16, 1, 64;
-    json_depth: 32, 1, 64;
-    json_tokens: 32768, 1, 131072;
-    objects_per_method: 256, 1, 1024;
-    query_page: 256, 1, 1024;
-    index_cache_bytes: 8 * MIB, 1, 32 * MIB;
-    journal_bytes: 4 * MIB, 4 * MIB, 4 * MIB;
-    journal_operations: 8192, 8192, 8192;
-    frame_bytes: MIB, MIB, MIB;
-    frame_operations: 4096, 4096, 4096;
-    upload_disk_bytes: 128 * MIB, 1, 1024 * MIB;
-    upload_expiry_seconds: 86400, 1, 604800;
-    queue_disk_bytes: 256 * MIB, 1, 1024 * MIB;
-    queue_submissions: 1000, 1, 10000;
-    sort_disk_bytes: 64 * MIB, 1, 256 * MIB;
-    log_file_bytes: 8 * MIB, 1, 64 * MIB;
-    retained_logs: 4, 1, 16;
-    memory_budget_bytes: 64 * MIB, 1, 128 * MIB;
+    configurable {
+        smtp_sessions: 8, 1, 32;
+        smtp_per_peer: 2, 1, 32;
+        https_connections: 8, 1, 32;
+        tls_handshakes: 2, 1, 8;
+        event_streams: 2, 0, 8;
+        body_jobs: 2, 1, 8;
+        storage_views: 2, 1, 8;
+        message_bytes: 32 * MIB, 1, 128 * MIB;
+        header_bytes: 256 * KIB, 1, MIB;
+        mime_depth: 32, 1, 64;
+        mime_parts: 1024, 1, 4096;
+        smtp_recipients: 100, 100, 1000;
+        json_bytes: MIB, 1, 4 * MIB;
+        json_methods: 16, 1, 64;
+        json_depth: 32, 1, 64;
+        json_tokens: 32768, 1, 131072;
+        objects_per_method: 256, 1, 1024;
+        query_page: 256, 1, 1024;
+        index_cache_bytes: 8 * MIB, 1, 32 * MIB;
+        upload_disk_bytes: 128 * MIB, 1, 1024 * MIB;
+        upload_expiry_seconds: 86400, 1, 604800;
+        queue_disk_bytes: 256 * MIB, 1, 1024 * MIB;
+        queue_submissions: 1000, 1, 10000;
+        sort_disk_bytes: 64 * MIB, 1, 256 * MIB;
+        log_file_bytes: 8 * MIB, 1, 64 * MIB;
+        retained_logs: 4, 1, 16;
+        memory_budget_bytes: 64 * MIB, 1, 128 * MIB;
+    }
+    fixed {
+        outbound_deliveries: 1;
+        journal_bytes: 4 * MIB;
+        journal_operations: 8192;
+        frame_bytes: MIB;
+        frame_operations: 4096;
+    }
 }
 
 /// One separately accounted reservation. Sizes include each slot's overhead.

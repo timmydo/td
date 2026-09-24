@@ -35,6 +35,14 @@ macro_rules! settings {
             fn default() -> Self { Self { $($field: $default,)+ } }
         }
         impl $name {
+            pub(crate) const CONFIG_FIELDS: &'static [&'static str] = &[$(stringify!($field),)+];
+            // Cold bounded string dispatch keeps declarations in one place.
+            pub(crate) fn set_config(&mut self, index: usize, value: u64) -> bool {
+                match Self::CONFIG_FIELDS.get(index).copied() {
+                    $(Some(stringify!($field)) => { self.$field = value; true },)+
+                    _ => false,
+                }
+            }
             fn validate(&self) -> Result<(), Error> {
                 $(if !($min..=$max).contains(&self.$field) {
                     return Err(Error::Range { field: stringify!($field), min: $min, max: $max });

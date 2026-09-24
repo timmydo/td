@@ -3,27 +3,27 @@
 ## Scope
 
 This document owns the configuration syntax. `config::syntax` implements
-bounded framing and statement decoding only. The typed field schema,
-defaults, snapshot builder, reference/resource validation, protected file
-access, effective output, and CLI remain M04b2/M04b3/M05/M19 work as assigned
-in IMPLEMENTATION.md. A syntactically accepted statement is not a valid
-service configuration. DESIGN.md §6 owns the administration contract;
-RESOURCES.md owns the aggregate memory budget.
+bounded framing and statement decoding only. The resource stanza schema below
+additionally builds checked resource plans. The other typed fields, snapshot
+builder, reference validation, protected file access, effective output, and
+CLI remain M04b2b/M04b2c/M04b3/M05/M19 work as assigned in IMPLEMENTATION.md.
+A syntactically accepted statement is not a valid service configuration.
+DESIGN.md §6 owns the administration contract; RESOURCES.md owns the aggregate
+memory budget.
 
 ## Physical input and limits
 
 Input is UTF-8, with LF or CRLF line endings, including mixed endings. A final
-unterminated line is allowed. A bare CR is invalid. Empty input is syntactically
-valid; the schema must still require its version and mandatory settings.
-A UTF-8 BOM prefix is refused. Outside quoted strings, whitespace means ASCII space
-or horizontal tab. Every line, including comments, must be valid UTF-8 and
-contain no Unicode control character except horizontal tab. Also reject
-Unicode line/paragraph separators U+2028/U+2029 and directional controls
-U+061C, U+200E/U+200F, U+202A..U+202E and U+2066..U+2069, including in
-comments, so visual line/direction changes cannot disguise settings. Quoted
+unterminated line is allowed. A bare CR is invalid. Empty input is
+syntactically valid; the schema must still require its version and mandatory
+settings. A UTF-8 BOM prefix is refused. Outside quoted strings, whitespace
+means ASCII space or horizontal tab. Every line, including comments, must be
+valid UTF-8 and contain no Unicode control character except horizontal tab.
+Also reject Unicode line/paragraph separators U+2028/U+2029 and directional
+controls U+061C, U+200E/U+200F, U+202A..U+202E and U+2066..U+2069, including
+in comments, so visual line/direction changes cannot disguise settings. Quoted
 strings also reject raw horizontal tabs. Other Unicode text is retained
-without normalization;
-field-specific validation follows syntax decoding.
+without normalization; field-specific validation follows syntax decoding.
 
 All ceilings apply together:
 
@@ -66,11 +66,11 @@ at `#` outside a string, after a complete statement or where a blank line
 could occur; no separating whitespace is required. Non-comment text after a
 complete statement is an error. There are no inline statements or semicolons.
 
-Strings use double quotes. Only `\"` and `\\` are escapes; all other
-backslash sequences are errors. `#`, `=`, `[` and `]` inside quotes are literal
-text. Empty strings and empty labels are syntactically valid. There are no
-single quotes, multiline strings, Unicode escape sequences, substitutions,
-or escape sequences for controls. Represent Unicode directly as UTF-8.
+Strings use double quotes. Only `\"` and `\\` are escapes; all other backslash
+sequences are errors. `#`, `=`, `[` and `]` inside quotes are literal text.
+Empty strings and empty labels are syntactically valid. There are no single
+quotes, multiline strings, Unicode escape sequences, substitutions, or escape
+sequences for controls. Represent Unicode directly as UTF-8.
 
 Integers are canonical unsigned decimal: `0` or a nonzero digit followed by
 digits. Leading zeros, signs, separators, fractions, exponents and overflow
@@ -112,12 +112,12 @@ an empty string requires no scratch bytes. No partial statement is returned
 on error. Scratch and frame tails are not erased when their visible length
 changes, so they are private storage and must never be dumped as diagnostics.
 
-The control worker's existing 64 KiB configuration scratch is divided into
-16 KiB input, 8 KiB physical line, 4 KiB decoded string and 36 KiB parser/builder
-state. Construction of the candidate uses its already budgeted snapshot;
-there is no whole-file input copy or allocated syntax tree. This increment
-does not instantiate the control worker, open files, read credentials, or
-prove ownership/permissions. M05 supplies the trusted filesystem boundary.
+The control worker's existing 64 KiB configuration scratch is divided into 16
+KiB input, 8 KiB physical line, 4 KiB decoded string and 36 KiB parser/builder
+state. Construction of the candidate uses its already budgeted snapshot; there
+is no whole-file input copy or allocated syntax tree. This increment does not
+instantiate the control worker, open files, read credentials, or prove
+ownership/permissions. M05 supplies the trusted filesystem boundary.
 
 ## Diagnostics and disclosure
 
@@ -136,11 +136,119 @@ Stable syntax codes are `config_capacity`, `config_invalid_state`,
 `config_name_too_long`, `config_expected_equals`, `config_expected_value`,
 `config_invalid_integer`, `config_invalid_escape`,
 `config_unterminated_string`, `config_string_too_long`,
-`config_expected_bracket`, `config_expected_space`, and `config_trailing_data`.
-They are library diagnostics; CLI JSON and exit-code wiring is still planned.
+`config_expected_bracket`, `config_expected_space`, and
+`config_trailing_data`. They are library diagnostics; CLI JSON and exit-code
+wiring is still planned.
 
 Display/debug diagnostics never include source bytes. `Statement` and `Value`
 implement redacted `Debug`, including names, labels, integers and booleans.
-Their typed accessors/patterns intentionally expose data to the trusted builder;
-redacted debug output is not an authorization boundary. Never interpolate a
-rejected key, value, input line or referenced secret into a normal event.
+Their typed accessors/patterns intentionally expose data to the trusted
+builder; redacted debug output is not an authorization boundary. Never
+interpolate a supplied key, raw input line, wrong-type value or referenced
+secret into a normal event. Typed numeric resource diagnostics have the
+explicit disclosure contract below.
+
+## Resource stanza schema
+
+M04b2a implements resource settings as a separate typed builder. It cannot
+validate an entire configuration. The outer snapshot builder must recognize
+unlabelled singleton `[limits]`, `[disk]`, `[work]`, `[network]` sections,
+reject labels, and establish the schema version and actual EOF. Each may
+appear at most once, in any order, and may be omitted to retain defaults.
+Within one section, each allowed key occurs at most once. Unknown keys fail;
+values must be integer literals, including when a boolean or quoted string
+contains something that resembles a number. No unit suffix is accepted.
+
+Fields, default values and range limits derive from the existing declarations
+in `Limits`, `DiskLimits`, `WorkLimits` and `NetworkLimits`; they are the same
+inputs consumed by RESOURCES.md and ADMISSION.md's planners. The supported v1
+key vocabulary is listed below and pinned by an independent test oracle.
+Adding a declaration must reconcile that vocabulary and this schema. The
+Limits declaration separates configurable values from fixed storage and
+execution constants. Fixed journal/frame sizes/counts and the single outbound
+worker are not operator keys; spelling them in a file is an unknown-field
+error even when the supplied value equals the constant.
+
+### `[limits]`
+
+`smtp_sessions`, `smtp_per_peer`, `https_connections`, `tls_handshakes`,
+`event_streams`, `body_jobs`, `storage_views`, `message_bytes`,
+`header_bytes`, `mime_depth`, `mime_parts`, `smtp_recipients`, `json_bytes`,
+`json_methods`, `json_depth`, `json_tokens`, `objects_per_method`,
+`query_page`, `index_cache_bytes`, `journal_bytes`, `upload_disk_bytes`,
+`upload_expiry_seconds`, `queue_disk_bytes`, `queue_submissions`,
+`sort_disk_bytes`, `log_file_bytes`, `retained_logs`, `memory_budget_bytes`.
+
+### `[disk]`
+
+`body_bytes`, `body_files`, `live_metadata_bytes`, `checkpoint_bytes`,
+`response_bytes`, `response_total_bytes`, `cache_bytes`, `cold_bytes`,
+`free_bytes`, `free_inodes`.
+
+### `[work]`
+
+`foreground_seconds`, `foreground_io_bytes`, `foreground_records`,
+`changes_seconds`, `changes_io_bytes`, `changes_records`, `request_seconds`,
+`commit_seconds`, `commit_io_bytes`, `commit_records`, `checkpoint_seconds`,
+`checkpoint_io_bytes`, `gc_drain_seconds`, `gc_seconds`, `gc_io_bytes`,
+`gc_records`, `gc_unlinks`, `backup_seconds`, `backup_io_bytes`,
+`admission_seconds`.
+
+### `[network]`
+
+`handshake_seconds`, `dns_seconds`, `dial_seconds`, `header_idle_seconds`,
+`header_seconds`, `body_idle_seconds`, `response_idle_seconds`,
+`keepalive_seconds`, `event_stall_seconds`, `smtp_idle_seconds`,
+`smtp_data_seconds`, `command_seconds`, `data_init_seconds`,
+`data_block_seconds`, `final_reply_seconds`, `migration_idle_seconds`,
+`migration_minimum_seconds`, `transfer_minimum_seconds`,
+`transfer_base_seconds`, `minimum_rate`.
+
+Quantities ending in `_bytes` are bytes and those ending in `_seconds` are
+seconds. Counts/depths are integers; `minimum_rate` is bytes per second. No
+unit conversion or multiplication is performed by the stanza decoder.
+
+### Builder and validation
+
+The outer builder calls `begin` for each resource section and supplies its
+current typed section explicitly to every `assign`. `Section::ALL` and
+`Section::from_name` enumerate/recognize the fixed names. This helper keeps no
+second current-section selection. Assignments before `begin` fail. The caller
+must route only assignments from the matching current resource stanza. It
+passes the assignment's key location; range errors point there, not inside the
+value. `begin` rejects repeated sections even if no assignments occurred or
+another section intervened. `assign` rejects repeated fields, retaining the
+first location for diagnostic context. The first error poisons the candidate;
+later `begin`, `assign` and `finish` return it. The outer builder must
+likewise discard the whole candidate if any other check fails.
+
+`finish(view_mode)` consumes the builder and runs, in order, the existing
+memory plan, disk/work plan and timeout plan. The selected view mode is an
+explicit typed argument from the future whole-configuration schema; this
+helper cannot infer whether online background operations are enabled. Resource
+integers are converted from u64 to usize with a checked conversion;
+disk/work/network values remain u64. No integer is truncated. Ranges and
+cross-field capacity rules are applied by the planners before `Validated` is
+returned. `Validated` contains only the three immutable plans and grants no
+filesystem, credential or listener authority.
+
+Resource errors use fixed codes and optional source locations. Duplicate
+errors include the original location; range errors identify the fixed schema
+field and its assignment when available, using `config_out_of_range`.
+Type/width errors also retain the recognized static field name.
+Cross-field/budget errors do not blame a single line and have no location.
+Typed planner errors are available as the error source; their names/rules are
+compiled strings, never supplied key strings or wrong-type values.
+Successfully decoded resource integers and computed totals may appear in the
+typed planner error, its Debug, or its error source (including a rejected
+memory budget). These are numeric administrative diagnostics, never credential
+data or raw input echoes. The builder holds at most 64 location slots per
+resource section and is bounded to 4 KiB by its size test, inside the existing
+36 KiB builder scratch. It allocates no additional storage.
+
+Resource codes are `config_duplicate_section`, `config_duplicate_field`,
+`config_unknown_field`, `config_expected_integer`, `config_integer_width`,
+`config_no_resource_section`, `config_resource_schema_capacity`,
+`config_out_of_range`, `config_resource_plan`, `config_admission_plan`, and
+`config_timeout_plan`. These supplement the syntax codes above; CLI output
+remains unimplemented.
