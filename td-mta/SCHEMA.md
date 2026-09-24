@@ -169,10 +169,12 @@ If no `direct_smtp` listener exists, structural validation requires an
 explicit `mx_host` for every domain, including gateway-only or loopback-only
 fixtures. The host receiving from a gateway is not implicitly its public MX. A
 defaulted MX must match a direct listener's `server_name`. If an explicit MX
-equals the global hostname or any direct listener name, it also requires a
-matching direct listener name/certificate requirement. Other explicit MX names
-designate an upstream endpoint whose certificates this host cannot validate
-offline. This classification controls DNS output; it is not a claim about
+equals any name advertised by this host (global hostname, direct/gateway
+listener server name, JMAP origin host or any enabled MTA-STS policy host),
+it also requires a matching direct listener name/certificate requirement.
+A gateway-only or HTTPS-only name cannot become a public MX by spelling it
+explicitly. Other explicit MX names designate an upstream endpoint whose
+certificates this host cannot validate offline. This classification controls DNS output; it is not a claim about
 actual DNS routing. `dns-plan` emits the configured MX record; it emits this
 host's address hints only for its own advertised listener/origin/policy names,
 never an unrelated gateway MX.
@@ -301,7 +303,12 @@ Use 1..16 `[certificate "NAME"]` profiles:
 Every profile must have a configured consumer. Derive identifier sets from
 listener server names, JMAP origin and enabled MTA-STS hosts, with at most 32
 distinct names per profile and 512 bindings overall. Repeated use of a name
-within one profile does not duplicate an identifier. A name cannot map to
+within one profile does not duplicate an identifier. The current schema
+produces at most 272 distinct bindings (16 listeners plus 256 domains).
+The 512-cell reservation remains the conservative 16-profile by 32-name
+ceiling; it does not claim all 512 entries are reachable. Derived-name
+text, including copies of existing consumer names, is charged to the
+shared non-routing arena. A name cannot map to
 conflicting certificate profiles in the same HTTPS SNI routing table.
 
 Files mode has explicit operator renewal responsibility. ACME mode requires an
@@ -506,6 +513,16 @@ header in workspace/headroom. These gateway header reservations are enforced
 by the combined layout check in M04b2c3d; current gateway host tests check
 the builder size. Structural helpers perform no DNS lookup, protected-file
 read or network operation.
+
+Graph binding cells use the existing 16 KiB partition. The enclosing
+borrowed graph header, including listener/certificate/gateway/domain
+headers, fits 1 KiB of global headroom and replaces the individual headers.
+Required names and canonical JMAP origin use shared non-routing text.
+Binding uses one 253-byte name scratch and one 257-byte canonical-origin
+scratch within the existing control-worker stack allowance. The whole
+loader stages at most 258 raw origin bytes plus its source coordinate in
+builder workspace until binding stores the canonical origin. Concrete
+combined layout and peak stack checks remain required before publication.
 
 The loader owns one pending stanza within that same 36 KiB builder
 workspace. Reserve 13 KiB for the largest pending variant, including text

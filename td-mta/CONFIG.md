@@ -727,7 +727,7 @@ field diagnostics. Named `DEFAULT_PREFERENCE` and
 `DEFAULT_MAX_AGE_SECONDS` constants are shared by input defaults and
 empty cells. Profile existence, certificate verification, port/SNI
 compatibility and direct versus gateway MX classification belong to
-M04b2c3c3/c4 and M07/M18.
+M04b2c3c3/c4b and M07/M18.
 
 Finalization first validates local routing, then confirms a policy for
 every routing domain. It validates and stores one canonical global
@@ -897,7 +897,7 @@ profile exists. Missing settings report the first ACME profile; an unused
 ACME section reports its own coordinate. Files-only profiles need no ACME
 settings. With zero profiles, the missing-profile error takes precedence
 even when an ACME section exists. Profile consumption, required-name sets,
-SNI conflicts and the ACME HTTP-01 requirement remain M04b2c3c4b checks; c4a
+SNI conflicts and the ACME HTTP-01 requirement use M04b2c3c4b below; c4a
 owns listener role fields and the HTTP-01 bind port.
 
 Profile checks run in this order: name syntax, duplicate declaration, path
@@ -925,7 +925,7 @@ SCHEMA.md's role matrix; a missing field and a supplied forbidden field have
 distinct fixed codes and a static field identifier. Direct/gateway server
 names receive shared DNS validation and lowercase storage. Certificate and
 gateway references receive profile-name validation only; their existence and
-compatibility are M04b2c3c4b checks. The source dispatcher still owns
+compatibility use M04b2c3c4b below. The source dispatcher still owns
 unknown fields, duplicates within a stanza, scalar types and reader EOF.
 
 Each bind is a parsed numeric socket endpoint. Loopback fixtures require
@@ -948,7 +948,7 @@ the shared pool; SMTP plus HTTP-01 still fails the HTTPS requirement.
 Non-SMTP roles cannot carry those fields. HTTPS and HTTP-01 retain their
 existing shared runtime pools; no per-listener pool is allocated.
 JMAP-origin ports, ACME HTTP-01 availability, certificate consumers, SNI
-names, gateway peer requirements and MX classification remain c4b checks.
+names, gateway peer requirements and MX classification use c4b below.
 
 The caller supplies 1..16 cells of at most 128 bytes, within the existing 2
 KiB listener partition; the builder fits 128 bytes of builder workspace. The
@@ -970,3 +970,81 @@ disclose only static schema context and source coordinates, with no
 error-source chain. Inputs/builders/records/ views redact Debug output.
 Trusted accessors expose declared settings and coordinates; these records
 grant no socket, TLS, gateway or SMTP authority.
+
+
+## Structural reference graph
+
+M04b2c3c4b implements `config::graph::bind`. It consumes the completed
+listener, certificate, gateway and domain-policy records, a validated JMAP
+origin, its source coordinate and caller-owned binding cells. All four
+tables must belong to the supplied shared text arena. This is a structural
+graph only: the whole loader must still establish actual EOF and every
+mandatory section; protected material, provider verification, DNS
+reachability, socket startup and publication remain later work.
+
+Check every listener certificate reference and every gateway reference.
+Used gateway policies require at least one allowed peer prefix; unused
+staged gateway policies may have none. Every HTTPS listener port matches the
+JMAP origin port. Any ACME profile requires an HTTP-01 listener, whose port
+80 is already enforced by the listener helper. MTA-STS in testing, enforce
+or none mode requires origin port 443 and its selected certificate profile.
+The enabled policy hosts use every HTTPS listener's SNI table. If a policy
+host equals the JMAP host, its profile must equal each HTTPS listener's
+primary profile. Different HTTPS listeners may select different primary
+profiles when this creates no conflict within either listener's SNI table.
+
+Without direct SMTP ingress every domain needs an explicit upstream MX.
+A default MX must match a direct listener server name. An explicit MX equal
+to any hostname advertised here also needs a matching direct listener:
+global hostname, direct/gateway server name, JMAP origin or any enabled
+MTA-STS host. This prevents gateway-only or HTTPS-only names from being
+classified as upstream merely because the MX is explicit. Other explicit
+targets remain unverified upstream names. This classification performs no DNS lookup and
+creates no gateway trust or forwarding authority.
+
+Derive certificate names from direct/gateway SMTP server names, each HTTPS
+listener's JMAP host and each enabled MTA-STS host. Retain lowercase names,
+deduplicate within each profile and enforce 32 names per profile, 512 binding
+cells overall. At most 272 names can be derived from the current 16
+listeners and 256 domains; a compile-time check keeps that maximum within
+the conservative 512-cell reservation. Tests fill all 272 derived entries
+across 16 profiles and refuse a caller region one cell smaller. Every
+declared certificate profile must have a consumer.
+The caller may supply fewer cells and receives a capacity error when they
+fill. Names are added in listener declaration order then canonical domain
+order; a duplicate retains its first consumer's coordinate. Binding views
+resolve the profile through the enclosing records, never an unrelated table.
+The graph also retains read-only access to the enclosed routing table.
+
+Each binding cell fits 32 bytes in the existing 16 KiB partition. The whole
+borrowed graph header, including its four enclosed table headers, fits 1 KiB
+of global headroom; it replaces those headers rather than duplicating them.
+Canonical origin and required names use the existing shared 192 KiB text.
+Required-name copies are charged here even when their consumer spelling is
+already stored; there is no unaccounted string pool.
+A 253-byte name scratch and 257-byte canonical-origin scratch live in the
+existing control-worker stack allowance; no heap allocation is introduced.
+M04b2c3d stages the server origin (at most 258 raw bytes, including an
+optional final slash) and its field coordinate within the existing builder
+workspace, then passes it here for canonical storage. Default port 443 and
+the optional slash are omitted and the host is folded; the directory URI's
+separate preserved spelling remains unchanged.
+
+Check order is binding-region size, all table owners, listener references
+and ports/peers, ACME HTTP-01, each domain's MX then MTA-STS port/reference/
+SNI rules, and unused profiles. All run before graph text or binding writes.
+Then store the canonical origin and derive names, checking per-profile and
+caller-region capacity before each name append. Missing references therefore
+precede name-capacity failures; MTA-STS port errors precede its certificate
+lookup. An unused profile cannot consume graph text or binding cells.
+
+An error consumes the input records and returns no partial graph. Earlier
+text or binding writes may remain charged in the discarded candidate; no
+rollback, reusable authority or replacement allocation is implied. Used
+binding cells are fully initialized, and only their current prefix is
+exposed after reuse. Live/frozen graph views check the arena owner; every
+compact read checks it again. Fixed `config_graph_` codes carry only source
+coordinates, with a related-setting coordinate where applicable. Display,
+Debug and the empty error-source chain reveal no operator values; trusted
+accessors expose settings explicitly. The whole dispatcher supplies any
+additional static stanza/field context from those coordinates.

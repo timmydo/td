@@ -298,11 +298,14 @@ Split at these concrete boundaries before dependent milestones start:
     roles. Caller cells fit the 2 KiB listener reservation; owner-checked views
     retain declared fields, references and coordinates for the graph below.
     No socket is opened; IPv6 startup still needs M11's audited socket policy.
-  - **M04b2c3c4b:** complete reference graph: origin/port/certificate required
-    names, profile consumption, gateway peer requirements, ACME HTTP-01,
-    MTA-STS SNI mapping and direct-versus-upstream MX classification. Test
-    direct, gateway and combined profiles entirely offline, including
-    incompatible and dangling policies. No provider or network authority.
+  - **M04b2c3c4b:** implemented `config/graph.rs`: consumes the listener,
+    certificate, gateway and domain tables as one closed structural graph.
+    Checks origin ports, profile consumption and required names, used gateway
+    peers, ACME HTTP-01, MTA-STS SNI conflicts and local/upstream MX rules.
+    Caller bindings fit the existing 16 KiB partition; canonical origin and
+    deduplicated names share non-routing text. Tests exercise direct, gateway,
+    combined and fixture ingress entirely offline. No provider or network
+    authority; whole-file dispatch and actual EOF remain d.
   - **M04b2c3d:** single whole-loader entry point owning its candidate and reader
     operation. Require root version, actual EOF, all mandatory sections and
     resource plans. Hold one pending stanza in SCHEMA.md's shared 13 KiB
