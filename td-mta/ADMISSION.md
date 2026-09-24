@@ -8,10 +8,13 @@ already validated ResourcePlan, DiskLimits, WorkLimits and explicit
 ViewMode. It validates capacity relationships without allocating pools or
 inspecting the filesystem. M04c2 supplies pure charged meters and timer
 budgets in `src/admission/work.rs` and `src/admission/timers.rs`. M04c3a
-supplies pure physical-space arithmetic in `src/admission/space.rs`. M04c3b
-owns reservation accounting. M05/M08 supply physical probes, persistence and
-maintenance. M13 owns request retention. No running admission coordinator or
-filesystem probe is claimed.
+supplies pure physical-space arithmetic in `src/admission/space.rs`. M04c3b1
+supplies fixed logical leases and linear effect tickets in
+`src/admission/logical.rs`, using `src/admission/quota.rs`. M04c3b2/M04c3b3
+own the derived writer/checkpoint ledger and composed physical reservation
+coordinator. M05/M08 supply physical probes, persistence and maintenance.
+M13 owns request retention. No running admission coordinator or filesystem
+probe is claimed.
 
 ## 1. Disk accounting
 
@@ -112,6 +115,54 @@ to coexist. Before a rollover, reserve the newly closed segment and next active
 file. Prune only unselected/unpinned files after publishing a safe history floor;
 defer checkpoint/admission if the cap cannot be met. A full advertised history
 does not itself require evicting a pinned segment or stalling every rollover.
+
+### Logical lease implementation
+
+M04c3b1 keeps up to 64 caller-owned cells, with four logical quota pairs per
+cell and at most eight cells in one atomic group. Duplicate kinds add across
+the whole group; every applicable category must fit used plus pending plus
+new charges before any group is installed. Constructor use comes from trusted
+store reconciliation and cannot exceed configured caps. These counters are
+not disk authority. The helper does not grant filesystem or writer permission;
+M04c3b2/M04c3b3 must couple its reservation to the checkpoint and space gates.
+
+Group and part tokens validate the complete process-local slot generation.
+A bounded extension increases a part's reservation without allocating another
+cell; the composed coordinator also requires fresh physical admission.
+Initially zero amounts disable their positions for the lease lifetime; an
+extension cannot activate them. An enabled position consumed to zero keeps
+its kind and can be extended. Packed kinds and amounts avoid pair padding. A
+linear effect ticket pins a part before work. A busy part cannot be extended,
+reused or canceled. Proven completion consumes only its exact bounded charges;
+an uncertain effect conservatively consumes the planned charges. Invalid
+completion leaves the ticket and reservation pinned. Completion can run after
+the lease deadline; expiration refuses new work and cannot undo effects.
+
+Writing raw/private bytes and publishing logical references are separate
+transitions with separate tickets/charges. A syscall error alone does not
+prove zero growth. Cancel releases only unused reservations; used raw/orphan
+charges remain. The logical helper has no public operation to release used
+charges. M05/M08's object ledger and proven cleanup/commit transitions own
+that later integration; a freed lease token cannot authenticate object cleanup.
+M04c3b2/M04c3b3 wrap this same logical ledger, without duplicate quota-used
+counters. Typed journal commit/rollover and object cleanup transitions must
+account for all recycled buckets, including scratch and logs. Proven effect
+amounts are trusted adapter inputs, not capabilities against arbitrary code.
+The composed coordinator must restrict who can supply that proof.
+
+The coordinator's job registry retains every lease and effect ticket until
+completion. Both handles carry must-use diagnostics. Bounded expiry enumeration
+returns root tokens, including busy groups; cancellation revalidates them and
+refuses a group with any busy member. Expiry never establishes worker quiescence.
+Losing a ticket leaves its part pinned: only a worker-quiescence fence plus
+trusted effect/object reconciliation can support recovery. Until that path is
+implemented, stop admission and restart/reconcile under the store lock rather
+than inventing a zero-effect completion. Dropping the table leaves occupied
+cells, preventing accidental reuse by a new table. The backing-memory owner
+can reset cells; this guard is not an integrity boundary against that owner.
+Unexpected internal failures after slot acquisition poison the table and stop
+new work; ordinary refusal rolls back without changing live charges.
+No syscall, publication or authoritative cleanup is implemented here.
 
 ## 2. Free space and completion reserves
 
@@ -570,6 +621,16 @@ pre-effect counter headroom (including pending/checkpoint growth), allocation
 unit matching, multi-file rounding slack and the journal-operation correction. These are
 arithmetic tests, not evidence of fresh probe matching, reservation ownership,
 atomic live grants, orphan recovery or an actual filesystem adapter.
+
+M04c3b1 tests pin independently configured quota mappings, duplicate grouped
+charges, all-or-nothing cap/late-ticket refusal, fixed capacity and record
+layout, stale/foreign tokens, extensions, effect pinning, uncertain/orphan
+charges surviving cancellation, deadline/completion separation and rejection
+of startup use above a cap. Expiry enumeration covers short output buffers and
+busy non-root members; overflow and disabled extensions preserve the book.
+These tests exercise logical state transitions;
+physical coupling, writer barriers, actual cleanup and live probes remain
+M04c3b2/M04c3b3/M05/M08 gates.
 
 M04/M05/M08/M13 add tests at their real execution boundaries, not document-only
 assertions: concurrent quota reservations cannot overbook; failed publications

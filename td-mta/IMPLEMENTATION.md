@@ -220,9 +220,16 @@ Split at these concrete boundaries before dependent milestones start:
   actual state transitions, idle resets and scheduling enforcement.
 - **M04c3a:** checked physical-space arithmetic in `admission/space.rs`,
   including concurrent-probe correction and checkpoint completion capacity.
-- **M04c3b:** bounded reservation ownership, atomic logical/physical accounting,
-  fresh probe matching and written/orphan transitions using M04c3a. Actual
-  filesystem probes remain M05's boundary; persistence remains M08's.
+- **M04c3b1:** fixed logical quota groups and linear effect tickets in
+  `admission/quota.rs` and `admission/logical.rs`; no physical I/O permission.
+- **M04c3b2:** coordinator-owned selected/journal scalar ledger and derived
+  checkpoint capacity, including reserved candidate frames and simulated
+  writer-barrier transitions. M08 supplies trusted selected/committed state.
+- **M04c3b3:** fresh filesystem probe matching and atomic physical/logical
+  reservation/effect accounting using the preceding helpers. Building
+  checkpoints transfer protected capacity without double charging; admission
+  stays closed until a fresh probe supports the next checkpoint. M05 supplies
+  descriptor-backed probes and cleanup proof; M08 owns persistence/view pins.
 - **M04d:** typed bounded event/status records, escaping and redaction.
 
 All parts gate M04 consumers. Individual helper modules are not a running

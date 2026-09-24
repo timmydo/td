@@ -45,6 +45,8 @@ macro_rules! settings {
     };
 }
 
+pub mod logical;
+pub mod quota;
 pub mod space;
 pub mod timers;
 pub mod work;
@@ -98,6 +100,8 @@ pub struct Plan {
     disk: DiskLimits,
     work: WorkLimits,
     view_mode: ViewMode,
+    active_journal_bytes: u64,
+    active_journal_operations: u64,
     closed_journal_bytes: u64,
     closed_journal_segments: u64,
     minimum_response_bytes: u64,
@@ -117,6 +121,12 @@ impl Plan {
     }
     pub fn view_mode(&self) -> ViewMode {
         self.view_mode
+    }
+    pub fn active_journal_bytes(&self) -> u64 {
+        self.active_journal_bytes
+    }
+    pub fn active_journal_operations(&self) -> u64 {
+        self.active_journal_operations
     }
     pub fn closed_journal_bytes(&self) -> u64 {
         self.closed_journal_bytes
@@ -286,6 +296,8 @@ impl DiskLimits {
             disk: self,
             work,
             view_mode: views,
+            active_journal_bytes: journal,
+            active_journal_operations: operations,
             closed_journal_bytes,
             closed_journal_segments,
             minimum_response_bytes,

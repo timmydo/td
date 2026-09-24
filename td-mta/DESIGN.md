@@ -24,7 +24,9 @@ state codecs; [QUEUE.md](QUEUE.md) freezes future queue/restart/JMAP semantics.
 M04's `bounded` and `ownership` modules provide caller-owned buffer/queue/slot
 primitives. Its `admission` module validates disk/work settings and derived
 capacity requirements and supplies charged work meters, timer budgets and
-physical-space arithmetic for injected probe samples.
+physical-space arithmetic for injected probe samples. Fixed logical leases
+add grouped quota checks and effect tickets; physical coupling and the writer
+checkpoint ledger remain M04c3b2/M04c3b3 work.
 They do not instantiate service pools, coordinate live disk reservations or
 implement protocol handlers.
 

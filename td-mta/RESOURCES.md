@@ -332,8 +332,14 @@ whole-process memory usage or execution-time enforcement.
 
 M04c3a's space evaluator uses scalar counters and injected probe samples. It
 protects pending and checkpoint capacity in its arithmetic, including writes
-completed during a probe. M04c3b still owns live reservation records, atomic
-installation, probe identity/freshness and written/orphan transitions.
+completed during a probe. M04c3b1 supplies fixed logical reservation records,
+atomic grouped quota checks and linear effect tickets. Its cell plus slot
+bookkeeping fits 80 bytes on the current target, leaving 48 of the existing
+128 bytes for the composed physical record; M04c3b3 must pin the actual
+combined layout before enabling physical admission. No replacement cells
+are allocated on saturation. M04c3b2/M04c3b3 still own the derived checkpoint
+ledger, atomic physical coupling and probe identity/freshness. M05/M08 own
+actual written/orphan cleanup authority.
 
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
 buffers and atomic text formatting. They neither allocate backing storage nor
