@@ -377,6 +377,13 @@ impl Viewport {
             .min(total_rows.saturating_sub(self.rows));
     }
 
+    /// Put a caret row near the middle, clamped to a full final viewport.
+    pub fn center(&mut self, row: usize, total_rows: usize) {
+        self.first_row = row
+            .saturating_sub(self.rows / 2)
+            .min(total_rows.saturating_sub(self.rows));
+    }
+
     /// The validated caret position and row count come from the same layout.
     pub fn reveal(&mut self, position: Position, total_rows: usize, soft_wrap: bool) {
         if position.row < self.first_row {

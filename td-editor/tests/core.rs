@@ -218,7 +218,7 @@ fn auto_fill_replaces_multiline_selection_and_undo_restores_all_removed_bytes() 
     apply(&mut e, id, Command::Type(' '));
     assert_eq!(
         e.document(id).unwrap().text(),
-        "one two three four\nfive  six seven\neight"
+        "one two three four\nfive  six seven eight"
     );
     apply(&mut e, id, Command::Undo);
     assert_eq!(e.document(id).unwrap().text(), original);
@@ -287,7 +287,7 @@ fn auto_fill_preserves_interior_separators_and_maps_every_caret() {
         }
     }
     let edit = fill::auto_fill("aaaaa bbbb cccc dddd", 5..5, ' ', 20).unwrap();
-    assert_eq!(edit.insert, "aaaaa  bbbb cccc\ndddd");
+    assert_eq!(edit.insert, " ");
     let source = "alpha  beta gamma delta epsilon";
     let edit = fill::auto_fill(source, source.len()..source.len(), ' ', 20).unwrap();
     assert_eq!(edit.insert, "alpha  beta gamma\ndelta epsilon ");
@@ -596,6 +596,60 @@ fn auto_fill_does_not_duplicate_an_indentation_only_line() {
 }
 
 #[test]
+fn auto_fill_wraps_at_caret_without_stranding_untouched_words() {
+    let original = "alpha bravo charlie\nshort tail";
+    let mut editor = Editor::default();
+    let tab = editor.load_bytes(original.as_bytes()).unwrap();
+    apply(&mut editor, tab, Command::FillColumn(20));
+    apply(&mut editor, tab, Command::AutoFill(true));
+    select(&mut editor, tab, 6, 6);
+    apply(&mut editor, tab, Command::Insert("extra".into()));
+    apply(&mut editor, tab, Command::Type(' '));
+    assert_eq!(
+        editor.document(tab).unwrap().text(),
+        "alpha extra bravo charlie\nshort tail"
+    );
+    assert_eq!(editor.document(tab).unwrap().selection().caret, 12);
+    apply(&mut editor, tab, Command::Insert("longerword".into()));
+    apply(&mut editor, tab, Command::Type(' '));
+    assert_eq!(
+        editor.document(tab).unwrap().text(),
+        "alpha extra\nlongerword bravo charlie\nshort tail"
+    );
+    apply(&mut editor, tab, Command::Undo);
+    assert_eq!(
+        editor.document(tab).unwrap().text(),
+        "alpha extra longerwordbravo charlie\nshort tail"
+    );
+
+    let text = "alpha bravo charlies\nshort tail";
+    let edit = fill::auto_fill(text, 5..5, ' ', 20).unwrap();
+    assert_eq!(edit.range, 5..5);
+    assert_eq!(edit.insert, " ");
+    assert_eq!(edit.caret, 6);
+
+    let edit = fill::auto_fill(text, 5..5, '\t', 20).unwrap();
+    assert_eq!(edit.range, 5..5);
+    assert_eq!(edit.insert, "\t");
+    assert_eq!(edit.caret, 6);
+
+    let text = "preface\nalpha extrabravo charlie\nshort tail\n";
+    let at = "preface\nalpha extra".len();
+    let edit = fill::auto_fill(text, at..at, ' ', 20).unwrap();
+    let mut actual = text.to_string();
+    actual.replace_range(edit.range, &edit.insert);
+    assert_eq!(actual, "preface\nalpha extra bravo charlie\nshort tail\n");
+    assert_eq!(edit.caret, at + 1);
+
+    let header = "To: alicebob@example.com\nSubject: Re: lunch\n--text follows this line--";
+    let at = "To: alicebob@example".len();
+    let edit = fill::auto_fill(header, at..at, ' ', 20).unwrap();
+    let mut actual = header.to_string();
+    actual.replace_range(edit.range, &edit.insert);
+    assert!(actual.ends_with("\nSubject: Re: lunch\n--text follows this line--"));
+}
+
+#[test]
 fn fill_maps_every_unicode_endpoint_to_a_boundary_and_roundtrips() {
     let source = "\tαα    beta  猫dog\n\tmore words words  \n\n";
     for (point, _) in source
@@ -662,6 +716,18 @@ fn search_failure_does_not_move_and_replace_all_is_nonoverlapping_and_undoable()
 #[test]
 fn logical_key_profiles_conflict_explicitly_and_cancel_prefixes() {
     let mut k = Keymap::default();
+    for profile in [Profile::Windows, Profile::Emacs] {
+        k.set_profile(profile);
+        assert!(matches!(
+            k.translate("M-q").unwrap(),
+            Action::Edit(Command::FillParagraph)
+        ));
+        assert!(matches!(
+            k.translate("C-l").unwrap(),
+            Action::Request("center-caret")
+        ));
+    }
+    k.set_profile(Profile::Windows);
     assert!(matches!(
         k.translate("C-x").unwrap(),
         Action::Request("cut")

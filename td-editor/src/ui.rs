@@ -801,6 +801,27 @@ impl Controller {
             }
             Action::Prefix => Outcome::Prefix,
             Action::Request(name) => match name {
+                "center-caret" => {
+                    if self.geometry.grid().0 == 0 || self.geometry.grid().1 == 0 {
+                        return Err(Error::Unavailable);
+                    }
+                    let state = self.tab_view(tab)?;
+                    let doc = self.editor.document(tab)?;
+                    let position =
+                        state
+                            .viewport
+                            .layout(doc, state.soft_wrap)?
+                            .position(Caret {
+                                byte: doc.selection().caret,
+                                affinity: state.affinity,
+                            })?;
+                    let state = self.tabs.get_mut(&tab).ok_or(Error::MissingTab)?;
+                    state.viewport.center(position.row, state.metrics.rows);
+                    state
+                        .viewport
+                        .reveal(position, state.metrics.rows, state.soft_wrap);
+                    Outcome::Changed
+                }
                 "up" | "down" | "select-up" | "select-down" | "page-up" | "page-down"
                 | "select-page-up" | "select-page-down" => {
                     let page = name.contains("page");

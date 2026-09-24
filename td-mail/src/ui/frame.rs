@@ -907,6 +907,45 @@ mod tests {
         pane.close(None);
     }
 
+    #[test]
+    fn draft_pane_uses_reflow_and_center_shortcuts() {
+        let mut pane = Pane::new().unwrap();
+        pane.place(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 240,
+                height: 64,
+            },
+            Surface::new(240, 64, Default::default()).unwrap(),
+        );
+        let mut draft = None;
+        pane.edit(&mut draft, "shortcuts", || {
+            "alpha bravo\ncharlie delta\n\none\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten"
+                .to_string()
+        });
+        let tab = pane.tab().unwrap();
+        assert_eq!(pane.chord("M-q"), Outcome::Changed);
+        assert!(pane
+            .editor()
+            .document(tab)
+            .unwrap()
+            .text()
+            .starts_with("alpha bravo charlie delta"));
+        assert_eq!(pane.chord("C-Home"), Outcome::Changed);
+        for _ in 0..7 {
+            assert_eq!(pane.chord("Down"), Outcome::Changed);
+        }
+        let before = pane.first_row().unwrap();
+        let selection = pane.editor().document(tab).unwrap().selection();
+        let revision = pane.editor().document(tab).unwrap().revision();
+        assert_eq!(pane.chord("C-l"), Outcome::Changed);
+        assert_eq!(pane.first_row(), Some(5));
+        assert_ne!(before, 5);
+        assert_eq!(pane.editor().document(tab).unwrap().selection(), selection);
+        assert_eq!(pane.editor().document(tab).unwrap().revision(), revision);
+    }
+
     /// A draft is loaded once for its key, editable and auto-filled; the
     /// kill ring carries a selection between documents; and the draft
     /// handle reads the document's state, marks it saved and gives it up.

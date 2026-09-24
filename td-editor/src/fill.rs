@@ -166,7 +166,10 @@ pub fn auto_fill(
     let caret = selection.start - start + 1;
     let row = text::line(&working, caret)?;
     let row_text = get(&working, row.clone())?;
-    if text::column(row_text) <= column || indent(row_text).len() == row_text.len() {
+    let caret_in_row = caret - row.start;
+    if text::column(get(row_text, 0..caret_in_row)?) <= column
+        || indent(row_text).len() == row_text.len()
+    {
         let caret = selection.start + 1;
         return Ok(Edit {
             range: selection,
@@ -175,12 +178,14 @@ pub fn auto_fill(
             caret,
         });
     }
-    // Auto Fill changes break points, not the user's other whitespace.
+    // Wrap only the words reached by typing. Rewrapping the untouched tail
+    // can leave a sequence of single-word rows after an interior insertion.
     let prefix = indent(row_text);
     let mut out = String::new();
     append(&mut out, prefix)?;
     let mut col = text::column(prefix);
     let mut first = true;
+    let mut wrapped = false;
     let mut at = prefix.len();
     let mut last_end = at;
     let mut mapped = caret - row.start;
@@ -195,7 +200,11 @@ pub fn auto_fill(
                     1
                 })
             });
-            if !first && next_col.saturating_add(word.chars().count()) > column {
+            if !first
+                && !wrapped
+                && at <= caret_in_row
+                && next_col.saturating_add(word.chars().count()) > column
+            {
                 let split = at.checked_sub(1).ok_or(Error::InvalidPosition)?;
                 append(&mut out, get(row_text, last_end..split)?)?;
                 append(&mut out, "\n")?;
@@ -204,6 +213,7 @@ pub fn auto_fill(
                     mapped += prefix.len();
                 }
                 col = text::column(prefix);
+                wrapped = true;
             } else {
                 append(&mut out, gap)?;
                 col = next_col;

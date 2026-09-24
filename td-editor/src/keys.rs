@@ -89,6 +89,8 @@ impl Keymap {
             "C-Tab" => Some(Action::NextTab(false)),
             "C-S-Tab" => Some(Action::NextTab(true)),
             "F7" => Some(Action::Request("check-spelling")),
+            "C-l" => Some(Action::Request("center-caret")),
+            "M-q" => Some(Action::Edit(Command::FillParagraph)),
             "Up" => Some(Action::Request("up")),
             "Down" => Some(Action::Request("down")),
             "S-Up" => Some(Action::Request("select-up")),
@@ -138,7 +140,6 @@ impl Keymap {
             (Profile::Emacs, "C-p") => Some(Action::Request("up")),
             (Profile::Emacs, "C-n") => Some(Action::Request("down")),
             (Profile::Emacs, "C-r") => Some(Action::Request("find-backward")),
-            (Profile::Emacs, "M-q") => Some(Action::Edit(Command::FillParagraph)),
             (Profile::Emacs, "M-x") => Some(Action::Request("command-prompt")),
             _ => None,
         };

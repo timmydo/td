@@ -209,6 +209,7 @@ impl Item {
             (Self::Spell, _) => "F7",
             (Self::GoToLine, _) => "F6",
             (Self::SelectAll, Profile::Windows) => "Ctrl+A",
+            (Self::Fill, Profile::Windows) => "Alt+Q",
             (Self::Fill, Profile::Emacs) => "M-q",
             (Self::Find, Profile::Windows) => "Ctrl+F",
             (Self::Replace, Profile::Windows) => "Ctrl+H",

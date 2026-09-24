@@ -139,7 +139,9 @@ bindings above are required for version 1. F7 invokes Check Spelling in
 both profiles; Emacs additionally exposes `M-x ispell-buffer`. The M-x prompt
 accepts the named editor commands, with completion; it is not an interpreter
 or an Emacs Lisp interface. Ctrl+Shift+Tab selects the previous tab in both
-profiles. Common navigation keys and Shift-selection work in both profiles.
+profiles. M-q fills the current paragraph and C-l centers the caret's visual
+row in the viewport in both profiles, including an embedded mail draft pane.
+Common navigation keys and Shift-selection work in both profiles.
 
 Find and Replace use literal, case-sensitive UTF-8 strings, without regular
 expressions. Search reports reaching the end before an explicit next search
@@ -771,17 +773,19 @@ shift by its byte-length delta. Filling is one undo transaction restoring
 the exact original bytes and selection; a no-op creates no history entry.
 
 Auto Fill runs only after a typed ASCII space or Tab, never after paste,
-remote text insertion, file loading, or an automatic replacement. If the
-caret's current line exceeds the fill column, greedily wrap that line using
-the same indentation and word-width rules. Unlike Fill Paragraph, retain
-horizontal whitespace, replacing only the final space/tab before a wrapped
-word with newline plus the original indentation. Extra separators remain as
-trailing whitespace on the preceding line; trailing whitespace may exceed
-the fill column. Retain the trailing typed separator so typing the next word
-remains separated. An interior typed separator remains a separator or becomes
-a line break, never a collapsed no-op. Do not pull text from
-the next logical line. The inserted separator and any resulting wrap form
-one transaction. A limit failure refuses that entire typing transaction.
+remote text insertion, file loading, or an automatic replacement. It waits
+until the caret's column exceeds the fill column, even if untouched text to
+its right makes the logical line longer. It greedily finds the first break
+at or before the caret, and makes at most one wrap per typed separator.
+Unlike Fill Paragraph, retain horizontal whitespace, replacing only the
+final space/tab before a wrapped word with newline plus the original
+indentation. Extra separators remain as trailing whitespace on the preceding
+line; trailing whitespace may exceed the fill column. Retain the trailing
+typed separator so typing the next word remains separated. An interior typed
+separator remains a separator or becomes a line break, never a collapsed
+no-op. Do not pull text from the next logical line. The inserted separator
+and any resulting wrap form one transaction. A limit failure refuses that
+entire typing transaction.
 
 ## On-demand spelling
 
