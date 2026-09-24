@@ -253,13 +253,19 @@ Split at these concrete boundaries before dependent milestones start:
     reservation. No owning snapshot, file/network I/O or publication is added.
     Typed compact cells remain b/c; the whole loader's d increment owns combined
     storage and static field/source-location diagnostic wrapping.
-  - **M04b2c3b:** bounded account/identity/address and domain-policy candidates.
-    Support forward references, list declaration order, null/empty/name
-    distinctions, default materialization, signature-file references and sorted
-    unique IDs. Fit the 8/64/16 KiB descriptor regions. Test unresolved signature
-    references, defaults and missing/duplicate/conflicting targets. Protected
-    input materialization and preimage invocation belong to M04b3, which reserves
-    borrowed views within 80 KiB of the existing control-worker stack.
+  - **M04b2c3b1:** implemented typed account/identity/address candidates in
+    `config/identities.rs`: compact cells, shared arena ownership checks,
+    forward references, ordered lists, null/empty distinctions, raw visible
+    strings, signature-file references and sorted unique IDs. Fits the 8/64 KiB
+    identity/address reservations, including room for two future signature spans.
+    Live borrowed text views allow protected loading to inspect paths and then
+    append without freezing early. Stanza dispatch/EOF remain d; protected
+    signature materialization and preimage invocation remain M04b3, using its
+    80 KiB borrowed-view reservation within the control-worker stack.
+  - **M04b2c3b2:** domain-policy candidates in the existing 16 KiB partition.
+    Bind routing domains, MX defaults and MTA-STS mode/age/certificate fields;
+    retain explicit-versus-default MX provenance for c's listener checks.
+    Test case-folded names, policy field bounds and off/enabled constraints.
   - **M04b2c3c:** bounded resolver/relay/certificate/gateway/listener candidates
     and their reference graph. Enforce role-specific fields, origin/port/certificate
     required-name derivation, gateway pins/prefixes, no public plaintext fixture,

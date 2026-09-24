@@ -503,7 +503,7 @@ any read/UTF-8/permission/capacity error without returning an authority. It
 then builds the temporary borrowed views and invokes the existing encoder. M07
 validates provider material. Only successful completion seals the immutable
 publishable snapshot for M19; there is no mutation of a sealed active
-snapshot. M04b2c3b tests unresolved signature references/defaults; M04b3 uses
+snapshot. M04b2c3b1 tests unresolved signature references/defaults; M04b3 uses
 bounded injected protected-input fixtures to test materialization and
 encoding.
 

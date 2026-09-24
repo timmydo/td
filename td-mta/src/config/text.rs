@@ -38,11 +38,15 @@ impl fmt::Display for Code {
 }
 impl std::error::Error for Code {}
 #[derive(Clone, Copy, Eq, PartialEq)]
-struct Span {
+pub(super) struct Span {
     offset: u32,
     length: u32,
 }
 impl Span {
+    pub(super) const EMPTY: Self = Self {
+        offset: 0,
+        length: 0,
+    };
     fn read(self, bytes: &[u8]) -> Result<&[u8], Code> {
         let start = usize::try_from(self.offset).map_err(|_| Code::Reference)?;
         let count = usize::try_from(self.length).map_err(|_| Code::Reference)?;
@@ -82,6 +86,14 @@ impl fmt::Debug for Builder<'_> {
     }
 }
 impl<'a> Builder<'a> {
+    pub(super) fn owner(&self) -> NonZeroU64 {
+        self.owner
+    }
+    // Strip the ticket only after checking this builder owns the handle.
+    pub(super) fn compact(&self, handle: Handle) -> Result<Span, Code> {
+        self.read(handle)?;
+        Ok(handle.span)
+    }
     /// One bounded ownership-ticket attempt; contention leaves storage untouched.
     /// The control worker may retry in a later bounded operation.
     pub fn new(storage: &'a mut [u8]) -> Result<Self, Code> {
@@ -141,6 +153,12 @@ impl<'a> Builder<'a> {
     pub fn text(&self, handle: Handle) -> Result<&str, Code> {
         std::str::from_utf8(self.read(handle)?).map_err(|_| Code::Utf8)
     }
+    pub(super) fn borrowed_view(&self) -> Result<View<'_>, Code> {
+        Ok(View {
+            bytes: self.storage.get(..self.used).ok_or(Code::Reference)?,
+            owner: self.owner,
+        })
+    }
     /// Freeze only the initialized prefix; no reset, scrubbing or publication.
     pub fn freeze(self) -> Result<View<'a>, Code> {
         Ok(View {
@@ -160,6 +178,15 @@ impl fmt::Debug for View<'_> {
     }
 }
 impl<'a> View<'a> {
+    pub(super) fn owner(self) -> NonZeroU64 {
+        self.owner
+    }
+    pub(super) fn read_span(self, owner: NonZeroU64, span: Span) -> Result<&'a [u8], Code> {
+        if self.owner != owner {
+            return Err(Code::Reference);
+        }
+        span.read(self.bytes)
+    }
     pub fn used(self) -> usize {
         self.bytes.len()
     }
@@ -395,5 +422,42 @@ mod tests {
             assert_eq!(code.to_string(), name);
             assert!(std::error::Error::source(&code).is_none());
         }
+    }
+    #[test]
+    fn compact_conversion_and_span_reads_check_owner_and_written_prefix() {
+        let _lock = TEST_CONSTRUCTION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut bytes = [0; 8];
+        let stale = {
+            let mut b = Builder::new(&mut bytes).unwrap();
+            b.append(b"old").unwrap()
+        };
+        let mut b = Builder::new(&mut bytes).unwrap();
+        let current = b.append(b"new").unwrap();
+        assert_eq!(b.compact(stale).err(), Some(Code::Reference));
+        let mut other_bytes = [0; 8];
+        let mut other = Builder::new(&mut other_bytes).unwrap();
+        let foreign = other.append(b"new").unwrap();
+        assert_eq!(b.compact(foreign).err(), Some(Code::Reference));
+        let outside = Handle {
+            owner: b.owner,
+            span: Span {
+                offset: 3,
+                length: 1,
+            },
+        };
+        assert_eq!(b.compact(outside).err(), Some(Code::Reference));
+        let span = b.compact(current).unwrap();
+        let owner = b.owner;
+        let borrowed = b.borrowed_view().unwrap();
+        assert_eq!(borrowed.read_span(owner, span), Ok(&b"new"[..]));
+        assert_eq!(borrowed.read_span(other.owner, span), Err(Code::Reference));
+        assert_eq!(
+            borrowed.read_span(owner, outside.span),
+            Err(Code::Reference)
+        );
+        b.append(b"more").unwrap();
+        assert_eq!(b.freeze().unwrap().used(), 7);
     }
 }

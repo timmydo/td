@@ -580,10 +580,11 @@ of persisted/configured descriptor cells. The remaining typed snapshot
 builders must keep eight-byte spans private under their enclosing arena
 owner; they must not charge 16-byte handles as eight-byte fields or serialize
 the process-local ticket. Typed cell construction and whole-snapshot ownership
-remain M04b2c3b/c/d. Those increments must extend `text.rs` with
-config-private span conversion and reads: bind each typed table to its arena
-owner, verify that owner before converting handles or reading compact spans,
-and keep raw span fields unavailable to external callers.
+are implemented for account/identity/address tables by M04b2c3b1 below.
+`text.rs` now has config-private span conversion and reads. Each typed table
+must bind to its arena owner and verify that owner before converting handles
+or reading compact spans. Raw span fields remain unavailable to external
+callers; combined snapshot ownership remains M04b2c3d.
 
 A constructor makes one atomic attempt to claim a never-reused ownership
 number; it returns `config_text_contended` if another constructor races it.
@@ -609,3 +610,83 @@ field/role and source-location wrapping remain the complete loader's responsibil
 Explicit read accessors reveal bytes to trusted callers; neither dropping nor
 freezing scrubs storage. Protected secret loading and erasure belong to the
 owning candidate/runtime work, not this borrowed helper.
+
+
+## Structural sending-identity records
+
+M04b2c3b1 implements `config::identities` for complete typed account,
+identity and address inputs. The whole-loader dispatcher still owns
+section names, field types, duplicate fields, required fields and actual
+reader EOF. These records grant no SMTP/JMAP sending permission and do
+not materialize signatures or produce the identity preimage.
+
+The caller provides 1..64 opaque identity cells of at most 128 bytes,
+0..2048 opaque address cells of at most 32 bytes, and the shared
+non-routing text builder. Compile-time checks pin the layouts and
+address-index sentinel. Identity layout reserves two additional
+eight-byte signature spans inside the existing 128-byte ceiling for
+M04b3. Construction checks caller capacities against the existing 8/64
+KiB metadata reservations. There is no second text arena or address
+vector. The enclosing table binds to the text builder's process-local
+owner; every mutation verifies that owner. Only config-private checked
+conversion strips a handle into an eight-byte span. Completed records
+likewise require a matching arena. `view_live` borrows a live text
+builder immutably, allowing path inspection before protected loading;
+when those borrowed values are no longer used, appends can continue.
+`view` accepts a frozen text view. Each compact read rechecks the table
+owner inside `text.rs`; spans and their fields remain unavailable to
+public callers.
+
+Account input validates the case-sensitive visible ASCII username
+excluding colon, its 254-byte ceiling, and the 4096-byte display-name
+ceiling. Require exactly one account. Identity inputs carry explicit
+defaults for name/list selectors and optional absolute signature paths.
+Mailboxes use the shared syntax and size limits while preserving their
+configured visible spelling. Only sending identities reject a decoded
+local part exactly `*`; reply-to/BCC entries use ordinary mailbox
+syntax. A signature path is retained verbatim: existence, ownership,
+permissions, content and materialization belong to M04b3/M05. An absent
+path stays distinguishable from a pending file reference.
+
+Address rows can precede their identity. The builder interns at most 64
+identity IDs, including undeclared forward targets, and maintains two
+bounded linked lists per identity. Each list has at most 16 rows.
+Address cells retain name/email spans, a next index, name presence and
+source coordinates. Null names and empty names remain distinct;
+duplicate visible addresses remain separate ordered rows. Identity
+sorting moves list heads with the identity; address indices and list
+order do not change. A true selector with no rows produces an empty
+iterator; a false selector produces null and rejects rows.
+
+Finalization requires a declared account, at least one identity, no
+undeclared forward targets, matching account references and consistent
+list selectors. It sorts identities by raw ID and returns structural
+records retaining a private exclusive borrow of identity cells. Public
+views borrow those records read-only. M04b3 consumes the records and
+fills the two reserved signature spans after protected reads; it must
+not mutate a published snapshot or an outstanding read view. Duplicate
+account/identity declarations format both current and prior source
+locations. Capacity errors caused while undeclared forward targets
+occupy slots also identify an earlier unresolved reference. Fixed error
+codes use the `config_identity_` prefix and reveal no supplied text. The
+typed builder attaches stanza coordinates; the whole dispatcher must
+supply field-specific validation and error context where available. This
+is not EOF or protected-file validation.
+
+The first mutation failure is sticky; later mutations and finalization
+return it. A multi-field operation may have appended an earlier field
+before text capacity runs out. Those bytes remain charged, but no
+successful records can be returned from that failed builder.
+Whole-loader failure must discard its entire candidate. An individual
+text append retains its own atomic failure contract.
+Builders/views/input wrappers redact Debug output and do not scrub
+backing bytes; explicit account/identity/address accessors reveal values
+to trusted callers.
+
+Views provide checked index access and bounded, fallible, fused address
+iterators. They do not promise an exact item count on an internal error.
+Only the used cell prefixes are live. M04b3 must build the existing
+encoder's borrowed arrays in its reserved stack workspace after
+protected signature loading; this increment adds no duplicate array or
+preimage buffer. Domain policy records remain M04b2c3b2; combined
+ownership and publication remain M04b2c3d/M19.
