@@ -1581,7 +1581,8 @@ their existing partition limits; the small resolved owner fits global/plan
 headroom. Individual signature/password limits do not guarantee aggregate
 fit in the 192 KiB text arena. Identity preimage encoding has its own
 192 KiB ceiling. Existing structural stack qualification does not cover this
-new compiled finalizer: M04b3b2b2/M05/M07 must qualify the complete production
+compiled finalizer. The combined fixture below covers its test instances;
+M04b3b2b2b/M05/M07 must qualify the complete production
 reader/finalizer/provider path before service use. Protected-input
 integration, effective output and runtime publication remain pending;
 M04b3b2b1's identity assembly is specified below.
@@ -1619,5 +1620,46 @@ The writer is for private configuration work until M05/M07 complete; it
 confers no file trust, authentication, digest or publication authority.
 The local td-crypto streaming Digest can consume the writer later without
 retaining a second 192 KiB buffer. Actual combined reader/materializer/view
-stack qualification is still required before production integration; this
-object-layout guard does not measure compiler frames or total stack use.
+stack qualification for the test instances is described below; installed
+service integration must be qualified separately. This object-layout guard
+does not measure compiler frames or total stack use.
+
+
+## Combined configuration stack qualification
+
+M04b3b2b2a extends the existing portable integration executable with a
+separate `portable_materialized_stack` case. It runs structural loading,
+text materialization and visible-identity preimage writing on one worker,
+reusing snapshot storage and caller scratch between fixtures. The original
+structural-only case retains its independent 176 KiB ceiling.
+
+The new worker requests 240 KiB. The same bounded `/proc/self/smaps` reader
+requires its entire private writable stack mapping to fit 256 KiB, with
+an adjacent lower no-access guard of at least 4 KiB and no grow-down flag.
+The portable runner requires exactly one positive measurement under
+`config_materialized_stack_mapping_bytes` and a successful one-test summary.
+The actual mapping is relayed to the build log. This is a checked ceiling,
+not a stack high-water measurement or an additional ledger reservation.
+
+The combined worker also runs the complete structural-loader scenario set.
+Materialization fixtures exercise fragmented structural and text readers,
+maximum pending fields and routing tables, all 64 identities and 2048 address
+entries, gateway/ACME/relay-CA inventory, both maximum-size signatures, text-arena overflow,
+and the independent preimage ceiling. They also exercise sink refusal,
+late password-reader failure, decoder-scratch clearing and returned-storage
+reuse. The ordinary host test executes the same fixtures to catch drift;
+its harness stack is not target evidence.
+
+This is manual point-in-time qualification of these generic reader, opener
+and sink instances in the integration test's pinned release-musl compilation.
+Fixture construction and mapping inspection allocate; no hot-path heap,
+provider-allocation or process-RSS bound is established. Protected-file
+opening, provider adapters and installed runtime callers must requalify
+their complete compiled paths within the existing worker reservation before
+service use. This test does not confer configuration publication authority.
+
+Rerun the portable command manually after compiler, profile, target or
+compiled-path changes, including the loader, inventory, material decoder,
+materializer, preimage assembly and identity encoder. `ready` does not enforce
+this evidence freshness. Each new compiled reader/opener/sink instance needs
+its own qualification; a prior artifact does not qualify later code.

@@ -235,7 +235,7 @@ name = "{name}"
             .into_storage();
     }
 }
-fn largest_pending_source() {
+fn pending_source() -> String {
     let domain = format!("{}.{}.{}", "a".repeat(63), "b".repeat(63), "c".repeat(61));
     let local = "x".repeat(64);
     let path = format!("/{}", "x".repeat(4094));
@@ -258,6 +258,10 @@ logs = "{logs}"
             "x".repeat(4096)
         ),
     );
+    source
+}
+fn largest_pending_source() {
+    let source = pending_source();
     let mut storage = Storage::try_new().unwrap();
     let mut pending = Pending::new();
     let mut scratch = vec![0; stream::SCRATCH_BYTES];
@@ -270,7 +274,7 @@ logs = "{logs}"
         storage = loaded.into_storage();
     }
 }
-fn full_routing_source() {
+fn routing_source() -> String {
     let mut source = SOURCE.to_owned();
     assert!(routing::MAX_ALIASES.is_power_of_two());
     for n in (1..routing::MAX_ALIASES).map(|n| n * 2053 % routing::MAX_ALIASES) {
@@ -281,6 +285,10 @@ fn full_routing_source() {
     for n in (1..routing::MAX_DOMAINS).rev() {
         source.push_str(&format!("[domain \"d{n:03}.test\"]\n"));
     }
+    source
+}
+fn full_routing_source() {
+    let source = routing_source();
     let mut storage = Storage::try_new().unwrap();
     let mut pending = Pending::new();
     let mut scratch = vec![0; stream::SCRATCH_BYTES];
@@ -302,7 +310,7 @@ fn full_routing_source() {
     storage = loaded.into_storage();
     assert!(read(storage, &mut pending, &mut scratch, &mut SOURCE.as_bytes()).is_ok());
 }
-fn profile_variants() {
+fn profile_sources() -> [String; 3] {
     let gateway = SOURCE
         .replace(
             "kind = \"direct_smtp\"",
@@ -358,10 +366,13 @@ kind = "reply_to"
 name = "Reply"
 email = "main@example.test"
 "#;
+    [gateway, acme, loopback]
+}
+fn profile_variants() {
     let mut storage = Storage::try_new().unwrap();
     let mut pending = Pending::new();
     let mut scratch = vec![0; stream::SCRATCH_BYTES];
-    for source in [gateway, acme, loopback] {
+    for source in profile_sources() {
         let loaded = read(
             storage,
             &mut pending,
@@ -374,7 +385,7 @@ email = "main@example.test"
     }
 }
 
-fn bounded_stack_mapping() -> usize {
+fn bounded_stack_mapping(label: &str, ceiling: usize) -> usize {
     use std::io::Read;
     let marker = 0u8;
     let address = std::hint::black_box(&marker) as *const u8 as usize;
@@ -385,12 +396,12 @@ fn bounded_stack_mapping() -> usize {
         .read_to_string(&mut text)
         .unwrap();
     assert!(text.len() <= 1024 * 1024);
-    let size = stack_mapping(&text, address).unwrap();
-    println!("config_stack_mapping_bytes={size}");
+    let size = stack_mapping(&text, address, ceiling).unwrap();
+    println!("{label}={size}");
     size
 }
 
-fn stack_mapping(text: &str, address: usize) -> Option<usize> {
+fn stack_mapping(text: &str, address: usize, ceiling: usize) -> Option<usize> {
     let mut previous: Option<(usize, usize, &str)> = None;
     let mut selected = None;
     for line in text.lines() {
@@ -416,7 +427,7 @@ fn stack_mapping(text: &str, address: usize) -> Option<usize> {
                 || guard_perms != "---p"
                 || guard_high != low
                 || guard_high.checked_sub(guard_low)? < 4096
-                || size > 176 * 1024
+                || size > ceiling
             {
                 return None;
             }
@@ -434,7 +445,7 @@ VmFlags: mr mw me
 2000-4000 rw-p 00000000 00:00 0
 VmFlags: rd wr mr mw me
 "#;
-    assert_eq!(stack_mapping(text, 0x3000), Some(8192));
+    assert_eq!(stack_mapping(text, 0x3000, 176 * 1024), Some(8192));
     for bad in [
         text.replace("2000-4000", "2000-30000"),
         text.replace("VmFlags: rd wr", "VmFlags: gd rd wr"),
@@ -443,9 +454,9 @@ VmFlags: rd wr mr mw me
         text.replace("1000-2000", "0000-1000"),
         text.replace("VmFlags: rd wr mr mw me\n", ""),
     ] {
-        assert_eq!(stack_mapping(&bad, 0x3000), None);
+        assert_eq!(stack_mapping(&bad, 0x3000, 176 * 1024), None);
     }
-    assert_eq!(stack_mapping(text, 0x5000), None);
+    assert_eq!(stack_mapping(text, 0x5000, 176 * 1024), None);
 }
 
 #[test]
@@ -463,7 +474,7 @@ fn portable_loader_stack() -> Result<(), Box<dyn std::error::Error>> {
         .name("config-stack".into())
         .stack_size(160 * 1024)
         .spawn(|| {
-            assert!(bounded_stack_mapping() <= 176 * 1024);
+            bounded_stack_mapping("config_stack_mapping_bytes", 176 * 1024);
             loader_scenarios();
         })?
         .join()
@@ -486,4 +497,264 @@ fn loader_scenarios() {
 fn host_loader_scenarios() {
     // Checks fixture drift; the host harness stack is not target evidence.
     loader_scenarios();
+}
+fn materialized_source(addresses: bool, name_bytes: usize) -> String {
+    let name = "x".repeat(name_bytes);
+    let lists = if addresses {
+        "reply_to = true\nbcc = true\n"
+    } else {
+        ""
+    };
+    let mut source = SOURCE
+        .replace(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "00000000000000000000000000000001",
+        )
+        .replace(
+            "[resolver \"primary\"]",
+            &format!("name = \"{name}\"\n{lists}[resolver \"primary\"]"),
+        );
+    for n in (2..=64).rev() {
+        source.push_str(&format!(
+            r#"[identity "{n:032x}"]
+account = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+name = "{name}"
+email = "main@example.test"
+{lists}"#
+        ));
+    }
+    if addresses {
+        for n in 1..=64 {
+            for kind in ["reply_to", "bcc"] {
+                for index in (0..16).rev() {
+                    source.push_str(&format!(
+                        r#"[identity_address "{n:032x}"]
+kind = "{kind}"
+email = "{kind}{n:02}-{index:02}@example.test"
+"#
+                    ));
+                    if (index % 2 == 0) == (kind == "reply_to") {
+                        source.push_str("name = \"\"\n");
+                    }
+                }
+            }
+        }
+    }
+    source
+}
+
+fn materialized_scenarios() {
+    use td_mta::config::{inputs, material, materialize, preimage};
+    let mut storage = Storage::try_new().unwrap();
+    let allocated = storage.allocated_bytes().unwrap();
+    let mut pending = Pending::new();
+    let mut scratch = vec![0; stream::SCRATCH_BYTES];
+    // Source generation and allocations are fixture setup, not heap evidence.
+    for (source, overflow) in [
+        (SOURCE.to_owned(), false),
+        (materialized_source(true, 0), false),
+        (materialized_source(false, 3020), true),
+        (pending_source(), false),
+        (routing_source(), false),
+    ]
+    .into_iter()
+    .chain(profile_sources().map(|source| {
+        (
+            source.replace(
+                "password_file = \"/private-password\"",
+                "password_file = \"/private-password\"\nca_file = \"/relay-ca\"",
+            ),
+            false,
+        )
+    })) {
+        let loaded = read(
+            storage,
+            &mut pending,
+            &mut scratch,
+            &mut reader(source.as_bytes(), 31),
+        )
+        .unwrap();
+        let resolved = materialize::read_text(loaded, &mut scratch, |reference| {
+            let bytes: &[u8] = match reference.target() {
+                inputs::Target::RelayPassword => b"password\r\n",
+                inputs::Target::TextSignature(_) | inputs::Target::HtmlSignature(_) => {
+                    b"signature\n"
+                }
+                _ => panic!("provider input opened by content stage"),
+            };
+            Ok::<_, ()>(reader(bytes, 1))
+        })
+        .unwrap();
+        assert_eq!(resolved.relay_password().unwrap(), "password");
+        let mut emitted = 0usize;
+        let result = preimage::write(&resolved, |bytes| {
+            emitted = emitted.checked_add(bytes.len()).unwrap();
+            Ok::<_, ()>(())
+        });
+        if overflow {
+            assert_eq!(emitted, 0);
+            assert!(matches!(
+                result,
+                Err(preimage::Error::Invalid(
+                    td_mta::config::identity::Error::PreimageLimit
+                ))
+            ));
+        } else {
+            assert_eq!(result.unwrap(), emitted);
+            assert!(emitted > 0);
+        }
+        let mut calls = 0;
+        let error = preimage::write(&resolved, |_| {
+            calls += 1;
+            Err::<(), _>("fixture sink refusal")
+        })
+        .unwrap_err();
+        if overflow {
+            assert_eq!(calls, 0);
+            assert!(matches!(
+                error,
+                preimage::Error::Invalid(td_mta::config::identity::Error::PreimageLimit)
+            ));
+        } else {
+            assert_eq!(calls, 1);
+            assert!(matches!(error, preimage::Error::Sink(_)));
+        }
+        assert!(scratch[..material::SIGNATURE_SCRATCH_BYTES]
+            .iter()
+            .all(|&byte| byte == 0));
+        storage = resolved.into_storage();
+        assert_eq!(storage.allocated_bytes().unwrap(), allocated);
+    }
+    let source = SOURCE.replace(
+        "[resolver \"primary\"]",
+        "text_signature_file = \"/text\"\nhtml_signature_file = \"/html\"\n[resolver \"primary\"]",
+    );
+    let signature = vec![b'x'; material::MAX_SIGNATURE_BYTES];
+    // The exact Reader/opener instantiation handles both success and late I/O failure.
+    for fail in [false, true] {
+        let loaded = read(
+            storage,
+            &mut pending,
+            &mut scratch,
+            &mut reader(source.as_bytes(), 17),
+        )
+        .unwrap();
+        let result = materialize::read_text(loaded, &mut scratch, |reference| {
+            let bytes = if reference.target() == inputs::Target::RelayPassword {
+                b"password".as_slice()
+            } else {
+                signature.as_slice()
+            };
+            let mut value = reader(bytes, 37);
+            if fail && reference.target() == inputs::Target::RelayPassword {
+                value.terminal = Some(io::ErrorKind::Other);
+            }
+            Ok::<_, ()>(value)
+        });
+        storage = match result {
+            Ok(resolved) => {
+                assert!(!fail);
+                assert_eq!(
+                    resolved.signatures(0).unwrap().unwrap().text.len(),
+                    material::MAX_SIGNATURE_BYTES
+                );
+                assert!(
+                    preimage::write(&resolved, |_| Ok::<_, ()>(())).unwrap()
+                        > 2 * material::MAX_SIGNATURE_BYTES
+                );
+                resolved.into_storage()
+            }
+            Err(failed) => {
+                assert!(fail);
+                assert_eq!(failed.target(), Some(inputs::Target::RelayPassword));
+                assert!(matches!(
+                    failed.error(),
+                    materialize::Error::Content(material::Error::Read(io::ErrorKind::Other))
+                ));
+                failed.into_parts().0
+            }
+        };
+        assert_eq!(storage.allocated_bytes().unwrap(), allocated);
+        assert!(scratch[..material::SIGNATURE_SCRATCH_BYTES]
+            .iter()
+            .all(|&byte| byte == 0));
+    }
+    let source = materialized_source(false, 0).replace(
+        "email = \"main@example.test\"\n",
+        "email = \"main@example.test\"\ntext_signature_file = \"/text\"\nhtml_signature_file = \"/html\"\n",
+    );
+    let loaded = read(
+        storage,
+        &mut pending,
+        &mut scratch,
+        &mut reader(source.as_bytes(), 31),
+    )
+    .unwrap();
+    let mut opened = 0;
+    let failed = materialize::read_text(loaded, &mut scratch, |reference| {
+        assert!(matches!(
+            reference.target(),
+            inputs::Target::TextSignature(_) | inputs::Target::HtmlSignature(_)
+        ));
+        opened += 1;
+        Ok::<_, ()>(reader(signature.as_slice(), 37))
+    })
+    .unwrap_err();
+    assert_eq!(opened, 12);
+    assert_eq!(
+        failed.target(),
+        Some(inputs::Target::HtmlSignature(
+            td_mta::ids::IdentityId::from_bytes(6u128.to_be_bytes())
+        ))
+    );
+    assert!(matches!(
+        failed.error(),
+        materialize::Error::Arena(td_mta::config::text::Code::Capacity)
+    ));
+    storage = failed.into_parts().0;
+    assert_eq!(storage.allocated_bytes().unwrap(), allocated);
+    assert!(scratch[..material::SIGNATURE_SCRATCH_BYTES]
+        .iter()
+        .all(|&byte| byte == 0));
+    assert!(read(storage, &mut pending, &mut scratch, &mut SOURCE.as_bytes()).is_ok());
+}
+
+#[test]
+fn host_materialized_scenarios() {
+    materialized_scenarios();
+}
+
+#[test]
+#[ignore = "run by the isolated pinned-musl qualification"]
+fn portable_materialized_stack() -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "musl"
+    )) || cfg!(debug_assertions)
+    {
+        return Err("requires the pinned release x86-64 musl artifact".into());
+    }
+    std::thread::Builder::new()
+        .name("config-materialized-stack".into())
+        .stack_size(240 * 1024)
+        .spawn(|| {
+            bounded_stack_mapping("config_materialized_stack_mapping_bytes", 256 * 1024);
+            loader_scenarios();
+            materialized_scenarios();
+        })?
+        .join()
+        .map_err(|_| "materialized configuration stack worker failed")?;
+    Ok(())
+}
+
+#[test]
+fn materialized_mapping_has_its_own_ceiling() {
+    let text = "1000-2000 ---p 00000000 00:00 0\nVmFlags: mr mw me\n2000-42000 rw-p 00000000 00:00 0\nVmFlags: rd wr mr mw me\n";
+    assert_eq!(stack_mapping(text, 0x3000, 256 * 1024), Some(256 * 1024));
+    assert_eq!(stack_mapping(text, 0x3000, 176 * 1024), None);
+    assert_eq!(
+        stack_mapping(&text.replace("42000", "42001"), 0x3000, 256 * 1024),
+        None
+    );
 }

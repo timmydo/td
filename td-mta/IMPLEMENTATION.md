@@ -474,9 +474,13 @@ Split at these concrete boundaries before dependent milestones start:
     streaming preimage encoding from resolved text, preserving list/name
     presence and declaration order within the 80 KiB view reservation.
     Validate the separate preimage ceiling before output; redact sink errors.
-  - **M04b3b2b2:** remaining combined stack qualification, M05 adapter
-    integration, provider validation and streamed redacted effective output.
-    Qualify each new compiled path and combined memory before service use.
+  - **M04b3b2b2a:** qualified the test-compiled structural/text/preimage path
+    within a guarded 256 KiB portable worker mapping, including full tables,
+    maximum signatures, independent limits, late errors and storage reuse.
+    CONFIG.md scopes the evidence; this is not heap/RSS qualification.
+  - **M04b3b2b2b:** remaining M05 adapter integration, M07 provider validation
+    and streamed redacted effective output. Requalify actual production
+    reader/finalizer/provider instances and combined memory before service use.
 - **M04c1:** checked u64 disk/work settings and capacity-derived maintenance
   validation in `admission.rs`; configuration uses this committed plan.
 - **M04c2:** charged work meters in `admission/work.rs` and checked

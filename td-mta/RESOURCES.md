@@ -357,8 +357,15 @@ fixtures, manual requalification obligation and limits. A production
 compile-time guard checks borrowed-view and list-range layouts on every target.
 The structural fixture does not call the implemented preimage assembly or
 create its finalization arrays. It does not qualify future protected-file,
-provider or runtime frames, or claim measured service RSS. No ledger entry
-or worker count changes.
+provider or runtime frames, or claim measured service RSS.
+
+M04b3b2b2a separately qualifies test-compiled structural loading, text-input
+materialization and preimage assembly on a non-growing guarded mapping of
+at most 256 KiB. This includes the temporary view arrays; it adds no stack
+reservation. CONFIG.md lists maximum-table/text and failure/reuse fixtures.
+Future M05/M07 adapters and installed service callers require their own
+qualification. Neither fixture measures hot-path allocation or service RSS.
+No ledger entry or worker count changes.
 
 M04c1's `admission.rs` validates the separate u64 disk/work plan and capacity
 relationships in ADMISSION.md. It consumes an already validated ResourcePlan

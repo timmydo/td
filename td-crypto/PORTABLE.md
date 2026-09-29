@@ -260,14 +260,17 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   dependency. It exercises native code that the current packaging entry point
   does not yet retain through a service caller.
 - `td-mta-config-smoke`: integration test linked to the production td-mta
-  library for the bounded structural-loader stack check in td-mta/CONFIG.md.
-  Generic loader functions compile in the test crate; this does not qualify
-  a future installed service caller, even with the same reader type.
-  It is not a service dependency. The same release Cargo graph builds it
-  with `--test config_stack --no-run`; selection requires a test target and
-  test profile. The runtime explicitly selects its ignored qualification
-  case and still requires exactly one passed test. Its observed mapping size
-  is relayed to the build log, not retained in `BUILD-INPUTS`.
+  library for the bounded configuration stack checks in td-mta/CONFIG.md.
+  Generic loader/materializer/writer functions compile in the test crate;
+  this does not qualify a future installed service caller, even with the
+  same reader type. It is not a service dependency. The same release Cargo
+  graph builds it with `--test config_stack --no-run`; selection requires
+  a test target and test profile. Runtime selects each ignored case by its
+  exact name and requires one passed test plus one positive bounded mapping
+  measurement. `portable_loader_stack` retains its 176 KiB ceiling and
+  `config_stack_mapping_bytes` label; `portable_materialized_stack` checks
+  256 KiB and emits `config_materialized_stack_mapping_bytes`. Measurements
+  are relayed to the build log, not retained in `BUILD-INPUTS`.
 - `BUILD-INPUTS`: staged source, vendor, reconstructed Rust kit, headers and
   helper NAR hashes, native recipe identities/NARs, target and actual inner
   Cargo argument/environment records.

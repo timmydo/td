@@ -555,14 +555,14 @@ fn enter(
     Ok(())
 }
 
-fn stack_evidence(output: &str) -> Result<usize> {
-    let mut values = output.lines().filter_map(|line| line.strip_prefix("config_stack_mapping_bytes="));
+fn stack_evidence(output: &str, prefix: &str, ceiling: usize) -> Result<usize> {
+    let mut values = output.lines().filter_map(|line| line.strip_prefix(prefix));
     let value = values.next().ok_or("portable stack measurement is missing")?;
     if values.next().is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return Err("portable stack measurement is ambiguous or malformed".into());
     }
     let bytes = value.parse::<usize>().map_err(|_| "portable stack measurement overflows")?;
-    if bytes == 0 || bytes > 176 * 1024 {
+    if bytes == 0 || bytes > ceiling {
         return Err("portable stack measurement exceeds its ceiling".into());
     }
     Ok(bytes)
@@ -589,6 +589,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "tls_smoke::rejects_bad_certificate_signature", false),
         ("td-crypto-smoke", "tls_smoke::rejects_tampered_ciphertext", false),
         ("td-mta-config-smoke", "portable_loader_stack", true),
+        ("td-mta-config-smoke", "portable_materialized_stack", true),
     ]
     .iter()
     .enumerate()
@@ -616,11 +617,16 @@ pub(crate) fn runtime_inner() -> Result<()> {
             return Err(format!("portable smoke case did not execute: {case}"));
         }
         if *ignored {
-            let bytes = stack_evidence(&output)?;
-            println!("portable runtime: config_stack_mapping_bytes={bytes}");
+            let (prefix, ceiling) = match *case {
+                "portable_loader_stack" => ("config_stack_mapping_bytes=", 176 * 1024),
+                "portable_materialized_stack" => ("config_materialized_stack_mapping_bytes=", 256 * 1024),
+                _ => return Err("unknown portable stack qualification case".into()),
+            };
+            let bytes = stack_evidence(&output, prefix, ceiling)?;
+            println!("portable runtime: {prefix}{bytes}");
         }
     }
-    println!("portable runtime: version, native SHA-256, explicit provider, eight TLS cases and bounded configuration stack passed without toolchain mounts");
+    println!("portable runtime: version, native SHA-256, explicit provider, eight TLS cases and both bounded configuration stacks passed without toolchain mounts");
     Ok(())
 }
 
@@ -771,12 +777,22 @@ mod tests {
 
     #[test]
     fn stack_measurement_requires_one_bounded_decimal_observation() {
-        assert_eq!(stack_evidence("noise\nconfig_stack_mapping_bytes=167936\n").unwrap(), 167936);
-        for bad in ["", "config_stack_mapping_bytes=", "config_stack_mapping_bytes=0",
-            "config_stack_mapping_bytes=180225", "config_stack_mapping_bytes=+1",
-            "config_stack_mapping_bytes=9999999999999999999999999999",
-            "config_stack_mapping_bytes=1\nconfig_stack_mapping_bytes=1"] {
-            assert!(stack_evidence(bad).is_err(), "{bad}");
+        for (prefix, ceiling, size) in [
+            ("config_stack_mapping_bytes=", 176 * 1024, 167936),
+            ("config_materialized_stack_mapping_bytes=", 256 * 1024, 249856),
+        ] {
+            assert_eq!(stack_evidence(&format!("noise\n{prefix}{size}\n"), prefix, ceiling).unwrap(), size);
+            assert_eq!(stack_evidence(&format!("{prefix}{ceiling}"), prefix, ceiling).unwrap(), ceiling);
+            let other = if prefix == "config_stack_mapping_bytes=" {
+                "config_materialized_stack_mapping_bytes="
+            } else { "config_stack_mapping_bytes=" };
+            assert!(stack_evidence(&format!("{other}1000"), prefix, ceiling).is_err());
+            for bad in [String::new(), prefix.to_owned(), format!("{prefix}0"),
+                format!("{prefix}{}", ceiling + 1), format!("{prefix}+1"),
+                format!("{prefix}9999999999999999999999999999"),
+                format!("{prefix}1\n{prefix}1"), "unrelated_mapping=1".into()] {
+                assert!(stack_evidence(&bad, prefix, ceiling).is_err(), "{bad}");
+            }
         }
     }
 
