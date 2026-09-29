@@ -58,9 +58,11 @@ and `td-setup-test` realized-output check. The recipe stages its own tree
 with `td-install`, `td-ui` and the compositor sources that the toolkit
 mounts, then builds with the target Rust toolchain. The check runs
 `--help`, `--font-license` and a headless render of every page type at the
-reference size, including all destination and review detail pages and every
-progress outcome, without emitting image bytes. Its data is synthetic and
-grants no authority.
+reference 800x600 size and the compositor's 752x508 tile, including all
+destination and review detail pages and every progress outcome, without
+emitting image bytes. The connected and pure views share a 752x480 minimum
+extent, while welcome keeps its own content-dependent layout. The render
+data is synthetic and grants no authority.
 This establishes an image-eligible executable whose window presents welcome
 and, on Enter, an explicit service-unavailable destination page. Escape
 returns to welcome. The destination page has no selectable disk and cannot
@@ -83,8 +85,8 @@ authenticate the source, establish eligibility and retain the disk claim.
 The page uses the pure `td-install` library's plan module. Its target recipe
 stages that sibling source tree and its confinement test pins the library's
 single public module. The live window uses only its service-unavailable
-state; it has no service connection or selected destination yet. The page
-fits the compositor's 752-pixel tile within an 800-pixel headless output.
+state; it has no service connection or selected destination yet. All wizard
+views fit the compositor's 752-pixel tile within an 800-pixel headless output.
 
 The account and regional settings page is also a pure view. Username and
 hostname are text entries; keyboard layout and time zone are chooser rows

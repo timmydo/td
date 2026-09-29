@@ -22,13 +22,34 @@ use td_install::installation_plan::{Destination, DestinationObservation, Plan, S
 use td_ui::raster::{Composition, Primitive, Raster, Scale, Surface};
 use welcome::Welcome;
 
-/// Paint every installer view using bounded, synthetic data. This checks that
-/// the realized target binary can execute the rendering paths; it supplies
-/// no service state, consent, or installation authority.
+/// Smallest common installer view within the compositor's 800x600 output.
+pub(crate) const MIN_PAGE_WIDTH: usize = 752;
+/// Minimum height shared by installer pages.
+pub(crate) const MIN_PAGE_HEIGHT: usize = 480;
+
+pub(crate) fn supported_page(surface: Surface) -> Option<()> {
+    surface.check().ok()?;
+    let scale = surface.scale.value();
+    let width = MIN_PAGE_WIDTH.checked_mul(scale)?;
+    let height = MIN_PAGE_HEIGHT.checked_mul(scale)?;
+    (surface.width >= width && surface.height >= height).then_some(())
+}
+
+/// Paint every installer view at reference and live-tile sizes using bounded,
+/// synthetic data. This checks the realized target renderer; it supplies no
+/// service state, consent, or installation authority.
 pub fn render_check() -> Result<(), String> {
     let font = td_ui::font::pinned()?;
-    let surface = Surface::new(800, 600, Scale::new(1).map_err(|e| format!("{e:?}"))?)
-        .map_err(|e| format!("{e:?}"))?;
+    for (width, height) in [(800, 600), (752, 508)] {
+        let surface = Surface::new(width, height, Scale::new(1).map_err(|e| format!("{e:?}"))?)
+            .map_err(|e| format!("{e:?}"))?;
+        render_check_surface(&font, surface)
+            .map_err(|error| format!("render check at {width}x{height}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn render_check_surface(font: &td_ui::font::Font, surface: Surface) -> Result<(), String> {
     let mut pixels = vec![0u8; surface.width * surface.height * 4];
     let mut paint = |page: &dyn Composition| -> Result<(), String> {
         let mut missing = None;
@@ -51,7 +72,7 @@ pub fn render_check() -> Result<(), String> {
             return Err("page emitted no text".into());
         }
         pixels.fill(0);
-        Raster::new(&mut pixels, &font, surface, surface.width * 4)
+        Raster::new(&mut pixels, font, surface, surface.width * 4)
             .map_err(|e| format!("{e:?}"))?
             .paint(page, surface.bounds())
             .map_err(|e| format!("{e:?}"))

@@ -77,13 +77,8 @@ impl DestinationPage {
         detail_page: usize,
         unavailable: bool,
     ) -> Option<Self> {
-        surface.check().ok()?;
+        crate::supported_page(surface)?;
         let scale = surface.scale.value();
-        // The compositor's tile within an 800-pixel output is 752 pixels
-        // wide. The page's bands and bounded identity text fit that tile.
-        if surface.width < 752 * scale || surface.height < 480 * scale {
-            return None;
-        }
         let overflow = disks.len() > MAX_DISKS;
         if selected.is_some_and(|index| index >= disks.len()) {
             return None;

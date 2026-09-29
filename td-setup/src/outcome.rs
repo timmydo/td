@@ -234,9 +234,7 @@ impl Composition for CompletionPage {
 }
 
 fn supported(surface: Surface) -> Option<()> {
-    surface.check().ok()?;
-    let scale = surface.scale.value();
-    (surface.width >= 800 * scale && surface.height >= 480 * scale).then_some(())
+    crate::supported_page(surface)
 }
 
 fn fill(surface: Surface, damage: Rect, sink: &mut dyn FnMut(Draw)) {
@@ -295,7 +293,7 @@ mod tests {
 
     #[test]
     fn all_progress_states_explain_the_operation_without_claiming_success() {
-        let screen = surface(800, 480);
+        let screen = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
         for phase in [
             Phase::PreparingDisk,
             Phase::WritingFilesystems,
@@ -338,18 +336,24 @@ mod tests {
 
     #[test]
     fn completion_requires_a_supported_surface_and_instructs_media_removal() {
-        let screen = surface(800, 480);
+        let screen = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
         let complete = CompletionPage::new(screen).unwrap();
         let painted = glyphs(&complete, screen);
         assert!(painted.contains("Installation complete"));
         assert!(painted.contains("Remove the installation media"));
         assert!(painted.contains(COMPLETE_FOOTER));
         assert!(
-            ProgressPage::new(surface(799, 480), Progress::Running(Phase::PreparingDisk)).is_none()
+            ProgressPage::new(surface(752, 480), Progress::Running(Phase::PreparingDisk)).is_some()
         );
-        assert!(CompletionPage::new(surface(800, 479)).is_none());
-        let scaled = Surface::new(1600, 960, Scale::new(2).unwrap()).unwrap();
+        assert!(
+            ProgressPage::new(surface(751, 480), Progress::Running(Phase::PreparingDisk)).is_none()
+        );
+        assert!(CompletionPage::new(surface(752, 480)).is_some());
+        assert!(CompletionPage::new(surface(752, 479)).is_none());
+        let scaled = Surface::new(1504, 960, Scale::new(2).unwrap()).unwrap();
         assert!(ProgressPage::new(scaled, Progress::Running(Phase::PreparingDisk)).is_some());
         assert!(CompletionPage::new(scaled).is_some());
+        let too_narrow = Surface::new(1503, 960, Scale::new(2).unwrap()).unwrap();
+        assert!(CompletionPage::new(too_narrow).is_none());
     }
 }

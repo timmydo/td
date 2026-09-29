@@ -33,11 +33,8 @@ pub struct ReviewPage {
 
 impl ReviewPage {
     pub fn new(surface: Surface, plan: &Plan, page: usize) -> Option<Self> {
-        surface.check().ok()?;
+        crate::supported_page(surface)?;
         let scale = surface.scale.value();
-        if surface.width < 800 * scale || surface.height < 480 * scale {
-            return None;
-        }
         let body = Block::new(surface, (BODY_TOP * scale) as i64, BODY_ROWS)?;
         let footer = Status::new(surface);
         let warning_end = WARNING_TOP + WARNINGS.len().saturating_sub(1) * ROW + CELL_HEIGHT;
@@ -200,7 +197,7 @@ mod tests {
     fn review_shows_exact_disk_settings_and_persistent_warning() {
         let serial = "S".repeat(256);
         let plan = plan(&serial);
-        let screen = surface(800, 480);
+        let screen = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
         let first = ReviewPage::new(screen, &plan, 0).unwrap();
         let (_, pages) = first.position();
         assert!(pages > 1);
@@ -255,9 +252,12 @@ mod tests {
             assert!(details.contains(expected), "missing {expected}");
         }
         assert!(ReviewPage::new(screen, &plan, pages).is_none());
-        assert!(ReviewPage::new(surface(799, 480), &plan, 0).is_none());
-        assert!(ReviewPage::new(surface(800, 479), &plan, 0).is_none());
-        let scaled = Surface::new(1600, 960, Scale::new(2).unwrap()).unwrap();
+        assert!(ReviewPage::new(surface(752, 480), &plan, 0).is_some());
+        assert!(ReviewPage::new(surface(751, 480), &plan, 0).is_none());
+        assert!(ReviewPage::new(surface(752, 479), &plan, 0).is_none());
+        let scaled = Surface::new(1504, 960, Scale::new(2).unwrap()).unwrap();
         assert!(ReviewPage::new(scaled, &plan, 0).is_some());
+        let too_narrow = Surface::new(1503, 960, Scale::new(2).unwrap()).unwrap();
+        assert!(ReviewPage::new(too_narrow, &plan, 0).is_none());
     }
 }

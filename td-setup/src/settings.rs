@@ -43,11 +43,8 @@ impl<'a> SettingsPage<'a> {
         carets: [usize; 2],
         caret_visible: bool,
     ) -> Option<Self> {
-        surface.check().ok()?;
+        crate::supported_page(surface)?;
         let scale = surface.scale.value();
-        if surface.width < 800 * scale || surface.height < 480 * scale {
-            return None;
-        }
         if focused.is_some_and(|index| index >= values.len()) {
             return None;
         }
@@ -244,9 +241,9 @@ mod tests {
     fn minimum_size_and_draft_bounds_are_enforced() {
         let values = ["alice", "tdhost", "us", "America/Los_Angeles"];
         let carets = [5, 6];
-        assert!(SettingsPage::new(surface(800, 480), values, Some(2), carets, true).is_some());
-        assert!(SettingsPage::new(surface(799, 480), values, Some(2), carets, true).is_none());
-        assert!(SettingsPage::new(surface(800, 479), values, Some(2), carets, true).is_none());
+        assert!(SettingsPage::new(surface(752, 480), values, Some(2), carets, true).is_some());
+        assert!(SettingsPage::new(surface(751, 480), values, Some(2), carets, true).is_none());
+        assert!(SettingsPage::new(surface(752, 479), values, Some(2), carets, true).is_none());
         assert!(SettingsPage::new(surface(800, 480), values, Some(4), carets, true).is_none());
         assert!(SettingsPage::new(surface(800, 480), values, Some(2), [6, 6], true).is_none());
         assert!(
@@ -272,7 +269,7 @@ mod tests {
 
     #[test]
     fn form_shows_all_choices_and_no_secret_field() {
-        let surface = surface(800, 480);
+        let surface = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
         let page = SettingsPage::new(
             surface,
             ["alice", "tdhost", "us", "UTC"],
@@ -306,7 +303,7 @@ mod tests {
 
     #[test]
     fn empty_choices_show_placeholders_and_only_a_live_focus_draws_a_caret() {
-        let surface = surface(800, 480);
+        let surface = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
         let draws = |focused, caret_visible| {
             let page = SettingsPage::new(surface, [""; 4], focused, [0; 2], caret_visible).unwrap();
             let mut glyphs = String::new();
