@@ -6,9 +6,10 @@ This document owns configuration syntax and its bounded parsing helpers.
 `config::syntax` implements framing and statement decoding; `config::stream`
 drives a trusted reader through EOF. The resource stanza schema below
 additionally builds checked resource plans. [SCHEMA.md](SCHEMA.md) specifies
-the remaining complete operator schema and
-snapshot partitions. Its loader, protected file access, effective output and
-CLI remain M04b2c3/M04b3/M05/M19 work as assigned in IMPLEMENTATION.md.
+the complete operator schema and snapshot partitions. `config::load::read`
+owns whole-reader structural loading. Target stack qualification, protected
+file access, effective output and CLI remain M04b2c3d4b/M04b3/M05/M19 work
+as assigned in IMPLEMENTATION.md.
 A syntactically accepted statement is not a valid service configuration.
 DESIGN.md §6 owns the administration contract; RESOURCES.md owns the aggregate
 memory budget.
@@ -1158,8 +1159,8 @@ display name, email and two signature paths; all three root paths need
 semantic text can exhaust the shared region before later semantic checks;
 a capacity failure is not evidence of field validity. Appends check the
 entire range before modifying bytes or the used prefix. No heap storage,
-whole-file AST or second alias-text arena is introduced. Combined loader
-workspace checks remain required in M04b2c3d4.
+whole-file AST or second alias-text arena is introduced. M04b2c3d4a guards
+combined named loader state; target peak-stack qualification remains d4b.
 
 Fixed `config_stanza_` errors disclose only static section/field context and
 source coordinates. Unknown raw names are never echoed. Duplicate fields
@@ -1196,7 +1197,7 @@ selected view mode, then identities, routing/policies, outbound settings,
 certificates, gateway peers, listeners and the certificate/name graph. It
 returns borrowed `Parsed` records and a matching read-only text view. This
 method does not operate a reader and is explicitly not evidence of actual
-EOF. M04b2c3d4 must call it only after the owned reader operation reaches
+EOF. M04b2c3d4a calls it only after its owned reader operation reaches
 EOF. Protected files, TLS/provider readiness and runtime publication remain
 later stages. Public structural records cannot authorize any of them.
 
@@ -1206,8 +1207,8 @@ hostname/origin and coordinates until their final canonical copies are
 written by policy/graph finalization. A compile-time guard covers the
 dispatcher and Pending within the existing 36 KiB workspace; this is not a
 peak-stack proof including called frames. The separate 28 KiB stream region
-and complete loader/call-frame measurement remain d4. Private owned storage
-and sealed table headers are described below.
+is combined with loader state guards in d4a; peak call-frame measurement
+remains d4b. Private owned storage and sealed table headers are described below.
 
 The first accept error is sticky and consuming finish refuses it. Partial
 table/text writes remain private and charged until the caller discards the
@@ -1334,7 +1335,52 @@ measurements; no RSS claim follows from these object-layout guards.
 
 A Candidate proves structural closure of the statements actually submitted,
 not reader EOF, protected-file trust, resolved signatures, certificate
-validity or runtime publication. M04b2c3d4 must own the reader operation and
-return a candidate only after actual EOF. M04b3 consumes exclusive candidate
+validity or runtime publication. M04b2c3d4a owns the reader operation and
+returns its Loaded wrapper only after actual EOF. M04b3 consumes exclusive candidate
 access for protected signature/credential material before publication; no
 mutable cells or loose headers are exposed by the current public API.
+
+
+## Whole-reader structural loading
+
+M04b2c3d4a adds `config::load::read`. It consumes preallocated Storage,
+borrows Pending and the 28 KiB stream scratch, and owns the complete reader
+operation. The restricted sink drives the dispatcher; stream success requires
+an actual `Read::read` result of zero. Only then does structural finalization
+close required sections, references and resource plans. There is no API to
+supply an unrelated stream Summary as completion evidence.
+
+Success returns `Loaded`, a private wrapper around the structural Candidate.
+It lends read-only candidate access; consuming it can erase the wrapper or
+recover storage. Callers cannot construct a Loaded from a statement-only
+Candidate. This certifies EOF from the same trusted reader operation, not
+filesystem ownership, protected-input validity, TLS material or publication.
+Reader adapters remain responsible for truthful EOF, bounded allocation and
+blocking behavior. This increment opens no files or sockets.
+
+Failure returns the reusable storage carrier. The first recorded dispatcher
+failure remains Configuration, preserving its typed cause and source context;
+this takes precedence over a wrapping reader callback error. A stream error
+without a dispatcher failure remains Input and can be inspected as its precise
+syntax/read/capacity/interruption variant. Input(Handler) cannot originate
+from this loader: its only handler is the dispatcher, whose failures become
+Configuration. The carrier's generic formatting
+continues to redact input errors. The caller's prior candidate is independent
+and remains readable during replacement and after a failed load.
+
+Tests cover fragmented input and an unterminated final line, actual EOF,
+late read failure, late syntax/handler/finalizer refusal, scratch shortage
+before reader I/O, and exhausted domain descriptors and shared text. Each
+failure can return storage for a valid retry. A compiler-code-pinned negative
+example prevents external construction of Loaded. No runtime generation is
+published; M19 retains that responsibility.
+
+A compile-time sum of the named Pending, dispatcher Builder, borrowed Parsed,
+Loaded, Failure, stream Summary, Framer and Statement representations fits
+36 KiB. This deliberately counts both build and completed representations,
+including inline global settings and resource plans. The separate stream
+scratch remains 28 KiB within the existing 64 KiB parser reservation. This is
+an object-layout guard, not compiler peak-stack evidence: parameter moves,
+initialization temporaries, nested helper frames, trusted reader frames and
+provider stack use still require target qualification. M04b2c3d4b owns that
+measurement before protected finalization or service integration.

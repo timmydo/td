@@ -3,9 +3,10 @@
 ## Status and ownership
 
 This document specifies the complete v1 operator schema to implement in
-M04b2c3. Typed statement dispatch now closes structural references, but
-owned whole-reader loading and a runnable service remain unimplemented. CONFIG.md owns physical syntax, resource fields, local routing and
-stream completion. API.md owns visible identity encoding. This document owns
+M04b2c3. Typed statement dispatch closes structural references, and the
+owned whole-reader loader requires actual EOF. A runnable service and target
+stack qualification remain unimplemented. CONFIG.md owns physical syntax,
+resource fields, local routing and stream completion. API.md owns visible identity encoding. This document owns
 the remaining fields, cross-references and candidate construction. Protected
 file loading and redacted effective output remain M04b3/M05; M19 owns
 publication.
@@ -578,10 +579,11 @@ Relay and certificate/ACME variants individually fit within 9 KiB including
 bookkeeping; the shared 13 KiB reservation also accommodates identity and
 root-path variants. Decoded protected-file contents are loaded later into
 the candidate's text/material budgets, never into this pending
-operator-stanza buffer. M04b2c3d must measure the complete pending
-representation and all concurrent builder/header/global staging state
-against the combined 36 KiB ceiling before use. This partition does not
-increase the existing 64 KiB parser scratch reservation.
+operator-stanza buffer. M04b2c3d4a guards the named
+pending/builder/header/global representations against the combined 36 KiB
+ceiling. M04b2c3d4b still owns compiler temporary and peak call-frame
+qualification. This partition does not increase the existing 64 KiB parser
+scratch reservation.
 
 Retain only one alias label (at most 254 bytes) until its account field is
 known, then hand it to the routing builder; never duplicate all alias
@@ -590,22 +592,33 @@ KiB allowance within the same workspace. Static whole-loader fields such as
 the staged server hostname also count against that workspace, outside the
 reusable pending variant.
 
-The public whole-loader entry point owns the candidate and stream operation as
-one call. It must not accept an unrelated Summary as EOF evidence. On any
-read, syntax, schema or reference failure, drop candidate authority and retain
-no publishable partial result. Reusable private backing bytes may remain.
-After EOF, resolve references and validate routing/resource plans. Return a
-structural candidate whose parsed settings are immutable, with private unused
-text capacity reserved for finalization. It is not a completed snapshot. M04b3
+The loader statically sums its named Pending, dispatcher Builder, borrowed
+Parsed, Loaded/Failure, stream Summary, Framer and Statement representations
+against the existing 36 KiB workspace. This includes inline globals/plans
+and counts build/completed representations together. The 28 KiB stream
+region retains the rest of the 64 KiB parser reservation. These
+object-layout bounds do not measure compiler temporaries or nested call
+frames. M04b2c3d4b must qualify peak stack use with the pinned musl target
+before M04b3/M19 consumption.
+
+`config::load::read` implements the public whole-loader entry point. It owns
+the candidate and stream operation as one call. Its private Loaded wrapper
+can only be produced after successful EOF and structural finalization. It
+accepts no unrelated Summary as EOF evidence. On any read, syntax, schema or
+reference failure, drop candidate authority and retain no publishable
+partial result. Reusable private backing bytes may remain. After EOF,
+resolve references and validate routing/resource plans. Return a structural
+candidate whose parsed settings are immutable, with private unused text
+capacity reserved for finalization. It is not a completed snapshot. M04b3
 consumes that candidate through M05 protected reads, appends signatures and
-decoded credentials into its existing 192 KiB non-routing region, and refuses
-any read/UTF-8/permission/capacity error without returning an authority. It
-then builds the temporary borrowed views and invokes the existing encoder. M07
-validates provider material. Only successful completion seals the immutable
-publishable snapshot for M19; there is no mutation of a sealed active
-snapshot. M04b2c3b1 tests unresolved signature references/defaults; M04b3 uses
-bounded injected protected-input fixtures to test materialization and
-encoding.
+decoded credentials into its existing 192 KiB non-routing region, and
+refuses any read/UTF-8/permission/capacity error without returning an
+authority. It then builds the temporary borrowed views and invokes the
+existing encoder. M07 validates provider material. Only successful
+completion seals the immutable publishable snapshot for M19; there is no
+mutation of a sealed active snapshot. M04b2c3b1 tests unresolved signature
+references/defaults; M04b3 uses bounded injected protected-input fixtures to
+test materialization and encoding.
 
 Initial ACME issuance uses DESIGN.md §7's bootstrap state: after structural,
 resource and protected-input validation, M19 may expose only HTTP-01 and local

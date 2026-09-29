@@ -57,7 +57,8 @@ Dependency edges:
 
 ```text
 M01 -> M02
-M02 -> M03, M04
+M02 -> M03, M04 foundations
+M03 -> M04b2c3d4b -> M04b3
 M04 -> M06
 M04 + M07 -> M05
 M05 + M06 -> M08
@@ -201,7 +202,8 @@ A clean fixture builds without undeclared ambient host toolchain inputs.
 
 ## M04 — Bounded primitives, configuration, and event records
 
-**Depends on:** M02. **Own:** `bounded`, `ownership`, `config`, `observability`,
+**Depends on:** M02 for foundations; M03 for target stack qualification
+(M04b2c3d4b) before M04b3. **Own:** `bounded`, `ownership`, `config`, `observability`,
 `limits` and `admission` modules.
 
 Split at these concrete boundaries before dependent milestones start:
@@ -352,15 +354,22 @@ Split at these concrete boundaries before dependent milestones start:
     backing tables, used prefixes and text owner together. No public loose
     rebinding, self-reference, extra snapshot copy or unsafe conversion.
     Prove every concrete snapshot partition fits its existing reservation.
-  - **M04b2c3d4:** integrate d1-d3 in one whole-loader entry point owning its
-    candidate and reader operation. Drive the d2 version/stanza rules through
-    actual EOF, require all mandatory sections, and finalize resource plans
-    and references. Measure all concurrent pending/global/builder state within
-    the 36 KiB workspace. Return only a structural candidate, with no runtime
-    authority. Test complete source fixtures and integrated schema refusals,
-    late read/handler failures, exhausted text/descriptors and unchanged
-    caller-held prior validated configuration; M19 tests active generations.
-    All combined snapshot/scratch proofs precede M04b3/M19 consumption.
+  - **M04b2c3d4a:** implemented `config/load.rs`: one call consumes private
+    storage and drives the restricted dispatcher sink through actual reader
+    EOF before structural finalization. Private Loaded distinguishes this
+    result from supplied-statement candidates; it confers no protected-file
+    or runtime authority. Typed stream/schema errors return reusable storage.
+    Complete fixtures cover fragmented input, final lines, late I/O/syntax/
+    handler/reference failures, exhausted descriptors/text, and the unchanged
+    caller-held prior candidate. Named concurrent state representations fit
+    36 KiB beside the 28 KiB stream region; no new allocation is introduced.
+  - **M04b2c3d4b:** qualify complete loader stack use on the pinned musl
+    target, including compiler temporaries, nested helper/reader frames and
+    initialization moves. Preserve the 36 KiB workspace and existing 256 KiB
+    control-worker stack reservations, including 80 KiB for later borrowed
+    identity views. M03 provides the portable toolchain. Object-layout guards
+    alone are not peak-stack proof. All combined snapshot/scratch proofs
+    precede M04b3/M19 consumption; M19 tests active generation publication.
 - **M04b3:** protected-file reference requirements and redacted effective
   configuration library output. Actual trusted file opening and permission
   evidence use M05 adapters; no successful full `config check` before that
