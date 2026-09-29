@@ -750,9 +750,16 @@ which is a claim it can make. A new repaint request invalidates the prior
 answer before either compound-commit deferral or backend I/O; explicitly
 deferred repaint does the same. A pending or failed request therefore leaves
 `last_submission` empty, and only that request's successful backend answer
-can fill it again. An earlier frame's `Presented` cannot stand in for a new
-prompt. This is submission bookkeeping, not request-bound consent: trusted
-prompt identity and cancellation must still be checked by the consumer.
+can fill it again. This is submission bookkeeping, not request-bound
+consent. Only the headless observers and the public capture still read it,
+and only backends that answer `Presented` serve those. What reached the
+screen is counted in paint EPOCHS: each successful paint is numbered, and
+the newest known to be on glass is recorded (at once for `Presented`, at the
+completion or the watchdog's recovery for `Queued`). Presentation evidence
+names the epoch it needs, which is the first paint that renders the scene as
+it stands, and waits for it. An earlier frame cannot stand in for a later
+one, and trusted prompt identity and cancellation are still checked by the
+consumer.
 
 `Damage` travels the other way. `Unknown` means the caller does not know what
 changed and a backend may discover it — fbdev compares its own shadow copy —
@@ -791,12 +798,19 @@ reasons the poll was wrong are the constraints the delivery path meets:
   cursor evidence are published today after a successful submit, which is
   correct while submit means presented; under a backend that answers `Queued`
   they would announce a frame that is not yet on screen, and they have to be
-  retained until the completion arrives. NOT YET MET, which is why the image
-  still runs fbdev. Under `--card` the trusted prompt refuses to present,
-  because it requires `Presented` from its own paint; its pixels do reach the
-  screen for a frame before the refusal withdraws them. Readiness would be
-  published a vblank early. Hiding the secure-attention overlay returns its
-  input cutoff before the overlay's removal is on glass.
+  retained until the completion arrives. MET:
+  - Readiness and cursor evidence are retained with the epoch that shows them.
+    They are published once that epoch is on glass, judged against
+    `completed()`, the bytes known to be on glass. The frame last composed is
+    no longer on the trait at all.
+  - The trusted prompt waits for its own paint, below.
+  - One boundary remains submission-timed, deliberately. Hiding the
+    secure-attention overlay returns its input cutoff when the ordinary
+    screen is submitted, not when it is shown, so input in that window
+    reaches clients while the overlay is still on glass. Only closing is
+    affected, which the user just asked for. Opening suspends client
+    keyboard delivery at once, whatever the paint does. fbdev's cutoff
+    likewise precedes the scanout that shows the change.
 
 Naming those is what §M asks for. Guessing at the response is what it calls
 painting into the corner.
@@ -4011,9 +4025,9 @@ is rendered at it and copied into either.
   `drm_lastclose` restores the fbdev client once the last descriptor
   closes.
 
-The image still runs fbdev. Presentation-dependent evidence has not yet moved
-to completion (above), and the boot's probes take the mastership the
-compositor would hold.
+The image still runs fbdev. Frame callbacks are still released at commit,
+which a synchronous paint paces and a queued one does not. The boot's probes
+also take the mastership the compositor would hold.
 
 A modeset unwinds in one order, for a narrower reason than it first appears.
 `SETCRTC` is the only one of the three steps the kernel flags `DRM_MASTER`
@@ -6567,6 +6581,23 @@ is advisory and root independently validates the store before each operation.
 
 A complete immutable prompt must be confirmed presented before each token
 creation/proof or unlock assertion; `Submission::Queued` is not a receipt.
+The receipt is the prompt's OWN paint reaching the screen:
+- Presentation is prepared under the runtime lock, naming the first
+  successful paint from then on.
+- It then waits outside that lock on a separate presentation clock, because
+  completions are delivered under the runtime lock.
+- A flip already in flight when the prompt is prepared is not the prompt's,
+  so its completion does not count.
+- The wait is bounded by `ATTENTION_PRESENTATION_DEADLINE`: two flips' worth
+  of the watchdog's bound, and never past the attempt's own deadline. A
+  recovery's blocking `SETCRTC` can outlast it, and the prompt is then
+  withdrawn although it may be about to land. That fails closed.
+- The receipt itself re-checks that the prompt's epoch is on glass, so
+  skipping the wait cannot make one.
+- A prompt that does not land in time is withdrawn, as a failed paint's is.
+- After the wait, the prompt must still be the request on screen, and the
+  completion time is read then. Input stamped before the prompt was on glass
+  therefore cannot answer it.
 The request fixes owner, nonce, platform and recovery policy throughout the
 operation. The two-token path presents creation and proof for each token;
 the unrecoverable path ends after primary proof. Both tokens must be ready
@@ -6575,7 +6606,8 @@ budget when shown, without renewing that deadline. This is a time snapshot,
 not a live countdown. Hardware timing remains unverified by host/VM fixtures.
 
 The physical attempt records cancellation atomically before waiting for the
-runtime lock. Presentation checks its lifetime before and after painting;
+runtime lock. Presentation checks its lifetime before and after painting,
+and holds no runtime lock while it waits for the paint to land;
 commit competes with cancellation in one atomic state transition. The
 winning execution decision is recorded before sending root the commit, so a
 lost reply cannot trigger a retry. Cancellation after that decision cannot

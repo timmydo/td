@@ -100,19 +100,41 @@ impl Attempt {
         if !self.active() {
             return Err("physical attention was cancelled".into());
         }
+        let presentation = {
+            let mut runtime = self.runtime.lock().map_err(|_| "runtime lock poisoned")?;
+            if !self.active() {
+                return Err("physical attention was cancelled".into());
+            }
+            let remaining = self
+                .deadline
+                .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+                .map(|duration| duration.as_secs())
+                .filter(|seconds| *seconds > 0)
+                .ok_or("physical secret operation expired")?;
+            runtime.begin_attention_presentation(&self.origin, request, Some(remaining))?
+        };
+        // Outside the runtime lock, because the completion this waits for is
+        // delivered under it. Bounded by the attempt's own deadline too.
+        let waited = Instant::now()
+            .checked_add(crate::runtime::ATTENTION_PRESENTATION_DEADLINE)
+            .into_iter()
+            .chain(self.deadline)
+            .min()
+            .ok_or_else(|| "physical secret operation expired".to_string())
+            .and_then(|deadline| presentation.wait(deadline));
         let mut runtime = self.runtime.lock().map_err(|_| "runtime lock poisoned")?;
+        let receipt = match waited {
+            Ok(()) => runtime.finish_attention_presentation(presentation)?,
+            Err(error) => {
+                runtime.abandon_attention_presentation(presentation.request());
+                return Err(error);
+            }
+        };
+        // Also the attempt's deadline, which a paint that landed before a
+        // late wait does not excuse. Its prompt is withdrawn with it, since
+        // nothing will answer it now.
         if !self.active() {
-            return Err("physical attention was cancelled".into());
-        }
-        let remaining = self
-            .deadline
-            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
-            .map(|duration| duration.as_secs())
-            .filter(|seconds| *seconds > 0)
-            .ok_or("physical secret operation expired")?;
-        let receipt =
-            runtime.present_attention_request_with_time(&self.origin, request, Some(remaining))?;
-        if !self.active() {
+            runtime.abandon_attention_presentation(receipt.request());
             return Err("physical attention was cancelled during presentation".into());
         }
         let completed = receipt.completed();

@@ -415,14 +415,10 @@ pub trait OutputBackend {
     /// exact target geometry, the trusted prompt.
     fn target_stride(&self) -> usize;
 
-    /// The frame the last `begin_frame` prepared and the renderer filled,
-    /// whether or not it was submitted. What the application observer
-    /// attributes pixels in.
-    fn composed(&self) -> FrameView<'_>;
-
     /// The bytes the device is known to hold, or `None` while that is not
     /// established: before the first submission completes, and across a
-    /// failed one. The public capture reads only this, and only each row's
+    /// failed one, and while a submission is queued. The public capture and
+    /// the application observer read only this, and only each row's
     /// visible `width * 4` bytes: row padding is never compared or captured,
     /// so a backend need not keep it in any particular state.
     fn completed(&self) -> Option<FrameView<'_>>;
@@ -709,14 +705,6 @@ mod tests {
             }
             fn target_stride(&self) -> usize {
                 3200
-            }
-            fn composed(&self) -> FrameView<'_> {
-                FrameView {
-                    pixels: &self.frame,
-                    width: self.width,
-                    height: 600,
-                    stride: 3200,
-                }
             }
             fn completed(&self) -> Option<FrameView<'_>> {
                 None

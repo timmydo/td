@@ -27,7 +27,7 @@ use crate::server::TransferEndpoint;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub(crate) const MAX_PENDING_KEYBOARD_DELIVERIES: usize = 64;
@@ -62,11 +62,89 @@ const MAX_RECOVERED_FRAMES: usize = 8;
 /// a CRTC that refuses to be set.
 const MAX_FAILED_RECOVERIES: u32 = 3;
 
-/// The one frame a backend has queued and not yet reported on glass.
+/// How long a trusted prompt waits for its own frame to reach the screen.
+///
+/// Two flips' worth of the watchdog's bound: the one that may already be in
+/// flight when the prompt is prepared, and the prompt's own, each recovered
+/// within `FLIP_DEADLINE` plus the watchdog's one-second tick. Past it the
+/// prompt is withdrawn rather than presumed shown. A recovery's own blocking
+/// SETCRTC is not counted, so a real stall can withdraw a prompt about to
+/// land: that fails closed.
+pub(crate) const ATTENTION_PRESENTATION_DEADLINE: Duration = Duration::from_secs(15);
+
+/// The one frame a backend has queued and not yet reported on glass, and the
+/// paint that rendered it.
 #[derive(Clone, Copy, Debug)]
 struct InFlight {
     frame: FrameId,
     since: Instant,
+    epoch: u64,
+}
+
+/// The newest paint known to be on glass.
+///
+/// A separate lock from the runtime's, and that is its whole reason to exist:
+/// a completion is delivered UNDER the runtime lock, so anything that waits
+/// for one must wait somewhere else. Epochs count successful paints, so "the
+/// first paint made after X" is a number that can be named before it exists.
+#[derive(Default)]
+pub(crate) struct PresentationClock {
+    presented: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl PresentationClock {
+    /// Record that paint `epoch` is on glass. Monotonic: a late report of an
+    /// older paint cannot move the clock back. A poisoned clock is left as it
+    /// is, since every waiter refuses one.
+    fn publish(&self, epoch: u64) {
+        if let Ok(mut presented) = self.presented.lock() {
+            *presented = (*presented).max(epoch);
+            self.changed.notify_all();
+        }
+    }
+
+    /// Block until paint `epoch` is on glass, or `deadline` passes.
+    fn wait_for(&self, epoch: u64, deadline: Instant) -> Result<(), String> {
+        let mut presented = self
+            .presented
+            .lock()
+            .map_err(|_| "presentation clock poisoned".to_string())?;
+        while *presented < epoch {
+            let left = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or("the trusted prompt did not reach the screen in time")?;
+            presented = self
+                .changed
+                .wait_timeout(presented, left)
+                .map_err(|_| "presentation clock poisoned".to_string())?
+                .0;
+        }
+        Ok(())
+    }
+}
+
+/// A trusted prompt handed to the output and not yet known to be on glass.
+/// Not a receipt: `Runtime::finish_attention_presentation` makes one, after
+/// `wait` has seen the prompt's own paint reach the screen.
+pub(crate) struct AttentionPresentation {
+    request: crate::authority::consent::Request,
+    epoch: u64,
+    clock: Arc<PresentationClock>,
+}
+
+impl AttentionPresentation {
+    pub fn request(&self) -> &crate::authority::consent::Request {
+        &self.request
+    }
+
+    /// Wait, WITHOUT the runtime lock, for the first paint made after the
+    /// prompt was prepared to be on glass. Every such paint renders the
+    /// prompt unless it was withdrawn, which the finish checks.
+    pub fn wait(&self, deadline: Instant) -> Result<(), String> {
+        self.clock.wait_for(self.epoch, deadline)
+    }
 }
 
 #[derive(Clone)]
@@ -413,6 +491,9 @@ pub(crate) struct PresentedRequest {
 #[allow(dead_code, reason = "trusted authority request consumer follows")]
 impl PresentedRequest {
     pub fn completed(&self) -> u128 { self.completed }
+    pub fn request(&self) -> &crate::authority::consent::Request {
+        &self.request
+    }
     pub fn into_request(self) -> crate::authority::consent::Request {
         self.request
     }
@@ -458,6 +539,12 @@ pub struct Runtime {
     /// Whether the watchdog's last attempt at an owed paint failed, so a
     /// paint that keeps failing is reported once rather than every tick.
     owed_paint_failing: bool,
+    /// Successful paints so far: the epoch of the newest one.
+    paints: u64,
+    /// The newest paint known to be on glass. `presented` is the same number
+    /// for waiters that cannot take this runtime's lock.
+    on_glass: u64,
+    presented: Arc<PresentationClock>,
     headless_output: Option<crate::headless::OutputStamp>,
     headless_action: u64,
     clipboard_control: Option<ClipboardControl>,
@@ -603,6 +690,12 @@ struct ApplicationReady {
     connection_live: Arc<AtomicBool>,
     cursor_wake: Option<SyncSender<ApplicationCursorEvidence>>,
     cursor_published: bool,
+    /// Readiness accepted before the paint showing it reached the glass,
+    /// and the epoch of that paint. Evidence is about the SCREEN, so under a
+    /// backend that answers `Queued` it waits for the completion.
+    unpresented: Option<(SurfaceKey, SurfaceKey, [usize; 2], u64)>,
+    /// The epoch a cursor drawn for the proved client waits on, likewise.
+    cursor_due: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -671,6 +764,9 @@ impl Runtime {
             evicted: None,
             failed_recoveries: 0,
             owed_paint_failing: false,
+            paints: 0,
+            on_glass: 0,
+            presented: Arc::new(PresentationClock::default()),
             headless_output: None,
             headless_action: 0,
             clipboard_control: None,
@@ -753,6 +849,8 @@ impl Runtime {
             connection_live,
             cursor_wake,
             cursor_published: false,
+            unpresented: None,
+            cursor_due: None,
         });
         Ok(())
     }
@@ -1109,15 +1207,21 @@ impl Runtime {
         let next_output = self.headless_output.map(|stamp| {
             stamp.output.checked_add(1).ok_or("headless output identity exhausted")
         }).transpose()?;
+        let epoch = self.paints.checked_add(1).ok_or("paint epochs exhausted")?;
         // The damage is cleared only on success, so a failed paint still owes
         // the whole output — which is what the backend's own shadow-copy
         // distrust did before this was the caller's to say.
         let submission = self.backend.paint(&self.scene, self.owed_damage)?;
-        if let Submission::Queued(frame) = submission {
-            self.in_flight = Some(InFlight {
-                frame,
-                since: Instant::now(),
-            });
+        self.paints = epoch;
+        match submission {
+            Submission::Queued(frame) => {
+                self.in_flight = Some(InFlight {
+                    frame,
+                    since: Instant::now(),
+                    epoch,
+                });
+            }
+            Submission::Presented => {}
         }
         self.last_submission = Some(submission);
         if self.last_submission == Some(Submission::Presented) {
@@ -1127,7 +1231,28 @@ impl Runtime {
         }
         self.owed_damage = Damage::Unknown;
         self.pending_paint = false;
+        if submission == Submission::Presented {
+            self.mark_on_glass(epoch);
+        }
         Ok(())
+    }
+
+    /// The first paint that renders the scene as it stands now: the latest
+    /// one, unless a paint is owed, in which case the next.
+    fn current_epoch(&self) -> u64 {
+        if self.pending_paint || self.compound_settle.is_some() {
+            self.paints.saturating_add(1)
+        } else {
+            self.paints
+        }
+    }
+
+    /// Paint `epoch` is on glass: tell whatever waits on it outside the lock,
+    /// and publish evidence that was waiting for it.
+    fn mark_on_glass(&mut self, epoch: u64) {
+        self.on_glass = self.on_glass.max(epoch);
+        self.presented.publish(epoch);
+        self.publish_presented_evidence();
     }
 
     /// The latest requested paint's answer; pending or failed requests are None.
@@ -1174,7 +1299,7 @@ impl Runtime {
         self.backend.frame_presented(in_flight.frame)?;
         self.in_flight = None;
         self.failed_recoveries = 0;
-        self.frame_on_glass(in_flight.frame);
+        self.frame_on_glass(in_flight);
         Ok(())
     }
 
@@ -1247,26 +1372,29 @@ impl Runtime {
             }
         }
         self.recovered.push_back(in_flight.frame);
-        self.frame_on_glass(in_flight.frame);
+        self.frame_on_glass(in_flight);
         Ok(())
     }
 
-    /// `frame` is on glass. If it is still the latest paint's answer, that
-    /// answer becomes `Presented`, and the paint owed while it was in flight
-    /// is taken now.
+    /// A queued frame is on glass. If it is still the latest paint's answer,
+    /// that answer becomes `Presented`; what waits on its paint is told; and
+    /// the paint owed while it was in flight is taken now.
     ///
     /// That paint failing is logged, not returned. The frame's completion
     /// was accepted, and the paint stays owed for the next request or
     /// watchdog tick, as any failed paint does; returning it would end the
     /// process from the thread that delivers completions.
-    fn frame_on_glass(&mut self, frame: FrameId) {
-        if self.last_submission == Some(Submission::Queued(frame)) {
+    fn frame_on_glass(&mut self, shown: InFlight) {
+        if self.last_submission == Some(Submission::Queued(shown.frame)) {
             self.last_submission = Some(Submission::Presented);
         }
+        // Before the owed paint is taken: that queues the next flip, and
+        // evidence is judged against a glass whose contents are known.
+        self.mark_on_glass(shown.epoch);
         if let Err(error) = self.flush_paint() {
             eprintln!(
                 "td-compositor: owed paint after frame {:#x}: {error}",
-                frame.cookie()
+                shown.frame.cookie()
             );
         }
     }
@@ -2099,6 +2227,64 @@ impl Runtime {
         if !self.application_evidence_is_current(key, content_surface, content_pixels) {
             return Ok(());
         }
+        let due = self.current_epoch();
+        if self.on_glass < due {
+            if let Some(ready) = self.application_ready.as_mut() {
+                ready.unpresented = Some((key, content_surface, content_pixels, due));
+            }
+            return Ok(());
+        }
+        self.publish_application_ready_on_glass(key, content_surface, content_pixels)
+    }
+
+    /// Evidence that waited for its paint, published now that the paint is
+    /// on glass. Logged rather than returned: the caller is a paint or a
+    /// completion, and an observer that went away does not fail either.
+    fn publish_presented_evidence(&mut self) {
+        let on_glass = self.on_glass;
+        let Some(ready) = self.application_ready.as_mut() else {
+            return;
+        };
+        let evidence = ready.unpresented.filter(|(.., due)| *due <= on_glass);
+        if evidence.is_some() {
+            ready.unpresented = None;
+        }
+        let cursor = ready.cursor_due.is_some_and(|due| due <= on_glass);
+        if cursor {
+            ready.cursor_due = None;
+        }
+        if let Some((key, content_surface, content_pixels, _)) = evidence {
+            if let Err(error) =
+                self.publish_application_ready_on_glass(key, content_surface, content_pixels)
+            {
+                eprintln!("td-compositor: application readiness: {error}");
+            }
+        }
+        // Independent of readiness: a cursor channel that works is not
+        // silenced by a readiness channel that does not. Sent, not
+        // re-deferred: every change of the drawn cursor raises `cursor_due`
+        // to the paint that shows it, so a due at or below the glass means
+        // the scene's cursor is the one shown. Re-checking the current epoch
+        // would put it off for as long as some paint is always owed.
+        if cursor {
+            if let Err(error) = self.send_application_cursor() {
+                eprintln!("td-compositor: application cursor: {error}");
+            }
+        }
+    }
+
+
+    /// Judge readiness against what is ON GLASS: `completed()`, not the frame
+    /// last composed, which under a flip in flight is not yet shown.
+    fn publish_application_ready_on_glass(
+        &mut self,
+        key: SurfaceKey,
+        content_surface: SurfaceKey,
+        content_pixels: [usize; 2],
+    ) -> Result<(), String> {
+        if !self.application_evidence_is_current(key, content_surface, content_pixels) {
+            return Ok(());
+        }
         let Some(expected_content_rgbs) = self
             .application_ready
             .as_ref()
@@ -2106,8 +2292,11 @@ impl Runtime {
         else {
             return Ok(());
         };
+        let Some(on_glass) = self.backend.completed() else {
+            return Ok(());
+        };
         let output_pixels = crate::output::surface_rgb_pixel_counts(
-            self.backend.composed(),
+            on_glass,
             &mut self.comparison,
             &self.scene,
             content_surface,
@@ -2161,7 +2350,26 @@ impl Runtime {
         self.publish_application_cursor()
     }
 
+    /// Cursor evidence, once the paint drawing the cursor is on glass.
     fn publish_application_cursor(&mut self) -> Result<(), String> {
+        if self
+            .application_ready
+            .as_ref()
+            .is_none_or(|ready| ready.cursor_published)
+        {
+            return Ok(());
+        }
+        let due = self.current_epoch();
+        if self.on_glass < due {
+            if let Some(ready) = self.application_ready.as_mut() {
+                ready.cursor_due = Some(ready.cursor_due.map_or(due, |seen| seen.max(due)));
+            }
+            return Ok(());
+        }
+        self.send_application_cursor()
+    }
+
+    fn send_application_cursor(&mut self) -> Result<(), String> {
         let Some((key, width, height)) = self.scene.drawn_cursor_image() else {
             return Ok(());
         };
@@ -2311,15 +2519,44 @@ impl Runtime {
         self.present_attention_request_with_time(origin, request, None)
     }
 
+    /// The whole presentation for a test that holds the runtime itself: it
+    /// cannot release a lock to wait, so the prompt's paint must already be
+    /// on glass when the paint returns, which only a backend that answers
+    /// `Presented` can arrange.
+    #[cfg(test)]
     pub(crate) fn present_attention_request_with_time(
+        &mut self,
+        origin: &crate::input::EvdevOrigin,
+        request: crate::authority::consent::Request,
+        remaining: Option<u64>,
+    ) -> Result<PresentedRequest, String> {
+        let presentation = self.begin_attention_presentation(origin, request, remaining)?;
+        if let Err(error) = presentation.wait(Instant::now()) {
+            self.abandon_attention_presentation(presentation.request());
+            return Err(error);
+        }
+        self.finish_attention_presentation(presentation)
+    }
+
+    /// Prepare a trusted prompt and hand it to the output.
+    ///
+    /// This is half of presenting one. The other half is waiting, outside
+    /// the runtime lock, for the prompt's paint to reach the screen, and
+    /// `finish_attention_presentation` is the only thing that turns the two
+    /// into a receipt. The paint to wait for is named BEFORE the repaint: it
+    /// is the first successful paint from here, whether that is this one or,
+    /// with a flip already in flight, the owed one that flip's completion
+    /// takes.
+    pub(crate) fn begin_attention_presentation(
         &mut self,
         _origin: &crate::input::EvdevOrigin,
         request: crate::authority::consent::Request,
         remaining: Option<u64>,
-    ) -> Result<PresentedRequest, String> {
+    ) -> Result<AttentionPresentation, String> {
         if !self.attention_enabled || self.compound_settle.is_some() {
             return Err("trusted prompt cannot be presented in this runtime state".into());
         }
+        let epoch = self.paints.checked_add(1).ok_or("paint epochs exhausted")?;
         let size = self.backend.dimensions();
         self.scene.prepare_attention_request_with_time(
             request,
@@ -2329,14 +2566,7 @@ impl Runtime {
             remaining,
         )?;
         self.owed_damage = Damage::Whole;
-        let painted = self.repaint().and_then(|()| {
-            if self.pending_paint || self.last_submission != Some(Submission::Presented) {
-                Err("trusted prompt has not been presented".into())
-            } else {
-                Ok(())
-            }
-        });
-        if let Err(error) = painted {
+        if let Err(error) = self.repaint() {
             self.scene.discard_attention_request();
             self.owed_damage = Damage::Whole;
             self.defer_repaint();
@@ -2347,8 +2577,52 @@ impl Runtime {
             .attention_request()
             .ok_or("trusted prompt was cancelled")?
             .clone();
+        Ok(AttentionPresentation {
+            request,
+            epoch,
+            clock: Arc::clone(&self.presented),
+        })
+    }
+
+    /// The receipt, once `presentation` has been waited for. The prompt must
+    /// STILL be the request on screen: the runtime lock was released for the
+    /// wait, and a prompt withdrawn meanwhile was not presented, however
+    /// briefly it was painted. The completion time is read here, after the
+    /// paint is known to be on glass, so input stamped before it cannot be
+    /// taken as a response to the prompt.
+    pub(crate) fn finish_attention_presentation(
+        &mut self,
+        presentation: AttentionPresentation,
+    ) -> Result<PresentedRequest, String> {
+        if self.on_glass < presentation.epoch {
+            return Err("trusted prompt has not reached the screen".into());
+        }
+        if !self.attention_request_visible(&presentation.request) {
+            return Err("trusted prompt was withdrawn before it was presented".into());
+        }
         let completed = crate::sys::monotonic_time()?;
-        Ok(PresentedRequest { request, completed })
+        Ok(PresentedRequest {
+            request: presentation.request,
+            completed,
+        })
+    }
+
+    /// Withdraw a prompt whose paint did not reach the screen in time, or
+    /// whose attempt ended while it waited: nothing on glass may be taken
+    /// for it. Repainted now, since fbdev has no watchdog to take a deferred
+    /// paint; with a flip in flight the paint is owed as any other. A
+    /// prompt that is no longer the one on screen is left alone.
+    pub(crate) fn abandon_attention_presentation(
+        &mut self,
+        request: &crate::authority::consent::Request,
+    ) {
+        if self.scene.attention_request() == Some(request) {
+            self.scene.discard_attention_request();
+            self.owed_damage = Damage::Whole;
+            if let Err(error) = self.repaint() {
+                eprintln!("td-compositor: withdrawn prompt: {error}");
+            }
+        }
     }
 
     pub(crate) fn attention_request_visible(&self, request: &crate::authority::consent::Request) -> bool {
@@ -2751,6 +3025,13 @@ impl Runtime {
             // focusing repaint settles this debt instead of being followed by
             // a second paint of the identical scene.
             self.defer_repaint();
+        }
+        if cursor_changed {
+            // Logged, not returned: this is the shared input thread, and an
+            // observer that went away is not the reader's failure.
+            if let Err(error) = self.publish_application_cursor() {
+                eprintln!("td-compositor: application cursor: {error}");
+            }
         }
         // Focus follows the mouse, and only on MOTION under three suspensions
         // — DESIGN.md §"KEYBOARD focus FOLLOWS THE POINTER" is the statement
@@ -4638,6 +4919,10 @@ impl Runtime {
             if let Err(error) = self.repaint() {
                 failures.push(error);
             }
+            // Logged: an observer that went away fails nothing it did not ask.
+            if let Err(error) = self.publish_application_cursor() {
+                eprintln!("td-compositor: application cursor: {error}");
+            }
         }
         if failures.is_empty() {
             return Ok(());
@@ -5940,6 +6225,299 @@ mod tests {
             .is_err());
         runtime
             .output_watchdog(Instant::now() + FLIP_DEADLINE + Duration::from_secs(1))
+            .unwrap();
+    }
+
+    /// Under a backend that queues, readiness and cursor evidence wait for
+    /// the completion of the paint that shows them, and are judged against
+    /// what reached the glass rather than what was composed.
+    #[test]
+    fn application_evidence_waits_for_its_frame_to_reach_the_glass() {
+        let (chain, _log) = crate::drm::testing::chain(800, 600);
+        let mut runtime = Runtime::new(chain);
+        let (wake, ready) = mpsc::sync_channel(1);
+        let (cursor_wake, cursor_ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application_with_cursor(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+                cursor_wake,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+        let key = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+        lend_application_resources(&mut runtime, key.client);
+        runtime
+            .set_application_id(key, "org.mozilla.firefox")
+            .unwrap();
+        runtime
+            .apply_commit(key, Some(application_content_surface()), None, None)
+            .unwrap();
+        assert_eq!(
+            ready.try_recv(),
+            Err(TryRecvError::Empty),
+            "readiness was published while its frame was only queued"
+        );
+        let shown = runtime.frame_in_flight().unwrap();
+        runtime.output_event(OutputEvent::Presented(shown)).unwrap();
+        assert_eq!(ready.try_recv().unwrap().content_pixels, [5_000; 2]);
+
+        while let Some(frame) = runtime.frame_in_flight() {
+            runtime.output_event(OutputEvent::Presented(frame)).unwrap();
+        }
+        let cursor = SurfaceKey {
+            client: key.client,
+            object: 31,
+        };
+        // Inside a compound, as every wl_surface.commit is: the repaint is
+        // only owed to the compound, and the evidence must name its paint.
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .set_cursor(
+                cursor.client,
+                Some(CursorRequest {
+                    surface: cursor.object,
+                    hotspot_x: 1,
+                    hotspot_y: 2,
+                }),
+            )
+            .unwrap();
+        runtime
+            .commit_cursor(
+                cursor,
+                Surface::from_shm_pixels(4, 5, vec![9; 4 * 5 * 4], SHM_XRGB8888).unwrap(),
+                (0, 0),
+            )
+            .unwrap();
+        assert_eq!(
+            cursor_ready.try_recv(),
+            Err(TryRecvError::Empty),
+            "cursor evidence named a paint the compound had not made"
+        );
+        runtime.finish_compound_commit().unwrap();
+        assert_eq!(cursor_ready.try_recv(), Err(TryRecvError::Empty));
+        // A paint owed when the cursor's frame lands, as under a client that
+        // animates: the evidence is sent then, not put off to a quiet frame.
+        let drawn = runtime.frame_in_flight().unwrap();
+        // Whole damage flips even an unchanged frame, so the owed paint is
+        // queued rather than answered on the spot.
+        runtime.owed_damage = Damage::Whole;
+        runtime.defer_repaint();
+        runtime.output_event(OutputEvent::Presented(drawn)).unwrap();
+        assert!(runtime.frame_in_flight().is_some());
+        assert_eq!(
+            cursor_ready.try_recv().unwrap(),
+            ApplicationCursorEvidence {
+                app_id: "org.mozilla.firefox".to_string(),
+                width: 4,
+                height: 5,
+            }
+        );
+    }
+
+    /// Readiness whose frame lands while the attention overlay covers the
+    /// window is refused then, and not lost: closing the overlay re-scans the
+    /// candidates, so an idle application that commits nothing more is still
+    /// found ready.
+    #[test]
+    fn readiness_covered_when_its_frame_lands_is_found_when_uncovered() {
+        let (chain, _log) = crate::drm::testing::chain(800, 600);
+        let mut runtime = Runtime::new(chain);
+        let (wake, ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
+            .unwrap();
+        let key = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+        lend_application_resources(&mut runtime, key.client);
+        runtime
+            .set_application_id(key, "org.mozilla.firefox")
+            .unwrap();
+        runtime
+            .apply_commit(key, Some(application_content_surface()), None, None)
+            .unwrap();
+        let origin = crate::input::test_origin();
+        runtime.enable_attention(true);
+        runtime.attention(&origin, true).unwrap();
+        while let Some(frame) = runtime.frame_in_flight() {
+            runtime.output_event(OutputEvent::Presented(frame)).unwrap();
+        }
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+
+        runtime.attention(&origin, false).unwrap();
+        while let Some(frame) = runtime.frame_in_flight() {
+            runtime.output_event(OutputEvent::Presented(frame)).unwrap();
+        }
+        assert_eq!(ready.try_recv().unwrap().content_pixels, [5_000; 2]);
+    }
+
+    fn unlock_request() -> crate::authority::consent::Request {
+        use crate::authority::consent::{Operation, Request, Role};
+        Request::new(
+            [1; 32],
+            1000,
+            Operation::Unlock {
+                role: Role::Primary,
+            },
+        )
+        .unwrap()
+    }
+
+    /// A trusted prompt under a backend that queues is presented only once
+    /// ITS paint is on glass: not at submission, and not at the completion
+    /// of the flip that was already in flight when it was prepared.
+    #[test]
+    fn a_trusted_prompt_waits_for_its_own_frame() {
+        let (chain, _log) = crate::drm::testing::chain(800, 600);
+        let mut runtime = Runtime::new(chain);
+        let origin = crate::input::test_origin();
+        runtime.enable_attention(true);
+        runtime.attention(&origin, true).unwrap();
+        let overlay = runtime.frame_in_flight().unwrap();
+        let request = unlock_request();
+        let presentation = runtime
+            .begin_attention_presentation(&origin, request.clone(), None)
+            .unwrap();
+        assert!(presentation.wait(Instant::now()).is_err());
+
+        runtime.output_event(OutputEvent::Presented(overlay)).unwrap();
+        let prompt = runtime.frame_in_flight().unwrap();
+        assert_ne!(prompt, overlay);
+        assert!(
+            presentation.wait(Instant::now()).is_err(),
+            "the overlay's completion stood in for the prompt's"
+        );
+
+        runtime.output_event(OutputEvent::Presented(prompt)).unwrap();
+        presentation.wait(Instant::now()).unwrap();
+        let receipt = runtime.finish_attention_presentation(presentation).unwrap();
+        assert_eq!(receipt.into_request(), request);
+    }
+
+    /// A prompt withdrawn while its frame is in flight is no receipt, and
+    /// one whose frame never lands is withdrawn when the wait gives up.
+    #[test]
+    fn a_trusted_prompt_that_does_not_land_is_no_receipt() {
+        let (chain, _log) = crate::drm::testing::chain(800, 600);
+        let mut runtime = Runtime::new(chain);
+        let origin = crate::input::test_origin();
+        runtime.enable_attention(true);
+        runtime.attention(&origin, true).unwrap();
+        while let Some(frame) = runtime.frame_in_flight() {
+            runtime.output_event(OutputEvent::Presented(frame)).unwrap();
+        }
+
+        let withdrawn = runtime
+            .begin_attention_presentation(&origin, unlock_request(), None)
+            .unwrap();
+        runtime.drain_attention(&origin).unwrap();
+        while let Some(frame) = runtime.frame_in_flight() {
+            runtime.output_event(OutputEvent::Presented(frame)).unwrap();
+        }
+        withdrawn.wait(Instant::now()).unwrap();
+        assert!(runtime.finish_attention_presentation(withdrawn).is_err());
+
+        runtime.attention(&origin, false).unwrap();
+        runtime.attention(&origin, true).unwrap();
+        while let Some(frame) = runtime.frame_in_flight() {
+            runtime.output_event(OutputEvent::Presented(frame)).unwrap();
+        }
+        let stalled = runtime
+            .begin_attention_presentation(&origin, unlock_request(), None)
+            .unwrap();
+        assert!(runtime.scene.attention_request().is_some());
+        assert!(stalled.wait(Instant::now()).is_err());
+        let request = stalled.request().clone();
+        assert!(
+            runtime.finish_attention_presentation(stalled).is_err(),
+            "a visible prompt whose paint is not on glass was receipted"
+        );
+        runtime.abandon_attention_presentation(&request);
+        assert!(runtime.scene.attention_request().is_none());
+        assert!(runtime.paint_pending());
+    }
+
+    /// A prompt whose paint fails is no presentation, and is withdrawn. One
+    /// whose flip stalls lands by the watchdog's recovery, which reads the
+    /// CRTC back before calling the frame shown, so it is a receipt.
+    #[test]
+    fn a_failed_prompt_is_withdrawn_and_a_recovered_one_lands() {
+        let (chain, log) = crate::drm::testing::chain(800, 600);
+        let mut runtime = Runtime::new(chain);
+        let origin = crate::input::test_origin();
+        runtime.enable_attention(true);
+        runtime.attention(&origin, true).unwrap();
+        while let Some(frame) = runtime.frame_in_flight() {
+            runtime.output_event(OutputEvent::Presented(frame)).unwrap();
+        }
+        log.lock().unwrap().fail_next_flip = true;
+        assert!(runtime
+            .begin_attention_presentation(&origin, unlock_request(), None)
+            .is_err());
+        assert!(runtime.scene.attention_request().is_none());
+        assert!(runtime.paint_pending());
+
+        runtime.attention(&origin, false).unwrap();
+        runtime.attention(&origin, true).unwrap();
+        while let Some(frame) = runtime.frame_in_flight() {
+            runtime.output_event(OutputEvent::Presented(frame)).unwrap();
+        }
+        let request = unlock_request();
+        let presentation = runtime
+            .begin_attention_presentation(&origin, request.clone(), None)
+            .unwrap();
+        assert!(presentation.wait(Instant::now()).is_err());
+        let late = Instant::now() + FLIP_DEADLINE + Duration::from_secs(1);
+        runtime.output_watchdog(late).unwrap();
+        presentation.wait(Instant::now()).unwrap();
+        let receipt = runtime.finish_attention_presentation(presentation).unwrap();
+        assert_eq!(receipt.into_request(), request);
+    }
+
+    /// The wait is made without the runtime lock: a completion delivered
+    /// under that lock on another thread is what releases it.
+    #[test]
+    fn a_prompt_waiter_does_not_hold_the_runtime_lock() {
+        let (chain, _log) = crate::drm::testing::chain(800, 600);
+        let runtime = Arc::new(Mutex::new(Runtime::new(chain)));
+        let origin = crate::input::test_origin();
+        let presentation = {
+            let mut runtime = runtime.lock().unwrap();
+            runtime.enable_attention(true);
+            runtime.attention(&origin, true).unwrap();
+            while let Some(frame) = runtime.frame_in_flight() {
+                runtime.output_event(OutputEvent::Presented(frame)).unwrap();
+            }
+            runtime
+                .begin_attention_presentation(&origin, unlock_request(), None)
+                .unwrap()
+        };
+        let waiter = std::thread::spawn(move || {
+            presentation
+                .wait(Instant::now() + Duration::from_secs(10))
+                .map(|()| presentation)
+        });
+        let prompt = runtime.lock().unwrap().frame_in_flight().unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .output_event(OutputEvent::Presented(prompt))
+            .unwrap();
+        let presentation = waiter.join().unwrap().unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .finish_attention_presentation(presentation)
             .unwrap();
     }
 
@@ -11936,8 +12514,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             crate::output::attributed_rgb_counts(
-                runtime.backend.composed(),
-                &vec![0; runtime.backend.composed().pixels.len()],
+                runtime.backend.completed().unwrap(),
+                &vec![0; runtime.backend.completed().unwrap().pixels.len()],
                 APPLICATION_CONTENT_RGBS,
             ),
             [5_000; 2]
@@ -14200,7 +14778,7 @@ mod tests {
         let background = [0x18, 0x20, 0x28];
         assert_eq!(
             crate::output::surface_rgb_pixel_counts(
-                runtime.backend.composed(),
+                runtime.backend.completed().unwrap(),
                 &mut runtime.comparison,
                 &runtime.scene,
                 key,

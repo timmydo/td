@@ -1502,15 +1502,6 @@ impl<C: ScanoutCrtc + 'static, M: ScanoutMemory + 'static> OutputBackend for Swa
         self.stride
     }
 
-    fn composed(&self) -> FrameView<'_> {
-        FrameView {
-            pixels: &self.frame,
-            width: self.output.dimensions.width,
-            height: self.output.dimensions.height,
-            stride: self.stride,
-        }
-    }
-
     /// The front buffer's shadow, and only while nothing is queued: once a
     /// flip is, the glass holds the front buffer until a vblank and the back
     /// one after it, and which of the two is not known until the completion
@@ -1917,6 +1908,11 @@ pub(crate) mod testing {
         pub fn front_index(&self) -> usize {
             self.front
         }
+
+        /// The frame last rendered, before any copy.
+        pub fn frame(&self) -> &[u8] {
+            &self.frame
+        }
     }
 }
 
@@ -1955,14 +1951,14 @@ mod tests {
         );
         // Every row, including the two the frame left at zero: the 0xee the
         // test allocator left there is gone.
-        assert_eq!(chain.buffer(1), chain.composed().pixels);
+        assert_eq!(chain.buffer(1), chain.frame());
         // Nothing is known to be on glass while the flip is in flight.
         assert!(chain.completed().is_none());
         assert!(chain.present().is_err(), "a second flip was queued over the first");
 
         chain.frame_presented(FrameId::FIRST).unwrap();
         assert_eq!(chain.front_index(), 1);
-        assert_eq!(chain.completed().unwrap().pixels, chain.composed().pixels);
+        assert_eq!(chain.completed().unwrap().pixels, chain.frame());
     }
 
     /// The back buffer is two frames old, so its copy is the rows IT lacks,
@@ -1979,7 +1975,7 @@ mod tests {
         fill(&mut chain, Damage::Unknown, 3, 3..4);
         let second = FrameId::FIRST.next();
         assert_eq!(chain.present().unwrap(), Submission::Queued(second));
-        assert_eq!(chain.buffer(0), chain.composed().pixels);
+        assert_eq!(chain.buffer(0), chain.frame());
         chain.frame_presented(second).unwrap();
         assert_eq!(chain.front_index(), 0);
     }
@@ -2027,7 +2023,7 @@ mod tests {
         chain.recover_stalled_frame(FrameId::FIRST).unwrap();
         assert_eq!(log.lock().unwrap().calls.last(), Some(&CrtcCall::Set { fb_id: 42 }));
         assert_eq!(chain.front_index(), 1);
-        assert_eq!(chain.completed().unwrap().pixels, chain.composed().pixels);
+        assert_eq!(chain.completed().unwrap().pixels, chain.frame());
         // And the late completion the kernel may still send is not the
         // chain's to act on.
         assert!(chain.frame_presented(FrameId::FIRST).is_err());

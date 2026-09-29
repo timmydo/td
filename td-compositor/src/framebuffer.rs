@@ -297,15 +297,6 @@ impl OutputBackend for Framebuffer {
         self.stride
     }
 
-    fn composed(&self) -> FrameView<'_> {
-        FrameView {
-            pixels: &self.frame,
-            width: self.width,
-            height: self.height,
-            stride: self.stride,
-        }
-    }
-
     /// The shadow copy, and only while it is trusted: `resend_all` is set
     /// across every write, so a failed or partial one leaves this `None`
     /// until a later write succeeds.

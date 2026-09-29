@@ -8616,11 +8616,10 @@ The KMS backend has landed behind `run --card`, and completions are
 DELIVERED rather than polled: a thread blocks on a duplicate of the card
 descriptor and hands each one to the runtime, which holds one flip in flight
 and owes any paint requested meanwhile. A watchdog recovers a flip that never
-completes by modeset. One thing that row still does NOT get, recorded because
-assuming otherwise is the expensive mistake: the presentation-dependent
-evidence published on submit — application readiness, and the trusted
-prompt's presentation — has not moved to completion. So the image still
-runs fbdev. The earlier blocker, that a completion could not be matched to
+completes by modeset. Presentation-dependent evidence has moved to
+completion. Application readiness, cursor evidence and the trusted prompt's
+receipt each wait for the paint epoch that shows them to be on glass. The
+earlier blocker, that a completion could not be matched to
 its frame, was removed by the page-flip landing: both `Submission` and
 `OutputEvent` carry a `FrameId`, and it is the `u64` the flip ioctl already
 round-trips through the kernel. `td-compositor/DESIGN.md` carries the design.
