@@ -9,9 +9,10 @@
 //! blocks of 32, 16 and 8 pixels by rate-distortion choice; every intra
 //! mode but CfL, palette and filter-intra; for luma below 32 the best
 //! of the reduced set's four DCT and ADST pairs, for chroma the mode's
-//! default; one transform per plane per block; the multi-symbol
-//! arithmetic coder with adapting CDFs from the defaults; uniform tile
-//! columns by the frame's size alone, which the threads spread over.
+//! default; one transform per plane per block, its levels a dead-zone
+//! quantizer's refined by a trellis; the multi-symbol arithmetic coder
+//! with adapting CDFs from the defaults; uniform tile columns by the
+//! frame's size alone, which the threads spread over.
 //! The deblocking filter is on at a level from the quantizer; CDEF,
 //! restoration, superres, film grain and screen-content tools stay off.
 //! `transform` holds the transforms, quantizers and scans, `cdf` the
@@ -1191,13 +1192,15 @@ struct Scratch {
 }
 
 /// A transform's residual, coefficients and dequantized levels, each
-/// written whole before it is read; empty until the first trial, so the
-/// placeholder `best_leaf` leaves in the tile allocates nothing.
+/// written whole before it is read, and the trellis's magnitudes; empty
+/// until the first trial, so the placeholder `best_leaf` leaves in the
+/// tile allocates nothing.
 #[derive(Default)]
 struct Work {
     residual: Vec<i32>,
     coeffs: Vec<i32>,
     dequant: Vec<i32>,
+    mags: Magnitudes,
 }
 
 /// One plane's quantized levels in the transform's row-major layout,
@@ -1206,6 +1209,61 @@ struct Work {
 struct Levels<'a> {
     levels: &'a [i32],
     eob: usize,
+}
+
+/// One transform's level CDFs, looked up once for its size and plane
+/// type.
+struct LevelCdfs<'a> {
+    base: &'a [Cdf; 42],
+    base_eob: &'a [Cdf; 4],
+    br: &'a [Cdf; 21],
+}
+
+impl LevelCdfs<'_> {
+    /// The rate of a zero short of the end of block in its base
+    /// context, in 1/512 bit.
+    fn zero_rate(&self, base: usize) -> u64 {
+        self.base.get(base).map_or(0, |cdf| u64::from(cdf.cost(0)))
+    }
+
+    /// The rate of a nonzero level, less its sign, in 1/512 bit: its base
+    /// symbol (the end of block's when it is the last), its range symbols
+    /// and its Golomb remainder, as `coefficient_symbols` codes them.
+    fn rate(&self, ctx: LevelCtx, level: u32) -> u64 {
+        let base = level.min(3) as usize;
+        let mut rate = match ctx.eob {
+            Some(eob) => self
+                .base_eob
+                .get(eob)
+                .map_or(0, |cdf| cdf.cost(base.saturating_sub(1))),
+            None => self.base.get(ctx.base).map_or(0, |cdf| cdf.cost(base)),
+        };
+        if level > 2 {
+            let br = self.br.get(ctx.br);
+            let base_range = (level - 3) as usize;
+            for idx in (0..12).step_by(3) {
+                let k = base_range.saturating_sub(idx).min(3);
+                rate += br.map_or(0, |cdf| cdf.cost(k));
+                if k < 3 {
+                    break;
+                }
+            }
+        }
+        if level > 14 {
+            let length = 32 - (level - 14).leading_zeros();
+            rate += 512 * (2 * length - 1);
+        }
+        u64::from(rate)
+    }
+}
+
+/// A level's contexts: its base symbol's, the end of block's in its
+/// place when it is the last, and its range symbols'.
+#[derive(Clone, Copy)]
+struct LevelCtx {
+    eob: Option<usize>,
+    base: usize,
+    br: usize,
 }
 
 /// A coded block: what the symbols say and the levels they carry.
@@ -1319,6 +1377,8 @@ struct Tile {
     /// The band's block sizes, a luma 4x4 each (the log2 of the side),
     /// `width / MI` to a row: what the deblocking filter reads.
     sizes: Vec<u8>,
+    /// `coefficient_symbols`'s magnitudes, kept for their buffer.
+    mags: Magnitudes,
     /// Saved states' context and pixel copies, returned by `restore` and
     /// `recycle`.
     spare_segments: Vec<Vec<u8>>,
@@ -1372,6 +1432,7 @@ impl Tile {
             screen_weight: 16 * (rdmult * 128).isqrt(),
             scratch: Scratch::default(),
             sizes: vec![3; SB_MI * (width / MI)],
+            mags: Magnitudes::default(),
             spare_segments: Vec::new(),
             spare_pixels: Vec::new(),
         }
@@ -1889,6 +1950,7 @@ impl Tile {
         }
         transform::forward(size, tx, residual, coeffs);
         let eob = self.quantize(size, coeffs, &mut out.levels);
+        let eob = self.trellis(plane, at, coeffs, &mut out.levels, eob, &mut work.mags);
         out.eob = eob;
         if eob > 0 {
             self.dequantize(size, &out.levels, dequant);
@@ -2127,6 +2189,192 @@ impl Tile {
         }
     }
 
+    /// The `dc_sign` context of one plane of a block: which way the DC
+    /// signs above and left of it lean.
+    fn dc_sign_ctx(&self, plane: usize, at: At) -> usize {
+        let sub = usize::from(plane > 0);
+        let units = plane_size(at.log2, plane).points() / MI;
+        let x4 = at.mi_col >> sub;
+        let y4 = at.sb_row() >> sub;
+        let max_x4 = (self.mi_cols >> sub).saturating_sub((self.x0 / MI) >> sub);
+        let max_y4 = (self.mi_rows >> sub).saturating_sub(self.band_mi_row >> sub);
+        let (_, above_dc, _, left_dc) = self.contexts.plane(plane);
+        let lean = |category: Option<&u8>| match category {
+            Some(1) => -1,
+            Some(2) => 1,
+            _ => 0,
+        };
+        let mut dc_sign = 0i32;
+        for k in 0..units {
+            if x4 + k < max_x4 {
+                dc_sign += lean(above_dc.get(x4 + k));
+            }
+            if y4 + k < max_y4 {
+                dc_sign += lean(left_dc.get(y4 + k));
+            }
+        }
+        match dc_sign.signum() {
+            -1 => 1,
+            1 => 2,
+            _ => 0,
+        }
+    }
+
+    /// A transform's level CDFs, for its size and plane type.
+    fn level_cdfs(&self, size: Size, ptype: usize) -> Option<LevelCdfs<'_>> {
+        let size_ctx = size.index();
+        Some(LevelCdfs {
+            base: self.cdfs.base.get(size_ctx)?.get(ptype)?,
+            base_eob: self.cdfs.base_eob.get(size_ctx)?.get(ptype)?,
+            br: self.cdfs.br.get(size_ctx.min(3))?.get(ptype)?,
+        })
+    }
+
+    /// The rate of an end of block's symbols, in 1/512 bit: its class,
+    /// the class's first extra bit and the plain bits after it.
+    fn eob_rate(&self, size: Size, ptype: usize, eob: usize) -> u64 {
+        if eob == 0 {
+            return 0;
+        }
+        let (eob_pt, extra_bits) = eob_position(eob);
+        let class = (size.points().ilog2() - 2) as usize;
+        let mut rate = self
+            .cdfs
+            .eob_pt
+            .get(class)
+            .and_then(|row| row.get(ptype))
+            .map_or(0, |cdf| cdf.cost(eob_pt - 1));
+        if extra_bits > 0 {
+            let extra = eob - eob_group_start(eob_pt);
+            let top = (extra >> (extra_bits - 1)) & 1 == 1;
+            rate += self
+                .cdfs
+                .eob_extra
+                .get(size.index())
+                .and_then(|row| row.get(ptype))
+                .and_then(|row| row.get(eob_pt - 3))
+                .map_or(0, |cdf| cdf.cost(usize::from(top)));
+            rate += 512 * (extra_bits as u32 - 1);
+        }
+        u64::from(rate)
+    }
+
+    /// Trellis quantization, libaom's `av1_optimize_txb` in kind: from
+    /// the end of block back, each nonzero level stays or drops by one,
+    /// whichever costs less -- the squared error in the transform domain
+    /// (the coefficients are eight times orthonormal at the dequantizer's
+    /// shift, so 64 of it is a pixel's) and the rate in the context the
+    /// later levels, already final, give it. A last level dropped to zero
+    /// moves the end of block back to the next nonzero one: its end of
+    /// block symbols and the zeros between are priced against the new
+    /// end's. Left out are the next level's change of base symbol and,
+    /// when no level is left, the transform's all-zero and type symbols,
+    /// so a lone level can still zero a transform. Returns the end of
+    /// block.
+    fn trellis(
+        &self,
+        plane: usize,
+        at: At,
+        coeffs: &[i32],
+        levels: &mut [i32],
+        eob: usize,
+        mags: &mut Magnitudes,
+    ) -> usize {
+        if eob == 0 {
+            return 0;
+        }
+        let size = plane_size(at.log2, plane);
+        let n = size.points();
+        mags.fill(levels, n);
+        let (row_shift, col_mask) = (n.ilog2(), n - 1);
+        let ptype = usize::from(plane > 0);
+        // libaom's `plane_rd_mult` for intra, in sixteenths.
+        let mult = if plane > 0 { 13 } else { 17 };
+        let shift = size.dequant_shift();
+        let (dc, ac) = (
+            i64::from(transform::dc_q(self.qindex)),
+            i64::from(transform::ac_q(self.qindex)),
+        );
+        let dc_sign = self
+            .cdfs
+            .dc_sign
+            .get(ptype)
+            .and_then(|r| r.get(self.dc_sign_ctx(plane, at)));
+        let Some(cdfs) = self.level_cdfs(size, ptype) else {
+            return eob;
+        };
+        let scan = size.scan();
+        let mut eob = eob;
+        for c in (0..eob).rev() {
+            let pos = usize::from(scan.get(c).copied().unwrap_or(0));
+            let (Some(&coeff), Some(&level)) = (coeffs.get(pos), levels.get(pos)) else {
+                continue;
+            };
+            let level = level.unsigned_abs();
+            let last = c + 1 == eob;
+            if level == 0 {
+                if last {
+                    eob = c;
+                }
+                continue;
+            }
+            let (row, col) = (pos >> row_shift, pos & col_mask);
+            let ctx = LevelCtx {
+                eob: last.then(|| base_eob_ctx(c, n)),
+                base: mags.base_ctx(row, col),
+                br: mags.br_ctx(row, col),
+            };
+            let sign = if c == 0 {
+                dc_sign.map_or(0, |cdf| u64::from(cdf.cost(usize::from(coeff < 0))))
+            } else {
+                512
+            };
+            let q = if pos == 0 { dc } else { ac };
+            let target = i64::from(coeff.unsigned_abs()) << shift;
+            let (eob_kept, eob_moved) = if last {
+                // The zeros before the next nonzero level are coded only
+                // while this one is.
+                let mut gap = 0;
+                let mut next = 0;
+                for k in (0..c).rev() {
+                    let pos = usize::from(scan.get(k).copied().unwrap_or(0));
+                    if levels.get(pos).is_some_and(|&l| l != 0) {
+                        next = k + 1;
+                        break;
+                    }
+                    gap += cdfs.zero_rate(mags.base_ctx(pos >> row_shift, pos & col_mask));
+                }
+                (
+                    self.eob_rate(size, ptype, c + 1) + gap,
+                    self.eob_rate(size, ptype, next),
+                )
+            } else {
+                (0, 0)
+            };
+            let cost = |l: u32| -> u64 {
+                // The decoder's dequantized level, at the target's scale.
+                let e = target - (((i64::from(l) * q) >> shift) << shift);
+                let rate = match (l, ctx.eob) {
+                    (0, Some(_)) => eob_moved,
+                    (0, None) => cdfs.zero_rate(ctx.base),
+                    _ => cdfs.rate(ctx, l) + sign + eob_kept,
+                };
+                (((e * e) as u64) << 5) + ((rate * self.rdmult * mult) >> 13)
+            };
+            if cost(level - 1) < cost(level) {
+                let lower = (level - 1) as i32;
+                if let Some(slot) = levels.get_mut(pos) {
+                    *slot = if coeff < 0 { -lower } else { lower };
+                }
+                mags.set(row, col, level - 1);
+                if lower == 0 && last {
+                    eob = c;
+                }
+            }
+        }
+        eob
+    }
+
     /// The coefficient symbols of one plane of a block (spec `coeffs`),
     /// from the contexts as they stand.
     fn coefficient_symbols(
@@ -2220,26 +2468,14 @@ impl Tile {
         // Levels in reverse scan order.
         let scan = size.scan();
         let (row_shift, col_mask) = (n.ilog2(), n - 1);
-        let level_at = |row: usize, col: usize| -> i32 {
-            if row >= n || col >= n {
-                return 0;
-            }
-            levels.get(row * n + col).map_or(0, |l| l.abs())
-        };
+        let mut mags = std::mem::take(&mut self.mags);
+        mags.fill(levels, n);
         for c in (0..eob).rev() {
             let pos = usize::from(scan.get(c).copied().unwrap_or(0));
             let (row, col) = (pos >> row_shift, pos & col_mask);
-            let level = level_at(row, col);
+            let level = levels.get(pos).map_or(0, |l| l.abs());
             if c == eob - 1 {
-                let ctx = if c == 0 {
-                    0
-                } else if c <= n * n / 8 {
-                    1
-                } else if c <= n * n / 4 {
-                    2
-                } else {
-                    3
-                };
+                let ctx = base_eob_ctx(c, n);
                 if let Some(cdf) = self
                     .cdfs
                     .base_eob
@@ -2250,23 +2486,7 @@ impl Tile {
                     sink.symbol(cdf, level.min(3) as usize - 1);
                 }
             } else {
-                let ctx = if pos == 0 {
-                    0
-                } else {
-                    let mag = level_at(row, col + 1).min(3)
-                        + level_at(row + 1, col).min(3)
-                        + level_at(row + 1, col + 1).min(3)
-                        + level_at(row, col + 2).min(3)
-                        + level_at(row + 2, col).min(3);
-                    let ctx = ((mag + 1) >> 1).min(4) as usize;
-                    ctx + if row + col < 2 {
-                        1
-                    } else if row + col < 4 {
-                        6
-                    } else {
-                        21
-                    }
-                };
+                let ctx = mags.base_ctx(row, col);
                 if let Some(cdf) = self
                     .cdfs
                     .base
@@ -2278,17 +2498,7 @@ impl Tile {
                 }
             }
             if level > 2 {
-                let mag = level_at(row, col + 1).min(15)
-                    + level_at(row + 1, col).min(15)
-                    + level_at(row + 1, col + 1).min(15);
-                let mag = ((mag + 1) >> 1).min(6) as usize;
-                let ctx = if pos == 0 {
-                    mag
-                } else if row < 2 && col < 2 {
-                    mag + 7
-                } else {
-                    mag + 14
-                };
+                let ctx = mags.br_ctx(row, col);
                 let base_range = (level - 3) as usize;
                 for idx in (0..12).step_by(3) {
                     let k = (base_range - idx).min(3);
@@ -2307,7 +2517,9 @@ impl Tile {
                 }
             }
         }
+        self.mags = mags;
         // Signs and the Golomb remainders in scan order.
+        let dc_sign = self.dc_sign_ctx(plane, at);
         for c in 0..eob {
             let pos = usize::from(scan.get(c).copied().unwrap_or(0));
             let Some(&level) = levels.get(pos) else {
@@ -2318,30 +2530,11 @@ impl Tile {
             }
             let negative = level < 0;
             if c == 0 {
-                let mut dc_sign = 0i32;
-                let lean = |category: Option<&u8>| match category {
-                    Some(1) => -1,
-                    Some(2) => 1,
-                    _ => 0,
-                };
-                for k in 0..units {
-                    if x4 + k < max_x4 {
-                        dc_sign += lean(above_dc.get(x4 + k));
-                    }
-                    if y4 + k < max_y4 {
-                        dc_sign += lean(left_dc.get(y4 + k));
-                    }
-                }
-                let ctx = match dc_sign.signum() {
-                    -1 => 1,
-                    1 => 2,
-                    _ => 0,
-                };
                 if let Some(cdf) = self
                     .cdfs
                     .dc_sign
                     .get_mut(ptype)
-                    .and_then(|r| r.get_mut(ctx))
+                    .and_then(|r| r.get_mut(dc_sign))
                 {
                     sink.symbol(cdf, usize::from(negative));
                 }
@@ -2508,6 +2701,103 @@ fn eob_group_start(t: usize) -> usize {
         1 => 1,
         2 => 2,
         _ => (1 << (t - 2)) + 1,
+    }
+}
+
+// ------------------------------------------------ coefficient contexts
+
+/// A block's level magnitudes (at most 63) row-major at a stride four
+/// wider than the block, with four zero rows under it, so the neighbours
+/// a context sums are always in the buffer: libaom's padded `levels`.
+#[derive(Default)]
+struct Magnitudes {
+    v: Vec<u8>,
+    stride: usize,
+}
+
+impl Magnitudes {
+    /// Fills from a row-major block of side `n`.
+    fn fill(&mut self, levels: &[i32], n: usize) {
+        self.stride = n + 4;
+        self.v.clear();
+        self.v.resize(self.stride * (n + 4), 0);
+        for (row, line) in levels.chunks_exact(n.max(1)).take(n).enumerate() {
+            let start = row * self.stride;
+            if let Some(out) = self.v.get_mut(start..start + n) {
+                for (m, &l) in out.iter_mut().zip(line) {
+                    *m = l.unsigned_abs().min(63) as u8;
+                }
+            }
+        }
+    }
+
+    fn set(&mut self, row: usize, col: usize, level: u32) {
+        if let Some(m) = self.v.get_mut(row * self.stride + col) {
+            *m = level.min(63) as u8;
+        }
+    }
+
+    /// The magnitudes right of and below a position, each capped: the
+    /// two beside it, the diagonal, then the two a step further.
+    fn neighbours(&self, row: usize, col: usize, cap: u8) -> [u8; 5] {
+        let at = row * self.stride + col;
+        let get = |k: usize| self.v.get(at + k).map_or(0, |&m| m.min(cap));
+        [
+            get(1),
+            get(self.stride),
+            get(self.stride + 1),
+            get(2),
+            get(2 * self.stride),
+        ]
+    }
+
+    /// The `coeff_base` context of a position short of the end of block
+    /// (spec `get_coeff_base_ctx`, 2D): the magnitudes right of and below
+    /// it, which the reverse scan has coded, and its distance from DC.
+    fn base_ctx(&self, row: usize, col: usize) -> usize {
+        if row == 0 && col == 0 {
+            return 0;
+        }
+        let mag: u32 = self
+            .neighbours(row, col, 3)
+            .iter()
+            .map(|&m| u32::from(m))
+            .sum();
+        let ctx = ((mag + 1) >> 1).min(4) as usize;
+        ctx + if row + col < 2 {
+            1
+        } else if row + col < 4 {
+            6
+        } else {
+            21
+        }
+    }
+
+    /// The `coeff_br` context of a position (spec `get_br_ctx`, 2D).
+    fn br_ctx(&self, row: usize, col: usize) -> usize {
+        let [right, below, diagonal, _, _] = self.neighbours(row, col, 15);
+        let mag = u32::from(right) + u32::from(below) + u32::from(diagonal);
+        let mag = ((mag + 1) >> 1).min(6) as usize;
+        if row == 0 && col == 0 {
+            mag
+        } else if row < 2 && col < 2 {
+            mag + 7
+        } else {
+            mag + 14
+        }
+    }
+}
+
+/// The `coeff_base_eob` context of the end of block's scan index.
+fn base_eob_ctx(c: usize, n: usize) -> usize {
+    if c == 0 {
+        0
+    } else if c <= n * n / 8 {
+        1
+    } else if c <= n * n / 4 {
+        2
+    } else {
+        3
     }
 }
 
@@ -3359,6 +3649,158 @@ mod tests {
         assert_eq!(mode_tx_type(H_PRED, Size::S16), TxType::DctAdst);
         assert_eq!(mode_tx_type(V_PRED, Size::S32), TxType::DctDct);
         assert_eq!(mode_tx_type(D45_PRED, Size::S4), TxType::DctDct);
+    }
+
+    #[test]
+    fn the_trellis_only_lowers_levels_and_keeps_its_end_of_block() {
+        // Over random coefficients of every size and both plane types,
+        // the trellis leaves each level at the quantizer's or one below it
+        // with the coefficient's sign, drops some, and returns the end of
+        // block its levels have: nonzero before it, zero from it on.
+        let g = Geometry::new(64, 64).unwrap();
+        let tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120);
+        let q = transform::ac_q(120);
+        let mut rng = Lcg(11);
+        let mut mags = Magnitudes::default();
+        let mut dropped = 0;
+        for round in 0..300 {
+            let (log2, plane) = ([3, 4, 5][round % 3], round / 3 % 2);
+            let at = At {
+                mi_row: 0,
+                mi_col: 0,
+                log2,
+            };
+            let size = plane_size(log2, plane);
+            let n = size.points();
+            let coeffs: Vec<i32> = (0..n * n)
+                .map(|_| {
+                    let r = rng.next();
+                    let magnitude = match r % 4 {
+                        0 | 1 => 0,
+                        2 => (r / 4) as i32 % q,
+                        _ => (r / 4) as i32 % (4 * q),
+                    };
+                    if r & 1 << 30 != 0 {
+                        -magnitude
+                    } else {
+                        magnitude
+                    }
+                })
+                .collect();
+            let mut levels = Vec::new();
+            let eob = tile.quantize(size, &coeffs, &mut levels);
+            let quantized = levels.clone();
+            let out = tile.trellis(plane, at, &coeffs, &mut levels, eob, &mut mags);
+            assert!(out <= eob, "round {round}");
+            for (c, &pos) in size.scan().iter().enumerate() {
+                let pos = usize::from(pos);
+                let (was, now) = (quantized[pos], levels[pos]);
+                assert!(
+                    now.abs() <= was.abs() && now.abs() + 1 >= was.abs(),
+                    "round {round}"
+                );
+                assert!(
+                    now == 0 || now.signum() == coeffs[pos].signum(),
+                    "round {round}"
+                );
+                dropped += usize::from(now != was);
+                if c >= out {
+                    assert_eq!(now, 0, "round {round}: a level past the end of block");
+                }
+            }
+            if out > 0 {
+                assert_ne!(
+                    levels[usize::from(size.scan()[out - 1])],
+                    0,
+                    "round {round}"
+                );
+            }
+        }
+        assert!(dropped > 100, "the trellis dropped only {dropped} levels");
+    }
+
+    #[test]
+    fn the_trellis_prices_levels_as_the_coder_codes_them() {
+        // Each level's rate as the trellis prices it, with the end of
+        // block's and the block's own symbols, sums to what the coder
+        // counts for the block, over random levels of every size, both
+        // plane types and levels past the Golomb threshold.
+        let g = Geometry::new(64, 64).unwrap();
+        let mut tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120);
+        let mut rng = Lcg(7);
+        for round in 0..200 {
+            let (log2, plane) = ([3, 4, 5][round % 3], round / 3 % 2);
+            let at = At {
+                mi_row: 0,
+                mi_col: 0,
+                log2,
+            };
+            let size = plane_size(log2, plane);
+            let n = size.points();
+            let eob = 1 + rng.next() as usize % (n * n);
+            let mut levels = vec![0i32; n * n];
+            for &pos in size.scan().iter().take(eob) {
+                let r = rng.next();
+                let magnitude = match r % 8 {
+                    0..=3 => 0,
+                    4 | 5 => 1 + r / 8 % 2,
+                    6 => 3 + r / 8 % 12,
+                    _ => 15 + r / 8 % 300,
+                } as i32;
+                levels[usize::from(pos)] = if r & 1 << 20 != 0 {
+                    -magnitude
+                } else {
+                    magnitude
+                };
+            }
+            let last = usize::from(size.scan()[eob - 1]);
+            if levels[last] == 0 {
+                levels[last] = 1;
+            }
+            let mut counter = Counter(0);
+            let coded = Levels {
+                levels: &levels,
+                eob,
+            };
+            tile.coefficient_symbols(&mut counter, plane, at, DC_PRED, TxType::DctDct, coded);
+            let ptype = usize::from(plane > 0);
+            let skip_ctx = if plane == 0 { 0 } else { 7 };
+            let mut model = u64::from(tile.cdfs.txb_skip[size.index()][skip_ctx].cost(0));
+            if plane == 0 && size != Size::S32 {
+                let tx = &tile.cdfs.tx_type[size.index()][usize::from(DC_PRED)];
+                model += u64::from(tx.cost(TxType::DctDct.symbol()));
+            }
+            model += tile.eob_rate(size, ptype, eob);
+            let dc_ctx = tile.dc_sign_ctx(plane, at);
+            let mut mags = Magnitudes::default();
+            mags.fill(&levels, n);
+            for c in 0..eob {
+                let pos = usize::from(size.scan()[c]);
+                let (row, col) = (pos / n, pos % n);
+                let level = levels[pos].unsigned_abs();
+                let ctx = LevelCtx {
+                    eob: (c + 1 == eob).then(|| base_eob_ctx(c, n)),
+                    base: mags.base_ctx(row, col),
+                    br: mags.br_ctx(row, col),
+                };
+                if level == 0 {
+                    let base = &tile.cdfs.base[size.index()][ptype][ctx.base];
+                    model += u64::from(base.cost(0));
+                    continue;
+                }
+                model += tile.level_cdfs(size, ptype).unwrap().rate(ctx, level);
+                model += if c == 0 {
+                    let negative = usize::from(levels[pos] < 0);
+                    u64::from(tile.cdfs.dc_sign[ptype][dc_ctx].cost(negative))
+                } else {
+                    512
+                };
+            }
+            assert_eq!(
+                model, counter.0,
+                "round {round}: {size:?} plane {plane} eob {eob}"
+            );
+        }
     }
 
     #[test]

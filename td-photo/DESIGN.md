@@ -1262,11 +1262,16 @@ chroma-from-luma, deblocking but no CDEF, restoration, superres or
 film grain, and the symbol adaptation the spec runs by default. The quality
 maps to `qindex` as `255 - ((q - 1) * 254 + 49) / 99`, the dead-zone
 quantiser rounds the DC at half a step and each AC at three eighths,
-and a block's mode is chosen by rate-distortion (`(16 D << 7) +
-(R * rdmult) >> 9`, `rdmult` from the DC step as libaom sets it and
-`D` the squared error, sixteen times it the scale libaom's distortion
-and `rdmult` share, the rate the coder's own cost of its symbols under
-the tile's live probabilities): the modes are
+a trellis then walks each transform's levels from the end of block
+back (libaom's `av1_optimize_txb` in kind) keeping each or dropping it
+by one, by its squared error in the transform domain and its rate in
+the context the later levels give it, the end of block's symbols and
+the zeros it moves over counted and libaom's intra plane multipliers
+(17/16 luma, 13/16 chroma) on the rate, and a block's mode is chosen by
+rate-distortion (`(16 D << 7) + (R * rdmult) >> 9`, `rdmult` from the DC
+step as libaom sets it and `D` the squared error, sixteen times it the
+scale libaom's distortion and `rdmult` share, the rate the coder's own
+cost of its symbols under the tile's live probabilities): the modes are
 screened by the 4x4 Hadamard SATD of their predictions plus their mode
 symbols' rate under sixteen times the root of the multiplier, the best
 three (two for chroma, one mode for both planes) coded in full and
@@ -1310,15 +1315,17 @@ block's prediction edges are read once per plane and every mode is
 predicted from them into the tile's scratch, which also holds the
 transform's working blocks and each plane's trial and best coding and
 only grows, so a block allocates only the levels its leaf keeps. A
-24-megapixel export takes under twenty seconds on one thread and a few
-on eight (`tests/av1.rs`'s `bench`). Against libaom's all-intra speed 6
-on a real 2048-pixel photo the encoder needs about 2% more bits for the
-same PSNR from 0.3 to 3 bits a pixel and about 10% below that; the
-compression follow-ups, by what libaom's tools measured there, are more
-modes coded in full, trellis quantisation, a skip test under a chroma
-weight (zeroing chroma saves luma bits but costs RGB fidelity),
-rectangular partitions and transforms, CDEF (most at low rates), angle
-deltas and chroma-from-luma.
+24-megapixel export takes about twenty-two seconds on one thread and a
+few on eight (`tests/av1.rs`'s `bench`). Against libaom's all-intra speed 6
+on a real 2048-pixel photo the encoder needs under 1% more bits for the
+same PSNR from 0.3 to 3 bits a pixel and about 8% below that; the
+compression follow-ups, by what libaom's tools measured there, are
+chroma-from-luma, rectangular partitions and transforms, CDEF (most at
+low rates) and angle deltas. Measured before the trellis priced the
+zeros an end of block passes over: zeroing a transform's few levels
+outright bought luma about 2% but cost RGB 3% at low rates, a chroma
+weight trading one for the other, and coding more luma modes in full
+bought under 1% on luma for half again the time.
 
 The AVIF (`avif::file`) is the least HEIF file the format asks for and
 every reader expects: `ftyp` with the `avif` brand and `mif1`, `miaf`
@@ -1873,7 +1880,10 @@ their ends; the coder's unit tests round-trip symbols and bits through a
 transcription of the spec's decoder, pin the adaptation, the bit writer,
 `leb128` and the OBU framing, the trailing-bit rule (spec 8.2.4, which
 libaom's decoder enforces), the end-of-block classes and the predictors
-by value; `avif`'s hold every box to its bytes.
+by value, and hold the trellis's prices to what the coder counts for
+random blocks of every size and its levels to the quantizer's or one
+below with an end of block that matches them; `avif`'s hold every box
+to its bytes.
 
 `tests/nef.rs`'s third command case runs `export` with `--long-edge`,
 `--quality` and `--format` over a temporary roll (the export shrunk with
