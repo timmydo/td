@@ -18,8 +18,139 @@ pub mod settings;
 pub mod welcome;
 pub mod window;
 
-use td_ui::raster::{Raster, Scale, Surface};
+use td_install::installation_plan::{Destination, DestinationObservation, Plan, Settings};
+use td_ui::raster::{Composition, Primitive, Raster, Scale, Surface};
 use welcome::Welcome;
+
+/// Paint every installer view using bounded, synthetic data. This checks that
+/// the realized target binary can execute the rendering paths; it supplies
+/// no service state, consent, or installation authority.
+pub fn render_check() -> Result<(), String> {
+    let font = td_ui::font::pinned()?;
+    let surface = Surface::new(800, 600, Scale::new(1).map_err(|e| format!("{e:?}"))?)
+        .map_err(|e| format!("{e:?}"))?;
+    let mut pixels = vec![0u8; surface.width * surface.height * 4];
+    let mut paint = |page: &dyn Composition| -> Result<(), String> {
+        let mut missing = None;
+        let mut glyphs = 0usize;
+        page.emit(surface.bounds(), &mut |draw| {
+            if let Primitive::Glyph { scalar, .. } = draw.primitive {
+                glyphs += 1;
+                if missing.is_none() && !font.covers(scalar) {
+                    missing = Some(scalar);
+                }
+            }
+        });
+        if let Some(scalar) = missing {
+            return Err(format!(
+                "page uses missing font glyph U+{:04X}",
+                scalar as u32
+            ));
+        }
+        if glyphs == 0 {
+            return Err("page emitted no text".into());
+        }
+        pixels.fill(0);
+        Raster::new(&mut pixels, &font, surface, surface.width * 4)
+            .map_err(|e| format!("{e:?}"))?
+            .paint(page, surface.bounds())
+            .map_err(|e| format!("{e:?}"))
+    };
+
+    paint(&Welcome::new(surface).ok_or("welcome page did not fit")?)?;
+    let disk = Destination::new(DestinationObservation {
+        name: "vda",
+        major: 254,
+        minor: 0,
+        sequence: 7,
+        capacity: 16_000_000_000,
+        sector: 512,
+        removable: false,
+        model: Some("Synthetic disk; no device is opened"),
+        serial: Some(&"S".repeat(256)),
+        wwid: Some(&"W".repeat(256)),
+    })?;
+    let disks = [disk.clone()];
+    paint(
+        &destination::DestinationPage::new(surface, &[], None, 0)
+            .ok_or("empty destination page did not fit")?,
+    )?;
+    paint(
+        &destination::DestinationPage::new(surface, &disks, None, 0)
+            .ok_or("unselected destination page did not fit")?,
+    )?;
+    let destination = destination::DestinationPage::new(surface, &disks, Some(0), 0)
+        .ok_or("destination page did not fit")?;
+    paint(&destination)?;
+    let (_, detail_pages) = destination.detail_position();
+    for index in 1..detail_pages {
+        paint(
+            &destination::DestinationPage::new(surface, &disks, Some(0), index)
+                .ok_or("destination detail page did not fit")?,
+        )?;
+    }
+    paint(
+        &settings::SettingsPage::new(
+            surface,
+            ["alice", "tdhost", "us", "Etc/UTC"],
+            Some(0),
+            [5, 6],
+            true,
+        )
+        .ok_or("settings page did not fit")?,
+    )?;
+    paint(
+        &settings::SettingsPage::new(surface, ["", "", "", ""], Some(2), [0, 0], true)
+            .ok_or("draft settings page did not fit")?,
+    )?;
+    let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC")?;
+    let uuid = [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 0];
+    let plan = Plan::new([1; 32], disk, [2; 32], uuid, settings)?;
+    let review = review::ReviewPage::new(surface, &plan, 0).ok_or("review page did not fit")?;
+    paint(&review)?;
+    let (_, review_pages) = review.position();
+    for index in 1..review_pages {
+        paint(
+            &review::ReviewPage::new(surface, &plan, index)
+                .ok_or("review detail page did not fit")?,
+        )?;
+    }
+    for phase in [
+        outcome::Phase::PreparingDisk,
+        outcome::Phase::WritingFilesystems,
+        outcome::Phase::PublishingDeployment,
+        outcome::Phase::ApplyingSettings,
+        outcome::Phase::VerifyingBoot,
+    ] {
+        paint(
+            &outcome::ProgressPage::new(surface, outcome::Progress::Running(phase))
+                .ok_or("progress page did not fit")?,
+        )?;
+    }
+    for failure in [
+        outcome::Failure::DestinationChanged,
+        outcome::Failure::InsufficientSpace,
+        outcome::Failure::WriteFailed,
+        outcome::Failure::VerificationFailed,
+        outcome::Failure::SettingsFailed,
+    ] {
+        paint(
+            &outcome::ProgressPage::new(surface, outcome::Progress::Failed(failure))
+                .ok_or("failure page did not fit")?,
+        )?;
+    }
+    paint(
+        &outcome::ProgressPage::new(surface, outcome::Progress::Unknown)
+            .ok_or("unknown outcome page did not fit")?,
+    )?;
+    paint(&outcome::CompletionPage::new(surface).ok_or("completion page did not fit")?)
+}
+
+#[cfg(test)]
+#[test]
+fn all_installer_pages_paint_with_the_pinned_font() -> Result<(), String> {
+    render_check()
+}
 
 /// Renders the welcome page to a tight XRGB buffer, `width` by `height` at
 /// `scale`, for a still-image preview. The surface must be large enough to

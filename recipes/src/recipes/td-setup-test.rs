@@ -2,7 +2,7 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 /// Check the realized target binary before it is admitted to a live image.
 /// The host native-compositor suite covers the actual welcome window; here
-/// the target tool must link statically, render a frame and run its text modes.
+/// the target tool must link statically, render every page and run its text modes.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-setup}/bin/td-setup";
     Recipe::mesboot("td-setup-test", "1.0")
@@ -22,7 +22,7 @@ pub fn recipe() -> Recipe {
             Step::WriteFile {
                 path: "{out}/result".into(),
                 content:
-                    "PASS: source-built static td-setup rendered a frame and executed text modes\n"
+                    "PASS: source-built static td-setup rendered all pages and executed text modes\n"
                         .into(),
                 exec: false,
             },
@@ -57,7 +57,7 @@ mod tests {
             .unwrap();
         let result = steps
             .iter()
-            .position(|step| matches!(step, Step::WriteFile { path, content, .. } if path == "{out}/result" && content.contains("rendered a frame")))
+            .position(|step| matches!(step, Step::WriteFile { path, content, .. } if path == "{out}/result" && content.contains("rendered all pages")))
             .unwrap();
         for flag in ["--help", "--font-license", "--render-check"] {
             let run = steps

@@ -79,6 +79,12 @@ fn source_inventory_and_toolkit_access_are_closed() {
         let text = std::fs::read_to_string(root.join("src").join(name)).unwrap();
         let allowed = if matches!(name, "destination.rs" | "review.rs") {
             text.replace("td_install::installation_plan::", "")
+        } else if name == "lib.rs" {
+            text.replacen(
+                "use td_install::installation_plan::{Destination, DestinationObservation, Plan, Settings};",
+                "",
+                1,
+            )
         } else {
             text.clone()
         };

@@ -57,8 +57,10 @@ The `td-setup` front end has a source-built static target recipe
 and `td-setup-test` realized-output check. The recipe stages its own tree
 with `td-install`, `td-ui` and the compositor sources that the toolkit
 mounts, then builds with the target Rust toolchain. The check runs
-`--help`, `--font-license` and a headless render of the full welcome
-frame without emitting its image bytes.
+`--help`, `--font-license` and a headless render of every page type at the
+reference size, including all destination and review detail pages and every
+progress outcome, without emitting image bytes. Its data is synthetic and
+grants no authority.
 This establishes an image-eligible executable whose window presents only
 the welcome page. Its library also has pure, unconnected destination,
 settings, review, progress and completion views. The release live profile
