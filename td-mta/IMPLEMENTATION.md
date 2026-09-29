@@ -437,9 +437,13 @@ Split at these concrete boundaries before dependent milestones start:
     handler/reference failures, exhausted descriptors/text, and the unchanged
     caller-held prior candidate. Named concurrent state representations fit
     36 KiB beside the 28 KiB stream region; no new allocation is introduced.
-  - **M04b2c3d4b:** qualify complete loader stack use on the pinned musl
-    target, including compiler temporaries, nested helper/reader frames and
-    initialization moves. Preserve the 36 KiB workspace and existing 256 KiB
+  - **M04b2c3d4b:** implemented point-in-time integration qualification
+    on the pinned release musl target, including initialization, nested
+    helper/fixture-reader frames, failure/reuse, near-maximum pending text and full table cases.
+    CONFIG.md defines the checked non-growing guarded stack ceiling. Later
+    compiled instances, adapters/providers/finalization must be qualified.
+    Ordinary host gates exercise fixture behavior but not the target ceiling.
+    Preserve the 36 KiB workspace and existing 256 KiB
     control-worker stack reservations, including 80 KiB for later borrowed
     identity views. M03 provides the portable toolchain. Object-layout guards
     alone are not peak-stack proof. All combined snapshot/scratch proofs

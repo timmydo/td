@@ -4,8 +4,9 @@
 
 This document specifies the complete v1 operator schema to implement in
 M04b2c3. Typed statement dispatch closes structural references, and the
-owned whole-reader loader requires actual EOF. A runnable service and target
-stack qualification remain unimplemented. CONFIG.md owns physical syntax,
+owned whole-reader loader requires actual EOF. CONFIG.md specifies its
+portable structural-loader stack qualification. A runnable service remains
+unimplemented. CONFIG.md owns physical syntax,
 resource fields, local routing and stream completion. API.md owns visible identity encoding. This document owns
 the remaining fields, cross-references and candidate construction. Protected
 file loading and redacted effective output remain M04b3/M05; M19 owns
@@ -503,11 +504,11 @@ must have a size/capacity check before use. The persistent representation uses
 private checked text references and indices, not a self-referential owning
 Rust object. Temporary borrowed identity/address arrays live in an 80 KiB
 reservation within the existing 256 KiB control-worker stack, outside the
-snapshot owner. Their measured current host layouts total 72704 bytes; target
-size checks remain mandatory. This leaves 176 KiB for all other control-worker
+snapshot owner. Their current x86-64 layouts total 72704 bytes; a production
+compile-time guard enforces the 80 KiB ceiling on each target. This leaves 176 KiB for all other control-worker
 call frames, initialization copies and provider stack use. Do not place
-another full view array on that stack. M04b3/M07/M23 must verify peak stack
-usage before enabling this path. Stack arrays borrow the snapshot only within
+another full view array on that stack. M04b3/M05/M07/M19 must qualify each new compiled
+path before enabling it; M23 retains whole-process RSS qualification. Stack arrays borrow the snapshot only within
 finalization, do not escape, and are dropped before moving/publishing the
 owning snapshot. No typed reinterpretation of byte arenas, self-reference or
 extra allocation is required.
@@ -581,8 +582,8 @@ root-path variants. Decoded protected-file contents are loaded later into
 the candidate's text/material budgets, never into this pending
 operator-stanza buffer. M04b2c3d4a guards the named
 pending/builder/header/global representations against the combined 36 KiB
-ceiling. M04b2c3d4b still owns compiler temporary and peak call-frame
-qualification. This partition does not increase the existing 64 KiB parser
+ceiling. M04b2c3d4b exercises compiler temporaries and nested call frames under
+CONFIG.md's checked portable stack ceiling. This partition does not increase the existing 64 KiB parser
 scratch reservation.
 
 Retain only one alias label (at most 254 bytes) until its account field is
@@ -598,8 +599,8 @@ against the existing 36 KiB workspace. This includes inline globals/plans
 and counts build/completed representations together. The 28 KiB stream
 region retains the rest of the 64 KiB parser reservation. These
 object-layout bounds do not measure compiler temporaries or nested call
-frames. M04b2c3d4b must qualify peak stack use with the pinned musl target
-before M04b3/M19 consumption.
+frames. M04b2c3d4b adds the pinned musl stack-ceiling fixture described in
+CONFIG.md. M04b3/M05/M07/M19 retain qualification of their added paths.
 
 `config::load::read` implements the public whole-loader entry point. It owns
 the candidate and stream operation as one call. Its private Loaded wrapper

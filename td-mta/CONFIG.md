@@ -7,8 +7,8 @@ This document owns configuration syntax and its bounded parsing helpers.
 drives a trusted reader through EOF. The resource stanza schema below
 additionally builds checked resource plans. [SCHEMA.md](SCHEMA.md) specifies
 the complete operator schema and snapshot partitions. `config::load::read`
-owns whole-reader structural loading. Target stack qualification, protected
-file access, effective output and CLI remain M04b2c3d4b/M04b3/M05/M19 work
+owns whole-reader structural loading, with the portable stack qualification
+below. Protected file access, effective output and CLI remain M04b3/M05/M19 work
 as assigned in IMPLEMENTATION.md.
 A syntactically accepted statement is not a valid service configuration.
 DESIGN.md §6 owns the administration contract; RESOURCES.md owns the aggregate
@@ -1382,5 +1382,56 @@ including inline global settings and resource plans. The separate stream
 scratch remains 28 KiB within the existing 64 KiB parser reservation. This is
 an object-layout guard, not compiler peak-stack evidence: parameter moves,
 initialization temporaries, nested helper frames, trusted reader frames and
-provider stack use still require target qualification. M04b2c3d4b owns that
-measurement before protected finalization or service integration.
+provider stack use need separate execution evidence. M04b2c3d4b supplies
+the structural-loader check below; later protected/provider paths must
+qualify their additional frames before service integration.
+
+
+### Portable structural-loader stack qualification
+
+`tests/config_stack.rs` exercises the production library as an integration test.
+Generic loader/dispatcher/stream functions are compiled in that test crate,
+with its fixture readers and inlining decisions. The installed executable
+has no service caller yet; this is evidence for the test compilation only.
+The portable command in td-crypto/PORTABLE.md builds it with the same pinned
+release musl compiler, target, frame-pointer flags and Cargo graph as the
+installed binary. Its qualification case is ignored by ordinary host tests;
+it refuses non-release or non-x86-64-musl execution. The portable runtime
+selects that exact case in its own process with a 30-second deadline and
+requires exactly `1 passed; 0 failed`. A nonignored host case runs the same
+eight scenario bodies on the ordinary harness stack to catch fixture drift;
+it makes no target stack claim.
+
+The case requests a 160 KiB worker stack, allowing for musl's additional
+mapping overhead. Before loading, a bounded 1 MiB read of `/proc/self/smaps`
+locates a live local's writable private mapping. Its whole extent must be at
+most 176 KiB, with an adjacent lower no-access guard of at least 4 KiB and
+without the `gd` grow-down flag. Failure to establish that evidence fails
+qualification. A host unit case checks rejection of oversized/growing regions,
+missing flags and missing, short or noncontiguous guards. No unsafe stack
+inspection or custom allocator is introduced. The runner shows successful
+captured output and relays `config_stack_mapping_bytes` into the invoking
+build log; the artifact receipt does not retain this runtime measurement.
+
+On that worker, the fixture constructs storage and Pending, then exercises
+fragmented and final-line loading, EOF, late I/O/syntax/schema/reference
+refusals, old/replacement coexistence, returned-storage reuse, short scratch,
+and descriptor/text exhaustion. Maximum identity/path fields, a permuted full
+alias table and full domain table, gateway/MTA-STS/resource stanzas,
+ACME/HTTP-01, loopback listeners, logging and identity addresses exercise the
+larger and alternative structural paths. A production compile-time guard requires the borrowed Identity/Address layouts
+to fit the separate 80 KiB reservation on every compiled target. Existing
+compiled 36 KiB workspace guards remain in force.
+
+This establishes a point-in-time executable stack ceiling for these
+test-compiled loader paths on the qualified artifact, not an exact high-water measurement or a
+whole-process RSS bound. Fixture construction and mapping inspection allocate;
+this is not the service allocation test. The reader is an injected bounded
+slice reader. M04b3/M05/M07/M19 must requalify protected finalization, real reader
+adapters, providers and runtime integration with the same total reservations.
+Compiler/profile/target or loader-path changes require a manual rerun of this
+portable check; ordinary `ready` does not enforce it. Every new compiled
+instance of `read`/`build_stanzas` needs qualification, even when using the
+same reader type. Five scenario bodies intentionally repeat the loader unit
+cases to exercise an external compilation; changes to their coverage must
+update both suites.

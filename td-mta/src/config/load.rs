@@ -51,8 +51,8 @@ pub fn read<R: io::Read + ?Sized>(
         .map(|candidate| Loaded { candidate })
 }
 
-// Named owned/borrowed state only; compiler temporaries and peak call frames
-// still require target stack qualification before service integration.
+// Named state only; tests/config_stack.rs separately qualifies the portable
+// structural-loader stack. Future adapters/providers must qualify their frames.
 const WORKSPACE_STATE_BYTES: usize = std::mem::size_of::<Pending>()
     + std::mem::size_of::<dispatch::Builder<'static, 'static>>()
     + std::mem::size_of::<dispatch::Parsed<'static>>()
@@ -63,6 +63,14 @@ const WORKSPACE_STATE_BYTES: usize = std::mem::size_of::<Pending>()
     + std::mem::size_of::<super::syntax::Statement<'static>>();
 const _: [(); 1] = [(); (WORKSPACE_STATE_BYTES <= 36 * 1024) as usize];
 const _: [(); 1] = [(); (stream::SCRATCH_BYTES + 36 * 1024 <= 64 * 1024) as usize];
+
+// The later finalizer borrows these views outside the loader workspace.
+const BORROWED_VIEW_BYTES: usize = super::identity::MAX_IDENTITIES
+    * std::mem::size_of::<super::identity::Identity<'static>>()
+    + 2 * super::identity::MAX_IDENTITIES
+        * super::identity::MAX_ADDRESSES
+        * std::mem::size_of::<super::identity::Address<'static>>();
+const _: [(); 1] = [(); (BORROWED_VIEW_BYTES <= 80 * 1024) as usize];
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]

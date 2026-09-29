@@ -193,7 +193,26 @@ pub(crate) fn artifact_json(line: &str) -> Result<td_engine::json::Json> {
     td_engine::json::parse(line).map_err(|e| format!("Cargo artifact JSON: {e}"))
 }
 
-fn artifact_path(message: &str, package: &str, test: bool) -> Result<PathBuf> {
+#[derive(Clone, Copy)]
+enum ArtifactKind {
+    Installed,
+    LibraryTest,
+    IntegrationTest,
+}
+impl ArtifactKind {
+    fn target(self) -> &'static str {
+        match self {
+            Self::Installed => "bin",
+            Self::LibraryTest => "lib",
+            Self::IntegrationTest => "test",
+        }
+    }
+    fn test(self) -> bool {
+        !matches!(self, Self::Installed)
+    }
+}
+
+fn artifact_path(message: &str, package: &str, expected: ArtifactKind) -> Result<PathBuf> {
     let mut executable = None;
     for line in message.lines() {
         let value = artifact_json(line)?;
@@ -204,11 +223,11 @@ fn artifact_path(message: &str, package: &str, test: bool) -> Result<PathBuf> {
         if target.get("name").and_then(|v| v.as_str()) != Some(package) {
             continue;
         }
-        let expected_kind = if test { "lib" } else { "bin" };
+        let expected_kind = expected.target();
         let kind = target.get("kind").and_then(|v| v.as_arr());
         let profile_test = value.get("profile").and_then(|v| v.get("test"));
         if !matches!(kind, Some([v]) if v.as_str() == Some(expected_kind))
-            || profile_test != Some(&td_engine::json::Json::Bool(test))
+            || profile_test != Some(&td_engine::json::Json::Bool(expected.test()))
         {
             return Err(format!("unexpected artifact kind/profile for {package}"));
         }
@@ -222,9 +241,9 @@ fn artifact_path(message: &str, package: &str, test: bool) -> Result<PathBuf> {
     executable.ok_or_else(|| format!("no executable for {package}"))
 }
 
-fn executable(message: &str, package: &str, test: bool) -> Result<PathBuf> {
+fn executable(message: &str, package: &str, kind: ArtifactKind) -> Result<PathBuf> {
     let actual = confined_path(
-        &artifact_path(message, package, test)?,
+        &artifact_path(message, package, kind)?,
         Path::new("/output/target"),
     )?;
     qualify_binary(&actual)?;
@@ -320,7 +339,7 @@ pub(crate) fn build_inner() -> Result<()> {
     ]);
     command_record(&command, "mail-build", &mut receipt)?;
     let output = bounded_output(&mut command, "mail-build", 8 * 1024 * 1024, 1200)?;
-    let mail = executable(&output, "td-mta", false)?;
+    let mail = executable(&output, "td-mta", ArtifactKind::Installed)?;
     let mut command = cargo("test", "td-crypto");
     command.args([
         "--release",
@@ -330,11 +349,23 @@ pub(crate) fn build_inner() -> Result<()> {
     ]);
     command_record(&command, "crypto-build", &mut receipt)?;
     let output = bounded_output(&mut command, "crypto-build", 8 * 1024 * 1024, 1200)?;
-    let crypto = executable(&output, "td_crypto", true)?;
+    let crypto = executable(&output, "td_crypto", ArtifactKind::LibraryTest)?;
+    let mut command = cargo("test", "td-mta");
+    command.args([
+        "--release",
+        "--test",
+        "config_stack",
+        "--no-run",
+        "--message-format=json-render-diagnostics",
+    ]);
+    command_record(&command, "config-stack-build", &mut receipt)?;
+    let output = bounded_output(&mut command, "config-stack-build", 8 * 1024 * 1024, 1200)?;
+    let config = executable(&output, "config_stack", ArtifactKind::IntegrationTest)?;
     refuse_decoy(Path::new("/output"))?;
     fs::create_dir("/output/artifacts").map_err(|e| format!("portable artifacts: {e}"))?;
     copy_binary(&mail, Path::new("/output/artifacts/td-mta"))?;
     copy_binary(&crypto, Path::new("/output/artifacts/td-crypto-smoke"))?;
+    copy_binary(&config, Path::new("/output/artifacts/td-mta-config-smoke"))?;
     crate::crypto_api::qualify(&mut receipt)?;
     refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
@@ -383,7 +414,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
         }
         names.insert(entry.file_name());
     }
-    let expected = ["COMMANDS", "td-mta", "td-crypto-smoke"]
+    let expected = ["COMMANDS", "td-mta", "td-crypto-smoke", "td-mta-config-smoke"]
         .map(std::ffi::OsString::from)
         .into_iter()
         .collect();
@@ -392,7 +423,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
     }
     let receipt = read_output(&source.join("COMMANDS"), "commands", 64 * 1024)?;
     fs::create_dir(destination).map_err(|e| format!("create private artifact directory: {e}"))?;
-    for name in ["td-mta", "td-crypto-smoke"] {
+    for name in ["td-mta", "td-crypto-smoke", "td-mta-config-smoke"] {
         copy_binary(&source.join(name), &destination.join(name))?;
     }
     Ok(receipt)
@@ -524,8 +555,21 @@ fn enter(
     Ok(())
 }
 
+fn stack_evidence(output: &str) -> Result<usize> {
+    let mut values = output.lines().filter_map(|line| line.strip_prefix("config_stack_mapping_bytes="));
+    let value = values.next().ok_or("portable stack measurement is missing")?;
+    if values.next().is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("portable stack measurement is ambiguous or malformed".into());
+    }
+    let bytes = value.parse::<usize>().map_err(|_| "portable stack measurement overflows")?;
+    if bytes == 0 || bytes > 176 * 1024 {
+        return Err("portable stack measurement exceeds its ceiling".into());
+    }
+    Ok(bytes)
+}
+
 pub(crate) fn runtime_inner() -> Result<()> {
-    require_namespace(&["/artifacts/td-mta", "/artifacts/td-crypto-smoke", "/output"])?;
+    require_namespace(&["/artifacts/td-mta", "/artifacts/td-crypto-smoke", "/artifacts/td-mta-config-smoke", "/output"])?;
     let mut command = Command::new("/artifacts/td-mta");
     command.arg("--version").env_clear().stdin(Stdio::null());
     crate::host_bin::arm_check_child(&mut command);
@@ -533,28 +577,32 @@ pub(crate) fn runtime_inner() -> Result<()> {
     if version != "td-mta 0.1.0\n" {
         return Err("portable binary returned an unexpected version".into());
     }
-    for (index, case) in [
-        "tests::admitted_native_backend_sha256_smoke",
-        "tests::explicit_aws_provider_and_roots_construct_without_global_default",
-        "tls_smoke::tls12_local_round_trip",
-        "tls_smoke::tls13_local_round_trip",
-        "tls_smoke::rejects_wrong_server_name",
-        "tls_smoke::rejects_untrusted_chain",
-        "tls_smoke::rejects_expired_certificate",
-        "tls_smoke::rejects_malformed_record",
-        "tls_smoke::rejects_bad_certificate_signature",
-        "tls_smoke::rejects_tampered_ciphertext",
+    for (index, (binary, case, ignored)) in [
+        ("td-crypto-smoke", "tests::admitted_native_backend_sha256_smoke", false),
+        ("td-crypto-smoke", "tests::explicit_aws_provider_and_roots_construct_without_global_default", false),
+        ("td-crypto-smoke", "tls_smoke::tls12_local_round_trip", false),
+        ("td-crypto-smoke", "tls_smoke::tls13_local_round_trip", false),
+        ("td-crypto-smoke", "tls_smoke::rejects_wrong_server_name", false),
+        ("td-crypto-smoke", "tls_smoke::rejects_untrusted_chain", false),
+        ("td-crypto-smoke", "tls_smoke::rejects_expired_certificate", false),
+        ("td-crypto-smoke", "tls_smoke::rejects_malformed_record", false),
+        ("td-crypto-smoke", "tls_smoke::rejects_bad_certificate_signature", false),
+        ("td-crypto-smoke", "tls_smoke::rejects_tampered_ciphertext", false),
+        ("td-mta-config-smoke", "portable_loader_stack", true),
     ]
     .iter()
     .enumerate()
     {
-        let mut command = Command::new("/artifacts/td-crypto-smoke");
+        let mut command = Command::new(format!("/artifacts/{binary}"));
         command
-            .args(["--exact", case, "--test-threads=1"])
+            .args(["--exact", *case, "--test-threads=1"])
             .env_clear()
             .stdin(Stdio::null());
+        if *ignored {
+            command.args(["--ignored", "--show-output"]);
+        }
         crate::host_bin::arm_check_child(&mut command);
-        let name = format!("crypto-smoke-{index}");
+        let name = format!("{binary}-{index}");
         let output = bounded_output(&mut command, &name, 64 * 1024, 30).inspect_err(|_| {
             let path = Path::new("/output").join(format!("{name}.log"));
             if let Ok(log) = read_output(&path, &name, 64 * 1024) {
@@ -567,8 +615,12 @@ pub(crate) fn runtime_inner() -> Result<()> {
         {
             return Err(format!("portable smoke case did not execute: {case}"));
         }
+        if *ignored {
+            let bytes = stack_evidence(&output)?;
+            println!("portable runtime: config_stack_mapping_bytes={bytes}");
+        }
     }
-    println!("portable runtime: version, native SHA-256, explicit provider and eight TLS cases passed without toolchain mounts");
+    println!("portable runtime: version, native SHA-256, explicit provider, eight TLS cases and bounded configuration stack passed without toolchain mounts");
     Ok(())
 }
 
@@ -634,7 +686,7 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
     )?;
     let artifacts = scratch.0.join("artifacts");
     receipt.push_str(&collect_artifacts(&output, &artifacts)?);
-    for binary in ["td-mta", "td-crypto-smoke"] {
+    for binary in ["td-mta", "td-crypto-smoke", "td-mta-config-smoke"] {
         qualify_binary(&artifacts.join(binary))?;
     }
     let runtime = vec![
@@ -718,12 +770,23 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     #[test]
+    fn stack_measurement_requires_one_bounded_decimal_observation() {
+        assert_eq!(stack_evidence("noise\nconfig_stack_mapping_bytes=167936\n").unwrap(), 167936);
+        for bad in ["", "config_stack_mapping_bytes=", "config_stack_mapping_bytes=0",
+            "config_stack_mapping_bytes=180225", "config_stack_mapping_bytes=+1",
+            "config_stack_mapping_bytes=9999999999999999999999999999",
+            "config_stack_mapping_bytes=1\nconfig_stack_mapping_bytes=1"] {
+            assert!(stack_evidence(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn host_collection_refuses_output_links_extras_and_oversized_receipts() {
         let scratch = Scratch::create(&std::env::temp_dir(), "td-crypto-test").unwrap();
         let output = scratch.0.join("output");
         let source = output.join("artifacts");
         fs::create_dir_all(&source).unwrap();
-        for name in ["td-mta", "td-crypto-smoke", "COMMANDS"] {
+        for name in ["td-mta", "td-crypto-smoke", "td-mta-config-smoke", "COMMANDS"] {
             fs::write(source.join(name), name).unwrap();
         }
         let good = scratch.0.join("good");
@@ -780,26 +843,30 @@ mod tests {
     fn artifact_records_require_one_correct_profile_and_target() {
         let record = r#"{"reason":"compiler-artifact","target":{"name":"td-mta","kind":["bin"]},"profile":{"test":false},"executable":"/output/target/td-mta"}"#;
         assert_eq!(
-            artifact_path(record, "td-mta", false).unwrap(),
+            artifact_path(record, "td-mta", ArtifactKind::Installed).unwrap(),
             Path::new("/output/target/td-mta")
         );
-        assert!(artifact_path(&format!("{record}\n{record}"), "td-mta", false).is_err());
-        assert!(artifact_path(record, "td-mta", true).is_err());
-        assert!(artifact_path(record, "td_crypto", false).is_err());
+        assert!(artifact_path(&format!("{record}\n{record}"), "td-mta", ArtifactKind::Installed).is_err());
+        assert!(artifact_path(record, "td-mta", ArtifactKind::LibraryTest).is_err());
+        assert!(artifact_path(record, "td_crypto", ArtifactKind::Installed).is_err());
         assert!(artifact_path(
             &record.replace("[\"bin\"]", "[\"bin\",\"lib\"]"),
             "td-mta",
-            false
+            ArtifactKind::Installed
         )
         .is_err());
-        assert!(artifact_path("{", "td-mta", false).is_err());
+        assert!(artifact_path("{", "td-mta", ArtifactKind::Installed).is_err());
         assert!(artifact_json(&format!("{}0{}", "[".repeat(65), "]".repeat(65))).is_err());
         assert!(artifact_json(r#"{"quoted":"[[[\"{}"}"#).is_ok());
         let test = record
             .replace("td-mta", "td_crypto")
             .replace("\"bin\"", "\"lib\"")
             .replace("false", "true");
-        assert!(artifact_path(&test, "td_crypto", true).is_ok());
+        assert!(artifact_path(&test, "td_crypto", ArtifactKind::LibraryTest).is_ok());
+        let integration = test.replace("td_crypto", "config_stack").replace("\"lib\"", "\"test\"");
+        assert!(artifact_path(&integration, "config_stack", ArtifactKind::IntegrationTest).is_ok());
+        assert!(artifact_path(&test, "td_crypto", ArtifactKind::IntegrationTest).is_err());
+        assert!(artifact_path(&integration, "config_stack", ArtifactKind::LibraryTest).is_err());
     }
 
     #[test]

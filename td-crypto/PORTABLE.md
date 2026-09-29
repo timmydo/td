@@ -229,11 +229,12 @@ image's whole-closure profiling qualification. Debug information remains in
 the executables; distribution debug-companion integration is not claimed.
 
 Cargo's selected normal/build graphs must match admission. Its artifact records
-must select exactly one expected binary/test profile. Both results must be
+must select exactly one expected binary/test profile. All three results must be
 x86-64 static PIEs with an executable entry point and no ELF interpreter,
 DT_NEEDED or runtime search path. A second fresh namespace mounts only the
 result and static test supervisor, then runs the installed name's version command
-and each SHA-256, provider-construction and TLS smoke test in its own process.
+and each SHA-256, provider-construction, TLS and configuration-stack smoke
+case in its own process.
 It has no compiler, root-data file, loader or library mounts. Each runtime command has a
 30-second deadline; each Cargo command has a 20-minute deadline. Parsed Cargo
 stdout is limited to 8 MiB (graphs to 256 KiB); each JSON record is limited to
@@ -242,7 +243,7 @@ output quota. M07 owns native/TLS allocation and entropy-failure qualification;
 a Result wrapper cannot contain provider aborts.
 
 After the compile namespace exits and its descendants are reaped, the host
-requires an exact regular-file output inventory: two binaries and the inner
+requires an exact regular-file output inventory: three binaries and the inner
 command record. It rejects output directory/file symlinks and additional files,
 then copies these checked inputs into a fresh private directory outside the
 compiler's writable mount. Only this directory receives host-written metadata
@@ -258,6 +259,15 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
 - `td-crypto-smoke`: separate qualification test executable, not a service
   dependency. It exercises native code that the current packaging entry point
   does not yet retain through a service caller.
+- `td-mta-config-smoke`: integration test linked to the production td-mta
+  library for the bounded structural-loader stack check in td-mta/CONFIG.md.
+  Generic loader functions compile in the test crate; this does not qualify
+  a future installed service caller, even with the same reader type.
+  It is not a service dependency. The same release Cargo graph builds it
+  with `--test config_stack --no-run`; selection requires a test target and
+  test profile. The runtime explicitly selects its ignored qualification
+  case and still requires exactly one passed test. Its observed mapping size
+  is relayed to the build log, not retained in `BUILD-INPUTS`.
 - `BUILD-INPUTS`: staged source, vendor, reconstructed Rust kit, headers and
   helper NAR hashes, native recipe identities/NARs, target and actual inner
   Cargo argument/environment records.

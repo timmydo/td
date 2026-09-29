@@ -349,6 +349,15 @@ Concrete implementations must fit these contracts before enabling service.
 
 ## Evidence
 
+M04b2c3d4b's portable integration test provides point-in-time evidence for
+its compilation of the structural loader on a worker whose non-growing guarded mapping is checked to fit 176 KiB, leaving
+the existing 80 KiB identity-view reservation untouched. CONFIG.md lists its
+fixtures, manual requalification obligation and limits. A production
+compile-time guard checks borrowed-view layouts on every target without
+creating those future finalization arrays. It does not qualify future protected-file,
+provider or runtime frames, or claim measured service RSS. No ledger entry
+or worker count changes.
+
 M04c1's `admission.rs` validates the separate u64 disk/work plan and capacity
 relationships in ADMISSION.md. It consumes an already validated ResourcePlan
 without changing this RAM ledger. Logical upload/queue quotas may be smaller
