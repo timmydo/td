@@ -377,7 +377,8 @@ fixture's CA, no roots for the untrusted-chain case, or a same-named CA
 with a different key for the bad-signature case. The process-global
 provider stays unset.
 
-Sixteen cases run separately in the clean runtime:
+Sixteen baseline cases run separately in the clean runtime; two additional
+algorithm-policy cases are specified below:
 
 - TLS 1.2 and TLS 1.3 each negotiate the requested version, exchange binary
   plaintext in both directions and observe orderly closure on both peers.
@@ -406,11 +407,12 @@ and use unique leaf serials under their generated CA. No client-chain result
 is gateway authorization; the mail adapter must apply its peer policy after
 handshake completion. These are private backend tests, not service adapters.
 
-The round trips assert X25519 key exchange and AES-256-GCM/SHA-384 suites
+The baseline round trips assert X25519 key exchange and AES-256-GCM/SHA-384 suites
 for both versions. The fixture certificate and handshake signatures use
-ECDSA P-256/SHA-256. Other suites, key-exchange groups, RSA and alternative
-CPU/assembly paths are not covered by this smoke; M07 qualifies its full
-production policy. This check covers the CPU paths selected on the test host.
+ECDSA P-256/SHA-256. The algorithm-policy cases below cover the additional
+classical groups and suites. RSA, P-384, P-521 and Ed25519 signing schemes
+remain inventory-only; alternative CPU/assembly paths are not exercised.
+This check covers the CPU paths selected on the test host.
 
 Each drive uses a 32 KiB caller buffer and permits at most 256 KiB wire
 traffic and 64 bidirectional turns. Each round-trip case calls drive five
@@ -535,3 +537,16 @@ unwind. Anchor dates and self-signatures deliberately are not peer identity
 checks. The fixtures qualify material admission and backend path use; they
 do not qualify configuration-role enforcement, TLS Finished, gateway
 permission or the service's resource budget. No test contacts a public server.
+
+## Explicit algorithm policy qualification
+
+The portable artifact runs the exact suite/group/signature inventory and
+mapping-drift fixtures, plus a generated ML-DSA-signed leaf accepted by the
+native baseline and refused by the selected certificate policy. Backend
+TLS fixtures use the selected provider. Additional bounded local handshakes
+cover each classical group under TLS 1.2/1.3 and the six TLS 1.3/ECDSA TLS 1.2
+suites. Hybrid-only peers fail in either direction. An ML-DSA server signed by a
+classical CA completes a handshake with a native-default client, while the
+policy client refuses its signing scheme. RSA suites and P-384/P-521/Ed25519
+signing schemes receive inventory coverage only. These checks qualify the algorithm component; they do not
+claim public configurations, session limits or service admission.

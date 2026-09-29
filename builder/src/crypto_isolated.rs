@@ -663,6 +663,11 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "p256_oracle::tests::exceptional_point_cases_and_projective_representations", false),
         ("td-crypto-smoke", "p256_oracle::tests::signature_scalar_ranges_and_infinity_result_are_refused", false),
         ("td-crypto-smoke", "tests::explicit_aws_provider_and_roots_construct_without_global_default", false),
+        ("td-crypto-smoke", "tls_policy::tests::exact_tls_algorithm_inventory", false),
+        ("td-crypto-smoke", "tls_policy::tests::handshake_mapping_drift_is_refused", false),
+        ("td-crypto-smoke", "tls_policy::tests::excluded_certificate_signature_has_a_valid_baseline", false),
+        ("td-crypto-smoke", "tls_smoke::explicit_policy_negotiates_classical_groups_and_suites", false),
+        ("td-crypto-smoke", "tls_smoke::explicit_policy_refuses_excluded_peer_algorithms", false),
         ("td-crypto-smoke", "tls_smoke::tls12_local_round_trip", false),
         ("td-crypto-smoke", "tls_smoke::tls13_local_round_trip", false),
         ("td-crypto-smoke", "tls_smoke::rejects_wrong_server_name", false),
@@ -719,7 +724,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             println!("portable runtime: {prefix}{bytes}");
         }
     }
-    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit provider, sixteen TLS cases and both bounded configuration stacks passed without toolchain mounts");
+    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, eighteen TLS cases and both bounded configuration stacks passed without toolchain mounts");
     Ok(())
 }
 

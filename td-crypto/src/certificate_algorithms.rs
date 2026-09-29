@@ -96,13 +96,12 @@ const CERTIFICATE_ALGORITHMS: &[(&[u8], &[u8])] = &[
 
 pub(super) fn certificate_algorithms(
 ) -> Result<&'static [&'static dyn SignatureVerificationAlgorithm], TlsError> {
-    let all = rustls::crypto::aws_lc_rs::default_provider()
+    Ok(crate::tls_policy::provider()?
         .signature_verification_algorithms
-        .all;
-    select(all)
+        .all)
 }
 
-fn select<'a>(
+pub(super) fn select<'a>(
     all: &'a [&'static dyn SignatureVerificationAlgorithm],
 ) -> Result<&'a [&'static dyn SignatureVerificationAlgorithm], TlsError> {
     if all.len() != 22 {

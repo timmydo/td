@@ -26,6 +26,7 @@ pub use provider::{P256Key, Provider, P256_PKCS8_CAPACITY};
 mod der;
 mod certificate;
 mod certificate_algorithms;
+mod tls_policy;
 mod tls_error;
 pub use tls_error::{TlsError, VerificationFailure};
 mod identity;

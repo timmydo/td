@@ -682,6 +682,14 @@ Implement the remaining work as independently reviewable increments:
   fixed algorithm inventories, SNI/ALPN selection and supplied-clock bridge.
   Test excluded algorithms, no global provider, mandatory gateway client
   certificates and independent resumption refusal through this layer.
+  - **M07b3a — algorithm provider:** implemented private exact suite/group
+    lists and complete certificate/handshake identifier mapping checks, with
+    excluded native algorithms refused. Portable inventory, drift and local positive/
+    negative fixtures qualify this component without enabling service.
+  - **M07b3b — local signing bridge:** retain the existing owned key lifecycle
+    through native TLS signing; qualify DER signatures and shared retirement.
+  - **M07b3c — configuration handles:** implement immutable role selection,
+    bounded identity routing, ALPN, supplied clock and resumption refusal.
 - **M07c — opaque sessions:** implement and pin concrete public signatures
   for TLS.md's record/plaintext/output/status/close operations. Confinement
   tests cover the complete resolved public API. Local peers exercise one-byte

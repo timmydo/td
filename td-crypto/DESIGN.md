@@ -6,18 +6,18 @@ This crate owns td's provider-independent cryptographic API. The compiling
 M03a surface contains `Error`, `Entropy`, `Digest` and `Crypto`, extracted
 from td-mta's existing ports. M03b1 admits the private Rustls/AWS-LC
 dependencies and checks their offline host build. M07a1 implements opaque
-streaming SHA-256; its direct operation uses the owned fixed-state primitive.
-M07a3 adds the opaque worker-local entropy handle. M07a4 implements the Crypto
-factory, fixed-size comparison and opaque P-256 key generation/loading/signing.
-M07b1 adds bounded certificate PEM syntax and a P-256 PEM key loader.
-M07b2a adds cold admission of an owned local server identity. M07b2b adds
-explicit private CA bundles and the pinned public server root set.
-TLS sessions remain unimplemented. Test-only backend qualification covers
-explicit
-provider construction, SHA-256, local TLS 1.2/1.3 data exchange, certificate
-verification and malformed/tampered-record refusals in the isolated static
-executable.
-Mocks and interface tests are not cryptographic conformance evidence.
+streaming SHA-256; its direct operation uses the owned fixed-state
+primitive. M07a3 adds the opaque worker-local entropy handle. M07a4
+implements the Crypto factory, fixed-size comparison and opaque P-256 key
+generation/loading/signing. M07b1 adds bounded certificate PEM syntax and a
+P-256 PEM key loader. M07b2a adds cold admission of an owned local server
+identity. M07b2b adds explicit private CA bundles and the pinned public
+server root set. M07b3a supplies the explicit private TLS algorithm
+provider. Public TLS configurations and sessions remain unimplemented.
+Test-only backend qualification covers explicit provider construction,
+SHA-256, local TLS 1.2/1.3 data exchange, certificate verification and
+malformed/tampered-record refusals in the isolated static executable. Mocks
+and interface tests are not cryptographic conformance evidence.
 
 The target dependency graph is:
 
@@ -408,13 +408,14 @@ follow TLS.md's classical certificate inventory.
 
 The certificate algorithm selector checks all nineteen exact public-key and
 signature AlgorithmIdentifier pairs against the pinned backend prefix,
-including parameters, before returning its static slice. The three excluded ML-DSA pairs and their order are also checked.
+including parameters, before returning its static slice. The three excluded
+ML-DSA pairs and their order are also checked.
 The backend must still have its reviewed 22-entry inventory; changes refuse
 with Crypto.
 No ML-DSA entry or global provider is inherited. Constructing that backend
 inventory creates temporary cold allocations; this is not an allocation-free
-configuration path. TLS handshake mappings and full configuration policy
-remain M07b3.
+configuration path. The same private provider also validates handshake mappings; complete
+configuration policy remains M07b3.
 
 Reject duplicate or misordered certificates, and repeated issuer
 subject/key pairs even when their certificate bytes differ. The key
@@ -531,6 +532,46 @@ reuse, atomic refusal, caps, supported key families, constraints and fixed
 public inventory. A private client-auth verifier fixture proves certificate
 path usage only, not TLS Finished or gateway authorization. All cases also
 run in the portable artifact; no listener is enabled by this increment.
+
+### Explicit TLS algorithm provider
+
+One private constructor supplies TLS.md's exact nine cipher suites, three
+classical key-exchange groups, nineteen certificate algorithms and ten
+handshake signature mappings. Cipher/group lists are constructed explicitly.
+The certificate selector checks the full native inventory, including
+excluded entries. The handshake selector checks all thirteen native
+mappings, each scheme and every mapped algorithm identifier pair in order,
+then retains only the ten classical mappings. This pins the first ECDSA
+verifier used by TLS 1.3 as well as the alternatives available in TLS 1.2.
+These checks pin identifiers and ordering, not verifier behavior such as RSA
+modulus bounds; the reviewed source/lock pins retain that behavior. Any
+signature identifier inventory drift returns Crypto; no global provider is
+installed or consulted.
+
+Local certificate admission uses this shared provider's certificate list.
+The local backend TLS fixtures now use it for both endpoints; designated
+remote fixtures can still use native defaults to prove exclusion. Inventory
+fixtures test truncated, expanded, reordered and substituted mappings,
+including the three excluded ML-DSA mappings. A valid ML-DSA-signed leaf
+passes the native certificate baseline and fails the selected certificate
+policy. Local handshakes exercise all three classical groups under TLS 1.2
+and 1.3, each TLS 1.3/ECDSA TLS 1.2 cipher, hybrid-only peer refusal in both
+directions and refusal of a native ML-DSA server with a successful native
+client baseline. Inventory tests alone cover RSA suites and P-384/P-521/
+Ed25519 signing schemes; local positive handshakes use a P-256 signer.
+
+Construction catches Rust unwinds and publishes no partial provider. Cold
+native-default vectors and replacement vectors allocate; the native entropy,
+key, abort/OOM and hook limits are unchanged. This is an algorithm policy
+component, not a configuration handle, key-signing bridge or session API.
+Version selection, role policy, SNI, ALPN, clock, resumption and resource
+qualification still require their following increments before service use.
+The native key loader and random source are retained backend components, not
+restricted by these algorithm lists. Test-only configurations may load
+native keys, including the excluded peer fixtures. Future production
+configurations must use the owned P-256 signing bridge and must never call
+the native arbitrary-format key loader through with_single_cert or
+equivalent APIs.
 
 ### Mutual TLS backend qualification
 

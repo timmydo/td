@@ -5,8 +5,10 @@
 This is the M07 contract for the future public TLS facade. It does not claim
 that its configurations or sessions are implemented.
 Bounded PEM syntax, P-256 PEM key loading, local ServerIdentity admission
-and TrustStore construction are implemented; DESIGN.md records their acceptance and output contracts. The existing
-private TLS fixtures qualify selected backend behavior only. Implementations
+and TrustStore construction are implemented. The private algorithm provider
+implements the fixed suite/group/signature lists below; public configuration
+handles remain future work. DESIGN.md records implemented acceptance and
+output contracts. The existing private TLS fixtures qualify selected backend behavior only. Implementations
 must satisfy this contract and the resource/failure qualification in
 DESIGN.md before td-mta enables a listener or an outgoing connection through
 them.

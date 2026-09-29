@@ -36,6 +36,24 @@ fn pair(
     trust: Trust,
     now: u64,
 ) -> Result<(rustls::Connection, rustls::Connection)> {
+    pair_with_providers(
+        version,
+        hostname,
+        trust,
+        now,
+        crate::tls_policy::provider()?,
+        crate::tls_policy::provider()?,
+    )
+}
+
+fn pair_with_providers(
+    version: &'static rustls::SupportedProtocolVersion,
+    hostname: &'static str,
+    trust: Trust,
+    now: u64,
+    client_provider: rustls::crypto::CryptoProvider,
+    server_provider: rustls::crypto::CryptoProvider,
+) -> Result<(rustls::Connection, rustls::Connection)> {
     let rng = aws_lc_rs::rand::SystemRandom::new();
     let root_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)?;
     let root = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, root_bytes.as_ref())?;
@@ -47,7 +65,7 @@ fn pair(
         _ => certificate(&root, &root, true)?,
     };
     let leaf_cert = certificate(&leaf, &root, false)?;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(server_provider);
     let server = rustls::ServerConfig::builder_with_details(provider.clone(), Arc::new(Time(now)))
         .with_protocol_versions(&[version])?
         .with_no_client_auth()
@@ -59,10 +77,11 @@ fn pair(
     if !matches!(trust, Trust::Empty) {
         roots.add(root_cert.into())?;
     }
-    let client = rustls::ClientConfig::builder_with_details(provider, Arc::new(Time(now)))
-        .with_protocol_versions(&[version])?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let client =
+        rustls::ClientConfig::builder_with_details(Arc::new(client_provider), Arc::new(Time(now)))
+            .with_protocol_versions(&[version])?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     let mut client = rustls::Connection::Client(rustls::ClientConnection::new(
         Arc::new(client),
         hostname.try_into()?,
@@ -362,7 +381,7 @@ fn mutual_configs(
     )?;
     let mut roots = rustls::RootCertStore::empty();
     roots.add(root_cert.into())?;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(crate::tls_policy::provider()?);
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
         Arc::new(roots.clone()),
         provider.clone(),
@@ -575,5 +594,162 @@ fn mutual_authentication_refuses_mismatched_key_before_connect() -> Result<()> {
         );
         assert!(rustls::crypto::CryptoProvider::get_default().is_none());
     }
+    Ok(())
+}
+
+#[test]
+fn explicit_policy_negotiates_classical_groups_and_suites() -> Result<()> {
+    let base = crate::tls_policy::provider()?;
+    for group in &base.kx_groups {
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let mut client = crate::tls_policy::provider()?;
+            client.kx_groups = vec![*group];
+            let (mut client, mut server) = pair_with_providers(
+                version,
+                "localhost",
+                Trust::Correct,
+                VALID_TIME,
+                client,
+                crate::tls_policy::provider()?,
+            )?;
+            drive(&mut client, &mut server)?;
+            for peer in [&client, &server] {
+                assert_eq!(
+                    peer.negotiated_key_exchange_group().map(|g| g.name()),
+                    Some(group.name())
+                );
+                assert_eq!(peer.protocol_version(), Some(version.version));
+            }
+        }
+    }
+    for suite in base.cipher_suites.iter().take(6) {
+        let mut client = crate::tls_policy::provider()?;
+        client.cipher_suites = vec![*suite];
+        let (mut client, mut server) = pair_with_providers(
+            suite.version(),
+            "localhost",
+            Trust::Correct,
+            VALID_TIME,
+            client,
+            crate::tls_policy::provider()?,
+        )?;
+        drive(&mut client, &mut server)?;
+        for peer in [&client, &server] {
+            assert_eq!(
+                peer.negotiated_cipher_suite().map(|c| c.suite()),
+                Some(suite.suite())
+            );
+        }
+    }
+    assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+    Ok(())
+}
+
+#[test]
+fn explicit_policy_refuses_excluded_peer_algorithms() -> Result<()> {
+    for restricted_server in [false, true] {
+        let mut remote = rustls::crypto::aws_lc_rs::default_provider();
+        remote.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768];
+        let local = crate::tls_policy::provider()?;
+        let (client, server) = if restricted_server {
+            (remote, local)
+        } else {
+            (local, remote)
+        };
+        let (mut client, mut server) = pair_with_providers(
+            &rustls::version::TLS13,
+            "localhost",
+            Trust::Correct,
+            VALID_TIME,
+            client,
+            server,
+        )?;
+        let error = drive(&mut client, &mut server)
+            .err()
+            .ok_or("excluded hybrid group accepted")?;
+        assert!(
+            matches!(
+                error.downcast_ref::<rustls::Error>(),
+                Some(rustls::Error::PeerIncompatible(
+                    rustls::PeerIncompatible::NoKxGroupsInCommon
+                ))
+            ),
+            "{error:?}"
+        );
+    }
+    // A native client must finish against the excluded signer before its
+    // refusal can establish that the selected handshake mapping matters.
+    use crate::certificate_fixtures::{self as f, Parameters};
+    use aws_lc_rs::{
+        encoding::AsDer,
+        signature::{KeyPair, PqdsaKeyPair, ML_DSA_44_SIGNING},
+    };
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let root_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)?;
+    let root = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, root_bytes.as_ref())?;
+    let leaf = PqdsaKeyPair::generate(&ML_DSA_44_SIGNING)?;
+    let certificate = f::build(
+        leaf.public_key().as_der()?.as_ref().to_vec(),
+        f::signature_algorithm(),
+        &Parameters::new(false),
+        |body| Ok(root.sign(&rng, body)?.as_ref().to_vec()),
+    )?;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let server = Arc::new(
+        rustls::ServerConfig::builder_with_details(provider, Arc::new(Time(VALID_TIME)))
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certificate.into()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(leaf.to_pkcs8v1()?.as_ref().to_vec())
+                    .into(),
+            )?,
+    );
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(f::certificate(&root, &root, true)?.into())?;
+    for restricted in [false, true] {
+        let provider = if restricted {
+            crate::tls_policy::provider()?
+        } else {
+            rustls::crypto::aws_lc_rs::default_provider()
+        };
+        let client = rustls::ClientConfig::builder_with_details(
+            Arc::new(provider),
+            Arc::new(Time(VALID_TIME)),
+        )
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_root_certificates(roots.clone())
+        .with_no_client_auth();
+        let mut client = rustls::Connection::Client(rustls::ClientConnection::new(
+            Arc::new(client),
+            "localhost".try_into()?,
+        )?);
+        let mut server = rustls::Connection::Server(rustls::ServerConnection::new(server.clone())?);
+        client.set_buffer_limit(Some(BUFFER_BYTES));
+        server.set_buffer_limit(Some(BUFFER_BYTES));
+        let result = drive(&mut client, &mut server);
+        if restricted {
+            let error = result
+                .err()
+                .ok_or("excluded signer accepted by policy client")?;
+            assert!(
+                matches!(
+                    error.downcast_ref::<rustls::Error>(),
+                    Some(rustls::Error::PeerIncompatible(
+                        rustls::PeerIncompatible::NoSignatureSchemesInCommon
+                    ))
+                ),
+                "{error:?}"
+            );
+        } else {
+            result?;
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+            assert_eq!(
+                client.protocol_version(),
+                Some(rustls::ProtocolVersion::TLSv1_3)
+            );
+        }
+    }
+    assert!(rustls::crypto::CryptoProvider::get_default().is_none());
     Ok(())
 }
