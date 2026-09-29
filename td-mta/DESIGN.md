@@ -122,14 +122,19 @@ crates. The user has approved a minimal TLS/cryptography dependency category;
 the implementation must still record the exact pinned transitive closure,
 features, licenses, native build inputs, and rationale in its landing.
 
-Prefer rustls with its ring provider, reusing compatible versions already
-reviewed in `net/Cargo.lock`, and the existing root-certificate data where
-appropriate. Do not inherit the entire td-net dependency set or enable a second
-crypto provider. No async runtime, general web framework, database, mail parser,
-serialization framework, or ACME framework is part of this exception. The
-first dependency increment must demonstrate static musl linking and bounded
-TLS behavior before later tasks depend on its API. Exact versions belong in
-the lock and dependency review, not in this design's prose.
+Use rustls with its built-in `aws_lc_rs` provider backed by `aws-lc-rs`.
+Declare a direct runtime dependency on the same `aws-lc-rs` version for the
+mail cryptographic operations. Select one provider explicitly when
+constructing TLS configurations and certificate verifiers; do not depend on
+implicit process-global provider selection. Pin only the needed features,
+native build inputs and root-certificate data. Do not inherit the entire
+td-net dependency set or enable a second crypto provider. One resolved
+aws-lc-rs/aws-lc-sys version pair serves both direct operations and TLS. No
+async runtime, general web framework, database, mail parser, serialization
+framework, or ACME framework is part of this exception. The first dependency
+increment must demonstrate static musl linking and bounded TLS behavior
+before later tasks depend on its API. Exact versions belong in the lock and
+dependency review, not in this design's prose.
 
 The portable musl artifact has a separate, host-only build manifest: pin Rust
 and its target standard library, the musl C compiler/linker and sysroot needed
@@ -141,8 +146,24 @@ it must not import host-built outputs into that graph or claim its provenance.
 
 Core adapters provide typed errors and caller-owned buffers for transport,
 clock, entropy, digest/signature operations, and fault-injected persistence.
-Network workers cannot bypass the store's commit API. A crypto adapter also
-serves future DKIM verification without implementing new crypto primitives.
+Network workers cannot bypass the store's commit API. Future DKIM verification
+extends the crypto adapter with the required verification operations.
+
+Keep provider types private to the runtime adapters. The application-level
+`Crypto`/`Entropy` ports and TLS transport ports are separate boundaries;
+rustls's `CryptoProvider` is the lower-level boundary for replacing TLS
+primitives while retaining its protocol engine. API section 1.1 owns the
+construction, representation and replacement contract. There is no runtime
+backend selector or fallback to a different provider.
+
+A future `td-crypto` crate may supply shared td-owned cryptographic primitives.
+It remains std-only, independent of td-mta and rustls. Local runtime wrappers
+adapt it to the mail ports; a rustls provider bridge stays in the external-
+dependency runtime tier. Introducing that bridge does not put a rustls feature
+or dependency into `td-crypto`. Implementing only the mail crypto ports does
+not replace the TLS provider. IMPLEMENTATION F04 stages this future work and
+its security, interoperability and resource qualification before deployment;
+only after that acceptance may it become the provider in invariant 7.
 
 No new unsafe surface is authorized by this document. Prefer safe std APIs.
 If platform work requires unsafe, its increment must first read and amend
@@ -153,15 +174,17 @@ This includes any test allocator hook needing an unsafe implementation.
 
 ### 4.1 Direct MX
 
-Publish MX records for every served domain pointing to a configured hostname,
-for example `mx.example.net`, with A/AAAA records for reachable addresses.
-Internet SMTP uses port 25 with STARTTLS; port 25 is not a plaintext fallback
-after trying port 465. The receiving listener offers TLS 1.2/1.3 with the
-provider's reviewed cipher defaults. It accepts plaintext delivery for peers
-that do not negotiate TLS; selecting the direct role chooses this v1
-compatibility policy. There is no separate plaintext-toggle setting.
-Once STARTTLS begins, a failed handshake closes the connection; it never
-continues that session in plaintext. Reset SMTP state after successful TLS.
+Publish MX records for every served domain pointing to a configured
+hostname, for example `mx.example.net`, with A/AAAA records for reachable
+addresses. Internet SMTP uses port 25 with STARTTLS; port 25 is not a
+plaintext fallback after trying port 465. The receiving listener offers TLS
+1.2/1.3 with the explicit reviewed algorithm policy recorded by M07 (API
+section 1.1). Dependency upgrades must not silently change this policy. It
+accepts plaintext delivery for peers that do not negotiate TLS; selecting
+the direct role chooses this v1 compatibility policy. There is no separate
+plaintext-toggle setting. Once STARTTLS begins, a failed handshake closes
+the connection; it never continues that session in plaintext. Reset SMTP
+state after successful TLS.
 
 Port 443 serves JMAP HTTPS and configured MTA-STS policy hosts. Port 80 serves
 ACME HTTP-01 challenges and

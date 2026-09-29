@@ -67,6 +67,82 @@ fallback. Implementations must stop at the deadline and validate DNS source,
 question, name/compression limits and CNAME chains (M09). This port resolves
 configured A/AAAA endpoints only; MX/TXT/policy resolution is outside v1.
 
+### 1.1 Crypto provider boundary
+
+The core calls `Crypto` for SHA-256, fixed verifier equality and ACME P-256
+operations, and `Entropy` for secure random bytes. These are application
+operations, not a copy of rustls's primitive interfaces. TLS algorithms,
+certificate verification and handshake state stay behind `TlsFactory` and
+`TlsTransport`. The runtime implements these ports with local wrapper types;
+provider key, digest, connection and error types do not enter core interfaces.
+A future shared implementation need not depend on td-mta: the runtime's local
+wrappers implement td-mta's port traits on its behalf.
+
+Initially these wrappers use AWS-LC. Cold construction supplies an explicit
+rustls `CryptoProvider` to every client/server configuration and certificate
+verifier, including the HTTPS/ACME and smart-host clients. No wrapper installs
+or relies on the process-global default provider. Configurations and keys live
+in the existing bounded generations; construction still obeys RESOURCES.md.
+The runtime source names one shipping backend; there are no selectable Cargo
+backend features. F04 replaces that implementation and dependency closure in
+one landing.
+
+Persist standard key/certificate encodings and the specified digest/verifier
+bytes, never serialized provider contexts or backend identifiers. Keep the
+PKCS#8, SEC1 and fixed ES256 representations above at the application
+boundary; TLS key loading must also preserve M07's recorded compatibility
+baseline: accepted key encodings and algorithms, TLS versions, cipher
+suites, key-exchange groups and certificate/handshake signature schemes. M07
+records both configured preference order and accepted sets from the pinned
+provider; F04 compares against that inventory, not unspecified future
+provider defaults. M07 pins generated PKCS#8 DER variants and
+accepted/rejected input forms, including inconsistent embedded public keys,
+and retains non-secret test keys and digest fixtures. F04 tests key
+interchange in both directions, including rollback to the prior binary after
+the new backend has generated keys. A backend replacement reconstructs
+contexts from those files on restart. It does not convert live TLS
+connections or key objects. Algorithm, trust-policy or file-format changes
+require their own explicit design/migration; an implementation swap cannot
+silently change them.
+
+M07 supplies a runtime test suite generic over the mail crypto/entropy
+ports: SHA-256 known answers across chunk boundaries, fixed-length equality,
+fault-injected entropy failure without partial success, P-256 public-point
+known answers, key generation/load and malformed-key rejection, and ES256
+signing checked by an independent test-only verifier qualified with known
+valid and invalid vectors. The existing mail port needs no verification
+method for this suite. Check generated signatures as raw 64-byte r || s, not
+ASN.1 DER. F04 adds cross-backend key loading and signature verification,
+not byte equality of randomized signatures. Reuse the TLS
+verification/STARTTLS/implicit-TLS matrix when changing the rustls provider.
+A future switch to `td-crypto` must cover both the direct operations and the
+runtime's rustls provider bridge before AWS-LC can leave the runtime
+closure.
+
+Differential tests do not establish constant-time behavior or replace a
+cryptographic review. The initial provider and every replacement must
+qualify allocation, peak stack, RSS and portable target behavior; hiding a
+provider behind traits proves none of these bounds and does not permit
+panic-based error handling. M07 and F04 must document and verify
+secret-buffer ownership, wipe-on-release behavior and its limits, including
+provider internals and compiler-created copies. Drop or Vec::clear alone is
+not evidence of secure erasure.
+
+For the direct crypto ports, insufficient output capacity maps to Capacity;
+malformed, unsupported-curve or inconsistent keys map to Invalid; recoverable
+RNG failures map to Entropy and other provider operation failures to Crypto.
+Neither provider diagnostics nor secret bytes appear in these errors. M07's
+suite fixes these mappings across implementations. Approved/pinned external
+vector inputs and independent test tools must be recorded at M07, as at F04.
+
+A Result-returning wrapper cannot contain a native abort. AWS-LC has fatal
+RNG paths that terminate the process instead of returning Entropy. Such an
+exit follows the service's existing crash/durable-recovery contract; do not
+weaken randomness, continue with partial bytes, or claim a caught error.
+Fault-injection tests of Entropy returns and process-death recovery test
+separate guarantees. M07 audits the pinned provider's fatal paths and records
+which failures were actually exercised.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

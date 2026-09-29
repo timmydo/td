@@ -51,7 +51,7 @@ Open issue: stop dependent implementation and record the exact ambiguity
 | Serve mail | M13-M17 | Real JMAP read/write and submission queue |
 | Operate | M18-M21 | Automatic certificates, administration, backup/migration |
 | Release | M22-M25 | Real client/provider fixtures, memory/crash gates, artifact |
-| Later | F01-F03 | Sender verification and catch-all |
+| Later | F01-F04 | Sender verification, catch-all and td-owned crypto |
 
 Dependency edges:
 
@@ -185,12 +185,28 @@ contract. Complex codecs belong to their following task, not this checkpoint.
 **Depends on:** M02. **Own:** `td-mta-runtime` manifest/lock/build wiring;
 explicit AGENTS exception and affected/gate dependency validation.
 
-Introduce the runtime crate and installed binary name. Pin a minimal compatible
-rustls/ring/root-data closure, disabling unused features/providers. Record
-each transitive crate and build dependency; reuse existing reviewed pins where
-possible. Keep core std-only and preserve all other roster restrictions. Ensure
-the new runtime participates in host and sandbox test/Clippy paths with a
-specific checked closure rather than a generic external-dependency escape hatch.
+Introduce the runtime crate and installed binary name. Pin a minimal
+compatible rustls/aws-lc-rs/root-data closure, disabling unused
+features/providers. Record each transitive crate and build dependency,
+including AWS-LC's native compiler, assembler and any selected generator
+requirements; verify the exact pinned build path rather than inferring it
+from another provider. Reuse compatible reviewed pins where possible.
+Declare both rustls and aws-lc-rs as direct runtime dependencies, resolving
+one compatible AWS-LC version. Keep core std-only and preserve all other
+roster restrictions. Ensure the new runtime participates in host and sandbox
+test/Clippy paths with a specific checked closure rather than a generic
+external-dependency escape hatch.
+
+For Linux, checked build wiring fixes the source-build path, disables system
+libcrypto discovery and selects the cc builder with no fallback to CMake,
+bindgen or prebuilt NASM. Record the pinned version's controls; for the
+aws-lc-sys interface using these names, set AWS_LC_SYS_USE_SYSTEM=0 and
+AWS_LC_SYS_CMAKE_BUILDER=0 in that wiring. Reject incompatible generator,
+sanitizer or environment overrides. A clean environment exposes only declared
+tools and headers. Decoy OPENSSL_DIR/pkg-config/CMake inputs must remain unused;
+missing declared inputs fail. The gate verifies exactly one resolved
+aws-lc-rs/aws-lc-sys pair and the actual target feature/build graph, including
+inactive lock entries; a second version cannot hide behind symbol prefixes.
 
 **Acceptance:** static x86-64 musl smoke executable runs in a clean fixture;
 ELF inspection finds no interpreter or dynamic dependencies. Lock tampering or
@@ -511,7 +527,28 @@ Implement incoming/outgoing TLS, implicit TLS and STARTTLS handoff, hostname
 verification, SNI, private CA override, client certificate verification for
 gateways, and bounded certificate generations. Expose chunked Read/Write-like
 transport with explicit deadlines and typed failures. Disable unnecessary
-resumption/early-data features. Measure handshake and steady-state allocations.
+resumption/early-data features. Use runtime-local wrappers and explicit AWS-LC
+provider construction for all TLS configurations/verifiers as specified by API
+section 1.1. Implement its provider conformance suite with independent fixtures;
+keep the suite reusable for F04. Record API section 1.1's complete configured
+TLS compatibility baseline before serving traffic: version/suite/group lists
+and preference order, an explicit post-quantum decision, certificate/handshake
+signature schemes, and accepted PEM labels, DER forms, curves and RSA sizes.
+Construct configurations from those reviewed lists with explicit Cargo features;
+provider defaults cannot silently expand them. Offline fixtures cover each
+allowed entry and refusal outside the policy. Later provider/dependency updates
+compare against this baseline and the saved non-secret key/digest fixtures.
+
+Enforce explicit-provider construction/key loading with source confinement
+checks for implicit/global constructors and a fresh-process test proving the
+default provider remains unset after all construction paths. This read-only
+test may query get_default; production code may not. Rust allocation counting
+alone cannot measure AWS-LC's libc allocations. Include native allocations,
+C stack frames, CPU-dispatched code paths and per-thread RNG state in the
+measurements. Warm every crypto-using worker before admission and budget its
+retained state. Measure whole-process RSS and peak stack as well as Rust/native
+allocation activity; any allocator hook first needs an UNSAFE.md amendment.
+Record secret-erasure limits, native fatal paths and crash-recovery evidence.
 
 **Acceptance:** local certificate fixtures cover valid/untrusted/expired/wrong-
 name chains, mTLS admission, fragmented records, handshake saturation, and
@@ -890,8 +927,9 @@ none/temperror/permerror result model. Direct mode evaluates the real peer;
 gateway mode needs the explicit trusted-origin contract first. Authentication
 results must distinguish checks from disposition. Local DNS fixtures only.
 
-**F02 — DKIM and DMARC.** Use the existing crypto adapter, streaming body/header
-canonicalization, bounded signature/DNS processing and exact standards fixtures.
+**F02 — DKIM and DMARC.** Extend the crypto port with RSA-SHA256 and Ed25519-SHA256
+verification; use streaming body/header canonicalization, bounded signature/DNS
+processing and exact standards fixtures.
 Define alignment and organizational-domain rules using a reviewed data strategy
 and applicable standard versions; do not casually add a dependency or hostname
 heuristic. Start with observed results before policy enforcement. Forwarded
@@ -902,6 +940,45 @@ requested. Report support does not imply DMARC report generation.
 **F03 — Catch-all.** Add an explicit per-domain fallback only after exact aliases,
 with predictable quota/admission behavior and tests for rejected domains. No
 plus addressing, external forwarding, or regex address rewriting rides with it.
+
+**F04 — Shared td-owned cryptography.** This is future work, not a v1 dependency.
+Design a standalone std-only `td-crypto` crate with no td-mta or rustls dependency.
+Keep each algorithm increment independently reviewed and gate-tested; do not
+create an empty crate or add unused primitive interfaces ahead of that work.
+Its normative primitive contract belongs in td-crypto/DESIGN.md when the crate
+is introduced; this plan owns only td-mta's integration. First inventory the
+existing engine SHA/Ed25519 and td-secret crypto/P-256 code and audit evidence.
+A shared-code consolidation moves affected consumers atomically and does not
+inherit unproven side-channel properties from existing implementations.
+
+1. Specify primitive contracts, supported algorithms, key/secret lifetimes,
+   constant-time requirements, wipe-on-release behavior/limits and failure
+   behavior. Account for all operations in the shipping TLS provider, including
+   record protection, key exchange, signing, certificate signature verification
+   and secure randomness, plus DKIM verification if F02 has landed. The smaller
+   mail `Crypto` port is not that inventory. Specify ECDSA nonce generation,
+   the OS entropy source and any optimization barriers; new unsafe surfaces
+   require the normal UNSAFE.md amendment before implementation.
+2. Implement and qualify primitives incrementally with known-answer,
+   adversarial and differential tests. Pin/license any new external vector
+   inputs through the normal dependency approval process. Require independent
+   cryptographic and side-channel review before deployment; passing functional
+   tests alone is insufficient. Inspect constant-time code generation in the
+   exact shipping artifact/compiler/flags/target, repeating qualification when
+   those inputs change. Preserve panic and allocation contracts.
+3. Adapt qualified operations to the existing mail ports through runtime-local
+   wrappers. Build the separate rustls `CryptoProvider` bridge inside the
+   runtime tier, retaining rustls for TLS protocol and certificate policy.
+   Before cutover, the candidate crate is a dev-dependency and its runtime
+   bridge is test-only; neither enters the shipping dependency graph. The
+   reviewed qualification closure can contain both providers for comparison.
+   Cutover promotes the candidate and removes the old production provider.
+4. Run API section 1.1 conformance and cross-backend key/signature tests, the
+   complete M07 TLS matrix and persistence/restart fixtures. Requalify resource
+   bounds and static x86-64 musl linkage; document aarch64 validation status.
+   Replace the production provider atomically, removing AWS-LC and its obsolete
+   closure/build inputs in that landing. Algorithm/trust/format changes are
+   separate work with explicit compatibility handling.
 
 ## Completion report for each milestone
 
