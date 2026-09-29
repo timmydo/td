@@ -27,6 +27,7 @@ mod cargo_lock;
 mod crypto_policy;
 mod crypto_build;
 mod crypto_headers;
+mod crypto_portable;
 mod check_host;
 mod check_loop;
 mod check_memory;

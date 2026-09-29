@@ -91,8 +91,9 @@ consumers are implemented; they follow the same ownership and redaction rules.
 M03b1 pins versions, features, licenses and roots; M03b2 pins the portable
 native build inputs.
 M03b2a implements checksum-pinned x86-64 musl header preparation as specified
-in `PORTABLE.md`. It invokes no compiler or upstream script. M03b2b still owns
-the complete isolated build, artifact, API confinement and TLS qualification.
+in `PORTABLE.md`. It invokes no compiler or upstream script. M03b2b adds the
+pinned host Rust kit and retained td GNU recipe outputs. M03b2c owns the
+isolated build and artifact; M03b2d owns API confinement and TLS qualification.
 Reuse compatible reviewed pins without inheriting td-net's dependency set.
 Rustls and aws-lc-rs are direct dependencies only of td-crypto, resolving one
 AWS-LC version pair for direct operations and TLS. No second backend enters the

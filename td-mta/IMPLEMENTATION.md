@@ -230,17 +230,23 @@ packages separately from the active graph.
 
 ### M03b2 — Portable artifact and backend boundary qualification
 
-This milestone lands in two independently checked increments:
+This milestone lands in independently checked increments:
 
 - **M03b2a:** pinned x86-64 musl header preparation in the builder, with no
   upstream scripts, byte agreement with upstream `install-headers`, retained
   licensing and refusal of modified archives or cached output. This prepares
   one native input and does not complete M03.
-- **M03b2b:** the remaining portable toolchain, isolated build, installed
-  binary, complete API confinement and TLS smoke acceptance below.
+- **M03b2b:** prepare the pinned upstream Rust host/target components and
+  retain the declared td GNU recipe outputs in verified local caches. This
+  prepares build inputs only; no portable artifact is qualified yet.
+- **M03b2c:** wire the isolated build, installed binary, source/cc decoys,
+  missing-input refusals and static ELF/clean-runtime acceptance below.
+- **M03b2d:** complete API confinement and bounded local TLS smoke acceptance.
+  All four increments are required before M03 completes.
 
-**Depends on:** M03b1. Complete public-API confinement and the source/cc decoy
-checks above, then qualify the portable toolchain and TLS smoke fixture.
+**Depends on:** M03b1. Prepare inputs in M03b2a/b, qualify the isolated
+artifact and source/cc decoys in M03b2c, then complete API confinement and
+TLS smoke in M03b2d before any service consumer depends on the backend.
 Clear ambient native flags/tool search paths. The host admission wrapper is
 initially x86-64 GNU/musl only; qualify any additional build host explicitly.
 Its exact manifests declare no extra test arguments or trusted-test-root;
