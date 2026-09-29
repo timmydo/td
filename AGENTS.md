@@ -286,6 +286,9 @@ message.
 
 # Rust code
 
+- Every Rust file is in rustfmt's default style, including files compiled
+  only through `include!` or `#[path]`; the `cargo-test` and `net-test`
+  preflights enforce it. `DEVELOPMENT.md` says how to format.
 - New or changed production code must not add `unwrap()`, `expect()`,
   `panic!`, `unreachable!`, `todo!`, `unimplemented!`, or panicking indexing.
   Return `Result`/`Option`, propagate with `?`, and use `.get()` for untrusted

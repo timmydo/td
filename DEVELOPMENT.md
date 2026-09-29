@@ -332,6 +332,38 @@ because `~/.td` was absent or unwritable. The one td control-plane program
 not yet covered is `td-recipe-eval`, whose QEMU and check-runner teardown
 still kill without a record.
 
+# Formatting
+
+Every tracked Rust file is in rustfmt's default style for its manifest's
+edition; there is no `rustfmt.toml`. The `cargo-test` and `net-test`
+preflights run the check over the whole repository whatever the branch
+touched, `cargo-test` beside its other groups and `net-test` ahead of its
+tests:
+
+```text
+td-builder gate-crates fmt --all
+td-builder gate-crates fmt --all --write
+```
+
+The second formats instead of checking. Prefer it to `cargo fmt`, which
+formats only the module tree it finds from each target: the recipes and the
+gate definitions compile through `build.rs`-generated `include!` and
+`#[path]` modules, so `cargo fmt` never reaches them. The check reads the
+file list from git and refuses, by name, a tracked Rust file outside the
+workspace members, the `td-*` crates and td-net; a new tree of Rust is added
+to `format_roots` in `builder/src/affected.rs`.
+
+rustfmt is not always idempotent. If `--write` leaves a difference, run it
+again. Source-pin tests match the formatted text, so a reformatted line they
+read needs its pin moved with it.
+
+The check needs `rustfmt` on `PATH`, which the host toolchain is expected
+to provide; a minimal rustup profile does not. td's own source-built Rust
+toolchain does not ship it yet, so on a td system the two preflights fail,
+saying so, until it does. rustfmt also reads a `rustfmt.toml` above the
+repository or in the user's configuration directory, as `cargo fmt` does;
+keep none there.
+
 # Test binaries run under a memory ceiling
 
 Namespace workloads inherit only their configured standard descriptors.

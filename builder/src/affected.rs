@@ -1642,6 +1642,13 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         )),
     }
 
+    // A Rust file no arm above maps is outside every format root, and the
+    // cargo-test preflight's format check refuses it by name: selecting the
+    // preflight is what makes a new tree of Rust red rather than go unchecked.
+    if p.ends_with(".rs") {
+        sel.add_preflight("cargo-test");
+    }
+
     // Catch-all: an unmapped path used to require the FULL loop; it now runs
     // the whole behavioral tier — there is no narrower honest answer.
     sel.add_target("check");
@@ -1660,6 +1667,27 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 /// arguments.
 const SHELL_SYNTAX: &str = "for f in start build-qcow test-iso host-preflight.sh news mail tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done";
 
+/// The repository-wide format check, as the preflights spell it: this binary's
+/// `gate-crates fmt --all` (`check_format`).
+fn format_check_cmd() -> Result<String, String> {
+    let binary = std::env::current_exe().map_err(|e| format!("gate executable: {e}"))?;
+    let quoted = shell_quote(&binary).ok_or("gate executable path cannot be shell-quoted")?;
+    Ok(format!("{quoted} gate-crates fmt --all"))
+}
+
+/// Whether a cargo-test command is the format check.
+fn is_format_check(command: &str) -> bool {
+    command.ends_with(" gate-crates fmt --all")
+}
+
+/// td-net's tests. td-net is outside the roster, so the format check rides its
+/// preflight too, ahead of them.
+const NET_TESTS: &str = "CC=gcc cargo test --frozen --manifest-path net/Cargo.toml";
+
+fn net_test_cmd() -> Result<String, String> {
+    Ok(format!("{} && {NET_TESTS}", format_check_cmd()?))
+}
+
 fn preflight_cmd(root: &Path, name: &str, changed: &[String]) -> Option<String> {
     match name {
         "shell-syntax" => Some(format!("  {}", SHELL_SYNTAX)),
@@ -1675,9 +1703,8 @@ fn preflight_cmd(root: &Path, name: &str, changed: &[String]) -> Option<String> 
             // here rather than quietly advertising a narrower run.
             Err(e) => Some(format!("  cargo-test: UNAVAILABLE — {e}")),
         },
-        "net-test" => {
-            Some("  CC=gcc cargo test --frozen --manifest-path net/Cargo.toml".to_string())
-        }
+        // Named as the other lines name it; the run spells out this binary.
+        "net-test" => Some(format!("  td-builder gate-crates fmt --all && {NET_TESTS}")),
         "affected-self-test" => Some("  td-builder affected-checks --self-test".to_string()),
         "local-source-roster" => Some("  td-recipe-eval local-source-roster --check".to_string()),
         _ => None,
@@ -1688,7 +1715,7 @@ fn preflight_cmd(root: &Path, name: &str, changed: &[String]) -> Option<String> 
 /// with the manifests it will actually visit.
 fn render_cargo_test(cmds: &[String]) -> String {
     let workspace = cmds.iter().any(|c| c.contains("--workspace"));
-    let mut o = String::from("  cargo test + clippy --frozen");
+    let mut o = String::from("  rustfmt --check (every Rust file) + cargo test + clippy --frozen");
     if workspace {
         o.push_str(" --workspace (builder/recipes/engine)");
     }
@@ -2423,7 +2450,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_no_preflight!("net/Cargo.lock", "local-source-roster");
     assert_contains!(
         "net/src/ostree.rs",
-        "CC=gcc cargo test --frozen --manifest-path net/Cargo.toml"
+        "td-builder gate-crates fmt --all && CC=gcc cargo test --frozen --manifest-path net/Cargo.toml"
     );
     // td-kexec/src is include_str!'d into the target artifact, so a helper-source edit
     // rides the host cargo preflight AND is recorded against recipe-checks,
@@ -2926,6 +2953,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_runs!("builder/src/gates.rs", "check");
     assert_branch_policy!("builder/src/gates.rs", "the full check would be waived");
     assert_runs!("new/unmapped.file", "check");
+    assert_preflight!("new/tree/src/lib.rs", "cargo-test");
     assert_branch_policy!("new/unmapped.file", "the full check would be waived");
     // A chain diff names BOTH its focused target (bootstrap-seed) and the proof of
     // the whole ladder (recipe-checks) — #397: the per-rung bootstrap-gcc-mesboot
@@ -3026,6 +3054,16 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        [op, all] if op == "fmt" && all == "--all" => match check_format(&root, false) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        },
+        [op, all, write] if op == "fmt" && all == "--all" && write == "--write" => {
+            match check_format(&root, true) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
         [op] if op == "cargo-cmds" => match gate_cargo_cmds(&root) {
             Ok(cmds) if !cmds.is_empty() => {
                 for cmd in cmds {
@@ -3125,6 +3163,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
         _ => {
             eprintln!("usage: td-builder gate-crates locks");
             eprintln!("       td-builder gate-crates cargo-cmds");
+            eprintln!("       td-builder gate-crates fmt --all [--write]");
             eprintln!("       td-builder gate-crates names");
             eprintln!("       td-builder gate-crates crypto-cargo test|clippy --manifest-path CRATE/Cargo.toml");
             eprintln!(
@@ -3181,6 +3220,16 @@ fn run_shell(root: &Path, script: &str) -> i32 {
         .unwrap_or(1)
 }
 
+/// The group a cargo-test command runs in: its crate's, the workspace's
+/// (None), or the format check's own, so that a drift anywhere fails the
+/// preflight without stopping the workspace suites queued behind it.
+fn cargo_group_key(cmd: &str) -> Option<String> {
+    if is_format_check(cmd) {
+        return Some("(format check)".to_string());
+    }
+    cmd_manifest_crate(cmd).map(str::to_string)
+}
+
 /// Run the cargo commands as one group per manifest — the workspace's and
 /// each crate's — several groups at a time. The commands were one serial
 /// list, and each cargo run left most of the machine idle: a crate's suite
@@ -3203,7 +3252,7 @@ fn run_cargo_groups(root: &Path, cmds: &[String]) -> i32 {
     use std::sync::{Mutex, PoisonError};
     let mut groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
     for cmd in cmds {
-        let key = cmd_manifest_crate(cmd).map(str::to_string);
+        let key = cargo_group_key(cmd);
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, list)) => list.push(cmd.clone()),
             None => groups.push((key, vec![cmd.clone()])),
@@ -4224,6 +4273,12 @@ fn is_shell_safe(c: char) -> bool {
 /// member, since the workspace is dependency-free. Read from the root manifest
 /// so adding a member does not need a count changed here as well.
 fn workspace_member_count(root: &Path) -> Result<usize, String> {
+    Ok(workspace_members(root)?.len())
+}
+
+/// The workspace's member directories, as the root manifest's one-line
+/// `members` array names them.
+fn workspace_members(root: &Path) -> Result<Vec<String>, String> {
     let manifest = root.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest)
         .map_err(|e| format!("{} could not be read: {e}", manifest.display()))?;
@@ -4240,16 +4295,17 @@ fn workspace_member_count(root: &Path) -> Result<usize, String> {
         let Some(end) = rest.find(']') else {
             return Err("root Cargo.toml `members` does not close on its line".to_string());
         };
-        let n = rest
+        let members: Vec<String> = rest
             .get(..end)
             .unwrap_or_default()
             .split(',')
-            .filter(|s| !s.trim().is_empty())
-            .count();
-        if n == 0 {
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if members.is_empty() {
             return Err("root Cargo.toml lists no workspace members".to_string());
         }
-        return Ok(n);
+        return Ok(members);
     }
     Err("root Cargo.toml has no `members =` line".to_string())
 }
@@ -4658,8 +4714,13 @@ fn cmd_manifest_crate(cmd: &str) -> Option<&str> {
     Some(cmd.rsplit_once("--manifest-path ")?.1.split_once('/')?.0)
 }
 
-/// What the `cargo-test` preflight runs, in order: every `cargo test` before
-/// every `cargo clippy`, the workspace before the standalone crates.
+/// What the `cargo-test` preflight runs, in order: the format check, then
+/// every `cargo test` before every `cargo clippy`, the workspace before the
+/// standalone crates. The format check covers every Rust tree and belongs to
+/// no one crate, so it runs with the workspace group on every run, narrowed or
+/// not: a repository-wide claim, like the lock guard's. The runner takes the
+/// groups side by side, so a drift fails the preflight rather than stopping
+/// the other crates' tests.
 ///
 /// Derived from the SAME roster the lock guard reads, so the two can no longer
 /// be two hand-written copies of one crate set that drift apart — which is what
@@ -4667,7 +4728,10 @@ fn cmd_manifest_crate(cmd: &str) -> Option<&str> {
 /// written to catch after `td-install` landed guarded but uncompiled.
 fn cargo_test_cmds_all(root: &Path) -> Result<Vec<String>, String> {
     let crates = discover_gate_crates(root)?;
-    let mut out = vec!["cargo test --frozen --workspace".to_string()];
+    let mut out = vec![
+        format_check_cmd()?,
+        "cargo test --frozen --workspace".to_string(),
+    ];
     for k in &crates {
         let mut cmd = crate_test_command(k)?;
         if let Some(args) = &k.test_args {
@@ -4690,8 +4754,159 @@ fn cargo_test_cmds_all(root: &Path) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Every tree whose Rust the format check covers, relative to the repository,
+/// with the edition its manifest declares: the workspace members, every
+/// roster crate, and td-net, which is neither.
+fn format_roots(root: &Path) -> Result<Vec<(String, String)>, String> {
+    let mut dirs = workspace_members(root)?;
+    dirs.extend(discover_gate_crates(root)?.into_iter().map(|k| k.name));
+    dirs.push("net".to_string());
+    dirs.into_iter()
+        .map(|dir| {
+            let manifest = root.join(&dir).join("Cargo.toml");
+            let text = std::fs::read_to_string(&manifest)
+                .map_err(|e| format!("{} could not be read: {e}", manifest.display()))?;
+            let edition =
+                manifest_edition(&text).map_err(|e| format!("{}: {e}", manifest.display()))?;
+            Ok((dir, edition))
+        })
+        .collect()
+}
+
+/// The `edition` a manifest's `[package]` table declares, which rustfmt must
+/// be told. An inherited edition is refused rather than guessed.
+fn manifest_edition(manifest: &str) -> Result<String, String> {
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("edition").filter(|_| in_package) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if rest.starts_with('.') {
+            return Err("inherits its edition, which the format check does not resolve".into());
+        }
+        let Some(value) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        if value.len() != 4 || !value.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!("edition {value:?} is not a year"));
+        }
+        return Ok(value.to_string());
+    }
+    Err("declares no edition in [package]".to_string())
+}
+
+/// The Rust files git tracks, relative to the repository. Tracked rather than
+/// walked: build output, tool caches, the worktrees under `.claude` and editor
+/// scratch are not the source, and a hidden directory that is gets checked
+/// like any other.
+fn tracked_rust_files(root: &Path) -> Result<Vec<String>, String> {
+    let out = Command::new("git")
+        .args(["ls-files", "-z", "--", "*.rs"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("git ls-files: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-files: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8(out.stdout)
+        .map_err(|_| "git ls-files: a Rust path is not UTF-8".to_string())?;
+    Ok(text
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// `files` under the format root holding each, as (root, edition, files). A
+/// file no root holds is refused by name: that is how a new tree of Rust
+/// reds rather than goes unchecked.
+fn group_by_root(
+    files: &[String],
+    roots: &[(String, String)],
+) -> Result<Vec<(String, String, Vec<String>)>, String> {
+    let mut groups: Vec<(String, String, Vec<String>)> = roots
+        .iter()
+        .map(|(dir, edition)| (dir.clone(), edition.clone(), Vec::new()))
+        .collect();
+    for file in files {
+        // The separator matters: `td-shell/x.rs` is not in `td-sh`.
+        let holder = groups.iter_mut().find(|(dir, _, _)| {
+            file.starts_with(dir.as_str()) && file.as_bytes().get(dir.len()) == Some(&b'/')
+        });
+        match holder {
+            Some((_, _, list)) => list.push(file.clone()),
+            None => {
+                return Err(format!(
+                    "{file} is outside every format root (the workspace members, the td-* \
+                     crates and net); add its tree to format_roots"
+                ))
+            }
+        }
+    }
+    Ok(groups)
+}
+
+/// rustfmt over every tracked Rust file, not `cargo fmt`: cargo fmt formats
+/// the module tree it finds from each target, and the files that compile only
+/// through build.rs-generated `include!`/`#[path]` modules (the recipes, the
+/// gate definitions) are outside it. `write` formats instead of checking.
+fn check_format(root: &Path, write: bool) -> Result<(), String> {
+    let groups = group_by_root(&tracked_rust_files(root)?, &format_roots(root)?)?;
+    let mut drifted = Vec::new();
+    for (dir, edition, files) in groups {
+        // A tracked file deleted from the working tree has nothing to check.
+        let files: Vec<String> = files
+            .into_iter()
+            .filter(|file| root.join(file).is_file())
+            .collect();
+        if files.is_empty() {
+            continue;
+        }
+        let mut rustfmt = Command::new("rustfmt");
+        rustfmt.args(["--edition", edition.as_str()]);
+        if !write {
+            rustfmt.arg("--check");
+        }
+        let status = rustfmt
+            .args(&files)
+            .current_dir(root)
+            .status()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "rustfmt is not on PATH, and the format check needs it (td's own Rust \
+                     toolchain does not ship it yet)"
+                        .to_string()
+                } else {
+                    format!("rustfmt: {e}")
+                }
+            })?;
+        if !status.success() {
+            drifted.push(dir);
+        }
+    }
+    match (drifted.is_empty(), write) {
+        (true, _) => Ok(()),
+        (false, true) => Err(format!("rustfmt failed in {}", drifted.join(", "))),
+        (false, false) => Err(format!(
+            "not rustfmt-formatted: {}; `td-builder gate-crates fmt --all --write` formats them",
+            drifted.join(", ")
+        )),
+    }
+}
+
 /// The cargo commands gate 325 runs IN the loop sandbox, derived from the same
-/// roster as the host preflight's.
+/// roster as the host preflight's. The format check is not among them: that
+/// gate's provisioned toolchain promises rustc, cargo and clippy, not rustfmt.
 ///
 /// Kept apart from `cargo_test_cmds_all` rather than shared: the two legs run
 /// deliberately different suites (see `GateCrate::gate_test_args`), and the
@@ -4828,10 +5043,13 @@ fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
             }
             run_cargo_groups(root, &cmds)
         }
-        "net-test" => run_shell(
-            root,
-            "CC=gcc cargo test --frozen --manifest-path net/Cargo.toml",
-        ),
+        "net-test" => match net_test_cmd() {
+            Ok(cmd) => run_shell(root, &cmd),
+            Err(e) => {
+                eprintln!("affected-checks: {e}");
+                1
+            }
+        },
         // The dispatcher's own self-test — run IN-PROCESS (the shell oracle is gone,
         // and this binary IS the dispatcher), so no `td-builder` re-resolution.
         "affected-self-test" => {
@@ -5085,6 +5303,12 @@ pub(crate) fn run_selected(root: &Path, args: &[String], defer_checks: bool) -> 
 
 #[cfg(test)]
 mod tests {
+    /// Whether a cargo-test command covers more than one crate: the workspace
+    /// suites, and the format check, which covers every Rust tree.
+    fn is_workspace_cmd(command: &str) -> bool {
+        command.contains("--workspace") || is_format_check(command)
+    }
+
     fn cargo_driver(command: &str, driver: &str) -> bool {
         command.starts_with(driver)
             || driver
@@ -7614,6 +7838,133 @@ mod tests {
         );
     }
 
+    /// Every tracked Rust file is under a format root, which is what lets the
+    /// check run at all.
+    #[test]
+    fn every_tracked_rust_file_is_under_a_format_root() {
+        let root = repo_root();
+        let Ok(roots) = format_roots(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        let Ok(files) = tracked_rust_files(&root) else {
+            eprintln!("SKIP: no git checkout");
+            return;
+        };
+        assert!(files.len() > 900, "{} files", files.len());
+        let groups = group_by_root(&files, &roots).unwrap();
+        assert_eq!(
+            groups.iter().map(|(_, _, f)| f.len()).sum::<usize>(),
+            files.len()
+        );
+    }
+
+    /// A file belongs to the root that holds it, whole path segment, and a
+    /// file no root holds is refused by name.
+    #[test]
+    fn format_groups_follow_path_segments_and_refuse_strays() {
+        let roots = [
+            ("builder".to_string(), "2021".to_string()),
+            ("td-sh".to_string(), "2018".to_string()),
+        ];
+        let files = ["builder/src/a.rs".to_string(), "td-sh/.x/y.rs".to_string()];
+        let groups = group_by_root(&files, &roots).unwrap();
+        assert_eq!(
+            groups,
+            [
+                (
+                    "builder".to_string(),
+                    "2021".to_string(),
+                    vec!["builder/src/a.rs".to_string()]
+                ),
+                (
+                    "td-sh".to_string(),
+                    "2018".to_string(),
+                    vec!["td-sh/.x/y.rs".to_string()]
+                ),
+            ]
+        );
+        for stray in ["td-shell/src/main.rs", "extra/lib.rs", "main.rs"] {
+            let err = group_by_root(&[stray.to_string()], &roots).unwrap_err();
+            assert!(err.starts_with(stray), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_edition_is_read_from_its_package_table_only() {
+        let edition = |text: &str| manifest_edition(text);
+        assert_eq!(
+            edition("[package]\nname = \"x\"\nedition = \"2021\"\n").as_deref(),
+            Ok("2021")
+        );
+        assert_eq!(
+            edition("[package]\nedition = '2018' # old\n").as_deref(),
+            Ok("2018")
+        );
+        assert_eq!(
+            edition("[package.metadata.x]\nedition = \"1999\"\n[package]\nedition = \"2021\"\n")
+                .as_deref(),
+            Ok("2021")
+        );
+        assert!(edition("[package]\nedition.workspace = true\n").is_err());
+        assert!(edition("[package]\nedition = \"next\"\n").is_err());
+        assert!(edition("[dependencies]\nedition = \"2021\"\n").is_err());
+        assert!(edition("[package]\nname = \"x\"\n").is_err());
+    }
+
+    #[test]
+    fn every_format_root_is_on_edition_2021() {
+        let Ok(roots) = format_roots(&repo_root()) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        for (dir, edition) in roots {
+            assert_eq!(edition, "2021", "{dir}");
+        }
+    }
+
+    /// One format check, first, in the host preflight and td-net's; none in
+    /// gate 325, whose toolchain need not have rustfmt.
+    #[test]
+    fn the_format_check_runs_first_and_host_side_only() {
+        let root = repo_root();
+        let Ok(cmds) = cargo_test_cmds_all(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        let fmt = format_check_cmd().unwrap();
+        assert_eq!(cmds.first(), Some(&fmt));
+        assert_eq!(cmds.iter().filter(|c| **c == fmt).count(), 1);
+        assert!(net_test_cmd().unwrap().starts_with(&format!("{fmt} && ")));
+        assert!(!gate_cargo_cmds(&root)
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("gate-crates fmt")));
+    }
+
+    /// The format check runs as a group of its own, beside the workspace's
+    /// rather than ahead of it: a group stops at its first failure.
+    #[test]
+    fn the_format_check_is_a_cargo_group_of_its_own() {
+        let root = repo_root();
+        let Ok(cmds) = cargo_test_cmds_all(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        let fmt = cmds.iter().find(|c| is_format_check(c)).unwrap();
+        let key = cargo_group_key(fmt);
+        assert!(key.is_some());
+        assert!(cmds
+            .iter()
+            .filter(|c| *c != fmt)
+            .all(|c| cargo_group_key(c) != key));
+        assert_eq!(cargo_group_key("cargo test --frozen --workspace"), None);
+        assert_eq!(
+            cargo_group_key("cargo test --frozen --manifest-path td-sh/Cargo.toml").as_deref(),
+            Some("td-sh")
+        );
+    }
+
     #[test]
     fn both_crypto_legs_require_the_offline_wrapper() {
         let root = repo_root();
@@ -7679,7 +8030,7 @@ mod tests {
     fn every_cargo_command_has_the_shape_the_parser_assumes() {
         for cmd in gate_cmds() {
             let cmd = cmd.as_str();
-            if cmd.contains("--workspace") {
+            if is_workspace_cmd(cmd) {
                 assert_eq!(cmd_manifest_crate(cmd), None, "{cmd:?}");
                 continue;
             }
@@ -7712,24 +8063,24 @@ mod tests {
             out.dedup();
             out
         };
-        let workspace = |cmds: &[String]| cmds.iter().filter(|c| c.contains("--workspace")).count();
+        let workspace = |cmds: &[String]| cmds.iter().filter(|c| is_workspace_cmd(c)).count();
         // td-review: the workspace suite and its own, nothing else — nobody
         // reads it.
         let review = one("td-review/src/land.rs");
-        assert_eq!(review.len(), 4, "{review:?}");
-        assert_eq!(workspace(&review), 2);
+        assert_eq!(review.len(), 5, "{review:?}");
+        assert_eq!(workspace(&review), 3);
         assert_eq!(names(&review), ["td-review"]);
         let vm = one("td-vm/src/bin/td-vm-registrar.rs");
-        assert_eq!(workspace(&vm), 2);
+        assert_eq!(workspace(&vm), 3);
         // An embedded crate nobody else reads: the same shape.
         let sh = one("td-sh/src/main.rs");
-        assert_eq!(sh.len(), 4, "{sh:?}");
+        assert_eq!(sh.len(), 5, "{sh:?}");
         assert_eq!(names(&sh), ["td-sh"]);
         // td-setup is now a target recipe with a realized-output check, but
         // no other host crate reads it: its host selection remains its own
         // commands and the workspace suite plus the native compositor case.
         let setup = one("td-setup/src/welcome.rs");
-        assert_eq!(setup.len(), 5, "{setup:?}");
+        assert_eq!(setup.len(), 6, "{setup:?}");
         assert_eq!(names(&setup), ["td-setup"]);
         // A crate others read brings its readers: td-portal and td-editor build
         // modules out of td-compositor sources, so a change there is a change
@@ -7764,8 +8115,9 @@ mod tests {
         // td-photo's and td-mail's native cases make their commands three,
         // as td-setup's are; td-news, a toolkit consumer with no native
         // case, adds two. The test-only P-256 oracle connects td-secret
-        // to td-crypto and then td-mta, adding two commands each.
-        assert_eq!(comp.len(), 48, "{comp:?}");
+        // to td-crypto and then td-mta, adding two commands each. The format
+        // check rides with the workspace.
+        assert_eq!(comp.len(), 49, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -7799,10 +8151,13 @@ mod tests {
             names(&one("td-boot/src/protocol.rs")),
             ["td-boot", "td-install", "td-setup", "td-update"]
         );
-        // The order holds within a narrowed list: every test before any clippy,
-        // the workspace first.
+        // The order holds within a narrowed list: the format check, then every
+        // test before any clippy, the workspace first.
         assert!(comp
             .first()
+            .is_some_and(|c| c.ends_with(" gate-crates fmt --all")));
+        assert!(comp
+            .get(1)
             .is_some_and(|c| c.starts_with("cargo test --frozen --workspace")));
         let last_test = comp
             .iter()
@@ -7832,7 +8187,7 @@ mod tests {
             ],
         )
         .expect("narrowing");
-        assert_eq!(two.len(), 6, "{two:?}");
+        assert_eq!(two.len(), 7, "{two:?}");
         assert_eq!(names(&two), ["td-review", "td-sh"]);
         // One narrowable path does not license the OTHERS in the same diff.
         assert_eq!(
@@ -8102,7 +8457,7 @@ mod tests {
         let full = preflight_cmd(&root, "cargo-test", &["builder/src/main.rs".to_string()])
             .unwrap_or_default();
         assert!(full.starts_with(
-            "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path "
+            "  rustfmt --check (every Rust file) + cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path "
         ));
         // Every gated crate by name rather than one pinned spelling of the
         // whole line: the roster is derived now, so an expectation that listed
@@ -8757,13 +9112,16 @@ mod tests {
         let mut mine = Selection::default();
         map_path(&root, &roster, "td-fresh/src/main.rs", &mut mine);
         // A path in NO discovered crate must keep the catch-all exactly, or this
-        // arm has become a second catch-all that runs cargo for anything.
+        // arm has become a second catch-all that runs cargo for anything. Not a
+        // Rust file: an unmapped one takes the preflight for its format check.
         let mut other = Selection::default();
-        map_path(&root, &roster, "who/knows.rs", &mut other);
+        map_path(&root, &roster, "who/knows.txt", &mut other);
+        let mut stray_rust = Selection::default();
+        map_path(&root, &roster, "who/knows.rs", &mut stray_rust);
         // …and a crate whose name is only a PREFIX of the discovered one is a
         // different crate.
         let mut near = Selection::default();
-        map_path(&root, &roster, "td-fresher/src/main.rs", &mut near);
+        map_path(&root, &roster, "td-fresher/README", &mut near);
         std::fs::remove_dir_all(&root).ok();
 
         assert!(
@@ -8785,6 +9143,11 @@ mod tests {
             !near.preflights.iter().any(|x| x == "cargo-test"),
             "td-fresher is not td-fresh: {:?}",
             near.preflights
+        );
+        assert!(
+            stray_rust.preflights.iter().any(|x| x == "cargo-test"),
+            "an unmapped Rust file reaches the format check: {:?}",
+            stray_rust.preflights
         );
     }
 
@@ -9602,7 +9965,7 @@ mod tests {
                 "  td-review/src/land.rs",
                 "",
                 "Selected checks:",
-                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-review/Cargo.toml -- --include-ignored",
+                "  rustfmt --check (every Rust file) + cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-review/Cargo.toml -- --include-ignored",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
                 "Branch-mode policy for these paths: the full check would be waived",
