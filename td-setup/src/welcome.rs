@@ -37,7 +37,7 @@ pub const BODY: [&str; 3] = [
 /// The status-row footer naming this step of the wizard. INSTALLER.md's
 /// sequence is welcome, destination disk, account and regional settings,
 /// review, installation progress, completion: six steps.
-pub const FOOTER: &str = "Welcome \u{b7} step 1 of 6";
+pub const FOOTER: &str = "Welcome \u{b7} step 1 of 6 \u{b7} Enter to continue";
 
 /// The left and right text margin, in reference pixels: one cell, matching
 /// the chrome bands' inset.

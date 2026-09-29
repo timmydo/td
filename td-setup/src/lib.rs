@@ -5,11 +5,11 @@
 //! wizard as a dependency-free Rust Wayland client over the shared
 //! toolkit's raster and chrome bands, following td-install/INSTALLER.md.
 //!
-//! The `window` turn loop currently presents the welcome page. The pure
-//! destination, settings, review and outcome views render bounded inputs
-//! but are not yet connected to that loop. The privileged disk writer
-//! stays in td-install; this front end holds no disk-writing authority
-//! (INSTALLER.md). Navigation and service wiring follow later.
+//! The `window` turn loop presents welcome and a service-unavailable
+//! destination state. The pure settings, review and outcome views render
+//! bounded inputs but are not yet connected to that loop. The privileged
+//! disk writer stays in td-install; this front end holds no disk-writing
+//! authority (INSTALLER.md). Service wiring and later navigation follow.
 
 pub mod destination;
 pub mod outcome;
@@ -71,6 +71,10 @@ pub fn render_check() -> Result<(), String> {
         wwid: Some(&"W".repeat(256)),
     })?;
     let disks = [disk.clone()];
+    paint(
+        &destination::DestinationPage::unavailable(surface)
+            .ok_or("unavailable destination page did not fit")?,
+    )?;
     paint(
         &destination::DestinationPage::new(surface, &[], None, 0)
             .ok_or("empty destination page did not fit")?,

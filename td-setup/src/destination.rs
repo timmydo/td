@@ -60,9 +60,28 @@ impl DestinationPage {
         first: usize,
         detail_page: usize,
     ) -> Option<Self> {
+        Self::build(surface, disks, selected, first, detail_page, false)
+    }
+
+    /// An absent service is distinct from a service reporting no eligible
+    /// disks. This state offers no selectable destination.
+    pub fn unavailable(surface: Surface) -> Option<Self> {
+        Self::build(surface, &[], None, 0, 0, true)
+    }
+
+    fn build(
+        surface: Surface,
+        disks: &[Destination],
+        selected: Option<usize>,
+        first: usize,
+        detail_page: usize,
+        unavailable: bool,
+    ) -> Option<Self> {
         surface.check().ok()?;
         let scale = surface.scale.value();
-        if surface.width < 800 * scale || surface.height < 480 * scale {
+        // The compositor's tile within an 800-pixel output is 752 pixels
+        // wide. The page's bands and bounded identity text fit that tile.
+        if surface.width < 752 * scale || surface.height < 480 * scale {
             return None;
         }
         let overflow = disks.len() > MAX_DISKS;
@@ -108,7 +127,13 @@ impl DestinationPage {
             .columns()
             .min((BLOCK_SCALARS - (DETAIL_ROWS - 1)) / DETAIL_ROWS);
         let mut lines = Vec::new();
-        if overflow {
+        if unavailable {
+            push_lines(
+                &mut lines,
+                "The installer service is unavailable. No disk can be selected. Press Escape to return.",
+                columns,
+            );
+        } else if overflow {
             push_lines(
                 &mut lines,
                 "More than 64 eligible disks were reported. Installation cannot continue.",
@@ -462,11 +487,20 @@ mod tests {
         let empty = DestinationPage::new(surface(), &[], None, 0).unwrap();
         assert_eq!(empty.selected(), None);
         assert!(empty.detail.contains("cannot continue"));
+        let unavailable = DestinationPage::unavailable(surface()).unwrap();
+        assert_eq!(unavailable.selected(), None);
+        assert!(unavailable.rows.is_empty());
+        assert!(unavailable.detail.contains("service is unavailable"));
+        assert!(!unavailable
+            .detail
+            .contains("No eligible disks were reported"));
         assert!(DestinationPage::new(surface(), &[], Some(0), 0).is_none());
         let small = Surface::new(640, 480, Scale::new(1).unwrap()).unwrap();
         assert!(DestinationPage::new(small, &[], None, 0).is_none());
-        let minimum = Surface::new(800, 480, Scale::new(1).unwrap()).unwrap();
+        let minimum = Surface::new(752, 480, Scale::new(1).unwrap()).unwrap();
         assert!(DestinationPage::new(minimum, &[], None, 0).is_some());
+        let narrower = Surface::new(751, 480, Scale::new(1).unwrap()).unwrap();
+        assert!(DestinationPage::new(narrower, &[], None, 0).is_none());
     }
 
     #[test]
@@ -508,6 +542,23 @@ mod tests {
         let wide = Surface::new(2400, 480, Scale::new(1).unwrap()).unwrap();
         let resized = DestinationPage::new(wide, &disks, Some(0), pages).unwrap();
         assert_eq!(resized.detail_position().0, resized.detail_position().1 - 1);
+
+        // The compositor's 800-pixel output gives the installer a 752-pixel
+        // tile. Paint every detail page there, including the long labels.
+        let tile = Surface::new(752, 508, Scale::new(1).unwrap()).unwrap();
+        let count = DestinationPage::new(tile, &disks, Some(0), 0)
+            .unwrap()
+            .detail_position()
+            .1;
+        let font = td_ui::font::pinned().unwrap();
+        let mut pixels = vec![0; tile.width * tile.height * 4];
+        for index in 0..count {
+            let page = DestinationPage::new(tile, &disks, Some(0), index).unwrap();
+            td_ui::raster::Raster::new(&mut pixels, &font, tile, tile.width * 4)
+                .unwrap()
+                .paint(&page, tile.bounds())
+                .unwrap();
+        }
     }
 
     #[test]

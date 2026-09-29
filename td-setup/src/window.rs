@@ -1,18 +1,19 @@
 //! The installer window: a `td_ui` client that presents the wizard's pages
-//! over a Wayland toplevel. For now it presents the welcome page and drives
-//! the surface lifecycle; the input that advances the wizard arrives with
-//! the later pages. It owns no Wayland objects of its own, so its `Tag` is
+//! over a Wayland toplevel. It moves between welcome and the unavailable
+//! destination state while the installer service is absent. It owns no
+//! Wayland objects of its own, so its `Tag` is
 //! the empty `Object`; the seat and its devices are the client's.
 
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use td_ui::client::{run, App, Client, Handled, Tag};
+use td_ui::client::{run, App, Client, Handled, KeyboardEvent, Tag};
 use td_ui::font::Font;
 use td_ui::raster::{Draw, Primitive, Raster, Scale, Surface, CHROME};
 use td_ui::wayland::{connect, endpoint};
 use td_ui::wire::Message;
 
+use crate::destination::DestinationPage;
 use crate::welcome::Welcome;
 
 type Result<T> = std::result::Result<T, String>;
@@ -39,6 +40,31 @@ struct Window {
     font: Font,
     size: (usize, usize),
     dirty: bool,
+    page: Page,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Page {
+    Welcome,
+    DestinationUnavailable,
+}
+
+impl Page {
+    fn key(self, chord: &str) -> Self {
+        match (self, chord) {
+            (Self::Welcome, "Return" | "KP_Enter") => Self::DestinationUnavailable,
+            (Self::DestinationUnavailable, "Escape") => Self::Welcome,
+            _ => self,
+        }
+    }
+}
+
+fn keyboard_page(page: Page, event: KeyboardEvent) -> Result<Page> {
+    match event {
+        KeyboardEvent::Key { stroke, .. } => Ok(page.key(&stroke.chord)),
+        KeyboardEvent::Keymap(Err(detail)) => Err(format!("keyboard keymap: {detail}")),
+        _ => Ok(page),
+    }
 }
 
 impl Window {
@@ -48,6 +74,7 @@ impl Window {
             font: td_ui::font::pinned()?,
             size: DEFAULT_SIZE,
             dirty: true,
+            page: Page::Welcome,
         })
     }
 
@@ -87,20 +114,26 @@ impl Window {
                 self.client.close();
                 Ok(())
             }
-            // The first page reads nothing from the seat or the clipboard, so
-            // their events, the seat itself going, and a removed optional
-            // global need no action; only a lost required global is fatal for
-            // a live installer window. (A seat-needing later page revisits
-            // this, as td-editor's window does.)
             Handled::GlobalRemoved { required: true, .. } => {
                 Err("required Wayland global was removed".into())
             }
+            Handled::Capabilities {
+                keyboard: false, ..
+            }
+            | Handled::SeatRemoved => Err("installer keyboard is unavailable".into()),
+            // Only translated keyboard presses navigate the live pages.
+            Handled::Keyboard(event) => {
+                let next = keyboard_page(self.page, event)?;
+                if next != self.page {
+                    self.page = next;
+                    self.dirty = true;
+                }
+                Ok(())
+            }
             Handled::GlobalRemoved { .. }
             | Handled::Capabilities { .. }
-            | Handled::Keyboard(_)
             | Handled::Pointer(_)
             | Handled::Clipboard(_) => Ok(()),
-            Handled::SeatRemoved => Ok(()),
             Handled::Unhandled => Err(format!(
                 "unexpected Wayland event {}:{}",
                 message.object, message.opcode
@@ -114,11 +147,19 @@ impl Window {
         }
         let (width, height) = self.size;
         let surface = Surface::new(width, height, Scale::new(1).map_err(error)?).map_err(error)?;
-        let Window { client, font, .. } = self;
+        let Window {
+            client, font, page, ..
+        } = self;
         let presented = client.present(width, height, &mut |pixels| {
             let mut raster = Raster::new(pixels, font, surface, width * 4).map_err(error)?;
-            match Welcome::new(surface) {
-                Some(page) => raster.paint(&page, surface.bounds()).map_err(error),
+            let painted = match page {
+                Page::Welcome => Welcome::new(surface)
+                    .map(|view| raster.paint(&view, surface.bounds()).map_err(error)),
+                Page::DestinationUnavailable => DestinationPage::unavailable(surface)
+                    .map(|view| raster.paint(&view, surface.bounds()).map_err(error)),
+            };
+            match painted {
+                Some(result) => result,
                 // Too small for the page: a plain chrome ground, never garbage.
                 None => {
                     raster.draw(Draw {
@@ -171,7 +212,7 @@ impl App for Window {
 
 /// Opens the installer window: resolves the display endpoint from the
 /// environment, connects, and runs the turn loop presenting the welcome
-/// page.
+/// page and the unavailable destination state.
 pub fn run_window() -> std::io::Result<()> {
     let work = || -> Result<()> {
         let endpoint = endpoint(
@@ -184,4 +225,21 @@ pub fn run_window() -> std::io::Result<()> {
         run(&mut window)
     };
     work().map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+#[test]
+fn navigation_stops_at_the_service_boundary_and_returns() {
+    assert_eq!(Page::Welcome.key("Return"), Page::DestinationUnavailable);
+    assert_eq!(Page::Welcome.key("KP_Enter"), Page::DestinationUnavailable);
+    assert_eq!(
+        Page::DestinationUnavailable.key("Return"),
+        Page::DestinationUnavailable
+    );
+    assert_eq!(Page::DestinationUnavailable.key("Escape"), Page::Welcome);
+    assert_eq!(Page::Welcome.key("Escape"), Page::Welcome);
+    assert_eq!(
+        keyboard_page(Page::Welcome, KeyboardEvent::Keymap(Err("bad map".into()))),
+        Err("keyboard keymap: bad map".into())
+    );
 }

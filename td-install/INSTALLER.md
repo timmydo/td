@@ -61,11 +61,13 @@ mounts, then builds with the target Rust toolchain. The check runs
 reference size, including all destination and review detail pages and every
 progress outcome, without emitting image bytes. Its data is synthetic and
 grants no authority.
-This establishes an image-eligible executable whose window presents only
-the welcome page. Its library also has pure, unconnected destination,
-settings, review, progress and completion views. The release live profile
-must wait for navigation, its paired service, trusted consent, and end-to-end
-installation evidence.
+This establishes an image-eligible executable whose window presents welcome
+and, on Enter, an explicit service-unavailable destination page. Escape
+returns to welcome. The destination page has no selectable disk and cannot
+advance until a paired service reports eligible destinations. Its library also has
+pure, unconnected settings, review, progress and completion views. The
+release live profile must wait for later navigation, its paired service,
+trusted consent, and end-to-end installation evidence.
 
 The destination page is a pure view over `Destination` values supplied by
 the future service. It shows capacity, model, kernel name, device number,
@@ -80,8 +82,9 @@ row is only a navigation index; the service must still
 authenticate the source, establish eligibility and retain the disk claim.
 The page uses the pure `td-install` library's plan module. Its target recipe
 stages that sibling source tree and its confinement test pins the library's
-single public module. The page is not yet connected to the live window or a
-service.
+single public module. The live window uses only its service-unavailable
+state; it has no service connection or selected destination yet. The page
+fits the compositor's 752-pixel tile within an 800-pixel headless output.
 
 The account and regional settings page is also a pure view. Username and
 hostname are text entries; keyboard layout and time zone are chooser rows

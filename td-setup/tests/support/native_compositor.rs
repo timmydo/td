@@ -4,8 +4,8 @@
 //! `TD_TEST_COMPOSITOR` binary, and `SetupProcess` launches the installer as
 //! an ordinary client against its Wayland socket. The one case proves the
 //! whole live path the wire tests cannot: the client connects, binds, obeys
-//! the compositor's configure, and presents the welcome page, whose captured
-//! pixels equal the crate's own `preview` of the same surface.
+//! the compositor's configure, accepts a keyboard press, and presents the
+//! welcome and unavailable destination pages pixel for pixel.
 
 use super::*;
 
@@ -278,8 +278,7 @@ impl Drop for Compositor {
 }
 
 /// The td-setup installer launched as an ordinary Wayland client against the
-/// compositor's socket. It reads nothing from the seat and needs no control
-/// channel of its own: it maps a toplevel and presents the welcome page.
+/// compositor's socket. It maps a toplevel and reads the seat's keyboard.
 struct SetupProcess {
     child: Child,
     log: PathBuf,
@@ -313,7 +312,7 @@ impl Drop for SetupProcess {
 
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
-fn welcome_page_presents_over_the_native_compositor() {
+fn installer_navigation_presents_over_the_native_compositor() {
     let compositor_directory = Directory::new();
     let mut compositor = Compositor::start(&compositor_directory);
     let client_directory = Directory::new();
@@ -350,6 +349,75 @@ fn welcome_page_presents_over_the_native_compositor() {
     // spaced so the retry does not busy-spin the compositor and client that
     // still need CPU to settle the frame.
     let expected = td_setup::preview(place.width, place.height, 1).unwrap();
+    assert_frame(&compositor, &place, &expected, &client, "welcome");
+
+    // Enter moves to the explicit unavailable state; Escape returns to
+    // welcome. The pure state test proves that a second Enter cannot advance
+    // without a service.
+    let unavailable = unavailable_pixels(place.width, place.height);
+    for (step, (time, code, label, frame)) in [
+        (1, 28, "destination", unavailable.as_slice()),
+        (3, 1, "welcome again", expected.as_slice()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let down_action = step * 2 + 1;
+        let up_action = down_action + 1;
+        let request = format!("key {} {time} {code} down", compositor.session);
+        let reply = compositor.request(&request, 1024);
+        assert_eq!(
+            reply,
+            format!(
+                "ok\ntd-action-v1 session={} action={down_action}\n",
+                compositor.session
+            )
+            .as_bytes(),
+            "{label} key receipt"
+        );
+        let release = format!("key {} {} {code} up", compositor.session, time + 1);
+        let reply = compositor.request(&release, 1024);
+        assert_eq!(
+            reply,
+            format!(
+                "ok\ntd-action-v1 session={} action={up_action}\n",
+                compositor.session
+            )
+            .as_bytes(),
+            "{label} key release"
+        );
+        assert_frame(&compositor, &place, frame, &client, label);
+    }
+
+    drop(client);
+    compositor.stop();
+}
+
+fn unavailable_pixels(width: usize, height: usize) -> Vec<u8> {
+    use td_ui::raster::{Raster, Scale, Surface};
+    let surface = Surface::new(width, height, Scale::new(1).unwrap()).unwrap();
+    let page = td_setup::destination::DestinationPage::unavailable(surface);
+    assert!(
+        page.is_some(),
+        "destination page does not fit {width}x{height}"
+    );
+    let page = page.unwrap();
+    let font = td_ui::font::pinned().unwrap();
+    let mut pixels = vec![0; width * height * 4];
+    Raster::new(&mut pixels, &font, surface, width * 4)
+        .unwrap()
+        .paint(&page, surface.bounds())
+        .unwrap();
+    pixels
+}
+
+fn assert_frame(
+    compositor: &Compositor,
+    place: &Placement,
+    expected: &[u8],
+    client: &SetupProcess,
+    label: &str,
+) {
     let render_deadline = Instant::now() + TIMEOUT;
     let mut rendered = false;
     while Instant::now() < render_deadline {
@@ -381,10 +449,7 @@ fn welcome_page_presents_over_the_native_compositor() {
     }
     assert!(
         rendered,
-        "td-setup did not present the welcome page within {TIMEOUT:?}; client stderr: {}",
+        "td-setup did not present {label} within {TIMEOUT:?}; client stderr: {}",
         client.stderr()
     );
-
-    drop(client);
-    compositor.stop();
 }
