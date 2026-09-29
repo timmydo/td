@@ -334,7 +334,7 @@ Split at these concrete boundaries before dependent milestones start:
     `config/identities.rs`: compact cells, shared arena ownership checks,
     forward references, ordered lists, null/empty distinctions, raw visible
     strings, signature-file references and sorted unique IDs. Fits the 8/64 KiB
-    identity/address reservations, including room for two future signature spans.
+    identity/address reservations, including the two resolved signature spans.
     Live borrowed text views allow protected loading to inspect paths and then
     append without freezing early. Stanza dispatch/EOF remain d; protected
     signature materialization and preimage invocation remain M04b3, using its
@@ -464,10 +464,16 @@ Split at these concrete boundaries before dependent milestones start:
     raw caps and private-mode requirements. Owner-bound cursor callbacks
     release candidate borrows between requests and refuse stale reuse;
     requests establish no file trust. SCHEMA.md defines M05's checks.
-  - **M04b3b2:** remaining M05 adapter integration, exclusive finalization,
-    resolved spans, identity materialization and preimage encoding, plus
-    streamed redacted effective output. Qualify each new compiled path and
-    combined memory before service integration.
+  - **M04b3b2a:** implemented exclusive text-input materialization from Loaded,
+    stream-scratch reuse, resolved signature spans and private relay-password
+    handle within the existing text arena. Independent signature-completion
+    flags refuse omissions/duplicates; the decoder window clears on return or
+    unwind. Failures return header-free storage with typed input context.
+    This content-only stage establishes no protected-file or runtime authority.
+  - **M04b3b2b:** remaining M05 adapter integration, provider validation,
+    identity materialization and preimage encoding, plus streamed redacted
+    effective output. Qualify each new compiled path and combined memory
+    before service integration.
 - **M04c1:** checked u64 disk/work settings and capacity-derived maintenance
   validation in `admission.rs`; configuration uses this committed plan.
 - **M04c2:** charged work meters in `admission/work.rs` and checked

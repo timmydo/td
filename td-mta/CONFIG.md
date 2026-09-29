@@ -625,9 +625,10 @@ not materialize signatures or produce the identity preimage.
 The caller provides 1..64 opaque identity cells of at most 128 bytes,
 0..2048 opaque address cells of at most 32 bytes, and the shared
 non-routing text builder. Compile-time checks pin the layouts and
-address-index sentinel. Identity layout reserves two additional
-eight-byte signature spans inside the existing 128-byte ceiling for
-M04b3. Construction checks caller capacities against the existing 8/64
+address-index sentinel. Identity layout includes two resolved eight-byte
+signature spans inside the existing 128-byte ceiling; M04b3b2a fills them
+only while consuming an unpublished candidate. Construction checks caller
+capacities against the existing 8/64
 KiB metadata reservations. There is no second text arena or address
 vector. The enclosing table binds to the text builder's process-local
 owner; every mutation verifies that owner. Only config-private checked
@@ -666,9 +667,9 @@ list selectors. It sorts identities by raw ID and returns structural
 records retaining a private exclusive borrow of identity cells. Public
 views borrow those records read-only. Records may be consumed into the sealed
 candidate described below.
-M04b3 consumes exclusive candidate access and fills the two reserved
-signature spans after protected reads; it must
-not mutate a published snapshot or an outstanding read view. Duplicate
+M04b3b2a consumes exclusive candidate access and fills those spans after
+content decoding. M05 still owes protected-file checks before publication.
+It cannot mutate a published snapshot or an outstanding read view. Duplicate
 account/identity declarations format both current and prior source
 locations. Capacity errors caused while undeclared forward targets
 occupy slots also identify an earlier unresolved reference. Fixed error
@@ -1521,3 +1522,64 @@ callback payload/source chains. Trusted callers can inspect the typed
 Callback variant explicitly. A structural candidate need not prove source
 EOF; finalization must still consume `load::Loaded`. The inventory grants no
 permission, resolved-input, provider or runtime publication authority.
+
+
+## Resolved configuration text
+
+M04b3b2a adds `config::materialize::read_text`. It consumes `load::Loaded`,
+retaining the requirement for source EOF from one reader operation, and
+returns `ResolvedText` only after every configured signature and the relay
+password has decoded through EOF. A statement-only Candidate cannot create
+that wrapper. Provider key/chain/CA requests are skipped; their loading and
+validation remain M07. This is text materialization, not a fully finalized
+configuration or permission to publish, authenticate, or serve requests.
+
+The caller supplies the stream scratch after source EOF and an opener that
+returns an owned reader. Require at least the signature decoder's 16385
+bytes before any opener call. Traverse the owner-bound input cursor, open
+one text reference, decode into scratch, release the path borrow, then
+append the decoded bytes to the existing non-routing text arena. The arena
+retains its owner ticket and already initialized prefix. No new arena,
+resizable collection or concurrent read buffer is created. Opener/reader
+allocations, truthful read results, blocking and later M05 descriptor trust
+remain trusted adapter obligations. M05 must check every operator input's
+ownership, modes and secret/public inode separation before any content can
+leave the trusted configuration worker; checking only text references is
+insufficient.
+
+Two resolved spans occupy the previously reserved sixteen bytes per identity
+cell, with two completion flags inside the existing 128-byte ceiling.
+Refuse a duplicate store and verify that every configured signature path
+has completed before returning ResolvedText, independently of cursor
+exhaustion. Absent signature paths resolve to empty text; present empty files also yield empty text without erasing the
+original path's presence. Signature bytes remain exact. Relay password bytes
+use the decoder's specified line-ending rule and remain behind a private
+handle with an explicit trusted accessor. All Debug/error formatting stays
+redacted; typed input errors are available only through explicit inspection,
+with no automatic source chain. Failure retains an optional typed Target
+for explicit diagnostics without its path; whole-stage failures have none.
+M05/M07 must consume this content stage into a configuration wrapper carrying
+all descriptor, inode-separation and provider checks before publication.
+SMTP/JMAP/relay consumers must receive that validated runtime configuration,
+never ResolvedText directly. Its accessors serve trusted configuration work.
+
+Any opener, content, inventory or aggregate text-capacity failure consumes
+the candidate's headers and returns reusable Storage. Its private backing
+can retain bytes. A bounded guard fills the decoder's 16385-byte scratch
+window with zero on success, error or stack unwind; bytes beyond that
+window remain untouched. Short scratch fails before modification or I/O.
+This observable scratch hygiene is not a secure-erasure guarantee: stored
+credential bytes and copies outside this window still have their normal
+lifetimes. A separate active generation is untouched. A panic in trusted
+callback code unwinds exclusive ownership and cannot return a partial ResolvedText. This
+helper introduces no production panics or recovery mechanism.
+
+The resolved owner reports actual allocated table capacities plus its full
+inline header, replacing Candidate's inline size once. All cells retain
+their existing partition limits; the small resolved owner fits global/plan
+headroom. Individual signature/password limits do not guarantee aggregate
+fit in the 192 KiB text arena. Future identity preimage encoding has its own
+192 KiB ceiling. Existing structural stack qualification does not cover this
+new compiled finalizer: M04b3b2b/M05/M07 must qualify the complete production
+reader/finalizer/provider path before service use. Identity view assembly,
+preimage encoding, effective output and runtime publication remain pending.

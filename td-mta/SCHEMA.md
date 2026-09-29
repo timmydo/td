@@ -300,8 +300,10 @@ preserve all other bytes, including leading/trailing spaces. Refuse empty
 values, embedded line endings, tabs, controls, DEL and non-ASCII text. Read
 at most 1026 raw bytes plus one over-limit observation byte. This is a local
 configuration restriction, not the full set of strings permitted by SASL.
-M04b3a implements content decoding only; M04b3/M05 still own protected-file
-trust and candidate finalization. A decoded value grants no AUTH authority.
+M04b3a implements content decoding; M04b3b2a appends resolved text within
+an exclusively owned candidate. M05 still owns protected-file trust, and
+complete configuration finalization remains pending. A decoded value grants
+no AUTH authority.
 
 M17 must omit an AUTH initial response when it would exceed the ordinary
 SMTP command limit and use the challenge round trip instead, as required by
@@ -386,10 +388,10 @@ relay/ACME trust, every files-profile key/chain and every gateway CA, even
 an unused gateway. Absent signatures/default public roots add no reference.
 ACME-managed keys and renewed chains are service state, not operator inputs.
 Identical paths used for different roles retain separate inventory entries.
-Before any resolved input is exposed, M05 must reject a file used both as a
-secret (relay password/private key) and as a non-secret input (including the
-main configuration). Compare opened device/inode identities, not only path
-strings, so hard links cannot bypass this separation. The inventory itself
+Before any resolved input leaves the trusted configuration worker, M05 must
+reject a file used both as a secret (relay password/private key) and as a
+non-secret input (including the main configuration). Compare opened
+device/inode identities, not only path strings, so hard links cannot bypass this separation. The inventory itself
 does not perform that check. Combined key/chain PEM files are unsupported;
 keep the key in its separate private file. Successful permission checks
 alone cannot authorize exposing a secret as a signature.

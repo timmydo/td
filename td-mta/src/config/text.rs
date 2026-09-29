@@ -178,6 +178,10 @@ impl fmt::Debug for View<'_> {
     }
 }
 impl<'a> View<'a> {
+    pub(super) fn compact(self, handle: Handle) -> Result<Span, Code> {
+        self.read(handle)?;
+        Ok(handle.span)
+    }
     pub(super) fn owner(self) -> NonZeroU64 {
         self.owner
     }
@@ -217,6 +221,26 @@ impl Builder<'_> {
     }
 }
 impl Header {
+    // Append only through exclusive Candidate ownership; keep existing tickets.
+    pub(super) fn append(&mut self, bytes: &mut [u8], input: &[u8]) -> Result<Handle, Code> {
+        if bytes.len() > MAX_BYTES || self.used > bytes.len() {
+            return Err(Code::Capacity);
+        }
+        let end = self.used.checked_add(input.len()).ok_or(Code::Capacity)?;
+        let span = Span {
+            offset: u32::try_from(self.used).map_err(|_| Code::Capacity)?,
+            length: u32::try_from(input.len()).map_err(|_| Code::Capacity)?,
+        };
+        bytes
+            .get_mut(self.used..end)
+            .ok_or(Code::Capacity)?
+            .copy_from_slice(input);
+        self.used = end;
+        Ok(Handle {
+            owner: self.owner,
+            span,
+        })
+    }
     pub(super) fn view<'a>(&self, bytes: &'a [u8]) -> Result<View<'a>, Code> {
         Ok(View {
             bytes: bytes.get(..self.used).ok_or(Code::Reference)?,
@@ -229,6 +253,27 @@ impl Header {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    #[test]
+    fn sealed_append_preserves_old_handles_and_refuses_foreign_spans() {
+        let _serial = TEST_CONSTRUCTION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut bytes = [0x55; 5];
+        let mut builder = Builder::new(&mut bytes).unwrap();
+        let old = builder.append(b"abc").unwrap();
+        let mut header = builder.seal();
+        assert_eq!(header.append(&mut bytes, b"def"), Err(Code::Capacity));
+        assert_eq!(bytes, [b'a', b'b', b'c', 0x55, 0x55]);
+        let new = header.append(&mut bytes, b"de").unwrap();
+        let view = header.view(&bytes).unwrap();
+        assert_eq!(view.text(old), Ok("abc"));
+        assert_eq!(view.text(new), Ok("de"));
+        assert_eq!(view.used(), 5);
+        assert!(view.compact(old) == Ok(old.span));
+        let mut other = [0; 5];
+        let foreign = Builder::new(&mut other).unwrap().append(b"abc").unwrap();
+        assert!(view.compact(foreign) == Err(Code::Reference));
+    }
     #[test]
     fn capacity_failures_preserve_all_bytes_and_empty_values_fit() {
         let _serial = TEST_CONSTRUCTION_LOCK

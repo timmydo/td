@@ -424,7 +424,49 @@ const _: [(); 1] = [(); (size_of::<dispatch::Header>() <= 4 * 1024) as usize];
 const _: [(); 1] = [(); (size_of::<super::resources::Validated>() <= PLANS_BYTES) as usize];
 const _: [(); 1] = [(); (size_of::<graph::Header>() <= 1024) as usize];
 const _: [(); 1] = [(); (size_of::<identities::Header>() <= 128) as usize];
+const _: [(); 1] =
+    [(); (size_of::<super::materialize::ResolvedText>() <= GLOBAL_BYTES + PLANS_BYTES) as usize];
 impl Candidate {
+    pub(super) fn signatures_complete(&self) -> Result<(), text::Code> {
+        self.header
+            .identities
+            .signatures_complete(&self.storage.identities)
+    }
+    pub(super) fn append_material(&mut self, value: &str) -> Result<text::Handle, text::Code> {
+        self.header
+            .text
+            .append(&mut self.storage.text, value.as_bytes())
+    }
+    pub(super) fn store_signature(
+        &mut self,
+        id: crate::ids::IdentityId,
+        html: bool,
+        handle: text::Handle,
+    ) -> Result<(), text::Code> {
+        self.header.identities.store_signature(
+            &mut self.storage.identities,
+            self.header.text.view(&self.storage.text)?,
+            id,
+            html,
+            handle,
+        )
+    }
+    pub(super) fn material_text(&self, handle: text::Handle) -> Result<&str, text::Code> {
+        self.header.text.view(&self.storage.text)?.text(handle)
+    }
+    pub(super) fn signature_text(&self, index: usize) -> Result<Option<(&str, &str)>, text::Code> {
+        self.header.identities.signature_text(
+            &self.storage.identities,
+            self.header.text.view(&self.storage.text)?,
+            index,
+        )
+    }
+    pub(super) fn materialized_allocated_bytes(&self) -> Result<usize, Error> {
+        self.allocated_bytes()?
+            .checked_sub(size_of::<Self>())
+            .and_then(|n| n.checked_add(size_of::<super::materialize::ResolvedText>()))
+            .ok_or_else(|| layout(Region::Global))
+    }
     pub(super) fn input_owner(&self) -> Result<std::num::NonZeroU64, dispatch::Error> {
         Ok(self.text()?.owner())
     }

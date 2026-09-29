@@ -127,6 +127,8 @@ pub struct IdentitySlot {
     email: text::Span,
     text_path: text::Span,
     html_path: text::Span,
+    text_value: text::Span,
+    html_value: text::Span,
     chains: [Chain; 2],
     location: Location,
     declared: bool,
@@ -134,6 +136,8 @@ pub struct IdentitySlot {
     bcc: bool,
     has_text: bool,
     has_html: bool,
+    resolved_text: bool,
+    resolved_html: bool,
 }
 impl IdentitySlot {
     pub const EMPTY: Self = Self {
@@ -143,6 +147,8 @@ impl IdentitySlot {
         email: text::Span::EMPTY,
         text_path: text::Span::EMPTY,
         html_path: text::Span::EMPTY,
+        text_value: text::Span::EMPTY,
+        html_value: text::Span::EMPTY,
         chains: [Chain::EMPTY; 2],
         location: ORIGIN,
         declared: false,
@@ -150,6 +156,8 @@ impl IdentitySlot {
         bcc: false,
         has_text: false,
         has_html: false,
+        resolved_text: false,
+        resolved_html: false,
     };
 }
 #[derive(Clone, Copy)]
@@ -169,8 +177,7 @@ impl AddressSlot {
         has_name: false,
     };
 }
-// Reserve two future eight-byte resolved signature spans inside each cell.
-const _: [(); 1] = [(); (std::mem::size_of::<IdentitySlot>() + 16 <= 128) as usize];
+const _: [(); 1] = [(); (std::mem::size_of::<IdentitySlot>() <= 128) as usize];
 const _: [(); 1] = [(); (std::mem::size_of::<AddressSlot>() <= 32) as usize];
 const _: [(); 1] = [(); (MAX_ADDRESS_CELLS < u16::MAX as usize) as usize];
 #[derive(Clone, Copy)]
@@ -366,6 +373,8 @@ impl<'a> Builder<'a> {
                 email,
                 text_path,
                 html_path,
+                text_value: text::Span::EMPTY,
+                html_value: text::Span::EMPTY,
                 chains: old.chains,
                 location: at,
                 declared: true,
@@ -373,6 +382,8 @@ impl<'a> Builder<'a> {
                 bcc: input.bcc,
                 has_text: input.text_signature_file.is_some(),
                 has_html: input.html_signature_file.is_some(),
+                resolved_text: false,
+                resolved_html: false,
             };
             Ok(())
         })
@@ -699,6 +710,70 @@ impl Records<'_> {
     }
 }
 impl Header {
+    pub(super) fn signatures_complete(&self, slots: &[IdentitySlot]) -> Result<(), text::Code> {
+        let slots = slots.get(..self.identities).ok_or(text::Code::Reference)?;
+        if slots
+            .iter()
+            .any(|slot| slot.has_text != slot.resolved_text || slot.has_html != slot.resolved_html)
+        {
+            return Err(text::Code::Reference);
+        }
+        Ok(())
+    }
+    pub(super) fn store_signature(
+        &self,
+        slots: &mut [IdentitySlot],
+        arena: text::View<'_>,
+        id: IdentityId,
+        html: bool,
+        value: text::Handle,
+    ) -> Result<(), text::Code> {
+        if self.owner != arena.owner() {
+            return Err(text::Code::Reference);
+        }
+        let span = arena.compact(value)?;
+        let slot = slots
+            .get_mut(..self.identities)
+            .ok_or(text::Code::Reference)?
+            .iter_mut()
+            .find(|slot| slot.id == id)
+            .ok_or(text::Code::Reference)?;
+        if html {
+            if !slot.has_html || slot.resolved_html {
+                return Err(text::Code::Reference);
+            }
+            slot.html_value = span;
+            slot.resolved_html = true;
+        } else {
+            if !slot.has_text || slot.resolved_text {
+                return Err(text::Code::Reference);
+            }
+            slot.text_value = span;
+            slot.resolved_text = true;
+        }
+        Ok(())
+    }
+    pub(super) fn signature_text<'a>(
+        &self,
+        slots: &[IdentitySlot],
+        arena: text::View<'a>,
+        index: usize,
+    ) -> Result<Option<(&'a str, &'a str)>, text::Code> {
+        if self.owner != arena.owner() {
+            return Err(text::Code::Reference);
+        }
+        let Some(slot) = slots
+            .get(..self.identities)
+            .ok_or(text::Code::Reference)?
+            .get(index)
+        else {
+            return Ok(None);
+        };
+        let read = |span| {
+            std::str::from_utf8(arena.read_span(self.owner, span)?).map_err(|_| text::Code::Utf8)
+        };
+        Ok(Some((read(slot.text_value)?, read(slot.html_value)?)))
+    }
     pub(super) fn view<'a, 't>(
         &self,
         identities: &'a [IdentitySlot],

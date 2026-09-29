@@ -11,6 +11,7 @@ pub mod inputs;
 pub mod listener;
 pub mod load;
 pub mod material;
+pub mod materialize;
 pub mod outbound;
 pub mod policy;
 pub mod resources;
