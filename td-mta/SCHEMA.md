@@ -362,8 +362,13 @@ treated as separators.
 ACME account keys, orders and renewed certificates are service-managed state,
 not additional operator include files. Bound provider-parsed material in the
 separate certificate-generation ledger; do not keep an uncharged second copy
-inside configuration text. M07/M18 own key/chain matching,
-algorithm/expiry/name validation, returned identifier checks and atomic
+inside configuration text. Material formats and TLS acceptance policy are
+defined in [td-crypto/TLS.md](../td-crypto/TLS.md). In particular, initial
+local identities use P-256 with unencrypted PRIVATE KEY PKCS#8 PEM and a
+separate CERTIFICATE PEM chain; other local key formats are unsupported.
+This does not restrict the supported remote server or gateway-client key
+algorithms. The TLS loader is still unimplemented. M07/M18 own key/chain
+matching, algorithm/expiry/name validation, returned identifier checks and atomic
 renewal. No certificate is trusted merely because its profile reference
 resolves.
 

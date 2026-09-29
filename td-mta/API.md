@@ -73,8 +73,9 @@ secrets. Existing mail callers can use
 `?` across this boundary. Clock and mail/TLS transport policy remain local.
 
 The shared contract and implementation rules live in
-[td-crypto/DESIGN.md](../td-crypto/DESIGN.md). Its implemented Crypto factory,
-SHA-256, worker-local entropy and P-256 key operations use opaque td-owned
+[td-crypto/DESIGN.md](../td-crypto/DESIGN.md), with the future TLS operation
+contract in [td-crypto/TLS.md](../td-crypto/TLS.md). Its implemented Crypto
+factory, SHA-256, worker-local entropy and P-256 key operations use opaque td-owned
 handles. Direct streaming SHA-256 uses owned inline state; other implemented
 operations retain the private AWS-LC backend. TLS session APIs and
 service/resource qualification remain M07 work. Shared backend conformance
@@ -87,7 +88,15 @@ leases, sockets, deadlines and STARTTLS handoff/reset. td-crypto performs TLS
 handshakes and generic certificate validation; the mail adapter additionally
 checks gateway allowlist policy before constructing Gateway proof. A raw peer
 certificate or digest is not proof of that authorization. HTTPS/ACME and the
-smart-host client use this same boundary.
+smart-host client use this same boundary. Map shared TLS progress into the
+existing transport progress, including Pending for empty caller slices. The
+adapter assembles one bounded wire record, retains short socket-write tails,
+reports whether such a tail remains to each shared record-intake call,
+and distinguishes read EOF from write closure. It maps terminal facade errors
+to the mail Tls error, while its own lease/deadline failures keep their existing
+mail error. Any failed handshake or session aborts its socket. Shared TLS clock
+seconds come from checked conversion of the injected mail UTC milliseconds;
+negative time or Clock failure is unavailable time, never a system fallback.
 
 Shared configurations/keys and their backend allocations count in the existing
 RESOURCES.md generations and leases, including cold overlap. Moving their code

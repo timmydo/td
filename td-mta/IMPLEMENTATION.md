@@ -3,7 +3,7 @@
 ## How to use this plan
 
 Read `DESIGN.md`, root `AGENTS.md`, and `DEVELOPMENT.md` before work.
-Crypto/backend tasks also read `td-crypto/DESIGN.md`.
+Crypto/backend tasks also read `td-crypto/DESIGN.md` and `td-crypto/TLS.md`.
 Service-facing tasks also read `RESOURCES.md` and `ADMISSION.md`, including
 their named milestone-specific evidence. Message/query tasks read `POLICY.md`,
 `UNICODE.md` and `CASES.md`. Storage tasks read `STORAGE.md`.
@@ -632,8 +632,11 @@ with resumption disabled. Opaque TLS sessions, gateway authorization, native
 allocation and service resource qualification remain pending; these fixtures
 do not complete M07 or enable service.
 
-Freeze the bounded td-owned TLS configuration/session API before implementing
-consumers. Implement direct Crypto/Entropy operations and incoming/outgoing TLS
+The future TLS contract is specified in td-crypto/TLS.md, including explicit
+algorithm sets, local P-256 PEM identity admission, trust/SNI/time policy,
+bounded record progress and failure/close behavior. Concrete compiling TLS
+interfaces and their qualification are still pending. Implement direct
+Crypto/Entropy operations and incoming/outgoing TLS
 inside td-crypto. Rustls provider/configuration/verifier/key types never leave
 that crate. Implement the conformance, explicit-provider confinement, algorithm
 baseline, key compatibility and native allocation/failure qualification in
@@ -646,6 +649,35 @@ client-certificate verification. Preserve SNI, private CA override, bounded
 certificate generations and verified peer semantics. Disable unneeded
 resumption/early data. No authentication credentials reach a peer before
 verified TLS.
+
+Implement the remaining work as independently reviewable increments:
+
+- **M07b1 — material syntax:** bounded PEM/base64 decoding into caller buffers
+  and strict key/chain envelopes. Reject malformed input, wrong labels, extra
+  keys, noncanonical padding and byte/count overflow. Decoded DER is not a
+  verified identity. No listener/config publication in this increment.
+- **M07b2 — identity admission:** local key/leaf agreement, chain consistency,
+  dates, SAN coverage and usage checks; explicit private/public trust handling.
+  Use local generated fixtures for wrong keys, missing names, stale clocks,
+  expired/misordered/unsupported chains and trust replacement. Keep service
+  loading disabled until full generation allocation qualification.
+- **M07b3 — explicit TLS configuration:** compile opaque shareable handles,
+  fixed algorithm inventories, SNI/ALPN selection and supplied-clock bridge.
+  Test excluded algorithms, no global provider, mandatory gateway client
+  certificates and independent resumption refusal through this layer.
+- **M07c — opaque sessions:** implement and pin concrete public signatures
+  for TLS.md's record/plaintext/output/status/close operations. Confinement
+  tests cover the complete resolved public API. Local peers exercise one-byte
+  fragmentation, short buffers, backpressure, truncation, exact authenticated
+  evidence and permanent retirement after returned errors/Rust unwinds.
+- **M07d — mail transport:** implement existing ports through that facade,
+  with socket/lease/deadline handling, implicit client TLS, STARTTLS transition
+  fixtures and gateway pin plus address authorization. No provider type or
+  diagnostic reaches td-mta. Use td-mail-compatible local HTTPS/SMTP fixtures.
+- **M07e — resource/service admission:** qualify complete generation overlap,
+  session/handshake peaks, worker entropy and Rust/native stack/allocation/RSS
+  on the portable artifact before activating the adapters. Amend the checked
+  ledger if measurements cannot fit; never infer a bound from buffer limits.
 
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.

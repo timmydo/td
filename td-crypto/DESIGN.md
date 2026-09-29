@@ -107,8 +107,10 @@ source failure and Crypto for other recoverable provider operation failures.
 They expose no provider diagnostics, nested provider error, secret bytes or
 input-dependent formatted message. td-mta re-exports the shared traits and
 maps these errors into its own port error enum. The shared crate never imports
-that enum. TLS-specific errors and interfaces are frozen by M07 before their
-consumers are implemented; they follow the same ownership and redaction rules.
+that enum. The future TLS configuration, progress, error and authentication
+contract is
+[TLS.md](TLS.md). M07 implements its concrete interfaces before consumers;
+they follow the same ownership and redaction rules.
 
 ## Backend and TLS implementation
 
@@ -399,13 +401,13 @@ chain/time/name/client-certificate verification. Verification results distinguis
 verified identities from raw peer claims; td-mta applies gateway allowlists
 before reporting gateway authorization. There is no ignore-verification escape.
 
-M07 records accepted sets and configured preference orders for TLS versions,
-cipher suites, key-exchange groups/PQ policy, and separate certificate and
-handshake signature schemes. Record accepted PEM labels, DER forms, key
-curves and RSA sizes; reject unsupported policy inputs. Provider defaults
-cannot silently expand that baseline. Dependency or backend changes compare
-against it. Persist standard keys/certificates/digests, never provider contexts
-or backend IDs. Retain non-secret golden key fixtures, including generated,
+TLS.md records the accepted sets and preference orders for TLS versions,
+cipher suites, key-exchange groups, certificate and handshake signatures, and
+local/peer key formats. M07 must implement and test those explicit lists;
+provider defaults cannot silently expand the baseline. Dependency or backend
+changes compare against it. Persist standard keys/certificates/digests, never
+provider contexts or backend IDs. Retain non-secret golden key fixtures,
+including generated,
 accepted and rejected PKCS#8 variants and inconsistent embedded public keys.
 Replacement reconstructs contexts after restart and tests key interchange and
 rollback in both directions. Algorithm, trust or format changes need their own

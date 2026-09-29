@@ -90,6 +90,15 @@ configured memory budget does not preserve the default RSS claim.
   actual target layouts and peak stack usage must pass before this path runs.
 - TLS sessions include SMTP, HTTPS and outgoing delivery slots; handshake
   scratch is additional. The handshake cap is global in this profile.
+  TLS wire assembly and socket-write tails are charged within those entries;
+  a full framed record may occupy 18437 bytes. The main-loop 16 KiB chunk
+  limit below refers to application plaintext; one ciphertext-record turn
+  includes its bounded TLS overhead. It is not a 16 KiB wire-buffer promise.
+  Internal backend queues, peer chains and retained handshake fragments need
+  separate measurement within these same entries, not an added allowance.
+  Incoming TLS 1.3 tickets still derive secrets, query the clock and copy peer
+  chains before discard with resumption disabled. Include these temporary
+  allocations and record work in established-session measurements.
   HTTP-01/administration must use the existing fixed control/I/O reservations;
   they cannot silently add another general connection pool.
 - Each 1 MiB certificate generation includes every server profile and parsed
