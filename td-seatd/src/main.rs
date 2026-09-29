@@ -10,6 +10,9 @@ use std::process::{self, Command};
 use std::time::{Duration, Instant};
 
 const FRAMEBUFFER: &str = "/dev/fb0";
+/// The DRM card behind the framebuffer. Optional: a machine whose only
+/// display is a legacy firmware framebuffer has none.
+const CARD: &str = "/dev/dri/card0";
 const INPUT_DIR: &str = "/dev/input";
 const SOUND_DIR: &str = "/dev/snd";
 const MAX_PLAYBACK_DEVICES: usize = 64;
@@ -509,12 +512,31 @@ fn prepare_compositor_runtime(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Counts {
+    card: bool,
     inputs: usize,
     playback: usize,
 }
 
+/// The display nodes the compositor is given: the framebuffer it draws
+/// through today, and the DRM card behind it when there is one.
+#[derive(Clone, Copy)]
+struct Display<'a> {
+    framebuffer: &'a Path,
+    card: &'a Path,
+}
+
+/// Whether an optional device node exists. Only absence is optional; any
+/// other lookup failure refuses, as a required node's would.
+fn present(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("stat {}: {e}", path.display())),
+    }
+}
+
 fn assign(
-    framebuffer: &Path,
+    display: Display<'_>,
     input_dir: &Path,
     sound_dir: &Path,
     runtime: &Path,
@@ -532,13 +554,20 @@ fn assign(
         &shared_runtime(runtime, "td-guest")?, assignment.seat, require_char,
     )?;
     prepare_audio_runtime(audio_runtime, assignment.audio, require_char)?;
-    assign_path(framebuffer, assignment.compositor, require_char)?;
+    assign_path(display.framebuffer, assignment.compositor, require_char)?;
+    let card = if present(display.card)? {
+        assign_path(display.card, assignment.compositor, require_char)?;
+        true
+    } else {
+        false
+    };
     let inputs = input_paths(input_dir)?;
     for path in &inputs {
         assign_path(path, assignment.compositor, require_char)?;
     }
     let playback = assign_playback(sound_dir, assignment.audio, require_char)?;
     Ok(Counts {
+        card,
         inputs: inputs.len(),
         playback: playback.len(),
     })
@@ -564,7 +593,7 @@ fn exec_audio(args: &[String]) -> Result<(), String> {
 }
 
 fn probe(
-    framebuffer: &Path,
+    display: Display<'_>,
     input_dir: &Path,
     sound_dir: &Path,
     runtime: &Path,
@@ -585,8 +614,15 @@ fn probe(
     verify_runtime_base(vm_runtime.parent().ok_or("missing VM parent")?, require_char)?;
     verify_owner_mode(&vm_runtime, assignment.seat, 0o755)?;
     verify_owner_mode(audio_runtime, assignment.audio, 0o755)?;
-    checked_metadata(framebuffer, require_char)?;
-    verify_owner_mode(framebuffer, assignment.compositor, 0o600)?;
+    checked_metadata(display.framebuffer, require_char)?;
+    verify_owner_mode(display.framebuffer, assignment.compositor, 0o600)?;
+    let card = if present(display.card)? {
+        checked_metadata(display.card, require_char)?;
+        verify_owner_mode(display.card, assignment.compositor, 0o600)?;
+        true
+    } else {
+        false
+    };
     let inputs = input_paths(input_dir)?;
     for path in &inputs {
         checked_metadata(path, require_char)?;
@@ -598,6 +634,7 @@ fn probe(
         verify_owner_mode(path, assignment.audio, 0o600)?;
     }
     Ok(Counts {
+        card,
         inputs: inputs.len(),
         playback: playback.len(),
     })
@@ -647,6 +684,9 @@ fn probe_access(assignment: Assignment) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     require_human_process(&status, assignment.seat)?;
     denied_device_read(Path::new(FRAMEBUFFER))?;
+    if present(Path::new(CARD))? {
+        denied_device_read(Path::new(CARD))?;
+    }
     for path in input_paths(Path::new(INPUT_DIR))? {
         denied_device_read(&path)?;
     }
@@ -730,7 +770,10 @@ fn run(args: &[String]) -> Result<(), String> {
     let runtime = PathBuf::from(RUNTIME_BASE).join(assignment.seat.uid.to_string());
     let counts = match command.as_str() {
         "assign" => assign(
-            Path::new(FRAMEBUFFER),
+            Display {
+                framebuffer: Path::new(FRAMEBUFFER),
+                card: Path::new(CARD),
+            },
             Path::new(INPUT_DIR),
             Path::new(SOUND_DIR),
             &runtime,
@@ -739,7 +782,10 @@ fn run(args: &[String]) -> Result<(), String> {
             true,
         )?,
         "probe" => probe(
-            Path::new(FRAMEBUFFER),
+            Display {
+                framebuffer: Path::new(FRAMEBUFFER),
+                card: Path::new(CARD),
+            },
             Path::new(INPUT_DIR),
             Path::new(SOUND_DIR),
             &runtime,
@@ -755,7 +801,7 @@ fn run(args: &[String]) -> Result<(), String> {
     println!(
         "{READY_MARKER} uid={} gid={} framebuffer={} inputs={} runtime={} \
          compositor-uid={} compositor-gid={} compositor-runtime={} \
-         audio-uid={} audio-gid={} audio-runtime={AUDIO_RUNTIME} audio-pcms={}",
+         audio-uid={} audio-gid={} audio-runtime={AUDIO_RUNTIME} audio-pcms={} card={}",
         assignment.seat.uid,
         assignment.seat.gid,
         FRAMEBUFFER,
@@ -767,6 +813,7 @@ fn run(args: &[String]) -> Result<(), String> {
         assignment.audio.uid,
         assignment.audio.gid,
         counts.playback,
+        if counts.card { CARD } else { "none" },
     );
     Ok(())
 }
@@ -821,6 +868,9 @@ mod tests {
             .unwrap();
         assert!(body.contains("require_human_process(&status, assignment.seat)?"));
         assert!(body.contains("denied_device_read(Path::new(FRAMEBUFFER))?"));
+        assert!(body.contains(
+            "if present(Path::new(CARD))? {\n        denied_device_read(Path::new(CARD))?;\n    }"
+        ));
         assert!(body.contains("input_paths(Path::new(INPUT_DIR))?"));
         assert!(body.contains("denied_device_read(&path)?"));
         assert!(!body.contains("probe("));
@@ -1151,6 +1201,11 @@ mod tests {
         fs::create_dir(&run).unwrap();
         fs::set_permissions(&run, Permissions::from_mode(0o755)).unwrap();
         fs::write(dev.join("fb0"), b"").unwrap();
+        fs::create_dir(dev.join("dri")).unwrap();
+        fs::write(dev.join("dri/card0"), b"").unwrap();
+        fs::set_permissions(dev.join("dri/card0"), Permissions::from_mode(0o644)).unwrap();
+        fs::write(dev.join("dri/renderD128"), b"render").unwrap();
+        fs::set_permissions(dev.join("dri/renderD128"), Permissions::from_mode(0o644)).unwrap();
         fs::write(input.join("event0"), b"").unwrap();
         fs::write(input.join("event12"), b"").unwrap();
         fs::write(input.join("mouse0"), b"untouched").unwrap();
@@ -1173,7 +1228,7 @@ mod tests {
             },
         };
         let count = assign(
-            &dev.join("fb0"),
+            Display { framebuffer: &dev.join("fb0"), card: &dev.join("dri/card0") },
             &input,
             &sound,
             &runtime,
@@ -1185,6 +1240,7 @@ mod tests {
         assert_eq!(
             count,
             Counts {
+                card: true,
                 inputs: 2,
                 playback: 1,
             }
@@ -1195,9 +1251,12 @@ mod tests {
         );
         assert_eq!(fs::read(sound.join("pcmC0D0c")).unwrap(), b"capture");
         assert_eq!(fs::read(sound.join("controlC0")).unwrap(), b"control");
+        verify_owner_mode(&dev.join("dri/card0"), assignment.compositor, 0o600).unwrap();
+        // The render node is not the display and stays as it was.
+        assert_eq!(fs::metadata(dev.join("dri/renderD128")).unwrap().mode() & 0o777, 0o644);
         assert_eq!(
             probe(
-                &dev.join("fb0"),
+                Display { framebuffer: &dev.join("fb0"), card: &dev.join("dri/card0") },
                 &input,
                 &sound,
                 &runtime,
@@ -1207,6 +1266,7 @@ mod tests {
             )
             .unwrap(),
             Counts {
+                card: true,
                 inputs: 2,
                 playback: 1,
             }
@@ -1223,10 +1283,97 @@ mod tests {
         verify_owner_mode(&vm_runtime, assignment.seat, 0o755).unwrap();
         verify_runtime_base(vm_runtime.parent().unwrap(), false).unwrap();
         fs::set_permissions(&vm_runtime, Permissions::from_mode(0o777)).unwrap();
-        assert!(probe(&dev.join("fb0"), &input, &sound, &runtime, &audio_runtime, assignment, false).is_err());
+        assert!(probe(Display { framebuffer: &dev.join("fb0"), card: &dev.join("dri/card0") }, &input, &sound, &runtime, &audio_runtime, assignment, false).is_err());
         let base = fs::symlink_metadata(run.join("user")).unwrap();
         assert!(base.file_type().is_dir());
         assert_eq!(base.permissions().mode() & 0o7777, 0o755);
+    }
+
+    #[test]
+    fn a_machine_without_a_card_is_assigned_and_probed_without_one() {
+        let scratch = Scratch::new();
+        let dev = scratch.path.join("dev");
+        let input = dev.join("input");
+        let run = scratch.path.join("run");
+        let sound = dev.join("snd");
+        let runtime = run.join("user/1000");
+        let audio_runtime = run.join("td-audio");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir(&sound).unwrap();
+        fs::create_dir(&run).unwrap();
+        fs::set_permissions(&run, Permissions::from_mode(0o755)).unwrap();
+        fs::write(dev.join("fb0"), b"").unwrap();
+        fs::write(input.join("event0"), b"").unwrap();
+        let metadata = fs::metadata(&scratch.path).unwrap();
+        let account = Account {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        };
+        let assignment = Assignment {
+            seat: account,
+            compositor: account,
+            audio: account,
+        };
+        let card = dev.join("dri/card0");
+        let expected = Counts {
+            card: false,
+            inputs: 1,
+            playback: 0,
+        };
+        let assigned =
+            assign(Display { framebuffer: &dev.join("fb0"), card: &card }, &input, &sound, &runtime, &audio_runtime, assignment, false);
+        assert_eq!(assigned.unwrap(), expected);
+        let probed =
+            probe(Display { framebuffer: &dev.join("fb0"), card: &card }, &input, &sound, &runtime, &audio_runtime, assignment, false);
+        assert_eq!(probed.unwrap(), expected);
+        // A card that appears later is not silently taken as assigned.
+        fs::create_dir(dev.join("dri")).unwrap();
+        fs::write(&card, b"").unwrap();
+        fs::set_permissions(&card, Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            probe(Display { framebuffer: &dev.join("fb0"), card: &card }, &input, &sound, &runtime, &audio_runtime, assignment, false)
+                .unwrap_err()
+                .contains("expected 0600")
+        );
+    }
+
+    #[test]
+    fn a_card_that_is_a_symlink_is_refused_not_followed() {
+        let scratch = Scratch::new();
+        let dev = scratch.path.join("dev");
+        let input = dev.join("input");
+        let run = scratch.path.join("run");
+        let sound = dev.join("snd");
+        let runtime = run.join("user/1000");
+        let audio_runtime = run.join("td-audio");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir(&sound).unwrap();
+        fs::create_dir(&run).unwrap();
+        fs::set_permissions(&run, Permissions::from_mode(0o755)).unwrap();
+        fs::write(dev.join("fb0"), b"").unwrap();
+        fs::write(input.join("event0"), b"").unwrap();
+        let target = scratch.path.join("target");
+        fs::write(&target, b"").unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o644)).unwrap();
+        fs::create_dir(dev.join("dri")).unwrap();
+        let card = dev.join("dri/card0");
+        unix_fs::symlink(&target, &card).unwrap();
+        let metadata = fs::metadata(&scratch.path).unwrap();
+        let account = Account {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        };
+        let assignment = Assignment {
+            seat: account,
+            compositor: account,
+            audio: account,
+        };
+        let display = Display { framebuffer: &dev.join("fb0"), card: &card };
+        let assigned = assign(display, &input, &sound, &runtime, &audio_runtime, assignment, false);
+        assert!(assigned.unwrap_err().contains("refusing symlink"));
+        let probed = probe(display, &input, &sound, &runtime, &audio_runtime, assignment, false);
+        assert!(probed.unwrap_err().contains("refusing symlink"));
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o777, 0o644);
     }
 
     #[test]

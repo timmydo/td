@@ -18,9 +18,14 @@ Linux devtmpfs + sysfs + fbdev + evdev
 
 `td-seatd` is a root oneshot for one permanently configured local seat.
 It creates the private human runtime `/run/user/1000` and the compositor's
-`/run/td-compositor/1000` below root-owned parents. It validates framebuffer
-and evdev nodes as character devices, assigns them to compositor UID/GID 993
-with mode 0600, and verifies the result. The human cannot open those devices.
+`/run/td-compositor/1000` below root-owned parents. It validates the
+framebuffer, the DRM card `/dev/dri/card0` and the evdev nodes as character
+devices, assigns them to compositor UID/GID 993 with mode 0600, and verifies
+the result. The human cannot open those devices. The card is optional. A
+machine whose only display is a firmware framebuffer has none, and it boots
+with `card=none` on the ready line. A card that appears after assignment
+is not taken as assigned: the probe refuses it until the next assignment.
+The render node is not the display, and seatd leaves it alone.
 It also assigns only playback PCM nodes to the dedicated audio account and
 creates `/run/td-audio`; `APPLICATIONS.md` §K.5 owns that boundary.
 There is no multi-user arbitration, hotplug, suspend/resume, VT switching or
@@ -3968,10 +3973,16 @@ tested against `size_of` of the struct it carries, and `DrmModeInfo` is pinned
 at 68 bytes separately because it is not an argument but the ELEMENT of the
 array `modes_ptr` points at, making its size the kernel's copy stride.
 
-That the compositor cannot yet OPEN a card as its own user is a fact about the
-image rather than about this surface: devtmpfs creates `/dev/dri/card0`
-root-owned at mode 0600 and td runs no udev, so the boot probe runs as root and
-granting the ui account a card belongs to `td-seatd` beside `/dev/fb0`.
+devtmpfs creates `/dev/dri/card0` root-owned at mode 0600, and td runs no
+udev. `td-seatd` therefore assigns the card to the compositor account beside
+`/dev/fb0`. The boot's discovery probe, which modesets nothing, runs as that
+account through `td-login exec-service-as`, so the QEMU check's discovery
+marker proves the grant: without it, the open fails with `EACCES` and the
+marker is missing.
+The modeset and flip probes still run as root. A non-root opener may
+`SET_MASTER` only if its file was the card's master at open. Arranging that
+is the KMS backend's own work, and until it lands these probes are root-only
+evidence.
 
 Discovery does not gate boot success. The probe prints its report and a
 failure prints a diagnostic, but neither moves `healthy`: every other leg of
@@ -6345,10 +6356,10 @@ oneshot has a 90-second backstop, including Unix connect stalls. This is a
 controlled stock-image integration regression, not adversarial process
 attestation or secure attention. Normal boots skip it without synthetic input.
 
-The human seat-access evidence checks actual read denial on the framebuffer
-and current input nodes. It does not require late-arriving nodes to have
-already received the compositor's ownership; a root-owned unreadable node
-still satisfies the privacy check. Initial seat assignment retains its
+The human seat-access evidence checks actual read denial on the framebuffer,
+the card when present, and current input nodes. It does not require
+late-arriving nodes to have already received the compositor's ownership; a
+root-owned unreadable node still satisfies the privacy check. Initial seat assignment retains its
 separate ownership/readiness probe. This does not add compositor hotplug.
 
 Public Wayland, private portal, control and readiness sockets reject other

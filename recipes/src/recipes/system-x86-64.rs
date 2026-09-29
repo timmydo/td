@@ -3043,7 +3043,8 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          /bin/grep -q -x -F {TD_JAIL_KILL_REAPS_MARKER} || \
          {{ echo \"td-jail: kill-reaps returned unexpected output: $k\"; \
          exit 1; }}'; then echo {TD_JAIL_KILL_REAPS_MARKER}; mtk=1; fi\n\
-         if d=$(/bin/td-compositor probe-drm /dev/dri/card0 2>&1) && \
+         if d=$(/bin/td-login exec-service-as {COMPOSITOR_USER} -- \
+         /bin/td-compositor probe-drm /dev/dri/card0 2>&1) && \
          /bin/td-util printf \"%s\\n\" \"$d\" | \
          /bin/grep -q \"^{TD_COMPOSITOR_DRM_PROBE_MARKER} driver=\"; then \
          /bin/td-util printf \"%s\\n\" \"$d\"; \
@@ -9917,6 +9918,21 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             unit_key("sshd", "exec"),
             Some(format!("/bin/sshd -D -e -f {SSHD_CONFIG}"))
         );
+    }
+
+    /// Discovery runs as the compositor's own account, so the boot marker
+    /// the QEMU check requires is also proof of td-seatd's card grant. Run as
+    /// root, it would open the node through CAP_DAC_OVERRIDE and prove
+    /// nothing about the grant.
+    #[test]
+    fn boot_health_discovers_the_card_as_the_compositor_account() {
+        let bootsuccess = build_bootsuccess(&SYSTEM);
+        let discovery = format!(
+            "d=$(/bin/td-login exec-service-as {COMPOSITOR_USER} -- \
+             /bin/td-compositor probe-drm /dev/dri/card0 2>&1)"
+        );
+        assert_eq!(bootsuccess.matches(&discovery).count(), 1, "{bootsuccess}");
+        assert_eq!(bootsuccess.matches("probe-drm").count(), 1);
     }
 
     #[test]

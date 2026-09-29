@@ -8100,7 +8100,7 @@ middle.
 | component | uid | why |
 |---|---|---|
 | `td-svc` | root | the supervisor |
-| `td-seatd` | root, oneshot | assigns `/dev/fb0` and `/dev/input/*`; makes human `/run/user/1000`, compositor `/run/td-compositor/1000`, and audio `/run/td-audio`; assigns only `/dev/snd/pcmC*D*p` playback nodes to `audio` |
+| `td-seatd` | root, oneshot | assigns `/dev/fb0`, `/dev/dri/card0` when present, and `/dev/input/*`; makes human `/run/user/1000`, compositor `/run/td-compositor/1000`, and audio `/run/td-audio`; assigns only `/dev/snd/pcmC*D*p` playback nodes to `audio` |
 | `td-compositor` | 993 (`tdc1000`) | owns display/input devices and the private root authority endpoint |
 | `td-busd` | 992 (`tdb1000`) | protected runtime and explicit kernel-UID admission |
 | `td-portal` | 991 (`tdp1000`) | owns the credential store and reads a fixed read-only Downloads view |
@@ -8298,7 +8298,8 @@ This enables ordinary terminal launches, with no consent path.
 #### Device ownership and secure-path prerequisites
 
 1. **Device access belongs to the compositor.** `td-seatd` assigns mode-0600
-   `/dev/fb0` and `/dev/input/event*` to UID/GID 993. The human identity has
+   `/dev/fb0`, `/dev/dri/card0` when the machine has one, and
+   `/dev/input/event*` to UID/GID 993. The human identity has
    no supplementary membership in the compositor group. A required boot probe
    runs as UID 1000, verifies the assigned metadata, and requires `EACCES` when
    opening each node. Missing devices or an unexpectedly successful open
@@ -8762,15 +8763,17 @@ connector reporting no modes here is as much a statement about mastership as
 about the sink, and the diagnostic says so rather than calling the screen
 absent.
 
-Two things it does NOT settle, recorded because assuming otherwise is the
-expensive mistake. The card node is `root:root` mode 0600 under devtmpfs, and
-td has no udev, so the ui user CANNOT open it: the probe runs as root on the
-health leg, and granting the compositor's own account a card is `td-seatd`'s
-to do — it already assigns `/dev/fb0`, `/dev/input` and `/dev/snd`, and a DRM
-node is a row there rather than a new mechanism. And `possible_crtcs` is a
-bitmask over INDEXES into the resources' CRTC list, not over CRTC ids; reading
-it as ids is the classic way to modeset onto a pipe an encoder cannot drive,
-and it is silent, because ids are small integers too. A test pins the
+Two things discovery does not settle on its own, recorded because assuming
+otherwise is the expensive mistake. The card node is `root:root` mode 0600
+under devtmpfs, and td has no udev, so `td-seatd` assigns it to the
+compositor's own account, beside `/dev/fb0` and `/dev/input`. It is a row in
+the list of nodes seatd assigns rather than a new mechanism, and it is
+optional so that a machine without a card still boots. The health leg runs
+discovery as that account, so the grant is proven on every boot check.
+Modeset and flip still run as root until the backend owns mastership. And
+`possible_crtcs` is a bitmask over INDEXES into the resources' CRTC list, not
+over CRTC ids; reading it as ids is the classic way to modeset onto a pipe an
+encoder cannot drive, and it is silent, because ids are small integers too. A test pins the
 distinction on a list whose ids and indexes deliberately disagree.
 
 Row 2 has NOT landed: there are no leases and no completion, and td still
