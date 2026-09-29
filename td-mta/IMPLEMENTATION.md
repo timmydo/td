@@ -470,10 +470,13 @@ Split at these concrete boundaries before dependent milestones start:
     flags refuse omissions/duplicates; the decoder window clears on return or
     unwind. Failures return header-free storage with typed input context.
     This content-only stage establishes no protected-file or runtime authority.
-  - **M04b3b2b:** remaining M05 adapter integration, provider validation,
-    identity materialization and preimage encoding, plus streamed redacted
-    effective output. Qualify each new compiled path and combined memory
-    before service integration.
+  - **M04b3b2b1:** implemented fixed-array visible-identity assembly and
+    streaming preimage encoding from resolved text, preserving list/name
+    presence and declaration order within the 80 KiB view reservation.
+    Validate the separate preimage ceiling before output; redact sink errors.
+  - **M04b3b2b2:** remaining combined stack qualification, M05 adapter
+    integration, provider validation and streamed redacted effective output.
+    Qualify each new compiled path and combined memory before service use.
 - **M04c1:** checked u64 disk/work settings and capacity-derived maintenance
   validation in `admission.rs`; configuration uses this committed plan.
 - **M04c2:** charged work meters in `admission/work.rs` and checked

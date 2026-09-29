@@ -64,12 +64,8 @@ const WORKSPACE_STATE_BYTES: usize = std::mem::size_of::<Pending>()
 const _: [(); 1] = [(); (WORKSPACE_STATE_BYTES <= 36 * 1024) as usize];
 const _: [(); 1] = [(); (stream::SCRATCH_BYTES + 36 * 1024 <= 64 * 1024) as usize];
 
-// The later finalizer borrows these views outside the loader workspace.
-const BORROWED_VIEW_BYTES: usize = super::identity::MAX_IDENTITIES
-    * std::mem::size_of::<super::identity::Identity<'static>>()
-    + 2 * super::identity::MAX_IDENTITIES
-        * super::identity::MAX_ADDRESSES
-        * std::mem::size_of::<super::identity::Address<'static>>();
+// Identity assembly uses these fixed views outside the loader workspace.
+const BORROWED_VIEW_BYTES: usize = super::preimage::WORKSPACE_BYTES;
 const _: [(); 1] = [(); (BORROWED_VIEW_BYTES <= 80 * 1024) as usize];
 
 #[cfg(test)]

@@ -1421,8 +1421,9 @@ refusals, old/replacement coexistence, returned-storage reuse, short scratch,
 and descriptor/text exhaustion. Maximum identity/path fields, a permuted full
 alias table and full domain table, gateway/MTA-STS/resource stanzas,
 ACME/HTTP-01, loopback listeners, logging and identity addresses exercise the
-larger and alternative structural paths. A production compile-time guard requires the borrowed Identity/Address layouts
-to fit the separate 80 KiB reservation on every compiled target. Existing
+larger and alternative structural paths. A production compile-time guard
+requires the borrowed Identity/Address layouts and list ranges to fit the
+separate 80 KiB reservation on every compiled target. Existing
 compiled 36 KiB workspace guards remain in force.
 
 This establishes a point-in-time executable stack ceiling for these
@@ -1578,8 +1579,45 @@ The resolved owner reports actual allocated table capacities plus its full
 inline header, replacing Candidate's inline size once. All cells retain
 their existing partition limits; the small resolved owner fits global/plan
 headroom. Individual signature/password limits do not guarantee aggregate
-fit in the 192 KiB text arena. Future identity preimage encoding has its own
+fit in the 192 KiB text arena. Identity preimage encoding has its own
 192 KiB ceiling. Existing structural stack qualification does not cover this
-new compiled finalizer: M04b3b2b/M05/M07 must qualify the complete production
-reader/finalizer/provider path before service use. Identity view assembly,
-preimage encoding, effective output and runtime publication remain pending.
+new compiled finalizer: M04b3b2b2/M05/M07 must qualify the complete production
+reader/finalizer/provider path before service use. Protected-input
+integration, effective output and runtime publication remain pending;
+M04b3b2b1's identity assembly is specified below.
+
+
+## Identity preimage assembly
+
+M04b3b2b1 adds `config::preimage::write` over ResolvedText. First assemble
+all address views and list ranges in fixed arrays; then assemble identity
+views borrowing the completed address array and the immutable text arena.
+There is no self-referential owner, growing collection or retained preimage.
+The existing 80 KiB view reservation covers 2048 Address entries, 64 Identity
+entries and 128 fixed list ranges. Compile-time layout checks include all
+three arrays. The loader's workspace guard refers to this same sum.
+
+Preserve ascending raw identity IDs, each address list's declaration order,
+null versus empty lists, and absent versus empty address names. Take exact
+resolved text/HTML signatures from the content stage; absent files remain
+empty. The relay password, signature paths and other configuration fields
+are excluded by field from this visible-identity representation. M05 must
+reject secret/public input-file aliasing before publication; this content
+stage alone cannot prevent a signature from containing credential bytes.
+
+Invoke the existing versioned `identity::write_preimage` only after view
+assembly succeeds. It validates the whole immutable representation, including
+its independent 192 KiB encoded-size ceiling, before the first sink call.
+A candidate fitting the text arena can still fail that ceiling because the
+preimage includes IDs and framing. The outer error wrapper formats fixed
+codes only and exposes no arbitrary sink source chain. Explicit typed
+inspection retains the underlying validation or sink error.
+
+Sink failure can leave a prefix and must discard that output/digest. Sink
+allocation, blocking and panic behavior remain trusted caller obligations.
+The writer is for private configuration work until M05/M07 complete; it
+confers no file trust, authentication, digest or publication authority.
+The local td-crypto streaming Digest can consume the writer later without
+retaining a second 192 KiB buffer. Actual combined reader/materializer/view
+stack qualification is still required before production integration; this
+object-layout guard does not measure compiler frames or total stack use.

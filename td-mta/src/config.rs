@@ -14,6 +14,7 @@ pub mod material;
 pub mod materialize;
 pub mod outbound;
 pub mod policy;
+pub mod preimage;
 pub mod resources;
 pub mod routing;
 pub mod stanza;

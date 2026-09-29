@@ -336,9 +336,10 @@ only for bounded operation lifetimes and reauthorize Access as API.md specifies.
 SCHEMA.md fixes the remaining target stanza/field ceilings and the 384 KiB
 metadata partition. Temporary borrowed identity views use 80 KiB of the existing
 256 KiB control-worker stack, outside the snapshot owner, as SCHEMA.md specifies.
-Those target
-structs are not implemented yet; their concrete size and capacity checks remain
-M04's implementation gate. The 228 KiB remainder is within the same reservation,
+Implemented configuration tables and temporary view arrays carry concrete
+size/capacity guards. Device cells and runtime consumers remain incomplete;
+their implementations must establish corresponding bounds before use.
+The 228 KiB remainder is within the same reservation,
 not additional process memory.
 
 This ledger does not budget whole earlier JMAP responses, generic JSON trees,
@@ -353,8 +354,9 @@ M04b2c3d4b's portable integration test provides point-in-time evidence for
 its compilation of the structural loader on a worker whose non-growing guarded mapping is checked to fit 176 KiB, leaving
 the existing 80 KiB identity-view reservation untouched. CONFIG.md lists its
 fixtures, manual requalification obligation and limits. A production
-compile-time guard checks borrowed-view layouts on every target without
-creating those future finalization arrays. It does not qualify future protected-file,
+compile-time guard checks borrowed-view and list-range layouts on every target.
+The structural fixture does not call the implemented preimage assembly or
+create its finalization arrays. It does not qualify future protected-file,
 provider or runtime frames, or claim measured service RSS. No ledger entry
 or worker count changes.
 

@@ -567,9 +567,10 @@ and remain part of process-memory qualification.
 These are implementation ceilings, not measured struct sizes. Every new layout
 must have a size/capacity check before use. The persistent representation uses
 private checked text references and indices, not a self-referential owning
-Rust object. Temporary borrowed identity/address arrays live in an 80 KiB
-reservation within the existing 256 KiB control-worker stack, outside the
-snapshot owner. Their current x86-64 layouts total 72704 bytes; a production
+Rust object. Temporary borrowed identity/address arrays and list ranges
+live in an 80 KiB reservation within the existing 256 KiB control-worker
+stack, outside the
+snapshot owner. Their current x86-64 layouts total 75776 bytes; a production
 compile-time guard enforces the 80 KiB ceiling on each target. This leaves 176 KiB for all other control-worker
 call frames, initialization copies and provider stack use. Do not place
 another full view array on that stack. M04b3/M05/M07/M19 must qualify each new compiled
