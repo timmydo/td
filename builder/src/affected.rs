@@ -1477,9 +1477,8 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // Toolkit edits affect the standalone consumers and the target taskmgr,
-    // editor, photo and portal recipes; source pins and realized-output
-    // checks are required.
+    // Toolkit edits affect its standalone consumers and their target recipes;
+    // locally derived source identities and realized-output checks apply.
     if p.starts_with("td-ui/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
@@ -1487,14 +1486,13 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // td-setup, the installer front end, is a td-ui consumer with no recipe
-    // consumer yet, so the arm the editor had before it had a recipe: the
-    // host preflight covers its own lock/test/clippy obligations, and the
-    // cargo narrowing carries the change to every crate whose manifest names
-    // it (nobody yet). Packaging the installer replaces this arm with
-    // target-artifact coverage.
+    // td-setup is a static target recipe with a realized-output check; a
+    // source edit changes the eventual live installer binary as well as the
+    // host-tested window.
     if p.starts_with("td-setup/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
@@ -2464,6 +2462,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-editor/src/main.rs", "check");
     assert_target!("td-editor/src/main.rs", "recipe-checks");
     assert_target!("td-editor/Cargo.lock", "recipe-checks");
+    // The installer window now has the same source-built static coverage.
+    assert_no_preflight!("td-setup/src/window.rs", "local-source-roster");
+    assert_preflight!("td-setup/src/window.rs", "cargo-test");
+    assert_target!("td-setup/src/window.rs", "check");
+    assert_target!("td-setup/src/window.rs", "recipe-checks");
+    assert_target!("td-setup/Cargo.lock", "recipe-checks");
     assert_preflight!("td-audio/src/main.rs", "cargo-test");
     assert_preflight!("td-audio/src/sys.rs", "cargo-test");
     assert_preflight!("td-audio/src/pcm.rs", "cargo-test");
@@ -7280,9 +7284,9 @@ mod tests {
         let sh = one("td-sh/src/main.rs");
         assert_eq!(sh.len(), 4, "{sh:?}");
         assert_eq!(names(&sh), ["td-sh"]);
-        // td-setup, the installer front end: read by nobody, so its own
-        // commands and the workspace suite, like any leaf crate — plus the
-        // native compositor command its native-compositor-tests opt-in adds.
+        // td-setup is now a target recipe with a realized-output check, but
+        // no other host crate reads it: its host selection remains its own
+        // commands and the workspace suite plus the native compositor case.
         let setup = one("td-setup/src/welcome.rs");
         assert_eq!(setup.len(), 5, "{setup:?}");
         assert_eq!(names(&setup), ["td-setup"]);

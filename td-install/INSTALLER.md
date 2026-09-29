@@ -53,6 +53,14 @@ Compositor-owned trusted consent must bind destructive execution to the
 exact reviewed request under the existing elevation contract; ordinary
 client pixels or synthetic input are not authorization evidence.
 
+The welcome-only `td-setup` front end has a source-built static target recipe
+and `td-setup-test` realized-output check. The recipe stages its own tree with
+`td-ui` and the compositor sources that the toolkit mounts, then builds with
+the target Rust toolchain; the check runs its `--help` and `--font-license`
+entry points. This establishes an image-eligible executable, not an active
+installer: the release live profile must wait for the remaining wizard pages,
+its paired service, trusted consent, and end-to-end installation evidence.
+
 Disk enumeration is read-only and bounded. Show model, serial when supplied
 by the device, capacity and a distinguishing device identifier. These are
 descriptions, not proof of device authenticity. Exclude the installation

@@ -417,6 +417,7 @@ mod tests {
                 "td-photo",
                 "td-portal",
                 "td-secret",
+                "td-setup",
                 "td-taskmgr",
                 "td-ui"
             ]
