@@ -59,10 +59,11 @@ with `td-install`, `td-ui` and the compositor sources that the toolkit
 mounts, then builds with the target Rust toolchain. The check runs
 `--help`, `--font-license` and a headless render of the full welcome
 frame without emitting its image bytes.
-This establishes an image-eligible executable whose window presents only the
-welcome page. Its library also has a pure, unconnected destination view.
-The release live profile must wait for the remaining wizard pages, its
-paired service, trusted consent, and end-to-end installation evidence.
+This establishes an image-eligible executable whose window presents only
+the welcome page. Its library also has pure, unconnected destination and
+settings views. The release live profile must wait for the remaining
+wizard pages, its paired service, trusted consent, and end-to-end
+installation evidence.
 
 The destination page is a pure view over `Destination` values supplied by
 the future service. It shows capacity, model, kernel name, device number,
@@ -79,6 +80,13 @@ The page uses the pure `td-install` library's plan module. Its target recipe
 stages that sibling source tree and its confinement test pins the library's
 single public module. The page is not yet connected to the live window or a
 service.
+
+The account and regional settings page is also a pure view. Username and
+hostname are text entries; keyboard layout and time zone are chooser rows
+for catalog selections. It displays bounded tokens and focus without
+treating wire admission as policy or catalog approval. Empty values may
+be shown before completion. The page is not yet connected to the live
+window; the validation contract below applies before review.
 
 Disk enumeration is read-only and bounded. Show model, serial when supplied
 by the device, capacity and a distinguishing device identifier. These are

@@ -27,6 +27,7 @@ fn source_inventory_and_toolkit_access_are_closed() {
         "destination.rs",
         "lib.rs",
         "main.rs",
+        "settings.rs",
         "welcome.rs",
         "window.rs",
     ]
@@ -67,6 +68,7 @@ fn source_inventory_and_toolkit_access_are_closed() {
         "destination.rs",
         "lib.rs",
         "main.rs",
+        "settings.rs",
         "welcome.rs",
         "window.rs",
     ] {
