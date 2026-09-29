@@ -68,7 +68,8 @@ const MAX_UI_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HELD_KEYS: usize = 256;
 
 fn usage() -> String {
-    "usage: td-compositor run (--framebuffer PATH | --card PATH) --input DIR --socket PATH \
+    "usage: td-compositor run (--card PATH [--framebuffer PATH] | --framebuffer PATH) \
+     --input DIR --socket PATH \
      --portal-socket PATH [--control-socket PATH] \
      (--launcher-client PATH | --launcher-application NAME \
      --application-ready-socket PATH --application-app-id ID \
@@ -79,12 +80,10 @@ fn usage() -> String {
      td-compositor probe-terminal-authority | \
      td-compositor probe SOCKET | \
      td-compositor probe-application SOCKET ID RGB_A RGB_B [--quiet] | \
-     td-compositor probe-drm DEVICE | \
-     td-compositor probe-kms DEVICE | \
-     td-compositor probe-flip DEVICE | \
      td-compositor terminfo PATH | \
      td-compositor selftest\n\
-     --terminal-authority requires --launcher-application."
+     --terminal-authority requires --launcher-application. \
+     --framebuffer beside --card is driven only when the card does not exist."
         .into()
 }
 
@@ -230,11 +229,51 @@ fn run_term(args: &[OsString]) -> Result<(), String> {
 }
 
 /// Where the compositor draws. `Framebuffer` is fbdev; `Card` is a DRM
-/// primary node the KMS backend takes mastership of and flips on.
+/// primary node the KMS backend takes mastership of and flips on, with the
+/// fbdev node to drive instead when the machine has no such card.
 #[derive(Debug, Eq, PartialEq)]
 enum OutputDevice {
     Framebuffer(PathBuf),
-    Card(PathBuf),
+    Card {
+        card: PathBuf,
+        fallback: Option<PathBuf>,
+    },
+}
+
+/// The backend `run` opens, once the card's existence is known.
+#[derive(Debug, Eq, PartialEq)]
+enum Backend<'a> {
+    Framebuffer(&'a Path),
+    Card(&'a Path),
+}
+
+/// Choose the backend. `inspect` answers whether the card node exists, and is
+/// asked only when there is a fallback to take.
+///
+/// The fallback is for a machine with NO card, and nothing else: only a
+/// `NotFound` takes it. A card that exists but cannot be inspected, opened or
+/// modeset is an error, never masked by quietly drawing somewhere else.
+fn select_backend(
+    output: &OutputDevice,
+    inspect: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<Backend<'_>, String> {
+    match output {
+        OutputDevice::Framebuffer(path) => Ok(Backend::Framebuffer(path)),
+        OutputDevice::Card {
+            card,
+            fallback: None,
+        } => Ok(Backend::Card(card)),
+        OutputDevice::Card {
+            card,
+            fallback: Some(framebuffer),
+        } => match inspect(card) {
+            Ok(()) => Ok(Backend::Card(card)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Backend::Framebuffer(framebuffer))
+            }
+            Err(error) => Err(format!("inspect DRM device {}: {error}", card.display())),
+        },
+    }
 }
 
 struct RunOptions {
@@ -339,8 +378,8 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     }
     let output = match (framebuffer, card) {
         (Some(path), None) => OutputDevice::Framebuffer(path),
-        (None, Some(path)) => OutputDevice::Card(path),
-        _ => return Err("exactly one --framebuffer or --card is required".into()),
+        (fallback, Some(card)) => OutputDevice::Card { card, fallback },
+        (None, None) => return Err("--card or --framebuffer is required".into()),
     };
     if terminal_client.is_some() == terminal_authority {
         return Err("exactly one --terminal-client or --terminal-authority is required".into());
@@ -466,14 +505,29 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         })?)
     };
     let task_launcher = launches.task_launcher();
-    let (mut runtime, flips, described) = match &options.output {
-        OutputDevice::Framebuffer(path) => {
+    let backend = select_backend(&options.output, |card| std::fs::metadata(card).map(|_| ()))?;
+    if let (OutputDevice::Card { card, .. }, Backend::Framebuffer(path)) =
+        (&options.output, &backend)
+    {
+        eprintln!(
+            "td-compositor: no DRM device at {}; driving {} instead",
+            card.display(),
+            path.display()
+        );
+    }
+    let (mut runtime, flips, described) = match backend {
+        Backend::Framebuffer(path) => {
             let framebuffer = Framebuffer::open(path)?;
             let described = describe_output("software", &framebuffer);
             (Runtime::new(framebuffer), None, described)
         }
-        OutputDevice::Card(path) => {
+        Backend::Card(path) => {
             let (kms, flips, lit) = drm::open_kms(path)?;
+            // Logged rather than fatal, as the flip marker is: the display
+            // works whether or not the console took the line.
+            if let Err(error) = announce_kms_ready(&mut std::io::stdout().lock(), &lit, &kms) {
+                eprintln!("td-compositor: {error}");
+            }
             let described = format!("{} {lit}", describe_output("kms", &kms));
             (Runtime::new(kms), Some(flips), described)
         }
@@ -571,6 +625,39 @@ fn describe_output(kind: &str, backend: &dyn OutputBackend) -> String {
     )
 }
 
+/// The KMS backend's boot evidence, printed once the modeset `open_kms` made
+/// has answered: what it lit, and the geometry the runtime renders at.
+fn announce_kms_ready(
+    out: &mut impl Write,
+    lit: &str,
+    backend: &dyn OutputBackend,
+) -> Result<(), String> {
+    let size = backend.dimensions();
+    let line = format!(
+        "\nTD-COMPOSITOR-KMS-READY {lit} output={}x{} stride={}\n",
+        size.width,
+        size.height,
+        backend.target_stride()
+    );
+    write_marker(out, &line)
+}
+
+/// One write that begins a line of its own. The console is shared with
+/// unbuffered stderr, this process's and others', whose fragments need not
+/// end a line, and the boot check reads a marker only at a line's start.
+fn write_marker(out: &mut impl Write, line: &str) -> Result<(), String> {
+    out.write_all(line.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|error| format!("write boot marker: {error}"))
+}
+
+/// The first page flip the runtime accepted as on glass, printed once. The
+/// cookie is the completion's own `user_data`, carried back by the kernel.
+fn announce_first_flip(out: &mut impl Write, frame: output::FrameId) -> Result<(), String> {
+    let line = format!("\nTD-COMPOSITOR-FLIP-OK cookie={:#x} flip=ok\n", frame.cookie());
+    write_marker(out, &line)
+}
+
 /// How often the watchdog looks at the frame in flight. A fifth of the
 /// deadline, so a stalled flip is recovered within 1.2 deadlines at worst.
 const FLIP_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -586,6 +673,10 @@ const FLIP_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// queue another and would stand frozen while looking alive. Exiting hands
 /// the display back to the supervisor, and the kernel releases mastership
 /// with the descriptors. A failed PAINT is not among them: it stays owed.
+///
+/// The reader also prints the boot's flip marker, once, after the first
+/// completion the runtime accepts, and outside the runtime lock. A marker it
+/// cannot write is logged, not fatal: the display is working.
 fn start_flip_threads(
     mut flips: drm::FlipEvents,
     runtime: &Arc<Mutex<Runtime>>,
@@ -593,16 +684,31 @@ fn start_flip_threads(
     let completions = Arc::clone(runtime);
     std::thread::Builder::new()
         .name("td-kms-flips".into())
-        .spawn(move || loop {
-            let delivered = flips.next().and_then(|frame| {
-                completions
-                    .lock()
-                    .map_err(|_| "runtime lock poisoned".to_string())?
-                    .output_event(output::OutputEvent::Presented(frame))
-            });
-            if let Err(error) = delivered {
-                eprintln!("td-compositor: page-flip completion: {error}");
-                process::exit(1);
+        .spawn(move || {
+            let mut announced = false;
+            loop {
+                let delivered = flips.next().and_then(|frame| {
+                    completions
+                        .lock()
+                        .map_err(|_| "runtime lock poisoned".to_string())?
+                        .output_event(output::OutputEvent::Presented(frame))?;
+                    Ok(frame)
+                });
+                match delivered {
+                    Ok(frame) if !announced => {
+                        announced = true;
+                        if let Err(error) =
+                            announce_first_flip(&mut std::io::stdout().lock(), frame)
+                        {
+                            eprintln!("td-compositor: {error}");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("td-compositor: page-flip completion: {error}");
+                        process::exit(1);
+                    }
+                }
             }
         })
         .map_err(|error| format!("start the page-flip reader: {error}"))?;
@@ -664,150 +770,6 @@ fn selftest() -> Result<(), String> {
     Ok(())
 }
 
-/// §M row 1's discovery half, printed.
-///
-/// Reads a card and reports what a KMS backend would be built on. It takes no
-/// DRM mastership and issues no modeset, which is what lets it run on a booted
-/// image WHILE `fbcon` and the fbdev compositor are driving that same card —
-/// the only way any of this can be proven before the backend that would
-/// replace them exists.
-fn probe_drm(device: &Path) -> Result<(), String> {
-    let card = drm::open_card(device)?;
-    let discovery = drm::discover(&card)?;
-    let output = discovery.scanout.output()?;
-    // Allocated at the mode's own size, which is the only size a scanout
-    // buffer is ever wanted at, and released before this returns: the probe
-    // proves the mapping class works on this card without leaving a buffer
-    // behind on a machine that is running a compositor on the same device.
-    // From the MODE rather than from `output.dimensions`: both say the same
-    // thing, but the mode's `u16` fields widen to `u32` infallibly, and a
-    // scanout size is not a place to introduce a fallible conversion.
-    let mut frame = drm::DumbFrame::allocate(
-        &card,
-        u32::from(discovery.scanout.mode.hdisplay),
-        u32::from(discovery.scanout.mode.vdisplay),
-    )?;
-    frame.prove_mapping()?;
-    let mut out = std::io::stdout().lock();
-    writeln!(
-        out,
-        "TD-COMPOSITOR-DRM-PROBE-OK {} output={}x{} {}",
-        discovery.describe(),
-        output.dimensions.width,
-        output.dimensions.height,
-        frame.describe()
-    )
-    .map_err(|error| format!("write DRM probe marker: {error}"))?;
-    Ok(())
-}
-
-/// Set a mode on a real card, read the CRTC back, and put it as it was.
-///
-/// The proof this increment owes. `SETCRTC` answering success says the kernel
-/// accepted the request; it does not say the CRTC is scanning out the buffer
-/// that was handed to it, and a driver that kept the previous framebuffer would
-/// answer success while showing the old picture. Reading the CRTC back is the
-/// strongest statement about what is on a screen that a headless process can
-/// make.
-///
-/// Everything is restored on the way out, in an order the type system carries:
-/// the CRTC stops scanning out this framebuffer, then the framebuffer is
-/// unregistered, then mastership is released. Closing the descriptor afterwards
-/// puts the fbdev client back exactly, through the kernel's own lastclose path.
-fn probe_kms(device: &Path) -> Result<(), String> {
-    let card = drm::open_card(device)?;
-    let discovery = drm::discover(&card)?;
-    let mode = discovery.scanout.mode;
-    let mut frame = drm::DumbFrame::allocate(
-        &card,
-        u32::from(mode.hdisplay),
-        u32::from(mode.vdisplay),
-    )?;
-    frame.prove_mapping()?;
-    // Filled before it is shown. A modeset onto a buffer nobody wrote is a
-    // modeset onto whatever the allocator left there, which on a headless run
-    // proves the same thing but describes a worse default for anyone who
-    // copies this path onto a machine with a monitor attached.
-    for byte in frame.pixels_mut() {
-        *byte = 0;
-    }
-    let modeset = drm::Modeset::apply(&card, &discovery.scanout, &frame)?;
-    modeset.verify(&card, &mode)?;
-    let mut out = std::io::stdout().lock();
-    writeln!(
-        out,
-        "TD-COMPOSITOR-KMS-PROBE-OK {} output={}x{} {} {}",
-        discovery.describe(),
-        mode.hdisplay,
-        mode.vdisplay,
-        frame.describe(),
-        modeset.describe()
-    )
-    .map_err(|error| format!("write KMS probe marker: {error}"))?;
-    Ok(())
-}
-
-/// Put one frame on a screen, then FLIP to another and wait for the kernel to
-/// say the second one arrived.
-///
-/// The claim this makes and `probe-kms` does not: a frame can be exchanged for
-/// the next one and the compositor can learn WHEN. That is what makes a
-/// sequence of pictures a display rather than a single modeset, and it is the
-/// completion path §M row 3 recorded as unbuilt.
-///
-/// The two frames are filled differently on purpose. A flip between two
-/// identical buffers completes exactly the same way and would prove the same
-/// ioctl sequence while showing nothing; filling the second differently means
-/// a machine with a monitor attached shows a visibly different picture at the
-/// flip, which is the thing being claimed.
-fn probe_flip(device: &Path) -> Result<(), String> {
-    let card = drm::open_card(device)?;
-    let discovery = drm::discover(&card)?;
-    let mode = discovery.scanout.mode;
-    let width = u32::from(mode.hdisplay);
-    let height = u32::from(mode.vdisplay);
-
-    let mut first = drm::DumbFrame::allocate(&card, width, height)?;
-    first.prove_mapping()?;
-    for byte in first.pixels_mut() {
-        *byte = 0;
-    }
-    let modeset = drm::Modeset::apply(&card, &discovery.scanout, &first)?;
-    modeset.verify(&card, &mode)?;
-
-    let mut second = drm::DumbFrame::allocate(&card, width, height)?;
-    second.prove_mapping()?;
-    for byte in second.pixels_mut() {
-        *byte = 0xff;
-    }
-    // The cookie is a `FrameId`, not a bare number, and it is the identity the
-    // completion is matched on. `FIRST.next()` rather than `FIRST` because a
-    // cookie of 1 is the value a zeroed or defaulted `user_data` is likeliest
-    // to collide with; 2 rules that out.
-    //
-    // It does NOT rule out a compositor printing a constant, and an earlier
-    // revision of this comment claimed it did. The round-trip is proven by the
-    // marker EXISTING: `await_flip` returns only on a completion whose
-    // `user_data` equals the cookie, so a kernel that echoed the wrong value
-    // produces no marker at all rather than a marker with a wrong field.
-    let id = output::FrameId::FIRST.next();
-    let flip = drm::Flip::queue_and_wait(&card, &modeset, &discovery.scanout, &second, id.cookie())?;
-    flip.verify(&card, &mode)?;
-
-    let mut out = std::io::stdout().lock();
-    writeln!(
-        out,
-        "TD-COMPOSITOR-FLIP-PROBE-OK {} output={}x{} {} {}",
-        discovery.describe(),
-        mode.hdisplay,
-        mode.vdisplay,
-        modeset.describe(),
-        flip.describe()
-    )
-    .map_err(|error| format!("write flip probe marker: {error}"))?;
-    Ok(())
-}
-
 fn run(args: &[String]) -> Result<(), String> {
     let command = args.first().ok_or_else(usage)?;
     match command.as_str() {
@@ -819,44 +781,6 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "run" => run_compositor(parse_run(args.get(1..).ok_or_else(usage)?)?),
         "headless" => headless::run(args.get(1..).ok_or_else(usage)?, std::io::stdin()),
-        // §M row 1's discovery half, as a subcommand rather than as something
-        // the compositor does on the way up: it reads a card and takes no
-        // mastership, so it can run on a booted image beside the fbdev
-        // compositor that is currently driving that same card, and prove what
-        // the KMS backend will be built on before there is a backend.
-        "probe-drm" => {
-            let device = args.get(1).ok_or_else(usage)?;
-            if args.get(2).is_some() {
-                return Err(usage());
-            }
-            probe_drm(Path::new(device))
-        }
-        // §M row 1's MODESET half, and unlike `probe-drm` this one DISTURBS
-        // the screen: it takes DRM mastership, which stops the in-kernel fbdev
-        // client's damage reaching the display for as long as it is held, sets
-        // a mode, reads the CRTC back, and puts everything as it was. A
-        // separate subcommand for exactly that reason -- discovery is safe to
-        // run beside a running compositor and this is not, so the two must not
-        // be reachable by one name.
-        "probe-kms" => {
-            let device = args.get(1).ok_or_else(usage)?;
-            if args.get(2).is_some() {
-                return Err(usage());
-            }
-            probe_kms(Path::new(device))
-        }
-        // A page flip: a modeset, then a SECOND frame put on the same CRTC
-        // and waited for. Separate from `probe-kms` for the reason that one is
-        // separate from `probe-drm` -- it disturbs the screen for longer and
-        // proves a strictly stronger claim, and a name that covered both would
-        // make the weaker run imply the stronger.
-        "probe-flip" => {
-            let device = args.get(1).ok_or_else(usage)?;
-            if args.get(2).is_some() {
-                return Err(usage());
-            }
-            probe_flip(Path::new(device))
-        }
         "probe" => {
             let socket = args.get(1).ok_or_else(usage)?;
             if args.get(2).is_some() {
@@ -1862,10 +1786,10 @@ unsafe impl Send for MappedRegion {}"#;
     /// wrapper functions.
     ///
     /// Four DRM numbers READ a card. `DROP_MASTER` releases authority that
-    /// opening a primary node granted without being asked, and `SET_MASTER` --
-    /// which this increment adds -- takes it back deliberately, for a bounded
-    /// window. The dumb trio allocates, maps and frees. The modeset four
-    /// register a framebuffer, read a CRTC, drive one, and unregister.
+    /// opening a primary node granted without being asked, and `SET_MASTER`
+    /// takes it back deliberately, for the KMS backend's life. The dumb trio
+    /// allocates, maps and frees. The modeset four register a framebuffer,
+    /// read a CRTC, drive one, and unregister.
     ///
     /// `MODE_SETPLANE` and `MODE_ATOMIC` remain deliberately absent, and the
     /// stand-in has moved AGAIN: this increment rosters `MODE_PAGE_FLIP`, which
@@ -2056,14 +1980,9 @@ unsafe impl Send for MappedRegion {}"#;
                 "{request} is not reached from {wrapper}"
             );
         }
-        // Discovery takes no mastership, and the absence IS the claim: a
-        // process that became DRM master would take the console away from
-        // fbcon, which is precisely what makes this probe runnable on a live
-        // image beside the compositor already driving that card.
-        // Mastership is RELEASED on the way in, and the release is on the one
-        // path that opens a card, so no descriptor this module hands out is
-        // ever the DRM master for longer than the two syscalls between them.
-        // An earlier revision asserted the ABSENCE of `DROP_MASTER` as proof of
+        // Mastership is RELEASED on the way in, on the one path that opens a
+        // card, so the one place it is TAKEN is `open_kms`'s explicit
+        // `SET_MASTER`, two syscalls later. An earlier revision asserted the ABSENCE of `DROP_MASTER` as proof of
         // not being master; that had it backwards -- `drm_master_open` grants
         // mastership on the open itself, so the absence pinned that the code
         // could not give back what it had already taken.
@@ -2077,9 +1996,9 @@ unsafe impl Send for MappedRegion {}"#;
         assert_eq!(occurrences(production(DRM), "OpenOptions::new()"), 1);
         // And the policy module DECLARES no request of its own: the ABI lives
         // in `sys.rs`, so the only requests `drm.rs` can cause are the
-        // thirteen the allow-list admits, reached through the calls pinned
-        // above. It may
-        // still NAME one in prose, so the claim is about a declaration.
+        // fourteen DRM requests the allow-list admits, reached through the
+        // calls pinned above. It may still NAME one in prose, so the claim is
+        // about a declaration.
         assert!(!production(DRM).contains("const DRM_IOCTL"));
         // No raw syscall of its own: named as the two forms that would be one,
         // rather than as the word, which this module's own prose uses to say
@@ -2087,8 +2006,8 @@ unsafe impl Send for MappedRegion {}"#;
         assert!(!production(DRM).contains("syscall5("));
         assert!(!production(DRM).contains("syscall6("));
         assert!(!production(DRM).contains("asm!"));
-        // Nor does the policy module map anything itself. `DumbFrame` OWNS a
-        // `MappedRegion` and lends its bytes on, which is the whole point of
+        // Nor does the policy module map anything itself. `ScanoutBuffer` OWNS
+        // a `MappedRegion` and lends its bytes on, which is the whole point of
         // the region type: the mapping pair is created and destroyed in one
         // module, and `drm.rs` never names either half.
         assert!(!production(DRM).contains("from_raw_parts"));
@@ -2096,52 +2015,31 @@ unsafe impl Send for MappedRegion {}"#;
         assert!(!production(DRM).contains("SYS_MUNMAP"));
     }
 
-    /// A modeset unwinds in the one order that works, and that order is field
-    /// declaration order.
+    /// The backend unwinds in the one order that works, and that order is
+    /// field declaration order.
     ///
-    /// The restore is a `SETCRTC`, which is the ONE step of the three that
+    /// The restore is a `SETCRTC`, which is the ONE teardown step that
     /// carries `DRM_MASTER` in the kernel's ioctl table -- `GETCRTC`, `ADDFB2`
     /// and `RMFB` carry no flag (`drm_ioctl.c:674`, `675`, `691`, `692`). So
-    /// mastership has to outlive the restore, and is released last.
+    /// mastership has to outlive the restore, and is released after it.
     ///
-    /// An earlier revision of this comment claimed more: that `RMFB` on a
-    /// framebuffer still being scanned out is refused. It is not.
-    /// `drm_framebuffer_remove` disables the CRTCs using it instead, because
-    /// "drm ABI mandates that we remove any deleted framebuffers from active
-    /// usage". The wrong order therefore blanks the CRTC and then restores it,
-    /// which is a flicker and not a failure. The order is still worth pinning;
-    /// the claim about why is smaller than it was.
-    ///
-    /// No `impl Drop for Modeset`, for the reason recorded on `DumbFrame`: a
-    /// type's own destructor runs BEFORE its fields, so writing this sequence
-    /// there would run it in exactly the wrong place. Each release call is
-    /// reached from its guard's `Drop` and nowhere else, which is what stops an
-    /// early return from skipping one.
+    /// `RMFB` on a framebuffer still being scanned out is not refused:
+    /// `drm_framebuffer_remove` disables the CRTCs using it, because "drm ABI
+    /// mandates that we remove any deleted framebuffers from active usage".
+    /// Unregistering first therefore blanks the CRTC and leaves the restore
+    /// to light it again, which is a flicker and not a failure. The CRTC is
+    /// declared before the buffers so that does not happen.
     #[test]
-    fn a_modeset_unwinds_crtc_then_framebuffer_then_mastership() {
+    fn the_backend_unwinds_crtc_then_mastership_then_buffers() {
         let drm = production(DRM);
-        assert!(
-            !drm.contains("impl Drop for Modeset"),
-            "Modeset grew a destructor, which runs before its fields drop"
-        );
-        for guard in [
-            "impl Drop for CrtcRestore",
-            "impl Drop for FbGuard",
-            "impl Drop for MasterGuard",
-        ] {
-            assert!(drm.contains(guard), "{guard} is gone");
-        }
-        // Each release is issued from exactly one place per family: its guard
-        // for the borrowed modeset, and `Registration` for the backend's
-        // owned buffers. Mastership is TAKEN twice -- by the probe's modeset
-        // and by `open_kms`, which keeps it for the backend's life.
-        assert_eq!(occurrences(drm, "sys::drm_rm_fb("), 2);
-        assert_eq!(occurrences(drm, "sys::drm_set_master("), 2);
-        // The backend's teardown is the same order in two places. The chain
-        // declares its CRTC before its buffers, so the restore runs before
-        // any framebuffer it may be scanning out is unregistered; and the
-        // CRTC's own drop restores before it gives mastership back, because
-        // the restore is a `SETCRTC`.
+        // Each release is issued from exactly one place: `Registration` for
+        // the owned buffers. Mastership is TAKEN once, by `open_kms`, which
+        // keeps it for the backend's life.
+        assert_eq!(occurrences(drm, "sys::drm_rm_fb("), 1);
+        assert_eq!(occurrences(drm, "sys::drm_set_master("), 1);
+        // The chain declares its CRTC before its buffers, so the restore runs
+        // before any framebuffer it may be scanning out is unregistered; and
+        // the CRTC's own drop restores before it gives mastership back.
         let chain = drm
             .find("pub struct SwapChain<C, M> {")
             .and_then(|start| drm.get(start..))
@@ -2172,108 +2070,40 @@ unsafe impl Send for MappedRegion {}"#;
             restore_call < master_call,
             "CardCrtc gives mastership back before the restore that needs it"
         );
-        let start = drm
-            .find("pub struct Modeset<'card, 'frame> {")
-            .expect("drm.rs no longer declares Modeset");
-        let body = drm.get(start..).unwrap_or_default();
-        let end = body.find("\n}").unwrap_or(body.len());
-        let fields = body.get(..end).unwrap_or_default();
-        let restore = fields
-            .find("restore: CrtcRestore<'card>,")
-            .expect("Modeset no longer holds its CRTC restore by that name");
-        let fb = fields
-            .find("fb: FbGuard<'card>,")
-            .expect("Modeset no longer holds its framebuffer guard by that name");
-        let master = fields
-            .find("master: MasterGuard<'card>,")
-            .expect("Modeset no longer holds its master guard by that name");
-        assert!(
-            restore < fb && fb < master,
-            "Modeset's guards are declared out of order, so mastership is dropped \
-             before the restore that needs it, or the screen is blanked by the \
-             framebuffer's removal and then repainted by the restore"
-        );
-        // And the SAME order in `apply`'s locals, which is where the error
-        // paths get theirs. The field order above governs only the success
-        // path: a `?` between two of these unwinds whatever locals exist at
-        // that point, in their own declaration order. Hoisting `restore` above
-        // `fb` inverts the error-path unwind while every other test in this
-        // file stays green, so the two orders are pinned separately because
-        // they are two separate orders.
-        let apply = drm
-            .find("    pub fn apply(")
-            .expect("drm.rs no longer declares Modeset::apply");
-        let body = drm.get(apply..).unwrap_or_default();
-        let end = body.find("\n    }").unwrap_or(body.len());
-        let locals = body.get(..end).unwrap_or_default();
-        let master_local = locals
-            .find("let master = MasterGuard { card };")
-            .expect("apply no longer binds its master guard by that name");
-        let fb_local = locals
-            .find("let fb = FbGuard { card, fb_id };")
-            .expect("apply no longer binds its framebuffer guard by that name");
-        let restore_local = locals
-            .find("let restore = CrtcRestore::capture(")
-            .expect("apply no longer binds its CRTC restore by that name");
         // The restore's connector set is READ rather than substituted. Pinned
         // as the CALL, not merely as the function's existence: reverting this
-        // one line to `vec![scanout.connector_id]` leaves `connectors_on_crtc`
-        // defined, leaves every sys call site spelled, leaves the count at
-        // twenty, and silently restores the bug two reviewers caught.
+        // one line to the selected connector leaves `connectors_on_crtc`
+        // defined, leaves every sys call site spelled, and silently restores
+        // the bug two reviewers caught -- a second lit sink left dark.
         assert!(
-            drm.contains("let routed = connectors_on_crtc(card, scanout.crtc_id)?;"),
-            "the modeset no longer reads the CRTC's real connector routing, so its \
+            drm.contains("let routed = connectors_on_crtc(&card, scanout.crtc_id)?;"),
+            "open_kms no longer reads the CRTC's real connector routing, so its \
              restore is guessing again"
-        );
-        // The fourth field, pinned because its whole job is to make a mistake
-        // uncompilable: without it a modeset outlives the frame it scans out,
-        // and every test in this file still passes. Deleting it is a silent
-        // regression by construction, so the pin is the only thing that
-        // notices.
-        assert!(
-            fields.contains("frame: &'frame DumbFrame<'card>,"),
-            "Modeset no longer borrows its frame, so it may outlive the buffer \
-             it is scanning out"
-        );
-        assert!(
-            master_local < fb_local && fb_local < restore_local,
-            "apply's guard locals are declared out of order, so an early return \
-             unwinds them in an order the success path would never use"
         );
     }
 
-    /// A dumb buffer is unmapped BEFORE its handle is released, and that
+    /// A scanout buffer is unmapped BEFORE its handle is released, and that
     /// ordering is the compiler's rather than a comment's.
     ///
     /// Rust drops struct fields in declaration order, so `region` before
-    /// `handle` means munmap before `DESTROY_DUMB`. An `impl Drop for
-    /// DumbFrame` would invert it: a type's own `drop` runs BEFORE its fields
-    /// are dropped. Both halves are pinned because either one alone permits the
-    /// other order -- the field order is only meaningful while no destructor
-    /// preempts it.
+    /// `registration` means munmap before `RMFB` and `DESTROY_DUMB`. An
+    /// `impl Drop for ScanoutBuffer` would invert it: a type's own `drop` runs
+    /// BEFORE its fields are dropped. Both halves are pinned because either
+    /// one alone permits the other order.
     ///
     /// What is pinned is a PREFERENCE, not a safety property. The kernel
     /// tolerates either order, since a GEM mapping holds its own reference to
     /// the object; `UNSAFE.md` §6 carries the citation and the correction of an
-    /// earlier claim that it was required. The test earns its place by keeping
-    /// the code saying what the documents say, which is the thing that silently
-    /// stops being true.
+    /// earlier claim that it was required.
     #[test]
-    fn a_dumb_frame_unmaps_before_it_releases_the_handle() {
+    fn a_scanout_buffer_unmaps_before_it_releases_the_handle() {
         let drm = production(DRM);
-        assert!(
-            !drm.contains("impl Drop for DumbFrame"),
-            "DumbFrame grew a destructor, which runs before its fields drop"
-        );
-        // The handle's own guard is what performs the release, and it is the
-        // only place that does -- one guard per family, as for `RMFB`.
-        assert!(drm.contains("impl Drop for DumbHandle"));
         assert!(drm.contains("impl Drop for Registration"));
-        assert_eq!(occurrences(drm, "sys::drm_destroy_dumb("), 2);
-        // The backend's buffer releases in the same order, by the same means:
-        // mapping declared before registration, no destructor of its own, and
-        // inside the registration the framebuffer before the handle it names.
-        assert!(!drm.contains("impl Drop for ScanoutBuffer"));
+        assert_eq!(occurrences(drm, "sys::drm_destroy_dumb("), 1);
+        assert!(
+            !drm.contains("impl Drop for ScanoutBuffer"),
+            "ScanoutBuffer grew a destructor, which runs before its fields drop"
+        );
         let owned = drm
             .find("pub struct ScanoutBuffer {")
             .and_then(|start| drm.get(start..))
@@ -2303,23 +2133,6 @@ unsafe impl Send for MappedRegion {}"#;
         assert!(
             unregister < destroy,
             "Registration frees the handle before unregistering the framebuffer on it"
-        );
-        let start = drm
-            .find("pub struct DumbFrame<'card> {")
-            .expect("drm.rs no longer declares DumbFrame");
-        let body = drm.get(start..).unwrap_or_default();
-        let end = body.find('}').unwrap_or(body.len());
-        let fields = body.get(..end).unwrap_or_default();
-        let region = fields
-            .find("region: sys::MappedRegion,")
-            .expect("DumbFrame no longer holds its mapping by that name");
-        let handle = fields
-            .find("handle: DumbHandle<'card>,")
-            .expect("DumbFrame no longer holds its handle guard by that name");
-        assert!(
-            region < handle,
-            "DumbFrame declares its handle before its mapping, so the handle is \
-             released while the mapping is still live"
         );
     }
 
@@ -2546,22 +2359,10 @@ pub struct MappedRegion {
             "if let Ok(encoder) = sys::drm_encoder(card, connector.encoder_id) {",
             "let Ok(encoder) = sys::drm_encoder(card, *encoder_id) else {",
             "sys::drm_drop_master(&card)",
-            "let buffer = sys::drm_create_dumb(card, width, height)?;",
-            "let region = sys::drm_map_dumb(card, &buffer)?;",
-            "let _ = sys::drm_destroy_dumb(self.card, self.handle);",
-            "sys::drm_set_master(card)",
-            "let saved = sys::drm_get_crtc(card, scanout.crtc_id)?;",
-            "let fb_id = sys::drm_add_fb(card, width, height, frame.pitch(), frame.handle())?;",
             "let listed = sys::drm_resources(card)?;",
             "let Ok(connector) = sys::drm_connector(card, *id) else {",
             "let Ok(encoder) = sys::drm_encoder(card, connector.encoder_id) else {",
-            "let live = sys::drm_get_crtc(card, self.crtc_id)?;",
-            "sys::drm_set_crtc(card, &wanted, &mut connectors)?;",
-            "if let Err(error) = sys::drm_set_crtc(self.card, &self.saved, &mut self.connectors) {",
-            "sys::drm_page_flip(card, modeset.crtc_id(), fb_id, cookie)?;",
-            "let _ = sys::drm_rm_fb(self.card, self.fb_id);",
-            "let _ = sys::drm_drop_master(self.card);",
-            // The owned backend's twelve.
+            // The backend's twelve.
             "sys::drm_set_master(&card).map_err(|error| {",
             "let saved = sys::drm_get_crtc(&card, scanout.crtc_id)?;",
             "let buffer = sys::drm_create_dumb(&**card, width, height)?;",
@@ -2577,40 +2378,31 @@ pub struct MappedRegion {
         ] {
             assert!(drm.contains(call), "drm.rs no longer spells `{call}`");
         }
-        // Twenty calls and no twenty-first. Three names are a take-and-
-        // give-back pair: `drop_master` from `open_card` and from
-        // `MasterGuard::drop`; `get_crtc` to save the state and again to read
-        // back what the modeset actually did; `set_crtc` to drive the scanout
-        // and again from `CrtcRestore::drop` to put it back. Three more are
-        // read twice for two different questions -- `drm_resources`,
-        // `drm_connector` and `drm_encoder` answer "what could be driven" for
-        // discovery and "what is being driven right now" for the restore, and
-        // `drm_encoder` a third time inside `crtc_for`'s fallback. Each of the
-        // four release calls is reached from a `Drop` and from nowhere else,
-        // which is what makes the unwind a property of field order rather than
-        // of a path some early return can miss.
+        // Twenty-one calls and no twenty-second. Nine are discovery's and
+        // the open's: `drop_master` once in `open_card`; `drm_resources`,
+        // `drm_connector` and `drm_encoder` read twice for two different
+        // questions -- "what could be driven" for discovery and "what is being
+        // driven right now" for the restore -- and `drm_encoder` a third time
+        // inside `crtc_for`'s fallback; and the driver's name.
         //
-        // The owned backend adds twelve, one per step of its life: take
-        // mastership and save the CRTC; allocate, map and register each
-        // buffer; flip, set and read back; and restore, give back, unregister
-        // and free on the way out. Its discovery and routing reads are the
-        // SAME functions the probes call, so they add nothing here.
-        assert_eq!(occurrences(drm, "sys::drm_"), 35);
+        // The backend adds twelve, one per step of its life: take mastership
+        // and save the CRTC; allocate, map and register each buffer; flip,
+        // set and read back; and restore, give back, unregister and free on
+        // the way out. Each of the four release calls is reached from a
+        // `Drop` and from nowhere else, which is what makes the unwind a
+        // property of field order rather than of a path some early return
+        // can miss.
+        assert_eq!(occurrences(drm, "sys::drm_"), 21);
         // `drm_add_fb` is pinned by COUNT as well as by spelling, because it
         // is the worst of these to get wrong: four bare `u32`s in a row, so
         // swapping width for height, or pitch for handle, type-checks, passes
-        // this whole suite, and fails only on a real card.
-        // TWO registrations now, and both are spelled the same way because
-        // they are the same call: a modeset registers the frame it sets, and a
-        // flip registers the frame it flips to. Each is followed immediately by
-        // its own `FbGuard`, which is the property that matters and the reason
-        // a second one is not a smell.
-        // And a third: the backend registers each buffer once, at
-        // allocation, and flips between the two registrations for its life.
-        assert_eq!(occurrences(drm, "sys::drm_add_fb("), 3);
+        // this whole suite, and fails only on a real card. The backend
+        // registers each buffer once, at allocation, and flips between the
+        // two registrations for its life.
+        assert_eq!(occurrences(drm, "sys::drm_add_fb("), 1);
         assert_eq!(occurrences(drm, "sys::drm_resources("), 2);
-        // One queue per family: the probe's `Flip`, and the backend's CRTC.
-        assert_eq!(occurrences(drm, "sys::drm_page_flip("), 2);
+        // One queue: the backend's CRTC.
+        assert_eq!(occurrences(drm, "sys::drm_page_flip("), 1);
         let production_main = production(MAIN);
         for (name, source) in std::iter::once(("main.rs", production_main))
             .chain(OTHER.iter().copied())
@@ -2781,7 +2573,7 @@ pub struct MappedRegion {
             (&["sys::drm_", "sys::parse_drm_event"], &["drm.rs"]),
             (
                 &["sys::make_nonblocking", "sys::restore_status_flags"],
-                &["conn.rs", "drm.rs"],
+                &["conn.rs"],
             ),
             (&["sys::input_monotonic_clock"], &["input.rs"]),
             (&["sys::monotonic_time"], &["runtime.rs"]),
@@ -2835,6 +2627,73 @@ pub struct MappedRegion {
     #[test]
     fn the_selftest_subcommand_passes() {
         super::selftest().unwrap();
+    }
+
+    /// The fallback is taken for a MISSING card and nothing else: a card that
+    /// exists is driven, and one that cannot even be inspected is an error
+    /// rather than a quiet switch to fbdev. The existence check is asked only
+    /// when there is somewhere to fall back to.
+    #[test]
+    fn the_framebuffer_is_driven_only_when_the_card_is_missing() {
+        use super::{select_backend, Backend, OutputDevice};
+        use std::io::{Error, ErrorKind};
+        use std::path::{Path, PathBuf};
+
+        let card = Path::new("/dev/dri/card0");
+        let fb = Path::new("/dev/fb0");
+        let with_fallback = OutputDevice::Card {
+            card: card.into(),
+            fallback: Some(fb.into()),
+        };
+        assert_eq!(
+            select_backend(&with_fallback, |_| Ok(())),
+            Ok(Backend::Card(card))
+        );
+        assert_eq!(
+            select_backend(&with_fallback, |_| Err(Error::from(ErrorKind::NotFound))),
+            Ok(Backend::Framebuffer(fb))
+        );
+        let refused = select_backend(&with_fallback, |_| {
+            Err(Error::from(ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert!(refused.contains("/dev/dri/card0"), "{refused}");
+        let asked = |_: &Path| -> std::io::Result<()> { panic!("no fallback, nothing to ask") };
+        assert_eq!(
+            select_backend(
+                &OutputDevice::Card {
+                    card: card.into(),
+                    fallback: None,
+                },
+                asked
+            ),
+            Ok(Backend::Card(card))
+        );
+        assert_eq!(
+            select_backend(&OutputDevice::Framebuffer(PathBuf::from(fb)), asked),
+            Ok(Backend::Framebuffer(fb))
+        );
+    }
+
+    /// The two KMS boot markers, byte for byte: the image's check parses
+    /// these lines, so their spelling is an interface.
+    #[test]
+    fn the_kms_boot_markers_are_one_flushed_line_each() {
+        let (chain, _) = crate::drm::testing::chain(4, 3);
+        let lit = "driver=virtio_gpu connector=Virtual-1#36 status=connected crtc=35 \
+                   encoder=37 mode=4x3@60 name=4x3 preferred=true mm=0x0 fb=40,41 modeset=ok";
+        let mut out = Vec::new();
+        super::announce_kms_ready(&mut out, lit, &chain).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("\nTD-COMPOSITOR-KMS-READY {lit} output=4x3 stride=16\n")
+        );
+        let mut out = Vec::new();
+        super::announce_first_flip(&mut out, crate::output::FrameId::FIRST.next()).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\nTD-COMPOSITOR-FLIP-OK cookie=0x2 flip=ok\n"
+        );
     }
 
     #[test]
@@ -3008,7 +2867,8 @@ pub struct MappedRegion {
             options.output,
             super::OutputDevice::Framebuffer(std::path::PathBuf::from("/dev/fb0"))
         );
-        // The card instead of fbdev, and never both or neither.
+        // The card instead of fbdev; the card with fbdev as its fallback; and
+        // never neither.
         let fresh = valid(&wayland, &portal, &ready);
         let at = fresh
             .iter()
@@ -3019,16 +2879,28 @@ pub struct MappedRegion {
         card[at + 1] = "/dev/dri/card0".into();
         assert_eq!(
             super::parse_run(&card).unwrap().output,
-            super::OutputDevice::Card(std::path::PathBuf::from("/dev/dri/card0"))
+            super::OutputDevice::Card {
+                card: std::path::PathBuf::from("/dev/dri/card0"),
+                fallback: None,
+            }
         );
         let mut both_outputs = fresh.clone();
         both_outputs.extend(["--card".into(), "/dev/dri/card0".into()]);
-        assert!(super::parse_run(&both_outputs).is_err());
+        assert_eq!(
+            super::parse_run(&both_outputs).unwrap().output,
+            super::OutputDevice::Card {
+                card: std::path::PathBuf::from("/dev/dri/card0"),
+                fallback: Some(std::path::PathBuf::from("/dev/fb0")),
+            }
+        );
+        let mut twice = both_outputs.clone();
+        twice.extend(["--card".into(), "/dev/dri/card1".into()]);
+        assert!(super::parse_run(&twice).is_err());
         let mut neither = fresh;
         neither.drain(at..at + 2);
         assert!(super::parse_run(&neither)
             .err()
-            .is_some_and(|error| error.contains("exactly one --framebuffer or --card")));
+            .is_some_and(|error| error.contains("--card or --framebuffer is required")));
         assert_eq!(options.launcher_client, None);
         assert_eq!(options.launcher_application.as_deref(), Some("td-jail-fixture"));
         assert_eq!(

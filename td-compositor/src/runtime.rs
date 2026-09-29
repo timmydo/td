@@ -38,11 +38,11 @@ const MAX_APPLICATION_SCAN_DIAGNOSTICS: usize = 8;
 /// How long a queued page flip may go unanswered before the watchdog puts
 /// its frame on glass by modeset instead.
 ///
-/// A bound on a HANG, not a schedule, and five seconds for the flip probe's
-/// reason: a completion is delivered from a timer that needs the guest
-/// scheduled, and a loaded TCG host can leave it unscheduled far longer than
-/// any frame interval. Recovering a flip that was merely slow costs one
-/// modeset; waiting forever on one that was lost costs the screen.
+/// A bound on a HANG, not a schedule, and five seconds because a completion
+/// is delivered from a timer that needs the guest scheduled, and a loaded
+/// TCG host can leave it unscheduled far longer than any frame interval.
+/// Recovering a flip that was merely slow costs one modeset; waiting forever
+/// on one that was lost costs the screen.
 ///
 /// The modeset is not free. On an atomic driver a legacy `SETCRTC` is a
 /// blocking commit that first waits out the stalled one, up to the kernel's
@@ -6092,7 +6092,7 @@ mod tests {
         let mut runtime = Runtime::new(chain);
         let key = SurfaceKey { client: 1, object: 1 };
         runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
-        let first = FrameId::FIRST;
+        let first = crate::drm::FIRST_FLIP;
         assert_eq!(runtime.last_submission(), Some(Submission::Queued(first)));
         assert_eq!(runtime.frame_in_flight(), Some(first));
         assert_eq!(flips(&log), 1);
@@ -6131,7 +6131,7 @@ mod tests {
         runtime
             .commit(SurfaceKey { client: 1, object: 1 }, surface([1, 2, 3, 0]))
             .unwrap();
-        let first = FrameId::FIRST;
+        let first = crate::drm::FIRST_FLIP;
         assert!(runtime
             .output_event(OutputEvent::Presented(first.next()))
             .is_err());
@@ -6176,7 +6176,7 @@ mod tests {
             .unwrap();
         runtime.flush_paint().unwrap();
         assert!(runtime.paint_pending());
-        let first = FrameId::FIRST;
+        let first = crate::drm::FIRST_FLIP;
         let second = first.next();
         let late = Instant::now() + FLIP_DEADLINE + Duration::from_secs(1);
         runtime.output_watchdog(late).unwrap();
@@ -6204,7 +6204,7 @@ mod tests {
         }
         log.lock().unwrap().fail_next_set = true;
         assert!(runtime.output_watchdog(late).is_err());
-        assert_eq!(runtime.frame_in_flight(), Some(FrameId::FIRST));
+        assert_eq!(runtime.frame_in_flight(), Some(crate::drm::FIRST_FLIP));
     }
 
     /// A burst of late completions after more stalls than are remembered,
@@ -6295,13 +6295,13 @@ mod tests {
         runtime.flush_paint().unwrap();
         log.lock().unwrap().fail_next_flip = true;
         runtime
-            .output_event(OutputEvent::Presented(FrameId::FIRST))
+            .output_event(OutputEvent::Presented(crate::drm::FIRST_FLIP))
             .unwrap();
         assert_eq!(runtime.frame_in_flight(), None);
         assert!(runtime.paint_pending());
 
         runtime.output_watchdog(Instant::now()).unwrap();
-        assert_eq!(runtime.frame_in_flight(), Some(FrameId::FIRST.next()));
+        assert_eq!(runtime.frame_in_flight(), Some(crate::drm::FIRST_FLIP.next()));
         assert!(!runtime.paint_pending());
     }
 
@@ -6317,7 +6317,7 @@ mod tests {
             Runtime::new(Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap());
         runtime.repaint().unwrap();
         assert!(runtime
-            .output_event(OutputEvent::Presented(FrameId::FIRST))
+            .output_event(OutputEvent::Presented(crate::drm::FIRST_FLIP))
             .is_err());
         runtime
             .output_watchdog(Instant::now() + FLIP_DEADLINE + Duration::from_secs(1))

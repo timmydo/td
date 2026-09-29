@@ -1026,68 +1026,32 @@ pub const TD_JAIL_TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 /// td-jail's exported filter and observes the compiled errno and kill actions.
 pub const TD_JAIL_SECCOMP_PROBE_MARKER: &str = "TD-JAIL-SECCOMP-PROBE-OK";
 
-/// APPLICATIONS.md §M row 1, the DISCOVERY half: td-compositor opened the card,
-/// asked the kernel which driver is behind it, enumerated its connectors,
-/// encoders and CRTCs, and chose the connector, mode and CRTC a KMS backend
-/// would drive.
+/// td-compositor opened the card as the compositor account, took DRM
+/// mastership, and set the mode it will scan out from: APPLICATIONS.md §M row
+/// 1, printed by the running compositor rather than by a probe beside it.
 ///
-/// The line carries what it found, not just that it found something, because
-/// the numbers are the evidence: an image whose virtio-gpu stopped offering a
-/// preferred mode, or whose connector went to `disconnected`, still has a card
-/// and would still satisfy a bare "it worked". The check asserts the driver and
-/// a non-zero mode out of this line for that reason.
+/// The line carries what the backend found and did, because the numbers are
+/// the evidence: an image whose virtio-gpu stopped offering a preferred mode,
+/// or whose connector went to `disconnected`, still has a card and would still
+/// satisfy a bare "it worked". It names the driver, connector, CRTC and mode
+/// from discovery, the two framebuffers of the swap chain, `modeset=ok` once
+/// the CRTC read back what was set, and the output size and stride frames are
+/// rendered at.
 ///
-/// It takes NO DRM mastership and issues no modeset, which is what lets it run
-/// on the ordinary boot beside the fbdev compositor already driving that same
-/// card. That is also its limit: `DRM_IOCTL_MODE_GETCONNECTOR` re-probes only
-/// for the current master, so this reads the mode list the kernel already had
-/// rather than forcing a fresh probe.
-pub const TD_COMPOSITOR_DRM_PROBE_MARKER: &str = "TD-COMPOSITOR-DRM-PROBE-OK";
+/// Absent under the fbdev fallback, which the compositor takes only when the
+/// machine has no card; QEMU always attaches one.
+pub const TD_COMPOSITOR_KMS_MARKER: &str = "TD-COMPOSITOR-KMS-READY";
 
-/// What `td-compositor probe-kms` prints when it has actually SET a mode.
+/// The running compositor's first page flip completed and the runtime took it:
+/// the completion came back carrying the frame identity it was queued with,
+/// the `u64` `DRM_IOCTL_MODE_PAGE_FLIP` round-trips through the kernel.
 ///
-/// A separate marker from the discovery one because it is a separate claim, and
-/// a much stronger one: discovery says a card exists and offers a mode, this
-/// says the mode was programmed onto a CRTC and the CRTC agreed. The probe
-/// takes DRM mastership, registers the dumb buffer it mapped as a framebuffer,
-/// drives the connector from its CRTC, reads the CRTC back, and then puts
-/// everything as it was.
-///
-/// Unlike the discovery probe, this one DISTURBS the display, and the reason
-/// is the modeset rather than the mastership. Once this probe's framebuffer is
-/// on the primary plane, the fbdev console's damage stops reaching the screen
-/// — `drm_atomic_helper_dirtyfb` skips every plane whose current framebuffer
-/// is not the one being damaged (`drm_damage_helper.c:168`) — so the console
-/// goes on committing updates to a buffer nothing is scanning out. Mastership
-/// alone would not do that; it only stops another process becoming master
-/// (`drm_auth.c:260`) and fails two fbdev ioctls this image never issues.
-///
-/// That is why this is a separate subcommand rather than more output from the
-/// same one, and why nothing in the boot's health verdict depends on the
-/// display during it. On the headless QEMU run there is nothing to disturb; on
-/// a machine with a monitor there would be, briefly.
-pub const TD_COMPOSITOR_KMS_PROBE_MARKER: &str = "TD-COMPOSITOR-KMS-PROBE-OK";
-
-/// `td-compositor probe-flip` exchanged one frame for another and the kernel
-/// said when.
-///
-/// The third and strongest of the three card claims, and each is strictly
-/// stronger than the last: discovery says a card exists and offers a mode; the
-/// modeset says that mode was programmed and the CRTC agreed; this says a
-/// SECOND frame replaced the first and the completion for it came back
-/// carrying the identity it was queued with.
-///
-/// That last clause is the increment. A page flip whose completion cannot be
-/// matched to the frame that caused it is not a completion path — a caller
-/// with two frames in flight would be guessing — and the identity is the
-/// `u64` `DRM_IOCTL_MODE_PAGE_FLIP` round-trips through the kernel, not
-/// something td keeps beside it.
-///
-/// It disturbs the display for the same reason `probe-kms` does and for
-/// slightly longer, so it is a third subcommand rather than more output from
-/// the second, and nothing in the boot's health verdict depends on the display
-/// while it runs.
-pub const TD_COMPOSITOR_FLIP_PROBE_MARKER: &str = "TD-COMPOSITOR-FLIP-PROBE-OK";
+/// Printed once, for the first completion the runtime accepted: the frame in
+/// flight's, or the late one of a frame the watchdog recovered. The runtime
+/// refuses any other, so the line is the round-trip, not a constant. A
+/// recovery by modeset alone prints nothing: that is the flip NOT completing.
+/// The swap chain numbers frames from 2, so the cookie is at least `0x2`.
+pub const TD_COMPOSITOR_FLIP_MARKER: &str = "TD-COMPOSITOR-FLIP-OK";
 
 /// APPLICATIONS.md §H item 12: `kill -KILL` of stage 1 reaped the whole
 /// instance.

@@ -31,8 +31,7 @@ use crate::ladder::{
     TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER,
     TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
     TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER,
-    TD_APPLICATIONS_PLACED_MARKER, TD_COMPOSITOR_DRM_PROBE_MARKER,
-    TD_COMPOSITOR_FLIP_PROBE_MARKER, TD_COMPOSITOR_KMS_PROBE_MARKER,
+    TD_APPLICATIONS_PLACED_MARKER,
     TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
     TD_FETCH_BOOT_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
     TD_MAIL_BOOT_MARKER,
@@ -1321,7 +1320,8 @@ mod svc_timeouts {
     pub const FIRSTBOOT: u32 = 300;
     /// Dozens of greps over /proc/mounts, several `su` runs, and write probes.
     pub const ROOTCHECK: u32 = 120;
-    /// Validates and assigns one framebuffer plus the built-in evdev nodes.
+    /// Validates and assigns the display card and framebuffer plus the
+    /// built-in evdev nodes.
     pub const SEAT: u32 = 30;
     /// `td-netd up` is DHCP with bounded retries. Under the nettest token it also
     /// resolves and reaches the upstream, then Git has libcurl's 300-second connect
@@ -1654,11 +1654,12 @@ fn build_td_svc_conf() -> String {
          console=yes\n\
          \n\
          # The private pair admits the enrolled compositor before display access.\n\
+         # It drives the card; the framebuffer only on a machine without one.\n\
          [wayland]\n\
          type=daemon\n\
          cgroup=service\n\
          exec=/bin/td-authd terminal-serve --primary --peer-uid {compositor_uid}\n\
-         pair-exec=/bin/td-login exec-service-as {compositor_user} -- /bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket {wayland_socket} --portal-socket {portal_wayland_socket} --control-socket {control_socket} --launcher-application {firefox_name} --terminal-authority stdin --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}\n\
+         pair-exec=/bin/td-login exec-service-as {compositor_user} -- /bin/td-compositor run --card /dev/dri/card0 --framebuffer /dev/fb0 --input /dev/input --socket {wayland_socket} --portal-socket {portal_wayland_socket} --control-socket {control_socket} --launcher-application {firefox_name} --terminal-authority stdin --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}\n\
          after=seat\n\
          requires=seat\n\
          ready=/bin/td-login exec-primary -- /bin/td-compositor probe {wayland_socket}\n\
@@ -3043,22 +3044,6 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          /bin/grep -q -x -F {TD_JAIL_KILL_REAPS_MARKER} || \
          {{ echo \"td-jail: kill-reaps returned unexpected output: $k\"; \
          exit 1; }}'; then echo {TD_JAIL_KILL_REAPS_MARKER}; mtk=1; fi\n\
-         if d=$(/bin/td-login exec-service-as {COMPOSITOR_USER} -- \
-         /bin/td-compositor probe-drm /dev/dri/card0 2>&1) && \
-         /bin/td-util printf \"%s\\n\" \"$d\" | \
-         /bin/grep -q \"^{TD_COMPOSITOR_DRM_PROBE_MARKER} driver=\"; then \
-         /bin/td-util printf \"%s\\n\" \"$d\"; \
-         else echo \"td-compositor: DRM discovery failed: $d\"; fi\n\
-         if k=$(/bin/td-compositor probe-kms /dev/dri/card0 2>&1) && \
-         /bin/td-util printf \"%s\\n\" \"$k\" | \
-         /bin/grep -q \"^{TD_COMPOSITOR_KMS_PROBE_MARKER} driver=\"; then \
-         /bin/td-util printf \"%s\\n\" \"$k\"; \
-         else echo \"td-compositor: KMS modeset failed: $k\"; fi\n\
-         if f=$(/bin/td-compositor probe-flip /dev/dri/card0 2>&1) && \
-         /bin/td-util printf \"%s\\n\" \"$f\" | \
-         /bin/grep -q \"^{TD_COMPOSITOR_FLIP_PROBE_MARKER} driver=\"; then \
-         /bin/td-util printf \"%s\\n\" \"$f\"; \
-         else echo \"td-compositor: page flip failed: $f\"; fi\n\
          if [ -e /var/lib/td-test/td-jail-seccomp-probe ]; then \
          mts=0; /bin/rm -rf /run/td-jail-seccomp-probe; \
          if [ -f /var/lib/td-test/td-jail-seccomp-probe ] \
@@ -6996,7 +6981,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         // paths, with no shell interpreting authority arguments.
         let expected = format!(
             "/bin/td-login exec-service-as {COMPOSITOR_USER} -- /bin/td-compositor run \
-             --framebuffer /dev/fb0 --input /dev/input \
+             --card /dev/dri/card0 --framebuffer /dev/fb0 --input /dev/input \
              --socket {WAYLAND_SOCKET} \
              --portal-socket {PORTAL_WAYLAND_SOCKET} \
              --control-socket {CONTROL_SOCKET} \
@@ -9920,19 +9905,14 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
     }
 
-    /// Discovery runs as the compositor's own account, so the boot marker
-    /// the QEMU check requires is also proof of td-seatd's card grant. Run as
-    /// root, it would open the node through CAP_DAC_OVERRIDE and prove
-    /// nothing about the grant.
+    /// The card is the running compositor's. Boot health opens nothing on
+    /// it: a probe taking mastership would contend with the compositor that
+    /// holds it, and the card evidence is what the compositor itself prints.
     #[test]
-    fn boot_health_discovers_the_card_as_the_compositor_account() {
+    fn boot_health_leaves_the_card_to_the_compositor() {
         let bootsuccess = build_bootsuccess(&SYSTEM);
-        let discovery = format!(
-            "d=$(/bin/td-login exec-service-as {COMPOSITOR_USER} -- \
-             /bin/td-compositor probe-drm /dev/dri/card0 2>&1)"
-        );
-        assert_eq!(bootsuccess.matches(&discovery).count(), 1, "{bootsuccess}");
-        assert_eq!(bootsuccess.matches("probe-drm").count(), 1);
+        assert!(!bootsuccess.contains("/dev/dri"), "{bootsuccess}");
+        assert!(!bootsuccess.contains("td-compositor probe-"), "{bootsuccess}");
     }
 
     #[test]

@@ -437,8 +437,10 @@ pub fn recipe() -> Recipe {
     //    is still what an ordinary machine has.
     //    DRM_CLIENT_SELECTION is selected by DRM_VIRTIO_GPU; the explicit pins
     //    on its fbdev client and default keep /dev/fb0 from depending on a
-    //    Kconfig default. The VT/fbcon path leaves a visible recovery console
-    //    available even though ttyS0 remains the boot console.
+    //    Kconfig default. td-compositor drives the card itself and keeps
+    //    /dev/fb0 only as its fallback on a machine without one. The VT/fbcon
+    //    console shows until the compositor takes the card and again after it
+    //    exits (drm_lastclose); ttyS0 remains the boot and recovery console.
     //
     //    SANDBOXED APPLICATIONS (APPLICATIONS.md §0): the namespace, seccomp and
     //    cgroup symbols td-jail needs. Every one of them is PROMPTED, so allnoconfig

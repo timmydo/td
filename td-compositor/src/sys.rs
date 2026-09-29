@@ -45,9 +45,7 @@ const EVIOCSCLOCKID: usize = 0x4004_45a0;
 /// `EVIOCGABS` lesson one driver over, and `the_drm_requests_encode_the_structs_they_carry`
 /// is what makes that a test rather than a remark.
 ///
-/// These four READ. None of them modesets or allocates: discovery is allowed to
-/// look at a card `fbcon` is currently driving, which is why the probe hands
-/// mastership back the instant the open takes it.
+/// These four READ. None of them modesets or allocates.
 const DRM_IOCTL_VERSION: usize = 0xc040_6400;
 /// `DRM_IOCTL_DROP_MASTER`. Not a write to the display: it RELEASES authority
 /// this process was given without asking for it.
@@ -74,11 +72,11 @@ const DRM_IOCTL_VERSION: usize = 0xc040_6400;
 /// fbdev ioctls, `drm_fb_helper_setcmap` (`:863`) and
 /// `drm_fb_helper_pan_display` (`:1247`), fail for as long as it is held.
 ///
-/// Dropping it immediately is what makes "this probe does not disturb what is
-/// on the screen" a property of the code rather than a hope. An earlier
-/// revision asserted the absence of this request as PROOF of not being master,
-/// which had it exactly backwards: it pinned that the code could not give back
-/// what the open had already taken.
+/// `open_card` drops it immediately, so the one place mastership is TAKEN is
+/// the backend's explicit `SET_MASTER`; the backend's teardown drops it again
+/// after restoring the CRTC. An earlier revision asserted the absence of this
+/// request as PROOF of not being master, which had it exactly backwards: it
+/// pinned that the code could not give back what the open had already taken.
 const DRM_IOCTL_DROP_MASTER: usize = 0x0000_641f;
 const DRM_IOCTL_MODE_GETRESOURCES: usize = 0xc040_64a0;
 const DRM_IOCTL_MODE_GETENCODER: usize = 0xc014_64a6;
@@ -1037,11 +1035,6 @@ impl MappedRegion {
         // `&mut self` exists, and the returned borrow cannot outlive it.
         unsafe { core::slice::from_raw_parts_mut(self.address, self.length) }
     }
-
-    /// The length the mapping was created with.
-    pub fn len(&self) -> usize {
-        self.length
-    }
 }
 
 impl Drop for MappedRegion {
@@ -1322,7 +1315,6 @@ struct DrmModeCrtcPageFlip {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DrmFlipCompletion {
     pub user_data: u64,
-    pub sequence: u32,
     pub crtc_id: u32,
 }
 
@@ -1358,7 +1350,6 @@ pub fn parse_drm_event(bytes: &[u8]) -> Option<(usize, Option<DrmFlipCompletion>
     }
     let completion = DrmFlipCompletion {
         user_data: read_u64(bytes, 8)?,
-        sequence: read_u32(bytes, 24)?,
         crtc_id: read_u32(bytes, 28)?,
     };
     Some((length, Some(completion)))
@@ -1501,7 +1492,7 @@ pub fn drm_driver_name(card: &impl AsRawFd) -> Result<String, String> {
     // reported longer than what was written. Believe the smaller number.
     name.truncate(length.min(fill.name_len));
     // Filtered exactly as `DrmModeInfo::name` is, and for the same reason: this
-    // string goes into a whitespace-split probe report, so a driver name
+    // string goes into a whitespace-split boot marker, so a driver name
     // carrying a newline would truncate the line and one carrying " output="
     // would shadow a later field. It also bounds the decoded LENGTH -- lossy
     // decoding expands one invalid byte to three, so 64 invalid bytes would
@@ -1567,14 +1558,9 @@ pub fn drm_resources(card: &impl AsRawFd) -> Result<DrmResources, String> {
 
 /// Read one connector: its status, its modes, and the encoders that can drive it.
 ///
-/// A zero `count_modes` asks the kernel to re-probe, but ONLY for the current
-/// DRM master — `drm_mode_getconnector` demotes everyone else to a read-only
-/// probe and says so in `drm_dbg_kms`. This process is deliberately not master,
-/// so what comes back is the mode list the kernel already had, which on a
-/// virtio-gpu driven by fbdev emulation is the list that produced the current
-/// mode. Discovery reporting no modes is therefore a fact about mastership as
-/// much as about the sink, and the caller says so rather than calling the
-/// screen absent.
+/// Never a forced probe: a zero `count_modes` asks for one (and only the
+/// current master gets it), while this sends the counting form below, so the
+/// modes read are the list the kernel already had.
 pub fn drm_connector(card: &impl AsRawFd, connector_id: u32) -> Result<DrmConnector, String> {
     let fd = card.as_raw_fd();
     for _ in 0..DRM_RESTART_ATTEMPTS {
@@ -1598,11 +1584,12 @@ pub fn drm_connector(card: &impl AsRawFd, connector_id: u32) -> Result<DrmConnec
         let wanted_modes = drm_count(probe.count_modes, MAX_DRM_MODES, "modes")?;
         let wanted_encoders = drm_count(probe.count_encoders, MAX_DRM_OBJECTS, "encoders")?;
 
-        let mut modes = vec![DrmModeInfo::empty(); wanted_modes];
+        let sent_modes = connector_fill_modes(probe.count_modes);
+        let mut modes = vec![DrmModeInfo::empty(); wanted_modes.max(1)];
         let mut encoders = vec![0u32; wanted_encoders];
 
         let mut fill = DrmModeGetConnector::for_connector(connector_id);
-        fill.count_modes = probe.count_modes;
+        fill.count_modes = sent_modes;
         fill.count_encoders = probe.count_encoders;
         fill.modes_ptr = address_of(&mut modes);
         fill.encoders_ptr = address_of(&mut encoders);
@@ -1617,7 +1604,7 @@ pub fn drm_connector(card: &impl AsRawFd, connector_id: u32) -> Result<DrmConnec
         // when what it was given is at least what it has. A larger count back
         // means nothing was written, so the buffers are re-sized rather than
         // read.
-        if fill.count_modes > probe.count_modes || fill.count_encoders > probe.count_encoders {
+        if fill.count_modes > sent_modes || fill.count_encoders > probe.count_encoders {
             continue;
         }
         modes.truncate(drm_count(fill.count_modes, MAX_DRM_MODES, "modes")?);
@@ -1641,6 +1628,14 @@ pub fn drm_connector(card: &impl AsRawFd, connector_id: u32) -> Result<DrmConnec
     Err(format!(
         "DRM_IOCTL_MODE_GETCONNECTOR: connector {connector_id} changed shape on every one of {DRM_RESTART_ATTEMPTS} attempts"
     ))
+}
+
+/// The mode count the fill call sends. A connector with no cached modes
+/// counts 0, and sending that back would be the force-probe request, honoured
+/// for the master discovery runs as; 1, with room for one, reads the empty
+/// list instead.
+const fn connector_fill_modes(counted: u32) -> u32 {
+    if counted == 0 { 1 } else { counted }
 }
 
 /// Read one encoder.
@@ -2078,6 +2073,15 @@ pub fn discard_received(fds: &[RawFd]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A modeless connector's fill must not send `count_modes == 0`, the
+    /// kernel's force-probe request; a cached list is read at its own size.
+    #[test]
+    fn a_connector_fill_never_sends_the_force_probe_count() {
+        assert_eq!(connector_fill_modes(0), 1);
+        assert_eq!(connector_fill_modes(1), 1);
+        assert_eq!(connector_fill_modes(7), 7);
+    }
     use std::fs;
 
     /// An ordinary scanout size maps.
@@ -2429,7 +2433,6 @@ mod tests {
             completion,
             Some(DrmFlipCompletion {
                 user_data: 0xdead_beef,
-                sequence: 41,
                 crtc_id: 29,
             })
         );

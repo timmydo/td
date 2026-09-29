@@ -332,10 +332,7 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ladder::{
-        TD_COMPOSITOR_DRM_PROBE_MARKER, TD_COMPOSITOR_FLIP_PROBE_MARKER,
-        TD_COMPOSITOR_KMS_PROBE_MARKER,
-    };
+    use crate::ladder::{TD_COMPOSITOR_FLIP_MARKER, TD_COMPOSITOR_KMS_MARKER};
     use super::super::system_x86_64::{ROOTCHECK_ETC_NAME, SHADOW_ETC_NAME};
     use crate::ladder::{
         TD_APPLICATION_CONFIG_PATH, TD_APPLICATION_LAUNCHER_TABLE, TD_APPLICATION_REGISTRY,
@@ -712,124 +709,47 @@ mod tests {
         assert!(INIT_MAIN.contains(r#"("cttyhack", cttyhack::run)"#));
     }
 
-    /// The ladder's marker and the string the compositor actually prints are
+    /// The ladder's markers and the strings the compositor actually prints are
     /// two copies of one fact in two crates that cannot import each other, so
     /// the only thing that can hold them together is a test that reads both.
     ///
-    /// The boot check greps for this marker at the START of a line and then
+    /// The boot check greps for each marker at the START of a line and then
     /// believes the fields after it. A compositor that printed a different
     /// string would fail the boot with "the marker was absent", which reads as
     /// a broken card rather than as a renamed constant.
     #[test]
-    fn the_drm_probe_marker_is_the_one_the_compositor_prints() {
+    fn the_kms_boot_markers_are_the_ones_the_compositor_prints() {
         assert!(
             MAIN_RS.contains(&format!(
-                "\"{TD_COMPOSITOR_DRM_PROBE_MARKER} {{}} output={{}}x{{}} {{}}\""
+                "\"\\n{TD_COMPOSITOR_KMS_MARKER} {{lit}} output={{}}x{{}} stride={{}}\\n\""
             )),
-            "td-compositor no longer prints {TD_COMPOSITOR_DRM_PROBE_MARKER} in the shape the boot check greps for"
+            "td-compositor no longer prints {TD_COMPOSITOR_KMS_MARKER} in the shape the boot \
+             check reads"
         );
-        // And the subcommand that prints it is reachable by the name the image
-        // invokes.
-        assert!(MAIN_RS.contains("\"probe-drm\" => {"));
-        // The FIELDS inside the line are a second copy of the same fact, and a
-        // rename of one is the failure this test exists to make impossible.
-        //
-        // `DumbFrame::describe` emits them and `qemu_boot.rs` reads them with
-        // `strip_prefix`, in two crates that cannot import each other. Renaming
-        // `pitch=` in the compositor passes every host test in both crates and
-        // then fails EVERY agent's `qemu-boot-system` with "reported pitch 0
-        // and 0 bytes", which reads as a broken driver rather than as a renamed
-        // field. Found by review rather than by anything failing.
+        assert!(
+            MAIN_RS.contains(&format!(
+                "\"\\n{TD_COMPOSITOR_FLIP_MARKER} cookie={{:#x}} flip=ok\\n\""
+            )),
+            "td-compositor no longer prints {TD_COMPOSITOR_FLIP_MARKER} in the shape the boot \
+             check reads"
+        );
+        // The FIELDS inside `{lit}` are a second copy of the same fact:
+        // discovery's and the swap chain's describe them and `qemu_boot.rs`
+        // reads them with `strip_prefix`. A rename passes every host test in
+        // both crates and then fails every agent's `qemu-boot-system` with a
+        // report the check reads as a broken card.
         let drm = MODULES
             .iter()
             .find(|(name, _)| *name == "drm")
             .map(|(_, source)| *source)
             .expect("td-compositor no longer declares a drm module");
         assert!(
-            drm.contains(r#""buffer={}x{} pitch={} bytes={} mapping=ok""#),
-            "DumbFrame::describe no longer emits the fields the boot check reads"
+            drm.contains(r#""driver={} connector={}#{} status={} crtc={} "#),
+            "discovery no longer describes the fields the boot check reads"
         );
-    }
-
-    /// The KMS marker and its fields, held together the same way and for the
-    /// same reason the DRM ones are.
-    ///
-    /// This is the second copy of a lesson rather than a new one: a rename in
-    /// `Modeset::describe` passes every host test in both crates and then fails
-    /// every agent's `qemu-boot-system` with a report the check reads as a
-    /// broken card. The marker itself lives in `ladder.rs` so both sides share
-    /// one constant; the FIELDS cannot, so they are asserted here.
-    #[test]
-    fn the_kms_probe_marker_is_the_one_the_compositor_prints() {
         assert!(
-            MAIN_RS.contains(&format!(
-                "\"{TD_COMPOSITOR_KMS_PROBE_MARKER} {{}} output={{}}x{{}} {{}} {{}}\""
-            )),
-            "td-compositor no longer prints {TD_COMPOSITOR_KMS_PROBE_MARKER} in the shape the \
-             boot check greps for"
-        );
-        assert!(MAIN_RS.contains("\"probe-kms\" => {"));
-        let drm = MODULES
-            .iter()
-            .find(|(name, _)| *name == "drm")
-            .map(|(_, source)| *source)
-            .expect("td-compositor no longer declares a drm module");
-        assert!(
-            drm.contains(r#""fb={} modeset=ok""#),
-            "Modeset::describe no longer emits the fields the boot check reads"
-        );
-        // And it does NOT emit a second `crtc=`, which `Discovery::describe`
-        // already puts on the same line: two fields of one name in one
-        // whitespace-split report are read by whichever comes first.
-        assert!(
-            !drm.contains(r#""crtc={} fb={}"#),
-            "Modeset::describe emits a crtc= field that collides with discovery's"
-        );
-    }
-
-    /// The flip marker and its fields, held together the same way and for the
-    /// same reason the other two are.
-    ///
-    /// Third copy of one lesson: a rename in `Flip::describe` passes every
-    /// host test in both crates and then fails every agent's
-    /// `qemu-boot-system` with a report the check reads as a card that cannot
-    /// flip. The marker lives in `ladder.rs` so both sides share one constant;
-    /// the FIELDS cannot, so they are asserted here.
-    #[test]
-    fn the_flip_probe_marker_is_the_one_the_compositor_prints() {
-        assert!(
-            MAIN_RS.contains(&format!(
-                "\"{TD_COMPOSITOR_FLIP_PROBE_MARKER} {{}} output={{}}x{{}} {{}} {{}}\""
-            )),
-            "td-compositor no longer prints {TD_COMPOSITOR_FLIP_PROBE_MARKER} in the shape the \
-             boot check greps for"
-        );
-        assert!(MAIN_RS.contains("\"probe-flip\" => {"));
-        let drm = MODULES
-            .iter()
-            .find(|(name, _)| *name == "drm")
-            .map(|(_, source)| *source)
-            .expect("td-compositor no longer declares a drm module");
-        assert!(
-            drm.contains(r#""flipfb={} cookie={:#x} seq={} flip=ok""#),
-            "Flip::describe no longer emits the fields the boot check reads"
-        );
-        // The framebuffer field is `flipfb=` and NOT `fb=`, because
-        // `Modeset::describe` already puts `fb=` on this same line. A rename to
-        // `fb=` would make the boot check read the modeset's framebuffer and
-        // call the flip proven.
-        assert!(
-            !drm.contains(r#""fb={} cookie="#),
-            "Flip::describe emits an fb= field that collides with the modeset's"
-        );
-        // The cookie the probe queues is `FrameId::FIRST.next()`, and the boot
-        // check asserts the kernel handed back `0x2`. Sending `FIRST` would
-        // make a round-trip indistinguishable from a constant, and the check
-        // would still pass -- so which id is queued is pinned here, beside the
-        // field names it travels with.
-        assert!(
-            MAIN_RS.contains("output::FrameId::FIRST.next()"),
-            "probe-flip no longer queues the id the boot check expects back"
+            drm.contains(r#""{} fb={},{} modeset=ok""#),
+            "open_kms no longer describes the swap chain the way the boot check reads it"
         );
     }
 }

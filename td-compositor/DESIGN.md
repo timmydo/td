@@ -24,7 +24,8 @@ devices, assigns them to compositor UID/GID 993 with mode 0600, and verifies
 the result. The human cannot open those devices. The card is optional. A
 machine whose only display is a firmware framebuffer has none, and it boots
 with `card=none` on the ready line. A card that appears after assignment
-is not taken as assigned: the probe refuses it until the next assignment.
+is not taken as assigned: the compositor cannot open it until the next
+assignment.
 The render node is not the display, and seatd leaves it alone.
 It also assigns only playback PCM nodes to the dedicated audio account and
 creates `/run/td-audio`; `APPLICATIONS.md` §K.5 owns that boundary.
@@ -73,8 +74,10 @@ second unsafe exception for the client half of wl_shm.
 
 ## 2. Hardware profile
 
-The first supported output is QEMU's virtio-gpu framebuffer, exposed as
-`/dev/fb0` by the kernel's DRM fbdev emulation. Width, height, and stride come
+The image drives QEMU's virtio-gpu card, `/dev/dri/card0`, through the KMS
+backend of section 4, and falls back to the fbdev backend only on a machine
+with no card. The fbdev backend drives `/dev/fb0`, exposed by the kernel's
+DRM fbdev emulation. Width, height, and stride come
 from `/sys/class/graphics/fb0`; the compositor refuses any format other than
 32 bits per pixel and treats it as little-endian XRGB8888. Renderer tests pin
 that interpretation against a file-backed framebuffer.
@@ -900,8 +903,10 @@ backend's:
   the production trait.
 
 The KMS swap chain is the second implementation, selected by `run --card
-PATH` in place of `--framebuffer PATH`. `Runtime` drives either through the
-trait alone; the only difference it sees is that one answers `Queued`.
+PATH`. `--framebuffer PATH` beside it is a fallback taken only when the card
+path does not exist; a card that exists and fails to open or modeset is an
+error. `Runtime` drives either through the trait alone; the only difference
+it sees is that one answers `Queued`.
 
 The framebuffer is single-buffered from userspace's perspective. The renderer
 allocates its frame storage once and composes a full frame after scene changes.
@@ -914,10 +919,10 @@ duration of every write and trusted again only once that write has returned, so
 a failed or partial write resends the whole image rather than leaving the device
 holding bytes no shadow describes.
 
-The compositor is not the only writer of that device. It deliberately does not
-take the VT, and the boot profile keeps fbcon there on purpose so a recovery
-console stays reachable; owning the `/dev/fb0` node through td-seatd does not
-stop a writer inside the kernel. Every paint used to rewrite the whole image and
+The compositor is not the only writer of that device. Under the fbdev backend
+it deliberately does not take the VT, and the boot profile keeps fbcon there on
+purpose so a recovery console stays reachable; owning the `/dev/fb0` node
+through td-seatd does not stop a writer inside the kernel. Every paint used to rewrite the whole image and
 so healed foreign pixels for free, where a shadow copy that is never distrusted
 would keep them until a scene change happened to touch those exact rows. Two
 things bound that: one paint in every 240 is an unconditional full write, and
@@ -3948,14 +3953,9 @@ remaining rows add them by amendment.
 A page flip is the completion path this document recorded as missing, and it
 needed no invented correlation: `DRM_IOCTL_MODE_PAGE_FLIP` carries a `u64`
 `user_data` that the kernel copies into the completion event. `FrameId` is that
-value as a type, `Submission::Queued` and `OutputEvent::Presented` both carry
-one, and the probe proves the round-trip by queuing a cookie that is not the
-first id a backend would mint — a probe sending 1 and receiving 1 could not
-tell a round-trip from a constant.
-
-The probe waits for its own flip with a bounded non-blocking poll, which is
-right for one shot and wrong for a compositor. The backend instead delivers
-completions from a thread, and its shape is the rest of this subsection.
+value as a type, and `Submission::Queued` and `OutputEvent::Presented` both
+carry one. The backend delivers completions from a thread, and its shape is
+the rest of this subsection.
 
 **The KMS backend** is `SwapChain` in `drm.rs`, built by `open_kms` for
 `run --card`. It opens the card, re-takes the mastership `open_card` gave
@@ -3997,8 +3997,9 @@ is rendered at it and copied into either.
   vblank and the back buffer after it, and which of the two is not known
   until the completion arrives.
 - **The watchdog.** A second thread looks at the frame in flight once a
-  second. A flip unanswered after `FLIP_DEADLINE` (five seconds, the flip
-  probe's bound, for its reason) is recovered by modesetting onto its buffer
+  second. A flip unanswered after `FLIP_DEADLINE` (five seconds, since a
+  completion's timer needs the guest scheduled and a loaded TCG host can
+  leave it unscheduled that long) is recovered by modesetting onto its buffer
   and reading the CRTC back. It is then treated as completed, so a late
   completion costs one modeset rather than a frozen screen. That modeset is a
   blocking commit taken under the runtime lock. It may first wait out the
@@ -4018,9 +4019,8 @@ is rendered at it and copied into either.
   logging when that starts and stops failing. Up is not usable: the screen is
   frozen, and a paint failure reaches a committing client as it does under
   fbdev, as an implementation error that disconnects it.
-- **Teardown.** Teardown mirrors `Modeset`'s order, owned rather than borrowed.
-  `SwapChain` declares its `CardCrtc` before its buffers, so the CRTC is
-  restored first (a `SETCRTC`, while still master) and then mastership is
+- **Teardown.** `SwapChain` declares its `CardCrtc` before its buffers, so
+  the CRTC is restored first (a `SETCRTC`, while still master) and then mastership is
   given back. Each `ScanoutBuffer` then unmaps, unregisters its framebuffer,
   and frees its handle. Confinement tests pin both orders. It runs when a
   start fails once the CRTC state is saved; a running compositor's backend
@@ -4059,27 +4059,40 @@ longer holds it to the screen's rate the way a synchronous one did:
 - The epoch is read after the transaction's lock is released, so a paint
   queued in between can lengthen the wait by a frame, never shorten it.
 
-The image still runs fbdev: the boot's probes take the mastership the
-compositor would hold.
+The image runs `run --card /dev/dri/card0 --framebuffer /dev/fb0`: the KMS
+backend, with fbdev only for a machine that has no card. Its boot evidence is
+two stdout lines the compositor prints itself, each flushed and pinned
+byte-for-byte by a unit test. `TD-COMPOSITOR-KMS-READY` follows `open_kms`'s
+modeset once, carrying discovery's report, both framebuffer ids, and the
+output geometry and stride the runtime renders at. `TD-COMPOSITOR-FLIP-OK
+cookie=... flip=ok` follows, once per process, the first completion the
+runtime accepts: the frame in flight's, or a recovered frame's late one. A
+recovery by modeset alone prints nothing. Each is one write beginning with a
+newline, since the console is shared with unbuffered stderr and the boot check
+reads a marker only at a line's start. A marker that cannot be written is
+logged rather than fatal. The fbdev backend prints
+neither. No separate probe subcommand touches the card: it would contend
+with the running compositor for mastership.
 
-A modeset unwinds in one order, for a narrower reason than it first appears.
-`SETCRTC` is the only one of the three steps the kernel flags `DRM_MASTER`
+While the compositor holds the display, the VT and fbcon console is not
+visible. Once the backend's framebuffer is on the primary plane, fbcon's
+damage lands in a buffer nothing scans out (`drm_damage_helper.c:168`). That
+loss is accepted: the serial `ttyS0` greeter remains the recovery console, and
+when the compositor exits the kernel's `drm_lastclose` restores fbcon.
+
+The backend unwinds in one order, for a narrower reason than it first appears.
+`SETCRTC` is the only teardown step the kernel flags `DRM_MASTER`
 (`drm_ioctl.c:675`); `GETCRTC`, `ADDFB2` and `RMFB` need no master at all. The
-restore is a `SETCRTC`, so mastership is released last. Unregistering the
+restore is a `SETCRTC`, so mastership is released after it. Unregistering the
 framebuffer first would not fail — `drm_framebuffer_remove` disables the CRTCs
 using it, as the DRM ABI requires — it would blank the CRTC and leave the
 restore to turn it back on, which is a flicker rather than an error.
-`Modeset` declares `CrtcRestore`, `FbGuard` and `MasterGuard` in that order and
-has no `Drop` of its own, for the reason recorded below. `apply`'s LOCALS are
-declared in the mirror-image order, because that is where an early return gets
-its unwind; the two orders are pinned by separate assertions because they are
-separate orders.
 
 `GETCRTC` reports the mode, framebuffer and position but NOT the connector
 routing, so the routing is read the other way round — every connector names its
 encoder and every encoder names its CRTC — under the mastership just taken and
 before anything is changed. An earlier revision substituted the connector the
-probe was about to drive; on a card with two connected sinks that is not the
+backend was about to drive; on a card with two connected sinks that is not the
 same set, and restoring to it would leave the other sink dark. A saved state
 that `SETCRTC` would refuse — an enabled CRTC with no primary framebuffer, or a
 mode with no connectors — is turned into a deliberate disable rather than sent
@@ -4087,14 +4100,15 @@ and silently failed, and a restore that fails anyway says so on stderr.
 
 The kernel's own backstop is real but conditional: `drm_lastclose` puts the
 fbdev client back exactly, and `drm_release` reaches it only when the device's
-open count falls to zero (`drm_file.c:440`). Nothing else opens the card today.
-A backend that holds the node open removes that guarantee, and this restore
-becomes the only one.
+open count falls to zero (`drm_file.c:440`). The compositor holds the node
+open for its life, so on a failed start `CardCrtc`'s restore is the only one;
+at exit its descriptors are the last to close, and the backstop runs.
 
 A dumb buffer is unmapped BEFORE its handle is freed, and that ordering is a
-property of declaration order rather than of a comment. `DumbFrame` holds its
-`MappedRegion` ahead of a `DumbHandle` guard and deliberately has no `Drop` of
-its own: a type's own destructor runs before its fields are dropped, so writing
+property of declaration order rather than of a comment. `ScanoutBuffer` holds
+its `MappedRegion` ahead of its `Registration` guard, which unregisters the
+framebuffer and then frees the handle, and deliberately has no `Drop` of its
+own: a type's own destructor runs before its fields are dropped, so writing
 the release there would invert the order it exists to guarantee. The
 confinement test pins both the field order and the absence of that destructor,
 because either alone permits the bad order.
@@ -4107,10 +4121,10 @@ correctness constraint. `UNSAFE.md` §6 carries the citation.
 `DROP_MASTER` is on the roster because opening a primary node
 GRANTS mastership: `drm_master_open` makes the first opener master when
 `dev->master` is NULL, and fbcon never sets it. So `open_card` releases it
-immediately; while it is held the fbdev damage this compositor depends on
-would be refused with `-EBUSY`. The confinement test pins the release rather
-than the absence of `SET_MASTER`, which an earlier revision mistook for proof
-of the same thing. They are issued
+immediately, and `open_kms`'s explicit `SET_MASTER` is the one place it is
+taken. The confinement test pins the release rather than the absence of
+`SET_MASTER`, which an earlier revision mistook for proof of not being
+master. They are issued
 through a second entry point, `drm_ioctl`, which retries `EINTR`/`EAGAIN` a
 bounded number of times because the kernel's own `drm_ioctl` takes the
 mode-config lock interruptibly — that entry point shares the one allow-list, so
@@ -4121,21 +4135,17 @@ array `modes_ptr` points at, making its size the kernel's copy stride.
 
 devtmpfs creates `/dev/dri/card0` root-owned at mode 0600, and td runs no
 udev. `td-seatd` therefore assigns the card to the compositor account beside
-`/dev/fb0`. The boot's discovery probe, which modesets nothing, runs as that
-account through `td-login exec-service-as`, so the QEMU check's discovery
-marker proves the grant: without it, the open fails with `EACCES` and the
-marker is missing.
-The modeset and flip probes still run as root. A non-root opener may
-`SET_MASTER` only if its file was the card's master at open. Arranging that
-is the KMS backend's own work, and until it lands these probes are root-only
-evidence.
+`/dev/fb0`. The compositor opens it as that account, so its
+`TD-COMPOSITOR-KMS-READY` marker proves the grant: without it, the open fails
+with `EACCES`, which is an error rather than a fallback. The non-root
+compositor may `SET_MASTER` because its descriptor was the card's master at
+open (`drm_master_check_perm`'s `was_master`).
 
-Discovery does not gate boot success. The probe prints its report and a
-failure prints a diagnostic, but neither moves `healthy`: every other leg of
-that verdict is hardware-independent, and making a deployment mark itself bad
-because no connector reported a mode would put a machine with no monitor into
-a rollback loop. The proof that discovery works lives in the QEMU check, which
-requires the marker, the `virtio_gpu` driver and a non-zero scanout size.
+Discovery gates graphical readiness. A card that exists but offers no
+connector with a mode fails `open_kms`, and with it the compositor's start,
+like any other card error; only a missing card falls back to fbdev. The QEMU
+check requires both markers, the `virtio_gpu` driver and a non-zero scanout
+size.
 
 No framebuffer, socket, allocation, process, or filesystem operation passes
 through that surface, and no input REPORT: every evdev record td acts on is
@@ -4187,7 +4197,7 @@ Confinement tests pin each wrapper family to its callers across every module:
 descriptor transport to `client.rs`, `conn.rs`, and `server.rs`; terminal
 control to `pty.rs`; absolute-axis recovery and evdev clock selection to
 `input.rs`; peer authentication to `server.rs` and `session.rs`; DRM to
-`drm.rs`; descriptor status changes to `conn.rs` and `drm.rs`; and the
+`drm.rs`; descriptor status changes to `conn.rs`; and the
 monotonic attention cutoff to `runtime.rs`. The complete family/module
 matrix also rejects a wrong-family call from an otherwise admitted module,
 and aliases cannot bypass it. The extracted connection is crate-visible,
@@ -4215,8 +4225,8 @@ and the borrowed mapped slice. The region is also `Send`, and not `Sync`.
 It is the sole owner of a process-wide mapping, and its bytes are reached
 only through `&mut self`, so moving the owner moves the only way in.
 Confinement tests pin these bodies, the `Send`, the mapping construction and
-length, and its unmap-before-handle-release order for the probe's
-`DumbFrame` and the backend's `ScanoutBuffer` alike.
+length, and the backend `ScanoutBuffer`'s unmap-before-handle-release
+order.
 `UNSAFE.md` §6 records the complete mapping contract.
 
 ## 5. Boot and recovery
@@ -4242,8 +4252,10 @@ when the graphical daemon fails. The automated deployment-success transaction
 strictly requires td-svc to declare the graphical service ready, however, so a
 broken UI cannot mark an update healthy or let QEMU power off before testing
 the new boot seam. The
-graphical service prints `TD-WAYLAND-READY` only after the framebuffer has
-been painted and both Wayland sockets are listening. A separate evidence unit
+graphical service prints `TD-WAYLAND-READY` only after its first frame has
+been submitted and both Wayland sockets are listening. Under fbdev that frame
+is written; under KMS it is queued as a flip and may not have landed yet, which
+`TD-COMPOSITOR-FLIP-OK` records separately. A separate evidence unit
 then validates the private socket's exact registry and completes the first
 privileged manager's dialog association and dismissal lifecycle. The QEMU
 system oracle requires both markers and the first client's later
@@ -6743,23 +6755,22 @@ active paired attention outside cancellation drain and no compound commit.
 The first request consumes the presentation slot. Only its exact next
 enrollment step may replace it; owner, nonce, platform and recovery remain
 fixed. Unlock has no successor. It installs the prepared frame,
-owes the entire output and repaints synchronously. Only an immediate
-`Submission::Presented` with no pending paint returns a `PresentedRequest`
-containing the exact description. A failed or queued paint returns no
-receipt, discards the prepared prompt and retains capture. A later flush
+owes the entire output and repaints, naming the paint epoch that shows it.
+A `PresentedRequest` containing the exact description is returned only once
+that epoch is on glass (the receipt rules below). A failed paint, or one
+that does not land in time, returns no receipt, discards the prepared prompt
+and retains capture. A later flush
 paints the attention menu. Repeated, skipped or changed requests refuse and
 consume the retained predecessor. A failed successor preparation or paint
 also leaves no predecessor to retry. Only a successfully completed close
 followed by reopening creates a fresh initial presentation opportunity.
 Failed-close recovery preserves the consumed slot. Draining or closing discards the retained prompt.
 
-The current fbdev backend presents immediately. A future queued backend can
-scan out an already submitted invitation after receipt refusal and before
-the inert repaint; discarding the request does not revoke queued pixels.
-Before activating this API there, the backend must provide completion and
-cancellation or superseding-frame guarantees. It must also release any
-frame state when rendering refuses before submission; dropping the current
-fbdev shadow-buffer borrow already does so.
+Under the KMS backend a withdrawn prompt's frame may still be queued: it can
+reach the screen after its receipt was refused and before the withdrawing
+repaint lands, since discarding the request does not revoke queued pixels.
+No receipt is made for it, and the next frame replaces it. Rendering that
+refuses before submission releases its frame state under either backend.
 
 This receipt records a completed paint, not live authorization. The private
 session client retains it only for the exact outstanding description and

@@ -543,12 +543,11 @@ its vblank wait returns and commits the damage regardless
 OTHER process becoming master (`drm_auth.c:260`) plus the `setcmap` and
 `pan_display` fbdev ioctls (`:863`, `:1247`).
 An earlier revision of this section reasoned from the absence of
-`SET_MASTER` and concluded the probe took no mastership; that was exactly
-backwards, and two reviewers caught it. Dropping the mastership on the one
-path that opens a card is what makes the claim a property of the code, and
-the confinement test now pins the DROP rather than the absence of the SET.
-`SET_MASTER` remains off the roster, and that asymmetry is the point: giving
-authority back is this increment's, taking it is the backend's.
+`SET_MASTER` and concluded discovery took no mastership; that was exactly
+backwards, and two reviewers caught it. `open_card`, the one path that opens
+a card, drops the mastership the open granted, and the confinement test pins
+the DROP rather than the absence of the SET. The one place mastership is
+TAKEN is then the backend's explicit `SET_MASTER`.
 
 Three more joined for the MAPPING landing that followed. `MODE_CREATE_DUMB`
 (0xc02064b2), `MODE_MAP_DUMB` (0xc01064b3) and `MODE_DESTROY_DUMB`
@@ -560,23 +559,30 @@ in advance.
 Five more joined for the MODESET landing that followed, and this is the group
 that CHANGES WHAT IS ON SCREEN. `SET_MASTER` (0x641e) is the authority for the
 rest: opening a primary node already grants mastership when `dev->master` is
-NULL and `open_card` gives it straight back, so this re-takes it deliberately
-for a bounded window — which is why `DROP_MASTER` was rostered two increments
-before its opposite, and why the asymmetry was worth keeping that long.
+NULL and `open_card` gives it straight back, so `open_kms` re-takes it
+deliberately and holds it for the KMS backend's life; the backend's teardown
+gives it back with `DROP_MASTER` after restoring the CRTC.
 `MODE_GETCRTC`/`MODE_SETCRTC` (0xc06864a1/0xc06864a2) read and write one CRTC's
 mode, framebuffer and connector set, both carrying the 104-byte
 `drm_mode_crtc`; `MODE_ADDFB2` (0xc06864b8) registers a buffer as a scanout
 framebuffer and `MODE_RMFB` (0xc00464af) unregisters one, and `RMFB`'s size
 field is 4 rather than a struct's because it takes a bare `unsigned int`.
 
-The modeset probe is a separate subcommand rather than more output from the
-discovery one, and the reason is the SETCRTC rather than the mastership. Once
-this probe's framebuffer is on the primary plane, the fbdev console's damage
-stops reaching the screen: `drm_atomic_helper_dirtyfb` skips every plane whose
-current framebuffer is not the one being damaged (`drm_damage_helper.c:168`),
-so the console commits its updates to a buffer nothing scans out. Discovery is
-safe to run beside a running compositor; this is not, and two claims that
-different must not share one name.
+Once the backend's framebuffer is on the primary plane, the fbdev console's
+damage stops reaching the screen: `drm_atomic_helper_dirtyfb` skips every
+plane whose current framebuffer is not the one being damaged
+(`drm_damage_helper.c:168`), so the console commits its updates to a buffer
+nothing scans out. That is the accepted cost of driving the card; the serial
+console is the recovery path, and `drm_lastclose` restores fbcon when the
+compositor's descriptors close.
+
+The earlier one-shot `probe-drm`, `probe-kms` and `probe-flip` subcommands,
+and the borrowed `Modeset`/`Flip` guard family and bounded non-blocking flip
+wait only they used, are gone: they would contend with the running
+compositor for mastership. Their removal deleted no syscall, request or
+scoped allowance, since the backend issues every request they did. Boot
+evidence is now the compositor's own `TD-COMPOSITOR-KMS-READY` and
+`TD-COMPOSITOR-FLIP-OK` lines.
 
 `MODE_PAGE_FLIP` (0xc018_64b0) joined for the landing after that, and it is
 the twentieth request in the roster. It carries the 24-byte
@@ -596,10 +602,11 @@ blocker for consuming completions; the identity was in the ABI the whole time,
 and `FrameId` is the newtype that keeps it from being a bare integer.
 
 Reading those completions adds NO syscall surface. They arrive on the card
-descriptor as ordinary readable bytes, so `File`'s own `read` serves, and the
-bounded wait uses the `fcntl` `O_NONBLOCK` pair already rostered for the
-clipboard. The parser is byte-at-a-time through `get` rather than a cast over
-the buffer: the bytes come from a `Vec<u8>` with no alignment guarantee, an
+descriptor as ordinary readable bytes, so `File`'s own `read` serves: the
+backend blocks in it on a `dup` of the card from a thread of its own, and no
+`fcntl` touches the card. The parser is byte-at-a-time through `get` rather
+than a cast over the buffer: the bytes come from a `Vec<u8>` with no alignment
+guarantee, an
 event shorter than its header must be refused rather than advanced past, and
 an event type this build has never heard of is stepped over by the length it
 declared rather than by any assumption here.
@@ -849,10 +856,10 @@ recorded because they are the kind of detail a plan written in advance
 misses. First, `mmap(2)` takes six arguments and every existing body took
 five, so `syscall6` is a second `core::arch::asm!` body rather than a widened
 first — the alternative was appending a zero at seven call sites that this
-crate's tests pin by exact text. Second, `DumbFrame` releases in a
-deliberate ORDER — the region unmaps, then the GEM handle is freed — expressed
-as field declaration order with no `Drop` of its own, because a type's own
-destructor runs BEFORE its fields are dropped and writing the release there
+crate's tests pin by exact text. Second, `ScanoutBuffer` releases in a
+deliberate ORDER — the region unmaps, then the framebuffer is unregistered and
+the GEM handle freed — expressed as field declaration order with no `Drop` of
+its own, because a type's own destructor runs BEFORE its fields are dropped and writing the release there
 would have inverted exactly the order it was meant to guarantee. A confinement
 test pins both halves.
 

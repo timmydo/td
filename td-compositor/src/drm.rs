@@ -1,22 +1,21 @@
-//! DRM/KMS discovery: which card, which connector, which mode, which CRTC.
+//! The DRM/KMS output backend: discovery, and the swap chain `run --card`
+//! drives.
 //!
-//! §M's first row is a DRM/KMS output backend. This module is its DISCOVERY
-//! half — everything a card will answer when it is only read: no modeset, no
-//! buffer, no mapping, and no DRM mastership. Keeping that half apart is what
-//! makes the selection testable against recorded connector shapes instead of
-//! against a card, and it leaves taking mastership away from `fbcon` as a
-//! decision the backend landing has to make out loud rather than inherit.
+//! Discovery decides which connector to believe, which of its modes to want,
+//! and which CRTC can drive it. It is kept apart from the chain so the
+//! selection is testable against recorded connector shapes instead of against
+//! a card. `open_kms` then takes DRM mastership for the compositor's life,
+//! modesets, and hands back a `SwapChain` of two dumb buffers and the reader
+//! for its page-flip completions.
 //!
 //! The kernel ABI lives in `sys.rs` with the rest of it. What is here is
-//! policy: which connector to believe, which of its modes to want, and which
-//! CRTC can drive it.
+//! policy.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use crate::output::{
     Damage, Fourcc, FrameId, FrameTarget, FrameView, Output, OutputBackend, OutputDimensions,
@@ -157,150 +156,10 @@ impl Discovery {
     }
 }
 
-/// The GEM handle alone, so releasing it is a FIELD DROP rather than a
-/// statement someone can reorder or an early return can skip.
-struct DumbHandle<'card> {
-    card: &'card File,
-    handle: u32,
-}
-
-impl Drop for DumbHandle<'_> {
-    fn drop(&mut self) {
-        let _ = sys::drm_destroy_dumb(self.card, self.handle);
-    }
-}
-
-/// One dumb buffer and its mapping, released together and in that order.
-///
-/// Field order is load-bearing, and there is deliberately NO `impl Drop` on
-/// this type. Rust drops fields in declaration order, so `region` unmaps before
-/// `handle` releases the GEM handle. An explicit `Drop` here would run before
-/// either field and invert that.
-///
-/// The kernel tolerates either order — a GEM mapping takes its own reference,
-/// so closing the handle first leaves the mapping valid — so this is hygiene
-/// rather than a requirement, and an earlier comment here called it "the one
-/// ordering worth avoiding", which overstated it. It is still expressed in the
-/// type rather than in a destructor, because releasing in the reverse of
-/// acquisition is the default worth having and this is the version of it the
-/// compiler enforces for free.
-pub struct DumbFrame<'card> {
-    region: sys::MappedRegion,
-    /// Held by value rather than released in a destructor here, so the release
-    /// ORDER is the compiler's business rather than a comment's. It is read
-    /// now, by `handle()`, which the modeset needs to name the buffer to
-    /// `ADDFB2`; before that it existed only for its `Drop`.
-    handle: DumbHandle<'card>,
-    width: u32,
-    height: u32,
-    pitch: u32,
-}
-
-impl<'card> DumbFrame<'card> {
-    /// Allocate a buffer for one scanout and map it.
-    ///
-    /// The handle guard is built BEFORE the mapping is attempted, so a failure
-    /// to map releases the buffer on the way out rather than leaking it: the
-    /// `?` below drops the guard. That is the reason for the two-step rather
-    /// than a tidier single constructor.
-    pub fn allocate(
-        card: &'card File,
-        width: u32,
-        height: u32,
-    ) -> Result<DumbFrame<'card>, String> {
-        let buffer = sys::drm_create_dumb(card, width, height)?;
-        let handle = DumbHandle {
-            card,
-            handle: buffer.handle,
-        };
-        buffer_covers_scanout(buffer.pitch, width, height, buffer.size)?;
-        let region = sys::drm_map_dumb(card, &buffer)?;
-        Ok(DumbFrame {
-            region,
-            handle,
-            width,
-            height,
-            pitch: buffer.pitch,
-        })
-    }
-
-    /// The kernel's stride for this buffer, in bytes.
-    ///
-    /// The kernel's, never `width * 4`: a driver may align a scanline well past
-    /// the pixel width, and `ADDFB2` has to be told the real one or the
-    /// framebuffer it registers describes rows that are not where the pixels
-    /// are.
-    pub fn pitch(&self) -> u32 {
-        self.pitch
-    }
-
-    /// The GEM handle, for naming this buffer to `ADDFB2`.
-    pub fn handle(&self) -> u32 {
-        self.handle.handle
-    }
-
-    /// The size this buffer was ALLOCATED at.
-    ///
-    /// Read by the modeset so it can refuse to register a framebuffer whose
-    /// declared size is not the size of the memory behind it. `ADDFB2` is told
-    /// a width, a height, a pitch and a handle as four bare numbers, and the
-    /// kernel's own object-size check is the only thing that would catch a
-    /// mismatch -- which makes it an error reported from the wrong place, in
-    /// terms of a GEM object rather than of the two sizes that disagreed.
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-
-    /// The height this buffer was allocated at. See `width`.
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-
-    /// The mapping's length.
-    pub fn len(&self) -> usize {
-        self.region.len()
-    }
-
-    /// The pixels, borrowed for no longer than this frame.
-    pub fn pixels_mut(&mut self) -> &mut [u8] {
-        self.region.bytes_mut()
-    }
-
-    /// Write a known pattern through the mapping and read it back.
-    ///
-    /// The point is not the pattern. `mmap` answering an address is not
-    /// evidence that the address IS the buffer, and a length that disagreed
-    /// with its mapping would still map and still write — it would simply write
-    /// somewhere else, or past the end. Reading back what was written is the
-    /// cheapest thing that separates a live mapping from a plausible pointer.
-    ///
-    /// Split into three so the halves are testable without a card: the offsets
-    /// are chosen by arithmetic, the write and the verify are separate passes
-    /// over a plain slice, and a test can corrupt a byte between them. A single
-    /// function writing and reading the same slice could not have failed.
-    pub fn prove_mapping(&mut self) -> Result<(), String> {
-        let offsets = pattern_offsets(self.len())?;
-        let pixels = self.pixels_mut();
-        write_pattern(pixels, &offsets);
-        verify_pattern(pixels, &offsets)
-    }
-
-    /// One line, for a proof to match and a person to read.
-    pub fn describe(&self) -> String {
-        format!(
-            "buffer={}x{} pitch={} bytes={} mapping=ok",
-            self.width,
-            self.height,
-            self.pitch,
-            self.len()
-        )
-    }
-}
-
 /// Is this CRTC actually showing what was asked for?
 ///
-/// Split out of `verify` so the three refusals are testable against recorded
-/// CRTC states rather than against a card. Each is a different failure with a
+/// Split out of `CardCrtc::set` so the three refusals are testable against
+/// recorded CRTC states rather than against a card. Each is a different failure with a
 /// different cause, which is why they are three checks and not one equality:
 /// a dark CRTC means the modeset did not take, a different framebuffer means
 /// the driver kept the old picture and answered success anyway, and a
@@ -330,11 +189,6 @@ fn crtc_shows(
     }
     Ok(())
 }
-
-/// The first byte of the read-back pattern. Not zero and not `0xff`: a mapping
-/// that reads back as freshly-zeroed or as unwritten memory would satisfy
-/// either of those without anything having been written.
-const PATTERN_BASE: u8 = 0xa5;
 
 /// Does a driver's reported size actually cover the scanout it is for?
 ///
@@ -367,448 +221,31 @@ fn buffer_covers_scanout(pitch: u32, width: u32, height: u32, size: u64) -> Resu
     Ok(())
 }
 
-/// The three offsets the read-back pattern uses: first, middle and LAST.
-///
-/// The last is the one that earns its place. An off-by-one in a mapping's
-/// length shows up at the final byte and nowhere else, which is the failure
-/// `UNSAFE.md` §6 asks the length to be held in the region type to prevent. A
-/// zero-length mapping is refused rather than handed an empty set, because
-/// "every one of no probes passed" is not evidence of anything.
-fn pattern_offsets(length: usize) -> Result<[usize; 3], String> {
-    let last = length
-        .checked_sub(1)
-        .ok_or_else(|| "dumb mapping: a zero-length mapping proves nothing".to_string())?;
-    Ok([0, length / 2, last])
-}
-
-/// Stamp the pattern. Offsets past the end are skipped rather than refused:
-/// `pattern_offsets` derives them from the same length, so an out-of-range one
-/// is unreachable, and `verify_pattern` is what reports a byte that did not
-/// take rather than this silently deciding a short buffer is fine.
-fn write_pattern(pixels: &mut [u8], offsets: &[usize]) {
-    for (step, offset) in offsets.iter().enumerate() {
-        if let Some(slot) = pixels.get_mut(*offset) {
-            *slot = PATTERN_BASE.wrapping_add(step as u8);
-        }
-    }
-}
-
-/// Read the pattern back, naming the first byte that disagrees.
-fn verify_pattern(pixels: &[u8], offsets: &[usize]) -> Result<(), String> {
-    let length = pixels.len();
-    for (step, offset) in offsets.iter().enumerate() {
-        let expected = PATTERN_BASE.wrapping_add(step as u8);
-        let seen = pixels
-            .get(*offset)
-            .ok_or_else(|| format!("dumb mapping: offset {offset} is past {length} bytes"))?;
-        if *seen != expected {
-            return Err(format!(
-                "dumb mapping: byte {offset} of {length} read back {seen:#04x}, not \
-                 {expected:#04x} — the mapping is not the buffer"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// DRM mastership, taken for a bounded window and given back on drop.
-struct MasterGuard<'card> {
-    card: &'card File,
-}
-
-impl Drop for MasterGuard<'_> {
-    fn drop(&mut self) {
-        let _ = sys::drm_drop_master(self.card);
-    }
-}
-
-/// One registered scanout framebuffer, unregistered on drop.
-struct FbGuard<'card> {
-    card: &'card File,
-    fb_id: u32,
-}
-
-impl Drop for FbGuard<'_> {
-    fn drop(&mut self) {
-        let _ = sys::drm_rm_fb(self.card, self.fb_id);
-    }
-}
-
-/// The CRTC state as it was before this process touched it.
-///
-/// `GETCRTC` reports the mode, framebuffer and position but NOT the connector
-/// routing — the kernel fills neither `set_connectors_ptr` nor
-/// `count_connectors` on the way out (`drm_mode_getcrtc`, `drm_crtc.c:543`) —
-/// so the routing is read the long way instead, by `connectors_on_crtc`.
-///
-/// An earlier revision substituted the connector this code was about to drive
-/// and called it "the same connector fbcon was using". It is not the same
-/// thing. The connector is chosen by `select_scanout` on PREFERENCE and its
-/// CRTC by `crtc_for`, which falls back to the first CRTC the connector's
-/// encoder can reach — so on a card with two connected sinks, this can pick a
-/// CRTC that some OTHER connector is currently lit by, and restoring to the
-/// selected connector would then leave that sink dark. Reading the routing
-/// costs three ioctls this module already issues and removes the guess.
-///
-/// This is still best-effort, and the backstop is weaker than it looks:
-/// `drm_lastclose`'s `drm_client_dev_restore` puts the fbdev client back
-/// exactly, but `drm_release` calls it only when the device's open count
-/// reaches zero (`drm_file.c:440`). Nothing else opens the card today, so it
-/// does run; the moment §M row 1's backend holds the node open it stops
-/// running, and this restore becomes the only one there is.
-struct CrtcRestore<'card> {
-    card: &'card File,
-    saved: sys::DrmModeCrtc,
-    connectors: Vec<u32>,
-}
-
-impl<'card> CrtcRestore<'card> {
-    /// Capture a CRTC state as a request `SETCRTC` will actually accept.
-    ///
-    /// The saved state and a well-formed request are not the same thing, and
-    /// the gap is reachable. `drm_mode_getcrtc` fills `mode_valid` from
-    /// `crtc->state->enable` and `fb_id` from the primary plane INDEPENDENTLY
-    /// (`drm_crtc.c:577`, `:562`), so an enabled CRTC with no primary
-    /// framebuffer reads back as `mode_valid = 1, fb_id = 0`. Replaying that
-    /// asks the kernel to look up framebuffer 0, which answers `-ENOENT`
-    /// (`:773`). Two more shapes are refused outright: a mode with no
-    /// connectors (`:824`) and connectors with no mode or no framebuffer
-    /// (`:830`).
-    ///
-    /// So anything that would be refused is turned into the one request that
-    /// is always well-formed — switch the CRTC off — rather than sent and
-    /// silently failed. That is a worse restore than the real one and a better
-    /// one than none, and `drm_lastclose` is what makes it recoverable.
-    fn capture(card: &'card File, saved: sys::DrmModeCrtc, connectors: Vec<u32>) -> Self {
-        let (saved, connectors) = restorable(saved, connectors);
-        CrtcRestore {
-            card,
-            saved,
-            connectors,
-        }
-    }
-}
-
-impl Drop for CrtcRestore<'_> {
-    fn drop(&mut self) {
-        // Reported rather than swallowed. A restore that failed leaves a
-        // screen this process is responsible for in a state it did not
-        // intend, and the old `let _ =` made that indistinguishable from
-        // success. stderr and never stdout: the probe marker is on stdout and
-        // the boot check reads that stream whole-line.
-        if let Err(error) = sys::drm_set_crtc(self.card, &self.saved, &mut self.connectors) {
-            let _ = writeln!(
-                std::io::stderr(),
-                "td-compositor: restoring CRTC {} failed: {error}",
-                self.saved.crtc_id
-            );
-        }
-    }
-}
-
-/// How long to wait for a flip the kernel accepted.
-///
-/// A queued flip completes at the next vblank, so this is orders of magnitude
-/// longer than it needs to be — a 60Hz output is 17ms and even a slow virtual
-/// one is far inside this. It is a bound on a HANG, not a schedule: without
-/// it a driver that accepted the flip and never delivered would park the probe
-/// on a blocking read, and a boot that never finishes reports as a timeout
-/// blaming whatever ran last rather than as the flip that did not arrive.
-///
-/// Five seconds rather than the two an earlier revision used, for one reason:
-/// this runs inside every agent's `qemu-boot-system`, under TCG, on a host
-/// that may be running several other agents' VMs at once. virtio-gpu delivers
-/// the completion from an hrtimer that needs the guest scheduled, so the
-/// number that matters is not the frame interval but how long the guest might
-/// go unscheduled. The extra three seconds cost nothing — they are only ever
-/// spent on a flip that is already failing — and an intermittent red on a row
-/// every agent runs is expensive to diagnose.
-const FLIP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long to sleep between reads while waiting.
-///
-/// The descriptor is made non-blocking for the wait, so this is a poll
-/// interval rather than a latency floor. Small enough that the wait costs one
-/// interval on average, large enough not to spin a core for the whole vblank.
-const FLIP_POLL_INTERVAL: Duration = Duration::from_millis(1);
-
-/// One page flip: a second framebuffer, queued onto a live modeset and waited
-/// for.
-///
-/// A flip is not a modeset and does not unwind like one. It changes which
-/// framebuffer a CRTC scans out and changes nothing else, so what it owns is
-/// the framebuffer registration — the CRTC's own restoration stays the
-/// `Modeset`'s, which is why this borrows one rather than replacing it.
-pub struct Flip<'card, 'frame> {
-    /// Unregistered on drop, like the modeset's. This runs BEFORE the
-    /// modeset's restore, since a `Flip` is created after one and dropped
-    /// first, so the kernel blanks the CRTC on the way out and the restore
-    /// then turns it back on — the flicker `Modeset` records, not an error.
-    #[allow(dead_code)]
-    fb: FbGuard<'card>,
-    /// For `Modeset`'s reason: the compiler refuses a flip that outlives the
-    /// buffer the kernel is scanning out.
-    #[allow(dead_code)]
-    frame: &'frame DumbFrame<'card>,
-    /// And the modeset it was queued onto, for the same reason one step out.
-    /// A flip that outlived its modeset would unregister its framebuffer after
-    /// mastership had been given back, and `verify` would read a CRTC that had
-    /// already been restored. Nothing reads this field; holding the borrow is
-    /// the whole point, exactly as with `frame` above.
-    #[allow(dead_code)]
-    modeset: &'frame Modeset<'card, 'frame>,
-    fb_id: u32,
-    crtc_id: u32,
-    completion: sys::DrmFlipCompletion,
-}
-
-impl<'card, 'frame> Flip<'card, 'frame> {
-    /// Register `frame`, queue it on the modeset's CRTC, and wait for the
-    /// kernel to say it is on glass.
-    ///
-    /// `cookie` is carried through the kernel and compared on the way back.
-    /// That comparison is the point of the whole increment: a completion that
-    /// cannot be matched to the frame that caused it is not a completion path,
-    /// and a caller with two frames in flight would otherwise be guessing.
-    pub fn queue_and_wait(
-        card: &'card File,
-        modeset: &'frame Modeset<'card, 'frame>,
-        scanout: &Scanout,
-        frame: &'frame DumbFrame<'card>,
-        cookie: u64,
-    ) -> Result<Flip<'card, 'frame>, String> {
-        let width = u32::from(scanout.mode.hdisplay);
-        let height = u32::from(scanout.mode.vdisplay);
-        // The flip's framebuffer has to cover the plane's source rectangle,
-        // which the kernel checks and refuses. Checked here for `apply`'s
-        // reason: the two sizes that disagree are visible right here.
-        frame_fits_mode(frame.width(), frame.height(), width, height)?;
-        let fb_id = sys::drm_add_fb(card, width, height, frame.pitch(), frame.handle())?;
-        let fb = FbGuard { card, fb_id };
-        sys::drm_page_flip(card, modeset.crtc_id(), fb_id, cookie)?;
-        // Queued. From here the framebuffer must stay registered until the
-        // completion arrives, which is what `fb` living to the end of this
-        // function and then into the returned value achieves.
-        let completion = await_flip(card, cookie)?;
-        // The completion names its CRTC (`drm_plane.c:1526` fills it from
-        // `crtc->base.id`), and matching on the cookie alone would accept a
-        // completion for the right frame on the wrong CRTC. Cheap, and the
-        // field is already parsed.
-        if completion.crtc_id != modeset.crtc_id() {
-            return Err(format!(
-                "the flip completion for {cookie:#x} named CRTC {} rather than the {} it was \
-                 queued on",
-                completion.crtc_id,
-                modeset.crtc_id()
-            ));
-        }
-        Ok(Flip {
-            fb,
-            frame,
-            modeset,
-            fb_id,
-            crtc_id: modeset.crtc_id(),
-            completion,
-        })
-    }
-
-    /// Ask the CRTC which framebuffer it has been COMMITTED to.
-    ///
-    /// Weaker than an earlier revision of this comment claimed, and the
-    /// difference matters. That revision said a driver which reported
-    /// completion but kept the previous framebuffer would fail here. It would
-    /// not: `drm_mode_getcrtc` reports `plane->state->fb` (`drm_crtc.c:561`),
-    /// and for an atomic driver `drm_atomic_helper_commit` swaps the software
-    /// state at `drm_atomic_helper.c:2284` — BEFORE it queues the work that
-    /// performs the flip at `:2309`, with the kernel's own comment saying "we
-    /// can commit the new state on the software side now". So this field
-    /// reads as the new framebuffer the moment `PAGE_FLIP` returns, whatever
-    /// the hardware is scanning out.
-    ///
-    /// What it does prove is worth keeping anyway: the CRTC is the one that
-    /// was asked, it is still enabled, it is at the size that was asked for,
-    /// and the framebuffer it is committed to is this flip's rather than the
-    /// modeset's. The claim that the frame REACHED the screen rests on the
-    /// completion event, which the kernel sends from the vblank handler, and
-    /// not on this.
-    pub fn verify(&self, card: &File, wanted: &sys::DrmModeInfo) -> Result<(), String> {
-        let live = sys::drm_get_crtc(card, self.crtc_id)?;
-        crtc_shows(&live, self.crtc_id, self.fb_id, wanted)
-    }
-
-    /// The frame this completion belongs to.
-    ///
-    /// The one place a `u64` from the kernel becomes a `FrameId`, which is
-    /// what `FrameId`'s own doc claims and what an earlier revision left
-    /// unenforced: `from_cookie` had no production caller at all, so the
-    /// stated single-conversion-point discipline was a comment rather than a
-    /// property.
-    pub fn frame(&self) -> crate::output::FrameId {
-        crate::output::FrameId::from_cookie(self.completion.user_data)
-    }
-
-    /// One line, for a proof to match and a person to read.
-    ///
-    /// The framebuffer field is `flipfb=` rather than `fb=`, because
-    /// `Modeset::describe` already emits `fb=` on the same line and two fields
-    /// of one name in one whitespace-split report are read by whichever comes
-    /// first. The same collision `Modeset::describe` avoids by not emitting
-    /// `crtc=`, one increment later and one field along.
-    pub fn describe(&self) -> String {
-        format!(
-            "flipfb={} cookie={:#x} seq={} flip=ok",
-            self.fb_id,
-            self.frame().cookie(),
-            self.completion.sequence
-        )
-    }
-}
-
-/// Wait for the flip tagged `cookie`, or say why it did not arrive.
-///
-/// The descriptor is made non-blocking for the duration and its prior status
-/// word restored afterwards, including on the error paths — the card outlives
-/// this call and a retained `O_NONBLOCK` would change how every later read
-/// behaves.
-///
-/// Events that are not this flip's completion are SKIPPED rather than
-/// refused. A vblank event, or a completion carrying some other cookie,
-/// means the kernel had something else to say first; it is not evidence that
-/// this flip failed, and treating it as such would make the probe fail on a
-/// card that merely reported more than one thing.
-fn await_flip(card: &File, cookie: u64) -> Result<sys::DrmFlipCompletion, String> {
-    let saved_flags = sys::make_nonblocking(card)?;
-    let outcome = read_until_flip(card, cookie);
-    // Restored before the result is examined, so an error path cannot leave
-    // the descriptor non-blocking.
-    let restored = sys::restore_status_flags(card, saved_flags);
-    // Both are reported when both fail. An earlier revision wrote
-    // `outcome?; restored?;`, which DISCARDED the restore failure whenever the
-    // flip had also failed -- and a card left non-blocking is the more
-    // consequential of the two, because it changes how every later read on
-    // this descriptor behaves.
-    match (outcome, restored) {
-        (Ok(completion), Ok(())) => Ok(completion),
-        (Err(flip), Ok(())) => Err(flip),
-        (Ok(_), Err(restore)) => Err(restore),
-        (Err(flip), Err(restore)) => Err(format!(
-            "{flip}; and the card's status flags could not be restored afterwards: {restore}"
-        )),
-    }
-}
-
-fn read_until_flip(card: &File, cookie: u64) -> Result<sys::DrmFlipCompletion, String> {
-    // `checked_add` rather than `+`, which panics on overflow. Unreachable on
-    // `CLOCK_MONOTONIC`, but every other deadline in this crate is written this
-    // way and a new production `panic!` is what the rule forbids.
-    let deadline = Instant::now().checked_add(FLIP_TIMEOUT);
-    let mut pending: Vec<u8> = Vec::with_capacity(sys::DRM_EVENT_VBLANK_LEN * 4);
-    // 4 KiB because the kernel says so: `drm_read` will not split an event
-    // across reads, and if the next one does not fit in the buffer it is put
-    // BACK on the queue and the read answers zero (`drm_file.c:581`). The
-    // documentation's recommendation is a page, and a smaller buffer takes on
-    // a forward-progress contract this code has no reason to accept.
-    let mut chunk = [0u8; 4096];
-    // Set when the deadline passes, and the loop then gets exactly ONE more
-    // read before it gives up. Without it the sequence "read answers
-    // WouldBlock, sleep, deadline passes, report timeout" never looks at the
-    // descriptor again — so a completion delivered DURING that sleep is
-    // sitting there unread while this reports that none arrived. On a loaded
-    // TCG guest that is a false rejection of a flip that worked, on a row
-    // every agent's boot runs.
-    let mut expired = false;
-    loop {
-        // Parse everything already buffered before reading more: one read can
-        // deliver several events, and a completion sitting behind a vblank in
-        // the same read must not wait for another read to be noticed.
-        while let Some(completion) = take_completion(&mut pending) {
-            if completion.user_data == cookie {
-                return Ok(completion);
-            }
-        }
-        // Only after the final drain above has had its chance to parse.
-        if expired {
-            return Err(format!(
-                "the page flip tagged {cookie:#x} was accepted by the kernel but no completion \
-                 arrived within {FLIP_TIMEOUT:?} — the flip was queued and the CRTC never \
-                 reported it reaching the screen"
-            ));
-        }
-        expired = deadline.is_none_or(|deadline| Instant::now() >= deadline);
-        match (&*card).read(&mut chunk) {
-            // NOT end-of-file, which an earlier revision called it. `drm_read`
-            // answers zero when the next event does not fit in the buffer it
-            // was given, having put that event back on the queue
-            // (`drm_file.c:581`). With a page-sized buffer no in-tree DRM
-            // event can provoke it, so reaching here means the kernel grew an
-            // event larger than a page and this loop would spin forever
-            // re-reading it. Refused with the reason rather than retried.
-            Ok(0) => {
-                return Err(
-                    "the DRM card returned a short read while waiting for a flip completion: \
-                     the next event does not fit in a 4 KiB buffer, so it was put back and \
-                     re-reading it would not make progress"
-                        .to_string(),
-                )
-            }
-            Ok(read) => pending.extend_from_slice(chunk.get(..read).unwrap_or_default()),
-            // No sleep once expired: the next pass reports the timeout, and
-            // sleeping first would only delay saying so.
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if !expired {
-                    std::thread::sleep(FLIP_POLL_INTERVAL);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(format!("read a flip completion from the card: {error}")),
-        }
-    }
-}
-
-/// Was this frame allocated at the size the mode is about to be set to?
-///
-/// Checked HERE rather than left to the kernel. `ADDFB2` is told a width, a
-/// height, a pitch and a handle as four bare numbers and validates them against
-/// the GEM object's size, so a frame allocated at some other size comes back as
-/// "object too small" — an error about a handle, raised inside the kernel, for
-/// a mistake that is visible right here as two sizes that disagree. Split out
-/// for `crtc_shows`'s reason: the refusal is then testable without a card.
-///
-/// `probe_kms` allocates from the same mode it sets, so nothing reaches this
-/// today. It is a precondition of `apply`, not of that one caller, and the
-/// backend §M row 1 still owes will have a buffer pool that outlives any single
-/// mode.
-fn frame_fits_mode(
-    frame_width: u32,
-    frame_height: u32,
-    mode_width: u32,
-    mode_height: u32,
-) -> Result<(), String> {
-    if frame_width != mode_width || frame_height != mode_height {
-        return Err(format!(
-            "the frame is {frame_width}x{frame_height} but the mode to be set is \
-             {mode_width}x{mode_height} — a framebuffer registered at the mode's size would \
-             describe rows this buffer does not have"
-        ));
-    }
-    Ok(())
-}
-
 /// Can this saved state be sent back as-is?
 ///
-/// Split out of `capture` so the three shapes the kernel refuses are testable
+/// Split out of `restorable` so the shapes the kernel refuses are testable
 /// against recorded CRTC states rather than against a card, for the reason
-/// `crtc_shows` is split out of `verify`. All three have to hold at once: a
-/// mode to set, a framebuffer to set it onto, and at least one connector to
-/// send it to. Any one missing and `SETCRTC` answers `-EINVAL` or `-ENOENT`
-/// rather than restoring anything.
+/// `crtc_shows` is split out. All three have to hold at once: a mode to set, a
+/// framebuffer to set it onto, and at least one connector to send it to. Any
+/// one missing and `SETCRTC` answers `-EINVAL` or `-ENOENT` rather than
+/// restoring anything.
 fn is_restorable(saved: &sys::DrmModeCrtc, connectors: &[u32]) -> bool {
     saved.mode_valid != 0 && saved.fb_id != 0 && !connectors.is_empty()
 }
 
 /// A saved CRTC state as a request `SETCRTC` will accept: itself when it is
 /// restorable, and otherwise "switch the CRTC off", the one request that is
-/// always well-formed. See `CrtcRestore::capture` for the shapes refused.
+/// always well-formed.
+///
+/// The saved state and a well-formed request are not the same thing, and the
+/// gap is reachable. `drm_mode_getcrtc` fills `mode_valid` from
+/// `crtc->state->enable` and `fb_id` from the primary plane INDEPENDENTLY
+/// (`drm_crtc.c:577`, `:562`), so an enabled CRTC with no primary framebuffer
+/// reads back as `mode_valid = 1, fb_id = 0`. Replaying that asks the kernel
+/// to look up framebuffer 0, which answers `-ENOENT` (`:773`). Two more shapes
+/// are refused outright: a mode with no connectors (`:824`) and connectors
+/// with no mode or no framebuffer (`:830`). Switching off is a worse restore
+/// than the real one and a better one than a request sent and silently failed.
 fn restorable(saved: sys::DrmModeCrtc, connectors: Vec<u32>) -> (sys::DrmModeCrtc, Vec<u32>) {
     if is_restorable(&saved, &connectors) {
         return (saved, connectors);
@@ -851,152 +288,19 @@ fn connectors_on_crtc(card: &File, crtc_id: u32) -> Result<Vec<u32>, String> {
     Ok(routed)
 }
 
-/// One modeset: a framebuffer registered, a CRTC driving it, and mastership
-/// held for as long as both are true.
-///
-/// Release order is declaration order again, and the reason is narrower than
-/// it first looks. Only ONE of the three steps needs mastership: `SETCRTC`
-/// carries `DRM_MASTER` in the kernel's ioctl table, while `GETCRTC`, `ADDFB2`
-/// and `RMFB` carry no flag at all (`drm_ioctl.c:674`, `675`, `691`, `692`).
-/// So the load-bearing part is that the restore -- which is a `SETCRTC` --
-/// happens while mastership is still held, and mastership is therefore
-/// released last.
-///
-/// Unregistering first would not FAIL, and an earlier revision of this comment
-/// said it would. `drm_framebuffer_remove` scans the CRTCs and planes using a
-/// framebuffer and disables them, because "drm ABI mandates that we remove any
-/// deleted framebuffers from active usage" (`drm_framebuffer.c:1157`). The
-/// consequence of the wrong order is a CRTC the kernel blanked and this code
-/// then turned back on -- a flicker rather than an error, which is a weaker
-/// reason to keep the order but still a reason.
-///
-/// Written as three fields with no `Drop` on this type, for the reason
-/// `DumbFrame` records: a type's own destructor runs before its fields, so
-/// putting the sequence there would run it in exactly the wrong place.
-pub struct Modeset<'card, 'frame> {
-    /// None of these three is ever READ, and that is what they are for: each
-    /// exists so its `Drop` runs, and the order they run in is the order they
-    /// are declared. Annotated individually rather than with one allowance on
-    /// the type, so a fourth field has to say for itself why nothing reads it.
-    #[allow(dead_code)]
-    restore: CrtcRestore<'card>,
-    #[allow(dead_code)]
-    fb: FbGuard<'card>,
-    #[allow(dead_code)]
-    master: MasterGuard<'card>,
-    /// The fourth field, saying for itself. Nothing reads it and it has no
-    /// destructor; it is here so the COMPILER refuses a modeset that outlives
-    /// the buffer it is scanning out. Without it `Modeset` borrows only the
-    /// card, so dropping the frame first releases the GEM handle and unmaps
-    /// the memory while the framebuffer is still registered and still on
-    /// screen. The kernel survives that — a framebuffer holds its own
-    /// reference to the object — but it is the one place the module's
-    /// "released together and in that order" discipline stopped at a comment,
-    /// and a borrow is cheaper than a comment.
-    #[allow(dead_code)]
-    frame: &'frame DumbFrame<'card>,
-    fb_id: u32,
-    crtc_id: u32,
-}
-
-impl<'card, 'frame> Modeset<'card, 'frame> {
-    /// Take mastership, register `frame` as a framebuffer, and drive the
-    /// scanout's connector from its CRTC.
-    ///
-    /// Each guard is built BEFORE the step that needs undoing can fail, so an
-    /// early return unwinds exactly what was done: `?` after `drm_set_master`
-    /// drops the master guard, `?` after `drm_add_fb` drops the framebuffer
-    /// too, and so on. That is the same discipline `DumbFrame::allocate` uses
-    /// and the reason neither needs a cleanup path written by hand.
-    pub fn apply(
-        card: &'card File,
-        scanout: &Scanout,
-        frame: &'frame DumbFrame<'card>,
-    ) -> Result<Modeset<'card, 'frame>, String> {
-        let width = u32::from(scanout.mode.hdisplay);
-        let height = u32::from(scanout.mode.vdisplay);
-        frame_fits_mode(frame.width(), frame.height(), width, height)?;
-        sys::drm_set_master(card)
-            .map_err(|error| format!("take DRM mastership to modeset: {error}"))?;
-        let master = MasterGuard { card };
-        let saved = sys::drm_get_crtc(card, scanout.crtc_id)?;
-        // Read before anything is changed, and under the mastership just
-        // taken: this is the routing the restore has to put back.
-        let routed = connectors_on_crtc(card, scanout.crtc_id)?;
-        let fb_id = sys::drm_add_fb(card, width, height, frame.pitch(), frame.handle())?;
-        let fb = FbGuard { card, fb_id };
-        let restore = CrtcRestore::capture(card, saved, routed);
-        let mut connectors = vec![scanout.connector_id];
-        let mut wanted = sys::DrmModeCrtc::empty();
-        wanted.crtc_id = scanout.crtc_id;
-        wanted.fb_id = fb_id;
-        wanted.mode_valid = 1;
-        wanted.mode = scanout.mode;
-        sys::drm_set_crtc(card, &wanted, &mut connectors)?;
-        Ok(Modeset {
-            restore,
-            fb,
-            master,
-            frame,
-            fb_id,
-            crtc_id: scanout.crtc_id,
-        })
-    }
-
-    /// The CRTC this modeset is driving, for a flip to name.
-    pub fn crtc_id(&self) -> u32 {
-        self.crtc_id
-    }
-
-    /// Ask the CRTC what it is actually doing, and refuse anything but what was
-    /// asked for.
-    ///
-    /// `SETCRTC` returning success is not the same claim. The kernel validates
-    /// and can land on a different mode than the one requested, and a driver
-    /// that quietly kept the previous framebuffer would report success while
-    /// showing the old picture. Reading the CRTC back is the only statement
-    /// about what is on the screen that this process can make without a camera.
-    pub fn verify(&self, card: &File, wanted: &sys::DrmModeInfo) -> Result<(), String> {
-        let live = sys::drm_get_crtc(card, self.crtc_id)?;
-        crtc_shows(&live, self.crtc_id, self.fb_id, wanted)
-    }
-
-    /// One line, for a proof to match and a person to read.
-    ///
-    /// Deliberately does NOT repeat `crtc=`: `Discovery::describe` already
-    /// emits that field, and a second one in the same whitespace-split line
-    /// would be read by whichever `strip_prefix` ran first. They carry the same
-    /// number today -- `apply` modesets the CRTC discovery chose -- so the
-    /// duplicate would have been invisible until the day they differed, which
-    /// is exactly when the check would need to be right.
-    pub fn describe(&self) -> String {
-        format!("fb={} modeset=ok", self.fb_id)
-    }
-}
-
 /// Open a card node and immediately give back the authority opening it took.
 ///
-/// Read-write because a DRM node is: the mode-setting requests the next
-/// landing issues are writes to the device even though this one only reads,
-/// and opening read-only would defer the failure to the modeset rather than
-/// report it at the door.
+/// Read-write because a DRM node is: the mode-setting requests are writes to
+/// the device, and opening read-only would defer the failure to the modeset
+/// rather than report it at the door.
 ///
-/// The `drm_drop_master` is not politeness, it is the correctness of every
-/// claim this module makes about not disturbing the screen. `drm_master_open`
-/// makes the first opener of a primary node the DRM master whenever
-/// `dev->master` is NULL, and fbcon — an in-kernel client — never sets it. So
-/// the plain `open` above IS the acquisition.
-///
-/// What holding it costs is not what an earlier revision of this comment
-/// claimed. The fbdev console keeps painting under a foreign master — the
-/// vblank wait answers `-EBUSY` and `drm_fb_helper_fb_dirty` discards it
-/// (`drm_fb_helper.c:237`, `:249`) — so the screen does NOT go stale. What
-/// does happen is that no other process can become master while this
-/// descriptor is one (`drm_auth.c:260`), which on a machine running a real DRM
-/// compositor is the disturbance that matters. Dropping it here closes a
-/// window measured in the whole length of the probe down to the two syscalls
-/// between them.
-pub fn open_card(path: &Path) -> Result<File, String> {
+/// `drm_master_open` makes the first opener of a primary node the DRM master
+/// whenever `dev->master` is NULL, and fbcon — an in-kernel client — never
+/// sets it. So the plain `open` IS an acquisition, one nobody asked for.
+/// Giving it back here keeps the one place this module TAKES mastership the
+/// explicit `SET_MASTER` in `open_kms`, two syscalls later; re-taking it is
+/// permitted to a non-root opener because its descriptor was master at open.
+fn open_card(path: &Path) -> Result<File, String> {
     let card = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1015,7 +319,7 @@ pub fn open_card(path: &Path) -> Result<File, String> {
 /// whether the right node was even opened — a render node answers its name
 /// happily and then refuses every modeset request with `EACCES`, which is the
 /// most likely way this is pointed at the wrong file.
-pub fn discover(card: &File) -> Result<Discovery, String> {
+fn discover(card: &File) -> Result<Discovery, String> {
     let driver = sys::drm_driver_name(card)?;
     let resources = sys::drm_resources(card)
         .map_err(|error| format!("{error} (driver {driver})"))?;
@@ -1103,10 +407,7 @@ fn select_scanout(card: &File, resources: &sys::DrmResources) -> Result<Scanout,
             "no connector on this DRM device can be scanned out: {} connector(s) examined, \
              {disconnected} disconnected, {without_modes} with no mode, {without_crtc} with no \
              reachable CRTC, {vanished} that disappeared between being listed and being \
-             read, and status values this build does not know: {unrecognised:?}. A \
-             connector reporting no modes is as much a statement about \
-             mastership as about the sink: DRM_IOCTL_MODE_GETCONNECTOR re-probes only for the \
-             current DRM master, and this process is deliberately not one",
+             read, and status values this build does not know: {unrecognised:?}",
             resources.connectors.len()
         )
     })
@@ -1192,9 +493,9 @@ fn first_possible_crtc(encoder: &sys::DrmEncoder, resources: &sys::DrmResources)
 /// The card, shared by the CRTC the backend drives and every buffer it
 /// registers.
 ///
-/// Owned rather than borrowed, which is the difference between the backend
-/// and the probes above: `Runtime` holds its output for the compositor's life,
-/// so nothing it holds can borrow a descriptor from a caller's stack frame.
+/// Owned rather than borrowed: `Runtime` holds its output for the
+/// compositor's life, so nothing it holds can borrow a descriptor from a
+/// caller's stack frame.
 /// `Arc` rather than `Rc` because the runtime crosses threads behind its lock.
 type Card = Arc<File>;
 
@@ -1205,10 +506,9 @@ const KMS_FORMATS: [Fourcc; 1] = [DRM_FORMAT_XRGB8888];
 /// One dumb buffer's GEM handle and, once registered, its framebuffer id,
 /// released framebuffer first and handle second.
 ///
-/// The owned counterpart of `DumbHandle` and `FbGuard` together. One guard
-/// rather than two because the two ids are only ever released as a pair, and
-/// a framebuffer registered on a handle that was already destroyed is the
-/// order worth never writing.
+/// One guard rather than two because the two ids are only ever released as a
+/// pair, and a framebuffer registered on a handle that was already destroyed
+/// is the order worth never writing.
 struct Registration {
     card: Card,
     handle: u32,
@@ -1229,9 +529,12 @@ impl Drop for Registration {
 /// One scanout buffer the backend owns outright: a dumb buffer, its mapping,
 /// and its framebuffer registration.
 ///
-/// Released in `DumbFrame`'s order for `DumbFrame`'s reason: `region` is
+/// Released in the reverse of acquisition, by field order: `region` is
 /// declared first, so it unmaps before the registration unregisters and
-/// frees, and there is no `Drop` of this type's own to run ahead of either.
+/// frees. There is deliberately no `Drop` of this type's own, because a
+/// type's destructor runs BEFORE its fields drop and would invert that. The
+/// kernel tolerates either order -- a GEM mapping holds its own reference --
+/// so this is hygiene rather than a requirement.
 pub struct ScanoutBuffer {
     region: sys::MappedRegion,
     registration: Registration,
@@ -1296,9 +599,9 @@ pub trait ScanoutCrtc {
 
 /// The CRTC the backend drives, mastership over it, and the state to put back.
 ///
-/// Its `Drop` is the teardown `Modeset` spreads across three guards, in the
-/// same order and for the same reason: the restore is a `SETCRTC`, which needs
-/// mastership, so mastership is released after it. It is declared FIRST in
+/// Its `Drop` restores the saved state and then gives mastership back, in that
+/// order because the restore is a `SETCRTC`, the one step the kernel flags
+/// `DRM_MASTER` (`drm_ioctl.c:675`). It is declared FIRST in
 /// `SwapChain`, so it runs before any buffer is unregistered -- unregistering
 /// a framebuffer the CRTC still scans out blanks the CRTC, which the restore
 /// would then have to light again.
@@ -1306,10 +609,9 @@ pub trait ScanoutCrtc {
 /// It runs when a start fails once the CRTC state is saved -- in `open_kms`,
 /// or in `run_compositor` before the completion threads start -- and never
 /// with a flip queued. A running compositor never drops its backend: the
-/// completion threads hold
-/// the runtime until the process ends. At exit the kernel releases mastership
-/// with the descriptors, and `drm_lastclose` restores the fbdev client once
-/// the last one closes, which is the same restore the probe relies on.
+/// completion threads hold the runtime until the process ends. At exit the
+/// kernel releases mastership with the descriptors, and `drm_lastclose`
+/// restores the fbdev client once the last one closes.
 pub struct CardCrtc {
     card: Card,
     crtc_id: u32,
@@ -1324,9 +626,10 @@ impl ScanoutCrtc for CardCrtc {
         sys::drm_page_flip(&*self.card, self.crtc_id, fb_id, cookie)
     }
 
-    /// Read back, for `Modeset::verify`'s reason: `SETCRTC` answering success
-    /// says the request was accepted, not that this framebuffer is the one
-    /// the CRTC is committed to.
+    /// Read back: `SETCRTC` answering success says the request was accepted,
+    /// not that this framebuffer is the one the CRTC is committed to. The
+    /// kernel may validate the request into another mode, and a driver that
+    /// kept the previous framebuffer would still answer success.
     fn set(&mut self, fb_id: u32) -> Result<(), String> {
         let mut wanted = sys::DrmModeCrtc::empty();
         wanted.crtc_id = self.crtc_id;
@@ -1342,7 +645,9 @@ impl ScanoutCrtc for CardCrtc {
 
 impl Drop for CardCrtc {
     fn drop(&mut self) {
-        // Reported for `CrtcRestore`'s reason, and on stderr for the same one.
+        // Reported rather than swallowed: a failed restore leaves a screen in a
+        // state nothing intended. On stderr, because stdout carries the boot
+        // markers the image's check reads whole-line.
         if let Err(error) = sys::drm_set_crtc(&*self.card, &self.saved, &mut self.routed) {
             let _ = writeln!(
                 std::io::stderr(),
@@ -1403,6 +708,11 @@ pub struct SwapChain<C, M> {
 /// The KMS backend as `run --card` builds it.
 pub type Kms = SwapChain<CardCrtc, ScanoutBuffer>;
 
+/// The first frame a swap chain queues. Not `FrameId::FIRST`: 1 is what a
+/// zeroed or defaulted `user_data` is likeliest to hold, and a kernel echoing
+/// a constant would then have its first completion accepted.
+pub const FIRST_FLIP: FrameId = FrameId::FIRST.next();
+
 impl<C: ScanoutCrtc, M: ScanoutMemory> SwapChain<C, M> {
     /// Build the chain and modeset onto a blank buffer 0.
     ///
@@ -1449,7 +759,7 @@ impl<C: ScanoutCrtc, M: ScanoutMemory> SwapChain<C, M> {
             front: 0,
             queued: None,
             shown: false,
-            next: FrameId::FIRST,
+            next: FIRST_FLIP,
             frame: zeroed(size)?,
             force: false,
             output,
@@ -1658,14 +968,16 @@ fn zeroed(size: usize) -> Result<Vec<u8>, String> {
 /// need this thread to wake.
 ///
 /// Sharing the description means sharing its status flags. Nothing may make
-/// the backend's card non-blocking as `await_flip` makes the probe's: this
-/// read would answer `WouldBlock`, which it reports as a failure.
+/// the backend's card non-blocking: this read would answer `WouldBlock`,
+/// which it reports as a failure.
 pub struct FlipEvents {
     card: File,
     crtc_id: u32,
     pending: Vec<u8>,
-    /// A page, for `read_until_flip`'s reason: `drm_read` never splits an
-    /// event, and puts back one that does not fit.
+    /// A page, because the kernel's documentation recommends one: `drm_read`
+    /// never splits an event, and puts back one that does not fit and answers
+    /// zero (`drm_file.c:581`), so a smaller buffer takes on a
+    /// forward-progress contract this reader has no reason to accept.
     chunk: Vec<u8>,
 }
 
@@ -1754,8 +1066,10 @@ pub fn open_kms(path: &Path) -> Result<(Kms, FlipEvents, String), String> {
             path.display()
         )
     })?;
-    // After the mastership rather than before, so connectors are probed as
-    // master: `GETCONNECTOR` re-probes a sink only for the current master.
+    // Discovery reads the mode list the kernel already has (fbcon probed it
+    // at boot); it never forces a probe, which "can be slow, might cause
+    // flickering and the ioctl will block" (drm_mode.h). A sink that changed
+    // since is followed only once hotplug is.
     let discovery = discover(&card)?;
     let scanout = discovery.scanout;
     let output = scanout.output()?;
@@ -1769,8 +1083,11 @@ pub fn open_kms(path: &Path) -> Result<(Kms, FlipEvents, String), String> {
         output.dimensions.width.saturating_mul(4),
     )?;
     // Read under mastership and before anything changes: this is the state
-    // the restore puts back. The routing is read, not assumed, for
-    // `CrtcRestore`'s reason.
+    // the restore puts back. `GETCRTC` reports no connector routing
+    // (`drm_crtc.c:543`), and the connector just selected need not be the one
+    // lit: on a card with two connected sinks `crtc_for` can pick a CRTC
+    // another connector is lit by, and restoring to the selected connector
+    // would leave that sink dark. So the routing is read, not assumed.
     let saved = sys::drm_get_crtc(&card, scanout.crtc_id)?;
     let routed = connectors_on_crtc(&card, scanout.crtc_id)?;
     let (saved, routed) = restorable(saved, routed);
@@ -1944,10 +1261,10 @@ mod tests {
 
         fill(&mut chain, Damage::Unknown, 7, 1..2);
         let submission = chain.present().unwrap();
-        assert_eq!(submission, Submission::Queued(FrameId::FIRST));
+        assert_eq!(submission, Submission::Queued(FIRST_FLIP));
         assert_eq!(
             log.lock().unwrap().calls.last(),
-            Some(&CrtcCall::Flip { fb_id: 42, cookie: 1 })
+            Some(&CrtcCall::Flip { fb_id: 42, cookie: FIRST_FLIP.cookie() })
         );
         // Every row, including the two the frame left at zero: the 0xee the
         // test allocator left there is gone.
@@ -1956,7 +1273,7 @@ mod tests {
         assert!(chain.completed().is_none());
         assert!(chain.present().is_err(), "a second flip was queued over the first");
 
-        chain.frame_presented(FrameId::FIRST).unwrap();
+        chain.frame_presented(FIRST_FLIP).unwrap();
         assert_eq!(chain.front_index(), 1);
         assert_eq!(chain.completed().unwrap().pixels, chain.frame());
     }
@@ -1969,11 +1286,11 @@ mod tests {
         // Frame 1 → buffer 1: row 0 set.
         fill(&mut chain, Damage::Unknown, 1, 0..1);
         chain.present().unwrap();
-        chain.frame_presented(FrameId::FIRST).unwrap();
+        chain.frame_presented(FIRST_FLIP).unwrap();
         // Frame 2 → buffer 0: row 3 set too. Buffer 0 is blank, so it needs
         // row 0 as well as row 3.
         fill(&mut chain, Damage::Unknown, 3, 3..4);
-        let second = FrameId::FIRST.next();
+        let second = FIRST_FLIP.next();
         assert_eq!(chain.present().unwrap(), Submission::Queued(second));
         assert_eq!(chain.buffer(0), chain.frame());
         chain.frame_presented(second).unwrap();
@@ -1991,7 +1308,7 @@ mod tests {
         assert_eq!(log.lock().unwrap().calls.len(), 1, "only the modeset");
 
         fill(&mut chain, Damage::Whole, 0, 0..0);
-        assert_eq!(chain.present().unwrap(), Submission::Queued(FrameId::FIRST));
+        assert_eq!(chain.present().unwrap(), Submission::Queued(FIRST_FLIP));
     }
 
     /// Completions are matched on the frame, and one for anything but the
@@ -1999,10 +1316,10 @@ mod tests {
     #[test]
     fn a_completion_for_another_frame_is_refused() {
         let (mut chain, _log) = testing::chain(2, 2);
-        assert!(chain.frame_presented(FrameId::FIRST).is_err(), "nothing was queued");
+        assert!(chain.frame_presented(FIRST_FLIP).is_err(), "nothing was queued");
         fill(&mut chain, Damage::Unknown, 5, 0..1);
         chain.present().unwrap();
-        assert!(chain.frame_presented(FrameId::FIRST.next()).is_err());
+        assert!(chain.frame_presented(FIRST_FLIP.next()).is_err());
         assert_eq!(chain.front_index(), 0);
         assert!(chain.completed().is_none());
     }
@@ -2016,17 +1333,17 @@ mod tests {
         chain.present().unwrap();
 
         log.lock().unwrap().fail_next_set = true;
-        assert!(chain.recover_stalled_frame(FrameId::FIRST).is_err());
+        assert!(chain.recover_stalled_frame(FIRST_FLIP).is_err());
         assert!(chain.completed().is_none());
         assert!(chain.present().is_err(), "the failed recovery released the flip");
 
-        chain.recover_stalled_frame(FrameId::FIRST).unwrap();
+        chain.recover_stalled_frame(FIRST_FLIP).unwrap();
         assert_eq!(log.lock().unwrap().calls.last(), Some(&CrtcCall::Set { fb_id: 42 }));
         assert_eq!(chain.front_index(), 1);
         assert_eq!(chain.completed().unwrap().pixels, chain.frame());
         // And the late completion the kernel may still send is not the
         // chain's to act on.
-        assert!(chain.frame_presented(FrameId::FIRST).is_err());
+        assert!(chain.frame_presented(FIRST_FLIP).is_err());
     }
 
     /// A `Whole` repair of an unchanged frame survives a refused flip: a
@@ -2037,7 +1354,7 @@ mod tests {
         fill(&mut chain, Damage::Whole, 0, 0..0);
         log.lock().unwrap().fail_next_flip = true;
         assert!(chain.present().is_err());
-        assert_eq!(chain.present().unwrap(), Submission::Queued(FrameId::FIRST));
+        assert_eq!(chain.present().unwrap(), Submission::Queued(FIRST_FLIP));
     }
 
     /// A flip the kernel refused leaves nothing queued, and the frame's rows
@@ -2048,7 +1365,7 @@ mod tests {
         fill(&mut chain, Damage::Unknown, 5, 0..1);
         log.lock().unwrap().fail_next_flip = true;
         assert!(chain.present().is_err());
-        assert_eq!(chain.present().unwrap(), Submission::Queued(FrameId::FIRST));
+        assert_eq!(chain.present().unwrap(), Submission::Queued(FIRST_FLIP));
     }
 
     /// One DRM event: `kind`, a 32-byte length, the cookie, and CRTC `crtc`.
@@ -2197,7 +1514,7 @@ mod tests {
 
     /// The failure this check exists for: a driver that accepted the request,
     /// answered success, and kept scanning out the picture that was already
-    /// there. Nothing else in the probe would notice.
+    /// there. Nothing else in the backend would notice.
     #[test]
     fn a_crtc_still_showing_the_previous_framebuffer_is_refused() {
         let wanted = mode(1280, 800, true, "1280x800");
@@ -2216,26 +1533,6 @@ mod tests {
         assert!(error.contains("1280x800"), "{error}");
     }
 
-    /// A frame allocated at the mode's size is the only one that may be
-    /// registered at it.
-    #[test]
-    fn a_frame_the_size_of_its_mode_is_accepted() {
-        assert_eq!(frame_fits_mode(1280, 800, 1280, 800), Ok(()));
-    }
-
-    /// Either dimension is enough, and the two are checked separately rather
-    /// than by area: 1280x800 and 800x1280 hold the same pixels and describe
-    /// different rows.
-    #[test]
-    fn a_frame_that_is_not_the_size_of_its_mode_is_refused() {
-        let error = frame_fits_mode(1024, 768, 1280, 800).unwrap_err();
-        assert!(error.contains("1024x768"), "{error}");
-        assert!(error.contains("1280x800"), "{error}");
-        assert!(frame_fits_mode(800, 1280, 1280, 800).is_err());
-        assert!(frame_fits_mode(1280, 768, 1280, 800).is_err());
-        assert!(frame_fits_mode(1024, 800, 1280, 800).is_err());
-    }
-
     /// A CRTC that was lit, onto a real framebuffer, with somewhere to send
     /// it: the only shape that can be replayed as it stands.
     #[test]
@@ -2244,7 +1541,7 @@ mod tests {
     }
 
     /// A CRTC that was already off. Replaying it means switching it off, which
-    /// `capture` expresses as the empty request rather than as this one.
+    /// `restorable` expresses as the empty request rather than as this one.
     #[test]
     fn a_dark_crtc_is_not_replayed() {
         assert!(!is_restorable(&live_crtc(7, 1280, 800, 0), &[31]));
@@ -2265,65 +1562,6 @@ mod tests {
     #[test]
     fn a_mode_with_nowhere_to_send_it_is_not_replayed() {
         assert!(!is_restorable(&live_crtc(7, 1280, 800, 1), &[]));
-    }
-
-    /// A zero-length mapping proves nothing, and is refused rather than given
-    /// an empty probe set that would pass vacuously.
-    #[test]
-    fn a_zero_length_mapping_is_not_a_proof() {
-        let error = pattern_offsets(0).unwrap_err();
-        assert!(error.contains("proves nothing"), "{error}");
-    }
-
-    /// The LAST byte is probed, not just the first and the middle. This is the
-    /// whole reason the set has three members: a mapping one byte short of its
-    /// buffer reads back correctly everywhere except here.
-    #[test]
-    fn the_last_byte_of_the_mapping_is_probed() {
-        assert_eq!(pattern_offsets(1).unwrap(), [0, 0, 0]);
-        assert_eq!(pattern_offsets(2).unwrap(), [0, 1, 1]);
-        let offsets = pattern_offsets(4096).unwrap();
-        assert_eq!(offsets, [0, 2048, 4095]);
-    }
-
-    /// A mapping that keeps what was written to it passes.
-    #[test]
-    fn a_mapping_that_retains_its_writes_is_proven() {
-        let mut pixels = vec![0u8; 4096];
-        let offsets = pattern_offsets(pixels.len()).unwrap();
-        write_pattern(&mut pixels, &offsets);
-        assert_eq!(verify_pattern(&pixels, &offsets), Ok(()));
-    }
-
-    /// The three offsets carry DIFFERENT bytes, so a mapping that aliased all
-    /// three onto one address would fail rather than read back its own last
-    /// write three times.
-    #[test]
-    fn the_three_probes_are_not_the_same_byte() {
-        let mut pixels = vec![0u8; 4096];
-        let offsets = pattern_offsets(pixels.len()).unwrap();
-        write_pattern(&mut pixels, &offsets);
-        let seen: Vec<u8> = offsets.iter().filter_map(|at| pixels.get(*at).copied()).collect();
-        assert_eq!(seen.len(), 3);
-        assert_ne!(seen.first(), seen.get(1));
-        assert_ne!(seen.get(1), seen.get(2));
-    }
-
-    /// A byte that does not survive the write is named, with its offset. This
-    /// is the case a single write-then-read pass over one slice could not have
-    /// produced, and it is why the two halves are separate functions.
-    #[test]
-    fn a_byte_that_does_not_stick_is_reported_by_offset() {
-        let mut pixels = vec![0u8; 4096];
-        let offsets = pattern_offsets(pixels.len()).unwrap();
-        write_pattern(&mut pixels, &offsets);
-        // The LAST byte, which is the off-by-one a short mapping produces.
-        if let Some(slot) = pixels.get_mut(4095) {
-            *slot = 0;
-        }
-        let error = verify_pattern(&pixels, &offsets).unwrap_err();
-        assert!(error.contains("byte 4095 of 4096"), "{error}");
-        assert!(error.contains("not the buffer"), "{error}");
     }
 
     fn mode(width: u16, height: u16, preferred: bool, name: &str) -> sys::DrmModeInfo {

@@ -326,7 +326,7 @@ impl FrameId {
     /// Wrapping rather than checked: a `u64` at sixty frames a second wraps
     /// after about ten billion years, so the overflow branch could never be
     /// taken and a `Result` here would be a lie the caller has to handle.
-    pub fn next(self) -> FrameId {
+    pub const fn next(self) -> FrameId {
         FrameId(self.0.wrapping_add(1))
     }
 
@@ -337,9 +337,9 @@ impl FrameId {
 
     /// Rebuild an id from a completion's `user_data`.
     ///
-    /// Called only where a completion event has been parsed: `Flip::frame`
-    /// for the probe and `FlipEvents::next` for the backend. That is what
-    /// makes the paragraph above a property rather than a wish.
+    /// Called only where a completion event has been parsed:
+    /// `FlipEvents::next`. That is what makes the paragraph above a property
+    /// rather than a wish.
     pub fn from_cookie(cookie: u64) -> FrameId {
         FrameId(cookie)
     }

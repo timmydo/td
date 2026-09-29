@@ -8654,103 +8654,80 @@ an admitted request as absent asserts nothing while still passing; it is
 `SETPLANE` and `ATOMIC` today. Read those, not this sentence, for what the test
 pins.
 
-Row 1's MAPPING half has landed since, and it is the honest toll this section
-names rather than the backend itself. `td-compositor/src/drm.rs` allocates a
-dumb buffer at the chosen mode's size, maps it, writes a pattern at its first,
-middle and last byte, reads that back, and releases both. Nothing is displayed:
-`ADDFB2`, `SETCRTC` and the page flip are what put pixels on glass and are
-still absent. What it buys is that `mmap` is now a rostered, confined surface
-with a region type owning its unmap — `UNSAFE.md` §6 records what landed
-against the shape budgeted there in advance — so the backend increment inherits
-a mapping class instead of introducing one.
+Row 1's MAPPING half has landed: the swap chain's two buffers are dumb
+buffers at the chosen mode's size, mapped through `mmap`, which is a rostered,
+confined surface with a region type owning its unmap — `UNSAFE.md` §6 records
+what landed against the shape budgeted there in advance. The QEMU boot check
+asserts that the stride frames are rendered at covers the output's width.
 
-The read-back is the part worth keeping: `mmap` answering an address is not
-evidence that the address is the buffer, and a length that disagreed with its
-mapping would still map and still write, just somewhere else. The last byte is
-probed because an off-by-one shows up there and nowhere else. The QEMU boot
-check asserts `mapping=ok` together with a pitch that covers the scanout width
-and a size that covers pitch times height, so the claim is proven on a real
-card rather than in a unit test.
-
-Row 1's MODESET half has landed since. `Modeset::apply` takes DRM mastership, registers the mapped
-dumb buffer with `ADDFB2`, drives the discovered connector from its CRTC with
-`SETCRTC`, and then reads the CRTC BACK with `GETCRTC` — because `SETCRTC`
-answering success is a weaker claim than the CRTC showing what was asked for,
-and a driver that kept the previous framebuffer would answer success while
-displaying the old picture. Reading it back is the strongest statement about
-what is on a screen that a headless process can make.
+Row 1's MODESET half has landed. The backend takes DRM mastership, registers
+both buffers with `ADDFB2`, drives the discovered connector from its CRTC with
+`SETCRTC` onto the first, and then reads the CRTC BACK with `GETCRTC` —
+because `SETCRTC` answering success is a weaker claim than the CRTC showing
+what was asked for, and a driver that kept the previous framebuffer would
+answer success while displaying the old picture. Reading it back is the
+strongest statement about what is on a screen that a headless process can
+make.
 
 The routing that restore puts back is READ rather than assumed. No ioctl
-reports a CRTC's connector set, so the probe walks the reverse mapping —
+reports a CRTC's connector set, so the backend walks the reverse mapping —
 connector to encoder to CRTC — under the mastership it just took. An earlier
 revision substituted the connector it was about to drive, which is the same set
 only when one sink is connected; two reviewers caught it, and on a two-monitor
 card it would have restored the wrong one and left the other dark.
 
-Everything is restored on the way out, in an order the type carries: the CRTC
-stops scanning out this framebuffer, then the framebuffer is unregistered, then
-mastership is released. The reason is narrower than "the kernel would refuse
-the other order", which an earlier draft of this paragraph claimed. Only
-`SETCRTC` is flagged `DRM_MASTER`; `ADDFB2` and `RMFB` need no master, and
-`RMFB` on a live framebuffer does not fail — the kernel disables the CRTCs
-using it, as the DRM ABI requires. What the order buys is that the restore, a
-`SETCRTC`, still has mastership when it runs, and that the screen is not
-blanked and then repainted on the way out.
+When a start fails after the modeset, everything is restored in an order the
+types carry: the CRTC is restored, then mastership is released, then the
+framebuffers are unregistered. Only `SETCRTC` is flagged `DRM_MASTER`;
+`ADDFB2` and `RMFB` need no master, and `RMFB` on a live framebuffer does not
+fail — the kernel disables the CRTCs using it, as the DRM ABI requires. What
+the order buys is that the restore, a `SETCRTC`, still has mastership when it
+runs, and that the screen is not blanked and then repainted on the way out. A
+running backend lives until the process exits, where `drm_lastclose` restores
+the fbdev client.
 
 Row 1's PAGE-FLIP half has landed after it. The row is NOT complete: it is
 specified as "atomic modeset, dumb buffers, page-flip vsync", and what landed
 is the LEGACY `SETCRTC`-plus-`PAGE_FLIP` pair. `MODE_ATOMIC` is still absent
-and is what replaces both once more than one plane is in play. `probe-flip` sets a mode, allocates a second frame, queues
-it with `MODE_PAGE_FLIP`, waits for the completion on the card descriptor, and
-reads the CRTC back showing the flipped framebuffer. That is what makes a
-sequence of pictures a display rather than one modeset.
+and is what replaces both once more than one plane is in play. The KMS
+backend sets a mode onto the first of two dumb buffers, then queues each frame
+with `MODE_PAGE_FLIP` and learns of its completion on the card descriptor.
+That is what makes a sequence of pictures a display rather than one modeset.
 
 The identity problem this section recorded as the blocker turned out not to
 need solving so much as noticing. Row 3 said a completion could not be matched
 to its frame "through an identity neither `Submission` nor `OutputEvent`
 carries" — but `DRM_IOCTL_MODE_PAGE_FLIP` takes a `u64 user_data` and the
 kernel copies it verbatim into the completion event, so the correlation channel
-is the ABI's. `FrameId` is that `u64` as a type, both variants carry one, and
-the boot check asserts the cookie that comes back is the one that went out. The
-probe deliberately queues the SECOND id rather than the first, because a probe
-that sent 1 and got 1 back could not distinguish a round-trip from a constant.
+is the ABI's. `FrameId` is that `u64` as a type, and both variants carry one.
+The runtime accepts only the completion of the frame in flight, or the late
+one of a frame the watchdog recovered, and the compositor prints its boot flip
+marker only after it accepted one, so the marker is the round-trip rather than
+a constant. Frames are numbered from 2, so a kernel echoing a zeroed
+`user_data` has nothing accepted.
 
-What is still missing is the delivery path, and it is worth being exact about
-which half. A one-shot probe can wait for its own flip; a compositor cannot,
-because a flip arrives asynchronously and draining only from a repaint means an
-idle screen never observes one — the client waits for a frame callback that
-waits for a completion that waits for a repaint that waits for the client. The
-card descriptor has to join the event loop. It since has: the KMS backend
-reads completions on a thread of its own, as row 3 records.
+The delivery path is the other half. A compositor cannot wait for its own
+flip, because a flip arrives asynchronously and draining only from a repaint
+means an idle screen never observes one — the client waits for a frame
+callback that waits for a completion that waits for a repaint that waits for
+the client. The card descriptor has to join the event loop, and it has: the
+KMS backend reads completions on a thread of its own, as row 3 records.
 
-The probe that proves this DISTURBS the screen, which discovery's did not —
-and the mechanism is the modeset, not the mastership. Once this probe's
-framebuffer is on the primary plane, the fbdev console's damage stops reaching
-the screen, because the kernel skips every plane whose current framebuffer is
-not the one being damaged; the console goes on painting into a buffer nothing
-scans out. So `probe-kms` is a separate subcommand from `probe-drm` and nothing
-in the boot's health verdict depends on the display while it runs. On the
-headless QEMU check there is nothing to disturb; on a machine with a monitor
-there would be, briefly.
+The image runs the KMS backend on `/dev/dri/card0`, with the fbdev backend as
+its fallback only on a machine without a card. Driving the card takes the
+screen from the fbdev console, and the mechanism is the modeset, not the
+mastership: once the compositor's framebuffer is on the primary plane, the
+console's damage stops reaching the screen, because the kernel skips every
+plane whose current framebuffer is not the one being damaged. So the VT
+console is not visible while the compositor runs. That loss is accepted: the
+serial greeter remains the recovery console, and `drm_lastclose` gives the
+screen back to fbcon when the compositor exits.
 
-It does, however, take DRM mastership, and saying otherwise was this
-increment's one real defect. Opening a PRIMARY node makes the opener master
-whenever `dev->master` is NULL, which is exactly the state fbcon leaves it in,
-so `SET_MASTER` never being issued proves nothing — the `open` is the
-acquisition. `open_card` therefore drops mastership immediately, and the
-confinement test pins that release rather than the absence of `SET_MASTER`.
-What lets this probe run beside the compositor driving the same card is the
-drop, not an absence.
-
-The modeset landing corrected the second half of that sentence, which had said
-the held mastership refuses the running compositor's fbdev damage. It does
-not: the kernel's fbdev helper asks for a vblank, is told `-EBUSY` while a
-foreign master exists, discards that answer and commits the damage anyway. A
-foreign master costs the console its vblank rate-limit, blocks any other
-process from becoming master, and fails the palette and panning ioctls — three
-real effects, none of them the one claimed. Dropping mastership promptly is
-still right, and the strongest reason is the second: while this descriptor is
-master, a genuine DRM compositor cannot take the card.
+Opening a PRIMARY node makes the opener master whenever `dev->master` is NULL,
+which is exactly the state fbcon leaves it in, so the `open` is the
+acquisition. `open_card` drops it at once, and the backend takes it back with
+`SET_MASTER` — permitted to the non-root compositor account only because its
+descriptor was master at open — and holds it for its life.
 
 The same correction applies to how the connector is read. `count_modes = 0` is
 the kernel's FORCE-PROBE request, which its own header says "can be slow,
@@ -8758,23 +8735,19 @@ might cause flickering and the ioctl will block"; the counting form the UAPI
 documents is `count_modes = 1` with room for one mode, and that is what this
 now sends.
 
-It also states its own limit, because the limit is load-bearing.
-`DRM_IOCTL_MODE_GETCONNECTOR` re-probes a connector only for the current DRM
-master and demotes everyone else to a read-only probe, so what discovery reads
-is the mode list the kernel already had. On a td image that list is the one
-`fbcon` produced, which is exactly the list a backend would inherit — but a
-connector reporting no modes here is as much a statement about mastership as
-about the sink, and the diagnostic says so rather than calling the screen
-absent.
+Discovery therefore reads the mode list the kernel already had — on a td
+image, the one fbcon's probe produced at boot — and never forces a probe. A
+connector reporting no modes fails the compositor's start rather than falling
+back, since the card exists.
 
 Two things discovery does not settle on its own, recorded because assuming
 otherwise is the expensive mistake. The card node is `root:root` mode 0600
 under devtmpfs, and td has no udev, so `td-seatd` assigns it to the
 compositor's own account, beside `/dev/fb0` and `/dev/input`. It is a row in
 the list of nodes seatd assigns rather than a new mechanism, and it is
-optional so that a machine without a card still boots. The health leg runs
-discovery as that account, so the grant is proven on every boot check.
-Modeset and flip still run as root until the backend owns mastership. And
+optional so that a machine without a card still boots. The compositor opens
+the card as that account, so its boot marker proves the grant on every boot
+check. And
 `possible_crtcs` is a bitmask over INDEXES into the resources' CRTC list, not
 over CRTC ids; reading it as ids is the classic way to modeset onto a pipe an
 encoder cannot drive, and it is silent, because ids are small integers too. A test pins the

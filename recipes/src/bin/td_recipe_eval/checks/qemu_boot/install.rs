@@ -2195,16 +2195,13 @@ mod tests {
             host_key: Some("ssh-ed25519 AAAA".into()),
             ..ConsoleEvidence::default()
         };
-        let display = "driver=virtio_gpu connector=Virtual-1#31 status=connected crtc=29 encoder=30 mode=1280x800@60 name=1280x800 preferred=true mm=0x0 output=1280x800";
-        evidence.td_compositor_drm = Some(format!(
-            "{display} buffer=1280x800 pitch=5120 bytes=4096000 mapping=ok"
-        ));
-        evidence.td_compositor_kms = Some(format!(
-            "{display} buffer=1280x800 pitch=5120 bytes=4096000 mapping=ok fb=7 modeset=ok"
-        ));
-        evidence.td_compositor_flip = Some(format!(
-            "{display} fb=7 modeset=ok flipfb=8 cookie=0x2 seq=41 flip=ok"
-        ));
+        evidence.td_compositor_kms = Some(
+            "driver=virtio_gpu connector=Virtual-1#31 status=connected crtc=29 encoder=30 \
+             mode=1280x800@60 name=1280x800 preferred=true mm=0x0 fb=7,8 modeset=ok \
+             output=1280x800 stride=5120"
+                .into(),
+        );
+        evidence.td_compositor_flip = Some("cookie=0x2 flip=ok".into());
         BootResult {
             evidence, exited_clean: false, marker_killed: true,
             reason: "fixture".into(),
@@ -2620,7 +2617,6 @@ mod tests {
             |e: &mut ConsoleEvidence| e.firstboot_new = false,
             |e: &mut ConsoleEvidence| e.firstboot_stable = true,
             |e: &mut ConsoleEvidence| e.host_key = None,
-            |e: &mut ConsoleEvidence| e.td_compositor_drm = None,
             |e: &mut ConsoleEvidence| e.td_compositor_kms = None,
             |e: &mut ConsoleEvidence| e.td_compositor_flip = None,
         ] {
