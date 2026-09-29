@@ -332,7 +332,15 @@ Split at these concrete boundaries before dependent milestones start:
     only; its borrowed result does not prove reader EOF or confer authority.
     Typed handoff errors preserve helper causes and add static source context.
     Builder plus Pending fits 36 KiB; d4 still measures concurrent call frames.
-  - **M04b2c3d3:** private owned candidate storage and sealed table headers.
+  - **M04b2c3d3a:** implemented `config/storage.rs`: cold fallible allocation
+    of private typed tables and both text arenas at the compiled maxima.
+    Check requested and returned capacities against each implemented region
+    partition;
+    initialize in place without a megabyte stack temporary. Subsequent
+    borrowed dispatcher builds reuse allocations after success or failure.
+    Results retain exclusive storage borrowing; no owned validated snapshot
+    or whole-reader authority is claimed.
+  - **M04b2c3d3b:** seal completed records into an owning candidate.
     Consume borrowed builders before moving their enclosing storage; keep
     backing tables, used prefixes and text owner together. No public loose
     rebinding, self-reference, extra snapshot copy or unsafe conversion.

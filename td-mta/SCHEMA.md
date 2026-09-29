@@ -487,6 +487,15 @@ The target metadata partition is:
 | Global settings, references, indices, ownership and unassigned headroom | 228 KiB |
 | **Total** | **384 KiB** |
 
+`config::storage` now allocates the twelve implemented regions with checked,
+fallible cold allocations and keeps all vectors private. Each returned vector
+capacity must fit its listed partition. The movable storage owner itself fits
+1 KiB of global headroom; it currently lends tables to borrowed dispatcher
+results. Device cells, owned resource plans and sealed record headers remain
+reserved, not implemented by this allocation helper. Allocator overhead and
+transient allocation behavior are outside these payload counts and remain
+part of process-memory qualification.
+
 These are implementation ceilings, not measured struct sizes. Every new layout
 must have a size/capacity check before use. The persistent representation uses
 private checked text references and indices, not a self-referential owning

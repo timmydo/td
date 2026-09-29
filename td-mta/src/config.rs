@@ -13,6 +13,7 @@ pub mod policy;
 pub mod resources;
 pub mod routing;
 pub mod stanza;
+pub mod storage;
 pub mod stream;
 pub mod syntax;
 pub mod text;

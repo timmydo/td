@@ -1221,3 +1221,49 @@ record coordinates; discarded stanzas are not retained as a source map.
 Unknown input names and supplied values are never echoed, error source chains
 are empty, and builders/tables/results redact Debug. Explicit record accessors
 expose values for trusted consumers.
+
+
+## Preallocated configuration storage
+
+M04b2c3d3a implements `config::storage::Storage`. Its cold `try_new` creates
+two text regions and ten typed table regions at the existing compiled count
+ceilings. All vectors are private. Compile-time checks also require every
+compiled count/layout to fit its partition; unused space within a partition
+is allowed. Each allocation checks count multiplication
+and its SCHEMA partition before calling `try_reserve_exact`, checks returned
+capacity against that same partition, then initializes cells with their
+small empty value. A returned capacity smaller than requested also fails;
+initialization cannot silently trigger another allocation. Spare capacity
+within a partition is allowed and counted, but only the requested cells are
+initialized or lent to builders. Failure drops
+partially constructed regions and returns a fixed region/code diagnostic.
+There is no large aggregate stack temporary, byte reinterpretation or unsafe.
+
+`allocated_bytes` reports actual vector payload capacities plus the owner
+headers. Every region retains its existing ceiling; the owner fits 1 KiB of
+global headroom. Unimplemented device cells, resource-plan storage and sealed
+record headers keep their separate reservations. This count excludes allocator
+bookkeeping/rounding, does not predict RSS and does not count external borrowed
+Parsed headers/plans as though they were already stored inside this owner.
+An allocator returning vector capacity above its region partition is refused; this post-allocation
+check is not a bound on allocator-internal transient storage. The partition
+ledger and later whole-process qualification retain their existing roles.
+
+`builder` lends all regions exclusively to the existing typed dispatcher and
+uses caller-owned Pending scratch. Building, finalizing and querying retain
+those allocations. A completed Parsed result still borrows the storage; drop
+all builders/results/views before rebuilding or moving its owner. Failed
+candidates expose no records; a fresh build obtains a new text ownership
+ticket and initializes its used prefixes, so old rows/bytes cannot be
+observed through the new result. Unused backing bytes are private, not
+scrubbed or exposed as diagnostics. This is storage reuse after discarding
+a failed candidate, not recovery of that failed builder.
+
+Tests check all table counts, capacity accounting, allocation/layout refusal,
+unchanged allocation addresses across success/failure/reuse, shrinking every
+typed table and text prefix, moving unused storage, and an independent prior configuration
+remaining readable after replacement failure. Pointer/capacity checks establish
+region reuse; they do not replace later whole-process allocation measurement.
+M04b2c3d3b still owns sealed headers and a movable completed candidate; d4 owns
+actual reader EOF, concurrent workspace and call-frame checks. No service,
+protected-file, provider or publication authority is introduced.
