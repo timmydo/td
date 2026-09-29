@@ -26,6 +26,7 @@ mod bzip2;
 mod cargo_lock;
 mod crypto_policy;
 mod crypto_build;
+mod crypto_headers;
 mod check_host;
 mod check_loop;
 mod check_memory;
