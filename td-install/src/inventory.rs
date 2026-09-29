@@ -358,7 +358,7 @@ fn candidate(device: &Device, devices: &[Device]) -> bool {
             .all(|peer| peer.holders.is_empty() && peer.slaves.is_empty())
 }
 
-fn matches_plan(device: &Device, plan: &installation_plan::Plan) -> io::Result<bool> {
+fn destination_value(device: &Device) -> io::Result<installation_plan::Destination> {
     let disk = device
         .disk
         .as_ref()
@@ -375,7 +375,7 @@ fn matches_plan(device: &Device, plan: &installation_plan::Plan) -> io::Result<b
         .map_err(|_| invalid("observed destination minor exceeds u32".into()))?;
     let sector = u32::try_from(disk.logical_sector_bytes)
         .map_err(|_| invalid("observed destination sector size exceeds u32".into()))?;
-    let observed = installation_plan::Destination::new(installation_plan::DestinationObservation {
+    installation_plan::Destination::new(installation_plan::DestinationObservation {
         name: &device.name,
         major,
         minor,
@@ -387,8 +387,11 @@ fn matches_plan(device: &Device, plan: &installation_plan::Plan) -> io::Result<b
         serial: disk.serial.as_deref(),
         wwid: disk.wwid.as_deref(),
     })
-    .map_err(invalid)?;
-    Ok(&observed == plan.destination())
+    .map_err(invalid)
+}
+
+fn matches_plan(device: &Device, plan: &installation_plan::Plan) -> io::Result<bool> {
+    Ok(&destination_value(device)? == plan.destination())
 }
 
 /// Hold a read-write O_EXCL claim through the caller's observation. This
@@ -454,11 +457,11 @@ fn probe(device: &Device) -> io::Result<bool> {
     Ok(true)
 }
 
-fn discover(
+fn select<R>(
     mut observation: impl FnMut() -> io::Result<Vec<Device>>,
     mut available: impl FnMut(&Device) -> io::Result<bool>,
-    output: &mut impl Write,
-) -> io::Result<()> {
+    finish: impl FnOnce(&[&Device]) -> io::Result<R>,
+) -> io::Result<R> {
     let devices = observation()?;
     let mut candidates = Vec::new();
     for device in &devices {
@@ -471,11 +474,42 @@ fn discover(
             "block inventory changed during candidate discovery; retry discovery".into(),
         ));
     }
-    write_devices(&candidates, "candidate-only", output)
+    finish(&candidates)
+}
+
+fn discover(
+    observation: impl FnMut() -> io::Result<Vec<Device>>,
+    available: impl FnMut(&Device) -> io::Result<bool>,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    select(observation, available, |candidates| {
+        write_devices(candidates, "candidate-only", output)
+    })
+}
+
+fn record(
+    observation: impl FnMut() -> io::Result<Vec<Device>>,
+    available: impl FnMut(&Device) -> io::Result<bool>,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    select(observation, available, |candidates| {
+        let disks = candidates
+            .iter()
+            .map(|device| destination_value(device))
+            .collect::<io::Result<Vec<_>>>()?;
+        let record = installation_plan::Candidates::new(disks).map_err(invalid)?;
+        output.write_all(&record.encode())
+    })
 }
 
 pub fn destinations(output: &mut impl Write) -> io::Result<()> {
     discover(|| collect(Path::new("/sys/class/block")), probe, output)
+}
+
+/// Write one bounded advisory record after the same two-scan discovery and
+/// temporary read-only claims as `destinations`.
+pub fn candidate_record(output: &mut impl Write) -> io::Result<()> {
+    record(|| collect(Path::new("/sys/class/block")), probe, output)
 }
 
 pub fn run(root: &Path, output: &mut impl Write) -> io::Result<()> {
@@ -539,7 +573,7 @@ fn write_devices(devices: &[&Device], scope: &str, output: &mut impl Write) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::installation_plan::{Destination, DestinationObservation, Plan, Settings};
+    use crate::installation_plan::{Candidates, Destination, DestinationObservation, Plan, Settings};
     use std::fs;
     use std::os::unix::fs::symlink;
 
@@ -702,6 +736,81 @@ mod tests {
             devices.iter().find(|d| d.name == "dm-0").unwrap(),
             &devices
         ));
+    }
+
+    #[test]
+    fn candidate_record_uses_the_same_advisory_filter_and_publishes_one_binary_reply() {
+        let fixture = Fixture::new();
+        let disk = fixture.disk("vda", "252:0", 512);
+        fs::write(disk.join("device/model"), "Installer target\n").unwrap();
+        fs::write(disk.join("serial"), "serial-7\n").unwrap();
+        fs::write(disk.join("wwid"), "wwid-7\n").unwrap();
+        fs::write(disk.join("removable"), "1\n").unwrap();
+        let excluded = fixture.disk("sda", "8:0", 512);
+        fs::write(excluded.join("diskseq"), "8\n").unwrap();
+        let ineligible = fixture.disk("sdb", "8:16", 512);
+        fs::write(ineligible.join("ro"), "1\n").unwrap();
+        fs::write(ineligible.join("diskseq"), "9\n").unwrap();
+        let mut output = Vec::new();
+        record(
+            || collect(&fixture.class),
+            |device| Ok(device.name != "sda"),
+            &mut output,
+        )
+        .unwrap();
+        let decoded = Candidates::decode(&output).unwrap();
+        assert_eq!(decoded.as_slice().len(), 1);
+        let observed = decoded.as_slice().first().unwrap();
+        assert_eq!(observed.name(), "vda");
+        assert_eq!(observed.number(), (252, 0));
+        assert_eq!(observed.sequence(), 7);
+        assert_eq!(observed.capacity(), 6 * 1024 * 1024 * 1024);
+        assert_eq!(observed.sector(), 512);
+        assert!(observed.removable());
+        assert_eq!(observed.model(), Some("Installer target"));
+        assert_eq!(observed.serial(), Some("serial-7"));
+        assert_eq!(observed.wwid(), Some("wwid-7"));
+        assert_eq!(decoded.encode(), output);
+        let mut json = Vec::new();
+        discover(
+            || collect(&fixture.class),
+            |device| Ok(device.name != "sda"),
+            &mut json,
+        )
+        .unwrap();
+        let json = String::from_utf8(json).unwrap();
+        assert!(json.contains("\"name\":\"vda\""));
+        assert!(!json.contains("\"name\":\"sda\""));
+        assert!(!json.contains("\"name\":\"sdb\""));
+
+        let mut empty = Vec::new();
+        record(|| collect(&fixture.class), |_| Ok(false), &mut empty).unwrap();
+        assert_eq!(empty, b"TDCAND01\0");
+    }
+
+    #[test]
+    fn candidate_record_refuses_changed_or_ambiguous_inventory_before_output() {
+        let fixture = Fixture::new();
+        let disk = fixture.disk("vda", "252:0", 512);
+        let mut output = Vec::new();
+        let error = record(
+            || collect(&fixture.class),
+            |_| {
+                fs::write(disk.join("diskseq"), "8\n").unwrap();
+                Ok(true)
+            },
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("changed during candidate discovery"));
+        assert!(output.is_empty());
+
+        let other = fixture.disk("sda", "8:0", 512);
+        fs::write(disk.join("diskseq"), "8\n").unwrap();
+        fs::write(other.join("diskseq"), "8\n").unwrap();
+        let error = record(|| collect(&fixture.class), |_| Ok(true), &mut output).unwrap_err();
+        assert!(error.to_string().contains("duplicate installation candidate"));
+        assert!(output.is_empty());
     }
 
     #[test]

@@ -795,6 +795,18 @@ after all probes finish. Collection bounds, JSON escaping and output-error
 handling remain the same as inventory. Empty candidates are a successful
 observation, not permission to bypass admission.
 
+`td-install candidate-record` applies the same filter, temporary claims and
+second full inventory, then emits one canonical `TDCAND01` binary record
+to a pipe or file. It refuses a terminal so device-supplied control bytes
+cannot be interpreted there. The record contains no trailing newline;
+model, serial and WWID remain untrusted UTF-8 and must be escaped by any
+displaying client. All fields and the count are admitted before writing.
+More than 64 candidates or repeated names, device numbers or disk
+sequences refuse the binary command without output; the JSON diagnostic
+keeps its existing behavior. A write error can leave a truncated record,
+which the bounded decoder rejects. The probe claims close after each disk
+and before the second inventory; the command retains no chosen disk.
+
 This requires trusted devtmpfs/sysfs and their ancestors, and the live
 profile must retain mounts of the installation medium and every filesystem
 backing its files. Those kernel claims, or excluded stacked relationships,

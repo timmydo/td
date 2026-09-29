@@ -560,6 +560,8 @@ and limitations. Only ResourceBusy (Linux EBUSY, retained as ErrorKind by
 the path wrapper) excludes a probed disk; other failures refuse discovery.
 No device bytes are written. This does not replace the formatter's
 read-write claim or establish the installation service's retained authority.
+`td-install candidate-record` shares that read-only observation. INSTALLER.md
+owns its binary output contract and its lack of retained authority.
 `td-install observe-plan` separately takes a read-write exclusive claim,
 compares a bounded reviewed plan with two complete inventories and the
 opened block device, then releases the claim after its observation report.

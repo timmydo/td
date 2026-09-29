@@ -56,7 +56,7 @@ mod hostname;
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -69,15 +69,24 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
+
+fn candidate_output_allowed(terminal: bool) -> io::Result<()> {
+    if terminal {
+        Err(invalid("candidate-record is binary; redirect stdout to a pipe or file".into()))
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 enum Mode {
     NewVolumeUuid,
     Inventory,
     Destinations,
+    CandidateRecord,
     ObservePlan,
     ObserveSourcePlan { td_boot: PathBuf, source: PathBuf, trusted_key: PathBuf },
     PrepareSelector {
@@ -484,6 +493,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     match (verb.to_str(), rest) {
         (Some("inventory"), []) => Ok(Mode::Inventory),
         (Some("destinations"), []) => Ok(Mode::Destinations),
+        (Some("candidate-record"), []) => Ok(Mode::CandidateRecord),
         (Some("observe-plan"), []) => Ok(Mode::ObservePlan),
         (Some("observe-source-plan"), [td_boot, source, trusted_key]) => Ok(Mode::ObserveSourcePlan {
             td_boot: PathBuf::from(td_boot),
@@ -2345,6 +2355,13 @@ fn main() -> ExitCode {
             let mut output = io::BufWriter::new(stdout.lock());
             inventory::destinations(&mut output).and_then(|()| output.flush())
         },
+        Mode::CandidateRecord => {
+            let stdout = io::stdout();
+            candidate_output_allowed(stdout.is_terminal()).and_then(|()| {
+                let mut output = io::BufWriter::new(stdout.lock());
+                inventory::candidate_record(&mut output).and_then(|()| output.flush())
+            })
+        },
         Mode::ObservePlan => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
@@ -3281,6 +3298,12 @@ mod tests {
 
     #[test]
     fn the_verb_and_its_arity_are_exact() {
+        assert_eq!(parse_args(args(&["candidate-record"])).unwrap(), Mode::CandidateRecord);
+        assert!(parse_args(args(&["candidate-record", "/dev/vda"])).is_err());
+        assert!(parse_args(args(&["candidate-record", "--uuid"])).is_err());
+        assert!(parse_args(args(&["candidate-record", "--trusted-key"])).is_err());
+        assert!(candidate_output_allowed(true).is_err());
+        assert!(candidate_output_allowed(false).is_ok());
         assert_eq!(
             parse_args(args(&["layout", "/dev/sda"])).unwrap(),
             Mode::Layout {
