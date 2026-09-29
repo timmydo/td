@@ -393,9 +393,12 @@ fn gratings(width: usize, height: usize, cell: usize, chroma: bool) -> Vec<u8> {
 fn turned_angles_decode_on_gratings() {
     // Every directional mode of both planes at nonzero deltas, blocks
     // on the right and bottom edges reading replicated above-right and
-    // below-left pixels among them.
+    // below-left pixels among them, and 32x32s past both, whose edges the
+    // filter cuts where the frame does.
     for (width, height, cell, quality, chroma) in [
         (97, 61, 16, 20, false),
+        (118, 87, 32, 30, false),
+        (118, 87, 32, 60, true),
         (131, 257, 8, 45, false),
         (300, 190, 32, 70, false),
         (257, 9, 16, 95, false),
@@ -560,11 +563,9 @@ fn the_stream_opens_with_the_documented_headers() {
     assert_eq!(bits(seq, &mut at, 4), 15, "frame_height_bits_minus_1");
     assert_eq!(bits(seq, &mut at, 16), 63, "max_frame_width_minus_1");
     assert_eq!(bits(seq, &mut at, 16), 47, "max_frame_height_minus_1");
-    assert_eq!(
-        bits(seq, &mut at, 4),
-        0,
-        "128x128, filter/edge intra, superres"
-    );
+    assert_eq!(bits(seq, &mut at, 2), 0, "128x128, filter intra");
+    assert_eq!(bits(seq, &mut at, 1), 1, "enable_intra_edge_filter");
+    assert_eq!(bits(seq, &mut at, 1), 0, "enable_superres");
     assert_eq!(bits(seq, &mut at, 1), 1, "enable_cdef");
     assert_eq!(bits(seq, &mut at, 1), 0, "enable_restoration");
     assert_eq!(bits(seq, &mut at, 2), 0, "high_bitdepth, mono_chrome");
@@ -674,11 +675,11 @@ fn fnv(bytes: &[u8]) -> u64 {
 #[test]
 fn the_streams_are_the_bytes_dav1d_decoded() {
     for (width, height, quality, rows_log2, hash) in [
-        (65, 33, 30, 0, 0xcdaf065dd35e7b93u64),
-        (520, 40, 60, 0, 0x546679abb6fc81d9),
-        (200, 200, 75, 1, 0xe02b688817e1aa87),
-        (67, 45, 15, 0, 0xf615a7a8dab1c8b8),
-        (130, 70, 1, 0, 0x7f11f8fb1f0cd206),
+        (65, 33, 30, 0, 0xfda2f434c8fa3cbau64),
+        (520, 40, 60, 0, 0x8f0fa319538a8f50),
+        (200, 200, 75, 1, 0x1de3ce80b3820a96),
+        (67, 45, 15, 0, 0xda15606197a91103),
+        (130, 70, 1, 0, 0xd9cbd4339259970a),
     ] {
         let name = format!("g{width}x{height}q{quality}r{rows_log2}");
         let (obus, reconstruction) = encode_tiled(width, height, quality, 1, rows_log2);

@@ -6,18 +6,18 @@
 //! wraps them. Fed rows like `jpeg::Encoder`, a superblock row at a time.
 //!
 //! What the encoder uses of AV1: 64x64 superblocks split down to square
-//! blocks of 32, 16, 8 and 4 pixels and the halves of a 32, a 16 or an 8
-//! by rate-distortion choice; every intra mode, angle deltas and chroma
-//! from luma included, but palette and filter-intra; for luma with no
-//! side of 32 the best of the reduced set's four DCT and ADST pairs, for
-//! chroma the mode's default; one transform per plane per block, its
-//! levels a dead-zone quantizer's refined by a trellis; the multi-symbol
-//! arithmetic coder with adapting CDFs from the defaults; uniform tile
-//! columns by the frame's size alone, which the threads spread over.
-//! The deblocking filter and CDEF are on at strengths from the
+//! blocks of 32, 16, 8 and 4 pixels and the halves of a 32, a 16 or an 8 by
+//! rate-distortion choice; every intra mode, angle deltas, the intra edge
+//! filter and chroma from luma included, but palette and filter-intra; for
+//! luma with no side of 32 the best of the reduced set's four DCT and ADST
+//! pairs, for chroma the mode's default; one transform per plane per block,
+//! its levels a dead-zone quantizer's refined by a trellis; the
+//! multi-symbol arithmetic coder with adapting CDFs from the defaults;
+//! uniform tile columns by the frame's size alone, which the threads spread
+//! over. The deblocking filter and CDEF are on at strengths from the
 //! quantizer; restoration, superres, film grain and screen-content tools
-//! stay off. `transform` holds the transforms, quantizers and scans,
-//! `cdf` the default CDFs, `deblock` and `cdef` the filters.
+//! stay off. `transform` holds the transforms, quantizers and scans, `cdf`
+//! the default CDFs, `deblock` and `cdef` the filters.
 
 use std::fmt;
 
@@ -139,6 +139,11 @@ fn mode_angle(mode: u8) -> i32 {
 
 fn is_directional(mode: u8) -> bool {
     (V_PRED..=D67_PRED).contains(&mode)
+}
+
+/// The spec's `is_smooth`, a luma or chroma mode alike.
+fn is_smooth(mode: u8) -> bool {
+    matches!(mode, SMOOTH_PRED | SMOOTH_V_PRED | SMOOTH_H_PRED)
 }
 
 /// The spec's `Intra_Mode_Context`.
@@ -911,11 +916,12 @@ fn sequence_header(geometry: &Geometry) -> Vec<u8> {
     b.put(4, 15);
     b.put(16, (geometry.width - 1) as u32);
     b.put(16, (geometry.height - 1) as u32);
-    // enable_superblock_128x128, _filter_intra, _intra_edge_filter and
-    // _superres off, enable_cdef on, enable_restoration off.
+    // enable_superblock_128x128 and _filter_intra off,
+    // enable_intra_edge_filter on, enable_superres off, enable_cdef on,
+    // enable_restoration off.
     b.flag(false);
     b.flag(false);
-    b.flag(false);
+    b.flag(true);
     b.flag(false);
     b.flag(true);
     b.flag(false);
@@ -1064,8 +1070,8 @@ impl Band {
 // --------------------------------------------------------- contexts
 
 /// The above and left context arrays of one tile: level and DC sign
-/// contexts per plane in 4-pixel units, the skip flags, modes and block
-/// sizes of the mode-info neighbours.
+/// contexts per plane in 4-pixel units, the skip flags, luma and chroma
+/// modes and block sizes of the mode-info neighbours.
 #[derive(Clone)]
 struct Contexts {
     above_level: [Vec<u8>; 3],
@@ -1076,6 +1082,9 @@ struct Contexts {
     left_skip: Vec<u8>,
     above_mode: Vec<u8>,
     left_mode: Vec<u8>,
+    /// The chroma modes of the blocks with chroma, where they are.
+    above_uv_mode: Vec<u8>,
+    left_uv_mode: Vec<u8>,
     above_width_log2: Vec<u8>,
     left_height_log2: Vec<u8>,
     /// Per plane, the superblock's decoded 4x4 units with a border of
@@ -1098,6 +1107,8 @@ impl Contexts {
             left_skip: rows(),
             above_mode: cols(),
             left_mode: rows(),
+            above_uv_mode: cols(),
+            left_uv_mode: rows(),
             above_width_log2: cols(),
             left_height_log2: rows(),
             decoded: [[false; DECODED * DECODED]; 3],
@@ -1471,8 +1482,9 @@ struct Saved {
 }
 
 /// The context slices a block writes: the level and DC columns and rows
-/// of the three planes, then the skip, mode and size columns and rows.
-const SEGMENTS: usize = 18;
+/// of the three planes, then the skip, luma and chroma mode and size
+/// columns and rows.
+const SEGMENTS: usize = 20;
 
 impl Contexts {
     /// Every context slice a block at the position writes.
@@ -1489,6 +1501,8 @@ impl Contexts {
             left_skip,
             above_mode,
             left_mode,
+            above_uv_mode,
+            left_uv_mode,
             above_width_log2,
             left_height_log2,
             ..
@@ -1511,10 +1525,10 @@ impl Contexts {
             push(above.get_mut(x4..x4 + (w4 >> sub)).unwrap_or(&mut []));
             push(left.get_mut(y4..y4 + (h4 >> sub)).unwrap_or(&mut []));
         }
-        for above in [above_skip, above_mode, above_width_log2] {
+        for above in [above_skip, above_mode, above_uv_mode, above_width_log2] {
             push(above.get_mut(mi_col..mi_col + w4).unwrap_or(&mut []));
         }
-        for left in [left_skip, left_mode, left_height_log2] {
+        for left in [left_skip, left_mode, left_uv_mode, left_height_log2] {
             push(left.get_mut(sb_row..sb_row + h4).unwrap_or(&mut []));
         }
         out
@@ -2030,7 +2044,7 @@ impl Tile {
             .zip(luma.chunks_exact_mut(area))
             .enumerate()
         {
-            predict_block(mode, 0, &edges, pred);
+            predict_block(mode, 0, &edges, false, pred);
             let mut counter = Counter(0);
             self.y_mode_symbols(&mut counter, at, mode, 0);
             *slot = (self.screen(self.satd(0, at, pred), counter.0), mode, 0, k);
@@ -2053,7 +2067,7 @@ impl Tile {
             else {
                 break;
             };
-            predict_block(mode, delta, &edges, pred);
+            predict_block(mode, delta, &edges, false, pred);
             let mut counter = Counter(0);
             self.y_mode_symbols(&mut counter, at, mode, delta);
             *slot = (
@@ -2076,6 +2090,12 @@ impl Tile {
                 LUMA_TRIALS
             })
         {
+            // The screen's estimate made exact: the edges filtered.
+            if let (true, Some(pred)) =
+                (is_directional(mode), luma.get_mut(k * area..(k + 1) * area))
+            {
+                predict_block(mode, delta, &edges, true, pred);
+            }
             let pred = luma.get(k * area..(k + 1) * area).unwrap_or(&[]);
             self.code_plane(0, at, mode, mode_tx_type(mode, size), pred, work, trial_y);
             let mut counter = Counter(0);
@@ -2132,8 +2152,8 @@ impl Tile {
                 .enumerate()
             {
                 let (u, v) = pred.split_at_mut(area);
-                predict_block(mode, 0, &edges_u, u);
-                predict_block(mode, 0, &edges_v, v);
+                predict_block(mode, 0, &edges_u, false, u);
+                predict_block(mode, 0, &edges_v, false, v);
                 let mut counter = Counter(0);
                 self.uv_mode_symbols(&mut counter, at, y_mode, mode, 0, [0; 2]);
                 let satd = self.satd(1, uv_at, u) + self.satd(2, uv_at, v);
@@ -2160,8 +2180,8 @@ impl Tile {
                     break;
                 };
                 let (u, v) = pred.split_at_mut(area);
-                predict_block(mode, delta, &edges_u, u);
-                predict_block(mode, delta, &edges_v, v);
+                predict_block(mode, delta, &edges_u, false, u);
+                predict_block(mode, delta, &edges_v, false, v);
                 let mut counter = Counter(0);
                 self.uv_mode_symbols(&mut counter, at, y_mode, mode, delta, [0; 2]);
                 let satd = self.satd(1, uv_at, u) + self.satd(2, uv_at, v);
@@ -2204,6 +2224,13 @@ impl Tile {
             for (i, &(score, mode, delta, k)) in screened_uv.iter().enumerate() {
                 if score == u64::MAX || (i >= CHROMA_TRIALS && mode != UV_CFL_PRED) {
                     continue;
+                }
+                let exact = chroma.get_mut(k * area * 2..(k + 1) * area * 2);
+                if let (true, Some((u, v))) =
+                    (is_directional(mode), exact.map(|p| p.split_at_mut(area)))
+                {
+                    predict_block(mode, delta, &edges_u, true, u);
+                    predict_block(mode, delta, &edges_v, true, v);
                 }
                 let pred = chroma.get(k * area * 2..(k + 1) * area * 2).unwrap_or(&[]);
                 let (pu, pv) = pred.split_at(area.min(pred.len()));
@@ -2436,13 +2463,34 @@ impl Tile {
         let y = ((mi_row - self.band_mi_row) * MI) >> sub;
         let have_left = self.avail_left(mi_col);
         let have_above = self.avail_up(mi_row);
+        // The spec's `get_filter_type`: whether the block above or left
+        // is smooth; for chroma, of the 8x8 the region is, the block
+        // with chroma past its above-right or below-left corner.
+        let (above_modes, left_modes, col, row) = if plane == 0 {
+            (
+                &self.contexts.above_mode,
+                &self.contexts.left_mode,
+                mi_col,
+                mi_row,
+            )
+        } else {
+            (
+                &self.contexts.above_uv_mode,
+                &self.contexts.left_uv_mode,
+                mi_col + 1,
+                mi_row + 1,
+            )
+        };
+        let smooth_at = |modes: &[u8], i: usize| modes.get(i).copied().is_some_and(is_smooth);
+        let smooth = (have_above && smooth_at(above_modes, col))
+            || (have_left && smooth_at(left_modes, row % SB_MI));
         let mut edges = Edges {
-            w,
-            h,
             have_above,
             have_left,
-            above: [128; 65],
-            left: [128; 65],
+            n_above: 0,
+            n_left: 0,
+            smooth,
+            ..Edges::new(w, h, [128; 65], [128; 65])
         };
         let Some(band) = self.recon.get(plane) else {
             return edges;
@@ -2460,6 +2508,12 @@ impl Tile {
             .min(self.width >> sub)
             - 1;
         let max_y = ((self.mi_rows * MI) >> sub) - 1 - ((self.band_mi_row * MI) >> sub);
+        if have_above {
+            edges.n_above = w.min(max_x + 1 - x);
+        }
+        if have_left {
+            edges.n_left = h.min(max_y + 1 - y);
+        }
         // Band rows are the plane's rows plus one: row 0 is the row above.
         let px = |xx: usize, band_row: usize| band.at(xx, band_row);
         let Edges { above, left, .. } = &mut edges;
@@ -3104,9 +3158,11 @@ impl Tile {
         let Contexts {
             above_skip,
             above_mode,
+            above_uv_mode,
             above_width_log2,
             left_skip,
             left_mode,
+            left_uv_mode,
             left_height_log2,
             ..
         } = &mut self.contexts;
@@ -3131,6 +3187,14 @@ impl Tile {
             *skip = u8::from(leaf.skip);
             *mode = leaf.y_mode;
             *height = (at.h_log2 - 2) as u8;
+        }
+        if at.chroma().is_some() {
+            above_uv_mode
+                .iter_mut()
+                .skip(mi_col)
+                .take(w4)
+                .chain(left_uv_mode.iter_mut().skip(sb_row).take(h4))
+                .for_each(|mode| *mode = leaf.uv_mode);
         }
     }
 
@@ -3408,8 +3472,249 @@ struct Edges {
     h: usize,
     have_above: bool,
     have_left: bool,
+    /// How many of the block's `w` above and `h` left pixels are inside
+    /// the mode-info grid, none where the edge is unavailable: where the
+    /// spec's edge filter stops (`numPx`).
+    n_above: usize,
+    n_left: usize,
+    /// The spec's `filterType`: a neighbour is smooth.
+    smooth: bool,
     above: [u8; 65],
     left: [u8; 65],
+}
+
+impl Edges {
+    fn new(w: usize, h: usize, above: [u8; 65], left: [u8; 65]) -> Edges {
+        Edges {
+            w,
+            h,
+            have_above: true,
+            have_left: true,
+            n_above: w,
+            n_left: h,
+            smooth: false,
+            above,
+            left,
+        }
+    }
+}
+
+/// A directional mode's edges, filtered and upsampled (spec 7.11.2.4
+/// with `enable_intra_edge_filter`), those its key changes:
+/// `above[2 + i]` is `AboveRow[i]`, down to the upsampled
+/// `AboveRow[-2]`, the same for the left column.
+struct DrEdges {
+    above: [u8; 66],
+    left: [u8; 66],
+}
+
+/// The spec's `Intra_Edge_Kernel`, by strength less one.
+const EDGE_KERNELS: [[u16; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
+
+/// The spec's `intra_edge_filter_strength_selection` for a block whose
+/// sides sum to `wh`, its angle `delta` degrees from the edge's normal.
+fn edge_strength(wh: usize, delta: i32, smooth: bool) -> usize {
+    let d = delta.abs();
+    let steps: &[(i32, usize)] = match (smooth, wh) {
+        (false, ..=8) => &[(56, 1)],
+        (false, ..=16) => &[(40, 1)],
+        (false, ..=24) => &[(8, 1), (16, 2), (32, 3)],
+        (false, ..=32) => &[(1, 1), (4, 2), (32, 3)],
+        (false, _) => &[(1, 3)],
+        (true, ..=8) => &[(40, 1), (64, 2)],
+        (true, ..=16) => &[(20, 1), (48, 2)],
+        (true, ..=24) => &[(4, 3)],
+        (true, _) => &[(1, 3)],
+    };
+    steps
+        .iter()
+        .take_while(|&&(from, _)| d >= from)
+        .last()
+        .map_or(0, |&(_, strength)| strength)
+}
+
+/// The spec's `intra_edge_upsample_selection`.
+fn edge_upsamples(wh: usize, delta: i32, smooth: bool) -> bool {
+    let d = delta.abs();
+    d > 0 && d < 40 && wh <= if smooth { 8 } else { 16 }
+}
+
+/// The spec's intra edge filter (7.11.2.12) over `edge[..len]`, the
+/// corner first, which it keeps.
+fn filter_edge(edge: &mut [u8], len: usize, strength: usize) {
+    let Some(&[k0, k1, k2, k3, k4]) = strength.checked_sub(1).and_then(|k| EDGE_KERNELS.get(k))
+    else {
+        return;
+    };
+    let len = len.min(edge.len());
+    let (Some(&first), Some(&last)) = (edge.first(), len.checked_sub(1).and_then(|i| edge.get(i)))
+    else {
+        return;
+    };
+    // The edge with each end twice more, so that every tap reads in it.
+    let mut padded = [0u16; 70];
+    let values = [first; 2]
+        .into_iter()
+        .chain(edge.iter().take(len).copied())
+        .chain([last; 2]);
+    for (slot, v) in padded.iter_mut().zip(values) {
+        *slot = u16::from(v);
+    }
+    // Tap `j` of pixel `i` reads `padded[i + j]`: five shifted runs.
+    let run = |j: usize| padded.get(j + 1..).unwrap_or(&[]).iter();
+    let taps = run(0).zip(run(1)).zip(run(2)).zip(run(3)).zip(run(4));
+    for (slot, ((((a, b), c), d), e)) in edge.iter_mut().take(len).skip(1).zip(taps) {
+        *slot = ((k0 * a + k1 * b + k2 * c + k3 * d + k4 * e + 8) >> 4) as u8;
+    }
+}
+
+/// The spec's intra edge upsample (7.11.2.11) of an edge's `n` pixels
+/// past its corner, `edge[1]`, into `2 * n` from `edge[0]`.
+fn upsample_edge(edge: &mut [u8; 66], n: usize) {
+    let at = |edge: &[u8; 66], i: usize| i32::from(edge.get(i).copied().unwrap_or(0));
+    // `edge_upsamples` keeps `n` to 16.
+    let mut dup = [0i32; 19];
+    let corner = at(edge, 1);
+    for (i, slot) in dup.iter_mut().enumerate().take(n + 3) {
+        *slot = match i {
+            0 | 1 => corner,
+            _ if i == n + 2 => at(edge, n + 1),
+            _ => at(edge, i),
+        };
+    }
+    if let Some(slot) = edge.get_mut(0) {
+        *slot = corner as u8;
+    }
+    for i in 0..n {
+        let d = |k: usize| dup.get(i + k).copied().unwrap_or(0);
+        let s = (-d(0) + 9 * d(1) + 9 * d(2) - d(3) + 8) >> 4;
+        if let Some(slot) = edge.get_mut(2 * i + 1) {
+            *slot = s.clamp(0, 255) as u8;
+        }
+        if let Some(slot) = edge.get_mut(2 * i + 2) {
+            *slot = d(2) as u8;
+        }
+    }
+}
+
+/// What a directional angle does to a block's edges (spec 7.11.2.4):
+/// whether it filters the corner, each edge's filter strength and the
+/// pixels it filters from the corner, and how many each upsamples.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct DrKey {
+    corner: bool,
+    filter_above: (u8, u8),
+    filter_left: (u8, u8),
+    up_above: u8,
+    up_left: u8,
+}
+
+impl DrKey {
+    fn changes_above(self) -> bool {
+        self.corner || self.filter_above.0 > 0 || self.up_above > 0
+    }
+
+    fn changes_left(self) -> bool {
+        self.corner || self.filter_left.0 > 0 || self.up_left > 0
+    }
+
+    /// The angle's, the default where the edges stay the block's own.
+    fn new(edges: &Edges, angle: i32) -> DrKey {
+        if angle == 90 || angle == 180 {
+            return DrKey::default();
+        }
+        let (w, h, smooth) = (edges.w, edges.h, edges.smooth);
+        let (need_above, need_left) = (angle < 180, angle > 90);
+        let filter = |need: bool, n: usize, delta: i32, extra: usize| {
+            let strength = if need && n > 0 {
+                edge_strength(w + h, delta, smooth)
+            } else {
+                0
+            };
+            if strength > 0 {
+                (strength as u8, (n + 1 + extra) as u8)
+            } else {
+                (0, 0)
+            }
+        };
+        let up = |need: bool, delta: i32, n: usize| {
+            if need && edge_upsamples(w + h, delta, smooth) {
+                n as u8
+            } else {
+                0
+            }
+        };
+        DrKey {
+            corner: need_above && need_left && w + h >= 24,
+            filter_above: filter(
+                need_above,
+                edges.n_above,
+                angle - 90,
+                if angle < 90 { h } else { 0 },
+            ),
+            filter_left: filter(
+                need_left,
+                edges.n_left,
+                angle - 180,
+                if angle > 180 { w } else { 0 },
+            ),
+            up_above: up(need_above, angle - 90, w + if angle < 90 { h } else { 0 }),
+            up_left: up(need_left, angle - 180, h + if angle > 180 { w } else { 0 }),
+        }
+    }
+}
+
+impl DrEdges {
+    /// The block's edges as the key has them, those it changes.
+    fn new(edges: &Edges, key: DrKey) -> DrEdges {
+        let mut dr = DrEdges {
+            above: [0; 66],
+            left: [0; 66],
+        };
+        let (above, left) = (&edges.above, &edges.left);
+        // What a prediction reads: to `AboveRow[w + h - 1]` from the
+        // corner.
+        for (changed, to, from) in [
+            (key.changes_above(), &mut dr.above, above),
+            (key.changes_left(), &mut dr.left, left),
+        ] {
+            if changed {
+                for (slot, &v) in to
+                    .iter_mut()
+                    .skip(1)
+                    .zip(from.iter())
+                    .take(edges.w + edges.h + 1)
+                {
+                    *slot = v;
+                }
+            }
+        }
+        if key.corner {
+            let px = |edge: &[u8; 65], i: usize| u32::from(edge.get(i).copied().unwrap_or(0));
+            let s = (5 * px(left, 1) + 6 * px(above, 0) + 5 * px(above, 1) + 8) >> 4;
+            for edge in [&mut dr.above, &mut dr.left] {
+                if let Some(corner) = edge.get_mut(1) {
+                    *corner = s as u8;
+                }
+            }
+        }
+        for ((strength, len), edge) in [
+            (key.filter_above, &mut dr.above),
+            (key.filter_left, &mut dr.left),
+        ] {
+            filter_edge(
+                edge.get_mut(1..).unwrap_or(&mut []),
+                usize::from(len),
+                usize::from(strength),
+            );
+        }
+        for (n, edge) in [(key.up_above, &mut dr.above), (key.up_left, &mut dr.left)] {
+            if n > 0 {
+                upsample_edge(edge, usize::from(n));
+            }
+        }
+        dr
+    }
 }
 
 /// Fills a block `w` across row by row with `value(i, j)`, clamped to a
@@ -3423,8 +3728,14 @@ fn fill(out: &mut [u8], w: usize, value: impl Fn(usize, usize) -> i32) {
 }
 
 /// The spec's prediction of a `w` by `h` block from the edges, a
-/// directional mode's angle moved by `delta` steps of three degrees.
-fn predict_block(mode: u8, delta: i8, edges: &Edges, out: &mut [u8]) {
+/// directional mode's angle moved by `delta` steps of three degrees and,
+/// unless `filtered` is false, its edges through the intra edge filter:
+/// the screen's cheaper estimate, which a trial predicts again exactly.
+fn predict_block(mode: u8, delta: i8, edges: &Edges, filtered: bool, out: &mut [u8]) {
+    if is_directional(mode) {
+        predict_directional(mode, delta, edges, filtered, out);
+        return;
+    }
     let Edges {
         w,
         h,
@@ -3432,6 +3743,7 @@ fn predict_block(mode: u8, delta: i8, edges: &Edges, out: &mut [u8]) {
         have_left,
         ref above,
         ref left,
+        ..
     } = *edges;
     let a = |i: isize| i32::from(above.get((i + 1) as usize).copied().unwrap_or(128));
     let l = |i: isize| i32::from(left.get((i + 1) as usize).copied().unwrap_or(128));
@@ -3494,89 +3806,144 @@ fn predict_block(mode: u8, delta: i8, edges: &Edges, out: &mut [u8]) {
                 }
             });
         }
-        _ => {
-            let angle = mode_angle(mode) + 3 * i32::from(delta);
-            let round5 = |v: i32| (v + 16) >> 5;
-            // Past the edge's last pixel, `AboveRow[w + h - 1]` or
-            // `LeftCol[w + h - 1]`, a line holds it.
-            let max_base = w + h - 1;
-            if angle == 90 {
-                if let Some(top) = above.get(1..=w) {
-                    for row in out.chunks_exact_mut(w) {
-                        row.copy_from_slice(top);
-                    }
-                }
-            } else if angle == 180 {
-                for (row, &side) in out.chunks_exact_mut(w).zip(left.iter().skip(1)) {
-                    row.fill(side);
-                }
-            } else if angle < 90 {
-                // Row by row from the above edge: the step between two
-                // pixels is the row's.
-                let dx = derivative(angle);
-                let last = above.get(max_base + 1).copied().unwrap_or(128);
-                for (i, row) in out.chunks_exact_mut(w).enumerate() {
-                    let idx = (i as i32 + 1) * dx;
-                    let base = (idx >> 6) as usize;
-                    let (inner, outer) = row.split_at_mut(max_base.saturating_sub(base).min(w));
-                    blend(
-                        inner,
-                        above.get(base + 1..).unwrap_or(&[]),
-                        (idx >> 1) & 0x1F,
-                    );
-                    outer.fill(last);
-                }
-            } else if angle < 180 {
-                // Each row reads the above edge from the column where its
-                // projection meets it, at one step, and the left edge
-                // before that.
-                let dx = derivative(180 - angle);
-                let dy = derivative(angle - 90);
-                for (i, row) in out.chunks_exact_mut(w).enumerate() {
-                    let back = -(i as i32 + 1) * dx;
-                    let first = (-1 - (back >> 6)).clamp(0, w as i32) as usize;
-                    let (by_left, by_above) = row.split_at_mut(first);
-                    // The above part begins where the row's projection
-                    // meets the corner, `AboveRow[-1]`.
-                    blend(by_above, above, (back >> 1) & 0x1F);
-                    for (j, slot) in by_left.iter_mut().enumerate() {
-                        let idx = ((i as i32) << 6) - (j as i32 + 1) * dy;
-                        let base = (idx >> 6) as isize;
-                        let shift = (idx >> 1) & 0x1F;
-                        *slot = round5(l(base) * (32 - shift) + l(base + 1) * shift) as u8;
-                    }
-                }
-            } else {
-                // Column by column from the left edge, as rows are from
-                // the above one.
-                let dy = derivative(270 - angle);
-                let last = left.get(max_base + 1).copied().unwrap_or(128);
-                let mut column = [0u8; 64];
-                for j in 0..w {
-                    let idx = (j as i32 + 1) * dy;
-                    let base = (idx >> 6) as usize;
-                    let line = column.get_mut(..h).unwrap_or(&mut []);
-                    let (inner, outer) = line.split_at_mut(max_base.saturating_sub(base).min(h));
-                    blend(
-                        inner,
-                        left.get(base + 1..).unwrap_or(&[]),
-                        (idx >> 1) & 0x1F,
-                    );
-                    outer.fill(last);
-                    for (slot, &v) in out.iter_mut().skip(j).step_by(w).zip(column.iter()) {
-                        *slot = v;
-                    }
-                }
+        _ => {}
+    }
+}
+
+/// `predict_block` for a directional mode, from the edges its angle
+/// filters and upsamples.
+fn predict_directional(mode: u8, delta: i8, edges: &Edges, filtered: bool, out: &mut [u8]) {
+    /// The edge from the entry `lead` past `k`, where `lead` is the
+    /// entry of `AboveRow[0]` or `LeftCol[0]`.
+    fn from(edge: &[u8], lead: i32, k: i32) -> &[u8] {
+        usize::try_from(k + lead)
+            .ok()
+            .and_then(|i| edge.get(i..))
+            .unwrap_or(&[])
+    }
+    let (w, h) = (edges.w, edges.h);
+    let angle = mode_angle(mode) + 3 * i32::from(delta);
+    if angle == 90 {
+        if let Some(top) = edges.above.get(1..=w) {
+            for row in out.chunks_exact_mut(w) {
+                row.copy_from_slice(top);
+            }
+        }
+        return;
+    }
+    if angle == 180 {
+        for (row, &side) in out.chunks_exact_mut(w).zip(edges.left.iter().skip(1)) {
+            row.fill(side);
+        }
+        return;
+    }
+    let key = if filtered {
+        DrKey::new(edges, angle)
+    } else {
+        DrKey::default()
+    };
+    let dr = (key != DrKey::default()).then(|| DrEdges::new(edges, key));
+    // Each edge, the entry of its pixel 0, and whether it is upsampled:
+    // then a pixel's step along it is two entries, a position's
+    // fraction a 32nd, and its extent twice as far.
+    let (above, lead_above, ua): (&[u8], i32, i32) = match &dr {
+        Some(dr) if key.changes_above() => (&dr.above, 2, i32::from(key.up_above > 0)),
+        _ => (&edges.above, 1, 0),
+    };
+    let (left, lead_left, ul): (&[u8], i32, i32) = match &dr {
+        Some(dr) if key.changes_left() => (&dr.left, 2, i32::from(key.up_left > 0)),
+        _ => (&edges.left, 1, 0),
+    };
+    // Past the edge's last pixel, `AboveRow[w + h - 1]` or
+    // `LeftCol[w + h - 1]`, a line holds it.
+    let max_base = (w + h) as i32 - 1;
+    // How many of a line's `n` pixels from `base` fall before the edge's
+    // last, at steps of `1 << up`.
+    let inside = |base: i32, up: i32, n: usize| {
+        (((max_base << up) - base + (1 << up) - 1) >> up).clamp(0, n as i32) as usize
+    };
+    let last = |edge: &[u8], lead: i32, up: i32| {
+        from(edge, lead, max_base << up)
+            .first()
+            .copied()
+            .unwrap_or(128)
+    };
+    if angle < 90 {
+        // Row by row from the above edge: the step between two
+        // pixels is the row's.
+        let dx = derivative(angle);
+        let last = last(above, lead_above, ua);
+        for (i, row) in out.chunks_exact_mut(w).enumerate() {
+            let x = (i as i32 + 1) * dx;
+            let base = x >> (6 - ua);
+            let (inner, outer) = row.split_at_mut(inside(base, ua, w));
+            blend(
+                inner,
+                from(above, lead_above, base),
+                ((x << ua) & 0x3F) >> 1,
+                ua,
+            );
+            outer.fill(last);
+        }
+    } else if angle < 180 {
+        // Each row reads the above edge from the column where its
+        // projection meets it, at one step, and the left edge
+        // before that.
+        let dx = derivative(180 - angle);
+        let dy = derivative(angle - 90);
+        for (i, row) in out.chunks_exact_mut(w).enumerate() {
+            let back = -(i as i32 + 1) * dx;
+            let first = (-1 - (back >> 6)).clamp(0, w as i32);
+            let (by_left, by_above) = row.split_at_mut(first as usize);
+            // The above part begins at or just past the corner.
+            let x = (first << 6) + back;
+            let shift = ((x << ua) & 0x3F) >> 1;
+            blend(by_above, from(above, lead_above, x >> (6 - ua)), shift, ua);
+            for (j, slot) in by_left.iter_mut().enumerate() {
+                let y = ((i as i32) << 6) - (j as i32 + 1) * dy;
+                // One pixel reads one pair, whatever the edge's step.
+                let pair = from(left, lead_left, y >> (6 - ul));
+                blend(std::slice::from_mut(slot), pair, ((y << ul) & 0x3F) >> 1, 0);
+            }
+        }
+    } else {
+        // Column by column from the left edge, as rows are from
+        // the above one.
+        let dy = derivative(270 - angle);
+        let last = last(left, lead_left, ul);
+        let mut column = [0u8; 64];
+        for j in 0..w {
+            let y = (j as i32 + 1) * dy;
+            let base = y >> (6 - ul);
+            let line = column.get_mut(..h).unwrap_or(&mut []);
+            let (inner, outer) = line.split_at_mut(inside(base, ul, h));
+            blend(
+                inner,
+                from(left, lead_left, base),
+                ((y << ul) & 0x3F) >> 1,
+                ul,
+            );
+            outer.fill(last);
+            for (slot, &v) in out.iter_mut().skip(j).step_by(w).zip(column.iter()) {
+                *slot = v;
             }
         }
     }
 }
 
-/// `out[j]` the edge's `edge[j]` and `edge[j + 1]` mixed `32 - shift`
-/// to `shift` in 32nds, rounded: a directional prediction's line.
-fn blend(out: &mut [u8], edge: &[u8], shift: i32) {
-    for (slot, (&p, &q)) in out.iter_mut().zip(edge.iter().zip(edge.iter().skip(1))) {
-        *slot = ((i32::from(p) * (32 - shift) + i32::from(q) * shift + 16) >> 5) as u8;
+/// `out[j]` the edge's `edge[j << up]` and the entry after it mixed
+/// `32 - shift` to `shift` in 32nds, rounded: a directional prediction's
+/// line, along an edge upsampled (`up` 1) or not.
+fn blend(out: &mut [u8], edge: &[u8], shift: i32, up: i32) {
+    let mix = |p: u8, q: u8| ((i32::from(p) * (32 - shift) + i32::from(q) * shift + 16) >> 5) as u8;
+    if up == 0 {
+        for (slot, (&p, &q)) in out.iter_mut().zip(edge.iter().zip(edge.iter().skip(1))) {
+            *slot = mix(p, q);
+        }
+    } else {
+        for (slot, &[p, q]) in out.iter_mut().zip(edge.as_chunks::<2>().0) {
+            *slot = mix(p, q);
+        }
     }
 }
 
@@ -4296,87 +4663,260 @@ mod tests {
         },
     ];
 
-    /// The spec's directional prediction pixel by pixel (7.11.2.4, with
-    /// no edge filter or upsampling), which `predict_block` computes a
-    /// line at a time.
-    fn directional_by_pixel(
-        angle: i32,
-        (w, h): (usize, usize),
-        above: &[u8; 65],
-        left: &[u8; 65],
-    ) -> Vec<u8> {
-        // An index before the corner panics: the spec never reads one.
-        let a = |i: isize| i32::from(above[usize::try_from(i + 1).unwrap()]);
-        let l = |i: isize| i32::from(left[usize::try_from(i + 1).unwrap()]);
-        let round5 = |v: i32| (v + 16) >> 5;
-        let max_base = (w + h) as isize - 1;
-        let mut out = vec![0; w * h];
-        fill(&mut out, w, |i, j| {
-            let (i, j) = (i as i32, j as i32);
-            if angle < 90 {
-                let idx = (i + 1) * derivative(angle);
-                let (base, shift) = ((idx >> 6) as isize + j as isize, (idx >> 1) & 0x1F);
-                if base < max_base {
-                    round5(a(base) * (32 - shift) + a(base + 1) * shift)
-                } else {
-                    a(max_base)
+    /// libaom's directional prediction as written (`reconintra.c`:
+    /// `build_directional_and_filter_intra_predictors` from its edges on,
+    /// then `dr_prediction_z1` to `z3`), pixel by pixel, to hold
+    /// `predict_block` to. It keeps libaom's shape, repeated branches
+    /// and copies too.
+    #[allow(clippy::if_same_then_else, clippy::manual_memcpy)]
+    fn libaom_directional(angle: i32, edges: &Edges, (n_top_px, n_left_px): (i32, i32)) -> Vec<u8> {
+        let (w, h) = (edges.w as i32, edges.h as i32);
+        let smooth = i32::from(edges.smooth);
+        let strength = |bs0: i32, bs1: i32, delta: i32, ty: i32| {
+            let d = delta.abs();
+            let mut strength = 0;
+            let blk_wh = bs0 + bs1;
+            if ty == 0 {
+                if blk_wh <= 8 {
+                    if d >= 56 {
+                        strength = 1;
+                    }
+                } else if blk_wh <= 12 {
+                    if d >= 40 {
+                        strength = 1;
+                    }
+                } else if blk_wh <= 16 {
+                    if d >= 40 {
+                        strength = 1;
+                    }
+                } else if blk_wh <= 24 {
+                    if d >= 8 {
+                        strength = 1;
+                    }
+                    if d >= 16 {
+                        strength = 2;
+                    }
+                    if d >= 32 {
+                        strength = 3;
+                    }
+                } else if blk_wh <= 32 {
+                    if d >= 1 {
+                        strength = 1;
+                    }
+                    if d >= 4 {
+                        strength = 2;
+                    }
+                    if d >= 32 {
+                        strength = 3;
+                    }
+                } else if d >= 1 {
+                    strength = 3;
                 }
-            } else if angle < 180 {
-                let idx = (j << 6) - (i + 1) * derivative(180 - angle);
-                if idx >> 6 >= -1 {
-                    let (base, shift) = ((idx >> 6) as isize, (idx >> 1) & 0x1F);
-                    round5(a(base) * (32 - shift) + a(base + 1) * shift)
-                } else {
-                    let idx = (i << 6) - (j + 1) * derivative(angle - 90);
-                    let (base, shift) = ((idx >> 6) as isize, (idx >> 1) & 0x1F);
-                    round5(l(base) * (32 - shift) + l(base + 1) * shift)
+            } else if blk_wh <= 8 {
+                if d >= 40 {
+                    strength = 1;
                 }
-            } else {
-                let idx = (j + 1) * derivative(270 - angle);
-                let (base, shift) = ((idx >> 6) as isize + i as isize, (idx >> 1) & 0x1F);
-                if base < max_base {
-                    round5(l(base) * (32 - shift) + l(base + 1) * shift)
-                } else {
-                    l(max_base)
+                if d >= 64 {
+                    strength = 2;
                 }
+            } else if blk_wh <= 16 {
+                if d >= 20 {
+                    strength = 1;
+                }
+                if d >= 48 {
+                    strength = 2;
+                }
+            } else if blk_wh <= 24 {
+                if d >= 4 {
+                    strength = 3;
+                }
+            } else if d >= 1 {
+                strength = 3;
             }
-        });
+            strength
+        };
+        let use_upsample = |bs0: i32, bs1: i32, delta: i32, ty: i32| {
+            let d = delta.abs();
+            let blk_wh = bs0 + bs1;
+            if d == 0 || d >= 40 {
+                return false;
+            }
+            if ty != 0 {
+                blk_wh <= 8
+            } else {
+                blk_wh <= 16
+            }
+        };
+        let filter = |p: &mut [i32], at: usize, sz: i32, strength: i32| {
+            if strength == 0 {
+                return;
+            }
+            let kernel = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]][strength as usize - 1];
+            let edge: Vec<i32> = p[at..at + sz as usize].to_vec();
+            for i in 1..sz {
+                let mut s = 0;
+                for j in 0..5 {
+                    let k = (i - 2 + j).clamp(0, sz - 1);
+                    s += edge[k as usize] * kernel[j as usize];
+                }
+                p[at + i as usize] = (s + 8) >> 4;
+            }
+        };
+        let upsample = |p: &mut [i32], at: usize, sz: i32| {
+            let sz = sz as usize;
+            let mut input = vec![0; sz + 3];
+            input[0] = p[at - 1];
+            input[1] = p[at - 1];
+            for i in 0..sz {
+                input[i + 2] = p[at + i];
+            }
+            input[sz + 2] = p[at + sz - 1];
+            p[at - 2] = input[0];
+            for i in 0..sz {
+                let s = -input[i] + 9 * input[i + 1] + 9 * input[i + 2] - input[i + 3];
+                p[at + 2 * i - 1] = ((s + 8) >> 4).clamp(0, 255);
+                p[at + 2 * i] = input[i + 2];
+            }
+        };
+        const AT: usize = 16;
+        let mut above = vec![0i32; AT + 160];
+        let mut left = vec![0i32; AT + 160];
+        for i in 0..65 {
+            above[AT - 1 + i] = i32::from(edges.above[i]);
+            left[AT - 1 + i] = i32::from(edges.left[i]);
+        }
+        let need_above = angle < 180;
+        let need_left = angle > 90;
+        let (mut upsample_above, mut upsample_left) = (0, 0);
+        let need_right = angle < 90;
+        let need_bottom = angle > 180;
+        if angle != 90 && angle != 180 {
+            if need_above && need_left && w + h >= 24 {
+                let s = (left[AT] * 5 + above[AT - 1] * 6 + above[AT] * 5 + 8) >> 4;
+                above[AT - 1] = s;
+                left[AT - 1] = s;
+            }
+            if need_above && n_top_px > 0 {
+                let strength = strength(w, h, angle - 90, smooth);
+                let n_px = n_top_px + 1 + if need_right { h } else { 0 };
+                filter(&mut above, AT - 1, n_px, strength);
+            }
+            if need_left && n_left_px > 0 {
+                let strength = strength(h, w, angle - 180, smooth);
+                let n_px = n_left_px + 1 + if need_bottom { w } else { 0 };
+                filter(&mut left, AT - 1, n_px, strength);
+            }
+        }
+        if use_upsample(w, h, angle - 90, smooth) && need_above {
+            upsample_above = 1;
+            upsample(&mut above, AT, w + if need_right { h } else { 0 });
+        }
+        if use_upsample(h, w, angle - 180, smooth) && need_left {
+            upsample_left = 1;
+            upsample(&mut left, AT, h + if need_bottom { w } else { 0 });
+        }
+        let a = |i: i32| above[(AT as i32 + i) as usize];
+        let l = |i: i32| left[(AT as i32 + i) as usize];
+        let mut out = vec![0u8; (w * h) as usize];
+        for r in 0..h {
+            for c in 0..w {
+                let val = if angle == 90 {
+                    a(c)
+                } else if angle == 180 {
+                    l(r)
+                } else if angle < 90 {
+                    let max_base_x = (w + h - 1) << upsample_above;
+                    let x = (r + 1) * derivative(angle);
+                    let base = (x >> (6 - upsample_above)) + (c << upsample_above);
+                    let shift = ((x << upsample_above) & 0x3F) >> 1;
+                    if base < max_base_x {
+                        (a(base) * (32 - shift) + a(base + 1) * shift + 16) >> 5
+                    } else {
+                        a(max_base_x)
+                    }
+                } else if angle < 180 {
+                    let x = (c << 6) - (r + 1) * derivative(180 - angle);
+                    let base_x = x >> (6 - upsample_above);
+                    if base_x >= -(1 << upsample_above) {
+                        let shift = ((x * (1 << upsample_above)) & 0x3F) >> 1;
+                        (a(base_x) * (32 - shift) + a(base_x + 1) * shift + 16) >> 5
+                    } else {
+                        let y = (r << 6) - (c + 1) * derivative(angle - 90);
+                        let base_y = y >> (6 - upsample_left);
+                        let shift = ((y * (1 << upsample_left)) & 0x3F) >> 1;
+                        (l(base_y) * (32 - shift) + l(base_y + 1) * shift + 16) >> 5
+                    }
+                } else {
+                    let max_base_y = (w + h - 1) << upsample_left;
+                    let y = (c + 1) * derivative(270 - angle);
+                    let base = (y >> (6 - upsample_left)) + (r << upsample_left);
+                    let shift = ((y << upsample_left) & 0x3F) >> 1;
+                    if base < max_base_y {
+                        (l(base) * (32 - shift) + l(base + 1) * shift + 16) >> 5
+                    } else {
+                        l(max_base_y)
+                    }
+                };
+                out[(r * w + c) as usize] = val as u8;
+            }
+        }
         out
     }
 
     #[test]
-    fn the_directional_lines_are_the_spec_pixel_by_pixel() {
+    fn the_directional_predictions_are_libaoms() {
         let mut rng = Lcg(7);
+        let mut upsampled = 0;
         for (w, h) in SHAPES {
-            for _ in 0..8 {
+            for round in 0..24 {
                 let mut above = [0u8; 65];
                 let mut left = [0u8; 65];
                 for v in above.iter_mut().chain(left.iter_mut()) {
                     *v = rng.next() as u8;
                 }
                 left[0] = above[0];
+                // Every availability, neighbours smooth or not, and edges
+                // the frame cuts short, past which `pred_edges` repeats
+                // the last pixel and libaom filters none.
+                let (have_above, have_left) = (round % 4 != 1, round % 4 != 2);
+                let mut short = |have: bool, n: usize, edge: &mut [u8; 65]| {
+                    let inside = match (have, round % 3) {
+                        (false, _) => 0,
+                        (true, 0) => 1 + rng.next() as usize % n,
+                        _ => n,
+                    };
+                    if (1..n).contains(&inside) {
+                        let last = edge[inside];
+                        edge[inside + 1..].fill(last);
+                    }
+                    inside as i32
+                };
+                let inside = (
+                    short(have_above, w, &mut above),
+                    short(have_left, h, &mut left),
+                );
                 let edges = Edges {
-                    w,
-                    h,
-                    have_above: true,
-                    have_left: true,
-                    above,
-                    left,
+                    have_above,
+                    have_left,
+                    n_above: inside.0 as usize,
+                    n_left: inside.1 as usize,
+                    smooth: round % 2 == 1,
+                    ..Edges::new(w, h, above, left)
                 };
                 let mut out = vec![0; w * h];
                 for mode in V_PRED..=D67_PRED {
                     for delta in -3..=3 {
                         let angle = mode_angle(mode) + 3 * i32::from(delta);
-                        if angle == 90 || angle == 180 {
-                            continue;
-                        }
-                        predict_block(mode, delta, &edges, &mut out);
-                        let want = directional_by_pixel(angle, (w, h), &above, &left);
-                        assert_eq!(out, want, "{w}x{h} {mode} {delta}");
+                        predict_block(mode, delta, &edges, true, &mut out);
+                        let want = libaom_directional(angle, &edges, inside);
+                        assert_eq!(out, want, "{w}x{h} {mode} {delta} round {round}");
+                        let key = DrKey::new(&edges, angle);
+                        upsampled += usize::from(key.up_above + key.up_left > 0);
                     }
                 }
             }
         }
+        assert!(upsampled > 0);
     }
 
     #[test]
@@ -4389,69 +4929,49 @@ mod tests {
         }
         above[0] = 77;
         left[0] = 77;
-        let edges = |have_above, have_left| Edges {
-            w: 4,
-            h: 4,
+        let edges = |have_above: bool, have_left: bool| Edges {
             have_above,
             have_left,
-            above,
-            left,
+            n_above: if have_above { 4 } else { 0 },
+            n_left: if have_left { 4 } else { 0 },
+            ..Edges::new(4, 4, above, left)
         };
         let mut out = [0u8; 16];
-        predict_block(V_PRED, 0, &edges(true, true), &mut out);
+        predict_block(V_PRED, 0, &edges(true, true), true, &mut out);
         assert_eq!(&out[..4], &above[1..5]);
         assert_eq!(&out[12..], &above[1..5]);
-        predict_block(H_PRED, 0, &edges(true, true), &mut out);
+        predict_block(H_PRED, 0, &edges(true, true), true, &mut out);
         assert_eq!(out[0], left[1]);
         assert_eq!(out[15], left[4]);
-        predict_block(DC_PRED, 0, &edges(true, true), &mut out);
+        predict_block(DC_PRED, 0, &edges(true, true), true, &mut out);
         let sum: u32 = above[1..5]
             .iter()
             .chain(&left[1..5])
             .map(|&v| u32::from(v))
             .sum();
         assert!(out.iter().all(|&v| u32::from(v) == (sum + 4) / 8));
-        predict_block(DC_PRED, 0, &edges(false, false), &mut out);
+        predict_block(DC_PRED, 0, &edges(false, false), true, &mut out);
         assert!(out.iter().all(|&v| v == 128));
-        predict_block(DC_PRED, 0, &edges(false, true), &mut out);
+        predict_block(DC_PRED, 0, &edges(false, true), true, &mut out);
         let sum: u32 = left[1..5].iter().map(|&v| u32::from(v)).sum();
         assert!(out.iter().all(|&v| u32::from(v) == (sum + 2) / 4));
         // D45 walks up and right: row i, column j is AboveRow[i + j + 1].
-        predict_block(D45_PRED, 0, &edges(true, true), &mut out);
+        predict_block(D45_PRED, 0, &edges(true, true), true, &mut out);
         for i in 0..4 {
             for j in 0..4 {
                 assert_eq!(out[i * 4 + j], above[i + j + 2], "{i} {j}");
             }
         }
         // D135 walks down and right from the corner.
-        predict_block(D135_PRED, 0, &edges(true, true), &mut out);
+        predict_block(D135_PRED, 0, &edges(true, true), true, &mut out);
         for i in 0..4 {
             for j in 0..4 {
                 let want = if j >= i { above[j - i] } else { left[i - j] };
                 assert_eq!(out[i * 4 + j], want, "{i} {j}");
             }
         }
-        // An angle delta turns the mode: V at 87 degrees leans a thirty-
-        // second a row towards the above-right, so on the edge's ramp of
-        // 3 its fourth row rounds up by one; H at 189 leans a sixth a
-        // column towards the below-left, so past its first column the
-        // falling ramp of 2 rounds down by one.
-        predict_block(V_PRED, -1, &edges(true, true), &mut out);
-        for i in 0..4 {
-            for j in 0..4 {
-                let want = above[j + 1] + u8::from(i == 3);
-                assert_eq!(out[i * 4 + j], want, "{i} {j}");
-            }
-        }
-        predict_block(H_PRED, 3, &edges(true, true), &mut out);
-        for i in 0..4 {
-            for j in 0..4 {
-                let want = left[i + 1] - u8::from(j > 0);
-                assert_eq!(out[i * 4 + j], want, "{i} {j}");
-            }
-        }
         // Paeth picks the neighbour closest to the gradient guess.
-        predict_block(PAETH_PRED, 0, &edges(true, true), &mut out);
+        predict_block(PAETH_PRED, 0, &edges(true, true), true, &mut out);
         let (top, side, corner) = (i32::from(above[1]), i32::from(left[1]), 77);
         let base = top + side - corner;
         let want = if (base - side).abs() <= (base - top).abs()
@@ -4465,7 +4985,7 @@ mod tests {
         };
         assert_eq!(i32::from(out[0]), want);
         // Smooth blends towards the far edges.
-        predict_block(SMOOTH_PRED, 0, &edges(true, true), &mut out);
+        predict_block(SMOOTH_PRED, 0, &edges(true, true), true, &mut out);
         // The weight at the first of four is 255; the rest of 256 goes
         // to the far edge.
         let want = (255 * i32::from(above[1])
@@ -4483,21 +5003,21 @@ mod tests {
             ..edges(have_above, have_left)
         };
         let mut out = [0u8; 32];
-        predict_block(DC_PRED, 0, &wide(true, true), &mut out);
+        predict_block(DC_PRED, 0, &wide(true, true), true, &mut out);
         let sum: u32 = above[1..9]
             .iter()
             .chain(&left[1..5])
             .map(|&v| u32::from(v))
             .sum();
         assert!(out.iter().all(|&v| u32::from(v) == (sum + 6) / 12));
-        predict_block(DC_PRED, 0, &wide(true, false), &mut out);
+        predict_block(DC_PRED, 0, &wide(true, false), true, &mut out);
         let sum: u32 = above[1..9].iter().map(|&v| u32::from(v)).sum();
         assert!(out.iter().all(|&v| u32::from(v) == (sum + 4) / 8));
-        predict_block(SMOOTH_V_PRED, 0, &wide(true, true), &mut out);
+        predict_block(SMOOTH_V_PRED, 0, &wide(true, true), true, &mut out);
         // Row 3 of 4 weighs the above edge 64 of 256, the below-left 192.
         let want = (64 * i32::from(above[8]) + 192 * i32::from(left[4]) + 128) >> 8;
         assert_eq!(i32::from(out[3 * 8 + 7]), want);
-        predict_block(SMOOTH_H_PRED, 0, &wide(true, true), &mut out);
+        predict_block(SMOOTH_H_PRED, 0, &wide(true, true), true, &mut out);
         // Column 7 of 8 weighs the left edge 32 of 256, the above-right
         // 224.
         let want = (32 * i32::from(left[1]) + 224 * i32::from(above[8]) + 128) >> 8;
@@ -4585,6 +5105,30 @@ mod tests {
         assert_eq!(out, [92, 108, 92, 108, 0, 200]);
         cfl_predict(&[250; 6], &ac, 16, &mut out);
         assert_eq!(out[4], 255);
+    }
+
+    #[test]
+    fn the_edge_filter_reads_the_neighbours_the_spec_names() {
+        // Chroma's smooth neighbour above is the block with chroma past its
+        // 8x8's above-right corner, not the one above the corner itself;
+        // a mode left over from the superblock row before is no
+        // neighbour where the left edge is unavailable.
+        let g = Geometry::new(64, 64).unwrap();
+        let mut tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120);
+        let region = At::square(2, 0, 3);
+        for (own, past, want) in [(SMOOTH_PRED, DC_PRED, false), (DC_PRED, SMOOTH_PRED, true)] {
+            tile.contexts.above_uv_mode[0] = own;
+            tile.contexts.above_uv_mode[1] = past;
+            assert_eq!(tile.pred_edges(1, region).smooth, want, "{own} {past}");
+        }
+        tile.contexts.above_uv_mode.fill(DC_PRED);
+        tile.contexts.left_uv_mode.fill(SMOOTH_PRED);
+        tile.contexts.left_mode.fill(SMOOTH_H_PRED);
+        assert!(!tile.pred_edges(1, region).smooth);
+        assert!(!tile.pred_edges(0, region).smooth);
+        let inside = At::square(2, 2, 3);
+        assert!(tile.pred_edges(1, inside).smooth);
+        assert!(tile.pred_edges(0, inside).smooth);
     }
 
     #[test]

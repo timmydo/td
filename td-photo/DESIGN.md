@@ -1263,8 +1263,12 @@ the 8x8's, `HasChroma`), one transform the block's size
 side of 32 may signal any of the four DCT and ADST pairs, chroma's is
 the one its mode implies, `DCT_DCT` with a side of 32), the
 thirteen intra modes, the directional ones with their angle deltas
-in blocks of 8x8 and more (three degrees a step, to nine either way),
-without filter or palette
+in blocks of 8x8 and more (three degrees a step, to nine either way)
+and the intra edge filter (the corner and each edge a directional
+angle reads smoothed by a strength its block's size, its distance from
+the edge's normal and a smooth neighbour select, the smallest blocks'
+edges upsampled near the normal; chroma's neighbour is the block with
+chroma past its 8x8's corner), without filter intra or palette
 and, for chroma, its prediction from the block's luma (each plane's alpha
 the least-squares fit in eighths, it and its neighbours tried by
 squared error), deblocking and CDEF but no restoration, superres or
@@ -1285,7 +1289,10 @@ screened by the 4x4 Hadamard SATD of their predictions plus their mode
 symbols' rate under sixteen times the root of the multiplier (the two
 closest directional modes of luma and the closest of chroma screened
 again at their six other angles, the predictor making each row or
-column one two-tap blend of an edge slice at a fixed step),
+column one two-tap blend of an edge slice at a fixed step, two entries
+a pixel on an upsampled edge; the screen reads the edges unfiltered, an
+estimate a full trial then predicts exactly, which saved two thirds
+of the filter's time for about 0.1%),
 the best three, two under 8x8 (for chroma, one mode for both planes,
 the closest two and the
 prediction from luma if it is not one of them, since the screen ranks
@@ -1353,12 +1360,17 @@ about fifty-four seconds on one thread and eleven to thirteen on eight
 (`tests/av1.rs`'s `bench`, a noisy synthetic picture the blocks under
 8x8 cost half again on and gain nothing; a photo they cost a third
 again). Against libaom's all-intra speed 6 on a real 2048-pixel photo
-the encoder needs about 4% fewer bits for the same luma PSNR from 0.3
-to 3 bits a pixel (as many for RGB) and about 2% more below that,
-where libaom's CDEF chooses strengths by searching each 64x64; what
-libaom's tools measured there leaves the partitions not coded here
-(the halves of a 64, the three- and four-way ones) and transforms
-smaller than their block as the compression follow-up.
+the encoder needs about 4.5% fewer bits for the same luma PSNR from
+0.3 to 3 bits a pixel (1% fewer for RGB) and about 1% more below that.
+libaom leaves CDEF off there; what it has is one tile where this
+encoder cuts that frame into eight columns, which libaom's own ablation
+prices at 4% below 0.3 bits a pixel and 1% above, and which here one
+tile measured at 3.2% and 1.6% for up to four and a half times the
+time on eight threads, since the threads spread only over columns.
+Coding a tile's superblock rows in a wavefront (libaom's row-mt) would
+keep the time: that, the partitions not coded here (the halves of a
+64, the three- and four-way ones) and transforms smaller than their
+block are the compression follow-up.
 Measured before the trellis priced the zeros an end of block passes
 over: zeroing a transform's few levels outright bought luma about 2%
 but cost RGB 3% at low rates, a chroma weight trading one for the
