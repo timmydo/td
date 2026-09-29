@@ -97,7 +97,7 @@ own entry.
 | 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has five pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with twenty-one value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` pinned to one dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region; also the shared private-channel instruction and adoption of §16 |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with twenty-one value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` each pinned to a dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region, which is `Send`; also the shared private-channel instruction and adoption of §16 |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
@@ -829,6 +829,20 @@ What landed, against each budgeted item:
   pinned as naming neither `SYS_MMAP`, `SYS_MUNMAP` nor `from_raw_parts`.
 - `DMA_BUF_IOCTL_SYNC` did NOT arrive and is still named here for when it
   does. Nothing in this increment reads a dmabuf.
+
+One more arrived with the KMS BACKEND, and it is an allowance rather than a
+body: `unsafe impl Send for MappedRegion`. The backend is owned by the
+compositor's runtime, which crosses threads behind its lock, and a raw
+pointer field makes the region `!Send` by default. It is sound for the
+reasons the region type already holds. It is the sole owner of one
+process-wide mapping that is not tied to a thread. Its bytes are reached
+only through `bytes_mut(&mut self)`, so moving the owner moves the only way
+in. And `munmap` from any thread unmaps the same pair. `Sync` is
+deliberately NOT implemented: a shared reference lends nothing, and nothing
+needs one. The confinement test pins the impl by its exact text, the
+allowance count at five, and the absence of `Sync`. It adds no syscall, no
+request and no second construction site; the backend maps two buffers
+through the same `drm_map_dumb`, each owned by its own region.
 
 Two things this increment adds that the anticipation did not name, both
 recorded because they are the kind of detail a plan written in advance

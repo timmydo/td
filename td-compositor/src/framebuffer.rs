@@ -1,5 +1,5 @@
 use crate::output::{
-    Damage, Fourcc, FrameTarget, FrameView, Output, OutputBackend, OutputDimensions, OutputEvent,
+    Damage, Fourcc, FrameId, FrameTarget, FrameView, Output, OutputBackend, OutputDimensions,
     OutputId, OutputScale, OutputTransform, Submission, DRM_FORMAT_XRGB8888,
 };
 #[cfg(test)]
@@ -71,7 +71,11 @@ fn parse_virtual_size(path: &Path) -> Result<(usize, usize), String> {
     Ok((width, height))
 }
 
-fn validate_geometry(width: usize, height: usize, stride: usize) -> Result<usize, String> {
+pub(crate) fn validate_geometry(
+    width: usize,
+    height: usize,
+    stride: usize,
+) -> Result<usize, String> {
     if width == 0 || height == 0 {
         return Err("framebuffer dimensions must be non-zero".into());
     }
@@ -111,7 +115,7 @@ fn validate_geometry(width: usize, height: usize, stride: usize) -> Result<usize
 /// unchanged. Rows, not rectangles: a band is one contiguous write, where
 /// per-row column spans would be one `seek`+`write` pair each and the syscalls
 /// would cost more than the bytes they saved.
-fn damaged_rows(written: &[u8], frame: &[u8], stride: usize) -> Option<(usize, usize)> {
+pub(crate) fn damaged_rows(written: &[u8], frame: &[u8], stride: usize) -> Option<(usize, usize)> {
     if stride == 0 {
         return None;
     }
@@ -403,11 +407,19 @@ impl OutputBackend for Framebuffer {
         Ok(Submission::Presented)
     }
 
-    /// fbdev originates nothing: there is no page flip to complete and no
-    /// hotplug to report, so this appends nothing rather than the method
-    /// being absent.
-    fn poll_events(&mut self, _events: &mut Vec<OutputEvent>) -> Result<(), String> {
-        Ok(())
+    /// fbdev never answers `Queued`, so no completion can be its.
+    fn frame_presented(&mut self, frame: FrameId) -> Result<(), String> {
+        Err(format!(
+            "fbdev queues no frame, so completion {:#x} is not one of its",
+            frame.cookie()
+        ))
+    }
+
+    fn recover_stalled_frame(&mut self, frame: FrameId) -> Result<(), String> {
+        Err(format!(
+            "fbdev queues no frame, so frame {:#x} cannot have stalled on it",
+            frame.cookie()
+        ))
     }
 }
 

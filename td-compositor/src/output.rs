@@ -299,7 +299,7 @@ impl FrameView<'_> {
 
 /// Which frame — minted when one is queued, compared when it completes.
 ///
-/// This is the identity `poll_events` recorded as missing. It is NOT invented
+/// This is the identity a completion is matched on. It is NOT invented
 /// out of band: `DRM_IOCTL_MODE_PAGE_FLIP` takes a `u64 user_data` and the
 /// kernel copies it into the completion event, so the correlation channel is
 /// the ABI's and this newtype is what keeps it from being a bare integer that
@@ -307,7 +307,7 @@ impl FrameView<'_> {
 ///
 /// A backend mints these; nothing else may. That is why there is no
 /// `From<u64>`: a value arriving from the kernel is turned back into one by
-/// `from_cookie` at exactly one place, the completion parser, and a `FrameId`
+/// `from_cookie` only where a completion event is parsed, and a `FrameId`
 /// appearing anywhere else came from a backend that queued a frame.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FrameId(u64);
@@ -337,8 +337,9 @@ impl FrameId {
 
     /// Rebuild an id from a completion's `user_data`.
     ///
-    /// Called from exactly one place, `Flip::frame`, which is what makes the
-    /// paragraph above a property rather than a wish.
+    /// Called only where a completion event has been parsed: `Flip::frame`
+    /// for the probe and `FlipEvents::next` for the backend. That is what
+    /// makes the paragraph above a property rather than a wish.
     pub fn from_cookie(cookie: u64) -> FrameId {
         FrameId(cookie)
     }
@@ -359,24 +360,22 @@ pub enum Submission {
     /// caller with two frames in flight can tell which completion is which,
     /// instead of assuming completions arrive in the order frames were
     /// queued.
-    // Constructed by the KMS backend §M plans, not by fbdev.
-    #[allow(dead_code)]
     Queued(FrameId),
 }
 
 /// Something the backend originates rather than something a caller asked for.
 ///
-/// Nothing consumes these yet, and the allowances below are per-variant so a
-/// third one has to justify itself rather than inheriting an exemption.
+/// The allowance below is per-variant so a third one has to justify itself
+/// rather than inheriting an exemption.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputEvent {
     /// The submission that answered `Queued` with this id reached the screen.
-    #[allow(dead_code)]
     Presented(FrameId),
     /// The mode or connection changed; `output()` must be read again, and
     /// every value computed from a previous one is stale. Not only the
     /// sizes: the scale and the transform are `output()`'s own fields and
-    /// change with it.
+    /// change with it. Nothing originates one yet: the KMS backend drives
+    /// the mode it found at start and does not watch for hotplug.
     #[allow(dead_code)]
     Changed,
 }
@@ -440,36 +439,17 @@ pub trait OutputBackend {
     /// are now visible": the return value says which of the two happened.
     fn present(&mut self) -> Result<Submission, String>;
 
-    /// Backend-originated events since the last call, appended to `events`.
-    ///
-    /// An out-parameter rather than a returned `Vec` so the caller can keep
-    /// one buffer across frames: a KMS backend reports a flip every frame,
-    /// and this is the frame loop.
-    ///
-    /// NOTHING CALLS THIS YET, deliberately. It is on the trait because §M
-    /// names it and because a backend's events must have somewhere to go, but
-    /// the delivery path is not the frame loop's to invent, and an earlier
-    /// draft of this commit got it wrong in a way three reviewers caught:
-    ///
-    /// - a page flip arrives on the card descriptor asynchronously, so
-    ///   draining only from a repaint means an idle screen never observes
-    ///   one — the client waits for a frame callback that waits for a flip
-    ///   completion that waits for a repaint that waits for the client. The
-    ///   descriptor has to join the event loop.
-    /// - a completion drained after submitting frame N could not be told
-    ///   apart from N-1's, because neither `Submission` nor `OutputEvent`
-    ///   carried a frame identity. SOLVED since: both carry a `FrameId`, and
-    ///   it is the `u64` the page-flip ioctl already round-trips through the
-    ///   kernel rather than a correlation invented beside it.
-    /// - `Changed` invalidates everything computed from a previous
-    ///   `output()`, not just the damage: the shadow copy, the frame storage
-    ///   and the layout. The scale and the transform change with it too, and
-    ///   neither is a size.
-    ///
-    /// Writing those down is the point; guessing at the response is what §M
-    /// calls painting into the corner.
-    #[allow(dead_code)]
-    fn poll_events(&mut self, events: &mut Vec<OutputEvent>) -> Result<(), String>;
+    /// The frame this backend answered `Queued(frame)` for reached the
+    /// screen. Told, not asked: completions arrive on a descriptor the
+    /// backend does not read, from a thread of their own, because a flip
+    /// drained only from a repaint is never observed on an idle screen.
+    /// A backend that queues nothing refuses every call.
+    fn frame_presented(&mut self, frame: FrameId) -> Result<(), String>;
+
+    /// The frame queued as `frame` never completed. Put it on glass some
+    /// other way, so the output stops waiting on an event that did not
+    /// come; the completion that may still arrive afterwards is stale.
+    fn recover_stalled_frame(&mut self, frame: FrameId) -> Result<(), String>;
 
     /// Render `scene` into this backend's target and submit it.
     ///
@@ -748,8 +728,11 @@ mod tests {
                 self.presents += 1;
                 Ok(Submission::Presented)
             }
-            fn poll_events(&mut self, _: &mut Vec<OutputEvent>) -> Result<(), String> {
-                Ok(())
+            fn frame_presented(&mut self, _: FrameId) -> Result<(), String> {
+                Err("this backend queues nothing".into())
+            }
+            fn recover_stalled_frame(&mut self, _: FrameId) -> Result<(), String> {
+                Err("this backend queues nothing".into())
             }
         }
         let request = Request::new(

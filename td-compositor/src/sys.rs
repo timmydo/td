@@ -1051,6 +1051,14 @@ impl Drop for MappedRegion {
     }
 }
 
+// SAFETY: the region is the sole owner of one process-wide mapping; nothing
+// about it is tied to the thread that created it. Its bytes are reached only
+// through `bytes_mut(&mut self)`, so moving the owner between threads moves
+// the only way in, and `munmap` from any thread unmaps the same pair. Not
+// `Sync`: a shared reference lends nothing, and none is needed.
+#[allow(unsafe_code)]
+unsafe impl Send for MappedRegion {}
+
 /// Allocate one dumb buffer on this card.
 pub fn drm_create_dumb(
     card: &impl AsRawFd,

@@ -15,9 +15,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::output::{Output, OutputDimensions, OutputId, OutputScale, OutputTransform};
+use crate::output::{
+    Damage, Fourcc, FrameId, FrameTarget, FrameView, Output, OutputBackend, OutputDimensions,
+    OutputId, OutputScale, OutputTransform, Submission, DRM_FORMAT_XRGB8888,
+};
 use crate::sys;
 
 /// `O_CLOEXEC`. The x86-64 value, as `sys.rs` says of its own flag words: a
@@ -476,20 +480,11 @@ impl<'card> CrtcRestore<'card> {
     /// silently failed. That is a worse restore than the real one and a better
     /// one than none, and `drm_lastclose` is what makes it recoverable.
     fn capture(card: &'card File, saved: sys::DrmModeCrtc, connectors: Vec<u32>) -> Self {
-        if is_restorable(&saved, &connectors) {
-            return CrtcRestore {
-                card,
-                saved,
-                connectors,
-            };
-        }
-        let mut off = saved;
-        off.mode_valid = 0;
-        off.fb_id = 0;
+        let (saved, connectors) = restorable(saved, connectors);
         CrtcRestore {
             card,
-            saved: off,
-            connectors: Vec::new(),
+            saved,
+            connectors,
         }
     }
 }
@@ -726,18 +721,11 @@ fn read_until_flip(card: &File, cookie: u64) -> Result<sys::DrmFlipCompletion, S
         // Parse everything already buffered before reading more: one read can
         // deliver several events, and a completion sitting behind a vblank in
         // the same read must not wait for another read to be noticed.
-        let mut consumed = 0usize;
-        while let Some((length, completion)) =
-            sys::parse_drm_event(pending.get(consumed..).unwrap_or_default())
-        {
-            consumed = consumed.saturating_add(length);
-            if let Some(completion) = completion {
-                if completion.user_data == cookie {
-                    return Ok(completion);
-                }
+        while let Some(completion) = take_completion(&mut pending) {
+            if completion.user_data == cookie {
+                return Ok(completion);
             }
         }
-        pending.drain(..consumed.min(pending.len()));
         // Only after the final drain above has had its chance to parse.
         if expired {
             return Err(format!(
@@ -816,6 +804,19 @@ fn frame_fits_mode(
 /// rather than restoring anything.
 fn is_restorable(saved: &sys::DrmModeCrtc, connectors: &[u32]) -> bool {
     saved.mode_valid != 0 && saved.fb_id != 0 && !connectors.is_empty()
+}
+
+/// A saved CRTC state as a request `SETCRTC` will accept: itself when it is
+/// restorable, and otherwise "switch the CRTC off", the one request that is
+/// always well-formed. See `CrtcRestore::capture` for the shapes refused.
+fn restorable(saved: sys::DrmModeCrtc, connectors: Vec<u32>) -> (sys::DrmModeCrtc, Vec<u32>) {
+    if is_restorable(&saved, &connectors) {
+        return (saved, connectors);
+    }
+    let mut off = saved;
+    off.mode_valid = 0;
+    off.fb_id = 0;
+    (off, Vec::new())
 }
 
 /// Which connectors the kernel is currently routing to `crtc_id`.
@@ -1188,9 +1189,946 @@ fn first_possible_crtc(encoder: &sys::DrmEncoder, resources: &sys::DrmResources)
         })
 }
 
+/// The card, shared by the CRTC the backend drives and every buffer it
+/// registers.
+///
+/// Owned rather than borrowed, which is the difference between the backend
+/// and the probes above: `Runtime` holds its output for the compositor's life,
+/// so nothing it holds can borrow a descriptor from a caller's stack frame.
+/// `Arc` rather than `Rc` because the runtime crosses threads behind its lock.
+type Card = Arc<File>;
+
+/// The one format the backend registers its buffers in: `drm_add_fb` names
+/// XRGB8888 and nothing else.
+const KMS_FORMATS: [Fourcc; 1] = [DRM_FORMAT_XRGB8888];
+
+/// One dumb buffer's GEM handle and, once registered, its framebuffer id,
+/// released framebuffer first and handle second.
+///
+/// The owned counterpart of `DumbHandle` and `FbGuard` together. One guard
+/// rather than two because the two ids are only ever released as a pair, and
+/// a framebuffer registered on a handle that was already destroyed is the
+/// order worth never writing.
+struct Registration {
+    card: Card,
+    handle: u32,
+    /// Zero until `ADDFB2` answers. Zero is never a registered id --
+    /// `drm_add_fb` refuses one -- so it doubles as "not registered yet".
+    fb_id: u32,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        if self.fb_id != 0 {
+            let _ = sys::drm_rm_fb(&*self.card, self.fb_id);
+        }
+        let _ = sys::drm_destroy_dumb(&*self.card, self.handle);
+    }
+}
+
+/// One scanout buffer the backend owns outright: a dumb buffer, its mapping,
+/// and its framebuffer registration.
+///
+/// Released in `DumbFrame`'s order for `DumbFrame`'s reason: `region` is
+/// declared first, so it unmaps before the registration unregisters and
+/// frees, and there is no `Drop` of this type's own to run ahead of either.
+pub struct ScanoutBuffer {
+    region: sys::MappedRegion,
+    registration: Registration,
+}
+
+impl ScanoutBuffer {
+    /// Allocate, map and register one buffer at the mode's size, answering
+    /// the kernel's pitch beside it.
+    ///
+    /// The registration guard exists before anything after the allocation
+    /// can fail, so every `?` below releases what was taken: the locals drop
+    /// in reverse, the mapping first.
+    fn allocate(card: &Card, width: u32, height: u32) -> Result<(ScanoutBuffer, u32), String> {
+        let buffer = sys::drm_create_dumb(&**card, width, height)?;
+        let mut registration = Registration {
+            card: Arc::clone(card),
+            handle: buffer.handle,
+            fb_id: 0,
+        };
+        buffer_covers_scanout(buffer.pitch, width, height, buffer.size)?;
+        let region = sys::drm_map_dumb(&**card, &buffer)?;
+        registration.fb_id =
+            sys::drm_add_fb(&**card, width, height, buffer.pitch, buffer.handle)?;
+        Ok((
+            ScanoutBuffer {
+                region,
+                registration,
+            },
+            buffer.pitch,
+        ))
+    }
+}
+
+/// What a swap chain writes a frame into and names to its CRTC.
+///
+/// A trait so the chain's bookkeeping -- which buffer is on glass, which rows
+/// a copy owes, what a completion means -- is tested against memory a test
+/// owns rather than only against a card.
+pub trait ScanoutMemory {
+    fn bytes_mut(&mut self) -> &mut [u8];
+    fn fb_id(&self) -> u32;
+}
+
+impl ScanoutMemory for ScanoutBuffer {
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        self.region.bytes_mut()
+    }
+
+    fn fb_id(&self) -> u32 {
+        self.registration.fb_id
+    }
+}
+
+/// What a swap chain asks of the CRTC it drives, for `ScanoutMemory`'s
+/// reason.
+pub trait ScanoutCrtc {
+    /// Queue `fb_id` for the next vblank, tagged `cookie`.
+    fn flip(&mut self, fb_id: u32, cookie: u64) -> Result<(), String>;
+    /// Put `fb_id` on the CRTC now, by modeset, and confirm it took.
+    fn set(&mut self, fb_id: u32) -> Result<(), String>;
+}
+
+/// The CRTC the backend drives, mastership over it, and the state to put back.
+///
+/// Its `Drop` is the teardown `Modeset` spreads across three guards, in the
+/// same order and for the same reason: the restore is a `SETCRTC`, which needs
+/// mastership, so mastership is released after it. It is declared FIRST in
+/// `SwapChain`, so it runs before any buffer is unregistered -- unregistering
+/// a framebuffer the CRTC still scans out blanks the CRTC, which the restore
+/// would then have to light again.
+///
+/// It runs when a start fails once the CRTC state is saved -- in `open_kms`,
+/// or in `run_compositor` before the completion threads start -- and never
+/// with a flip queued. A running compositor never drops its backend: the
+/// completion threads hold
+/// the runtime until the process ends. At exit the kernel releases mastership
+/// with the descriptors, and `drm_lastclose` restores the fbdev client once
+/// the last one closes, which is the same restore the probe relies on.
+pub struct CardCrtc {
+    card: Card,
+    crtc_id: u32,
+    connector_id: u32,
+    mode: sys::DrmModeInfo,
+    saved: sys::DrmModeCrtc,
+    routed: Vec<u32>,
+}
+
+impl ScanoutCrtc for CardCrtc {
+    fn flip(&mut self, fb_id: u32, cookie: u64) -> Result<(), String> {
+        sys::drm_page_flip(&*self.card, self.crtc_id, fb_id, cookie)
+    }
+
+    /// Read back, for `Modeset::verify`'s reason: `SETCRTC` answering success
+    /// says the request was accepted, not that this framebuffer is the one
+    /// the CRTC is committed to.
+    fn set(&mut self, fb_id: u32) -> Result<(), String> {
+        let mut wanted = sys::DrmModeCrtc::empty();
+        wanted.crtc_id = self.crtc_id;
+        wanted.fb_id = fb_id;
+        wanted.mode_valid = 1;
+        wanted.mode = self.mode;
+        let mut connectors = [self.connector_id];
+        sys::drm_set_crtc(&*self.card, &wanted, &mut connectors)?;
+        let live = sys::drm_get_crtc(&*self.card, self.crtc_id)?;
+        crtc_shows(&live, self.crtc_id, fb_id, &self.mode)
+    }
+}
+
+impl Drop for CardCrtc {
+    fn drop(&mut self) {
+        // Reported for `CrtcRestore`'s reason, and on stderr for the same one.
+        if let Err(error) = sys::drm_set_crtc(&*self.card, &self.saved, &mut self.routed) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "td-compositor: restoring CRTC {} failed: {error}",
+                self.crtc_id
+            );
+        }
+        let _ = sys::drm_drop_master(&*self.card);
+    }
+}
+
+/// One of the chain's two buffers and what it is known to hold.
+struct Slot<M> {
+    memory: M,
+    /// A copy of `memory`'s first `stride * height` bytes, kept so the rows a
+    /// frame changes are found by comparing ordinary memory rather than by
+    /// reading back through a scanout mapping, which is write-combined on
+    /// real hardware and slow to read.
+    shadow: Vec<u8>,
+    /// Copy every row into this buffer next time, not only those that differ
+    /// from `shadow`. Set when the shadow is not known to describe the
+    /// memory, and by a caller's `Damage::Whole`.
+    stale: bool,
+}
+
+/// Two scanout buffers alternating on one CRTC: the KMS output backend.
+///
+/// One buffer is FRONT -- on glass, or about to be replaced by a queued flip
+/// -- and the other is written and flipped to. At most one flip is in flight.
+/// The runtime keeps it that way by owing a paint rather than taking one
+/// while a flip is queued; `present` refuses a second flip rather than
+/// trusting that, since a CRTC with a flip pending answers `-EBUSY` to
+/// another.
+///
+/// Rendering goes into `frame`, ordinary memory, and only the rows that
+/// differ from what the back buffer already holds are copied into it. The
+/// back buffer is two frames old rather than one, which is why each buffer
+/// keeps its own shadow instead of the chain keeping one.
+pub struct SwapChain<C, M> {
+    /// Declared first so its teardown runs first: see `CardCrtc`.
+    crtc: C,
+    buffers: [Slot<M>; 2],
+    /// Which of `buffers` is front: 0 or 1.
+    front: usize,
+    /// The frame a flip is in flight for, and the buffer it flips to.
+    queued: Option<(FrameId, usize)>,
+    /// Whether the front buffer is known to be on glass. False before the
+    /// first modeset answers and across a failed recovery.
+    shown: bool,
+    next: FrameId,
+    frame: Vec<u8>,
+    /// The caller said `Damage::Whole`: flip even if nothing changed.
+    force: bool,
+    output: Output,
+    stride: usize,
+}
+
+/// The KMS backend as `run --card` builds it.
+pub type Kms = SwapChain<CardCrtc, ScanoutBuffer>;
+
+impl<C: ScanoutCrtc, M: ScanoutMemory> SwapChain<C, M> {
+    /// Build the chain and modeset onto a blank buffer 0.
+    ///
+    /// The modeset is issued on the ASSEMBLED chain rather than before it, so
+    /// a modeset that fails unwinds in field order: the CRTC's restore before
+    /// any buffer is unregistered.
+    fn new(crtc: C, memory: [M; 2], output: Output, stride: usize) -> Result<Self, String> {
+        let size = crate::framebuffer::validate_geometry(
+            output.dimensions.width,
+            output.dimensions.height,
+            stride,
+        )?;
+        let [mut first, mut second] = memory;
+        for (index, buffer) in [&mut first, &mut second].into_iter().enumerate() {
+            let length = buffer.bytes_mut().len();
+            if length < size {
+                return Err(format!(
+                    "scanout buffer {index} maps {length} bytes, short of the {size} the frame needs"
+                ));
+            }
+        }
+        // Buffer 0 is what the modeset shows, so it is blanked here and its
+        // shadow says so. Buffer 1 holds whatever the allocator left, so its
+        // first copy is a whole one.
+        first
+            .bytes_mut()
+            .get_mut(..size)
+            .ok_or("scanout buffer 0 is shorter than the frame")?
+            .fill(0);
+        let mut chain = SwapChain {
+            crtc,
+            buffers: [
+                Slot {
+                    memory: first,
+                    shadow: zeroed(size)?,
+                    stale: false,
+                },
+                Slot {
+                    memory: second,
+                    shadow: zeroed(size)?,
+                    stale: true,
+                },
+            ],
+            front: 0,
+            queued: None,
+            shown: false,
+            next: FrameId::FIRST,
+            frame: zeroed(size)?,
+            force: false,
+            output,
+            stride,
+        };
+        let fb_id = chain.fb_id(0)?;
+        chain.crtc.set(fb_id)?;
+        chain.shown = true;
+        Ok(chain)
+    }
+
+    fn fb_id(&self, index: usize) -> Result<u32, String> {
+        self.buffers
+            .get(index)
+            .map(|slot| slot.memory.fb_id())
+            .ok_or_else(|| format!("the swap chain has no buffer {index}"))
+    }
+
+    /// The buffer `frame` was queued to, taken out of flight. Anything but
+    /// the queued frame is refused: a completion this chain cannot place is
+    /// not one it may act on.
+    fn queued_buffer(&self, frame: FrameId) -> Result<usize, String> {
+        match self.queued {
+            Some((queued, back)) if queued == frame => Ok(back),
+            Some((queued, _)) => Err(format!(
+                "frame {:#x} is not the frame in flight, {:#x}",
+                frame.cookie(),
+                queued.cookie()
+            )),
+            None => Err(format!(
+                "frame {:#x} is not in flight: nothing is",
+                frame.cookie()
+            )),
+        }
+    }
+}
+
+impl<C: ScanoutCrtc + 'static, M: ScanoutMemory + 'static> OutputBackend for SwapChain<C, M> {
+    fn output(&self) -> Output {
+        self.output
+    }
+
+    fn supported_formats(&self) -> &[Fourcc] {
+        &KMS_FORMATS
+    }
+
+    /// The kernel's pitch for the dumb buffers, which the frame is rendered
+    /// at so a band copies row for row.
+    fn target_stride(&self) -> usize {
+        self.stride
+    }
+
+    fn composed(&self) -> FrameView<'_> {
+        FrameView {
+            pixels: &self.frame,
+            width: self.output.dimensions.width,
+            height: self.output.dimensions.height,
+            stride: self.stride,
+        }
+    }
+
+    /// The front buffer's shadow, and only while nothing is queued: once a
+    /// flip is, the glass holds the front buffer until a vblank and the back
+    /// one after it, and which of the two is not known until the completion
+    /// says so.
+    fn completed(&self) -> Option<FrameView<'_>> {
+        if !self.shown || self.queued.is_some() {
+            return None;
+        }
+        let front = self.buffers.get(self.front)?;
+        Some(FrameView {
+            pixels: &front.shadow,
+            width: self.output.dimensions.width,
+            height: self.output.dimensions.height,
+            stride: self.stride,
+        })
+    }
+
+    #[cfg(test)]
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    /// `Whole` means what fbdev's shadow distrust means: repaint everything.
+    /// Nothing but this process writes these buffers, so it is a repair
+    /// rather than a correction. It is honoured by marking both buffers for a
+    /// whole copy, each made when that buffer is next written, and by
+    /// flipping even when nothing changed.
+    fn begin_frame(&mut self, damage: Damage) -> Result<FrameTarget<'_>, String> {
+        if matches!(damage, Damage::Whole) {
+            self.force = true;
+            for slot in &mut self.buffers {
+                slot.stale = true;
+            }
+        }
+        Ok(FrameTarget {
+            pixels: &mut self.frame,
+            width: self.output.dimensions.width,
+            height: self.output.dimensions.height,
+            stride: self.stride,
+        })
+    }
+
+    /// Copy the rows the back buffer lacks and queue it.
+    ///
+    /// A frame identical to the one already on glass is `Presented` with no
+    /// flip: queuing it would only wait a vblank to show nothing new.
+    fn present(&mut self) -> Result<Submission, String> {
+        if let Some((queued, _)) = self.queued {
+            return Err(format!(
+                "frame {:#x} is still queued, and a CRTC takes one flip at a time",
+                queued.cookie()
+            ));
+        }
+        // Read, not taken: a flip the kernel refuses keeps the repair owed.
+        let force = self.force;
+        let unchanged = self
+            .buffers
+            .get(self.front)
+            .is_some_and(|front| front.shadow == self.frame);
+        if !force && self.shown && unchanged {
+            return Ok(Submission::Presented);
+        }
+        let back = self.front ^ 1;
+        let stride = self.stride;
+        let slot = self
+            .buffers
+            .get_mut(back)
+            .ok_or("the swap chain has no back buffer")?;
+        let rows = self.frame.len().checked_div(stride).unwrap_or(0);
+        let band = if slot.stale {
+            rows.checked_sub(1).map(|last| (0, last))
+        } else {
+            crate::framebuffer::damaged_rows(&slot.shadow, &self.frame, stride)
+        };
+        if let Some((first, last)) = band {
+            let start = first
+                .checked_mul(stride)
+                .ok_or("scanout damage offset overflow")?;
+            let end = last
+                .checked_add(1)
+                .and_then(|rows| rows.checked_mul(stride))
+                .ok_or("scanout damage extent overflow")?;
+            let rows = self
+                .frame
+                .get(start..end)
+                .ok_or_else(|| format!("scanout damage {start}..{end} is outside the frame"))?;
+            // Pessimistic across the copy, as fbdev is across its write: an
+            // error between the two halves leaves the shadow describing
+            // nothing, and the next copy is then a whole one.
+            slot.stale = true;
+            slot.memory
+                .bytes_mut()
+                .get_mut(start..end)
+                .ok_or_else(|| format!("scanout damage {start}..{end} is outside the buffer"))?
+                .copy_from_slice(rows);
+            slot.shadow
+                .get_mut(start..end)
+                .ok_or_else(|| format!("scanout damage {start}..{end} is outside the shadow"))?
+                .copy_from_slice(rows);
+        }
+        slot.stale = false;
+        let frame = self.next;
+        let fb_id = slot.memory.fb_id();
+        self.crtc.flip(fb_id, frame.cookie())?;
+        self.force = false;
+        self.next = frame.next();
+        self.queued = Some((frame, back));
+        Ok(Submission::Queued(frame))
+    }
+
+    fn frame_presented(&mut self, frame: FrameId) -> Result<(), String> {
+        let back = self.queued_buffer(frame)?;
+        self.queued = None;
+        self.front = back;
+        self.shown = true;
+        Ok(())
+    }
+
+    /// Modeset onto the buffer the stalled flip was for. Not known to be on
+    /// glass until the modeset answers, so `completed` answers nothing across
+    /// it; a failed one leaves the frame queued for the caller to try again
+    /// or give up on.
+    fn recover_stalled_frame(&mut self, frame: FrameId) -> Result<(), String> {
+        let back = self.queued_buffer(frame)?;
+        let fb_id = self.fb_id(back)?;
+        self.shown = false;
+        self.crtc.set(fb_id)?;
+        self.queued = None;
+        self.front = back;
+        self.shown = true;
+        Ok(())
+    }
+}
+
+/// A zeroed buffer of `size` bytes, or the reason there is none. Not `vec!`,
+/// which aborts the process on an allocation the kernel refused.
+fn zeroed(size: usize) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|error| format!("allocate a {size}-byte scanout frame: {error}"))?;
+    bytes.resize(size, 0);
+    Ok(bytes)
+}
+
+/// The card's page-flip completions, read on a thread of their own.
+///
+/// A second descriptor for the same open card -- `try_clone` is `dup`, so it
+/// shares the open file description and with it the event queue -- which is
+/// what lets a thread block in `read` on it while the runtime, behind its
+/// lock, holds the backend. Blocking and unbounded, deliberately: an idle
+/// screen queues no flip and should wait forever. The bound on a flip that
+/// was queued and never answered is the runtime's watchdog, which does not
+/// need this thread to wake.
+///
+/// Sharing the description means sharing its status flags. Nothing may make
+/// the backend's card non-blocking as `await_flip` makes the probe's: this
+/// read would answer `WouldBlock`, which it reports as a failure.
+pub struct FlipEvents {
+    card: File,
+    crtc_id: u32,
+    pending: Vec<u8>,
+    /// A page, for `read_until_flip`'s reason: `drm_read` never splits an
+    /// event, and puts back one that does not fit.
+    chunk: Vec<u8>,
+}
+
+impl FlipEvents {
+    /// Block until the next page-flip completion and name its frame.
+    pub fn next(&mut self) -> Result<FrameId, String> {
+        loop {
+            if let Some(completion) = take_completion(&mut self.pending) {
+                // The one CRTC this backend drives is the only one it flips,
+                // so a completion naming another is not a stale event but a
+                // card this code does not understand.
+                if completion.crtc_id != self.crtc_id {
+                    return Err(format!(
+                        "a page-flip completion named CRTC {} rather than the {} this backend \
+                         drives",
+                        completion.crtc_id, self.crtc_id
+                    ));
+                }
+                return Ok(FrameId::from_cookie(completion.user_data));
+            }
+            // Everything a whole read delivered has been parsed, and the
+            // kernel never splits an event across reads, so bytes left over
+            // do not frame one. Waiting for more would wait on a buffer that
+            // never parses; refused instead.
+            if !self.pending.is_empty() {
+                return Err(format!(
+                    "the card delivered {} bytes that do not frame a DRM event",
+                    self.pending.len()
+                ));
+            }
+            match (&self.card).read(&mut self.chunk) {
+                Ok(0) => {
+                    return Err(
+                        "the DRM card returned a short read for a page-flip completion: the next \
+                         event does not fit in a 4 KiB buffer"
+                            .to_string(),
+                    )
+                }
+                Ok(read) => self
+                    .pending
+                    .extend_from_slice(self.chunk.get(..read).unwrap_or_default()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(format!("read a page-flip completion from the card: {error}"))
+                }
+            }
+        }
+    }
+}
+
+/// Parse `pending` up to and including its first flip completion and drop
+/// what was parsed. Events that are not completions -- a vblank, a type this
+/// build does not know -- are stepped over by the length they declare.
+fn take_completion(pending: &mut Vec<u8>) -> Option<sys::DrmFlipCompletion> {
+    let mut consumed = 0usize;
+    let mut found = None;
+    while let Some((length, completion)) =
+        sys::parse_drm_event(pending.get(consumed..).unwrap_or_default())
+    {
+        consumed = consumed.saturating_add(length);
+        if completion.is_some() {
+            found = completion;
+            break;
+        }
+    }
+    pending.drain(..consumed.min(pending.len()));
+    found
+}
+
+/// Open `path`, take mastership for good, and modeset a blank frame onto the
+/// connector discovery prefers. Answers the backend, the reader for its
+/// completions, and one line describing what was lit.
+///
+/// Mastership is dropped by `open_card` and re-taken at once. The window
+/// between is two syscalls, and re-taking is permitted to a process that is
+/// not root only because its descriptor was master when opened
+/// (`drm_master_check_perm`'s `was_master`), which is what the seat grant of
+/// the card to the compositor account relies on. Held from here to the
+/// backend's drop; an error before `CardCrtc` exists needs no guard, because
+/// nothing has been changed yet and closing the only descriptor gives it back.
+pub fn open_kms(path: &Path) -> Result<(Kms, FlipEvents, String), String> {
+    let card = open_card(path)?;
+    sys::drm_set_master(&card).map_err(|error| {
+        format!(
+            "take DRM mastership of {}: {error} -- another process may be driving the display",
+            path.display()
+        )
+    })?;
+    // After the mastership rather than before, so connectors are probed as
+    // master: `GETCONNECTOR` re-probes a sink only for the current master.
+    let discovery = discover(&card)?;
+    let scanout = discovery.scanout;
+    let output = scanout.output()?;
+    let width = u32::from(scanout.mode.hdisplay);
+    let height = u32::from(scanout.mode.vdisplay);
+    // The frame limits at the tightest pitch the mode allows, before a byte
+    // is allocated for it. The kernel's pitch is checked again once known.
+    crate::framebuffer::validate_geometry(
+        output.dimensions.width,
+        output.dimensions.height,
+        output.dimensions.width.saturating_mul(4),
+    )?;
+    // Read under mastership and before anything changes: this is the state
+    // the restore puts back. The routing is read, not assumed, for
+    // `CrtcRestore`'s reason.
+    let saved = sys::drm_get_crtc(&card, scanout.crtc_id)?;
+    let routed = connectors_on_crtc(&card, scanout.crtc_id)?;
+    let (saved, routed) = restorable(saved, routed);
+    let card: Card = Arc::new(card);
+    let crtc = CardCrtc {
+        card: Arc::clone(&card),
+        crtc_id: scanout.crtc_id,
+        connector_id: scanout.connector_id,
+        mode: scanout.mode,
+        saved,
+        routed,
+    };
+    let (first, pitch) = ScanoutBuffer::allocate(&card, width, height)?;
+    let (second, second_pitch) = ScanoutBuffer::allocate(&card, width, height)?;
+    // One stride for both, because one frame is rendered at it and copied
+    // into either. A driver that pitched two identical allocations
+    // differently is not one this backend can drive.
+    if pitch != second_pitch {
+        return Err(format!(
+            "two {width}x{height} dumb buffers came back at pitches {pitch} and {second_pitch}"
+        ));
+    }
+    let stride = usize::try_from(pitch).map_err(|_| format!("pitch {pitch} is not a usize"))?;
+    let fbs = (first.fb_id(), second.fb_id());
+    let events = FlipEvents {
+        card: card
+            .try_clone()
+            .map_err(|error| format!("duplicate the card descriptor for completions: {error}"))?,
+        crtc_id: scanout.crtc_id,
+        pending: Vec::with_capacity(sys::DRM_EVENT_VBLANK_LEN * 4),
+        chunk: zeroed(4096)?,
+    };
+    let chain = SwapChain::new(crtc, [first, second], output, stride)?;
+    let described = format!(
+        "{} fb={},{} modeset=ok",
+        discovery.describe(),
+        fbs.0,
+        fbs.1
+    );
+    Ok((chain, events, described))
+}
+
+/// A swap chain over ordinary memory and a CRTC that records what it was
+/// asked, for tests of the chain and of the runtime driving it.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{ScanoutCrtc, ScanoutMemory, SwapChain};
+    use crate::output::{Output, OutputDimensions, OutputId, OutputScale, OutputTransform};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum CrtcCall {
+        Flip { fb_id: u32, cookie: u64 },
+        Set { fb_id: u32 },
+    }
+
+    #[derive(Default)]
+    pub struct CrtcLog {
+        pub calls: Vec<CrtcCall>,
+        pub fail_next_flip: bool,
+        pub fail_next_set: bool,
+    }
+
+    pub struct RecordingCrtc(pub Arc<Mutex<CrtcLog>>);
+
+    impl ScanoutCrtc for RecordingCrtc {
+        fn flip(&mut self, fb_id: u32, cookie: u64) -> Result<(), String> {
+            let mut log = self.0.lock().map_err(|_| "crtc log poisoned")?;
+            if std::mem::take(&mut log.fail_next_flip) {
+                return Err("injected flip failure".into());
+            }
+            log.calls.push(CrtcCall::Flip { fb_id, cookie });
+            Ok(())
+        }
+
+        fn set(&mut self, fb_id: u32) -> Result<(), String> {
+            let mut log = self.0.lock().map_err(|_| "crtc log poisoned")?;
+            if std::mem::take(&mut log.fail_next_set) {
+                return Err("injected modeset failure".into());
+            }
+            log.calls.push(CrtcCall::Set { fb_id });
+            Ok(())
+        }
+    }
+
+    /// A buffer's bytes, in ordinary memory.
+    pub struct TestMemory {
+        fb_id: u32,
+        view: Vec<u8>,
+    }
+
+    impl ScanoutMemory for TestMemory {
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut self.view
+        }
+
+        fn fb_id(&self) -> u32 {
+            self.fb_id
+        }
+    }
+
+    pub type TestChain = SwapChain<RecordingCrtc, TestMemory>;
+
+    /// A chain at `width`x`height`, its buffers pre-filled with `0xee` so a
+    /// copy that skipped a row is visible, and the log its CRTC writes.
+    pub fn chain(width: usize, height: usize) -> (TestChain, Arc<Mutex<CrtcLog>>) {
+        let stride = width * 4;
+        let log = Arc::new(Mutex::new(CrtcLog::default()));
+        let memory = |fb_id| TestMemory {
+            fb_id,
+            view: vec![0xee; stride * height],
+        };
+        let output = Output {
+            id: OutputId::FIRST,
+            dimensions: OutputDimensions { width, height },
+            scale: OutputScale::ONE,
+            transform: OutputTransform::Normal,
+        };
+        let chain = SwapChain::new(
+            RecordingCrtc(Arc::clone(&log)),
+            [memory(41), memory(42)],
+            output,
+            stride,
+        )
+        .unwrap();
+        (chain, log)
+    }
+
+    impl TestChain {
+        /// The bytes buffer `index` holds.
+        pub fn buffer(&self, index: usize) -> &[u8] {
+            &self.buffers[index].memory.view
+        }
+
+        pub fn front_index(&self) -> usize {
+            self.front
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::output::{Damage, FrameId, OutputBackend, Submission};
+    use testing::CrtcCall;
+
+    fn fill(chain: &mut testing::TestChain, damage: Damage, byte: u8, rows: std::ops::Range<usize>) {
+        let target = chain.begin_frame(damage).unwrap();
+        let stride = target.stride;
+        for row in rows {
+            target.pixels[row * stride..(row + 1) * stride].fill(byte);
+        }
+    }
+
+    /// The chain lights buffer 0, blank, at construction, and a first frame
+    /// is queued to buffer 1 as a whole copy: buffer 1 held whatever the
+    /// allocator left, so its shadow describes nothing.
+    #[test]
+    fn a_new_chain_modesets_a_blank_front_and_queues_a_whole_first_frame() {
+        let (mut chain, log) = testing::chain(4, 3);
+        assert_eq!(log.lock().unwrap().calls, [CrtcCall::Set { fb_id: 41 }]);
+        assert!(chain.buffer(0).iter().all(|byte| *byte == 0));
+        let blank = chain.completed().unwrap();
+        assert!(blank.pixels.iter().all(|byte| *byte == 0));
+
+        fill(&mut chain, Damage::Unknown, 7, 1..2);
+        let submission = chain.present().unwrap();
+        assert_eq!(submission, Submission::Queued(FrameId::FIRST));
+        assert_eq!(
+            log.lock().unwrap().calls.last(),
+            Some(&CrtcCall::Flip { fb_id: 42, cookie: 1 })
+        );
+        // Every row, including the two the frame left at zero: the 0xee the
+        // test allocator left there is gone.
+        assert_eq!(chain.buffer(1), chain.composed().pixels);
+        // Nothing is known to be on glass while the flip is in flight.
+        assert!(chain.completed().is_none());
+        assert!(chain.present().is_err(), "a second flip was queued over the first");
+
+        chain.frame_presented(FrameId::FIRST).unwrap();
+        assert_eq!(chain.front_index(), 1);
+        assert_eq!(chain.completed().unwrap().pixels, chain.composed().pixels);
+    }
+
+    /// The back buffer is two frames old, so its copy is the rows IT lacks,
+    /// which is more than the rows the last frame changed.
+    #[test]
+    fn a_back_buffer_receives_the_rows_it_lacks_not_only_the_last_frames() {
+        let (mut chain, _log) = testing::chain(2, 4);
+        // Frame 1 → buffer 1: row 0 set.
+        fill(&mut chain, Damage::Unknown, 1, 0..1);
+        chain.present().unwrap();
+        chain.frame_presented(FrameId::FIRST).unwrap();
+        // Frame 2 → buffer 0: row 3 set too. Buffer 0 is blank, so it needs
+        // row 0 as well as row 3.
+        fill(&mut chain, Damage::Unknown, 3, 3..4);
+        let second = FrameId::FIRST.next();
+        assert_eq!(chain.present().unwrap(), Submission::Queued(second));
+        assert_eq!(chain.buffer(0), chain.composed().pixels);
+        chain.frame_presented(second).unwrap();
+        assert_eq!(chain.front_index(), 0);
+    }
+
+    /// A frame the glass already shows is answered without a flip: queuing
+    /// it would wait a vblank to show nothing, and would owe a completion.
+    /// `Whole` flips anyway, because it is a request to repaint.
+    #[test]
+    fn an_unchanged_frame_is_presented_without_a_flip_unless_whole() {
+        let (mut chain, log) = testing::chain(2, 2);
+        fill(&mut chain, Damage::Unknown, 0, 0..0);
+        assert_eq!(chain.present().unwrap(), Submission::Presented);
+        assert_eq!(log.lock().unwrap().calls.len(), 1, "only the modeset");
+
+        fill(&mut chain, Damage::Whole, 0, 0..0);
+        assert_eq!(chain.present().unwrap(), Submission::Queued(FrameId::FIRST));
+    }
+
+    /// Completions are matched on the frame, and one for anything but the
+    /// queued frame is refused without moving the front.
+    #[test]
+    fn a_completion_for_another_frame_is_refused() {
+        let (mut chain, _log) = testing::chain(2, 2);
+        assert!(chain.frame_presented(FrameId::FIRST).is_err(), "nothing was queued");
+        fill(&mut chain, Damage::Unknown, 5, 0..1);
+        chain.present().unwrap();
+        assert!(chain.frame_presented(FrameId::FIRST.next()).is_err());
+        assert_eq!(chain.front_index(), 0);
+        assert!(chain.completed().is_none());
+    }
+
+    /// A stalled flip is recovered by modesetting onto its buffer, and a
+    /// failed recovery leaves it queued and the glass unknown.
+    #[test]
+    fn a_stalled_flip_is_recovered_by_modeset_onto_its_buffer() {
+        let (mut chain, log) = testing::chain(2, 2);
+        fill(&mut chain, Damage::Unknown, 5, 0..1);
+        chain.present().unwrap();
+
+        log.lock().unwrap().fail_next_set = true;
+        assert!(chain.recover_stalled_frame(FrameId::FIRST).is_err());
+        assert!(chain.completed().is_none());
+        assert!(chain.present().is_err(), "the failed recovery released the flip");
+
+        chain.recover_stalled_frame(FrameId::FIRST).unwrap();
+        assert_eq!(log.lock().unwrap().calls.last(), Some(&CrtcCall::Set { fb_id: 42 }));
+        assert_eq!(chain.front_index(), 1);
+        assert_eq!(chain.completed().unwrap().pixels, chain.composed().pixels);
+        // And the late completion the kernel may still send is not the
+        // chain's to act on.
+        assert!(chain.frame_presented(FrameId::FIRST).is_err());
+    }
+
+    /// A `Whole` repair of an unchanged frame survives a refused flip: a
+    /// retry flips rather than answering that the glass already shows it.
+    #[test]
+    fn a_refused_forced_flip_keeps_the_repair_owed() {
+        let (mut chain, log) = testing::chain(2, 2);
+        fill(&mut chain, Damage::Whole, 0, 0..0);
+        log.lock().unwrap().fail_next_flip = true;
+        assert!(chain.present().is_err());
+        assert_eq!(chain.present().unwrap(), Submission::Queued(FrameId::FIRST));
+    }
+
+    /// A flip the kernel refused leaves nothing queued, and the frame's rows
+    /// are still in the back buffer, so a retry need not copy them again.
+    #[test]
+    fn a_refused_flip_queues_nothing() {
+        let (mut chain, log) = testing::chain(2, 2);
+        fill(&mut chain, Damage::Unknown, 5, 0..1);
+        log.lock().unwrap().fail_next_flip = true;
+        assert!(chain.present().is_err());
+        assert_eq!(chain.present().unwrap(), Submission::Queued(FrameId::FIRST));
+    }
+
+    /// One DRM event: `kind`, a 32-byte length, the cookie, and CRTC `crtc`.
+    fn event_bytes(kind: u32, cookie: u64, crtc: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&kind.to_le_bytes());
+        bytes.extend_from_slice(&32u32.to_le_bytes());
+        bytes.extend_from_slice(&cookie.to_le_bytes());
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&crtc.to_le_bytes());
+        bytes
+    }
+
+    /// A reader over a regular file holding `bytes`, which reads them and
+    /// then answers end-of-file the way `drm_read` answers an event too
+    /// large for the buffer.
+    fn events_from(bytes: &[u8], name: &str) -> FlipEvents {
+        let path = std::env::temp_dir().join(format!(
+            "td-flip-events-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let card = File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        FlipEvents {
+            card,
+            crtc_id: 29,
+            pending: Vec::new(),
+            chunk: vec![0; 4096],
+        }
+    }
+
+    /// The reader names each completion's frame, in order, past a vblank.
+    #[test]
+    fn flip_events_name_each_completions_frame_in_order() {
+        let mut bytes = event_bytes(0x01, 9, 29);
+        bytes.extend(event_bytes(sys::DRM_EVENT_FLIP_COMPLETE, 2, 29));
+        bytes.extend(event_bytes(sys::DRM_EVENT_FLIP_COMPLETE, 3, 29));
+        let mut events = events_from(&bytes, "order");
+        assert_eq!(events.next().unwrap(), FrameId::from_cookie(2));
+        assert_eq!(events.next().unwrap(), FrameId::from_cookie(3));
+        let short = events.next().unwrap_err();
+        assert!(short.contains("short read"), "{short}");
+    }
+
+    /// Each of the reader's refusals, which end the compositor: another
+    /// CRTC's completion, and bytes that cannot frame an event.
+    #[test]
+    fn flip_events_refuse_another_crtc_and_unframed_bytes() {
+        let foreign = events_from(&event_bytes(sys::DRM_EVENT_FLIP_COMPLETE, 2, 30), "crtc")
+            .next()
+            .unwrap_err();
+        assert!(foreign.contains("CRTC 30"), "{foreign}");
+        // A header declaring 64 bytes over a 32-byte read: the kernel never
+        // splits an event, so what is left over is not the start of one.
+        let mut torn = event_bytes(sys::DRM_EVENT_FLIP_COMPLETE, 2, 29);
+        torn[4] = 64;
+        let unframed = events_from(&torn, "torn").next().unwrap_err();
+        assert!(unframed.contains("do not frame"), "{unframed}");
+    }
+
+    /// Completion parsing takes the first completion and leaves the rest,
+    /// stepping over any other event on the way.
+    #[test]
+    fn completions_are_taken_one_at_a_time_past_other_events() {
+        let event = |kind: u32, cookie: u64| event_bytes(kind, cookie, 29);
+        let mut pending = event(0x01, 9);
+        pending.extend(event(sys::DRM_EVENT_FLIP_COMPLETE, 2));
+        pending.extend(event(sys::DRM_EVENT_FLIP_COMPLETE, 3));
+        assert_eq!(take_completion(&mut pending).map(|c| c.user_data), Some(2));
+        assert_eq!(pending.len(), 32);
+        assert_eq!(take_completion(&mut pending).map(|c| c.user_data), Some(3));
+        assert!(pending.is_empty());
+        assert_eq!(take_completion(&mut pending), None);
+    }
 
     /// A driver whose reported size covers its own stride is accepted, and an
     /// over-aligned pitch is fine: the kernel picks it.

@@ -10,7 +10,7 @@ use crate::keyboard::{
 };
 use crate::launcher::{LaunchRequest, LauncherAction};
 use crate::layout::{Command, Direction, ViewLayout};
-use crate::output::{Damage, Output, OutputBackend, Submission};
+use crate::output::{Damage, FrameId, Output, OutputBackend, OutputEvent, Submission};
 use crate::pointer::{
     PointerButtonInput, PointerButtonState, PointerScroll, PointerSnapshot, PointerState,
     PointerTarget, PressOwner, RoutedPointerFrame,
@@ -24,15 +24,50 @@ use crate::scene::{
 #[cfg(test)]
 use crate::scene::{SHM_ARGB8888, SHM_XRGB8888};
 use crate::server::TransferEndpoint;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub(crate) const MAX_PENDING_KEYBOARD_DELIVERIES: usize = 64;
 pub(crate) const MIN_APPLICATION_CONTENT_PIXELS: usize = 4_096;
 pub(crate) const MAX_APPLICATION_PIXEL_SCAN: usize = 1_048_576;
 const MAX_APPLICATION_SCAN_DIAGNOSTICS: usize = 8;
+
+/// How long a queued page flip may go unanswered before the watchdog puts
+/// its frame on glass by modeset instead.
+///
+/// A bound on a HANG, not a schedule, and five seconds for the flip probe's
+/// reason: a completion is delivered from a timer that needs the guest
+/// scheduled, and a loaded TCG host can leave it unscheduled far longer than
+/// any frame interval. Recovering a flip that was merely slow costs one
+/// modeset; waiting forever on one that was lost costs the screen.
+///
+/// The modeset is not free. On an atomic driver a legacy `SETCRTC` is a
+/// blocking commit that first waits out the stalled one, up to the kernel's
+/// own ten-second dependency timeout, and it does so under the runtime lock.
+/// If vblank delivery is dead rather than slow, no modeset repairs it: later
+/// flips are refused, each paint fails and stays owed, and the log says so.
+pub(crate) const FLIP_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How many recovered frames are remembered exactly. One older than all of
+/// them is still accepted as late (`evicted`), so the bound costs precision
+/// about ancient frames, never a refusal of a real completion.
+const MAX_RECOVERED_FRAMES: usize = 8;
+
+/// Consecutive failed recoveries of one frame after which the watchdog gives
+/// up and ends the process. One tick apart, though each attempt may itself
+/// block for the kernel's commit timeout, so this can be tens of seconds of
+/// a CRTC that refuses to be set.
+const MAX_FAILED_RECOVERIES: u32 = 3;
+
+/// The one frame a backend has queued and not yet reported on glass.
+#[derive(Clone, Copy, Debug)]
+struct InFlight {
+    frame: FrameId,
+    since: Instant,
+}
 
 #[derive(Clone)]
 pub struct SubscriptionStop {
@@ -400,8 +435,29 @@ pub struct Runtime {
     /// The latest requested paint's answer, or None before a paint, while
     /// pending, or after failure. No `Presented` default, so observing
     /// `Presented` proves a paint answered it, which a default would make
-    /// unfalsifiable — fbdev has no other answer to give.
+    /// unfalsifiable — fbdev has no other answer to give. A `Queued(frame)`
+    /// answer becomes `Presented` when that frame's completion arrives and
+    /// no later request has replaced it.
     last_submission: Option<Submission>,
+    /// A backend that answers `Queued` takes one frame at a time: while this
+    /// is set a repaint is OWED rather than taken, and the completion that
+    /// clears it takes the owed one. That is what coalesces a burst of
+    /// commits into one frame per vblank instead of a queue of stale ones.
+    in_flight: Option<InFlight>,
+    /// Frames the watchdog put on glass by modeset, whose completions may
+    /// still arrive. Only these are accepted late: the kernel sends one
+    /// completion per flip, so any other that is not the frame in flight is
+    /// one this runtime cannot place.
+    recovered: VecDeque<FrameId>,
+    /// The newest recovered frame forgotten to keep `recovered` bounded. A
+    /// completion at or below it is late beyond memory, not unknown: a
+    /// guest paused across many stalls delivers exactly that burst.
+    evicted: Option<FrameId>,
+    /// Consecutive failed recoveries of the frame in flight.
+    failed_recoveries: u32,
+    /// Whether the watchdog's last attempt at an owed paint failed, so a
+    /// paint that keeps failing is reported once rather than every tick.
+    owed_paint_failing: bool,
     headless_output: Option<crate::headless::OutputStamp>,
     headless_action: u64,
     clipboard_control: Option<ClipboardControl>,
@@ -610,6 +666,11 @@ impl Runtime {
             comparison: Vec::new(),
             owed_damage: Damage::Unknown,
             last_submission: None,
+            in_flight: None,
+            recovered: VecDeque::new(),
+            evicted: None,
+            failed_recoveries: 0,
+            owed_paint_failing: false,
             headless_output: None,
             headless_action: 0,
             clipboard_control: None,
@@ -1040,13 +1101,25 @@ impl Runtime {
             return Ok(());
         }
         self.pending_paint = true;
+        // One flip at a time. The scene is already current, so owing the
+        // paint loses nothing: the completion takes it.
+        if self.in_flight.is_some() {
+            return Ok(());
+        }
         let next_output = self.headless_output.map(|stamp| {
             stamp.output.checked_add(1).ok_or("headless output identity exhausted")
         }).transpose()?;
         // The damage is cleared only on success, so a failed paint still owes
         // the whole output — which is what the backend's own shadow-copy
         // distrust did before this was the caller's to say.
-        self.last_submission = Some(self.backend.paint(&self.scene, self.owed_damage)?);
+        let submission = self.backend.paint(&self.scene, self.owed_damage)?;
+        if let Submission::Queued(frame) = submission {
+            self.in_flight = Some(InFlight {
+                frame,
+                since: Instant::now(),
+            });
+        }
+        self.last_submission = Some(submission);
         if self.last_submission == Some(Submission::Presented) {
             if let (Some(stamp), Some(next)) = (self.headless_output.as_mut(), next_output) {
                 stamp.output = next;
@@ -1063,6 +1136,144 @@ impl Runtime {
     #[cfg(test)]
     pub(crate) fn last_submission(&self) -> Option<Submission> {
         self.last_submission
+    }
+
+    /// Something the output backend originated, delivered by the thread that
+    /// reads it.
+    pub(crate) fn output_event(&mut self, event: OutputEvent) -> Result<(), String> {
+        match event {
+            OutputEvent::Presented(frame) => self.frame_presented(frame),
+            OutputEvent::Changed => Err(
+                "the output changed, and td does not yet follow a mode or connection change"
+                    .into(),
+            ),
+        }
+    }
+
+    /// The frame in flight reached the screen.
+    ///
+    /// The one other completion accepted is a RECOVERED frame's: the watchdog
+    /// put it on glass by modeset and the kernel reported its flip late.
+    /// Anything else is refused, because acting on a completion this runtime
+    /// cannot place would release the next frame early.
+    fn frame_presented(&mut self, frame: FrameId) -> Result<(), String> {
+        let Some(in_flight) = self.in_flight.filter(|in_flight| in_flight.frame == frame) else {
+            if let Some(at) = self.recovered.iter().position(|seen| *seen == frame) {
+                self.recovered.remove(at);
+                return Ok(());
+            }
+            if self.evicted.is_some_and(|evicted| frame <= evicted) {
+                return Ok(());
+            }
+            return Err(format!(
+                "a page-flip completion named frame {:#x}, which is neither in flight nor \
+                 recovered",
+                frame.cookie()
+            ));
+        };
+        self.backend.frame_presented(in_flight.frame)?;
+        self.in_flight = None;
+        self.failed_recoveries = 0;
+        self.frame_on_glass(in_flight.frame);
+        Ok(())
+    }
+
+    /// Bound the wait for the frame in flight. Called once a second; a flip
+    /// older than `FLIP_DEADLINE` is recovered by the backend and treated as
+    /// completed, so a late completion costs one modeset rather than every
+    /// frame after it. A failed recovery is tried again on later ticks and
+    /// is an error only once `MAX_FAILED_RECOVERIES` have failed in a row.
+    ///
+    /// With nothing in flight it takes a paint left owed by a failed one, so
+    /// a transient failure heals without waiting for a client to ask. A
+    /// paint that keeps failing -- a vblank that is dead, not slow, refuses
+    /// every flip -- is reported when it starts and when it stops. The
+    /// process stays up: that is the one case where the compositor cannot
+    /// learn when a frame reached the screen and does not exit, because a
+    /// restart cannot revive the vblank either.
+    pub(crate) fn output_watchdog(&mut self, now: Instant) -> Result<(), String> {
+        let Some(in_flight) = self.in_flight else {
+            if self.pending_paint && self.compound_settle.is_none() {
+                match self.flush_paint() {
+                    Ok(()) if self.owed_paint_failing => {
+                        self.owed_paint_failing = false;
+                        eprintln!("td-compositor: owed paint taken");
+                    }
+                    Ok(()) => {}
+                    Err(error) if !self.owed_paint_failing => {
+                        self.owed_paint_failing = true;
+                        eprintln!("td-compositor: owed paint failing: {error}");
+                    }
+                    Err(_) => {}
+                }
+            } else if !self.pending_paint && self.owed_paint_failing {
+                // A client's paint took it: the episode is over either way.
+                self.owed_paint_failing = false;
+                eprintln!("td-compositor: owed paint taken");
+            }
+            return Ok(());
+        };
+        let waited = now.saturating_duration_since(in_flight.since);
+        if waited < FLIP_DEADLINE {
+            return Ok(());
+        }
+        eprintln!(
+            "td-compositor: page flip for frame {:#x} unanswered after {waited:?}; setting the \
+             mode again",
+            in_flight.frame.cookie()
+        );
+        if let Err(error) = self.backend.recover_stalled_frame(in_flight.frame) {
+            self.failed_recoveries = self.failed_recoveries.saturating_add(1);
+            if self.failed_recoveries >= MAX_FAILED_RECOVERIES {
+                return Err(format!(
+                    "{error}; {} recoveries of frame {:#x} failed in a row",
+                    self.failed_recoveries,
+                    in_flight.frame.cookie()
+                ));
+            }
+            eprintln!(
+                "td-compositor: recovering frame {:#x} failed ({} of {MAX_FAILED_RECOVERIES}): \
+                 {error}",
+                in_flight.frame.cookie(),
+                self.failed_recoveries
+            );
+            return Ok(());
+        }
+        self.failed_recoveries = 0;
+        self.in_flight = None;
+        if self.recovered.len() >= MAX_RECOVERED_FRAMES {
+            if let Some(forgotten) = self.recovered.pop_front() {
+                self.evicted = Some(forgotten);
+            }
+        }
+        self.recovered.push_back(in_flight.frame);
+        self.frame_on_glass(in_flight.frame);
+        Ok(())
+    }
+
+    /// `frame` is on glass. If it is still the latest paint's answer, that
+    /// answer becomes `Presented`, and the paint owed while it was in flight
+    /// is taken now.
+    ///
+    /// That paint failing is logged, not returned. The frame's completion
+    /// was accepted, and the paint stays owed for the next request or
+    /// watchdog tick, as any failed paint does; returning it would end the
+    /// process from the thread that delivers completions.
+    fn frame_on_glass(&mut self, frame: FrameId) {
+        if self.last_submission == Some(Submission::Queued(frame)) {
+            self.last_submission = Some(Submission::Presented);
+        }
+        if let Err(error) = self.flush_paint() {
+            eprintln!(
+                "td-compositor: owed paint after frame {:#x}: {error}",
+                frame.cookie()
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_in_flight(&self) -> Option<FrameId> {
+        self.in_flight.map(|in_flight| in_flight.frame)
     }
 
     /// Owe a paint instead of taking one. The scene is already current, so any
@@ -5481,6 +5692,255 @@ mod tests {
         assert_eq!(runtime.last_submission(), None);
         runtime.flush_paint().unwrap();
         assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+    }
+
+    fn flips(log: &Mutex<crate::drm::testing::CrtcLog>) -> usize {
+        log.lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|call| matches!(call, crate::drm::testing::CrtcCall::Flip { .. }))
+            .count()
+    }
+
+    /// One flip at a time. A paint requested while one is in flight is OWED,
+    /// however many are requested, and the completion takes exactly one.
+    #[test]
+    fn a_queued_frame_owes_later_paints_until_its_completion_takes_one() {
+        let (chain, log) = crate::drm::testing::chain(120, 80);
+        let mut runtime = Runtime::new(chain);
+        let key = SurfaceKey { client: 1, object: 1 };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let first = FrameId::FIRST;
+        assert_eq!(runtime.last_submission(), Some(Submission::Queued(first)));
+        assert_eq!(runtime.frame_in_flight(), Some(first));
+        assert_eq!(flips(&log), 1);
+
+        // The pointer is drawn, so each move is a different picture.
+        for at in [30, 60] {
+            runtime
+                .pointer_frame(1, at, at, &[], PointerScroll::default())
+                .unwrap();
+            runtime.flush_paint().unwrap();
+        }
+        assert_eq!(flips(&log), 1, "a second flip was queued over the first");
+        assert!(runtime.paint_pending());
+        assert_eq!(runtime.last_submission(), None);
+
+        runtime.output_event(OutputEvent::Presented(first)).unwrap();
+        let second = first.next();
+        assert_eq!(flips(&log), 2);
+        assert_eq!(runtime.frame_in_flight(), Some(second));
+        assert!(!runtime.paint_pending());
+        assert_eq!(runtime.last_submission(), Some(Submission::Queued(second)));
+
+        // Nothing owed this time, so the completion settles the answer.
+        runtime.output_event(OutputEvent::Presented(second)).unwrap();
+        assert_eq!(flips(&log), 2);
+        assert_eq!(runtime.frame_in_flight(), None);
+        assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+    }
+
+    /// A completion the runtime never queued is refused, and one that
+    /// arrives after the watchdog recovered its frame is late, not wrong.
+    #[test]
+    fn a_stalled_flip_is_recovered_and_its_late_completion_ignored() {
+        let (chain, log) = crate::drm::testing::chain(120, 80);
+        let mut runtime = Runtime::new(chain);
+        runtime
+            .commit(SurfaceKey { client: 1, object: 1 }, surface([1, 2, 3, 0]))
+            .unwrap();
+        let first = FrameId::FIRST;
+        assert!(runtime
+            .output_event(OutputEvent::Presented(first.next()))
+            .is_err());
+
+        let queued = Instant::now();
+        runtime.output_watchdog(queued).unwrap();
+        assert_eq!(runtime.frame_in_flight(), Some(first), "recovered early");
+
+        let late = queued + FLIP_DEADLINE + Duration::from_secs(1);
+        log.lock().unwrap().fail_next_set = true;
+        runtime.output_watchdog(late).unwrap();
+        assert_eq!(runtime.frame_in_flight(), Some(first), "a failed recovery released it");
+
+        runtime.output_watchdog(late).unwrap();
+        assert_eq!(
+            log.lock().unwrap().calls.last(),
+            Some(&crate::drm::testing::CrtcCall::Set { fb_id: 42 })
+        );
+        assert_eq!(runtime.frame_in_flight(), None);
+        assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+        runtime.output_event(OutputEvent::Presented(first)).unwrap();
+        assert_eq!(runtime.frame_in_flight(), None);
+        // Accepted late once: the kernel sends one completion per flip.
+        assert!(runtime.output_event(OutputEvent::Presented(first)).is_err());
+        assert!(runtime
+            .output_event(OutputEvent::Presented(first.next()))
+            .is_err());
+    }
+
+    /// The realistic late completion: a paint was owed across the stall, so
+    /// recovery queues the next frame at once and the recovered frame's
+    /// completion arrives while THAT one is in flight.
+    #[test]
+    fn a_late_completion_behind_the_next_frame_does_not_release_it() {
+        let (chain, _log) = crate::drm::testing::chain(120, 80);
+        let mut runtime = Runtime::new(chain);
+        runtime
+            .commit(SurfaceKey { client: 1, object: 1 }, surface([1, 2, 3, 0]))
+            .unwrap();
+        runtime
+            .pointer_frame(1, 30, 30, &[], PointerScroll::default())
+            .unwrap();
+        runtime.flush_paint().unwrap();
+        assert!(runtime.paint_pending());
+        let first = FrameId::FIRST;
+        let second = first.next();
+        let late = Instant::now() + FLIP_DEADLINE + Duration::from_secs(1);
+        runtime.output_watchdog(late).unwrap();
+        assert_eq!(runtime.frame_in_flight(), Some(second));
+
+        runtime.output_event(OutputEvent::Presented(first)).unwrap();
+        assert_eq!(runtime.frame_in_flight(), Some(second), "the late one released the next");
+        runtime.output_event(OutputEvent::Presented(second)).unwrap();
+        assert_eq!(runtime.frame_in_flight(), None);
+        assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+    }
+
+    /// Recovery failing is retried, and ends the watchdog only in a row.
+    #[test]
+    fn repeated_failed_recoveries_are_an_error_only_in_a_row() {
+        let (chain, log) = crate::drm::testing::chain(120, 80);
+        let mut runtime = Runtime::new(chain);
+        runtime
+            .commit(SurfaceKey { client: 1, object: 1 }, surface([1, 2, 3, 0]))
+            .unwrap();
+        let late = Instant::now() + FLIP_DEADLINE + Duration::from_secs(1);
+        for _ in 1..MAX_FAILED_RECOVERIES {
+            log.lock().unwrap().fail_next_set = true;
+            runtime.output_watchdog(late).unwrap();
+        }
+        log.lock().unwrap().fail_next_set = true;
+        assert!(runtime.output_watchdog(late).is_err());
+        assert_eq!(runtime.frame_in_flight(), Some(FrameId::FIRST));
+    }
+
+    /// A burst of late completions after more stalls than are remembered,
+    /// as a paused guest delivers: every one is late, none is unknown, and
+    /// the frame in flight is untouched until its own arrives.
+    #[test]
+    fn late_completions_beyond_the_remembered_stalls_are_still_late() {
+        let (chain, _log) = crate::drm::testing::chain(120, 80);
+        let mut runtime = Runtime::new(chain);
+        runtime
+            .commit(SurfaceKey { client: 1, object: 1 }, surface([1, 2, 3, 0]))
+            .unwrap();
+        let mut stalled = Vec::new();
+        for at in 0..=MAX_RECOVERED_FRAMES {
+            // Relative motion: alternate, so the pointer never pins at an edge.
+            let at = if at % 2 == 0 { 7 } else { -7 };
+            runtime
+                .pointer_frame(1, at, at, &[], PointerScroll::default())
+                .unwrap();
+            runtime.flush_paint().unwrap();
+            stalled.push(runtime.frame_in_flight().unwrap());
+            let late = Instant::now() + FLIP_DEADLINE + Duration::from_secs(1);
+            runtime.output_watchdog(late).unwrap();
+        }
+        let current = runtime.frame_in_flight().unwrap();
+        for frame in stalled {
+            runtime.output_event(OutputEvent::Presented(frame)).unwrap();
+        }
+        assert_eq!(runtime.frame_in_flight(), Some(current));
+        assert!(runtime
+            .output_event(OutputEvent::Presented(current.next()))
+            .is_err());
+    }
+
+    /// The count is per stalled frame and consecutive: a completion, or a
+    /// recovery that succeeds, starts it again.
+    #[test]
+    fn a_completion_or_a_recovery_resets_the_failed_recovery_count() {
+        let (chain, log) = crate::drm::testing::chain(120, 80);
+        let mut runtime = Runtime::new(chain);
+        let key = SurfaceKey { client: 1, object: 1 };
+        for (at, heal) in [(30, "completion"), (60, "recovery")] {
+            runtime
+                .pointer_frame(1, at, at, &[], PointerScroll::default())
+                .unwrap();
+            runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+            runtime.flush_paint().unwrap();
+            let late = Instant::now() + FLIP_DEADLINE + Duration::from_secs(1);
+            for _ in 1..MAX_FAILED_RECOVERIES {
+                log.lock().unwrap().fail_next_set = true;
+                runtime.output_watchdog(late).unwrap();
+            }
+            let stalled = runtime.frame_in_flight().unwrap();
+            match heal {
+                "completion" => runtime
+                    .output_event(OutputEvent::Presented(stalled))
+                    .unwrap(),
+                _ => runtime.output_watchdog(late).unwrap(),
+            }
+            assert_eq!(runtime.frame_in_flight(), None, "{heal}");
+        }
+        // Two more failures on a fresh stall are still below the limit.
+        runtime
+            .pointer_frame(1, 90, 90, &[], PointerScroll::default())
+            .unwrap();
+        runtime.flush_paint().unwrap();
+        let late = Instant::now() + FLIP_DEADLINE + Duration::from_secs(1);
+        for _ in 1..MAX_FAILED_RECOVERIES {
+            log.lock().unwrap().fail_next_set = true;
+            runtime.output_watchdog(late).unwrap();
+        }
+        assert!(runtime.frame_in_flight().is_some());
+    }
+
+    /// A paint the completion owes and fails is a failed paint, not a failed
+    /// completion: the completion is accepted, the paint stays owed, and the
+    /// watchdog's next tick takes it.
+    #[test]
+    fn an_owed_paint_that_fails_after_a_completion_stays_owed_for_the_watchdog() {
+        let (chain, log) = crate::drm::testing::chain(120, 80);
+        let mut runtime = Runtime::new(chain);
+        runtime
+            .commit(SurfaceKey { client: 1, object: 1 }, surface([1, 2, 3, 0]))
+            .unwrap();
+        runtime
+            .pointer_frame(1, 30, 30, &[], PointerScroll::default())
+            .unwrap();
+        runtime.flush_paint().unwrap();
+        log.lock().unwrap().fail_next_flip = true;
+        runtime
+            .output_event(OutputEvent::Presented(FrameId::FIRST))
+            .unwrap();
+        assert_eq!(runtime.frame_in_flight(), None);
+        assert!(runtime.paint_pending());
+
+        runtime.output_watchdog(Instant::now()).unwrap();
+        assert_eq!(runtime.frame_in_flight(), Some(FrameId::FIRST.next()));
+        assert!(!runtime.paint_pending());
+    }
+
+    /// fbdev never queues, so every completion is one it cannot place.
+    #[test]
+    fn a_backend_that_never_queued_refuses_every_completion() {
+        let cleanup = Cleanup(std::env::temp_dir().join(format!(
+            "td-runtime-no-queue-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let mut runtime =
+            Runtime::new(Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap());
+        runtime.repaint().unwrap();
+        assert!(runtime
+            .output_event(OutputEvent::Presented(FrameId::FIRST))
+            .is_err());
+        runtime
+            .output_watchdog(Instant::now() + FLIP_DEADLINE + Duration::from_secs(1))
+            .unwrap();
     }
 
     #[test]

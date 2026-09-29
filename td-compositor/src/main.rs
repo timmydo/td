@@ -68,7 +68,7 @@ const MAX_UI_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HELD_KEYS: usize = 256;
 
 fn usage() -> String {
-    "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH \
+    "usage: td-compositor run (--framebuffer PATH | --card PATH) --input DIR --socket PATH \
      --portal-socket PATH [--control-socket PATH] \
      (--launcher-client PATH | --launcher-application NAME \
      --application-ready-socket PATH --application-app-id ID \
@@ -229,8 +229,16 @@ fn run_term(args: &[OsString]) -> Result<(), String> {
     }
 }
 
+/// Where the compositor draws. `Framebuffer` is fbdev; `Card` is a DRM
+/// primary node the KMS backend takes mastership of and flips on.
+#[derive(Debug, Eq, PartialEq)]
+enum OutputDevice {
+    Framebuffer(PathBuf),
+    Card(PathBuf),
+}
+
 struct RunOptions {
-    framebuffer: PathBuf,
+    output: OutputDevice,
     input: PathBuf,
     socket: PathBuf,
     portal_socket: PathBuf,
@@ -250,6 +258,7 @@ struct RunOptions {
 
 fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     let mut framebuffer = None;
+    let mut card = None;
     let mut input = None;
     let mut socket = None;
     let mut portal_socket = None;
@@ -272,6 +281,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             .ok_or_else(|| format!("{flag} requires a value"))?;
         match flag.as_str() {
             "--framebuffer" if framebuffer.is_none() => framebuffer = Some(PathBuf::from(value)),
+            "--card" if card.is_none() => card = Some(PathBuf::from(value)),
             "--input" if input.is_none() => input = Some(PathBuf::from(value)),
             "--socket" if socket.is_none() => socket = Some(PathBuf::from(value)),
             "--portal-socket" if portal_socket.is_none() => {
@@ -308,6 +318,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
                 application_content_rgb_b = Some(value.clone())
             }
             "--framebuffer"
+            | "--card"
             | "--input"
             | "--socket"
             | "--portal-socket"
@@ -326,6 +337,11 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         }
         index += 2;
     }
+    let output = match (framebuffer, card) {
+        (Some(path), None) => OutputDevice::Framebuffer(path),
+        (None, Some(path)) => OutputDevice::Card(path),
+        _ => return Err("exactly one --framebuffer or --card is required".into()),
+    };
     if terminal_client.is_some() == terminal_authority {
         return Err("exactly one --terminal-client or --terminal-authority is required".into());
     }
@@ -393,7 +409,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         }
     }
     Ok(RunOptions {
-        framebuffer: framebuffer.ok_or_else(|| "--framebuffer is required".to_string())?,
+        output,
         input: input.ok_or_else(|| "--input is required".to_string())?,
         socket,
         portal_socket,
@@ -450,27 +466,18 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         })?)
     };
     let task_launcher = launches.task_launcher();
-    let framebuffer = Framebuffer::open(&options.framebuffer)?;
-    let size = framebuffer.dimensions();
-    let geometry = (size.width, size.height, framebuffer.target_stride());
-    // What this backend can put on glass, as DRM fourccs. Reported at start
-    // because the answer is a property of the BACKEND rather than of td: a
-    // KMS backend on the same machine would print a different list, and that
-    // list is the first thing to look at when a format is refused.
-    let scanout: Vec<String> = framebuffer
-        .supported_formats()
-        .iter()
-        .map(|format| {
-            let code = format.code();
-            // A fourcc that is not four printable characters is still a
-            // number worth reading, and hex is the form every DRM header
-            // writes it in.
-            std::str::from_utf8(&code)
-                .map(String::from)
-                .unwrap_or_else(|_| format!("{:#010x}", u32::from_le_bytes(code)))
-        })
-        .collect();
-    let mut runtime = Runtime::new(framebuffer);
+    let (mut runtime, flips, described) = match &options.output {
+        OutputDevice::Framebuffer(path) => {
+            let framebuffer = Framebuffer::open(path)?;
+            let described = describe_output("software", &framebuffer);
+            (Runtime::new(framebuffer), None, described)
+        }
+        OutputDevice::Card(path) => {
+            let (kms, flips, lit) = drm::open_kms(path)?;
+            let described = format!("{} {lit}", describe_output("kms", &kms));
+            (Runtime::new(kms), Some(flips), described)
+        }
+    };
     runtime.enable_attention(options.terminal_authority);
     runtime.set_launcher_application(options.launcher_application.as_deref());
     runtime.set_launcher_task_manager(options.terminal_authority);
@@ -492,6 +499,12 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         )?;
     }
     let runtime = Arc::new(Mutex::new(runtime));
+    // Before the first paint, so the flip it queues has a reader: a
+    // completion that arrived first would wait in the card's queue, but a
+    // reader that failed to start must stop the compositor before it draws.
+    if let Some(flips) = flips {
+        start_flip_threads(flips, &runtime)?;
+    }
     runtime
         .lock()
         .map_err(|_| "runtime lock poisoned".to_string())?
@@ -521,19 +534,94 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     ) {
         eprintln!("td-compositor: {error}");
     }
-    eprintln!(
-        "td-compositor: software output {}x{} stride={} scanout={} inputs={inputs}",
-        geometry.0,
-        geometry.1,
-        geometry.2,
-        scanout.join(",")
-    );
+    eprintln!("td-compositor: {described} inputs={inputs}");
     server::serve(
         &options.socket,
         &options.portal_socket,
         runtime,
         display_policy,
     )
+}
+
+/// One line for the startup diagnostic: the backend's kind, geometry, and
+/// what it can put on glass as DRM fourccs. The formats are a property of the
+/// BACKEND rather than of td, so fbdev and KMS on one machine may differ, and
+/// the list is the first thing to look at when a format is refused.
+fn describe_output(kind: &str, backend: &dyn OutputBackend) -> String {
+    let size = backend.dimensions();
+    let scanout: Vec<String> = backend
+        .supported_formats()
+        .iter()
+        .map(|format| {
+            let code = format.code();
+            // A fourcc that is not four printable characters is still a
+            // number worth reading, and hex is the form every DRM header
+            // writes it in.
+            std::str::from_utf8(&code)
+                .map(String::from)
+                .unwrap_or_else(|_| format!("{:#010x}", u32::from_le_bytes(code)))
+        })
+        .collect();
+    format!(
+        "{kind} output {}x{} stride={} scanout={}",
+        size.width,
+        size.height,
+        backend.target_stride(),
+        scanout.join(",")
+    )
+}
+
+/// How often the watchdog looks at the frame in flight. A fifth of the
+/// deadline, so a stalled flip is recovered within 1.2 deadlines at worst.
+const FLIP_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The KMS backend's two threads: one blocks on the card for completions
+/// and delivers each under the runtime lock, the other bounds the wait for
+/// a completion that never comes.
+///
+/// An error from either ends the process. The reader's are a card it cannot
+/// read and a completion the runtime cannot place; the watchdog's is a
+/// recovery that failed several ticks in a row. Each means the compositor
+/// can no longer learn when a frame reached the screen, so it can never
+/// queue another and would stand frozen while looking alive. Exiting hands
+/// the display back to the supervisor, and the kernel releases mastership
+/// with the descriptors. A failed PAINT is not among them: it stays owed.
+fn start_flip_threads(
+    mut flips: drm::FlipEvents,
+    runtime: &Arc<Mutex<Runtime>>,
+) -> Result<(), String> {
+    let completions = Arc::clone(runtime);
+    std::thread::Builder::new()
+        .name("td-kms-flips".into())
+        .spawn(move || loop {
+            let delivered = flips.next().and_then(|frame| {
+                completions
+                    .lock()
+                    .map_err(|_| "runtime lock poisoned".to_string())?
+                    .output_event(output::OutputEvent::Presented(frame))
+            });
+            if let Err(error) = delivered {
+                eprintln!("td-compositor: page-flip completion: {error}");
+                process::exit(1);
+            }
+        })
+        .map_err(|error| format!("start the page-flip reader: {error}"))?;
+    let watched = Arc::clone(runtime);
+    std::thread::Builder::new()
+        .name("td-kms-watchdog".into())
+        .spawn(move || loop {
+            std::thread::sleep(FLIP_WATCHDOG_INTERVAL);
+            let checked = watched
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())
+                .and_then(|mut runtime| runtime.output_watchdog(std::time::Instant::now()));
+            if let Err(error) = checked {
+                eprintln!("td-compositor: page-flip watchdog: {error}");
+                process::exit(1);
+            }
+        })
+        .map_err(|error| format!("start the page-flip watchdog: {error}"))?;
+    Ok(())
 }
 
 fn selftest() -> Result<(), String> {
@@ -1478,6 +1566,10 @@ mod confinement {
                 < run.find("Framebuffer::open").unwrap()
         );
         assert!(
+            run.find("authority::Launcher::connect()").unwrap()
+                < run.find("drm::open_kms").unwrap()
+        );
+        assert!(
             run.find("authority::Launcher::connect()").unwrap() < run.find("input::start").unwrap()
         );
     }
@@ -1518,8 +1610,8 @@ mod confinement {
         assert_eq!(occurrences(SHARED_SHA256, "core::arch::asm!"), 0);
     }
 
-    /// Four scoped `unsafe` bodies, and the fourth is a different CLASS from
-    /// the other three.
+    /// Four scoped `unsafe` bodies plus the mapping's `Send`, and the fourth
+    /// body is a different CLASS from the other three.
     ///
     /// `syscall5`, `syscall6` and the descriptor adoption are instruction
     /// one-shots: the unsafe begins at an instruction and ends when it returns,
@@ -1529,8 +1621,14 @@ mod confinement {
     /// the mapping — the lifetime-carrying class `UNSAFE.md` §6 budgeted before
     /// any of it existed. Pinning each body by its exact text is what stops a
     /// fifth from arriving quietly beside them.
+    ///
+    /// The fifth ALLOWANCE is not a body. The KMS backend lives in the
+    /// runtime, which crosses threads behind its lock, so the region that
+    /// owns a mapping must be `Send`; a raw pointer field makes it `!Send`
+    /// by default. The impl is pinned whole, and `Sync` is pinned absent:
+    /// a shared reference lends nothing, so nothing needs it.
     #[test]
-    fn four_scoped_unsafe_bodies_are_the_syscalls_the_adoption_and_the_mapping() {
+    fn scoped_unsafe_is_the_syscalls_the_adoption_the_mapping_and_its_send() {
         let syscall_body = r#"#[allow(unsafe_code)]
 fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
     let result: isize;
@@ -1595,8 +1693,13 @@ fn syscall6(
         // `&mut self` exists, and the returned borrow cannot outlive it.
         unsafe { core::slice::from_raw_parts_mut(self.address, self.length) }
     }"#;
-        assert_eq!(occurrences(SYS, "#[allow(unsafe_code)]"), 4);
+        let send_impl = r#"#[allow(unsafe_code)]
+unsafe impl Send for MappedRegion {}"#;
+        assert_eq!(occurrences(SYS, "#[allow(unsafe_code)]"), 5);
         assert_eq!(occurrences(SYS, "unsafe {"), 4);
+        assert_eq!(occurrences(SYS, "unsafe impl"), 1);
+        assert_eq!(occurrences(SYS, send_impl), 1);
+        assert!(!SYS.contains("impl Sync"));
         assert_eq!(occurrences(SYS, "core::arch::asm!"), 2);
         assert_eq!(occurrences(SYS, syscall_body), 1);
         assert_eq!(occurrences(SYS, syscall6_body), 1);
@@ -2028,9 +2131,47 @@ fn syscall6(
         ] {
             assert!(drm.contains(guard), "{guard} is gone");
         }
-        // Each release is issued from exactly one place: its guard.
-        assert_eq!(occurrences(drm, "sys::drm_rm_fb("), 1);
-        assert_eq!(occurrences(drm, "sys::drm_set_master("), 1);
+        // Each release is issued from exactly one place per family: its guard
+        // for the borrowed modeset, and `Registration` for the backend's
+        // owned buffers. Mastership is TAKEN twice -- by the probe's modeset
+        // and by `open_kms`, which keeps it for the backend's life.
+        assert_eq!(occurrences(drm, "sys::drm_rm_fb("), 2);
+        assert_eq!(occurrences(drm, "sys::drm_set_master("), 2);
+        // The backend's teardown is the same order in two places. The chain
+        // declares its CRTC before its buffers, so the restore runs before
+        // any framebuffer it may be scanning out is unregistered; and the
+        // CRTC's own drop restores before it gives mastership back, because
+        // the restore is a `SETCRTC`.
+        let chain = drm
+            .find("pub struct SwapChain<C, M> {")
+            .and_then(|start| drm.get(start..))
+            .expect("drm.rs no longer declares SwapChain");
+        let chain = chain.get(..chain.find("\n}").unwrap_or(chain.len())).unwrap_or_default();
+        let crtc_field = chain.find("    crtc: C,").expect("SwapChain lost its CRTC field");
+        let buffers_field = chain
+            .find("    buffers: [Slot<M>; 2],")
+            .expect("SwapChain lost its buffers field");
+        assert!(
+            crtc_field < buffers_field,
+            "SwapChain declares its buffers before its CRTC, so the framebuffers are \
+             unregistered while the CRTC still scans one out"
+        );
+        assert!(!drm.contains("Drop for SwapChain"));
+        let teardown = drm
+            .find("impl Drop for CardCrtc {")
+            .and_then(|start| drm.get(start..))
+            .expect("CardCrtc no longer releases in a Drop");
+        let teardown = teardown.get(..teardown.find("\n}").unwrap_or(teardown.len())).unwrap_or_default();
+        let restore_call = teardown
+            .find("sys::drm_set_crtc(&*self.card, &self.saved, &mut self.routed)")
+            .expect("CardCrtc no longer restores its saved state");
+        let master_call = teardown
+            .find("sys::drm_drop_master(&*self.card)")
+            .expect("CardCrtc no longer gives mastership back");
+        assert!(
+            restore_call < master_call,
+            "CardCrtc gives mastership back before the restore that needs it"
+        );
         let start = drm
             .find("pub struct Modeset<'card, 'frame> {")
             .expect("drm.rs no longer declares Modeset");
@@ -2125,9 +2266,44 @@ fn syscall6(
             "DumbFrame grew a destructor, which runs before its fields drop"
         );
         // The handle's own guard is what performs the release, and it is the
-        // only place that does.
+        // only place that does -- one guard per family, as for `RMFB`.
         assert!(drm.contains("impl Drop for DumbHandle"));
-        assert_eq!(occurrences(drm, "sys::drm_destroy_dumb("), 1);
+        assert!(drm.contains("impl Drop for Registration"));
+        assert_eq!(occurrences(drm, "sys::drm_destroy_dumb("), 2);
+        // The backend's buffer releases in the same order, by the same means:
+        // mapping declared before registration, no destructor of its own, and
+        // inside the registration the framebuffer before the handle it names.
+        assert!(!drm.contains("impl Drop for ScanoutBuffer"));
+        let owned = drm
+            .find("pub struct ScanoutBuffer {")
+            .and_then(|start| drm.get(start..))
+            .expect("drm.rs no longer declares ScanoutBuffer");
+        let owned = owned.get(..owned.find('}').unwrap_or(owned.len())).unwrap_or_default();
+        let owned_region = owned
+            .find("region: sys::MappedRegion,")
+            .expect("ScanoutBuffer no longer holds its mapping by that name");
+        let owned_registration = owned
+            .find("registration: Registration,")
+            .expect("ScanoutBuffer no longer holds its registration by that name");
+        assert!(
+            owned_region < owned_registration,
+            "ScanoutBuffer declares its registration before its mapping"
+        );
+        let released = drm
+            .find("impl Drop for Registration {")
+            .and_then(|start| drm.get(start..))
+            .expect("Registration no longer releases in a Drop");
+        let released = released.get(..released.find("\n}").unwrap_or(released.len())).unwrap_or_default();
+        let unregister = released
+            .find("sys::drm_rm_fb(&*self.card, self.fb_id)")
+            .expect("Registration no longer unregisters its framebuffer");
+        let destroy = released
+            .find("sys::drm_destroy_dumb(&*self.card, self.handle)")
+            .expect("Registration no longer frees its handle");
+        assert!(
+            unregister < destroy,
+            "Registration frees the handle before unregistering the framebuffer on it"
+        );
         let start = drm
             .find("pub struct DumbFrame<'card> {")
             .expect("drm.rs no longer declares DumbFrame");
@@ -2385,6 +2561,19 @@ pub struct MappedRegion {
             "sys::drm_page_flip(card, modeset.crtc_id(), fb_id, cookie)?;",
             "let _ = sys::drm_rm_fb(self.card, self.fb_id);",
             "let _ = sys::drm_drop_master(self.card);",
+            // The owned backend's twelve.
+            "sys::drm_set_master(&card).map_err(|error| {",
+            "let saved = sys::drm_get_crtc(&card, scanout.crtc_id)?;",
+            "let buffer = sys::drm_create_dumb(&**card, width, height)?;",
+            "let region = sys::drm_map_dumb(&**card, &buffer)?;",
+            "sys::drm_add_fb(&**card, width, height, buffer.pitch, buffer.handle)?;",
+            "let _ = sys::drm_rm_fb(&*self.card, self.fb_id);",
+            "let _ = sys::drm_destroy_dumb(&*self.card, self.handle);",
+            "sys::drm_page_flip(&*self.card, self.crtc_id, fb_id, cookie)",
+            "sys::drm_set_crtc(&*self.card, &wanted, &mut connectors)?;",
+            "let live = sys::drm_get_crtc(&*self.card, self.crtc_id)?;",
+            "if let Err(error) = sys::drm_set_crtc(&*self.card, &self.saved, &mut self.routed) {",
+            "let _ = sys::drm_drop_master(&*self.card);",
         ] {
             assert!(drm.contains(call), "drm.rs no longer spells `{call}`");
         }
@@ -2400,7 +2589,13 @@ pub struct MappedRegion {
         // four release calls is reached from a `Drop` and from nowhere else,
         // which is what makes the unwind a property of field order rather than
         // of a path some early return can miss.
-        assert_eq!(occurrences(drm, "sys::drm_"), 23);
+        //
+        // The owned backend adds twelve, one per step of its life: take
+        // mastership and save the CRTC; allocate, map and register each
+        // buffer; flip, set and read back; and restore, give back, unregister
+        // and free on the way out. Its discovery and routing reads are the
+        // SAME functions the probes call, so they add nothing here.
+        assert_eq!(occurrences(drm, "sys::drm_"), 35);
         // `drm_add_fb` is pinned by COUNT as well as by spelling, because it
         // is the worst of these to get wrong: four bare `u32`s in a row, so
         // swapping width for height, or pitch for handle, type-checks, passes
@@ -2410,10 +2605,12 @@ pub struct MappedRegion {
         // flip registers the frame it flips to. Each is followed immediately by
         // its own `FbGuard`, which is the property that matters and the reason
         // a second one is not a smell.
-        assert_eq!(occurrences(drm, "sys::drm_add_fb("), 2);
+        // And a third: the backend registers each buffer once, at
+        // allocation, and flips between the two registrations for its life.
+        assert_eq!(occurrences(drm, "sys::drm_add_fb("), 3);
         assert_eq!(occurrences(drm, "sys::drm_resources("), 2);
-        // One queue, and no second: a page flip is issued from `Flip` alone.
-        assert_eq!(occurrences(drm, "sys::drm_page_flip("), 1);
+        // One queue per family: the probe's `Flip`, and the backend's CRTC.
+        assert_eq!(occurrences(drm, "sys::drm_page_flip("), 2);
         let production_main = production(MAIN);
         for (name, source) in std::iter::once(("main.rs", production_main))
             .chain(OTHER.iter().copied())
@@ -2807,7 +3004,31 @@ pub struct MappedRegion {
         assert!(super::parse_run(&demo).is_err());
 
         let resolved_parent = std::fs::canonicalize(&actual).unwrap();
-        assert_eq!(options.framebuffer, std::path::PathBuf::from("/dev/fb0"));
+        assert_eq!(
+            options.output,
+            super::OutputDevice::Framebuffer(std::path::PathBuf::from("/dev/fb0"))
+        );
+        // The card instead of fbdev, and never both or neither.
+        let fresh = valid(&wayland, &portal, &ready);
+        let at = fresh
+            .iter()
+            .position(|word| word == "--framebuffer")
+            .unwrap();
+        let mut card = fresh.clone();
+        card[at] = "--card".into();
+        card[at + 1] = "/dev/dri/card0".into();
+        assert_eq!(
+            super::parse_run(&card).unwrap().output,
+            super::OutputDevice::Card(std::path::PathBuf::from("/dev/dri/card0"))
+        );
+        let mut both_outputs = fresh.clone();
+        both_outputs.extend(["--card".into(), "/dev/dri/card0".into()]);
+        assert!(super::parse_run(&both_outputs).is_err());
+        let mut neither = fresh;
+        neither.drain(at..at + 2);
+        assert!(super::parse_run(&neither)
+            .err()
+            .is_some_and(|error| error.contains("exactly one --framebuffer or --card")));
         assert_eq!(options.launcher_client, None);
         assert_eq!(options.launcher_application.as_deref(), Some("td-jail-fixture"));
         assert_eq!(

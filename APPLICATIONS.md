@@ -8597,13 +8597,14 @@ ran out, and neither is a decision an accessor can make for it.
 `Surface::resident_bytes` is deleted rather than left beside the charge,
 since a number meaning "bytes" is what this row replaces.
 
-Row 3: `td-compositor/src/output.rs` holds `OutputBackend`, with
-`Framebuffer` as its one implementation. Its required methods are `output`,
-`supported_formats`, `begin_frame(damage)`, `present` and `poll_events`, and
-it provides two more: `dimensions`, a view of `output` since row 6, and
-`paint`, which is defined as submit.
+Row 3: `td-compositor/src/output.rs` holds `OutputBackend`, implemented by
+fbdev's `Framebuffer` and by the KMS swap chain in `drm.rs`. Its required
+methods are `output`, `supported_formats`, `begin_frame(damage)`, `present`,
+`frame_presented` and `recover_stalled_frame`, and it provides two more:
+`dimensions`, a view of `output` since row 6, and `paint`, which is defined
+as submit.
 It returns a `Submission`, so no caller can read a return as pixels on glass;
-fbdev answers `Presented` and a KMS backend will answer `Queued`. The
+fbdev answers `Presented` and the KMS backend answers `Queued`. The
 whole-output repair a tiling command reaches for is now `Damage::Whole` passed
 in rather than a reach into fbdev's shadow copy, which is the same request
 stated in terms a backend without a shadow copy can honour. Formats are
@@ -8611,16 +8612,18 @@ answered as a `Fourcc` newtype, which is what actually keeps the DRM namespace
 apart from `wl_shm`'s — an alias would have left both as `u32` and prevented
 nothing.
 
-Two things that row did NOT get, recorded because assuming otherwise is the
-expensive mistake. `Runtime` now holds any backend through the trait, but
-fbdev is still the only one, so substituting a backend remains outstanding.
-And `poll_events` has no caller,
-because the delivery path is asynchronous and the presentation-dependent
-evidence published on submit today would announce a frame that is not yet on
-glass. The third reason listed here — that a completion could not be matched to
-its frame — has since been removed by the page-flip landing: both `Submission`
-and `OutputEvent` now carry a `FrameId`, and it is the `u64` the flip ioctl
-already round-trips through the kernel. `td-compositor/DESIGN.md` carries the list.
+The KMS backend has landed behind `run --card`, and completions are
+DELIVERED rather than polled: a thread blocks on a duplicate of the card
+descriptor and hands each one to the runtime, which holds one flip in flight
+and owes any paint requested meanwhile. A watchdog recovers a flip that never
+completes by modeset. One thing that row still does NOT get, recorded because
+assuming otherwise is the expensive mistake: the presentation-dependent
+evidence published on submit — application readiness, and the trusted
+prompt's presentation — has not moved to completion. So the image still
+runs fbdev. The earlier blocker, that a completion could not be matched to
+its frame, was removed by the page-flip landing: both `Submission` and
+`OutputEvent` carry a `FrameId`, and it is the `u64` the flip ioctl already
+round-trips through the kernel. `td-compositor/DESIGN.md` carries the design.
 
 Row 6: `Output` names the screen — an `OutputId`, the scanout dimensions, an
 `OutputScale` and an `OutputTransform` — and a backend answers it rather than
@@ -8716,9 +8719,8 @@ which half. A one-shot probe can wait for its own flip; a compositor cannot,
 because a flip arrives asynchronously and draining only from a repaint means an
 idle screen never observes one — the client waits for a frame callback that
 waits for a completion that waits for a repaint that waits for the client. The
-card descriptor has to join the event loop, and that is `poll_events`'
-remaining half. Substituting the backend into `Runtime` waits on it, so
-`Framebuffer` is still the only `OutputBackend` implementation.
+card descriptor has to join the event loop. It since has: the KMS backend
+reads completions on a thread of its own, as row 3 records.
 
 The probe that proves this DISTURBS the screen, which discovery's did not —
 and the mechanism is the modeset, not the mastership. Once this probe's

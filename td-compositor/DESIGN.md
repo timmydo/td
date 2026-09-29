@@ -726,9 +726,10 @@ splits once rather than once per repeat interval. Ordinary keys omit XKB's
 by default. Clients combine that per-key property with
 `wl_keyboard.repeat_info`.
 
-Scanout sits behind `output.rs`'s `OutputBackend`, and `Framebuffer` is its
-one implementation. The trait is `output`, `supported_formats`,
-`begin_frame(damage)`, `present` and `poll_events`, with two provided methods:
+Scanout sits behind `output.rs`'s `OutputBackend`, implemented by fbdev's
+`Framebuffer` and by the KMS swap chain in `drm.rs`. The trait is `output`,
+`supported_formats`, `begin_frame(damage)`, `present`, `frame_presented` and
+`recover_stalled_frame`, with two provided methods:
 `dimensions`, a view of `output()`, and `paint`, which renders a scene into
 the target and submits it. That split is `APPLICATIONS.md` §M's third row, and
 it exists so the fbdev assumptions the renderer had absorbed become one
@@ -738,9 +739,9 @@ backend's answers rather than the shape of the code.
 returns a `Submission`: `Presented` means the pixels are on glass, `Queued`
 means submitted and not yet visible. fbdev always answers `Presented` because
 its `write` returns when the bytes are the device's and there is no later
-event to wait for; a KMS backend answers `Queued` and completes at the page
-flip. Nothing today can produce `Queued`, which is exactly why it is named
-now: a caller written against a `paint` that returned `()` would have encoded
+event to wait for; the KMS backend answers `Queued` and completes at the page
+flip. `Queued` was named before any backend produced it, and that was the
+point: a caller written against a `paint` that returned `()` would have encoded
 "the frame is visible" as an assumption no type could correct, and widening
 the contract afterwards means auditing every caller instead of none.
 `Runtime` therefore keeps the answer in `last_submission` rather than
@@ -762,16 +763,20 @@ and the same request still means the same thing to it. Damage is cleared only
 on a successful paint, so a failed one still owes the whole output —
 `a_failed_paint_keeps_the_whole_output_owed_for_the_next_one` is what holds
 that, and it fails if the clear is hoisted above the paint.
-`poll_events` is on the trait and NOTHING CALLS IT. That is deliberate and is
-the more useful half of this section. A draft of this landing drained it at the
-end of every repaint and answered both events there; three reviewers
-independently showed that response is wrong, and the reasons are the ones a
-KMS author must not rediscover:
+Completions are DELIVERED to the runtime, not polled from a repaint. An
+earlier trait carried a `poll_events` that nothing called, because a draft had
+drained it at the end of every repaint and three reviewers independently
+showed that response wrong. The KMS landing replaced it with
+`frame_presented(frame)`, which the runtime calls when a completion arrives,
+and `recover_stalled_frame(frame)`, which it calls when one does not. The
+reasons the poll was wrong are the constraints the delivery path meets:
 
 - a page flip arrives on the card descriptor asynchronously, so draining only
   from a repaint means an idle screen never observes one. The client waits for
   a frame callback, which waits for a completion, which waits for a repaint,
-  which waits for the client. The descriptor has to join the input event loop.
+  which waits for the client. MET: a thread of its own blocks on a duplicate
+  of the card descriptor and delivers each completion under the runtime lock,
+  the way each input device's reader does.
 - a completion drained after submitting frame N could not be distinguished
   from N-1's, because neither `Submission` nor `OutputEvent` carried a frame
   identity. The draft marked the just-queued frame as on glass. SOLVED by the
@@ -786,7 +791,12 @@ KMS author must not rediscover:
   cursor evidence are published today after a successful submit, which is
   correct while submit means presented; under a backend that answers `Queued`
   they would announce a frame that is not yet on screen, and they have to be
-  retained until the completion arrives.
+  retained until the completion arrives. NOT YET MET, which is why the image
+  still runs fbdev. Under `--card` the trusted prompt refuses to present,
+  because it requires `Presented` from its own paint; its pixels do reach the
+  screen for a frame before the refusal withdraws them. Readiness would be
+  published a vblank early. Hiding the secure-attention overlay returns its
+  input cutoff before the overlay's removal is on glass.
 
 Naming those is what §M asks for. Guessing at the response is what it calls
 painting into the corner.
@@ -875,9 +885,9 @@ backend's:
   by downcasting through a test-only `as_any_mut`, so they are not part of
   the production trait.
 
-What this still does not do is substitute a second backend: the only
-implementation is fbdev. What it claims is the interface, the submit
-semantics, and that nothing in `Runtime` depends on which backend it holds.
+The KMS swap chain is the second implementation, selected by `run --card
+PATH` in place of `--framebuffer PATH`. `Runtime` drives either through the
+trait alone; the only difference it sees is that one answers `Queued`.
 
 The framebuffer is single-buffered from userspace's perspective. The renderer
 allocates its frame storage once and composes a full frame after scene changes.
@@ -3885,6 +3895,8 @@ the kernel's conforming ancillary framing.
 
 `td-compositor/src/sys.rs` has four scoped unsafe blocks: the five- and
 six-argument syscall bodies, descriptor adoption, and mapped-region access.
+A fifth scoped allowance is not a block: `unsafe impl Send for
+MappedRegion`, which lets the KMS backend live in the lock-shared runtime.
 The `syscall5` body carries:
 
 - sendmsg(2), to send the demo client's wl_shm descriptor, the server's XKB
@@ -3924,14 +3936,84 @@ one, and the probe proves the round-trip by queuing a cookie that is not the
 first id a backend would mint — a probe sending 1 and receiving 1 could not
 tell a round-trip from a constant.
 
-What this does NOT do is join the card descriptor to the event loop. The probe
-waits for its own flip with a bounded non-blocking poll, which is right for one
-shot and wrong for a compositor: a flip arrives asynchronously, so draining
-only from a repaint means an idle screen never observes one, and the client
-waits for a frame callback that waits for a completion that waits for a
-repaint. That remains `poll_events`' unsolved half, and the reason the one
-backend `Runtime` is given is still fbdev, although it holds it only
-through the trait.
+The probe waits for its own flip with a bounded non-blocking poll, which is
+right for one shot and wrong for a compositor. The backend instead delivers
+completions from a thread, and its shape is the rest of this subsection.
+
+**The KMS backend** is `SwapChain` in `drm.rs`, built by `open_kms` for
+`run --card`. It opens the card, re-takes the mastership `open_card` gave
+back — permitted to the non-root compositor account only because its
+descriptor was master when opened — and keeps it for the backend's life. It
+then discovers as master, saves the CRTC state and routing, allocates, maps
+and registers two dumb buffers at the mode's size, and modesets onto a
+blanked buffer 0. Both buffers must come back at one pitch, since one frame
+is rendered at it and copied into either.
+
+- **Rendering and copying.** The scene renders into an ordinary CPU frame,
+  which is `composed()`. `present` copies into the BACK buffer only the rows
+  that differ from what that buffer holds, and queues a flip to it tagged with
+  the next `FrameId`. The back buffer is two frames old, so each buffer keeps
+  its own shadow. The shadows also mean the mapping is never read, which on
+  real hardware is write-combined and slow to read. A frame identical to the
+  one on glass answers `Presented` with no flip. `Damage::Whole` marks both
+  buffers for a whole copy, each made when that buffer is next written, and
+  flips even when nothing changed.
+- **One flip at a time.** `present` refuses a second flip while one is queued,
+  and the runtime never asks it to. A repaint requested while a frame is in
+  flight is OWED rather than taken, however many are requested. The completion
+  takes exactly one, which renders the current scene. A burst of commits
+  therefore coalesces into one frame per vblank rather than a queue of stale
+  ones.
+- **Completion.** `FlipEvents` owns a `dup` of the card descriptor, which
+  shares its event queue. It blocks in `read` on a thread of its own and
+  answers each completion's `FrameId`, refusing one that names another CRTC
+  or bytes that do not frame an event. The thread delivers
+  `OutputEvent::Presented` under the runtime lock. The runtime refuses a
+  completion that is not the frame in flight, except a RECOVERED frame's,
+  accepted once. The last eight recoveries are remembered exactly, and a
+  completion older than all of them is late too, as a guest paused across
+  many stalls delivers. On completion the latest paint's `Queued(frame)` becomes
+  `Presented`, and the owed paint is taken. That paint failing is a failed
+  paint, not a failed completion: it is logged and stays owed.
+- **`completed()`** is the front buffer's shadow, and only while nothing is
+  queued. Once a flip is queued, the glass shows the front buffer until a
+  vblank and the back buffer after it, and which of the two is not known
+  until the completion arrives.
+- **The watchdog.** A second thread looks at the frame in flight once a
+  second. A flip unanswered after `FLIP_DEADLINE` (five seconds, the flip
+  probe's bound, for its reason) is recovered by modesetting onto its buffer
+  and reading the CRTC back. It is then treated as completed, so a late
+  completion costs one modeset rather than a frozen screen. That modeset is a
+  blocking commit taken under the runtime lock. It may first wait out the
+  stalled flip, for up to the kernel's own ten-second timeout. A failed
+  recovery leaves the frame queued and `completed()` empty, and is retried on
+  later ticks. With nothing in flight, a tick takes a paint left owed by a
+  failed one. A vblank that is dead rather than slow is beyond repair: later
+  flips are refused, each paint fails and stays owed, and the log says so.
+- **Failure ends the process** only where the compositor can no longer learn
+  when a frame reached the screen: an unreadable card, a completion the
+  runtime cannot place, or `MAX_FAILED_RECOVERIES` failed recoveries in a
+  row. Such a compositor can never queue another frame, and a frozen one that
+  looks alive is worse than a restart. The kernel releases mastership with
+  the descriptors. The one exception is a dead vblank: the recovery
+  "succeeds" and every later flip is refused. A restart cannot revive the
+  vblank, so the process stays up, retrying the owed paint each tick and
+  logging when that starts and stops failing. Up is not usable: the screen is
+  frozen, and a paint failure reaches a committing client as it does under
+  fbdev, as an implementation error that disconnects it.
+- **Teardown.** Teardown mirrors `Modeset`'s order, owned rather than borrowed.
+  `SwapChain` declares its `CardCrtc` before its buffers, so the CRTC is
+  restored first (a `SETCRTC`, while still master) and then mastership is
+  given back. Each `ScanoutBuffer` then unmaps, unregisters its framebuffer,
+  and frees its handle. Confinement tests pin both orders. It runs when a
+  start fails once the CRTC state is saved; a running compositor's backend
+  lives until the process ends. At exit the kernel releases mastership, and
+  `drm_lastclose` restores the fbdev client once the last descriptor
+  closes.
+
+The image still runs fbdev. Presentation-dependent evidence has not yet moved
+to completion (above), and the boot's probes take the mastership the
+compositor would hold.
 
 A modeset unwinds in one order, for a narrower reason than it first appears.
 `SETCRTC` is the only one of the three steps the kernel flags `DRM_MASTER`
@@ -4029,7 +4111,8 @@ and restores the complete prior status word before closing the endpoint. A
 receiver can therefore lose its own transfer but cannot park every later one.
 
 The crate denies unsafe globally; confinement tests pin the allow count, all four
-unsafe bodies, syscall numbers, callers, and the absence of unsafe from every
+unsafe bodies, the region's `Send` and the absence of `Sync`, syscall numbers,
+callers, and the absence of unsafe from every
 other target source file. Each developer tool is a separate crate root that
 also denies unsafe. Adding a syscall or another scoped allow amends this
 document and the repository-wide unsafe inventory.
@@ -4081,8 +4164,12 @@ kernel returned for a buffer this crate created. `MappedRegion` retains the
 construction length, lends a mutable slice whose lifetime is tied to its
 borrow, and unmaps on drop; no pointer escapes. The four scoped unsafe
 bodies cover the two syscall instructions, received-descriptor adoption,
-and the borrowed mapped slice. Confinement tests pin these bodies, the
-mapping construction and length, and its unmap-before-handle-release order.
+and the borrowed mapped slice. The region is also `Send`, and not `Sync`.
+It is the sole owner of a process-wide mapping, and its bytes are reached
+only through `&mut self`, so moving the owner moves the only way in.
+Confinement tests pin these bodies, the `Send`, the mapping construction and
+length, and its unmap-before-handle-release order for the probe's
+`DumbFrame` and the backend's `ScanoutBuffer` alike.
 `UNSAFE.md` §6 records the complete mapping contract.
 
 ## 5. Boot and recovery
