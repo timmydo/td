@@ -6,8 +6,10 @@ This crate owns td's provider-independent cryptographic API. The compiling
 M03a surface contains `Error`, `Entropy`, `Digest` and `Crypto`, extracted
 from td-mta's existing ports. M03b1 admits the private Rustls/AWS-LC
 dependencies and checks their offline host build. It currently implements no production cryptographic algorithm,
-entropy source or TLS session. The backend is exercised only by construction
-and SHA-256 smoke tests.
+entropy source or TLS session. Test-only backend qualification covers explicit
+provider construction, SHA-256, local TLS 1.2/1.3 data exchange, certificate
+verification and malformed/tampered-record refusals in the isolated static
+executable.
 Mocks and interface tests are not cryptographic conformance evidence.
 
 The target dependency graph is:
@@ -95,7 +97,7 @@ in `PORTABLE.md`. It invokes no compiler or upstream script. M03b2b adds the
 pinned host Rust kit and retained td GNU recipe outputs. M03b2c implements the
 isolated static musl build, packaging binary and clean-runtime smoke specified
 in PORTABLE.md. M03b2d1 adds compiler-resolved API confinement;
-M03b2d2 owns bounded TLS qualification.
+M03b2d2 adds the bounded local TLS smoke specified in PORTABLE.md.
 Reuse compatible reviewed pins without inheriting td-net's dependency set.
 Rustls and aws-lc-rs are direct dependencies only of td-crypto, resolving one
 AWS-LC version pair for direct operations and TLS. No second backend enters the

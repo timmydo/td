@@ -245,7 +245,10 @@ This milestone lands in independently checked increments:
   Cargo preflights; API/TLS qualification below still gates M03 completion.
 - **M03b2d1:** implemented compiler-resolved public API confinement in the
   portable command, including conditional-export and backend-type mutations.
-- **M03b2d2:** complete bounded local TLS smoke acceptance.
+- **M03b2d2:** implemented local TLS 1.2/1.3 handshakes, bidirectional data/
+  closure, certificate-signature verification and malformed/tampered-record
+  refusals with bounded fixture work in the
+  clean static runtime. PORTABLE.md defines the smoke and its limits.
   All increments are required before M03 completes.
 
 **Depends on:** M03b1. Prepare inputs in M03b2a/b, qualify the isolated

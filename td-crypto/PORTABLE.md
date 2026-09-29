@@ -4,7 +4,7 @@
 
 M03b2a implements header preparation; M03b2b prepares the remaining Rust and
 GNU tool inputs. M03b2c supplies isolated compilation and static artifact
-qualification. M03b2d1 adds API confinement; TLS smoke remains M03b2d2.
+qualification. M03b2d1 adds API confinement; M03b2d2 adds local TLS smoke.
 This is a host build path for the
 standalone td-mta executable; it does not grant the source-bootstrap provenance
 of td's target image graph. Nothing prepared here is automatically admitted
@@ -233,13 +233,13 @@ must select exactly one expected binary/test profile. Both results must be
 x86-64 static PIEs with an executable entry point and no ELF interpreter,
 DT_NEEDED or runtime search path. A second fresh namespace mounts only the
 result and static test supervisor, then runs the installed name's version command
-and each native SHA-256/provider-construction test in its own process. It has no
-compiler, root-data file, loader or library mounts. Each runtime command has a
+and each SHA-256, provider-construction and TLS smoke test in its own process.
+It has no compiler, root-data file, loader or library mounts. Each runtime command has a
 30-second deadline; each Cargo command has a 20-minute deadline. Parsed Cargo
 stdout is limited to 8 MiB (graphs to 256 KiB); each JSON record is limited to
 256 KiB and 64 nesting levels. Logs on disk are temporary, not a streaming
-output quota. Native/TLS allocation, entropy failure and handshake qualification
-remain M03b2d2/M07; a Result wrapper cannot contain provider aborts.
+output quota. M07 owns native/TLS allocation and entropy-failure qualification;
+a Result wrapper cannot contain provider aborts.
 
 After the compile namespace exits and its descendants are reaped, the host
 requires an exact regular-file output inventory: two binaries and the inner
@@ -275,6 +275,48 @@ for reconstructible build caches. Private `crypto-build-<pid>-<attempt>` trees
 are removed on normal completion/error; after a hard kill remove one only after
 confirming its process ended. Retained artifacts follow the same explicit cache
 cleanup rule as prepared inputs.
+
+## Local TLS smoke
+
+The test-only backend module generates an ephemeral P-256 root and localhost
+leaf with the admitted signing backend. A small fixture DER encoder builds
+certificates valid from 2025-01-01 to 2035-01-01; no external certificate,
+private key, server, OpenSSL command or new dependency is needed. Both peers
+receive an explicit provider and fixed clock. The client trusts only this
+fixture's CA, no roots for the untrusted-chain case, or a same-named CA
+with a different key for the bad-signature case. The process-global
+provider stays unset.
+
+Eight cases run separately in the clean runtime:
+
+- TLS 1.2 and TLS 1.3 each negotiate the requested version, exchange binary
+  plaintext in both directions and observe orderly closure on both peers.
+- TLS 1.3 rejects a wrong DNS name, an untrusted chain and an expired leaf,
+  checking the specific backend certificate error in each case.
+- A server rejects an invalid TLS content type as a malformed record.
+- TLS 1.3 rejects the wrong CA key with a certificate-signature error and
+  rejects a flipped authentication-tag byte with a decryption error.
+
+The round trips assert X25519 key exchange and AES-256-GCM/SHA-384 suites
+for both versions. The fixture certificate and handshake signatures use
+ECDSA P-256/SHA-256. Other suites, key-exchange groups, RSA and alternative
+CPU/assembly paths are not covered by this smoke; M07 qualifies its full
+production policy. This check covers the CPU paths selected on the test host.
+
+Each drive uses a 32 KiB caller buffer and permits at most 256 KiB wire
+traffic and 64 bidirectional turns. Each round-trip case calls drive five
+times. Each connection's Rustls application-data send-buffer limit is
+32 KiB; this does not constrain queued handshake or alert messages.
+Zero progress and exhausted budgets fail the test;
+each case also has the supervisor's 30-second process deadline. A failed
+runtime case prints its captured stdout when it fits the 64 KiB log limit;
+negative tests include the actual backend error in assertion diagnostics.
+Fixture/key
+construction may allocate. These work limits do not bound provider memory,
+CPU time inside a call or stack, and are not the production transport API.
+M07 still owns production TLS policy, adapters, secret handling, allocation
+and fatal-failure qualification. This smoke proves local interoperability
+within the pinned backend, not independent cryptographic conformance.
 
 ## Public API qualification
 

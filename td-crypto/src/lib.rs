@@ -62,6 +62,9 @@ pub trait Crypto: Send + Sync {
 }
 
 #[cfg(test)]
+mod tls_smoke;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn explicit_aws_provider_and_roots_construct_without_global_default(

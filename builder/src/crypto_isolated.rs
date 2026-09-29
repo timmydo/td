@@ -536,6 +536,14 @@ pub(crate) fn runtime_inner() -> Result<()> {
     for (index, case) in [
         "tests::admitted_native_backend_sha256_smoke",
         "tests::explicit_aws_provider_and_roots_construct_without_global_default",
+        "tls_smoke::tls12_local_round_trip",
+        "tls_smoke::tls13_local_round_trip",
+        "tls_smoke::rejects_wrong_server_name",
+        "tls_smoke::rejects_untrusted_chain",
+        "tls_smoke::rejects_expired_certificate",
+        "tls_smoke::rejects_malformed_record",
+        "tls_smoke::rejects_bad_certificate_signature",
+        "tls_smoke::rejects_tampered_ciphertext",
     ]
     .iter()
     .enumerate()
@@ -546,12 +554,13 @@ pub(crate) fn runtime_inner() -> Result<()> {
             .env_clear()
             .stdin(Stdio::null());
         crate::host_bin::arm_check_child(&mut command);
-        let output = bounded_output(
-            &mut command,
-            &format!("crypto-smoke-{index}"),
-            64 * 1024,
-            30,
-        )?;
+        let name = format!("crypto-smoke-{index}");
+        let output = bounded_output(&mut command, &name, 64 * 1024, 30).inspect_err(|_| {
+            let path = Path::new("/output").join(format!("{name}.log"));
+            if let Ok(log) = read_output(&path, &name, 64 * 1024) {
+                eprintln!("portable smoke failure in {case}:\n{log}");
+            }
+        })?;
         if !output
             .lines()
             .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;"))
@@ -559,7 +568,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             return Err(format!("portable smoke case did not execute: {case}"));
         }
     }
-    println!("portable runtime: version, native SHA-256 and explicit Rustls provider passed without toolchain mounts");
+    println!("portable runtime: version, native SHA-256, explicit provider and eight TLS cases passed without toolchain mounts");
     Ok(())
 }
 
