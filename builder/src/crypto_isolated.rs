@@ -640,6 +640,11 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "identity::tests::local_identity_accepts_rsa_issuer_and_refuses_unsupported_algorithms", false),
         ("td-crypto-smoke", "identity::tests::identity_admission_unwind_drops_unpublished_state", false),
         ("td-crypto-smoke", "identity::tests::local_identity_metadata_bounds_and_malformed_values", false),
+        ("td-crypto-smoke", "trust::tests::private_trust_replaces_public_and_other_private_roots", false),
+        ("td-crypto-smoke", "trust::tests::private_trust_bundle_limits_duplicates_and_atomic_refusal", false),
+        ("td-crypto-smoke", "trust::tests::private_trust_anchor_policy_and_ignored_self_signature", false),
+        ("td-crypto-smoke", "trust::tests::public_trust_inventory_and_source_are_fixed", false),
+        ("td-crypto-smoke", "trust::tests::trust_construction_unwind_drops_unpublished_state", false),
         ("td-crypto-smoke", "provider::tests::factory_digest_and_fixed_comparison", false),
         ("td-crypto-smoke", "provider::tests::accepted_pkcs8_variants_and_public_point_known_answer", false),
         ("td-crypto-smoke", "provider::tests::malformed_der_and_inconsistent_keys_are_refused", false),
@@ -714,7 +719,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             println!("portable runtime: {prefix}{bytes}");
         }
     }
-    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity, entropy and P-256/oracle probes, explicit provider, sixteen TLS cases and both bounded configuration stacks passed without toolchain mounts");
+    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit provider, sixteen TLS cases and both bounded configuration stacks passed without toolchain mounts");
     Ok(())
 }
 

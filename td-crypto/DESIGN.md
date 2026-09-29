@@ -10,7 +10,8 @@ streaming SHA-256; its direct operation uses the owned fixed-state primitive.
 M07a3 adds the opaque worker-local entropy handle. M07a4 implements the Crypto
 factory, fixed-size comparison and opaque P-256 key generation/loading/signing.
 M07b1 adds bounded certificate PEM syntax and a P-256 PEM key loader.
-M07b2a adds cold admission of an owned local server identity.
+M07b2a adds cold admission of an owned local server identity. M07b2b adds
+explicit private CA bundles and the pinned public server root set.
 TLS sessions remain unimplemented. Test-only backend qualification covers
 explicit
 provider construction, SHA-256, local TLS 1.2/1.3 data exchange, certificate
@@ -415,19 +416,23 @@ inventory creates temporary cold allocations; this is not an allocation-free
 configuration path. TLS handshake mappings and full configuration policy
 remain M07b3.
 
-Reject duplicate or misordered certificates, and repeated issuer subject/key
-pairs even when their certificate bytes differ. This prevents backend path
-building from bypassing an issuer and its constraints through an equivalent
-anchor or intermediate. Check every supplied adjacent
-issuer name and signature, and the last certificate's self-signature when
-self-issued. Enforce issuer path-length limits, excluding self-issued
-intermediates in the owned check. The backend additionally counts self-issued
-intermediates against non-anchor path-length limits, so some rollover paths
-that pass the owned check are refused. Its stricter refusal can report Other
-or Signature rather than Usage. For a chain with supplied issuers, also run backend path/name
-constraint verification using the last supplied issuer as a temporary
-consistency anchor. Its dates, CA/usage and path length are still checked
-locally; using it for consistency does not trust it on any network peer.
+Reject duplicate or misordered certificates, and repeated issuer
+subject/key pairs even when their certificate bytes differ. The key
+comparison uses native-parsed, reserialized SubjectPublicKeyInfo, so
+compressed/uncompressed EC point aliases compare equal. Original
+certificate bytes remain unchanged. This prevents backend path building
+from bypassing an issuer and its constraints through an equivalent anchor
+or intermediate. Check every supplied adjacent issuer name and signature,
+and the last certificate's self-signature when self-issued. Enforce issuer
+path-length limits, excluding self-issued intermediates in the owned
+check. The backend additionally counts self-issued intermediates against
+non-anchor path-length limits, so some rollover paths that pass the owned
+check are refused. Its stricter refusal can report Other or Signature
+rather than Usage. For a chain with supplied issuers, also run backend
+path/name constraint verification using the last supplied issuer as a
+temporary consistency anchor. Its dates, CA/usage and path length are
+still checked locally; using it for consistency does not trust it on any
+network peer.
 
 An omitted issuer is allowed at a non-self-issued chain tail. Its absent
 key means the tail's issuer signature cannot be verified locally; that
@@ -453,9 +458,79 @@ follows from a returned Result or a synthetic unwind fixture.
 
 Owned vectors reserve checked bounded capacities; the key and native
 verification code still allocate. M07e must charge inputs, decode scratch,
-certificate/name copies, temporary backend inventories/path state, retained
-keys and overlapping generations before the service can use this handle.
+certificate/name copies, temporary native key parsing/canonical public-key
+copies, backend inventories/path state, retained keys and overlapping
+generations before the service can use this handle.
 No listener or outbound adapter is enabled by M07b2a.
+
+### Trust-store admission
+
+`TrustStore::from_pem` constructs an owned explicit private CA store;
+`public_roots` selects only the already pinned webpki-roots server roots.
+There is no append, merge, OS-store read, network fetch or fallback operation.
+An explicit bundle replaces public trust completely. The immutable handle
+retains its source marker and exposes only its count and whether the source
+is public; Debug prints those two fields. It retains no caller input.
+
+Explicit input uses the bounded trust PEM reader: nonempty, at most 128 KiB,
+128 certificates and 16 KiB DER per certificate. Every certificate passes the
+owned metadata parser and strict backend certificate parser; no best-effort
+loader silently skips entries. A malformed later entry, duplicate subject/key
+anchor or construction error refuses the whole store. Duplicate detection
+uses the same canonical key representation as local identity admission. The local v3/date
+syntax/extension-count subset above applies. Input time is not requested:
+anchor certificate dates and signatures are not peer-path validation inputs.
+Even an expired anchor or damaged self-signature can supply explicitly
+trusted name/key material. This is trusted configuration, not a certificate
+identity or proof that its issuer signed it.
+
+The initial explicit private bundle is CA-only, with keyCertSign required
+when KeyUsage is present. It does not implement leaf-certificate pinning.
+Reject any anchor with an EKU, path-length or name-constraints extension in
+this initial subset. Root conversion discards EKU/path length, while name
+constraints need their own admission validation; none may silently become
+broader trust. Such constraints can still occur on peer intermediates and
+are handled by peer path verification. Supporting constrained private anchors
+requires a separate admission/enforcement increment. Unknown critical
+extensions are refused; other noncritical extensions retain the backend's
+ordinary ignore semantics. A local self-signed server leaf remains a valid
+ServerIdentity, independently of the remote endpoint's trust configuration.
+
+Private anchor keys follow the classical public-key inventory: P-256,
+P-384, P-521, Ed25519 or RSA 2048..8192. Parse the key with the admitted native
+safe API during construction after exact raw-format checks. EC keys require
+SEC1 points: uncompressed 04 with 65/97/133 bytes, or compressed 02/03 with
+33/49/67 bytes for P-256/P-384/P-521. Ed25519 requires exactly 32 bytes; RSA
+uses the minimal PKCS#1 public encoding already checked above. Nested SPKI,
+trailing bytes and incompatible encodings are Invalid. Local identity
+issuers share these checks; the local P-256 leaf remains uncompressed only.
+Native key parsing is not a peer signature proof. The certificate's unused
+self/issuer signature need not use an admitted path-signature algorithm.
+Peer verification still uses the separate pinned path/handshake inventories.
+
+Public construction copies the vector of the compiled upstream anchors;
+its subject/key/name-constraint bytes remain borrowed static data. The
+reviewed set currently contains 118 anchors. Existing checksum/lock admission
+pins the data; a test checks the complete retained list and count. It uses
+upstream anchor constraints, without reparsing public roots through the
+narrow private-CA certificate subset. Public trust is allowed only for
+outbound server verification. M07b3's mandatory client-auth factory must
+refuse a handle marked public; this constructor alone authenticates no peer.
+
+Configured-bundle syntax, constraint, duplicate, key and CA/usage refusals
+all return Invalid. Allocation-reserve failures return Capacity; native
+reserialization failures and caught Rust unwinds return Crypto. No peer
+Verification result is produced by trust construction.
+
+Cold construction catches Rust unwinds and drops unpublished state. Checked
+vector reserves, decode scratch, native public-key parsing and owned anchor
+copies remain part of the future M07e generation allocation qualification.
+Native abort/OOM/blocking and unwind-hook limits remain unchanged. Tests use
+disjoint generated CAs to prove complete replacement, ownership after input
+reuse, atomic refusal, caps, supported key families, constraints and fixed
+public inventory. A private client-auth verifier fixture proves certificate
+path usage only, not TLS Finished or gateway authorization. All cases also
+run in the portable artifact; no listener is enabled by this increment.
 
 ### Mutual TLS backend qualification
 

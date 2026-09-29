@@ -30,6 +30,8 @@ mod tls_error;
 pub use tls_error::{TlsError, VerificationFailure};
 mod identity;
 pub use identity::ServerIdentity;
+mod trust;
+pub use trust::TrustStore;
 
 /// Fixed failures carry neither backend diagnostics nor secret input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

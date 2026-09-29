@@ -501,6 +501,46 @@ fn local_identity_chain_constraints_and_maximum_depth() {
         Some(TlsError::Invalid)
     );
 
+    let point = fixture.root.public_key().as_ref();
+    let compressed = [vec![2 | (point[64] & 1)], point[1..33].to_vec()].concat();
+    let spki = seq(&[
+        der(0x30, certificate_algorithms::P256_KEY),
+        der(3, &[vec![0], compressed].concat()),
+    ]);
+    let plain_root = fixture::build(
+        spki.clone(),
+        fixture::signature_algorithm(),
+        &Parameters::new(true),
+        |body| {
+            Ok(fixture
+                .root
+                .sign(&aws_lc_rs::rand::SystemRandom::new(), body)?
+                .as_ref()
+                .to_vec())
+        },
+    )
+    .unwrap();
+    assert!(fixture
+        .admit(&[basic[0].clone(), plain_root], &["localhost"], Some(NOW))
+        .is_ok());
+    let repeated = fixture::build(spki, fixture::signature_algorithm(), &constrained, |body| {
+        Ok(fixture
+            .root
+            .sign(&aws_lc_rs::rand::SystemRandom::new(), body)?
+            .as_ref()
+            .to_vec())
+    })
+    .unwrap();
+    assert_eq!(
+        fixture
+            .admit(
+                &[basic[0].clone(), repeated, basic[1].clone()],
+                &["localhost"],
+                Some(NOW)
+            )
+            .err(),
+        Some(TlsError::Invalid)
+    );
     let mut chain = Vec::new();
     let mut leaf = Parameters::new(false);
     leaf.issuer = b"issuer-1".to_vec();

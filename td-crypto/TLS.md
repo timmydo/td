@@ -3,9 +3,9 @@
 ## Status and ownership
 
 This is the M07 contract for the future public TLS facade. It does not claim
-that its configurations, trust-store admission or sessions are implemented.
-Bounded PEM syntax, P-256 PEM key loading and local ServerIdentity admission
-are implemented; DESIGN.md records their acceptance and output contracts. The existing
+that its configurations or sessions are implemented.
+Bounded PEM syntax, P-256 PEM key loading, local ServerIdentity admission
+and TrustStore construction are implemented; DESIGN.md records their acceptance and output contracts. The existing
 private TLS fixtures qualify selected backend behavior only. Implementations
 must satisfy this contract and the resource/failure qualification in
 DESIGN.md before td-mta enables a listener or an outgoing connection through
@@ -178,7 +178,11 @@ fetch is performed; v1 does not claim online revocation checking. Gateway
 revocation is applied by td-mta's current pin/address policy and
 configuration-generation rules. Client configurations use either the pinned
 public root set or one explicit bundle that replaces it completely.
-Invalid/empty explicit trust is an error. Verify server chain, dates, usage
+Invalid/empty explicit trust is an error. Initial explicit stores admit the
+CA-only, unconstrained-anchor subset specified in DESIGN.md; they refuse
+anchor EKU, path length and name constraints rather than silently discarding
+them. Public roots retain their upstream anchor constraints. Verify server
+chain, dates, usage
 and the supplied DNS name; send that name as SNI. V1 outbound mail/ACME has
 no client identity. The facade need not expose client-certificate signing
 until a real consumer requires it; test-only mutual peers are not public API

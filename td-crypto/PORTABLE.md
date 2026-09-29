@@ -234,7 +234,7 @@ must select exactly one expected binary/test profile. All four results must be
 x86-64 static PIEs with an executable entry point and no ELF interpreter,
 DT_NEEDED or runtime search path. A second fresh namespace mounts only the
 result and static test supervisor, then runs the installed name's version command
-and each SHA-256, mail-format, PEM/identity, entropy, provider-construction, TLS and
+and each SHA-256, mail-format, PEM/identity/trust, entropy, provider-construction, TLS and
 configuration-stack smoke case in its own process.
 It has no compiler, root-data file, loader or library mounts. Each runtime command has a
 30-second deadline; each Cargo command has a 20-minute deadline. Parsed Cargo
@@ -524,3 +524,14 @@ and synthetic Rust construction unwinds. Existing TLS fixtures share their
 certificate generator with these tests. Every case remains in-memory and
 contacts no CA or deployment. This does not qualify trust-store selection,
 TLS sessions or native allocation/stack/RSS admission.
+
+## Trust-store qualification
+
+Five additional cases cover explicit private root replacement with disjoint
+local CAs, server/client certificate usage, fixed public-root inventory,
+input ownership and caps, duplicate/malformed bundle refusal, supported
+anchor key families, the restricted private-CA subset and construction
+unwind. Anchor dates and self-signatures deliberately are not peer identity
+checks. The fixtures qualify material admission and backend path use; they
+do not qualify configuration-role enforcement, TLS Finished, gateway
+permission or the service's resource budget. No test contacts a public server.

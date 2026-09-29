@@ -22,6 +22,7 @@ pub(super) struct Certificate<'a> {
     pub path_length: Option<u64>,
     pub key_usage: Option<u16>,
     pub extended_usage: Option<u8>,
+    pub has_name_constraints: bool,
 }
 
 fn whole_sequence(bytes: &[u8]) -> Result<Der<'_>, TlsError> {
@@ -133,6 +134,7 @@ impl<'a> Certificate<'a> {
             path_length: None,
             key_usage: None,
             extended_usage: None,
+            has_name_constraints: false,
         };
         if !body.0.is_empty() {
             let mut extensions = whole_sequence(body.take(0xa3)?.value)?;
@@ -157,6 +159,7 @@ impl<'a> Certificate<'a> {
                     [0x55, 0x1d, 0x0f] => certificate.key_usage(contents)?,
                     [0x55, 0x1d, 0x25] => certificate.extended_usage(contents)?,
                     [0x55, 0x1d, 0x11] => subject_names(contents)?,
+                    [0x55, 0x1d, 0x1e] => certificate.has_name_constraints = true,
                     _ => {}
                 }
             }

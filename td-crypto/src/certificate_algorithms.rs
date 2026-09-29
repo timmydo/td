@@ -124,6 +124,46 @@ fn select<'a>(
     Ok(selected)
 }
 
+pub(super) fn canonical_key(
+    certificate: &crate::certificate::Certificate<'_>,
+) -> Result<Vec<u8>, TlsError> {
+    use aws_lc_rs::{encoding::AsDer, signature as native};
+    let bytes = certificate.public_key;
+    let ec_shape = |plain, compressed| match bytes.first() {
+        Some(4) => bytes.len() == plain,
+        Some(2 | 3) => bytes.len() == compressed,
+        _ => false,
+    };
+    let (algorithm, valid): (&'static dyn native::VerificationAlgorithm, bool) =
+        match certificate.key_algorithm {
+            P256_KEY => (&native::ECDSA_P256_SHA256_ASN1, ec_shape(65, 33)),
+            P384_KEY => (&native::ECDSA_P384_SHA384_ASN1, ec_shape(97, 49)),
+            P521_KEY => (&native::ECDSA_P521_SHA512_ASN1, ec_shape(133, 67)),
+            ED25519_KEY => (&native::ED25519, bytes.len() == 32),
+            RSA_KEY => {
+                certificate.rsa_size()?;
+                (&native::RSA_PKCS1_2048_8192_SHA256, true)
+            }
+            _ => return Err(TlsError::Invalid),
+        };
+    if !valid {
+        return Err(TlsError::Invalid);
+    }
+    let key = native::ParsedPublicKey::new(algorithm, certificate.public_key)
+        .map_err(|_| TlsError::Invalid)?;
+    let encoded = key.as_der().map_err(|_| TlsError::Crypto)?;
+    let bytes = encoded.as_ref();
+    if bytes.len() > crate::CERTIFICATE_DER_CAPACITY {
+        return Err(TlsError::Crypto);
+    }
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| TlsError::Capacity)?;
+    owned.extend_from_slice(bytes);
+    Ok(owned)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {

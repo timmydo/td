@@ -195,9 +195,12 @@ fn admission(
     parsed
         .try_reserve_exact(chain.len())
         .map_err(|_| TlsError::Capacity)?;
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(chain.len())
+        .map_err(|_| TlsError::Capacity)?;
     for (index, der) in chain.iter().enumerate() {
         let certificate = Certificate::parse(der)?;
-        certificate.rsa_size()?;
+        let canonical = certificate_algorithms::canonical_key(&certificate)?;
         let native = CertificateDer::from(der.as_slice());
         rustls::server::ParsedCertificate::try_from(&native).map_err(|_| TlsError::Invalid)?;
         certificate.valid_at(now)?;
@@ -211,6 +214,7 @@ fn admission(
         {
             return Err(TlsError::Invalid);
         }
+        keys.push(canonical);
         parsed.push(certificate);
     }
     let leaf = parsed.first().ok_or(TlsError::Invalid)?;
@@ -228,11 +232,8 @@ fn admission(
             .get(1..index)
             .ok_or(TlsError::Crypto)?
             .iter()
-            .any(|earlier| {
-                earlier.subject == issuer.subject
-                    && earlier.key_algorithm == issuer.key_algorithm
-                    && earlier.public_key == issuer.public_key
-            })
+            .zip(keys.get(1..index).ok_or(TlsError::Crypto)?)
+            .any(|(earlier, key)| earlier.subject == issuer.subject && Some(key) == keys.get(index))
         {
             return Err(TlsError::Invalid);
         }

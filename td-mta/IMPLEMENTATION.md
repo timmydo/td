@@ -671,10 +671,13 @@ Implement the remaining work as independently reviewable increments:
     fixtures cover RSA issuers and malformed/refused material. Inspection
     exposes public certificate/name data only. This grants no remote trust
     and enables no serving path; absent chain-tail issuers remain unchecked.
-  - **M07b2b — trust stores:** implement explicit bundle admission and pinned
-    public-root selection with complete replacement, no silent skipped roots
-    and no implicit OS/network source. Qualify private/public trust separately
-    before configuration construction.
+  - **M07b2b — trust stores:** implemented opaque explicit private CA bundles
+    and pinned public-root selection with complete replacement, no skipped
+    malformed roots and no implicit OS/network source. Initial private anchors
+    refuse EKU/path-length/name constraints as specified in td-crypto/DESIGN.md.
+    Generated fixtures qualify replacement, usage, limits and atomic refusal.
+    Configuration-role enforcement remains M07b3; no peer is authenticated by
+    material construction alone.
 - **M07b3 — explicit TLS configuration:** compile opaque shareable handles,
   fixed algorithm inventories, SNI/ALPN selection and supplied-clock bridge.
   Test excluded algorithms, no global provider, mandatory gateway client
