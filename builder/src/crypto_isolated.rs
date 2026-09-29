@@ -533,6 +533,32 @@ fn stage_sources(root: &Path, destination: &Path) -> Result<()> {
             Err(e) => return Err(format!("inspect crate tests: {e}")),
         }
     }
+    for (package, directory, names) in [
+        ("engine", "src", &["sha256.rs"][..]),
+        ("td-secret", "src", &["fido_p256.rs"][..]),
+        ("td-secret", "tests", &["p256_vectors.txt"][..]),
+    ] {
+        for ancestor in [root.join(package), root.join(package).join(directory)] {
+            if !fs::symlink_metadata(&ancestor)
+                .map_err(|e| format!("inspect oracle source directory: {e}"))?
+                .is_dir()
+            {
+                return Err("oracle source ancestors must be directories, not links".into());
+            }
+        }
+        let target = destination.join(package).join(directory);
+        fs::create_dir_all(&target).map_err(|e| format!("create oracle source directory: {e}"))?;
+        for name in names {
+            let input = root.join(package).join(directory).join(name);
+            if !fs::symlink_metadata(&input)
+                .map_err(|e| format!("inspect oracle source: {e}"))?
+                .is_file()
+            {
+                return Err("oracle sources must be regular files, not links".into());
+            }
+            source_tree(&input, &target.join(name), 0)?;
+        }
+    }
     Ok(())
 }
 
@@ -597,6 +623,23 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "entropy::tests::local_randomness_smoke", false),
         ("td-crypto-smoke", "entropy::tests::construction_requires_nonempty_successful_initialization", false),
         ("td-crypto-smoke", "entropy::tests::synthetic_partial_error_clears_the_entire_caller_slice", false),
+        ("td-crypto-smoke", "provider::tests::factory_digest_and_fixed_comparison", false),
+        ("td-crypto-smoke", "provider::tests::accepted_pkcs8_variants_and_public_point_known_answer", false),
+        ("td-crypto-smoke", "provider::tests::malformed_der_and_inconsistent_keys_are_refused", false),
+        ("td-crypto-smoke", "provider::tests::generated_keys_and_signatures_pass_independent_verification", false),
+        ("td-crypto-smoke", "provider::tests::capacity_failure_and_retired_keys_preserve_caller_output", false),
+        ("td-crypto-smoke", "provider::tests::shared_key_serializes_success_and_terminal_failure", false),
+        ("td-crypto-smoke", "sha256_oracle::tests::empty_input", false),
+        ("td-crypto-smoke", "sha256_oracle::tests::abc", false),
+        ("td-crypto-smoke", "sha256_oracle::tests::two_block_message", false),
+        ("td-crypto-smoke", "sha256_oracle::tests::million_a", false),
+        ("td-crypto-smoke", "p256_oracle::tests::independent_modular_arithmetic_covers_carries_and_borrows", false),
+        ("td-crypto-smoke", "p256_oracle::tests::nist_ecdh_and_openssl_scalar_boundaries_match", false),
+        ("td-crypto-smoke", "p256_oracle::tests::nist_signature_acceptance_and_refusal_and_rare_x_reduction", false),
+        ("td-crypto-smoke", "p256_oracle::tests::nist_public_key_validation_preserves_overwide_rejections", false),
+        ("td-crypto-smoke", "p256_oracle::tests::scalar_and_coordinate_admission_never_reduce_untrusted_values", false),
+        ("td-crypto-smoke", "p256_oracle::tests::exceptional_point_cases_and_projective_representations", false),
+        ("td-crypto-smoke", "p256_oracle::tests::signature_scalar_ranges_and_infinity_result_are_refused", false),
         ("td-crypto-smoke", "tests::explicit_aws_provider_and_roots_construct_without_global_default", false),
         ("td-crypto-smoke", "tls_smoke::tls12_local_round_trip", false),
         ("td-crypto-smoke", "tls_smoke::tls13_local_round_trip", false),
@@ -646,7 +689,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             println!("portable runtime: {prefix}{bytes}");
         }
     }
-    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, entropy probes, explicit provider, eight TLS cases and both bounded configuration stacks passed without toolchain mounts");
+    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, entropy and P-256/oracle probes, explicit provider, eight TLS cases and both bounded configuration stacks passed without toolchain mounts");
     Ok(())
 }
 
@@ -922,8 +965,36 @@ mod tests {
             fs::create_dir(path.join(".cargo")).unwrap();
             fs::write(path.join(".cargo/config.toml"), "do not copy").unwrap();
         }
+        for relative in ["engine/src/sha256.rs", "td-secret/src/fido_p256.rs", "td-secret/tests/p256_vectors.txt"] {
+            let input = root.join(relative);
+            fs::create_dir_all(input.parent().unwrap()).unwrap();
+            fs::write(input, relative).unwrap();
+        }
+        fs::write(root.join("engine/src/not-an-oracle.rs"), "excluded").unwrap();
         let destination = scratch.0.join("staged");
         stage_sources(&root, &destination).unwrap();
+        for relative in ["engine/src/sha256.rs", "td-secret/src/fido_p256.rs", "td-secret/tests/p256_vectors.txt"] {
+            assert_eq!(fs::read(destination.join(relative)).unwrap(), relative.as_bytes());
+        }
+        assert!(!destination.join("engine/src/not-an-oracle.rs").exists());
+        fs::remove_file(root.join("td-secret/tests/p256_vectors.txt")).unwrap();
+        assert!(stage_sources(&root, &scratch.0.join("missing-oracle"))
+            .unwrap_err().starts_with("inspect oracle source:"));
+        symlink("../../engine/src/sha256.rs", root.join("td-secret/tests/p256_vectors.txt")).unwrap();
+        assert_eq!(stage_sources(&root, &scratch.0.join("linked-oracle")).unwrap_err(),
+            "oracle sources must be regular files, not links");
+        fs::remove_file(root.join("td-secret/tests/p256_vectors.txt")).unwrap();
+        fs::write(root.join("td-secret/tests/p256_vectors.txt"), "restored").unwrap();
+        for (index, relative) in ["engine", "engine/src", "td-secret", "td-secret/src", "td-secret/tests"].iter().enumerate() {
+            let source = root.join(relative);
+            let retained = scratch.0.join("retained-oracle-directory");
+            fs::rename(&source, &retained).unwrap();
+            symlink(&retained, &source).unwrap();
+            assert_eq!(stage_sources(&root, &scratch.0.join(format!("linked-oracle-parent-{index}"))).unwrap_err(),
+                "oracle source ancestors must be directories, not links");
+            fs::remove_file(&source).unwrap();
+            fs::rename(&retained, &source).unwrap();
+        }
         assert!(!destination.join("td-mta/.cargo").exists());
         assert!(!destination.join("td-mta/build.rs").exists());
         fs::write(root.join("td-mta/src/lib.rs"), "changed").unwrap();

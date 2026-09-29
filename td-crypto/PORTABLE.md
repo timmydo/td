@@ -195,8 +195,9 @@ fetch declared fixed-output sources. Compilation runs without network access.
 The ordinary Cargo preflight still qualifies the host build; it does not
 silently claim to have run this separately provisioned portable command.
 
-The driver stages only both crates' manifests, locks, `src/` and optional
-`tests/`, refusing symlinks and special files. It rechecks staged manifest/lock
+The driver stages both crates' manifests, locks, `src/` and optional `tests/`,
+plus the three test-only oracle files listed below. It refuses symlinks and
+special files. It rechecks staged manifest/lock
 pins, reconstructs the verified vendor tree, and mounts these inputs read-only.
 It uses the existing source-fingerprinted static td-builder helper for namespace
 entry, host linking and failing fallback decoys. This helper is host control
@@ -324,6 +325,26 @@ These cases do not induce native RNG failure or prove recovery from native
 abort/OOM or bounded native wait time. Process-wide/per-thread state, shared
 locks, direct native stderr, warm-up, cleanup and remaining allocation/stack/RSS
 qualification follow DESIGN.md. No service is enabled by this probe.
+
+## Crypto factory and P-256 qualification
+
+The existing crypto smoke executable also runs the factory/comparison, accepted
+PKCS#8 forms/public-point answer, malformed/inconsistent-key refusal,
+generated-key/signature verification, output/retirement and shared-key cases.
+Its independent test-only oracles reuse exactly engine/src/sha256.rs,
+td-secret/src/fido_p256.rs and td-secret/tests/p256_vectors.txt. Stage these
+regular files at their original relative paths and include their bytes in the
+source digest. Missing files, symlinks and non-directory ancestors refuse the
+build. No other engine/td-secret file is staged and no Cargo dependency is
+added. Neither oracle is compiled into the installed td-mta executable.
+
+The runtime separately runs the oracle's four SHA-256 known-answer cases and
+all seven P-256 arithmetic, point, range and signature-vector cases, requiring
+one exact passing result for each. Functional comparison results do not prove
+constant-time lowering. Key/signing returned-error and unwind injection do not
+induce native RNG failure; native allocation, blocking, stack/RSS and timing
+qualification remain M07 obligations. DESIGN.md owns the accepted key formats,
+secret lifecycle, output/retirement contract and native failure limits.
 
 ## Mail-format digest qualification
 

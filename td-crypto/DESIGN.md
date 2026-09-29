@@ -7,7 +7,8 @@ M03a surface contains `Error`, `Entropy`, `Digest` and `Crypto`, extracted
 from td-mta's existing ports. M03b1 admits the private Rustls/AWS-LC
 dependencies and checks their offline host build. M07a1 implements opaque
 streaming SHA-256 through the private AWS-LC backend. M07a3 adds the opaque
-worker-local entropy handle. Signing-key operations and TLS sessions remain
+worker-local entropy handle. M07a4 implements the Crypto factory, fixed-size
+comparison and opaque P-256 key generation/loading/signing. TLS sessions remain
 unimplemented. Test-only backend qualification covers explicit
 provider construction, SHA-256, local TLS 1.2/1.3 data exchange, certificate
 verification and malformed/tampered-record refusals in the isolated static
@@ -82,6 +83,10 @@ are cold operations; callers supply output capacity and account for retained
 key state. Signing consumes message bytes and applies SHA-256 once as part of
 ES256. No undocumented prehash convention. `equal_digest` uses reviewed
 constant-time code; ordinary Rust equality is not its production implementation.
+
+After public-point extraction or signing fails, discard the key; implementations
+must refuse later operations, including mocks. Crypto output buffers remain
+unchanged on returned errors.
 
 The four fixed errors are Capacity for insufficient output, Invalid for
 malformed/unsupported/inconsistent key input, Entropy for recoverable random
@@ -158,7 +163,7 @@ or compiler/caller copies.
 `Sha256::try_new` creates one opaque digest operation. Initialization is cold
 and may allocate provider state; failure returns `Error::Crypto`. `Digest`
 updates stream directly into that state without retaining whole input chunks;
-native state retains up to 63 bytes of a partial block. The future concrete
+native state retains up to 63 bytes of a partial block. The concrete
 `Crypto` factory delegates to the same `Sha256::try_new` constructor.
 Checked total input length cannot exceed `u64::MAX / 8` bytes, the SHA-256
 bit-length limit. Length refusal or a provider update failure retires the
@@ -204,8 +209,86 @@ and the public provider API exposes no reset operation. Constructing one per
 message cannot satisfy td-mta's no-allocation hot-path contract by calling it
 admission work. Cold configuration/startup work can use this facade; reusable
 state or a separately qualified implementation is required before hot-path
-hashing is enabled. The remaining Crypto operations and concrete factory
-are pending.
+hashing is enabled. The factory and P-256 operations below use the same
+resource restrictions.
+
+### Crypto factory and P-256 signing keys
+
+`Provider` is a stateless td-owned implementation of `Crypto`; creating it does
+not initialize native state or warm a worker. Its SHA-256 factory delegates to
+`Sha256::try_new`. Fixed 32-byte equality calls the admitted provider's
+constant-time comparison (`CRYPTO_memcmp`), with no ordinary-equality fallback.
+Functional comparison tests do not establish exact-artifact timing behavior.
+
+`P256Key` owns the backend key behind a private mutex. Public-point extraction
+and signing serialize on that handle. Each operation takes ownership of the
+native key inside the same narrow unwind boundary; only success restores it.
+A returned operation error or Rust unwind drops the key and leaves the handle
+retired. Later operations fail Crypto; a poisoned mutex also refuses access.
+No clone, private-scalar export or backend handle is exposed. The mutex can
+block; these operations have no timeout/cancellation mechanism. M07 must fit
+actual usage into the control-worker lifecycle before enabling service.
+
+Key input is one complete unencrypted PKCS#8 v1 DER PrivateKeyInfo (version
+integer zero), capped at `P256_PKCS8_CAPACITY = 150` bytes. The outer algorithm
+must contain exactly id-ecPublicKey and named-curve prime256v1 OIDs. Its private
+OCTET STRING contains one SEC1 ECPrivateKey sequence: version one, exactly
+32 scalar octets, optional explicit [0] containing the same curve OID, then
+optional explicit [1] containing a zero-padding BIT STRING with a 65-byte
+uncompressed point. All lengths use minimal definite DER encoding; every
+container must end exactly. The four accepted shapes are 67, 79, 138 and 150
+bytes, depending on the two optional inner fields. The provider validates
+scalar range, curve membership and embedded-public-key consistency, deriving
+the public point when omitted. Structural acceptance alone is no key proof.
+
+Refuse encrypted keys, PEM, bare SEC1, PKCS#8 v2, attributes, explicit curve
+parameters, compressed/hybrid/infinity encodings, overlong/indefinite lengths,
+wrong/duplicate/reordered fields and trailing bytes at every level. These are
+intentional subset restrictions. The bounded precheck is needed because the
+pinned provider's outer PKCS#8 reader does not reject trailing input itself.
+The formats follow [PKCS#8](https://www.rfc-editor.org/rfc/rfc5208) and the
+[ECPrivateKey structure](https://www.rfc-editor.org/rfc/rfc5915); curve
+parameters may be inherited from the outer algorithm for compatibility with
+the provider's conventional PKCS#8 encoding.
+
+Generation requires caller capacity of at least 150 bytes before invoking the
+provider. The pinned provider emits a 138-byte document with an inner public
+point and curve parameters only in the outer algorithm; validate it against
+the same accepted subset before copying. Return the used length and leave the
+unused tail unchanged. Public-point output is exactly 65-byte SEC1; ES256
+output is exactly 64-byte r || s. Signing hashes the complete message with
+SHA-256 once; it accepts no prehashed convention. Refuse messages beyond the
+SHA-256 bit-length limit. Output buffers remain unchanged on returned errors;
+callers must treat them as having no result. Caller-owned private-key input
+and generated output remain the caller's secret-lifecycle responsibility.
+
+Generation, parsing, public-state construction and signing can allocate native
+and Rust memory. The pinned signing path constructs digest/signing contexts
+and temporary signature buffers for each call. This is not qualified for a
+no-allocation hot path. The compatibility SecureRandom argument to native key
+generation/signing is ignored by the pinned provider; those calls use native
+RNG state, with the blocking/abort/stderr limits above. A synthetic Rust error
+or unwind injection is not a native RNG-failure test.
+
+The native key and its public view hold references to the same EVP key; their
+final release frees the wrapped scalar through the default cleansing allocator.
+Generated provider Document storage uses its zeroizing destructor; temporary
+native encoding buffers use native cleanup. This does not guarantee erasure
+of stack/compiler copies or cleanup after abort/kill. Ordinary parse failures
+map to Invalid; generation/signing failures and caught Rust unwinds map to
+Crypto. No native diagnostics or panic payload becomes a public error. The
+same whole-graph unwind and hook limitations as SHA-256 apply.
+
+Tests use only existing repository crypto material: the engine SHA-256 and
+td-secret P-256 source/vector fixtures are compiled as test-only independent
+oracles. Their own known-answer, valid/invalid signature and arithmetic cases
+qualify the oracle; generated signatures must verify against the message,
+not its digest, and modified messages/signatures are refused. No randomized
+signature-byte equality is required. These sources never enter the shipped
+backend or add a Cargo dependency. Portable staging includes the exact oracle
+source files and vector data in its source digest. Functional, grammar and
+failure qualification does not complete native allocation, timing, stack/RSS
+or service integration work.
 
 M03b1 pins versions, features, licenses and roots; M03b2 pins the portable
 native build inputs.

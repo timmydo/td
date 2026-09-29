@@ -307,7 +307,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/sha256.rs",
-        "td-builder, td-recipe-eval, target-static td-boot and td-update, and the td-compositor terminal corpus verifier/importer",
+        "td-builder, td-recipe-eval, target-static td-boot and td-update, the td-compositor terminal corpus verifier/importer, and td-crypto's test-only ES256 oracle",
     ),
     (
         "engine/src/crc32.rs",
@@ -2166,10 +2166,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // distinguishes a target-included source. `recipe-checks` is a build gate,
     // so the target assertions below hold for engine/src/json.rs too: they
     // guard that the gate is selected AT ALL, not that the table selected it.
+    assert_preflight!("engine/src/sha256.rs", "cargo-test");
     assert_target!("engine/src/sha256.rs", "check-engine");
     assert_target!("engine/src/sha256.rs", "recipe-checks");
     assert_contains!("engine/src/principals.rs", "target-static td-firstboot");
     assert_contains!("engine/src/sha256.rs", "target-static td-boot");
+    assert_contains!("engine/src/sha256.rs", "td-crypto's test-only ES256 oracle");
     assert_contains!("engine/src/crc32.rs", "target-static td-install");
     assert_contains!("engine/src/gpt.rs", "target-static td-install");
     assert_contains!("engine/src/fat.rs", "target-static td-install");
@@ -5311,12 +5313,14 @@ mod tests {
             Some(paths(&[
                 "td-authd",
                 "td-compositor",
+                "td-crypto",
                 "td-editor",
                 "td-firstboot",
                 "td-install",
                 "td-jail",
                 "td-login",
                 "td-mail",
+                "td-mta",
                 "td-news",
                 "td-photo",
                 "td-portal",
@@ -7412,12 +7416,14 @@ mod tests {
             [
                 "td-authd",
                 "td-compositor",
+                "td-crypto",
                 "td-editor",
                 "td-firstboot",
                 "td-install",
                 "td-jail",
                 "td-login",
                 "td-mail",
+                "td-mta",
                 "td-news",
                 "td-photo",
                 "td-portal",
@@ -7432,8 +7438,9 @@ mod tests {
         );
         // td-photo's and td-mail's native cases make their commands three,
         // as td-setup's are; td-news, a toolkit consumer with no native
-        // case, adds two.
-        assert_eq!(comp.len(), 44, "{comp:?}");
+        // case, adds two. The test-only P-256 oracle connects td-secret
+        // to td-crypto and then td-mta, adding two commands each.
+        assert_eq!(comp.len(), 48, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -7443,12 +7450,14 @@ mod tests {
                 "td-authd",
                 "td-busd",
                 "td-compositor",
+                "td-crypto",
                 "td-editor",
                 "td-firstboot",
                 "td-install",
                 "td-jail",
                 "td-login",
                 "td-mail",
+                "td-mta",
                 "td-news",
                 "td-photo",
                 "td-portal",

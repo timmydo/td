@@ -1,5 +1,5 @@
-//! Opaque SHA-256 and entropy APIs over the private AWS-LC backend.
-//! Signing-key operations and TLS sessions remain unimplemented.
+//! Opaque cryptography APIs over the private AWS-LC backend.
+//! TLS configuration and session APIs remain unimplemented.
 //!
 //! These checks reject the two named root exports; backend integration must
 //! also check nested exports, aliases and public signatures.
@@ -18,6 +18,9 @@ mod sha256;
 pub use sha256::Sha256;
 mod entropy;
 pub use entropy::SystemEntropy;
+mod pkcs8;
+mod provider;
+pub use provider::{P256Key, Provider, P256_PKCS8_CAPACITY};
 
 /// Fixed failures carry neither backend diagnostics nor secret input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +54,9 @@ pub trait Digest: Send {
     fn update(&mut self, bytes: &[u8]) -> Result<(), Error>;
     fn finish(self) -> Result<[u8; 32], Error>;
 }
+/// After a public-point or signing error, discard the key. Implementations
+/// must refuse all later operations on that key, including test providers.
+/// Output buffers remain unchanged on returned errors.
 pub trait Crypto: Send + Sync {
     type Sha256: Digest;
     type SigningKey: Send + Sync;
@@ -59,6 +65,7 @@ pub trait Crypto: Send + Sync {
     /// Provider-backed constant-time equality for fixed-size digests.
     fn equal_digest(&self, left: &[u8; 32], right: &[u8; 32]) -> bool;
     /// Cold path only; output is a complete PKCS#8 P-256 private key.
+    /// Requires at least P256_PKCS8_CAPACITY bytes before generation begins.
     fn generate_p256(&self, output: &mut [u8]) -> Result<usize, Error>;
     /// Cold path only; callers account for the key's retained provider storage.
     fn load_p256(&self, pkcs8: &[u8]) -> Result<Self::SigningKey, Error>;
@@ -107,3 +114,13 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[allow(dead_code, clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+#[path = "../../td-secret/src/fido_p256.rs"]
+mod p256_oracle;
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../engine/src/sha256.rs"]
+mod sha256_oracle;
