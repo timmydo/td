@@ -18,14 +18,10 @@ checks account/device authorization and rechecks it at the operation boundary.
 
 Clock returns UTC plus monotonic boot-local milliseconds. Deadline uses the
 latter, checked addition and expiry at now >= deadline. Never persist Tick
-or compare it across boots. Entropy fills the entire output or fails; callers
-discard the entire output on failure. Crypto SHA-256 is streaming. P-256
-keys are PKCS#8, public points uncompressed SEC1, ES256 signatures fixed
-32-byte r followed by 32-byte s. The provider owns secure key storage;
-generation/load are cold operations. equal_digest uses the reviewed provider
-for constant-time equality of fixed 32-byte password verifiers; core Rust
-comparison is not a substitute. TLS owns peer certificate verification.
-Neither a fake digest nor these trait signatures prove cryptographic quality.
+or compare it across boots. Shared cryptographic representations, entropy
+failure handling and constant-time requirements belong to td-crypto/DESIGN.md;
+section 1.1 below defines the mail integration. TLS owns peer certificate
+verification. Neither fake digests nor trait signatures prove crypto quality.
 
 Transport methods are nonblocking and make bounded progress. Bytes(n) means
 1 <= n <= supplied slice length; an empty slice returns Pending. Pending
@@ -69,79 +65,36 @@ configured A/AAAA endpoints only; MX/TXT/policy resolution is outside v1.
 
 ### 1.1 Crypto provider boundary
 
-The core calls `Crypto` for SHA-256, fixed verifier equality and ACME P-256
-operations, and `Entropy` for secure random bytes. These are application
-operations, not a copy of rustls's primitive interfaces. TLS algorithms,
-certificate verification and handshake state stay behind `TlsFactory` and
-`TlsTransport`. The runtime implements these ports with local wrapper types;
-provider key, digest, connection and error types do not enter core interfaces.
-A future shared implementation need not depend on td-mta: the runtime's local
-wrappers implement td-mta's port traits on its behalf.
+Under DESIGN section 3's dependency boundary, `ports` re-exports td-crypto's
+Crypto, Digest and Entropy traits and its Error as CryptoError. Their methods
+return that shared error. The total From conversion into the mail Error enum
+preserves Capacity, Invalid, Entropy and Crypto without provider strings or
+secrets. Existing mail callers can use
+`?` across this boundary. Clock and mail/TLS transport policy remain local.
 
-Initially these wrappers use AWS-LC. Cold construction supplies an explicit
-rustls `CryptoProvider` to every client/server configuration and certificate
-verifier, including the HTTPS/ACME and smart-host clients. No wrapper installs
-or relies on the process-global default provider. Configurations and keys live
-in the existing bounded generations; construction still obeys RESOURCES.md.
-The runtime source names one shipping backend; there are no selectable Cargo
-backend features. F04 replaces that implementation and dependency closure in
-one landing.
+The shared contract and implementation rules live in
+[td-crypto/DESIGN.md](../td-crypto/DESIGN.md). The current crate contains those
+contracts only. M03b/M07 implement that boundary. Shared backend conformance
+fixtures live in td-crypto; service integration tests reach it through the same
+public facade as production.
 
-Persist standard key/certificate encodings and the specified digest/verifier
-bytes, never serialized provider contexts or backend identifiers. Keep the
-PKCS#8, SEC1 and fixed ES256 representations above at the application
-boundary; TLS key loading must also preserve M07's recorded compatibility
-baseline: accepted key encodings and algorithms, TLS versions, cipher
-suites, key-exchange groups and certificate/handshake signature schemes. M07
-records both configured preference order and accepted sets from the pinned
-provider; F04 compares against that inventory, not unspecified future
-provider defaults. M07 pins generated PKCS#8 DER variants and
-accepted/rejected input forms, including inconsistent embedded public keys,
-and retains non-secret test keys and digest fixtures. F04 tests key
-interchange in both directions, including rollback to the prior binary after
-the new backend has generated keys. A backend replacement reconstructs
-contexts from those files on restart. It does not convert live TLS
-connections or key objects. Algorithm, trust-policy or file-format changes
-require their own explicit design/migration; an implementation swap cannot
-silently change them.
+Mail transport adapters implement TlsFactory/TlsTransport above using td-crypto's
+opaque configuration/session interfaces. td-mta owns policy-generation/slot
+leases, sockets, deadlines and STARTTLS handoff/reset. td-crypto performs TLS
+handshakes and generic certificate validation; the mail adapter additionally
+checks gateway allowlist policy before constructing Gateway proof. A raw peer
+certificate or digest is not proof of that authorization. HTTPS/ACME and the
+smart-host client use this same boundary.
 
-M07 supplies a runtime test suite generic over the mail crypto/entropy
-ports: SHA-256 known answers across chunk boundaries, fixed-length equality,
-fault-injected entropy failure without partial success, P-256 public-point
-known answers, key generation/load and malformed-key rejection, and ES256
-signing checked by an independent test-only verifier qualified with known
-valid and invalid vectors. The existing mail port needs no verification
-method for this suite. Check generated signatures as raw 64-byte r || s, not
-ASN.1 DER. F04 adds cross-backend key loading and signature verification,
-not byte equality of randomized signatures. Reuse the TLS
-verification/STARTTLS/implicit-TLS matrix when changing the rustls provider.
-A future switch to `td-crypto` must cover both the direct operations and the
-runtime's rustls provider bridge before AWS-LC can leave the runtime
-closure.
-
-Differential tests do not establish constant-time behavior or replace a
-cryptographic review. The initial provider and every replacement must
-qualify allocation, peak stack, RSS and portable target behavior; hiding a
-provider behind traits proves none of these bounds and does not permit
-panic-based error handling. M07 and F04 must document and verify
-secret-buffer ownership, wipe-on-release behavior and its limits, including
-provider internals and compiler-created copies. Drop or Vec::clear alone is
-not evidence of secure erasure.
-
-For the direct crypto ports, insufficient output capacity maps to Capacity;
-malformed, unsupported-curve or inconsistent keys map to Invalid; recoverable
-RNG failures map to Entropy and other provider operation failures to Crypto.
-Neither provider diagnostics nor secret bytes appear in these errors. M07's
-suite fixes these mappings across implementations. Approved/pinned external
-vector inputs and independent test tools must be recorded at M07, as at F04.
-
-A Result-returning wrapper cannot contain a native abort. AWS-LC has fatal
-RNG paths that terminate the process instead of returning Entropy. Such an
-exit follows the service's existing crash/durable-recovery contract; do not
-weaken randomness, continue with partial bytes, or claim a caught error.
-Fault-injection tests of Entropy returns and process-death recovery test
-separate guarantees. M07 audits the pinned provider's fatal paths and records
-which failures were actually exercised.
+Shared configurations/keys and their backend allocations count in the existing
+RESOURCES.md generations and leases, including cold overlap. Moving their code
+to another crate adds no memory allowance. M07 implements the shared crate's
+conformance/qualification requirements and this file's transport matrix; F04
+repeats them with bidirectional key/rollback fixtures before backend replacement.
+Standard persisted formats remain stable. Provider process failures described
+in the shared design follow the service's crash/durable-recovery contract.
+Neither interface tests nor fake digests prove a cryptographic implementation,
+bounded TLS behavior or resource limits.
 
 ## 2. Read views and change history
 

@@ -3,6 +3,7 @@
 ## How to use this plan
 
 Read `DESIGN.md`, root `AGENTS.md`, and `DEVELOPMENT.md` before work.
+Crypto/backend tasks also read `td-crypto/DESIGN.md`.
 Service-facing tasks also read `RESOURCES.md` and `ADMISSION.md`, including
 their named milestone-specific evidence. Message/query tasks read `POLICY.md`,
 `UNICODE.md` and `CASES.md`. Storage tasks read `STORAGE.md`.
@@ -98,7 +99,7 @@ need adapters. The dependency edges are the shared-interface handoff gate.
 | Boundary | Inputs / outputs | Owner |
 | --- | --- | --- |
 | `Limits`, `ResourcePlan` | Valid config -> checked arena/slot/stack ledger | M01/M04 |
-| `Clock`, `Entropy`, `Crypto` | Injected time, randomness, digest/sign/verify | M02/M07 |
+| `Clock`; shared `Entropy`, `Digest`, `Crypto` | Injected time, randomness, digest/sign; future verification | M02/M03a/M07 |
 | `WireBuffer`, `Arena`, `SlotId` | Caller-owned capacity -> borrowed views / limit errors | M04 |
 | `Store`, `ReadView`, `Transaction` | Bounded operations -> committed IDs and sequence | M05/M08 |
 | `BlobReader`, `BlobWriter` | Chunks and offsets -> immutable published blob | M05 |
@@ -180,41 +181,58 @@ decoders where provided; every acknowledgement maps to a sync boundary; every
 queue transition has restart and JMAP meaning. No open-ended TODO serves as a
 contract. Complex codecs belong to their following task, not this checkpoint.
 
-## M03 — Narrow runtime dependency and gate integration
+## M03 — Local crypto boundary, backend and gate integration
 
-**Depends on:** M02. **Own:** `td-mta-runtime` manifest/lock/build wiring;
-explicit AGENTS exception and affected/gate dependency validation.
+**Depends on:** M02. **Own:** td-crypto, td-mta's direct dependency and error
+adaptation, eventual binary/build wiring and explicit dependency gate changes.
+The following increments land separately; M03 is complete only after M03b.
 
-Introduce the runtime crate and installed binary name. Pin a minimal
-compatible rustls/aws-lc-rs/root-data closure, disabling unused
-features/providers. Record each transitive crate and build dependency,
-including AWS-LC's native compiler, assembler and any selected generator
-requirements; verify the exact pinned build path rather than inferring it
-from another provider. Reuse compatible reviewed pins where possible.
-Declare both rustls and aws-lc-rs as direct runtime dependencies, resolving
-one compatible AWS-LC version. Keep core std-only and preserve all other
-roster restrictions. Ensure the new runtime participates in host and sandbox
-test/Clippy paths with a specific checked closure rather than a generic
-external-dependency escape hatch.
+### M03a — Shared contracts and direct dependency
 
-For Linux, checked build wiring fixes the source-build path, disables system
-libcrypto discovery and selects the cc builder with no fallback to CMake,
-bindgen or prebuilt NASM. Record the pinned version's controls; for the
-aws-lc-sys interface using these names, set AWS_LC_SYS_USE_SYSTEM=0 and
-AWS_LC_SYS_CMAKE_BUILDER=0 in that wiring. Reject incompatible generator,
-sanitizer or environment overrides. A clean environment exposes only declared
-tools and headers. Decoy OPENSSL_DIR/pkg-config/CMake inputs must remain unused;
-missing declared inputs fail. The gate verifies exactly one resolved
-aws-lc-rs/aws-lc-sys pair and the actual target feature/build graph, including
-inactive lock entries; a second version cannot hide behind symbol prefixes.
+Create the local td-crypto crate by moving the existing nondeterministic
+Crypto/Entropy/Digest ports into it, with its own fixed error enum. Re-export
+the traits from mail ports and provide a total error conversion. Make the
+local path the mail crate's only direct dependency, including dev/build scope;
+keep the shared crate independent of mail types. Both crates carry standalone
+locks and join the discovered host/sandbox test and Clippy roster. No external
+backend or new primitive implementation is introduced in this increment.
+
+**Acceptance:** consumer compilation proves shared trait identity and error
+conversion, including propagation of a partial-fill failure through a test
+caller using `?`. This is interface evidence, not production token handling.
+Dependency confinement rejects another direct mail dependency. The gate
+discovers both crates and the dependent mail tests when td-crypto changes.
+No test-only fake is described as a cryptographic implementation.
+
+### M03b — Private backend, exact closure and portable build
+
+Add Rustls, aws-lc-rs and roots only inside td-crypto. Keep every public type,
+error and configuration opaque to upstream types. Pin a minimal compatible
+closure with one AWS-LC version pair and explicit features. Record licenses,
+all native compiler/assembler/generator inputs and why each dependency is
+present. td-mta's lock necessarily includes this transitive closure, while its
+manifest still names only td-crypto. Amend AGENTS.md and the common host/gate
+checks atomically to admit these exact named closures and preserve the std-only
+rules for other crates. Do not exclude either crate from tests or Clippy.
+
+Implement the source/cc build controls and decoy checks in
+`td-crypto/DESIGN.md`. Guard both resolved locks and actual target feature/build
+graphs, including inactive entries and duplicate versioned native libraries.
+
+Provide the installed binary name from td-mta itself; no separate runtime
+package. Backend construction and smoke fixtures belong inside td-crypto;
+mail wiring uses only its public facade. Complete key/digest and TLS consumer
+adapters remain M07. Do not advertise serving mail from this build increment.
 
 **Acceptance:** static x86-64 musl smoke executable runs in a clean fixture;
-ELF inspection finds no interpreter or dynamic dependencies. Lock tampering or
-an extra runtime/core dependency fails the gate. Offline source provisioning
-is reproducible and does not depend on host libssl or td-net at runtime.
-Pin the host portability toolchain manifest from DESIGN section 3, including
-musl target std, C compiler/linker/sysroot and checksum/provenance evidence.
-A clean fixture builds without undeclared ambient host toolchain inputs.
+ELF inspection finds no interpreter or dynamic dependencies. Lock/feature
+changes, an extra direct mail dependency or an unapproved crypto dependency
+fail the gate. Public-API confinement rejects upstream type/re-export leaks.
+Offline source provisioning is reproducible and has no host libssl/td-net
+runtime dependency. Pin DESIGN section 3's portability toolchain manifest,
+including target std, C compiler/linker/sysroot and checksum/provenance evidence.
+The clean fixture builds without ambient undeclared inputs. Establish bounded
+TLS smoke behavior before any service consumer depends on the backend.
 
 ## M04 — Bounded primitives, configuration, and event records
 
@@ -478,11 +496,11 @@ versus incomplete-tail rules. Do not deduplicate bodies or pack MIME into a
 metadata value.
 Implement bounded sequential replay with incomplete-tail recovery and explicit
 interior-corruption refusal. Expose committed visibility only after durability.
-The std-only core accepts the Crypto interface; its deterministic fake tests
-check ordering/failure behavior, not digest correctness. M05 owns additional
-runtime integration tests using M07's real provider for every SHA-256-bearing
-golden frame/table/blob. These run alongside core tests without introducing
-an external dependency or runtime-to-core cycle into the core manifest.
+The mail core accepts the shared Crypto interface; its deterministic fake tests
+check ordering/failure behavior, not digest correctness. M05 owns td-mta
+integration tests using M07's real provider through the td-crypto facade for
+every SHA-256-bearing golden frame/table/blob. These introduce no direct
+external dev-dependency.
 Provide deterministic failure injection before/after each filesystem operation.
 
 **Acceptance:** two writers cannot open the store; partial/short writes and
@@ -519,43 +537,37 @@ allocating client parser merely because it is already std-only.
 CASES.md H01-H06/M01-M10 and UNICODE.md's adversarial replay/failure cases are
 required independent oracles, including exact malformed-transfer blob bytes.
 
-## M07 — TLS and cryptographic runtime adapter
+## M07 — Shared TLS implementation and mail transport adapters
 
-**Depends on:** M03/M04. **Own:** runtime TLS, roots, entropy/digest/sign adapters.
+**Depends on:** M03/M04. **Own:** td-crypto's private TLS/crypto backend and public
+opaque APIs; td-mta's transport, policy-generation and resource integration.
 
-Implement incoming/outgoing TLS, implicit TLS and STARTTLS handoff, hostname
-verification, SNI, private CA override, client certificate verification for
-gateways, and bounded certificate generations. Expose chunked Read/Write-like
-transport with explicit deadlines and typed failures. Disable unnecessary
-resumption/early-data features. Use runtime-local wrappers and explicit AWS-LC
-provider construction for all TLS configurations/verifiers as specified by API
-section 1.1. Implement its provider conformance suite with independent fixtures;
-keep the suite reusable for F04. Record API section 1.1's complete configured
-TLS compatibility baseline before serving traffic: version/suite/group lists
-and preference order, an explicit post-quantum decision, certificate/handshake
-signature schemes, and accepted PEM labels, DER forms, curves and RSA sizes.
-Construct configurations from those reviewed lists with explicit Cargo features;
-provider defaults cannot silently expand them. Offline fixtures cover each
-allowed entry and refusal outside the policy. Later provider/dependency updates
-compare against this baseline and the saved non-secret key/digest fixtures.
+Freeze the bounded td-owned TLS configuration/session API before implementing
+consumers. Implement direct Crypto/Entropy operations and incoming/outgoing TLS
+inside td-crypto. Rustls provider/configuration/verifier/key types never leave
+that crate. Implement the conformance, explicit-provider confinement, algorithm
+baseline, key compatibility and native allocation/failure qualification in
+`td-crypto/DESIGN.md`, retaining its independent fixtures for F04.
 
-Enforce explicit-provider construction/key loading with source confinement
-checks for implicit/global constructors and a fresh-process test proving the
-default provider remains unset after all construction paths. This read-only
-test may query get_default; production code may not. Rust allocation counting
-alone cannot measure AWS-LC's libc allocations. Include native allocations,
-C stack frames, CPU-dispatched code paths and per-thread RNG state in the
-measurements. Warm every crypto-using worker before admission and budget its
-retained state. Measure whole-process RSS and peak stack as well as Rust/native
-allocation activity; any allocator hook first needs an UNSAFE.md amendment.
-Record secret-erasure limits, native fatal paths and crash-recovery evidence.
+The mail adapters implement TlsFactory/TlsTransport through that facade. They
+own implicit-TLS and STARTTLS handoff, socket/deadline progress, generation/slot
+leases and gateway allowlist authorization. td-crypto owns chain/time/name and
+client-certificate verification. Preserve SNI, private CA override, bounded
+certificate generations and verified peer semantics. Disable unneeded
+resumption/early data. No authentication credentials reach a peer before
+verified TLS.
 
-**Acceptance:** local certificate fixtures cover valid/untrusted/expired/wrong-
-name chains, mTLS admission, fragmented records, handshake saturation, and
-wrong keys. Test known SHA-256 vectors and M02 digest-bearing fixture inputs
-through the real provider; never call fake-adapter output a digest oracle. No auth bytes reach a peer before successful verified TLS. Library
-allocation headroom is documented and tested; a second provider cannot enter
-the lock unnoticed. No live CA/provider contact and no ignore-cert-errors flag.
+**Acceptance:** shared backend tests exercise known-answer/independent crypto
+oracles, malformed keys, explicit TLS policy and upstream API confinement.
+Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,
+mTLS admission, fragmented records, STARTTLS reset, handshake saturation,
+wrong keys and returned/fatal failure boundaries. Test M02 digest-bearing
+fixture inputs through the real provider; fake output is not a digest oracle.
+Fit cold/session/handshake generations, native allocations and Rust/C peak
+stack within the service ledger and measure whole-process RSS. Warm workers
+before admission and report secret-erasure limits. Any allocator hook first
+requires an UNSAFE.md amendment. No live CA/provider contact, ignored certificate
+errors, hidden second backend or additional direct mail dependency.
 
 ## M08 — Store objects, indexes, checkpoints and reclamation
 
@@ -941,44 +953,31 @@ requested. Report support does not imply DMARC report generation.
 with predictable quota/admission behavior and tests for rejected domains. No
 plus addressing, external forwarding, or regex address rewriting rides with it.
 
-**F04 — Shared td-owned cryptography.** This is future work, not a v1 dependency.
-Design a standalone std-only `td-crypto` crate with no td-mta or rustls dependency.
-Keep each algorithm increment independently reviewed and gate-tested; do not
-create an empty crate or add unused primitive interfaces ahead of that work.
-Its normative primitive contract belongs in td-crypto/DESIGN.md when the crate
-is introduced; this plan owns only td-mta's integration. First inventory the
-existing engine SHA/Ed25519 and td-secret crypto/P-256 code and audit evidence.
-A shared-code consolidation moves affected consumers atomically and does not
-inherit unproven side-channel properties from existing implementations.
+**F04 — Owned cryptographic primitives inside td-crypto.** The facade crate
+exists from M03a; replacing its private AWS-LC implementation is future work
+and does not block v1. Its normative contracts live in td-crypto/DESIGN.md.
+Mail code and its direct dependency do not change with backend selection.
 
-1. Specify primitive contracts, supported algorithms, key/secret lifetimes,
-   constant-time requirements, wipe-on-release behavior/limits and failure
-   behavior. Account for all operations in the shipping TLS provider, including
-   record protection, key exchange, signing, certificate signature verification
-   and secure randomness, plus DKIM verification if F02 has landed. The smaller
-   mail `Crypto` port is not that inventory. Specify ECDSA nonce generation,
-   the OS entropy source and any optimization barriers; new unsafe surfaces
-   require the normal UNSAFE.md amendment before implementation.
-2. Implement and qualify primitives incrementally with known-answer,
-   adversarial and differential tests. Pin/license any new external vector
-   inputs through the normal dependency approval process. Require independent
-   cryptographic and side-channel review before deployment; passing functional
-   tests alone is insufficient. Inspect constant-time code generation in the
-   exact shipping artifact/compiler/flags/target, repeating qualification when
-   those inputs change. Preserve panic and allocation contracts.
-3. Adapt qualified operations to the existing mail ports through runtime-local
-   wrappers. Build the separate rustls `CryptoProvider` bridge inside the
-   runtime tier, retaining rustls for TLS protocol and certificate policy.
-   Before cutover, the candidate crate is a dev-dependency and its runtime
-   bridge is test-only; neither enters the shipping dependency graph. The
-   reviewed qualification closure can contain both providers for comparison.
-   Cutover promotes the candidate and removes the old production provider.
-4. Run API section 1.1 conformance and cross-backend key/signature tests, the
-   complete M07 TLS matrix and persistence/restart fixtures. Requalify resource
-   bounds and static x86-64 musl linkage; document aarch64 validation status.
-   Replace the production provider atomically, removing AWS-LC and its obsolete
-   closure/build inputs in that landing. Algorithm/trust/format changes are
-   separate work with explicit compatibility handling.
+1. Follow td-crypto/DESIGN.md's primitive inventory and review requirements.
+   Inventory the entire configured TLS backend, plus DKIM operations if F02
+   has landed. Specify algorithms, secret lifetimes/erasure limits,
+   constant-time and failure contracts, ECDSA nonces, entropy and optimization
+   barriers. New unsafe surfaces need the normal UNSAFE.md amendment first.
+2. Implement independently reviewed primitive increments privately in td-crypto,
+   with pinned/approved known-answer, adversarial and differential inputs.
+   Require independent cryptographic and exact-artifact side-channel review,
+   repeated when compiler/flags/target change. Tests alone are insufficient.
+3. Implement its private Rustls CryptoProvider bridge as well as the direct
+   operations. Candidate paths stay test-only until cutover; there is no public
+   feature/configuration selector or new mail dependency. The reviewed test
+   closure may contain both implementations for qualification.
+4. Run shared conformance, complete M07 mail/TLS integration and bidirectional
+   persisted-key/rollback fixtures. Requalify resources and static x86-64 musl
+   linkage; record aarch64 validation status. Atomically select the qualified
+   backend and remove obsolete AWS-LC dependencies/native build inputs from all
+   affected locks/build wiring. Rustls remains private inside td-crypto; this
+   replacement alone does not make its entire closure std-only. Algorithm,
+   trust or format changes are separate explicit compatibility work.
 
 ## Completion report for each milestone
 

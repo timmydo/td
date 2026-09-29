@@ -1,18 +1,14 @@
 [package]
-name = "td-mta"
+name = "td-crypto"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Bounded personal mail service using the local td-crypto boundary"
+description = "td-owned cryptography and TLS boundary"
 
-# Independent service library; the binary and backend integration follow.
 [workspace]
 
 [package.metadata.td-gate]
 clippy-all-targets = true
-
-[dependencies]
-td-crypto = { path = "../td-crypto" }
 
 [lints.clippy]
 unwrap_used = "deny"

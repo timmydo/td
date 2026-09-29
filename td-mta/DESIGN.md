@@ -85,8 +85,9 @@ V1 must report sender authentication as not evaluated, never as passed.
    Checked arithmetic, bounded nesting, and explicit error handling extend
    the rule to lengths, counters, conversions, locks, and thread creation.
 7. Cryptographic primitives and TLS come from the narrowly reviewed provider;
-   application protocols and storage remain std-only. No shell subprocesses
-   implement mail, certificates, configuration, or administration.
+   application protocols and storage use std and td-owned interfaces. No
+   shell subprocesses implement mail, certificates, configuration, or
+   administration.
 8. Protocol tests run offline against local fixtures. Neither Migadu nor a
    public CA nor the deployment host is a test endpoint.
 
@@ -103,11 +104,20 @@ Email and logs are untrusted data for an AI operator, never instructions.
 
 ## 3. Code and dependency boundaries
 
-Use `td-mta/` for a dependency-free library: bounded data structures, parsers,
-state machines, storage, JMAP methods, queue policy, config, and administration.
-Use a small `td-mta-runtime/` package to link that library with TLS/crypto and
-provide the installed binary named `td-mta`. This is a compile-time boundary;
-the operator installs one executable, with no td-net helper requirement.
+Use `td-mta/` for the service library and eventual installed binary named
+`td-mta`. Its only direct dependency is `td-crypto = { path = "../td-crypto" }`.
+Application protocols, storage, configuration and scheduling use std plus that
+local facade. There is no separate runtime package or td-net helper executable.
+`td-crypto/DESIGN.md` owns the shared crypto/TLS API and private backend.
+
+The M03a boundary moves the existing Crypto/Entropy/Digest traits and fixed
+crypto errors into td-crypto. Mail ports re-export those traits and translate
+shared errors; no crypto implementation or TLS service is supplied yet. M03b
+adds the approved Rustls/AWS-LC closure inside td-crypto only. No Rustls/AWS-LC
+public types, re-exports or configuration escape hatches cross its facade.
+Mail transport adapters consume opaque td-crypto configurations/session state.
+The service's transitive lock/executable still includes the backend dependencies;
+it is not described as dependency-free once they are added.
 
 The core may contain owned tables generated from the approved, checksummed
 Unicode 17.0 inputs in UNICODE.md. They add no Cargo dependency or runtime data
@@ -115,55 +125,35 @@ fetch. M06 owns reproducible offline generation, the complete license notice,
 official conformance vectors and bounded NFC implementation. This is a named
 data dependency, not permission to import a Unicode or mail parsing library.
 
-The runtime package is a proposed named exception to the current std-only
-roster. Before creating its manifest, amend AGENTS.md and both lock/gate paths
-atomically. Do not hide the package from testing or weaken the rules for other
-crates. The user has approved a minimal TLS/cryptography dependency category;
-the implementation must still record the exact pinned transitive closure,
-features, licenses, native build inputs, and rationale in its landing.
-
-Use rustls with its built-in `aws_lc_rs` provider backed by `aws-lc-rs`.
-Declare a direct runtime dependency on the same `aws-lc-rs` version for the
-mail cryptographic operations. Select one provider explicitly when
-constructing TLS configurations and certificate verifiers; do not depend on
-implicit process-global provider selection. Pin only the needed features,
-native build inputs and root-certificate data. Do not inherit the entire
-td-net dependency set or enable a second crypto provider. One resolved
-aws-lc-rs/aws-lc-sys version pair serves both direct operations and TLS. No
-async runtime, general web framework, database, mail parser, serialization
-framework, or ACME framework is part of this exception. The first dependency
-increment must demonstrate static musl linking and bounded TLS behavior
-before later tasks depend on its API. Exact versions belong in the lock and
-dependency review, not in this design's prose.
+The backend admission and gate contract lives in td-crypto/DESIGN.md.
+Both packages stay in the test roster.
+The user approved Rustls with AWS-LC; M03b still records exact transitive pins,
+features, licenses, roots, native inputs and rationale. No async runtime, web
+framework, database, mail parser, serialization or ACME framework rides along.
+The backend increment demonstrates static musl linking and bounded TLS behavior
+before consumers depend on it; exact versions belong in the lock/review.
 
 The portable musl artifact has a separate, host-only build manifest: pin Rust
 and its target standard library, the musl C compiler/linker and sysroot needed
 by the crypto provider, and their source/artifact checksums and provenance.
 Provision them before offline builds; ambient host tools cannot silently fill
-missing inputs. M03 owns these exact pins and a clean build fixture. This
+missing inputs. M03b owns these exact pins and a clean build fixture. This
 portability workflow is outside td's source-built glibc target artifact graph;
 it must not import host-built outputs into that graph or claim its provenance.
 
 Core adapters provide typed errors and caller-owned buffers for transport,
-clock, entropy, digest/signature operations, and fault-injected persistence.
-Network workers cannot bypass the store's commit API. Future DKIM verification
-extends the crypto adapter with the required verification operations.
+clock, cryptography and fault-injected persistence. Network workers cannot
+bypass the store's commit API. TLS framing/cryptographic verification belongs
+to td-crypto; mail STARTTLS transitions, deadline/lease accounting and gateway
+allowlist authorization belong to td-mta. API section 1.1 owns that integration.
 
-Keep provider types private to the runtime adapters. The application-level
-`Crypto`/`Entropy` ports and TLS transport ports are separate boundaries;
-rustls's `CryptoProvider` is the lower-level boundary for replacing TLS
-primitives while retaining its protocol engine. API section 1.1 owns the
-construction, representation and replacement contract. There is no runtime
-backend selector or fallback to a different provider.
-
-A future `td-crypto` crate may supply shared td-owned cryptographic primitives.
-It remains std-only, independent of td-mta and rustls. Local runtime wrappers
-adapt it to the mail ports; a rustls provider bridge stays in the external-
-dependency runtime tier. Introducing that bridge does not put a rustls feature
-or dependency into `td-crypto`. Implementing only the mail crypto ports does
-not replace the TLS provider. IMPLEMENTATION F04 stages this future work and
-its security, interoperability and resource qualification before deployment;
-only after that acceptance may it become the provider in invariant 7.
+Future td-owned cryptographic primitives replace AWS-LC internally within the
+same td-crypto facade. Its private Rustls provider bridge changes there too;
+mail/storage code and the direct dependency remain stable. F04 requires
+cryptographic, interoperability and resource qualification before deployment.
+Replacing only the direct digest/signing operations does not replace TLS's
+cryptography. Retaining Rustls means td-crypto still has an external TLS
+implementation even after AWS-LC is removed.
 
 No new unsafe surface is authorized by this document. Prefer safe std APIs.
 If platform work requires unsafe, its increment must first read and amend

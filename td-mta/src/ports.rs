@@ -1,5 +1,7 @@
 //! Synchronous adapter contracts; runtime workers own scheduling and pool leases.
 //! No adapter implementation or durability claim is supplied by these traits.
+pub use td_crypto::{Crypto, Digest, Entropy, Error as CryptoError};
+
 use crate::{
     format::{
         key::Key,
@@ -31,6 +33,16 @@ pub enum Error {
         kind: ErrorKind,
         os_code: Option<i32>,
     },
+}
+impl From<td_crypto::Error> for Error {
+    fn from(error: td_crypto::Error) -> Self {
+        match error {
+            td_crypto::Error::Capacity => Self::Capacity,
+            td_crypto::Error::Invalid => Self::Invalid,
+            td_crypto::Error::Entropy => Self::Entropy,
+            td_crypto::Error::Crypto => Self::Crypto,
+        }
+    }
 }
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
@@ -73,33 +85,6 @@ pub struct Time {
 }
 pub trait Clock: Send + Sync {
     fn sample(&self) -> Result<Time, Error>;
-}
-pub trait Entropy {
-    fn fill(&mut self, output: &mut [u8]) -> Result<(), Error>;
-}
-pub trait Digest: Send {
-    fn update(&mut self, bytes: &[u8]) -> Result<(), Error>;
-    fn finish(self) -> Result<[u8; 32], Error>;
-}
-pub trait Crypto: Send + Sync {
-    type Sha256: Digest;
-    type SigningKey: Send + Sync;
-    fn sha256(&self) -> Self::Sha256;
-    /// Provider-backed constant-time equality for fixed-size password verifiers.
-    fn equal_digest(&self, left: &[u8; 32], right: &[u8; 32]) -> bool;
-    /// Cold path only; output is a complete PKCS#8 P-256 private key.
-    fn generate_p256(&self, output: &mut [u8]) -> Result<usize, Error>;
-    /// Cold path only; a key's owned provider storage counts in the cold ledger.
-    fn load_p256(&self, pkcs8: &[u8]) -> Result<Self::SigningKey, Error>;
-    /// Uncompressed SEC1 point: 0x04 followed by fixed-width X and Y.
-    fn p256_public(&self, key: &Self::SigningKey, output: &mut [u8; 65]) -> Result<(), Error>;
-    /// SHA-256 ECDSA signature in fixed-width r||s form; DER wrapping is core code.
-    fn sign_es256(
-        &self,
-        key: &Self::SigningKey,
-        message: &[u8],
-        output: &mut [u8; 64],
-    ) -> Result<(), Error>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -567,5 +552,57 @@ mod tests {
         }
         const { assert!(1000 + 3 < MAX_FRAME_OPERATIONS) };
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod crypto_boundary_tests {
+    use super::{CryptoError, Entropy, Error};
+
+    struct PartialFailure;
+    impl td_crypto::Entropy for PartialFailure {
+        fn fill(&mut self, output: &mut [u8]) -> Result<(), CryptoError> {
+            if let Some(first) = output.first_mut() {
+                *first = 42;
+            }
+            Err(CryptoError::Entropy)
+        }
+    }
+
+    fn token(entropy: &mut dyn Entropy) -> Result<[u8; 32], Error> {
+        let mut bytes = [0; 32];
+        entropy.fill(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    #[test]
+    fn shared_entropy_trait_preserves_error_through_mail_conversion() {
+        assert_eq!(token(&mut PartialFailure), Err(Error::Entropy));
+        for (shared, mail) in [
+            (td_crypto::Error::Capacity, Error::Capacity),
+            (td_crypto::Error::Invalid, Error::Invalid),
+            (td_crypto::Error::Crypto, Error::Crypto),
+        ] {
+            assert_eq!(Error::from(shared), mail);
+        }
+    }
+
+    #[test]
+    fn crypto_is_the_only_direct_dependency() {
+        // The roster gate validates TOML shape; pin the permitted dependency
+        // table here so adding even another local crate needs a design change.
+        let manifest = include_str!("../Cargo.toml");
+        let mut inside = false;
+        let mut dependencies = Vec::new();
+        for line in manifest.lines().map(str::trim) {
+            if line.starts_with('[') {
+                assert!(!line.contains("dev-dependencies"));
+                assert!(!line.contains("build-dependencies"));
+                inside = line == "[dependencies]";
+            } else if inside && !line.is_empty() && !line.starts_with('#') {
+                dependencies.push(line);
+            }
+        }
+        assert_eq!(dependencies, [r#"td-crypto = { path = "../td-crypto" }"#]);
     }
 }
