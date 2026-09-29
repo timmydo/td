@@ -1,5 +1,5 @@
 //! Opaque cryptography APIs with owned SHA-256 and a private AWS-LC backend.
-//! TLS configuration and session APIs remain unimplemented.
+//! Outbound configuration is implemented; server configuration and sessions follow.
 //!
 //! These checks reject the two named root exports; backend integration must
 //! also check nested exports, aliases and public signatures.
@@ -34,6 +34,10 @@ mod identity;
 pub use identity::ServerIdentity;
 mod trust;
 pub use trust::TrustStore;
+mod tls_clock;
+pub use tls_clock::{ClockHandle, UtcClock};
+mod tls_client;
+pub use tls_client::{ClientConfig, TlsProtocol};
 
 /// Fixed failures carry neither backend diagnostics nor secret input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

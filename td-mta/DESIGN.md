@@ -110,8 +110,9 @@ service commands arrive with their implementations. Its only direct dependency i
 Application protocols, storage, configuration and scheduling use std plus that
 local facade. There is no separate runtime package or td-net helper executable.
 `td-crypto/DESIGN.md` owns the shared crypto/TLS API and private backend;
-`td-crypto/TLS.md` specifies the future TLS policy and session contract.
-Those TLS configuration/session interfaces remain unimplemented.
+`td-crypto/TLS.md` specifies the TLS policy and session contract. The outbound
+ClientConfig and shared clock are implemented. Server configuration, public
+sessions and mail transport integration remain pending.
 
 The M03a boundary moves the existing Crypto/Entropy/Digest traits and fixed
 crypto errors into td-crypto. Mail ports re-export those traits and translate

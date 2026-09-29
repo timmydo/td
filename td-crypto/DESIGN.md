@@ -13,7 +13,9 @@ generation/loading/signing. M07b1 adds bounded certificate PEM syntax and a
 P-256 PEM key loader. M07b2a adds cold admission of an owned local server
 identity. M07b2b adds explicit private CA bundles and the pinned public
 server root set. M07b3a supplies the explicit private TLS algorithm
-provider. Public TLS configurations and sessions remain unimplemented.
+provider. M07b3b retains owned keys for TLS signing; M07b3c1 adds the
+shared clock and outbound ClientConfig. Server configurations and sessions
+remain unimplemented.
 Test-only backend qualification covers explicit provider construction,
 SHA-256, local TLS 1.2/1.3 data exchange, certificate verification and
 malformed/tampered-record refusals in the isolated static executable. Mocks
@@ -625,6 +627,85 @@ native keys, including the excluded peer fixtures. Future production
 configurations must use the owned P-256 signing bridge and must never call
 the native arbitrary-format key loader through with_single_cert or
 equivalent APIs.
+
+### Outbound configuration and shared clock
+
+`ClientConfig::new` constructs one immutable outbound configuration from an
+admitted TrustStore, shared ClockHandle and TlsProtocol (Http1 or Smtp). Its
+public API contains no backend types. Construction checks time once, copies
+exactly the supplied anchors into the private verifier, and publishes no
+configuration on failure. An explicit private store completely replaces the
+public roots. There is no client identity, OS trust read, system-clock read,
+network operation or provider default. Client configuration construction
+alone authenticates no peer and exposes no session operations.
+
+The configuration uses the explicit algorithm provider, TLS 1.3 followed by
+1.2, mandatory TLS 1.2 EMS, outbound SNI and selected-ALPN checking. Http1
+supplies only http/1.1; Smtp supplies no ALPN. Client resumption, early data,
+key logging, secret extraction, ticket requests and both certificate
+compression lists/cache are explicitly disabled. The non-ECH builder path
+is used. The pinned fragmenter subtracts five header bytes from its explicit
+size setting: 16389 admits one 16384-byte plaintext fragment. A local fixture
+checks that one full application chunk emits one record in both versions.
+These configuration choices do not bound every retained/temporary allocation.
+
+ClockHandle owns one boxed UtcClock source behind a mutex. Its public now
+method and the private backend time adapter use the same serialized callback.
+The source must perform bounded, nonblocking work and must not reenter its
+handle. No backend trait is implemented on a public td type. The handle's
+Debug and the backend adapter's Debug reveal no source state or time. Native
+UnixTime represents every u64 second value accepted by this interface.
+
+Each call removes the owned source from its slot, invokes it inside a narrow
+unwind boundary, and restores it only after a normal return. A None return
+maps to Clock and keeps the source usable for another operation. A caught
+callback unwind drops the source before releasing the mutex and permanently
+retires this handle for every configuration sharing it; later callbacks are
+refused with Crypto. Poisoned mutex access also permanently refuses. The
+AssertUnwindSafe applies only to the consumed source, whose state is never
+reused after unwind, not to a retained backend session. This cannot revoke
+external aliases independently kept by a source implementation. Source
+and panic-payload destructor failures, panic-hook failures, native abort/OOM
+and blocking remain outside recovery. Constructor allocation and mutex
+contention belong in qualification.
+
+The backend time trait can express only missing time, so its private adapter
+returns None for either ordinary unavailability or a retired source. The
+future session facade must retain a private per-connection observation of
+every callback failure and inspect it after every backend call, even a
+successful call. It must also check shared retirement without another
+callback before publishing results, and check time on operations for which
+the backend requests none. Re-polling alone misses a transient None followed
+by success. Failed sessions never revive when their clock recovers.
+
+TLS 1.2 backend session saving requests time after server Finished when the
+peer issued a session ID, even with client resumption disabled. It ignores
+None and can report successful handshake completion after a clock failure
+or caught callback panic. The new fixture pins both cases and demonstrates
+why a later successful clock poll is insufficient. On normal time, that path
+copies the master secret and peer chain before its no-op store drops them;
+M07e must charge those temporary allocations and secret lifetimes. Other
+fixtures cover missing time before construction, during TLS 1.2/1.3
+verification and after TLS 1.3 Finished when a remote server sends tickets.
+These backend observations are not public session success or failure evidence.
+
+The private verifier checks at most eight presented certificates, at most
+16 KiB DER each and 64 KiB aggregate before path/signature verification.
+Refusal uses a fixed private Capacity tag. Every successful verification and
+handshake-signature check delegates to the explicit classical WebPKI verifier;
+there is no permissive result or skipped name/date/usage check. This callback
+runs after backend message parsing. It does not prevent certificate-vector
+allocation during parsing; M07c must enforce record/deframer intake ceilings,
+and M07e must measure many small certificate entries and all parser overhead.
+
+Tests pin configuration flags and local full handshakes, shared time-source
+failure, disjoint trust replacement, wrong names, absent/known ALPN, server
+refusal of non-overlapping ALPN and certificate-boundary enforcement. The
+client's unoffered-ALPN check has inventory coverage only. Repeated connections
+to a resumption-enabled remote server remain full handshakes in both versions.
+No server role/SNI routing, mandatory client authentication, public session,
+mail adapter or service listener is supplied by this increment. Those layers
+must enforce their remaining TLS.md contracts before service admission.
 
 ### Mutual TLS backend qualification
 

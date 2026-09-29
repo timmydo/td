@@ -560,3 +560,39 @@ refuse after shared-key retirement; preceding peer name/protocol refusals
 leave it usable. Resumption is disabled in this fixture. Private state faults
 are synthetic Rust failures, not native RNG/OOM/abort simulation. TLS roles,
 sessions and resource qualification remain separate.
+
+## Outbound TLS configuration qualification
+
+The portable runner exercises the owned ClientConfig and ClockHandle through
+local backend connections. Configuration inventory checks cover the fixed
+protocol selector and disabled resumption, compression/cache, key logging,
+secret extraction, early data and ticket requests; the provider remains
+explicit and the process-global default unset. Both TLS versions complete
+repeated full handshakes against a resumption-enabled peer, including absent
+ALPN and HTTP/1.1 selection. Disjoint trust, wrong names and incompatible
+ALPN fail (the non-overlap refusal occurs at the server; the client's check
+of an unoffered selection has inventory coverage). A 16384-byte application
+chunk emits exactly one TLS record. The client provider's groups, certificate
+algorithms and complete handshake mappings are compared with the owned policy.
+
+Clock fixtures cover ordinary missing time, recovery for another operation,
+serialized shared callback panic/retirement and poisoned-handle refusal.
+Backend verification fails with no supplied time in both versions. A TLS 1.3
+peer completes Finished and then sends tickets after time becomes unavailable;
+the client refuses despite its no-op resumption store. This does not yet
+qualify the future public session's error mapping or clock checks on backend
+operations that do not request time.
+
+A separate TLS 1.2 fixture returns transient None or panics exactly when the
+backend saves session state after server Finished. The backend ignores the
+time failure and completes the handshake; a later successful clock poll can
+miss it. This pins a hazard, not an allowed public session success: M07c must
+retain each callback failure per connection and check it and shared retirement
+after backend work before publishing results. Normal TLS 1.2 session saving
+also copies secret and certificate state before the no-op store drops it.
+
+Verifier fixtures check certificate count, per-certificate and aggregate
+ceilings before path work. Backend parsing occurs earlier and may allocate;
+these are not whole-session memory bounds. Constructors, root copies, clocks,
+verifiers and native connections remain subject to M07e allocation/stack/RSS
+qualification. No listener or live network service is used.

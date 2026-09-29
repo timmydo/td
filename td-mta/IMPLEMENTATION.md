@@ -691,6 +691,13 @@ Implement the remaining work as independently reviewable increments:
     canonical DER, hash-once signing, shared retirement and local handshakes.
   - **M07b3c — configuration handles:** implement immutable role selection,
     bounded identity routing, ALPN, supplied clock and resumption refusal.
+    - **M07b3c1 — outbound configuration:** implemented owned ClientConfig,
+      fixed HTTP/SMTP protocol selection, bounded verifier and shared injected
+      clock with callback-unwind retirement. Portable local peers qualify
+      independent client resumption refusal, trust/name/ALPN policy and time
+      failure through incoming post-handshake tickets. Sessions remain separate.
+    - **M07b3c2 — server configuration:** implement immutable role selection,
+      bounded identity routing and private mandatory client authentication.
 - **M07c — opaque sessions:** implement and pin concrete public signatures
   for TLS.md's record/plaintext/output/status/close operations. Confinement
   tests cover the complete resolved public API. Local peers exercise one-byte

@@ -2,13 +2,14 @@
 
 ## Status and ownership
 
-This is the M07 contract for the future public TLS facade. It does not claim
-that its configurations or sessions are implemented. Bounded PEM syntax,
-P-256 PEM key loading, local ServerIdentity admission and TrustStore
+This is the M07 contract for the public TLS facade. Outbound ClientConfig
+and the shared ClockHandle are implemented; ServerConfig and sessions remain
+future work. Bounded PEM syntax, P-256 PEM key loading, local ServerIdentity
+admission and TrustStore
 construction are implemented. Admitted identities retain a private TLS
 signer sharing the same owned key and retirement state. The private
 algorithm provider implements the fixed suite/group/signature lists below;
-public configuration handles remain future work. DESIGN.md records
+outbound configuration applies its fixed client policy. DESIGN.md records
 implemented acceptance and output contracts. The existing private TLS
 fixtures qualify selected backend behavior only. Implementations must
 satisfy this contract and the resource/failure qualification in DESIGN.md
@@ -104,8 +105,9 @@ inventory.
 
 ## Material and configuration admission
 
-Construct configurations on the cold control path from borrowed byte slices.
-The constructor retains no caller slice; success owns parsed material and
+Admit material on the cold control path from borrowed byte slices, then
+construct configurations from admitted handles and a shared clock.
+Constructors retain no caller slice; success owns parsed material and
 failure publishes no usable configuration. The caller charges input,
 temporary, parsed, shared and overlapping allocations to its generation
 reservation. There is no implicit file read, OS certificate store,
@@ -200,6 +202,11 @@ No h2 engine or ACME TLS-ALPN-01 protocol is implied.
 A td-owned shared Send + Sync clock trait returns optional UTC seconds since
 Unix epoch. Its callback performs bounded, nonblocking work; configurations
 retain a shared clock handle and never retain a short-lived caller borrow.
+ClockHandle owns and serializes the source. Missing time returns Clock and
+leaves the source available for other operations; callback unwind permanently
+retires the shared source and later calls return Crypto. A poisoned handle
+also refuses. Callbacks must not reenter the handle. DESIGN.md defines the
+consuming unwind boundary and its limits.
 All backend time requests use this clock, with no hidden system fallback.
 Missing/unrepresentable time fails Clock, including on an open connection.
 td-mta owns monotonic deadlines and clock-health policy. Check local server
@@ -217,6 +224,19 @@ transient allocation and established-session work to the TLS session budget,
 including several tickets within one record. Test a ticket-sending remote
 server with the clock becoming unavailable after handshake completion.
 Constructor-only and handshake-only clock tests are insufficient.
+
+TLS 1.2 session saving also requests time after server Finished when the
+peer assigned a session ID, despite disabled client resumption. It silently
+ignores missing time; with time available it copies the master secret and
+peer chain before the no-op store drops them. Charge those temporary copies.
+The facade must record each backend time failure in private per-connection
+state and inspect it after every backend call, including successful calls.
+Check shared clock retirement without another callback before publishing
+results. A transient None followed by a successful re-poll must still retire
+the affected session with Clock. A callback panic retires the shared source
+and requires Crypto, even if the backend reports Finished success. Also check
+time on operations where the backend does not request it. The configuration
+fixtures pin this backend hazard; session enforcement remains M07c work.
 
 ## Session progress and buffers
 
@@ -353,8 +373,10 @@ key and configurations selecting it. All clones/sessions check that lifecycle
 fence before use and again before publishing results from an in-flight key
 operation; new calls refuse Crypto. Rebuild through full cold admission and
 generation accounting. Immutable policy does not prevent a shared retirement
-flag. Ordinary remote verification/protocol refusals do not retire shared
-keys. Native abort, OOM and panic hooks retain DESIGN.md's limits.
+flag. A retired shared clock similarly refuses new session work; ordinary
+missing time retires the affected session without retiring that source.
+Ordinary remote verification/protocol refusals do not retire shared keys.
+Native abort, OOM and panic hooks retain DESIGN.md's limits.
 
 Requesting clean close stops new plaintext writes and appends close_notify
 after queued output. Drain it completely before transport close completion;
