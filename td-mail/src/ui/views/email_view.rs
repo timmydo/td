@@ -43,12 +43,6 @@ const MOVE_KEYS: &[Key] = &[Key::Enter, Key::Escape];
 const ATTACHMENT_LABELS: &[&str] = &["Cancel"];
 const ATTACHMENT_KEYS: &[Key] = &[Key::Escape];
 
-/// Where a thread's messages part. The rule is drawn only in the text
-/// closure, which alone knows the pane's columns, so until then the line
-/// stands as a scalar a message body has no reason to carry (and which the
-/// pane would show as U+FFFD if one did).
-const SEPARATOR: &str = "\u{1}";
-
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{} B", bytes)
@@ -139,9 +133,9 @@ pub struct EmailView {
     can_expire_now: bool,
     email_id: String,
     email: Option<Email>,
-    /// The message as lines, unwrapped: the pane's columns wrap them.
-    lines: Vec<String>,
-    /// Bumped whenever `lines` is rebuilt, so the text's key changes with
+    /// The message's text, unwrapped: the pane's columns wrap it.
+    text: String,
+    /// Bumped whenever `text` is rebuilt, so the text's key changes with
     /// what it says even when the message is the same one.
     text_generation: u64,
     loading: bool,
@@ -156,10 +150,6 @@ pub struct EmailView {
     show_all_headers: bool,
     raw_headers_cache: HashMap<String, String>,
     raw_headers_loading: bool,
-    thread_id: Option<String>,
-    /// The thread's subject as the list gave it, for the window's title.
-    thread_subject: String,
-    thread_emails: Vec<Email>,
     mailboxes: Vec<Mailbox>,
     archive_folder: String,
     deleted_folder: String,
@@ -194,7 +184,7 @@ impl EmailView {
             can_expire_now,
             email_id,
             email: None,
-            lines: Vec::new(),
+            text: String::new(),
             text_generation: 0,
             loading: true,
             error: None,
@@ -208,9 +198,6 @@ impl EmailView {
             show_all_headers: false,
             raw_headers_cache: HashMap::new(),
             raw_headers_loading: false,
-            thread_id: None,
-            thread_subject: String::new(),
-            thread_emails: Vec::new(),
             mailboxes,
             archive_folder,
             deleted_folder,
@@ -223,59 +210,6 @@ impl EmailView {
             url_cursor: 0,
             nav_entries,
             nav_cursor,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_thread(
-        cmd_tx: mpsc::Sender<BackendCommand>,
-        reply_from_address: String,
-        thread_id: String,
-        subject: String,
-        can_expire_now: bool,
-        mailboxes: Vec<Mailbox>,
-        archive_folder: String,
-        deleted_folder: String,
-        browser: Option<String>,
-    ) -> Self {
-        let _ = cmd_tx.send(BackendCommand::QueryThreadEmails {
-            thread_id: thread_id.clone(),
-        });
-        EmailView {
-            cmd_tx,
-            reply_from_address,
-            can_expire_now,
-            email_id: String::new(),
-            email: None,
-            lines: Vec::new(),
-            text_generation: 0,
-            loading: true,
-            error: None,
-            pending_reply_all: None,
-            pending_forward: false,
-            pending_compose: None,
-            status_message: None,
-            next_write_op_id: 1,
-            pending_write_ops: HashMap::new(),
-            attachment_picking: false,
-            show_all_headers: false,
-            raw_headers_cache: HashMap::new(),
-            raw_headers_loading: false,
-            thread_id: Some(thread_id),
-            thread_subject: subject,
-            thread_emails: Vec::new(),
-            mailboxes,
-            archive_folder,
-            deleted_folder,
-            move_mode: false,
-            move_cursor: 0,
-            prefer_html: false,
-            browser,
-            urls: Vec::new(),
-            url_picking: false,
-            url_cursor: 0,
-            nav_entries: Vec::new(),
-            nav_cursor: 0,
         }
     }
 
@@ -413,45 +347,6 @@ impl EmailView {
         }
 
         (lines, urls)
-    }
-
-    /// A thread's messages as lines, parted by `SEPARATOR`, with every link
-    /// they carry listed once at the end.
-    fn render_thread_emails(
-        emails: &[Email],
-        raw_headers_cache: &HashMap<String, String>,
-        prefer_html: bool,
-    ) -> (Vec<String>, Vec<String>) {
-        let mut lines = Vec::new();
-        let mut all_urls = Vec::new();
-        for (i, email) in emails.iter().enumerate() {
-            if i > 0 {
-                lines.push(String::new());
-                lines.push(SEPARATOR.to_string());
-                lines.push(String::new());
-            }
-            let raw = raw_headers_cache.get(&email.id).map(|s| s.as_str());
-            Self::render_headers(email, raw, &mut lines);
-            lines.push(String::new());
-            let body_text = Self::extract_body(email, prefer_html);
-            for line in body_text.lines() {
-                lines.push(line.to_string());
-            }
-            for url in extract_urls(&body_text) {
-                if !all_urls.contains(&url) {
-                    all_urls.push(url);
-                }
-            }
-        }
-        // Append combined URL list at end
-        if !all_urls.is_empty() {
-            lines.push(String::new());
-            lines.push("Links:".to_string());
-            for (i, url) in all_urls.iter().enumerate() {
-                lines.push(format!("  [{}] {}", i + 1, url));
-            }
-        }
-        (lines, all_urls)
     }
 
     fn extract_body(email: &Email, prefer_html: bool) -> String {
@@ -609,36 +504,19 @@ impl EmailView {
         }
     }
 
-    /// Rebuilds the lines and the links from what is loaded, and bumps the
+    /// Rebuilds the text and the links from what is loaded, and bumps the
     /// generation so the pane reloads the text its key now names.
-    fn rerender_lines(&mut self) {
-        let rebuilt = if self.thread_id.is_some() && !self.thread_emails.is_empty() {
-            let empty = HashMap::new();
-            let cache = if self.show_all_headers {
-                &self.raw_headers_cache
-            } else {
-                // Empty map = use structured headers
-                &empty
-            };
-            Some(Self::render_thread_emails(
-                &self.thread_emails,
-                cache,
-                self.prefer_html,
-            ))
-        } else if let Some(ref email) = self.email {
-            let raw = if self.show_all_headers {
-                self.raw_headers_cache.get(&email.id).map(|s| s.as_str())
-            } else {
-                None
-            };
-            Some(Self::render_email(email, raw, self.prefer_html))
+    fn rerender_text(&mut self) {
+        let Some(ref email) = self.email else {
+            return;
+        };
+        let raw = if self.show_all_headers {
+            self.raw_headers_cache.get(&email.id).map(|s| s.as_str())
         } else {
             None
         };
-        let Some((lines, urls)) = rebuilt else {
-            return;
-        };
-        self.lines = lines;
+        let (lines, urls) = Self::render_email(email, raw, self.prefer_html);
+        self.text = lines.join("\n");
         self.urls = urls;
         self.text_generation = self.text_generation.wrapping_add(1);
     }
@@ -664,19 +542,11 @@ impl EmailView {
         };
 
         let op_id = self.next_op_id();
-        let send_result = if let Some(thread_id) = &self.thread_id {
-            self.cmd_tx.send(BackendCommand::MoveThread {
-                op_id,
-                thread_id: thread_id.clone(),
-                to_mailbox_id: target_id,
-            })
-        } else {
-            self.cmd_tx.send(BackendCommand::MoveEmail {
-                op_id,
-                id: self.email_id.clone(),
-                to_mailbox_id: target_id,
-            })
-        };
+        let send_result = self.cmd_tx.send(BackendCommand::MoveEmail {
+            op_id,
+            id: self.email_id.clone(),
+            to_mailbox_id: target_id,
+        });
 
         match send_result {
             Ok(()) => ViewAction::Pop,
@@ -689,19 +559,11 @@ impl EmailView {
 
     fn move_to_mailbox_id(&mut self, target_id: String) -> ViewAction {
         let op_id = self.next_op_id();
-        let send_result = if let Some(thread_id) = &self.thread_id {
-            self.cmd_tx.send(BackendCommand::MoveThread {
-                op_id,
-                thread_id: thread_id.clone(),
-                to_mailbox_id: target_id,
-            })
-        } else {
-            self.cmd_tx.send(BackendCommand::MoveEmail {
-                op_id,
-                id: self.email_id.clone(),
-                to_mailbox_id: target_id,
-            })
-        };
+        let send_result = self.cmd_tx.send(BackendCommand::MoveEmail {
+            op_id,
+            id: self.email_id.clone(),
+            to_mailbox_id: target_id,
+        });
 
         match send_result {
             Ok(()) => ViewAction::Pop,
@@ -754,17 +616,10 @@ impl EmailView {
         }
 
         let op_id = self.next_op_id();
-        let send_result = if let Some(thread_id) = &self.thread_id {
-            self.cmd_tx.send(BackendCommand::DestroyThread {
-                op_id,
-                thread_id: thread_id.clone(),
-            })
-        } else {
-            self.cmd_tx.send(BackendCommand::DestroyEmail {
-                op_id,
-                id: self.email_id.clone(),
-            })
-        };
+        let send_result = self.cmd_tx.send(BackendCommand::DestroyEmail {
+            op_id,
+            id: self.email_id.clone(),
+        });
 
         match send_result {
             Ok(()) => ViewAction::Pop,
@@ -775,12 +630,8 @@ impl EmailView {
         }
     }
 
-    /// The subject the window names: the thread's, as the list gave it, or
-    /// the loaded message's.
+    /// The subject the window names: the loaded message's.
     fn subject(&self) -> &str {
-        if !self.thread_subject.is_empty() {
-            return &self.thread_subject;
-        }
         self.email
             .as_ref()
             .and_then(|email| email.subject.as_deref())
@@ -789,11 +640,10 @@ impl EmailView {
     }
 
     fn title(&self) -> String {
-        match (self.loading, self.thread_id.is_some()) {
-            (true, true) => "Thread".to_string(),
-            (true, false) => "Email".to_string(),
-            (false, true) => format!("Thread: {}", strip_newlines(self.subject())),
-            (false, false) => strip_newlines(self.subject()),
+        if self.loading {
+            "Email".to_string()
+        } else {
+            strip_newlines(self.subject())
         }
     }
 
@@ -801,10 +651,9 @@ impl EmailView {
     /// were built in, and the flags that change what they say, so the pane
     /// reloads exactly when the text differs.
     fn text_key(&self) -> String {
-        let id = self.thread_id.as_deref().unwrap_or(&self.email_id);
         format!(
             "email:{}:{}:{}{}",
-            id,
+            self.email_id,
             self.text_generation,
             if self.show_all_headers { 'v' } else { '-' },
             if self.prefer_html { 'h' } else { '-' }
@@ -813,12 +662,7 @@ impl EmailView {
 
     fn body(&self) -> Body<'_> {
         if self.loading {
-            let note = if self.thread_id.is_some() {
-                "Loading thread..."
-            } else {
-                "Loading email..."
-            };
-            return Body::message(note.to_string());
+            return Body::message("Loading email...".to_string());
         }
         if let Some(ref error) = self.error {
             return Body::message(error.clone());
@@ -851,20 +695,7 @@ impl EmailView {
         }
         Body::Text {
             key: self.text_key(),
-            text: Box::new(move |columns| {
-                let mut text = String::new();
-                for (index, line) in self.lines.iter().enumerate() {
-                    if index > 0 {
-                        text.push('\n');
-                    }
-                    if line == SEPARATOR {
-                        text.push_str(&"─".repeat(columns));
-                    } else {
-                        text.push_str(line);
-                    }
-                }
-                wrap_text(&text, columns)
-            }),
+            text: Box::new(move |columns| wrap_text(&self.text, columns)),
         }
     }
 
@@ -1164,32 +995,17 @@ impl View for EmailView {
             Key::Char('v') => {
                 self.show_all_headers = !self.show_all_headers;
                 if self.show_all_headers {
-                    // Fetch raw headers for emails that aren't cached yet
-                    let ids_to_fetch: Vec<String> = if self.thread_id.is_some() {
-                        self.thread_emails
-                            .iter()
-                            .filter(|e| !self.raw_headers_cache.contains_key(&e.id))
-                            .map(|e| e.id.clone())
-                            .collect()
-                    } else {
-                        let id = self.email_id.clone();
-                        if self.raw_headers_cache.contains_key(&id) {
-                            vec![]
-                        } else {
-                            vec![id]
-                        }
-                    };
-                    if ids_to_fetch.is_empty() {
-                        self.rerender_lines();
+                    if self.raw_headers_cache.contains_key(&self.email_id) {
+                        self.rerender_text();
                     } else {
                         self.raw_headers_loading = true;
                         self.status_message = Some("Loading raw headers...".to_string());
-                        for id in ids_to_fetch {
-                            let _ = self.cmd_tx.send(BackendCommand::GetEmailRawHeaders { id });
-                        }
+                        let _ = self.cmd_tx.send(BackendCommand::GetEmailRawHeaders {
+                            id: self.email_id.clone(),
+                        });
                     }
                 } else {
-                    self.rerender_lines();
+                    self.rerender_text();
                 }
                 ViewAction::Continue
             }
@@ -1200,7 +1016,7 @@ impl View for EmailView {
                 } else {
                     "Showing plain text body".to_string()
                 });
-                self.rerender_lines();
+                self.rerender_text();
                 ViewAction::Continue
             }
             Key::Char('b') => {
@@ -1232,42 +1048,6 @@ impl View for EmailView {
 
     fn on_response(&mut self, response: &BackendResponse) -> bool {
         match response {
-            BackendResponse::ThreadEmails { thread_id, emails }
-                if self.thread_id.as_deref() == Some(thread_id) =>
-            {
-                self.loading = false;
-                match emails {
-                    Ok(emails) => {
-                        self.thread_emails = emails.clone();
-                        if let Some(last) = emails.last() {
-                            self.email_id = last.id.clone();
-                            self.email = Some(last.clone());
-                        }
-                        self.rerender_lines();
-                        self.error = None;
-                        // Mark all unread thread emails as read
-                        let unread_ids: Vec<String> = emails
-                            .iter()
-                            .filter(|e| !e.keywords.contains_key("$seen"))
-                            .map(|e| e.id.clone())
-                            .collect();
-                        if !unread_ids.is_empty() {
-                            let _ = self.cmd_tx.send(BackendCommand::MarkThreadRead {
-                                thread_id: thread_id.clone(),
-                                email_ids: unread_ids,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        self.error = Some(format!("Failed to load thread: {}", e));
-                    }
-                }
-                true
-            }
-            BackendResponse::ThreadMarkedRead { .. } => {
-                // Silently consume; no UI update needed
-                false
-            }
             BackendResponse::EmailBody { id, result } if *id == self.email_id => {
                 self.loading = false;
                 match result.as_ref() {
@@ -1277,7 +1057,7 @@ impl View for EmailView {
                             self.nav_cursor = idx;
                         }
                         self.email = Some(email.clone());
-                        self.rerender_lines();
+                        self.rerender_text();
                         self.error = None;
                         self.pending_write_ops.clear();
                     }
@@ -1394,19 +1174,11 @@ impl View for EmailView {
                         self.status_message = Some(format!("Failed to load raw headers: {}", e));
                     }
                 }
-                // Check if all requested headers have arrived
-                let all_loaded = if self.thread_id.is_some() {
-                    self.thread_emails
-                        .iter()
-                        .all(|e| self.raw_headers_cache.contains_key(&e.id))
-                } else {
-                    self.raw_headers_cache.contains_key(&self.email_id)
-                };
-                if all_loaded {
+                if self.raw_headers_cache.contains_key(&self.email_id) {
                     self.raw_headers_loading = false;
                     self.status_message = None;
                     if self.show_all_headers {
-                        self.rerender_lines();
+                        self.rerender_text();
                     }
                 }
                 true
@@ -1636,34 +1408,6 @@ mod tests {
             view.handle_key(Key::Char('p'), 20),
             ViewAction::Scroll(Scroll::Lines(-1))
         ));
-    }
-
-    #[test]
-    fn a_threads_messages_are_parted_by_a_rule_across_the_pane() {
-        let (cmd_tx, _cmd_rx) = mpsc::channel();
-        let mut view = EmailView::new_thread(
-            cmd_tx,
-            "me@example.com".to_string(),
-            "t1".to_string(),
-            "The subject".to_string(),
-            false,
-            Vec::new(),
-            "Archive".to_string(),
-            "Trash".to_string(),
-            None,
-        );
-        assert_eq!(view.scene().title, "Thread");
-        view.on_response(&BackendResponse::ThreadEmails {
-            thread_id: "t1".to_string(),
-            emails: Ok(vec![
-                make_email("e1", "The subject", "first"),
-                make_email("e2", "Re: The subject", "second"),
-            ]),
-        });
-        assert_eq!(view.scene().title, "Thread: The subject");
-        let (_, text) = shown_text(&view, 12);
-        assert!(text.contains(&"─".repeat(12)), "{text}");
-        assert!(text.contains("first") && text.contains("second"), "{text}");
     }
 
     #[test]

@@ -135,7 +135,7 @@ pub fn all_keybindings() -> Vec<KeyBinding> {
             view: "email_list",
             key: "Enter",
             action: "open",
-            description: "Open email / thread reading view",
+            description: "Open email",
         },
         KeyBinding {
             view: "email_list",
@@ -183,19 +183,19 @@ pub fn all_keybindings() -> Vec<KeyBinding> {
             view: "email_list",
             key: "a",
             action: "archive",
-            description: "Archive selected email/thread",
+            description: "Archive selected email",
         },
         KeyBinding {
             view: "email_list",
             key: "d",
             action: "delete",
-            description: "Move selected email/thread to deleted folder",
+            description: "Move selected email to deleted folder",
         },
         KeyBinding {
             view: "email_list",
             key: "D",
             action: "destroy",
-            description: "Expire selected email/thread now (deleted folder only)",
+            description: "Expire selected email now (deleted folder only)",
         },
         KeyBinding {
             view: "email_list",

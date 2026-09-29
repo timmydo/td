@@ -60,25 +60,12 @@ pub enum BackendCommand {
         id: String,
         to_mailbox_id: String,
     },
-    MoveThread {
-        op_id: u64,
-        thread_id: String,
-        to_mailbox_id: String,
-    },
     DestroyEmail {
         op_id: u64,
         id: String,
     },
-    DestroyThread {
-        op_id: u64,
-        thread_id: String,
-    },
     QueryThreadEmails {
         thread_id: String,
-    },
-    MarkThreadRead {
-        thread_id: String,
-        email_ids: Vec<String>,
     },
     MarkMailboxRead {
         mailbox_id: String,
@@ -200,12 +187,6 @@ pub enum BackendResponse {
         op_id: u64,
         id: String,
         action: EmailMutationAction,
-        result: Result<(), String>,
-    },
-    ThreadMarkedRead {
-        #[allow(dead_code)]
-        thread_id: String,
-        #[allow(dead_code)]
         result: Result<(), String>,
     },
     MailboxMarkedRead {
@@ -337,7 +318,8 @@ pub enum EmailMutationAction {
 /// The offline queue's entries. Written as one JSON object per operation
 /// carrying a `kind` discriminator beside the variant's own fields, which is
 /// the shape serde's internally-tagged representation wrote, so a queue
-/// written by an older build still replays.
+/// written by an older build still replays. Only an older build queued the
+/// thread-wide variants; they are kept for that replay and never written.
 #[derive(Clone, Debug)]
 enum QueuedMutation {
     MarkRead {
@@ -650,32 +632,18 @@ fn apply_local_mutation(cache: Option<&Cache>, op: &QueuedMutation) {
         } => {
             let _ = cache.apply_move_email(id, to_mailbox_id);
         }
-        QueuedMutation::MoveThread {
-            thread_id,
-            to_mailbox_id,
-            ..
-        } => {
-            for email in cache.get_thread_emails(thread_id) {
-                let _ = cache.apply_move_email(&email.id, to_mailbox_id);
-            }
-        }
         QueuedMutation::DestroyEmail { id, .. } => {
             let _ = cache.apply_destroy_email(id);
-        }
-        QueuedMutation::DestroyThread { thread_id, .. } => {
-            for email in cache.get_thread_emails(thread_id) {
-                let _ = cache.apply_destroy_email(&email.id);
-            }
-        }
-        QueuedMutation::MarkThreadRead { email_ids, .. } => {
-            for id in email_ids {
-                let _ = cache.apply_mark_seen(id, true);
-            }
         }
         QueuedMutation::MarkMailboxRead { mailbox_id, .. } => {
             let _ = cache.apply_mark_mailbox_read(mailbox_id);
         }
-        QueuedMutation::RunRulesForMailbox { .. }
+        // The thread-wide variants are only replayed, which applies nothing
+        // locally.
+        QueuedMutation::MoveThread { .. }
+        | QueuedMutation::DestroyThread { .. }
+        | QueuedMutation::MarkThreadRead { .. }
+        | QueuedMutation::RunRulesForMailbox { .. }
         | QueuedMutation::ExecuteRetentionExpiry { .. } => {}
     }
 }
@@ -731,10 +699,7 @@ fn process_mutation_via_queue(
         Err(e) => {
             let resolved = matches!(
                 op,
-                QueuedMutation::MoveEmail { .. }
-                    | QueuedMutation::MoveThread { .. }
-                    | QueuedMutation::DestroyEmail { .. }
-                    | QueuedMutation::DestroyThread { .. }
+                QueuedMutation::MoveEmail { .. } | QueuedMutation::DestroyEmail { .. }
             ) && is_missing_remote_error(&e);
             if resolved {
                 log_info!(
@@ -1038,24 +1003,6 @@ fn handle_offline_command(
                 result: result.map(|_| ()),
             });
         }
-        BackendCommand::MoveThread {
-            op_id,
-            thread_id,
-            to_mailbox_id,
-        } => {
-            let op = QueuedMutation::MoveThread {
-                op_id: *op_id,
-                thread_id: thread_id.clone(),
-                to_mailbox_id: to_mailbox_id.clone(),
-            };
-            let result = queue_offline(cache.as_ref(), &op, reason);
-            let _ = resp_tx.send(BackendResponse::EmailMutation {
-                op_id: *op_id,
-                id: thread_id.clone(),
-                action: EmailMutationAction::Move,
-                result: result.map(|_| ()),
-            });
-        }
         BackendCommand::DestroyEmail { op_id, id, .. } => {
             let op = QueuedMutation::DestroyEmail {
                 op_id: *op_id,
@@ -1065,21 +1012,6 @@ fn handle_offline_command(
             let _ = resp_tx.send(BackendResponse::EmailMutation {
                 op_id: *op_id,
                 id: id.clone(),
-                action: EmailMutationAction::Destroy,
-                result: result.map(|_| ()),
-            });
-        }
-        BackendCommand::DestroyThread {
-            op_id, thread_id, ..
-        } => {
-            let op = QueuedMutation::DestroyThread {
-                op_id: *op_id,
-                thread_id: thread_id.clone(),
-            };
-            let result = queue_offline(cache.as_ref(), &op, reason);
-            let _ = resp_tx.send(BackendResponse::EmailMutation {
-                op_id: *op_id,
-                id: thread_id.clone(),
                 action: EmailMutationAction::Destroy,
                 result: result.map(|_| ()),
             });
@@ -1105,20 +1037,6 @@ fn handle_offline_command(
             let _ = resp_tx.send(BackendResponse::ThreadEmails {
                 thread_id: thread_id.clone(),
                 emails: result,
-            });
-        }
-        BackendCommand::MarkThreadRead {
-            thread_id,
-            email_ids,
-        } => {
-            let op = QueuedMutation::MarkThreadRead {
-                thread_id: thread_id.clone(),
-                email_ids: email_ids.clone(),
-            };
-            let result = queue_offline(cache.as_ref(), &op, reason);
-            let _ = resp_tx.send(BackendResponse::ThreadMarkedRead {
-                thread_id: thread_id.clone(),
-                result: result.map(|_| ()),
             });
         }
         BackendCommand::MarkMailboxRead {
@@ -2087,36 +2005,6 @@ fn backend_loop(
                     result,
                 });
             }
-            BackendCommand::MoveThread {
-                op_id,
-                thread_id,
-                to_mailbox_id,
-            } => {
-                let op = QueuedMutation::MoveThread {
-                    op_id,
-                    thread_id: thread_id.clone(),
-                    to_mailbox_id,
-                };
-                let result = process_mutation_via_queue(
-                    client,
-                    &op,
-                    &mut cached_mailboxes,
-                    &rules,
-                    &custom_headers,
-                    &my_email_regex,
-                    cache.as_ref(),
-                )
-                .map_err(|msg| {
-                    log_warn!("Failed to move thread {}: {}", thread_id, msg);
-                    msg
-                });
-                let _ = resp_tx.send(BackendResponse::EmailMutation {
-                    op_id,
-                    id: thread_id,
-                    action: EmailMutationAction::Move,
-                    result,
-                });
-            }
             BackendCommand::DestroyEmail { op_id, id } => {
                 let op = QueuedMutation::DestroyEmail {
                     op_id,
@@ -2142,50 +2030,6 @@ fn backend_loop(
                     action: EmailMutationAction::Destroy,
                     result,
                 });
-            }
-            BackendCommand::DestroyThread { op_id, thread_id } => {
-                let op = QueuedMutation::DestroyThread {
-                    op_id,
-                    thread_id: thread_id.clone(),
-                };
-                let result = process_mutation_via_queue(
-                    client,
-                    &op,
-                    &mut cached_mailboxes,
-                    &rules,
-                    &custom_headers,
-                    &my_email_regex,
-                    cache.as_ref(),
-                )
-                .map_err(|msg| {
-                    log_warn!("Failed to destroy thread {}: {}", thread_id, msg);
-                    msg
-                });
-                let _ = resp_tx.send(BackendResponse::EmailMutation {
-                    op_id,
-                    id: thread_id,
-                    action: EmailMutationAction::Destroy,
-                    result,
-                });
-            }
-            BackendCommand::MarkThreadRead {
-                thread_id,
-                email_ids,
-            } => {
-                let op = QueuedMutation::MarkThreadRead {
-                    thread_id: thread_id.clone(),
-                    email_ids,
-                };
-                let result = process_mutation_via_queue(
-                    client,
-                    &op,
-                    &mut cached_mailboxes,
-                    &rules,
-                    &custom_headers,
-                    &my_email_regex,
-                    cache.as_ref(),
-                );
-                let _ = resp_tx.send(BackendResponse::ThreadMarkedRead { thread_id, result });
             }
             BackendCommand::MarkMailboxRead {
                 mailbox_id,
@@ -3552,7 +3396,6 @@ fn ymd_to_days_since_epoch(year: i32, month: u32, day: u32) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::cache::Cache;
-    use std::collections::HashMap;
 
     /// A lost send's record reads back as written, beside the draft and
     /// private; one that is not a record, too long, or not a regular
@@ -3859,30 +3702,6 @@ mod tests {
         std::env::remove_var("XDG_CACHE_HOME");
     }
 
-    fn make_email(id: &str) -> Email {
-        Email {
-            id: id.to_string(),
-            thread_id: Some("thread-1".to_string()),
-            from: None,
-            to: None,
-            cc: None,
-            reply_to: None,
-            subject: Some(format!("Subject {}", id)),
-            received_at: Some("2025-01-01T00:00:00Z".to_string()),
-            sent_at: None,
-            preview: None,
-            text_body: None,
-            html_body: None,
-            body_values: HashMap::new(),
-            keywords: HashMap::new(),
-            mailbox_ids: HashMap::new(),
-            message_id: None,
-            references: None,
-            attachments: None,
-            extra: HashMap::new(),
-        }
-    }
-
     #[test]
     fn queued_rule_actions_compile_to_email_mutations() {
         let mailboxes = vec![
@@ -3947,48 +3766,6 @@ mod tests {
         assert_eq!(move_targets.len(), 2);
         assert!(move_targets.contains(&"archive".to_string()));
         assert!(move_targets.contains(&"trash".to_string()));
-    }
-
-    #[test]
-    fn apply_local_mark_thread_read_updates_seen_and_unread_counts() {
-        let dir = crate::testing::tempdir().unwrap();
-        let _env = crate::testing::env_lock();
-        std::env::set_var("XDG_CACHE_HOME", dir.path());
-        let cache = Cache::open("backend_thread_mark_read").unwrap();
-
-        let mut e1 = make_email("e1");
-        e1.mailbox_ids.insert("inbox".to_string(), true);
-        let mut e2 = make_email("e2");
-        e2.mailbox_ids.insert("inbox".to_string(), true);
-        cache.put_emails(&[e1.clone(), e2.clone()]);
-        cache.put_mailbox_index("inbox", &["e1".into(), "e2".into()]);
-        cache.put_mailboxes(&[Mailbox {
-            id: "inbox".to_string(),
-            name: "INBOX".to_string(),
-            parent_id: None,
-            role: Some("inbox".to_string()),
-            total_emails: 2,
-            unread_emails: 2,
-            sort_order: 0,
-        }]);
-
-        let op = QueuedMutation::MarkThreadRead {
-            thread_id: "thread-1".to_string(),
-            email_ids: vec!["e1".to_string(), "e2".to_string()],
-        };
-        apply_local_mutation(Some(&cache), &op);
-
-        assert!(cache
-            .get_email("e1")
-            .unwrap()
-            .keywords
-            .contains_key("$seen"));
-        assert!(cache
-            .get_email("e2")
-            .unwrap()
-            .keywords
-            .contains_key("$seen"));
-        assert_eq!(cache.get_mailboxes().unwrap()[0].unread_emails, 0);
     }
 
     #[test]

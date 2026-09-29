@@ -669,7 +669,6 @@ impl View for MailboxListView {
                 // correct state. The user can press 'g' to refresh manually.
                 false
             }
-            BackendResponse::ThreadMarkedRead { .. } => false,
             BackendResponse::MailboxMarkedRead {
                 mailbox_id,
                 mailbox_name,
