@@ -448,6 +448,51 @@ fn halved_blocks_decode_past_the_edges() {
     }
 }
 
+/// Four-pixel cells of unrelated colours.
+fn cells(width: usize, height: usize) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        for x in 0..width {
+            let (row, col) = ((y / 4) as u32, (x / 4) as u32);
+            let h =
+                (row.wrapping_mul(2654435761) ^ col.wrapping_mul(40503)).wrapping_mul(2246822519);
+            let (v, w) = ((h >> 24) as u8, (h >> 8) as u8);
+            rgb.extend([v, w, v / 2 + w / 3]);
+        }
+    }
+    rgb
+}
+
+#[test]
+fn blocks_under_8x8_decode() {
+    // 4x4s, 8x4s and 4x8s, the last of each 8x8 carrying its chroma, on
+    // bands `av1`'s unit test finds them in, past the right and bottom
+    // edges too; and on cells, whose chroma reads its left edge where the
+    // bands' 4-wide blocks predict vertically, at the frame's left edge
+    // and a second tile's.
+    let bands =
+        [(128, 128, 4), (128, 128, 8), (118, 125, 8), (86, 61, 4)].map(|(width, height, band)| {
+            (
+                format!("s{width}x{height}b{band}"),
+                width,
+                height,
+                bands(width, height, band),
+            )
+        });
+    let cells = [(64, 64), (520, 64)].map(|(width, height)| {
+        (
+            format!("c{width}x{height}"),
+            width,
+            height,
+            cells(width, height),
+        )
+    });
+    for (name, width, height, rgb) in bands.into_iter().chain(cells) {
+        let (obus, reconstruction) = encode_rgb(&rgb, width, height, 97, 1, 0);
+        decodes_as_reconstructed(&obus, &reconstruction, &name);
+    }
+}
+
 #[test]
 fn the_filters_decode_on_hard_content() {
     // The strongest CDEF strengths meet noise, a hard edge and a
@@ -630,8 +675,8 @@ fn fnv(bytes: &[u8]) -> u64 {
 fn the_streams_are_the_bytes_dav1d_decoded() {
     for (width, height, quality, rows_log2, hash) in [
         (65, 33, 30, 0, 0xcdaf065dd35e7b93u64),
-        (520, 40, 60, 0, 0x439210b901059d43),
-        (200, 200, 75, 1, 0xd9a5524b4be5939e),
+        (520, 40, 60, 0, 0x546679abb6fc81d9),
+        (200, 200, 75, 1, 0xe02b688817e1aa87),
         (67, 45, 15, 0, 0xf615a7a8dab1c8b8),
         (130, 70, 1, 0, 0x7f11f8fb1f0cd206),
     ] {

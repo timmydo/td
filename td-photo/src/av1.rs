@@ -6,12 +6,12 @@
 //! wraps them. Fed rows like `jpeg::Encoder`, a superblock row at a time.
 //!
 //! What the encoder uses of AV1: 64x64 superblocks split down to square
-//! blocks of 32, 16 and 8 pixels and the halves of a 32 or a 16 by
-//! rate-distortion choice; every intra mode, angle deltas and chroma from
-//! luma included, but palette and filter-intra; for luma with no side of
-//! 32 the best of the reduced set's four DCT and ADST pairs, for chroma
-//! the mode's default; one transform per plane per block, its levels a
-//! dead-zone quantizer's refined by a trellis; the multi-symbol
+//! blocks of 32, 16, 8 and 4 pixels and the halves of a 32, a 16 or an 8
+//! by rate-distortion choice; every intra mode, angle deltas and chroma
+//! from luma included, but palette and filter-intra; for luma with no
+//! side of 32 the best of the reduced set's four DCT and ADST pairs, for
+//! chroma the mode's default; one transform per plane per block, its
+//! levels a dead-zone quantizer's refined by a trellis; the multi-symbol
 //! arithmetic coder with adapting CDFs from the defaults; uniform tile
 //! columns by the frame's size alone, which the threads spread over.
 //! The deblocking filter and CDEF are on at strengths from the
@@ -85,15 +85,17 @@ const UV_CFL_PRED: u8 = 13;
 /// chroma from luma is coded beside chroma's too.
 const LUMA_TRIALS: usize = 3;
 const CHROMA_TRIALS: usize = 2;
+/// Luma's under 8x8, where a third bought 0.1% for 3% of the time.
+const SUB8X8_LUMA_TRIALS: usize = 2;
 /// How many of the screen's closest directional modes have their angle
 /// deltas screened too, luma and chroma.
 const ANGLE_MODES: usize = 2;
 const UV_ANGLE_MODES: usize = 1;
 /// A node's halves are tried unless its split costs less than this
-/// fraction of it whole, `(numerator, denominator)`: where the split wins
-/// by that much the halves seldom beat it. On a textured photo this and
-/// `RECT_MARGIN` keep five sixths of what trying both halvings gains for
-/// two fifths of the trials.
+/// fraction of it whole, `(numerator, denominator)`: where the split
+/// wins by that much the halves seldom beat it. With `RECT_MARGIN` it
+/// kept five sixths of what trying both halvings gained at 16x16 and
+/// 32x32 on the bench's noisy picture, for two fifths of the trials.
 const RECT_GATE: (u64, u64) = (92, 100);
 /// A direction's halves are left untried when the other's hold the
 /// luma's variance under this fraction of what its own do.
@@ -1205,7 +1207,7 @@ impl Contexts {
 // -------------------------------------------------------------- tile
 
 /// A block's place: its mode-info position in the tile and the log2 of
-/// its luma width and height (3 to 6), which a partition's square node
+/// its luma width and height (2 to 6), which a partition's square node
 /// has equal.
 #[derive(Clone, Copy)]
 struct At {
@@ -1246,6 +1248,33 @@ impl At {
     fn plane_dims(self, plane: usize) -> (usize, usize) {
         let sub = usize::from(plane > 0);
         (self.width() >> sub, self.height() >> sub)
+    }
+
+    /// The block whose chroma this one codes, if any (spec `HasChroma`,
+    /// 4:2:0): a block 4 luma pixels on a side carries none unless it
+    /// is the last along that side of its 8x8, and then the 8x8's.
+    fn chroma(self) -> Option<At> {
+        let (odd_row, odd_col) = (self.mi_row % 2 == 1, self.mi_col % 2 == 1);
+        let (thin_rows, thin_cols) = (self.h_log2 == 2, self.w_log2 == 2);
+        if (thin_rows && !odd_row) || (thin_cols && !odd_col) {
+            return None;
+        }
+        Some(At {
+            mi_row: self.mi_row - usize::from(thin_rows),
+            mi_col: self.mi_col - usize::from(thin_cols),
+            w_log2: self.w_log2.max(3),
+            h_log2: self.h_log2.max(3),
+        })
+    }
+
+    /// Whether a side is 4 pixels (spec `MiSize < BLOCK_8X8`).
+    fn is_sub8x8(self) -> bool {
+        self.w_log2 < 3 || self.h_log2 < 3
+    }
+
+    /// Whether the block's directional modes code an angle delta.
+    fn has_angle_deltas(self) -> bool {
+        !self.is_sub8x8()
     }
 
     /// The position's row within its superblock, in mode-info units.
@@ -1540,6 +1569,16 @@ fn plane_size(at: At, plane: usize) -> Size {
     Size::of(w, h).unwrap_or(Size::S4)
 }
 
+/// Where a block codes a plane: luma in place, chroma over its chroma
+/// region if it carries one.
+fn plane_at(at: At, plane: usize) -> Option<At> {
+    if plane == 0 {
+        Some(at)
+    } else {
+        at.chroma()
+    }
+}
+
 /// A block's luma width and height log2 in one byte, the width low.
 fn pack_size(w_log2: u32, h_log2: u32) -> u8 {
     ((h_log2.min(15) << 4) | w_log2.min(15)) as u8
@@ -1672,21 +1711,20 @@ impl Tile {
 
     /// Decides the partition under the square node at the position,
     /// leaving reconstruction and contexts as if coded, and returns the
-    /// rate-distortion cost: the node whole, split, or (a 16x16 or 32x32,
-    /// whose halves have a transform) halved either way, whichever costs
-    /// least. Each is cut short once it costs more than the best so far,
-    /// and the halves are tried only where `RECT_GATE` and
-    /// `rect_directions` let them.
+    /// rate-distortion cost: the node whole, split, or (a 32x32, 16x16
+    /// or 8x8, whose halves have a transform) halved either way,
+    /// whichever costs least. Each is cut short once it costs more than
+    /// the best so far, and the halves are tried only where `RECT_GATE`
+    /// and `rect_directions` let them.
     fn decide(&mut self, at: At, out: &mut Vec<Node>) -> u64 {
         let Some((has_rows, has_cols)) = self.edges(at) else {
             return 0;
         };
         let half = at.w_units() / 2;
-        if at.w_log2 == 3 {
-            let rate = self.partition_rate(at, Partition::None);
+        if at.w_log2 == 2 {
             let (leaf, cost) = self.best_leaf(at);
             out.push(Node::Block(leaf));
-            return cost + self.rd(0, rate);
+            return cost;
         }
         let split_rate = self.partition_rate(at, Partition::Split);
         if at.w_log2 == 6 || !(has_rows && has_cols) {
@@ -1816,12 +1854,15 @@ impl Tile {
         counter.0
     }
 
-    /// The partition symbol of a node (spec `decode_partition`). At the
-    /// frame's edges only a split is coded.
+    /// The partition symbol of a node (spec `decode_partition`), none
+    /// under 8x8. At the frame's edges only a split is coded.
     fn partition_symbol(&mut self, sink: &mut impl Sink, at: At, partition: Partition) {
         let Some((has_rows, has_cols)) = self.edges(at) else {
             return;
         };
+        if at.w_log2 < 3 {
+            return;
+        }
         let (mi_row, mi_col) = (at.mi_row, at.mi_col);
         let bsl = at.w_log2 - 2;
         let above = self.avail_up(mi_row)
@@ -1840,9 +1881,8 @@ impl Tile {
         let cdf = if bsl == 1 {
             self.cdfs.partition_8.get_mut(ctx)
         } else {
-            self.cdfs
-                .partition
-                .get_mut(bsl as usize - 2)
+            bsl.checked_sub(2)
+                .and_then(|i| self.cdfs.partition.get_mut(i as usize))
                 .and_then(|row| row.get_mut(ctx))
         };
         let Some(cdf) = cdf else {
@@ -2001,7 +2041,11 @@ impl Tile {
         let angled = ranked
             .iter()
             .filter(|&&(score, mode, ..)| score != u64::MAX && is_directional(mode))
-            .take(ANGLE_MODES)
+            .take(if at.has_angle_deltas() {
+                ANGLE_MODES
+            } else {
+                0
+            })
             .flat_map(|&(_, mode, ..)| DELTAS.map(|delta| (mode, delta)));
         for (k, (mode, delta)) in (MODES.len()..).zip(angled) {
             let (Some(pred), Some(slot)) =
@@ -2026,7 +2070,11 @@ impl Tile {
         for &(_, mode, delta, k) in screened
             .iter()
             .filter(|&&(score, ..)| score != u64::MAX)
-            .take(LUMA_TRIALS)
+            .take(if at.is_sub8x8() {
+                SUB8X8_LUMA_TRIALS
+            } else {
+                LUMA_TRIALS
+            })
         {
             let pred = luma.get(k * area..(k + 1) * area).unwrap_or(&[]);
             self.code_plane(0, at, mode, mode_tx_type(mode, size), pred, work, trial_y);
@@ -2065,123 +2113,134 @@ impl Tile {
         self.write_recon(0, at, &best_y.recon);
         leaf.levels[0] = std::mem::take(&mut best_y.levels);
         leaf.eob[0] = best_y.eob;
-        // Chroma: both planes share a mode, each mode's u then v.
-        let (chroma_w, chroma_h) = at.plane_dims(1);
-        let area = chroma_w * chroma_h;
-        let (edges_u, edges_v) = (self.pred_edges(1, at), self.pred_edges(2, at));
-        const UV_SLOTS: usize = MODES.len() + 1 + UV_ANGLE_MODES * DELTAS.len();
-        let chroma = grown(preds, UV_SLOTS * area * 2);
-        let mut screened_uv = [(u64::MAX, DC_PRED, 0i8, 0usize); UV_SLOTS];
-        for (k, ((slot, &mode), pred)) in screened_uv
-            .iter_mut()
-            .zip(&MODES)
-            .zip(chroma.chunks_exact_mut(area * 2))
-            .enumerate()
-        {
-            let (u, v) = pred.split_at_mut(area);
-            predict_block(mode, 0, &edges_u, u);
-            predict_block(mode, 0, &edges_v, v);
-            let mut counter = Counter(0);
-            self.uv_mode_symbols(&mut counter, y_mode, mode, 0, [0; 2]);
-            let satd = self.satd(1, at, u) + self.satd(2, at, v);
-            *slot = (self.screen(satd, counter.0), mode, 0, k);
-        }
-        // The closest directional modes' other angles, after the slot
-        // chroma from luma takes.
-        let mut ranked = screened_uv;
-        ranked.sort_unstable();
-        let angled = ranked
-            .iter()
-            .filter(|&&(score, mode, ..)| score != u64::MAX && is_directional(mode))
-            .take(UV_ANGLE_MODES)
-            .flat_map(|&(_, mode, ..)| DELTAS.map(|delta| (mode, delta)));
-        for (k, (mode, delta)) in (MODES.len() + 1..).zip(angled) {
-            let (Some(pred), Some(slot)) = (
-                chroma.get_mut(k * area * 2..(k + 1) * area * 2),
-                screened_uv.get_mut(k),
-            ) else {
-                break;
+        // Chroma, when the block carries it, over its chroma region: both
+        // planes share a mode, each mode's u then v.
+        let uv_cost = 'chroma: {
+            let Some(uv_at) = at.chroma() else {
+                break 'chroma 0;
             };
-            let (u, v) = pred.split_at_mut(area);
-            predict_block(mode, delta, &edges_u, u);
-            predict_block(mode, delta, &edges_v, v);
-            let mut counter = Counter(0);
-            self.uv_mode_symbols(&mut counter, y_mode, mode, delta, [0; 2]);
-            let satd = self.satd(1, at, u) + self.satd(2, at, v);
-            *slot = (self.screen(satd, counter.0), mode, delta, k);
-        }
-        // Chroma from luma: each plane's DC prediction, the first of the
-        // modes, and its alpha against the luma just reconstructed.
-        let k = MODES.len();
-        let mut cfl = [0i8; 2];
-        self.cfl_ac(at, &mut work.ac);
-        if let (Some((dc, rest)), Some(slot)) = (
-            chroma.split_at_mut_checked(area * 2),
-            screened_uv.get_mut(k),
-        ) {
-            let out = rest
-                .get_mut((k - 1) * area * 2..k * area * 2)
-                .unwrap_or(&mut []);
-            if out.len() == area * 2 {
-                let (dc_u, dc_v) = dc.split_at(area);
-                let (u, v) = out.split_at_mut(area);
-                cfl = [
-                    self.cfl_alpha(1, at, dc_u, &work.ac, u),
-                    self.cfl_alpha(2, at, dc_v, &work.ac, v),
-                ];
-                if cfl != [0, 0] {
-                    cfl_predict(dc_u, &work.ac, cfl[0], u);
-                    cfl_predict(dc_v, &work.ac, cfl[1], v);
-                    let mut counter = Counter(0);
-                    self.uv_mode_symbols(&mut counter, y_mode, UV_CFL_PRED, 0, cfl);
-                    let satd = self.satd(1, at, u) + self.satd(2, at, v);
-                    *slot = (self.screen(satd, counter.0), UV_CFL_PRED, 0, k);
+            let (chroma_w, chroma_h) = uv_at.plane_dims(1);
+            let area = chroma_w * chroma_h;
+            let (edges_u, edges_v) = (self.pred_edges(1, uv_at), self.pred_edges(2, uv_at));
+            const UV_SLOTS: usize = MODES.len() + 1 + UV_ANGLE_MODES * DELTAS.len();
+            let chroma = grown(preds, UV_SLOTS * area * 2);
+            let mut screened_uv = [(u64::MAX, DC_PRED, 0i8, 0usize); UV_SLOTS];
+            for (k, ((slot, &mode), pred)) in screened_uv
+                .iter_mut()
+                .zip(&MODES)
+                .zip(chroma.chunks_exact_mut(area * 2))
+                .enumerate()
+            {
+                let (u, v) = pred.split_at_mut(area);
+                predict_block(mode, 0, &edges_u, u);
+                predict_block(mode, 0, &edges_v, v);
+                let mut counter = Counter(0);
+                self.uv_mode_symbols(&mut counter, at, y_mode, mode, 0, [0; 2]);
+                let satd = self.satd(1, uv_at, u) + self.satd(2, uv_at, v);
+                *slot = (self.screen(satd, counter.0), mode, 0, k);
+            }
+            // The closest directional modes' other angles, after the slot
+            // chroma from luma takes.
+            let mut ranked = screened_uv;
+            ranked.sort_unstable();
+            let angled = ranked
+                .iter()
+                .filter(|&&(score, mode, ..)| score != u64::MAX && is_directional(mode))
+                .take(if at.has_angle_deltas() {
+                    UV_ANGLE_MODES
+                } else {
+                    0
+                })
+                .flat_map(|&(_, mode, ..)| DELTAS.map(|delta| (mode, delta)));
+            for (k, (mode, delta)) in (MODES.len() + 1..).zip(angled) {
+                let (Some(pred), Some(slot)) = (
+                    chroma.get_mut(k * area * 2..(k + 1) * area * 2),
+                    screened_uv.get_mut(k),
+                ) else {
+                    break;
+                };
+                let (u, v) = pred.split_at_mut(area);
+                predict_block(mode, delta, &edges_u, u);
+                predict_block(mode, delta, &edges_v, v);
+                let mut counter = Counter(0);
+                self.uv_mode_symbols(&mut counter, at, y_mode, mode, delta, [0; 2]);
+                let satd = self.satd(1, uv_at, u) + self.satd(2, uv_at, v);
+                *slot = (self.screen(satd, counter.0), mode, delta, k);
+            }
+            // Chroma from luma: each plane's DC prediction, the first of the
+            // modes, and its alpha against the luma just reconstructed.
+            let k = MODES.len();
+            let mut cfl = [0i8; 2];
+            self.cfl_ac(uv_at, &mut work.ac);
+            if let (Some((dc, rest)), Some(slot)) = (
+                chroma.split_at_mut_checked(area * 2),
+                screened_uv.get_mut(k),
+            ) {
+                let out = rest
+                    .get_mut((k - 1) * area * 2..k * area * 2)
+                    .unwrap_or(&mut []);
+                if out.len() == area * 2 {
+                    let (dc_u, dc_v) = dc.split_at(area);
+                    let (u, v) = out.split_at_mut(area);
+                    cfl = [
+                        self.cfl_alpha(1, uv_at, dc_u, &work.ac, u),
+                        self.cfl_alpha(2, uv_at, dc_v, &work.ac, v),
+                    ];
+                    if cfl != [0, 0] {
+                        cfl_predict(dc_u, &work.ac, cfl[0], u);
+                        cfl_predict(dc_v, &work.ac, cfl[1], v);
+                        let mut counter = Counter(0);
+                        self.uv_mode_symbols(&mut counter, at, y_mode, UV_CFL_PRED, 0, cfl);
+                        let satd = self.satd(1, uv_at, u) + self.satd(2, uv_at, v);
+                        *slot = (self.screen(satd, counter.0), UV_CFL_PRED, 0, k);
+                    }
                 }
             }
-        }
-        screened_uv.sort_unstable();
-        let mut uv_mode = None;
-        let mut best_score = u64::MAX;
-        // The closest few and chroma from luma, which the screen ranks
-        // below what coding it measures.
-        for (i, &(score, mode, delta, k)) in screened_uv.iter().enumerate() {
-            if score == u64::MAX || (i >= CHROMA_TRIALS && mode != UV_CFL_PRED) {
-                continue;
+            screened_uv.sort_unstable();
+            let mut uv_mode = None;
+            let mut best_score = u64::MAX;
+            // The closest few and chroma from luma, which the screen ranks
+            // below what coding it measures.
+            for (i, &(score, mode, delta, k)) in screened_uv.iter().enumerate() {
+                if score == u64::MAX || (i >= CHROMA_TRIALS && mode != UV_CFL_PRED) {
+                    continue;
+                }
+                let pred = chroma.get(k * area * 2..(k + 1) * area * 2).unwrap_or(&[]);
+                let (pu, pv) = pred.split_at(area.min(pred.len()));
+                let tx = mode_tx_type(mode, plane_size(uv_at, 1));
+                self.code_plane(1, uv_at, mode, tx, pu, work, trial_u);
+                self.code_plane(2, uv_at, mode, tx, pv, work, trial_v);
+                let alphas = if mode == UV_CFL_PRED { cfl } else { [0; 2] };
+                let mut counter = Counter(0);
+                self.uv_mode_symbols(&mut counter, at, y_mode, mode, delta, alphas);
+                let score = trial_u
+                    .cost
+                    .saturating_add(trial_v.cost)
+                    .saturating_add(self.rd(0, counter.0));
+                if uv_mode.is_none() || score < best_score {
+                    std::mem::swap(trial_u, best_u);
+                    std::mem::swap(trial_v, best_v);
+                    uv_mode = Some((mode, delta));
+                    best_score = score;
+                }
             }
-            let pred = chroma.get(k * area * 2..(k + 1) * area * 2).unwrap_or(&[]);
-            let (pu, pv) = pred.split_at(area.min(pred.len()));
-            let tx = mode_tx_type(mode, plane_size(at, 1));
-            self.code_plane(1, at, mode, tx, pu, work, trial_u);
-            self.code_plane(2, at, mode, tx, pv, work, trial_v);
-            let alphas = if mode == UV_CFL_PRED { cfl } else { [0; 2] };
-            let mut counter = Counter(0);
-            self.uv_mode_symbols(&mut counter, y_mode, mode, delta, alphas);
-            let score = trial_u
-                .cost
-                .saturating_add(trial_v.cost)
-                .saturating_add(self.rd(0, counter.0));
-            if uv_mode.is_none() || score < best_score {
-                std::mem::swap(trial_u, best_u);
-                std::mem::swap(trial_v, best_v);
-                uv_mode = Some((mode, delta));
-                best_score = score;
+            let Some((uv_mode, uv_delta)) = uv_mode else {
+                return (leaf, y_cost);
+            };
+            let uv_cost = best_u.cost.saturating_add(best_v.cost);
+            leaf.uv_mode = uv_mode;
+            leaf.deltas[1] = uv_delta;
+            if uv_mode == UV_CFL_PRED {
+                leaf.cfl = cfl;
             }
-        }
-        let Some((uv_mode, uv_delta)) = uv_mode else {
-            return (leaf, y_cost);
+            self.write_recon(1, uv_at, &best_u.recon);
+            self.write_recon(2, uv_at, &best_v.recon);
+            leaf.levels[1] = std::mem::take(&mut best_u.levels);
+            leaf.levels[2] = std::mem::take(&mut best_v.levels);
+            leaf.eob[1] = best_u.eob;
+            leaf.eob[2] = best_v.eob;
+            uv_cost
         };
-        let uv_cost = best_u.cost.saturating_add(best_v.cost);
-        leaf.uv_mode = uv_mode;
-        leaf.deltas[1] = uv_delta;
-        if uv_mode == UV_CFL_PRED {
-            leaf.cfl = cfl;
-        }
-        self.write_recon(1, at, &best_u.recon);
-        self.write_recon(2, at, &best_v.recon);
-        leaf.levels[1] = std::mem::take(&mut best_u.levels);
-        leaf.levels[2] = std::mem::take(&mut best_v.levels);
-        leaf.eob[1] = best_u.eob;
-        leaf.eob[2] = best_v.eob;
         leaf.skip = leaf.eob.iter().all(|&e| e == 0);
         // The mode symbols' rate, then the block is applied.
         let mut counter = Counter(0);
@@ -2464,7 +2523,9 @@ impl Tile {
         }
         let [y_delta, uv_delta] = leaf.deltas;
         self.y_mode_symbols(sink, leaf.at, leaf.y_mode, y_delta);
-        self.uv_mode_symbols(sink, leaf.y_mode, leaf.uv_mode, uv_delta, leaf.cfl);
+        if leaf.at.chroma().is_some() {
+            self.uv_mode_symbols(sink, leaf.at, leaf.y_mode, leaf.uv_mode, uv_delta, leaf.cfl);
+        }
     }
 
     /// The luma mode's symbols of a block at the position: `y_mode` under
@@ -2497,14 +2558,15 @@ impl Tile {
         {
             sink.symbol(cdf, usize::from(y_mode));
         }
-        self.angle_delta_symbol(sink, y_mode, delta);
+        self.angle_delta_symbol(sink, at, y_mode, delta);
     }
 
-    /// The chroma mode's symbols under the luma mode: `uv_mode` and, for
-    /// a directional one, its angle delta.
+    /// The chroma mode's symbols of a block at the position under its
+    /// luma mode: `uv_mode` and, for a directional one, its angle delta.
     fn uv_mode_symbols(
         &mut self,
         sink: &mut impl Sink,
+        at: At,
         y_mode: u8,
         uv_mode: u8,
         delta: i8,
@@ -2538,12 +2600,13 @@ impl Tile {
                 }
             }
         }
-        self.angle_delta_symbol(sink, uv_mode, delta);
+        self.angle_delta_symbol(sink, at, uv_mode, delta);
     }
 
-    /// A directional mode's angle delta, `-3..=3` coded from 0.
-    fn angle_delta_symbol(&mut self, sink: &mut impl Sink, mode: u8, delta: i8) {
-        if is_directional(mode) {
+    /// A directional mode's angle delta, `-3..=3` coded from 0, in a
+    /// block that has them.
+    fn angle_delta_symbol(&mut self, sink: &mut impl Sink, at: At, mode: u8, delta: i8) {
+        if at.has_angle_deltas() && is_directional(mode) {
             if let Some(cdf) = self.cdfs.angle_delta.get_mut(usize::from(mode - V_PRED)) {
                 sink.symbol(cdf, u8::try_from(delta + 3).map_or(3, usize::from));
             }
@@ -2558,9 +2621,9 @@ impl Tile {
 
     /// The block's luma reconstruction as chroma-from-luma reads it
     /// (spec 7.11.5, 4:2:0): each 2x2 summed and doubled, eight times
-    /// the mean, less the block's average, into `ac`. The block's luma is
-    /// decoded whole, its one transform starting in the picture, so no
-    /// edge is padded.
+    /// the mean, less the block's average, into `ac`. The block's luma,
+    /// under 8x8 its 8x8's, is decoded whole, each transform starting in
+    /// the picture, so no edge is padded.
     fn cfl_ac(&self, at: At, ac: &mut Vec<i32>) {
         let (w, h) = at.plane_dims(1);
         let x = at.mi_col * MI;
@@ -2999,10 +3062,13 @@ impl Tile {
         let (w4, h4) = (at.w_units(), at.h_units());
         let sb_row = at.sb_row();
         for (plane, (levels, &eob)) in leaf.levels.iter().zip(leaf.eob.iter()).enumerate() {
+            let Some(pat) = plane_at(at, plane) else {
+                continue;
+            };
             let sub = usize::from(plane > 0);
-            let x4 = at.mi_col >> sub;
-            let y4 = sb_row >> sub;
-            let (w4, h4) = (w4 >> sub, h4 >> sub);
+            let x4 = pat.mi_col >> sub;
+            let y4 = pat.sb_row() >> sub;
+            let (pw4, ph4) = (pat.w_units() >> sub, pat.h_units() >> sub);
             let (cul, dc) = if leaf.skip || eob == 0 {
                 (0, 0)
             } else {
@@ -3019,20 +3085,20 @@ impl Tile {
                 .iter_mut()
                 .zip(above_dc.iter_mut())
                 .skip(x4)
-                .take(w4)
+                .take(pw4)
                 .chain(
                     left_level
                         .iter_mut()
                         .zip(left_dc.iter_mut())
                         .skip(y4)
-                        .take(h4),
+                        .take(ph4),
                 )
             {
                 *level = cul;
                 *sign = dc;
             }
             self.contexts
-                .mark_decoded(plane, (at.mi_col % SB_MI) >> sub, y4, w4, h4);
+                .mark_decoded(plane, (pat.mi_col % SB_MI) >> sub, y4, pw4, ph4);
         }
         let mi_col = at.mi_col;
         let Contexts {
@@ -3107,10 +3173,13 @@ impl Tile {
         self.mode_symbols(&mut coder, &leaf);
         if !leaf.skip {
             for (plane, (levels, &eob)) in leaf.levels.iter().zip(leaf.eob.iter()).enumerate() {
+                let Some(pat) = plane_at(leaf.at, plane) else {
+                    continue;
+                };
                 self.coefficient_symbols(
                     &mut coder,
                     plane,
-                    leaf.at,
+                    pat,
                     leaf.y_mode,
                     leaf.tx_type,
                     Levels { levels, eob },
@@ -4161,8 +4230,10 @@ mod tests {
         (32, 16),
     ];
 
-    /// Every luma block below a superblock, square or halved.
-    const LUMA_SHAPES: [At; 7] = [
+    /// Every luma block below a superblock, square or halved, those
+    /// under 8x8 placed last along their short sides, where they carry
+    /// their 8x8's chroma.
+    const LUMA_SHAPES: [At; 10] = [
         At {
             mi_row: 0,
             mi_col: 0,
@@ -4204,6 +4275,24 @@ mod tests {
             mi_col: 0,
             w_log2: 4,
             h_log2: 5,
+        },
+        At {
+            mi_row: 1,
+            mi_col: 1,
+            w_log2: 2,
+            h_log2: 2,
+        },
+        At {
+            mi_row: 1,
+            mi_col: 0,
+            w_log2: 3,
+            h_log2: 2,
+        },
+        At {
+            mi_row: 0,
+            mi_col: 1,
+            w_log2: 2,
+            h_log2: 3,
         },
     ];
 
@@ -4452,6 +4541,33 @@ mod tests {
         assert_eq!(plane_size(top, 0), Size::S32x16);
         let q = node.quarter(4, 4);
         assert_eq!((q.mi_row, q.mi_col, q.w_log2, q.h_log2), (12, 20, 4, 4));
+        // Under 8x8 only the last block along a 4-pixel side carries
+        // chroma, its 8x8's, and none codes an angle delta.
+        let small = |mi_row, mi_col, w_log2, h_log2| At {
+            mi_row,
+            mi_col,
+            w_log2,
+            h_log2,
+        };
+        let region = |at: At| {
+            at.chroma()
+                .map(|c| (c.mi_row, c.mi_col, c.w_log2, c.h_log2))
+        };
+        assert_eq!(region(small(2, 4, 2, 2)), None);
+        assert_eq!(region(small(3, 4, 2, 2)), None);
+        assert_eq!(region(small(2, 5, 2, 2)), None);
+        assert_eq!(region(small(3, 5, 2, 2)), Some((2, 4, 3, 3)));
+        assert_eq!(region(small(2, 4, 3, 2)), None);
+        assert_eq!(region(small(3, 4, 3, 2)), Some((2, 4, 3, 3)));
+        assert_eq!(region(small(2, 4, 2, 3)), None);
+        assert_eq!(region(small(2, 5, 2, 3)), Some((2, 4, 3, 3)));
+        assert_eq!(region(q), Some((12, 20, 4, 4)));
+        assert!(small(3, 5, 2, 2).is_sub8x8() && !small(3, 5, 2, 2).has_angle_deltas());
+        assert!(!q.is_sub8x8() && q.has_angle_deltas());
+        let [a, b] = At::square(2, 4, 3).halves(false);
+        assert_eq!((a.chroma().is_some(), b.chroma().is_some()), (false, true));
+        let [a, b] = At::square(2, 4, 3).halves(true);
+        assert_eq!((a.chroma().is_some(), b.chroma().is_some()), (false, true));
         assert_eq!(unpack_size(pack_size(5, 4), true), 5);
         assert_eq!(unpack_size(pack_size(5, 4), false), 4);
     }
@@ -4484,7 +4600,8 @@ mod tests {
         let mut mags = Magnitudes::default();
         let mut dropped = 0;
         for round in 0..300 {
-            let (at, plane) = (LUMA_SHAPES[round % 7], round / 7 % 2);
+            let (at, plane) = (LUMA_SHAPES[round % 10], round / 10 % 2);
+            let at = plane_at(at, plane).unwrap();
             let size = plane_size(at, plane);
             let coeffs: Vec<i32> = (0..size.area())
                 .map(|_| {
@@ -4542,8 +4659,9 @@ mod tests {
         let g = Geometry::new(64, 64).unwrap();
         let mut tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120);
         let mut rng = Lcg(7);
-        for round in 0..280 {
-            let (at, plane) = (LUMA_SHAPES[round % 7], round / 7 % 2);
+        for round in 0..400 {
+            let (at, plane) = (LUMA_SHAPES[round % 10], round / 10 % 2);
+            let at = plane_at(at, plane).unwrap();
             let size = plane_size(at, plane);
             let (w, area) = (size.width(), size.area());
             let eob = 1 + rng.next() as usize % area;
@@ -4657,6 +4775,33 @@ mod tests {
             assert!(
                 halved > 0 && past_edge > 0,
                 "q{quality}: {halved} halved 4x4s, {past_edge} past the edge"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_under_8x8_are_chosen_in_every_shape() {
+        // What `tests/av1.rs` holds to dav1d covers 4x4s, 8x4s and 4x8s,
+        // whatever the search's tuning: bands four and eight pixels wide
+        // at a high quality.
+        let (width, height) = (128, 128);
+        for band in [4, 8] {
+            let mut encoder = Encoder::new(width, height, 97, 1).unwrap();
+            encoder.keep_reconstruction();
+            encoder.encode_rows(&bands(width, height, band)).unwrap();
+            let kept = encoder.kept.as_ref().unwrap();
+            let mut shapes = [0usize; 3];
+            for &s in &kept.sizes {
+                match (unpack_size(s, true), unpack_size(s, false)) {
+                    (2, 2) => shapes[0] += 1,
+                    (3, 2) => shapes[1] += 1,
+                    (2, 3) => shapes[2] += 1,
+                    _ => {}
+                }
+            }
+            assert!(
+                shapes.iter().all(|&n| n > 0),
+                "band {band}: 4x4, 8x4, 4x8 {shapes:?}"
             );
         }
     }
