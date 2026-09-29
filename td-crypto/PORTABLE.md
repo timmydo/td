@@ -296,20 +296,23 @@ cleanup rule as prepared inputs.
 
 ## Streaming digest qualification
 
-The runtime runs the opaque SHA-256 facade's four existing known-answer
+The runtime runs the owned SHA-256 facade's four existing known-answer
 fixtures, including fragmented updates around block boundaries and a million
-`a` bytes. Separate cases inject constructor/update/finish Rust unwinds and
-verify terminal state after update/length refusal. The checked length limit
-uses a synthetic counter near its ceiling; the test does not hash exabytes.
-These are the same private call boundaries used by the public methods.
+`a` bytes. Differential cases compare against the admitted native SHA-256
+implementation at every byte length through 257 and selected larger block
+boundaries through 4097, with varied chunks and every split through 257.
+Separate cases verify terminal refusal, retained-state clearing, bounded inline
+storage and redacted Debug. The length limit uses a synthetic counter near its
+ceiling; synthetic differences exercise upper padding-length bytes without
+hashing exabytes.
 
-The entire target graph and final executable require `panic=unwind`. The
-supported Cargo build uses its default unwind strategy. The crate guard refuses
-its own abort compilation; it cannot detect a separately compiled final-only
-abort override. Such linking is unsupported, including in future target recipes.
-Hooks still run, and these tests do not simulate native OOM, native abort or
-entropy failure. They add no allocation/RSS or service-stack claim. DESIGN.md
-owns the failure policy and the remaining M07 qualification requirements.
+Direct digests have no provider unwind path, heap allocation or native crypto
+calls. Source and exact-artifact control/address and call-graph review qualify
+that narrow primitive; retain compiler/flags/target and artifact identity in the landing
+record. This is not a guarantee for arbitrary compiler changes, other CPU
+paths, secure erasure of all copies, or whole-service resource use. The native
+adapters still require whole-graph `panic=unwind`; their synthetic failures do
+not simulate native abort/OOM or entropy failure. DESIGN.md owns those limits.
 
 ## Entropy qualification
 

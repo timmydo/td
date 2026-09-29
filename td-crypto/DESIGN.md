@@ -6,9 +6,10 @@ This crate owns td's provider-independent cryptographic API. The compiling
 M03a surface contains `Error`, `Entropy`, `Digest` and `Crypto`, extracted
 from td-mta's existing ports. M03b1 admits the private Rustls/AWS-LC
 dependencies and checks their offline host build. M07a1 implements opaque
-streaming SHA-256 through the private AWS-LC backend. M07a3 adds the opaque
-worker-local entropy handle. M07a4 implements the Crypto factory, fixed-size
-comparison and opaque P-256 key generation/loading/signing. TLS sessions remain
+streaming SHA-256; its direct operation uses the owned fixed-state primitive.
+M07a3 adds the opaque worker-local entropy handle. M07a4 implements the Crypto
+factory, fixed-size comparison and opaque P-256 key generation/loading/signing.
+TLS sessions remain
 unimplemented. Test-only backend qualification covers explicit
 provider construction, SHA-256, local TLS 1.2/1.3 data exchange, certificate
 verification and malformed/tampered-record refusals in the isolated static
@@ -76,7 +77,8 @@ types defined by td-crypto. Never re-export upstream modules, type aliases,
 provider configuration types or error chains; a public function returning a
 Rustls type would breach the boundary even without a direct consumer dependency.
 Concrete backend state lives in private fields/modules. There is one selected
-backend in source, with no feature, environment or runtime backend selector.
+implementation per operation in source, with no feature, environment or runtime
+backend selector.
 
 `Entropy::fill` returning success fills the entire caller slice. On a returned
 error, discard the whole output, including bytes written before the error.
@@ -171,57 +173,51 @@ or compiler/caller copies.
 
 ### Streaming SHA-256
 
-`Sha256::try_new` creates one opaque digest operation. Initialization is cold
-and may allocate provider state; failure returns `Error::Crypto`. `Digest`
-updates stream directly into that state without retaining whole input chunks;
-native state retains up to 63 bytes of a partial block. The concrete
-`Crypto` factory delegates to the same `Sha256::try_new` constructor.
-Checked total input length cannot exceed `u64::MAX / 8` bytes, the SHA-256
-bit-length limit. Length refusal or a provider update failure retires the
-state; later updates and finish return `Error::Crypto`. Only a successful,
-consuming finish returns a 32-byte digest. No clone or reset is exposed.
+`Sha256::try_new` creates one inline td-owned operation with eight chaining
+words, one 64-byte partial block, a checked byte counter and terminal-state
+flag. Construction, updates and consuming finish use no heap, native provider,
+locks or OS calls. The fallible public API remains unchanged. The concrete
+`Crypto` factory delegates to this constructor. Only this direct streaming
+operation uses the owned primitive; Rustls and ES256 signing still use AWS-LC.
 
-The pinned provider's public Context constructor, update and finish use
-unwrap/expect internally; their fallible helpers are private. A narrow
-`catch_unwind` boundary owns the context across each call. On unwind it drops
-the context and returns the fixed error; it never resumes a partial context.
-No `AssertUnwindSafe`, global hook change, vendor patch or second backend is
-introduced. The pinned digest cleanup calls native `EVP_MD_CTX_cleanup`
-without a Rust panic path. Algorithm selection is fixed to SHA-256; the
-audited Rust failure payloads are fixed messages and `Unspecified`, not input
-bytes. No provider error or panic payload crosses the public API.
+The implementation adapts the FIPS 180-4 constants and compression algorithm
+already present in engine/src/sha256.rs. It owns its checked streaming and
+padding logic inside this crate; no engine helper or allocating file/string
+adapter enters the production dependency graph. Compression uses a fixed
+64-word schedule, 64 rounds and wrapping 32-bit additions. Loop counts and
+memory addresses depend on public message length/round number, not message
+contents. No data-dependent lookup table or hardware dispatch is used.
 
-This boundary requires Rust unwinding throughout the target graph, including
-the final executable. The crate refuses its own compilation with `panic=abort`;
-that check alone cannot detect linking an unwind-built rlib into a separately
-compiled aborting executable. The supported portable Cargo build compiles the
-whole graph with the default unwind strategy. Every future target recipe or
-consumer build must preserve that strategy through final linking; a final-only
-abort override is unsupported. Panic hooks still execute, and an aborting or
-panicking hook is outside the boundary. Native aborts, OOM and unwinding failures are not contained.
-Returned failure tests inject Rust unwinds at the same private entry points;
-they do not establish native allocation-failure or entropy-failure recovery.
+Checked total input length cannot exceed `u64::MAX / 8` bytes. Padding writes
+the original big-endian bit length directly, without passing padding through
+the counted update path. Length refusal or an internal bounds failure clears
+and retires the state; later updates and finish return `Error::Crypto`. Only a
+successful consuming finish returns 32 bytes. No clone/reset or alternate
+backend selector is exposed. This implementation has no provider panic to
+catch; the crate still requires unwinding for its remaining native adapters.
 
-Successful native finalization explicitly cleanses digest state. Every cleanup
-path, including early/error drop, also calls `EVP_MD_CTX_cleanup` and then
-`OPENSSL_free`. The pinned default allocator cleanses the allocation, including
-its size prefix, before freeing it. No allocator override is installed; any
-future override must preserve this responsibility and repeat qualification.
-This source audit does not prove erasure of provider stack temporaries or
-compiler/caller copies. Never finalize a failed context merely to clear it.
+Retirement and Drop clear retained words, block and counters; compression
+clears its schedule. `std::hint::black_box` follows those writes to discourage
+dead-store removal in the qualified build. This is observable hygiene with
+an optimization barrier, not a portable secure-erasure guarantee. Rust moves,
+registers, compiler temporaries, caller input and abort/kill paths can retain
+copies. No unsafe volatile-write helper or new dependency is introduced.
+In the inspected x86-64 musl build, update refusal and drop without finish
+clear state in place. Consuming finish clears a moved copy; the caller's
+original stack slot and compression spills can retain message/state bytes.
 
-Known-answer tests reuse the four existing engine SHA-256 fixture values and
-exercise empty inputs and fragmented updates around block boundaries. The
-portable harness runs those cases, retirement checks and unwind injection in
-its isolated runtime. This is functional and API-confinement evidence; M07
-still owes native allocation, worker-stack and whole-process qualification
-before service use. Successful construction allocates native digest state,
-and the public provider API exposes no reset operation. Constructing one per
-message cannot satisfy td-mta's no-allocation hot-path contract by calling it
-admission work. Cold configuration/startup work can use this facade; reusable
-state or a separately qualified implementation is required before hot-path
-hashing is enabled. The factory and P-256 operations below use the same
-resource restrictions.
+Tests retain the four existing known answers and compare boundary lengths,
+fragmentation and every split through 257 bytes against the admitted AWS-LC
+implementation. Engine-derived code is not an independent oracle for this
+replacement. Synthetic counters exercise the limit without hashing exabytes;
+counter differences also check that each upper padding-length byte matters.
+Malformed private-state fixtures check fail-closed retirement. The portable
+harness runs these cases and the existing mail-format digest fixtures. Its
+inline state is at most 128 bytes; source and exact-artifact call-graph review
+qualify the no-allocation and content-independent control/address claims for
+the recorded compiler/flags/target. Repeat artifact review when those change.
+This does not complete whole-service stack/RSS qualification or qualify other
+primitives, targets or microarchitectural leakage outside that review scope.
 
 ### Crypto factory and P-256 signing keys
 
@@ -288,11 +284,23 @@ native encoding buffers use native cleanup. This does not guarantee erasure
 of stack/compiler copies or cleanup after abort/kill. Ordinary parse failures
 map to Invalid; generation/signing failures and caught Rust unwinds map to
 Crypto. No native diagnostics or panic payload becomes a public error. The
-same whole-graph unwind and hook limitations as SHA-256 apply.
+whole-graph unwind and hook limitations below apply.
+
+This boundary requires Rust unwinding throughout the target graph, including
+the final executable. The crate refuses its own compilation with `panic=abort`;
+that check alone cannot detect linking an unwind-built rlib into a separately
+compiled aborting executable. The supported portable Cargo build compiles the
+whole graph with the default unwind strategy. Every future target recipe or
+consumer build must preserve that strategy through final linking; a final-only
+abort override is unsupported. Panic hooks still execute, and an aborting or
+panicking hook is outside the boundary. Native aborts, OOM and unwinding failures are not contained.
+P-256 failure tests inject Rust unwinds at its private operation boundaries;
+they do not establish native allocation-failure or entropy-failure recovery.
 
 Tests use only existing repository crypto material: the engine SHA-256 and
 td-secret P-256 source/vector fixtures are compiled as test-only independent
-oracles. Their own known-answer, valid/invalid signature and arithmetic cases
+oracles for the native ES256 signer. Their own known-answer, valid/invalid
+signature and arithmetic cases
 qualify the oracle; generated signatures must verify against the message,
 not its digest, and modified messages/signatures are refused. No randomized
 signature-byte equality is required. These sources never enter the shipped
@@ -311,8 +319,9 @@ in PORTABLE.md. M03b2d1 adds compiler-resolved API confinement;
 M03b2d2 adds the bounded local TLS smoke specified in PORTABLE.md.
 Reuse compatible reviewed pins without inheriting td-net's dependency set.
 Rustls and aws-lc-rs are direct dependencies only of td-crypto, resolving one
-AWS-LC version pair for direct operations and TLS. No second backend enters the
-shipping graph. Disable unused features and all undeclared build fallbacks.
+AWS-LC version pair for entropy, comparison, P-256 signing and TLS. The owned
+SHA-256 implementation serves direct streaming digests only. Disable unused
+features and all undeclared build fallbacks.
 The portable musl artifact follows td-mta/DESIGN.md section 3; it does not
 inherit the source-bootstrap provenance of td's separate target image graph.
 
@@ -402,6 +411,10 @@ it is outside F04. td-mta/IMPLEMENTATION.md F04 owns mail integration staging
 and cutover. Each primitive needs
 independent cryptographic and exact-artifact side-channel review, including
 compiler/flags/target, nonce generation and entropy/optimization-barrier choices.
-Passing functional tests alone is insufficient. Test candidates stay outside
-the shipping backend until an atomic qualified replacement removes obsolete
-AWS-LC dependencies/build inputs. Do not prebuild unused primitive interfaces.
+Passing functional tests alone is insufficient. The direct streaming SHA-256
+operation is an independently qualified early
+cutover from F04: its native Context adapter is removed atomically, while
+AWS-LC remains required for entropy, comparison, P-256 and Rustls. Further
+candidates stay test-only until their qualified cutover; remove each obsolete
+adapter and remove native dependencies/build inputs when their final user
+is replaced. Do not prebuild unused primitive interfaces.

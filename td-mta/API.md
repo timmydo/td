@@ -75,8 +75,9 @@ secrets. Existing mail callers can use
 The shared contract and implementation rules live in
 [td-crypto/DESIGN.md](../td-crypto/DESIGN.md). Its implemented Crypto factory,
 SHA-256, worker-local entropy and P-256 key operations use opaque td-owned
-handles over the private backend. TLS session APIs and service/resource
-qualification remain M07 work. Shared backend conformance
+handles. Direct streaming SHA-256 uses owned inline state; other implemented
+operations retain the private AWS-LC backend. TLS session APIs and
+service/resource qualification remain M07 work. Shared backend conformance
 fixtures live in td-crypto; service integration tests reach it through the same
 public facade as production.
 

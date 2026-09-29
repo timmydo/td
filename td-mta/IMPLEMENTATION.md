@@ -614,8 +614,11 @@ required independent oracles, including exact malformed-transfer blob bytes.
 opaque APIs; td-mta's transport, policy-generation and resource integration.
 
 **Partial implementation:** M07a1 supplies opaque, fallible streaming SHA-256
-inside td-crypto, with terminal failure state and a narrow provider-unwind
-boundary. Known-answer and failure tests run in the portable harness. M07a2
+inside td-crypto, with terminal failure state. Its direct operation now uses
+the owned fixed-state SHA-256 primitive brought forward from F04, without
+heap allocation or provider calls. Known-answer, differential and failure tests
+run in the portable harness. This leaves the remaining native operations
+unchanged. M07a2
 compares the real facade with existing mail-format container, cross-file,
 blob and import snapshot digest fixtures on the host and portable artifact.
 This is hash-coverage qualification, not a production container verifier.
@@ -1038,7 +1041,8 @@ with predictable quota/admission behavior and tests for rejected domains. No
 plus addressing, external forwarding, or regex address rewriting rides with it.
 
 **F04 — Owned cryptographic primitives inside td-crypto.** The facade crate
-exists from M03a; replacing its private AWS-LC implementation is future work
+exists from M03a. Direct streaming SHA-256 is brought forward to satisfy v1
+allocation constraints; the rest of AWS-LC replacement remains future work
 and does not block v1. Its normative contracts live in td-crypto/DESIGN.md.
 Mail code and its direct dependency do not change with backend selection.
 
@@ -1052,7 +1056,8 @@ Mail code and its direct dependency do not change with backend selection.
    Require independent cryptographic and exact-artifact side-channel review,
    repeated when compiler/flags/target change. Tests alone are insufficient.
 3. Implement its private Rustls CryptoProvider bridge as well as the direct
-   operations. Candidate paths stay test-only until cutover; there is no public
+   operations, except the separately qualified direct SHA-256 cutover. Other
+   candidate paths stay test-only until cutover; there is no public
    feature/configuration selector or new mail dependency. The reviewed test
    closure may contain both implementations for qualification.
 4. Run shared conformance, complete M07 mail/TLS integration and bidirectional

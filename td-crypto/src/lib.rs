@@ -1,4 +1,4 @@
-//! Opaque cryptography APIs over the private AWS-LC backend.
+//! Opaque cryptography APIs with owned SHA-256 and a private AWS-LC backend.
 //! TLS configuration and session APIs remain unimplemented.
 //!
 //! These checks reject the two named root exports; backend integration must
@@ -60,7 +60,7 @@ pub trait Digest: Send {
 pub trait Crypto: Send + Sync {
     type Sha256: Digest;
     type SigningKey: Send + Sync;
-    /// Cold creation may fail before a digest state is available.
+    /// Fallible digest creation; the concrete Provider uses inline storage.
     fn sha256(&self) -> Result<Self::Sha256, Error>;
     /// Provider-backed constant-time equality for fixed-size digests.
     fn equal_digest(&self, left: &[u8; 32], right: &[u8; 32]) -> bool;

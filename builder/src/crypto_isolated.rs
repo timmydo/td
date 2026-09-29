@@ -618,8 +618,9 @@ pub(crate) fn runtime_inner() -> Result<()> {
     for (index, (binary, case, ignored)) in [
         ("td-crypto-smoke", "tests::admitted_native_backend_sha256_smoke", false),
         ("td-crypto-smoke", "sha256::tests::known_answers_and_fragmented_updates", false),
-        ("td-crypto-smoke", "sha256::tests::initialization_update_and_finalization_unwinds_return_fixed_failure", false),
-        ("td-crypto-smoke", "sha256::tests::length_refusal_retires_state_before_provider_update", false),
+        ("td-crypto-smoke", "sha256::tests::differential_padding_blocks_and_every_split", false),
+        ("td-crypto-smoke", "sha256::tests::refusal_retires_and_clears_state", false),
+        ("td-crypto-smoke", "sha256::tests::inline_storage_and_fixed_debug", false),
         ("td-crypto-smoke", "entropy::tests::local_randomness_smoke", false),
         ("td-crypto-smoke", "entropy::tests::construction_requires_nonempty_successful_initialization", false),
         ("td-crypto-smoke", "entropy::tests::synthetic_partial_error_clears_the_entire_caller_slice", false),

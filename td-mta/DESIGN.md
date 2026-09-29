@@ -118,7 +118,9 @@ only. M07a1 implements opaque SHA-256; M07a2 qualifies it against the existing
 mail-format digest fixtures. M07a3 adds worker-local entropy initialization;
 M07a4 implements the Crypto factory and opaque P-256 operations.
 TLS sessions and service/resource qualification remain pending.
-Native per-digest allocation has not been qualified for mail hot paths. No
+Direct streaming digests use td-owned inline SHA-256 without heap allocation
+or provider calls.
+Other native operations still require resource qualification. No
 Rustls/AWS-LC public types, re-exports or configuration escape hatches cross
 its facade.
 Mail transport adapters consume opaque td-crypto configurations/session state.
