@@ -308,4 +308,4 @@ pub(super) fn private_key<T>(
 
 #[cfg(test)]
 #[path = "pem_tests.rs"]
-mod tests;
+pub(crate) mod tests;

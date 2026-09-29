@@ -1,6 +1,6 @@
 //! Local backend qualification only; no production TLS adapter.
 //! Generated keys, certificates and fixed time keep this fixture offline.
-use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,108 +13,7 @@ const TURNS: usize = 64;
 
 type Error = Box<dyn std::error::Error>;
 type Result<T> = std::result::Result<T, Error>;
-fn der(tag: u8, bytes: &[u8]) -> Vec<u8> {
-    let mut out = vec![tag];
-    if bytes.len() < 128 {
-        out.push(bytes.len() as u8)
-    } else {
-        let length = bytes.len().to_be_bytes();
-        let length = length
-            .iter()
-            .skip_while(|b| **b == 0)
-            .copied()
-            .collect::<Vec<_>>();
-        out.push(0x80 | length.len() as u8);
-        out.extend_from_slice(&length);
-    }
-    out.extend_from_slice(bytes);
-    out
-}
-fn seq(parts: &[Vec<u8>]) -> Vec<u8> {
-    der(0x30, &parts.concat())
-}
-fn oid(bytes: &[u8]) -> Vec<u8> {
-    der(6, bytes)
-}
-fn name(cn: &[u8]) -> Vec<u8> {
-    seq(&[der(0x31, &seq(&[oid(&[0x55, 4, 3]), der(0x0c, cn)]))])
-}
-fn signature_algorithm() -> Vec<u8> {
-    seq(&[oid(&[0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3, 2])])
-}
-fn extension(last: u8, critical: bool, value: Vec<u8>) -> Vec<u8> {
-    let mut parts = vec![oid(&[0x55, 0x1d, last])];
-    if critical {
-        parts.push(der(1, &[0xff]))
-    };
-    parts.push(der(4, &value));
-    seq(&parts)
-}
-// Fixture DER only: P-256 CA and localhost leaf, valid 2025-01-01 to 2035-01-01.
-fn certificate(key: &EcdsaKeyPair, signer: &EcdsaKeyPair, ca: bool) -> Result<Vec<u8>> {
-    certificate_with(
-        key,
-        signer,
-        ca,
-        1,
-        b"td-test-root",
-        b"350101000000Z",
-        if ca { 1 } else { 2 },
-    )
-}
-fn certificate_with(
-    key: &EcdsaKeyPair,
-    signer: &EcdsaKeyPair,
-    ca: bool,
-    usage: u8,
-    issuer: &[u8],
-    expires: &[u8],
-    serial: u8,
-) -> Result<Vec<u8>> {
-    let mut public = vec![0];
-    public.extend_from_slice(key.public_key().as_ref());
-    let spki = seq(&[
-        seq(&[
-            oid(&[0x2a, 0x86, 0x48, 0xce, 0x3d, 2, 1]),
-            oid(&[0x2a, 0x86, 0x48, 0xce, 0x3d, 3, 1, 7]),
-        ]),
-        der(3, &public),
-    ]);
-    let mut extensions = vec![
-        extension(
-            0x13,
-            true,
-            if ca {
-                seq(&[der(1, &[0xff])])
-            } else {
-                seq(&[])
-            },
-        ),
-        extension(0x0f, true, der(3, if ca { &[1, 6] } else { &[7, 0x80] })),
-    ];
-    if !ca {
-        extensions.push(extension(0x11, false, seq(&[der(0x82, b"localhost")])));
-        extensions.push(extension(
-            0x25,
-            false,
-            seq(&[oid(&[0x2b, 6, 1, 5, 5, 7, 3, usage])]),
-        ));
-    }
-    let body = seq(&[
-        der(0xa0, &der(2, &[2])),
-        der(2, &[serial]),
-        signature_algorithm(),
-        name(issuer),
-        seq(&[der(0x17, b"250101000000Z"), der(0x17, expires)]),
-        name(if ca { b"td-test-root" } else { b"localhost" }),
-        spki,
-        der(0xa3, &seq(&extensions)),
-    ]);
-    let signed = signer.sign(&aws_lc_rs::rand::SystemRandom::new(), &body)?;
-    let mut bits = vec![0];
-    bits.extend_from_slice(signed.as_ref());
-    Ok(seq(&[body, signature_algorithm(), der(3, &bits)]))
-}
+use crate::certificate_fixtures::{certificate, certificate_with};
 #[derive(Debug)]
 struct Time(u64);
 impl rustls::time_provider::TimeProvider for Time {

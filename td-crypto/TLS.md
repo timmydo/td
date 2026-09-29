@@ -3,9 +3,9 @@
 ## Status and ownership
 
 This is the M07 contract for the future public TLS facade. It does not claim
-that its configurations, identity admission or sessions are implemented.
-Bounded PEM syntax and P-256 PEM key loading are implemented; DESIGN.md
-records their narrower acceptance and output contract. The existing
+that its configurations, trust-store admission or sessions are implemented.
+Bounded PEM syntax, P-256 PEM key loading and local ServerIdentity admission
+are implemented; DESIGN.md records their acceptance and output contracts. The existing
 private TLS fixtures qualify selected backend behavior only. Implementations
 must satisfy this contract and the resource/failure qualification in
 DESIGN.md before td-mta enables a listener or an outgoing connection through
@@ -142,6 +142,12 @@ certificate: remote peers apply their own roots. Private deployments may use
 an explicitly configured self-signed server leaf with the same key,
 validity, usage and name checks. Do not substitute a generated self-signed
 certificate.
+
+Local identity admission additionally limits each certificate to 64
+extensions and the backend's X.509 v3/1970-or-later date subset. It requires
+an uncompressed P-256 leaf point and canonical owned metadata encodings;
+DESIGN.md specifies the exact subset and partial-chain signature limits.
+Local admission alone does not establish remote trust.
 
 A server configuration contains at most 16 identities and 512 exact DNS-name
 bindings, with at most 32 names per identity and 253 ASCII bytes per name.

@@ -23,6 +23,13 @@ mod pem;
 pub use pem::{PemCertificates, CERTIFICATE_DER_CAPACITY};
 mod provider;
 pub use provider::{P256Key, Provider, P256_PKCS8_CAPACITY};
+mod der;
+mod certificate;
+mod certificate_algorithms;
+mod tls_error;
+pub use tls_error::{TlsError, VerificationFailure};
+mod identity;
+pub use identity::ServerIdentity;
 
 /// Fixed failures carry neither backend diagnostics nor secret input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +89,8 @@ pub trait Crypto: Send + Sync {
     ) -> Result<(), Error>;
 }
 
+#[cfg(test)]
+mod certificate_fixtures;
 #[cfg(test)]
 mod tls_smoke;
 

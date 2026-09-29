@@ -234,7 +234,7 @@ must select exactly one expected binary/test profile. All four results must be
 x86-64 static PIEs with an executable entry point and no ELF interpreter,
 DT_NEEDED or runtime search path. A second fresh namespace mounts only the
 result and static test supervisor, then runs the installed name's version command
-and each SHA-256, mail-format, PEM, entropy, provider-construction, TLS and
+and each SHA-256, mail-format, PEM/identity, entropy, provider-construction, TLS and
 configuration-stack smoke case in its own process.
 It has no compiler, root-data file, loader or library mounts. Each runtime command has a
 30-second deadline; each Cargo command has a 20-minute deadline. Parsed Cargo
@@ -513,3 +513,14 @@ limits, and generated P-256 PEM loading/refusals. These operate on in-memory
 fixtures and use the already admitted PEM reader as an independent decoding
 oracle. No certificate trust, identity publication or service resource
 qualification is implied.
+
+## Local identity qualification
+
+The same crypto artifact runs local identity admission, canonical metadata
+and certificate algorithm inventory fixtures. Generated local chains cover
+P-256 and RSA issuers, names/time/key mismatch, usage, issuer/path/name
+constraints, exact name/extension/depth limits, malformed DER and metadata,
+and synthetic Rust construction unwinds. Existing TLS fixtures share their
+certificate generator with these tests. Every case remains in-memory and
+contacts no CA or deployment. This does not qualify trust-store selection,
+TLS sessions or native allocation/stack/RSS admission.

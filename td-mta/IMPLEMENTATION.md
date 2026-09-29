@@ -664,6 +664,17 @@ Implement the remaining work as independently reviewable increments:
   Use local generated fixtures for wrong keys, missing names, stale clocks,
   expired/misordered/unsupported chains and trust replacement. Keep service
   loading disabled until full generation allocation qualification.
+  - **M07b2a — local identity:** implemented owned ServerIdentity admission,
+    P-256 key/leaf agreement, bounded certificate metadata, supplied-chain
+    signatures/constraints, validity and SAN/usage checks. Includes fixed TLS
+    errors and the exact classical certificate-algorithm inventory. Generated
+    fixtures cover RSA issuers and malformed/refused material. Inspection
+    exposes public certificate/name data only. This grants no remote trust
+    and enables no serving path; absent chain-tail issuers remain unchecked.
+  - **M07b2b — trust stores:** implement explicit bundle admission and pinned
+    public-root selection with complete replacement, no silent skipped roots
+    and no implicit OS/network source. Qualify private/public trust separately
+    before configuration construction.
 - **M07b3 — explicit TLS configuration:** compile opaque shareable handles,
   fixed algorithm inventories, SNI/ALPN selection and supplied-clock bridge.
   Test excluded algorithms, no global provider, mandatory gateway client

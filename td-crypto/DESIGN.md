@@ -10,6 +10,7 @@ streaming SHA-256; its direct operation uses the owned fixed-state primitive.
 M07a3 adds the opaque worker-local entropy handle. M07a4 implements the Crypto
 factory, fixed-size comparison and opaque P-256 key generation/loading/signing.
 M07b1 adds bounded certificate PEM syntax and a P-256 PEM key loader.
+M07b2a adds cold admission of an owned local server identity.
 TLS sessions remain unimplemented. Test-only backend qualification covers
 explicit
 provider construction, SHA-256, local TLS 1.2/1.3 data exchange, certificate
@@ -359,6 +360,102 @@ keys compare decoded PKCS#8 and public points. Exact input/count/DER limits,
 truncations, malformed envelopes/padding, retry and output preservation run
 in host tests and the isolated portable artifact. Syntax acceptance does
 not validate X.509 or complete the TLS allocation/stack/RSS qualification.
+
+### Local server identity admission
+
+`ServerIdentity::from_pem` accepts a bounded leaf-first chain, one P-256
+PKCS#8 PEM key, one to 32 exact DNS bindings, and optional UTC seconds.
+It publishes one owned identity only after all checks pass. It retains no
+caller borrow and performs no filesystem, socket, DNS, trust-download or
+system-clock operation. Names follow the mail configuration's ASCII hostname
+shape, are folded to lowercase, and reject wildcards, IP literals, trailing
+dots, underscore labels and duplicate folded bindings. SAN matching uses
+the backend verifier, including ordinary certificate wildcard semantics.
+
+The identity retains its certificate bytes, names, opaque P256Key and the
+inclusive validity intersection of every supplied certificate. Inspection
+methods return only public certificate/name data and counts; Debug shows
+counts only. Out-of-range inspection returns None. `check_validity` checks
+supplied time and key health again. Configurations must still recheck at the
+selection/completion points specified in TLS.md. This handle has no TLS
+session or mail-authorization operation, and is not a remote trust grant.
+
+The owned metadata reader precedes backend parsing. It uses checked slice
+access, minimal definite lengths, fixed depth, a four-digit calendar and at
+most 64 extensions per certificate. Duplicate extension OIDs, malformed OID
+encodings, noncanonical known BOOLEAN/named-bit encodings and incomplete
+containers are refused. Every SAN GeneralName envelope is checked, including
+entries after a matching DNS name; IA5 forms must be nonempty ASCII, IP forms
+must have four or sixteen octets, and registered IDs must be canonical OIDs.
+Structured non-DNS GeneralName contents remain opaque; this is not full
+semantic validation of every X.509 name form.
+X.509 v3 is required, matching the backend parser;
+issuer/subject names and serial compatibility otherwise follow its supported
+X.509 parsing. Dates use whole-second Zulu UTCTime or GeneralizedTime,
+1970 through 9999, with ordinary Gregorian leap years and no leap seconds
+or fractions. Pre-1970 dates are unsupported by the pinned backend. Every
+supplied certificate, including a supplied root, must be current.
+
+Require a non-CA P-256 leaf with the exact uncompressed public point of the
+loaded key. Issuers must be CAs. Present KeyUsage must permit digitalSignature
+for the leaf or keyCertSign for an issuer; a non-CA leaf cannot claim
+keyCertSign. Present EKU must include serverAuth; anyExtendedKeyUsage alone
+does not satisfy the pinned backend. Absent usage extensions are allowed.
+RSA issuer modulus size is 2048 through 8192 bits; the provider validates
+actual key/signature mathematics. Remaining supported issuer algorithms
+follow TLS.md's classical certificate inventory.
+
+The certificate algorithm selector checks all nineteen exact public-key and
+signature AlgorithmIdentifier pairs against the pinned backend prefix,
+including parameters, before returning its static slice. The three excluded ML-DSA pairs and their order are also checked.
+The backend must still have its reviewed 22-entry inventory; changes refuse
+with Crypto.
+No ML-DSA entry or global provider is inherited. Constructing that backend
+inventory creates temporary cold allocations; this is not an allocation-free
+configuration path. TLS handshake mappings and full configuration policy
+remain M07b3.
+
+Reject duplicate or misordered certificates, and repeated issuer subject/key
+pairs even when their certificate bytes differ. This prevents backend path
+building from bypassing an issuer and its constraints through an equivalent
+anchor or intermediate. Check every supplied adjacent
+issuer name and signature, and the last certificate's self-signature when
+self-issued. Enforce issuer path-length limits, excluding self-issued
+intermediates in the owned check. The backend additionally counts self-issued
+intermediates against non-anchor path-length limits, so some rollover paths
+that pass the owned check are refused. Its stricter refusal can report Other
+or Signature rather than Usage. For a chain with supplied issuers, also run backend path/name
+constraint verification using the last supplied issuer as a temporary
+consistency anchor. Its dates, CA/usage and path length are still checked
+locally; using it for consistency does not trust it on any network peer.
+
+An omitted issuer is allowed at a non-self-issued chain tail. Its absent
+key means the tail's issuer signature cannot be verified locally; that
+includes a lone CA-issued leaf. A self-issued tail must also be self-signed
+in this subset: a rollover certificate signed by a different same-name
+issuer must include that issuer. Issuer/subject equality uses the backend's
+exact encoded-name comparison. A provided self-signed leaf must verify its
+own signature.
+These checks establish local key/chain/name consistency, not a complete
+public or private trust path. Peer verification and explicit/public trust
+configuration remain separate. No fallback certificate or old identity is
+published on refusal.
+
+`TlsError` and `VerificationFailure` implement TLS.md's fixed categories.
+Construction catches Rust unwinds, drops unpublished state and returns
+Crypto. Input/format errors return Invalid; a mismatched valid local key
+returns KeyMismatch. Missing time returns Clock. Time, name, usage and
+signature failures carry the matching fixed verification reason; remaining
+backend path constraints use Other. No provider error or input becomes an
+error source. Native abort/OOM, panic hooks and backend blocking retain the
+limits above. No secret erasure, timing or whole-service resource guarantee
+follows from a returned Result or a synthetic unwind fixture.
+
+Owned vectors reserve checked bounded capacities; the key and native
+verification code still allocate. M07e must charge inputs, decode scratch,
+certificate/name copies, temporary backend inventories/path state, retained
+keys and overlapping generations before the service can use this handle.
+No listener or outbound adapter is enabled by M07b2a.
 
 ### Mutual TLS backend qualification
 

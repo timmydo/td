@@ -21,7 +21,7 @@ fn encode(bytes: &[u8]) -> Vec<u8> {
     output
 }
 
-fn pem(label: &str, der: &[u8]) -> Vec<u8> {
+pub(crate) fn pem(label: &str, der: &[u8]) -> Vec<u8> {
     let mut output = format!("-----BEGIN {label}-----\n").into_bytes();
     for line in encode(der).chunks(64) {
         output.extend_from_slice(line);

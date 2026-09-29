@@ -629,6 +629,17 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "pem::tests::certificate_envelopes_and_retry", false),
         ("td-crypto-smoke", "pem::tests::certificate_limits_and_der_envelopes", false),
         ("td-crypto-smoke", "pem::tests::p256_pem_loading_and_refusals", false),
+        ("td-crypto-smoke", "der::tests::certificate_der_lengths_bit_strings_and_oids", false),
+        ("td-crypto-smoke", "der::tests::certificate_calendar_boundaries", false),
+        ("td-crypto-smoke", "certificate_algorithms::tests::certificate_algorithm_inventory_fails_closed", false),
+        ("td-crypto-smoke", "identity::tests::local_identity_owns_material_and_checks_validity", false),
+        ("td-crypto-smoke", "identity::tests::identity_refuses_wrong_key_name_time_and_order", false),
+        ("td-crypto-smoke", "identity::tests::local_identity_enforces_key_usage_and_extensions", false),
+        ("td-crypto-smoke", "identity::tests::local_identity_name_and_extension_limits", false),
+        ("td-crypto-smoke", "identity::tests::local_identity_chain_constraints_and_maximum_depth", false),
+        ("td-crypto-smoke", "identity::tests::local_identity_accepts_rsa_issuer_and_refuses_unsupported_algorithms", false),
+        ("td-crypto-smoke", "identity::tests::identity_admission_unwind_drops_unpublished_state", false),
+        ("td-crypto-smoke", "identity::tests::local_identity_metadata_bounds_and_malformed_values", false),
         ("td-crypto-smoke", "provider::tests::factory_digest_and_fixed_comparison", false),
         ("td-crypto-smoke", "provider::tests::accepted_pkcs8_variants_and_public_point_known_answer", false),
         ("td-crypto-smoke", "provider::tests::malformed_der_and_inconsistent_keys_are_refused", false),
@@ -703,7 +714,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             println!("portable runtime: {prefix}{bytes}");
         }
     }
-    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM, entropy and P-256/oracle probes, explicit provider, sixteen TLS cases and both bounded configuration stacks passed without toolchain mounts");
+    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity, entropy and P-256/oracle probes, explicit provider, sixteen TLS cases and both bounded configuration stacks passed without toolchain mounts");
     Ok(())
 }
 
