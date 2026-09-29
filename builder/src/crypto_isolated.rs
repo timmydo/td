@@ -11,7 +11,7 @@ const TARGET: &str = "x86_64-unknown-linux-musl";
 const LIBRARIES: &str = "/lib64:/gcc-runtime:/zlib:/rust/lib";
 const NATIVE_FLAGS: &str = "-nostdinc -isystem /musl/include -isystem /cc/lib/gcc/x86_64-pc-linux-gnu/14.3.0/include -B/binutils/bin/ -march=x86-64 -mtune=generic -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -g1 -ffile-prefix-map=/source=/td-build -ffile-prefix-map=/vendor=/td-cargo/vendor -ffile-prefix-map=/output=/td-build-root";
 
-fn rust_flags() -> String {
+pub(crate) fn rust_flags() -> String {
     [
         "-C",
         "linker=/rust/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld",
@@ -32,13 +32,17 @@ fn rust_flags() -> String {
     .join("\x1f")
 }
 
-fn cargo(verb: &str, package: &str) -> Command {
+pub(crate) fn cargo(verb: &str, package: &str) -> Command {
+    cargo_manifest(verb, Path::new(&format!("/source/{package}/Cargo.toml")))
+}
+
+pub(crate) fn cargo_manifest(verb: &str, manifest: &Path) -> Command {
     let mut command = Command::new("/rust/bin/cargo");
     command
         .current_dir("/tmp")
         .env_clear()
         .args([verb, "--frozen", "--target", TARGET, "--manifest-path"])
-        .arg(format!("/source/{package}/Cargo.toml"))
+        .arg(manifest)
         .args([
             "--config",
             "source.crates-io.replace-with=\"td-crypto-vendor\"",
@@ -83,7 +87,11 @@ fn cargo(verb: &str, package: &str) -> Command {
     command
 }
 
-fn bounded_output(command: &mut Command, name: &str, limit: u64, seconds: u64) -> Result<String> {
+pub(crate) fn bounded_output(command: &mut Command, name: &str, limit: u64, seconds: u64) -> Result<String> {
+    bounded_exit_output(command, name, limit, seconds, 0)
+}
+
+pub(crate) fn bounded_exit_output(command: &mut Command, name: &str, limit: u64, seconds: u64, expected: i32) -> Result<String> {
     let path = Path::new("/output").join(format!("{name}.log"));
     let file = fs::OpenOptions::new()
         .write(true)
@@ -95,13 +103,15 @@ fn bounded_output(command: &mut Command, name: &str, limit: u64, seconds: u64) -
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(seconds))
         .ok_or("portable command deadline overflow")?;
-    if !crate::host_bin::wait_with_deadline(&mut child, Some(deadline)) {
+    let _ = crate::host_bin::wait_with_deadline(&mut child, Some(deadline));
+    let status = child.try_wait().map_err(|e| format!("inspect {name} status: {e}"))?;
+    if Instant::now() >= deadline || status.and_then(|status| status.code()) != Some(expected) {
         return Err(format!("portable {name} failed or exceeded its deadline"));
     }
     read_output(&path, name, limit)
 }
 
-fn read_output(path: &Path, name: &str, limit: u64) -> Result<String> {
+pub(crate) fn read_output(path: &Path, name: &str, limit: u64) -> Result<String> {
     let mut bytes = Vec::new();
     fs::File::open(path)
         .map_err(|e| format!("open command output: {e}"))?
@@ -150,7 +160,7 @@ fn record_decoy(output: &Path) -> Result<()> {
     Err("portable build invoked an unapproved native tool".into())
 }
 
-fn artifact_json(line: &str) -> Result<td_engine::json::Json> {
+pub(crate) fn artifact_json(line: &str) -> Result<td_engine::json::Json> {
     if line.len() > 256 * 1024 {
         return Err("Cargo artifact record exceeds 256 KiB".into());
     }
@@ -248,7 +258,7 @@ fn require_namespace(paths: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn command_record(command: &Command, name: &str, receipt: &mut String) -> Result<()> {
+pub(crate) fn command_record(command: &Command, name: &str, receipt: &mut String) -> Result<()> {
     receipt.push_str(&format!(
         "command {name} {:?} {:?} cwd={:?}\n",
         command.get_program(),
@@ -325,6 +335,8 @@ pub(crate) fn build_inner() -> Result<()> {
     fs::create_dir("/output/artifacts").map_err(|e| format!("portable artifacts: {e}"))?;
     copy_binary(&mail, Path::new("/output/artifacts/td-mta"))?;
     copy_binary(&crypto, Path::new("/output/artifacts/td-crypto-smoke"))?;
+    crate::crypto_api::qualify(&mut receipt)?;
+    refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
     Ok(())
 }

@@ -243,8 +243,10 @@ This milestone lands in independently checked increments:
   source/cc decoys, missing-input refusals and static ELF/clean-runtime checks
   in td-crypto/PORTABLE.md. It is separately provisioned from ordinary host
   Cargo preflights; API/TLS qualification below still gates M03 completion.
-- **M03b2d:** complete API confinement and bounded local TLS smoke acceptance.
-  All four increments are required before M03 completes.
+- **M03b2d1:** implemented compiler-resolved public API confinement in the
+  portable command, including conditional-export and backend-type mutations.
+- **M03b2d2:** complete bounded local TLS smoke acceptance.
+  All increments are required before M03 completes.
 
 **Depends on:** M03b1. Prepare inputs in M03b2a/b, qualify the isolated
 artifact and source/cc decoys in M03b2c, then complete API confinement and

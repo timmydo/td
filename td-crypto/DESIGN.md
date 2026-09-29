@@ -94,7 +94,8 @@ M03b2a implements checksum-pinned x86-64 musl header preparation as specified
 in `PORTABLE.md`. It invokes no compiler or upstream script. M03b2b adds the
 pinned host Rust kit and retained td GNU recipe outputs. M03b2c implements the
 isolated static musl build, packaging binary and clean-runtime smoke specified
-in PORTABLE.md. M03b2d owns API confinement and TLS qualification.
+in PORTABLE.md. M03b2d1 adds compiler-resolved API confinement;
+M03b2d2 owns bounded TLS qualification.
 Reuse compatible reviewed pins without inheriting td-net's dependency set.
 Rustls and aws-lc-rs are direct dependencies only of td-crypto, resolving one
 AWS-LC version pair for direct operations and TLS. No second backend enters the
@@ -109,10 +110,17 @@ AWS_LC_SYS_USE_SYSTEM=0 and AWS_LC_SYS_CMAKE_BUILDER=0. Reject incompatible
 overrides. Plant decoy OPENSSL_DIR/pkg-config/CMake inputs and prove none is
 consumed. Missing declared inputs fail.
 
-M03b2's public-API confinement must cover nested exports, renamed aliases,
-public signatures and associated types, with mutations for each escape. The
-M03a doctests check only two named root exports and are insufficient evidence
-for that backend boundary.
+The portable build combines rustc's private-dependency check with a resolved
+public API graph, including
+nested/hidden exports, aliases, signatures, generic bounds and associated
+types. Only local and std/core/alloc definitions are allowed. Opaque private
+backend fields are allowed; exported macros and unsupported public item kinds
+are refused. Conditional compilation using `doc` or `debug_assertions` is
+forbidden in the qualified configuration, including macro-generated conditions,
+so rustdoc cannot hide a release API. The compiler pass separately covers dyn
+trait implementations absent from the graph. PORTABLE.md owns the pinned compiler,
+configuration, limits and mutation fixtures. The M03a root-export doctests
+remain small consumer checks; they do not establish the whole boundary.
 
 All Rustls provider construction, TLS configurations, verifiers and key loading
 stay private here. Supply the provider explicitly to every configuration and

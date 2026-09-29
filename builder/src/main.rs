@@ -29,6 +29,7 @@ mod crypto_build;
 mod crypto_headers;
 mod crypto_portable;
 mod crypto_isolated;
+mod crypto_api;
 mod check_host;
 mod check_loop;
 mod check_memory;

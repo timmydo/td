@@ -4,7 +4,8 @@
 
 M03b2a implements header preparation; M03b2b prepares the remaining Rust and
 GNU tool inputs. M03b2c supplies isolated compilation and static artifact
-qualification. API confinement/TLS smoke remain M03b2d. This is a host build path for the
+qualification. M03b2d1 adds API confinement; TLS smoke remains M03b2d2.
+This is a host build path for the
 standalone td-mta executable; it does not grant the source-bootstrap provenance
 of td's target image graph. Nothing prepared here is automatically admitted
 as a target recipe input.
@@ -238,7 +239,7 @@ compiler, root-data file, loader or library mounts. Each runtime command has a
 stdout is limited to 8 MiB (graphs to 256 KiB); each JSON record is limited to
 256 KiB and 64 nesting levels. Logs on disk are temporary, not a streaming
 output quota. Native/TLS allocation, entropy failure and handshake qualification
-remain M03b2d/M07; a Result wrapper cannot contain provider aborts.
+remain M03b2d2/M07; a Result wrapper cannot contain provider aborts.
 
 After the compile namespace exits and its descendants are reaped, the host
 requires an exact regular-file output inventory: two binaries and the inner
@@ -274,3 +275,76 @@ for reconstructible build caches. Private `crypto-build-<pid>-<attempt>` trees
 are removed on normal completion/error; after a hard kill remove one only after
 confirming its process ended. Retained artifacts follow the same explicit cache
 cleanup rule as prepared inputs.
+
+## Public API qualification
+
+Before publication, the portable command compiles the production td-crypto
+library again in a separate diagnostic target directory, selecting `-p td-crypto`
+through td-mta's Cargo manifest, lock and release profile, with the same target,
+native controls and Rust target flags as the shipping binary. This ordinary
+stable compilation forbids `unexpected_cfgs` and declares
+`--check-cfg=cfg(doc,debug_assertions,values())`. Every reachable use of either
+condition, including cfg_attr, cfg! and expanded macros, is an error. Source
+lint allowances cannot override the command's forbid. The later diagnostic
+commands repeat this guard. These conditional branches are unsupported:
+rustdoc adds `doc` and keeps `debug_assertions` enabled despite release flags.
+
+The exact manifest pins admit neither custom build scripts nor Cargo check-cfg
+declarations that could merge additional allowed conditions into this guard.
+Those are forbidden in future pin updates too; changing this rule requires
+requalifying the guard. Mutation tests exercise the pin refusals.
+
+A second compiler pass marks all three direct backend dependencies private
+using `--extern priv:NAME` and forbids `exported_private_dependencies`. This
+also catches transitive foreign types and methods/associated types involving
+`dyn` local traits that pinned Rust 1.96 rustdoc omits from its JSON. The compiler
+pass is mandatory; the graph alone is insufficient. Both the privacy pass and
+rustdoc use crate-scoped `RUSTC_BOOTSTRAP=td_crypto` for diagnostic options only.
+The shipping binaries have already been compiled and copied; their build uses
+no unstable options. No nightly toolchain, Rust parser dependency or source-text
+re-expansion is used. Cargo supplies the crate environment and dependency
+resolution. Actual commands/environment and graph/fixture counts enter
+BUILD-INPUTS.
+
+Pinned rustdoc produces schema-57 JSON including private and hidden items. The
+std-only walker follows public modules/re-exports, aliases, fields, variants,
+functions, methods, generic bounds, traits and associated types. It follows
+trait implementations attached to reachable local types, including private
+traits. This deliberately rejects private-trait backend types on public
+wrappers; private backend fields remain allowed. Every referenced type must
+belong to td-crypto or std/core/alloc. Missing IDs, unknown public item kinds,
+exported macros, changed schema or incomplete output fail.
+
+The JSON target triple and enabled CPU features must match baseline x86-64
+musl. Schema 57 omits `crt-static` from its CPU-feature list, so a generated
+Cargo fixture using the same command constructor proves static musl/non-test
+conditional exports survive. Two more Cargo probes prove the actual compiler
+invocation enforces the cfg guard and private-dependency rule; the latter
+first compiles the leaking program normally, then requires the privacy error.
+Target conditions remain supported. Other targets/features need qualification.
+This checks the public type boundary, not semantic behavior of method bodies.
+
+The graph conservatively refuses imported blanket traits that expose foreign
+traits on public types. Facade handles must be defined at module scope:
+rustdoc may omit function-local definitions reached through returned impl
+Trait, and unresolved IDs fail rather than being ignored.
+
+JSON is limited to 16 MiB, 128 nesting levels and 65,536 entries per ID table
+and reachable graph. Each production diagnostic Cargo command has a 20-minute
+deadline and 8 MiB stdout limit. Generated fixture compiler commands have
+30-second deadlines and 256 KiB stdout/stderr parsing limits; the small Cargo
+probes have 120-second deadlines and 8 MiB stdout limits. Temporary disk logs
+are not streaming quotas. Negative cases require normal exit code 1 for rustc
+or 101 for Cargo and the expected structured compiler diagnostic. A timeout,
+signal, unrelated failure or exceeded bound refuses publication.
+
+Each portable build compiles owned fake backend/leaf crates and valid Rust
+consumers. Positive fixtures retain private provider state and owned associated
+types. Negative fixtures cover nested/renamed/glob/hidden exports, aliases,
+signatures, bounds, methods, tuple/enum/union fields, constants, associated
+types, dyn-trait methods/operator arguments, transitive types, exported macros,
+musl/static conditions and direct/local/external-macro doc conditions.
+The doc/release-condition fixtures first compile without the guard, then
+require the cfg error. Foreign-type cases require the private-dependency error;
+except for the omitted dyn impls, their valid JSON must also reject the foreign
+reference. Exported macros are rejected by the graph.
