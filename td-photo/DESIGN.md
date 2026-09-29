@@ -1167,9 +1167,11 @@ window alike (the resampler's middle pass and the orient hold transient
 `td-photo export` develops from level 0 at full resolution, one band of
 output rows at a time, straight into the JPEG encoder, so the frame is
 never held as RGB: level 0 (the decoded CFA frame, 87 MiB on a Z 8) plus
-one band is the peak (an AVIF adds a few copies of its coded stream at
-the end, the tiles, the frame OBU and the file, since the container
-names the stream's length). `develop::export_geometry` plans
+one band is the peak (an AVIF adds the AV1 encoder's batch of converted
+superblock rows, four a thread: 24 MiB of a Z 8 frame on eight threads
+and 48 MiB, three quarters of it, on sixteen; and a few copies of its
+coded stream at the end, the tiles, the frame OBU and the file, since
+the container names the stream's length). `develop::export_geometry` plans
 it: the user crop's
 fractions of the oriented frame are mapped back through the inverse of the
 orientation to a `Region` of the sensor crop by the mapping `level2`
@@ -1284,7 +1286,8 @@ the zeros it moves over counted and libaom's intra plane multipliers
 rate-distortion (`(16 D << 7) + (R * rdmult) >> 9`, `rdmult` from the DC
 step as libaom sets it and `D` the squared error, sixteen times it the
 scale libaom's distortion and `rdmult` share, the rate the coder's own
-cost of its symbols under the tile's live probabilities): the modes are
+cost of its symbols under the superblock row's probabilities, below):
+the modes are
 screened by the 4x4 Hadamard SATD of their predictions plus their mode
 symbols' rate under sixteen times the root of the multiplier (the two
 closest directional modes of luma and the closest of chroma screened
@@ -1311,15 +1314,23 @@ bench's noisy synthetic picture that kept five sixths of what trying
 both gained for two fifths of the trials.
 The frame is tiled
 uniformly by its size alone, so the bytes are the same whatever the
-thread count, as the JPEG encoder's are: as many tile columns as the
-width allows while the uniform column stays four superblocks wide (the
-last column is the remainder), within the tile columns the level the
-picture size sets allows (Annex A.3), and the fewest rows the tile area
-needs, which is none up to level 6; past it a column the cap left wide
-and rounded up to whole superblocks can pass the tile area, and the
-rows then split again. The tiles of a superblock row are coded in
-their own coders over `develop::bands`, so the threads spread over the
-columns; the tile sizes are written in four bytes, and the sequence
+thread count, as the JPEG encoder's are, and by the fewest tiles the
+spec allows (Annex A.3), since each tile's edges cut the prediction
+and contexts across them and restart the probabilities: the columns a
+tile's 4096-pixel width needs (the last column is the remainder), then
+the rows the tile area needs, which split again where a column rounded
+up to whole superblocks passes the area. A tile's superblock rows are
+searched in a wavefront (libaom's row-mt): a row's superblock waits
+until the row above has searched the one past it, whose pixels it
+reads above and to the right, and takes the contexts and the last row
+of pixels that row left over it; the row's rates are under its own
+probabilities, the row above's after its second superblock adapted by
+the row's own symbols, and the tile's one coder writes the rows'
+decisions in order under the real ones, so no search waits on the
+coder, though a finished row waits its turn to write. The
+rows come in batches of four a thread, every tile's rows over
+`develop::bands` in order, so the row a row waits for is always under
+way. The tile sizes are written in four bytes, and the sequence
 header claims the least level whose picture size, tile count and tile
 columns admit the frame. `av1::av1c` and the colour constants are the
 configuration the container repeats, from the same values the sequence
@@ -1346,30 +1357,28 @@ chroma filtering. Prediction reads the unfiltered pixels, so the filters
 run once the frame is coded, over the superblock-padded planes a decoder
 filters, and only on a reconstruction the caller asked to keep, which is
 then what any conforming decoder shows; `tests/av1.rs` holds that to
-dav1d when one is named (`TD_TEST_DAV1D`), and holds five small streams
+dav1d when one is named (`TD_TEST_DAV1D`), and holds six small streams
 and their reconstructions to the hashes of bytes dav1d decoded, so a
 change to any emitted symbol or filtered pixel is verified against the
 decoder before the hash moves. It is fed rows like the JPEG encoder and
-codes a superblock row when one is complete, so the export band rules
-hold; a frame is at most 16384 on an axis. A block's prediction edges
+codes a batch of superblock rows when one is complete, holding the
+batch's planes, a byte and a half a pixel (Export, above); a frame is
+at most 16384 on an axis. A block's prediction edges
 are read once per plane and every mode is predicted from them into the
-tile's scratch, which also holds the transform's working blocks and each
-plane's trial and best coding and only grows, so a block
+row's scratch, which also holds the transform's working blocks and each
+plane's trial and best coding and only grows over the row, so a block
 allocates only the levels its leaf keeps. A 24-megapixel export takes
-about fifty-four seconds on one thread and eleven to thirteen on eight
+about a minute on one thread and twelve to fourteen seconds on eight
 (`tests/av1.rs`'s `bench`, a noisy synthetic picture the blocks under
 8x8 cost half again on and gain nothing; a photo they cost a third
 again). Against libaom's all-intra speed 6 on a real 2048-pixel photo
-the encoder needs about 4.5% fewer bits for the same luma PSNR from
-0.3 to 3 bits a pixel (1% fewer for RGB) and about 1% more below that.
-libaom leaves CDEF off there; what it has is one tile where this
-encoder cuts that frame into eight columns, which libaom's own ablation
-prices at 4% below 0.3 bits a pixel and 1% above, and which here one
-tile measured at 3.2% and 1.6% for up to four and a half times the
-time on eight threads, since the threads spread only over columns.
-Coding a tile's superblock rows in a wavefront (libaom's row-mt) would
-keep the time: that, the partitions not coded here (the halves of a
-64, the three- and four-way ones) and transforms smaller than their
+the encoder needs about 6% fewer bits for the same luma PSNR from 0.3 to
+3 bits a pixel (2.5% fewer for RGB) and about 2% fewer below that
+(libaom leaves CDEF off there). One tile instead of the eight columns
+the wavefront replaced gained 1.4% on that photo at mid rates and 3.2%
+below (libaom's own ablation prices eight columns at 1% and 4%) in the
+same time on eight threads. The partitions not coded here (the halves of
+a 64, the three- and four-way ones) and transforms smaller than their
 block are the compression follow-up.
 Measured before the trellis priced the zeros an end of block passes
 over: zeroing a transform's few levels outright bought luma about 2%
@@ -1911,22 +1920,25 @@ first zigzag entries and the chroma's last at `QUALITY`); the standard
 tables' completeness is an inline unit test in `jpeg`.
 
 `tests/av1.rs` pins the AV1 encoder: the geometry by value (the mode-info
-and superblock grids, the tile column starts the width and the level
-allow, the rows the area past level 6, the rounding and a caller ask
-for, the level of each size and grid, the axes refused, the quality to
+and superblock grids, the tile columns the width needs and the rows
+the area does, its second split, the tiles a caller asks for, the
+level of each size and grid, the axes refused, the quality to
 `qindex` map monotone with its ends); a range of shapes, whole and partial
-superblocks of every edge, one pixel, a frame wider than a tile, tile
-columns and two and five tile rows on one and two threads, each coding
+superblocks of every edge, one pixel, a frame wider than a tile, ten
+superblock rows over two batches, tile columns a superblock wide and
+two and five tile rows on one to three threads, each coding
 to a stream whose reconstruction is the encoder's own and, with
 `TD_TEST_DAV1D` naming a dav1d binary, decoded by it to the same bytes
 exactly, as are colour ramps that make chroma from luma code every
 pair of alpha signs in blocks both edges cut, and noise, a hard edge
 and a chroma checkerboard at the strongest filter strengths, and
 gratings at an angle a cell, in luma and in chroma alone, that make
-every directional mode of each plane turn; five
+every directional mode of each plane turn, a superblock's top-right
+blocks among them reading the next superblock's row above; six
 streams and their reconstructions held to the hashes recorded under
 that decode, two at the coarsest steps, the same bytes on one thread
-and three; the stream's sequence header
+and three, whose batches end at different rows; the stream's sequence
+header
 and the frame header's opening field by field, the quality buying luma
 PSNR and costing bytes; the rows refused by name; and the container's
 extent read back as the stream and decoded. The transforms' unit

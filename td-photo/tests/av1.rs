@@ -87,16 +87,16 @@ fn hues(width: usize, height: usize) -> Vec<u8> {
 
 /// Encodes a synthetic picture, feeding rows in uneven pieces.
 fn encode(width: usize, height: usize, quality: u8, threads: usize) -> (Vec<u8>, Reconstruction) {
-    encode_tiled(width, height, quality, threads, 0)
+    encode_tiled(width, height, quality, threads, (0, 0))
 }
 
-/// `encode`, asking for tile rows.
+/// `encode`, asking for at least `tiles`' columns and rows, log2.
 fn encode_tiled(
     width: usize,
     height: usize,
     quality: u8,
     threads: usize,
-    rows_log2: u32,
+    tiles: (u32, u32),
 ) -> (Vec<u8>, Reconstruction) {
     encode_rgb(
         &picture(width, height),
@@ -104,7 +104,7 @@ fn encode_tiled(
         height,
         quality,
         threads,
-        rows_log2,
+        tiles,
     )
 }
 
@@ -115,9 +115,9 @@ fn encode_rgb(
     height: usize,
     quality: u8,
     threads: usize,
-    rows_log2: u32,
+    (cols_log2, rows_log2): (u32, u32),
 ) -> (Vec<u8>, Reconstruction) {
-    let geometry = Geometry::tiled(width, height, rows_log2).unwrap();
+    let geometry = Geometry::tiled(width, height, cols_log2, rows_log2).unwrap();
     let mut encoder = Encoder::with_geometry(geometry, quality, threads).unwrap();
     encoder.keep_reconstruction();
     let row = width * 3;
@@ -190,60 +190,53 @@ fn luma_psnr(rgb: &[u8], reconstruction: &Reconstruction) -> f64 {
 
 #[test]
 fn the_geometry_tiles_as_the_level_rules_require() {
-    // Ten superblocks across split into two columns of five; a frame
-    // under eight stays one tile.
+    // A frame up to 4096 wide and the tile area is one tile.
     let g = Geometry::new(640, 480).unwrap();
     assert_eq!(g.mi_grid(), (160, 120));
     assert_eq!(g.sb_grid(), (10, 8));
-    assert_eq!((g.tile_cols(), g.tile_rows()), (2, 1));
+    assert_eq!((g.tile_cols(), g.tile_rows()), (1, 1));
     assert_eq!(g.level(), 4);
     assert_eq!(Geometry::new(640, 400).unwrap().level(), 1);
-    let g = Geometry::new(300, 300).unwrap();
-    assert_eq!((g.tile_cols(), g.tile_rows()), (1, 1));
-    // Wider than 4096 needs two columns at least; 94 superblocks split
-    // to sixteen columns of six, which level 6 allows, and the area
-    // rule then needs no rows.
-    let g = Geometry::new(6000, 4000).unwrap();
-    assert_eq!((g.tile_cols(), g.tile_rows()), (16, 1));
-    assert_eq!(g.level(), 16);
-    // The level the size sets caps the columns: 4096x1024 is level 5
-    // (eight columns), though the width would take sixteen.
     let g = Geometry::new(4096, 1024).unwrap();
-    assert_eq!((g.tile_cols(), g.tile_rows()), (8, 1));
+    assert_eq!((g.tile_cols(), g.tile_rows()), (1, 1));
     assert_eq!(g.level(), 12);
-    // Sixty-five superblocks across go in thirteen columns of five,
-    // the sixteenth start past the edge, the last column the remainder.
+    // Wider than 4096 needs two columns, of 47 superblocks here, and
+    // the area rule then two rows.
+    let g = Geometry::new(6000, 4000).unwrap();
+    assert_eq!(g.tile_col_starts(), [0, 47, 94]);
+    assert_eq!(g.tile_row_starts(), [0, 32, 63]);
+    assert_eq!(g.level(), 16);
+    // Sixty-five superblocks across go in two columns, the last the
+    // remainder; the area rule asks for one row, but the column's 33
+    // rounded up past its share passes the tile area, so the rows
+    // split again.
     let g = Geometry::new(4160, 4480).unwrap();
-    assert_eq!((g.tile_cols(), g.tile_rows()), (13, 1));
-    assert_eq!(g.tile_col_starts()[..3], [0, 5, 10]);
-    assert_eq!(g.tile_col_starts()[12..], [60, 65]);
-    // At level 3 (the width is past level 2's) the cap is six columns,
-    // so the same width goes in four columns of seventeen: eight would
-    // pass the cap.
+    assert_eq!(g.tile_col_starts(), [0, 33, 65]);
+    assert_eq!(g.tile_row_starts(), [0, 35, 70]);
     let g = Geometry::new(4160, 8).unwrap();
-    assert_eq!(g.tile_col_starts(), [0, 17, 34, 51, 65]);
+    assert_eq!(g.tile_col_starts(), [0, 33, 65]);
     assert_eq!(g.level(), 4);
-    // Past level 6 the area rule adds rows, and a column the cap left
-    // wide can round up past the tile area: the rows then split again.
+    // Past level 6 the columns and rows both grow.
     let g = Geometry::new(16384, 16384).unwrap();
-    assert_eq!((g.tile_cols(), g.tile_rows()), (16, 2));
-    assert_eq!(g.tile_row_starts(), [0, 128, 256]);
+    assert_eq!((g.tile_cols(), g.tile_rows()), (4, 8));
     let g = Geometry::new(9217, 14721).unwrap();
     assert_eq!(g.sb_grid(), (145, 231));
-    assert_eq!((g.tile_cols(), g.tile_rows()), (15, 2));
-    assert_eq!(g.tile_row_starts(), [0, 116, 231]);
+    assert_eq!(g.tile_col_starts(), [0, 37, 74, 111, 145]);
+    assert_eq!(g.tile_row_starts(), [0, 58, 116, 174, 231]);
     assert_eq!(g.level(), 31);
-    // Tile rows on request, no more than the superblock rows allow, and
-    // the level accounts for them.
-    let g = Geometry::tiled(300, 300, 1).unwrap();
+    // Tiles on request, no more than the superblocks allow, and the
+    // level accounts for them.
+    let g = Geometry::tiled(300, 300, 0, 1).unwrap();
     assert_eq!((g.tile_cols(), g.tile_rows()), (1, 2));
     assert_eq!(g.tile_row_starts(), [0, 3, 5]);
-    let g = Geometry::tiled(300, 300, 4).unwrap();
-    assert_eq!(g.tile_rows(), 5);
+    let g = Geometry::tiled(300, 300, 4, 4).unwrap();
+    assert_eq!(g.tile_col_starts(), [0, 1, 2, 3, 4, 5]);
     assert_eq!(g.tile_row_starts(), [0, 1, 2, 3, 4, 5]);
-    assert_eq!(g.level(), 0);
+    let g = Geometry::tiled(520, 64, 1, 0).unwrap();
+    assert_eq!(g.tile_col_starts(), [0, 5, 9]);
+    assert_eq!(Geometry::tiled(300, 300, 0, 4).unwrap().level(), 0);
     // Twenty tiles are more than level 3 allows.
-    assert_eq!(Geometry::tiled(640, 640, 4).unwrap().level(), 8);
+    assert_eq!(Geometry::tiled(640, 640, 1, 4).unwrap().level(), 8);
     assert_eq!(Geometry::new(16384, 16384).unwrap().level(), 31);
     assert!(Geometry::new(0, 10).is_err());
     assert!(Geometry::new(10, 16385).is_err());
@@ -257,26 +250,32 @@ fn the_geometry_tiles_as_the_level_rules_require() {
 
 #[test]
 fn every_shape_codes_and_decodes_to_the_encoders_own_reconstruction() {
-    for (width, height, quality, threads, rows_log2) in [
-        (64, 64, 80, 1, 0),
-        (1, 1, 50, 1, 0),
-        (7, 5, 90, 1, 0),
-        (128, 64, 80, 1, 0),
-        (64, 40, 80, 1, 0),
-        (40, 64, 80, 1, 0),
-        (65, 33, 30, 1, 0),
-        (97, 61, 1, 1, 0),
-        (150, 90, 22, 2, 0),
-        (200, 130, 70, 2, 0),
-        (300, 70, 95, 1, 0),
-        (520, 40, 60, 2, 0),
-        (4160, 8, 50, 1, 0),
-        // Tile rows: two, and one per superblock row with two columns.
-        (200, 200, 75, 1, 1),
-        (520, 150, 60, 2, 2),
+    for (width, height, quality, threads, tiles) in [
+        (64, 64, 80, 1, (0, 0)),
+        (1, 1, 50, 1, (0, 0)),
+        (7, 5, 90, 1, (0, 0)),
+        (128, 64, 80, 1, (0, 0)),
+        (64, 40, 80, 1, (0, 0)),
+        (40, 64, 80, 1, (0, 0)),
+        (65, 33, 30, 1, (0, 0)),
+        (97, 61, 1, 1, (0, 0)),
+        (150, 90, 22, 2, (0, 0)),
+        (200, 130, 70, 2, (0, 0)),
+        (300, 70, 95, 1, (0, 0)),
+        (520, 40, 60, 2, (0, 0)),
+        (4160, 8, 50, 1, (0, 0)),
+        // Ten superblock rows over two batches on two threads, one and
+        // two superblocks wide.
+        (60, 600, 40, 2, (0, 0)),
+        (130, 600, 40, 2, (0, 0)),
+        // Tile rows: two, and one per superblock row with two columns;
+        // columns one superblock wide.
+        (200, 200, 75, 1, (0, 1)),
+        (520, 150, 60, 2, (1, 2)),
+        (300, 130, 50, 3, (4, 0)),
     ] {
-        let name = format!("p{width}x{height}q{quality}r{rows_log2}");
-        let (obus, reconstruction) = encode_tiled(width, height, quality, threads, rows_log2);
+        let name = format!("p{width}x{height}q{quality}t{tiles:?}");
+        let (obus, reconstruction) = encode_tiled(width, height, quality, threads, tiles);
         assert!(obus.len() > 10, "{name}");
         assert_eq!(reconstruction.width, width);
         assert_eq!(reconstruction.height, height);
@@ -312,7 +311,7 @@ fn chroma_from_luma_decodes_with_every_sign_and_past_the_edges() {
     ] {
         let name = format!("h{width}x{height}q{quality}");
         let rgb = hues(width, height);
-        let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, 1, 0);
+        let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, 1, (0, 0));
         decodes_as_reconstructed(&obus, &reconstruction, &name);
     }
 }
@@ -394,8 +393,10 @@ fn turned_angles_decode_on_gratings() {
     // Every directional mode of both planes at nonzero deltas, blocks
     // on the right and bottom edges reading replicated above-right and
     // below-left pixels among them, and 32x32s past both, whose edges the
-    // filter cuts where the frame does.
+    // filter cuts where the frame does; at 320x320 blocks on a
+    // superblock's top right read the next superblock's row above.
     for (width, height, cell, quality, chroma) in [
+        (320, 320, 8, 70, false),
         (97, 61, 16, 20, false),
         (118, 87, 32, 30, false),
         (118, 87, 32, 60, true),
@@ -407,7 +408,7 @@ fn turned_angles_decode_on_gratings() {
     ] {
         let name = format!("a{width}x{height}c{cell}q{quality}{chroma}");
         let rgb = gratings(width, height, cell, chroma);
-        let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, 1, 0);
+        let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, 1, (0, 0));
         decodes_as_reconstructed(&obus, &reconstruction, &name);
     }
 }
@@ -446,7 +447,7 @@ fn halved_blocks_decode_past_the_edges() {
     ] {
         let name = format!("b{width}x{height}b{band}q{quality}");
         let rgb = bands(width, height, band);
-        let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, 1, 0);
+        let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, 1, (0, 0));
         decodes_as_reconstructed(&obus, &reconstruction, &name);
     }
 }
@@ -491,7 +492,7 @@ fn blocks_under_8x8_decode() {
         )
     });
     for (name, width, height, rgb) in bands.into_iter().chain(cells) {
-        let (obus, reconstruction) = encode_rgb(&rgb, width, height, 97, 1, 0);
+        let (obus, reconstruction) = encode_rgb(&rgb, width, height, 97, 1, (0, 0));
         decodes_as_reconstructed(&obus, &reconstruction, &name);
     }
 }
@@ -503,17 +504,17 @@ fn the_filters_decode_on_hard_content() {
     // sweep's that caught a mistake in a rarely taken path (the clamp
     // to the taps' range, the variance's cap, luma's direction kept
     // when its adjusted strength is zero).
-    for (kind, width, height, quality, rows_log2) in [
-        (0, 257, 131, 1, 0),
-        (1, 127, 129, 1, 0),
-        (1, 127, 129, 8, 0),
-        (0, 300, 300, 1, 1),
-        (2, 300, 300, 1, 1),
-        (2, 520, 150, 22, 2),
+    for (kind, width, height, quality, tiles) in [
+        (0, 257, 131, 1, (0, 0)),
+        (1, 127, 129, 1, (0, 0)),
+        (1, 127, 129, 8, (0, 0)),
+        (0, 300, 300, 1, (0, 1)),
+        (2, 300, 300, 1, (0, 1)),
+        (2, 520, 150, 22, (1, 2)),
     ] {
         let name = format!("k{kind}w{width}h{height}q{quality}");
         let rgb = hard(kind, width, height);
-        let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, 1, rows_log2);
+        let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, 1, tiles);
         decodes_as_reconstructed(&obus, &reconstruction, &name);
     }
 }
@@ -671,20 +672,23 @@ fn fnv(bytes: &[u8]) -> u64 {
 /// every decode exact, so a change to any emitted symbol, or to the
 /// filtered pixels of these pictures, reds here with or without the
 /// decoder and is verified against it again before the hash moves. The coarse cases filter at
-/// the strongest strengths. The thread count is not in the bytes.
+/// the strongest strengths. The thread count is not in the bytes, nor
+/// where the batches of superblock rows end: one thread's batches are
+/// four rows, three threads' twelve.
 #[test]
 fn the_streams_are_the_bytes_dav1d_decoded() {
-    for (width, height, quality, rows_log2, hash) in [
-        (65, 33, 30, 0, 0xfda2f434c8fa3cbau64),
-        (520, 40, 60, 0, 0x8f0fa319538a8f50),
-        (200, 200, 75, 1, 0x1de3ce80b3820a96),
-        (67, 45, 15, 0, 0xda15606197a91103),
-        (130, 70, 1, 0, 0xd9cbd4339259970a),
+    for (width, height, quality, tiles, hash) in [
+        (65, 33, 30, (0, 0), 0xfda2f434c8fa3cbau64),
+        (520, 40, 60, (1, 0), 0x8f0fa319538a8f50),
+        (200, 200, 75, (0, 1), 0xcf61837a521661c6),
+        (67, 45, 15, (0, 0), 0xda15606197a91103),
+        (130, 70, 1, (0, 0), 0xd9cbd4339259970a),
+        (200, 330, 50, (0, 0), 0xcfe9360deb33c292),
     ] {
-        let name = format!("g{width}x{height}q{quality}r{rows_log2}");
-        let (obus, reconstruction) = encode_tiled(width, height, quality, 1, rows_log2);
+        let name = format!("g{width}x{height}q{quality}t{tiles:?}");
+        let (obus, reconstruction) = encode_tiled(width, height, quality, 1, tiles);
         assert_eq!(
-            encode_tiled(width, height, quality, 3, rows_log2).0,
+            encode_tiled(width, height, quality, 3, tiles).0,
             obus,
             "{name}: the thread count changes the bytes"
         );

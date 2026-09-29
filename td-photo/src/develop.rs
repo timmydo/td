@@ -79,11 +79,13 @@ fn band_rows(rows: usize, threads: usize) -> usize {
 }
 
 /// Runs `work` over every band exactly once, on up to `threads - 1` scoped
-/// threads beside the caller, all pulling from one queue. A thread the
-/// system refuses to create is simply absent: the caller drains what is
-/// left, so the result never depends on how many threads started. The one
-/// place the crate spreads work across threads; the JPEG encoder borrows
-/// it for its transform and the AV1 encoder for its tiles.
+/// threads beside the caller, all pulling from one queue, the last item
+/// first: an item is taken only once every item after it has been, which
+/// is what lets an item wait on one after it. A thread the system refuses
+/// to create is simply absent: the caller drains what is left, so the
+/// result never depends on how many threads started. The one place the
+/// crate spreads work across threads; the JPEG encoder borrows it for its
+/// transform and the AV1 encoder for its tiles' superblock rows.
 pub(crate) fn bands<T: Send>(items: Vec<T>, threads: usize, work: impl Fn(T) + Sync) {
     let threads = threads.clamp(1, MAX_THREADS);
     let queue = Mutex::new(items);

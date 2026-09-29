@@ -12,14 +12,16 @@
 //! luma with no side of 32 the best of the reduced set's four DCT and ADST
 //! pairs, for chroma the mode's default; one transform per plane per block,
 //! its levels a dead-zone quantizer's refined by a trellis; the
-//! multi-symbol arithmetic coder with adapting CDFs from the defaults;
-//! uniform tile columns by the frame's size alone, which the threads spread
-//! over. The deblocking filter and CDEF are on at strengths from the
+//! multi-symbol arithmetic coder with adapting CDFs from the defaults; the
+//! fewest tiles the frame's size allows, each tile's superblock rows
+//! searched in a wavefront over the threads and written in order by its
+//! coder. The deblocking filter and CDEF are on at strengths from the
 //! quantizer; restoration, superres, film grain and screen-content tools
 //! stay off. `transform` holds the transforms, quantizers and scans, `cdf`
 //! the default CDFs, `deblock` and `cdef` the filters.
 
 use std::fmt;
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::cdef;
 use crate::cdf;
@@ -317,6 +319,7 @@ const PROB_COST: [u16; 128] = [
 
 /// Every CDF a tile adapts, from the defaults of the frame's quantizer
 /// band.
+#[derive(Clone)]
 struct Cdfs {
     y_mode: [[Cdf; 5]; 5],
     uv_mode: [Cdf; 13],
@@ -539,6 +542,18 @@ impl Sink for Coder {
     }
 }
 
+/// The CDFs adapted to what passes, nothing written: a superblock
+/// row's search keeping its probabilities live.
+struct Adapter;
+
+impl Sink for Adapter {
+    fn symbol(&mut self, cdf: &mut Cdf, s: usize) {
+        cdf.adapt(s);
+    }
+
+    fn bit(&mut self, _bit: bool) {}
+}
+
 /// The rate of what passes, in 1/512 bit, the CDFs left as they are.
 struct Counter(u64);
 
@@ -688,18 +703,6 @@ const LEVELS: [Level; 7] = [
 /// The `seq_level_idx` past every level's limits.
 const UNCONSTRAINED: u32 = 31;
 
-/// The tile and tile column limits of the least level the picture size
-/// fits, or of level 6 past it.
-fn level_limits(width: usize, height: usize) -> (usize, usize) {
-    LEVELS
-        .iter()
-        .find(|level| level.admits(width, height))
-        .or(LEVELS.last())
-        .map_or((MAX_TILE_COLS * MAX_TILE_ROWS, MAX_TILE_COLS), |level| {
-            (level.max_tiles, level.max_cols)
-        })
-}
-
 /// `tile_log2(blk, target)`: the least `k` with `blk << k >= target`.
 fn tile_log2(blk: usize, target: usize) -> u32 {
     let mut k = 0;
@@ -710,20 +713,25 @@ fn tile_log2(blk: usize, target: usize) -> u32 {
 }
 
 impl Geometry {
-    /// The frame's grid, tiled uniformly: as many tile columns as the
-    /// width allows while the uniform column stays four superblocks
-    /// wide (the last, the remainder, may be narrower), within the
-    /// tile columns the level the picture size sets allows (spec
-    /// `tile_info`, Annex A.3), and the fewest rows the tile area
-    /// needs. The grid is the frame's alone, so the bytes are the same
-    /// on any host; threads spread over the columns.
+    /// The frame's grid, tiled uniformly by the fewest tiles the spec
+    /// allows (`tile_info`, Annex A.3): the columns a tile's width
+    /// needs (the last, the remainder, may be narrower), then the rows
+    /// its area needs. The grid is the frame's alone, so the bytes are
+    /// the same on any host; threads spread over a tile's superblock
+    /// rows.
     pub fn new(width: usize, height: usize) -> Result<Geometry, Error> {
-        Self::tiled(width, height, 0)
+        Self::tiled(width, height, 0, 0)
     }
 
-    /// `new`, with at least `rows_log2` tile rows where the limits
-    /// allow them: the way to exercise tile rows on a small frame.
-    pub fn tiled(width: usize, height: usize, rows_log2: u32) -> Result<Geometry, Error> {
+    /// `new`, with at least `cols_log2` tile columns and `rows_log2`
+    /// tile rows where the limits allow them: the way to exercise
+    /// tiles on a small frame.
+    pub fn tiled(
+        width: usize,
+        height: usize,
+        cols_log2: u32,
+        rows_log2: u32,
+    ) -> Result<Geometry, Error> {
         if width == 0 || height == 0 || width > MAX_AXIS || height > MAX_AXIS {
             return Err(Error::Axis { width, height });
         }
@@ -738,14 +746,7 @@ impl Geometry {
         let max_log2_cols = tile_log2(1, sb_cols.min(MAX_TILE_COLS));
         let max_log2_rows = tile_log2(1, sb_rows.min(MAX_TILE_ROWS));
         let min_log2_tiles = min_log2_cols.max(tile_log2(max_tile_area_sb, sb_rows * sb_cols));
-        let (_, max_level_cols) = level_limits(width, height);
-        let mut tile_cols_log2 = min_log2_cols;
-        while tile_cols_log2 < max_log2_cols
-            && (sb_cols >> (tile_cols_log2 + 1)) >= 4
-            && (1 << (tile_cols_log2 + 1)) <= max_level_cols
-        {
-            tile_cols_log2 += 1;
-        }
+        let tile_cols_log2 = min_log2_cols.max(cols_log2.min(max_log2_cols));
         let tile_width_sb = sb_cols.div_ceil(1 << tile_cols_log2);
         let mut tile_col_starts: Vec<usize> = (0..sb_cols).step_by(tile_width_sb).collect();
         tile_col_starts.push(sb_cols);
@@ -1055,16 +1056,6 @@ impl Band {
             .get_mut(y * stride..(y + 1) * stride)
             .unwrap_or(&mut [])
     }
-
-    /// Copies the last row into the first: the band above's floor.
-    fn carry_last_row(&mut self) {
-        let stride = self.stride;
-        let last = (self.rows - 1) * stride;
-        let (top, rest) = self.data.split_at_mut(stride);
-        if let Some(bottom) = rest.get(last - stride..last) {
-            top.copy_from_slice(bottom);
-        }
-    }
 }
 
 // --------------------------------------------------------- contexts
@@ -1155,6 +1146,36 @@ impl Contexts {
                 *slot = false;
             }
         }
+    }
+
+    /// The above context columns over a superblock column: what the
+    /// row below reads there.
+    fn above_of(&mut self, sb: usize) -> [&mut [u8]; 10] {
+        let Contexts {
+            above_level,
+            above_dc,
+            above_skip,
+            above_mode,
+            above_uv_mode,
+            above_width_log2,
+            ..
+        } = self;
+        let mut out: [&mut [u8]; 10] = Default::default();
+        let mut slots = out.iter_mut();
+        let luma = [above_skip, above_mode, above_uv_mode, above_width_log2];
+        for (plane, above) in above_level
+            .iter_mut()
+            .chain(above_dc.iter_mut())
+            .enumerate()
+            .map(|(k, above)| (k % 3, above))
+            .chain(luma.into_iter().map(|above| (0, above)))
+        {
+            let n = SB_MI >> usize::from(plane > 0);
+            if let Some(slot) = slots.next() {
+                *slot = above.get_mut(sb * n..(sb + 1) * n).unwrap_or(&mut []);
+            }
+        }
+        out
     }
 
     /// A plane's level and DC contexts: above level, above DC, left
@@ -1535,6 +1556,172 @@ impl Contexts {
     }
 }
 
+/// What a superblock row leaves over one of its superblocks for the
+/// row below: the above contexts, and the reconstruction's last row of
+/// each plane, end to end.
+#[derive(Default)]
+struct Above {
+    contexts: Vec<u8>,
+    floor: Vec<u8>,
+}
+
+/// One tile's superblock rows in flight: each row is searched two
+/// superblocks behind the row above, from what that row left over each
+/// superblock and from its probabilities after its second, and the
+/// tile's coder writes the rows' decisions in order. The rows come in
+/// batches, the row before a batch done.
+struct Wave {
+    x0: usize,
+    width: usize,
+    mi_row_start: usize,
+    mi_row_end: usize,
+    above: Vec<Mutex<Above>>,
+    progress: Mutex<Progress>,
+    moved: Condvar,
+    coding: Mutex<Coding>,
+}
+
+/// The superblocks each row of the batch has searched, and the
+/// probabilities the next row starts from.
+struct Progress {
+    done: Vec<usize>,
+    seed: Cdfs,
+}
+
+/// The tile's coder, the superblock row it writes next and the rows
+/// searched before it.
+struct Coding {
+    tile: Tile,
+    next: usize,
+    ready: Vec<(usize, Vec<Node>)>,
+}
+
+impl Coding {
+    /// Takes a searched superblock row and writes whatever rows are next
+    /// in order.
+    fn add(&mut self, sb_row: usize, nodes: Vec<Node>) {
+        self.ready.push((sb_row, nodes));
+        while let Some(at) = self.ready.iter().position(|(r, _)| *r == self.next) {
+            let (next, nodes) = self.ready.swap_remove(at);
+            self.tile.write_row(next * SB_MI, &nodes);
+            self.next += 1;
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Wave {
+    fn new(
+        x0: usize,
+        width: usize,
+        (mi_row_start, mi_row_end): (usize, usize),
+        geometry: &Geometry,
+        qindex: u8,
+    ) -> Wave {
+        Wave {
+            x0,
+            width,
+            mi_row_start,
+            mi_row_end,
+            above: (0..width / SB).map(|_| Mutex::default()).collect(),
+            progress: Mutex::new(Progress {
+                done: Vec::new(),
+                seed: Cdfs::new(qindex),
+            }),
+            moved: Condvar::new(),
+            coding: Mutex::new(Coding {
+                tile: Tile::new(x0, width, mi_row_start, mi_row_end, geometry, qindex),
+                next: mi_row_start / SB_MI,
+                ready: Vec::new(),
+            }),
+        }
+    }
+
+    /// Starts a batch of `rows` superblock rows.
+    fn begin(&mut self, rows: usize) {
+        let progress = self
+            .progress
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        progress.done.clear();
+        progress.done.resize(rows, 0);
+    }
+
+    /// Waits until the row above the batch's `row` has searched `need`
+    /// superblocks.
+    fn wait(&self, row: usize, need: usize) -> MutexGuard<'_, Progress> {
+        let mut progress = lock(&self.progress);
+        while row
+            .checked_sub(1)
+            .and_then(|above| progress.done.get(above))
+            .is_some_and(|&done| done < need)
+        {
+            progress = self
+                .moved
+                .wait(progress)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        progress
+    }
+
+    /// Records a row's searched superblocks, and the probabilities
+    /// the row below starts from once it has them.
+    fn advance(&self, row: usize, done: usize, seed: Option<Cdfs>) {
+        let mut progress = lock(&self.progress);
+        if let Some(seed) = seed {
+            progress.seed = seed;
+        }
+        if let Some(slot) = progress.done.get_mut(row) {
+            *slot = done;
+        }
+        drop(progress);
+        self.moved.notify_all();
+    }
+
+    /// Searches the batch's `row`, superblock row `sb_row` of the
+    /// frame, from its converted planes, keeps its reconstruction if
+    /// asked, and writes whatever rows are next in order.
+    fn search(
+        &self,
+        row: usize,
+        sb_row: usize,
+        [y, u, v]: &[Band; 3],
+        geometry: &Geometry,
+        qindex: u8,
+        kept: &Mutex<Option<Kept>>,
+    ) {
+        // However the search ends, the rows below stop waiting on it, so
+        // a panic ends the scope rather than hanging it.
+        struct Release<'a>(&'a Wave, usize);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.advance(self.1, usize::MAX, None);
+            }
+        }
+        let _release = Release(self, row);
+        let mut tile = Tile::new(
+            self.x0,
+            self.width,
+            self.mi_row_start,
+            self.mi_row_end,
+            geometry,
+            qindex,
+        );
+        let band_mi_row = sb_row * SB_MI;
+        tile.band_mi_row = band_mi_row;
+        tile.take_source(y, u, v);
+        tile.cdfs = self.wait(row, (self.width / SB).min(2)).seed.clone();
+        let nodes = tile.search_row(self, row);
+        if let Some(kept) = lock(kept).as_mut() {
+            kept.take(&tile, geometry);
+        }
+        lock(&self.coding).add(sb_row, nodes);
+    }
+}
+
 /// One tile's encoder: its share of the source and reconstruction bands,
 /// its contexts, CDFs and coder.
 struct Tile {
@@ -1664,33 +1851,117 @@ impl Tile {
         }
     }
 
-    /// Codes one superblock row of the tile: decisions, then symbols.
-    fn encode_sb_row(&mut self, band_mi_row: usize) {
-        self.band_mi_row = band_mi_row;
-        if band_mi_row != self.mi_row_start {
-            for plane in 0..3 {
-                if let Some(band) = self.recon.get_mut(plane) {
-                    band.carry_last_row();
+    /// Searches the wave's superblock row `row` of the batch, each
+    /// superblock once the row above has searched the one past it, and
+    /// returns the decisions in coding order.
+    fn search_row(&mut self, wave: &Wave, row: usize) -> Vec<Node> {
+        let count = self.width / SB;
+        let mut nodes = Vec::new();
+        for sb in 0..count {
+            // The row above left the contexts over this superblock and
+            // the pixels over the next, which the one here reads above
+            // and to the right; the pixels over this one came as the
+            // superblock before's, before this row wrote its own there.
+            drop(wave.wait(row, (sb + 2).min(count)));
+            for (k, above) in wave.above.iter().enumerate().take(sb + 2).skip(sb) {
+                let above = lock(above);
+                if k == sb {
+                    self.take_contexts(sb, &above.contexts);
+                }
+                if k > sb || k == 0 {
+                    self.take_floor(k, &above.floor);
                 }
             }
-        }
-        self.contexts.clear_left();
-        let sb_count = self.width / SB;
-        for sb in 0..sb_count {
             let mi_col = sb * SB_MI;
             let mi_width_left = self.mi_col_end.saturating_sub(mi_col);
-            let mi_height_left = self.mi_row_end - band_mi_row;
+            let mi_height_left = self.mi_row_end - self.band_mi_row;
             self.contexts.clear_decoded(mi_width_left, mi_height_left);
-            let at = At::square(band_mi_row, mi_col, 6);
+            let at = At::square(self.band_mi_row, mi_col, 6);
             let before = self.save(at, false);
-            let mut nodes = Vec::new();
+            let start = nodes.len();
             self.decide(at, &mut nodes);
             // The decisions left the contexts where the superblock ends;
-            // coding walks them forward again from where it began.
+            // the probabilities follow its symbols from where it began.
             self.restore(before);
             self.contexts.clear_decoded(mi_width_left, mi_height_left);
-            let mut nodes = nodes.into_iter();
-            self.emit(at, &mut nodes);
+            self.emit(
+                &mut Adapter,
+                at,
+                &mut nodes.get(start..).unwrap_or(&[]).iter(),
+            );
+            if let Some(above) = wave.above.get(sb) {
+                let mut above = lock(above);
+                let Above { contexts, floor } = &mut *above;
+                self.give_contexts(sb, contexts);
+                self.give_floor(sb, floor);
+            }
+            let seed = (sb + 1 == count.min(2)).then(|| self.cdfs.clone());
+            wave.advance(row, sb + 1, seed);
+        }
+        nodes
+    }
+
+    /// Writes a searched superblock row's decisions.
+    fn write_row(&mut self, band_mi_row: usize, nodes: &[Node]) {
+        self.band_mi_row = band_mi_row;
+        self.contexts.clear_left();
+        let mut coder = std::mem::replace(&mut self.coder, Coder::new());
+        let mut nodes = nodes.iter();
+        for sb in 0..self.width / SB {
+            let mi_col = sb * SB_MI;
+            self.contexts.clear_decoded(
+                self.mi_col_end.saturating_sub(mi_col),
+                self.mi_row_end - band_mi_row,
+            );
+            self.emit(&mut coder, At::square(band_mi_row, mi_col, 6), &mut nodes);
+        }
+        self.coder = coder;
+    }
+
+    fn take_contexts(&mut self, sb: usize, from: &[u8]) {
+        let mut rest = from;
+        for slot in self.contexts.above_of(sb) {
+            let Some((copy, tail)) = rest.split_at_checked(slot.len()) else {
+                break;
+            };
+            slot.copy_from_slice(copy);
+            rest = tail;
+        }
+    }
+
+    fn give_contexts(&mut self, sb: usize, to: &mut Vec<u8>) {
+        to.clear();
+        for slot in self.contexts.above_of(sb) {
+            to.extend_from_slice(slot);
+        }
+    }
+
+    /// Takes the row above's last row of pixels over a superblock into
+    /// the band's first.
+    fn take_floor(&mut self, sb: usize, from: &[u8]) {
+        let mut rest = from;
+        for (plane, band) in self.recon.iter_mut().enumerate() {
+            let n = SB >> usize::from(plane > 0);
+            let (Some((copy, tail)), Some(slot)) = (
+                rest.split_at_checked(n),
+                band.row_mut(0).get_mut(sb * n..(sb + 1) * n),
+            ) else {
+                break;
+            };
+            slot.copy_from_slice(copy);
+            rest = tail;
+        }
+    }
+
+    fn give_floor(&self, sb: usize, to: &mut Vec<u8>) {
+        to.clear();
+        for (plane, band) in self.recon.iter().enumerate() {
+            let n = SB >> usize::from(plane > 0);
+            to.extend_from_slice(
+                band.row(band.rows - 1)
+                    .get(sb * n..(sb + 1) * n)
+                    .unwrap_or(&[]),
+            );
         }
     }
 
@@ -3199,7 +3470,12 @@ impl Tile {
     }
 
     /// Writes a decided tree's symbols in coding order.
-    fn emit(&mut self, at: At, nodes: &mut impl Iterator<Item = Node>) {
+    fn emit<'a>(
+        &mut self,
+        sink: &mut impl Sink,
+        at: At,
+        nodes: &mut impl Iterator<Item = &'a Node>,
+    ) {
         if self.edges(at).is_none() {
             return;
         }
@@ -3208,40 +3484,37 @@ impl Tile {
             return;
         };
         let partition = match node {
-            Node::Parts(partition) => partition,
+            Node::Parts(partition) => *partition,
             Node::Block(_) => Partition::None,
         };
-        let mut coder = std::mem::replace(&mut self.coder, Coder::new());
-        self.partition_symbol(&mut coder, at, partition);
-        self.coder = coder;
+        self.partition_symbol(sink, at, partition);
         match node {
             Node::Parts(Partition::Split) => {
                 for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
-                    self.emit(at.quarter(dr, dc), nodes);
+                    self.emit(sink, at.quarter(dr, dc), nodes);
                 }
             }
             Node::Parts(_) => {
                 for _ in 0..2 {
                     if let Some(Node::Block(leaf)) = nodes.next() {
-                        self.emit_block(leaf);
+                        self.emit_block(sink, leaf);
                     }
                 }
             }
-            Node::Block(leaf) => self.emit_block(leaf),
+            Node::Block(leaf) => self.emit_block(sink, leaf),
         }
     }
 
     /// Writes a block's mode and coefficient symbols.
-    fn emit_block(&mut self, leaf: Leaf) {
-        let mut coder = std::mem::replace(&mut self.coder, Coder::new());
-        self.mode_symbols(&mut coder, &leaf);
+    fn emit_block(&mut self, sink: &mut impl Sink, leaf: &Leaf) {
+        self.mode_symbols(sink, leaf);
         if !leaf.skip {
             for (plane, (levels, &eob)) in leaf.levels.iter().zip(leaf.eob.iter()).enumerate() {
                 let Some(pat) = plane_at(leaf.at, plane) else {
                     continue;
                 };
                 self.coefficient_symbols(
-                    &mut coder,
+                    sink,
                     plane,
                     pat,
                     leaf.y_mode,
@@ -3250,8 +3523,7 @@ impl Tile {
                 );
             }
         }
-        self.coder = coder;
-        self.apply_contexts(&leaf);
+        self.apply_contexts(leaf);
         self.record_block(leaf.at, leaf.skip);
     }
 
@@ -3967,14 +4239,16 @@ pub struct Encoder {
     qindex: u8,
     threads: usize,
     taken: usize,
-    /// Rows received and not yet coded, at most a superblock row.
+    /// Rows received and not yet converted, at most a superblock row.
     pending: Vec<u8>,
-    /// The converted planes of one superblock row, frame-wide padded.
-    planes: [Band; 3],
+    /// The converted planes of the superblock rows not yet coded,
+    /// frame-wide padded, up to `WAVE_ROWS` a thread.
+    batch: Vec<[Band; 3]>,
     /// The tiles of the current tile row, by column.
-    tiles: Vec<Tile>,
+    waves: Vec<Wave>,
     /// Coded tiles' bytes in tile order.
     coded: Vec<Vec<u8>>,
+    /// The superblock rows converted.
     sb_row: usize,
     /// The frame's deblocking levels and CDEF strengths.
     levels: deblock::Levels,
@@ -3994,6 +4268,49 @@ struct Kept {
     skips: Vec<bool>,
 }
 
+/// The superblock rows a batch holds per thread: enough that a tile's
+/// wavefront fills the threads between batches, whose first row waits
+/// for the last before.
+const WAVE_ROWS: usize = 4;
+
+impl Kept {
+    /// Copies a searched superblock row of a tile in.
+    fn take(&mut self, tile: &Tile, geometry: &Geometry) {
+        let stride = geometry.sb_cols * SB;
+        let mi_stride = geometry.sb_cols * SB_MI;
+        let y0 = tile.band_mi_row * MI;
+        for (plane, band) in tile.recon.iter().enumerate() {
+            let sub = usize::from(plane > 0);
+            let (w, x0) = (tile.width >> sub, tile.x0 >> sub);
+            let Some(out) = self.planes.get_mut(plane) else {
+                continue;
+            };
+            for r in 0..(SB >> sub) {
+                let at = ((y0 >> sub) + r) * (stride >> sub) + x0;
+                if let (Some(src), Some(dst)) = (band.row(r + 1).get(..w), out.get_mut(at..at + w))
+                {
+                    dst.copy_from_slice(src);
+                }
+            }
+        }
+        let cols = tile.width / MI;
+        for (r, (sizes, skips)) in tile
+            .sizes
+            .chunks_exact(cols)
+            .zip(tile.skips.chunks_exact(cols))
+            .enumerate()
+        {
+            let at = (tile.band_mi_row + r) * mi_stride + tile.x0 / MI;
+            if let Some(dst) = self.sizes.get_mut(at..at + cols) {
+                dst.copy_from_slice(sizes);
+            }
+            if let Some(dst) = self.skips.get_mut(at..at + cols) {
+                dst.copy_from_slice(skips);
+            }
+        }
+    }
+}
+
 impl Encoder {
     /// Begins a `width` by `height` frame at `quality` (1..=100).
     pub fn new(width: usize, height: usize, quality: u8, threads: usize) -> Result<Encoder, Error> {
@@ -4006,19 +4323,14 @@ impl Encoder {
         quality: u8,
         threads: usize,
     ) -> Result<Encoder, Error> {
-        let stride = geometry.sb_cols * SB;
         Ok(Encoder {
             geometry,
             qindex: qindex(quality),
-            threads: threads.max(1),
+            threads: threads.clamp(1, crate::develop::MAX_THREADS),
             taken: 0,
             pending: Vec::new(),
-            planes: [
-                Band::new(stride, SB),
-                Band::new(stride / 2, SB / 2),
-                Band::new(stride / 2, SB / 2),
-            ],
-            tiles: Vec::new(),
+            batch: Vec::new(),
+            waves: Vec::new(),
             coded: Vec::new(),
             sb_row: 0,
             levels: filter_levels(qindex(quality)),
@@ -4084,6 +4396,7 @@ impl Encoder {
             let band = std::mem::take(&mut self.pending);
             self.code_band(&band, rows);
         }
+        self.flush();
         self.close_tile_row();
         let mut out = Vec::new();
         obu(
@@ -4183,11 +4496,22 @@ impl Encoder {
         }
     }
 
-    /// Converts a band of `rows` RGB rows into the planes, padded, and
-    /// codes it as one superblock row.
+    /// Converts a band of `rows` RGB rows into the planes, padded, as
+    /// one superblock row of the batch, and codes the batch when it is
+    /// full.
     fn code_band(&mut self, band: &[u8], rows: usize) {
+        if let Some(tile_row) = self.geometry.tile_row_starting(self.sb_row) {
+            self.flush();
+            self.close_tile_row();
+            self.open_tile_row(tile_row);
+        }
         let width = self.geometry.width;
-        let stride = self.planes[0].stride;
+        let stride = self.geometry.sb_cols * SB;
+        let mut planes = [
+            Band::new(stride, SB),
+            Band::new(stride / 2, SB / 2),
+            Band::new(stride / 2, SB / 2),
+        ];
         let rgb_at = |x: usize, y: usize| -> (i32, i32, i32) {
             let x = x.min(width - 1);
             let y = y.min(rows - 1);
@@ -4203,7 +4527,7 @@ impl Encoder {
             for x in 0..stride {
                 let (r, g, b) = rgb_at(x, y);
                 let luma = (77 * r + 150 * g + 29 * b + 128) >> 8;
-                if let Some(slot) = self.planes[0].data.get_mut(y * stride + x) {
+                if let Some(slot) = planes[0].data.get_mut(y * stride + x) {
                     *slot = luma.clamp(0, 255) as u8;
                 }
             }
@@ -4219,62 +4543,42 @@ impl Encoder {
                 }
                 let cb = 128 + ((cb + 512) >> 10);
                 let cr = 128 + ((cr + 512) >> 10);
-                if let Some(slot) = self.planes[1].data.get_mut(y * (stride / 2) + x) {
+                if let Some(slot) = planes[1].data.get_mut(y * (stride / 2) + x) {
                     *slot = cb.clamp(0, 255) as u8;
                 }
-                if let Some(slot) = self.planes[2].data.get_mut(y * (stride / 2) + x) {
+                if let Some(slot) = planes[2].data.get_mut(y * (stride / 2) + x) {
                     *slot = cr.clamp(0, 255) as u8;
                 }
             }
         }
-        if let Some(tile_row) = self.geometry.tile_row_starting(self.sb_row) {
-            self.close_tile_row();
-            self.open_tile_row(tile_row);
-        }
-        let band_mi_row = self.sb_row * SB_MI;
-        let [y, u, v] = &self.planes;
-        for tile in self.tiles.iter_mut() {
-            tile.take_source(y, u, v);
-        }
-        let items: Vec<&mut Tile> = self.tiles.iter_mut().collect();
-        crate::develop::bands(items, self.threads, |tile| tile.encode_sb_row(band_mi_row));
-        if let Some(kept) = self.kept.as_mut() {
-            let stride = self.geometry.sb_cols * SB;
-            let mi_stride = self.geometry.sb_cols * SB_MI;
-            for tile in &self.tiles {
-                for (plane, band) in tile.recon.iter().enumerate() {
-                    let sub = usize::from(plane > 0);
-                    let (w, x0) = (tile.width >> sub, tile.x0 >> sub);
-                    let Some(out) = kept.planes.get_mut(plane) else {
-                        continue;
-                    };
-                    for r in 0..(SB >> sub) {
-                        let at = (((self.sb_row * SB) >> sub) + r) * (stride >> sub) + x0;
-                        if let (Some(src), Some(dst)) =
-                            (band.row(r + 1).get(..w), out.get_mut(at..at + w))
-                        {
-                            dst.copy_from_slice(src);
-                        }
-                    }
-                }
-                let cols = tile.width / MI;
-                for (r, (sizes, skips)) in tile
-                    .sizes
-                    .chunks_exact(cols)
-                    .zip(tile.skips.chunks_exact(cols))
-                    .enumerate()
-                {
-                    let at = (band_mi_row + r) * mi_stride + tile.x0 / MI;
-                    if let Some(dst) = kept.sizes.get_mut(at..at + cols) {
-                        dst.copy_from_slice(sizes);
-                    }
-                    if let Some(dst) = kept.skips.get_mut(at..at + cols) {
-                        dst.copy_from_slice(skips);
-                    }
-                }
-            }
-        }
+        self.batch.push(planes);
         self.sb_row += 1;
+        if self.batch.len() >= WAVE_ROWS * self.threads {
+            self.flush();
+        }
+    }
+
+    /// Codes the batch: each tile's rows searched in a wavefront, all
+    /// the tiles' rows over the threads in order, so the row a row
+    /// waits for is always under way.
+    fn flush(&mut self) {
+        let rows = std::mem::take(&mut self.batch);
+        let first = self.sb_row - rows.len();
+        for wave in &mut self.waves {
+            wave.begin(rows.len());
+        }
+        let kept = Mutex::new(self.kept.take());
+        let jobs: Vec<(usize, &Wave)> = (0..rows.len())
+            .rev()
+            .flat_map(|row| self.waves.iter().rev().map(move |wave| (row, wave)))
+            .collect();
+        let (geometry, qindex) = (&self.geometry, self.qindex);
+        crate::develop::bands(jobs, self.threads, |(row, wave)| {
+            if let Some(planes) = rows.get(row) {
+                wave.search(row, first + row, planes, geometry, qindex, &kept);
+            }
+        });
+        self.kept = kept.into_inner().unwrap_or_else(PoisonError::into_inner);
     }
 
     fn open_tile_row(&mut self, tile_row: usize) {
@@ -4287,15 +4591,14 @@ impl Encoder {
             .unwrap_or(g.sb_rows)
             * SB_MI;
         let mi_row_end = mi_row_end.min(g.mi_rows);
-        self.tiles = (0..g.tile_cols())
+        self.waves = (0..g.tile_cols())
             .map(|col| {
                 let start = g.tile_col_starts.get(col).copied().unwrap_or(0);
                 let end = g.tile_col_starts.get(col + 1).copied().unwrap_or(g.sb_cols);
-                Tile::new(
+                Wave::new(
                     start * SB,
                     (end - start) * SB,
-                    mi_row_start,
-                    mi_row_end,
+                    (mi_row_start, mi_row_end),
                     g,
                     self.qindex,
                 )
@@ -4304,8 +4607,12 @@ impl Encoder {
     }
 
     fn close_tile_row(&mut self) {
-        for tile in self.tiles.drain(..) {
-            self.coded.push(tile.coder.finish());
+        for wave in self.waves.drain(..) {
+            let coding = wave
+                .coding
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.coded.push(coding.tile.coder.finish());
         }
     }
 }
@@ -5108,6 +5415,44 @@ mod tests {
     }
 
     #[test]
+    fn the_coder_writes_the_rows_in_order_whatever_order_they_finish() {
+        let g = Geometry::new(64, 128).unwrap();
+        // Two rows of ramps, searched in order.
+        let rows = || {
+            let mut wave = Wave::new(0, 64, (0, g.mi_rows), &g, 120);
+            wave.begin(2);
+            (0..2)
+                .map(|row| {
+                    let mut tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120);
+                    tile.band_mi_row = row * SB_MI;
+                    for (i, v) in tile.source[0].data.iter_mut().enumerate() {
+                        *v = ((i % 64) * (row + 1) * 3 + i / 64) as u8;
+                    }
+                    tile.cdfs = wave.wait(row, 1).seed.clone();
+                    tile.search_row(&wave, row)
+                })
+                .collect::<Vec<Vec<Node>>>()
+        };
+        let write = |order: [usize; 2]| {
+            let mut coding = Coding {
+                tile: Tile::new(0, 64, 0, g.mi_rows, &g, 120),
+                next: 0,
+                ready: Vec::new(),
+            };
+            let mut nodes = rows();
+            for (k, row) in order.into_iter().enumerate() {
+                coding.add(row, std::mem::take(&mut nodes[row]));
+                // Row 1 alone waits; row 0 brings it along.
+                let written = if k == 0 { usize::from(row == 0) } else { 2 };
+                assert_eq!(coding.next, written, "{order:?}");
+            }
+            assert!(coding.ready.is_empty(), "{order:?}");
+            coding.tile.coder.finish()
+        };
+        assert_eq!(write([1, 0]), write([0, 1]));
+    }
+
+    #[test]
     fn the_edge_filter_reads_the_neighbours_the_spec_names() {
         // Chroma's smooth neighbour above is the block with chroma past its
         // 8x8's above-right corner, not the one above the corner itself;
@@ -5306,6 +5651,7 @@ mod tests {
             let mut encoder = Encoder::new(width, height, quality, 1).unwrap();
             encoder.keep_reconstruction();
             encoder.encode_rows(&bands(width, height, 16)).unwrap();
+            encoder.flush();
             let kept = encoder.kept.as_ref().unwrap();
             let (mi_cols, _) = encoder.geometry.mi_grid();
             let stride = encoder.geometry.sb_grid().0 * SB_MI;
@@ -5333,6 +5679,7 @@ mod tests {
             let mut encoder = Encoder::new(width, height, 97, 1).unwrap();
             encoder.keep_reconstruction();
             encoder.encode_rows(&bands(width, height, band)).unwrap();
+            encoder.flush();
             let kept = encoder.kept.as_ref().unwrap();
             let mut shapes = [0usize; 3];
             for &s in &kept.sizes {
