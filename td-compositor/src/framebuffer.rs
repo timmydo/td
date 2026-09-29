@@ -1,8 +1,9 @@
 use crate::output::{
-    Damage, Fourcc, FrameTarget, Output, OutputBackend, OutputDimensions, OutputEvent, OutputId,
-    OutputScale, OutputTransform, Submission, DRM_FORMAT_XRGB8888,
+    Damage, Fourcc, FrameTarget, FrameView, Output, OutputBackend, OutputDimensions, OutputEvent,
+    OutputId, OutputScale, OutputTransform, Submission, DRM_FORMAT_XRGB8888,
 };
-use crate::scene::{Scene, SurfaceKey};
+#[cfg(test)]
+use crate::scene::Scene;
 use crate::{MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -29,7 +30,6 @@ pub struct Framebuffer {
     height: usize,
     stride: usize,
     frame: Vec<u8>,
-    comparison: Vec<u8>,
     // What the device is believed to hold. `resend_all` says that belief is
     // unfounded, so the next paint writes the whole image rather than a band.
     written: Vec<u8>,
@@ -127,50 +127,6 @@ fn damaged_rows(written: &[u8], frame: &[u8], stride: usize) -> Option<(usize, u
     Some((first, last))
 }
 
-fn attributed_rgb_counts(
-    rendered: &[u8],
-    omitted: &[u8],
-    width: usize,
-    height: usize,
-    stride: usize,
-    rgbs: [[u8; 3]; 2],
-) -> [usize; 2] {
-    let mut counts = [0usize; 2];
-    let visible = width.saturating_mul(4);
-    for (rendered_row, omitted_row) in rendered
-        .chunks(stride)
-        .zip(omitted.chunks(stride))
-        .take(height)
-    {
-        let (Some(rendered_pixels), Some(omitted_pixels)) = (
-            rendered_row.get(..visible),
-            omitted_row.get(..visible),
-        ) else {
-            return [0; 2];
-        };
-        for (pixel, without) in rendered_pixels
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .zip(omitted_pixels.as_chunks::<4>().0)
-        {
-            if pixel == without {
-                continue;
-            }
-            let [blue, green, red, _] = pixel;
-            let rgb = [*red, *green, *blue];
-            for (index, expected) in rgbs.iter().enumerate() {
-                if rgb == *expected {
-                    if let Some(count) = counts.get_mut(index) {
-                        *count = count.saturating_add(1);
-                    }
-                }
-            }
-        }
-    }
-    counts
-}
-
 impl Framebuffer {
     pub fn open(path: &Path) -> Result<Framebuffer, String> {
         let name = path
@@ -198,7 +154,6 @@ impl Framebuffer {
             height,
             stride,
             frame: vec![0; size],
-            comparison: Vec::new(),
             written: vec![0; size],
             resend_all: true,
             since_resend: 0,
@@ -236,7 +191,6 @@ impl Framebuffer {
             height,
             stride,
             frame: vec![0; size],
-            comparison: Vec::new(),
             written: vec![0; size],
             resend_all: true,
             since_resend: 0,
@@ -268,7 +222,6 @@ impl Framebuffer {
             height,
             stride,
             frame: allocate()?,
-            comparison: Vec::new(),
             written: allocate()?,
             resend_all: true,
             since_resend: 0,
@@ -311,103 +264,6 @@ impl Framebuffer {
     pub fn take_writes(&mut self) -> Vec<(u64, usize)> {
         std::mem::take(&mut self.writes)
     }
-
-    /// The device's row pitch. fbdev's own, reported by the startup
-    /// diagnostic: a dumb buffer's pitch is the kernel's to choose, so this
-    /// is a property of THIS backend's memory rather than of the output, and
-    /// it is not on the trait for that reason.
-    pub fn stride(&self) -> usize {
-        self.stride
-    }
-
-    /// Only completed bytes that match a public-scene render may be captured.
-    /// In particular, neither a failed write nor private attention pixels can
-    /// be relabeled as a public frame by the caller.
-    pub(crate) fn completed_public_ppm(
-        &mut self, scene: &Scene, stamp: crate::headless::OutputStamp,
-    ) -> Result<Vec<u8>, String> {
-        if self.resend_all || self.written.len() != self.frame.len() {
-            return Err("output completion is not established".into());
-        }
-        if self.comparison.len() != self.frame.len() {
-            let additional = self.frame.len().saturating_sub(self.comparison.len());
-            self.comparison.try_reserve_exact(additional)
-                .map_err(|_| "reserve public capture comparison")?;
-            self.comparison.resize(self.frame.len(), 0);
-        }
-        scene.render(&mut self.comparison, self.width, self.height, self.stride);
-        if self.comparison != self.written {
-            return Err("completed output does not match the public scene".into());
-        }
-        let pixels = self.width.checked_mul(self.height).and_then(|n| n.checked_mul(3))
-            .ok_or("capture byte count overflow")?;
-        let header = format!("P6\n# td-output-v1 {}\n{} {}\n255\n",
-            stamp.record(), self.width, self.height);
-        let length = pixels.checked_add(header.len()).ok_or("capture size overflow")?;
-        let mut ppm = Vec::new();
-        ppm.try_reserve_exact(length).map_err(|_| "reserve public capture")?;
-        ppm.extend_from_slice(header.as_bytes());
-        let row_bytes = self.width.checked_mul(4).ok_or("capture row overflow")?;
-        for row in self.written.chunks_exact(self.stride).take(self.height) {
-            let row = row.get(..row_bytes).ok_or("capture row is truncated")?;
-            for [blue, green, red, _] in row.as_chunks::<4>().0 {
-                ppm.extend_from_slice(&[*red, *green, *blue]);
-            }
-        }
-        if ppm.len() != length {
-            return Err("capture frame is truncated".into());
-        }
-        Ok(ppm)
-    }
-
-    /// Exact final-output pixels attributable to `surface`. Re-rendering with
-    /// only that surface omitted makes hidden, clipped and occluded pixels
-    /// disappear from the count while leaving its descendants in place.
-    pub(crate) fn surface_rgb_pixel_counts(
-        &mut self,
-        scene: &Scene,
-        surface: SurfaceKey,
-        rgbs: [[u8; 3]; 2],
-    ) -> Result<[usize; 2], String> {
-        if scene.attention_visible() {
-            return Ok([0; 2]);
-        }
-        if self.comparison.len() != self.frame.len() {
-            let additional = self.frame.len().saturating_sub(self.comparison.len());
-            self.comparison
-                .try_reserve_exact(additional)
-                .map_err(|_| "reserve application comparison frame".to_string())?;
-            self.comparison.resize(self.frame.len(), 0);
-        }
-        scene.render_omitting(
-            &mut self.comparison,
-            self.width,
-            self.height,
-            self.stride,
-            Some(surface),
-        );
-        Ok(attributed_rgb_counts(
-            &self.frame,
-            &self.comparison,
-            self.width,
-            self.height,
-            self.stride,
-            rgbs,
-        ))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn rgb_pixel_counts_for_test(&self, rgbs: [[u8; 3]; 2]) -> [usize; 2] {
-        let omitted = vec![0; self.frame.len()];
-        attributed_rgb_counts(
-            &self.frame,
-            &omitted,
-            self.width,
-            self.height,
-            self.stride,
-            rgbs,
-        )
-    }
 }
 
 impl OutputBackend for Framebuffer {
@@ -429,6 +285,41 @@ impl OutputBackend for Framebuffer {
 
     fn supported_formats(&self) -> &[Fourcc] {
         &FBDEV_FORMATS
+    }
+
+    /// fbdev's own pitch, read from sysfs at open and fixed for the device's
+    /// life.
+    fn target_stride(&self) -> usize {
+        self.stride
+    }
+
+    fn composed(&self) -> FrameView<'_> {
+        FrameView {
+            pixels: &self.frame,
+            width: self.width,
+            height: self.height,
+            stride: self.stride,
+        }
+    }
+
+    /// The shadow copy, and only while it is trusted: `resend_all` is set
+    /// across every write, so a failed or partial one leaves this `None`
+    /// until a later write succeeds.
+    fn completed(&self) -> Option<FrameView<'_>> {
+        if self.resend_all || self.written.len() != self.frame.len() {
+            return None;
+        }
+        Some(FrameView {
+            pixels: &self.written,
+            width: self.width,
+            height: self.height,
+            stride: self.stride,
+        })
+    }
+
+    #[cfg(test)]
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 
     fn begin_frame(&mut self, damage: Damage) -> Result<FrameTarget<'_>, String> {
@@ -542,30 +433,6 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn application_color_counts_exclude_stride_padding() {
-        let path = std::env::temp_dir().join(format!(
-            "td-framebuffer-color-count-test-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let rendered = [0xff, 0x00, 0xff, 0, 0x00, 0xff, 0x00, 0, 0x00, 0xff, 0x00, 0];
-        let mut omitted = [0u8; 12];
-        let colors = [[0xff, 0x00, 0xff], [0x00, 0xff, 0x00]];
-        assert_eq!(
-            attributed_rgb_counts(&rendered, &omitted, 2, 1, 12, colors),
-            [1, 1]
-        );
-        omitted[4..8].copy_from_slice(&rendered[4..8]);
-        assert_eq!(
-            attributed_rgb_counts(&rendered, &omitted, 2, 1, 12, colors),
-            [1, 0]
-        );
-        let framebuffer = Framebuffer::test_file(&path, 2, 1, 12).unwrap();
-        drop(framebuffer);
-        fs::remove_file(path).unwrap();
-    }
-
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "td-framebuffer-{name}-{}-{}",
@@ -582,14 +449,24 @@ mod tests {
         }
     }
 
+    fn capture(framebuffer: &Framebuffer, scene: &Scene) -> Result<Vec<u8>, String> {
+        let mut comparison = Vec::new();
+        crate::output::completed_public_ppm(
+            framebuffer.completed(),
+            &mut comparison,
+            scene,
+            CAPTURE_STAMP,
+        )
+    }
+
     #[test]
     fn public_capture_is_completed_rgb_without_stride_padding() {
         let cleanup = Cleanup(scratch("capture-stride"));
         let mut framebuffer = Framebuffer::test_file(&cleanup.0, 8, 4, 40).unwrap();
         let scene = Scene::new();
-        assert!(framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).is_err());
+        assert!(capture(&framebuffer, &scene).is_err());
         framebuffer.paint(&scene, Damage::Unknown).unwrap();
-        let ppm = framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).unwrap();
+        let ppm = capture(&framebuffer, &scene).unwrap();
         let header = format!("P6\n# td-output-v1 {}\n8 4\n255\n", CAPTURE_STAMP.record());
         let pixels = ppm.strip_prefix(header.as_bytes()).unwrap();
         let backing = fs::read(&cleanup.0).unwrap();
@@ -607,20 +484,20 @@ mod tests {
         let mut framebuffer = Framebuffer::test_file(&cleanup.0, 320, 200, 1280).unwrap();
         let mut scene = Scene::new();
         framebuffer.paint(&scene, Damage::Unknown).unwrap();
-        let public = framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).unwrap();
+        let public = capture(&framebuffer, &scene).unwrap();
         scene.set_attention(true);
         framebuffer.paint(&scene, Damage::Unknown).unwrap();
-        assert!(framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).is_err());
+        assert!(capture(&framebuffer, &scene).is_err());
         scene.set_attention(false);
         // Merely declaring the scene public does not relabel private output.
-        assert!(framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).is_err());
+        assert!(capture(&framebuffer, &scene).is_err());
         framebuffer.paint(&scene, Damage::Unknown).unwrap();
-        assert_eq!(framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).unwrap(), public);
+        assert_eq!(capture(&framebuffer, &scene).unwrap(), public);
         framebuffer.fail_next_write();
         assert!(framebuffer.paint(&scene, Damage::Whole).is_err());
-        assert!(framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).is_err());
+        assert!(capture(&framebuffer, &scene).is_err());
         framebuffer.paint(&scene, Damage::Whole).unwrap();
-        assert_eq!(framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).unwrap(), public);
+        assert_eq!(capture(&framebuffer, &scene).unwrap(), public);
     }
 
     #[test]

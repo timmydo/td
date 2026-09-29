@@ -2,6 +2,7 @@ use crate::buffer::{BufferCharge, Surface};
 use crate::client_resources::{ClientResourceHighWater, ClientResourceSnapshot};
 use crate::configure::ConfigureTracker;
 use crate::control::ControlSnapshot;
+#[cfg(test)]
 use crate::framebuffer::Framebuffer;
 use crate::help::HelpAction;
 use crate::keyboard::{
@@ -385,7 +386,12 @@ impl PresentedRequest {
 pub struct Runtime {
     scene: Scene,
     attention_enabled: bool,
-    framebuffer: Framebuffer,
+    /// Where frames go. Held through the trait alone, so a second backend is
+    /// a constructor argument rather than a change to anything here.
+    backend: Box<dyn OutputBackend + Send>,
+    /// Scratch frame the readbacks re-render into, kept so a capture or an
+    /// observation allocates it once rather than per call.
+    comparison: Vec<u8>,
     /// What the next paint will tell the backend about what changed. The
     /// backend discovers ordinary damage itself, so this carries only the
     /// case it cannot: pixels the compositor did not write and its shadow
@@ -596,11 +602,12 @@ impl Drag {
 }
 
 impl Runtime {
-    pub fn new(framebuffer: Framebuffer) -> Runtime {
+    pub fn new(backend: impl OutputBackend + Send + 'static) -> Runtime {
         Runtime {
             scene: Scene::new(),
             attention_enabled: false,
-            framebuffer,
+            backend: Box::new(backend),
+            comparison: Vec::new(),
             owed_damage: Damage::Unknown,
             last_submission: None,
             headless_output: None,
@@ -737,11 +744,11 @@ impl Runtime {
 
     /// This runtime's output, named — id, scanout size, scale and transform.
     pub fn output(&self) -> Output {
-        self.framebuffer.output()
+        self.backend.output()
     }
 
-    pub(crate) fn headless(framebuffer: Framebuffer, session: u128) -> Self {
-        let mut runtime = Self::new(framebuffer);
+    pub(crate) fn headless(backend: impl OutputBackend + Send + 'static, session: u128) -> Self {
+        let mut runtime = Self::new(backend);
         runtime.headless_output = Some(crate::headless::OutputStamp { session, output: 0 });
         runtime
     }
@@ -1011,7 +1018,12 @@ impl Runtime {
             return Err("capture requires completed output, not queued submission".into());
         }
         let stamp = self.headless_output.ok_or("not a headless automation runtime")?;
-        self.framebuffer.completed_public_ppm(&self.scene, stamp)
+        crate::output::completed_public_ppm(
+            self.backend.completed(),
+            &mut self.comparison,
+            &self.scene,
+            stamp,
+        )
     }
 
     /// Pessimistic across the paint, as the framebuffer's shadow copy is across
@@ -1034,7 +1046,7 @@ impl Runtime {
         // The damage is cleared only on success, so a failed paint still owes
         // the whole output — which is what the backend's own shadow-copy
         // distrust did before this was the caller's to say.
-        self.last_submission = Some(self.framebuffer.paint(&self.scene, self.owed_damage)?);
+        self.last_submission = Some(self.backend.paint(&self.scene, self.owed_damage)?);
         if self.last_submission == Some(Submission::Presented) {
             if let (Some(stamp), Some(next)) = (self.headless_output.as_mut(), next_output) {
                 stamp.output = next;
@@ -1074,7 +1086,16 @@ impl Runtime {
 
     #[cfg(test)]
     pub fn take_writes(&mut self) -> Vec<(u64, usize)> {
-        self.framebuffer.take_writes()
+        self.framebuffer_for_test().take_writes()
+    }
+
+    /// The fbdev backend every runtime test builds, for its own fault hooks.
+    #[cfg(test)]
+    pub(crate) fn framebuffer_for_test(&mut self) -> &mut Framebuffer {
+        self.backend
+            .as_any_mut()
+            .downcast_mut::<Framebuffer>()
+            .expect("runtime tests drive the fbdev backend")
     }
 
     /// Open a window BELOW another, settling as every other mutation does.
@@ -1393,7 +1414,7 @@ impl Runtime {
     }
 
     pub fn popup_constraint(&self, parent: SurfaceKey) -> Option<PopupConstraint> {
-        let size = self.framebuffer.dimensions();
+        let size = self.backend.dimensions();
         self.scene
             .popup_constraint(parent, size.width, size.height)
     }
@@ -1874,7 +1895,9 @@ impl Runtime {
         else {
             return Ok(());
         };
-        let output_pixels = self.framebuffer.surface_rgb_pixel_counts(
+        let output_pixels = crate::output::surface_rgb_pixel_counts(
+            self.backend.composed(),
+            &mut self.comparison,
             &self.scene,
             content_surface,
             expected_content_rgbs,
@@ -2086,12 +2109,12 @@ impl Runtime {
         if !self.attention_enabled || self.compound_settle.is_some() {
             return Err("trusted prompt cannot be presented in this runtime state".into());
         }
-        let size = self.framebuffer.dimensions();
+        let size = self.backend.dimensions();
         self.scene.prepare_attention_request_with_time(
             request,
             size.width,
             size.height,
-            self.framebuffer.stride(),
+            self.backend.target_stride(),
             remaining,
         )?;
         self.owed_damage = Damage::Whole;
@@ -2350,12 +2373,12 @@ impl Runtime {
 
     #[cfg(test)]
     pub fn fail_next_repaint(&mut self) {
-        self.framebuffer.fail_next_paint();
+        self.framebuffer_for_test().fail_next_paint();
     }
 
     #[cfg(test)]
     pub fn clear_repaint_failure(&mut self) {
-        self.framebuffer.clear_paint_failure();
+        self.framebuffer_for_test().clear_paint_failure();
     }
 
     pub fn pointer_frame(
@@ -2373,7 +2396,7 @@ impl Runtime {
         // outward one at the edge of the output is clamped away, and a report
         // that changed no coordinate owes no paint, re-answers no focus and
         // re-derives no drop.
-        let size = self.framebuffer.dimensions();
+        let size = self.backend.dimensions();
         let moved = self.scene.move_pointer(dx, dy, size.width, size.height);
         self.pointer_report(time, moved, buttons, scroll)
     }
@@ -2395,7 +2418,7 @@ impl Runtime {
         buttons: &[PointerButtonInput],
         scroll: PointerScroll,
     ) -> Result<(), String> {
-        let size = self.framebuffer.dimensions();
+        let size = self.backend.dimensions();
         if self.scene.attention_visible() {
             return Ok(());
         }
@@ -2410,7 +2433,7 @@ impl Runtime {
         buttons: &[PointerButtonInput],
         scroll: PointerScroll,
     ) -> Result<(), String> {
-        let size = self.framebuffer.dimensions();
+        let size = self.backend.dimensions();
         let overlay_modal = self.scene.modal();
         let portal_modal = self.scene.portal_modal().is_some();
         let input_modal = overlay_modal || portal_modal;
@@ -2683,7 +2706,7 @@ impl Runtime {
             return Ok(false);
         }
         let mut named_workspace = false;
-        let size = self.framebuffer.dimensions();
+        let size = self.backend.dimensions();
         let (width, height) = (size.width, size.height);
         // One pass, in the order the transitions happened. A frame can carry
         // several — evdev keeps every transition up to its SYN_REPORT — and a
@@ -4293,7 +4316,7 @@ impl Runtime {
     fn refresh_layout(&mut self) -> bool {
         let next: BTreeMap<SurfaceKey, ViewLayout> = self
             .scene
-            .views(self.framebuffer.dimensions().width, self.framebuffer.dimensions().height)
+            .views(self.backend.dimensions().width, self.backend.dimensions().height)
             .into_iter()
             .map(|view| (view.key, view))
             .collect();
@@ -4430,7 +4453,7 @@ impl Runtime {
         if self.scene.attention_visible() {
             return None;
         }
-        let size = self.framebuffer.dimensions();
+        let size = self.backend.dimensions();
         if let Some(dialog) = self.scene.portal_modal() {
             return self
                 .scene
@@ -4472,8 +4495,8 @@ impl Runtime {
     fn pointer_targets(&self) -> (Option<PointerTarget>, Option<PointerTarget>) {
         let (hover, grab) = self.scene.pointer_targets(
             self.pointer.grab_surface(),
-            self.framebuffer.dimensions().width,
-            self.framebuffer.dimensions().height,
+            self.backend.dimensions().width,
+            self.backend.dimensions().height,
         );
         (
             hover.map(|point| PointerTarget {
@@ -5609,7 +5632,7 @@ mod tests {
         runtime.launcher(LauncherAction::Open).unwrap();
         assert!(runtime.launcher_visible());
 
-        runtime.framebuffer.fail_next_paint();
+        runtime.framebuffer_for_test().fail_next_paint();
         assert!(runtime.launcher(LauncherAction::Activate).is_err());
         assert!(runtime.launcher_visible());
         assert_eq!(
@@ -11452,9 +11475,11 @@ mod tests {
             .apply_commit(decoy, Some(application_content_surface()), None, None)
             .unwrap();
         assert_eq!(
-            runtime
-                .framebuffer
-                .rgb_pixel_counts_for_test(APPLICATION_CONTENT_RGBS),
+            crate::output::attributed_rgb_counts(
+                runtime.backend.composed(),
+                &vec![0; runtime.backend.composed().pixels.len()],
+                APPLICATION_CONTENT_RGBS,
+            ),
             [5_000; 2]
         );
 
@@ -13714,10 +13739,14 @@ mod tests {
         // the explicit guard would expose its pixels to this observer.
         let background = [0x18, 0x20, 0x28];
         assert_eq!(
-            runtime
-                .framebuffer
-                .surface_rgb_pixel_counts(&runtime.scene, key, [background; 2])
-                .unwrap(),
+            crate::output::surface_rgb_pixel_counts(
+                runtime.backend.composed(),
+                &mut runtime.comparison,
+                &runtime.scene,
+                key,
+                [background; 2],
+            )
+            .unwrap(),
             [0; 2]
         );
         runtime.attention(&origin, false).unwrap();
@@ -13854,7 +13883,7 @@ mod tests {
                     runtime.attention(&origin, false).unwrap();
                 }
                 if fail_write {
-                    runtime.framebuffer.fail_next_write();
+                    runtime.framebuffer_for_test().fail_next_write();
                 } else {
                     runtime.exhaust_pointer_revision();
                 }
@@ -13883,7 +13912,7 @@ mod tests {
         runtime.attention(&origin, true).unwrap();
         let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
         let saved = std::sync::Arc::clone(&observed);
-        runtime.framebuffer.after_next_write(move || {
+        runtime.framebuffer_for_test().after_next_write(move || {
             // Separate the observations even on a coarse host clock.
             std::thread::sleep(std::time::Duration::from_millis(2));
             *saved.lock().unwrap() = Some(crate::sys::monotonic_time().unwrap());

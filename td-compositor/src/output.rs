@@ -11,7 +11,7 @@
 //! So scanout sits behind `OutputBackend`, and `paint` is defined as SUBMIT.
 //! `Submission` is how a backend says which of the two it did.
 
-use crate::scene::Scene;
+use crate::scene::{Scene, SurfaceKey};
 
 /// A format a backend can put on glass, as a DRM fourcc.
 ///
@@ -263,6 +263,40 @@ pub struct FrameTarget<'a> {
     pub stride: usize,
 }
 
+/// Bytes a backend already holds, read-only, with the geometry describing
+/// them. The read side of `FrameTarget`: what the readbacks below compare,
+/// so they belong to no one backend.
+#[derive(Clone, Copy)]
+pub struct FrameView<'a> {
+    pub pixels: &'a [u8],
+    pub width: usize,
+    pub height: usize,
+    pub stride: usize,
+}
+
+impl FrameView<'_> {
+    /// The view, if its geometry describes its bytes: a non-empty frame, a
+    /// pitch that holds a row, and rows that fit. The readbacks slice by
+    /// this geometry, so a backend's view is checked rather than trusted.
+    fn checked(self) -> Result<Self, String> {
+        let row = self.width.checked_mul(4).ok_or("frame view row overflow")?;
+        let rows = self
+            .stride
+            .checked_mul(self.height)
+            .ok_or("frame view size overflow")?;
+        if self.width == 0 || self.height == 0 || self.stride < row || rows > self.pixels.len() {
+            return Err(format!(
+                "frame view {}x{} at stride {} does not describe {} bytes",
+                self.width,
+                self.height,
+                self.stride,
+                self.pixels.len()
+            ));
+        }
+        Ok(self)
+    }
+}
+
 /// Which frame — minted when one is queued, compared when it completes.
 ///
 /// This is the identity `poll_events` recorded as missing. It is NOT invented
@@ -375,6 +409,30 @@ pub trait OutputBackend {
     /// first one only.
     fn supported_formats(&self) -> &[Fourcc];
 
+    /// The row pitch the next `begin_frame` target will carry, at least
+    /// `width * 4` and so never zero. A property of this backend's memory,
+    /// not of the output: a dumb buffer's pitch is the kernel's to choose.
+    /// It is asked for ahead of a frame only by what pre-renders one at the
+    /// exact target geometry, the trusted prompt.
+    fn target_stride(&self) -> usize;
+
+    /// The frame the last `begin_frame` prepared and the renderer filled,
+    /// whether or not it was submitted. What the application observer
+    /// attributes pixels in.
+    fn composed(&self) -> FrameView<'_>;
+
+    /// The bytes the device is known to hold, or `None` while that is not
+    /// established: before the first submission completes, and across a
+    /// failed one. The public capture reads only this, and only each row's
+    /// visible `width * 4` bytes: row padding is never compared or captured,
+    /// so a backend need not keep it in any particular state.
+    fn completed(&self) -> Option<FrameView<'_>>;
+
+    /// A test's way back to the concrete backend it built, for the fault
+    /// hooks that are that backend's own rather than the trait's.
+    #[cfg(test)]
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
     /// Prepare a frame and hand back the bytes to render into.
     fn begin_frame(&mut self, damage: Damage) -> Result<FrameTarget<'_>, String>;
 
@@ -425,9 +483,218 @@ pub trait OutputBackend {
     }
 }
 
+/// Only completed bytes that match a public-scene render may be captured.
+/// In particular, neither a failed write nor private attention pixels can be
+/// relabeled as a public frame by the caller. `comparison` is the caller's
+/// scratch frame, kept across captures so it is allocated once.
+pub(crate) fn completed_public_ppm(
+    completed: Option<FrameView<'_>>,
+    comparison: &mut Vec<u8>,
+    scene: &Scene,
+    stamp: crate::headless::OutputStamp,
+) -> Result<Vec<u8>, String> {
+    let completed = completed
+        .ok_or("output completion is not established")?
+        .checked()?;
+    fit(comparison, completed.pixels.len(), "reserve public capture comparison")?;
+    scene.render(comparison, completed.width, completed.height, completed.stride);
+    // Visible bytes only: the renderer never writes row padding, and what a
+    // backend's padding holds is not part of the picture.
+    let visible = completed.width.checked_mul(4).ok_or("capture row overflow")?;
+    let rows = comparison
+        .chunks_exact(completed.stride)
+        .zip(completed.pixels.chunks_exact(completed.stride))
+        .take(completed.height);
+    for (rendered, held) in rows {
+        if rendered.get(..visible) != held.get(..visible) {
+            return Err("completed output does not match the public scene".into());
+        }
+    }
+    let pixels = completed
+        .width
+        .checked_mul(completed.height)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or("capture byte count overflow")?;
+    let header = format!(
+        "P6\n# td-output-v1 {}\n{} {}\n255\n",
+        stamp.record(),
+        completed.width,
+        completed.height
+    );
+    let length = pixels.checked_add(header.len()).ok_or("capture size overflow")?;
+    let mut ppm = Vec::new();
+    ppm.try_reserve_exact(length).map_err(|_| "reserve public capture")?;
+    ppm.extend_from_slice(header.as_bytes());
+    let row_bytes = completed.width.checked_mul(4).ok_or("capture row overflow")?;
+    for row in completed
+        .pixels
+        .chunks_exact(completed.stride)
+        .take(completed.height)
+    {
+        let row = row.get(..row_bytes).ok_or("capture row is truncated")?;
+        for [blue, green, red, _] in row.as_chunks::<4>().0 {
+            ppm.extend_from_slice(&[*red, *green, *blue]);
+        }
+    }
+    if ppm.len() != length {
+        return Err("capture frame is truncated".into());
+    }
+    Ok(ppm)
+}
+
+/// Exact final-output pixels attributable to `surface`. Re-rendering with
+/// only that surface omitted makes hidden, clipped and occluded pixels
+/// disappear from the count while leaving its descendants in place.
+pub(crate) fn surface_rgb_pixel_counts(
+    composed: FrameView<'_>,
+    comparison: &mut Vec<u8>,
+    scene: &Scene,
+    surface: SurfaceKey,
+    rgbs: [[u8; 3]; 2],
+) -> Result<[usize; 2], String> {
+    if scene.attention_visible() {
+        return Ok([0; 2]);
+    }
+    let composed = composed.checked()?;
+    fit(comparison, composed.pixels.len(), "reserve application comparison frame")?;
+    scene.render_omitting(
+        comparison,
+        composed.width,
+        composed.height,
+        composed.stride,
+        Some(surface),
+    );
+    Ok(attributed_rgb_counts(composed, comparison, rgbs))
+}
+
+/// Resize the caller's scratch frame to exactly `length` without a
+/// panicking allocation. It changes size only when the frame does.
+fn fit(scratch: &mut Vec<u8>, length: usize, what: &str) -> Result<(), String> {
+    if scratch.len() != length {
+        let additional = length.saturating_sub(scratch.len());
+        scratch.try_reserve_exact(additional).map_err(|_| what.to_string())?;
+        scratch.resize(length, 0);
+    }
+    Ok(())
+}
+
+pub(crate) fn attributed_rgb_counts(
+    rendered: FrameView<'_>,
+    omitted: &[u8],
+    rgbs: [[u8; 3]; 2],
+) -> [usize; 2] {
+    let mut counts = [0usize; 2];
+    if rendered.stride == 0 {
+        return counts;
+    }
+    let visible = rendered.width.saturating_mul(4);
+    for (rendered_row, omitted_row) in rendered
+        .pixels
+        .chunks(rendered.stride)
+        .zip(omitted.chunks(rendered.stride))
+        .take(rendered.height)
+    {
+        let (Some(rendered_pixels), Some(omitted_pixels)) =
+            (rendered_row.get(..visible), omitted_row.get(..visible))
+        else {
+            return [0; 2];
+        };
+        for (pixel, without) in rendered_pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(omitted_pixels.as_chunks::<4>().0)
+        {
+            if pixel == without {
+                continue;
+            }
+            let [blue, green, red, _] = pixel;
+            let rgb = [*red, *green, *blue];
+            for (index, expected) in rgbs.iter().enumerate() {
+                if rgb == *expected {
+                    if let Some(count) = counts.get_mut(index) {
+                        *count = count.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    counts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_color_counts_exclude_stride_padding() {
+        let rendered = [0xff, 0x00, 0xff, 0, 0x00, 0xff, 0x00, 0, 0x00, 0xff, 0x00, 0];
+        let mut omitted = [0u8; 12];
+        let colors = [[0xff, 0x00, 0xff], [0x00, 0xff, 0x00]];
+        let view = FrameView {
+            pixels: &rendered,
+            width: 2,
+            height: 1,
+            stride: 12,
+        };
+        assert_eq!(attributed_rgb_counts(view, &omitted, colors), [1, 1]);
+        omitted[4..8].copy_from_slice(&rendered[4..8]);
+        assert_eq!(attributed_rgb_counts(view, &omitted, colors), [1, 0]);
+    }
+
+    const STAMP: crate::headless::OutputStamp =
+        crate::headless::OutputStamp { session: 7, output: 1 };
+
+    #[test]
+    fn a_view_whose_geometry_does_not_describe_its_bytes_is_refused_not_sliced() {
+        let bytes = [0u8; 64];
+        let view = |width, height, stride| FrameView {
+            pixels: &bytes,
+            width,
+            height,
+            stride,
+        };
+        for (width, height, stride) in [(0, 4, 16), (4, 0, 16), (4, 4, 0), (4, 4, 12), (4, 5, 16)] {
+            let bad = view(width, height, stride);
+            assert!(completed_public_ppm(Some(bad), &mut Vec::new(), &Scene::new(), STAMP).is_err());
+            let key = SurfaceKey {
+                client: 1,
+                object: 1,
+            };
+            let counts =
+                surface_rgb_pixel_counts(bad, &mut Vec::new(), &Scene::new(), key, [[0; 3]; 2]);
+            assert!(counts.is_err());
+        }
+        assert!(view(4, 4, 16).checked().is_ok());
+        assert_eq!(attributed_rgb_counts(view(4, 4, 0), &bytes, [[0; 3]; 2]), [0; 2]);
+    }
+
+    /// Row padding is not the picture: a backend whose padding holds
+    /// anything still captures, and a changed visible byte still refuses.
+    #[test]
+    fn a_public_capture_compares_visible_bytes_and_ignores_row_padding() {
+        let (width, height, stride) = (4, 3, 24);
+        let scene = Scene::new();
+        let mut clean = vec![0u8; stride * height];
+        scene.render(&mut clean, width, height, stride);
+        let mut padded = clean.clone();
+        for row in padded.chunks_exact_mut(stride) {
+            row[width * 4..].fill(0xaa);
+        }
+        let capture = |pixels: &[u8]| {
+            let view = FrameView {
+                pixels,
+                width,
+                height,
+                stride,
+            };
+            completed_public_ppm(Some(view), &mut Vec::new(), &scene, STAMP)
+        };
+        let expected = capture(&clean).unwrap();
+        assert_eq!(capture(&padded).unwrap(), expected);
+        padded[stride + 1] ^= 0xff;
+        assert!(capture(&padded).is_err());
+    }
 
     #[test]
     fn a_mismatched_trusted_raster_never_reaches_present() {
@@ -459,6 +726,23 @@ mod tests {
                     height: 600,
                     stride: 3200,
                 })
+            }
+            fn target_stride(&self) -> usize {
+                3200
+            }
+            fn composed(&self) -> FrameView<'_> {
+                FrameView {
+                    pixels: &self.frame,
+                    width: self.width,
+                    height: 600,
+                    stride: 3200,
+                }
+            }
+            fn completed(&self) -> Option<FrameView<'_>> {
+                None
+            }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
             }
             fn present(&mut self) -> Result<Submission, String> {
                 self.presents += 1;

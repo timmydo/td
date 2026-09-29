@@ -846,22 +846,38 @@ names the first output instead of being a string that happens to end in a 1.
 a layout: a quarter turn makes a landscape output portrait and a half turn
 does not.
 
-**What the split does NOT yet do**, so the seam is not read as wider than it
-is: `Runtime` still holds a concrete `Framebuffer` and its constructor still
-names one. Every OUTPUT-GEOMETRY read goes through `output()`, whether
-directly or through the `dimensions()` view of it, and the width, height and
-stride fields are private, so no caller reads the output's shape out of this
-backend. Three things stay inherent to it, and each is a caller a second
-backend would break: the row pitch, which `main.rs`'s startup diagnostic reads
-through `stride()` — a dumb buffer's pitch is the kernel's to choose and is a
-property of this backend's memory rather than of the output, which is why it
-is not on the trait; the pixel-attribution the application observer needs
-(`surface_rgb_pixel_counts`); and the `#[cfg(test)]` hooks. Substituting a
-second backend therefore still needs `Runtime` to become generic over one or
-to hold a boxed trait object, and that is the KMS landing's work rather than
-something this split can claim. What it claims is the interface, the submit
-semantics, and that fbdev's output geometry is no longer readable outside its
-own module.
+`Runtime` holds its backend as a `Box<dyn OutputBackend + Send>`. Its
+constructor takes any backend. No production code outside `main.rs` and
+`headless.rs`, which open the device and the headless file, constructs or
+holds a `Framebuffer`. Every OUTPUT-GEOMETRY read goes
+through `output()`, directly or through its `dimensions()` view. The three
+things that used to be inherent to fbdev are now the trait's, or no
+backend's:
+
+- **The row pitch** is `target_stride()`: the pitch the next `begin_frame`
+  target will carry. It is a property of the frame target, not of the
+  output (a dumb buffer's pitch is the kernel's to choose), and
+  `FrameTarget` already carried it. Its callers are the startup diagnostic
+  and the trusted prompt, which pre-renders at the exact target geometry.
+- **The readbacks** are backend-independent functions in `output.rs`. The
+  public capture and the application observer's pixel attribution each
+  re-render into a scratch frame that `Runtime` owns, and compare the
+  result with what a backend exposes. That is `composed()`, the frame last
+  rendered, for attribution, and `completed()`, the bytes the device is
+  known to hold, for capture. `completed()` is `None` whenever that is not
+  established. A view's geometry is checked before anything is sliced by
+  it, and the capture compares and emits only each row's visible bytes, so
+  a backend's row padding may hold anything. fbdev answers from its shadow copy, and only while the copy
+  is trusted, which is what keeps a failed write from being captured as
+  public. A KMS backend answers from its CPU-mapped dumb buffers, and gets
+  both readbacks without reimplementing them.
+- **The `#[cfg(test)]` fault hooks** stay fbdev's own. A test reaches them
+  by downcasting through a test-only `as_any_mut`, so they are not part of
+  the production trait.
+
+What this still does not do is substitute a second backend: the only
+implementation is fbdev. What it claims is the interface, the submit
+semantics, and that nothing in `Runtime` depends on which backend it holds.
 
 The framebuffer is single-buffered from userspace's perspective. The renderer
 allocates its frame storage once and composes a full frame after scene changes.
@@ -3913,8 +3929,9 @@ waits for its own flip with a bounded non-blocking poll, which is right for one
 shot and wrong for a compositor: a flip arrives asynchronously, so draining
 only from a repaint means an idle screen never observes one, and the client
 waits for a frame callback that waits for a completion that waits for a
-repaint. That remains `poll_events`' unsolved half and the reason `Runtime`
-still holds a concrete `Framebuffer`.
+repaint. That remains `poll_events`' unsolved half, and the reason the one
+backend `Runtime` is given is still fbdev, although it holds it only
+through the trait.
 
 A modeset unwinds in one order, for a narrower reason than it first appears.
 `SETCRTC` is the only one of the three steps the kernel flags `DRM_MASTER`

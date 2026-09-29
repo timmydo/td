@@ -8612,8 +8612,9 @@ apart from `wl_shm`'s — an alias would have left both as `u32` and prevented
 nothing.
 
 Two things that row did NOT get, recorded because assuming otherwise is the
-expensive mistake: `Runtime` still holds a concrete `Framebuffer`, so
-substituting a backend remains outstanding; and `poll_events` has no caller,
+expensive mistake. `Runtime` now holds any backend through the trait, but
+fbdev is still the only one, so substituting a backend remains outstanding.
+And `poll_events` has no caller,
 because the delivery path is asynchronous and the presentation-dependent
 evidence published on submit today would announce a frame that is not yet on
 glass. The third reason listed here — that a completion could not be matched to

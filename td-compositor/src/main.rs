@@ -452,7 +452,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     let task_launcher = launches.task_launcher();
     let framebuffer = Framebuffer::open(&options.framebuffer)?;
     let size = framebuffer.dimensions();
-    let geometry = (size.width, size.height, framebuffer.stride());
+    let geometry = (size.width, size.height, framebuffer.target_stride());
     // What this backend can put on glass, as DRM fourccs. Reported at start
     // because the answer is a property of the BACKEND rather than of td: a
     // KMS backend on the same machine would print a different list, and that
