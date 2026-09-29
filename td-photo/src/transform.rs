@@ -2,8 +2,9 @@
 //! and ADST the specification fixes (AV1 bitstream specification, section
 //! 7.13), which every decoder reproduces bit for bit, the forward
 //! butterflies libaom pairs them with, the quantizer steps, and the
-//! coefficient scans. Square sizes of 4 to 32 points only: that is every
-//! transform the encoder's block ladder reaches. The butterflies are
+//! coefficient scans. Square sizes of 4 to 32 points and the 2:1
+//! rectangles between them: every transform a block of 8 to 32 luma
+//! pixels, square or halved, reaches. The butterflies are
 //! tables of stages, each output one operation over the previous stage,
 //! extracted from libaom 3.9.1's `av1_inv_txfm1d.c` and
 //! `av1_fwd_txfm1d.c`, which `butterfly!` expands to straight code; the
@@ -11,42 +12,76 @@
 
 use std::convert::TryFrom;
 
-/// A square transform's size.
+/// A transform's size, width by height: the squares, and the 2:1
+/// rectangles between them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Size {
     S4,
     S8,
     S16,
     S32,
+    S4x8,
+    S8x4,
+    S8x16,
+    S16x8,
+    S16x32,
+    S32x16,
 }
 
 impl Size {
-    /// Points along a side.
-    pub fn points(self) -> usize {
+    /// Points across.
+    pub fn width(self) -> usize {
         match self {
-            Size::S4 => 4,
-            Size::S8 => 8,
-            Size::S16 => 16,
-            Size::S32 => 32,
+            Size::S4 | Size::S4x8 => 4,
+            Size::S8 | Size::S8x4 | Size::S8x16 => 8,
+            Size::S16 | Size::S16x8 | Size::S16x32 => 16,
+            Size::S32 | Size::S32x16 => 32,
         }
     }
 
-    /// The spec's `TX_4X4`..`TX_32X32` index, its context and its
-    /// quantizer band.
+    /// Points down.
+    pub fn height(self) -> usize {
+        match self {
+            Size::S4 | Size::S8x4 => 4,
+            Size::S8 | Size::S4x8 | Size::S16x8 => 8,
+            Size::S16 | Size::S8x16 | Size::S32x16 => 16,
+            Size::S32 | Size::S16x32 => 32,
+        }
+    }
+
+    /// Points in all.
+    pub fn area(self) -> usize {
+        self.width() * self.height()
+    }
+
+    /// Whether one side is twice the other, which the row pass scales
+    /// by the root of a half.
+    fn is_rect2(self) -> bool {
+        let (w, h) = (self.width(), self.height());
+        w == 2 * h || h == 2 * w
+    }
+
+    /// The spec's `TX_4X4`..`TX_32X16` index, `TX_4X8` 5 on.
     pub fn index(self) -> usize {
         match self {
             Size::S4 => 0,
             Size::S8 => 1,
             Size::S16 => 2,
             Size::S32 => 3,
+            Size::S4x8 => 5,
+            Size::S8x4 => 6,
+            Size::S8x16 => 7,
+            Size::S16x8 => 8,
+            Size::S16x32 => 9,
+            Size::S32x16 => 10,
         }
     }
 
     /// The spec's `Transform_Row_Shift`.
     fn row_shift(self) -> u32 {
         match self {
-            Size::S4 => 0,
-            Size::S8 => 1,
+            Size::S4 | Size::S4x8 | Size::S8x4 => 0,
+            Size::S8 | Size::S8x16 | Size::S16x8 | Size::S16x32 | Size::S32x16 => 1,
             Size::S16 | Size::S32 => 2,
         }
     }
@@ -56,18 +91,16 @@ impl Size {
     fn forward_column_shift(self) -> u32 {
         match self {
             Size::S4 => 0,
-            Size::S8 => 1,
-            Size::S16 => 2,
-            Size::S32 => 4,
+            Size::S8 | Size::S4x8 | Size::S8x4 => 1,
+            Size::S16 | Size::S8x16 | Size::S16x8 => 2,
+            Size::S32 | Size::S16x32 | Size::S32x16 => 4,
         }
     }
 
-    /// The spec's `dqDenom` shift: a 32x32 dequantizes to half.
+    /// The spec's `dqDenom` shift: a transform of more than 256 points
+    /// dequantizes to half.
     pub fn dequant_shift(self) -> u32 {
-        match self {
-            Size::S32 => 1,
-            _ => 0,
-        }
+        u32::from(self.area() > 256)
     }
 
     /// The default scan of this size.
@@ -77,6 +110,12 @@ impl Size {
             Size::S8 => &SCAN_8,
             Size::S16 => &SCAN_16,
             Size::S32 => &SCAN_32,
+            Size::S4x8 => &SCAN_4X8,
+            Size::S8x4 => &SCAN_8X4,
+            Size::S8x16 => &SCAN_8X16,
+            Size::S16x8 => &SCAN_16X8,
+            Size::S16x32 => &SCAN_16X32,
+            Size::S32x16 => &SCAN_32X16,
         }
     }
 }
@@ -357,33 +396,39 @@ fn forward_1d(kernel: Kernel, x: &mut [i32]) {
 
 /// The spec's 2D inverse transform (7.13.3) of `coeffs`, row-major with
 /// the row the vertical frequency, into `residual`, row-major pixels'
-/// worth of difference: rows first with their shift, then columns with
-/// the final `Round2(.., 4)`, sixteen-bit clamps at each entry. Slices
-/// of another length than the size squared are left untouched.
+/// worth of difference: rows first (a 2:1 rectangle's inputs scaled by
+/// the root of a half) with their shift, then columns with the final
+/// `Round2(.., 4)`, sixteen-bit clamps at each entry. Slices of another
+/// length than the size's area are left untouched.
 pub fn inverse(size: Size, tx: TxType, coeffs: &[i32], residual: &mut [i32]) {
-    let n = size.points();
-    if coeffs.len() != n * n || residual.len() != n * n {
+    let (w, h) = (size.width(), size.height());
+    if coeffs.len() != w * h || residual.len() != w * h {
         return;
     }
     let mut column = [0i32; 32];
-    let Some(column) = column.get_mut(..n) else {
+    let Some(column) = column.get_mut(..h) else {
         return;
     };
-    for (row, out) in coeffs.chunks_exact(n).zip(residual.chunks_exact_mut(n)) {
-        for (o, c) in out.iter_mut().zip(row) {
-            *o = clamp16(*c);
+    for (row, out) in coeffs.chunks_exact(w).zip(residual.chunks_exact_mut(w)) {
+        for (o, &c) in out.iter_mut().zip(row) {
+            let c = if size.is_rect2() {
+                round2(i64::from(c) * 2896, 12)
+            } else {
+                c
+            };
+            *o = clamp16(c);
         }
         inverse_1d(tx.horizontal(), out);
         for o in out.iter_mut() {
             *o = round2(i64::from(*o), size.row_shift());
         }
     }
-    for j in 0..n {
-        for (c, row) in column.iter_mut().zip(residual.chunks_exact(n)) {
+    for j in 0..w {
+        for (c, row) in column.iter_mut().zip(residual.chunks_exact(w)) {
             *c = clamp16(row.get(j).copied().unwrap_or(0));
         }
         inverse_1d(tx.vertical(), column);
-        for (c, row) in column.iter().zip(residual.chunks_exact_mut(n)) {
+        for (c, row) in column.iter().zip(residual.chunks_exact_mut(w)) {
             if let Some(o) = row.get_mut(j) {
                 *o = round2(i64::from(*c), 4);
             }
@@ -393,29 +438,35 @@ pub fn inverse(size: Size, tx: TxType, coeffs: &[i32], residual: &mut [i32]) {
 
 /// libaom's 2D forward transform of `residual`, the scale the inverse
 /// undoes: columns first over the residual doubled twice, the column
-/// shift, then rows. Slices of another length are left untouched.
+/// shift, then rows, a 2:1 rectangle's scaled by the root of two. Slices
+/// of another length are left untouched.
 pub fn forward(size: Size, tx: TxType, residual: &[i32], coeffs: &mut [i32]) {
-    let n = size.points();
-    if coeffs.len() != n * n || residual.len() != n * n {
+    let (w, h) = (size.width(), size.height());
+    if coeffs.len() != w * h || residual.len() != w * h {
         return;
     }
     let mut column = [0i32; 32];
-    let Some(column) = column.get_mut(..n) else {
+    let Some(column) = column.get_mut(..h) else {
         return;
     };
-    for j in 0..n {
-        for (c, row) in column.iter_mut().zip(residual.chunks_exact(n)) {
+    for j in 0..w {
+        for (c, row) in column.iter_mut().zip(residual.chunks_exact(w)) {
             *c = row.get(j).copied().unwrap_or(0) << 2;
         }
         forward_1d(tx.vertical(), column);
-        for (c, row) in column.iter().zip(coeffs.chunks_exact_mut(n)) {
+        for (c, row) in column.iter().zip(coeffs.chunks_exact_mut(w)) {
             if let Some(o) = row.get_mut(j) {
                 *o = round2(i64::from(*c), size.forward_column_shift());
             }
         }
     }
-    for row in coeffs.chunks_exact_mut(n) {
+    for row in coeffs.chunks_exact_mut(w) {
         forward_1d(tx.horizontal(), row);
+        if size.is_rect2() {
+            for c in row.iter_mut() {
+                *c = round2(i64::from(*c) * 5793, 12);
+            }
+        }
     }
 }
 
@@ -1019,6 +1070,93 @@ pub const SCAN_32: [u16; 1024] = [
     926, 895, 927, 958, 989, 1020, 1021, 990, 959, 991, 1022, 1023,
 ];
 
+pub const SCAN_4X8: [u16; 32] = [
+    0, 1, 4, 2, 5, 8, 3, 6, 9, 12, 7, 10, 13, 16, 11, 14, 17, 20, 15, 18, 21, 24, 19, 22, 25, 28,
+    23, 26, 29, 27, 30, 31,
+];
+
+pub const SCAN_8X4: [u16; 32] = [
+    0, 8, 1, 16, 9, 2, 24, 17, 10, 3, 25, 18, 11, 4, 26, 19, 12, 5, 27, 20, 13, 6, 28, 21, 14, 7,
+    29, 22, 15, 30, 23, 31,
+];
+
+pub const SCAN_8X16: [u16; 128] = [
+    0, 1, 8, 2, 9, 16, 3, 10, 17, 24, 4, 11, 18, 25, 32, 5, 12, 19, 26, 33, 40, 6, 13, 20, 27, 34,
+    41, 48, 7, 14, 21, 28, 35, 42, 49, 56, 15, 22, 29, 36, 43, 50, 57, 64, 23, 30, 37, 44, 51, 58,
+    65, 72, 31, 38, 45, 52, 59, 66, 73, 80, 39, 46, 53, 60, 67, 74, 81, 88, 47, 54, 61, 68, 75, 82,
+    89, 96, 55, 62, 69, 76, 83, 90, 97, 104, 63, 70, 77, 84, 91, 98, 105, 112, 71, 78, 85, 92, 99,
+    106, 113, 120, 79, 86, 93, 100, 107, 114, 121, 87, 94, 101, 108, 115, 122, 95, 102, 109, 116,
+    123, 103, 110, 117, 124, 111, 118, 125, 119, 126, 127,
+];
+
+pub const SCAN_16X8: [u16; 128] = [
+    0, 16, 1, 32, 17, 2, 48, 33, 18, 3, 64, 49, 34, 19, 4, 80, 65, 50, 35, 20, 5, 96, 81, 66, 51,
+    36, 21, 6, 112, 97, 82, 67, 52, 37, 22, 7, 113, 98, 83, 68, 53, 38, 23, 8, 114, 99, 84, 69, 54,
+    39, 24, 9, 115, 100, 85, 70, 55, 40, 25, 10, 116, 101, 86, 71, 56, 41, 26, 11, 117, 102, 87,
+    72, 57, 42, 27, 12, 118, 103, 88, 73, 58, 43, 28, 13, 119, 104, 89, 74, 59, 44, 29, 14, 120,
+    105, 90, 75, 60, 45, 30, 15, 121, 106, 91, 76, 61, 46, 31, 122, 107, 92, 77, 62, 47, 123, 108,
+    93, 78, 63, 124, 109, 94, 79, 125, 110, 95, 126, 111, 127,
+];
+
+pub const SCAN_16X32: [u16; 512] = [
+    0, 1, 16, 2, 17, 32, 3, 18, 33, 48, 4, 19, 34, 49, 64, 5, 20, 35, 50, 65, 80, 6, 21, 36, 51,
+    66, 81, 96, 7, 22, 37, 52, 67, 82, 97, 112, 8, 23, 38, 53, 68, 83, 98, 113, 128, 9, 24, 39, 54,
+    69, 84, 99, 114, 129, 144, 10, 25, 40, 55, 70, 85, 100, 115, 130, 145, 160, 11, 26, 41, 56, 71,
+    86, 101, 116, 131, 146, 161, 176, 12, 27, 42, 57, 72, 87, 102, 117, 132, 147, 162, 177, 192,
+    13, 28, 43, 58, 73, 88, 103, 118, 133, 148, 163, 178, 193, 208, 14, 29, 44, 59, 74, 89, 104,
+    119, 134, 149, 164, 179, 194, 209, 224, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180,
+    195, 210, 225, 240, 31, 46, 61, 76, 91, 106, 121, 136, 151, 166, 181, 196, 211, 226, 241, 256,
+    47, 62, 77, 92, 107, 122, 137, 152, 167, 182, 197, 212, 227, 242, 257, 272, 63, 78, 93, 108,
+    123, 138, 153, 168, 183, 198, 213, 228, 243, 258, 273, 288, 79, 94, 109, 124, 139, 154, 169,
+    184, 199, 214, 229, 244, 259, 274, 289, 304, 95, 110, 125, 140, 155, 170, 185, 200, 215, 230,
+    245, 260, 275, 290, 305, 320, 111, 126, 141, 156, 171, 186, 201, 216, 231, 246, 261, 276, 291,
+    306, 321, 336, 127, 142, 157, 172, 187, 202, 217, 232, 247, 262, 277, 292, 307, 322, 337, 352,
+    143, 158, 173, 188, 203, 218, 233, 248, 263, 278, 293, 308, 323, 338, 353, 368, 159, 174, 189,
+    204, 219, 234, 249, 264, 279, 294, 309, 324, 339, 354, 369, 384, 175, 190, 205, 220, 235, 250,
+    265, 280, 295, 310, 325, 340, 355, 370, 385, 400, 191, 206, 221, 236, 251, 266, 281, 296, 311,
+    326, 341, 356, 371, 386, 401, 416, 207, 222, 237, 252, 267, 282, 297, 312, 327, 342, 357, 372,
+    387, 402, 417, 432, 223, 238, 253, 268, 283, 298, 313, 328, 343, 358, 373, 388, 403, 418, 433,
+    448, 239, 254, 269, 284, 299, 314, 329, 344, 359, 374, 389, 404, 419, 434, 449, 464, 255, 270,
+    285, 300, 315, 330, 345, 360, 375, 390, 405, 420, 435, 450, 465, 480, 271, 286, 301, 316, 331,
+    346, 361, 376, 391, 406, 421, 436, 451, 466, 481, 496, 287, 302, 317, 332, 347, 362, 377, 392,
+    407, 422, 437, 452, 467, 482, 497, 303, 318, 333, 348, 363, 378, 393, 408, 423, 438, 453, 468,
+    483, 498, 319, 334, 349, 364, 379, 394, 409, 424, 439, 454, 469, 484, 499, 335, 350, 365, 380,
+    395, 410, 425, 440, 455, 470, 485, 500, 351, 366, 381, 396, 411, 426, 441, 456, 471, 486, 501,
+    367, 382, 397, 412, 427, 442, 457, 472, 487, 502, 383, 398, 413, 428, 443, 458, 473, 488, 503,
+    399, 414, 429, 444, 459, 474, 489, 504, 415, 430, 445, 460, 475, 490, 505, 431, 446, 461, 476,
+    491, 506, 447, 462, 477, 492, 507, 463, 478, 493, 508, 479, 494, 509, 495, 510, 511,
+];
+
+pub const SCAN_32X16: [u16; 512] = [
+    0, 32, 1, 64, 33, 2, 96, 65, 34, 3, 128, 97, 66, 35, 4, 160, 129, 98, 67, 36, 5, 192, 161, 130,
+    99, 68, 37, 6, 224, 193, 162, 131, 100, 69, 38, 7, 256, 225, 194, 163, 132, 101, 70, 39, 8,
+    288, 257, 226, 195, 164, 133, 102, 71, 40, 9, 320, 289, 258, 227, 196, 165, 134, 103, 72, 41,
+    10, 352, 321, 290, 259, 228, 197, 166, 135, 104, 73, 42, 11, 384, 353, 322, 291, 260, 229, 198,
+    167, 136, 105, 74, 43, 12, 416, 385, 354, 323, 292, 261, 230, 199, 168, 137, 106, 75, 44, 13,
+    448, 417, 386, 355, 324, 293, 262, 231, 200, 169, 138, 107, 76, 45, 14, 480, 449, 418, 387,
+    356, 325, 294, 263, 232, 201, 170, 139, 108, 77, 46, 15, 481, 450, 419, 388, 357, 326, 295,
+    264, 233, 202, 171, 140, 109, 78, 47, 16, 482, 451, 420, 389, 358, 327, 296, 265, 234, 203,
+    172, 141, 110, 79, 48, 17, 483, 452, 421, 390, 359, 328, 297, 266, 235, 204, 173, 142, 111, 80,
+    49, 18, 484, 453, 422, 391, 360, 329, 298, 267, 236, 205, 174, 143, 112, 81, 50, 19, 485, 454,
+    423, 392, 361, 330, 299, 268, 237, 206, 175, 144, 113, 82, 51, 20, 486, 455, 424, 393, 362,
+    331, 300, 269, 238, 207, 176, 145, 114, 83, 52, 21, 487, 456, 425, 394, 363, 332, 301, 270,
+    239, 208, 177, 146, 115, 84, 53, 22, 488, 457, 426, 395, 364, 333, 302, 271, 240, 209, 178,
+    147, 116, 85, 54, 23, 489, 458, 427, 396, 365, 334, 303, 272, 241, 210, 179, 148, 117, 86, 55,
+    24, 490, 459, 428, 397, 366, 335, 304, 273, 242, 211, 180, 149, 118, 87, 56, 25, 491, 460, 429,
+    398, 367, 336, 305, 274, 243, 212, 181, 150, 119, 88, 57, 26, 492, 461, 430, 399, 368, 337,
+    306, 275, 244, 213, 182, 151, 120, 89, 58, 27, 493, 462, 431, 400, 369, 338, 307, 276, 245,
+    214, 183, 152, 121, 90, 59, 28, 494, 463, 432, 401, 370, 339, 308, 277, 246, 215, 184, 153,
+    122, 91, 60, 29, 495, 464, 433, 402, 371, 340, 309, 278, 247, 216, 185, 154, 123, 92, 61, 30,
+    496, 465, 434, 403, 372, 341, 310, 279, 248, 217, 186, 155, 124, 93, 62, 31, 497, 466, 435,
+    404, 373, 342, 311, 280, 249, 218, 187, 156, 125, 94, 63, 498, 467, 436, 405, 374, 343, 312,
+    281, 250, 219, 188, 157, 126, 95, 499, 468, 437, 406, 375, 344, 313, 282, 251, 220, 189, 158,
+    127, 500, 469, 438, 407, 376, 345, 314, 283, 252, 221, 190, 159, 501, 470, 439, 408, 377, 346,
+    315, 284, 253, 222, 191, 502, 471, 440, 409, 378, 347, 316, 285, 254, 223, 503, 472, 441, 410,
+    379, 348, 317, 286, 255, 504, 473, 442, 411, 380, 349, 318, 287, 505, 474, 443, 412, 381, 350,
+    319, 506, 475, 444, 413, 382, 351, 507, 476, 445, 414, 383, 508, 477, 446, 415, 509, 478, 447,
+    510, 479, 511,
+];
+
 /// The DC quantizer step of every `qindex` at 8 bits (spec `Dc_Qlookup[0]`).
 #[rustfmt::skip]
 pub const DC_Q: [u16; 256] = [
@@ -1084,6 +1222,18 @@ mod tests {
     }
 
     const SIZES: [Size; 4] = [Size::S4, Size::S8, Size::S16, Size::S32];
+    const ALL: [Size; 10] = [
+        Size::S4,
+        Size::S8,
+        Size::S16,
+        Size::S32,
+        Size::S4x8,
+        Size::S8x4,
+        Size::S8x16,
+        Size::S16x8,
+        Size::S16x32,
+        Size::S32x16,
+    ];
     const TYPES: [TxType; 4] = [
         TxType::DctDct,
         TxType::AdstDct,
@@ -1133,7 +1283,7 @@ mod tests {
     fn the_inverse_dct_tables_compute_the_dct() {
         let mut rng = Lcg(7);
         for size in SIZES {
-            let n = size.points();
+            let n = size.width();
             for _ in 0..200 {
                 let coeffs: Vec<i32> = (0..n).map(|_| rng.signed(2000)).collect();
                 let mut x = coeffs.clone();
@@ -1153,7 +1303,7 @@ mod tests {
     #[test]
     fn every_inverse_kernel_is_orthogonal() {
         for size in SIZES {
-            let n = size.points();
+            let n = size.width();
             for kernel in [Kernel::Dct, Kernel::Adst] {
                 if kernel == Kernel::Adst && size == Size::S32 {
                     continue;
@@ -1183,17 +1333,18 @@ mod tests {
     #[test]
     fn the_forward_and_inverse_round_trip_a_residual() {
         let mut rng = Lcg(11);
-        for size in SIZES {
-            let n = size.points();
+        for size in ALL {
+            let n = size.area();
             for tx in TYPES {
-                if size == Size::S32 && tx != TxType::DctDct {
+                // No 32-point ADST: a 32 either way is DCT only.
+                if size.width().max(size.height()) == 32 && tx != TxType::DctDct {
                     continue;
                 }
                 for _ in 0..20 {
-                    let residual: Vec<i32> = (0..n * n).map(|_| rng.signed(255)).collect();
-                    let mut coeffs = vec![0i32; n * n];
+                    let residual: Vec<i32> = (0..n).map(|_| rng.signed(255)).collect();
+                    let mut coeffs = vec![0i32; n];
                     forward(size, tx, &residual, &mut coeffs);
-                    let mut back = vec![0i32; n * n];
+                    let mut back = vec![0i32; n];
                     inverse(size, tx, &coeffs, &mut back);
                     for (i, (b, r)) in back.iter().zip(&residual).enumerate() {
                         assert!((b - r).abs() <= 2, "{size:?} {tx:?} [{i}] {b} vs {r}");
@@ -1201,10 +1352,10 @@ mod tests {
                 }
                 // The extremes stay within the sixteen-bit ranges.
                 for v in [-255, 255] {
-                    let residual = vec![v; n * n];
-                    let mut coeffs = vec![0i32; n * n];
+                    let residual = vec![v; n];
+                    let mut coeffs = vec![0i32; n];
                     forward(size, tx, &residual, &mut coeffs);
-                    let mut back = vec![0i32; n * n];
+                    let mut back = vec![0i32; n];
                     inverse(size, tx, &coeffs, &mut back);
                     assert!(
                         back.iter().all(|b| (b - v).abs() <= 1),
@@ -1217,17 +1368,15 @@ mod tests {
 
     #[test]
     fn a_flat_block_is_one_dc_coefficient_at_the_documented_scale() {
-        for (size, dc) in [
-            (Size::S4, 32),
-            (Size::S8, 64),
-            (Size::S16, 128),
-            (Size::S32, 128),
-        ] {
-            let n = size.points();
-            let residual = vec![100i32; n * n];
-            let mut coeffs = vec![0i32; n * n];
+        // Eight times the orthonormal DC, four past 256 points, where the
+        // dequantizer halves: the root of the area times 8 or 4.
+        for size in ALL {
+            let n = size.area();
+            let residual = vec![100i32; n];
+            let mut coeffs = vec![0i32; n];
             forward(size, TxType::DctDct, &residual, &mut coeffs);
-            let want = dc * 100;
+            let scale = if n > 256 { 4.0 } else { 8.0 };
+            let want = (scale * (n as f64).sqrt() * 100.0).round() as i32;
             assert!(
                 (coeffs[0] - want).abs() * 100 <= want,
                 "{size:?} {}",
@@ -1251,22 +1400,25 @@ mod tests {
 
     #[test]
     fn the_scans_walk_the_anti_diagonals_of_a_row_major_block() {
-        for size in SIZES {
-            let n = size.points();
+        for size in ALL {
+            let w = size.width();
             let scan = size.scan();
-            let mut seen = vec![false; n * n];
+            let mut seen = vec![false; size.area()];
             let mut last = 0;
             for (c, &pos) in scan.iter().enumerate() {
                 let pos = usize::from(pos);
                 assert!(!seen[pos], "{size:?} {c}");
                 seen[pos] = true;
-                let diagonal = pos / n + pos % n;
+                let diagonal = pos / w + pos % w;
                 assert!(diagonal >= last, "{size:?} {c}");
                 last = diagonal;
             }
             assert!(seen.iter().all(|s| *s));
             assert_eq!(scan[0], 0);
-            assert_eq!(scan[1], 1, "{size:?}: the horizontal frequency first");
+            // The squares and tall rectangles take the horizontal
+            // frequency first, the wide ones the vertical.
+            let second = if size.width() > size.height() { w } else { 1 };
+            assert_eq!(usize::from(scan[1]), second, "{size:?}");
         }
     }
 
@@ -1281,6 +1433,11 @@ mod tests {
             assert!(ac_q(q) >= ac_q(q - 1));
         }
         assert_eq!(Size::S32.dequant_shift(), 1);
+        assert_eq!(Size::S16x32.dequant_shift(), 1);
+        assert_eq!(Size::S32x16.dequant_shift(), 1);
         assert_eq!(Size::S16.dequant_shift(), 0);
+        for size in [Size::S4x8, Size::S8x4, Size::S8x16, Size::S16x8] {
+            assert_eq!(size.dequant_shift(), 0, "{size:?}");
+        }
     }
 }

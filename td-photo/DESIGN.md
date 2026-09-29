@@ -1304,33 +1304,36 @@ columns admit the frame. `av1::av1c` and the colour constants are the
 configuration the container repeats, from the same values the sequence
 header writes. The transforms are the spec's integer butterflies, each
 a table of stages that `butterfly!` expands to straight code over fixed
-arrays, and the deblocking filter (`deblock`) is the spec's edge loop
-over 4x4 units: an edge's length is the smaller transform beside it (4,
-8 or 14 luma taps, 4 or 6 chroma), no intra block counts as skipped, and
-the level, one for every plane and direction, is libaom's fit of the AC
-step for a key frame (`LPF_PICK_FROM_Q`) half again, which measured
-better on a photo than the fit at every rate and as well as double it
-but for RGB fidelity. CDEF (`cdef`, spec 7.15 in dav1d's form) follows
-it: each 8x8 of luma with coefficients is filtered along the direction
-its pixels show, and its 4x4s of chroma with it, every tap reading the
-deblocked frame and none outside the mode-info grid; one strength set
-serves the frame (`cdef_bits` 0), libaom's fits of the AC step for an
-intra frame (`av1_pick_cdef_from_qp`) with chroma's halved, which
-measured better on a photo than the fit (whose chroma cost RGB
-fidelity at mid rates) or no chroma filtering. Prediction reads the
-unfiltered pixels, so the filters run once the frame is coded, over
-the superblock-padded planes a decoder filters, and only on a
-reconstruction the caller asked to keep, which is then what any
-conforming decoder shows; `tests/av1.rs` holds that to dav1d when one
-is named (`TD_TEST_DAV1D`), and holds five small streams and their
-reconstructions to the hashes of bytes dav1d decoded, so a change to
-any emitted symbol or filtered pixel is verified against the decoder
-before the hash moves. It is fed rows like the JPEG encoder and codes
-a superblock row when one is complete, so the export band rules hold;
-a frame is at most 16384 on an axis. A block's prediction edges are
-read once per plane and every mode is predicted from them into the
-tile's scratch, which also holds the transform's working blocks and
-each plane's trial and best coding and only grows, so a block
+arrays, at the square sizes and the 2:1 rectangles between them (the
+rectangles' rows scaled by the root of a half as the spec's inverse
+does, the forward by the root of two as libaom's; the rectangles await
+the partitions that code them), and the deblocking filter (`deblock`)
+is the spec's edge loop over 4x4 units: an edge's length is the smaller
+transform beside it (4, 8 or 14 luma taps, 4 or 6 chroma), no intra
+block counts as skipped, and the level, one for every plane and
+direction, is libaom's fit of the AC step for a key frame
+(`LPF_PICK_FROM_Q`) half again, which measured better on a photo than
+the fit at every rate and as well as double it but for RGB fidelity.
+CDEF (`cdef`, spec 7.15 in dav1d's form) follows it: each 8x8 of luma
+with coefficients is filtered along the direction its pixels show, and
+its 4x4s of chroma with it, every tap reading the deblocked frame and
+none outside the mode-info grid; one strength set serves the frame
+(`cdef_bits` 0), libaom's fits of the AC step for an intra frame
+(`av1_pick_cdef_from_qp`) with chroma's halved, which measured better on
+a photo than the fit (whose chroma cost RGB fidelity at mid rates) or no
+chroma filtering. Prediction reads the unfiltered pixels, so the filters
+run once the frame is coded, over the superblock-padded planes a decoder
+filters, and only on a reconstruction the caller asked to keep, which is
+then what any conforming decoder shows; `tests/av1.rs` holds that to
+dav1d when one is named (`TD_TEST_DAV1D`), and holds five small streams
+and their reconstructions to the hashes of bytes dav1d decoded, so a
+change to any emitted symbol or filtered pixel is verified against the
+decoder before the hash moves. It is fed rows like the JPEG encoder and
+codes a superblock row when one is complete, so the export band rules
+hold; a frame is at most 16384 on an axis. A block's prediction edges
+are read once per plane and every mode is predicted from them into the
+tile's scratch, which also holds the transform's working blocks and each
+plane's trial and best coding and only grows, so a block
 allocates only the levels its leaf keeps. A 24-megapixel export takes
 about twenty-four seconds on one thread and a few on eight
 (`tests/av1.rs`'s `bench`). Against libaom's all-intra speed 6 on a
@@ -1899,17 +1902,18 @@ and the frame header's opening field by field, the quality buying luma
 PSNR and costing bytes; the rows refused by name; and the container's
 extent read back as the stream and decoded. The transforms' unit
 tests hold every kernel to the real transform it approximates and to
-orthogonality, the scans to their anti-diagonals, the quantiser tables to
-their ends; the coder's unit tests round-trip symbols and bits through a
-transcription of the spec's decoder, pin the adaptation, the bit writer,
-`leb128` and the OBU framing, the trailing-bit rule (spec 8.2.4, which
-libaom's decoder enforces), the end-of-block classes and the predictors
-by value, chroma from luma's signed rounding and two angle deltas'
-turns among them, hold every directional angle's line-at-a-time
-prediction to the spec's pixel by pixel on random edges, and hold the
-trellis's prices to what the coder counts for random blocks of every
-size and its levels to the quantizer's or one below with an end of
-block that matches them; `cdef`'s pin the direction search on each
+orthogonality, every size's forward and inverse to a round trip and a
+flat block to its DC, the scans to their anti-diagonals, the quantiser
+tables to their ends; the coder's unit tests round-trip symbols and
+bits through a transcription of the spec's decoder, pin the adaptation,
+the bit writer, `leb128` and the OBU framing, the trailing-bit rule
+(spec 8.2.4, which libaom's decoder enforces), the end-of-block classes
+and the predictors by value, chroma from luma's signed rounding and two
+angle deltas' turns among them, hold every directional angle's
+line-at-a-time prediction to the spec's pixel by pixel on random edges,
+and hold the trellis's prices to what the coder counts for random blocks
+of every size and its levels to the quantizer's or one below with an end
+of block that matches them; `cdef`'s pin the direction search on each
 direction's lines, stripes and a flat block and the tap constraint and
 strength adjustment by value; `avif`'s hold every box to its bytes.
 

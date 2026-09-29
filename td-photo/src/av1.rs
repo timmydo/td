@@ -2083,7 +2083,7 @@ impl Tile {
         // The work blocks hold the last trial's values: every row of the
         // residual is written and the transforms write every output, so
         // a prediction or transform of another size is refused.
-        if pred.len() != n * n || size.points() != n {
+        if pred.len() != n * n || (size.width(), size.height()) != (n, n) {
             out.cost = u64::MAX;
             out.levels.clear();
             out.eob = 0;
@@ -2469,7 +2469,7 @@ impl Tile {
     /// signs above and left of it lean.
     fn dc_sign_ctx(&self, plane: usize, at: At) -> usize {
         let sub = usize::from(plane > 0);
-        let units = plane_size(at.log2, plane).points() / MI;
+        let units = plane_size(at.log2, plane).width() / MI;
         let x4 = at.mi_col >> sub;
         let y4 = at.sb_row() >> sub;
         let max_x4 = (self.mi_cols >> sub).saturating_sub((self.x0 / MI) >> sub);
@@ -2513,7 +2513,7 @@ impl Tile {
             return 0;
         }
         let (eob_pt, extra_bits) = eob_position(eob);
-        let class = (size.points().ilog2() - 2) as usize;
+        let class = (size.width().ilog2() - 2) as usize;
         let mut rate = self
             .cdfs
             .eob_pt
@@ -2560,7 +2560,7 @@ impl Tile {
             return 0;
         }
         let size = plane_size(at.log2, plane);
-        let n = size.points();
+        let n = size.width();
         mags.fill(levels, n);
         let (row_shift, col_mask) = (n.ilog2(), n - 1);
         let ptype = usize::from(plane > 0);
@@ -2665,7 +2665,7 @@ impl Tile {
         let Levels { levels, eob } = coded;
         let sub = usize::from(plane > 0);
         let size = plane_size(at.log2, plane);
-        let n = size.points();
+        let n = size.width();
         let units = n / MI;
         let x4 = at.mi_col >> sub;
         let y4 = at.sb_row() >> sub;
@@ -2715,7 +2715,7 @@ impl Tile {
         }
         // eob_pt and its extra bits
         let (eob_pt, extra_bits) = eob_position(eob);
-        let class = (size.points().ilog2() - 2) as usize;
+        let class = (size.width().ilog2() - 2) as usize;
         if let Some(cdf) = self
             .cdfs
             .eob_pt
@@ -4149,7 +4149,7 @@ mod tests {
                 log2,
             };
             let size = plane_size(log2, plane);
-            let n = size.points();
+            let n = size.width();
             let coeffs: Vec<i32> = (0..n * n)
                 .map(|_| {
                     let r = rng.next();
@@ -4214,7 +4214,7 @@ mod tests {
                 log2,
             };
             let size = plane_size(log2, plane);
-            let n = size.points();
+            let n = size.width();
             let eob = 1 + rng.next() as usize % (n * n);
             let mut levels = vec![0i32; n * n];
             for &pos in size.scan().iter().take(eob) {
