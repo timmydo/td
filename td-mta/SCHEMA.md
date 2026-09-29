@@ -7,10 +7,11 @@ M04b2c3. Typed statement dispatch closes structural references, and the
 owned whole-reader loader requires actual EOF. CONFIG.md specifies its
 portable structural-loader stack qualification. A runnable service remains
 unimplemented. CONFIG.md owns physical syntax,
-resource fields, local routing and stream completion. API.md owns visible identity encoding. This document owns
-the remaining fields, cross-references and candidate construction. Protected
-file loading and redacted effective output remain M04b3/M05; M19 owns
-publication.
+resource fields, local routing and stream completion. API.md owns visible
+identity encoding. This document owns the remaining fields, cross-references
+and candidate construction. M04b3a implements bounded signature/password
+content decoding. Protected file loading and redacted effective output remain
+M04b3/M05; M19 owns publication.
 
 No ordinary configuration load contacts DNS, a relay, a CA or a listening
 socket. Structural acceptance does not prove file permissions, certificate
@@ -293,10 +294,19 @@ and configured hostname before authentication, without a downgrade or
 verification-disable option. AUTH mechanism selection follows M17's advertised
 PLAIN/LOGIN support, not a configuration guess about provider software.
 
-M04b3 must define bounded password-file decoding before it claims resolved
-credentials; the trust roles and material ceilings below already apply. The
-schema's reference is not the password, and its structural acceptance grants
-no authority to send an AUTH command.
+The v1 relay password is 1..1024 printable ASCII bytes (`0x20..0x7e`).
+The file may end in one LF or CRLF; remove exactly that one ending and
+preserve all other bytes, including leading/trailing spaces. Refuse empty
+values, embedded line endings, tabs, controls, DEL and non-ASCII text. Read
+at most 1026 raw bytes plus one over-limit observation byte. This is a local
+configuration restriction, not the full set of strings permitted by SASL.
+M04b3a implements content decoding only; M04b3/M05 still own protected-file
+trust and candidate finalization. A decoded value grants no AUTH authority.
+
+M17 must omit an AUTH initial response when it would exceed the ordinary
+SMTP command limit and use the challenge round trip instead, as required by
+[RFC 4954 section 4](https://www.rfc-editor.org/rfc/rfc4954.html#section-4).
+The 1024-byte local password cap does not override the peer's limits.
 
 ## 6. Certificates and ACME
 

@@ -455,6 +455,15 @@ Split at these concrete boundaries before dependent milestones start:
   within its remaining text capacity, materialize identities with bounded
   injected protected-input fixtures, then encode from temporary borrowed views.
   Any late failure drops the candidate. M19 owns atomic runtime publication.
+  - **M04b3a:** implemented bounded content decoding for signature and relay
+    password inputs through injected readers. Exact EOF, byte ceilings,
+    bounded Interrupted retries, fixed redacted failures and borrowed output;
+    SCHEMA.md specifies password-file bytes. Sized to reuse stream scratch.
+    This adds no filesystem trust, candidate finalization or CLI success.
+  - **M04b3b:** remaining protected-reference inventory and M05 adapter
+    contract, exclusive finalization, resolved spans, identity materialization
+    and preimage encoding, plus streamed redacted effective output. Qualify
+    each new compiled path and combined memory before service integration.
 - **M04c1:** checked u64 disk/work settings and capacity-derived maintenance
   validation in `admission.rs`; configuration uses this committed plan.
 - **M04c2:** charged work meters in `admission/work.rs` and checked

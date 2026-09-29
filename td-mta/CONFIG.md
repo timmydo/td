@@ -8,7 +8,8 @@ drives a trusted reader through EOF. The resource stanza schema below
 additionally builds checked resource plans. [SCHEMA.md](SCHEMA.md) specifies
 the complete operator schema and snapshot partitions. `config::load::read`
 owns whole-reader structural loading, with the portable stack qualification
-below. Protected file access, effective output and CLI remain M04b3/M05/M19 work
+below. `config::material` decodes bounded signature and relay-password bytes.
+Protected file access, effective output and CLI remain M04b3/M05/M19 work
 as assigned in IMPLEMENTATION.md.
 A syntactically accepted statement is not a valid service configuration.
 DESIGN.md §6 owns the administration contract; RESOURCES.md owns the aggregate
@@ -1435,3 +1436,47 @@ instance of `read`/`build_stanzas` needs qualification, even when using the
 same reader type. Five scenario bodies intentionally repeat the loader unit
 cases to exercise an external compilation; changes to their coverage must
 update both suites.
+
+
+## Operator-file content decoding
+
+M04b3a adds `config::material::read`, an allocation-free content driver over
+an injected `Read`. `Kind::Signature` accepts at most 16384 bytes of UTF-8
+without NUL; it preserves every byte, including newlines, markup and any BOM.
+Empty signatures are valid. `Kind::RelayPassword` implements SCHEMA.md's
+printable-ASCII password format and optional single terminal LF/CRLF. The
+kinds share no expansion, normalization, filesystem or provider behavior.
+
+The caller lends `Kind::scratch_bytes()` bytes: 16385 for signatures and
+1027 for passwords, including the over-limit observation byte. Short scratch
+refuses before reader I/O. Larger slices have only that prefix used. Before
+reading, initialize the admitted prefix to zero once, so a faulty reader that
+reports unwritten bytes cannot return a prior password as signature text.
+This is buffer initialization, not a secure-erasure guarantee. Every
+successful value requires an actual nonempty-window EOF read, even when the
+raw size is exactly its limit. Oversize input fails after at most limit+1
+bytes. Invalid `Read` counts refuse before slicing. The total Interrupted
+retry allowance is the stream driver's 32, without resetting on progress;
+other I/O errors fail immediately and retain only `ErrorKind`. Late errors
+never return a partial value. The trusted reader owns blocking, allocation
+behavior, truthful EOF/counts and writing every byte it reports; this helper
+supplies no wall-clock deadline.
+
+`Value` privately carries its kind and borrowed text. Its explicit `text()`
+accessor is for trusted finalization; Debug is redacted and there is no
+Display. Fixed `config_material_*` diagnostics carry no path, file bytes or
+arbitrary I/O error payload/source chain. Scratch can retain input on success
+or failure; neither this helper nor the existing text arena promises secure
+erasure. Later integration must account for the whole credential lifetime.
+
+This is content validity and same-read EOF evidence only. No protected-file
+ownership, permissions, ancestor trust, runtime authentication or publication
+proof follows. M04b3's finalizer must consume a structural candidate, use M05
+trusted file handles, append decoded text within the remaining 192 KiB arena,
+and discard candidate authority on any late error. The decoder's maximum
+scratch is sized to reuse the existing 28 KiB stream region after structural
+EOF; compile-time checks pin both kinds' fit. M04b3b must implement that reuse.
+No second concurrent buffer is budgeted.
+New compiled finalizer/reader instances still need CONFIG.md's target stack
+qualification before service use. Provider inputs remain M07's separate
+certificate-generation ledger; this helper does not load keys or trust stores.

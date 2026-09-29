@@ -9,6 +9,7 @@ pub mod identities;
 pub mod identity;
 pub mod listener;
 pub mod load;
+pub mod material;
 pub mod outbound;
 pub mod policy;
 pub mod resources;
