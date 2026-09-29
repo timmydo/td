@@ -19,6 +19,8 @@ pub use sha256::Sha256;
 mod entropy;
 pub use entropy::SystemEntropy;
 mod pkcs8;
+mod pem;
+pub use pem::{PemCertificates, CERTIFICATE_DER_CAPACITY};
 mod provider;
 pub use provider::{P256Key, Provider, P256_PKCS8_CAPACITY};
 

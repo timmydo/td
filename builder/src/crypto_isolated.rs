@@ -624,6 +624,11 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "entropy::tests::local_randomness_smoke", false),
         ("td-crypto-smoke", "entropy::tests::construction_requires_nonempty_successful_initialization", false),
         ("td-crypto-smoke", "entropy::tests::synthetic_partial_error_clears_the_entire_caller_slice", false),
+        ("td-crypto-smoke", "pem::tests::canonical_base64_and_transactional_output", false),
+        ("td-crypto-smoke", "pem::tests::certificate_decoding_matches_independent_pem_reader", false),
+        ("td-crypto-smoke", "pem::tests::certificate_envelopes_and_retry", false),
+        ("td-crypto-smoke", "pem::tests::certificate_limits_and_der_envelopes", false),
+        ("td-crypto-smoke", "pem::tests::p256_pem_loading_and_refusals", false),
         ("td-crypto-smoke", "provider::tests::factory_digest_and_fixed_comparison", false),
         ("td-crypto-smoke", "provider::tests::accepted_pkcs8_variants_and_public_point_known_answer", false),
         ("td-crypto-smoke", "provider::tests::malformed_der_and_inconsistent_keys_are_refused", false),
@@ -698,7 +703,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             println!("portable runtime: {prefix}{bytes}");
         }
     }
-    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, entropy and P-256/oracle probes, explicit provider, sixteen TLS cases and both bounded configuration stacks passed without toolchain mounts");
+    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM, entropy and P-256/oracle probes, explicit provider, sixteen TLS cases and both bounded configuration stacks passed without toolchain mounts");
     Ok(())
 }
 

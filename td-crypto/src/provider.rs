@@ -36,6 +36,16 @@ fn provider<T>(operation: impl FnOnce() -> Result<T, Error> + UnwindSafe) -> Res
     catch_unwind(operation).map_err(|_| Error::Crypto)?
 }
 
+impl Provider {
+    /// Cold-load one unencrypted P-256 PKCS#8 PRIVATE KEY PEM block.
+    /// Input is capped at 16 KiB; decoded key storage is fixed and cleared on
+    /// return or Rust unwind. Caller input and compiler copies are not erased.
+    /// This validates the key, not its correspondence to any certificate.
+    pub fn load_p256_pem(&self, input: &[u8]) -> Result<P256Key, Error> {
+        crate::pem::private_key(input, |der| self.load_p256(der))
+    }
+}
+
 impl P256Key {
     fn operate<T>(
         &self,

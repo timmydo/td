@@ -9,8 +9,9 @@ dependencies and checks their offline host build. M07a1 implements opaque
 streaming SHA-256; its direct operation uses the owned fixed-state primitive.
 M07a3 adds the opaque worker-local entropy handle. M07a4 implements the Crypto
 factory, fixed-size comparison and opaque P-256 key generation/loading/signing.
-TLS sessions remain
-unimplemented. Test-only backend qualification covers explicit
+M07b1 adds bounded certificate PEM syntax and a P-256 PEM key loader.
+TLS sessions remain unimplemented. Test-only backend qualification covers
+explicit
 provider construction, SHA-256, local TLS 1.2/1.3 data exchange, certificate
 verification and malformed/tampered-record refusals in the isolated static
 executable.
@@ -102,7 +103,7 @@ must refuse later operations, including mocks. Crypto output buffers remain
 unchanged on returned errors.
 
 The four fixed errors are Capacity for insufficient output, Invalid for
-malformed/unsupported/inconsistent key input, Entropy for recoverable random
+malformed/unsupported/inconsistent key or certificate-envelope input, Entropy for recoverable random
 source failure and Crypto for other recoverable provider operation failures.
 They expose no provider diagnostics, nested provider error, secret bytes or
 input-dependent formatted message. td-mta re-exports the shared traits and
@@ -250,8 +251,8 @@ bytes, depending on the two optional inner fields. The provider validates
 scalar range, curve membership and embedded-public-key consistency, deriving
 the public point when omitted. Structural acceptance alone is no key proof.
 
-Refuse encrypted keys, PEM, bare SEC1, PKCS#8 v2, attributes, explicit curve
-parameters, compressed/hybrid/infinity encodings, overlong/indefinite lengths,
+The DER entry point refuses encrypted keys, PEM, bare SEC1, PKCS#8 v2,
+attributes, explicit curve parameters, compressed/hybrid/infinity encodings, overlong/indefinite lengths,
 wrong/duplicate/reordered fields and trailing bytes at every level. These are
 intentional subset restrictions. The bounded precheck is needed because the
 pinned provider's outer PKCS#8 reader does not reject trailing input itself.
@@ -310,6 +311,54 @@ backend or add a Cargo dependency. Portable staging includes the exact oracle
 source files and vector data in its source digest. Functional, grammar and
 failure qualification does not complete native allocation, timing, stack/RSS
 or service integration work.
+
+### Bounded PEM material syntax
+
+`PemCertificates::chain` and `trust_bundle` borrow a complete bounded input
+and validate every envelope before returning a reader. The reader stores
+only the remaining slice and count. `decode_next` writes one certificate to
+a caller buffer without allocation; insufficient capacity leaves the reader
+and output unchanged for retry. Success leaves the unused output tail alone;
+exhaustion returns None without writing. `CERTIFICATE_DER_CAPACITY` gives
+callers a sufficient buffer size. Debug reports only the count.
+The parser is a cold-path syntax interface, not verified identity evidence.
+
+TLS.md owns the byte/count limits. A constructor refuses empty input, wrong
+or mixed labels, headers, unknown text, invalid padding, and a malformed,
+nonminimal or incomplete outer DER SEQUENCE. Inner certificate fields,
+duplicate certificates, dates, names, signatures and trust remain M07b2.
+The constructor publishes no partial reader when a later block is invalid.
+The text cap is checked before scanning; fixed counters and a four-byte DER
+prefix replace input-sized temporary storage. The complete borrowed input
+cannot change while a reader exists.
+
+BEGIN may follow whitespace between blocks, including on the same line.
+END starts its own line; neither marker permits trailing whitespace. LF and
+CRLF are accepted, including mixed line endings; a final footer need not
+have a newline. All six ASCII whitespace bytes are permitted between blocks.
+Inside
+base64, permit space, tab, LF and CRLF only. Standard alphabet and canonical
+padding are required; padding is present exactly when the final quantum
+needs it. No data may follow a padded quantum within a block. An empty DER
+SEQUENCE is refused. These are intentional PEM subset restrictions.
+
+`Provider::load_p256_pem` accepts exactly one PRIVATE KEY block, decodes
+into a fixed 150-byte temporary, and delegates to the existing strict DER
+and provider key checks. It does not match a key to a certificate. Its
+borrowed input cap is 16 KiB; malformed/over-limit material returns Invalid,
+while caller certificate output shortage returns Capacity. The temporary
+clears on normal return, returned error and Rust unwind, with black_box after
+clearing. That supplies ordinary hygiene only: decoded quantum temporaries,
+registers, caller input and compiler copies may remain, and abort/kill can
+bypass cleanup. Backend key construction still allocates and retains the
+native failure limits above.
+
+Tests compare certificate decoding with the already admitted backend's PEM
+reader over padding, byte-value and DER-length boundaries; local generated
+keys compare decoded PKCS#8 and public points. Exact input/count/DER limits,
+truncations, malformed envelopes/padding, retry and output preservation run
+in host tests and the isolated portable artifact. Syntax acceptance does
+not validate X.509 or complete the TLS allocation/stack/RSS qualification.
 
 ### Mutual TLS backend qualification
 

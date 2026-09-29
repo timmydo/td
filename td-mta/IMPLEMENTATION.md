@@ -652,10 +652,13 @@ verified TLS.
 
 Implement the remaining work as independently reviewable increments:
 
-- **M07b1 — material syntax:** bounded PEM/base64 decoding into caller buffers
-  and strict key/chain envelopes. Reject malformed input, wrong labels, extra
+- **M07b1 — material syntax:** implemented bounded PEM/base64 decoding into
+  caller buffers and strict key/chain envelopes. Reject malformed input, wrong labels, extra
   keys, noncanonical padding and byte/count overflow. Decoded DER is not a
-  verified identity. No listener/config publication in this increment.
+  verified identity. The P-256 PEM loader delegates to existing key validation;
+  borrowed certificate readers validate all envelopes before publication.
+  Host and portable tests cover independent decoding, exact limits and retry.
+  No listener/config publication in this increment.
 - **M07b2 — identity admission:** local key/leaf agreement, chain consistency,
   dates, SAN coverage and usage checks; explicit private/public trust handling.
   Use local generated fixtures for wrong keys, missing names, stale clocks,

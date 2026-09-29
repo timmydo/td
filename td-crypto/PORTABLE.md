@@ -234,8 +234,8 @@ must select exactly one expected binary/test profile. All four results must be
 x86-64 static PIEs with an executable entry point and no ELF interpreter,
 DT_NEEDED or runtime search path. A second fresh namespace mounts only the
 result and static test supervisor, then runs the installed name's version command
-and each SHA-256, mail-format, entropy, provider-construction, TLS and configuration-stack smoke
-case in its own process.
+and each SHA-256, mail-format, PEM, entropy, provider-construction, TLS and
+configuration-stack smoke case in its own process.
 It has no compiler, root-data file, loader or library mounts. Each runtime command has a
 30-second deadline; each Cargo command has a 20-minute deadline. Parsed Cargo
 stdout is limited to 8 MiB (graphs to 256 KiB); each JSON record is limited to
@@ -503,3 +503,13 @@ The doc/release-condition fixtures first compile without the guard, then
 require the cfg error. Foreign-type cases require the private-dependency error;
 except for the omitted dyn impls, their valid JSON must also reject the foreign
 reference. Exported macros are rejected by the graph.
+
+## PEM syntax qualification
+
+The crypto smoke artifact also runs the bounded PEM fixtures: canonical
+base64 and unchanged error output, independent certificate decoding,
+complete-envelope validation and short-buffer retry, exact byte/count/DER
+limits, and generated P-256 PEM loading/refusals. These operate on in-memory
+fixtures and use the already admitted PEM reader as an independent decoding
+oracle. No certificate trust, identity publication or service resource
+qualification is implied.

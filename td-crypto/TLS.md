@@ -3,7 +3,9 @@
 ## Status and ownership
 
 This is the M07 contract for the future public TLS facade. It does not claim
-that its types, material loader or sessions are implemented. The existing
+that its configurations, identity admission or sessions are implemented.
+Bounded PEM syntax and P-256 PEM key loading are implemented; DESIGN.md
+records their narrower acceptance and output contract. The existing
 private TLS fixtures qualify selected backend behavior only. Implementations
 must satisfy this contract and the resource/failure qualification in
 DESIGN.md before td-mta enables a listener or an outgoing connection through
