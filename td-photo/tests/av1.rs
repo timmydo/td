@@ -47,6 +47,44 @@ fn picture(width: usize, height: usize) -> Vec<u8> {
     rgb
 }
 
+/// Ramps from black to a colour in 32-pixel cells, each cell's colour
+/// and direction its own, so chroma follows luma with every sign in
+/// blocks on and past the picture's edges.
+fn hues(width: usize, height: usize) -> Vec<u8> {
+    const COLOURS: [[i32; 3]; 12] = [
+        [0, 0, 255],
+        [255, 0, 0],
+        [255, 0, 255],
+        [0, 255, 0],
+        [0, 255, 255],
+        [255, 255, 0],
+        [255, 128, 0],
+        [128, 128, 255],
+        // One chroma plane flat under BT.601: Cr twice, then Cb twice.
+        [100, 70, 255],
+        [200, 239, 0],
+        [255, 0, 86],
+        [0, 200, 132],
+    ];
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        for x in 0..width {
+            let cell = x / 32 * 5 + y / 32 * 3;
+            let colour = COLOURS[cell % COLOURS.len()];
+            let (u, v) = (x % 32, y % 32);
+            let t = match cell % 3 {
+                0 => u,
+                1 => v,
+                _ => (u + v) / 2,
+            } as i32;
+            for c in colour {
+                rgb.push((16 + c * t / 40) as u8);
+            }
+        }
+    }
+    rgb
+}
+
 /// Encodes a synthetic picture, feeding rows in uneven pieces.
 fn encode(width: usize, height: usize, quality: u8, threads: usize) -> (Vec<u8>, Reconstruction) {
     encode_tiled(width, height, quality, threads, 0)
@@ -60,7 +98,25 @@ fn encode_tiled(
     threads: usize,
     rows_log2: u32,
 ) -> (Vec<u8>, Reconstruction) {
-    let rgb = picture(width, height);
+    encode_rgb(
+        &picture(width, height),
+        width,
+        height,
+        quality,
+        threads,
+        rows_log2,
+    )
+}
+
+/// `encode_tiled` of a given picture.
+fn encode_rgb(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    quality: u8,
+    threads: usize,
+    rows_log2: u32,
+) -> (Vec<u8>, Reconstruction) {
     let geometry = Geometry::tiled(width, height, rows_log2).unwrap();
     let mut encoder = Encoder::with_geometry(geometry, quality, threads).unwrap();
     encoder.keep_reconstruction();
@@ -225,15 +281,32 @@ fn every_shape_codes_and_decodes_to_the_encoders_own_reconstruction() {
         let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
         assert_eq!(reconstruction.planes[0].len(), width * height);
         assert_eq!(reconstruction.planes[1].len(), cw * ch);
-        if let Some(decoded) = dav1d(&obus, &name) {
-            let mut planes = Vec::new();
-            for plane in &reconstruction.planes {
-                planes.extend_from_slice(plane);
-            }
-            assert_eq!(decoded.len(), planes.len(), "{name}");
-            let mismatch = decoded.iter().zip(&planes).position(|(a, b)| a != b);
-            assert_eq!(mismatch, None, "{name}: dav1d differs from the encoder");
+        decodes_as_reconstructed(&obus, &reconstruction, &name);
+    }
+}
+
+/// Asserts dav1d's decode is the encoder's reconstruction, if it runs.
+fn decodes_as_reconstructed(obus: &[u8], reconstruction: &Reconstruction, name: &str) {
+    if let Some(decoded) = dav1d(obus, name) {
+        let mut planes = Vec::new();
+        for plane in &reconstruction.planes {
+            planes.extend_from_slice(plane);
         }
+        assert_eq!(decoded.len(), planes.len(), "{name}");
+        let mismatch = decoded.iter().zip(&planes).position(|(a, b)| a != b);
+        assert_eq!(mismatch, None, "{name}: dav1d differs from the encoder");
+    }
+}
+
+#[test]
+fn chroma_from_luma_decodes_with_every_sign_and_past_the_edges() {
+    // Colour ramps make chroma from luma win with each pair of alpha
+    // signs, in 32-pixel blocks the right and bottom edges cut.
+    for (width, height, quality) in [(184, 120, 40), (184, 120, 80), (90, 250, 60)] {
+        let name = format!("h{width}x{height}q{quality}");
+        let rgb = hues(width, height);
+        let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, 1, 0);
+        decodes_as_reconstructed(&obus, &reconstruction, &name);
     }
 }
 
@@ -393,9 +466,9 @@ fn fnv(bytes: &[u8]) -> u64 {
 #[test]
 fn the_streams_are_the_bytes_dav1d_decoded() {
     for (width, height, quality, rows_log2, hash) in [
-        (65, 33, 30, 0, 0x86982f58633816a8u64),
-        (520, 40, 60, 0, 0x827667d5d4a3227a),
-        (200, 200, 75, 1, 0x1503b8348e390a16),
+        (65, 33, 30, 0, 0x5db5f3dd0486061fu64),
+        (520, 40, 60, 0, 0x1dcd86b7b35f2d5d),
+        (200, 200, 75, 1, 0xdea43fb26b4b7f7e),
     ] {
         let name = format!("g{width}x{height}q{quality}r{rows_log2}");
         let (obus, reconstruction) = encode_tiled(width, height, quality, 1, rows_log2);

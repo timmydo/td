@@ -1257,9 +1257,11 @@ block is ever a leaf, since there is no 64-point transform here), one
 transform the block's size (`TX_MODE_LARGEST`, the reduced transform
 set: a luma block below 32 may signal any of the four DCT and ADST
 pairs, chroma's is the one its mode implies, `DCT_DCT` at 32), the
-thirteen intra modes without an angle delta, filter, palette or
-chroma-from-luma, deblocking but no CDEF, restoration, superres or
-film grain, and the symbol adaptation the spec runs by default. The quality
+thirteen intra modes without an angle delta, filter or palette and,
+for chroma, its prediction from the block's luma (each plane's alpha
+the least-squares fit in eighths, it and its neighbours tried by
+squared error), deblocking but no CDEF, restoration, superres or film
+grain, and the symbol adaptation the spec runs by default. The quality
 maps to `qindex` as `255 - ((q - 1) * 254 + 49) / 99`, the dead-zone
 quantiser rounds the DC at half a step and each AC at three eighths,
 a trellis then walks each transform's levels from the end of block
@@ -1274,12 +1276,14 @@ scale libaom's distortion and `rdmult` share, the rate the coder's own
 cost of its symbols under the tile's live probabilities): the modes are
 screened by the 4x4 Hadamard SATD of their predictions plus their mode
 symbols' rate under sixteen times the root of the multiplier, the best
-three (two for chroma, one mode for both planes) coded in full and
-compared with their mode's rate, then the chosen luma mode coded under
-the other transform types when it left any coefficient, and a
-superblock's partition is decided by trials that save and restore the
-contexts and pixels they touch before the chosen tree is emitted, so the
-decoder's state is the encoder's exactly. The frame is tiled
+three (for chroma, one mode for both planes, the closest two and the
+prediction from luma if it is not one of them, since the screen ranks
+it below what coding it measures) coded in full and compared with
+their mode's rate, then the chosen luma mode coded under the other
+transform types when it left any coefficient, and a superblock's
+partition is decided by trials that save and restore the contexts and
+pixels they touch before the chosen tree is emitted, so the decoder's
+state is the encoder's exactly. The frame is tiled
 uniformly by its size alone, so the bytes are the same whatever the
 thread count, as the JPEG encoder's are: as many tile columns as the
 width allows while the uniform column stays four superblocks wide (the
@@ -1320,12 +1324,12 @@ few on eight (`tests/av1.rs`'s `bench`). Against libaom's all-intra speed 6
 on a real 2048-pixel photo the encoder needs under 1% more bits for the
 same PSNR from 0.3 to 3 bits a pixel and about 8% below that; the
 compression follow-ups, by what libaom's tools measured there, are
-chroma-from-luma, rectangular partitions and transforms, CDEF (most at
-low rates) and angle deltas. Measured before the trellis priced the
-zeros an end of block passes over: zeroing a transform's few levels
-outright bought luma about 2% but cost RGB 3% at low rates, a chroma
-weight trading one for the other, and coding more luma modes in full
-bought under 1% on luma for half again the time.
+rectangular partitions and transforms, CDEF (most at low rates) and
+angle deltas. Measured before the trellis priced the zeros an end of
+block passes over: zeroing a transform's few levels outright bought
+luma about 2% but cost RGB 3% at low rates, a chroma weight trading
+one for the other, and coding more luma modes in full bought under 1%
+on luma for half again the time.
 
 The AVIF (`avif::file`) is the least HEIF file the format asks for and
 every reader expects: `ftyp` with the `avif` brand and `mif1`, `miaf`
@@ -1869,8 +1873,10 @@ superblocks of every edge, one pixel, a frame wider than a tile, tile
 columns and two and five tile rows on one and two threads, each coding
 to a stream whose reconstruction is the encoder's own and, with
 `TD_TEST_DAV1D` naming a dav1d binary, decoded by it to the same bytes
-exactly; three streams held to the hashes recorded under that decode,
-the same bytes on one thread and three; the stream's sequence header
+exactly, as are colour ramps that make chroma from luma code every
+pair of alpha signs in blocks both edges cut; three streams held to
+the hashes recorded under that decode, the same bytes on one thread
+and three; the stream's sequence header
 and the frame header's opening field by field, the quality buying luma
 PSNR and costing bytes; the rows refused by name; and the container's
 extent read back as the stream and decoded. The transforms' unit
@@ -1880,10 +1886,10 @@ their ends; the coder's unit tests round-trip symbols and bits through a
 transcription of the spec's decoder, pin the adaptation, the bit writer,
 `leb128` and the OBU framing, the trailing-bit rule (spec 8.2.4, which
 libaom's decoder enforces), the end-of-block classes and the predictors
-by value, and hold the trellis's prices to what the coder counts for
-random blocks of every size and its levels to the quantizer's or one
-below with an end of block that matches them; `avif`'s hold every box
-to its bytes.
+by value, chroma from luma's signed rounding among them, and hold the
+trellis's prices to what the coder counts for random blocks of every
+size and its levels to the quantizer's or one below with an end of
+block that matches them; `avif`'s hold every box to its bytes.
 
 `tests/nef.rs`'s third command case runs `export` with `--long-edge`,
 `--quality` and `--format` over a temporary roll (the export shrunk with

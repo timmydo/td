@@ -7,12 +7,12 @@
 //!
 //! What the encoder uses of AV1: 64x64 superblocks split down to square
 //! blocks of 32, 16 and 8 pixels by rate-distortion choice; every intra
-//! mode but CfL, palette and filter-intra; for luma below 32 the best
-//! of the reduced set's four DCT and ADST pairs, for chroma the mode's
-//! default; one transform per plane per block, its levels a dead-zone
-//! quantizer's refined by a trellis; the multi-symbol arithmetic coder
-//! with adapting CDFs from the defaults; uniform tile columns by the
-//! frame's size alone, which the threads spread over.
+//! mode, chroma from luma included, but palette and filter-intra; for
+//! luma below 32 the best of the reduced set's four DCT and ADST pairs,
+//! for chroma the mode's default; one transform per plane per block, its
+//! levels a dead-zone quantizer's refined by a trellis; the multi-symbol
+//! arithmetic coder with adapting CDFs from the defaults; uniform tile
+//! columns by the frame's size alone, which the threads spread over.
 //! The deblocking filter is on at a level from the quantizer; CDEF,
 //! restoration, superres, film grain and screen-content tools stay off.
 //! `transform` holds the transforms, quantizers and scans, `cdf` the
@@ -77,7 +77,10 @@ const SMOOTH_PRED: u8 = 9;
 const SMOOTH_V_PRED: u8 = 10;
 const SMOOTH_H_PRED: u8 = 11;
 const PAETH_PRED: u8 = 12;
-/// How many of the screened modes are coded in full, luma and chroma.
+/// Chroma's prediction from the block's luma, a chroma mode only.
+const UV_CFL_PRED: u8 = 13;
+/// How many of the screened modes are coded in full, luma and chroma;
+/// chroma from luma is coded beside chroma's too.
 const LUMA_TRIALS: usize = 3;
 const CHROMA_TRIALS: usize = 2;
 /// Every mode the encoder tries, luma and chroma alike.
@@ -96,6 +99,8 @@ const MODES: [u8; 13] = [
     SMOOTH_H_PRED,
     PAETH_PRED,
 ];
+// Chroma from luma takes its DC prediction from the first mode's slot.
+const _: () = assert!(MODES[0] == DC_PRED);
 
 /// The spec's `Mode_To_Angle`.
 fn mode_angle(mode: u8) -> i32 {
@@ -272,6 +277,8 @@ const PROB_COST: [u16; 128] = [
 struct Cdfs {
     y_mode: [[Cdf; 5]; 5],
     uv_mode: [Cdf; 13],
+    cfl_sign: Cdf,
+    cfl_alpha: [Cdf; 6],
     angle_delta: [Cdf; 8],
     partition_8: [Cdf; 4],
     partition: [[Cdf; 4]; 3],
@@ -328,6 +335,8 @@ impl Cdfs {
         Cdfs {
             y_mode: table2(&cdf::KF_Y_MODE),
             uv_mode: uv,
+            cfl_sign: Cdf::new(&cdf::CFL_SIGN),
+            cfl_alpha: table(&cdf::CFL_ALPHA),
             angle_delta: table(&cdf::ANGLE_DELTA),
             partition_8: table(&cdf::PARTITION_8),
             partition: table2(&cdf::PARTITION),
@@ -1201,6 +1210,8 @@ struct Work {
     coeffs: Vec<i32>,
     dequant: Vec<i32>,
     mags: Magnitudes,
+    /// Chroma from luma's luma, less its average.
+    ac: Vec<i32>,
 }
 
 /// One plane's quantized levels in the transform's row-major layout,
@@ -1272,6 +1283,9 @@ struct Leaf {
     skip: bool,
     y_mode: u8,
     uv_mode: u8,
+    /// The chroma-from-luma alphas of U and V in eighths, when `uv_mode`
+    /// is `UV_CFL_PRED`.
+    cfl: [i8; 2],
     tx_type: TxType,
     /// Per plane: quantized levels in the transform's row-major layout
     /// and the end of block in scan order (0 for none).
@@ -1732,6 +1746,7 @@ impl Tile {
             skip: false,
             y_mode: DC_PRED,
             uv_mode: DC_PRED,
+            cfl: [0; 2],
             tx_type: TxType::DctDct,
             levels: [Vec::new(), Vec::new(), Vec::new()],
             eob: [0; 3],
@@ -1806,8 +1821,9 @@ impl Tile {
         let n = side / 2;
         let area = n * n;
         let (edges_u, edges_v) = (self.pred_edges(1, at), self.pred_edges(2, at));
-        let chroma = grown(preds, MODES.len() * area * 2);
-        for (k, ((slot, &mode), pred)) in screened
+        let chroma = grown(preds, (MODES.len() + 1) * area * 2);
+        let mut screened_uv = [(u64::MAX, DC_PRED, 0usize); MODES.len() + 1];
+        for (k, ((slot, &mode), pred)) in screened_uv
             .iter_mut()
             .zip(&MODES)
             .zip(chroma.chunks_exact_mut(area * 2))
@@ -1817,21 +1833,56 @@ impl Tile {
             predict_block(mode, &edges_u, u);
             predict_block(mode, &edges_v, v);
             let mut counter = Counter(0);
-            self.uv_mode_symbols(&mut counter, y_mode, mode);
+            self.uv_mode_symbols(&mut counter, y_mode, mode, [0; 2]);
             let satd = self.satd(1, at, u) + self.satd(2, at, v);
             *slot = (self.screen(satd, counter.0), mode, k);
         }
-        screened.sort_unstable();
+        // Chroma from luma: each plane's DC prediction, the first of the
+        // modes, and its alpha against the luma just reconstructed.
+        let k = MODES.len();
+        let mut cfl = [0i8; 2];
+        self.cfl_ac(at, &mut work.ac);
+        if let (Some((dc, rest)), Some(slot)) = (
+            chroma.split_at_mut_checked(area * 2),
+            screened_uv.get_mut(k),
+        ) {
+            let out = rest
+                .get_mut((k - 1) * area * 2..k * area * 2)
+                .unwrap_or(&mut []);
+            if out.len() == area * 2 {
+                let (dc_u, dc_v) = dc.split_at(area);
+                let (u, v) = out.split_at_mut(area);
+                cfl = [
+                    self.cfl_alpha(1, at, dc_u, &work.ac, u),
+                    self.cfl_alpha(2, at, dc_v, &work.ac, v),
+                ];
+                if cfl != [0, 0] {
+                    cfl_predict(dc_u, &work.ac, cfl[0], u);
+                    cfl_predict(dc_v, &work.ac, cfl[1], v);
+                    let mut counter = Counter(0);
+                    self.uv_mode_symbols(&mut counter, y_mode, UV_CFL_PRED, cfl);
+                    let satd = self.satd(1, at, u) + self.satd(2, at, v);
+                    *slot = (self.screen(satd, counter.0), UV_CFL_PRED, k);
+                }
+            }
+        }
+        screened_uv.sort_unstable();
         let mut uv_mode = None;
         let mut best_score = u64::MAX;
-        for &(_, mode, k) in screened.iter().take(CHROMA_TRIALS) {
+        // The closest few and chroma from luma, which the screen ranks
+        // below what coding it measures.
+        for (i, &(score, mode, k)) in screened_uv.iter().enumerate() {
+            if score == u64::MAX || (i >= CHROMA_TRIALS && mode != UV_CFL_PRED) {
+                continue;
+            }
             let pred = chroma.get(k * area * 2..(k + 1) * area * 2).unwrap_or(&[]);
             let (pu, pv) = pred.split_at(area.min(pred.len()));
             let tx = mode_tx_type(mode, plane_size(at.log2, 1));
             self.code_plane(1, at, mode, tx, pu, work, trial_u);
             self.code_plane(2, at, mode, tx, pv, work, trial_v);
+            let alphas = if mode == UV_CFL_PRED { cfl } else { [0; 2] };
             let mut counter = Counter(0);
-            self.uv_mode_symbols(&mut counter, y_mode, mode);
+            self.uv_mode_symbols(&mut counter, y_mode, mode, alphas);
             let score = trial_u
                 .cost
                 .saturating_add(trial_v.cost)
@@ -1848,6 +1899,9 @@ impl Tile {
         };
         let uv_cost = best_u.cost.saturating_add(best_v.cost);
         leaf.uv_mode = uv_mode;
+        if uv_mode == UV_CFL_PRED {
+            leaf.cfl = cfl;
+        }
         self.write_recon(1, at, &best_u.recon);
         self.write_recon(2, at, &best_v.recon);
         leaf.levels[1] = std::mem::take(&mut best_u.levels);
@@ -2135,7 +2189,7 @@ impl Tile {
             sink.symbol(cdf, usize::from(leaf.skip));
         }
         self.y_mode_symbols(sink, leaf.at, leaf.y_mode);
-        self.uv_mode_symbols(sink, leaf.y_mode, leaf.uv_mode);
+        self.uv_mode_symbols(sink, leaf.y_mode, leaf.uv_mode, leaf.cfl);
     }
 
     /// The luma mode's symbols of a block at the position: `y_mode` under
@@ -2178,15 +2232,122 @@ impl Tile {
 
     /// The chroma mode's symbols under the luma mode: `uv_mode` and, for
     /// a directional one, a zero angle delta.
-    fn uv_mode_symbols(&mut self, sink: &mut impl Sink, y_mode: u8, uv_mode: u8) {
+    fn uv_mode_symbols(&mut self, sink: &mut impl Sink, y_mode: u8, uv_mode: u8, cfl: [i8; 2]) {
         if let Some(cdf) = self.cdfs.uv_mode.get_mut(usize::from(y_mode)) {
             sink.symbol(cdf, usize::from(uv_mode));
+        }
+        if uv_mode == UV_CFL_PRED {
+            // read_cfl_alphas: the joint sign (0 zero, 1 negative, 2
+            // positive, never both zero), then each nonzero magnitude
+            // under its own sign and the other's.
+            let sign = |a: i8| -> usize {
+                match a.signum() {
+                    -1 => 1,
+                    1 => 2,
+                    _ => 0,
+                }
+            };
+            let (sign_u, sign_v) = (sign(cfl[0]), sign(cfl[1]));
+            sink.symbol(
+                &mut self.cdfs.cfl_sign,
+                (sign_u * 3 + sign_v).saturating_sub(1),
+            );
+            for (alpha, own, other) in [(cfl[0], sign_u, sign_v), (cfl[1], sign_v, sign_u)] {
+                if own == 0 {
+                    continue;
+                }
+                if let Some(cdf) = self.cfl_alpha_cdf(own, other) {
+                    sink.symbol(cdf, usize::from(alpha.unsigned_abs()).saturating_sub(1));
+                }
+            }
         }
         if is_directional(uv_mode) {
             if let Some(cdf) = self.cdfs.angle_delta.get_mut(usize::from(uv_mode - V_PRED)) {
                 sink.symbol(cdf, 3);
             }
         }
+    }
+
+    /// The `cfl_alpha` CDF of an alpha with a nonzero sign under the
+    /// other's sign.
+    fn cfl_alpha_cdf(&mut self, own: usize, other: usize) -> Option<&mut Cdf> {
+        self.cdfs.cfl_alpha.get_mut(own.checked_sub(1)? * 3 + other)
+    }
+
+    /// The block's luma reconstruction as chroma-from-luma reads it
+    /// (spec 7.11.5, 4:2:0): each 2x2 summed and doubled, eight times
+    /// the mean, less the block's average, into `ac`. The block's luma is
+    /// decoded whole, its one transform starting in the picture, so no
+    /// edge is padded.
+    fn cfl_ac(&self, at: At, ac: &mut Vec<i32>) {
+        let n = at.side() / 2;
+        let x = at.mi_col * MI;
+        let y = (at.mi_row - self.band_mi_row) * MI;
+        ac.clear();
+        let Some(luma) = self.recon.first() else {
+            return;
+        };
+        for r in 0..n {
+            let top = luma.row(y + 1 + 2 * r);
+            let bottom = luma.row(y + 2 + 2 * r);
+            for c in 0..n {
+                let at =
+                    |row: &[u8], k: usize| i32::from(row.get(x + 2 * c + k).copied().unwrap_or(0));
+                ac.push((at(top, 0) + at(top, 1) + at(bottom, 0) + at(bottom, 1)) << 1);
+            }
+        }
+        let log2 = 2 * n.ilog2();
+        let sum: i32 = ac.iter().sum();
+        let average = (sum + ((1 << log2) >> 1)) >> log2;
+        for a in ac.iter_mut() {
+            *a -= average;
+        }
+    }
+
+    /// The alpha, in eighths within 16, whose prediction from `dc` and
+    /// `ac` is closest to the plane's source: the least-squares fit
+    /// rounded, then it and its neighbours by squared error, the smaller
+    /// magnitude, which usually codes in fewer bits, on a tie.
+    fn cfl_alpha(&self, plane: usize, at: At, dc: &[u8], ac: &[i32], pred: &mut [u8]) -> i8 {
+        let n = at.side() / 2;
+        let x = (at.mi_col * MI) >> 1;
+        let y = ((at.mi_row - self.band_mi_row) * MI) >> 1;
+        let Some(source) = self.source.get(plane) else {
+            return 0;
+        };
+        let (mut num, mut den) = (0i64, 0i64);
+        for (r, (drow, arow)) in dc.chunks_exact(n).zip(ac.chunks_exact(n)).enumerate() {
+            let srow = source.row(y + r).get(x..x + n).unwrap_or(&[]);
+            for ((&s, &d), &a) in srow.iter().zip(drow).zip(arow) {
+                num += i64::from(a) * (i64::from(s) - i64::from(d));
+                den += i64::from(a) * i64::from(a);
+            }
+        }
+        if den == 0 {
+            return 0;
+        }
+        // scaled = alpha * ac / 64, so the fit is 64 num / den.
+        let fit = ((num * 128 / den) + (num * 128 / den).signum()) / 2;
+        let fit = fit.clamp(-16, 16) as i8;
+        let mut best = (u64::MAX, 0i8);
+        for alpha in [fit - 1, fit, fit + 1] {
+            if !(-16..=16).contains(&alpha) {
+                continue;
+            }
+            cfl_predict(dc, ac, alpha, pred);
+            let mut sse = 0u64;
+            for (r, prow) in pred.chunks_exact(n).enumerate() {
+                let srow = source.row(y + r).get(x..x + n).unwrap_or(&[]);
+                for (&s, &p) in srow.iter().zip(prow) {
+                    let d = i64::from(s) - i64::from(p);
+                    sse += (d * d) as u64;
+                }
+            }
+            if (sse, alpha.unsigned_abs()) < (best.0, best.1.unsigned_abs()) {
+                best = (sse, alpha);
+            }
+        }
+        best.1
     }
 
     /// The `dc_sign` context of one plane of a block: which way the DC
@@ -2802,6 +2963,20 @@ fn base_eob_ctx(c: usize, n: usize) -> usize {
 }
 
 // --------------------------------------------------- prediction kernels
+
+/// Chroma from luma's prediction (spec 7.11.5): the DC prediction plus
+/// the alpha, in eighths, of the luma's AC, eight times the luma.
+fn cfl_predict(dc: &[u8], ac: &[i32], alpha: i8, out: &mut [u8]) {
+    for ((o, &d), &a) in out.iter_mut().zip(dc).zip(ac) {
+        let scaled = i32::from(alpha) * a;
+        let scaled = if scaled < 0 {
+            -((-scaled + 32) >> 6)
+        } else {
+            (scaled + 32) >> 6
+        };
+        *o = (i32::from(d) + scaled).clamp(0, 255) as u8;
+    }
+}
 
 /// The first `len` of a buffer that only grows.
 fn grown<T: Copy + Default>(buffer: &mut Vec<T>, len: usize) -> &mut [T] {
@@ -3649,6 +3824,21 @@ mod tests {
         assert_eq!(mode_tx_type(H_PRED, Size::S16), TxType::DctAdst);
         assert_eq!(mode_tx_type(V_PRED, Size::S32), TxType::DctDct);
         assert_eq!(mode_tx_type(D45_PRED, Size::S4), TxType::DctDct);
+    }
+
+    #[test]
+    fn chroma_from_luma_scales_the_ac_by_eighths_and_rounds_away_from_zero() {
+        // Round2Signed(alpha * ac, 6) on the DC: halves round away from
+        // zero alike for either sign, and the sum clips to the pixel.
+        let dc = [100u8; 6];
+        let ac = [32, -32, 31, -31, 400, -400];
+        let mut out = [0u8; 6];
+        cfl_predict(&dc, &ac, 1, &mut out);
+        assert_eq!(out, [101, 99, 100, 100, 106, 94]);
+        cfl_predict(&dc, &ac, -16, &mut out);
+        assert_eq!(out, [92, 108, 92, 108, 0, 200]);
+        cfl_predict(&[250; 6], &ac, 16, &mut out);
+        assert_eq!(out[4], 255);
     }
 
     #[test]
