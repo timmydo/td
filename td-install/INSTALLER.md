@@ -61,8 +61,8 @@ mounts, then builds with the target Rust toolchain. The check runs
 frame without emitting its image bytes.
 This establishes an image-eligible executable whose window presents only
 the welcome page. Its library also has pure, unconnected destination,
-settings and review views. The release live profile must wait for the
-remaining wizard pages, its paired service, trusted consent, and end-to-end
+settings, review, progress and completion views. The release live profile
+must wait for navigation, its paired service, trusted consent, and end-to-end
 installation evidence.
 
 The destination page is a pure view over `Destination` values supplied by
@@ -94,6 +94,16 @@ detail pages. The destructive-loss and unencrypted automatic-login notices
 remain visible on every page. It cannot authenticate the source, establish a
 disk claim or authorize execution; the service and compositor-owned trusted
 consent remain mandatory. It is not yet connected to the live window.
+
+The pure progress view renders service-supplied phases and a bounded failure
+reason. It shows an unknown outcome when service status is unavailable, never
+infers success from a queued request, and warns that a failed disk may be
+incomplete and requires a new review before retry. The completion view
+instructs the user to remove installation media and reboot; the caller may
+show it only after the service reports durable filesystem and deployment
+publication, verified boot artifacts, and settings publication. The orderly
+reboot offer still belongs to live navigation. Neither view is yet connected
+to the live window.
 
 Disk enumeration is read-only and bounded. Show model, serial when supplied
 by the device, capacity and a distinguishing device identifier. These are

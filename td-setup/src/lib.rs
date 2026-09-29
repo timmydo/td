@@ -6,12 +6,13 @@
 //! toolkit's raster and chrome bands, following td-install/INSTALLER.md.
 //!
 //! The `window` turn loop currently presents the welcome page. The pure
-//! destination, settings and review views render bounded inputs but are
-//! not yet connected to that loop. The privileged disk writer stays in
-//! td-install; this front end holds no disk-writing authority
-//! (INSTALLER.md). The remaining pages and navigation follow later.
+//! destination, settings, review and outcome views render bounded inputs
+//! but are not yet connected to that loop. The privileged disk writer
+//! stays in td-install; this front end holds no disk-writing authority
+//! (INSTALLER.md). Navigation and service wiring follow later.
 
 pub mod destination;
+pub mod outcome;
 pub mod review;
 pub mod settings;
 pub mod welcome;
