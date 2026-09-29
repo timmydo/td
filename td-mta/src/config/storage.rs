@@ -425,6 +425,9 @@ const _: [(); 1] = [(); (size_of::<super::resources::Validated>() <= PLANS_BYTES
 const _: [(); 1] = [(); (size_of::<graph::Header>() <= 1024) as usize];
 const _: [(); 1] = [(); (size_of::<identities::Header>() <= 128) as usize];
 impl Candidate {
+    pub(super) fn input_owner(&self) -> Result<std::num::NonZeroU64, dispatch::Error> {
+        Ok(self.text()?.owner())
+    }
     fn text(&self) -> Result<text::View<'_>, dispatch::Error> {
         self.header
             .text

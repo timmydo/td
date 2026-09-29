@@ -460,10 +460,14 @@ Split at these concrete boundaries before dependent milestones start:
     bounded Interrupted retries, fixed redacted failures and borrowed output;
     SCHEMA.md specifies password-file bytes. Sized to reuse stream scratch.
     This adds no filesystem trust, candidate finalization or CLI success.
-  - **M04b3b:** remaining protected-reference inventory and M05 adapter
-    contract, exclusive finalization, resolved spans, identity materialization
-    and preimage encoding, plus streamed redacted effective output. Qualify
-    each new compiled path and combined memory before service integration.
+  - **M04b3b1:** implemented bounded referenced-file inventory, role-specific
+    raw caps and private-mode requirements. Owner-bound cursor callbacks
+    release candidate borrows between requests and refuse stale reuse;
+    requests establish no file trust. SCHEMA.md defines M05's checks.
+  - **M04b3b2:** remaining M05 adapter integration, exclusive finalization,
+    resolved spans, identity materialization and preimage encoding, plus
+    streamed redacted effective output. Qualify each new compiled path and
+    combined memory before service integration.
 - **M04c1:** checked u64 disk/work settings and capacity-derived maintenance
   validation in `admission.rs`; configuration uses this committed plan.
 - **M04c2:** charged work meters in `admission/work.rs` and checked

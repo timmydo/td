@@ -7,6 +7,7 @@ pub mod globals;
 pub mod graph;
 pub mod identities;
 pub mod identity;
+pub mod inputs;
 pub mod listener;
 pub mod load;
 pub mod material;

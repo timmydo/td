@@ -378,6 +378,59 @@ generations or uncharged trust cache. M03/M07 must prove provider allocation
 bounds and old/new/session overlap before enabling material loading; bounded
 input alone is not that proof.
 
+### Referenced-file requirements
+
+M04b3b1's `config::inputs` inventory labels each operator reference and its
+raw byte ceiling from the sections above. It includes optional explicit
+relay/ACME trust, every files-profile key/chain and every gateway CA, even
+an unused gateway. Absent signatures/default public roots add no reference.
+ACME-managed keys and renewed chains are service state, not operator inputs.
+Identical paths used for different roles retain separate inventory entries.
+Before any resolved input is exposed, M05 must reject a file used both as a
+secret (relay password/private key) and as a non-secret input (including the
+main configuration). Compare opened device/inode identities, not only path
+strings, so hard links cannot bypass this separation. The inventory itself
+does not perform that check. Combined key/chain PEM files are unsupported;
+keep the key in its separate private file. Successful permission checks
+alone cannot authorize exposing a secret as a signature.
+
+M05 must validate the opened regular file and its pinned ancestor chain.
+Each owner must be root or the deployment's actual service UID; reject
+symlink components and group/other-writable files or ancestors, including
+sticky writable ancestors. Reject execute and special bits on input files.
+Relay passwords and private keys additionally require no group/other
+permissions (`0400` or `0600` with owner read access). Other roles can be
+readable by group/others, but retain every ownership and write-protection
+check. `requires_private_mode=false` does not waive those checks. The UID
+comes from the trusted process/deployment context, never an input reference.
+Open/read checks run with the same unprivileged service credentials for
+`config check` and service startup; a privileged check is not a substitute.
+Root ownership is allowed only when that service can actually read the file.
+Prefer root-owned input directories and non-secret files readable by the
+service; secret files normally belong to the service UID. The ownership
+rules exclude other UIDs, not compromise of the trusted service UID itself.
+Use physical paths: symlink aliases under `/etc` gain no special exception.
+
+These are adapter requirements, not properties established by the inventory.
+Checking pathname metadata before opening is insufficient; validate the
+actual descriptors used for reading. Refuse non-regular objects before a
+read-capable open can block on a FIFO or trigger device behavior; checking
+only after a potentially blocking open is insufficient. M05 must specify
+and review the concrete descriptor-opening mechanism and its syscall
+surface before implementation; this inventory introduces neither.
+Operators replace input files atomically and do not mutate their contents
+in place during validation. Untrusted concurrent writers to operator inputs
+are unsupported under this contract's ownership/write-protection rules.
+Metadata length
+is only a hint; bounded reading and actual EOF establish the raw byte limit.
+All material still obeys the aggregate text/provider budgets above.
+
+The main configuration file is a separate initial operator input, using the
+same ownership, ancestor and non-secret mode rules plus CONFIG.md's source
+limit. This inventory begins with a structural candidate and does not open
+or inventory that original source file. Runtime trust, resolved contents,
+provider validation and publication remain later stages.
+
 ## 7. Gateway policies
 
 There are at most 16 `[gateway "NAME"]` policies. Each network gateway policy

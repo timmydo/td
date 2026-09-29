@@ -1480,3 +1480,44 @@ No second concurrent buffer is budgeted.
 New compiled finalizer/reader instances still need CONFIG.md's target stack
 qualification before service use. Provider inputs remain M07's separate
 certificate-generation ledger; this helper does not load keys or trust stores.
+
+## Referenced-file inventory
+
+M04b3b1 adds `config::inputs::Cursor` over an immutable structural Candidate.
+It stores a process-local text-owner ticket and a bounded scan position,
+without borrowing the candidate between calls. `visit_next` requires the
+same owner on every call, including after moving the candidate. Rebuilding
+reused storage issues a new ticket and refuses an old cursor before invoking
+its callback. This is request provenance only, not a file-trust credential.
+
+Each successful step invokes its callback at most once with a borrowed
+Reference and typed Target. The callback's reference cannot escape, while
+its result may borrow caller-owned scratch. This permits later exclusive
+finalization to read one input, release path borrows and then append the
+decoded bytes within the same arena. That mutation is not implemented here.
+Callback allocation, blocking, its own frames and side effects remain
+trusted caller responsibilities. Inventory frames remain live during a
+callback, including reopened graph Records for certificate/gateway inputs.
+M04b3b2's stack qualification must include those frames together with the
+callback and finalizer. No file is opened and no content is loaded by the
+inventory itself.
+
+Scanning is bounded by 179 slots: two per identity, relay password/CA,
+ACME CA, two per certificate and one per gateway. This is a conservative
+ceiling; some slots are mutually exclusive. Skip absent optional references,
+preserving distinct requests when several roles share a path. Identity order
+is ascending raw ID, text then HTML; then relay password/CA, ACME CA, profile
+chain/key pairs and gateway CAs in their stored index order. Indices identify
+this candidate only. ACME profiles do not yield managed key/chain requests.
+SCHEMA.md owns each raw cap and the M05 ownership/mode/ancestor requirements.
+
+Exhaustion remains None on repeated calls for the same owner; it proves only
+that the inventory was visited. Any callback, invariant or owner failure
+makes the cursor terminal, with subsequent calls returning FailedCursor.
+The cursor is terminal during dispatch too: catching a callback unwind does
+not allow continuation past the skipped input.
+Fixed `config_inputs_*` errors and Debug output contain no paths or arbitrary
+callback payload/source chains. Trusted callers can inspect the typed
+Callback variant explicitly. A structural candidate need not prove source
+EOF; finalization must still consume `load::Loaded`. The inventory grants no
+permission, resolved-input, provider or runtime publication authority.
