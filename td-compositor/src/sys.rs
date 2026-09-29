@@ -1912,6 +1912,21 @@ pub fn recv_with_fds(stream: &UnixStream, bytes: &mut [u8]) -> Result<Received, 
 }
 
 pub fn send_with_fd(stream: &UnixStream, bytes: &[u8], fd: RawFd) -> io::Result<()> {
+    let sent = send_prefix_with_fd(stream, bytes, fd)?;
+    if sent < bytes.len() {
+        let tail = bytes
+            .get(sent..)
+            .ok_or_else(|| io::Error::other("sendmsg byte count escaped message"))?;
+        let mut borrowed = stream;
+        borrowed.write_all(tail)?;
+    }
+    Ok(())
+}
+
+/// The one `sendmsg` that carries `fd` with the head of `bytes`, returning how
+/// many bytes it took. A caller that bounds its writes in time finishes the
+/// tail itself; the descriptor has left once this returns a count.
+pub fn send_prefix_with_fd(stream: &UnixStream, bytes: &[u8], fd: RawFd) -> io::Result<usize> {
     if bytes.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1979,14 +1994,7 @@ pub fn send_with_fd(stream: &UnixStream, bytes: &[u8], fd: RawFd) -> io::Result<
             "sendmsg returned invalid byte count {sent}"
         )));
     }
-    if sent < bytes.len() {
-        let tail = bytes
-            .get(sent..)
-            .ok_or_else(|| io::Error::other("sendmsg byte count escaped message"))?;
-        let mut borrowed = stream;
-        borrowed.write_all(tail)?;
-    }
-    Ok(())
+    Ok(sent)
 }
 
 /// Adopt a raw descriptor by reopening it through `/proc/self/fd/N` and closing

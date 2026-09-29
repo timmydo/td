@@ -178,6 +178,18 @@ const MAX_PUBLIC_CLIENTS: usize = 30;
 const MAX_PORTAL_CLIENTS: usize = 2;
 const PORTAL_UID: u32 = 991;
 const PORTAL_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long one event may stay unwritten once a public client's socket has
+/// stopped taking bytes. The portal keeps `PORTAL_CLIENT_IO_TIMEOUT`.
+const CLIENT_WRITE_DEADLINE: Duration = Duration::from_secs(5);
+/// The kernel send timeout on every client socket. It is how often a stalled
+/// write looks at its deadline. The clock starts at the first stall a slice
+/// reveals, so a stalled event fails within the budget plus about two slices.
+const CLIENT_WRITE_SLICE: Duration = Duration::from_millis(250);
+/// The most one send call offers the kernel. A Unix stream send re-arms its
+/// timeout for every buffer it allocates, so a call spanning several could
+/// wait several slices on a reader that frees space just in time; one this
+/// size needs one buffer. Nearly every Wayland event is smaller.
+const CLIENT_WRITE_CHUNK: usize = 4096;
 const MAX_CACHED_SUBSURFACE_COMMITS: usize = 128;
 const MAX_PENDING_FRAME_CALLBACKS: usize = 256;
 const MAX_SURFACE_OUTPUT_MULTIPLIER: usize = 2;
@@ -674,8 +686,56 @@ struct KeymapFile {
     size: u32,
 }
 
+/// Per-connection write policy: how long one event may stall, how often a
+/// stalled write wakes to ask, and the clock it asks. The clock is injected so
+/// a test can expire a deadline without waiting for it.
+#[derive(Clone)]
+struct WriteDeadline {
+    budget: Duration,
+    slice: Duration,
+    now: Arc<dyn Fn() -> Instant + Send + Sync>,
+}
+
+impl WriteDeadline {
+    fn for_access(access: ClientAccess) -> WriteDeadline {
+        let budget = match access {
+            ClientAccess::Public => CLIENT_WRITE_DEADLINE,
+            ClientAccess::Portal => PORTAL_CLIENT_IO_TIMEOUT,
+        };
+        WriteDeadline {
+            budget,
+            slice: CLIENT_WRITE_SLICE,
+            now: Arc::new(Instant::now),
+        }
+    }
+
+    /// Records a stall and says whether this event has now been stalled for
+    /// the whole budget. The first stall starts the clock, so an event that
+    /// never stalls never reads it.
+    fn expired(&self, stalled_since: &mut Option<Instant>) -> bool {
+        let now = (self.now)();
+        let since = *stalled_since.get_or_insert(now);
+        now.saturating_duration_since(since) >= self.budget
+    }
+}
+
+enum WriteFailure {
+    Stalled,
+    Io(std::io::Error),
+}
+
+/// The send timeout expiring is a stall observation, not a failure: the loop
+/// that sees it asks the deadline whether to keep waiting.
+fn send_slice_expired(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
 struct Outbound {
     stream: UnixStream,
+    deadline: WriteDeadline,
     disconnected: bool,
 }
 
@@ -688,38 +748,118 @@ struct DeferredOutbound {
 }
 
 impl Outbound {
+    fn new(stream: UnixStream, deadline: WriteDeadline) -> Result<Outbound, String> {
+        // The socket is shared with the dispatch thread's reader, but a send
+        // timeout touches only sends, and every send to a client is made here.
+        stream
+            .set_write_timeout(Some(deadline.slice))
+            .map_err(|error| format!("set Wayland client send timeout: {error}"))?;
+        Ok(Outbound {
+            stream,
+            deadline,
+            disconnected: false,
+        })
+    }
+
     fn send(&mut self, message: &[u8]) -> Result<(), String> {
         if self.disconnected {
             return Ok(());
         }
-        match self.stream.write_all(message) {
-            Ok(()) => Ok(()),
-            Err(error) if sys::write_peer_disconnected(&error) => {
-                self.disconnected = true;
-                Ok(())
-            }
-            Err(error) => {
-                // write_all may already have emitted a prefix. No later event
-                // may be appended to a stream whose framing is now unknown.
-                self.disconnected = true;
-                Err(format!("write Wayland event: {error}"))
-            }
-        }
+        let result = self.write_from(message, 0, &mut None);
+        self.settle(result, "write Wayland event")
     }
 
     fn send_with_fd(&mut self, message: &[u8], fd: RawFd) -> Result<(), String> {
         if self.disconnected {
             return Ok(());
         }
-        match sys::send_with_fd(&self.stream, message, fd) {
+        let mut stalled_since = None;
+        let result = loop {
+            let head = message.get(..CLIENT_WRITE_CHUNK).unwrap_or(message);
+            match sys::send_prefix_with_fd(&self.stream, head, fd) {
+                // A short count is a slice that expired partway, as in
+                // `write_from`, and starts the clock the same way.
+                Ok(sent) if sent < head.len() && self.deadline.expired(&mut stalled_since) => {
+                    break Err(WriteFailure::Stalled)
+                }
+                Ok(sent) => break self.write_from(message, sent, &mut stalled_since),
+                // Nothing left, the descriptor included, so asking again is
+                // not a second copy of it.
+                Err(error) if send_slice_expired(&error) => {
+                    if self.deadline.expired(&mut stalled_since) {
+                        break Err(WriteFailure::Stalled);
+                    }
+                }
+                Err(error) => break Err(WriteFailure::Io(error)),
+            }
+        };
+        self.settle(result, "send Wayland descriptor event")
+    }
+
+    /// Writes `message[written..]`, waking every slice to ask the deadline.
+    /// The deadline is per event and absolute: a client that drains a few
+    /// bytes each slice still has only the budget to take the whole event.
+    fn write_from(
+        &self,
+        message: &[u8],
+        mut written: usize,
+        stalled_since: &mut Option<Instant>,
+    ) -> Result<(), WriteFailure> {
+        loop {
+            let Some(rest) = message.get(written..) else {
+                return Err(WriteFailure::Io(std::io::Error::other(
+                    "Wayland event write escaped its message",
+                )));
+            };
+            if rest.is_empty() {
+                return Ok(());
+            }
+            let chunk = rest.get(..CLIENT_WRITE_CHUNK).unwrap_or(rest);
+            // Stalled means this call took less than it was offered. A full
+            // chunk of a longer event is progress, not a stall.
+            let stalled = match (&self.stream).write(chunk) {
+                Ok(0) => return Err(WriteFailure::Io(std::io::ErrorKind::WriteZero.into())),
+                Ok(count) => {
+                    written = written.saturating_add(count);
+                    count < chunk.len()
+                }
+                // A send is interrupted only while it waits for space, so a
+                // signal is a stall observation too and cannot extend the wait.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::Interrupted
+                        || send_slice_expired(&error) =>
+                {
+                    true
+                }
+                Err(error) => return Err(WriteFailure::Io(error)),
+            };
+            if stalled && self.deadline.expired(stalled_since) {
+                return Err(WriteFailure::Stalled);
+            }
+        }
+    }
+
+    fn settle(&mut self, result: Result<(), WriteFailure>, what: &str) -> Result<(), String> {
+        match result {
             Ok(()) => Ok(()),
-            Err(error) if sys::write_peer_disconnected(&error) => {
+            Err(WriteFailure::Io(error)) if sys::write_peer_disconnected(&error) => {
                 self.disconnected = true;
                 Ok(())
             }
-            Err(error) => {
+            Err(WriteFailure::Io(error)) => {
+                // A prefix may already have left. No later event may be
+                // appended to a stream whose framing is now unknown.
                 self.disconnected = true;
-                Err(format!("send Wayland descriptor event: {error}"))
+                Err(format!("{what}: {error}"))
+            }
+            Err(WriteFailure::Stalled) => {
+                // Shutting the socket is what frees the slot: the dispatch
+                // thread's read returns and it tears the connection down.
+                self.disconnect();
+                Err(format!(
+                    "{what}: client left the event stalled for {}ms",
+                    self.deadline.budget.as_millis()
+                ))
             }
         }
     }
@@ -1346,9 +1486,9 @@ fn dismiss_from_seat(
     // none has been.
     //
     // Holding the REGISTRATIONS across the send would get it too, and that is
-    // what td did until review built the interleaving. `Outbound::send` is
-    // `write_all` on the client's socket with no timeout, so a client that
-    // stops reading blocks it forever — and `Runtime::record_dismissal` takes
+    // what td did until review built the interleaving. `Outbound::send`
+    // waits out its write deadline on a client that stops reading, seconds
+    // rather than a frame — and `Runtime::record_dismissal` takes
     // this same registration lock with the RUNTIME lock held. One client going
     // quiet mid-dismissal would leave the seat thread holding the
     // registrations inside a blocked write while the input thread waits for
@@ -2010,22 +2150,26 @@ fn request(object: u32, opcode: u16, builder: wire::Builder) -> Result<wire::Mes
 }
 
 impl Client {
+    #[cfg(test)]
     fn new(
         id: u64,
         stream: UnixStream,
         runtime: Arc<Mutex<Runtime>>,
         keymap: KeymapFile,
     ) -> Result<Client, String> {
-        Self::new_with_access(id, stream, runtime, keymap, ClientAccess::Public)
+        let deadline = WriteDeadline::for_access(ClientAccess::Public);
+        Self::new_with_access(id, stream, runtime, keymap, ClientAccess::Public, deadline)
     }
 
+    #[cfg(test)]
     fn new_portal(
         id: u64,
         stream: UnixStream,
         runtime: Arc<Mutex<Runtime>>,
         keymap: KeymapFile,
     ) -> Result<Client, String> {
-        Self::new_with_access(id, stream, runtime, keymap, ClientAccess::Portal)
+        let deadline = WriteDeadline::for_access(ClientAccess::Portal);
+        Self::new_with_access(id, stream, runtime, keymap, ClientAccess::Portal, deadline)
     }
 
     fn new_with_access(
@@ -2034,12 +2178,16 @@ impl Client {
         runtime: Arc<Mutex<Runtime>>,
         keymap: KeymapFile,
         access: ClientAccess,
+        deadline: WriteDeadline,
     ) -> Result<Client, String> {
         let mut objects = BTreeMap::new();
         objects.insert(1, Object::Display);
         let writer = stream
             .try_clone()
             .map_err(|e| format!("clone Wayland client stream: {e}"))?;
+        // Before registration: every later failure path unregisters, and
+        // this one would not.
+        let outbound = Outbound::new(writer, deadline)?;
         let resources = Arc::new(ClientResourceHighWater::default());
         resources.observe_objects(objects.len());
         runtime
@@ -2050,10 +2198,7 @@ impl Client {
             id,
             access,
             stream,
-            outbound: Arc::new(Mutex::new(Outbound {
-                stream: writer,
-                disconnected: false,
-            })),
+            outbound: Arc::new(Mutex::new(outbound)),
             configurations: Arc::new(Mutex::new(BTreeMap::new())),
             keyboards: Arc::new(Mutex::new(BTreeMap::new())),
             pointers: Arc::new(Mutex::new(BTreeMap::new())),
@@ -6971,11 +7116,10 @@ fn serve_client_with_access(
     runtime: Arc<Mutex<Runtime>>,
     keymap: KeymapFile,
     access: ClientAccess,
+    deadline: WriteDeadline,
 ) -> Result<(), String> {
-    let mut client = match access {
-        ClientAccess::Public => Client::new(id, stream, Arc::clone(&runtime), keymap)?,
-        ClientAccess::Portal => Client::new_portal(id, stream, Arc::clone(&runtime), keymap)?,
-    };
+    let mut client =
+        Client::new_with_access(id, stream, Arc::clone(&runtime), keymap, access, deadline)?;
     let subscription = match runtime.lock() {
         Ok(mut runtime) => match runtime.subscribe(id) {
             Ok(subscription) => subscription,
@@ -7199,7 +7343,8 @@ fn serve_client(
     runtime: Arc<Mutex<Runtime>>,
     keymap: KeymapFile,
 ) -> Result<(), String> {
-    serve_client_with_access(stream, id, runtime, keymap, ClientAccess::Public)
+    let deadline = WriteDeadline::for_access(ClientAccess::Public);
+    serve_client_with_access(stream, id, runtime, keymap, ClientAccess::Public, deadline)
 }
 
 fn keymap_directory(path: &Path) -> Result<&Path, String> {
@@ -7635,17 +7780,16 @@ fn prepare_client_stream(
     }
     let uid = sys::peer_uid(&stream)?;
     require_portal_peer(uid)?;
-    set_portal_client_timeout(&stream, portal_timeout)?;
+    set_portal_read_timeout(&stream, portal_timeout)?;
     Ok(stream)
 }
 
-fn set_portal_client_timeout(stream: &UnixStream, timeout: Duration) -> Result<(), String> {
+/// Only the read side: the send side of every client socket belongs to its
+/// `Outbound`, whose deadline for the portal is this same timeout.
+fn set_portal_read_timeout(stream: &UnixStream, timeout: Duration) -> Result<(), String> {
     stream
         .set_read_timeout(Some(timeout))
-        .map_err(|error| format!("set private portal client read timeout: {error}"))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|error| format!("set private portal client write timeout: {error}"))
+        .map_err(|error| format!("set private portal client read timeout: {error}"))
 }
 
 #[derive(Default)]
@@ -7702,8 +7846,9 @@ fn accept_clients(
             .name(format!("wayland-client-{id}"))
             .spawn(move || {
                 let _permit = permit;
+                let deadline = WriteDeadline::for_access(access);
                 if let Err(error) =
-                    serve_client_with_access(stream, id, runtime, keymap, access)
+                    serve_client_with_access(stream, id, runtime, keymap, access, deadline)
                 {
                     eprintln!("td-compositor: {channel} client {id}: {error}");
                 }
@@ -8011,6 +8156,12 @@ mod tests {
     use std::time::Duration;
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    impl Outbound {
+        fn for_test(stream: UnixStream) -> Outbound {
+            Outbound::new(stream, WriteDeadline::for_access(ClientAccess::Public)).unwrap()
+        }
+    }
 
     fn test_directory(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -8416,9 +8567,9 @@ mod tests {
     }
 
     /// The registrations are NOT held across the write, and one quiet client
-    /// therefore cannot stop the compositor. `Outbound::send` is `write_all` on
-    /// that client's socket with no timeout, so a client that stops reading
-    /// blocks the seat thread here for as long as it likes — and the runtime
+    /// therefore cannot stop the compositor. `Outbound::send` waits out its
+    /// write deadline on a client that stops reading, so such a client
+    /// blocks the seat thread here for seconds — and the runtime
     /// takes this same registration lock with the RUNTIME lock held, to record
     /// a dismissal on the thread that read the press. Holding the
     /// registrations inside the blocked write would park the input thread on
@@ -8434,10 +8585,7 @@ mod tests {
     fn a_blocked_write_does_not_take_the_registrations_down_with_it() {
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let outbound = Arc::new(Mutex::new(Outbound {
-            stream: server,
-            disconnected: false,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::for_test(server)));
         let popups: PopupRegistrations = Arc::new(Mutex::new(BTreeMap::from([(
             6,
             PopupRegistration {
@@ -8498,10 +8646,7 @@ mod tests {
     fn a_menu_the_compositor_closed_is_told_on_the_seats_thread() {
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let outbound = Arc::new(Mutex::new(Outbound {
-            stream: server,
-            disconnected: false,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::for_test(server)));
         let popups: PopupRegistrations = Arc::new(Mutex::new(BTreeMap::from([(
             6,
             PopupRegistration {
@@ -8540,10 +8685,7 @@ mod tests {
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
-        let outbound = Arc::new(Mutex::new(Outbound {
-            stream: server,
-            disconnected: false,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::for_test(server)));
         let popups: PopupRegistrations = Arc::new(Mutex::new(BTreeMap::from([(
             6,
             PopupRegistration {
@@ -8570,10 +8712,7 @@ mod tests {
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
-        let outbound = Arc::new(Mutex::new(Outbound {
-            stream: server,
-            disconnected: false,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::for_test(server)));
         let popups: PopupRegistrations = Arc::new(Mutex::new(BTreeMap::new()));
 
         dismiss_from_seat(6, 14, &popups, &outbound).unwrap();
@@ -9265,30 +9404,271 @@ mod tests {
         let directory = test_directory("descriptor-disconnect-test");
         let keymap = keymap_file(&directory).unwrap();
         fs::remove_dir(directory).unwrap();
-        let mut outbound = Outbound {
-            stream: server,
-            disconnected: false,
-        };
+        let mut outbound = Outbound::for_test(server);
         assert!(outbound
             .send_with_fd(b"event", keymap.file.as_raw_fd())
             .is_ok());
         assert!(outbound.disconnected);
     }
 
-    #[test]
-    fn a_timed_out_partial_event_disconnects_before_any_later_write() {
-        let (server, _peer) = UnixStream::pair().unwrap();
-        server
-            .set_write_timeout(Some(Duration::from_millis(20)))
-            .unwrap();
-        let mut outbound = Outbound {
-            stream: server,
-            disconnected: false,
+    /// A deadline an hour long whose clock moves `step` further on every
+    /// reading, with a one-millisecond slice. A test that finishes has
+    /// therefore not waited for the deadline; the clock expired it.
+    fn stepped_deadline(step: Duration) -> (WriteDeadline, Arc<AtomicUsize>) {
+        let readings = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&readings);
+        let base = Instant::now();
+        let now = move || {
+            let reading = counted.fetch_add(1, Ordering::SeqCst);
+            base + step * u32::try_from(reading).unwrap()
         };
+        let deadline = WriteDeadline {
+            budget: Duration::from_secs(3600),
+            slice: Duration::from_millis(1),
+            now: Arc::new(now),
+        };
+        (deadline, readings)
+    }
+
+    /// Fills `server`'s send queue toward `_peer` until it takes no more.
+    fn fill_send_queue(server: &UnixStream) {
+        server.set_nonblocking(true).unwrap();
+        let chunk = [0u8; 4096];
+        loop {
+            match (&*server).write(&chunk) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill send queue: {error}"),
+            }
+        }
+        server.set_nonblocking(false).unwrap();
+    }
+
+    #[test]
+    fn a_client_socket_carries_the_slice_as_its_send_timeout_only() {
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let inspection = server.try_clone().unwrap();
+        let _outbound = Outbound::for_test(server);
+        // The kernel keeps the timeout in jiffies, so it reads back rounded.
+        let slice = inspection.write_timeout().unwrap().unwrap();
+        assert!(slice >= CLIENT_WRITE_SLICE && slice < CLIENT_WRITE_SLICE * 2, "{slice:?}");
+        assert_eq!(inspection.read_timeout().unwrap(), None);
+        let public = WriteDeadline::for_access(ClientAccess::Public);
+        let portal = WriteDeadline::for_access(ClientAccess::Portal);
+        assert_eq!(public.budget, CLIENT_WRITE_DEADLINE);
+        assert_eq!(portal.budget, PORTAL_CLIENT_IO_TIMEOUT);
+        assert!(CLIENT_WRITE_SLICE < CLIENT_WRITE_DEADLINE);
+    }
+
+    #[test]
+    fn a_stalled_event_disconnects_at_its_deadline_and_nothing_follows() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        let (deadline, readings) = stepped_deadline(Duration::from_secs(3600));
+        let mut outbound = Outbound::new(server, deadline).unwrap();
         let error = outbound.send(&vec![0u8; 8 * 1024 * 1024]).unwrap_err();
-        assert!(error.contains("write Wayland event"), "{error}");
+        assert!(error.contains("write Wayland event: client left the event stalled for 3600000ms"), "{error}");
         assert!(outbound.disconnected);
+        // One reading starts the stall and the next is past the budget.
+        assert_eq!(readings.load(Ordering::SeqCst), 2);
         assert!(outbound.send(b"must-not-follow-a-partial-frame").is_ok());
+        // The socket was shut, which is what wakes the dispatch reader: the
+        // peer drains the partial prefix and then reads end-of-stream.
+        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut drained = Vec::new();
+        peer.read_to_end(&mut drained).unwrap();
+        assert!(drained.len() < 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn an_event_that_never_stalls_never_reads_the_clock() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        let (deadline, readings) = stepped_deadline(Duration::from_secs(3600));
+        let mut outbound = Outbound::new(server, deadline).unwrap();
+        outbound.send(b"small event").unwrap();
+        assert_eq!(readings.load(Ordering::SeqCst), 0);
+        let mut received = [0u8; 11];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"small event");
+    }
+
+    #[test]
+    fn a_multi_chunk_event_to_a_reading_client_never_reads_the_clock() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        let (deadline, readings) = stepped_deadline(Duration::from_secs(3600));
+        let mut outbound = Outbound::new(server, deadline).unwrap();
+        // Well inside the socket's buffer, so no call can block: every
+        // chunk is taken whole and none may be mistaken for a stall.
+        let message: Vec<u8> = (0..3 * CLIENT_WRITE_CHUNK + 5).map(|index| index as u8).collect();
+        outbound.send(&message).unwrap();
+        assert_eq!(readings.load(Ordering::SeqCst), 0);
+        let mut received = vec![0u8; message.len()];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, message);
+    }
+
+    #[test]
+    fn a_slow_reader_outlasts_many_slices_while_its_deadline_holds() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        // A clock that never moves: however many slices expire, the budget
+        // is never spent, so expiring slices alone must not disconnect.
+        let base = Instant::now();
+        let deadline = WriteDeadline {
+            budget: Duration::from_secs(3600),
+            slice: Duration::from_millis(1),
+            now: Arc::new(move || base),
+        };
+        let mut outbound = Outbound::new(server, deadline).unwrap();
+        let length = 1024 * 1024;
+        let reader = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            let mut received = vec![0u8; length];
+            peer.read_exact(&mut received).unwrap();
+            received
+        });
+        let message: Vec<u8> = (0..length).map(|index| index as u8).collect();
+        outbound.send(&message).unwrap();
+        assert!(!outbound.disconnected);
+        assert_eq!(reader.join().unwrap(), message);
+    }
+
+    #[test]
+    fn a_dribbling_reader_still_meets_an_absolute_per_event_deadline() {
+        let (server, peer) = UnixStream::pair().unwrap();
+        fill_send_queue(&server);
+        peer.set_nonblocking(true).unwrap();
+        // The peer drains a burst at every stall the writer reports, so it
+        // makes progress between every pair of stalls without any timing
+        // assumption. The clock moves half the budget per reading, so the
+        // third stall is past it however much was drained: a per-syscall
+        // timeout would have been renewed by every burst.
+        let readings = Arc::new(AtomicUsize::new(0));
+        let drained = Arc::new(AtomicUsize::new(0));
+        let (counted, drained_by_clock) = (Arc::clone(&readings), Arc::clone(&drained));
+        let base = Instant::now();
+        let now = move || {
+            let reading = counted.fetch_add(1, Ordering::SeqCst);
+            let mut burst = [0u8; 64 * 1024];
+            if let Ok(count) = (&peer).read(&mut burst) {
+                drained_by_clock.fetch_add(count, Ordering::SeqCst);
+            }
+            base + Duration::from_secs(1800) * u32::try_from(reading).unwrap()
+        };
+        let deadline = WriteDeadline {
+            budget: Duration::from_secs(3600),
+            slice: Duration::from_millis(1),
+            now: Arc::new(now),
+        };
+        let mut outbound = Outbound::new(server, deadline).unwrap();
+        let error = outbound.send(&vec![0u8; 8 * 1024 * 1024]).unwrap_err();
+        assert!(error.contains("client left the event stalled"), "{error}");
+        assert_eq!(readings.load(Ordering::SeqCst), 3);
+        assert!(drained.load(Ordering::SeqCst) > 0);
+    }
+
+    #[test]
+    fn a_descriptor_event_longer_than_one_chunk_arrives_whole_with_its_descriptor() {
+        let (server, peer) = UnixStream::pair().unwrap();
+        let directory = test_directory("descriptor-chunk-test");
+        let keymap = keymap_file(&directory).unwrap();
+        fs::remove_dir(directory).unwrap();
+        let (deadline, readings) = stepped_deadline(Duration::from_secs(3600));
+        let mut outbound = Outbound::new(server, deadline).unwrap();
+        let message: Vec<u8> = (0..3 * CLIENT_WRITE_CHUNK + 5).map(|index| index as u8).collect();
+        outbound.send_with_fd(&message, keymap.file.as_raw_fd()).unwrap();
+        outbound.send(b"next").unwrap();
+        let mut received = Vec::new();
+        let mut fds = Vec::new();
+        let mut incoming = [0u8; 64 * 1024];
+        while received.len() < message.len() + 4 {
+            let got = sys::recv_with_fds(&peer, &mut incoming).unwrap();
+            assert_ne!(got.count, 0);
+            received.extend_from_slice(&incoming[..got.count]);
+            fds.extend(got.fds);
+        }
+        assert_eq!(&received[..message.len()], &message[..]);
+        assert_eq!(&received[message.len()..], b"next");
+        assert_eq!(fds.len(), 1);
+        sys::discard_received(&fds);
+        assert_eq!(readings.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_stalled_descriptor_event_disconnects_without_sending_its_descriptor() {
+        let (server, peer) = UnixStream::pair().unwrap();
+        fill_send_queue(&server);
+        let directory = test_directory("descriptor-stall-test");
+        let keymap = keymap_file(&directory).unwrap();
+        fs::remove_dir(directory).unwrap();
+        let (deadline, readings) = stepped_deadline(Duration::from_secs(3600));
+        let mut outbound = Outbound::new(server, deadline).unwrap();
+        let error = outbound
+            .send_with_fd(b"keymap event", keymap.file.as_raw_fd())
+            .unwrap_err();
+        assert!(
+            error.contains("send Wayland descriptor event: client left the event stalled"),
+            "{error}"
+        );
+        assert!(outbound.disconnected);
+        assert_eq!(readings.load(Ordering::SeqCst), 2);
+        // Everything the peer can read is the filler, then end-of-stream:
+        // no byte of the event and no descriptor ever left.
+        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut incoming = [0u8; 64 * 1024];
+        loop {
+            let received = sys::recv_with_fds(&peer, &mut incoming).unwrap();
+            assert!(received.fds.is_empty(), "a descriptor left: {:?}", received.fds);
+            if received.count == 0 {
+                break;
+            }
+            assert!(incoming[..received.count].iter().all(|byte| *byte == 0));
+        }
+    }
+
+    /// The whole connection, not just the writer: a client that sends
+    /// requests and never reads their replies loses its connection at the
+    /// deadline, and `serve_client_with_access` returning is what releases
+    /// the accept loop's slot permit.
+    #[test]
+    fn a_client_that_stops_reading_is_disconnected_and_its_slot_released() {
+        let stem = format!(
+            "td-write-deadline-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 8 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, peer) = UnixStream::pair().unwrap();
+        let (deadline, _readings) = stepped_deadline(Duration::from_secs(3600));
+        let thread_runtime = Arc::clone(&runtime);
+        let worker = thread::spawn(move || {
+            serve_client_with_access(
+                server,
+                93,
+                thread_runtime,
+                test_keymap(),
+                ClientAccess::Public,
+                deadline,
+            )
+        });
+        // Every sync is answered with a done and a delete_id this peer never
+        // reads. It stops writing when the server shuts the socket.
+        let mut requests = peer.try_clone().unwrap();
+        let writer = thread::spawn(move || {
+            for callback in 2..200_000u32 {
+                let mut sync = wire::Builder::new();
+                sync.u32(callback);
+                if requests.write_all(&sync.message(1, 0).unwrap()).is_err() {
+                    return;
+                }
+            }
+            panic!("the server took 200000 unanswered syncs without disconnecting");
+        });
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.contains("client left the event stalled"), "{error}");
+        writer.join().unwrap();
+        drop(peer);
+        let _ = fs::remove_file(framebuffer_path);
     }
 
     #[test]
@@ -9667,10 +10047,7 @@ mod tests {
         let registrations = Arc::new(Mutex::new(registrations));
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let outbound = Arc::new(Mutex::new(Outbound {
-            stream: server,
-            disconnected: false,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::for_test(server)));
         let worker_stop = stop.clone();
         let worker_registrations = Arc::clone(&registrations);
         let worker_outbound = Arc::clone(&outbound);
@@ -9812,10 +10189,7 @@ mod tests {
         let pointer_authority = Arc::new(Mutex::new(None));
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let outbound = Arc::new(Mutex::new(Outbound {
-            stream: server,
-            disconnected: false,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::for_test(server)));
         let worker_stop = stop.clone();
         let worker_pointers = Arc::clone(&pointers);
         let worker_authority = Arc::clone(&pointer_authority);
@@ -9979,10 +10353,7 @@ mod tests {
     fn queued_split_transition_preserves_a_new_pointer_initial_authority() {
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let outbound = Arc::new(Mutex::new(Outbound {
-            stream: server,
-            disconnected: false,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::for_test(server)));
         let pointers = BTreeMap::from([
             (
                 9,
@@ -10081,10 +10452,7 @@ mod tests {
         use crate::pointer::{AxisStep, PointerAxis};
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let outbound = Arc::new(Mutex::new(Outbound {
-            stream: server,
-            disconnected: false,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::for_test(server)));
         let pointers = BTreeMap::from([(
             9,
             PointerRegistration {
@@ -10180,10 +10548,7 @@ mod tests {
         };
         for (version, count) in [(4, 1), (5, 2)] {
             let (server, mut peer) = UnixStream::pair().unwrap();
-            let outbound = Arc::new(Mutex::new(Outbound {
-                stream: server,
-                disconnected: false,
-            }));
+            let outbound = Arc::new(Mutex::new(Outbound::for_test(server)));
             send_pointer_initial(
                 &outbound,
                 9,
@@ -10235,10 +10600,7 @@ mod tests {
             Arc::new(DataObjectState::new(DataObjects::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(PortalManagerState::default())),
-            Arc::new(Mutex::new(Outbound {
-                stream: server,
-                disconnected: false,
-            })),
+            Arc::new(Mutex::new(Outbound::for_test(server))),
         )
         .unwrap_err();
         assert!(error.contains("before client teardown"));
@@ -10285,10 +10647,7 @@ mod tests {
             KeyboardRegistration { after_revision: 0 },
         )])));
         let (server, _peer) = UnixStream::pair().unwrap();
-        let outbound = Arc::new(Mutex::new(Outbound {
-            stream: server,
-            disconnected: false,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::for_test(server)));
         let error = supervise_seat_worker(
             99,
             receiver,
@@ -10340,10 +10699,7 @@ mod tests {
             Arc::new(DataObjectState::new(DataObjects::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(PortalManagerState::default())),
-            Arc::new(Mutex::new(Outbound {
-                stream: server,
-                disconnected: false,
-            })),
+            Arc::new(Mutex::new(Outbound::for_test(server))),
         )
         .is_ok());
         assert!(pending.lock().unwrap().is_empty());
@@ -11352,7 +11708,7 @@ mod tests {
                 None
             };
             assert_eq!(inspection.read_timeout().unwrap(), expected);
-            assert_eq!(inspection.write_timeout().unwrap(), expected);
+            assert_eq!(inspection.write_timeout().unwrap(), None);
         }
     }
 
@@ -11374,7 +11730,7 @@ mod tests {
         if uid == PORTAL_UID {
             let prepared = prepared.unwrap();
             assert_eq!(prepared.read_timeout().unwrap(), Some(timeout));
-            assert_eq!(prepared.write_timeout().unwrap(), Some(timeout));
+            assert_eq!(prepared.write_timeout().unwrap(), None);
         } else {
             let error = prepared.unwrap_err();
             assert!(error.contains(&format!("reject peer uid {uid}")), "{error}");
@@ -11584,10 +11940,7 @@ mod tests {
             managers: BTreeMap::from([(20, live)]),
             dialogs: BTreeMap::from([(6, (live, 4))]),
         }));
-        let outbound = Arc::new(Mutex::new(Outbound {
-            stream: server,
-            disconnected: false,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::for_test(server)));
         send_portal_dialogs_standalone(
             &managers,
             &outbound,
@@ -11637,10 +11990,7 @@ mod tests {
             managers: BTreeMap::from([(20, stale)]),
             dialogs: BTreeMap::from([(5, (stale, 3))]),
         }));
-        let outbound = Arc::new(Mutex::new(Outbound {
-            stream: server,
-            disconnected: false,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::for_test(server)));
 
         // Stop the old event at the last lock boundary. Once delivery holds
         // the manager gate, a destroy/recreate request must not pass it and
@@ -12383,10 +12733,7 @@ mod tests {
         )])));
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let outbound = Arc::new(Mutex::new(Outbound {
-            stream: server,
-            disconnected: false,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::for_test(server)));
         let worker_data = Arc::clone(&data);
         let worker_stop = stop.clone();
         let worker = thread::spawn(move || {
@@ -20687,9 +21034,9 @@ mod tests {
             let permit = ClientPermit::acquire(ClientAccess::Portal).unwrap();
             let (server, peer) = UnixStream::pair().unwrap();
             let timeout = Duration::from_millis(20);
-            set_portal_client_timeout(&server, timeout).unwrap();
+            set_portal_read_timeout(&server, timeout).unwrap();
             assert_eq!(server.read_timeout().unwrap(), Some(timeout));
-            assert_eq!(server.write_timeout().unwrap(), Some(timeout));
+            assert_eq!(server.write_timeout().unwrap(), None);
             let worker_runtime = Arc::clone(&runtime);
             workers.push(thread::spawn(move || {
                 let _permit = permit;
@@ -20699,6 +21046,7 @@ mod tests {
                     worker_runtime,
                     test_keymap(),
                     ClientAccess::Portal,
+                    WriteDeadline::for_access(ClientAccess::Portal),
                 )
             }));
             peers.push(peer);

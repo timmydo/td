@@ -2241,6 +2241,7 @@ pub struct MappedRegion {
             "pub fn peer_uid(",
             "pub fn recv_with_fds(",
             "pub fn send_with_fd(",
+            "pub fn send_prefix_with_fd(",
         ] {
             assert!(SYS.contains(operation), "{operation}");
         }
@@ -2295,6 +2296,7 @@ pub struct MappedRegion {
     fn each_confined_operation_is_reachable_only_from_its_own_module() {
         const TRANSPORT: &[&str] = &[
             "sys::send_with_fd(",
+            "sys::send_prefix_with_fd(",
             "sys::recv_with_fds(",
             "sys::take_received(",
             "sys::discard_received(",

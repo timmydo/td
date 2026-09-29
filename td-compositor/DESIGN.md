@@ -2020,12 +2020,12 @@ retired, and a registration still naming this popup proves none has been.
 
 Outbound before registrations, and never the other way. `Outbound::send` is a
 blocking write on the client's own socket, so a client that stops reading holds
-it for as long as it likes; the registrations are taken with the RUNTIME lock
-held, by the dismissal above. A seat thread that held the registrations inside
-that blocked write would park the input thread on them while it holds the
-runtime lock, and every other client's input, commits and repaints behind that
-— one quiet client stopping the compositor. Review built that interleaving out
-of td's first two fixes taken together. The registrations are a leaf: nothing
+it for up to its write deadline (§3); the registrations are taken with the
+RUNTIME lock held, by the dismissal above. A seat thread that held the
+registrations inside that blocked write would park the input thread on them
+while it holds the runtime lock, and every other client's input, commits and
+repaints behind that — one quiet client stopping the compositor. Review built
+that interleaving out of td's first two fixes taken together. The registrations are a leaf: nothing
 is acquired while they are held.
 
 One consequence is recorded rather than fixed: the client's ceiling is not
@@ -3771,8 +3771,8 @@ A full seat queue closes that client's runtime subscription instead of
 blocking the evdev reader. The seat worker drains the bounded queue and
 disconnects the client when it observes the closed subscription. If that
 worker is already blocked writing to a client that does not read, the
-disconnect waits for the same accepted per-client availability gap as the
-configure worker; other clients and the input reader continue.
+disconnect waits for that write's deadline, below; other clients and the
+input reader continue.
 A request that illegally reuses the exact id whose ordered `delete_id` is
 blocked on that socket also waits for the write, preserving ordering instead
 of letting request dispatch overtake it.
@@ -3780,21 +3780,61 @@ A client that stalls during the initial keymap and focus burst holds its
 keyboard-registration ordering guard; its worker queues behind that guard
 until saturation closes the subscription. The worker cannot observe that
 closure or disconnect the client until the blocked initial write and guard
-unblock, so this is part of the accepted per-client availability gap below.
+unblock, which the write deadline below bounds.
 
-These ceilings do not yet bound time. A connected client that stops reading
-events can block its configure worker on a socket write and retain one client
-slot. It does not hold the runtime or framebuffer lock while writing, so it
-cannot block input or other clients. The write deliberately retains that
-client's configure-registration and tracker locks to keep event pairs ordered,
-so the same client's ACK, role mutation, and request dispatch can also wait for
-the write. This can park both of that client's threads and retain its slot
-until the peer reads events or closes; there is no self-heal. If dispatch exits
-for another reason, it shuts down its socket clone before joining, which
-interrupts a blocked write. This first profile accepts the remaining
-per-client availability gap. A future write deadline must be an explicit,
-injectable connection policy with deterministic tests that do not wait for
-elapsed wall time.
+Time is bounded by a per-connection write deadline. Every event to a client
+leaves through its `Outbound`, and while a client reads, nothing about that
+changes. A client that stops reading can block a write for at most the
+deadline: five seconds for a public client, and the portal's existing
+thirty-second I/O timeout for the private portal. The write that exceeds it
+shuts the socket down, which ends the dispatch thread's read, tears the
+connection down and releases its client slot. It is the writer's error, logged
+under the client's id. While the write waits it holds no runtime or
+framebuffer lock, so input and other clients continue. It does hold that
+client's configure-registration and tracker locks, to keep event pairs
+ordered, so the same client's ACK, role mutation and request dispatch wait
+with it: for seconds, no longer indefinitely.
+
+The deadline is per event and absolute, not per syscall. A per-syscall send
+timeout is renewed by every byte, so a client that drains a few bytes a second
+would never trip it. Each client socket instead carries a quarter-second
+`SO_SNDTIMEO` as a slice. A send call that expires a slice, or that takes less
+than it was offered, is a stall observation: the first starts the event's clock,
+and the event fails once it has been stalled for the budget, however much the
+client drained in between. That first observation comes up to a slice after
+the socket stopped taking bytes, and the clock is read once per slice, so a
+stalled event fails within the budget plus about two slices. That holds only
+if one send call waits at most one slice. A Unix stream send re-arms its
+timeout for every buffer it allocates, so each call offers at most 4 KiB,
+which fits one buffer. Nearly every event is smaller, so the common case is
+still one call. A longer event takes several calls, and a chunk taken whole
+is progress, not a stall. So a client that frees a whole chunk within each
+slice is not stalled, and the bound above counts from the first stall rather
+than from the event's first byte. A 64 KiB event, `wire::MAX_MESSAGE` and
+sixteen chunks, paced that way can spend up to sixteen slices before its
+clock starts. A write interrupted by a signal is a stall observation too. An
+event that never stalls never reads the clock, however many chunks it takes.
+
+The slice is set with std's safe `set_write_timeout` and touches only sends,
+so the dispatch thread's reader on the same socket is unaffected. The
+portal's read timeout is still its own. A descriptor event's `sendmsg`
+either takes bytes, and the descriptor with them, or takes nothing.
+`sys::send_prefix_with_fd` returns that count, so the tail is finished under
+the same deadline and a retried `sendmsg` never sends a second copy of the
+descriptor. That wrapper retries `EINTR` itself, without the clock. No
+client can signal the compositor, which runs under its own uid, and the call
+offers one chunk.
+
+The policy (budget, slice and clock) is an explicit `WriteDeadline` passed to
+each connection. Tests inject a clock that steps a full hour-long budget per
+reading, so a stalled event, a dribbling reader, a stalled descriptor event
+and a whole connection that stops reading are all disconnected without the
+suite waiting for the deadline. A frozen clock proves that expiring slices
+alone never disconnect a slow reader. This is an availability bound against a
+same-user client, like the ceilings above. It does not claim fairness: a
+client that keeps reading slowly, one event within each deadline, is served
+at its own pace. It applies to td's own clients as well: a terminal or dialog
+that stops reading its socket for longer than the deadline is disconnected.
 
 ## 4. Unsafe confinement
 
