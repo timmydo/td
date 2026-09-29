@@ -52,6 +52,25 @@ fn extension(last: u8, critical: bool, value: Vec<u8>) -> Vec<u8> {
 }
 // Fixture DER only: P-256 CA and localhost leaf, valid 2025-01-01 to 2035-01-01.
 fn certificate(key: &EcdsaKeyPair, signer: &EcdsaKeyPair, ca: bool) -> Result<Vec<u8>> {
+    certificate_with(
+        key,
+        signer,
+        ca,
+        1,
+        b"td-test-root",
+        b"350101000000Z",
+        if ca { 1 } else { 2 },
+    )
+}
+fn certificate_with(
+    key: &EcdsaKeyPair,
+    signer: &EcdsaKeyPair,
+    ca: bool,
+    usage: u8,
+    issuer: &[u8],
+    expires: &[u8],
+    serial: u8,
+) -> Result<Vec<u8>> {
     let mut public = vec![0];
     public.extend_from_slice(key.public_key().as_ref());
     let spki = seq(&[
@@ -78,15 +97,15 @@ fn certificate(key: &EcdsaKeyPair, signer: &EcdsaKeyPair, ca: bool) -> Result<Ve
         extensions.push(extension(
             0x25,
             false,
-            seq(&[oid(&[0x2b, 6, 1, 5, 5, 7, 3, 1])]),
+            seq(&[oid(&[0x2b, 6, 1, 5, 5, 7, 3, usage])]),
         ));
     }
     let body = seq(&[
         der(0xa0, &der(2, &[2])),
-        der(2, &[if ca { 1 } else { 2 }]),
+        der(2, &[serial]),
         signature_algorithm(),
-        name(b"td-test-root"),
-        seq(&[der(0x17, b"250101000000Z"), der(0x17, b"350101000000Z")]),
+        name(issuer),
+        seq(&[der(0x17, b"250101000000Z"), der(0x17, expires)]),
         name(if ca { b"td-test-root" } else { b"localhost" }),
         spki,
         der(0xa3, &seq(&extensions)),
@@ -381,5 +400,281 @@ fn rejects_tampered_ciphertext() -> Result<()> {
         "{error:?}"
     );
     assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ClientCase {
+    Valid,
+    Missing,
+    UnknownIssuer,
+    Expired,
+    ServerUsage,
+    BadSignature,
+    WrongKey,
+}
+
+struct MutualConfigs {
+    client: Arc<rustls::ClientConfig>,
+    server: Arc<rustls::ServerConfig>,
+    leaf: Vec<u8>,
+}
+
+fn mutual_configs(
+    version: &'static rustls::SupportedProtocolVersion,
+    case: ClientCase,
+) -> Result<MutualConfigs> {
+    assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let root_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)?;
+    let root = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, root_bytes.as_ref())?;
+    let server_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)?;
+    let server_key =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, server_bytes.as_ref())?;
+    let client_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)?;
+    let client_key =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, client_bytes.as_ref())?;
+    let root_cert = certificate(&root, &root, true)?;
+    let server_cert = certificate(&server_key, &root, false)?;
+    let client_cert = certificate_with(
+        &client_key,
+        if matches!(case, ClientCase::BadSignature) {
+            &server_key
+        } else {
+            &root
+        },
+        false,
+        if matches!(case, ClientCase::ServerUsage) {
+            1
+        } else {
+            2
+        },
+        if matches!(case, ClientCase::UnknownIssuer) {
+            b"unconfigured root"
+        } else {
+            b"td-test-root"
+        },
+        if matches!(case, ClientCase::Expired) {
+            b"260101000000Z"
+        } else {
+            b"350101000000Z"
+        },
+        3,
+    )?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(root_cert.into())?;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots.clone()),
+        provider.clone(),
+    )
+    .build()?;
+    let mut server =
+        rustls::ServerConfig::builder_with_details(provider.clone(), Arc::new(Time(VALID_TIME)))
+            .with_protocol_versions(&[version])?
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![server_cert.into()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(server_bytes.as_ref().to_vec()).into(),
+            )?;
+    server.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    server.send_tls13_tickets = 0;
+    server.max_early_data_size = 0;
+    let builder = rustls::ClientConfig::builder_with_details(provider, Arc::new(Time(VALID_TIME)))
+        .with_protocol_versions(&[version])?
+        .with_root_certificates(roots);
+    let mut client = if matches!(case, ClientCase::Missing) {
+        builder.with_no_client_auth()
+    } else {
+        let key = if matches!(case, ClientCase::WrongKey) {
+            root_bytes.as_ref()
+        } else {
+            client_bytes.as_ref()
+        };
+        builder.with_client_auth_cert(
+            vec![client_cert.clone().into()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.to_vec()).into(),
+        )?
+    };
+    client.resumption = rustls::client::Resumption::disabled();
+    client.enable_early_data = false;
+    Ok(MutualConfigs {
+        client: Arc::new(client),
+        server: Arc::new(server),
+        leaf: client_cert,
+    })
+}
+
+fn mutual_pair(
+    client: Arc<rustls::ClientConfig>,
+    server: Arc<rustls::ServerConfig>,
+    hostname: &'static str,
+) -> Result<(rustls::Connection, rustls::Connection)> {
+    let mut client =
+        rustls::Connection::Client(rustls::ClientConnection::new(client, hostname.try_into()?)?);
+    let mut server = rustls::Connection::Server(rustls::ServerConnection::new(server)?);
+    client.set_buffer_limit(Some(BUFFER_BYTES));
+    server.set_buffer_limit(Some(BUFFER_BYTES));
+    Ok((client, server))
+}
+
+fn mutual_accepted(version: &'static rustls::SupportedProtocolVersion) -> Result<()> {
+    let MutualConfigs {
+        client,
+        server,
+        leaf,
+    } = mutual_configs(version, ClientCase::Valid)?;
+    let mut remote_client = (*client).clone();
+    remote_client.resumption = rustls::client::Resumption::default();
+    let mut remote_server = (*server).clone();
+    remote_server.session_storage = rustls::server::ServerSessionMemoryCache::new(32);
+    remote_server.send_tls13_tickets = 2;
+    // Each side's refusal must hold independently of its peer's preference.
+    for (client, server) in [
+        (client.clone(), server.clone()),
+        (Arc::new(remote_client), server.clone()),
+        (client.clone(), Arc::new(remote_server)),
+    ] {
+        mutual_round_trips(version, client, server, &leaf)?;
+    }
+    let (mut client, mut server) = mutual_pair(client, server, "wrong.example")?;
+    let error = drive(&mut client, &mut server)
+        .err()
+        .ok_or("mutual client accepted wrong server name")?;
+    assert!(
+        matches!(
+            error.downcast_ref::<rustls::Error>(),
+            Some(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForNameContext { .. }
+            ))
+        ),
+        "{error:?}"
+    );
+    assert!(server.peer_certificates().is_none());
+    assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+    Ok(())
+}
+
+fn mutual_round_trips(
+    version: &'static rustls::SupportedProtocolVersion,
+    client: Arc<rustls::ClientConfig>,
+    server: Arc<rustls::ServerConfig>,
+    leaf: &[u8],
+) -> Result<()> {
+    for _ in 0..2 {
+        let (mut client, mut server) = mutual_pair(client.clone(), server.clone(), "localhost")?;
+        assert!(client.is_handshaking() && server.is_handshaking());
+        drive(&mut client, &mut server)?;
+        for peer in [&client, &server] {
+            assert!(!peer.is_handshaking());
+            assert_eq!(peer.protocol_version(), Some(version.version));
+            assert_eq!(peer.handshake_kind(), Some(rustls::HandshakeKind::Full));
+        }
+        let chain = server
+            .peer_certificates()
+            .ok_or("missing authenticated client chain")?;
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain.first().ok_or("empty client chain")?.as_ref(), leaf);
+        let payload = b"gateway fixture after verified handshake";
+        client.writer().write_all(payload)?;
+        drive(&mut client, &mut server)?;
+        let mut buffer = [0; 128];
+        let output = buffer.get_mut(..payload.len()).ok_or("plaintext bound")?;
+        server.reader().read_exact(output)?;
+        assert_eq!(output, payload);
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn tls12_mutual_authentication() -> Result<()> {
+    mutual_accepted(&rustls::version::TLS12)
+}
+#[test]
+fn tls13_mutual_authentication() -> Result<()> {
+    mutual_accepted(&rustls::version::TLS13)
+}
+
+fn mutual_refused(case: ClientCase, expected: fn(&rustls::Error) -> bool) -> Result<()> {
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        let MutualConfigs { client, server, .. } = mutual_configs(version, case)?;
+        let (mut client, mut server) = mutual_pair(client, server, "localhost")?;
+        let error = drive(&mut client, &mut server)
+            .err()
+            .ok_or("unauthenticated client accepted")?;
+        let error = error
+            .downcast_ref::<rustls::Error>()
+            .ok_or("non-TLS fixture failure")?;
+        assert!(expected(error), "{version:?}: {error:?}");
+        assert!(server.peer_certificates().is_none());
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn mutual_authentication_requires_certificate() -> Result<()> {
+    mutual_refused(ClientCase::Missing, |e| {
+        matches!(e, rustls::Error::NoCertificatesPresented)
+    })
+}
+#[test]
+fn mutual_authentication_refuses_unknown_issuer() -> Result<()> {
+    mutual_refused(ClientCase::UnknownIssuer, |e| {
+        matches!(
+            e,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
+        )
+    })
+}
+#[test]
+fn mutual_authentication_refuses_expired_certificate() -> Result<()> {
+    mutual_refused(ClientCase::Expired, |e| {
+        matches!(
+            e,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::ExpiredContext {
+                time, not_after
+            }) if time.as_secs() == VALID_TIME && not_after.as_secs() == 1_767_225_600
+        )
+    })
+}
+#[test]
+fn mutual_authentication_refuses_server_only_usage() -> Result<()> {
+    mutual_refused(ClientCase::ServerUsage, |e| {
+        matches!(
+            e,
+            rustls::Error::InvalidCertificate(
+                rustls::CertificateError::InvalidPurposeContext { .. }
+            )
+        )
+    })
+}
+#[test]
+fn mutual_authentication_refuses_bad_signature() -> Result<()> {
+    mutual_refused(ClientCase::BadSignature, |e| {
+        matches!(
+            e,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature)
+        )
+    })
+}
+#[test]
+fn mutual_authentication_refuses_mismatched_key_before_connect() -> Result<()> {
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        let error = mutual_configs(version, ClientCase::WrongKey)
+            .err()
+            .ok_or("mismatched client key accepted")?;
+        assert!(
+            matches!(
+                error.downcast_ref::<rustls::Error>(),
+                Some(rustls::Error::InconsistentKeys(
+                    rustls::InconsistentKeys::KeyMismatch
+                ))
+            ),
+            "{error:?}"
+        );
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+    }
     Ok(())
 }

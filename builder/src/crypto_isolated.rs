@@ -650,6 +650,14 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "tls_smoke::rejects_malformed_record", false),
         ("td-crypto-smoke", "tls_smoke::rejects_bad_certificate_signature", false),
         ("td-crypto-smoke", "tls_smoke::rejects_tampered_ciphertext", false),
+        ("td-crypto-smoke", "tls_smoke::tls12_mutual_authentication", false),
+        ("td-crypto-smoke", "tls_smoke::tls13_mutual_authentication", false),
+        ("td-crypto-smoke", "tls_smoke::mutual_authentication_requires_certificate", false),
+        ("td-crypto-smoke", "tls_smoke::mutual_authentication_refuses_unknown_issuer", false),
+        ("td-crypto-smoke", "tls_smoke::mutual_authentication_refuses_expired_certificate", false),
+        ("td-crypto-smoke", "tls_smoke::mutual_authentication_refuses_server_only_usage", false),
+        ("td-crypto-smoke", "tls_smoke::mutual_authentication_refuses_bad_signature", false),
+        ("td-crypto-smoke", "tls_smoke::mutual_authentication_refuses_mismatched_key_before_connect", false),
         ("td-mta-format-smoke", "provider_hashes_container_and_binding_fixtures", false),
         ("td-mta-format-smoke", "provider_hashes_import_snapshot_fixtures", false),
         ("td-mta-config-smoke", "portable_loader_stack", true),
@@ -690,7 +698,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             println!("portable runtime: {prefix}{bytes}");
         }
     }
-    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, entropy and P-256/oracle probes, explicit provider, eight TLS cases and both bounded configuration stacks passed without toolchain mounts");
+    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, entropy and P-256/oracle probes, explicit provider, sixteen TLS cases and both bounded configuration stacks passed without toolchain mounts");
     Ok(())
 }
 

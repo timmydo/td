@@ -309,6 +309,46 @@ source files and vector data in its source digest. Functional, grammar and
 failure qualification does not complete native allocation, timing, stack/RSS
 or service integration work.
 
+### Mutual TLS backend qualification
+
+M07a5 extends the local backend fixture with mandatory client-certificate
+verification under both TLS 1.2 and TLS 1.3. Each server verifier receives
+an explicit provider and one generated local trust anchor. The client still
+verifies the server's chain, time and localhost name. Valid clients complete
+the handshake and send application data; the server's completed connection
+reports the exact client leaf DER supplied by the fixture.
+The check requires `!is_handshaking()` before using that leaf. Rustls can
+expose peer certificates before checking Finished; presence alone is not
+completed-handshake evidence. Refused client credentials leave no peer chain.
+The mutual setup also refuses a wrong server name, and its client-expiry
+assertion identifies both the verification time and the expired leaf's date.
+
+For each protocol, refuse an absent client certificate, an unknown issuer,
+an expired leaf, server-only extended key usage and a bad issuer signature.
+A mismatched client certificate/private key is refused during configuration,
+before connecting. Negative cases require the expected typed TLS error, not
+an arbitrary fixture failure. The process-global provider remains unset.
+
+The tested configurations disable client resumption, server session storage,
+TLS 1.3 tickets and early data. For each version, three configuration pairs
+cover both disabled, a resumption-enabled remote client, and a
+resumption-enabled remote server. Two connections reuse each pair and require
+full authenticated handshakes, qualifying each side's refusal independently.
+This qualifies this explicit fixture
+configuration; it does not configure a production session or prove an absence
+of temporary constructor allocations. Work retains the portable harness's
+existing wire, iteration, output and process-time bounds.
+
+These tests establish backend client-certificate behavior only. They do not
+supply an opaque TLS session API, filesystem/key admission, gateway peer/IP
+allowlist authorization, STARTTLS transitions, certificate rotation or
+resource qualification. A verified client chain or matching leaf hash is not
+mail authorization; td-mta's adapter must combine completed-handshake evidence
+with its current gateway policy. Generated certificates and in-memory peers
+contact no external service and add no fixture dependency.
+
+### Build, provider confinement and TLS policy
+
 M03b1 pins versions, features, licenses and roots; M03b2 pins the portable
 native build inputs.
 M03b2a implements checksum-pinned x86-64 musl header preparation as specified

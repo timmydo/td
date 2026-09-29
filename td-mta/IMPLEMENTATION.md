@@ -626,8 +626,11 @@ M07a3 adds a worker-local entropy handle with nonempty cold initialization,
 fixed returned-error handling and explicit native-abort limits. M07a4 supplies
 the concrete Crypto factory, fixed-size provider comparison and opaque P-256
 key generation/loading/signing, with bounded PKCS#8 admission and independent
-test-only ES256 verification. TLS, native allocation and service resource
-qualification remain pending; this does not complete M07 or enable service.
+test-only ES256 verification. M07a5 qualifies mandatory client certificates
+on local TLS 1.2/1.3 peers, including exact refusal cases and full handshakes
+with resumption disabled. Opaque TLS sessions, gateway authorization, native
+allocation and service resource qualification remain pending; these fixtures
+do not complete M07 or enable service.
 
 Freeze the bounded td-owned TLS configuration/session API before implementing
 consumers. Implement direct Crypto/Entropy operations and incoming/outgoing TLS

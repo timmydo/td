@@ -369,14 +369,15 @@ trust, publication, recovery, allocation bounds or service operation.
 
 The test-only backend module generates an ephemeral P-256 root and localhost
 leaf with the admitted signing backend. A small fixture DER encoder builds
-certificates valid from 2025-01-01 to 2035-01-01; no external certificate,
+certificates normally valid from 2025-01-01 to 2035-01-01; the client-expiry
+case ends its leaf's validity at 2026-01-01. No external certificate,
 private key, server, OpenSSL command or new dependency is needed. Both peers
 receive an explicit provider and fixed clock. The client trusts only this
 fixture's CA, no roots for the untrusted-chain case, or a same-named CA
 with a different key for the bad-signature case. The process-global
 provider stays unset.
 
-Eight cases run separately in the clean runtime:
+Sixteen cases run separately in the clean runtime:
 
 - TLS 1.2 and TLS 1.3 each negotiate the requested version, exchange binary
   plaintext in both directions and observe orderly closure on both peers.
@@ -385,6 +386,25 @@ Eight cases run separately in the clean runtime:
 - A server rejects an invalid TLS content type as a malformed record.
 - TLS 1.3 rejects the wrong CA key with a certificate-signature error and
   rejects a flipped authentication-tag byte with a decryption error.
+- TLS 1.2 and TLS 1.3 each require a trusted client certificate, complete
+  a full handshake, expose the exact verified client leaf and transfer data.
+  Two connections reuse each of three configuration pairs: both sides disable
+  resumption, only the remote client enables it, and only the remote server
+  enables it. Every connection must perform a full handshake, independently
+  qualifying the tested server and client settings. Early data stays off.
+  The mutual setup also refuses a wrong server name in each version.
+- Five cases run both versions and require specific errors for a missing
+  client certificate, unknown issuer, expired client leaf, server-only usage
+  and bad issuer signature. Client expiry alone changes in that case; the
+  server certificate and verification clock remain valid. The error pins
+  the verification and expiry timestamps. Refused clients leave no peer chain.
+- One case runs both versions and refuses a client certificate/private-key
+  mismatch during configuration, before creating connections.
+
+The mutual-authentication fixtures generate distinct client and server keys
+and use unique leaf serials under their generated CA. No client-chain result
+is gateway authorization; the mail adapter must apply its peer policy after
+handshake completion. These are private backend tests, not service adapters.
 
 The round trips assert X25519 key exchange and AES-256-GCM/SHA-384 suites
 for both versions. The fixture certificate and handshake signatures use
@@ -394,7 +414,11 @@ production policy. This check covers the CPU paths selected on the test host.
 
 Each drive uses a 32 KiB caller buffer and permits at most 256 KiB wire
 traffic and 64 bidirectional turns. Each round-trip case calls drive five
-times. Each connection's Rustls application-data send-buffer limit is
+times; each mutual-authentication positive case uses six successful
+connections with two drives each, plus one wrong-name handshake refusal.
+The five client-certificate refusal cases attempt
+one handshake per version; the key-mismatch case creates no connection.
+Each connection's Rustls application-data send-buffer limit is
 32 KiB; this does not constrain queued handshake or alert messages.
 Zero progress and exhausted budgets fail the test;
 each case also has the supervisor's 30-second process deadline. A failed
