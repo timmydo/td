@@ -216,8 +216,9 @@ checks atomically to admit these exact named closures and preserve the std-only
 rules for other crates. Do not exclude either crate from tests or Clippy.
 
 Implement the source/cc build controls in `td-crypto/DESIGN.md`; M03b2
-supplies their decoy checks. Pin the root Cargo config, reject ancestor
-configs and automatic build.rs inputs. Guard the locks and the actual host
+supplies their decoy checks. Pin the required root Cargo config and require
+ancestor config.toml files to match that pin. Reject legacy config files and
+automatic build.rs inputs. Guard the locks and the actual host
 feature/build graph, including inactive entries and duplicate native versions.
 M03b2 applies this policy to the portable target build as well.
 

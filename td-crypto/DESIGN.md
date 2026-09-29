@@ -35,8 +35,19 @@ backend uses the approved Rustls/AWS-LC category. AGENTS.md and the shared
 host/sandbox gate admit only the exact named
 manifests, locks, root Cargo configuration and selected normal/build features in
 `builder/src/crypto_policy.rs`. Other roster closures remain std-only.
-Changing any pinned input requires an explicit policy update. Cargo config
-files above the repository and either crate's automatic build.rs are refused.
+Changing any pinned input requires an explicit policy update. The checkout's
+root `.cargo/config.toml` is required. Ancestor `.cargo/config.toml` files are
+accepted only when each matches that same compiled pin, allowing nested
+worktrees to use their own runner. Legacy `.cargo/config` files remain refused
+at every level, as do either crate's automatic build.rs files. The pin contains
+only target runner settings, for which Cargo selects the deepest definition.
+Any future pin change must recheck ancestor merging and relative-path behavior;
+identical files with other settings need not have identical effective behavior.
+A nested worktree that changes the pin therefore requires matching ancestor
+configs too; an older worktree must rebase after an ancestor pin changes.
+Config reads require regular files of at most 4096 bytes and are bounded even
+if a file grows. These are trusted host checkout inputs, not a defense against
+concurrent hostile path replacement.
 `DEPENDENCIES.md` records the complete locked inventory and active subset.
 
 The host preflight prepares checksum-pinned crate archives through td-feed

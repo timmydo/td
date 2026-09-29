@@ -1,6 +1,7 @@
 //! Named dependency admission for the mail cryptography boundary.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::Path;
 
 pub(crate) const DEPENDENCIES: [&str; 3] = [
@@ -50,8 +51,8 @@ fn check_pin(name: &str, file: &str, text: &str, expected: &str) -> Result<(), S
 }
 
 /// Cargo can inject environment controls and replace a native `links` build
-/// script without changing its package graph. Only the reviewed root config
-/// may participate; a private CARGO_HOME alone does not hide parent configs.
+/// script without changing its package graph. Ancestor configs must carry the
+/// same reviewed pin; a private CARGO_HOME alone does not hide parent configs.
 pub(crate) fn cargo_config(root: &Path) -> Result<(), String> {
     let root = root
         .canonicalize()
@@ -61,6 +62,7 @@ pub(crate) fn cargo_config(root: &Path) -> Result<(), String> {
             let path = directory.join(".cargo").join(name);
             match std::fs::symlink_metadata(&path) {
                 Ok(_) if directory == root && name == "config.toml" => {}
+                Ok(_) if name == "config.toml" => check_cargo_config(&path)?,
                 Ok(_) => {
                     return Err(format!(
                         "crypto build refuses additional Cargo config: {}",
@@ -68,18 +70,40 @@ pub(crate) fn cargo_config(root: &Path) -> Result<(), String> {
                     ))
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(format!("inspect crypto Cargo config: {e}")),
+                Err(e) => {
+                    return Err(format!(
+                        "inspect crypto Cargo config {}: {e}",
+                        path.display()
+                    ))
+                }
             }
         }
     }
-    let text = std::fs::read_to_string(root.join(".cargo/config.toml"))
-        .map_err(|e| format!("read crypto Cargo config: {e}"))?;
+    // An ancestor must not substitute for the checkout's own runner config.
+    check_cargo_config(&root.join(".cargo/config.toml"))
+}
+
+fn check_cargo_config(path: &Path) -> Result<(), String> {
+    const MAX_CONFIG_BYTES: u64 = 4096;
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("read crypto Cargo config {}: {e}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
+        return Err(format!(
+            "crypto Cargo config must be a regular file of at most {MAX_CONFIG_BYTES} bytes: {}",
+            path.display()
+        ));
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(MAX_CONFIG_BYTES + 1).read_to_string(&mut text))
+        .map_err(|e| format!("read crypto Cargo config {}: {e}", path.display()))?;
     check_pin(
         "repository",
         ".cargo/config.toml",
         &text,
         "6328f2aeb929deef4faff8e6108c0b6b07eac36ae98dbde30a5f37ac3b6ed225",
     )
+    .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 pub(crate) fn no_build_script(root: &Path, name: &str) -> Result<(), String> {
@@ -168,6 +192,7 @@ mod tests {
         }
         std::fs::create_dir(&base).unwrap();
         let _cleanup = Cleanup(base.clone());
+        let base = base.canonicalize().unwrap();
         let checkout = base.join("checkout");
         std::fs::create_dir_all(checkout.join(".cargo")).unwrap();
         let path = checkout.join(".cargo/config.toml");
@@ -193,8 +218,60 @@ mod tests {
         let parent = base.join(".cargo/config.toml");
         std::fs::write(&parent, "[env]\nAWS_LC_SYS_NO_ASM = \"1\"\n").unwrap();
         assert!(cargo_config(&checkout).is_err());
-        std::fs::remove_file(parent).unwrap();
+        std::fs::remove_file(&parent).unwrap();
         assert!(cargo_config(&checkout).is_ok());
+
+        let nested = checkout.join(".claude/worktrees/nested");
+        std::fs::create_dir_all(nested.join(".cargo")).unwrap();
+        let nested_config = nested.join(".cargo/config.toml");
+        std::fs::write(&nested_config, &config).unwrap();
+        assert!(cargo_config(&nested).is_ok(), "identical parent config");
+        std::fs::write(&parent, &config).unwrap();
+        assert!(
+            cargo_config(&nested).is_ok(),
+            "multiple identical ancestors"
+        );
+        for ancestor in [&parent, &path, &nested_config] {
+            std::fs::write(ancestor, format!("{config}\n[env]\nCC = \"unapproved\"\n")).unwrap();
+            let error = cargo_config(&nested).unwrap_err();
+            assert!(error.contains("reviewed crypto admission pin"), "{error}");
+            assert!(error.contains(&ancestor.display().to_string()), "{error}");
+            std::fs::remove_file(ancestor).unwrap();
+            std::fs::create_dir(ancestor).unwrap();
+            assert!(
+                cargo_config(&nested).is_err(),
+                "unreadable config directory"
+            );
+            std::fs::remove_dir(ancestor).unwrap();
+            std::os::unix::fs::symlink("absent", ancestor).unwrap();
+            assert!(cargo_config(&nested).is_err(), "dangling config symlink");
+            std::fs::remove_file(ancestor).unwrap();
+            std::os::unix::fs::symlink("/dev/zero", ancestor).unwrap();
+            let error = cargo_config(&nested).unwrap_err();
+            assert!(error.contains("must be a regular file"), "{error}");
+            std::fs::remove_file(ancestor).unwrap();
+            std::fs::write(ancestor, vec![b'x'; 4097]).unwrap();
+            let error = cargo_config(&nested).unwrap_err();
+            assert!(error.contains("at most 4096 bytes"), "{error}");
+            std::fs::write(ancestor, &config).unwrap();
+        }
+        for directory in [&base, &checkout, &nested] {
+            let legacy = directory.join(".cargo/config");
+            std::fs::write(&legacy, &config).unwrap();
+            let error = cargo_config(&nested).unwrap_err();
+            assert!(error.contains("refuses additional Cargo config"), "{error}");
+            assert!(error.contains(&legacy.display().to_string()), "{error}");
+            std::fs::remove_file(legacy).unwrap();
+        }
+        std::fs::remove_file(&nested_config).unwrap();
+        let error = cargo_config(&nested).unwrap_err();
+        assert!(error.contains("read crypto Cargo config"), "{error}");
+        assert!(
+            error.contains(&nested_config.display().to_string()),
+            "{error}"
+        );
+        std::fs::write(&nested_config, &config).unwrap();
+        assert!(cargo_config(&nested).is_ok());
         for name in ["td-crypto", "td-mta"] {
             std::fs::create_dir(checkout.join(name)).unwrap();
             assert!(no_build_script(&checkout, name).is_ok());
