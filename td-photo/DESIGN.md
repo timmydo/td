@@ -1258,8 +1258,9 @@ block is ever a leaf, since there is no 64-point transform here), one
 transform the block's size (`TX_MODE_LARGEST`, the reduced transform
 set: a luma block below 32 may signal any of the four DCT and ADST
 pairs, chroma's is the one its mode implies, `DCT_DCT` at 32), the
-thirteen intra modes without an angle delta, filter or palette and,
-for chroma, its prediction from the block's luma (each plane's alpha
+thirteen intra modes, the directional ones with their angle deltas
+(three degrees a step, to nine either way), without filter or palette
+and, for chroma, its prediction from the block's luma (each plane's alpha
 the least-squares fit in eighths, it and its neighbours tried by
 squared error), deblocking and CDEF but no restoration, superres or
 film grain, and the symbol adaptation the spec runs by default. The
@@ -1276,8 +1277,11 @@ step as libaom sets it and `D` the squared error, sixteen times it the
 scale libaom's distortion and `rdmult` share, the rate the coder's own
 cost of its symbols under the tile's live probabilities): the modes are
 screened by the 4x4 Hadamard SATD of their predictions plus their mode
-symbols' rate under sixteen times the root of the multiplier, the best
-three (for chroma, one mode for both planes, the closest two and the
+symbols' rate under sixteen times the root of the multiplier (the two
+closest directional modes of luma and the closest of chroma screened
+again at their six other angles, the predictor making each row or
+column one two-tap blend of an edge slice at a fixed step),
+the best three (for chroma, one mode for both planes, the closest two and the
 prediction from luma if it is not one of them, since the screen ranks
 it below what coding it measures) coded in full and compared with
 their mode's rate, then the chosen luma mode coded under the other
@@ -1328,18 +1332,18 @@ read once per plane and every mode is predicted from them into the
 tile's scratch, which also holds the transform's working blocks and
 each plane's trial and best coding and only grows, so a block
 allocates only the levels its leaf keeps. A 24-megapixel export takes
-about twenty-two seconds on one thread and a few on eight
+about twenty-four seconds on one thread and a few on eight
 (`tests/av1.rs`'s `bench`). Against libaom's all-intra speed 6 on a
-real 2048-pixel photo the encoder needs under 1% more bits for the
-same PSNR from 0.3 to 3 bits a pixel and about 7% below that, where
-libaom's CDEF chooses strengths by searching each 64x64; the
-compression follow-ups, by what libaom's tools measured there, are
-rectangular partitions and transforms and angle deltas. Measured
-before the trellis priced the zeros an end of block passes over:
-zeroing a transform's few levels outright bought luma about 2% but
-cost RGB 3% at low rates, a chroma weight trading one for the other,
-and coding more luma modes in full bought under 1% on luma for half
-again the time.
+real 2048-pixel photo the encoder needs about 1% fewer bits for the
+same luma PSNR from 0.3 to 3 bits a pixel (1% more for RGB) and about
+3% more below that, where libaom's CDEF chooses strengths by
+searching each 64x64; the compression follow-up, by what libaom's
+tools measured there, is rectangular partitions and transforms.
+Measured before the trellis priced the zeros an end of block passes
+over: zeroing a transform's few levels outright bought luma about 2%
+but cost RGB 3% at low rates, a chroma weight trading one for the
+other, and coding more luma modes in full bought under 1% on luma for
+half again the time.
 
 The AVIF (`avif::file`) is the least HEIF file the format asks for and
 every reader expects: `ftyp` with the `avif` brand and `mif1`, `miaf`
@@ -1885,7 +1889,9 @@ to a stream whose reconstruction is the encoder's own and, with
 `TD_TEST_DAV1D` naming a dav1d binary, decoded by it to the same bytes
 exactly, as are colour ramps that make chroma from luma code every
 pair of alpha signs in blocks both edges cut, and noise, a hard edge
-and a chroma checkerboard at the strongest filter strengths; five
+and a chroma checkerboard at the strongest filter strengths, and
+gratings at an angle a cell, in luma and in chroma alone, that make
+every directional mode of each plane turn; five
 streams and their reconstructions held to the hashes recorded under
 that decode, two at the coarsest steps, the same bytes on one thread
 and three; the stream's sequence header
@@ -1898,7 +1904,9 @@ their ends; the coder's unit tests round-trip symbols and bits through a
 transcription of the spec's decoder, pin the adaptation, the bit writer,
 `leb128` and the OBU framing, the trailing-bit rule (spec 8.2.4, which
 libaom's decoder enforces), the end-of-block classes and the predictors
-by value, chroma from luma's signed rounding among them, and hold the
+by value, chroma from luma's signed rounding and two angle deltas'
+turns among them, hold every directional angle's line-at-a-time
+prediction to the spec's pixel by pixel on random edges, and hold the
 trellis's prices to what the coder counts for random blocks of every
 size and its levels to the quantizer's or one below with an end of
 block that matches them; `cdef`'s pin the direction search on each

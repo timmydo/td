@@ -7,12 +7,13 @@
 //!
 //! What the encoder uses of AV1: 64x64 superblocks split down to square
 //! blocks of 32, 16 and 8 pixels by rate-distortion choice; every intra
-//! mode, chroma from luma included, but palette and filter-intra; for
-//! luma below 32 the best of the reduced set's four DCT and ADST pairs,
-//! for chroma the mode's default; one transform per plane per block, its
-//! levels a dead-zone quantizer's refined by a trellis; the multi-symbol
-//! arithmetic coder with adapting CDFs from the defaults; uniform tile
-//! columns by the frame's size alone, which the threads spread over.
+//! mode, angle deltas and chroma from luma included, but palette and
+//! filter-intra; for luma below 32 the best of the reduced set's four
+//! DCT and ADST pairs, for chroma the mode's default; one transform per
+//! plane per block, its levels a dead-zone quantizer's refined by a
+//! trellis; the multi-symbol arithmetic coder with adapting CDFs from
+//! the defaults; uniform tile columns by the frame's size alone, which
+//! the threads spread over.
 //! The deblocking filter and CDEF are on at strengths from the
 //! quantizer; restoration, superres, film grain and screen-content tools
 //! stay off. `transform` holds the transforms, quantizers and scans,
@@ -84,6 +85,12 @@ const UV_CFL_PRED: u8 = 13;
 /// chroma from luma is coded beside chroma's too.
 const LUMA_TRIALS: usize = 3;
 const CHROMA_TRIALS: usize = 2;
+/// How many of the screen's closest directional modes have their angle
+/// deltas screened too, luma and chroma.
+const ANGLE_MODES: usize = 2;
+const UV_ANGLE_MODES: usize = 1;
+/// The nonzero angle deltas, in steps of three degrees.
+const DELTAS: [i8; 6] = [-3, -2, -1, 1, 2, 3];
 /// Every mode the encoder tries, luma and chroma alike.
 const MODES: [u8; 13] = [
     DC_PRED,
@@ -1319,6 +1326,9 @@ struct Leaf {
     skip: bool,
     y_mode: u8,
     uv_mode: u8,
+    /// The directional modes' angle deltas, luma and chroma, in steps of
+    /// three degrees.
+    deltas: [i8; 2],
     /// The chroma-from-luma alphas of U and V in eighths, when `uv_mode`
     /// is `UV_CFL_PRED`.
     cfl: [i8; 2],
@@ -1786,6 +1796,7 @@ impl Tile {
             skip: false,
             y_mode: DC_PRED,
             uv_mode: DC_PRED,
+            deltas: [0; 2],
             cfl: [0; 2],
             tx_type: TxType::DctDct,
             levels: [Vec::new(), Vec::new(), Vec::new()],
@@ -1803,36 +1814,65 @@ impl Tile {
         // the closest few coded in full.
         let edges = self.pred_edges(0, at);
         let area = side * side;
-        let luma = grown(preds, MODES.len() * area);
-        let mut screened = [(0u64, 0u8, 0usize); MODES.len()];
+        let luma = grown(preds, (MODES.len() + ANGLE_MODES * DELTAS.len()) * area);
+        let mut screened =
+            [(u64::MAX, DC_PRED, 0i8, 0usize); MODES.len() + ANGLE_MODES * DELTAS.len()];
         for (k, ((slot, &mode), pred)) in screened
             .iter_mut()
             .zip(&MODES)
             .zip(luma.chunks_exact_mut(area))
             .enumerate()
         {
-            predict_block(mode, &edges, pred);
+            predict_block(mode, 0, &edges, pred);
             let mut counter = Counter(0);
-            self.y_mode_symbols(&mut counter, at, mode);
-            *slot = (self.screen(self.satd(0, at, pred), counter.0), mode, k);
+            self.y_mode_symbols(&mut counter, at, mode, 0);
+            *slot = (self.screen(self.satd(0, at, pred), counter.0), mode, 0, k);
+        }
+        // The closest directional modes' other angles.
+        let mut ranked = screened;
+        ranked.sort_unstable();
+        let angled = ranked
+            .iter()
+            .filter(|&&(score, mode, ..)| score != u64::MAX && is_directional(mode))
+            .take(ANGLE_MODES)
+            .flat_map(|&(_, mode, ..)| DELTAS.map(|delta| (mode, delta)));
+        for (k, (mode, delta)) in (MODES.len()..).zip(angled) {
+            let (Some(pred), Some(slot)) =
+                (luma.get_mut(k * area..(k + 1) * area), screened.get_mut(k))
+            else {
+                break;
+            };
+            predict_block(mode, delta, &edges, pred);
+            let mut counter = Counter(0);
+            self.y_mode_symbols(&mut counter, at, mode, delta);
+            *slot = (
+                self.screen(self.satd(0, at, pred), counter.0),
+                mode,
+                delta,
+                k,
+            );
         }
         screened.sort_unstable();
         let size = plane_size(at.log2, 0);
         let mut y_mode = None;
         let mut best_score = u64::MAX;
-        for &(_, mode, k) in screened.iter().take(LUMA_TRIALS) {
+        for &(_, mode, delta, k) in screened
+            .iter()
+            .filter(|&&(score, ..)| score != u64::MAX)
+            .take(LUMA_TRIALS)
+        {
             let pred = luma.get(k * area..(k + 1) * area).unwrap_or(&[]);
             self.code_plane(0, at, mode, mode_tx_type(mode, size), pred, work, trial_y);
             let mut counter = Counter(0);
-            self.y_mode_symbols(&mut counter, at, mode);
+            self.y_mode_symbols(&mut counter, at, mode, delta);
             let score = trial_y.cost.saturating_add(self.rd(0, counter.0));
             if y_mode.is_none() || score < best_score {
                 std::mem::swap(trial_y, best_y);
-                y_mode = Some((mode, k));
+                y_mode = Some((mode, delta, k));
                 best_score = score;
             }
         }
-        let Some((y_mode, k)) = y_mode else {
+        let Some((y_mode, y_delta, k)) = y_mode else {
             return (leaf, 0);
         };
         // The chosen mode under the other types its size signals: the
@@ -1853,6 +1893,7 @@ impl Tile {
         }
         let y_cost = best_y.cost;
         leaf.y_mode = y_mode;
+        leaf.deltas[0] = y_delta;
         leaf.tx_type = best_y.tx;
         self.write_recon(0, at, &best_y.recon);
         leaf.levels[0] = std::mem::take(&mut best_y.levels);
@@ -1861,8 +1902,9 @@ impl Tile {
         let n = side / 2;
         let area = n * n;
         let (edges_u, edges_v) = (self.pred_edges(1, at), self.pred_edges(2, at));
-        let chroma = grown(preds, (MODES.len() + 1) * area * 2);
-        let mut screened_uv = [(u64::MAX, DC_PRED, 0usize); MODES.len() + 1];
+        const UV_SLOTS: usize = MODES.len() + 1 + UV_ANGLE_MODES * DELTAS.len();
+        let chroma = grown(preds, UV_SLOTS * area * 2);
+        let mut screened_uv = [(u64::MAX, DC_PRED, 0i8, 0usize); UV_SLOTS];
         for (k, ((slot, &mode), pred)) in screened_uv
             .iter_mut()
             .zip(&MODES)
@@ -1870,12 +1912,36 @@ impl Tile {
             .enumerate()
         {
             let (u, v) = pred.split_at_mut(area);
-            predict_block(mode, &edges_u, u);
-            predict_block(mode, &edges_v, v);
+            predict_block(mode, 0, &edges_u, u);
+            predict_block(mode, 0, &edges_v, v);
             let mut counter = Counter(0);
-            self.uv_mode_symbols(&mut counter, y_mode, mode, [0; 2]);
+            self.uv_mode_symbols(&mut counter, y_mode, mode, 0, [0; 2]);
             let satd = self.satd(1, at, u) + self.satd(2, at, v);
-            *slot = (self.screen(satd, counter.0), mode, k);
+            *slot = (self.screen(satd, counter.0), mode, 0, k);
+        }
+        // The closest directional modes' other angles, after the slot
+        // chroma from luma takes.
+        let mut ranked = screened_uv;
+        ranked.sort_unstable();
+        let angled = ranked
+            .iter()
+            .filter(|&&(score, mode, ..)| score != u64::MAX && is_directional(mode))
+            .take(UV_ANGLE_MODES)
+            .flat_map(|&(_, mode, ..)| DELTAS.map(|delta| (mode, delta)));
+        for (k, (mode, delta)) in (MODES.len() + 1..).zip(angled) {
+            let (Some(pred), Some(slot)) = (
+                chroma.get_mut(k * area * 2..(k + 1) * area * 2),
+                screened_uv.get_mut(k),
+            ) else {
+                break;
+            };
+            let (u, v) = pred.split_at_mut(area);
+            predict_block(mode, delta, &edges_u, u);
+            predict_block(mode, delta, &edges_v, v);
+            let mut counter = Counter(0);
+            self.uv_mode_symbols(&mut counter, y_mode, mode, delta, [0; 2]);
+            let satd = self.satd(1, at, u) + self.satd(2, at, v);
+            *slot = (self.screen(satd, counter.0), mode, delta, k);
         }
         // Chroma from luma: each plane's DC prediction, the first of the
         // modes, and its alpha against the luma just reconstructed.
@@ -1900,9 +1966,9 @@ impl Tile {
                     cfl_predict(dc_u, &work.ac, cfl[0], u);
                     cfl_predict(dc_v, &work.ac, cfl[1], v);
                     let mut counter = Counter(0);
-                    self.uv_mode_symbols(&mut counter, y_mode, UV_CFL_PRED, cfl);
+                    self.uv_mode_symbols(&mut counter, y_mode, UV_CFL_PRED, 0, cfl);
                     let satd = self.satd(1, at, u) + self.satd(2, at, v);
-                    *slot = (self.screen(satd, counter.0), UV_CFL_PRED, k);
+                    *slot = (self.screen(satd, counter.0), UV_CFL_PRED, 0, k);
                 }
             }
         }
@@ -1911,7 +1977,7 @@ impl Tile {
         let mut best_score = u64::MAX;
         // The closest few and chroma from luma, which the screen ranks
         // below what coding it measures.
-        for (i, &(score, mode, k)) in screened_uv.iter().enumerate() {
+        for (i, &(score, mode, delta, k)) in screened_uv.iter().enumerate() {
             if score == u64::MAX || (i >= CHROMA_TRIALS && mode != UV_CFL_PRED) {
                 continue;
             }
@@ -1922,7 +1988,7 @@ impl Tile {
             self.code_plane(2, at, mode, tx, pv, work, trial_v);
             let alphas = if mode == UV_CFL_PRED { cfl } else { [0; 2] };
             let mut counter = Counter(0);
-            self.uv_mode_symbols(&mut counter, y_mode, mode, alphas);
+            self.uv_mode_symbols(&mut counter, y_mode, mode, delta, alphas);
             let score = trial_u
                 .cost
                 .saturating_add(trial_v.cost)
@@ -1930,15 +1996,16 @@ impl Tile {
             if uv_mode.is_none() || score < best_score {
                 std::mem::swap(trial_u, best_u);
                 std::mem::swap(trial_v, best_v);
-                uv_mode = Some(mode);
+                uv_mode = Some((mode, delta));
                 best_score = score;
             }
         }
-        let Some(uv_mode) = uv_mode else {
+        let Some((uv_mode, uv_delta)) = uv_mode else {
             return (leaf, y_cost);
         };
         let uv_cost = best_u.cost.saturating_add(best_v.cost);
         leaf.uv_mode = uv_mode;
+        leaf.deltas[1] = uv_delta;
         if uv_mode == UV_CFL_PRED {
             leaf.cfl = cfl;
         }
@@ -2228,14 +2295,14 @@ impl Tile {
         if let Some(cdf) = self.cdfs.skip.get_mut(usize::from(above_skip + left_skip)) {
             sink.symbol(cdf, usize::from(leaf.skip));
         }
-        self.y_mode_symbols(sink, leaf.at, leaf.y_mode);
-        self.uv_mode_symbols(sink, leaf.y_mode, leaf.uv_mode, leaf.cfl);
+        let [y_delta, uv_delta] = leaf.deltas;
+        self.y_mode_symbols(sink, leaf.at, leaf.y_mode, y_delta);
+        self.uv_mode_symbols(sink, leaf.y_mode, leaf.uv_mode, uv_delta, leaf.cfl);
     }
 
     /// The luma mode's symbols of a block at the position: `y_mode` under
-    /// its neighbours' modes and, for a directional one, a zero angle
-    /// delta.
-    fn y_mode_symbols(&mut self, sink: &mut impl Sink, at: At, y_mode: u8) {
+    /// its neighbours' modes and, for a directional one, its angle delta.
+    fn y_mode_symbols(&mut self, sink: &mut impl Sink, at: At, y_mode: u8, delta: i8) {
         let (mi_row, mi_col) = (at.mi_row, at.mi_col);
         let above_mode = if self.avail_up(mi_row) {
             self.contexts
@@ -2263,16 +2330,19 @@ impl Tile {
         {
             sink.symbol(cdf, usize::from(y_mode));
         }
-        if is_directional(y_mode) {
-            if let Some(cdf) = self.cdfs.angle_delta.get_mut(usize::from(y_mode - V_PRED)) {
-                sink.symbol(cdf, 3);
-            }
-        }
+        self.angle_delta_symbol(sink, y_mode, delta);
     }
 
     /// The chroma mode's symbols under the luma mode: `uv_mode` and, for
-    /// a directional one, a zero angle delta.
-    fn uv_mode_symbols(&mut self, sink: &mut impl Sink, y_mode: u8, uv_mode: u8, cfl: [i8; 2]) {
+    /// a directional one, its angle delta.
+    fn uv_mode_symbols(
+        &mut self,
+        sink: &mut impl Sink,
+        y_mode: u8,
+        uv_mode: u8,
+        delta: i8,
+        cfl: [i8; 2],
+    ) {
         if let Some(cdf) = self.cdfs.uv_mode.get_mut(usize::from(y_mode)) {
             sink.symbol(cdf, usize::from(uv_mode));
         }
@@ -2301,9 +2371,14 @@ impl Tile {
                 }
             }
         }
-        if is_directional(uv_mode) {
-            if let Some(cdf) = self.cdfs.angle_delta.get_mut(usize::from(uv_mode - V_PRED)) {
-                sink.symbol(cdf, 3);
+        self.angle_delta_symbol(sink, uv_mode, delta);
+    }
+
+    /// A directional mode's angle delta, `-3..=3` coded from 0.
+    fn angle_delta_symbol(&mut self, sink: &mut impl Sink, mode: u8, delta: i8) {
+        if is_directional(mode) {
+            if let Some(cdf) = self.cdfs.angle_delta.get_mut(usize::from(mode - V_PRED)) {
+                sink.symbol(cdf, u8::try_from(delta + 3).map_or(3, usize::from));
             }
         }
     }
@@ -3071,8 +3146,9 @@ fn fill(out: &mut [u8], n: usize, value: impl Fn(usize, usize) -> i32) {
     }
 }
 
-/// The spec's prediction of an `n` square from the edges.
-fn predict_block(mode: u8, edges: &Edges, out: &mut [u8]) {
+/// The spec's prediction of an `n` square from the edges, a
+/// directional mode's angle moved by `delta` steps of three degrees.
+fn predict_block(mode: u8, delta: i8, edges: &Edges, out: &mut [u8]) {
     let Edges {
         n,
         have_above,
@@ -3141,7 +3217,7 @@ fn predict_block(mode: u8, edges: &Edges, out: &mut [u8]) {
             });
         }
         _ => {
-            let angle = mode_angle(mode);
+            let angle = mode_angle(mode) + 3 * i32::from(delta);
             let round5 = |v: i32| (v + 16) >> 5;
             if angle == 90 {
                 if let Some(top) = above.get(1..=n) {
@@ -3154,50 +3230,74 @@ fn predict_block(mode: u8, edges: &Edges, out: &mut [u8]) {
                     row.fill(side);
                 }
             } else if angle < 90 {
+                // Row by row from the above edge: the step between two
+                // pixels is the row's, and past `max_base` the last pixel.
                 let dx = derivative(angle);
-                let max_base = 2 * n as isize - 1;
-                fill(out, n, |i, j| {
+                let max_base = 2 * n - 1;
+                let last = above.get(max_base + 1).copied().unwrap_or(128);
+                for (i, row) in out.chunks_exact_mut(n).enumerate() {
                     let idx = (i as i32 + 1) * dx;
-                    let shift = (idx >> 1) & 0x1F;
-                    let base = (idx >> 6) as isize + j as isize;
-                    if base < max_base {
-                        round5(a(base) * (32 - shift) + a(base + 1) * shift)
-                    } else {
-                        a(max_base)
-                    }
-                });
+                    let base = (idx >> 6) as usize;
+                    let (inner, outer) = row.split_at_mut(max_base.saturating_sub(base).min(n));
+                    blend(
+                        inner,
+                        above.get(base + 1..).unwrap_or(&[]),
+                        (idx >> 1) & 0x1F,
+                    );
+                    outer.fill(last);
+                }
             } else if angle < 180 {
+                // Each row reads the above edge from the column where its
+                // projection meets it, at one step, and the left edge
+                // before that.
                 let dx = derivative(180 - angle);
                 let dy = derivative(angle - 90);
-                fill(out, n, |i, j| {
-                    let idx = ((j as i32) << 6) - (i as i32 + 1) * dx;
-                    let base = idx >> 6;
-                    if base >= -1 {
-                        let shift = (idx >> 1) & 0x1F;
-                        let b = base as isize;
-                        round5(a(b) * (32 - shift) + a(b + 1) * shift)
-                    } else {
+                for (i, row) in out.chunks_exact_mut(n).enumerate() {
+                    let back = -(i as i32 + 1) * dx;
+                    let first = (-1 - (back >> 6)).clamp(0, n as i32) as usize;
+                    let (by_left, by_above) = row.split_at_mut(first);
+                    // The above part begins where the row's projection
+                    // meets the corner, `AboveRow[-1]`.
+                    blend(by_above, above, (back >> 1) & 0x1F);
+                    for (j, slot) in by_left.iter_mut().enumerate() {
                         let idx = ((i as i32) << 6) - (j as i32 + 1) * dy;
                         let base = (idx >> 6) as isize;
                         let shift = (idx >> 1) & 0x1F;
-                        round5(l(base) * (32 - shift) + l(base + 1) * shift)
+                        *slot = round5(l(base) * (32 - shift) + l(base + 1) * shift) as u8;
                     }
-                });
+                }
             } else {
+                // Column by column from the left edge, as rows are from
+                // the above one.
                 let dy = derivative(270 - angle);
-                let max_base = 2 * n as isize - 1;
-                fill(out, n, |i, j| {
+                let max_base = 2 * n - 1;
+                let last = left.get(max_base + 1).copied().unwrap_or(128);
+                let mut column = [0u8; 64];
+                for j in 0..n {
                     let idx = (j as i32 + 1) * dy;
-                    let shift = (idx >> 1) & 0x1F;
-                    let base = (idx >> 6) as isize + i as isize;
-                    if base < max_base {
-                        round5(l(base) * (32 - shift) + l(base + 1) * shift)
-                    } else {
-                        l(max_base)
+                    let base = (idx >> 6) as usize;
+                    let line = column.get_mut(..n).unwrap_or(&mut []);
+                    let (inner, outer) = line.split_at_mut(max_base.saturating_sub(base).min(n));
+                    blend(
+                        inner,
+                        left.get(base + 1..).unwrap_or(&[]),
+                        (idx >> 1) & 0x1F,
+                    );
+                    outer.fill(last);
+                    for (slot, &v) in out.iter_mut().skip(j).step_by(n).zip(column.iter()) {
+                        *slot = v;
                     }
-                });
+                }
             }
         }
+    }
+}
+
+/// `out[j]` the edge's `edge[j]` and `edge[j + 1]` mixed `32 - shift`
+/// to `shift` in 32nds, rounded: a directional prediction's line.
+fn blend(out: &mut [u8], edge: &[u8], shift: i32) {
+    for (slot, (&p, &q)) in out.iter_mut().zip(edge.iter().zip(edge.iter().skip(1))) {
+        *slot = ((i32::from(p) * (32 - shift) + i32::from(q) * shift + 16) >> 5) as u8;
     }
 }
 
@@ -3836,6 +3936,83 @@ mod tests {
         assert_eq!(eob_position(1024), (11, 9));
     }
 
+    /// The spec's directional prediction pixel by pixel (7.11.2.4, with
+    /// no edge filter or upsampling), which `predict_block` computes a
+    /// line at a time.
+    fn directional_by_pixel(angle: i32, n: usize, above: &[u8; 65], left: &[u8; 65]) -> Vec<u8> {
+        // An index before the corner panics: the spec never reads one.
+        let a = |i: isize| i32::from(above[usize::try_from(i + 1).unwrap()]);
+        let l = |i: isize| i32::from(left[usize::try_from(i + 1).unwrap()]);
+        let round5 = |v: i32| (v + 16) >> 5;
+        let max_base = 2 * n as isize - 1;
+        let mut out = vec![0; n * n];
+        fill(&mut out, n, |i, j| {
+            let (i, j) = (i as i32, j as i32);
+            if angle < 90 {
+                let idx = (i + 1) * derivative(angle);
+                let (base, shift) = ((idx >> 6) as isize + j as isize, (idx >> 1) & 0x1F);
+                if base < max_base {
+                    round5(a(base) * (32 - shift) + a(base + 1) * shift)
+                } else {
+                    a(max_base)
+                }
+            } else if angle < 180 {
+                let idx = (j << 6) - (i + 1) * derivative(180 - angle);
+                if idx >> 6 >= -1 {
+                    let (base, shift) = ((idx >> 6) as isize, (idx >> 1) & 0x1F);
+                    round5(a(base) * (32 - shift) + a(base + 1) * shift)
+                } else {
+                    let idx = (i << 6) - (j + 1) * derivative(angle - 90);
+                    let (base, shift) = ((idx >> 6) as isize, (idx >> 1) & 0x1F);
+                    round5(l(base) * (32 - shift) + l(base + 1) * shift)
+                }
+            } else {
+                let idx = (j + 1) * derivative(270 - angle);
+                let (base, shift) = ((idx >> 6) as isize + i as isize, (idx >> 1) & 0x1F);
+                if base < max_base {
+                    round5(l(base) * (32 - shift) + l(base + 1) * shift)
+                } else {
+                    l(max_base)
+                }
+            }
+        });
+        out
+    }
+
+    #[test]
+    fn the_directional_lines_are_the_spec_pixel_by_pixel() {
+        let mut rng = Lcg(7);
+        for n in [4, 8, 16, 32] {
+            for _ in 0..8 {
+                let mut above = [0u8; 65];
+                let mut left = [0u8; 65];
+                for v in above.iter_mut().chain(left.iter_mut()) {
+                    *v = rng.next() as u8;
+                }
+                left[0] = above[0];
+                let edges = Edges {
+                    n,
+                    have_above: true,
+                    have_left: true,
+                    above,
+                    left,
+                };
+                let mut out = vec![0; n * n];
+                for mode in V_PRED..=D67_PRED {
+                    for delta in -3..=3 {
+                        let angle = mode_angle(mode) + 3 * i32::from(delta);
+                        if angle == 90 || angle == 180 {
+                            continue;
+                        }
+                        predict_block(mode, delta, &edges, &mut out);
+                        let want = directional_by_pixel(angle, n, &above, &left);
+                        assert_eq!(out, want, "{n} {mode} {delta}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_predictors_follow_the_edges() {
         let mut above = [0u8; 65];
@@ -3854,41 +4031,60 @@ mod tests {
             left,
         };
         let mut out = [0u8; 16];
-        predict_block(V_PRED, &edges(true, true), &mut out);
+        predict_block(V_PRED, 0, &edges(true, true), &mut out);
         assert_eq!(&out[..4], &above[1..5]);
         assert_eq!(&out[12..], &above[1..5]);
-        predict_block(H_PRED, &edges(true, true), &mut out);
+        predict_block(H_PRED, 0, &edges(true, true), &mut out);
         assert_eq!(out[0], left[1]);
         assert_eq!(out[15], left[4]);
-        predict_block(DC_PRED, &edges(true, true), &mut out);
+        predict_block(DC_PRED, 0, &edges(true, true), &mut out);
         let sum: u32 = above[1..5]
             .iter()
             .chain(&left[1..5])
             .map(|&v| u32::from(v))
             .sum();
         assert!(out.iter().all(|&v| u32::from(v) == (sum + 4) / 8));
-        predict_block(DC_PRED, &edges(false, false), &mut out);
+        predict_block(DC_PRED, 0, &edges(false, false), &mut out);
         assert!(out.iter().all(|&v| v == 128));
-        predict_block(DC_PRED, &edges(false, true), &mut out);
+        predict_block(DC_PRED, 0, &edges(false, true), &mut out);
         let sum: u32 = left[1..5].iter().map(|&v| u32::from(v)).sum();
         assert!(out.iter().all(|&v| u32::from(v) == (sum + 2) / 4));
         // D45 walks up and right: row i, column j is AboveRow[i + j + 1].
-        predict_block(D45_PRED, &edges(true, true), &mut out);
+        predict_block(D45_PRED, 0, &edges(true, true), &mut out);
         for i in 0..4 {
             for j in 0..4 {
                 assert_eq!(out[i * 4 + j], above[i + j + 2], "{i} {j}");
             }
         }
         // D135 walks down and right from the corner.
-        predict_block(D135_PRED, &edges(true, true), &mut out);
+        predict_block(D135_PRED, 0, &edges(true, true), &mut out);
         for i in 0..4 {
             for j in 0..4 {
                 let want = if j >= i { above[j - i] } else { left[i - j] };
                 assert_eq!(out[i * 4 + j], want, "{i} {j}");
             }
         }
+        // An angle delta turns the mode: V at 87 degrees leans a thirty-
+        // second a row towards the above-right, so on the edge's ramp of
+        // 3 its fourth row rounds up by one; H at 189 leans a sixth a
+        // column towards the below-left, so past its first column the
+        // falling ramp of 2 rounds down by one.
+        predict_block(V_PRED, -1, &edges(true, true), &mut out);
+        for i in 0..4 {
+            for j in 0..4 {
+                let want = above[j + 1] + u8::from(i == 3);
+                assert_eq!(out[i * 4 + j], want, "{i} {j}");
+            }
+        }
+        predict_block(H_PRED, 3, &edges(true, true), &mut out);
+        for i in 0..4 {
+            for j in 0..4 {
+                let want = left[i + 1] - u8::from(j > 0);
+                assert_eq!(out[i * 4 + j], want, "{i} {j}");
+            }
+        }
         // Paeth picks the neighbour closest to the gradient guess.
-        predict_block(PAETH_PRED, &edges(true, true), &mut out);
+        predict_block(PAETH_PRED, 0, &edges(true, true), &mut out);
         let (top, side, corner) = (i32::from(above[1]), i32::from(left[1]), 77);
         let base = top + side - corner;
         let want = if (base - side).abs() <= (base - top).abs()
@@ -3902,7 +4098,7 @@ mod tests {
         };
         assert_eq!(i32::from(out[0]), want);
         // Smooth blends towards the far edges.
-        predict_block(SMOOTH_PRED, &edges(true, true), &mut out);
+        predict_block(SMOOTH_PRED, 0, &edges(true, true), &mut out);
         // The weight at the first of four is 255; the rest of 256 goes
         // to the far edge.
         let want = (255 * i32::from(above[1])

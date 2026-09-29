@@ -356,6 +356,59 @@ fn hard(kind: usize, width: usize, height: usize) -> Vec<u8> {
     rgb
 }
 
+/// Gratings at an angle of their own in each `cell`, so directional
+/// modes win at turned angles: in luma (red square or sinusoidal, blue
+/// at another angle), or, with `chroma`, in chroma alone, blue against
+/// red at a luma held level.
+fn gratings(width: usize, height: usize, cell: usize, chroma: bool) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        for x in 0..width {
+            let c = ((x / cell) * 131 + (y / cell) * 71) % 360;
+            let th = (c as f64).to_radians();
+            let period = 3.0 + (c % 7) as f64 * 1.7;
+            let along = |th: f64, period: f64| {
+                ((x as f64 * th.cos() + y as f64 * th.sin()) * std::f64::consts::TAU / period).sin()
+            };
+            let p = along(th, period);
+            let px = if chroma {
+                // BT.601 luma 128 whatever the red and blue.
+                let (r, b) = (128.0 + 100.0 * p, 128.0 - 100.0 * p);
+                [r, (128.0 - 0.299 * r - 0.114 * b) / 0.587, b]
+            } else {
+                let s = if c.is_multiple_of(2) { p.signum() } else { p };
+                [
+                    128.0 + 120.0 * s,
+                    128.0 + 110.0 * p,
+                    128.0 + 100.0 * along(th + 0.7, period * 1.5),
+                ]
+            };
+            rgb.extend(px.map(|v| v.clamp(0.0, 255.0) as u8));
+        }
+    }
+    rgb
+}
+
+#[test]
+fn turned_angles_decode_on_gratings() {
+    // Every directional mode of both planes at nonzero deltas, blocks
+    // on the right and bottom edges reading replicated above-right and
+    // below-left pixels among them.
+    for (width, height, cell, quality, chroma) in [
+        (97, 61, 16, 20, false),
+        (131, 257, 8, 45, false),
+        (300, 190, 32, 70, false),
+        (257, 9, 16, 95, false),
+        (193, 129, 16, 60, true),
+        (300, 190, 32, 80, true),
+    ] {
+        let name = format!("a{width}x{height}c{cell}q{quality}{chroma}");
+        let rgb = gratings(width, height, cell, chroma);
+        let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, 1, 0);
+        decodes_as_reconstructed(&obus, &reconstruction, &name);
+    }
+}
+
 #[test]
 fn the_filters_decode_on_hard_content() {
     // The strongest CDEF strengths meet noise, a hard edge and a
@@ -537,11 +590,11 @@ fn fnv(bytes: &[u8]) -> u64 {
 #[test]
 fn the_streams_are_the_bytes_dav1d_decoded() {
     for (width, height, quality, rows_log2, hash) in [
-        (65, 33, 30, 0, 0x4fb5600e0677a5e3u64),
-        (520, 40, 60, 0, 0x8f81a8615e83a228),
-        (200, 200, 75, 1, 0xe7d2e056b32c310e),
-        (67, 45, 15, 0, 0x9dada4b6d73be7c2),
-        (130, 70, 1, 0, 0xdbfaa0f7562854bc),
+        (65, 33, 30, 0, 0xcdaf065dd35e7b93u64),
+        (520, 40, 60, 0, 0xb60b45c246c00b34),
+        (200, 200, 75, 1, 0x81b2c7a04b3fc0b2),
+        (67, 45, 15, 0, 0xa5ccc71125ff1270),
+        (130, 70, 1, 0, 0x7f11f8fb1f0cd206),
     ] {
         let name = format!("g{width}x{height}q{quality}r{rows_log2}");
         let (obus, reconstruction) = encode_tiled(width, height, quality, 1, rows_log2);
