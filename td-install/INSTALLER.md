@@ -150,7 +150,7 @@ sequence.
 ## Immutable review data
 
 The `td-install` Rust library exports `installation_plan::{Plan,
-Destination, DestinationObservation, Settings}`. It is a pure data
+Destination, DestinationObservation, Settings, Candidates}`. It is a pure data
 prerequisite for the service and UI, with no CLI, device access,
 filesystem access, entropy generation, transport or installation
 execution. The Cargo library is also a target path dependency of td-setup;
@@ -160,6 +160,18 @@ confinement test. The formatter stages that module separately through
 declaring the source. Each further target consumer must declare its source
 and public API reach in its own recipe and confinement roster. A decoded
 plan conveys no authority.
+
+`Candidates` carries at most 64 distinct destination observations for a
+future read-only service reply. Its canonical `TDCAND01` record has an
+eight-byte magic, one-byte count, then each destination in the same field
+order and bounds as the plan's destination. It admits at most 55,817 bytes
+before allocation and rejects trailing bytes, duplicate kernel names or
+device numbers, repeated disk sequence numbers, invalid fields and
+truncation. An empty list is valid.
+Encoding and decoding preserve the observations only: neither operation
+proves that a disk is eligible, that the installation medium is excluded,
+or that a privileged service supplied the bytes. The live window still has
+no service connection or selectable destination.
 
 A plan owns a nonzero 32-byte proposal nonce, the complete destination
 observations, a 32-byte deployment manifest digest, a version-4 volume

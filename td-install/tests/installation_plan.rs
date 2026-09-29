@@ -6,7 +6,8 @@
 )]
 
 use td_install::installation_plan::{
-    Destination, DestinationObservation, Plan, Settings, MAX_BYTES,
+    Candidates, Destination, DestinationObservation, Plan, Settings, MAX_BYTES, MAX_CANDIDATES,
+    MAX_CANDIDATE_BYTES,
 };
 
 fn observed_destination(
@@ -52,6 +53,125 @@ fn uuid() -> [u8; 16] {
 }
 fn plan() -> Plan {
     Plan::new([1; 32], destination(), [2; 32], uuid(), settings()).unwrap()
+}
+
+fn distinct_candidates(count: usize, maximal: bool) -> Vec<Destination> {
+    let label = "X".repeat(256);
+    let mut disks = Vec::new();
+    for index in 0..count {
+        let stem = format!("vd{index:02}");
+        let name = if maximal {
+            format!("{stem:0<64}")
+        } else {
+            stem
+        };
+        let labels = if maximal {
+            (
+                Some(label.as_str()),
+                Some(label.as_str()),
+                Some(label.as_str()),
+            )
+        } else {
+            (None, None, None)
+        };
+        disks.push(
+            observed_destination(
+                &name,
+                (253, index as u32),
+                index as u64 + 1,
+                (6 << 30, 4096),
+                false,
+                labels,
+            )
+            .unwrap(),
+        );
+    }
+    disks
+}
+
+#[test]
+fn candidate_wire_is_canonical_bounded_and_authority_free() {
+    let disk = destination();
+    let candidates = Candidates::new(vec![disk.clone()]).unwrap();
+    let mut bytes = b"TDCAND01\x01".to_vec();
+    bytes.extend([0, 0, 1, 3, 0, 0, 0, 3]);
+    bytes.extend([0, 0, 0, 0, 0, 0, 0, 27]);
+    bytes.extend([0, 0, 0, 1, 128, 0, 0, 0]);
+    bytes.extend([0, 0, 16, 0, 0]);
+    bytes.extend(b"\0\x07nvme0n1\x01\0\x07Model A\x01\0\x09serial-42\0");
+    assert_eq!(candidates.encode(), bytes);
+    assert_eq!(Candidates::decode(&bytes).unwrap().as_slice(), &[disk]);
+    let mut duplicate = b"TDCAND01\x02".to_vec();
+    duplicate.extend_from_slice(&bytes[9..]);
+    duplicate.extend_from_slice(&bytes[9..]);
+    assert!(Candidates::decode(&duplicate).is_err());
+    for prefix in 0..bytes.len() {
+        assert!(Candidates::decode(&bytes[..prefix]).is_err());
+    }
+    assert_eq!(Candidates::decode(b"TDCAND01\0").unwrap().as_slice(), &[]);
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(Candidates::decode(&trailing).is_err());
+    let mut malformed = bytes.clone();
+    *malformed.get_mut(37).unwrap() = 2;
+    assert_eq!(
+        Candidates::decode(&malformed),
+        Err("invalid candidates flag".into())
+    );
+    let mut too_many = b"TDCAND01".to_vec();
+    too_many.push((MAX_CANDIDATES + 1) as u8);
+    assert_eq!(
+        Candidates::decode(&too_many),
+        Err("too many installation candidates".into())
+    );
+}
+
+#[test]
+fn candidate_identity_is_unique_and_count_is_bounded() {
+    let first = destination();
+    let same_number = observed_destination(
+        "vda",
+        (259, 3),
+        28,
+        (6 << 30, 4096),
+        false,
+        (None, None, None),
+    )
+    .unwrap();
+    let same_name = observed_destination(
+        "nvme0n1",
+        (8, 0),
+        28,
+        (6 << 30, 4096),
+        false,
+        (None, None, None),
+    )
+    .unwrap();
+    let same_sequence = observed_destination(
+        "vda",
+        (8, 0),
+        27,
+        (6 << 30, 4096),
+        false,
+        (None, None, None),
+    )
+    .unwrap();
+    assert!(Candidates::new(vec![first.clone(), first.clone()]).is_err());
+    assert!(Candidates::new(vec![first.clone(), same_number]).is_err());
+    assert!(Candidates::new(vec![first.clone(), same_name]).is_err());
+    assert!(Candidates::new(vec![first, same_sequence]).is_err());
+    assert!(Candidates::new(distinct_candidates(MAX_CANDIDATES + 1, false)).is_err());
+
+    let full = Candidates::new(distinct_candidates(MAX_CANDIDATES, true)).unwrap();
+    let bytes = full.encode();
+    assert_eq!(bytes.len(), MAX_CANDIDATE_BYTES);
+    assert_eq!(Candidates::decode(&bytes).unwrap(), full);
+    let mut oversized = bytes;
+    oversized.push(0);
+    assert_eq!(
+        Candidates::decode(&oversized),
+        Err("installation candidates exceed wire bound".into())
+    );
 }
 
 #[test]

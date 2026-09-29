@@ -4,21 +4,26 @@
 /// The largest current valid encoding is 1191 bytes.
 pub const MAX_BYTES: usize = 2048;
 const MAGIC: &[u8; 8] = b"TDPLAN01";
+const CANDIDATES_MAGIC: &[u8; 8] = b"TDCAND01";
+pub const MAX_CANDIDATES: usize = 64;
 const NAME_BYTES: usize = 64;
 const LABEL_BYTES: usize = 256;
 const USERNAME_BYTES: usize = 32;
 const HOSTNAME_BYTES: usize = 63;
 const KEYBOARD_BYTES: usize = 64;
 const TIMEZONE_BYTES: usize = 64;
-const ENCODED_BYTES: usize = 117
-    + 2
-    + NAME_BYTES
-    + 3 * (3 + LABEL_BYTES)
-    + 8
+const DESTINATION_BYTES: usize = 4 + 4 + 8 + 8 + 4 + 1 + 2 + NAME_BYTES + 3 * (1 + 2 + LABEL_BYTES);
+const ENCODED_BYTES: usize = 8
+    + 32
+    + 32
+    + 16
+    + DESTINATION_BYTES
+    + 4 * 2
     + USERNAME_BYTES
     + HOSTNAME_BYTES
     + KEYBOARD_BYTES
     + TIMEZONE_BYTES;
+pub const MAX_CANDIDATE_BYTES: usize = 8 + 1 + MAX_CANDIDATES * DESTINATION_BYTES;
 
 /// Unvalidated caller observations. Construction copies admitted values.
 #[derive(Debug)]
@@ -128,6 +133,71 @@ impl Destination {
     }
 }
 
+/// Bounded advisory observations for the destination page. The root service
+/// must independently establish eligibility, source identity and a held disk
+/// claim before proposing or executing an installation. Decoding these bytes
+/// grants no such authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Candidates {
+    disks: Vec<Destination>,
+}
+
+impl Candidates {
+    pub fn new(disks: Vec<Destination>) -> Result<Self, String> {
+        if disks.len() > MAX_CANDIDATES {
+            return Err("too many installation candidates".into());
+        }
+        for (index, disk) in disks.iter().enumerate() {
+            if disks.iter().take(index).any(|other| {
+                other.name() == disk.name()
+                    || other.number() == disk.number()
+                    || other.sequence() == disk.sequence()
+            }) {
+                return Err("duplicate installation candidate identity".into());
+            }
+        }
+        Ok(Self { disks })
+    }
+
+    pub fn as_slice(&self) -> &[Destination] {
+        &self.disks
+    }
+
+    /// Canonical bounded bytes for a read-only service reply.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 1 + self.disks.len() * DESTINATION_BYTES);
+        out.extend_from_slice(CANDIDATES_MAGIC);
+        out.push(self.disks.len() as u8);
+        for disk in &self.disks {
+            put_destination(&mut out, disk);
+        }
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_CANDIDATE_BYTES {
+            return Err("installation candidates exceed wire bound".into());
+        }
+        let mut reader = Reader(bytes, "candidates");
+        if &reader.array::<8>()? != CANDIDATES_MAGIC {
+            return Err("unsupported installation candidates version".into());
+        }
+        let [count] = reader.array::<1>()?;
+        let count = usize::from(count);
+        if count > MAX_CANDIDATES {
+            return Err("too many installation candidates".into());
+        }
+        let mut disks = Vec::with_capacity(count);
+        for _ in 0..count {
+            disks.push(read_destination(&mut reader)?);
+        }
+        if !reader.0.is_empty() {
+            return Err("trailing installation candidates bytes".into());
+        }
+        Self::new(disks)
+    }
+}
+
 /// Bounded choices. Account policy and catalog membership are caller checks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Settings {
@@ -230,15 +300,21 @@ impl Plan {
         if id.len() != 64 {
             return false;
         }
-        id.as_bytes().as_chunks::<2>().0.iter().zip(self.deployment).all(|([high, low], expected)| {
-            let digit = |byte| match byte {
-                b'0'..=b'9' => Some(byte - b'0'),
-                b'a'..=b'f' => Some(byte - b'a' + 10),
-                _ => None,
-            };
-            digit(*high).zip(digit(*low))
-                .is_some_and(|(high, low)| high * 16 + low == expected)
-        })
+        id.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(self.deployment)
+            .all(|([high, low], expected)| {
+                let digit = |byte| match byte {
+                    b'0'..=b'9' => Some(byte - b'0'),
+                    b'a'..=b'f' => Some(byte - b'a' + 10),
+                    _ => None,
+                };
+                digit(*high)
+                    .zip(digit(*low))
+                    .is_some_and(|(high, low)| high * 16 + low == expected)
+            })
     }
     pub fn volume_uuid(&self) -> &[u8; 16] {
         &self.volume_uuid
@@ -254,20 +330,7 @@ impl Plan {
         out.extend_from_slice(&self.nonce);
         out.extend_from_slice(&self.deployment);
         out.extend_from_slice(&self.volume_uuid);
-        let d = &self.destination;
-        out.extend_from_slice(&d.major.to_be_bytes());
-        out.extend_from_slice(&d.minor.to_be_bytes());
-        out.extend_from_slice(&d.sequence.to_be_bytes());
-        out.extend_from_slice(&d.capacity.to_be_bytes());
-        out.extend_from_slice(&d.sector.to_be_bytes());
-        out.push(u8::from(d.removable));
-        put(&mut out, &d.name);
-        for label in [&d.model, &d.serial, &d.wwid] {
-            out.push(u8::from(label.is_some()));
-            if let Some(label) = label {
-                put(&mut out, label);
-            }
-        }
+        put_destination(&mut out, &self.destination);
         for value in [
             &self.settings.username,
             &self.settings.hostname,
@@ -283,23 +346,14 @@ impl Plan {
         if bytes.len() > MAX_BYTES {
             return Err("installation plan exceeds wire bound".into());
         }
-        let mut r = Reader(bytes);
+        let mut r = Reader(bytes, "plan");
         if &r.array::<8>()? != MAGIC {
             return Err("unsupported installation plan version".into());
         }
         let nonce = r.array()?;
         let deployment = r.array()?;
         let uuid = r.array()?;
-        let major = u32::from_be_bytes(r.array()?);
-        let minor = u32::from_be_bytes(r.array()?);
-        let sequence = u64::from_be_bytes(r.array()?);
-        let capacity = u64::from_be_bytes(r.array()?);
-        let sector = u32::from_be_bytes(r.array()?);
-        let removable = r.flag()?;
-        let name = r.string(NAME_BYTES)?;
-        let model = r.optional()?;
-        let serial = r.optional()?;
-        let wwid = r.optional()?;
+        let destination = read_destination(&mut r)?;
         let username = r.string(USERNAME_BYTES)?;
         let hostname = r.string(HOSTNAME_BYTES)?;
         let keyboard = r.string(KEYBOARD_BYTES)?;
@@ -307,21 +361,50 @@ impl Plan {
         if !r.0.is_empty() {
             return Err("trailing installation plan bytes".into());
         }
-        let destination = Destination::new(DestinationObservation {
-            name,
-            major,
-            minor,
-            sequence,
-            capacity,
-            sector,
-            removable,
-            model,
-            serial,
-            wwid,
-        })?;
         let settings = Settings::new(username, hostname, keyboard, timezone)?;
         Self::new(nonce, destination, deployment, uuid, settings)
     }
+}
+
+fn put_destination(out: &mut Vec<u8>, disk: &Destination) {
+    out.extend_from_slice(&disk.major.to_be_bytes());
+    out.extend_from_slice(&disk.minor.to_be_bytes());
+    out.extend_from_slice(&disk.sequence.to_be_bytes());
+    out.extend_from_slice(&disk.capacity.to_be_bytes());
+    out.extend_from_slice(&disk.sector.to_be_bytes());
+    out.push(u8::from(disk.removable));
+    put(out, &disk.name);
+    for label in [&disk.model, &disk.serial, &disk.wwid] {
+        out.push(u8::from(label.is_some()));
+        if let Some(label) = label {
+            put(out, label);
+        }
+    }
+}
+
+fn read_destination(reader: &mut Reader<'_>) -> Result<Destination, String> {
+    let major = u32::from_be_bytes(reader.array()?);
+    let minor = u32::from_be_bytes(reader.array()?);
+    let sequence = u64::from_be_bytes(reader.array()?);
+    let capacity = u64::from_be_bytes(reader.array()?);
+    let sector = u32::from_be_bytes(reader.array()?);
+    let removable = reader.flag()?;
+    let name = reader.string(NAME_BYTES)?;
+    let model = reader.optional()?;
+    let serial = reader.optional()?;
+    let wwid = reader.optional()?;
+    Destination::new(DestinationObservation {
+        name,
+        major,
+        minor,
+        sequence,
+        capacity,
+        sector,
+        removable,
+        model,
+        serial,
+        wwid,
+    })
 }
 
 fn text(value: &str, limit: usize) -> Result<(), String> {
@@ -344,34 +427,35 @@ fn put(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(&(value.len() as u16).to_be_bytes());
     out.extend_from_slice(value.as_bytes());
 }
-struct Reader<'a>(&'a [u8]);
+struct Reader<'a>(&'a [u8], &'static str);
 impl<'a> Reader<'a> {
     fn take(&mut self, count: usize) -> Result<&'a [u8], String> {
         let (value, remaining) = self
             .0
             .split_at_checked(count)
-            .ok_or("truncated installation plan")?;
+            .ok_or_else(|| format!("truncated installation {}", self.1))?;
         self.0 = remaining;
         Ok(value)
     }
     fn array<const N: usize>(&mut self) -> Result<[u8; N], String> {
         self.take(N)?
             .try_into()
-            .map_err(|_| "invalid fixed plan field".into())
+            .map_err(|_| format!("invalid fixed {} field", self.1))
     }
     fn flag(&mut self) -> Result<bool, String> {
         match self.array::<1>()? {
             [0] => Ok(false),
             [1] => Ok(true),
-            _ => Err("invalid plan flag".into()),
+            _ => Err(format!("invalid {} flag", self.1)),
         }
     }
     fn string(&mut self, limit: usize) -> Result<&'a str, String> {
         let count = usize::from(u16::from_be_bytes(self.array()?));
         if count > limit {
-            return Err("invalid plan string length".into());
+            return Err(format!("invalid {} string length", self.1));
         }
-        std::str::from_utf8(self.take(count)?).map_err(|_| "invalid plan text encoding".into())
+        std::str::from_utf8(self.take(count)?)
+            .map_err(|_| format!("invalid {} text encoding", self.1))
     }
     fn optional(&mut self) -> Result<Option<&'a str>, String> {
         if self.flag()? {
