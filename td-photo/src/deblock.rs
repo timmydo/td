@@ -6,11 +6,11 @@
 //! the encoder's decisions never see it; only what the decoder shows
 //! does.
 //!
-//! The blocks here are square, one transform the block's size, intra
-//! (never skipped for the filter), without segmentation, loop filter
-//! deltas or sharpness, so an edge's strength is the plane's level and
-//! its length the smaller transform's: 4, 8 or 14 taps for luma, 4 or 6
-//! for chroma.
+//! The blocks here are squares and their halves, one transform the
+//! block's size, intra (never skipped for the filter), without
+//! segmentation, loop filter deltas or sharpness, so an edge's strength
+//! is the plane's level and its length the smaller transform's across
+//! it: 4, 8 or 14 taps for luma, 4 or 6 for chroma.
 
 /// A frame's deblocking levels (spec `loop_filter_params`): luma's for
 /// vertical and for horizontal edges, then U's and V's. Both luma levels
@@ -32,8 +32,13 @@ pub struct Plane<'a> {
 }
 
 /// Filters the three planes (4:2:0) in place. `block_log2(mi_row,
-/// mi_col)` is the log2 of the luma side of the block over a luma 4x4.
-pub fn filter(planes: [Plane<'_>; 3], levels: Levels, block_log2: impl Fn(usize, usize) -> u32) {
+/// mi_col, vertical)` is the log2 of the luma width (for vertical edges)
+/// or height of the block over a luma 4x4.
+pub fn filter(
+    planes: [Plane<'_>; 3],
+    levels: Levels,
+    block_log2: impl Fn(usize, usize, bool) -> u32,
+) {
     if levels.luma == [0, 0] {
         return;
     }
@@ -50,10 +55,11 @@ pub fn filter(planes: [Plane<'_>; 3], levels: Levels, block_log2: impl Fn(usize,
                 continue;
             }
             let limits = Limits::new(level);
-            // The log2 of the transform's side in pixels over a plane 4x4,
-            // read from the luma 4x4 at its bottom right as libaom does.
+            // The log2 of the transform's width or height in pixels over
+            // a plane 4x4, read from the luma 4x4 at its bottom right as
+            // libaom does.
             let tx_log2 = |x: usize, y: usize| {
-                block_log2(((y << sub) >> 2) | sub, ((x << sub) >> 2) | sub)
+                block_log2(((y << sub) >> 2) | sub, ((x << sub) >> 2) | sub, vertical)
                     .min(6)
                     .saturating_sub(sub as u32)
             };

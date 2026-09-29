@@ -54,6 +54,23 @@ impl Size {
         self.width() * self.height()
     }
 
+    /// The size `width` across by `height` down, if there is one.
+    pub fn of(width: usize, height: usize) -> Option<Size> {
+        Some(match (width, height) {
+            (4, 4) => Size::S4,
+            (8, 8) => Size::S8,
+            (16, 16) => Size::S16,
+            (32, 32) => Size::S32,
+            (4, 8) => Size::S4x8,
+            (8, 4) => Size::S8x4,
+            (8, 16) => Size::S8x16,
+            (16, 8) => Size::S16x8,
+            (16, 32) => Size::S16x32,
+            (32, 16) => Size::S32x16,
+            _ => return None,
+        })
+    }
+
     /// Whether one side is twice the other, which the row pass scales
     /// by the root of a half.
     fn is_rect2(self) -> bool {
@@ -1419,7 +1436,10 @@ mod tests {
             // frequency first, the wide ones the vertical.
             let second = if size.width() > size.height() { w } else { 1 };
             assert_eq!(usize::from(scan[1]), second, "{size:?}");
+            assert_eq!(Size::of(w, size.height()), Some(size));
         }
+        assert_eq!(Size::of(64, 64), None);
+        assert_eq!(Size::of(4, 16), None);
     }
 
     #[test]

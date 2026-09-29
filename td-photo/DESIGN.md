@@ -1252,12 +1252,15 @@ set), main profile, 8-bit 4:2:0 at full range in BT.601 (`Y = (77R +
 150G + 29B + 128) >> 8`, the chroma the mean of each 2x2 offset by 128),
 one key frame of intra blocks. The tools are the subset a decoder must
 carry and an encoder can verify: 64-pixel superblocks always split,
-then square blocks of 32, 16 or 8 (a partition of `NONE` or `SPLIT`
-alone, the frame's edges splitting as the spec forces them; no 64-wide
-block is ever a leaf, since there is no 64-point transform here), one
-transform the block's size (`TX_MODE_LARGEST`, the reduced transform
-set: a luma block below 32 may signal any of the four DCT and ADST
-pairs, chroma's is the one its mode implies, `DCT_DCT` at 32), the
+then square blocks of 32, 16 or 8 and the halves of a 32 or a 16 (a
+partition of `NONE`, `HORZ`, `VERT` or `SPLIT`; a node whose lower or
+right half starts past the frame's edge is split, where the spec
+would allow it the halving inside too; no 64-wide block is ever a leaf,
+since there is no 64-point transform here, and no 8x8 is halved, whose
+halves would share their chroma), one transform the block's size
+(`TX_MODE_LARGEST`, the reduced transform set: a luma block with no
+side of 32 may signal any of the four DCT and ADST pairs, chroma's is
+the one its mode implies, `DCT_DCT` with a side of 32), the
 thirteen intra modes, the directional ones with their angle deltas
 (three degrees a step, to nine either way), without filter or palette
 and, for chroma, its prediction from the block's luma (each plane's alpha
@@ -1288,7 +1291,14 @@ their mode's rate, then the chosen luma mode coded under the other
 transform types when it left any coefficient, and a superblock's
 partition is decided by trials that save and restore the contexts and
 pixels they touch before the chosen tree is emitted, so the decoder's
-state is the encoder's exactly. The frame is tiled
+state is the encoder's exactly: each node whole, then split, then
+halved either way, each trial cut short once it costs more than the
+best so far. The halvings, which cost as much again as the node whole,
+are tried only where the split did not beat it whole by 8%, and a
+direction only where its halves hold the source luma's variance within
+nine tenths of the other's as tightly; on a textured photo that keeps
+five sixths of what trying both gains for two fifths of the trials.
+The frame is tiled
 uniformly by its size alone, so the bytes are the same whatever the
 thread count, as the JPEG encoder's are: as many tile columns as the
 width allows while the uniform column stays four superblocks wide (the
@@ -1306,10 +1316,10 @@ header writes. The transforms are the spec's integer butterflies, each
 a table of stages that `butterfly!` expands to straight code over fixed
 arrays, at the square sizes and the 2:1 rectangles between them (the
 rectangles' rows scaled by the root of a half as the spec's inverse
-does, the forward by the root of two as libaom's; the rectangles await
-the partitions that code them), and the deblocking filter (`deblock`)
-is the spec's edge loop over 4x4 units: an edge's length is the smaller
-transform beside it (4, 8 or 14 luma taps, 4 or 6 chroma), no intra
+does, the forward by the root of two as libaom's), and the deblocking
+filter (`deblock`) is the spec's edge loop over 4x4 units: an edge's
+length is the smaller extent across it of the transforms beside it (4,
+8 or 14 luma taps, 4 or 6 chroma), no intra
 block counts as skipped, and the level, one for every plane and
 direction, is libaom's fit of the AC step for a key frame
 (`LPF_PICK_FROM_Q`) half again, which measured better on a photo than
@@ -1335,13 +1345,14 @@ are read once per plane and every mode is predicted from them into the
 tile's scratch, which also holds the transform's working blocks and each
 plane's trial and best coding and only grows, so a block
 allocates only the levels its leaf keeps. A 24-megapixel export takes
-about twenty-four seconds on one thread and a few on eight
+about thirty-three seconds on one thread and five to seven on eight
 (`tests/av1.rs`'s `bench`). Against libaom's all-intra speed 6 on a
-real 2048-pixel photo the encoder needs about 1% fewer bits for the
-same luma PSNR from 0.3 to 3 bits a pixel (1% more for RGB) and about
-3% more below that, where libaom's CDEF chooses strengths by
-searching each 64x64; the compression follow-up, by what libaom's
-tools measured there, is rectangular partitions and transforms.
+real 2048-pixel photo the encoder needs about 1.5% fewer bits for the
+same luma PSNR from 0.3 to 3 bits a pixel (as many for RGB) and about
+2% more below that, where libaom's CDEF chooses strengths by
+searching each 64x64; what libaom's tools measured there leaves 4x4
+blocks and the partitions not coded here (the halves of a 64 or an 8,
+the three- and four-way ones) as the compression follow-up.
 Measured before the trellis priced the zeros an end of block passes
 over: zeroing a transform's few levels outright bought luma about 2%
 but cost RGB 3% at low rates, a chroma weight trading one for the

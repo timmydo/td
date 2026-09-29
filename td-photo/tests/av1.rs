@@ -409,6 +409,45 @@ fn turned_angles_decode_on_gratings() {
     }
 }
 
+/// Bands a block high or wide, alternating by 64x64, each a ramp of its
+/// own: content the halvings win on, as `av1`'s unit test of them asserts
+/// on the same pixels.
+fn bands(width: usize, height: usize, band: usize) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        for x in 0..width {
+            let (row, col) = ((y / band) as i32, (x / band) as i32);
+            let across = 40 + (row * 57) % 150 + x as i32 * (row % 5 - 2) / 3;
+            let down = 40 + (col * 37) % 150 + y as i32 * (col % 5 - 2) / 3;
+            let v = if (x / 64 + y / 64) % 2 == 0 {
+                across
+            } else {
+                down
+            };
+            let v = v.clamp(0, 255) as u8;
+            rgb.extend([v, v / 2 + 60, 255 - v]);
+        }
+    }
+    rgb
+}
+
+#[test]
+fn halved_blocks_decode_past_the_edges() {
+    // Horizontal and vertical halves of 32x32s and 16x16s, some past the
+    // frame's right edge (118 wide) and bottom (125 and 61 high).
+    for (width, height, band, quality) in [
+        (118, 128, 16, 20),
+        (118, 128, 16, 40),
+        (184, 125, 16, 60),
+        (86, 61, 8, 20),
+    ] {
+        let name = format!("b{width}x{height}b{band}q{quality}");
+        let rgb = bands(width, height, band);
+        let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, 1, 0);
+        decodes_as_reconstructed(&obus, &reconstruction, &name);
+    }
+}
+
 #[test]
 fn the_filters_decode_on_hard_content() {
     // The strongest CDEF strengths meet noise, a hard edge and a
@@ -591,9 +630,9 @@ fn fnv(bytes: &[u8]) -> u64 {
 fn the_streams_are_the_bytes_dav1d_decoded() {
     for (width, height, quality, rows_log2, hash) in [
         (65, 33, 30, 0, 0xcdaf065dd35e7b93u64),
-        (520, 40, 60, 0, 0xb60b45c246c00b34),
-        (200, 200, 75, 1, 0x81b2c7a04b3fc0b2),
-        (67, 45, 15, 0, 0xa5ccc71125ff1270),
+        (520, 40, 60, 0, 0x439210b901059d43),
+        (200, 200, 75, 1, 0xd9a5524b4be5939e),
+        (67, 45, 15, 0, 0xf615a7a8dab1c8b8),
         (130, 70, 1, 0, 0x7f11f8fb1f0cd206),
     ] {
         let name = format!("g{width}x{height}q{quality}r{rows_log2}");
