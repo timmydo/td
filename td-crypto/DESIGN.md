@@ -139,8 +139,13 @@ exercise empty inputs and fragmented updates around block boundaries. The
 portable harness runs those cases, retirement checks and unwind injection in
 its isolated runtime. This is functional and API-confinement evidence; M07
 still owes native allocation, worker-stack and whole-process qualification
-before service use. Wrapping the provider does not establish a no-allocation
-hot path. The remaining Crypto operations and concrete factory are pending.
+before service use. Successful construction allocates native digest state,
+and the public provider API exposes no reset operation. Constructing one per
+message cannot satisfy td-mta's no-allocation hot-path contract by calling it
+admission work. Cold configuration/startup work can use this facade; reusable
+state or a separately qualified implementation is required before hot-path
+hashing is enabled. The remaining Crypto operations and concrete factory
+are pending.
 
 M03b1 pins versions, features, licenses and roots; M03b2 pins the portable
 native build inputs.

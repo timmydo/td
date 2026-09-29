@@ -5,6 +5,10 @@ use td_mta::format::{
 };
 use td_mta::ids::*;
 
+// Shared by the independent structure and real-provider digest checks.
+const MAILBOX_SOURCE_PREIMAGE: &str = "010800000050726f6a656374730108000000706172656e742d31000100000001";
+const EMAIL_SOURCE_PREIMAGE: &str = "03ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad0300000000000000ffffffffffffffff02000000020000006161010000007a0200000005000000247365656e0700000070726f6a656374";
+
 fn hex(input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let digits: String = input.split_whitespace().collect();
     let (pairs, rest) = digits.as_bytes().as_chunks::<2>();
@@ -741,7 +745,7 @@ fn every_container_fixture_has_the_selected_identity_and_extent(
 fn source_preimage_literals_pin_raw_id_sort_and_optional_lengths(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use td_mta::format::scalar::Reader;
-    let mailbox = hex("010800000050726f6a656374730108000000706172656e742d31000100000001")?;
+    let mailbox = hex(MAILBOX_SOURCE_PREIMAGE)?;
     let mut r = Reader::new(&mailbox);
     assert_eq!(r.u8()?, 1);
     assert_eq!(r.text(1024)?, "Projects");
@@ -751,7 +755,7 @@ fn source_preimage_literals_pin_raw_id_sort_and_optional_lengths(
     assert_eq!(r.u32()?, 1);
     assert!(r.boolean()?);
     r.finish()?;
-    let email=hex("03ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad0300000000000000ffffffffffffffff02000000020000006161010000007a0200000005000000247365656e0700000070726f6a656374")?;
+    let email = hex(EMAIL_SOURCE_PREIMAGE)?;
     let mut r = Reader::new(&email);
     assert_eq!(r.u8()?, 3);
     assert_eq!(
@@ -767,5 +771,149 @@ fn source_preimage_literals_pin_raw_id_sort_and_optional_lengths(
     assert_eq!(r.text(255)?, "$seen");
     assert_eq!(r.text(255)?, "project");
     r.finish()?;
+    Ok(())
+}
+
+// FORMAT.md offsets and independent checked-in artifacts are the oracle.
+// This qualifies hash coverage, not a production container verifier.
+fn provider_hash(input: &[u8], chunk: usize) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    use td_crypto::Digest;
+    let mut digest = td_crypto::Sha256::try_new()?;
+    for part in input.chunks(chunk) {
+        digest.update(part)?;
+    }
+    Ok(digest.finish()?)
+}
+
+fn hash_matches(input: &[u8], expected: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(expected.len(), 32);
+    for chunk in [1, 31, 64, 65] {
+        assert_eq!(provider_hash(input, chunk)?.as_slice(), expected);
+    }
+    if !input.is_empty() {
+        let mut changed = input.to_vec();
+        for index in [0, input.len() / 2, input.len() - 1] {
+            let byte = changed.get_mut(index).ok_or("mutation index")?;
+            *byte ^= 1;
+            assert_ne!(provider_hash(&changed, 31)?.as_slice(), expected);
+            *changed.get_mut(index).ok_or("mutation restore")? ^= 1;
+        }
+    }
+    Ok(())
+}
+
+fn hash_at(bytes: &[u8], end: usize) -> Result<(), Box<dyn std::error::Error>> {
+    hash_matches(
+        bytes.get(..end).ok_or("preimage extent")?,
+        bytes
+            .get(end..end.checked_add(32).ok_or("digest overflow")?)
+            .ok_or("digest extent")?,
+    )
+}
+
+#[test]
+fn provider_hashes_container_and_binding_fixtures() -> Result<(), Box<dyn std::error::Error>> {
+    hash_at(&fixture!("format"), 48)?;
+    let initial_tables = [
+        fixture!("empty-table-1"),
+        fixture!("empty-table-2"),
+        fixture!("empty-table-3"),
+        fixture!("empty-table-4"),
+        fixture!("empty-table-5"),
+        fixture!("empty-table-6"),
+        fixture!("empty-table-7"),
+        fixture!("empty-table-8"),
+        fixture!("empty-table-9"),
+        fixture!("empty-table-10"),
+        fixture!("empty-table-11"),
+    ];
+    let checkpoint_tables = [
+        fixture!("populated-blob-table"),
+        fixture!("checkpoint-table-2"),
+        fixture!("checkpoint-table-3"),
+        fixture!("checkpoint-table-4"),
+        fixture!("checkpoint-table-5"),
+        fixture!("checkpoint-table-6"),
+        fixture!("checkpoint-table-7"),
+        fixture!("checkpoint-table-8"),
+        fixture!("checkpoint-table-9"),
+        fixture!("checkpoint-table-10"),
+        fixture!("checkpoint-table-11"),
+    ];
+    for table in initial_tables.iter().chain(&checkpoint_tables) {
+        hash_at(table, 80)?;
+    }
+    let record = fixture!("record-blob");
+    hash_at(
+        &record,
+        record.len().checked_sub(32).ok_or("record footer")?,
+    )?;
+    assert_eq!(
+        checkpoint_tables.first().ok_or("blob table")?.get(112..),
+        Some(record.as_slice())
+    );
+    for journal in [
+        fixture!("empty-journal"),
+        fixture!("journal-with-frame"),
+        fixture!("active-journal-two"),
+    ] {
+        hash_at(&journal, 64)?;
+    }
+    for frame in [fixture!("frame-put-blob"), fixture!("frame-delete-change")] {
+        hash_at(&frame, 32)?;
+        hash_at(&frame, frame.len().checked_sub(32).ok_or("frame footer")?)?;
+    }
+    assert_eq!(
+        fixture!("journal-with-frame").get(96..),
+        Some(fixture!("frame-put-blob").as_slice())
+    );
+    for (current, manifest, tables) in [
+        (fixture!("current"), fixture!("manifest"), &initial_tables),
+        (
+            fixture!("current-history"),
+            fixture!("manifest-history"),
+            &checkpoint_tables,
+        ),
+    ] {
+        hash_at(&current, 88)?;
+        hash_at(
+            &manifest,
+            manifest.len().checked_sub(32).ok_or("manifest footer")?,
+        )?;
+        hash_matches(
+            &manifest,
+            current.get(56..88).ok_or("CURRENT manifest hash")?,
+        )?;
+        for (index, table) in tables.iter().enumerate() {
+            // Descriptor hash follows its 24-byte fields, after 88-byte prefix.
+            let start = 88 + index * 56 + 24;
+            hash_matches(table, manifest.get(start..start + 32).ok_or("table hash")?)?;
+        }
+    }
+    let history = fixture!("manifest-history");
+    // The sole history descriptor follows all eleven table descriptors.
+    let start = 88 + 11 * 56 + 32;
+    hash_matches(
+        &fixture!("journal-with-frame"),
+        history.get(start..start + 32).ok_or("history hash")?,
+    )?;
+    hash_matches(b"abc", fixture!("row-blob").get(9..41).ok_or("blob hash")?)?;
+    Ok(())
+}
+
+#[test]
+fn provider_hashes_import_snapshot_fixtures() -> Result<(), Box<dyn std::error::Error>> {
+    for (preimage, digest) in [
+        (
+            MAILBOX_SOURCE_PREIMAGE,
+            "2ebfa0d8f9aaecd36e1288487ab8419eeba45d7e22cbb079f6f5ea1a53a2cb05",
+        ),
+        (
+            EMAIL_SOURCE_PREIMAGE,
+            "ecc93dd30f2e7c6e9f14ba4cc6d910377772dc7ad3386bc801578d9801a82175",
+        ),
+    ] {
+        hash_matches(&hex(preimage)?, &hex(digest)?)?;
+    }
     Ok(())
 }

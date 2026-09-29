@@ -361,11 +361,23 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "config-stack-build", &mut receipt)?;
     let output = bounded_output(&mut command, "config-stack-build", 8 * 1024 * 1024, 1200)?;
     let config = executable(&output, "config_stack", ArtifactKind::IntegrationTest)?;
+    let mut command = cargo("test", "td-mta");
+    command.args([
+        "--release",
+        "--test",
+        "format_rows",
+        "--no-run",
+        "--message-format=json-render-diagnostics",
+    ]);
+    command_record(&command, "format-digest-build", &mut receipt)?;
+    let output = bounded_output(&mut command, "format-digest-build", 8 * 1024 * 1024, 1200)?;
+    let format = executable(&output, "format_rows", ArtifactKind::IntegrationTest)?;
     refuse_decoy(Path::new("/output"))?;
     fs::create_dir("/output/artifacts").map_err(|e| format!("portable artifacts: {e}"))?;
     copy_binary(&mail, Path::new("/output/artifacts/td-mta"))?;
     copy_binary(&crypto, Path::new("/output/artifacts/td-crypto-smoke"))?;
     copy_binary(&config, Path::new("/output/artifacts/td-mta-config-smoke"))?;
+    copy_binary(&format, Path::new("/output/artifacts/td-mta-format-smoke"))?;
     crate::crypto_api::qualify(&mut receipt)?;
     refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
@@ -414,7 +426,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
         }
         names.insert(entry.file_name());
     }
-    let expected = ["COMMANDS", "td-mta", "td-crypto-smoke", "td-mta-config-smoke"]
+    let expected = ["COMMANDS", "td-mta", "td-crypto-smoke", "td-mta-config-smoke", "td-mta-format-smoke"]
         .map(std::ffi::OsString::from)
         .into_iter()
         .collect();
@@ -423,7 +435,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
     }
     let receipt = read_output(&source.join("COMMANDS"), "commands", 64 * 1024)?;
     fs::create_dir(destination).map_err(|e| format!("create private artifact directory: {e}"))?;
-    for name in ["td-mta", "td-crypto-smoke", "td-mta-config-smoke"] {
+    for name in ["td-mta", "td-crypto-smoke", "td-mta-config-smoke", "td-mta-format-smoke"] {
         copy_binary(&source.join(name), &destination.join(name))?;
     }
     Ok(receipt)
@@ -569,7 +581,7 @@ fn stack_evidence(output: &str, prefix: &str, ceiling: usize) -> Result<usize> {
 }
 
 pub(crate) fn runtime_inner() -> Result<()> {
-    require_namespace(&["/artifacts/td-mta", "/artifacts/td-crypto-smoke", "/artifacts/td-mta-config-smoke", "/output"])?;
+    require_namespace(&["/artifacts/td-mta", "/artifacts/td-crypto-smoke", "/artifacts/td-mta-config-smoke", "/artifacts/td-mta-format-smoke", "/output"])?;
     let mut command = Command::new("/artifacts/td-mta");
     command.arg("--version").env_clear().stdin(Stdio::null());
     crate::host_bin::arm_check_child(&mut command);
@@ -591,6 +603,8 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "tls_smoke::rejects_malformed_record", false),
         ("td-crypto-smoke", "tls_smoke::rejects_bad_certificate_signature", false),
         ("td-crypto-smoke", "tls_smoke::rejects_tampered_ciphertext", false),
+        ("td-mta-format-smoke", "provider_hashes_container_and_binding_fixtures", false),
+        ("td-mta-format-smoke", "provider_hashes_import_snapshot_fixtures", false),
         ("td-mta-config-smoke", "portable_loader_stack", true),
         ("td-mta-config-smoke", "portable_materialized_stack", true),
     ]
@@ -629,7 +643,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             println!("portable runtime: {prefix}{bytes}");
         }
     }
-    println!("portable runtime: version, SHA-256 facade/failure probes, explicit provider, eight TLS cases and both bounded configuration stacks passed without toolchain mounts");
+    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, explicit provider, eight TLS cases and both bounded configuration stacks passed without toolchain mounts");
     Ok(())
 }
 
@@ -695,7 +709,7 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
     )?;
     let artifacts = scratch.0.join("artifacts");
     receipt.push_str(&collect_artifacts(&output, &artifacts)?);
-    for binary in ["td-mta", "td-crypto-smoke", "td-mta-config-smoke"] {
+    for binary in ["td-mta", "td-crypto-smoke", "td-mta-config-smoke", "td-mta-format-smoke"] {
         qualify_binary(&artifacts.join(binary))?;
     }
     let runtime = vec![
@@ -800,14 +814,17 @@ mod tests {
     }
 
     #[test]
-    fn host_collection_refuses_output_links_extras_and_oversized_receipts() {
+    fn host_collection_refuses_missing_outputs_links_extras_and_oversized_receipts() {
         let scratch = Scratch::create(&std::env::temp_dir(), "td-crypto-test").unwrap();
         let output = scratch.0.join("output");
         let source = output.join("artifacts");
         fs::create_dir_all(&source).unwrap();
-        for name in ["td-mta", "td-crypto-smoke", "td-mta-config-smoke", "COMMANDS"] {
+        for name in ["td-mta", "td-crypto-smoke", "td-mta-config-smoke", "td-mta-format-smoke", "COMMANDS"] {
             fs::write(source.join(name), name).unwrap();
         }
+        fs::remove_file(source.join("td-mta-format-smoke")).unwrap();
+        assert!(collect_artifacts(&output, &scratch.0.join("missing-format")).is_err());
+        fs::write(source.join("td-mta-format-smoke"), b"td-mta-format-smoke").unwrap();
         let good = scratch.0.join("good");
         assert_eq!(collect_artifacts(&output, &good).unwrap(), "COMMANDS");
         assert_eq!(fs::read(good.join("td-mta")).unwrap(), b"td-mta");

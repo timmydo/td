@@ -56,9 +56,12 @@ and uncertain state with retained RCPT response. Four relationship values
 are empty. Lease covers both permitted uses.
 
 M05 consumes these same artifacts for exact container encoders/decoders,
-truncation/corruption and cross-file binding checks. M07 hashes their preimages
-with the real provider. Until then these fixtures are format oracles, not
-passing cryptographic integrity or crash-recovery tests.
+truncation/corruption and cross-file binding checks. M07a2 hashes their preimages
+through the real td-crypto provider on the host and pinned portable artifact.
+It checks header/footer digests, complete-file manifest/table/history bindings,
+blob abc and the two import snapshots below. Fragmented updates and changed
+first/middle/last preimage bytes exercise the same facade. These are literal
+hash-coverage tests, not production integrity validation or crash recovery.
 
 ## Import source preimage oracles
 

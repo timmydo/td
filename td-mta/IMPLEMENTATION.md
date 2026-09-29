@@ -614,7 +614,10 @@ opaque APIs; td-mta's transport, policy-generation and resource integration.
 
 **Partial implementation:** M07a1 supplies opaque, fallible streaming SHA-256
 inside td-crypto, with terminal failure state and a narrow provider-unwind
-boundary. Known-answer and failure tests run in the portable harness. Other
+boundary. Known-answer and failure tests run in the portable harness. M07a2
+compares the real facade with existing mail-format container, cross-file,
+blob and import snapshot digest fixtures on the host and portable artifact.
+This is hash-coverage qualification, not a production container verifier. Other
 Crypto operations, entropy, TLS, native allocation and service resource
 qualification remain pending; this does not complete M07 or enable service.
 

@@ -426,9 +426,14 @@ formula. Decode enforces the same local rules as encode.
 `tests/fixtures/format-v1/README.md` defines the complete container oracles and
 preimages. They were calculated independently of the Rust codecs with Python
 struct/hashlib during development; Python is not a build/runtime dependency.
-M02b tests row bytes and fixture structure, not SHA-256 or crash durability.
+M02b tests row bytes and fixture structure. M07a2 additionally hashes the
+existing container, cross-file binding, blob and import snapshot fixtures
+through the real td-crypto facade, with fragmented updates and changed-byte
+comparisons. These host and portable tests qualify literal hash coverage;
+they do not implement production container validation or crash durability.
 M02c supplies state, queue and API meanings. M05 verifies SHA-256 through the
 reviewed provider, implements exact encoders/decoders for containers, validates
-cross-file bindings and exercises fault I/O. M07 provider tests independently
-hash the golden preimages. A successful row test must never be reported as a
-successful integrity, replay, synchronization or crash-recovery test.
+cross-file bindings and exercises fault I/O. The M07a2 tests compare against
+the independently calculated golden digests. A successful row test must never
+be reported as a successful integrity, replay, synchronization or crash-recovery
+test.
