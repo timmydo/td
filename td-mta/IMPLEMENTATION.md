@@ -340,7 +340,14 @@ Split at these concrete boundaries before dependent milestones start:
     borrowed dispatcher builds reuse allocations after success or failure.
     Results retain exclusive storage borrowing; no owned validated snapshot
     or whole-reader authority is claimed.
-  - **M04b2c3d3b:** seal completed records into an owning candidate.
+  - **M04b2c3d3b:** implemented sealed per-table headers and
+    `storage::Candidate`. A restricted statement sink lends only `accept`,
+    preventing callbacks from replacing the builder/backing association.
+    Success consumes every borrowed record before moving the owner; failure
+    returns reusable storage without validated headers. Direct read-only
+    identity/global/outbound views and scoped graph access borrow the owner.
+    Aggregate header/candidate and existing per-partition guards account for
+    payload memory; reader EOF and peak call-frame proof remain d4.
     Consume borrowed builders before moving their enclosing storage; keep
     backing tables, used prefixes and text owner together. No public loose
     rebinding, self-reference, extra snapshot copy or unsafe conversion.

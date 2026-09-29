@@ -434,6 +434,42 @@ fn read(text: text::View<'_>, owner: NonZeroU64, span: text::Span) -> Result<&st
         .map_err(|_| invariant())
 }
 
+pub(super) struct Header {
+    routes: routing::Header,
+    slots: usize,
+    hostname: text::Span,
+    owner: NonZeroU64,
+}
+impl Records<'_> {
+    pub(super) fn seal(self) -> Header {
+        Header {
+            routes: self.routes.seal(),
+            slots: self.slots.len(),
+            hostname: self.hostname,
+            owner: self.owner,
+        }
+    }
+}
+impl Header {
+    pub(super) fn reopen<'a>(
+        &self,
+        text: &'a [u8],
+        domains: &'a [routing::DomainSlot],
+        aliases: &'a [routing::AliasSlot],
+        slots: &'a [Slot],
+    ) -> Result<Records<'a>, Error> {
+        Ok(Records {
+            routes: self
+                .routes
+                .reopen(text, domains, aliases)
+                .map_err(route_error)?,
+            slots: slots.get(..self.slots).ok_or_else(invariant)?,
+            hostname: self.hostname,
+            owner: self.owner,
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {

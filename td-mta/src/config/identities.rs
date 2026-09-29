@@ -682,6 +682,42 @@ impl<'t> Iterator for AddressIter<'_, 't> {
     }
 }
 
+pub(super) struct Header {
+    identities: usize,
+    addresses: usize,
+    account: Account,
+    owner: NonZeroU64,
+}
+impl Records<'_> {
+    pub(super) fn seal(self) -> Header {
+        Header {
+            identities: self.identities.len(),
+            addresses: self.addresses.len(),
+            account: self.account,
+            owner: self.owner,
+        }
+    }
+}
+impl Header {
+    pub(super) fn view<'a, 't>(
+        &self,
+        identities: &'a [IdentitySlot],
+        addresses: &'a [AddressSlot],
+        text: text::View<'t>,
+    ) -> Result<View<'a, 't>, Error> {
+        if self.owner != text.owner() {
+            return Err(err(Code::ForeignArena, None));
+        }
+        Ok(View {
+            identities: identities.get(..self.identities).ok_or_else(invariant)?,
+            addresses: addresses.get(..self.addresses).ok_or_else(invariant)?,
+            account: self.account,
+            owner: self.owner,
+            text,
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {

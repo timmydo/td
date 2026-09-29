@@ -204,6 +204,27 @@ fn checked_read(owner: NonZeroU64, bytes: &[u8], handle: Handle) -> Result<&[u8]
     handle.span.read(bytes)
 }
 
+pub(super) struct Header {
+    used: usize,
+    owner: NonZeroU64,
+}
+impl Builder<'_> {
+    pub(super) fn seal(self) -> Header {
+        Header {
+            used: self.used,
+            owner: self.owner,
+        }
+    }
+}
+impl Header {
+    pub(super) fn view<'a>(&self, bytes: &'a [u8]) -> Result<View<'a>, Code> {
+        Ok(View {
+            bytes: bytes.get(..self.used).ok_or(Code::Reference)?,
+            owner: self.owner,
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {

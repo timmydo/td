@@ -238,7 +238,7 @@ impl Storage {
         Ok(storage)
     }
     /// Vec payload capacities plus this owner, excluding allocator overhead and
-    /// still-unimplemented sealed headers, devices, and externally borrowed plans.
+    /// sealed headers/plans (counted by Candidate) and future device storage.
     pub fn allocated_bytes(&self) -> Result<usize, Error> {
         let regions = [
             payload::<u8>(self.text.capacity(), Region::Text)?,
@@ -292,6 +292,222 @@ impl Storage {
             },
             pending,
         )
+    }
+}
+
+/// A complete set of supplied statements; not reader EOF or runtime authority.
+///
+/// A borrowed view prevents consuming its owner:
+/// ```compile_fail,E0505
+/// use td_mta::config::{dispatch, storage::Candidate};
+/// fn reuse_while_borrowed(candidate: Candidate) -> Result<(), dispatch::Error> {
+///     let identities = candidate.identities()?;
+///     let storage = candidate.into_storage();
+///     let count = identities.len();
+///     Ok(())
+/// }
+/// ```
+pub struct Candidate {
+    storage: Storage,
+    header: dispatch::Header,
+}
+impl fmt::Debug for Candidate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ConfigurationCandidate(<redacted>)")
+    }
+}
+/// Failure returns storage to its caller, without any validated record headers.
+pub struct Failed<E> {
+    storage: Storage,
+    error: BuildError<E>,
+}
+impl<E> fmt::Debug for Failed<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FailedConfiguration(<redacted>)")
+    }
+}
+impl<E> Failed<E> {
+    pub fn error(&self) -> &BuildError<E> {
+        &self.error
+    }
+    pub fn into_parts(self) -> (Storage, BuildError<E>) {
+        (self.storage, self.error)
+    }
+}
+pub enum BuildError<E> {
+    Input(E),
+    Configuration(dispatch::Error),
+}
+impl<E> fmt::Debug for BuildError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input(_) => f.write_str("ConfigurationInputError(<redacted>)"),
+            Self::Configuration(e) => e.fmt(f),
+        }
+    }
+}
+impl<E> fmt::Display for BuildError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input(_) => f.write_str("config_candidate_input"),
+            Self::Configuration(e) => e.fmt(f),
+        }
+    }
+}
+impl<E> std::error::Error for BuildError<E> {}
+fn configuration(cause: dispatch::Cause) -> dispatch::Error {
+    dispatch::Error {
+        cause,
+        context: None,
+    }
+}
+/// Restricted statement sink: callers cannot replace the owner-bound builder.
+/// ```compile_fail,E0616
+/// use td_mta::config::{dispatch::Builder, storage::Statements};
+/// fn extract<'a, 'w, 's>(input: Statements<'a, 'w, 's>) -> &'s mut Builder<'a, 'w> {
+///     input.builder
+/// }
+/// ```
+pub struct Statements<'a, 'w, 's> {
+    builder: &'s mut dispatch::Builder<'a, 'w>,
+}
+impl fmt::Debug for Statements<'_, '_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ConfigurationStatements(<redacted>)")
+    }
+}
+impl Statements<'_, '_, '_> {
+    pub fn accept(
+        &mut self,
+        statement: super::syntax::Statement<'_>,
+    ) -> Result<(), dispatch::Error> {
+        self.builder.accept(statement)
+    }
+}
+impl Storage {
+    // Returning the preallocated owner avoids allocating error storage.
+    #[allow(clippy::result_large_err)]
+    pub fn build_stanzas<E>(
+        mut self,
+        pending: &mut Pending,
+        feed: impl FnOnce(Statements<'_, '_, '_>) -> Result<(), E>,
+    ) -> Result<Candidate, Failed<E>> {
+        let result = (|| {
+            let mut builder = self.builder(pending).map_err(BuildError::Configuration)?;
+            if let Err(input) = feed(Statements {
+                builder: &mut builder,
+            }) {
+                return Err(match builder.failure() {
+                    Some(error) => BuildError::Configuration(error),
+                    None => BuildError::Input(input),
+                });
+            }
+            builder
+                .finish_stanzas()
+                .map(dispatch::Parsed::seal)
+                .map_err(BuildError::Configuration)
+        })();
+        match result {
+            Ok(header) => Ok(Candidate {
+                storage: self,
+                header,
+            }),
+            Err(error) => Err(Failed {
+                storage: self,
+                error,
+            }),
+        }
+    }
+}
+const _: [(); 1] = [(); (size_of::<Candidate>() <= GLOBAL_BYTES + PLANS_BYTES) as usize];
+const _: [(); 1] = [(); (size_of::<dispatch::Header>() <= 4 * 1024) as usize];
+const _: [(); 1] = [(); (size_of::<super::resources::Validated>() <= PLANS_BYTES) as usize];
+const _: [(); 1] = [(); (size_of::<graph::Header>() <= 1024) as usize];
+const _: [(); 1] = [(); (size_of::<identities::Header>() <= 128) as usize];
+impl Candidate {
+    fn text(&self) -> Result<text::View<'_>, dispatch::Error> {
+        self.header
+            .text
+            .view(&self.storage.text)
+            .map_err(|e| configuration(dispatch::Cause::Text(e)))
+    }
+    pub fn identities(&self) -> Result<identities::View<'_, '_>, dispatch::Error> {
+        self.header
+            .identities
+            .view(
+                &self.storage.identities,
+                &self.storage.addresses,
+                self.text()?,
+            )
+            .map_err(|e| configuration(dispatch::Cause::Identities(e)))
+    }
+    pub fn outbound(&self) -> Result<super::outbound::View<'_, '_>, dispatch::Error> {
+        self.header
+            .outbound
+            .view(self.text()?)
+            .map_err(|e| configuration(dispatch::Cause::Outbound(e)))
+    }
+    pub fn globals(&self) -> Result<super::globals::View<'_, '_>, dispatch::Error> {
+        self.header
+            .globals
+            .view(self.text()?)
+            .map_err(|e| configuration(dispatch::Cause::Globals(e)))
+    }
+    pub fn server(&self) -> super::globals::Server {
+        self.header.globals.server()
+    }
+    pub fn minimum_severity(&self) -> crate::observability::Severity {
+        self.header.globals.minimum_severity()
+    }
+    pub fn resources(&self) -> &super::resources::Validated {
+        &self.header.resources
+    }
+    /// The small graph header is temporary; no borrowed graph view can escape.
+    /// ```compile_fail,E0521
+    /// use td_mta::config::{graph, storage::Candidate};
+    /// fn escape<'a>(candidate: &'a Candidate)
+    ///     -> Option<Result<graph::View<'a, 'a>, graph::Error>> {
+    ///     let mut escaped = None;
+    ///     candidate.with_graph(|records, text| { escaped = Some(records.view(text)); }).ok();
+    ///     escaped
+    /// }
+    /// ```
+    pub fn with_graph<R>(
+        &self,
+        read: impl FnOnce(&graph::Records<'_>, text::View<'_>) -> R,
+    ) -> Result<R, dispatch::Error> {
+        let s = &self.storage;
+        let records = self
+            .header
+            .graph
+            .reopen(graph::Backing {
+                routing_text: &s.routing_text,
+                domains: &s.domains,
+                aliases: &s.aliases,
+                policies: &s.policies,
+                listeners: &s.listeners,
+                certificates: &s.certificates,
+                gateways: &s.gateways,
+                peers: &s.peers,
+                bindings: &s.bindings,
+            })
+            .map_err(|e| configuration(dispatch::Cause::Graph(e)))?;
+        let text = self.text()?;
+        records
+            .view(text)
+            .map_err(|e| configuration(dispatch::Cause::Graph(e)))?;
+        Ok(read(&records, text))
+    }
+    pub fn allocated_bytes(&self) -> Result<usize, Error> {
+        self.storage
+            .allocated_bytes()?
+            .checked_sub(size_of::<Storage>())
+            .and_then(|n| n.checked_add(size_of::<Self>()))
+            .ok_or_else(|| layout(Region::Global))
+    }
+    /// Consumes all validation headers. No borrowed view may outlive this move.
+    pub fn into_storage(self) -> Storage {
+        self.storage
     }
 }
 
@@ -643,5 +859,228 @@ address = "127.0.0.2:53"
         let error = layout(Region::Text);
         assert_eq!(format!("{error}"), "config_storage_layout in text");
         assert!(std::error::Error::source(&error).is_none());
+    }
+    #[allow(clippy::result_large_err)]
+    fn candidate(storage: Storage, source: &str) -> Result<Candidate, Failed<dispatch::Error>> {
+        let mut pending = Pending::new();
+        storage.build_stanzas(&mut pending, |mut builder| {
+            let mut decoded = [0; 4096];
+            for (index, line) in source.lines().enumerate() {
+                builder.accept(
+                    super::super::syntax::parse_line(
+                        NonZeroU32::new(index as u32 + 1).unwrap(),
+                        line.as_bytes(),
+                        &mut decoded,
+                    )
+                    .unwrap(),
+                )?;
+            }
+            Ok(())
+        })
+    }
+    #[test]
+    fn sealed_candidate_moves_and_views_use_the_original_regions() {
+        let _guard = lock();
+        let storage = Storage::try_new().unwrap();
+        let allocations = allocation_ids(&storage);
+        let allocated = storage.allocated_bytes().unwrap();
+        let value = candidate(storage, &expanded_source()).unwrap();
+        assert_eq!(
+            value.allocated_bytes().unwrap(),
+            allocated - size_of::<Storage>() + size_of::<Candidate>()
+        );
+        assert!(value.allocated_bytes().unwrap() < SNAPSHOT_BYTES - DEVICE_BYTES);
+        assert_eq!(allocation_ids(&value.storage), allocations);
+        let boxed = Box::new(value);
+        let identities = boxed.identities().unwrap();
+        assert_eq!(identities.len(), 2);
+        assert_eq!(
+            identities
+                .identity(0)
+                .unwrap()
+                .unwrap()
+                .reply_to
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            boxed.identities().unwrap().account().unwrap().username,
+            "longer-name"
+        );
+        assert_eq!(
+            boxed.outbound().unwrap().relay().unwrap().username,
+            "longer-name"
+        );
+        assert_eq!(
+            boxed.globals().unwrap().data().unwrap(),
+            super::super::globals::DEFAULT_DATA
+        );
+        boxed
+            .with_graph(|records, text| {
+                assert_eq!(records.routes().alias_count(), 2);
+                assert!(records
+                    .routes()
+                    .resolve("old@example.test")
+                    .unwrap()
+                    .is_some());
+                let graph = records.view(text).unwrap();
+                assert_eq!(graph.binding_count(), 4);
+                assert_eq!(graph.certificates().unwrap().len(), 2);
+                assert_eq!(graph.listeners().unwrap().len(), 3);
+                let gateways = graph.gateways().unwrap();
+                assert_eq!(gateways.len(), 1);
+                assert_eq!(gateways.gateway(0).unwrap().unwrap().peer_count(), 1);
+                assert!(gateways
+                    .gateway(0)
+                    .unwrap()
+                    .unwrap()
+                    .peer(0)
+                    .unwrap()
+                    .is_some());
+                assert_eq!(graph.origin().unwrap().host(), "jmap.example.test");
+            })
+            .unwrap();
+        assert_eq!(allocation_ids(&boxed.storage), allocations);
+        let storage = boxed.into_storage();
+        let rebuilt = candidate(storage, &source("short", false)).unwrap();
+        assert_eq!(allocation_ids(&rebuilt.storage), allocations);
+        assert_eq!(rebuilt.identities().unwrap().len(), 1);
+        assert!(rebuilt
+            .identities()
+            .unwrap()
+            .identity(0)
+            .unwrap()
+            .unwrap()
+            .reply_to
+            .is_none());
+        assert_eq!(
+            rebuilt.identities().unwrap().account().unwrap().username,
+            "short"
+        );
+        rebuilt
+            .with_graph(|records, text| {
+                assert_eq!(records.routes().alias_count(), 1);
+                assert_eq!(records.routes().domain_count(), 1);
+                assert_eq!(records.routes().resolve("old@example.test").unwrap(), None);
+                let graph = records.view(text).unwrap();
+                assert_eq!(graph.binding_count(), 2);
+                assert_eq!(graph.certificates().unwrap().len(), 1);
+                assert_eq!(graph.listeners().unwrap().len(), 2);
+                assert_eq!(graph.gateways().unwrap().len(), 0);
+                assert!(graph.gateways().unwrap().gateway(0).unwrap().is_none());
+            })
+            .unwrap();
+    }
+    #[test]
+    fn failed_input_and_finalization_return_reusable_storage_without_headers() {
+        let _guard = lock();
+        let old = candidate(Storage::try_new().unwrap(), &source("old", true)).unwrap();
+        let mut storage = Storage::try_new().unwrap();
+        let allocations = allocation_ids(&storage);
+        let mut pending = Pending::new();
+        let failure = storage
+            .build_stanzas(&mut pending, |_| Err("private supplied failure"))
+            .unwrap_err();
+        assert!(
+            !format!("{failure:?} {:?} {}", failure.error(), failure.error()).contains("private")
+        );
+        assert!(std::error::Error::source(failure.error()).is_none());
+        let (returned, cause) = failure.into_parts();
+        assert!(matches!(
+            cause,
+            BuildError::Input("private supplied failure")
+        ));
+        storage = returned;
+        let malformed =
+            source("new", false).replace("certificate = \"public\"", "certificate = \"missing\"");
+        let failure = candidate(storage, &malformed).unwrap_err();
+        assert!(matches!(failure.error(), BuildError::Configuration(_)));
+        let (returned, _) = failure.into_parts();
+        assert_eq!(allocation_ids(&returned), allocations);
+        assert_eq!(old.identities().unwrap().account().unwrap().username, "old");
+        let next = candidate(returned, &source("new", false)).unwrap();
+        assert_eq!(allocation_ids(&next.storage), allocations);
+        assert_eq!(
+            next.identities().unwrap().account().unwrap().username,
+            "new"
+        );
+    }
+    #[test]
+    fn propagated_and_ignored_accept_errors_keep_the_first_diagnostic() {
+        let _guard = lock();
+        let source = source("valid", false) + "private_unknown = true\n";
+        let mut storage = Storage::try_new().unwrap();
+        let mut pending = Pending::new();
+        let mut scratch = vec![0; super::super::stream::SCRATCH_BYTES];
+        for ignored in [false, true] {
+            let mut observed = None;
+            let failed = storage
+                .build_stanzas(&mut pending, |mut sink| {
+                    super::super::stream::read(&mut source.as_bytes(), &mut scratch, |statement| {
+                        let result = sink.accept(statement);
+                        if let Err(error) = result {
+                            observed.get_or_insert(error);
+                            if ignored {
+                                return Ok(());
+                            }
+                        }
+                        result
+                    })
+                    .map(|_| ())
+                })
+                .unwrap_err();
+            let wanted = observed.unwrap();
+            assert!(matches!(failed.error(), BuildError::Configuration(error) if *error == wanted));
+            assert_eq!(failed.error().to_string(), wanted.to_string());
+            (storage, _) = failed.into_parts();
+        }
+    }
+
+    #[test]
+    fn sealed_owner_and_used_prefix_checks_refuse_internal_mismatch() {
+        let _guard = lock();
+        let mut first = candidate(Storage::try_new().unwrap(), &source("first", false)).unwrap();
+        let mut second = candidate(Storage::try_new().unwrap(), &source("second", true)).unwrap();
+        std::mem::swap(&mut first.header.text, &mut second.header.text);
+        assert!(first.identities().is_err());
+        assert!(first.outbound().is_err());
+        assert!(first.globals().is_err());
+        assert!(first
+            .with_graph(|_, _| panic!("foreign owner reached callback"))
+            .is_err());
+        std::mem::swap(&mut first.header.text, &mut second.header.text);
+        first.storage.identities.clear();
+        assert!(first.identities().is_err());
+        second.storage.bindings.clear();
+        assert!(second.with_graph(|_, _| ()).is_err());
+    }
+    #[test]
+    fn every_sealed_prefix_rejects_truncated_backing() {
+        let _guard = lock();
+        let mut value = candidate(Storage::try_new().unwrap(), &expanded_source()).unwrap();
+        macro_rules! reject_graph {
+            ($field:ident) => {{
+                let mut cells = Vec::new();
+                std::mem::swap(&mut cells, &mut value.storage.$field);
+                assert!(value.with_graph(|_, _| ()).is_err(), stringify!($field));
+                std::mem::swap(&mut cells, &mut value.storage.$field);
+            }};
+        }
+        reject_graph!(routing_text);
+        reject_graph!(domains);
+        reject_graph!(aliases);
+        reject_graph!(policies);
+        reject_graph!(listeners);
+        reject_graph!(certificates);
+        reject_graph!(gateways);
+        reject_graph!(peers);
+        reject_graph!(bindings);
+        let mut addresses = Vec::new();
+        std::mem::swap(&mut addresses, &mut value.storage.addresses);
+        assert!(value.identities().is_err());
+        std::mem::swap(&mut addresses, &mut value.storage.addresses);
+        assert!(value.identities().is_ok());
+        assert!(value.with_graph(|_, _| ()).is_ok());
     }
 }

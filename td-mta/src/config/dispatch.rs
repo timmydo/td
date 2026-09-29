@@ -380,6 +380,9 @@ impl<'a, 'w> Builder<'a, 'w> {
         }
         result
     }
+    pub(super) fn failure(&self) -> Option<Error> {
+        self.failure
+    }
     fn flush(&mut self) -> Result<(), Error> {
         if matches!(self.active, Active::Pending) {
             let stanza = self.pending.finish().map_err(Error::from_stanza)?;
@@ -987,6 +990,27 @@ fn apply_context(
                 .map_err(Error::from_listener)
         }
         Section::Resource(_) => Err(invariant()),
+    }
+}
+
+pub(super) struct Header {
+    pub graph: graph::Header,
+    pub identities: identities::Header,
+    pub outbound: outbound::Records,
+    pub globals: globals::Records,
+    pub resources: resources::Validated,
+    pub text: text::Header,
+}
+impl Parsed<'_> {
+    pub(super) fn seal(self) -> Header {
+        Header {
+            graph: self.graph.seal(),
+            identities: self.identities.seal(),
+            outbound: self.outbound,
+            globals: self.globals,
+            resources: self.resources,
+            text: self.text.seal(),
+        }
     }
 }
 

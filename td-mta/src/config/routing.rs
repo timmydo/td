@@ -493,6 +493,38 @@ impl Routing<'_> {
     }
 }
 
+pub(super) struct Header {
+    text: usize,
+    domains: usize,
+    aliases: usize,
+    account: AccountId,
+}
+impl Routing<'_> {
+    pub(super) fn seal(self) -> Header {
+        Header {
+            text: self.text.len(),
+            domains: self.domains.len(),
+            aliases: self.aliases.len(),
+            account: self.account,
+        }
+    }
+}
+impl Header {
+    pub(super) fn reopen<'a>(
+        &self,
+        text: &'a [u8],
+        domains: &'a [DomainSlot],
+        aliases: &'a [AliasSlot],
+    ) -> Result<Routing<'a>, Error> {
+        Ok(Routing {
+            text: text.get(..self.text).ok_or_else(invariant)?,
+            domains: domains.get(..self.domains).ok_or_else(invariant)?,
+            aliases: aliases.get(..self.aliases).ok_or_else(invariant)?,
+            account: self.account,
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {

@@ -463,6 +463,34 @@ impl Gateway<'_, '_> {
     }
 }
 
+pub(super) struct Header {
+    slots: usize,
+    owner: NonZeroU64,
+    peers: usize,
+}
+impl Records<'_> {
+    pub(super) fn seal(self) -> Header {
+        Header {
+            slots: self.slots.len(),
+            owner: self.owner,
+            peers: self.peers.len(),
+        }
+    }
+}
+impl Header {
+    pub(super) fn reopen<'a>(
+        &self,
+        slots: &'a [Slot],
+        peers: &'a [PeerSlot],
+    ) -> Result<Records<'a>, Error> {
+        Ok(Records {
+            slots: slots.get(..self.slots).ok_or_else(invariant)?,
+            owner: self.owner,
+            peers: peers.get(..self.peers).ok_or_else(invariant)?,
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {

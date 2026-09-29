@@ -423,6 +423,30 @@ impl<'t> View<'_, 't> {
     }
 }
 
+pub(super) struct Header {
+    slots: usize,
+    owner: NonZeroU64,
+    acme: Option<AcmeSlot>,
+}
+impl Records<'_> {
+    pub(super) fn seal(self) -> Header {
+        Header {
+            slots: self.slots.len(),
+            owner: self.owner,
+            acme: self.acme,
+        }
+    }
+}
+impl Header {
+    pub(super) fn reopen<'a>(&self, slots: &'a [Slot]) -> Result<Records<'a>, Error> {
+        Ok(Records {
+            slots: slots.get(..self.slots).ok_or_else(invariant)?,
+            owner: self.owner,
+            acme: self.acme,
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {

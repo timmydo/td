@@ -633,6 +633,75 @@ impl<'s, 't> View<'s, 't> {
     }
 }
 
+pub(super) struct Header {
+    listeners: listener::Header,
+    certificates: certificate::Header,
+    gateways: gateway::Header,
+    domains: policy::Header,
+    bindings: usize,
+    origin: text::Span,
+    owner: NonZeroU64,
+}
+pub(super) struct Backing<'a> {
+    pub routing_text: &'a [u8],
+    pub domains: &'a [super::routing::DomainSlot],
+    pub aliases: &'a [super::routing::AliasSlot],
+    pub policies: &'a [policy::Slot],
+    pub listeners: &'a [listener::Slot],
+    pub certificates: &'a [certificate::Slot],
+    pub gateways: &'a [gateway::Slot],
+    pub peers: &'a [gateway::PeerSlot],
+    pub bindings: &'a [BindingSlot],
+}
+impl Records<'_> {
+    pub(super) fn seal(self) -> Header {
+        Header {
+            listeners: self.inputs.listeners.seal(),
+            certificates: self.inputs.certificates.seal(),
+            gateways: self.inputs.gateways.seal(),
+            domains: self.inputs.domains.seal(),
+            bindings: self.bindings.len(),
+            origin: self.origin,
+            owner: self.owner,
+        }
+    }
+}
+impl Header {
+    pub(super) fn reopen<'a>(&self, backing: Backing<'a>) -> Result<Records<'a>, Error> {
+        Ok(Records {
+            inputs: Inputs {
+                listeners: self
+                    .listeners
+                    .reopen(backing.listeners)
+                    .map_err(|_| invariant())?,
+                certificates: self
+                    .certificates
+                    .reopen(backing.certificates)
+                    .map_err(|_| invariant())?,
+                gateways: self
+                    .gateways
+                    .reopen(backing.gateways, backing.peers)
+                    .map_err(|_| invariant())?,
+                domains: self
+                    .domains
+                    .reopen(
+                        backing.routing_text,
+                        backing.domains,
+                        backing.aliases,
+                        backing.policies,
+                    )
+                    .map_err(|_| invariant())?,
+            },
+            bindings: backing
+                .bindings
+                .get(..self.bindings)
+                .ok_or_else(invariant)?,
+            origin: self.origin,
+            owner: self.owner,
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {

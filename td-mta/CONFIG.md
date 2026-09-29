@@ -662,8 +662,10 @@ Finalization requires a declared account, at least one identity, no
 undeclared forward targets, matching account references and consistent
 list selectors. It sorts identities by raw ID and returns structural
 records retaining a private exclusive borrow of identity cells. Public
-views borrow those records read-only. M04b3 consumes the records and
-fills the two reserved signature spans after protected reads; it must
+views borrow those records read-only. Records may be consumed into the sealed
+candidate described below.
+M04b3 consumes exclusive candidate access and fills the two reserved
+signature spans after protected reads; it must
 not mutate a published snapshot or an outstanding read view. Duplicate
 account/identity declarations format both current and prior source
 locations. Capacity errors caused while undeclared forward targets
@@ -1205,7 +1207,7 @@ written by policy/graph finalization. A compile-time guard covers the
 dispatcher and Pending within the existing 36 KiB workspace; this is not a
 peak-stack proof including called frames. The separate 28 KiB stream region
 and complete loader/call-frame measurement remain d4. Private owned storage
-and sealed table headers remain d3.
+and sealed table headers are described below.
 
 The first accept error is sticky and consuming finish refuses it. Partial
 table/text writes remain private and charged until the caller discards the
@@ -1241,10 +1243,10 @@ There is no large aggregate stack temporary, byte reinterpretation or unsafe.
 
 `allocated_bytes` reports actual vector payload capacities plus the owner
 headers. Every region retains its existing ceiling; the owner fits 1 KiB of
-global headroom. Unimplemented device cells, resource-plan storage and sealed
-record headers keep their separate reservations. This count excludes allocator
-bookkeeping/rounding, does not predict RSS and does not count external borrowed
-Parsed headers/plans as though they were already stored inside this owner.
+global headroom. Device cells remain reserved and unimplemented. This empty
+owner count excludes borrowed Parsed headers/plans and allocator overhead; it
+does not predict RSS. `Candidate::allocated_bytes` additionally counts the
+completed sealed headers and owned resource plans as described below.
 An allocator returning vector capacity above its region partition is refused; this post-allocation
 check is not a bound on allocator-internal transient storage. The partition
 ledger and later whole-process qualification retain their existing roles.
@@ -1264,6 +1266,75 @@ unchanged allocation addresses across success/failure/reuse, shrinking every
 typed table and text prefix, moving unused storage, and an independent prior configuration
 remaining readable after replacement failure. Pointer/capacity checks establish
 region reuse; they do not replace later whole-process allocation measurement.
-M04b2c3d3b still owns sealed headers and a movable completed candidate; d4 owns
+The following section specifies sealed headers and movable candidates; d4 owns
 actual reader EOF, concurrent workspace and call-frame checks. No service,
 protected-file, provider or publication authority is introduced.
+
+
+## Owning structural candidates
+
+M04b2c3d3b adds `storage::Candidate` and private sealed headers.
+`Storage::build_stanzas` consumes its preallocated owner and borrows caller
+Pending scratch. The supplied callback receives an owned restricted
+`Statements` sink with only `accept`; it cannot replace or extract the
+underlying dispatcher. This preserves the association between the builder,
+its storage, and the headers later sealed from it. The callback must propagate
+its input errors. A recorded accept failure takes precedence over the
+callback error and retains the first typed configuration diagnostic. With no
+recorded accept failure, the callback error remains Input. Ignored accept
+failures still poison finalization.
+
+After callback success, the owner finalizes all supplied statements and
+consumes the borrowed Parsed result. Routing, identities, policies, listeners,
+certificates, gateways and bindings retain private used counts and inline
+settings; text retains its original owner ticket and used prefix. Global and
+outbound records and resource plans move directly into the header aggregate.
+Every table borrow ends before the backing owner moves. Header constructors
+and checked reopening stay private to configuration modules; there is no
+public detached-header or arbitrary rebinding API. No self-reference, unsafe
+conversion, new allocation or complete snapshot copy is introduced.
+
+Identity, outbound and global accessors return read-only views borrowing the
+candidate. `with_graph` reconstructs only the bounded borrowed graph header
+on the stack, validates its text owner, and invokes a caller callback; a
+graph view cannot outlive that
+callback. The same closure can use local routes and nested graph accessors.
+Compiler rejection examples pin graph-view escape, consuming an owner while
+an identity view remains in use, and the private statement sink. Each requires
+its specific Rust error code so an unrelated linker failure cannot pass.
+Every reopened slice checks its
+sealed count, and text-backed views continue to enforce the original owner.
+
+A callback or configuration failure returns `Failed<E>`, containing the
+preallocated storage and its error, with no validated headers. `into_parts`
+recovers that storage for another build. Input errors have redacted Debug,
+Display and source chains; matching the public Input variant explicitly
+exposes the trusted caller's original error. Configuration errors retain their
+fixed diagnostics. Returning the storage inline has one documented
+`result_large_err` Clippy allowance; boxing the failure would allocate on
+the error path. Generic input error storage belongs to the caller's bounded
+loader/workspace contract, not the snapshot payload ledger.
+
+`Candidate::into_storage` consumes all completed headers and recovers the
+regions. Rust borrowing prevents this while a read view exists. Reuse creates
+a new text ticket and new used prefixes; old private bytes remain unscrubbed
+as specified above. Tests move completed candidates, compare allocation
+addresses, rebuild with smaller configurations, exercise input/finalizer and
+sticky errors, reject internal owner/count mismatch, and retain an independent
+prior candidate across replacement failure. No old generation is mutated.
+
+Complete sealed headers fit 4 KiB; the graph subheader fits 1 KiB and identity
+subheader 128 bytes, within global headroom. Resource plans independently fit
+their 4 KiB partition. Candidate inline ownership plus headers fits global
+headroom plus the plans partition. `allocated_bytes` counts the actual table
+capacities plus the whole candidate header once, replacing the small empty
+Storage owner's count. Existing table partition ceilings continue to apply.
+Allocator overhead, provider material and peak call frames remain separate
+measurements; no RSS claim follows from these object-layout guards.
+
+A Candidate proves structural closure of the statements actually submitted,
+not reader EOF, protected-file trust, resolved signatures, certificate
+validity or runtime publication. M04b2c3d4 must own the reader operation and
+return a candidate only after actual EOF. M04b3 consumes exclusive candidate
+access for protected signature/credential material before publication; no
+mutable cells or loose headers are exposed by the current public API.
