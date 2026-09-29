@@ -1,5 +1,5 @@
-//! Opaque cryptographic APIs; streaming SHA-256 uses the private AWS-LC backend.
-//! Entropy, signing-key operations and TLS sessions remain unimplemented.
+//! Opaque SHA-256 and entropy APIs over the private AWS-LC backend.
+//! Signing-key operations and TLS sessions remain unimplemented.
 //!
 //! These checks reject the two named root exports; backend integration must
 //! also check nested exports, aliases and public signatures.
@@ -16,6 +16,8 @@ compile_error!("td-crypto requires panic=unwind for its provider error boundary"
 
 mod sha256;
 pub use sha256::Sha256;
+mod entropy;
+pub use entropy::SystemEntropy;
 
 /// Fixed failures carry neither backend diagnostics nor secret input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

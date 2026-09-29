@@ -594,6 +594,9 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "sha256::tests::known_answers_and_fragmented_updates", false),
         ("td-crypto-smoke", "sha256::tests::initialization_update_and_finalization_unwinds_return_fixed_failure", false),
         ("td-crypto-smoke", "sha256::tests::length_refusal_retires_state_before_provider_update", false),
+        ("td-crypto-smoke", "entropy::tests::local_randomness_smoke", false),
+        ("td-crypto-smoke", "entropy::tests::construction_requires_nonempty_successful_initialization", false),
+        ("td-crypto-smoke", "entropy::tests::synthetic_partial_error_clears_the_entire_caller_slice", false),
         ("td-crypto-smoke", "tests::explicit_aws_provider_and_roots_construct_without_global_default", false),
         ("td-crypto-smoke", "tls_smoke::tls12_local_round_trip", false),
         ("td-crypto-smoke", "tls_smoke::tls13_local_round_trip", false),
@@ -643,7 +646,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             println!("portable runtime: {prefix}{bytes}");
         }
     }
-    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, explicit provider, eight TLS cases and both bounded configuration stacks passed without toolchain mounts");
+    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, entropy probes, explicit provider, eight TLS cases and both bounded configuration stacks passed without toolchain mounts");
     Ok(())
 }
 

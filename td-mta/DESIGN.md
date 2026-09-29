@@ -115,7 +115,8 @@ The M03a boundary moves the existing Crypto/Entropy/Digest traits and fixed
 crypto errors into td-crypto. Mail ports re-export those traits and translate
 shared errors. M03b1 admits the approved Rustls/AWS-LC closure inside td-crypto
 only. M07a1 implements opaque SHA-256; M07a2 qualifies it against the existing
-mail-format digest fixtures. Other primitives and a TLS service remain pending.
+mail-format digest fixtures. M07a3 adds worker-local entropy initialization.
+Other primitives and a TLS service remain pending.
 Native per-digest allocation has not been qualified for mail hot paths. No
 Rustls/AWS-LC public types, re-exports or configuration escape hatches cross
 its facade.

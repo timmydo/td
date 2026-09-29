@@ -617,8 +617,10 @@ inside td-crypto, with terminal failure state and a narrow provider-unwind
 boundary. Known-answer and failure tests run in the portable harness. M07a2
 compares the real facade with existing mail-format container, cross-file,
 blob and import snapshot digest fixtures on the host and portable artifact.
-This is hash-coverage qualification, not a production container verifier. Other
-Crypto operations, entropy, TLS, native allocation and service resource
+This is hash-coverage qualification, not a production container verifier.
+M07a3 adds a worker-local entropy handle with nonempty cold initialization,
+fixed returned-error handling and explicit native-abort limits. Remaining
+Crypto operations, TLS, native allocation and service resource
 qualification remain pending; this does not complete M07 or enable service.
 
 Freeze the bounded td-owned TLS configuration/session API before implementing

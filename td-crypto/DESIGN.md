@@ -6,8 +6,9 @@ This crate owns td's provider-independent cryptographic API. The compiling
 M03a surface contains `Error`, `Entropy`, `Digest` and `Crypto`, extracted
 from td-mta's existing ports. M03b1 admits the private Rustls/AWS-LC
 dependencies and checks their offline host build. M07a1 implements opaque
-streaming SHA-256 through the private AWS-LC backend. Entropy, signing-key
-operations and TLS sessions remain unimplemented. Test-only backend qualification covers explicit
+streaming SHA-256 through the private AWS-LC backend. M07a3 adds the opaque
+worker-local entropy handle. Signing-key operations and TLS sessions remain
+unimplemented. Test-only backend qualification covers explicit
 provider construction, SHA-256, local TLS 1.2/1.3 data exchange, certificate
 verification and malformed/tampered-record refusals in the isolated static
 executable.
@@ -92,6 +93,65 @@ that enum. TLS-specific errors and interfaces are frozen by M07 before their
 consumers are implemented; they follow the same ownership and redaction rules.
 
 ## Backend and TLS implementation
+
+### Worker-local entropy
+
+`SystemEntropy::try_new` performs a nonempty one-byte random fill before
+returning a handle. Construct it on its owning worker during cold setup. The
+handle is neither Send nor Sync, so it cannot transfer an initialized handle
+to an unwarmed thread. This warms only the RNG path used by this API; other
+crypto/TLS paths still require their own qualification. Empty fills succeed
+but do not initialize native state. No Default constructor bypasses warm-up.
+
+The opaque handle owns no Rust heap buffer. Native per-thread state survives
+handle drop. Initial use can allocate RNG state, a pthread pointer table and
+source-specific state; moving a Rust value would not transfer those allocations.
+There is also lazy process-wide state. The admitted Linux build includes jitter
+entropy; absent the native VM-generation-detection alternative, it initializes
+a global seed DRBG and jitter collector with its memory buffer/self-test.
+OS-randomness setup, VM-generation probing and the fork-detection mapping also
+have process-wide costs. Each worker's tree-seed initialization and later
+reseeds take a shared global lock; reseeding can collect jitter entropy while
+holding it. First use in the process costs more than later worker warm-up.
+M07 must measure both global and per-worker memory, stack and lock contention.
+Constructor success establishes neither a no-allocation hot path nor a bound
+on later native calls or elapsed time.
+
+The admitted non-FIPS `aws_lc_rs::rand::fill` path calls native `RAND_bytes`
+and maps its return status without a Rust unwrap/expect path. The pinned
+native function returns one on every normal return. Allocation, entropy,
+initialization/reseed/generation, lock/once and state-validation failures can
+abort the process. Those failures cannot become `Error::Entropy` or be caught
+by Rust unwinding. There is no weak-randomness or partial-byte fallback.
+
+Native calls can also block: early-boot OS entropy initialization may wait
+without a deadline, and calls after exit-time zeroization can remain locked
+forever (or abort when a lock reports an error). Waiting/fatal native paths
+can write diagnostics directly to stderr, including the executable path from
+AT_EXECFN; td's fixed returned errors do not redact that separate channel.
+M07 must qualify startup/shutdown ordering and supervision around these limits;
+this constructor supplies no timeout or cancellation mechanism.
+
+An ordinary returned provider error maps to fixed `Error::Entropy` and
+clears the entire caller slice. Callers must still discard it; zeroed bytes
+are never successful entropy. This is observable hygiene, not guaranteed
+erasure of compiler/caller copies. Private callback tests inject a returned
+error after a partial write at the same boundary; they do not simulate native
+entropy failure, OOM or process-death recovery. A local sample comparison is
+only a no-op/constant-output wiring check, not an entropy-quality test.
+
+Normal pthread teardown invokes native entropy-source cleanup and frees its
+source/RNG allocations through the default cleansing allocator. Dropping the
+handle does not trigger it; normal process exit does not run the main thread's
+pthread key destructors. Exit destructors clear registered frontend DRBGs,
+lock against later output and invoke source-specific zeroization. The tree-seed
+DRBG path reseeds with OS data (zeros if entropy is unavailable), rather than
+simply clearing its bytes. A separate destructor frees the global seed DRBG
+and jitter collector. Some thread nodes remain for OS reclaim at exit,
+including the main thread's node and nodes racing shutdown. These destructors
+are normal-exit paths; `_exit`, abort and kill can bypass them. This audit
+supplies no all-path erasure claim for source-owned storage, stack temporaries
+or compiler/caller copies.
 
 ### Streaming SHA-256
 

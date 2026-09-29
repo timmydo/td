@@ -233,7 +233,7 @@ must select exactly one expected binary/test profile. All four results must be
 x86-64 static PIEs with an executable entry point and no ELF interpreter,
 DT_NEEDED or runtime search path. A second fresh namespace mounts only the
 result and static test supervisor, then runs the installed name's version command
-and each SHA-256, mail-format, provider-construction, TLS and configuration-stack smoke
+and each SHA-256, mail-format, entropy, provider-construction, TLS and configuration-stack smoke
 case in its own process.
 It has no compiler, root-data file, loader or library mounts. Each runtime command has a
 30-second deadline; each Cargo command has a 20-minute deadline. Parsed Cargo
@@ -309,6 +309,21 @@ abort override. Such linking is unsupported, including in future target recipes.
 Hooks still run, and these tests do not simulate native OOM, native abort or
 entropy failure. They add no allocation/RSS or service-stack claim. DESIGN.md
 owns the failure policy and the remaining M07 qualification requirements.
+
+## Entropy qualification
+
+Three exact cases in `td-crypto-smoke` exercise local bounded random fills,
+nonempty constructor initialization, and synthetic returned errors after a
+partial write. They verify that failed construction yields no handle and a
+returned fill error clears the whole caller slice while preserving guards.
+The local sample comparison catches no-op/constant-output wiring; it is not
+an entropy-quality test. The host compile-fail doctests separately pin the handle's
+Send and Sync refusals. No new portable executable is added.
+
+These cases do not induce native RNG failure or prove recovery from native
+abort/OOM or bounded native wait time. Process-wide/per-thread state, shared
+locks, direct native stderr, warm-up, cleanup and remaining allocation/stack/RSS
+qualification follow DESIGN.md. No service is enabled by this probe.
 
 ## Mail-format digest qualification
 
