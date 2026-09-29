@@ -115,7 +115,12 @@ impl DestinationPage {
                 columns,
             );
         } else if let Some(disk) = selected.and_then(|index| disks.get(index)) {
-            details(disk, columns, &mut lines);
+            push_identity_lines(disk, columns, &mut lines);
+            push_lines(
+                &mut lines,
+                "Selection alone does not erase this disk.",
+                columns,
+            );
         } else if disks.is_empty() {
             push_lines(
                 &mut lines,
@@ -216,7 +221,8 @@ fn row_model(disk: &Destination) -> String {
         .unwrap_or_else(|| "not provided".into())
 }
 
-fn details(disk: &Destination, columns: usize, lines: &mut Vec<String>) {
+/// Append the complete escaped disk identity for both destination and review.
+pub(crate) fn push_identity_lines(disk: &Destination, columns: usize, lines: &mut Vec<String>) {
     let (major, minor) = disk.number();
     let serial = disk
         .serial()
@@ -259,7 +265,6 @@ fn details(disk: &Destination, columns: usize, lines: &mut Vec<String>) {
         (format!("Model: {}", model(disk)), "| Model: "),
         (format!("Serial: {serial}"), "| Serial: "),
         (format!("WWID: {wwid}"), "| WWID: "),
-        ("Selection alone does not erase this disk.".into(), "| "),
     ] {
         push_lines_with(lines, &line, columns, continuation);
     }
@@ -268,7 +273,7 @@ fn details(disk: &Destination, columns: usize, lines: &mut Vec<String>) {
 /// Show untrusted device labels without terminal controls, bidirectional
 /// overrides or ambiguous backslash escapes. The input is bounded to 256
 /// bytes by `Destination`; this complete rendering can span detail pages.
-fn safe_label(value: &str) -> String {
+pub(crate) fn safe_label(value: &str) -> String {
     let mut out = String::new();
     for ch in value.chars() {
         out.push_str(&escaped(ch));
@@ -325,7 +330,13 @@ fn push_lines(lines: &mut Vec<String>, text: &str, columns: usize) {
     push_lines_with(lines, text, columns, "| ");
 }
 
-fn push_lines_with(lines: &mut Vec<String>, text: &str, columns: usize, continuation: &str) {
+/// Wrap a field while repeating its heading on each continuation line.
+pub(crate) fn push_lines_with(
+    lines: &mut Vec<String>,
+    text: &str,
+    columns: usize,
+    continuation: &str,
+) {
     let mut line = String::new();
     let mut used = 0;
     for ch in text.chars() {

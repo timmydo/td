@@ -60,9 +60,9 @@ mounts, then builds with the target Rust toolchain. The check runs
 `--help`, `--font-license` and a headless render of the full welcome
 frame without emitting its image bytes.
 This establishes an image-eligible executable whose window presents only
-the welcome page. Its library also has pure, unconnected destination and
-settings views. The release live profile must wait for the remaining
-wizard pages, its paired service, trusted consent, and end-to-end
+the welcome page. Its library also has pure, unconnected destination,
+settings and review views. The release live profile must wait for the
+remaining wizard pages, its paired service, trusted consent, and end-to-end
 installation evidence.
 
 The destination page is a pure view over `Destination` values supplied by
@@ -87,6 +87,13 @@ for catalog selections. It displays bounded tokens and focus without
 treating wire admission as policy or catalog approval. Empty values may
 be shown before completion. The page is not yet connected to the live
 window; the validation contract below applies before review.
+
+The pure review page renders one immutable `Plan` proposal. It shows the
+complete escaped disk identity and all four selected settings across bounded
+detail pages. The destructive-loss and unencrypted automatic-login notices
+remain visible on every page. It cannot authenticate the source, establish a
+disk claim or authorize execution; the service and compositor-owned trusted
+consent remain mandatory. It is not yet connected to the live window.
 
 Disk enumeration is read-only and bounded. Show model, serial when supplied
 by the device, capacity and a distinguishing device identifier. These are

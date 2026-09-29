@@ -27,6 +27,7 @@ fn source_inventory_and_toolkit_access_are_closed() {
         "destination.rs",
         "lib.rs",
         "main.rs",
+        "review.rs",
         "settings.rs",
         "welcome.rs",
         "window.rs",
@@ -68,12 +69,13 @@ fn source_inventory_and_toolkit_access_are_closed() {
         "destination.rs",
         "lib.rs",
         "main.rs",
+        "review.rs",
         "settings.rs",
         "welcome.rs",
         "window.rs",
     ] {
         let text = std::fs::read_to_string(root.join("src").join(name)).unwrap();
-        let allowed = if name == "destination.rs" {
+        let allowed = if matches!(name, "destination.rs" | "review.rs") {
             text.replace("td_install::installation_plan::", "")
         } else {
             text.clone()
