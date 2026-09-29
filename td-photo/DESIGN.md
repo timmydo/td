@@ -31,8 +31,8 @@ the look in it, and the full-resolution bilinear demosaic export runs in row
 bands (`develop`), the RGB image buffers and PPM writer and reader
 (`image`), the baseline JPEG decoder for the embedded previews with its
 reduced-transform scaling and the baseline encoder export writes through
-(`jpeg`), the AV1 still-picture encoder (`av1` over `transform`, `cdf`
-and `deblock`) and the AVIF container (`avif`) export writes through
+(`jpeg`), the AV1 still-picture encoder (`av1` over `transform`, `cdf`,
+`deblock` and `cdef`) and the AVIF container (`avif`) export writes through
 instead when asked, the thumbnail rule and the thumbnail cache,
 the library's sidecar grammar, roll rules and dating rule (`library`), the cull
 and develop controller over td-ui's driven seam with its action table and scene
@@ -1245,7 +1245,8 @@ category and AC run/size once) with no code of all ones, which is what the
 decoder refuses; the clamp is pinned by a unit test over `forward`.
 
 The AVIF export codes the frame with the crate's own AV1 encoder
-(`av1::Encoder`, over `transform`, `cdf` and `deblock`), pure `std`:
+(`av1::Encoder`, over `transform`, `cdf`, `deblock` and `cdef`), pure
+`std`:
 a still picture (`still_picture` and `reduced_still_picture_header`
 set), main profile, 8-bit 4:2:0 at full range in BT.601 (`Y = (77R +
 150G + 29B + 128) >> 8`, the chroma the mean of each 2x2 offset by 128),
@@ -1260,9 +1261,9 @@ pairs, chroma's is the one its mode implies, `DCT_DCT` at 32), the
 thirteen intra modes without an angle delta, filter or palette and,
 for chroma, its prediction from the block's luma (each plane's alpha
 the least-squares fit in eighths, it and its neighbours tried by
-squared error), deblocking but no CDEF, restoration, superres or film
-grain, and the symbol adaptation the spec runs by default. The quality
-maps to `qindex` as `255 - ((q - 1) * 254 + 49) / 99`, the dead-zone
+squared error), deblocking and CDEF but no restoration, superres or
+film grain, and the symbol adaptation the spec runs by default. The
+quality maps to `qindex` as `255 - ((q - 1) * 254 + 49) / 99`, the dead-zone
 quantiser rounds the DC at half a step and each AC at three eighths,
 a trellis then walks each transform's levels from the end of block
 back (libaom's `av1_optimize_txb` in kind) keeping each or dropping it
@@ -1305,31 +1306,40 @@ over 4x4 units: an edge's length is the smaller transform beside it (4,
 the level, one for every plane and direction, is libaom's fit of the AC
 step for a key frame (`LPF_PICK_FROM_Q`) half again, which measured
 better on a photo than the fit at every rate and as well as double it
-but for RGB fidelity. Prediction reads the unfiltered pixels, so the
-filter runs once the frame is coded, over the superblock-padded planes
-a decoder filters, and only on a reconstruction the caller asked to
-keep, which is then what any conforming decoder shows; `tests/av1.rs`
-holds that to dav1d when one is named (`TD_TEST_DAV1D`), and holds
-three small streams to the hashes of bytes dav1d decoded, so a change
-to any emitted symbol is verified against the decoder before the hash
-moves. It is fed rows like
-the JPEG encoder and codes a superblock row when one is complete, so
-the export band rules hold; a frame is at most 16384 on an axis. A
-block's prediction edges are read once per plane and every mode is
-predicted from them into the tile's scratch, which also holds the
-transform's working blocks and each plane's trial and best coding and
-only grows, so a block allocates only the levels its leaf keeps. A
-24-megapixel export takes about twenty-two seconds on one thread and a
-few on eight (`tests/av1.rs`'s `bench`). Against libaom's all-intra speed 6
-on a real 2048-pixel photo the encoder needs under 1% more bits for the
-same PSNR from 0.3 to 3 bits a pixel and about 8% below that; the
+but for RGB fidelity. CDEF (`cdef`, spec 7.15 in dav1d's form) follows
+it: each 8x8 of luma with coefficients is filtered along the direction
+its pixels show, and its 4x4s of chroma with it, every tap reading the
+deblocked frame and none outside the mode-info grid; one strength set
+serves the frame (`cdef_bits` 0), libaom's fits of the AC step for an
+intra frame (`av1_pick_cdef_from_qp`) with chroma's halved, which
+measured better on a photo than the fit (whose chroma cost RGB
+fidelity at mid rates) or no chroma filtering. Prediction reads the
+unfiltered pixels, so the filters run once the frame is coded, over
+the superblock-padded planes a decoder filters, and only on a
+reconstruction the caller asked to keep, which is then what any
+conforming decoder shows; `tests/av1.rs` holds that to dav1d when one
+is named (`TD_TEST_DAV1D`), and holds five small streams and their
+reconstructions to the hashes of bytes dav1d decoded, so a change to
+any emitted symbol or filtered pixel is verified against the decoder
+before the hash moves. It is fed rows like the JPEG encoder and codes
+a superblock row when one is complete, so the export band rules hold;
+a frame is at most 16384 on an axis. A block's prediction edges are
+read once per plane and every mode is predicted from them into the
+tile's scratch, which also holds the transform's working blocks and
+each plane's trial and best coding and only grows, so a block
+allocates only the levels its leaf keeps. A 24-megapixel export takes
+about twenty-two seconds on one thread and a few on eight
+(`tests/av1.rs`'s `bench`). Against libaom's all-intra speed 6 on a
+real 2048-pixel photo the encoder needs under 1% more bits for the
+same PSNR from 0.3 to 3 bits a pixel and about 7% below that, where
+libaom's CDEF chooses strengths by searching each 64x64; the
 compression follow-ups, by what libaom's tools measured there, are
-rectangular partitions and transforms, CDEF (most at low rates) and
-angle deltas. Measured before the trellis priced the zeros an end of
-block passes over: zeroing a transform's few levels outright bought
-luma about 2% but cost RGB 3% at low rates, a chroma weight trading
-one for the other, and coding more luma modes in full bought under 1%
-on luma for half again the time.
+rectangular partitions and transforms and angle deltas. Measured
+before the trellis priced the zeros an end of block passes over:
+zeroing a transform's few levels outright bought luma about 2% but
+cost RGB 3% at low rates, a chroma weight trading one for the other,
+and coding more luma modes in full bought under 1% on luma for half
+again the time.
 
 The AVIF (`avif::file`) is the least HEIF file the format asks for and
 every reader expects: `ftyp` with the `avif` brand and `mif1`, `miaf`
@@ -1874,8 +1884,10 @@ columns and two and five tile rows on one and two threads, each coding
 to a stream whose reconstruction is the encoder's own and, with
 `TD_TEST_DAV1D` naming a dav1d binary, decoded by it to the same bytes
 exactly, as are colour ramps that make chroma from luma code every
-pair of alpha signs in blocks both edges cut; three streams held to
-the hashes recorded under that decode, the same bytes on one thread
+pair of alpha signs in blocks both edges cut, and noise, a hard edge
+and a chroma checkerboard at the strongest filter strengths; five
+streams and their reconstructions held to the hashes recorded under
+that decode, two at the coarsest steps, the same bytes on one thread
 and three; the stream's sequence header
 and the frame header's opening field by field, the quality buying luma
 PSNR and costing bytes; the rows refused by name; and the container's
@@ -1889,7 +1901,9 @@ libaom's decoder enforces), the end-of-block classes and the predictors
 by value, chroma from luma's signed rounding among them, and hold the
 trellis's prices to what the coder counts for random blocks of every
 size and its levels to the quantizer's or one below with an end of
-block that matches them; `avif`'s hold every box to its bytes.
+block that matches them; `cdef`'s pin the direction search on each
+direction's lines, stripes and a flat block and the tap constraint and
+strength adjustment by value; `avif`'s hold every box to its bytes.
 
 `tests/nef.rs`'s third command case runs `export` with `--long-edge`,
 `--quality` and `--format` over a temporary roll (the export shrunk with

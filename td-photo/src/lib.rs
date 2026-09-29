@@ -7,9 +7,10 @@
 //! decoder for the camera's embedded previews, `image` the RGB buffers
 //! and PPM writer, `library` the sidecar grammar, roll rules and dating
 //! rule, `look` the look format with its built-in set, `settings` the
-//! export settings' grammar, `transform`, `cdf`, `deblock` and `av1` the
-//! AV1 still picture encoder (the transforms and quantizers, the default
-//! symbol probabilities, the deblocking filter, and the coder), `avif`
+//! export settings' grammar, `transform`, `cdf`, `deblock`, `cdef` and
+//! `av1` the AV1 still picture encoder (the transforms and quantizers,
+//! the default symbol probabilities, the deblocking and directional
+//! filters, and the coder), `avif`
 //! its container, and `ui` the cull controller over td-ui's driven seam.
 //! None of these reads a file, the environment, a clock or a
 //! descriptor: `main` owns I/O. DESIGN.md is the contract.
@@ -17,6 +18,7 @@
 pub mod av1;
 pub mod avif;
 pub mod camera;
+pub mod cdef;
 pub mod cdf;
 pub mod color;
 pub mod deblock;

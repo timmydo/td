@@ -265,6 +265,8 @@ fn every_shape_codes_and_decodes_to_the_encoders_own_reconstruction() {
         (64, 40, 80, 1, 0),
         (40, 64, 80, 1, 0),
         (65, 33, 30, 1, 0),
+        (97, 61, 1, 1, 0),
+        (150, 90, 22, 2, 0),
         (200, 130, 70, 2, 0),
         (300, 70, 95, 1, 0),
         (520, 40, 60, 2, 0),
@@ -302,10 +304,76 @@ fn decodes_as_reconstructed(obus: &[u8], reconstruction: &Reconstruction, name: 
 fn chroma_from_luma_decodes_with_every_sign_and_past_the_edges() {
     // Colour ramps make chroma from luma win with each pair of alpha
     // signs, in 32-pixel blocks the right and bottom edges cut.
-    for (width, height, quality) in [(184, 120, 40), (184, 120, 80), (90, 250, 60)] {
+    for (width, height, quality) in [
+        (184, 120, 15),
+        (184, 120, 40),
+        (184, 120, 80),
+        (90, 250, 60),
+    ] {
         let name = format!("h{width}x{height}q{quality}");
         let rgb = hues(width, height);
         let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, 1, 0);
+        decodes_as_reconstructed(&obus, &reconstruction, &name);
+    }
+}
+
+/// Hard content for the filters: full-range noise, a flat field with
+/// one hard diagonal edge and speckles, or a gradient under noise and a
+/// chroma checkerboard.
+fn hard(kind: usize, width: usize, height: usize) -> Vec<u8> {
+    let mut seed = 0x1234_5678u64 + kind as u64;
+    let mut next = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as i32
+    };
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        for x in 0..width {
+            let px = match kind {
+                0 => [next() & 255, next() & 255, next() & 255],
+                1 => {
+                    let v = if x * 3 > y * 2 + width / 2 { 220 } else { 30 };
+                    let s = if (x * 7 + y * 13) % 97 == 0 { 255 } else { v };
+                    [s, v, 255 - s]
+                }
+                _ => {
+                    let n = next() % 40 - 20;
+                    let c = if (x / 3 + y / 3) % 2 == 0 { 60 } else { -60 };
+                    [
+                        (x * 255 / width) as i32 + n + c,
+                        (y * 255 / height) as i32 + n,
+                        128 - c + n,
+                    ]
+                }
+            };
+            for c in px {
+                rgb.push(c.clamp(0, 255) as u8);
+            }
+        }
+    }
+    rgb
+}
+
+#[test]
+fn the_filters_decode_on_hard_content() {
+    // The strongest CDEF strengths meet noise, a hard edge and a
+    // chroma checkerboard: each case was one of a wide adversarial
+    // sweep's that caught a mistake in a rarely taken path (the clamp
+    // to the taps' range, the variance's cap, luma's direction kept
+    // when its adjusted strength is zero).
+    for (kind, width, height, quality, rows_log2) in [
+        (0, 257, 131, 1, 0),
+        (1, 127, 129, 1, 0),
+        (1, 127, 129, 8, 0),
+        (0, 300, 300, 1, 1),
+        (2, 300, 300, 1, 1),
+        (2, 520, 150, 22, 2),
+    ] {
+        let name = format!("k{kind}w{width}h{height}q{quality}");
+        let rgb = hard(kind, width, height);
+        let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, 1, rows_log2);
         decodes_as_reconstructed(&obus, &reconstruction, &name);
     }
 }
@@ -356,10 +424,12 @@ fn the_stream_opens_with_the_documented_headers() {
     assert_eq!(bits(seq, &mut at, 16), 63, "max_frame_width_minus_1");
     assert_eq!(bits(seq, &mut at, 16), 47, "max_frame_height_minus_1");
     assert_eq!(
-        bits(seq, &mut at, 6),
+        bits(seq, &mut at, 4),
         0,
-        "128x128, filter/edge intra, superres, cdef, restoration"
+        "128x128, filter/edge intra, superres"
     );
+    assert_eq!(bits(seq, &mut at, 1), 1, "enable_cdef");
+    assert_eq!(bits(seq, &mut at, 1), 0, "enable_restoration");
     assert_eq!(bits(seq, &mut at, 2), 0, "high_bitdepth, mono_chrome");
     assert_eq!(bits(seq, &mut at, 1), 1, "color_description_present_flag");
     assert_eq!(bits(seq, &mut at, 8), 1, "color_primaries BT.709");
@@ -458,17 +528,20 @@ fn fnv(bytes: &[u8]) -> u64 {
     })
 }
 
-/// The streams are the bytes dav1d decoded once: the hashes were
-/// recorded from a run with `TD_TEST_DAV1D` and every decode exact, so a
-/// change to any emitted symbol reds here and is verified against the
-/// decoder again before the hash moves. The thread count is not in the
-/// bytes.
+/// The streams and their reconstructions are the bytes dav1d decoded
+/// once: the hashes were recorded from a run with `TD_TEST_DAV1D` and
+/// every decode exact, so a change to any emitted symbol, or to the
+/// filtered pixels of these pictures, reds here with or without the
+/// decoder and is verified against it again before the hash moves. The coarse cases filter at
+/// the strongest strengths. The thread count is not in the bytes.
 #[test]
 fn the_streams_are_the_bytes_dav1d_decoded() {
     for (width, height, quality, rows_log2, hash) in [
-        (65, 33, 30, 0, 0x5db5f3dd0486061fu64),
-        (520, 40, 60, 0, 0x1dcd86b7b35f2d5d),
-        (200, 200, 75, 1, 0xdea43fb26b4b7f7e),
+        (65, 33, 30, 0, 0x4fb5600e0677a5e3u64),
+        (520, 40, 60, 0, 0x8f81a8615e83a228),
+        (200, 200, 75, 1, 0xe7d2e056b32c310e),
+        (67, 45, 15, 0, 0x9dada4b6d73be7c2),
+        (130, 70, 1, 0, 0xdbfaa0f7562854bc),
     ] {
         let name = format!("g{width}x{height}q{quality}r{rows_log2}");
         let (obus, reconstruction) = encode_tiled(width, height, quality, 1, rows_log2);
@@ -484,7 +557,11 @@ fn the_streams_are_the_bytes_dav1d_decoded() {
             }
             assert_eq!(decoded, planes, "{name}: dav1d differs from the encoder");
         }
-        assert_eq!(fnv(&obus), hash, "{name}: {:#018x}", fnv(&obus));
+        let mut bytes = obus;
+        for plane in &reconstruction.planes {
+            bytes.extend_from_slice(plane);
+        }
+        assert_eq!(fnv(&bytes), hash, "{name}: {:#018x}", fnv(&bytes));
     }
 }
 

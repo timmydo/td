@@ -32,6 +32,7 @@ const PURE: &[&str] = &[
     "av1.rs",
     "avif.rs",
     "camera.rs",
+    "cdef.rs",
     "cdf.rs",
     "color.rs",
     "deblock.rs",

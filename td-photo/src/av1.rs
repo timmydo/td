@@ -13,13 +13,14 @@
 //! levels a dead-zone quantizer's refined by a trellis; the multi-symbol
 //! arithmetic coder with adapting CDFs from the defaults; uniform tile
 //! columns by the frame's size alone, which the threads spread over.
-//! The deblocking filter is on at a level from the quantizer; CDEF,
-//! restoration, superres, film grain and screen-content tools stay off.
-//! `transform` holds the transforms, quantizers and scans, `cdf` the
-//! default CDFs, `deblock` the filter.
+//! The deblocking filter and CDEF are on at strengths from the
+//! quantizer; restoration, superres, film grain and screen-content tools
+//! stay off. `transform` holds the transforms, quantizers and scans,
+//! `cdf` the default CDFs, `deblock` and `cdef` the filters.
 
 use std::fmt;
 
+use crate::cdef;
 use crate::cdf;
 use crate::deblock;
 use crate::transform::{self, Size, TxType};
@@ -870,11 +871,13 @@ fn sequence_header(geometry: &Geometry) -> Vec<u8> {
     b.put(4, 15);
     b.put(16, (geometry.width - 1) as u32);
     b.put(16, (geometry.height - 1) as u32);
+    // enable_superblock_128x128, _filter_intra, _intra_edge_filter and
+    // _superres off, enable_cdef on, enable_restoration off.
     b.flag(false);
     b.flag(false);
     b.flag(false);
     b.flag(false);
-    b.flag(false);
+    b.flag(true);
     b.flag(false);
     // color_config: 8-bit, colour, the declared colour, chroma position
     // unknown, one chroma delta q.
@@ -894,7 +897,12 @@ fn sequence_header(geometry: &Geometry) -> Vec<u8> {
 
 /// The frame OBU's header bits, to the byte alignment before the tile
 /// group.
-fn frame_header(geometry: &Geometry, qindex: u8, levels: deblock::Levels) -> Bits {
+fn frame_header(
+    geometry: &Geometry,
+    qindex: u8,
+    levels: deblock::Levels,
+    strengths: cdef::Strengths,
+) -> Bits {
     let mut b = Bits::new();
     b.flag(false);
     b.flag(false);
@@ -917,6 +925,13 @@ fn frame_header(geometry: &Geometry, qindex: u8, levels: deblock::Levels) -> Bit
     }
     b.put(3, 0);
     b.flag(false);
+    // cdef_params: one strength set for the frame (cdef_bits 0).
+    b.put(2, u32::from(strengths.damping.saturating_sub(3)));
+    b.put(2, 0);
+    b.put(4, u32::from(strengths.y_pri));
+    b.put(2, u32::from(strengths.y_sec));
+    b.put(4, u32::from(strengths.uv_pri));
+    b.put(2, u32::from(strengths.uv_sec));
     b.flag(false);
     b.flag(true);
     b.align();
@@ -936,6 +951,27 @@ fn filter_levels(qindex: u8) -> deblock::Levels {
         luma: [level, level],
         u: level,
         v: level,
+    }
+}
+
+/// The CDEF strengths of a key frame from its quantizer: libaom's
+/// (`av1_pick_cdef_from_qp` for an intra frame, quadratic fits of the
+/// AC step to what its search chose) in fixed point, the damping
+/// rising a step every 64 of `qindex`, chroma's at half the fit, which
+/// measured better on a photo than the fit or none.
+fn cdef_strengths(qindex: u8) -> cdef::Strengths {
+    let q = i64::from(transform::ac_q(qindex));
+    // Each fit's coefficients in units of 2^-30, rounded to nearest.
+    let fit = |[c2, c1, c0]: [i64; 3], max: i64| -> u8 {
+        let v = (c2 * q * q + c1 * q + c0 + (1 << 29)) >> 30;
+        v.clamp(0, max) as u8
+    };
+    cdef::Strengths {
+        damping: 3 + (qindex >> 6),
+        y_pri: fit([3622, 8_665_734, 20_147_047], 15),
+        y_sec: fit([3132, 2_984_855, 8_526_047], 3),
+        uv_pri: fit([-7022, 6_921_557, -4_017_878], 15),
+        uv_sec: fit([1753, 190_698, 1_224_560], 3),
     }
 }
 
@@ -1391,6 +1427,9 @@ struct Tile {
     /// The band's block sizes, a luma 4x4 each (the log2 of the side),
     /// `width / MI` to a row: what the deblocking filter reads.
     sizes: Vec<u8>,
+    /// Whether each luma 4x4's block coded no coefficient, laid out as
+    /// `sizes`: what CDEF reads.
+    skips: Vec<bool>,
     /// `coefficient_symbols`'s magnitudes, kept for their buffer.
     mags: Magnitudes,
     /// Saved states' context and pixel copies, returned by `restore` and
@@ -1446,6 +1485,7 @@ impl Tile {
             screen_weight: 16 * (rdmult * 128).isqrt(),
             scratch: Scratch::default(),
             sizes: vec![3; SB_MI * (width / MI)],
+            skips: vec![true; SB_MI * (width / MI)],
             mags: Magnitudes::default(),
             spare_segments: Vec::new(),
             spare_pixels: Vec::new(),
@@ -2815,13 +2855,14 @@ impl Tile {
                 }
                 self.coder = coder;
                 self.apply_contexts(&leaf);
-                self.record_size(leaf.at);
+                self.record_block(leaf.at, leaf.skip);
             }
         }
     }
 
-    /// Records a coded block's size over the 4x4s it covers in the band.
-    fn record_size(&mut self, at: At) {
+    /// Records a coded block's size and skip over the 4x4s it covers in
+    /// the band.
+    fn record_block(&mut self, at: At, skip: bool) {
         let cols = self.width / MI;
         let units = at.units();
         for r in 0..units {
@@ -2830,6 +2871,9 @@ impl Tile {
             let end = (start + units).min((row + 1) * cols);
             if let Some(slots) = self.sizes.get_mut(start..end) {
                 slots.fill(at.log2 as u8);
+            }
+            if let Some(slots) = self.skips.get_mut(start..end) {
+                slots.fill(skip);
             }
         }
     }
@@ -3186,19 +3230,22 @@ pub struct Encoder {
     /// Coded tiles' bytes in tile order.
     coded: Vec<Vec<u8>>,
     sb_row: usize,
-    /// The frame's deblocking levels.
+    /// The frame's deblocking levels and CDEF strengths.
     levels: deblock::Levels,
+    strengths: cdef::Strengths,
     /// The reconstruction as a decoder holds it before the filter,
     /// gathered when asked for.
     kept: Option<Kept>,
 }
 
-/// The reconstruction before deblocking: the planes padded to whole
-/// superblocks, which hold every pixel the filter reads, and each luma
-/// 4x4's block size (the log2 of its side), `sb_cols * SB_MI` to a row.
+/// The reconstruction before the filters: the planes padded to whole
+/// superblocks, which hold every pixel the filters read, and each luma
+/// 4x4's block size (the log2 of its side) and skip, `sb_cols * SB_MI`
+/// to a row.
 struct Kept {
     planes: [Vec<u8>; 3],
     sizes: Vec<u8>,
+    skips: Vec<bool>,
 }
 
 impl Encoder {
@@ -3229,6 +3276,7 @@ impl Encoder {
             coded: Vec::new(),
             sb_row: 0,
             levels: filter_levels(qindex(quality)),
+            strengths: cdef_strengths(qindex(quality)),
             kept: None,
         })
     }
@@ -3240,6 +3288,7 @@ impl Encoder {
         self.kept = Some(Kept {
             planes: [vec![0; w * h], vec![0; w * h / 4], vec![0; w * h / 4]],
             sizes: vec![3; cells],
+            skips: vec![true; cells],
         });
     }
 
@@ -3296,7 +3345,8 @@ impl Encoder {
             OBU_SEQUENCE_HEADER,
             &sequence_header(&self.geometry),
         );
-        let mut frame = frame_header(&self.geometry, self.qindex, self.levels).bytes;
+        let mut frame =
+            frame_header(&self.geometry, self.qindex, self.levels, self.strengths).bytes;
         let tiles = self.geometry.tile_cols() * self.geometry.tile_rows();
         if tiles > 1 {
             // tile_start_and_end_present_flag, then the alignment.
@@ -3314,27 +3364,61 @@ impl Encoder {
         Ok((out, reconstruction))
     }
 
-    /// The kept frame filtered as a decoder filters it, then cropped to
-    /// the picture.
+    /// The kept frame filtered as a decoder filters it, deblocking then
+    /// CDEF, then cropped to the picture.
     fn reconstruct(&self, kept: Kept) -> Reconstruction {
-        let Kept { mut planes, sizes } = kept;
+        let Kept {
+            mut planes,
+            sizes,
+            skips,
+        } = kept;
         let (width, height) = (self.geometry.width, self.geometry.height);
         let stride = self.geometry.sb_cols * SB;
         let mi_stride = self.geometry.sb_cols * SB_MI;
         let [y, u, v] = &mut planes;
-        let plane = |data, sub: usize| deblock::Plane {
-            data,
-            stride: stride >> sub,
-            width: width.div_ceil(1 << sub),
-            height: height.div_ceil(1 << sub),
-        };
+        // Each filter's view of a padded plane: `sub` its subsampling.
+        fn plane(
+            data: &mut [u8],
+            stride: usize,
+            (w, h): (usize, usize),
+            sub: usize,
+        ) -> deblock::Plane<'_> {
+            deblock::Plane {
+                data,
+                stride: stride >> sub,
+                width: w.div_ceil(1 << sub),
+                height: h.div_ceil(1 << sub),
+            }
+        }
+        let size = (width, height);
         deblock::filter(
-            [plane(y, 0), plane(u, 1), plane(v, 1)],
+            [
+                plane(y, stride, size, 0),
+                plane(u, stride, size, 1),
+                plane(v, stride, size, 1),
+            ],
             self.levels,
             |mi_row, mi_col| {
                 sizes
                     .get(mi_row * mi_stride + mi_col)
                     .map_or(3, |&s| u32::from(s))
+            },
+        );
+        let (mi_cols, mi_rows) = (self.geometry.mi_cols, self.geometry.mi_rows);
+        cdef::filter(
+            [
+                plane(y, stride, size, 0),
+                plane(u, stride, size, 1),
+                plane(v, stride, size, 1),
+            ],
+            self.strengths,
+            mi_rows,
+            mi_cols,
+            |row, col| {
+                let at = 2 * row * mi_stride + 2 * col;
+                [at, at + 1, at + mi_stride, at + mi_stride + 1]
+                    .iter()
+                    .all(|&k| skips.get(k).copied().unwrap_or(true))
             },
         );
         let crop = |padded: &[u8], sub: usize| -> Vec<u8> {
@@ -3428,10 +3512,18 @@ impl Encoder {
                     }
                 }
                 let cols = tile.width / MI;
-                for (r, row) in tile.sizes.chunks_exact(cols).enumerate() {
+                for (r, (sizes, skips)) in tile
+                    .sizes
+                    .chunks_exact(cols)
+                    .zip(tile.skips.chunks_exact(cols))
+                    .enumerate()
+                {
                     let at = (band_mi_row + r) * mi_stride + tile.x0 / MI;
                     if let Some(dst) = kept.sizes.get_mut(at..at + cols) {
-                        dst.copy_from_slice(row);
+                        dst.copy_from_slice(sizes);
+                    }
+                    if let Some(dst) = kept.skips.get_mut(at..at + cols) {
+                        dst.copy_from_slice(skips);
                     }
                 }
             }
@@ -3998,18 +4090,20 @@ mod tests {
         let g = Geometry::new(64, 48).unwrap();
         let seq = sequence_header(&g);
         assert_eq!(seq.len(), 12);
-        let header = frame_header(&g, 21, deblock::Levels::default());
-        // Nine flags and a byte of quantizer, six-bit filter levels and
-        // the rest: the header is byte-aligned at a known length.
+        let strengths = cdef_strengths(21);
+        let header = frame_header(&g, 21, deblock::Levels::default(), strengths);
+        // Nine flags and a byte of quantizer, six-bit filter levels, the
+        // CDEF strengths' sixteen bits and the rest: the header is
+        // byte-aligned at a known length.
         assert_eq!(header.used, 0);
-        assert_eq!(header.bytes.len(), 5);
+        assert_eq!(header.bytes.len(), 7);
         // A filtering frame adds the two chroma levels' twelve bits.
         let levels = deblock::Levels {
             luma: [5, 6],
             u: 7,
             v: 8,
         };
-        assert_eq!(frame_header(&g, 21, levels).bytes.len(), 6);
+        assert_eq!(frame_header(&g, 21, levels, strengths).bytes.len(), 8);
         assert_eq!(qindex(92), 22);
         // The from-quantizer levels: none at the finest steps, the
         // most at the coarsest, rising with the step between.
@@ -4017,5 +4111,17 @@ mod tests {
         assert_eq!(filter_levels(255).luma, [63, 63]);
         let steps: Vec<u8> = [92, 60, 30].map(|q| filter_levels(qindex(q)).u).to_vec();
         assert!(steps.windows(2).all(|w| w[0] < w[1]), "{steps:?}");
+        // The CDEF strengths: off at the finest steps, luma's strongest
+        // and the damping's most at the coarsest, where chroma's fit has
+        // turned back down.
+        assert!(cdef_strengths(qindex(100)).is_off());
+        let coarsest = cdef_strengths(255);
+        assert_eq!(
+            (coarsest.damping, coarsest.y_pri, coarsest.y_sec),
+            (6, 15, 3)
+        );
+        assert_eq!(coarsest.uv_pri, 0);
+        let mid = cdef_strengths(qindex(30));
+        assert!(mid.y_pri > 0 && mid.uv_pri > 0, "{mid:?}");
     }
 }
