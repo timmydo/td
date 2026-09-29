@@ -3015,6 +3015,27 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
                 Err(e) => fail(&e),
             }
         }
+        [op] if op == "crypto-portable-runtime-inner" => {
+            match crate::crypto_isolated::runtime_inner() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
+        [op] if op == "crypto-portable-build-inner" => {
+            match crate::crypto_isolated::build_inner() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
+        [op, flag, archives] if op == "crypto-portable-build" && flag == "--archives" => {
+            if let Err(e) = crate::crypto_build::validate(&root)
+                .and_then(|()| crate::check_loop::warm_crypto_sources(&root))
+            { return fail(&e); }
+            match crate::crypto_isolated::build(&root, Path::new(archives)) {
+                Ok(path) => { println!("{}", path.display()); ExitCode::SUCCESS }
+                Err(e) => fail(&e),
+            }
+        }
         [op] if op == "names" => match gate_crate_names(&root) {
             Ok(names) if !names.is_empty() => {
                 println!("{}", names.join(", "));
@@ -3055,6 +3076,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             eprintln!("       td-builder gate-crates crypto-cargo test|clippy --manifest-path CRATE/Cargo.toml");
             eprintln!("       td-builder gate-crates crypto-musl-headers --archive musl-1.2.5.tar.gz");
             eprintln!("       td-builder gate-crates crypto-portable-prepare --archives DIRECTORY");
+            eprintln!("       td-builder gate-crates crypto-portable-build --archives DIRECTORY");
             eprintln!(concat!(
                 "       td-builder gate-crates native-compositor ",
                 "--manifest-path CRATE/Cargo.toml"

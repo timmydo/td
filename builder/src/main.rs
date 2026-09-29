@@ -28,6 +28,7 @@ mod crypto_policy;
 mod crypto_build;
 mod crypto_headers;
 mod crypto_portable;
+mod crypto_isolated;
 mod check_host;
 mod check_loop;
 mod check_memory;
@@ -9119,6 +9120,8 @@ fn main() -> ExitCode {
         .file_name()
         .and_then(|n| n.to_str());
     match applet {
+        Some("td-crypto-host-linker") => return applet_exit("td-crypto-host-linker", crypto_isolated::host_linker(args.get(1..).unwrap_or(&[])).map(|()| 0)),
+        Some("td-crypto-decoy") => return applet_exit("td-crypto-decoy", crypto_isolated::decoy().map(|()| 0)),
         Some("mount") => return applet_exit("mount", run_mount_applet(&args)),
         Some("flock") => return applet_exit("flock", run_flock_applet(&args)),
         _ => {}

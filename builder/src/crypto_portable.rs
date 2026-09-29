@@ -87,10 +87,10 @@ const NATIVE: [NativeInput; 5] = [
     },
 ];
 
-struct NativeTree {
-    inside: &'static str,
-    directory: PathBuf,
-    record: String,
+pub(crate) struct NativeTree {
+    pub(crate) inside: &'static str,
+    pub(crate) directory: PathBuf,
+    pub(crate) record: String,
 }
 
 #[derive(Default)]
@@ -268,7 +268,7 @@ fn verified_cache(destination: &Path, expected: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn publish_tree(source: &Path, parent: &Path, label: &str, expected: &str) -> Result<PathBuf> {
+pub(crate) fn publish_tree(source: &Path, parent: &Path, label: &str, expected: &str) -> Result<PathBuf> {
     let destination = cache_path(parent, label, expected)?;
     if verified_cache(&destination, expected)? {
         return Ok(destination);
@@ -567,13 +567,25 @@ fn prepare_rust(root: &Path, archives: &Path) -> Result<PathBuf> {
     publish_tree(&kit, &parent, "rust-1.96.0", &expected)
 }
 
+pub(crate) struct Inputs {
+    pub(crate) rust: PathBuf,
+    pub(crate) headers: PathBuf,
+    pub(crate) native: Vec<NativeTree>,
+}
+
+pub(crate) fn inputs(root: &Path, archives: &Path) -> Result<Inputs> {
+    Ok(Inputs {
+        rust: prepare_rust(root, archives)?,
+        headers: crate::crypto_headers::prepare(root, &archives.join("musl-1.2.5.tar.gz"))?,
+        native: native_outputs(root)?,
+    })
+}
+
 pub(crate) fn prepare(root: &Path, archives: &Path) -> Result<()> {
-    let kit = prepare_rust(root, archives)?;
-    let headers = crate::crypto_headers::prepare(root, &archives.join("musl-1.2.5.tar.gz"))?;
-    let native = native_outputs(root)?;
-    println!("portable-rust {}", kit.display());
-    println!("portable-musl-headers {}", headers.display());
-    for tree in native {
+    let inputs = inputs(root, archives)?;
+    println!("portable-rust {}", inputs.rust.display());
+    println!("portable-musl-headers {}", inputs.headers.display());
+    for tree in inputs.native {
         print!("{}", tree.record);
         println!(
             "portable-native-bind {} {}",

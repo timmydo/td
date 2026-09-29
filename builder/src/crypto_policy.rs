@@ -16,7 +16,7 @@ pub(crate) fn admitted(name: &str) -> bool {
 pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-crypto" => "7ca2d70176ddb80083ff07de51465e8194fd01e4e4d435201444f11ed997c308",
-        "td-mta" => "2939577a1100cc5bd2b08b966e642adca2866e51a28d50c66c107c64dbeabb8e",
+        "td-mta" => "0f61a97f323482fac4f9218f55162692969a9760b0c9b186db574635a3caa57e",
         _ => {
             return Err(format!(
                 "{name} has no external crypto dependency admission"

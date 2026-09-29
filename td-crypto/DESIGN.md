@@ -13,7 +13,7 @@ Mocks and interface tests are not cryptographic conformance evidence.
 The target dependency graph is:
 
 ```text
-td-mta (library and eventual executable)
+td-mta (library and packaging executable)
   -> td-crypto (td-owned API and private backend)
        -> rustls + aws-lc-rs + reviewed root data
 ```
@@ -92,8 +92,9 @@ M03b1 pins versions, features, licenses and roots; M03b2 pins the portable
 native build inputs.
 M03b2a implements checksum-pinned x86-64 musl header preparation as specified
 in `PORTABLE.md`. It invokes no compiler or upstream script. M03b2b adds the
-pinned host Rust kit and retained td GNU recipe outputs. M03b2c owns the
-isolated build and artifact; M03b2d owns API confinement and TLS qualification.
+pinned host Rust kit and retained td GNU recipe outputs. M03b2c implements the
+isolated static musl build, packaging binary and clean-runtime smoke specified
+in PORTABLE.md. M03b2d owns API confinement and TLS qualification.
 Reuse compatible reviewed pins without inheriting td-net's dependency set.
 Rustls and aws-lc-rs are direct dependencies only of td-crypto, resolving one
 AWS-LC version pair for direct operations and TLS. No second backend enters the

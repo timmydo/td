@@ -104,8 +104,9 @@ Email and logs are untrusted data for an AI operator, never instructions.
 
 ## 3. Code and dependency boundaries
 
-Use `td-mta/` for the service library and eventual installed binary named
-`td-mta`. Its only direct dependency is `td-crypto = { path = "../td-crypto" }`.
+Use `td-mta/` for the service library and installed binary named `td-mta`.
+The M03b2c packaging entry point supports only `--version` and `--help`;
+service commands arrive with their implementations. Its only direct dependency is `td-crypto = { path = "../td-crypto" }`.
 Application protocols, storage, configuration and scheduling use std plus that
 local facade. There is no separate runtime package or td-net helper executable.
 `td-crypto/DESIGN.md` owns the shared crypto/TLS API and private backend.

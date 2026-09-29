@@ -3,8 +3,8 @@
 ## Status
 
 M03b2a implements header preparation; M03b2b prepares the remaining Rust and
-GNU tool inputs. Isolated compilation and artifact qualification remain
-M03b2c, and API confinement/TLS smoke remain M03b2d. This is a host build path for the
+GNU tool inputs. M03b2c supplies isolated compilation and static artifact
+qualification. API confinement/TLS smoke remain M03b2d. This is a host build path for the
 standalone td-mta executable; it does not grant the source-bootstrap provenance
 of td's target image graph. Nothing prepared here is automatically admitted
 as a target recipe input.
@@ -109,11 +109,16 @@ bits, upstream installed notices and separate root notices for each package, inc
 runs. `PORTABLE-INPUTS` inside the kit records URLs, lengths and hashes.
 
 The kit is published under `.td-build-cache/crypto-rust-1.96.0-<NAR-sha256>`.
+The build additionally requires NAR SHA-256
+`dce3040c995d6572fd47df15fded5d5e3ea6c87455b5daef82f4dea2503942b1`.
+This pins the reconstructed layout and notices as well as archive bytes.
+Update this build pin only with a reviewed reconstruction/input change and
+repeat the isolated artifact qualification.
 Every invocation reconstructs the expected kit from authenticated archives;
 reuse compares the complete tree's NAR hash, including links, executable bits
 and notices. A changed or symlink cache root fails. No persisted digest alone
 authenticates a mutable tree. This prepares binaries and libraries as data;
-it does not execute them or yet prove their runtime closure.
+preparation alone does not execute them or prove their runtime closure.
 
 ## Declared GNU tool and host runtime inputs
 
@@ -153,8 +158,7 @@ not independently re-prove a warm build's source provenance. Cache reuse
 requires a fresh durable-output comparison.
 Role directories are resolved within the retained output; a changed layout or
 escaping directory is refused. Internal tool links are retained as data, not
-followed to import host files. Their resolution inside the future isolated
-build remains part of M03b2c.
+followed to import host files. The isolated build below resolves these links only inside its declared mounts.
 
 Success prints `portable-rust`, `portable-musl-headers`, and pairs of `native`
 recipe identity/NAR records and `portable-native-bind` role/directory records.
@@ -176,3 +180,97 @@ until the evaluator's ordinary later-run cleanup and may occupy several GiB;
 this command does not sweep shared evaluator scratch. Service memory budgets
 do not describe build-time resource use. ARM host and target support requires
 a separate manifest/layout qualification.
+
+
+## Isolated compilation and artifact
+
+```text
+td-builder gate-crates crypto-portable-build --archives /path/to/archives
+```
+
+This explicit qualification command first performs the same input preparation
+and provisions the locked registry archives through td-feed. Preparation can
+fetch declared fixed-output sources. Compilation runs without network access.
+The ordinary Cargo preflight still qualifies the host build; it does not
+silently claim to have run this separately provisioned portable command.
+
+The driver stages only both crates' manifests, locks, `src/` and optional
+`tests/`, refusing symlinks and special files. It rechecks staged manifest/lock
+pins, reconstructs the verified vendor tree, and mounts these inputs read-only.
+It uses the existing source-fingerprinted static td-builder helper for namespace
+entry, host linking and failing fallback decoys. This helper is host control
+plane, not part of the installed binary. Build/output and Cargo home are private;
+no previous Cargo target directory is reused. Caller-owned source/cache trees
+must not be concurrently modified. No hostile same-uid writer boundary is claimed.
+
+The namespace has only these mounts plus the Rust kit, musl headers and five
+native roles listed above. It has private `/tmp`, minimal `/dev`, private `/proc`
+and no host `/usr`, `/bin`, OpenSSL installation or Cargo configuration. Cargo's
+environment is cleared and reconstructed. The inner helper records each actual
+Cargo command's arguments, working directory and explicit environment in
+`BUILD-INPUTS`; these include frozen/offline source replacement, two jobs, epoch 0,
+explicit Rust/C/ar/linker paths and all five AWS-LC source-build controls.
+CMake and pkg-config point to a failing td-builder applet which writes a marker;
+OpenSSL points to a nonexistent directory. The positive build refuses any marker.
+A missing compiler, header, archive or library is an error, with no ambient
+substitute. There is no Zig dependency.
+
+Rust links the target through its bundled rust-lld, static musl target std and
+`+crt-static`, with `target-cpu=x86-64`. GCC uses `-nostdinc`, only the declared
+musl/GCC builtin includes and binutils, and `-march=x86-64 -mtune=generic`.
+Compiled Rust and C request frame pointers and level-1 debug information;
+release/bench profile stripping is explicitly disabled, and the artifact check
+requires structurally valid `.debug_line` data. Source/vendor/output paths map
+to `/td-build`, `/td-cargo/vendor` and
+`/td-build-root`. Upstream prebuilt std/libc and hand-written provider assembly
+remain profiling boundaries. This host portable artifact is not the target
+image's whole-closure profiling qualification. Debug information remains in
+the executables; distribution debug-companion integration is not claimed.
+
+Cargo's selected normal/build graphs must match admission. Its artifact records
+must select exactly one expected binary/test profile. Both results must be
+x86-64 static PIEs with an executable entry point and no ELF interpreter,
+DT_NEEDED or runtime search path. A second fresh namespace mounts only the
+result and static test supervisor, then runs the installed name's version command
+and each native SHA-256/provider-construction test in its own process. It has no
+compiler, root-data file, loader or library mounts. Each runtime command has a
+30-second deadline; each Cargo command has a 20-minute deadline. Parsed Cargo
+stdout is limited to 8 MiB (graphs to 256 KiB); each JSON record is limited to
+256 KiB and 64 nesting levels. Logs on disk are temporary, not a streaming
+output quota. Native/TLS allocation, entropy failure and handshake qualification
+remain M03b2d/M07; a Result wrapper cannot contain provider aborts.
+
+After the compile namespace exits and its descendants are reaped, the host
+requires an exact regular-file output inventory: two binaries and the inner
+command record. It rejects output directory/file symlinks and additional files,
+then copies these checked inputs into a fresh private directory outside the
+compiler's writable mount. Only this directory receives host-written metadata
+and notices, and only it is bound into the runtime fixture and published.
+The internal commands require the host-sandbox marker and expected input paths
+before writing. This guards accidental direct invocation, not callers forging
+their environment; namespace entry remains the isolation boundary.
+
+Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
+
+- `td-mta`: the installed executable name, currently only `--version`/`--help`;
+  all service arguments fail. It does not yet serve mail.
+- `td-crypto-smoke`: separate qualification test executable, not a service
+  dependency. It exercises native code that the current packaging entry point
+  does not yet retain through a service caller.
+- `BUILD-INPUTS`: staged source, vendor, reconstructed Rust kit, headers and
+  helper NAR hashes, native recipe identities/NARs, target and actual inner
+  Cargo argument/environment records.
+- `notices/`: upstream LICENSE/COPYING/COPYRIGHT/NOTICE/AUTHORS files, including nested
+  provider attribution and Rust's bundled library notices. Vendor notices cover
+  the entire locked inventory, including inactive and build-only packages;
+  every vendored package must contribute at least one notice. Their presence
+  does not claim that all packages are linked.
+
+The artifact hash covers binaries, receipts and notices. Each invocation rebuilds
+from a fresh target directory; an identical result reuses an existing verified
+artifact. Changed or symlink cache entries fail instead of being repaired.
+Concurrent identical publication is allowed. No fsync durability is promised
+for reconstructible build caches. Private `crypto-build-<pid>-<attempt>` trees
+are removed on normal completion/error; after a hard kill remove one only after
+confirming its process ended. Retained artifacts follow the same explicit cache
+cleanup rule as prepared inputs.

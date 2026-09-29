@@ -7,6 +7,10 @@ type Result<T> = std::result::Result<T, String>;
 
 pub(crate) fn validate(root: &Path) -> Result<()> {
     crate::crypto_policy::cargo_config(root)?;
+    validate_sources(root)
+}
+
+pub(crate) fn validate_sources(root: &Path) -> Result<()> {
     for name in ["td-crypto", "td-mta"] {
         crate::crypto_policy::no_build_script(root, name)?;
         for file in ["Cargo.toml", "Cargo.lock"] {
@@ -22,7 +26,7 @@ pub(crate) fn validate(root: &Path) -> Result<()> {
     Ok(())
 }
 
-const CONTROLS: [(&str, &str); 5] = [
+pub(crate) const CONTROLS: [(&str, &str); 5] = [
     ("AWS_LC_SYS_USE_SYSTEM", "0"),
     ("AWS_LC_SYS_CMAKE_BUILDER", "0"),
     ("AWS_LC_SYS_PREBUILT_NASM", "0"),

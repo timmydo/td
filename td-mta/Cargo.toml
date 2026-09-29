@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 description = "Bounded personal mail service using the local td-crypto boundary"
 
-# Independent service library; the binary and backend integration follow.
+# Independent service library and foundations-only executable.
 [workspace]
 
 [package.metadata.td-gate]

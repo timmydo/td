@@ -239,8 +239,10 @@ This milestone lands in independently checked increments:
 - **M03b2b:** prepare the pinned upstream Rust host/target components and
   retain the declared td GNU recipe outputs in verified local caches. This
   prepares build inputs only; no portable artifact is qualified yet.
-- **M03b2c:** wire the isolated build, installed binary, source/cc decoys,
-  missing-input refusals and static ELF/clean-runtime acceptance below.
+- **M03b2c:** implemented the explicit isolated build command, packaging binary,
+  source/cc decoys, missing-input refusals and static ELF/clean-runtime checks
+  in td-crypto/PORTABLE.md. It is separately provisioned from ordinary host
+  Cargo preflights; API/TLS qualification below still gates M03 completion.
 - **M03b2d:** complete API confinement and bounded local TLS smoke acceptance.
   All four increments are required before M03 completes.
 
