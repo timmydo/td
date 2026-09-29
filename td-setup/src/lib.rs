@@ -5,13 +5,13 @@
 //! wizard as a dependency-free Rust Wayland client over the shared
 //! toolkit's raster and chrome bands, following td-install/INSTALLER.md.
 //!
-//! So far this crate carries the wizard's pages and their rendering, and
-//! the `window` turn loop that presents them as a live client. The
-//! privileged disk writer stays in td-install; the front end holds no
-//! disk-writing authority (INSTALLER.md). The first page is `welcome`; the
-//! wizard's remaining pages, its model and the input that advances them
-//! follow in later increments.
+//! The `window` turn loop currently presents the welcome page. The pure
+//! destination view renders service-supplied disk observations but is not
+//! yet connected to that loop. The privileged disk writer stays in
+//! td-install; this front end holds no disk-writing authority
+//! (INSTALLER.md). The remaining pages and navigation follow later.
 
+pub mod destination;
 pub mod welcome;
 pub mod window;
 

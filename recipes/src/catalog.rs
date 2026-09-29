@@ -412,6 +412,7 @@ mod tests {
                 "td-busd",
                 "td-compositor",
                 "td-editor",
+                "td-install",
                 "td-mail",
                 "td-news",
                 "td-photo",

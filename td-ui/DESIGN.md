@@ -130,9 +130,9 @@ trees (`local_source_trees`, the td-net shape); a flat-staged direct-rustc
 recipe cannot link a second crate. td-portal, td-taskmgr, td-editor,
 td-news, td-mail and td-setup are built that way: each stages `td-ui`, and
 `td-compositor` because td-ui mounts the font and wire modules from it,
-beside its own tree (td-portal stages further siblings of its own), so a
-toolkit edit changes each consumer's locally derived source identity and
-selects each consumer's realized-output check.
+beside its own tree. td-portal and td-setup stage further siblings of their
+own. A toolkit edit changes each consumer's locally derived source identity
+and selects each consumer's realized-output check.
 
 ## Public surface
 

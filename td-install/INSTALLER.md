@@ -53,14 +53,32 @@ Compositor-owned trusted consent must bind destructive execution to the
 exact reviewed request under the existing elevation contract; ordinary
 client pixels or synthetic input are not authorization evidence.
 
-The welcome-only `td-setup` front end has a source-built static target recipe
-and `td-setup-test` realized-output check. The recipe stages its own tree with
-`td-ui` and the compositor sources that the toolkit mounts, then builds with
-the target Rust toolchain; the check runs `--help`, `--font-license` and a
-headless render of the full welcome frame without emitting its image bytes.
-This establishes an image-eligible executable, not an active installer: the
-release live profile must wait for the remaining wizard pages, its paired
-service, trusted consent, and end-to-end installation evidence.
+The `td-setup` front end has a source-built static target recipe
+and `td-setup-test` realized-output check. The recipe stages its own tree
+with `td-install`, `td-ui` and the compositor sources that the toolkit
+mounts, then builds with the target Rust toolchain. The check runs
+`--help`, `--font-license` and a headless render of the full welcome
+frame without emitting its image bytes.
+This establishes an image-eligible executable whose window presents only the
+welcome page. Its library also has a pure, unconnected destination view.
+The release live profile must wait for the remaining wizard pages, its
+paired service, trusted consent, and end-to-end installation evidence.
+
+The destination page is a pure view over `Destination` values supplied by
+the future service. It shows capacity, model, kernel name, device number,
+sequence, serial and WWID where present, and escapes untrusted labels for
+display, including spaces. Long identifiers span numbered detail pages, so
+the full escaped identity remains inspectable; excess disk counts show an
+explicit refusal. The caller retains list position separately from choice.
+Supplied label values carry a `value:` prefix, and wrapped continuation
+lines carry `| ` and the field name, so they cannot impersonate the
+page's own field headings or missing and present-empty markers. A selected
+row is only a navigation index; the service must still
+authenticate the source, establish eligibility and retain the disk claim.
+The page uses the pure `td-install` library's plan module. Its target recipe
+stages that sibling source tree and its confinement test pins the library's
+single public module. The page is not yet connected to the live window or a
+service.
 
 Disk enumeration is read-only and bounded. Show model, serial when supplied
 by the device, capacity and a distinguishing device identifier. These are
@@ -103,11 +121,13 @@ The `td-install` Rust library exports `installation_plan::{Plan,
 Destination, DestinationObservation, Settings}`. It is a pure data
 prerequisite for the service and UI, with no CLI, device access,
 filesystem access, entropy generation, transport or installation
-execution. The Cargo library target remains host/preflight-only. The
-target-built formatter now stages the same module through `#[path]` for
-`observe-plan`, with its recipe and compiled-file guard declaring that
-source. Each further target consumer must declare the source in its
-own recipe and confinement roster. A decoded plan conveys no authority.
+execution. The Cargo library is also a target path dependency of td-setup;
+it still exports only `installation_plan`, as pinned by td-setup's
+confinement test. The formatter stages that module separately through
+`#[path]` for `observe-plan`, with its recipe and compiled-file guard
+declaring the source. Each further target consumer must declare its source
+and public API reach in its own recipe and confinement roster. A decoded
+plan conveys no authority.
 
 A plan owns a nonzero 32-byte proposal nonce, the complete destination
 observations, a 32-byte deployment manifest digest, a version-4 volume

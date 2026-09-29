@@ -4298,7 +4298,8 @@ fn sources_under(dir: &Path, required: bool) -> Result<String, String> {
 /// wrapped argument (review's finding). A name in an error message counts
 /// too, and only widens the run, which is the cheap direction. A crate is
 /// never its own reader. Today: td-portal builds modules out of td-compositor
-/// and td-busd through `#[path]`, td-install out of td-boot, td-jail's tests
+/// and td-busd through `#[path]`, td-install out of td-boot, td-setup through
+/// its td-install path dependency, td-jail's tests
 /// `include_str!` td-busd's spec and transport source, and td-login names
 /// td-busd's directory in a test's argument string, which is no read at all
 /// and only widens.
@@ -5176,6 +5177,7 @@ mod tests {
         // a name is a name wherever it is spelled.
         assert_eq!(readers_of("td-busd"), ["td-audio", "td-compositor", "td-jail", "td-login", "td-portal", "td-secret"]);
         assert_eq!(readers_of("td-boot"), ["td-install", "td-update"]);
+        assert_eq!(readers_of("td-install"), ["td-setup"]);
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
         // td-mail and td-news depend on the editor for their document pane.
         assert_eq!(readers_of("td-editor"), ["td-mail", "td-news"]);
@@ -7351,7 +7353,7 @@ mod tests {
         );
         assert_eq!(
             names(&one("td-boot/src/protocol.rs")),
-            ["td-boot", "td-install", "td-update"]
+            ["td-boot", "td-install", "td-setup", "td-update"]
         );
         // The order holds within a narrowed list: every test before any clippy,
         // the workspace first.

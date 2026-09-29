@@ -23,10 +23,16 @@ fn source_inventory_and_toolkit_access_are_closed() {
             .contains("#![forbid(unsafe_code)]"),
         "crate root forbids unsafe"
     );
-    let expected: BTreeSet<String> = ["lib.rs", "main.rs", "welcome.rs", "window.rs"]
-        .iter()
-        .map(|name| name.to_string())
-        .collect();
+    let expected: BTreeSet<String> = [
+        "destination.rs",
+        "lib.rs",
+        "main.rs",
+        "welcome.rs",
+        "window.rs",
+    ]
+    .iter()
+    .map(|name| name.to_string())
+    .collect();
     let mut actual = BTreeSet::new();
     for entry in std::fs::read_dir(root.join("src")).unwrap() {
         let entry = entry.unwrap();
@@ -46,6 +52,40 @@ fn source_inventory_and_toolkit_access_are_closed() {
         actual.insert(name);
     }
     assert_eq!(actual, expected, "unexpected or missing source file");
+    let installer = std::fs::read_to_string(root.join("../td-install/src/lib.rs")).unwrap();
+    let active: Vec<_> = installer
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .collect();
+    assert_eq!(
+        active,
+        ["#![forbid(unsafe_code)]", "pub mod installation_plan;"],
+        "installer library source or API grew"
+    );
+    for name in [
+        "destination.rs",
+        "lib.rs",
+        "main.rs",
+        "welcome.rs",
+        "window.rs",
+    ] {
+        let text = std::fs::read_to_string(root.join("src").join(name)).unwrap();
+        let allowed = if name == "destination.rs" {
+            text.replace("td_install::installation_plan::", "")
+        } else {
+            text.clone()
+        };
+        assert!(
+            !allowed.contains("td_install"),
+            "{name} reaches another installer API"
+        );
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            !compact.contains("path=") && !compact.contains("include!("),
+            "{name} mounts outside source"
+        );
+    }
     // The client boundary is real: `window` names both the transport and the
     // client, so removing either from it would be caught here, not silently.
     let window = std::fs::read_to_string(root.join("src/window.rs")).unwrap();

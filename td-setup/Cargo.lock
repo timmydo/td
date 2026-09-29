@@ -3,9 +3,14 @@
 version = 4
 
 [[package]]
+name = "td-install"
+version = "0.1.0"
+
+[[package]]
 name = "td-setup"
 version = "0.1.0"
 dependencies = [
+ "td-install",
  "td-ui",
 ]
 

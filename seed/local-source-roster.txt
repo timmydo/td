@@ -17,5 +17,5 @@ td-net-source net engine,td-boot
 td-news-source td-news td-ui,td-compositor,td-editor
 td-photo-source td-photo td-ui,td-compositor
 td-portal-source td-portal td-secret,td-busd,td-compositor,engine,td-ui
-td-setup-source td-setup td-ui,td-compositor
+td-setup-source td-setup td-install,td-ui,td-compositor
 td-taskmgr-source td-taskmgr td-ui,td-compositor
