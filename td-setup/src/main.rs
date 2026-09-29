@@ -4,12 +4,13 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 const HELP: &str = concat!(
-    "td-setup [--preview | --font-license | --help]\n",
+    "td-setup [--preview | --render-check | --font-license | --help]\n",
     "The offline graphical installer front end (INSTALLER.md).\n",
     "With no argument it opens the installer window on the Wayland display\n",
     "named by WAYLAND_SOCKET, or WAYLAND_DISPLAY under XDG_RUNTIME_DIR.\n",
     "It presents the welcome page; the wizard's later pages are not built yet.\n",
     "--preview writes the welcome page as a PPM image to stdout.\n",
+    "--render-check renders that page and exits without image output.\n",
     "This front end holds no disk-writing authority; td-install writes disks.\n",
 );
 
@@ -21,6 +22,7 @@ fn main() -> ExitCode {
     let result = match args.as_slice() {
         [] => td_setup::window::run_window(),
         [arg] if arg == "--preview" => preview(&mut io::stdout().lock()),
+        [arg] if arg == "--render-check" => preview(&mut io::sink()),
         [arg] if arg == "--font-license" => {
             let mut output = io::stdout().lock();
             [

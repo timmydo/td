@@ -2,7 +2,7 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 /// Check the realized target binary before it is admitted to a live image.
 /// The host native-compositor suite covers the actual welcome window; here
-/// the target tool must link statically and run --help and --font-license.
+/// the target tool must link statically, render a frame and run its text modes.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-setup}/bin/td-setup";
     Recipe::mesboot("td-setup-test", "1.0")
@@ -15,13 +15,14 @@ pub fn recipe() -> Recipe {
             Step::assert_static(&[bin]),
             Step::run("{root}", &[bin, "--help"]),
             Step::run("{root}", &[bin, "--font-license"]),
+            Step::run("{root}", &[bin, "--render-check"]),
             Step::MkDir {
                 path: "{out}".into(),
             },
             Step::WriteFile {
                 path: "{out}/result".into(),
                 content:
-                    "PASS: source-built static td-setup executed help and embedded font notices\n"
+                    "PASS: source-built static td-setup rendered a frame and executed text modes\n"
                         .into(),
                 exec: false,
             },
@@ -56,9 +57,9 @@ mod tests {
             .unwrap();
         let result = steps
             .iter()
-            .position(|step| matches!(step, Step::WriteFile { path, content, .. } if path == "{out}/result" && content.contains("static td-setup")))
+            .position(|step| matches!(step, Step::WriteFile { path, content, .. } if path == "{out}/result" && content.contains("rendered a frame")))
             .unwrap();
-        for flag in ["--help", "--font-license"] {
+        for flag in ["--help", "--font-license", "--render-check"] {
             let run = steps
                 .iter()
                 .position(|step| matches!(step, Step::Run { argv, .. } if argv == &vec![bin.to_string(), flag.to_string()]))
