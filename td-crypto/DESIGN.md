@@ -5,8 +5,9 @@
 This crate owns td's provider-independent cryptographic API. The compiling
 M03a surface contains `Error`, `Entropy`, `Digest` and `Crypto`, extracted
 from td-mta's existing ports. M03b1 admits the private Rustls/AWS-LC
-dependencies and checks their offline host build. It currently implements no production cryptographic algorithm,
-entropy source or TLS session. Test-only backend qualification covers explicit
+dependencies and checks their offline host build. M07a1 implements opaque
+streaming SHA-256 through the private AWS-LC backend. Entropy, signing-key
+operations and TLS sessions remain unimplemented. Test-only backend qualification covers explicit
 provider construction, SHA-256, local TLS 1.2/1.3 data exchange, certificate
 verification and malformed/tampered-record refusals in the isolated static
 executable.
@@ -67,7 +68,9 @@ backend in source, with no feature, environment or runtime backend selector.
 `Entropy::fill` returning success fills the entire caller slice. On a returned
 error, discard the whole output, including bytes written before the error.
 `Digest` streams SHA-256 and consumes its state to return exactly 32 bytes.
-`Crypto` owns SHA-256 construction, fixed 32-byte constant-time comparison,
+After any update error, callers must discard the operation; implementations
+must also refuse every later update and finish. This includes test providers.
+`Crypto` supplies fallible SHA-256 construction, fixed 32-byte constant-time comparison,
 P-256 key generation/loading, public-point encoding and ES256 signing. Associated
 key/digest types permit test implementations; shipped implementations must use
 td-owned opaque types, not upstream types as their public associated types.
@@ -89,6 +92,55 @@ that enum. TLS-specific errors and interfaces are frozen by M07 before their
 consumers are implemented; they follow the same ownership and redaction rules.
 
 ## Backend and TLS implementation
+
+### Streaming SHA-256
+
+`Sha256::try_new` creates one opaque digest operation. Initialization is cold
+and may allocate provider state; failure returns `Error::Crypto`. `Digest`
+updates stream directly into that state without retaining whole input chunks;
+native state retains up to 63 bytes of a partial block. The future concrete
+`Crypto` factory delegates to the same `Sha256::try_new` constructor.
+Checked total input length cannot exceed `u64::MAX / 8` bytes, the SHA-256
+bit-length limit. Length refusal or a provider update failure retires the
+state; later updates and finish return `Error::Crypto`. Only a successful,
+consuming finish returns a 32-byte digest. No clone or reset is exposed.
+
+The pinned provider's public Context constructor, update and finish use
+unwrap/expect internally; their fallible helpers are private. A narrow
+`catch_unwind` boundary owns the context across each call. On unwind it drops
+the context and returns the fixed error; it never resumes a partial context.
+No `AssertUnwindSafe`, global hook change, vendor patch or second backend is
+introduced. The pinned digest cleanup calls native `EVP_MD_CTX_cleanup`
+without a Rust panic path. Algorithm selection is fixed to SHA-256; the
+audited Rust failure payloads are fixed messages and `Unspecified`, not input
+bytes. No provider error or panic payload crosses the public API.
+
+This boundary requires Rust unwinding throughout the target graph, including
+the final executable. The crate refuses its own compilation with `panic=abort`;
+that check alone cannot detect linking an unwind-built rlib into a separately
+compiled aborting executable. The supported portable Cargo build compiles the
+whole graph with the default unwind strategy. Every future target recipe or
+consumer build must preserve that strategy through final linking; a final-only
+abort override is unsupported. Panic hooks still execute, and an aborting or
+panicking hook is outside the boundary. Native aborts, OOM and unwinding failures are not contained.
+Returned failure tests inject Rust unwinds at the same private entry points;
+they do not establish native allocation-failure or entropy-failure recovery.
+
+Successful native finalization explicitly cleanses digest state. Every cleanup
+path, including early/error drop, also calls `EVP_MD_CTX_cleanup` and then
+`OPENSSL_free`. The pinned default allocator cleanses the allocation, including
+its size prefix, before freeing it. No allocator override is installed; any
+future override must preserve this responsibility and repeat qualification.
+This source audit does not prove erasure of provider stack temporaries or
+compiler/caller copies. Never finalize a failed context merely to clear it.
+
+Known-answer tests reuse the four existing engine SHA-256 fixture values and
+exercise empty inputs and fragmented updates around block boundaries. The
+portable harness runs those cases, retirement checks and unwind injection in
+its isolated runtime. This is functional and API-confinement evidence; M07
+still owes native allocation, worker-stack and whole-process qualification
+before service use. Wrapping the provider does not establish a no-allocation
+hot path. The remaining Crypto operations and concrete factory are pending.
 
 M03b1 pins versions, features, licenses and roots; M03b2 pins the portable
 native build inputs.

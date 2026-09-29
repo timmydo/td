@@ -1,4 +1,5 @@
-//! Provider-independent cryptographic contracts; no backend is implemented yet.
+//! Opaque cryptographic APIs; streaming SHA-256 uses the private AWS-LC backend.
+//! Entropy, signing-key operations and TLS sessions remain unimplemented.
 //!
 //! These checks reject the two named root exports; backend integration must
 //! also check nested exports, aliases and public signatures.
@@ -9,6 +10,12 @@
 //! use td_crypto::aws_lc_rs;
 //! ```
 #![forbid(unsafe_code)]
+
+#[cfg(panic = "abort")]
+compile_error!("td-crypto requires panic=unwind for its provider error boundary");
+
+mod sha256;
+pub use sha256::Sha256;
 
 /// Fixed failures carry neither backend diagnostics nor secret input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +43,8 @@ impl std::error::Error for Error {}
 pub trait Entropy {
     fn fill(&mut self, output: &mut [u8]) -> Result<(), Error>;
 }
+/// Streaming SHA-256. After an update error, discard the operation.
+/// Implementations must refuse every later update and finish, including mocks.
 pub trait Digest: Send {
     fn update(&mut self, bytes: &[u8]) -> Result<(), Error>;
     fn finish(self) -> Result<[u8; 32], Error>;
@@ -43,7 +52,8 @@ pub trait Digest: Send {
 pub trait Crypto: Send + Sync {
     type Sha256: Digest;
     type SigningKey: Send + Sync;
-    fn sha256(&self) -> Self::Sha256;
+    /// Cold creation may fail before a digest state is available.
+    fn sha256(&self) -> Result<Self::Sha256, Error>;
     /// Provider-backed constant-time equality for fixed-size digests.
     fn equal_digest(&self, left: &[u8; 32], right: &[u8; 32]) -> bool;
     /// Cold path only; output is a complete PKCS#8 P-256 private key.

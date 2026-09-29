@@ -612,6 +612,12 @@ required independent oracles, including exact malformed-transfer blob bytes.
 **Depends on:** M03/M04. **Own:** td-crypto's private TLS/crypto backend and public
 opaque APIs; td-mta's transport, policy-generation and resource integration.
 
+**Partial implementation:** M07a1 supplies opaque, fallible streaming SHA-256
+inside td-crypto, with terminal failure state and a narrow provider-unwind
+boundary. Known-answer and failure tests run in the portable harness. Other
+Crypto operations, entropy, TLS, native allocation and service resource
+qualification remain pending; this does not complete M07 or enable service.
+
 Freeze the bounded td-owned TLS configuration/session API before implementing
 consumers. Implement direct Crypto/Entropy operations and incoming/outgoing TLS
 inside td-crypto. Rustls provider/configuration/verifier/key types never leave

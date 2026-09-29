@@ -289,6 +289,23 @@ are removed on normal completion/error; after a hard kill remove one only after
 confirming its process ended. Retained artifacts follow the same explicit cache
 cleanup rule as prepared inputs.
 
+## Streaming digest qualification
+
+The runtime runs the opaque SHA-256 facade's four existing known-answer
+fixtures, including fragmented updates around block boundaries and a million
+`a` bytes. Separate cases inject constructor/update/finish Rust unwinds and
+verify terminal state after update/length refusal. The checked length limit
+uses a synthetic counter near its ceiling; the test does not hash exabytes.
+These are the same private call boundaries used by the public methods.
+
+The entire target graph and final executable require `panic=unwind`. The
+supported Cargo build uses its default unwind strategy. The crate guard refuses
+its own abort compilation; it cannot detect a separately compiled final-only
+abort override. Such linking is unsupported, including in future target recipes.
+Hooks still run, and these tests do not simulate native OOM, native abort or
+entropy failure. They add no allocation/RSS or service-stack claim. DESIGN.md
+owns the failure policy and the remaining M07 qualification requirements.
+
 ## Local TLS smoke
 
 The test-only backend module generates an ephemeral P-256 root and localhost

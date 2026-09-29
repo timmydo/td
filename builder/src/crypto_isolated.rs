@@ -579,6 +579,9 @@ pub(crate) fn runtime_inner() -> Result<()> {
     }
     for (index, (binary, case, ignored)) in [
         ("td-crypto-smoke", "tests::admitted_native_backend_sha256_smoke", false),
+        ("td-crypto-smoke", "sha256::tests::known_answers_and_fragmented_updates", false),
+        ("td-crypto-smoke", "sha256::tests::initialization_update_and_finalization_unwinds_return_fixed_failure", false),
+        ("td-crypto-smoke", "sha256::tests::length_refusal_retires_state_before_provider_update", false),
         ("td-crypto-smoke", "tests::explicit_aws_provider_and_roots_construct_without_global_default", false),
         ("td-crypto-smoke", "tls_smoke::tls12_local_round_trip", false),
         ("td-crypto-smoke", "tls_smoke::tls13_local_round_trip", false),
@@ -626,7 +629,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             println!("portable runtime: {prefix}{bytes}");
         }
     }
-    println!("portable runtime: version, native SHA-256, explicit provider, eight TLS cases and both bounded configuration stacks passed without toolchain mounts");
+    println!("portable runtime: version, SHA-256 facade/failure probes, explicit provider, eight TLS cases and both bounded configuration stacks passed without toolchain mounts");
     Ok(())
 }
 
