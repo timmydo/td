@@ -686,8 +686,9 @@ Implement the remaining work as independently reviewable increments:
     lists and complete certificate/handshake identifier mapping checks, with
     excluded native algorithms refused. Portable inventory, drift and local positive/
     negative fixtures qualify this component without enabling service.
-  - **M07b3b — local signing bridge:** retain the existing owned key lifecycle
-    through native TLS signing; qualify DER signatures and shared retirement.
+  - **M07b3b — local signing bridge:** implemented private retained-identity
+    signing through the existing owned key lifecycle. Portable fixtures cover
+    canonical DER, hash-once signing, shared retirement and local handshakes.
   - **M07b3c — configuration handles:** implement immutable role selection,
     bounded identity routing, ALPN, supplied clock and resumption refusal.
 - **M07c — opaque sessions:** implement and pin concrete public signatures

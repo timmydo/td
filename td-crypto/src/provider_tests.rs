@@ -346,3 +346,34 @@ fn shared_key_serializes_success_and_terminal_failure() {
             .unwrap();
     });
 }
+#[test]
+fn signature_transform_failure_retires_before_key_restore() {
+    for unwind in [false, true] {
+        let key = load_fixture();
+        let entered = std::sync::atomic::AtomicBool::new(false);
+        let result = key.sign_es256_with::<()>(b"post-sign transform", |signature| {
+            assert!(verify(&generator(), b"post-sign transform", signature));
+            entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            if unwind {
+                panic!("fixture signature encoding unwind");
+            }
+            Err(Error::Capacity)
+        });
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            result,
+            Err(if unwind {
+                Error::Crypto
+            } else {
+                Error::Capacity
+            })
+        );
+        assert!(key.key.lock().unwrap().is_none());
+        let mut output = [0xa5; 64];
+        assert_eq!(
+            Provider.sign_es256(&key, b"retry", &mut output),
+            Err(Error::Crypto)
+        );
+        assert_eq!(output, [0xa5; 64]);
+    }
+}

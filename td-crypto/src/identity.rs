@@ -4,18 +4,23 @@ use crate::{
     Provider, TlsError, VerificationFailure, CERTIFICATE_DER_CAPACITY,
 };
 use rustls::pki_types::{CertificateDer, ServerName, SignatureVerificationAlgorithm, UnixTime};
-use std::{panic::catch_unwind, time::Duration};
+use std::{panic::catch_unwind, sync::Arc, time::Duration};
 
 /// An owned local key, certificate chain and exact DNS bindings.
 /// Admission checks local consistency; it establishes no remote trust or mail
 /// authorization. Native allocations and failure limits still apply.
 pub struct ServerIdentity {
-    chain: Vec<Vec<u8>>,
+    pub(super) certified: Arc<rustls::sign::CertifiedKey>,
     names: Vec<String>,
-    key: P256Key,
+    key: Arc<P256Key>,
     not_before: u64,
     not_after: u64,
 }
+
+// The erased SigningKey is exclusively our adapter: immutable public data
+// and a mutex-fenced key that retires before an unwind returns.
+impl std::panic::UnwindSafe for ServerIdentity {}
+impl std::panic::RefUnwindSafe for ServerIdentity {}
 
 impl ServerIdentity {
     /// Cold admission of a bounded PEM chain and P-256 key, with 1..=32 names.
@@ -32,12 +37,12 @@ impl ServerIdentity {
 
     /// Number of certificates retained in their supplied leaf-first order.
     pub fn certificate_count(&self) -> usize {
-        self.chain.len()
+        self.certified.cert.len()
     }
 
     /// Public certificate bytes for inspection; out-of-range indices yield None.
     pub fn certificate_der(&self, index: usize) -> Option<&[u8]> {
-        self.chain.get(index).map(Vec::as_slice)
+        self.certified.cert.get(index).map(|der| der.as_ref())
     }
 
     /// Number of checked exact DNS bindings.
@@ -74,7 +79,7 @@ fn admission_boundary(
 impl std::fmt::Debug for ServerIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerIdentity")
-            .field("certificates", &self.chain.len())
+            .field("certificates", &self.certified.cert.len())
             .field("names", &self.names.len())
             .finish_non_exhaustive()
     }
@@ -322,8 +327,10 @@ fn admit(
         .p256_public(&key, &mut public)
         .map_err(crypto_error)?;
     let (not_before, not_after) = admission(&chain, &names, &public, now)?;
+    let key = Arc::new(key);
+    let certified = Arc::new(crate::tls_signer::certified_key(chain, key.clone())?);
     Ok(ServerIdentity {
-        chain,
+        certified,
         names,
         key,
         not_before,

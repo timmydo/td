@@ -114,7 +114,7 @@ fn transfer(
     Ok(written)
 }
 // Bound fixture work; this is not a bound on provider allocation or CPU time.
-fn drive(c: &mut rustls::Connection, s: &mut rustls::Connection) -> Result<()> {
+pub(super) fn drive(c: &mut rustls::Connection, s: &mut rustls::Connection) -> Result<()> {
     let mut bytes = [0; BUFFER_BYTES];
     let mut total = 0;
     for _ in 0..TURNS {

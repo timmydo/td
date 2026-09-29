@@ -92,7 +92,7 @@ fn local_identity_owns_material_and_checks_validity() {
         format!("{identity:?}"),
         "ServerIdentity { certificates: 2, names: 1, .. }"
     );
-    fn send_sync<T: Send + Sync>() {}
+    fn send_sync<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
     send_sync::<ServerIdentity>();
     assert!(fixture
         .admit(&chain[..1], &["localhost"], Some(NOW))
@@ -812,5 +812,152 @@ fn local_identity_metadata_bounds_and_malformed_values() {
             Certificate::parse(&certificate).unwrap().rsa_size().is_ok(),
             accepted
         );
+    }
+}
+#[test]
+fn retained_tls_identity_shares_key_lifecycle() {
+    let fixture = Fixture::new();
+    let chain = fixture.chain(&Parameters::new(false), &Parameters::new(true));
+    let identity = fixture.admit(&chain, &["localhost"], Some(NOW)).unwrap();
+    identity.certified.keys_match().unwrap();
+    let signer = identity
+        .certified
+        .key
+        .choose_scheme(&[rustls::SignatureScheme::ECDSA_NISTP256_SHA256])
+        .unwrap();
+    signer.sign(b"identity retained signer").unwrap();
+    assert_eq!(
+        identity
+            .key
+            .sign_es256_with::<()>(b"retire", |_| Err(Error::Crypto)),
+        Err(Error::Crypto)
+    );
+    assert_eq!(identity.check_validity(Some(NOW)), Err(TlsError::Crypto));
+    assert!(signer.sign(b"after retirement").is_err());
+    assert_eq!(identity.certificate_der(0), Some(chain[0].as_slice()));
+}
+
+#[test]
+fn retained_tls_identity_completes_handshakes_and_survives_remote_refusal() {
+    use rustls::{pki_types::UnixTime, SignatureScheme};
+    use std::sync::Arc;
+    #[derive(Debug)]
+    struct Clock;
+    impl rustls::time_provider::TimeProvider for Clock {
+        fn current_time(&self) -> Option<UnixTime> {
+            Some(UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+                NOW,
+            )))
+        }
+    }
+    let fixture = Fixture::new();
+    let chain = fixture.chain(&Parameters::new(false), &Parameters::new(true));
+    let root = chain.last().unwrap().clone();
+    let identity = fixture.admit(&chain, &["localhost"], Some(NOW)).unwrap();
+    let key = identity.key.clone();
+    let certified = identity.certified.clone();
+    let provider = Arc::new(crate::tls_policy::provider().unwrap());
+    let mut configurations = Vec::new();
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        let mut server =
+            rustls::ServerConfig::builder_with_details(provider.clone(), Arc::new(Clock))
+                .with_protocol_versions(&[version])
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+                    certified.clone(),
+                )));
+        server.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        server.send_tls13_tickets = 0;
+        let server = Arc::new(server);
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(root.clone().into()).unwrap();
+        let mut client =
+            rustls::ClientConfig::builder_with_details(provider.clone(), Arc::new(Clock))
+                .with_protocol_versions(&[version])
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        client.resumption = rustls::client::Resumption::disabled();
+        let client = Arc::new(client);
+        configurations.push((client.clone(), server.clone()));
+        for wrong in [true, false] {
+            let name = if wrong { "wrong.example" } else { "localhost" };
+            let mut client = rustls::Connection::Client(
+                rustls::ClientConnection::new(client.clone(), name.try_into().unwrap()).unwrap(),
+            );
+            let mut server =
+                rustls::Connection::Server(rustls::ServerConnection::new(server.clone()).unwrap());
+            client.set_buffer_limit(Some(32 * 1024));
+            server.set_buffer_limit(Some(32 * 1024));
+            let result = crate::tls_smoke::drive(&mut client, &mut server);
+            if wrong {
+                assert!(matches!(
+                    result.unwrap_err().downcast_ref::<rustls::Error>(),
+                    Some(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::NotValidForNameContext { .. }
+                    ))
+                ));
+                let mut alert = [0; 32 * 1024];
+                let length = client
+                    .write_tls(&mut std::io::Cursor::new(alert.as_mut_slice()))
+                    .unwrap();
+                assert!(length > 0 && !client.wants_write());
+                assert_eq!(
+                    server
+                        .read_tls(&mut std::io::Cursor::new(&alert[..length]))
+                        .unwrap(),
+                    length
+                );
+                assert!(matches!(
+                    server.process_new_packets(),
+                    Err(rustls::Error::AlertReceived(
+                        rustls::AlertDescription::BadCertificate
+                    ))
+                ));
+                identity.check_validity(Some(NOW)).unwrap();
+            } else {
+                result.unwrap();
+                assert!(!client.is_handshaking() && !server.is_handshaking());
+                assert_eq!(client.protocol_version(), Some(version.version));
+            }
+        }
+        let mut refused = rustls::ServerConnection::new(server).unwrap();
+        assert_eq!(
+            refused
+                .read_tls(&mut std::io::Cursor::new([0xff, 3, 3, 0, 1, 0]))
+                .unwrap(),
+            6
+        );
+        assert!(matches!(
+            refused.process_new_packets(),
+            Err(rustls::Error::InvalidMessage(
+                rustls::InvalidMessage::InvalidContentType
+            ))
+        ));
+        let signer = certified
+            .key
+            .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
+            .unwrap();
+        signer.sign(b"after remote refusal").unwrap();
+    }
+    assert_eq!(
+        key.sign_es256_with::<()>(b"retire shared signing key", |_| Err(Error::Crypto)),
+        Err(Error::Crypto)
+    );
+    for (client, server) in configurations {
+        let mut client = rustls::Connection::Client(
+            rustls::ClientConnection::new(client, "localhost".try_into().unwrap()).unwrap(),
+        );
+        let mut server = rustls::Connection::Server(rustls::ServerConnection::new(server).unwrap());
+        client.set_buffer_limit(Some(32 * 1024));
+        server.set_buffer_limit(Some(32 * 1024));
+        let error = crate::tls_smoke::drive(&mut client, &mut server).unwrap_err();
+        match error.downcast_ref::<rustls::Error>().unwrap() {
+            rustls::Error::Other(rustls::OtherError(error)) => {
+                assert_eq!(error.downcast_ref::<TlsError>(), Some(&TlsError::Crypto))
+            }
+            _ => panic!("unexpected retired key handshake error"),
+        }
     }
 }

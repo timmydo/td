@@ -464,6 +464,59 @@ copies, backend inventories/path state, retained keys and overlapping
 generations before the service can use this handle.
 No listener or outbound adapter is enabled by M07b2a.
 
+### Owned-key TLS signing bridge
+
+Local identity admission retains its chain in one private shared CertifiedKey
+and its existing opaque P256Key behind an Arc. The private TLS adapter retains
+that same key, with no private-key export, reload or independent failure state.
+Certificate byte vectors move into the retained chain without copying their
+contents. Public inspection still returns the same certificate bytes and
+counts. A cached 91-byte P-256 SPKI contains only public key material; native
+key/leaf matching checks it before publication. No backend handle crosses the
+public API, and no reference cycle retains an identity.
+ServerIdentity retains Send, Sync, UnwindSafe and RefUnwindSafe. The erased
+backend signing trait does not express the last two; the owned identity
+implements them because its sole adapter has immutable public state and the
+existing mutex-fenced, retiring key. Tests pin the concrete adapter's inferred
+unwind traits. This is not a promise that native aborts or panic hooks recover.
+
+The adapter advertises only ecdsa_secp256r1_sha256 and passes the unhashed
+handshake message into the existing SHA-256 ECDSA operation. It converts the
+64-byte r || s result into canonical positive DER INTEGERs and a SEQUENCE of
+at most 72 bytes. Leading zero octets are removed, sign padding is inserted
+when needed, and a zero scalar is refused as an internal failure. The native
+signer supplies valid scalars; this private encoder is not a separate public
+signature-validation interface.
+
+Signature construction and its fallible Vec reserve run inside the same
+locked operation/unwind boundary that owns the native key. A transform error
+or unwind drops the key before restoration; all adapters/configurations
+sharing it refuse later signing. The raw ES256 API uses that same boundary
+with an identity transform, preserving its fixed output and error semantics.
+A completed operation cannot retract signature bytes already returned; future
+sessions must still recheck shared-key health at the TLS.md admission and
+handshake-evidence publication points. Cached public bytes and certificate
+inspection are not proof of live key state. Ordinary remote protocol/name
+refusals do not retire the shared key.
+
+Only fixed td-owned TlsError tags travel through the private native error
+channel. Public errors never include native diagnostics, certificates,
+signatures, names or secrets. Debug for the adapter/signer is fixed redacted
+text. Rustls selector boxing and the returned signature Vec are TLS
+allocations; chain/header vectors, SPKI and Arc ownership are cold generation
+costs. M07e still must measure them with native signing/entropy costs. Native
+abort/OOM, panic hooks, blocking and secret-erasure limits remain unchanged.
+
+Tests cover canonical DER integer boundaries, native ASN.1 verification and
+hash-once behavior, wrong scheme refusal, synthetic post-sign transform errors
+and unwinds, shared retired-key refusal and unchanged raw ES256 outputs. Local
+TLS 1.2/1.3 fixtures complete full handshakes with the owned signer, retain key
+health after remote name/protocol failures, including receipt of the refusing
+client's fatal alert after server signing, and refuse both configurations after
+shared-key retirement. Resumption is disabled in those fixtures so it cannot
+bypass the signing operation. These tests do not implement public TLS
+configuration roles, clocks, sessions or gateway authorization.
+
 ### Trust-store admission
 
 `TrustStore::from_pem` constructs an owned explicit private CA store;

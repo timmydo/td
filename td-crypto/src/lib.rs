@@ -27,6 +27,7 @@ mod der;
 mod certificate;
 mod certificate_algorithms;
 mod tls_policy;
+mod tls_signer;
 mod tls_error;
 pub use tls_error::{TlsError, VerificationFailure};
 mod identity;

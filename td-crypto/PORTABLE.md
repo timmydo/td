@@ -550,3 +550,13 @@ classical CA completes a handshake with a native-default client, while the
 policy client refuses its signing scheme. RSA suites and P-384/P-521/Ed25519
 signing schemes receive inventory coverage only. These checks qualify the algorithm component; they do not
 claim public configurations, session limits or service admission.
+
+## Owned TLS signing qualification
+
+The portable artifact runs signature DER boundary and hash-once verification,
+shared-key transform-error/unwind retirement, retained-identity lifecycle and
+local TLS 1.2/1.3 handshakes through the owned signer. Both configurations
+refuse after shared-key retirement; preceding peer name/protocol refusals
+leave it usable. Resumption is disabled in this fixture. Private state faults
+are synthetic Rust failures, not native RNG/OOM/abort simulation. TLS roles,
+sessions and resource qualification remain separate.

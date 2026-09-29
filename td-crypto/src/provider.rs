@@ -47,6 +47,23 @@ impl Provider {
 }
 
 impl P256Key {
+    pub(super) fn sign_es256_with<T>(
+        &self,
+        message: &[u8],
+        transform: impl FnOnce(&[u8; 64]) -> Result<T, Error> + UnwindSafe,
+    ) -> Result<T, Error> {
+        self.operate(|key| {
+            if u64::try_from(message.len()).map_err(|_| Error::Crypto)? > u64::MAX / 8 {
+                return Err(Error::Crypto);
+            }
+            let signature = key
+                .sign(&aws_lc_rs::rand::SystemRandom::new(), message)
+                .map_err(|_| Error::Crypto)?;
+            let signature: &[u8; 64] = signature.as_ref().try_into().map_err(|_| Error::Crypto)?;
+            transform(signature)
+        })
+    }
+
     fn operate<T>(
         &self,
         operation: impl FnOnce(&EcdsaKeyPair) -> Result<T, Error> + UnwindSafe,
@@ -138,15 +155,7 @@ impl Crypto for Provider {
         message: &[u8],
         output: &mut [u8; 64],
     ) -> Result<(), Error> {
-        let signature = key.operate(|key| {
-            if u64::try_from(message.len()).map_err(|_| Error::Crypto)? > u64::MAX / 8 {
-                return Err(Error::Crypto);
-            }
-            let signature = key
-                .sign(&aws_lc_rs::rand::SystemRandom::new(), message)
-                .map_err(|_| Error::Crypto)?;
-            signature.as_ref().try_into().map_err(|_| Error::Crypto)
-        })?;
+        let signature = key.sign_es256_with(message, |signature| Ok(*signature))?;
         *output = signature;
         Ok(())
     }

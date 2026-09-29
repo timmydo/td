@@ -663,6 +663,12 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "p256_oracle::tests::exceptional_point_cases_and_projective_representations", false),
         ("td-crypto-smoke", "p256_oracle::tests::signature_scalar_ranges_and_infinity_result_are_refused", false),
         ("td-crypto-smoke", "tests::explicit_aws_provider_and_roots_construct_without_global_default", false),
+        ("td-crypto-smoke", "provider::tests::signature_transform_failure_retires_before_key_restore", false),
+        ("td-crypto-smoke", "tls_signer::tests::canonical_tls_signature_encoding_boundaries", false),
+        ("td-crypto-smoke", "tls_signer::tests::tls_signer_uses_owned_key_and_hashes_once", false),
+        ("td-crypto-smoke", "tls_signer::tests::shared_tls_signers_observe_transform_retirement", false),
+        ("td-crypto-smoke", "identity::tests::retained_tls_identity_completes_handshakes_and_survives_remote_refusal", false),
+        ("td-crypto-smoke", "identity::tests::retained_tls_identity_shares_key_lifecycle", false),
         ("td-crypto-smoke", "tls_policy::tests::exact_tls_algorithm_inventory", false),
         ("td-crypto-smoke", "tls_policy::tests::handshake_mapping_drift_is_refused", false),
         ("td-crypto-smoke", "tls_policy::tests::excluded_certificate_signature_has_a_valid_baseline", false),
@@ -724,7 +730,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             println!("portable runtime: {prefix}{bytes}");
         }
     }
-    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, eighteen TLS cases and both bounded configuration stacks passed without toolchain mounts");
+    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
     Ok(())
 }
 
