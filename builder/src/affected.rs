@@ -2979,7 +2979,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
                     return fail(&e);
                 }
             }
-            println!("{} dependency-free lock(s) verified", locks.len());
+            println!("{} lock(s) verified against their named dependency policies", locks.len());
             ExitCode::SUCCESS
         }
         [op] if op == "cargo-cmds" => match gate_cargo_cmds(&root) {
@@ -2992,6 +2992,14 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             Ok(_) => fail("the derived command list is empty — it cannot be"),
             Err(e) => fail(&e),
         },
+        [op, action, flag, manifest] if op == "crypto-cargo" && flag == "--manifest-path" => {
+            // The same manifest/config policy applies to direct wrapper calls.
+            if let Err(e) = dependency_free_locks(&root) { return fail(&e); }
+            match crate::crypto_build::run(&root, action, manifest) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
         [op] if op == "names" => match gate_crate_names(&root) {
             Ok(names) if !names.is_empty() => {
                 println!("{}", names.join(", "));
@@ -3029,6 +3037,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             eprintln!("usage: td-builder gate-crates locks");
             eprintln!("       td-builder gate-crates cargo-cmds");
             eprintln!("       td-builder gate-crates names");
+            eprintln!("       td-builder gate-crates crypto-cargo test|clippy --manifest-path CRATE/Cargo.toml");
             eprintln!(concat!(
                 "       td-builder gate-crates native-compositor ",
                 "--manifest-path CRATE/Cargo.toml"
@@ -3252,7 +3261,8 @@ fn shell_quote(p: &Path) -> Option<String> {
 /// What a guarded lock must list. The workspace root carries one `[[package]]`
 /// per member. A standalone `td-*` crate carries exactly its own package plus
 /// the roster crates its manifest depends on by path, transitively: never a
-/// registry or git crate, and never a path outside the roster, so the engine
+/// registry or git crate except the named Crypto policy. No path points
+/// outside the roster, so the engine
 /// workspace's members still reach a target crate only as shared source.
 /// Names here are roster DIRECTORY names, for `own` and `allowed` alike. A
 /// lock spells package names, so every roster crate's package name must equal
@@ -3261,12 +3271,11 @@ fn shell_quote(p: &Path) -> Option<String> {
 pub(crate) enum LockMembers {
     Count(usize),
     Roster { own: String, allowed: Vec<String> },
+    Crypto { own: String },
 }
 
-/// The lock guard: no `source` line and exactly the package set `LockMembers`
-/// expects, as gate 325 spells the AGENTS.md dependency-free rule. Both,
-/// because they catch different things: the membership catches a new crate,
-/// the source line catches a registry one hiding under a roster name.
+/// The shared lock guard. Count/Roster require the exact local package set
+/// and no registry source; Crypto requires its complete reviewed lock hash.
 pub(crate) fn assert_dependency_free(
     root: &Path,
     lock: &str,
@@ -3285,8 +3294,12 @@ pub(crate) fn assert_dependency_free(
 /// The check itself, over the lock's TEXT — no filesystem, so its cases are
 /// literals in the test rather than a fixture tree.
 fn dependency_free(lock: &str, text: &str, expected: &LockMembers) -> Result<(), String> {
+    if let LockMembers::Crypto { own } = expected {
+        return crate::crypto_policy::lock_pin(own, text);
+    }
     let names = lock_package_names(lock, text)?;
     match expected {
+        LockMembers::Crypto { .. } => return Err("crypto lock was not dispatched".into()),
         LockMembers::Count(expected) => {
             let found = names.len();
             if found != *expected {
@@ -3608,6 +3621,9 @@ fn manifest_path_dependencies(
     name: &str,
     manifest: &str,
 ) -> Result<(Vec<String>, Vec<String>), String> {
+    if crate::crypto_policy::admitted(name) {
+        crate::crypto_policy::manifest_pin(name, manifest)?;
+    }
     let mut deps: Vec<String> = Vec::new();
     let mut dev: Vec<String> = Vec::new();
     let mut inside: Option<bool> = None;
@@ -3713,6 +3729,9 @@ fn manifest_path_dependencies(
             }
             continue;
         };
+        if name == "td-crypto" && !is_dev && crate::crypto_policy::DEPENDENCIES.contains(&line) {
+            continue;
+        }
         let admitted = line
             .split_once(" = ")
             .filter(|(key, _)| !key.is_empty() && key.chars().all(is_name_char))
@@ -3746,6 +3765,12 @@ fn manifest_path_dependencies(
 /// working directory, so a roster crate may carry no `.cargo` directory of
 /// its own: the repository's is the only one.
 fn refuse_cargo_config_overrides(root: &Path, roster: &[GateCrate]) -> Result<(), String> {
+    if roster.iter().any(|k| crate::crypto_policy::admitted(&k.name)) {
+        crate::crypto_policy::cargo_config(root)?;
+        for name in ["td-crypto", "td-mta"] {
+            crate::crypto_policy::no_build_script(root, name)?;
+        }
+    }
     for krate in roster {
         let local = root.join(&krate.name).join(".cargo");
         match std::fs::symlink_metadata(&local) {
@@ -3795,7 +3820,7 @@ fn refuse_cargo_config_overrides(root: &Path, roster: &[GateCrate]) -> Result<()
             let segment = head.split(['.', ']']).next().unwrap_or(head).trim();
             // An escape spells a table name the eye does not see:
             // `"paths"` is `paths`. No key here needs one.
-            if segment.contains('\\') {
+            if head.contains('\\') || (segment.trim_matches(['"', '\'']) == "env" && line.contains('\\')) {
                 return Err(format!(
                     "{name} spells a key with an escape (`{line}`) — the cargo \
                      config's keys are bare, so each can be read for what it is \
@@ -3805,6 +3830,11 @@ fn refuse_cargo_config_overrides(root: &Path, roster: &[GateCrate]) -> Result<()
             // `include` loads further config files this guard would never
             // read; it is refused with the redirects.
             let table = segment.trim_matches(['"', '\'']).trim();
+            // Cargo applies [env] after the wrapper checks its inherited
+            // environment. Reserve every AWS-LC control for the wrapper.
+            if line.contains("AWS_LC_SYS_") {
+                return Err(format!("{name} sets a reserved crypto build control"));
+            }
             if matches!(table, "paths" | "patch" | "source" | "include") {
                 return Err(format!(
                     "{name} redirects dependency resolution (`{line}`) — the roster's \
@@ -4113,7 +4143,8 @@ fn workspace_member_count(root: &Path) -> Result<usize, String> {
 /// Gate 325 asserts these too, but it degrades to a tolerated Unprovisioned
 /// SKIP on every host today (re #469) and names this preflight the authoritative
 /// enforcement — so in the only tier that executes, this is where the
-/// dependency-free claim is actually checked. `--frozen` does not stand in: it
+/// applicable dependency policy is checked. Crypto uses exact reviewed pins;
+/// every other roster closure stays std-only. `--frozen` does not stand in: it
 /// demands that the committed lock RESOLVE, not that it be empty.
 pub(crate) fn dependency_free_locks(root: &Path) -> Result<Vec<(String, LockMembers)>, String> {
     let mut out = vec![(
@@ -4139,13 +4170,16 @@ pub(crate) fn dependency_free_locks(root: &Path) -> Result<Vec<(String, LockMemb
         }
     }
     for krate in &roster {
-        out.push((
-            format!("{}/Cargo.lock", krate.name),
-            LockMembers::Roster {
-                own: krate.name.clone(),
-                allowed: roster_closure(&roster, &krate.name),
-            },
-        ));
+        let closure = roster_closure(&roster, &krate.name);
+        let members = if crate::crypto_policy::admitted(&krate.name) {
+            LockMembers::Crypto { own: krate.name.clone() }
+        } else {
+            if closure.iter().any(|name| crate::crypto_policy::admitted(name)) {
+                return Err(format!("{} may not inherit the external crypto closure", krate.name));
+            }
+            LockMembers::Roster { own: krate.name.clone(), allowed: closure }
+        };
+        out.push((format!("{}/Cargo.lock", krate.name), members));
     }
     Ok(out)
 }
@@ -4497,7 +4531,7 @@ fn cargo_test_cmds_all(root: &Path) -> Result<Vec<String>, String> {
     let crates = discover_gate_crates(root)?;
     let mut out = vec!["cargo test --frozen --workspace".to_string()];
     for k in &crates {
-        let mut cmd = crate_test_command(k);
+        let mut cmd = crate_test_command(k)?;
         if let Some(args) = &k.test_args {
             cmd.push_str(" -- ");
             cmd.push_str(args);
@@ -4509,8 +4543,8 @@ fn cargo_test_cmds_all(root: &Path) -> Result<Vec<String>, String> {
     }
     out.push("cargo clippy --frozen --workspace".to_string());
     for k in &crates {
-        let mut cmd = format!("cargo clippy --frozen --manifest-path {}/Cargo.toml", k.name);
-        if k.clippy_all_targets {
+        let mut cmd = crate_cargo_command(k, "clippy")?;
+        if k.clippy_all_targets && !crate::crypto_policy::admitted(&k.name) {
             cmd.push_str(" --all-targets");
         }
         out.push(cmd);
@@ -4529,15 +4563,15 @@ pub(crate) fn gate_cargo_cmds(root: &Path) -> Result<Vec<String>, String> {
     let crates = discover_gate_crates(root)?;
     let mut out = vec!["cargo clippy --frozen --workspace".to_string()];
     for k in &crates {
-        let mut cmd = format!("cargo clippy --frozen --manifest-path {}/Cargo.toml", k.name);
-        if k.clippy_all_targets {
+        let mut cmd = crate_cargo_command(k, "clippy")?;
+        if k.clippy_all_targets && !crate::crypto_policy::admitted(&k.name) {
             cmd.push_str(" --all-targets");
         }
         out.push(cmd);
     }
     out.push("cargo test --frozen --workspace".to_string());
     for k in &crates {
-        let mut cmd = crate_test_command(k);
+        let mut cmd = crate_test_command(k)?;
         if let Some(args) = &k.gate_test_args {
             cmd.push(' ');
             cmd.push_str(args);
@@ -4550,12 +4584,22 @@ pub(crate) fn gate_cargo_cmds(root: &Path) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn crate_test_command(krate: &GateCrate) -> String {
-    let mut cmd = format!("cargo test --frozen --manifest-path {}/Cargo.toml", krate.name);
+fn crate_cargo_command(krate: &GateCrate, action: &str) -> Result<String, String> {
+    if crate::crypto_policy::admitted(&krate.name) {
+        let binary = std::env::current_exe().map_err(|e| format!("gate executable: {e}"))?;
+        let quoted = shell_quote(&binary).ok_or("gate executable path cannot be shell-quoted")?;
+        Ok(format!("{quoted} gate-crates crypto-cargo {action} --manifest-path {}/Cargo.toml", krate.name))
+    } else {
+        Ok(format!("cargo {action} --frozen --manifest-path {}/Cargo.toml", krate.name))
+    }
+}
+
+fn crate_test_command(krate: &GateCrate) -> Result<String, String> {
+    let mut cmd = crate_cargo_command(krate, "test")?;
     if krate.trusted_test_root {
         cmd.push_str(" --config 'env.TD_TEST_TRUSTED_ROOT.value=\"1\"' --config 'env.TD_TEST_TRUSTED_ROOT.force=true'");
     }
-    cmd
+    Ok(cmd)
 }
 
 fn native_compositor_command(krate: &GateCrate) -> Result<String, String> {
@@ -4629,6 +4673,12 @@ fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
                     return 1;
                 }
             };
+            if cmds.iter().any(|cmd| cmd.contains(" gate-crates crypto-cargo ")) {
+                if let Err(e) = crate::check_loop::warm_crypto_sources(root) {
+                    eprintln!("affected-checks: {e}");
+                    return 1;
+                }
+            }
             run_cargo_groups(root, &cmds)
         }
         "net-test" => run_shell(
@@ -4888,6 +4938,11 @@ pub(crate) fn run_selected(root: &Path, args: &[String], defer_checks: bool) -> 
 
 #[cfg(test)]
 mod tests {
+    fn cargo_driver(command: &str, driver: &str) -> bool {
+        command.starts_with(driver) || driver.trim().strip_prefix("cargo ")
+            .is_some_and(|verb| command.contains(&format!(" gate-crates crypto-cargo {verb} ")))
+    }
+
     use super::*;
 
     #[test]
@@ -7201,6 +7256,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn both_crypto_legs_require_the_offline_wrapper() {
+        let root = repo_root();
+        for commands in [cargo_test_cmds_all(&root).unwrap(), gate_cargo_cmds(&root).unwrap()] {
+            for name in ["td-crypto", "td-mta"] {
+                for action in ["test", "clippy"] {
+                    let selected: Vec<_> = commands.iter().filter(|cmd|
+                        cmd_manifest_crate(cmd) == Some(name) && cargo_driver(cmd, &format!("cargo {action}"))
+                    ).collect();
+                    assert_eq!(selected.len(), 1);
+                    assert!(selected.first().unwrap().contains(&format!(" gate-crates crypto-cargo {action} ")));
+                }
+            }
+        }
+    }
+
     /// Every roster crate must narrow to commands of both KINDS for itself.
     /// Without this the filter could yield a list without one, and a
     /// preflight over it would exit 0 having tested that crate not at all;
@@ -7221,7 +7292,7 @@ mod tests {
                 .expect("narrowing");
             for want in ["cargo test ", "cargo clippy "] {
                 assert!(
-                    mine.iter().any(|c| c.starts_with(want)
+                    mine.iter().any(|c| cargo_driver(c, want)
                         && cmd_manifest_crate(c) == Some(krate.name.as_str())),
                     "{} has no `{want}` command: {mine:?}",
                     krate.name
@@ -7731,7 +7802,7 @@ mod tests {
             for driver in ["cargo clippy", "cargo test"] {
                 assert!(
                     cmds.iter()
-                        .any(|c| c.starts_with(driver) && c.contains(&manifest)),
+                        .any(|c| cargo_driver(c, driver) && c.contains(&manifest)),
                     "gate 325 never runs `{driver}` for {krate}"
                 );
             }
@@ -7759,13 +7830,13 @@ mod tests {
             let clippy = cmds
                 .iter()
                 .find(|c| {
-                    c.starts_with("cargo clippy")
+                    cargo_driver(c, "cargo clippy")
                         && c.contains(&format!("--manifest-path {}/Cargo.toml", k.name))
                 })
                 .map(String::as_str)
                 .unwrap_or_default();
             assert_eq!(
-                clippy.ends_with(" --all-targets"),
+                clippy.ends_with(" --all-targets") || clippy.contains(" gate-crates crypto-cargo clippy "),
                 k.clippy_all_targets,
                 "{}: --all-targets does not follow its declaration: `{clippy}`",
                 k.name
@@ -7773,7 +7844,7 @@ mod tests {
             let test = cmds
                 .iter()
                 .find(|c| {
-                    c.starts_with("cargo test")
+                    cargo_driver(c, "cargo test")
                         && c.contains(&format!("--manifest-path {}/Cargo.toml", k.name))
                 })
                 .map(String::as_str)
@@ -7808,7 +7879,7 @@ mod tests {
         let host = cargo_test_cmds_all(&root).expect("the preflight list derives");
         let line = |cmds: &[String], krate: &str| {
             cmds.iter()
-                .find(|c| c.starts_with("cargo test") && c.contains(krate))
+                .find(|c| cargo_driver(c, "cargo test") && c.contains(krate))
                 .cloned()
                 .unwrap_or_default()
         };
@@ -8297,6 +8368,32 @@ mod tests {
         assert!(got.is_err(), "a manifest with no members must red: {got:?}");
     }
 
+    #[test]
+    fn other_roster_consumers_cannot_inherit_crypto() {
+        let source = repo_root();
+        if !source.join("td-crypto/Cargo.toml").exists() { return; }
+        let temp = std::env::temp_dir().join(format!("td-crypto-consumers-{}", std::process::id()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        std::fs::create_dir(&temp).unwrap();
+        let _cleanup = Cleanup(temp.clone());
+        std::fs::create_dir(temp.join(".cargo")).unwrap();
+        std::fs::copy(source.join(".cargo/config.toml"), temp.join(".cargo/config.toml")).unwrap();
+        std::fs::write(temp.join("Cargo.toml"), "[workspace]\nmembers = [\"builder\"]\n").unwrap();
+        for name in ["td-crypto", "td-mta"] {
+            std::fs::create_dir(temp.join(name)).unwrap();
+            std::fs::copy(source.join(name).join("Cargo.toml"), temp.join(name).join("Cargo.toml")).unwrap();
+        }
+        assert!(dependency_free_locks(&temp).is_ok());
+        for (name, dep) in [("td-reader", "td-crypto"), ("td-reader", "td-mta"), ("td-indirect", "td-reader")] {
+            std::fs::create_dir_all(temp.join(name)).unwrap();
+            std::fs::write(temp.join(name).join("Cargo.toml"), format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n[dependencies]\n{dep} = {{ path = \"../{dep}\" }}\n"
+            )).unwrap();
+            assert!(dependency_free_locks(&temp).is_err_and(|e| e.contains("crypto")));
+        }
+    }
+
     /// Every `td-*` crate in the tree reaches BOTH rosters.
     ///
     /// Both are derived from one scan, so this cannot fail today — which is the
@@ -8328,7 +8425,7 @@ mod tests {
             for driver in ["cargo test", "cargo clippy"] {
                 assert!(
                     cmds.iter()
-                        .any(|c| c.starts_with(driver) && c.contains(&manifest)),
+                        .any(|c| cargo_driver(c, driver) && c.contains(&manifest)),
                     "{name} has no `{driver}` command — its lints and tests never run"
                 );
             }
@@ -8641,6 +8738,19 @@ mod tests {
                 std::fs::remove_file(root.join(name)).unwrap();
             }
         }
+        for config in [
+            "[env]\nAWS_LC_SYS_NO_ASM = \"1\"\n",
+            "[env.AWS_LC_SYS_SYSTEM_DIR]\nvalue = \"/system\"\nforce = true\n",
+            "env = { AWS_LC_SYS_CMAKE_BUILDER = \"1\" }\n",
+            "[env.\"AWS_LC_SYS_NO_\\u0041SM\"]\nvalue = \"1\"\n",
+            "env = { \"AW\\u0053_LC_SYS_NO_ASM\" = \"1\" }\n",
+        ] {
+            for file in [".cargo/config.toml", ".cargo/config"] {
+                write(file, config);
+                assert!(dependency_free_locks(&root).is_err(), "{config:?}");
+                std::fs::remove_file(root.join(file)).unwrap();
+            }
+        }
         // Codex's escape: `"paths"` is `paths` once TOML decodes it.
         write(".cargo/config.toml", "\"pa\\u0074hs\" = [\"../vendor/td-bb\"]\n");
         assert!(
@@ -8741,7 +8851,7 @@ mod tests {
                 assert!(
                     cmds
                         .iter()
-                        .any(|cmd| cmd.starts_with(driver) && cmd.contains(&manifest)),
+                        .any(|cmd| cargo_driver(cmd, driver) && cmd.contains(&manifest)),
                     "{krate} is in the lock roster but no `{driver}` in the \
                      command list compiles it — its lints and tests never run \
                      (AGENTS.md, 'Rust code')"

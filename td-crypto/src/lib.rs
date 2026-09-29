@@ -64,13 +64,31 @@ pub trait Crypto: Send + Sync {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn contracts_have_no_dependency_tables() {
-        // The shared roster gate rejects alternate TOML spellings; this also
-        // refuses local dependencies until backend admission changes the rule.
-        for line in include_str!("../Cargo.toml").lines().map(str::trim) {
-            if line.starts_with('[') {
-                assert!(!line.contains("dependencies"));
-            }
-        }
+    fn explicit_aws_provider_and_roots_construct_without_global_default(
+    ) -> Result<(), rustls::Error> {
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let roots =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        assert!(!roots.is_empty());
+        let _config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_native_backend_sha256_smoke() {
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, b"abc");
+        assert_eq!(
+            digest.as_ref(),
+            &[
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad,
+            ]
+        );
     }
 }

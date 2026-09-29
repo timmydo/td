@@ -35,7 +35,8 @@
 //! `the_workspace_lock_count_follows_the_members_list`. The `source = ` half
 //! went the other way: the old script applied it to the root lock alone, and
 //! it now runs over every lock in the roster. Every
-//! roster crate keeps a lock listing only itself and the sibling roster
+//! roster crate, except the named td-crypto/td-mta admission, keeps a lock
+//! listing only itself and the sibling roster
 //! crates its manifest depends on by path, checked over the derived list by
 //! `gate-crates locks`. Most are TARGET-built programs — the
 //! shipped userland, from the boot shim and installer up to the compositor and
@@ -43,7 +44,7 @@
 //! each crate's own manifest says what it is. (This paragraph used to
 //! enumerate their roles, and had already drifted past the three crates whose
 //! absence this gate was fixed for.) They are
-//! not engine code, but are pure std and compile offline, so
+//! not engine code, but compile offline under their named lock policy, so
 //! they lint/test here with the engine crates. A crate that declares
 //! `clippy-all-targets` is linted
 //! `--all-targets`, so its tests are held to the coding rules too — each takes
@@ -84,7 +85,9 @@
 //! clippy-driver, the cargo bin dir carries cargo, and the cc bin dir (gcc-toolchain, rust's
 //! default linker driver) is prepended to PATH — all resolved guix-free by `provision-{rust,cc}`
 //! (a PROVIDED TD_RUST_HOME/TD_CC_HOME, or rustup/system cc). `cargo clippy/test --frozen`
-//! (= --locked --offline) on DEPENDENCY-FREE crates touches no network.
+//! (= --locked --offline) touches no network. td-crypto and td-mta use the
+//! shared crypto-cargo wrapper with checksum-verified sources prepared before
+//! entering the sandbox; no Cargo registry fetch is available here.
 //! Scratch CARGO_HOME/CARGO_TARGET_DIR live in .cargo-test-scratch/ at the repo ROOT — OUTSIDE
 //! the crate dirs, so they cannot perturb the td-builder/td-recipe package source hashes.
 //! `set -e` inside the shell + pipefail keep a FAILED clippy or test from being greened by the
@@ -140,7 +143,7 @@ $cmds" 2>&1 | tee "$log"; \
 	"$td" text cargo-test-ok "$log" || \
 	  { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }; \
 rm -rf "$scratch"; \
-echo "PASS: cargo-test — the engine workspace (builder + recipes + engine) and $names are dependency-free and lint clean; their unit tests pass (guix-free toolchain)."
+echo "PASS: cargo-test — the engine workspace (builder + recipes + engine) and $names satisfy their named dependency policies and lint clean; their unit tests pass (guix-free toolchain)."
 
 "##,
     }

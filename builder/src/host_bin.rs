@@ -83,11 +83,15 @@ impl NativeVendor {
 }
 
 fn extract_native_vendor(root: &Path) -> Result<NativeVendor, String> {
+    extract_vendor(root, "td-net", "net/Cargo.lock")
+}
+
+fn extract_vendor(root: &Path, destination: &str, lock_path: &str) -> Result<NativeVendor, String> {
     use std::os::unix::fs::DirBuilderExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    if !vendor_is_complete(root, "td-net", Some("net/Cargo.lock")) {
-        return Err("native td-net vendor is incomplete or stale; prepare it with the installed td-feed first".into());
+    if !vendor_is_complete(root, destination, Some(lock_path)) {
+        return Err(format!("{destination} vendor is incomplete or stale; prepare its locked sources first"));
     }
     let scratch = root.join(".td-build-cache").join(format!(
         "native-vendor-{}-{}",
@@ -99,13 +103,13 @@ fn extract_native_vendor(root: &Path) -> Result<NativeVendor, String> {
         .create(&scratch)
         .map_err(|e| format!("create native vendor {}: {e}", scratch.display()))?;
     let prepared = NativeVendor(scratch);
-    let lock = std::fs::read_to_string(root.join("net/Cargo.lock"))
-        .map_err(|e| format!("read native td-net Cargo.lock: {e}"))?;
+    let lock = std::fs::read_to_string(root.join(lock_path))
+        .map_err(|e| format!("read {lock_path}: {e}"))?;
     crate::build::validate_cargo_lock_sources(&lock, &[])?;
     let archives = prepared.0.join("archives");
     // td-feed publishes archives. Verify private copies before extraction.
     crate::stage_verified_vendor(
-        &root.join(".td-build-cache/crate-vendor/td-net/vendor"),
+        &root.join(".td-build-cache/crate-vendor").join(destination).join("vendor"),
         &lock,
         &archives,
         false,
@@ -159,8 +163,15 @@ fn extract_native_vendor(root: &Path) -> Result<NativeVendor, String> {
 /// Reconstruct from lock-verified archives, then compare the complete cached
 /// tree before reuse. Same-UID concurrent mutation is not an isolation boundary.
 fn prepare_native_vendor(root: &Path) -> Result<PathBuf, String> {
+    prepare_vendor(root, extract_native_vendor(root)?)
+}
+
+pub(crate) fn prepare_crypto_vendor(root: &Path) -> Result<PathBuf, String> {
+    prepare_vendor(root, extract_vendor(root, "td-crypto", "td-crypto/Cargo.lock")?)
+}
+
+fn prepare_vendor(root: &Path, prepared: NativeVendor) -> Result<PathBuf, String> {
     use std::os::unix::fs::DirBuilderExt;
-    let prepared = extract_native_vendor(root)?;
     let sources = prepared.directory();
     let digest = crate::sandbox::nar_hash_of(&sources)
         .map_err(|e| format!("hash verified native Cargo sources: {e}"))?;
@@ -489,6 +500,26 @@ mod native_vendor_tests {
         let lock_digest = crate::sha256::sha256_file(&fixture.0.join("net/Cargo.lock")).unwrap();
         fs::write(vendor.join(".warm-complete"), format!("{lock_digest}\n1\n")).unwrap();
         fixture
+    }
+
+    #[test]
+    fn crypto_vendor_uses_its_own_lock_and_rejects_tampering() {
+        let fixture = fixture("crypto");
+        assert!(prepare_crypto_vendor(&fixture.0).is_err());
+        fs::rename(fixture.0.join("net"), fixture.0.join("td-crypto")).unwrap();
+        fs::rename(fixture.0.join(".td-build-cache/crate-vendor/td-net"),
+            fixture.0.join(".td-build-cache/crate-vendor/td-crypto")).unwrap();
+        let prepared = prepare_crypto_vendor(&fixture.0).unwrap();
+        assert!(prepared.join("tinydep-0.1.0/src/lib.rs").is_file());
+        assert!(prepare_native_vendor(&fixture.0).is_err());
+        fs::write(prepared.join("tinydep-0.1.0/src/lib.rs"), "changed").unwrap();
+        assert!(prepare_crypto_vendor(&fixture.0).is_err());
+        fs::remove_dir_all(prepared).unwrap();
+        let archive = fixture.0.join(".td-build-cache/crate-vendor/td-crypto/vendor/tinydep-0.1.0.crate");
+        fs::write(&archive, "corrupt").unwrap();
+        assert!(prepare_crypto_vendor(&fixture.0).is_err());
+        fs::remove_file(archive).unwrap();
+        assert!(prepare_crypto_vendor(&fixture.0).is_err());
     }
 
     #[test]

@@ -185,7 +185,7 @@ contract. Complex codecs belong to their following task, not this checkpoint.
 
 **Depends on:** M02. **Own:** td-crypto, td-mta's direct dependency and error
 adaptation, eventual binary/build wiring and explicit dependency gate changes.
-The following increments land separately; M03 is complete only after M03b.
+The following increments land separately; M03 is complete only after M03b2.
 
 ### M03a — Shared contracts and direct dependency
 
@@ -204,20 +204,38 @@ Dependency confinement rejects another direct mail dependency. The gate
 discovers both crates and the dependent mail tests when td-crypto changes.
 No test-only fake is described as a cryptographic implementation.
 
-### M03b — Private backend, exact closure and portable build
+### M03b1 — Private backend admission and offline gates
 
 Add Rustls, aws-lc-rs and roots only inside td-crypto. Keep every public type,
 error and configuration opaque to upstream types. Pin a minimal compatible
-closure with one AWS-LC version pair and explicit features. Record licenses,
-all native compiler/assembler/generator inputs and why each dependency is
-present. td-mta's lock necessarily includes this transitive closure, while its
+closure with one AWS-LC version pair and explicit features. Record licenses
+and why each dependency is present. M03b2 records all portable native
+compiler/assembler/generator inputs. td-mta's lock necessarily includes this transitive closure, while its
 manifest still names only td-crypto. Amend AGENTS.md and the common host/gate
 checks atomically to admit these exact named closures and preserve the std-only
 rules for other crates. Do not exclude either crate from tests or Clippy.
 
-Implement the source/cc build controls and decoy checks in
-`td-crypto/DESIGN.md`. Guard both resolved locks and actual target feature/build
-graphs, including inactive entries and duplicate versioned native libraries.
+Implement the source/cc build controls in `td-crypto/DESIGN.md`; M03b2
+supplies their decoy checks. Pin the root Cargo config, reject ancestor
+configs and automatic build.rs inputs. Guard the locks and the actual host
+feature/build graph, including inactive entries and duplicate native versions.
+M03b2 applies this policy to the portable target build as well.
+
+**Acceptance:** both crates pass the same derived host/sandbox test and Clippy
+commands using only verified vendored sources. Mutations to manifest, lock,
+features or other roster consumers fail. Explicit-provider construction and a
+native SHA-256 known answer establish that the selected backend builds; they
+are not full algorithm, TLS or resource qualification. Record inactive locked
+packages separately from the active graph.
+
+### M03b2 — Portable artifact and backend boundary qualification
+
+**Depends on:** M03b1. Complete public-API confinement and the source/cc decoy
+checks above, then qualify the portable toolchain and TLS smoke fixture.
+Clear ambient native flags/tool search paths. The host admission wrapper is
+initially x86-64 GNU/musl only; qualify any additional build host explicitly.
+Its exact manifests declare no extra test arguments or trusted-test-root;
+revisit wrapper dispatch if later manifest pins add those fields.
 
 Provide the installed binary name from td-mta itself; no separate runtime
 package. Backend construction and smoke fixtures belong inside td-crypto;

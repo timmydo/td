@@ -112,8 +112,8 @@ local facade. There is no separate runtime package or td-net helper executable.
 
 The M03a boundary moves the existing Crypto/Entropy/Digest traits and fixed
 crypto errors into td-crypto. Mail ports re-export those traits and translate
-shared errors; no crypto implementation or TLS service is supplied yet. M03b
-adds the approved Rustls/AWS-LC closure inside td-crypto only. No Rustls/AWS-LC
+shared errors; no crypto implementation or TLS service is supplied yet. M03b1
+admits the approved Rustls/AWS-LC closure inside td-crypto only. No Rustls/AWS-LC
 public types, re-exports or configuration escape hatches cross its facade.
 Mail transport adapters consume opaque td-crypto configurations/session state.
 The service's transitive lock/executable still includes the backend dependencies;
@@ -127,8 +127,9 @@ data dependency, not permission to import a Unicode or mail parsing library.
 
 The backend admission and gate contract lives in td-crypto/DESIGN.md.
 Both packages stay in the test roster.
-The user approved Rustls with AWS-LC; M03b still records exact transitive pins,
-features, licenses, roots, native inputs and rationale. No async runtime, web
+The user approved Rustls with AWS-LC; M03b1 records exact transitive pins,
+features, licenses, roots and rationale; M03b2 pins the portable native inputs.
+No async runtime, web
 framework, database, mail parser, serialization or ACME framework rides along.
 The backend increment demonstrates static musl linking and bounded TLS behavior
 before consumers depend on it; exact versions belong in the lock/review.
@@ -137,7 +138,7 @@ The portable musl artifact has a separate, host-only build manifest: pin Rust
 and its target standard library, the musl C compiler/linker and sysroot needed
 by the crypto provider, and their source/artifact checksums and provenance.
 Provision them before offline builds; ambient host tools cannot silently fill
-missing inputs. M03b owns these exact pins and a clean build fixture. This
+missing inputs. M03b2 owns these exact pins and a clean build fixture. This
 portability workflow is outside td's source-built glibc target artifact graph;
 it must not import host-built outputs into that graph or claim its provenance.
 

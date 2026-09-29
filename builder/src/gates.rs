@@ -319,8 +319,15 @@ fn is_tier_keyword(goal: &str) -> bool {
     matches!(goal, "check" | "check-fast" | "check-engine")
 }
 
-/// Expand the requested goals into the set of node indices to run (make
-/// semantics kept: prerequisites always run, so take the transitive dep closure).
+/// Query the same tier/dependency selection the gate runner will execute.
+pub(crate) fn goals_include(goals: &[String], name: &str, disabled: &str) -> Result<bool, String> {
+    let set = load()?;
+    let selected = expand_goals(&set, goals)?;
+    let (selected, _) = filter_disabled(&set, &selected, disabled);
+    Ok(selected.into_iter().any(|i| set.gates.get(i).is_some_and(|g| g.name == name)))
+}
+
+/// Expand goals including their transitive prerequisites.
 fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, String> {
     let mut sel: HashSet<usize> = HashSet::new();
     let add_pool = |sel: &mut HashSet<usize>, p: Pool| sel.extend(set.members(p));
@@ -2135,6 +2142,16 @@ pub fn cli(args: &[String]) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn crypto_preparation_follows_gate_selection_and_disables() {
+        let goals = vec!["check-engine".to_string()];
+        assert!(super::goals_include(&goals, "cargo-test", "").unwrap());
+        assert!(!super::goals_include(&goals, "cargo-test", "cargo-test").unwrap());
+        assert!(!super::goals_include(&goals, "cargo-test", "pool:engine").unwrap());
+        assert!(!super::goals_include(&["check-fast".into()], "cargo-test", "").unwrap());
+        assert!(super::goals_include(&["cargo-test".into()], "cargo-test", "").unwrap());
+    }
+
     use super::*;
 
     #[test]

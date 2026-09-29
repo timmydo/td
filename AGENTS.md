@@ -300,8 +300,8 @@ message.
 - `builder`, `recipes`, and `engine` are one zero-external-dependency workspace.
   Target crates and the host tools `td-review` and `td-vm` have standalone
   locks that list their own package and, at most, other `td-*` roster crates
-  they depend on by path: no registry or git crate, and no path outside the
-  roster, so engine sources reach a target crate only as shared source. A
+  they depend on by path (except the named crypto admission below): no registry
+  or git crate, and no path outside the roster, so engine sources reach a target crate only as shared source. A
   sibling is declared only as `NAME = { path = "../NAME" }` on its own line
   under a bare `[dependencies]` or `[dev-dependencies]` header (`cargo add`
   also writes a `version`; remove it). The manifest is where the guard
@@ -311,9 +311,14 @@ message.
   carries no `[target]`, `[patch]` or `[replace]` table; a roster crate
   carries no `.cargo` directory of its own, the repository's `.cargo` config
   carries no `paths`, `[patch]`, `[source]` or `include` key, and a declared
-  `test-args` or `gate-test-args` carries no `--config` or `-Z`. The `td-net`
-  multicall is the sole external-dependency tier and may use only its existing
-  reviewed vendored closure. Any new dependency needs principle-2 sign-off.
+  `test-args` or `gate-test-args` carries no `--config` or `-Z`.
+  `td-net` retains its existing reviewed vendored closure. The other named
+  exception is `td-crypto`'s private Rustls/AWS-LC closure: exact manifests,
+  locks, root Cargo configuration and active features are pinned in `builder/src/crypto_policy.rs`.
+  `td-mta` depends directly only on local `td-crypto`; its lock includes that
+  closure. No other roster crate may depend on either, directly or transitively.
+  `td-crypto/DESIGN.md` owns offline preparation and backend confinement.
+  Any new dependency needs principle-2 sign-off.
 - A new standalone crate joins the gate by EXISTING: `builder/src/affected.rs`
   discovers every `td-*/Cargo.toml` at the repo root and derives both the
   dependency-free lock roster and the cargo test/clippy commands from it. Commit

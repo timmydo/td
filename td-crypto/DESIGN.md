@@ -4,8 +4,10 @@
 
 This crate owns td's provider-independent cryptographic API. The compiling
 M03a surface contains `Error`, `Entropy`, `Digest` and `Crypto`, extracted
-from td-mta's existing ports. It currently implements no cryptographic
-algorithm, entropy source or TLS session and has no external dependencies.
+from td-mta's existing ports. M03b1 admits the private Rustls/AWS-LC
+dependencies and checks their offline host build. It currently implements no production cryptographic algorithm,
+entropy source or TLS session. The backend is exercised only by construction
+and SHA-256 smoke tests.
 Mocks and interface tests are not cryptographic conformance evidence.
 
 The target dependency graph is:
@@ -24,11 +26,32 @@ and other std-only roster crates cannot inherit its external closure.
 `td-crypto` does not depend on td-mta, its identifiers, configuration grammar,
 mail protocols, storage, logging, workers or service administration. Its own
 code uses std and follows the panic/indexing and unsafe contracts. The initial
-backend uses the approved Rustls/AWS-LC category. Before adding that closure,
-M03b must atomically amend AGENTS.md and the shared host/sandbox gate logic:
-permit the named crypto crate's pinned closure and the mail crate's exact
-transitive closure, preserving restrictions on every other roster crate.
-The present std-only locks need no exception.
+backend uses the approved Rustls/AWS-LC category. AGENTS.md and the shared
+host/sandbox gate admit only the exact named
+manifests, locks, root Cargo configuration and selected normal/build features in
+`builder/src/crypto_policy.rs`. Other roster closures remain std-only.
+Changing any pinned input requires an explicit policy update. Cargo config
+files above the repository and either crate's automatic build.rs are refused.
+`DEPENDENCIES.md` records the complete locked inventory and active subset.
+
+The host preflight prepares checksum-pinned crate archives through td-feed
+before compiling. The loop attempts preparation after provisioning its userland and before
+entering its networkless sandbox, respecting disabled gates. Preparation there
+is best-effort: a provisioned Cargo gate enforces presence, while a missing
+toolchain retains the existing Unprovisioned result. The host preflight fails
+if its required source preparation cannot complete. Both command lists use `td-builder gate-crates crypto-cargo` for
+these two crates. This wrapper verifies private archive copies, reconstructs
+and rehashes extracted sources before cache reuse, uses a fresh Cargo home,
+forces offline/frozen source replacement, and checks Cargo's selected graph.
+A missing, stale or tampered vendor fails; Cargo never fetches a substitute.
+Repository Cargo configuration cannot set AWS_LC_SYS controls, including
+through escaped keys or inline environment tables.
+The wrapper qualifies the provisioned host Rust/C toolchain. Host invocations
+share `.td-build-cache/crypto-target` unless CARGO_TARGET_DIR is supplied.
+Verified archive extraction and tree hashing repeat for each invocation; a
+persisted digest alone cannot authenticate changed source bytes. Its build is
+not the portable artifact: M03b2 must separately pin all portable native and
+Rust inputs and prove the clean musl build before M03 completes.
 
 ## Public API and failure rules
 
@@ -65,7 +88,8 @@ consumers are implemented; they follow the same ownership and redaction rules.
 
 ## Backend and TLS implementation
 
-M03b pins exact versions, features, licenses, native build inputs and roots.
+M03b1 pins versions, features, licenses and roots; M03b2 pins the portable
+native build inputs.
 Reuse compatible reviewed pins without inheriting td-net's dependency set.
 Rustls and aws-lc-rs are direct dependencies only of td-crypto, resolving one
 AWS-LC version pair for direct operations and TLS. No second backend enters the
@@ -80,7 +104,7 @@ AWS_LC_SYS_USE_SYSTEM=0 and AWS_LC_SYS_CMAKE_BUILDER=0. Reject incompatible
 overrides. Plant decoy OPENSSL_DIR/pkg-config/CMake inputs and prove none is
 consumed. Missing declared inputs fail.
 
-M03b's public-API confinement must cover nested exports, renamed aliases,
+M03b2's public-API confinement must cover nested exports, renamed aliases,
 public signatures and associated types, with mutations for each escape. The
 M03a doctests check only two named root exports and are insufficient evidence
 for that backend boundary.
