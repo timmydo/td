@@ -833,6 +833,11 @@ consent, source verification, scratch or payload-fit checks.
 The QEMU host requires exactly its available target in the initial report,
 with the same complete identity as inventory, and no candidates while a
 whole-disk claim or mounted system partition holds the target busy.
+For writable fixture targets at least 6 GiB in size, the guest also runs
+the shipped `candidate-record` command and compares its entire bounded
+binary reply with an independently framed sysfs observation. The host
+requires exactly one guest verification marker. This proves target
+execution, not a service channel or UI selection.
 Read-only and undersized targets must be absent even though the fixture
 still invokes the formatter to test its refusal. Source-corruption cases
 also collect this read-only report before source validation; candidates do

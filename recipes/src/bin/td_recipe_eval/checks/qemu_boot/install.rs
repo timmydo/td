@@ -1267,6 +1267,21 @@ fn validate_candidates(
     Ok(())
 }
 
+fn validate_candidate_record(console: &str, attempted: bool) -> Result<(), String> {
+    let count = console
+        .lines()
+        .filter(|line| line.trim_end() == protocol::CANDIDATE_RECORD_MARKER)
+        .count();
+    if count == usize::from(attempted) {
+        Ok(())
+    } else {
+        Err(format!(
+            "binary candidate record: expected {} guest verdict(s), saw {count}",
+            usize::from(attempted)
+        ))
+    }
+}
+
 fn validate_plan_observation(console: &str, expected: &InventoryExpected<'_>, partitioned: bool, attempted: bool, source_id: Option<&str>) -> Result<(), String> {
     if !attempted {
         if console.lines().any(|line| line.starts_with(protocol::PLAN_OBSERVATION_MARKER)
@@ -1373,15 +1388,26 @@ fn validate_live_reports(
             tail(&result.console, 80)
         )
     })?;
-    validate_inventories(&result.console, expected, partitioned)
-        .and_then(|()| validate_candidates(&result.console, expected, partitioned))
-        .and_then(|()| validate_plan_observation(&result.console, expected, partitioned, plan_expected, source_id))
+    validate_storage_reports(&result.console, expected, partitioned, plan_expected, source_id)
         .map_err(|error| {
             format!(
                 "installer storage reports: {error}\n{}",
                 tail(&result.console, 80)
             )
         })
+}
+
+fn validate_storage_reports(
+    console: &str,
+    expected: &InventoryExpected<'_>,
+    partitioned: bool,
+    plan_expected: bool,
+    source_id: Option<&str>,
+) -> Result<(), String> {
+    validate_inventories(console, expected, partitioned)
+        .and_then(|()| validate_candidates(console, expected, partitioned))
+        .and_then(|()| validate_candidate_record(console, plan_expected))
+        .and_then(|()| validate_plan_observation(console, expected, partitioned, plan_expected, source_id))
 }
 
 fn refusal_plan(image: &Path) -> BootPlan<'_> {
@@ -3088,9 +3114,20 @@ mod tests {
         assert!(!candidate_geometry(MINIMUM_TARGET_BYTES, 1024));
     }
 
+    #[test]
+    fn binary_candidate_record_requires_exactly_one_guest_verdict_when_attempted() {
+        let marker = format!("{}\n", protocol::CANDIDATE_RECORD_MARKER);
+        assert!(validate_candidate_record(&marker, true).is_ok());
+        assert!(validate_candidate_record("", false).is_ok());
+        assert!(validate_candidate_record("", true).is_err());
+        assert!(validate_candidate_record(&marker, false).is_err());
+        assert!(validate_candidate_record(&format!("{marker}{marker}"), true).is_err());
+    }
+
     fn candidate_console(available: bool, partitioned: bool, plan_expected: bool) -> String {
         let mut console = inventory_console(INVENTORY_FIXTURE, None);
         if plan_expected {
+            console.push_str(&format!("{}\n", protocol::CANDIDATE_RECORD_MARKER));
             let report = "{\"version\":1,\"scope\":\"plan-observation-only\",\"destination\":\"vda\"}";
             console.push_str(&format!("{} {} {report}\n", protocol::PLAN_OBSERVATION_MARKER, report.len()));
             console.push_str(&format!("{}\n", protocol::PLAN_STALE_MARKER));
@@ -3218,6 +3255,17 @@ mod tests {
         expected.target_bytes = 128 * 1024 * 1024;
         validate_candidates(&candidate_console(false, false, false), &expected, false).unwrap();
         assert!(validate_candidates(&candidate_console(true, false, true), &expected, false).is_err());
+    }
+
+    #[test]
+    fn storage_report_chain_requires_the_binary_guest_verdict() {
+        let expected = inventory_expectation();
+        let source_id = "02".repeat(32);
+        let valid = candidate_console(true, false, true);
+        assert!(validate_storage_reports(&valid, &expected, false, true, Some(&source_id)).is_ok());
+        let marker = format!("{}\n", protocol::CANDIDATE_RECORD_MARKER);
+        assert!(validate_storage_reports(&valid.replace(&marker, ""), &expected, false, true, Some(&source_id)).is_err());
+        assert!(validate_storage_reports(&format!("{valid}{marker}"), &expected, false, true, Some(&source_id)).is_err());
     }
 
     #[test]

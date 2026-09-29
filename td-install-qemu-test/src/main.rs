@@ -334,6 +334,10 @@ fn diagnostic_line(bytes: Vec<u8>, limit: usize, label: &str) -> Result<String, 
 }
 
 fn command_line(args: &[&str], limit: usize, label: &str) -> Result<String, String> {
+    diagnostic_line(command_bytes(args, limit, label)?, limit, label)
+}
+
+fn command_bytes(args: &[&str], limit: usize, label: &str) -> Result<Vec<u8>, String> {
     let mut child = Command::new("/bin/td-install")
         .args(args)
         .stdout(Stdio::piped())
@@ -349,7 +353,10 @@ fn command_line(args: &[&str], limit: usize, label: &str) -> Result<String, Stri
             .take(limit as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| format!("read {label}: {error}"))?;
-        diagnostic_line(bytes, limit, label)
+        if bytes.len() > limit {
+            return Err(format!("{label} exceeds {limit} bytes"));
+        }
+        Ok(bytes)
     })();
     if captured.is_err() {
         let _ = child.kill();
@@ -357,12 +364,12 @@ fn command_line(args: &[&str], limit: usize, label: &str) -> Result<String, Stri
     let waited = child
         .wait()
         .map_err(|error| format!("reap {label}: {error}"));
-    let json = captured?;
+    let bytes = captured?;
     let status = waited?;
     if !status.success() {
         return Err(format!("{label} failed: {status}"));
     }
-    Ok(json)
+    Ok(bytes)
 }
 
 fn diagnostic(marker: &str, args: &[&str], limit: usize, label: &str) -> Result<(), String> {
@@ -375,6 +382,20 @@ fn diagnostic(marker: &str, args: &[&str], limit: usize, label: &str) -> Result<
 
 fn candidates(marker: &str) -> Result<(), String> {
     diagnostic(marker, &["destinations"], MAX_INVENTORY_BYTES, "destination candidates")
+}
+
+fn check_candidate_record(device: &str) -> Result<(), String> {
+    let mut expected = b"TDCAND01\x01".to_vec();
+    expected.extend_from_slice(&observed_destination(device)?);
+    let observed = command_bytes(
+        &["candidate-record"],
+        expected.len(),
+        "binary destination candidates",
+    )?;
+    if observed != expected {
+        return Err("binary candidate record differs from the independent target observation".into());
+    }
+    report(std::io::stdout(), format_args!("{CANDIDATE_RECORD_MARKER}"))
 }
 
 fn attribute(path: &Path, optional: bool) -> Result<Option<String>, String> {
@@ -420,9 +441,9 @@ fn put_plan_optional(bytes: &mut Vec<u8>, value: Option<String>) -> Result<(), S
     }
 }
 
-/// Independently frame the QEMU device observations, so the guest checks the
-/// shipped decoder against bytes that its own codec did not produce.
-fn observed_plan(device: &str, deployment: [u8; 32]) -> Result<Vec<u8>, String> {
+/// Independently frame sysfs observations for the encoder and plan decoder
+/// oracles, without using either shipped codec as the expected value.
+fn observed_destination(device: &str) -> Result<Vec<u8>, String> {
     let name = device.strip_prefix("/dev/").ok_or("invalid target path")?;
     let base = Path::new("/sys/class/block").join(name);
     let number = required_attribute(&base.join("dev"))?;
@@ -448,14 +469,7 @@ fn observed_plan(device: &str, deployment: [u8; 32]) -> Result<Vec<u8>, String> 
         Some(value) => Some(value),
         None => attribute(&base.join("device/wwid"), true)?,
     };
-    let mut bytes = Vec::with_capacity(256);
-    bytes.extend_from_slice(b"TDPLAN01");
-    bytes.extend_from_slice(&[1; 32]);
-    bytes.extend_from_slice(&deployment);
-    let mut uuid = [0; 16];
-    *uuid.get_mut(6).ok_or("fixture UUID has no version byte")? = 0x40;
-    *uuid.get_mut(8).ok_or("fixture UUID has no variant byte")? = 0x80;
-    bytes.extend_from_slice(&uuid);
+    let mut bytes = Vec::with_capacity(128);
     bytes.extend_from_slice(&major.to_be_bytes());
     bytes.extend_from_slice(&minor.to_be_bytes());
     bytes.extend_from_slice(&sequence.to_be_bytes());
@@ -466,6 +480,22 @@ fn observed_plan(device: &str, deployment: [u8; 32]) -> Result<Vec<u8>, String> 
     for label in [model, serial, wwid] {
         put_plan_optional(&mut bytes, label)?;
     }
+    Ok(bytes)
+}
+
+/// Independently frame the QEMU device observations, so the guest checks the
+/// shipped decoder against bytes that its own codec did not produce.
+fn observed_plan(device: &str, deployment: [u8; 32]) -> Result<Vec<u8>, String> {
+    let destination = observed_destination(device)?;
+    let mut bytes = Vec::with_capacity(256);
+    bytes.extend_from_slice(b"TDPLAN01");
+    bytes.extend_from_slice(&[1; 32]);
+    bytes.extend_from_slice(&deployment);
+    let mut uuid = [0; 16];
+    *uuid.get_mut(6).ok_or("fixture UUID has no version byte")? = 0x40;
+    *uuid.get_mut(8).ok_or("fixture UUID has no variant byte")? = 0x80;
+    bytes.extend_from_slice(&uuid);
+    bytes.extend_from_slice(&destination);
     for choice in ["alice", "td-qemu-installed", "us", "Europe/London"] {
         put_plan_text(&mut bytes, choice)?;
     }
@@ -681,6 +711,7 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
     let sectors = required_attribute(&sysfs.join("size"))?.parse::<u64>()
         .map_err(|_| "invalid target sector count")?;
     if writable && sectors >= PLAN_PROBE_MINIMUM_SECTORS {
+        check_candidate_record(device)?;
         check_plan_observation(device)?;
     }
     // Validate the source before the first destructive command. Publication
