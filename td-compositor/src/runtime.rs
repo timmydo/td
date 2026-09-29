@@ -545,6 +545,13 @@ pub struct Runtime {
     /// for waiters that cannot take this runtime's lock.
     on_glass: u64,
     presented: Arc<PresentationClock>,
+    /// Frame callbacks held until the paint showing their commit is on
+    /// glass: per client, oldest first, each with that paint's epoch.
+    paced_callbacks: BTreeMap<u64, VecDeque<(u64, u32)>>,
+    /// Callbacks a configure worker has taken and not yet written, per
+    /// client. Still the client's to bound, and what a newer callback must
+    /// not overtake.
+    paced_in_transit: BTreeMap<u64, usize>,
     headless_output: Option<crate::headless::OutputStamp>,
     headless_action: u64,
     clipboard_control: Option<ClipboardControl>,
@@ -767,6 +774,8 @@ impl Runtime {
             paints: 0,
             on_glass: 0,
             presented: Arc::new(PresentationClock::default()),
+            paced_callbacks: BTreeMap::new(),
+            paced_in_transit: BTreeMap::new(),
             headless_output: None,
             headless_action: 0,
             clipboard_control: None,
@@ -1253,6 +1262,91 @@ impl Runtime {
         self.on_glass = self.on_glass.max(epoch);
         self.presented.publish(epoch);
         self.publish_presented_evidence();
+        self.wake_paced_callbacks();
+    }
+
+    /// Hold a commit's frame callbacks until the paint that shows the commit
+    /// is on glass, and answer those that may be sent now. That paint is
+    /// `current_epoch()`, so a client drawing on `done` draws once per frame
+    /// SHOWN rather than once per frame submitted, which under a flip in
+    /// flight is as often as it can commit. Where the paint is already on
+    /// glass -- under fbdev, unless a paint is owed -- they are answered at
+    /// once, unless older ones of the client's are still held or
+    /// being written by its worker, which keeps its callbacks in order.
+    pub fn pace_frame_callbacks(&mut self, client: u64, callbacks: Vec<u32>) -> Vec<u32> {
+        let due = self.current_epoch();
+        let holding = self.paced_callbacks.contains_key(&client)
+            || self.paced_in_transit.contains_key(&client);
+        if due <= self.on_glass && !holding {
+            return callbacks;
+        }
+        if !callbacks.is_empty() {
+            self.paced_callbacks
+                .entry(client)
+                .or_default()
+                .extend(callbacks.into_iter().map(|callback| (due, callback)));
+        }
+        if due <= self.on_glass {
+            self.wake_layout(client);
+        }
+        Vec::new()
+    }
+
+    /// The client's held callbacks whose paint is now on glass, taken for
+    /// its configure worker to send once this lock is released. They are in
+    /// transit until `presented_callbacks_sent`.
+    pub fn take_presented_callbacks(&mut self, client: u64) -> Vec<u32> {
+        let on_glass = self.on_glass;
+        let Some(held) = self.paced_callbacks.get_mut(&client) else {
+            return Vec::new();
+        };
+        let mut shown = Vec::new();
+        while let Some(&(due, callback)) = held.front() {
+            if due > on_glass {
+                break;
+            }
+            held.pop_front();
+            shown.push(callback);
+        }
+        if held.is_empty() {
+            self.paced_callbacks.remove(&client);
+        }
+        if !shown.is_empty() {
+            let transit = self.paced_in_transit.entry(client).or_default();
+            *transit = transit.saturating_add(shown.len());
+        }
+        shown
+    }
+
+    /// The worker wrote `count` callbacks it took.
+    pub fn presented_callbacks_sent(&mut self, client: u64, count: usize) {
+        if let Some(transit) = self.paced_in_transit.get_mut(&client) {
+            *transit = transit.saturating_sub(count);
+            if *transit == 0 {
+                self.paced_in_transit.remove(&client);
+            }
+        }
+    }
+
+    /// How many of the client's callbacks are held. They count against its
+    /// pending-callback bound, as they did before their commit.
+    pub fn paced_frame_callbacks(&self, client: u64) -> usize {
+        let held = self.paced_callbacks.get(&client).map_or(0, VecDeque::len);
+        let transit = self.paced_in_transit.get(&client).copied().unwrap_or(0);
+        held.saturating_add(transit)
+    }
+
+    /// Wake the configure worker of each client holding a callback whose
+    /// paint is on glass. The wake is coalesced, so a full channel means one
+    /// is already owed.
+    fn wake_paced_callbacks(&self) {
+        for (client, held) in &self.paced_callbacks {
+            if held.front().is_some_and(|(due, _)| *due <= self.on_glass) {
+                if let Some(wake) = self.subscribers.get(client) {
+                    let _ = wake.try_send(());
+                }
+            }
+        }
     }
 
     /// The latest requested paint's answer; pending or failed requests are None.
@@ -3617,6 +3711,8 @@ impl Runtime {
 
     pub fn unsubscribe(&mut self, id: u64) {
         self.subscribers.remove(&id);
+        self.paced_callbacks.remove(&id);
+        self.paced_in_transit.remove(&id);
     }
 
     #[cfg(test)]
@@ -6482,6 +6578,52 @@ mod tests {
         presentation.wait(Instant::now()).unwrap();
         let receipt = runtime.finish_attention_presentation(presentation).unwrap();
         assert_eq!(receipt.into_request(), request);
+    }
+
+    /// Frame callbacks are answered at once when their commit's paint is on
+    /// glass, held while it is in flight, and handed back in order once it
+    /// lands, with the client's configure worker woken to send them.
+    #[test]
+    fn frame_callbacks_wait_for_the_paint_that_shows_their_commit() {
+        let (chain, _log) = crate::drm::testing::chain(120, 80);
+        let mut runtime = Runtime::new(chain);
+        let (wake, _stop) = runtime.subscribe(3).unwrap().split();
+        assert!(wake.try_recv().is_ok(), "the subscription is primed");
+        assert_eq!(runtime.pace_frame_callbacks(3, vec![40]), [40]);
+
+        runtime
+            .pointer_frame(1, 10, 10, &[], PointerScroll::default())
+            .unwrap();
+        runtime.flush_paint().unwrap();
+        let shown = runtime.frame_in_flight().unwrap();
+        assert!(runtime.pace_frame_callbacks(3, vec![50, 51]).is_empty());
+        assert_eq!(runtime.paced_frame_callbacks(3), 2);
+        assert!(runtime.take_presented_callbacks(3).is_empty());
+        while wake.try_recv().is_ok() {}
+
+        runtime.output_event(OutputEvent::Presented(shown)).unwrap();
+        assert!(wake.try_recv().is_ok(), "the landing woke the worker");
+        // Due now, but behind held ones: queued, so they stay in order.
+        assert!(runtime.pace_frame_callbacks(3, vec![52]).is_empty());
+        assert_eq!(runtime.take_presented_callbacks(3), [50, 51, 52]);
+        // Taken but not yet written: still counted, and not overtaken.
+        assert_eq!(runtime.paced_frame_callbacks(3), 3);
+        assert!(runtime.pace_frame_callbacks(3, vec![54]).is_empty());
+        runtime.presented_callbacks_sent(3, 3);
+        assert_eq!(runtime.paced_frame_callbacks(3), 1);
+        assert_eq!(runtime.take_presented_callbacks(3), [54]);
+        runtime.presented_callbacks_sent(3, 1);
+        assert_eq!(runtime.paced_frame_callbacks(3), 0);
+
+        runtime
+            .pointer_frame(1, -10, -10, &[], PointerScroll::default())
+            .unwrap();
+        runtime.flush_paint().unwrap();
+        assert!(runtime.pace_frame_callbacks(3, vec![53]).is_empty());
+        assert_eq!(runtime.paced_frame_callbacks(3), 1);
+
+        runtime.unsubscribe(3);
+        assert_eq!(runtime.paced_frame_callbacks(3), 0);
     }
 
     /// The wait is made without the runtime lock: a completion delivered

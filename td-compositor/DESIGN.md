@@ -1303,10 +1303,11 @@ placement still belong to the root commit; state authored after a child's own
 cached commit remains the child's next uncommitted state. The applying parent
 and every synchronized descendant mutate under one runtime lock and incur one
 paint/focus/layout settlement, so neither input nor the framebuffer can
-observe a half-applied compound frame. Buffer releases, frame callbacks,
-configures, and popup dismissals generated along that path are queued until
-after the runtime lock is released; a client that stops reading therefore
-cannot freeze the compositor through this atomicity boundary. Parent
+observe a half-applied compound frame. Buffer releases, configures, and popup
+dismissals generated along that path are queued until after the runtime lock
+is released, and frame callbacks are answered after it too (paced, below); a
+client that stops reading therefore cannot freeze the compositor through this
+atomicity boundary. Parent
 destruction uses the same transaction for every direct child and the root.
 Every teardown releases a cached buffer and retires cached frame callback ids;
 an orphan becomes desynchronized and inert rather than retaining callbacks for
@@ -1321,7 +1322,7 @@ with the compound root. Per-client copied-surface byte and object ceilings cover
 mapped and hidden children. Each synchronized surface retains at most one
 pending buffer and input-region state; no more than 128 synchronized surfaces
 may hold an unapplied commit, and no more than 256 frame callbacks may be
-pending across live and cached state. Cached input-region snapshots
+pending across live, cached, and held-for-their-paint state. Cached input-region snapshots
 participate in the same aggregate operation quota as live and pending surface
 regions.
 
@@ -3758,7 +3759,9 @@ and subsurfaces rather than mistaking shared pool address space for memory
 copied into the compositor.
 One compound commit may defer at most 2,048 events and 256 KiB of encoded
 event bytes while the runtime lock is held, including at most 512 buffer
-releases and 256 frame-callback completions. The cap is checked before each
+releases. Frame-callback completions are not in that queue: they are paced
+(the page-flip section) under the 256 pending-callback bound. The cap is
+checked before each
 message joins the queue; overflow fails that client and the runtime lock is
 released before disconnection.
 Each XDG surface has at most 32 current-generation configures. During remap it
@@ -4025,9 +4028,39 @@ is rendered at it and copied into either.
   `drm_lastclose` restores the fbdev client once the last descriptor
   closes.
 
-The image still runs fbdev. Frame callbacks are still released at commit,
-which a synchronous paint paces and a queued one does not. The boot's probes
-also take the mastership the compositor would hold.
+Frame callbacks are PACED to presentation. A client drawing on
+`wl_callback.done` otherwise draws once per commit, and a queued paint no
+longer holds it to the screen's rate the way a synchronous one did:
+- A commit's callbacks leave the client's objects, keep their ids reserved
+  for delete_id, and at the end of the transaction are handed to the
+  runtime with the epoch of the paint that shows the commit
+  (`current_epoch()`).
+- Where that paint is already on glass, they are answered at once by the
+  client's own thread after the runtime lock, as before. Under fbdev that is
+  every commit except one made while a paint is owed -- between an input
+  batch's deferral and its flush, say -- whose callbacks the owed paint
+  answers. Otherwise the runtime holds them per client.
+- The paint landing wakes that client's configure worker, the per-client
+  thread the runtime already wakes for layout. It takes the due callbacks
+  under the lock and writes `done` and delete_id after it, following any
+  configure, so no client write is made under the runtime lock.
+- A client's callbacks stay in order. A newer one queues behind any held,
+  and behind any the worker has taken and not yet written: those are in
+  transit until it reports them sent.
+- Held and in-transit callbacks count against the client's 256 pending
+  callbacks, so a screen that never completes bounds them. A departing
+  client's are dropped with its layout subscription.
+- A commit that changes nothing on screen is answered as soon as the scene
+  it leaves is on glass, which with nothing in flight is at once. A client
+  re-committing identical frames on `done` is therefore not slowed by it,
+  under either backend; pacing it would need a timer, which td does not
+  keep. Under fbdev a paint owed by a failure holds such commits until the
+  next paint, since nothing retries it without the KMS watchdog.
+- The epoch is read after the transaction's lock is released, so a paint
+  queued in between can lengthen the wait by a frame, never shorten it.
+
+The image still runs fbdev: the boot's probes take the mastership the
+compositor would hold.
 
 A modeset unwinds in one order, for a narrower reason than it first appears.
 `SETCRTC` is the only one of the three steps the kernel flags `DRM_MASTER`
@@ -4249,8 +4282,10 @@ The landing must prove:
   accounting until the last buffer reference leaves, and a resize shares its
   monotonic declared charge with buffers made before it; pool count,
   declarations, scale-1 committed dimensions, synchronized commit caches,
-  pending callbacks, and compound buffer-release/callback queues stop at their
-  exact bounds; ordinary surface destruction retires a full callback ceiling
+  pending callbacks, and the compound buffer-release queue stop at their
+  exact bounds; a callback held for its paint counts against that bound and
+  keeps its id reserved until the configure worker answers it when the
+  paint lands; ordinary surface destruction retires a full callback ceiling
   and reaches a stalled outbound flush only after releasing the runtime lock;
 - the boot client discovers globals, completes both initial and tile-sized XDG
   configure/ack cycles, replaces its buffer at the requested size, receives

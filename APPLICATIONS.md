@@ -6532,10 +6532,10 @@ and decoration extents outside an XDG window geometry while keeping the bound
 derived from the actual output; the independent copied-surface byte ceiling
 still applies. Cursor surfaces keep their tighter 256-by-256 rule. At most 128
 synchronized subsurfaces may hold an unapplied
-commit and at most 256 frame callbacks may be pending. A compound scene
-transaction retains at most 2,048 events and 256 KiB of encoded event bytes,
-including no more than 512 buffer releases and 256 callback completions,
-before the runtime lock is released. Exact saturation and last-reference
+commit and at most 256 frame callbacks may be pending, including those held
+until their commit's paint is on glass. A compound scene transaction retains
+at most 2,048 events and 256 KiB of encoded event bytes, including no more
+than 512 buffer releases, before the runtime lock is released. Exact saturation and last-reference
 regressions pin every limit. Ordinary surface destruction also retires all of
 its pending callback objects in one bounded transaction; the regression holds
 client output stalled while proving that scene teardown released the runtime
@@ -8618,8 +8618,10 @@ descriptor and hands each one to the runtime, which holds one flip in flight
 and owes any paint requested meanwhile. A watchdog recovers a flip that never
 completes by modeset. Presentation-dependent evidence has moved to
 completion. Application readiness, cursor evidence and the trusted prompt's
-receipt each wait for the paint epoch that shows them to be on glass. The
-earlier blocker, that a completion could not be matched to
+receipt each wait for the paint epoch that shows them to be on glass, and
+frame callbacks are answered when their commit's paint lands, so a client
+that changes the screen is paced by it rather than by its own commits. The earlier blocker, that
+a completion could not be matched to
 its frame, was removed by the page-flip landing: both `Submission` and
 `OutputEvent` carry a `FrameId`, and it is the `u64` the flip ioctl already
 round-trips through the kernel. `td-compositor/DESIGN.md` carries the design.

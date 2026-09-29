@@ -194,7 +194,6 @@ const MAX_CACHED_SUBSURFACE_COMMITS: usize = 128;
 const MAX_PENDING_FRAME_CALLBACKS: usize = 256;
 const MAX_SURFACE_OUTPUT_MULTIPLIER: usize = 2;
 const MAX_DEFERRED_BUFFER_RELEASES: usize = 512;
-const MAX_DEFERRED_FRAME_CALLBACKS: usize = MAX_PENDING_FRAME_CALLBACKS;
 const MAX_DEFERRED_EVENTS: usize = 2_048;
 const MAX_DEFERRED_EVENT_BYTES: usize = 256 * 1024;
 const MAX_CLIENT_INPUT_REGION_OPERATIONS: usize = 4_096;
@@ -744,7 +743,6 @@ struct DeferredOutbound {
     messages: Vec<Vec<u8>>,
     bytes: usize,
     buffer_releases: usize,
-    frame_callbacks: usize,
 }
 
 impl Outbound {
@@ -892,6 +890,10 @@ struct Client {
     /// They leave only after the scene has settled, so a stalled client cannot
     /// hold the global runtime lock in a blocking socket write.
     deferred_outbound: Option<DeferredOutbound>,
+    /// Frame callbacks of the transaction in progress, removed from
+    /// `objects` and reserved for delete_id. The runtime decides at its end
+    /// whether each is answered now or held for its paint.
+    committed_callbacks: Vec<u32>,
     /// Pending stack per parent surface, bottom to top. `None` is the parent
     /// itself; child entries name wl_surface objects rather than protocol ids.
     subsurface_stacks: BTreeMap<u32, Vec<Option<u32>>>,
@@ -1046,20 +1048,35 @@ fn configure_worker(
     runtime: Arc<Mutex<Runtime>>,
     configurations: Arc<Mutex<BTreeMap<SurfaceKey, ConfigureRegistration>>>,
     outbound: Arc<Mutex<Outbound>>,
+    client: u64,
+    pending_deletes: PendingDeletes,
 ) -> Result<(), String> {
     while receiver.recv().is_ok() {
         if stop.is_stopped() {
             return Ok(());
         }
-        let snapshot = runtime
-            .lock()
-            .map_err(|_| "runtime lock poisoned".to_string())?
-            .layout_snapshot();
+        let (snapshot, shown) = {
+            let mut runtime = runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?;
+            (runtime.layout_snapshot(), runtime.take_presented_callbacks(client))
+        };
         let configurations = configurations
             .lock()
             .map_err(|_| "configure registration lock poisoned".to_string())?;
         for (key, registration) in configurations.iter() {
             update_configure(&outbound, registration, view_status(&snapshot, *key)?)?;
+        }
+        // After the configures: a client drawing on `done` then draws at
+        // the size it was just told.
+        for callback in &shown {
+            send_frame_done(&outbound, &pending_deletes, *callback)?;
+        }
+        if !shown.is_empty() {
+            runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?
+                .presented_callbacks_sent(client, shown.len());
         }
         if outbound
             .lock()
@@ -1413,6 +1430,24 @@ fn send_pointer_frame(
         }
     }
     Ok(())
+}
+
+/// `wl_callback.done` for a frame callback, then the delete_id its
+/// reservation waits on. Sent by the client's own thread when the paint was
+/// already on glass, and by its configure worker when the paint lands.
+fn send_frame_done(
+    outbound: &Arc<Mutex<Outbound>>,
+    pending_deletes: &PendingDeletes,
+    callback: u32,
+) -> Result<(), String> {
+    let mut done = wire::Builder::new();
+    done.u32(next_serial());
+    let message = done.message(callback, WL_CALLBACK_DONE)?;
+    outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+        .send(&message)?;
+    send_reserved_delete_id(outbound, pending_deletes, callback)
 }
 
 fn send_reserved_delete_id(
@@ -2213,6 +2248,7 @@ impl Client {
             pending_deletes: Arc::new(Mutex::new(BTreeMap::new())),
             objects,
             deferred_outbound: None,
+            committed_callbacks: Vec::new(),
             subsurface_stacks: BTreeMap::new(),
             runtime,
             keymap,
@@ -2260,7 +2296,15 @@ impl Client {
                 .checked_add(retained)
                 .ok_or_else(|| "frame callback accounting overflow".to_string())?;
         }
-        Ok(callbacks)
+        // Committed but held for their paint: still this client's to bound.
+        let held = self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .paced_frame_callbacks(self.id);
+        callbacks
+            .checked_add(held)
+            .ok_or_else(|| "frame callback accounting overflow".to_string())
     }
 
     fn cached_subsurface_commits(&self) -> usize {
@@ -2519,8 +2563,6 @@ impl Client {
         if let Some(deferred) = self.deferred_outbound.as_mut() {
             let buffer_release = opcode == WL_BUFFER_RELEASE
                 && matches!(self.objects.get(&object), Some(Object::Buffer(_)));
-            let frame_callback = opcode == WL_CALLBACK_DONE
-                && matches!(self.objects.get(&object), Some(Object::Callback));
             let next_events = deferred
                 .messages
                 .len()
@@ -2534,23 +2576,17 @@ impl Client {
                 .buffer_releases
                 .checked_add(usize::from(buffer_release))
                 .ok_or_else(|| "deferred buffer release accounting overflow".to_string())?;
-            let next_callbacks = deferred
-                .frame_callbacks
-                .checked_add(usize::from(frame_callback))
-                .ok_or_else(|| "deferred frame callback accounting overflow".to_string())?;
             if next_events > MAX_DEFERRED_EVENTS
                 || next_bytes > MAX_DEFERRED_EVENT_BYTES
                 || next_releases > MAX_DEFERRED_BUFFER_RELEASES
-                || next_callbacks > MAX_DEFERRED_FRAME_CALLBACKS
             {
                 return Err(format!(
-                    "compound commit exceeds deferred event bounds: events={next_events} bytes={next_bytes} releases={next_releases} callbacks={next_callbacks}"
+                    "compound commit exceeds deferred event bounds: events={next_events} bytes={next_bytes} releases={next_releases}"
                 ));
             }
             deferred.messages.push(message);
             deferred.bytes = next_bytes;
             deferred.buffer_releases = next_releases;
-            deferred.frame_callbacks = next_callbacks;
             self.resources.observe_deferred(next_events, next_bytes);
             return Ok(());
         }
@@ -2565,6 +2601,27 @@ impl Client {
             return Err("nested deferred Wayland output".to_string());
         }
         self.deferred_outbound = Some(DeferredOutbound::default());
+        Ok(())
+    }
+
+    /// Hand the transaction's frame callbacks to the runtime, which holds
+    /// those whose paint is not yet on glass for this client's configure
+    /// worker, and send the rest. The epoch is read after the transaction's
+    /// lock is released, so a paint queued in between can only lengthen the
+    /// wait, never shorten it.
+    fn release_committed_callbacks(&mut self) -> Result<(), String> {
+        if self.committed_callbacks.is_empty() {
+            return Ok(());
+        }
+        let callbacks = std::mem::take(&mut self.committed_callbacks);
+        let shown = self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .pace_frame_callbacks(self.id, callbacks);
+        for callback in shown {
+            send_frame_done(&self.outbound, &self.pending_deletes, callback)?;
+        }
         Ok(())
     }
 
@@ -3195,13 +3252,8 @@ impl Client {
         self.send(1, 1, event)
     }
 
-    fn remove_surface_object(&mut self, id: u32) -> Result<(), String> {
-        if id <= 1 {
-            return Err(format!("refusing to delete reserved object {id}"));
-        }
-        if self.objects.remove(&id).is_none() {
-            return Err(format!("object {id} does not exist"));
-        }
+    /// Hold `id` out of reuse until whichever thread sends its delete_id.
+    fn reserve_delete(&self, id: u32) -> Result<(), String> {
         let mut pending = self
             .pending_deletes
             .lock()
@@ -3210,7 +3262,17 @@ impl Client {
             return Err(format!("object {id} already has a pending deletion"));
         }
         pending.insert(id, Arc::new(Mutex::new(())));
-        drop(pending);
+        Ok(())
+    }
+
+    fn remove_surface_object(&mut self, id: u32) -> Result<(), String> {
+        if id <= 1 {
+            return Err(format!("refusing to delete reserved object {id}"));
+        }
+        if self.objects.remove(&id).is_none() {
+            return Err(format!("object {id} does not exist"));
+        }
+        self.reserve_delete(id)?;
         let queued = self
             .runtime
             .lock()
@@ -4851,9 +4913,16 @@ impl Client {
         settle: Result<(), String>,
     ) -> Result<(), String> {
         match (operation, settle) {
-            (Ok(()), Ok(())) => self.flush_deferred_outbound(),
+            (Ok(()), Ok(())) => {
+                if let Err(error) = self.flush_deferred_outbound() {
+                    self.committed_callbacks.clear();
+                    return Err(error);
+                }
+                self.release_committed_callbacks()
+            }
             (Err(error), _) | (Ok(()), Err(error)) => {
                 self.discard_deferred_outbound();
+                self.committed_callbacks.clear();
                 Err(error)
             }
         }
@@ -5465,11 +5534,9 @@ impl Client {
             )?;
         }
         for callback in state.frame_callbacks {
-            let mut done = wire::Builder::new();
-            done.u32(next_serial());
-            self.send(callback, WL_CALLBACK_DONE, done)?;
             self.objects.remove(&callback);
-            self.delete_id(callback)?;
+            self.reserve_delete(callback)?;
+            self.committed_callbacks.push(callback);
         }
         if let Some(Object::Surface(current)) = self.objects.get_mut(&id) {
             current.pending_buffer = None;
@@ -7176,6 +7243,7 @@ fn serve_client_with_access(
     let configurations = Arc::clone(&client.configurations);
     let outbound = Arc::clone(&client.outbound);
     let worker_outbound = Arc::clone(&outbound);
+    let configure_deletes = Arc::clone(&client.pending_deletes);
     let configure_thread = match thread::Builder::new()
         .name(format!("wayland-configure-{id}"))
         .spawn(move || {
@@ -7185,6 +7253,8 @@ fn serve_client_with_access(
                 worker_runtime,
                 configurations,
                 worker_outbound,
+                id,
+                configure_deletes,
             );
             if let Err(error) = &result {
                 eprintln!("td-compositor: client {id} configure: {error}");
@@ -15175,6 +15245,7 @@ mod tests {
         let worker_runtime = Arc::clone(&runtime);
         let configurations = Arc::clone(&client.configurations);
         let outbound = Arc::clone(&client.outbound);
+        let deletes = Arc::clone(&client.pending_deletes);
         let worker = thread::spawn(move || {
             configure_worker(
                 receiver,
@@ -15182,6 +15253,8 @@ mod tests {
                 worker_runtime,
                 configurations,
                 outbound,
+                88,
+                deletes,
             )
         });
 
@@ -15779,18 +15852,6 @@ mod tests {
         assert!(error.contains("pending frame-callback limit"), "{error}");
         assert!(!client.objects.contains_key(&2000));
 
-        client.begin_deferred_outbound().unwrap();
-        for _ in 0..MAX_DEFERRED_FRAME_CALLBACKS {
-            client
-                .send(1000, WL_CALLBACK_DONE, wire::Builder::new())
-                .unwrap();
-        }
-        let error = client
-            .send(1000, WL_CALLBACK_DONE, wire::Builder::new())
-            .unwrap_err();
-        assert!(error.contains("callbacks=257"), "{error}");
-        client.discard_deferred_outbound();
-
         client
             .insert(
                 7,
@@ -15853,6 +15914,78 @@ mod tests {
         assert_eq!(resources.deferred_bytes, MAX_DEFERRED_EVENT_BYTES);
 
         fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    /// Under a backend that queues, a commit's frame callback is answered
+    /// by the configure worker once the paint showing the commit lands. Until
+    /// then it counts against the client's bound and its id stays reserved.
+    #[test]
+    fn frame_callbacks_are_answered_when_their_paint_lands() {
+        let (chain, _log) = crate::drm::testing::chain(120, 80);
+        let runtime = Arc::new(Mutex::new(Runtime::new(chain)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(1, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        let (receiver, stop) = runtime.lock().unwrap().subscribe(1).unwrap().split();
+        let worker_stop = stop.clone();
+        let worker_runtime = Arc::clone(&runtime);
+        let configurations = Arc::clone(&client.configurations);
+        let outbound = Arc::clone(&client.outbound);
+        let deletes = Arc::clone(&client.pending_deletes);
+        let worker = thread::spawn(move || {
+            configure_worker(
+                receiver,
+                worker_stop,
+                worker_runtime,
+                configurations,
+                outbound,
+                1,
+                deletes,
+            )
+        });
+        {
+            let mut runtime = runtime.lock().unwrap();
+            runtime
+                .pointer_frame(1, 10, 10, &[], crate::pointer::PointerScroll::default())
+                .unwrap();
+            runtime.flush_paint().unwrap();
+        }
+        let shown = runtime.lock().unwrap().frame_in_flight().unwrap();
+
+        client
+            .insert(5, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        let mut frame = wire::Builder::new();
+        frame.u32(50);
+        client
+            .dispatch(request(5, 3, frame).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(request(5, 6, wire::Builder::new()).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert!(drain_messages(&mut peer).is_empty(), "answered before its paint landed");
+        assert_eq!(client.pending_frame_callbacks().unwrap(), 1);
+        let reused = client.insert(50, Object::Callback).unwrap_err();
+        assert!(reused.contains("reused before delete_id"), "{reused}");
+
+        runtime
+            .lock()
+            .unwrap()
+            .output_event(crate::output::OutputEvent::Presented(shown))
+            .unwrap();
+        peer.set_read_timeout(None).unwrap();
+        let events = receive_messages(&mut peer, 2);
+        assert_eq!((events[0].object, events[0].opcode), (50, WL_CALLBACK_DONE));
+        assert_eq!((events[1].object, events[1].opcode), (1, 1));
+        // The worker reports them sent after writing, so a moment later.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while client.pending_frame_callbacks().unwrap() != 0 {
+            assert!(Instant::now() < deadline, "the worker never reported them sent");
+            thread::sleep(Duration::from_millis(5));
+        }
+        client.insert(50, Object::Callback).unwrap();
+
+        stop.stop();
+        worker.join().unwrap().unwrap();
     }
 
     #[test]
