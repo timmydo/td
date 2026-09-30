@@ -724,6 +724,19 @@ Implement the remaining work as independently reviewable increments:
   with socket/lease/deadline handling, implicit client TLS, STARTTLS transition
   fixtures and gateway pin plus address authorization. No provider type or
   diagnostic reaches td-mta. Use td-mail-compatible local HTTPS/SMTP fixtures.
+  - **M07d1 — socket/time foundations:** implemented an exclusively owned
+    nonblocking TCP adapter with 16 KiB data I/O calls, TCP_NODELAY, fixed sticky
+    errors, separate read/write closure and captured socket peer. Implemented
+    one runtime monotonic origin and checked injected UTC conversion for TLS.
+    Local socket and fault/time fixtures cover their contracts. This adds no
+    listeners, dialer, slot admission or TLS/STARTTLS policy integration.
+  - **M07d2 — TLS record pump:** compose the shared session with caller-owned
+    wire/tail buffers and bounded socket progress. Qualify partial I/O,
+    bidirectional backpressure, exact error/close semantics and deadline fences.
+  - **M07d3 — admitted upgrades:** bind immutable policy generations and slot
+    leases, reserve before STARTTLS replies, reject plaintext tails and map
+    verified leaf evidence plus actual peer address to gateway authorization.
+    Complete local HTTPS/SMTP transition fixtures before enabling service.
 - **M07e — resource/service admission:** qualify complete generation overlap,
   session/handshake peaks, worker entropy and Rust/native stack/allocation/RSS
   on the portable artifact before activating the adapters. Amend the checked

@@ -108,6 +108,52 @@ in the shared design follow the service's crash/durable-recovery contract.
 Neither interface tests nor fake digests prove a cryptographic implementation,
 bounded TLS behavior or resource limits.
 
+### 1.2 Implemented socket and clock foundations
+
+M07d1 supplies `transport::TcpTransport`, consuming one already connected,
+exclusively owned standard TCP stream. It sets nonblocking mode and TCP_NODELAY,
+clears socket timeouts and captures the actual socket peer before publication. Its caller
+must supply an ordinary socket without positive linger or another live handle;
+the adapter exposes no cloning, raw descriptor or stream extraction. Slot
+admission, listeners, DNS, dialing and protocol deadlines remain runtime work.
+No service entry point constructs it yet.
+
+Each read/write attempts at most one data I/O call over at most 16 KiB;
+terminal errors additionally shut down and close the stream. TCP_NODELAY
+prevents Nagle buffering of short TLS-record tails after a full-size chunk.
+WouldBlock and Interrupted return Pending without an internal retry loop.
+EOF closes only the read half; orderly close shuts down only the write half
+and remains idempotent, allowing the peer's final data to be read. A nonempty
+write after local close is a terminal BrokenPipe error. Other terminal I/O
+errors retain their first fixed kind/code, shut down both halves and drop the
+stream; later nonempty I/O, flush and close return that same error. Abort uses
+Invalid when no earlier error exists. Empty reads/writes always return Pending,
+including after failure; they grant no progress. Drop aborts the stream.
+There is no userspace output buffer, so flush completes immediately on a live
+stream. Flush/abort cannot establish peer receipt or retract bytes already
+accepted by the kernel. This is not a promise of TCP reset delivery.
+Terminating on a write error deliberately discards any unread peer reply.
+The protocol reports a transport failure rather than reconstructing a reply
+after cancellation. Queue handling must retain an already established final
+DATA acceptance uncertainty under QUEUE.md; the absence of a parsed reply is
+not evidence that a remote delivery failed or is safe to retry.
+
+`clock::RuntimeClock` supplies UTC milliseconds and elapsed monotonic
+milliseconds from one runtime-owned Instant origin. Share that same clock
+across the runtime; ticks from separate origins are not comparable. Checked
+conversion refuses pre-epoch system time, representational overflow or an
+Instant before the origin. Wall-clock adjustments do not reset the monotonic
+origin; the two values are successive observations, not an atomic clock pair.
+`TlsClockSource` cold-retains the injected mail clock and implements the shared
+UTC callback. It rejects a failed sample or negative UTC before truncating
+milliseconds to whole seconds. It performs no system-clock fallback or cache.
+
+Local TCP pairs and injected outcomes test bounded counts, Pending, both
+half-close orders, idempotence, cancellation/drop and sticky failure. Injected
+time tests conversion/refusal and recovery of a healthy shared clock source.
+These helpers allocate no td-owned per-operation buffers, but do not prove
+platform allocation, whole-process bounds, slot ownership or TLS integration.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

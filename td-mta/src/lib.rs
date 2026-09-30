@@ -3,6 +3,7 @@
 
 pub mod admission;
 pub mod bounded;
+pub mod clock;
 pub mod config;
 pub mod format;
 pub mod ids;
@@ -11,6 +12,7 @@ pub mod observability;
 pub mod ownership;
 pub mod ports;
 pub mod sync;
+pub mod transport;
 pub mod wire;
 
 /// Operator configuration schema, independent of the future storage format.

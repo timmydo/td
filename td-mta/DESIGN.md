@@ -37,6 +37,10 @@ probes pass.
 They do not instantiate service pools, perform live disk I/O or
 implement protocol handlers.
 
+M07d1 supplies an exclusively owned nonblocking TCP stream adapter and shared
+runtime/TLS clock conversion, as specified in API.md §1.2. These foundations
+do not open listeners, dial endpoints, admit slots or activate serving paths.
+
 The initial deployment is one person's approximately 1 GB of mail, multiple
 domains, and explicit aliases on each domain pointing into one account's
 mailbox store. Account IDs remain explicit in every storage and authorization
