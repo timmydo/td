@@ -1801,6 +1801,238 @@ scales, clipped/narrow surfaces, focus loss and stale consumer data. Extend
 shared primitives atomically where necessary; no temporary application
 copy of a widget is an acceptable completion of this work.
 
+## Outline faces and the glyph atlas
+
+Every td-ui consumer and td-term draw text from one bitmap face: Unifont's
+8x16 cells, pixel-doubled at scales above one. This section adds a second
+kind of face, a TrueType outline covered with antialiasing at the
+surface's own pixel size. The first such face is JetBrains Mono Nerd Font.
+The bitmap face stays as the fallback and as the face of the compositor's
+own chrome. The work is ordered so that a GPU backend, when td has one,
+reuses the same model as the CPU raster (see "The GPU path" below).
+
+### The face
+
+The first outline face is the Mono variant, `JetBrainsMonoNerdFontMono`,
+from the Nerd Fonts v3.5.1 release. The Mono variant holds every icon to
+the single advance, so the icons fit td's cell grid. Its measurements:
+1000 units per em, a 600-unit advance, a 1020 ascender, a -300 descender,
+no line gap and 12608 glyphs, all quadratic `glyf` outlines. Its Unicode
+map is cmap format 12, because the Material Design icons sit in plane 15
+(from U+F0001). So a scalar-to-glyph lookup must cover every plane, not
+only the BMP.
+
+At 13 pixels per em the cell is 8x17, close to today's 8x16. At 16 it is
+10x21. Cell metrics come from the face, not from constants. Bold, italic
+and bold italic are that release's own files. The terminal's fake bold
+smear and italic shear remain only for the bitmap face.
+
+Its ligatures are never applied. td-ui maps one scalar to one glyph through
+the character map and reads no `GSUB`, so the calt ligatures do not
+change what a cell shows. Hinting programs (`fpgm`, `prep`, per-glyph
+instructions) are skipped and never executed, and coverage is unhinted
+linear area. Kerning (`GPOS`, `kern`) is not read, since a monospace face
+has none that matters on a grid.
+
+### Delivery and trust position
+
+The Unifont face is committed as generated Rust source (see
+`td-compositor/assets/PROVENANCE`). That route does not scale to this
+face. Each style is 2.5 MiB, about 5 MiB of hex per style as source. Target
+recipes stage sources as strings, so `include_bytes!` of a binary is not an
+option either. The face is therefore data. A recipe fetches the release
+archive as a fixed-output source by its upstream URL and SHA-256:
+
+```text
+https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.1/JetBrainsMono.tar.xz
+sha256 04d5e8f903693f9dd13e16f867e994834e681eb3c72c0d337a770dcda09010cf
+JetBrainsMonoNerdFontMono-Regular.ttf
+sha256 f2a5ea6cfab397445ffab00c0370927b66d61e560a05db5db271b42006381c1a
+OFL.txt
+sha256 30f0c136e3c88e422d0791acd97238870f9054a9729bc34cf2ff0d4ed8cac4ad
+```
+
+The recipe extracts the four Mono styles and `OFL.txt` into a data output,
+and the image carries that output read-only. A consumer reads a style's
+bytes once at startup, from the path the image names, and hands them to
+`sfnt::Font::parse`. The pure modules never open a file. A missing or
+refused face falls back to Unifont and says so once; a program never fails
+to start because the face is missing.
+
+The trust question is new, and it needs sign-off before the pin lands. A
+compiled TTF is not source: JetBrains builds it with fontmake from
+`.glyphs` sources, and Nerd Fonts patches it with FontForge. Neither
+toolchain is in td's graph, so td cannot rebuild the face. It is also not
+an executable. td never runs its bytecode, and no program but td-ui's
+reader parses it. It is not a compilation input either: it is read at
+runtime, never embedded. It fits none of the input classes AGENTS.md names
+today (bootstrap seeds, source, and marked foreign application payloads).
+So the pin landing either amends AGENTS.md with a fourth class, pinned
+upstream data, or carries the face as a marked payload on the
+`payload_inputs` channel. The first option is recommended: a font is
+read-only data for td-owned programs, not an application run under
+confinement.
+
+Licences: JetBrains Mono and the patched faces are under the SIL Open Font
+License 1.1 (`OFL.txt` in the archive). The pin also records the licences
+of the icon sets Nerd Fonts merges in, taken from that repository's
+`LICENSE` at the pinned tag. Programs expose all of these beside the
+Unifont texts in their `--font-license` output.
+
+### Reader and coverage
+
+`sfnt` is a bounded reader, and it is pure. It accepts a TrueType
+table directory and refuses collections and CFF outlines by name. It
+checks each table's range and refuses duplicate tables. From the tables it
+reads:
+
+- `head`: the magic, 16 to 16384 units per em, and the loca format;
+- `maxp`: the glyph count;
+- `hhea`: the ascender, descender, line gap and long-metric count;
+- `hmtx`: advances; glyphs past the long metrics share the last one;
+- `loca`: each glyph's range, with the start no later than the end and
+  the range inside `glyf`;
+- `cmap`: format 12 is preferred over format 4, and Windows full repertoire
+  over Unicode platform over Windows BMP.
+
+Simple glyphs decode every flag and coordinate form. Composite glyphs
+decode offsets, the scale forms (uniform, x and y, and two-by-two), scaled
+and unscaled offsets, and point matching. Composites are held to a depth of
+8 and 256 components per glyph at every depth together, so a fan-out
+cannot multiply through the depth bound. The whole outline is held to 8192
+points and 1024 contours. Every refusal names its item, and a refused glyph
+leaves an empty outline behind.
+
+`coverage` is also pure, and it turns an outline into an alpha mask. For
+each pixel it accumulates the exact signed area of the outline's edges per
+row, and flattens curves to within 1/32 of a pixel. The fill rule is
+nonzero for same-direction overlaps and clamps at full. The resulting mask
+is at most 512 pixels on an axis and carries its bearing from the pen and
+the baseline. A refusal leaves the caller's mask untouched. Both the
+rasterizer and the outline are reused, so a steady state allocates nothing.
+
+### The atlas executor
+
+The draw stream does not change. The seam under "Invariants" holds: a
+`Glyph` names a Unicode scalar and a style, never a bitmap. So widgets,
+scenes, `driven`'s text read-back and every draw-stream oracle are
+untouched by the face. The change is below the seam: `Raster` executes a
+`Glyph` through an outline face when it is given one.
+
+Per-frame text cost must not include rasterizing. `atlas` is one 8-bit
+coverage page of fixed extent, shelf-packed. Its entries are keyed by face
+style and glyph at the page's pixel size, and each entry records its
+rectangle and bearing.
+
+The executor looks each scalar up in the face's character map. It covers
+the glyph into the page on first use and blends it from the page after
+that. A scalar the face lacks draws from the Unifont face, as it does
+today. When the page is full it resets whole under a new epoch and fills
+again from the draws that follow, so its memory is bounded by its extent.
+The page reports the band of rows written since it was last taken, which
+is exactly the sub-image a GPU backend uploads.
+
+The blend is `background + (ink - background) * alpha / 255` per channel,
+using the `GlyphStyle`'s explicit background. The executor never reads the
+buffer back. This keeps the bitmap face's rule that fringe colours derive
+from the explicit background a caller paints, and it means a repaint is
+independent of old pixels. It is also exactly a GPU fragment shader with
+blending off, so a CPU frame and a GPU frame of one draw stream are
+pixel-identical by construction. Zero coverage writes nothing, as an unset
+bitmap pixel does. `Weight::Medium` selects the bold style when the face
+has one.
+
+The exact-pixel oracles and `--preview` checksums pin the bitmap backend,
+so the executor is opt-in per raster. A consumer's oracles move when the
+consumer does.
+
+### Runtime cells
+
+`CELL_WIDTH` and `CELL_HEIGHT` are constants because the bitmap face fixes
+them. With an outline face they become a `Cell` value derived from the
+face at the surface's pixel size:
+
+- the cell width is the rounded advance of `0`;
+- the baseline is the rounded ascender;
+- the cell height is that plus the rounded descender and line gap.
+
+Consumers thread that value through layout, hit testing and painting in
+place of the constants. The glyph is rasterized at the device pixel size
+(the base size times the integer scale), not drawn at 1x and doubled.
+
+A scalar the face lacks falls back to the Unifont glyph, centred in the
+cell. Wide cells (CJK) remain a separate decision; section 13 of
+td-compositor/DESIGN.md already excludes them.
+
+### td-term
+
+td-term is the `td-compositor` multicall. It paints cells through the
+compositor's own `render.rs` over the bitmap `Font`. It moves onto td-ui in
+two steps:
+
+1. The compositor's recipe stages the `td-ui` tree, as each consumer's
+   already stages `td-compositor`.
+2. td-term's cell painter becomes a td-ui `Composition` of fills and
+   glyphs over `Cell`, executed through the atlas, with the terminal's
+   attributes mapped as follows:
+   - bold, italic and bold italic select their faces (`GlyphStyle` gains
+     a slant beside its weight, an additive change to the stream);
+   - faint and inverse stay colour operations;
+   - underline and strike are fills placed from the face's metrics.
+
+The pixel size the terminal reports through `TIOCSWINSZ` follows the cell.
+The compositor's own chrome keeps the bitmap face. td-compositor/DESIGN.md
+section 11's rule that host tests and the target consume the same face
+bytes holds for Unifont. Outline oracles use fonts the tests encode
+themselves, and the image check is what realizes the pinned face.
+
+### The GPU path
+
+"GPU-accelerated text" means this: glyphs are rasterized to coverage once
+and cached in a texture atlas, and each frame draws one textured quad per
+glyph, blended in a fragment shader. The atlas executor above is that
+model. The draw stream a `Composition` emits is the quad list (one quad per
+`Glyph`, at its cell), the page's dirty band is the texture upload, and the
+blend is the shader. The
+CPU raster is the reference backend and the pixel oracle a GPU backend is
+held to.
+
+td has no GPU stack to run that model on. The compositor composites in
+software and scans out DRM dumb buffers. Clients present only through
+`wl_shm`, and APPLICATIONS.md records `zwp_linux_dmabuf_v1` as absent
+("no GPU, nothing to export"). A client's GPU-rendered frame reaches the
+screen without a copy only as a dmabuf, which the compositor imports and
+then either composites on the GPU or scans out directly. Until then, a GPU
+frame is read back into `wl_shm`, which costs more than the mask blend it
+replaces.
+
+GPU text therefore needs, in this order:
+
+1. **A driver stack in the target graph.** Mesa built from source is a
+   large reviewed non-Rust package: C, C++, meson, Python and, for most
+   hardware drivers, LLVM. That needs principle-2 sign-off. A td-owned
+   driver is not realistic.
+2. **A render-node grant.** Applications reach the GPU only through td-jail
+   and the confinement path. GPU drivers are among the kernel's largest
+   attack surfaces, so the grant is a threat-model decision
+   (APPLICATIONS.md), not plumbing.
+3. **The compositor's GPU path.** That means dmabuf import with explicit
+   synchronization, and GPU composition or direct scanout in its DRM
+   backend. The compositor is where td-term's and every client's pixels
+   meet, so it is the first GPU consumer.
+4. **td-ui's GPU backend.** It sits below the same seam: the atlas page is
+   uploaded by its dirty band, and each `Glyph` becomes a quad.
+
+Until then, the CPU path is already GPU-shaped in cost as well as form:
+
+- a glyph is rasterized once per face and size;
+- a frame's text is a bounded blend per cell;
+- damage already confines frames to what changed.
+
+Measured on the Mono Regular face, every one of its 12608 glyphs parses
+and covers in about 30 ms at 16 pixels per em. A frame needs only the
+glyphs it shows, once.
+
 ## Independently landable increments
 
 The task-manager widget sequence is tracked in
@@ -1943,3 +2175,26 @@ regressions. Those increments extend the original sequence below.
     its own raw module down to two syscalls. Landed. td-mail and
     td-news copy and paste through it in their own increment
     (APPLICATIONS.md §W.8, "Reworked again" and "Composing in place").
+17. Outline reader and coverage: `sfnt` and `coverage` under "Outline
+    faces and the glyph atlas", pure, proven against fonts the tests
+    encode, with pixel and closed-form area oracles.
+18. The atlas executor: `atlas` with its page, shelf packing, epochs and
+    dirty band; the face's `Cell` at a pixel size; and `Raster` executing
+    `Glyph` through an outline face, opt-in, with the Unifont fallback
+    and the explicit-background blend, under pixel oracles over encoded
+    fonts. The draw stream is unchanged.
+19. The face pin: a data recipe fetching the Nerd Fonts v3.5.1
+    `JetBrainsMono.tar.xz` by URL and SHA-256, extracting the four Mono
+    styles and the licences into an output the image carries read-only,
+    with the AGENTS.md amendment naming pinned upstream data. Requires
+    sign-off (see "Delivery and trust position").
+20. Runtime cells: `Cell` replaces the constants in layout, hit testing
+    and painting, and the consumer reads the pinned face and falls back to
+    Unifont. td-editor goes first, since the other consumers lay out over
+    its pane.
+21. td-term on td-ui: the compositor's recipe stages td-ui, and td-term's
+    cell painter moves onto `Cell` and the atlas executor, with the
+    attribute mapping above. Its PPM oracles are regolded.
+22. The GPU path, gated on the sign-offs "The GPU path" lists: the
+    compositor's GPU composition first, then client dmabufs, then td-ui's
+    GPU backend held to the CPU raster's oracles.
