@@ -114,6 +114,10 @@ fn material() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 }
 
 fn large_material() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    large_material_names(&["localhost"])
+}
+
+pub(super) fn large_material_names(names: &[&str]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut raw = [0; P256_PKCS8_CAPACITY];
     let n = Provider.generate_p256(&mut raw).unwrap();
     let root = Provider.load_p256(&raw[..n]).unwrap();
@@ -156,7 +160,7 @@ fn large_material() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
             &Certificate {
                 ca: ca_flag,
                 serial,
-                names: &["localhost"],
+                names: if ca_flag { &["localhost"] } else { names },
                 client: false,
                 issuer: issuer_name,
                 subject,

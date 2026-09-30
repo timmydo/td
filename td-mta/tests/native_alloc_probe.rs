@@ -258,6 +258,13 @@ fn main() {
     }
     if std::env::args()
         .nth(1)
+        .is_some_and(|arg| arg == "--tls-generations")
+    {
+        tls_generations();
+        return;
+    }
+    if std::env::args()
+        .nth(1)
         .is_some_and(|arg| arg == "--tls-large-chain")
     {
         tls_large_chain();
@@ -284,4 +291,48 @@ fn main() {
 #[cfg(not(td_native_alloc_probe))]
 fn main() {
     println!("native allocation probe unqualified: use the isolated musl build");
+}
+
+#[cfg(td_native_alloc_probe)]
+#[path = "support/tls_generation_scenario.rs"]
+mod tls_generation_scenario;
+
+#[cfg(td_native_alloc_probe)]
+fn tls_generations() {
+    use native_allocator_bridge::{calls, TD_MTA_NATIVE_REGISTRY as REGISTRY};
+    let mut samples = [(calls(), REGISTRY.snapshot()); tls_generation_scenario::PHASES.len()];
+    let mut slots = samples.iter_mut();
+    tls_generation_scenario::run(|| *slots.next().unwrap() = (calls(), REGISTRY.snapshot()));
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|(_, s)| !s.invalid));
+    assert_eq!(
+        samples.get(5),
+        samples.get(6),
+        "generation refusal allocated"
+    );
+    assert_eq!(
+        samples.get(3).unwrap().1.bytes,
+        samples.get(7).unwrap().1.bytes,
+        "old generation release retained C boundary bytes"
+    );
+    assert_eq!(
+        samples.get(3).unwrap().1.blocks,
+        samples.get(7).unwrap().1.blocks,
+        "old generation release retained C boundary blocks"
+    );
+    assert_eq!(
+        samples.get(7).unwrap().1.bytes,
+        samples.get(8).unwrap().1.bytes,
+        "replacement retained C boundary bytes"
+    );
+    assert_eq!(
+        samples.get(7).unwrap().1.blocks,
+        samples.get(8).unwrap().1.blocks,
+        "replacement retained C boundary blocks"
+    );
+    for (phase, (c, s)) in tls_generation_scenario::PHASES.into_iter().zip(samples) {
+        let [malloc, calloc, realloc, free, posix, aligned] = c;
+        println!("tls-native-generation {phase} {malloc} {calloc} {realloc} {free} {posix} {aligned} {} {} {}", s.blocks, s.bytes, s.peak);
+    }
+    println!("tls-generation-allocation-v1: native passed");
 }

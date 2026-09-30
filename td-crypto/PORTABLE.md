@@ -859,6 +859,14 @@ four returned buffers drop; native tracking additionally requires four fewer
 blocks. Other allocation scenarios retain v1. Endpoint release deltas exclude
 shared state and stack storage.
 
+Fresh `--tls-generations` processes in both counter domains compile sixteen
+large files profiles into direct SMTP, HTTPS/MTA-STS and relay policies, retain
+old and replacement owners, refuse a third generation, and repeat replacement
+after releasing the old lease. Eleven ordered rows and a distinct v1 completion
+are required. Counter refusal must be unchanged and repeated replacements must
+not retain requested bytes or native blocks. This is a profile-count fixture,
+not a complete generation-memory bound; td-mta/RESOURCES.md defines its scope.
+
 ## Mail sampled RSS diagnostic artifact
 
 `td-mta-rss-probe` is an eighth integration executable with its own main.
@@ -868,10 +876,11 @@ and refuse the Rust/native probe sentinels there. The exact artifact inventory,
 static ELF validation and fresh runtime namespace include it explicitly.
 
 The default process checks the bounded rollup parser and observes a positive
-resident increase after touching a 16 MiB allocation. Five independent fresh
-processes run the existing client, local handshake, entropy worker, fragmented
-handshake and large-chain scenarios. The runtime requires exact ordered rows,
-positive decimal KiB values and the scenario completion record before logging.
+resident increase after touching a 16 MiB allocation. Six independent fresh
+processes run the client, local handshake, entropy worker, fragmented
+handshake, large-chain and sixteen-profile generation scenarios. The runtime
+requires exact ordered rows, positive decimal KiB values and the scenario
+completion record before logging.
 Every mode has its own bounded log and 30-second deadline. Missing procfs
 support or malformed/truncated rollup output fails qualification.
 

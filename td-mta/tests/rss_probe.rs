@@ -124,6 +124,12 @@ fn main() {
         Some("--tls-large-chain") => observe("large-chain", tls_handshake_scenario::PHASES, |f| {
             tls_handshake_scenario::run_large(f)
         }),
+        Some("--tls-generations") => observe("generation", tls_generation_scenario::PHASES, |f| {
+            tls_generation_scenario::run(f)
+        }),
         _ => controls(),
     }
 }
+
+#[path = "support/tls_generation_scenario.rs"]
+mod tls_generation_scenario;

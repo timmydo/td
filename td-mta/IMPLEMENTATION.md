@@ -926,6 +926,13 @@ Implement the remaining work as independently reviewable increments:
     asserting allocator release. Shared state, fixed objects and transient peaks
     remain separate.
 
+  - **M07e4c — sixteen-profile generation observations:** compile sixteen large
+    files identities into SMTP and HTTPS/MTA-STS policies with explicit relay
+    trust. Separate candidate/publication/old/current release checkpoints,
+    unchanged third-generation refusal counters and repeated replacement
+    retention checks run in both counter domains and unwrapped RSS. Maximum
+    trust/name/listener combinations and aggregate admission remain pending.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,

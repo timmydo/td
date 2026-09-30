@@ -257,6 +257,13 @@ fn main() {
     }
     if std::env::args()
         .nth(1)
+        .is_some_and(|arg| arg == "--tls-generations")
+    {
+        tls_generations();
+        return;
+    }
+    if std::env::args()
+        .nth(1)
         .is_some_and(|arg| arg == "--tls-large-chain")
     {
         tls_large_chain();
@@ -264,4 +271,37 @@ fn main() {
     }
     hot_paths();
     println!("rust-allocation-probe-v1: counter-model forwarding hot-paths passed");
+}
+
+#[path = "support/tls_generation_scenario.rs"]
+mod tls_generation_scenario;
+
+fn tls_generations() {
+    let mut samples = [COUNTERS.snapshot(); tls_generation_scenario::PHASES.len()];
+    let mut slots = samples.iter_mut();
+    tls_generation_scenario::run(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|s| !s.invalid));
+    assert_eq!(
+        samples.get(5),
+        samples.get(6),
+        "generation refusal allocated"
+    );
+    assert_eq!(
+        samples.get(3).unwrap().live,
+        samples.get(7).unwrap().live,
+        "old generation release retained Rust bytes"
+    );
+    assert_eq!(
+        samples.get(7).unwrap().live,
+        samples.get(8).unwrap().live,
+        "replacement retained Rust bytes"
+    );
+    for (phase, s) in tls_generation_scenario::PHASES.into_iter().zip(samples) {
+        println!(
+            "tls-rust-generation {phase} {} {} {} {} {} {} {}",
+            s.alloc, s.zeroed, s.realloc, s.free, s.failed, s.live, s.peak
+        );
+    }
+    println!("tls-generation-allocation-v1: rust passed");
 }

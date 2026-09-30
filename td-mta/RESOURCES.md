@@ -918,7 +918,7 @@ The large margin is a positive observation control, not an exact page-count
 claim. Those controls run separately so they do not warm scenario processes.
 
 The existing phase names are retained. Rows have `rss SCENARIO PHASE KIB`,
-where SCENARIO is client, handshake, entropy, fragment or large-chain;
+where SCENARIO is client, handshake, entropy, fragment, large-chain or generation;
 `rss-observation-v2: SCENARIO passed` closes each output. Samples use fixed
 arrays and are formatted after scenario teardown. Positive controls use the
 control scenario with baseline, touched and dropped phases.
@@ -931,3 +931,39 @@ but do not turn these samples into transient high-water marks. Page residency
 and allocator retention vary by host and run. Whole-service worst-case RSS,
 maximum concurrency, stack coverage and ledger qualification remain pending;
 these observations change no memory allowance or service activation rule.
+
+## Sixteen-profile generation observations
+
+The `--tls-generations` mode in each counter executable and the unwrapped RSS
+executable constructs sixteen independently admitted files identities from
+synthetic large chain/key material. A direct SMTP listener and one HTTPS
+listener consume two profiles; fourteen MTA-STS domain names select the other
+profiles through the HTTPS configuration. The complete table has three roles,
+including explicit relay trust. Every preparation must read sixteen chains,
+sixteen keys and one relay CA. Each chain exceeds 60 KiB of PEM and remains
+within the 64 KiB local input ceiling; each certificate remains within 16 KiB
+DER. Reusing fixture bytes does not bypass per-profile admission. The test
+creates no service listener, ACME request or network connection.
+
+Eleven ordered checkpoints record baseline, retained material, materialized
+configuration, first published generation, replacement candidate, publication
+with the old lease retained, third-generation refusal, old-lease release, four
+further replacements, current-generation release and complete scope teardown.
+The capacity refusal must leave both counter snapshots unchanged. Releasing
+the old lease must return live requested bytes to the first-generation level;
+repeated replacements must preserve that level. Native tracking also checks
+live blocks at both boundaries. The raw material, configuration and
+clock remain alive at the current-generation-release checkpoint. Fixed arrays
+hold observations until all owners drop. Allocation records use the distinct
+`tls-generation-allocation-v1: DOMAIN passed` completion; RSS uses its existing
+v2 completion with the generation scenario. Missing, duplicate, reordered or
+wrong-version records fail the isolated reader.
+
+These requested-byte differences include the independently compiled identities
+and shared HTTPS routing objects, but exclude fixed caller state, stack and
+allocator overhead. Their lifetime peaks include fixture preparation and both
+generations. The domains overlap. RSS includes the entire fixture and observer
+and need not fall on release. Sixteen profiles do not maximize listener count,
+name count, gateway policies, trust bundles or mixed key algorithms. No
+aggregate 1 MiB generation admission or service activation follows from this
+case; complete concurrent session and generation qualification remains M07e.
