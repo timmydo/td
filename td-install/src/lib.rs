@@ -3,3 +3,4 @@
 //! Shared installer data contracts. Values here carry no write authority.
 
 pub mod installation_plan;
+pub mod installation_protocol;

@@ -63,7 +63,11 @@ fn source_inventory_and_toolkit_access_are_closed() {
         .collect();
     assert_eq!(
         active,
-        ["#![forbid(unsafe_code)]", "pub mod installation_plan;"],
+        [
+            "#![forbid(unsafe_code)]",
+            "pub mod installation_plan;",
+            "pub mod installation_protocol;"
+        ],
         "installer library source or API grew"
     );
     for name in [

@@ -191,9 +191,7 @@ impl Candidates {
         for _ in 0..count {
             disks.push(read_destination(&mut reader)?);
         }
-        if !reader.0.is_empty() {
-            return Err("trailing installation candidates bytes".into());
-        }
+        reader.finish()?;
         Self::new(disks)
     }
 }
@@ -331,14 +329,7 @@ impl Plan {
         out.extend_from_slice(&self.deployment);
         out.extend_from_slice(&self.volume_uuid);
         put_destination(&mut out, &self.destination);
-        for value in [
-            &self.settings.username,
-            &self.settings.hostname,
-            &self.settings.keyboard,
-            &self.settings.timezone,
-        ] {
-            put(&mut out, value);
-        }
+        put_settings(&mut out, &self.settings);
         out
     }
 
@@ -354,19 +345,32 @@ impl Plan {
         let deployment = r.array()?;
         let uuid = r.array()?;
         let destination = read_destination(&mut r)?;
-        let username = r.string(USERNAME_BYTES)?;
-        let hostname = r.string(HOSTNAME_BYTES)?;
-        let keyboard = r.string(KEYBOARD_BYTES)?;
-        let timezone = r.string(TIMEZONE_BYTES)?;
-        if !r.0.is_empty() {
-            return Err("trailing installation plan bytes".into());
-        }
-        let settings = Settings::new(username, hostname, keyboard, timezone)?;
+        let settings = read_settings(&mut r)?;
+        r.finish()?;
         Self::new(nonce, destination, deployment, uuid, settings)
     }
 }
 
-fn put_destination(out: &mut Vec<u8>, disk: &Destination) {
+pub(crate) fn put_settings(out: &mut Vec<u8>, settings: &Settings) {
+    for value in [
+        &settings.username,
+        &settings.hostname,
+        &settings.keyboard,
+        &settings.timezone,
+    ] {
+        put(out, value);
+    }
+}
+
+pub(crate) fn read_settings(reader: &mut Reader<'_>) -> Result<Settings, String> {
+    let username = reader.string(USERNAME_BYTES)?;
+    let hostname = reader.string(HOSTNAME_BYTES)?;
+    let keyboard = reader.string(KEYBOARD_BYTES)?;
+    let timezone = reader.string(TIMEZONE_BYTES)?;
+    Settings::new(username, hostname, keyboard, timezone)
+}
+
+pub(crate) fn put_destination(out: &mut Vec<u8>, disk: &Destination) {
     out.extend_from_slice(&disk.major.to_be_bytes());
     out.extend_from_slice(&disk.minor.to_be_bytes());
     out.extend_from_slice(&disk.sequence.to_be_bytes());
@@ -382,7 +386,7 @@ fn put_destination(out: &mut Vec<u8>, disk: &Destination) {
     }
 }
 
-fn read_destination(reader: &mut Reader<'_>) -> Result<Destination, String> {
+pub(crate) fn read_destination(reader: &mut Reader<'_>) -> Result<Destination, String> {
     let major = u32::from_be_bytes(reader.array()?);
     let minor = u32::from_be_bytes(reader.array()?);
     let sequence = u64::from_be_bytes(reader.array()?);
@@ -427,8 +431,19 @@ fn put(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(&(value.len() as u16).to_be_bytes());
     out.extend_from_slice(value.as_bytes());
 }
-struct Reader<'a>(&'a [u8], &'static str);
+/// Positional reader over one bounded record; the label names it in errors.
+pub(crate) struct Reader<'a>(&'a [u8], &'static str);
 impl<'a> Reader<'a> {
+    pub(crate) fn new(bytes: &'a [u8], label: &'static str) -> Self {
+        Self(bytes, label)
+    }
+    pub(crate) fn finish(self) -> Result<(), String> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("trailing installation {} bytes", self.1))
+        }
+    }
     fn take(&mut self, count: usize) -> Result<&'a [u8], String> {
         let (value, remaining) = self
             .0
@@ -437,7 +452,7 @@ impl<'a> Reader<'a> {
         self.0 = remaining;
         Ok(value)
     }
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], String> {
+    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N], String> {
         self.take(N)?
             .try_into()
             .map_err(|_| format!("invalid fixed {} field", self.1))

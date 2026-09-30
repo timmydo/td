@@ -51,7 +51,8 @@ only the paired installer session access to this service. This authority
 does not depend on `su`, empty passwords, or a reusable elevation grant.
 Compositor-owned trusted consent must bind destructive execution to the
 exact reviewed request under the existing elevation contract; ordinary
-client pixels or synthetic input are not authorization evidence.
+client pixels or synthetic input are not authorization evidence. The
+typed operations are specified in "Installation service protocol".
 
 The `td-setup` front end has a source-built static target recipe
 and `td-setup-test` realized-output check. The recipe stages its own tree
@@ -84,7 +85,8 @@ row is only a navigation index; the service must still
 authenticate the source, establish eligibility and retain the disk claim.
 The page uses the pure `td-install` library's plan module. Its target recipe
 stages that sibling source tree and its confinement test pins the library's
-single public module. The live window uses only its service-unavailable
+two public modules and forbids td-setup sources from naming the protocol
+module. The live window uses only its service-unavailable
 state; it has no service connection or selected destination yet. All wizard
 views fit the compositor's 752-pixel tile within an 800-pixel headless output.
 
@@ -150,19 +152,22 @@ sequence.
 ## Immutable review data
 
 The `td-install` Rust library exports `installation_plan::{Plan,
-Destination, DestinationObservation, Settings, Candidates}`. It is a pure data
-prerequisite for the service and UI, with no CLI, device access,
+Destination, DestinationObservation, Settings, Candidates}` and the
+`installation_protocol` messages described below. Both are pure data
+prerequisites for the service and UI, with no CLI, device access,
 filesystem access, entropy generation, transport or installation
 execution. The Cargo library is also a target path dependency of td-setup;
-it still exports only `installation_plan`, as pinned by td-setup's
-confinement test. The formatter stages that module separately through
+it exports exactly those two modules, as pinned by td-setup's confinement
+test, which still forbids every td-setup source file from naming
+`installation_protocol` until the service is wired. The formatter does not
+compile the protocol. It stages the plan module separately through
 `#[path]` for `observe-plan`, with its recipe and compiled-file guard
 declaring the source. Each further target consumer must declare its source
 and public API reach in its own recipe and confinement roster. A decoded
 plan conveys no authority.
 
-`Candidates` carries at most 64 distinct destination observations for a
-future read-only service reply. Its canonical `TDCAND01` record has an
+`Candidates` carries at most 64 distinct destination observations, as the
+protocol's destinations reply. Its canonical `TDCAND01` record has an
 eight-byte magic, one-byte count, then each destination in the same field
 order and bounds as the plan's destination. It admits at most 55,817 bytes
 before allocation and rejects trailing bytes, duplicate kernel names or
@@ -238,6 +243,100 @@ grants consent. No public request, reconnect or service restart may
 silently retry erasure. This increment does not connect the value to the
 existing update-only consent operation or activate a whole-disk service
 or wizard action.
+
+## Installation service protocol
+
+`td_install::installation_protocol` defines the messages between the
+unprivileged installer and the root installation service. It is data and
+codec only: no socket, service, consent operation or wizard wiring uses it
+yet, and decoding a message grants no authority.
+
+Both ends first send and require the eight bytes `TDINS01\n`. Any change to
+a message or its bytes changes this greeting; there is no negotiation.
+Each message then travels in one frame: a big-endian u32 length and that
+many payload bytes. `payload_len` admits a nonzero length within the
+direction's bound before the reader allocates. A request is at most 2049
+bytes, so root admits only a small bound from the unprivileged side; a
+reply is at most 55,818 bytes. A payload is one message: a tag byte and its
+body, with trailing bytes refused. A decode failure closes the channel
+without a reply.
+
+Requests carry no path, executable, mount option, source or consent:
+
+- `0x01` destinations: no body. The service observes eligible whole disks.
+- `0x02` propose: a destination, then username, hostname, keyboard and
+  timezone, in the plan's field order and bounds. The destination only
+  selects: the service admits it only if it equals, field for field and
+  labels included, the service's own fresh observation of an eligible
+  candidate, and otherwise refuses with destination changed. The reviewed
+  plan carries the service's observation, never UI-supplied values. The
+  service chooses the nonce and volume UUID, authenticates the source and
+  claims the disk.
+- `0x03` execute: the complete `TDPLAN01` record the installer reviewed. It
+  asks the service to seek consent for the review it retains, and is
+  refused unless the record equals that review. Equality is a
+  precondition, never consent: consent reaches root only from the
+  compositor, under the elevation contract, never through this channel.
+- `0x04` status: no body.
+- `0x05` withdraw: a 32-byte review nonce. It releases a review, and its
+  claim, before any destructive write.
+
+Replies set the high bit, so no request decodes as a reply or the reverse:
+
+- `0x81` destinations: a `TDCAND01` record.
+- `0x82` reviewed: the service's `TDPLAN01` record, made while it holds
+  the destination claim. Its nonce names the review.
+- `0x83` status: a state byte, then for every state but idle the nonzero
+  review nonce, then for running, failed and abandoned one detail code.
+  States are 0 idle, 1 reviewed, 2 awaiting consent, 3 running, 4 complete,
+  5 failed and 6 abandoned.
+- `0x84` refused: one code. Nothing was written.
+
+Running phases are 1 preparing the disk, 2 writing filesystems, 3
+publishing the deployment, 4 applying settings and 5 verifying boot.
+Failures, after which the disk may be incomplete and a retry needs a new
+review, are 1 destination changed, 2 insufficient space, 3 write failed, 4
+verification failed and 5 settings failed. Abandonment, which means no
+destructive write started, is 1 withdrawn, 2 consent declined, 3 consent
+expired, 4 consent unavailable (the compositor's consent path was lost
+while displayed) or 5 destination changed (the held disk changed or
+vanished, or a recheck refused it, before the first write). Refusals are
+1 busy, 2 source
+unavailable, 3 discovery failed, 4 destination changed, 5 destination
+busy, 6 insufficient space, 7 invalid username, 8 invalid hostname, 9
+unsupported keyboard, 10 unsupported timezone, 11 stale review, 12 no
+review and 13 consent unavailable (no seat, compositor or trusted consent
+path can present the review). Unassigned codes refuse, and a duplicated
+code does not compile.
+
+The service holds at most one review. A review is held while reviewed,
+awaiting consent or running, and not after complete, failed or abandoned.
+Where two refusals apply, busy wins. Each state admits:
+
+- destinations and status: in every state; both are read-only.
+- propose: while idle, failed or abandoned. While reviewed, awaiting
+  consent or running it is refused as busy; the installer withdraws before
+  proposing again, so no request replaces a review that is held or
+  displayed. After complete it is refused as busy: one boot installs once.
+- execute: only while reviewed, and only with a record equal to that
+  review. The service rechecks the held disk, then answers awaiting
+  consent, abandoned (destination changed) or refused as consent
+  unavailable. A different record is a stale review; with no held review
+  it is no review; while awaiting consent or running it is busy, so
+  execution is never repeated.
+- withdraw: while reviewed or awaiting consent, for that review's nonce,
+  answering abandoned (withdrawn) and releasing the claim and any displayed
+  consent. Another nonce is a stale review, no held review is no review,
+  and running is busy: a started installation cannot be withdrawn.
+
+Destinations and propose may be refused; execute and withdraw answer with
+status or a refusal; status always answers with status. `Reply::answers`
+checks only this shape: the installer still compares the review nonce and
+the proposed or echoed fields. Complete means durable filesystem and
+deployment publication, verified boot artifacts and settings publication.
+An installer that asked for execution and then sees idle, or loses the
+channel, shows the outcome as unknown, never success. Nothing retries a
+destructive operation after a reconnect or restart.
 
 ## Choosing the volume identity
 
