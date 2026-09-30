@@ -1253,17 +1253,19 @@ a still picture (`still_picture` and `reduced_still_picture_header`
 set), main profile, 8-bit 4:2:0 at full range in BT.601 (`Y = (77R +
 150G + 29B + 128) >> 8`, the chroma the mean of each 2x2 offset by 128),
 one key frame of intra blocks. The tools are the subset a decoder must
-carry and an encoder can verify: 64-pixel superblocks always split,
-then square blocks of 32, 16, 8 or 4 and the halves of a 32, a 16 or
-an 8 (a partition of `NONE`, `HORZ`, `VERT` or `SPLIT`; a node whose
-lower or right half starts past the frame's edge is split, where the
-spec would allow it the halving inside too; no 64-wide block is ever a
-leaf, since there is no 64-point transform here; of the blocks under
-8x8 only the last along each 4-pixel side of its 8x8 carries chroma,
-the 8x8's, `HasChroma`), one transform the block's size
-(`TX_MODE_LARGEST`, the reduced transform set: a luma block with no
-side of 32 may signal any of the four DCT and ADST pairs, chroma's is
-the one its mode implies, `DCT_DCT` with a side of 32), the
+carry and an encoder can verify: square blocks of 64, 32, 16, 8 or
+4 and the halves of a 32, a 16 or an 8 (a partition of `NONE`,
+`HORZ`, `VERT` or `SPLIT`; a node whose lower or right half starts
+past the frame's edge is split, where the spec would allow it the
+halving inside too; of the blocks under 8x8 only the last along each
+4-pixel side of its 8x8 carries chroma, the 8x8's, `HasChroma`), one
+transform the block's size (`TX_MODE_LARGEST`, the reduced transform
+set: a luma block with no side of 32 or more may signal any of the
+four DCT and ADST pairs, chroma's is the one its mode implies,
+`DCT_DCT` with a side of 32 or 64; a 64-point transform codes only
+its lower 32 frequencies each way, the spec zeroing the rest, and a
+64x64's chroma is never predicted from luma, the spec's CfL stopping
+at 32), the
 thirteen intra modes, the directional ones with their angle deltas
 in blocks of 8x8 and more (three degrees a step, to nine either way)
 and the intra edge filter (the corner and each edge a directional
@@ -1311,7 +1313,13 @@ are tried only where the split did not beat it whole by 8%, and a
 direction only where its halves hold the source luma's variance within
 nine tenths of the other's as tightly; at 16x16 and 32x32 on the
 bench's noisy synthetic picture that kept five sixths of what trying
-both gained for two fifths of the trials.
+both gained for two fifths of the trials. A 64x64 is tried whole only
+where its source luma's variance is within twice the square of the DC
+step over 64, which on a real photo tried a quarter to seven tenths of
+them from 0.3 to 3 bits a pixel and nearly all below, for nearly all of
+what trying every one gained, and it is never halved (0.1% more at low
+rates for 6% more instructions), nor its luma screened at the
+directional modes' other angles, which gained nothing there.
 The frame is tiled
 uniformly by its size alone, so the bytes are the same whatever the
 thread count, as the JPEG encoder's are, and by the fewest tiles the
@@ -1336,7 +1344,8 @@ columns admit the frame. `av1::av1c` and the colour constants are the
 configuration the container repeats, from the same values the sequence
 header writes. The transforms are the spec's integer butterflies, each
 a table of stages that `butterfly!` expands to straight code over fixed
-arrays, at the square sizes and the 2:1 rectangles between them (the
+arrays, at the square sizes of 4 to 64 and the 2:1 rectangles of 4 to
+32 (the
 rectangles' rows scaled by the root of a half as the spec's inverse
 does, the forward by the root of two as libaom's), and the deblocking
 filter (`deblock`) is the spec's edge loop over 4x4 units: an edge's
@@ -1368,18 +1377,21 @@ are read once per plane and every mode is predicted from them into the
 row's scratch, which also holds the transform's working blocks and each
 plane's trial and best coding and only grows over the row, so a block
 allocates only the levels its leaf keeps. A 24-megapixel export takes
-about a minute on one thread and twelve to fourteen seconds on eight
+about a minute on one thread and ten to fourteen seconds on eight
 (`tests/av1.rs`'s `bench`, a noisy synthetic picture the blocks under
 8x8 cost half again on and gain nothing; a photo they cost a third
 again). Against libaom's all-intra speed 6 on a real 2048-pixel photo
 the encoder needs about 6% fewer bits for the same luma PSNR from 0.3 to
-3 bits a pixel (2.5% fewer for RGB) and about 2% fewer below that
-(libaom leaves CDEF off there). One tile instead of the eight columns
-the wavefront replaced gained 1.4% on that photo at mid rates and 3.2%
-below (libaom's own ablation prices eight columns at 1% and 4%) in the
-same time on eight threads. The partitions not coded here (the halves of
-a 64, the three- and four-way ones) and transforms smaller than their
-block are the compression follow-up.
+3 bits a pixel (3% fewer for RGB) and about 3.5% fewer below that
+(4.5% for RGB; libaom leaves CDEF off there). One tile instead of the
+eight columns the wavefront replaced gained 1.4% on that photo at mid
+rates and 3.2% below (libaom's own ablation prices eight columns at 1%
+and 4%) in the same time on eight threads. Coding 64x64s whole gained
+0.3% at mid rates and 1.3% below for 9% more instructions (capping
+libaom's partitions at 32 costs its speed 4 1.5% below and changes
+nothing at its speed 6). The partitions not coded here (the
+halves of a 64, the three- and four-way ones) and transforms smaller
+than their block are the compression follow-up.
 Measured before the trellis priced the zeros an end of block passes
 over: zeroing a transform's few levels outright bought luma about 2%
 but cost RGB 3% at low rates, a chroma weight trading one for the
@@ -1934,7 +1946,10 @@ pair of alpha signs in blocks both edges cut, and noise, a hard edge
 and a chroma checkerboard at the strongest filter strengths, and
 gratings at an angle a cell, in luma and in chroma alone, that make
 every directional mode of each plane turn, a superblock's top-right
-blocks among them reading the next superblock's row above; six
+blocks among them reading the next superblock's row above, and
+smooth ramps whose 64x64s are coded whole, with coefficients and
+chroma modes without CfL, beside the frame's edges, in a second tile
+and over threads; six
 streams and their reconstructions held to the hashes recorded under
 that decode, two at the coarsest steps, the same bytes on one thread
 and three, whose batches end at different rows; the stream's sequence

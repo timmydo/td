@@ -2,9 +2,10 @@
 //! and ADST the specification fixes (AV1 bitstream specification, section
 //! 7.13), which every decoder reproduces bit for bit, the forward
 //! butterflies libaom pairs them with, the quantizer steps, and the
-//! coefficient scans. Square sizes of 4 to 32 points and the 2:1
-//! rectangles between them: every transform a block of 8 to 32 luma
-//! pixels, square or halved, reaches. The butterflies are
+//! coefficient scans. Square sizes of 4 to 64 points and the 2:1
+//! rectangles of 4 to 32: every transform a block the export codes
+//! reaches, a 64-point square coding only its lower 32 frequencies each
+//! way (the spec zeroes the rest). The butterflies are
 //! tables of stages, each output one operation over the previous stage,
 //! extracted from libaom 3.9.1's `av1_inv_txfm1d.c` and
 //! `av1_fwd_txfm1d.c`, which `butterfly!` expands to straight code; the
@@ -13,7 +14,7 @@
 use std::convert::TryFrom;
 
 /// A transform's size, width by height: the squares, and the 2:1
-/// rectangles between them.
+/// rectangles of 4 to 32 points.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Size {
     S4,
@@ -26,6 +27,7 @@ pub enum Size {
     S16x8,
     S16x32,
     S32x16,
+    S64,
 }
 
 impl Size {
@@ -36,6 +38,7 @@ impl Size {
             Size::S8 | Size::S8x4 | Size::S8x16 => 8,
             Size::S16 | Size::S16x8 | Size::S16x32 => 16,
             Size::S32 | Size::S32x16 => 32,
+            Size::S64 => 64,
         }
     }
 
@@ -46,6 +49,7 @@ impl Size {
             Size::S8 | Size::S4x8 | Size::S16x8 => 8,
             Size::S16 | Size::S8x16 | Size::S32x16 => 16,
             Size::S32 | Size::S16x32 => 32,
+            Size::S64 => 64,
         }
     }
 
@@ -67,6 +71,7 @@ impl Size {
             (16, 8) => Size::S16x8,
             (16, 32) => Size::S16x32,
             (32, 16) => Size::S32x16,
+            (64, 64) => Size::S64,
             _ => return None,
         })
     }
@@ -78,6 +83,15 @@ impl Size {
         w == 2 * h || h == 2 * w
     }
 
+    /// The size whose coefficients are coded: a 64-point square's lower
+    /// 32 frequencies each way, packed row-major as a 32x32's.
+    pub fn coded(self) -> Size {
+        match self {
+            Size::S64 => Size::S32,
+            other => other,
+        }
+    }
+
     /// The spec's `TX_4X4`..`TX_32X16` index, `TX_4X8` 5 on.
     pub fn index(self) -> usize {
         match self {
@@ -85,6 +99,7 @@ impl Size {
             Size::S8 => 1,
             Size::S16 => 2,
             Size::S32 => 3,
+            Size::S64 => 4,
             Size::S4x8 => 5,
             Size::S8x4 => 6,
             Size::S8x16 => 7,
@@ -99,25 +114,27 @@ impl Size {
         match self {
             Size::S4 | Size::S4x8 | Size::S8x4 => 0,
             Size::S8 | Size::S8x16 | Size::S16x8 | Size::S16x32 | Size::S32x16 => 1,
-            Size::S16 | Size::S32 => 2,
+            Size::S16 | Size::S32 | Size::S64 => 2,
         }
     }
 
-    /// libaom's forward column shift: the rounding that keeps the
-    /// forward pair's output at the scale the inverse expects.
-    fn forward_column_shift(self) -> u32 {
+    /// libaom's forward shifts (`fwd_shift_*`): up on the input, down
+    /// after the columns and after the rows, which keep the forward
+    /// pair's output at the scale the inverse expects.
+    fn forward_shifts(self) -> (u32, u32, u32) {
         match self {
-            Size::S4 => 0,
-            Size::S8 | Size::S4x8 | Size::S8x4 => 1,
-            Size::S16 | Size::S8x16 | Size::S16x8 => 2,
-            Size::S32 | Size::S16x32 | Size::S32x16 => 4,
+            Size::S4 => (2, 0, 0),
+            Size::S8 | Size::S4x8 | Size::S8x4 => (2, 1, 0),
+            Size::S16 | Size::S8x16 | Size::S16x8 => (2, 2, 0),
+            Size::S32 | Size::S16x32 | Size::S32x16 => (2, 4, 0),
+            Size::S64 => (0, 2, 2),
         }
     }
 
     /// The spec's `dqDenom` shift: a transform of more than 256 points
-    /// dequantizes to half.
+    /// dequantizes to half, of more than 1024 to a quarter.
     pub fn dequant_shift(self) -> u32 {
-        u32::from(self.area() > 256)
+        u32::from(self.area() > 256) + u32::from(self.area() > 1024)
     }
 
     /// The default scan of this size.
@@ -133,6 +150,7 @@ impl Size {
             Size::S16x8 => &SCAN_16X8,
             Size::S16x32 => &SCAN_16X32,
             Size::S32x16 => &SCAN_32X16,
+            Size::S64 => &SCAN_32,
         }
     }
 }
@@ -390,6 +408,7 @@ fn inverse_1d(kernel: Kernel, x: &mut [i32]) {
         (Kernel::Dct, 8) => run(x, idct8),
         (Kernel::Dct, 16) => run(x, idct16),
         (Kernel::Dct, 32) => run(x, idct32),
+        (Kernel::Dct, 64) => run(x, idct64),
         (Kernel::Adst, 4) => iadst4(x),
         (Kernel::Adst, 8) => run(x, iadst8),
         (Kernel::Adst, 16) => run(x, iadst16),
@@ -404,6 +423,7 @@ fn forward_1d(kernel: Kernel, x: &mut [i32]) {
         (Kernel::Dct, 8) => run(x, fdct8),
         (Kernel::Dct, 16) => run(x, fdct16),
         (Kernel::Dct, 32) => run(x, fdct32),
+        (Kernel::Dct, 64) => run(x, fdct64),
         (Kernel::Adst, 4) => fadst4(x),
         (Kernel::Adst, 8) => run(x, fadst8),
         (Kernel::Adst, 16) => run(x, fadst16),
@@ -412,21 +432,29 @@ fn forward_1d(kernel: Kernel, x: &mut [i32]) {
 }
 
 /// The spec's 2D inverse transform (7.13.3) of `coeffs`, row-major with
-/// the row the vertical frequency, into `residual`, row-major pixels'
-/// worth of difference: rows first (a 2:1 rectangle's inputs scaled by
-/// the root of a half) with their shift, then columns with the final
-/// `Round2(.., 4)`, sixteen-bit clamps at each entry. Slices of another
-/// length than the size's area are left untouched.
+/// the row the vertical frequency at the coded size, into `residual`,
+/// row-major pixels' worth of difference at the full size: rows first (a
+/// 2:1 rectangle's inputs scaled by the root of a half) with their
+/// shift, then columns with the final `Round2(.., 4)`, sixteen-bit
+/// clamps at each entry. Slices of other lengths are left untouched.
 pub fn inverse(size: Size, tx: TxType, coeffs: &[i32], residual: &mut [i32]) {
     let (w, h) = (size.width(), size.height());
-    if coeffs.len() != w * h || residual.len() != w * h {
+    let coded_w = size.coded().width();
+    if coeffs.len() != size.coded().area() || residual.len() != w * h {
         return;
     }
-    let mut column = [0i32; 32];
+    let mut column = [0i32; 64];
     let Some(column) = column.get_mut(..h) else {
         return;
     };
-    for (row, out) in coeffs.chunks_exact(w).zip(residual.chunks_exact_mut(w)) {
+    let mut rows = coeffs.chunks_exact(coded_w);
+    for out in residual.chunks_exact_mut(w) {
+        // Past the coded frequencies a row is zero, and so is its
+        // transform.
+        out.fill(0);
+        let Some(row) = rows.next() else {
+            continue;
+        };
         for (o, &c) in out.iter_mut().zip(row) {
             let c = if size.is_rect2() {
                 round2(i64::from(c) * 2896, 12)
@@ -453,36 +481,65 @@ pub fn inverse(size: Size, tx: TxType, coeffs: &[i32], residual: &mut [i32]) {
     }
 }
 
-/// libaom's 2D forward transform of `residual`, the scale the inverse
-/// undoes: columns first over the residual doubled twice, the column
-/// shift, then rows, a 2:1 rectangle's scaled by the root of two. Slices
-/// of another length are left untouched.
+/// libaom's 2D forward transform of `residual` at the full size into
+/// `coeffs` at the coded size, the scale the inverse undoes: columns
+/// first over the residual shifted up, the column shift, then rows, a
+/// 2:1 rectangle's scaled by the root of two, with the row shift; a
+/// 64-point side keeps its lower 32 frequencies. Every pass's cosines
+/// have thirteen bits, where libaom's 64-point rows have ten. Slices of
+/// other lengths are left untouched.
 pub fn forward(size: Size, tx: TxType, residual: &[i32], coeffs: &mut [i32]) {
     let (w, h) = (size.width(), size.height());
-    if coeffs.len() != w * h || residual.len() != w * h {
+    let (coded_w, coded_h) = (size.coded().width(), size.coded().height());
+    if coeffs.len() != coded_w * coded_h || residual.len() != w * h {
         return;
     }
-    let mut column = [0i32; 32];
+    if w == coded_w {
+        forward_in(size, tx, residual, coeffs);
+        return;
+    }
+    // A 64-point row needs all its columns' outputs, which `coeffs` is
+    // too narrow to hold.
+    let mut wide = [0i32; 64 * 32];
+    let Some(wide) = wide.get_mut(..w * coded_h) else {
+        return;
+    };
+    forward_in(size, tx, residual, wide);
+    for (src, out) in wide.chunks_exact(w).zip(coeffs.chunks_exact_mut(coded_w)) {
+        for (o, &c) in out.iter_mut().zip(src) {
+            *o = c;
+        }
+    }
+}
+
+/// `forward` into `out`, the full width by the coded height.
+fn forward_in(size: Size, tx: TxType, residual: &[i32], out: &mut [i32]) {
+    let (w, h) = (size.width(), size.height());
+    let (up, column_shift, row_shift) = size.forward_shifts();
+    let mut column = [0i32; 64];
     let Some(column) = column.get_mut(..h) else {
         return;
     };
     for j in 0..w {
-        for (c, row) in column.iter_mut().zip(residual.chunks_exact(w)) {
-            *c = row.get(j).copied().unwrap_or(0) << 2;
+        for (c, r) in column.iter_mut().zip(residual.chunks_exact(w)) {
+            *c = r.get(j).copied().unwrap_or(0) << up;
         }
         forward_1d(tx.vertical(), column);
-        for (c, row) in column.iter().zip(coeffs.chunks_exact_mut(w)) {
-            if let Some(o) = row.get_mut(j) {
-                *o = round2(i64::from(*c), size.forward_column_shift());
+        for (c, r) in column.iter().zip(out.chunks_exact_mut(w)) {
+            if let Some(o) = r.get_mut(j) {
+                *o = round2(i64::from(*c), column_shift);
             }
         }
     }
-    for row in coeffs.chunks_exact_mut(w) {
+    for row in out.chunks_exact_mut(w) {
         forward_1d(tx.horizontal(), row);
-        if size.is_rect2() {
-            for c in row.iter_mut() {
-                *c = round2(i64::from(*c) * 5793, 12);
-            }
+        for c in row.iter_mut() {
+            let v = if size.is_rect2() {
+                round2(i64::from(*c) * 5793, 12)
+            } else {
+                *c
+            };
+            *c = round2(i64::from(v), row_shift);
         }
     }
 }
@@ -893,6 +950,280 @@ butterfly! {
 }
 
 butterfly! {
+    /// The inverse DCT of 64 points, stage by stage (spec 7.13.2.3).
+    fn idct64(64, COSPI12, INVERSE_BITS, clamp16) [
+        [
+            C(0), C(32), C(16), C(48), C(8), C(40), C(24), C(56), C(4), C(36), C(20), C(52),
+            C(12), C(44), C(28), C(60), C(2), C(34), C(18), C(50), C(10), C(42), C(26),
+            C(58), C(6), C(38), C(22), C(54), C(14), C(46), C(30), C(62), C(1), C(33),
+            C(17), C(49), C(9), C(41), C(25), C(57), C(5), C(37), C(21), C(53), C(13),
+            C(45), C(29), C(61), C(3), C(35), C(19), C(51), C(11), C(43), C(27), C(59),
+            C(7), C(39), C(23), C(55), C(15), C(47), C(31), C(63),
+        ],
+        [
+            C(0), C(1), C(2), C(3), C(4), C(5), C(6), C(7), C(8), C(9), C(10), C(11), C(12),
+            C(13), C(14), C(15), C(16), C(17), C(18), C(19), C(20), C(21), C(22), C(23),
+            C(24), C(25), C(26), C(27), C(28), C(29), C(30), C(31), B(63, 32, -1, 63),
+            B(31, 33, -33, 62), B(47, 34, -17, 61), B(15, 35, -49, 60), B(55, 36, -9, 59),
+            B(23, 37, -41, 58), B(39, 38, -25, 57), B(7, 39, -57, 56), B(59, 40, -5, 55),
+            B(27, 41, -37, 54), B(43, 42, -21, 53), B(11, 43, -53, 52), B(51, 44, -13, 51),
+            B(19, 45, -45, 50), B(35, 46, -29, 49), B(3, 47, -61, 48), B(61, 47, 3, 48),
+            B(29, 46, 35, 49), B(45, 45, 19, 50), B(13, 44, 51, 51), B(53, 43, 11, 52),
+            B(21, 42, 43, 53), B(37, 41, 27, 54), B(5, 40, 59, 55), B(57, 39, 7, 56),
+            B(25, 38, 39, 57), B(41, 37, 23, 58), B(9, 36, 55, 59), B(49, 35, 15, 60),
+            B(17, 34, 47, 61), B(33, 33, 31, 62), B(1, 32, 63, 63),
+        ],
+        [
+            C(0), C(1), C(2), C(3), C(4), C(5), C(6), C(7), C(8), C(9), C(10), C(11), C(12),
+            C(13), C(14), C(15), B(62, 16, -2, 31), B(30, 17, -34, 30), B(46, 18, -18, 29),
+            B(14, 19, -50, 28), B(54, 20, -10, 27), B(22, 21, -42, 26), B(38, 22, -26, 25),
+            B(6, 23, -58, 24), B(58, 23, 6, 24), B(26, 22, 38, 25), B(42, 21, 22, 26),
+            B(10, 20, 54, 27), B(50, 19, 14, 28), B(18, 18, 46, 29), B(34, 17, 30, 30),
+            B(2, 16, 62, 31), A(32, 33), S(32, 33), S(35, 34), A(34, 35), A(36, 37),
+            S(36, 37), S(39, 38), A(38, 39), A(40, 41), S(40, 41), S(43, 42), A(42, 43),
+            A(44, 45), S(44, 45), S(47, 46), A(46, 47), A(48, 49), S(48, 49), S(51, 50),
+            A(50, 51), A(52, 53), S(52, 53), S(55, 54), A(54, 55), A(56, 57), S(56, 57),
+            S(59, 58), A(58, 59), A(60, 61), S(60, 61), S(63, 62), A(62, 63),
+        ],
+        [
+            C(0), C(1), C(2), C(3), C(4), C(5), C(6), C(7), B(60, 8, -4, 15),
+            B(28, 9, -36, 14), B(44, 10, -20, 13), B(12, 11, -52, 12), B(52, 11, 12, 12),
+            B(20, 10, 44, 13), B(36, 9, 28, 14), B(4, 8, 60, 15), A(16, 17), S(16, 17),
+            S(19, 18), A(18, 19), A(20, 21), S(20, 21), S(23, 22), A(22, 23), A(24, 25),
+            S(24, 25), S(27, 26), A(26, 27), A(28, 29), S(28, 29), S(31, 30), A(30, 31),
+            C(32), B(-4, 33, 60, 62), B(-60, 34, -4, 61), C(35), C(36), B(-36, 37, 28, 58),
+            B(-28, 38, -36, 57), C(39), C(40), B(-20, 41, 44, 54), B(-44, 42, -20, 53),
+            C(43), C(44), B(-52, 45, 12, 50), B(-12, 46, -52, 49), C(47), C(48),
+            B(-52, 46, 12, 49), B(12, 45, 52, 50), C(51), C(52), B(-20, 42, 44, 53),
+            B(44, 41, 20, 54), C(55), C(56), B(-36, 38, 28, 57), B(28, 37, 36, 58), C(59),
+            C(60), B(-4, 34, 60, 61), B(60, 33, 4, 62), C(63),
+        ],
+        [
+            C(0), C(1), C(2), C(3), B(56, 4, -8, 7), B(24, 5, -40, 6), B(40, 5, 24, 6),
+            B(8, 4, 56, 7), A(8, 9), S(8, 9), S(11, 10), A(10, 11), A(12, 13), S(12, 13),
+            S(15, 14), A(14, 15), C(16), B(-8, 17, 56, 30), B(-56, 18, -8, 29), C(19),
+            C(20), B(-40, 21, 24, 26), B(-24, 22, -40, 25), C(23), C(24),
+            B(-40, 22, 24, 25), B(24, 21, 40, 26), C(27), C(28), B(-8, 18, 56, 29),
+            B(56, 17, 8, 30), C(31), A(32, 35), A(33, 34), S(33, 34), S(32, 35), S(39, 36),
+            S(38, 37), A(37, 38), A(36, 39), A(40, 43), A(41, 42), S(41, 42), S(40, 43),
+            S(47, 44), S(46, 45), A(45, 46), A(44, 47), A(48, 51), A(49, 50), S(49, 50),
+            S(48, 51), S(55, 52), S(54, 53), A(53, 54), A(52, 55), A(56, 59), A(57, 58),
+            S(57, 58), S(56, 59), S(63, 60), S(62, 61), A(61, 62), A(60, 63),
+        ],
+        [
+            B(32, 0, 32, 1), B(32, 0, -32, 1), B(48, 2, -16, 3), B(16, 2, 48, 3), A(4, 5),
+            S(4, 5), S(7, 6), A(6, 7), C(8), B(-16, 9, 48, 14), B(-48, 10, -16, 13), C(11),
+            C(12), B(-16, 10, 48, 13), B(48, 9, 16, 14), C(15), A(16, 19), A(17, 18),
+            S(17, 18), S(16, 19), S(23, 20), S(22, 21), A(21, 22), A(20, 23), A(24, 27),
+            A(25, 26), S(25, 26), S(24, 27), S(31, 28), S(30, 29), A(29, 30), A(28, 31),
+            C(32), C(33), B(-8, 34, 56, 61), B(-8, 35, 56, 60), B(-56, 36, -8, 59),
+            B(-56, 37, -8, 58), C(38), C(39), C(40), C(41), B(-40, 42, 24, 53),
+            B(-40, 43, 24, 52), B(-24, 44, -40, 51), B(-24, 45, -40, 50), C(46), C(47),
+            C(48), C(49), B(-40, 45, 24, 50), B(-40, 44, 24, 51), B(24, 43, 40, 52),
+            B(24, 42, 40, 53), C(54), C(55), C(56), C(57), B(-8, 37, 56, 58),
+            B(-8, 36, 56, 59), B(56, 35, 8, 60), B(56, 34, 8, 61), C(62), C(63),
+        ],
+        [
+            A(0, 3), A(1, 2), S(1, 2), S(0, 3), C(4), B(-32, 5, 32, 6), B(32, 5, 32, 6),
+            C(7), A(8, 11), A(9, 10), S(9, 10), S(8, 11), S(15, 12), S(14, 13), A(13, 14),
+            A(12, 15), C(16), C(17), B(-16, 18, 48, 29), B(-16, 19, 48, 28),
+            B(-48, 20, -16, 27), B(-48, 21, -16, 26), C(22), C(23), C(24), C(25),
+            B(-16, 21, 48, 26), B(-16, 20, 48, 27), B(48, 19, 16, 28), B(48, 18, 16, 29),
+            C(30), C(31), A(32, 39), A(33, 38), A(34, 37), A(35, 36), S(35, 36), S(34, 37),
+            S(33, 38), S(32, 39), S(47, 40), S(46, 41), S(45, 42), S(44, 43), A(43, 44),
+            A(42, 45), A(41, 46), A(40, 47), A(48, 55), A(49, 54), A(50, 53), A(51, 52),
+            S(51, 52), S(50, 53), S(49, 54), S(48, 55), S(63, 56), S(62, 57), S(61, 58),
+            S(60, 59), A(59, 60), A(58, 61), A(57, 62), A(56, 63),
+        ],
+        [
+            A(0, 7), A(1, 6), A(2, 5), A(3, 4), S(3, 4), S(2, 5), S(1, 6), S(0, 7), C(8),
+            C(9), B(-32, 10, 32, 13), B(-32, 11, 32, 12), B(32, 11, 32, 12),
+            B(32, 10, 32, 13), C(14), C(15), A(16, 23), A(17, 22), A(18, 21), A(19, 20),
+            S(19, 20), S(18, 21), S(17, 22), S(16, 23), S(31, 24), S(30, 25), S(29, 26),
+            S(28, 27), A(27, 28), A(26, 29), A(25, 30), A(24, 31), C(32), C(33), C(34),
+            C(35), B(-16, 36, 48, 59), B(-16, 37, 48, 58), B(-16, 38, 48, 57),
+            B(-16, 39, 48, 56), B(-48, 40, -16, 55), B(-48, 41, -16, 54),
+            B(-48, 42, -16, 53), B(-48, 43, -16, 52), C(44), C(45), C(46), C(47), C(48),
+            C(49), C(50), C(51), B(-16, 43, 48, 52), B(-16, 42, 48, 53), B(-16, 41, 48, 54),
+            B(-16, 40, 48, 55), B(48, 39, 16, 56), B(48, 38, 16, 57), B(48, 37, 16, 58),
+            B(48, 36, 16, 59), C(60), C(61), C(62), C(63),
+        ],
+        [
+            A(0, 15), A(1, 14), A(2, 13), A(3, 12), A(4, 11), A(5, 10), A(6, 9), A(7, 8),
+            S(7, 8), S(6, 9), S(5, 10), S(4, 11), S(3, 12), S(2, 13), S(1, 14), S(0, 15),
+            C(16), C(17), C(18), C(19), B(-32, 20, 32, 27), B(-32, 21, 32, 26),
+            B(-32, 22, 32, 25), B(-32, 23, 32, 24), B(32, 23, 32, 24), B(32, 22, 32, 25),
+            B(32, 21, 32, 26), B(32, 20, 32, 27), C(28), C(29), C(30), C(31), A(32, 47),
+            A(33, 46), A(34, 45), A(35, 44), A(36, 43), A(37, 42), A(38, 41), A(39, 40),
+            S(39, 40), S(38, 41), S(37, 42), S(36, 43), S(35, 44), S(34, 45), S(33, 46),
+            S(32, 47), S(63, 48), S(62, 49), S(61, 50), S(60, 51), S(59, 52), S(58, 53),
+            S(57, 54), S(56, 55), A(55, 56), A(54, 57), A(53, 58), A(52, 59), A(51, 60),
+            A(50, 61), A(49, 62), A(48, 63),
+        ],
+        [
+            A(0, 31), A(1, 30), A(2, 29), A(3, 28), A(4, 27), A(5, 26), A(6, 25), A(7, 24),
+            A(8, 23), A(9, 22), A(10, 21), A(11, 20), A(12, 19), A(13, 18), A(14, 17),
+            A(15, 16), S(15, 16), S(14, 17), S(13, 18), S(12, 19), S(11, 20), S(10, 21),
+            S(9, 22), S(8, 23), S(7, 24), S(6, 25), S(5, 26), S(4, 27), S(3, 28), S(2, 29),
+            S(1, 30), S(0, 31), C(32), C(33), C(34), C(35), C(36), C(37), C(38), C(39),
+            B(-32, 40, 32, 55), B(-32, 41, 32, 54), B(-32, 42, 32, 53), B(-32, 43, 32, 52),
+            B(-32, 44, 32, 51), B(-32, 45, 32, 50), B(-32, 46, 32, 49), B(-32, 47, 32, 48),
+            B(32, 47, 32, 48), B(32, 46, 32, 49), B(32, 45, 32, 50), B(32, 44, 32, 51),
+            B(32, 43, 32, 52), B(32, 42, 32, 53), B(32, 41, 32, 54), B(32, 40, 32, 55),
+            C(56), C(57), C(58), C(59), C(60), C(61), C(62), C(63),
+        ],
+        [
+            A(0, 63), A(1, 62), A(2, 61), A(3, 60), A(4, 59), A(5, 58), A(6, 57), A(7, 56),
+            A(8, 55), A(9, 54), A(10, 53), A(11, 52), A(12, 51), A(13, 50), A(14, 49),
+            A(15, 48), A(16, 47), A(17, 46), A(18, 45), A(19, 44), A(20, 43), A(21, 42),
+            A(22, 41), A(23, 40), A(24, 39), A(25, 38), A(26, 37), A(27, 36), A(28, 35),
+            A(29, 34), A(30, 33), A(31, 32), S(31, 32), S(30, 33), S(29, 34), S(28, 35),
+            S(27, 36), S(26, 37), S(25, 38), S(24, 39), S(23, 40), S(22, 41), S(21, 42),
+            S(20, 43), S(19, 44), S(18, 45), S(17, 46), S(16, 47), S(15, 48), S(14, 49),
+            S(13, 50), S(12, 51), S(11, 52), S(10, 53), S(9, 54), S(8, 55), S(7, 56),
+            S(6, 57), S(5, 58), S(4, 59), S(3, 60), S(2, 61), S(1, 62), S(0, 63),
+        ],
+    ]
+}
+
+butterfly! {
+    /// The forward DCT of 64 points: libaom's butterflies, the inverse's transpose.
+    fn fdct64(64, COSPI13, FORWARD_BITS, keep) [
+        [
+            A(0, 63), A(1, 62), A(2, 61), A(3, 60), A(4, 59), A(5, 58), A(6, 57), A(7, 56),
+            A(8, 55), A(9, 54), A(10, 53), A(11, 52), A(12, 51), A(13, 50), A(14, 49),
+            A(15, 48), A(16, 47), A(17, 46), A(18, 45), A(19, 44), A(20, 43), A(21, 42),
+            A(22, 41), A(23, 40), A(24, 39), A(25, 38), A(26, 37), A(27, 36), A(28, 35),
+            A(29, 34), A(30, 33), A(31, 32), S(31, 32), S(30, 33), S(29, 34), S(28, 35),
+            S(27, 36), S(26, 37), S(25, 38), S(24, 39), S(23, 40), S(22, 41), S(21, 42),
+            S(20, 43), S(19, 44), S(18, 45), S(17, 46), S(16, 47), S(15, 48), S(14, 49),
+            S(13, 50), S(12, 51), S(11, 52), S(10, 53), S(9, 54), S(8, 55), S(7, 56),
+            S(6, 57), S(5, 58), S(4, 59), S(3, 60), S(2, 61), S(1, 62), S(0, 63),
+        ],
+        [
+            A(0, 31), A(1, 30), A(2, 29), A(3, 28), A(4, 27), A(5, 26), A(6, 25), A(7, 24),
+            A(8, 23), A(9, 22), A(10, 21), A(11, 20), A(12, 19), A(13, 18), A(14, 17),
+            A(15, 16), S(15, 16), S(14, 17), S(13, 18), S(12, 19), S(11, 20), S(10, 21),
+            S(9, 22), S(8, 23), S(7, 24), S(6, 25), S(5, 26), S(4, 27), S(3, 28), S(2, 29),
+            S(1, 30), S(0, 31), C(32), C(33), C(34), C(35), C(36), C(37), C(38), C(39),
+            B(-32, 40, 32, 55), B(-32, 41, 32, 54), B(-32, 42, 32, 53), B(-32, 43, 32, 52),
+            B(-32, 44, 32, 51), B(-32, 45, 32, 50), B(-32, 46, 32, 49), B(-32, 47, 32, 48),
+            B(32, 48, 32, 47), B(32, 49, 32, 46), B(32, 50, 32, 45), B(32, 51, 32, 44),
+            B(32, 52, 32, 43), B(32, 53, 32, 42), B(32, 54, 32, 41), B(32, 55, 32, 40),
+            C(56), C(57), C(58), C(59), C(60), C(61), C(62), C(63),
+        ],
+        [
+            A(0, 15), A(1, 14), A(2, 13), A(3, 12), A(4, 11), A(5, 10), A(6, 9), A(7, 8),
+            S(7, 8), S(6, 9), S(5, 10), S(4, 11), S(3, 12), S(2, 13), S(1, 14), S(0, 15),
+            C(16), C(17), C(18), C(19), B(-32, 20, 32, 27), B(-32, 21, 32, 26),
+            B(-32, 22, 32, 25), B(-32, 23, 32, 24), B(32, 24, 32, 23), B(32, 25, 32, 22),
+            B(32, 26, 32, 21), B(32, 27, 32, 20), C(28), C(29), C(30), C(31), A(32, 47),
+            A(33, 46), A(34, 45), A(35, 44), A(36, 43), A(37, 42), A(38, 41), A(39, 40),
+            S(39, 40), S(38, 41), S(37, 42), S(36, 43), S(35, 44), S(34, 45), S(33, 46),
+            S(32, 47), S(63, 48), S(62, 49), S(61, 50), S(60, 51), S(59, 52), S(58, 53),
+            S(57, 54), S(56, 55), A(56, 55), A(57, 54), A(58, 53), A(59, 52), A(60, 51),
+            A(61, 50), A(62, 49), A(63, 48),
+        ],
+        [
+            A(0, 7), A(1, 6), A(2, 5), A(3, 4), S(3, 4), S(2, 5), S(1, 6), S(0, 7), C(8),
+            C(9), B(-32, 10, 32, 13), B(-32, 11, 32, 12), B(32, 12, 32, 11),
+            B(32, 13, 32, 10), C(14), C(15), A(16, 23), A(17, 22), A(18, 21), A(19, 20),
+            S(19, 20), S(18, 21), S(17, 22), S(16, 23), S(31, 24), S(30, 25), S(29, 26),
+            S(28, 27), A(28, 27), A(29, 26), A(30, 25), A(31, 24), C(32), C(33), C(34),
+            C(35), B(-16, 36, 48, 59), B(-16, 37, 48, 58), B(-16, 38, 48, 57),
+            B(-16, 39, 48, 56), B(-48, 40, -16, 55), B(-48, 41, -16, 54),
+            B(-48, 42, -16, 53), B(-48, 43, -16, 52), C(44), C(45), C(46), C(47), C(48),
+            C(49), C(50), C(51), B(48, 52, -16, 43), B(48, 53, -16, 42), B(48, 54, -16, 41),
+            B(48, 55, -16, 40), B(16, 56, 48, 39), B(16, 57, 48, 38), B(16, 58, 48, 37),
+            B(16, 59, 48, 36), C(60), C(61), C(62), C(63),
+        ],
+        [
+            A(0, 3), A(1, 2), S(1, 2), S(0, 3), C(4), B(-32, 5, 32, 6), B(32, 6, 32, 5),
+            C(7), A(8, 11), A(9, 10), S(9, 10), S(8, 11), S(15, 12), S(14, 13), A(14, 13),
+            A(15, 12), C(16), C(17), B(-16, 18, 48, 29), B(-16, 19, 48, 28),
+            B(-48, 20, -16, 27), B(-48, 21, -16, 26), C(22), C(23), C(24), C(25),
+            B(48, 26, -16, 21), B(48, 27, -16, 20), B(16, 28, 48, 19), B(16, 29, 48, 18),
+            C(30), C(31), A(32, 39), A(33, 38), A(34, 37), A(35, 36), S(35, 36), S(34, 37),
+            S(33, 38), S(32, 39), S(47, 40), S(46, 41), S(45, 42), S(44, 43), A(44, 43),
+            A(45, 42), A(46, 41), A(47, 40), A(48, 55), A(49, 54), A(50, 53), A(51, 52),
+            S(51, 52), S(50, 53), S(49, 54), S(48, 55), S(63, 56), S(62, 57), S(61, 58),
+            S(60, 59), A(60, 59), A(61, 58), A(62, 57), A(63, 56),
+        ],
+        [
+            B(32, 0, 32, 1), B(-32, 1, 32, 0), B(48, 2, 16, 3), B(48, 3, -16, 2), A(4, 5),
+            S(4, 5), S(7, 6), A(7, 6), C(8), B(-16, 9, 48, 14), B(-48, 10, -16, 13), C(11),
+            C(12), B(48, 13, -16, 10), B(16, 14, 48, 9), C(15), A(16, 19), A(17, 18),
+            S(17, 18), S(16, 19), S(23, 20), S(22, 21), A(22, 21), A(23, 20), A(24, 27),
+            A(25, 26), S(25, 26), S(24, 27), S(31, 28), S(30, 29), A(30, 29), A(31, 28),
+            C(32), C(33), B(-8, 34, 56, 61), B(-8, 35, 56, 60), B(-56, 36, -8, 59),
+            B(-56, 37, -8, 58), C(38), C(39), C(40), C(41), B(-40, 42, 24, 53),
+            B(-40, 43, 24, 52), B(-24, 44, -40, 51), B(-24, 45, -40, 50), C(46), C(47),
+            C(48), C(49), B(24, 50, -40, 45), B(24, 51, -40, 44), B(40, 52, 24, 43),
+            B(40, 53, 24, 42), C(54), C(55), C(56), C(57), B(56, 58, -8, 37),
+            B(56, 59, -8, 36), B(8, 60, 56, 35), B(8, 61, 56, 34), C(62), C(63),
+        ],
+        [
+            C(0), C(1), C(2), C(3), B(56, 4, 8, 7), B(24, 5, 40, 6), B(24, 6, -40, 5),
+            B(56, 7, -8, 4), A(8, 9), S(8, 9), S(11, 10), A(11, 10), A(12, 13), S(12, 13),
+            S(15, 14), A(15, 14), C(16), B(-8, 17, 56, 30), B(-56, 18, -8, 29), C(19),
+            C(20), B(-40, 21, 24, 26), B(-24, 22, -40, 25), C(23), C(24),
+            B(24, 25, -40, 22), B(40, 26, 24, 21), C(27), C(28), B(56, 29, -8, 18),
+            B(8, 30, 56, 17), C(31), A(32, 35), A(33, 34), S(33, 34), S(32, 35), S(39, 36),
+            S(38, 37), A(38, 37), A(39, 36), A(40, 43), A(41, 42), S(41, 42), S(40, 43),
+            S(47, 44), S(46, 45), A(46, 45), A(47, 44), A(48, 51), A(49, 50), S(49, 50),
+            S(48, 51), S(55, 52), S(54, 53), A(54, 53), A(55, 52), A(56, 59), A(57, 58),
+            S(57, 58), S(56, 59), S(63, 60), S(62, 61), A(62, 61), A(63, 60),
+        ],
+        [
+            C(0), C(1), C(2), C(3), C(4), C(5), C(6), C(7), B(60, 8, 4, 15),
+            B(28, 9, 36, 14), B(44, 10, 20, 13), B(12, 11, 52, 12), B(12, 12, -52, 11),
+            B(44, 13, -20, 10), B(28, 14, -36, 9), B(60, 15, -4, 8), A(16, 17), S(16, 17),
+            S(19, 18), A(19, 18), A(20, 21), S(20, 21), S(23, 22), A(23, 22), A(24, 25),
+            S(24, 25), S(27, 26), A(27, 26), A(28, 29), S(28, 29), S(31, 30), A(31, 30),
+            C(32), B(-4, 33, 60, 62), B(-60, 34, -4, 61), C(35), C(36), B(-36, 37, 28, 58),
+            B(-28, 38, -36, 57), C(39), C(40), B(-20, 41, 44, 54), B(-44, 42, -20, 53),
+            C(43), C(44), B(-52, 45, 12, 50), B(-12, 46, -52, 49), C(47), C(48),
+            B(12, 49, -52, 46), B(52, 50, 12, 45), C(51), C(52), B(44, 53, -20, 42),
+            B(20, 54, 44, 41), C(55), C(56), B(28, 57, -36, 38), B(36, 58, 28, 37), C(59),
+            C(60), B(60, 61, -4, 34), B(4, 62, 60, 33), C(63),
+        ],
+        [
+            C(0), C(1), C(2), C(3), C(4), C(5), C(6), C(7), C(8), C(9), C(10), C(11), C(12),
+            C(13), C(14), C(15), B(62, 16, 2, 31), B(30, 17, 34, 30), B(46, 18, 18, 29),
+            B(14, 19, 50, 28), B(54, 20, 10, 27), B(22, 21, 42, 26), B(38, 22, 26, 25),
+            B(6, 23, 58, 24), B(6, 24, -58, 23), B(38, 25, -26, 22), B(22, 26, -42, 21),
+            B(54, 27, -10, 20), B(14, 28, -50, 19), B(46, 29, -18, 18), B(30, 30, -34, 17),
+            B(62, 31, -2, 16), A(32, 33), S(32, 33), S(35, 34), A(35, 34), A(36, 37),
+            S(36, 37), S(39, 38), A(39, 38), A(40, 41), S(40, 41), S(43, 42), A(43, 42),
+            A(44, 45), S(44, 45), S(47, 46), A(47, 46), A(48, 49), S(48, 49), S(51, 50),
+            A(51, 50), A(52, 53), S(52, 53), S(55, 54), A(55, 54), A(56, 57), S(56, 57),
+            S(59, 58), A(59, 58), A(60, 61), S(60, 61), S(63, 62), A(63, 62),
+        ],
+        [
+            C(0), C(1), C(2), C(3), C(4), C(5), C(6), C(7), C(8), C(9), C(10), C(11), C(12),
+            C(13), C(14), C(15), C(16), C(17), C(18), C(19), C(20), C(21), C(22), C(23),
+            C(24), C(25), C(26), C(27), C(28), C(29), C(30), C(31), B(63, 32, 1, 63),
+            B(31, 33, 33, 62), B(47, 34, 17, 61), B(15, 35, 49, 60), B(55, 36, 9, 59),
+            B(23, 37, 41, 58), B(39, 38, 25, 57), B(7, 39, 57, 56), B(59, 40, 5, 55),
+            B(27, 41, 37, 54), B(43, 42, 21, 53), B(11, 43, 53, 52), B(51, 44, 13, 51),
+            B(19, 45, 45, 50), B(35, 46, 29, 49), B(3, 47, 61, 48), B(3, 48, -61, 47),
+            B(35, 49, -29, 46), B(19, 50, -45, 45), B(51, 51, -13, 44), B(11, 52, -53, 43),
+            B(43, 53, -21, 42), B(27, 54, -37, 41), B(59, 55, -5, 40), B(7, 56, -57, 39),
+            B(39, 57, -25, 38), B(23, 58, -41, 37), B(55, 59, -9, 36), B(15, 60, -49, 35),
+            B(47, 61, -17, 34), B(31, 62, -33, 33), B(63, 63, -1, 32),
+        ],
+        [
+            C(0), C(32), C(16), C(48), C(8), C(40), C(24), C(56), C(4), C(36), C(20), C(52),
+            C(12), C(44), C(28), C(60), C(2), C(34), C(18), C(50), C(10), C(42), C(26),
+            C(58), C(6), C(38), C(22), C(54), C(14), C(46), C(30), C(62), C(1), C(33),
+            C(17), C(49), C(9), C(41), C(25), C(57), C(5), C(37), C(21), C(53), C(13),
+            C(45), C(29), C(61), C(3), C(35), C(19), C(51), C(11), C(43), C(27), C(59),
+            C(7), C(39), C(23), C(55), C(15), C(47), C(31), C(63),
+        ],
+    ]
+}
+
+butterfly! {
     /// The forward ADST of 8 points: libaom's butterflies.
     fn fadst8(8, COSPI13, FORWARD_BITS, keep) [
         [
@@ -1238,8 +1569,8 @@ mod tests {
         }
     }
 
-    const SIZES: [Size; 4] = [Size::S4, Size::S8, Size::S16, Size::S32];
-    const ALL: [Size; 10] = [
+    const SIZES: [Size; 5] = [Size::S4, Size::S8, Size::S16, Size::S32, Size::S64];
+    const ALL: [Size; 11] = [
         Size::S4,
         Size::S8,
         Size::S16,
@@ -1250,6 +1581,7 @@ mod tests {
         Size::S16x8,
         Size::S16x32,
         Size::S32x16,
+        Size::S64,
     ];
     const TYPES: [TxType; 4] = [
         TxType::DctDct,
@@ -1307,8 +1639,10 @@ mod tests {
                 inverse_1d(Kernel::Dct, &mut x);
                 let want = reference_idct(&coeffs);
                 for (i, (got, want)) in x.iter().zip(want.iter()).enumerate() {
+                    // Two more stages' rounding at 64 points.
                     let error = (f64::from(*got) - want).abs();
-                    assert!(error <= 8.0, "{size:?} [{i}] {got} vs {want}");
+                    let tolerance = if n == 64 { 12.0 } else { 8.0 };
+                    assert!(error <= tolerance, "{size:?} [{i}] {got} vs {want}");
                 }
             }
         }
@@ -1322,7 +1656,7 @@ mod tests {
         for size in SIZES {
             let n = size.width();
             for kernel in [Kernel::Dct, Kernel::Adst] {
-                if kernel == Kernel::Adst && size == Size::S32 {
+                if kernel == Kernel::Adst && size.width() >= 32 {
                     continue;
                 }
                 let columns: Vec<Vec<f64>> = (0..n)
@@ -1347,30 +1681,69 @@ mod tests {
         }
     }
 
+    /// A residual of `size` whose frequencies along a 64-point side all
+    /// lie in the lower 32, which the coded coefficients keep: random
+    /// cosines at those frequencies, at most 255 in all.
+    fn band_limited(size: Size, rng: &mut Lcg) -> Vec<i32> {
+        let (w, h) = (size.width(), size.height());
+        let terms: Vec<(f64, usize, usize)> = (0..6)
+            .map(|_| {
+                let u = rng.next() as usize % w.min(32);
+                let v = rng.next() as usize % h.min(32);
+                (f64::from(rng.signed(40)), u, v)
+            })
+            .collect();
+        let wave = |k: usize, i: usize, n: usize| {
+            ((2 * i + 1) as f64 * k as f64 * std::f64::consts::PI / (2 * n) as f64).cos()
+        };
+        (0..w * h)
+            .map(|p| {
+                let (y, x) = (p / w, p % w);
+                terms
+                    .iter()
+                    .map(|&(a, u, v)| a * wave(u, x, w) * wave(v, y, h))
+                    .sum::<f64>()
+                    .round() as i32
+            })
+            .collect()
+    }
+
     #[test]
     fn the_forward_and_inverse_round_trip_a_residual() {
         let mut rng = Lcg(11);
         for size in ALL {
             let n = size.area();
+            let coded = size.coded().area();
             for tx in TYPES {
-                // No 32-point ADST: a 32 either way is DCT only.
-                if size.width().max(size.height()) == 32 && tx != TxType::DctDct {
+                // No 32- or 64-point ADST: such a side is DCT only.
+                if size.width().max(size.height()) >= 32 && tx != TxType::DctDct {
                     continue;
                 }
                 for _ in 0..20 {
-                    let residual: Vec<i32> = (0..n).map(|_| rng.signed(255)).collect();
-                    let mut coeffs = vec![0i32; n];
+                    // What a 64-point side codes is its lower half.
+                    let residual: Vec<i32> = if coded < n {
+                        band_limited(size, &mut rng)
+                    } else {
+                        (0..n).map(|_| rng.signed(255)).collect()
+                    };
+                    let mut coeffs = vec![0i32; coded];
                     forward(size, tx, &residual, &mut coeffs);
                     let mut back = vec![0i32; n];
                     inverse(size, tx, &coeffs, &mut back);
+                    // A 64-point side also drops its upper half of the
+                    // rounding the residual carries.
+                    let tolerance = if coded < n { 3 } else { 2 };
                     for (i, (b, r)) in back.iter().zip(&residual).enumerate() {
-                        assert!((b - r).abs() <= 2, "{size:?} {tx:?} [{i}] {b} vs {r}");
+                        assert!(
+                            (b - r).abs() <= tolerance,
+                            "{size:?} {tx:?} [{i}] {b} vs {r}"
+                        );
                     }
                 }
                 // The extremes stay within the sixteen-bit ranges.
                 for v in [-255, 255] {
                     let residual = vec![v; n];
-                    let mut coeffs = vec![0i32; n];
+                    let mut coeffs = vec![0i32; coded];
                     forward(size, tx, &residual, &mut coeffs);
                     let mut back = vec![0i32; n];
                     inverse(size, tx, &coeffs, &mut back);
@@ -1385,14 +1758,15 @@ mod tests {
 
     #[test]
     fn a_flat_block_is_one_dc_coefficient_at_the_documented_scale() {
-        // Eight times the orthonormal DC, four past 256 points, where the
-        // dequantizer halves: the root of the area times 8 or 4.
+        // Eight times the orthonormal DC, four past 256 points and two
+        // past 1024, as the dequantizer halves and quarters: the root of
+        // the area times 8, 4 or 2.
         for size in ALL {
             let n = size.area();
             let residual = vec![100i32; n];
-            let mut coeffs = vec![0i32; n];
+            let mut coeffs = vec![0i32; size.coded().area()];
             forward(size, TxType::DctDct, &residual, &mut coeffs);
-            let scale = if n > 256 { 4.0 } else { 8.0 };
+            let scale = 8.0 / f64::from(1 << size.dequant_shift());
             let want = (scale * (n as f64).sqrt() * 100.0).round() as i32;
             assert!(
                 (coeffs[0] - want).abs() * 100 <= want,
@@ -1418,9 +1792,10 @@ mod tests {
     #[test]
     fn the_scans_walk_the_anti_diagonals_of_a_row_major_block() {
         for size in ALL {
-            let w = size.width();
+            let coded = size.coded();
+            let w = coded.width();
             let scan = size.scan();
-            let mut seen = vec![false; size.area()];
+            let mut seen = vec![false; coded.area()];
             let mut last = 0;
             for (c, &pos) in scan.iter().enumerate() {
                 let pos = usize::from(pos);
@@ -1434,11 +1809,11 @@ mod tests {
             assert_eq!(scan[0], 0);
             // The squares and tall rectangles take the horizontal
             // frequency first, the wide ones the vertical.
-            let second = if size.width() > size.height() { w } else { 1 };
+            let second = if coded.width() > coded.height() { w } else { 1 };
             assert_eq!(usize::from(scan[1]), second, "{size:?}");
-            assert_eq!(Size::of(w, size.height()), Some(size));
+            assert_eq!(Size::of(size.width(), size.height()), Some(size));
         }
-        assert_eq!(Size::of(64, 64), None);
+        assert_eq!(Size::of(64, 32), None);
         assert_eq!(Size::of(4, 16), None);
     }
 
@@ -1456,6 +1831,8 @@ mod tests {
         assert_eq!(Size::S16x32.dequant_shift(), 1);
         assert_eq!(Size::S32x16.dequant_shift(), 1);
         assert_eq!(Size::S16.dequant_shift(), 0);
+        assert_eq!(Size::S64.dequant_shift(), 2);
+        assert_eq!(Size::S64.coded(), Size::S32);
         for size in [Size::S4x8, Size::S8x4, Size::S8x16, Size::S16x8] {
             assert_eq!(size.dequant_shift(), 0, "{size:?}");
         }

@@ -5,20 +5,20 @@
 //! itself. The stream is a sequence header OBU and a frame OBU; `avif`
 //! wraps them. Fed rows like `jpeg::Encoder`, a superblock row at a time.
 //!
-//! What the encoder uses of AV1: 64x64 superblocks split down to square
-//! blocks of 32, 16, 8 and 4 pixels and the halves of a 32, a 16 or an 8 by
-//! rate-distortion choice; every intra mode, angle deltas, the intra edge
-//! filter and chroma from luma included, but palette and filter-intra; for
-//! luma with no side of 32 the best of the reduced set's four DCT and ADST
-//! pairs, for chroma the mode's default; one transform per plane per block,
-//! its levels a dead-zone quantizer's refined by a trellis; the
-//! multi-symbol arithmetic coder with adapting CDFs from the defaults; the
-//! fewest tiles the frame's size allows, each tile's superblock rows
-//! searched in a wavefront over the threads and written in order by its
-//! coder. The deblocking filter and CDEF are on at strengths from the
-//! quantizer; restoration, superres, film grain and screen-content tools
-//! stay off. `transform` holds the transforms, quantizers and scans, `cdf`
-//! the default CDFs, `deblock` and `cdef` the filters.
+//! What the encoder uses of AV1: 64x64 superblocks coded whole or split down to
+//! square blocks of 32, 16, 8 and 4 pixels and the halves of a 32, a 16 or an 8
+//! by rate-distortion choice; every intra mode, angle deltas, the intra edge
+//! filter and chroma from luma included, but palette and filter-intra; for luma
+//! with no side of 32 or more the best of the reduced set's four DCT and ADST
+//! pairs, for chroma the mode's default; one transform per plane per block, its
+//! levels a dead-zone quantizer's refined by a trellis; the multi-symbol
+//! arithmetic coder with adapting CDFs from the defaults; the fewest tiles the
+//! frame's size allows, each tile's superblock rows searched in a wavefront
+//! over the threads and written in order by its coder. The deblocking filter
+//! and CDEF are on at strengths from the quantizer; restoration, superres, film
+//! grain and screen-content tools stay off. `transform` holds the transforms,
+//! quantizers and scans, `cdf` the default CDFs, `deblock` and `cdef` the
+//! filters.
 
 use std::fmt;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -182,9 +182,10 @@ fn mode_tx_type(mode: u8, size: Size) -> TxType {
     }
 }
 
-/// Whether a transform's set is `TX_SET_DCTONLY`: a 32-point side.
+/// Whether a transform's set is `TX_SET_DCTONLY`: a 32- or 64-point
+/// side.
 fn dct_only(size: Size) -> bool {
-    size.width().max(size.height()) == 32
+    size.width().max(size.height()) >= 32
 }
 
 /// The spec's `Tx_Size_Sqr`, the square of the shorter side, which
@@ -220,12 +221,16 @@ fn derivative(angle: i32) -> i32 {
 
 /// The spec's `Sm_Weights` by block side.
 #[rustfmt::skip]
-const SM_WEIGHTS: [u8; 60] = [
+const SM_WEIGHTS: [u8; 124] = [
     255, 149, 85, 64,
     255, 197, 146, 105, 73, 50, 37, 32,
     255, 225, 196, 170, 145, 123, 102, 84, 68, 54, 43, 33, 26, 20, 17, 16,
     255, 240, 225, 210, 196, 182, 169, 157, 145, 133, 122, 111, 101, 92, 83,
     74, 66, 59, 52, 45, 39, 34, 29, 25, 21, 17, 14, 12, 10, 9, 8, 8,
+    255, 248, 240, 233, 225, 218, 210, 203, 196, 189, 182, 176, 169, 163, 156,
+    150, 144, 138, 133, 127, 121, 116, 111, 106, 101, 96, 91, 86, 82, 77, 73,
+    69, 65, 61, 57, 54, 50, 47, 44, 41, 38, 35, 32, 29, 27, 25, 22, 20, 18,
+    16, 15, 13, 12, 10, 9, 8, 7, 6, 6, 5, 5, 4, 4, 4,
 ];
 
 fn sm_weights(n: usize) -> &'static [u8] {
@@ -233,7 +238,9 @@ fn sm_weights(n: usize) -> &'static [u8] {
         4 => 0,
         8 => 4,
         16 => 12,
-        _ => 28,
+        32 => 28,
+        64 => 60,
+        _ => return &[],
     };
     SM_WEIGHTS.get(start..start + n).unwrap_or(&[])
 }
@@ -323,6 +330,8 @@ const PROB_COST: [u16; 128] = [
 struct Cdfs {
     y_mode: [[Cdf; 5]; 5],
     uv_mode: [Cdf; 13],
+    /// Where chroma from luma is not allowed.
+    uv_mode_no_cfl: [Cdf; 13],
     cfl_sign: Cdf,
     cfl_alpha: [Cdf; 6],
     angle_delta: [Cdf; 8],
@@ -381,6 +390,7 @@ impl Cdfs {
         Cdfs {
             y_mode: table2(&cdf::KF_Y_MODE),
             uv_mode: uv,
+            uv_mode_no_cfl: table(&cdf::UV_MODE),
             cfl_sign: Cdf::new(&cdf::CFL_SIGN),
             cfl_alpha: table(&cdf::CFL_ALPHA),
             angle_delta: table(&cdf::ANGLE_DELTA),
@@ -1309,6 +1319,11 @@ impl At {
         !self.is_sub8x8()
     }
 
+    /// The spec's `CflAllowed`: no side past 32.
+    fn cfl_allowed(self) -> bool {
+        self.w_log2.max(self.h_log2) <= 5
+    }
+
     /// The position's row within its superblock, in mode-info units.
     fn sb_row(self) -> usize {
         self.mi_row % SB_MI
@@ -1471,6 +1486,14 @@ struct Leaf {
     /// and the end of block in scan order (0 for none).
     levels: [Vec<i32>; 3],
     eob: [usize; 3],
+}
+
+/// The best trial of a node so far: its cost, nodes and the state it
+/// left.
+struct Best {
+    cost: u64,
+    nodes: Vec<Node>,
+    state: Option<Saved>,
 }
 
 /// A square node's partition (spec `PARTITION_NONE` to
@@ -1996,11 +2019,11 @@ impl Tile {
 
     /// Decides the partition under the square node at the position,
     /// leaving reconstruction and contexts as if coded, and returns the
-    /// rate-distortion cost: the node whole, split, or (a 32x32, 16x16
-    /// or 8x8, whose halves have a transform) halved either way,
-    /// whichever costs least. Each is cut short once it costs more than
-    /// the best so far, and the halves are tried only where `RECT_GATE`
-    /// and `rect_directions` let them.
+    /// rate-distortion cost: the node whole, split, or halved either
+    /// way, whichever costs least. Each is cut short once it costs more
+    /// than the best so far, and the halves are tried only where
+    /// `RECT_GATE` and `rect_directions` let them. A 64x64 is tried
+    /// whole only where `whole_64` lets it, and never halved.
     fn decide(&mut self, at: At, out: &mut Vec<Node>) -> u64 {
         let Some((has_rows, has_cols)) = self.edges(at) else {
             return 0;
@@ -2012,7 +2035,7 @@ impl Tile {
             return cost;
         }
         let split_rate = self.partition_rate(at, Partition::Split);
-        if at.w_log2 == 6 || !(has_rows && has_cols) {
+        if !(has_rows && has_cols) {
             out.push(Node::Parts(Partition::Split));
             let mut cost = self.rd(0, split_rate);
             for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
@@ -2021,35 +2044,36 @@ impl Tile {
             return cost;
         }
         let before = self.save(at, true);
-        let none_rate = self.partition_rate(at, Partition::None);
-        let (leaf, leaf_cost) = self.best_leaf(at);
-        let none_cost = leaf_cost + self.rd(0, none_rate);
-        let mut best_cost = none_cost;
-        let mut best_nodes = vec![Node::Block(leaf)];
-        let mut best_state = self.save(at, true);
+        let mut best = Best {
+            cost: u64::MAX,
+            nodes: Vec::new(),
+            state: None,
+        };
+        let mut nodes = Vec::new();
+        let mut none_cost = u64::MAX;
+        if at.w_log2 < 6 || self.whole_64(at) {
+            none_cost = self.try_none(at, &mut nodes, &mut best);
+        }
         self.reset(&before);
-        let mut nodes = vec![Node::Parts(Partition::Split)];
+        nodes.clear();
+        nodes.push(Node::Parts(Partition::Split));
         let mut split_cost = self.rd(0, split_rate);
         for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
-            if split_cost >= best_cost {
+            if split_cost >= best.cost {
                 break;
             }
             split_cost += self.decide(at.quarter(dr, dc), &mut nodes);
         }
-        if split_cost < best_cost {
-            best_cost = split_cost;
-            std::mem::swap(&mut nodes, &mut best_nodes);
-            let state = self.save(at, true);
-            self.recycle(std::mem::replace(&mut best_state, state));
-        }
+        self.keep_if_best(at, split_cost, &mut nodes, &mut best);
         // A split cut short cost at least the node whole, so only a
         // split that won can close the gate.
         let (keep, of) = RECT_GATE;
-        let [horz, vert] = if split_cost.saturating_mul(of) < none_cost.saturating_mul(keep) {
-            [false; 2]
-        } else {
-            self.rect_directions(at)
-        };
+        let [horz, vert] =
+            if at.w_log2 == 6 || split_cost.saturating_mul(of) < none_cost.saturating_mul(keep) {
+                [false; 2]
+            } else {
+                self.rect_directions(at)
+            };
         let kinds = [(Partition::Horz, horz), (Partition::Vert, vert)];
         for kind in kinds.into_iter().filter_map(|(k, on)| on.then_some(k)) {
             nodes.clear();
@@ -2058,24 +2082,67 @@ impl Tile {
             let mut cost = self.rd(0, rate);
             nodes.push(Node::Parts(kind));
             for block in at.halves(kind == Partition::Vert) {
-                if cost >= best_cost {
+                if cost >= best.cost {
                     break;
                 }
                 let (leaf, leaf_cost) = self.best_leaf(block);
                 cost += leaf_cost;
                 nodes.push(Node::Block(leaf));
             }
-            if cost < best_cost {
-                best_cost = cost;
-                std::mem::swap(&mut nodes, &mut best_nodes);
-                let state = self.save(at, true);
-                self.recycle(std::mem::replace(&mut best_state, state));
-            }
+            self.keep_if_best(at, cost, &mut nodes, &mut best);
         }
         self.recycle(before);
-        self.restore(best_state);
-        out.append(&mut best_nodes);
-        best_cost
+        if let Some(state) = best.state {
+            self.restore(state);
+        }
+        out.append(&mut best.nodes);
+        best.cost
+    }
+
+    /// The node coded whole: its cost, kept if it is the best so far.
+    fn try_none(&mut self, at: At, nodes: &mut Vec<Node>, best: &mut Best) -> u64 {
+        let none_rate = self.partition_rate(at, Partition::None);
+        let (leaf, leaf_cost) = self.best_leaf(at);
+        let none_cost = leaf_cost + self.rd(0, none_rate);
+        nodes.clear();
+        nodes.push(Node::Block(leaf));
+        self.keep_if_best(at, none_cost, nodes, best);
+        none_cost
+    }
+
+    /// Keeps a trial's nodes and state if it costs less than the best.
+    fn keep_if_best(&mut self, at: At, cost: u64, nodes: &mut Vec<Node>, best: &mut Best) {
+        if cost < best.cost {
+            best.cost = cost;
+            std::mem::swap(nodes, &mut best.nodes);
+            let state = self.save(at, true);
+            if let Some(old) = best.state.replace(state) {
+                self.recycle(old);
+            }
+        }
+    }
+
+    /// Whether a 64x64 is worth trying whole: its source luma's variance
+    /// within twice the DC step's square over 64. On a photo that tried
+    /// a quarter to seven tenths of them at 0.3 to 3 bits a pixel and
+    /// nearly all below, for nearly all of what trying every one gained.
+    fn whole_64(&self, at: At) -> bool {
+        let x = at.mi_col * MI;
+        let y = (at.mi_row - self.band_mi_row) * MI;
+        let Some(source) = self.source.first() else {
+            return true;
+        };
+        let (mut sum, mut squares) = (0i64, 0i64);
+        for r in 0..SB {
+            for &v in source.row(y + r).get(x..x + SB).unwrap_or(&[]) {
+                sum += i64::from(v);
+                squares += i64::from(v) * i64::from(v);
+            }
+        }
+        // The variance times the area squared, against the bound's.
+        let n = (SB * SB) as i64;
+        let dc = i64::from(transform::dc_q(self.qindex));
+        (squares * n - sum * sum) * 32 <= dc * dc * n * n
     }
 
     /// Which halves of a node, horizontal and vertical, are worth
@@ -2326,7 +2393,7 @@ impl Tile {
         let angled = ranked
             .iter()
             .filter(|&&(score, mode, ..)| score != u64::MAX && is_directional(mode))
-            .take(if at.has_angle_deltas() {
+            .take(if at.has_angle_deltas() && at.w_log2 < 6 {
                 ANGLE_MODES
             } else {
                 0
@@ -2462,8 +2529,11 @@ impl Tile {
             // modes, and its alpha against the luma just reconstructed.
             let k = MODES.len();
             let mut cfl = [0i8; 2];
-            self.cfl_ac(uv_at, &mut work.ac);
-            if let (Some((dc, rest)), Some(slot)) = (
+            if at.cfl_allowed() {
+                self.cfl_ac(uv_at, &mut work.ac);
+            }
+            if let (true, Some((dc, rest)), Some(slot)) = (
+                at.cfl_allowed(),
                 chroma.split_at_mut_checked(area * 2),
                 screened_uv.get_mut(k),
             ) {
@@ -2613,10 +2683,11 @@ impl Tile {
             out.eob = 0;
             return;
         }
+        let coded = size.coded().area();
         let (residual, coeffs, dequant) = (
             grown(&mut work.residual, w * h),
-            grown(&mut work.coeffs, w * h),
-            grown(&mut work.dequant, w * h),
+            grown(&mut work.coeffs, coded),
+            grown(&mut work.dequant, coded),
         );
         let source = self.source.get(plane);
         for (r, (res, prow)) in residual
@@ -2761,7 +2832,7 @@ impl Tile {
             n_above: 0,
             n_left: 0,
             smooth,
-            ..Edges::new(w, h, [128; 65], [128; 65])
+            ..Edges::new(w, h, [128; EDGE], [128; EDGE])
         };
         let Some(band) = self.recon.get(plane) else {
             return edges;
@@ -2897,7 +2968,12 @@ impl Tile {
         delta: i8,
         cfl: [i8; 2],
     ) {
-        if let Some(cdf) = self.cdfs.uv_mode.get_mut(usize::from(y_mode)) {
+        let cdfs = if at.cfl_allowed() {
+            &mut self.cdfs.uv_mode
+        } else {
+            &mut self.cdfs.uv_mode_no_cfl
+        };
+        if let Some(cdf) = cdfs.get_mut(usize::from(y_mode)) {
             sink.symbol(cdf, usize::from(uv_mode));
         }
         if uv_mode == UV_CFL_PRED {
@@ -3066,7 +3142,7 @@ impl Tile {
             return 0;
         }
         let (eob_pt, extra_bits) = eob_position(eob);
-        let class = (size.area().ilog2() - 4) as usize;
+        let class = (size.coded().area().ilog2() - 4) as usize;
         let mut rate = self
             .cdfs
             .eob_pt
@@ -3113,8 +3189,9 @@ impl Tile {
             return 0;
         }
         let size = plane_size(at, plane);
-        let w = size.width();
-        mags.fill(levels, w, size.height());
+        let coded = size.coded();
+        let w = coded.width();
+        mags.fill(levels, size);
         let (row_shift, col_mask) = (w.ilog2(), w - 1);
         let ptype = usize::from(plane > 0);
         // libaom's `plane_rd_mult` for intra, in sixteenths.
@@ -3149,7 +3226,7 @@ impl Tile {
             }
             let (row, col) = (pos >> row_shift, pos & col_mask);
             let ctx = LevelCtx {
-                eob: last.then(|| base_eob_ctx(c, size.area())),
+                eob: last.then(|| base_eob_ctx(c, coded.area())),
                 base: mags.base_ctx(row, col),
                 br: mags.br_ctx(row, col),
             };
@@ -3265,7 +3342,8 @@ impl Tile {
         }
         // eob_pt and its extra bits
         let (eob_pt, extra_bits) = eob_position(eob);
-        let class = (size.area().ilog2() - 4) as usize;
+        let coded = size.coded();
+        let class = (coded.area().ilog2() - 4) as usize;
         if let Some(cdf) = self
             .cdfs
             .eob_pt
@@ -3293,15 +3371,16 @@ impl Tile {
         }
         // Levels in reverse scan order.
         let scan = size.scan();
-        let (row_shift, col_mask) = (w.ilog2(), w - 1);
+        let coded_w = coded.width();
+        let (row_shift, col_mask) = (coded_w.ilog2(), coded_w - 1);
         let mut mags = std::mem::take(&mut self.mags);
-        mags.fill(levels, w, size.height());
+        mags.fill(levels, size);
         for c in (0..eob).rev() {
             let pos = usize::from(scan.get(c).copied().unwrap_or(0));
             let (row, col) = (pos >> row_shift, pos & col_mask);
             let level = levels.get(pos).map_or(0, |l| l.abs());
             if c == eob - 1 {
-                let ctx = base_eob_ctx(c, size.area());
+                let ctx = base_eob_ctx(c, coded.area());
                 if let Some(cdf) = self
                     .cdfs
                     .base_eob
@@ -3600,10 +3679,12 @@ const BASE_CTX_OFFSETS: [[[u8; 5]; 5]; 3] = [
 ];
 
 impl Magnitudes {
-    /// Fills from a row-major block `w` across and `h` down.
-    fn fill(&mut self, levels: &[i32], w: usize, h: usize) {
+    /// Fills from a transform's levels, row-major at its coded size;
+    /// the offsets follow its full size's shape, as the spec's do.
+    fn fill(&mut self, levels: &[i32], size: Size) {
+        let (w, h) = (size.coded().width(), size.coded().height());
         self.stride = w + 4;
-        let shape = match w.cmp(&h) {
+        let shape = match size.width().cmp(&size.height()) {
             std::cmp::Ordering::Equal => 0,
             std::cmp::Ordering::Greater => 1,
             std::cmp::Ordering::Less => 2,
@@ -3751,12 +3832,15 @@ struct Edges {
     n_left: usize,
     /// The spec's `filterType`: a neighbour is smooth.
     smooth: bool,
-    above: [u8; 65],
-    left: [u8; 65],
+    above: [u8; EDGE],
+    left: [u8; EDGE],
 }
 
+/// An edge's pixels, the corner and a 64-pixel block's `w + h`.
+const EDGE: usize = 129;
+
 impl Edges {
-    fn new(w: usize, h: usize, above: [u8; 65], left: [u8; 65]) -> Edges {
+    fn new(w: usize, h: usize, above: [u8; EDGE], left: [u8; EDGE]) -> Edges {
         Edges {
             w,
             h,
@@ -3776,8 +3860,8 @@ impl Edges {
 /// `above[2 + i]` is `AboveRow[i]`, down to the upsampled
 /// `AboveRow[-2]`, the same for the left column.
 struct DrEdges {
-    above: [u8; 66],
-    left: [u8; 66],
+    above: [u8; EDGE + 1],
+    left: [u8; EDGE + 1],
 }
 
 /// The spec's `Intra_Edge_Kernel`, by strength less one.
@@ -3824,7 +3908,7 @@ fn filter_edge(edge: &mut [u8], len: usize, strength: usize) {
         return;
     };
     // The edge with each end twice more, so that every tap reads in it.
-    let mut padded = [0u16; 70];
+    let mut padded = [0u16; EDGE + 4];
     let values = [first; 2]
         .into_iter()
         .chain(edge.iter().take(len).copied())
@@ -3842,8 +3926,8 @@ fn filter_edge(edge: &mut [u8], len: usize, strength: usize) {
 
 /// The spec's intra edge upsample (7.11.2.11) of an edge's `n` pixels
 /// past its corner, `edge[1]`, into `2 * n` from `edge[0]`.
-fn upsample_edge(edge: &mut [u8; 66], n: usize) {
-    let at = |edge: &[u8; 66], i: usize| i32::from(edge.get(i).copied().unwrap_or(0));
+fn upsample_edge(edge: &mut [u8; EDGE + 1], n: usize) {
+    let at = |edge: &[u8; EDGE + 1], i: usize| i32::from(edge.get(i).copied().unwrap_or(0));
     // `edge_upsamples` keeps `n` to 16.
     let mut dup = [0i32; 19];
     let corner = at(edge, 1);
@@ -3940,8 +4024,8 @@ impl DrEdges {
     /// The block's edges as the key has them, those it changes.
     fn new(edges: &Edges, key: DrKey) -> DrEdges {
         let mut dr = DrEdges {
-            above: [0; 66],
-            left: [0; 66],
+            above: [0; EDGE + 1],
+            left: [0; EDGE + 1],
         };
         let (above, left) = (&edges.above, &edges.left);
         // What a prediction reads: to `AboveRow[w + h - 1]` from the
@@ -3962,7 +4046,7 @@ impl DrEdges {
             }
         }
         if key.corner {
-            let px = |edge: &[u8; 65], i: usize| u32::from(edge.get(i).copied().unwrap_or(0));
+            let px = |edge: &[u8; EDGE], i: usize| u32::from(edge.get(i).copied().unwrap_or(0));
             let s = (5 * px(left, 1) + 6 * px(above, 0) + 5 * px(above, 1) + 8) >> 4;
             for edge in [&mut dr.above, &mut dr.left] {
                 if let Some(corner) = edge.get_mut(1) {
@@ -4891,11 +4975,12 @@ mod tests {
     }
 
     /// Every transform shape a block reaches, width by height.
-    const SHAPES: [(usize, usize); 10] = [
+    const SHAPES: [(usize, usize); 11] = [
         (4, 4),
         (8, 8),
         (16, 16),
         (32, 32),
+        (64, 64),
         (4, 8),
         (8, 4),
         (8, 16),
@@ -5088,7 +5173,7 @@ mod tests {
         const AT: usize = 16;
         let mut above = vec![0i32; AT + 160];
         let mut left = vec![0i32; AT + 160];
-        for i in 0..65 {
+        for i in 0..EDGE {
             above[AT - 1 + i] = i32::from(edges.above[i]);
             left[AT - 1 + i] = i32::from(edges.left[i]);
         }
@@ -5176,8 +5261,8 @@ mod tests {
         let mut upsampled = 0;
         for (w, h) in SHAPES {
             for round in 0..24 {
-                let mut above = [0u8; 65];
-                let mut left = [0u8; 65];
+                let mut above = [0u8; EDGE];
+                let mut left = [0u8; EDGE];
                 for v in above.iter_mut().chain(left.iter_mut()) {
                     *v = rng.next() as u8;
                 }
@@ -5186,7 +5271,7 @@ mod tests {
                 // the frame cuts short, past which `pred_edges` repeats
                 // the last pixel and libaom filters none.
                 let (have_above, have_left) = (round % 4 != 1, round % 4 != 2);
-                let mut short = |have: bool, n: usize, edge: &mut [u8; 65]| {
+                let mut short = |have: bool, n: usize, edge: &mut [u8; EDGE]| {
                     let inside = match (have, round % 3) {
                         (false, _) => 0,
                         (true, 0) => 1 + rng.next() as usize % n,
@@ -5228,8 +5313,8 @@ mod tests {
 
     #[test]
     fn the_predictors_follow_the_edges() {
-        let mut above = [0u8; 65];
-        let mut left = [0u8; 65];
+        let mut above = [0u8; EDGE];
+        let mut left = [0u8; EDGE];
         for i in 0..65 {
             above[i] = (10 + i * 3) as u8;
             left[i] = (200 - i * 2) as u8;
@@ -5589,7 +5674,7 @@ mod tests {
             model += tile.eob_rate(size, ptype, eob);
             let dc_ctx = tile.dc_sign_ctx(plane, at);
             let mut mags = Magnitudes::default();
-            mags.fill(&levels, w, size.height());
+            mags.fill(&levels, size);
             for c in 0..eob {
                 let pos = usize::from(size.scan()[c]);
                 let (row, col) = (pos / w, pos % w);
@@ -5639,6 +5724,53 @@ mod tests {
             }
         }
         rgb
+    }
+
+    /// A smooth curved ramp in every plane: content a 64x64 is coded whole
+    /// on, with a residual its prediction leaves.
+    fn ramp(width: usize, height: usize) -> Vec<u8> {
+        let mut rgb = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                let (x, y) = (x as i32, y as i32);
+                let v = 30 + x / 2 + (x - 96) * (x - 96) / 200 + y / 3;
+                let v = v.clamp(0, 255) as u8;
+                rgb.extend([v, 255 - v / 2, v / 3 + 50]);
+            }
+        }
+        rgb
+    }
+    #[test]
+    fn smooth_64x64s_are_coded_whole_with_coefficients() {
+        // What `tests/av1.rs` holds to dav1d covers whole 64x64s, their
+        // 64-point transforms carrying coefficients and their chroma's
+        // modes without CfL, whatever the search's tuning; busy ones
+        // are only ever split.
+        for (quality, smooth) in [(20, true), (50, true), (97, false)] {
+            let (width, height) = (192, 128);
+            let rgb = if smooth {
+                ramp(width, height)
+            } else {
+                bands(width, height, 4)
+            };
+            let mut encoder = Encoder::new(width, height, quality, 1).unwrap();
+            encoder.keep_reconstruction();
+            encoder.encode_rows(&rgb).unwrap();
+            encoder.flush();
+            let kept = encoder.kept.as_ref().unwrap();
+            let (mut whole, mut coded) = (0, 0);
+            for (&s, &skip) in kept.sizes.iter().zip(&kept.skips) {
+                if (unpack_size(s, true), unpack_size(s, false)) == (6, 6) {
+                    whole += 1;
+                    coded += usize::from(!skip);
+                }
+            }
+            if smooth {
+                assert!(coded > 0, "q{quality}: {whole} 4x4s whole, {coded} coded");
+            } else {
+                assert_eq!(whole, 0, "q{quality}");
+            }
+        }
     }
 
     #[test]

@@ -452,6 +452,40 @@ fn halved_blocks_decode_past_the_edges() {
     }
 }
 
+/// A smooth curved ramp in every plane: content a 64x64 is coded whole
+/// on, with a residual its prediction leaves.
+fn ramp(width: usize, height: usize) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        for x in 0..width {
+            let (x, y) = (x as i32, y as i32);
+            let v = 30 + x / 2 + (x - 96) * (x - 96) / 200 + y / 3;
+            let v = v.clamp(0, 255) as u8;
+            rgb.extend([v, 255 - v / 2, v / 3 + 50]);
+        }
+    }
+    rgb
+}
+
+#[test]
+fn whole_64x64_blocks_decode() {
+    // 64x64s coded whole, with coefficients and chroma modes without
+    // CfL, as `av1`'s unit test finds them; beside the frame's right
+    // and bottom edges, where the 64x64 nodes split; and in a second
+    // tile and over threads.
+    for (width, height, quality, threads, tiles) in [
+        (192, 128, 20, 1, (0, 0)),
+        (192, 128, 50, 1, (0, 0)),
+        (200, 130, 35, 1, (0, 0)),
+        (320, 192, 30, 2, (1, 0)),
+    ] {
+        let name = format!("w{width}x{height}q{quality}t{tiles:?}");
+        let rgb = ramp(width, height);
+        let (obus, reconstruction) = encode_rgb(&rgb, width, height, quality, threads, tiles);
+        decodes_as_reconstructed(&obus, &reconstruction, &name);
+    }
+}
+
 /// Four-pixel cells of unrelated colours.
 fn cells(width: usize, height: usize) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(width * height * 3);
@@ -682,7 +716,7 @@ fn the_streams_are_the_bytes_dav1d_decoded() {
         (520, 40, 60, (1, 0), 0x8f0fa319538a8f50),
         (200, 200, 75, (0, 1), 0xcf61837a521661c6),
         (67, 45, 15, (0, 0), 0xda15606197a91103),
-        (130, 70, 1, (0, 0), 0xd9cbd4339259970a),
+        (130, 70, 1, (0, 0), 0xabc6d4c9419aee08),
         (200, 330, 50, (0, 0), 0xcfe9360deb33c292),
     ] {
         let name = format!("g{width}x{height}q{quality}t{tiles:?}");
