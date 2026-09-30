@@ -67,6 +67,7 @@ pub mod links;
 pub mod menus;
 pub mod notices;
 pub mod open;
+pub mod pinned_face;
 pub mod pointer;
 pub mod raster;
 pub mod repeat;
@@ -78,6 +79,7 @@ pub mod tree_table;
 mod tree_table_geometry;
 mod tree_table_model;
 mod tree_table_paint;
+pub mod typeface;
 pub mod wayland;
 pub mod window;
 #[allow(clippy::new_without_default)]

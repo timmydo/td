@@ -13,6 +13,8 @@
 //! from the handler's paint, the clipboard it copies to and pastes from
 //! for the handler, and the whole loop over a socket.
 
+mod fonts;
+
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
@@ -23,7 +25,8 @@ use std::time::Duration;
 use td_ui::client::{App, DISPLAY, REGISTRY, SHM, SURFACE, SYNC, TOPLEVEL, XDG_SURFACE};
 use td_ui::clipboard::MAX_BYTES;
 use td_ui::data::{PLAIN, UTF8};
-use td_ui::raster::{Primitive, Raster, Rect, Scale, Surface, PAPER};
+use td_ui::raster::{GlyphStyle, Primitive, Raster, Rect, Scale, Surface, Weight, PAPER};
+use td_ui::typeface::Typeface;
 use td_ui::wayland::{backing_file, peer, Connection, IDLE_WAIT};
 use td_ui::window::{
     run, Clipboard, Flow, Handler, Input, PointerPhase, Refusal, Window, DEFAULT_HEIGHT,
@@ -137,6 +140,20 @@ impl td_ui::raster::Composition for Corner {
                 primitive: Primitive::Fill { rect, color },
             });
         }
+        // A glyph on the grid, which a typeface's face executes.
+        sink(td_ui::raster::Draw {
+            clip: self.0.bounds(),
+            primitive: Primitive::Glyph {
+                x: 40,
+                y: 16,
+                scalar: '0',
+                style: GlyphStyle {
+                    ink: BLUE,
+                    background: PAPER,
+                    weight: Weight::Regular,
+                },
+            },
+        });
     }
 }
 
@@ -820,7 +837,7 @@ fn the_loop_runs_a_handler_over_a_socket_until_it_quits() {
     let worker = std::thread::spawn(move || {
         let mut handler = Recorder::new();
         handler.quit_on = Some(Record::Close);
-        let result = run(&mut handler, client, std::env::temp_dir());
+        let result = run(&mut handler, client, std::env::temp_dir(), None);
         (result, handler)
     });
     let mut handshake = [0; 24];
@@ -1405,4 +1422,59 @@ fn a_paste_asks_the_selection_and_its_text_arrives_as_an_input() {
         .inputs
         .iter()
         .any(|r| matches!(r, Record::Paste(_))));
+}
+
+/// A typeface whose '0' is a square of half the em on the baseline.
+fn typeface() -> Typeface {
+    let square = vec![
+        (0, 0, true),
+        (0, 500, true),
+        (500, 500, true),
+        (500, 0, true),
+    ];
+    let mut builder = fonts::Builder::new(vec![
+        fonts::Glyph::Empty,
+        fonts::Glyph::Simple(vec![square]),
+    ]);
+    builder.format4 = vec![fonts::Segment::Delta(0x30, 0x30, 1u16.wrapping_sub(0x30))];
+    Typeface::new(builder.font(), None).unwrap()
+}
+
+/// The frame a window presents for the corner composition, through
+/// `typeface` when given one.
+fn presented(typeface: Option<Typeface>) -> Vec<u8> {
+    let mut handler = Recorder::new();
+    let (mut w, peer, _, _) = fixture(&mut handler);
+    if let Some(typeface) = typeface {
+        w = w.with_typeface(typeface);
+    }
+    configure(&mut w, 83, 35);
+    drain(&peer);
+    w.draw().unwrap();
+    let (_, files) = drain(&peer);
+    let mut bytes = vec![0; 83 * 35 * 4];
+    files[0].read_exact_at(&mut bytes, 0).unwrap();
+    bytes
+}
+
+#[test]
+fn a_window_given_a_typeface_executes_glyphs_through_its_fitted_face() {
+    let font = td_ui::font::pinned().unwrap();
+    let surface = Surface::new(83, 35, Scale::default()).unwrap();
+    let direct = |typeface: Option<&mut Typeface>| {
+        let mut pixels = vec![0; 83 * 35 * 4];
+        {
+            let mut raster = Raster::new(&mut pixels, &font, surface, 83 * 4).unwrap();
+            if let Some(face) = typeface.and_then(|t| t.face(surface.scale)) {
+                raster = raster.with_face(face);
+            }
+            raster.paint(&Corner(surface), surface.bounds()).unwrap();
+        }
+        pixels
+    };
+    let outline = presented(Some(typeface()));
+    let bitmap = presented(None);
+    assert_eq!(outline, direct(Some(&mut typeface())));
+    assert_eq!(bitmap, direct(None));
+    assert_ne!(outline, bitmap, "the glyph's cell differs");
 }

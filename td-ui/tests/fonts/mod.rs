@@ -43,6 +43,10 @@ pub struct Builder {
     pub extra: Vec<([u8; 4], Vec<u8>)>,
     pub units_per_em: u16,
     pub short_offsets: bool,
+    pub ascender: i16,
+    pub descender: i16,
+    /// Every glyph's advance; `None` gives glyph `i` 500 + `i`.
+    pub advance: Option<u16>,
 }
 
 impl Builder {
@@ -57,6 +61,9 @@ impl Builder {
             extra: vec![],
             units_per_em: 1000,
             short_offsets: false,
+            ascender: 800,
+            descender: -200,
+            advance: None,
         }
     }
 
@@ -81,8 +88,8 @@ impl Builder {
             }
             b"hhea" => {
                 let mut hhea = vec![0u8; 36];
-                hhea[4..6].copy_from_slice(&800i16.to_be_bytes());
-                hhea[6..8].copy_from_slice(&(-200i16).to_be_bytes());
+                hhea[4..6].copy_from_slice(&self.ascender.to_be_bytes());
+                hhea[6..8].copy_from_slice(&self.descender.to_be_bytes());
                 hhea[8..10].copy_from_slice(&90i16.to_be_bytes());
                 hhea[34..36].copy_from_slice(&self.long_metrics.to_be_bytes());
                 hhea
@@ -90,7 +97,7 @@ impl Builder {
             b"hmtx" => {
                 let mut hmtx = vec![];
                 for index in 0..self.glyphs.len() {
-                    let advance = 500 + index as u16;
+                    let advance = self.advance.unwrap_or(500 + index as u16);
                     if index < usize::from(self.long_metrics) {
                         hmtx.extend_from_slice(&advance.to_be_bytes());
                     }

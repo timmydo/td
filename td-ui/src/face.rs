@@ -1,9 +1,11 @@
 //! An outline face at one pixel size: the style bytes a consumer read, the
-//! cell the face's metrics give, and the atlas its glyphs are covered
-//! into on first use. A lookup answers from the atlas; only a miss parses
+//! cell the face's metrics give or the grid it is fitted to, and the atlas
+//! its glyphs are covered into on first use. A lookup answers from the atlas; only a miss parses
 //! the face, finds the glyph and covers it. Nothing here reads the
 //! environment, a clock, a descriptor or the filesystem: the consumer
 //! hands over the bytes.
+
+use std::sync::Arc;
 
 use crate::atlas::{Atlas, Slot, Style};
 use crate::coverage::{Mask, Rasterizer};
@@ -16,19 +18,20 @@ pub const MAX_PIXELS_PER_EM: u16 = 256;
 pub const MAX_CELL_AXIS: usize = 512;
 
 /// The grid a face lays text on at its pixel size: the width of one
-/// advance, the height of one line, and the baseline's distance from the
-/// cell's top.
+/// advance, the height of one line, the baseline's distance from the
+/// cell's top, and the pen's from its left.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Cell {
     pub width: usize,
     pub height: usize,
     pub baseline: usize,
+    pub pen: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct Face {
-    regular: Vec<u8>,
-    bold: Option<Vec<u8>>,
+    regular: Arc<[u8]>,
+    bold: Option<Arc<[u8]>>,
     pixels_per_em: u16,
     /// Pixels per font unit, for the regular style and the bold one,
     /// whose units per em may differ.
@@ -50,35 +53,97 @@ impl Face {
         }
         let font = Font::parse(&regular)?;
         let scale = f32::from(pixels_per_em) / f32::from(font.units_per_em());
-        let bold_scale = match &bold {
-            Some(bold) => f32::from(pixels_per_em) / f32::from(Font::parse(bold)?.units_per_em()),
-            None => scale,
-        };
-        let advance = ['0', 'M']
-            .into_iter()
-            .find_map(|scalar| font.glyph(scalar).and_then(|glyph| font.advance(glyph)))
-            .ok_or(Error::Missing("cell advance"))?;
         let pixels = |units: f32| (units * scale).round().max(0.0) as usize;
-        let width = pixels(f32::from(advance));
+        let width = pixels(f32::from(advance(&font)?));
         let baseline = pixels(f32::from(font.ascender()));
         let height =
             baseline + pixels(-f32::from(font.descender())) + pixels(f32::from(font.line_gap()));
         if width == 0 || height == 0 {
             return Err(Error::Malformed("cell metrics"));
         }
-        if width > MAX_CELL_AXIS || height > MAX_CELL_AXIS {
+        let cell = Cell {
+            width,
+            height,
+            baseline,
+            pen: 0,
+        };
+        Self::build(
+            regular.into(),
+            bold.map(Arc::from),
+            f32::from(pixels_per_em),
+            cell,
+        )
+    }
+
+    /// A face fitted to a fixed `width` by `height` grid cell, so text laid
+    /// out on that grid needs no other change: the largest size, fractional,
+    /// whose advance fits the width and whose em fits the height, so a
+    /// width-bound advance fills the cell and full-cell glyphs meet their
+    /// neighbours. The advance is centred across the cell and the line box
+    /// (ascender to descender) down it, the baseline below the cell if that
+    /// is where centring puts it; what the line box holds past the cell's
+    /// height is clipped with it. A bold style is covered at the same
+    /// size, scaled by its own units per em.
+    pub fn fit(
+        regular: Arc<[u8]>,
+        bold: Option<Arc<[u8]>>,
+        width: usize,
+        height: usize,
+    ) -> Result<Self, Error> {
+        if width == 0 || height == 0 {
+            return Err(Error::Malformed("cell metrics"));
+        }
+        let font = Font::parse(&regular)?;
+        let units_per_em = f64::from(font.units_per_em());
+        let advance = f64::from(advance(&font)?);
+        if advance == 0.0 {
+            return Err(Error::Malformed("cell metrics"));
+        }
+        let pixels_per_em = (width as f64 * units_per_em / advance)
+            .min(height as f64)
+            .min(f64::from(MAX_PIXELS_PER_EM));
+        let scale = pixels_per_em / units_per_em;
+        let pen = ((width as f64 - advance * scale) / 2.0).round().max(0.0);
+        let middle = (f64::from(font.ascender()) + f64::from(font.descender())) / 2.0;
+        // Below the cell when a tall line box leans up: centring decides
+        // what is clipped, and the raster clips to the cell.
+        let baseline = (height as f64 / 2.0 + middle * scale).round().max(0.0);
+        let cell = Cell {
+            width,
+            height,
+            baseline: baseline as usize,
+            pen: pen as usize,
+        };
+        Self::build(regular, bold, pixels_per_em as f32, cell)
+    }
+
+    fn build(
+        regular: Arc<[u8]>,
+        bold: Option<Arc<[u8]>>,
+        pixels_per_em: f32,
+        cell: Cell,
+    ) -> Result<Self, Error> {
+        let range = f32::from(MIN_PIXELS_PER_EM)..=f32::from(MAX_PIXELS_PER_EM);
+        if !range.contains(&pixels_per_em) {
+            return Err(Error::Limit("pixels per em"));
+        }
+        if cell.width > MAX_CELL_AXIS || cell.height > MAX_CELL_AXIS {
             return Err(Error::Limit("cell"));
         }
+        let scale_of = |bytes: &[u8]| {
+            Font::parse(bytes).map(|font| pixels_per_em / f32::from(font.units_per_em()))
+        };
+        let scale = scale_of(&regular)?;
+        let bold_scale = match &bold {
+            Some(bold) => scale_of(bold)?,
+            None => scale,
+        };
         Ok(Self {
             regular,
             bold,
-            pixels_per_em,
+            pixels_per_em: pixels_per_em.round() as u16,
             scales: [scale, bold_scale],
-            cell: Cell {
-                width,
-                height,
-                baseline,
-            },
+            cell,
             atlas: Atlas::new(),
             rasterizer: Rasterizer::new(),
             outline: Outline::new(),
@@ -90,6 +155,8 @@ impl Face {
         self.cell
     }
 
+    /// The size glyphs are covered at, rounded: a fitted face's is
+    /// fractional.
     pub fn pixels_per_em(&self) -> u16 {
         self.pixels_per_em
     }
@@ -150,4 +217,12 @@ impl Face {
             }
         }
     }
+}
+
+/// The advance a cell is one of: that of `0`, else `M`.
+fn advance(font: &Font) -> Result<u16, Error> {
+    ['0', 'M']
+        .into_iter()
+        .find_map(|scalar| font.glyph(scalar).and_then(|glyph| font.advance(glyph)))
+        .ok_or(Error::Missing("cell advance"))
 }

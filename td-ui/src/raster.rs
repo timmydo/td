@@ -8,7 +8,7 @@
 //! (`with_face`) executes glyphs through its atlas instead, below the same
 //! draw stream.
 
-use crate::atlas::{Entry, Slot, PAGE_WIDTH};
+use crate::atlas::{Entry, Slot, Style, PAGE_WIDTH};
 use crate::face::Face;
 use crate::font::Font;
 use crate::hint;
@@ -494,13 +494,16 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
     }
 
     /// Executes every `Glyph` through `face` from here on: in the face's
-    /// cell at the draw's origin, covered into its atlas on first use and
-    /// blended over the style's explicit background, `Weight::Medium` in
-    /// the bold style when the face has one. A scalar the face lacks draws
-    /// from the bitmap face, centred in the cell. The face is sized for the
-    /// surface's pixels, scale included, by its owner, and the composition
-    /// must lay its glyphs out on the face's cell: one laid out on the
-    /// bitmap grid overlaps or gaps wherever the two cells differ.
+    /// cell at the draw's origin, from its pen, covered into its atlas on
+    /// first use and blended over the style's explicit background, every
+    /// weight in the regular style (`Weight::Medium` is the bitmap face's
+    /// body text, not bold). A scalar
+    /// the face lacks draws from the bitmap face, centred in the cell. The
+    /// face is sized for the surface's pixels, scale included, by its
+    /// owner, and the composition must lay its glyphs out on the face's
+    /// cell: one laid out on the bitmap grid overlaps or gaps wherever the
+    /// two cells differ, which a face fitted to that grid (`Face::fit`)
+    /// never does.
     pub fn with_face(mut self, face: &'font mut Face) -> Self {
         self.face = Some(face);
         self
@@ -546,9 +549,15 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
         let Some(clip) = clip.intersection(bounds) else {
             return;
         };
-        match face.glyph(face.style(style.weight == Weight::Medium), scalar) {
+        // The stream's weights are the bitmap face's: Medium is its body
+        // text, the fringe thickening a thin face, so every weight draws the
+        // outline's regular style.
+        match face.glyph(Style::Regular, scalar) {
             Slot::Placed(entry) => {
-                let origin = (x, y.saturating_add(cell.baseline as i64));
+                let origin = (
+                    x.saturating_add(cell.pen as i64),
+                    y.saturating_add(cell.baseline as i64),
+                );
                 blend(
                     self.pixels,
                     self.stride,

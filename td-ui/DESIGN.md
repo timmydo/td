@@ -121,8 +121,14 @@ atlas" below).
 
 Pinned (increment 19): the JetBrains Mono Nerd Font as pinned upstream
 data, at `/etc/fonts/jetbrains-mono-nerd` in the image and in the jail of
-a program on `static-runtime`. No consumer reads it yet; that is
-increment 20.
+a program on `static-runtime`.
+
+Newly built (increment 20): `Face::fit`, which fits an outline face to the
+bitmap grid's cell; `typeface`, the style bytes and a face fitted at the
+current scale; `pinned_face`, which reads the pinned face; and the widget
+window's typeface, through which td-news and td-mail draw their text
+(see "The grid fit" below). The programs with their own windows follow
+in increment 21.
 
 ## Purpose and trust position
 
@@ -236,10 +242,17 @@ of its own files may name each module.
   `Entry` (its rectangle on the page and its bearing), `PAGE_WIDTH`,
   `PAGE_HEIGHT` and `MAX_KEYS`.
 - `face`: `Face` (`new` over the regular style's bytes, an optional bold
-  style's and a pixel size, `cell`, `pixels_per_em`, `atlas`,
+  style's and a pixel size; `fit` over shared style bytes and a grid
+  cell's width and height; `cell`, `pixels_per_em`, `atlas`,
   `take_dirty`, `style` and `glyph`), `Cell` (`width`, `height`,
-  `baseline`), `MIN_PIXELS_PER_EM`, `MAX_PIXELS_PER_EM` and
+  `baseline`, `pen`), `MIN_PIXELS_PER_EM`, `MAX_PIXELS_PER_EM` and
   `MAX_CELL_AXIS`; refusals are `sfnt::Error`.
+- `typeface`: `Typeface` (`new` over the regular style's bytes and an
+  optional bold style's, refused as a face fitted to the grid's cell at
+  scale one is; `face` at a `Scale`, refitted when the scale changes).
+- `pinned_face`: `DIR` and `REGULAR`, where the pinned face is; `load`
+  and `load_from` a directory, and `load_or_note`, which says on
+  standard error why a program draws with Unifont instead.
 - `hint`: the hint face, a hand-authored 4x5 glyph (`WIDTH`, `HEIGHT`,
   `ADVANCE` 5) per printable ASCII scalar, `glyph` and the pixel `width`
   of a text; a scalar it lacks is a box. It is the small lighter text a
@@ -422,9 +435,9 @@ of its own files may name each module.
   `NoClipboard`, which refuses everything, for a test or a headless run;
   the `Handler` trait (`app_id`, `title`, `input` with a clipboard,
   `poll`, `wait_ms`, `needs_redraw`, `paint`, `notice`); `Object`, the
-  empty tag; `Window<'h, H>` (`new`, `handler`, `handler_mut`,
-  `surface`), the `App` over a handler it borrows; and `run`, under
-  "Widget window" below.
+  empty tag; `Window<'h, H>` (`new`, `with_typeface`, `handler`,
+  `handler_mut`, `surface`), the `App` over a handler it borrows; and
+  `run` with an optional `Typeface`, under "Widget window" below.
 
 ## Driving
 
@@ -834,11 +847,13 @@ not frames, and stays its own).
   owns its thread and reads the monotonic clock for its deadlines; and
   `replay`, which reads and writes only the streams it is handed; the
   widget window `window`, whose `Window::new` reads the embedded face and
-  whose loop is `client::run`; and `open`, which reads `BROWSER`, starts
+  whose loop is `client::run`; `open`, which reads `BROWSER`, starts
   the browser as a child process with its streams closed and reaps it on
-  a thread of its own. Apart from `open`'s `BROWSER` they read no
-  environment variable, taking the display values and the socket path as
-  explicit arguments.
+  a thread of its own; and `pinned_face`, which reads the outline face's
+  regular style from the one directory it names, a regular file within
+  the reader's bound, checked before it is opened. Apart from `open`'s
+  `BROWSER` they read no environment variable, taking the display values
+  and the socket path as explicit arguments.
 - `control` and `driven` are pure: the frame, envelope and codecs touch
   no descriptor, and the seam reads only the composition it is handed
   and the embedded face. The decoder allocates at most one frame, after
@@ -1011,8 +1026,9 @@ not frames, and stays its own).
   `Raster::with_face` executes `Glyph` through an outline face's atlas,
   opt-in per raster, and changes no draw. It paints each glyph in the
   face's cell, so it keeps the cell model only for a composition laid
-  out on that cell; the widgets lay out on the bitmap grid until runtime
-  cells (increment 20), and a consumer opts in with them.
+  out on that cell; the widgets lay out on the bitmap grid, so a
+  consumer opts in with a face fitted to that grid (`Face::fit`) until
+  runtime cells (increment 23).
 - The atlas is one 1024 by 1024 page (1 MiB) of at most 8192 keys, placed
   and missing together, with a pixel of gutter right of and below each
   entry, zeroed when it is placed and inside the dirty band; a full page
@@ -1108,16 +1124,27 @@ keeping only the mask that did not fit, the key budget, each entry's
 gutter zeroed after a reset over opaque bytes, a held key keeping its
 slot and a short alpha recorded missing.
 `tests/face.rs` holds the face and the executor: the cell from encoded
-metrics at two sizes, the size, advance and byte refusals, a glyph
-covered once with misses remembered, and pixel oracles over a buffer of
-garbage (so nothing is read back): ink and the half-covered blend from
-the explicit background, the cell and draw clips, blank glyphs writing
+metrics at two sizes, the size, advance and byte refusals, a glyph covered
+once with misses remembered, and pixel oracles over a buffer of garbage
+(so nothing is read back): ink and the half-covered blend from the
+explicit background, the cell and draw clips, blank glyphs writing
 nothing, the missing glyph equal to a bitmap raster's centred one at
-scales one and two, Medium drawing the bold style only when the face has
-one, at the bold file's own units per em and falling back to its regular
-outline, a Bold lookup on a face without one the regular slot, fills and
-marks unchanged, and a padded stride at scale three whose padding is
-never written, with origins at the i64 extremes writing nothing.
+scales one and two, every weight drawing the regular style even when the
+face has a bold one, the bold style at the bold file's own units per em
+and falling back to its regular outline, a Bold lookup on a face without
+one the regular slot, fills and marks unchanged, and a padded stride at
+scale three whose padding is never written, with origins at the i64
+extremes writing nothing. For the fit it holds the cell, size, baseline
+and pen for the four grid cells and two others, the fit's refusals, an
+exact square from the pen and baseline, a full-width glyph leaving no seam
+between two cells, an integral advance centred to the pixel, a tall line
+box leaning up centred with its baseline below the cell, and a scalar the
+face lacks equal to the bitmap raster's own draw at scales one to four.
+`tests/typeface.rs` holds the face fitted at each scale, kept while the
+scale holds and replaced when it changes, the typeface's refusals, and the
+loader over a directory the test writes: the regular style read, and a
+missing file, a file past the reader's bound (refused before it is read),
+a refused font and a directory each an error naming the path.
 
 `tests/chrome.rs` holds the band oracles, draw-stream checks that read each
 band's fills and glyphs: the menu bar's fill, its labels from cell
@@ -1288,6 +1315,10 @@ anything after, and Shift under a focused synchronized keyboard
 extending the press; wheel frames in cells; the poll and wait each turn,
 the keyboard capability's loss as focus loss once; and the whole loop
 over a socket.
+
+`tests/window.rs` also presents the corner composition, whose glyph
+the window executes through a typeface's fitted face when it is given
+one, exactly as a raster with that face paints it.
 
 `tests/confinement.rs` holds `window.rs` among the adapters, adds
 `control.rs` and `driven.rs` to the pure set and the three adapters to
@@ -2088,8 +2119,10 @@ IEC power symbols or Hack's extra glyphs (each MIT upstream), for Font
 Logos, which the README lists as unlicensed, or for the Apache 2.0 text
 MaterialDesign's names by URL; for those the README's attribution and
 that URL are what ship, and pinning the texts from their own upstreams
-is a separate reviewed change. Programs expose the notices beside the
-Unifont texts in their `--font-license` output once they read the face.
+is a separate reviewed change. The notices travel as files beside the
+faces, in the image and in `static-runtime` alike; a program with a
+`--font-license` output names that directory beside the embedded
+Unifont texts once it reads the face (increment 21).
 
 ### Reader and coverage
 
@@ -2165,8 +2198,11 @@ from the explicit background a caller paints, and it means a repaint is
 independent of old pixels. It is also exactly a GPU fragment shader with
 blending off, so a CPU frame and a GPU frame of one draw stream are
 pixel-identical by construction. Zero coverage writes nothing, as an unset
-bitmap pixel does. `Weight::Medium` selects the bold style when the face
-has one, covered at the bold file's own units per em. An entry is valid
+bitmap pixel does. Every weight draws the regular style: `Weight::Medium`
+is the bitmap face's body text, its fringe thickening a thin face, not a
+bold. The bold style, covered at the bold file's own units per em, is
+reached through `Face::glyph` until the stream gains a bold weight (with
+td-term, increment 22). An entry is valid
 in the epoch that placed it, and any miss may reset the page: a GPU
 backend holding a frame's entries compares epochs. Each entry's gutter is
 zeroed as it is placed, so a sampler filtering across its edge never
@@ -2175,17 +2211,47 @@ reads a retired glyph.
 The exact-pixel oracles and `--preview` checksums pin the bitmap backend,
 so the executor is opt-in per raster. It paints each glyph in the face's
 cell from the draw's origin, so a composition must lay glyphs out on that
-cell: a consumer opts in together with runtime cells, and its oracles
-move when it does. At the largest sizes a page holds few glyphs, and a
+cell: a consumer opts in with a face fitted to its grid (see "The grid
+fit") or with runtime cells, and its oracles move when it does. At the largest sizes a page holds few glyphs, and a
 scene needing more than a page resets it every frame; that is bounded
 work, not a fault, and a larger page is the remedy if a consumer meets
 it.
 
+### The grid fit
+
+Every consumer lays text out on the bitmap face's 8x16 cell, scaled.
+Runtime cells (below) would replace that grid; until they do, `Face::fit`
+fits an outline face to it, so a consumer takes the face with no change
+to its layout, hit testing or draw stream. The fitted size is the
+largest, fractional, whose advance fits the cell's width and whose em
+fits its height: the Mono face is 13.3 pixels per em in the 8x16 cell
+and 26.7 in the 16x32 one, its advance filling the width exactly, so box
+drawing and block elements meet across columns. The advance is centred
+across the cell and the line box (ascender to descender, 1.32 em for
+this face) down it, the baseline below the cell if a tall line box
+leaning up puts it there. What the line box holds past the cell is
+clipped with it: box drawing, which spans the whole line box, still meets across
+rows, and only the extremes of accents and descenders are lost. A scalar
+the face lacks draws exactly as the bitmap raster draws it, since the
+cells coincide.
+
+`typeface::Typeface` holds the style bytes once, shared, and fits a face
+at the scale asked for, refitting when it changes, so one atlas is held.
+`pinned_face::load` reads the regular style from
+`/etc/fonts/jetbrains-mono-nerd`, the only one the draw stream selects;
+the bold file ships for td-term's bold weight. A program calls
+`load_or_note` at startup: on any failure it says once on standard error
+that the program draws with Unifont, and the program starts. Tests and
+previews never load it. The face reaches a window only when handed to it
+(`window::run`'s typeface, `Window::with_typeface`), so every existing
+oracle and `--preview` checksum stays on the bitmap face.
+
 ### Runtime cells
 
 `CELL_WIDTH` and `CELL_HEIGHT` are constants because the bitmap face fixes
-them. With an outline face they become a `Cell` value derived from the
-face at the surface's pixel size:
+them. Runtime cells (increment 23) make them a `Cell` value derived from
+the face at the surface's pixel size, so a face can be drawn at a size
+the grid does not fix:
 
 - the cell width is the rounded advance of `0` (else `M`);
 - the baseline is the rounded ascender;
@@ -2208,14 +2274,16 @@ two steps:
 1. The compositor's recipe stages the `td-ui` tree, as each consumer's
    already stages `td-compositor`.
 2. td-term's cell painter becomes a td-ui `Composition` of fills and
-   glyphs over `Cell`, executed through the atlas, with the terminal's
-   attributes mapped as follows:
-   - bold, italic and bold italic select their faces (`GlyphStyle` gains
-     a slant beside its weight, an additive change to the stream);
+   glyphs on its grid, executed through a face fitted to that grid's
+   cell as the other consumers' are, with the terminal's attributes
+   mapped as follows:
+   - bold, italic and bold italic select their faces (`Weight` gains a
+     bold and `GlyphStyle` a slant, additive changes to the stream);
    - faint and inverse stay colour operations;
    - underline and strike are fills placed from the face's metrics.
 
-The pixel size the terminal reports through `TIOCSWINSZ` follows the cell.
+The pixel size the terminal reports through `TIOCSWINSZ` follows the cell,
+which is the grid's until runtime cells.
 The compositor's own chrome keeps the bitmap face. td-compositor/DESIGN.md
 section 11's rule that host tests and the target consume the same face
 bytes holds for Unifont. Outline oracles use fonts the tests encode
@@ -2424,13 +2492,21 @@ regressions. Those increments extend the original sequence below.
     `/etc/fonts/jetbrains-mono-nerd`, with a copy in `static-runtime`
     for jailed programs, and the AGENTS.md amendment naming pinned
     upstream data. Landed.
-20. Runtime cells: `Cell` replaces the constants in layout, hit testing
-    and painting, and the consumer reads the pinned face and falls back to
-    Unifont. td-editor goes first, since the other consumers lay out over
-    its pane.
-21. td-term on td-ui: the compositor's recipe stages td-ui, and td-term's
-    cell painter moves onto `Cell` and the atlas executor, with the
-    attribute mapping above. Its PPM oracles are regolded.
-22. The GPU path, gated on the sign-offs "The GPU path" lists: the
+20. The grid fit: `Face::fit`, `typeface` and `pinned_face` under "The
+    grid fit", and the widget window's typeface, which td-news and
+    td-mail load at startup, falling back to Unifont with a note. Every
+    oracle stays on the bitmap face. Landed.
+21. The other consumers on the grid fit: td-editor's window, td-setup,
+    the file chooser, td-photo and the task manager load the pinned face
+    for their live windows, and their `--font-license` output names
+    where its notices are.
+22. td-term on td-ui: the compositor's recipe stages td-ui, and td-term's
+    cell painter moves onto a face fitted to its grid, with the
+    attribute mapping above. Its PPM oracles stay on the bitmap face.
+23. Runtime cells: `Cell` replaces the constants in layout, hit testing
+    and painting, so a face is drawn at a size the grid does not fix.
+    td-editor goes first, since the other consumers lay out over its
+    pane.
+24. The GPU path, gated on the sign-offs "The GPU path" lists: the
     compositor's GPU composition first, then client dmabufs, then td-ui's
     GPU backend held to the CPU raster's oracles.

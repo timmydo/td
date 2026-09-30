@@ -134,7 +134,8 @@ fn the_cell_comes_from_the_face_metrics() {
         Cell {
             width: 10,
             height: 22,
-            baseline: 16
+            baseline: 16,
+            pen: 0
         }
     );
     assert_eq!(face.pixels_per_em(), 20);
@@ -144,7 +145,8 @@ fn the_cell_comes_from_the_face_metrics() {
         Cell {
             width: 7,
             height: 14,
-            baseline: 10
+            baseline: 10,
+            pen: 0
         }
     );
 }
@@ -282,7 +284,8 @@ fn blank_glyphs_write_nothing_and_missing_ones_fall_back_centred() {
         Cell {
             width: 20,
             height: 44,
-            baseline: 32
+            baseline: 32,
+            pen: 0
         }
     );
     let s = surface(40, 50, 2);
@@ -296,7 +299,7 @@ fn blank_glyphs_write_nothing_and_missing_ones_fall_back_centred() {
 }
 
 #[test]
-fn medium_weight_draws_the_bold_style_when_the_face_has_one() {
+fn every_weight_draws_the_regular_style() {
     let s = surface(40, 30, 1);
     let lit = |pixels: &[u8]| {
         (0..30)
@@ -309,16 +312,18 @@ fn medium_weight_draws_the_bold_style_when_the_face_has_one() {
         lit(&paint(&mut plain, s, &[glyph(5, 3, 'a', Weight::Medium)])),
         100
     );
+    // Medium is the bitmap face's body text, so even a face with a bold
+    // style draws it, and Regular, in the regular one.
     let mut both = Face::new(face_bytes(false), Some(face_bytes(true)), 20).unwrap();
     assert_eq!(
         lit(&paint(&mut both, s, &[glyph(5, 3, 'a', Weight::Medium)])),
-        25
+        100
     );
     assert_eq!(
         lit(&paint(&mut both, s, &[glyph(5, 3, 'a', Weight::Regular)])),
         100
     );
-    assert_eq!(both.atlas().len(), 2, "one slot a style");
+    assert_eq!(both.atlas().len(), 1, "the regular slot alone");
 }
 
 #[test]
@@ -358,12 +363,9 @@ fn other_primitives_are_unchanged_by_a_face() {
 
 #[test]
 fn the_bold_style_has_its_own_scale_and_falls_back_to_regular_outlines() {
-    let s = surface(40, 30, 1);
-    let lit = |pixels: &[u8]| {
-        (0..30)
-            .flat_map(|y| (0..40).map(move |x| (x, y)))
-            .filter(|&(x, y)| !untouched(pixels, s, x, y))
-            .count()
+    let size = |slot: Slot| match slot {
+        Slot::Placed(entry) => (entry.width, entry.height),
+        other => panic!("{other:?}"),
     };
     // A bold face at 2000 units per em whose 'a' is a 1000-unit square:
     // the same 10 pixels at 20 px/em as the regular 500 of 1000. It maps
@@ -378,13 +380,10 @@ fn the_bold_style_has_its_own_scale_and_falls_back_to_regular_outlines() {
         Segment::Delta(0x61, 0x61, 1u16.wrapping_sub(0x61)),
     ];
     let mut face = Face::new(face_bytes(false), Some(builder.font()), 20).unwrap();
+    assert_eq!(size(face.glyph(Style::Bold, 'a')), (10, 10));
     assert_eq!(
-        lit(&paint(&mut face, s, &[glyph(5, 3, 'a', Weight::Medium)])),
-        100
-    );
-    assert_eq!(
-        paint(&mut face, s, &[glyph(5, 3, 'h', Weight::Medium)]),
-        paint(&mut face, s, &[glyph(5, 3, 'h', Weight::Regular)])
+        size(face.glyph(Style::Bold, 'h')),
+        size(face.glyph(Style::Regular, 'h'))
     );
     assert!(matches!(
         face.atlas().get(Style::Bold, 'h'),
@@ -434,4 +433,124 @@ fn padded_strides_larger_scales_and_extreme_origins_are_safe() {
         assert!(row[160..].iter().all(|&b| b == GARBAGE), "padding");
     }
     assert!(pixels.iter().any(|&b| b != GARBAGE));
+}
+
+#[test]
+fn a_fitted_face_takes_the_grid_cell_and_centres_its_line_box() {
+    let fit = |width, height| {
+        Face::fit(face_bytes(false).into(), None, width, height)
+            .map(|face| (face.cell(), face.pixels_per_em()))
+    };
+    // Advance 501 of 1000 units, ascender 800, descender -200: the width
+    // allows 8000/501 = 15.97 px/em (reported 16), so the advance fills the
+    // 8 px exactly; the line box's middle is 300 units above the baseline,
+    // which sits 4.79 px below the cell's middle and rounds to row 13.
+    let cell = |width, height, baseline, pen| Cell {
+        width,
+        height,
+        baseline,
+        pen,
+    };
+    assert_eq!(fit(8, 16), Ok((cell(8, 16, 13, 0), 16)));
+    assert_eq!(fit(16, 32), Ok((cell(16, 32, 26, 0), 32)));
+    assert_eq!(fit(24, 48), Ok((cell(24, 48, 38, 0), 48)));
+    assert_eq!(fit(32, 64), Ok((cell(32, 64, 51, 0), 64)));
+    // The em bounds a wide cell's size, and the advance is centred.
+    assert_eq!(fit(20, 16), Ok((cell(20, 16, 13, 6), 16)));
+    assert_eq!(fit(8, 200), Ok((cell(8, 200, 105, 0), 16)));
+    assert_eq!(fit(0, 16).unwrap_err(), Error::Malformed("cell metrics"));
+    assert_eq!(fit(8, 0).unwrap_err(), Error::Malformed("cell metrics"));
+    assert_eq!(fit(2, 16).unwrap_err(), Error::Limit("pixels per em"));
+    assert_eq!(fit(8, 5).unwrap_err(), Error::Limit("pixels per em"));
+    assert_eq!(fit(600, 16).unwrap_err(), Error::Limit("cell"));
+    assert_eq!(
+        Face::fit(vec![0; 3].into(), None, 8, 16).unwrap_err(),
+        Face::new(vec![0; 3], None, 13).unwrap_err()
+    );
+}
+
+#[test]
+fn a_fitted_face_paints_from_its_pen_and_falls_back_to_the_bitmap_draw() {
+    // At 16 px/em the '0' square is exactly 8 px: columns 6..14 from the
+    // pen and rows 5..13 up from the baseline, all ink, nothing else.
+    let s = surface(20, 16, 1);
+    let mut face = Face::fit(face_bytes(false).into(), None, 20, 16).unwrap();
+    let pixels = paint(&mut face, s, &[glyph(0, 0, '0', Weight::Regular)]);
+    for y in 0..16 {
+        for x in 0..20 {
+            if (6..14).contains(&x) && (5..13).contains(&y) {
+                assert_eq!(pixel(&pixels, s, x, y), mix(255), "({x}, {y})");
+            } else {
+                assert!(untouched(&pixels, s, x, y), "({x}, {y})");
+            }
+        }
+    }
+    // Fitted to the bitmap grid, a scalar the face lacks is the bitmap
+    // raster's own draw at every scale.
+    let font = pinned().unwrap();
+    for scale in [1, 2, 3, 4] {
+        let s = surface(40, 64, scale);
+        let size = usize::from(scale);
+        let mut face = Face::fit(face_bytes(false).into(), None, 8 * size, 16 * size).unwrap();
+        let draws = [
+            glyph(3, 5, 'q', Weight::Regular),
+            glyph(13, 21, 'W', Weight::Medium),
+        ];
+        let mut bitmap = vec![GARBAGE; s.width * s.height * 4];
+        {
+            let mut raster = Raster::new(&mut bitmap, &font, s, s.width * 4).unwrap();
+            for draw in draws {
+                raster.draw(draw);
+            }
+        }
+        assert_eq!(paint(&mut face, s, &draws), bitmap, "scale {scale}");
+    }
+}
+
+#[test]
+fn a_fitted_advance_fills_the_cell_so_full_cells_meet() {
+    // A '0' as wide as its 501-unit advance and the whole em tall, fitted
+    // to 8 by 16: the fractional size makes it exactly 8 px wide, so every
+    // column of the cell, the last included, is full ink.
+    let mut builder = Builder::new(vec![
+        Glyph::Empty,
+        Glyph::Simple(vec![rectangle(0, -100, 501, 700)]),
+    ]);
+    builder.format4 = vec![Segment::Delta(0x30, 0x30, 1u16.wrapping_sub(0x30))];
+    let mut face = Face::fit(builder.font().into(), None, 8, 16).unwrap();
+    let s = surface(16, 16, 1);
+    let pixels = paint(
+        &mut face,
+        s,
+        &[
+            glyph(0, 0, '0', Weight::Medium),
+            glyph(8, 0, '0', Weight::Medium),
+        ],
+    );
+    for x in 0..16 {
+        assert_eq!(pixel(&pixels, s, x, 8), mix(255), "column {x}");
+    }
+}
+
+#[test]
+fn the_fit_centres_exactly_and_keeps_a_tall_line_box_centred() {
+    let font = |advance: u16, ascender: i16, descender: i16| {
+        let mut builder = Builder::new(vec![
+            Glyph::Empty,
+            Glyph::Simple(vec![rectangle(0, 0, 100, 100)]),
+        ]);
+        builder.format4 = vec![Segment::Delta(0x30, 0x30, 1u16.wrapping_sub(0x30))];
+        builder.advance = Some(advance);
+        builder.ascender = ascender;
+        builder.descender = descender;
+        builder.font()
+    };
+    // A 375-unit advance at the em-bound 16 px/em is exactly 6 px, so the
+    // pen is exactly 1.
+    let face = Face::fit(font(375, 800, -200).into(), None, 8, 16).unwrap();
+    assert_eq!((face.cell().pen, face.pixels_per_em()), (1, 16));
+    // A line box of 1.6 em leaning up centres its middle, 700 units above
+    // the baseline, on the cell's: the baseline is row 19, below the cell.
+    let face = Face::fit(font(500, 1500, -100).into(), None, 8, 16).unwrap();
+    assert_eq!(face.cell().baseline, 19);
 }

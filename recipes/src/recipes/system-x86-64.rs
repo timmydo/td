@@ -9694,6 +9694,37 @@ mod tests {
         Some(value)
     }
 
+    /// td-ui's loader and the image must agree on where the outline face is:
+    /// the loader names `/etc/fonts/jetbrains-mono-nerd` and a file in it,
+    /// and a mismatch shows only as every program drawing with Unifont.
+    #[test]
+    fn td_ui_reads_the_outline_face_where_the_image_links_it() {
+        const PINNED_FACE_RS: &str = include_str!("../../../td-ui/src/pinned_face.rs");
+        let constant = |name: &str| {
+            PINNED_FACE_RS
+                .split_once(&format!("pub const {name}: &str = \""))
+                .and_then(|(_, after)| after.split_once('"'))
+                .map(|(value, _)| value)
+        };
+        let dir = constant("DIR").unwrap_or_default();
+        let entry = IMMUTABLE_ETC
+            .iter()
+            .find(|entry| format!("/etc/{}", entry.etc) == dir)
+            .unwrap_or_else(|| unreachable!("no IMMUTABLE_ETC entry is td-ui's {dir:?}"));
+        assert_eq!(
+            entry.target,
+            format!(
+                "{{in:jetbrains-mono-nerd-font}}/{}",
+                super::super::jetbrains_mono_nerd_font::DIR
+            )
+        );
+        let file = constant("REGULAR").unwrap_or_default();
+        assert!(
+            super::super::jetbrains_mono_nerd_font::FILES.contains(&file),
+            "td-ui reads {file:?}, which the font recipe does not ship"
+        );
+    }
+
     /// The table and td-firstboot are two crates that must agree on four paths, and
     /// nothing in the type system makes them: the image points `/etc` symlinks at
     /// `/var/lib/td/...` while the provisioner independently decides where to write.

@@ -19,6 +19,7 @@ pub use crate::driven::PointerPhase;
 use crate::font::Font;
 use crate::pointer::{self, Wheel};
 use crate::raster::{Raster, Scale, Surface};
+use crate::typeface::Typeface;
 use crate::wire::Message;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -323,6 +324,9 @@ pub struct Window<'h, H: Handler> {
     client: Client<Object>,
     handler: &'h mut H,
     font: Font,
+    /// The outline face glyphs are executed through, when the window was
+    /// given one; else the bitmap face draws them.
+    typeface: Option<Typeface>,
     clock: u64,
     surface: Surface,
     /// The configured extent; a refused one is put back to the surface's.
@@ -349,6 +353,7 @@ impl<'h, H: Handler> Window<'h, H> {
             client: Client::new(stream, temporary)?,
             handler,
             font: crate::font::pinned()?,
+            typeface: None,
             clock: 0,
             surface,
             size: (DEFAULT_WIDTH, DEFAULT_HEIGHT),
@@ -360,6 +365,13 @@ impl<'h, H: Handler> Window<'h, H> {
             focused: false,
             board: Board::default(),
         })
+    }
+
+    /// Draws the window's text in `typeface`'s outline face, fitted to the
+    /// grid at the surface's scale, instead of the bitmap face.
+    pub fn with_typeface(mut self, typeface: Typeface) -> Self {
+        self.typeface = Some(typeface);
+        self
     }
 
     pub fn handler(&self) -> &H {
@@ -790,11 +802,15 @@ impl<H: Handler> App for Window<'_, H> {
             client,
             handler,
             font,
+            typeface,
             ..
         } = self;
         let presented = client.present(surface.width, surface.height, &mut |pixels| {
             let mut raster = Raster::new(pixels, font, surface, surface.width * 4)
                 .map_err(|why| why.to_string())?;
+            if let Some(face) = typeface.as_mut().and_then(|t| t.face(surface.scale)) {
+                raster = raster.with_face(face);
+            }
             handler.paint(&mut raster, surface)
         })?;
         if presented {
@@ -805,9 +821,17 @@ impl<H: Handler> App for Window<'_, H> {
 }
 
 /// Runs `handler` in a window over `stream`, its pool files under
-/// `temporary`, until the window closes; the handler stays the caller's
-/// whichever way the loop ends.
-pub fn run<H: Handler>(handler: &mut H, stream: UnixStream, temporary: PathBuf) -> Result<()> {
+/// `temporary`, until the window closes, its text in `typeface` when given
+/// one; the handler stays the caller's whichever way the loop ends.
+pub fn run<H: Handler>(
+    handler: &mut H,
+    stream: UnixStream,
+    temporary: PathBuf,
+    typeface: Option<Typeface>,
+) -> Result<()> {
     let mut window = Window::new(handler, stream, temporary)?;
+    if let Some(typeface) = typeface {
+        window = window.with_typeface(typeface);
+    }
     crate::client::run(&mut window)
 }

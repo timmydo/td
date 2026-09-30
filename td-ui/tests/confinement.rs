@@ -23,7 +23,7 @@ fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-const PURE: [&str; 28] = [
+const PURE: [&str; 29] = [
     "atlas.rs",
     "charts.rs",
     "chrome.rs",
@@ -47,6 +47,7 @@ const PURE: [&str; 28] = [
     "tree_table_geometry.rs",
     "tree_table_model.rs",
     "tree_table_paint.rs",
+    "typeface.rs",
     "xkb.rs",
     "xkb_compat.rs",
     "xkb_keys.rs",
@@ -69,6 +70,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "lib.rs",
                 "notices.rs",
                 "open.rs",
+                "pinned_face.rs",
                 "replay.rs",
                 "sys.rs",
                 "wayland.rs",
@@ -146,6 +148,25 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 0,
                 "the client's test support {support} is not called in {name}"
             );
+        }
+        if name == "pinned_face.rs" {
+            // One file, named by the one constant directory, checked and
+            // bounded before it is read; nothing else on the filesystem
+            // and no environment.
+            assert!(text.contains("pub const DIR: &str = \"/etc/fonts/jetbrains-mono-nerd\";"));
+            assert_eq!(compact.matches("File::open(").count(), 1);
+            assert_eq!(compact.matches("fs::metadata(").count(), 1);
+            assert_eq!(compact.matches(".join(").count(), 1);
+            assert!(compact.contains(".take(MAX_FONT_BYTESasu64+1)"));
+            for absent in [
+                "env::",
+                "read_dir",
+                "canonicalize",
+                "eprintln!",
+                "OpenOptions",
+            ] {
+                assert!(!compact.contains(absent), "{absent} in pinned_face.rs");
+            }
         }
         if name == "lib.rs" {
             assert!(compact.starts_with("#![deny(unsafe_code)]"));

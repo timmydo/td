@@ -1645,7 +1645,8 @@ pub fn run(
     let stack = ViewStack::new(Box::new(mailbox_view));
     let mut session =
         Session::new(setup, stack, cmd_tx, resp_rx, mouse).map_err(io::Error::other)?;
-    let outcome = td_ui::window::run(&mut session, stream, std::env::temp_dir());
+    let typeface = td_ui::pinned_face::load_or_note("td-mail");
+    let outcome = td_ui::window::run(&mut session, stream, std::env::temp_dir(), typeface);
     let _ = session.cmd_tx.send(BackendCommand::Shutdown);
     // The backend answers what it held from the cache on the way out;
     // wait for it to go, up to two seconds of silence, so a mutation it
