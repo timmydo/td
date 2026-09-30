@@ -628,17 +628,18 @@ the concrete Crypto factory, fixed-size provider comparison and opaque P-256
 key generation/loading/signing, with bounded PKCS#8 admission and independent
 test-only ES256 verification. M07a5 qualifies mandatory client certificates
 on local TLS 1.2/1.3 peers, including exact refusal cases and full handshakes
-with resumption disabled. Opaque TLS sessions, gateway authorization, native
-allocation and service resource qualification remain pending; these fixtures
-do not complete M07 or enable service.
+with resumption disabled. Opaque TLS sessions and bounded mail record progress
+are now implemented. Gateway authorization, native allocation and service
+resource qualification remain pending; these fixtures do not complete M07
+or enable service.
 
-The future TLS contract is specified in td-crypto/TLS.md, including explicit
+The TLS contract is specified in td-crypto/TLS.md, including explicit
 algorithm sets, local P-256 PEM identity admission, trust/SNI/time policy,
 bounded record progress and failure/close behavior. Material admission and
 immutable client/server configurations and socket-free client/server progress
-are implemented; mail adapters and complete resource qualification remain
-pending. Direct Crypto/Entropy operations are implemented inside td-crypto;
-mail transport integration follows. Rustls provider/configuration/verifier/key types never leave
+are implemented. M07d2 composes record progress; admitted mail adapters and
+complete resource qualification remain pending. Direct Crypto/Entropy
+operations are implemented inside td-crypto. Rustls provider/configuration/verifier/key types never leave
 that crate. Implement the conformance, explicit-provider confinement, algorithm
 baseline, key compatibility and native allocation/failure qualification in
 `td-crypto/DESIGN.md`, retaining its independent fixtures for F04.
@@ -730,9 +731,14 @@ Implement the remaining work as independently reviewable increments:
     one runtime monotonic origin and checked injected UTC conversion for TLS.
     Local socket and fault/time fixtures cover their contracts. This adds no
     listeners, dialer, slot admission or TLS/STARTTLS policy integration.
-  - **M07d2 — TLS record pump:** compose the shared session with caller-owned
-    wire/tail buffers and bounded socket progress. Qualify partial I/O,
-    bidirectional backpressure, exact error/close semantics and deadline fences.
+  - **M07d2 — TLS record pump:** implemented shared sessions with two borrowed
+    record/tail buffers, bounded transport progress and fixed deadlines.
+    Public-facade TLS 1.3 fixtures cover partial I/O, simultaneous full chunks,
+    flush backpressure, error/close semantics, publication deadline fences and
+    TCP loopback. Consuming connection/refusal returns recover both buffers
+    for pool reuse, including constructor failure before admission.
+    No mail authorization is constructed from raw TLS evidence.
+    TLS 1.2 mail fixtures and complete resource qualification remain below.
   - **M07d3 — admitted upgrades:** bind immutable policy generations and slot
     leases, reserve before STARTTLS replies, reject plaintext tails and map
     verified leaf evidence plus actual peer address to gateway authorization.
@@ -741,6 +747,8 @@ Implement the remaining work as independently reviewable increments:
   session/handshake peaks, worker entropy and Rust/native stack/allocation/RSS
   on the portable artifact before activating the adapters. Amend the checked
   ledger if measurements cannot fit; never infer a bound from buffer limits.
+  Resolve RESOURCES.md's known session-cap sum above the 128 KiB target and
+  account for separate header/body polling calls before service admission.
 
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.

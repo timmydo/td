@@ -91,9 +91,22 @@ configured memory budget does not preserve the default RSS claim.
 - TLS sessions include SMTP, HTTPS and outgoing delivery slots; handshake
   scratch is additional. The handshake cap is global in this profile.
   TLS wire assembly and socket-write tails are charged within those entries;
-  a full framed record may occupy 18437 bytes. The main-loop 16 KiB chunk
+  each framed-record buffer reserves 18437 bytes. The facade's strict outer
+  bound rejects bodies >=18432; negotiated limits may be smaller. The main-loop 16 KiB chunk
   limit below refers to application plaintext; one ciphertext-record turn
   includes its bounded TLS overhead. It is not a 16 KiB wire-buffer promise.
+  M07d2's record pump borrows two distinct 18437-byte reservations per
+  connection (36874 bytes total), one input frame and one output/tail frame.
+  These count against the existing 128 KiB session target, not extra headroom.
+  The current independent facade maxima (83973 ciphertext plus 16384
+  plaintext bytes) and the pump buffers total 137231 bytes before handles,
+  native state and allocator overhead: that conservative sum exceeds the
+  target. This is a known M07e admission blocker, not a qualified bound.
+  M07e must reduce effective native queue limits and measure coexistence
+  within 128 KiB, or amend the ledger before serving. The runtime must reserve
+  the wire buffers before admission and recover them through into_buffers
+  on either a consumed connection or a constructor refusal when it owns moved
+  buffer references rather than their original storage.
   Internal backend queues, peer chains and retained handshake fragments need
   separate measurement within these same entries, not an added allowance.
   Incoming TLS 1.3 tickets still derive secrets, query the clock and copy peer

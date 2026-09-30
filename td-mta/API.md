@@ -73,12 +73,12 @@ secrets. Existing mail callers can use
 `?` across this boundary. Clock and mail/TLS transport policy remain local.
 
 The shared contract and implementation rules live in
-[td-crypto/DESIGN.md](../td-crypto/DESIGN.md), with the future TLS operation
+[td-crypto/DESIGN.md](../td-crypto/DESIGN.md), with the TLS operation
 contract in [td-crypto/TLS.md](../td-crypto/TLS.md). Its implemented Crypto
 factory, SHA-256, worker-local entropy and P-256 key operations use opaque td-owned
 handles. Direct streaming SHA-256 uses owned inline state; other implemented
-operations retain the private AWS-LC backend. TLS session APIs and
-service/resource qualification remain M07 work. Shared backend conformance
+operations retain the private AWS-LC backend. Opaque client/server TLS sessions
+are implemented; service/resource qualification remains M07 work. Shared backend conformance
 fixtures live in td-crypto; service integration tests reach it through the same
 public facade as production.
 
@@ -153,6 +153,71 @@ half-close orders, idempotence, cancellation/drop and sticky failure. Injected
 time tests conversion/refusal and recovery of a healthy shared clock source.
 These helpers allocate no td-owned per-operation buffers, but do not prove
 platform allocation, whole-process bounds, slot ownership or TLS integration.
+
+### 1.3 Implemented TLS record progress
+
+M07d2 supplies `tls_io::TlsIo<T: Transport>`, consuming a handshaking shared
+session and one exclusive transport. It borrows two distinct caller-reserved
+18437-byte ciphertext buffers for its lifetime. Each operation progresses at
+most one outgoing and one incoming record, with at most one underlying read
+and one write. Headers are assembled before bounded bodies; partial records
+and short write tails remain in those buffers. Intake tells td-crypto whether
+an undrained socket tail remains. Application reads/writes are at most 16 KiB.
+Outgoing assembly may make two nonempty in-memory facade drains, for header
+then body, in addition to the empty health probes. Incoming assembly yields
+after its one header read, so a record needs at least two progress calls.
+Partial progress and idle Pending are intentionally indistinguishable here;
+M07e must count those calls and the scheduler's polling delay in its latency
+and throughput qualification. One record is an upper bound per turn, not a
+promise that every ready turn completes a record. The 18437-byte reservation
+does not enlarge td-crypto's accepted size: reject bodies >=18432 before
+reading them, then let the facade enforce negotiated protection limits.
+There are no internal retry loops, growing collections or td-owned hot-path
+buffer allocations. The native TLS session still has its separately budgeted
+allocations and key/clock locking; this is not a latency or RSS qualification.
+
+Construction fixes whole-connection and handshake deadlines in the injected
+clock's monotonic domain. The latter cannot exceed the former. Progress
+checks deadlines and shared crypto health before and after work, including
+retained socket tails. The handshake deadline applies to the whole call that
+publishes success, even if Finished arrives or its final output drains during
+that call. Expiry, missing TLS time, provider refusal or transport failure
+aborts both handles, clears logical buffers and evidence, and preserves the
+first error. TLS errors map to Tls; local deadline/transport errors retain
+their mail variant. Aborting discards buffer contents logically, without a
+memory-erasure claim. Empty reads/writes remain Pending even after failure.
+`into_buffers()` consumes and aborts the connection, then returns both borrowed
+reservations for safe pool reuse. It does not expose the transport or session.
+Constructor failure returns `TlsIoRefusal` after aborting both handles. Its
+fixed `error()` code and consuming `into_buffers()` preserve those same
+reservations on phase, clock or deadline refusal. Debug omits buffer contents.
+A pool holding moved references must recover both buffers on either success
+teardown or constructor refusal; it need not retain access to the arrays'
+original owner to recycle its reservations.
+
+Only an explicit successful `handshake()` permits application bytes. It
+requires verified Finished, drained native/output buffers and a completed
+underlying flush. `evidence()` returns cached raw cryptographic evidence,
+not a fresh policy authorization. This foundation implements Transport, not
+TlsTransport: generation/slot leases, STARTTLS handoff and gateway pin/address
+authorization remain M07d3. No service entry point uses it yet.
+
+Flush drives record output through the underlying transport and does not
+prove peer receipt or handshake completion. Close queues close_notify, drains
+output and closes only the underlying write half, preserving incoming data.
+A completed close stays idempotent without more clock or I/O work; later
+reads still enforce the deadline. Nonempty writes after local TLS closure
+fail terminally. EOF requires a complete framing boundary and authenticated
+TLS closure. Drop aborts any remaining connection ownership.
+
+A failing post-operation check can occur after bytes entered caller output or
+the kernel. Callers discard output on error, and queue effect fences must
+precede writes; no error proves that already accepted output was undelivered.
+Local public-facade TLS 1.3 fixtures cover tiny duplex pipes, fragmented I/O,
+simultaneous full chunks, flush backpressure, close/EOF, invalid counts,
+deadline/time refusal, repeated buffer reuse and a TCP loopback exchange. Shared td-crypto fixtures
+qualify TLS 1.2 as well; mail-specific TLS 1.2 and service/resource acceptance
+remain part of M07d3/M07e.
 
 ## 2. Read views and change history
 

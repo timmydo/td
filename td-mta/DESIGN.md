@@ -38,7 +38,10 @@ They do not instantiate service pools, perform live disk I/O or
 implement protocol handlers.
 
 M07d1 supplies an exclusively owned nonblocking TCP stream adapter and shared
-runtime/TLS clock conversion, as specified in API.md §1.2. These foundations
+runtime/TLS clock conversion, as specified in API.md §1.2. M07d2 composes
+opaque shared TLS sessions with borrowed record/tail buffers and fixed
+deadlines (API.md §1.3). Local facade and TCP fixtures cover bounded progress,
+backpressure, close and terminal failures. These foundations
 do not open listeners, dial endpoints, admit slots or activate serving paths.
 
 The initial deployment is one person's approximately 1 GB of mail, multiple
@@ -115,8 +118,9 @@ Application protocols, storage, configuration and scheduling use std plus that
 local facade. There is no separate runtime package or td-net helper executable.
 `td-crypto/DESIGN.md` owns the shared crypto/TLS API and private backend;
 `td-crypto/TLS.md` specifies the TLS policy and session contract.
-ClientConfig, ServerConfig and shared clock are implemented. Public sessions,
-mail transport integration and service/resource qualification remain pending.
+ClientConfig, ServerConfig, shared clock and public client/server sessions
+are implemented. The mail record pump composes them; admitted transport
+integration and service/resource qualification remain pending.
 
 The M03a boundary moves the existing Crypto/Entropy/Digest traits and fixed
 crypto errors into td-crypto. Mail ports re-export those traits and translate
@@ -124,7 +128,8 @@ shared errors. M03b1 admits the approved Rustls/AWS-LC closure inside td-crypto
 only. M07a1 implements opaque SHA-256; M07a2 qualifies it against the existing
 mail-format digest fixtures. M07a3 adds worker-local entropy initialization;
 M07a4 implements the Crypto factory and opaque P-256 operations.
-TLS sessions and service/resource qualification remain pending.
+TLS sessions and bounded mail record progress are implemented; admitted
+service integration and resource qualification remain pending.
 Direct streaming digests use td-owned inline SHA-256 without heap allocation
 or provider calls.
 Other native operations still require resource qualification. No
