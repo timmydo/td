@@ -278,7 +278,7 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   test-target/profile, static ELF and isolated-runtime checks as the other
   qualification binaries; it is not an installed service dependency.
 - `td-mta-transport-smoke`: the `--lib --no-run` td-mta test executable,
-  selected by its `td_mta` library target and test profile. Forty-three
+  selected by its `td_mta` library target and test profile. Forty-five
   exact policy/generation/gateway/admission/clock/TCP/TLS cases execute
   individually under the existing deadline and positive-one-test verdict
   requirement. They cover complete TLS policy compilation and HTTPS name
@@ -290,23 +290,28 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   client authentication. Retained TCP handoff cases cover plaintext tails,
   exact buffer recovery, fixed/tightened deadlines, encrypted
   delivery/close, generation and handshake capacity, clock failure and
-  changed-policy abort. Positive gateway mTLS transport remains a
-  protocol-integration requirement. They also cover generation saturation
-  before construction, stale/foreign publication, detached worker
-  construction/retention, boxed payload handoff on a small requested stack,
-  final payload drop order and construction/release races; canonical gateway
-  policy equivalence/change, pin/CIDR and material refusals, mandatory
-  client authentication against a positive no-client-auth control, handshake
-  count limits, concurrent reservation and release, worker returns and
-  refusal cleanup, clock conversion, bounded TCP/half-close/failure, TLS 1.3
-  duplex progress and framing, backpressure, publication deadlines, closure
-  and truncation, and buffer recovery after success or constructor refusal,
-  with both borrowed and owned reservations, including owned connection
-  transfer through a worker thread. Socket fixtures bind only ephemeral IPv4
-  loopback ports; certificates are generated locally through the public
-  crypto facade. No provider, CA or deployment server is contacted. This
-  qualifies those adapter behaviors on musl, not full service admission,
-  native allocation/stack/RSS, or mail-specific TLS 1.2 integration.
+  changed-policy abort. Two gateway process cases use the private td-crypto
+  test peer for TLS 1.2/1.3 current/next pin acceptance and verified-leaf
+  wrong-pin/actual-peer refusal. Runtime sets the peer executable to
+  /artifacts/td-crypto-smoke; the mail test accepts only its own ephemeral
+  loopback connection, and the child verifies the server certificate/name.
+  No test client-auth API enters the public facade. They also cover
+  generation saturation before construction, stale/foreign publication,
+  detached worker construction/retention, boxed payload handoff on a small
+  requested stack, final payload drop order and construction/release races;
+  canonical gateway policy equivalence/change, pin/CIDR and material
+  refusals, mandatory client authentication against a positive
+  no-client-auth control, handshake count limits, concurrent reservation and
+  release, worker returns and refusal cleanup, clock conversion, bounded
+  TCP/half-close/failure, TLS 1.3 duplex progress and framing, backpressure,
+  publication deadlines, closure and truncation, and buffer recovery after
+  success or constructor refusal, with both borrowed and owned reservations,
+  including owned connection transfer through a worker thread. Socket
+  fixtures bind only ephemeral IPv4 loopback ports; certificates are
+  generated locally through the public crypto facade. No provider, CA or
+  deployment server is contacted. This qualifies those adapter behaviors on
+  musl, not full service admission, native allocation/stack/RSS, or
+  complete SMTP/STARTTLS protocol integration.
 - `BUILD-INPUTS`: staged source, vendor, reconstructed Rust kit, headers and
   helper NAR hashes, native recipe identities/NARs, target and actual inner
   Cargo argument/environment records.
@@ -324,6 +329,20 @@ for reconstructible build caches. Private `crypto-build-<pid>-<attempt>` trees
 are removed on normal completion/error; after a hard kill remove one only after
 confirming its process ended. Retained artifacts follow the same explicit cache
 cleanup rule as prepared inputs.
+
+## Private gateway process peer
+
+Host mail tests run through `gate-crates crypto-cargo test --manifest-path
+td-mta/Cargo.toml`. That wrapper builds td-crypto's private library-test peer
+from the same reviewed offline closure, selects its exact Cargo JSON test
+artifact within the configured target directory and injects its absolute path.
+Ambient TD_MTA_TEST_TLS_PEER cannot select a substitute. The peer entry point
+is ignored by ordinary crypto tests and invoked only with synthetic fixture
+material and a loopback socket. The parent bounds elapsed time and
+reaps its owned child; the child bounds individual socket operations. The portable runner supplies the same
+peer from the already qualified static test executable without toolchain mounts.
+These are test orchestration processes; they do not add a service worker or
+claim runtime allocation/stack/RSS qualification.
 
 ## Streaming digest qualification
 

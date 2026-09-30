@@ -134,7 +134,7 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
     }
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .unwrap_or_else(|| root.join(".td-build-cache/crypto-target").into_os_string());
-    let command = |verb: &str| {
+    let command = |verb: &str, manifest: &str| {
         let mut cmd = Command::new(&cargo);
         cmd.current_dir(root)
             .args([
@@ -167,6 +167,7 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
             .env("RUSTC_WRAPPER", "")
             .env("RUSTC_WORKSPACE_WRAPPER", "")
             .env("CARGO_ENCODED_RUSTFLAGS", "")
+            .env_remove("TD_MTA_TEST_TLS_PEER")
             .env(crate::stage0::target_linker_var(&host), &cc)
             .stdin(Stdio::null());
         // cc-rs recognizes target-specific spellings before plain CC/AR.
@@ -188,7 +189,7 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
         crate::host_bin::arm_check_child(&mut cmd);
         cmd
     };
-    let output = command("tree")
+    let output = command("tree", manifest)
         .args([
             "--edges",
             "normal,build",
@@ -209,7 +210,58 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
     let graph =
         std::str::from_utf8(&output.stdout).map_err(|e| format!("crypto graph UTF-8: {e}"))?;
     crate::crypto_policy::active_graph(root, name, graph)?;
-    let mut cmd = command(action);
+    let mut cmd = command(action, manifest);
+    if action == "test" && name == "td-mta" {
+        use std::io::Read;
+        let mut peer = command("test", "td-crypto/Cargo.toml");
+        peer.args([
+            "--lib",
+            "--no-run",
+            "--message-format=json-render-diagnostics",
+        ])
+        .stdout(Stdio::piped());
+        let mut child = Child(
+            peer.spawn()
+                .map_err(|e| format!("crypto fixture build: {e}"))?,
+        );
+        let mut output = Vec::new();
+        child
+            .0
+            .stdout
+            .take()
+            .ok_or("crypto fixture build has no stdout")?
+            .take(8 * 1024 * 1024 + 1)
+            .read_to_end(&mut output)
+            .map_err(|e| format!("read crypto fixture build: {e}"))?;
+        if output.len() > 8 * 1024 * 1024 {
+            return Err("crypto fixture build output exceeds its ceiling".into());
+        }
+        if !child
+            .0
+            .wait()
+            .map_err(|e| format!("crypto fixture build wait: {e}"))?
+            .success()
+        {
+            return Err("crypto fixture build failed".into());
+        }
+        let message =
+            std::str::from_utf8(&output).map_err(|e| format!("crypto fixture JSON: {e}"))?;
+        let executable = crate::crypto_isolated::artifact_path(
+            message,
+            "td_crypto",
+            crate::crypto_isolated::ArtifactKind::LibraryTest,
+        )?;
+        let executable = executable
+            .canonicalize()
+            .map_err(|e| format!("crypto fixture executable: {e}"))?;
+        let target = Path::new(&target_dir)
+            .canonicalize()
+            .map_err(|e| format!("crypto fixture target: {e}"))?;
+        if !executable.starts_with(target) || !executable.is_file() {
+            return Err("crypto fixture executable escaped its target directory".into());
+        }
+        cmd.env("TD_MTA_TEST_TLS_PEER", executable);
+    }
     if action == "clippy" {
         cmd.args(["--all-targets", "--", "-D", "warnings"]);
     }

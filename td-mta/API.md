@@ -233,8 +233,9 @@ The portable harness also selects these eleven TLS cases and the five
 clock/TCP cases from td-mta's library test executable under isolated musl.
 Each must report one passing test; missing or renamed cases refuse artifact
 publication. This adds target behavioral coverage, not resource admission.
-Shared td-crypto fixtures qualify TLS 1.2 as well; mail-specific TLS 1.2 and service/resource acceptance
-remain part of M07d3/M07e.
+Shared td-crypto fixtures qualify TLS 1.2 as well. The gateway process
+fixtures below cover both versions through the admitted mail transport;
+complete SMTP/STARTTLS and service/resource acceptance remain M07d3/M07e.
 
 ### 1.4 Handshake capacity reservations
 
@@ -511,7 +512,12 @@ then maps evidence according to the retained role: ordinary inbound is None,
 relay/ACME require VerifiedServerName, and gateway requires VerifiedClientLeaf
 plus the configured current/next leaf pin and CIDR match on this actual peer.
 Any role/evidence mismatch refuses. Gateway matching never trusts a presented
-unverified digest. Positive gateway mTLS transport fixtures remain M07d3c.
+unverified digest. Local process fixtures now cover positive gateway mTLS
+for current/next pins and refusal of a verified leaf with a wrong pin or actual
+socket peer, under both TLS 1.2 and TLS 1.3. The remote client lives only in
+td-crypto's private test binary; mail tests use the production public facade.
+The fixture exchanges EHLO/reply bytes after TLS, without claiming a complete
+SMTP parser or STARTTLS state machine.
 
 Only that successful mapping publishes cached TlsInfo and releases the
 handshake permit. Before it, nonempty read/write may progress bounded TLS work

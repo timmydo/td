@@ -96,10 +96,13 @@ pub(crate) fn certificate_with_serial(
     ca: bool,
     serial: u8,
 ) -> Vec<u8> {
-    certificate_names(key, signer, ca, serial, &["localhost"])
+    certificate_names(key, signer, ca, serial, &["localhost"], false)
 }
 pub(crate) fn certificate_with_names(key: &P256Key, signer: &P256Key, names: &[&str]) -> Vec<u8> {
-    certificate_names(key, signer, false, 2, names)
+    certificate_names(key, signer, false, 2, names, false)
+}
+pub(crate) fn client_certificate(key: &P256Key, signer: &P256Key) -> Vec<u8> {
+    certificate_names(key, signer, false, 3, &["localhost"], true)
 }
 fn certificate_names(
     key: &P256Key,
@@ -107,6 +110,7 @@ fn certificate_names(
     ca: bool,
     serial: u8,
     names: &[&str],
+    client: bool,
 ) -> Vec<u8> {
     let provider = Provider;
     let mut public = [0; 65];
@@ -143,7 +147,7 @@ fn certificate_names(
         extensions.push(extension(
             0x25,
             false,
-            seq(&[oid(&[0x2b, 6, 1, 5, 5, 7, 3, 1])]),
+            seq(&[oid(&[0x2b, 6, 1, 5, 5, 7, 3, if client { 2 } else { 1 }])]),
         ));
     }
     let body = seq(&[

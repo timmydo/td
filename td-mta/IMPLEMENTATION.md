@@ -743,7 +743,8 @@ Implement the remaining work as independently reviewable increments:
     The portable harness executes all eleven pump and five clock/TCP cases
     from a separately selected static musl library test artifact.
     No mail authorization is constructed from raw TLS evidence.
-    TLS 1.2 mail fixtures and complete resource qualification remain below.
+    Gateway process fixtures below cover TLS 1.2/1.3 through mail transport;
+    complete protocol and resource qualification remain below.
   - **M07d3 — admitted upgrades:** bind immutable policy generations and slot
     leases, reserve before STARTTLS replies, reject plaintext tails and map
     verified leaf evidence plus actual peer address to gateway authorization.
@@ -808,9 +809,13 @@ Implement the remaining work as independently reviewable increments:
             serialization and durable mutation fencing remain M11/M13. Host and
             portable cases cover deadlines, refusal, encrypted delivery, close,
             retention, clock failure and missing-client-certificate denial.
-            Positive gateway mTLS and exact STARTTLS transitions remain M07d3c.
-    - **M07d3c — protocol integration:** complete STARTTLS flush/tail/reset,
-      positive gateway mTLS pin/address fixtures and local HTTPS/SMTP transitions.
+            Private process-peer fixtures now qualify positive gateway mTLS
+            under TLS 1.2/1.3 with current/next pins, wrong verified leaf pins
+            and actual peer CIDR refusal. Exact STARTTLS transitions remain
+            M07d3c.
+    - **M07d3c — protocol integration:** complete STARTTLS flush/tail handling,
+      parser/EHLO/auth reset and local HTTPS/SMTP transitions. Gateway mTLS
+      transport evidence is covered by the process fixtures above.
 - **M07e — resource/service admission:** qualify complete generation overlap,
   session/handshake peaks, worker entropy and Rust/native stack/allocation/RSS
   on the portable artifact before activating the adapters. Amend the checked

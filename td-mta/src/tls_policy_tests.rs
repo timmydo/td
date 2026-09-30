@@ -1,6 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 #[path = "tls_policy_client_tests.rs"]
 mod client_tests;
+#[path = "tls_gateway_process_tests.rs"]
+mod gateway_process_tests;
 #[path = "tls_policy_io_tests.rs"]
 mod io_tests;
 use super::*;
