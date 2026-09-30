@@ -278,11 +278,14 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   test-target/profile, static ELF and isolated-runtime checks as the other
   qualification binaries; it is not an installed service dependency.
 - `td-mta-transport-smoke`: the `--lib --no-run` td-mta test executable,
-  selected by its `td_mta` library target and test profile. Forty-five
-  exact policy/generation/gateway/admission/clock/TCP/TLS cases execute
+  selected by its `td_mta` library target and test profile. Fifty-three
+  exact SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases execute
   individually under the existing deadline and positive-one-test verdict
-  requirement. They cover complete TLS policy compilation and HTTPS name
-  subsets, reader caps/refusals, client-only startup/expiry admission,
+  requirement. Eight SMTP control-framing cases cover fragmented strict CRLF,
+  line/reply ceilings, multiline code agreement, exact tails, bare final codes,
+  malformed syntax and EHLO greeting/extension separation. They also cover
+  complete TLS policy compilation and HTTPS name subsets, reader
+  caps/refusals, client-only startup/expiry admission,
   strict client trust and complete-table replacement within the same
   generation budget, generation-bound IDs, queued/native session ownership,
   exact buffer recovery and gateway policy/binding comparison; local

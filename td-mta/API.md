@@ -547,6 +547,54 @@ reuse. Ordinary Drop aborts through the pump, releases owners and frees owned
 arrays. Complete runtime session/byte slots, return queues and aggregate
 qualification remain required before service activation. No listener is enabled.
 
+### 1.9 SMTP control framing
+
+`smtp_wire::LineReader` borrows one 512-byte startup reservation and
+recognizes strict CRLF across arbitrary chunks. It accepts ASCII printable
+control-line bytes and HT; DATA has separate framing. Its limit includes
+CRLF. `feed` stops at the first complete line and reports the exact consumed
+prefix. The caller retains the entire tail, including pipelined plaintext or
+TLS-looking bytes; the reader never silently discards it. A complete line
+remains borrowed until explicit `advance`. Invalid framing or capacity is a
+terminal error. Advancing a complete line clears its storage; constructing or
+dropping a reader does not. Final/failed line bytes may remain in the caller
+reservation but cannot be observed through a fresh reader. No secure erasure
+is promised. EOF before a complete line is a protocol failure owned by
+the transport driver; this byte parser does not read sockets or time out.
+
+`ReplyReader` uses that same reservation for one reply, checking each
+three-digit SMTP code, separator and text. Every continuation line has the
+same code. A bare final code is accepted. The 16 KiB aggregate ceiling counts
+all wire bytes including every CRLF. It emits each complete line separately;
+callers advance continuation lines and retain recognized extension facts
+only after the final successful reply. A complete reply cannot advance into
+the next reply; construct a fresh reader over the reused reservation.
+Syntax/capacity failures clear observable reply evidence and remain terminal.
+V1 rejects non-ASCII reply text as a protocol failure, even if its leading
+code appears valid. Never synthesize smtpReply or permanent refusal from that
+prefix. QUEUE.md's protocol-failure/retry/uncertainty rules apply; this can
+retry a nonconforming relay's non-ASCII refusal until expiry. UTF-8 message
+content under 8BITMIME does not change control-reply syntax. M17 must bound
+normalized persisted reply text separately to its 4096-byte storage ceiling;
+a 16 KiB wire-work limit is neither that storage limit nor an allocation.
+
+`ehlo_extension` parses extension keyword/parameter syntax only for a 250
+reply line after the first greeting. Callers compare keywords without ASCII
+case; a greeting containing STARTTLS is never an advertisement. An Invalid
+extension result affects that line only: skip it as unadvertised and continue
+the correctly framed reply. This includes legacy AUTH= syntax and trailing
+spaces. A later standard AUTH line still counts; absent required capabilities
+refuse the operation. Recognized keywords still require their own parameter
+semantics (STARTTLS has none). Neither syntax helper authorizes TLS,
+implements a command transaction, or proves a
+reply has been flushed. STARTTLS drivers still own reservation-before-220,
+complete output flush, exact-tail refusal, handshake and parser/EHLO/auth
+reset. M10/M17 own the remaining SMTP protocol and extension semantics.
+These readers borrow existing SMTP/outbound scratch; they allocate nothing
+and add no resource reservation or service listener. The 512-byte reader is
+for base control lines; M10 must add the larger MAIL command ceilings required
+by advertised SIZE/8BITMIME before using it for the complete receiver.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

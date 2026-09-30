@@ -13,6 +13,7 @@ pub mod limits;
 pub mod observability;
 pub mod ownership;
 pub mod ports;
+pub mod smtp_wire;
 pub mod sync;
 pub mod tls_admission;
 pub mod tls_io;

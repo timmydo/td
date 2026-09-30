@@ -815,6 +815,14 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-mta-transport-smoke", "tls_policy::tests::client_tests::client_only_acme_bootstrap_never_opens_server_material", false),
         ("td-mta-transport-smoke", "tls_policy::tests::client_tests::expired_server_does_not_block_clients_but_invalid_client_trust_still_refuses", false),
         ("td-mta-transport-smoke", "tls_policy::tests::client_tests::client_generation_transitions_to_complete_within_the_same_two_slots", false),
+        ("td-mta-transport-smoke", "smtp_wire::tests::line_split_at_every_boundary_retains_exact_tail", false),
+        ("td-mta-transport-smoke", "smtp_wire::tests::strict_line_framing_is_terminal_after_failure", false),
+        ("td-mta-transport-smoke", "smtp_wire::tests::control_line_counts_crlf_and_clears_only_its_reservation", false),
+        ("td-mta-transport-smoke", "smtp_wire::tests::reply_syntax_accepts_bare_codes_and_refuses_ambiguous_separators", false),
+        ("td-mta-transport-smoke", "smtp_wire::tests::multiline_replies_require_one_code_and_leave_the_next_reply_unread", false),
+        ("td-mta-transport-smoke", "smtp_wire::tests::fragmented_220_reply_stops_before_plaintext_or_record_tail", false),
+        ("td-mta-transport-smoke", "smtp_wire::tests::reply_aggregate_cap_includes_all_lines_and_the_final_crlf", false),
+        ("td-mta-transport-smoke", "smtp_wire::tests::ehlo_greeting_is_never_a_starttls_advertisement", false),
         ("td-mta-transport-smoke", "tls_policy::tests::gateway_process_tests::gateway_mutual_tls_accepts_current_and_next_verified_leaf_pins", false),
         ("td-mta-transport-smoke", "tls_policy::tests::gateway_process_tests::gateway_mutual_tls_refuses_verified_leaf_with_wrong_pin_or_actual_peer", false),
         ("td-mta-transport-smoke", "gateway_policy::tests::canonical_gateway_policy_ignores_only_representation_and_server_material", false),
@@ -880,7 +888,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
-    println!("portable runtime: forty-five mail policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
+    println!("portable runtime: fifty-three mail SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
     Ok(())
 }
 

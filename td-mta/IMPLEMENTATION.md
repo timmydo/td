@@ -816,6 +816,14 @@ Implement the remaining work as independently reviewable increments:
     - **M07d3c — protocol integration:** complete STARTTLS flush/tail handling,
       parser/EHLO/auth reset and local HTTPS/SMTP transitions. Gateway mTLS
       transport evidence is covered by the process fixtures above.
+      - **Control framing:** implemented borrowed 512-byte strict-CRLF line
+        framing and a 16 KiB aggregate multiline reply reader. Exact consumed
+        prefixes preserve tails; reply codes agree across continuation lines,
+        bare final codes are accepted, and framing/capacity failure is terminal.
+        EHLO extension syntax excludes the initial greeting. Boundary, malformed,
+        fragmented, aggregate-cap and tail fixtures run on host and musl.
+        The parser does not own sockets, deadlines or command state. STARTTLS
+        reservation/flush/reset transitions and protocol drivers remain pending.
 - **M07e — resource/service admission:** qualify complete generation overlap,
   session/handshake peaks, worker entropy and Rust/native stack/allocation/RSS
   on the portable artifact before activating the adapters. Amend the checked
