@@ -63,6 +63,16 @@ impl ServerIdentity {
     /// Recheck time and key health. Admission does not grant permanent validity.
     pub fn check_validity(&self, now: Option<u64>) -> Result<(), TlsError> {
         check_time(now, self.not_before, self.not_after)?;
+        self.check_health()
+    }
+
+    #[cfg(test)]
+    pub(super) fn retire_for_test(&self) -> Result<(), Error> {
+        self.key
+            .sign_es256_with(b"retirement fixture", |_| Err(Error::Crypto))
+    }
+
+    pub(super) fn check_health(&self) -> Result<(), TlsError> {
         let mut point = [0; 65];
         Provider
             .p256_public(&self.key, &mut point)

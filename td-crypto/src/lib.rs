@@ -1,5 +1,5 @@
 //! Opaque cryptography APIs with owned SHA-256 and a private AWS-LC backend.
-//! TLS configurations and socket-free client sessions are implemented.
+//! TLS configurations and socket-free client/server sessions are implemented.
 //!
 //! These checks reject the two named root exports; backend integration must
 //! also check nested exports, aliases and public signatures.
@@ -157,3 +157,5 @@ mod p256_oracle;
 #[allow(dead_code)]
 #[path = "../../engine/src/sha256.rs"]
 mod sha256_oracle;
+
+mod tls_hello;

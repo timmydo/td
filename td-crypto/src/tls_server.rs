@@ -1,4 +1,4 @@
-//! Cold server policy and immutable name routing; session admission is separate.
+//! Cold server policy and immutable name routing retained by server sessions.
 use crate::{
     tls_clock::BackendClock, ClockHandle, ServerIdentity, TlsError, TlsProtocol, TrustStore,
 };
@@ -27,8 +27,8 @@ pub struct ServerConfig {
     pub(super) native: Arc<rustls::ServerConfig>,
     pub(super) clock: Arc<ClockHandle>,
     pub(super) routing: Arc<Routing>,
-    protocol: TlsProtocol,
-    mandatory_client_auth: bool,
+    pub(super) protocol: TlsProtocol,
+    pub(super) mandatory_client_auth: bool,
 }
 impl ServerConfig {
     /// Cold construction. None disables client authentication; Some requires a

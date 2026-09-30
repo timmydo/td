@@ -434,7 +434,7 @@ fn client_session_never_emits_after_close_or_reuses_failed_state() {
         for bad_mac in [false, true] {
             let mut d = Driver::new(version);
             d.handshake(false).unwrap();
-            let config = d.client.live.as_ref().unwrap().config.clone();
+            let config = d.client.live.as_ref().unwrap().client_config();
             d.client.close().unwrap();
             assert!(d.client.drain_ciphertext(&mut [0; 128]).unwrap() > 0);
             let error = if bad_mac {
@@ -476,7 +476,7 @@ fn client_session_unwind_consumes_state_and_shared_clock_failure_fences_reuse() 
     let mut d = Driver::new(&rustls::version::TLS13);
     d.handshake(false).unwrap();
     let observer = Arc::downgrade(&d.client.live.as_ref().unwrap().clock);
-    let config = d.client.live.as_ref().unwrap().config.clone();
+    let config = d.client.live.as_ref().unwrap().client_config();
     assert_eq!(
         d.client.run::<()>(|_| panic!("synthetic session unwind")),
         Err(TlsError::Crypto)
@@ -487,7 +487,7 @@ fn client_session_unwind_consumes_state_and_shared_clock_failure_fences_reuse() 
 
     let mut d = Driver::new(&rustls::version::TLS13);
     d.handshake(false).unwrap();
-    let config = d.client.live.as_ref().unwrap().config.clone();
+    let config = d.client.live.as_ref().unwrap().client_config();
     let mut second = TlsSession::client(config.clone(), "localhost").unwrap();
     d.clock.time.store(u64::MAX, Ordering::SeqCst);
     assert_eq!(d.client.drain_ciphertext(&mut []), Err(TlsError::Crypto));
@@ -550,7 +550,7 @@ fn client_session_unread_plaintext_blocks_without_consuming_next_record() {
 fn client_session_name_verification_maps_and_retires_without_output() {
     for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
         let mut d = Driver::new_name(version, "wrong.mail.test");
-        let config = d.client.live.as_ref().unwrap().config.clone();
+        let config = d.client.live.as_ref().unwrap().client_config();
         let calls = d.clock.calls.load(Ordering::SeqCst);
         for name in ["", "127.0.0.1", "localhost.", "*.mail.test"] {
             assert!(matches!(
@@ -894,3 +894,15 @@ fn client_session_tls12_simultaneous_close_pins_pending_output_refusal() {
         assert_eq!(d.client.status().ciphertext_pending, 0);
     }
 }
+
+impl Live {
+    fn client_config(&self) -> Arc<ClientConfig> {
+        match &self.config {
+            Role::Client(config) => config.clone(),
+            Role::Server(_) => panic!("expected client fixture"),
+        }
+    }
+}
+
+#[path = "tls_server_session_tests.rs"]
+mod server;

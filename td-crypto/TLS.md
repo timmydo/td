@@ -3,8 +3,8 @@
 ## Status and ownership
 
 This is the M07 contract for the public TLS facade. ClientConfig,
-ServerConfig, the shared ClockHandle and socket-free client sessions are
-implemented; server session admission remains M07c2. Bounded PEM syntax,
+ServerConfig, the shared ClockHandle and socket-free client/server sessions
+are implemented. Bounded PEM syntax,
 P-256 PEM key loading, local ServerIdentity admission and TrustStore
 construction are implemented.
 Admitted identities retain a private TLS signer sharing the same owned
@@ -251,7 +251,8 @@ the affected session with Clock. A callback panic retires the shared source
 and requires Crypto, even if the backend reports Finished success. Also check
 time on operations where the backend does not request it. The configuration
 fixtures pin this backend hazard; client sessions enforce this observation.
-Server session enforcement remains M07c2 work.
+Server sessions install the same observer before configuration-dependent
+handshake work.
 
 ## Session progress and buffers
 
@@ -276,10 +277,11 @@ work. Implementation freezes concrete signatures with its compiling
 interface tests; these operation semantics cannot change silently when
 signatures are added.
 
-The implemented client interface is:
+The implemented interface is:
 
 ```rust
 TlsSession::client(Arc<ClientConfig>, &str) -> Result<TlsSession, TlsError>
+TlsSession::server(Arc<ServerConfig>) -> Result<TlsSession, TlsError>
 status(&self) -> TlsStatus
 receive_record(&mut self, &[u8], socket_unwritten: bool) -> Result<TlsProgress, TlsError>
 drain_ciphertext(&mut self, &mut [u8]) -> Result<usize, TlsError>
@@ -294,8 +296,9 @@ TlsProgress is Bytes(count), Blocked(reason) or Eof; Eof is read-only.
 BlockedOn identifies PeerInput, DrainPlaintext or DrainCiphertext. TlsStatus
 contains phase, pending plaintext/ciphertext counts, wants_input, write_ready,
 read_closed, write_closed, optional HandshakeInfo and optional fixed error.
-HandshakeInfo contains TlsVersion (V12/V13) and PeerEvidence; only
-VerifiedServerName is currently implemented. Server evidence follows M07c2.
+HandshakeInfo contains TlsVersion (V12/V13) and PeerEvidence:
+VerifiedServerName for clients; Unauthenticated for ordinary servers; or
+VerifiedClientLeaf([u8; 32]) for mandatory client authentication.
 Status is cached from the last successful operation, or fixed on terminal
 failure; it is not a fresh clock-health or authorization query. A shared
 clock fault is observed on the next operational call. Readiness describes

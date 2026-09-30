@@ -635,10 +635,10 @@ do not complete M07 or enable service.
 The future TLS contract is specified in td-crypto/TLS.md, including explicit
 algorithm sets, local P-256 PEM identity admission, trust/SNI/time policy,
 bounded record progress and failure/close behavior. Material admission and
-immutable client/server configuration interfaces and client session progress
-are implemented; server sessions and complete resource qualification remain
+immutable client/server configurations and socket-free client/server progress
+are implemented; mail adapters and complete resource qualification remain
 pending. Direct Crypto/Entropy operations are implemented inside td-crypto;
-incoming session and mail transport operations follow. Rustls provider/configuration/verifier/key types never leave
+mail transport integration follows. Rustls provider/configuration/verifier/key types never leave
 that crate. Implement the conformance, explicit-provider confinement, algorithm
 baseline, key compatibility and native allocation/failure qualification in
 `td-crypto/DESIGN.md`, retaining its independent fixtures for F04.
@@ -713,10 +713,13 @@ Implement the remaining work as independently reviewable increments:
     Local peers exercise tiny bounded pipes, simultaneous writes, KeyUpdate,
     post-handshake ticket time failures and exact reassembly limits. Portable
     qualification covers the same cases. This does not enable mail transport.
-  - **M07c2 — server session:** pending bounded raw ClientHello/SNI validation,
-    including fragmented/retry hellos before backend loss; selected-identity
-    health/date checks before signing and after Finished; mandatory-client
-    leaf evidence and all shared lifecycle fences through the common facade.
+  - **M07c2 — server session:** implemented bounded raw ClientHello/SNI checks
+    before backend loss, including fragmented/retry hellos; selected-identity
+    health/date fences before signing and after Finished; mandatory-client
+    leaf evidence and shared lifecycle fences through the common facade.
+    Public-pair tiny pipes and local mutual peers qualify progress, exact
+    evidence and typed refusal. Raw parser state stays below 1 KiB; complete
+    generation/session/native accounting remains M07e.
 - **M07d — mail transport:** implement existing ports through that facade,
   with socket/lease/deadline handling, implicit client TLS, STARTTLS transition
   fixtures and gateway pin plus address authorization. No provider type or

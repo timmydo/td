@@ -1,8 +1,8 @@
-//! Exclusive socket-free client TLS progress. Server admission follows separately.
+//! Exclusive socket-free TLS progress with consumed failure state.
 use crate::{
     session_clock::SessionClock,
     tls_record::{Protection, Record, PLAINTEXT_LIMIT},
-    ClientConfig, TlsError, TlsProtocol,
+    ClientConfig, ServerConfig, TlsError, TlsProtocol,
 };
 use std::{
     io::{Cursor, Read, Write},
@@ -27,6 +27,8 @@ pub enum TlsPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerEvidence {
     VerifiedServerName,
+    Unauthenticated,
+    VerifiedClientLeaf([u8; 32]),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HandshakeInfo {
@@ -63,10 +65,18 @@ pub struct TlsSession {
     live: Option<Live>,
     status: TlsStatus,
 }
+#[derive(Clone)]
+enum Role {
+    Client(Arc<ClientConfig>),
+    Server(Arc<ServerConfig>),
+}
 struct Live {
-    connection: rustls::Connection,
+    connection: Option<rustls::Connection>,
+    acceptor: Option<rustls::server::Acceptor>,
+    hellos: Option<crate::tls_hello::RawHellos>,
+    selected: Option<usize>,
     clock: Arc<SessionClock>,
-    config: Arc<ClientConfig>,
+    config: Role,
     protection: Protection,
     status: TlsStatus,
 }
@@ -76,6 +86,14 @@ impl TlsSession {
         // All mutable native connection state is fresh and consumed by this
         // boundary. Shared policy is immutable; its clock has its own fence.
         let live = catch_unwind(AssertUnwindSafe(move || Live::client(config, name)))
+            .map_err(|_| TlsError::Crypto)??;
+        Ok(Self {
+            status: live.status,
+            live: Some(live),
+        })
+    }
+    pub fn server(config: Arc<ServerConfig>) -> Result<Self, TlsError> {
+        let live = catch_unwind(AssertUnwindSafe(move || Live::server(config)))
             .map_err(|_| TlsError::Crypto)??;
         Ok(Self {
             status: live.status,
@@ -232,9 +250,13 @@ impl TlsSession {
         // On unwind the consumed connection is dropped, never restored. Slices
         // borrowed by the operation carry no invariant and are discarded on error.
         let result = catch_unwind(AssertUnwindSafe(move || {
-            live.clock.now()?;
+            let now = live.clock.now()?;
+            live.check_material(now)?;
             let result = operation(&mut live)?;
             live.clock.check()?;
+            if matches!(live.config, Role::Server(_)) {
+                live.check_material(live.clock.now()?)?;
+            }
             live.publish()?;
             Ok((live, result))
         }))
@@ -277,9 +299,12 @@ impl Live {
             rustls::ClientConnection::new(Arc::new(native), name).map_err(native_error);
         clock.check()?;
         let mut live = Self {
-            connection: rustls::Connection::Client(connection?),
+            connection: Some(rustls::Connection::Client(connection?)),
+            acceptor: None,
+            hellos: None,
+            selected: None,
             clock,
-            config,
+            config: Role::Client(config),
             protection: Protection::Plain,
             status: TlsStatus {
                 phase: TlsPhase::Handshaking,
@@ -305,14 +330,15 @@ impl Live {
         &mut self,
         operation: impl FnOnce(&mut rustls::Connection) -> Result<T, TlsError>,
     ) -> Result<T, TlsError> {
-        let value = operation(&mut self.connection);
+        let value = operation(self.connection.as_mut().ok_or(TlsError::Crypto)?);
         self.clock.check()?;
+        self.check_selected_health()?;
         value
     }
     fn process(&mut self) -> Result<(), TlsError> {
         let mut io =
             self.backend(|connection| connection.process_new_packets().map_err(native_error))?;
-        if !self.status.write_closed && !self.connection.is_handshaking() {
+        if !self.status.write_closed && !self.connection()?.is_handshaking() {
             // Flush a deferred KeyUpdate response without application bytes.
             // After local close this must remain suppressed with all new output.
             let count = self.backend(|connection| {
@@ -354,6 +380,14 @@ impl Live {
         {
             return Err(TlsError::Protocol);
         }
+        if let Some(hellos) = self.hellos.as_mut() {
+            if record.kind == 22 && self.protection != Protection::Tls12 {
+                hellos.feed(record.body)?;
+            }
+        }
+        if self.acceptor.is_some() {
+            return self.accept(wire);
+        }
         let mut input = Cursor::new(wire);
         let length = u64::try_from(wire.len()).map_err(|_| TlsError::Protocol)?;
         while input.position() < length {
@@ -368,7 +402,7 @@ impl Live {
             }
             self.process()?;
         }
-        match self.connection.protocol_version() {
+        match self.connection()?.protocol_version() {
             Some(rustls::ProtocolVersion::TLSv1_3) => self.protection = Protection::Tls13,
             Some(rustls::ProtocolVersion::TLSv1_2) if record.kind == 20 && record.body == [1] => {
                 self.protection = Protection::Tls12
@@ -404,41 +438,36 @@ impl Live {
     }
     fn publish(&mut self) -> Result<(), TlsError> {
         self.clock.check()?;
-        if self.status.handshake.is_none() && !self.connection.is_handshaking() {
+        if self.connection.is_none() {
+            self.status.wants_input = true;
+            return self.clock.check();
+        }
+        if self.status.handshake.is_none() && !self.connection()?.is_handshaking() {
             if self.status.read_closed || self.status.write_closed {
                 return Err(TlsError::Protocol);
             }
             if !matches!(
-                self.connection.handshake_kind(),
+                self.connection()?.handshake_kind(),
                 Some(
                     rustls::HandshakeKind::Full | rustls::HandshakeKind::FullWithHelloRetryRequest
                 )
             ) {
                 return Err(TlsError::Crypto);
             }
-            let version = match self.connection.protocol_version() {
+            let version = match self.connection()?.protocol_version() {
                 Some(rustls::ProtocolVersion::TLSv1_2) => TlsVersion::V12,
                 Some(rustls::ProtocolVersion::TLSv1_3) => TlsVersion::V13,
                 _ => return Err(TlsError::Crypto),
             };
             let valid_alpn = matches!(
-                (self.config.protocol, self.connection.alpn_protocol()),
+                (self.protocol(), self.connection()?.alpn_protocol()),
                 (_, None) | (TlsProtocol::Http1, Some(b"http/1.1"))
             );
             if !valid_alpn {
                 return Err(TlsError::Protocol);
             }
-            if self
-                .connection
-                .peer_certificates()
-                .is_none_or(|chain| chain.is_empty())
-            {
-                return Err(TlsError::Crypto);
-            }
-            self.status.handshake = Some(HandshakeInfo {
-                version,
-                peer: PeerEvidence::VerifiedServerName,
-            });
+            let peer = self.peer_evidence()?;
+            self.status.handshake = Some(HandshakeInfo { version, peer });
         }
         self.status.wants_input = !self.status.read_closed
             && self.status.plaintext_pending == 0
@@ -458,9 +487,13 @@ impl Live {
         } else {
             TlsPhase::Handshaking
         };
+        self.check_selected_health()?;
         self.clock.check()
     }
 }
+#[path = "tls_server_session.rs"]
+mod server;
+
 fn native_error(error: rustls::Error) -> TlsError {
     use crate::VerificationFailure as V;
     use rustls::{CertificateError as C, Error as E};

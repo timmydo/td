@@ -1,4 +1,4 @@
-//! Immutable outbound configuration. Socket-free sessions are a later layer.
+//! Immutable outbound configuration retained by socket-free sessions.
 use crate::{tls_clock::BackendClock, ClockHandle, TlsError, TrustStore};
 use rustls::{
     client::{
@@ -18,7 +18,7 @@ pub enum TlsProtocol {
 }
 
 /// Opaque immutable outbound TLS policy. Construction performs no I/O and does
-/// not authenticate a peer. Share the handle with Arc; sessions remain future work.
+/// not authenticate a peer. Share the handle with Arc across sessions.
 pub struct ClientConfig {
     pub(super) native: Arc<rustls::ClientConfig>,
     pub(super) clock: Arc<ClockHandle>,

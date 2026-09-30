@@ -15,8 +15,8 @@ identity. M07b2b adds explicit private CA bundles and the pinned public
 server root set. M07b3a supplies the explicit private TLS algorithm
 provider. M07b3b retains owned keys for TLS signing; M07b3c1 adds the
 shared clock and outbound ClientConfig. M07b3c2 adds ServerConfig and
-immutable identity routing. M07c1 adds socket-free client sessions; server
-session admission remains M07c2.
+immutable identity routing. M07c1 adds socket-free client sessions; M07c2
+adds server admission and verified-client evidence.
 Test-only backend qualification covers explicit provider construction,
 SHA-256, local TLS 1.2/1.3 data exchange, certificate verification and
 malformed/tampered-record refusals in the isolated static executable. Mocks
@@ -733,12 +733,12 @@ A cold candidate containing any invalid material is refused atomically. TLS.md
 distinguishes that publication rule from continuing to serve other valid
 identities in an already admitted configuration.
 
-The resolver repeats the same pure lookup used by the future session facade's
+The resolver repeats the same pure lookup used by the session facade's
 typed preselection. It does not call the clock or grant ongoing validity.
-M07c must inspect the initial ClientHello, select an identity, check that
-identity's dates/key against the shared clock before backend signing, retain
-that selection and recheck it before publishing Finished evidence. An unrelated
-expired identity must not prevent a valid identity from serving. The native
+M07c inspects the initial ClientHello, selects an identity, checks that
+identity's dates/key against the shared clock before backend signing, retains
+that selection and rechecks it before publishing Finished evidence. An unrelated
+expired identity does not prevent a valid identity from serving. The native
 configuration alone does not enforce those session boundaries.
 
 The pinned backend intentionally treats an IP literal in raw SNI as absent.
@@ -748,8 +748,8 @@ with an equal-length IP literal and proves that loss. This is a backend hazard,
 not admissible facade behavior. The same accepted hello selects the default
 identity in both SMTP configurations and is refused by the HTTP configuration.
 It does not complete a handshake: the mutation changes the transcript. M07c
-must perform bounded raw ClientHello/SNI validation before that information is discarded, including fragmented and
-retry hellos. The pure routing helper rejects malformed names it receives,
+performs bounded raw ClientHello/SNI validation before that information is
+discarded, including fragmented and retry hellos. The pure routing helper rejects malformed names it receives,
 but cannot reject a raw name already converted to absence. No public session
 or listener bypasses this requirement in the configuration increment.
 
@@ -789,8 +789,8 @@ is enabled until M07c/M07d/M07e complete their remaining contracts.
 ### Socket-free client sessions
 
 `TlsSession::client` retains one ClientConfig and one owned, checked DNS name
-inside a private backend connection. It supplies only client sessions; server
-Acceptor admission and verified-client evidence remain M07c2. No socket, DNS,
+inside a private backend connection. M07c1 supplies the client role; M07c2
+adds the server role described below. No socket, DNS,
 mail policy or listener is created. The caller assembles one complete TLS
 record in its bounded wire buffer, retains socket-write tails, and aborts its
 transport on every session error.
@@ -884,6 +884,73 @@ Synthetic session unwinds prove state consumption and independent reuse of a
 healthy configuration. Post-local-close malformed/bad-MAC cases qualify both
 host and portable behavior without emitting a later alert. M07d/M07e must
 still qualify mail adapters, resource leases and complete service bounds.
+
+### Socket-free server admission
+
+`TlsSession::server` retains one ServerConfig and the common per-session clock
+observer. It begins in a private Acceptor with no authentication evidence.
+Single-identity construction checks that identity; multiple-identity sessions
+check material only after name selection. A native connection replaces the
+Acceptor only after complete ClientHello validation and selected-key/date
+checks, inside the same consuming unwind boundary as client progress.
+Acceptor errors discard their native alert; failed sessions expose no output.
+
+Before native intake, a streaming raw ClientHello checker validates plaintext
+handshake fragments. Its state is at most 1024 bytes on qualified targets,
+including fixed 253-byte name buffers; it allocates no memory and retains no
+caller slice. It carries the four-byte handshake header, checked remaining
+lengths and a field state across records. Check session-ID/cipher/compression
+vector boundaries, exact extension lengths and one nonempty host_name entry
+within a unique SNI extension. Unknown extension payloads are bounded skips;
+native parsing still validates their semantics and protocol order. Refuse
+IP literals and malformed DNS with the existing name policy before native
+conversion can lose them. Accept absent SNI as absence, subject to routing.
+
+Validate complete and fragmented initial/retry hellos. At most two ClientHellos
+are admitted, with identical folded name or absence on retry. The checker runs
+only after backpressure checks, so a Blocked record can be retried without
+advancing it. Validate the entire incoming record before passing any of it to
+the backend; an invalid final SNI fragment cannot trigger signing. TLS 1.2
+ciphertext after accepted ChangeCipherSpec and TLS 1.3 outer application-data
+records bypass this plaintext scanner. Existing record/deframer bounds remain
+independent; no extra 64 KiB handshake pool is introduced.
+
+At initial acceptance, require the raw checked name to equal the backend's
+name, then select through the configuration's immutable routing table. Check
+only the selected identity before converting Acceptor state into a signing
+connection, before later handshake operations (including HRR) and again before
+publishing Finished. A candidate configuration still cold-checks all material;
+expired or retired unrelated identities within an existing configuration do
+not block its healthy selected identity. Completed connections check selected
+key health on every operation, without re-expiring their established peer
+authentication when the certificate's date passes. Shared key retirement is
+checked after native calls and before publication; ordinary peer errors retire
+only the session. A private health helper performs the existing fenced public
+point operation, without adding a signing or secret-export path.
+
+Server configuration clones install their own sticky clock observer before
+configuration-dependent native work. Sample supplied time before operations
+and again after server work, including completion; backend callback failures
+and shared source retirement remain terminal. Local key and clock fences are
+independent. Unwinds consume Acceptor or connected state and cannot restore it.
+
+Full Finished success produces Unauthenticated for ordinary inbound TLS. With
+mandatory private-client authentication, require the verified native leaf and
+hash its exact DER using owned SHA-256 into VerifiedClientLeaf. Native peer
+certificate presence alone is insufficient. No certificate bytes, backend
+object, gateway authorization or socket address crosses this session API.
+The server uses the same progress, fixed errors, close behavior and output
+growth refusal as the client. Mail authorization and transport still await
+M07d; total generation/session/native memory qualification remains M07e.
+
+Local fixtures exercise TLS 1.2/1.3 public sessions, tiny bounded pipes,
+simultaneous full-size writes, clean close, private mutual authentication,
+typed certificate refusals and independently checked leaf digests. A forced
+allowed-group HRR first proves a complete valid handshake, then verifies raw
+IP/changed-name refusal across fragmented retry records. Lifecycle fixtures
+separate cold candidate refusal, selected/unrelated expiry, expiry during
+handshake, established-date policy, shared-key retirement and clock/unwind
+retirement. No live service or external network endpoint is used.
 
 ### Mutual TLS backend qualification
 
@@ -1034,3 +1101,12 @@ AWS-LC remains required for entropy, comparison, P-256 and Rustls. Further
 candidates stay test-only until their qualified cutover; remove each obsolete
 adapter and remove native dependencies/build inputs when their final user
 is replaced. Do not prebuild unused primitive interfaces.
+
+Selected-key health currently uses the owned key's mutex-backed public-point
+operation. A server session checks it before work, after native calls and at
+publication, so established record work can wait behind another session's
+signing operation. These repeated acquisitions preserve shared retirement
+semantics; they are not qualified as nonblocking or latency-bounded. M07e must
+measure contention across handshake and established workers, along with the
+shared clock callback, before service admission. Any later lock-free health
+optimization must independently preserve those retirement fences.

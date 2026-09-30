@@ -579,15 +579,15 @@ Clock fixtures cover ordinary missing time, recovery for another operation,
 serialized shared callback panic/retirement and poisoned-handle refusal.
 Backend verification fails with no supplied time in both versions. A TLS 1.3
 peer completes Finished and then sends tickets after time becomes unavailable;
-the client refuses despite its no-op resumption store. This does not yet
-qualify the future public session's error mapping or clock checks on backend
-operations that do not request time.
+the client refuses despite its no-op resumption store. These configuration cases alone do not
+qualify session error mapping or operations that do not request time; the
+public session cases below exercise those additional boundaries.
 
 A separate TLS 1.2 fixture returns transient None or panics exactly when the
 backend saves session state after server Finished. The backend ignores the
 time failure and completes the handshake; a later successful clock poll can
-miss it. This pins a hazard, not an allowed public session success: M07c must
-retain each callback failure per connection and check it and shared retirement
+miss it. This pins a hazard, not an allowed public session success: M07c
+retains each callback failure per connection and checks it and shared retirement
 after backend work before publishing results. Normal TLS 1.2 session saving
 also copies secret and certificate state before the no-op store drops it.
 
@@ -621,9 +621,9 @@ requires a client certificate; omitted hints do not omit trust verification.
 
 A raw ClientHello mutation pins the backend's conversion of an IP-literal SNI
 into absence before resolver lookup. This is a known integration hazard, not
-an accepted facade input: M07c must validate raw SNI before that loss, check
+an accepted facade input: M07c validates raw SNI before that loss, checks
 selected material and shared clock/key state before signing and after Finished,
-and enforce the per-connection time-failure observation specified in TLS.md.
+and enforces the per-connection time-failure observation specified in TLS.md.
 The configuration fixtures do not supply public session progress, gateway
 leaf-pin/address policy, listener activation or complete resource bounds.
 
@@ -656,3 +656,25 @@ session without drainable output. Test-only extraction is enabled on that
 remote peer; facade configurations still disable extraction. Separate cases
 pin the conservative simultaneous-close refusal when TLS 1.2 output remains
 inside the facade or in the caller's socket-write tail.
+
+## Socket-free server session qualification
+
+The public server constructor begins with private bounded ClientHello admission.
+The portable runner checks raw SNI before backend conversion, including every
+fragment split, absent names, malformed/IP names, duplicate SNI and vector
+lengths, large skipped extensions and retry consistency. Parser state is at
+most 1024 bytes without an additional handshake copy. A valid forced HRR
+baseline completes before mutated retry names are refused without evidence.
+A separate absent-SNI first hello and IP-literal retry distinguishes facade
+validation from the backend, which treats both names as absent. Mixed-case
+initial names also reach every admitted server selection mode after folding.
+
+Local public session pairs use seven-byte pipes, one-byte reads, short output
+tails, simultaneous full-size writes and version-specific closure under both
+TLS versions. Mandatory private-client cases verify the exact leaf fingerprint
+against an independent digest and refuse missing/untrusted/expired/wrong-use/
+bad-signature/count/size inputs. A future expiry case proves supplied time
+reaches peer verification. Reusing healthy material after remote refusals is
+required. Selected versus unrelated expiry/retirement, mid-handshake expiry,
+established-date behavior, shared clock panic and consuming Acceptor unwind
+are separate cases. No gateway authorization or whole-memory bound is claimed.
