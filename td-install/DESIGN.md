@@ -521,7 +521,8 @@ This guard does not implement the installation service's exclusive
 admission. Unclaimed raw I/O can still race a claim, image files have no
 block claim, and each command releases its descriptor when it finishes.
 Media/backing-device exclusion, stable identity, the service's held
-operation descriptors and trusted destructive consent remain required.
+operation descriptors through execution and trusted destructive consent
+remain required; `td-install serve` holds the claim through review only.
 
 The internal `FormatDestination` owns one File and a diagnostic label.
 Both formatting bodies borrow that File; neither reopens its label. A
@@ -537,13 +538,15 @@ The pathname CLI commands each construct and release their own object;
 format retains one through both raw writes. A service holding a separate
 block claim still cannot invoke them: the distinct holder would conflict.
 There is no descriptor-number CLI, claim transfer through /proc, or
-cross-process descriptor protocol. The future service must own its
-formatting object in the process performing writes. Partition refresh and
-mounted deployment publication still need an explicit claim handoff design
-and kernel validation before service activation; borrowing a File across raw
-writes does not settle that phase. In particular, callers must not assume
-the current separate pathname-based refresh and mount commands can run while
-this exclusive claim is held.
+cross-process descriptor protocol. The service must own its formatting
+object in the process performing writes. `td-install serve` takes the same
+read-write exclusive claim at propose and holds that File until the review
+ends; its execution will wrap that File, in that process. Partition refresh
+and mounted deployment publication still need an explicit claim handoff
+design and kernel validation before service activation; borrowing a File
+across raw writes does not settle that phase. In particular, callers must
+not assume the current separate pathname-based refresh and mount commands
+can run while this exclusive claim is held.
 
 A regular-file regression replaces the destination name after opening,
 then formats both layout and volume through the retained object. It checks

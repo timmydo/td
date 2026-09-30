@@ -48,6 +48,13 @@ mod inventory;
 #[allow(dead_code)]
 mod installation_plan;
 
+#[path = "installation_protocol.rs"]
+#[allow(dead_code)]
+mod installation_protocol;
+
+#[path = "installation_service.rs"]
+mod installation_service;
+
 #[path = "timezones.rs"]
 mod timezones;
 
@@ -69,7 +76,7 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install serve <td-boot> <deployment-directory> <trusted-key> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
 
@@ -95,6 +102,8 @@ enum Mode {
         source: PathBuf,
         trusted_key: PathBuf,
     },
+    /// The installation service core, for one installer on the stdin socket.
+    Serve(LiveHost),
     PrepareSelector {
         template: PathBuf,
         uuid: VolumeUuid,
@@ -579,6 +588,29 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 trusted_key: PathBuf::from(trusted_key),
             })
         }
+        (Some("serve"), [td_boot, source, trusted_key, root, firstboot]) => {
+            let host = LiveHost {
+                td_boot: td_boot.clone(),
+                source: source.clone(),
+                trusted_key: trusted_key.clone(),
+                root: root.clone(),
+                firstboot: firstboot.clone(),
+                timezones: PathBuf::from(TIMEZONE_ROOT),
+            };
+            if [
+                &host.td_boot,
+                &host.source,
+                &host.trusted_key,
+                &host.root,
+                &host.firstboot,
+            ]
+            .iter()
+            .any(|path| !path.is_absolute())
+            {
+                return Err(invalid("serve operands must be absolute paths".into()));
+            }
+            Ok(Mode::Serve(host))
+        }
         (Some("new-volume-uuid"), []) => Ok(Mode::NewVolumeUuid),
         (Some("prepare-selector"), [template, uuid, output]) => Ok(Mode::PrepareSelector {
             template: template.clone(),
@@ -732,6 +764,17 @@ fn validate_source_plan(
     source: &Path,
     trusted_key: &Path,
 ) -> io::Result<String> {
+    let id = authenticate_source(td_boot, source, trusted_key)?;
+    if !plan.matches_deployment_id(&id) {
+        return Err(invalid(
+            "reviewed deployment differs from authenticated source".into(),
+        ));
+    }
+    Ok(id)
+}
+
+/// The canonical manifest ID td-boot prints after authenticating `source`.
+fn authenticate_source(td_boot: &Path, source: &Path, trusted_key: &Path) -> io::Result<String> {
     let result = std::process::Command::new(td_boot)
         .arg("validate-source")
         .arg(source)
@@ -757,12 +800,255 @@ fn validate_source_plan(
             "source validator returned a noncanonical ID".into(),
         ));
     }
-    if !plan.matches_deployment_id(id) {
-        return Err(invalid(
-            "reviewed deployment differs from authenticated source".into(),
-        ));
-    }
     Ok(id.to_owned())
+}
+
+/// The only keyboard layout admitted until a keyboard catalog exists.
+const KEYBOARD: &str = "us";
+
+/// The machine the service observes. The wire carries only a refusal's
+/// code, so each refusal's cause is also written to stderr.
+#[derive(Debug, Eq, PartialEq)]
+struct LiveHost {
+    td_boot: PathBuf,
+    source: PathBuf,
+    trusted_key: PathBuf,
+    root: PathBuf,
+    firstboot: PathBuf,
+    timezones: PathBuf,
+}
+
+fn refuse(
+    refusal: installation_protocol::Refusal,
+    cause: impl std::fmt::Display,
+) -> installation_protocol::Refusal {
+    let _ = writeln!(io::stderr(), "td-install serve: {refusal:?}: {cause}");
+    refusal
+}
+
+impl installation_service::Host for LiveHost {
+    type Claim = File;
+
+    fn candidates(
+        &mut self,
+    ) -> Result<installation_plan::Candidates, installation_protocol::Refusal> {
+        inventory::candidates()
+            .map_err(|error| refuse(installation_protocol::Refusal::DiscoveryFailed, error))
+    }
+
+    fn check_settings(
+        &mut self,
+        settings: &installation_plan::Settings,
+    ) -> Result<(), installation_protocol::Refusal> {
+        use installation_protocol::Refusal;
+        PrimarySelection {
+            name: settings.username().into(),
+            root: self.root.clone(),
+            firstboot: self.firstboot.clone(),
+        }
+        .check()
+        .map_err(|error| refuse(Refusal::InvalidUsername, error))?;
+        hostname::Hostname::parse(settings.hostname())
+            .map_err(|error| refuse(Refusal::InvalidHostname, error))?;
+        if settings.keyboard() != KEYBOARD {
+            return Err(refuse(
+                Refusal::UnsupportedKeyboard,
+                format!(
+                    "keyboard layout {} is not in the catalog",
+                    settings.keyboard()
+                ),
+            ));
+        }
+        timezones::Selection::load(&self.timezones, settings.timezone())
+            .map_err(|error| refuse(Refusal::UnsupportedTimezone, error))?;
+        Ok(())
+    }
+
+    fn claim(
+        &mut self,
+        destination: &installation_plan::Destination,
+    ) -> Result<File, installation_protocol::Refusal> {
+        inventory::claim_destination(destination)
+            .map_err(|error| refuse(claim_refusal(error.kind()), error))
+    }
+
+    fn authenticate_source(&mut self) -> Result<[u8; 32], installation_protocol::Refusal> {
+        authenticate_source(&self.td_boot, &self.source, &self.trusted_key)
+            .and_then(|id| digest_bytes(&id))
+            .map_err(|error| refuse(installation_protocol::Refusal::SourceUnavailable, error))
+    }
+
+    fn recheck(&mut self, destination: &installation_plan::Destination, claim: &mut File) -> bool {
+        match inventory::recheck_claim_destination(destination, claim) {
+            Ok(()) => true,
+            Err(error) => {
+                refuse(installation_protocol::Refusal::DestinationChanged, error);
+                false
+            }
+        }
+    }
+
+    fn entropy(&mut self) -> io::Result<([u8; 32], [u8; 16])> {
+        let mut bytes = [0; 48];
+        let urandom = Path::new("/dev/urandom");
+        paths::open_read(urandom)?
+            .read_exact(&mut bytes)
+            .map_err(|error| {
+                io::Error::new(error.kind(), format!("read {}: {error}", urandom.display()))
+            })?;
+        Ok(plan_identity(bytes))
+    }
+}
+
+/// A proposal nonce and a version-4 volume UUID in network byte order, as
+/// the plan carries it (unlike `random_guid`'s GPT layout).
+fn plan_identity(bytes: [u8; 48]) -> ([u8; 32], [u8; 16]) {
+    let mut nonce_bytes = [0; 32];
+    let mut uuid_bytes = [0; 16];
+    for (slot, byte) in nonce_bytes
+        .iter_mut()
+        .chain(uuid_bytes.iter_mut())
+        .zip(bytes)
+    {
+        *slot = byte;
+    }
+    if let Some(byte) = uuid_bytes.get_mut(6) {
+        *byte = (*byte & 0x0f) | 0x40;
+    }
+    if let Some(byte) = uuid_bytes.get_mut(8) {
+        *byte = (*byte & 0x3f) | 0x80;
+    }
+    (nonce_bytes, uuid_bytes)
+}
+
+fn digest_bytes(id: &str) -> io::Result<[u8; 32]> {
+    let mut digest = [0; 32];
+    // `from_str_radix` alone would admit a sign.
+    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid("deployment ID must be 64 hex digits".into()));
+    }
+    for (slot, pair) in digest.iter_mut().zip(id.as_bytes().as_chunks::<2>().0) {
+        *slot = std::str::from_utf8(pair)
+            .ok()
+            .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+            .ok_or_else(|| invalid("deployment ID must be 64 hex digits".into()))?;
+    }
+    Ok(digest)
+}
+
+/// How a failed claim is reported: a disk held elsewhere is busy, one that
+/// changed or vanished is changed, and anything else failed discovery.
+fn claim_refusal(kind: io::ErrorKind) -> installation_protocol::Refusal {
+    use installation_protocol::Refusal;
+    match kind {
+        io::ErrorKind::ResourceBusy => Refusal::DestinationBusy,
+        // Discovery just listed the disk; failing to claim it means it is
+        // no longer the disk that was observed.
+        _ => Refusal::DestinationChanged,
+    }
+}
+
+/// Serve only as uid 0, on a connected Unix socket; refuse before any byte.
+/// `euid` is this process's own: a sanity gate for a misplaced start, not
+/// proof of the caller's privilege (uid 0 in a user namespace passes).
+fn admit_serve(euid: u32, stdin: File) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::os::unix::fs::FileTypeExt;
+    if euid != 0 {
+        return Err(invalid("serve requires the installation authority".into()));
+    }
+    use std::os::unix::fs::MetadataExt;
+    let channel = || invalid("serve requires its installer channel on stdin".into());
+    let metadata = stdin.metadata()?;
+    if !metadata.file_type().is_socket() {
+        return Err(channel());
+    }
+    let stream = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(stdin));
+    // Another socket family, or an unconnected socket, has no Unix peer.
+    stream.peer_addr().map_err(|_| channel())?;
+    // A datagram or sequenced-packet peer would truncate frames and never
+    // close as a stream does, so its claim could outlive it.
+    let table = io::BufReader::new(paths::open_read(Path::new("/proc/net/unix"))?);
+    if !unix_stream_in(table, metadata.ino())? {
+        return Err(channel());
+    }
+    // Blocking reads frame the channel; an inherited O_NONBLOCK would not.
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+/// Whether a `/proc/net/unix` table lists socket inode `inode` as
+/// SOCK_STREAM (Type `0001`); its columns are Num, RefCount, Protocol,
+/// Flags, Type, St, Inode and an optional path. A path is printed raw, so
+/// a bound name holding a newline can forge a row: every row naming the
+/// inode must say stream, so a forgery can only refuse a socket listed
+/// here. The caller creates the socket in this namespace (INSTALLER.md).
+fn unix_stream_in(table: impl io::BufRead, inode: u64) -> io::Result<bool> {
+    let inode = inode.to_string();
+    let mut listed = false;
+    for line in table.split(b'\n').skip(1) {
+        let line = line?;
+        let mut fields = line
+            .split(|byte| *byte == b' ')
+            .filter(|field| !field.is_empty());
+        let (Some(kind), Some(named)) = (fields.nth(4), fields.nth(1)) else {
+            continue;
+        };
+        if named == inode.as_bytes() {
+            if kind != b"0001" {
+                return Ok(false);
+            }
+            listed = true;
+        }
+    }
+    Ok(listed)
+}
+
+fn run_serve(host: LiveHost) -> io::Result<()> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    // A missing or misplaced control-plane input is the caller's error;
+    // without this it would reach the installer as a refused choice.
+    enum Kind {
+        Executable,
+        Directory,
+        File,
+    }
+    for (operand, kind) in [
+        (&host.td_boot, Kind::Executable),
+        (&host.source, Kind::Directory),
+        (&host.trusted_key, Kind::File),
+        (&host.root, Kind::Directory),
+        (&host.firstboot, Kind::Executable),
+    ] {
+        let (admits, kind): (fn(&std::fs::Metadata) -> bool, _) = match kind {
+            Kind::Executable => (
+                |metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+                "an executable file",
+            ),
+            Kind::Directory => (|metadata| metadata.is_dir(), "a directory"),
+            Kind::File => (|metadata| metadata.is_file(), "a file"),
+        };
+        match paths::metadata_if_present(operand) {
+            None => {
+                return Err(invalid(format!(
+                    "serve operand {} is not present",
+                    operand.display()
+                )))
+            }
+            Some(metadata) if !admits(&metadata) => {
+                return Err(invalid(format!(
+                    "serve operand {} is not {kind}",
+                    operand.display()
+                )))
+            }
+            Some(_) => {}
+        }
+    }
+    let euid = paths::open_read(Path::new("/proc/self"))?.metadata()?.uid();
+    let stdin = File::from(io::stdin().as_fd().try_clone_to_owned()?);
+    let mut stream = admit_serve(euid, stdin)?;
+    installation_service::serve(&mut stream, installation_service::Service::new(host))
 }
 
 fn preview_number(value: &OsStr, label: &str) -> io::Result<u64> {
@@ -1202,8 +1488,9 @@ mod paths {
     }
 
     /// What is at `path`, or nothing — the one call here whose error is
-    /// DISCARDED, because the caller asks only whether two files are the same
-    /// and an unreadable path is not one of them.
+    /// DISCARDED, because each caller asks only whether a usable file is
+    /// there (the same file, or a serve operand), and an unreadable path is
+    /// not one.
     pub fn metadata_if_present(path: &Path) -> Option<Metadata> {
         std::fs::metadata(path).ok()
     }
@@ -2539,6 +2826,7 @@ fn main() -> ExitCode {
                 &trusted_key,
             )
         }
+        Mode::Serve(host) => run_serve(host),
         Mode::Inventory => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
@@ -2630,6 +2918,235 @@ mod tests {
             assert!(observe_plan(&mut io::Cursor::new(bytes), &mut output).is_err());
             assert!(output.is_empty());
         }
+    }
+
+    #[test]
+    fn serve_binds_five_absolute_operands() {
+        let full = [
+            "serve",
+            "/bin/td-boot",
+            "/source",
+            "/trusted.pub",
+            "/root",
+            "/bin/td-firstboot",
+        ];
+        assert_eq!(
+            parse_args(args(&full)).unwrap(),
+            Mode::Serve(LiveHost {
+                td_boot: PathBuf::from("/bin/td-boot"),
+                source: PathBuf::from("/source"),
+                trusted_key: PathBuf::from("/trusted.pub"),
+                root: PathBuf::from("/root"),
+                firstboot: PathBuf::from("/bin/td-firstboot"),
+                timezones: PathBuf::from(TIMEZONE_ROOT),
+            })
+        );
+        for count in 1..full.len() {
+            assert!(parse_args(args(&full[..count])).is_err(), "{count}");
+        }
+        assert!(parse_args(args(&[full.as_slice(), &["/extra"]].concat())).is_err());
+        for index in 1..full.len() {
+            let mut relative = full;
+            relative[index] = "relative";
+            assert_eq!(
+                parse_args(args(&relative)).unwrap_err().to_string(),
+                "serve operands must be absolute paths"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_admits_only_a_root_caller_on_a_socket() {
+        let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let descriptor = || File::from(std::os::fd::OwnedFd::from(socket.try_clone().unwrap()));
+        assert_eq!(
+            admit_serve(1000, descriptor()).unwrap_err().to_string(),
+            "serve requires the installation authority"
+        );
+        let directory = scratch::path("serve-admission");
+        std::fs::create_dir(&directory).unwrap();
+        let _cleanup = ScratchDirectory(directory.clone());
+        let regular = directory.join("stdin");
+        std::fs::write(&regular, b"").unwrap();
+        assert_eq!(
+            admit_serve(0, paths::open_read(&regular).unwrap())
+                .unwrap_err()
+                .to_string(),
+            "serve requires its installer channel on stdin"
+        );
+        let unconnected =
+            std::os::unix::net::UnixListener::bind(directory.join("listener")).unwrap();
+        assert_eq!(
+            admit_serve(0, File::from(std::os::fd::OwnedFd::from(unconnected)))
+                .unwrap_err()
+                .to_string(),
+            "serve requires its installer channel on stdin"
+        );
+        let (datagram, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        assert_eq!(
+            admit_serve(0, File::from(std::os::fd::OwnedFd::from(datagram)))
+                .unwrap_err()
+                .to_string(),
+            "serve requires its installer channel on stdin"
+        );
+        // An inherited O_NONBLOCK is cleared: a read waits for a late peer.
+        socket.set_nonblocking(true).unwrap();
+        let mut admitted = admit_serve(0, descriptor()).unwrap();
+        let mut late = peer.try_clone().unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            late.write_all(b"y").unwrap();
+        });
+        let mut byte = [0];
+        admitted.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"y");
+        writer.join().unwrap();
+        admitted.write_all(b"x").unwrap();
+        let mut byte = [0];
+        peer.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+    }
+
+    #[test]
+    fn only_a_listed_stream_inode_is_a_stream() {
+        let table: &[u8] = b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+            0000000000000000: 00000002 00000000 00000000 0005 03 17\n\
+            0000000000000000: 00000002 00000000 00000000 0002 01 18 /run/\xff\n\
+            0000000000000000: 00000003 00000000 00000000 0001 03 1\n\
+            0000000000000000: 00000003 00000000 00000000 0001 03 19\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 21 @x\n\
+            0: 0 0 0 0001 03 22\n\
+            0000000000000000: 00000002 00000000 00000000 0002 01 22\n";
+        // Inode 22's first row is forged by a bound name; its real row wins.
+        for (inode, stream) in [
+            (19, true),
+            (21, true),
+            (22, false),
+            (17, false),
+            (18, false),
+            (20, false),
+            (0, false),
+        ] {
+            assert_eq!(unix_stream_in(table, inode).unwrap(), stream, "{inode}");
+        }
+    }
+
+    #[test]
+    fn claim_failures_map_to_their_refusals() {
+        use installation_protocol::Refusal;
+        for (kind, refusal) in [
+            (io::ErrorKind::ResourceBusy, Refusal::DestinationBusy),
+            (io::ErrorKind::InvalidData, Refusal::DestinationChanged),
+            (io::ErrorKind::NotFound, Refusal::DestinationChanged),
+            (io::ErrorKind::PermissionDenied, Refusal::DestinationChanged),
+            (io::ErrorKind::Other, Refusal::DestinationChanged),
+        ] {
+            assert_eq!(claim_refusal(kind), refusal, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn plan_identity_is_a_version_four_uuid_in_network_order() {
+        for fill in [0x00, 0x5a, 0xff] {
+            let (nonce, uuid) = plan_identity([fill; 48]);
+            assert_eq!(nonce, [fill; 32]);
+            assert_eq!(uuid[6] >> 4, 4);
+            assert_eq!(uuid[6] & 0x0f, fill & 0x0f);
+            assert_eq!(uuid[8] >> 6, 2);
+            assert_eq!(uuid[8] & 0x3f, fill & 0x3f);
+            for (index, byte) in uuid.iter().enumerate() {
+                if index != 6 && index != 8 {
+                    assert_eq!(*byte, fill);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deployment_ids_decode_only_as_64_hex_digits() {
+        assert_eq!(digest_bytes(&"ab".repeat(32)).unwrap(), [0xab; 32]);
+        let mut sequence = [0; 32];
+        for (index, byte) in sequence.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let text: String = sequence.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(digest_bytes(&text).unwrap(), sequence);
+        for bad in [
+            "ab".repeat(31),
+            "ab".repeat(33),
+            format!("{}zz", "ab".repeat(31)),
+            format!("{}+1", "ab".repeat(31)),
+            format!("{} 1", "ab".repeat(31)),
+        ] {
+            assert!(digest_bytes(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn live_settings_refuse_with_the_failed_choice() {
+        use installation_protocol::Refusal;
+        use installation_service::Host;
+        let directory = scratch::path("serve-settings");
+        std::fs::create_dir(&directory).unwrap();
+        let _cleanup = ScratchDirectory(directory.clone());
+        let firstboot = directory.join("td-firstboot");
+        scratch::executable(
+            &firstboot,
+            "#!/bin/sh\n[ \"$1\" = check-primary-name ] && [ \"$3\" != taken ]\n",
+        )
+        .unwrap();
+        let zones = directory.join("zoneinfo");
+        std::fs::create_dir_all(zones.join("Europe")).unwrap();
+        std::fs::create_dir(zones.join("Etc")).unwrap();
+        std::fs::write(zones.join("iso3166.tab"), b"GB\tBritain\n").unwrap();
+        std::fs::write(
+            zones.join("zone1970.tab"),
+            b"GB\t+5130-00007\tEurope/London\n",
+        )
+        .unwrap();
+        let mut header = vec![0; 44];
+        header[..5].copy_from_slice(b"TZif2");
+        for id in ["Europe/London", "Etc/UTC"] {
+            std::fs::write(zones.join(id), &header).unwrap();
+        }
+        let mut host = LiveHost {
+            td_boot: PathBuf::from("/nonexistent/td-boot"),
+            source: PathBuf::from("/nonexistent/source"),
+            trusted_key: PathBuf::from("/nonexistent/trusted.pub"),
+            root: directory.clone(),
+            firstboot,
+            timezones: zones,
+        };
+        for (choice, expected) in [
+            (["alice", "td-laptop", "us", "Europe/London"], Ok(())),
+            (
+                ["taken", "td-laptop", "us", "Europe/London"],
+                Err(Refusal::InvalidUsername),
+            ),
+            (
+                ["Alice", "td-laptop", "us", "Europe/London"],
+                Err(Refusal::InvalidUsername),
+            ),
+            (
+                ["alice", "-laptop", "us", "Europe/London"],
+                Err(Refusal::InvalidHostname),
+            ),
+            (
+                ["alice", "td-laptop", "de", "Europe/London"],
+                Err(Refusal::UnsupportedKeyboard),
+            ),
+            (
+                ["alice", "td-laptop", "us", "Europe/Paris"],
+                Err(Refusal::UnsupportedTimezone),
+            ),
+        ] {
+            let [username, hostname, keyboard, timezone] = choice;
+            let settings =
+                installation_plan::Settings::new(username, hostname, keyboard, timezone).unwrap();
+            assert_eq!(host.check_settings(&settings), expected, "{choice:?}");
+        }
+        // No source is present, so authentication refuses rather than guessing.
+        assert_eq!(host.authenticate_source(), Err(Refusal::SourceUnavailable));
     }
 
     #[test]
@@ -5270,7 +5787,7 @@ mod tests {
     /// inventory uses paths; timezones uses the regular-file reader.
     type Compiled = (&'static str, &'static str, &'static [&'static str]);
 
-    fn compiled_files() -> [Compiled; 12] {
+    fn compiled_files() -> [Compiled; 14] {
         [
             ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
             (
@@ -5310,6 +5827,16 @@ mod tests {
                 include_str!("installation_plan.rs"),
                 [].as_slice(),
             ),
+            (
+                "installation_protocol.rs",
+                include_str!("installation_protocol.rs"),
+                [].as_slice(),
+            ),
+            (
+                "installation_service.rs",
+                include_str!("installation_service.rs"),
+                [].as_slice(),
+            ),
             ("timezones.rs", include_str!("timezones.rs"), [].as_slice()),
             (
                 "hostname.rs",
@@ -5327,7 +5854,7 @@ mod tests {
     ///
     /// Over the UNCOMMENTED source, for the reason the allow scan is: a
     /// comment explaining a `#[path]` declaration is prose, and reading one as
-    /// a declaration reds a file that compiles exactly twelve.
+    /// a declaration reds a file that compiles exactly fourteen.
     #[test]
     fn every_compiled_file_is_one_the_guards_read() {
         // WHITESPACE-INSENSITIVE from the marker on: `#[path="x.rs"]` with no
@@ -5350,7 +5877,7 @@ mod tests {
         // include inside a `stringify!`, which satisfied the search while
         // `compiled_files` went on reading the original.
         let table_body = {
-            const HEAD: &str = "fn compiled_files() -> [Compiled; 12] {";
+            const HEAD: &str = "fn compiled_files() -> [Compiled; 14] {";
             let Some(at) = index_of(&text, HEAD) else {
                 panic!("the compiled-file table is not where this scan looks for it")
             };

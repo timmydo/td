@@ -78,91 +78,212 @@ impl From<&Plan> for ReviewNonce {
     }
 }
 
-macro_rules! codes {
-    (
-        $(#[$meta:meta])* $name:ident, $what:literal {
-            $($(#[$doc:meta])* $variant:ident = $code:literal,)+
-        }
-    ) => {
-        $(#[$meta])*
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        pub enum $name {
-            $($(#[$doc])* $variant,)+
-        }
-
-        impl $name {
-            pub const ALL: &[Self] = &[$(Self::$variant,)+];
-            fn code(self) -> u8 {
-                match self {
-                    $(Self::$variant => $code,)+
-                }
-            }
-            // A repeated code would silently shadow a variant.
-            #[deny(unreachable_patterns)]
-            fn from_code(code: u8) -> Result<Self, String> {
-                match code {
-                    $($code => Ok(Self::$variant),)+
-                    _ => Err(concat!("unknown installation ", $what).into()),
-                }
-            }
-        }
-    };
+/// The operation a running installation reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Phase {
+    PreparingDisk,
+    WritingFilesystems,
+    PublishingDeployment,
+    ApplyingSettings,
+    VerifyingBoot,
 }
 
-codes!(
-    /// The operation a running installation reports.
-    Phase, "phase" {
-        PreparingDisk = 1,
-        WritingFilesystems = 2,
-        PublishingDeployment = 3,
-        ApplyingSettings = 4,
-        VerifyingBoot = 5,
-    }
-);
+impl Phase {
+    pub const ALL: &[Self] = &[
+        Self::PreparingDisk,
+        Self::WritingFilesystems,
+        Self::PublishingDeployment,
+        Self::ApplyingSettings,
+        Self::VerifyingBoot,
+    ];
 
-codes!(
-    /// Why an installation stopped after destructive writes may have begun.
-    Failure, "failure" {
-        DestinationChanged = 1,
-        InsufficientSpace = 2,
-        WriteFailed = 3,
-        VerificationFailed = 4,
-        SettingsFailed = 5,
+    fn code(self) -> u8 {
+        match self {
+            Self::PreparingDisk => 1,
+            Self::WritingFilesystems => 2,
+            Self::PublishingDeployment => 3,
+            Self::ApplyingSettings => 4,
+            Self::VerifyingBoot => 5,
+        }
     }
-);
 
-codes!(
-    /// Why a review ended before any destructive write.
-    Abandon, "abandonment" {
-        Withdrawn = 1,
-        ConsentDeclined = 2,
-        ConsentExpired = 3,
-        /// The compositor's consent path was lost while it was displayed.
-        ConsentUnavailable = 4,
-        /// The disk changed or vanished before the first write.
-        DestinationChanged = 5,
+    // A repeated code would silently shadow a variant.
+    #[deny(unreachable_patterns)]
+    fn from_code(code: u8) -> Result<Self, String> {
+        match code {
+            1 => Ok(Self::PreparingDisk),
+            2 => Ok(Self::WritingFilesystems),
+            3 => Ok(Self::PublishingDeployment),
+            4 => Ok(Self::ApplyingSettings),
+            5 => Ok(Self::VerifyingBoot),
+            _ => Err("unknown installation phase".into()),
+        }
     }
-);
+}
 
-codes!(
-    /// Why the service refused a request. Nothing was written.
-    Refusal, "refusal" {
-        Busy = 1,
-        SourceUnavailable = 2,
-        DiscoveryFailed = 3,
-        DestinationChanged = 4,
-        DestinationBusy = 5,
-        InsufficientSpace = 6,
-        InvalidUsername = 7,
-        InvalidHostname = 8,
-        UnsupportedKeyboard = 9,
-        UnsupportedTimezone = 10,
-        StaleReview = 11,
-        NoReview = 12,
-        /// No seat, compositor or trusted consent path can present the review.
-        ConsentUnavailable = 13,
+/// Why an installation stopped after destructive writes may have begun.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Failure {
+    DestinationChanged,
+    InsufficientSpace,
+    WriteFailed,
+    VerificationFailed,
+    SettingsFailed,
+}
+
+impl Failure {
+    pub const ALL: &[Self] = &[
+        Self::DestinationChanged,
+        Self::InsufficientSpace,
+        Self::WriteFailed,
+        Self::VerificationFailed,
+        Self::SettingsFailed,
+    ];
+
+    fn code(self) -> u8 {
+        match self {
+            Self::DestinationChanged => 1,
+            Self::InsufficientSpace => 2,
+            Self::WriteFailed => 3,
+            Self::VerificationFailed => 4,
+            Self::SettingsFailed => 5,
+        }
     }
-);
+
+    // A repeated code would silently shadow a variant.
+    #[deny(unreachable_patterns)]
+    fn from_code(code: u8) -> Result<Self, String> {
+        match code {
+            1 => Ok(Self::DestinationChanged),
+            2 => Ok(Self::InsufficientSpace),
+            3 => Ok(Self::WriteFailed),
+            4 => Ok(Self::VerificationFailed),
+            5 => Ok(Self::SettingsFailed),
+            _ => Err("unknown installation failure".into()),
+        }
+    }
+}
+
+/// Why a review ended before any destructive write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Abandon {
+    Withdrawn,
+    ConsentDeclined,
+    ConsentExpired,
+    /// The compositor's consent path was lost while it was displayed.
+    ConsentUnavailable,
+    /// The disk changed or vanished before the first write.
+    DestinationChanged,
+}
+
+impl Abandon {
+    pub const ALL: &[Self] = &[
+        Self::Withdrawn,
+        Self::ConsentDeclined,
+        Self::ConsentExpired,
+        Self::ConsentUnavailable,
+        Self::DestinationChanged,
+    ];
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Withdrawn => 1,
+            Self::ConsentDeclined => 2,
+            Self::ConsentExpired => 3,
+            Self::ConsentUnavailable => 4,
+            Self::DestinationChanged => 5,
+        }
+    }
+
+    // A repeated code would silently shadow a variant.
+    #[deny(unreachable_patterns)]
+    fn from_code(code: u8) -> Result<Self, String> {
+        match code {
+            1 => Ok(Self::Withdrawn),
+            2 => Ok(Self::ConsentDeclined),
+            3 => Ok(Self::ConsentExpired),
+            4 => Ok(Self::ConsentUnavailable),
+            5 => Ok(Self::DestinationChanged),
+            _ => Err("unknown installation abandonment".into()),
+        }
+    }
+}
+
+/// Why the service refused a request. Nothing was written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Refusal {
+    Busy,
+    SourceUnavailable,
+    DiscoveryFailed,
+    DestinationChanged,
+    DestinationBusy,
+    InsufficientSpace,
+    InvalidUsername,
+    InvalidHostname,
+    UnsupportedKeyboard,
+    UnsupportedTimezone,
+    StaleReview,
+    NoReview,
+    /// No seat, compositor or trusted consent path can present the review.
+    ConsentUnavailable,
+}
+
+impl Refusal {
+    pub const ALL: &[Self] = &[
+        Self::Busy,
+        Self::SourceUnavailable,
+        Self::DiscoveryFailed,
+        Self::DestinationChanged,
+        Self::DestinationBusy,
+        Self::InsufficientSpace,
+        Self::InvalidUsername,
+        Self::InvalidHostname,
+        Self::UnsupportedKeyboard,
+        Self::UnsupportedTimezone,
+        Self::StaleReview,
+        Self::NoReview,
+        Self::ConsentUnavailable,
+    ];
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Busy => 1,
+            Self::SourceUnavailable => 2,
+            Self::DiscoveryFailed => 3,
+            Self::DestinationChanged => 4,
+            Self::DestinationBusy => 5,
+            Self::InsufficientSpace => 6,
+            Self::InvalidUsername => 7,
+            Self::InvalidHostname => 8,
+            Self::UnsupportedKeyboard => 9,
+            Self::UnsupportedTimezone => 10,
+            Self::StaleReview => 11,
+            Self::NoReview => 12,
+            Self::ConsentUnavailable => 13,
+        }
+    }
+
+    // A repeated code would silently shadow a variant.
+    #[deny(unreachable_patterns)]
+    fn from_code(code: u8) -> Result<Self, String> {
+        match code {
+            1 => Ok(Self::Busy),
+            2 => Ok(Self::SourceUnavailable),
+            3 => Ok(Self::DiscoveryFailed),
+            4 => Ok(Self::DestinationChanged),
+            5 => Ok(Self::DestinationBusy),
+            6 => Ok(Self::InsufficientSpace),
+            7 => Ok(Self::InvalidUsername),
+            8 => Ok(Self::InvalidHostname),
+            9 => Ok(Self::UnsupportedKeyboard),
+            10 => Ok(Self::UnsupportedTimezone),
+            11 => Ok(Self::StaleReview),
+            12 => Ok(Self::NoReview),
+            13 => Ok(Self::ConsentUnavailable),
+            _ => Err("unknown installation refusal".into()),
+        }
+    }
+}
 
 /// What the installer asks. None of it names a path, executable, source or
 /// consent.

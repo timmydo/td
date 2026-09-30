@@ -390,50 +390,57 @@ fn destination_value(device: &Device) -> io::Result<installation_plan::Destinati
     .map_err(invalid)
 }
 
-fn matches_plan(device: &Device, plan: &installation_plan::Plan) -> io::Result<bool> {
-    Ok(&destination_value(device)? == plan.destination())
-}
-
 /// Hold a read-write O_EXCL claim through the caller's observation. This
 /// function writes no bytes and does not authenticate the deployment or source.
 pub fn claim_plan(plan: &installation_plan::Plan) -> io::Result<File> {
+    claim_destination(plan.destination())
+}
+
+/// The same claim for an observed destination, before any plan exists.
+pub fn claim_destination(destination: &installation_plan::Destination) -> io::Result<File> {
     let devices = collect(Path::new("/sys/class/block"))?;
-    plan_candidate(&devices, plan)?;
-    let path = Path::new("/dev").join(plan.destination().name());
+    plan_candidate(&devices, destination)?;
+    let path = Path::new("/dev").join(destination.name());
     let mut file = paths::open_destination_claim(&path, true)?;
-    check_claimed_file(&mut file, plan)?;
+    check_claimed_file(&mut file, destination)?;
     if devices != collect(Path::new("/sys/class/block"))? {
         return Err(invalid(
-            "block inventory changed during plan observation".into(),
+            "block inventory changed while claiming the destination".into(),
         ));
     }
     Ok(file)
 }
 
-fn plan_candidate(devices: &[Device], plan: &installation_plan::Plan) -> io::Result<()> {
+fn plan_candidate(
+    devices: &[Device],
+    destination: &installation_plan::Destination,
+) -> io::Result<()> {
     let device = devices
         .iter()
-        .find(|device| device.name == plan.destination().name())
-        .ok_or_else(|| invalid("reviewed destination is no longer present".into()))?;
-    if !candidate(device, devices) || !matches_plan(device, plan)? {
+        .find(|device| device.name == destination.name())
+        .ok_or_else(|| invalid("destination is no longer present".into()))?;
+    if !candidate(device, devices) || &destination_value(device)? != destination {
         return Err(invalid(
-            "reviewed destination is no longer an unchanged candidate".into(),
+            "destination is no longer an unchanged candidate".into(),
         ));
     }
     Ok(())
 }
 
-fn check_claimed_file(file: &mut File, plan: &installation_plan::Plan) -> io::Result<()> {
+fn check_claimed_file(
+    file: &mut File,
+    destination: &installation_plan::Destination,
+) -> io::Result<()> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let metadata = file.metadata()?;
     let number = crate::device_numbers(metadata.rdev());
-    let (major, minor) = plan.destination().number();
+    let (major, minor) = destination.number();
     if !metadata.file_type().is_block_device()
         || number != (u64::from(major), u64::from(minor))
-        || crate::destination_bytes(file)? != plan.destination().capacity()
+        || crate::destination_bytes(file)? != destination.capacity()
     {
         return Err(invalid(
-            "opened destination differs from reviewed plan".into(),
+            "opened destination differs from the observed destination".into(),
         ));
     }
     Ok(())
@@ -442,19 +449,27 @@ fn check_claimed_file(file: &mut File, plan: &installation_plan::Plan) -> io::Re
 /// Recheck the same claimed descriptor and disk inventory after a long
 /// read-only source operation, before its success report is emitted.
 pub fn recheck_claim_plan(plan: &installation_plan::Plan, file: &mut File) -> io::Result<()> {
-    recheck_inventory(plan, Path::new("/sys/class/block"), || {
-        check_claimed_file(file, plan)
+    recheck_claim_destination(plan.destination(), file)
+        .map_err(|error| io::Error::new(error.kind(), format!("after source validation: {error}")))
+}
+
+/// Recheck a held claim against the destination it was taken for.
+pub fn recheck_claim_destination(
+    destination: &installation_plan::Destination,
+    file: &mut File,
+) -> io::Result<()> {
+    recheck_inventory(destination, Path::new("/sys/class/block"), || {
+        check_claimed_file(file, destination)
     })
-    .map_err(|error| io::Error::new(error.kind(), format!("after source validation: {error}")))
 }
 
 fn recheck_inventory(
-    plan: &installation_plan::Plan,
+    destination: &installation_plan::Destination,
     class: &Path,
     check_claim: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     let devices = collect(class)?;
-    plan_candidate(&devices, plan)?;
+    plan_candidate(&devices, destination)?;
     check_claim()?;
     if devices != collect(class)? {
         return Err(invalid(
@@ -527,13 +542,20 @@ fn record(
     available: impl FnMut(&Device) -> io::Result<bool>,
     output: &mut impl Write,
 ) -> io::Result<()> {
+    let record = observe_candidates(observation, available)?;
+    output.write_all(&record.encode())
+}
+
+fn observe_candidates(
+    observation: impl FnMut() -> io::Result<Vec<Device>>,
+    available: impl FnMut(&Device) -> io::Result<bool>,
+) -> io::Result<installation_plan::Candidates> {
     select(observation, available, |candidates| {
         let disks = candidates
             .iter()
             .map(|device| destination_value(device))
             .collect::<io::Result<Vec<_>>>()?;
-        let record = installation_plan::Candidates::new(disks).map_err(invalid)?;
-        output.write_all(&record.encode())
+        installation_plan::Candidates::new(disks).map_err(invalid)
     })
 }
 
@@ -545,6 +567,11 @@ pub fn destinations(output: &mut impl Write) -> io::Result<()> {
 /// temporary read-only claims as `destinations`.
 pub fn candidate_record(output: &mut impl Write) -> io::Result<()> {
     record(|| collect(Path::new("/sys/class/block")), probe, output)
+}
+
+/// The same discovery as `candidate_record`, as a value.
+pub fn candidates() -> io::Result<installation_plan::Candidates> {
+    observe_candidates(|| collect(Path::new("/sys/class/block")), probe)
 }
 
 pub fn run(root: &Path, output: &mut impl Write) -> io::Result<()> {
@@ -692,7 +719,7 @@ mod tests {
         uuid[8] = 0x80;
         let plan = Plan::new([1; 32], destination, [2; 32], uuid, settings).unwrap();
         let current = || collect(&fixture.class).unwrap();
-        plan_candidate(&current(), &plan).unwrap();
+        plan_candidate(&current(), plan.destination()).unwrap();
         for (path, stale) in [
             ("diskseq", "8"),
             ("size", "12582914"),
@@ -706,7 +733,7 @@ mod tests {
             let file = disk.join(path);
             let old = fs::read(&file).ok();
             fs::write(&file, stale).unwrap();
-            let error = plan_candidate(&current(), &plan).unwrap_err();
+            let error = plan_candidate(&current(), plan.destination()).unwrap_err();
             assert!(
                 error
                     .to_string()
@@ -717,10 +744,10 @@ mod tests {
                 Some(old) => fs::write(&file, old).unwrap(),
                 None => fs::remove_file(&file).unwrap(),
             }
-            plan_candidate(&current(), &plan).unwrap();
+            plan_candidate(&current(), plan.destination()).unwrap();
         }
         fs::write(disk.join("ro"), "1").unwrap();
-        let error = plan_candidate(&current(), &plan).unwrap_err();
+        let error = plan_candidate(&current(), plan.destination()).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -751,14 +778,14 @@ mod tests {
         uuid[6] = 0x40;
         uuid[8] = 0x80;
         let plan = Plan::new([1; 32], destination, [2; 32], uuid, settings).unwrap();
-        recheck_inventory(&plan, &fixture.class, || Ok(())).unwrap();
+        recheck_inventory(plan.destination(), &fixture.class, || Ok(())).unwrap();
         fs::write(disk.join("diskseq"), "8").unwrap();
-        let error = recheck_inventory(&plan, &fixture.class, || Ok(())).unwrap_err();
+        let error = recheck_inventory(plan.destination(), &fixture.class, || Ok(())).unwrap_err();
         assert!(error
             .to_string()
             .contains("no longer an unchanged candidate"));
         fs::write(disk.join("diskseq"), "7").unwrap();
-        let error = recheck_inventory(&plan, &fixture.class, || {
+        let error = recheck_inventory(plan.destination(), &fixture.class, || {
             fs::write(disk.join("diskseq"), "8")
         })
         .unwrap_err();

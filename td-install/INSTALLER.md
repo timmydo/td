@@ -159,10 +159,10 @@ filesystem access, entropy generation, transport or installation
 execution. The Cargo library is also a target path dependency of td-setup;
 it exports exactly those two modules, as pinned by td-setup's confinement
 test, which still forbids every td-setup source file from naming
-`installation_protocol` until the service is wired. The formatter does not
-compile the protocol. It stages the plan module separately through
-`#[path]` for `observe-plan`, with its recipe and compiled-file guard
-declaring the source. Each further target consumer must declare its source
+`installation_protocol` until the service is wired. The formatter binary
+stages the plan and protocol modules separately through `#[path]`, for
+`observe-plan` and `serve`, with its recipe and compiled-file guard
+declaring the sources. Each further target consumer must declare its source
 and public API reach in its own recipe and confinement roster. A decoded
 plan conveys no authority.
 
@@ -233,23 +233,29 @@ authentication can establish that it names the intended manifest. The
 codec does not prove a nonce is fresh or a UUID globally unique. The
 authority generates them.
 
-Before a future service presents this value, it must authenticate and
-retain its source, validate all choices against that source, establish
-destination eligibility and layout/payload/scratch fit, and retain the
-exact proposed value. Execution must require fresh trusted consent bound
-to that whole value and revalidate the selected disk under a retained
-exclusive claim. Neither matching plan bytes nor possession of the nonce
-grants consent. No public request, reconnect or service restart may
-silently retry erasure. This increment does not connect the value to the
-existing update-only consent operation or activate a whole-disk service
-or wizard action.
+Before a service presents this value to an operator for consent, it must
+authenticate and retain its source, validate all choices against that
+source, establish destination eligibility and layout/payload/scratch fit,
+and retain the exact proposed value. The service core below already
+authenticates the source under its claim and retains the value, but does
+not yet retain the source, validates choices against caller-bound roots
+(the verified root and the running system's timezone catalog) rather than
+that source, and does not check payload and scratch fit, so its review is
+not yet presentable; no trusted caller starts it. Execution must require
+fresh trusted consent bound to that whole value and revalidate the
+selected disk under a retained exclusive claim. Neither matching plan
+bytes nor possession of the nonce grants consent. No public request,
+reconnect or service restart may silently retry erasure. This increment
+does not connect the value to the existing update-only consent operation
+or activate a whole-disk service or wizard action.
 
 ## Installation service protocol
 
 `td_install::installation_protocol` defines the messages between the
 unprivileged installer and the root installation service. It is data and
-codec only: no socket, service, consent operation or wizard wiring uses it
-yet, and decoding a message grants no authority.
+codec only, and decoding a message grants no authority. The service core
+below implements it; no public intake, consent operation or wizard wiring
+uses it yet.
 
 Both ends first send and require the eight bytes `TDINS01\n`. Any change to
 a message or its bytes changes this greeting; there is no negotiation.
@@ -337,6 +343,55 @@ deployment publication, verified boot artifacts and settings publication.
 An installer that asked for execution and then sees idle, or loses the
 channel, shows the outcome as unknown, never success. Nothing retries a
 destructive operation after a reconnect or restart.
+
+## Installation service core
+
+`td-install serve <td-boot> <deployment-directory> <trusted-key>
+<verified-root> <td-firstboot>` is the service core for one installer. Its
+five operands are absolute control-plane inputs bound by its caller, never
+by the installer, and must be present and of their kind: `td-boot` and
+`td-firstboot` executable files, the deployment directory and verified
+root directories, the key a file. It requires effective uid 0 (a sanity
+gate against a misplaced start, not proof of privilege) and a connected
+Unix stream socket on standard input, found as such in `/proc/net/unix`,
+since a datagram or sequenced-packet peer would truncate frames and need
+not close. That table lists only serve's own network namespace, so its
+caller must create the socket there, and every row naming the socket must
+agree, since a bound name can forge one. It clears an inherited
+non-blocking flag, and refuses before sending a byte otherwise. It then
+speaks the installation service protocol on that socket until the peer
+closes between frames, and exits; a malformed frame or message ends it
+without a reply. The review and its claim end with the process: no review
+outlives its installer. No trusted caller starts it yet.
+
+It holds at most one review, under the admission rules above. Propose
+checks, in order: busy; the settings (the username through `td-firstboot
+check-primary-name` against the verified root, the hostname grammar, the
+keyboard layout, which admits only `us` until a keyboard catalog exists,
+and the running system's timezone catalog, as volume formatting uses); a
+fresh candidate discovery, which must contain the proposed destination
+exactly, and whose observation the review then carries; the read-write
+exclusive claim of DESIGN.md (a disk held elsewhere is refused as busy;
+any other failure to claim a disk discovery just listed, as changed);
+source authentication through `td-boot validate-source` while that claim
+is held; the nonce and version-4 volume UUID from `/dev/urandom`; and a
+recheck of the claimed disk against two inventories. Any refusal releases
+the claim. Only then is the review held and returned. Execute rechecks the
+held disk and, until compositor consent exists, answers consent
+unavailable and keeps the review; a disk that changed abandons it.
+Withdraw releases it. The wire carries only a refusal's code, so the cause
+of each discovery, settings, claim, source or recheck failure is written
+to standard error. While a review is held, its own claim keeps the held
+disk out of destinations replies; that omission is not a disk change. Each
+request is served in turn, so an installer can repeat source
+authentication at will; the caller that starts the service bounds that.
+
+The service writes no disk byte and cannot start an installation.
+Exclusion of the medium backing the deployment source currently rests on
+discovery: a mounted medium's exclusive claim keeps it out. Independent
+retention and exclusion of source backing storage, validation of choices
+against that source rather than caller-bound roots, payload and scratch
+fit, and trusted consent remain required before execution.
 
 ## Choosing the volume identity
 
@@ -923,9 +978,11 @@ not an atomic snapshot, a time bound on kernel I/O, or protection against
 removal/replacement, changes that reverse between observations, unclaimed
 raw I/O or a privileged topology writer.
 
-The future service must bind the reviewed identity and settings in its
-immutable plan, independently resolve source backing storage, revalidate
-the selected device and retain its claim through destructive execution.
+The service must bind the reviewed identity and settings in its immutable
+plan, independently resolve source backing storage, revalidate the
+selected device and retain its claim through destructive execution;
+"Installation service core" does all but source resolution, short of
+execution.
 This advisory CLI does not activate the service or provide that admission,
 consent, source verification, scratch or payload-fit checks.
 
@@ -951,7 +1008,7 @@ commands must refuse the source open with EBUSY. After releasing every
 source mount, an exclusive read-write open must succeed without writing.
 Whole-image length and SHA-256 comparisons preserve both source and target
 after QEMU is reaped. This tests the mounted-media claim and its release;
-the future service must keep its source mounts and plan identity alive.
+the service must keep its source mounts and plan identity alive.
 Other media cases remain write-protected, and no operator device is used.
 
 ## Plan observation

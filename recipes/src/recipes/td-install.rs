@@ -10,6 +10,10 @@ const MAIN_RS: &str = include_str!("../../../td-install/src/main.rs");
 const TIMEZONES_RS: &str = include_str!("../../../td-install/src/timezones.rs");
 const INVENTORY_RS: &str = include_str!("../../../td-install/src/inventory.rs");
 const INSTALLATION_PLAN_RS: &str = include_str!("../../../td-install/src/installation_plan.rs");
+const INSTALLATION_PROTOCOL_RS: &str =
+    include_str!("../../../td-install/src/installation_protocol.rs");
+const INSTALLATION_SERVICE_RS: &str =
+    include_str!("../../../td-install/src/installation_service.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
 const REALFILE_RS: &str = include_str!("../../../td-boot/src/realfile.rs");
 const CRC32_RS: &str = include_str!("../../../engine/src/crc32.rs");
@@ -74,6 +78,16 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-install/src/installation_plan.rs".into(),
             content: INSTALLATION_PLAN_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-install/src/installation_protocol.rs".into(),
+            content: INSTALLATION_PROTOCOL_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-install/src/installation_service.rs".into(),
+            content: INSTALLATION_SERVICE_RS.into(),
             exec: false,
         },
         Step::WriteFile {

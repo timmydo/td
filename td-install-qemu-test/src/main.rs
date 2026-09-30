@@ -631,7 +631,7 @@ fn check_plan_observation(device: &str) -> Result<(), String> {
     let diagnostic = String::from_utf8_lossy(&response.stderr);
     if response.status.success()
         || !response.stdout.is_empty()
-        || !diagnostic.contains("reviewed destination is no longer an unchanged candidate")
+        || !diagnostic.contains("destination is no longer an unchanged candidate")
     {
         return Err("stale plan observation was accepted or reported success".into());
     }
