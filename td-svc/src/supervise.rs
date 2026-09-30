@@ -5717,8 +5717,11 @@ mod tests {
     /// wrapper and leaves the login tree running.
     #[test]
     fn a_recorded_terminal_decides_how_a_console_orphan_is_addressed() {
+        // Above the kernel's pid limit, so the read below finds no process,
+        // where a small literal pid could name a live host one.
+        let absent = i32::MAX;
         let console = crate::evict::Entry {
-            pid: 4242,
+            pid: absent,
             starttime: 7,
             tty: 1032,
             name: "greeter".to_string(),
@@ -5726,7 +5729,7 @@ mod tests {
         assert_eq!(
             containment_of(&console),
             Containment::Console {
-                leader: 4242,
+                leader: absent,
                 tty: 1032,
             },
             "a recorded terminal was ignored; the login tree would survive"
@@ -5737,7 +5740,7 @@ mod tests {
             tty: 0,
             ..console.clone()
         };
-        assert_eq!(containment_of(&plain), Containment::Process(4242));
+        assert_eq!(containment_of(&plain), Containment::Process(absent));
     }
 
     /// I3 at the eviction's decision point: an incomplete scan is not
@@ -6574,16 +6577,19 @@ mod tests {
     /// away), declares `Stopped` over a live leader, and the late exit then
     /// runs the restart policy — putting back the service an operator stopped.
     ///
-    /// No `/bin/kill` is needed: an empty scope means nothing is signalled, so
-    /// this isolates the release from the send.
+    /// An empty scope means nothing is signalled, so this isolates the release
+    /// from the send.
     #[test]
     fn escalating_a_requested_stop_does_not_release_the_leader() {
         let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
         let index = rt.index_of("a").unwrap();
+        // Read through /proc as the leader: above the kernel's pid limit, it is
+        // never a live host process, so `escalate` always reaches the release.
+        let absent = i32::MAX;
         {
             let service = rt.lookup_mut("a").unwrap();
             service.phase = Phase::Ready;
-            service.pid = Some(4242);
+            service.pid = Some(absent);
             service.starttime = Some(1);
             service.stopping = true;
             // Nothing to signal, so `escalate` reaches the release directly.
@@ -6594,7 +6600,7 @@ mod tests {
         let service = rt.lookup("a").unwrap();
         assert_eq!(
             service.pid,
-            Some(4242),
+            Some(absent),
             "the leader's identity was released while its waiter still owned the \
              child; the sweep can now call a live leader stopped"
         );
@@ -6636,7 +6642,7 @@ mod tests {
     /// `escalate` passes `stop_scope` into it: replacing that argument with
     /// `None` left every test green while silently restoring the P0. The
     /// `killed` flag is set exactly when a target was chosen, so it stands in
-    /// for the send on a host with no `/bin/kill`.
+    /// for the send, which reaches a group that holds nothing.
     #[test]
     fn escalate_aims_at_the_recorded_scope() {
         let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
@@ -6646,7 +6652,9 @@ mod tests {
             service.phase = Phase::Ready;
             service.pid = None; // leader reaped; survivors hold the group
             service.stopping = true;
-            service.stop_scope = Some(Containment::Group(999_998));
+            // The KILL is really sent: above the kernel's pid limit, this
+            // group can hold no host process.
+            service.stop_scope = Some(Containment::Group(i32::MAX));
             service.kill_at = Instant::now().checked_sub(SWEPT_AGO);
         }
         rt.escalate(index);
@@ -7190,10 +7198,13 @@ mod tests {
     #[test]
     fn a_unit_that_ignores_the_term_is_killed_after_its_stop_timeout() {
         let mut rt = runtime("[slow]\ntype=oneshot\nexec=/x\ntimeout=1\nstop-timeout=5\n");
+        // The TERM below is really sent, to this pid's group: above the
+        // kernel's pid limit, it can name no host process.
+        let absent = i32::MAX;
         {
             let service = rt.lookup_mut("slow").unwrap();
             service.phase = Phase::Starting;
-            service.pid = Some(4242);
+            service.pid = Some(absent);
             service.deadline = Instant::now().checked_sub(Duration::from_secs(1));
         }
         rt.enforce_deadlines();
@@ -7203,7 +7214,7 @@ mod tests {
             slow.kill_at.is_some(),
             "the KILL must be scheduled, not skipped"
         );
-        assert_eq!(slow.pid, Some(4242), "the pid is the only handle on it");
+        assert_eq!(slow.pid, Some(absent), "the pid is the only handle on it");
 
         // ...and once that elapses, the escalation runs and lets the pid go.
         rt.lookup_mut("slow").unwrap().kill_at = Instant::now().checked_sub(Duration::from_secs(1));
