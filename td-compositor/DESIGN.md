@@ -5194,6 +5194,44 @@ spaces, rows are joined with one newline, and UTF-8 encoding is bounded before
 publication at 64 KiB. A range that trims to no bytes is a no-op: it neither
 replaces the seat clipboard nor emits a zero-byte success marker.
 
+A left-button press with Control (Caps and Num Lock ignored, no other
+modifier) reads the link under it as soon as it is dispatched, from the
+viewport's row by td-ui's rule (`links`, mounted from
+`td-ui/src/links.rs`), and only while the screen shows the model: a
+model changed since the last committed frame, or a committed frame whose
+callback has not yet said it reached the screen, is not what the person
+saw, and the press is then a plain one. A screen under continuous output
+never shows its model unchanged, so there a Control-press is always
+plain. Output or a wheel later in the same frame cannot change the link
+read. A press past the drawn grid reads none, though a selection's clamp
+would reach the edge cell. The frame that closes the press decides: with
+a link it opens through td-ui's opener (`open`, mounted likewise) and
+the press selects nothing, its drag and release ignored, so the
+selection a copy would take stays unless output clears it, as output
+clears any selection; without one it is a plain press. The link is read
+from the cells, not from what they look like, so text whose foreground
+is the colour of its background is part of it: what opens is what the
+row holds, which may be more than the person can read. A link that
+cannot be opened is a `td-term: open link:` line on stderr and the
+visual bell. A cell holds one scalar, so the row's text is its cells in
+order; a link the terminal wrapped onto the next row is found only up to
+the row's end.
+
+The browser is td-term's one child outside the session child's rules
+(§12): it is `BROWSER`, else `xdg-open`, found on td-term's own `PATH`,
+run directly with the link as one argument and never through a shell,
+in td-term's working directory, with td-term's own environment less
+`WAYLAND_SOCKET` and with `WAYLAND_DISPLAY` set to the socket td-term
+dials, made absolute (a relative `WAYLAND_DISPLAY` would be resolved
+under `XDG_RUNTIME_DIR`), so it opens on the display the terminal is
+on. Its streams are `/dev/null`, every descriptor td-term holds is
+close-on-exec, and a thread reaps it; each followed link holds one such
+thread until its browser exits, at the rate a person clicks. td-term's
+environment carries no `BROWSER` and the image has no `xdg-open`, so
+until APPLICATIONS.md §W.6's `OpenURI` opener lands a followed link
+rings the bell there; in a session whose environment names a browser it
+opens.
+
 `Control+Shift+C` with no Alt, Logo, or unknown modifier is a td-term command,
 not PTY input and not a repeat candidate. It creates a `wl_data_source` at
 version 3, offers `text/plain;charset=utf-8`, `text/plain`, and `UTF8_STRING`,
@@ -5461,7 +5499,8 @@ application is unaffected, which is the case `--command` exists for; an
 unjailed program that wants those signals names the wrapper. An explicit
 program is an absolute path, refused at argument parsing before td-term
 dials the compositor; the constant wrapper path is checked when the child
-command is assembled. td-term has no PATH to search. The td-term recipe and
+command is assembled. td-term has no PATH to search for it (the browser
+a followed link starts is the exception, above). The td-term recipe and
 system integration tests assert that the staged td-init advertises and
 exercises this exact flag, tying the absolute path to the declared runtime
 input. Ordinary rescue-console behavior remains unchanged.

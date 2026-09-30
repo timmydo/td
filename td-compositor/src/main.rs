@@ -7,6 +7,16 @@
 )]
 mod app_policy;
 
+// td-ui's link rule and opener, shared so td-term follows a link as
+// td-editor and td-mail do; `around` is td-mail's wrap's alone, and
+// `open::link` is theirs.
+#[allow(dead_code, reason = "shared link rule")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/links.rs")]
+mod links;
+#[allow(dead_code, reason = "shared opener: td-term opens on its display")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/open.rs")]
+mod open;
+
 mod attention;
 mod authority;
 mod bar;
@@ -1335,6 +1345,8 @@ mod confinement {
             "app_policy.rs",
             include_str!("../../td-busd/src/app_policy.rs"),
         ),
+        ("links.rs", include_str!("../../td-ui/src/links.rs")),
+        ("open.rs", include_str!("../../td-ui/src/open.rs")),
         ("attention.rs", include_str!("attention.rs")),
         ("authority.rs", AUTHORITY),
         ("bar.rs", include_str!("bar.rs")),
@@ -1795,7 +1807,7 @@ unsafe impl Send for MappedRegion {}"#;
             OTHER
                 .iter()
                 .chain(TEST_ONLY)
-                .filter(|(name, _)| *name != "app_policy.rs")
+                .filter(|(name, _)| !["app_policy.rs", "links.rs", "open.rs"].contains(name))
                 .map(|(name, _)| (*name).to_string()),
         );
         inventoried.sort();

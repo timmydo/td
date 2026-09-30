@@ -5,6 +5,7 @@
 //! reaped on a thread of its own, so a slow browser never holds the
 //! window's loop.
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Where a command puts the link among its words.
@@ -18,24 +19,49 @@ const FALLBACK: &str = "xdg-open";
 /// `xdg-open`. Answers the program started, for a status line, or why
 /// none was.
 pub fn link(link: &str, command: Option<&str>) -> Result<String, String> {
+    link_on(link, command, None)
+}
+
+/// As `link`, the browser told the display it is to open on: a program
+/// that dials a socket its environment does not name (td-term) names it
+/// here, and the browser's `WAYLAND_DISPLAY` is that path.
+pub fn link_on(
+    link: &str,
+    command: Option<&str>,
+    display: Option<&Path>,
+) -> Result<String, String> {
     let environment = std::env::var("BROWSER").ok();
-    let argv = argv(link, command, environment.as_deref())?;
-    let (program, arguments) = argv.split_first().ok_or("no browser command")?;
-    let mut child = Command::new(program)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        // The program's own display connection is not the browser's.
-        .env_remove("WAYLAND_SOCKET")
-        .spawn()
-        .map_err(|e| format!("{program}: {e}"))?;
+    let (program, mut process) = prepare(link, command, environment.as_deref(), display)?;
+    let mut child = process.spawn().map_err(|e| format!("{program}: {e}"))?;
     // A thread that cannot be made leaves the browser unreaped until this
     // process exits; the link is open either way.
     let _ = std::thread::Builder::new()
         .name("td-ui-open".into())
         .spawn(move || child.wait());
-    Ok(program.clone())
+    Ok(program)
+}
+
+/// The browser's process for `link`, not yet started, and its program.
+fn prepare(
+    link: &str,
+    command: Option<&str>,
+    browser: Option<&str>,
+    display: Option<&Path>,
+) -> Result<(String, Command), String> {
+    let argv = argv(link, command, browser)?;
+    let (program, arguments) = argv.split_first().ok_or("no browser command")?;
+    let mut process = Command::new(program);
+    process
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // The program's own display connection is not the browser's.
+        .env_remove("WAYLAND_SOCKET");
+    if let Some(display) = display {
+        process.env("WAYLAND_DISPLAY", display);
+    }
+    Ok((program.clone(), process))
 }
 
 /// The words run for `link`: the first command of `command`, `browser`
@@ -141,6 +167,20 @@ mod tests {
         ] {
             assert!(argv(text, Some("firefox"), None).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn the_browser_has_the_display_named_and_not_the_programs_socket() {
+        use std::ffi::OsStr;
+        let display = Path::new("/run/td/wayland-1");
+        let (program, process) = prepare(LINK, Some("b"), None, Some(display)).unwrap();
+        assert_eq!(program, "b");
+        let envs: Vec<_> = process.get_envs().collect();
+        assert!(envs.contains(&(OsStr::new("WAYLAND_SOCKET"), None)));
+        assert!(envs.contains(&(OsStr::new("WAYLAND_DISPLAY"), Some(display.as_os_str()))));
+        let (_, process) = prepare(LINK, Some("b"), None, None).unwrap();
+        let envs: Vec<_> = process.get_envs().collect();
+        assert_eq!(envs, [(OsStr::new("WAYLAND_SOCKET"), None)]);
     }
 
     #[test]

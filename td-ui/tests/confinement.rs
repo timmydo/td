@@ -252,6 +252,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
         if name == "open.rs" {
             assert!(production.contains("std::env::var(\"BROWSER\")"));
             assert!(production.contains(".env_remove(\"WAYLAND_SOCKET\")"));
+            assert!(production.contains(".env(\"WAYLAND_DISPLAY\", display)"));
         }
         if PURE.contains(&name.as_str()) {
             // Production text only: a module's own `#[cfg(test)] mod tests`

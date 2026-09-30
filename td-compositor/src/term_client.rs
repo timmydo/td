@@ -409,6 +409,20 @@ struct Surface {
     pending_selection_anchor: Option<(i32, i32)>,
     pending_selection_extent: Option<(i32, i32)>,
     selection: Option<render::Selection>,
+    /// A Control-press's position, read by `serve_event` as soon as the
+    /// press is dispatched.
+    pending_link: Option<(i32, i32)>,
+    /// The link under that press, read from the screen as it stood at the
+    /// press, which the frame closing the press follows: over a link the
+    /// link opens and the press selects nothing; elsewhere it is plain.
+    link: Option<String>,
+    /// A followed press is still held: its drag and release select nothing.
+    following: bool,
+    /// The browser command a link opens with; none, as in production, is
+    /// `BROWSER` then `xdg-open` (td-ui's opener).
+    browser: Option<String>,
+    /// The display socket td-term dials, which the browser is told.
+    display: Option<PathBuf>,
     /// Detents accumulated since the last `wl_pointer.frame`. A frame is the
     /// transaction, so a report that turned the wheel is applied once when it
     /// closes rather than per axis event — which is also what keeps a tilting
@@ -491,6 +505,11 @@ impl Surface {
             pending_selection_anchor: None,
             pending_selection_extent: None,
             selection: None,
+            pending_link: None,
+            link: None,
+            following: false,
+            browser: None,
+            display: None,
             pending_notches: 0,
             keymap_verified: false,
             modifiers: 0,
@@ -846,6 +865,13 @@ impl Surface {
                     if button == LEFT_BUTTON {
                         match state {
                             KEY_PRESSED => {
+                                let control = self.modifiers
+                                    & !(crate::keyboard::MOD_CAPS | crate::keyboard::MOD_NUM)
+                                    == crate::keyboard::MOD_CONTROL;
+                                self.pending_link =
+                                    control.then_some((self.pointer_x, self.pointer_y));
+                                self.link = None;
+                                self.following = false;
                                 self.pointer_left_down = true;
                                 self.pending_selection_anchor =
                                     Some((self.pointer_x, self.pointer_y));
@@ -854,8 +880,10 @@ impl Surface {
                             }
                             KEY_RELEASED => {
                                 self.pointer_left_down = false;
-                                self.pending_selection_extent =
-                                    Some((self.pointer_x, self.pointer_y));
+                                if !std::mem::take(&mut self.following) {
+                                    self.pending_selection_extent =
+                                        Some((self.pointer_x, self.pointer_y));
+                                }
                             }
                             _ => {
                                 return Err(format!("wl_pointer button has invalid state {state}"))
@@ -1208,6 +1236,71 @@ impl Surface {
         let row = (pixel(fixed.1) / font.height()).min(usize::from(rows).saturating_sub(1));
         let column = (pixel(fixed.0) / font.width()).min(usize::from(columns).saturating_sub(1));
         Some((row, column))
+    }
+
+    /// The link under a pointer position in the viewport's row, as td-ui's
+    /// rule finds it; none past the drawn grid, whose edge cells a
+    /// selection's clamp would reach. A cell holds one scalar, so the row's
+    /// text is its cells in order; a link td-term wrapped onto the next row
+    /// is found only up to the row's end.
+    fn link_at(&self, terminal: &Terminal, fixed: (i32, i32), font: &Font) -> Option<String> {
+        let (rows, columns) = self.cells?;
+        let inside = |value: i32, cells: u16, cell: usize| {
+            usize::try_from(value.div_euclid(256))
+                .is_ok_and(|pixel| pixel < usize::from(cells).saturating_mul(cell))
+        };
+        if !inside(fixed.0, columns, font.width()) || !inside(fixed.1, rows, font.height()) {
+            return None;
+        }
+        let (row, column) = self.cell_at(fixed, font)?;
+        let viewport = self.viewport.offset(terminal.scrollback());
+        let snapshot =
+            render::Snapshot::new(terminal, self.activated, false).scrolled_back(viewport);
+        let mut text = String::new();
+        let mut at = None;
+        // Only the drawn columns: a model wider than the surface is clipped.
+        for cell in 0..snapshot.columns().min(usize::from(columns)) {
+            if cell == column {
+                at = Some(text.len());
+            }
+            text.push(snapshot.cell(row, cell).scalar);
+        }
+        let range = crate::links::at(&text, at?)?;
+        text.get(range).map(str::to_owned)
+    }
+
+    /// Reads the link under a Control-press just dispatched, from the
+    /// screen as the person saw it: a model changed since the last
+    /// committed frame (`stale`), or a committed frame whose callback has
+    /// not said it reached the screen, is not what was on screen, and the
+    /// press is then a plain one. Output or a wheel later in the frame
+    /// cannot change it.
+    fn read_pending_link(&mut self, terminal: Option<&Terminal>, font: &Font) {
+        if let Some(at) = self.pending_link.take() {
+            let shown = !self.stale && self.frame.as_ref().is_none_or(|frame| frame.presented);
+            self.link = terminal
+                .filter(|_| shown)
+                .and_then(|terminal| self.link_at(terminal, at, font));
+        }
+    }
+
+    /// Closes a pointer frame: a Control-press over a link opens the link
+    /// and selects nothing, its drag and release ignored; otherwise the
+    /// frame's selection is applied. Answers why a link found could not be
+    /// opened.
+    fn close_pointer_frame(&mut self, font: &Font) -> Result<(), String> {
+        if let Some(link) = self.link.take() {
+            self.pending_selection_anchor = None;
+            self.pending_selection_extent = None;
+            // A release in the same frame already came and went.
+            self.following = std::mem::take(&mut self.pointer_left_down);
+            return crate::open::link_on(&link, self.browser.as_deref(), self.display.as_deref())
+                .map(|_| ());
+        }
+        if let Some(selection) = self.take_pointer_selection() {
+            self.apply_pointer_selection(selection, font);
+        }
+        Ok(())
     }
 
     fn apply_pointer_selection(&mut self, frame: PointerSelectionFrame, font: &Font) {
@@ -2280,9 +2373,15 @@ fn serve_event(
             if !connection.handle_common(&message)? {
                 surface.dispatch(connection, &message, fallback)?;
             }
+            surface.read_pending_link(model.as_ref(), session.font);
             if closes_pointer_frame {
-                if let Some(selection) = surface.take_pointer_selection() {
-                    surface.apply_pointer_selection(selection, session.font);
+                if let Err(error) = surface.close_pointer_frame(session.font) {
+                    let line = format!("td-term: open link: {error}\n");
+                    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+                    if let Some(terminal) = model.as_mut() {
+                        terminal.ring();
+                        surface.stale = true;
+                    }
                 }
             }
             if std::mem::take(&mut surface.pending_paste) && !surface.request_paste(connection)? {
@@ -2899,6 +2998,12 @@ pub fn run(options: &Options) -> Result<(), String> {
     // been told something true for less than a second.
     let sources = surface.source_registry();
     let (clipboard, _clipboard_writer) = spawn_clipboard_writer(clipboard_proof)?;
+    // Absolute, because the browser's libwayland resolves a relative
+    // WAYLAND_DISPLAY under XDG_RUNTIME_DIR, not td-term's directory.
+    surface.display = Some(
+        std::path::absolute(&options.socket)
+            .map_err(|e| format!("{}: {e}", options.socket.display()))?,
+    );
     let reader = connection.detach_reader()?;
     let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
     let (paste_reader, _paste_thread) = spawn_paste_reader(sender.clone())?;
@@ -3431,6 +3536,222 @@ mod tests {
             )
             .unwrap();
         assert_eq!(surface.pending_clipboard_focus_marker, Some(4));
+    }
+
+    /// A Control-press over a link opens it through td-ui's opener (here a
+    /// browser that cannot start, so the bell rings) and selects nothing:
+    /// the selection stays through the press, its drag and its release.
+    /// Control off a link, and a press without Control on one, are plain
+    /// presses that select their cell.
+    #[test]
+    fn control_press_follows_a_link_and_is_otherwise_a_selection() {
+        let (mut connection, _peer) = pair();
+        let mut surface = test_surface();
+        let pointer = 99;
+        surface.pointer = Some(pointer);
+        surface.cells = Some((2, 40));
+        surface.browser = Some("/nonexistent/td-term-browser".to_string());
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        let mut terminal = Terminal::new(2, 40).unwrap();
+        terminal.feed(b"see https://e.example/x now");
+        let mut model = Some(terminal);
+        let mut child = Child::default();
+        let fixed = |column: usize| {
+            let x = column
+                .saturating_mul(font.width())
+                .saturating_add(font.width() / 2)
+                .saturating_mul(256);
+            let y = (font.height() / 2).saturating_mul(256);
+            (i32::try_from(x).unwrap(), i32::try_from(y).unwrap())
+        };
+        let encoded = |value: i32| u32::from_ne_bytes(value.to_ne_bytes());
+        let mut serve =
+            |surface: &mut Surface, model: &mut Option<Terminal>, words: (u16, Vec<u32>)| {
+                serve_event(
+                    &mut connection,
+                    surface,
+                    model,
+                    &session,
+                    fallback,
+                    &mut child,
+                    Event::Wayland(words_message(pointer, words.0, &words.1)),
+                )
+                .unwrap();
+            };
+        let at = |column: usize| {
+            let (x, y) = fixed(column);
+            (2u16, vec![7, encoded(x), encoded(y)])
+        };
+        let press = (3u16, vec![2, 9, LEFT_BUTTON, KEY_PRESSED]);
+        let release = (3u16, vec![3, 9, LEFT_BUTTON, KEY_RELEASED]);
+        let frame = (5u16, Vec::new());
+        let before = Some(render::Selection {
+            anchor: (1, 0),
+            extent: (1, 3),
+        });
+        surface.selection = before;
+        assert_eq!(
+            surface
+                .link_at(model.as_ref().unwrap(), fixed(10), &font)
+                .as_deref(),
+            Some("https://e.example/x")
+        );
+        assert_eq!(
+            surface.link_at(model.as_ref().unwrap(), fixed(1), &font),
+            None
+        );
+
+        // The screen shows the model: nothing has changed since it was drawn.
+        surface.stale = false;
+        surface.modifiers = crate::keyboard::MOD_CONTROL | crate::keyboard::MOD_NUM;
+        let (x, y) = fixed(10);
+        serve(
+            &mut surface,
+            &mut model,
+            (0, vec![1, SURFACE, encoded(x), encoded(y)]),
+        );
+        serve(&mut surface, &mut model, press.clone());
+        serve(&mut surface, &mut model, frame.clone());
+        assert!(
+            model.as_mut().unwrap().take_bell(),
+            "no browser, and no bell"
+        );
+        assert_eq!(surface.selection, before, "the followed press selected");
+        serve(&mut surface, &mut model, at(14));
+        serve(&mut surface, &mut model, frame.clone());
+        serve(&mut surface, &mut model, release.clone());
+        serve(&mut surface, &mut model, frame.clone());
+        assert_eq!(surface.selection, before, "its drag or release selected");
+        assert!(!model.as_mut().unwrap().take_bell());
+
+        // Control off the link is a plain press.
+        serve(&mut surface, &mut model, at(1));
+        serve(&mut surface, &mut model, press.clone());
+        serve(&mut surface, &mut model, frame.clone());
+        serve(&mut surface, &mut model, release.clone());
+        serve(&mut surface, &mut model, frame.clone());
+        assert_eq!(
+            surface.selection,
+            Some(render::Selection {
+                anchor: (0, 1),
+                extent: (0, 1),
+            })
+        );
+        // Without Control a press on the link selects its cell.
+        surface.modifiers = 0;
+        serve(&mut surface, &mut model, at(10));
+        serve(&mut surface, &mut model, press.clone());
+        serve(&mut surface, &mut model, frame.clone());
+        serve(&mut surface, &mut model, release.clone());
+        serve(&mut surface, &mut model, frame.clone());
+        assert_eq!(
+            surface.selection,
+            Some(render::Selection {
+                anchor: (0, 10),
+                extent: (0, 10),
+            })
+        );
+        assert!(!model.as_mut().unwrap().take_bell());
+
+        // The link is read at the press, from the screen then: output before
+        // the frame closes cannot change what opens. A press and release in
+        // one frame leave nothing held.
+        surface.modifiers = crate::keyboard::MOD_CONTROL;
+        surface.selection = before;
+        // The bell's frame was drawn.
+        surface.stale = false;
+        serve(&mut surface, &mut model, at(10));
+        serve(&mut surface, &mut model, press.clone());
+        assert_eq!(surface.link.as_deref(), Some("https://e.example/x"));
+        model
+            .as_mut()
+            .unwrap()
+            .feed(b"\rsee https://z.example/y now");
+        surface.stale = true;
+        assert_eq!(
+            surface
+                .link_at(model.as_ref().unwrap(), fixed(10), &font)
+                .as_deref(),
+            Some("https://z.example/y")
+        );
+        serve(&mut surface, &mut model, release.clone());
+        serve(&mut surface, &mut model, frame.clone());
+        assert!(model.as_mut().unwrap().take_bell());
+        assert_eq!(surface.selection, before);
+        assert!(!surface.following, "a released press is still held");
+
+        // A screen not yet drawn is not what was seen: the press is plain.
+        assert!(surface.stale);
+        serve(&mut surface, &mut model, press.clone());
+        serve(&mut surface, &mut model, frame.clone());
+        serve(&mut surface, &mut model, release.clone());
+        serve(&mut surface, &mut model, frame.clone());
+        assert!(!model.as_mut().unwrap().take_bell());
+        assert_eq!(
+            surface.selection,
+            Some(render::Selection {
+                anchor: (0, 10),
+                extent: (0, 10),
+            })
+        );
+
+        // Nor is one committed whose callback has not come: the old picture
+        // may still be up. Once it has, the press follows.
+        surface.stale = false;
+        surface.frame = Some(Frame {
+            buffer: 1,
+            callback: 2,
+            released: true,
+            presented: false,
+        });
+        serve(&mut surface, &mut model, press.clone());
+        serve(&mut surface, &mut model, frame.clone());
+        serve(&mut surface, &mut model, release.clone());
+        serve(&mut surface, &mut model, frame.clone());
+        assert!(!model.as_mut().unwrap().take_bell());
+        if let Some(pending) = surface.frame.as_mut() {
+            pending.presented = true;
+        }
+        serve(&mut surface, &mut model, press);
+        serve(&mut surface, &mut model, frame.clone());
+        serve(&mut surface, &mut model, release);
+        serve(&mut surface, &mut model, frame);
+        assert!(model.as_mut().unwrap().take_bell());
+        surface.frame = None;
+
+        // Past the drawn grid is no link, though a selection's clamp would
+        // reach the edge cell.
+        let mut edge = Terminal::new(1, 20).unwrap();
+        edge.feed(b"https://e.example/ab");
+        surface.cells = Some((1, 20));
+        assert_eq!(
+            surface.link_at(&edge, fixed(19), &font).as_deref(),
+            Some("https://e.example/ab")
+        );
+        assert_eq!(surface.link_at(&edge, fixed(20), &font), None);
+        // A model wider than the drawn grid is read only as far as it is drawn.
+        surface.cells = Some((1, 15));
+        assert_eq!(
+            surface.link_at(&edge, fixed(14), &font).as_deref(),
+            Some("https://e.examp")
+        );
+        surface.cells = Some((1, 20));
+        let below = (
+            fixed(5).0,
+            i32::try_from(font.height() * 256 + 128).unwrap(),
+        );
+        assert_eq!(surface.link_at(&edge, below, &font), None);
+        assert_eq!(surface.link_at(&edge, (-256, fixed(5).1), &font), None);
     }
 
     #[test]

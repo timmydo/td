@@ -300,8 +300,9 @@ of its own files may name each module.
 - `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
   texts beside the face in `td-compositor/assets`, embedded at compile
   time for a program's `--font-license` output.
-- `open`: `link`, which starts the browser on one whole link; under
-  "Following links" below.
+- `open`: `link`, which starts the browser on one whole link, and
+  `link_on`, the same on a display the caller names; under "Following
+  links" below.
 - `wayland`: `Endpoint` and `endpoint` (from the `WAYLAND_SOCKET`,
   `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` values a consumer passes),
   `connect`, `Connection` (`new`, `send` with at most one borrowed file,
@@ -1825,17 +1826,19 @@ time, coordinate extremes, explicit cancellation and consumed pairs.
 ## Following links
 
 A Control-press on a link opens it in the browser in td-editor's
-documents and in td-mail's messages, which td-mail shows in the editor's
-pane; td-news does not follow links yet. The rule and the launch are the
-toolkit's so the programs agree. `links::at` finds the link over the
-byte under the pointer: an
+documents, in td-mail's messages, which td-mail shows in the editor's
+pane, and in td-term's grid; td-news does not follow links yet. The
+rule and the launch are the toolkit's so the programs agree.
+`links::at` finds the link over the byte under the pointer: an
 `http://` or `https://` scheme with at least one byte after it, running
 to the next ASCII whitespace or `<>])"'` backtick, trailing `.,;:!?`
 left out, which is td-mail's link-list rule. It looks at most
 `MAX_BYTES` either side of the byte, and a run longer than that on
-either side is no link, so a press costs the same in any line; the
-module is pure, so a program that
-cannot link the crate, the compositor's terminal, can mount it.
+either side is no link, so a press costs the same in any line. td-term
+lives in td-compositor, which links no crate, so it mounts `links.rs`
+and `open.rs` by path as td-ui mounts the compositor's font and wire,
+and its recipe stages them; `open` reads only `crate::links`, which the
+mount provides (td-compositor/DESIGN.md §11).
 td-editor's controller maps a surface pixel to the glyph under it
 (`Controller::link_at`, read-only) and the program follows what it
 answers: a press over a link opens it and is not the document's press,
@@ -1853,15 +1856,19 @@ a word holding `{url}` has it replaced by the link (quotes put around the
 bare placeholder are taken off), and a command without one gets the link
 as its last word. The child's standard streams are `/dev/null`, its
 environment is the program's without `WAYLAND_SOCKET` (so the browser
-cannot speak on the program's display connection), and it is reaped on
-its own thread, so the window's loop never waits on it; the program
-reports the program started, or why none was, in its status. A
-`WAYLAND_SOCKET` descriptor the program inherited without close-on-exec
-is still inherited by the browser, as by any child: the client
-duplicates it and leaves the original alone. td's launchers pass
-`WAYLAND_DISPLAY`. The pins in `tests/confinement.rs` hold `BROWSER` as
-the one environment read outside tests and the `WAYLAND_SOCKET`
-removal.
+cannot speak on the program's display connection) and, through
+`open::link_on`, with `WAYLAND_DISPLAY` set to a path the caller names
+(td-term, whose own environment need not name the socket it dials, names
+that socket, made absolute so the browser's libwayland does not resolve
+it under `XDG_RUNTIME_DIR`), and it is reaped on its own thread, so the
+window's loop never waits on it; the program reports the program
+started, or why none was, in its status. A `WAYLAND_SOCKET` descriptor
+the program inherited without close-on-exec is still inherited by the
+browser, as by any child: the client duplicates it and leaves the
+original alone. td's launchers pass `WAYLAND_DISPLAY`. The pins in
+`tests/confinement.rs` hold `BROWSER` as the one environment read
+outside tests, the `WAYLAND_SOCKET` removal and the named
+`WAYLAND_DISPLAY`.
 
 ## Shared tree table
 

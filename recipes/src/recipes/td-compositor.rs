@@ -18,6 +18,8 @@ const MODULES: &[(&str, &str)] = &[
         "app_policy",
         include_str!("../../../td-busd/src/app_policy.rs"),
     ),
+    ("links", include_str!("../../../td-ui/src/links.rs")),
+    ("open", include_str!("../../../td-ui/src/open.rs")),
     (
         "attention",
         include_str!("../../../td-compositor/src/attention.rs"),
