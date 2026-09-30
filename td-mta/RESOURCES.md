@@ -786,15 +786,29 @@ must negotiate TLS 1.3, authenticate the relay's server name, leave the inbound
 SMTP peer unauthenticated, and release both handshake permits upon completion.
 One thread drives both endpoints with bounded progress loops and fixed time.
 
-Eleven snapshots cover baseline, generated material, resolved configuration,
-compiled generation, four reserved buffers and socket setup, constructed
-connections, handshake completion, one 16 KiB transfer in each direction,
-32 additional transfers in each direction, released connections retaining their
-returned buffers, and complete owner destruction. Each transfer verifies all
-plaintext bytes. Snapshot storage is fixed and output follows owner destruction.
-The columns match the outbound lifecycle observations; row prefixes are
+Thirteen snapshots cover baseline, generated material, resolved
+configuration, compiled generation, four reserved buffers and socket setup,
+constructed connections, handshake completion, one 16 KiB transfer in each
+direction, 32 additional transfers in each direction, client release with
+the server and all returned buffers retained, release of both connections
+with all four buffers retained, explicit release of those buffers, and
+complete owner destruction. Each transfer verifies all plaintext bytes.
+Snapshot storage is fixed and output follows owner destruction. The columns
+match the outbound lifecycle observations. Row prefixes are
 `tls-rust-handshake` and `tls-native-handshake`. The builder accepts only the
-ordered handshake schema and gives each process a distinct command log.
+ordered handshake schema and gives each process a distinct command log. The
+handshake and large-chain completion records use allocation schema v2;
+client, entropy and fragmented-input allocation records remain v1.
+
+The repeated-to-client_released and client_released-to-released requested-byte
+deltas show state released by each endpoint while shared generation/material
+and wire reservations remain alive. They exclude fixed object/stack storage,
+shared ownership and process-lifetime provider state; they are not complete
+session costs. Releasing the four returned buffers must remove exactly
+73748 requested bytes in each counter domain and four native tracked blocks.
+This pins their allocation ownership independently of endpoint state. RSS
+observes the same phases but does not require an equivalent resident decrease;
+allocator retention and page accounting differ from requested-byte ownership.
 
 Warm repeated records must retain no additional requested Rust bytes or tracked
 C boundary bytes/blocks. This is a retention check, not a zero-call assertion:
@@ -874,7 +888,7 @@ The complete PEM chain must exceed 60 KiB and fit the loader's 64 KiB input
 ceiling; this tests a large admitted chain, not every maximum encoding.
 Ordinary fixtures retain their original certificate shape without padding.
 
-The eleven phases and columns match the ordinary handshake scenario, with
+The thirteen phases and columns match the ordinary handshake scenario, with
 `tls-rust-large-chain` and `tls-native-large-chain` prefixes. Require
 authenticated server name, TLS 1.3, returned handshake permits, verified
 bidirectional 16 KiB
@@ -905,7 +919,7 @@ claim. Those controls run separately so they do not warm scenario processes.
 
 The existing phase names are retained. Rows have `rss SCENARIO PHASE KIB`,
 where SCENARIO is client, handshake, entropy, fragment or large-chain;
-`rss-observation-v1: SCENARIO passed` closes each output. Samples use fixed
+`rss-observation-v2: SCENARIO passed` closes each output. Samples use fixed
 arrays and are formatted after scenario teardown. Positive controls use the
 control scenario with baseline, touched and dropped phases.
 

@@ -129,13 +129,22 @@ fn tls_handshake() {
         samples.get(8).unwrap().live,
         "warm records retained Rust bytes"
     );
+    assert_eq!(
+        samples
+            .get(10)
+            .unwrap()
+            .live
+            .checked_sub(samples.get(11).unwrap().live),
+        Some(4 * td_mta::tls_io::TLS_WIRE_BYTES),
+        "returned wire buffers did not release their requested bytes"
+    );
     for (phase, s) in tls_handshake_scenario::PHASES.into_iter().zip(samples) {
         println!(
             "tls-rust-handshake {phase} {} {} {} {} {} {} {}",
             s.alloc, s.zeroed, s.realloc, s.free, s.failed, s.live, s.peak
         );
     }
-    println!("tls-handshake-allocation-v1: rust passed");
+    println!("tls-handshake-allocation-v2: rust passed");
 }
 
 fn tls_large_chain() {
@@ -151,13 +160,22 @@ fn tls_large_chain() {
         samples.get(8).unwrap().live,
         "warm records retained Rust bytes"
     );
+    assert_eq!(
+        samples
+            .get(10)
+            .unwrap()
+            .live
+            .checked_sub(samples.get(11).unwrap().live),
+        Some(4 * td_mta::tls_io::TLS_WIRE_BYTES),
+        "returned wire buffers did not release their requested bytes"
+    );
     for (phase, s) in tls_handshake_scenario::PHASES.into_iter().zip(samples) {
         println!(
             "tls-rust-large-chain {phase} {} {} {} {} {} {} {}",
             s.alloc, s.zeroed, s.realloc, s.free, s.failed, s.live, s.peak
         );
     }
-    println!("tls-large-chain-allocation-v1: rust passed");
+    println!("tls-large-chain-allocation-v2: rust passed");
 }
 
 #[path = "support/tls_fragment_scenario.rs"]

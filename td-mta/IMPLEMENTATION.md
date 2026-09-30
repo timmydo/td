@@ -918,6 +918,14 @@ Implement the remaining work as independently reviewable increments:
     capacity refusal. This narrows one queue bound; retained and temporary
     memory, complete generations and total session admission remain pending.
 
+  - **M07e4b — endpoint and wire-buffer release observations:** split the local
+    and large-chain teardown checkpoints into client release, remaining-server
+    release and one checkpoint dropping all four returned buffers. Both counter
+    domains require the exact requested wire bytes to disappear; native
+    tracking also checks four blocks. RSS samples the same checkpoints without
+    asserting allocator release. Shared state, fixed objects and transient peaks
+    remain separate.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,

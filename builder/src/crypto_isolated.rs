@@ -540,7 +540,9 @@ fn tls_handshake_evidence(output: &str, native: bool) -> Result<()> {
             "handshake",
             "record",
             "repeated",
+            "client_released",
             "released",
+            "buffers_released",
             "dropped",
         ],
     )
@@ -562,7 +564,9 @@ fn tls_large_chain_evidence(output: &str, native: bool) -> Result<()> {
             "handshake",
             "record",
             "repeated",
+            "client_released",
             "released",
+            "buffers_released",
             "dropped",
         ],
     )
@@ -639,7 +643,12 @@ fn tls_phase_evidence(
             return Err("wrong TLS allocation measurement width".into());
         }
     }
-    let success = format!("tls-{scenario}-allocation-v1: {domain} passed");
+    let version = if matches!(scenario, "handshake" | "large-chain") {
+        2
+    } else {
+        1
+    };
+    let success = format!("tls-{scenario}-allocation-v{version}: {domain} passed");
     if lines.next() != Some(success.as_str()) || lines.next().is_some() || !output.ends_with('\n') {
         return Err("invalid TLS allocation completion".into());
     }
@@ -680,7 +689,9 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
             "handshake",
             "record",
             "repeated",
+            "client_released",
             "released",
+            "buffers_released",
             "dropped",
         ],
         "entropy" => &[
@@ -722,7 +733,7 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
             return Err("invalid RSS observation".into());
         }
     }
-    let completion = format!("rss-observation-v1: {scenario} passed");
+    let completion = format!("rss-observation-v2: {scenario} passed");
     if lines.next() != Some(completion.as_str())
         || lines.next().is_some()
         || !output.ends_with('\n')
@@ -1593,8 +1604,44 @@ mod tests {
     }
 
     #[test]
+    fn rss_handshake_records_require_all_endpoint_release_phases() {
+        for scenario in ["handshake", "large-chain"] {
+            let mut output = String::new();
+            for phase in [
+                "baseline",
+                "material",
+                "config",
+                "generation",
+                "buffers",
+                "constructed",
+                "handshake",
+                "record",
+                "repeated",
+                "client_released",
+                "released",
+                "buffers_released",
+                "dropped",
+            ] {
+                output.push_str(&format!("rss {scenario} {phase} 100\n"));
+            }
+            output.push_str(&format!("rss-observation-v2: {scenario} passed\n"));
+            assert!(rss_evidence(&output, scenario).is_ok());
+            for bad in [
+                output.replace(&format!("rss {scenario} client_released 100\n"), ""),
+                output.replace(&format!("rss {scenario} buffers_released 100\n"), ""),
+                output.replace("client_released", "buffers_released"),
+                output.replace("buffers_released", "released"),
+                output.replace("-v2:", "-v1:"),
+                format!("{output}extra\n"),
+            ] {
+                assert!(rss_evidence(&bad, scenario).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn rss_records_require_positive_values_exact_phases_and_completion() {
-        let good = "rss control baseline 100\nrss control touched 17000\nrss control dropped 110\nrss-observation-v1: control passed\n";
+        let good = "rss control baseline 100\nrss control touched 17000\nrss control dropped 110\nrss-observation-v2: control passed\n";
         assert!(rss_evidence(good, "control").is_ok());
         assert!(rss_evidence(good, "client").is_err());
         assert!(rss_evidence(good, "unknown").is_err());
@@ -1610,6 +1657,7 @@ mod tests {
             assert!(rss_evidence(&bad, "control").is_err());
         }
         assert!(rss_evidence(good.trim_end(), "control").is_err());
+        assert!(rss_evidence(&good.replace("-v2:", "-v1:"), "control").is_err());
     }
 
     #[test]
@@ -1713,13 +1761,16 @@ mod tests {
                 "handshake",
                 "record",
                 "repeated",
+                "client_released",
                 "released",
+                "buffers_released",
                 "dropped",
             ] {
                 output.push_str(&format!("tls-{domain}-handshake {phase} {values}\n"));
             }
-            output.push_str(&format!("tls-handshake-allocation-v1: {domain} passed\n"));
+            output.push_str(&format!("tls-handshake-allocation-v2: {domain} passed\n"));
             assert!(tls_handshake_evidence(&output, native).is_ok());
+            assert!(tls_handshake_evidence(&output.replace("-v2:", "-v1:"), native).is_err());
             assert!(tls_handshake_evidence(&output, !native).is_err());
             assert!(tls_allocation_evidence(&output, native).is_err());
             for bad in [
@@ -1754,13 +1805,16 @@ mod tests {
                 "handshake",
                 "record",
                 "repeated",
+                "client_released",
                 "released",
+                "buffers_released",
                 "dropped",
             ] {
                 output.push_str(&format!("tls-{domain}-large-chain {phase} {values}\n"));
             }
-            output.push_str(&format!("tls-large-chain-allocation-v1: {domain} passed\n"));
+            output.push_str(&format!("tls-large-chain-allocation-v2: {domain} passed\n"));
             assert!(tls_large_chain_evidence(&output, native).is_ok());
+            assert!(tls_large_chain_evidence(&output.replace("-v2:", "-v1:"), native).is_err());
             assert!(tls_large_chain_evidence(&output, !native).is_err());
             assert!(tls_handshake_evidence(&output, native).is_err());
             for bad in [

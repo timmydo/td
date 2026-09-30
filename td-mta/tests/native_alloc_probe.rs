@@ -79,11 +79,31 @@ fn tls_handshake() {
         samples.get(8).unwrap().1.blocks,
         "warm records retained C boundary blocks"
     );
+    assert_eq!(
+        samples
+            .get(10)
+            .unwrap()
+            .1
+            .bytes
+            .checked_sub(samples.get(11).unwrap().1.bytes),
+        Some(4 * td_mta::tls_io::TLS_WIRE_BYTES),
+        "returned wire buffers did not release their requested bytes"
+    );
+    assert_eq!(
+        samples
+            .get(10)
+            .unwrap()
+            .1
+            .blocks
+            .checked_sub(samples.get(11).unwrap().1.blocks),
+        Some(4),
+        "returned wire buffers did not release four tracked blocks"
+    );
     for (phase, (c, s)) in tls_handshake_scenario::PHASES.into_iter().zip(samples) {
         let [malloc, calloc, realloc, free, posix, aligned] = c;
         println!("tls-native-handshake {phase} {malloc} {calloc} {realloc} {free} {posix} {aligned} {} {} {}", s.blocks, s.bytes, s.peak);
     }
-    println!("tls-handshake-allocation-v1: native passed");
+    println!("tls-handshake-allocation-v2: native passed");
 }
 
 #[cfg(td_native_alloc_probe)]
@@ -106,11 +126,31 @@ fn tls_large_chain() {
         samples.get(8).unwrap().1.blocks,
         "warm records retained C boundary blocks"
     );
+    assert_eq!(
+        samples
+            .get(10)
+            .unwrap()
+            .1
+            .bytes
+            .checked_sub(samples.get(11).unwrap().1.bytes),
+        Some(4 * td_mta::tls_io::TLS_WIRE_BYTES),
+        "returned wire buffers did not release their requested bytes"
+    );
+    assert_eq!(
+        samples
+            .get(10)
+            .unwrap()
+            .1
+            .blocks
+            .checked_sub(samples.get(11).unwrap().1.blocks),
+        Some(4),
+        "returned wire buffers did not release four tracked blocks"
+    );
     for (phase, (c, s)) in tls_handshake_scenario::PHASES.into_iter().zip(samples) {
         let [malloc, calloc, realloc, free, posix, aligned] = c;
         println!("tls-native-large-chain {phase} {malloc} {calloc} {realloc} {free} {posix} {aligned} {} {} {}", s.blocks, s.bytes, s.peak);
     }
-    println!("tls-large-chain-allocation-v1: native passed");
+    println!("tls-large-chain-allocation-v2: native passed");
 }
 
 #[cfg(td_native_alloc_probe)]

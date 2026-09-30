@@ -92,7 +92,7 @@ fn controls() {
     assert!(live.checked_sub(before).unwrap() >= 8 * 1024);
     drop(touched);
     let dropped = observer.sample();
-    println!("rss control baseline {before}\nrss control touched {live}\nrss control dropped {dropped}\nrss-observation-v1: control passed");
+    println!("rss control baseline {before}\nrss control touched {live}\nrss control dropped {dropped}\nrss-observation-v2: control passed");
 }
 
 fn observe<const N: usize>(scenario: &str, phases: [&str; N], run: impl FnOnce(&mut dyn FnMut())) {
@@ -104,7 +104,7 @@ fn observe<const N: usize>(scenario: &str, phases: [&str; N], run: impl FnOnce(&
     for (phase, rss) in phases.into_iter().zip(samples) {
         println!("rss {scenario} {phase} {rss}");
     }
-    println!("rss-observation-v1: {scenario} passed");
+    println!("rss-observation-v2: {scenario} passed");
 }
 
 fn main() {

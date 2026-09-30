@@ -25,7 +25,7 @@ use td_mta::{
     transport::TcpTransport,
 };
 
-pub const PHASES: [&str; 11] = [
+pub const PHASES: [&str; 13] = [
     "baseline",
     "material",
     "config",
@@ -35,7 +35,9 @@ pub const PHASES: [&str; 11] = [
     "handshake",
     "record",
     "repeated",
+    "client_released",
     "released",
+    "buffers_released",
     "dropped",
 ];
 const SOURCE: &str = r#"version = 1
@@ -299,9 +301,13 @@ fn run_profile(large: bool, mut observe: impl FnMut()) {
         }
         observe();
         let client_buffers = client.into_buffers().unwrap();
+        observe();
         let server_buffers = server.into_buffers().unwrap();
         observe();
         black_box((&client_buffers, &server_buffers));
+        drop(client_buffers);
+        drop(server_buffers);
+        observe();
     }
     observe();
 }

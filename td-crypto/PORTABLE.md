@@ -824,8 +824,8 @@ A separate `--tls-handshake` process per counter domain additionally qualifies
 the local TLS 1.3 observation path. It generates synthetic material, completes
 an admitted loopback pair, transfers verified 16 KiB records in both directions,
 and requires stable retained requested bytes across repeated transfers. All
-eleven ordered rows are validated before logging. These representative requested
-allocation observations do not establish TLS memory ceilings or RSS bounds.
+thirteen ordered rows are validated before logging. These representative
+requested allocation observations do not establish TLS memory ceilings or RSS bounds.
 
 Each domain additionally runs `--entropy-workers` in a fresh process. Seven
 ordered rows record startup of eight test workers, cold RNG work on one then
@@ -847,10 +847,17 @@ This is an untrusted-input diagnostic, not a complete TLS/session/RSS bound.
 The fresh `--tls-large-chain` processes reuse the local authenticated TLS 1.3
 scenario with a signed leaf/intermediate/root chain above 60 KiB of PEM but
 within the local loader's 64 KiB limit. Each padded certificate remains within
-16 KiB DER. Eleven ordered observations and exact completion use a separate
+16 KiB DER. Thirteen ordered observations and exact completion use a separate
 large-chain schema and log per domain. Both endpoints and retained fixture
 material are included; successful large-chain traffic is not a total service,
 maximum-profile or RSS qualification.
+
+Handshake and large-chain allocation records use schema v2 with separate
+client, remaining-server and returned-wire-buffer release checkpoints. The
+counter probes require exactly 73748 requested bytes to disappear when the
+four returned buffers drop; native tracking additionally requires four fewer
+blocks. Other allocation scenarios retain v1. Endpoint release deltas exclude
+shared state and stack storage.
 
 ## Mail sampled RSS diagnostic artifact
 
@@ -871,3 +878,8 @@ support or malformed/truncated rollup output fails qualification.
 RESOURCES.md in td-mta defines the observation scope. These are sampled whole
 fixture process values, including stacks and observer state. They do not
 establish transient peaks, isolate provider costs or qualify service admission.
+
+RSS completion records use v2 for every scenario, with the same additional
+handshake release phases. The runner rejects earlier completion versions and
+missing/reordered phases. An RSS delta is not required to match a requested
+allocation delta.
