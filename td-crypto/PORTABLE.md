@@ -278,10 +278,16 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   test-target/profile, static ELF and isolated-runtime checks as the other
   qualification binaries; it is not an installed service dependency.
 - `td-mta-transport-smoke`: the `--lib --no-run` td-mta test executable,
-  selected by its `td_mta` library target and test profile. Fifty-three
+  selected by its `td_mta` library target and test profile. Fifty-nine
   exact SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases execute
   individually under the existing deadline and positive-one-test verdict
-  requirement. Eight SMTP control-framing cases cover fragmented strict CRLF,
+  requirement. Six inbound STARTTLS cases cover reserved-session ownership,
+  framed bare commands and tails, short writes/complete flush, deadlines and
+  refusal cleanup, direct TCP/TLS handoff and private gateway STARTTLS with
+  TLS 1.2/1.3 pin acceptance/refusal. The private peer waits for the exact
+  plaintext 220 before starting TLS. These start at the STARTTLS command
+  boundary; complete greeting/EHLO/transaction/reset semantics remain pending.
+  Eight SMTP control-framing cases cover fragmented strict CRLF,
   line/reply ceilings, multiline code agreement, exact tails, bare final codes,
   malformed syntax and EHLO greeting/extension separation. They also cover
   complete TLS policy compilation and HTTPS name subsets, reader

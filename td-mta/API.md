@@ -500,7 +500,9 @@ before TLS progress, abort both handles on refusal, and return the two original
 wire arrays. Constructor deadline/clock refusal has the same recovery path.
 The runtime must reserve before SMTP 220, flush that reply completely before
 handoff and bound the queued job lifetime. The adapter cannot prove protocol
-framing or flush from an empty slice; those transitions remain M07d3c.
+framing or flush from an empty slice. ServerStartTls below implements the
+inbound reply boundary; full state reset and outbound upgrades remain
+protocol integration work.
 
 TlsConnection implements TlsTransport and Transport, with private native state,
 a retained generation, handshake permit and two preallocated wire reservations.
@@ -594,6 +596,43 @@ These readers borrow existing SMTP/outbound scratch; they allocate nothing
 and add no resource reservation or service listener. The 512-byte reader is
 for base control lines; M10 must add the larger MAIL command ceilings required
 by advertised SIZE/8BITMIME before using it for the complete receiver.
+
+### 1.10 Inbound STARTTLS reply ownership
+
+`tls_policy::ServerStartTls` consumes a prepared native session and the
+exclusive TcpTransport before sending any 220 bytes. Construction requires a
+complete LineReader containing bare, case-insensitive STARTTLS, an empty
+unread tail, a DirectSmtp/GatewaySmtp policy and valid fixed whole/handshake
+deadlines. Refusal aborts the socket and destroys native state before returning
+the original two wire buffers and releasing the handshake/generation owners.
+No plaintext response is emitted on constructor refusal. The SMTP driver
+validates command sequencing and emits any syntax/temporary refusal before
+entering this owner; this primitive does not replace the command dispatcher.
+
+`advance(self)` performs one bounded write or flush and returns Pending with
+ownership, or consumes the owner into TlsConnection only after the entire
+220 reply and flush complete. Short writes and Pending preserve the offset;
+invalid counts, clock/transport errors or deadline expiry abort and return
+SessionRefusal with both buffers. Time is checked before and after each
+operation; crossing the deadline can occur after bytes were already sent.
+There is no plaintext fallback and no renewed deadline. The returned TLS
+connection still requires a successful verified handshake before application
+I/O. Explicit cancellation returns the reserved buffers; Drop closes/releases
+owned resources without inventing a pool return queue.
+
+The trusted driver supplies the reader and exact tail from this socket,
+drains any other plaintext output, retains no other plaintext input, and
+supplies a still-authorized retained generation. This owner does not prove
+that caller context or implement an actual-current mutation fence. Full
+SMTP parser, EHLO/extension, authentication and transaction-state reset after
+successful TLS remains M10/M13 integration. Outbound STARTTLS remains M17.
+Tests cover short writes/flush backpressure, clock/deadline/refusal cleanup,
+real direct SMTP handoff and private gateway client-certificate peers under
+TLS 1.2/1.3. These fixtures start at the STARTTLS command boundary; they do not
+implement the initial SMTP greeting/EHLO or the complete mail protocol.
+Existing session/wire reservations are retained; no worker, allocation or
+resource allowance is added. M07e still gates whole native/session resource
+qualification before service activation.
 
 ## 2. Read views and change history
 

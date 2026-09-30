@@ -5,6 +5,8 @@ mod client_tests;
 mod gateway_process_tests;
 #[path = "tls_policy_io_tests.rs"]
 mod io_tests;
+#[path = "tls_policy_starttls_tests.rs"]
+mod starttls_tests;
 use super::*;
 use crate::{
     clock::TlsClockSource,

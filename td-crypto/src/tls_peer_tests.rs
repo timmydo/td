@@ -67,13 +67,27 @@ fn gateway_client_process() {
     .unwrap();
     let connection =
         rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()).unwrap();
-    let socket = TcpStream::connect_timeout(&address, Duration::from_secs(3)).unwrap();
+    let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(3)).unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
     socket
         .set_write_timeout(Some(Duration::from_secs(3)))
         .unwrap();
+    match std::env::var("TD_MTA_TEST_PEER_TRANSPORT")
+        .unwrap()
+        .as_str()
+    {
+        "implicit" => {}
+        "starttls" => {
+            socket.write_all(b"STARTTLS\r\n").unwrap();
+            socket.flush().unwrap();
+            let mut reply = [0; b"220 2.0.0 Ready to start TLS\r\n".len()];
+            socket.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"220 2.0.0 Ready to start TLS\r\n");
+        }
+        _ => panic!("invalid fixture transport"),
+    }
     let mut stream = rustls::StreamOwned::new(connection, socket);
     stream.write_all(b"EHLO gateway\r\n").unwrap();
     stream.flush().unwrap();

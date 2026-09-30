@@ -66,7 +66,7 @@ fn material() -> (Material, Vec<u8>, Vec<u8>, [u8; 32]) {
     )
 }
 
-fn exercise(version: &str, next: bool, bad_pin: bool, bad_peer: bool) {
+fn exercise(version: &str, next: bool, bad_pin: bool, bad_peer: bool, starttls: bool) {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let _serial = serial();
     let (material, client_chain, client_key, pin) = material();
@@ -126,6 +126,10 @@ fn exercise(version: &str, next: bool, bad_pin: bool, bad_peer: bool) {
             )
             .env("TD_MTA_TEST_PEER_MATERIAL", &directory.0)
             .env("TD_MTA_TEST_PEER_VERSION", version)
+            .env(
+                "TD_MTA_TEST_PEER_TRANSPORT",
+                if starttls { "starttls" } else { "implicit" },
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -151,15 +155,47 @@ fn exercise(version: &str, next: bool, bad_pin: bool, bad_peer: bool) {
         }
     };
     let cap = Deadline::after(Tick(0), 1000).unwrap();
-    let mut connection = reservation
-        .handoff(
-            TcpTransport::from_stream(socket).unwrap(),
-            &[],
+    let mut plain = TcpTransport::from_stream(socket).unwrap();
+    let mut connection = if starttls {
+        let mut scratch = [0; crate::smtp_wire::LINE_BYTES];
+        let mut reader = crate::smtp_wire::LineReader::new(&mut scratch).unwrap();
+        let mut input = [0; crate::smtp_wire::LINE_BYTES];
+        let tail = loop {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            match plain.read(&mut input).unwrap() {
+                IoProgress::Bytes(n) => {
+                    let progress = reader.feed(&input[..n]).unwrap();
+                    if progress.complete {
+                        break progress.consumed..n;
+                    }
+                }
+                IoProgress::Pending => std::thread::yield_now(),
+                IoProgress::Closed => panic!("peer closed before STARTTLS"),
+            }
+        };
+        let mut owner = ServerStartTls::new(
+            reservation,
+            plain,
+            &reader,
+            &input[tail],
             material.source.clone(),
             cap,
             cap,
         )
+        .ok()
         .unwrap();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            match owner.advance().ok().unwrap() {
+                ServerUpgradeProgress::Pending(next) => owner = next,
+                ServerUpgradeProgress::Tls(connection) => break connection,
+            }
+        }
+    } else {
+        reservation
+            .handoff(plain, &[], material.source.clone(), cap, cap)
+            .unwrap()
+    };
     let handshake = loop {
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -227,14 +263,22 @@ fn exercise(version: &str, next: bool, bad_pin: bool, bad_peer: bool) {
 #[test]
 fn gateway_mutual_tls_accepts_current_and_next_verified_leaf_pins() {
     for version in ["1.2", "1.3"] {
-        exercise(version, false, false, false);
-        exercise(version, true, false, false);
+        exercise(version, false, false, false, false);
+        exercise(version, true, false, false, false);
     }
 }
 #[test]
 fn gateway_mutual_tls_refuses_verified_leaf_with_wrong_pin_or_actual_peer() {
     for version in ["1.2", "1.3"] {
-        exercise(version, false, true, false);
-        exercise(version, false, false, true);
+        exercise(version, false, true, false, false);
+        exercise(version, false, false, true, false);
+    }
+}
+
+#[test]
+fn gateway_starttls_process_requires_verified_pin_after_plaintext_reply() {
+    for version in ["1.2", "1.3"] {
+        exercise(version, false, false, false, true);
+        exercise(version, false, true, false, true);
     }
 }

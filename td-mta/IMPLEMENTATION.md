@@ -823,7 +823,17 @@ Implement the remaining work as independently reviewable increments:
         EHLO extension syntax excludes the initial greeting. Boundary, malformed,
         fragmented, aggregate-cap and tail fixtures run on host and musl.
         The parser does not own sockets, deadlines or command state. STARTTLS
-        reservation/flush/reset transitions and protocol drivers remain pending.
+        inbound reply ownership is described next; complete reset/dispatch and
+        outbound protocol drivers remain pending.
+      - **Inbound reply ownership:** implemented ServerStartTls consuming the
+        prepared session and socket before 220. Validate the framed bare command,
+        tail, receiving role and deadlines. One bounded operation per advance
+        writes/drains the complete reply before TLS handoff; refusal/cancellation
+        recover both wire reservations and release native/generation/count owners.
+        Direct local and private gateway process fixtures qualify the boundary,
+        including TLS 1.2/1.3 pin acceptance/refusal. Full command sequencing,
+        SMTP state reset, actual-current fencing and outbound STARTTLS remain
+        protocol integration work.
 - **M07e — resource/service admission:** qualify complete generation overlap,
   session/handshake peaks, worker entropy and Rust/native stack/allocation/RSS
   on the portable artifact before activating the adapters. Amend the checked
