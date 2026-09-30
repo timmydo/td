@@ -190,6 +190,13 @@ enum Mode {
         deployment_id: String,
         loop_device: PathBuf,
     },
+    /// Stage the live volume's contents for `mkfs.btrfs --rootdir` from the
+    /// medium `live-root` left mounted.
+    LiveSeed {
+        mountpoint: PathBuf,
+        deployment_id: String,
+        seed: PathBuf,
+    },
 }
 
 struct Manifest {
@@ -264,7 +271,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>",
+        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>\n       td-boot live-seed <mountpoint> <deployment-id> <seed-directory>",
     )
 }
 
@@ -393,6 +400,19 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
                 mountpoint: PathBuf::from(mountpoint),
                 deployment_id,
                 loop_device: PathBuf::from(loop_device),
+            })
+        }
+        Some(mode) if mode == OsStr::new("live-seed") => {
+            let mountpoint = args.next().ok_or_else(usage_error)?;
+            let deployment_id = parse_deployment_id(args.next().ok_or_else(usage_error)?)?;
+            let seed = args.next().ok_or_else(usage_error)?;
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::LiveSeed {
+                mountpoint: PathBuf::from(mountpoint),
+                deployment_id,
+                seed: PathBuf::from(seed),
             })
         }
         Some(mode) if mode == OsStr::new("root-loop") => {
@@ -3502,20 +3522,20 @@ fn run_live_boot(mountpoint: &Path, base_cmdline: &OsStr) -> io::Result<()> {
     result
 }
 
-/// The live handoff must name the deployment `live-root` was given.
+/// The live handoff must name the deployment a live verb was given.
 ///
 /// The deployment init reads its id from the same line, so this is defence in
 /// depth: an argv id the selector did not authenticate is refused.
 fn require_live_handoff(cmdline: &[u8], deployment_id: &str) -> io::Result<()> {
     if !cmdline_has_token(cmdline, protocol::LIVE_CMDLINE_TOKEN.as_bytes()) {
         return Err(invalid(format!(
-            "live-root requires the live selector's {} handoff",
+            "the live verbs require the live selector's {} handoff",
             protocol::LIVE_CMDLINE_TOKEN
         )));
     }
     if !cmdline_has_token(cmdline, format!("td.deployment={deployment_id}").as_bytes()) {
         return Err(invalid(format!(
-            "live-root was given deployment {deployment_id}, which the handoff does not name"
+            "a live verb was given deployment {deployment_id}, which the handoff does not name"
         )));
     }
     Ok(())
@@ -3561,6 +3581,80 @@ fn run_live_root(mountpoint: &Path, deployment_id: &str, loop_device: &Path) -> 
         best_effort_unmount(mountpoint);
     }
     result
+}
+
+/// The live volume's contents, staged for `mkfs.btrfs --rootdir`.
+///
+/// Only what the booted system reads from its volume: `current` naming the
+/// running deployment, that deployment's manifest and signature, an empty
+/// update channel and the `@var` directory. The payloads stay on the medium,
+/// which `live-root` has already bound. Modes are set rather than masked, as
+/// td-install's seed does, because `--rootdir` copies them verbatim.
+///
+/// The signature is copied, not checked: only the manifest is bound to the
+/// id, and nothing on a live volume authenticates it again. Everything is read
+/// before anything is created, and `/init` has no retry, so a failed write
+/// leaving part of a tree is not a case to recover from.
+fn live_seed(medium: &Path, deployment_id: &str, seed: &Path) -> io::Result<()> {
+    require_absolute(seed, "live seed")?;
+    require_real_directory(medium, "install medium")?;
+    let manifest = media_manifest(medium)?;
+    let id = sha256::hex_digest(&manifest);
+    if id != deployment_id {
+        return Err(invalid(format!(
+            "install medium holds deployment {id}, not the selected {deployment_id}"
+        )));
+    }
+    let signature = read_bounded_real_file(
+        &medium.join(media_name(protocol::MANIFEST_SIG_NAME)?),
+        "install medium deployment signature",
+        protocol::MAX_SIGNATURE_BYTES,
+    )?;
+    let deployment = format!("{}/{id}", protocol::DEPLOYMENTS_DIR);
+    // `seed` first and alone may not exist yet: a stale tree would otherwise
+    // become the volume's contents.
+    for directory in [
+        "",
+        "td",
+        protocol::BOOT_DIR,
+        protocol::DEPLOYMENTS_DIR,
+        protocol::VOLUME_CHANNEL_DIR,
+        &deployment,
+        protocol::VOLUME_SUBVOL,
+    ] {
+        let path = seed.join(directory);
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+    }
+    let directory = seed.join(&deployment);
+    for (name, bytes) in [
+        (protocol::MANIFEST_NAME, manifest.as_slice()),
+        (protocol::MANIFEST_SIG_NAME, signature.as_slice()),
+    ] {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(name))?;
+        file.write_all(bytes)?;
+        file.set_permissions(fs::Permissions::from_mode(0o644))?;
+    }
+    symlink(
+        format!("{}{id}", protocol::SELECTOR_PREFIX),
+        seed.join(protocol::BOOT_DIR).join(protocol::CURRENT_SLOT),
+    )
+}
+
+fn run_live_seed(mountpoint: &Path, deployment_id: &str, seed: &Path) -> io::Result<()> {
+    require_live_handoff(
+        &read_bounded_real_file(
+            Path::new("/proc/cmdline"),
+            "kernel command line",
+            MAX_CMDLINE_BYTES as u64,
+        )?,
+        deployment_id,
+    )?;
+    live_seed(mountpoint, deployment_id, seed)
 }
 
 fn run() -> io::Result<()> {
@@ -3683,6 +3777,11 @@ fn dispatch(mode: Mode) -> io::Result<()> {
             deployment_id,
             loop_device,
         } => run_live_root(&mountpoint, &deployment_id, &loop_device),
+        Mode::LiveSeed {
+            mountpoint,
+            deployment_id,
+            seed,
+        } => run_live_seed(&mountpoint, &deployment_id, &seed),
     }
 }
 
@@ -7710,5 +7809,79 @@ mod tests {
             .unwrap();
         assert!(body.contains("live_trust_root(Path::new(BOOT_ROOTFS))?"));
         assert!(!body.contains("read_boot_trust_root("));
+    }
+
+    #[test]
+    fn a_live_seed_holds_only_what_the_booted_system_reads_from_its_volume() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let (medium, id) = media_bundle(&fixture);
+        let seed = fixture.root.join("seed");
+        live_seed(&medium, &id, &seed).unwrap();
+
+        let mut found = Vec::new();
+        let mut pending = vec![seed.clone()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                let relative = path.strip_prefix(&seed).unwrap().display().to_string();
+                if metadata.is_dir() {
+                    pending.push(path);
+                }
+                found.push((relative, metadata.permissions().mode() & 0o7777));
+            }
+        }
+        found.sort();
+        let deployment = format!("td/deployments/{id}");
+        let mut expected = vec![
+            ("@var".to_string(), 0o755),
+            ("td".to_string(), 0o755),
+            ("td/boot".to_string(), 0o755),
+            ("td/boot/current".to_string(), 0o777),
+            ("td/deployments".to_string(), 0o755),
+            (deployment.clone(), 0o755),
+            (format!("{deployment}/manifest"), 0o644),
+            (format!("{deployment}/manifest.sig"), 0o644),
+            ("td/incoming".to_string(), 0o755),
+        ];
+        expected.sort();
+        assert_eq!(found, expected);
+        assert_eq!(read_selector(&seed, "current").unwrap(), id);
+        assert_eq!(
+            fs::read(seed.join(&deployment).join("manifest")).unwrap(),
+            fs::read(medium.join("manifest")).unwrap()
+        );
+        assert_eq!(
+            fs::read(seed.join(&deployment).join("manifest.sig")).unwrap(),
+            fs::read(medium.join("manifest.sig")).unwrap()
+        );
+
+        // A stale tree is never reused as a volume's contents.
+        assert!(live_seed(&medium, &id, &seed).is_err());
+        let other = fixture.root.join("other-seed");
+        let error = live_seed(&medium, &"c".repeat(64), &other).err().unwrap();
+        assert!(error.to_string().contains("not the selected"), "{error}");
+        assert!(!other.exists(), "a refused seed left a tree behind");
+        assert!(live_seed(&medium, &id, Path::new("relative")).is_err());
+    }
+
+    #[test]
+    fn live_seed_verb_takes_exact_operands() {
+        let id = "a".repeat(64);
+        assert!(matches!(
+            parse_args(args(&["live-seed", "/media", &id, "/live-seed"])).unwrap(),
+            Mode::LiveSeed { .. }
+        ));
+        for bad in [
+            vec!["live-seed", "/media", &id],
+            vec!["live-seed", "/media", "not-an-id", "/live-seed"],
+            vec!["live-seed", "/media", &id, "/live-seed", "extra"],
+        ] {
+            assert!(parse_args(args(&bad)).is_err(), "{bad:?}");
+        }
+        assert!(usage_error()
+            .to_string()
+            .contains("td-boot live-seed <mountpoint> <deployment-id> <seed-directory>"));
     }
 }

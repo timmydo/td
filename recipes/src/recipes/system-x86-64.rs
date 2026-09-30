@@ -2076,15 +2076,24 @@ fn build_td_svc_conf() -> String {
 /// The firmware/direct-boot initramfs always selects through td-boot and kexecs
 /// the verified deployment. It has no selected-deployment branch, so an external
 /// kernel command line cannot bypass current/previous selection.
+///
+/// The live branch is chosen by a file only install media provisioning appends
+/// (td-install/MEDIA.md "Live boot"), never by the command line: td-boot
+/// refuses the live tokens in any base line.
 fn build_selector_init() -> String {
-    "#!/bin/sh\n\
-     set -e\n\
-     set -f\n\
-     /bin/mount -t devtmpfs dev /dev\n\
-     /bin/mount -t proc proc /proc\n\
-     /bin/mount -t sysfs sysfs /sys\n\
-     exec /bin/td-boot on-volume boot /volume \"$(/bin/td-util cat /proc/cmdline)\"\n"
-        .into()
+    format!(
+        "#!/bin/sh\n\
+         set -e\n\
+         set -f\n\
+         /bin/mount -t devtmpfs dev /dev\n\
+         /bin/mount -t proc proc /proc\n\
+         /bin/mount -t sysfs sysfs /sys\n\
+         if /bin/td-util test -e /{marker}; then\n\
+           exec /bin/td-boot live-boot /media \"$(/bin/td-util cat /proc/cmdline)\"\n\
+         fi\n\
+         exec /bin/td-boot on-volume boot /volume \"$(/bin/td-util cat /proc/cmdline)\"\n",
+        marker = td_boot_protocol::LIVE_MEDIA_MARKER_PATH,
+    )
 }
 
 #[cfg(test)]
@@ -2114,18 +2123,43 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/mount -t sysfs sysfs /sys\n\
      deployment=\n\
      deployment_seen=\n\
+     live=\n\
+     volume=\n\
      for word in $(/bin/td-util cat /proc/cmdline); do\n\
        case \"$word\" in\n\
          td.deployment=*) \
            /bin/td-util test -z \"$deployment_seen\" || { echo 'td-init: duplicate td.deployment handoff' >&2; exit 1; }; \
            deployment_seen=1; deployment=${word#td.deployment=} ;;\n\
+         td.live=1) live=1 ;;\n\
+         td.volume=*) volume=${word#td.volume=} ;;\n\
        esac\n\
      done\n\
      /bin/td-util test -n \"$deployment\" || { echo 'td-init: missing td.deployment handoff' >&2; exit 1; }\n\
-     /bin/td-boot on-volume mount-root /volume\n\
-     if ! /bin/td-util test -b /dev/loop0; then /bin/mknod /dev/loop0 b 7 0; fi\n\
-     /bin/td-boot root-loop /volume \"$deployment\" /dev/loop0\n\
-     /bin/mount -t erofs -o ro /dev/loop0 /sysroot\n\
+     if ! /bin/td-util test -b /dev/loop0; then /bin/mknod /dev/loop0 b 7 0; fi\n"
+        .to_string();
+    // A live boot (td-install/MEDIA.md "Live boot") binds the root image on the
+    // install medium and formats a volatile volume on brd's /dev/ram0 under the
+    // selector's fresh UUID; `on-volume mount-root` then finds it exactly as it
+    // finds an installed volume, and nothing after this differs. td-boot
+    // re-parses td.volume= strictly; the shell copy only names it to mkfs.
+    init.push_str(&format!(
+        "if /bin/td-util test -n \"$live\"; then\n\
+           /bin/td-util test -n \"$volume\" || {{ echo 'td-init: live boot without a td.volume handoff' >&2; exit 1; }}\n\
+           /bin/td-boot live-root /media \"$deployment\" /dev/loop0\n\
+           /bin/td-boot live-seed /media \"$deployment\" /live-seed\n\
+           /bin/{mkfs} --quiet --uuid \"$volume\" --label {label} --rootdir /live-seed \
+         --subvol rw:{subvol} /dev/ram0\n\
+           /bin/td-boot on-volume mount-root /volume\n\
+         else\n\
+           /bin/td-boot on-volume mount-root /volume\n\
+           /bin/td-boot root-loop /volume \"$deployment\" /dev/loop0\n\
+         fi\n",
+        mkfs = td_boot_protocol::MKFS_BTRFS,
+        label = td_boot_protocol::VOLUME_LABEL,
+        subvol = td_boot_protocol::VOLUME_SUBVOL,
+    ));
+    init.push_str(
+        "/bin/mount -t erofs -o ro /dev/loop0 /sysroot\n\
      /bin/td-boot on-volume mount-var /sysroot/var\n\
      /bin/td-util printf '%s\\n' 2 > /proc/sys/kernel/perf_event_paranoid\n\
      /bin/td-util test \"$(/bin/td-util cat /proc/sys/kernel/perf_event_paranoid)\" = 2 || { echo 'td-init: kernel.perf_event_paranoid did not realize the pinned value 2' >&2; exit 1; }\n\
@@ -2135,9 +2169,13 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/td-util chmod 0600 /sysroot/run/td-deployment\n\
      /bin/td-util mkdir -p /sysroot/run/td-volume\n\
      /bin/mount -o move /volume /sysroot/run/td-volume\n\
+     if /bin/td-util test -n \"$live\"; then\n\
+       /bin/td-util mkdir -p /sysroot/run/td-media\n\
+       /bin/mount -o move /media /sysroot/run/td-media\n\
+     fi\n\
      /bin/mount -t tmpfs -o mode=1777 tmpfs /sysroot/tmp\n\
-     /bin/td-util mkdir -p /sysroot/var/log /sysroot/var/home"
-        .to_string();
+     /bin/td-util mkdir -p /sysroot/var/log /sysroot/var/home",
+    );
     for user in sys.users {
         if gets_generic_persistent_home_setup(user) && user.uid != UI_UID {
             init.push_str(&format!(" /sysroot/var{}", user.home));
@@ -4072,6 +4110,18 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
             // `mknod` joins them for the same reason: only this /init creates
             // /dev/loop0, because only this one has a loop to bind.
             s.push_str("slink /bin/mknod {in:td-init}/bin/td-init 0777 0 0\n");
+            // Only a live boot's /init formats anything: its volatile volume on
+            // /dev/ram0. Static, so it runs before any root is mounted; its
+            // debug companion ships in the real root with the package.
+            s.push_str("dir {in:btrfs-progs-x86-64} 0755 0 0\n");
+            s.push_str("dir {in:btrfs-progs-x86-64}/bin 0755 0 0\n");
+            s.push_str(
+                "file {in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static \
+                 {in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static 0755 0 0\n",
+            );
+            s.push_str(
+                "slink /bin/mkfs.btrfs {in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static 0777 0 0\n",
+            );
         }
     }
     s.push_str("nod /dev/console 0600 0 0 c 5 1\n");
@@ -4299,6 +4349,17 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         .collect(),
         exec: false,
     });
+    // A live boot's deployment initramfs runs mkfs.btrfs from this package; the
+    // image carries the static binaries and their debug companions.
+    steps.push(Step::MkDir {
+        path: "{root}/real-root{in:btrfs-progs-x86-64}".into(),
+    });
+    for child in ["bin", "lib/debug"] {
+        steps.push(Step::CopyTree {
+            from: format!("{{in:btrfs-progs-x86-64}}/{child}"),
+            dest: format!("{{root}}/real-root{{in:btrfs-progs-x86-64}}/{child}"),
+        });
+    }
     // The QEMU HTTPS origin needs only LibreSSL's static command and its debug
     // companion. Keep the development archives and headers out of the image.
     steps.push(Step::MkDir {
@@ -4687,6 +4748,11 @@ fn shape_check() -> String {
      printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-init$' || { echo 'deployment initramfs: td-init store member missing - the switch_root and mount/umount symlinks would dangle' >&2; exit 1; }; \
      for l in \"$selector_list\" \"$init_list\"; do printf '%s\\n' \"$l\" | grep -qE '^td/store/[^/]+/bin/td-util$' || { echo 'initramfs: td-util store member missing - /bin/td-util would dangle and the /init would stop at its first cat/sleep under set -e, with no cause on the console' >&2; exit 1; }; done; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/switch_root; then echo 'selector initramfs: switch_root must be deployment-only - the selector kexecs, it never pivots' >&2; exit 1; fi; \
+     printf '%s\\n' \"$init_list\" | grep -q -x -F bin/mkfs.btrfs || { echo 'deployment initramfs: bin/mkfs.btrfs missing - a live boot could not format its volatile volume' >&2; exit 1; }; \
+     printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/mkfs[.]btrfs[.]static$' || { echo 'deployment initramfs: mkfs.btrfs store member missing - /bin/mkfs.btrfs would dangle' >&2; exit 1; }; \
+     if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/mkfs.btrfs; then echo 'selector initramfs: mkfs.btrfs must be deployment-only - the selector formats nothing' >&2; exit 1; fi; \
+     if printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/mkfs[.]btrfs[.]static$'; then echo 'selector initramfs: the mkfs.btrfs payload must be deployment-only' >&2; exit 1; fi; \
+     for p in mkfs.btrfs btrfs; do [ -f \"$root{in:btrfs-progs-x86-64}/lib/debug/bin/$p.static.debug\" ] || { echo \"root tree: $p lacks its debug companion\" >&2; exit 1; }; done; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/losetup || { echo 'deployment initramfs: bin/losetup missing - td-boot root-loop could not bind the verified root and the boot would stop there' >&2; exit 1; }; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/losetup; then echo 'selector initramfs: losetup must be deployment-only - the selector kexecs, it never binds a root loop' >&2; exit 1; fi; \
      [ \"$(wc -l < \"$selector_manifest\")\" -eq 2 ] || { echo 'selector manifest: expected header plus one payload entry' >&2; exit 1; }; \
@@ -5242,9 +5308,11 @@ pub fn recipe() -> Recipe {
         // td-busd: the static session D-Bus broker used by every Firefox launch.
         // td-portal: the static Settings service, activation supervisor, and
         //   unprivileged live client probe.
+        // btrfs-progs-x86-64: static mkfs.btrfs for a live boot's volatile volume.
         .native_inputs(&[
             "busybox-x86-64",
             "linux-x86-64",
+            "btrfs-progs-x86-64",
             "uutils",
             "ripgrep",
             "fd",
@@ -10433,6 +10501,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_live_branches_run_in_order_and_only_on_their_handoffs() {
+        let selector = build_selector_init();
+        let at = |text: &str, needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?}"))
+        };
+        // The selector branches on the provisioned marker, before the
+        // installed exec, and never on the command line.
+        let marker = format!("test -e /{}", td_boot_protocol::LIVE_MEDIA_MARKER_PATH);
+        assert!(
+            at(&selector, &marker) < at(&selector, "td-boot live-boot /media")
+                && at(&selector, "td-boot live-boot /media")
+                    < at(&selector, "td-boot on-volume boot /volume")
+        );
+        assert!(!selector.contains("td.live"));
+
+        let init = build_deployment_init(&SYSTEM);
+        let live = at(&init, "if /bin/td-util test -n \"$live\"; then");
+        let order = [
+            "mknod /dev/loop0 b 7 0",
+            "if /bin/td-util test -n \"$live\"; then",
+            "live boot without a td.volume handoff",
+            "/bin/td-boot live-root /media \"$deployment\" /dev/loop0",
+            "/bin/td-boot live-seed /media \"$deployment\" /live-seed",
+            "/bin/mkfs.btrfs --quiet --uuid \"$volume\" --label td-system --rootdir /live-seed",
+            "--subvol rw:@var /dev/ram0",
+            "/bin/td-boot on-volume mount-root /volume\nelse",
+            "/bin/td-boot root-loop /volume",
+            "mount -t erofs -o ro /dev/loop0 /sysroot",
+            "mount -t tmpfs -o mode=0755 tmpfs /sysroot/run",
+            "mount -o move /volume /sysroot/run/td-volume",
+            "/bin/mount -o move /media /sysroot/run/td-media",
+        ];
+        for pair in order.windows(2) {
+            assert!(at(&init, pair[0]) < at(&init, pair[1]), "{pair:?}");
+        }
+        assert!(at(&init, "td.live=1) live=1") < live);
+        // The medium moves only on a live boot.
+        let media = at(&init, "/bin/mount -o move /media");
+        let guard = init
+            .get(..media)
+            .and_then(|head| head.rfind("if /bin/td-util test -n \"$live\"; then"))
+            .unwrap();
+        let branch = init.get(guard..media).unwrap();
+        assert!(
+            branch.lines().all(|line| !matches!(
+                line.split_whitespace()
+                    .next()
+                    .map(|w| w.trim_end_matches(';')),
+                Some("fi" | "else" | "elif")
+            )),
+            "{branch}"
+        );
+    }
+
     /// The first pass must select through td-boot. The selected pass must bind
     /// root.erofs through td-boot, mount persistent @var, leave `/etc`
     /// untouched, and `exec switch_root` so the pivot inherits PID 1.
@@ -11562,11 +11686,13 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         const PAT: &str = "^td/store/[^/]+/bin/";
         let mut greps = 0usize;
         for (at, _) in check.match_indices(PAT) {
+            // `[.]` is the regex's literal dot, as in `mkfs[.]btrfs[.]static`.
             let name: String = check
                 .get(at + PAT.len()..)
                 .unwrap_or_default()
+                .replace("[.]", ".")
                 .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
                 .collect();
             greps += 1;
             // WHICH archive is asked is part of the claim: td-kexec is
@@ -11659,7 +11785,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // Exact for the same reason: a floor stays green while shape_check quietly
         // stops asking one archive for a payload the other still gets checked for.
         assert_eq!(
-            greps, 10,
+            greps, 12,
             "{greps} store-member greps found - the scan has gone stale"
         );
     }

@@ -186,7 +186,9 @@ and updating a deployment must never require writing to the ESP.
 true — `td-boot` reaches only `td-init` applets, and `losetup` moved into
 `td-init` precisely so that no absolute path to a foreign multicall sits
 between a machine and its root filesystem. This workstream does not
-reintroduce one. The single deliberate exception is at INSTALL time, D7.
+reintroduce one. The deliberate exception is D7's `mkfs.btrfs`: at INSTALL
+time, and on a LIVE boot, whose deployment initramfs formats its volatile
+volume with it (MEDIA.md "Live boot").
 
 **D7. `mkfs.btrfs` is an approved install-time exception, bound at build
 time.** `td-install` execs the shipped, source-built `btrfs-progs` to create
@@ -200,7 +202,11 @@ build-time complaint**. So the landing that execs it also carries the binding
 the recipe-side image check consumes, so an image that does not provide
 `mkfs.btrfs` **reds the build** instead of failing an install on a machine
 someone is standing in front of. The binding lands *with* the exec, not
-after it.
+after it. The live boot's exec is bound by the image's shape check instead:
+it refuses a deployment initramfs without `/bin/mkfs.btrfs` and its store
+payload, and a selector initramfs with either. It is the static binary built
+under the shipped target profile, so its debug companion ships in the image
+with it.
 
 **D8. No new `unsafe`.** Everything here is ordinary file I/O: partition
 tables and filesystems are bytes at offsets, and efivarfs is a filesystem.

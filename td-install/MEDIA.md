@@ -277,6 +277,22 @@ that manifest and attaches the verified descriptor to a read-only loop, as
 `root-loop` does for an installed volume, and leaves the medium mounted
 because the loop holds its file. On failure it unmounts.
 
-The volatile volume, its layout and the deployment initramfs's live branch are
-separate increments. Until they land nothing provisions a live selector or
-calls these verbs.
+The deployment initramfs takes the live branch only on `td.live=1`, which
+only `live-boot` hands over, and requires `td.volume=` with it. It runs
+`live-root`, then `td-boot live-seed MOUNTPOINT ID SEED`, which requires the
+same handoff, rechecks that the mounted medium's manifest hashes to the id,
+and stages only what the booted system reads from its volume in a directory
+that must not already exist: `td/boot/current` naming the deployment, its
+`manifest` and `manifest.sig`, an empty `td/incoming` and `@var`, with
+directories 0755 and files 0644. `mkfs.btrfs` formats `/dev/ram0` from that
+tree with the handed-off UUID, the `td-system` label and a writable `@var`
+subvolume, as td-install formats an installed volume. From `on-volume
+mount-root` on, the boot is the installed one: the volume is found by UUID,
+the root loop is already bound, `@var` is mounted, and the medium is moved to
+`/run/td-media` so it stays mounted under the loop. The seed's
+`manifest.sig` is copied unchecked; only the manifest is bound to the id, and
+nothing on the live volume authenticates it again. A live session has no
+`td/trusted.pub` and no bundled `td/source`, so it offers no updates, and
+everything it writes is lost at power-off.
+
+Nothing provisions a live selector until the install media producer lands.
