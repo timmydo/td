@@ -284,7 +284,10 @@ impl Transport for Peer {
 fn deadline() -> Deadline {
     Deadline::after(Tick(0), 1000).unwrap()
 }
-fn handshakes<L: Transport, R: Transport>(client: &mut TlsIo<'_, L>, server: &mut TlsIo<'_, R>) {
+fn handshakes<L: Transport, R: Transport, B: TlsWireStorage, C: TlsWireStorage>(
+    client: &mut TlsIo<L, B>,
+    server: &mut TlsIo<R, C>,
+) {
     for _ in 0..100_000 {
         let left = client.handshake().unwrap();
         let right = server.handshake().unwrap();
@@ -570,7 +573,13 @@ fn public_tls_round_trip_with_tiny_pipes_and_independent_close() {
     assert_eq!(client.evidence(), None);
 }
 
-fn with_pair(work: impl FnOnce(&mut TlsIo<'_, Peer>, &mut TlsIo<'_, Peer>, &Arc<TestClock>)) {
+fn with_pair(
+    work: impl FnOnce(
+        &mut TlsIo<Peer, &mut [u8; TLS_WIRE_BYTES]>,
+        &mut TlsIo<Peer, &mut [u8; TLS_WIRE_BYTES]>,
+        &Arc<TestClock>,
+    ),
+) {
     let clock = TestClock::new();
     let (client, server) = configs(&clock);
     let (left, right, _) = peers();
@@ -872,15 +881,16 @@ fn established_tcp_eof_without_tls_close_is_terminal_even_at_record_boundary() {
 
 #[test]
 fn returned_buffers_are_reused_and_close_paths_keep_exclusive_ownership() {
+    let (mut c, mut d) = ([0xa5; TLS_WIRE_BYTES], [0xa5; TLS_WIRE_BYTES]);
+    reuse_buffers(&mut c, &mut d);
+    reuse_buffers(Box::new(c), Box::new(d));
+    owned_worker_handoff();
+}
+
+fn reuse_buffers<B: TlsWireStorage>(mut input: B, mut output: B) {
     let clock = TestClock::new();
     let (client_config, server_config) = configs(&clock);
-    let (mut a, mut b, mut c, mut d) = (
-        [0xa5; TLS_WIRE_BYTES],
-        [0xa5; TLS_WIRE_BYTES],
-        [0xa5; TLS_WIRE_BYTES],
-        [0xa5; TLS_WIRE_BYTES],
-    );
-    let (mut input, mut output) = (&mut c, &mut d);
+    let (mut a, mut b) = ([0xa5; TLS_WIRE_BYTES], [0xa5; TLS_WIRE_BYTES]);
     let addresses = (input.as_ptr(), output.as_ptr());
     for _ in 0..2 {
         let (left, right, link) = peers();
@@ -952,10 +962,17 @@ fn returned_buffers_are_reused_and_close_paths_keep_exclusive_ownership() {
 
 #[test]
 fn constructor_refusals_return_moved_pool_buffers_without_logging_them() {
+    let (mut a, mut b) = ([0xa5; TLS_WIRE_BYTES], [0x5a; TLS_WIRE_BYTES]);
+    refused_buffers(&mut a, &mut b);
+    refused_buffers(
+        Box::new([0xa5; TLS_WIRE_BYTES]),
+        Box::new([0x5a; TLS_WIRE_BYTES]),
+    );
+}
+
+fn refused_buffers<B: TlsWireStorage>(mut input: B, mut output: B) {
     let clock = TestClock::new();
     let (client_config, server_config) = configs(&clock);
-    let (mut a, mut b) = ([0xa5; TLS_WIRE_BYTES], [0x5a; TLS_WIRE_BYTES]);
-    let (mut input, mut output) = (&mut a, &mut b);
     let addresses = (input.as_ptr(), output.as_ptr());
     for (mode, expected) in [
         (0, Error::Invalid),
@@ -1028,4 +1045,56 @@ fn constructor_refusals_return_moved_pool_buffers_without_logging_them() {
     handshakes(&mut client, &mut server);
     let (input, output) = server.into_buffers().unwrap();
     assert_eq!((input.as_ptr(), output.as_ptr()), addresses);
+}
+
+fn owned_worker_handoff() {
+    let clock = TestClock::new();
+    let (client_config, server_config) = configs(&clock);
+    let (left, right, link) = peers();
+    let buffers = std::array::from_fn::<_, 4, _>(|_| Box::new([0xa5; TLS_WIRE_BYTES]));
+    let addresses = buffers.each_ref().map(|buffer| buffer.as_ptr());
+    let [a, b, c, d] = buffers;
+    let mut client = TlsIo::new(
+        left,
+        TlsSession::client(client_config, "localhost").unwrap(),
+        clock.clone(),
+        deadline(),
+        deadline(),
+        a,
+        b,
+    )
+    .unwrap();
+    let mut server = TlsIo::new(
+        right,
+        TlsSession::server(server_config).unwrap(),
+        clock,
+        deadline(),
+        deadline(),
+        c,
+        d,
+    )
+    .unwrap();
+    let buffers = std::thread::spawn(move || {
+        handshakes(&mut client, &mut server);
+        assert_eq!(client.write(b"owned").unwrap(), IoProgress::Bytes(5));
+        let mut received = [0; 5];
+        let mut used = 0;
+        for _ in 0..100_000 {
+            client.flush().unwrap();
+            if let IoProgress::Bytes(count) = server.read(&mut received[used..]).unwrap() {
+                used += count;
+            }
+            if used == received.len() {
+                break;
+            }
+        }
+        assert_eq!(&received, b"owned");
+        let (a, b) = client.into_buffers().unwrap();
+        let (c, d) = server.into_buffers().unwrap();
+        [a, b, c, d]
+    })
+    .join()
+    .unwrap();
+    assert_eq!(buffers.each_ref().map(|buffer| buffer.as_ptr()), addresses);
+    assert_eq!(link.lock().unwrap().aborted, [true, true]);
 }

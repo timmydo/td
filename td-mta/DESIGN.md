@@ -39,8 +39,8 @@ implement protocol handlers.
 
 M07d1 supplies an exclusively owned nonblocking TCP stream adapter and shared
 runtime/TLS clock conversion, as specified in API.md §1.2. M07d2 composes
-opaque shared TLS sessions with borrowed record/tail buffers and fixed
-deadlines (API.md §1.3). Local facade and TCP fixtures cover bounded progress,
+opaque shared TLS sessions with preallocated borrowed or owned record/tail
+buffers and fixed deadlines (API.md §1.3). Local facade and TCP fixtures cover bounded progress,
 backpressure, close and terminal failures. These foundations
 do not open listeners, dial endpoints, admit slots or activate serving paths.
 

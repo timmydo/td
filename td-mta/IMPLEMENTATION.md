@@ -731,12 +731,15 @@ Implement the remaining work as independently reviewable increments:
     one runtime monotonic origin and checked injected UTC conversion for TLS.
     Local socket and fault/time fixtures cover their contracts. This adds no
     listeners, dialer, slot admission or TLS/STARTTLS policy integration.
-  - **M07d2 — TLS record pump:** implemented shared sessions with two borrowed
+  - **M07d2 — TLS record pump:** implemented shared sessions with two reserved
     record/tail buffers, bounded transport progress and fixed deadlines.
     Public-facade TLS 1.3 fixtures cover partial I/O, simultaneous full chunks,
     flush backpressure, error/close semantics, publication deadline fences and
     TCP loopback. Consuming connection/refusal returns recover both buffers
     for pool reuse, including constructor failure before admission.
+    Sealed borrowed/owned array storage supports complete connection movement
+    between workers; owned buffers are allocated before admission and returned
+    explicitly. Runtime leases and pool return queues remain M07d3.
     The portable harness executes all eleven pump and five clock/TCP cases
     from a separately selected static musl library test artifact.
     No mail authorization is constructed from raw TLS evidence.

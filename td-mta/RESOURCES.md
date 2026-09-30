@@ -95,7 +95,7 @@ configured memory budget does not preserve the default RSS claim.
   bound rejects bodies >=18432; negotiated limits may be smaller. The main-loop 16 KiB chunk
   limit below refers to application plaintext; one ciphertext-record turn
   includes its bounded TLS overhead. It is not a 16 KiB wire-buffer promise.
-  M07d2's record pump borrows two distinct 18437-byte reservations per
+  M07d2's record pump retains two distinct 18437-byte reservations per
   connection (36874 bytes total), one input frame and one output/tail frame.
   These count against the existing 128 KiB session target, not extra headroom.
   The current independent facade maxima (83973 ciphertext plus 16384
@@ -104,9 +104,13 @@ configured memory budget does not preserve the default RSS claim.
   target. This is a known M07e admission blocker, not a qualified bound.
   M07e must reduce effective native queue limits and measure coexistence
   within 128 KiB, or amend the ledger before serving. The runtime must reserve
-  the wire buffers before admission and recover them through into_buffers
-  on either a consumed connection or a constructor refusal when it owns moved
-  buffer references rather than their original storage.
+  the wire buffers before admission and recover both through into_buffers on
+  teardown or constructor refusal, for either representation. The pump accepts
+  borrowed references or Box-owned arrays allocated before admission; it never
+  allocates or replaces them. Ordinary Drop frees owned storage and is not a
+  pool-return mechanism.
+  Count each buffer once regardless of its ownership representation; owned
+  allocation bookkeeping remains part of the same session target.
   Internal backend queues, peer chains and retained handshake fragments need
   separate measurement within these same entries, not an added allowance.
   Incoming TLS 1.3 tickets still derive secrets, query the clock and copy peer

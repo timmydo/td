@@ -156,9 +156,15 @@ platform allocation, whole-process bounds, slot ownership or TLS integration.
 
 ### 1.3 Implemented TLS record progress
 
-M07d2 supplies `tls_io::TlsIo<T: Transport>`, consuming a handshaking shared
-session and one exclusive transport. It borrows two distinct caller-reserved
-18437-byte ciphertext buffers for its lifetime. Each operation progresses at
+M07d2 supplies `tls_io::TlsIo<T: Transport, B: TlsWireStorage>`, consuming a
+handshaking shared session, one exclusive transport and two distinct
+caller-reserved 18437-byte ciphertext buffers. TlsWireStorage is sealed to mutable
+array references and Box-owned arrays; data access cannot invoke arbitrary
+caller code or grow storage. Borrowed buffers remain exclusively borrowed for
+the connection lifetime. Owned buffers must be allocated at startup, before
+admission; the pump never constructs or replaces them. They let the complete
+connection move between workers without self-references or unsafe code.
+Each operation progresses at
 most one outgoing and one incoming record, with at most one underlying read
 and one write. Headers are assembled before bounded bodies; partial records
 and short write tails remain in those buffers. Intake tells td-crypto whether
@@ -186,14 +192,17 @@ aborts both handles, clears logical buffers and evidence, and preserves the
 first error. TLS errors map to Tls; local deadline/transport errors retain
 their mail variant. Aborting discards buffer contents logically, without a
 memory-erasure claim. Empty reads/writes remain Pending even after failure.
-`into_buffers()` consumes and aborts the connection, then returns both borrowed
-reservations for safe pool reuse. It does not expose the transport or session.
+`into_buffers()` consumes and aborts the connection, then returns both original
+buffer owners for safe pool reuse, preserving their storage type and addresses.
+It does not expose the transport or session.
 Constructor failure returns `TlsIoRefusal` after aborting both handles. Its
 fixed `error()` code and consuming `into_buffers()` preserve those same
 reservations on phase, clock or deadline refusal. Debug omits buffer contents.
-A pool holding moved references must recover both buffers on either success
-teardown or constructor refusal; it need not retain access to the arrays'
-original owner to recycle its reservations.
+A pool must recover both buffers on either success teardown or constructor
+refusal. Dropping an owned connection/refusal instead frees its owned buffers;
+there is no implicit pool return. Borrowed storage remains with its original
+owner. Runtime leases, return queues and their capacity guarantees remain
+M07d3; accepting owned storage alone does not implement admission.
 
 Only an explicit successful `handshake()` permits application bytes. It
 requires verified Finished, drained native/output buffers and a completed
@@ -215,7 +224,8 @@ the kernel. Callers discard output on error, and queue effect fences must
 precede writes; no error proves that already accepted output was undelivered.
 Local public-facade TLS 1.3 fixtures cover tiny duplex pipes, fragmented I/O,
 simultaneous full chunks, flush backpressure, close/EOF, invalid counts,
-deadline/time refusal, repeated buffer reuse and a TCP loopback exchange.
+deadline/time refusal, repeated borrowed/owned buffer reuse, owned connection
+handoff through an ordinary worker thread, and a TCP loopback exchange.
 The portable harness also selects these eleven TLS cases and the five
 clock/TCP cases from td-mta's library test executable under isolated musl.
 Each must report one passing test; missing or renamed cases refuse artifact

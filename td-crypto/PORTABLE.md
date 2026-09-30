@@ -283,7 +283,9 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   positive-one-test verdict requirement. They cover clock conversion,
   bounded TCP/half-close/failure, TLS 1.3 duplex progress and framing,
   backpressure, publication deadlines, closure and truncation, and buffer
-  recovery after success or constructor refusal. Socket fixtures bind only
+  recovery after success or constructor refusal, with both borrowed and owned
+  reservations, including owned connection transfer through a worker thread.
+  Socket fixtures bind only
   ephemeral IPv4 loopback ports; certificates are generated locally through
   the public crypto facade. No provider, CA or deployment server is contacted.
   This qualifies those adapter behaviors on musl, not full service admission,

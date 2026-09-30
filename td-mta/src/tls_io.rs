@@ -1,31 +1,43 @@
 //! Bounded TLS wire progress over an exclusively owned transport.
 //! Policy authorization and pool leases belong to the admitting factory.
 use crate::ports::{Clock, Deadline, Error, FlushProgress, IoProgress, Transport};
-use std::sync::Arc;
+use std::{ops::DerefMut, sync::Arc};
 use td_crypto::{HandshakeInfo, TlsPhase, TlsProgress, TlsSession};
 
 pub const TLS_WIRE_BYTES: usize = 18_437;
 const PLAIN_BYTES: usize = 16 * 1024;
 
-/// Construction has already aborted both handles. Recover these reservations
-/// even when a pool owns only their moved references, not the original arrays.
-pub struct TlsIoRefusal<'a> {
-    error: Error,
-    input: &'a mut [u8; TLS_WIRE_BYTES],
-    output: &'a mut [u8; TLS_WIRE_BYTES],
+mod sealed {
+    pub trait Buffer {}
+    impl Buffer for &mut [u8; super::TLS_WIRE_BYTES] {}
+    impl Buffer for Box<[u8; super::TLS_WIRE_BYTES]> {}
 }
 
-impl<'a> TlsIoRefusal<'a> {
+/// Exactly one fixed reservation, either borrowed or allocated before admission.
+/// Sealed to standard storage whose access cannot allocate or run callbacks.
+pub trait TlsWireStorage: sealed::Buffer + DerefMut<Target = [u8; TLS_WIRE_BYTES]> + Send {}
+impl TlsWireStorage for &mut [u8; TLS_WIRE_BYTES] {}
+impl TlsWireStorage for Box<[u8; TLS_WIRE_BYTES]> {}
+
+/// Construction has already aborted both handles. Recover both reservations
+/// with into_buffers for pool reuse. Drop frees owned arrays, never returns them.
+pub struct TlsIoRefusal<B: TlsWireStorage> {
+    error: Error,
+    input: B,
+    output: B,
+}
+
+impl<B: TlsWireStorage> TlsIoRefusal<B> {
     pub const fn error(&self) -> Error {
         self.error
     }
 
-    pub fn into_buffers(self) -> (&'a mut [u8; TLS_WIRE_BYTES], &'a mut [u8; TLS_WIRE_BYTES]) {
+    pub fn into_buffers(self) -> (B, B) {
         (self.input, self.output)
     }
 }
 
-impl std::fmt::Debug for TlsIoRefusal<'_> {
+impl<B: TlsWireStorage> std::fmt::Debug for TlsIoRefusal<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsIoRefusal")
             .field("error", &self.error)
@@ -35,16 +47,16 @@ impl std::fmt::Debug for TlsIoRefusal<'_> {
 
 /// One connection and two caller-reserved ciphertext buffers. Raw handshake
 /// evidence is not mail authorization; no gateway proof is constructed here.
-pub struct TlsIo<'a, T: Transport> {
+pub struct TlsIo<T: Transport, B: TlsWireStorage> {
     transport: T,
     session: TlsSession,
     clock: Arc<dyn Clock>,
     deadline: Deadline,
     handshake_deadline: Deadline,
-    input: Option<&'a mut [u8; TLS_WIRE_BYTES]>,
+    input: Option<B>,
     input_used: usize,
     input_target: usize,
-    output: Option<&'a mut [u8; TLS_WIRE_BYTES]>,
+    output: Option<B>,
     output_start: usize,
     output_end: usize,
     output_target: usize,
@@ -54,7 +66,7 @@ pub struct TlsIo<'a, T: Transport> {
     failure: Option<Error>,
 }
 
-impl<'a, T: Transport> TlsIo<'a, T> {
+impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
     /// Consume a handshaking session and transport. Deadlines are absolute and
     /// cannot be renewed. Refusal aborts both handles and returns both buffers.
     pub fn new(
@@ -63,9 +75,9 @@ impl<'a, T: Transport> TlsIo<'a, T> {
         clock: Arc<dyn Clock>,
         deadline: Deadline,
         handshake_deadline: Deadline,
-        input: &'a mut [u8; TLS_WIRE_BYTES],
-        output: &'a mut [u8; TLS_WIRE_BYTES],
-    ) -> Result<Self, TlsIoRefusal<'a>> {
+        input: B,
+        output: B,
+    ) -> Result<Self, TlsIoRefusal<B>> {
         let admitted =
             if session.status().phase != TlsPhase::Handshaking || handshake_deadline > deadline {
                 Err(Error::Invalid)
@@ -125,9 +137,7 @@ impl<'a, T: Transport> TlsIo<'a, T> {
 
     /// Abort and return the reserved buffers for another connection. Their
     /// bytes are not erased; only the next owner's logical lengths matter.
-    pub fn into_buffers(
-        mut self,
-    ) -> Result<(&'a mut [u8; TLS_WIRE_BYTES], &'a mut [u8; TLS_WIRE_BYTES]), Error> {
+    pub fn into_buffers(mut self) -> Result<(B, B), Error> {
         self.abort();
         let input = self.input.take().ok_or(Error::Invalid)?;
         let output = self.output.take().ok_or(Error::Invalid)?;
@@ -328,7 +338,7 @@ fn record_length(header: &[u8]) -> Result<usize, Error> {
     Ok(length)
 }
 
-impl<T: Transport> Transport for TlsIo<'_, T> {
+impl<T: Transport, B: TlsWireStorage> Transport for TlsIo<T, B> {
     fn read(&mut self, output: &mut [u8]) -> Result<IoProgress, Error> {
         if output.is_empty() {
             return Ok(IoProgress::Pending);
@@ -427,7 +437,7 @@ impl<T: Transport> Transport for TlsIo<'_, T> {
     }
 }
 
-impl<T: Transport> Drop for TlsIo<'_, T> {
+impl<T: Transport, B: TlsWireStorage> Drop for TlsIo<T, B> {
     fn drop(&mut self) {
         self.abort();
     }
