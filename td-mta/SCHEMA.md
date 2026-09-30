@@ -367,10 +367,12 @@ defined in [td-crypto/TLS.md](../td-crypto/TLS.md). In particular, initial
 local identities use P-256 with unencrypted PRIVATE KEY PKCS#8 PEM and a
 separate CERTIFICATE PEM chain; other local key formats are unsupported.
 This does not restrict the supported remote server or gateway-client key
-algorithms. The TLS loader is still unimplemented. M07/M18 own key/chain
-matching, algorithm/expiry/name validation, returned identifier checks and atomic
-renewal. No certificate is trusted merely because its profile reference
-resolves.
+algorithms. M07's TLS content compiler admits keys, chains, required names and
+explicit trust inputs through a trusted reader callback. Protected-descriptor
+loading, full allocation qualification, service publication and M18 atomic
+renewal remain pending. ACME material requests identify existing service-managed
+profile material; compilation never performs network issuance. No certificate
+is trusted merely because its profile reference resolves.
 
 Bound each raw chain file/response to 64 KiB, private key to 16 KiB, and
 explicit CA bundle to 128 KiB. These are individual ceilings, not simultaneous

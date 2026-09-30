@@ -151,6 +151,21 @@ configured memory budget does not preserve the default RSS claim.
   The runtime bounds lease counts and destruction concurrency with its fixed
   slots/workers. GenerationSet cannot bound T's contents, loader temporaries,
   extracted resources or native allocations; M07e still proves their aggregate.
+  The TLS policy compiler reserves at most 18 table entries (16 listeners,
+  relay and ACME). It constructs each identity once, shares it among native
+  configurations (HTTPS/gateway subsets share admitted keys and chains),
+  reads one gateway bundle for all its listeners, and validates
+  unused staged gateway bundles without retaining a trust cache. Per-input
+  raw buffers allocate their ceiling plus one overflow byte cold; chain and key
+  coexist during identity admission, and one CA buffer coexists with its parsed
+  configuration. Raw input windows are cleared on drop without a secure-erasure
+  claim. Table vectors, strings, boxed gateway policies, native objects and all
+  temporaries remain charged to this same generation allowance. The compiler
+  does not yet measure/enforce the 1 MiB native aggregate and cannot activate
+  serving. SessionPreparation retains the handshake count, generation and two
+  preallocated buffers without allocating; native construction runs later on a
+  fixed TLS worker. The runtime must still supply/retain the complete session
+  slot and native byte allowance; a pair of arrays alone is not that admission.
 - Certificate overlap, reload overlap, allocator bookkeeping, executable
   pages and main/worker stacks all count at peak coexistence. RSS tests must
   validate the allowances; this ledger is not an OS memory limiter.

@@ -55,6 +55,25 @@ impl ServerIdentity {
         self.names.get(index).map(String::as_str)
     }
 
+    /// Cold narrowing of admitted DNS bindings. Share the existing key and
+    /// chain; never add authority, extend validity or revive a retired key.
+    pub fn restrict_names(&self, bindings: &[&str]) -> Result<Self, TlsError> {
+        admission_boundary(|| {
+            let names = names(bindings)?;
+            if names.iter().any(|name| !self.names.contains(name)) {
+                return Err(TlsError::Invalid);
+            }
+            self.check_health()?;
+            Ok(Self {
+                certified: self.certified.clone(),
+                names,
+                key: self.key.clone(),
+                not_before: self.not_before,
+                not_after: self.not_after,
+            })
+        })
+    }
+
     /// Inclusive UTC validity intersection of every supplied certificate.
     pub fn validity(&self) -> (u64, u64) {
         (self.not_before, self.not_after)

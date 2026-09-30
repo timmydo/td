@@ -384,6 +384,90 @@ this is not complete control-worker or TLS stack qualification. Material-specifi
 TLS tables, slot/session ownership and current-policy revocation remain
 M07d3b2b/M07d3c; this helper enables no service endpoint.
 
+### 1.7 Compiled TLS policy generations and queued session preparation
+
+`tls_policy::TlsPolicies::prepare` consumes a detached GenerationConstruction
+and borrows a ResolvedText configuration. The latter proves whole-reader
+structural closure plus resolved text inputs, not protected-descriptor trust.
+On the cold control worker the compiler admits every certificate profile's
+complete derived name set, key/chain consistency and current validity through
+td-crypto. It builds at most 18 immutable policies: the configured TLS listeners,
+one relay and optional ACME client. HTTP-01 and loopback plaintext fixtures have
+no TLS policy. No native configuration or identity handle escapes the table.
+
+The trusted opener receives a redacted MaterialRequest with an explicit kind,
+optional profile and optional path. Files-mode identities use configured paths;
+ACME chain/key requests name the profile and have no operator path. They load
+existing service-managed material, never initiate issuance. This complete table
+currently requires every server identity to be present and valid, so it cannot
+bootstrap initial ACME issuance or recover after expiry on its own. Before
+service activation, M18 must independently prepare and retain relay/ACME client
+policies while unavailable server roles stay disabled, within the same resource
+ledger. This is an explicit integration blocker, not a startup design change.
+Explicit CA requests
+retain their exact configured role. Missing relay/ACME overrides select pinned
+public roots; malformed or unreadable explicit input never falls back. Every
+staged gateway CA is checked, even without a listener. Each used gateway bundle
+is read once and supplies all of that gateway's listeners in this generation.
+
+Readers must implement truthful Read/EOF and bounded, deadlined I/O with M05's
+protected-file and secret/public inode checks. The compiler itself performs no
+filesystem or network access. It reads through EOF or the ceiling plus one byte,
+refuses oversized and impossible counts, and permits at most 32
+Interrupted results across the whole read, matching config material readers.
+Positive progress never resets that allowance; at most ceiling + 34 calls
+cover one-byte progress, overflow/EOF and interrupted attempts. Chain/key
+caps are 64/16 KiB; CA caps are 128 KiB. Raw windows clear on drop, including
+errors/unwinds, without a secure-erasure promise. An opener panic follows fatal
+service policy. Failure destroys the candidate and returns its generation slot;
+active publication is unchanged.
+
+Direct SMTP uses its profile with DefaultIdentity, HTTPS uses RequiredName
+with its primary and selected MTA-STS profiles, and gateways require their
+private client trust plus separately retained pin/prefix policy. Gateway
+identities narrow to that listener's server_name before MatchPresentName
+selection. Complete identities first validate all graph-derived names.
+HTTPS then narrows
+the selected profiles to exactly the JMAP origin and their MTA-STS names, sharing
+existing key/chain ownership. This avoids treating SMTP names as HTTPS routes
+or introducing name collisions across shared profiles. HTTP authority routing
+still separately admits only the configured JMAP/MTA-STS authorities.
+Relay and ACME
+use their configured host, port, trust and SMTP/HTTP protocol. Destination
+metadata and PolicyRole are configuration, never authenticated peer evidence.
+
+Listener lookup uses the configured name, not a saved row index. Returned
+TlsPolicyId contains the retained generation ID and checked table index;
+resolution refuses a different generation or invalid index. A reload can
+reorder rows. `gateway_unchanged` compares the selected old policy with a row
+in the supplied current table using its canonical gateway fingerprint and all
+listener stanza fields (name, kind, numeric bind, server/certificate/gateway
+names, session and per-peer limits). It ignores source locations and row order.
+Server material renewal alone does not revoke client policy; semantic trust/pin/
+prefix changes, including broadening, or binding changes do. The caller must
+supply the actual active generation and serialize this predicate with mutation
+publication. Passing a retained old table as current proves nothing. This
+helper supplies neither authenticated gateway evidence nor that runtime fence.
+
+`reserve_session` validates the policy ID and reserves the shared HandshakePool
+before returning non-clonable SessionPreparation. It owns a generation lease,
+permit and both caller-reserved wire buffers, including while queued. It makes
+no allocations and performs no native TLS construction or I/O. A fixed TLS
+worker consumes `construct` to create the opaque native handshaking session;
+SessionReservation keeps all owners together. Status remains raw crypto status,
+not mail authorization. Both wrappers are must-use and cannot expose/clone raw
+configuration/session handles. Native destruction precedes generation and permit
+release. Preparation or native teardown returns both original arrays explicitly;
+ordinary Drop frees Box-owned arrays without returning them to runtime pools.
+Refusal returns a fixed error and both arrays, releasing permit and generation.
+
+The runtime separately owns the complete session slot, native byte allowance,
+queue/completion credit and bounded generation lifetime. Construction is not
+whole-resource qualification. Socket handoff, permit release after a completed
+handshake, current-policy fencing, STARTTLS transitions and mail TlsTransport
+remain the next M07d3 increments. No listener or service entry point uses these
+owners yet; M07e still gates native allocation/stack/RSS and aggregate admission.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

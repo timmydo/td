@@ -684,6 +684,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "der::tests::certificate_calendar_boundaries", false),
         ("td-crypto-smoke", "certificate_algorithms::tests::certificate_algorithm_inventory_fails_closed", false),
         ("td-crypto-smoke", "identity::tests::local_identity_owns_material_and_checks_validity", false),
+        ("td-crypto-smoke", "identity::tests::narrowed_identity_shares_material_and_cannot_expand_or_revive_bindings", false),
         ("td-crypto-smoke", "identity::tests::identity_refuses_wrong_key_name_time_and_order", false),
         ("td-crypto-smoke", "identity::tests::local_identity_enforces_key_usage_and_extensions", false),
         ("td-crypto-smoke", "identity::tests::local_identity_name_and_extension_limits", false),
@@ -794,6 +795,13 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-mta-transport-smoke", "generations::tests::failed_stale_and_foreign_candidates_preserve_active_state_and_owners", false),
         ("td-mta-transport-smoke", "generations::tests::final_worker_release_destroys_payload_before_returning_capacity", false),
         ("td-mta-transport-smoke", "generations::tests::racing_preparation_and_release_never_construct_a_third_live_payload", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::compiled_policy_roles_bind_names_trust_and_generation_ids", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::queued_and_native_reservations_retain_capacity_and_recover_exact_buffers", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::gateway_comparison_survives_reordering_but_rejects_policy_or_binding_changes", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::material_errors_never_publish_and_acme_requests_are_explicit", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::material_reader_caps_bytes_eof_and_interrupted_work", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::compiled_configs_enforce_relay_trust_protocol_and_gateway_client_auth", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::https_profiles_narrow_shared_smtp_names_before_native_routing", false),
         ("td-mta-transport-smoke", "gateway_policy::tests::canonical_gateway_policy_ignores_only_representation_and_server_material", false),
         ("td-mta-transport-smoke", "gateway_policy::tests::gateway_filters_and_material_limits_refuse_without_fallback", false),
         ("td-mta-transport-smoke", "gateway_policy::tests::gateway_tls_requires_a_client_certificate_on_the_same_valid_server", false),
@@ -854,7 +862,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
-    println!("portable runtime: twenty-seven mail generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
+    println!("portable runtime: thirty-four mail policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
     Ok(())
 }
 

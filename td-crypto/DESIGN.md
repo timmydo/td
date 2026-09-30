@@ -384,6 +384,15 @@ supplied time and key health again. Configurations must still recheck at the
 selection/completion points specified in TLS.md. This handle has no TLS
 session or mail-authorization operation, and is not a remote trust grant.
 
+`restrict_names` cold-constructs an identity with a nonempty subset of already
+admitted exact bindings. It applies the same canonicalization/duplicate limits,
+refuses widening even to another name present in the certificate SAN, and
+shares the existing key/certificate-chain owners. It preserves validity bounds
+and checks key health; retirement remains shared. It performs no new key import,
+certificate parsing, trust operation or time extension. The new name vector and
+small identity/shared-owner headers belong to the caller's existing generation
+budget. TLS configuration/session time and health fences still apply.
+
 The owned metadata reader precedes backend parsing. It uses checked slice
 access, minimal definite lengths, fixed depth, a four-digit calendar and at
 most 64 extensions per certificate. Duplicate extension OIDs, malformed OID

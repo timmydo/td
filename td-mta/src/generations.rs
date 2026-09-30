@@ -12,6 +12,9 @@ use std::{
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 const TWO_SLOTS: u8 = 3;
 
+#[cfg(test)]
+pub(crate) static TEST_CONSTRUCTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Process-local identity; never persisted or accepted as peer authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GenerationId(NonZeroU64);

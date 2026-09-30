@@ -779,6 +779,25 @@ Implement the remaining work as independently reviewable increments:
           Refusal returns all owners; hold the permit across queued/Pending
           progress and release only on completion or teardown. Apply current
           policy revocation using canonical comparison plus listener binding.
+          - **Policy compilation and preparation:** implemented complete
+            TLS content compilation from a closed, text-resolved configuration
+            inside a reserved generation. Bounded readers admit every local
+            identity and explicit trust input; immutable tables select listener,
+            relay and ACME roles. IDs resolve only within their generation.
+            Detached session preparation retains the global handshake permit,
+            generation and caller-owned wire buffers before worker-native
+            construction; refusal/teardown recover both buffers. Exact gateway
+            comparison covers canonical policy and the full listener binding.
+            This is not current-generation authority or a mutation fence.
+            **M18 integration blocker before service:** split client-role
+            preparation/retention from complete server identity admission, so
+            initial ACME issuance and expired-certificate recovery can use
+            ACME/relay TLS while unavailable server roles remain disabled.
+            Keep both paths within the existing generation/resource ledger.
+          - **Socket handoff:** next consume prepared native sessions into the
+            bounded transport pump, retain owners through handshake/completion,
+            authorize verified gateway evidence against the actual socket peer,
+            and enforce current-policy checks at runtime mutation boundaries.
     - **M07d3c — protocol integration:** complete STARTTLS flush/tail/reset,
       gateway pin/address authorization and local HTTPS/SMTP transition cases.
 - **M07e — resource/service admission:** qualify complete generation overlap,

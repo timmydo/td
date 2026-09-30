@@ -104,6 +104,55 @@ fn local_identity_owns_material_and_checks_validity() {
 }
 
 #[test]
+fn narrowed_identity_shares_material_and_cannot_expand_or_revive_bindings() {
+    let fixture = Fixture::new();
+    let mut parameters = Parameters::new(false);
+    parameters.extensions[2] = extension(
+        0x11,
+        false,
+        seq(&[
+            der(0x82, b"localhost"),
+            der(0x82, b"mail.example.test"),
+            der(0x82, b"unused.example.test"),
+        ]),
+    );
+    let chain = fixture.chain(&parameters, &Parameters::new(true));
+    let identity = fixture
+        .admit(&chain, &["localhost", "mail.example.test"], Some(NOW))
+        .unwrap();
+    let narrowed = identity.restrict_names(&["LOCALHOST"]).unwrap();
+    assert_eq!(narrowed.name_count(), 1);
+    assert_eq!(narrowed.name(0), Some("localhost"));
+    assert!(Arc::ptr_eq(&identity.certified, &narrowed.certified));
+    assert!(Arc::ptr_eq(&identity.key, &narrowed.key));
+    assert_eq!(identity.validity(), narrowed.validity());
+    assert_eq!(
+        narrowed.check_validity(Some(END + 1)),
+        Err(TlsError::Verification(VerificationFailure::Expired))
+    );
+    for names in [
+        &[][..],
+        &["localhost", "LOCALHOST"][..],
+        &["unused.example.test"][..],
+    ] {
+        assert_eq!(
+            identity.restrict_names(names).err(),
+            Some(TlsError::Invalid)
+        );
+    }
+    assert_eq!(
+        narrowed.restrict_names(&["mail.example.test"]).err(),
+        Some(TlsError::Invalid)
+    );
+    assert!(identity.retire_for_test().is_err());
+    assert_eq!(narrowed.check_validity(Some(NOW)), Err(TlsError::Crypto));
+    assert_eq!(
+        identity.restrict_names(&["localhost"]).err(),
+        Some(TlsError::Crypto)
+    );
+}
+
+#[test]
 fn identity_refuses_wrong_key_name_time_and_order() {
     let fixture = Fixture::new();
     let chain = fixture.chain(&Parameters::new(false), &Parameters::new(true));

@@ -96,6 +96,18 @@ pub(crate) fn certificate_with_serial(
     ca: bool,
     serial: u8,
 ) -> Vec<u8> {
+    certificate_names(key, signer, ca, serial, &["localhost"])
+}
+pub(crate) fn certificate_with_names(key: &P256Key, signer: &P256Key, names: &[&str]) -> Vec<u8> {
+    certificate_names(key, signer, false, 2, names)
+}
+fn certificate_names(
+    key: &P256Key,
+    signer: &P256Key,
+    ca: bool,
+    serial: u8,
+    names: &[&str],
+) -> Vec<u8> {
     let provider = Provider;
     let mut public = [0; 65];
     provider.p256_public(key, &mut public).unwrap();
@@ -120,7 +132,14 @@ pub(crate) fn certificate_with_serial(
         extension(0x0f, true, der(3, if ca { &[1, 6] } else { &[7, 0x80] })),
     ];
     if !ca {
-        extensions.push(extension(0x11, false, seq(&[der(0x82, b"localhost")])));
+        extensions.push(extension(
+            0x11,
+            false,
+            seq(&names
+                .iter()
+                .map(|name| der(0x82, name.as_bytes()))
+                .collect::<Vec<_>>()),
+        ));
         extensions.push(extension(
             0x25,
             false,

@@ -1,12 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 use super::*;
-use std::sync::{atomic::AtomicUsize, Barrier, Mutex};
+use std::sync::{atomic::AtomicUsize, Barrier};
 
 // Serialize unwrap-based fixtures against the shared process ID CAS;
 // the contention fixture deliberately accepts transient Busy.
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 fn lock() -> std::sync::MutexGuard<'static, ()> {
-    TEST_LOCK
+    TEST_CONSTRUCTION_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
