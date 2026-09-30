@@ -34,9 +34,9 @@ build inputs.
 
 The std-only importer verifies every source-file hash before generating output:
 
-  cargo run --manifest-path td-compositor/Cargo.toml \
-    --bin td-term-import-libvterm -- check LIBVTERM-0.3.3 \
-    td-compositor/spec/term
+  cargo run --manifest-path td-ui/Cargo.toml \
+    --bin td-ui-import-libvterm -- check LIBVTERM-0.3.3 \
+    td-ui/spec/vt
 
 Run the ignored `print_semantic_expectations_overlay` test to regenerate the
 exact xfail set. Unexpected failures, passes, stale entries, unknown tags, and

@@ -1,11 +1,12 @@
 //! Cross-identity socket admission for the configured graphical session.
 
-use crate::{control, ready, sys};
+use crate::{control, sys};
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -79,6 +80,12 @@ const AUTHORITY_DONE: &str = "TD-TERMINAL-AUTHORITY-OK";
 const INPUT_TOKEN: &str = "td.firefox-input=1";
 const CONTROL: &str = "/run/td-compositor/1000/td-control";
 const HUMAN_RUNTIME: &str = "/run/user/1000";
+/// The terminal the stock session launches. It is its own program, so its
+/// readiness is asked of it rather than parsed by a second copy here.
+const TERMINAL_PROGRAM: &str = "/bin/td-term";
+/// The window title td-term gives itself; `terminal_is_focused` recognises the
+/// terminal by it. A confinement test pins it against td-term's source.
+pub(crate) const TERMINAL_TITLE: &str = "td terminal";
 
 /// Composed boot diagnostic: the host supplies the two physical key chords.
 /// This observes the stock launch path; it is not a consent or identity proof.
@@ -121,8 +128,9 @@ pub(crate) fn probe_terminal_authority() -> Result<(), String> {
         }
         if let (Some(socket), Some(handle)) = (sockets.first(), added.first()) {
             if terminal_is_focused(&report, *handle) {
-                match ready::probe(socket) {
-                    Ok(()) => {
+                match terminal_ready(socket) {
+                    Ok(line) => {
+                        say(&line)?;
                         if Instant::now() >= deadline {
                             return Err(
                                 "terminal authority launch timed out during readiness".into()
@@ -175,7 +183,34 @@ pub(crate) fn process_uid() -> Result<u32, String> {
     if status.len() > 8192 {
         return Err("terminal probe status exceeds 8192 bytes".into());
     }
-    crate::pty::effective_uid(&status)
+    crate::proc_status::effective_uid(&status)
+}
+
+/// Ask the terminal's own probe whether it is ready, and return the readiness
+/// line it printed. A refusal carries the probe's own diagnostic.
+fn terminal_ready(socket: &Path) -> Result<String, String> {
+    let output = Command::new(TERMINAL_PROGRAM)
+        .arg("probe")
+        .arg(socket)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("run {TERMINAL_PROGRAM} probe: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{TERMINAL_PROGRAM} probe {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| format!("{TERMINAL_PROGRAM} probe printed a non-UTF-8 answer"))
+}
+
+fn say(text: &str) -> Result<(), String> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|error| format!("write terminal readiness: {error}"))
 }
 
 fn emit(marker: &str) -> Result<(), String> {
@@ -231,7 +266,7 @@ fn terminal_is_focused(report: &str, handle: u64) -> bool {
             return false;
         };
         let fields: Vec<_> = fields.split_ascii_whitespace().collect();
-        title == crate::term_client::TITLE
+        title == TERMINAL_TITLE
             && fields.contains(&"visible=true")
             && fields.contains(&"focused=true")
             && fields.iter().any(|field| {
@@ -398,7 +433,15 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_that_cannot_be_asked_is_not_ready() {
+        let missing =
+            std::env::temp_dir().join(format!("td-authority-missing-{}.ready", std::process::id()));
+        assert!(terminal_ready(&missing).is_err());
+    }
+
+    #[test]
     fn terminal_layout_requires_a_new_focused_visible_positive_window() {
+        assert_eq!(TERMINAL_TITLE, "td terminal");
         let row = "window id=@7 object=1:4 workspace=1 x=0 y=24 width=800 height=600 visible=true focused=true fullscreen=false floating=false parent= app_id= title=td terminal\n";
         assert_eq!(window_ids(row).unwrap(), BTreeSet::from([7]));
         assert!(terminal_is_focused(row, 7));

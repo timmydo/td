@@ -3057,7 +3057,7 @@ and stage 1 never steals. A shell's terminal is owned because td-term's
 default child is `cttyhack`, which takes it; so `claude` typed at a td-term
 prompt fails with a diagnostic naming td-term's `--command`, the path that
 produces a session-less pty for exactly this purpose
-(`td-compositor/DESIGN.md` §12). "Never the operator's" therefore rests on
+(`td-term/DESIGN.md` §4). "Never the operator's" therefore rests on
 that wrapper: a shell started with `--command /bin/sh` leads no session, its
 pty is unowned, and an application launched from it would acquire and share
 that terminal. Terminal stdin always selects the new-session path, even
@@ -6232,11 +6232,11 @@ surface, since td-portal rides `conn.rs`.
 **"No new surface" is right about SYSCALLS and wrong about the roster**,
 which is a distinction `UNSAFE.md` §6 draws deliberately and this
 document owed a row for. That section pins the transport's USERS in code
-— `TRANSPORT_USERS = ["client.rs", "conn.rs", "term_client.rs"]` in
+— `TRANSPORT_USERS = ["client.rs", "conn.rs"]` in
 `td-compositor/src/main.rs` — precisely so a module can reach `sendmsg`
 and `recvmsg` through a `Connection` without ever spelling `sys::`, which
 is all the caller scan looks for. A portal personality holding one is a
-FOURTH user, and `UNSAFE.md` says in terms that a module joining that
+THIRD user, and `UNSAFE.md` says in terms that a module joining that
 roster is an amendment. The confinement test will red the landing, which
 is the mechanism working; what was missing is that §V.2's sequencing of
 the existing unsafe-surface amendments has no row for this one, and it belongs
@@ -9520,7 +9520,7 @@ td-mail executed a plain-word editor command directly and kept `sh -c`
 only for shell text, until "Reworked" below. Landed; the in-jail
 acceptance test in `td-editor/DESIGN.md` is not.
 
-**Rendering.** Section 11 of `td-compositor/DESIGN.md` pins a Unifont PSF2
+**Rendering.** Section 3 of `td-term/DESIGN.md` pins a Unifont PSF2
 face and a pure renderer over it; td-term draws with it, and in td-ui's
 pinned outline face fitted to its cells where the image has it. The editor
 borrows the face exactly: the PSF2 reader and pinned face are shared source the
@@ -9531,9 +9531,10 @@ with td-ui's raster, the editor's bounded glyph painter moved into the
 toolkit, so every td-ui consumer renders the same cells with one
 painter. The one face besides Unifont is td-ui's pinned outline face,
 fitted to those cells for live windows (td-ui/DESIGN.md, "The grid fit");
-the compositor keeps its own painters (the terminal renderer, over both
-faces, and the attention sheet, over the bitmap one), td-ui's raster
-is the one every toolkit consumer shares, and td-portal's private copy
+the compositor keeps its own painters over the bitmap face (the attention
+sheet among them), the terminal's cell renderer moved into td-ui with
+td-term as `vt_render`, over both faces, td-ui's raster is the one every
+other toolkit consumer shares, and td-portal's private copy
 goes when its chooser moves to td-ui.
 
 **Behaviour, in landing order.** (1) A buffer model and an Emacs keymap

@@ -1,22 +1,24 @@
 //! td-term's readiness socket, its marker, and the probe that reads it.
 //!
-//! §12 has the supervisor prove a terminal is up by connecting to a private
+//! §4 has the supervisor prove a terminal is up by connecting to a private
 //! socket rather than by watching the console, and compares what the probe
 //! prints against the `TD-TERM-READY` diagnostic the terminal itself emitted.
 //! That comparison is only meaningful if the two cannot drift, so there is one
 //! encoder: [`marker`] produces both.
 //!
-//! `publish`'s caller is `term_client::run`, which reaches it only once its
-//! first frame has come back with both `wl_buffer.release` and its frame
-//! callback — the point §12 defines readiness at, and the point at which the
+//! `publish`'s caller is the window, which reaches it only once its first
+//! frame has come back with both `wl_buffer.release` and its frame
+//! callback — the point §4 defines readiness at, and the point at which the
 //! grid it announces is the one the compositor actually gave it.
 
-use crate::pty;
-use crate::socket;
+use std::fs::{self, Permissions};
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
+use td_ui::pty;
 
 pub const MARKER: &str = "TD-TERM-READY";
 
@@ -74,7 +76,7 @@ fn field(value: Option<&str>, name: &str) -> Result<u16, String> {
         .ok_or_else(|| format!("readiness field '{value}' is not {name}"))?;
     // `u16::from_str` also takes `+24` and `024`, which the encoder never
     // emits. Accepting them would make two more spellings of a ready terminal,
-    // and the spelling is the thing §12 compares.
+    // and the spelling is the thing §4 compares.
     if digits.is_empty()
         || !digits.bytes().all(|byte| byte.is_ascii_digit())
         || (digits.len() > 1 && digits.starts_with('0'))
@@ -88,25 +90,112 @@ fn field(value: Option<&str>, name: &str) -> Result<u16, String> {
         .map_err(|_| format!("readiness {name} '{digits}' is not a grid dimension"))
 }
 
-/// Bind the readiness socket and answer every caller with this grid.
-pub fn publish(path: &Path, rows: u16, columns: u16) -> Result<socket::Published, String> {
+/// Consecutive failed accepts before the listener gives up: `ECONNABORTED`
+/// and a brief `EMFILE` are not the end of the socket, but a listener that
+/// can accept nothing would otherwise spin forever.
+const MAX_ACCEPT_FAILURES: u32 = 64;
+
+/// A bound on answering ONE caller, so a caller that never reads cannot stop
+/// the socket answering anyone else.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A bound readiness socket. Dropping it unlinks the path, so a terminal that
+/// exits leaves nothing for the next one to refuse.
+///
+/// It does NOT retire the listener: that thread owns the descriptor and parks
+/// in `accept`, and its only retirement is process exit — sound because a
+/// terminal is one process, and closing it IS exiting. So nothing may join it.
+pub struct Published {
+    path: PathBuf,
+}
+
+impl Drop for Published {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// A socket left by a terminal that died without unlinking it is replaced; a
+/// live one, or anything that is not a socket, is refused.
+fn remove_stale(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => match UnixStream::connect(path) {
+            Ok(_) => Err(format!(
+                "refusing to replace live readiness socket {}",
+                path.display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                fs::remove_file(path)
+                    .map_err(|e| format!("remove stale readiness socket {}: {e}", path.display()))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "probe existing readiness socket {}: {error}",
+                path.display()
+            )),
+        },
+        Ok(_) => Err(format!(
+            "refusing to replace non-socket readiness path {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("stat readiness socket {}: {error}", path.display())),
+    }
+}
+
+/// Bind the readiness socket, mode 0600, and answer every caller with this
+/// grid from a listener thread.
+pub fn publish(path: &Path, rows: u16, columns: u16) -> Result<Published, String> {
     let line = marker(rows, columns);
     // Refuse to publish a grid the probe would then reject, rather than
     // serving a line no caller can accept.
     parse(&line)?;
-    socket::publish(path, "td-term-ready", line.into_bytes())
+    remove_stale(path)?;
+    let listener = UnixListener::bind(path)
+        .map_err(|e| format!("bind readiness socket {}: {e}", path.display()))?;
+    // Taken one line after the socket exists, so every `?` below unlinks it.
+    let published = Published {
+        path: path.to_path_buf(),
+    };
+    fs::set_permissions(path, Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod readiness socket {}: {e}", path.display()))?;
+    let answer = line.into_bytes();
+    thread::Builder::new()
+        .name("td-term-ready".into())
+        .spawn(move || serve(listener.incoming(), &answer))
+        .map_err(|e| format!("start readiness listener {}: {e}", path.display()))?;
+    Ok(published)
+}
+
+/// Answer each caller, and give up only on a run of failed accepts. Returns
+/// whether it gave up, so a test can tell that from callers running out.
+fn serve(connections: impl Iterator<Item = std::io::Result<UnixStream>>, answer: &[u8]) -> bool {
+    let mut consecutive = 0;
+    for connection in connections {
+        let Ok(mut connection) = connection else {
+            consecutive += 1;
+            if consecutive > MAX_ACCEPT_FAILURES {
+                return true;
+            }
+            continue;
+        };
+        consecutive = 0;
+        let _ = connection.set_write_timeout(Some(ANSWER_TIMEOUT));
+        let _ = connection.write_all(answer);
+    }
+    false
 }
 
 /// Ask a terminal whether it is up, and print what it answered.
 ///
-/// The printed line is the terminal's own, unaltered, because §12 compares it
+/// The printed line is the terminal's own, unaltered, because §4 compares it
 /// with the diagnostic that terminal emitted.
 pub fn probe(path: &Path) -> Result<(), String> {
     probe_to(path, PROBE_TIMEOUT, &mut std::io::stdout())
 }
 
 /// Where the probe writes is a parameter so the BYTES it prints are testable:
-/// §12 compares them with the terminal's own diagnostic, and a probe that
+/// §4 compares them with the terminal's own diagnostic, and a probe that
 /// validated correctly and then printed something else would satisfy every
 /// assertion about what it parsed.
 fn probe_to(path: &Path, deadline: Duration, out: &mut impl Write) -> Result<(), String> {
@@ -323,9 +412,9 @@ mod tests {
         let directory = scratch("published");
         let path = directory.join("td-term-ready");
         let ready = publish(&path, 24, 80).unwrap();
-        // Private to the graphical user: §12's mode, not the umask's.
+        // Private to the graphical user: §4's mode, not the umask's.
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        // The literal §12 specifies, not the constant under test.
+        // The literal §4 specifies, not the constant under test.
         assert_eq!(mode, 0o600);
 
         let mut stream = UnixStream::connect(&path).unwrap();
@@ -334,7 +423,7 @@ mod tests {
         assert_eq!(answer, marker(24, 80));
         // Serving one caller does not retire the socket -- and what the probe
         // PRINTS is the terminal's own line, byte for byte, since that is what
-        // §12 compares against the diagnostic.
+        // §4 compares against the diagnostic.
         let mut printed = Vec::new();
         probe_to(&path, TEST_PROBE_TIMEOUT, &mut printed).unwrap();
         assert_eq!(printed, marker(24, 80).into_bytes());

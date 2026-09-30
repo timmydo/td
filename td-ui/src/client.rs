@@ -39,6 +39,8 @@ pub const SURFACE: u32 = 7;
 pub const XDG_SURFACE: u32 = 8;
 pub const TOPLEVEL: u32 = 9;
 const DYNAMIC: usize = 10;
+/// `xdg_toplevel.state.activated`.
+const ACTIVATED: u32 = 4;
 /// The client id table: slots are reused only after `wl_display.delete_id`.
 pub const OBJECTS: usize = 128;
 /// At most this many live registry entries, each name at most `NAME_BYTES`.
@@ -221,6 +223,9 @@ pub struct Client<T: Tag> {
     pixels: Vec<u8>,
     configured: bool,
     pending_size: Option<(i32, i32)>,
+    pending_activated: Option<bool>,
+    activated: bool,
+    presented: Option<u32>,
     xrgb: bool,
     argb: bool,
     cursor_image: Option<CursorImage>,
@@ -231,6 +236,7 @@ pub struct Client<T: Tag> {
     input: Input,
     held: Held,
     enter: Option<u32>,
+    focus_serial: Option<u32>,
     data: Option<Data>,
     bound: bool,
     closed: bool,
@@ -273,6 +279,9 @@ impl<T: Tag> Client<T> {
             pixels: Vec::new(),
             configured: false,
             pending_size: None,
+            pending_activated: None,
+            activated: false,
+            presented: None,
             xrgb: false,
             argb: false,
             cursor_image: None,
@@ -283,6 +292,7 @@ impl<T: Tag> Client<T> {
             input: Input::default(),
             held: Held::default(),
             enter: None,
+            focus_serial: None,
             data: None,
             bound: false,
             closed: false,
@@ -358,6 +368,12 @@ impl<T: Tag> Client<T> {
 
     pub fn pointer(&self) -> Option<u32> {
         self.pointer
+    }
+
+    /// The serial of the keyboard's enter while the surface has focus, so
+    /// one focus can be told from the next.
+    pub fn focus_serial(&self) -> Option<u32> {
+        self.focus_serial
     }
 
     /// The serial of the pointer's enter while it is inside the surface.
@@ -584,6 +600,7 @@ impl<T: Tag> Client<T> {
             self.set_kind(device, Kind::RetiredKeyboard)?;
         }
         self.input = Input::default();
+        self.focus_serial = None;
         self.clear_selection()
     }
 
@@ -927,11 +944,12 @@ impl<T: Tag> Client<T> {
                 Handled::Keyboard(KeyboardEvent::Keymap(result))
             }
             _ if !active => Handled::Done,
-            KeyboardMessage::Enter(surface, keys) => {
+            KeyboardMessage::Enter(serial, surface, keys) => {
                 if surface != SURFACE {
                     return Err("keyboard enter for unknown surface".into());
                 }
                 self.input.focus(&keys, true)?;
+                self.focus_serial = Some(serial);
                 Handled::Keyboard(KeyboardEvent::Focus(true))
             }
             KeyboardMessage::Leave(surface) => {
@@ -939,6 +957,7 @@ impl<T: Tag> Client<T> {
                     return Err("keyboard leave for unknown surface".into());
                 }
                 self.input.focus(&[], false)?;
+                self.focus_serial = None;
                 self.held = Held::default();
                 self.clear_selection()?;
                 Handled::Keyboard(KeyboardEvent::Focus(false))
@@ -1034,6 +1053,17 @@ impl<T: Tag> Client<T> {
     /// Past the initial roundtrip.
     pub fn bound(&self) -> bool {
         self.bound
+    }
+
+    /// Whether the last applied toplevel configure carried the `activated`
+    /// state: the window is the one the compositor directs input to.
+    pub fn activated(&self) -> bool {
+        self.activated
+    }
+
+    /// The buffer the last `present` attached, until another replaces it.
+    pub fn presented(&self) -> Option<u32> {
+        self.presented
     }
 
     /// At least one configure was acknowledged.
@@ -1189,6 +1219,7 @@ impl<T: Tag> Client<T> {
         self.connection.words(SURFACE, 3, &[callback])?;
         self.connection.words(SURFACE, 6, &[])?;
         self.buffers.get_mut(index).ok_or("buffer slot")?.busy = true;
+        self.presented = Some(id);
         // Occluded surfaces may receive no callback until visible. Only the
         // initial handshake and submission have a deadline.
         self.connection.set_startup_deadline(None);
@@ -1337,15 +1368,20 @@ impl<T: Tag> Client<T> {
                 if width < 0 || height < 0 || length > 256 || length % 4 != 0 {
                     return Err("invalid toplevel configure".into());
                 }
+                let mut activated = false;
                 for _ in 0..length / 4 {
-                    cursor.u32()?;
+                    activated |= cursor.u32()? == ACTIVATED;
                 }
                 self.pending_size = Some((width, height));
+                self.pending_activated = Some(activated);
                 Handled::Done
             }
             (TOPLEVEL, 1) if self.bound => Handled::CloseRequested,
             (XDG_SURFACE, 0) if self.bound => {
                 let serial = cursor.u32()?;
+                if let Some(activated) = self.pending_activated.take() {
+                    self.activated = activated;
+                }
                 Handled::Configure {
                     size: self.pending_size.take(),
                     serial,
@@ -1439,7 +1475,7 @@ impl<T: Tag> Client<T> {
 
 enum KeyboardMessage {
     Map(u32, u32),
-    Enter(u32, Vec<u32>),
+    Enter(u32, u32, Vec<u32>),
     Leave(u32),
     Key(u32, u32, bool),
     Modifiers(Modifiers),
@@ -1452,7 +1488,7 @@ fn keyboard_message(message: &Message) -> Result<KeyboardMessage> {
     let event = match message.opcode {
         0 => KeyboardMessage::Map(cursor.u32()?, cursor.u32()?),
         1 => {
-            cursor.u32()?;
+            let serial = cursor.u32()?;
             let surface = cursor.u32()?;
             let bytes = cursor.u32()?;
             if bytes % 4 != 0 || bytes > 768 * 4 {
@@ -1462,7 +1498,7 @@ fn keyboard_message(message: &Message) -> Result<KeyboardMessage> {
             for _ in 0..bytes / 4 {
                 keys.push(cursor.u32()?);
             }
-            KeyboardMessage::Enter(surface, keys)
+            KeyboardMessage::Enter(serial, surface, keys)
         }
         2 => {
             cursor.u32()?;

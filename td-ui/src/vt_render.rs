@@ -1,15 +1,17 @@
-//! Model-to-pixels rendering (DESIGN.md section 11).
+//! The terminal's model-to-pixels rendering (td-term/DESIGN.md, "Font,
+//! keyboard, and rendering").
 //!
 //! Pure: it reads a snapshot and writes XRGB8888. It opens nothing, owns
 //! nothing, and allocates nothing in the cell loop but what an outline face
-//! covers into its atlas the first time it draws a glyph, so section 14's
-//! exact P6 PPM oracle can drive it without a compositor, a framebuffer, or
-//! a child process.
+//! covers into its atlas the first time it draws a glyph, so the exact P6
+//! PPM oracle can drive it without a compositor, a framebuffer, or a child
+//! process.
 
 use crate::atlas::{Entry, Slot, PAGE_WIDTH};
 use crate::face::Face;
 use crate::font::Font;
-use crate::term::{Attributes, Cell, Color, Terminal};
+use crate::raster::{self, Scale, Surface};
+use crate::vt::{Attributes, Cell, Color, Terminal};
 
 pub const BYTES_PER_PIXEL: usize = 4;
 
@@ -704,7 +706,8 @@ fn invert_pixel(pixels: &mut [u8], width: usize, height: usize, x: usize, y: usi
     }
 }
 
-/// Encode a rendered surface as binary P6 PPM, section 14's visual oracle.
+/// Encode a rendered surface as binary P6 PPM, the visual oracle: the
+/// raster's own encoder over exactly `width` by `height` pixels.
 pub fn ppm(pixels: &[u8], width: usize, height: usize) -> Result<Vec<u8>, String> {
     let expected = width
         .checked_mul(height)
@@ -716,17 +719,11 @@ pub fn ppm(pixels: &[u8], width: usize, height: usize) -> Result<Vec<u8>, String
             pixels.len()
         ));
     }
-    let header = format!("P6\n{width} {height}\n255\n");
-    let body = expected / BYTES_PER_PIXEL * 3;
-    let mut out = Vec::with_capacity(header.len().saturating_add(body));
-    out.extend_from_slice(header.as_bytes());
-    let (chunks, _) = pixels.as_chunks::<BYTES_PER_PIXEL>();
-    for [blue, green, red, _] in chunks.iter().copied() {
-        out.push(red);
-        out.push(green);
-        out.push(blue);
-    }
-    Ok(out)
+    let surface = Surface::new(width, height, Scale::default())
+        .map_err(|error| format!("surface {width}x{height}: {error}"))?;
+    let rgb = raster::rgb(pixels, surface, width * BYTES_PER_PIXEL)
+        .map_err(|error| format!("surface {width}x{height}: {error}"))?;
+    Ok(raster::ppm(surface, &rgb))
 }
 
 /// Decode a binary P6 PPM back to `(pixels, width, height)` in the same
@@ -823,6 +820,5 @@ pub fn selftest() -> Result<(), String> {
 }
 
 #[cfg(test)]
-#[cfg(not(feature = "target-recipe"))]
-#[path = "render_spec.rs"]
+#[path = "vt_render_spec.rs"]
 mod spec;

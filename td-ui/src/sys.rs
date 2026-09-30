@@ -1,15 +1,16 @@
-//! Linux x86-64 descriptor transport for the Wayland client and the
-//! clipboard destination's status commands; UNSAFE.md section 19. One
-//! function-scoped syscall instruction carries `recvmsg`, `sendmsg`,
-//! `fcntl` pinned to `F_DUPFD_CLOEXEC` for the transport and to `F_GETFL`
-//! and `F_SETFL` for the destination owner, and `poll` over exactly the
-//! connection's stream and its waker; one function-scoped adoption
-//! site owns freshly installed descriptors. Safe `std` owns connection
-//! setup, byte-only sends, timeouts, file creation and every close.
-//! Nothing here is reachable from another crate: the connection in
-//! `wayland` and the destination owner in `clipboard` are the callers,
-//! and a consumer that needs a raw surface of its own gets its own roster
-//! entry.
+//! Linux x86-64 descriptor transport for the Wayland client, the
+//! clipboard destination's status commands and the terminal's PTY;
+//! UNSAFE.md section 19. One function-scoped syscall instruction carries
+//! `recvmsg`, `sendmsg`, `fcntl` pinned to `F_DUPFD_CLOEXEC` for the
+//! transport and to `F_GETFL` and `F_SETFL` for the destination owner,
+//! `poll` over exactly the connection's stream and its waker, and `ioctl`
+//! pinned to the four PTY requests; one function-scoped adoption site
+//! owns freshly installed descriptors. Safe `std` owns connection setup,
+//! byte-only sends, timeouts, file creation and every close. Nothing here
+//! is reachable from another crate: the connection in `wayland`, the
+//! destination owner in `clipboard` and the terminal in `pty` are the
+//! callers, and a consumer that needs a raw surface of its own gets its
+//! own roster entry.
 
 use std::fs::File;
 use std::io;
@@ -23,7 +24,15 @@ const SYS_SENDMSG: usize = 46;
 const SYS_RECVMSG: usize = 47;
 const SYS_FCNTL: usize = 72;
 const SYS_POLL: usize = 7;
+const SYS_IOCTL: usize = 16;
 const POLLIN: i16 = 1;
+const TIOCSPTLCK: usize = 0x4004_5431;
+const TIOCGPTPEER: usize = 0x5441;
+const TIOCSWINSZ: usize = 0x5414;
+const TIOCGWINSZ: usize = 0x5413;
+/// `O_RDWR | O_NOCTTY | O_CLOEXEC`: the slave belongs to the child, never
+/// to this process, and does not leak across an unrelated exec.
+const PTY_PEER_FLAGS: usize = 0o2 | 0o400 | 0o2_000_000;
 const F_DUPFD_CLOEXEC: usize = 1030;
 const F_GETFL: usize = 3;
 const F_SETFL: usize = 4;
@@ -173,6 +182,54 @@ pub(crate) fn readable(
         Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok([false, false]),
         Err(e) => Err(e),
     }
+}
+
+/// Unlock a freshly opened `/dev/ptmx` master: a pointer to a zero `int`.
+pub(crate) fn unlock_pty(master: &File) -> io::Result<()> {
+    let unlocked: i32 = 0;
+    result(syscall3(
+        SYS_IOCTL,
+        master.as_raw_fd() as usize,
+        TIOCSPTLCK,
+        (&unlocked as *const i32) as usize,
+    ))
+    .map(|_| ())
+}
+
+/// The master's slave, by descriptor rather than by `/dev/pts` name: the
+/// flags are an immediate and the kernel installs a new descriptor.
+pub(crate) fn pty_peer(master: &File) -> io::Result<File> {
+    let value = result(syscall3(
+        SYS_IOCTL,
+        master.as_raw_fd() as usize,
+        TIOCGPTPEER,
+        PTY_PEER_FLAGS,
+    ))?;
+    let fd = i32::try_from(value).map_err(|_| io::Error::other("peer descriptor out of range"))?;
+    Ok(File::from(adopt(fd)))
+}
+
+/// Publish a `struct winsize`, four native `u16` words in kernel order.
+pub(crate) fn set_window_size(terminal: &File, words: [u16; 4]) -> io::Result<()> {
+    result(syscall3(
+        SYS_IOCTL,
+        terminal.as_raw_fd() as usize,
+        TIOCSWINSZ,
+        (&words as *const [u16; 4]) as usize,
+    ))
+    .map(|_| ())
+}
+
+/// Read a terminal's `struct winsize` back into four words.
+pub(crate) fn window_size(terminal: &File) -> io::Result<[u16; 4]> {
+    let mut words = [0u16; 4];
+    result(syscall3(
+        SYS_IOCTL,
+        terminal.as_raw_fd() as usize,
+        TIOCGWINSZ,
+        (&mut words as *mut [u16; 4]) as usize,
+    ))?;
+    Ok(words)
 }
 
 fn header(iov: &mut IoVec, control: &mut Control, length: usize) -> MsgHdr {

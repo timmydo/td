@@ -18,9 +18,6 @@ const MODULES: &[(&str, &str)] = &[
         "app_policy",
         include_str!("../../../td-busd/src/app_policy.rs"),
     ),
-    ("atlas", include_str!("../../../td-ui/src/atlas.rs")),
-    ("links", include_str!("../../../td-ui/src/links.rs")),
-    ("open", include_str!("../../../td-ui/src/open.rs")),
     (
         "attention",
         include_str!("../../../td-compositor/src/attention.rs"),
@@ -48,14 +45,11 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/configure.rs"),
     ),
     ("conn", include_str!("../../../td-compositor/src/conn.rs")),
-    ("coverage", include_str!("../../../td-ui/src/coverage.rs")),
     (
         "control",
         include_str!("../../../td-compositor/src/control.rs"),
     ),
     ("drm", include_str!("../../../td-compositor/src/drm.rs")),
-    ("face", include_str!("../../../td-ui/src/face.rs")),
-    ("face_file", include_str!("../../../td-ui/src/face_file.rs")),
     (
         "filter",
         include_str!("../../../td-compositor/src/filter.rs"),
@@ -79,7 +73,6 @@ const MODULES: &[(&str, &str)] = &[
         "keyboard",
         include_str!("../../../td-compositor/src/keyboard.rs"),
     ),
-    ("keys", include_str!("../../../td-compositor/src/keys.rs")),
     (
         "launcher",
         include_str!("../../../td-compositor/src/launcher.rs"),
@@ -100,11 +93,13 @@ const MODULES: &[(&str, &str)] = &[
         "positioner",
         include_str!("../../../td-compositor/src/positioner.rs"),
     ),
-    ("pty", include_str!("../../../td-compositor/src/pty.rs")),
-    ("ready", include_str!("../../../td-compositor/src/ready.rs")),
     (
-        "render",
-        include_str!("../../../td-compositor/src/render.rs"),
+        "proc_status",
+        include_str!("../../../td-compositor/src/proc_status.rs"),
+    ),
+    (
+        "reportable",
+        include_str!("../../../td-compositor/src/reportable.rs"),
     ),
     (
         "runtime",
@@ -119,21 +114,11 @@ const MODULES: &[(&str, &str)] = &[
         "session",
         include_str!("../../../td-compositor/src/session.rs"),
     ),
-    ("sfnt", include_str!("../../../td-ui/src/sfnt.rs")),
     (
         "socket",
         include_str!("../../../td-compositor/src/socket.rs"),
     ),
     ("sys", include_str!("../../../td-compositor/src/sys.rs")),
-    ("term", include_str!("../../../td-compositor/src/term.rs")),
-    (
-        "term_client",
-        include_str!("../../../td-compositor/src/term_client.rs"),
-    ),
-    (
-        "terminfo",
-        include_str!("../../../td-compositor/src/terminfo.rs"),
-    ),
     (
         "timezone",
         include_str!("../../../td-compositor/src/timezone.rs"),
@@ -267,13 +252,7 @@ pub fn recipe() -> Recipe {
             target: "td-compositor".into(),
             link: "{out}/bin/td-ui-demo".into(),
         },
-        // The terminal is the same artifact under a third name, not a second
-        // build of the same modules: argv[0] is what picks the program.
-        Step::Symlink {
-            target: "td-compositor".into(),
-            link: "{out}/bin/td-term".into(),
-        },
-        // And the control client under a fourth. It shares the artifact for a
+        // And the control client under a third. It shares the artifact for a
         // reason of its own: the request vocabulary and the compositor that
         // answers it are one module, so two binaries built from one source
         // cannot drift apart on the wire.
@@ -285,30 +264,9 @@ pub fn recipe() -> Recipe {
             paths: vec![
                 "{out}/bin/td-compositor".into(),
                 "{out}/bin/td-ui-demo".into(),
-                "{out}/bin/td-term".into(),
                 "{out}/bin/td-ctl".into(),
             ],
             exec: true,
-        },
-        // The just-built binary writes its own terminfo entry: one encoder,
-        // and the bytes the image installs are the bytes its tests decode.
-        // `tic` and a host terminfo database are not inputs. This runs after
-        // the Require above, so a binary that failed to link is reported as
-        // that rather than as a mysteriously failing build step.
-        Step::MkDir {
-            path: "{out}/share/terminfo/t".into(),
-        },
-        Step::run(
-            "{out}",
-            &[
-                "{out}/bin/td-compositor",
-                "terminfo",
-                "{out}/share/terminfo/t/td-term",
-            ],
-        ),
-        Step::Require {
-            paths: vec!["{out}/share/terminfo/t/td-term".into()],
-            exec: false,
         },
         target_rustc(
             "{src}",
@@ -351,7 +309,6 @@ pub fn recipe() -> Recipe {
         Step::assert_static(&[
             "{out}/bin/td-compositor",
             "{out}/bin/td-ui-demo",
-            "{out}/bin/td-term",
             "{out}/bin/td-ctl",
         ]),
     ]);
@@ -374,8 +331,7 @@ mod tests {
         TD_APPLICATION_CONFIG_PATH, TD_APPLICATION_LAUNCHER_TABLE, TD_APPLICATION_REGISTRY,
         TD_JAIL_FIXTURE_ALIAS, TD_JAIL_FIXTURE_DOWNLOAD_TARGET, TD_JAIL_FIXTURE_ENTRY,
         TD_JAIL_FIXTURE_GRANT_FILE, TD_JAIL_FIXTURE_GRANT_ROOT, TD_JAIL_FIXTURE_PICTURES_TARGET,
-        TD_POINTER_ABSOLUTE_MARKER, TD_TERM_RUNTIME_MARKER, TD_UI_CLIENT_RUNTIME_MARKER,
-        TD_WAYLAND_RUNTIME_MARKER,
+        TD_POINTER_ABSOLUTE_MARKER, TD_UI_CLIENT_RUNTIME_MARKER, TD_WAYLAND_RUNTIME_MARKER,
     };
     use crate::ladder::{TD_COMPOSITOR_FLIP_MARKER, TD_COMPOSITOR_KMS_MARKER};
 
@@ -626,15 +582,6 @@ mod tests {
         assert!(client.contains(&format!(
             "writeln!(out, \"{TD_UI_CLIENT_RUNTIME_MARKER} surface={{}}x{{}}\", width, height)"
         )));
-        // The terminal's marker is the boot oracle's first-client proof since
-        // the cutover, so the literal is pinned here as the other two are.
-        let ready = MODULES
-            .iter()
-            .find_map(|(name, source)| (*name == "ready").then_some(*source))
-            .expect("ready source");
-        assert!(ready.contains(&format!(
-            "pub const MARKER: &str = \"{TD_TERM_RUNTIME_MARKER}\";"
-        )));
         // The absolute-pointer marker is the only evidence that a real device
         // answered `EVIOCGABS`, and the whole CALL is pinned as the three
         // above are — a literal alone would be satisfied by a `const` nothing
@@ -661,90 +608,6 @@ mod tests {
         ]
         .join("\n");
         assert!(input.contains(&emit), "input.rs no longer emits the marker");
-    }
-
-    /// One artifact, three names. The symlink is what makes the terminal
-    /// reachable at all: `main` picks its program from argv[0], so a missing
-    /// link is not a build error anywhere — it is an image with no terminal
-    /// and nothing to say so.
-    #[test]
-    fn the_terminal_ships_as_a_name_on_the_compositor() {
-        let steps = recipe().steps.expect("steps");
-        let linked = steps.iter().any(|step| {
-            matches!(step, Step::Symlink { target, link }
-                if target == "td-compositor" && link == "{out}/bin/td-term")
-        });
-        assert!(linked, "nothing installs the td-term name");
-        // A name nothing requires is one a failed link leaves missing with the
-        // build still green, and one nothing asserts static is a name the
-        // image could ship dynamically linked.
-        let required = steps.iter().any(|step| {
-            matches!(step, Step::Require { paths, exec }
-                if *exec && paths.iter().any(|path| path == "{out}/bin/td-term"))
-        });
-        assert!(required, "nothing requires td-term to exist and execute");
-        let asserted = steps.iter().any(|step| {
-            matches!(step, Step::AssertStatic { paths }
-                if paths.iter().any(|path| path == "{out}/bin/td-term"))
-        });
-        assert!(asserted, "nothing asserts td-term is static");
-        // And the binary answers to it. Both halves are needed: a link to a
-        // binary that does not know the name would dispatch to the compositor.
-        assert!(MAIN_RS.contains(r#"Some("td-term") => Personality::Term,"#));
-    }
-
-    /// The recipe writes the terminfo entry at a path the compositor's own
-    /// module also spells, and the two never compile against each other, so a
-    /// divergence would be caught by nothing without this. The binary refuses
-    /// a path not ending in its constant, which makes a wrong STORE path a
-    /// build failure.
-    ///
-    /// Reaching it is the image's half: the child is given
-    /// `TERMINFO=/etc/terminfo`, and `IMMUTABLE_ETC` in the system recipe
-    /// points that name at this directory — the category that landing added
-    /// for exactly this, since every other `/etc` symlink there dangles by
-    /// design and this one must not.
-    #[test]
-    fn the_terminfo_entry_is_installed_where_the_encoder_expects() {
-        let terminfo = MODULES
-            .iter()
-            .filter(|(name, _)| *name == "terminfo")
-            .map(|(_, source)| *source)
-            .next()
-            .expect("terminfo source");
-        assert!(terminfo
-            .contains(r#"pub(crate) const INSTALL_PATH: &str = "share/terminfo/t/td-term";"#));
-        let steps = recipe().steps.expect("steps");
-        let writes = steps.iter().any(|step| {
-            matches!(step, Step::Run { argv, .. }
-                if argv.iter().any(|word| word == "terminfo")
-                    && argv.iter().any(|word| word == "{out}/share/terminfo/t/td-term"))
-        });
-        assert!(writes, "no step installs the terminfo entry");
-    }
-
-    /// td-term's child command is an absolute path into a DIFFERENT staged
-    /// package plus a flag that package must parse. Neither crate compiles
-    /// against the other, so nothing but this would notice `--stdin` being
-    /// renamed on one side: the terminal would build, ship, and fail at the
-    /// first spawn. Both recipes' sources are embedded here, so pin them
-    /// against each other where both are already in hand.
-    #[test]
-    fn the_terminals_session_wrapper_matches_the_staged_td_init() {
-        const CTTYHACK: &str = include_str!("../../../td-init/src/cttyhack.rs");
-        let pty = MODULES
-            .iter()
-            .find_map(|(name, source)| (*name == "pty").then_some(*source))
-            .expect("pty source");
-        assert!(pty.contains(r#"pub const CTTYHACK: &str = "/bin/cttyhack";"#));
-        assert!(pty.contains(r#"pub const CTTYHACK_STDIN: &str = "--stdin";"#));
-        assert!(CTTYHACK.contains(r#"const STDIN_FLAG: &str = "--stdin";"#));
-        // And that the applet still advertises it, so `cttyhack` alone tells an
-        // operator the mode exists.
-        assert!(CTTYHACK.contains("usage: cttyhack [--stdin] PROG [ARG...]"));
-        // `/bin/cttyhack` is td-init's own symlink name in the image roster.
-        const INIT_MAIN: &str = include_str!("../../../td-init/src/main.rs");
-        assert!(INIT_MAIN.contains(r#"("cttyhack", cttyhack::run)"#));
     }
 
     /// The ladder's markers and the strings the compositor actually prints are

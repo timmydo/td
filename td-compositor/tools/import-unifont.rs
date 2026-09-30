@@ -1,8 +1,9 @@
 #![deny(unsafe_code)]
 
-//! Converts GNU Unifont's `.hex` release into the single PSF2 face section 11
-//! pins. Upstream ships no full-coverage PSF2 -- only an APL-specific PSF1 --
-//! so the committed asset is derived here rather than downloaded, and this
+//! Converts GNU Unifont's `.hex` release into the single PSF2 face
+//! td-term/DESIGN.md §3 pins. Upstream ships no full-coverage PSF2 -- only an
+//! APL-specific PSF1 -- so the committed asset is derived here rather than
+//! downloaded, and this
 //! tool is what makes that derivation reproducible from a hash-pinned input.
 
 use std::collections::BTreeMap;
@@ -30,7 +31,7 @@ const ASSET_FILE: &str = "unifont-16.0.04-8x16.psf2";
 /// fails in the target build while every host test still passes.
 const MODULE_FILE: &str = "font_data.rs";
 
-/// Single-width cells only: section 13 makes double-width a deliberate
+/// Single-width cells only: td-term/DESIGN.md §2 makes double-width a deliberate
 /// first-profile exclusion, and PSF2 has one fixed cell for every glyph, so a
 /// face carrying Unifont's 16x16 glyphs could not describe them anyway.
 const GLYPH_WIDTH: usize = 8;
@@ -53,7 +54,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("td-term-import-unifont: {error}");
+            eprintln!("td-compositor-import-unifont: {error}");
             ExitCode::FAILURE
         }
     }
@@ -61,7 +62,7 @@ fn main() -> ExitCode {
 
 fn usage() -> String {
     format!(
-        "usage: td-term-import-unifont <unifont_all-*.hex> <out-dir>\n  \
+        "usage: td-compositor-import-unifont <unifont_all-*.hex> <out-dir>\n  \
          expects the decompressed hex of {ARCHIVE_URL}"
     )
 }

@@ -28,6 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::layout::{Command, Direction, Presentation, Rect, FINAL_WORKSPACE, INITIAL_WORKSPACE};
+use crate::reportable::reportable;
 use crate::runtime::{Runtime, Sent};
 use crate::scene::SurfaceKey;
 use crate::session::SocketPolicy;
@@ -824,39 +825,6 @@ fn clean_app_id(app_id: Option<&str>) -> String {
         })
         .take(TITLE_LIMIT)
         .collect()
-}
-
-/// Whether a character may appear in a record.
-///
-/// `char::is_control` is Unicode category Cc and is NOT the whole answer, which
-/// an earlier draft of this assumed. Two more kinds matter and neither is Cc:
-///
-/// - U+2028 and U+2029 END A LINE for readers that are not `str::lines` —
-///   Python's `splitlines` among them, and a program in Python is exactly the
-///   reader this report is for. A title carrying one forges a record there
-///   while looking harmless here.
-/// - the bidirectional controls and the zero-width characters change how the
-///   line READS without changing what it contains. That is the same objection
-///   the carriage return already answers: a person reading `td-ctl layout` out
-///   of a terminal should see what the record says.
-///
-/// A list rather than a category test, because this crate has no Unicode
-/// tables and will not grow one for a label field, nor for the screen rows and
-/// program names td-term reports through it. Ordinary text in any script
-/// survives; what does not is the set below, named with its reason.
-pub(crate) fn reportable(character: char) -> bool {
-    !character.is_control()
-        && !matches!(character,
-            // Line and paragraph separators (Zl, Zp).
-            '\u{2028}' | '\u{2029}'
-            // Zero-width and the directional marks (U+200B-200F).
-            | '\u{200b}'..='\u{200f}'
-            // Bidirectional embedding, override and pop (U+202A-202E).
-            | '\u{202a}'..='\u{202e}'
-            // Bidirectional isolates (U+2066-2069).
-            | '\u{2066}'..='\u{2069}'
-            // The remaining invisibles a title has no use for.
-            | '\u{00ad}' | '\u{061c}' | '\u{180e}' | '\u{feff}')
 }
 
 /// Apply one request and answer it. The report is BUILT here, under the

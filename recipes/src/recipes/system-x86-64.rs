@@ -1219,7 +1219,7 @@ const WINDOW_RECORD: &str = "^window id=[^ ]* object=[^ ]* workspace=[^ ]* x=[^ 
 /// The td-term terminfo entry as the image stages it: the one store file
 /// td-jail admits at a fixed mode, `0444`, which the staging copy loses and
 /// the mode-fixing step restores; the root-tree check reads it back.
-const TERMINFO_ENTRY: &str = "{root}/real-root{in:td-compositor}/share/terminfo/t/td-term";
+const TERMINFO_ENTRY: &str = "{root}/real-root{in:td-term-terminfo}/share/terminfo/t/td-term";
 
 pub(super) const ROOTCHECK_ETC_NAME: &str = "rootcheck";
 pub(super) const SHADOW_ETC_NAME: &str = "shadow";
@@ -3566,7 +3566,7 @@ const IMMUTABLE_ETC: &[ImmutableEtc] = &[
     },
     ImmutableEtc {
         etc: "terminfo",
-        target: "{in:td-compositor}/share/terminfo",
+        target: "{in:td-term-terminfo}/share/terminfo",
         why: "ncurses resolves TERM through TERMINFO, and td-term hands its child \
               TERMINFO=/etc/terminfo because a content-addressed store path is not \
               a name any child could have been given",
@@ -4253,6 +4253,21 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-taskmgr}/bin/td-taskmgr".into(),
         link: "{root}/real-root/bin/td-taskmgr".into(),
     });
+    // td-term, the terminal (td-term/DESIGN.md): a static system-tree program
+    // the session starts and the launcher opens, and its compiled terminfo
+    // entry, a data package `/etc/terminfo` names.
+    steps.push(Step::CopyTree {
+        from: "{in:td-term}".into(),
+        dest: "{root}/real-root{in:td-term}".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-term}/bin/td-term".into(),
+        link: "{root}/real-root/bin/td-term".into(),
+    });
+    steps.push(Step::CopyTree {
+        from: "{in:td-term-terminfo}".into(),
+        dest: "{root}/real-root{in:td-term-terminfo}".into(),
+    });
     // td-photo, the photo tool, a static system-tree program run from the
     // terminal (td-photo/DESIGN.md).
     steps.push(Step::CopyTree {
@@ -4525,10 +4540,6 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     steps.push(Step::Symlink {
         target: "{in:td-compositor}/bin/td-compositor".into(),
         link: "{root}/real-root/bin/td-compositor".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "{in:td-compositor}/bin/td-term".into(),
-        link: "{root}/real-root/bin/td-term".into(),
     });
     // /bin/td-ctl — the control client. A name in `/bin` because a person in a
     // terminal is who runs it, and the session hands it its socket through the
@@ -4890,8 +4901,8 @@ fn shape_check() -> String {
      audio=\"{root}/real-root{in:td-audio}/bin/td-audio\"; { [ -f \"$audio\" ] && [ -x \"$audio\" ]; } || { echo 'root tree: td-audio is not packed and executable' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-compositor\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-compositor\" ] || { echo 'root tree: /bin/td-compositor is not a symlink to the staged software Wayland compositor' >&2; exit 1; }; \
      compositor=\"{root}/real-root{in:td-compositor}/bin/td-compositor\"; { [ -f \"$compositor\" ] && [ -x \"$compositor\" ]; } || { echo 'root tree: td-compositor is not packed and executable' >&2; exit 1; }; \
-     [ \"$(readlink \"$root/bin/td-term\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-term\" ] || { echo 'root tree: /bin/td-term is not a symlink to the staged terminal' >&2; exit 1; }; \
-     tdterm=\"{root}/real-root{in:td-compositor}/bin/td-term\"; { [ -f \"$tdterm\" ] && [ -x \"$tdterm\" ]; } || { echo 'root tree: td-term is not packed/executable at real-root{in:td-compositor}/bin/td-term - the /bin/td-term symlink would dangle' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-term\" 2>/dev/null)\" = \"{in:td-term}/bin/td-term\" ] || { echo 'root tree: /bin/td-term is not a symlink to the staged terminal' >&2; exit 1; }; \
+     tdterm=\"{root}/real-root{in:td-term}/bin/td-term\"; { [ -f \"$tdterm\" ] && [ -x \"$tdterm\" ]; } || { echo 'root tree: td-term is not packed/executable at real-root{in:td-term}/bin/td-term - the /bin/td-term symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-ctl\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-ctl\" ] || { echo 'root tree: /bin/td-ctl is not a symlink to the staged control client' >&2; exit 1; }; \
      tdctl=\"{root}/real-root{in:td-compositor}/bin/td-ctl\"; { [ -f \"$tdctl\" ] && [ -x \"$tdctl\" ]; } || { echo 'root tree: td-ctl is not packed/executable at real-root{in:td-compositor}/bin/td-ctl - the /bin/td-ctl symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-busd\" 2>/dev/null)\" = \"{in:td-busd}/bin/td-busd\" ] || { echo 'root tree: /bin/td-busd is not a symlink to the staged session bus broker - the busd unit names it in full, so this is the only thing standing between that unit and exec-ing nothing' >&2; exit 1; }; \
@@ -5352,6 +5363,8 @@ pub fn recipe() -> Recipe {
             "td-svc",
             "td-profiler",
             "td-taskmgr",
+            "td-term",
+            "td-term-terminfo",
             "td-photo",
             "td-jail",
             "td-seatd",
@@ -7145,7 +7158,7 @@ mod tests {
         let steps = real_root_steps(&SYSTEM).unwrap();
         for (name, package) in [
             ("td-authd", "td-authd"),
-            ("td-term", "td-compositor"),
+            ("td-term", "td-term"),
             ("td-taskmgr", "td-taskmgr"),
             ("td-photo", "td-photo"),
         ] {
@@ -10114,21 +10127,46 @@ mod tests {
         }
     }
 
-    /// The terminal is packaged under its own name. Asserted on the steps
-    /// because the boot does not start it yet — nothing else would notice the
-    /// symlink going missing until the cutover landing tried to run it.
+    /// The terminal is its own static package, packed rather than merely
+    /// symlinked, beside its terminfo data package, and both are declared
+    /// inputs so their `{in:...}` names resolve.
     #[test]
     fn the_terminal_is_packaged_as_bin_td_term() {
         let steps = real_root_steps(&SYSTEM).unwrap();
+        for package in ["td-term", "td-term-terminfo"] {
+            assert!(
+                steps.iter().any(|step| matches!(
+                    step,
+                    Step::CopyTree { from, dest }
+                        if from == &format!("{{in:{package}}}")
+                            && dest == &format!("{{root}}/real-root{{in:{package}}}")
+                )),
+                "{package} must be CopyTree'd into the immutable root"
+            );
+        }
         assert!(
             steps.iter().any(|step| matches!(
                 step,
                 Step::Symlink { target, link }
-                    if target == "{in:td-compositor}/bin/td-term"
+                    if target == "{in:td-term}/bin/td-term"
                         && link == "{root}/real-root/bin/td-term"
             )),
-            "/bin/td-term does not symlink into the staged td-compositor package"
+            "/bin/td-term does not symlink into the staged td-term package"
         );
+        assert!(
+            !steps.iter().any(|step| matches!(
+                step,
+                Step::Symlink { target, .. } if target == "{in:td-compositor}/bin/td-term"
+            )),
+            "the compositor no longer carries a td-term name"
+        );
+        let native_inputs = recipe().native_inputs.expect("system native inputs");
+        for package in ["td-term", "td-term-terminfo"] {
+            assert!(
+                native_inputs.iter().any(|input| input == package),
+                "{package} must be a declared native input"
+            );
+        }
     }
 
     /// The staged tree must carry one symlink per table entry, with the recorded
@@ -11844,17 +11882,17 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// grant requires of the file it binds: the packed copy is made writable
     /// by its owner when it is staged, so the mode-fixing step restores the
     /// mode before the packer runs, and the root-tree check refuses an image
-    /// where it did not. Pinned to the path the compositor installs the entry
+    /// where it did not. Pinned to the path td-term installs the entry
     /// at, the mode the jail reads, the step's place before the packer, and
     /// the applets the step and the check run under, because a drift in any
     /// of them is a boot whose every terminal window closes on a refusal, or
     /// an image build refused for a mode it could not read.
     #[test]
     fn the_terminfo_entry_is_packed_at_the_mode_the_jail_admits() {
-        let terminfo = include_str!("../../../td-compositor/src/terminfo.rs");
+        let terminfo = include_str!("../../../td-ui/src/vt_terminfo.rs");
         assert!(
             terminfo.contains("const INSTALL_PATH: &str = \"share/terminfo/t/td-term\";"),
-            "the compositor installs its entry somewhere else"
+            "td-term installs its entry somewhere else"
         );
         assert!(TERMINFO_ENTRY.ends_with("/share/terminfo/t/td-term"));
         // The rule is looked for in the readback's own body, not anywhere

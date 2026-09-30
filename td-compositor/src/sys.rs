@@ -1,10 +1,9 @@
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::io::Write;
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 
 const SYS_CLOSE: usize = 3;
@@ -19,7 +18,7 @@ const SYS_CLOCK_GETTIME: usize = 228;
 const CLOCK_MONOTONIC: i32 = 1;
 
 /// The only `fcntl(2)` commands this crate may issue. They temporarily make
-/// one clipboard destination nonblocking so a receiver cannot park td-term's
+/// one clipboard destination nonblocking so a receiver cannot park the
 /// sole bounded writer forever.
 const F_GETFL: usize = 3;
 const F_SETFL: usize = 4;
@@ -28,10 +27,7 @@ const O_NONBLOCK: usize = 0o4000;
 /// The only `ioctl(2)` requests this crate may issue, pinned by value. A request
 /// number encodes direction, argument size, and target driver, so a wrong one is
 /// a different kernel operation performed on whatever argument is at hand.
-const TIOCSPTLCK: usize = 0x4004_5431;
-const TIOCGPTPEER: usize = 0x5441;
-const TIOCSWINSZ: usize = 0x5414;
-const TIOCGWINSZ: usize = 0x5413;
+///
 /// `EVIOCGABS(ABS_X)` and `EVIOCGABS(ABS_Y)`. The size field of an evdev
 /// request encodes `sizeof(struct input_absinfo)`, so these two numbers assert
 /// the 24-byte buffer below as much as `ABSINFO_WORDS` does.
@@ -213,14 +209,6 @@ const MAX_DRM_MODES: u32 = 256;
 /// to the same prefix would have inflated that count by one.
 const DRM_RESTART_ATTEMPTS: usize = 16;
 
-/// `O_NOCTTY` — the terminal td-term creates belongs to the child it starts, so
-/// neither the peer descriptor nor its duplicate may acquire it by side effect.
-const O_NOCTTY: i32 = 0o400;
-
-/// `O_RDWR | O_NOCTTY | O_CLOEXEC`, the flags `TIOCGPTPEER` opens the slave
-/// with. These are the x86-64 ABI values, as the syscall numbers above are;
-/// `O_CLOEXEC` in particular differs on Alpha and SPARC.
-const PTY_PEER_FLAGS: usize = 0o2 | 0o400 | 0o2_000_000;
 const SOL_SOCKET: i32 = 1;
 const SCM_RIGHTS: i32 = 1;
 const SO_PEERCRED: i32 = 17;
@@ -377,7 +365,7 @@ pub fn restore_status_flags(file: &impl AsRawFd, flags: usize) -> Result<(), Str
 /// roster, so a mistyped or newly invented number cannot reach the kernel
 /// without amending both this list and the confinement tests that pin it.
 ///
-/// Terminal/evdev failures propagate to their caller, including interrupted
+/// Evdev failures propagate to their caller, including interrupted
 /// clock selection. DRM operations use the bounded `drm_ioctl` retry loop
 /// below; retry behavior belongs to the operation.
 fn ioctl_checked(
@@ -388,11 +376,7 @@ fn ioctl_checked(
 ) -> Result<isize, String> {
     if !matches!(
         request,
-        TIOCSPTLCK
-            | TIOCGPTPEER
-            | TIOCSWINSZ
-            | TIOCGWINSZ
-            | EVIOCGABS_X
+        EVIOCGABS_X
             | EVIOCGABS_Y
             | EVIOCSCLOCKID
             | DRM_IOCTL_VERSION
@@ -477,98 +461,6 @@ pub fn peer_uid(stream: &UnixStream) -> Result<u32, String> {
         .ok_or_else(|| "SO_PEERCRED uid word is absent".to_string())
 }
 
-/// The kernel's `struct winsize`: four native-endian `u16` fields. The pixel
-/// pair is reported as zero because td-term publishes a character grid.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct WindowSize {
-    pub rows: u16,
-    pub columns: u16,
-    pub x_pixels: u16,
-    pub y_pixels: u16,
-}
-
-/// The eight bytes the kernel actually reads and writes. `[u16; 4]` rather than
-/// a `#[repr(C)]` struct because the language guarantees this layout, which
-/// makes the field ORDER an ordinary tested function instead of an attribute
-/// nobody can observe: a swapped pair is a well-formed resize to another size.
-fn winsize_words(size: WindowSize) -> [u16; 4] {
-    [size.rows, size.columns, size.x_pixels, size.y_pixels]
-}
-
-fn winsize_from_words(words: [u16; 4]) -> WindowSize {
-    let [rows, columns, x_pixels, y_pixels] = words;
-    WindowSize {
-        rows,
-        columns,
-        x_pixels,
-        y_pixels,
-    }
-}
-
-/// Unlock a freshly opened `/dev/ptmx` master. `TIOCSPTLCK` takes a pointer to a
-/// four-byte `int`; zero unlocks.
-pub fn unlock_pty(master: &impl AsRawFd) -> Result<(), String> {
-    let unlocked: i32 = 0;
-    ioctl(
-        master.as_raw_fd(),
-        TIOCSPTLCK,
-        (&unlocked as *const i32) as usize,
-        "TIOCSPTLCK",
-    )?;
-    Ok(())
-}
-
-/// Obtain the master's slave. `TIOCGPTPEER` takes the open flags as an immediate
-/// rather than a pointer and returns a new descriptor for the same peer the
-/// master already names, so no `/dev/pts/N` name is resolved.
-///
-/// The returned number is reopened exactly once through `/proc/self/fd/N`
-/// and closed. The descriptor's inode belongs to this terminal identity.
-/// The received-file unsafe conversion remains scoped to SCM_RIGHTS.
-pub fn pty_peer(master: &impl AsRawFd) -> Result<File, String> {
-    let raw = ioctl(
-        master.as_raw_fd(),
-        TIOCGPTPEER,
-        PTY_PEER_FLAGS,
-        "TIOCGPTPEER",
-    )?;
-    let fd = RawFd::try_from(raw)
-        .map_err(|_| format!("TIOCGPTPEER returned invalid descriptor {raw}"))?;
-    reopen_and_close(
-        fd,
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(O_NOCTTY),
-        "terminal peer",
-    )
-}
-
-/// Publish a grid size on a terminal.
-pub fn set_window_size(terminal: &impl AsRawFd, size: WindowSize) -> Result<(), String> {
-    let words = winsize_words(size);
-    ioctl(
-        terminal.as_raw_fd(),
-        TIOCSWINSZ,
-        (&words as *const [u16; 4]) as usize,
-        "TIOCSWINSZ",
-    )?;
-    Ok(())
-}
-
-/// Read back a terminal's grid size. Every published size is verified through
-/// this call before the child is allowed to observe it.
-pub fn window_size(terminal: &impl AsRawFd) -> Result<WindowSize, String> {
-    let mut words = [0u16; 4];
-    ioctl(
-        terminal.as_raw_fd(),
-        TIOCGWINSZ,
-        (&mut words as *mut [u16; 4]) as usize,
-        "TIOCGWINSZ",
-    )?;
-    Ok(winsize_from_words(words))
-}
-
 /// Which axis of an absolute device to ask about. An ENUM rather than a
 /// request number at the call site, for `Disposition`'s reason in td-sh: the
 /// two range requests differ in one nibble, and a caller that could supply
@@ -648,12 +540,11 @@ pub fn monotonic_time() -> Result<u128, String> {
 /// Ask an absolute device where one of its axes is and what range it reports
 /// over.
 ///
-/// `[i32; 6]` rather than a `#[repr(C)]` struct for `winsize`'s reason: the
-/// language guarantees this layout, which makes the field ORDER a tested
-/// function rather than an attribute nobody can observe. It matters more here
-/// than there — `value`, `minimum` and `maximum` are three adjacent words of
-/// the same type, so an index off by one is a well-formed range that maps every
-/// report to the wrong place on screen.
+/// `[i32; 6]` rather than a `#[repr(C)]` struct: the language guarantees this
+/// layout, which makes the field ORDER a tested function rather than an
+/// attribute nobody can observe. `value`, `minimum` and `maximum` are three
+/// adjacent words of the same type, so an index off by one is a well-formed
+/// range that maps every report to the wrong place on screen.
 pub fn absolute_info(device: &impl AsRawFd, axis: AbsAxis) -> Result<AbsInfo, String> {
     let (request, name) = axis.request();
     let mut words = [0i32; ABSINFO_WORDS];
@@ -2007,25 +1898,6 @@ pub fn send_prefix_with_fd(stream: &UnixStream, bytes: &[u8], fd: RawFd) -> io::
     Ok(sent)
 }
 
-/// Adopt a raw descriptor by reopening it through `/proc/self/fd/N` and closing
-/// the original. Both outcomes are reported: a duplicate that leaked its source
-/// is as much a failure as one that never opened.
-fn reopen_and_close(fd: RawFd, options: &OpenOptions, what: &str) -> Result<File, String> {
-    if fd < 0 {
-        return Err(format!("invalid {what} descriptor {fd}"));
-    }
-    let result = options
-        .open(format!("/proc/self/fd/{fd}"))
-        .map_err(|e| format!("duplicate fd {fd}: {e}"));
-    let close = close_raw(fd);
-    match (result, close) {
-        (Ok(file), Ok(())) => Ok(file),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(open), Err(close)) => Err(format!("{open}; {close}")),
-    }
-}
-
 /// Consume one fresh SCM_RIGHTS descriptor without another permission check.
 pub fn take_received(fd: RawFd) -> Result<File, String> {
     ReceivedFd::adopt(fd).map(ReceivedFd::into_file)
@@ -2080,6 +1952,7 @@ pub fn discard_received(fds: &[RawFd]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
 
     /// A modeless connector's fill must not send `count_modes == 0`, the
     /// kernel's force-probe request; a cached list is read at its own size.
@@ -2382,22 +2255,6 @@ mod tests {
         );
     }
 
-    /// The kernel reads eight bytes and takes the row count from the first
-    /// field. Rows and columns are the pair a swap would silently exchange, so
-    /// the order is asserted in both directions against distinct values.
-    #[test]
-    fn winsize_words_keep_the_kernel_field_order() {
-        let size = WindowSize {
-            rows: 24,
-            columns: 80,
-            x_pixels: 3,
-            y_pixels: 4,
-        };
-        assert_eq!(winsize_words(size), [24, 80, 3, 4]);
-        assert_eq!(winsize_from_words([24, 80, 3, 4]), size);
-        assert_eq!(std::mem::size_of::<[u16; 4]>(), 8);
-    }
-
     /// The roster is the confinement: a request outside it never reaches the
     /// kernel, whatever descriptor or argument the caller composed.
     #[test]
@@ -2407,16 +2264,18 @@ mod tests {
             error.contains("refusing unreviewed ioctl request 0x5401"),
             "{error}"
         );
-        for request in [
-            TIOCSPTLCK,
-            TIOCGPTPEER,
-            TIOCSWINSZ,
-            TIOCGWINSZ,
-            EVIOCGABS_X,
-            EVIOCGABS_Y,
-        ] {
+        for request in [EVIOCGABS_X, EVIOCGABS_Y] {
             let error = ioctl(-1, request, 0, "pinned").unwrap_err();
             assert!(error.contains("invalid descriptor -1"), "{error}");
+        }
+        // The terminal's four PTY requests left with td-term: the compositor
+        // owns no terminal, so each is refused like any other stranger.
+        for request in [0x4004_5431, 0x5441, 0x5414, 0x5413] {
+            let error = ioctl(-1, request, 0, "former pty").unwrap_err();
+            assert!(
+                error.contains("refusing unreviewed ioctl request"),
+                "{error}"
+            );
         }
     }
 

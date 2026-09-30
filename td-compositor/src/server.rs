@@ -18,8 +18,6 @@ use crate::scene::{
     MAX_CURSOR_DIMENSION, MAX_INPUT_REGION_OPERATIONS, MAX_SUBSURFACE_DEPTH, SHM_ARGB8888,
     SHM_XRGB8888,
 };
-#[cfg(test)]
-use crate::scene::{GAP, TITLE_HEIGHT};
 use crate::session::SocketPolicy;
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -11027,123 +11025,6 @@ mod tests {
         worker.join().unwrap().unwrap();
         fs::remove_file(framebuffer_path).unwrap();
         fs::remove_file(pool_path).unwrap();
-    }
-
-    /// The terminal presenting against the REAL server. Every other test of
-    /// `term_client` hands `dispatch` events it built itself, so this is the
-    /// only one that would catch a wrong opcode, a wrong object id, a
-    /// mis-ordered request, or an event arm that is missing.
-    ///
-    /// It is also the whole argument for the ORDER: a client that attached no
-    /// buffer would never be mapped, would receive only the initial zero
-    /// configure, and would announce its own 80x24 default. Having presented,
-    /// this one is mapped and holds the tile the compositor actually gave it —
-    /// so the grid asserted below is the compositor's and not the fallback,
-    /// and swapping the frame back behind readiness makes it the fallback
-    /// again.
-    #[test]
-    fn td_term_presents_a_frame_and_sizes_a_pty_to_the_grid_it_was_given() {
-        let stem = format!(
-            "td-term-integration-{}-{}",
-            std::process::id(),
-            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
-        );
-        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
-        let framebuffer =
-            Framebuffer::test_file(&framebuffer_path, 640, 400 + BAR_HEIGHT, 640 * 4).unwrap();
-        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
-        runtime.lock().unwrap().repaint().unwrap();
-        let (server, client) = UnixStream::pair().unwrap();
-        let thread_runtime = Arc::clone(&runtime);
-        let keymap = test_keymap();
-        let worker = thread::spawn(move || serve_client(server, 78, thread_runtime, keymap));
-
-        let (connection, prepared) = crate::term_client::prepare_for_test(
-            client,
-            &std::env::temp_dir(),
-            std::path::Path::new(crate::pty::DEV_PTMX),
-        )
-        .unwrap();
-        let (pty, size, cells) = (&prepared.pty, prepared.size().unwrap(), prepared.cells);
-        let font = crate::font::pinned().unwrap();
-
-        // The tile this output gives one surface, not the client's own guess.
-        assert_eq!(
-            size,
-            crate::term_client::Size {
-                width: 592,
-                height: 332
-            }
-        );
-        assert_eq!(
-            runtime.lock().unwrap().surface_size(SurfaceKey {
-                client: 78,
-                object: 7,
-            }),
-            Some((592, 332))
-        );
-        assert_eq!(cells, crate::term_client::grid(size, &font).unwrap());
-        assert_eq!(cells, (20, 74));
-        assert_ne!(
-            cells,
-            crate::term_client::grid(crate::term_client::default_size(&font).unwrap(), &font)
-                .unwrap(),
-            "the terminal announced its fallback grid rather than the tile's"
-        );
-        // The whole chain in one assertion: the compositor's tile became a
-        // grid, that grid was published to a real terminal, and the kernel —
-        // asked again, independently of the readback `resize` already did —
-        // says the terminal IS that size. §12 requires the readiness line to
-        // name a grid something was actually set to; this is what makes that
-        // more than a claim about arithmetic.
-        let window = pty.window().unwrap();
-        assert_eq!((window.rows, window.columns), cells);
-        assert_eq!((window.rows, window.columns), (20, 74));
-        assert_eq!(
-            crate::ready::marker(window.rows, window.columns),
-            "TD-TERM-READY rows=20 columns=74\n"
-        );
-        // A frame that was released and presented is a frame that reached the
-        // framebuffer. Compared against the DESKTOP BACKGROUND, which is what
-        // every pixel held before the client connected — comparing against
-        // zero would pass on the bare desktop and prove nothing. These are
-        // MEMORY bytes, not an RGB literal: XRGB8888 is little-endian, so the
-        // blue channel comes first, as `scene`'s own desktop test spells it.
-        // Counted INSIDE THE CLIENT'S OWN AREA only. Scanning the whole
-        // output would let the status bar's own 640x24 band — none of it the
-        // desktop colour — stand in for 15360 pixels the client never
-        // painted, which is about twenty-six terminal rows of slack in an
-        // assertion whose whole job is to prove the tile was covered; and
-        // scanning the whole TILE would now let the title band do the same
-        // for another 592x20 the compositor painted rather than the client.
-        let painted = fs::read(&framebuffer_path).unwrap();
-        // The client's own rectangle, derived from the constants rather than
-        // from the tile being centred: the band makes it no longer symmetric
-        // about the tiling area, so the old halving would have quietly moved
-        // the window it scans off the client and onto the desktop below it.
-        let (client_width, client_height) = (592usize, 332usize);
-        let output_width = 640usize;
-        let left = (output_width - client_width) / 2;
-        let top = BAR_HEIGHT + GAP + TITLE_HEIGHT;
-        let stride = output_width * 4;
-        let mut foreign = 0usize;
-        for y in top..top + client_height {
-            for x in left..left + client_width {
-                let offset = y * stride + x * 4;
-                if painted.get(offset..offset + 4) != Some(&[0x30, 0x25, 0x20, 0][..]) {
-                    foreign += 1;
-                }
-            }
-        }
-        assert_eq!(
-            foreign,
-            client_width * client_height,
-            "the presented frame left desktop showing inside its own client area"
-        );
-
-        drop(connection);
-        worker.join().unwrap().unwrap();
-        fs::remove_file(&framebuffer_path).unwrap();
     }
 
     #[test]

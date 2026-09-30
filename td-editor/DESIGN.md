@@ -1216,17 +1216,18 @@ authorized by this document. Until that system design exists, only the
 reference renderer is implementable here and GPU editor rendering remains
 an explicit unmet objective, not a silently dropped requirement.
 
-Relevant code in `td-compositor/src`:
+Relevant code in `td-compositor/src`, and the terminal files that have since
+moved out of it, named from the repository root:
 
 | File | Reuse decision |
 | --- | --- |
 | `font.rs`, `font_data.rs` | Reuse the checked PSF2 decoder and pinned Unifont face; carry font provenance and license into standalone packaging. |
 | `wire.rs` | Reuse the existing framing codec as shared source, including its malformed-input tests. |
-| `conn.rs` | Reference for object allocation and descriptor lifetime; the editor's connection is td-ui's `wayland::Connection`, kept separate from this module because it imports terminal rendering and td's exact keymap. |
-| `term_client.rs` | Reference for configure/ack, release, resize, clipboard and focus lifecycle; do not fork the terminal loop into the editor. |
-| `render.rs` | Reuse bounded glyph drawing and pixel-oracle approach, not terminal `Snapshot`/SGR data structures. |
+| `conn.rs` | Reference for object allocation and descriptor lifetime; the editor's connection is td-ui's `wayland::Connection`, kept separate from this module because it imports td's exact keymap. |
+| `td-term/src/app.rs` (was `term_client.rs`) | Reference for configure/ack, release, resize, clipboard and focus lifecycle over td-ui's client; do not fork the terminal loop into the editor. |
+| `td-ui/src/vt_render.rs` (was `render.rs`) | Reuse bounded glyph drawing and pixel-oracle approach, not terminal `Snapshot`/SGR data structures. |
 | `socket.rs` | Reference for explicit socket lifecycle and refusal of live endpoints; editor control must enforce its own path ownership. |
-| `keys.rs`, `keyboard.rs` | Reuse repeat/chord concepts and td test fixtures; terminal escape sequences and the fixed US keymap are not portable editor input. The editor's own XKB compiler and repeat policy now live in `td-ui`. |
+| `keyboard.rs`, `td-ui/src/vt_keys.rs` (was `keys.rs`) | Reuse repeat/chord concepts and td test fixtures; terminal escape sequences and the fixed US keymap are not portable editor input. The editor's own XKB compiler and repeat policy now live in `td-ui`. |
 | `buffer.rs` | Compositor surface-storage and accounting design reference, not an editable text buffer. |
 | `ui.rs` | Reference for pure rendering and input models, not a toolkit or the editor's state model. |
 

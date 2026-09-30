@@ -26,6 +26,10 @@ impl Modifiers {
 pub struct Stroke {
     pub chord: String,
     pub repeat: bool,
+    /// The printable character the key resolved to, Shift and Caps Lock
+    /// applied, before a Control or Alt chord spelled its letter lowercase;
+    /// `None` for a named key. What a terminal sends under Alt is this case.
+    pub text: Option<char>,
 }
 
 /// The modifier roles a state holds, as a chord names them: `C-` control,
@@ -342,6 +346,7 @@ impl Keymap {
         if value.and_then(symbols::role).is_some() {
             return Ok(None);
         }
+        let text = value.and_then(symbols::ascii);
         let base = if let Some(mut c) = value.and_then(symbols::ascii) {
             if control || alt {
                 if c.is_ascii_alphabetic() {
@@ -388,6 +393,7 @@ impl Keymap {
         Ok(Some(Stroke {
             chord,
             repeat: selected.repeat,
+            text,
         }))
     }
 

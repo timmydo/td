@@ -494,7 +494,7 @@ mod confinement {
     /// The live claim needs a PTY slave on descriptor zero, which this crate
     /// cannot create — it has no `TIOCGPTPEER` — so the positive path is proven
     /// by the system integration test when td-term is packaged
-    /// (`td-compositor/DESIGN.md` §12). This is what holds until then.
+    /// (`td-term/DESIGN.md` §4). This is what holds until then.
     #[test]
     fn the_stdin_session_is_claimed_in_the_only_order_that_works() {
         let cttyhack = sources()

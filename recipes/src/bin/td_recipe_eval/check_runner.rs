@@ -9678,6 +9678,8 @@ chmod 755 '{}'
         assert!(toolkit.contains("td-taskmgr-test"));
         assert!(toolkit.contains("td-portal-test"));
         assert!(toolkit.contains("td-photo-test"));
+        assert!(toolkit.contains("td-term-test"));
+        assert!(reached.contains("td-term-test"));
         // Both directions: every selected owner reads the crate somewhere in
         // its closure, and every check owner that does is selected — the
         // second is the one a dropped owner would fail.

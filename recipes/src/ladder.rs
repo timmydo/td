@@ -949,7 +949,7 @@ pub const TD_UI_CLIENT_RUNTIME_MARKER: &str = "TD-UI-CLIENT-READY";
 /// demanding a device it never uses would be a client lying about its needs to
 /// hold a test property up.
 ///
-/// DUPLICATED as `MARKER` in td-compositor/src/ready.rs and pinned by its recipe.
+/// DUPLICATED as `MARKER` in td-term/src/ready.rs and pinned by its recipe.
 pub const TD_TERM_RUNTIME_MARKER: &str = "TD-TERM-READY";
 
 /// Printed by the compositor for each input device that ANSWERED `EVIOCGABS`

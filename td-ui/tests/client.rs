@@ -995,7 +995,8 @@ fn a_keymap_crosses_the_socket_and_presses_translate_after_focus_and_the_snapsho
             key: 30,
             stroke: td_ui::keyboard::Stroke {
                 chord: "a".into(),
-                repeat: true
+                repeat: true,
+                text: Some('a'),
             }
         })
     );

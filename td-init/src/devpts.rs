@@ -2,9 +2,9 @@
 //!
 //! td-term opens `/dev/ptmx` for every terminal it starts, and nothing on the
 //! real root mounts devpts, so this is the applet that makes a pty allocatable
-//! at all. DESIGN.md §12 specifies the sequence and the reasoning; this is one
-//! program rather than four sysinit lines so that no part of it rests on a
-//! uutils binary being present at an absolute path.
+//! at all. td-term/DESIGN.md §4 specifies the sequence and the reasoning; this
+//! is one program rather than four sysinit lines so that no part of it rests
+//! on a uutils binary being present at an absolute path.
 //!
 //! It does NOT call `sys::mount`: the mount goes through the `mount` applet as
 //! the argv an inittab line would have written, which keeps flag composition in

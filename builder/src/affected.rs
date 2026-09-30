@@ -1494,6 +1494,15 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // The terminal the same way: td-term-test runs the static binary's
+    // selftest and requires the terminfo entry td-term-terminfo writes.
+    if p.starts_with("td-term/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        return;
+    }
+
     // Toolkit edits affect its standalone consumers and their target recipes;
     // locally derived source identities and realized-output checks apply.
     if p.starts_with("td-ui/") && !p.contains("..") {
@@ -2737,32 +2746,41 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-compositor/src/server.rs", "recipe-checks");
     assert_target!("td-compositor/src/sys.rs", "recipe-checks");
     assert_preflight!("td-compositor/src/sys.rs", "cargo-test");
-    // td-term's keyboard and PTY adapters ship in the same multicall, so they
-    // route like every other compositor module; pty.rs is the only permitted
-    // caller of the confined terminal ioctls.
-    assert_target!("td-compositor/src/keys.rs", "recipe-checks");
-    assert_preflight!("td-compositor/src/keys.rs", "cargo-test");
+    // The compositor's record filter is shared source td-ui mounts.
+    assert_target!("td-compositor/src/reportable.rs", "recipe-checks");
+    assert_preflight!("td-compositor/src/reportable.rs", "cargo-test");
     assert_target!("td-compositor/src/font.rs", "recipe-checks");
     assert_preflight!("td-compositor/src/font.rs", "cargo-test");
     assert_target!("td-compositor/src/font_data.rs", "recipe-checks");
     assert_preflight!("td-compositor/src/font_data.rs", "cargo-test");
     assert_target!("td-compositor/tools/import-unifont.rs", "recipe-checks");
     assert_preflight!("td-compositor/tools/import-unifont.rs", "cargo-test");
-    assert_target!("td-compositor/src/pty.rs", "recipe-checks");
-    assert_preflight!("td-compositor/src/pty.rs", "cargo-test");
-    assert_target!("td-compositor/src/render.rs", "recipe-checks");
-    assert_preflight!("td-compositor/src/render.rs", "cargo-test");
+    // td-term's terminal model, renderer, keyboard encoder and PTY mechanism
+    // live in td-ui, whose consumers' target recipes they change; pty.rs is
+    // the only permitted caller of td-ui's confined terminal ioctls.
+    assert_target!("td-ui/src/vt_keys.rs", "recipe-checks");
+    assert_preflight!("td-ui/src/vt_keys.rs", "cargo-test");
+    assert_target!("td-ui/src/pty.rs", "recipe-checks");
+    assert_preflight!("td-ui/src/pty.rs", "cargo-test");
+    assert_target!("td-ui/src/vt_render.rs", "recipe-checks");
+    assert_preflight!("td-ui/src/vt_render.rs", "cargo-test");
     // Rendered goldens route like the terminal corpus beside them.
-    assert_target!("td-compositor/spec/render/renditions.ppm", "check");
-    assert_preflight!("td-compositor/spec/render/renditions.ppm", "cargo-test");
-    assert_target!("td-compositor/spec/term/input.term", "check");
-    assert_preflight!("td-compositor/spec/term/input.term", "cargo-test");
-    assert_target!("td-compositor/tools/import-libvterm.rs", "check");
-    assert_preflight!("td-compositor/tools/import-libvterm.rs", "cargo-test");
-    assert_target!("td-compositor/tools/libvterm-0.3.3.sources", "check");
-    assert_preflight!("td-compositor/tools/libvterm-0.3.3.sources", "cargo-test");
-    assert_target!("td-compositor/spec/term/cursor.term", "check");
-    assert_preflight!("td-compositor/spec/term/cursor.term", "cargo-test");
+    assert_target!("td-ui/spec/vt_render/renditions.ppm", "check");
+    assert_preflight!("td-ui/spec/vt_render/renditions.ppm", "cargo-test");
+    assert_target!("td-ui/spec/vt/input.term", "check");
+    assert_preflight!("td-ui/spec/vt/input.term", "cargo-test");
+    assert_target!("td-ui/tools/import-libvterm.rs", "check");
+    assert_preflight!("td-ui/tools/import-libvterm.rs", "cargo-test");
+    assert_target!("td-ui/tools/libvterm-0.3.3.sources", "check");
+    assert_preflight!("td-ui/tools/libvterm-0.3.3.sources", "cargo-test");
+    assert_target!("td-ui/spec/vt/cursor.term", "check");
+    assert_preflight!("td-ui/spec/vt/cursor.term", "cargo-test");
+    // The terminal itself is a static target recipe with a realized-output
+    // check, routed as td-photo is.
+    assert_target!("td-term/src/main.rs", "check");
+    assert_target!("td-term/src/app.rs", "recipe-checks");
+    assert_preflight!("td-term/src/ready.rs", "cargo-test");
+    assert_target!("td-term/Cargo.lock", "recipe-checks");
     assert_target!("td-compositor/Cargo.lock", "recipe-checks");
     assert_no_target!("td-compositor/DESIGN.md", "check");
     assert_preflight!("start", "shell-syntax");
@@ -5619,6 +5637,7 @@ mod tests {
                 "td-secret",
                 "td-setup",
                 "td-taskmgr",
+                "td-term",
                 "td-ui",
                 "td-vm",
                 "td-vm-guest"
@@ -5712,6 +5731,7 @@ mod tests {
                 "td-secret",
                 "td-setup",
                 "td-taskmgr",
+                "td-term",
                 "td-ui",
                 "td-vm",
                 "td-vm-guest"
@@ -8089,7 +8109,7 @@ mod tests {
         // modules out of td-compositor sources, so a change there is a change
         // to what they compile, and td-photo reads td-ui, which reads
         // td-compositor's sources too; td-busd is read by six.
-        let comp = one("td-compositor/src/pty.rs");
+        let comp = one("td-compositor/src/reportable.rs");
         assert_eq!(
             names(&comp),
             [
@@ -8110,17 +8130,18 @@ mod tests {
                 "td-secret",
                 "td-setup",
                 "td-taskmgr",
+                "td-term",
                 "td-ui",
                 "td-vm",
                 "td-vm-guest"
             ]
         );
         // td-photo's and td-mail's native cases make their commands three,
-        // as td-setup's are; td-news, a toolkit consumer with no native
-        // case, adds two. The test-only P-256 oracle connects td-secret
-        // to td-crypto and then td-mta, adding two commands each. The format
-        // check rides with the workspace.
-        assert_eq!(comp.len(), 49, "{comp:?}");
+        // as td-setup's are; td-news and td-term, toolkit consumers with no
+        // native case, add two each. The test-only P-256 oracle connects
+        // td-secret to td-crypto and then td-mta, adding two commands each.
+        // The format check rides with the workspace.
+        assert_eq!(comp.len(), 51, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -8145,6 +8166,7 @@ mod tests {
                 "td-secret",
                 "td-setup",
                 "td-taskmgr",
+                "td-term",
                 "td-ui",
                 "td-vm",
                 "td-vm-guest"

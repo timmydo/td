@@ -308,7 +308,7 @@ pub fn window_size(fd: RawFd, out: &mut [u8; WINSIZE_LEN]) -> Result<(), String>
 
 /// `struct pollfd`: `int fd; short events; short revents;` — two words on
 /// x86-64, laid out as a plain `[u32; 2]` rather than a `#[repr(C)]` type so its
-/// field ORDER is a tested function, as td-compositor's winsize is. The two
+/// field ORDER is a tested function, as td-ui's winsize is. The two
 /// `short`s share the second word, little-endian: `events` low, `revents` high.
 /// A swapped pair is a well-formed request for a DIFFERENT event, which the
 /// kernel accepts and answers.

@@ -90,10 +90,7 @@ A consumer inherits that surface through the toolkit's connection and
 its `clipboard::Outgoing`, which owns the send right's status flags for
 a transfer, and nothing else; reusing a module does not transfer its
 authorization to a raw boundary of the consumer's own, which gets its
-own entry. `td-compositor` mounts td-ui's `sfnt`, `coverage`, `atlas`,
-`face` and `face_file` by path for td-term's outline face and does not
-depend on the crate: those modules carry no `unsafe` and name no other
-td-ui module, so the compositor's own surface (§6) is unchanged.
+own entry.
 
 ## Roster
 
@@ -104,7 +101,7 @@ td-ui module, so the compositor's own surface (§6) is unchanged.
 | 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has five pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with twenty-one value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` each pinned to a dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region, which is `Send`; also the shared private-channel instruction and adoption of §16 |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with seventeen value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` each pinned to a dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region, which is `Send`; also the shared private-channel instruction and adoption of §16 |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
@@ -117,7 +114,7 @@ td-ui module, so the compositor's own surface (§6) is unchanged.
 | 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake and six-request terminal ioctl/poll modules below |
 | 17 | `td-mail` | retired: `term_sys.rs`, td-sh's terminal half, went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§17](#17-td-mail--retired) |
 | 18 | `td-news` | retired: the copy of `term_sys.rs` went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§18](#18-td-news--retired) |
-| 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker; plus one scoped descriptor adoption — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
+| 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with four value-pinned PTY requests for the terminal's device; plus one scoped descriptor adoption — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
@@ -482,19 +479,13 @@ and `F_SETFL=4`: `conn.rs` temporarily adds x86-64 `O_NONBLOCK=0o4000` while
 the bounded clipboard writer drains one destination, then restores the exact
 prior status word. This closes the indefinite-write denial of service without
 holding a registry lock across I/O; another command, caller, or flag is an
-amendment here. The surface also carries `ioctl(2)` for
-td-term's PTY, with FOUR value-pinned requests reached only from `pty.rs`:
-`TIOCSPTLCK` (0x40045431) to unlock the slave, `TIOCGPTPEER` (0x5441) to
-obtain it as a descriptor rather than by `/dev/pts/N` name, and
-`TIOCSWINSZ`/`TIOCGWINSZ` (0x5414/0x5413) to publish a grid and read it
-back. The readback is the point, as it is for `losetup`'s read-only flag:
-nothing observable distinguishes a `TIOCSWINSZ` the kernel applied from
-one it clamped or ignored, and a child that lays out its screen for a size
-the terminal does not have is a terminal that looks broken with every test
-green. Two more requests joined that roster for the ABSOLUTE pointer:
+amendment here. The surface also carries `ioctl(2)`. td-term's four PTY
+requests (`TIOCSPTLCK`, `TIOCGPTPEER`, `TIOCSWINSZ`, `TIOCGWINSZ`) left this
+surface when the terminal became its own program on td-ui; the compositor
+owns no terminal, and its allow-list refuses those numbers like any other.
+Two requests serve the ABSOLUTE pointer:
 `EVIOCGABS(ABS_X)`/`EVIOCGABS(ABS_Y)` (0x80184540/0x80184541), reached only
-from `input.rs`, which is a THIRD disjoint module on this surface rather
-than a widening of either existing one. A tablet reports a position in its
+from `input.rs`. A tablet reports a position in its
 own units, so mapping one to a screen needs the device's declared range, and
 nothing but this ioctl reports it — `/sys` carries which axes exist but not
 their bounds, and guessing would put the pointer somewhere other than where
@@ -507,11 +498,10 @@ refuses it is relative, which is the ordinary case and not an error. It asks
 for three of the six words: the two bounds, and `value` — where the axis IS
 at the moment it is asked, which is the only account of a device's position
 before it has reported anything, and which the kernel needs because it omits
-an axis whose value has not changed. The argument is pinned for the winsize
-buffer's reason, arriving at it differently. `EVIOCGABS` copies
-`sizeof(struct input_absinfo)` — 24 bytes, six `__s32` — through the pointer,
-and unlike the winsize and termios calls it takes that length from the MINIMUM
-of the REQUEST NUMBER's own size field and its own `sizeof`. Half of that is
+an axis whose value has not changed. The argument is pinned. `EVIOCGABS`
+copies `sizeof(struct input_absinfo)` — 24 bytes, six `__s32` — through the
+pointer, and it takes that length from the MINIMUM of the REQUEST NUMBER's
+own size field and its own `sizeof`. Half of that is
 protective, and the half that is not is the reason the two must be pinned
 TOGETHER: an oversized number cannot make the copy longer, but a buffer
 shortened without the number is 24 bytes written into less — an out-of-bounds
@@ -521,14 +511,14 @@ apart. The axis is named by an ENUM
 rather
 than by a number at the call site, td-sh's `Disposition` shape: the two
 requests differ in one nibble, and a caller free to compose one could
-compose a third. Its buffer is an `[i32; 6]` for the winsize reason and
-more sharply — `value`, `minimum` and `maximum` are three ADJACENT words of
-the same type, so an index off by one is a well-formed position and range
-that maps every report to the wrong part of the screen, with nothing
-observable to say so.
+compose a third. Its buffer is an `[i32; 6]`, a layout the language
+guarantees, so its field ORDER is a tested function — `value`, `minimum` and
+`maximum` are three ADJACENT words of the same type, so an index off by one
+is a well-formed position and range that maps every report to the wrong part
+of the screen, with nothing observable to say so.
 Five more requests joined that roster for DRM/KMS DISCOVERY, reached only
-from `drm.rs` — a FOURTH disjoint module on this surface, and, like the
-pointer's, not a widening of any existing one. `DRM_IOCTL_VERSION`
+from `drm.rs` — a second disjoint module on this surface, and not a widening
+of the pointer's. `DRM_IOCTL_VERSION`
 (0xc0406400) asks which driver is behind a card node;
 `DRM_IOCTL_MODE_GETRESOURCES` (0xc04064a0) asks what it has;
 `DRM_IOCTL_MODE_GETCONNECTOR` (0xc05064a7) and `DRM_IOCTL_MODE_GETENCODER`
@@ -592,7 +582,7 @@ evidence is now the compositor's own `TD-COMPOSITOR-KMS-READY` and
 `TD-COMPOSITOR-FLIP-OK` lines.
 
 `MODE_PAGE_FLIP` (0xc018_64b0) joined for the landing after that, and it is
-the twentieth request in the roster. It carries the 24-byte
+the fourteenth DRM request in the roster. It carries the 24-byte
 `drm_mode_crtc_page_flip`, which is four `u32` and a `u64`; the kernel's own
 handler takes the wider `drm_mode_crtc_page_flip_target`, but the request
 number is sized for the narrower struct and the repurposed field is read only
@@ -644,9 +634,9 @@ ioctl argument but the ELEMENT of the array `modes_ptr` points at, so its size
 is the kernel's copy STRIDE, and a drift there walks a 68-byte record across a
 differently-sized slot.
 
-Two properties of these four are unlike the other six. They are issued through
-a SECOND entry point, `drm_ioctl`, which retries `EINTR` and `EAGAIN` up to a
-bounded count: `drm_ioctl` in the kernel takes the mode-config lock with
+Two properties of these four are unlike the evdev requests. They are issued
+through a SECOND entry point, `drm_ioctl`, which retries `EINTR` and `EAGAIN`
+up to a bounded count: `drm_ioctl` in the kernel takes the mode-config lock with
 `mutex_lock_interruptible`, so a restart is an ordinary answer rather than a
 failure, which is why libdrm's own `drmIoctl` is a loop. Bounded rather than
 unbounded, because a device answering `EAGAIN` forever is a broken device and a
@@ -661,12 +651,8 @@ rather than believed, since the kernel copies a connector's mode and encoder
 arrays all-or-nothing.
 
 The request roster is enforced in code, not only in a test — one
-allow-list refuses anything outside the twenty-one before either entry point
-issues the syscall — and the winsize argument is an `[u16; 4]` rather than a
-`#[repr(C)]` struct so its field ORDER is a tested function; a swapped
-rows/columns pair is a well-formed resize to a different size.
-`TIOCGPTPEER`'s returned number is still reopened through `/proc/self/fd/N`
-and closed by the PTY wrapper. Received Wayland descriptors instead preserve
+allow-list refuses anything outside the seventeen before either entry point
+issues the syscall. Received Wayland descriptors preserve
 the exact open-file description installed by SCM_RIGHTS. Reopening a regular
 file checks inode permissions again and can fail across the compositor/human
 UID boundary even though the receiver owns a valid descriptor.
@@ -683,7 +669,8 @@ owner, consuming their received descriptor through the same pinned
 `ReceivedFd::into_file` conversion in `server.rs`. A VM export can supply a
 native owned Unix socket endpoint without raw adoption; an imported selection
 consumes its destination File in the existing bounded clipboard writer. The
-client source retains its separately pinned conversion. No registry or runtime
+client-side selection conversion was td-term's and left with it; the
+compositor's own clients adopt no selection endpoint. No registry or runtime
 lock spans endpoint I/O. The VM worker may call exactly the bounded
 `conn::write_clipboard` helper; its source pin refuses every other reach into
 that Wayland transport module. This changes no syscall or unsafe allowance.
@@ -697,14 +684,9 @@ publishes it, which is a cursor move that came through this surface rather
 than through a file), Unix socket setup and
 byte I/O (`std`), mmap (wl_shm
 pixels are copied with `FileExt`; the mapping hardware rendering will need is
-anticipated below rather than present), device ownership (safe `td-seatd`), or
-anything else the PTY needs — no termios call (the slave's kernel defaults
-ARE the canonical-input policy), no `setsid(2)` or `TIOCSCTTY` (the default
-child gets its session from the declared `td-init` input's `cttyhack
---stdin`; an explicit `--command` child gets none from td-term, and a td-jail
-terminal application acquires its own under surface #9),
-and no `fork`/`execve`/`dup2` (`Command` plus `Stdio::from(File)` cover
-all three). Nor, on the evdev side: `EVIOCGABS` for any axis but X and Y
+anticipated below rather than present), device ownership (safe `td-seatd`),
+or any terminal control: the compositor starts processes only through
+`Command`. Nor, on the evdev side: `EVIOCGABS` for any axis but X and Y
 (a pressure or tilt axis is not a place on a screen, and the request number
 is composed from the axis, so serving one would mean composing them);
 `EVIOCGBIT`/`EVIOCGNAME` (which axes a device HAS is answered by whether
@@ -719,7 +701,7 @@ specification. Its confinement tests pin the allow count, assembly body,
 syscall numbers, callers, and absence of unsafe from every other module;
 adding another syscall or scoped allow is an amendment there AND here. The
 syscall families are pinned to their modules: transport to
-`client.rs`/`conn.rs`/`server.rs`, terminal control to `pty.rs`, absolute
+`client.rs`/`conn.rs`/`server.rs`, absolute
 axis queries and evdev clock selection to `input.rs`, peer authentication
 to `server.rs` and `session.rs`, DRM to `drm.rs`, and the monotonic cutoff
 to `runtime.rs`. The runtime has two total `sys::` references to the same monotonic-clock
@@ -727,47 +709,17 @@ wrapper: one after ordinary-screen restoration and one after complete
 trusted-prompt presentation. Session policy has one pinned peer-UID
 reference. No other module may
 reach a syscall wrapper.
-`conn.rs` is the client
-transport itself, extracted from `client.rs` so the terminal is a second
-USER of one connection rather than a second copy of it; the descriptor
-queue is intrinsic to that connection, so it moved with it. That widens the
-transport's caller list by one module and narrows nothing. A `Connection` is
+`conn.rs` is the demo client's transport, extracted from `client.rs`; the
+descriptor queue is intrinsic to that connection. A `Connection` is
 crate-visible, though, so a module could reach `sendmsg`/`recvmsg` through
 one without ever spelling `sys::` — which is all the caller scan looks for.
-The transport's USERS are therefore pinned by that same test, which is what
-makes "the terminal modules — parser, model, renderer, keyboard, PTY policy
-— reach none of it" a checked property rather than a claim. A module joining
-that roster is an amendment here, as a new caller is, and `term_client.rs`
-is the first: the terminal's own Wayland client is a transport USER by
-construction. It is NOT a new caller — it names no `sys::` at all, and the
-descriptors it receives arrive through `Connection` — so the syscall
-roster above is unchanged by it.
-
-"Eventually" is now: the terminal binds a `wl_seat`, creates a
-`wl_keyboard`, and RECEIVES its keymap descriptor, which §6 keeps inside
-the same transport boundary wl_shm submission is in. That is one more user
-of
-`recvmsg(2)`'s product and no new caller of it — the fd is claimed with
-`Connection::take_fd` and validated by `conn::verify_keymap`, both in
-the module the roster already names. Its TEST needed the other
-direction, a peer sending a descriptor, and that is why
-`conn::send_event_with_fd` exists rather than the test spelling
-`sys::send_with_fd` in `term_client.rs`: a test that named it would be a
-roster change, and the confinement scan refuses one — which is how this
-was caught rather than decided.
-
-A connection's READING half detaches: `Connection::detach_reader` hands a
-`Reader` to a thread, so a client whose main loop has a second source to
-serve is not blocked in a socket read. `recvmsg(2)`, and the `close(2)` that
-retires a descriptor nobody claimed, therefore issue from that thread rather
-than from the main one. That is not an amendment to the roster above — same
-wrappers, same one calling module, and `term_client.rs` still names no
-`sys::` — but it is a change to what "intrinsic to that connection" means
-above, so it is recorded rather than left to be inferred. The one-reader
-rule is the TYPE's: a `Reader` is not clonable, exposes no descriptor, and a
-`Connection` refuses both to read and to detach again once it has given one
-up. Detaching also requires the handshake to be over, because the socket
-read timeout a deadline sets outlives the deadline itself.
+The transport's USERS are therefore pinned by that same test to `client.rs`
+and `conn.rs`, and a module joining that roster is an amendment here, as a
+new caller is. td-term's Wayland client, the roster's other user, left with
+the terminal for td-ui's transport (§19), and with it the detached reading
+half and the client-side selection adoption it needed. The demo client's
+keymap descriptor is claimed with `Connection::take_fd` and validated by
+`conn::verify_keymap`, both in the module the roster already names.
 
 ### The mapping class
 
@@ -1079,7 +1031,7 @@ pinned because `sys_rt_sigaction` copies `sizeof(struct sigaction)`
 through the pointer with no length negotiation, so a short buffer is an
 out-of-bounds kernel write from code the compiler reads as safe. The
 struct is a plain `[usize; 4]` rather than a `#[repr(C)]` type so its
-field ORDER is a tested function, as td-compositor's winsize is: a handler
+field ORDER is a tested function, as td-ui's winsize is: a handler
 written at the wrong offset is a well-formed `sa_flags` and a disposition
 left alone. SECOND, `signal_set` re-queries and REFUSES unless the kernel
 agrees, the same argument as the mask above — a signal the kernel still
@@ -1353,7 +1305,7 @@ each of those over the SHIPPED half of `sys.rs`, since the crate's own
 tests name what they assert about, as the `ioctl` roster's scan does.
 
 The struct is a plain `[u32; 2]` rather than a `#[repr(C)]` type so its
-field ORDER is a tested function, as td-compositor's winsize is: the two
+field ORDER is a tested function, as td-ui's winsize is: the two
 `short`s share the second word, and a swapped pair is a well-formed
 request for a DIFFERENT event, which the kernel accepts and answers.
 Composing and reading that word are two named functions for a reason no
@@ -1973,8 +1925,7 @@ time rather than plateauing.
 adoption: `OwnedFd` means `std` performs every close, so the crate has no close
 of its own. Section 6 needs one because its server retains exact endpoints in a
 safe raw owner and disposes refused ancillary descriptors before adoption.
-Its PTY wrapper also closes its reopened slave descriptor. This broker instead
-adopts every admitted descriptor immediately
+This broker instead adopts every admitted descriptor immediately
 and pays for its second allow by giving back a syscall.
 
 There is no `poll(2)` or `epoll_*`. Stable `std` exposes neither, and
@@ -2493,10 +2444,10 @@ channel boundary.
 The compositor's optional authority client compiles §16's exact channel and
 raw modules under `authority::{channel,sys}`. This adds the shared fixed
 setsockopt and pidfd poll calls and their two function-scoped allowances to
-surface 6; it adds no operation to the shared raw module. The Wayland/PTY raw
+surface 6; it adds no operation to the shared raw module. The Wayland raw
 module remains separate and unchanged. Only the authority client calls the
 shared Channel constructor; no private-channel descriptor reaches the
-Wayland, clipboard or PTY interfaces. Its greeting occurs before the first
+Wayland or clipboard interfaces. Its greeting occurs before the first
 worker; one worker then owns framed exchanges, and the authority-mode launcher
 creates no child process. Original stdin remains exclusive in the compositor.
 Both crates pin the shared source, while compositor confinement pins the two
@@ -2653,11 +2604,12 @@ td-sh's own entry.
 
 ## 19. `td-ui` — the shared Wayland client transport
 
-td-ui's `sys.rs` carries exactly FOUR x86-64 Linux syscalls through one
+td-ui's `sys.rs` carries exactly FIVE x86-64 Linux syscalls through one
 function-scoped instruction: `recvmsg` (47), `sendmsg` (46), `fcntl` (72)
 pinned to `F_DUPFD_CLOEXEC` (1030) for the transport and to `F_GETFL` (3)
-and `F_SETFL` (4) for the clipboard destination owner, and `poll` (7) for
-the connection's wait once a consumer holds its waker. A second
+and `F_SETFL` (4) for the clipboard destination owner, `poll` (7) for
+the connection's wait once a consumer holds its waker, and `ioctl` (16)
+pinned to four PTY requests for the terminal's device. A second
 function-scoped allowance adopts newly installed nonnegative descriptors
 into `OwnedFd`. Safe `std` owns connection setup, byte-only sends,
 timeouts, pool file creation and unlinking, positional pixel writes and
@@ -2667,8 +2619,9 @@ and the two allowances are the module's only ones. Other architectures
 are refused at compile time rather than inheriting its ABI. The rest of
 the toolkit — the client over the transport, the raster, the chrome
 bands, the keymap compiler, the repeat policy, the pointer and
-data-device decoders, the widget window and the mounted font and wire
-sources — has no raw boundary.
+data-device decoders, the widget window, the terminal model, renderer,
+keyboard encoder and terminfo compiler, the PTY's threads, and the
+mounted font, wire and report-text sources — has no raw boundary.
 
 This surface is the editor's transport subset, moved here so that every
 td-owned graphical program shares one client, with one change: the
@@ -2678,8 +2631,11 @@ program's clipboard writes through one owner; §14 records what the
 editor kept. Reusing this module does not transfer its authorization to
 a new consumer: a program that depends on td-ui inherits the transport
 through `wayland::Connection`, alone or beneath `client::Client`, the
-destination owner through `clipboard::Outgoing`, and nothing else, and
-one that needs a raw surface of its own gets its own roster entry.
+destination owner through `clipboard::Outgoing`, the terminal's device
+through `pty::Pty`, and nothing else, and one that needs a raw surface of
+its own gets its own roster entry. The PTY moved here from td-compositor
+(§6), which kept none of it, when td-term became its own program over the
+toolkit; td-term itself forbids `unsafe`.
 
 The inherited-stream `fcntl` caller is pinned to `F_DUPFD_CLOEXEC`,
 minimum descriptor 3. It duplicates the borrowed `WAYLAND_SOCKET`
@@ -2751,6 +2707,27 @@ two are the connection's own, and the waker's end is drained with at
 most 64 safe nonblocking receives. The pollfd layout is asserted at
 eight bytes.
 
+The ioctl callers are `pty::Pty` and `pty::window_size`, one wrapper
+per request and the request never a parameter: `unlock_pty` passes
+`TIOCSPTLCK` (0x40045431) a pointer to a zero `i32` on its own frame;
+`pty_peer` passes `TIOCGPTPEER` (0x5441) the immediate flags
+`O_RDWR | O_NOCTTY | O_CLOEXEC` (0o2000402) and adopts the new slave
+descriptor the kernel installs, once, at the module's adoption site;
+`set_window_size` passes `TIOCSWINSZ` (0x5414) a pointer to four
+`u16` words on the caller's frame in the kernel's `struct winsize`
+order, and `window_size` passes `TIOCGWINSZ` (0x5413) a pointer to four
+zeroed words it then reads. Each wrapper borrows a safe `File`; the
+master is opened by safe `std` with `O_NOCTTY` from `/dev/ptmx`, so this
+process never acquires the terminal. `Pty::open` names no path, and
+`window_size` borrows a duplicate `std` made of whatever descriptor its
+caller lends; `TIOCGWINSZ` only reads, and a non-terminal answers
+`ENOTTY`. `Pty::resize` reads every published size back
+through `TIOCGWINSZ` before it is trusted. No request changes termios,
+a controlling terminal or a session: the child gets its session and
+terminal from the program it runs (td's `cttyhack`), and `spawn` is safe
+`Command` with the slave on its three standard streams. The slave is
+never looked up by `/dev/pts` name.
+
 The only send caller is the connection's descriptor-send path. `sendmsg`
 carries exactly one borrowed `File` in a 24-byte ancillary extent,
 `cmsg_len=20`, and fixed `SOL_SOCKET`/`SCM_RIGHTS`. The caller supplies only
@@ -2791,22 +2768,28 @@ readable-only entries) and only
 `clipboard.rs` its two status wrappers, through the destination owner
 alone, whose whole implementation is fingerprinted and whose five status
 calls are pinned each at its exact site and in its exact form, that
-the crate root denies `unsafe`, and that the keymap reader and the send
+the crate root denies `unsafe`, that the keymap reader and the send
 are the only pops beyond the FIFO's own accessor, the reader with its
-format, size and regular-file checks. Kernel tests exercise transfer,
+format, size and regular-file checks, and that `ioctl` is named at
+exactly its four wrappers, each request constant at its definition and
+its one use, the peer flags likewise, and `pty.rs` the wrappers' only
+caller, each at one site, opening the master with `O_NOCTTY` and
+reading every published size back. Kernel tests exercise transfer,
 close-on-exec duplication, refusal cleanup and truncated rights, poll
-readiness per entry with timeout and hangup, and the
+readiness per entry with timeout and hangup, a real PTY's unlock,
+peer, published and read-back sizes and a child's view of them, and the
 destination owner over real pipes and sockets: nonblocking mode and its
 restoration through a shared alias on completion, cancel and drop, the
 refusals, the deadline and the byte budget; a byte-level synthetic
 control test checks cleanup beyond unrecognized records and invalid
 entries.
 
-No mmap, ioctl, GPU access, poll beyond the connection's two-entry wait,
-close syscall, credential call, child exec, raw environment-fd adoption or
-received-fd consumer beyond the keymap reader and the send hand-off is
-authorized here. A fifth syscall, fourth fcntl command, another caller, or
-additional allowance amends this section
+No mmap, ioctl beyond the four PTY requests, termios or session
+request, GPU access, poll beyond the connection's two-entry wait, close
+syscall, credential call, raw environment-fd adoption or received-fd
+consumer beyond the keymap reader and the send hand-off is authorized
+here. A sixth syscall, fourth fcntl command, fifth ioctl request, another
+caller, or additional allowance amends this section
 and `td-ui/DESIGN.md` in the same landing; a consumer that takes a right
 from the FIFO records that consumer in its own section.
 

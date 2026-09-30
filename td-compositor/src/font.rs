@@ -1,6 +1,6 @@
-//! The pinned PSF2 face of section 11. Every header field, every table entry,
-//! and every pixel offset is checked once at parse time, so the renderer's
-//! inner loop can index a glyph without arithmetic that could fail.
+//! The pinned PSF2 face of td-term/DESIGN.md §3. Every header field, every
+//! table entry, and every pixel offset is checked once at parse time, so the
+//! renderer's inner loop can index a glyph without arithmetic that could fail.
 
 use std::collections::BTreeMap;
 

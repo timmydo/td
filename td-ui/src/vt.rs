@@ -1,5 +1,12 @@
+//! The terminal model and its byte-stream parser: td-term's screen, and any
+//! td-owned program's that embeds a terminal. Bytes, sizes and keys in;
+//! cells, cursor, modes, history and replies out. Nothing here reads a
+//! descriptor, clock or environment.
+
 use std::collections::VecDeque;
 
+/// The largest row or column count a grid may have.
+pub const MAX_DIMENSION: usize = 16_384;
 const MAX_SCREEN_CELLS: usize = 1_048_576;
 const MAX_SCREEN_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HISTORY_CELLS: usize = 1_048_576;
@@ -10,14 +17,14 @@ const MAX_CSI_PARAMS: usize = 32;
 const MAX_REPLY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Color {
+pub enum Color {
     Default,
     Indexed(u8),
     Rgb(u8, u8, u8),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Attributes {
+pub struct Attributes {
     pub bold: bool,
     pub faint: bool,
     pub italic: bool,
@@ -54,7 +61,7 @@ impl Attributes {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Cell {
+pub struct Cell {
     pub scalar: char,
     pub attributes: Attributes,
 }
@@ -276,10 +283,9 @@ fn checked_cell_count(rows: usize, columns: usize) -> Result<usize, String> {
     if rows == 0 || columns == 0 {
         return Err("terminal dimensions must be nonzero".into());
     }
-    if rows > crate::MAX_UI_DIMENSION || columns > crate::MAX_UI_DIMENSION {
+    if rows > MAX_DIMENSION || columns > MAX_DIMENSION {
         return Err(format!(
-            "terminal dimensions {rows}x{columns} exceed {}",
-            crate::MAX_UI_DIMENSION
+            "terminal dimensions {rows}x{columns} exceed {MAX_DIMENSION}"
         ));
     }
     let cells = rows
@@ -918,12 +924,12 @@ impl Utf8Decoder {
     }
 }
 
-/// What one boundary in `reply_ends` costs, charged against §10's reply
+/// What one boundary in `reply_ends` costs, charged against td-term/DESIGN.md §2's reply
 /// ceiling beside the bytes it delimits.
 const REPLY_OVERHEAD: usize = std::mem::size_of::<usize>();
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Terminal {
+pub struct Terminal {
     primary: Screen,
     alternate: Screen,
     alternate_active: bool,
@@ -942,7 +948,7 @@ pub(crate) struct Terminal {
     dec_alternate: Option<SavedState>,
     last_printed: Option<char>,
     replies: Vec<u8>,
-    /// Where each reply ends in `replies`. §10's atomicity unit is ONE reply,
+    /// Where each reply ends in `replies`. td-term/DESIGN.md §2's atomicity unit is ONE reply,
     /// so the loop has to be able to admit one and refuse the next; a flat
     /// buffer alone makes a batch look like a single sequence.
     reply_ends: Vec<usize>,
@@ -950,7 +956,7 @@ pub(crate) struct Terminal {
 }
 
 impl Terminal {
-    pub(crate) fn new(rows: usize, columns: usize) -> Result<Self, String> {
+    pub fn new(rows: usize, columns: usize) -> Result<Self, String> {
         let attributes = Attributes::default();
         Ok(Self {
             primary: Screen::new(rows, columns, attributes, true)?,
@@ -1040,24 +1046,24 @@ impl Terminal {
             saved.cursor.pending_wrap && screen.cursor_column.saturating_add(1) == screen.columns;
     }
 
-    pub(crate) fn rows(&self) -> usize {
+    pub fn rows(&self) -> usize {
         self.screen().rows
     }
 
-    pub(crate) fn columns(&self) -> usize {
+    pub fn columns(&self) -> usize {
         self.screen().columns
     }
 
-    pub(crate) fn cursor(&self) -> (usize, usize, bool) {
+    pub fn cursor(&self) -> (usize, usize, bool) {
         let screen = self.screen();
         (screen.cursor_row, screen.cursor_column, screen.pending_wrap)
     }
 
-    pub(crate) fn cell(&self, row: usize, column: usize) -> Option<Cell> {
+    pub fn cell(&self, row: usize, column: usize) -> Option<Cell> {
         self.screen().cell(row, column)
     }
 
-    pub(crate) fn row_text(&self, row: usize) -> Result<String, String> {
+    pub fn row_text(&self, row: usize) -> Result<String, String> {
         if row >= self.rows() {
             return Err(format!("terminal row {row} is out of bounds"));
         }
@@ -1071,7 +1077,7 @@ impl Terminal {
         Ok(text)
     }
 
-    pub(crate) fn mode(&self, name: &str) -> Option<bool> {
+    pub fn mode(&self, name: &str) -> Option<bool> {
         match name {
             "alternate-screen" => Some(self.alternate_active),
             "application-cursor" => Some(self.application_cursor),
@@ -1084,12 +1090,12 @@ impl Terminal {
     }
 
     #[cfg(test)]
-    pub(crate) fn replies(&self) -> &[u8] {
+    pub fn replies(&self) -> &[u8] {
         &self.replies
     }
 
     /// The pending replies, each on its own, in the order the child asked.
-    pub(crate) fn take_replies(&mut self) -> Vec<Vec<u8>> {
+    pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
         let replies = std::mem::take(&mut self.replies);
         let ends = std::mem::take(&mut self.reply_ends);
         let mut sequences = Vec::with_capacity(ends.len());
@@ -1103,26 +1109,26 @@ impl Terminal {
         sequences
     }
 
-    /// §10's third source of the visual bell, beside C0 BEL and a reply the
+    /// td-term/DESIGN.md §2's third source of the visual bell, beside C0 BEL and a reply the
     /// model itself could not hold: a sequence the main loop could not admit
     /// to the child WHOLE. The model owns the bit because the renderer reads
     /// it from a snapshot, so the loop has nowhere else to put one.
-    pub(crate) fn ring(&mut self) {
+    pub fn ring(&mut self) {
         self.bell_pending = true;
     }
 
-    pub(crate) fn take_bell(&mut self) -> bool {
+    pub fn take_bell(&mut self) -> bool {
         std::mem::take(&mut self.bell_pending)
     }
 
-    pub(crate) fn history_cells(&self) -> usize {
+    pub fn history_cells(&self) -> usize {
         self.primary.history.cells
     }
 
     /// Scrollback is primary-screen only, so these read the primary history
     /// even while the alternate screen is active — which is what lets the
     /// viewport show the shell a full-screen program is covering.
-    pub(crate) fn history_lines(&self) -> usize {
+    pub fn history_lines(&self) -> usize {
         self.primary.history.lines.len()
     }
 
@@ -1130,20 +1136,20 @@ impl Terminal {
     /// `history_lines()` but never this, which is what lets a viewport name
     /// a line rather than a distance from a moving bottom.
     ///
-    pub(crate) fn history_pushed(&self) -> u64 {
+    pub fn history_pushed(&self) -> u64 {
         self.primary.history.pushed
     }
 
     /// Which numbering `history_pushed` is counting in. A clear -- a reset,
     /// or `CSI 3 J` -- retires the old one.
-    pub(crate) fn history_epoch(&self) -> u64 {
+    pub fn history_epoch(&self) -> u64 {
         self.primary.history.epoch
     }
 
     /// The three numbers a viewport needs, read together so they cannot
     /// describe different moments.
-    pub(crate) fn scrollback(&self) -> crate::keys::Scrollback {
-        crate::keys::Scrollback {
+    pub fn scrollback(&self) -> crate::vt_keys::Scrollback {
+        crate::vt_keys::Scrollback {
             epoch: self.history_epoch(),
             pushed: self.history_pushed(),
             lines: self.history_lines(),
@@ -1154,7 +1160,7 @@ impl Terminal {
     /// recently scrolled off, the one immediately above the live screen.
     /// `None` past a line's stored width, which a resize can leave shorter
     /// than the current grid.
-    pub(crate) fn history_cell(&self, line: usize, column: usize) -> Option<Cell> {
+    pub fn history_cell(&self, line: usize, column: usize) -> Option<Cell> {
         self.primary.history.line_cell(line, column)
     }
 
@@ -1162,11 +1168,11 @@ impl Terminal {
     /// scrollback viewport reads through this so it shows one coherent
     /// primary scroll region; `cell` would put primary history above the
     /// split and a full-screen program's alternate rows below it.
-    pub(crate) fn primary_cell(&self, row: usize, column: usize) -> Option<Cell> {
+    pub fn primary_cell(&self, row: usize, column: usize) -> Option<Cell> {
         self.primary.cell(row, column)
     }
 
-    pub(crate) fn feed(&mut self, bytes: &[u8]) {
+    pub fn feed(&mut self, bytes: &[u8]) {
         for byte in bytes {
             self.feed_byte(*byte);
         }
@@ -1841,7 +1847,7 @@ impl Terminal {
         if bytes.is_empty() {
             return;
         }
-        // The boundary is charged too. §10 caps the reply storage, and an
+        // The boundary is charged too. td-term/DESIGN.md §2 caps the reply storage, and an
         // index of one `usize` per reply is storage: uncharged, a child
         // spamming the four-byte status report would hold the ceiling in
         // bytes and twice it again in offsets.
@@ -1880,7 +1886,7 @@ impl Terminal {
         self.utf8.reset();
     }
 
-    pub(crate) fn resize(&mut self, rows: usize, columns: usize) -> Result<(), String> {
+    pub fn resize(&mut self, rows: usize, columns: usize) -> Result<(), String> {
         checked_cell_count(rows, columns)?;
         let attributes = self.attributes;
         let old_columns = self.columns();
@@ -1902,7 +1908,7 @@ impl Terminal {
     }
 }
 
-pub(crate) fn selftest() -> Result<(), String> {
+pub fn selftest() -> Result<(), String> {
     let mut terminal = Terminal::new(2, 4)?;
     terminal.feed(b"td\x1b[31m!\x1b[6n\x07");
     let replies = terminal.take_replies();
@@ -1927,6 +1933,5 @@ pub(crate) fn selftest() -> Result<(), String> {
 }
 
 #[cfg(test)]
-#[cfg(not(feature = "target-recipe"))]
-#[path = "term_spec.rs"]
+#[path = "vt_spec.rs"]
 mod spec;

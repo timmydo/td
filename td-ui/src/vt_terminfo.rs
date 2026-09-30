@@ -1,9 +1,9 @@
-//! td-term's terminfo entry.
+//! The terminal profile's terminfo entry, `td-term`.
 //!
 //! A human-readable capability source, the compiler that turns it into the
 //! legacy binary format, and the decoder the tests read the result back with.
 //! `tic`, ncurses, and a host terminfo database are not build inputs; the
-//! shipped multicall emits its own entry.
+//! shipped `td-term` emits its own entry.
 //!
 //! Position in the three name tables below IS the wire index, so those tables
 //! are the whole trust surface: a capability written at the wrong index is a
@@ -221,34 +221,34 @@ const ABSENT: i16 = -1;
 const MAX_TABLE: usize = i16::MAX as usize;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Value {
+pub enum Value {
     Flag,
     Number(i16),
     Bytes(Vec<u8>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Capability {
-    pub(crate) name: &'static str,
-    pub(crate) index: usize,
-    pub(crate) value: Value,
-    pub(crate) case: &'static str,
+pub struct Capability {
+    pub name: &'static str,
+    pub index: usize,
+    pub value: Value,
+    pub case: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Entry {
-    pub(crate) names: &'static str,
-    pub(crate) capabilities: Vec<Capability>,
+pub struct Entry {
+    pub names: &'static str,
+    pub capabilities: Vec<Capability>,
 }
 
 /// The decoded form of a compiled entry: dense arrays exactly as the file
 /// declares them, so a test can see an index the source never mentioned.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Decoded {
-    pub(crate) names: String,
-    pub(crate) booleans: Vec<bool>,
-    pub(crate) numbers: Vec<i16>,
-    pub(crate) strings: Vec<Option<Vec<u8>>>,
+pub struct Decoded {
+    pub names: String,
+    pub booleans: Vec<bool>,
+    pub numbers: Vec<i16>,
+    pub strings: Vec<Option<Vec<u8>>>,
 }
 
 fn index_of(table: &[&str], name: &str) -> Option<usize> {
@@ -324,7 +324,7 @@ fn unescape(input: &str) -> Result<Vec<u8>, String> {
 /// Parse the pinned capability source. Every capability must name a table
 /// entry, so a typo is a build failure rather than a silently dropped
 /// capability.
-pub(crate) fn parse() -> Result<Entry, String> {
+pub fn parse() -> Result<Entry, String> {
     let mut names = None;
     let mut capabilities = Vec::new();
     for line in SOURCE.lines() {
@@ -408,7 +408,7 @@ fn push_i16(output: &mut Vec<u8>, value: i16) {
 }
 
 /// Compile an entry into the legacy binary format.
-pub(crate) fn compile(entry: &Entry) -> Result<Vec<u8>, String> {
+pub fn compile(entry: &Entry) -> Result<Vec<u8>, String> {
     let mut booleans = Vec::new();
     let mut numbers = Vec::new();
     let mut strings = Vec::new();
@@ -511,7 +511,7 @@ fn read_i16(bytes: &[u8], at: usize) -> Result<i16, String> {
 
 /// Decode a compiled entry. Bounds and counts are checked before any read, so
 /// a corrupt file is an error rather than a panic.
-pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
+pub fn decode(bytes: &[u8]) -> Result<Decoded, String> {
     let magic = read_i16(bytes, 0)?;
     if magic.to_le_bytes() != MAGIC.to_le_bytes() {
         return Err(format!("magic {magic:#x} is not a terminfo entry"));
@@ -619,15 +619,15 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
 }
 
 /// The compiled entry the recipe installs.
-pub(crate) fn entry() -> Result<Vec<u8>, String> {
+pub fn entry() -> Result<Vec<u8>, String> {
     compile(&parse()?)
 }
 
 /// The store-relative path the entry is installed at. ncurses looks a terminal
 /// up under the first letter of its name.
-pub(crate) const INSTALL_PATH: &str = "share/terminfo/t/td-term";
+pub const INSTALL_PATH: &str = "share/terminfo/t/td-term";
 
-pub(crate) fn selftest() -> Result<(), String> {
+pub fn selftest() -> Result<(), String> {
     let parsed = parse()?;
     let bytes = entry()?;
     let decoded = decode(&bytes)?;
@@ -659,8 +659,7 @@ pub(crate) fn selftest() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keyboard::MOD_SHIFT;
-    use crate::keys;
+    use crate::vt_keys as keys;
     use std::collections::BTreeSet;
 
     fn parsed() -> Entry {
@@ -740,7 +739,7 @@ mod tests {
         }
     }
 
-    /// §10's structural check: decode the compiled entry and compare it with
+    /// td-term/DESIGN.md §2's structural check: decode the compiled entry and compare it with
     /// the source capabilities field for field.
     #[test]
     fn the_compiled_entry_decodes_back_to_its_source() {
@@ -877,8 +876,9 @@ mod tests {
     }
 
     /// The key capabilities are a promise about bytes ANOTHER module produces.
-    /// Nothing but this ties them together: retyping a key in `keys.rs` would
-    /// leave this entry telling every curses application the old sequence.
+    /// Nothing but this ties them together: retyping a key in `vt_keys.rs`
+    /// would leave this entry telling every curses application the old
+    /// sequence.
     #[test]
     fn key_capabilities_are_the_bytes_the_adapter_sends() {
         let entry = parsed();
@@ -890,54 +890,49 @@ mod tests {
         let plain = keys::Modes {
             application_cursor: false,
         };
-        let send = |name: &str, modifiers: u32, modes: keys::Modes| -> Vec<u8> {
-            let code = keys::key_code(name).unwrap_or_else(|| panic!("no key {name}"));
-            keys::sequence(code, modifiers, modes)
-                .unwrap_or_else(|| panic!("{name} is silent"))
+        let send = |chord: &str, modes: keys::Modes| -> Vec<u8> {
+            keys::sequence(chord, modes)
+                .unwrap_or_else(|| panic!("{chord} is silent"))
                 .as_slice()
                 .to_vec()
         };
 
         for (capability, key) in [
-            ("kcuu1", "up"),
-            ("kcud1", "down"),
-            ("kcuf1", "right"),
-            ("kcub1", "left"),
-            ("khome", "home"),
-            ("kend", "end"),
+            ("kcuu1", "Up"),
+            ("kcud1", "Down"),
+            ("kcuf1", "Right"),
+            ("kcub1", "Left"),
+            ("khome", "Home"),
+            ("kend", "End"),
         ] {
             assert_eq!(
                 string(&entry, capability),
-                send(key, 0, application),
+                send(key, application),
                 "{capability}"
             );
         }
         // Paging and the editing keys are mode-independent, so the entry's one
         // spelling has to be right in BOTH modes.
         for (capability, key) in [
-            ("kpp", "pageup"),
-            ("knp", "pagedown"),
-            ("kich1", "insert"),
-            ("kdch1", "delete"),
-            ("kbs", "backspace"),
+            ("kpp", "PageUp"),
+            ("knp", "PageDown"),
+            ("kich1", "Insert"),
+            ("kdch1", "Delete"),
+            ("kbs", "Backspace"),
         ] {
+            assert_eq!(string(&entry, capability), send(key, plain), "{capability}");
             assert_eq!(
                 string(&entry, capability),
-                send(key, 0, plain),
-                "{capability}"
-            );
-            assert_eq!(
-                string(&entry, capability),
-                send(key, 0, application),
+                send(key, application),
                 "{capability} under DECCKM"
             );
         }
-        assert_eq!(string(&entry, "kcbt"), send("tab", MOD_SHIFT, plain));
+        assert_eq!(string(&entry, "kcbt"), send("S-Tab", plain));
         for number in 1..=12 {
-            let key = format!("f{number}");
+            let key = format!("F{number}");
             assert_eq!(
                 string(&entry, &format!("kf{number}")),
-                send(&key, 0, application),
+                send(&key, application),
                 "kf{number}"
             );
         }
@@ -950,7 +945,7 @@ mod tests {
     /// line-drawing character ncurses would not know it could draw.
     #[test]
     fn acsc_covers_exactly_the_models_graphics_map() {
-        const TERM: &str = include_str!("term.rs");
+        const TERM: &str = include_str!("vt.rs");
         let body = TERM
             .split_once("fn map_charset")
             .and_then(|(_, tail)| tail.split_once("_ => scalar,"))
@@ -1033,7 +1028,7 @@ mod tests {
 #[cfg(test)]
 mod effects {
     use super::*;
-    use crate::term::Terminal;
+    use crate::vt::Terminal;
 
     /// The concrete form is the capability with its parameters filled in;
     /// `then` is whatever makes the effect observable (a `sc` is only visible
@@ -1047,7 +1042,7 @@ mod effects {
         expect: fn(&Terminal) -> bool,
     }
 
-    fn attributes(terminal: &Terminal) -> crate::term::Attributes {
+    fn attributes(terminal: &Terminal) -> crate::vt::Attributes {
         terminal
             .cell(0, 0)
             .map(|cell| cell.attributes)
@@ -1221,7 +1216,7 @@ mod effects {
             setup: b"\x1b[1m",
             concrete: b"\x1bc",
             then: b"X",
-            expect: |t| attributes(t) == crate::term::Attributes::default(),
+            expect: |t| attributes(t) == crate::vt::Attributes::default(),
         },
         Effect {
             capability: "il1",
@@ -1437,7 +1432,7 @@ mod effects {
             setup: b"\x1b[1;4;7m",
             concrete: b"\x1b[mX",
             then: b"",
-            expect: |t| attributes(t) == crate::term::Attributes::default(),
+            expect: |t| attributes(t) == crate::vt::Attributes::default(),
         },
         Effect {
             capability: "op",
@@ -1446,8 +1441,8 @@ mod effects {
             concrete: b"\x1b[39;49mX",
             then: b"",
             expect: |t| {
-                attributes(t).foreground == crate::term::Color::Default
-                    && attributes(t).background == crate::term::Color::Default
+                attributes(t).foreground == crate::vt::Color::Default
+                    && attributes(t).background == crate::vt::Color::Default
             },
         },
         Effect {
@@ -1784,7 +1779,7 @@ mod effects {
     /// Every branch of `setaf`/`setab` must set the channel its name promises.
     #[test]
     fn the_colour_capabilities_reach_the_channel_they_name() {
-        use crate::term::Color;
+        use crate::vt::Color;
         for (capability, foreground) in [("setaf", true), ("setab", false)] {
             let format = declared(capability);
             // One colour from each branch: the 30-37 form, the 90-97 bright

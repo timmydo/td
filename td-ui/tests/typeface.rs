@@ -9,7 +9,8 @@
 //! The typeface over fonts `fonts` encodes: a face fitted to the grid's
 //! cell at each scale, made once, and the refusal of a face no grid cell
 //! fits; a raster given a typeface drawing through the face fitted at its
-//! scale; and the pinned face's loader over a directory the test writes.
+//! scale; and the pinned face's loaders, the regular style and a
+//! terminal's four, over a directory the test writes.
 
 mod fonts;
 
@@ -19,10 +20,10 @@ use std::path::PathBuf;
 use fonts::{Builder, Glyph, Segment};
 use td_ui::atlas::{Slot, Style};
 use td_ui::face::Face;
-use td_ui::face_file::{DIR, REGULAR};
+use td_ui::face_file::{BOLD, BOLD_ITALIC, DIR, ITALIC, REGULAR};
 use td_ui::font::pinned;
 use td_ui::notices::OUTLINE_FACE;
-use td_ui::pinned_face::{load_from, load_from_or_note, SETTING};
+use td_ui::pinned_face::{load_from, load_from_or_note, styles_from_or_note, SETTING};
 use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, Weight};
 use td_ui::sfnt::{Error, MAX_FONT_BYTES};
 use td_ui::typeface::Typeface;
@@ -133,6 +134,54 @@ fn the_bitmap_setting_keeps_a_program_on_the_bitmap_face() {
     // Without the face the note is written and the program still starts.
     fs::remove_file(dir.join(REGULAR)).unwrap();
     assert!(load_from_or_note(&dir, "test", None).is_none());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A style whose '0' is the square (`left`, `bottom`) to (`right`, `top`),
+/// advancing 500 of 1000 units like the others, so the four fit one cell.
+fn style(left: i32, bottom: i32, right: i32, top: i32) -> Vec<u8> {
+    let square = vec![
+        (left, bottom, true),
+        (left, top, true),
+        (right, top, true),
+        (right, bottom, true),
+    ];
+    let mut builder = Builder::new(vec![Glyph::Empty, Glyph::Simple(vec![square])]);
+    builder.advance = Some(500);
+    builder.format4 = vec![Segment::Delta(0x30, 0x30, 1u16.wrapping_sub(0x30))];
+    builder.font()
+}
+
+/// A terminal's four styles load as one face fitted to its cell unless the
+/// setting asks for the bitmap face; a style missing is the whole face
+/// refused, so the terminal draws in Unifont rather than in a face that
+/// cannot draw every rendition.
+#[test]
+fn a_terminal_loads_four_styles_unless_the_setting_asks_for_the_bitmap_face() {
+    let dir = scratch("styles");
+    for (name, bytes) in [
+        (REGULAR, style(0, 0, 500, 500)),
+        (BOLD, style(0, 0, 250, 250)),
+        (ITALIC, style(250, 0, 500, 250)),
+        (BOLD_ITALIC, style(0, 250, 250, 500)),
+    ] {
+        fs::write(dir.join(name), bytes).unwrap();
+    }
+    let load = |setting: Option<&str>| {
+        let setting = setting.map(std::ffi::OsString::from);
+        styles_from_or_note(&dir, "test", CELL_WIDTH, CELL_HEIGHT, setting.as_deref())
+    };
+    let loaded = load(None).expect("the four styles load");
+    assert_eq!(
+        (loaded.cell().width, loaded.cell().height),
+        (CELL_WIDTH, CELL_HEIGHT)
+    );
+    assert_eq!(loaded.style(true, true), Style::BoldItalic);
+    assert_eq!(loaded.style(false, true), Style::Italic);
+    assert!(load(Some("outline")).is_some());
+    assert!(load(Some("bitmap")).is_none());
+    fs::remove_file(dir.join(ITALIC)).unwrap();
+    assert!(load(None).is_none());
     fs::remove_dir_all(&dir).unwrap();
 }
 

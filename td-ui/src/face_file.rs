@@ -1,8 +1,7 @@
 //! The pinned outline face's files: the one directory both the image and a
 //! jailed program's runtime give it (td-ui/DESIGN.md, "Delivery and trust
 //! position"), its styles' names, and the bounded read of one of them.
-//! td-term mounts this module beside the pure face modules, so it depends
-//! on nothing else of td-ui's.
+//! `pinned_face` reads through it.
 
 use std::ffi::OsStr;
 use std::fs::{self, File};

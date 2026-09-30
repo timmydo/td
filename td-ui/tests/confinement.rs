@@ -23,7 +23,7 @@ fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-const PURE: [&str; 29] = [
+const PURE: [&str; 30] = [
     "atlas.rs",
     "charts.rs",
     "chrome.rs",
@@ -48,12 +48,33 @@ const PURE: [&str; 29] = [
     "tree_table_model.rs",
     "tree_table_paint.rs",
     "typeface.rs",
+    "vt_keys.rs",
     "xkb.rs",
     "xkb_compat.rs",
     "xkb_keys.rs",
     "xkb_symbols.rs",
     "xkb_syntax.rs",
 ];
+
+/// The terminal model, its renderer and its terminfo entry: pure like
+/// `PURE`, but their tests are specification files mounted beside them
+/// (or, for terminfo, two test modules), so the production text is what
+/// precedes the first column-zero `#[cfg(test)]` and the tail is pinned
+/// exactly.
+const TERMINAL: [(&str, &str); 3] = [
+    (
+        "vt.rs",
+        "#[cfg(test)]\n#[path = \"vt_spec.rs\"]\nmod spec;\n",
+    ),
+    (
+        "vt_render.rs",
+        "#[cfg(test)]\n#[path = \"vt_render_spec.rs\"]\nmod spec;\n",
+    ),
+    ("vt_terminfo.rs", ""),
+];
+
+/// Specification files compiled only as those modules' tests.
+const TERMINAL_SPECS: [&str; 2] = ["vt_spec.rs", "vt_render_spec.rs"];
 
 #[test]
 fn source_inventory_and_shared_mounts_are_closed() {
@@ -72,6 +93,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "notices.rs",
                 "open.rs",
                 "pinned_face.rs",
+                "pty.rs",
                 "replay.rs",
                 "sys.rs",
                 "wayland.rs",
@@ -79,6 +101,8 @@ fn source_inventory_and_shared_mounts_are_closed() {
             ]
             .iter(),
         )
+        .chain(TERMINAL.iter().map(|(name, _)| name))
+        .chain(TERMINAL_SPECS.iter())
         .map(|name| name.to_string())
         .collect();
     let mut actual = BTreeSet::new();
@@ -107,9 +131,10 @@ fn source_inventory_and_shared_mounts_are_closed() {
             "unsafe keyword in {name}"
         );
         // The raw module is named by the crate root's private declaration,
-        // by the transport's two imports and five wrapper calls and by the
-        // clipboard's import and five status calls; no other module,
-        // shared source or test-support reader reaches it.
+        // by the transport's two imports and five wrapper calls, by the
+        // clipboard's import and five status calls and by the PTY's import
+        // and four ioctl wrapper calls; no other module, shared source or
+        // test-support reader reaches it.
         // The socket's pinned procfs pathname has a `sys` segment that is
         // not raw-module access.
         let raw_text = if name == "control_socket.rs" {
@@ -125,15 +150,86 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "lib.rs" => 1,
                 "wayland.rs" => 7,
                 "clipboard.rs" => 6,
+                "pty.rs" => 5,
                 _ => 0,
             },
             "raw-module access in {name}"
         );
         assert_eq!(
             compact.matches("#[path=").count(),
-            if name == "lib.rs" { 4 } else { 0 },
+            match name.as_str() {
+                "lib.rs" => 6,
+                // The two specifications, the engine's SHA-256 the model's
+                // specification checks the libvterm import with, and the
+                // fonts the renderer's outline oracles encode.
+                "vt.rs" | "vt_render.rs" | "vt_spec.rs" | "vt_render_spec.rs" => 1,
+                _ => 0,
+            },
             "source paths in {name}"
         );
+        if name == "vt_spec.rs" {
+            assert!(compact.contains(
+                "#[allow(dead_code)]#[path=\"../../engine/src/sha256.rs\"]modmigration_sha256;"
+            ));
+        }
+        if name == "vt_render_spec.rs" {
+            assert!(compact.contains("#[path=\"../tests/fonts/mod.rs\"]modfonts;"));
+        }
+        if TERMINAL_SPECS.contains(&name.as_str()) {
+            assert!(
+                !text.contains("#[cfg(test)]"),
+                "a specification is test code throughout: {name}"
+            );
+        }
+        if let Some((_, tail)) = TERMINAL.iter().find(|(file, _)| *file == name.as_str()) {
+            let (production, tests) = text
+                .split_once("\n#[cfg(test)]\n")
+                .unwrap_or((text.as_str(), ""));
+            if tail.is_empty() {
+                // Two tail test modules and nothing else at column zero.
+                let modules: Vec<&str> = tests
+                    .lines()
+                    .chain(["#[cfg(test)]"])
+                    .filter(|line| !line.is_empty() && !line.starts_with([' ', '}', '/']))
+                    .collect();
+                assert_eq!(
+                    modules,
+                    [
+                        "mod tests {",
+                        "#[cfg(test)]",
+                        "mod effects {",
+                        "#[cfg(test)]"
+                    ],
+                    "test tail of {name}"
+                );
+            } else {
+                assert_eq!(
+                    format!("#[cfg(test)]\n{tests}"),
+                    *tail,
+                    "test tail of {name}"
+                );
+            }
+            for ambient in [
+                "std::env",
+                "std::fs",
+                "std::net",
+                "std::process",
+                "std::time",
+                "std::os",
+                "std::io",
+                "Instant",
+                "SystemTime",
+                "include_str!",
+                "include_bytes!",
+                "#[path",
+                "mod ",
+            ] {
+                assert!(
+                    !production.contains(ambient),
+                    "ambient access `{ambient}` in terminal module {name}"
+                );
+            }
+        }
         assert_eq!(
             text.matches(".pop_descriptor()").count(),
             match name.as_str() {
@@ -143,7 +239,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
             },
             "pops: the transport's own test, the client's accessor, keymap reader and send: {name}"
         );
-        for support in [".unconfigure(", ".input_mut("] {
+        for support in [".unconfigure(", ".input_mut(", ".take_for_test("] {
             assert_eq!(
                 text.matches(support).count(),
                 0,
@@ -175,41 +271,21 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 assert!(!compact.contains(absent), "{absent} in pinned_face.rs");
             }
         }
-        // td-term mounts these beside its own modules (td-compositor's
-        // main.rs), so they name no other td-ui module.
-        let mounted: Option<&[&str]> = match name.as_str() {
-            "sfnt.rs" => Some(&[]),
-            "coverage.rs" => Some(&["sfnt"]),
-            "atlas.rs" => Some(&["coverage"]),
-            "face.rs" => Some(&["atlas", "coverage", "sfnt"]),
-            "face_file.rs" => Some(&["sfnt"]),
-            _ => None,
-        };
-        if let Some(mounted) = mounted {
-            let named: BTreeSet<&str> = text
-                .match_indices("crate::")
-                .filter_map(|(at, _)| {
-                    text.get(at + "crate::".len()..)?
-                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                        .next()
-                })
-                .collect();
-            assert_eq!(
-                named,
-                mounted.iter().copied().collect(),
-                "{name} names only what td-term mounts beside it"
-            );
-        }
         if name == "lib.rs" {
             assert!(compact.starts_with("#![deny(unsafe_code)]"));
             assert!(!compact.contains("#![allow("));
             assert!(compact.contains("modsys;"), "the raw module is declared");
             assert!(!compact.contains("pubmodsys"), "the raw module is private");
             assert!(compact.contains("pubmodwayland;"));
+            for terminal in ["pty", "vt", "vt_keys", "vt_render", "vt_terminfo"] {
+                assert!(compact.contains(&format!("pubmod{terminal};")));
+            }
             for (file, declaration) in [
                 ("filter.rs", "pubmodfilter;"),
                 ("font.rs", "pubmodfont;"),
                 ("font_data.rs", "modfont_data;"),
+                ("proc_status.rs", "pubmodproc_status;"),
+                ("reportable.rs", "pubmodreportable;"),
                 ("wire.rs", "pubmodwire;"),
             ] {
                 assert!(
@@ -364,7 +440,7 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0xd4d8765954d79021,
+        hash, 0x3295d19065593dfe,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
@@ -372,7 +448,13 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         "const SYS_RECVMSG: usize = 47;",
         "const SYS_FCNTL: usize = 72;",
         "const SYS_POLL: usize = 7;",
+        "const SYS_IOCTL: usize = 16;",
         "const POLLIN: i16 = 1;",
+        "const TIOCSPTLCK: usize = 0x4004_5431;",
+        "const TIOCGPTPEER: usize = 0x5441;",
+        "const TIOCSWINSZ: usize = 0x5414;",
+        "const TIOCGWINSZ: usize = 0x5413;",
+        "const PTY_PEER_FLAGS: usize = 0o2 | 0o400 | 0o2_000_000;",
         "const F_DUPFD_CLOEXEC: usize = 1030;",
         "const F_GETFL: usize = 3;",
         "const F_SETFL: usize = 4;",
@@ -399,9 +481,32 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         "pub(crate) fn readable(\n    stream: &UnixStream,\n    waker: &UnixDatagram,\n    timeout_ms: u16,\n) -> io::Result<[bool; 2]>",
         "SYS_POLL,\n        fds.as_mut_ptr() as usize,\n        fds.len(),\n        usize::from(timeout_ms),",
         "events: POLLIN,",
+        "pub(crate) fn unlock_pty(master: &File) -> io::Result<()>",
+        "let unlocked: i32 = 0;",
+        "SYS_IOCTL,\n        master.as_raw_fd() as usize,\n        TIOCSPTLCK,\n        (&unlocked as *const i32) as usize,",
+        "pub(crate) fn pty_peer(master: &File) -> io::Result<File>",
+        "SYS_IOCTL,\n        master.as_raw_fd() as usize,\n        TIOCGPTPEER,\n        PTY_PEER_FLAGS,",
+        "Ok(File::from(adopt(fd)))",
+        "pub(crate) fn set_window_size(terminal: &File, words: [u16; 4]) -> io::Result<()>",
+        "SYS_IOCTL,\n        terminal.as_raw_fd() as usize,\n        TIOCSWINSZ,\n        (&words as *const [u16; 4]) as usize,",
+        "pub(crate) fn window_size(terminal: &File) -> io::Result<[u16; 4]>",
+        "let mut words = [0u16; 4];",
+        "SYS_IOCTL,\n        terminal.as_raw_fd() as usize,\n        TIOCGWINSZ,\n        (&mut words as *mut [u16; 4]) as usize,",
     ] {
         assert!(raw.contains(pin), "{pin}");
     }
+    // ioctl(2) is exactly the four PTY requests, each at its one wrapper:
+    // the request is never a parameter.
+    assert_eq!(raw.matches("SYS_IOCTL").count(), 5);
+    for request in ["TIOCSPTLCK", "TIOCGPTPEER", "TIOCSWINSZ", "TIOCGWINSZ"] {
+        assert_eq!(raw.matches(request).count(), 2, "{request}");
+    }
+    assert_eq!(raw.matches("PTY_PEER_FLAGS").count(), 2);
+    assert_eq!(
+        raw.matches("adopt(").count(),
+        4,
+        "the adoption site and its three callers"
+    );
     assert!(!raw.contains("#![allow("));
     assert_eq!(raw.matches("core::arch::asm!").count(), 1);
     assert_eq!(raw.matches("from_raw_fd").count(), 1);
@@ -476,6 +581,32 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
     assert!(client.contains("!metadata.is_file() || metadata.len() < u64::from(size)"));
     assert!(!client.contains("from_raw_fd") && !client.contains("as_raw_fd"));
     assert!(!client.contains("mmap"));
+    // The PTY is the ioctls' one caller, each at one site: the master is
+    // opened without acquiring it and unlocked, its slave taken from it by
+    // descriptor, and every published size read back before it is trusted.
+    let pty = include_str!("../src/pty.rs");
+    let pty = pty.split("\n#[cfg(test)]\n#[allow(").next().unwrap();
+    assert_eq!(pty.matches("sys::").count(), 4);
+    assert_eq!(pty.matches("use crate::sys;").count(), 1);
+    for call in [
+        "sys::unlock_pty(&master)",
+        "sys::pty_peer(&self.master)",
+        "sys::set_window_size(&self.master, winsize_words(requested))",
+        "sys::window_size(&terminal)",
+    ] {
+        assert_eq!(pty.matches(call).count(), 1, "{call}");
+    }
+    assert!(pty.contains(".custom_flags(O_NOCTTY)"));
+    assert!(pty.contains("pub const DEV_PTMX: &str = \"/dev/ptmx\";"));
+    assert_eq!(pty.matches(".open(").count(), 1, "one device opened");
+    assert!(pty.contains(".open(DEV_PTMX)"));
+    assert!(pty.contains("const O_NOCTTY: i32 = 0o400;"));
+    assert!(pty.contains("let observed = window_size(&self.master)?;"));
+    assert!(!pty.contains("from_raw_fd") && !pty.contains("as_raw_fd"));
+    assert!(
+        pty.contains(".env_clear()"),
+        "a child's environment is its caller's"
+    );
     let transport = include_str!("../src/wayland.rs");
     assert_eq!(transport.matches("sys::").count(), 5);
     for call in [

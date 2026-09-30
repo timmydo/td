@@ -3931,10 +3931,9 @@ The `syscall5` body carries:
   listener;
 - fcntl(2), with only `F_GETFL` and `F_SETFL`, to add `O_NONBLOCK` while one
   clipboard source writes and restore the destination's prior status;
-- ioctl(2), for the four pinned terminal-control requests in section 12, the
-  two pinned `EVIOCGABS` requests that read an absolute pointer's declared
-  axis range, EVIOCSCLOCKID fixed to CLOCK_MONOTONIC, and the fourteen DRM
-  requests below;
+- ioctl(2), for the two pinned `EVIOCGABS` requests that read an absolute
+  pointer's declared axis range, EVIOCSCLOCKID fixed to CLOCK_MONOTONIC, and
+  the fourteen DRM requests below;
 - clock_gettime(2), fixed to CLOCK_MONOTONIC for the attention cutoff; and
 - munmap(2), for an owned dumb-buffer mapping. The six-argument body carries
   only mmap(2), pinned to that buffer's shared read/write mapping.
@@ -4174,7 +4173,7 @@ other target source file. Each developer tool is a separate crate root that
 also denies unsafe. Adding a syscall or another scoped allow amends this
 document and the repository-wide unsafe inventory.
 
-Standalone demo and terminal clients create their frame buffers beside their
+The standalone demo client creates its frame buffers beside its
 own readiness socket, independently of the display socket's owner. Embedded
 demo sessions retain their explicitly supplied client runtime. The portal
 dialog uses its separate configured human runtime for both initial and resized
@@ -4190,22 +4189,20 @@ Server clipboard endpoints use the opaque `TransferEndpoint` File owner.
 The server consumes its received descriptor through the existing exact
 `ReceivedFd::into_file` conversion; a VM export may instead supply a native
 owned Unix socket endpoint. Ordinary forwarding preserves the exact open-file
-description. The client clipboard source retains its own pinned conversion. PTY slave acquisition retains
-its existing reopen-and-close helper and does not receive cross-UID files.
+description. No compositor client adopts a clipboard endpoint; td-term's did,
+and left with it for td-ui.
 
 Confinement tests pin each wrapper family to its callers across every module:
-descriptor transport to `client.rs`, `conn.rs`, and `server.rs`; terminal
-control to `pty.rs`; absolute-axis recovery and evdev clock selection to
+descriptor transport to `client.rs`, `conn.rs`, and `server.rs`;
+absolute-axis recovery and evdev clock selection to
 `input.rs`; peer authentication to `server.rs` and `session.rs`; DRM to
 `drm.rs`; descriptor status changes to `conn.rs`; and the
 monotonic attention cutoff to `runtime.rs`. The complete family/module
 matrix also rejects a wrong-family call from an otherwise admitted module,
 and aliases cannot bypass it. The extracted connection is crate-visible,
-so its naming roster is separately pinned to `client.rs`, `conn.rs`, and
-`term_client.rs`. A transport user is not thereby a syscall caller:
-`term_client.rs` names no `sys`.
+so its naming roster is separately pinned to `client.rs` and `conn.rs`.
 
-`ioctl(2)` carries twenty-one value-pinned requests. One allow-list refuses
+`ioctl(2)` carries seventeen value-pinned requests. One allow-list refuses
 any other value before either the ordinary or bounded-retry DRM entry point
 issues the syscall. Tests pin each value, the shared guard, both entry
 points, and each wrapper's operand shape. Two values also pin a length: the
@@ -4231,13 +4228,14 @@ order.
 
 ## 5. Boot and recovery
 
-This section records the boot profile. The td-term cutover of sections 12 and
-14 has landed: it replaced the demo SERVICE and the oracle's marker, and the
-devpts setup is in the early mount sequence. The Firefox image cutover then
-removed the demo's final-image `/bin` symlink and assigned the application
-launcher entry to Firefox; `td-ui-demo` remains a protocol fixture inside the
-copied compositor store output and its own recipe. The compositor ordering,
-readiness, restart, and serial-recovery guarantees remain in force.
+This section records the boot profile. The td-term cutover
+([td-term/DESIGN.md](../td-term/DESIGN.md) §4 and §6) has landed: it replaced
+the demo SERVICE and the oracle's marker, and the devpts setup is in the early
+mount sequence. The Firefox image cutover then removed the demo's final-image
+`/bin` symlink and assigned the application launcher entry to Firefox;
+`td-ui-demo` remains a protocol fixture inside the copied compositor store
+output and its own recipe. The compositor ordering, readiness, restart, and
+serial-recovery guarantees remain in force.
 
 PID 1 still mounts devtmpfs, procfs, sysfs, tmpfs, and the immutable root.
 `td-svc` starts `td-seatd` after root checking, then starts
@@ -4263,15 +4261,16 @@ system oracle requires both markers and the first client's later
 
 ## 6. Required proof
 
-These are the compositor and client proofs. The td-term proof of section 14
-has landed and superseded the demo-specific `TD-UI-CLIENT-READY` requirement;
-the demo's protocol coverage remains host-side rather than an image-launcher
-claim. Where a bullet below says "the boot client" it now means td-term. The
-terminal takes a pointer for its wheel and consumes every framed event on it,
-but that is proved by host tests over `Surface::dispatch`, not by the boot
-oracle, which delivers the boot client no pointer input. Nothing about the
-terminal requires the capability either: it binds a pointer only where a seat
-offers one.
+These are the compositor and client proofs. The td-term proof of
+[td-term/DESIGN.md](../td-term/DESIGN.md) §6 has landed and superseded the
+demo-specific `TD-UI-CLIENT-READY` requirement; the demo's protocol coverage
+remains host-side rather than an image-launcher claim. Where a bullet below
+says "the boot client" it now means td-term. The terminal takes a pointer for
+its wheel and consumes every framed event on it, but that is proved by
+td-term's host tests over a scripted peer, not by the boot oracle, which
+delivers the boot client no pointer input. Nothing about the terminal
+requires the capability either: it binds a pointer only where a seat offers
+one.
 
 The landing must prove:
 
@@ -4640,57 +4639,16 @@ still shows the cross everywhere — the protocol half is what a toolkit needs
 and the asking half is a client's own increment. Clipboard, hotplug, and real
 DRM/KMS profiles follow. The terminal stack has the separate contract below.
 
-Of that contract these are built: the parser and terminal model, the native
-corpus including its `key` operations, the keyboard adapter of section 11
-(translation, autorepeat, the bounded input queue, and the scrollback
-viewport it selects), and from section 12 the PTY open/unlock/peer/winsize
-operations, the account and environment policy, the child argv (the default
-shell through `cttyhack --stdin`, or a literal `--command`), and the PTY
-reader thread.
-
-Section 11's pinned font is landed: the committed Unifont face, its licenses
-and provenance record, the importer that derives it reproducibly, and the PSF2
-reader that validates every header field, table entry, and pixel offset before
-the renderer can index a glyph. So is td-term's outline face, td-ui's pinned
-JetBrains Mono Nerd Font fitted to that face's cell in four styles.
-
-Section 11's renderer is landed as a pure function, with section 14's exact
-P6 goldens as its oracle: the palette, the six renditions, the cursor, the
-visual-bell ring, the clipping, and the scrollback viewport, whose selecting
-keys landed after it.
-Its caller is the Wayland client of section 12, which submits each rendered
-frame to its surface, so the frame-callback coalescing, the persistent-buffer
-reuse-after-release, and the buffer replacement on resize that section 11 also
-specifies are landed with it.
-
-Section 12's PTY writer thread and child waiter are landed with the bounded
-keyboard queue they share with the main loop. Section 12's devpts instance is
-landed: the image mounts it at sysinit
-through a `td-init` applet, pins `CONFIG_UNIX98_PTYS=y`, and re-proves the
-mount options, the `/dev/ptmx` symlink and the instance `ptmx` on the booted
-machine. Section 12's readiness socket, `TD-TERM-READY` marker, and `probe`
-subcommand are landed, along with the `td-term` name itself: one artifact
-serves three programs, chosen by argv[0], and the store output carries the
-terminal as a symlink beside the compositor. The `/bin/td-term` name §12 spells
-and the `ready=` line that calls it are packaging, and are landed. The
-publisher has its caller: deciding a terminal IS ready belongs to the Wayland
-client, which publishes after `present` has drawn a frame at a size the
-compositor CHOSE and taken both the buffer release and the first frame
-callback, and then once everything that can still fail has — handshake
-finished, reader detached, child started — and before its main loop, so a
-probe is never told something true for less than a second. That is strictly
-more than the demo's marker proved, which is why the boot oracle could move
-to it. That client is landed and is the PTY adapter's production caller; its
-host tests still drive
-every operation against a real PTY, and the packaged binary's selftest covers
-the policy layer, which is what runs where devpts is not mounted. The terminfo
-entry and the `/bin/td-term` symlink are landed, the launcher can open a
-terminal, and the boot cutover is landed: the `[terminal]` unit replaced
-`[ui-demo]`, so the machine comes up on a shell prompt and the boot oracle's
-first-client marker is the terminal's. The selected Firefox application now
-occupies the launcher application entry; the demo has no `/bin` name, service
-or launcher role in the image, although its personality remains reachable in
-the copied compositor store output for lower-level protocol tests.
+td-term is its own program over the td-ui client toolkit, which carries the
+terminal model, renderer, keyboard encoder, terminfo compiler and PTY;
+[td-term/DESIGN.md](../td-term/DESIGN.md) records what of its contract is
+landed. The compositor keeps the pinned Unifont face, its importer and the
+PSF2 reader for its own drawing, the devpts instance the image mounts at
+sysinit, and the launcher entry and terminal-authority probe that run
+`/bin/td-term`. The selected Firefox application occupies the launcher
+application entry; the demo has no `/bin` name, service or launcher role in
+the image, although its personality remains reachable in the copied
+compositor store output for lower-level protocol tests.
 General Wayland toolkit compatibility is not claimed until the missing core
 protocols have explicit tests. Hardware acceleration, niri, portals, PipeWire,
 Xwayland, and a C desktop stack remain optional consumers rather than
@@ -4698,1173 +4656,29 @@ foundations of td's UI.
 
 ## 9. td-term boundary and philosophy
 
-`td-term` is td's native terminal for this compositor. Its product reference
-is foot: one process per terminal, native Wayland, immediate startup, a quiet
-interface, and no server process or application framework. It is not a foot
-reimplementation and does not inherit foot's implementation or compatibility
-claims.
-
-The terminal is the third argv[0] entry point of the existing compositor
-multicall, alongside `td-compositor` and `td-ui-demo`. The package installs a
-relative `td-term -> td-compositor` symlink. This reuses the one Wayland wire
-implementation and the existing confined SCM_RIGHTS transport instead of
-creating a second target-side unsafe surface. The client and server run as the
-same graphical user, and the shared artifact is not a privilege boundary.
-`td-ui-demo` remains a source and target-recipe protocol fixture. The Firefox
-image cutover removes its final-image `/bin` symlink and service; the copied
-compositor store output, protocol tests and standalone compositor recipe, not
-the deployed launcher, retain the synthetic client.
-
-All terminal code is dependency-free Rust built by td's source-built stage2
-toolchain. It has no toolkit, GPU API, dynamic font system, terminal daemon,
-configuration language, plugin interface, or external crate. Its first
-renderer is software XRGB8888 into persistent `wl_shm` buffers.
-
-The implementation has four separable layers:
-
-- a byte-stream parser that emits bounded terminal actions;
-- a terminal model that owns grids, modes, cursor, history, and replies;
-- a bitmap renderer that converts an explicit model snapshot to pixels; and
-- PTY, Wayland, keyboard, and clock adapters around those pure layers.
-
-The parser, terminal model, and renderer read no descriptors, sockets, clocks,
-environment, or global process state. Tests can therefore drive every state
-transition with explicit bytes, sizes, keys, and time values. Adapter failures
-close the affected terminal without corrupting model state.
+Moved to [td-term/DESIGN.md](../td-term/DESIGN.md) §1.
 
 ## 10. First terminal profile
 
-The first profile is a bounded, keyboard-first ECMA-48/DEC terminal sufficient
-for td's shell and userland. It implements:
-
-- streaming UTF-8 decoding with replacement of malformed input;
-- a primary grid, an alternate grid, a cursor, tab stops, scrolling margins,
-  origin mode, autowrap, and bounded primary-screen history;
-- C0 bell as a coalesced visual notification, backspace, tab, line feed,
-  vertical tab, form feed, carriage return, shift-in, shift-out, escape,
-  cancel, and substitute controls;
-- index, next-line, reverse-index, tab-set, save/restore, and reset escape
-  operations, plus G0/G1 ASCII and DEC special-graphics designation;
-- cursor movement and position, erase in display and line, insert/delete/erase
-  characters, insert/delete lines, scroll, margins, tab clearing, and repeat;
-- SGR reset, bold, faint, italic, underline, inverse, strike, default colors,
-  the 16-color palette, indexed 256 colors, and 24-bit colors;
-- normal and application cursor keys, primary device attributes, cursor
-  position reports, and the replies required by the claimed profile; and
-- DEC cursor preservation for mode 1048 and alternate-screen mode 1049;
-- bracketed-paste mode 2004, initially disabled and cleared by terminal reset.
-
-UTF-8 scalars are initially single-cell glyphs. Wide cells, combining
-sequences, grapheme clustering, bidi, shaping, and emoji presentation require
-a separately pinned Unicode-data design. A missing glyph renders a visible
-replacement cell. This limitation is part of the claimed profile rather than
-an accidental difference hidden by the test overlay.
-
-Ordinary C0 controls and DEL execute or are ignored without cancelling a
-partially received UTF-8 scalar; ESC, CAN, SUB, and malformed non-continuation
-bytes retain their parser recovery behavior. Color parameters use the
-semicolon forms in the native corpus; colon subparameter forms are deferred.
-
-The initial cursor is steady rather than clock-blinking. Shift+PageUp and
-Shift+PageDown navigate scrollback. Ordinary text input returns to the live
-bottom. An unmodified End key is consumed for the same purpose while viewing
-scrollback and is forwarded in the selected cursor-key mode at the live
-bottom. Mouse reporting, hyperlinks, images, sixel, ligatures, search, and
-shell integration are deferred. Pointer selection and the core data-device
-clipboard source are specified below. A protocol is not parsed merely because
-another terminal implements it.
-
-Unsupported CSI operations are ignored as complete sequences. OSC, DCS, SOS,
-APC, and PM strings enter allocation-free streaming ignore states and cannot
-execute commands or open paths. BEL or ST terminates an ignored string; CAN
-and SUB cancel one. ESC either begins ST or recovers through the normal escape
-state. Unsupported input must not leak printable fragments or desynchronize
-subsequent supported input.
-
-Resource ceilings are part of the model contract:
-
-- at most 32 CSI parameters;
-- at most 1,048,576 history cells, 16,384 history lines, and 16 MiB of history
-  storage;
-- at most 1 MiB of queued PTY output, 64 KiB of queued keyboard input, and
-  64 KiB of queued terminal replies; and
-- screen dimensions bounded by the compositor's existing dimension and pixel
-  ceilings.
-
-Exceeding a syntactic ceiling transitions to a sink state that consumes through
-the sequence's final byte before returning to ground. A full PTY-output channel
-blocks its reader thread, applying kernel PTY backpressure without dropping
-bytes. A keyboard sequence is enqueued atomically; if the complete sequence
-cannot fit, td-term drops that whole input event and marks the visual bell
-rather than truncating stream bytes or closing the session. History evicts
-only complete oldest lines. A reply is also admitted atomically; if it cannot
-fit, td-term drops that whole reply and marks the visual bell rather than
-deadlocking the child's input and output paths. No queue or storage grows
-without limit.
-
-The child environment is cleared and reconstructed. A bounded parse of
-`/proc/self/status` selects the matching unique `/etc/passwd` entry and
-supplies `HOME`, `USER`, and `LOGNAME`; a missing, duplicate, malformed, or
-mismatched account closes the terminal before child creation. Malformed is
-whole-file, not per-entry: any line without seven fields or with a non-numeric
-uid closes it, wherever it sits. td owns this file, so a line it cannot account
-for is a system-integrity problem rather than an entry to skip past on the way
-to the one being looked up. That file is the
-whole account namespace: td resolves no Name Service Switch, so an account that
-exists only in LDAP, NIS, or a directory service does not exist for td-term.
-This is the same single-local-seat assumption `td-seatd` is built on, and
-lifting it is a separately reviewed design change, not a parser change. The
-remaining
-values are `TERM=td-term`, `COLORTERM=truecolor`, `PATH=/bin`,
-`SHELL=/bin/sh`, and `TERMINFO=/etc/terminfo`. The package carries its td-owned
-entry under its store `share/terminfo`, and the system closure exposes that
-immutable directory through `/etc/terminfo`; no new top-level image root is
-needed. `XDG_RUNTIME_DIR=/run/user/UID` comes from the verified numeric uid and
-`WAYLAND_DISPLAY` carries the terminal launcher's actual socket path. The
-stock image uses `/run/td-compositor/1000/wayland-0`; host development carries
-its supplied endpoint. Consumers must honor absolute-display semantics
-(`Path::join` does); concatenating the runtime and display strings is invalid.
-A dependency-free
-encoder produces the entry from a human-readable capability source; `tic`,
-ncurses, and a host terminfo database are not build inputs. Every boolean,
-number, output sequence, and input key in that entry names a blocking native
-case. A structural test decodes the installed entry and compares it
-field-for-field with the source capabilities.
-
-The encoder emits the legacy binary format rather than the 32-bit-number one,
-which exists to carry `pairs#65536`; this entry's largest number fits the
-signed 16-bit field, so the older format every reader understands is enough.
-The three capability arrays are declared only one past the highest index
-claimed, and a reader treats the rest as absent — which is also why the pinned
-`Caps` ordering stops after `setab` instead of continuing through printer and
-bit-image capabilities this profile will never claim.
-
-That ordering is the whole trust surface. Position in the name tables IS the
-wire index, so a capability written at the wrong one is a well-formed entry
-that means something else, and no round-trip through the module's own decoder
-can see it — the encoder and decoder would share the mistake. It is therefore
-pinned as ordered lists rather than per-capability integers, so what a reviewer
-checks is one list against `Caps`, with the counts and the order's
-non-alphabetical joints asserted separately: `kf10` between `kf1` and `kf2`,
-`lf10` between `lf1` and `lf2`, and `kf11` after `rfi` rather than after
-`kf10`.
-
-Attribution is checked, not merely declared. Key capabilities are compared
-byte-for-byte against the sequence the keyboard adapter generates for that key,
-because a key is emitted exactly as the entry spells it; the same comparison
-runs against the corpus case's own input expectation. Output capabilities are
-compared by escape-sequence shape — introducer, private flag and final byte,
-and, for the finals where a parameter SELECTS the operation rather than
-counting or positioning, the parameters too — because a capability spells the
-default-parameter form (`\E[A`) of a sequence a case naturally writes with
-parameters (`\E[3A`), and demanding the literal bytes would only push the
-corpus into writing degenerate sequences to satisfy a test.
-
-Attribution alone is not enough, and the gap is worth stating precisely. It
-asks whether the named case exercises an operation; it cannot ask whether that
-is the RIGHT operation for that capability. Where a family shares one case the
-distinction is the whole point: the cursor case writes all four of `CSI A/B/C/D`,
-so exchanging `cuu` and `cud` satisfies every attribution and ships an entry
-that moves the cursor the wrong way — as do exchanging `il1`/`dl1`, `ich`/`dch`,
-`indn`/`rin`, or any two of the nine renditions that share a case. Each such
-capability is therefore pinned twice more: its declared spelling must be the
-same operation as a concrete form written beside it, and feeding that concrete
-form to the model must produce the effect its name promises. A capability that
-shares a case with another and has no such check is refused, so the coverage
-cannot quietly lapse as the entry grows. The colour capabilities are pinned by
-expansion instead — every branch of `setaf`/`setab` is instantiated and driven
-through the model — because a redirected branch still emits a well-formed SGR,
-just for the wrong channel.
-
-The entry is reachable at runtime. The child is given `TERMINFO=/etc/terminfo`,
-the image's immutable `/etc/terminfo` resolves to the package's store
-`share/terminfo`, and td-jail's terminal grant binds the one entry for the
-launcher's `TERM` read-only into a jail's own `/etc/terminfo`, where it requires
-the file at mode `0444` — the mode a bind reads from the store file itself. The
-build step's own mode does not reach the image: every tree the builder stages is
-copied writable by its owner, and a NAR restore writes `0644`, so the image's
-mode-fixing step sets `0444` on the packed entry and the root-tree check refuses
-an image whose entry is anything else, naming the launches it would refuse. The
-terminal applications' first boot is what found the requirement: both windows
-closed on td-jail's refusal of a `0644` entry, and nothing short of a booted
-jail runs that readback.
-
-What the entry omits is as deliberate as what it claims. `cols`/`lines` are
-absent because td-term sets and verifies the PTY winsize before the child
-starts, so the pre-winsize fallback they exist to serve is unreachable by
-construction. `smir`/`rmir` are absent because this profile implements no ANSI
-insert mode, and `blink`/`invis` because it has no SGR for either — an entry
-that claimed them would be describing a terminal td-term is not. `bel` is
-absent for a different reason: BEL sets the model's coalesced visual-bell bit,
-which no corpus observation can see until the renderer that presents it lands,
-and a capability whose case would be a fiction is worse than a missing one.
-
-An outer `TERM=foot`, `TERM=linux`, or other value describes the parent
-terminal and is never an oracle or a capability claim for td-term. An optional
-developer check may ask a pinned host `infocmp` to decode the generated entry,
-but neither that tool nor its result participates in the required gate. The
-check remains green when the optional host tool is absent.
+Moved to [td-term/DESIGN.md](../td-term/DESIGN.md) §2.
 
 ## 11. Font, keyboard, and rendering
 
-The first implementation pins one licensed PSF2 bitmap font with a Unicode
-table: GNU Unifont 16.0.04, single-width, 8x16, 20673 glyphs. Its exact bytes
-and license are committed under `td-compositor/assets`, while the archive hash
-and upstream provenance are recorded there in `PROVENANCE`.
-
-That face is derived rather than downloaded, which the provenance record and
-`tools/import-unifont.rs` exist to make reproducible: upstream publishes no
-full-coverage PSF2, only an APL-specific PSF1. The importer pins the upstream
-`.hex` by hash and takes only its single-width records, which is not a
-narrowing of Unifont so much as the only thing PSF2 can express -- one fixed
-cell for every glyph -- and matches section 13 making double-width cells a
-deliberate first-profile exclusion. It also excludes the two jiskan16 files
-COPYING carves out of the dual license, by construction rather than by choice,
-since both are 16x16.
-Host tests and the target recipe consume those same bytes; no host font lookup
-or fetched-only test input participates. The PSF2 reader checks headers,
-dimensions, glyph counts, table bounds, scalar validity, and all pixel
-arithmetic before use.
-
-td-term also draws in td-ui's pinned outline face (td-ui/DESIGN.md,
-"td-term"). At startup it reads JetBrains Mono Nerd Font's four styles
-from `/etc/fonts/jetbrains-mono-nerd` through td-ui's `face_file`,
-mounted here with td-ui's `sfnt`, `coverage`, `atlas` and `face`, and
-fits them to Unifont's 8x16 cell, so the grid, the `TIOCSWINSZ` pixel
-size and every rule stay Unifont's. A scalar the outline face lacks, a
-missing or refused face, and `TD_UI_FACE=bitmap` all draw from Unifont
-as below. No test reads the pinned outline face: the outline painter's
-oracles use fonts the tests encode, and every other oracle renders from
-Unifont.
-
-The renderer gives every claimed rendition a deterministic presentation from
-the bitmap face; through the outline face, bold, italic and bold italic
-select those styles, and faint, inverse, underline and strike are as
-here. Bold adds a clipped one-pixel rightward copy of set glyph bits,
-faint blends foreground halfway toward background with integer channel
-arithmetic, and italic applies a bounded row-dependent one-pixel shear.
-Underline and strike draw fixed clipped cell rows, and inverse exchanges
-foreground and background. Blocking PPM cases prove that each claimed
-attribute differs from an otherwise identical normal cell.
-
-The fixed palette is xterm's: its sixteen base entries are a table, and the
-remaining 240 are computed from the arithmetic that defines them -- the
-six-level cube on 0, 95, 135, 175, 215, 255, then the grey ramp from 8 in
-steps of 10 -- so those entries cannot drift from their own definition.
-Default ink is entry 7 on entry 0 rather than a seventeenth colour, so
-`SGR 39` and `SGR 49` land back on a palette the child can also name.
-Faint follows inverse rather than preceding it: after the exchange the
-drawn foreground is the one to dim, and blending before it would brighten
-an inverse-and-faint cell instead.
-
-The cursor is a presentation of that same exchange. Focused, it is its cell
-drawn with inverse toggled, so a cursor over an already-inverse cell reads
-as the surrounding text. Unfocused, it is a hollow one-pixel box in the
-cell's foreground, leaving the glyph legible underneath: present, but not
-claiming the keyboard. That box is the same colour as the glyph it rings, so
-over a cell whose border pixels are all set -- `U+2588`, and some
-box-drawing -- an unfocused cursor is invisible. That follows from drawing it
-in the cell's own foreground and is accepted for the first profile, where an
-unfocused terminal has nothing to locate; a focused cursor is never affected,
-since exchanging the ink is visible against any glyph. A pending wrap does
-not move either, because the model already reports the column the cursor
-still occupies.
-
-The renderer consumes a complete terminal snapshot, a fixed palette, focus
-state, and cursor state. It performs no allocation in the cell loop
-beyond the outline face covering a glyph into its atlas on first use. A full
-redraw is acceptable for the initial QEMU profile, but rendering is coalesced
-behind at most one frame callback. A submitted persistent buffer is reused or
-mutated only after its `wl_buffer.release`; the initial fill precedes its first
-submission. Resizing creates a replacement while retaining the old buffer
-until release. Every glyph and decoration is clipped to the surface before
-pixels are visited.
-
-C0 BEL, an atomically dropped keyboard event, or an atomically dropped reply
-sets one coalesced visual-bell bit in the snapshot. The next submitted frame
-inverts the one-pixel ring inside the client surface and clears the bit after
-release; repeated notifications before that release do not queue additional
-frames. A blocking PPM case and the file-backed gallery cover the exact
-presentation.
-
-td-term binds the compositor's keyboard and validates that the received
-keymap descriptor contains exactly the shared `keyboard::XKB_KEYMAP` string
-followed by its NUL terminator, matching the server's advertised size. A
-mismatch closes the client before child creation; running under another
-Wayland compositor is outside the first profile. It binds the seat at
-version 5 through 7, as the demo does, because repeat_info is a version-4
-event and the timings below are read out of it rather than restated; a lower
-bind would make this section unimplementable and a higher one arrives at a
-client whose dispatch treats an unknown keyboard opcode as fatal. The
-terminal translates the fixed evdev key codes and standard XKB modifier
-masks itself; it does not import libxkbcommon. A pinned in-tree table marks
-text and navigation keys repeatable and modifiers non-repeating, mirroring
-the exact keymap's repeat exclusions. Validation uses positioned
-`FileExt::read_at` calls so reading one SCM_RIGHTS duplicate cannot advance
-the shared open-file-description offset seen by a restarted or second
-client.
-
-The input adapter covers text keys, Enter, Tab, Backspace, Escape, arrows,
-Home, End, PageUp, PageDown, Insert, Delete, and F1 through F12. It selects
-normal or application sequences from explicit terminal modes. Ctrl produces
-the specified ASCII C0 bytes, Alt prefixes the resulting sequence with ESC,
-and Shift selects the defined text or navigation variant; unlisted modifier
-combinations produce no bytes. td-term routes that adapter: the keyboard's
-modifiers event folds depressed, latched and locked into the one mask the
-adapter reads, and a pressed key becomes bytes in the queue the PTY writer
-drains. Releases send nothing, and a non-zero keymap group sends nothing
-either — the pinned map has one group, so reading another against group 0's
-table would send a different key's bytes rather than none. The terminal mode
-that picks between two spellings is refreshed from the model before each
-event, because a child's reply to one key can change how the next is
-spelled. Key REPEAT is wired, and its timings are the compositor's rather
-than the client's: `repeat_info` publishes a rate in keys per second and a
-delay in milliseconds, and a rate of zero is the protocol's "do not repeat"
-rather than an infinite interval. A held key is the only thing that makes
-the main loop time-sensitive, so with none armed it blocks on its channel
-exactly as before, and with one armed it waits no longer than that key's
-next repetition rather than polling. A repetition is re-routed per tick
-rather than replayed, so a child that changes DECCKM under a held cursor key
-gets the new spelling; a release, any modifier change, a keymap group
-change, losing focus, and a republished rate of zero each retire the held
-key, because the sequence armed under the old state is no longer the one it
-would send — and a key pressed while the group is not td's arms nothing at
-all, for the reason a single such press sends nothing. A later `repeat_info`
-with a different nonzero rate is not a retirement: it retimes the held key
-rather than dropping it. The scrollback VIEWPORT is wired too.
-`Shift+PageUp` and `Shift+PageDown` move the view rather than reaching the
-child, and a key that scrolls never also sends bytes. The view names the
-LINE it is looking at rather than a distance from the live bottom, so a
-child writing underneath an open viewport does not drag it along; the anchor
-is clamped against what history holds on every read, so eviction and resize
-leave it riding the top of what remains rather than snapping back. A clear
-retires the numbering, which is what stops an old anchor reopening a closed
-view on unrelated lines. End has two meanings and the effective position
-decides which: with the view open it returns to the live bottom, and at the
-bottom it is the child's key. A held scroll repeats, since walking back
-through history is what holding it is for. While the view is open the
-cursor is drawn where the shift puts it, and stops being drawn once that pushes it
-past the bottom: the renderer shifts the live screen and the cursor by
-the same offset, so neither needs a special case.
-
-Those three rules are exhaustive, and what they exclude is deliberate. Ctrl
-reaches printable keys only, and only where a C0 spelling is defined; the
-character it maps is the one Shift already selected, so `Ctrl+Shift+6` needs no
-second rule to reach `RS`. Alt prefixes ESC uniformly rather than folding a
-modifier into a CSI parameter, because this profile does not claim the
-modified-key encodings such a parameter implies, and a sequence it does not
-claim would be indistinguishable to the child from one it does. Shift on an
-arrow or a function key is therefore silent, and `Shift+PageUp` and
-`Shift+PageDown` belong to the scrollback viewport rather than to the child.
-Keys the pinned keymap publishes but this profile does not translate — Print,
-Pause, Menu, and the media keys — are silent for the same reason.
-
-Shift is not silent everywhere: on the fixed keys it passes through, because
-they have one spelling at both levels and real terminals send CR for
-`Shift+Enter` and DEL for `Shift+Backspace`. Tab is the one fixed key with a
-defined second spelling. It is the navigation and function keys, which have no
-shifted spelling in this profile, that Shift silences.
-
-A modifier the profile does not translate makes the whole chord unlisted rather
-than a bare key press. The compositor forwards Super chords it has no binding
-for, so without that rule `Super+q` would type `q`. The rule belongs to the
-PROFILE rather than to td's compositor, and so does not shrink as that
-compositor's table grows: it holds for `Super+Enter` and `Super+Up`, which td
-keeps for itself, under any other compositor that forwards them.
-Shift, Caps Lock, Control, and Alt
-are the handled set; Num Lock is handled-and-inert, because this profile's
-keypad is digits-only; any other bit, including an undefined one, silences the
-chord.
-
-The key table is checked against the compositor's published keymap in both
-directions, and the keys it marks repeatable are exactly that keymap's
-`repeat=no` exclusions inverted, so a client using the published keymap and
-td-term cannot disagree about which keys autorepeat.
-
-Those are checks on codes and characters, and neither reads a roster name. A
-code set is a set, so two entries that trade codes leave it identical; the
-character check walks the keymap into a spelling without consulting the name
-that selects it, so two entries that trade names leave it identical too — and
-then a corpus chord names one physical key and reaches another. Every roster
-name is therefore pinned to the keysym the keymap publishes for its key, and
-that pin covers the roster exactly in both directions, so a key added later
-cannot arrive unpinned. It is also the keypad's only per-key identity check,
-since the character check excludes `KP_7`-style symbols on purpose. Caps Lock behaviour is read
-from the keymap's declared `type="ALPHABETIC"` rather than inferred from a
-key's symbols looking like a letter pair, because retyping a key changes what
-Caps does for every xkbcommon client while its symbols stay as they were.
-
-Backspace emits DEL (`0x7f`) to match the
-slave's Linux-default canonical `VERASE`; Alt prefixes that byte with ESC. The
-compositor suppresses evdev repeat and publishes a repeat rate of 25 Hz with a
-600 millisecond delay, so td-term implements repeat from an injected clock.
-Release, focus loss, or any modifier snapshot change cancels the corresponding
-repeat; this also covers compositor chords whose command-key events are
-intercepted. Releasing some other key leaves a held key repeating, and
-repetitions missed while the main loop was busy are dropped rather than
-delivered as a burst. A repetition is routed when it is emitted, not when
-the key went down: the child can change cursor-key mode while an arrow is held,
-and a stored sequence would keep sending the spelling that was correct at the
-press. A held chord that scrolls repeats as a scroll, since walking back
-through scrollback is what holding it is for and the compositor sends no
-repeat events of its own to fall back on. Routing per repetition is also
-what makes a held End coherent: the first repetition closes the viewport and
-the ones after it are the child's, because by then the view is at the live
-bottom.
-
-Keyboard bytes reach the PTY writer through a bounded queue that admits a
-sequence whole or drops it whole: half a `CSI` arriving at the child would be
-worse than the key never having been pressed, so an overflowing queue rings the
-visual bell instead of truncating. The writer consumes only what the kernel
-accepted, so a partial write leaves the remainder queued; keystrokes have
-nowhere to come back from. Because the master is blocking, a child that stops
-reading blocks that writer once the line discipline fills — which is why the
-writer is its own thread and the main loop only enqueues.
-
-`Shift+PageUp` and `Shift+PageDown` move the viewport a screen less one row
-at a time, so the line last read is still on screen to read on from, and a
-one-row grid still scrolls by one rather than not at all. Both stop at the
-ends: there is nothing above the oldest retained line and nothing below the
-live screen, so a chord at either end is inert rather than an error.
-
-A WHEEL moves the same viewport three lines a detent, and reaches it by a
-second route rather than through `Action`: that enum is what one KEY PRESS
-does, and a notch arriving as one would be a third thing a key could mean. It
-is three rather than a page because a wheel is turned in flicks — a page a
-notch overshoots, and a line a notch makes crossing a screenful a dozen
-turns. The count comes from `axis_discrete`, which is the event that carries
-it; deriving it from the axis VALUE would need the compositor's own
-units-per-detent, a number no client is given. An `axis` event arriving with
-no discrete beside it is therefore IGNORED rather than read as one notch: the
-terminal requires its seat at version 5 or above, where a wheel always carries
-its count, so the only source that sends a bare axis is a smooth-scrolling one
-— and each of its many small events becoming a whole notch would make a
-trackpad scroll uncontrollably.
-
-A `wl_pointer.frame` is what APPLIES the accumulated notches, not each axis
-event: the frame is the transaction, so a tilting wheel — which reports both
-axes at once — moves the view once and repaints once for one flick. The
-horizontal axis is read and discarded rather than assumed absent, since a
-terminal has no sideways scrollback and counting the two together would send
-a sideways flick up the history.
-
-The pointer takes a DYNAMIC object id rather than a fixed one, and that is
-forced by the capability gate rather than chosen. Ids are per-client and must
-be DENSE. A fixed id reserved for the pointer is skipped on a keyboard-only
-seat, where the object is never created — precisely the gap a compliant
-compositor disconnects for, and one nothing in td would report, since td's own
-server checks only uniqueness. A dynamic id is dense either way, being handed
-out when the object is actually asked for.
-
-The viewport stores the line it is looking at in a monotonic numbering of
-lines ever pushed to primary history, not a distance from the live bottom,
-because the bottom moves. A stored distance would let a child writing
-underneath an open viewport drag the view along with it, one line per line
-of output. Clearing that history — a reset, or `CSI 3 J` — retires the
-numbering along with the lines, so an anchor is tagged with which numbering
-it belongs to. Zeroing the count alone would not close the view: the old
-anchor's line number comes back around as new lines arrive, and the view
-would reopen on lines that have nothing to do with it.
-
-The distance the anchor implies is clamped on every read rather than stored,
-because eviction drops the oldest lines and a resize can shorten the history
-an anchor lives in. An anchor whose line has been evicted rides the top of
-what history still holds, rather than being thrown back to the live bottom:
-that is where the reader was heading, and on a full buffer the alternative
-moves the view on every further line of output. Riding the top is therefore
-the end of what scrolling back can reach, and a retired numbering is the
-only thing that returns a view to the live bottom without a key. A silent
-key does not re-anchor at where a clamp put the view — the anchor still
-names the line asked for. End's two meanings follow that position rather
-than whether the viewport was ever opened, since what it asks is whether
-anything but the live screen is showing.
-
-The renderer's half of that viewport is landed: a snapshot carries how many
-lines back it is scrolled, rows above the split come from the primary
-history and the rest from the live screen, and a request deeper than the
-stored history clamps rather than blanks. History is primary-screen only,
-so the viewport reads it even while the alternate screen is active -- which
-is what lets it show the shell a full-screen program is covering. A line is
-stored at the width it scrolled off with, so a widening resize leaves the
-tail of an old line blank rather than fabricating cells for it.
-
-The keys that select it are landed too, so the viewport is complete as a
-pure pair: the adapter routes a press to the child, to the viewport, or
-nowhere, and the viewport turns those into the offset a snapshot takes.
-The client calls them: td-term routes every press through the adapter and
-holds the viewport across frames, so the corpus is no longer the only thing
-driving either.
-
-Pointer selection is an inclusive row-major range over the visible snapshot.
-A left-button press anchors it, motion extends it, and release retains it;
-`wl_pointer.frame` applies the accumulated transaction so one physical report
-causes at most one repaint. A click without motion selects its one cell.
-Reverse drags normalize only when text is copied.
-The renderer inverts every selected cell. Resizing, new terminal output,
-viewport movement, or an ordinary non-modifier key press clears the range and
-schedules a repaint; modifier-only presses preserve it so the physical Ctrl
-and Shift needed for the copy chord cannot erase it first. The copy chord does
-not clear the bytes it is copying. Each selected row loses trailing ASCII
-spaces, rows are joined with one newline, and UTF-8 encoding is bounded before
-publication at 64 KiB. A range that trims to no bytes is a no-op: it neither
-replaces the seat clipboard nor emits a zero-byte success marker.
-
-A left-button press with Control (Caps and Num Lock ignored, no other
-modifier) reads the link under it as soon as it is dispatched, from the
-viewport's row by td-ui's rule (`links`, mounted from
-`td-ui/src/links.rs`), and only while the screen shows the model: a
-model changed since the last committed frame, or a committed frame whose
-callback has not yet said it reached the screen, is not what the person
-saw, and the press is then a plain one. A screen under continuous output
-never shows its model unchanged, so there a Control-press is always
-plain. Output or a wheel later in the same frame cannot change the link
-read. A press past the drawn grid reads none, though a selection's clamp
-would reach the edge cell. The frame that closes the press decides: with
-a link it opens through td-ui's opener (`open`, mounted likewise) and
-the press selects nothing, its drag and release ignored, so the
-selection a copy would take stays unless output clears it, as output
-clears any selection; without one it is a plain press. The link is read
-from the cells, not from what they look like, so text whose foreground
-is the colour of its background is part of it: what opens is what the
-row holds, which may be more than the person can read. A link that
-cannot be opened is a `td-term: open link:` line on stderr and the
-visual bell. A cell holds one scalar, so the row's text is its cells in
-order; a link the terminal wrapped onto the next row is found only up to
-the row's end.
-
-The browser is td-term's one child outside the session child's rules
-(§12): it is `BROWSER`, else `xdg-open`, found on td-term's own `PATH`,
-run directly with the link as one argument and never through a shell,
-in td-term's working directory, with td-term's own environment less
-`WAYLAND_SOCKET` and with `WAYLAND_DISPLAY` set to the socket td-term
-dials, made absolute (a relative `WAYLAND_DISPLAY` would be resolved
-under `XDG_RUNTIME_DIR`), so it opens on the display the terminal is
-on. Its streams are `/dev/null`, every descriptor td-term holds is
-close-on-exec, and a thread reaps it; each followed link holds one such
-thread until its browser exits, at the rate a person clicks. td-term's
-environment carries no `BROWSER` and the image has no `xdg-open`, so
-until APPLICATIONS.md §W.6's `OpenURI` opener lands a followed link
-rings the bell there; in a session whose environment names a browser it
-opens.
-
-`Control+Shift+C` with no Alt, Logo, or unknown modifier is a td-term command,
-not PTY input and not a repeat candidate. It creates a `wl_data_source` at
-version 3, offers `text/plain;charset=utf-8`, `text/plain`, and `UTF8_STRING`,
-and calls `set_selection` with the key event's compositor serial. Caps Lock and
-Num Lock do not disable the chord. td-term retains at most eight live sources,
-eight outstanding sync callbacks, and eight incoming offers. A cancelled
-source retains its callback until `done`, so the callback ceiling also gates
-new copies. Incoming offers retain only a preferred text MIME, with at most
-64 MIME events of at most 256 bytes per offer. A replaced selection destroys
-the previous offer. Drag and drop remains deferred. td's compositor never
-starts a drag and cancels every attempted version-3 drag source, so DnD-only
-device and offer events are fail-closed arms outside this client profile rather
-than silently implemented partial drag and drop.
-
-`Control+Shift+V` with the same modifier policy requests the selected text
-offer only while td-term owns keyboard focus. It is neither PTY key input nor
-a repeat candidate. One incoming transfer may be active, queued, or awaiting
-main-loop completion. A dedicated reader receives through a private Unix
-socket pair passed using the existing SCM_RIGHTS request path. It reads at
-most 64 KiB against a five-second absolute deadline; a focus leave, keyboard
-removal, or replacement selection cancels the transfer. Cancellation is
-checked between reads with at most a 50 ms read timeout. The main loop checks
-the request identity and cancellation again before admitting the completed
-payload. An old completion cannot satisfy a newer request. These checks use
-focus and selection events observed by the client; a transfer accepted by the
-compositor is not retroactively revoked before that client learns of a change.
-
-Only complete valid UTF-8 is admitted. Control characters other than tab, CR,
-and LF are refused, including ESC that could terminate a bracketed paste.
-No newline or Enter is appended. Mode 2004 wraps nonempty text in the standard
-`CSI 200~` and `CSI 201~` delimiters; otherwise bytes pass unchanged. The whole
-encoded paste must fit the existing 64 KiB PTY input queue or none is admitted
-and the terminal rings its visual bell. Empty text is a no-op. Successful
-nonempty paste clears the visual selection and returns to the live viewport.
-Transfer, encoding, and queue failures leave the terminal usable. No terminal
-escape sequence reads or writes the host clipboard.
-
-The payload enters a shared source registry before any request can make the
-source callable. A data-source `send` event consumes exactly one SCM_RIGHTS
-endpoint, looks up an immutable payload under the registry lock, then releases
-the lock before enqueueing any I/O. One clipboard writer thread owns a bounded
-four-entry queue and writes the supplied `File` in nonblocking mode against a
-five-second deadline, restoring its original status afterwards. An unknown
-MIME type, full queue, or expired destination drops the endpoint and therefore
-answers EOF without blocking the Wayland reader or terminal loop. An excess
-descriptor or stopped writer closes td-term after dropping the endpoint.
-The closed td compositor never sends to a stale source; an event on an
-unregistered object remains a fail-closed protocol error.
-Source cancellation removes both registries and destroys the object. A display
-sync callback prints `TD-TERM-CLIPBOARD-READY bytes=N` only if the new source is
-still current after the compositor has processed `set_selection`. This marker
-proves source admission, not that another client pasted the bytes; the system
-image's fixed QEMU flow separately focuses td-term, waits for its post-enter
-modifier-state acknowledgement, clears the screen, physically types
-`Welcome`, and waits for a marker naming the live viewport's visible target,
-settled grid and cell coordinates. It selects those cells, waits for their
-highlighted frame to become visible, then injects the copy chord and waits for
-the exact seven-byte source marker. Firefox browser chrome must first report
-that its URL bar is focused after the physical focus and `Control+L` sequence.
-One continuous bounded chrome session stays live after that acknowledgement,
-admits the physical paste chord, and permits one through four events to
-tolerate bounded TCG key-repeat timing. If the first command boundary exposes
-only empty paste data while the selected URL remains unchanged, one exact
-guest marker admits one retry command. Across the at most eight events, every
-nonempty value must be the exact bytes. Because Firefox can expose empty event
-data while its default action asynchronously consumes the Wayland transfer,
-the URL bar must contain one or more exact payload copies, no more than all
-paste events and no fewer than events exposing exact data. A harmless Shift tap follows each paste command,
-and Firefox must observe that ordered keyup before classifying the command;
-there is no timing sleep or success before an unobserved chord. The writer separately
-prints `TD-TERM-CLIPBOARD-SENT bytes=7` only after it has written the exact
-`Welcome` proof payload to the requested endpoint;
-its endpoint close is the transfer delimiter. The image proof requires both
-records, so neither source admission alone nor a synthetic chrome assignment
-can pass it. These grid scans, proof markers, and disabled terminal key repeat
-exist only when the exact `td.firefox-input=1` kernel token is present; normal
-boots retain ordinary repeat behavior and execute none of the proof scan.
-
-The same token-gated QMP session continues from the clipboard acknowledgement
-to the authenticated page's fixed download link. Firefox content validates and
-focuses that link before td-jail emits the arm marker; only then does the host
-send one Enter chord through the ordinary keyboard path. The page records one
-through four trusted key events under TCG, suppresses every default action after
-the first, and requires exactly one trusted link activation. A later physical
-Shift keyup terminates that command, so success cannot precede a delayed repeat.
-This compositor input evidence is necessary but not sufficient: the root-owned
-image unit publishes completion only after a separate unprivileged td-jail
-probe, outside
-the application namespace, validates the exact regular file and bytes at the
-source of Firefox's writable Downloads grant. Ordinary boots retain neither
-the fixture link nor any of these listeners or markers.
-
-The Firefox package's reviewed `GTK_USE_PORTAL=1` environment forces the same
-portal backend in ordinary and autotest launches. The session first exposes a
-full-viewport focus control. One physical pointer click must focus the document
-and reach its one-shot refocus listeners. A fresh bounded, read-only Marionette
-session validates that persistent record and current Firefox focus, then
-closes before the host sends physical `Control+O`. Firefox's native Open File
-command issues the broker-authenticated FileChooser request without a DOM
-picker call or synthetic file assignment. The
-portal validates Firefox's bounded native filter list and admits its selected
-`All Files` glob and matching current filter, renders that bounded label, and
-returns the selected filter. Non-current filters are validated compatibility
-metadata rather than selectable UI; selecting richer filter semantics remains
-a typed refusal. The
-portal reports its first frame only after the private manager acknowledgement,
-keyboard enter, shm release and frame callback.
-At that boundary the host captures the virtio display through QMP, requires the
-centred portal client geometry and chooser background, panel and selected-row
-palette, and reconstructs the client XRGB bytes from that rectangle to match
-the portal's announced checksum. Only that pixel proof admits physical Enter.
-Firefox content must then load the exact granted `file:` URL as `text/plain`
-with the download fixture's exact bytes. The root-owned input unit writes
-its atomic completion record only after the portal service's next captured
-exact success line in its volatile bounded log and a fresh result-only
-Marionette session. The focus-evidence poll closes before the native command
-and supplies no input or DOM mutation. A hidden dialog, synthetic DOM
-assignment, stale
-portal line or response that never reached Firefox cannot pass. This machinery
-remains gated by the exact input-test boot token.
+Moved to [td-term/DESIGN.md](../td-term/DESIGN.md) §3.
 
 ## 12. PTY and process lifecycle
 
-After mounting devtmpfs and before graphical services, the system creates
-`/dev/pts`, mounts devpts there with
-`newinstance,ptmxmode=0666,mode=0620,gid=5`, removes devtmpfs's existing
-`/dev/ptmx` node, and creates the relative `ptmx -> pts/ptmx` symlink. The
-image pins `CONFIG_UNIX98_PTYS=y` and its existing `tty` group owns gid 5.
-td-term opens `/dev/ptmx` with safe `std` file operations, unlocks it, and
-obtains the slave as an owned descriptor with `TIOCGPTPEER` and
-`O_RDWR | O_NOCTTY | O_CLOEXEC`. No `/dev/pts/N` path is reopened.
-The image proof pins the startup mount command and re-checks `mode`, `gid`
-and `ptmxmode` out of `/proc/mounts` on the booted machine, in the kernel's
-own `%03o` spelling rather than the mount's -- the `mode=0620` asked for
-comes back as `mode=620`, so a check written to match what was passed would
-red every correct boot, and rootcheck is a gate; it does not require
-`/proc/mounts` to echo the modern kernel's accepted no-op `newinstance`
-token. The effective SLAVE gid and mode are proven by opening one, which
-lands with the client that opens the first pty.
-
-That sequence is one `td-init` applet rather than four sysinit lines. Three
-of the four would otherwise be uutils `mkdir`, `rm` and `ln` reached at
-absolute paths, with nothing tying them to the boot that needs them. It
-composes the mount as the argv the `mount` applet parses rather than calling
-`mount(2)` itself, so flag composition stays in the one module td-init's
-confinement tests allow it in -- and this mount needs no `MS_*` bit at all,
-since every option it passes is filesystem data. It adds no syscall, so it
-is not an amendment to `UNSAFE.md`.
-
-It reads its own mount back out of `/proc/mounts` before relinking
-`/dev/ptmx`, which is why the sysinit line comes after `/proc` rather than
-beside the devtmpfs mount: an option devpts does not know makes the mount
-fail outright, so what a readback catches is a known option that took a
-DIFFERENT value than the one asked for, and nothing distinguishes that until
-a pty is opened. Each option is matched as a whole comma-separated token, so
-`mode=620` cannot be satisfied by `ptmxmode=620`, and the expected spellings
-are derived from the ones passed rather than restated beside them. The
-instance `ptmx` is checked too -- character device, mode 0666 -- since it is
-mode 0000 on a mount that dropped `ptmxmode`. Relinking requires a value only
-that verification returns, so the order is the compiler's to enforce, and it
-is a rename rather than an unlink and a create, so a failure cannot leave the
-machine with no `/dev/ptmx` at all. A second run is refused rather than
-served: devpts stacks, and an instance mounted over a live one hides every
-pty the first is serving while every check still reads healthy.
-
-The symlink is the setup the kernel's own devpts documentation describes.
-It is not that a `/dev/ptmx` device node would allocate from the initial
-instance -- modern kernels resolve a `pts` directory beside the node and use
-that mount -- but that the link makes this instance the answer explicitly
-rather than resting on a sibling-directory lookup nothing checks. `mode=0620`
-is likewise the tty convention rather than a relaxation: owner read/write and
-tty group WRITE, which is how anything reaches a terminal it does not own,
-where the devpts default would be 0600 owned by group root.
-
-Stable Rust does not expose the required PTY operations. The existing
-x86-64 `SYS_IOCTL=16` entry point permits twenty-one request values. Four
-are this section's; the others are the `EVIOCGABS` pair, fixed evdev clock
-selection, and fourteen DRM requests, which no module here may name:
-
-- `TIOCSPTLCK=0x40045431`, to unlock the slave;
-- `TIOCGPTPEER=0x5441`, to obtain the slave as a new owned descriptor;
-- `TIOCSWINSZ=0x5414`, to publish rows and columns; and
-- `TIOCGWINSZ=0x5413`, to verify every published size before it becomes
-  visible to the child.
-
-The confinement tests pin the `SYS_` constant count, raw-body call count,
-request values, and callers. This setter applies only to td-term's newly
-created PTY; it does not weaken the separate repository prohibition on
-resizing an operator's terminal. A request outside the roster is refused by
-the one `ioctl` entry point before the syscall is issued, so a mistyped or
-newly invented number cannot reach the kernel without amending both the
-roster and the test that pins it.
-
-The wrappers use a four-byte native-endian `int` for `TIOCSPTLCK` and an
-eight-byte `[u16; 4]` of native-endian rows, columns, and the two pixel fields
-for both winsize requests. The array rather than a `#[repr(C)]` struct because
-the language guarantees that layout, which turns the field ORDER into an
-ordinary tested function: a swapped rows/columns pair is a well-formed resize
-to a different size, and an attribute nobody can observe would not catch it.
-The kernel never receives a pointer to a temporary or shorter object, and the
-existing assembly body remains memory-aware: it does not acquire
-`options(nomem)`. `TIOCGPTPEER` receives the open flags as an immediate value
-rather than a pointer, and the flags are pinned in `sys.rs` rather than chosen
-by a caller, so `O_NOCTTY` cannot be forgotten by the one call site that must
-not acquire the terminal.
-
-Its nonnegative return is reopened exactly once through `/proc/self/fd/N`,
-and the raw number is closed. The crate's `File::from_raw_fd` allowance is
-confined to received SCM_RIGHTS descriptors. Extending that conversion to the
-PTY would widen its caller roster without need: the slave inode belongs to
-this terminal identity and can be reopened. The reopen is by descriptor
-number, not by terminal name: no `/dev/pts/N` path is resolved, so it retains
-the property the peer request was chosen for.
-
-No termios construction, signal syscall, process creation, or descriptor
-duplication enters that unsafe surface. The slave's kernel defaults provide
-canonical input and echo. Safe `Command` and `Stdio` operations wire three
-slave clones to the child.
-
-All SCM_RIGHTS operations for td-term remain inside the client transport
-boundary, including keymap receipt and wl_shm submission. That boundary is
-now `conn.rs` as well as `client.rs`: the connection — its id allocation,
-message framing, and descriptor queue — was extracted so the terminal is a
-second user of one transport rather than a second copy of it, and the
-descriptor queue could not stay behind. Section 4 records the same boundary.
-`term_client.rs` is the terminal's own client and is on the transport-user
-roster; the terminal's parser, model, renderer, keyboard, and PTY policy
-modules are not, may not name the transport, and do not call the
-descriptor-transport wrappers.
-
-When the compositor declines to choose a size, the terminal falls back to a
-grid rather than to a rectangle: 80 columns by 24 rows, multiplied out by the
-pinned font's cell, since that is what a terminfo entry and anything drawing a
-box assume when they cannot ask. Each axis declines independently. Its fixed
-object ids run densely through the data-device manager and the seat's data
-device. The first dynamic id follows them. The `wl_pointer` remains a dynamic
-object because a seat may not offer the capability; reserving a fixed id would
-leave a gap on a keyboard-only seat, and a compliant compositor can disconnect
-a client whose object map skips an id it never created. Ids are per-client, so
-an equal numeric id in the separate demo client is unrelated.
-
-Safe `Command` cannot call `setsid(2)`, and `pre_exec` would introduce a second
-unsafe surface. The declared td-init input therefore extends `cttyhack` with
-an explicit `--stdin` mode. That mode always creates a new session and claims
-descriptor zero without stealing a terminal, even when the wrapper inherited
-an outer controlling terminal. Unlike rescue mode, `--stdin` exits nonzero if
-`setsid(2)` or `TIOCSCTTY` fails. td-term invokes
-`/bin/cttyhack --stdin /bin/sh` by default. A `--command PROGRAM [ARG...]` on
-its own command line ends td-term's flags and is exec'd exactly as given,
-WITHOUT the wrapper: the slave is its stdio, and it starts in td-term's
-session with no controlling terminal. The wrapper exists for a shell, which
-expects a controlling terminal it does not create; a program that wants that
-behaviour names `/bin/cttyhack --stdin` itself, and a td-jail terminal
-application must not, because the jail's terminal grant (`devices=tty`, its
-own increment in APPLICATIONS.md §C) acquires the terminal inside stage 1's
-detached session, and the kernel refuses `TIOCSCTTY` for a terminal the
-wrapper has already made the launcher's. The consequence for a child that
-never acquires the slave is stated here because a unit author would
-otherwise discover it: the slave then belongs to no session and has no
-foreground process group, so the kernel generates NO terminal signals for
-it — no `SIGWINCH` when td-term resizes it, no `SIGINT` for `^C`, no
-`SIGHUP` when the terminal closes. Such a child must read its window size
-itself and notices the hangup only as `EIO` on the slave. A jailed terminal
-application is unaffected, which is the case `--command` exists for; an
-unjailed program that wants those signals names the wrapper. An explicit
-program is an absolute path, refused at argument parsing before td-term
-dials the compositor; the constant wrapper path is checked when the child
-command is assembled. td-term has no PATH to search for it (the browser
-a followed link starts is the exception, above). The td-term recipe and
-system integration tests assert that the staged td-init advertises and
-exercises this exact flag, tying the absolute path to the declared runtime
-input. Ordinary rescue-console behavior remains unchanged.
-
-The child starts in the verified account home by default: setting `HOME` does
-not move a process, so without an explicit working directory the shell would
-start wherever td-svc left the graphical service and disagree with its own
-environment. `--working-directory PATH` accepts one absolute path before
-`--command`; failure to enter it fails the spawn rather than silently landing
-in `/`. The paired authority never accepts that path from its caller: its typed
-task-terminal request derives `/home/NAME/src/td-vm/work` from the validated
-primary account.
-Immediately after a successful spawn, td-term drops the original
-slave and all three parent-side `Stdio` clones, retaining only the master.
-Closing that master produces the kernel's normal PTY hangup; child exit unmaps
-the surface and terminates the client.
-
-A `--command` child that ends badly, by a non-zero status or a signal, leaves
-its last screen in the log before td-term reports the exit: the rows of the
-active screen at exit — whichever screen that is, and however far back the
-reader had scrolled, because the program's last words are there and not in the
-history — with trailing blanks and the blank rows below the last written one
-dropped, one `td-term: last screen (<program>): ` line each, the program being
-the command's final path component, in one buffer written once and beginning on
-a fresh line, since a writer sharing the console may have left one unfinished.
-The prefix means no row can begin a console line, which is what the
-line-anchored boot markers require, short of a write the kernel cuts and td-term
-resumes, the residue every console writer shares; it does not defend the markers
-the boot oracle latches as substrings, so the oracle blanks those records, from
-the prefix wherever it stands in a line to the line's end, a co-writer's residue
-on that line going with it, which can lose a latch but not forge one, before its
-latches read the console, because a marker on a jailed application's screen is
-not evidence. A character the control report would not print in a title is a
-space here for the same reason. A program that leaves the alternate screen
-before dying shows the primary screen, which is what the window showed. The
-window closes with the session, and what td-jail or the program wrote there was
-otherwise on no log; the first boot of the terminal applications ended in two
-windows that had shown a refusal nobody could read. The default shell reports
-nothing, because a shell exits with its last command's status and a logout after
-a failed command is not news; a clean exit reports nothing; and the output is
-bounded by the grid. The screen may hold what the user typed, and the console it
-goes to is trusted by image configuration today (td-login/THREAT-MODEL.md);
-under principle 7's target trust model a screen copied to a shared console is a
-disclosure, so this is scoped to the current model rather than a permanent
-grant.
-
-The PTY reader thread owns a master descriptor and parks in `read` whenever the
-child is idle, and safe `std` cannot interrupt that: there is no poll, no read
-timeout, and closing a descriptor another thread is reading is not something
-this crate may express. Its only retirement is the child's exit closing the last
-slave. That is sound because td-term is one process per terminal: closing the
-terminal IS exiting, process exit closes the descriptor, and the kernel then
-sends `SIGHUP` to the session holding the slave as its controlling terminal —
-the default shell's, or the one a td-jail terminal application acquires. A
-bare `--command` child holds no such session and sees the hangup only as
-`EIO` on the slave, so its retirement is its own exit, which is the same path
-one step later. The consequence is a contract rather than a mechanism — a
-teardown path must not join that thread — and interrupting the reader for any
-other reason requires a separately reviewed wakeup surface.
-
-The writer differs, but less than it first appears: it parks in a
-condition-variable wait rather than in a syscall, so closing the keyboard queue
-retires it and its handle IS joinable — for a writer that is waiting for bytes.
-Closing sets the predicate the writer checks BETWEEN writes; it does not
-interrupt one, and nothing safe cancels a blocking write. A child that never
-reads does not by itself park the writer: in the kernel's default canonical mode
-the line discipline accepts and discards rather than blocking, and the tests
-cover that case against a live child that reads nothing. A child in RAW mode
-that stops reading is the case that parks it, and that is every shell and
-editor. The child's exit does not free such a writer either — the last slave
-closing hangs up the reader, which is the reader's whole retirement, while the
-writer stays parked in `write` on the same terminal at the same instant. So the
-teardown rule is the reader's rule: td-term ends a terminal by exiting the
-process, not by joining either thread, and joining the writer is for a writer
-known to be idle. Because the writer can therefore die unobserved, its failure
-is recorded where the main loop meets it: a `push` after the writer is gone is
-an error rather than the bell §10 rings for a full queue, since a terminal
-beeping at every keystroke would be reporting the wrong thing forever. One
-bounded queue serves both ends — the
-main loop admits a sequence whole or drops it whole and rings the bell, and the
-writer drains it —
-because a second buffer downstream would be a second place for half a sequence
-to sit. Bytes are copied out under the lock and written without it, so a child
-that has stopped reading parks the writer in `write` without ever delaying an
-enqueue. Only the writer consumes, so a partial write's remainder stays at the
-front in order however much arrived meanwhile.
-
-The client first completes the required empty XDG commit and initial
-configure/ack. It maps a bounded blank placeholder and waits up to the same
-20-second absolute startup deadline as the existing demo for the compositor's
-nonzero tile configure. Expiry closes the client before child creation; tests
-inject the clock and never sleep. The client derives the exact cell grid, sets
-and verifies the PTY winsize, and only then starts the child. A tile smaller
-than one font cell uses a logical 1-by-1 grid whose pixels remain clipped to
-the actual surface. Later nonzero configures preserve horizontal overlap
-without reflow. On primary-screen vertical shrink, blank tail rows disappear
-first; otherwise top rows move to primary history so the lowest content and
-cursor survive. The alternate screen discards removed rows, and resizing the
-hidden grid never adds history. Growth appends blank rows to both grids. The
-client updates and verifies the PTY size before rendering the replacement
-buffer.
-
-A Wayland reader, blocking PTY reader and writer, bounded clipboard writer,
-bounded paste reader, and child waiter surround one main loop. A full
-PTY-output channel blocks its reader thread and lets the kernel PTY buffer
-backpressure the child. The
-clipboard writer instead has the four-entry refusal and five-second endpoint
-deadline above, so a receiver that stops reading cannot backpressure input,
-rendering, the protocol reader, or all later transfers indefinitely. The main
-loop alone mutates the terminal model and writes ordinary Wayland requests;
-the reader transfers only an already-requested clipboard payload to its exact
-endpoint. Paste adds at most one 64 KiB payload beyond the PTY-output event
-budget and one bounded encoded copy during main-loop admission. Its worker
-closes the receive endpoint before publishing completion; cancellation and
-process exit release pending transfer authority. No correctness condition
-relies on poll, elapsed sleeps, or scheduler order; the startup deadline
-bounds failure detection rather than
-ordering state transitions.
-
-td-term exposes a mode-0600 readiness socket and prints `TD-TERM-READY` with
-its rows and columns only after the exact tile-sized buffer receives both
-`wl_buffer.release` and its frame callback AND its seat still offers a
-keyboard AND its keymap is verified. The keyboard half is a precondition
-rather than a parallel errand: a terminal that started its shell before
-knowing what a key MEANS would take its first keystrokes against no map at
-all, so the same wait that makes readiness a frame the compositor chose
-makes it a frame it can be typed at. The seat is asked for its LATEST
-capability rather than the one that prompted the keymap request, since a
-seat may withdraw what it announced; td's own server announces keyboard and
-pointer once at bind and withdraws neither, so this bounds another
-compositor rather than describing a state this one reaches. It is a startup
-gate only — a capability withdrawn after readiness is not noticed, and
-noticing it needs somewhere to put a terminal that has lost its keyboard.
-Reaching that buffer takes TWO frames, and that is the protocol rather than
-a retry: the compositor cannot tile a surface it has not mapped, so its
-first configure is zero in both axes, presenting at the client's own
-fallback is what maps the surface, and the tile arrives in the configure
-that follows. Readiness is therefore a frame drawn at a size the compositor
-CHOSE, and choosing is per axis — zero is a declined axis, and a configure
-choosing one axis has chosen. An `ack_configure` takes effect on the surface
-commit that follows it, so a configure needing no new frame is applied with
-a bare `wl_surface.commit` rather than left acknowledged and unapplied; a
-chosen tile equal to the client's fallback is exactly that case. One encoder
-produces both the diagnostic and the socket's answer, since the integration
-test compares them and two spellings could drift while each stayed
-plausible. A readiness line is parsed fail-closed and order-pinned, and its
-grid is held to the same definition the winsize ioctl is: a line describing
-a grid no terminal could have been set to is not readiness. The terminal
-refuses to publish a grid its own probe would reject. td-svc's `ready=`
-command uses the existing credential-switch pattern to invoke `/bin/td-term
-probe /run/user/1000/td-term-ready` as the graphical user. The probe
-requires a ready state and nonzero internally consistent rows and columns;
-its output and the matching `TD-TERM-READY` QEMU diagnostic are compared in
-integration tests. The boot profile has atomically replaced the visible
-`td-ui-demo` service with a `[terminal]` one. The later Firefox cutover removed
-the demo's final-image `/bin` symlink; the launcher now activates the mapped
-service-owned Firefox surface rather than spawning either client. The
-compositor and serial recovery greeter remain independently restartable.
+Moved to [td-term/DESIGN.md](../td-term/DESIGN.md) §4.
 
 ## 13. Native terminal corpus
 
-td-term behavior is specified in one td-native text corpus. Imported and
-td-authored cases use the same format and live together by subject:
-
-```
-td-compositor/spec/term/
-  README
-  parser.term
-  cursor.term
-  editing.term
-  wrapping.term
-  modes.term
-  color.term
-  replies.term
-  input.term
-  resize.term
-  unicode.term
-  expectations.txt
-  LICENSE.libvterm
-  visual/*.ppm
-```
-
-The visual oracle is two-tiered, and only the lower tier is built. Goldens
-that pin the renderer itself live beside it in `td-compositor/spec/render/`,
-driven by native Rust fixtures that name a snapshot, a surface size, focus,
-and a cursor directly; they are what the renderer's own landing proves.
-`spec/term/visual/` above is the upper tier -- a corpus case rendering its
-own final grid through an `expect ppm` statement -- and neither those images
-nor that statement exist yet. A corpus case cannot render until the parser
-below it also carries a surface size and a focus state, which is a corpus
-format change rather than a renderer one, so it lands with the Wayland
-client that gives a frame those properties in the first place.
-
-The model starts with a small td-authored seed corpus. The bulk migration then
-converts a source archive and SHA-256 pin of the MIT-licensed libvterm 0.3.3
-suite. A sibling license file retains the complete upstream copyright and
-permission notice. The archive and original harness do not enter td's build or
-repository. A dependency-free Rust importer accepts an explicitly supplied
-verifies its source-file manifest, rejects every unknown source command or
-assertion, and emits deterministic native cases. Its migration report counts
-source files, cases, assertions, converted assertions, and every intentional
-exclusion. The landing records those counts and reasons.
-
-Each derived case retains its source release, path, and original case identity.
-The conversion targets externally observable cells, cursor, modes, history,
-properties, and replies rather than libvterm callback names. After the
-migration the native cases are normative and maintained with td-authored
-cases; provenance remains even when a derived case is clarified. There is no
-separate upstream test directory or legacy-format reader in the blocking
-corpus or target artifact; the developer-only importer is the reproducer.
-Pinned cases are classified against the first-profile feature matrix:
-upstream-positive tests for deferred protocols are exclusions, not product
-xfails, excluded sections roll back to their last reset, and retained cases
-never replay deferred control sequences. Primary DA is normalized from
-libvterm's identity to td's. The first profile accepts semicolon-delimited SGR
-colors; colon-separated color subparameters remain an explicit exclusion.
-
-The std-only importer remains a non-shipped developer provenance tool, not a
-runtime or build reader. Its unit tests and committed complete source manifest
-exercise the upstream parser without the archive; when an explicitly supplied
-tree is available, its exact check verifies all source hashes and reproduces
-the committed corpus and report. No upstream-format case runs in the gate.
-
-The native language has stable case identifiers and a deliberately small
-vocabulary:
-
-- `case`, `source`, `tags`, `size`, and `end`;
-- `write`, `resize`, and `key` operations; and
-- `expect` statements for rows, imported text and glyph observations, cells,
-  cursor, modes, cumulative terminal replies, cumulative keyboard input,
-  history, the scrollback viewport, and an optional rendered PPM -- the last
-  of these deferred, as §13's tree records. Cursor expectations accept only
-  the optional `pending-wrap` flag.
-
-Every case has a source. td-authored cases use `source td`; derived cases name
-the pinned release, path, and original case. `size` is rows followed by
-columns, byte strings use Rust-like ASCII escapes, and cursor coordinates are
-zero-based. A representative case is:
-
-```
-case wrapping/right-margin
-source "libvterm-0.3.3:t/20state_wrapping.test:right margin"
-tags core wrapping
-size 2 5
-write b"ABCDE"
-expect cursor 0 4 pending-wrap
-write b"F"
-expect row 0 "ABCDE"
-expect row 1 "F    "
-expect cursor 1 1
-end
-```
-
-Byte literals use one specified escape syntax and reject ambiguous or invalid
-escapes. Row expectations are shorthand for default single-width cells; cell
-expectations state scalars, colors, and attributes explicitly. Imported
-character-only observations use `text` and `glyph`, which deliberately ignore
-rendition absent from the source oracle. Replies are ordered byte strings. The
-parser rejects unknown fields, duplicate stable identifiers, empty cases,
-assertions before initialization, and expectations that escape the declared
-grid. Reply expectations name the complete byte stream emitted since case
-initialization; the PTY adapter drains that bounded stream after each
-successful master write. Input expectations separately name the keyboard
-adapter's complete generated byte stream, making `key` operations observable
-before the PTY writer merges the two bounded sources.
-
-Feature tags distinguish deliberate profile exclusions such as mouse or
-double-width cells from missing behavior inside the first profile. A generated
-`expectations.txt` records in-profile known failures by case and expectation,
-so another observation cannot regress behind an existing failure. Every
-in-profile case still runs. An unlisted failure, unexpected pass, stale entry,
-unmatched case, unknown tag, or malformed corpus reds the gate.
-
-Every byte-stream case runs as one write, one byte per write, at every
-two-piece split, and under deterministic pseudorandom chunkings. All forms
-must produce identical cells, cursor, modes, history, and replies.
-Deterministic arbitrary-byte cases additionally enforce total parsing,
-resource ceilings, valid cursor/grid relationships, and absence of panics.
-
-The committed native expectations are the blocking semantic oracle. No host
-terminal or external emulator runs in the gate. `$TERM` is only a capability
-label. Foot remains a product reference and an optional black-box comparison,
-not the normative state model.
+Moved to [td-term/DESIGN.md](../td-term/DESIGN.md) §5.
 
 ## 14. Visual and end-to-end proof
 
-The pure renderer's blocking visual oracle is exact P6 PPM output. Selected
-cases render with the pinned font, palette, surface size, focus, and cursor.
-Those five are parameters rather than defaults, so no case can be green
-against a face or a palette it did not name. A mismatch reports the first
-differing coordinate and writes an actual image plus a high-contrast PPM
-diff beneath the build's temporary output; no PNG encoder or image library
-is required. The cases are Rust fixtures today and native corpus cases once
-the corpus format carries a surface, per §13.
+The terminal's proof moved to [td-term/DESIGN.md](../td-term/DESIGN.md) §6.
+The control channel of §15 is proved as follows:
 
-Exactness is the contract in both directions: a golden whose bytes differ
-from what the encoder emits fails even when it decodes to identical pixels,
-because the only thing that could produce one is a hand-edit, and a hand-
-edited golden is no longer an oracle. Goldens are generated by the renderer,
-so what makes them evidence is not their provenance but the structural
-assertions beside them -- that each rendition differs from an otherwise
-identical normal cell, that bold only adds pixels and each added one is a
-step right of a set one, that italic's every top-half pixel is its normal
-neighbour shifted one column, that underline and strike are exactly one full
-row each. Those are what a wrong renderer fails; the goldens are what a
-CHANGED one fails.
-
-A smaller integration gallery runs td-term against a real td-compositor with
-a file-backed framebuffer. It compares the compositor's exact final XRGB8888
-frame, including tile geometry, borders, clipping, buffer replacement, and
-frame-callback lifecycle. This is the pixel-parity gate for the shipped stack.
-
-Foot comparison is a separate, non-blocking developer operation. It uses a
-pinned foot binary, font, configuration, fixture, geometry, and isolated
-headless Wayland environment to produce side-by-side captures. Different font
-and rasterization stacks make exact cross-terminal pixels a false contract;
-the gallery adjudicates taste and exposes behavioral disagreements for a
-native semantic case to settle. The required check remains green when these
-optional host-side comparison tools are absent.
-
-The complete terminal landing must prove:
-
-- the native corpus is structurally valid, attributed, consistent with the
-  committed migration counts and digests, and guarded by a generated
-  no-regression expectations overlay;
-- parser and model results are invariant under every required input chunking
-  and remain bounded for malformed streams;
-- exact model-renderer PPM and full-compositor framebuffer goldens pass;
-- the shipped artifact is static, the `td-term` entry point is a relative
-  symlink, and target selftests run without host paths or libraries;
-- the installed `td-term` terminfo entry decodes to exactly the capabilities
-  exercised by the native corpus;
-- a PTY fixture sees the peer descriptor's `/dev/pts/N` as its controlling
-  terminal and reads back the grid's exact winsize;
-- focused keyboard input reaches the PTY, echoed output changes the framebuffer,
-  and repeat cancellation is deterministic;
-- two sequential clients validate the shared keymap descriptor without
-  advancing its open-file-description offset;
-- a compositor configure replaces the wl_shm buffer, preserves the specified
-  grid overlap, and updates the PTY size before the child observes it;
-- child exit, PTY hangup, compositor disconnect, queue saturation, and malformed
-  Wayland input terminate without a stuck worker or leaked surface;
-- the image creates the devpts mountpoint after devtmpfs, replaces its
-  `/dev/ptmx` node with the specified symlink, mounts devpts with the specified
-  options, contains the selected font and required multicall entry points,
-  starts td-term as uid 1000, passes the readiness-socket probe, and observes
-  the matching `TD-TERM-READY` diagnostic; and
-- graphical failure leaves the serial recovery path and existing compositor
-  readiness proof intact;
 - the control channel is proved through a real socket and a real runtime, not
   a parser and a mock: a request crosses the kernel, moves the session, and is
   read back through the same socket that ordered it, since what a caller can
@@ -5881,15 +4695,13 @@ The complete terminal landing must prove:
   attacker-chosen field is stripped of control characters, and the proof is
   that a title containing a newline and a well-formed `window` record leaves
   exactly one `window` line;
-- the fourth name dispatches in the BUILT artifact, proved on the target by an
-  argv no other personality accepts — unlike the terminal's selftest, which
-  proves the name exists and executes but would exit zero if it fell through
-  to the compositor;
+- the third name dispatches in the BUILT artifact, proved on the target by an
+  argv no other personality accepts, since a name that merely executes would
+  exit zero if it fell through to the compositor;
 - the compositor STARTS the listener. Nothing else can see that: `td-ctl help`
   needs no session, the recipe compares an `exec=` string, and the crate's own
   socket tests build their own listener, so deleting the call left the feature
-  dead in the image with every test green. It is pinned in the source, as the
-  terminal's selftest layers are;
+  dead in the image with every test green. It is pinned in the source;
 - each policy's mode is asserted against literal 0600 or 0666, and the
   cross-UID policy separately requires the kernel human peer;
 - the conversation's deadline ends a read that a partial line would not, and
@@ -5911,9 +4723,9 @@ The complete terminal landing must prove:
   direction — a verb added to the match and not to `USAGE` shipped
   undocumented before this;
 - the shell is told where the socket is, which takes the `[wayland]` unit, the
-  `[terminal]` unit beside it, and `pty::environment` — `pty::spawn` clears
-  the environment, so the child gets exactly the list it is given and nothing
-  inherited;
+  `[terminal]` unit beside it, and td-term's `session::environment` — td-ui's
+  `pty::spawn` clears the environment, so the child gets exactly the list it
+  is given and nothing inherited;
 - `--control-socket` reaches the option it names, and the control socket is
   one of the four in the alias walk. Nothing else reaches either: dropping the
   endpoint from the walk, and storing a path the flag did not give, both left
@@ -5988,8 +4800,8 @@ The complete terminal landing must prove:
 ## 15. Control channel
 
 A keyboard and a pointer are how a person drives this compositor. Section 15
-is how a PROGRAM does. `td-ctl` is a fourth name for the compositor artifact,
-selected by argv[0] beside `td-ui-demo` and `td-term`, and what it does is
+is how a PROGRAM does. `td-ctl` is a third name for the compositor artifact,
+selected by argv[0] beside `td-ui-demo`, and what it does is
 write one line to a Unix socket and print what comes back.
 
 The normal deployment channel remains layout-only. Disposable `headless`
@@ -6046,7 +4858,8 @@ application readiness use that same policy. Bind/chmod timing grants no
 protocol access to a peer that fails admission.
 
 Direct development sockets remain mode 0600 in private runtime directories.
-`socket::publish` is reserved for the human td-term and td-ui-demo clients;
+`socket::publish` is reserved for the human td-ui-demo client (td-term
+publishes its own, [td-term/DESIGN.md](../td-term/DESIGN.md) §4);
 compositor application evidence uses the policy-aware `publish_while`.
 
 ### One line in, one answer out

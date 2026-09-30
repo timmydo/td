@@ -9292,13 +9292,13 @@ mod tests {
         assert!(system.contains("$origin/content-alt.html"));
         assert!(system.contains("<a id=td-download href=download.txt "));
         assert!(system.contains("download=td-firefox-download.txt>Download</a>"));
-        let terminal = include_str!("../../../../../td-compositor/src/term_client.rs");
+        let terminal = include_str!("../../../../../td-term/src/app.rs");
         assert!(terminal.contains("TD-TERM-CLIPBOARD-TARGET-READY"));
         assert!(terminal.contains("TD-TERM-CLIPBOARD-FOCUS-READY"));
-        assert!(terminal.contains("TD-TERM-CLIPBOARD-SELECTION-READY bytes=7"));
-        assert!(terminal.contains("TD-TERM-CLIPBOARD-READY bytes={bytes}"));
+        assert!(terminal.contains("\"TD-TERM-CLIPBOARD-SELECTION-READY bytes={}\\n\""));
+        assert!(terminal.contains("\"TD-TERM-CLIPBOARD-READY bytes={length}\\n\""));
         assert!(terminal.contains("const CLIPBOARD_PROOF_BYTES: &[u8; 7] = b\"Welcome\";"));
-        assert!(terminal.contains("clipboard_sent_marker(clipboard_proof, &write.payload)"));
+        assert!(terminal.contains("clipboard_sent_marker(self.proof.enabled, &text)"));
         assert!(terminal.contains("clipboard_proof_enabled(Path::new(PROC_CMDLINE))"));
         let scene = include_str!("../../../../../td-compositor/src/scene.rs");
         assert!(scene.contains(&format!(
@@ -10390,7 +10390,7 @@ mod tests {
             without_screen_records(b"a\nb\n"),
             std::borrow::Cow::Borrowed(_)
         ));
-        let term_client = include_str!("../../../../../td-compositor/src/term_client.rs");
+        let term_client = include_str!("../../../../../td-term/src/app.rs");
         assert!(term_client.contains(&format!(
             "const LAST_SCREEN_PREFIX: &str = {TD_TERM_LAST_SCREEN_PREFIX:?};"
         )));

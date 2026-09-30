@@ -443,6 +443,7 @@ mod tests {
                 "td-secret",
                 "td-setup",
                 "td-taskmgr",
+                "td-term",
                 "td-ui"
             ]
         );

@@ -14,11 +14,7 @@ name = "td-compositor"
 path = "src/main.rs"
 
 [[bin]]
-name = "td-term-import-libvterm"
-path = "tools/import-libvterm.rs"
-
-[[bin]]
-name = "td-term-import-unifont"
+name = "td-compositor-import-unifont"
 path = "tools/import-unifont.rs"
 
 [features]

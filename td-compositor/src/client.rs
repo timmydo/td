@@ -1,15 +1,14 @@
 use crate::conn::{
-    self, Connection, Globals, COMPOSITOR, KEYBOARD, POINTER, SEAT, SHM, SURFACE, XDG_SURFACE,
-    XDG_TOPLEVEL, XDG_WM_BASE,
+    self, Connection, Globals, BYTES_PER_PIXEL, COMPOSITOR, KEYBOARD, POINTER, SEAT, SHM, SURFACE,
+    XDG_SURFACE, XDG_TOPLEVEL, XDG_WM_BASE,
 };
 use crate::MAX_HELD_KEYS;
 
 /// One past the last fixed id the DEMO creates. It binds a seat and creates a
-/// keyboard and pointer, so its dynamic range starts higher than the
-/// terminal's; see `conn`'s note on why this is per-client and must be dense.
+/// keyboard and pointer, so its dynamic range starts after them; see `conn`'s
+/// note on why this is per-client and must be dense.
 const FIRST_DYNAMIC_ID: u32 = POINTER + 1;
 use crate::pointer::MAX_POINTER_FRAME_EVENTS;
-use crate::render::BYTES_PER_PIXEL;
 use crate::scene::SHM_XRGB8888;
 use crate::ui::{KeyboardUpdate, PointerUpdate, UiKeyState, UiModel, UiModifiers};
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};

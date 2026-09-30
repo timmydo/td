@@ -152,8 +152,8 @@ fn fail(message: impl Into<String>) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: td-term-import-libvterm generate SOURCE-TREE OUTPUT-DIR | \
-     td-term-import-libvterm check SOURCE-TREE OUTPUT-DIR"
+    "usage: td-ui-import-libvterm generate SOURCE-TREE OUTPUT-DIR | \
+     td-ui-import-libvterm check SOURCE-TREE OUTPUT-DIR"
         .into()
 }
 
@@ -405,7 +405,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("td-term-import-libvterm: {error}");
+            eprintln!("td-ui-import-libvterm: {error}");
             ExitCode::FAILURE
         }
     }

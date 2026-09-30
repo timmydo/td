@@ -12,9 +12,12 @@ all moved out of td-editor, with the chrome bands (`chrome`: the menu bar
 and its panel, the wrapped text block, the tab strip and the status row)
 that td-editor draws, and the paged list `List` built on the panel's row
 painter, the single-line text entry `TextEntry`, the button strip
-`Buttons` and the slider `Slider`, the widgets no scene drew. td-editor
-is its first consumer; the installer front end `td-setup` (its welcome
-page landed), td-portal's file chooser and td-photo follow.
+`Buttons` and the slider `Slider`, the widgets no scene drew, and the
+terminal's reusable half: the VT parser and model, its renderer, the
+keyboard chord encoder, the terminfo compiler and the PTY with its
+threads. td-editor is its first consumer; the installer front end
+`td-setup` (its welcome page landed), td-portal's file chooser, td-photo
+and the terminal `td-term` follow.
 This document is the component contract and the starting point for
 successive agents; the root `AGENTS.md` and `DEVELOPMENT.md` still govern
 changes and submission.
@@ -50,8 +53,11 @@ bar with its drop-down panel, the wrapped text block, the tab strip and the
 status row, which td-editor's scene composes and paints, and the list, text
 entry, button strip and slider later consumers asked for). It re-mounts the
 compositor's `font`, `font_data`, `wire` and `filter` sources exactly as
-td-editor did, so there is still one Unifont face and one wire codec in the
-tree, and it owns the 8x16 cell constants every consumer lays text out on.
+td-editor did, its `reportable` report-text predicate and its
+`proc_status` reader, so there is still one Unifont face, one wire codec,
+one rule for which characters a report prints and one reading of a
+process's effective uid in the tree, and it owns the 8x16 cell constants every
+consumer lays text out on.
 td-editor depends on it by path and uses those modules through the crate's
 public surface.
 
@@ -139,9 +145,26 @@ td-photo and the task manager. Their still-image `--preview` output,
 
 Newly built (increment 22): `face_file`, the outline face's paths and
 bounded read; the italic and bold italic styles (`Face::with_slant`,
-`Face::style` over bold and italic); and td-term, which mounts td-ui's
-face modules and draws its cells through a face fitted to its grid (see
-"td-term" below).
+`Face::style` over bold and italic); and td-term's cell painter
+(`vt_render::render_with`), which draws through a face fitted to its grid
+(see "td-term" below).
+
+Moved (increment 23): the terminal. td-term, once an argv[0]
+personality of the compositor multicall, is its own crate over the
+toolkit, and what another program could reuse to embed a terminal moved
+here out of the compositor: the VT parser and model (`vt`) with its
+native corpus under `spec/vt` and the libvterm importer
+`td-ui-import-libvterm`, the renderer (`vt_render`) with its PPM goldens
+under `spec/vt_render`, the terminfo compiler (`vt_terminfo`), and the
+PTY with its reader, writer and waiter threads (`pty`), whose four
+`ioctl(2)` requests joined the raw module under `UNSAFE.md` §19. Newly
+built beside them: `vt_keys`, the chord encoder that replaces the
+compositor's evdev key table, so the terminal reads the chords the
+toolkit's keymap makes of any compositor's map rather than verifying td's
+byte for byte; and the client's `activated`, `presented` and
+`focus_serial` accessors the terminal's readiness and proof read.
+`td-term/DESIGN.md` is the normative contract for all of it; this
+document records only the toolkit's side.
 
 ## Purpose and trust position
 
@@ -159,11 +182,12 @@ consumer's lock then lists exactly its own package plus td-ui. A program
 that depends on td-ui is built by a cargo recipe that stages sibling source
 trees (`local_source_trees`, the td-net shape); a flat-staged direct-rustc
 recipe cannot link a second crate. td-portal, td-taskmgr, td-editor,
-td-news, td-mail and td-setup are built that way: each stages `td-ui`, and
-`td-compositor` because td-ui mounts the font and wire modules from it,
-beside its own tree. td-portal and td-setup stage further siblings of their
-own. A toolkit edit changes each consumer's locally derived source identity
-and selects each consumer's realized-output check.
+td-news, td-mail, td-setup and td-term are built that way: each stages
+`td-ui`, and `td-compositor` because td-ui mounts the font and wire
+modules from it, beside its own tree. td-portal and td-setup stage
+further siblings of their own. A toolkit edit changes each consumer's
+locally derived source identity and selects each consumer's
+realized-output check.
 
 ## Public surface
 
@@ -176,13 +200,23 @@ of its own files may name each module.
 - `font`: the compositor's PSF2 reader and pinned Unifont face, unchanged.
   Provenance and licences stay in `td-compositor/assets`.
 - `wire`: the compositor's Wayland framing codec, unchanged.
+- `reportable`: the compositor's report-text predicate, mounted from
+  `td-compositor/src/reportable.rs` unchanged, which says whether a
+  character may appear in a line a reader parses as a record; td-term
+  blanks what it refuses in a program name and a last-screen report.
+- `proc_status`: `effective_uid`, the second field of a
+  `/proc/<pid>/status` `Uid:` line, mounted from
+  `td-compositor/src/proc_status.rs` unchanged; td-term's account lookup
+  and the compositor's terminal-authority probe read it through one parser.
 - `filter`: `MAX_QUERY_BYTES`, `insert` and `matches`, the compositor's
   bounded ASCII query rule shared by the launcher and td-portal's chooser,
   mounted from `td-compositor/src/filter.rs` unchanged; the finder takes
   its `insert` and bound and repeats its match rule with the name folded
   at the comparison.
 - `keyboard`: `Keymap::parse` over an XKB text-v1 map, `Modifiers`,
-  `Stroke`, `InputError`, `Selected`, and translation from evdev keycodes
+  `Stroke` (its chord, whether it repeats, and `text`, the printable
+  character resolved before a Control or Alt chord lowercased it),
+  `InputError`, `Selected`, and translation from evdev keycodes
   plus a compositor modifier snapshot to logical chords; `Held`, the
   control, alt and shift roles a snapshot holds (`Keymap::held`; a state
   the map refuses holds none), with its chord `prefix` (`C-M-S-` in that
@@ -274,13 +308,16 @@ of its own files may name each module.
   `BOLD`, `ITALIC`, `BOLD_ITALIC`); `SETTING` (`TD_UI_FACE`), the
   variable whose value a program passes, and `wanted`, whether that value
   asks for the face (all but `bitmap` do); and `read`, the bounded read
-  of one file. td-term mounts it with `sfnt`, `coverage`, `atlas` and
-  `face`.
+  of one file. td-term reads the four styles through it.
 - `pinned_face`: `load` and `load_from` a directory, the regular style
   through `face_file::read`; `SETTING`, re-exported; and `load_or_note` and
   `load_from_or_note` a directory, which take that value, draw with
   Unifont without reading anything when it is `bitmap`, and otherwise
-  say on standard error why a program draws with Unifont instead.
+  say on standard error why a program draws with Unifont instead; and,
+  for a terminal, `styles_from` a directory, the four styles as one
+  `Face` fitted to a cell, refused whole if a style is missing or
+  refused, with `styles_or_note` and `styles_from_or_note` taking the
+  setting and saying so as the regular loaders do.
 - `hint`: the hint face, a hand-authored 4x5 glyph (`WIDTH`, `HEIGHT`,
   `ADVANCE` 5) per printable ASCII scalar, `glyph` and the pixel `width`
   of a text; a scalar it lacks is a box. It is the small lighter text a
@@ -396,7 +433,11 @@ of its own files may name each module.
   its text over a consumer's endpoint, `offer_selection` to offer text at a
   serial, and `source` for the live source whose text the consumer keeps),
   the pointer image's `cursor`, the state accessors `bound`, `configured`
-  and `closed`, `words`, `send` and `pop_descriptor` with the pending
+  and `closed`, `activated` (whether the last applied toplevel configure
+  carried the xdg `activated` state), `presented` (the buffer the last
+  `present` attached, until another replaces it) and `focus_serial` (the
+  keyboard enter's serial while the surface has focus, so one focus can be
+  told from the next), `words`, `send` and `pop_descriptor` with the pending
   `descriptors` count, `needs_descriptor` for the keymap and send rights the
   client consumes, `connection` for the schedule inputs, and `handle`, which
   takes the consumer's clock, consumes what is the client's in an event and
@@ -467,6 +508,46 @@ of its own files may name each module.
   empty tag; `Window<'h, H>` (`new`, `with_typeface`, `handler`,
   `handler_mut`, `surface`), the `App` over a handler it borrows; and
   `run` with an optional `Typeface`, under "Widget window" below.
+- `vt`: `Terminal`, the terminal model with its byte-stream parser (`new`
+  at a grid, `feed`, `resize`, the `cell`, `row_text`, `cursor` and `mode`
+  reads, `take_replies` one reply at a time and `replies`, `ring` and
+  `take_bell` for the coalesced bell, the history reads and `scrollback`),
+  `Cell`, `Attributes`, `Color`, `MAX_DIMENSION`, and `selftest`. Pure; its
+  specification, `vt_spec.rs`, runs the native corpus under `spec/vt`.
+- `vt_render`: `Palette` (`pinned`, xterm's), `Snapshot` (`new` with focus
+  and bell, `with_cursor`, `scrolled_back`, `with_selection`, and its reads),
+  `Cursor`, `Selection`, `render` of a snapshot into a tight XRGB8888
+  surface over the bitmap `font::Font`, `render_with`, the same with an
+  optional outline `Face` fitted to that font's cell, `ppm` and `from_ppm`,
+  `BYTES_PER_PIXEL`, and `selftest`. Pure; its specification,
+  `vt_render_spec.rs`, holds the goldens under `spec/vt_render`.
+- `vt_keys`: `action(chord, modes, viewing)`, which routes one chord as the
+  keymap spells it to `Action::Bytes` with a bounded `Sequence`,
+  `Action::Scroll` with a `Scroll`, or `Action::Silent`; `sequence`, the
+  bytes alone; `Modes`; `Viewport` with `Scrollback`, the scrollback view
+  anchored to a line; `InputQueue`, the whole-or-nothing keyboard queue;
+  `MAX_SEQUENCE`, `MAX_INPUT_BYTES`, and `selftest`. Pure and
+  keymap-independent: it knows chords, never keycodes.
+- `vt_terminfo`: `parse` of the capability source into an `Entry` of
+  `Capability` values, `compile` to the legacy binary format, `decode` back
+  to `Decoded`, `entry` (the compiled `td-term` entry), `INSTALL_PATH`
+  (`share/terminfo/t/td-term`), and `selftest`. Pure.
+- `pty`: `Pty` (`open` unlocks `/dev/ptmx` opened without acquiring it,
+  `master`, `into_master`, `peer` for the slave by descriptor, `window`,
+  and `resize`, which publishes a grid and reads it back before trusting
+  it), `WindowSize` and `window_size`, `grid_size` and `grid_for_tile`,
+  `ChildCommand` and `spawn` (a caller-composed command on the slave, the
+  environment cleared and set to the caller's list), the threads
+  `spawn_reader`, `spawn_writer` and `spawn_waiter` (named `pty-output`,
+  `pty-input` and `pty-child`, each reporting its own ending on the
+  caller's channel as `Output` or `Waited` and running the caller's
+  `notify` after each send), `Input`, the bounded queue the loop fills and
+  the writer drains (`new`, `push`, `close`), `write_input`, the
+  `DEV_PTMX`, `READ_CHUNK`, `MAX_OUTPUT_BYTES` and `MAX_OUTPUT_CHUNKS`
+  constants, and `selftest`. `Input::take_for_test` is test support,
+  public because a consumer's tests are another crate and hidden from the
+  crate's documentation. Which account, environment and command a
+  terminal runs is its caller's policy, never this module's.
 
 ## Driving
 
@@ -881,10 +962,14 @@ not frames, and stays its own).
   the browser as a child process with its streams closed and reaps it on
   a thread of its own; `face_file`, which reads one of the outline face's
   files from the one directory it names, a regular file within the
-  reader's bound, checked before it is opened; and `pinned_face`, which
-  reads only through it. Apart from `open`'s `BROWSER` they read no
-  environment variable, taking the display values, the socket path and
-  the face setting as explicit arguments.
+  reader's bound, checked before it is opened; `pinned_face`, which
+  reads only through it; and `pty`, which opens `/dev/ptmx`, spawns the
+  caller's command and owns the threads around it. Apart from `open`'s
+  `BROWSER` they read no environment variable, taking the display
+  values, the socket path, the face setting and a child's whole
+  environment as explicit arguments. The terminal's pure modules are
+  `vt`, `vt_render`, `vt_terminfo` and `vt_keys`: bytes, sizes, chords
+  and snapshots in; cells, replies, pixels and byte sequences out.
 - `control` and `driven` are pure: the frame, envelope and codecs touch
   no descriptor, and the seam reads only the composition it is handed
   and the embedded face. The decoder allocates at most one frame, after
@@ -1059,7 +1144,7 @@ not frames, and stays its own).
   face's cell, so it keeps the cell model only for a composition laid
   out on that cell; the widgets lay out on the bitmap grid, so a
   consumer opts in with a face fitted to that grid (`Face::fit`) until
-  runtime cells (increment 23).
+  runtime cells (increment 24).
 - The atlas is one 1024 by 1024 page (1 MiB) of at most 8192 keys, placed
   and missing together, with a pixel of gutter right of and below each
   entry, zeroed when it is placed and inside the dirty band; a full page
@@ -1088,16 +1173,26 @@ not frames, and stays its own).
 - `unsafe` is confined to `sys`, the transport's raw module, under
   `UNSAFE.md` §19: two function-scoped allowances, one syscall instruction
   carrying `recvmsg`, `sendmsg`, `fcntl` pinned to `F_DUPFD_CLOEXEC`,
-  `F_GETFL` and `F_SETFL`, and `poll` over the connection's stream and
-  its waker, one descriptor adoption site, and a crate root
-  that denies it. Only `wayland` and `clipboard` name the module, the
-  transport through its four wrappers and the clipboard's destination
-  owner through the two status ones. Reusing it does not transfer
-  authorization to a new consumer, which gets its own roster entry.
-- The shared font and wire sources are mounted here by exact repository
-  path and nowhere else among td-ui's consumers. A future move of their
-  canonical home updates staging, check mappings and every consumer
-  atomically, as td-editor/DESIGN.md already requires.
+  `F_GETFL` and `F_SETFL`, `poll` over the connection's stream and
+  its waker, and `ioctl` pinned to the four PTY requests `TIOCSPTLCK`,
+  `TIOCGPTPEER`, `TIOCSWINSZ` and `TIOCGWINSZ`, one wrapper each with the
+  request never a parameter, one descriptor adoption site, and a crate
+  root that denies it. Only `wayland`, `clipboard` and `pty` name the
+  module, the transport through its four wrappers, the clipboard's
+  destination owner through the two status ones, and the PTY through the
+  four ioctl ones, each at one site. Reusing it does not transfer
+  authorization to a new consumer, which gets its own roster entry;
+  td-term reaches the PTY only through `pty::Pty` and forbids `unsafe`.
+- The terminal modules keep the bounds `td-term/DESIGN.md` §2 states
+  (CSI parameters, grid, history, reply, keyboard-queue and PTY-output
+  ceilings), admit a key sequence or a reply whole or not at all, and
+  never join a PTY reader or writer on a teardown path (§4 there). That
+  document is the terminal's behavioural specification; this one does not
+  restate it.
+- The shared font, wire, filter and report-text sources are mounted here by
+  exact repository path and nowhere else among td-ui's consumers. A future
+  move of their canonical home updates staging, check mappings and every
+  consumer atomically, as td-editor/DESIGN.md already requires.
 - The text entry's masked mode is a plain rendering option, not a trust
   boundary. It draws a fixed mask glyph for each of the field's
   characters instead of the characters, so a consumer can collect a PIN
@@ -1273,25 +1368,57 @@ malformed-send FIFO oracle, and offer budgets with a retired device); the
 editor keeps its transfer, request and control coverage and its reactions to
 the client's device and clipboard outcomes.
 
-`tests/confinement.rs` pins the source inventory, the exact three shared
-source mounts, the absence of ambient I/O in pure modules, that `notices`
-is three embedded texts and the outline face's literal and nothing else,
-the absence of `include!`, `cfg_attr` and any dependency declaration, that
-the shared sources bind no input interface, that `face_file` opens one
-file under its one directory after checking it and bounding the read and
-`pinned_face` reads only through it, that the five modules td-term
-mounts name no td-ui module but each other, and the raw layer: the
-complete fingerprint of `sys.rs`, its syscall and flag values, its two
-function-only allowances, the single instruction and adoption sites, that
-the crate root denies `unsafe` and declares the module private, that
-`wayland` and `clipboard` are its only callers, the transport through
-exactly five wrapper calls (the poll over two readable-only entries among
-them) and the clipboard's destination owner through exactly five status
-calls, that no production module calls the client's
-test support (`unconfigure`, `input_mut`), and that the client is the
-toolkit's one consumer of a received right, through the pinned keymap
-reader with its format, size and regular-file checks and the send that
-hands its right on.
+The terminal's suites are its specification files and in-file tests,
+listed by obligation in `td-term/DESIGN.md` §6. `vt_spec.rs`, compiled
+only as `vt.rs`'s test module, runs the native corpus under `spec/vt`
+against its generated `expectations.txt` overlay, checks the libvterm
+migration against its report and source manifest, and holds the model to
+chunking invariance, malformed-stream recovery, bounded replies and
+history, and the terminfo entry's attribution; its `key` cases run through
+td's own keymap, compiled from the compositor's source, and `vt_keys`.
+`vt_render_spec.rs`, compiled only as `vt_render.rs`'s test module, holds
+the renderer to the exact PPM goldens under `spec/vt_render` and the
+structural rendition, palette, cursor, selection, bell and viewport
+oracles, writing an actual frame and a diff beneath the build's temporary
+output on a mismatch, and holds `render_with` to its outline oracles over
+fonts the tests encode (`tests/fonts`, mounted by path). `vt_keys.rs` pins
+the chord table, the viewport and the input queue; `vt_terminfo.rs` its
+capability order, binary layout, decoder refusals, key bytes and
+per-capability effects; and `pty.rs` carries kernel tests over a real PTY:
+unlock, peer, published and read-back sizes, a child's view of the slave
+and grid, and the reader, writer and waiter lifecycles.
+`td-ui-import-libvterm` is a developer tool, run only by hand against a
+supplied archive tree.
+
+`tests/confinement.rs` pins the source inventory, the exact six shared
+source mounts, the absence of ambient I/O in pure modules, that `notices` is
+three embedded texts and the outline face's literal and nothing else, the
+absence of `include!`, `cfg_attr` and any dependency declaration, that the
+shared sources bind no input interface, that `face_file` opens one file
+under its one directory after checking it and bounding the read and
+`pinned_face` reads only through it, and the raw layer: the complete
+fingerprint of `sys.rs`, its syscall and flag values, its two function-only
+allowances, the single instruction and adoption sites, that the crate root
+denies `unsafe` and declares the module private, that `wayland`, `clipboard`
+and `pty` are its only callers, the transport through exactly five wrapper
+calls (the poll over two readable-only entries among them), the clipboard's
+destination owner through exactly five status calls, and the PTY through
+exactly its four ioctl wrappers, each at one site, with `SYS_IOCTL` named
+only at its definition and those wrappers and each request constant and the
+peer flags only at their definition and their one use, the master opened
+with `O_NOCTTY`, every published size read back, and the child's environment
+cleared, that no production module calls the test support (the client's
+`unconfigure` and `input_mut`, `pty::Input::take_for_test`), and that the
+client is the toolkit's one consumer of a received right, through the pinned
+keymap reader with its format, size and regular-file checks and the send
+that hands its right on. For the terminal it pins `pty`, `vt`, `vt_keys`,
+`vt_render` and `vt_terminfo` as public modules, `vt_keys` among the pure
+set, and `vt`, `vt_render` and `vt_terminfo` as pure production text -- no
+environment, filesystem, network, process, time, I/O, embedded file, path
+mount or nested module before the test tail -- whose tails are exactly their
+specification mounts (`vt_terminfo`'s two test modules), with the
+specifications test code throughout and `vt_spec.rs` mounting only the
+engine's SHA-256.
 
 `control`'s in-file tests are td-editor's framing tests moved: every frame
 split and single-byte delivery, truncation, zero/oversized/trailing frames,
@@ -1380,8 +1507,9 @@ between socket and replay, and its window's two-jobs-per-turn polling,
 stays in td-editor's suites and confinement tests.
 
 The builder discovers the crate by existing. Its gate runs `cargo test` and
-all-target Clippy; a change under `td-ui/` selects td-editor's tests through
-the reader graph, because td-editor's manifest names the crate.
+all-target Clippy; a change under `td-ui/` selects each consumer's tests,
+td-editor's and td-term's among them, through the reader graph, because
+each consumer's manifest names the crate.
 
 ## Widget window
 
@@ -1934,10 +2062,7 @@ to the next ASCII whitespace or `<>])"'` backtick, trailing `.,;:!?`
 left out, which is td-mail's link-list rule. It looks at most
 `MAX_BYTES` either side of the byte, and a run longer than that on
 either side is no link, so a press costs the same in any line. td-term
-lives in td-compositor, which links no crate, so it mounts `links.rs`
-and `open.rs` by path as td-ui mounts the compositor's font and wire,
-and its recipe stages them; `open` reads only `crate::links`, which the
-mount provides (td-compositor/DESIGN.md §11).
+reads its grid's row through it (td-term/DESIGN.md §3).
 td-editor's controller maps a surface pixel to the glyph under it
 (`Controller::link_at`, read-only) and the program follows what it
 answers: a press over a link opens it and is not the document's press,
@@ -2300,7 +2425,7 @@ not.
 ### Runtime cells
 
 `CELL_WIDTH` and `CELL_HEIGHT` are constants because the bitmap face fixes
-them. Runtime cells (increment 23) make them a `Cell` value derived from
+them. Runtime cells (increment 24) make them a `Cell` value derived from
 the face at the surface's pixel size, so a face can be drawn at a size
 the grid does not fix:
 
@@ -2313,27 +2438,24 @@ place of the constants. The glyph is rasterized at the device pixel size
 (the base size times the integer scale), not drawn at 1x and doubled.
 
 A scalar the face lacks falls back to the Unifont glyph, centred in the
-cell. Wide cells (CJK) remain a separate decision; section 13 of
-td-compositor/DESIGN.md already excludes them.
+cell. Wide cells (CJK) remain a separate decision; td-term/DESIGN.md §2
+already excludes them from the terminal profile.
 
 ### td-term
 
-td-term is the `td-compositor` multicall. It paints cells through the
-compositor's own `render.rs` over the bitmap `Font`, and draws each glyph
-the pinned outline face has through a face fitted to that font's cell:
+td-term is its own crate over the toolkit (`td-term/DESIGN.md`). Its
+renderer is td-ui's `vt_render`, which paints cells straight into the
+XRGB buffer over the bitmap `Font` rather than as a `Composition`, and
+draws each glyph the pinned outline face has through a face fitted to
+that font's cell:
 
-1. The compositor mounts td-ui's `sfnt`, `coverage`, `atlas`, `face` and
-   `face_file` by path, as it mounts td-busd's `app_policy`, and its
-   recipe writes the five files beside its own. Those modules name no
-   other td-ui module (td-ui's confinement test pins that), so the
-   compositor takes none of td-ui's transport, raster or `unsafe`
-   surface.
-2. At startup td-term reads the four styles through `face_file` unless
-   `TD_UI_FACE` is `bitmap`, fits them to the 8x16 cell with `Face::fit`
-   and `with_slant`, and on any failure says so once and draws with
-   Unifont.
-3. `render::render_with` draws a cell through the face when the face has
-   its scalar: the cell's ground, then the glyph's coverage from the
+1. At startup td-term loads the four styles through
+   `pinned_face::styles_or_note` unless `TD_UI_FACE` is `bitmap`, which
+   reads them through `face_file` and fits them to the 8x16 cell with
+   `Face::fit` and `with_slant`; on any failure it says so once and
+   td-term draws with Unifont.
+2. `vt_render::render_with` draws a cell through the face when the face
+   has its scalar: the cell's ground, then the glyph's coverage from the
    atlas page blended from the ground toward the ink and clipped to the
    cell, then the rules. The terminal's attributes map as follows:
    - bold, italic and bold italic select those styles through
@@ -2351,12 +2473,12 @@ raster's.
 
 The pixel size the terminal reports through `TIOCSWINSZ` follows the cell,
 which is the grid's until runtime cells.
-The compositor's own chrome keeps the bitmap face. td-compositor/DESIGN.md
-section 11's rule that host tests and the target consume the same face
-bytes holds for Unifont. The render spec's PPM oracles stay on `render`
-and the bitmap face; the outline painter's oracles use fonts the tests
-encode (td-ui's `tests/fonts`, mounted by path), and the image check is
-what realizes the pinned face.
+The compositor's own chrome keeps the bitmap face. td-term/DESIGN.md §3's
+rule that host tests and the target consume the same face bytes holds for
+Unifont. `vt_render_spec.rs`'s PPM oracles stay on `render` and the
+bitmap face; the outline painter's oracles use fonts the tests encode
+(`tests/fonts`, mounted by path), and the image check is what realizes
+the pinned face.
 
 ### The GPU path
 
@@ -2569,14 +2691,22 @@ regressions. Those increments extend the original sequence below.
     the file chooser, td-photo and the task manager load the pinned face
     for their live windows, and their `--font-license` output names
     where its notices are. Landed.
-22. td-term on the outline face: the compositor mounts td-ui's face
-    modules, and td-term's cell painter draws through a face fitted to
-    its grid in four styles, with the attribute mapping above. Its PPM
-    oracles stay on the bitmap face. Landed.
-23. Runtime cells: `Cell` replaces the constants in layout, hit testing
+22. td-term on the outline face: its cell painter draws through a face
+    fitted to its grid in four styles, with the attribute mapping above.
+    Its PPM oracles stay on the bitmap face. Landed.
+23. td-term on td-ui: td-term its own crate and static binary over the
+    toolkit, out of the compositor multicall: the VT model and its
+    corpus, the renderer and its goldens, the terminfo compiler, and the
+    PTY with its four ioctl requests (`UNSAFE.md` §19) moved here;
+    `vt_keys`, the chord encoder, and the client's `activated`,
+    `presented` and `focus_serial` accessors newly built; `reportable`
+    and `proc_status` mounted; td-term's window, session policy and
+    readiness socket in its own crate, which forbids `unsafe`; the
+    `td-term`, `td-term-terminfo` and `td-term-test` recipes. Landed.
+24. Runtime cells: `Cell` replaces the constants in layout, hit testing
     and painting, so a face is drawn at a size the grid does not fix.
     td-editor goes first, since the other consumers lay out over its
     pane.
-24. The GPU path, gated on the sign-offs "The GPU path" lists: the
+25. The GPU path, gated on the sign-offs "The GPU path" lists: the
     compositor's GPU composition first, then client dmabufs, then td-ui's
     GPU backend held to the CPU raster's oracles.

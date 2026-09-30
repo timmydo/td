@@ -1,24 +1,19 @@
-//! td-term's PTY and child-process adapter.
+//! A PTY and the threads around it, for a terminal that runs a child.
 //!
-//! The policy here — grid derivation, account selection, environment, and argv
-//! — is pure and tested without a device. Only `Pty` itself touches the kernel,
-//! and it does so through the four reviewed `ioctl(2)` requests in `sys.rs`.
-//!
-//! `term_client::run` opens a `Pty`, sizes it to the grid the compositor
-//! chose — so the readiness line names a grid something was actually set to —
-//! and then starts the child on it: the slave and all three threads — reader,
-//! waiter and writer — have production callers. What is left unwired is the
-//! keyboard, which is a Wayland seat rather than anything here; the queue the
-//! writer drains already carries the answers the model composes. Host tests
-//! drive every item against a real PTY, and `selftest` covers the policy layer
-//! inside the packaged binary, where devpts may not be mounted. Each item
-//! still unwired carries its own `dead_code` allow rather than the module
-//! carrying one, so what is left is visible.
+//! `Pty` opens `/dev/ptmx` without acquiring it, unlocks it, sizes it and
+//! hands out its slave by descriptor, through the four `ioctl(2)` requests
+//! UNSAFE.md section 19 pins in the raw layer. `spawn` starts a caller-composed
+//! command on the slave; one reader, one writer and one waiter thread then
+//! carry output, keyboard input and the child's exit, each reporting its
+//! own ending on a channel, since nothing may join a thread parked in a
+//! read. Which account, environment and command a terminal runs is its
+//! caller's policy (td-term/DESIGN.md), not this module's.
 
 use crate::sys;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -38,15 +33,9 @@ const EIO: i32 = 5;
 
 pub const DEV_PTMX: &str = "/dev/ptmx";
 
-/// The declared td-init input that gives the child a session and a controlling
-/// terminal; safe `Command` reaches neither.
-pub const CTTYHACK: &str = "/bin/cttyhack";
-pub const CTTYHACK_STDIN: &str = "--stdin";
-pub const DEFAULT_SHELL: &str = "/bin/sh";
-
 /// What a PTY reader puts on its channel: output, and then exactly one
 /// ending. The ending is a MESSAGE rather than only the thread's return value
-/// because nothing joins these threads — §12 forbids it, the read cannot be
+/// because nothing joins these threads — td-term/DESIGN.md §4 forbids it, the read cannot be
 /// interrupted — so a terminal that learned of a fault only from a join handle
 /// would never learn of it at all.
 #[derive(Debug)]
@@ -64,22 +53,51 @@ pub enum Waited {
     Failed(String),
 }
 
-/// §10's PTY-output ceiling, as whole read chunks. A full channel blocks the
+/// td-term/DESIGN.md §2's PTY-output ceiling, as whole read chunks. A full channel blocks the
 /// reader thread, which is how the kernel's PTY buffer backpressures the child.
 pub const READ_CHUNK: usize = 8 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_OUTPUT_CHUNKS: usize = MAX_OUTPUT_BYTES / READ_CHUNK;
 
-/// Bounded reads of the two small files the child environment is derived from.
-const MAX_STATUS_BYTES: usize = 64 * 1024;
-const MAX_PASSWD_BYTES: usize = 1024 * 1024;
+/// The kernel's `struct winsize`. The pixel pair is reported as zero,
+/// because a terminal here publishes a character grid.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WindowSize {
+    pub rows: u16,
+    pub columns: u16,
+    pub x_pixels: u16,
+    pub y_pixels: u16,
+}
 
-/// The graphical account, as `/proc/self/status` and `/etc/passwd` agree it is.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Account {
-    pub uid: u32,
-    pub name: String,
-    pub home: String,
+/// The eight bytes the kernel reads and writes, in its field order. A
+/// `[u16; 4]` rather than a `#[repr(C)]` struct, so the ORDER is an
+/// ordinary tested function: a swapped pair is a well-formed resize to
+/// another size.
+fn winsize_words(size: WindowSize) -> [u16; 4] {
+    [size.rows, size.columns, size.x_pixels, size.y_pixels]
+}
+
+fn winsize_from_words(words: [u16; 4]) -> WindowSize {
+    let [rows, columns, x_pixels, y_pixels] = words;
+    WindowSize {
+        rows,
+        columns,
+        x_pixels,
+        y_pixels,
+    }
+}
+
+/// What a terminal reports its grid to be, asked fresh: the master or any
+/// descriptor of its slave.
+pub fn window_size(terminal: &impl AsFd) -> Result<WindowSize, String> {
+    let terminal = terminal
+        .as_fd()
+        .try_clone_to_owned()
+        .map(File::from)
+        .map_err(|e| format!("duplicate terminal: {e}"))?;
+    sys::window_size(&terminal)
+        .map(winsize_from_words)
+        .map_err(|e| format!("TIOCGWINSZ: {e}"))
 }
 
 /// An open PTY master whose slave has been unlocked but not yet handed out.
@@ -88,14 +106,16 @@ pub struct Pty {
 }
 
 impl Pty {
-    pub fn open(ptmx: &Path) -> Result<Pty, String> {
+    /// Open a master on `/dev/ptmx`, the one device the ioctls below are
+    /// issued on, and unlock its slave.
+    pub fn open() -> Result<Pty, String> {
         let master = OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(O_NOCTTY)
-            .open(ptmx)
-            .map_err(|e| format!("open {}: {e}", ptmx.display()))?;
-        sys::unlock_pty(&master)?;
+            .open(DEV_PTMX)
+            .map_err(|e| format!("open {DEV_PTMX}: {e}"))?;
+        sys::unlock_pty(&master).map_err(|e| format!("TIOCSPTLCK: {e}"))?;
         Ok(Pty { master })
     }
 
@@ -110,7 +130,7 @@ impl Pty {
 
     /// The slave, obtained from the master rather than by name.
     pub fn peer(&self) -> Result<File, String> {
-        sys::pty_peer(&self.master)
+        sys::pty_peer(&self.master).map_err(|e| format!("TIOCGPTPEER: {e}"))
     }
 
     /// What the terminal currently IS, asked fresh. `resize` verifies its own
@@ -118,18 +138,19 @@ impl Pty {
     /// that was NOT the one to set the size can ask — which today is the
     /// integration test, and with resize handling will be the client.
     #[allow(dead_code)]
-    pub fn window(&self) -> Result<sys::WindowSize, String> {
-        sys::window_size(&self.master)
+    pub fn window(&self) -> Result<WindowSize, String> {
+        window_size(&self.master)
     }
 
     /// Publish a grid size and verify it before anything may observe it. An
     /// unverified `TIOCSWINSZ` is indistinguishable at the call site from one
     /// the kernel clamped or ignored, and the child would then lay out its
     /// screen for a size the terminal does not have.
-    pub fn resize(&self, rows: usize, columns: usize) -> Result<sys::WindowSize, String> {
+    pub fn resize(&self, rows: usize, columns: usize) -> Result<WindowSize, String> {
         let requested = grid_size(rows, columns)?;
-        sys::set_window_size(&self.master, requested)?;
-        let observed = sys::window_size(&self.master)?;
+        sys::set_window_size(&self.master, winsize_words(requested))
+            .map_err(|e| format!("TIOCSWINSZ: {e}"))?;
+        let observed = window_size(&self.master)?;
         if observed.rows != requested.rows || observed.columns != requested.columns {
             return Err(format!(
                 "published {}x{} but the terminal reports {}x{}",
@@ -142,7 +163,7 @@ impl Pty {
 
 /// A grid the kernel can represent. Zero is not a size a terminal can be laid
 /// out for, and the winsize fields are sixteen bits wide.
-pub fn grid_size(rows: usize, columns: usize) -> Result<sys::WindowSize, String> {
+pub fn grid_size(rows: usize, columns: usize) -> Result<WindowSize, String> {
     let rows = u16::try_from(rows)
         .ok()
         .filter(|rows| *rows > 0)
@@ -151,7 +172,7 @@ pub fn grid_size(rows: usize, columns: usize) -> Result<sys::WindowSize, String>
         .ok()
         .filter(|columns| *columns > 0)
         .ok_or_else(|| format!("terminal column count {columns} is not a representable grid"))?;
-    Ok(sys::WindowSize {
+    Ok(WindowSize {
         rows,
         columns,
         x_pixels: 0,
@@ -176,189 +197,11 @@ pub fn grid_for_tile(
     Ok((rows, columns))
 }
 
-fn read_bounded(path: &Path, limit: usize) -> Result<String, String> {
-    let metadata = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
-    if metadata.len() > limit as u64 {
-        return Err(format!(
-            "{} is larger than the {limit}-byte bound",
-            path.display()
-        ));
-    }
-    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let mut bytes = Vec::with_capacity(limit.min(4096));
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    if bytes.len() > limit {
-        return Err(format!(
-            "{} is larger than the {limit}-byte bound",
-            path.display()
-        ));
-    }
-    String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))
-}
-
-/// The effective uid from `/proc/self/status`. The effective one is what the
-/// kernel checks and what owns `/run/user/UID`, so it is what the child's
-/// environment must describe.
-pub fn effective_uid(status: &str) -> Result<u32, String> {
-    let mut uid_line = None;
-    for line in status.lines() {
-        if let Some(fields) = line.strip_prefix("Uid:") {
-            uid_line = Some(fields);
-            break;
-        }
-    }
-    let line = uid_line.ok_or_else(|| "process status has no Uid line".to_string())?;
-    let mut fields = line.split_whitespace();
-    let _real = fields
-        .next()
-        .ok_or_else(|| "process status Uid line has no real uid".to_string())?;
-    let effective = fields
-        .next()
-        .ok_or_else(|| "process status Uid line has no effective uid".to_string())?;
-    effective
-        .parse()
-        .map_err(|_| format!("process status effective uid '{effective}' is not a number"))
-}
-
-/// The unique `/etc/passwd` entry for a uid. Fail-closed on every ambiguity:
-/// a duplicate uid, an absent one, or any malformed line closes the terminal
-/// rather than starting a shell whose HOME belongs to somebody else.
-pub fn account(passwd: &str, uid: u32) -> Result<Account, String> {
-    let mut found: Option<Account> = None;
-    for (number, line) in passwd.lines().enumerate() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() != 7 {
-            return Err(format!(
-                "passwd line {} has {} fields, expected 7",
-                number.saturating_add(1),
-                fields.len()
-            ));
-        }
-        let name = fields.first().copied().unwrap_or_default();
-        let entry_uid = fields.get(2).copied().unwrap_or_default();
-        let home = fields.get(5).copied().unwrap_or_default();
-        let entry_uid: u32 = entry_uid.parse().map_err(|_| {
-            format!(
-                "passwd line {} has non-numeric uid '{entry_uid}'",
-                number.saturating_add(1)
-            )
-        })?;
-        if entry_uid != uid {
-            continue;
-        }
-        if found.is_some() {
-            return Err(format!("passwd has more than one entry for uid {uid}"));
-        }
-        if name.is_empty() {
-            return Err(format!("passwd entry for uid {uid} has no user name"));
-        }
-        if !home.starts_with('/') {
-            return Err(format!(
-                "passwd entry for uid {uid} has a relative home '{home}'"
-            ));
-        }
-        found = Some(Account {
-            uid,
-            name: name.to_string(),
-            home: home.to_string(),
-        });
-    }
-    found.ok_or_else(|| format!("passwd has no entry for uid {uid}"))
-}
-
-/// The account td-term runs as, read from the live process and account files.
-pub fn current_account(status: &Path, passwd: &Path) -> Result<Account, String> {
-    let uid = effective_uid(&read_bounded(status, MAX_STATUS_BYTES)?)?;
-    account(&read_bounded(passwd, MAX_PASSWD_BYTES)?, uid)
-}
-
-/// The child's complete environment. It is constructed, never inherited: an
-/// outer `TERM` describes the parent terminal and would be a false capability
-/// claim for this one.
-/// The child's whole environment: `spawn` clears and sets exactly this, so a
-/// variable absent here is absent from the shell whatever the terminal was
-/// started with.
-///
-/// Socket paths come from the terminal launch configuration. They are
-/// arguments so this remains a pure function. The production caller supplies
-/// its connected Wayland path and the control path from its environment.
-pub fn environment(
-    account: &Account,
-    control_socket: Option<&str>,
-    wayland_socket: &str,
-) -> Vec<(String, String)> {
-    let mut environment = vec![
-        ("COLORTERM".into(), "truecolor".into()),
-        ("HOME".into(), account.home.clone()),
-        ("LOGNAME".into(), account.name.clone()),
-        ("PATH".into(), "/bin".into()),
-        ("SHELL".into(), DEFAULT_SHELL.into()),
-        ("TERM".into(), "td-term".into()),
-        ("TERMINFO".into(), "/etc/terminfo".into()),
-        ("USER".into(), account.name.clone()),
-        ("WAYLAND_DISPLAY".into(), wayland_socket.into()),
-        (
-            "XDG_RUNTIME_DIR".into(),
-            format!("/run/user/{}", account.uid),
-        ),
-    ];
-    // Last, and only when there is one: a shell in this terminal is where a
-    // person runs `td-ctl`, and without this they would have to name the
-    // socket by hand on a machine that already knows it.
-    if let Some(socket) = control_socket {
-        environment.push(("TD_CONTROL_SOCKET".into(), socket.into()));
-    }
-    environment
-}
-
-/// What td-term execs: literal argv values, no shell, no PATH search.
+/// What a terminal execs: literal argv values, no shell, no PATH search.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChildCommand {
     pub program: PathBuf,
     pub arguments: Vec<OsString>,
-}
-
-/// `/bin/cttyhack --stdin /bin/sh` by default, or exactly the command supplied
-/// on td-term's own command line.
-///
-/// The default shell is wrapped because a shell expects a controlling terminal
-/// it does not create, and safe `Command` cannot make one. An explicit command
-/// is NOT wrapped: it is exec'd as given, with the slave on its stdio and no
-/// session or controlling terminal of its own. A program that wants cttyhack's
-/// behaviour names the wrapper itself; td-jail's terminal grant (its own
-/// increment, `devices=tty` in APPLICATIONS.md) instead acquires the terminal
-/// inside its own detached session, which the kernel refuses for a terminal
-/// the wrapper has already made the launcher's. Both paths must be absolute:
-/// a relative program would be resolved against an ambient PATH this adapter
-/// deliberately does not have.
-pub fn child_command(wrapper: &Path, command: &[OsString]) -> Result<ChildCommand, String> {
-    if !wrapper.is_absolute() {
-        return Err(format!(
-            "terminal session wrapper '{}' is not absolute",
-            wrapper.display()
-        ));
-    }
-    let Some(program) = command.first() else {
-        return Ok(ChildCommand {
-            program: wrapper.to_path_buf(),
-            arguments: vec![
-                OsString::from(CTTYHACK_STDIN),
-                OsString::from(DEFAULT_SHELL),
-            ],
-        });
-    };
-    if !Path::new(program).is_absolute() {
-        return Err(format!(
-            "terminal command '{}' is not absolute",
-            program.to_string_lossy()
-        ));
-    }
-    Ok(ChildCommand {
-        program: PathBuf::from(program),
-        arguments: command.iter().skip(1).cloned().collect(),
-    })
 }
 
 /// Start the child on the slave. The slave and all three parent-side clones are
@@ -401,9 +244,10 @@ pub fn spawn(
     })
 }
 
-/// A channel of §10's output length, for tests that drive a reader on its
-/// own. The terminal's own channel is `term_client`'s, because it carries
-/// Wayland events too and one queue can only have one bound.
+/// A channel of td-term/DESIGN.md §2's output length, for tests that drive a
+/// reader on its own. td-term's own channel is its window's, because it
+/// carries the child waiter's events too and one queue can only have one
+/// bound.
 #[cfg(test)]
 pub fn output_channel<T>() -> (SyncSender<T>, Receiver<T>) {
     sync_channel(MAX_OUTPUT_CHUNKS)
@@ -420,7 +264,7 @@ pub fn output_channel<T>() -> (SyncSender<T>, Receiver<T>) {
 /// closes the last slave and the read returns — and there is no path that
 /// retires the reader while the child lives.
 ///
-/// That is sound only because td-term is one process per terminal (§9): closing
+/// That is sound only because td-term is one process per terminal (td-term/DESIGN.md §1): closing
 /// "the terminal" IS exiting, process exit closes this descriptor, and the
 /// kernel then sends `SIGHUP` to the session that holds the slave as its
 /// controlling terminal — the default shell's, through cttyhack, or the one a
@@ -431,13 +275,17 @@ pub fn output_channel<T>() -> (SyncSender<T>, Receiver<T>) {
 /// cannot delay process exit, but a join would wait for a read that never
 /// returns. Interrupting the reader for any other reason needs a separately
 /// reviewed wakeup surface.
+///
+/// `notify` runs after every send, so a loop that waits on something other
+/// than the channel (a Wayland connection's waker) learns there is output.
 pub fn spawn_reader<T: Send + 'static>(
     mut master: File,
     sender: SyncSender<T>,
     wrap: fn(Output) -> T,
+    notify: impl Fn() + Send + 'static,
 ) -> Result<JoinHandle<Result<(), String>>, String> {
     thread::Builder::new()
-        .name("td-term-pty".into())
+        .name("pty-output".into())
         .spawn(move || {
             let mut buffer = vec![0u8; READ_CHUNK];
             let ended = loop {
@@ -452,6 +300,7 @@ pub fn spawn_reader<T: Send + 'static>(
                         if sender.send(wrap(Output::Bytes(bytes.to_vec()))).is_err() {
                             return Ok(());
                         }
+                        notify();
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     // EIO is the hangup this thread retires on. Every other
@@ -462,10 +311,11 @@ pub fn spawn_reader<T: Send + 'static>(
                 }
             };
             // The ending goes on the CHANNEL and not only through the join
-            // handle. Nobody joins this thread — §12 forbids it, since the
+            // handle. Nobody joins this thread — td-term/DESIGN.md §4 forbids it, since the
             // read it may be parked in cannot be interrupted — so a handle is
             // somewhere an error goes to be lost.
             let _ = sender.send(wrap(Output::Ended(ended.clone())));
+            notify();
             ended
         })
         .map_err(|e| format!("spawn PTY reader: {e}"))
@@ -476,7 +326,7 @@ pub fn spawn_reader<T: Send + 'static>(
 /// nowhere to come back from.
 ///
 /// The master is blocking, so a child that stops reading blocks this call once
-/// the line discipline fills. §12 puts the writer on its own thread for exactly
+/// the line discipline fills. td-term/DESIGN.md §4 puts the writer on its own thread for exactly
 /// that reason.
 fn write_chunk(sink: &mut impl Write, bytes: &[u8]) -> Result<usize, String> {
     loop {
@@ -491,7 +341,7 @@ fn write_chunk(sink: &mut impl Write, bytes: &[u8]) -> Result<usize, String> {
 
 /// Drain a keyboard queue into the child, consuming only what was taken.
 #[allow(dead_code)]
-pub fn write_input(master: &File, queue: &mut crate::keys::InputQueue) -> Result<(), String> {
+pub fn write_input(master: &File, queue: &mut crate::vt_keys::InputQueue) -> Result<(), String> {
     let mut sink = master;
     while !queue.is_empty() {
         let taken = write_chunk(&mut sink, queue.front(READ_CHUNK))?;
@@ -502,12 +352,12 @@ pub fn write_input(master: &File, queue: &mut crate::keys::InputQueue) -> Result
 
 /// The keyboard queue the main loop fills and the writer thread drains.
 ///
-/// ONE bounded queue rather than a queue plus a channel: §10 admits a key
+/// ONE bounded queue rather than a queue plus a channel: td-term/DESIGN.md §2 admits a key
 /// sequence whole or drops it whole, and a second buffer downstream would be a
 /// second place for half of one to sit. The lock is held to copy bytes out —
 /// which may contiguate the ring first — or to put a consumption back, NEVER
 /// across the write, because
-/// §12 requires the main loop to enqueue without blocking and the master is
+/// td-term/DESIGN.md §4 requires the main loop to enqueue without blocking and the master is
 /// blocking — a child that stops reading parks the writer indefinitely once the
 /// line discipline fills.
 pub struct Input {
@@ -516,7 +366,7 @@ pub struct Input {
 }
 
 struct Pending {
-    queue: crate::keys::InputQueue,
+    queue: crate::vt_keys::InputQueue,
     closed: bool,
     failed: Option<String>,
 }
@@ -525,7 +375,7 @@ impl Input {
     pub fn new() -> Arc<Input> {
         Arc::new(Input {
             pending: Mutex::new(Pending {
-                queue: crate::keys::InputQueue::new(),
+                queue: crate::vt_keys::InputQueue::new(),
                 closed: false,
                 failed: None,
             }),
@@ -539,7 +389,7 @@ impl Input {
     ///
     /// A writer that has DIED is an error rather than a refusal. The two look
     /// identical from a full queue — bytes going nowhere either way — but they
-    /// are not the same news: §10 defines `false` as "that sequence did not
+    /// are not the same news: td-term/DESIGN.md §2 defines `false` as "that sequence did not
     /// fit, ring the bell", and a terminal that beeps at every keystroke
     /// because its writer is gone would be reporting the wrong one forever.
     /// An explicit [`Input::close`] outranks both.
@@ -561,10 +411,10 @@ impl Input {
         Ok(admitted)
     }
 
-    /// What the writer would send next, for tests that have no writer. The
-    /// production drain is the writer thread's, and it is the queue rather
-    /// than the descriptor that the main loop's half of this is about.
-    #[cfg(test)]
+    /// Test support, public because a consumer's tests are another crate:
+    /// what the writer would send next, taken, for tests that have no
+    /// writer. The production drain is the writer thread's.
+    #[doc(hidden)]
     pub fn take_for_test(&self) -> Vec<u8> {
         let Ok(mut pending) = self.pending.lock() else {
             return Vec::new();
@@ -593,7 +443,7 @@ impl Input {
     /// td-term's teardown is process exit rather than a join, exactly as it is
     /// for the reader.
     // Not on td-term's own teardown path, which is process exit rather than a
-    // close (§12), so this is exercised by tests and by whatever ends a
+    // close (td-term/DESIGN.md §4), so this is exercised by tests and by whatever ends a
     // terminal without ending the process.
     #[allow(dead_code)]
     pub fn close(&self) -> Result<(), String> {
@@ -679,7 +529,7 @@ fn spawn_pump<W: Write + Send + 'static>(
     input: Arc<Input>,
 ) -> Result<JoinHandle<Result<(), String>>, String> {
     thread::Builder::new()
-        .name("td-term-pty-input".into())
+        .name("pty-input".into())
         .spawn(move || {
             let outcome = pump(&mut sink, &input);
             if let Err(failure) = &outcome {
@@ -707,15 +557,18 @@ pub fn exit_channel<T>() -> (SyncSender<T>, Receiver<T>) {
 /// closure on failure, and dropping a `Child` neither signals nor reaps. Losing
 /// it that way would leave a live process holding the slave — no hangup for the
 /// reader, and a zombie once it exits.
+///
+/// `notify` runs after the send, as the reader's does.
 pub fn spawn_waiter<T: Send + 'static>(
     child: Child,
     sender: SyncSender<T>,
     wrap: fn(Waited) -> T,
+    notify: impl Fn() + Send + 'static,
 ) -> Result<JoinHandle<Result<(), String>>, String> {
     let held = Arc::new(Mutex::new(Some(child)));
     let carried = Arc::clone(&held);
     let spawned = thread::Builder::new()
-        .name("td-term-child".into())
+        .name("pty-child".into())
         .spawn(move || {
             let waited = carried
                 .lock()
@@ -735,6 +588,7 @@ pub fn spawn_waiter<T: Send + 'static>(
             // Deliberately ignored: a closed receiver means the main loop is
             // already gone, which is not this thread's problem to report.
             let _ = sender.send(wrap(message));
+            notify();
             waited.map(|_| ())
         });
     match spawned {
@@ -763,47 +617,11 @@ fn reap_unwatched(held: &Mutex<Option<Child>>, cause: &str) -> String {
     }
 }
 
-/// The packaged binary's own check of the PTY policy layer. It opens no device:
-/// the live ioctl round trip is a host test, because the target selftest runs
-/// wherever the artifact does, including where devpts is not mounted.
+/// The packaged binary's own check of the grid arithmetic and the
+/// `winsize` field order. It opens no device: the live ioctl round trip is
+/// a host test, because a target selftest runs wherever the artifact does,
+/// including where devpts is not mounted.
 pub fn selftest() -> Result<(), String> {
-    let account = account(
-        "root:x:0:0:root:/root:/bin/sh\ntd:x:1000:1000::/var/home/td:/bin/sh\n",
-        1000,
-    )?;
-    if account.name != "td" || account.home != "/var/home/td" {
-        return Err("PTY selftest selected the wrong account".into());
-    }
-    if effective_uid("Name:\tsh\nUid:\t1000\t1000\t1000\t1000\n")? != 1000 {
-        return Err("PTY selftest misread its own uid".into());
-    }
-    let environment = environment(&account, None, "/run/td-compositor/1000/wayland-0");
-    let named = |name: &str| {
-        let mut value = None;
-        for (key, candidate) in &environment {
-            if key == name {
-                value = Some(candidate.as_str());
-            }
-        }
-        value
-    };
-    if named("TERM") != Some("td-term")
-        || named("XDG_RUNTIME_DIR") != Some("/run/user/1000")
-        || named("HOME") != Some("/var/home/td")
-        || environment.len() != 10
-    {
-        return Err("PTY selftest built the wrong child environment".into());
-    }
-    let command = child_command(Path::new(CTTYHACK), &[])?;
-    if command.program != Path::new(CTTYHACK)
-        || command.arguments
-            != vec![
-                OsString::from(CTTYHACK_STDIN),
-                OsString::from(DEFAULT_SHELL),
-            ]
-    {
-        return Err("PTY selftest composed the wrong child command".into());
-    }
     let size = grid_size(24, 80)?;
     if (size.rows, size.columns) != (24, 80)
         || grid_size(0, 80).is_ok()
@@ -811,6 +629,8 @@ pub fn selftest() -> Result<(), String> {
         || grid_size(1, 65_536).is_ok()
         || grid_for_tile(512, 320, 8, 16)? != (20, 64)
         || grid_for_tile(3, 3, 8, 16)? != (1, 1)
+        || winsize_words(size) != [24, 80, 0, 0]
+        || winsize_from_words([24, 80, 0, 0]) != size
     {
         return Err("PTY selftest derived the wrong grid".into());
     }
@@ -818,49 +638,24 @@ pub fn selftest() -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
 
-    #[test]
-    fn the_child_is_told_where_the_control_socket_is() {
-        // `spawn` clears the environment and sets exactly what this returns,
-        // so a variable missing here is missing from the shell — which is how
-        // `td-ctl` came to need `--socket` on a machine that already knew the
-        // path. Absent when there is none, so a session without a control
-        // socket does not advertise one.
-        let account = Account {
-            name: "tester".into(),
-            uid: 1000,
-            home: "/var/home/tester".into(),
-        };
-        let without = environment(&account, None, "/run/td-compositor/1000/wayland-0");
-        assert!(
-            !without.iter().any(|(name, _)| name == "TD_CONTROL_SOCKET"),
-            "a session with no control socket advertised one"
-        );
-        let with = environment(
-            &account,
-            Some("/run/td-compositor/1000/td-control"),
-            "/run/td-compositor/1000/wayland-0",
-        );
-        assert_eq!(
-            with.iter()
-                .find(|(name, _)| name == "TD_CONTROL_SOCKET")
-                .map(|(_, value)| value.as_str()),
-            Some("/run/td-compositor/1000/td-control"),
-            "the shell was not told where the control socket is"
-        );
-        // And it is the only difference, so nothing else changed shape.
-        assert_eq!(with.len(), without.len() + 1);
-    }
     use super::*;
     use std::io::Read;
     use std::time::Duration;
 
-    const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\n\
-                          td:x:1000:1000:td user:/var/home/td:/bin/sh\n";
+    /// A constructed environment, as a terminal's own policy would pass:
+    /// `spawn` sets exactly this and nothing inherited.
+    fn fixture_environment() -> Vec<(String, String)> {
+        vec![
+            ("PATH".into(), "/bin".into()),
+            ("TERM".into(), "td-term".into()),
+        ]
+    }
 
     fn open_pty() -> Pty {
-        Pty::open(Path::new(DEV_PTMX)).unwrap_or_else(|error| {
+        Pty::open().unwrap_or_else(|error| {
             panic!("this host cannot provide a PTY, which td-term requires: {error}")
         })
     }
@@ -888,146 +683,6 @@ mod tests {
         assert!(grid_for_tile(512, 320, 8, 0).is_err());
     }
 
-    #[test]
-    fn the_effective_uid_is_the_one_taken_from_process_status() {
-        let status = "Name:\ttd-term\nUid:\t0\t1000\t1000\t1000\nGid:\t0\t1000\t1000\t1000\n";
-        assert_eq!(effective_uid(status).unwrap(), 1000);
-        assert!(effective_uid("Name:\ttd-term\n").is_err());
-        assert!(effective_uid("Uid:\t1000\n").is_err());
-        assert!(effective_uid("Uid:\t1000\tnope\n").is_err());
-    }
-
-    #[test]
-    fn the_account_must_be_unique_well_formed_and_present() {
-        let account = account(PASSWD, 1000).unwrap();
-        assert_eq!(
-            account,
-            Account {
-                uid: 1000,
-                name: "td".into(),
-                home: "/var/home/td".into(),
-            }
-        );
-        assert!(account_error(PASSWD, 1001).contains("no entry for uid 1001"));
-        let duplicate = format!("{PASSWD}other:x:1000:1000::/var/home/other:/bin/sh\n");
-        assert!(account_error(&duplicate, 1000).contains("more than one entry"));
-        assert!(account_error("td:x:1000:1000::/var/home/td\n", 1000).contains("6 fields"));
-        assert!(
-            account_error(":x:1000:1000::/var/home/td:/bin/sh\n", 1000).contains("no user name")
-        );
-        assert!(
-            account_error("td:x:1000:1000::var/home/td:/bin/sh\n", 1000).contains("relative home")
-        );
-        assert!(account_error("td:x:x:1000::/var/home/td:/bin/sh\n", 1000).contains("non-numeric"));
-        // Whole-file strictness reaches a blank line too: it is a line td
-        // cannot account for, and the entry being looked up may sit after it.
-        // `lines()` drops the trailing newline, so a well-formed file has none.
-        let blank = format!("\n{PASSWD}");
-        assert!(account_error(&blank, 1000).contains("line 1 has 1 fields"));
-        let internal = PASSWD.replace("td:x:1000", "\ntd:x:1000");
-        assert!(account_error(&internal, 1000).contains("1 fields"));
-    }
-
-    fn account_error(passwd: &str, uid: u32) -> String {
-        account(passwd, uid).unwrap_err()
-    }
-
-    #[test]
-    fn the_child_environment_is_constructed_rather_than_inherited() {
-        let account = account(PASSWD, 1000).unwrap();
-        let environment = environment(&account, None, "/run/td-compositor/1000/wayland-0");
-        let names: Vec<&str> = environment.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec![
-                "COLORTERM",
-                "HOME",
-                "LOGNAME",
-                "PATH",
-                "SHELL",
-                "TERM",
-                "TERMINFO",
-                "USER",
-                "WAYLAND_DISPLAY",
-                "XDG_RUNTIME_DIR",
-            ]
-        );
-        let value = |name: &str| {
-            let mut found = None;
-            for (key, candidate) in &environment {
-                if key == name {
-                    found = Some(candidate.clone());
-                }
-            }
-            found.unwrap()
-        };
-        assert_eq!(value("TERM"), "td-term");
-        assert_eq!(value("HOME"), "/var/home/td");
-        assert_eq!(value("USER"), "td");
-        assert_eq!(value("LOGNAME"), "td");
-        assert_eq!(value("XDG_RUNTIME_DIR"), "/run/user/1000");
-        assert_eq!(
-            value("WAYLAND_DISPLAY"),
-            "/run/td-compositor/1000/wayland-0"
-        );
-        assert_eq!(value("TERMINFO"), "/etc/terminfo");
-    }
-
-    #[test]
-    fn the_default_child_is_the_shell_through_cttyhack() {
-        let default = child_command(Path::new(CTTYHACK), &[]).unwrap();
-        assert_eq!(default.program, PathBuf::from("/bin/cttyhack"));
-        assert_eq!(default.arguments, vec!["--stdin", "/bin/sh"]);
-        assert!(child_command(Path::new("cttyhack"), &[]).is_err());
-    }
-
-    #[test]
-    fn an_explicit_command_is_literal_argv_without_the_wrapper() {
-        use std::os::unix::ffi::OsStringExt;
-        let words = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        let explicit = child_command(
-            Path::new(CTTYHACK),
-            &words(&["/bin/mail", "--cli", "echo hi"]),
-        )
-        .unwrap();
-        assert_eq!(explicit.program, PathBuf::from("/bin/mail"));
-        assert_eq!(explicit.arguments, vec!["--cli", "echo hi"]);
-        // A caller that wants the wrapper spells it out and gets exactly that.
-        let wrapped = child_command(
-            Path::new(CTTYHACK),
-            &words(&[CTTYHACK, CTTYHACK_STDIN, "/bin/sh"]),
-        )
-        .unwrap();
-        assert_eq!(wrapped.program, PathBuf::from(CTTYHACK));
-        assert_eq!(wrapped.arguments, vec!["--stdin", "/bin/sh"]);
-        // Literal means bytes: an argument that is not UTF-8 is carried as-is.
-        let raw = OsString::from_vec(vec![0x2f, 0x74, 0x6d, 0x70, 0x2f, 0xff]);
-        let bytes = child_command(
-            Path::new(CTTYHACK),
-            &[OsString::from("/bin/mail"), raw.clone()],
-        )
-        .unwrap();
-        assert_eq!(bytes.arguments, vec![raw]);
-        assert!(child_command(Path::new(CTTYHACK), &words(&["sh"])).is_err());
-        // The wrapper's own path is checked even when the command does not use it.
-        assert!(child_command(Path::new("cttyhack"), &words(&["/bin/mail"])).is_err());
-    }
-
-    #[test]
-    fn current_account_reads_the_live_process_and_account_files() {
-        let directory =
-            std::env::temp_dir().join(format!("td-term-account-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let passwd = directory.join("passwd");
-        std::fs::write(&passwd, PASSWD).unwrap();
-        let status = directory.join("status");
-        std::fs::write(&status, "Uid:\t1000\t1000\t1000\t1000\n").unwrap();
-        assert_eq!(current_account(&status, &passwd).unwrap().name, "td");
-        std::fs::write(&status, "Uid:\t1000\t4242\t4242\t4242\n").unwrap();
-        assert!(current_account(&status, &passwd).is_err());
-        std::fs::remove_dir_all(&directory).unwrap();
-    }
-
     /// The peer comes from the master, and the size the master publishes is the
     /// size the slave — the child's own descriptor — reports back.
     #[test]
@@ -1036,11 +691,11 @@ mod tests {
         let observed = pty.resize(24, 80).unwrap();
         assert_eq!((observed.rows, observed.columns), (24, 80));
         let slave = pty.peer().unwrap();
-        let from_slave = sys::window_size(&slave).unwrap();
+        let from_slave = window_size(&slave).unwrap();
         assert_eq!((from_slave.rows, from_slave.columns), (24, 80));
         // A later resize reaches the same already-open slave.
         pty.resize(40, 100).unwrap();
-        let from_slave = sys::window_size(&slave).unwrap();
+        let from_slave = window_size(&slave).unwrap();
         assert_eq!((from_slave.rows, from_slave.columns), (40, 100));
         assert!(pty.resize(0, 80).is_err());
     }
@@ -1054,11 +709,11 @@ mod tests {
         let mut slave = pty.peer().unwrap();
         let master = pty.master().try_clone().unwrap();
         let (sender, receiver) = output_channel();
-        let reader = spawn_reader(master, sender, std::convert::identity).unwrap();
+        let reader = spawn_reader(master, sender, std::convert::identity, || {}).unwrap();
 
         // Through the bounded queue, as the writer thread will: the queue is
         // what makes a partial write recoverable.
-        let mut queue = crate::keys::InputQueue::new();
+        let mut queue = crate::vt_keys::InputQueue::new();
         assert!(queue.push(b"input\n"));
         write_input(pty.master(), &mut queue).unwrap();
         assert!(queue.is_empty(), "the writer consumed only what it wrote");
@@ -1127,15 +782,14 @@ mod tests {
                 "--nocapture".into(),
             ],
         };
-        let account = account(PASSWD, 1000).unwrap();
-        let mut environment = environment(&account, None, "/run/td-compositor/1000/wayland-0");
+        let mut environment = fixture_environment();
         environment.push((FIXTURE.into(), "1".into()));
         let home = std::env::temp_dir();
         let mut child = spawn(&command, &environment, &home, slave).unwrap();
 
         let master = pty.into_master();
         let (sender, receiver) = output_channel();
-        let reader = spawn_reader(master, sender, std::convert::identity).unwrap();
+        let reader = spawn_reader(master, sender, std::convert::identity, || {}).unwrap();
         let mut seen = String::new();
         let marker = loop {
             match receiver.recv_timeout(Duration::from_secs(30)) {
@@ -1164,7 +818,7 @@ mod tests {
         // `spawn`: setting HOME does not move a child, so this is what proves
         // the shell starts where its own environment says it does.
         let home = home.canonicalize().unwrap();
-        assert_eq!(marker, format!("31 97 td-term 11 {}", home.display()));
+        assert_eq!(marker, format!("31 97 td-term 3 {}", home.display()));
         let status = child.wait().unwrap();
         assert!(
             status.success(),
@@ -1187,7 +841,7 @@ mod tests {
         if std::env::var_os(FIXTURE).is_none() {
             return;
         }
-        let size = sys::window_size(&std::io::stdin()).unwrap();
+        let size = window_size(&std::io::stdin()).unwrap();
         let term = std::env::var("TERM").unwrap_or_default();
         let count = std::env::vars_os().count();
         let directory = std::env::current_dir().unwrap();
@@ -1284,8 +938,7 @@ mod tests {
                 "--nocapture".into(),
             ],
         };
-        let account = account(PASSWD, 1000).unwrap();
-        let mut environment = environment(&account, None, "/run/td-compositor/1000/wayland-0");
+        let mut environment = fixture_environment();
         environment.push((SILENT_FIXTURE.into(), "1500".into()));
         // `spawn` consumes the slave and both clones into the child's stdio,
         // so the child is the only holder and its exit is the last close.
@@ -1298,7 +951,7 @@ mod tests {
         // to keep moving or the CHILD blocks in its own write — a deadlock of
         // this test's making rather than anything about the writer.
         let (chunks, output) = output_channel();
-        let reader = spawn_reader(master, chunks, std::convert::identity).unwrap();
+        let reader = spawn_reader(master, chunks, std::convert::identity, || {}).unwrap();
         let drain = thread::spawn(move || while output.recv().is_ok() {});
 
         let sequence = vec![b'z'; 1024];
@@ -1315,7 +968,7 @@ mod tests {
             .unwrap();
 
         let (sender, receiver) = exit_channel();
-        spawn_waiter(child, sender, std::convert::identity).unwrap();
+        spawn_waiter(child, sender, std::convert::identity, || {}).unwrap();
         assert!(matches!(
             receiver.recv_timeout(Duration::from_secs(30)),
             Ok(Waited::Exited(_))
@@ -1371,7 +1024,7 @@ mod tests {
     }
 
     /// A writer that died is not a full queue. Both look like bytes going
-    /// nowhere, but §10's `false` means "ring the bell", and a session whose
+    /// nowhere, but td-term/DESIGN.md §2's `false` means "ring the bell", and a session whose
     /// writer is gone would ring it at every keystroke forever.
     #[test]
     fn a_dead_writer_is_reported_to_the_next_push() {
@@ -1521,7 +1174,7 @@ mod tests {
             if !input.push(&sequence).unwrap() {
                 break;
             }
-            assert!(input.queued().unwrap() <= crate::keys::MAX_INPUT_BYTES);
+            assert!(input.queued().unwrap() <= crate::vt_keys::MAX_INPUT_BYTES);
         }
         input.close().unwrap();
         drop(_slave);
@@ -1551,10 +1204,10 @@ mod tests {
         }
         let queued = input.queued().unwrap();
         assert_eq!(queued, admitted * sequence.len());
-        assert!(queued <= crate::keys::MAX_INPUT_BYTES);
+        assert!(queued <= crate::vt_keys::MAX_INPUT_BYTES);
         // The refusal is the queue being unable to take a WHOLE sequence, not
         // it being full: there is room left, just not this much.
-        assert!(queued + sequence.len() > crate::keys::MAX_INPUT_BYTES);
+        assert!(queued + sequence.len() > crate::vt_keys::MAX_INPUT_BYTES);
     }
 
     #[test]
@@ -1571,18 +1224,17 @@ mod tests {
                 "--nocapture".into(),
             ],
         };
-        let account = account(PASSWD, 1000).unwrap();
-        let mut environment = environment(&account, None, "/run/td-compositor/1000/wayland-0");
+        let mut environment = fixture_environment();
         environment.push((FIXTURE.into(), "1".into()));
         let child = spawn(&command, &environment, &std::env::temp_dir(), slave).unwrap();
 
         let (sender, receiver) = exit_channel();
-        let waiter = spawn_waiter(child, sender, std::convert::identity).unwrap();
+        let waiter = spawn_waiter(child, sender, std::convert::identity, || {}).unwrap();
         // Drain the master so the fixture's own output cannot fill the buffer
         // and stall the exit this is waiting for.
         let master = pty.into_master();
         let (chunks, output) = output_channel();
-        let reader = spawn_reader(master, chunks, std::convert::identity).unwrap();
+        let reader = spawn_reader(master, chunks, std::convert::identity, || {}).unwrap();
 
         let Waited::Exited(status) = receiver
             .recv_timeout(Duration::from_secs(30))
@@ -1623,8 +1275,7 @@ mod tests {
                 "--nocapture".into(),
             ],
         };
-        let account = account(PASSWD, 1000).unwrap();
-        let mut environment = environment(&account, None, "/run/td-compositor/1000/wayland-0");
+        let mut environment = fixture_environment();
         // A child that outlives this test by a wide margin, because the kill
         // is the half a self-exiting fixture cannot prove: reaping one that
         // was never signalled would simply wait for it and still pass. In
@@ -1651,7 +1302,7 @@ mod tests {
     }
 
     #[test]
-    fn the_selftest_covers_the_policy_layer() {
+    fn the_selftest_covers_the_grid_and_the_field_order() {
         selftest().unwrap();
     }
 }

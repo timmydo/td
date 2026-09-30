@@ -1,5 +1,5 @@
 use super::*;
-use crate::keys;
+use crate::vt_keys as keys;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -538,7 +538,7 @@ fn twenty_four_bit_and_indexed_colors_reach_the_pixels() {
 
 #[test]
 fn a_glyph_the_face_lacks_renders_a_visible_replacement() {
-    // DESIGN section 10: a missing glyph renders a visible replacement cell
+    // td-term/DESIGN.md §2: a missing glyph renders a visible replacement cell
     // rather than a blank one.
     let missing = char::from_u32(0x10_fffd).unwrap();
     assert!(!face().covers(missing));
@@ -956,10 +956,10 @@ fn from_ppm_keeps_a_payload_whose_first_byte_is_whitespace() {
 
 // ---------------------------------------------------------------- goldens
 
-const GOLDEN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/spec/render");
-/// Section 14's "beneath the build's temporary output": the crate's own
-/// target directory, so parallel worktrees cannot collide on it and no
-/// shared `/tmp` name has to be trusted.
+const GOLDEN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/spec/vt_render");
+/// td-term/DESIGN.md §6's "beneath the build's temporary output": the
+/// crate's own target directory, so parallel worktrees cannot collide on it
+/// and no shared `/tmp` name has to be trusted.
 const DIFF_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/render-diff");
 
 /// The first differing coordinate and a high-contrast diff image: white
@@ -987,8 +987,8 @@ fn diff_frames(pixels: &[u8], wanted: &[u8], width: usize) -> (Option<(usize, us
     (first, diff)
 }
 
-/// Section 14's oracle: compare against the committed image, and on a
-/// mismatch report the first differing coordinate and leave the actual
+/// td-term/DESIGN.md §6's oracle: compare against the committed image, and
+/// on a mismatch report the first differing coordinate and leave the actual
 /// frame plus a high-contrast diff under the build's temporary output.
 fn assert_golden(name: &str, expected: &[u8], pixels: &[u8], width: usize, height: usize) {
     let actual = ppm(pixels, width, height).unwrap();
@@ -1041,7 +1041,7 @@ macro_rules! golden {
             let (pixels, width, height) = $body;
             assert_golden(
                 $name,
-                include_bytes!(concat!("../spec/render/", $name, ".ppm")),
+                include_bytes!(concat!("../spec/vt_render/", $name, ".ppm")),
                 &pixels,
                 width,
                 height,
@@ -1196,7 +1196,7 @@ fn selftest_renders_the_pinned_face_and_round_trips_through_p6() {
     clippy::panic,
     clippy::indexing_slicing
 )]
-#[path = "../../td-ui/tests/fonts/mod.rs"]
+#[path = "../tests/fonts/mod.rs"]
 mod fonts;
 
 use crate::face::Face;
@@ -1415,41 +1415,6 @@ fn an_outline_glyph_larger_than_its_cell_stays_inside_it() {
             "({row}, {column})"
         );
     }
-}
-
-#[test]
-fn td_term_loads_four_styles_unless_the_setting_asks_for_the_bitmap_face() {
-    let dir = std::env::temp_dir().join(format!("td-term-outline-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    for (name, style) in [
-        (crate::face_file::REGULAR, outline_style(0, 0, 500, 500)),
-        (crate::face_file::BOLD, outline_style(0, 0, 250, 250)),
-        (crate::face_file::ITALIC, outline_style(250, 0, 500, 250)),
-        (
-            crate::face_file::BOLD_ITALIC,
-            outline_style(0, 250, 250, 500),
-        ),
-    ] {
-        std::fs::write(dir.join(name), &*style).unwrap();
-    }
-    let load = |setting: Option<&str>| {
-        let setting = setting.map(std::ffi::OsString::from);
-        crate::term_client::outline_face_from(&dir, face(), setting.as_deref())
-    };
-    let loaded = load(None).expect("the four styles load");
-    assert_eq!(
-        (loaded.cell().width, loaded.cell().height),
-        (face().width(), face().height())
-    );
-    assert_eq!(loaded.style(true, true), crate::atlas::Style::BoldItalic);
-    assert!(load(Some("outline")).is_some());
-    assert!(load(Some("bitmap")).is_none());
-    // A style missing is the whole face refused: the terminal draws in
-    // Unifont rather than in a face that cannot draw every rendition.
-    std::fs::remove_file(dir.join(crate::face_file::ITALIC)).unwrap();
-    assert!(load(None).is_none());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

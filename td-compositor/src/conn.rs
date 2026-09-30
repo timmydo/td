@@ -1,14 +1,12 @@
 //! The Wayland client transport, and the object-id map its users share.
 //!
-//! Extracted from the demo client so the terminal is a second USER of one
-//! connection rather than a second copy of it. Nothing here knows what is
+//! Extracted from the demo client. Nothing here knows what is
 //! being drawn: it connects, allocates and recycles object ids, frames
 //! messages, carries descriptors, and answers the three events every client
 //! must answer identically — the display's protocol error, its `delete_id`,
 //! and the shell's ping.
 
 use crate::keyboard::XKB_KEYMAP;
-use crate::render::BYTES_PER_PIXEL;
 use crate::{sys, wire};
 use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -20,6 +18,10 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Bytes in one `wl_shm` XRGB8888 pixel, the only format this transport
+/// presents.
+pub const BYTES_PER_PIXEL: usize = 4;
 
 pub const DISPLAY: u32 = 1;
 pub const REGISTRY: u32 = 2;
@@ -63,7 +65,6 @@ pub struct Globals {
     shm: Option<Global>,
     xdg_wm_base: Option<Global>,
     seat: Option<Global>,
-    data_device_manager: Option<Global>,
 }
 
 impl Globals {
@@ -81,10 +82,6 @@ impl Globals {
 
     pub fn seat(&self) -> Option<Global> {
         self.seat
-    }
-
-    pub fn data_device_manager(&self) -> Option<Global> {
-        self.data_device_manager
     }
 
     pub fn record(&mut self, name: u32, interface: &str, version: u32) {
@@ -109,13 +106,6 @@ impl Globals {
             }
             "wl_seat" if self.seat.is_none_or(|current| version > current.version) => {
                 self.seat = Some(global)
-            }
-            "wl_data_device_manager"
-                if self
-                    .data_device_manager
-                    .is_none_or(|current| version > current.version) =>
-            {
-                self.data_device_manager = Some(global)
             }
             _ => {}
         }
@@ -147,64 +137,10 @@ pub struct Connection {
     free_ids: BTreeSet<u32>,
     pending_fds: VecDeque<RawFd>,
     incoming: [u8; RECEIVE_BUFFER_BYTES],
-    /// Whether the reading half has moved to a thread. Reading from both
-    /// would split a message between them.
-    reader_detached: bool,
-}
-
-/// The reading half of a connection, once it has been detached. Owns a second
-/// handle on the same socket, the bytes already read past the last message,
-/// and any descriptors that arrived unclaimed — so nothing a `Connection` had
-/// buffered is lost by moving reads to a thread.
-pub struct Reader {
-    stream: UnixStream,
-    buffered: Vec<u8>,
-    pending_fds: VecDeque<RawFd>,
-    incoming: [u8; RECEIVE_BUFFER_BYTES],
-}
-
-impl Drop for Reader {
-    fn drop(&mut self) {
-        discard_fds(&mut self.pending_fds);
-    }
-}
-
-impl Reader {
-    pub fn next(&mut self) -> Result<wire::Message, String> {
-        // No deadline, and that is not an omission: detaching requires the
-        // handshake to have finished, which is the only thing a deadline
-        // bounds. A running client waits as long as the compositor is quiet.
-        read_next(
-            &self.stream,
-            &mut self.buffered,
-            &mut self.pending_fds,
-            &mut self.incoming,
-            None,
-        )
-    }
-
-    /// How many descriptors arrived that nobody claimed. The terminal takes
-    /// its keymap descriptor and no other, so a leftover is a compositor
-    /// sending one nothing asked for.
-    pub fn pending_fd_count(&self) -> usize {
-        self.pending_fds.len()
-    }
-
-    /// Claim the exact descriptor carried by the event just read. A selection
-    /// endpoint may be a pipe or socket; its open-file description is the
-    /// capability the destination supplied.
-    pub fn take_file(&mut self, purpose: &str) -> Result<File, String> {
-        let fd = self
-            .pending_fds
-            .pop_front()
-            .ok_or_else(|| format!("{purpose} event arrived without a descriptor"))?;
-        let endpoint = sys::ReceivedFd::adopt(fd)?;
-        Ok(sys::ReceivedFd::into_file(endpoint))
-    }
 }
 
 /// Write one source payload without letting an adversarial destination park
-/// td-term's sole writer forever. `O_NONBLOCK` is restored even on failure
+/// the sole writer forever. `O_NONBLOCK` is restored even on failure
 /// because the receiver may have retained a duplicate of the endpoint.
 pub fn write_clipboard(file: &mut File, bytes: &[u8]) -> Result<(), String> {
     write_clipboard_with_timeout(file, bytes, CLIPBOARD_WRITE_TIMEOUT)
@@ -266,9 +202,8 @@ fn write_clipboard_with_timeout(
 /// The whole wl_keyboard keymap check: format, announced size, the file's own
 /// size, and its bytes against td's pinned keymap plus its NUL.
 ///
-/// It lives here rather than in a client because BOTH clients need it — the
-/// demo and the terminal — and a validation copied is a validation that stays
-/// correct until exactly one copy is fixed.
+/// It lives with the transport rather than in the demo so the check is one
+/// function beside the keymap it compares against.
 pub fn verify_keymap(file: &File, format: u32, size: u32) -> Result<(), String> {
     if format != 1 {
         return Err(format!("unsupported wl_keyboard keymap format {format}"));
@@ -307,7 +242,7 @@ pub fn verify_keymap(file: &File, format: u32, size: u32) -> Result<(), String> 
     Ok(())
 }
 
-/// POSITIONED reads, which is §11's rule and not a style choice. The
+/// POSITIONED reads, which is td-term/DESIGN.md §3's rule and not a style choice. The
 /// compositor sends every client a duplicate of ONE open file description, so
 /// on the wire the read offset is SHARED, and a sequential read would leave it
 /// at end-of-file for whoever binds a keyboard next.
@@ -361,24 +296,13 @@ fn read_keymap_bytes(file: &File, expected_size: usize) -> Result<Vec<u8>, Strin
     Ok(bytes)
 }
 
-/// Send an event carrying a descriptor, for tests that need a client to
-/// RECEIVE one. It lives here because this is a module the descriptor roster
-/// already names: `term_client.rs` reaches no confined syscall, and a test
-/// there spelling one would be a roster change rather than a test.
-#[cfg(test)]
-pub fn send_event_with_fd(peer: &UnixStream, bytes: &[u8], file: &File) -> std::io::Result<()> {
-    sys::send_with_fd(peer, bytes, file.as_raw_fd())
-}
-
 fn discard_fds(fds: &mut VecDeque<RawFd>) {
     while let Some(fd) = fds.pop_front() {
         sys::discard_received(&[fd]);
     }
 }
 
-/// One event, from whichever half is doing the reading. A free function over
-/// the pieces rather than a method, so `Connection` and `Reader` cannot drift
-/// into two dialects of the same parser.
+/// One event from the connection's reading state.
 fn read_next(
     stream: &UnixStream,
     buffered: &mut Vec<u8>,
@@ -512,7 +436,6 @@ impl Connection {
             free_ids: BTreeSet::new(),
             pending_fds: VecDeque::new(),
             incoming: [0; RECEIVE_BUFFER_BYTES],
-            reader_detached: false,
         }
     }
 
@@ -553,9 +476,6 @@ impl Connection {
     }
 
     pub fn next(&mut self) -> Result<wire::Message, String> {
-        if self.reader_detached {
-            return Err("Wayland events are being read on another thread".into());
-        }
         read_next(
             &self.stream,
             &mut self.buffered,
@@ -563,47 +483,6 @@ impl Connection {
             &mut self.incoming,
             self.deadline,
         )
-    }
-
-    /// Hand the reading half to another thread, and stop reading here.
-    ///
-    /// Wayland reads BLOCK, and a client whose main loop has a second source
-    /// to serve — a terminal with a child on a PTY — cannot afford to block
-    /// in one of them. Every WRITE stays with the connection, so request
-    /// order remains the property of one thread rather than something two
-    /// have to agree about; what moves is the socket handle for reading, the
-    /// bytes already buffered, and any descriptors already received.
-    ///
-    /// Detaching is one-way, which is what makes "who reads" answerable by
-    /// looking rather than by reasoning: this connection refuses to read
-    /// afterwards, so a second reader cannot appear by accident and take
-    /// half of a message the first is waiting for.
-    pub fn detach_reader(&mut self) -> Result<Reader, String> {
-        if self.reader_detached {
-            return Err("the Wayland reading half was already detached".into());
-        }
-        // Only after the handshake, and that is a real constraint rather than
-        // a convention. `read_next` SETS the socket's read timeout from a
-        // live deadline and never clears it, so a connection whose deadline
-        // went away while a timeout stayed behind would give the reader a
-        // thread that wakes with `TimedOut` on a compositor that is merely
-        // quiet. `finish_handshake` clears both together and is the only way
-        // to clear either, so requiring it here is what makes that pairing a
-        // property instead of an ordering somebody has to remember.
-        if self.deadline.is_some() {
-            return Err("the Wayland reading half detached before the handshake finished".into());
-        }
-        let stream = self
-            .stream
-            .try_clone()
-            .map_err(|e| format!("clone the Wayland connection for reading: {e}"))?;
-        self.reader_detached = true;
-        Ok(Reader {
-            stream,
-            buffered: std::mem::take(&mut self.buffered),
-            pending_fds: std::mem::take(&mut self.pending_fds),
-            incoming: [0; RECEIVE_BUFFER_BYTES],
-        })
     }
 
     pub fn handle_common(&mut self, message: &wire::Message) -> Result<bool, String> {
@@ -874,7 +753,7 @@ pub fn attach_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{Seek, SeekFrom};
     use std::os::fd::{IntoRawFd, OwnedFd};
     use std::time::Duration;
     #[test]
@@ -885,8 +764,9 @@ mod tests {
         assert_eq!(error, "wl_keyboard keymap must be a regular file");
     }
 
-    /// The read leaves the offset exactly where it found it, which is §11's
-    /// rule stated as the property rather than as a mechanism. Reading twice
+    /// The read leaves the offset exactly where it found it, which is
+    /// td-term/DESIGN.md §3's rule stated as the property rather than as a
+    /// mechanism. Reading twice
     /// is not enough on its own: an implementation that SEEKS to zero and then
     /// reads sequentially answers twice and still leaves the description at
     /// end-of-file for whoever holds it next.
@@ -938,25 +818,6 @@ mod tests {
         assert!(error.contains("read 17 bytes, expected 16"));
     }
 
-    fn event(object: u32, opcode: u16, payload: &[u8]) -> Vec<u8> {
-        let mut builder = wire::Builder::new();
-        for word in payload.chunks(4) {
-            let mut bytes = [0u8; 4];
-            for (target, source) in bytes.iter_mut().zip(word) {
-                *target = *source;
-            }
-            builder.u32(u32::from_ne_bytes(bytes));
-        }
-        builder.message(object, opcode).unwrap()
-    }
-
-    fn pair() -> (Connection, UnixStream) {
-        let (ours, theirs) = UnixStream::pair().unwrap();
-        ours.set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        (Connection::over(ours, None, 10), theirs)
-    }
-
     #[test]
     fn a_full_clipboard_endpoint_times_out_and_restores_blocking_status() {
         let (mut endpoint, _receiver) = UnixStream::pair().unwrap();
@@ -983,129 +844,5 @@ mod tests {
         let flags = sys::make_nonblocking(&endpoint).unwrap();
         assert_eq!(flags & 0o4000, 0, "blocking status was not restored");
         sys::restore_status_flags(&endpoint, flags).unwrap();
-    }
-
-    /// Detaching moves the bytes already READ but not yet parsed, and what
-    /// puts bytes there is a SHORT read: `read_next` asks for exactly what
-    /// the message in hand still needs, so it never over-reads past one, but
-    /// a receive that returns less leaves a fragment behind. A detach that
-    /// handed over a bare descriptor would drop that fragment, and the
-    /// message it belongs to would then be parsed from its own middle.
-    ///
-    /// A first version of this test wrote two whole events and read one,
-    /// believing the second would be buffered. It is not — it stays in the
-    /// socket, which the reader inherits anyway — so that test passed
-    /// whether the buffer moved or not.
-    #[test]
-    fn detaching_carries_the_bytes_already_buffered() {
-        let (mut connection, mut peer) = pair();
-        let whole = event(7, 0, &9u32.to_ne_bytes());
-        let (head, tail) = whole.split_at(5);
-        peer.write_all(head).unwrap();
-
-        // Part of a message and no more: this read banks the fragment and
-        // then times out waiting for the rest of it.
-        connection
-            .set_read_timeout(Some(Duration::from_millis(250)))
-            .unwrap();
-        assert!(connection.next().is_err());
-
-        let mut reader = connection.detach_reader().unwrap();
-        peer.write_all(tail).unwrap();
-        let message = reader.next().unwrap();
-        assert_eq!(
-            (message.object, message.opcode),
-            (7, 0),
-            "the fragment did not survive the detach"
-        );
-        assert_eq!(message.payload, 9u32.to_ne_bytes().to_vec());
-    }
-
-    /// Two readers on one socket would split a message between them, and the
-    /// half each got would be unparseable in a different way. Detaching is
-    /// therefore one-way and stated in the errors rather than by convention.
-    #[test]
-    fn only_one_half_may_read() {
-        let (mut connection, mut peer) = pair();
-        peer.write_all(&event(7, 0, &3u32.to_ne_bytes())).unwrap();
-        let _reader = connection.detach_reader().unwrap();
-
-        let refused = connection.next().err().unwrap();
-        assert!(refused.contains("another thread"), "{refused}");
-        let refused = connection.detach_reader().err().unwrap();
-        assert!(refused.contains("already detached"), "{refused}");
-    }
-
-    /// Detaching before the handshake is over is refused, because
-    /// `read_next` sets the socket's read timeout from a deadline and never
-    /// clears it: a reader that inherited the socket after the deadline was
-    /// dropped but before the timeout was would wake with `TimedOut` on a
-    /// compositor that had simply said nothing.
-    #[test]
-    fn the_reading_half_detaches_only_after_the_handshake() {
-        let (ours, _peer) = UnixStream::pair().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut connection = Connection::over(ours, Some(deadline), 10);
-        let refused = connection.detach_reader().err().unwrap();
-        assert!(
-            refused.contains("before the handshake finished"),
-            "{refused}"
-        );
-
-        connection.finish_handshake().unwrap();
-        connection.detach_reader().unwrap();
-    }
-
-    /// Descriptors move with the reader, and the reader closes what it still
-    /// holds. Both halves matter and neither is visible from the protocol: a
-    /// queue left behind is a descriptor held open until the process ends,
-    /// and one carried but never closed is the same leak in a new place.
-    ///
-    /// The socket pair is the oracle — a peer reads end-of-file only once
-    /// EVERY handle on the other end is gone, so the read returning zero is
-    /// the reader's `Drop` having closed the one it carried.
-    #[test]
-    fn descriptors_move_with_the_reader_and_are_closed_by_it() {
-        let (mut connection, _peer) = pair();
-        let (held, mut watcher) = UnixStream::pair().unwrap();
-        connection.queue_fd_for_test(held.into_raw_fd());
-        assert_eq!(connection.pending_fd_count(), 1);
-
-        let reader = connection.detach_reader().unwrap();
-        assert_eq!(
-            connection.pending_fd_count(),
-            0,
-            "the connection kept a descriptor it had handed over"
-        );
-        assert_eq!(reader.pending_fd_count(), 1);
-
-        drop(reader);
-        watcher
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut byte = [0u8; 1];
-        assert_eq!(
-            watcher.read(&mut byte).unwrap(),
-            0,
-            "the reader did not close the descriptor it carried"
-        );
-    }
-
-    /// Writing is what stays behind. The whole point of detaching is that the
-    /// main loop keeps issuing requests while a thread blocks in a read, so a
-    /// connection that could no longer write would have gained nothing.
-    #[test]
-    fn a_detached_connection_still_writes() {
-        let (mut connection, mut peer) = pair();
-        let _reader = connection.detach_reader().unwrap();
-        connection.send(SURFACE, 6, wire::Builder::new()).unwrap();
-
-        peer.set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut said = [0u8; 8];
-        peer.read_exact(&mut said).unwrap();
-        let object = u32::from_ne_bytes([said[0], said[1], said[2], said[3]]);
-        let opcode = u16::from_ne_bytes([said[4], said[5]]);
-        assert_eq!((object, opcode), (SURFACE, 6));
     }
 }

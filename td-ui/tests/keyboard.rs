@@ -92,6 +92,19 @@ fn supplied_td_and_ordinary_us_maps_translate_editor_keys() {
             );
         }
         assert_eq!(chord(&map, 29, 4), None);
+        // Under Alt the chord lowercases its letter; the stroke keeps the
+        // case Shift and Caps Lock resolved, which a terminal sends.
+        for (mask, spelled, text) in [
+            (8, "M-a", 'a'),
+            (9, "M-S-a", 'A'),
+            (10, "M-a", 'A'),
+            (11, "M-S-a", 'a'),
+        ] {
+            let stroke = map.translate(30, state(mask)).unwrap().unwrap();
+            assert_eq!(stroke.chord, spelled, "mask={mask}");
+            assert_eq!(stroke.text, Some(text), "mask={mask}");
+        }
+        assert_eq!(map.translate(28, state(0)).unwrap().unwrap().text, None);
         assert!(map.translate(30, state(64)).is_err());
         assert!(map.translate(30, state(128)).is_err());
         assert!(map

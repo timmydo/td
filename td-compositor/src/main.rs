@@ -6,31 +6,6 @@
     path = "../../td-busd/src/app_policy.rs"
 )]
 mod app_policy;
-#[allow(dead_code, reason = "td-ui's outline face, of which td-term uses part")]
-#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/atlas.rs")]
-mod atlas;
-#[allow(dead_code, reason = "td-ui's outline face, of which td-term uses part")]
-#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/coverage.rs")]
-mod coverage;
-#[allow(dead_code, reason = "td-ui's outline face, of which td-term uses part")]
-#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/face.rs")]
-mod face;
-#[allow(dead_code, reason = "td-ui's outline face, of which td-term uses part")]
-#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/face_file.rs")]
-mod face_file;
-#[allow(dead_code, reason = "td-ui's outline face, of which td-term uses part")]
-#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/sfnt.rs")]
-mod sfnt;
-
-// td-ui's link rule and opener, shared so td-term follows a link as
-// td-editor, td-mail and td-news do; `around` is td-mail's wrap's alone,
-// `open::link` theirs, and `open::url` and `open::file` td-news's.
-#[allow(dead_code, reason = "shared link rule")]
-#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/links.rs")]
-mod links;
-#[allow(dead_code, reason = "shared opener: td-term opens on its display")]
-#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/open.rs")]
-mod open;
 
 mod attention;
 mod authority;
@@ -51,15 +26,13 @@ mod headless;
 mod help;
 mod input;
 mod keyboard;
-mod keys;
 mod launcher;
 mod layout;
 mod output;
 mod pointer;
 mod positioner;
-mod pty;
-mod ready;
-mod render;
+mod proc_status;
+mod reportable;
 mod runtime;
 mod scene;
 mod secret_client;
@@ -67,9 +40,6 @@ mod server;
 mod session;
 mod socket;
 mod sys;
-mod term;
-mod term_client;
-mod terminfo;
 mod timezone;
 mod ui;
 mod vm_bridge;
@@ -108,7 +78,6 @@ fn usage() -> String {
      td-compositor probe-terminal-authority | \
      td-compositor probe SOCKET | \
      td-compositor probe-application SOCKET ID RGB_A RGB_B [--quiet] | \
-     td-compositor terminfo PATH | \
      td-compositor selftest\n\
      --terminal-authority requires --launcher-application. \
      --framebuffer beside --card is driven only when the card does not exist."
@@ -119,40 +88,6 @@ fn client_usage() -> String {
     "usage: td-ui-demo run --socket PATH --ready-socket PATH | \
      td-ui-demo probe READY_SOCKET | td-ui-demo selftest [--shared-network]"
         .into()
-}
-
-fn term_usage() -> String {
-    "usage: td-term run --socket PATH --ready-socket PATH [--working-directory PATH] [--command PROGRAM [ARG...]] \
-| td-term probe READY_SOCKET | td-term selftest"
-        .into()
-}
-
-/// `--command` ends td-term's own flags: everything after it is the child's
-/// literal argv, so a program's flags can never collide with the terminal's.
-/// Literal means bytes — a filename argument is whatever the filesystem
-/// holds — so the tail stays `OsString` while td-term's own flags, which are
-/// paths it spells itself, must be UTF-8. An empty command is refused rather
-/// than silently meaning the shell: an operator who wrote `--command` and
-/// nothing else did not ask for `/bin/sh`. A relative program is refused
-/// HERE, before td-term dials the compositor: `pty::child_command` checks it
-/// again at spawn, but a typo in a unit file should fail at parse time rather
-/// than paint a window and then die.
-fn split_term_command(args: &[OsString]) -> Result<(Vec<String>, Vec<OsString>), String> {
-    let Some(index) = args.iter().position(|argument| argument == "--command") else {
-        return Ok((utf8_args(args)?, Vec::new()));
-    };
-    let flags = utf8_args(args.get(..index).ok_or_else(term_usage)?)?;
-    let command = args.get(index + 1..).ok_or_else(term_usage)?;
-    let Some(program) = command.first() else {
-        return Err("--command requires a program".to_string());
-    };
-    if !Path::new(program).is_absolute() {
-        return Err(format!(
-            "terminal command '{}' is not absolute",
-            program.to_string_lossy()
-        ));
-    }
-    Ok((flags, command.to_vec()))
 }
 
 /// td's own flags are text; only a child's argv is bytes. Refusing is what
@@ -175,7 +110,6 @@ fn utf8_args(args: &[OsString]) -> Result<Vec<String>, String> {
 enum Personality {
     Compositor,
     Demo,
-    Term,
     /// The control client: not a Wayland client at all, which is why it is a
     /// name of this artifact rather than a program of its own — the request
     /// vocabulary and the compositor that answers it are one module, and two
@@ -193,7 +127,6 @@ impl Personality {
             .and_then(|name| name.to_str());
         match name {
             Some("td-ui-demo") => Personality::Demo,
-            Some("td-term") => Personality::Term,
             Some("td-ctl") => Personality::Control,
             _ => Personality::Compositor,
         }
@@ -203,58 +136,8 @@ impl Personality {
         match self {
             Personality::Compositor => "td-compositor",
             Personality::Demo => "td-ui-demo",
-            Personality::Term => "td-term",
             Personality::Control => "td-ctl",
         }
-    }
-}
-
-/// The terminal's four self-checks and the marker that says all four ran.
-/// Where it writes is a parameter so the marker is a tested string rather than
-/// one nobody reads.
-fn term_selftest(out: &mut impl std::io::Write) -> Result<(), String> {
-    term::selftest()?;
-    pty::selftest()?;
-    ready::selftest()?;
-    term_client::selftest()?;
-    writeln!(out, "TD-TERM-SELFTEST-OK").map_err(|e| format!("write selftest marker: {e}"))
-}
-
-/// The terminal's own entry point. `run` is the Wayland client; the other two
-/// need no surface — the readiness probe td-svc calls, and the packaged
-/// binary's self-check.
-fn run_term(args: &[OsString]) -> Result<(), String> {
-    let command = args
-        .first()
-        .and_then(|word| word.to_str())
-        .ok_or_else(term_usage)?;
-    match command {
-        "run" => {
-            let args = args.get(1..).ok_or_else(term_usage)?;
-            let (flags, command) = split_term_command(args)?;
-            let (socket, ready_socket, working_directory) = parse_term_run_flags(&flags)?;
-            term_client::run(&term_client::Options {
-                socket,
-                ready_socket,
-                working_directory,
-                command,
-                face_setting: env::var_os(face_file::SETTING),
-            })
-        }
-        "probe" => {
-            let socket = args.get(1).ok_or_else(term_usage)?;
-            if args.get(2).is_some() {
-                return Err(term_usage());
-            }
-            ready::probe(Path::new(socket))
-        }
-        "selftest" => {
-            if args.get(1).is_some() {
-                return Err(term_usage());
-            }
-            term_selftest(&mut std::io::stdout())
-        }
-        _ => Err(term_usage()),
     }
 }
 
@@ -768,12 +651,6 @@ fn start_flip_threads(
 }
 
 fn selftest() -> Result<(), String> {
-    term::selftest()?;
-    keys::selftest()?;
-    pty::selftest()?;
-    render::selftest()?;
-    terminfo::selftest()?;
-
     let mut payload = wire::Builder::new();
     payload.u32(7);
     let mut encoded = payload.message(1, 0)?;
@@ -850,25 +727,6 @@ fn run(args: &[String]) -> Result<(), String> {
             out.flush()
                 .map_err(|error| format!("flush application evidence: {error}"))
         }
-        // The build step that installs the entry; the shipped binary is the
-        // only encoder, so nothing can compile a second, divergent copy.
-        "terminfo" => {
-            let path = args.get(1).ok_or_else(usage)?;
-            if args.get(2).is_some() {
-                return Err(usage());
-            }
-            // ncurses finds an entry only under its own first letter, and a
-            // path that spells it differently is a terminal with no
-            // description and nothing to say so.
-            if !path.ends_with(terminfo::INSTALL_PATH) {
-                return Err(format!(
-                    "{path} does not end with {}",
-                    terminfo::INSTALL_PATH
-                ));
-            }
-            let bytes = terminfo::entry()?;
-            std::fs::write(path, bytes).map_err(|error| format!("write {path}: {error}"))
-        }
         "selftest" => {
             if args.get(1).is_some() {
                 return Err(usage());
@@ -879,9 +737,8 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// The two run flags both clients take. They are spelled the same way because
-/// the terminal is meant to replace the demo service, not to be started
-/// differently from it; what differs is only what each builds from them.
+/// The demo client's two run flags. td-term spells the same two the same
+/// way, so a launcher builds either command from one pair of paths.
 fn parse_run_flags(args: &[String]) -> Result<(PathBuf, PathBuf), String> {
     let mut socket = None;
     let mut ready_socket = None;
@@ -905,35 +762,6 @@ fn parse_run_flags(args: &[String]) -> Result<(PathBuf, PathBuf), String> {
         socket.ok_or_else(|| "--socket is required".to_string())?,
         ready_socket.ok_or_else(|| "--ready-socket is required".to_string())?,
     ))
-}
-
-fn parse_term_run_flags(args: &[String]) -> Result<(PathBuf, PathBuf, Option<PathBuf>), String> {
-    let mut common = Vec::new();
-    let mut working_directory = None;
-    let mut index = 0;
-    while index < args.len() {
-        let flag = args
-            .get(index)
-            .ok_or_else(|| "missing terminal run flag".to_string())?;
-        let value = args
-            .get(index + 1)
-            .ok_or_else(|| format!("{flag} requires a value"))?;
-        if flag == "--working-directory" {
-            if working_directory.is_some() {
-                return Err("duplicate flag '--working-directory'".into());
-            }
-            let path = PathBuf::from(value);
-            if !path.is_absolute() {
-                return Err("terminal working directory is not absolute".into());
-            }
-            working_directory = Some(path);
-        } else {
-            common.extend([flag.clone(), value.clone()]);
-        }
-        index += 2;
-    }
-    let (socket, ready_socket) = parse_run_flags(&common)?;
-    Ok((socket, ready_socket, working_directory))
 }
 
 fn parse_client_run(args: &[String]) -> Result<client::Options, String> {
@@ -1047,9 +875,8 @@ fn run_client(args: &[String]) -> Result<(), client::ClientRunFailure> {
 }
 
 fn main() {
-    // Bytes, not text: `env::args()` panics on a non-UTF-8 argument, and the
-    // terminal's child argv may legitimately carry one. Each personality
-    // decides what must be UTF-8.
+    // Bytes, not text: `env::args()` panics on a non-UTF-8 argument. Each
+    // personality decides what must be UTF-8.
     let mut argv = env::args_os();
     let executable = argv
         .next()
@@ -1071,12 +898,9 @@ fn main() {
                 }
             },
         },
-        Personality::Term => run_term(&args),
-        // `args` is `OsString` since td-term gained a child argv that may
-        // legitimately not be UTF-8, and td-ctl's vocabulary is text. Each
-        // personality decides that for itself; `control_outcome` decides it
-        // for this one, and a word that cannot be a request is refused the
-        // way any wrong request is.
+        // td-ctl's vocabulary is text; `control_outcome` decides that for
+        // this personality, and a word that cannot be a request is refused
+        // the way any wrong request is.
         Personality::Control => match control_outcome(&args) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -1107,10 +931,15 @@ mod tests {
             run(&["probe-terminal-authority".into(), "extra".into()]),
             Err(usage())
         );
-        assert_eq!(
-            run_term(&[OsString::from("probe-terminal-authority")]),
-            Err(term_usage())
-        );
+    }
+
+    /// The terminal is its own program now; its installer subcommand is not
+    /// a word the compositor answers.
+    #[test]
+    fn the_compositor_no_longer_serves_the_terminal() {
+        assert_eq!(run(&["terminfo".into(), "/x".into()]), Err(usage()));
+        assert!(!usage().contains("terminfo"));
+        assert!(Personality::of("/bin/td-term", false) == Personality::Compositor);
     }
 
     #[test]
@@ -1123,18 +952,17 @@ mod tests {
     }
 
     #[test]
-    fn the_four_names_pick_the_four_programs() {
+    fn the_three_names_pick_the_three_programs() {
         // Installed symlinks select by basename; only the exact fixture entry
         // also uses its authenticated application identity.
         for (name, personality) in [
             ("td-compositor", Personality::Compositor),
             ("td-ui-demo", Personality::Demo),
-            ("td-term", Personality::Term),
             ("td-ctl", Personality::Control),
         ] {
             // The name a personality PRINTS itself as has to be the name that
             // selects it, or a diagnostic names a program the reader cannot
-            // run. Every one of the four, since the loop is the check.
+            // run. Every one of the three, since the loop is the check.
             assert_eq!(personality.program(), name);
             assert!(Personality::of(&format!("/bin/{name}"), false) == personality);
         }
@@ -1149,123 +977,24 @@ mod tests {
         // `td-ctl` that is only the tail of a longer name.
         assert!(Personality::of("/bin/td-ctlx", false) == Personality::Compositor);
         assert!(Personality::of("/bin/xtd-ctl", false) == Personality::Compositor);
-        assert!(Personality::of("/bin/td-term", false) == Personality::Term);
-        assert!(Personality::of("td-term", false) == Personality::Term);
-        assert!(
-            Personality::of("/td/store/x-td-compositor/bin/td-term", false) == Personality::Term
-        );
         assert!(Personality::of("/bin/td-ui-demo", false) == Personality::Demo);
         assert!(Personality::of("/bin/td-compositor", false) == Personality::Compositor);
         assert!(Personality::of(client::JAIL_FIXTURE_ENTRY, true) == Personality::Demo);
         assert!(Personality::of("/bin/td-compositor", true) == Personality::Compositor);
-        assert!(Personality::of("/bin/td-term", true) == Personality::Term);
         assert!(Personality::of("/bin/td-ui-demo", true) == Personality::Demo);
-        // An unknown name is the compositor, as it was before td-term existed.
+        // An unknown name is the compositor.
         assert!(Personality::of("/bin/something-else", false) == Personality::Compositor);
         assert!(Personality::of("", false) == Personality::Compositor);
         // A name that merely CONTAINS one is not that one.
-        assert!(Personality::of("/bin/td-terminal", false) == Personality::Compositor);
-        assert!(Personality::of("/bin/td-term/", false) == Personality::Term);
+        assert!(Personality::of("/bin/td-ui-demox", false) == Personality::Compositor);
+        assert!(Personality::of("/bin/td-ui-demo/", false) == Personality::Demo);
         for personality in [
             Personality::Compositor,
             Personality::Demo,
-            Personality::Term,
+            Personality::Control,
         ] {
             assert_eq!(Personality::of(personality.program(), false), personality);
         }
-    }
-
-    #[test]
-    fn the_terminal_serves_only_what_it_can_serve_yet() {
-        // `run` lands with the Wayland client; until then it is not a command,
-        // and neither is anything else that is not spelled out.
-        assert!(run_term(&[]).is_err());
-        assert!(run_term(&["run".into()]).is_err());
-        assert!(run_term(&["probe".into()]).is_err());
-        assert!(run_term(&["probe".into(), "/nonexistent".into()]).is_err());
-        assert!(run_term(&["probe".into(), "/a".into(), "/b".into()]).is_err());
-        assert!(run_term(&["selftest".into(), "extra".into()]).is_err());
-        run_term(&["selftest".into()]).unwrap();
-        // The marker is the terminal's own, not the compositor's.
-        let mut printed = Vec::new();
-        term_selftest(&mut printed).unwrap();
-        assert_eq!(printed, b"TD-TERM-SELFTEST-OK\n");
-    }
-
-    #[test]
-    fn a_command_ends_the_terminal_flags_and_is_carried_literally() {
-        use std::os::unix::ffi::OsStringExt;
-        let args = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        let text = |list: &[&str]| -> Vec<String> { list.iter().map(|s| s.to_string()).collect() };
-        let plain = args(&["--socket", "/s"]);
-        let (flags, command) = split_term_command(&plain).unwrap();
-        assert_eq!(flags, text(&["--socket", "/s"]));
-        assert!(command.is_empty());
-        // Everything after `--command` belongs to the child, including words
-        // that spell td-term's own flags.
-        let full = args(&[
-            "--socket",
-            "/s",
-            "--ready-socket",
-            "/r",
-            "--command",
-            "/bin/mail",
-            "--socket",
-            "--command",
-        ]);
-        let (flags, command) = split_term_command(&full).unwrap();
-        assert_eq!(flags, text(&["--socket", "/s", "--ready-socket", "/r"]));
-        assert_eq!(command, args(&["/bin/mail", "--socket", "--command"]));
-        // The child's argv is bytes; td-term's own flags are text.
-        let raw = OsString::from_vec(vec![0x2f, 0x74, 0x6d, 0x70, 0x2f, 0xff]);
-        let mut bytes = args(&["--socket", "/s", "--command", "/bin/mail"]);
-        bytes.push(raw.clone());
-        let (flags, command) = split_term_command(&bytes).unwrap();
-        assert_eq!(flags, text(&["--socket", "/s"]));
-        assert_eq!(command, vec![OsString::from("/bin/mail"), raw.clone()]);
-        let mut raw_flag = vec![OsString::from("--socket"), raw];
-        raw_flag.extend(args(&["--command", "/bin/mail"]));
-        let error = split_term_command(&raw_flag).unwrap_err();
-        assert!(error.contains("is not UTF-8"), "{error}");
-        let bare = args(&["--socket", "/s", "--command"]);
-        assert!(split_term_command(&bare).is_err());
-        let relative = args(&["--socket", "/s", "--command", "mail"]);
-        let error = split_term_command(&relative).unwrap_err();
-        assert!(error.contains("'mail' is not absolute"), "{error}");
-        // `run` refuses a bare `--command` and a relative program at parse
-        // time, before it would dial the socket; neither error mentions the
-        // socket, which is how the test knows nothing was dialed.
-        for tail in [vec!["--command"], vec!["--command", "mail"]] {
-            let mut invocation = args(&["run", "--socket", "/s", "--ready-socket", "/r"]);
-            invocation.extend(tail.iter().map(OsString::from));
-            let error = run_term(&invocation).unwrap_err();
-            assert!(!error.contains("/s"), "{error}");
-            assert!(
-                error.contains("--command") || error.contains("not absolute"),
-                "{error}"
-            );
-        }
-        assert!(term_usage().contains("[--working-directory PATH]"));
-        assert!(term_usage().contains("[--command PROGRAM [ARG...]]"));
-        let parsed = parse_term_run_flags(&text(&[
-            "--socket",
-            "/s",
-            "--ready-socket",
-            "/r",
-            "--working-directory",
-            "/home/tester/src/td-vm/work",
-        ]))
-        .unwrap();
-        assert_eq!(parsed.2, Some(PathBuf::from("/home/tester/src/td-vm/work")));
-        assert!(parse_term_run_flags(&text(&[
-            "--socket",
-            "/s",
-            "--ready-socket",
-            "/r",
-            "--working-directory",
-            "relative",
-        ]))
-        .is_err());
     }
 
     #[test]
@@ -1296,7 +1025,9 @@ mod tests {
         assert!(ready_name.ends_with("-7.ready"));
 
         // An ordinary terminal keeps the two common flags, and the task
-        // terminal adds one terminal-only absolute directory.
+        // terminal adds one terminal-only absolute directory. td-term is its
+        // own program, so its argv is pinned here as the words td-term's
+        // `run` parses.
         let (program, arguments, ready_socket) =
             launcher::launch_command(&launch, launcher::LaunchRequest::Terminal, 8).unwrap();
         assert_eq!(program, launch.terminal);
@@ -1315,36 +1046,32 @@ mod tests {
             .into_iter()
             .map(|argument| argument.into_string().unwrap())
             .collect();
-        let parsed = parse_term_run_flags(arguments.get(1..).unwrap()).unwrap();
-        assert_eq!(parsed.0, launch.socket);
-        assert_eq!(parsed.1, task_ready);
         assert_eq!(
-            parsed.2.as_deref(),
-            Some(Path::new(launcher::TASK_DIRECTORY))
+            arguments,
+            [
+                "run".to_string(),
+                "--socket".into(),
+                launch.socket.to_string_lossy().into_owned(),
+                "--ready-socket".into(),
+                task_ready.to_string_lossy().into_owned(),
+                "--working-directory".into(),
+                launcher::TASK_DIRECTORY.into(),
+            ]
         );
-        // The two usage strings are hand-written and the parser is not, so the
-        // thing that can drift is what each TELLS an operator. Both must spell
-        // the shared flags identically, or one personality documents a
-        // spelling `parse_run_flags` would refuse.
+        // The usage string is hand-written and the parser is not, so the
+        // thing that can drift is what it TELLS an operator.
         let flags = "run --socket PATH --ready-socket PATH";
         assert!(client_usage().contains(flags), "{}", client_usage());
-        assert!(term_usage().contains(flags), "{}", term_usage());
     }
 }
 
 #[cfg(test)]
 #[cfg(not(feature = "target-recipe"))]
 mod confinement {
-    const IMPORTERS: &[(&str, &str)] = &[
-        (
-            "import-libvterm.rs",
-            include_str!("../tools/import-libvterm.rs"),
-        ),
-        (
-            "import-unifont.rs",
-            include_str!("../tools/import-unifont.rs"),
-        ),
-    ];
+    const IMPORTERS: &[(&str, &str)] = &[(
+        "import-unifont.rs",
+        include_str!("../tools/import-unifont.rs"),
+    )];
     const MAIN: &str = include_str!("main.rs");
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
@@ -1361,13 +1088,6 @@ mod confinement {
             "app_policy.rs",
             include_str!("../../td-busd/src/app_policy.rs"),
         ),
-        ("atlas.rs", include_str!("../../td-ui/src/atlas.rs")),
-        ("coverage.rs", include_str!("../../td-ui/src/coverage.rs")),
-        ("face.rs", include_str!("../../td-ui/src/face.rs")),
-        ("face_file.rs", include_str!("../../td-ui/src/face_file.rs")),
-        ("links.rs", include_str!("../../td-ui/src/links.rs")),
-        ("open.rs", include_str!("../../td-ui/src/open.rs")),
-        ("sfnt.rs", include_str!("../../td-ui/src/sfnt.rs")),
         ("attention.rs", include_str!("attention.rs")),
         ("authority.rs", AUTHORITY),
         ("bar.rs", include_str!("bar.rs")),
@@ -1387,45 +1107,24 @@ mod confinement {
         ("help.rs", include_str!("help.rs")),
         ("input.rs", include_str!("input.rs")),
         ("keyboard.rs", include_str!("keyboard.rs")),
-        ("keys.rs", include_str!("keys.rs")),
         ("launcher.rs", include_str!("launcher.rs")),
         ("layout.rs", include_str!("layout.rs")),
         ("output.rs", include_str!("output.rs")),
         ("pointer.rs", include_str!("pointer.rs")),
         ("positioner.rs", include_str!("positioner.rs")),
-        ("pty.rs", include_str!("pty.rs")),
-        ("ready.rs", include_str!("ready.rs")),
-        ("render.rs", include_str!("render.rs")),
+        ("proc_status.rs", include_str!("proc_status.rs")),
+        ("reportable.rs", include_str!("reportable.rs")),
         ("runtime.rs", include_str!("runtime.rs")),
         ("scene.rs", include_str!("scene.rs")),
         ("secret_client.rs", include_str!("secret_client.rs")),
         ("server.rs", include_str!("server.rs")),
         ("session.rs", include_str!("session.rs")),
         ("socket.rs", include_str!("socket.rs")),
-        ("term.rs", include_str!("term.rs")),
-        ("term_client.rs", include_str!("term_client.rs")),
-        ("terminfo.rs", include_str!("terminfo.rs")),
         ("timezone.rs", include_str!("timezone.rs")),
         ("ui.rs", include_str!("ui.rs")),
         ("vm_bridge.rs", include_str!("vm_bridge.rs")),
         ("vm_wire.rs", include_str!("vm_wire.rs")),
         ("wire.rs", include_str!("wire.rs")),
-    ];
-    /// Sources other crates own that are mounted here: td-busd's policy,
-    /// td-ui's link rule and opener, and td-ui's outline face.
-    const MOUNTED: &[&str] = &[
-        "app_policy.rs",
-        "atlas.rs",
-        "coverage.rs",
-        "face.rs",
-        "face_file.rs",
-        "links.rs",
-        "open.rs",
-        "sfnt.rs",
-    ];
-    const TEST_ONLY: &[(&str, &str)] = &[
-        ("render_spec.rs", include_str!("render_spec.rs")),
-        ("term_spec.rs", include_str!("term_spec.rs")),
     ];
 
     /// A module's source with its test module removed. Anchored on the test
@@ -1458,25 +1157,16 @@ mod confinement {
             .collect()
     }
 
-    /// The terminal's selftest is a composition, and its marker says all four
-    /// ran. Nothing observable distinguishes three from four — each returns
-    /// `Ok(())` — so the composition is pinned against the source, the way
-    /// this crate pins everything else the compiler cannot see.
+    /// td-term names its own window; the authority probe recognises the
+    /// terminal by that name, so the compositor's copy is pinned to it.
     #[test]
-    fn the_terminals_selftest_covers_all_four_of_its_layers() {
-        let body = MAIN
-            .split("fn term_selftest")
-            .nth(1)
-            .and_then(|rest| rest.split("\nfn ").next())
-            .expect("term_selftest body");
-        for layer in [
-            "term::selftest()?",
-            "pty::selftest()?",
-            "ready::selftest()?",
-            "term_client::selftest()?",
-        ] {
-            assert!(body.contains(layer), "the terminal selftest skips {layer}");
-        }
+    fn the_authority_probe_names_the_title_td_term_sets() {
+        let app = include_str!("../../td-term/src/app.rs");
+        let title = format!(
+            "const TITLE: &str = \"{}\";",
+            crate::session::TERMINAL_TITLE
+        );
+        assert!(app.contains(&title), "td-term no longer spells {title}");
     }
 
     #[test]
@@ -1714,7 +1404,7 @@ unsafe impl Send for MappedRegion {}"#;
             assert!(SYS.contains(syscall), "{syscall}");
         }
         assert_eq!(occurrences(SYS, "const SYS_"), 9);
-        for (name, source) in OTHER.iter().chain(TEST_ONLY) {
+        for (name, source) in OTHER {
             assert_eq!(
                 source.matches("unsafe").count(),
                 usize::from(*name == "authority.rs"),
@@ -1813,19 +1503,6 @@ unsafe impl Send for MappedRegion {}"#;
     }
 
     #[test]
-    fn test_only_module_inventory_matches_path_declarations() {
-        for (name, _) in TEST_ONLY {
-            let declaration = format!("#[path = \"{name}\"]");
-            assert!(
-                OTHER
-                    .iter()
-                    .any(|(_, source)| source.contains(&declaration)),
-                "{name} is not declared from an inventoried module"
-            );
-        }
-    }
-
-    #[test]
     fn confinement_inventory_covers_every_source_file() {
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut actual = std::fs::read_dir(directory)
@@ -1839,8 +1516,7 @@ unsafe impl Send for MappedRegion {}"#;
         inventoried.extend(
             OTHER
                 .iter()
-                .chain(TEST_ONLY)
-                .filter(|(name, _)| !MOUNTED.contains(name))
+                .filter(|(name, _)| *name != "app_policy.rs")
                 .map(|(name, _)| (*name).to_string()),
         );
         inventoried.sort();
@@ -1848,7 +1524,7 @@ unsafe impl Send for MappedRegion {}"#;
     }
 
     /// `ioctl(2)`'s request number chooses the operation, so the roster is the
-    /// confinement: these twenty-one values, one allow-list, and twenty
+    /// confinement: these seventeen values, one allow-list, and sixteen
     /// wrapper functions.
     ///
     /// Four DRM numbers READ a card. `DROP_MASTER` releases authority that
@@ -1870,12 +1546,8 @@ unsafe impl Send for MappedRegion {}"#;
     /// whole display state at once, which is what replaces this legacy
     /// modeset-and-flip pair when more than one plane is in play.
     #[test]
-    fn the_ioctl_surface_is_twenty_one_pinned_requests_and_twenty_wrappers() {
+    fn the_ioctl_surface_is_seventeen_pinned_requests_and_sixteen_wrappers() {
         for request in [
-            "const TIOCSPTLCK: usize = 0x4004_5431;",
-            "const TIOCGPTPEER: usize = 0x5441;",
-            "const TIOCSWINSZ: usize = 0x5414;",
-            "const TIOCGWINSZ: usize = 0x5413;",
             "const EVIOCGABS_X: usize = 0x8018_4540;",
             "const EVIOCGABS_Y: usize = 0x8018_4541;",
             "const EVIOCSCLOCKID: usize = 0x4004_45a0;",
@@ -1896,7 +1568,12 @@ unsafe impl Send for MappedRegion {}"#;
         ] {
             assert!(SYS.contains(request), "{request}");
         }
-        assert_eq!(occurrences(SYS, "const TIOC"), 4);
+        // The terminal's PTY requests left with td-term, which owns them in
+        // td-ui's surface; the compositor owns no terminal.
+        assert_eq!(occurrences(SYS, "const TIOC"), 0);
+        for number in ["0x4004_5431", "0x5441", "0x5414", "0x5413"] {
+            assert!(!production(SYS).contains(number), "{number}");
+        }
         assert_eq!(occurrences(SYS, "const EVIOCGABS"), 2);
         assert_eq!(occurrences(SYS, "const DRM_IOCTL_"), 14);
         // No write-side DRM request is DECLARED, and none of their numbers
@@ -1936,11 +1613,7 @@ unsafe impl Send for MappedRegion {}"#;
         // wrapper passing it to the one entry point.
         let guard = r#"    if !matches!(
         request,
-        TIOCSPTLCK
-            | TIOCGPTPEER
-            | TIOCSWINSZ
-            | TIOCGWINSZ
-            | EVIOCGABS_X
+        EVIOCGABS_X
             | EVIOCGABS_Y
             | EVIOCSCLOCKID
             | DRM_IOCTL_VERSION
@@ -1968,10 +1641,10 @@ unsafe impl Send for MappedRegion {}"#;
         let prose = occurrences(production_sys, "ioctl(2)");
         let every = occurrences(production_sys, "ioctl(") - prose;
         let drm = occurrences(production_sys, "drm_ioctl(");
-        // One definition plus exactly six call sites for the terminal and
-        // evdev entry point: a seventh wrapper reusing a pinned request would
-        // satisfy every other assertion here.
-        assert_eq!(every - drm, 7);
+        // One definition plus exactly two call sites for the evdev entry
+        // point: a third wrapper reusing a pinned request would satisfy every
+        // other assertion here.
+        assert_eq!(every - drm, 3);
         // One definition plus the seventeen requests the fourteen DRM wrappers
         // issue: two each for the three that ask a count before they ask for
         // data, one for the encoder, whose answer is a fixed-size struct, one
@@ -1984,31 +1657,9 @@ unsafe impl Send for MappedRegion {}"#;
         // growing beside the roster instead of behind it.
         assert_eq!(occurrences(production_sys, "ioctl_checked("), 3);
         assert_eq!(occurrences(production_sys, "syscall5(SYS_IOCTL"), 1);
-        // The four wrappers, each reaching that entry point exactly once with
-        // its own request and its own operand.
-        for (wrapper, call) in [
-            (
-                "pub fn unlock_pty(",
-                "        master.as_raw_fd(),\n        TIOCSPTLCK,\n        (&unlocked as *const i32) as usize,\n        \"TIOCSPTLCK\",",
-            ),
-            (
-                "pub fn pty_peer(",
-                "        master.as_raw_fd(),\n        TIOCGPTPEER,\n        PTY_PEER_FLAGS,\n        \"TIOCGPTPEER\",",
-            ),
-            (
-                "pub fn set_window_size(",
-                "        terminal.as_raw_fd(),\n        TIOCSWINSZ,\n        (&words as *const [u16; 4]) as usize,\n        \"TIOCSWINSZ\",",
-            ),
-            (
-                "pub fn window_size(",
-                "        terminal.as_raw_fd(),\n        TIOCGWINSZ,\n        (&mut words as *mut [u16; 4]) as usize,\n        \"TIOCGWINSZ\",",
-            ),
-        ] {
-            assert!(SYS.contains(wrapper), "{wrapper}");
-            assert_eq!(occurrences(SYS, call), 1, "{wrapper}");
-        }
-        // The fifth takes its request from an AXIS rather than being handed
-        // one, so the two evdev numbers are unreachable from any call site.
+        // The absolute-axis wrapper takes its request from an AXIS rather than
+        // being handed one, so the two evdev numbers are unreachable from any
+        // call site.
         assert!(SYS.contains("pub fn absolute_info(device: &impl AsRawFd, axis: AbsAxis)"));
         assert_eq!(
             occurrences(
@@ -2017,16 +1668,10 @@ unsafe impl Send for MappedRegion {}"#;
             ),
             1
         );
-        // The peer's open flags are pinned rather than chosen by a caller: the
-        // slave belongs to the child, so O_NOCTTY cannot be forgotten.
-        assert!(SYS.contains("const PTY_PEER_FLAGS: usize = 0o2 | 0o400 | 0o2_000_000;"));
-        // The eight bytes the kernel reads are an array whose layout the
-        // language guarantees, not an attribute nobody can observe. Same for
-        // the absinfo's twenty-four, where the three leading words are the
-        // same type and a slipped index is a well-formed wrong range.
-        assert!(SYS.contains("fn winsize_words(size: WindowSize) -> [u16; 4] {"));
-        assert_eq!(occurrences(SYS, "as *const [u16; 4]"), 1);
-        assert_eq!(occurrences(SYS, "as *mut [u16; 4]"), 1);
+        // The absinfo's twenty-four bytes are an array whose layout the
+        // language guarantees, not an attribute nobody can observe: the three
+        // leading words are the same type and a slipped index is a
+        // well-formed wrong range.
         assert_eq!(occurrences(SYS, "as *mut [i32; ABSINFO_WORDS]"), 1);
         assert!(SYS.contains("fn absinfo(words: [i32; ABSINFO_WORDS]) -> AbsInfo {"));
         // The DRM wrappers that ask a card about itself, each reaching its
@@ -2355,7 +2000,7 @@ pub struct MappedRegion {
     }
 
     /// Pin each syscall family to its reviewed callers: transport endpoints,
-    /// terminal control, evdev, peer admission, DRM, and the shared clock.
+    /// evdev, peer admission, DRM, and the shared clock.
     /// Aliases must not hide an additional caller from these scans.
     #[test]
     fn each_confined_operation_is_reachable_only_from_its_own_module() {
@@ -2396,12 +2041,6 @@ pub struct MappedRegion {
         let session = production(include_str!("session.rs"));
         assert_eq!(occurrences(session, "sys::"), 1);
         assert_eq!(occurrences(session, "sys::peer_uid(stream)?"), 1);
-        const TERMINAL: &[&str] = &[
-            "sys::unlock_pty(",
-            "sys::pty_peer(",
-            "sys::set_window_size(",
-            "sys::window_size(",
-        ];
         // An absolute pointer's range is asked for where the device file is
         // opened, and again only at a recovery.
         const ABSOLUTE: &[&str] = &["sys::absolute_info("];
@@ -2480,16 +2119,14 @@ pub struct MappedRegion {
         // One queue: the backend's CRTC.
         assert_eq!(occurrences(drm, "sys::drm_page_flip("), 1);
         let production_main = production(MAIN);
-        for (name, source) in std::iter::once(("main.rs", production_main))
-            .chain(OTHER.iter().copied())
-            .chain(TEST_ONLY.iter().copied())
+        for (name, source) in
+            std::iter::once(("main.rs", production_main)).chain(OTHER.iter().copied())
         {
             if matches!(
                 name,
                 "client.rs"
                     | "conn.rs"
                     | "server.rs"
-                    | "pty.rs"
                     | "input.rs"
                     | "drm.rs"
                     | "session.rs"
@@ -2503,15 +2140,14 @@ pub struct MappedRegion {
             );
         }
         // A NAMED or ALIASED import defeats the scan above the way a glob does:
-        // `use crate::sys as raw;` then `raw::set_window_size(...)` matches
-        // nothing it looks for, and terminal control would be reachable from a
-        // module that never resizes anything it verified. Every reach must be
+        // `use crate::sys as raw;` then `raw::drm_set_crtc(...)` matches
+        // nothing it looks for, and a modeset would be reachable from a
+        // module that never verified the card it drives. Every reach must be
         // spelled `sys::<wrapper>` where the caller scan can see it — including
         // inside every permitted module, so the module list stays the
         // whole answer to "who can call this".
-        for (name, source) in std::iter::once(("main.rs", production_main))
-            .chain(OTHER.iter().copied())
-            .chain(TEST_ONLY.iter().copied())
+        for (name, source) in
+            std::iter::once(("main.rs", production_main)).chain(OTHER.iter().copied())
         {
             for form in [
                 concat!("use", "crate::sys::"),
@@ -2530,12 +2166,11 @@ pub struct MappedRegion {
         // that holds a `Connection` reaches `sendmsg`/`recvmsg` through
         // `send_with_fd`/`next`/`take_fd` without ever spelling `sys::`, which
         // is all the scan above looks for. So who may NAME the transport is a
-        // roster on the same footing as who may call the syscall, and the
-        // terminal's client joins it by amendment rather than by importing.
-        const TRANSPORT_USERS: &[&str] = &["client.rs", "conn.rs", "term_client.rs"];
-        for (name, source) in std::iter::once(("main.rs", production_main))
-            .chain(OTHER.iter().copied())
-            .chain(TEST_ONLY.iter().copied())
+        // roster on the same footing as who may call the syscall, and a new
+        // client joins it by amendment rather than by importing.
+        const TRANSPORT_USERS: &[&str] = &["client.rs", "conn.rs"];
+        for (name, source) in
+            std::iter::once(("main.rs", production_main)).chain(OTHER.iter().copied())
         {
             if TRANSPORT_USERS.contains(&name) {
                 continue;
@@ -2560,13 +2195,12 @@ pub struct MappedRegion {
         let client = include_str!("client.rs");
         let conn = include_str!("conn.rs");
         let server = include_str!("server.rs");
-        let pty = include_str!("pty.rs");
         // The control listener is STARTED, and by the compositor's own run
         // path. Nothing else can see this: `td-ctl help` needs no session, the
         // recipe compares an `exec=` string, and the crate's socket tests
         // build their own listener — so deleting this call left the whole
         // feature dead in the image with every test green. Pinned in the
-        // source, as this crate pins the terminal's selftest layers.
+        // source, as this crate pins what the compiler cannot see.
         assert!(
             production(MAIN).contains("control::serve(path, Arc::clone(&runtime), socket_policy)?"),
             "run_compositor no longer starts the control listener"
@@ -2608,15 +2242,17 @@ pub struct MappedRegion {
             1,
             "server selection descriptor ownership must have one adoption site"
         );
+        // The client that received selection endpoints was td-term's, and it
+        // left with td-term: the compositor's own clients adopt none.
         assert_eq!(
             occurrences(production(conn), "sys::ReceivedFd::adopt("),
-            1,
-            "client selection descriptor ownership must have one adoption site"
+            0,
+            "client selection descriptor adoption returned to the transport"
         );
         assert_eq!(
             occurrences(production(conn), "sys::ReceivedFd::into_file("),
-            1,
-            "client selection endpoints must have one exact conversion site"
+            0,
+            "client selection endpoint conversion returned to the transport"
         );
         assert_eq!(
             occurrences(production(client), "sys::ReceivedFd::into_file("),
@@ -2653,7 +2289,6 @@ pub struct MappedRegion {
         const FAMILIES: &[(&[&str], &[&str])] = &[
             (TRANSPORT, &["client.rs", "conn.rs", "server.rs"]),
             (PEER_AUTH, &["server.rs", "session.rs"]),
-            (TERMINAL, &["pty.rs"]),
             (ABSOLUTE, &["input.rs"]),
             (&["sys::drm_", "sys::parse_drm_event"], &["drm.rs"]),
             (
@@ -2663,9 +2298,8 @@ pub struct MappedRegion {
             (&["sys::input_monotonic_clock"], &["input.rs"]),
             (&["sys::monotonic_time"], &["runtime.rs"]),
         ];
-        for (name, source) in std::iter::once(("main.rs", production_main))
-            .chain(OTHER.iter().copied())
-            .chain(TEST_ONLY.iter().copied())
+        for (name, source) in
+            std::iter::once(("main.rs", production_main)).chain(OTHER.iter().copied())
         {
             let source = squeezed(source);
             for (operations, permitted) in FAMILIES {
@@ -2681,28 +2315,6 @@ pub struct MappedRegion {
                 }
             }
         }
-        // Both wrappers are generic over `AsRawFd`, so inside pty.rs they
-        // would type-check against ANY terminal — including an operator's.
-        let production_pty = production(pty);
-        // The IDENTIFIER count is the load-bearing one, and it is what the
-        // spelling assertions below are not: a call written with a space, or
-        // taken as a function pointer and called through that, satisfies
-        // every `sys::window_size(&self.master)` match while reaching the
-        // kernel with a descriptor nobody checked. It bounds every reach
-        // because the glob-and-alias scan above already requires each to be
-        // spelled `sys::<wrapper>`. Three: one in `set_window_size`, two in
-        // `window_size` — the setter's caller is `Pty::resize`, which
-        // verifies what it published, and the getter's two are that same
-        // readback and the accessor for something that did NOT set the size.
-        assert_eq!(occurrences(production_pty, "window_size"), 3);
-        assert_eq!(occurrences(production_pty, "sys::set_window_size("), 1);
-        assert!(production_pty.contains("sys::set_window_size(&self.master, requested)?;"));
-        assert_eq!(occurrences(production_pty, "sys::window_size("), 2);
-        assert_eq!(
-            occurrences(production_pty, "sys::window_size(&self.master)"),
-            2
-        );
-        assert!(production_pty.contains("let observed = sys::window_size(&self.master)?;"));
     }
 
     /// The binary's own `selftest` subcommand, which is what the td-ui-test

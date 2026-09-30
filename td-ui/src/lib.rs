@@ -27,8 +27,12 @@
 //! the reader of the selection's text), and the outline face's bounded
 //! TrueType reader (`sfnt`) with its antialiased coverage (`coverage`),
 //! the coverage page (`atlas`) and the face at one pixel size (`face`)
-//! through which a raster may execute its glyphs.
-//! Outside `wayland`, `client`, `clipboard`, the private raw module
+//! through which a raster may execute its glyphs, and the embeddable
+//! terminal (td-term/DESIGN.md): the VT model (`vt`), its renderer
+//! (`vt_render`), the chord encoder and scrollback viewport (`vt_keys`),
+//! the terminfo compiler (`vt_terminfo`) and the PTY with its threads
+//! (`pty`).
+//! Outside `wayland`, `client`, `clipboard`, `pty`, the private raw module
 //! beneath them, the driving adapters
 //! `control_socket`, `control_worker` and `replay`, and the widget window
 //! `window`, nothing reads the environment, a clock, a descriptor or the
@@ -70,9 +74,14 @@ pub mod notices;
 pub mod open;
 pub mod pinned_face;
 pub mod pointer;
+#[path = "../../td-compositor/src/proc_status.rs"]
+pub mod proc_status;
+pub mod pty;
 pub mod raster;
 pub mod repeat;
 pub mod replay;
+#[path = "../../td-compositor/src/reportable.rs"]
+pub mod reportable;
 pub mod sfnt;
 pub mod split;
 mod sys;
@@ -81,6 +90,10 @@ mod tree_table_geometry;
 mod tree_table_model;
 mod tree_table_paint;
 pub mod typeface;
+pub mod vt;
+pub mod vt_keys;
+pub mod vt_render;
+pub mod vt_terminfo;
 pub mod wayland;
 pub mod window;
 #[allow(clippy::new_without_default)]

@@ -1,30 +1,223 @@
 use super::*;
-use crate::keys;
+use crate::keyboard::{Keymap, Modifiers};
+use crate::vt_keys as keys;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 #[allow(dead_code)]
 #[path = "../../engine/src/sha256.rs"]
 mod migration_sha256;
 
 const CORPUS: &[(&str, &str)] = &[
-    ("color.term", include_str!("../spec/term/color.term")),
-    ("cursor.term", include_str!("../spec/term/cursor.term")),
-    ("editing.term", include_str!("../spec/term/editing.term")),
-    ("input.term", include_str!("../spec/term/input.term")),
+    ("color.term", include_str!("../spec/vt/color.term")),
+    ("cursor.term", include_str!("../spec/vt/cursor.term")),
+    ("editing.term", include_str!("../spec/vt/editing.term")),
+    ("input.term", include_str!("../spec/vt/input.term")),
     (
         "libvterm-0.3.3.term",
-        include_str!("../spec/term/libvterm-0.3.3.term"),
+        include_str!("../spec/vt/libvterm-0.3.3.term"),
     ),
-    ("modes.term", include_str!("../spec/term/modes.term")),
-    ("parser.term", include_str!("../spec/term/parser.term")),
-    ("replies.term", include_str!("../spec/term/replies.term")),
-    ("resize.term", include_str!("../spec/term/resize.term")),
-    ("unicode.term", include_str!("../spec/term/unicode.term")),
-    ("wrapping.term", include_str!("../spec/term/wrapping.term")),
+    ("modes.term", include_str!("../spec/vt/modes.term")),
+    ("parser.term", include_str!("../spec/vt/parser.term")),
+    ("replies.term", include_str!("../spec/vt/replies.term")),
+    ("resize.term", include_str!("../spec/vt/resize.term")),
+    ("unicode.term", include_str!("../spec/vt/unicode.term")),
+    ("wrapping.term", include_str!("../spec/vt/wrapping.term")),
 ];
-const EXPECTATIONS: &str = include_str!("../spec/term/expectations.txt");
-const LIBVTERM_REPORT: &str = include_str!("../spec/term/libvterm-0.3.3.report");
+const EXPECTATIONS: &str = include_str!("../spec/vt/expectations.txt");
+const LIBVTERM_REPORT: &str = include_str!("../spec/vt/libvterm-0.3.3.report");
 const LIBVTERM_SOURCE_MANIFEST: &str = include_str!("../tools/libvterm-0.3.3.sources");
+/// The corpus's key names and their evdev codes: td's pinned keymap is what
+/// turns a code and a modifier state into the chord the encoder reads, so a
+/// `key` case exercises the whole path a press takes.
+const KEY_NAMES: &[(&str, u32)] = &[
+    ("escape", 1),
+    ("1", 2),
+    ("2", 3),
+    ("3", 4),
+    ("4", 5),
+    ("5", 6),
+    ("6", 7),
+    ("7", 8),
+    ("8", 9),
+    ("9", 10),
+    ("0", 11),
+    ("minus", 12),
+    ("equal", 13),
+    ("backspace", 14),
+    ("tab", 15),
+    ("q", 16),
+    ("w", 17),
+    ("e", 18),
+    ("r", 19),
+    ("t", 20),
+    ("y", 21),
+    ("u", 22),
+    ("i", 23),
+    ("o", 24),
+    ("p", 25),
+    ("leftbracket", 26),
+    ("rightbracket", 27),
+    ("enter", 28),
+    ("leftcontrol", 29),
+    ("a", 30),
+    ("s", 31),
+    ("d", 32),
+    ("f", 33),
+    ("g", 34),
+    ("h", 35),
+    ("j", 36),
+    ("k", 37),
+    ("l", 38),
+    ("semicolon", 39),
+    ("apostrophe", 40),
+    ("grave", 41),
+    ("leftshift", 42),
+    ("backslash", 43),
+    ("z", 44),
+    ("x", 45),
+    ("c", 46),
+    ("v", 47),
+    ("b", 48),
+    ("n", 49),
+    ("m", 50),
+    ("comma", 51),
+    ("period", 52),
+    ("slash", 53),
+    ("rightshift", 54),
+    ("kpasterisk", 55),
+    ("leftalt", 56),
+    ("space", 57),
+    ("capslock", 58),
+    ("f1", 59),
+    ("f2", 60),
+    ("f3", 61),
+    ("f4", 62),
+    ("f5", 63),
+    ("f6", 64),
+    ("f7", 65),
+    ("f8", 66),
+    ("f9", 67),
+    ("f10", 68),
+    ("numlock", 69),
+    ("scrolllock", 70),
+    ("kp7", 71),
+    ("kp8", 72),
+    ("kp9", 73),
+    ("kpminus", 74),
+    ("kp4", 75),
+    ("kp5", 76),
+    ("kp6", 77),
+    ("kpplus", 78),
+    ("kp1", 79),
+    ("kp2", 80),
+    ("kp3", 81),
+    ("kp0", 82),
+    ("kpperiod", 83),
+    ("less", 86),
+    ("f11", 87),
+    ("f12", 88),
+    ("kpenter", 96),
+    ("rightcontrol", 97),
+    ("kpslash", 98),
+    ("print", 99),
+    ("rightalt", 100),
+    ("home", 102),
+    ("up", 103),
+    ("pageup", 104),
+    ("left", 105),
+    ("right", 106),
+    ("end", 107),
+    ("down", 108),
+    ("pagedown", 109),
+    ("insert", 110),
+    ("delete", 111),
+    ("mute", 113),
+    ("volumedown", 114),
+    ("volumeup", 115),
+    ("power", 116),
+    ("kpequal", 117),
+    ("pause", 119),
+    ("leftmeta", 125),
+    ("rightmeta", 126),
+    ("menu", 127),
+];
+
+/// The real modifier bits td's keymap assigns: Shift, Lock, Control, Mod1
+/// (Alt), Mod2 (Num Lock) and Mod4 (Super).
+const MOD_SHIFT: u32 = 1 << 0;
+const MOD_CAPS: u32 = 1 << 1;
+const MOD_CONTROL: u32 = 1 << 2;
+const MOD_ALT: u32 = 1 << 3;
+const MOD_LOGO: u32 = 1 << 6;
+
+/// td's own keymap, the one its compositor publishes, compiled once.
+fn td_keymap() -> &'static Keymap {
+    static MAP: OnceLock<Keymap> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let source = include_str!("../../td-compositor/src/keyboard.rs")
+            .split_once("pub const XKB_KEYMAP: &str = r#\"")
+            .and_then(|(_, rest)| rest.split_once("\"#;"))
+            .map(|(map, _)| map)
+            .unwrap_or_default();
+        Keymap::parse(source).unwrap_or_else(|error| panic!("td keymap: {error}"))
+    })
+}
+
+/// `ctrl+alt+a` and friends: modifiers, then one key name.
+fn parse_key(text: &str) -> Result<(u32, u32), String> {
+    let mut modifiers = 0u32;
+    let mut name = None;
+    for part in text.split('+') {
+        if part.is_empty() {
+            return Err(format!("empty component in key chord '{text}'"));
+        }
+        let modifier = match part {
+            "ctrl" => Some(MOD_CONTROL),
+            "alt" => Some(MOD_ALT),
+            "shift" => Some(MOD_SHIFT),
+            "super" => Some(MOD_LOGO),
+            "caps" => Some(MOD_CAPS),
+            _ => None,
+        };
+        match (modifier, name) {
+            (Some(_), Some(_)) => {
+                return Err(format!("key chord '{text}' has a modifier after its key"));
+            }
+            (Some(bit), None) if modifiers & bit != 0 => {
+                return Err(format!("key chord '{text}' repeats a modifier"));
+            }
+            (Some(bit), None) => modifiers |= bit,
+            (None, None) => name = Some(part),
+            (None, Some(_)) => return Err(format!("key chord '{text}' names two keys")),
+        }
+    }
+    let name = name.ok_or_else(|| format!("key chord '{text}' names no key"))?;
+    let code = KEY_NAMES
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, code)| *code)
+        .ok_or_else(|| format!("unknown key '{name}'"))?;
+    Ok((code, modifiers))
+}
+
+/// The chord td's keymap makes of a press, or nothing: a modifier alone, an
+/// untranslated key, and a press the keymap refuses (Super held) are all
+/// silent to the terminal.
+fn chord_of(code: u32, modifiers: u32) -> Option<(String, Option<char>)> {
+    // Caps Lock is a lock; the rest are held.
+    let state = Modifiers {
+        depressed: modifiers & !MOD_CAPS,
+        locked: modifiers & MOD_CAPS,
+        ..Modifiers::default()
+    };
+    td_keymap()
+        .translate(code, state)
+        .ok()
+        .flatten()
+        .map(|stroke| (stroke.chord, stroke.text))
+}
+
 const KNOWN_TAGS: &[&str] = &[
     "alternate-screen",
     "bounds",
@@ -55,8 +248,9 @@ struct Case {
 enum Step {
     Write(Vec<u8>),
     Resize(usize, usize),
-    /// One key press through the keyboard adapter: evdev code and XKB masks.
-    Key(u16, u32),
+    /// One key press through td's keymap and the encoder: evdev code and
+    /// real modifier masks.
+    Key(u32, u32),
     Expect(Expectation),
 }
 
@@ -689,7 +883,7 @@ fn parse_file(file: &str, input: &str) -> Result<Vec<Case>, String> {
                 return Err(at(file, line, "key precedes size"));
             }
             let (code, modifiers) =
-                keys::parse_chord(chord.trim()).map_err(|error| at(file, line, &error))?;
+                parse_key(chord.trim()).map_err(|error| at(file, line, &error))?;
             builder.steps.push(Step::Key(code, modifiers));
             builder.operations += 1;
         } else if let Some(size) = text.strip_prefix("resize ") {
@@ -1022,7 +1216,12 @@ fn run_case(case: &Case, chunking: Chunking) -> Result<CaseRun, String> {
                     application_cursor: terminal.mode("application-cursor") == Some(true),
                 };
                 let history = scrollback(&terminal);
-                let action = keys::action(*code, *modifiers, modes, viewport.viewing(history));
+                let action = match chord_of(*code, *modifiers) {
+                    Some((chord, text)) => {
+                        keys::action(&chord, text, modes, viewport.viewing(history))
+                    }
+                    None => keys::Action::Silent,
+                };
                 if let keys::Action::Bytes(sequence) = action {
                     input.extend_from_slice(sequence.as_slice());
                 }
@@ -1254,7 +1453,7 @@ fn libvterm_migration_is_attributed_and_self_consistent() {
     assert_eq!(excluded, 826);
     assert_eq!(converted.saturating_add(excluded), 1_248);
     let native_sha256 =
-        migration_sha256::hex_digest(include_str!("../spec/term/libvterm-0.3.3.term").as_bytes());
+        migration_sha256::hex_digest(include_str!("../spec/vt/libvterm-0.3.3.term").as_bytes());
     assert_eq!(
         fields.get("native-sha256").copied(),
         Some(native_sha256.as_str())
@@ -1349,7 +1548,7 @@ fn every_seed_case_is_independent_of_input_chunking() {
 fn malformed_streams_resynchronize_within_fixed_bounds() {
     assert!(Terminal::new(0, 1).is_err());
     assert!(Terminal::new(1, 0).is_err());
-    assert!(Terminal::new(crate::MAX_UI_DIMENSION, crate::MAX_UI_DIMENSION).is_err());
+    assert!(Terminal::new(MAX_DIMENSION, MAX_DIMENSION).is_err());
 
     let mut terminal = Terminal::new(2, 8).unwrap();
     let mut too_many = b"\x1b[".to_vec();
@@ -1387,7 +1586,7 @@ fn replies_are_bounded_drainable_and_reusable() {
     let replies = terminal.take_replies();
     assert!(!replies.is_empty());
     assert_eq!(replies.concat(), flat);
-    // Each reply arrives on its own — §10's atomicity unit — so the COUNT is
+    // Each reply arrives on its own — td-term/DESIGN.md §2's atomicity unit — so the COUNT is
     // what the ceiling admitted, not one batch and not one short. The ceiling
     // charges each reply its bytes AND its boundary, so what fits is fewer
     // than the bytes alone would suggest.
@@ -1686,7 +1885,7 @@ fn corpus_parser_rejects_silent_coverage_loss() {
 
 #[test]
 fn corpus_inventory_covers_every_native_case_file() {
-    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("spec/term");
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("spec/vt");
     let mut actual = std::fs::read_dir(&directory)
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -1743,11 +1942,11 @@ fn expectations_overlay_rejects_xpass_and_stale_entries() {
     );
 }
 
-/// §10 requires every capability in the shipped terminfo entry to name a
+/// td-term/DESIGN.md §2 requires every capability in the shipped terminfo entry to name a
 /// blocking native case. The corpus lives here, so the check does too.
 #[test]
 fn every_terminfo_capability_names_a_case_that_passes() {
-    let entry = crate::terminfo::parse().unwrap();
+    let entry = crate::vt_terminfo::parse().unwrap();
     let cases = corpus().unwrap();
     let ids: BTreeSet<&str> = cases.iter().map(|case| case.id.as_str()).collect();
     let xfails = parse_expectations(EXPECTATIONS).unwrap();
@@ -1881,12 +2080,12 @@ fn literal_terminfo_capabilities_appear_in_the_case_they_name() {
         found
     }
 
-    let entry = crate::terminfo::parse().unwrap();
+    let entry = crate::vt_terminfo::parse().unwrap();
     let cases = corpus().unwrap();
     let mut checked = 0;
     let mut missing = Vec::new();
     for capability in &entry.capabilities {
-        let crate::terminfo::Value::Bytes(bytes) = &capability.value else {
+        let crate::vt_terminfo::Value::Bytes(bytes) = &capability.value else {
             continue;
         };
         // `acsc` is a translation table, not a stream any case carries.
