@@ -875,3 +875,37 @@ Fixture material, its source PEM bytes and both endpoints remain charged in
 these observations; they are not isolated per-session or per-generation costs.
 Lifetime peaks include earlier controls. No ledger limit, production trust
 policy, generation admission or whole-service RSS claim changes.
+
+## Sampled process RSS observations
+
+A separate unwrapped `rss_probe` integration executable reuses the five shared
+allocation scenarios. Each mode runs in a fresh process without either
+allocation counter or the native registry. An observer opened before the
+scenario rewinds `/proc/self/smaps_rollup` into a fixed 4096-byte buffer and
+requires one complete read followed by EOF. It extracts exactly one positive
+`Rss:` value with kernel `kB` units (KiB); duplicate, missing, malformed or
+truncated values fail. Unsupported procfs is an error, with no fallback.
+The Linux [procfs documentation](https://docs.kernel.org/filesystems/proc.html)
+describes the smaps interfaces for more accurate resident accounting than the
+scalable, approximate status/statm counters.
+
+A separate default process checks parsing refusals and touches a 16 MiB
+allocation, requiring at least an 8 MiB resident increase. It reports before,
+live and dropped samples without requiring allocator release after drop.
+The large margin is a positive observation control, not an exact page-count
+claim. Those controls run separately so they do not warm scenario processes.
+
+The existing phase names are retained. Rows have `rss SCENARIO PHASE KIB`,
+where SCENARIO is client, handshake, entropy, fragment or large-chain;
+`rss-observation-v1: SCENARIO passed` closes each output. Samples use fixed
+arrays and are formatted after scenario teardown. Positive controls use the
+control scenario with baseline, touched and dropped phases.
+
+RSS includes resident code, stacks, shared pages, allocator overhead, fixture
+material and the observer itself. It is neither a disjoint native-allocation
+count nor a per-session charge. A rollup is a kernel walk, not an atomic
+snapshot of concurrently running threads. Checkpoints reduce fixture activity
+but do not turn these samples into transient high-water marks. Page residency
+and allocator retention vary by host and run. Whole-service worst-case RSS,
+maximum concurrency, stack coverage and ledger qualification remain pending;
+these observations change no memory allowance or service activation rule.

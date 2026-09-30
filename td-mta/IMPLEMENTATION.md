@@ -905,6 +905,12 @@ Implement the remaining work as independently reviewable increments:
     observe completed authentication and repeated records; maximal profile
     counts, remote chains, other TLS versions and whole-service bounds remain.
 
+  - **M07e3f — sampled process RSS observations:** a separate unwrapped test
+    executable runs the five existing scenarios, each in a fresh process.
+    A fixed rollup reader and positive resident-allocation control qualify
+    ordered KiB samples. They include fixture/observer overhead and do not
+    establish transient peaks, whole-service bounds or per-session charges.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,

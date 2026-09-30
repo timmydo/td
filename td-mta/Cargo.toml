@@ -22,6 +22,10 @@ harness = false
 name = "native_alloc_probe"
 harness = false
 
+[[test]]
+name = "rss_probe"
+harness = false
+
 [lints.rust]
 unexpected_cfgs = { level = "deny", check-cfg = ["cfg(td_native_alloc_probe)"] }
 

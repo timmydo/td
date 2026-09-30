@@ -433,6 +433,17 @@ pub(crate) fn build_inner() -> Result<()> {
         1200,
     )?;
     let native = executable(&output, "native_alloc_probe", ArtifactKind::IntegrationTest)?;
+    let mut command = cargo("test", "td-mta");
+    command.args([
+        "--release",
+        "--test",
+        "rss_probe",
+        "--no-run",
+        "--message-format=json-render-diagnostics",
+    ]);
+    command_record(&command, "rss-probe-build", &mut receipt)?;
+    let output = bounded_output(&mut command, "rss-probe-build", 8 * 1024 * 1024, 1200)?;
+    let rss = executable(&output, "rss_probe", ArtifactKind::IntegrationTest)?;
     for (index, (binary, probe, native_probe)) in [
         (&mail, false, false),
         (&crypto, false, false),
@@ -441,6 +452,7 @@ pub(crate) fn build_inner() -> Result<()> {
         (&transport, false, false),
         (&allocation, true, false),
         (&native, false, true),
+        (&rss, false, false),
     ]
     .into_iter()
     .enumerate()
@@ -457,6 +469,7 @@ pub(crate) fn build_inner() -> Result<()> {
         let symbols = bounded_output(&mut command, &name, 8 * 1024 * 1024, 30)?;
         allocation_symbols(&symbols, probe)?;
         native_allocation_symbols(&symbols, native_probe)?;
+        rss_symbols(&symbols, binary == &rss)?;
     }
     refuse_decoy(Path::new("/output"))?;
     fs::create_dir("/output/artifacts").map_err(|e| format!("portable artifacts: {e}"))?;
@@ -476,6 +489,7 @@ pub(crate) fn build_inner() -> Result<()> {
         &native,
         Path::new("/output/artifacts/td-mta-native-allocation-probe"),
     )?;
+    copy_binary(&rss, Path::new("/output/artifacts/td-mta-rss-probe"))?;
     crate::crypto_api::qualify(&mut receipt)?;
     refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
@@ -632,6 +646,92 @@ fn tls_phase_evidence(
     Ok(())
 }
 
+fn rss_symbols(symbols: &str, probe: bool) -> Result<()> {
+    if symbols.trim().is_empty() || symbols.contains("rss_probe") != probe {
+        return Err("RSS diagnostic symbol boundary failed".into());
+    }
+    Ok(())
+}
+
+fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
+    let phases: &[&str] = match scenario {
+        "control" => &["baseline", "touched", "dropped"],
+        "client" => &[
+            "baseline",
+            "config",
+            "generation",
+            "buffers",
+            "reserved",
+            "constructed",
+            "overlap",
+            "two_sessions",
+            "refused",
+            "released",
+            "repeated",
+            "dropped",
+        ],
+        "handshake" | "large-chain" => &[
+            "baseline",
+            "material",
+            "config",
+            "generation",
+            "buffers",
+            "constructed",
+            "handshake",
+            "record",
+            "repeated",
+            "released",
+            "dropped",
+        ],
+        "entropy" => &[
+            "baseline",
+            "spawned",
+            "first_warm",
+            "all_warm",
+            "repeated",
+            "joined",
+            "dropped",
+        ],
+        "fragment" => &[
+            "baseline",
+            "policy",
+            "storage",
+            "large_constructed",
+            "large_pending",
+            "large_refused",
+            "small_constructed",
+            "small_pending",
+            "small_refused",
+            "over_limit",
+            "repeated",
+            "dropped",
+        ],
+        _ => return Err("unknown RSS observation scenario".into()),
+    };
+    let mut lines = output.lines();
+    for phase in phases {
+        let prefix = format!("rss {scenario} {phase} ");
+        let value = lines
+            .next()
+            .and_then(|line| line.strip_prefix(&prefix))
+            .ok_or("missing or reordered RSS phase")?;
+        if value.is_empty()
+            || !value.bytes().all(|b| b.is_ascii_digit())
+            || value.parse::<u64>().map_err(|_| "invalid RSS value")? == 0
+        {
+            return Err("invalid RSS observation".into());
+        }
+    }
+    let completion = format!("rss-observation-v1: {scenario} passed");
+    if lines.next() != Some(completion.as_str())
+        || lines.next().is_some()
+        || !output.ends_with('\n')
+    {
+        return Err("invalid RSS completion".into());
+    }
+    Ok(())
+}
+
 fn native_allocation_evidence(output: &str, zero_resize: bool) -> Result<()> {
     if zero_resize {
         if output != "native-allocation-probe-v1: zero-resize invalidated\n" {
@@ -764,6 +864,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
         "td-mta-transport-smoke",
         "td-mta-rust-allocation-probe",
         "td-mta-native-allocation-probe",
+        "td-mta-rss-probe",
     ]
     .map(std::ffi::OsString::from)
     .into_iter()
@@ -781,6 +882,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
         "td-mta-transport-smoke",
         "td-mta-rust-allocation-probe",
         "td-mta-native-allocation-probe",
+        "td-mta-rss-probe",
     ] {
         copy_binary(&source.join(name), &destination.join(name))?;
     }
@@ -965,6 +1067,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         "/artifacts/td-mta-transport-smoke",
         "/artifacts/td-mta-rust-allocation-probe",
         "/artifacts/td-mta-native-allocation-probe",
+        "/artifacts/td-mta-rss-probe",
         "/output",
     ])?;
     let mut command = Command::new("/artifacts/td-mta");
@@ -1294,6 +1397,28 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
 
+    for (scenario, argument) in [
+        ("control", None),
+        ("client", Some("--tls-clients")),
+        ("handshake", Some("--tls-handshake")),
+        ("entropy", Some("--entropy-workers")),
+        ("fragment", Some("--tls-fragments")),
+        ("large-chain", Some("--tls-large-chain")),
+    ] {
+        let mut command = Command::new("/artifacts/td-mta-rss-probe");
+        command.env_clear().stdin(Stdio::null());
+        if let Some(argument) = argument {
+            command.arg(argument);
+        }
+        crate::host_bin::arm_check_child(&mut command);
+        let name = format!("rss-probe-{scenario}");
+        let output = bounded_output(&mut command, &name, 8192, 30)?;
+        rss_evidence(&output, scenario)?;
+        for line in output.lines() {
+            println!("portable RSS diagnostic (KiB): {line}");
+        }
+    }
+
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
     println!("portable runtime: sixty-five mail SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
     Ok(())
@@ -1369,6 +1494,7 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
         "td-mta-transport-smoke",
         "td-mta-rust-allocation-probe",
         "td-mta-native-allocation-probe",
+        "td-mta-rss-probe",
     ] {
         qualify_binary(&artifacts.join(binary))?;
     }
@@ -1451,6 +1577,39 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn rss_symbols_require_the_named_probe_only_in_its_artifact() {
+        let probe = "000001 T rss_probe::main\n";
+        let plain = "000001 T main\n";
+        assert!(rss_symbols(probe, true).is_ok());
+        assert!(rss_symbols(plain, false).is_ok());
+        assert!(rss_symbols(probe, false).is_err());
+        assert!(rss_symbols(plain, true).is_err());
+        for intended in [false, true] {
+            assert!(rss_symbols(" \n", intended).is_err());
+        }
+    }
+
+    #[test]
+    fn rss_records_require_positive_values_exact_phases_and_completion() {
+        let good = "rss control baseline 100\nrss control touched 17000\nrss control dropped 110\nrss-observation-v1: control passed\n";
+        assert!(rss_evidence(good, "control").is_ok());
+        assert!(rss_evidence(good, "client").is_err());
+        assert!(rss_evidence(good, "unknown").is_err());
+        for bad in [
+            good.replace("touched", "baseline"),
+            good.replace("100", "0"),
+            good.replace("100", "-1"),
+            good.replace("100", "18446744073709551616"),
+            good.replace("100", "100 1"),
+            good.replace("passed", "failed"),
+            format!("{good}extra\n"),
+        ] {
+            assert!(rss_evidence(&bad, "control").is_err());
+        }
+        assert!(rss_evidence(good.trim_end(), "control").is_err());
+    }
 
     #[test]
     fn fragment_records_require_pending_refusal_and_repetition() {
@@ -1808,6 +1967,7 @@ mod tests {
             "td-mta-transport-smoke",
             "td-mta-rust-allocation-probe",
             "td-mta-native-allocation-probe",
+            "td-mta-rss-probe",
             "COMMANDS",
         ] {
             fs::write(source.join(name), name).unwrap();
@@ -1825,6 +1985,9 @@ mod tests {
         fs::remove_file(source.join("td-mta-rust-allocation-probe")).unwrap();
         assert!(collect_artifacts(&output, &scratch.0.join("missing-allocation")).is_err());
         fs::write(source.join("td-mta-rust-allocation-probe"), b"probe").unwrap();
+        fs::remove_file(source.join("td-mta-rss-probe")).unwrap();
+        assert!(collect_artifacts(&output, &scratch.0.join("missing-rss")).is_err());
+        fs::write(source.join("td-mta-rss-probe"), b"rss").unwrap();
         let good = scratch.0.join("good");
         assert_eq!(collect_artifacts(&output, &good).unwrap(), "COMMANDS");
         assert_eq!(fs::read(good.join("td-mta")).unwrap(), b"td-mta");

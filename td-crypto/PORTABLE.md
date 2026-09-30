@@ -230,7 +230,7 @@ image's whole-closure profiling qualification. Debug information remains in
 the executables; distribution debug-companion integration is not claimed.
 
 Cargo's selected normal/build graphs must match admission. Its artifact records
-must select exactly one expected binary/test profile. All seven results must be
+must select exactly one expected binary/test profile. All eight results must be
 x86-64 static PIEs with an executable entry point and no ELF interpreter,
 DT_NEEDED or runtime search path. A second fresh namespace mounts only the
 result and static test supervisor, then runs the installed name's version command
@@ -245,7 +245,7 @@ output quota. M07 owns native/TLS allocation and entropy-failure qualification;
 a Result wrapper cannot contain provider aborts.
 
 After the compile namespace exits and its descendants are reaped, the host
-requires an exact regular-file output inventory: seven binaries and the inner
+requires an exact regular-file output inventory: eight binaries and the inner
 command record. It rejects output directory/file symlinks and additional files,
 then copies these checked inputs into a fresh private directory outside the
 compiler's writable mount. Only this directory receives host-written metadata
@@ -256,6 +256,8 @@ their environment; namespace entry remains the isolation boundary.
 
 Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
 
+- `td-mta-rss-probe`: separate unwrapped process RSS observations, with no
+  service use or inferred whole-service/transient-peak bound.
 - `td-mta-native-allocation-probe`: separate libc forwarding diagnostic with
   explicit registry/counter/per-thread-flag storage evidence and no service use.
 - `td-mta-rust-allocation-probe`: dedicated System-forwarding allocation
@@ -795,7 +797,7 @@ Successful output reports registry bytes, fixed counter bytes and one thread
 flag separately; thread TLS-block/runtime overhead is outside these figures.
 The builder requires positive bounded values plus the exact completion record.
 It requires wrapper/registry sentinels in this executable, refuses
-any wrapper in the other six executables and refuses resolved sdallocx or
+any wrapper in the other seven executables and refuses resolved sdallocx or
 OPENSSL_memory allocator hooks and unqualified aligned/array entry points. These checks do not classify all allocation
 machinery or cover hidden/local references; counts remain diagnostic.
 
@@ -843,3 +845,23 @@ within the local loader's 64 KiB limit. Each padded certificate remains within
 large-chain schema and log per domain. Both endpoints and retained fixture
 material are included; successful large-chain traffic is not a total service,
 maximum-profile or RSS qualification.
+
+## Mail sampled RSS diagnostic artifact
+
+`td-mta-rss-probe` is an eighth integration executable with its own main.
+It uses the ordinary allocator, no native wrappers and no allocation-counter
+storage. Symbol checks require the `rss_probe` sentinel only in this artifact
+and refuse the Rust/native probe sentinels there. The exact artifact inventory,
+static ELF validation and fresh runtime namespace include it explicitly.
+
+The default process checks the bounded rollup parser and observes a positive
+resident increase after touching a 16 MiB allocation. Five independent fresh
+processes run the existing client, local handshake, entropy worker, fragmented
+handshake and large-chain scenarios. The runtime requires exact ordered rows,
+positive decimal KiB values and the scenario completion record before logging.
+Every mode has its own bounded log and 30-second deadline. Missing procfs
+support or malformed/truncated rollup output fails qualification.
+
+RESOURCES.md in td-mta defines the observation scope. These are sampled whole
+fixture process values, including stacks and observer state. They do not
+establish transient peaks, isolate provider costs or qualify service admission.
