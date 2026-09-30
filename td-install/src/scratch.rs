@@ -51,6 +51,16 @@ struct ScratchRoot {
     _lease: File,
 }
 
+impl Drop for ScratchRoot {
+    fn drop(&mut self) {
+        // The lock lives on the open file description, and a child a sibling
+        // thread is spawning shares that from its fork until its exec closes
+        // it. Closing our descriptor alone can leave the root locked a while
+        // longer; unlocking releases it for every holder.
+        let _ = self._lease.unlock();
+    }
+}
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 /// A fresh, unique path under this process's private scratch root. Nothing is
