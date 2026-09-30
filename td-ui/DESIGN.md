@@ -308,8 +308,9 @@ of its own files may name each module.
   `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` values a consumer passes),
   `connect`, `Connection` (`new`, `send` with at most one borrowed file,
   `words`, `take`, `read_more`, `budget`, `pop_descriptor` with the
-  pending `descriptors` count, and the `wait` and `startup_deadline`
-  accessors), the budgets `READ_BYTES`,
+  pending `descriptors` count, the `wait` and `startup_deadline`
+  accessors, and `waker`), `Waker` (`wake`; `Clone`, `Send`, `Sync`), the
+  budgets `READ_BYTES`,
   `PENDING_BYTES`, `DESCRIPTORS`, `WRITE_DEADLINE`, `CONNECT_DEADLINE` and
   `IDLE_WAIT`, `backing_file`, `CURSOR_WIDTH`, `CURSOR_HEIGHT` and
   `cursor_pixels`, and `peer`, the test support: `drain` reads the far
@@ -867,7 +868,19 @@ not frames, and stays its own).
   KiB read feeds a 128 KiB pending-byte budget and an eight-right FIFO; the
   idle reader waits `IDLE_WAIT` through a socket timeout, or elapsed-time
   backoff for an inherited nonblocking socket whose shared status flags it
-  never changes, and a consumer's `set_wait` shortens that wait.
+  never changes, and a consumer's `set_wait` shortens that wait. Once a
+  consumer has asked for the connection's one `Waker`, the wait is a
+  `poll` over exactly two descriptors, the stream and the waker's own end
+  of a private nonblocking datagram pair, readable only, for the same
+  budget rounded up to a whole millisecond and capped at 65535 (a longer
+  wait ends early and the loop waits again; a zero wait is a probe); a
+  wake ends it after draining at most 64 queued wakes, so wakes sent
+  together are one, a wake sent before the wait is not lost and one left
+  queued is another turn, and the stream is read only when poll reports
+  it, for what is left of the budget. A program whose work arrives on
+  another thread (td-term's PTY output) wakes the loop when it sends
+  instead of being served on a short wait. A waker whose connection has
+  gone reports an error, without a `SIGPIPE`, rather than blocking.
 - The client's table is dense: the fixed ids 1 through 9 are published in
   order before any dynamic id from 10, a slot is reused only after
   `delete_id` (for a consumer's object, only when its tag says it is
@@ -1023,10 +1036,11 @@ not frames, and stays its own).
   invalid input returns a diagnostic or error naming the item.
 - `unsafe` is confined to `sys`, the transport's raw module, under
   `UNSAFE.md` §19: two function-scoped allowances, one syscall instruction
-  carrying `recvmsg`, `sendmsg` and `fcntl` pinned to `F_DUPFD_CLOEXEC`,
-  `F_GETFL` and `F_SETFL`, one descriptor adoption site, and a crate root
+  carrying `recvmsg`, `sendmsg`, `fcntl` pinned to `F_DUPFD_CLOEXEC`,
+  `F_GETFL` and `F_SETFL`, and `poll` over the connection's stream and
+  its waker, one descriptor adoption site, and a crate root
   that denies it. Only `wayland` and `clipboard` name the module, the
-  transport through its three wrappers and the clipboard's destination
+  transport through its four wrappers and the clipboard's destination
   owner through the two status ones. Reusing it does not transfer
   authorization to a new consumer, which gets its own roster entry.
 - The shared font and wire sources are mounted here by exact repository
@@ -1139,7 +1153,11 @@ td-editor's adapter: close-on-exec duplication of an inherited stream,
 owned and closed received rights, the ancillary walk past unknown records
 and invalid entries, kernel truncation, byte-only EOF, the eight-right
 FIFO budget with disconnect closing every owner, the idle wait on an
-inherited nonblocking socket without touching its shared flags, write
+inherited nonblocking socket without touching its shared flags, poll
+readiness naming each stream with a timeout naming neither and a hangup
+counted as readiness, a wake ending a long wait from another thread and
+before it with queued wakes drained as one, compositor bytes still read
+beside a waker, a waker outliving its connection refused, write
 backpressure under the startup deadline, environment precedence, and the
 peer reader draining requests with their rights from a pool file that is
 private, unlinked and exactly sized.
@@ -1192,7 +1210,8 @@ interface, and the raw layer: the complete fingerprint of `sys.rs`, its
 syscall and flag values, its two function-only allowances, the single
 instruction and adoption sites, that the crate root denies `unsafe` and
 declares the module private, that `wayland` and `clipboard` are its only
-callers, the transport through exactly four wrapper calls and the
+callers, the transport through exactly five wrapper calls (the poll
+over two readable-only entries among them) and the
 clipboard's destination owner through exactly five status calls, that no
 production module calls the client's
 test support (`unconfigure`, `input_mut`), and that the client is the

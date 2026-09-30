@@ -104,7 +104,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
             "unsafe keyword in {name}"
         );
         // The raw module is named by the crate root's private declaration,
-        // by the transport's two imports and four wrapper calls and by the
+        // by the transport's two imports and five wrapper calls and by the
         // clipboard's import and five status calls; no other module,
         // shared source or test-support reader reaches it.
         // The socket's pinned procfs pathname has a `sys` segment that is
@@ -120,7 +120,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
             identifier_count(&raw_text, "sys"),
             match name.as_str() {
                 "lib.rs" => 1,
-                "wayland.rs" => 6,
+                "wayland.rs" => 7,
                 "clipboard.rs" => 6,
                 _ => 0,
             },
@@ -310,13 +310,15 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0x614c3ddedf2ca24d,
+        hash, 0xd4d8765954d79021,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
         "const SYS_SENDMSG: usize = 46;",
         "const SYS_RECVMSG: usize = 47;",
         "const SYS_FCNTL: usize = 72;",
+        "const SYS_POLL: usize = 7;",
+        "const POLLIN: i16 = 1;",
         "const F_DUPFD_CLOEXEC: usize = 1030;",
         "const F_GETFL: usize = 3;",
         "const F_SETFL: usize = 4;",
@@ -340,12 +342,18 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         "pub(crate) fn inherited(fd: i32) -> io::Result<UnixStream>",
         "pub(crate) fn receive(stream: &UnixStream, bytes: &mut [u8])",
         "pub(crate) fn send_file(stream: &UnixStream, bytes: &[u8], file: &File)",
+        "pub(crate) fn readable(\n    stream: &UnixStream,\n    waker: &UnixDatagram,\n    timeout_ms: u16,\n) -> io::Result<[bool; 2]>",
+        "SYS_POLL,\n        fds.as_mut_ptr() as usize,\n        fds.len(),\n        usize::from(timeout_ms),",
+        "events: POLLIN,",
     ] {
         assert!(raw.contains(pin), "{pin}");
     }
     assert!(!raw.contains("#![allow("));
     assert_eq!(raw.matches("core::arch::asm!").count(), 1);
     assert_eq!(raw.matches("from_raw_fd").count(), 1);
+    // poll(2) is over exactly the two borrowed streams, readable only.
+    assert_eq!(raw.matches("events: POLLIN,").count(), 2);
+    assert_eq!(raw.matches("SYS_POLL").count(), 2);
     let production = raw.split("#[cfg(test)]").next().unwrap();
     assert!(!production.contains("pub fn"), "nothing raw is public");
     assert!(!production.contains("pub struct"));
@@ -415,8 +423,9 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
     assert!(!client.contains("from_raw_fd") && !client.contains("as_raw_fd"));
     assert!(!client.contains("mmap"));
     let transport = include_str!("../src/wayland.rs");
-    assert_eq!(transport.matches("sys::").count(), 4);
+    assert_eq!(transport.matches("sys::").count(), 5);
     for call in [
+        "sys::readable(&self.stream, own, millis)",
         "sys::inherited(fd)",
         "sys::send_file(&self.stream, suffix, right)",
         "sys::receive(&self.stream, &mut self.read)",
@@ -425,6 +434,13 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         assert_eq!(transport.matches(call).count(), 1, "{call}");
     }
     assert_eq!(transport.matches("use crate::sys;").count(), 1);
+    // The poll's one caller is the connection's wait.
+    let read_more = transport
+        .split("pub fn read_more(&mut self) -> Result<()> {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    pub fn ").next())
+        .unwrap();
+    assert!(read_more.contains("sys::readable(&self.stream, own, millis)"));
     assert_eq!(
         transport
             .matches("use super::{sys, wire, Connection, Message, Result, DESCRIPTORS, PENDING_BYTES, READ_BYTES};")

@@ -110,7 +110,7 @@ own entry.
 | 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake and six-request terminal ioctl/poll modules below |
 | 17 | `td-mail` | retired: `term_sys.rs`, td-sh's terminal half, went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§17](#17-td-mail--retired) |
 | 18 | `td-news` | retired: the copy of `term_sys.rs` went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§18](#18-td-news--retired) |
-| 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner; plus one scoped descriptor adoption — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
+| 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker; plus one scoped descriptor adoption — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
@@ -2646,10 +2646,11 @@ td-sh's own entry.
 
 ## 19. `td-ui` — the shared Wayland client transport
 
-td-ui's `sys.rs` carries exactly THREE x86-64 Linux syscalls through one
-function-scoped instruction: `recvmsg` (47), `sendmsg` (46) and `fcntl` (72)
+td-ui's `sys.rs` carries exactly FOUR x86-64 Linux syscalls through one
+function-scoped instruction: `recvmsg` (47), `sendmsg` (46), `fcntl` (72)
 pinned to `F_DUPFD_CLOEXEC` (1030) for the transport and to `F_GETFL` (3)
-and `F_SETFL` (4) for the clipboard destination owner. A second
+and `F_SETFL` (4) for the clipboard destination owner, and `poll` (7) for
+the connection's wait once a consumer holds its waker. A second
 function-scoped allowance adopts newly installed nonnegative descriptors
 into `OwnedFd`. Safe `std` owns connection setup, byte-only sends,
 timeouts, pool file creation and unlinking, positional pixel writes and
@@ -2730,6 +2731,19 @@ consumer of the toolkit with objects of its own pops their rights through
 the client's accessor under its own contract (§14 records that the editor
 has none).
 
+The poll caller is `Connection::read_more`, and only once a consumer has
+asked for the connection's `Waker`. `readable` builds a two-entry `pollfd`
+array on its own frame — the connection's stream and the waker's own end
+of a private nonblocking datagram pair, each borrowed, each `POLLIN` (1)
+only — and passes its length and a timeout of at most 65535 milliseconds
+taken from the connection's bounded wait, never a negative (infinite)
+one. It returns which entries reported any event; a hangup or error is
+readiness, so the read that follows reports it. Interruption is readiness
+of neither. No descriptor is adopted, closed or chosen by the caller: the
+two are the connection's own, and the waker's end is drained with at
+most 64 safe nonblocking receives. The pollfd layout is asserted at
+eight bytes.
+
 The only send caller is the connection's descriptor-send path. `sendmsg`
 carries exactly one borrowed `File` in a 24-byte ancillary extent,
 `cmsg_len=20`, and fixed `SOL_SOCKET`/`SCM_RIGHTS`. The caller supplies only
@@ -2765,24 +2779,27 @@ ancillary boundaries coincide with wire-message boundaries.
 Confinement tests pin the complete raw source fingerprint, the syscall and
 flag values, the two function-only allowances, the single instruction and
 adoption sites, that no other td-ui module names the raw module and that
-only `wayland.rs` calls its three transport wrappers and only
+only `wayland.rs` calls its four transport wrappers (the poll with two
+readable-only entries) and only
 `clipboard.rs` its two status wrappers, through the destination owner
 alone, whose whole implementation is fingerprinted and whose five status
 calls are pinned each at its exact site and in its exact form, that
 the crate root denies `unsafe`, and that the keymap reader and the send
 are the only pops beyond the FIFO's own accessor, the reader with its
 format, size and regular-file checks. Kernel tests exercise transfer,
-close-on-exec duplication, refusal cleanup and truncated rights, and the
+close-on-exec duplication, refusal cleanup and truncated rights, poll
+readiness per entry with timeout and hangup, and the
 destination owner over real pipes and sockets: nonblocking mode and its
 restoration through a shared alias on completion, cancel and drop, the
 refusals, the deadline and the byte budget; a byte-level synthetic
 control test checks cleanup beyond unrecognized records and invalid
 entries.
 
-No mmap, ioctl, GPU access, poll, close syscall, credential call, child
-exec, raw environment-fd adoption or received-fd consumer beyond the keymap
-reader and the send hand-off is authorized here. A fourth syscall, fourth
-fcntl command, another caller, or additional allowance amends this section
+No mmap, ioctl, GPU access, poll beyond the connection's two-entry wait,
+close syscall, credential call, child exec, raw environment-fd adoption or
+received-fd consumer beyond the keymap reader and the send hand-off is
+authorized here. A fifth syscall, fourth fcntl command, another caller, or
+additional allowance amends this section
 and `td-ui/DESIGN.md` in the same landing; a consumer that takes a right
 from the FIFO records that consumer in its own section.
 

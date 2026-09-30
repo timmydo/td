@@ -15,9 +15,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -105,10 +106,36 @@ pub fn connect(endpoint: Endpoint) -> Result<UnixStream> {
     }
 }
 
+/// Ends a connection's wait from another thread: a program whose work
+/// arrives on a channel wakes the loop when it sends, rather than being
+/// served on a short wait. A wake before the wait begins is kept until the
+/// wait sees it; wakes that arrive together are one. A datagram pair, so
+/// a wake whose connection has gone is refused without a `SIGPIPE`.
+#[derive(Clone, Debug)]
+pub struct Waker {
+    socket: Arc<UnixDatagram>,
+}
+
+impl Waker {
+    /// A full buffer is a wake already pending, not a failure; a loop that
+    /// has gone is.
+    pub fn wake(&self) -> Result<()> {
+        loop {
+            match self.socket.send(&[1]) {
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("wake: {e}")),
+            }
+        }
+    }
+}
+
 /// One display connection: the stream, the bytes received but not yet
 /// parsed, the rights received but not yet consumed, the startup deadline
-/// that caps every wait until the first frame is submitted, and the idle
-/// wait the consumer sets from its own schedule.
+/// that caps every wait until the first frame is submitted, the idle
+/// wait the consumer sets from its own schedule, and the waker's end, once
+/// a consumer has asked for one.
 pub struct Connection {
     stream: UnixStream,
     pending: Vec<u8>,
@@ -116,6 +143,7 @@ pub struct Connection {
     startup_deadline: Option<Instant>,
     descriptors: VecDeque<OwnedFd>,
     wait: Duration,
+    waker: Option<(UnixDatagram, Waker)>,
 }
 
 impl Connection {
@@ -128,7 +156,24 @@ impl Connection {
             startup_deadline: None,
             descriptors: VecDeque::with_capacity(DESCRIPTORS),
             wait: IDLE_WAIT,
+            waker: None,
         })
+    }
+
+    /// The connection's one waker, made on first use: from then on each
+    /// wait also ends when a clone of it is woken.
+    pub fn waker(&mut self) -> Result<Waker> {
+        if let Some((_, waker)) = &self.waker {
+            return Ok(waker.clone());
+        }
+        let (own, other) = UnixDatagram::pair().map_err(error)?;
+        own.set_nonblocking(true).map_err(error)?;
+        other.set_nonblocking(true).map_err(error)?;
+        let waker = Waker {
+            socket: Arc::new(other),
+        };
+        self.waker = Some((own, waker.clone()));
+        Ok(waker)
     }
 
     /// Sends one request, with at most one borrowed file as its right. A
@@ -198,9 +243,41 @@ impl Connection {
     }
 
     /// Waits at most the idle wait (capped by the startup deadline) for
-    /// more bytes and rights, refusing either budget's overflow.
+    /// more bytes and rights, refusing either budget's overflow. With a
+    /// waker, a wake also ends the wait, having drained at most 64 queued
+    /// wakes; one left queued ends the next wait.
     pub fn read_more(&mut self) -> Result<()> {
-        let wait = self.budget(self.wait)?;
+        let mut wait = self.budget(self.wait)?;
+        if let Some((own, _)) = &self.waker {
+            // Rounded up, so the poll never ends before the budget does.
+            let partial = u128::from(wait.subsec_nanos() % 1_000_000 != 0);
+            let millis =
+                u16::try_from(wait.as_millis().saturating_add(partial)).unwrap_or(u16::MAX);
+            let polled = Instant::now();
+            let [stream, woken] = sys::readable(&self.stream, own, millis).map_err(error)?;
+            if woken {
+                // A bounded drain: a wake left queued is another turn, not
+                // a lost one. The connection keeps a clone of its waker,
+                // so the sending end cannot close under it.
+                let mut drained = [0u8; 1];
+                for _ in 0..64 {
+                    match own.recv(&mut drained) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(format!("waker: {e}")),
+                    }
+                }
+            }
+            if !stream {
+                return Ok(());
+            }
+            // The stream is readable, so the receive only needs what is
+            // left of the budget; a socket timeout cannot be zero.
+            wait = wait
+                .saturating_sub(polled.elapsed())
+                .max(Duration::from_millis(1));
+        }
         self.stream.set_read_timeout(Some(wait)).map_err(error)?;
         let start = Instant::now();
         match sys::receive(&self.stream, &mut self.read) {
@@ -224,8 +301,9 @@ impl Connection {
                         | io::ErrorKind::Interrupted
                 ) =>
             {
-                // Inherited nonblocking sockets do not honor SO_RCVTIMEO.
-                if e.kind() == io::ErrorKind::WouldBlock {
+                // Inherited nonblocking sockets do not honor SO_RCVTIMEO;
+                // with a waker the poll already spent the wait.
+                if e.kind() == io::ErrorKind::WouldBlock && self.waker.is_none() {
                     std::thread::sleep(wait.saturating_sub(start.elapsed()));
                 }
                 Ok(())
@@ -500,6 +578,79 @@ mod tests {
         for mut peer in endpoints {
             assert_eq!(peer.read(&mut [0]).unwrap(), 0);
         }
+    }
+
+    const _: fn() = || {
+        fn shared<T: Send + Sync + Clone>() {}
+        shared::<Waker>();
+    };
+
+    #[test]
+    fn a_wake_ends_the_wait_and_bytes_still_arrive_with_a_waker() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(stream).unwrap();
+        connection.set_wait(Duration::from_secs(10));
+        let waker = connection.waker().unwrap();
+        let other = connection.waker().unwrap();
+        // Wakes before the wait are kept, and several are one.
+        waker.wake().unwrap();
+        other.wake().unwrap();
+        let start = Instant::now();
+        connection.read_more().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(connection.take().unwrap().is_none());
+        // A zero wait with a waker is a probe, not a sleep.
+        connection.set_wait(Duration::ZERO);
+        let start = Instant::now();
+        connection.read_more().unwrap();
+        assert!(start.elapsed() < Duration::from_millis(50));
+        // Drained: the next wait lasts until a thread wakes it.
+        connection.set_wait(Duration::from_millis(50));
+        let start = Instant::now();
+        connection.read_more().unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        connection.set_wait(Duration::from_secs(10));
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            waker.wake().unwrap();
+        });
+        let start = Instant::now();
+        connection.read_more().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        thread.join().unwrap();
+        // Compositor bytes are still read on a connection with a waker.
+        let mut bytes = Builder::new();
+        bytes.u32(7);
+        peer.write_all(&bytes.message(1, 2).unwrap()).unwrap();
+        connection.read_more().unwrap();
+        let message = connection.take().unwrap().unwrap();
+        assert_eq!((message.object, message.opcode), (1, 2));
+        drop(peer);
+        assert!(connection.read_more().unwrap_err().contains("disconnected"));
+        // Waking a connection that has gone is an error, not a hang.
+        drop(connection);
+        assert!(other.wake().is_err());
+    }
+
+    #[test]
+    fn a_wake_backlog_is_drained_a_bounded_amount_per_wait() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(stream).unwrap();
+        let waker = connection.waker().unwrap();
+        for _ in 0..100 {
+            waker.wake().unwrap();
+        }
+        connection.set_wait(Duration::from_secs(10));
+        // Sixty-four go on the first wait; the rest end the second at once.
+        for _ in 0..2 {
+            let start = Instant::now();
+            connection.read_more().unwrap();
+            assert!(start.elapsed() < Duration::from_secs(5));
+        }
+        connection.set_wait(Duration::from_millis(50));
+        let start = Instant::now();
+        connection.read_more().unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(50));
     }
 
     #[test]

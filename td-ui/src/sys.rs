@@ -1,8 +1,9 @@
 //! Linux x86-64 descriptor transport for the Wayland client and the
 //! clipboard destination's status commands; UNSAFE.md section 19. One
-//! function-scoped syscall instruction carries `recvmsg`, `sendmsg` and
+//! function-scoped syscall instruction carries `recvmsg`, `sendmsg`,
 //! `fcntl` pinned to `F_DUPFD_CLOEXEC` for the transport and to `F_GETFL`
-//! and `F_SETFL` for the destination owner; one function-scoped adoption
+//! and `F_SETFL` for the destination owner, and `poll` over exactly the
+//! connection's stream and its waker; one function-scoped adoption
 //! site owns freshly installed descriptors. Safe `std` owns connection
 //! setup, byte-only sends, timeouts, file creation and every close.
 //! Nothing here is reachable from another crate: the connection in
@@ -13,7 +14,7 @@
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixDatagram, UnixStream};
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("the td-ui Wayland transport requires Linux x86-64");
@@ -21,6 +22,8 @@ compile_error!("the td-ui Wayland transport requires Linux x86-64");
 const SYS_SENDMSG: usize = 46;
 const SYS_RECVMSG: usize = 47;
 const SYS_FCNTL: usize = 72;
+const SYS_POLL: usize = 7;
+const POLLIN: i16 = 1;
 const F_DUPFD_CLOEXEC: usize = 1030;
 const F_GETFL: usize = 3;
 const F_SETFL: usize = 4;
@@ -52,6 +55,14 @@ struct MsgHdr {
     flags: i32,
 }
 
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const _: [(); 8] = [(); std::mem::size_of::<PollFd>()];
 const _: [(); 16] = [(); std::mem::size_of::<IoVec>()];
 const _: [(); 56] = [(); std::mem::size_of::<MsgHdr>()];
 const _: [(); 48] = [(); std::mem::offset_of!(MsgHdr, flags)];
@@ -127,6 +138,41 @@ pub(crate) fn inherited(fd: i32) -> io::Result<UnixStream> {
     let stream = UnixStream::from(owned);
     stream.peer_addr()?;
     Ok(stream)
+}
+
+/// Which of the two borrowed streams became readable, hung up or failed
+/// within `timeout_ms`; a following read reports which. Interruption is
+/// readiness of neither. The array is exactly two entries on this frame.
+pub(crate) fn readable(
+    stream: &UnixStream,
+    waker: &UnixDatagram,
+    timeout_ms: u16,
+) -> io::Result<[bool; 2]> {
+    let mut fds = [
+        PollFd {
+            fd: stream.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        },
+        PollFd {
+            fd: waker.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        },
+    ];
+    match result(syscall3(
+        SYS_POLL,
+        fds.as_mut_ptr() as usize,
+        fds.len(),
+        usize::from(timeout_ms),
+    )) {
+        Ok(_) => {
+            let [first, second] = &fds;
+            Ok([first.revents != 0, second.revents != 0])
+        }
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok([false, false]),
+        Err(e) => Err(e),
+    }
 }
 
 fn header(iov: &mut IoVec, control: &mut Control, length: usize) -> MsgHdr {
@@ -375,6 +421,26 @@ mod tests {
         for mut peer in peers {
             assert_eq!(peer.read(&mut [0]).unwrap(), 0);
         }
+    }
+
+    #[test]
+    fn readiness_names_each_stream_and_a_timeout_names_neither() {
+        let (stream, mut stream_peer) = UnixStream::pair().unwrap();
+        let (waker, waker_peer) = UnixDatagram::pair().unwrap();
+        assert_eq!(readable(&stream, &waker, 0).unwrap(), [false, false]);
+        let started = std::time::Instant::now();
+        assert_eq!(readable(&stream, &waker, 30).unwrap(), [false, false]);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(30));
+        waker_peer.send(b"w").unwrap();
+        assert_eq!(readable(&stream, &waker, 1000).unwrap(), [false, true]);
+        stream_peer.write_all(b"s").unwrap();
+        assert_eq!(readable(&stream, &waker, 1000).unwrap(), [true, true]);
+        waker.recv(&mut [0]).unwrap();
+        assert_eq!(readable(&stream, &waker, 0).unwrap(), [true, false]);
+        (&stream).read_exact(&mut [0]).unwrap();
+        drop(stream_peer);
+        // A hangup is readiness: the read that follows reports the end.
+        assert_eq!(readable(&stream, &waker, 1000).unwrap(), [true, false]);
     }
 
     #[test]
