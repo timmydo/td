@@ -230,7 +230,7 @@ image's whole-closure profiling qualification. Debug information remains in
 the executables; distribution debug-companion integration is not claimed.
 
 Cargo's selected normal/build graphs must match admission. Its artifact records
-must select exactly one expected binary/test profile. All five results must be
+must select exactly one expected binary/test profile. All six results must be
 x86-64 static PIEs with an executable entry point and no ELF interpreter,
 DT_NEEDED or runtime search path. A second fresh namespace mounts only the
 result and static test supervisor, then runs the installed name's version command
@@ -245,7 +245,7 @@ output quota. M07 owns native/TLS allocation and entropy-failure qualification;
 a Result wrapper cannot contain provider aborts.
 
 After the compile namespace exits and its descendants are reaped, the host
-requires an exact regular-file output inventory: five binaries and the inner
+requires an exact regular-file output inventory: six binaries and the inner
 command record. It rejects output directory/file symlinks and additional files,
 then copies these checked inputs into a fresh private directory outside the
 compiler's writable mount. Only this directory receives host-written metadata
@@ -256,6 +256,8 @@ their environment; namespace entry remains the isolation boundary.
 
 Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
 
+- `td-mta-rust-allocation-probe`: dedicated System-forwarding allocation
+  qualification process; never an installed executable or service dependency.
 - `td-mta`: the installed executable name, currently only `--version`/`--help`;
   all service arguments fail. It does not yet serve mail.
 - `td-crypto-smoke`: separate qualification test executable, not a service
@@ -753,3 +755,18 @@ reaches peer verification. Reusing healthy material after remote refusals is
 required. Selected versus unrelated expiry/retirement, mid-handshake expiry,
 established-date behavior, shared clock panic and consuming Acceptor unwind
 are separate cases. No gateway authorization or whole-memory bound is claimed.
+
+## Mail Rust allocation qualification artifact
+
+`td-mta-rust-allocation-probe` is a separate integration test with its own main
+and no libtest workers. The ordinary installed executable and library retain
+their existing allocator. The build uses declared binutils nm to require the
+`TD_MTA_ALLOCATION_COUNTERS` and `rust_alloc_probe` symbol-name substrings
+in this test and refuse these sentinels in every other retained executable.
+These are checks for the named probe, not exhaustive classification of all
+allocator machinery; source confinement enforces its import boundary. The artifact inventory, static ELF checks and runtime
+namespace include this executable explicitly. No common compiler/linker flag
+changes. The runtime runs it once in a fresh process, requiring its exact
+success line after model, forwarding and digest/SMTP checks. UNSAFE.md T1 and
+td-mta/RESOURCES.md define the scope: requested Rust bytes only; no native,
+RSS, whole-service or allocation-elimination guarantee is inferred.

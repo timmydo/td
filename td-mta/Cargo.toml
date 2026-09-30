@@ -14,6 +14,10 @@ clippy-all-targets = true
 [dependencies]
 td-crypto = { path = "../td-crypto" }
 
+[[test]]
+name = "rust_alloc_probe"
+harness = false
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

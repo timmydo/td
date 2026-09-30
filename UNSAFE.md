@@ -61,6 +61,10 @@ registrar root uses `deny` with its one function-scoped allowance. The
 separate `td-review` package forbids unsafe code package-wide and contains
 no VM binaries or services.
 
+The test-only allocation probe in `td-mta` has the separately recorded T1
+surface below. It is absent from shipped binaries and libraries and does not
+add a target syscall exception to the numbered roster.
+
 Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
 amendment recorded HERE. A new syscall in an existing surface, a new
 value-pinned request, or a second scoped `#[allow]` is likewise an
@@ -2883,3 +2887,50 @@ function cannot add a scoped allowance. Kernel tests check actual connected
 credentials; parser tests refuse short, zero and unmapped results. A second
 syscall, option, caller or allowance amends this section and `td-vm/DESIGN.md`
 in the same landing.
+
+## T1. td-mta — test-only Rust allocation observation
+
+The human-approved test instrumentation exception is confined to
+`td-mta/tests/support/allocation_shim.rs`, included only by the separate
+`tests/rust_alloc_probe.rs` integration executable. Cargo marks this target
+`harness = false`: one main runs each observation sequentially without libtest
+workers. The root is `cfg(test)` and denies unsafe code. Production library
+and binary roots retain their prohibition; no runtime feature enables a probe.
+
+One impl-scoped allowance covers `unsafe impl GlobalAlloc` and exactly four
+methods (`alloc`, `alloc_zeroed`, `dealloc`, `realloc`). Each has exactly one
+block forwarding to the matching `std::alloc::System` method. Nine occurrences
+of the keyword and one scoped allowance are the complete inventory. There
+are no pointer dereferences, FFI declarations, allocator substitutions,
+changed layouts or manually owned allocations. The caller's GlobalAlloc
+contract supplies nonzero valid layouts, live pointers with matching layouts,
+and valid nonzero replacement sizes. Forward those values unchanged; return
+System's pointer including null unchanged. A failed realloc retains the old
+allocation and counter charge. Successful realloc charges only the change in
+requested bytes; it cannot observe System's transient copy/allocator overhead.
+
+Bookkeeping uses fixed atomics, checked arithmetic and a sticky invalid bit;
+it never allocates, formats, locks, unwinds, or changes allocator success.
+There is no counter reset or sampling enable switch. Underflow or overflow
+invalidates evidence. Requested live bytes and the lifetime high-water mark
+are observations at the wrapper's atomic accounting points, not native heap
+usage. Concurrent calls remain memory-safe, but individual snapshot fields
+are not coherent during activity; qualification reads at quiescent boundaries.
+No simultaneous-worker or thread-specific attribution is claimed here.
+
+The safe model fixture covers success/failure, grow/shrink, underflow and
+counter overflow. Safe Vec/Box operations exercise real forwarding, zeroed
+memory, over-alignment, failed growth preserving data, and released charges.
+These observations are not memory-safety assumptions: optimizing Rust may
+eliminate allocation calls. The pinned artifact must produce positive control
+observations before the probe accepts zero-call hot-path evidence.
+
+`tests/allocation_confinement.rs` pins the complete shim and accounting source,
+checks the exact keyword/allowance inventory, the test root/manifest, and
+refuses additional owned code surfaces or production imports. The portable
+builder admits one additional qualification artifact, validates its static
+ELF, and uses its declared binutils nm to require the counter symbol only in
+that executable and refuse probe symbols in all other retained executables.
+No linker flags or production allocator change. C/native wrappers are not
+part of T1 yet; they require their own reviewed amendment. Rust counts exclude
+direct AWS-LC/libc calls and must not certify the complete service ledger.

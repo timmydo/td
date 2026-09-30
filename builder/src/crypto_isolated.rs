@@ -399,6 +399,40 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "mail-transport-build", &mut receipt)?;
     let output = bounded_output(&mut command, "mail-transport-build", 8 * 1024 * 1024, 1200)?;
     let transport = executable(&output, "td_mta", ArtifactKind::LibraryTest)?;
+    let mut command = cargo("test", "td-mta");
+    command.args([
+        "--release",
+        "--test",
+        "rust_alloc_probe",
+        "--no-run",
+        "--message-format=json-render-diagnostics",
+    ]);
+    command_record(&command, "rust-allocation-build", &mut receipt)?;
+    let output = bounded_output(&mut command, "rust-allocation-build", 8 * 1024 * 1024, 1200)?;
+    let allocation = executable(&output, "rust_alloc_probe", ArtifactKind::IntegrationTest)?;
+    for (index, (binary, probe)) in [
+        (&mail, false),
+        (&crypto, false),
+        (&config, false),
+        (&format, false),
+        (&transport, false),
+        (&allocation, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut command = Command::new("/binutils/bin/nm");
+        command
+            .arg("--defined-only")
+            .arg(binary)
+            .env_clear()
+            .stdin(Stdio::null());
+        crate::host_bin::arm_check_child(&mut command);
+        let name = format!("allocator-symbols-{index}");
+        command_record(&command, &name, &mut receipt)?;
+        let symbols = bounded_output(&mut command, &name, 8 * 1024 * 1024, 30)?;
+        allocation_symbols(&symbols, probe)?;
+    }
     refuse_decoy(Path::new("/output"))?;
     fs::create_dir("/output/artifacts").map_err(|e| format!("portable artifacts: {e}"))?;
     copy_binary(&mail, Path::new("/output/artifacts/td-mta"))?;
@@ -409,9 +443,38 @@ pub(crate) fn build_inner() -> Result<()> {
         &transport,
         Path::new("/output/artifacts/td-mta-transport-smoke"),
     )?;
+    copy_binary(
+        &allocation,
+        Path::new("/output/artifacts/td-mta-rust-allocation-probe"),
+    )?;
     crate::crypto_api::qualify(&mut receipt)?;
     refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
+    Ok(())
+}
+
+fn allocation_symbols(symbols: &str, probe: bool) -> Result<()> {
+    let has_counter = symbols.contains("TD_MTA_ALLOCATION_COUNTERS");
+    let has_probe = symbols.contains("rust_alloc_probe");
+    if symbols.trim().is_empty()
+        || if probe {
+            !has_counter || !has_probe
+        } else {
+            has_counter || has_probe
+        }
+    {
+        return Err("portable allocation probe symbol boundary failed".into());
+    }
+    Ok(())
+}
+
+const ALLOCATION_SUCCESS: &str =
+    "rust-allocation-probe-v1: counter-model forwarding hot-paths passed\n";
+
+fn allocation_evidence(output: &str) -> Result<()> {
+    if output != ALLOCATION_SUCCESS {
+        return Err("portable Rust allocation probe did not complete exactly".into());
+    }
     Ok(())
 }
 
@@ -464,6 +527,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
         "td-mta-config-smoke",
         "td-mta-format-smoke",
         "td-mta-transport-smoke",
+        "td-mta-rust-allocation-probe",
     ]
     .map(std::ffi::OsString::from)
     .into_iter()
@@ -479,6 +543,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
         "td-mta-config-smoke",
         "td-mta-format-smoke",
         "td-mta-transport-smoke",
+        "td-mta-rust-allocation-probe",
     ] {
         copy_binary(&source.join(name), &destination.join(name))?;
     }
@@ -661,6 +726,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         "/artifacts/td-mta-config-smoke",
         "/artifacts/td-mta-format-smoke",
         "/artifacts/td-mta-transport-smoke",
+        "/artifacts/td-mta-rust-allocation-probe",
         "/output",
     ])?;
     let mut command = Command::new("/artifacts/td-mta");
@@ -900,6 +966,12 @@ pub(crate) fn runtime_inner() -> Result<()> {
             println!("portable runtime: {prefix}{bytes}");
         }
     }
+    let mut command = Command::new("/artifacts/td-mta-rust-allocation-probe");
+    command.env_clear().stdin(Stdio::null());
+    crate::host_bin::arm_check_child(&mut command);
+    let output = bounded_output(&mut command, "rust-allocation-probe", 4096, 30)?;
+    allocation_evidence(&output)?;
+    println!("portable runtime: Rust allocation counter model, forwarding and digest/SMTP hot paths passed");
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
     println!("portable runtime: sixty-five mail SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
     Ok(())
@@ -973,6 +1045,7 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
         "td-mta-config-smoke",
         "td-mta-format-smoke",
         "td-mta-transport-smoke",
+        "td-mta-rust-allocation-probe",
     ] {
         qualify_binary(&artifacts.join(binary))?;
     }
@@ -1101,6 +1174,33 @@ mod tests {
     }
 
     #[test]
+    fn allocation_probe_requires_symbols_and_exact_completion() {
+        let counter = "000 b rust_alloc_probe_TD_MTA_ALLOCATION_COUNTERS";
+        assert!(allocation_symbols(counter, true).is_ok());
+        assert!(allocation_symbols(counter, false).is_err());
+        assert!(allocation_symbols("000 t ordinary_main", false).is_ok());
+        assert!(allocation_symbols("000 t ordinary_main", true).is_err());
+        for text in [
+            "",
+            "000 b TD_MTA_ALLOCATION_COUNTERS",
+            "000 t rust_alloc_probe",
+        ] {
+            assert!(allocation_symbols(text, true).is_err());
+            assert!(allocation_symbols(text, false).is_err());
+        }
+        assert!(allocation_evidence(ALLOCATION_SUCCESS).is_ok());
+        for bad in [
+            "",
+            ALLOCATION_SUCCESS.trim_end(),
+            "test result: ok. 0 passed; 0 failed;\n",
+        ] {
+            assert!(allocation_evidence(bad).is_err());
+        }
+        assert!(allocation_evidence(&format!("{ALLOCATION_SUCCESS}{ALLOCATION_SUCCESS}")).is_err());
+        assert!(allocation_evidence(&format!("{ALLOCATION_SUCCESS}failed\n")).is_err());
+    }
+
+    #[test]
     fn host_collection_refuses_missing_outputs_links_extras_and_oversized_receipts() {
         let scratch = Scratch::create(&std::env::temp_dir(), "td-crypto-test").unwrap();
         let output = scratch.0.join("output");
@@ -1112,6 +1212,7 @@ mod tests {
             "td-mta-config-smoke",
             "td-mta-format-smoke",
             "td-mta-transport-smoke",
+            "td-mta-rust-allocation-probe",
             "COMMANDS",
         ] {
             fs::write(source.join(name), name).unwrap();
@@ -1126,6 +1227,9 @@ mod tests {
             b"td-mta-transport-smoke",
         )
         .unwrap();
+        fs::remove_file(source.join("td-mta-rust-allocation-probe")).unwrap();
+        assert!(collect_artifacts(&output, &scratch.0.join("missing-allocation")).is_err());
+        fs::write(source.join("td-mta-rust-allocation-probe"), b"probe").unwrap();
         let good = scratch.0.join("good");
         assert_eq!(collect_artifacts(&output, &good).unwrap(), "COMMANDS");
         assert_eq!(fs::read(good.join("td-mta")).unwrap(), b"td-mta");

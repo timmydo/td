@@ -176,10 +176,17 @@ Replacing only the direct digest/signing operations does not replace TLS's
 cryptography. Retaining Rustls means td-crypto still has an external TLS
 implementation even after AWS-LC is removed.
 
-No new unsafe surface is authorized by this document. Prefer safe std APIs.
-If platform work requires unsafe, its increment must first read and amend
-UNSAFE.md and this design, name each operation, and add confinement tests.
-This includes any test allocator hook needing an unsafe implementation.
+Production code retains `forbid(unsafe_code)`. The separate test executable
+`tests/rust_alloc_probe.rs` has the user-approved allocation instrumentation
+exception specified in UNSAFE.md T1. Its single scoped GlobalAlloc
+implementation forwards all four operations to System without changing
+layouts, pointers, results or failure behavior. Fixed atomic counters observe
+requested Rust bytes; native allocation and RSS need separate measurements.
+The probe has its own main and no libtest workers. It is never a library
+module, runtime feature or installed executable. Source confinement and the
+portable artifact inventory/symbol check enforce this boundary.
+Any further platform or test instrumentation surface must amend UNSAFE.md and
+this design, name each operation, and add confinement tests before landing.
 
 ## 4. Deployment and transport
 

@@ -855,6 +855,11 @@ Implement the remaining work as independently reviewable increments:
     construction/refusal, retained generations, TLS/STARTTLS and gateway paths.
     RESOURCES.md scopes the evidence; complete allocation/native/RSS accounting,
     maximum inputs, CPU paths and production caller stacks remain pending.
+  - **M07e2a — Rust allocation probe foundation:** a separate test executable
+    forwards System allocation through the approved UNSAFE.md T1 boundary.
+    Checked counters and positive controls qualify the probe before measuring
+    repeated digest and SMTP success/refusal paths. Native heap accounting,
+    TLS generation/session measurements and whole-service RSS remain pending.
 
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.

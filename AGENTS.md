@@ -295,7 +295,8 @@ message.
   indices. Inline `#[cfg(test)]` code may opt out locally. Existing
   grandfathered production allowances are migration debt: do not widen them
   or use them as precedent.
-- `unsafe` is confined to the syscall surfaces recorded in `UNSAFE.md`. A new
+- `unsafe` is confined to the syscall surfaces and the separately recorded
+  test-only allocation instrumentation in `UNSAFE.md`. A new
   surface, syscall, value-pinned request, or scoped allow requires an amendment
   there and in any component design/threat model in the same landing. Each
   crate's confinement tests must pin the source-level contract the compiler

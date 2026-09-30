@@ -610,3 +610,34 @@ pinning; none is implemented by this encoder. Offline commands may encode into
 administrative scratch. Counters saturate explicitly and missing observations
 remain unknown. These are caller-owned helpers, not evidence of a running or
 measured service.
+
+## Rust allocation probe
+
+M07e2a supplies a dedicated test executable with a System-forwarding Rust
+GlobalAlloc counter, confined by UNSAFE.md T1. It counts allocation, zeroed
+allocation, reallocation, deallocation and failed calls, requested live bytes
+and lifetime peak bytes. Atomics are fixed static test overhead. Any arithmetic
+failure invalidates the run. It does not track pointer identities; valid
+GlobalAlloc callers supply matching layouts. It does not measure allocator
+headers, fragmentation, transient realloc copies, direct native allocations,
+RSS or stack bytes. Native/C measurements may overlap System traffic and must
+never be added as disjoint totals without evidence.
+
+All observations here run sequentially on the dedicated process's main thread.
+Snapshots require quiescence; no counter is reset. A successful call's charge
+is recorded before its pointer returns, and a free's charge is removed before
+forwarding. The live/peak figures describe these accounting points, not an
+instantaneous view inside System. Real forwarding controls must observe
+alloc/zeroed/realloc/free/failure and an aligned allocation before accepting
+zero-call evidence. Optimizations may remove allocations; this is evidence
+for the actual pinned build and exercised paths, not proof for every source
+path or compiler. Failure and overflow model tests are independent of the
+process-wide counters.
+
+The initial hot-path fixture repeats SHA-256 construction/update/finish and
+SMTP line parsing with fragmented success, invalid framing, sticky refusal
+and short-storage failure. It compares every counter before/after with no
+logging inside the interval. It does not qualify TLS generations, sessions,
+parallel workers, maximum inputs or whole-service memory, and it changes no
+ledger allowance or service admission condition. Portable qualification runs
+the fresh static executable and requires its exact completion record.
