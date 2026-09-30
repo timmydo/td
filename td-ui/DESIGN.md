@@ -112,10 +112,13 @@ offers text as the selection at the press it is answering and asks the
 selection for its text, which the window delivers as `Input::Paste`. The
 editor's window keeps its own clipboard half over the moved writer.
 
-Newly built (increment 17): the outline reader `sfnt` and its coverage
-rasterizer `coverage`, the first half of "Outline faces and the glyph
-atlas" below. No consumer uses them yet: the atlas executor that paints
-their masks is increment 18.
+Newly built (increments 17 and 18): the outline reader `sfnt` and its
+coverage rasterizer `coverage`, and the atlas executor over them: the
+coverage page `atlas`, the outline face `face` at one pixel size with its
+`Cell`, and `Raster::with_face`, which executes the unchanged draw
+stream's glyphs through that face (see "Outline faces and the glyph
+atlas" below). No consumer opts in yet: the face pin is increment 19 and
+runtime cells increment 20.
 
 ## Purpose and trust position
 
@@ -194,7 +197,9 @@ of its own files may name each module.
   composition reports the surface it was laid out for and streams the draws
   inside a damage rectangle; `Raster::new` validates surface, font, stride and
   buffer before any write, and `Raster::paint` refuses a composition laid out
-  for another surface. The behavioural contract (clipping, the medium fringe,
+  for another surface. `Raster::with_face` lends the raster an outline
+  `face::Face`, through which it executes every `Glyph` from then on.
+  The behavioural contract (clipping, the medium fringe,
   scrollbar proportions and drag rounding) is the one td-editor/DESIGN.md
   records under "Implemented reference-renderer contract"; that text moves here
   with the documentation increment.
@@ -213,6 +218,16 @@ of its own files may name each module.
   and row-major `alpha`, with `clear` and a bounded `get`) and
   `MAX_MASK_AXIS` and `MAX_OVERSAMPLED_AXIS`; refusals are the raster's
   `Error`.
+- `atlas`: `Atlas` (`new`, `page`, `epoch`, `len`, `is_empty`, `get`,
+  `record`, `place`, `reset` and `take_dirty`), `Style` (`Regular`,
+  `Bold`), `Slot` (`Placed` with its `Entry`, `Blank`, `Missing`),
+  `Entry` (its rectangle on the page and its bearing), `PAGE_WIDTH`,
+  `PAGE_HEIGHT` and `MAX_KEYS`.
+- `face`: `Face` (`new` over the regular style's bytes, an optional bold
+  style's and a pixel size, `cell`, `pixels_per_em`, `atlas`,
+  `take_dirty`, `style` and `glyph`), `Cell` (`width`, `height`,
+  `baseline`), `MIN_PIXELS_PER_EM`, `MAX_PIXELS_PER_EM` and
+  `MAX_CELL_AXIS`; refusals are `sfnt::Error`.
 - `hint`: the hint face, a hand-authored 4x5 glyph (`WIDTH`, `HEIGHT`,
   `ADVANCE` 5) per printable ASCII scalar, `glyph` and the pixel `width`
   of a text; a scalar it lacks is a box. It is the small lighter text a
@@ -961,6 +976,24 @@ not frames, and stays its own).
   lists the version-1 exclusions, antialiasing among them. Draw-stream
   oracles are the portable contract every backend keeps; the exact-pixel
   oracles and the `--preview` checksum pin the current software backend.
+  `Raster::with_face` executes `Glyph` through an outline face's atlas,
+  opt-in per raster, and changes no draw. It paints each glyph in the
+  face's cell, so it keeps the cell model only for a composition laid
+  out on that cell; the widgets lay out on the bitmap grid until runtime
+  cells (increment 20), and a consumer opts in with them.
+- The atlas is one 1024 by 1024 page (1 MiB) of at most 8192 keys, placed
+  and missing together, with a pixel of gutter right of and below each
+  entry, zeroed when it is placed and inside the dirty band; a full page
+  or spent budget resets it whole under a new epoch, a held key keeps its
+  slot, and a mask that with its gutter would not fit the page, or whose
+  alpha is not its width by height, is recorded missing. An entry is valid
+  in the epoch that placed it. A face is 6 through 256 pixels per em with
+  a cell of at most 512 on an axis, each style covered at its own units
+  per em. The executor writes only inside the glyph's cell and the draw's
+  clip, only pixels with coverage, each the style's background moved
+  toward its ink by the coverage, and never reads the buffer; a scalar the
+  face lacks or refuses draws the bitmap face's glyph centred in the cell,
+  and other primitives are the bitmap raster's unchanged.
 - The outline reader and its coverage are bounded before they allocate
   or recurse: a 32 MiB font, 64 tables each inside the file, a glyph's
   range inside `glyf`, 8192 points and 1024 contours per outline with
@@ -1033,7 +1066,25 @@ area, a curve and an all-off-curve contour against their closed-form
 areas, start-point independence, empty and degenerate outlines, every
 refusal leaving the mask untouched, reuse across sizes, flagged overlaps
 resolving to their union on the finer grid (and past its axis covered
-unrefined), and a mask reading zero outside itself.
+unrefined), and a mask reading zero outside itself. `tests/fonts` is
+the encoder those fonts come from, shared with `tests/face.rs`.
+`tests/atlas.rs` holds the page over hand-built masks: placement apart
+with its gutter, the coverage copied intact, shelf sharing, the dirty
+band, blank and missing slots taking no space, the reset of a full page
+keeping only the mask that did not fit, the key budget, each entry's
+gutter zeroed after a reset over opaque bytes, a held key keeping its
+slot and a short alpha recorded missing.
+`tests/face.rs` holds the face and the executor: the cell from encoded
+metrics at two sizes, the size, advance and byte refusals, a glyph
+covered once with misses remembered, and pixel oracles over a buffer of
+garbage (so nothing is read back): ink and the half-covered blend from
+the explicit background, the cell and draw clips, blank glyphs writing
+nothing, the missing glyph equal to a bitmap raster's centred one at
+scales one and two, Medium drawing the bold style only when the face has
+one, at the bold file's own units per em and falling back to its regular
+outline, a Bold lookup on a face without one the regular slot, fills and
+marks unchanged, and a padded stride at scale three whose padding is
+never written, with origins at the i64 extremes writing nothing.
 
 `tests/chrome.rs` holds the band oracles, draw-stream checks that read each
 band's fills and glyphs: the menu bar's fill, its labels from cell
@@ -1989,11 +2040,12 @@ rectangle and bearing.
 
 The executor looks each scalar up in the face's character map. It covers
 the glyph into the page on first use and blends it from the page after
-that. A scalar the face lacks draws from the Unifont face, as it does
-today. When the page is full it resets whole under a new epoch and fills
-again from the draws that follow, so its memory is bounded by its extent.
-The page reports the band of rows written since it was last taken, which
-is exactly the sub-image a GPU backend uploads.
+that. A scalar the bold style lacks is covered from the regular one, and
+one the face lacks draws from the Unifont face, as it does today. When the
+page is full it resets whole under a new epoch and fills again from the
+draws that follow, so its memory is bounded by its extent. The page
+reports the band of rows written since it was last taken, which is exactly
+the sub-image a GPU backend uploads.
 
 The blend is `background + (ink - background) * alpha / 255` per channel,
 using the `GlyphStyle`'s explicit background. The executor never reads the
@@ -2003,11 +2055,20 @@ independent of old pixels. It is also exactly a GPU fragment shader with
 blending off, so a CPU frame and a GPU frame of one draw stream are
 pixel-identical by construction. Zero coverage writes nothing, as an unset
 bitmap pixel does. `Weight::Medium` selects the bold style when the face
-has one.
+has one, covered at the bold file's own units per em. An entry is valid
+in the epoch that placed it, and any miss may reset the page: a GPU
+backend holding a frame's entries compares epochs. Each entry's gutter is
+zeroed as it is placed, so a sampler filtering across its edge never
+reads a retired glyph.
 
 The exact-pixel oracles and `--preview` checksums pin the bitmap backend,
-so the executor is opt-in per raster. A consumer's oracles move when the
-consumer does.
+so the executor is opt-in per raster. It paints each glyph in the face's
+cell from the draw's origin, so a composition must lay glyphs out on that
+cell: a consumer opts in together with runtime cells, and its oracles
+move when it does. At the largest sizes a page holds few glyphs, and a
+scene needing more than a page resets it every frame; that is bounded
+work, not a fault, and a larger page is the remedy if a consumer meets
+it.
 
 ### Runtime cells
 
@@ -2015,7 +2076,7 @@ consumer does.
 them. With an outline face they become a `Cell` value derived from the
 face at the surface's pixel size:
 
-- the cell width is the rounded advance of `0`;
+- the cell width is the rounded advance of `0` (else `M`);
 - the baseline is the rounded ascender;
 - the cell height is that plus the rounded descender and line gap.
 
@@ -2245,7 +2306,7 @@ regressions. Those increments extend the original sequence below.
     dirty band; the face's `Cell` at a pixel size; and `Raster` executing
     `Glyph` through an outline face, opt-in, with the Unifont fallback
     and the explicit-background blend, under pixel oracles over encoded
-    fonts. The draw stream is unchanged.
+    fonts. The draw stream is unchanged. Landed.
 19. The face pin: a data recipe fetching the Nerd Fonts v3.5.1
     `JetBrainsMono.tar.xz` by URL and SHA-256, extracting the four Mono
     styles and the licences into an output the image carries read-only,

@@ -25,7 +25,9 @@
 //! clipboard), and the clipboard's transfer owners (`clipboard`: the
 //! bounded nonblocking writer of an offered text over the send's right and
 //! the reader of the selection's text), and the outline face's bounded
-//! TrueType reader (`sfnt`) with its antialiased coverage (`coverage`).
+//! TrueType reader (`sfnt`) with its antialiased coverage (`coverage`),
+//! the coverage page (`atlas`) and the face at one pixel size (`face`)
+//! through which a raster may execute its glyphs.
 //! Outside `wayland`, `client`, `clipboard`, the private raw module
 //! beneath them, the driving adapters
 //! `control_socket`, `control_worker` and `replay`, and the widget window
@@ -39,6 +41,7 @@
 pub const CELL_WIDTH: usize = 8;
 pub const CELL_HEIGHT: usize = 16;
 
+pub mod atlas;
 pub mod charts;
 pub mod chrome;
 pub mod client;
@@ -50,6 +53,7 @@ pub mod control_worker;
 pub mod coverage;
 pub mod data;
 pub mod driven;
+pub mod face;
 #[path = "../../td-compositor/src/filter.rs"]
 pub mod filter;
 pub mod finder;

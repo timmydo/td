@@ -4,8 +4,12 @@
 //! the text-run and hint-run painters and the raster that writes them
 //! into a caller-owned buffer. A program's scene composes these and
 //! streams draws through [`Composition`]; nothing here reads the
-//! environment, a clock or a descriptor.
+//! environment, a clock or a descriptor. A raster given an outline face
+//! (`with_face`) executes glyphs through its atlas instead, below the same
+//! draw stream.
 
+use crate::atlas::{Entry, Slot, PAGE_WIDTH};
+use crate::face::Face;
 use crate::font::Font;
 use crate::hint;
 use crate::{CELL_HEIGHT, CELL_WIDTH};
@@ -453,6 +457,7 @@ enum Shape {
 pub struct Raster<'pixels, 'font> {
     pixels: &'pixels mut [u8],
     font: &'font Font,
+    face: Option<&'font mut Face>,
     surface: Surface,
     stride: usize,
 }
@@ -482,9 +487,23 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
         Ok(Self {
             pixels,
             font,
+            face: None,
             surface,
             stride,
         })
+    }
+
+    /// Executes every `Glyph` through `face` from here on: in the face's
+    /// cell at the draw's origin, covered into its atlas on first use and
+    /// blended over the style's explicit background, `Weight::Medium` in
+    /// the bold style when the face has one. A scalar the face lacks draws
+    /// from the bitmap face, centred in the cell. The face is sized for the
+    /// surface's pixels, scale included, by its owner, and the composition
+    /// must lay its glyphs out on the face's cell: one laid out on the
+    /// bitmap grid overlaps or gaps wherever the two cells differ.
+    pub fn with_face(mut self, face: &'font mut Face) -> Self {
+        self.face = Some(face);
+        self
     }
 
     /// Paints a composition laid out for this exact surface; a mismatch is
@@ -505,8 +524,59 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
         let Some(clip) = draw.clip.intersection(self.surface.bounds()) else {
             return;
         };
+        let Primitive::Glyph {
+            x,
+            y,
+            scalar,
+            style,
+        } = draw.primitive
+        else {
+            return self.shape(clip, draw.primitive);
+        };
+        let Some(face) = self.face.as_deref_mut() else {
+            return self.shape(clip, draw.primitive);
+        };
+        let cell = face.cell();
+        let bounds = Rect {
+            x,
+            y,
+            width: u32::try_from(cell.width).unwrap_or(u32::MAX),
+            height: u32::try_from(cell.height).unwrap_or(u32::MAX),
+        };
+        let Some(clip) = clip.intersection(bounds) else {
+            return;
+        };
+        match face.glyph(face.style(style.weight == Weight::Medium), scalar) {
+            Slot::Placed(entry) => {
+                let origin = (x, y.saturating_add(cell.baseline as i64));
+                blend(
+                    self.pixels,
+                    self.stride,
+                    face.atlas().page(),
+                    entry,
+                    origin,
+                    clip,
+                    style,
+                );
+            }
+            Slot::Blank => {}
+            Slot::Missing => {
+                let scale = self.surface.scale.value();
+                let inset = |cell: usize, glyph: usize| (cell as i64 - (glyph * scale) as i64) / 2;
+                let primitive = Primitive::Glyph {
+                    x: x.saturating_add(inset(cell.width, CELL_WIDTH)),
+                    y: y.saturating_add(inset(cell.height, CELL_HEIGHT)),
+                    scalar,
+                    style,
+                };
+                self.shape(clip, primitive);
+            }
+        }
+    }
+
+    fn shape(&mut self, clip: Rect, primitive: Primitive) {
         let scale = self.surface.scale.value();
-        let (rect, color, shape) = match draw.primitive {
+        let (rect, color, shape) = match primitive {
             Primitive::Fill { rect, color } => (rect, color, Shape::Solid),
             Primitive::Glyph {
                 x,
@@ -586,4 +656,56 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
             }
         }
     }
+}
+
+/// Covers `entry` from the atlas page over the pen at `origin`, inside
+/// `clip`: each pixel's colour is the style's background moved toward its
+/// ink by the coverage, never a read of the buffer.
+fn blend(
+    pixels: &mut [u8],
+    stride: usize,
+    page: &[u8],
+    entry: Entry,
+    (x, y): (i64, i64),
+    clip: Rect,
+    style: GlyphStyle,
+) {
+    let rect = Rect {
+        x: x.saturating_add(i64::from(entry.left)),
+        y: y.saturating_sub(i64::from(entry.top)),
+        width: u32::try_from(entry.width).unwrap_or(0),
+        height: u32::try_from(entry.height).unwrap_or(0),
+    };
+    let Some(area) = rect.intersection(clip) else {
+        return;
+    };
+    // The clip lies inside the surface, so the area's coordinates are
+    // non-negative and its offsets into the glyph are within the entry.
+    for py in area.y..area.y + i64::from(area.height) {
+        let row = (entry.y + (py - rect.y) as usize) * PAGE_WIDTH + entry.x;
+        let start = py as usize * stride;
+        for px in area.x..area.x + i64::from(area.width) {
+            let alpha = page.get(row + (px - rect.x) as usize).copied().unwrap_or(0);
+            if alpha == 0 {
+                continue;
+            }
+            let color = mix(style.background, style.ink, alpha) | 0xff000000;
+            let at = start + px as usize * 4;
+            if let Some(pixel) = pixels.get_mut(at..at + 4) {
+                pixel.copy_from_slice(&color.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// `from` moved toward `to` by `alpha` of 255, per channel, rounded.
+fn mix(from: u32, to: u32, alpha: u8) -> u32 {
+    let alpha = u32::from(alpha);
+    let mut color = 0;
+    for shift in [0, 8, 16] {
+        let from = (from >> shift) & 255;
+        let to = (to >> shift) & 255;
+        color |= ((from * (255 - alpha) + to * alpha + 127) / 255) << shift;
+    }
+    color
 }
