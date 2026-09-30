@@ -54,6 +54,7 @@ pub mod coverage;
 pub mod data;
 pub mod driven;
 pub mod face;
+pub mod face_file;
 #[path = "../../td-compositor/src/filter.rs"]
 pub mod filter;
 pub mod finder;

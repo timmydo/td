@@ -68,6 +68,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "control_socket.rs",
                 "control_worker.rs",
                 "lib.rs",
+                "face_file.rs",
                 "notices.rs",
                 "open.rs",
                 "pinned_face.rs",
@@ -149,7 +150,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "the client's test support {support} is not called in {name}"
             );
         }
-        if name == "pinned_face.rs" {
+        if name == "face_file.rs" {
             // One file, named by the one constant directory, checked and
             // bounded before it is read; nothing else on the filesystem
             // and no environment.
@@ -165,8 +166,39 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "eprintln!",
                 "OpenOptions",
             ] {
+                assert!(!compact.contains(absent), "{absent} in face_file.rs");
+            }
+        }
+        if name == "pinned_face.rs" {
+            // Reads only through face_file.
+            for absent in ["File", "fs::", "env::", "eprintln!", "OpenOptions"] {
                 assert!(!compact.contains(absent), "{absent} in pinned_face.rs");
             }
+        }
+        // td-term mounts these beside its own modules (td-compositor's
+        // main.rs), so they name no other td-ui module.
+        let mounted: Option<&[&str]> = match name.as_str() {
+            "sfnt.rs" => Some(&[]),
+            "coverage.rs" => Some(&["sfnt"]),
+            "atlas.rs" => Some(&["coverage"]),
+            "face.rs" => Some(&["atlas", "coverage", "sfnt"]),
+            "face_file.rs" => Some(&["sfnt"]),
+            _ => None,
+        };
+        if let Some(mounted) = mounted {
+            let named: BTreeSet<&str> = text
+                .match_indices("crate::")
+                .filter_map(|(at, _)| {
+                    text.get(at + "crate::".len()..)?
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .next()
+                })
+                .collect();
+            assert_eq!(
+                named,
+                mounted.iter().copied().collect(),
+                "{name} names only what td-term mounts beside it"
+            );
         }
         if name == "lib.rs" {
             assert!(compact.starts_with("#![deny(unsafe_code)]"));

@@ -9521,8 +9521,9 @@ only for shell text, until "Reworked" below. Landed; the in-jail
 acceptance test in `td-editor/DESIGN.md` is not.
 
 **Rendering.** Section 11 of `td-compositor/DESIGN.md` pins a Unifont PSF2
-face and a pure renderer over it; td-term draws with it. The editor borrows
-the face exactly: the PSF2 reader and pinned face are shared source the
+face and a pure renderer over it; td-term draws with it, and in td-ui's
+pinned outline face fitted to its cells where the image has it. The editor
+borrows the face exactly: the PSF2 reader and pinned face are shared source the
 compositor embeds and `td-ui`, the shared UI toolkit (`td-ui/DESIGN.md`),
 mounts once for every program that depends on it by path — the editor first
 (the way `engine/src/permissions.rs` is shared with td-jail) — and paints
@@ -9530,8 +9531,8 @@ with td-ui's raster, the editor's bounded glyph painter moved into the
 toolkit, so every td-ui consumer renders the same cells with one
 painter. The one face besides Unifont is td-ui's pinned outline face,
 fitted to those cells for live windows (td-ui/DESIGN.md, "The grid fit");
-the compositor keeps its own painters over the bitmap face (the terminal
-renderer and the attention sheet), td-ui's raster
+the compositor keeps its own painters (the terminal renderer, over both
+faces, and the attention sheet, over the bitmap one), td-ui's raster
 is the one every toolkit consumer shares, and td-portal's private copy
 goes when its chooser moves to td-ui.
 

@@ -90,7 +90,10 @@ A consumer inherits that surface through the toolkit's connection and
 its `clipboard::Outgoing`, which owns the send right's status flags for
 a transfer, and nothing else; reusing a module does not transfer its
 authorization to a raw boundary of the consumer's own, which gets its
-own entry.
+own entry. `td-compositor` mounts td-ui's `sfnt`, `coverage`, `atlas`,
+`face` and `face_file` by path for td-term's outline face and does not
+depend on the crate: those modules carry no `unsafe` and name no other
+td-ui module, so the compositor's own surface (§6) is unchanged.
 
 ## Roster
 

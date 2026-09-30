@@ -137,6 +137,12 @@ td-photo and the task manager. Their still-image `--preview` output,
 `--render-check` and in-process tests stay on the bitmap face, and each
 `--font-license` output names where the outline face's notices ship.
 
+Newly built (increment 22): `face_file`, the outline face's paths and
+bounded read; the italic and bold italic styles (`Face::with_slant`,
+`Face::style` over bold and italic); and td-term, which mounts td-ui's
+face modules and draws its cells through a face fitted to its grid (see
+"td-term" below).
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
@@ -243,25 +249,35 @@ of its own files may name each module.
 - `coverage`: `Rasterizer` (`new`, `rasterize` an outline at a scale in
   pixels per font unit), `Mask` (its `width`, `height`, `left`, `top`
   and row-major `alpha`, with `clear` and a bounded `get`) and
-  `MAX_MASK_AXIS` and `MAX_OVERSAMPLED_AXIS`; refusals are the raster's
-  `Error`.
+  `MAX_MASK_AXIS` and `MAX_OVERSAMPLED_AXIS`; refusals are
+  `sfnt::Error`.
 - `atlas`: `Atlas` (`new`, `page`, `epoch`, `len`, `is_empty`, `get`,
   `record`, `place`, `reset` and `take_dirty`), `Style` (`Regular`,
-  `Bold`), `Slot` (`Placed` with its `Entry`, `Blank`, `Missing`),
+  `Bold`, `Italic`, `BoldItalic`), `Slot` (`Placed` with its `Entry`,
+  `Blank`, `Missing`),
   `Entry` (its rectangle on the page and its bearing), `PAGE_WIDTH`,
   `PAGE_HEIGHT` and `MAX_KEYS`.
 - `face`: `Face` (`new` over the regular style's bytes, an optional bold
   style's and a pixel size; `fit` over shared style bytes and a grid
-  cell's width and height; `cell`, `pixels_per_em`, `atlas`,
-  `take_dirty`, `style` and `glyph`), `Cell` (`width`, `height`,
+  cell's width and height; `with_slant` over an italic and a bold italic
+  style's shared bytes, covered at the face's size, which empties the
+  atlas; `cell`,
+  `pixels_per_em`, `atlas`, `take_dirty`, `style` (the style bold and
+  italic ask for, as the face has it: bold italic falls to italic, then
+  bold, and any style to regular) and `glyph`), `Cell` (`width`, `height`,
   `baseline`, `pen`), `MIN_PIXELS_PER_EM`, `MAX_PIXELS_PER_EM` and
   `MAX_CELL_AXIS`; refusals are `sfnt::Error`.
 - `typeface`: `Typeface` (`new` over the regular style's bytes and an
   optional bold style's, refused as a face fitted to the grid's cell at
   scale one is; `face` at a `Scale`, refitted when the scale changes).
-- `pinned_face`: `DIR` and `REGULAR`, where the pinned face is; `load`
-  and `load_from` a directory; `SETTING` (`TD_UI_FACE`), the variable
-  whose value a consumer passes; and `load_or_note` and
+- `face_file`: `DIR` and the four styles' file names (`REGULAR`,
+  `BOLD`, `ITALIC`, `BOLD_ITALIC`); `SETTING` (`TD_UI_FACE`), the
+  variable whose value a program passes, and `wanted`, whether that value
+  asks for the face (all but `bitmap` do); and `read`, the bounded read
+  of one file. td-term mounts it with `sfnt`, `coverage`, `atlas` and
+  `face`.
+- `pinned_face`: `load` and `load_from` a directory, the regular style
+  through `face_file::read`; `SETTING`, re-exported; and `load_or_note` and
   `load_from_or_note` a directory, which take that value, draw with
   Unifont without reading anything when it is `bitmap`, and otherwise
   say on standard error why a program draws with Unifont instead.
@@ -863,11 +879,12 @@ not frames, and stays its own).
   widget window `window`, whose `Window::new` reads the embedded face and
   whose loop is `client::run`; `open`, which reads `BROWSER`, starts
   the browser as a child process with its streams closed and reaps it on
-  a thread of its own; and `pinned_face`, which reads the outline face's
-  regular style from the one directory it names, a regular file within
-  the reader's bound, checked before it is opened. Apart from `open`'s
-  `BROWSER` they read no environment variable, taking the display values
-  and the socket path as explicit arguments.
+  a thread of its own; `face_file`, which reads one of the outline face's
+  files from the one directory it names, a regular file within the
+  reader's bound, checked before it is opened; and `pinned_face`, which
+  reads only through it. Apart from `open`'s `BROWSER` they read no
+  environment variable, taking the display values, the socket path and
+  the face setting as explicit arguments.
 - `control` and `driven` are pure: the frame, envelope and codecs touch
   no descriptor, and the seam reads only the composition it is handed
   and the embedded face. The decoder allocates at most one frame, after
@@ -1154,6 +1171,12 @@ exact square from the pen and baseline, a full-width glyph leaving no seam
 between two cells, an integral advance centred to the pixel, a tall line
 box leaning up centred with its baseline below the cell, and a scalar the
 face lacks equal to the bitmap raster's own draw at scales one to four.
+For the slanted styles it holds the style each of bold and italic
+resolves to with and without each style, the italic style at its own
+units per em, bold italic on a face without it the italic slot, a scalar
+italic lacks covered from the regular outline, a fitted face covering
+its italic at the fitted size, a refused italic, and replacing the
+slanted styles emptying the atlas so an old slot does not answer.
 `tests/typeface.rs` holds the face fitted at each scale, kept while the
 scale holds and replaced when it changes, the typeface's refusals, a
 raster given a typeface drawing exactly as one given the face fitted at
@@ -1254,7 +1277,10 @@ the client's device and clipboard outcomes.
 source mounts, the absence of ambient I/O in pure modules, that `notices`
 is three embedded texts and the outline face's literal and nothing else,
 the absence of `include!`, `cfg_attr` and any dependency declaration, that
-the shared sources bind no input interface, and the raw layer: the
+the shared sources bind no input interface, that `face_file` opens one
+file under its one directory after checking it and bounding the read and
+`pinned_face` reads only through it, that the five modules td-term
+mounts name no td-ui module but each other, and the raw layer: the
 complete fingerprint of `sys.rs`, its syscall and flag values, its two
 function-only allowances, the single instruction and adoption sites, that
 the crate root denies `unsafe` and declares the module private, that
@@ -2218,9 +2244,10 @@ blending off, so a CPU frame and a GPU frame of one draw stream are
 pixel-identical by construction. Zero coverage writes nothing, as an unset
 bitmap pixel does. Every weight draws the regular style: `Weight::Medium`
 is the bitmap face's body text, its fringe thickening a thin face, not a
-bold. The bold style, covered at the bold file's own units per em, is
-reached through `Face::glyph` until the stream gains a bold weight (with
-td-term, increment 22). An entry is valid
+bold. The bold, italic and bold italic styles, each covered at its own
+file's units per em, are reached through `Face::glyph`; the stream has no
+bold weight, and td-term, which draws them, reads the atlas directly
+(see "td-term"). An entry is valid
 in the epoch that placed it, and any miss may reset the page: a GPU
 backend holding a frame's entries compares epochs. Each entry's gutter is
 zeroed as it is placed, so a sampler filtering across its edge never
@@ -2257,7 +2284,7 @@ cells coincide.
 at the scale asked for, refitting when it changes, so one atlas is held.
 `pinned_face::load` reads the regular style from
 `/etc/fonts/jetbrains-mono-nerd`, the only one the draw stream selects;
-the bold file ships for td-term's bold weight. A program calls
+the other three styles ship for td-term. A program calls
 `load_or_note` at startup with the value of `TD_UI_FACE`, which it reads
 as it reads the Wayland endpoint's variables: `bitmap` keeps it on
 Unifont without reading anything; otherwise, on any failure it says once
@@ -2292,26 +2319,44 @@ td-compositor/DESIGN.md already excludes them.
 ### td-term
 
 td-term is the `td-compositor` multicall. It paints cells through the
-compositor's own `render.rs` over the bitmap `Font`. It moves onto td-ui in
-two steps:
+compositor's own `render.rs` over the bitmap `Font`, and draws each glyph
+the pinned outline face has through a face fitted to that font's cell:
 
-1. The compositor's recipe stages the `td-ui` tree, as each consumer's
-   already stages `td-compositor`.
-2. td-term's cell painter becomes a td-ui `Composition` of fills and
-   glyphs on its grid, executed through a face fitted to that grid's
-   cell as the other consumers' are, with the terminal's attributes
-   mapped as follows:
-   - bold, italic and bold italic select their faces (`Weight` gains a
-     bold and `GlyphStyle` a slant, additive changes to the stream);
-   - faint and inverse stay colour operations;
-   - underline and strike are fills placed from the face's metrics.
+1. The compositor mounts td-ui's `sfnt`, `coverage`, `atlas`, `face` and
+   `face_file` by path, as it mounts td-busd's `app_policy`, and its
+   recipe writes the five files beside its own. Those modules name no
+   other td-ui module (td-ui's confinement test pins that), so the
+   compositor takes none of td-ui's transport, raster or `unsafe`
+   surface.
+2. At startup td-term reads the four styles through `face_file` unless
+   `TD_UI_FACE` is `bitmap`, fits them to the 8x16 cell with `Face::fit`
+   and `with_slant`, and on any failure says so once and draws with
+   Unifont.
+3. `render::render_with` draws a cell through the face when the face has
+   its scalar: the cell's ground, then the glyph's coverage from the
+   atlas page blended from the ground toward the ink and clipped to the
+   cell, then the rules. The terminal's attributes map as follows:
+   - bold, italic and bold italic select those styles through
+     `Face::style`, falling back to what the face has;
+   - faint and inverse stay colour operations, applied before the blend;
+   - underline and strike keep the cell's rows, which the fitted face
+     shares with the bitmap one.
+
+A scalar the face lacks is the bitmap painter's own cell, its bold smear
+and italic shear included, and the cursor and the bell are unchanged.
+The painter reads the atlas page directly rather than through a td-ui
+`Composition`: the page and its entries are what a GPU backend uploads
+and samples, so the GPU path takes the terminal's glyphs as it takes the
+raster's.
 
 The pixel size the terminal reports through `TIOCSWINSZ` follows the cell,
 which is the grid's until runtime cells.
 The compositor's own chrome keeps the bitmap face. td-compositor/DESIGN.md
 section 11's rule that host tests and the target consume the same face
-bytes holds for Unifont. Outline oracles use fonts the tests encode
-themselves, and the image check is what realizes the pinned face.
+bytes holds for Unifont. The render spec's PPM oracles stay on `render`
+and the bitmap face; the outline painter's oracles use fonts the tests
+encode (td-ui's `tests/fonts`, mounted by path), and the image check is
+what realizes the pinned face.
 
 ### The GPU path
 
@@ -2524,9 +2569,10 @@ regressions. Those increments extend the original sequence below.
     the file chooser, td-photo and the task manager load the pinned face
     for their live windows, and their `--font-license` output names
     where its notices are. Landed.
-22. td-term on td-ui: the compositor's recipe stages td-ui, and td-term's
-    cell painter moves onto a face fitted to its grid, with the
-    attribute mapping above. Its PPM oracles stay on the bitmap face.
+22. td-term on the outline face: the compositor mounts td-ui's face
+    modules, and td-term's cell painter draws through a face fitted to
+    its grid in four styles, with the attribute mapping above. Its PPM
+    oracles stay on the bitmap face. Landed.
 23. Runtime cells: `Cell` replaces the constants in layout, hit testing
     and painting, so a face is drawn at a size the grid does not fix.
     td-editor goes first, since the other consumers lay out over its

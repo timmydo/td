@@ -11,12 +11,13 @@ use crate::conn::{
     self, Connection, Globals, COMPOSITOR, KEYBOARD, REGISTRY, SEAT, SHM, SURFACE, XDG_SURFACE,
     XDG_TOPLEVEL, XDG_WM_BASE,
 };
+use crate::face::Face;
 use crate::font::Font;
 use crate::pty::Pty;
 use crate::scene::SHM_XRGB8888;
 use crate::term::Terminal;
 use crate::{
-    font, keys, pty, ready, render, socket, wire, MAX_HELD_KEYS, MAX_UI_DIMENSION,
+    face_file, font, keys, pty, ready, render, sfnt, socket, wire, MAX_HELD_KEYS, MAX_UI_DIMENSION,
     MAX_UI_FRAME_BYTES,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,6 +42,8 @@ pub struct Options {
     /// `pty::child_command` for what each means. Bytes rather than text: a
     /// filename argument is whatever the filesystem holds.
     pub command: Vec<OsString>,
+    /// The `TD_UI_FACE` value: `bitmap` keeps the terminal on Unifont.
+    pub face_setting: Option<OsString>,
 }
 
 /// Bound on reaching a presented frame. Past this the compositor is not
@@ -479,6 +482,9 @@ struct Surface {
     live_buffers: BTreeSet<u32>,
     live_callbacks: BTreeSet<u32>,
     frame: Option<Frame>,
+    /// The outline face the cells are drawn in, fitted to the bitmap face's
+    /// cell; `None` draws every cell from the bitmap face.
+    outline: Option<Face>,
 }
 
 impl Surface {
@@ -535,6 +541,7 @@ impl Surface {
             live_buffers: BTreeSet::new(),
             live_callbacks: BTreeSet::new(),
             frame: None,
+            outline: None,
         }
     }
 
@@ -1692,10 +1699,12 @@ fn draw_offset(surface: &Surface, terminal: &Terminal) -> usize {
     surface.viewport.offset(terminal.scrollback())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_pixels(
     size: Size,
     terminal: &Terminal,
     font: &Font,
+    outline: Option<&mut Face>,
     palette: &render::Palette,
     focused: bool,
     viewport: usize,
@@ -1709,10 +1718,11 @@ fn build_pixels(
     let snapshot = render::Snapshot::new(terminal, focused, false)
         .scrolled_back(viewport)
         .with_selection(selection);
-    render::render(
+    render::render_with(
         &snapshot,
         palette,
         font,
+        outline,
         &mut pixels,
         size.width,
         size.height,
@@ -1740,6 +1750,7 @@ fn commit_frame(
         size,
         terminal,
         font,
+        surface.outline.as_mut(),
         palette,
         surface.activated,
         viewport,
@@ -2821,6 +2832,7 @@ fn present(
     connection: &mut Connection,
     directory: &Path,
     font: &Font,
+    outline: Option<Face>,
     palette: &render::Palette,
     pty: &Pty,
 ) -> Result<Presented, String> {
@@ -2832,6 +2844,7 @@ fn present(
     };
     let fallback = default_size(font)?;
     let mut surface = Surface::new(bind_globals(connection)?);
+    surface.outline = outline;
     conn::create_surface(connection, TITLE)?;
     // Two frames, not one, and that is the protocol rather than a retry. The
     // compositor cannot tile a surface it has not mapped, so its first
@@ -2884,6 +2897,7 @@ fn prepare(
     connection: &mut Connection,
     directory: &Path,
     font: &Font,
+    outline: Option<Face>,
     palette: &render::Palette,
     ptmx: &Path,
 ) -> Result<Prepared, String> {
@@ -2891,7 +2905,8 @@ fn prepare(
     // missing or misconfigured should fail without having drawn a window,
     // and nothing about the size is needed to open one.
     let pty = Pty::open(ptmx)?;
-    let (surface, terminal, cells, input) = present(connection, directory, font, palette, &pty)?;
+    let (surface, terminal, cells, input) =
+        present(connection, directory, font, outline, palette, &pty)?;
     Ok(Prepared {
         surface,
         pty,
@@ -2916,8 +2931,54 @@ pub fn prepare_for_test(
         .ok_or_else(|| "could not bound the terminal's Wayland handshake".to_string())?;
     let mut connection = Connection::over(stream, Some(deadline), FIRST_DYNAMIC_ID);
     connection.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    let prepared = prepare(&mut connection, directory, &font, &palette, ptmx)?;
+    let prepared = prepare(&mut connection, directory, &font, None, &palette, ptmx)?;
     Ok((connection, prepared))
+}
+
+/// The pinned outline face, its four styles fitted to the bitmap face's
+/// cell, unless `setting` asks for the bitmap face; on any failure a line
+/// on standard error says the terminal draws with Unifont, and it starts.
+fn outline_face(font: &Font, setting: Option<&std::ffi::OsStr>) -> Option<Face> {
+    outline_face_from(Path::new(face_file::DIR), font, setting)
+}
+
+/// `outline_face` from `dir`.
+pub(crate) fn outline_face_from(
+    dir: &Path,
+    font: &Font,
+    setting: Option<&std::ffi::OsStr>,
+) -> Option<Face> {
+    if !face_file::wanted(setting) {
+        return None;
+    }
+    load_outline(dir, font)
+        .map_err(|why| {
+            let _ = writeln!(
+                std::io::stderr(),
+                "td-term: outline face unavailable ({why}); using Unifont"
+            );
+        })
+        .ok()
+}
+
+fn load_outline(dir: &Path, font: &Font) -> Result<Face, String> {
+    let read = |name: &str| face_file::read(dir, name).map(Arc::<[u8]>::from);
+    let refused = |styles: [&str; 2], why: sfnt::Error| {
+        let [first, second] = styles;
+        format!("{} ({first} or {second}): {why}", dir.display())
+    };
+    Face::fit(
+        read(face_file::REGULAR)?,
+        Some(read(face_file::BOLD)?),
+        font.width(),
+        font.height(),
+    )
+    .map_err(|why| refused([face_file::REGULAR, face_file::BOLD], why))?
+    .with_slant(
+        Some(read(face_file::ITALIC)?),
+        Some(read(face_file::BOLD_ITALIC)?),
+    )
+    .map_err(|why| refused([face_file::ITALIC, face_file::BOLD_ITALIC], why))
 }
 
 fn cmdline_has_clipboard_proof(bytes: &[u8]) -> bool {
@@ -2957,6 +3018,7 @@ pub fn run(options: &Options) -> Result<(), String> {
     let clipboard_proof = clipboard_proof_enabled(Path::new(PROC_CMDLINE))?;
     let runtime_directory = client_directory(options)?;
     let font = font::pinned()?;
+    let outline = outline_face(&font, options.face_setting.as_deref());
     let palette = render::Palette::pinned();
     let fallback = default_size(&font)?;
     let deadline = Instant::now()
@@ -2973,6 +3035,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         &mut connection,
         runtime_directory,
         &font,
+        outline,
         &palette,
         Path::new(pty::DEV_PTMX),
     )?;
@@ -3149,6 +3212,7 @@ mod tests {
             ready_socket: "/run/user/1000/terminal.ready".into(),
             working_directory: None,
             command: Vec::new(),
+            face_setting: None,
         };
         assert_eq!(
             client_directory(&options).unwrap(),
@@ -7713,8 +7777,8 @@ mod tests {
         for line in 0..20u32 {
             terminal.feed(format!("L{line}\r\n").as_bytes());
         }
-        let live = build_pixels(size, &terminal, &font, &palette, true, 0, None).unwrap();
-        let back = build_pixels(size, &terminal, &font, &palette, true, 4, None).unwrap();
+        let live = build_pixels(size, &terminal, &font, None, &palette, true, 0, None).unwrap();
+        let back = build_pixels(size, &terminal, &font, None, &palette, true, 4, None).unwrap();
         assert_ne!(
             live, back,
             "a scrolled viewport drew the live screen anyway"
@@ -8567,6 +8631,7 @@ mod tests {
             &mut connection,
             &std::env::temp_dir(),
             &font,
+            None,
             &palette,
             Path::new("/nonexistent/td-term-ptmx"),
         )

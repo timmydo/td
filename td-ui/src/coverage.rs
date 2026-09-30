@@ -10,8 +10,7 @@
 //! linear area. Nothing here reads the environment, a clock, a descriptor
 //! or the filesystem.
 
-use crate::raster::Error;
-use crate::sfnt::{Outline, Point};
+use crate::sfnt::{Error, Outline, Point};
 
 /// A mask's width and height; past it the outline is refused.
 pub const MAX_MASK_AXIS: usize = 512;
@@ -82,13 +81,13 @@ impl Rasterizer {
         mask: &mut Mask,
     ) -> Result<(), Error> {
         if !(scale.is_finite() && scale > 0.0) {
-            return Err(Error::InvalidArgument);
+            return Err(Error::Malformed("coverage scale"));
         }
         let mut bounds: Option<(f32, f32, f32, f32)> = None;
         for point in outline.points() {
             let (x, y) = (point.x * scale, point.y * scale);
             if !(x.is_finite() && y.is_finite()) {
-                return Err(Error::Limit);
+                return Err(Error::Limit("coverage"));
             }
             bounds = Some(match bounds {
                 None => (x, y, x, y),
@@ -104,7 +103,7 @@ impl Rasterizer {
         let (left, bottom, right, top) = (left.floor(), bottom.floor(), right.ceil(), top.ceil());
         let axis = MAX_MASK_AXIS as f32;
         if right - left > axis || top - bottom > axis || left.abs() > 1e6 || top.abs() > 1e6 {
-            return Err(Error::Limit);
+            return Err(Error::Limit("coverage"));
         }
         // Bounded above, so these conversions are exact.
         let width = (right - left) as usize;

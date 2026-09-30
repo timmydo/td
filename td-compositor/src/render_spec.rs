@@ -1187,3 +1187,295 @@ fn the_diff_marks_a_truncated_frame_rather_than_reading_past_it() {
 fn selftest_renders_the_pinned_face_and_round_trips_through_p6() {
     super::selftest().unwrap();
 }
+
+// ---------------------------------------------------------- outline face
+
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+#[path = "../../td-ui/tests/fonts/mod.rs"]
+mod fonts;
+
+use crate::face::Face;
+use fonts::{Builder, Glyph, Segment};
+
+/// A face whose every glyph advances 500 of 1000 units, so fitted to the
+/// 8x16 cell it is 16 px/em with the pen at 0 and the baseline at row 13,
+/// and whose '0' is the square (`left`, `bottom`) to (`right`, `top`) in
+/// font units: a pixel is 62.5 units, so a square on a multiple of 125
+/// covers whole pixels. ' ' is blank; it maps nothing else.
+fn outline_style(left: i32, bottom: i32, right: i32, top: i32) -> std::sync::Arc<[u8]> {
+    let mut builder = Builder::new(vec![
+        Glyph::Empty,
+        Glyph::Simple(vec![vec![
+            (left, bottom, true),
+            (left, top, true),
+            (right, top, true),
+            (right, bottom, true),
+        ]]),
+        Glyph::Empty,
+    ]);
+    builder.advance = Some(500);
+    builder.format4 = vec![
+        Segment::Delta(0x20, 0x20, 2u16.wrapping_sub(0x20)),
+        Segment::Delta(0x30, 0x30, 1u16.wrapping_sub(0x30)),
+    ];
+    builder.font().into()
+}
+
+/// Regular '0' fills columns 0..8 and rows 5..13; bold's is the lower-left
+/// 4x4 (rows 9..13), italic's the lower-right, bold italic's the upper-left
+/// (rows 5..9), so the pixels say which style drew.
+fn outline_face() -> Face {
+    Face::fit(
+        outline_style(0, 0, 500, 500),
+        Some(outline_style(0, 0, 250, 250)),
+        face().width(),
+        face().height(),
+    )
+    .unwrap()
+    .with_slant(
+        Some(outline_style(250, 0, 500, 250)),
+        Some(outline_style(0, 250, 250, 500)),
+    )
+    .unwrap()
+}
+
+fn draw_outline(snapshot: &Snapshot, outline: &mut Face) -> (Vec<u8>, usize) {
+    let (width, height) = surface(snapshot.rows(), snapshot.columns());
+    let mut pixels = vec![0; width * height * BYTES_PER_PIXEL];
+    render_with(
+        snapshot,
+        palette(),
+        face(),
+        Some(outline),
+        &mut pixels,
+        width,
+        height,
+    )
+    .unwrap();
+    (pixels, width)
+}
+
+/// The first cell's inked pixels, as (column, row).
+fn first_cell_ink(pixels: &[u8], width: usize, ink: [u8; 3]) -> Vec<(usize, usize)> {
+    set_pixels(pixels, width, ink)
+        .into_iter()
+        .filter(|&(x, _)| x < face().width())
+        .collect()
+}
+
+fn square(columns: std::ops::Range<usize>, rows: std::ops::Range<usize>) -> Vec<(usize, usize)> {
+    let mut pixels = Vec::new();
+    for y in rows {
+        for x in columns.clone() {
+            pixels.push((x, y));
+        }
+    }
+    pixels.sort_by_key(|&(x, y)| (y, x));
+    pixels
+}
+
+#[test]
+fn an_outline_face_draws_each_rendition_from_its_own_style() {
+    let foreground = palette().foreground();
+    for (input, expected) in [
+        (&b"0"[..], square(0..8, 5..13)),
+        (b"\x1b[1m0", square(0..4, 9..13)),
+        (b"\x1b[3m0", square(4..8, 9..13)),
+        (b"\x1b[1;3m0", square(0..4, 5..9)),
+    ] {
+        let terminal = terminal(1, 3, input);
+        let (pixels, width) =
+            draw_outline(&Snapshot::new(&terminal, false, false), &mut outline_face());
+        let mut ink = first_cell_ink(&pixels, width, foreground);
+        ink.sort_by_key(|&(x, y)| (y, x));
+        assert_eq!(ink, expected, "{input:?}");
+        // Everything else in the cell is its ground.
+        let ground = set_pixels(&pixels, width, palette().background())
+            .into_iter()
+            .filter(|&(x, _)| x < face().width())
+            .count();
+        assert_eq!(ground, face().width() * face().height() - expected.len());
+    }
+}
+
+#[test]
+fn an_outline_glyph_keeps_the_cells_rules_and_inverse() {
+    let (foreground, background) = (palette().foreground(), palette().background());
+    // Bold's '0' is rows 9..13, so the strike at the middle row (8) and the
+    // underline two rows above the bottom (14) each stand clear of it: the
+    // bitmap face's rows, whichever face draws the cell.
+    let terminal = terminal(1, 3, b"\x1b[1;4;9m0");
+    let (pixels, width) =
+        draw_outline(&Snapshot::new(&terminal, false, false), &mut outline_face());
+    let mut expected = square(0..4, 9..13);
+    expected.extend(square(0..8, 8..9));
+    expected.extend(square(0..8, 14..15));
+    expected.sort_by_key(|&(x, y)| (y, x));
+    expected.dedup();
+    let mut ink = first_cell_ink(&pixels, width, foreground);
+    ink.sort_by_key(|&(x, y)| (y, x));
+    assert_eq!(ink, expected);
+
+    let terminal = terminal_inverse();
+    let (pixels, width) =
+        draw_outline(&Snapshot::new(&terminal, false, false), &mut outline_face());
+    let mut glyph = first_cell_ink(&pixels, width, background);
+    glyph.sort_by_key(|&(x, y)| (y, x));
+    assert_eq!(glyph, square(0..8, 5..13));
+    assert_eq!(
+        first_cell_ink(&pixels, width, foreground).len(),
+        face().width() * face().height() - 64
+    );
+}
+
+fn terminal_inverse() -> Terminal {
+    terminal(1, 3, b"\x1b[7m0")
+}
+
+#[test]
+fn a_scalar_the_outline_face_lacks_is_the_bitmap_faces_own_cell() {
+    // Every rendition the bitmap painter has, the cursor focused and not,
+    // over scalars the outline face does not map.
+    for focused in [false, true] {
+        let terminal = terminal(
+            2,
+            6,
+            b"q\x1b[1mW\x1b[3mz\x1b[4;9my\x1b[7mk\x1b[2mj\r\n\x1b[0m#",
+        );
+        let snapshot = Snapshot::new(&terminal, focused, false);
+        let (bitmap, _, _) = draw_grid(&snapshot);
+        let (outline, _) = draw_outline(&snapshot, &mut outline_face());
+        assert_eq!(outline, bitmap, "focused {focused}");
+    }
+}
+
+#[test]
+fn the_focused_cursor_is_its_cell_through_the_outline_face_inverted() {
+    let (foreground, background) = (palette().foreground(), palette().background());
+    let terminal = terminal(1, 3, b"0\x1b[D");
+    let (pixels, width) = draw_outline(&Snapshot::new(&terminal, true, false), &mut outline_face());
+    let mut glyph = first_cell_ink(&pixels, width, background);
+    glyph.sort_by_key(|&(x, y)| (y, x));
+    assert_eq!(glyph, square(0..8, 5..13));
+    assert_eq!(
+        first_cell_ink(&pixels, width, foreground).len(),
+        face().width() * face().height() - 64
+    );
+}
+
+#[test]
+fn a_blank_outline_glyph_is_the_cells_ground_and_rules() {
+    // ' ' is blank in the outline face, so its cells take the outline
+    // path: ground and rules only, as the bitmap face's space is, through
+    // every rendition and the cursor.
+    let mut outline = outline_face();
+    for bold in [false, true] {
+        for italic in [false, true] {
+            let style = outline.style(bold, italic);
+            assert_eq!(outline.glyph(style, ' '), crate::atlas::Slot::Blank);
+        }
+    }
+    for focused in [false, true] {
+        let terminal = terminal(2, 4, b" \x1b[4m \x1b[9m \x1b[7m \r\n\x1b[2;7m \x1b[0m ");
+        let snapshot = Snapshot::new(&terminal, focused, false);
+        let (bitmap, _, _) = draw_grid(&snapshot);
+        let (painted, _) = draw_outline(&snapshot, &mut outline);
+        assert_eq!(painted, bitmap, "focused {focused}");
+    }
+}
+
+#[test]
+fn an_outline_glyph_larger_than_its_cell_stays_inside_it() {
+    // Two pixels past each side and past the top and bottom: the cell is
+    // all ink and none of its four neighbours is touched.
+    let mut outline = Face::fit(outline_style(-125, -300, 625, 1100), None, 8, 16).unwrap();
+    let terminal = terminal(3, 4, b" \r\n 0 ");
+    let (pixels, width) = draw_outline(&Snapshot::new(&terminal, false, false), &mut outline);
+    let (cell_width, cell_height) = (face().width(), face().height());
+    let cell = |row: usize, column: usize| {
+        let mut colors = Vec::new();
+        for y in row * cell_height..(row + 1) * cell_height {
+            for x in column * cell_width..(column + 1) * cell_width {
+                colors.push(rgb_at(&pixels, width, x, y));
+            }
+        }
+        colors
+    };
+    assert!(cell(1, 1).iter().all(|&c| c == palette().foreground()));
+    for (row, column) in [(0, 1), (1, 0), (1, 2), (2, 1)] {
+        assert!(
+            cell(row, column)
+                .iter()
+                .all(|&c| c == palette().background()),
+            "({row}, {column})"
+        );
+    }
+}
+
+#[test]
+fn td_term_loads_four_styles_unless_the_setting_asks_for_the_bitmap_face() {
+    let dir = std::env::temp_dir().join(format!("td-term-outline-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, style) in [
+        (crate::face_file::REGULAR, outline_style(0, 0, 500, 500)),
+        (crate::face_file::BOLD, outline_style(0, 0, 250, 250)),
+        (crate::face_file::ITALIC, outline_style(250, 0, 500, 250)),
+        (
+            crate::face_file::BOLD_ITALIC,
+            outline_style(0, 250, 250, 500),
+        ),
+    ] {
+        std::fs::write(dir.join(name), &*style).unwrap();
+    }
+    let load = |setting: Option<&str>| {
+        let setting = setting.map(std::ffi::OsString::from);
+        crate::term_client::outline_face_from(&dir, face(), setting.as_deref())
+    };
+    let loaded = load(None).expect("the four styles load");
+    assert_eq!(
+        (loaded.cell().width, loaded.cell().height),
+        (face().width(), face().height())
+    );
+    assert_eq!(loaded.style(true, true), crate::atlas::Style::BoldItalic);
+    assert!(load(Some("outline")).is_some());
+    assert!(load(Some("bitmap")).is_none());
+    // A style missing is the whole face refused: the terminal draws in
+    // Unifont rather than in a face that cannot draw every rendition.
+    std::fs::remove_file(dir.join(crate::face_file::ITALIC)).unwrap();
+    assert!(load(None).is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_partly_covered_pixel_blends_the_ground_toward_the_ink() {
+    // 531 units tall is 8.5 pixels: the row above the whole ones is half
+    // covered, strictly between the ground and the ink on every channel.
+    let mut outline = Face::fit(outline_style(0, 0, 500, 531), None, 8, 16).unwrap();
+    let terminal = terminal(1, 3, b"0");
+    let (pixels, width) = draw_outline(&Snapshot::new(&terminal, false, false), &mut outline);
+    let (ground, ink) = (palette().background(), palette().foreground());
+    let edge = rgb_at(&pixels, width, 3, 4);
+    for channel in 0..3 {
+        assert!(
+            ground[channel] < edge[channel] && edge[channel] < ink[channel],
+            "{edge:?}"
+        );
+    }
+    assert_eq!(rgb_at(&pixels, width, 3, 5), ink);
+    assert_eq!(rgb_at(&pixels, width, 3, 3), ground);
+}
+
+#[test]
+fn an_outline_face_fitted_to_another_cell_is_not_used() {
+    let mut outline = Face::fit(outline_style(0, 0, 500, 500), None, 16, 32).unwrap();
+    let terminal = terminal(1, 3, b"0");
+    let snapshot = Snapshot::new(&terminal, true, false);
+    let (bitmap, _, _) = draw_grid(&snapshot);
+    assert_eq!(draw_outline(&snapshot, &mut outline).0, bitmap);
+}

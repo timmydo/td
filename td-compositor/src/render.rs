@@ -1,10 +1,13 @@
 //! Model-to-pixels rendering (DESIGN.md section 11).
 //!
 //! Pure: it reads a snapshot and writes XRGB8888. It opens nothing, owns
-//! nothing, and allocates nothing in the cell loop, so section 14's exact
-//! P6 PPM oracle can drive it without a compositor, a framebuffer, or a
-//! child process.
+//! nothing, and allocates nothing in the cell loop but what an outline face
+//! covers into its atlas the first time it draws a glyph, so section 14's
+//! exact P6 PPM oracle can drive it without a compositor, a framebuffer, or
+//! a child process.
 
+use crate::atlas::{Entry, Slot, PAGE_WIDTH};
+use crate::face::Face;
 use crate::font::Font;
 use crate::term::{Attributes, Cell, Color, Terminal};
 
@@ -345,6 +348,22 @@ pub fn render(
     width: usize,
     height: usize,
 ) -> Result<(), String> {
+    render_with(snapshot, palette, font, None, pixels, width, height)
+}
+
+/// `render`, drawing each glyph the `outline` face has through it: the face
+/// fitted to the bitmap face's cell, so the grid, the cursor and every
+/// rule are the same, and a scalar it lacks is drawn from the bitmap face.
+/// A face fitted to another cell is not used.
+pub fn render_with(
+    snapshot: &Snapshot,
+    palette: &Palette,
+    font: &Font,
+    mut outline: Option<&mut Face>,
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+) -> Result<(), String> {
     let expected = width
         .checked_mul(height)
         .and_then(|count| count.checked_mul(BYTES_PER_PIXEL))
@@ -358,6 +377,12 @@ pub fn render(
     let (cell_width, cell_height) = (font.width(), font.height());
     if cell_width == 0 || cell_height == 0 {
         return Err("font cells have no area".into());
+    }
+    if outline.as_ref().is_some_and(|face| {
+        let cell = face.cell();
+        (cell.width, cell.height) != (cell_width, cell_height)
+    }) {
+        outline = None;
     }
 
     fill(pixels, palette.background());
@@ -376,13 +401,23 @@ pub fn render(
             };
             let cell = snapshot.cell(row, column);
             paint_cell(
-                pixels, width, height, font, palette, &cell, origin_x, origin_y,
+                pixels,
+                width,
+                height,
+                font,
+                outline.as_deref_mut(),
+                palette,
+                &cell,
+                origin_x,
+                origin_y,
             );
         }
     }
 
     if let Some((row, column)) = snapshot.cursor() {
-        paint_cursor(pixels, width, height, font, palette, snapshot, row, column);
+        paint_cursor(
+            pixels, width, height, font, outline, palette, snapshot, row, column,
+        );
     }
 
     if snapshot.bell() {
@@ -405,6 +440,7 @@ fn paint_cell(
     width: usize,
     height: usize,
     font: &Font,
+    outline: Option<&mut Face>,
     palette: &Palette,
     cell: &Cell,
     origin_x: usize,
@@ -412,9 +448,37 @@ fn paint_cell(
 ) {
     let attributes = &cell.attributes;
     let ink = Ink::new(attributes, palette);
+    if let Some(face) = outline {
+        let slot = face.glyph(face.style(attributes.bold, attributes.italic), cell.scalar);
+        if slot != Slot::Missing {
+            let (x, y) = (origin_x, origin_y);
+            let rules = rules(attributes, font.height());
+            let coverage = |column: usize, row: usize| match slot {
+                Slot::Placed(entry) => covered(face, entry, column, row),
+                _ => 0,
+            };
+            for row in 0..font.height() {
+                let Some(y) = y.checked_add(row).filter(|&y| y < height) else {
+                    return;
+                };
+                let ruled = rules.contains(&Some(row));
+                for column in 0..font.width() {
+                    let Some(x) = x.checked_add(column).filter(|&x| x < width) else {
+                        break;
+                    };
+                    let color = if ruled {
+                        ink.foreground
+                    } else {
+                        mix(ink.background, ink.foreground, coverage(column, row))
+                    };
+                    put_pixel(pixels, width, height, x, y, color);
+                }
+            }
+            return;
+        }
+    }
     let glyph = font.index(cell.scalar);
-    let underline = font.height().saturating_sub(UNDERLINE_INSET);
-    let strike = font.height() / 2;
+    let rules = rules(attributes, font.height());
     for glyph_row in 0..font.height() {
         let Some(y) = origin_y.checked_add(glyph_row) else {
             return;
@@ -422,8 +486,7 @@ fn paint_cell(
         if y >= height {
             return;
         }
-        let ruled = (attributes.underline && glyph_row == underline)
-            || (attributes.strike && glyph_row == strike);
+        let ruled = rules.contains(&Some(glyph_row));
         let lean = if attributes.italic {
             shear(glyph_row, font.height())
         } else {
@@ -441,6 +504,57 @@ fn paint_cell(
             put_pixel(pixels, width, height, x, y, color);
         }
     }
+}
+
+/// The rows the underline and the strike take in a cell `height` tall,
+/// each when the rendition asks for it: the cell's, not the glyph's, so a
+/// rule is where it is whichever face draws the cell.
+fn rules(attributes: &Attributes, height: usize) -> [Option<usize>; 2] {
+    [
+        attributes
+            .underline
+            .then(|| height.saturating_sub(UNDERLINE_INSET)),
+        attributes.strike.then_some(height / 2),
+    ]
+}
+
+/// The coverage `entry` puts at (`column`, `row`) of the cell: the glyph's
+/// pixels from the atlas page, placed from the face's pen and baseline and
+/// clipped to the cell, so a lean or an overhang never reaches the next.
+fn covered(face: &Face, entry: Entry, column: usize, row: usize) -> u8 {
+    let cell = face.cell();
+    let signed = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+    let x = signed(column)
+        .saturating_sub(signed(cell.pen))
+        .saturating_sub(i64::from(entry.left));
+    let y = signed(row)
+        .saturating_sub(signed(cell.baseline))
+        .saturating_add(i64::from(entry.top));
+    let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y)) else {
+        return 0;
+    };
+    if x >= entry.width || y >= entry.height {
+        return 0;
+    }
+    entry
+        .y
+        .checked_add(y)
+        .and_then(|page_row| page_row.checked_mul(PAGE_WIDTH))
+        .and_then(|start| start.checked_add(entry.x))
+        .and_then(|start| start.checked_add(x))
+        .and_then(|at| face.atlas().page().get(at).copied())
+        .unwrap_or(0)
+}
+
+/// `from` moved toward `to` by `alpha` of 255, per channel, rounded.
+fn mix(from: [u8; 3], to: [u8; 3], alpha: u8) -> [u8; 3] {
+    let alpha = u16::from(alpha);
+    let mut mixed = [0u8; 3];
+    for (slot, (from, to)) in mixed.iter_mut().zip(from.iter().zip(to.iter())) {
+        let sum = u32::from(*from) * u32::from(255 - alpha) + u32::from(*to) * u32::from(alpha);
+        *slot = u8::try_from((sum + 127) / 255).unwrap_or(u8::MAX);
+    }
+    mixed
 }
 
 /// Whether the cell's pixel at (`glyph_column`, `glyph_row`) is set, after
@@ -473,6 +587,7 @@ fn paint_cursor(
     width: usize,
     height: usize,
     font: &Font,
+    outline: Option<&mut Face>,
     palette: &Palette,
     snapshot: &Snapshot,
     row: usize,
@@ -496,7 +611,7 @@ fn paint_cursor(
             attributes,
         };
         paint_cell(
-            pixels, width, height, font, palette, &flipped, origin_x, origin_y,
+            pixels, width, height, font, outline, palette, &flipped, origin_x, origin_y,
         );
         return;
     }

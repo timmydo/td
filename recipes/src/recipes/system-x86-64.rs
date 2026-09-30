@@ -9699,9 +9699,9 @@ mod tests {
     /// and a mismatch shows only as every program drawing with Unifont.
     #[test]
     fn td_ui_reads_the_outline_face_where_the_image_links_it() {
-        const PINNED_FACE_RS: &str = include_str!("../../../td-ui/src/pinned_face.rs");
+        const FACE_FILE_RS: &str = include_str!("../../../td-ui/src/face_file.rs");
         let constant = |name: &str| {
-            PINNED_FACE_RS
+            FACE_FILE_RS
                 .split_once(&format!("pub const {name}: &str = \""))
                 .and_then(|(_, after)| after.split_once('"'))
                 .map(|(value, _)| value)
@@ -9718,11 +9718,15 @@ mod tests {
                 super::super::jetbrains_mono_nerd_font::DIR
             )
         );
-        let file = constant("REGULAR").unwrap_or_default();
-        assert!(
-            super::super::jetbrains_mono_nerd_font::FILES.contains(&file),
-            "td-ui reads {file:?}, which the font recipe does not ship"
-        );
+        // The regular style for every consumer and the other three for
+        // td-term.
+        for name in ["REGULAR", "BOLD", "ITALIC", "BOLD_ITALIC"] {
+            let file = constant(name).unwrap_or_default();
+            assert!(
+                super::super::jetbrains_mono_nerd_font::FILES.contains(&file),
+                "td-ui reads {file:?}, which the font recipe does not ship"
+            );
+        }
     }
 
     /// The table and td-firstboot are two crates that must agree on four paths, and

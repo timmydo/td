@@ -4651,7 +4651,8 @@ reader thread.
 Section 11's pinned font is landed: the committed Unifont face, its licenses
 and provenance record, the importer that derives it reproducibly, and the PSF2
 reader that validates every header field, table entry, and pixel offset before
-the renderer can index a glyph.
+the renderer can index a glyph. So is td-term's outline face, td-ui's pinned
+JetBrains Mono Nerd Font fitted to that face's cell in four styles.
 
 Section 11's renderer is landed as a pure function, with section 14's exact
 P6 goldens as its oracle: the palette, the six renditions, the cursor, the
@@ -4925,8 +4926,21 @@ or fetched-only test input participates. The PSF2 reader checks headers,
 dimensions, glyph counts, table bounds, scalar validity, and all pixel
 arithmetic before use.
 
+td-term also draws in td-ui's pinned outline face (td-ui/DESIGN.md,
+"td-term"). At startup it reads JetBrains Mono Nerd Font's four styles
+from `/etc/fonts/jetbrains-mono-nerd` through td-ui's `face_file`,
+mounted here with td-ui's `sfnt`, `coverage`, `atlas` and `face`, and
+fits them to Unifont's 8x16 cell, so the grid, the `TIOCSWINSZ` pixel
+size and every rule stay Unifont's. A scalar the outline face lacks, a
+missing or refused face, and `TD_UI_FACE=bitmap` all draw from Unifont
+as below. No test reads the pinned outline face: the outline painter's
+oracles use fonts the tests encode, and every other oracle renders from
+Unifont.
+
 The renderer gives every claimed rendition a deterministic presentation from
-that one face. Bold adds a clipped one-pixel rightward copy of set glyph bits,
+the bitmap face; through the outline face, bold, italic and bold italic
+select those styles, and faint, inverse, underline and strike are as
+here. Bold adds a clipped one-pixel rightward copy of set glyph bits,
 faint blends foreground halfway toward background with integer channel
 arithmetic, and italic applies a bounded row-dependent one-pixel shear.
 Underline and strike draw fixed clipped cell rows, and inverse exchanges
@@ -4957,7 +4971,8 @@ not move either, because the model already reports the column the cursor
 still occupies.
 
 The renderer consumes a complete terminal snapshot, a fixed palette, focus
-state, and cursor state. It performs no allocation in the cell loop. A full
+state, and cursor state. It performs no allocation in the cell loop
+beyond the outline face covering a glyph into its atlas on first use. A full
 redraw is acceptable for the initial QEMU profile, but rendering is coalesced
 behind at most one frame callback. A submitted persistent buffer is reused or
 mutated only after its `wl_buffer.release`; the initial fill precedes its first

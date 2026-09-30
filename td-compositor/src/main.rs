@@ -6,6 +6,21 @@
     path = "../../td-busd/src/app_policy.rs"
 )]
 mod app_policy;
+#[allow(dead_code, reason = "td-ui's outline face, of which td-term uses part")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/atlas.rs")]
+mod atlas;
+#[allow(dead_code, reason = "td-ui's outline face, of which td-term uses part")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/coverage.rs")]
+mod coverage;
+#[allow(dead_code, reason = "td-ui's outline face, of which td-term uses part")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/face.rs")]
+mod face;
+#[allow(dead_code, reason = "td-ui's outline face, of which td-term uses part")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/face_file.rs")]
+mod face_file;
+#[allow(dead_code, reason = "td-ui's outline face, of which td-term uses part")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/sfnt.rs")]
+mod sfnt;
 
 // td-ui's link rule and opener, shared so td-term follows a link as
 // td-editor, td-mail and td-news do; `around` is td-mail's wrap's alone,
@@ -223,6 +238,7 @@ fn run_term(args: &[OsString]) -> Result<(), String> {
                 ready_socket,
                 working_directory,
                 command,
+                face_setting: env::var_os(face_file::SETTING),
             })
         }
         "probe" => {
@@ -1345,8 +1361,13 @@ mod confinement {
             "app_policy.rs",
             include_str!("../../td-busd/src/app_policy.rs"),
         ),
+        ("atlas.rs", include_str!("../../td-ui/src/atlas.rs")),
+        ("coverage.rs", include_str!("../../td-ui/src/coverage.rs")),
+        ("face.rs", include_str!("../../td-ui/src/face.rs")),
+        ("face_file.rs", include_str!("../../td-ui/src/face_file.rs")),
         ("links.rs", include_str!("../../td-ui/src/links.rs")),
         ("open.rs", include_str!("../../td-ui/src/open.rs")),
+        ("sfnt.rs", include_str!("../../td-ui/src/sfnt.rs")),
         ("attention.rs", include_str!("attention.rs")),
         ("authority.rs", AUTHORITY),
         ("bar.rs", include_str!("bar.rs")),
@@ -1389,6 +1410,18 @@ mod confinement {
         ("vm_bridge.rs", include_str!("vm_bridge.rs")),
         ("vm_wire.rs", include_str!("vm_wire.rs")),
         ("wire.rs", include_str!("wire.rs")),
+    ];
+    /// Sources other crates own that are mounted here: td-busd's policy,
+    /// td-ui's link rule and opener, and td-ui's outline face.
+    const MOUNTED: &[&str] = &[
+        "app_policy.rs",
+        "atlas.rs",
+        "coverage.rs",
+        "face.rs",
+        "face_file.rs",
+        "links.rs",
+        "open.rs",
+        "sfnt.rs",
     ];
     const TEST_ONLY: &[(&str, &str)] = &[
         ("render_spec.rs", include_str!("render_spec.rs")),
@@ -1807,7 +1840,7 @@ unsafe impl Send for MappedRegion {}"#;
             OTHER
                 .iter()
                 .chain(TEST_ONLY)
-                .filter(|(name, _)| !["app_policy.rs", "links.rs", "open.rs"].contains(name))
+                .filter(|(name, _)| !MOUNTED.contains(name))
                 .map(|(name, _)| (*name).to_string()),
         );
         inventoried.sort();

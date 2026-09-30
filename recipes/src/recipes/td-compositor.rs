@@ -18,6 +18,7 @@ const MODULES: &[(&str, &str)] = &[
         "app_policy",
         include_str!("../../../td-busd/src/app_policy.rs"),
     ),
+    ("atlas", include_str!("../../../td-ui/src/atlas.rs")),
     ("links", include_str!("../../../td-ui/src/links.rs")),
     ("open", include_str!("../../../td-ui/src/open.rs")),
     (
@@ -47,11 +48,14 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/configure.rs"),
     ),
     ("conn", include_str!("../../../td-compositor/src/conn.rs")),
+    ("coverage", include_str!("../../../td-ui/src/coverage.rs")),
     (
         "control",
         include_str!("../../../td-compositor/src/control.rs"),
     ),
     ("drm", include_str!("../../../td-compositor/src/drm.rs")),
+    ("face", include_str!("../../../td-ui/src/face.rs")),
+    ("face_file", include_str!("../../../td-ui/src/face_file.rs")),
     (
         "filter",
         include_str!("../../../td-compositor/src/filter.rs"),
@@ -115,6 +119,7 @@ const MODULES: &[(&str, &str)] = &[
         "session",
         include_str!("../../../td-compositor/src/session.rs"),
     ),
+    ("sfnt", include_str!("../../../td-ui/src/sfnt.rs")),
     (
         "socket",
         include_str!("../../../td-compositor/src/socket.rs"),

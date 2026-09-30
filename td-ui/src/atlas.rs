@@ -24,6 +24,8 @@ const GUTTER: usize = 1;
 pub enum Style {
     Regular,
     Bold,
+    Italic,
+    BoldItalic,
 }
 
 /// A glyph's rectangle on the page and its bearing: its left column

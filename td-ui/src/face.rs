@@ -31,11 +31,14 @@ pub struct Cell {
 #[derive(Clone, Debug)]
 pub struct Face {
     regular: Arc<[u8]>,
-    bold: Option<Arc<[u8]>>,
+    /// The bold, italic and bold italic styles, each with its pixels per
+    /// font unit, since units per em may differ between styles.
+    styles: [Option<(Arc<[u8]>, f32)>; 3],
+    /// Pixels per font unit for the regular style.
+    scale: f32,
+    /// The size glyphs are covered at, unrounded.
+    size: f32,
     pixels_per_em: u16,
-    /// Pixels per font unit, for the regular style and the bold one,
-    /// whose units per em may differ.
-    scales: [f32; 2],
     cell: Cell,
     atlas: Atlas,
     rasterizer: Rasterizer,
@@ -130,25 +133,45 @@ impl Face {
         if cell.width > MAX_CELL_AXIS || cell.height > MAX_CELL_AXIS {
             return Err(Error::Limit("cell"));
         }
-        let scale_of = |bytes: &[u8]| {
-            Font::parse(bytes).map(|font| pixels_per_em / f32::from(font.units_per_em()))
-        };
-        let scale = scale_of(&regular)?;
-        let bold_scale = match &bold {
-            Some(bold) => scale_of(bold)?,
-            None => scale,
-        };
+        let scale = scale_of(&regular, pixels_per_em)?;
+        let bold = bold
+            .map(|bold| scale_of(&bold, pixels_per_em).map(|scale| (bold, scale)))
+            .transpose()?;
         Ok(Self {
             regular,
-            bold,
+            styles: [bold, None, None],
+            scale,
+            size: pixels_per_em,
             pixels_per_em: pixels_per_em.round() as u16,
-            scales: [scale, bold_scale],
             cell,
             atlas: Atlas::new(),
             rasterizer: Rasterizer::new(),
             outline: Outline::new(),
             mask: Mask::default(),
         })
+    }
+
+    /// This face with italic and bold italic styles, covered at its size
+    /// on its cell, and its atlas emptied. Either may be absent; a slanted
+    /// style the face lacks draws upright.
+    pub fn with_slant(
+        mut self,
+        italic: Option<Arc<[u8]>>,
+        bold_italic: Option<Arc<[u8]>>,
+    ) -> Result<Self, Error> {
+        let size = self.size;
+        let scaled = |bytes: Option<Arc<[u8]>>| {
+            bytes
+                .map(|bytes| scale_of(&bytes, size).map(|scale| (bytes, scale)))
+                .transpose()
+        };
+        let [_, italic_slot, bold_italic_slot] = &mut self.styles;
+        *italic_slot = scaled(italic)?;
+        *bold_italic_slot = scaled(bold_italic)?;
+        // A slot covered, or found missing, before the change would
+        // otherwise answer for the new styles.
+        self.atlas.reset();
+        Ok(self)
     }
 
     pub fn cell(&self) -> Cell {
@@ -170,36 +193,55 @@ impl Face {
         self.atlas.take_dirty()
     }
 
-    /// The style a glyph is drawn in: bold only when the face has it.
-    pub fn style(&self, bold: bool) -> Style {
-        if bold && self.bold.is_some() {
-            Style::Bold
-        } else {
-            Style::Regular
+    /// The style a glyph is drawn in: the one asked for when the face has
+    /// it, else bold italic falls to italic and then bold, and any style to
+    /// regular.
+    pub fn style(&self, bold: bool, italic: bool) -> Style {
+        let has = |style: Style| self.source(style).is_some();
+        [
+            (bold && italic, Style::BoldItalic),
+            (italic, Style::Italic),
+            (bold, Style::Bold),
+        ]
+        .into_iter()
+        .find(|&(asked, style)| asked && has(style))
+        .map_or(Style::Regular, |(_, style)| style)
+    }
+
+    /// A style's bytes and scale other than the regular one's.
+    fn source(&self, style: Style) -> Option<&(Arc<[u8]>, f32)> {
+        let [bold, italic, bold_italic] = &self.styles;
+        match style {
+            Style::Regular => None,
+            Style::Bold => bold.as_ref(),
+            Style::Italic => italic.as_ref(),
+            Style::BoldItalic => bold_italic.as_ref(),
         }
     }
 
-    /// The scalar's slot in `style` (bold only when the face has it),
-    /// covering it on a miss. A scalar the bold style lacks is covered from
-    /// the regular one; one the face lacks, or whose glyph it refuses, is
-    /// recorded missing so the caller's fallback answers without another
+    /// The scalar's slot in `style`, as `style` resolves it from what the
+    /// face has, covering it on a miss. A scalar a style lacks is covered
+    /// from the regular one; one the face lacks, or whose glyph it refuses,
+    /// is recorded missing so the caller's fallback answers without another
     /// parse. A placed entry is valid until the atlas's next reset, which
     /// any later miss may cause: a caller holding entries across lookups
     /// compares `atlas().epoch()`.
     pub fn glyph(&mut self, style: Style, scalar: char) -> Slot {
-        let style = self.style(style == Style::Bold);
+        let bold = matches!(style, Style::Bold | Style::BoldItalic);
+        let italic = matches!(style, Style::Italic | Style::BoldItalic);
+        let style = self.style(bold, italic);
         if let Some(slot) = self.atlas.get(style, scalar) {
             return slot;
         }
-        let [scale, bold_scale] = self.scales;
-        let bold = match (style, &self.bold) {
-            (Style::Bold, Some(bold)) => Some((bold, bold_scale)),
-            _ => None,
-        };
-        let sources = bold.into_iter().chain([(&self.regular, scale)]);
+        let styled = self
+            .source(style)
+            .map(|(bytes, scale)| (bytes.clone(), *scale));
+        let sources = styled
+            .into_iter()
+            .chain([(self.regular.clone(), self.scale)]);
         let (outline, rasterizer, mask) = (&mut self.outline, &mut self.rasterizer, &mut self.mask);
         let covered = sources.into_iter().any(|(bytes, scale)| {
-            Font::parse(bytes)
+            Font::parse(&bytes)
                 .ok()
                 .and_then(|font| {
                     let glyph = font.glyph(scalar)?;
@@ -217,6 +259,11 @@ impl Face {
             }
         }
     }
+}
+
+/// Pixels per font unit at `pixels_per_em` for the face in `bytes`.
+fn scale_of(bytes: &[u8], pixels_per_em: f32) -> Result<f32, Error> {
+    Font::parse(bytes).map(|font| pixels_per_em / f32::from(font.units_per_em()))
 }
 
 /// The advance a cell is one of: that of `0`, else `M`.

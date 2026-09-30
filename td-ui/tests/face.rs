@@ -194,10 +194,92 @@ fn glyphs_are_covered_once_and_misses_are_remembered() {
     assert_eq!(face.glyph(Style::Regular, 'Z'), Slot::Missing);
     assert_eq!(face.atlas().get(Style::Regular, 'Z'), Some(Slot::Missing));
     assert_eq!((face.atlas().len(), face.atlas().epoch()), (3, 0));
-    assert_eq!(face.style(true), Style::Regular, "no bold face");
-    assert_eq!(face.style(false), Style::Regular);
+    assert_eq!(face.style(true, false), Style::Regular, "no bold face");
+    assert_eq!(face.style(false, false), Style::Regular);
     let face = Face::new(face_bytes(false), Some(face_bytes(true)), 20).unwrap();
-    assert_eq!(face.style(true), Style::Bold);
+    assert_eq!(face.style(true, false), Style::Bold);
+}
+
+#[test]
+fn slanted_styles_resolve_to_what_the_face_has_and_have_their_own_scale() {
+    let size = |slot: Slot| match slot {
+        Slot::Placed(entry) => (entry.width, entry.height),
+        other => panic!("{other:?}"),
+    };
+    // An italic face at 2000 units per em whose 'a' is a 400-unit square,
+    // 4 pixels at 20 px/em; it maps no 'h', which the regular outline
+    // then supplies.
+    let mut builder = Builder::new(vec![
+        Glyph::Empty,
+        Glyph::Simple(vec![rectangle(0, 0, 400, 400)]),
+    ]);
+    builder.units_per_em = 2000;
+    builder.format4 = vec![
+        Segment::Delta(0x30, 0x30, 1u16.wrapping_sub(0x30)),
+        Segment::Delta(0x61, 0x61, 1u16.wrapping_sub(0x61)),
+    ];
+    let italic: std::sync::Arc<[u8]> = builder.font().into();
+    let bold = || Some(face_bytes(true));
+
+    let upright = Face::new(face_bytes(false), bold(), 20).unwrap();
+    assert_eq!(upright.style(false, true), Style::Regular, "no italic");
+    assert_eq!(upright.style(true, true), Style::Bold, "no slant at all");
+
+    let mut face = Face::new(face_bytes(false), bold(), 20)
+        .unwrap()
+        .with_slant(Some(italic.clone()), None)
+        .unwrap();
+    assert_eq!(face.style(false, false), Style::Regular);
+    assert_eq!(face.style(true, false), Style::Bold);
+    assert_eq!(face.style(false, true), Style::Italic);
+    assert_eq!(face.style(true, true), Style::Italic, "no bold italic");
+    assert_eq!(size(face.glyph(Style::Italic, 'a')), (4, 4));
+    // Bold italic the face lacks is the italic slot, not a copy.
+    let held = face.atlas().len();
+    assert_eq!(size(face.glyph(Style::BoldItalic, 'a')), (4, 4));
+    assert_eq!(face.atlas().len(), held);
+    assert_eq!(
+        size(face.glyph(Style::Italic, 'h')),
+        size(face.glyph(Style::Regular, 'h'))
+    );
+
+    let mut face = Face::new(face_bytes(false), None, 20)
+        .unwrap()
+        .with_slant(None, Some(italic.clone()))
+        .unwrap();
+    assert_eq!(face.style(true, true), Style::BoldItalic);
+    assert_eq!(face.style(false, true), Style::Regular, "no italic");
+    assert_eq!(face.style(true, false), Style::Regular, "no bold");
+    assert_eq!(size(face.glyph(Style::BoldItalic, 'a')), (4, 4));
+
+    // A fitted face covers its slanted styles at the fitted size.
+    let mut fitted = Face::fit(face_bytes(false).into(), None, 20, 16)
+        .unwrap()
+        .with_slant(Some(face_bytes(false).into()), None)
+        .unwrap();
+    assert_eq!(
+        size(fitted.glyph(Style::Italic, 'a')),
+        size(fitted.glyph(Style::Regular, 'a'))
+    );
+
+    assert!(Face::new(face_bytes(false), None, 20)
+        .unwrap()
+        .with_slant(Some(b"not a font".to_vec().into()), None)
+        .is_err());
+
+    // Replacing the slanted styles empties the atlas: a slot covered, or
+    // found missing, from the old bytes does not answer for the new.
+    let mut face = Face::new(face_bytes(false), None, 20)
+        .unwrap()
+        .with_slant(Some(italic.clone()), None)
+        .unwrap();
+    assert_eq!(size(face.glyph(Style::Italic, 'a')), (4, 4));
+    let epoch = face.atlas().epoch();
+    let mut face = face
+        .with_slant(Some(face_bytes(true).into()), None)
+        .unwrap();
+    assert_ne!(face.atlas().epoch(), epoch);
+    assert_eq!(size(face.glyph(Style::Italic, 'a')), (5, 5));
 }
 
 #[test]

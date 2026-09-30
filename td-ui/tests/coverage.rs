@@ -11,8 +11,7 @@
 //! against the closed form, start-point independence and every refusal.
 
 use td_ui::coverage::{Mask, Rasterizer, MAX_MASK_AXIS, MAX_OVERSAMPLED_AXIS};
-use td_ui::raster::Error;
-use td_ui::sfnt::{Outline, Point};
+use td_ui::sfnt::{Error, Outline, Point};
 
 fn on(x: f32, y: f32) -> Point {
     Point { x, y, on: true }
@@ -244,7 +243,7 @@ fn refusals_leave_the_mask_untouched() {
         let mut mask = before.clone();
         assert_eq!(
             rasterizer.rasterize(&square, scale, &mut mask),
-            Err(Error::InvalidArgument)
+            Err(Error::Malformed("coverage scale"))
         );
         assert_eq!(mask, before);
     }
@@ -252,7 +251,7 @@ fn refusals_leave_the_mask_untouched() {
     let mut mask = before.clone();
     assert_eq!(
         rasterizer.rasterize(&square, (axis + 1.0) / 1000.0, &mut mask),
-        Err(Error::Limit)
+        Err(Error::Limit("coverage"))
     );
     assert_eq!(mask, before);
     let exact = cover(&square, axis / 1000.0);
@@ -260,12 +259,12 @@ fn refusals_leave_the_mask_untouched() {
     let far = outline(&[&rectangle(1e30, 0.0, 1e30 + 1.0, 1.0)]);
     assert_eq!(
         rasterizer.rasterize(&far, 1.0, &mut mask),
-        Err(Error::Limit)
+        Err(Error::Limit("coverage"))
     );
     let overflow = outline(&[&rectangle(0.0, 0.0, f32::MAX, 1.0)]);
     assert_eq!(
         rasterizer.rasterize(&overflow, 2.0, &mut mask),
-        Err(Error::Limit)
+        Err(Error::Limit("coverage"))
     );
     assert_eq!(mask, before);
 }
