@@ -754,9 +754,10 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
     );
     client.settle(9);
     let state = client.request(10, &["state"]);
-    // The zoom is the field before the three export settings.
+    // The zoom is the field before the three export settings and the
+    // contrast.
     assert_eq!(
-        state.get(state.len().wrapping_sub(4)).map(String::as_str),
+        state.get(state.len().wrapping_sub(5)).map(String::as_str),
         Some("100@5000,5000"),
         "{state:?}"
     );
@@ -787,6 +788,25 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
         compositor.tile(&place),
         brighter,
         "the developed frame fitted again"
+    );
+
+    // A contrast edit re-develops as the exposure's did: level 3 again,
+    // the frame the roll's preview as the sidecar now is.
+    assert_eq!(
+        client.request(13, &["action", "contrast-in"]),
+        ["ok", "changed"]
+    );
+    client.settle(14);
+    let steeper = super::preview_develop(&client_directory, place.width, place.height, &roll, 0);
+    assert_ne!(
+        super::box_pixels(&brighter, place.width, r#box),
+        super::box_pixels(&steeper, place.width, r#box),
+        "the contrast did not reach the developed pixels"
+    );
+    assert_eq!(
+        compositor.tile(&place),
+        steeper,
+        "the developed frame after the contrast"
     );
 
     // A look the sidecar names but no file provides makes the develop for the

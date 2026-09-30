@@ -43,21 +43,22 @@ const HELP: &str = concat!(
     "  with their geometry. --decode also decodes the raw strip and every\n",
     "  preview and prints their statistics and hashes.\n",
     "td-photo develop FILE OUT.ppm [--long-edge N] [--exposure STOPS]\n",
-    "                 [--look STEM] [--crop \"X Y W H\"]\n",
+    "                 [--contrast C] [--look STEM] [--crop \"X Y W H\"]\n",
     "  Develops the raw to 8-bit sRGB at most N pixels on the long side\n",
     "  (default 1600) with an exposure offset in stops (default 0), the\n",
-    "  look STEM (see looks; default none) and the crop \"X Y W H\", four\n",
-    "  fractions of the oriented frame as the sidecar spells it (default\n",
-    "  the whole frame), written through a fresh\n",
+    "  contrast C (-1.00 to 1.00, the tone's steepness about grey 2^C;\n",
+    "  default 0), the look STEM (see looks; default none) and the crop\n",
+    "  \"X Y W H\", four fractions of the oriented frame as the sidecar\n",
+    "  spells it (default the whole frame), written through a fresh\n",
     "  OUT.ppm.tmp and linked into place. OUT.ppm must not exist: td-photo\n",
     "  never overwrites a file.\n",
     "td-photo export FILE [--format jpeg|avif] [--quality N]\n",
     "                 [--long-edge N|full]\n",
     "  Renders FILE's raw at full resolution (a bilinear demosaic, in row\n",
-    "  bands) with its sidecar's exposure, crop and look, shrinks it to N\n",
-    "  pixels on the long side when --long-edge asks (default full, never\n",
-    "  enlarged), and writes it as a JPEG (4:4:4; the default) or an AVIF\n",
-    "  (8-bit 4:2:0) at --quality 1 to 100 (default 92) into exported/\n",
+    "  bands) with its sidecar's exposure, contrast, crop and look, shrinks\n",
+    "  it to N pixels on the long side when --long-edge asks (default full,\n",
+    "  never enlarged), and writes it as a JPEG (4:4:4; the default) or an\n",
+    "  AVIF (8-bit 4:2:0) at --quality 1 to 100 (default 92) into exported/\n",
     "  beside FILE: STEM.jpg, or STEM-2.jpg, STEM-3.jpg ... when that name\n",
     "  is taken (STEM.avif likewise), through a fresh STEM.jpg.tmp or\n",
     "  STEM.avif.tmp linked into place. Never overwrites, and a sidecar the\n",
@@ -95,8 +96,9 @@ const HELP: &str = concat!(
     "  cannot be read is unread: each is reported with why and left\n",
     "  alone, and the run fails after the rest. SRC is never written.\n",
     "td-photo list ROLL [--picks | --rejects | --unflagged]\n",
-    "  One line per original in ROLL: name, flag, exposure, crop, look and\n",
-    "  the sidecar's state (none, ok, or error and why), tab-separated.\n",
+    "  One line per original in ROLL: name, flag, exposure, contrast,\n",
+    "  crop, look and the sidecar's state (none, ok, or error and why),\n",
+    "  tab-separated.\n",
     "td-photo flag FILE pick | reject | clear\n",
     "  Sets or clears the cull flag in FILE's sidecar.\n",
     "td-photo delete-rejected ROLL\n",
@@ -107,8 +109,9 @@ const HELP: &str = concat!(
     "  when any was kept or split. Each file is linked into rejected/ before\n",
     "  its old name is dropped, so no name is replaced and no file is lost.\n",
     "td-photo edit FILE [KEY VALUE ... | reset | undo]\n",
-    "  Prints FILE's sidecar, or sets exposure STOPS (-5.00 to 5.00), crop\n",
-    "  X Y W H (fractions to four decimals), look STEM or flag pick|reject;\n",
+    "  Prints FILE's sidecar, or sets exposure STOPS (-5.00 to 5.00),\n",
+    "  contrast C (-1.00 to 1.00), crop X Y W H (fractions to four\n",
+    "  decimals), look STEM or flag pick|reject;\n",
     "  a VALUE of - clears the key. A develop key set is a step of the\n",
     "  sidecar's history (step-N lines, the keys their summary); undo takes\n",
     "  the last step back and reset clears all but the flag. The sidecar\n",
@@ -517,7 +520,13 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String> {
     check_flags(
         rest,
-        &["--long-edge", "--exposure", "--look", "--crop"],
+        &[
+            "--long-edge",
+            "--exposure",
+            "--contrast",
+            "--look",
+            "--crop",
+        ],
         &[],
     )?;
     let long_edge = match option(rest, "--long-edge")? {
@@ -535,6 +544,11 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
             .filter(|v| v.is_finite() && (-5.0..=5.0).contains(v))
             .ok_or_else(|| format!("--exposure {text:?} is not -5..=5 stops"))?,
         None => 0.0,
+    };
+    let contrast = match option(rest, "--contrast")? {
+        Some(text) => library::contrast(&text)
+            .map_err(|_| format!("--contrast {text:?} is not D.DD in -1.00..=1.00"))?,
+        None => 0,
     };
     // The look, like a bad option, is refused before the camera file is
     // read; a user look that does not parse is an error, not the built-in.
@@ -554,7 +568,14 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
     refuse_existing(out)?;
     let threads = threads();
     let started = Instant::now();
-    let (image, info) = develop_raw(path, crop, long_edge, exposure, look.as_ref(), threads)?;
+    let contrast = Look::contrast(contrast);
+    let params = Params {
+        exposure,
+        contrast: contrast.as_ref(),
+        threads,
+        look: look.as_ref(),
+    };
+    let (image, info) = develop_raw(path, crop, long_edge, &params)?;
     write_atomically(out, &image)?;
     writeln!(
         io::stdout().lock(),
@@ -748,7 +769,7 @@ pub(crate) fn crop_fractions(crop: library::Crop) -> [f32; 4] {
 
 /// Level 1 to level 2: the `crop`'s region (the whole frame when there is
 /// none) resampled to the canvas that fits `long_edge` and oriented. Rerun on
-/// a crop or resize; reused across exposure and look edits.
+/// a crop or resize; reused across exposure, contrast and look edits.
 pub(crate) fn level1_level2(
     level1: &develop::Level1,
     meta: &Meta,
@@ -763,7 +784,7 @@ pub(crate) fn level1_level2(
 /// (`develop::viewport`), from level 1 through `HALF_ZOOM` and from level
 /// 0 past it, where level 1 has fewer pixels than the box shows; a zoom
 /// past half needs the frame. Rerun on a zoom, pan, crop or resize, reused
-/// across exposure and look edits as the fit level 2 is.
+/// across exposure, contrast and look edits as the fit level 2 is.
 pub(crate) fn zoom_level2(
     level1: &develop::Level1,
     raw: Option<&RawFrame>,
@@ -793,50 +814,36 @@ pub(crate) fn level1_extent(
     develop::extent(level1.width, level1.height, crop, meta.orientation)
 }
 
-/// Level 2 to the frame: the per-pixel pipeline at `stops` with `look`, then
-/// the shrink to the box for a shape taller than it, the thumbnail rule.
-/// What an exposure or look edit reruns; level 2 is untouched.
+/// Level 2 to the frame: the per-pixel pipeline at `params`, then the
+/// shrink to the box for a shape taller than it, the thumbnail rule.
+/// What an exposure, contrast or look edit reruns; level 2 is untouched.
 pub(crate) fn level2_frame(
     level2: &develop::Level2,
     meta: &Meta,
     box_w: usize,
     box_h: usize,
-    stops: f32,
-    look: Option<&Look>,
-    threads: usize,
+    params: &Params<'_>,
 ) -> Result<Rgb8, String> {
-    let image = develop::level3(
-        level2,
-        meta.wb,
-        &meta.color,
-        &Transfer::srgb(),
-        &Params {
-            exposure: stops,
-            threads,
-            look,
-        },
-    )
-    .map_err(|e| e.to_string())?;
-    develop::shrink(image, box_w, box_h, threads).map_err(|e| e.to_string())
+    let image = develop::level3(level2, meta.wb, &meta.color, &Transfer::srgb(), params)
+        .map_err(|e| e.to_string())?;
+    develop::shrink(image, box_w, box_h, params.threads).map_err(|e| e.to_string())
 }
 
 /// The raw develop the `develop` verb shares with the window's preview: a
 /// file's raw sub-image parsed, decoded, demosaiced and rendered to an sRGB
 /// `Rgb8` fitting `long_edge`, `crop`'s region when one is given, at
-/// `exposure` stops with `look` when one is given, by way of the levels
-/// above. No file is written here; the caller decides. The verb runs it whole
-/// on one thread; the window runs the levels apart and caches them, and
-/// `--preview` runs the whole preview through `develop_preview` below.
+/// `params`, by way of the levels above. No file is written here; the
+/// caller decides. The verb runs it whole on one thread; the window runs
+/// the levels apart and caches them, and `--preview` runs the whole
+/// preview through `develop_preview` below.
 fn develop_raw(
     path: &Path,
     crop: Option<[f32; 4]>,
     long_edge: usize,
-    exposure: f32,
-    look: Option<&Look>,
-    threads: usize,
+    params: &Params<'_>,
 ) -> Result<(Rgb8, DevelopInfo), String> {
     let (raw, info) = decode_raw(path)?;
-    let level1 = raw_level1(&raw, threads)?;
+    let level1 = raw_level1(&raw, params.threads)?;
     let image = develop::render(
         &level1,
         crop,
@@ -845,11 +852,7 @@ fn develop_raw(
         raw.meta.wb,
         &raw.meta.color,
         &Transfer::srgb(),
-        &Params {
-            exposure,
-            threads,
-            look,
-        },
+        params,
     )
     .map_err(|e| e.to_string())?;
     Ok((image, info))
@@ -857,7 +860,8 @@ fn develop_raw(
 
 /// The developed preview the window blits into its box and `--preview`
 /// reproduces: the file at `roll/name` developed to fit `box_w` by `box_h`
-/// at the sidecar's `exposure` (hundredths of a stop) and `look` stem, or
+/// at the sidecar's `exposure` (hundredths of a stop), `contrast`
+/// (hundredths) and `look` stem, or
 /// `None` (a note on stderr) when it cannot be made, so the box keeps its
 /// placeholder as a grid box does for a thumbnail that cannot be made. The
 /// look stem is resolved here, off the turn loop's thread. Mirrors the
@@ -872,6 +876,7 @@ fn develop_preview(
     box_w: usize,
     box_h: usize,
     exposure: i32,
+    contrast: i32,
     look: Option<&str>,
     crop: Option<library::Crop>,
     zoom: Option<(u32, (u32, u32))>,
@@ -889,7 +894,13 @@ fn develop_preview(
         None => None,
     };
     let long_edge = box_w.max(box_h);
-    let stops = exposure as f32 / 100.0;
+    let contrast = Look::contrast(contrast);
+    let params = Params {
+        exposure: exposure as f32 / 100.0,
+        contrast: contrast.as_ref(),
+        threads,
+        look: look.as_ref(),
+    };
     let crop = crop.map(crop_fractions);
     let made = match zoom {
         // The zoomed box: the levels apart, as the window runs them, on
@@ -904,23 +915,13 @@ fn develop_preview(
                     box_h,
                 };
                 let level2 = zoom_level2(&level1, Some(&raw), &raw.meta, crop, zoom, threads)?;
-                level2_frame(
-                    &level2,
-                    &raw.meta,
-                    box_w,
-                    box_h,
-                    stops,
-                    look.as_ref(),
-                    threads,
-                )
+                level2_frame(&level2, &raw.meta, box_w, box_h, &params)
             })
             .map_err(|e| format!("{}: {e}", path.display())),
-        None => develop_raw(&path, crop, long_edge, stops, look.as_ref(), threads).and_then(
-            |(image, _)| {
-                develop::shrink(image, box_w, box_h, threads)
-                    .map_err(|e| format!("{}: {e}", path.display()))
-            },
-        ),
+        None => develop_raw(&path, crop, long_edge, &params).and_then(|(image, _)| {
+            develop::shrink(image, box_w, box_h, threads)
+                .map_err(|e| format!("{}: {e}", path.display()))
+        }),
     };
     match made {
         Ok(image) => Some(image),
@@ -940,8 +941,8 @@ const EXPORT_BAND_ROWS: usize = 64;
 /// Numbered names tried for one export before it gives up.
 const MAX_EXPORT_NAMES: u32 = 1000;
 
-/// One export as asked for: the original and its sidecar's exposure, crop
-/// and look as the file held them when the export was asked for, and the
+/// One export as asked for: the original and its sidecar's exposure,
+/// contrast, crop and look as the file held them when the export was asked for, and the
 /// settings it is written with, so the verb, the replay and the window's
 /// pool job develop the same thing. The look is a stem here and resolved
 /// where the export runs.
@@ -949,6 +950,7 @@ const MAX_EXPORT_NAMES: u32 = 1000;
 pub(crate) struct ExportRequest {
     pub(crate) path: PathBuf,
     pub(crate) exposure: i32,
+    pub(crate) contrast: i32,
     pub(crate) crop: Option<library::Crop>,
     pub(crate) look: Option<String>,
     pub(crate) settings: Settings,
@@ -1016,6 +1018,7 @@ pub(crate) fn export_request(path: &Path, settings: Settings) -> Result<ExportRe
     Ok(ExportRequest {
         path: path.to_path_buf(),
         exposure: sidecar.exposure().unwrap_or(0),
+        contrast: sidecar.contrast().unwrap_or(0),
         crop: sidecar.crop(),
         look: sidecar.look().map(str::to_string),
         settings,
@@ -1126,6 +1129,7 @@ pub(crate) fn export_file(
         None => None,
     };
     let stops = request.exposure as f32 / 100.0;
+    let contrast = Look::contrast(request.contrast);
     let crop = request.crop.map(crop_fractions);
     let stem = path
         .file_stem()
@@ -1178,6 +1182,7 @@ pub(crate) fn export_file(
     let transfer = Transfer::srgb();
     let params = Params {
         exposure: stops,
+        contrast: contrast.as_ref(),
         threads,
         look: look.as_ref(),
     };
@@ -2435,8 +2440,9 @@ fn edit(path: &Path, rest: &[OsString]) -> Result<(), String> {
     }
     let mut words = words.as_slice();
     while let Some((name, tail)) = words.split_first() {
-        let key = Key::parse(name)
-            .ok_or_else(|| format!("{name}: not a sidecar key (flag, exposure, crop, look)"))?;
+        let key = Key::parse(name).ok_or_else(|| {
+            format!("{name}: not a sidecar key (flag, exposure, contrast, crop, look)")
+        })?;
         let take = match key {
             Key::Crop if tail.first() != Some(&"-") => 4,
             _ => 1,
@@ -2482,9 +2488,10 @@ fn list(roll: &Path, rest: &[OsString]) -> Result<(), String> {
         let column = |key: Key| values.value(key).unwrap_or("-").to_string();
         writeln!(
             out,
-            "{name}\t{}\t{}\t{}\t{}\t{status}",
+            "{name}\t{}\t{}\t{}\t{}\t{}\t{status}",
             column(Key::Flag),
             column(Key::Exposure),
+            column(Key::Contrast),
             column(Key::Crop),
             column(Key::Look)
         )
@@ -2926,15 +2933,12 @@ impl Session {
                     outcome =
                         self.edit(index, name, |sidecar| sidecar.set(key, value.as_deref()))?
                 }
-                Effect::Expose { index, name, delta } => {
-                    outcome = self.edit(index, name, |sidecar| {
-                        let current = sidecar.exposure().unwrap_or(0);
-                        let next = current
-                            .saturating_add(delta)
-                            .clamp(-library::MAX_EXPOSURE, library::MAX_EXPOSURE);
-                        sidecar.set(Key::Exposure, Some(&library::exposure_text(next)))
-                    })?
-                }
+                Effect::Nudge {
+                    index,
+                    name,
+                    key,
+                    delta,
+                } => outcome = self.edit(index, name, |sidecar| sidecar.nudge(key, delta))?,
                 Effect::Reset { index, name } => {
                     outcome = self.edit(index, name, |sidecar| {
                         sidecar.reset();

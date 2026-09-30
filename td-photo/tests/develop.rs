@@ -399,6 +399,7 @@ fn render_develops_neutral_patches_to_expected_values() {
         &transfer,
         &Params {
             exposure: 0.0,
+            contrast: None,
             threads: 2,
             look: None,
         },
@@ -428,6 +429,7 @@ fn render_develops_neutral_patches_to_expected_values() {
         &transfer,
         &Params {
             exposure: 1.0,
+            contrast: None,
             threads: 1,
             look: None,
         },
@@ -449,6 +451,7 @@ fn render_develops_neutral_patches_to_expected_values() {
         &transfer,
         &Params {
             exposure: 0.0,
+            contrast: None,
             threads: 1,
             look: None,
         },
@@ -509,6 +512,7 @@ fn the_levels_split_composes_to_render() {
             for exposure in [-1.0, 0.0, 0.4] {
                 let params = Params {
                     exposure,
+                    contrast: None,
                     threads: 3,
                     look: look_opt,
                 };
@@ -554,6 +558,7 @@ fn the_levels_split_composes_to_render() {
     );
     let params = Params {
         exposure: 0.0,
+        contrast: None,
         threads: 1,
         look: None,
     };
@@ -596,6 +601,7 @@ fn a_crop_selects_the_oriented_region_for_every_orientation() {
     let level1 = level1_of(&pixels, w, h);
     let params = Params {
         exposure: 0.0,
+        contrast: None,
         threads: 3,
         look: None,
     };
@@ -664,6 +670,7 @@ fn a_degenerate_or_edge_crop_is_refused_not_panicked() {
     let level1 = level1_of(&[[0.5, 0.5, 0.5]; 24], 6, 4);
     let params = Params {
         exposure: 0.0,
+        contrast: None,
         threads: 1,
         look: None,
     };
@@ -744,6 +751,7 @@ fn render_reduces_orients_and_refuses_bad_buffers() {
     let level1 = level1_of(&pixels, 6, 4);
     let params = Params {
         exposure: 0.0,
+        contrast: None,
         threads: 3,
         look: None,
     };
@@ -931,6 +939,7 @@ fn resampler_and_demosaic_refuse_oversize_and_overflowing_axes() {
     let transfer = Transfer::srgb();
     let params = Params {
         exposure: 0.0,
+        contrast: None,
         threads: 1,
         look: None,
     };
@@ -986,6 +995,7 @@ fn work_is_the_same_on_one_thread_and_many() {
     let render = |threads: usize| {
         let params = Params {
             exposure: 0.7,
+            contrast: None,
             threads,
             look: None,
         };
@@ -1297,6 +1307,7 @@ fn export_bands_concatenate_to_the_whole_at_every_orientation() {
     let transfer = Transfer::srgb();
     let params = Params {
         exposure: 2.5,
+        contrast: None,
         threads: 3,
         look: None,
     };

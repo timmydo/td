@@ -269,8 +269,8 @@ fn enter_view(session: &mut Session, position: usize, single: bool) -> Result<()
 
 /// The developed preview for a `--preview --develop` or `--single`
 /// session: the develop box (the single view's) and the cursor photo
-/// developed to fit it, or to the model's zoom, at the sidecar's exposure
-/// and look, made on the calling thread; `None` without a box or when the
+/// developed to fit it, or to the model's zoom, at the sidecar's exposure,
+/// contrast and look, made on the calling thread; `None` without a box or when the
 /// develop cannot be made, leaving the box its placeholder.
 fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb8)> {
     let r#box = session.ui.develop_box()?;
@@ -281,6 +281,11 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
         .as_ref()
         .and_then(|sidecar| sidecar.exposure())
         .unwrap_or(0);
+    let contrast = photo
+        .sidecar
+        .as_ref()
+        .and_then(|sidecar| sidecar.contrast())
+        .unwrap_or(0);
     let look = photo.sidecar.as_ref().and_then(|sidecar| sidecar.look());
     let crop = photo.sidecar.as_ref().and_then(|sidecar| sidecar.crop());
     let image = crate::develop_preview(
@@ -289,6 +294,7 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
         r#box.width as usize,
         r#box.height as usize,
         exposure,
+        contrast,
         look,
         crop,
         session.ui.zoom(),
@@ -316,9 +322,10 @@ impl Key {
 }
 
 /// What a worker develops the preview by: the roll, the photo in it, the
-/// box it fits, the sidecar's crop, exposure and look, and the zoom and
-/// its centre when the box does not fit the image, so the same photo at
-/// another box, crop, exposure, look or zoom is another develop. There is
+/// box it fits, the sidecar's crop, exposure, contrast and look, and the
+/// zoom and its centre when the box does not fit the image, so the same
+/// photo at another box, crop, exposure, contrast, look or zoom is another
+/// develop. There is
 /// no generation: two requests with the same fields yield the same pixels.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Preview {
@@ -328,6 +335,7 @@ struct Preview {
     box_h: usize,
     crop: Option<library::Crop>,
     exposure: i32,
+    contrast: i32,
     look: Option<String>,
     zoom: Option<(u32, (u32, u32))>,
 }
@@ -345,7 +353,7 @@ impl Preview {
 }
 
 /// The level a develop starts from, and the cached levels it reuses: an
-/// exposure or look edit starts at `Level3` (level 2 reused), a resize at
+/// exposure, contrast or look edit starts at `Level3` (level 2 reused), a resize at
 /// `Level2` (level 1 reused), a photo whose level 0 is cached at `Level1`,
 /// and a new photo at `Decode`; a zoomed develop of the current photo
 /// starts at `Zoom` (level 1 reused, and the cached level 0 with it past
@@ -876,22 +884,20 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
     let threads = threads();
     let long_edge = preview.box_w.max(preview.box_h);
     let crop = preview.crop.map(crate::crop_fractions);
-    let stops = preview.exposure as f32 / 100.0;
     let look = match &preview.look {
         Some(stem) => Some(crate::find_look(stem)?),
         None => None,
     };
-    // Level 2 to the shown frame, at this box, exposure and look.
+    let contrast = crate::look::Look::contrast(preview.contrast);
+    let params = develop::Params {
+        exposure: preview.exposure as f32 / 100.0,
+        contrast: contrast.as_ref(),
+        threads,
+        look: look.as_ref(),
+    };
+    // Level 2 to the shown frame, at this box, exposure, contrast and look.
     let frame = |level2: &develop::Level2, meta: &crate::Meta| {
-        crate::level2_frame(
-            level2,
-            meta,
-            preview.box_w,
-            preview.box_h,
-            stops,
-            look.as_ref(),
-            threads,
-        )
+        crate::level2_frame(level2, meta, preview.box_w, preview.box_h, &params)
     };
     // The zoomed frame from level 1, and the level 0 past half zoom: the
     // window's zoomed level 2 is transient, so it goes straight to the
@@ -1054,7 +1060,7 @@ fn export_key(request: &crate::ExportRequest) -> Option<PhotoKey> {
 
 /// The current photo's levels above 0: level 1 (the demosaic, reused across
 /// resizes) and the level 2 for the box's current long edge and crop (reused
-/// across exposure and look edits), with the metadata level 3 applies. Let go
+/// across exposure, contrast and look edits), with the metadata level 3 applies. Let go
 /// with the thumbnails when the roll or scale changes.
 struct Current {
     key: PhotoKey,
@@ -1379,7 +1385,7 @@ struct Window {
     /// one lands. Let go with the thumbnails when the roll or scale changes.
     developed: Option<(Preview, Option<Rgb8>)>,
     /// The develop memo: the current photo's cached levels above 0 (so an
-    /// exposure or look edit reruns level 3 alone and a resize reruns level
+    /// exposure, contrast or look edit reruns level 3 alone and a resize reruns level
     /// 2) and the level-0 raw cache (so returning to a photo reruns level 1
     /// rather than the codec). Let go with the thumbnails when the roll or
     /// scale changes.
@@ -1820,7 +1826,7 @@ impl Window {
     /// leaves the image where the pointer left it until the new frame
     /// lands, rather than snapping back and then jumping. Zero unless the
     /// held develop differs from the wanted one only by its centre (an
-    /// exposure or look edit racing the release shifts the same), and zero
+    /// exposure, contrast or look edit racing the release shifts the same), and zero
     /// for a centre the model only normalized (`centre_shift`).
     fn held_shift(&self) -> (i64, i64) {
         let none = (0, 0);
@@ -2066,8 +2072,8 @@ impl Window {
     }
 
     /// The develop the model wants now: the cursor photo fitted to the
-    /// box (develop's or the single view's) at its sidecar's crop, exposure
-    /// and look, or `None` when the model shows no box.
+    /// box (develop's or the single view's) at its sidecar's crop,
+    /// exposure, contrast and look, or `None` when the model shows no box.
     fn wanted_preview(&self) -> Option<Preview> {
         let ui = &self.session.ui;
         let r#box = ui.develop_box()?;
@@ -2091,6 +2097,11 @@ impl Window {
                 .sidecar
                 .as_ref()
                 .and_then(|sidecar| sidecar.exposure())
+                .unwrap_or(0),
+            contrast: photo
+                .sidecar
+                .as_ref()
+                .and_then(|sidecar| sidecar.contrast())
                 .unwrap_or(0),
             look: photo
                 .sidecar
@@ -2335,7 +2346,7 @@ impl Window {
         let marquee = ui.marquee();
         let photos = ui.photos();
         // The develop box and the image to fill it: the held develop of the
-        // cursor's photo, so an exposure or look edit shows the last frame of
+        // cursor's photo, so an exposure, contrast or look edit shows the last frame of
         // that photo rather than a placeholder while the new one is made, but
         // a move to another photo shows the placeholder until its own develop
         // lands, not the previous photo's pixels.
@@ -2475,6 +2486,7 @@ mod tests {
             box_h: 200,
             crop: None,
             exposure: 0,
+            contrast: 0,
             look: None,
             zoom: None,
         }
@@ -2567,6 +2579,7 @@ mod tests {
         crate::ExportRequest {
             path: PathBuf::from("/td-photo/none").join(name),
             exposure: 0,
+            contrast: 0,
             crop: None,
             look: None,
             settings: crate::Settings::default(),
@@ -2861,6 +2874,13 @@ mod tests {
             ..a.clone()
         };
         assert_eq!(memo.plan(&a_edited).stage(), Stage::Level3);
+        // A contrast edit alone is another develop, from level 3 too.
+        let a_contrast = Preview {
+            contrast: 40,
+            ..a.clone()
+        };
+        assert_ne!(a_contrast, a);
+        assert_eq!(memo.plan(&a_contrast).stage(), Stage::Level3);
         // Same photo, a larger box: level 2 from the cached level 1.
         let a_big = Preview {
             box_w: 600,
@@ -3085,6 +3105,7 @@ mod tests {
         queue.exporting = Some(crate::ExportRequest {
             path: PathBuf::from("/td-photo/no-such-roll").join("d"),
             exposure: 0,
+            contrast: 0,
             crop: None,
             look: None,
             settings: crate::Settings::default(),

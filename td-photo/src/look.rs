@@ -53,6 +53,10 @@ pub enum Channel {
     Blue,
     /// Each of the three, the same way: what `tone` does.
     All,
+    /// Each of the three inside `0..=1`, a value outside passed as it is,
+    /// which the curve's fixed black and white keep continuous: the
+    /// photo's contrast, so a look after it sees what it would without.
+    Within,
     /// Rec. 709 luminance, the pixel scaled to the curve's answer.
     Luma,
 }
@@ -483,6 +487,25 @@ impl Look {
         Ok(Op::Curve { channel, table })
     }
 
+    /// The per-photo contrast as a look of one `tone` over every channel
+    /// within `0..=1` (`Channel::Within`): `contrast 2^(hundredths /
+    /// 100)`, no toe or shoulder, clamped to the tone's range; `None` at
+    /// zero, the identity.
+    pub fn contrast(hundredths: i32) -> Option<Look> {
+        if hundredths == 0 {
+            return None;
+        }
+        let c = 2f32.powf(hundredths as f32 / 100.0).clamp(0.5, 3.0);
+        let table = Table::build(tone(c, 0.0, 0.0))?;
+        Some(Look {
+            name: None,
+            ops: vec![Op::Curve {
+                channel: Channel::Within,
+                table,
+            }],
+        })
+    }
+
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
@@ -501,6 +524,13 @@ impl Look {
                     Channel::Green => [rgb[0], table.at(rgb[1]), rgb[2]],
                     Channel::Blue => [rgb[0], rgb[1], table.at(rgb[2])],
                     Channel::All => rgb.map(|v| table.at(v)),
+                    Channel::Within => rgb.map(|v| {
+                        if (0.0..=1.0).contains(&v) {
+                            table.at(v)
+                        } else {
+                            v
+                        }
+                    }),
                     Channel::Luma => {
                         let y = luma(rgb);
                         let target = table.at(y);

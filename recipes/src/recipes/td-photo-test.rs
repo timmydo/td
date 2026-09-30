@@ -271,7 +271,9 @@ mod tests {
             assert!(main.contains(&format!("if verb == \"{verb}\"")), "{verb}");
         }
         assert!(main.contains("&[\"--decode\"]"));
-        assert!(main.contains("&[\"--long-edge\", \"--exposure\", \"--look\", \"--crop\"]"));
+        assert!(main.contains(
+            "&[\n            \"--long-edge\",\n            \"--exposure\",\n            \"--contrast\",\n            \"--look\",\n            \"--crop\",\n        ]"
+        ));
         assert!(main.contains("(16..=nef::MAX_AXIS).contains(n)"));
         assert!(main.contains("(-5.0..=5.0).contains(v)"));
         // The `--replay` arm reaches td-ui's runner, whose clean EOF the

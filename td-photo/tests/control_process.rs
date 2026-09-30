@@ -202,6 +202,18 @@ fn preview_develop_reflects_the_sidecar() {
         box_pixels(&brighter, 800, r#box),
         "the exposure did not reach the developed pixels"
     );
+    // So does a contrast: the box differs from the same exposure without.
+    std::fs::write(
+        roll.join("DSC_0001.NEF.edit"),
+        "td-photo edit 1\nexposure 1.50\ncontrast 1.00\n",
+    )
+    .unwrap();
+    let steeper = preview_develop(&dir, 800, 600, &roll, 0);
+    assert_ne!(
+        box_pixels(&brighter, 800, r#box),
+        box_pixels(&steeper, 800, r#box),
+        "the contrast did not reach the developed pixels"
+    );
 }
 
 #[test]

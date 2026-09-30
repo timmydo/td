@@ -628,6 +628,108 @@ fn level1_of(pixels: &[[f32; 3]], width: usize, height: usize) -> Level1 {
     }
 }
 
+/// The photo's contrast is the `tone` sigmoid at `2^(C / 100)` over every
+/// channel: none at zero, grey, black and white fixed, steeper for a
+/// positive value and flatter for a negative one; and the pipeline applies
+/// it before the look, as a look that begins with that tone would.
+#[test]
+fn the_contrast_is_a_tone_about_grey_before_the_look() {
+    assert!(Look::contrast(0).is_none());
+    let up = Look::contrast(43).unwrap();
+    let down = Look::contrast(-50).unwrap();
+    let tone = Look::parse(
+        format!(
+            "{HEADER}\ntone contrast {} toe 0.0 shoulder 0.0\n",
+            2f32.powf(0.43)
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    for v in [0.0, 0.01, 0.05, MIDDLE_GREY, 0.4, 0.8, 1.0] {
+        let [a, ..] = up.apply([v; 3]);
+        let [b, ..] = tone.apply([v; 3]);
+        assert!((a - b).abs() < 1e-6, "{v}: {a} {b}");
+    }
+    let at = |look: &Look, v: f32| look.apply([v; 3])[0];
+    assert!((at(&up, MIDDLE_GREY) - MIDDLE_GREY).abs() < 1e-4);
+    assert!(at(&up, 0.0).abs() < 1e-6 && (at(&up, 1.0) - 1.0).abs() < 1e-6);
+    assert!(at(&up, 0.05) < 0.05 && at(&up, 0.6) > 0.6);
+    assert!(at(&down, 0.05) > 0.05 && at(&down, 0.6) < 0.6);
+    // Each channel alone: a colour keeps its channels' order.
+    let [r, g, b] = up.apply([0.5, 0.2, 0.05]);
+    assert!(r > g && g > b, "{r} {g} {b}");
+    // A channel outside 0..=1 passes as it is, so a look after the
+    // contrast sees what it would without: the smallest contrast under
+    // `mono` changes a bright colour past white by little, not by a clip.
+    assert_eq!(up.apply([2.0, 0.6, -0.05])[0], 2.0);
+    assert_eq!(up.apply([2.0, 0.6, -0.05])[2], -0.05);
+    let mono = Look::parse(look::builtin("mono").unwrap().as_bytes()).unwrap();
+    let least = Look::contrast(1).unwrap();
+    let bright = [2.0, 0.6, -0.05];
+    let [without, ..] = mono.apply(bright);
+    let [with, ..] = mono.apply(least.apply(bright));
+    assert!((with - without).abs() < 0.01, "{with} {without}");
+
+    let z8 = camera::find("NIKON CORPORATION", "NIKON Z 8").unwrap();
+    let color = camera_color(&z8.xyz_to_cam).unwrap();
+    let transfer = Transfer::srgb();
+    let wb = color.daylight;
+    let grey = |v: f32| [v / wb[0], v / wb[1], v / wb[2]];
+    // A red whose every channel is inside 0..=1 after the matrix, where the
+    // contrast and a parsed tone agree, and bright enough that the order
+    // of the contrast and the mix shows.
+    let red = [0.45 / wb[0], 0.08 / wb[1], 0.06 / wb[2]];
+    let level1 = level1_of(&[grey(0.03), grey(MIDDLE_GREY), grey(0.7), red], 2, 2);
+    let render = |contrast: Option<&Look>, look: Option<&Look>| {
+        develop::render(
+            &level1,
+            None,
+            2,
+            1,
+            wb,
+            &color,
+            &transfer,
+            &Params {
+                exposure: 0.0,
+                contrast,
+                threads: 2,
+                look,
+            },
+        )
+        .unwrap()
+    };
+    let mono = Look::parse(look::builtin("mono").unwrap().as_bytes()).unwrap();
+    let mono_body: String = look::builtin("mono")
+        .unwrap()
+        .lines()
+        .skip(1)
+        .filter(|line| !line.starts_with("name "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let tone_then_mono = Look::parse(
+        format!(
+            "{HEADER}\ntone contrast {} toe 0.0 shoulder 0.0\n{mono_body}",
+            2f32.powf(0.43)
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let both = render(Some(&up), Some(&mono));
+    let folded = render(None, Some(&tone_then_mono));
+    let plain = render(None, None);
+    for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+        let (a, b) = (both.pixel(x, y).unwrap(), folded.pixel(x, y).unwrap());
+        for (p, q) in a.iter().zip(b) {
+            assert!(p.abs_diff(q) <= 1, "({x}, {y}): {a:?} {b:?}");
+        }
+    }
+    // Grey holds; the shadow darkens and the highlight brightens.
+    let contrasted = render(Some(&up), None);
+    assert_eq!(contrasted.pixel(1, 0), plain.pixel(1, 0));
+    assert!(contrasted.pixel(0, 0).unwrap()[1] < plain.pixel(0, 0).unwrap()[1]);
+    assert!(contrasted.pixel(0, 1).unwrap()[1] > plain.pixel(0, 1).unwrap()[1]);
+}
+
 #[test]
 fn the_pipeline_applies_the_look_after_the_matrix() {
     let z8 = camera::find("NIKON CORPORATION", "NIKON Z 8").unwrap();
@@ -649,6 +751,7 @@ fn the_pipeline_applies_the_look_after_the_matrix() {
             &transfer,
             &Params {
                 exposure: 0.0,
+                contrast: None,
                 threads: 2,
                 look,
             },

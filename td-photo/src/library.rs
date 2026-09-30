@@ -17,6 +17,9 @@ pub const MAX_SIDECAR_BYTES: usize = 64 * 1024;
 pub const MAX_SIDECAR_LINES: usize = 1024;
 /// Exposure in hundredths of a stop, at most this magnitude either way.
 pub const MAX_EXPOSURE: i32 = 500;
+/// Contrast in hundredths, at most this magnitude either way: the tone
+/// curve's steepness about middle grey is `2^(contrast / 100)`.
+pub const MAX_CONTRAST: i32 = 100;
 /// Crop fractions are ten-thousandths of the oriented image.
 pub const CROP_UNIT: u32 = 10_000;
 /// A crop edge is at least this long (0.05 of the image).
@@ -83,17 +86,25 @@ impl std::error::Error for Error {}
 pub enum Key {
     Flag,
     Exposure,
+    Contrast,
     Crop,
     Look,
 }
 
 impl Key {
-    pub const ALL: [Key; 4] = [Key::Flag, Key::Exposure, Key::Crop, Key::Look];
+    pub const ALL: [Key; 5] = [
+        Key::Flag,
+        Key::Exposure,
+        Key::Contrast,
+        Key::Crop,
+        Key::Look,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Flag => "flag",
             Self::Exposure => "exposure",
+            Self::Contrast => "contrast",
             Self::Crop => "crop",
             Self::Look => "look",
         }
@@ -110,13 +121,31 @@ impl Key {
     }
 }
 
+/// What a history step sets: a develop key this version knows, or a key
+/// a later version wrote, kept by its name with its value as written and
+/// left out of the fold, so that version's edits survive this one's.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StepKey {
+    Known(Key),
+    Later(String),
+}
+
+impl StepKey {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Known(key) => key.name(),
+            Self::Later(name) => name,
+        }
+    }
+}
+
 /// One step of a photo's develop history: a develop key set to a value or
 /// cleared (`None`), and whether it is on. The settings in force are the
 /// steps that are on, folded in order, the last word on each key winning.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Step {
     pub on: bool,
-    pub key: Key,
+    pub key: StepKey,
     pub value: Option<String>,
 }
 
@@ -131,7 +160,9 @@ impl Step {
         )
     }
 
-    /// The step a line's value spells, or `None` when it is not one.
+    /// The step a line's value spells, or `None` when it is not one: a
+    /// known develop key's value held to its grammar, an unknown key's
+    /// (a later version's) kept as it is. The flag is never a step.
     fn parse(text: &str) -> Option<Step> {
         let (state, rest) = text.split_once(' ')?;
         let on = match state {
@@ -140,11 +171,20 @@ impl Step {
             _ => return None,
         };
         let (name, value) = rest.split_once(' ')?;
-        let key = Key::parse(name).filter(|key| key.develops())?;
+        let key = match Key::parse(name) {
+            Some(key) if key.develops() => StepKey::Known(key),
+            Some(_) => return None,
+            None if valid_key(name) && !name.starts_with(STEP_PREFIX) => {
+                StepKey::Later(name.to_string())
+            }
+            None => return None,
+        };
         let value = if value == "-" {
             None
         } else {
-            check(key, value).ok()?;
+            if let StepKey::Known(key) = key {
+                check(key, value).ok()?;
+            }
             Some(value.to_string())
         };
         Some(Step { on, key, value })
@@ -248,19 +288,39 @@ impl Crop {
 /// Exposure from `-D.DD` or `D.DD`, in hundredths of a stop within
 /// `MAX_EXPOSURE`; `-0.00` is not a spelling of zero.
 pub fn exposure(text: &str) -> Result<i32, Error> {
+    hundredths(text, MAX_EXPOSURE).ok_or(Error::Value(Key::Exposure))
+}
+
+/// The `exposure` value as the sidecar writes it.
+pub fn exposure_text(hundredths: i32) -> String {
+    signed_text(hundredths)
+}
+
+/// Contrast from `-D.DD` or `D.DD`, in hundredths within `MAX_CONTRAST`,
+/// spelled as exposure is.
+pub fn contrast(text: &str) -> Result<i32, Error> {
+    hundredths(text, MAX_CONTRAST).ok_or(Error::Value(Key::Contrast))
+}
+
+/// The `contrast` value as the sidecar writes it.
+pub fn contrast_text(hundredths: i32) -> String {
+    signed_text(hundredths)
+}
+
+/// `-D.DD` or `D.DD` in hundredths, at most `max` either way; `-0.00` is
+/// not a spelling of zero.
+fn hundredths(text: &str, max: i32) -> Option<i32> {
     let (negative, digits) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, text),
     };
     let magnitude = fraction(digits, 2)
         .and_then(|value| i32::try_from(value).ok())
-        .filter(|value| *value <= MAX_EXPOSURE && !(negative && *value == 0))
-        .ok_or(Error::Value(Key::Exposure))?;
-    Ok(if negative { -magnitude } else { magnitude })
+        .filter(|value| *value <= max && !(negative && *value == 0))?;
+    Some(if negative { -magnitude } else { magnitude })
 }
 
-/// The `exposure` value as the sidecar writes it.
-pub fn exposure_text(hundredths: i32) -> String {
+fn signed_text(hundredths: i32) -> String {
     let sign = if hundredths < 0 { "-" } else { "" };
     format!("{sign}{}", fixed(hundredths.unsigned_abs(), 2))
 }
@@ -313,6 +373,7 @@ fn check(key: Key, value: &str) -> Result<(), Error> {
     let ok = match key {
         Key::Flag => Flag::parse(value).is_some(),
         Key::Exposure => exposure(value).is_ok(),
+        Key::Contrast => contrast(value).is_ok(),
         Key::Crop => Crop::parse(value).is_ok(),
         Key::Look => valid_look(value),
     };
@@ -327,7 +388,7 @@ fn check(key: Key, value: &str) -> Result<(), Error> {
 /// file had them, then the develop history's `step-N` lines. Known keys
 /// are validated; any other line is kept verbatim and rewritten in place,
 /// so a later version's values survive this one's edit. The develop keys
-/// (exposure, crop, look) are the history's summary: what its steps that
+/// (exposure, contrast, crop, look) are the history's summary: what its steps that
 /// are on fold to, rewritten from it whenever it changes, so a reader
 /// that knows only the keys sees the settings in force. A file with a
 /// history is read by it; one without and with develop keys (an earlier
@@ -396,7 +457,7 @@ impl Sidecar {
             if let Some(key) = Key::parse(name).filter(|key| key.develops()) {
                 self.steps.push(Step {
                     on: true,
-                    key,
+                    key: StepKey::Known(key),
                     value: Some(value.clone()),
                 });
             }
@@ -412,7 +473,7 @@ impl Sidecar {
                 .steps
                 .iter()
                 .rev()
-                .find(|step| step.on && step.key == key)
+                .find(|step| step.on && step.key == StepKey::Known(key))
                 .and_then(|step| step.value.clone());
             self.set_line(key, value.as_deref());
         }
@@ -512,6 +573,12 @@ impl Sidecar {
             .and_then(|value| exposure(value).ok())
     }
 
+    /// Hundredths, `2^(contrast / 100)` the tone curve's steepness.
+    pub fn contrast(&self) -> Option<i32> {
+        self.get(Key::Contrast)
+            .and_then(|value| contrast(value).ok())
+    }
+
     pub fn crop(&self) -> Option<Crop> {
         self.get(Key::Crop)
             .and_then(|value| Crop::parse(value).ok())
@@ -556,7 +623,12 @@ impl Sidecar {
         }
         let value = value.map(str::to_string);
         match self.steps.last_mut() {
-            Some(last) if last.on && last.key == key && last.value.is_some() && value.is_some() => {
+            Some(last)
+                if last.on
+                    && last.key == StepKey::Known(key)
+                    && last.value.is_some()
+                    && value.is_some() =>
+            {
                 last.value = value;
             }
             _ => {
@@ -565,7 +637,7 @@ impl Sidecar {
                 }
                 self.steps.push(Step {
                     on: true,
-                    key,
+                    key: StepKey::Known(key),
                     value,
                 });
             }
@@ -574,8 +646,21 @@ impl Sidecar {
         Ok(())
     }
 
+    /// Adds `delta` hundredths to the exposure or contrast, clamped to the
+    /// key's range, as `set` sets it; another key is refused as a value
+    /// outside its grammar.
+    pub fn nudge(&mut self, key: Key, delta: i32) -> Result<(), Error> {
+        let (current, max, text): (_, _, fn(i32) -> String) = match key {
+            Key::Exposure => (self.exposure(), MAX_EXPOSURE, exposure_text),
+            Key::Contrast => (self.contrast(), MAX_CONTRAST, contrast_text),
+            _ => return Err(Error::Value(key)),
+        };
+        let next = current.unwrap_or(0).saturating_add(delta).clamp(-max, max);
+        self.set(key, Some(&text(next)))
+    }
+
     /// Back to the camera's defaults: the history cleared, and with it
-    /// exposure, crop and look; the flag, a cull decision, and any unknown
+    /// exposure, contrast, crop and look; the flag, a cull decision, and any unknown
     /// line kept.
     pub fn reset(&mut self) {
         self.steps.clear();

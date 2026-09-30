@@ -22,7 +22,7 @@ use td_ui::CELL_WIDTH;
 
 use crate::develop::{self, CENTRE_UNIT, ZOOM_STEPS};
 use crate::image::Rgb8;
-use crate::library::{self, Crop, Filter, Flag, Key, Sidecar, Step};
+use crate::library::{self, Crop, Filter, Flag, Key, Sidecar, Step, StepKey};
 use crate::settings::{self, Format, Settings};
 
 /// The surface a session starts on until it is resized.
@@ -58,6 +58,9 @@ pub const PLACEHOLDER: u32 = 0xd6d1c7;
 pub const EXPOSURE_STEP: i32 = 33;
 /// The fine exposure step, a tenth of a stop in hundredths.
 pub const EXPOSURE_FINE: i32 = 10;
+/// The contrast step, a tenth in hundredths: `2^0.1` the tone's
+/// steepness.
+pub const CONTRAST_STEP: i32 = 10;
 
 /// The mode `state` leads with: culling the roll as a grid, or developing
 /// one photo. The develop edits act on the cursor's photo; the cull view
@@ -183,13 +186,14 @@ pub enum Effect {
         key: Key,
         value: Option<String>,
     },
-    /// Add `delta` hundredths of a stop to this photo's exposure on the
-    /// file as it is then, clamped to the exposure range, and settle the
+    /// Add `delta` hundredths to this photo's exposure or contrast on the
+    /// file as it is then, clamped to the key's range, and settle the
     /// model: a delta, not an absolute, so a value changed meanwhile is
     /// added to.
-    Expose {
+    Nudge {
         index: usize,
         name: String,
+        key: Key,
         delta: i32,
     },
     /// Reset this photo's develop keys to camera defaults, keeping the
@@ -287,6 +291,9 @@ pub enum Action {
     StepDelete,
     Uncrop,
     Exposure,
+    ContrastIn,
+    ContrastOut,
+    Contrast,
     /// The Nth (from 1) of the available looks, `F1`..`F9`.
     LookAt(u8),
     ZoomFit,
@@ -305,7 +312,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 58] = [
+    pub const ALL: [Action; 61] = [
         Action::Open,
         Action::Choose,
         Action::Next,
@@ -342,6 +349,9 @@ impl Action {
         Action::StepDelete,
         Action::Uncrop,
         Action::Exposure,
+        Action::ContrastIn,
+        Action::ContrastOut,
+        Action::Contrast,
         Action::LookAt(1),
         Action::LookAt(2),
         Action::LookAt(3),
@@ -404,6 +414,9 @@ impl Action {
             Self::StepDelete => "step-delete",
             Self::Uncrop => "uncrop",
             Self::Exposure => "exposure",
+            Self::ContrastIn => "contrast-in",
+            Self::ContrastOut => "contrast-out",
+            Self::Contrast => "contrast",
             Self::LookAt(1) => "look-1",
             Self::LookAt(2) => "look-2",
             Self::LookAt(3) => "look-3",
@@ -450,7 +463,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 58] = [
+pub const BINDINGS: [Binding; 61] = [
     Binding {
         name: "open",
         chord: None,
@@ -635,7 +648,7 @@ pub const BINDINGS: [Binding; 58] = [
         name: "reset",
         chord: Some("0"),
         arguments: "",
-        help: "Reset exposure, crop and look to camera defaults, clearing the history (develop mode).",
+        help: "Reset exposure, contrast, crop and look to camera defaults, clearing the history (develop mode).",
     },
     Binding {
         name: "undo",
@@ -666,6 +679,24 @@ pub const BINDINGS: [Binding; 58] = [
         chord: None,
         arguments: "STOPS",
         help: "Set the exposure to STOPS, two decimals in -5.00..5.00 (develop mode); the slider commits one on release.",
+    },
+    Binding {
+        name: "contrast-in",
+        chord: Some("."),
+        arguments: "",
+        help: "Raise contrast a tenth (develop mode).",
+    },
+    Binding {
+        name: "contrast-out",
+        chord: Some(","),
+        arguments: "",
+        help: "Lower contrast a tenth (develop mode).",
+    },
+    Binding {
+        name: "contrast",
+        chord: None,
+        arguments: "VALUE",
+        help: "Set the contrast to VALUE, two decimals in -1.00..1.00, the tone's steepness about grey 2^VALUE (develop mode).",
     },
     Binding {
         name: "look-1",
@@ -841,9 +872,9 @@ pub const FILM_H: usize = THUMB_HEIGHT + CELL_PAD;
 /// A history step as the pane lists it: `KEY VALUE`, `-` a clear, a crop
 /// as `x,y wxh` in whole percents so it fits the pane's row.
 pub fn step_label(step: &Step) -> String {
-    let value = match (step.key, step.value.as_deref()) {
+    let value = match (&step.key, step.value.as_deref()) {
         (_, None) => "-".to_string(),
-        (Key::Crop, Some(text)) => match Crop::parse(text) {
+        (StepKey::Known(Key::Crop), Some(text)) => match Crop::parse(text) {
             Ok(crop) => {
                 let pct = |n: u32| (n + library::CROP_UNIT / 200) / (library::CROP_UNIT / 100);
                 format!(
@@ -3329,8 +3360,8 @@ impl Controller {
     /// under the cursor (its name in hex, flag, exposure, crop, look,
     /// sidecar state), the outstanding job count, the generation, the
     /// chooser's listed folder in hex, the history's step count and the
-    /// selected step, the zoom, then the export quality, long edge and
-    /// format. Absent values are `-`.
+    /// selected step, the zoom, the export quality, long edge and format,
+    /// then the photo's contrast. Absent values are `-`.
     pub fn state(&self) -> String {
         let position = self.position();
         let photo = self.cursor.and_then(|index| self.photos.get(index));
@@ -3360,13 +3391,14 @@ impl Controller {
             self.settings.quality.to_string(),
             settings::long_edge_text(self.settings.long_edge),
             self.settings.format.name().to_string(),
+            photo.map_or_else(dash, |p| p.value(Key::Contrast).to_string()),
         ]
         .join("\t")
     }
 
     /// The `photo N` body: the Nth shown photo's name in hex, flag,
-    /// exposure, crop, look, sidecar state and, for a refused sidecar, the
-    /// reason in hex (`-` otherwise).
+    /// exposure, crop, look, sidecar state, for a refused sidecar the
+    /// reason in hex (`-` otherwise), and contrast.
     pub fn photo(&self, position: usize) -> Result<String, Error> {
         if self.roll.is_none() {
             return Err(Error::NoRoll);
@@ -3386,6 +3418,7 @@ impl Controller {
             photo.value(Key::Look),
             photo.status(),
             reason.as_str(),
+            photo.value(Key::Contrast),
         ]
         .join("\t"))
     }
@@ -3507,10 +3540,15 @@ impl Controller {
             (Action::Reject, []) => return self.flag(Some(Flag::Reject), effects),
             (Action::Unflag, []) => return self.flag(None, effects),
             (Action::Develop, []) => self.enter_develop()?,
-            (Action::ExposeIn, []) => return self.expose(EXPOSURE_STEP, effects),
-            (Action::ExposeOut, []) => return self.expose(-EXPOSURE_STEP, effects),
-            (Action::ExposeInFine, []) => return self.expose(EXPOSURE_FINE, effects),
-            (Action::ExposeOutFine, []) => return self.expose(-EXPOSURE_FINE, effects),
+            (Action::ExposeIn, []) => return self.nudge(Key::Exposure, EXPOSURE_STEP, effects),
+            (Action::ExposeOut, []) => return self.nudge(Key::Exposure, -EXPOSURE_STEP, effects),
+            (Action::ExposeInFine, []) => return self.nudge(Key::Exposure, EXPOSURE_FINE, effects),
+            (Action::ExposeOutFine, []) => {
+                return self.nudge(Key::Exposure, -EXPOSURE_FINE, effects)
+            }
+            (Action::ContrastIn, []) => return self.nudge(Key::Contrast, CONTRAST_STEP, effects),
+            (Action::ContrastOut, []) => return self.nudge(Key::Contrast, -CONTRAST_STEP, effects),
+            (Action::Contrast, [value]) => return self.set_contrast(value, effects),
             (Action::Look, [stem]) => return self.set_look(stem, effects),
             (Action::Crop, [x, y, w, h]) => return self.set_crop(x, y, w, h, effects),
             (Action::AdjustCrop, []) => self.toggle_adjust()?,
@@ -3948,8 +3986,8 @@ impl Controller {
                 1 => self.uncrop(Vec::new()),
                 2 => self.undo(Vec::new()),
                 3 => self.reset_develop(Vec::new()),
-                4 => self.expose(-EXPOSURE_STEP, Vec::new()),
-                5 => self.expose(EXPOSURE_STEP, Vec::new()),
+                4 => self.nudge(Key::Exposure, -EXPOSURE_STEP, Vec::new()),
+                5 => self.nudge(Key::Exposure, EXPOSURE_STEP, Vec::new()),
                 6 => self
                     .set_zoom(None)
                     .map(|outcome| (self.finish(outcome), Vec::new())),
@@ -4183,6 +4221,30 @@ impl Controller {
                 index,
                 name,
                 key: Key::Exposure,
+                value: Some(value),
+            },
+            effects,
+        )
+    }
+
+    /// Sets the cursor photo's contrast to `value`, `-D.DD` or `D.DD`
+    /// within the range; any other spelling is `BadArgument`.
+    fn set_contrast(
+        &mut self,
+        value: &str,
+        effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        let hundredths = library::contrast(value).map_err(|_| Error::BadArgument)?;
+        let value = library::contrast_text(hundredths);
+        self.develop_effect(
+            index,
+            |index, name| Effect::Edit {
+                index,
+                name,
+                key: Key::Contrast,
                 value: Some(value),
             },
             effects,
@@ -4772,12 +4834,14 @@ impl Controller {
         Ok((Outcome::Changed, effects))
     }
 
-    /// Adjusts the cursor photo's exposure by `delta` hundredths of a stop.
+    /// Adjusts the cursor photo's exposure or contrast by `delta`
+    /// hundredths.
     /// The delta is applied to the file's exposure at the adapter, not the
     /// model's copy, so a value changed meanwhile is added to, and a delta
     /// that clamps to no change settles as `Ignored`.
-    fn expose(
+    fn nudge(
         &mut self,
+        key: Key,
         delta: i32,
         effects: Vec<Effect>,
     ) -> Result<(Outcome, Vec<Effect>), Error> {
@@ -4786,7 +4850,12 @@ impl Controller {
         };
         self.develop_effect(
             index,
-            |index, name| Effect::Expose { index, name, delta },
+            |index, name| Effect::Nudge {
+                index,
+                name,
+                key,
+                delta,
+            },
             effects,
         )
     }
@@ -5550,9 +5619,10 @@ impl Scene<'_> {
         );
         if facts {
             let facts = format!(
-                "{} | exposure {} | crop {} | look {} | sidecar {}",
+                "{} | exposure {} | contrast {} | crop {} | look {} | sidecar {}",
                 photo.flag().map_or("unflagged", Flag::word),
                 photo.value(Key::Exposure),
+                photo.value(Key::Contrast),
                 photo.value(Key::Crop),
                 photo.value(Key::Look),
                 photo.status()

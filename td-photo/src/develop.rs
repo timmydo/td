@@ -637,6 +637,9 @@ pub fn resample_u16(
 pub struct Params<'a> {
     /// Exposure in stops.
     pub exposure: f32,
+    /// The photo's contrast (`Look::contrast`), applied after the matrix
+    /// and before the look, when given.
+    pub contrast: Option<&'a Look>,
     pub threads: usize,
     /// Applied after the matrix and before the transfer, when given.
     pub look: Option<&'a Look>,
@@ -1006,10 +1009,11 @@ pub fn level2(
 }
 
 /// Level 2 to level 3: per pixel white balance and clip at the camera
-/// white, exposure folded into the camera matrix, the look when there is
-/// one, then the sRGB transfer to 8 bits. Level 2 is already oriented, so
-/// the display buffer follows its axes. This is what an exposure or look
-/// edit reruns; level 2 is untouched.
+/// white, exposure folded into the camera matrix, the contrast when there
+/// is one, the look when there is one, then the sRGB transfer to 8 bits.
+/// Level 2 is already oriented, so the display buffer follows its axes.
+/// This is what an exposure, contrast or look edit reruns; level 2 is
+/// untouched.
 pub fn level3(
     level2: &Level2,
     wb: [f32; 3],
@@ -1033,7 +1037,7 @@ pub fn level3(
     let band = band_rows(dh, threads);
     let small_ref = &level2.rgb;
     let matrix_ref = &matrix;
-    let look = params.look;
+    let (contrast, look) = (params.contrast, params.look);
     let items: Vec<(usize, &mut [u8])> = out.chunks_mut(band * dw * 3).enumerate().collect();
     bands(items, threads, |(band_index, chunk)| {
         let start = band_index * band * dw * 3;
@@ -1052,6 +1056,10 @@ pub fn level3(
                 (b * wb[2]).min(1.0),
             ];
             let rgb = apply(matrix_ref, cam);
+            let rgb = match contrast {
+                Some(contrast) => contrast.apply(rgb),
+                None => rgb,
+            };
             let rgb = match look {
                 Some(look) => look.apply(rgb),
                 None => rgb,

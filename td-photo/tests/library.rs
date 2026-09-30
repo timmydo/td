@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use td_photo::library::{self, Crop, Error, Filter, Flag, Key, Sidecar, SIDECAR_HEADER};
+use td_photo::library::{self, Crop, Error, Filter, Flag, Key, Sidecar, StepKey, SIDECAR_HEADER};
 
 const SAMPLE: &str = "td-photo edit 1\nflag pick\nfuture 1 2 3\nexposure -0.33\ncrop 0.1000 0.0500 0.8000 0.9000\nlook classic-chrome\n";
 
@@ -611,7 +611,7 @@ fn delete_rejected_moves_rejects_with_their_sidecars_and_unlinks_nothing() {
     assert_eq!(files_under(&roll).len(), before.len());
     assert_eq!(
         td_photo(&["list", roll_s, "--rejects"]).1,
-        "DSC_0003.NEF\treject\t-\t-\t-\tok\n"
+        "DSC_0003.NEF\treject\t-\t-\t-\t-\tok\n"
     );
     // Asked again, the kept one is kept again and nothing else moves.
     let (ok, out, _) = td_photo(&["delete-rejected", roll_s]);
@@ -723,6 +723,113 @@ fn delete_rejected_moves_rejects_with_their_sidecars_and_unlinks_nothing() {
     assert!(err.contains("needs ROLL"), "{err}");
 }
 
+/// Contrast is a develop key spelled as exposure is, within its own
+/// range; a nudge adds to either key, clamped to that key's range, as one
+/// step for a run; reset clears it with the others.
+#[test]
+fn contrast_is_a_develop_key_nudged_within_its_range() {
+    assert_eq!(library::contrast("-1.00"), Ok(-100));
+    assert_eq!(library::contrast("0.35"), Ok(35));
+    assert_eq!(library::contrast_text(-5), "-0.05");
+    for bad in ["1.01", "-0.00", "0.5", "+0.10", "2.00"] {
+        assert_eq!(
+            library::contrast(bad),
+            Err(Error::Value(Key::Contrast)),
+            "{bad}"
+        );
+    }
+    assert_eq!(Key::parse("contrast"), Some(Key::Contrast));
+    assert!(Key::Contrast.develops());
+    let mut sidecar = Sidecar::default();
+    for _ in 0..12 {
+        sidecar.nudge(Key::Contrast, 10).unwrap();
+    }
+    assert_eq!(sidecar.contrast(), Some(library::MAX_CONTRAST));
+    let mut floor = Sidecar::default();
+    floor.nudge(Key::Contrast, -250).unwrap();
+    assert_eq!(floor.contrast(), Some(-library::MAX_CONTRAST));
+    sidecar.nudge(Key::Exposure, -600).unwrap();
+    assert_eq!(sidecar.exposure(), Some(-library::MAX_EXPOSURE));
+    assert_eq!(sidecar.nudge(Key::Look, 10), Err(Error::Value(Key::Look)));
+    assert_eq!(
+        sidecar.text(),
+        "td-photo edit 1\ncontrast 1.00\nexposure -5.00\nstep-1 on contrast 1.00\nstep-2 on exposure -5.00\n"
+    );
+    let reread = Sidecar::parse(sidecar.text().as_bytes()).unwrap();
+    assert_eq!(reread.contrast(), Some(100));
+    assert!(Sidecar::parse(b"td-photo edit 1\ncontrast 1.50\n").is_err());
+    sidecar.reset();
+    assert_eq!(sidecar.contrast(), None);
+    assert_eq!(sidecar.text(), "td-photo edit 1\n");
+}
+
+/// A step naming a develop key this version does not know (a later
+/// version's) is kept as written, in its place, left out of the fold, and
+/// written back; undo, toggle and delete take it as any step; the flag is
+/// still never a step, and a known key's value is still held to its
+/// grammar.
+#[test]
+fn a_later_versions_steps_survive_this_ones_edit() {
+    let text = "td-photo edit 1\nexposure 0.33\nsharpen 0.50\nstep-1 on exposure 0.33\nstep-2 on sharpen 0.50\nstep-3 off grain -\n";
+    let mut sidecar = Sidecar::parse(text.as_bytes()).unwrap();
+    assert_eq!(sidecar.text(), text);
+    assert_eq!(sidecar.steps().len(), 3);
+    assert_eq!(
+        sidecar.steps()[1].key,
+        StepKey::Later("sharpen".to_string())
+    );
+    assert_eq!(sidecar.steps()[1].text(), "on sharpen 0.50");
+    assert_eq!(sidecar.exposure(), Some(33));
+    // An edit of this version's is a step after them; the later key's
+    // line is kept as an unknown line.
+    sidecar.set(Key::Contrast, Some("0.20")).unwrap();
+    assert_eq!(
+        sidecar.text(),
+        "td-photo edit 1\nexposure 0.33\nsharpen 0.50\ncontrast 0.20\nstep-1 on exposure 0.33\nstep-2 on sharpen 0.50\nstep-3 off grain -\nstep-4 on contrast 0.20\n"
+    );
+    assert!(sidecar.undo());
+    assert!(sidecar.toggle_step(1));
+    assert!(sidecar.text().contains("step-2 off sharpen 0.50\n"));
+    assert!(sidecar.delete_step(1));
+    assert_eq!(sidecar.steps().len(), 2);
+    assert_eq!(sidecar.steps()[1].text(), "off grain -");
+    for bad in [
+        "step-1 on flag pick\n",
+        "step-1 on exposure 9.00\n",
+        "step-1 on Sharpen 0.50\n",
+        "step-1 on step-2 0.50\n",
+        "step-1 on sharpen\n",
+    ] {
+        assert!(
+            Sidecar::parse(format!("td-photo edit 1\n{bad}").as_bytes()).is_err(),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn contrast_goes_through_edit_and_list() {
+    let temp = Temp::new("contrast");
+    let roll = temp.0.join("2026/2026-09-13");
+    fs::create_dir_all(&roll).unwrap();
+    let photo = roll.join("DSC_0001.NEF");
+    fs::write(&photo, tiff_with_date("2026:09:13 22:10:05")).unwrap();
+    let (roll_s, photo_s) = (roll.to_str().unwrap(), photo.to_str().unwrap());
+    assert!(td_photo(&["edit", photo_s, "contrast", "0.30"]).0);
+    assert_eq!(
+        td_photo(&["list", roll_s]).1,
+        "DSC_0001.NEF\t-\t-\t0.30\t-\t-\tok\n"
+    );
+    let (ok, _, err) = td_photo(&["edit", photo_s, "contrast", "1.50"]);
+    assert!(!ok);
+    assert!(err.contains("malformed contrast value"), "{err}");
+    assert!(td_photo(&["edit", photo_s, "contrast", "-"]).0);
+    assert_eq!(
+        td_photo(&["list", roll_s]).1,
+        "DSC_0001.NEF\t-\t-\t-\t-\t-\tok\n"
+    );
+}
+
 #[test]
 fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
     let temp = Temp::new("edit");
@@ -741,7 +848,7 @@ fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
     assert!(ok, "{err}");
     assert_eq!(
         out,
-        "DSC_0001.NEF\t-\t-\t-\t-\tnone\nDSC_0002.NEF\t-\t-\t-\t-\tnone\n"
+        "DSC_0001.NEF\t-\t-\t-\t-\t-\tnone\nDSC_0002.NEF\t-\t-\t-\t-\t-\tnone\n"
     );
     let sidecar = roll.join("DSC_0001.NEF.edit");
     assert!(td_photo(&["flag", photo_s, "pick"]).0);
@@ -783,12 +890,12 @@ fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
     assert_eq!(td_photo(&["edit", photo_s]).1, text);
     assert_eq!(
         td_photo(&["list", roll_s, "--picks"]).1,
-        "DSC_0001.NEF\tpick\t-0.33\t0.1000 0.0500 0.8000 0.9000\tclassic-chrome\tok\n"
+        "DSC_0001.NEF\tpick\t-0.33\t-\t0.1000 0.0500 0.8000 0.9000\tclassic-chrome\tok\n"
     );
     assert_eq!(td_photo(&["list", roll_s, "--rejects"]).1, "");
     assert_eq!(
         td_photo(&["list", roll_s, "--unflagged"]).1,
-        "DSC_0002.NEF\t-\t-\t-\t-\tnone\n"
+        "DSC_0002.NEF\t-\t-\t-\t-\t-\tnone\n"
     );
     assert!(!td_photo(&["list", roll_s, "--picks", "--rejects"]).0);
     // An unknown line survives, in place, a flag change and a reset.
@@ -835,7 +942,7 @@ fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
     fs::write(&sidecar, "td-photo edit 1\nexposure 7.00\n").unwrap();
     assert_eq!(
         td_photo(&["list", roll_s]).1,
-        "DSC_0001.NEF\t-\t-\t-\t-\terror malformed exposure value\nDSC_0002.NEF\t-\t-\t-\t-\tnone\n"
+        "DSC_0001.NEF\t-\t-\t-\t-\t-\terror malformed exposure value\nDSC_0002.NEF\t-\t-\t-\t-\t-\tnone\n"
     );
     let (ok, _, err) = td_photo(&["flag", photo_s, "pick"]);
     assert!(!ok);
@@ -853,7 +960,7 @@ fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
     fs::write(&sidecar, &full).unwrap();
     assert!(td_photo(&["list", roll_s])
         .1
-        .starts_with("DSC_0001.NEF\t-\t-\t-\t-\tok\n"));
+        .starts_with("DSC_0001.NEF\t-\t-\t-\t-\t-\tok\n"));
     let (ok, _, err) = td_photo(&["flag", photo_s, "pick"]);
     assert!(!ok);
     assert!(err.contains("over 1024 lines"), "{err}");
@@ -862,18 +969,18 @@ fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
     fs::write(&sidecar, long(65536 - 19)).unwrap();
     assert!(td_photo(&["list", roll_s])
         .1
-        .starts_with("DSC_0001.NEF\t-\t-\t-\t-\tok\n"));
+        .starts_with("DSC_0001.NEF\t-\t-\t-\t-\t-\tok\n"));
     fs::write(&sidecar, long(65537 - 19)).unwrap();
     assert!(td_photo(&["list", roll_s])
         .1
-        .starts_with("DSC_0001.NEF\t-\t-\t-\t-\terror sidecar over 65536 bytes\n"));
+        .starts_with("DSC_0001.NEF\t-\t-\t-\t-\t-\terror sidecar over 65536 bytes\n"));
     // A sidecar's name that is not a regular file is refused unopened,
     // shown as an error, and never replaced.
     let linked = roll.join("DSC_0002.NEF.edit");
     std::os::unix::fs::symlink(roll.join("notes.txt"), &linked).unwrap();
     assert!(td_photo(&["list", roll_s])
         .1
-        .ends_with("DSC_0002.NEF\t-\t-\t-\t-\terror not a regular file\n"));
+        .ends_with("DSC_0002.NEF\t-\t-\t-\t-\t-\terror not a regular file\n"));
     let two = roll.join("DSC_0002.NEF");
     let (ok, _, err) = td_photo(&["flag", two.to_str().unwrap(), "pick"]);
     assert!(!ok);

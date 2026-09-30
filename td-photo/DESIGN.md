@@ -111,9 +111,10 @@ modes are the photographer's order of work.
    lost and no name is replaced. `td-photo delete-rejected ROLL` is it headless.
 3. **Develop** shows one photo developed from its raw data, entered with `d`
    on the cursor's photo and left with `Escape`. `=`/`-` move exposure by a
-   third of a stop and their shifted pair `+`/`_` by a tenth, `0` resets to
-   camera defaults, and the crop and the look are set by the `crop` and `look`
-   actions, taking the box's four fractions or a look's stem, and the crop
+   third of a stop and their shifted pair `+`/`_` by a tenth, `.`/`,` move
+   contrast by a tenth, `0` resets to camera defaults, and the crop and the
+   look are set by the `crop` and `look` actions, taking the box's four
+   fractions or a look's stem, and the crop
    also over the preview: a marquee tightens it to a sub-region, and a
    crop-adjust sub-mode toggled with `c` (the Crop button) shows the whole
    frame with the crop's rectangle over it, a press off the rectangle (or
@@ -172,7 +173,8 @@ window, all speaking the toolkit's one vocabulary.
 - **One dispatcher.** Everything the window can do is an `Action`, a closed enum
   in `ui` (open a roll, choose one, the cursor moves, select, pick, reject,
   unflag, the four filters, the single view and back, scroll, quit, enter
-  develop and its exposure nudges and absolute `exposure`, look and the
+  develop and its exposure nudges and absolute `exposure`, its contrast
+  nudges and absolute `contrast`, look and the
   look shortcuts `look-1`..`look-9`, crop and `uncrop`, crop-adjust, aspect,
   the look palette (`looks`), reset, undo and the history's step toggle and
   delete, the zoom (`zoom-fit`, `zoom-100`, `zoom-in`, `zoom-out`), export,
@@ -238,9 +240,11 @@ window, all speaking the toolkit's one vocabulary.
   cull filters, `delete-rejected` and the single-view toggle are cull's
   and are `ignored` in develop and export. Exposure is a
   delta, `expose-in`/`expose-out` a third of a stop and
-  `expose-in-fine`/`expose-out-fine` a tenth, added by the adapter to the
-  file's exposure as it stands (concurrency-correct as a flag is, not the
-  model's copy) and clamped to `MAX_EXPOSURE`, so a step that clamps to no
+  `expose-in-fine`/`expose-out-fine` a tenth, and contrast one,
+  `contrast-in`/`contrast-out` a tenth, each a `Nudge` the adapter adds to
+  the file's value as it stands (concurrency-correct as a flag is, not the
+  model's copy) and clamps to `MAX_EXPOSURE` or `MAX_CONTRAST`
+  (`Sidecar::nudge`), so a step that clamps to no
   change writes nothing and is `ignored`, unless a file changed meanwhile
   makes the settle a change, as it does for a flag; `look` and `crop` are
   absolute values the adapter sets,
@@ -367,7 +371,8 @@ window, all speaking the toolkit's one vocabulary.
   step; a press on a disabled button, on a band's chrome, and a move or a
   release over a band are `Ignored`, and never start a crop drag. The
   `exposure` action takes the sidecar's own spelling (`-1.25`), bad-argument
-  otherwise, and sets it through an `Edit` like a look. The slider: a
+  otherwise, and sets it through an `Edit` like a look; so does `contrast`
+  (`-0.40`). The slider: a
   press on it moves the knob to the pointer's step and starts a drag that
   follows the pointer's column wherever it goes, each step it crosses a
   frame change and no write; its release commits the step it rests on as
@@ -580,8 +585,9 @@ window, all speaking the toolkit's one vocabulary.
   `tick`, `text` (the
   scene read back as a cell grid), `frame` (the frame's size and digest) and
   `frame-page` (its pixels in pages); and td-photo's own `photo N` (the Nth
-  shown photo's name in hex, flag, exposure, crop, look, sidecar state and, for
-  a refused sidecar, the reason in hex) and `wait-idle MS`: `ok idle` once no
+  shown photo's name in hex, flag, exposure, crop, look, sidecar state, for
+  a refused sidecar the reason in hex (`-` otherwise), then contrast) and
+  `wait-idle MS`: `ok idle` once no
   job is outstanding, the wants are computed for the model as it stands and
   the frame the compositor acknowledged (its frame callback) is the model's,
   `ok busy` at the deadline, `MS` at most `MAX_WAIT_MS` (4,000, under the
@@ -597,7 +603,8 @@ window, all speaking the toolkit's one vocabulary.
   selected step's index, then the zoom (`fit`, or the percent and the
   centre as `PERCENT@X,Y`, `fit` in cull too), then the export quality,
   the long edge (`full` or the pixels) and the format (`jpeg` or
-  `avif`); `-` stands for a roll, a
+  `avif`), then the cursor photo's contrast, last so the fields before it
+  kept their places; `-` stands for a roll, a
   photo, a chooser or a selection that is absent. The mode is `cull`,
   `develop` or `export`. The generation
   moves on a change and on nothing else: not on a step at an end, a filter, view
@@ -724,12 +731,15 @@ The library is folders of originals; there is no database.
   td-photo edit 1
   flag pick
   exposure -0.33
+  contrast 0.40
   crop 0.1000 0.0500 0.8000 0.9000
   look classic-chrome-like
   ```
 
   `flag` is `pick` or `reject`, absent when unflagged; `exposure` is stops with
-  two decimals in -5.00..=5.00, `-0.00` not a spelling of zero; `crop` is `x y w
+  two decimals in -5.00..=5.00, `-0.00` not a spelling of zero; `contrast` is
+  spelled as exposure is, in -1.00..=1.00, the tone's steepness about middle
+  grey `2^contrast` (Pipeline); `crop` is `x y w
   h` as fractions of the oriented image with four decimals, all in 0..=1, `w`
   and `h` at least 0.05; `look` is a look's file stem, 1 to 64 bytes of ASCII
   letters, digits, `-`, `_` and `.`, not starting with `.` and not the bare
@@ -741,7 +751,16 @@ The library is folders of originals; there is no database.
   keys survive an earlier one's edit; a known key given twice, a blank line, or
   a line that is not `key value` is a fault. The develop history follows the
   lines as `step-N on|off KEY VALUE` (`N` from 1 in order without a leading
-  zero, `KEY` a develop key, `VALUE` in its grammar or `-` for a clear):
+  zero, `KEY` a develop key, `VALUE` in its grammar or `-` for a clear). A
+  step whose `KEY` this version does not know, in the key grammar and not the
+  flag, is a later version's (`StepKey::Later`): kept with its value as
+  written and in its place, left out of the fold and written back, and
+  undone, turned off or deleted as any step, so that version's history
+  survives this one's edit. Versions before `contrast` refused such a step,
+  and with it the whole sidecar, so a photo whose history has a contrast
+  step cannot be read by them (a deployment rolled back past it shows the
+  photo at camera defaults with the error, and its flag and edits cannot be
+  changed or exported there until it is rolled forward):
 
   ```text
   step-1 on exposure -0.33
@@ -826,7 +845,8 @@ The library is folders of originals; there is no database.
   (a stale one is reported, not reused or removed), synced, then linked to
   the first free name, the same publication as `develop`'s: a name that
   appears between the check and the link is skipped for the next, never
-  replaced. The export takes the sidecar's exposure, crop and look as the
+  replaced. The export takes the sidecar's exposure, contrast, crop and look
+  as the
   file holds them; a sidecar the reader refuses, or a look it cannot find,
   refuses the export before anything is written, since developing at camera
   defaults would silently drop the edits. It is written at the export
@@ -1081,18 +1101,27 @@ In order, per pixel, all linear `f32` until the last step:
    white; this is what keeps clipped highlights neutral);
 3. exposure, `2^stops`;
 4. `rgb_cam` into linear sRGB primaries;
-5. the look, when one is applied (below), otherwise nothing;
+5. the photo's contrast, when it is not zero: the looks' `tone` sigmoid
+   (Looks, below) at `contrast 2^C` with no toe or shoulder over each
+   channel inside `0..=1`, so grey, black and white stay where they are,
+   and a channel outside it (a bright colour past white, a negative one
+   out of gamut) passed as it is, which the fixed black and white keep
+   continuous, so the look after it sees what it would without
+   (`Look::contrast`); then the look, when one is applied, otherwise
+   nothing;
 6. clip to `0..=1` and the sRGB transfer to 8 bits.
 
-Steps 3 and 4 fold into one 3x3 matrix; step 5 is the look's operations in file
-order, each a 3x3 matrix, a curve as a table over a log-spaced domain or a
-luminance mix (Looks, below); step 6 is the table. The cost per pixel without a
-look is twelve multiplies (three for the white balance, nine for the matrix), a
-clip, three table loads and a few adds; a look adds nine multiplies per matrix,
-six loads and a few multiplies per tone or three-channel curve, and a few
-multiplies (one division for a luminance curve) per mix or luminance step; which
-is what makes the preview redraw at frame cadence over a whole canvas on one
-core and in a few milliseconds across the pool.
+Steps 3 and 4 fold into one 3x3 matrix; step 5 is the contrast's tone, a
+three-channel curve tabulated as a look's is when the develop starts, then the
+look's operations in file order, each a 3x3 matrix, a curve as a table over a
+log-spaced domain or a luminance mix (Looks, below); step 6 is the table. The
+cost per pixel without a contrast or a look is twelve multiplies (three for the
+white balance, nine for the matrix), a clip, three table loads and a few adds;
+the contrast adds six loads and a few multiplies, and a look nine multiplies
+per matrix, six loads and a few multiplies per tone or three-channel curve, and
+a few multiplies (one division for a luminance curve) per mix or luminance
+step; which is what makes the preview redraw at frame cadence over a whole
+canvas on one core and in a few milliseconds across the pool.
 
 ### Levels and memoization
 
@@ -1106,7 +1135,7 @@ what an edit invalidates:
 | 2 | the crop of level 1 area-resampled to the canvas, oriented, linear `f32` | canvas x 12 bytes | current photo and canvas size |
 | 3 | display pixels, XRGB, written into the frame | canvas x 4 bytes | the frame |
 
-Exposure and look edits recompute level 3 only. A crop edit recomputes
+Exposure, contrast and look edits recompute level 3 only. A crop edit recomputes
 level 2 from level 1 (tens of milliseconds across the pool) and then level
 3; a crop set over the preview outlines its rectangle and commits the crop
 on release, which reruns level 2 as any crop edit does, so no develop runs
@@ -1548,7 +1577,8 @@ holds, at least one of each, so a surface too small for a cell clips one rather
 than shows none, and the grid scrolls by rows, keeping the cursor's row shown.
 The single view shows the name, the facts and the largest 3:2 box under them,
 the cursor's photo developed into the box as develop's is (its sidecar's
-crop, exposure and look applied, at the fit: the zoom, the crop drag and
+crop, exposure, contrast and look applied, at the fit: the zoom, the crop drag
+and
 the bands are develop's), so `develop_box` is that box there and the
 window's develop path, its memo and the neighbours' prefetch serve both
 views; develop mode shows the name row and the box (no facts row: the
@@ -1896,13 +1926,21 @@ renormalized at any scale, sixteen of the widest operations and the steepest
 admitted knots staying finite, and the file order; every built-in parsing,
 within both budgets, keeping a neutral ramp neutral, monotone and pinned at
 black and white; middle grey through the whole pipeline with a tone at the plain
-value and a mix making a colour grey; and runs the built binary: `looks` over a
+value and a mix making a colour grey; the photo's contrast as the tone at its
+power of two, none at zero, steepening or flattening about grey per channel,
+and applied before the look as a look that begins with that tone would, a
+channel outside `0..=1` passed as it is so the least contrast under `mono`
+moves a colour past white by little; and
+runs the built binary: `looks` over a
 user directory with a shadowing, a nameless, a refused, a linked and a stray
 file, a stem with a tab, a folder and a link to nothing at a built-in's stem,
 without a resolvable directory, and with a stem, and `develop --look` refusing a
 bad stem, an unknown one, an unparseable user file and a link to nothing before
 reading anything. `tests/nef.rs`'s command case develops its synthetic frame
-with `--look mono` to a grey image.
+with `--look mono` to a grey image, with `--contrast 0.00` to the plain frame
+and `0.80` to another, and refuses `--contrast 1.50`, and
+`tests/control_process.rs`'s `--preview --develop` case holds a sidecar's
+contrast to the develop box's pixels.
 
 `tests/jpeg.rs` carries a synthetic baseline JPEG writer (fixed complete
 DC and incomplete AC tables, byte stuffing, restart markers, 8- and
@@ -1993,8 +2031,9 @@ error. `tests/nef.rs`'s second command case runs `export`
 over a temporary roll:
 the JPEG in `exported/` decoding to the in-process export of the same frame
 within the round trip's tolerance, the second and third exports numbered
-and a gap filled, the sidecar's exposure brightening, `mono` greying and a
-crop selecting the pinned axes, a refused sidecar and an unknown look
+and a gap filled, the sidecar's exposure brightening, `mono` greying, its
+contrast spreading the values and a crop selecting the pinned axes, a refused
+sidecar and an unknown look
 refusing before anything is written, a stale temporary reported and left, a
 non-original, a stray argument and a missing FILE refused by name, a turned
 frame exporting turned, a file at `exported/` refusing, and the originals
@@ -2006,14 +2045,18 @@ words; in `image` the shrink's sizes, shares, means, bands and refusals
 as above; and in `main` the batch note's counts.
 
 `tests/library.rs` holds the sidecar grammar to its refusals by name and to
-in-place rewriting around an unknown line, the canonical value spellings, and
+in-place rewriting around an unknown line, the canonical value spellings,
+contrast's range and its nudges and exposure's clamped as one step a run, a
+later version's step kept in place and written back, taken by undo, toggle
+and delete, beside a flag step and a known key's bad value refused, and
 the roll and dating rules with a two-IFD TIFF carrying only a capture time; and
 runs the built binary over a temporary library: an import dated and undated,
 eight folders deep and not nine, through a linked source and past a linked
 folder and file, skipped when identical, refused as a conflict when a copy
 differs, a folder stands in its place or a `NAME.part` is in the way, with the
-card unchanged and no temporary left; `list` with each filter; and `flag` and
-`edit` writing through the sidecar, keeping an unknown line, refusing a bad
+card unchanged and no temporary left; `list` with each filter; `edit` and
+`list` carrying contrast; and `flag` and `edit` writing through the sidecar,
+keeping an unknown line, refusing a bad
 value before writing, refusing a malformed sidecar, a stale temporary, a linked
 sidecar, a sidecar past either ceiling and an edit that would take one past, and
 unlinking nothing; and `delete-rejected` moving a reject and its sidecar into
@@ -2123,7 +2166,10 @@ the area's clip keeps them off the status band, and the in-memory shrink by the
 thumbnail rule), `wait-idle` over the replay idle at once with its argument
 judged, `--preview` equal to the seam's frame of the empty window and of a roll
 and refused for a bad size or roll, `develop_box` the preview box only in
-develop mode, the crop set over the develop preview (a marquee armed,
+develop mode, contrast nudged by `.` and `,` and set by `contrast` (ignored
+outside develop, a bad spelling `bad-argument`, a run of nudges one step,
+the value last in `state` and `photo`), the crop set over the develop preview (a
+marquee armed,
 rubber-banded and committed as a sub-region of the current crop, a click, a
 sub-minimum marquee and an off-canvas press refused, the develop box the
 fallback canvas when no fit is reported (in crop-adjust no canvas at all: no
@@ -2229,7 +2275,8 @@ develop that would decode its photo waiting, dropped as the frame is collected
 and taken first once replanned, a prefetched frame joining the cache only into
 room and never evicting, evicted before a frame shown, refused for good when
 it could not decode and until the room is there when it had none, the memo
-planning each develop from what it holds (level 3 for an exposure or look edit,
+planning each develop from what it holds (level 3 for an exposure, contrast
+or look edit, a contrast edit alone another preview,
 level 2 for a resize, level 1 for a cached photo, else a decode; a zoom of the
 current photo from its level 1 with the cached frame, without it through half
 zoom alone and past half a decode, a zoomed result leaving the fit levels
@@ -2256,7 +2303,8 @@ window with its socket gone. A second native case, on a synthesized decodable
 NEF, develops the cursor photo over the socket and holds the captured tile to
 `--preview --develop` of the roll before and after an exposure edit, zooms
 to 100% over the socket (the tile `--preview --develop --zoom`, the box
-changed) and back to the fit (the tile the fitted frame again), then
+changed) and back to the fit (the tile the fitted frame again), and holds
+it again after a contrast edit (`contrast-in`, the box changed), then
 exports over the socket: with the sidecar naming a look no file provides the
 export fails and the row says so with nothing written, and with the look cleared
 `wait-idle` waits for the pool's export, the JPEG is in `exported/` and the row

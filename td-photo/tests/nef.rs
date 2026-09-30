@@ -1541,6 +1541,35 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     let pixels = &ppm[header.len()..];
     assert_eq!(pixels.len(), 16 * 7 * 3);
     assert!(pixels.chunks(3).all(|p| p[0] == p[1] && p[1] == p[2]));
+    // `--contrast` develops a different frame; zero is the identity.
+    let develop_at = |name: &str, contrast: &str| {
+        let out = dir.join(name);
+        let (ok, _, stderr) = run(&[
+            OsStr::new("develop"),
+            file.as_os_str(),
+            out.as_os_str(),
+            OsStr::new("--long-edge"),
+            OsStr::new("16"),
+            OsStr::new("--contrast"),
+            OsStr::new(contrast),
+        ]);
+        assert!(ok, "{stderr}");
+        std::fs::read(&out).unwrap()
+    };
+    let flat = develop_at("flat.ppm", "0.00");
+    let steep = develop_at("steep.ppm", "0.80");
+    let plain = dir.join("plain.ppm");
+    let (ok, _, stderr) = run(&[
+        OsStr::new("develop"),
+        file.as_os_str(),
+        plain.as_os_str(),
+        OsStr::new("--long-edge"),
+        OsStr::new("16"),
+    ]);
+    assert!(ok, "{stderr}");
+    let plain = std::fs::read(&plain).unwrap();
+    assert_eq!(flat, plain);
+    assert_ne!(steep, plain);
     // A crop develops a sub-region: fewer pixels on each axis than the whole
     // frame at the same long edge, so the crop is applied (5(e)). The exact
     // oriented-region mapping is pinned in tests/develop.rs.
@@ -1600,6 +1629,15 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     ]);
     assert!(!ok);
     assert!(stderr.contains("-5..=5"), "{stderr}");
+    let (ok, _, stderr) = run(&[
+        OsStr::new("develop"),
+        file.as_os_str(),
+        x.as_os_str(),
+        OsStr::new("--contrast"),
+        OsStr::new("1.50"),
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("D.DD in -1.00..=1.00"), "{stderr}");
     let (ok, _, stderr) = run(&[
         OsStr::new("develop"),
         file.as_os_str(),
@@ -1689,6 +1727,7 @@ fn the_command_line_exports_into_the_rolls_folder() {
         &td_photo::color::Transfer::srgb(),
         &td_photo::develop::Params {
             exposure: 0.0,
+            contrast: None,
             threads: 2,
             look: None,
         },
@@ -1751,6 +1790,30 @@ fn the_command_line_exports_into_the_rolls_folder() {
     )
     .unwrap();
     assert!(mono.data.chunks(3).all(|p| p[0] == p[1] && p[1] == p[2]));
+    // Contrast spreads the frame's values about grey.
+    std::fs::write(&sidecar, "td-photo edit 1\ncontrast 1.00\n").unwrap();
+    let (ok, stdout, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("DSC_0001-6.jpg"), "{stdout}");
+    let steep = td_photo::jpeg::decode(
+        &std::fs::read(exported.join("DSC_0001-6.jpg")).unwrap(),
+        td_photo::jpeg::Scale::Full,
+    )
+    .unwrap();
+    let spread = |image: &[u8]| {
+        let m = mean(image) as f64;
+        image
+            .iter()
+            .map(|v| (f64::from(*v) - m).powi(2))
+            .sum::<f64>()
+            / image.len() as f64
+    };
+    assert!(
+        spread(&steep.data) > spread(&decoded.data) * 1.2,
+        "{} {}",
+        spread(&steep.data),
+        spread(&decoded.data)
+    );
     std::fs::write(
         &sidecar,
         "td-photo edit 1\ncrop 0.2000 0.3000 0.5000 0.4000\n",

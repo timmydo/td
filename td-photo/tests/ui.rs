@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use td_photo::library::{self, Filter, Flag, Key, Sidecar};
+use td_photo::library::{Filter, Flag, Key, Sidecar};
 use td_photo::look;
 use td_photo::settings::{Format, Settings};
 use td_photo::ui::{self, Action, Controller, Effect, Photo, View, ZoomStep, BINDINGS};
@@ -51,6 +51,7 @@ const ZOOM: usize = 18;
 const QUALITY: usize = 19;
 const EDGE: usize = 20;
 const FORMAT: usize = 21;
+const CONTRAST: usize = 22;
 
 fn surface(width: usize, height: usize) -> Surface {
     Surface::new(width, height, Scale::new(1).unwrap()).unwrap()
@@ -159,6 +160,7 @@ fn the_action_table_is_closed_aligned_and_reachable() {
                         "crop",
                         "aspect",
                         "exposure",
+                        "contrast",
                         "quality",
                         "long-edge",
                         "format",
@@ -216,7 +218,7 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!((layout.columns, layout.rows), (4, 3));
     assert_eq!(
         c.state(),
-        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-\tfit\t92\tfull\tjpeg"
+        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-\tfit\t92\tfull\tjpeg\t-"
     );
     for name in ["next", "pick", "view", "first"] {
         assert_eq!(
@@ -277,12 +279,12 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!(c.action("select", &[]).unwrap_err().code(), "protocol");
     assert_eq!(
         c.photo(0).unwrap(),
-        format!("{}\t-\t-\t-\t-\tnone\t-", name(0))
+        format!("{}\t-\t-\t-\t-\tnone\t-\t-", name(0))
     );
     assert_eq!(
         c.photo(3).unwrap(),
         format!(
-            "{}\t-\t-\t-\t-\terror\t{}",
+            "{}\t-\t-\t-\t-\terror\t{}\t-",
             name(3),
             hex(b"malformed exposure value")
         )
@@ -484,15 +486,15 @@ fn a_session_walks_the_grid_and_reports_its_state() {
 /// stands (the model's copy here stands in for the file), then settles it.
 /// A refused sidecar is never rewritten; a mutation that leaves the sidecar
 /// as it was writes nothing and is `Ignored` unless the settle itself
-/// brought a change; anything else is `Changed`. The delta and clamp of
-/// exposure live here, as they do in the binary.
+/// brought a change; anything else is `Changed`. A nudge's delta and
+/// clamp are `Sidecar::nudge`'s, as they are in the binary.
 fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
     let mut outcome = Outcome::Changed;
     for effect in effects {
         let (index, name) = match effect {
             Effect::Flag { index, name, .. }
             | Effect::Edit { index, name, .. }
-            | Effect::Expose { index, name, .. }
+            | Effect::Nudge { index, name, .. }
             | Effect::Reset { index, name }
             | Effect::Undo { index, name }
             | Effect::StepToggle { index, name, .. }
@@ -552,15 +554,7 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
         match effect {
             Effect::Flag { flag, .. } => sidecar.set(Key::Flag, flag.map(Flag::word)).unwrap(),
             Effect::Edit { key, value, .. } => sidecar.set(*key, value.as_deref()).unwrap(),
-            Effect::Expose { delta, .. } => {
-                let current = sidecar.exposure().unwrap_or(0);
-                let next = current
-                    .saturating_add(*delta)
-                    .clamp(-library::MAX_EXPOSURE, library::MAX_EXPOSURE);
-                sidecar
-                    .set(Key::Exposure, Some(&library::exposure_text(next)))
-                    .unwrap();
-            }
+            Effect::Nudge { key, delta, .. } => sidecar.nudge(*key, *delta).unwrap(),
             Effect::Reset { .. } => sidecar.reset(),
             Effect::Undo { .. } => {
                 sidecar.undo();
@@ -811,6 +805,81 @@ fn flags_change_the_sidecar_through_effects_and_never_a_refused_one() {
     assert_eq!(roll.photos()[0], big);
 }
 
+/// Contrast is nudged a tenth by `.` and `,` and set by the `contrast`
+/// action, each a develop edit of the cursor photo as exposure's are; the
+/// value shows last in the state once the photo is settled.
+#[test]
+fn contrast_is_nudged_and_set_in_develop_mode() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    for name in ["contrast-in", "contrast-out"] {
+        assert_eq!(act(&mut c, name, &[]), Outcome::Ignored, "{name}");
+    }
+    assert_eq!(act(&mut c, "contrast", &["0.20"]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[CONTRAST], "-");
+    let (outcome, effects) = c.action("contrast-in", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Nudge {
+            index: 0,
+            name: file(0),
+            key: Key::Contrast,
+            delta: ui::CONTRAST_STEP,
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[CONTRAST], "0.10");
+    // The keys ask for the same nudges.
+    for (chord, delta) in [
+        (".", ui::CONTRAST_STEP),
+        (",", -ui::CONTRAST_STEP),
+        (",", -ui::CONTRAST_STEP),
+    ] {
+        let (outcome, effects) = c.input(Input::Key { chord }).unwrap();
+        assert_eq!(outcome, Outcome::Changed);
+        assert!(
+            matches!(effects.as_slice(), [Effect::Nudge { key: Key::Contrast, delta: d, .. }] if *d == delta),
+            "{chord}: {effects:?}"
+        );
+        apply(&mut c, &effects).unwrap();
+    }
+    assert_eq!(fields(&c)[CONTRAST], "0.00");
+    let (_, effects) = c.action("contrast", &["-0.40"]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Contrast,
+            value: Some("-0.40".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[CONTRAST], "-0.40");
+    assert_eq!(fields(&c)[EXPOSURE], "-");
+    for bad in ["1.50", "-0.00", "0.4", "x"] {
+        assert_eq!(
+            c.action("contrast", &[bad]).unwrap_err(),
+            ui::Error::BadArgument,
+            "{bad}"
+        );
+    }
+    // The history lists the run of nudges and the set as contrast steps.
+    let labels: Vec<String> = c
+        .photos()
+        .first()
+        .and_then(|photo| photo.sidecar.as_ref())
+        .unwrap()
+        .steps()
+        .iter()
+        .map(ui::step_label)
+        .collect();
+    assert_eq!(labels, ["contrast -0.40"]);
+    assert!(c.photo(0).unwrap().ends_with("\t-0.40"));
+}
+
 #[test]
 fn develop_edits_act_on_the_cursor_only_in_develop_mode() {
     let mut c = Controller::new(surface(800, 600));
@@ -854,9 +923,10 @@ fn develop_edits_act_on_the_cursor_only_in_develop_mode() {
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(
         effects,
-        [Effect::Expose {
+        [Effect::Nudge {
             index: 0,
             name: file(0),
+            key: Key::Exposure,
             delta: ui::EXPOSURE_STEP,
         }]
     );
@@ -1080,7 +1150,7 @@ fn the_scene_reads_back_as_text_and_paints_deterministically() {
     assert_eq!(lines[3].trim(), "DSC_0002.NEF");
     assert_eq!(
         lines[4].trim(),
-        "reject | exposure - | crop - | look - | sidecar ok"
+        "reject | exposure - | contrast - | crop - | look - | sidecar ok"
     );
     assert!(lines.last().unwrap().ends_with("| single"));
     act(&mut c, "grid", &[]);
@@ -1338,12 +1408,16 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "fit",
             "92",
             "full",
-            "jpeg"
+            "jpeg",
+            "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "58"]);
+    assert_eq!(&reply(2)[..2], ["ok", "61"]);
     assert_eq!(reply(3), ["ok", "changed"]);
-    assert_eq!(reply(4), ["ok", &name(1), "pick", "-", "-", "-", "ok", "-"]);
+    assert_eq!(
+        reply(4),
+        ["ok", &name(1), "pick", "-", "-", "-", "ok", "-", "-"]
+    );
     assert_eq!(
         reply(5),
         [
@@ -1354,7 +1428,8 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "-",
             "error",
-            &hex(b"malformed exposure value")
+            &hex(b"malformed exposure value"),
+            "-"
         ]
     );
     assert_eq!(reply(6), ["ok", "changed"]);
@@ -1453,7 +1528,8 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "-",
             "error",
-            &hex(b"malformed exposure value")
+            &hex(b"malformed exposure value"),
+            "-"
         ]
     );
     let (ok, rest, err) = session.finish();
@@ -4329,10 +4405,10 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
         request(9, &["text"]),
         request(10, &["action", "export-picks"]),
     ]);
-    assert_eq!(&a[0][21..], ["92", "full", "jpeg"]);
+    assert_eq!(&a[0][21..], ["92", "full", "jpeg", "-"]);
     assert_eq!(&a[1][1..], ["ok", "changed"]);
     assert_eq!(&a[2][1..], ["ok", "changed"]);
-    assert_eq!(&a[3][21..], ["80", "32", "jpeg"]);
+    assert_eq!(&a[3][21..], ["80", "32", "jpeg", "-"]);
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
         "td-photo export 1\nformat jpeg\nquality 80\nlong-edge 32\n"
@@ -4407,17 +4483,17 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     assert!(ok, "{err}");
     assert_eq!(
         &replies[0][21..],
-        ["92", "full", "jpeg"],
+        ["92", "full", "jpeg", "-"],
         "the empty configuration"
     );
-    assert_eq!(&replies_env[0][21..], ["80", "32", "jpeg"]);
+    assert_eq!(&replies_env[0][21..], ["80", "32", "jpeg", "-"]);
     fs::write(&file, "td-photo export 1\nquality 80\nsharpen 3\n").unwrap();
     let mut session = Replay::start_with_env(&["--size", "1100x400", roll_s], &env);
     let replies = session.send(&[
         request(1, &["state"]),
         request(2, &["action", "quality", "10"]),
     ]);
-    assert_eq!(&replies[0][21..], ["92", "full", "jpeg"]);
+    assert_eq!(&replies[0][21..], ["92", "full", "jpeg", "-"]);
     assert_eq!(&replies[1][1..], ["ok", "changed"]);
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");
@@ -4437,11 +4513,11 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
         request(4, &["action", "format", "png"]),
         request(5, &["state"]),
     ]);
-    assert_eq!(&replies[0][21..], ["92", "full", "avif"]);
+    assert_eq!(&replies[0][21..], ["92", "full", "avif", "-"]);
     assert_eq!(&replies[1][1..], ["ok", "changed"]);
     assert_eq!(&replies[2][1..], ["ok", "ignored"]);
     assert_eq!(&replies[3][1..3], ["error", "bad-argument"]);
-    assert_eq!(&replies[4][21..], ["10", "full", "avif"]);
+    assert_eq!(&replies[4][21..], ["10", "full", "avif", "-"]);
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
         "td-photo export 1\nformat avif\nquality 10\nlong-edge full\n"
@@ -4451,7 +4527,7 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
         request(7, &["state"]),
     ]);
     assert_eq!(&replies[0][1..], ["ok", "changed"]);
-    assert_eq!(&replies[1][21..], ["10", "full", "jpeg"]);
+    assert_eq!(&replies[1][21..], ["10", "full", "jpeg", "-"]);
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");
     assert_eq!(
@@ -4469,9 +4545,9 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
         request(2, &["action", "quality", "10"]),
         request(3, &["state"]),
     ]);
-    assert_eq!(&replies[0][21..], ["92", "full", "jpeg"]);
+    assert_eq!(&replies[0][21..], ["92", "full", "jpeg", "-"]);
     assert_eq!(replies[1][1..3], ["error", "refused"]);
-    assert_eq!(&replies[2][21..], ["92", "full", "jpeg"]);
+    assert_eq!(&replies[2][21..], ["92", "full", "jpeg", "-"]);
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");
     assert_eq!(err.matches("not a regular file").count(), 2, "{err}");
@@ -5525,13 +5601,13 @@ fn the_history_records_the_develop_steps_and_undoes_toggles_and_deletes_them() {
     assert_eq!(
         c.steps()
             .iter()
-            .map(|step| (step.on, step.key, step.value.clone()))
+            .map(|step| (step.on, step.key.name().to_string(), step.value.clone()))
             .collect::<Vec<_>>(),
         [
-            (true, Key::Exposure, Some("0.66".to_string())),
-            (false, Key::Look, Some("portra".to_string())),
-            (true, Key::Exposure, Some("0.33".to_string())),
-            (true, Key::Look, Some("velvia".to_string())),
+            (true, "exposure".to_string(), Some("0.66".to_string())),
+            (false, "look".to_string(), Some("portra".to_string())),
+            (true, "exposure".to_string(), Some("0.33".to_string())),
+            (true, "look".to_string(), Some("velvia".to_string())),
         ]
     );
 
@@ -5884,9 +5960,10 @@ fn the_tool_band_drives_the_develop_edits() {
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(
         effects,
-        [Effect::Expose {
+        [Effect::Nudge {
             index: 0,
             name: file(0),
+            key: Key::Exposure,
             delta: ui::EXPOSURE_STEP,
         }]
     );
@@ -5894,9 +5971,10 @@ fn the_tool_band_drives_the_develop_edits() {
     let (_, effects) = click(&mut c, button(4));
     assert_eq!(
         effects,
-        [Effect::Expose {
+        [Effect::Nudge {
             index: 0,
             name: file(0),
+            key: Key::Exposure,
             delta: -ui::EXPOSURE_STEP,
         }]
     );
