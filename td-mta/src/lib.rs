@@ -12,6 +12,7 @@ pub mod observability;
 pub mod ownership;
 pub mod ports;
 pub mod sync;
+pub mod tls_admission;
 pub mod tls_io;
 pub mod transport;
 pub mod wire;

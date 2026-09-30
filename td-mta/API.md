@@ -233,6 +233,35 @@ publication. This adds target behavioral coverage, not resource admission.
 Shared td-crypto fixtures qualify TLS 1.2 as well; mail-specific TLS 1.2 and service/resource acceptance
 remain part of M07d3/M07e.
 
+### 1.4 Handshake capacity reservations
+
+M07d3a supplies `tls_admission::HandshakePool` and its non-clonable
+`HandshakePermit`. Construct one service-global pool at startup with the
+validated handshake limit (1 through 8). Construction allocates one shared
+bitmap owner; reserving and dropping a permit allocate no replacement storage.
+Each reservation makes one atomic compare/exchange attempt. Saturation or a
+racing change returns Busy without a reservation; the scheduler may retry on
+a later turn. `available` is only a momentary observation. No operation spins,
+locks a mutex or waits for a worker. The bitmap accounts for capacity only;
+it does not publish or synchronize transport-slot payloads.
+
+The permit moves between workers and releases its bit on Drop, including a
+returned-error path. Keep it across queued, running and idle handshake steps,
+and release it only after successful completion or terminal teardown. It may
+outlive the public pool handle: the shared bitmap remains until the final
+owner drops. Forgetting a permit leaks capacity but cannot allow excess
+reservations. Constructing another pool is a separate capacity domain, never
+a way to replace a live service pool or bypass its global limit.
+
+This helper does not reserve wire/session memory, bind a policy generation,
+construct a TLS session or enforce a STARTTLS transition. The admitting
+factory must couple those owners before sending 220, and release them after
+refusal or completion. Pending integration must not treat possession of this
+scalar reservation as TLS or gateway authority. The portable runtime exercises
+all configured capacities, saturation/reuse, overlapping reservation/release,
+worker return and cleanup after refusal or public-pool destruction. These are
+ownership/capacity observations, not whole-process allocation measurements.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

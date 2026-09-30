@@ -748,6 +748,19 @@ Implement the remaining work as independently reviewable increments:
     leases, reserve before STARTTLS replies, reject plaintext tails and map
     verified leaf evidence plus actual peer address to gateway authorization.
     Complete local HTTPS/SMTP transition fixtures before enabling service.
+    - **M07d3a — handshake capacity:** implemented a fixed atomic bitmap and
+      linear movable permits over the validated global count. One reservation
+      attempt never waits/spins; Drop returns capacity. Host and portable cases
+      cover all capacities, saturation/reuse, overlapping reservation/release
+      and refusal cleanup.
+      This reserves only the count; it does not couple session buffers, policy
+      generations or protocol transitions and does not enable service.
+    - **M07d3b — policy and resource binding:** couple the global permit,
+      reserved wire/session storage and immutable authorized generation in the
+      admitting factory. Refusal returns all owners; hold the permit across
+      queued/Pending progress and release only on completion or teardown.
+    - **M07d3c — protocol integration:** complete STARTTLS flush/tail/reset,
+      gateway pin/address authorization and local HTTPS/SMTP transition cases.
 - **M07e — resource/service admission:** qualify complete generation overlap,
   session/handshake peaks, worker entropy and Rust/native stack/allocation/RSS
   on the portable artifact before activating the adapters. Amend the checked

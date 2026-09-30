@@ -278,18 +278,20 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   test-target/profile, static ELF and isolated-runtime checks as the other
   qualification binaries; it is not an installed service dependency.
 - `td-mta-transport-smoke`: the `--lib --no-run` td-mta test executable,
-  selected by its `td_mta` library target and test profile. Sixteen exact
-  clock/TCP/TLS cases execute individually under the existing deadline and
-  positive-one-test verdict requirement. They cover clock conversion,
-  bounded TCP/half-close/failure, TLS 1.3 duplex progress and framing,
-  backpressure, publication deadlines, closure and truncation, and buffer
-  recovery after success or constructor refusal, with both borrowed and owned
-  reservations, including owned connection transfer through a worker thread.
-  Socket fixtures bind only
-  ephemeral IPv4 loopback ports; certificates are generated locally through
-  the public crypto facade. No provider, CA or deployment server is contacted.
-  This qualifies those adapter behaviors on musl, not full service admission,
-  native allocation/stack/RSS, or mail-specific TLS 1.2 integration.
+  selected by its `td_mta` library target and test profile. Twenty exact
+  admission/clock/TCP/TLS cases execute individually under the existing
+  deadline and positive-one-test verdict requirement. They cover handshake
+  count limits, concurrent reservation and release, worker returns and
+  refusal cleanup, clock conversion, bounded TCP/half-close/failure, TLS
+  1.3 duplex progress and framing, backpressure, publication deadlines,
+  closure and truncation, and buffer recovery after success or constructor
+  refusal, with both borrowed and owned reservations, including owned
+  connection transfer through a worker thread. Socket fixtures bind only
+  ephemeral IPv4 loopback ports; certificates are generated locally
+  through the public crypto facade. No provider, CA or deployment server
+  is contacted. This qualifies those adapter behaviors on musl, not full
+  service admission, native allocation/stack/RSS, or mail-specific TLS 1.2
+  integration.
 - `BUILD-INPUTS`: staged source, vendor, reconstructed Rust kit, headers and
   helper NAR hashes, native recipe identities/NARs, target and actual inner
   Cargo argument/environment records.

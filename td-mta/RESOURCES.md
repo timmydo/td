@@ -111,6 +111,16 @@ configured memory budget does not preserve the default RSS claim.
   pool-return mechanism.
   Count each buffer once regardless of its ownership representation; owned
   allocation bookkeeping remains part of the same session target.
+  M07d3a's service-global HandshakePool reserves only the scalar handshake
+  count. Charge its cold shared bitmap allocation and live permits to the
+  71,168-byte remainder of the existing 128 KiB Slot queues and queue window
+  reservation; each live permit fits 16 bytes. Dropping a
+  permit returns capacity with one atomic operation, without taking a lock.
+  Reserve/drop make no allocations. It does not reserve the session buffers
+  or native handshake allowance; the admitting factory must couple all of
+  them before 220. Startup must create one pool shared by all handshake workers,
+  never one pool per listener or worker. Complete allocation/RSS accounting
+  remains M07e.
   Internal backend queues, peer chains and retained handshake fragments need
   separate measurement within these same entries, not an added allowance.
   Incoming TLS 1.3 tickets still derive secrets, query the clock and copy peer
