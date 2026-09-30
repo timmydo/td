@@ -242,6 +242,67 @@ impl Controller {
     pub fn tab_view(&self, tab: TabId) -> Result<TabView> {
         self.tabs.get(&tab).copied().ok_or(Error::MissingTab)
     }
+    /// The link (`td_ui::links`) over the glyph under the surface pixel
+    /// `x`, `y` in the active tab's text, which a Control-press follows;
+    /// none over anything else, a directory listing or a scrollbar.
+    pub fn link_at(
+        &self,
+        tab: TabId,
+        revision: u64,
+        x: i64,
+        y: i64,
+    ) -> Result<Option<std::ops::Range<usize>>> {
+        self.checked(tab, revision, true)?;
+        let doc = self.editor.document(tab)?;
+        let (columns, rows) = self.geometry.grid();
+        if doc.directory() || columns == 0 || rows == 0 {
+            return Ok(None);
+        }
+        let state = self.tab_view(tab)?;
+        let origin = state.viewport.origin();
+        let bars = [
+            self.geometry.scrollbar(state.metrics.rows, origin.row),
+            self.geometry
+                .horizontal_scrollbar(state.metrics.columns, origin.column),
+        ];
+        // Status is painted last and wins overlaps, as for a press.
+        if self.geometry.status().contains(x, y)
+            || bars
+                .into_iter()
+                .flatten()
+                .any(|bar| bar.track.contains(x, y))
+        {
+            return Ok(None);
+        }
+        let s = self.geometry.scale().value();
+        let mut area = self.geometry.document();
+        area.width = (columns * CELL_WIDTH * s) as u32;
+        area.height = (rows * CELL_HEIGHT * s) as u32;
+        if !area.contains(x, y) {
+            return Ok(None);
+        }
+        let (Ok(dx), Ok(dy)) = (usize::try_from(x - area.x), usize::try_from(y - area.y)) else {
+            return Ok(None);
+        };
+        let row = origin.row.saturating_add(dy / s / CELL_HEIGHT);
+        let cell_x = origin
+            .column
+            .saturating_mul(CELL_WIDTH)
+            .saturating_add(dx / s);
+        let layout = state.viewport.layout(doc, state.soft_wrap)?;
+        let Some(visual) = layout.rows().nth(row) else {
+            return Ok(None);
+        };
+        let cell = visual.cells().find(|cell| {
+            let left = cell.column.saturating_mul(CELL_WIDTH);
+            let right = cell
+                .column
+                .saturating_add(cell.width)
+                .saturating_mul(CELL_WIDTH);
+            cell_x >= left && cell_x < right
+        });
+        Ok(cell.and_then(|cell| td_ui::links::at(doc.text(), cell.bytes.start)))
+    }
     pub fn scene<'a>(&'a self, labels: &'a [Label<'a>]) -> Result<Scene<'a>> {
         let mut view = View {
             focused: self.focused,

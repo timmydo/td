@@ -1,8 +1,9 @@
 //! The widget window: the `App` that presents what a program paints into
 //! a raster over the surface and drives the program's [`Handler`] with
 //! what the window receives — keypresses as the keymap's chords, the left
-//! button's press, drag and release in surface pixels with Shift, wheel
-//! travel in rows and columns, the surface laid out again on configure,
+//! button's press, drag and release in surface pixels with Shift and
+//! Control, wheel travel in rows and columns, the surface laid out again
+//! on configure,
 //! focus, the close request and the text of a paste it asked for — and
 //! polls it each turn under the wait it asks for, so a program whose work
 //! arrives on a channel from another thread is served without a
@@ -57,14 +58,17 @@ pub enum Input<'a> {
         chord: &'a str,
         repeat: bool,
     },
-    /// The left button; `extend` is Shift held at the press, read from the
-    /// keyboard's synchronized modifier state while the window has focus,
-    /// and false on a move or a release.
+    /// The left button; `extend` is Shift and `follow` Control held at
+    /// the press, read from the keyboard's synchronized modifier state
+    /// while the window has focus, and both false on a move or a release.
+    /// A handler follows the link under a `follow` press (`links`, `open`)
+    /// and takes the press as a plain one where there is none.
     Pointer {
         phase: PointerPhase,
         x: i64,
         y: i64,
         extend: bool,
+        follow: bool,
     },
     /// The pointer left, or the device went, while the button was held:
     /// the handler ends its drag without a release.
@@ -495,28 +499,23 @@ impl<'h, H: Handler> Window<'h, H> {
         Ok(())
     }
 
-    /// Shift as the keyboard's synchronized state reports it while the
-    /// window has focus; a keyboard the window lacks extends nothing.
-    fn extend(&self) -> bool {
-        let input = self.client.input();
-        input.focused
-            && input.synchronized
-            && input
-                .map
-                .as_ref()
-                .is_some_and(|map| map.pointer_extend(input.modifiers))
-    }
-
-    /// The left button's press, at its serial, or its release, at none: a
-    /// selection is set at a press.
+    /// The left button's press, at its serial, with Shift and Control as
+    /// the keyboard's synchronized state reports them while the window
+    /// has focus (a keyboard the window lacks holds neither), or its
+    /// release, at none: a selection is set at a press.
     fn button(&mut self, serial: u32, phase: PointerPhase) -> Result<()> {
         let (x, y) = self.pointer;
-        let extend = phase == PointerPhase::Press && self.extend();
+        let held = if phase == PointerPhase::Press {
+            self.client.input().held()
+        } else {
+            Default::default()
+        };
         let input = Input::Pointer {
             phase,
             x,
             y,
-            extend,
+            extend: held.shift,
+            follow: held.control,
         };
         if phase == PointerPhase::Press {
             self.deliver_at(serial, input)
@@ -538,6 +537,7 @@ impl<'h, H: Handler> Window<'h, H> {
                         x,
                         y,
                         extend: false,
+                        follow: false,
                     })?;
                 }
             }

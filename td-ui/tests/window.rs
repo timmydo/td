@@ -37,7 +37,8 @@ const BLUE: u32 = 0x0033aa;
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Record {
     Key(String, bool),
-    Pointer(PointerPhase, i64, i64, bool),
+    /// Phase, position, `extend`, `follow`.
+    Pointer(PointerPhase, i64, i64, bool, bool),
     CancelPointer,
     Wheel(isize, isize),
     Resize(usize, usize),
@@ -55,7 +56,8 @@ impl Record {
                 x,
                 y,
                 extend,
-            } => Self::Pointer(phase, x, y, extend),
+                follow,
+            } => Self::Pointer(phase, x, y, extend, follow),
             Input::CancelPointer => Self::CancelPointer,
             Input::Wheel { rows, columns } => Self::Wheel(rows, columns),
             Input::Resize(surface) => Self::Resize(surface.width, surface.height),
@@ -604,7 +606,7 @@ fn the_left_button_presses_drags_and_releases_in_surface_pixels_with_shift() {
     w.event(message(pointer, 3, &[3, 0, 0x110, 1])).unwrap();
     assert_eq!(
         last(&w),
-        Some(&Record::Pointer(PointerPhase::Press, 20, 35, false))
+        Some(&Record::Pointer(PointerPhase::Press, 20, 35, false, false))
     );
     // Motion while held is a drag, past the edge signed; a second press
     // while held is nothing; the release ends it where the pointer is.
@@ -612,7 +614,7 @@ fn the_left_button_presses_drags_and_releases_in_surface_pixels_with_shift() {
         .unwrap();
     assert_eq!(
         last(&w),
-        Some(&Record::Pointer(PointerPhase::Move, -5, 40, false))
+        Some(&Record::Pointer(PointerPhase::Move, -5, 40, false, false))
     );
     let seen = w.handler().inputs.len();
     w.event(message(pointer, 3, &[4, 0, 0x110, 1])).unwrap();
@@ -620,7 +622,13 @@ fn the_left_button_presses_drags_and_releases_in_surface_pixels_with_shift() {
     w.event(message(pointer, 3, &[5, 0, 0x110, 0])).unwrap();
     assert_eq!(
         last(&w),
-        Some(&Record::Pointer(PointerPhase::Release, -5, 40, false))
+        Some(&Record::Pointer(
+            PointerPhase::Release,
+            -5,
+            40,
+            false,
+            false
+        ))
     );
     // Motion without the button, a release without a press and the right
     // button are nothing.
@@ -635,7 +643,7 @@ fn the_left_button_presses_drags_and_releases_in_surface_pixels_with_shift() {
     w.event(message(pointer, 3, &[9, 0, 0x110, 1])).unwrap();
     assert_eq!(
         last(&w),
-        Some(&Record::Pointer(PointerPhase::Press, 30, 30, false))
+        Some(&Record::Pointer(PointerPhase::Press, 30, 30, false, false))
     );
     w.event(message(pointer, 1, &[10, SURFACE])).unwrap();
     assert_eq!(last(&w), Some(&Record::CancelPointer));
@@ -650,13 +658,61 @@ fn the_left_button_presses_drags_and_releases_in_surface_pixels_with_shift() {
     w.event(message(pointer, 3, &[14, 0, 0x110, 1])).unwrap();
     assert_eq!(
         last(&w),
-        Some(&Record::Pointer(PointerPhase::Press, 50, 60, true))
+        Some(&Record::Pointer(PointerPhase::Press, 50, 60, true, false))
     );
     w.event(message(pointer, 3, &[15, 0, 0x110, 0])).unwrap();
     assert_eq!(
         last(&w),
-        Some(&Record::Pointer(PointerPhase::Release, 50, 60, false))
+        Some(&Record::Pointer(
+            PointerPhase::Release,
+            50,
+            60,
+            false,
+            false
+        ))
     );
+    // Control held follows, with Shift or without, and neither reaches a
+    // release or a drag.
+    w.event(message(keyboard, 4, &[15, 4, 0, 0, 0])).unwrap();
+    w.event(message(pointer, 3, &[15, 0, 0x110, 1])).unwrap();
+    assert_eq!(
+        last(&w),
+        Some(&Record::Pointer(PointerPhase::Press, 50, 60, false, true))
+    );
+    w.event(message(pointer, 2, &[0, fixed(51), fixed(60)]))
+        .unwrap();
+    assert_eq!(
+        last(&w),
+        Some(&Record::Pointer(PointerPhase::Move, 51, 60, false, false))
+    );
+    w.event(message(pointer, 3, &[15, 0, 0x110, 0])).unwrap();
+    assert_eq!(
+        last(&w),
+        Some(&Record::Pointer(
+            PointerPhase::Release,
+            51,
+            60,
+            false,
+            false
+        ))
+    );
+    w.event(message(keyboard, 4, &[15, 5, 0, 0, 0])).unwrap();
+    w.event(message(pointer, 3, &[15, 0, 0x110, 1])).unwrap();
+    assert_eq!(
+        last(&w),
+        Some(&Record::Pointer(PointerPhase::Press, 51, 60, true, true))
+    );
+    w.event(message(pointer, 3, &[15, 0, 0x110, 0])).unwrap();
+    // Unfocused, nothing is held.
+    w.event(message(keyboard, 2, &[15, SURFACE])).unwrap();
+    w.event(message(pointer, 3, &[15, 0, 0x110, 1])).unwrap();
+    assert_eq!(
+        last(&w),
+        Some(&Record::Pointer(PointerPhase::Press, 51, 60, false, false))
+    );
+    w.event(message(pointer, 3, &[15, 0, 0x110, 0])).unwrap();
+    w.event(message(keyboard, 1, &[15, SURFACE, 0])).unwrap();
+    w.event(message(keyboard, 4, &[15, 0, 0, 0, 0])).unwrap();
     // Losing the pointer capability while held cancels the drag; the
     // keyboard stays, so focus does not move.
     w.event(message(pointer, 3, &[16, 0, 0x110, 1])).unwrap();
@@ -1123,7 +1179,13 @@ fn a_release_and_an_unfocused_window_have_no_clipboard_authority() {
     w.event(message(pointer, 3, &[20, 0, 0x110, 0])).unwrap();
     assert_eq!(
         last(&w),
-        Some(&Record::Pointer(PointerPhase::Release, 20, 20, false))
+        Some(&Record::Pointer(
+            PointerPhase::Release,
+            20,
+            20,
+            false,
+            false
+        ))
     );
     assert_eq!(w.handler().outcomes.last(), Some(&Err(Refusal::NoSerial)));
     assert!(drain(&peer).0.is_empty());

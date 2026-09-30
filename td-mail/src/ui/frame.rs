@@ -566,6 +566,15 @@ impl Pane {
         }) == Outcome::Changed
     }
 
+    /// The link under the pointer's pixel in the shown document, which a
+    /// Control-press follows (`td_ui::links`); none over anything else.
+    pub fn link(&self, x: i64, y: i64) -> Option<String> {
+        let (tab, revision) = self.target()?;
+        let range = self.controller.link_at(tab, revision, x, y).ok()??;
+        let document = self.controller.editor().document(tab).ok()?;
+        document.text().get(range).map(str::to_owned)
+    }
+
     pub fn cancel_pointer(&mut self) {
         self.drag = false;
         self.event(Event::CancelPointer);

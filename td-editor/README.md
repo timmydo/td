@@ -490,7 +490,9 @@ td-editor/target/release/td-editor --window-preview --keys=emacs
 It starts with two editable scratch tabs and follows window-manager resizing.
 Type, navigate, select with Shift, undo, and switch tabs with Ctrl+Tab.
 Windows-like bindings are the default; the second command selects Emacs.
-Mouse selection, tab clicks, scrolling and menus work. Open/Save remain
+Mouse selection, tab clicks, scrolling and menus work; Ctrl-click on
+an `http://` or `https://` link opens it with `$BROWSER`, else
+`xdg-open`. Open/Save remain
 disabled in the scratch preview, as is dictionary loading. F7 reports no
 dictionary there. Clipboard
 commands require an available data-device v3 and keyboard focus.

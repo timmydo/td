@@ -1232,7 +1232,7 @@ impl Session {
         }
     }
 
-    fn pointer(&mut self, phase: PointerPhase, x: i64, y: i64, extend: bool) {
+    fn pointer(&mut self, phase: PointerPhase, x: i64, y: i64, extend: bool, follow: bool) {
         let Some(shape) = self.shape() else {
             return;
         };
@@ -1246,6 +1246,21 @@ impl Session {
             }
             return self.pointer_widgets(shape, phase, x, y);
         };
+        // A Control-press on a link opens it and is no press of the
+        // pane's; the drag and release that follow find no drag.
+        if follow && phase == PointerPhase::Press && rect.contains(x, y) {
+            self.pane.place(rect, self.surface);
+            if let Some(link) = self.pane.link(x, y) {
+                let note = match td_ui::open::link(&link, self.setup.browser.as_deref()) {
+                    Ok(program) => format!("opened {link} with {program}"),
+                    Err(why) => format!("link not opened: {why}"),
+                };
+                self.note(note);
+                // The followed press is no click: the next press starts anew.
+                self.pane.cancel_pointer();
+                return;
+            }
+        }
         if self.pane.drag || (phase == PointerPhase::Press && rect.contains(x, y)) {
             self.pane.place(rect, self.surface);
             if self.pane.pointer(phase, x, y, extend) {
@@ -1457,9 +1472,10 @@ impl Handler for Session {
                     x,
                     y,
                     extend,
+                    follow,
                 } => {
                     if self.mouse {
-                        self.pointer(phase, x, y, extend);
+                        self.pointer(phase, x, y, extend, follow);
                     }
                 }
                 Input::CancelPointer => self.pane.cancel_pointer(),
@@ -1851,10 +1867,170 @@ mod frame_tests {
                     x,
                     y,
                     extend: false,
+                    follow: false,
                 },
                 &mut NoClipboard,
             );
         }
+    }
+
+    /// A press and release with Control held.
+    fn follow(session: &mut Session, x: i64, y: i64) {
+        for phase in [PointerPhase::Press, PointerPhase::Release] {
+            session.input(
+                Input::Pointer {
+                    phase,
+                    x,
+                    y,
+                    extend: false,
+                    follow: phase == PointerPhase::Press,
+                },
+                &mut NoClipboard,
+            );
+        }
+    }
+
+    /// A Control-press on a link in a message opens it through the
+    /// configured browser, the note saying what the opener answered, and
+    /// is no press of the pane's: the caret stays. Off a link it is a
+    /// plain press, as a press without Control on the link is.
+    #[test]
+    fn a_control_press_on_a_link_opens_it_and_elsewhere_is_a_plain_press() {
+        let (mut session, _cmd_rx, resp_tx) = session(true);
+        // A browser that cannot start: the test opens nothing.
+        let browser = "/nonexistent/td-mail-browser";
+        // Past the pane's columns: the wrap must not break it.
+        const LONG: &str = "https://e.example/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        session.setup.browser = Some(browser.to_string());
+        let view = views::email_view::EmailView::new(
+            session.cmd_tx.clone(),
+            "me@example.com".to_string(),
+            "e1".to_string(),
+            Vec::new(),
+            0,
+            false,
+            Vec::new(),
+            "Archive".to_string(),
+            "Trash".to_string(),
+            None,
+        );
+        session.act(ViewAction::Push(Box::new(view)));
+        let email = crate::jmap::types::Email {
+            id: "e1".to_string(),
+            thread_id: None,
+            from: None,
+            to: None,
+            cc: None,
+            reply_to: None,
+            subject: Some("Hello".to_string()),
+            received_at: Some("2025-01-01".to_string()),
+            sent_at: None,
+            preview: Some(format!("see https://e.example/x now {LONG} end")),
+            text_body: None,
+            html_body: None,
+            body_values: std::collections::HashMap::new(),
+            keywords: std::collections::HashMap::new(),
+            mailbox_ids: std::collections::HashMap::new(),
+            message_id: None,
+            references: None,
+            attachments: None,
+            extra: std::collections::HashMap::new(),
+        };
+        resp_tx
+            .send(BackendResponse::EmailBody {
+                id: "e1".to_string(),
+                result: Box::new(Ok(email)),
+            })
+            .unwrap();
+        session.poll(0);
+        let text = session.shown();
+        assert!(text.contains("https://e.example/x"), "{text}");
+        let rect = session.shape().unwrap().layout.pane.expect("a pane");
+        let points = (0..i64::from(rect.height)).step_by(4).flat_map(|dy| {
+            (0..i64::from(rect.width))
+                .step_by(4)
+                .map(move |dx| (rect.x + dx, rect.y + dy))
+        });
+        let mut on = Vec::new();
+        let mut off = Vec::new();
+        let mut long = 0;
+        for (x, y) in points {
+            match session.pane.link(x, y).as_deref() {
+                Some("https://e.example/x") => on.push((x, y)),
+                Some(LONG) => long += 1,
+                Some(other) => panic!("a link cut short: {other}"),
+                None => off.push((x, y)),
+            }
+        }
+        assert!(
+            long > 4 * i64::from(rect.width) / 8,
+            "the long link is shown whole on its rows: {long}"
+        );
+        let first = *on.first().expect("the link is shown");
+        let row: Vec<_> = on.iter().filter(|point| point.1 == first.1).collect();
+        // Past the link's end on its row.
+        let end = row[row.len() - 1].0;
+        let off = *off
+            .iter()
+            .find(|point| point.1 == first.1 && point.0 > end)
+            .expect("the row goes on past the link");
+        let selection = |session: &Session| {
+            let tab = session.pane.tab().unwrap();
+            session.pane.editor().document(tab).unwrap().selection()
+        };
+        let tab = session.pane.tab().unwrap();
+        let shown = session
+            .pane
+            .editor()
+            .document(tab)
+            .unwrap()
+            .text()
+            .to_string();
+        // Without Control a press on the link is the pane's: the caret
+        // lands inside it. The press is one whose caret sits between two
+        // letters, where a second click would select a word; the clock
+        // steps between the tries so no two of them pair.
+        let mut now = 0;
+        let mut pick = None;
+        for &&point in &row {
+            now += 1000;
+            session.poll(now);
+            press(&mut session, point.0, point.1);
+            let caret = selection(&session).caret;
+            let letters = shown
+                .get(caret - 1..caret + 1)
+                .is_some_and(|pair| pair.bytes().all(|b| b.is_ascii_alphabetic()));
+            if letters {
+                pick = Some(point);
+                break;
+            }
+        }
+        let middle = pick.expect("a press between two letters of the link");
+        let placed = selection(&session);
+        assert!(
+            shown
+                .match_indices("https://e.example/x")
+                .any(|(start, _)| placed.caret > start && placed.caret < start + 19),
+            "{placed:?} {shown}"
+        );
+        assert!(session.note.is_none());
+        // With Control it opens the link, and the caret stays.
+        follow(&mut session, first.0, first.1);
+        let note = session.note.clone().unwrap_or_default();
+        assert!(
+            note.starts_with(&format!("link not opened: {browser}: ")),
+            "{note}"
+        );
+        assert_eq!(selection(&session), placed, "the press was not the pane's");
+        assert!(!session.pane.drag);
+        // A plain press on the link just after the followed one is a first
+        // click, not the second of a pair with the press before it.
+        press(&mut session, middle.0, middle.1);
+        assert_eq!(selection(&session), placed, "a first click, not a word");
+        // With Control off a link it is a plain press.
+        follow(&mut session, off.0, off.1);
+        assert_ne!(selection(&session), placed);
+        assert!(session.note.is_none());
     }
 
     /// The frame reads back as text: the mailboxes with their counts,

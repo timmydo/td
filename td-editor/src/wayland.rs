@@ -67,6 +67,9 @@ struct Window {
     frames: crate::control_frame::Frames,
     clock: u64,
     notice: Option<String>,
+    /// The browser command a followed link is opened with; none, as in
+    /// production, is `BROWSER` then `xdg-open` (`td_ui::open`).
+    browser: Option<String>,
     quitting: bool,
     files: Option<crate::session::Session>,
     prompt: Option<PathPrompt>,
@@ -302,6 +305,7 @@ impl Window {
             frames: crate::control_frame::Frames::default(),
             clock: 0,
             notice: None,
+            browser: None,
             quitting: false,
             files: None,
             prompt: None,
@@ -654,15 +658,44 @@ impl Window {
     }
 
     fn pointer_action(&mut self, phase: crate::ui::PointerPhase) -> Result<()> {
-        let extend = self.client.input().focused
-            && self.client.input().synchronized
-            && self
-                .client
-                .input()
-                .map
-                .as_ref()
-                .is_some_and(|map| map.pointer_extend(self.client.input().modifiers));
+        let held = self.client.input().held();
+        if held.control
+            && phase == crate::ui::PointerPhase::Press
+            && self.menu.is_none()
+            && self.follow_link()
+        {
+            self.pointer.held = false;
+            // The followed press is no click: the next press starts anew.
+            let _ = self.ui.dispatch(Event::CancelPointer);
+            return Ok(());
+        }
+        let extend = held.shift;
         self.decoded_pointer_action(phase, self.pointer.x, self.pointer.y, extend)
+    }
+
+    /// A Control-press over a link in the active document's text opens it
+    /// in the browser and is no press of the document's: whether it was
+    /// over one.
+    fn follow_link(&mut self) -> bool {
+        let x = i64::from(self.pointer.x).div_euclid(256);
+        let y = i64::from(self.pointer.y).div_euclid(256);
+        let Some(tab) = self.ui.editor().active() else {
+            return false;
+        };
+        let Ok(doc) = self.ui.editor().document(tab) else {
+            return false;
+        };
+        let Ok(Some(range)) = self.ui.link_at(tab, doc.revision(), x, y) else {
+            return false;
+        };
+        let Some(link) = doc.text().get(range).map(str::to_owned) else {
+            return false;
+        };
+        match td_ui::open::link(&link, self.browser.as_deref()) {
+            Ok(program) => self.notify(format!("Opened {link} with {program}")),
+            Err(why) => self.notify(format!("Link not opened: {why}")),
+        }
+        true
     }
 
     fn decoded_pointer_action(
@@ -5268,6 +5301,79 @@ mod tests {
     fn pointer_enter(w: &mut Window) {
         let pointer = w.client.pointer().unwrap();
         w.event(message(pointer, 0, &[19, SURFACE, 0, 0])).unwrap();
+    }
+
+    /// A Control-press over a link opens it through the opener and is no
+    /// press of the controller's: caret, selection and generation stay,
+    /// the release and a drag after it change nothing, and the next plain
+    /// press on the same spot is a first click. Control off a link, and a
+    /// press without Control on it, are plain presses.
+    #[test]
+    fn control_press_follows_a_link_and_is_otherwise_a_plain_press() {
+        let (mut w, _peer, keyboard, _device) = clipboard_fixture();
+        // A browser that cannot start: the test opens nothing.
+        let browser = "/nonexistent/td-editor-browser";
+        w.browser = Some(browser.to_string());
+        w.ui = Controller::default();
+        w.ui.dispatch(Event::Load(b"see https://e.example/x now\n"))
+            .unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        let area = w.ui.geometry().document();
+        let s = w.ui.geometry().scale().value() as i64;
+        let glyph = |column: i64| (area.x + (column * 8 + 3) * s, area.y + 8 * s);
+        let caret = |w: &Window| w.ui.editor().document(tab).unwrap().selection();
+        pointer_enter(&mut w);
+        // A plain click inside the link, then Control on the same spot.
+        let (x, y) = glyph(15);
+        pointer_move(&mut w, x, y);
+        pointer_button(&mut w, true);
+        pointer_button(&mut w, false);
+        let placed = caret(&w);
+        assert_eq!(placed.caret, 15);
+        w.event(message(keyboard, 4, &[3, 4, 0, 0, 0])).unwrap();
+        w.notice = None;
+        let generation = w.ui.generation();
+        pointer_button(&mut w, true);
+        let notice = w.notice.clone().unwrap_or_default();
+        assert!(
+            notice.starts_with(&format!("Link not opened: {browser}: ")),
+            "{notice}"
+        );
+        assert!(!w.pointer.held);
+        pointer_move(&mut w, glyph(14).0, y);
+        pointer_button(&mut w, false);
+        assert_eq!(caret(&w), placed);
+        assert_eq!(w.ui.generation(), generation);
+        // Control off the link is a plain press.
+        w.notice = None;
+        let (x, y) = glyph(1);
+        pointer_move(&mut w, x, y);
+        pointer_button(&mut w, true);
+        pointer_button(&mut w, false);
+        assert_eq!(caret(&w).caret, 1);
+        assert!(w.notice.is_none());
+        // Without Control a press on the link is the controller's, and a
+        // first click: the followed press between left no pair.
+        w.event(message(keyboard, 4, &[4, 0, 0, 0, 0])).unwrap();
+        w.ui.dispatch(Event::Tick(1000)).unwrap();
+        let (x, y) = glyph(15);
+        pointer_move(&mut w, x, y);
+        pointer_button(&mut w, true);
+        pointer_button(&mut w, false);
+        w.event(message(keyboard, 4, &[5, 4, 0, 0, 0])).unwrap();
+        pointer_button(&mut w, true);
+        pointer_button(&mut w, false);
+        w.event(message(keyboard, 4, &[6, 0, 0, 0, 0])).unwrap();
+        pointer_button(&mut w, true);
+        pointer_button(&mut w, false);
+        assert_eq!(
+            caret(&w),
+            crate::model::Selection {
+                anchor: 15,
+                caret: 15
+            },
+            "a first click, not a word"
+        );
     }
 
     #[test]

@@ -222,7 +222,14 @@ wrap mode, affinity, focus and caret visibility.
 Pointer coordinates are signed physical surface pixels. Presses in full
 document cells use the layout's nearest scalar endpoint, preserving exact
 physical-pixel midpoint ties at scales 1–4; Shift-press retains
-the previous anchor. A drag remains anchored to its starting tab and byte,
+the previous anchor. A Control-press over a link in a text document opens
+it in the browser (td-ui/DESIGN.md, "Following links") and is no press of
+the controller's: the native adapter asks the read-only
+`Controller::link_at` for the link under the glyph (none under the
+status row or a scrollbar) and dispatches only `CancelPointer`, so caret,
+selection and drag stay and the next press is a first click; elsewhere
+it is a plain press. Remote control has no Control-press. A drag remains
+anchored to its starting tab and byte,
 clamps out-of-surface motion to the viewport edges, and ends on release.
 There is no drag autoscroll yet. Blank rows below EOF select document end.
 Typing, semantic edits, tab/profile changes, effective resize/scroll and focus loss

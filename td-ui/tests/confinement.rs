@@ -23,7 +23,7 @@ fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-const PURE: [&str; 27] = [
+const PURE: [&str; 28] = [
     "atlas.rs",
     "charts.rs",
     "chrome.rs",
@@ -36,6 +36,7 @@ const PURE: [&str; 27] = [
     "finder.rs",
     "hint.rs",
     "keyboard.rs",
+    "links.rs",
     "menus.rs",
     "pointer.rs",
     "raster.rs",
@@ -67,6 +68,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "control_worker.rs",
                 "lib.rs",
                 "notices.rs",
+                "open.rs",
                 "replay.rs",
                 "sys.rs",
                 "wayland.rs",
@@ -238,6 +240,18 @@ fn source_inventory_and_shared_mounts_are_closed() {
                     "allocation `{allocating}` in the finder"
                 );
             }
+        }
+        // Outside tests the environment is read in one place: the
+        // opener's `BROWSER`.
+        let production = text.split("#[cfg(test)]").next().unwrap_or_default();
+        assert_eq!(
+            production.matches("std::env").count(),
+            usize::from(name == "open.rs"),
+            "environment access in {name}"
+        );
+        if name == "open.rs" {
+            assert!(production.contains("std::env::var(\"BROWSER\")"));
+            assert!(production.contains(".env_remove(\"WAYLAND_SOCKET\")"));
         }
         if PURE.contains(&name.as_str()) {
             // Production text only: a module's own `#[cfg(test)] mod tests`

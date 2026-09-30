@@ -1730,3 +1730,71 @@ fn a_pane_controller_frames_at_an_offset_and_reads_without_editing() {
         Err(Error::MissingTab)
     );
 }
+
+#[test]
+fn link_at_finds_the_link_under_a_glyph_and_nothing_elsewhere() {
+    let text = "see https://e.example/x now\nplain";
+    let link = 4..23;
+    for scale in 1..=3u8 {
+        let mut ui = loaded(text);
+        resize(&mut ui, 400 * scale as usize, 240 * scale as usize, scale);
+        let (tab, revision) = active(&ui);
+        let s = i64::from(scale);
+        let area = ui.geometry().document();
+        // The last pixel inside the glyph at `column`, `row`.
+        let at =
+            |column: i64, row: i64| (area.x + (column * 8 + 7) * s, area.y + (row * 16 + 15) * s);
+        let find = |ui: &Controller, (x, y): (i64, i64)| ui.link_at(tab, revision, x, y).unwrap();
+        for column in 4..23 {
+            assert_eq!(
+                find(&ui, at(column, 0)),
+                Some(link.clone()),
+                "{scale} {column}"
+            );
+        }
+        for (column, row) in [
+            (0, 0),
+            (3, 0),
+            (23, 0),
+            (26, 0),
+            (40, 0),
+            (0, 1),
+            (6, 1),
+            (6, 5),
+        ] {
+            assert_eq!(find(&ui, at(column, row)), None, "{scale} {column} {row}");
+        }
+        assert_eq!(find(&ui, (area.x - 1, area.y)), None);
+        assert_eq!(find(&ui, (area.x, area.y - 1)), None);
+        assert_eq!(
+            ui.link_at(tab, revision + 1, at(6, 0).0, at(6, 0).1),
+            Err(Error::StaleRevision)
+        );
+        // Asking moved nothing.
+        assert_eq!(
+            selection(&ui),
+            Selection {
+                anchor: 0,
+                caret: 0
+            }
+        );
+    }
+}
+
+#[test]
+fn link_at_follows_a_link_wrapped_onto_the_next_row() {
+    let mut ui = loaded("https://e.example/a/long/path/past/the/edge end");
+    resize(&mut ui, 200, 240, 1);
+    let (tab, revision) = active(&ui);
+    let (columns, _) = ui.geometry().grid();
+    assert!(columns < 40, "{columns}");
+    let area = ui.geometry().document();
+    let row = |row: i64| area.y + row * 16 + 8;
+    for y in [row(0), row(1)] {
+        assert_eq!(
+            ui.link_at(tab, revision, area.x + 4, y).unwrap(),
+            Some(0..43)
+        );
+    }
+    assert_eq!(ui.link_at(tab, revision, area.x + 4, row(5)).unwrap(), None);
+}

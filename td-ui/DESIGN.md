@@ -178,10 +178,18 @@ of its own files may name each module.
   client owns one for its keyboard and applies the lifecycle half (map,
   focus, snapshot, timing, presses) itself, lending a consumer a read of
   the state and the repeat half: `arm`, `repeat`, `wait_ms` and
-  `cancel_repeat`.
+  `cancel_repeat`, and `held`, the roles the synchronized snapshot holds
+  while focused, which a pointer press reads (none unfocused, before the
+  snapshot or without a map).
 - `pointer`: `Event`, `decode` for `wl_pointer` v5 through v7 events and
   `Wheel`, which accumulates axis, axis-discrete and axis-value120 input
   into whole cell rows and columns per frame.
+- `links`: `at`, the byte range of the link over a byte of a text,
+  `around`, the same without the bound, for a caller walking the text
+  once (td-mail's wrap, so it never splits a link a press could find),
+  `whole`, whether a text is one link whole at any length, `stop`, the
+  bytes that end one, and `MAX_BYTES`, the bound either side of a byte;
+  under "Following links" below.
 - `data`: `DeviceEvent`, `SourceEvent`, `device`, `source` and `offer`, the
   exact core data-device v3 schemas; `Offer`, the record the client keeps
   per server offer, with `mime`, its preferred supported text type, and
@@ -292,6 +300,8 @@ of its own files may name each module.
 - `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
   texts beside the face in `td-compositor/assets`, embedded at compile
   time for a program's `--font-license` output.
+- `open`: `link`, which starts the browser on one whole link; under
+  "Following links" below.
 - `wayland`: `Endpoint` and `endpoint` (from the `WAYLAND_SOCKET`,
   `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` values a consumer passes),
   `connect`, `Connection` (`new`, `send` with at most one borrowed file,
@@ -815,10 +825,13 @@ not frames, and stays its own).
   driving adapters: `control_socket`, which owns the listener it binds
   and reads procfs for the caller's identity; `control_worker`, which
   owns its thread and reads the monotonic clock for its deadlines; and
-  `replay`, which reads and writes only the streams it is handed; and the
+  `replay`, which reads and writes only the streams it is handed; the
   widget window `window`, whose `Window::new` reads the embedded face and
-  whose loop is `client::run`. Even they read no environment variable,
-  taking the display values and the socket path as explicit arguments.
+  whose loop is `client::run`; and `open`, which reads `BROWSER`, starts
+  the browser as a child process with its streams closed and reaps it on
+  a thread of its own. Apart from `open`'s `BROWSER` they read no
+  environment variable, taking the display values and the socket path as
+  explicit arguments.
 - `control` and `driven` are pure: the frame, envelope and codecs touch
   no descriptor, and the seam reads only the composition it is handed
   and the embedded face. The decoder allocates at most one frame, after
@@ -1292,9 +1305,10 @@ The vocabulary is `Input`: `Key` with the chord as the keymap spells it
 to td-editor's controller unchanged, and `repeat` for a delivery the
 repeat clock made; `Pointer` with the driven seam's `PointerPhase` (`Press`,
 `Move`, `Release`), the position in the surface's physical pixels, signed so
-travel past an edge is representable, and `extend`, Shift held at the
-press as the keyboard's synchronized modifier state reports it while
-the window has focus; `CancelPointer` when the pointer leaves or the
+travel past an edge is representable, `extend`, Shift held at the
+press, and `follow`, Control held at the press, as the keyboard's
+synchronized modifier state reports them while the window has focus;
+`CancelPointer` when the pointer leaves or the
 device goes while the button is held, so the handler ends a drag
 without a release; `Wheel` in cell rows and columns as `pointer::Wheel`
 accumulates a frame; `Resize` with the `Surface` the handler lays out
@@ -1807,6 +1821,47 @@ is consumed, so a third click cannot reuse it. The caller cancels on other
 input or geometry/focus changes and remains responsible for matching each
 individual press/release against its captured target. Tests cover identity,
 time, coordinate extremes, explicit cancellation and consumed pairs.
+
+## Following links
+
+A Control-press on a link opens it in the browser in td-editor's
+documents and in td-mail's messages, which td-mail shows in the editor's
+pane; td-news does not follow links yet. The rule and the launch are the
+toolkit's so the programs agree. `links::at` finds the link over the
+byte under the pointer: an
+`http://` or `https://` scheme with at least one byte after it, running
+to the next ASCII whitespace or `<>])"'` backtick, trailing `.,;:!?`
+left out, which is td-mail's link-list rule. It looks at most
+`MAX_BYTES` either side of the byte, and a run longer than that on
+either side is no link, so a press costs the same in any line; the
+module is pure, so a program that
+cannot link the crate, the compositor's terminal, can mount it.
+td-editor's controller maps a surface pixel to the glyph under it
+(`Controller::link_at`, read-only) and the program follows what it
+answers: a press over a link opens it and is not the document's press,
+so the caret, the selection and a drag are untouched; a press anywhere
+else is a plain press. A followed press also ends a click sequence, so
+the next press is a first click.
+
+`open::link` refuses anything that is not one link whole
+(`links::whole`, the same rule without the press's bound, so a link
+found at any byte opens), so no option, whitespace or other scheme
+reaches the browser's arguments. The
+browser is the program's configured command, else `BROWSER`, else
+`xdg-open`, split on whitespace and run directly, never through a shell:
+a word holding `{url}` has it replaced by the link (quotes put around the
+bare placeholder are taken off), and a command without one gets the link
+as its last word. The child's standard streams are `/dev/null`, its
+environment is the program's without `WAYLAND_SOCKET` (so the browser
+cannot speak on the program's display connection), and it is reaped on
+its own thread, so the window's loop never waits on it; the program
+reports the program started, or why none was, in its status. A
+`WAYLAND_SOCKET` descriptor the program inherited without close-on-exec
+is still inherited by the browser, as by any child: the client
+duplicates it and leaves the original alone. td's launchers pass
+`WAYLAND_DISPLAY`. The pins in `tests/confinement.rs` hold `BROWSER` as
+the one environment read outside tests and the `WAYLAND_SOCKET`
+removal.
 
 ## Shared tree table
 

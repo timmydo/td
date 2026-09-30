@@ -1,6 +1,6 @@
 //! Explicit-clock held-key policy. No socket, descriptor or ambient clock.
 
-use crate::keyboard::{Keymap, Modifiers, Stroke};
+use crate::keyboard::{Held, Keymap, Modifiers, Stroke};
 use std::collections::BTreeSet;
 
 #[derive(Default)]
@@ -18,6 +18,16 @@ pub struct Input {
 impl Input {
     pub fn cancel_repeat(&mut self) {
         self.repeat = None;
+    }
+
+    /// The roles the keyboard's synchronized modifier state holds while
+    /// focused, which a pointer press reads: none without focus, a map or
+    /// the snapshot that follows focus.
+    pub fn held(&self) -> Held {
+        match &self.map {
+            Some(map) if self.focused && self.synchronized => map.held(self.modifiers),
+            _ => Held::default(),
+        }
     }
 
     pub fn focus(&mut self, keys: &[u32], focused: bool) -> Result<(), String> {

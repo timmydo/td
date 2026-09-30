@@ -337,10 +337,46 @@ pub fn wrap_text(text: &str, columns: usize) -> String {
                         remaining.get(..space).unwrap_or_default(),
                         remaining.get(space + 1..).unwrap_or_default(),
                     ),
-                    None => (head, tail),
+                    // A link is not broken: the line runs to the end of
+                    // its word and the pane's soft wrap shows the rest,
+                    // so the link a Control-press follows is the whole
+                    // one.
+                    None => {
+                        // Only a piece a scheme starts in can split a link.
+                        // The run a scheme starts is kept whole or ends at a
+                        // stop, so no run is walked again piece by piece.
+                        let bytes = remaining.as_bytes();
+                        let scheme = (0..end).any(|at| {
+                            bytes.get(at..).is_some_and(|rest| {
+                                rest.starts_with(b"http://") || rest.starts_with(b"https://")
+                            })
+                        });
+                        let link = scheme
+                            .then(|| td_ui::links::around(remaining, end))
+                            .flatten()
+                            .filter(|link| link.start < end);
+                        match link {
+                            Some(link) => {
+                                let word = remaining
+                                    .get(link.end..)
+                                    .and_then(|after| after.find(' '))
+                                    .map_or(remaining.len(), |space| link.end + space);
+                                let rest = remaining.get(word..).unwrap_or_default();
+                                (
+                                    remaining.get(..word).unwrap_or_default(),
+                                    rest.strip_prefix(' ').unwrap_or(rest),
+                                )
+                            }
+                            None => (head, tail),
+                        }
+                    }
                 },
             };
             out.push_str(piece);
+            // A link that ends the line is the line's end.
+            if piece.len() == remaining.len() {
+                break;
+            }
             out.push('\n');
             remaining = rest;
         }
@@ -384,6 +420,46 @@ mod tests {
         assert_eq!(wrap_text("  a bb", 4), "  a\nbb");
         assert_eq!(wrap_text("> quoted text", 9), "> quoted\ntext");
         assert_eq!(wrap_text(" > text", 4), " >\ntext");
+    }
+
+    #[test]
+    fn a_link_past_the_column_is_not_broken() {
+        let link = "https://e.example/a/long/path";
+        assert_eq!(wrap_text(link, 8), link);
+        assert_eq!(
+            wrap_text(&format!("see {link} now"), 8),
+            format!("see\n{link}\nnow")
+        );
+        assert_eq!(
+            wrap_text(&format!("<{link}>, then"), 8),
+            format!("<{link}>,\nthen")
+        );
+        // Only the link runs long: the rest of the word wraps as before.
+        assert_eq!(wrap_text("xxxxhttps://e", 4), "xxxx\nhttps://e");
+        assert_eq!(wrap_text("http://", 4), "http\n://");
+        // Past the finder's bound around a press, still whole.
+        let long = format!(
+            "https://e.example/{}",
+            "a".repeat(3 * td_ui::links::MAX_BYTES)
+        );
+        assert_eq!(
+            wrap_text(&format!("{long} end"), 80),
+            format!("{long}\nend")
+        );
+        // A long run with no scheme wraps at the column as before, `://`
+        // or not, each piece looked at once.
+        let blob = "b".repeat(20);
+        assert_eq!(wrap_text(&blob, 8), "bbbbbbbb\nbbbbbbbb\nbbbb");
+        let colons = "a://".repeat(50_000);
+        let wrapped = wrap_text(&colons, 80);
+        assert_eq!(wrapped.lines().count(), colons.len().div_ceil(80));
+        assert_eq!(wrapped.replace('\n', ""), colons);
+        // A scheme broken at the column is still a link spanning it.
+        let link = "https://e.example/abcdef";
+        assert_eq!(
+            wrap_text(&format!("xxxxxhtt{}", &link[3..]), 8),
+            format!("xxxxx{link}")
+        );
     }
 
     #[test]

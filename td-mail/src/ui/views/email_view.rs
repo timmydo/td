@@ -461,47 +461,22 @@ impl EmailView {
             .unwrap_or(0)
     }
 
+    /// Opens the link numbered `index` through td-ui's opener, the one a
+    /// Control-press on a link uses: the configured browser command, else
+    /// `$BROWSER`, else `xdg-open`, run without a shell.
     fn open_url(&mut self, index: usize) {
-        if let Some(url) = self.urls.get(index) {
-            let browser = self
-                .browser
-                .clone()
-                .or_else(|| std::env::var("BROWSER").ok())
-                .unwrap_or_else(|| {
-                    if cfg!(target_os = "macos") {
-                        "open".to_string()
-                    } else {
-                        "xdg-open".to_string()
-                    }
-                });
-            // A shell, so a browser command may carry arguments; the URL is
-            // its `$1`, never part of the command.
-            let script = browser_script(&browser);
-            crate::log_info!("[Browser] running: {} with {}", script, url);
-            match std::process::Command::new("sh")
-                .arg("-f")
-                .arg("-c")
-                .arg(&script)
-                .arg("sh")
-                .arg(url)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(child) => {
-                    crate::ui::reap_in_background(child);
-                    self.status_message = Some(format!("Opening [{}]...", index + 1));
-                }
-                Err(e) => {
-                    crate::log_error!("[Browser] failed to run '{}': {}", script, e);
-                    self.status_message =
-                        Some(format!("Failed to open browser '{}': {}", browser, e));
-                }
-            }
-        } else {
+        let Some(url) = self.urls.get(index) else {
             self.status_message = Some("Invalid URL number".to_string());
-        }
+            return;
+        };
+        crate::log_info!("[Browser] opening {}", url);
+        self.status_message = Some(match td_ui::open::link(url, self.browser.as_deref()) {
+            Ok(_) => format!("Opening [{}]...", index + 1),
+            Err(e) => {
+                crate::log_error!("[Browser] {}", e);
+                format!("Failed to open browser: {}", e)
+            }
+        });
     }
 
     /// Rebuilds the text and the links from what is loaded, and bumps the
@@ -1198,66 +1173,6 @@ impl View for EmailView {
 
     fn take_pending_action(&mut self) -> Option<ViewAction> {
         self.pending_compose.take().map(ViewAction::Compose)
-    }
-}
-
-/// The shell script that runs the configured browser command with the URL
-/// as its `$1`. The URL is not written into the script, so nothing a link
-/// carries is read as shell, however the command is written: a `{url}`
-/// becomes `"$1"` (quotes a person put around the placeholder are taken
-/// off first, since inside them the expansion would be unquoted); without
-/// a placeholder the URL is appended as one word. The caller runs it as
-/// `sh -f -c <script> sh <url>`, `-f` so a `?` or `*` in the link is not a
-/// pattern either.
-fn browser_script(cmd: &str) -> String {
-    let cmd = cmd
-        .replace("\"{url}\"", "{url}")
-        .replace("'{url}'", "{url}");
-    if cmd.contains("{url}") {
-        cmd.replace("{url}", "\"$1\"")
-    } else {
-        format!("{cmd} \"$1\"")
-    }
-}
-
-#[cfg(test)]
-mod browser_script_tests {
-    use super::browser_script;
-
-    /// A link reaches the browser as one argument whichever way the command
-    /// is written, and none of it is read as shell: the script is run
-    /// through sh here, with a link that would print INJECTED if it were.
-    #[test]
-    fn a_link_reaches_the_browser_as_one_argument_however_the_command_is_written() {
-        let link = "https://x/$(printf INJECTED);'a\"b?*&c";
-        for (cmd, expected) in [
-            ("printf '%s\\n' {url}", link.to_string()),
-            ("printf '%s\\n' \"{url}\"", link.to_string()),
-            ("printf '%s\\n' '{url}'", link.to_string()),
-            ("printf '%s\\n' --url={url}", format!("--url={link}")),
-            ("printf '%s\\n'", link.to_string()),
-        ] {
-            let script = browser_script(cmd);
-            assert!(!script.contains("INJECTED"), "{cmd}: {script}");
-            let out = std::process::Command::new("sh")
-                .arg("-f")
-                .arg("-c")
-                .arg(&script)
-                .arg("sh")
-                .arg(link)
-                .output()
-                .expect("sh");
-            assert!(
-                out.status.success(),
-                "{cmd}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout).trim_end(),
-                expected,
-                "{cmd}"
-            );
-        }
     }
 }
 

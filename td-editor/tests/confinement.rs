@@ -836,6 +836,20 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
         .unwrap();
     assert!(physical
         .contains("self.decoded_pointer_action(phase, self.pointer.x, self.pointer.y, extend)"));
+    // A Control-press over a link is the one physical press that does not
+    // reach the controller as a press: it only asks it, opens the link and
+    // ends any click sequence.
+    assert!(physical.contains("self.follow_link()"));
+    assert!(physical.contains("self.ui.dispatch(Event::CancelPointer)"));
+    let follow = production
+        .split("fn follow_link(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
+    assert!(follow.contains("self.ui.link_at(") && follow.contains("td_ui::open::link("));
+    assert!(!follow.contains("dispatch(") && !follow.contains("Event::"));
     assert!(
         dispatch.find("request.is_mutating()").unwrap()
             < dispatch.find("Operation::Open(path)").unwrap()

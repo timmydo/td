@@ -104,6 +104,7 @@ impl HelpView {
             "  F           Forward as attachment (preserves HTML)".to_string(),
             "  f           Forward as inline quoted text".to_string(),
             "  A           Download/open attachment".to_string(),
+            "  Ctrl-click  Open the link under the pointer in the browser".to_string(),
             "  h           Toggle HTML vs plain text body".to_string(),
             "  v           Toggle raw headers (DKIM, Received, etc)".to_string(),
             "  *           Toggle flagged".to_string(),

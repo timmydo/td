@@ -503,6 +503,7 @@ impl App {
                 x,
                 y,
                 extend,
+                ..
             } if self.mouse_config => self.pointer(phase, x, y, extend, cache, cmd_tx),
             Input::CancelPointer => {
                 if self.pane_drag {
@@ -2929,6 +2930,7 @@ pub(super) mod tests {
                     x,
                     y,
                     extend: false,
+                    follow: false,
                 };
                 app.input(input, &cache, &cmd_tx);
             }

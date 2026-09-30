@@ -276,10 +276,6 @@ impl Keymap {
     pub fn virtual_mask(&self, name: &str) -> Option<u32> {
         self.virtuals.get(name).copied()
     }
-    pub fn pointer_extend(&self, modifiers: Modifiers) -> bool {
-        self.state(modifiers)
-            .is_ok_and(|state| state & self.role(Role::Shift) != 0)
-    }
     /// The roles a modifier state holds; a state the map refuses holds
     /// none.
     pub fn held(&self, modifiers: Modifiers) -> Held {

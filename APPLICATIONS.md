@@ -9562,9 +9562,12 @@ for callers outside this tree.
 
 **Diagnosis.** `td-news` opens a link by trying, in order, a configured
 browser command through `sh -c`, `$BROWSER` as a program, then
-`xdg-open` and `open`. `td-mail` opens links through `sh -c` with its
-configured browser and saved attachments through `$OPENER` or
-`xdg-open`; it ran its editor through `sh -c` too, until W.5 (a
+`xdg-open` and `open`. `td-mail` opens links, from its link list or a
+Control-press on one, through td-ui's opener (td-ui/DESIGN.md,
+"Following links"): its configured browser command, else `$BROWSER`,
+else `xdg-open`, run directly without a shell; and saved attachments
+through `$OPENER` or `xdg-open`; it ran its editor through `sh -c` too,
+until W.5 (a
 plain-word editor command then ran directly, until composing moved
 into its window, §W.5 "Reworked"). Inside the jail none of those
 exist: the `mail` and `news` packages are static binaries
@@ -9600,7 +9603,8 @@ lands after (1) with the descriptor forwarded to the handler's jail as a
 read-only grant, which is the Documents-portal shape without FUSE.
 (4) The application-side change in the two crates:
 prefer `$BROWSER` when set before probing `xdg-open`, so the manifest
-environment is enough and no `sh -c` is involved.
+environment is enough and no `sh -c` is involved. td-mail's links now
+do (td-ui's opener); td-news's and td-mail's attachments remain.
 
 ### W.7 Relaunching a shipped application without root
 
