@@ -209,11 +209,7 @@ mod tests {
         let want = Credentials::new(1000, 1000, &[10]);
         let ok = status([1000; 4], [1000; 4], &[10, 1000]);
         assert!(want.matches(&ok).is_ok());
-        for (field, name) in [
-            (0usize, "permitted"),
-            (1, "effective"),
-            (2, "ambient"),
-        ] {
+        for (field, name) in [(0usize, "permitted"), (1, "effective"), (2, "ambient")] {
             let mut seen = ok.clone();
             match field {
                 0 => seen.cap_prm = 0x0000_01ff_ffff_ffff,
@@ -221,7 +217,10 @@ mod tests {
                 _ => seen.cap_amb = 1 << 7,  // CAP_SETUID
             }
             let err = want.matches(&seen).unwrap_err();
-            assert!(err.contains(name), "{name} capabilities must fail the match, got: {err}");
+            assert!(
+                err.contains(name),
+                "{name} capabilities must fail the match, got: {err}"
+            );
         }
         // Inheritable is deliberately NOT enforced: see the comment in `matches`.
         // A non-zero one is ordinary — the machine this was written on hands every
@@ -263,7 +262,9 @@ mod tests {
             .matches(&status([1000; 4], [1000; 4], &[0, 10, 1000]))
             .is_err());
         // ...and the mirror, a set SMALLER than asked for.
-        assert!(want.matches(&status([1000; 4], [1000; 4], &[1000])).is_err());
+        assert!(want
+            .matches(&status([1000; 4], [1000; 4], &[1000]))
+            .is_err());
     }
 
     /// The diagnostic names the column, because "credential switch failed" with
@@ -308,7 +309,10 @@ mod tests {
         // The effective column ALONE is not the question: this is the shape a
         // setuid-root binary produces, and `is_root()` says yes to it.
         let setuid_exec = status([1000, 0, 0, 0], [0; 4], &[0]);
-        assert!(setuid_exec.is_root(), "the fixture must fool an euid-only gate");
+        assert!(
+            setuid_exec.is_root(),
+            "the fixture must fool an euid-only gate"
+        );
         assert!(may_switch(&setuid_exec).is_err());
         // ...and a multi-threaded process is refused whatever its uids are.
         let mut threaded = status([0; 4], [0; 4], &[0]);

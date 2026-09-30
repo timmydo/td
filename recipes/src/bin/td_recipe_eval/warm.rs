@@ -26,8 +26,8 @@ use td_recipe::catalog;
 use td_recipe::types::{OstreePin, Recipe, SourcePin};
 
 use crate::check_runner::{
-    classify_graph_inputs, is_executable, linux_version_from_file, recipe_closure,
-    ostree_cache_is_warm, source_pin_for_key, RecipeCheckRunner, RecipeNode, SeedInput,
+    classify_graph_inputs, is_executable, linux_version_from_file, ostree_cache_is_warm,
+    recipe_closure, source_pin_for_key, RecipeCheckRunner, RecipeNode, SeedInput,
 };
 
 /// One `td-feed warm crate`/`warm crate-local` job: the argv that populates
@@ -212,12 +212,7 @@ pub(crate) fn preflight(
     Ok(())
 }
 
-fn should_verify_ostree(
-    cache: &Path,
-    pin: &OstreePin,
-    verify_all: bool,
-    admitted: bool,
-) -> bool {
+fn should_verify_ostree(cache: &Path, pin: &OstreePin, verify_all: bool, admitted: bool) -> bool {
     verify_all || (ostree_cache_is_warm(cache, pin) && !admitted)
 }
 
@@ -367,11 +362,7 @@ fn vendor_warm_lines(graph: &[RecipeNode]) -> Result<Vec<String>, String> {
             // The lock LAST, after the stem, so a reader that wants only the
             // argv drops one field and one that must judge completeness has the
             // file td-feed will stamp — rather than deriving a second opinion.
-            Ok((args, lock)) => lines.push(format!(
-                "{}\t{}",
-                args.join("\t"),
-                lock.display()
-            )),
+            Ok((args, lock)) => lines.push(format!("{}\t{}", args.join("\t"), lock.display())),
             Err(e) => {
                 return Err(format!(
                     "no vendor plan for {}'s declared crate closure: {e}",
@@ -499,14 +490,12 @@ fn crate_name_from_pin(file: &str, version: &str) -> Result<String, String> {
 /// which hard-requires TD_BUILDER_SELF — without it the warm dies on the unset
 /// variable before fetching anything.
 fn ostree_warm_args(pin: &OstreePin, destination: &Path) -> Result<Vec<String>, String> {
-    let destination = destination
-        .to_str()
-        .ok_or_else(|| {
-            format!(
-                "OSTree cache destination is not UTF-8: {}",
-                destination.display()
-            )
-        })?;
+    let destination = destination.to_str().ok_or_else(|| {
+        format!(
+            "OSTree cache destination is not UTF-8: {}",
+            destination.display()
+        )
+    })?;
     Ok(vec![
         s("warm"),
         s("ostree"),
@@ -698,7 +687,11 @@ mod tests {
         )
         .unwrap();
         let warm = survey(&root, &sources, &ostree, &["firefox"]).unwrap();
-        assert!(warm.is_empty(), "completed exact graph stayed cold: {}", warm.describe());
+        assert!(
+            warm.is_empty(),
+            "completed exact graph stayed cold: {}",
+            warm.describe()
+        );
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&sources);
     }
@@ -706,8 +699,8 @@ mod tests {
     #[test]
     fn marker_complete_unadmitted_cache_is_selected_for_offline_repair() {
         let root = scratch("ostree-repair");
-        let pin = td_recipe::ostree_pins::by_key("firefox-154-source")
-            .expect("reviewed Firefox pin");
+        let pin =
+            td_recipe::ostree_pins::by_key("firefox-154-source").expect("reviewed Firefox pin");
         fs::create_dir_all(root.join("objects/00")).unwrap();
         fs::write(root.join("graph.v1"), b"manifest naming a corrupt object").unwrap();
         fs::write(root.join("objects/00/corrupt.filez"), b"corrupt").unwrap();
@@ -731,8 +724,7 @@ mod tests {
         assert!(WarmMode::Explicit.verifies_all_ostree());
         assert!(!WarmMode::Automatic.verifies_all_ostree());
         let runner = include_str!("check_runner.rs");
-        let wiring =
-            "crate::warm::preflight(&runner, &targets, crate::warm::WarmMode::Explicit)";
+        let wiring = "crate::warm::preflight(&runner, &targets, crate::warm::WarmMode::Explicit)";
         // Two call sites, and both are commands whose operator asked for the
         // fetch: `warm` itself, and `bundle`, which is built to run unattended
         // and so cannot lean on the terminal-gated automatic warm — a
@@ -747,8 +739,8 @@ mod tests {
     fn ostree_warm_argv_refuses_lossy_cache_paths() {
         use std::os::unix::ffi::OsStringExt;
 
-        let pin = td_recipe::ostree_pins::by_key("firefox-154-source")
-            .expect("reviewed Firefox pin");
+        let pin =
+            td_recipe::ostree_pins::by_key("firefox-154-source").expect("reviewed Firefox pin");
         let args = ostree_warm_args(&pin, Path::new("/cache/firefox")).unwrap();
         assert_eq!(
             args,
@@ -809,13 +801,7 @@ mod tests {
         // Crates alone are an INTERRUPTED warm — td-feed publishes the marker
         // last — and must still read cold, or the repair is skipped and the
         // build fails the vendor gate instead.
-        let partial = survey(
-            &root,
-            &sources,
-            &root.join("ostree"),
-            &["system-x86-64"],
-        )
-        .unwrap();
+        let partial = survey(&root, &sources, &root.join("ostree"), &["system-x86-64"]).unwrap();
         assert_eq!(
             partial.vendors.len(),
             cold.vendors.len(),
@@ -841,13 +827,7 @@ mod tests {
             let digest = td_engine::sha256::sha256_file(&lock).unwrap();
             fs::write(vendor.join(".warm-complete"), format!("{digest}\n1\n")).unwrap();
         }
-        let after = survey(
-            &root,
-            &sources,
-            &root.join("ostree"),
-            &["system-x86-64"],
-        )
-        .unwrap();
+        let after = survey(&root, &sources, &root.join("ostree"), &["system-x86-64"]).unwrap();
         assert!(
             after.is_empty(),
             "still cold after caching every declared input: {}",
@@ -897,7 +877,10 @@ mod tests {
         let mut recipe = td_recipe::catalog::lookup("uutils").unwrap();
         recipe.version = "wrong-version".into();
         let error = vendor_warm_plan(&recipe, "uutils").unwrap_err();
-        assert!(error.contains("is not `<name>-wrong-version.crate'"), "{error}");
+        assert!(
+            error.contains("is not `<name>-wrong-version.crate'"),
+            "{error}"
+        );
     }
 
     // The vendor warms the distro's closure needs from recipe metadata rather
@@ -941,8 +924,12 @@ mod tests {
             "codex declares a committed lock but is not in the default graph: {locked:?}"
         );
         let lines = vendor_warm_lines(&graph).unwrap();
-        assert!(lines.iter().any(|line| line == "warm\tcrate-local\tnet\ttd-net\tnet/Cargo.lock"),
-            "the builder's early td-net warm must match its recipe-owned plan");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "warm\tcrate-local\tnet\ttd-net\tnet/Cargo.lock"),
+            "the builder's early td-net warm must match its recipe-owned plan"
+        );
         for stem in &locked {
             assert!(
                 lines.iter().any(|line| {
@@ -1021,7 +1008,10 @@ mod tests {
     fn a_derived_vendor_warm_line_is_tab_joined_with_the_stem_then_the_lock() {
         let graph = recipe_closure(&["system-x86-64"]).unwrap();
         let lines = vendor_warm_lines(&graph).unwrap();
-        assert!(!lines.is_empty(), "the default graph derives no vendor warm");
+        assert!(
+            !lines.is_empty(),
+            "the default graph derives no vendor warm"
+        );
         for line in &lines {
             let fields: Vec<&str> = line.split('\t').collect();
             assert!(

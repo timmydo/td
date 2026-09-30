@@ -108,7 +108,9 @@ pub fn raw(tty: BorrowedFd<'_>) -> io::Result<Raw<'_>> {
     // only ever fire on bytes this function handed back verbatim.
     if !only_the_patch_changed(&got, &saved) {
         let _ = sys::termios_set(fd, &saved);
-        return Err(io::Error::other("terminal changed more than raw mode asked for"));
+        return Err(io::Error::other(
+            "terminal changed more than raw mode asked for",
+        ));
     }
     Ok(Raw { fd: tty, saved })
 }
@@ -127,10 +129,7 @@ pub fn size(tty: BorrowedFd<'_>) -> Option<(u16, u16)> {
 }
 
 /// Whether `got` differs from `saved` ONLY where the patch was applied.
-fn only_the_patch_changed(
-    got: &[u8; sys::TERMIOS_LEN],
-    saved: &[u8; sys::TERMIOS_LEN],
-) -> bool {
+fn only_the_patch_changed(got: &[u8; sys::TERMIOS_LEN], saved: &[u8; sys::TERMIOS_LEN]) -> bool {
     for i in 0..sys::TERMIOS_LEN {
         let patched =
             (LFLAG_AT..LFLAG_AT + 4).contains(&i) || i == CC_AT + VMIN || i == CC_AT + VTIME;
@@ -209,14 +208,17 @@ mod tests {
         set_cc(&mut want, VMIN, 1);
         set_cc(&mut want, VTIME, 0);
 
-        assert_eq!(read_u32(&want, LFLAG_AT) & (ICANON | ECHO), 0, "the bits cleared");
+        assert_eq!(
+            read_u32(&want, LFLAG_AT) & (ICANON | ECHO),
+            0,
+            "the bits cleared"
+        );
         assert_eq!(want.get(CC_AT + VMIN), Some(&1u8));
         assert_eq!(want.get(CC_AT + VTIME), Some(&0u8));
         // Every byte outside c_lflag and those two c_cc slots is untouched.
         for i in 0..sys::TERMIOS_LEN {
-            let touched = (LFLAG_AT..LFLAG_AT + 4).contains(&i)
-                || i == CC_AT + VMIN
-                || i == CC_AT + VTIME;
+            let touched =
+                (LFLAG_AT..LFLAG_AT + 4).contains(&i) || i == CC_AT + VMIN || i == CC_AT + VTIME;
             if !touched {
                 assert_eq!(want.get(i), original.get(i), "byte {i} must not change");
             }
@@ -297,7 +299,11 @@ mod tests {
         let mut built = [0u8; sys::TERMIOS_LEN];
         set_cc(&mut built, VMIN, 1);
         set_cc(&mut built, VTIME, 0);
-        assert_eq!(read_u32(&built, LFLAG_AT) & (ICANON | ECHO), 0, "the flag check passes");
+        assert_eq!(
+            read_u32(&built, LFLAG_AT) & (ICANON | ECHO),
+            0,
+            "the flag check passes"
+        );
         assert_eq!(built.get(CC_AT + VMIN), Some(&1), "the VMIN check passes");
         assert!(
             !only_the_patch_changed(&built, &saved),

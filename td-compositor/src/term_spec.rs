@@ -1031,7 +1031,8 @@ fn run_case(case: &Case, chunking: Chunking) -> Result<CaseRun, String> {
             }
             Step::Expect(expected) => {
                 expectation = expectation.saturating_add(1);
-                if let Err(error) = check_expectation(case, &terminal, &input, &viewport, expected) {
+                if let Err(error) = check_expectation(case, &terminal, &input, &viewport, expected)
+                {
                     mismatches.push(Mismatch {
                         gap: Gap {
                             case: case.id.clone(),
@@ -1449,13 +1450,11 @@ fn assert_terminal_invariants(terminal: &Terminal) {
             screen.history.storage_bytes()
                 <= MAX_HISTORY_BYTES.saturating_sub(HISTORY_ALLOCATOR_MARGIN)
         );
-        assert!(
-            screen
-                .history
-                .lines
-                .iter()
-                .all(|line| line.start < screen.history.max_cells)
-        );
+        assert!(screen
+            .history
+            .lines
+            .iter()
+            .all(|line| line.start < screen.history.max_cells));
     }
     assert!(terminal.replies().len() <= MAX_REPLY_BYTES);
 }
@@ -1494,7 +1493,10 @@ fn the_push_counter_outruns_the_lines_history_still_holds() {
     );
     assert_eq!(viewport.offset(scrollback(&terminal)), lines);
     terminal.feed(&row);
-    assert_eq!(viewport.offset(scrollback(&terminal)), terminal.history_lines());
+    assert_eq!(
+        viewport.offset(scrollback(&terminal)),
+        terminal.history_lines()
+    );
 }
 
 #[test]
@@ -1509,21 +1511,17 @@ fn history_evicts_whole_non_reflowing_lines_within_its_byte_ceiling() {
     assert!(history.storage_bytes() <= MAX_HISTORY_BYTES.saturating_sub(HISTORY_ALLOCATOR_MARGIN));
     assert!(history.cells <= MAX_HISTORY_CELLS);
     assert_eq!(history.cells % width, 0);
-    assert!(
-        history
-            .lines
-            .iter()
-            .all(|line| line.length == width && line.wrapped)
-    );
+    assert!(history
+        .lines
+        .iter()
+        .all(|line| line.length == width && line.wrapped));
     terminal.resize(1, 64).unwrap();
-    assert!(
-        terminal
-            .primary
-            .history
-            .lines
-            .iter()
-            .all(|line| line.length == width)
-    );
+    assert!(terminal
+        .primary
+        .history
+        .lines
+        .iter()
+        .all(|line| line.length == width));
 }
 
 #[test]
@@ -1609,48 +1607,36 @@ fn deterministic_arbitrary_bytes_are_total_bounded_and_chunk_invariant() {
 #[test]
 fn corpus_parser_rejects_silent_coverage_loss() {
     let unknown = "case parser/unknown\nsource td\ntags core\nsize 1 1\nwat b\"x\"\nend\n";
-    assert!(
-        parse_file("bad.term", unknown)
-            .unwrap_err()
-            .contains("unknown statement")
-    );
+    assert!(parse_file("bad.term", unknown)
+        .unwrap_err()
+        .contains("unknown statement"));
 
     let unknown_tag = "case parser/tag\nsource td\ntags surprise\nsize 1 1\nwrite b\"x\"\nexpect row 0 \"x\"\nend\n";
-    assert!(
-        parse_file("bad.term", unknown_tag)
-            .unwrap_err()
-            .contains("unknown feature tag")
-    );
+    assert!(parse_file("bad.term", unknown_tag)
+        .unwrap_err()
+        .contains("unknown feature tag"));
 
     let bad_escape = "case parser/escape\nsource td\ntags core\nsize 1 1\nwrite b\"\\q\"\nexpect row 0 \"x\"\nend\n";
-    assert!(
-        parse_file("bad.term", bad_escape)
-            .unwrap_err()
-            .contains("unsupported escape")
-    );
+    assert!(parse_file("bad.term", bad_escape)
+        .unwrap_err()
+        .contains("unsupported escape"));
 
     let missing_tags =
         "case parser/tags\nsource td\nsize 1 1\nwrite b\"x\"\nexpect row 0 \"x\"\nend\n";
-    assert!(
-        parse_file("bad.term", missing_tags)
-            .unwrap_err()
-            .contains("has no feature tags")
-    );
+    assert!(parse_file("bad.term", missing_tags)
+        .unwrap_err()
+        .contains("has no feature tags"));
 
     let escaped_grid = "case parser/grid\nsource td\ntags core\nsize 1 2\nwrite b\"x\"\nexpect cell 1 0 \"x\" fg=default bg=default attrs=none\nend\n";
-    assert!(
-        parse_file("bad.term", escaped_grid)
-            .unwrap_err()
-            .contains("escapes 1x2")
-    );
+    assert!(parse_file("bad.term", escaped_grid)
+        .unwrap_err()
+        .contains("escapes 1x2"));
 
     let short_row =
         "case parser/row\nsource td\ntags core\nsize 1 2\nwrite b\"x\"\nexpect row 0 \"x\"\nend\n";
-    assert!(
-        parse_file("bad.term", short_row)
-            .unwrap_err()
-            .contains("has 1 cells for a 2-column grid")
-    );
+    assert!(parse_file("bad.term", short_row)
+        .unwrap_err()
+        .contains("has 1 cells for a 2-column grid"));
 
     let long_glyph =
         "case parser/glyph\nsource td\ntags core\nsize 1 2\nwrite b\"x\"\nexpect glyph 0 0 \"xy\"\nend\n";
@@ -1684,7 +1670,8 @@ fn corpus_parser_rejects_silent_coverage_loss() {
         .unwrap_err()
         .contains("key precedes size"));
 
-    let bad_input = "case parser/input\nsource td\ntags core input\nsize 1 1\nkey a\nexpect input \"a\"\nend\n";
+    let bad_input =
+        "case parser/input\nsource td\ntags core input\nsize 1 1\nkey a\nexpect input \"a\"\nend\n";
     assert!(parse_file("bad.term", bad_input)
         .unwrap_err()
         .contains("byte literal"));

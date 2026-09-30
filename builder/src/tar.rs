@@ -56,7 +56,10 @@ impl TempTree {
                 dest.display()
             )
         })?;
-        if let Some(parent) = dest.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = dest
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent).map_err(|e| {
                 format!(
                     "create destination parent {} for temporary extraction: {e}",
@@ -221,7 +224,9 @@ pub fn unpack_archive(tarball: &Path, dest: &Path, keep_top: bool) -> Result<(),
     let extract_into = |d: &Path| -> Result<(), String> {
         let mut f = File::open(tarball).map_err(|e| format!("open {}: {e}", tarball.display()))?;
         let mut magic = [0u8; 6];
-        let n = f.read(&mut magic).map_err(|e| format!("read {}: {e}", tarball.display()))?;
+        let n = f
+            .read(&mut magic)
+            .map_err(|e| format!("read {}: {e}", tarball.display()))?;
         match magic.get(..n).unwrap_or(&[]) {
             [0x1f, 0x8b, ..] => extract_tar_gz(tarball, d),
             [b'B', b'Z', b'h', ..] => extract_tar_bz2(tarball, d),
@@ -365,9 +370,8 @@ pub fn extract_tar_reader<R: Read>(
                 // we still parse the stream so a global `size` or `path`/
                 // `linkpath` default we cannot faithfully honour reds the unpack
                 // rather than being silently ignored.
-                let records = read_entry_bytes(file, entry.size).map_err(|e| {
-                    format!("read pax global header {}: {e}", entry.path.display())
-                })?;
+                let records = read_entry_bytes(file, entry.size)
+                    .map_err(|e| format!("read pax global header {}: {e}", entry.path.display()))?;
                 apply_pax(&records, true, &mut pending_path, &mut pending_link)?;
                 skip_padding(file, entry.size)
                     .map_err(|e| format!("skip padding after {}: {e}", entry.path.display()))?;
@@ -542,11 +546,7 @@ fn validate_zero_padding<R: Read>(file: &mut R, source_name: &str) -> Result<(),
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => {
-                return Err(format!(
-                    "read trailing tar padding from {source_name}: {e}"
-                ))
-            }
+            Err(e) => return Err(format!("read trailing tar padding from {source_name}: {e}")),
         }
     }
 }
@@ -958,8 +958,8 @@ fn apply_pax(
             .position(|b| *b == b' ')
             .ok_or_else(|| "pax record missing length separator".to_string())?;
         let len_bytes = rest.get(..space).unwrap_or(&[]);
-        let len_str =
-            std::str::from_utf8(len_bytes).map_err(|_| "pax record length is not ascii".to_string())?;
+        let len_str = std::str::from_utf8(len_bytes)
+            .map_err(|_| "pax record length is not ascii".to_string())?;
         let rec_len = len_str
             .parse::<usize>()
             .map_err(|_| format!("pax record has a bad length `{len_str}`"))?;
@@ -988,7 +988,8 @@ fn apply_pax(
         match key {
             b"size" => {
                 return Err(
-                    "pax `size` override is unsupported (would desync the entry stream)".to_string(),
+                    "pax `size` override is unsupported (would desync the entry stream)"
+                        .to_string(),
                 );
             }
             b"path" if !global => set_or_clear(pending_path, value)?,
@@ -1069,19 +1070,18 @@ mod tests {
         // complete tar stream, so extraction has created the entry before the
         // decoder discovers the corruption.
         let mut archive = [
-            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46,
-            0x02, 0x00, 0x21, 0x01, 0x0c, 0x00, 0x00, 0x00, 0x8f, 0x98, 0x41, 0x9c,
-            0xe0, 0x27, 0xff, 0x00, 0x5c, 0x5d, 0x00, 0x3b, 0x1a, 0x4a, 0xcd, 0x37,
-            0xbe, 0xc0, 0x61, 0xb2, 0x3a, 0x7a, 0xf5, 0x32, 0xe0, 0xa9, 0x81, 0xd3,
-            0x13, 0xd9, 0x3e, 0x5f, 0xc4, 0x81, 0x95, 0xb8, 0xa4, 0x8c, 0xc1, 0xfb,
-            0x85, 0x1d, 0xe8, 0xbc, 0x8f, 0xbc, 0x0e, 0xf7, 0x81, 0x50, 0xa0, 0xf2,
-            0x60, 0xdd, 0xd1, 0xbb, 0x8c, 0x92, 0xa9, 0x86, 0x5d, 0x72, 0x0f, 0xd1,
-            0x80, 0x64, 0x10, 0xe1, 0xc5, 0xc8, 0x47, 0x0e, 0x1a, 0x06, 0xe5, 0xcf,
-            0xec, 0xbc, 0x6e, 0x7e, 0x11, 0xfb, 0xfe, 0xda, 0x5b, 0xd8, 0x0c, 0x88,
-            0xf8, 0xe7, 0x30, 0x79, 0x09, 0xc6, 0x2b, 0x6f, 0xa9, 0x23, 0x4e, 0xfd,
-            0xd1, 0x7a, 0x00, 0x00, 0xcd, 0xa5, 0x88, 0x7d, 0xee, 0x27, 0x1e, 0xeb,
-            0x00, 0x01, 0x78, 0x80, 0x50, 0x00, 0x00, 0x00, 0x41, 0xe4, 0xcf, 0x5e,
-            0xb1, 0xc4, 0x67, 0xfb, 0x02, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5a,
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x02, 0x00,
+            0x21, 0x01, 0x0c, 0x00, 0x00, 0x00, 0x8f, 0x98, 0x41, 0x9c, 0xe0, 0x27, 0xff, 0x00,
+            0x5c, 0x5d, 0x00, 0x3b, 0x1a, 0x4a, 0xcd, 0x37, 0xbe, 0xc0, 0x61, 0xb2, 0x3a, 0x7a,
+            0xf5, 0x32, 0xe0, 0xa9, 0x81, 0xd3, 0x13, 0xd9, 0x3e, 0x5f, 0xc4, 0x81, 0x95, 0xb8,
+            0xa4, 0x8c, 0xc1, 0xfb, 0x85, 0x1d, 0xe8, 0xbc, 0x8f, 0xbc, 0x0e, 0xf7, 0x81, 0x50,
+            0xa0, 0xf2, 0x60, 0xdd, 0xd1, 0xbb, 0x8c, 0x92, 0xa9, 0x86, 0x5d, 0x72, 0x0f, 0xd1,
+            0x80, 0x64, 0x10, 0xe1, 0xc5, 0xc8, 0x47, 0x0e, 0x1a, 0x06, 0xe5, 0xcf, 0xec, 0xbc,
+            0x6e, 0x7e, 0x11, 0xfb, 0xfe, 0xda, 0x5b, 0xd8, 0x0c, 0x88, 0xf8, 0xe7, 0x30, 0x79,
+            0x09, 0xc6, 0x2b, 0x6f, 0xa9, 0x23, 0x4e, 0xfd, 0xd1, 0x7a, 0x00, 0x00, 0xcd, 0xa5,
+            0x88, 0x7d, 0xee, 0x27, 0x1e, 0xeb, 0x00, 0x01, 0x78, 0x80, 0x50, 0x00, 0x00, 0x00,
+            0x41, 0xe4, 0xcf, 0x5e, 0xb1, 0xc4, 0x67, 0xfb, 0x02, 0x00, 0x00, 0x00, 0x00, 0x04,
+            0x59, 0x5a,
         ];
         let Some(check_byte) = archive.get_mut(124) else {
             panic!("fixture must contain its block check");
@@ -1097,8 +1097,14 @@ mod tests {
         let err = extract_tar_xz(&source, &dest).expect_err("bad XZ check must red");
 
         assert!(err.contains("CRC64 mismatch"), "got: {err}");
-        assert!(source.is_file(), "temporary allocation deleted the input archive");
-        assert!(!dest.exists(), "unverified destination must not be published");
+        assert!(
+            source.is_file(),
+            "temporary allocation deleted the input archive"
+        );
+        assert!(
+            !dest.exists(),
+            "unverified destination must not be published"
+        );
         let leaked_temp = fs::read_dir(&tmp).unwrap().flatten().any(|entry| {
             entry
                 .file_name()
@@ -1347,8 +1353,14 @@ mod tests {
 
         extract_tar(&tar, &out).unwrap();
 
-        let generated = fs::metadata(out.join("c-parse.c")).unwrap().modified().unwrap();
-        let source = fs::metadata(out.join("c-parse.y")).unwrap().modified().unwrap();
+        let generated = fs::metadata(out.join("c-parse.c"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let source = fs::metadata(out.join("c-parse.y"))
+            .unwrap()
+            .modified()
+            .unwrap();
         assert!(
             generated > source,
             "generated parser must stay newer than its source"
@@ -1472,7 +1484,10 @@ mod tests {
         // following it would hoist files out of the link's target tree.
         let err = unpack_archive(&tar, &dest, false).expect_err("symlink top must red");
 
-        assert!(err.contains("exactly one top-level directory"), "got: {err}");
+        assert!(
+            err.contains("exactly one top-level directory"),
+            "got: {err}"
+        );
         assert!(outside.join("keep").exists());
     }
 

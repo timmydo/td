@@ -307,9 +307,7 @@ mod tests {
         let request = AssertionRequest::new(&[7], [3; 32], 1024).unwrap();
         let mut expected = b"\x02\xa4\x01\x6atd.invalid\x02\x58\x20".to_vec();
         expected.extend([3; 32]);
-        expected.extend(
-            b"\x03\x81\xa2\x62id\x41\x07\x64type\x6apublic-key\x05\xa1\x62up\xf5",
-        );
+        expected.extend(b"\x03\x81\xa2\x62id\x41\x07\x64type\x6apublic-key\x05\xa1\x62up\xf5");
         assert_eq!(request.bytes(), expected);
         assert!(AssertionRequest::new(&[], [0; 32], 1024).is_err());
         assert!(AssertionRequest::new(&[0; 1025], [0; 32], 7609).is_err());

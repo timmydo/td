@@ -115,7 +115,9 @@ impl TargetDisk {
 }
 
 fn writable_media_bytes(source_bytes: u64) -> Result<u64, String> {
-    source_bytes.max(MINIMUM_TARGET_BYTES).checked_add(511)
+    source_bytes
+        .max(MINIMUM_TARGET_BYTES)
+        .checked_add(511)
         .map(|bytes| bytes & !511)
         .ok_or_else(|| "writable USB fixture capacity overflows sector alignment".into())
 }
@@ -237,7 +239,9 @@ struct LiveInstaller {
 impl LiveInstaller {
     fn load(runner: &RecipeCheckRunner, trust: &RunTrust) -> Result<Self, String> {
         let outputs = runner.build_and_stage("td-install-qemu-test", OUTPUTS)?;
-        let [probe, linux, installer, firstboot, init, boot, kexec, btrfs, tzdata] = outputs.as_slice() else {
+        let [probe, linux, installer, firstboot, init, boot, kexec, btrfs, tzdata] =
+            outputs.as_slice()
+        else {
             return Err("installation fixture output roster mismatch".into());
         };
         let kernel = linux.join("bzImage");
@@ -255,7 +259,11 @@ impl LiveInstaller {
             common.push((name.to_owned(), 0o755, read(&source)?));
         }
         let mut extra = vec![
-            ("bin/td-firstboot".into(), 0o755, read(&firstboot.join("bin/td-firstboot"))?),
+            (
+                "bin/td-firstboot".into(),
+                0o755,
+                read(&firstboot.join("bin/td-firstboot"))?,
+            ),
             (
                 "bin/td-install".into(),
                 0o755,
@@ -425,7 +433,11 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 &scratch.dir,
                 timeout,
             )?;
-            require(&result, protocol::REFUSAL_COMPLETE_MARKER, "refusal completion")?;
+            require(
+                &result,
+                protocol::REFUSAL_COMPLETE_MARKER,
+                "refusal completion",
+            )?;
             require(&result, refused, "duplicate volume refusal")?;
             if result.evidence.selected_current || result.evidence.selected_previous {
                 return Err("ambiguous volume reached deployment selection".into());
@@ -614,7 +626,10 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         }
     }
     let limited_live = scratch.dir.join("limited-scratch.cpio");
-    write(&limited_live, &initramfs(&base, &common, "install-scratch\n", &extra)?)?;
+    write(
+        &limited_live,
+        &initramfs(&base, &common, "install-scratch\n", &extra)?,
+    )?;
     let limited_iso = scratch.dir.join("limited-scratch.iso");
     media::write_image_with_payloads(&limited_iso, &kernel, &limited_live, &payloads)?;
     for (name, attachment, source_device) in [
@@ -626,7 +641,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         let before = target.fingerprint()?;
         let vars = scratch.dir.join(format!("scratch-{name}-vars.fd"));
         efi::copy_input(&vars_template, &vars)?;
-        println!("   [qemu-install] refusing exhausted scratch through {name} media before disk writes");
+        println!(
+            "   [qemu-install] refusing exhausted scratch through {name} media before disk writes"
+        );
         let refused = boot_source(
             &qemu,
             BootSource::Firmware {
@@ -647,18 +664,31 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         }
         validate_scratch_refusal(&refused, source_device)?;
         require_live_reports(
-            &refused, &target, source_device, &limited_iso, false, InventoryBefore::Fresh, Some(&id),
+            &refused,
+            &target,
+            source_device,
+            &limited_iso,
+            false,
+            InventoryBefore::Fresh,
+            Some(&id),
         )?;
     }
     let protected_live = scratch.dir.join("protected-media.cpio");
-    write(&protected_live, &initramfs(&base, &common, "protect-media\n", &extra)?)?;
+    write(
+        &protected_live,
+        &initramfs(&base, &common, "protect-media\n", &extra)?,
+    )?;
     let protected_iso = scratch.dir.join("protected-media.iso");
     media::write_image_with_payloads(&protected_iso, &kernel, &protected_live, &payloads)?;
     // Model flashing an ISO onto a larger thumbdrive, with usable geometry.
-    let medium = OpenOptions::new().write(true).open(&protected_iso)
+    let medium = OpenOptions::new()
+        .write(true)
+        .open(&protected_iso)
         .map_err(|error| format!("open private writable USB image: {error}"))?;
     let bytes = writable_media_bytes(medium.metadata().map_err(|error| error.to_string())?.len())?;
-    medium.set_len(bytes).and_then(|()| medium.sync_all())
+    medium
+        .set_len(bytes)
+        .and_then(|()| medium.sync_all())
         .map_err(|error| format!("pad private writable USB image: {error}"))?;
     drop(medium);
     let target = TargetDisk::create(&scratch.dir, "protected-media-target.img")?;
@@ -670,7 +700,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let target_before = target.fingerprint()?;
     let vars = scratch.dir.join("protected-media-vars.fd");
     efi::copy_input(&vars_template, &vars)?;
-    println!("   [qemu-install] refusing raw formatting of mounted writable USB installation media");
+    println!(
+        "   [qemu-install] refusing raw formatting of mounted writable USB installation media"
+    );
     let protected = boot_source(
         &qemu,
         BootSource::Firmware {
@@ -683,20 +715,30 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         &scratch.dir,
         timeout,
     )?;
-    if image_fingerprint(&protected_iso)? != source_before || target.fingerprint()? != target_before {
-        return Err(format!("writable-media claim test changed source or target bytes\n{}", tail(&protected.console, 80)));
+    if image_fingerprint(&protected_iso)? != source_before || target.fingerprint()? != target_before
+    {
+        return Err(format!(
+            "writable-media claim test changed source or target bytes\n{}",
+            tail(&protected.console, 80)
+        ));
     }
     validate_media_protection(&protected)?;
-    validate_live_reports(&protected, &InventoryExpected {
-        target_bytes: target_before.0,
-        source_bytes: source_before.0,
-        source_read_only: false,
-        sector_bytes: 512,
-        read_only: false,
-        source_name: "sda",
-        target_name: "vda",
-        before: InventoryBefore::Fresh,
-    }, false, false, None)?;
+    validate_live_reports(
+        &protected,
+        &InventoryExpected {
+            target_bytes: target_before.0,
+            source_bytes: source_before.0,
+            source_read_only: false,
+            sector_bytes: 512,
+            read_only: false,
+            source_name: "sda",
+            target_name: "vda",
+            before: InventoryBefore::Fresh,
+        },
+        false,
+        false,
+        None,
+    )?;
     let refuse = |case: &str, image: &Path, diagnostic: &str| -> Result<(), String> {
         for (name, attachment, source_device) in [
             ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
@@ -727,7 +769,11 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                     tail(&refused.console, 80)
                 ));
             }
-            require(&refused, protocol::REFUSAL_COMPLETE_MARKER, "refusal completion")?;
+            require(
+                &refused,
+                protocol::REFUSAL_COMPLETE_MARKER,
+                "refusal completion",
+            )?;
             require(
                 &refused,
                 &format!("{} {source_device}", protocol::MEDIA_MARKER),
@@ -993,7 +1039,12 @@ fn inventory_snapshot(
             expected.target_bytes,
             expected.read_only,
         ),
-        (expected.source_name, source, expected.source_bytes, expected.source_read_only),
+        (
+            expected.source_name,
+            source,
+            expected.source_bytes,
+            expected.source_read_only,
+        ),
     ] {
         report_expect_number(device, name, "capacity_bytes", capacity)?;
         report_expect_field(device, name, "read_only", &Json::Bool(read_only))?;
@@ -1282,15 +1333,23 @@ fn validate_candidate_record(console: &str, attempted: bool) -> Result<(), Strin
     }
 }
 
-fn validate_plan_observation(console: &str, expected: &InventoryExpected<'_>, partitioned: bool, attempted: bool, source_id: Option<&str>) -> Result<(), String> {
+fn validate_plan_observation(
+    console: &str,
+    expected: &InventoryExpected<'_>,
+    partitioned: bool,
+    attempted: bool,
+    source_id: Option<&str>,
+) -> Result<(), String> {
     if !attempted {
-        if console.lines().any(|line| line.starts_with(protocol::PLAN_OBSERVATION_MARKER)
-            || line.trim_end() == protocol::PLAN_STALE_MARKER
-            || line.trim_end() == protocol::PLAN_BUSY_MARKER
-            || line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
-            || line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER
-            || line.trim_end() == protocol::SOURCE_PLAN_BUSY_MARKER
-            || line.trim_end() == protocol::SOURCE_PLAN_CLAIM_MARKER) {
+        if console.lines().any(|line| {
+            line.starts_with(protocol::PLAN_OBSERVATION_MARKER)
+                || line.trim_end() == protocol::PLAN_STALE_MARKER
+                || line.trim_end() == protocol::PLAN_BUSY_MARKER
+                || line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
+                || line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER
+                || line.trim_end() == protocol::SOURCE_PLAN_BUSY_MARKER
+                || line.trim_end() == protocol::SOURCE_PLAN_CLAIM_MARKER
+        }) {
             return Err("plan observation ran for an unavailable target".into());
         }
         return Ok(());
@@ -1308,7 +1367,8 @@ fn validate_plan_observation(console: &str, expected: &InventoryExpected<'_>, pa
     if let Some(expected_id) = source_id {
         let source = diagnostic_frame(console, protocol::SOURCE_PLAN_OBSERVATION_MARKER, 256)?;
         if report_number(&source, "version")? != 1
-            || report_field(&source, "scope")?.as_str() != Some("held-source-plan-observation-only") {
+            || report_field(&source, "scope")?.as_str() != Some("held-source-plan-observation-only")
+        {
             return Err("source plan observation has wrong version or scope".into());
         }
         if report_field(&source, "destination")?.as_str() != Some(expected.target_name) {
@@ -1317,25 +1377,52 @@ fn validate_plan_observation(console: &str, expected: &InventoryExpected<'_>, pa
         if report_field(&source, "deployment")?.as_str() != Some(expected_id) {
             return Err("source plan report differs from fixture manifest ID".into());
         }
-        if console.lines().filter(|line| line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER).count() != 1 {
+        if console
+            .lines()
+            .filter(|line| line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER)
+            .count()
+            != 1
+        {
             return Err("stale source plan refusal has no unique completion marker".into());
         }
-        if console.lines().filter(|line| line.trim_end() == protocol::SOURCE_PLAN_CLAIM_MARKER).count() != 1 {
+        if console
+            .lines()
+            .filter(|line| line.trim_end() == protocol::SOURCE_PLAN_CLAIM_MARKER)
+            .count()
+            != 1
+        {
             return Err("source plan validation has no unique held-claim probe marker".into());
         }
-        if console.lines().filter(|line| line.trim_end() == protocol::SOURCE_PLAN_BUSY_MARKER).count() != usize::from(partitioned) {
+        if console
+            .lines()
+            .filter(|line| line.trim_end() == protocol::SOURCE_PLAN_BUSY_MARKER)
+            .count()
+            != usize::from(partitioned)
+        {
             return Err("busy source plan refusal has an unexpected completion marker".into());
         }
-    } else if console.lines().any(|line| line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
-        || line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER
-        || line.trim_end() == protocol::SOURCE_PLAN_BUSY_MARKER
-        || line.trim_end() == protocol::SOURCE_PLAN_CLAIM_MARKER) {
+    } else if console.lines().any(|line| {
+        line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
+            || line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER
+            || line.trim_end() == protocol::SOURCE_PLAN_BUSY_MARKER
+            || line.trim_end() == protocol::SOURCE_PLAN_CLAIM_MARKER
+    }) {
         return Err("source plan observation ran without a validated source".into());
     }
-    if console.lines().filter(|line| line.trim_end() == protocol::PLAN_STALE_MARKER).count() != 1 {
+    if console
+        .lines()
+        .filter(|line| line.trim_end() == protocol::PLAN_STALE_MARKER)
+        .count()
+        != 1
+    {
         return Err("stale plan refusal has no unique completion marker".into());
     }
-    if console.lines().filter(|line| line.trim_end() == protocol::PLAN_BUSY_MARKER).count() != usize::from(partitioned) {
+    if console
+        .lines()
+        .filter(|line| line.trim_end() == protocol::PLAN_BUSY_MARKER)
+        .count()
+        != usize::from(partitioned)
+    {
         return Err("busy plan refusal has an unexpected completion marker".into());
     }
     Ok(())
@@ -1364,8 +1451,8 @@ fn require_live_reports(
         target_name: target.bus.name(false),
         before,
     };
-    let plan_expected = !target.read_only
-        && expected.target_bytes >= protocol::PLAN_PROBE_MINIMUM_SECTORS * 512;
+    let plan_expected =
+        !target.read_only && expected.target_bytes >= protocol::PLAN_PROBE_MINIMUM_SECTORS * 512;
     validate_live_reports(result, &expected, partitioned, plan_expected, source_id)
 }
 
@@ -1388,13 +1475,19 @@ fn validate_live_reports(
             tail(&result.console, 80)
         )
     })?;
-    validate_storage_reports(&result.console, expected, partitioned, plan_expected, source_id)
-        .map_err(|error| {
-            format!(
-                "installer storage reports: {error}\n{}",
-                tail(&result.console, 80)
-            )
-        })
+    validate_storage_reports(
+        &result.console,
+        expected,
+        partitioned,
+        plan_expected,
+        source_id,
+    )
+    .map_err(|error| {
+        format!(
+            "installer storage reports: {error}\n{}",
+            tail(&result.console, 80)
+        )
+    })
 }
 
 fn validate_storage_reports(
@@ -1407,7 +1500,9 @@ fn validate_storage_reports(
     validate_inventories(console, expected, partitioned)
         .and_then(|()| validate_candidates(console, expected, partitioned))
         .and_then(|()| validate_candidate_record(console, plan_expected))
-        .and_then(|()| validate_plan_observation(console, expected, partitioned, plan_expected, source_id))
+        .and_then(|()| {
+            validate_plan_observation(console, expected, partitioned, plan_expected, source_id)
+        })
 }
 
 fn refusal_plan(image: &Path) -> BootPlan<'_> {
@@ -1417,31 +1512,75 @@ fn refusal_plan(image: &Path) -> BootPlan<'_> {
 fn validate_media_protection(result: &BootResult) -> Result<(), String> {
     let media = format!("{} /dev/sda", protocol::MEDIA_MARKER);
     require(result, &media, "read-only payload access")?;
-    let media_records: Vec<_> = result.console.lines().map(str::trim_end)
-        .filter(|line| line.starts_with(protocol::MEDIA_MARKER)).collect();
-    require(result, protocol::MEDIA_BUSY_MARKER, "mounted source formatter refusals")?;
-    require(result, protocol::MEDIA_RELEASED_MARKER, "released source exclusive claim")?;
-    let sequence: Vec<_> = result.console.lines().map(str::trim_end)
-        .filter(|line| matches!(*line, protocol::MEDIA_BUSY_MARKER | protocol::MEDIA_RELEASED_MARKER))
+    let media_records: Vec<_> = result
+        .console
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| line.starts_with(protocol::MEDIA_MARKER))
+        .collect();
+    require(
+        result,
+        protocol::MEDIA_BUSY_MARKER,
+        "mounted source formatter refusals",
+    )?;
+    require(
+        result,
+        protocol::MEDIA_RELEASED_MARKER,
+        "released source exclusive claim",
+    )?;
+    let sequence: Vec<_> = result
+        .console
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| {
+            matches!(
+                *line,
+                protocol::MEDIA_BUSY_MARKER | protocol::MEDIA_RELEASED_MARKER
+            )
+        })
         .collect();
     if sequence != [protocol::MEDIA_BUSY_MARKER, protocol::MEDIA_RELEASED_MARKER]
         || media_records != [media.as_str()]
-        || !result.evidence.target || !result.marker_killed || result.exited_clean
-        || result.evidence.selected_current || result.evidence.selected_previous
-        || [protocol::PARTITIONS_MARKER, protocol::DIRECT_MARKER, protocol::INSTALL_MARKER,
-            protocol::REFUSED_PREFIX, protocol::REFUSAL_COMPLETE_MARKER]
-            .iter().any(|marker| result.console.contains(marker))
+        || !result.evidence.target
+        || !result.marker_killed
+        || result.exited_clean
+        || result.evidence.selected_current
+        || result.evidence.selected_previous
+        || [
+            protocol::PARTITIONS_MARKER,
+            protocol::DIRECT_MARKER,
+            protocol::INSTALL_MARKER,
+            protocol::REFUSED_PREFIX,
+            protocol::REFUSAL_COMPLETE_MARKER,
+        ]
+        .iter()
+        .any(|marker| result.console.contains(marker))
     {
-        return Err(format!("writable media protection failed: {}\n{}", result.reason, tail(&result.console, 80)));
+        return Err(format!(
+            "writable media protection failed: {}\n{}",
+            result.reason,
+            tail(&result.console, 80)
+        ));
     }
     Ok(())
 }
 
 fn validate_scratch_refusal(result: &BootResult, source_device: &str) -> Result<(), String> {
-    require(result, protocol::SCRATCH_LIMIT_MARKER, "bounded scratch mount")?;
-    require(result, protocol::SCRATCH_EXHAUSTED_MARKER, "scratch ENOSPC probe")?;
+    require(
+        result,
+        protocol::SCRATCH_LIMIT_MARKER,
+        "bounded scratch mount",
+    )?;
+    require(
+        result,
+        protocol::SCRATCH_EXHAUSTED_MARKER,
+        "scratch ENOSPC probe",
+    )?;
     validate_target_refusal(result, source_device, "unable to zero the output file")?;
-    if !result.console.contains("/bin/mkfs.btrfs failed on the scratch image") {
+    if !result
+        .console
+        .contains("/bin/mkfs.btrfs failed on the scratch image")
+    {
         return Err(format!(
             "scratch refusal did not reach the filesystem formatter: {}\n{}",
             result.reason,
@@ -1456,7 +1595,11 @@ fn validate_target_refusal(
     source_device: &str,
     diagnostic: &str,
 ) -> Result<(), String> {
-    require(result, protocol::REFUSAL_COMPLETE_MARKER, "refusal completion")?;
+    require(
+        result,
+        protocol::REFUSAL_COMPLETE_MARKER,
+        "refusal completion",
+    )?;
     require(
         result,
         &format!("{} {source_device}", protocol::MEDIA_MARKER),
@@ -1559,7 +1702,11 @@ fn validate_interruption(
 }
 
 fn validate_interrupted_boot(result: &BootResult, refused: &str, uuid: &str) -> Result<(), String> {
-    require(result, protocol::REFUSAL_COMPLETE_MARKER, "refusal completion")?;
+    require(
+        result,
+        protocol::REFUSAL_COMPLETE_MARKER,
+        "refusal completion",
+    )?;
     require(result, refused, "interrupted installation boot refusal")?;
     if result.evidence.selected_current || result.evidence.selected_previous {
         return Err("incomplete installation reached deployment selection".into());
@@ -1806,12 +1953,13 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             if installations.is_empty() {
                 // Firmware cannot inject autotest tokens. Keep both stock firmware
                 // boots above and add one direct selector boot of that SAME disk.
-                let provisioned = provision_selector_with_uuid(
-                    &selector, &scratch.dir, &trust, Some(&uuid),
-                )?;
+                let provisioned =
+                    provision_selector_with_uuid(&selector, &scratch.dir, &trust, Some(&uuid))?;
                 let app_timeout = boot_timeout();
-                let tokens =
-                    format!("{AUTOTEST_CMDLINE_TOKEN} {}", autotest_wait_token(app_timeout));
+                let tokens = format!(
+                    "{AUTOTEST_CMDLINE_TOKEN} {}",
+                    autotest_wait_token(app_timeout)
+                );
                 let mut app_plan = target_plan(&target, GREETER_MARKER);
                 app_plan.kill_on_marker = false;
                 app_plan.mem = INSTALLED_SYSTEM_MEMORY_MIB;
@@ -1928,10 +2076,17 @@ fn validate_installed_system(
     }
     require_primary_profile(result, protocol::USERNAME)?;
     let expected_hostname = format!("TD-HOSTNAME-READY {}", protocol::HOSTNAME);
-    let hostnames: Vec<_> = result.console.lines().map(str::trim_end)
-        .filter(|line| line.starts_with("TD-HOSTNAME-READY ")).collect();
+    let hostnames: Vec<_> = result
+        .console
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| line.starts_with("TD-HOSTNAME-READY "))
+        .collect();
     if hostnames != [expected_hostname.as_str()] {
-        return Err(format!("installed system did not activate its saved hostname: {hostnames:?}\n{}", tail(&result.console, 100)));
+        return Err(format!(
+            "installed system did not activate its saved hostname: {hostnames:?}\n{}",
+            tail(&result.console, 100)
+        ));
     }
     for (name, present) in [
         ("greeter", result.evidence.greeter),
@@ -2184,10 +2339,16 @@ mod tests {
     fn installed_hostname_requires_exactly_one_verified_saved_name() {
         let good = healthy_system();
         let expected = format!("TD-HOSTNAME-READY {}\n", protocol::HOSTNAME);
-        for replacement in [String::new(), "TD-HOSTNAME-READY td\n".into(), expected.repeat(2)] {
+        for replacement in [
+            String::new(),
+            "TD-HOSTNAME-READY td\n".into(),
+            expected.repeat(2),
+        ] {
             let mut bad = healthy_system();
             bad.console = bad.console.replace(&expected, &replacement);
-            assert!(validate_installed_system(&bad, "uuid", "/dev/vda2", "deployment", true).is_err());
+            assert!(
+                validate_installed_system(&bad, "uuid", "/dev/vda2", "deployment", true).is_err()
+            );
         }
         assert!(validate_installed_system(&good, "uuid", "/dev/vda2", "deployment", true).is_ok());
     }
@@ -2195,12 +2356,25 @@ mod tests {
     #[test]
     fn installed_username_requires_exactly_one_verified_saved_name() {
         let expected = format!("TD-PRIMARY-PROFILE-READY {}\n", protocol::USERNAME);
-        for replacement in [String::new(), "TD-PRIMARY-PROFILE-READY tester\n".into(), expected.repeat(2)] {
+        for replacement in [
+            String::new(),
+            "TD-PRIMARY-PROFILE-READY tester\n".into(),
+            expected.repeat(2),
+        ] {
             let mut bad = healthy_system();
             bad.console = bad.console.replace(&expected, &replacement);
-            assert!(validate_installed_system(&bad, "uuid", "/dev/vda2", "deployment", true).is_err());
+            assert!(
+                validate_installed_system(&bad, "uuid", "/dev/vda2", "deployment", true).is_err()
+            );
         }
-        assert!(validate_installed_system(&healthy_system(), "uuid", "/dev/vda2", "deployment", true).is_ok());
+        assert!(validate_installed_system(
+            &healthy_system(),
+            "uuid",
+            "/dev/vda2",
+            "deployment",
+            true
+        )
+        .is_ok());
     }
 
     fn healthy_system() -> BootResult {
@@ -2330,51 +2504,93 @@ mod tests {
         let plan = refusal_plan(Path::new("fixture.iso"));
         assert!(plan.kill_on_marker);
         for newline in ["\n", "\r\n"] {
-            let diagnostic = format!("{} /bin/td-install failed: exit status: 1{newline}", protocol::REFUSED_PREFIX);
-            let bytes = format!("{diagnostic}{}{newline}", protocol::REFUSAL_COMPLETE_MARKER).into_bytes();
+            let diagnostic = format!(
+                "{} /bin/td-install failed: exit status: 1{newline}",
+                protocol::REFUSED_PREFIX
+            );
+            let bytes =
+                format!("{diagnostic}{}{newline}", protocol::REFUSAL_COMPLETE_MARKER).into_bytes();
             let stop = diagnostic.len() + protocol::REFUSAL_COMPLETE_MARKER.len();
             let mut evidence = ConsoleEvidence::default();
             for received in 0..=bytes.len() {
-                latch_console_evidence(&mut evidence, &bytes[..received], plan.target_marker.as_bytes());
-                assert_eq!(evidence.target, received >= stop, "received {received} of {}", bytes.len());
+                latch_console_evidence(
+                    &mut evidence,
+                    &bytes[..received],
+                    plan.target_marker.as_bytes(),
+                );
+                assert_eq!(
+                    evidence.target,
+                    received >= stop,
+                    "received {received} of {}",
+                    bytes.len()
+                );
             }
         }
     }
 
     #[test]
     fn writable_media_size_fits_candidate_geometry_without_truncation() {
-        for source in [0, 1024 * 1024 * 1024, MINIMUM_TARGET_BYTES, MINIMUM_TARGET_BYTES + 1] {
+        for source in [
+            0,
+            1024 * 1024 * 1024,
+            MINIMUM_TARGET_BYTES,
+            MINIMUM_TARGET_BYTES + 1,
+        ] {
             let bytes = writable_media_bytes(source).unwrap();
             assert!(bytes >= source);
             assert!(bytes.is_multiple_of(512));
             assert!(candidate_geometry(bytes, 512));
         }
-        assert_eq!(writable_media_bytes(MINIMUM_TARGET_BYTES + 1).unwrap(), MINIMUM_TARGET_BYTES + 512);
+        assert_eq!(
+            writable_media_bytes(MINIMUM_TARGET_BYTES + 1).unwrap(),
+            MINIMUM_TARGET_BYTES + 512
+        );
         assert!(writable_media_bytes(u64::MAX).is_err());
     }
 
     #[test]
     fn writable_usb_invalid_plans_refuse_before_qemu_or_firmware_access() {
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let scratch = Scratch { dir: create_scratch_dir(&env::temp_dir(), &SEQ).unwrap() };
+        let scratch = Scratch {
+            dir: create_scratch_dir(&env::temp_dir(), &SEQ).unwrap(),
+        };
         let target = TargetDisk::with_capacity(&scratch.dir, "target.img", 4096).unwrap();
         let image = TargetDisk::with_capacity(&scratch.dir, "source.iso", 4096).unwrap();
         let missing = scratch.dir.join("missing-firmware");
         for (attachment, read_only, present_target, reason) in [
-            (FirmwareAttachment::WritableUsbFixture, true, true, "writable USB fixture cannot use a read-only image"),
-            (FirmwareAttachment::WritableUsbFixture, false, false, "writable USB fixture requires its private target"),
-            (FirmwareAttachment::Usb, false, true, "optical and USB media oracles require read-only disks"),
+            (
+                FirmwareAttachment::WritableUsbFixture,
+                true,
+                true,
+                "writable USB fixture cannot use a read-only image",
+            ),
+            (
+                FirmwareAttachment::WritableUsbFixture,
+                false,
+                false,
+                "writable USB fixture requires its private target",
+            ),
+            (
+                FirmwareAttachment::Usb,
+                false,
+                true,
+                "optical and USB media oracles require read-only disks",
+            ),
         ] {
             let error = boot_source(
                 "/nonexistent-qemu-must-not-run",
                 BootSource::Firmware {
-                    code: &missing, vars: &missing, attachment,
+                    code: &missing,
+                    vars: &missing,
+                    attachment,
                     installation_target: present_target.then_some(&target),
                 },
                 plan(&image.path, read_only, protocol::MEDIA_RELEASED_MARKER),
                 &scratch.dir,
                 Duration::from_secs(1),
-            ).err().unwrap();
+            )
+            .err()
+            .unwrap();
             assert_eq!(error, reason);
         }
     }
@@ -2382,24 +2598,43 @@ mod tests {
     #[test]
     fn writable_media_protection_requires_both_claim_phases_and_no_installation() {
         let mut result = interrupted_result();
-        let console = format!("{} /dev/sda\n{}\n{}\n", protocol::MEDIA_MARKER,
-            protocol::MEDIA_BUSY_MARKER, protocol::MEDIA_RELEASED_MARKER);
+        let console = format!(
+            "{} /dev/sda\n{}\n{}\n",
+            protocol::MEDIA_MARKER,
+            protocol::MEDIA_BUSY_MARKER,
+            protocol::MEDIA_RELEASED_MARKER
+        );
         result.console = console.clone();
         validate_media_protection(&result).unwrap();
-        for missing in [protocol::MEDIA_MARKER, protocol::MEDIA_BUSY_MARKER, protocol::MEDIA_RELEASED_MARKER] {
+        for missing in [
+            protocol::MEDIA_MARKER,
+            protocol::MEDIA_BUSY_MARKER,
+            protocol::MEDIA_RELEASED_MARKER,
+        ] {
             result.console = console.replace(missing, "missing");
             assert!(validate_media_protection(&result).is_err());
         }
-        for extra in [protocol::PARTITIONS_MARKER, protocol::DIRECT_MARKER, protocol::INSTALL_MARKER,
-            protocol::REFUSED_PREFIX, protocol::REFUSAL_COMPLETE_MARKER, protocol::MEDIA_BUSY_MARKER,
-            protocol::MEDIA_MARKER, protocol::MEDIA_RELEASED_MARKER] {
+        for extra in [
+            protocol::PARTITIONS_MARKER,
+            protocol::DIRECT_MARKER,
+            protocol::INSTALL_MARKER,
+            protocol::REFUSED_PREFIX,
+            protocol::REFUSAL_COMPLETE_MARKER,
+            protocol::MEDIA_BUSY_MARKER,
+            protocol::MEDIA_MARKER,
+            protocol::MEDIA_RELEASED_MARKER,
+        ] {
             result.console = format!("{console}{extra}\n");
             assert!(validate_media_protection(&result).is_err());
         }
         result.console = console.replace("/dev/sda", "/dev/sdb");
         assert!(validate_media_protection(&result).is_err());
-        result.console = format!("{} /dev/sda\n{}\n{}\n", protocol::MEDIA_MARKER,
-            protocol::MEDIA_RELEASED_MARKER, protocol::MEDIA_BUSY_MARKER);
+        result.console = format!(
+            "{} /dev/sda\n{}\n{}\n",
+            protocol::MEDIA_MARKER,
+            protocol::MEDIA_RELEASED_MARKER,
+            protocol::MEDIA_BUSY_MARKER
+        );
         assert!(validate_media_protection(&result).is_err());
         result.console = console;
         result.marker_killed = false;
@@ -2415,7 +2650,9 @@ mod tests {
     #[test]
     fn writable_usb_admission_refuses_links_directories_and_read_only_images() {
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let scratch = Scratch { dir: create_scratch_dir(&env::temp_dir(), &SEQ).unwrap() };
+        let scratch = Scratch {
+            dir: create_scratch_dir(&env::temp_dir(), &SEQ).unwrap(),
+        };
         let target = TargetDisk::with_capacity(&scratch.dir, "media.iso", 4096).unwrap();
         validate_writable_usb_image(&BootDisk::new(&target.path, false)).unwrap();
         assert!(validate_writable_usb_image(&BootDisk::new(&target.path, true)).is_err());
@@ -2423,7 +2660,10 @@ mod tests {
         let link = scratch.dir.join("link");
         std::os::unix::fs::symlink(&target.path, &link).unwrap();
         assert!(validate_writable_usb_image(&BootDisk::new(&link, false)).is_err());
-        assert!(validate_writable_usb_image(&BootDisk::new(&scratch.dir.join("missing"), false)).is_err());
+        assert!(
+            validate_writable_usb_image(&BootDisk::new(&scratch.dir.join("missing"), false))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2431,19 +2671,26 @@ mod tests {
         let mut expected = inventory_expectation();
         expected.source_name = "sda";
         expected.source_read_only = false;
-        let usb = INVENTORY_FIXTURE.replace("\"sr0\"", "\"sda\"")
-            .replace("\"logical_sector_bytes\":2048", "\"logical_sector_bytes\":512");
+        let usb = INVENTORY_FIXTURE.replace("\"sr0\"", "\"sda\"").replace(
+            "\"logical_sector_bytes\":2048",
+            "\"logical_sector_bytes\":512",
+        );
         assert!(validate_inventories(&inventory_console(&usb, None), &expected, false).is_err());
         let writable = usb.replace("\"read_only\":true", "\"read_only\":false");
         validate_inventories(&inventory_console(&writable, None), &expected, false).unwrap();
         let mut result = interrupted_result();
         result.console = candidate_console(true, false, false)
             .replace("\"sr0\"", "\"sda\"")
-            .replace("\"logical_sector_bytes\":2048", "\"logical_sector_bytes\":512")
+            .replace(
+                "\"logical_sector_bytes\":2048",
+                "\"logical_sector_bytes\":512",
+            )
             .replace("\"read_only\":true", "\"read_only\":false");
         validate_live_reports(&result, &expected, false, false, None).unwrap();
         expected.source_read_only = true;
-        assert!(validate_inventories(&inventory_console(&writable, None), &expected, false).is_err());
+        assert!(
+            validate_inventories(&inventory_console(&writable, None), &expected, false).is_err()
+        );
     }
 
     #[test]
@@ -2467,7 +2714,11 @@ mod tests {
             result.console = console.replace(missing, "missing");
             assert!(validate_scratch_refusal(&result, "/dev/sr0").is_err());
         }
-        for extra in [protocol::PARTITIONS_MARKER, protocol::DIRECT_MARKER, protocol::INSTALL_MARKER] {
+        for extra in [
+            protocol::PARTITIONS_MARKER,
+            protocol::DIRECT_MARKER,
+            protocol::INSTALL_MARKER,
+        ] {
             result.console = format!("{console}{extra}\n");
             assert!(validate_scratch_refusal(&result, "/dev/sr0").is_err());
         }
@@ -2569,7 +2820,11 @@ mod tests {
         result.console.push_str(protocol::REFUSAL_COMPLETE_MARKER);
         result.console.push('\n');
         assert!(validate_interrupted_boot(&result, &refused, "uuid").is_ok());
-        for missing in [refused.as_str(), "TD-BOOT-VOLUME uuid /dev/vda2", protocol::REFUSAL_COMPLETE_MARKER] {
+        for missing in [
+            refused.as_str(),
+            "TD-BOOT-VOLUME uuid /dev/vda2",
+            protocol::REFUSAL_COMPLETE_MARKER,
+        ] {
             let console = result.console.clone();
             result.console = console.replace(missing, "");
             assert!(validate_interrupted_boot(&result, &refused, "uuid").is_err());
@@ -3102,7 +3357,8 @@ mod tests {
     #[test]
     fn candidate_capacity_uses_the_layout_minimum_in_both_geometries() {
         let without_tail = td_boot_protocol::PARTITION_ALIGN_BYTES
-            + td_boot_protocol::ESP_BYTES + td_boot_protocol::MIN_VOLUME_BYTES;
+            + td_boot_protocol::ESP_BYTES
+            + td_boot_protocol::MIN_VOLUME_BYTES;
         for sector in [512, 4096] {
             assert!(!candidate_geometry(0, sector));
             assert!(!candidate_geometry(without_tail, sector));
@@ -3128,11 +3384,20 @@ mod tests {
         let mut console = inventory_console(INVENTORY_FIXTURE, None);
         if plan_expected {
             console.push_str(&format!("{}\n", protocol::CANDIDATE_RECORD_MARKER));
-            let report = "{\"version\":1,\"scope\":\"plan-observation-only\",\"destination\":\"vda\"}";
-            console.push_str(&format!("{} {} {report}\n", protocol::PLAN_OBSERVATION_MARKER, report.len()));
+            let report =
+                "{\"version\":1,\"scope\":\"plan-observation-only\",\"destination\":\"vda\"}";
+            console.push_str(&format!(
+                "{} {} {report}\n",
+                protocol::PLAN_OBSERVATION_MARKER,
+                report.len()
+            ));
             console.push_str(&format!("{}\n", protocol::PLAN_STALE_MARKER));
             let report = format!("{{\"version\":1,\"scope\":\"held-source-plan-observation-only\",\"destination\":\"vda\",\"deployment\":\"{}\"}}", "02".repeat(32));
-            console.push_str(&format!("{} {} {report}\n", protocol::SOURCE_PLAN_OBSERVATION_MARKER, report.len()));
+            console.push_str(&format!(
+                "{} {} {report}\n",
+                protocol::SOURCE_PLAN_OBSERVATION_MARKER,
+                report.len()
+            ));
             console.push_str(&format!("{}\n", protocol::SOURCE_PLAN_STALE_MARKER));
             console.push_str(&format!("{}\n", protocol::SOURCE_PLAN_CLAIM_MARKER));
             if partitioned {
@@ -3154,8 +3419,9 @@ mod tests {
         ] {
             if include {
                 let devices = if target { device } else { "" };
-                let json =
-                    format!("{{\"version\":1,\"scope\":\"candidate-only\",\"devices\":[{devices}]}}");
+                let json = format!(
+                    "{{\"version\":1,\"scope\":\"candidate-only\",\"devices\":[{devices}]}}"
+                );
                 console.push_str(&format!("{marker} {} {json}\n", json.len()));
             }
         }
@@ -3169,24 +3435,50 @@ mod tests {
         validate_plan_observation(&valid, &expected, false, true, Some(&"02".repeat(32))).unwrap();
         for changed in [
             valid.replace("plan-observation-only", "candidate-only"),
-            valid.replace("\"scope\":\"plan-observation-only\",\"destination\":\"vda\"", "\"scope\":\"plan-observation-only\",\"destination\":\"sda\""),
+            valid.replace(
+                "\"scope\":\"plan-observation-only\",\"destination\":\"vda\"",
+                "\"scope\":\"plan-observation-only\",\"destination\":\"sda\"",
+            ),
             valid.replace(&format!("{}\n", protocol::PLAN_STALE_MARKER), ""),
             format!("{valid}{}\n", protocol::PLAN_STALE_MARKER),
-            valid.replace("held-source-plan-observation-only", "held-source-plan-observation-onlx"),
-            valid.replace("\"scope\":\"held-source-plan-observation-only\",\"destination\":\"vda\"", "\"scope\":\"held-source-plan-observation-only\",\"destination\":\"sda\""),
+            valid.replace(
+                "held-source-plan-observation-only",
+                "held-source-plan-observation-onlx",
+            ),
+            valid.replace(
+                "\"scope\":\"held-source-plan-observation-only\",\"destination\":\"vda\"",
+                "\"scope\":\"held-source-plan-observation-only\",\"destination\":\"sda\"",
+            ),
             valid.replace(&"02".repeat(32), &"z2".repeat(32)),
             valid.replace(&"02".repeat(32), &"03".repeat(32)),
-            valid.replace("\"version\":1,\"scope\":\"held-source-plan-observation-only\"", "\"version\":2,\"scope\":\"held-source-plan-observation-only\""),
+            valid.replace(
+                "\"version\":1,\"scope\":\"held-source-plan-observation-only\"",
+                "\"version\":2,\"scope\":\"held-source-plan-observation-only\"",
+            ),
             valid.replace(&format!("{}\n", protocol::SOURCE_PLAN_STALE_MARKER), ""),
             format!("{valid}{}\n", protocol::SOURCE_PLAN_STALE_MARKER),
             valid.replace(&format!("{}\n", protocol::SOURCE_PLAN_CLAIM_MARKER), ""),
             format!("{valid}{}\n", protocol::SOURCE_PLAN_CLAIM_MARKER),
         ] {
-            assert!(validate_plan_observation(&changed, &expected, false, true, Some(&"02".repeat(32))).is_err());
+            assert!(validate_plan_observation(
+                &changed,
+                &expected,
+                false,
+                true,
+                Some(&"02".repeat(32))
+            )
+            .is_err());
         }
         let mut unavailable = inventory_expectation();
         unavailable.read_only = true;
-        validate_plan_observation(&candidate_console(false, false, false), &unavailable, false, false, None).unwrap();
+        validate_plan_observation(
+            &candidate_console(false, false, false),
+            &unavailable,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
         assert!(validate_plan_observation(&valid, &unavailable, false, false, None).is_err());
         for unexpected in [
             format!("{} {} {{}}\n", protocol::SOURCE_PLAN_OBSERVATION_MARKER, 2),
@@ -3198,17 +3490,60 @@ mod tests {
             assert!(validate_plan_observation(&console, &unavailable, false, false, None).is_err());
         }
         let partitioned = candidate_console(true, true, true);
-        validate_plan_observation(&partitioned, &expected, true, true, Some(&"02".repeat(32))).unwrap();
-        assert!(validate_plan_observation(&partitioned, &expected, false, true, Some(&"02".repeat(32))).is_err());
-        assert!(validate_plan_observation(&partitioned.replace(&format!("{}\n", protocol::SOURCE_PLAN_BUSY_MARKER), ""), &expected, true, true, Some(&"02".repeat(32))).is_err());
-        assert!(validate_plan_observation(&format!("{partitioned}{}\n", protocol::SOURCE_PLAN_BUSY_MARKER), &expected, true, true, Some(&"02".repeat(32))).is_err());
-        let disk_only = valid.lines().filter(|line| !line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
-            && *line != protocol::SOURCE_PLAN_STALE_MARKER
-            && *line != protocol::SOURCE_PLAN_CLAIM_MARKER).collect::<Vec<_>>().join("\n") + "\n";
+        validate_plan_observation(&partitioned, &expected, true, true, Some(&"02".repeat(32)))
+            .unwrap();
+        assert!(validate_plan_observation(
+            &partitioned,
+            &expected,
+            false,
+            true,
+            Some(&"02".repeat(32))
+        )
+        .is_err());
+        assert!(validate_plan_observation(
+            &partitioned.replace(&format!("{}\n", protocol::SOURCE_PLAN_BUSY_MARKER), ""),
+            &expected,
+            true,
+            true,
+            Some(&"02".repeat(32))
+        )
+        .is_err());
+        assert!(validate_plan_observation(
+            &format!("{partitioned}{}\n", protocol::SOURCE_PLAN_BUSY_MARKER),
+            &expected,
+            true,
+            true,
+            Some(&"02".repeat(32))
+        )
+        .is_err());
+        let disk_only = valid
+            .lines()
+            .filter(|line| {
+                !line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
+                    && *line != protocol::SOURCE_PLAN_STALE_MARKER
+                    && *line != protocol::SOURCE_PLAN_CLAIM_MARKER
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
         validate_plan_observation(&disk_only, &expected, false, true, None).unwrap();
         assert!(validate_plan_observation(&valid, &expected, false, true, None).is_err());
-        assert!(validate_plan_observation(&format!("{disk_only}{}\n", protocol::SOURCE_PLAN_BUSY_MARKER), &expected, false, true, None).is_err());
-        assert!(validate_plan_observation(&format!("{valid}{}\n", protocol::SOURCE_PLAN_BUSY_MARKER), &expected, false, true, Some(&"02".repeat(32))).is_err());
+        assert!(validate_plan_observation(
+            &format!("{disk_only}{}\n", protocol::SOURCE_PLAN_BUSY_MARKER),
+            &expected,
+            false,
+            true,
+            None
+        )
+        .is_err());
+        assert!(validate_plan_observation(
+            &format!("{valid}{}\n", protocol::SOURCE_PLAN_BUSY_MARKER),
+            &expected,
+            false,
+            true,
+            Some(&"02".repeat(32))
+        )
+        .is_err());
     }
 
     #[test]
@@ -3216,15 +3551,25 @@ mod tests {
         let mut expected = inventory_expectation();
         let valid = candidate_console(true, true, true);
         validate_candidates(&valid, &expected, true).unwrap();
-        let free = valid.lines().find(|line| line.starts_with(protocol::CANDIDATES_BEFORE_MARKER)).unwrap();
-        for marker in [protocol::CANDIDATES_HELD_MARKER, protocol::CANDIDATES_MOUNTED_MARKER] {
+        let free = valid
+            .lines()
+            .find(|line| line.starts_with(protocol::CANDIDATES_BEFORE_MARKER))
+            .unwrap();
+        for marker in [
+            protocol::CANDIDATES_HELD_MARKER,
+            protocol::CANDIDATES_MOUNTED_MARKER,
+        ] {
             let busy = valid.lines().find(|line| line.starts_with(marker)).unwrap();
             let admitted = free.replacen(protocol::CANDIDATES_BEFORE_MARKER, marker, 1);
             assert!(validate_candidates(&valid.replace(busy, &admitted), &expected, true).is_err());
         }
 
-        assert!(validate_candidates(&candidate_console(false, true, false), &expected, true).is_err());
-        assert!(validate_candidates(&candidate_console(true, false, true), &expected, true).is_err());
+        assert!(
+            validate_candidates(&candidate_console(false, true, false), &expected, true).is_err()
+        );
+        assert!(
+            validate_candidates(&candidate_console(true, false, true), &expected, true).is_err()
+        );
         assert!(validate_candidates(&valid, &expected, false).is_err());
         for (old, new) in [
             ("candidate-only", "inventory-only"),
@@ -3250,11 +3595,15 @@ mod tests {
         }
         expected.read_only = true;
         validate_candidates(&candidate_console(false, false, false), &expected, false).unwrap();
-        assert!(validate_candidates(&candidate_console(true, false, true), &expected, false).is_err());
+        assert!(
+            validate_candidates(&candidate_console(true, false, true), &expected, false).is_err()
+        );
         expected.read_only = false;
         expected.target_bytes = 128 * 1024 * 1024;
         validate_candidates(&candidate_console(false, false, false), &expected, false).unwrap();
-        assert!(validate_candidates(&candidate_console(true, false, true), &expected, false).is_err());
+        assert!(
+            validate_candidates(&candidate_console(true, false, true), &expected, false).is_err()
+        );
     }
 
     #[test]
@@ -3264,8 +3613,22 @@ mod tests {
         let valid = candidate_console(true, false, true);
         assert!(validate_storage_reports(&valid, &expected, false, true, Some(&source_id)).is_ok());
         let marker = format!("{}\n", protocol::CANDIDATE_RECORD_MARKER);
-        assert!(validate_storage_reports(&valid.replace(&marker, ""), &expected, false, true, Some(&source_id)).is_err());
-        assert!(validate_storage_reports(&format!("{valid}{marker}"), &expected, false, true, Some(&source_id)).is_err());
+        assert!(validate_storage_reports(
+            &valid.replace(&marker, ""),
+            &expected,
+            false,
+            true,
+            Some(&source_id)
+        )
+        .is_err());
+        assert!(validate_storage_reports(
+            &format!("{valid}{marker}"),
+            &expected,
+            false,
+            true,
+            Some(&source_id)
+        )
+        .is_err());
     }
 
     #[test]

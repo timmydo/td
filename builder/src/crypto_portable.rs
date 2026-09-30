@@ -268,7 +268,12 @@ fn verified_cache(destination: &Path, expected: &str) -> Result<bool> {
     Ok(true)
 }
 
-pub(crate) fn publish_tree(source: &Path, parent: &Path, label: &str, expected: &str) -> Result<PathBuf> {
+pub(crate) fn publish_tree(
+    source: &Path,
+    parent: &Path,
+    label: &str,
+    expected: &str,
+) -> Result<PathBuf> {
     let destination = cache_path(parent, label, expected)?;
     if verified_cache(&destination, expected)? {
         return Ok(destination);

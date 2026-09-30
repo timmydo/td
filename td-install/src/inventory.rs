@@ -573,7 +573,9 @@ fn write_devices(devices: &[&Device], scope: &str, output: &mut impl Write) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::installation_plan::{Candidates, Destination, DestinationObservation, Plan, Settings};
+    use crate::installation_plan::{
+        Candidates, Destination, DestinationObservation, Plan, Settings,
+    };
     use std::fs;
     use std::os::unix::fs::symlink;
 
@@ -802,14 +804,18 @@ mod tests {
             &mut output,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("changed during candidate discovery"));
+        assert!(error
+            .to_string()
+            .contains("changed during candidate discovery"));
         assert!(output.is_empty());
 
         let other = fixture.disk("sda", "8:0", 512);
         fs::write(disk.join("diskseq"), "8\n").unwrap();
         fs::write(other.join("diskseq"), "8\n").unwrap();
         let error = record(|| collect(&fixture.class), |_| Ok(true), &mut output).unwrap_err();
-        assert!(error.to_string().contains("duplicate installation candidate"));
+        assert!(error
+            .to_string()
+            .contains("duplicate installation candidate"));
         assert!(output.is_empty());
     }
 

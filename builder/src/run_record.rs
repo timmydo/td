@@ -409,7 +409,10 @@ fn records(root: &Path) -> io::Result<Vec<(PathBuf, Result<Record, String>)>> {
             Err(e) => {
                 out.push((
                     dir(root),
-                    Err(format!("{}: reading the directory: {e}", dir(root).display())),
+                    Err(format!(
+                        "{}: reading the directory: {e}",
+                        dir(root).display()
+                    )),
                 ));
                 continue;
             }
@@ -558,9 +561,7 @@ fn stop_all(root: &Path, wait: Duration) -> Tally {
     let found = match records(root) {
         Ok(found) => found,
         Err(e) => {
-            tally
-                .problems
-                .push(format!("{}: {e}", dir(root).display()));
+            tally.problems.push(format!("{}: {e}", dir(root).display()));
             return tally;
         }
     };
@@ -747,7 +748,10 @@ mod tests {
         // The trap this parser exists to avoid. Both are legal `comm` values,
         // and splitting from the left counts fields inside the name.
         let tail = " R 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 4242 rest";
-        assert_eq!(parse_stat(&format!("1 (td builder){tail}")), Some(('R', 4242)));
+        assert_eq!(
+            parse_stat(&format!("1 (td builder){tail}")),
+            Some(('R', 4242))
+        );
         assert_eq!(parse_stat(&format!("1 (a) b) c){tail}")), Some(('R', 4242)));
         // The state travels with it, and comes from field 3, not from the name.
         let zombie = " Z 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 4242 rest";
@@ -819,7 +823,11 @@ mod tests {
         let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
         assert_eq!(parse_stat(&text).map(|(_, when)| when), Some(starttime));
         // ...and it is nonetheless not a process any more.
-        assert_eq!(starttime_of(pid).expect("stat"), None, "a zombie read as alive");
+        assert_eq!(
+            starttime_of(pid).expect("stat"),
+            None,
+            "a zombie read as alive"
+        );
         let record = Record {
             pid,
             starttime,
@@ -892,7 +900,10 @@ mod tests {
         // A file that is not a record must not read as one: `stop` treats an
         // unparseable record as a fault, and that only helps if this says so.
         assert_eq!(Record::parse("pid 12\nwhat 3\n"), None);
-        assert_eq!(Record::parse("pid twelve\nstarttime 3\nverb ready\nboot b\n"), None);
+        assert_eq!(
+            Record::parse("pid twelve\nstarttime 3\nverb ready\nboot b\n"),
+            None
+        );
         assert_eq!(Record::parse("pid 12\n"), None, "a partial record parsed");
         // Strict about keys, not merely about the three it needs: a file
         // holding a whole record plus something else is not a record we
@@ -966,7 +977,10 @@ mod tests {
             verb: "ready".to_string(),
             boot: boot_id().expect("boot id"),
         };
-        assert!(!is_same_process(&record).expect("check"), "a stale pid matched");
+        assert!(
+            !is_same_process(&record).expect("check"),
+            "a stale pid matched"
+        );
         let path = path_for(&root, pid);
         std::fs::create_dir_all(dir(&root)).expect("mkdir");
         std::fs::write(&path, record.render()).expect("write");
@@ -1011,7 +1025,10 @@ mod tests {
         let Some((_, Err(why))) = found.first() else {
             panic!("an unreadable record parsed: {found:?}");
         };
-        assert!(why.contains("7.run"), "the problem does not name the file: {why}");
+        assert!(
+            why.contains("7.run"),
+            "the problem does not name the file: {why}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1100,7 +1117,11 @@ mod tests {
         let reaper = std::thread::spawn(move || child.wait());
 
         let tally = stop_all(&root, Duration::from_secs(20));
-        assert_eq!(tally.stopped.len(), 1, "the live run was not stopped: {tally:?}");
+        assert_eq!(
+            tally.stopped.len(),
+            1,
+            "the live run was not stopped: {tally:?}"
+        );
         assert!(tally.problems.is_empty(), "{tally:?}");
         assert!(!path.exists(), "a confirmed stop kept its record");
         let status = reaper.join().expect("reaper").expect("wait");
@@ -1269,7 +1290,11 @@ mod tests {
         };
         std::fs::create_dir_all(dir(&root)).expect("mkdir");
         std::fs::write(path_for(&root, pid), stale.render()).expect("write");
-        assert_eq!(stop_main(&[], &root, wait), 0, "retiring a stale record failed");
+        assert_eq!(
+            stop_main(&[], &root, wait),
+            0,
+            "retiring a stale record failed"
+        );
         assert!(!path_for(&root, pid).exists(), "the stale record survived");
         // Same again for a record from another boot, where the pid AND the
         // starttime are ours and only the boot differs. Both records carry
@@ -1293,7 +1318,11 @@ mod tests {
         );
         // Something we cannot account for is 1.
         std::fs::write(dir(&root).join("999998.run"), "garbage").expect("write");
-        assert_eq!(stop_main(&[], &root, wait), 1, "an unreadable record was not 1");
+        assert_eq!(
+            stop_main(&[], &root, wait),
+            1,
+            "an unreadable record was not 1"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1369,9 +1398,8 @@ mod tests {
         // delegation with a hand-written copy, which is the shape that drifted
         // before. The assertion that carries content on its own is the
         // exclusion at the bottom.
-        let argv = |args: &[&str]| -> Vec<String> {
-            args.iter().map(|a| (*a).to_string()).collect()
-        };
+        let argv =
+            |args: &[&str]| -> Vec<String> { args.iter().map(|a| (*a).to_string()).collect() };
         for case in [
             vec!["ready"],
             vec!["ready", "--record-only"],
@@ -1401,8 +1429,14 @@ mod tests {
         // deriving without excluding it would let `stop` signal a control
         // client and report it as a stopped run.
         let control = argv(&["daemon-request", "sock", "PING"]);
-        assert!(crate::check_host::should_forward_with_host_state(&control, false));
-        assert_eq!(long_run_verb(&control), None, "a control message counted as a run");
+        assert!(crate::check_host::should_forward_with_host_state(
+            &control, false
+        ));
+        assert_eq!(
+            long_run_verb(&control),
+            None,
+            "a control message counted as a run"
+        );
     }
 
     #[test]
@@ -1429,7 +1463,10 @@ mod tests {
         );
         // `let hosted = !…is_some()` would satisfy the count above and invert
         // the meaning, so refuse the negation too.
-        let negated = concat!("hosted=!std::env::var_os(", "crate::check_memory::HOST_CHILD_ENV)");
+        let negated = concat!(
+            "hosted=!std::env::var_os(",
+            "crate::check_memory::HOST_CHILD_ENV)"
+        );
         assert!(!dense.contains(negated), "the hosted flag is read inverted");
     }
 
@@ -1540,7 +1577,13 @@ mod tests {
         verbs.dedup();
         assert_eq!(
             verbs,
-            ["affected-checks", "check", "daemon-request", "gate-run", "ready"],
+            [
+                "affected-checks",
+                "check",
+                "daemon-request",
+                "gate-run",
+                "ready"
+            ],
             "the forwarded roster changed. Decide whether the new verb is a run \
              `stop` may signal — if it is a control message, exclude it in \
              `long_run_verb` — then update this list"
@@ -1563,15 +1606,17 @@ mod tests {
         // record, making `stop` exit non-zero over something that is not one.
         let root = tempdir("isdir");
         std::fs::create_dir_all(dir(&root).join("9.run")).expect("mkdir");
-        assert_eq!(records(&root).expect("a .run directory broke stop"), Vec::new());
+        assert_eq!(
+            records(&root).expect("a .run directory broke stop"),
+            Vec::new()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn only_a_long_run_is_worth_recording() {
-        let argv = |args: &[&str]| -> Vec<String> {
-            args.iter().map(|a| (*a).to_string()).collect()
-        };
+        let argv =
+            |args: &[&str]| -> Vec<String> { args.iter().map(|a| (*a).to_string()).collect() };
         for verb in ["ready", "check", "gate-run"] {
             assert_eq!(long_run_verb(&argv(&[verb])), Some(verb));
         }
@@ -1582,20 +1627,36 @@ mod tests {
         // A control message is not a run. `daemon-request` is forwarded to the
         // check host exactly as `ready` is, so keying off forwarding would
         // have let `stop` claim to have stopped one.
-        assert_eq!(long_run_verb(&argv(&["daemon-request", "sock", "PING"])), None);
-        assert_eq!(long_run_verb(&argv(&["stop"])), None, "stop recorded itself");
+        assert_eq!(
+            long_run_verb(&argv(&["daemon-request", "sock", "PING"])),
+            None
+        );
+        assert_eq!(
+            long_run_verb(&argv(&["stop"])),
+            None,
+            "stop recorded itself"
+        );
         assert_eq!(long_run_verb(&argv(&[])), None);
         // Help prints and exits, wherever the flag sits.
         assert_eq!(long_run_verb(&argv(&["ready", "--help"])), None);
-        assert_eq!(long_run_verb(&argv(&["affected-checks", "--run", "-h"])), None);
+        assert_eq!(
+            long_run_verb(&argv(&["affected-checks", "--run", "-h"])),
+            None
+        );
         // The short forms of the same verbs are over before anyone could ask
         // to stop them, and each record costs a `git rev-parse` and a write.
         assert_eq!(long_run_verb(&argv(&["ready", "--record-only"])), None);
         assert_eq!(long_run_verb(&argv(&["affected-checks"])), None);
-        assert_eq!(long_run_verb(&argv(&["affected-checks", "--self-test"])), None);
+        assert_eq!(
+            long_run_verb(&argv(&["affected-checks", "--self-test"])),
+            None
+        );
         assert_eq!(long_run_verb(&argv(&["gate-run", "--list"])), None);
         assert_eq!(long_run_verb(&argv(&["gate-run", "list-gates"])), None);
-        assert_eq!(long_run_verb(&argv(&["gate-run", "gate-timing-report"])), None);
+        assert_eq!(
+            long_run_verb(&argv(&["gate-run", "gate-timing-report"])),
+            None
+        );
     }
 
     fn tempdir(tag: &str) -> PathBuf {

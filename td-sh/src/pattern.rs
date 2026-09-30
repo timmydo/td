@@ -507,7 +507,14 @@ mod tests {
         assert!(!matches(&pat("[\\*]"), "\\"));
         // Quoting suppresses it: a quoted backslash is data, which is why the
         // quoted forms of all of the above already agreed with ash.
-        let quoted: Vec<QChar> = "\\f".chars().map(|c| QChar { c, quoted: true, expanded: true }).collect();
+        let quoted: Vec<QChar> = "\\f"
+            .chars()
+            .map(|c| QChar {
+                c,
+                quoted: true,
+                expanded: true,
+            })
+            .collect();
         assert!(matches(&compile(&quoted), "\\f"));
         assert!(!matches(&compile(&quoted), "f"));
     }
@@ -517,7 +524,11 @@ mod tests {
     fn mixed(spec: &[(char, bool)]) -> Vec<Unit> {
         let qs: Vec<QChar> = spec
             .iter()
-            .map(|&(c, quoted)| QChar { c, quoted, expanded: true })
+            .map(|&(c, quoted)| QChar {
+                c,
+                quoted,
+                expanded: true,
+            })
             .collect();
         compile(&qs)
     }

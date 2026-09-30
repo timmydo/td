@@ -116,7 +116,10 @@ pub struct SpecError {
 
 impl SpecError {
     fn new(line: usize, msg: impl Into<String>) -> Self {
-        Self { line, msg: msg.into() }
+        Self {
+            line,
+            msg: msg.into(),
+        }
     }
 }
 
@@ -227,16 +230,32 @@ fn parse_ann_head(content: &str) -> Head {
         qualifier = q;
         let after_first = rest.get(first.len()..).unwrap_or("").trim_start();
         let sh = after_first.split_whitespace().next().unwrap_or("");
-        shells = sh.split('/').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+        shells = sh
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
         rest = after_first.get(sh.len()..).unwrap_or("").trim_start();
     }
 
     if let Some(idx) = rest.find(':') {
         let key = rest.get(..idx).unwrap_or("").trim().to_string();
         let value = rest.get(idx + 1..).unwrap_or("").trim_start().to_string();
-        Head { qualifier, shells, key, value, has_colon: true }
+        Head {
+            qualifier,
+            shells,
+            key,
+            value,
+            has_colon: true,
+        }
     } else {
-        Head { qualifier, shells, key: rest.trim().to_string(), value: String::new(), has_colon: false }
+        Head {
+            qualifier,
+            shells,
+            key: rest.trim().to_string(),
+            value: String::new(),
+            has_colon: false,
+        }
     }
 }
 
@@ -360,7 +379,10 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
                     // fail closed on the mixed shape rather than silently discard
                     // body code already collected.
                     if !c.code.is_empty() {
-                        return Err(SpecError::new(i + 1, "case mixes body code with `## code:`"));
+                        return Err(SpecError::new(
+                            i + 1,
+                            "case mixes body code with `## code:`",
+                        ));
                     }
                     c.code = head.value;
                     code_inline = true;
@@ -408,7 +430,10 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
             // can't silently truncate a golden. Before the first `####` (cur None)
             // a bare `##` line is file-level prose/metadata — ignore it.
             if cur.is_some() {
-                return Err(SpecError::new(i + 1, format!("invalid `##` line: {line:?}")));
+                return Err(SpecError::new(
+                    i + 1,
+                    format!("invalid `##` line: {line:?}"),
+                ));
             }
             i += 1;
             continue;
@@ -428,7 +453,10 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
                     // may follow. Real body code after it is the mixed shape Oils
                     // rejects — fail closed (mirror of the check above).
                     if !line.trim().is_empty() {
-                        return Err(SpecError::new(i + 1, "case mixes `## code:` with body code"));
+                        return Err(SpecError::new(
+                            i + 1,
+                            "case mixes `## code:` with body code",
+                        ));
                     }
                 } else {
                     if !c.code.is_empty() {
@@ -502,7 +530,9 @@ impl SpecCase {
 /// one compared that shell; without this an `ash-1.37` header would switch the
 /// bound off for its whole file with nothing to show for it.
 fn names_identity(token: &str, id: &str) -> bool {
-    token.strip_prefix(id).is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+    token
+        .strip_prefix(id)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
 }
 
 /// Whether the case designates a golden for `id`: its file named it in
@@ -527,7 +557,9 @@ pub fn designates(case: &SpecCase, id: &str) -> bool {
 /// comes from the default. `annotates_field` is what a claim about a failure
 /// has to be built on, and is the one the census uses.
 fn annotates(case: &SpecCase, id: &str) -> bool {
-    case.annotations.iter().any(|a| a.shells.iter().any(|s| s == id))
+    case.annotations
+        .iter()
+        .any(|a| a.shells.iter().any(|s| s == id))
 }
 
 /// `annotates`, narrowed to one field -- which is the resolution `pick` actually
@@ -583,8 +615,11 @@ pub fn graded_identity<'a>(case: &SpecCase, chain: &'a [&'a str]) -> Option<&'a 
 /// the unqualified default. Per field, so one field may resolve to a per-shell
 /// block while another falls to the default.
 fn pick<'a>(case: &'a SpecCase, chain: &[&str], field: Field) -> Option<&'a Annotation> {
-    let candidates: Vec<&Annotation> =
-        case.annotations.iter().filter(|a| key_in_field(&a.key, field)).collect();
+    let candidates: Vec<&Annotation> = case
+        .annotations
+        .iter()
+        .filter(|a| key_in_field(&a.key, field))
+        .collect();
     for id in effective_chain(case, chain) {
         if let Some(a) = candidates.iter().find(|a| a.shells.iter().any(|s| s == id)) {
             return Some(a);
@@ -679,7 +714,10 @@ fn json_decode(value: &str, line: usize) -> Result<String, SpecError> {
                         }
                     }
                     other => {
-                        return Err(SpecError::new(line, format!("invalid json escape \\{other}")));
+                        return Err(SpecError::new(
+                            line,
+                            format!("invalid json escape \\{other}"),
+                        ));
                     }
                 }
             }
@@ -702,14 +740,13 @@ fn expected_stream(ann: &Annotation, line: usize) -> Result<String, SpecError> {
 
 /// Resolve the effective expectation for `case` under `chain`.
 pub fn resolve(case: &SpecCase, chain: &[&str]) -> Result<Expected, SpecError> {
-    let status = match pick(case, chain, Field::Status) {
-        Some(a) => a
-            .value
-            .trim()
-            .parse::<i32>()
-            .map_err(|_| SpecError::new(case.line, format!("non-integer status {:?}", a.value)))?,
-        None => 0,
-    };
+    let status =
+        match pick(case, chain, Field::Status) {
+            Some(a) => a.value.trim().parse::<i32>().map_err(|_| {
+                SpecError::new(case.line, format!("non-integer status {:?}", a.value))
+            })?,
+            None => 0,
+        };
     let stdout = match pick(case, chain, Field::Stdout) {
         Some(a) => Some(expected_stream(a, case.line)?),
         None => None,
@@ -718,17 +755,30 @@ pub fn resolve(case: &SpecCase, chain: &[&str]) -> Result<Expected, SpecError> {
         Some(a) => Some(expected_stream(a, case.line)?),
         None => None,
     };
-    Ok(Expected { status, stdout, stderr })
+    Ok(Expected {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 // ---- running -------------------------------------------------------------
 
 /// Compare a shell's observed result against the resolved expectation.
-fn evaluate(name: &str, expected: &Expected, status: i32, stdout: &[u8], stderr: &[u8]) -> CaseOutcome {
+fn evaluate(
+    name: &str,
+    expected: &Expected,
+    status: i32,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> CaseOutcome {
     let mut fails: Vec<String> = Vec::new();
     let mut mismatched: Vec<Field> = Vec::new();
     if status != expected.status {
-        fails.push(format!("status: expected {}, got {}", expected.status, status));
+        fails.push(format!(
+            "status: expected {}, got {}",
+            expected.status, status
+        ));
         mismatched.push(Field::Status);
     }
     if let Some(exp) = &expected.stdout {
@@ -1098,7 +1148,10 @@ pub fn spec_paths(dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("sh")
-            && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".test.sh"))
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".test.sh"))
         {
             paths.push(path);
         }
@@ -1200,18 +1253,24 @@ impl Expectations {
                 continue;
             }
             let ln = idx + 1;
-            let (disp, key) = line
-                .split_once(char::is_whitespace)
-                .ok_or_else(|| SpecError::new(ln, "expectation needs `<xfail|skip> <file>::<case>`"))?;
+            let (disp, key) = line.split_once(char::is_whitespace).ok_or_else(|| {
+                SpecError::new(ln, "expectation needs `<xfail|skip> <file>::<case>`")
+            })?;
             let key = key.trim();
             if !key.contains("::") {
-                return Err(SpecError::new(ln, "expectation key must be `<file>::<case>`"));
+                return Err(SpecError::new(
+                    ln,
+                    "expectation key must be `<file>::<case>`",
+                ));
             }
             let inserted = match disp {
                 "xfail" => xfail.insert(key.to_string()),
                 "skip" => skip.insert(key.to_string()),
                 other => {
-                    return Err(SpecError::new(ln, format!("unknown disposition {other:?} (want xfail|skip)")));
+                    return Err(SpecError::new(
+                        ln,
+                        format!("unknown disposition {other:?} (want xfail|skip)"),
+                    ));
                 }
             };
             if !inserted {
@@ -1219,7 +1278,10 @@ impl Expectations {
             }
         }
         if let Some(k) = xfail.intersection(&skip).next() {
-            return Err(SpecError::new(0, format!("{k:?} listed as both xfail and skip")));
+            return Err(SpecError::new(
+                0,
+                format!("{k:?} listed as both xfail and skip"),
+            ));
         }
         Ok(Self { xfail, skip })
     }
@@ -1288,7 +1350,11 @@ fn classify(key: String, outcome: &CaseOutcome, exp: &Expectations) -> Classifie
         (true, true) => Disposition::XPass,
         (false, false) => Disposition::Fail,
     };
-    ClassifiedOutcome { key, disposition, detail: outcome.detail.clone() }
+    ClassifiedOutcome {
+        key,
+        disposition,
+        detail: outcome.detail.clone(),
+    }
 }
 
 /// Backstop against a genuine overlay-key collision. `case_keys` occurrence-qualifies
@@ -1322,7 +1388,11 @@ pub fn run_dir_classified(
     // them, and keying is a serial walk in any event.
     let mut files: Vec<(String, Vec<SpecCase>)> = Vec::new();
     for path in &spec_paths(dir)? {
-        let file = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        let file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
         let text = std::fs::read_to_string(path)?;
         files.push((file, parse_spec(&text)?));
     }
@@ -1339,12 +1409,19 @@ pub fn run_dir_classified(
                 slots.push(Some(ClassifiedOutcome {
                     key,
                     disposition: Disposition::Fail,
-                    detail: Some("two cases map to the same overlay key (collision) — cannot disambiguate".into()),
+                    detail: Some(
+                        "two cases map to the same overlay key (collision) — cannot disambiguate"
+                            .into(),
+                    ),
                 }));
                 continue;
             }
             if exp.is_skip(&key) {
-                slots.push(Some(ClassifiedOutcome { key, disposition: Disposition::Skip, detail: None }));
+                slots.push(Some(ClassifiedOutcome {
+                    key,
+                    disposition: Disposition::Skip,
+                    detail: None,
+                }));
                 continue;
             }
             queued.push((slots.len(), key, case));
@@ -1455,7 +1532,9 @@ fn run_cases_concurrently(
                 let Some(case) = cases.get(i) else { break };
                 let outcome = run_case(shell, helpers, case, chain).map_err(|e| e.to_string());
                 if let Some(slot) = slots.get(i) {
-                    *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+                    *slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
                 }
             });
         }
@@ -1501,7 +1580,11 @@ mod tests {
         let mut roots = vec![(src.join("main.rs"), "#![deny(unsafe_code)]")];
         let mut discovered = vec![src.join("lib.rs")];
         // Fail closed: an unreadable directory is where a root could hide.
-        for dir in [src.join("bin"), manifest.join("examples"), manifest.join("tests")] {
+        for dir in [
+            src.join("bin"),
+            manifest.join("examples"),
+            manifest.join("tests"),
+        ] {
             let entries = std::fs::read_dir(&dir).unwrap();
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -1560,8 +1643,14 @@ dash-says
     fn parses_all_cases() -> Result<(), SpecError> {
         let cases = parse_spec(SAMPLE)?;
         assert_eq!(cases.len(), 3);
-        assert_eq!(cases.first().map(|c| c.name.as_str()), Some("echo two words"));
-        assert_eq!(cases.first().map(|c| c.code.as_str()), Some("echo hello world"));
+        assert_eq!(
+            cases.first().map(|c| c.name.as_str()),
+            Some("echo two words")
+        );
+        assert_eq!(
+            cases.first().map(|c| c.code.as_str()),
+            Some("echo hello world")
+        );
         Ok(())
     }
 
@@ -1582,7 +1671,9 @@ echo real-line
 ## END
 ";
         let cases = parse_spec(spec)?;
-        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let c = cases
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
         assert_eq!(c.code, "cat <<'EOF2'\n#!/bin/sh\necho real-line\nEOF2");
         // The GOLDEN cannot say the same thing: a block drops its `#` line, so this
         // case is unmatchable in block form. Asserted so the limitation is visible
@@ -1604,7 +1695,9 @@ echo real-line
 ## status: 2
 ";
         let cases = parse_spec(spec)?;
-        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let c = cases
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
         assert_eq!(c.code, "ls foo bar '");
         assert!(c.unrecognized_keys().is_empty());
         assert_eq!(resolve(c, ASH_DASH_CHAIN)?.status, 2);
@@ -1615,16 +1708,19 @@ echo real-line
     fn block_end_is_lenient_and_optional() -> Result<(), SpecError> {
         // `## END:` (trailing colon) still terminates, per Oils' `re.match`.
         let colon = parse_spec("#### x\necho hi\n## STDOUT:\nhi\n## END:\n")?;
-        let c = colon.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let c = colon
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
         assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("hi\n"));
 
         // END is optional: a following `##` annotation ends the block, and an
         // empty per-shell block (the real `## N-I dash STDOUT:` / `## END:` shape)
         // resolves to empty output for that shell.
-        let optional = parse_spec(
-            "#### y\necho hi\n## STDOUT:\nideal\n## N-I dash STDOUT:\n## END:\n",
-        )?;
-        let c = optional.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let optional =
+            parse_spec("#### y\necho hi\n## STDOUT:\nideal\n## N-I dash STDOUT:\n## END:\n")?;
+        let c = optional
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
         // Chain [ash, dash]: the dash block (empty) wins over the default.
         assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some(""));
         // A chain without dash falls back to the default block.
@@ -1645,13 +1741,17 @@ echo real-line
         // Indented too, as Oils' `line.lstrip().startswith('#')` does. The format
         // therefore cannot express expected output beginning with `#`.
         let indented = parse_spec("#### y\nx\n## STDOUT:\n  # note\nhi\n## END\n")?;
-        let c = indented.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let c = indented
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
         assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("hi\n"));
 
         // The corpus closes two blocks with a mistyped `# END`, which this rule
         // absorbs -- the following annotation is what actually ends the block.
         let typo = parse_spec("#### z\nx\n## STDOUT:\nhi\n# END\n## status: 0\n")?;
-        let c = typo.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let c = typo
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
         let e = resolve(c, ASH_DASH_CHAIN)?;
         assert_eq!((e.stdout.as_deref(), e.status), (Some("hi\n"), 0));
         Ok(())
@@ -1667,11 +1767,15 @@ false
 ## stats: 3
 ";
         let cases = parse_spec(spec)?;
-        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let c = cases
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
         assert_eq!(c.unrecognized_keys(), vec!["stats"]);
         // A well-formed case reports none.
         let ok = parse_spec("#### ok\nfalse\n## status: 1\n")?;
-        let oc = ok.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let oc = ok
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
         assert!(oc.unrecognized_keys().is_empty());
         Ok(())
     }
@@ -1679,7 +1783,9 @@ false
     #[test]
     fn resolves_block_stdout_and_default_status() -> Result<(), SpecError> {
         let cases = parse_spec(SAMPLE)?;
-        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let c = cases
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
         let e = resolve(c, ASH_DASH_CHAIN)?;
         assert_eq!(e.status, 0);
         assert_eq!(e.stdout.as_deref(), Some("hello world\n"));
@@ -1690,7 +1796,9 @@ false
     #[test]
     fn resolves_status_and_json_empty_stdout() -> Result<(), SpecError> {
         let cases = parse_spec(SAMPLE)?;
-        let c = cases.get(1).ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let c = cases
+            .get(1)
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
         let e = resolve(c, ASH_DASH_CHAIN)?;
         assert_eq!(e.status, 3);
         assert_eq!(e.stdout.as_deref(), Some("")); // stdout-json "" => empty, no newline
@@ -1704,17 +1812,30 @@ false
         // the inference `effective_chain` above refuses. The `## OK dash` block
         // records where dash left it, so it must not be inherited either way.
         let cases = parse_spec(SAMPLE)?;
-        let c = cases.get(2).ok_or_else(|| SpecError::new(0, "missing case"))?;
-        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("default-ideal\n"));
+        let c = cases
+            .get(2)
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(
+            resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(),
+            Some("default-ideal\n")
+        );
 
         // The same case in a file that never ran ash says nothing about ash, so the
         // chain still falls through to its same-lineage neighbour.
         let without = SAMPLE.replace("mksh ash", "mksh");
         let cases = parse_spec(&without)?;
-        let c = cases.get(2).ok_or_else(|| SpecError::new(0, "missing case"))?;
-        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("dash-says\n"));
+        let c = cases
+            .get(2)
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(
+            resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(),
+            Some("dash-says\n")
+        );
         // A chain without dash falls back to the unqualified default.
-        assert_eq!(resolve(c, &["mksh"])?.stdout.as_deref(), Some("default-ideal\n"));
+        assert_eq!(
+            resolve(c, &["mksh"])?.stdout.as_deref(),
+            Some("default-ideal\n")
+        );
         Ok(())
     }
 
@@ -1738,8 +1859,13 @@ dash-says
 ## END
 ";
         let cases = parse_spec(spec)?;
-        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
-        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("ash-says\n"));
+        let c = cases
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(
+            resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(),
+            Some("ash-says\n")
+        );
         Ok(())
     }
 
@@ -1761,14 +1887,19 @@ dash-says
 ## END
 ";
         let cases = parse_spec(spec)?;
-        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
-        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("dash-says\n"));
+        let c = cases
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(
+            resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(),
+            Some("dash-says\n")
+        );
         Ok(())
     }
 
     #[test]
-    fn designating_nothing_is_not_the_same_as_designating_the_chain_head()
-    -> Result<(), SpecError> {
+    fn designating_nothing_is_not_the_same_as_designating_the_chain_head() -> Result<(), SpecError>
+    {
         // `graded_identity` answers "ash" for a file that RAN ash and for one
         // that ran neither chain shell, because it falls back to the head. Those
         // are opposite verdicts about a failing case -- a gap in the shell td-sh
@@ -1853,14 +1984,23 @@ dash-says
 ## END
 ";
         let cases = parse_spec(spec)?;
-        let first = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let first = cases
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
         assert_eq!(first.unrecognized_keys(), vec!["compare_shells"]);
-        let second = cases.get(1).ok_or_else(|| SpecError::new(0, "missing case"))?;
-        assert_eq!(resolve(second, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("dash-says\n"));
+        let second = cases
+            .get(1)
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(
+            resolve(second, ASH_DASH_CHAIN)?.stdout.as_deref(),
+            Some("dash-says\n")
+        );
         // Same for a qualified spelling, which the `## code:` hook also refuses.
         let spec = spec.replace("## compare_shells: ash", "## OK ash compare_shells: ash");
         let cases = parse_spec(&spec)?;
-        let first = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let first = cases
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
         assert_eq!(first.unrecognized_keys(), vec!["compare_shells"]);
         Ok(())
     }
@@ -1890,8 +2030,13 @@ dash-says
 ## END
 ";
         let cases = parse_spec(spec)?;
-        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
-        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("default-ideal\n"));
+        let c = cases
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(
+            resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(),
+            Some("default-ideal\n")
+        );
         Ok(())
     }
 
@@ -1914,7 +2059,9 @@ dash-says
 ## END
 ";
         let cases = parse_spec(spec)?;
-        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let c = cases
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
         assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout, None);
         Ok(())
     }
@@ -1934,8 +2081,13 @@ dash-says
 ## END
 ";
         let cases = parse_spec(spec)?;
-        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
-        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("dash-says\n"));
+        let c = cases
+            .first()
+            .ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(
+            resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(),
+            Some("dash-says\n")
+        );
         Ok(())
     }
 
@@ -1967,7 +2119,11 @@ dash-says
     fn evaluate_reds_a_stdout_mismatch() {
         // A run that exits 0 but prints nothing must fail a case expecting output —
         // the harness's own red-detection, independent of any real shell.
-        let expected = Expected { status: 0, stdout: Some("hello world\n".into()), stderr: None };
+        let expected = Expected {
+            status: 0,
+            stdout: Some("hello world\n".into()),
+            stderr: None,
+        };
         let out = evaluate("echo two words", &expected, 0, b"", b"");
         assert!(!out.passed);
         assert!(out.detail.is_some());
@@ -1991,14 +2147,22 @@ dash-says
         let out = evaluate("c", &all, 0, b"out\n", b"err\n");
         assert!(out.passed && out.mismatched.is_empty());
         // A field the case does not assert cannot differ, however wrong it is.
-        let only_status = Expected { status: 0, stdout: None, stderr: None };
+        let only_status = Expected {
+            status: 0,
+            stdout: None,
+            stderr: None,
+        };
         let out = evaluate("c", &only_status, 0, b"anything\n", b"anything\n");
         assert!(out.passed && out.mismatched.is_empty());
     }
 
     #[test]
     fn evaluate_passes_when_output_matches() {
-        let expected = Expected { status: 0, stdout: Some("hi\n".into()), stderr: None };
+        let expected = Expected {
+            status: 0,
+            stdout: Some("hi\n".into()),
+            stderr: None,
+        };
         let out = evaluate("x", &expected, 0, b"hi\n", b"");
         assert!(out.passed);
         assert_eq!(out.detail, None);
@@ -2008,7 +2172,11 @@ dash-says
         CaseOutcome {
             name: "c".into(),
             passed,
-            detail: if passed { None } else { Some("mismatch".into()) },
+            detail: if passed {
+                None
+            } else {
+                Some("mismatch".into())
+            },
             timed_out: false,
             truncated: false,
             mismatched: Vec::new(),
@@ -2041,29 +2209,59 @@ dash-says
     fn classify_maps_every_quadrant() {
         let exp = Expectations::parse("xfail f::gap").unwrap_or_default();
         // pass + unlisted => Pass; fail + unlisted => Fail (regression).
-        assert_eq!(classify("f::ok".into(), &outcome(true), &exp).disposition, Disposition::Pass);
-        assert_eq!(classify("f::reg".into(), &outcome(false), &exp).disposition, Disposition::Fail);
+        assert_eq!(
+            classify("f::ok".into(), &outcome(true), &exp).disposition,
+            Disposition::Pass
+        );
+        assert_eq!(
+            classify("f::reg".into(), &outcome(false), &exp).disposition,
+            Disposition::Fail
+        );
         // fail + listed => XFail (tolerated); pass + listed => XPass (promote).
-        assert_eq!(classify("f::gap".into(), &outcome(false), &exp).disposition, Disposition::XFail);
-        assert_eq!(classify("f::gap".into(), &outcome(true), &exp).disposition, Disposition::XPass);
+        assert_eq!(
+            classify("f::gap".into(), &outcome(false), &exp).disposition,
+            Disposition::XFail
+        );
+        assert_eq!(
+            classify("f::gap".into(), &outcome(true), &exp).disposition,
+            Disposition::XPass
+        );
     }
 
     #[test]
     fn summary_greens_only_without_fail_or_xpass() {
         let clean = [
-            ClassifiedOutcome { key: "a".into(), disposition: Disposition::Pass, detail: None },
-            ClassifiedOutcome { key: "b".into(), disposition: Disposition::XFail, detail: None },
-            ClassifiedOutcome { key: "c".into(), disposition: Disposition::Skip, detail: None },
+            ClassifiedOutcome {
+                key: "a".into(),
+                disposition: Disposition::Pass,
+                detail: None,
+            },
+            ClassifiedOutcome {
+                key: "b".into(),
+                disposition: Disposition::XFail,
+                detail: None,
+            },
+            ClassifiedOutcome {
+                key: "c".into(),
+                disposition: Disposition::Skip,
+                detail: None,
+            },
         ];
         let s = summarize(&clean);
         assert_eq!((s.pass, s.xfail, s.skip), (1, 1, 1));
         assert!(s.is_green());
 
-        let regressed =
-            [ClassifiedOutcome { key: "d".into(), disposition: Disposition::Fail, detail: None }];
+        let regressed = [ClassifiedOutcome {
+            key: "d".into(),
+            disposition: Disposition::Fail,
+            detail: None,
+        }];
         assert!(!summarize(&regressed).is_green());
-        let stale_pass =
-            [ClassifiedOutcome { key: "e".into(), disposition: Disposition::XPass, detail: None }];
+        let stale_pass = [ClassifiedOutcome {
+            key: "e".into(),
+            disposition: Disposition::XPass,
+            detail: None,
+        }];
         assert!(!summarize(&stale_pass).is_green());
     }
 
@@ -2119,7 +2317,7 @@ dash-says
         // is malformed (Oils raises) — it must not silently truncate a golden.
         assert!(parse_spec("#### x\necho hi\n##BADLINE\n").is_err()); // no space
         assert!(parse_spec("#### x\necho hi\n## STODUT\n").is_err()); // typo, no colon
-        // File-level `##` prose before the first case stays ignorable metadata.
+                                                                      // File-level `##` prose before the first case stays ignorable metadata.
         assert!(parse_spec("## just prose here\n#### x\necho hi\n## status: 0\n").is_ok());
     }
 
@@ -2165,7 +2363,10 @@ dash-says
         // Well past the cap, not a chunk past it, so "stopped at the cap" is
         // distinguishable from "read it all" at all.
         let over = CAPTURE_CAP + 512 * 1024;
-        let rx = drain_pipe(Some(Counted { left: over, read: std::sync::Arc::clone(&read) }));
+        let rx = drain_pipe(Some(Counted {
+            left: over,
+            read: std::sync::Arc::clone(&read),
+        }));
         let (buf, overflowed) = rx.recv_timeout(Duration::from_secs(30)).expect("drain");
         assert_eq!(buf.len(), CAPTURE_CAP, "retained more than the cap");
         assert!(overflowed, "the overflow went unreported");
@@ -2176,7 +2377,10 @@ dash-says
         // read it will ever do.
         let taken = read.load(std::sync::atomic::Ordering::Relaxed);
         assert!(taken < over, "kept reading past the cap: {taken} of {over}");
-        assert!(taken <= CAPTURE_CAP + 16 * 1024, "read {taken}, more than a chunk past the cap");
+        assert!(
+            taken <= CAPTURE_CAP + 16 * 1024,
+            "read {taken}, more than a chunk past the cap"
+        );
     }
 
     /// A reader that is INTERRUPTED once, then yields data, then fails. The
@@ -2216,14 +2420,23 @@ dash-says
     #[test]
     fn output_under_the_cap_is_captured_whole() {
         let read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let rx = drain_pipe(Some(Counted { left: 40_000, read: std::sync::Arc::clone(&read) }));
+        let rx = drain_pipe(Some(Counted {
+            left: 40_000,
+            read: std::sync::Arc::clone(&read),
+        }));
         let (buf, overflowed) = rx.recv_timeout(Duration::from_secs(30)).expect("drain");
         assert_eq!(buf.len(), 40_000);
         assert!(!overflowed);
-        assert!(buf.iter().all(|b| *b == b'x'), "the bytes were not passed through");
+        assert!(
+            buf.iter().all(|b| *b == b'x'),
+            "the bytes were not passed through"
+        );
         // Exactly at the cap is NOT an overflow: the boundary is inclusive, or a
         // legitimate case of exactly that size would be failed for nothing.
-        let rx = drain_pipe(Some(Counted { left: CAPTURE_CAP, read }));
+        let rx = drain_pipe(Some(Counted {
+            left: CAPTURE_CAP,
+            read,
+        }));
         let (buf, overflowed) = rx.recv_timeout(Duration::from_secs(30)).expect("drain");
         assert_eq!(buf.len(), CAPTURE_CAP);
         assert!(!overflowed, "the cap itself was called an overflow");

@@ -219,9 +219,7 @@ pub fn may_see(caller: &Identity, own: Option<&str>, target: &str) -> bool {
         // grant, it is a peer the broker could not place at all.
         Identity::Unknown(_) | Identity::Launcher => told_already,
         Identity::Jailed { owned, .. } => {
-            told_already
-                || is_portal_name(target)
-                || owned.iter().any(|granted| granted == target)
+            told_already || is_portal_name(target) || owned.iter().any(|granted| granted == target)
         }
     }
 }
@@ -388,7 +386,11 @@ mod tests {
         let nobody = Identity::Unknown("the walk hit a reused pid".into());
         // Every other peer, and the portal, which is a grant it has not
         // earned: an unprovable peer gets strictly LESS than a sandboxed one.
-        for target in [":1.7", "org.freedesktop.portal.Desktop", "org.example.Thing"] {
+        for target in [
+            ":1.7",
+            "org.freedesktop.portal.Desktop",
+            "org.example.Thing",
+        ] {
             assert!(!may_see(&nobody, Some(":1.1"), target), "{target}");
             assert!(!may_talk(&nobody, Some(":1.1"), target), "{target}");
         }
@@ -665,7 +667,9 @@ mod tests {
         }
         assert!(may_hold_portal_service(&Identity::Unconfined));
         assert!(!may_hold_portal_service(&jailed()));
-        assert!(!may_hold_portal_service(&Identity::Unknown("no proof".into())));
+        assert!(!may_hold_portal_service(&Identity::Unknown(
+            "no proof".into()
+        )));
     }
 
     /// A peer with no name yet still gets a decision, and it is not "see

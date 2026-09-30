@@ -112,10 +112,7 @@ pub fn recipe() -> Recipe {
         dest: format!("{zstage}/lib"),
     });
     steps.push(Step::CopyFiles {
-        files: vec![
-            "{root}/zsrc/zlib.h".into(),
-            "{root}/zsrc/zconf.h".into(),
-        ],
+        files: vec!["{root}/zsrc/zlib.h".into(), "{root}/zsrc/zconf.h".into()],
         dest: format!("{zstage}/include"),
     });
 

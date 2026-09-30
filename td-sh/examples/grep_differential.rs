@@ -34,36 +34,105 @@ use std::process::{Command, Stdio};
 
 /// Patterns inside the served subset, in both dialects.
 const PATTERNS: &[&str] = &[
-    "foo", "^foo", "foo$", "^$", ".", "a.c", "a*", "aa*", "^a*$", "[0-9]", "[0-9][0-9]", "[^/]",
-    "[a-z]", "[A-Z]", "[abc]", "[]]", "[-a]", "[a-]", "z=", "^z", "=$", "x", "^", "$", "b*", ".*",
-    "aab", "^aaa$", "[0-9]*", "a[0-9]b", "^[a-z]*$", "\\.", "\\*", "\\C-o", "[a-z0-9]*",
+    "foo",
+    "^foo",
+    "foo$",
+    "^$",
+    ".",
+    "a.c",
+    "a*",
+    "aa*",
+    "^a*$",
+    "[0-9]",
+    "[0-9][0-9]",
+    "[^/]",
+    "[a-z]",
+    "[A-Z]",
+    "[abc]",
+    "[]]",
+    "[-a]",
+    "[a-]",
+    "z=",
+    "^z",
+    "=$",
+    "x",
+    "^",
+    "$",
+    "b*",
+    ".*",
+    "aab",
+    "^aaa$",
+    "[0-9]*",
+    "a[0-9]b",
+    "^[a-z]*$",
+    "\\.",
+    "\\*",
+    "\\C-o",
+    "[a-z0-9]*",
     // The sets `\s`/`\w` name, and the bracketed classes they are short for.
     // Both dialects spell these the same way, which is why they are here rather
     // than in either dialect-only table.
-    "\\s", "\\S", "\\w", "\\W", "[[:space:]]", "[[:alpha:]]", "[[:digit:]]", "[[:alnum:]_]",
-    "[^[:space:]]", "[[:space:][:digit:]]", "[[:upper:]]", "[[:punct:]]", "[[:xdigit:]]",
-    "[[:blank:]]", "[[:print:]]", "[[:graph:]]", "[[:cntrl:]]", "[[:lower:]]", "[x[:digit:]]",
-    "[[:digit:]x]", "^[[:space:]]*$",
+    "\\s",
+    "\\S",
+    "\\w",
+    "\\W",
+    "[[:space:]]",
+    "[[:alpha:]]",
+    "[[:digit:]]",
+    "[[:alnum:]_]",
+    "[^[:space:]]",
+    "[[:space:][:digit:]]",
+    "[[:upper:]]",
+    "[[:punct:]]",
+    "[[:xdigit:]]",
+    "[[:blank:]]",
+    "[[:print:]]",
+    "[[:graph:]]",
+    "[[:cntrl:]]",
+    "[[:lower:]]",
+    "[x[:digit:]]",
+    "[[:digit:]x]",
+    "^[[:space:]]*$",
     // …and the near misses of the range rule above, where the `-` really is an
     // ordinary member because a `]` follows it.
-    "[[:digit:]-]", "[-[:digit:]]", "[a[:digit:]-]",
+    "[[:digit:]-]",
+    "[-[:digit:]]",
+    "[a[:digit:]-]",
     // The typo's own near misses, which GNU READS rather than diagnoses: an
     // empty name, and the two where a `-` makes it a range instead. They are
     // the other side of the refusals below, and the boundary is only pinned by
     // sweeping both.
-    "[::]", "[:-:]", "[:a-b:]", "[:ab:c]", "[x:a:]", "[:a:x]",
+    "[::]",
+    "[:-:]",
+    "[:a-b:]",
+    "[:ab:c]",
+    "[x:a:]",
+    "[:a:x]",
 ];
 
 /// …and the ones only an extended expression can express.
-const ERE_ONLY: &[&str] = &["[0-9]+", "a+", "[a-z]+b", "^[0-9]+$", "a?b", "aa?", "[^/]+$", "x+"];
+const ERE_ONLY: &[&str] = &[
+    "[0-9]+", "a+", "[a-z]+b", "^[0-9]+$", "a?b", "aa?", "[^/]+$", "x+",
+];
 
 /// A BRE reads these as literals where an ERE reads operators, so they belong
 /// to the basic dialect alone.
 const BRE_ONLY: &[&str] = &[
-    "a+b", "a?b", "*x", "a{2}", "a|b", "(ab)",
+    "a+b",
+    "a?b",
+    "*x",
+    "a{2}",
+    "a|b",
+    "(ab)",
     // GNU's two BRE repeat extensions, which an extended expression spells
     // without the backslash -- `s/ \+/ /g` is the corpus's commonest sed script.
-    "a\\+", " \\+", "x\\?", "[ \\t]\\+", "[0-9]\\+", "^a\\+$", "[[:space:]]\\+",
+    "a\\+",
+    " \\+",
+    "x\\?",
+    "[ \\t]\\+",
+    "[0-9]\\+",
+    "^a\\+$",
+    "[[:space:]]\\+",
 ];
 
 const INPUTS: &[&str] = &[
@@ -234,8 +303,13 @@ fn run(bin: &str, args: &[String], input: &str) -> Result<Ran, String> {
         // hit), so a refused write is that program's answer, not an error.
         let _ = w.write_all(input.as_bytes());
     }
-    let out = child.wait_with_output().map_err(|e| format!("{bin}: {e}"))?;
-    Ok(Ran { status: out.status.code().unwrap_or(-1), stdout: out.stdout })
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("{bin}: {e}"))?;
+    Ok(Ran {
+        status: out.status.code().unwrap_or(-1),
+        stdout: out.stdout,
+    })
 }
 
 /// A deterministic xorshift, so a failing run reproduces from its seed alone.
@@ -268,11 +342,37 @@ impl Rng {
 /// which is the folding path rather than the class one: a bracket holding only
 /// `[[:digit:]]` is served by a parser that read the class and stopped, and
 /// says nothing about one that has to go on reading after it.
-const ATOMS: &[&str] =
-    &["a", "b", "z", "1", "7", "=", "/", ".", "[0-9]", "[a-z]", "[^/]", "[abc]", "[^abc]", "x",
-      "\\.", "-", ":", "\\s", "\\w", "\\S", "\\W", "[[:digit:]]", "[[:alpha:]]",
-      "[^[:space:]]", "[[:punct:]]", "[[:digit:]abc]", "[x[:alpha:]]",
-      "[[:digit:][:punct:]]", "[^[:upper:]0-9]"];
+const ATOMS: &[&str] = &[
+    "a",
+    "b",
+    "z",
+    "1",
+    "7",
+    "=",
+    "/",
+    ".",
+    "[0-9]",
+    "[a-z]",
+    "[^/]",
+    "[abc]",
+    "[^abc]",
+    "x",
+    "\\.",
+    "-",
+    ":",
+    "\\s",
+    "\\w",
+    "\\S",
+    "\\W",
+    "[[:digit:]]",
+    "[[:alpha:]]",
+    "[^[:space:]]",
+    "[[:punct:]]",
+    "[[:digit:]abc]",
+    "[x[:alpha:]]",
+    "[[:digit:][:punct:]]",
+    "[^[:upper:]0-9]",
+];
 
 fn generated(rng: &mut Rng, ere: bool) -> String {
     // A BRE spells the two GNU repeats with a backslash, and they are the ones
@@ -350,8 +450,16 @@ fn compare(
         tally.mismatched += 1;
         if tally.mismatched <= 20 {
             println!("MISMATCH args={args:?} input={input:?}");
-            println!("  reference -> {} {:?}", theirs.status, String::from_utf8_lossy(&theirs.stdout));
-            println!("  ours      -> {} {:?}", ours.status, String::from_utf8_lossy(&ours.stdout));
+            println!(
+                "  reference -> {} {:?}",
+                theirs.status,
+                String::from_utf8_lossy(&theirs.stdout)
+            );
+            println!(
+                "  ours      -> {} {:?}",
+                ours.status,
+                String::from_utf8_lossy(&ours.stdout)
+            );
         }
     }
     Ok(())
@@ -360,13 +468,22 @@ fn compare(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let (Some(reference), Some(helper)) = (argv.first(), argv.get(1)) else {
-        return Err("usage: grep_differential <reference-grep> <spec-helpers-binary> [rounds] [seed]"
-            .into());
+        return Err(
+            "usage: grep_differential <reference-grep> <spec-helpers-binary> [rounds] [seed]"
+                .into(),
+        );
     };
     let rounds: usize = argv.get(2).and_then(|s| s.parse().ok()).unwrap_or(25_000);
-    let seed: u64 = argv.get(3).and_then(|s| s.parse().ok()).unwrap_or(0x2026_0811);
+    let seed: u64 = argv
+        .get(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x2026_0811);
 
-    let mut tally = Tally { compared: 0, refused: 0, mismatched: 0 };
+    let mut tally = Tally {
+        compared: 0,
+        refused: 0,
+        mismatched: 0,
+    };
 
     // --- the refusal contract --------------------------------------------
     let mut wrongly_accepted = 0usize;
@@ -380,10 +497,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ours = run(helper, &args, "ab\nfoo bar\nbfoob\n1\n")?;
         if ours.status != 2 {
             wrongly_accepted += 1;
-            println!("ACCEPTED (should refuse) {flag} {pat:?} -> status {}", ours.status);
+            println!(
+                "ACCEPTED (should refuse) {flag} {pat:?} -> status {}",
+                ours.status
+            );
         }
     }
-    println!("refusals: {} checked, {wrongly_accepted} wrongly accepted", REFUSALS.len());
+    println!(
+        "refusals: {} checked, {wrongly_accepted} wrongly accepted",
+        REFUSALS.len()
+    );
 
     // --- the systematic sweep --------------------------------------------
     for ere in [false, true] {

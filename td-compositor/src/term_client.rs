@@ -833,8 +833,7 @@ impl Surface {
                     self.pointer_x = args.i32()?;
                     self.pointer_y = args.i32()?;
                     if self.pointer_left_down {
-                        self.pending_selection_extent =
-                            Some((self.pointer_x, self.pointer_y));
+                        self.pending_selection_extent = Some((self.pointer_x, self.pointer_y));
                     }
                     args.finish()?;
                 }
@@ -1207,8 +1206,7 @@ impl Surface {
         }
         let pixel = |value: i32| usize::try_from(value.div_euclid(256)).unwrap_or(0);
         let row = (pixel(fixed.1) / font.height()).min(usize::from(rows).saturating_sub(1));
-        let column =
-            (pixel(fixed.0) / font.width()).min(usize::from(columns).saturating_sub(1));
+        let column = (pixel(fixed.0) / font.width()).min(usize::from(columns).saturating_sub(1));
         Some((row, column))
     }
 
@@ -1395,10 +1393,7 @@ impl Surface {
         &mut self,
         terminal: &Terminal,
     ) -> Result<Option<String>, String> {
-        if !self.clipboard_proof
-            || self.reported_clipboard_selection
-            || self.stale
-            || !self.ready()
+        if !self.clipboard_proof || self.reported_clipboard_selection || self.stale || !self.ready()
         {
             return Ok(None);
         }
@@ -2006,7 +2001,8 @@ fn spawn_clipboard_writer(
                             write.payload.len()
                         );
                         let _ = std::io::stderr().lock().write_all(detail.as_bytes());
-                        if let Some(marker) = clipboard_sent_marker(clipboard_proof, &write.payload) {
+                        if let Some(marker) = clipboard_sent_marker(clipboard_proof, &write.payload)
+                        {
                             let _ = std::io::stderr().lock().write_all(marker.as_bytes());
                         }
                     }
@@ -2383,8 +2379,7 @@ fn serve_event(
         // One locked `write_all` of one buffer, as every line this file
         // puts on the console is: a row that landed on a line of its own
         // could pass for a marker.
-        if let Some(report) = last_screen_report(child.program.as_deref(), status, model.as_ref())
-        {
+        if let Some(report) = last_screen_report(child.program.as_deref(), status, model.as_ref()) {
             let _ = std::io::stderr().lock().write_all(report.as_bytes());
         }
         return Err(ended(status));
@@ -2675,7 +2670,11 @@ fn last_screen_report(
         line.clear();
         for column in 0..columns {
             let scalar = snapshot.cell(row, column).scalar;
-            line.push(if crate::control::reportable(scalar) { scalar } else { ' ' });
+            line.push(if crate::control::reportable(scalar) {
+                scalar
+            } else {
+                ' '
+            });
         }
         let written = line.trim_end();
         report.push_str(&prefix);
@@ -4181,9 +4180,7 @@ mod tests {
                         4,
                         &[
                             72,
-                            crate::keyboard::MOD_CONTROL
-                                | crate::keyboard::MOD_SHIFT
-                                | excluded,
+                            crate::keyboard::MOD_CONTROL | crate::keyboard::MOD_SHIFT | excluded,
                             0,
                             0,
                             0,
@@ -4981,7 +4978,7 @@ mod tests {
                 shm: 2,
                 xdg_wm_base: 4,
                 seat: 5,
-            data_device_manager: 6,
+                data_device_manager: 6,
             });
             surface
                 .dispatch(

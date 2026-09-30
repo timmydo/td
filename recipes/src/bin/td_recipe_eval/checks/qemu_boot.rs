@@ -45,9 +45,9 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::Arc;
 use std::thread;
@@ -223,8 +223,7 @@ const TD_APPLICATION_CURSOR_PREFIX: &str =
 const FIREFOX_INPUT_CMDLINE_TOKEN: &str = td_recipe::ladder::FIREFOX_INPUT_CMDLINE_TOKEN;
 const FIREFOX_AUDIT_CMDLINE_TOKEN: &str = td_recipe::ladder::FIREFOX_AUDIT_CMDLINE_TOKEN;
 const KERNEL_AUDIT_CMDLINE_TOKEN: &str = td_recipe::ladder::KERNEL_AUDIT_CMDLINE_TOKEN;
-const KERNEL_AUDIT_OFF_CMDLINE_TOKEN: &str =
-    td_recipe::ladder::KERNEL_AUDIT_OFF_CMDLINE_TOKEN;
+const KERNEL_AUDIT_OFF_CMDLINE_TOKEN: &str = td_recipe::ladder::KERNEL_AUDIT_OFF_CMDLINE_TOKEN;
 const FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN: &str =
     td_recipe::ladder::FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN;
 const FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN: &str =
@@ -875,8 +874,15 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         runner.scratch_dir(),
         true,
     )?;
-    let moved = format!("TD-BOOT-VOLUME {} /dev/vdb", installation_uuid(&trust.public));
-    if !healthy_candidate.console.lines().any(|line| line.trim_end() == moved) {
+    let moved = format!(
+        "TD-BOOT-VOLUME {} /dev/vdb",
+        installation_uuid(&trust.public)
+    );
+    if !healthy_candidate
+        .console
+        .lines()
+        .any(|line| line.trim_end() == moved)
+    {
         return Err("reordered system boot did not resolve its UUID on /dev/vdb".into());
     }
     validate_system_boot(
@@ -2210,8 +2216,16 @@ fn validate_system_boot(
              td-firstboot's provisioned configuration, or the program itself failed within \
              the settle window, or its td-term window never reported ready. \
              Last serial output:\n{}",
-            if result.evidence.td_mail_running { "seen" } else { "absent" },
-            if result.evidence.td_news_running { "seen" } else { "absent" },
+            if result.evidence.td_mail_running {
+                "seen"
+            } else {
+                "absent"
+            },
+            if result.evidence.td_news_running {
+                "seen"
+            } else {
+                "absent"
+            },
             tail(&result.console, 80)
         ));
     }
@@ -2312,10 +2326,17 @@ fn validate_system_boot(
 
 fn require_primary_profile(result: &BootResult, name: &str) -> Result<(), String> {
     let expected = format!("TD-PRIMARY-PROFILE-READY {name}");
-    let names: Vec<_> = result.console.lines().map(str::trim_end)
-        .filter(|line| line.starts_with("TD-PRIMARY-PROFILE-READY ")).collect();
+    let names: Vec<_> = result
+        .console
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| line.starts_with("TD-PRIMARY-PROFILE-READY "))
+        .collect();
     if names != [expected.as_str()] {
-        return Err(format!("system did not activate its expected primary account {name}: {names:?}\n{}", tail(&result.console, 100)));
+        return Err(format!(
+            "system did not activate its expected primary account {name}: {names:?}\n{}",
+            tail(&result.console, 100)
+        ));
     }
     Ok(())
 }
@@ -2366,9 +2387,9 @@ fn validate_compositor_boot(result: &BootResult) -> Result<(), String> {
         ));
     }
     let output = field("output=");
-    let dimensions = output
-        .split_once('x')
-        .and_then(|(width, height)| Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?)));
+    let dimensions = output.split_once('x').and_then(|(width, height)| {
+        Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?))
+    });
     let width = match dimensions {
         Some((width, height)) if width > 0 && height > 0 => width,
         _ => {
@@ -2632,12 +2653,17 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
         },
         runner.scratch_dir(),
     )?;
-    println!("   [qemu-boot-session] elapsed: {:.2}s", result.elapsed.as_secs_f64());
+    println!(
+        "   [qemu-boot-session] elapsed: {:.2}s",
+        result.elapsed.as_secs_f64()
+    );
     validate_session_boot(&result)?;
     check_persistent_volume(&btrfs, &disk)?;
-    println!("PASS: one offline system session proves firstboot identity, immutable root, \
+    println!(
+        "PASS: one offline system session proves firstboot identity, immutable root, \
         owned state, component health, compositor/terminal readiness, application placement, \
-        browser support, Claude terminal admission and clean shutdown");
+        browser support, Claude terminal admission and clean shutdown"
+    );
     Ok(())
 }
 
@@ -3806,7 +3832,11 @@ fn provision_selector_with_uuid(
 /// The directory entries are emitted rather than assumed: neither phase of
 /// `build_initramfs_spec` creates `/etc`, and a missing parent is silent too —
 /// `filp_open` failing is `return 0` (`init/initramfs.c:385-387`).
-fn append_selector_identity(initramfs: &Path, key: &[u8], uuid: Option<&str>) -> Result<(), String> {
+fn append_selector_identity(
+    initramfs: &Path,
+    key: &[u8],
+    uuid: Option<&str>,
+) -> Result<(), String> {
     use td_engine::cpio::{Entry, Kind};
 
     // The caller's copy came from a store output, and `fs::copy` preserves the
@@ -4378,9 +4408,7 @@ fn boot(
     plan: BootPlan<'_>,
     scratch_base: &Path,
 ) -> Result<BootResult, String> {
-    boot_with_timeout(
-        qemu, bzimage, initramfs, plan, scratch_base, boot_timeout(),
-    )
+    boot_with_timeout(qemu, bzimage, initramfs, plan, scratch_base, boot_timeout())
 }
 
 #[derive(Clone, Copy)]
@@ -4399,8 +4427,14 @@ enum FirmwareAttachment {
 /// Firmware reads its kernel/initrd from the disk carried by BootPlan.
 #[derive(Clone, Copy)]
 enum BootSource<'a> {
-    Direct { kernel: &'a Path, initramfs: &'a Path },
-    DirectReordered { kernel: &'a Path, initramfs: &'a Path },
+    Direct {
+        kernel: &'a Path,
+        initramfs: &'a Path,
+    },
+    DirectReordered {
+        kernel: &'a Path,
+        initramfs: &'a Path,
+    },
     Firmware {
         code: &'a Path,
         vars: &'a Path,
@@ -4418,8 +4452,14 @@ fn boot_with_timeout(
     timeout: Duration,
 ) -> Result<BootResult, String> {
     boot_source(
-        qemu, BootSource::Direct { kernel: bzimage, initramfs },
-        plan, scratch_base, timeout,
+        qemu,
+        BootSource::Direct {
+            kernel: bzimage,
+            initramfs,
+        },
+        plan,
+        scratch_base,
+        timeout,
     )
 }
 
@@ -4450,31 +4490,57 @@ fn boot_source(
     if matches!(source, BootSource::DirectReordered { .. }) && plan.disk.is_none() {
         return Err("reordered direct boot requires a destination disk".into());
     }
-    if matches!(source, BootSource::Firmware {
-        attachment: FirmwareAttachment::Optical | FirmwareAttachment::Usb, ..
-    }) && plan.disk.as_ref().is_some_and(|disk| !disk.read_only) {
+    if matches!(
+        source,
+        BootSource::Firmware {
+            attachment: FirmwareAttachment::Optical | FirmwareAttachment::Usb,
+            ..
+        }
+    ) && plan.disk.as_ref().is_some_and(|disk| !disk.read_only)
+    {
         return Err("optical and USB media oracles require read-only disks".into());
     }
-    if matches!(source, BootSource::Firmware {
-        installation_target: Some(_),
-        attachment: FirmwareAttachment::Virtio | FirmwareAttachment::InstalledFixture, ..
-    }) {
+    if matches!(
+        source,
+        BootSource::Firmware {
+            installation_target: Some(_),
+            attachment: FirmwareAttachment::Virtio | FirmwareAttachment::InstalledFixture,
+            ..
+        }
+    ) {
         return Err("an installation target requires optical or USB source media".into());
     }
-    if matches!(source, BootSource::Firmware {
-        attachment: FirmwareAttachment::WritableUsbFixture, ..
-    }) {
-        let disk = plan.disk.as_ref().ok_or("writable USB fixture requires its image")?;
+    if matches!(
+        source,
+        BootSource::Firmware {
+            attachment: FirmwareAttachment::WritableUsbFixture,
+            ..
+        }
+    ) {
+        let disk = plan
+            .disk
+            .as_ref()
+            .ok_or("writable USB fixture requires its image")?;
         validate_writable_usb_image(disk)?;
-        if !matches!(source, BootSource::Firmware { installation_target: Some(_), .. }) {
+        if !matches!(
+            source,
+            BootSource::Firmware {
+                installation_target: Some(_),
+                ..
+            }
+        ) {
             return Err("writable USB fixture requires its private target".into());
         }
     }
     validate_boot_plan_tokens(plan.extra_append)?;
-    if matches!(source, BootSource::Firmware {
-        attachment: FirmwareAttachment::InstalledFixtureReordered,
-        installation_target: None, ..
-    }) {
+    if matches!(
+        source,
+        BootSource::Firmware {
+            attachment: FirmwareAttachment::InstalledFixtureReordered,
+            installation_target: None,
+            ..
+        }
+    ) {
         return Err("reordered fixture requires a private decoy disk".into());
     }
     if plan.capture_firefox_audio && (!plan.audio || !plan.physical_input) {
@@ -4561,16 +4627,34 @@ fn boot_source(
     // kill records to reach printk when CONFIG_AUDIT is compiled in.
     let append = kernel_append(plan.extra_append);
     let mut cmd = Command::new(qemu);
-    let machine = if matches!(source, BootSource::Firmware { .. }) { "q35" } else { "pc" };
-    cmd.args(["-M", machine, "-accel", "tcg", "-cpu", "Nehalem", "-m", plan.mem, "-no-reboot"])
-        .args(["-display", "none", "-monitor", "none"])
-        .args(["-no-user-config", "-vga", "none"])
-        .args(["-device", "virtio-vga"])
-        .args(["-device", "virtio-tablet-pci"])
-        .args(["-serial", &serial]);
+    let machine = if matches!(source, BootSource::Firmware { .. }) {
+        "q35"
+    } else {
+        "pc"
+    };
+    cmd.args([
+        "-M",
+        machine,
+        "-accel",
+        "tcg",
+        "-cpu",
+        "Nehalem",
+        "-m",
+        plan.mem,
+        "-no-reboot",
+    ])
+    .args(["-display", "none", "-monitor", "none"])
+    .args(["-no-user-config", "-vga", "none"])
+    .args(["-device", "virtio-vga"])
+    .args(["-device", "virtio-tablet-pci"])
+    .args(["-serial", &serial]);
     match source {
-        BootSource::Direct { kernel, initramfs } | BootSource::DirectReordered { kernel, initramfs } => {
-            cmd.arg("-kernel").arg(kernel).arg("-initrd").arg(initramfs)
+        BootSource::Direct { kernel, initramfs }
+        | BootSource::DirectReordered { kernel, initramfs } => {
+            cmd.arg("-kernel")
+                .arg(kernel)
+                .arg("-initrd")
+                .arg(initramfs)
                 .args(["-append", &append]);
         }
         BootSource::Firmware { code, vars, .. } => {
@@ -4608,10 +4692,15 @@ fn boot_source(
     if let Some(disk) = plan.disk {
         if matches!(source, BootSource::DirectReordered { .. }) {
             let decoy = dir.join("preceding-disk.raw");
-            OpenOptions::new().write(true).create_new(true).mode(0o600)
-                .open(&decoy).and_then(|file| file.set_len(1024 * 1024))
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&decoy)
+                .and_then(|file| file.set_len(1024 * 1024))
                 .map_err(|error| format!("create private preceding disk: {error}"))?;
-            cmd.arg("-drive").arg(drive_arg_with_id(&decoy, false, "preceding"));
+            cmd.arg("-drive")
+                .arg(drive_arg_with_id(&decoy, false, "preceding"));
             let prefix = crate::checks::vm_profile::DISK_DEVICE
                 .strip_suffix(crate::checks::vm_profile::DRIVE_ID)
                 .ok_or("VM disk device must end with its drive ID")?;
@@ -4619,19 +4708,24 @@ fn boot_source(
         }
         if let BootSource::Firmware {
             attachment: FirmwareAttachment::InstalledFixtureReordered,
-            installation_target: Some(decoy), ..
-        } = source {
+            installation_target: Some(decoy),
+            ..
+        } = source
+        {
             cmd.arg("-drive").arg(install::target_drive_arg(decoy));
             decoy.attach(&mut cmd, "td-install-decoy", Some(9))?;
         }
         match source {
             BootSource::Firmware {
-                attachment: FirmwareAttachment::Optical, ..
+                attachment: FirmwareAttachment::Optical,
+                ..
             } => {
                 cmd.arg("-drive").arg(media::optical_drive_arg(disk.path));
             }
             BootSource::Firmware {
-                attachment: attachment @ (FirmwareAttachment::Usb | FirmwareAttachment::WritableUsbFixture), ..
+                attachment:
+                    attachment @ (FirmwareAttachment::Usb | FirmwareAttachment::WritableUsbFixture),
+                ..
             } => {
                 cmd.args(["-device", "qemu-xhci,id=media-xhci"]);
                 let read_only = matches!(attachment, FirmwareAttachment::Usb) || disk.read_only;
@@ -4643,9 +4737,21 @@ fn boot_source(
             }
             _ => {
                 cmd.arg("-drive").arg(drive_arg(disk.path, disk.read_only));
-                if matches!(source, BootSource::Firmware { attachment: FirmwareAttachment::InstalledFixture | FirmwareAttachment::InstalledFixtureReordered, .. }) {
-                    disk.bus.attach(&mut cmd, crate::checks::vm_profile::DRIVE_ID,
-                        install::protocol::TARGET_SERIAL, Some(1), disk.sector_size)?;
+                if matches!(
+                    source,
+                    BootSource::Firmware {
+                        attachment: FirmwareAttachment::InstalledFixture
+                            | FirmwareAttachment::InstalledFixtureReordered,
+                        ..
+                    }
+                ) {
+                    disk.bus.attach(
+                        &mut cmd,
+                        crate::checks::vm_profile::DRIVE_ID,
+                        install::protocol::TARGET_SERIAL,
+                        Some(1),
+                        disk.sector_size,
+                    )?;
                 } else {
                     cmd.arg("-device").arg(format!(
                         "{}{}",
@@ -4657,9 +4763,14 @@ fn boot_source(
         }
     }
     if let BootSource::Firmware {
-        attachment: FirmwareAttachment::Optical | FirmwareAttachment::Usb | FirmwareAttachment::WritableUsbFixture,
-        installation_target: Some(target), ..
-    } = source {
+        attachment:
+            FirmwareAttachment::Optical
+            | FirmwareAttachment::Usb
+            | FirmwareAttachment::WritableUsbFixture,
+        installation_target: Some(target),
+        ..
+    } = source
+    {
         cmd.arg("-drive").arg(install::target_drive_arg(target));
         target.attach(&mut cmd, install::protocol::TARGET_SERIAL, None)?;
     }
@@ -4708,7 +4819,9 @@ fn boot_source(
         }
         if evidence.target && plan.kill_on_marker {
             let sent = child.kill().is_ok();
-            marker_killed = child.wait().is_ok_and(|status| sent && status.signal() == Some(9));
+            marker_killed = child
+                .wait()
+                .is_ok_and(|status| sent && status.signal() == Some(9));
             end = EndReason::MarkerSeen;
             break;
         }
@@ -6852,7 +6965,9 @@ fn tpm_chardev_arg(path: &Path) -> OsString {
     let mut out = OsString::from("socket,id=secret-tpm,path=");
     let mut escaped = Vec::new();
     for byte in path.as_os_str().as_bytes() {
-        if *byte == b',' { escaped.push(b','); }
+        if *byte == b',' {
+            escaped.push(b',');
+        }
         escaped.push(*byte);
     }
     out.push(OsString::from_vec(escaped));
@@ -7532,10 +7647,7 @@ fn validate_portal_screenshot(path: &Path, presentation: PortalPresentation) -> 
         PORTAL_CLIENT_X.saturating_add(300),
         PORTAL_CLIENT_Y.saturating_add(118),
     )?;
-    if corner != PORTAL_GROUND_RGB
-        || field != PORTAL_FIELD_RGB
-        || selected != PORTAL_SELECTED_RGB
-    {
+    if corner != PORTAL_GROUND_RGB || field != PORTAL_FIELD_RGB || selected != PORTAL_SELECTED_RGB {
         return Err(format!(
             "QMP portal screenshot missed its centred palette: corner={corner:02x?} field={field:02x?} selected={selected:02x?}"
         ));
@@ -7818,25 +7930,46 @@ mod tests {
         let _guard = Scratch { dir: dir.clone() };
         let demo = dir.join("demo");
         fs::create_dir(&demo).unwrap();
-        RunTrust::generate().unwrap().stage_installation_identity(&demo).unwrap();
+        RunTrust::generate()
+            .unwrap()
+            .stage_installation_identity(&demo)
+            .unwrap();
         assert_eq!(fs::read_dir(&demo).unwrap().count(), 0);
         let key = dir.join("source.pk8");
         fs::write(&key, b"private fixture bytes").unwrap();
         let trust = RunTrust {
             signing: SigningIdentity::Installation {
-                signer: dir.join("signer"), key, builder: dir.join("builder"),
+                signer: dir.join("signer"),
+                key,
+                builder: dir.join("builder"),
             },
             public: [3; 32],
         };
         let seed = dir.join("installed");
         trust.stage_installation_identity(&seed).unwrap();
         let state = seed.join("@var/lib/td-deploy");
-        assert_eq!(fs::metadata(&state).unwrap().permissions().mode() & 0o7777, 0o700);
-        assert_eq!(fs::metadata(state.join("deployment.pk8")).unwrap().permissions().mode() & 0o7777, 0o600);
-        assert_eq!(fs::read(state.join("deployment.pk8")).unwrap(), b"private fixture bytes");
+        assert_eq!(
+            fs::metadata(&state).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(state.join("deployment.pk8"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            fs::read(state.join("deployment.pk8")).unwrap(),
+            b"private fixture bytes"
+        );
         assert!(!seed.join("td/store").exists());
         assert!(trust.stage_installation_identity(&seed).is_err());
-        assert_eq!(fs::read(state.join("deployment.pk8")).unwrap(), b"private fixture bytes");
+        assert_eq!(
+            fs::read(state.join("deployment.pk8")).unwrap(),
+            b"private fixture bytes"
+        );
     }
 
     #[test]
@@ -8165,8 +8298,7 @@ mod tests {
         .unwrap_err()
         .contains("windows below"));
 
-        let scheduled =
-            verify_firefox_audio_bytes(&synthetic_firefox_wave(440.0, 1_200)).unwrap();
+        let scheduled = verify_firefox_audio_bytes(&synthetic_firefox_wave(440.0, 1_200)).unwrap();
         assert!((1_190..=1_200).contains(&scheduled.active_ms));
 
         let stretched =
@@ -9271,7 +9403,9 @@ mod tests {
         fs::create_dir_all(&fixture_seed).unwrap();
         stage_volume_trust_roots(&fixture_seed, &trust, VolumePurpose::Fixture).unwrap();
         assert!(
-            fixture_seed.join(td_recipe::ladder::DEPLOY_WRONG_KEY).is_file(),
+            fixture_seed
+                .join(td_recipe::ladder::DEPLOY_WRONG_KEY)
+                .is_file(),
             "the oracle still needs its decoy"
         );
     }
@@ -10128,7 +10262,10 @@ mod tests {
             record(TD_UTIL_RUNTIME_MARKER)
         );
         latch_console_evidence(&mut evidence, console.as_bytes(), b"target");
-        assert!(evidence.td_jail_kill_reaps, "the line after a record is a line of its own");
+        assert!(
+            evidence.td_jail_kill_reaps,
+            "the line after a record is a line of its own"
+        );
         assert!(
             !evidence.td_util_runtime,
             "a record after an unfinished line latched its marker"
@@ -10139,7 +10276,10 @@ mod tests {
             format!("...\n{TD_UTIL_RUNTIME_MARKER}\n").as_bytes(),
             b"target",
         );
-        assert!(evidence.td_util_runtime, "the marker on a line of its own is evidence");
+        assert!(
+            evidence.td_util_runtime,
+            "the marker on a line of its own is evidence"
+        );
 
         // Blanking keeps every offset and terminator; the record's prefix is
         // td-term's own spelling.
@@ -10190,12 +10330,20 @@ mod tests {
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _g = Scratch { dir: dir.clone() };
         for (prefix, expected) in [(head.clone(), false), ("x".repeat(head.len()), true)] {
-            let path = dir.join(if expected { "control.log" } else { "console.log" });
+            let path = dir.join(if expected {
+                "control.log"
+            } else {
+                "console.log"
+            });
             let mut bytes = vec![b'x'; start - 1];
             bytes.push(b'\n');
             bytes.extend_from_slice(prefix.as_bytes());
             bytes.extend_from_slice(pad.as_bytes());
-            assert_eq!(bytes.len(), marker_at, "the marker must begin past the seam");
+            assert_eq!(
+                bytes.len(),
+                marker_at,
+                "the marker must begin past the seam"
+            );
             bytes.extend_from_slice(TD_UTIL_RUNTIME_MARKER.as_bytes());
             bytes.push(b'\n');
             bytes.extend_from_slice(&[b'y'; 128]);
@@ -10271,27 +10419,27 @@ mod tests {
         evidence.td_firefox_support = true;
         evidence.td_init_runtime = true;
         evidence.td_compositor_kms = Some(HEALTHY_KMS_REPORT.to_string());
-    evidence.td_compositor_flip = Some("cookie=0x2 flip=ok".to_string());
-    evidence.td_jail_kill_reaps = true;
-    evidence.td_jail_seccomp = true;
-    evidence.td_jail_transition = true;
-    evidence.td_login_runtime = true;
-    evidence.td_pointer_absolute = true;
-    evidence.td_secret_runtime = true;
-    evidence.td_portal_request_runtime = true;
-    evidence.td_portal_runtime = true;
-    evidence.td_portal_unavailable_runtime = true;
-    evidence.td_profiler_attribution = true;
-    evidence.td_sandbox_kernel = true;
-    evidence.td_term_runtime = true;
-    evidence.td_fetch_ok = true;
-    evidence.td_mail_running = true;
-    evidence.td_news_running = true;
-    evidence.td_applications_placed = true;
-    evidence.td_txt_runtime = true;
-    evidence.td_util_runtime = true;
-    evidence.td_wayland_runtime = true;
-    evidence.uutils_runtime = true;
+        evidence.td_compositor_flip = Some("cookie=0x2 flip=ok".to_string());
+        evidence.td_jail_kill_reaps = true;
+        evidence.td_jail_seccomp = true;
+        evidence.td_jail_transition = true;
+        evidence.td_login_runtime = true;
+        evidence.td_pointer_absolute = true;
+        evidence.td_secret_runtime = true;
+        evidence.td_portal_request_runtime = true;
+        evidence.td_portal_runtime = true;
+        evidence.td_portal_unavailable_runtime = true;
+        evidence.td_profiler_attribution = true;
+        evidence.td_sandbox_kernel = true;
+        evidence.td_term_runtime = true;
+        evidence.td_fetch_ok = true;
+        evidence.td_mail_running = true;
+        evidence.td_news_running = true;
+        evidence.td_applications_placed = true;
+        evidence.td_txt_runtime = true;
+        evidence.td_util_runtime = true;
+        evidence.td_wayland_runtime = true;
+        evidence.uutils_runtime = true;
         evidence
     }
 
@@ -10381,9 +10529,15 @@ mod tests {
         result.evidence.td_claude_terminal = true;
         result.console = "TD-PRIMARY-PROFILE-READY tester\n".into();
         assert_eq!(validate_session_boot(&result), Ok(()));
-        for console in ["", "TD-PRIMARY-PROFILE-READY alice\n", "TD-PRIMARY-PROFILE-READY tester\nTD-PRIMARY-PROFILE-READY tester\n"] {
+        for console in [
+            "",
+            "TD-PRIMARY-PROFILE-READY alice\n",
+            "TD-PRIMARY-PROFILE-READY tester\nTD-PRIMARY-PROFILE-READY tester\n",
+        ] {
             let original = std::mem::replace(&mut result.console, console.into());
-            assert!(validate_session_boot(&result).unwrap_err().contains("expected primary account"));
+            assert!(validate_session_boot(&result)
+                .unwrap_err()
+                .contains("expected primary account"));
             result.console = original;
         }
         for (consumed, exhausted) in [(true, false), (false, true)] {
@@ -10423,7 +10577,9 @@ mod tests {
             .contains(TD_COMPOSITOR_DEVICES_PRIVATE_MARKER));
         result.evidence.compositor_devices_private = true;
         result.evidence.principals_enrolled = false;
-        assert!(validate(&result).unwrap_err().contains(TD_PRINCIPALS_MARKER));
+        assert!(validate(&result)
+            .unwrap_err()
+            .contains(TD_PRINCIPALS_MARKER));
     }
 
     /// What the compositor prints after `TD-COMPOSITOR-KMS-READY` on a healthy
@@ -10532,7 +10688,11 @@ mod tests {
             "{prefix}{}",
             "y".repeat(DRM_REPORT_MAX.saturating_sub(prefix.len()))
         );
-        assert_eq!(field.len(), DRM_REPORT_MAX, "the widest report the latch takes");
+        assert_eq!(
+            field.len(),
+            DRM_REPORT_MAX,
+            "the widest report the latch takes"
+        );
         let evidence = drain_across_a_read_boundary(&format!("{TD_COMPOSITOR_KMS_MARKER}{field}"));
         assert_eq!(
             evidence.td_compositor_kms.as_deref(),
@@ -10550,9 +10710,12 @@ mod tests {
             "{prefix}{}",
             "y".repeat(DRM_REPORT_MAX.saturating_sub(prefix.len()))
         );
-        assert_eq!(field.len(), DRM_REPORT_MAX, "the widest report the latch takes");
-        let evidence =
-            drain_across_a_read_boundary(&format!("{TD_COMPOSITOR_FLIP_MARKER}{field}"));
+        assert_eq!(
+            field.len(),
+            DRM_REPORT_MAX,
+            "the widest report the latch takes"
+        );
+        let evidence = drain_across_a_read_boundary(&format!("{TD_COMPOSITOR_FLIP_MARKER}{field}"));
         assert_eq!(
             evidence.td_compositor_flip.as_deref(),
             Some(field.trim()),
@@ -10642,7 +10805,10 @@ mod tests {
             assert!(!complaint.is_empty(), "{from} -> {to:?} was accepted");
         }
         let padded = HEALTHY_KMS_REPORT.replacen("stride=5120", "stride=8192", 1);
-        assert_eq!(compositor_complaint(Some(&padded), Some(HEALTHY_FLIP_REPORT)), "");
+        assert_eq!(
+            compositor_complaint(Some(&padded), Some(HEALTHY_FLIP_REPORT)),
+            ""
+        );
     }
 
     /// The flip row wants a real frame identity and `flip=ok`.
@@ -10805,8 +10971,10 @@ mod tests {
         let mut evidence = ConsoleEvidence::default();
         latch_console_evidence(
             &mut evidence,
-            format!("\ntd-jail: kill-reaps returned unexpected output: {TD_JAIL_KILL_REAPS_MARKER} x\n")
-                .as_bytes(),
+            format!(
+                "\ntd-jail: kill-reaps returned unexpected output: {TD_JAIL_KILL_REAPS_MARKER} x\n"
+            )
+            .as_bytes(),
             b"target",
         );
         assert!(
@@ -11174,10 +11342,10 @@ mod tests {
              {audit}"
         ))
         .is_err());
-        assert!(validate_boot_plan_tokens(&format!(
-            "{audit} {KERNEL_AUDIT_OFF_CMDLINE_TOKEN}"
-        ))
-        .is_err());
+        assert!(
+            validate_boot_plan_tokens(&format!("{audit} {KERNEL_AUDIT_OFF_CMDLINE_TOKEN}"))
+                .is_err()
+        );
     }
 
     #[test]

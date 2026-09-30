@@ -1829,12 +1829,20 @@ fn run_request(
     })?;
     let pid = child.id();
     let Some(stdout) = child.stdout.take() else {
-        terminate_tree(pid, "hosted command", "the hosted command has no stdout pipe");
+        terminate_tree(
+            pid,
+            "hosted command",
+            "the hosted command has no stdout pipe",
+        );
         let _ = child.wait();
         return Err("hosted command has no stdout pipe".to_string());
     };
     let Some(stderr) = child.stderr.take() else {
-        terminate_tree(pid, "hosted command", "the hosted command has no stderr pipe");
+        terminate_tree(
+            pid,
+            "hosted command",
+            "the hosted command has no stderr pipe",
+        );
         let _ = child.wait();
         return Err("hosted command has no stderr pipe".to_string());
     };
@@ -1842,7 +1850,11 @@ fn run_request(
     let out_thread = match spawn_output_pump("stdout", stdout, FRAME_STDOUT, out_writer) {
         Ok(thread) => thread,
         Err(e) => {
-            terminate_tree(pid, "hosted command", &format!("the stdout pump could not start: {e}"));
+            terminate_tree(
+                pid,
+                "hosted command",
+                &format!("the stdout pump could not start: {e}"),
+            );
             let _ = child.wait();
             return Err(e);
         }
@@ -1851,7 +1863,11 @@ fn run_request(
     let err_thread = match spawn_output_pump("stderr", stderr, FRAME_STDERR, err_writer) {
         Ok(thread) => thread,
         Err(e) => {
-            terminate_tree(pid, "hosted command", &format!("the stderr pump could not start: {e}"));
+            terminate_tree(
+                pid,
+                "hosted command",
+                &format!("the stderr pump could not start: {e}"),
+            );
             let _ = child.wait();
             // Same reason as the cancel path: a pump parked on a stalled
             // client would otherwise hold this worker for the whole budget.
@@ -1872,7 +1888,11 @@ fn run_request(
                 // child, and the caller is about to write its own frames down
                 // the same stream. Leaving them running splices one into the
                 // other and manufactures a framing error.
-                terminate_tree(pid, "hosted command", &format!("waiting for the hosted command failed: {e}"));
+                terminate_tree(
+                    pid,
+                    "hosted command",
+                    &format!("waiting for the hosted command failed: {e}"),
+                );
                 writer.abandon();
                 let _ = out_thread.join();
                 let _ = err_thread.join();
@@ -1913,7 +1933,11 @@ fn run_request(
             // child alive for the whole stall budget, precisely when that is
             // most expensive. The explanation is worth a few seconds, not
             // minutes, so it also carries its own short deadline.
-            terminate_tree(pid, "hosted command", &format!("the request was cancelled: {}", causes.join(", ")));
+            terminate_tree(
+                pid,
+                "hosted command",
+                &format!("the request was cancelled: {}", causes.join(", ")),
+            );
             if pressure {
                 let _ = writer.frame_if_free(
                     FRAME_STDERR,
@@ -2021,7 +2045,10 @@ fn terminate_tree(root: u32, role: &str, reason: &str) {
         (crate::sys::KillTarget::Pid(i64::from(root)), why.clone()),
     ];
     kills.extend(descendants.into_iter().map(|pid| {
-        (crate::sys::KillTarget::Pid(i64::from(pid)), format!("{why}; descendant"))
+        (
+            crate::sys::KillTarget::Pid(i64::from(pid)),
+            format!("{why}; descendant"),
+        )
     }));
     let _ = crate::sys::kill_all_recorded(&kills, crate::sys::SIGKILL);
 }

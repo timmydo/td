@@ -91,8 +91,14 @@ mod tests {
     /// The one form every boot marker is written with.
     #[test]
     fn the_marker_form_renders_exactly() {
-        assert_eq!(render("%s\\n", &s(&["td-rootcheck-v1"])), Ok("td-rootcheck-v1\n".to_string()));
-        assert_eq!(render("%s\\n", &s(&["waiting"])), Ok("waiting\n".to_string()));
+        assert_eq!(
+            render("%s\\n", &s(&["td-rootcheck-v1"])),
+            Ok("td-rootcheck-v1\n".to_string())
+        );
+        assert_eq!(
+            render("%s\\n", &s(&["waiting"])),
+            Ok("waiting\n".to_string())
+        );
     }
 
     /// The format REPEATS while operands remain, and runs once with none.

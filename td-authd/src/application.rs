@@ -43,7 +43,9 @@ fn decimal(text: &str, range: std::ops::RangeInclusive<u32>) -> Result<u32, Stri
 impl Request {
     fn parse(arguments: &[String]) -> Result<Self, String> {
         let [owner, name, mode, separator, rest @ ..] = arguments else {
-            return Err("application launch requires OWNER APP direct|terminal|shell -- ARG...".into());
+            return Err(
+                "application launch requires OWNER APP direct|terminal|shell -- ARG...".into(),
+            );
         };
         let owner = decimal(owner, 1000..=1000)?;
         if separator != "--"
@@ -157,11 +159,7 @@ fn admit(owner: u32, name: &str) -> Result<u32, String> {
     // that Command alive would prevent the reply's required EOF.
     let mut check = CheckedChild(
         Command::new("/bin/td-firstboot")
-            .args([
-                "check-launch-application",
-                &owner.to_string(),
-                name,
-            ])
+            .args(["check-launch-application", &owner.to_string(), name])
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::null())
@@ -219,7 +217,9 @@ fn read_reply(mut parent: UnixStream, deadline: Instant) -> Result<Vec<u8>, Stri
 }
 
 pub(crate) fn admitted_uid(name: &str) -> Result<u32, String> {
-    if !crate::consent::application_name(name) { return Err("invalid application name".into()); }
+    if !crate::consent::application_name(name) {
+        return Err("invalid application name".into());
+    }
     admit(1000, name)
 }
 

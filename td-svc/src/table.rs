@@ -411,10 +411,7 @@ pub fn parse(text: &str) -> (Vec<Unit>, Vec<String>) {
         }
     }
     if !clashes.is_empty() {
-        let named: Vec<&str> = clashes
-            .iter()
-            .filter_map(|c| c.split(':').next())
-            .collect();
+        let named: Vec<&str> = clashes.iter().filter_map(|c| c.split(':').next()).collect();
         units.retain(|u| !named.iter().any(|n| *n == u.name));
         problems.extend(clashes);
     }
@@ -641,7 +638,9 @@ fn finish(unit: Unit, stanza: Stanza, units: &mut Vec<Unit>, problems: &mut Vec<
     // td-svc's stderr already reaches the console. Accepting this would be the
     // accepted-and-ignored key the table forbids.
     if unit.console && unit.log.is_none() {
-        problems.push(format!("{name}: console= needs log=; there is nothing to copy"));
+        problems.push(format!(
+            "{name}: console= needs log=; there is nothing to copy"
+        ));
         ok = false;
     }
     // A unit cannot require itself: that is a cycle stated in one line, and
@@ -734,7 +733,8 @@ mod tests {
 
     #[test]
     fn comments_and_blank_lines_are_ignored() {
-        let (units, problems) = parse("# a comment\n\n[a]\n# another\ntype=daemon\nexec=/bin/x\n\n");
+        let (units, problems) =
+            parse("# a comment\n\n[a]\n# another\ntype=daemon\nexec=/bin/x\n\n");
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(units.len(), 1);
     }
@@ -781,9 +781,8 @@ mod tests {
 
     #[test]
     fn the_console_may_not_be_made_skippable() {
-        let (units, problems) = parse(
-            "[greeter]\ntype=daemon\nexec=/etc/tty-session\ntty=ttyS0\nrequires=netup\n",
-        );
+        let (units, problems) =
+            parse("[greeter]\ntype=daemon\nexec=/etc/tty-session\ntty=ttyS0\nrequires=netup\n");
         assert!(units.is_empty());
         assert!(
             problems.iter().any(|p| p.contains("never skippable")),
@@ -803,9 +802,8 @@ mod tests {
     /// `log=` names where output is captured, and `console=` copies it.
     #[test]
     fn a_unit_can_declare_where_its_output_goes() {
-        let (units, problems) = parse(
-            "[g]\ntype=daemon\nexec=/x\nlog=/var/log/svc/g.log\nconsole=yes\n",
-        );
+        let (units, problems) =
+            parse("[g]\ntype=daemon\nexec=/x\nlog=/var/log/svc/g.log\nconsole=yes\n");
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(
             units.first().and_then(|u| u.log.as_deref()),
@@ -829,9 +827,8 @@ mod tests {
     /// The limit keys, and the units they produce.
     #[test]
     fn a_unit_declares_its_own_bounds() {
-        let (units, problems) = parse(
-            "[g]\ntype=daemon\nexec=/x\nmemory-max=64M\npids-max=32\ncpu-weight=200\n",
-        );
+        let (units, problems) =
+            parse("[g]\ntype=daemon\nexec=/x\nmemory-max=64M\npids-max=32\ncpu-weight=200\n");
         assert!(problems.is_empty(), "{problems:?}");
         let g = units.first().expect("one unit");
         assert_eq!(g.limits.memory_max, Some(64 * 1024 * 1024));
@@ -856,13 +853,30 @@ mod tests {
     /// the one that matters: `memory.max=0` kills the service on its first page.
     #[test]
     fn a_size_is_binary_and_never_zero() {
-        for (text, want) in [("512", 512u64), ("1K", 1024), ("2M", 2 << 20), ("1G", 1 << 30)] {
+        for (text, want) in [
+            ("512", 512u64),
+            ("1K", 1024),
+            ("2M", 2 << 20),
+            ("1G", 1 << 30),
+        ] {
             assert_eq!(parse_bytes(text), Ok(want), "{text}");
         }
-        for bad in ["0", "0M", "", "M", "-1", "64MB", "1.5M", "99999999999999999999G"] {
+        for bad in [
+            "0",
+            "0M",
+            "",
+            "M",
+            "-1",
+            "64MB",
+            "1.5M",
+            "99999999999999999999G",
+        ] {
             assert!(parse_bytes(bad).is_err(), "{bad} was accepted");
         }
-        assert!(parse_count("0").is_err(), "a unit may not hold zero processes");
+        assert!(
+            parse_count("0").is_err(),
+            "a unit may not hold zero processes"
+        );
         assert_eq!(parse_count("32"), Ok(32));
         for bad in ["0", "10001", "-1", "x"] {
             assert!(parse_weight(bad).is_err(), "cpu weight {bad} was accepted");
@@ -884,10 +898,12 @@ mod tests {
             "a session unit owns no leaf, so it names none"
         );
         for value in ["yes", "own", "system", ""] {
-            let (units, problems) =
-                parse(&format!("[g]\ntype=daemon\nexec=/x\ncgroup={value}\n"));
+            let (units, problems) = parse(&format!("[g]\ntype=daemon\nexec=/x\ncgroup={value}\n"));
             assert!(units.is_empty(), "cgroup={value} was admitted");
-            assert!(problems.iter().any(|p| p.contains("unknown cgroup")), "{problems:?}");
+            assert!(
+                problems.iter().any(|p| p.contains("unknown cgroup")),
+                "{problems:?}"
+            );
         }
     }
 
@@ -895,9 +911,8 @@ mod tests {
     /// nothing. Refused as a pair, the way `tty=` with `log=` is.
     #[test]
     fn a_session_unit_may_not_declare_a_limit_it_cannot_hold() {
-        let (units, problems) = parse(
-            "[g]\ntype=daemon\nexec=/x\ncgroup=session\nmemory-max=64M\n",
-        );
+        let (units, problems) =
+            parse("[g]\ntype=daemon\nexec=/x\ncgroup=session\nmemory-max=64M\n");
         assert!(units.is_empty(), "a limit was admitted on a session unit");
         assert!(
             problems.iter().any(|p| p.contains("mutually exclusive")),
@@ -918,7 +933,14 @@ mod tests {
     fn a_unit_may_not_be_named_for_a_cgroup_file() {
         // `.` and `..` traverse; the rest are real interface files that exist
         // in every cgroup directory before td-svc creates anything.
-        for name in [".", "..", "cgroup.procs", "memory.max", "pids.max", "cpu.weight"] {
+        for name in [
+            ".",
+            "..",
+            "cgroup.procs",
+            "memory.max",
+            "pids.max",
+            "cpu.weight",
+        ] {
             let (units, problems) = parse(&format!("[{name}]\ntype=daemon\nexec=/x\n"));
             assert!(units.is_empty(), "a unit named '{name}' was admitted");
             assert!(
@@ -991,8 +1013,7 @@ mod tests {
     /// broken instead of obviously so.
     #[test]
     fn a_console_unit_may_not_also_be_captured() {
-        let (units, problems) =
-            parse("[g]\ntype=daemon\nexec=/x\ntty=ttyS0\nlog=/var/log/g.log\n");
+        let (units, problems) = parse("[g]\ntype=daemon\nexec=/x\ntty=ttyS0\nlog=/var/log/g.log\n");
         assert!(units.is_empty(), "tty= and log= were admitted together");
         assert!(
             problems.iter().any(|p| p.contains("mutually exclusive")),
@@ -1019,7 +1040,10 @@ mod tests {
     fn an_empty_terminal_name_is_refused() {
         let (units, problems) = parse("[g]\ntype=daemon\nexec=/x\ntty=\n");
         assert!(units.is_empty());
-        assert!(problems.iter().any(|p| p.contains("needs a terminal")), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("needs a terminal")),
+            "{problems:?}"
+        );
     }
 
     /// A line the parser cannot read has an UNKNOWN intent, so it fails its
@@ -1027,9 +1051,11 @@ mod tests {
     /// logged and then ignored, starting the service with no strict dependency.
     #[test]
     fn a_line_that_is_not_key_value_fails_its_stanza() {
-        let (units, problems) =
-            parse("[svc]\ntype=daemon\nexec=/x\nrequires firewall\n");
-        assert!(units.is_empty(), "a unit whose intent was not parsed must not run");
+        let (units, problems) = parse("[svc]\ntype=daemon\nexec=/x\nrequires firewall\n");
+        assert!(
+            units.is_empty(),
+            "a unit whose intent was not parsed must not run"
+        );
         assert!(problems.iter().any(|p| p.contains("expected key=value")));
     }
 
@@ -1059,8 +1085,7 @@ mod tests {
 
     #[test]
     fn duplicate_units_are_rejected_rather_than_silently_merged() {
-        let (units, problems) =
-            parse("[a]\ntype=oneshot\nexec=/x\n[a]\ntype=oneshot\nexec=/y\n");
+        let (units, problems) = parse("[a]\ntype=oneshot\nexec=/x\n[a]\ntype=oneshot\nexec=/y\n");
         assert_eq!(units.len(), 1);
         assert!(problems.iter().any(|p| p.contains("duplicate")));
     }
@@ -1077,7 +1102,11 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("unterminated")));
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].name, "good");
-        assert_eq!(units[0].argv, ["/bin/true"], "the stanza above was rewritten");
+        assert_eq!(
+            units[0].argv,
+            ["/bin/true"],
+            "the stanza above was rewritten"
+        );
         assert_eq!(units[0].kind, Kind::Oneshot);
     }
 
@@ -1090,7 +1119,10 @@ mod tests {
             u64::MAX
         ));
         assert!(units.is_empty());
-        assert!(problems.iter().any(|p| p.contains("ceiling")), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("ceiling")),
+            "{problems:?}"
+        );
         let (_, problems) = parse("[a]\ntype=oneshot\nexec=/x\ntimeout=3600\n");
         assert!(problems.is_empty(), "the ceiling itself must be accepted");
     }
@@ -1122,9 +1154,13 @@ mod tests {
     #[test]
     fn readiness_and_timeout_belong_to_the_right_kind() {
         let (_, problems) = parse("[a]\ntype=oneshot\nexec=/x\nready=/bin/true\n");
-        assert!(problems.iter().any(|p| p.contains("ready= applies to daemons")));
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("ready= applies to daemons")));
         let (_, problems) = parse("[a]\ntype=daemon\nexec=/x\ntimeout=5\n");
-        assert!(problems.iter().any(|p| p.contains("timeout= applies to oneshots")));
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("timeout= applies to oneshots")));
     }
 
     /// `restart=` on a oneshot was accepted and then ignored — the table said
@@ -1134,13 +1170,17 @@ mod tests {
         let (units, problems) = parse("[a]\ntype=oneshot\nexec=/x\nrestart=always\n");
         assert!(units.is_empty());
         assert!(
-            problems.iter().any(|p| p.contains("restart= applies to daemons")),
+            problems
+                .iter()
+                .any(|p| p.contains("restart= applies to daemons")),
             "{problems:?}"
         );
         // Including the one that matches the default: it still reads as a
         // promise, and the point is that the key has no meaning here.
         let (_, problems) = parse("[a]\ntype=oneshot\nexec=/x\nrestart=never\n");
-        assert!(problems.iter().any(|p| p.contains("restart= applies to daemons")));
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("restart= applies to daemons")));
         let (_, problems) = parse("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
         assert!(problems.is_empty(), "{problems:?}");
     }
@@ -1149,9 +1189,8 @@ mod tests {
     /// it, burying the one complaint that explained the whole stanza.
     #[test]
     fn a_rejected_header_does_not_cascade_a_complaint_per_key() {
-        let (units, problems) = parse(
-            "[a\ntype=daemon\nexec=/x\nafter=b\nrestart=always\nready=/bin/true\n",
-        );
+        let (units, problems) =
+            parse("[a\ntype=daemon\nexec=/x\nafter=b\nrestart=always\nready=/bin/true\n");
         assert!(units.is_empty());
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("unterminated"));
@@ -1182,7 +1221,9 @@ mod tests {
         assert!(split_argv("\"unclosed").is_err());
         assert!(split_argv("trailing\\").is_err());
         let (_, problems) = parse("[a]\ntype=oneshot\nexec=/bin/x 'oops\n");
-        assert!(problems.iter().any(|p| p.contains("unterminated single quote")));
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("unterminated single quote")));
     }
 
     /// The splitter is a COPY of td-init's, so these are the cases that would

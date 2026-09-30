@@ -163,7 +163,8 @@ impl JmapClient {
                 match fetched.location {
                     Some(location) => {
                         log_debug!("[JMAP] Following redirect {} -> {}", status, location);
-                        (current_url, carries) = Self::redirect_target(url, &current_url, &location);
+                        (current_url, carries) =
+                            Self::redirect_target(url, &current_url, &location);
                         continue;
                     }
                     None => {
@@ -1600,7 +1601,8 @@ impl JmapClient {
             if (300..400).contains(&status) {
                 match fetched.location {
                     Some(location) => {
-                        (current_url, carries) = Self::redirect_target(&url, &current_url, &location);
+                        (current_url, carries) =
+                            Self::redirect_target(&url, &current_url, &location);
                         continue;
                     }
                     None => {
@@ -1832,8 +1834,16 @@ mod tests {
         for (location, target, carries) in [
             ("/jmap/session", "https://mail.example/jmap/session", true),
             ("session", "https://mail.example/.well-known/session", true),
-            ("https://MAIL.example:443/s", "https://MAIL.example:443/s", true),
-            ("https://api.example/session", "https://api.example/session", false),
+            (
+                "https://MAIL.example:443/s",
+                "https://MAIL.example:443/s",
+                true,
+            ),
+            (
+                "https://api.example/session",
+                "https://api.example/session",
+                false,
+            ),
             ("http://mail.example/x", "http://mail.example/x", false),
             ("//evil.example/x", "https://evil.example/x", false),
         ] {
@@ -1850,9 +1860,14 @@ mod tests {
         let local = "http://127.0.0.1:8080/a";
         assert!(JmapClient::redirect_target(local, local, "http://127.0.0.1:8080/b").1);
         assert!(!JmapClient::redirect_target(local, local, "http://127.0.0.1:9090/b").1);
-        assert!(JmapClient::redirect_target("http://Local.Test:80/a", local, "http://local.test/b").1);
+        assert!(
+            JmapClient::redirect_target("http://Local.Test:80/a", local, "http://local.test/b").1
+        );
         let err = JmapClient::left_the_origin(401, trusted, "https://api.example/s");
-        assert!(err.to_string().contains("configure that URL directly"), "{err}");
+        assert!(
+            err.to_string().contains("configure that URL directly"),
+            "{err}"
+        );
     }
 
     /// A base with no path is its own directory; the query is not part
@@ -1860,9 +1875,18 @@ mod tests {
     #[test]
     fn a_relative_redirect_resolves_against_the_base_it_came_from() {
         let resolve = JmapClient::resolve_redirect;
-        assert_eq!(resolve("https://mail.example", "session"), "https://mail.example/session");
-        assert_eq!(resolve("https://mail.example", "/s"), "https://mail.example/s");
-        assert_eq!(resolve("https://mail.example/", "s"), "https://mail.example/s");
+        assert_eq!(
+            resolve("https://mail.example", "session"),
+            "https://mail.example/session"
+        );
+        assert_eq!(
+            resolve("https://mail.example", "/s"),
+            "https://mail.example/s"
+        );
+        assert_eq!(
+            resolve("https://mail.example/", "s"),
+            "https://mail.example/s"
+        );
         assert_eq!(resolve("https://h/a/b?q=/x", "c"), "https://h/a/c");
         assert_eq!(resolve("https://h/a/b", "//other/c"), "https://other/c");
         assert_eq!(resolve("https://h/a/b", "http://o/c"), "http://o/c");
@@ -1874,7 +1898,12 @@ mod tests {
         assert_eq!(uri_encode("a-b.c_d~E9"), "a-b.c_d~E9");
         assert_eq!(uri_encode("message/rfc822"), "message%2Frfc822");
         let hostile = uri_encode("x\nheader foo: bar?y#z");
-        assert!(!hostile.bytes().any(|b| b.is_ascii_control() || b"/?#: ".contains(&b)), "{hostile}");
+        assert!(
+            !hostile
+                .bytes()
+                .any(|b| b.is_ascii_control() || b"/?#: ".contains(&b)),
+            "{hostile}"
+        );
         assert_eq!(hostile, "x%0Aheader%20foo%3A%20bar%3Fy%23z");
     }
 }

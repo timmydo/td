@@ -104,9 +104,9 @@ mod tests {
             }),
             "nothing runs the terminal's own selftest"
         );
-        let claimed = steps.iter().any(|step| {
-            matches!(step, Step::WriteFile { content, .. } if content.contains("td-term"))
-        });
+        let claimed = steps.iter().any(
+            |step| matches!(step, Step::WriteFile { content, .. } if content.contains("td-term")),
+        );
         assert!(claimed, "the result does not mention what it proved");
     }
 

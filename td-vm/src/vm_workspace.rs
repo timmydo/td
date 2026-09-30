@@ -71,10 +71,17 @@ impl Workspace {
             return Err("workspace exceeds size limit".into());
         }
         let (header, rest) = text.split_once('\n').ok_or("missing workspace header")?;
-        if !matches!(header, "TDVM-WORKSPACE-1" | "TDVM-WORKSPACE-2" | "TDVM-WORKSPACE-3") {
+        if !matches!(
+            header,
+            "TDVM-WORKSPACE-1" | "TDVM-WORKSPACE-2" | "TDVM-WORKSPACE-3"
+        ) {
             return Err("invalid workspace header".into());
         }
-        let count = match header { "TDVM-WORKSPACE-1" => 3, "TDVM-WORKSPACE-2" => 5, _ => 6 };
+        let count = match header {
+            "TDVM-WORKSPACE-1" => 3,
+            "TDVM-WORKSPACE-2" => 5,
+            _ => 6,
+        };
         let mut fields = rest.splitn(count, '\n');
 
         let id = fields.next().ok_or("missing workspace identity")?;
@@ -94,11 +101,16 @@ impl Workspace {
             None
         };
         let start = if header == "TDVM-WORKSPACE-3" {
-            if enrollment.as_ref().is_none_or(|state| state.phase == Phase::Pending) {
+            if enrollment
+                .as_ref()
+                .is_none_or(|state| state.phase == Phase::Pending)
+            {
                 return Err("starting commit requires an acknowledged enrollment".into());
             }
             Some(fields.next().ok_or("missing starting commit")?.to_string())
-        } else { None };
+        } else {
+            None
+        };
         let profile = Profile::parse(fields.next().ok_or("missing workspace profile")?)?;
         if let Some(oid) = &start {
             crate::vm_git_origin::Origin::new(profile.repository()?.into(), oid.clone())?;
@@ -122,12 +134,18 @@ impl Workspace {
             ),
             Some(state) => format!(
                 "{}\n{}\n{}\n{}\n{}\n{}{}",
-                if self.start.is_some() { "TDVM-WORKSPACE-3" } else { "TDVM-WORKSPACE-2" },
+                if self.start.is_some() {
+                    "TDVM-WORKSPACE-3"
+                } else {
+                    "TDVM-WORKSPACE-2"
+                },
                 self.id,
                 self.branch,
                 state.phase.text(),
                 state.key,
-                self.start.as_ref().map_or_else(String::new, |oid| format!("{oid}\n")),
+                self.start
+                    .as_ref()
+                    .map_or_else(String::new, |oid| format!("{oid}\n")),
                 self.profile.encode()
             ),
         }
@@ -189,14 +207,22 @@ impl Workspace {
     pub fn record_start(&mut self, dir: &Path, oid: &str) -> Result<()> {
         crate::vm_git_origin::Origin::new(self.profile.repository()?.into(), oid.into())?;
         if load(dir)?.as_ref() != Some(self)
-            || self.enrollment.as_ref().is_none_or(|state| state.phase != Phase::Enrolled)
+            || self
+                .enrollment
+                .as_ref()
+                .is_none_or(|state| state.phase != Phase::Enrolled)
             || self.start.as_ref().is_some_and(|old| old != oid)
         {
             return Err("refusing changed workspace or starting-commit replacement".into());
         }
         let next = Self {
-            id: self.id.clone(), branch: self.branch.clone(), profile: self.profile.clone(),
-            enrollment: self.enrollment.as_ref().map(|state| Enrollment { phase: state.phase, key: state.key.clone() }),
+            id: self.id.clone(),
+            branch: self.branch.clone(),
+            profile: self.profile.clone(),
+            enrollment: self.enrollment.as_ref().map(|state| Enrollment {
+                phase: state.phase,
+                key: state.key.clone(),
+            }),
             start: Some(oid.into()),
         };
         next.save(dir)?;
@@ -251,7 +277,10 @@ impl Workspace {
                 "sync workspace directory",
             )?;
             for parent in dir.ancestors().skip(1) {
-                io(File::open(parent).and_then(|file| file.sync_all()), "sync workspace publication ancestor")?;
+                io(
+                    File::open(parent).and_then(|file| file.sync_all()),
+                    "sync workspace publication ancestor",
+                )?;
             }
             Ok(())
         })();
@@ -289,8 +318,14 @@ mod tests {
     use super::*;
     #[test]
     fn recorded_start_is_immutable_and_survives_revocation() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("td-start-state-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "td-start-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_nanos()
+        ));
         fs::create_dir(&dir).map_err(|e| e.to_string())?;
         let result = (|| {
             let profile = Profile::parse(&format!("TDVM-GIT-PROFILE-1\nrepository=/srv/git/td.git\naddress=10.0.2.2\nport=22\nuser=test\nserver-uid=1001\nsocket=/home/test/.td-vm-registrar\nregistrar=/usr/local/libexec/td-vm-registrar\ngit=/bin/git\nhost-key={KEY}\nauthor-name=Fixture\nauthor-email=fixture@example.invalid\n"))?;
@@ -311,7 +346,10 @@ mod tests {
             assert!(Workspace::parse(&encoded.replace(&oid, &"0".repeat(40))).is_err());
             assert!(Workspace::parse(&encoded.replace("\nenrolled\n", "\npending\n")).is_err());
             workspace.transition(&dir, Phase::Revoking, KEY)?;
-            assert_eq!(load(&dir)?.ok_or("missing workspace")?.start.as_deref(), Some(oid.as_str()));
+            assert_eq!(
+                load(&dir)?.ok_or("missing workspace")?.start.as_deref(),
+                Some(oid.as_str())
+            );
             assert!(workspace.record_start(&dir, &oid).is_err());
             assert!(workspace.transition(&dir, Phase::Enrolled, KEY).is_err());
             Ok(())
@@ -319,5 +357,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
         result
     }
-    const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+    const KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
 }

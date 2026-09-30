@@ -852,10 +852,19 @@ pub const AUTH_REJECTIONS: &[(&str, &[u8])] = &[
     ("ANONYMOUS", b"\x00AUTH ANONYMOUS\r\n"),
     ("DBUS_COOKIE_SHA1", b"\x00AUTH DBUS_COOKIE_SHA1 6162\r\n"),
     ("a bare AUTH", b"\x00AUTH\r\n"),
-    ("an identity that is not numeric", b"\x00AUTH EXTERNAL 6162\r\n"),
+    (
+        "an identity that is not numeric",
+        b"\x00AUTH EXTERNAL 6162\r\n",
+    ),
     // "+1000": numeric to `parse`, and a second text for one uid.
-    ("an identity carrying a sign", b"\x00AUTH EXTERNAL 2b31303030\r\n"),
-    ("an identity that is not this peer", b"\x00AUTH EXTERNAL 39\r\n"),
+    (
+        "an identity carrying a sign",
+        b"\x00AUTH EXTERNAL 2b31303030\r\n",
+    ),
+    (
+        "an identity that is not this peer",
+        b"\x00AUTH EXTERNAL 39\r\n",
+    ),
 ];
 
 /// One command that is right for another state. The specification answers
@@ -977,7 +986,9 @@ fn check_auth() -> Result<(), String> {
             let mut reply = Vec::new();
             let mut at = 0usize;
             while at < transcript.client.len() && !shake.begun() {
-                let Some(end) = at.checked_add(chunk).map(|end| end.min(transcript.client.len()))
+                let Some(end) = at
+                    .checked_add(chunk)
+                    .map(|end| end.min(transcript.client.len()))
                 else {
                     break;
                 };
@@ -1187,7 +1198,10 @@ fn check_auth() -> Result<(), String> {
     for (spelling, client) in [
         ("a stated identity", &b"\x00AUTH EXTERNAL 31303030\r\n"[..]),
         ("an empty DATA", &b"\x00AUTH EXTERNAL\r\nDATA\r\n"[..]),
-        ("a stated DATA", &b"\x00AUTH EXTERNAL\r\nDATA 31303030\r\n"[..]),
+        (
+            "a stated DATA",
+            &b"\x00AUTH EXTERNAL\r\nDATA 31303030\r\n"[..],
+        ),
     ] {
         let mut shake = Handshake::new(mapped, guid);
         shake
@@ -1380,7 +1394,11 @@ fn check_messages() -> Result<(), String> {
     }
     match message::frame_len(&[]) {
         Ok(None) => {}
-        other => return Err(format!("frame_len claimed to know an empty frame: {other:?}")),
+        other => {
+            return Err(format!(
+                "frame_len claimed to know an empty frame: {other:?}"
+            ))
+        }
     }
 
     check_round_trips()
@@ -1409,8 +1427,8 @@ fn check_round_trips() -> Result<(), String> {
         .map_err(|e| format!("marshalling NameOwnerChanged: {e}"))?
         .encode()
         .map_err(|e| format!("encoding NameOwnerChanged: {e}"))?;
-        let (decoded, _) = message::decode(&signal, 0)
-            .map_err(|e| format!("decoding NameOwnerChanged: {e}"))?;
+        let (decoded, _) =
+            message::decode(&signal, 0).map_err(|e| format!("decoding NameOwnerChanged: {e}"))?;
         let expected = "signal serial=7 flags=0x0 path=/org/freedesktop/DBus \
 interface=org.freedesktop.DBus member=NameOwnerChanged signature=sss \
 args=s:org.example.App|s:|s::1.4";
@@ -1440,7 +1458,8 @@ args=s:org.example.App|s:|s::1.4";
             .map_err(|e| format!("encoding the error: {e}"))?;
         let (decoded, _) =
             message::decode(&error, 0).map_err(|e| format!("decoding the error: {e}"))?;
-        let expected = "error serial=8 flags=0x1 error_name=org.freedesktop.DBus.Error.AccessDenied \
+        let expected =
+            "error serial=8 flags=0x1 error_name=org.freedesktop.DBus.Error.AccessDenied \
 destination=:1.4 signature=s reply_serial=7 args=s:no";
         let described = describe(&decoded)?;
         if described != expected {
@@ -1471,7 +1490,11 @@ destination=:1.4 signature=s reply_serial=7 args=s:no";
     .map_err(|e| format!("encoding the descriptor carrier: {e}"))?;
     match message::decode(&carrier, 2) {
         Ok((decoded, _)) if decoded.fields.unix_fds == Some(2) => {}
-        other => return Err(format!("a two-descriptor message did not decode: {other:?}")),
+        other => {
+            return Err(format!(
+                "a two-descriptor message did not decode: {other:?}"
+            ))
+        }
     }
     match message::decode(&carrier, 1) {
         Err(MessageError::FdCountMismatch) => {}
@@ -1488,12 +1511,16 @@ destination=:1.4 signature=s reply_serial=7 args=s:no";
         Some("org.example.Sink"),
         "Take",
     )
-        .unix_fds(message::MAX_FDS_PER_MESSAGE + 1)
-        .serial(10)
-        .encode()
+    .unix_fds(message::MAX_FDS_PER_MESSAGE + 1)
+    .serial(10)
+    .encode()
     {
         Err(MessageError::TooManyFds) => {}
-        other => return Err(format!("a message over the descriptor cap was built: {other:?}")),
+        other => {
+            return Err(format!(
+                "a message over the descriptor cap was built: {other:?}"
+            ))
+        }
     }
     Ok(())
 }
@@ -1525,10 +1552,7 @@ pub fn selftest() -> Result<String, String> {
     }
 
     for stream in STREAMS {
-        for (endian, bytes) in [
-            (Endian::Little, stream.little),
-            (Endian::Big, stream.big),
-        ] {
+        for (endian, bytes) in [(Endian::Little, stream.little), (Endian::Big, stream.big)] {
             let rendered = decode(bytes, stream.signature, endian, SAMPLER_FDS)
                 .map_err(|e| format!("{}: {e}", stream.name))?;
             if rendered != stream.expect {
@@ -1638,7 +1662,10 @@ mod tests {
             );
         }
         assert!(SAMPLER_SIGNATURE.contains('('), "no struct in the sampler");
-        assert!(SAMPLER_SIGNATURE.contains('{'), "no dict entry in the sampler");
+        assert!(
+            SAMPLER_SIGNATURE.contains('{'),
+            "no dict entry in the sampler"
+        );
     }
 
     /// Each refusal must name a distinct failure, or the table would look like

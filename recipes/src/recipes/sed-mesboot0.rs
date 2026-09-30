@@ -228,9 +228,12 @@ pub fn recipe() -> Recipe {
     // mes delivers the byte before the flush panics, so it arrives either way and
     // sed's exit(4) is swallowed inside `$(...)'. Assert on exit status, as here.
     steps.push(
-        Step::run("{src}", &["{out}/bin/sed", "-n", "w /dev/null", "smoke.txt"])
-            .env("LANG", "")
-            .env("LC_ALL", ""),
+        Step::run(
+            "{src}",
+            &["{out}/bin/sed", "-n", "w /dev/null", "smoke.txt"],
+        )
+        .env("LANG", "")
+        .env("LC_ALL", ""),
     );
 
     Recipe::mesboot("sed-mesboot0", "4.0.9")

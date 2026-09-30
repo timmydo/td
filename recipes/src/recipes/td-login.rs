@@ -75,7 +75,10 @@ const MODULES: &[(&str, &str)] = &[
     ("db", include_str!("../../../td-login/src/db.rs")),
     ("exec_as", include_str!("../../../td-login/src/exec_as.rs")),
     ("login", include_str!("../../../td-login/src/login.rs")),
-    ("primary_account", include_str!("../../../td-authd/src/primary_account.rs")),
+    (
+        "primary_account",
+        include_str!("../../../td-authd/src/primary_account.rs"),
+    ),
     ("session", include_str!("../../../td-login/src/session.rs")),
     ("status", include_str!("../../../td-login/src/status.rs")),
     ("su", include_str!("../../../td-login/src/su.rs")),
@@ -142,7 +145,9 @@ pub fn recipe() -> Recipe {
 
     let mut steps = Vec::new();
     for directory in ["{src}/td-login/src", "{src}/td-authd/src"] {
-        steps.push(Step::MkDir { path: directory.into() });
+        steps.push(Step::MkDir {
+            path: directory.into(),
+        });
     }
     steps.push(Step::MkDir {
         path: "{out}/bin".into(),
@@ -169,7 +174,9 @@ pub fn recipe() -> Recipe {
     steps.push(Step::MkDir {
         path: "{root}/eh".into(),
     });
-    steps.push(Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
+    steps.push(
+        Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
+    );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
     steps.push(
         target_rustc(

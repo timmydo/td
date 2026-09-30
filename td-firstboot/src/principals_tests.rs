@@ -96,7 +96,8 @@ impl AccountStageFixture {
         for _ in 0..64 {
             let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!(
-                "td-primary-stage-{}-{stamp}-{serial}", std::process::id()
+                "td-primary-stage-{}-{stamp}-{serial}",
+                std::process::id()
             ));
             match std::fs::DirBuilder::new().mode(0o700).create(&root) {
                 Ok(()) => return Ok(root),
@@ -104,7 +105,9 @@ impl AccountStageFixture {
                 Err(error) => return Err(error),
             }
         }
-        Err(std::io::Error::other("account fixture staging names exhausted"))
+        Err(std::io::Error::other(
+            "account fixture staging names exhausted",
+        ))
     }
 
     fn new() -> Self {
@@ -155,7 +158,10 @@ fn primary_staging_creates_consistent_private_output_without_changing_the_source
     check_primary_name(&output, "alice").unwrap();
     check_deployment(&output).unwrap();
     assert_eq!(std::fs::metadata(&output).unwrap().mode() & 0o7777, 0o700);
-    assert_eq!(std::fs::metadata(output.join("etc")).unwrap().mode() & 0o7777, 0o755);
+    assert_eq!(
+        std::fs::metadata(output.join("etc")).unwrap().mode() & 0o7777,
+        0o755
+    );
     for (name, original, mode) in [
         (TABLE_NAME, TABLE, 0o444),
         ("passwd", PASSWD, 0o644),
@@ -217,38 +223,122 @@ fn primary_staging_refuses_bad_identity_or_writable_parent_before_creating_outpu
 #[test]
 fn primary_names_preserve_numeric_reservations_and_reject_identity_collisions() {
     let registry = Registry::parse(TABLE).unwrap();
-    for name in ["tester", "alice", "a-b_2", "tda", "tdcarol", "tda99x", &"a".repeat(32)] {
-        registry.check_primary_name(PASSWD, GROUP, SHADOW, name).unwrap();
+    for name in [
+        "tester",
+        "alice",
+        "a-b_2",
+        "tda",
+        "tdcarol",
+        "tda99x",
+        &"a".repeat(32),
+    ] {
+        registry
+            .check_primary_name(PASSWD, GROUP, SHADOW, name)
+            .unwrap();
     }
-    for name in ["root", "other", "wheel", "tdc1000", "tdb1001", "tdp1000", "tda65536",
-        "tdc1002", "tda99999", "tdb0", "tdp0001",
-        "", "Alice", "-alice", "1alice", "a.b", "../root", "alice\n", "álîce", &"a".repeat(33)] {
-        assert!(registry.check_primary_name(PASSWD, GROUP, SHADOW, name).is_err(), "accepted {name:?}");
+    for name in [
+        "root",
+        "other",
+        "wheel",
+        "tdc1000",
+        "tdb1001",
+        "tdp1000",
+        "tda65536",
+        "tdc1002",
+        "tda99999",
+        "tdb0",
+        "tdp0001",
+        "",
+        "Alice",
+        "-alice",
+        "1alice",
+        "a.b",
+        "../root",
+        "alice\n",
+        "álîce",
+        &"a".repeat(33),
+    ] {
+        assert!(
+            registry
+                .check_primary_name(PASSWD, GROUP, SHADOW, name)
+                .is_err(),
+            "accepted {name:?}"
+        );
     }
     // The preflight also accepts a deployment already using a different name.
-    registry.check_primary_name(
-        &PASSWD.replace("tester", "alice"),
-        &GROUP.replace("tester", "alice"),
-        &SHADOW.replace("tester", "alice"), "alice").unwrap();
+    registry
+        .check_primary_name(
+            &PASSWD.replace("tester", "alice"),
+            &GROUP.replace("tester", "alice"),
+            &SHADOW.replace("tester", "alice"),
+            "alice",
+        )
+        .unwrap();
 }
 
 #[test]
 fn primary_name_check_refuses_orphan_authority_and_inconsistent_tables() {
     let registry = Registry::parse(TABLE).unwrap();
     for (passwd, group, shadow) in [
-        (PASSWD.to_owned(), GROUP.replace("10:tester", "10:tester,alice"), SHADOW.to_owned()),
-        (PASSWD.to_owned(), GROUP.replace("10:tester", "10:tester,missing"), SHADOW.to_owned()),
-        (PASSWD.to_owned(), GROUP.replace("10:tester", "10:tester,tester"), SHADOW.to_owned()),
-        (PASSWD.to_owned(), GROUP.replace("10:tester", "10:tester,"), SHADOW.to_owned()),
-        (PASSWD.to_owned(), GROUP.replace("tester:x:1000:", "alias:x:1000:"), SHADOW.to_owned()),
-        (PASSWD.to_owned(), GROUP.replace("tester:x:1000:\n", ""), SHADOW.to_owned()),
-        (PASSWD.to_owned(), GROUP.replace("tester:x:1000:", "tester:x:01000:"), SHADOW.to_owned()),
-        (PASSWD.to_owned(), GROUP.to_owned(), SHADOW.replace("tester::0:0:99999:7:::\n", "")),
-        (PASSWD.to_owned(), GROUP.to_owned(), format!("{SHADOW}alice:secret-hash:0:0:99999:7:::\n")),
-        (PASSWD.replace("/home/tester", "/home/tester/../root"), GROUP.to_owned(), SHADOW.to_owned()),
-        (PASSWD.replace("1000:1000", "1000:0"), GROUP.to_owned(), SHADOW.to_owned()),
+        (
+            PASSWD.to_owned(),
+            GROUP.replace("10:tester", "10:tester,alice"),
+            SHADOW.to_owned(),
+        ),
+        (
+            PASSWD.to_owned(),
+            GROUP.replace("10:tester", "10:tester,missing"),
+            SHADOW.to_owned(),
+        ),
+        (
+            PASSWD.to_owned(),
+            GROUP.replace("10:tester", "10:tester,tester"),
+            SHADOW.to_owned(),
+        ),
+        (
+            PASSWD.to_owned(),
+            GROUP.replace("10:tester", "10:tester,"),
+            SHADOW.to_owned(),
+        ),
+        (
+            PASSWD.to_owned(),
+            GROUP.replace("tester:x:1000:", "alias:x:1000:"),
+            SHADOW.to_owned(),
+        ),
+        (
+            PASSWD.to_owned(),
+            GROUP.replace("tester:x:1000:\n", ""),
+            SHADOW.to_owned(),
+        ),
+        (
+            PASSWD.to_owned(),
+            GROUP.replace("tester:x:1000:", "tester:x:01000:"),
+            SHADOW.to_owned(),
+        ),
+        (
+            PASSWD.to_owned(),
+            GROUP.to_owned(),
+            SHADOW.replace("tester::0:0:99999:7:::\n", ""),
+        ),
+        (
+            PASSWD.to_owned(),
+            GROUP.to_owned(),
+            format!("{SHADOW}alice:secret-hash:0:0:99999:7:::\n"),
+        ),
+        (
+            PASSWD.replace("/home/tester", "/home/tester/../root"),
+            GROUP.to_owned(),
+            SHADOW.to_owned(),
+        ),
+        (
+            PASSWD.replace("1000:1000", "1000:0"),
+            GROUP.to_owned(),
+            SHADOW.to_owned(),
+        ),
     ] {
-        let error = registry.check_primary_name(&passwd, &group, &shadow, "alice").unwrap_err();
+        let error = registry
+            .check_primary_name(&passwd, &group, &shadow, "alice")
+            .unwrap_err();
         assert!(!error.contains("secret-hash"));
     }
 }
@@ -263,7 +353,14 @@ fn active_application_accounts_bind_reserved_uids_to_private_homes() {
     let shadow = format!("{SHADOW}tda65536:!td-service:0:0:99999:7:::\n");
     registry.verify_accounts(&passwd, &group, &shadow).unwrap();
     let active = registry.application_accounts(&passwd).unwrap();
-    assert_eq!(active, vec![Application { owner: 1000, name: "firefox".into(), uid: 65536 }]);
+    assert_eq!(
+        active,
+        vec![Application {
+            owner: 1000,
+            name: "firefox".into(),
+            uid: 65536
+        }]
+    );
     for bad in [
         passwd.replace("applications/65536", "applications/65537"),
         passwd.replace("/var/lib/td/applications/65536", "/home/tester"),
@@ -375,7 +472,12 @@ fn staged_configuration_check_is_read_only_and_refuses_substituted_files() {
     check_deployment(&root).unwrap();
     check_primary_name(&root, "alice").unwrap();
     assert!(check_primary_name(&root, "root").is_err());
-    for (name, contents) in [("passwd", PASSWD), ("group", GROUP), ("shadow", SHADOW), ("td-principals.tsv", TABLE)] {
+    for (name, contents) in [
+        ("passwd", PASSWD),
+        ("group", GROUP),
+        ("shadow", SHADOW),
+        ("td-principals.tsv", TABLE),
+    ] {
         assert_eq!(fs::read_to_string(etc.join(name)).unwrap(), contents);
     }
     assert!(!root.join("var").exists());

@@ -145,7 +145,13 @@ const OPTS: &[&[&str]] = &[&[], &["-e"], &["--expression"]];
 
 /// …and the extended dialect, which needs its own scripts because `+` and `?`
 /// are operators there and literals in a BRE.
-const ERE_SCRIPTS: &[&str] = &["s/a+/X/", "s/a+/X/g", "s/[0-9]+/N/g", "s/ +/ /g", "s/a?b/Y/g"];
+const ERE_SCRIPTS: &[&str] = &[
+    "s/a+/X/",
+    "s/a+/X/g",
+    "s/[0-9]+/N/g",
+    "s/ +/ /g",
+    "s/a?b/Y/g",
+];
 
 const ERE_OPTS: &[&[&str]] = &[&["-E"], &["-r"], &["--regexp-extended"]];
 
@@ -178,7 +184,9 @@ fn run(bin: &str, args: &[String], input: &str) -> Result<Ran, String> {
         // then fails -- which is the refusal, not a harness error.
         let _ = sink.write_all(&bytes);
     }
-    let out = child.wait_with_output().map_err(|e| format!("wait {bin}: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("wait {bin}: {e}"))?;
     Ok(Ran {
         status: out.status.code().unwrap_or(-1),
         stdout: out.stdout,
@@ -252,8 +260,28 @@ impl Rng {
 
 /// Pattern pieces the matcher serves, so a generated script stays in subset.
 const PAT: &[&str] = &[
-    "a", "b", "x", "=", " ", "\\t", "[0-9]", "[a-z]", "[^a]", "[[:space:]]", "[[:digit:]]",
-    "\\s", "\\w", ".", "a*", "[0-9]*", "\\s\\+", "a\\+", "b\\?", "^a", "c$", "[ \\t]",
+    "a",
+    "b",
+    "x",
+    "=",
+    " ",
+    "\\t",
+    "[0-9]",
+    "[a-z]",
+    "[^a]",
+    "[[:space:]]",
+    "[[:digit:]]",
+    "\\s",
+    "\\w",
+    ".",
+    "a*",
+    "[0-9]*",
+    "\\s\\+",
+    "a\\+",
+    "b\\?",
+    "^a",
+    "c$",
+    "[ \\t]",
 ];
 
 /// …and replacement pieces, `&` among them since it is the one that reads the
@@ -261,9 +289,10 @@ const PAT: &[&str] = &[
 /// 100000 generated rounds could not see `\a`/`\f`/`\v` being emitted as the
 /// letter: a generator that never writes an escape cannot find one resolved
 /// wrongly.
-const REP: &[&str] =
-    &["X", "", "&", "[&]", "-", "\\t", "\\n", "&&", "_", "y", "\\a", "\\f", "\\v", "\\r",
-      "\\x41", "\\x4", "\\x", "\\&", "\\\\"];
+const REP: &[&str] = &[
+    "X", "", "&", "[&]", "-", "\\t", "\\n", "&&", "_", "y", "\\a", "\\f", "\\v", "\\r", "\\x41",
+    "\\x4", "\\x", "\\&", "\\\\",
+];
 
 /// The delimiters the corpus spells, plus `,` -- varied because `\<delim>` has
 /// to become a literal delimiter, which is a per-delimiter rule.
@@ -312,11 +341,16 @@ fn generated_input(rng: &mut Rng) -> String {
 fn main() -> Result<(), String> {
     let argv: Vec<String> = std::env::args().collect();
     let (Some(reference), Some(helper)) = (argv.get(1), argv.get(2)) else {
-        return Err("usage: sed_differential <reference-sed> <spec-helpers-binary> [rounds] [seed]"
-            .to_string());
+        return Err(
+            "usage: sed_differential <reference-sed> <spec-helpers-binary> [rounds] [seed]"
+                .to_string(),
+        );
     };
     let rounds: usize = argv.get(3).and_then(|s| s.parse().ok()).unwrap_or(20_000);
-    let seed: u64 = argv.get(4).and_then(|s| s.parse().ok()).unwrap_or(0x2026_0812);
+    let seed: u64 = argv
+        .get(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x2026_0812);
 
     let mut wrongly_accepted = 0usize;
     for script in REFUSALS {
@@ -324,12 +358,21 @@ fn main() -> Result<(), String> {
         let ours = run(helper, &args, "abc\nx\n")?;
         if ours.status != 2 {
             wrongly_accepted += 1;
-            println!("ACCEPTED (should refuse) {script:?} -> status {}", ours.status);
+            println!(
+                "ACCEPTED (should refuse) {script:?} -> status {}",
+                ours.status
+            );
         }
     }
-    println!("refusals: {} checked, {wrongly_accepted} wrongly accepted", REFUSALS.len());
+    println!(
+        "refusals: {} checked, {wrongly_accepted} wrongly accepted",
+        REFUSALS.len()
+    );
 
-    let mut tally = Tally { compared: 0, mismatched: 0 };
+    let mut tally = Tally {
+        compared: 0,
+        mismatched: 0,
+    };
     for script in SCRIPTS {
         for input in INPUTS {
             for opt in OPTS {
@@ -349,7 +392,10 @@ fn main() -> Result<(), String> {
             }
         }
     }
-    println!("sweep: {} compared, {} mismatched", tally.compared, tally.mismatched);
+    println!(
+        "sweep: {} compared, {} mismatched",
+        tally.compared, tally.mismatched
+    );
 
     // FILE OPERANDS, which the generated rounds cannot reach: they feed one
     // stdin stream, and a file's end is a LINE's end. Concatenating two
@@ -376,7 +422,10 @@ fn main() -> Result<(), String> {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
-    println!("with file operands: {} compared, {} mismatched", tally.compared, tally.mismatched);
+    println!(
+        "with file operands: {} compared, {} mismatched",
+        tally.compared, tally.mismatched
+    );
 
     let mut rng = Rng(seed | 1);
     for _ in 0..rounds {

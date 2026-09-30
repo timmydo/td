@@ -28,7 +28,12 @@ fn verify_ripgrep_seed_closure(report: &str) -> Result<(), String> {
             ));
         }
     }
-    if report.lines().filter(|line| line.starts_with("store\t")).count() != 2 {
+    if report
+        .lines()
+        .filter(|line| line.starts_with("store\t"))
+        .count()
+        != 2
+    {
         return Err("ripgrep-seed application closure must contain exactly two store paths".into());
     }
     let source_disposition = report.lines().find_map(|line| {
@@ -63,10 +68,12 @@ mod tests {
         verify_ripgrep_seed_closure(&report("build-only")).unwrap();
         let error = verify_ripgrep_seed_closure(&report("retained")).unwrap_err();
         assert!(error.contains("build-only"), "{error}");
-        let error = verify_ripgrep_seed_closure(
-            &report("build-only").replace("members\t2", "members\t3"),
-        )
-        .unwrap_err();
-        assert!(error.contains("members\\t2") || error.contains("members\t2"), "{error}");
+        let error =
+            verify_ripgrep_seed_closure(&report("build-only").replace("members\t2", "members\t3"))
+                .unwrap_err();
+        assert!(
+            error.contains("members\\t2") || error.contains("members\t2"),
+            "{error}"
+        );
     }
 }

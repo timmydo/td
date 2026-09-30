@@ -414,20 +414,18 @@ impl Guest {
     fn wait_for_source(&mut self) -> Result<()> {
         let original_deadline = self.deadline;
         self.deadline = original_deadline.min(Instant::now() + Duration::from_secs(600));
-        let result: Result<()> = (|| {
-            loop {
-                if Instant::now() >= self.deadline {
-                    return Err("release source initialization timed out".into());
-                }
-                let state = self.scalar(
+        let result: Result<()> = (|| loop {
+            if Instant::now() >= self.deadline {
+                return Err("release source initialization timed out".into());
+            }
+            let state = self.scalar(
                     "if test -L /var/home/tester/src/td/update; then echo source-ready; else echo source-pending; fi",
                     |line| matches!(line, "source-ready" | "source-pending"),
                 )?;
-                if state == "source-ready" {
-                    return Ok(());
-                }
-                thread::sleep(Duration::from_secs(1));
+            if state == "source-ready" {
+                return Ok(());
             }
+            thread::sleep(Duration::from_secs(1));
         })();
         self.deadline = original_deadline;
         result.map_err(|error| format!("wait for release source initialization: {error}"))

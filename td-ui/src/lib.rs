@@ -50,11 +50,11 @@ pub mod driven;
 #[path = "../../td-compositor/src/filter.rs"]
 pub mod filter;
 pub mod finder;
-pub mod hint;
 #[path = "../../td-compositor/src/font.rs"]
 pub mod font;
 #[path = "../../td-compositor/src/font_data.rs"]
 mod font_data;
+pub mod hint;
 pub mod keyboard;
 pub mod menus;
 pub mod notices;

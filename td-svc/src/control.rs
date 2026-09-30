@@ -449,7 +449,10 @@ mod tests {
              could run a different verb than the client sent"
         );
         // ...and nothing reached the loop, so no verb ran.
-        assert!(rx.try_recv().is_err(), "a truncated request reached the loop");
+        assert!(
+            rx.try_recv().is_err(),
+            "a truncated request reached the loop"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -506,9 +509,7 @@ mod tests {
 
         // Connect, then hold the connection open and send nothing at all.
         let client = UnixStream::connect(&path).unwrap();
-        let released = done_rx
-            .recv_timeout(READ_TIMEOUT.saturating_mul(3))
-            .is_ok();
+        let released = done_rx.recv_timeout(READ_TIMEOUT.saturating_mul(3)).is_ok();
         drop(client);
         assert!(
             released,
@@ -595,7 +596,9 @@ mod tests {
             unreachable!("expected a control event")
         };
         assert_eq!(request, "status");
-        reply.send("greeter ready pid=42 failures=0\n".into()).unwrap();
+        reply
+            .send("greeter ready pid=42 failures=0\n".into())
+            .unwrap();
 
         let mut got = String::new();
         BufReader::new(client).read_line(&mut got).unwrap();

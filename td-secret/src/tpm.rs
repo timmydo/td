@@ -782,7 +782,13 @@ pub(crate) mod tests {
             put_blob(&mut parameters, &[]).unwrap();
             put32(&mut parameters, 0);
             let (handle, out) = client
-                .call(CREATE_PRIMARY, &[hierarchy], Some(PASSWORD), &parameters, true)
+                .call(
+                    CREATE_PRIMARY,
+                    &[hierarchy],
+                    Some(PASSWORD),
+                    &parameters,
+                    true,
+                )
                 .unwrap();
             let mut reader = Reader(&out);
             let returned = reader.blob().unwrap();
@@ -832,7 +838,9 @@ pub(crate) mod tests {
             for _ in 0..2 {
                 let value = reader.blob().unwrap();
                 assert!((1..=32).contains(&value.len()));
-                let first = value.iter().position(|byte| *byte != 0)
+                let first = value
+                    .iter()
+                    .position(|byte| *byte != 0)
                     .expect("TPM returned a zero ECDSA component");
                 let value = &value[first..];
                 let pad = usize::from(value[0] & 0x80 != 0);
@@ -1422,9 +1430,13 @@ pub(crate) mod tests {
     }
 
     fn qemu_guard(case: &str) {
-        assert!(std::fs::read_to_string("/proc/cmdline").unwrap()
-            .split_whitespace().any(|word| word == "td.tpm-fixture=1"),
-            "requires the explicitly selected disposable TPM guest");
+        assert!(
+            std::fs::read_to_string("/proc/cmdline")
+                .unwrap()
+                .split_whitespace()
+                .any(|word| word == "td.tpm-fixture=1"),
+            "requires the explicitly selected disposable TPM guest"
+        );
         assert_eq!(std::fs::read_to_string("/case").unwrap(), case);
     }
 
@@ -1440,12 +1452,18 @@ pub(crate) mod tests {
         let mut parameters = 1u32.to_be_bytes().to_vec();
         put16(&mut parameters, SHA256);
         parameters.extend_from_slice(digest);
-        qemu_client().call(0x182, &[7], Some(PASSWORD), &parameters, false).unwrap();
+        qemu_client()
+            .call(0x182, &[7], Some(PASSWORD), &parameters, false)
+            .unwrap();
     }
 
     fn qemu_disk(write: bool) -> File {
-        let file = OpenOptions::new().read(true).write(write)
-            .custom_flags(O_NOFOLLOW).open("/dev/vda").unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(write)
+            .custom_flags(O_NOFOLLOW)
+            .open("/dev/vda")
+            .unwrap();
         assert!(file.metadata().unwrap().file_type().is_block_device());
         file
     }
@@ -1468,8 +1486,11 @@ pub(crate) mod tests {
         let key = BoundKey::decode(&bytes).unwrap();
         key.require_binding(1000, &QEMU_BINDING).unwrap();
         qemu_extend(&[9; 32]);
-        assert_eq!(qemu_client().snapshot(Pcrs::parse("7").unwrap()).unwrap(),
-            key.key.pcr_digest, "cold boot did not reproduce the fixture PCR state");
+        assert_eq!(
+            qemu_client().snapshot(Pcrs::parse("7").unwrap()).unwrap(),
+            key.key.pcr_digest,
+            "cold boot did not reproduce the fixture PCR state"
+        );
         key
     }
 
@@ -1479,17 +1500,25 @@ pub(crate) mod tests {
         use std::io::{Seek, SeekFrom};
         qemu_guard("tpm-seal");
         qemu_extend(&[9; 32]);
-        let sealed = qemu_client().seal_bound(1000, Pcrs::parse("7").unwrap(),
-            &QEMU_KEY, &QEMU_BINDING).unwrap();
-        assert_eq!(qemu_client().unseal_bound(&sealed, &QEMU_BINDING).unwrap(), QEMU_KEY);
+        let sealed = qemu_client()
+            .seal_bound(1000, Pcrs::parse("7").unwrap(), &QEMU_KEY, &QEMU_BINDING)
+            .unwrap();
+        assert_eq!(
+            qemu_client().unseal_bound(&sealed, &QEMU_BINDING).unwrap(),
+            QEMU_KEY
+        );
         let encoded = sealed.encode().unwrap();
         let mut disk = qemu_disk(true);
         let mut empty = [0; 4096];
         disk.read_exact(&mut empty).unwrap();
-        assert!(empty.iter().all(|byte| *byte == 0), "fixture disk is not fresh");
+        assert!(
+            empty.iter().all(|byte| *byte == 0),
+            "fixture disk is not fresh"
+        );
         disk.seek(SeekFrom::Start(0)).unwrap();
         disk.write_all(QEMU_DISK_MAGIC).unwrap();
-        disk.write_all(&u32::try_from(encoded.len()).unwrap().to_be_bytes()).unwrap();
+        disk.write_all(&u32::try_from(encoded.len()).unwrap().to_be_bytes())
+            .unwrap();
         disk.write_all(&encoded).unwrap();
         disk.sync_all().unwrap();
     }
@@ -1499,7 +1528,10 @@ pub(crate) mod tests {
     fn qemu_device_reopens_after_cold_boot() {
         qemu_guard("tpm-reopen");
         let sealed = qemu_read_key();
-        assert_eq!(qemu_client().unseal_bound(&sealed, &QEMU_BINDING).unwrap(), QEMU_KEY);
+        assert_eq!(
+            qemu_client().unseal_bound(&sealed, &QEMU_BINDING).unwrap(),
+            QEMU_KEY
+        );
     }
 
     #[test]
@@ -1507,11 +1539,18 @@ pub(crate) mod tests {
     fn qemu_device_refuses_changed_pcr() {
         qemu_guard("tpm-pcr");
         let sealed = qemu_read_key();
-        assert_eq!(qemu_client().unseal_bound(&sealed, &QEMU_BINDING).unwrap(), QEMU_KEY);
+        assert_eq!(
+            qemu_client().unseal_bound(&sealed, &QEMU_BINDING).unwrap(),
+            QEMU_KEY
+        );
         qemu_extend(&[8; 32]);
-        assert_ne!(qemu_client().snapshot(Pcrs::parse("7").unwrap()).unwrap(),
-            sealed.key.pcr_digest);
-        let error = qemu_client().unseal_bound(&sealed, &QEMU_BINDING).unwrap_err();
+        assert_ne!(
+            qemu_client().snapshot(Pcrs::parse("7").unwrap()).unwrap(),
+            sealed.key.pcr_digest
+        );
+        let error = qemu_client()
+            .unseal_bound(&sealed, &QEMU_BINDING)
+            .unwrap_err();
         assert!(error.starts_with("TPM command 0x17f refused:"), "{error}");
     }
 
@@ -1520,8 +1559,9 @@ pub(crate) mod tests {
     fn qemu_device_refuses_another_tpm() {
         qemu_guard("tpm-other");
         let sealed = qemu_read_key();
-        let error = qemu_client().unseal_bound(&sealed, &QEMU_BINDING).unwrap_err();
+        let error = qemu_client()
+            .unseal_bound(&sealed, &QEMU_BINDING)
+            .unwrap_err();
         assert!(error.starts_with("TPM command 0x157 refused:"), "{error}");
     }
-
 }

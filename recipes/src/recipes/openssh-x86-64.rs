@@ -37,11 +37,10 @@ pub fn recipe() -> Recipe {
     let mut steps = unpack_into("openssh-x86-64-source", "{src}");
     steps.push(Step::ToolFarm {
         links: [
-            "awk", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "diff",
-            "dirname", "echo", "egrep", "env", "expr", "false", "find", "grep", "head",
-            "install", "ln", "ls", "mkdir", "mktemp", "mv", "printf", "pwd", "rm",
-            "rmdir", "sed", "sort", "tail", "tee", "test", "touch", "tr", "true",
-            "uname", "wc", "which", "xargs",
+            "awk", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "diff", "dirname",
+            "echo", "egrep", "env", "expr", "false", "find", "grep", "head", "install", "ln", "ls",
+            "mkdir", "mktemp", "mv", "printf", "pwd", "rm", "rmdir", "sed", "sort", "tail", "tee",
+            "test", "touch", "tr", "true", "uname", "wc", "which", "xargs",
         ]
         .iter()
         .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
@@ -207,9 +206,7 @@ mod tests {
         );
         let steps = recipe.steps.unwrap_or_default();
         let configure = steps.iter().find_map(|step| match step {
-            Step::Run { argv, .. }
-                if argv.iter().any(|arg| arg.ends_with("/configure")) =>
-            {
+            Step::Run { argv, .. } if argv.iter().any(|arg| arg.ends_with("/configure")) => {
                 Some(argv)
             }
             _ => None,
@@ -225,7 +222,10 @@ mod tests {
             "--with-privsep-user=sshd",
             "--with-privsep-path=/run/sshd-empty",
         ] {
-            assert!(configure.iter().any(|arg| arg == required), "missing {required}");
+            assert!(
+                configure.iter().any(|arg| arg == required),
+                "missing {required}"
+            );
         }
         for forbidden in ["libressl-x86-64", "zlib-x86-64-self", "rust-toolchain"] {
             assert!(
@@ -266,9 +266,7 @@ mod tests {
             .unwrap_or_default()
             .into_iter()
             .find_map(|step| match step {
-                Step::WriteFile { path, content, .. } if path == "{root}/wb/cc" => {
-                    Some(content)
-                }
+                Step::WriteFile { path, content, .. } if path == "{root}/wb/cc" => Some(content),
                 _ => None,
             })
             .expect("compiler wrapper");

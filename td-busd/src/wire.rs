@@ -767,7 +767,10 @@ fn read_array<'a>(
         limits: *limits,
         depth: inner_depth,
     };
-    Ok((Value::Array(seq), element_len.checked_add(1).ok_or(WireError::Overflow)?))
+    Ok((
+        Value::Array(seq),
+        element_len.checked_add(1).ok_or(WireError::Overflow)?,
+    ))
 }
 
 fn read_struct<'a>(
@@ -809,7 +812,10 @@ fn read_struct<'a>(
         limits: *limits,
         depth: inner_depth,
     };
-    Ok((Value::Struct(seq), used.checked_add(2).ok_or(WireError::Overflow)?))
+    Ok((
+        Value::Struct(seq),
+        used.checked_add(2).ok_or(WireError::Overflow)?,
+    ))
 }
 
 fn read_dict_entry<'a>(
@@ -849,7 +855,10 @@ fn read_dict_entry<'a>(
         limits: *limits,
         depth: inner_depth,
     };
-    Ok((Value::DictEntry(seq), used.checked_add(2).ok_or(WireError::Overflow)?))
+    Ok((
+        Value::DictEntry(seq),
+        used.checked_add(2).ok_or(WireError::Overflow)?,
+    ))
 }
 
 fn read_variant<'a>(
@@ -939,7 +948,8 @@ impl Writer {
     fn align(&mut self, to: usize) {
         let remainder = self.buf.len() % to;
         if remainder != 0 {
-            self.buf.resize(self.buf.len().saturating_add(to - remainder), 0);
+            self.buf
+                .resize(self.buf.len().saturating_add(to - remainder), 0);
         }
     }
 
@@ -1057,7 +1067,11 @@ impl Writer {
         self.align(alignment(code)?);
         let start = self.buf.len();
         fill(self)?;
-        let written = self.buf.len().checked_sub(start).ok_or(WireError::Overflow)?;
+        let written = self
+            .buf
+            .len()
+            .checked_sub(start)
+            .ok_or(WireError::Overflow)?;
         if written > MAX_ARRAY_BYTES {
             return Err(WireError::ValueTooLarge);
         }
@@ -1249,7 +1263,11 @@ mod tests {
             ("a{si i}", WireError::BadDictEntry),
             ("a", WireError::BadSignature),
         ] {
-            assert_eq!(validate_signature(sig), Err(error), "{sig} should be refused");
+            assert_eq!(
+                validate_signature(sig),
+                Err(error),
+                "{sig} should be refused"
+            );
         }
     }
 
@@ -1270,9 +1288,7 @@ mod tests {
             Err(WireError::NestingTooDeep)
         );
 
-        let structs = |depth: usize| {
-            format!("{}y{}", "(".repeat(depth), ")".repeat(depth))
-        };
+        let structs = |depth: usize| format!("{}y{}", "(".repeat(depth), ")".repeat(depth));
         assert_eq!(validate_signature(&structs(MAX_NESTING as usize)), Ok(()));
         assert_eq!(
             validate_signature(&structs(MAX_NESTING as usize + 1)),
@@ -1408,7 +1424,12 @@ mod tests {
         // The two excluded types are refused for real, in an ARRAY, which is
         // the path the fast path would have taken over.
         assert_eq!(
-            read_body(&[4, 0, 0, 0, 9, 0, 0, 0], "ah", Endian::Little, Limits { fds: 1 }),
+            read_body(
+                &[4, 0, 0, 0, 9, 0, 0, 0],
+                "ah",
+                Endian::Little,
+                Limits { fds: 1 }
+            ),
             Err(WireError::FdIndexOutOfRange)
         );
         assert_eq!(
@@ -1434,10 +1455,7 @@ mod tests {
             .first()
             .and_then(Value::as_seq)
             .expect("an array value");
-        assert_eq!(
-            seq.values(4),
-            Ok(vec![Value::Uint32(1), Value::Uint32(2)])
-        );
+        assert_eq!(seq.values(4), Ok(vec![Value::Uint32(1), Value::Uint32(2)]));
     }
 
     /// `render` is a diagnostic: a blob past the cap is elided rather than
@@ -1615,10 +1633,7 @@ mod tests {
             writer.variant("yy", |_| Ok(())),
             Err(WireError::BadSignature)
         );
-        assert_eq!(
-            writer.array("yy", |_| Ok(())),
-            Err(WireError::BadSignature)
-        );
+        assert_eq!(writer.array("yy", |_| Ok(())), Err(WireError::BadSignature));
         assert_eq!(
             writer.signature(&"y".repeat(MAX_SIGNATURE_LEN + 1)),
             Err(WireError::SignatureTooLong)

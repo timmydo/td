@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::arith;
-use crate::ast::{AndOr, ArithCmp, Cmd, CondExpr, CondOp, Conn, List, Pipeline, Redir, Sep, Stage, Word};
+use crate::ast::{
+    AndOr, ArithCmp, Cmd, CondExpr, CondOp, Conn, List, Pipeline, Redir, Sep, Stage, Word,
+};
 use crate::builtin;
 use crate::expand;
 use crate::parser::{self, Aliases};
@@ -185,7 +187,7 @@ pub struct Shell {
     /// (eval.c:752), where busybox ash and bash report the absolute line; the
     /// corpus grades this shell on dash's answer.
     pub funcline: u32,
-    pub status: i32,         // $?
+    pub status: i32, // $?
     /// ash's `random_gen`, lazily seeded: `None` is "never seeded", which takes
     /// the pid and the clock on first read as ash's `UNINITED_RANDOM_T` does.
     pub random: Option<crate::random::Rand>,
@@ -393,9 +395,13 @@ fn shlvl_next(inherited: &str) -> u32 {
         let Some(d) = c.to_digit(10).map(i64::from) else {
             break;
         };
-        let step = acc
-            .checked_mul(10)
-            .and_then(|a| if neg { a.checked_sub(d) } else { a.checked_add(d) });
+        let step = acc.checked_mul(10).and_then(|a| {
+            if neg {
+                a.checked_sub(d)
+            } else {
+                a.checked_add(d)
+            }
+        });
         acc = match step {
             Some(v) => v,
             // strtol clamps and keeps scanning; the remaining digits cannot
@@ -506,9 +512,7 @@ impl Shell {
         // lying value from the parent cannot survive); otherwise the physical
         // path replaces it. Either way PWD ends up set and EXPORTED.
         let logical = match sh.get_var("PWD") {
-            Some(p) if p.starts_with('/') && same_dir(Path::new(&p), &sh.cwd) => {
-                PathBuf::from(p)
-            }
+            Some(p) if p.starts_with('/') && same_dir(Path::new(&p), &sh.cwd) => PathBuf::from(p),
             _ => sh.cwd.clone(),
         };
         let _ = sh.set_var("PWD", &logical.to_string_lossy());
@@ -591,8 +595,7 @@ impl Shell {
             status: 0,
             last_bg: None,
             opts: Opts::default(),
-            logical_cwd: std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("/")),
+            logical_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             fds: Fds::new(),
             localvar_depth: 0,
@@ -710,8 +713,11 @@ impl Shell {
         // only if `is_number` passes, which is what stops `number()` reaching its
         // `Illegal number` raise: anything else restarts the scan silently.
         let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
-        self.getopts_optind =
-            if digits { value.parse::<i64>().unwrap_or(i64::MAX).max(1) } else { 1 };
+        self.getopts_optind = if digits {
+            value.parse::<i64>().unwrap_or(i64::MAX).max(1)
+        } else {
+            1
+        };
         self.getopts_off = -1;
     }
 
@@ -841,7 +847,9 @@ impl Shell {
         // Scoped to RANDOM rather than to DYNAMIC: ash exempts its one dynamic
         // name, and dash -- whose LINENO this is -- refuses `readonly LINENO;
         // LINENO=5` with `is read only`, measured.
-        self.vars.get(name).is_some_and(|v| v.readonly && v.dynamic != Some(Dyn::Random))
+        self.vars
+            .get(name)
+            .is_some_and(|v| v.readonly && v.dynamic != Some(Dyn::Random))
     }
 
     pub fn unset_var(&mut self, name: &str) -> bool {
@@ -1052,7 +1060,6 @@ pub fn run_source(sh: &mut Shell, src: &str) -> R<()> {
         }
     }
 }
-
 
 pub fn run_list(sh: &mut Shell, list: &List) -> R<()> {
     for (and_or, sep) in &list.items {
@@ -1352,11 +1359,7 @@ fn run_command_dispatch(sh: &mut Shell, cmd: &Cmd) -> R<()> {
     }
 }
 
-fn run_if(
-    sh: &mut Shell,
-    arms: &[crate::ast::IfArm],
-    otherwise: &Option<List>,
-) -> R<()> {
+fn run_if(sh: &mut Shell, arms: &[crate::ast::IfArm], otherwise: &Option<List>) -> R<()> {
     for arm in arms {
         run_condition(sh, &arm.cond)?;
         if sh.status == 0 {
@@ -1407,7 +1410,11 @@ fn run_loop(sh: &mut Shell, until: bool, cond: &List, body: &List) -> R<()> {
     let result = (|| {
         loop {
             run_condition(sh, cond)?;
-            let go = if until { sh.status != 0 } else { sh.status == 0 };
+            let go = if until {
+                sh.status != 0
+            } else {
+                sh.status == 0
+            };
             if !go {
                 break;
             }
@@ -1482,7 +1489,10 @@ struct CondError {
 impl CondError {
     /// A malformed EXPRESSION: status 2, the one `test` reports for one.
     fn bad(msg: String) -> CondError {
-        CondError { msg: Some(msg), status: 2 }
+        CondError {
+            msg: Some(msg),
+            status: 2,
+        }
     }
 }
 
@@ -1553,7 +1563,11 @@ fn eval_cond(sh: &mut Shell, expr: &CondExpr) -> R<Result<bool, CondError>> {
                     let chars = expand::expand_pattern(sh, rhs)?;
                     let units = pattern::compile(&chars);
                     let hit = pattern::matches(&units, &left);
-                    Ok(if matches!(op, CondOp::Match) { hit } else { !hit })
+                    Ok(if matches!(op, CondOp::Match) {
+                        hit
+                    } else {
+                        !hit
+                    })
                 }
                 // A SEARCH, not a whole-string match, so `[[ abc =~ b ]]` holds.
                 // A regex that does not compile is FATAL rather than false:
@@ -1997,7 +2011,6 @@ pub fn terminating(sig: &Sig) -> bool {
     matches!(sig, Sig::Exit(_) | Sig::Abort(_) | Sig::Interrupt(_))
 }
 
-
 /// Put back what one binding displaced. `None` means the name did not exist, so
 /// restoring it is an unset -- and it overwrites whatever the body assigned
 /// through the binding, which is what makes a temp frame vanish entirely. The
@@ -2274,7 +2287,9 @@ pub const ELOOP: i32 = 40;
 /// no errno has no suffix and passes through whole.
 pub fn strerror(e: &std::io::Error) -> String {
     let text = e.to_string();
-    let Some(n) = e.raw_os_error() else { return text };
+    let Some(n) = e.raw_os_error() else {
+        return text;
+    };
     let suffix = format!(" (os error {n})");
     text.strip_suffix(&suffix).unwrap_or(&text).to_owned()
 }
@@ -2342,7 +2357,9 @@ pub fn diag_applet(sh: &Shell, msg: &str) -> std::io::Result<()> {
 /// is the argument for naming the kind that ENDS the shell rather than
 /// enumerating the kinds that do not.
 pub fn note_epipe(sh: &Shell, r: std::io::Result<()>) -> std::io::Result<()> {
-    if r.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) {
+    if r.as_ref()
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
+    {
         sh.stderr_epipe.store(true, Ordering::Relaxed);
     }
     r
@@ -2368,7 +2385,10 @@ mod tests {
     fn a_slash_name_is_defined_but_never_looked_up() {
         // `type` below stats the name against the SHELL's cwd, which
         // `new_for_test` seeds from the process's -- so say why a red is one.
-        assert!(!std::path::Path::new("a/b").exists(), "an `a/b` in the cwd reds this");
+        assert!(
+            !std::path::Path::new("a/b").exists(),
+            "an `a/b` in the cwd reds this"
+        );
         // Defining one is silent, and naming it afterwards reaches PATH rather
         // than the definition -- this harness has none, so 127.
         assert_eq!(run("a/b() { echo B; }"), (0, String::new(), String::new()));
@@ -2415,8 +2435,15 @@ mod tests {
         };
         // BOTH spellings file the name, and each has its own line to lose it
         // on -- so both are asked, or restoring one filter goes unnoticed.
-        for defs in ["a/b() { echo B; }\nazz() { echo Z; }\n", "function a/b { echo B; }\n"] {
-            assert_eq!(offered(defs, "a").ok(), Some((0, true)), "{defs:?} must be offered");
+        for defs in [
+            "a/b() { echo B; }\nazz() { echo Z; }\n",
+            "function a/b { echo B; }\n",
+        ] {
+            assert_eq!(
+                offered(defs, "a").ok(),
+                Some((0, true)),
+                "{defs:?} must be offered"
+            );
             // Removed from the table, so no longer offered -- ash agrees.
             assert_eq!(
                 offered(&format!("{defs}unset -f a/b\n"), "a").ok(),
@@ -2437,7 +2464,9 @@ mod tests {
     #[test]
     fn a_function_name_is_any_word_that_is_not_an_assignment() {
         // Punctuation, a leading digit, and nothing but dots: all callable.
-        for name in ["py-repr", "a.b", "a+b", "a:b", "a@b", "a,b", "9lives", "..", "_ok"] {
+        for name in [
+            "py-repr", "a.b", "a+b", "a:b", "a@b", "a,b", "9lives", "..", "_ok",
+        ] {
             let src = format!("{name}() {{ echo B; }}; {name}");
             assert_eq!(run(&src), (0, "B\n".to_string(), String::new()), "{src:?}");
         }
@@ -2470,12 +2499,20 @@ mod tests {
         // Quoted or expanded: ash files these under the word's own text, which
         // no later word can spell, and that is what a `None` name means here.
         // The lookup then misses, and this harness has no PATH, so it is 127.
-        for src in ["\"f\"() { echo B; }; f", "'f'() { echo B; }; f", "x=f; $x() { echo B; }; f"] {
+        for src in [
+            "\"f\"() { echo B; }; f",
+            "'f'() { echo B; }; f",
+            "x=f; $x() { echo B; }; f",
+        ] {
             assert_eq!(run(src).0, 127, "{src:?} must define nothing callable");
         }
         // A reserved word that only CLOSES a construct is still refused before
         // the definition test, or `fi() { ... }` would define one.
-        for src in ["fi() { echo B; }", "done() { echo B; }", "then() { echo B; }"] {
+        for src in [
+            "fi() { echo B; }",
+            "done() { echo B; }",
+            "then() { echo B; }",
+        ] {
             assert_eq!(run(src).0, 2, "{src:?}");
         }
         // Both spellings agree, which is the point: the `function` one always
@@ -2523,14 +2560,23 @@ mod tests {
         };
         let field = |p: &str, k: Option<&str>| super::proc_field(p, k);
 
-        assert_eq!(field(&write("full", "t5700g\n"), None).as_deref(), Some("t5700g"));
+        assert_eq!(
+            field(&write("full", "t5700g\n"), None).as_deref(),
+            Some("t5700g")
+        );
         assert_eq!(field(&write("empty", ""), None).as_deref(), Some(""));
         assert_eq!(field(&write("blank", "\n"), None).as_deref(), Some(""));
         // Only the terminating newline is framing. A hostname may hold spaces,
         // and ash's `uname(2)` hands them over verbatim, so `trim()` would
         // silently rename the host.
-        assert_eq!(field(&write("spaced", " x \n"), None).as_deref(), Some(" x "));
-        assert_eq!(field(&write("inner", "a b\n"), None).as_deref(), Some("a b"));
+        assert_eq!(
+            field(&write("spaced", " x \n"), None).as_deref(),
+            Some(" x ")
+        );
+        assert_eq!(
+            field(&write("inner", "a b\n"), None).as_deref(),
+            Some("a b")
+        );
         // Exactly one newline: a value that really ends in one keeps the rest.
         assert_eq!(field(&write("two", "x\n\n"), None).as_deref(), Some("x\n"));
         assert_eq!(field(&write("nonl", "x"), None).as_deref(), Some("x"));
@@ -2618,8 +2664,7 @@ mod tests {
         sh.set_var("before", "2").unwrap();
         sh.opts.allexport = false;
         sh.set_var("after", "3").unwrap();
-        let mut env: Vec<String> =
-            sh.exported_env().into_iter().map(|(k, _)| k).collect();
+        let mut env: Vec<String> = sh.exported_env().into_iter().map(|(k, _)| k).collect();
         env.sort();
         assert_eq!(env, ["before", "during"]);
     }
@@ -2633,7 +2678,10 @@ mod tests {
         // An assignment-only command is traced too, with its values expanded and
         // AFTER they are applied -- dash prints its varlist here.
         let (_, out, err) = run("set -x; x=1 x=2; echo $x");
-        assert_eq!((out.as_str(), err.as_str()), ("2\n", "+ x=1 x=2\n+ echo 2\n"));
+        assert_eq!(
+            (out.as_str(), err.as_str()),
+            ("2\n", "+ x=1 x=2\n+ echo 2\n")
+        );
         // dash seeds PS4 as a real variable; unsetting it leaves an EMPTY prefix
         // rather than restoring the default, and the command is still traced.
         let (_, out, _) = run("echo [$PS4]");
@@ -2678,8 +2726,7 @@ mod tests {
         // the raw string, so the script runs on. Verified against a dash 0.5.12
         // built from source: it prints its diagnostic and still reports 0.
         for ps4 in ["+${x", "+$(x", "+oops $(( 1 / 0 )) \\$"] {
-            let (status, out, _) =
-                run(&format!("PS4='{ps4}'; set -x; echo one; echo status=$?"));
+            let (status, out, _) = run(&format!("PS4='{ps4}'; set -x; echo one; echo status=$?"));
             assert_eq!((status, out.as_str()), (0, "one\nstatus=0\n"), "{ps4}");
         }
         // A LIVE command substitution in PS4 -- single-quoted, so it runs at
@@ -2687,7 +2734,10 @@ mod tests {
         // subshell it runs in inherits the guard, or this recurses until the
         // depth cap.
         let (status, out, err) = run("PS4='$(echo X)'; set -x; echo hi");
-        assert_eq!((status, out.as_str(), err.as_str()), (0, "hi\n", "Xecho hi\n"));
+        assert_eq!(
+            (status, out.as_str(), err.as_str()),
+            (0, "hi\n", "Xecho hi\n")
+        );
     }
 
     #[test]
@@ -2874,7 +2924,10 @@ mod tests {
                 );
                 // Ends WITH it rather than equals: the abandoned substitution
                 // still leaves `echo` a blank line to print.
-                assert!(out.ends_with("AFTER\n"), "the shell did not survive it: {out:?}");
+                assert!(
+                    out.ends_with("AFTER\n"),
+                    "the shell did not survive it: {out:?}"
+                );
             }
         }
         // ...and an ordinary nesting in a stage still runs, so the bound is not
@@ -2895,8 +2948,14 @@ mod tests {
         let n = super::MAX_RUN_DEPTH as usize + 50;
         let param = format!("{}echo 1{}", "${x:-$(".repeat(n), ")}".repeat(n));
         let (_, out, err) = run(&format!("echo {param}; echo AFTER"));
-        assert!(err.contains("maximum recursion depth exceeded"), "guard: {err:?}");
-        assert!(out.ends_with("AFTER\n"), "the shell did not survive it: {out:?}");
+        assert!(
+            err.contains("maximum recursion depth exceeded"),
+            "guard: {err:?}"
+        );
+        assert!(
+            out.ends_with("AFTER\n"),
+            "the shell did not survive it: {out:?}"
+        );
     }
 
     /// The three unary operators `test` does not serve. `-a` is the interesting
@@ -2959,7 +3018,10 @@ mod tests {
         assert_eq!(run("readonly n=1; echo $((n=2)); echo after").1, "");
         // An arm the conditional disabled never assigns, so there is no
         // refusal to report once or twice.
-        assert_eq!(run("readonly n=1; echo $((0?n=2:3))"), (0, "3\n".into(), String::new()));
+        assert_eq!(
+            run("readonly n=1; echo $((0?n=2:3))"),
+            (0, "3\n".into(), String::new())
+        );
         // `[[ ]]` catches it instead of dying of it: one diagnostic, and NOT
         // under the `[[: ` prefix, which belongs to messages it raised itself.
         let (st, out, err) = run("readonly n=1; [[ 'n=2' -eq 2 ]]; echo after=$?");
@@ -2968,7 +3030,10 @@ mod tests {
         assert_eq!(st, 0);
         // The other arm still earns that prefix, which is what stops the fix
         // above from silencing a message arith really did raise.
-        assert_eq!(run("[[ 1+ -eq 2 ]]").2, "td-sh: [[: arithmetic syntax error\n");
+        assert_eq!(
+            run("[[ 1+ -eq 2 ]]").2,
+            "td-sh: [[: arithmetic syntax error\n"
+        );
         // A SLICE bound is the third way into arith, and reaches it through
         // `expand` rather than either entry point above -- so it is the one
         // that shows the fix is in the shared type and not in a caller.
@@ -3005,7 +3070,10 @@ mod tests {
         assert_eq!(out, "a=[1]\n");
         // Both operands run when the first SUCCEEDS -- the short-circuit must
         // not cost the ordinary case its second side effect.
-        assert_eq!(run("[[ 'a=1' -eq 'm=3' ]]; echo a=[$a] m=[$m]").1, "a=[1] m=[3]\n");
+        assert_eq!(
+            run("[[ 'a=1' -eq 'm=3' ]]; echo a=[$a] m=[$m]").1,
+            "a=[1] m=[3]\n"
+        );
         assert_eq!(run("[[ 'a=3' -eq 'm=3' ]]").0, 0);
     }
 
@@ -3013,7 +3081,11 @@ mod tests {
     /// regex where `==`'s is a glob, and quoting still decides per character.
     #[test]
     fn a_conditional_searches_with_a_regular_expression() {
-        assert_eq!(run("[[ abc =~ b ]]").0, 0, "a search, not a whole-string match");
+        assert_eq!(
+            run("[[ abc =~ b ]]").0,
+            0,
+            "a search, not a whole-string match"
+        );
         assert_eq!(run("[[ abc =~ ^b ]]").0, 1);
         assert_eq!(run("[[ abc =~ ^a ]]").0, 0);
         assert_eq!(run("[[ abc =~ c$ ]]").0, 0);
@@ -3030,7 +3102,11 @@ mod tests {
         assert_eq!(run("[[ xbc == a* ]]").0, 1, "glob: no match");
         assert_eq!(run("[[ xbc =~ a* ]]").0, 0, "regex: empty run matches");
         assert_eq!(run("[[ ab == a* ]]").0, 0);
-        assert_eq!(run("[[ zab =~ ^a* ]]").0, 0, "`a*` matches the empty prefix");
+        assert_eq!(
+            run("[[ zab =~ ^a* ]]").0,
+            0,
+            "`a*` matches the empty prefix"
+        );
     }
 
     /// A regex that does not COMPILE ends the shell, where a false comparison
@@ -3080,9 +3156,18 @@ mod tests {
         // the pipeline needs no external command: what it prints is what
         // reached the pipe, which is the whole question.
         let sink = "{ read l; echo \"got:$l\"; }";
-        assert_eq!(run(&format!("echo [[; echo a =~ b|{sink}")).1, "[[\ngot:a =~ b\n");
-        assert_eq!(run(&format!("echo [[ |{sink}; echo a =~ b|{sink}")).1, "got:[[\ngot:a =~ b\n");
-        assert_eq!(run(&format!("echo [[\necho a =~ b|{sink}")).1, "[[\ngot:a =~ b\n");
+        assert_eq!(
+            run(&format!("echo [[; echo a =~ b|{sink}")).1,
+            "[[\ngot:a =~ b\n"
+        );
+        assert_eq!(
+            run(&format!("echo [[ |{sink}; echo a =~ b|{sink}")).1,
+            "got:[[\ngot:a =~ b\n"
+        );
+        assert_eq!(
+            run(&format!("echo [[\necho a =~ b|{sink}")).1,
+            "[[\ngot:a =~ b\n"
+        );
         // ...and the connectives do NOT, since a conditional continues past
         // them: a regex after one still lexes as a regex.
         assert_eq!(run("[[ abc =~ a|z &&\nabc =~ b|y ]]").0, 0);
@@ -3095,8 +3180,14 @@ mod tests {
         assert_eq!(run("[[ =~ && x ]]").0, 0);
         // Every position a conditional can legitimately start in still works.
         assert_eq!(run("if [[ abc =~ a|z ]]; then echo y; fi").1, "y\n");
-        assert_eq!(run("while [[ abc =~ a|z ]]; do echo y; break; done").1, "y\n");
-        assert_eq!(run("until [[ abc =~ q|z ]]; do echo y; break; done").1, "y\n");
+        assert_eq!(
+            run("while [[ abc =~ a|z ]]; do echo y; break; done").1,
+            "y\n"
+        );
+        assert_eq!(
+            run("until [[ abc =~ q|z ]]; do echo y; break; done").1,
+            "y\n"
+        );
         assert_eq!(run("! [[ abc =~ q|z ]]").0, 0);
         assert_eq!(run("{ [[ abc =~ a|z ]]; }").0, 0);
     }
@@ -3158,7 +3249,8 @@ mod tests {
 
     #[test]
     fn case_matches_a_pattern() {
-        let (_, out, _) = run("x=banana; case $x in apple) echo a ;; b*) echo b ;; *) echo o ;; esac");
+        let (_, out, _) =
+            run("x=banana; case $x in apple) echo a ;; b*) echo b ;; *) echo o ;; esac");
         assert_eq!(out, "b\n");
     }
 
@@ -3178,8 +3270,7 @@ mod tests {
     fn break_and_continue() {
         let (_, out, _) = run("for x in 1 2 3 4; do if [ $x = 3 ]; then break; fi; echo $x; done");
         assert_eq!(out, "1\n2\n");
-        let (_, out, _) =
-            run("for x in 1 2 3; do if [ $x = 2 ]; then continue; fi; echo $x; done");
+        let (_, out, _) = run("for x in 1 2 3; do if [ $x = 2 ]; then continue; fi; echo $x; done");
         assert_eq!(out, "1\n3\n");
     }
 
@@ -3483,7 +3574,10 @@ mod tests {
             // The status is the child dying, so the diagnostic must still be the
             // redirection's -- a fatal path that reported 2 and said nothing
             // would be indistinguishable from one that failed for another reason.
-            assert_eq!(err, "td-sh: can't open /no/such/td-e: no such file\n", "src: {src}");
+            assert_eq!(
+                err, "td-sh: can't open /no/such/td-e: no such file\n",
+                "src: {src}"
+            );
         }
         // The contrast, at the same three shapes: everything that is NOT a
         // subshell goes through the equivalent of `redirectsafe` and answers 1.
@@ -3579,8 +3673,7 @@ mod tests {
         // created or truncated by a shell asked only to parse.
         let unmade = std::env::temp_dir().join(format!("td-sh-noexec-{}", std::process::id()));
         let _ = std::fs::remove_file(&unmade);
-        let (_status, _out, err) =
-            run(&format!("set -n; {{ :; }} >'{}' &", unmade.display()));
+        let (_status, _out, err) = run(&format!("set -n; {{ :; }} >'{}' &", unmade.display()));
         assert!(!unmade.exists(), "-n created the target");
         assert_eq!(err, "");
         // And the line, which the redirections expand under: the target names
@@ -3689,11 +3782,17 @@ mod tests {
             ("PATH=./pdir", "./pdir/target.sh"),
         ] {
             let (_s, _o, err) = run(&format!("cd {}; {dir_word}; . target.sh", dir.display()));
-            assert_eq!(err, format!("td-sh: .: line 1: can't open '{want}': Permission denied\n"));
+            assert_eq!(
+                err,
+                format!("td-sh: .: line 1: can't open '{want}': Permission denied\n")
+            );
         }
         // An empty entry is the cwd and contributes NO prefix.
         let (_s, _o, err) = run(&format!("cd {}; PATH=; . target.sh", sub.display()));
-        assert_eq!(err, "td-sh: .: line 1: can't open 'target.sh': Permission denied\n");
+        assert_eq!(
+            err,
+            "td-sh: .: line 1: can't open 'target.sh': Permission denied\n"
+        );
         let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3717,7 +3816,11 @@ mod tests {
         for (src, want, code) in [
             // A slash name is handed to the kernel, so a DIRECTORY is EACCES.
             (format!("{ad}"), "Permission denied", 126),
-            (format!("{d}/loopy"), "Too many levels of symbolic links", 127),
+            (
+                format!("{d}/loopy"),
+                "Too many levels of symbolic links",
+                127,
+            ),
             (format!("{d}/nope"), "not found", 127),
             // A PATH walk: a regular file it cannot run is 126, a directory 127
             // -- same message, and the status is the only tell.
@@ -3727,9 +3830,21 @@ mod tests {
             // A later entry that does not EXIST must not erase what an earlier
             // one established -- ash only ever overwrites `e` with a more
             // specific errno, never back to "nothing there".
-            (format!("PATH={ad}:{d}/no/such; only"), "Permission denied", 126),
-            (format!("PATH={d}/no/such:{ad}; only"), "Permission denied", 126),
-            (format!("PATH={ad}:{d}/no/such; dirtool"), "Permission denied", 127),
+            (
+                format!("PATH={ad}:{d}/no/such; only"),
+                "Permission denied",
+                126,
+            ),
+            (
+                format!("PATH={d}/no/such:{ad}; only"),
+                "Permission denied",
+                126,
+            ),
+            (
+                format!("PATH={ad}:{d}/no/such; dirtool"),
+                "Permission denied",
+                127,
+            ),
         ] {
             let (status, _o, err) = run(&src);
             let name = src.rsplit(' ').next().unwrap_or(&src);
@@ -3750,11 +3865,19 @@ mod tests {
         let lpd = lp.display();
         let nrd = noread.display();
         for (src, want, code) in [
-            (format!("PATH={lpd}; tool"), "Too many levels of symbolic links", 127),
+            (
+                format!("PATH={lpd}; tool"),
+                "Too many levels of symbolic links",
+                127,
+            ),
             (format!("PATH={nrd}; tool"), "Permission denied", 127),
             // A later errno REPLACES an earlier one, so the loop decides both
             // the word and the status here -- 127, not the file's 126.
-            (format!("PATH={ad}:{lpd}; tool"), "Too many levels of symbolic links", 127),
+            (
+                format!("PATH={ad}:{lpd}; tool"),
+                "Too many levels of symbolic links",
+                127,
+            ),
             // A regular file makes ash's lookup SUCCEED, and a later directory
             // cannot un-succeed it: 126 in both orders.
             (format!("PATH={ad}:{dd}; tool"), "Permission denied", 126),
@@ -3783,7 +3906,11 @@ mod tests {
             format!("echo $(exec {g})"),
         ] {
             let (_s, _o, err) = run(&src);
-            assert_eq!(err, format!("td-sh: exec: line 1: {g}: not found\n"), "src: {src}");
+            assert_eq!(
+                err,
+                format!("td-sh: exec: line 1: {g}: not found\n"),
+                "src: {src}"
+            );
         }
         let _ = std::fs::set_permissions(&noread, std::fs::Permissions::from_mode(0o755));
         // And a non-executable match must still not shadow a real one later.
@@ -4017,7 +4144,10 @@ mod tests {
             (format!("v=$({l} <<E); echo \"v=[$v]\""), "v=[]\n"),
             // A backquote body inside an alias replacement is still its own
             // text, so it ends there as well.
-            (format!("alias e='v=`{l} <<E\none`; echo \"v=[$v]\"'\ne"), "v=[[one]]\n"),
+            (
+                format!("alias e='v=`{l} <<E\none`; echo \"v=[$v]\"'\ne"),
+                "v=[[one]]\n",
+            ),
         ] {
             assert_eq!(run(&src), (0, want.to_string(), String::new()), "{src:?}");
         }
@@ -4031,7 +4161,10 @@ mod tests {
             assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
             // The REASON, not merely that something failed: an unrelated error
             // reaching stderr would satisfy a non-empty check.
-            assert!(err.contains(r#"end of file (expecting ")")"#), "{src:?}: {err}");
+            assert!(
+                err.contains(r#"end of file (expecting ")")"#),
+                "{src:?}: {err}"
+            );
         }
         // A `.` script is the third text that owns its end, and takes a file to
         // be one. What it pins beyond the body is that the SOURCING script
@@ -4088,8 +4221,14 @@ mod tests {
             // one inside a `${...}` operand. Both read as raw text by anything
             // that does not lex, and both then eat the rest of the script.
             ("echo $(echo $((1<<3))\necho done)".to_string(), "8 done\n"),
-            ("echo $(echo $(( 1 << 3 ))\necho done)".to_string(), "8 done\n"),
-            ("echo $(echo ${x:-a<<b}\necho two)".to_string(), "a<<b two\n"),
+            (
+                "echo $(echo $(( 1 << 3 ))\necho done)".to_string(),
+                "8 done\n",
+            ),
+            (
+                "echo $(echo ${x:-a<<b}\necho two)".to_string(),
+                "a<<b two\n",
+            ),
             // ... and a `#` that is not a comment: inside a `${...}` operand,
             // and after a QUOTED blank, which leaves a word still open.
             ("x=abc; echo $(echo ${x:- #y})".to_string(), "abc\n"),
@@ -4097,7 +4236,10 @@ mod tests {
             // A here-document delimiter folded across a line: `E\<newline>OF`
             // is the delimiter `EOF`, which no body line can equal if the fold
             // is left in it.
-            (format!("v=$({l} <<E\\\nOF\nbody\nEOF\n); echo \"v=[$v]\""), "v=[[body]]\n"),
+            (
+                format!("v=$({l} <<E\\\nOF\nbody\nEOF\n); echo \"v=[$v]\""),
+                "v=[[body]]\n",
+            ),
         ] {
             assert_eq!(run(&src), (0, want.to_string(), String::new()), "{src:?}");
         }
@@ -4111,7 +4253,10 @@ mod tests {
         ] {
             let (status, out, err) = run(&src);
             assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
-            assert!(err.contains(r#"end of file (expecting ")")"#), "{src:?}: {err}");
+            assert!(
+                err.contains(r#"end of file (expecting ")")"#),
+                "{src:?}: {err}"
+            );
         }
     }
 
@@ -4123,10 +4268,16 @@ mod tests {
     /// against busybox ash 1.37.0, whose wording this matches byte for byte.
     #[test]
     fn a_word_that_only_closes_a_construct_cannot_start_a_command() {
-        for w in ["then", "else", "elif", "fi", "do", "done", "esac", "in", "}"] {
+        for w in [
+            "then", "else", "elif", "fi", "do", "done", "esac", "in", "}",
+        ] {
             let (status, out, err) = run(w);
             assert_eq!((status, out.as_str()), (2, ""), "{w}");
-            assert_eq!(err, format!("td-sh: syntax error: unexpected \"{w}\"\n"), "{w}");
+            assert_eq!(
+                err,
+                format!("td-sh: syntax error: unexpected \"{w}\"\n"),
+                "{w}"
+            );
         }
         // Every position that is a command position, including the one that
         // would otherwise LOOP: `fi` as a command is not found over and over.
@@ -4146,7 +4297,10 @@ mod tests {
             let (status, out, err) = run(src);
             assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
             // The TOKEN, not merely that something was unexpected.
-            assert!(err.contains(&format!("unexpected \"{want}\"")), "{src:?}: {err}");
+            assert!(
+                err.contains(&format!("unexpected \"{want}\"")),
+                "{src:?}: {err}"
+            );
         }
         // The whole input is refused, so what precedes the word does not run.
         assert_eq!(run("echo a; done").1, "", "nothing before the error runs");
@@ -4273,7 +4427,10 @@ mod tests {
             // ash adds `(expecting ")")` here. This shell builds that suffix
             // elsewhere (`{ echo A; )` names `"}"`) but not at this refusal;
             // the TOKEN named is the same.
-            assert!(err.contains(&format!("unexpected \"{want}\"")), "{src:?}: {err}");
+            assert!(
+                err.contains(&format!("unexpected \"{want}\"")),
+                "{src:?}: {err}"
+            );
         }
         // `list(2)` is consulted only where a list ITEM may start, so a
         // backtick body refuses everywhere else -- including the position that
@@ -4336,7 +4493,10 @@ mod tests {
         ] {
             let (status, out, err) = run(src);
             assert_eq!((status, out.as_str()), (2, ""), "{src:?}");
-            assert!(err.contains(&format!("unexpected \"{want}\"")), "{src:?}: {err}");
+            assert!(
+                err.contains(&format!("unexpected \"{want}\"")),
+                "{src:?}: {err}"
+            );
         }
         // `while` end to end, in the spelling that cannot hang if the rule
         // regresses: an empty `while false` body exits and fails the assert,
@@ -4467,7 +4627,8 @@ mod tests {
             let (status, out, err) = run(src);
             assert_eq!((status, out.as_str()), (2, ""), "{src:?}: {err}");
             assert!(
-                err.trim_end().ends_with(&format!("syntax error: unexpected {want}")),
+                err.trim_end()
+                    .ends_with(&format!("syntax error: unexpected {want}")),
                 "{src:?}: {err}"
             );
         }
@@ -4525,13 +4686,19 @@ mod tests {
             // the same list have run, which a parse error would have skipped.
             let (status, out, err) = run(&format!("echo ONE; : \"{body}\"; echo AFTER"));
             assert_eq!((status, out.as_str()), (2, "ONE\n"), "{body:?}");
-            assert!(err.contains(&format!("bad substitution: `{body}`")), "{err}");
+            assert!(
+                err.contains(&format!("bad substitution: `{body}`")),
+                "{err}"
+            );
         }
         // The one body that did NOT move, because ash does not defer it either:
         // a `:` with no operator makes ash take the `}` AS the operator, so the
         // body never closes and it reports the enclosing quote unterminated.
         // Both shells stop parsing, and a cold branch does not save it.
-        for src in ["false && echo \"${x:}\"; echo AFTER", "false && echo ${x:}; echo AFTER"] {
+        for src in [
+            "false && echo \"${x:}\"; echo AFTER",
+            "false && echo ${x:}; echo AFTER",
+        ] {
             let (status, out, err) = run(src);
             assert_eq!((status, out.as_str()), (2, ""), "{src:?}: {err}");
             assert!(err.contains("bad substitution: `${x:}`"), "{src:?}: {err}");
@@ -4576,29 +4743,71 @@ mod tests {
             ("echo \"abc", "syntax error: unterminated quoted string"),
             ("echo $'ab", "syntax error: unterminated quoted string"),
             ("echo `ec", "syntax error: EOF in backquote substitution"),
-            ("echo $(echo `a", "syntax error: EOF in backquote substitution"),
+            (
+                "echo $(echo `a",
+                "syntax error: EOF in backquote substitution",
+            ),
             // The paren-COUNTING fallback, which a body the lexer cannot read
             // at all falls back to: a hard failure inside `$( )` (`${}` is a
             // bad substitution, `$((1)x` a bad expansion) sends the rest of
             // that body to a scan that knows only how to count, and an
             // unterminated quote or backtick after it is reported from there.
             // Both of its arms, since they are one `if` apart.
-            ("echo $(echo ${} `foo", "syntax error: EOF in backquote substitution"),
-            ("echo $(echo $((1)x `foo", "syntax error: EOF in backquote substitution"),
-            ("echo $(echo ${} 'foo", "syntax error: unterminated quoted string"),
-            ("echo $(ec", "syntax error: unexpected end of file (expecting \")\")"),
+            (
+                "echo $(echo ${} `foo",
+                "syntax error: EOF in backquote substitution",
+            ),
+            (
+                "echo $(echo $((1)x `foo",
+                "syntax error: EOF in backquote substitution",
+            ),
+            (
+                "echo $(echo ${} 'foo",
+                "syntax error: unterminated quoted string",
+            ),
+            (
+                "echo $(ec",
+                "syntax error: unexpected end of file (expecting \")\")",
+            ),
             ("echo $((1+", "syntax error: missing '))'"),
             ("echo ${x", "syntax error: missing '}'"),
             ("echo ${x:-", "syntax error: missing '}'"),
-            ("if :", "syntax error: unexpected end of file (expecting \"then\")"),
-            ("if :; then", "syntax error: unexpected end of file (expecting \"fi\")"),
-            ("while false", "syntax error: unexpected end of file (expecting \"do\")"),
-            ("while false; do", "syntax error: unexpected end of file (expecting \"done\")"),
-            ("until true; do", "syntax error: unexpected end of file (expecting \"done\")"),
-            ("for i in a; do", "syntax error: unexpected end of file (expecting \"done\")"),
-            ("{ :", "syntax error: unexpected end of file (expecting \"}\")"),
-            ("( :", "syntax error: unexpected end of file (expecting \")\")"),
-            ("f() {", "syntax error: unexpected end of file (expecting \"}\")"),
+            (
+                "if :",
+                "syntax error: unexpected end of file (expecting \"then\")",
+            ),
+            (
+                "if :; then",
+                "syntax error: unexpected end of file (expecting \"fi\")",
+            ),
+            (
+                "while false",
+                "syntax error: unexpected end of file (expecting \"do\")",
+            ),
+            (
+                "while false; do",
+                "syntax error: unexpected end of file (expecting \"done\")",
+            ),
+            (
+                "until true; do",
+                "syntax error: unexpected end of file (expecting \"done\")",
+            ),
+            (
+                "for i in a; do",
+                "syntax error: unexpected end of file (expecting \"done\")",
+            ),
+            (
+                "{ :",
+                "syntax error: unexpected end of file (expecting \"}\")",
+            ),
+            (
+                "( :",
+                "syntax error: unexpected end of file (expecting \")\")",
+            ),
+            (
+                "f() {",
+                "syntax error: unexpected end of file (expecting \"}\")",
+            ),
             ("f()", "syntax error: unexpected end of file"),
             ("function f", "syntax error: unexpected end of file"),
             ("echo a &&", "syntax error: unexpected end of file"),
@@ -4611,7 +4820,10 @@ mod tests {
             // shell owes `do` either way. Where the list ENDS, not what the
             // message calls it, so it is the `case` divergence's family and
             // not this increment's.
-            ("for i in a", "syntax error: unexpected end of file (expecting \"do\")"),
+            (
+                "for i in a",
+                "syntax error: unexpected end of file (expecting \"do\")",
+            ),
             // Nor are these, and for one reason: with constructs NESTED, ash
             // picks its wording by a fixed precedence at `endword` -- arithmetic
             // first, then any quote, then a braced parameter (ash.c:12692-12702)
@@ -4653,28 +4865,67 @@ mod tests {
             ("{ :; } then", "syntax error: unexpected \"then\""),
             ("echo > ;", "syntax error: unexpected \";\""),
             ("echo > <", "syntax error: unexpected redirection"),
-            ("for i in &>; do :; done", "syntax error: unexpected redirection"),
-            ("case ; in x) :;; esac", "syntax error: unexpected \";\" (expecting word)"),
-            ("case && in x) :;; esac", "syntax error: unexpected \"&&\" (expecting word)"),
-            ("case x in x;; esac", "syntax error: unexpected \";;\" (expecting \")\")"),
-            ("case x in x do", "syntax error: unexpected word (expecting \")\")"),
-            ("for i in a; echo x", "syntax error: unexpected word (expecting \"do\")"),
-            ("for i in a do :; done", "syntax error: unexpected \"done\" (expecting \"do\")"),
+            (
+                "for i in &>; do :; done",
+                "syntax error: unexpected redirection",
+            ),
+            (
+                "case ; in x) :;; esac",
+                "syntax error: unexpected \";\" (expecting word)",
+            ),
+            (
+                "case && in x) :;; esac",
+                "syntax error: unexpected \"&&\" (expecting word)",
+            ),
+            (
+                "case x in x;; esac",
+                "syntax error: unexpected \";;\" (expecting \")\")",
+            ),
+            (
+                "case x in x do",
+                "syntax error: unexpected word (expecting \")\")",
+            ),
+            (
+                "for i in a; echo x",
+                "syntax error: unexpected word (expecting \"do\")",
+            ),
+            (
+                "for i in a do :; done",
+                "syntax error: unexpected \"done\" (expecting \"do\")",
+            ),
             ("for", "syntax error: bad for loop variable"),
-            ("for ; in a; do :; done", "syntax error: bad for loop variable"),
+            (
+                "for ; in a; do :; done",
+                "syntax error: bad for loop variable",
+            ),
             // The other arm: a word that is not a NAME, rather than no word.
-            ("for 1x in a; do :; done", "syntax error: bad for loop variable"),
+            (
+                "for 1x in a; do :; done",
+                "syntax error: bad for loop variable",
+            ),
             // An IO NUMBER and a NEWLINE are classes of their own, and each is
             // the only token that reaches its arm.
-            ("for i in a 2>f; do :; done", "syntax error: unexpected redirection"),
+            (
+                "for i in a 2>f; do :; done",
+                "syntax error: unexpected redirection",
+            ),
             ("echo >\nfoo", "syntax error: unexpected newline"),
             // An assignment-shaped function name is reported from PAST the
             // name, so what is named is the token ash stops on.
             ("function a=1 { :; }", "syntax error: unexpected \"{\""),
             ("function a=1", "syntax error: unexpected end of file"),
-            ("for \"q\" in a; do :; done", "syntax error: bad for loop variable"),
-            ("function ;", "syntax error: unexpected \";\" (expecting word)"),
-            ("function f function g { :; }", "syntax error: unexpected \"function\""),
+            (
+                "for \"q\" in a; do :; done",
+                "syntax error: bad for loop variable",
+            ),
+            (
+                "function ;",
+                "syntax error: unexpected \";\" (expecting word)",
+            ),
+            (
+                "function f function g { :; }",
+                "syntax error: unexpected \"function\"",
+            ),
             ("function f echo x", "syntax error: unexpected word"),
         ] {
             let (status, out, err) = run(src);
@@ -4713,8 +4964,14 @@ mod tests {
             // ash reads the NAME with CHKALIAS and not CHKKWD, so an alias
             // fires there -- even one named for a keyword -- and may supply the
             // `()` and the body with it.
-            ("alias N=f\nfunction N { echo BODY; }\nunalias N\nf", "BODY\n"),
-            ("alias fi=g\nfunction fi { echo BODY; }\nunalias fi\ng", "BODY\n"),
+            (
+                "alias N=f\nfunction N { echo BODY; }\nunalias N\nf",
+                "BODY\n",
+            ),
+            (
+                "alias fi=g\nfunction fi { echo BODY; }\nunalias fi\ng",
+                "BODY\n",
+            ),
             ("alias N=\"f() { echo BODY; }\"\nfunction N\nf", "BODY\n"),
             // The BODY position takes one only through the `()` spelling, which
             // rejoins the ordinary path; without it ash reads that token with
@@ -4752,9 +5009,16 @@ mod tests {
             "function $undef { echo x; }; echo after",
             "function f/g { echo x; }; echo after",
         ] {
-            assert_eq!(run(src), (0, "after\n".to_string(), String::new()), "{src:?}");
+            assert_eq!(
+                run(src),
+                (0, "after\n".to_string(), String::new()),
+                "{src:?}"
+            );
         }
-        for src in ["function \"myfunc\" { echo x; }; myfunc", "function f/g { echo x; }; f/g"] {
+        for src in [
+            "function \"myfunc\" { echo x; }; myfunc",
+            "function f/g { echo x; }; f/g",
+        ] {
             assert_eq!(run(src).0, 127, "{src:?}");
         }
         assert_eq!(run("function f/g { echo x; }; type f/g").0, 127);
@@ -4762,7 +5026,11 @@ mod tests {
         // the number is dash's, whose relative rule this shell follows for a
         // definition's line, and ash says 4.
         for def in ["function f", "function f ()", "f()"] {
-            assert_eq!(run(&format!(":\n:\n{def}\n{{\n  echo $LINENO\n}}\nf")).1, "3\n", "{def}");
+            assert_eq!(
+                run(&format!(":\n:\n{def}\n{{\n  echo $LINENO\n}}\nf")).1,
+                "3\n",
+                "{def}"
+            );
         }
         // Without the parentheses the body must OPEN with one of ash's seven
         // words, which a nested definition, a `!` and a redirection are not;
@@ -4827,7 +5095,9 @@ mod tests {
         // A here-document body is the other region only the lexer sees; its `(`
         // used to cancel the pattern's `)` in a count, and cancels nothing now.
         assert_eq!(
-            run(&format!("echo $({l} <<E\n(\nE\ncase x in x) echo p;; esac)")),
+            run(&format!(
+                "echo $({l} <<E\n(\nE\ncase x in x) echo p;; esac)"
+            )),
             (0, "[(] p\n".to_string(), String::new())
         );
         for (src, want) in [
@@ -4851,10 +5121,16 @@ mod tests {
             // A case that a command can start before: after `then`, after `do`,
             // and after a pattern's own `)`, which has no separator after it.
             ("echo $(if :; then case x in x) echo t;; esac; fi)", "t\n"),
-            ("echo $(for i in 1; do case x in x) echo d;; esac; done)", "d\n"),
+            (
+                "echo $(for i in 1; do case x in x) echo d;; esac; done)",
+                "d\n",
+            ),
             // The substitution keeps closing where it did: after `esac`, with a
             // command still to come, and around a nested substitution.
-            ("echo $(case x in x) echo hit;; esac; echo tail)", "hit tail\n"),
+            (
+                "echo $(case x in x) echo hit;; esac; echo tail)",
+                "hit tail\n",
+            ),
             ("echo $(case x in x) echo $(echo in);; esac)", "in\n"),
             // `(` that only the LEXER hides: a `${...}` operand and a
             // here-document body. A count sees them and they used to cancel the
@@ -4874,7 +5150,10 @@ mod tests {
             ("echo $(echo { case x in a)", "{ case x in a\n"),
             // `esac` likewise: it ends an arm only from a command position, so
             // one echoed inside an arm leaves the case running.
-            ("echo $(case y in x) echo esac;; y) echo hit;; esac)", "hit\n"),
+            (
+                "echo $(case y in x) echo esac;; y) echo hit;; esac)",
+                "hit\n",
+            ),
             // ... and it is only RESERVED where a pattern may start. Past a `(`
             // or a `|` it is a pattern word, which ash checks no keyword at.
             ("echo $(case esac in (esac) echo hit;; esac)", "hit\n"),
@@ -4941,9 +5220,17 @@ mod tests {
         // `>&word` on fd 1 is a create too, and the one whose spelling gives no
         // hint of it -- it looks like a dup. `&>word` and a NONNUMERIC `1<&word`
         // reach the same place, so all three are asked.
-        for src in [format!("echo x >&{p}"), format!("echo x &>{p}"), format!("echo x 1<&{p}")] {
+        for src in [
+            format!("echo x >&{p}"),
+            format!("echo x &>{p}"),
+            format!("echo x 1<&{p}"),
+        ] {
             let (_s, _o, err) = run(&src);
-            assert_eq!(err, format!("td-sh: can't create {p}: nonexistent directory\n"), "src: {src}");
+            assert_eq!(
+                err,
+                format!("td-sh: can't create {p}: nonexistent directory\n"),
+                "src: {src}"
+            );
         }
         // `set -C` opens through `noclobber_open` instead, whose OWN two open
         // arms carry the word -- and neither is reached by the loop above,
@@ -4953,10 +5240,22 @@ mod tests {
         let _ = std::fs::create_dir_all(&adir);
         let ad = adir.display();
         for (src, want) in [
-            (format!("set -C; : > {p}"), format!("td-sh: can't create {p}: nonexistent directory\n")),
-            (format!("set -C; echo x >&{p}"), format!("td-sh: can't create {p}: nonexistent directory\n")),
-            (format!("set -C; : > {ad}"), format!("td-sh: can't create {ad}: Is a directory\n")),
-            (format!("set -C; echo x >&{ad}"), format!("td-sh: can't create {ad}: Is a directory\n")),
+            (
+                format!("set -C; : > {p}"),
+                format!("td-sh: can't create {p}: nonexistent directory\n"),
+            ),
+            (
+                format!("set -C; echo x >&{p}"),
+                format!("td-sh: can't create {p}: nonexistent directory\n"),
+            ),
+            (
+                format!("set -C; : > {ad}"),
+                format!("td-sh: can't create {ad}: Is a directory\n"),
+            ),
+            (
+                format!("set -C; echo x >&{ad}"),
+                format!("td-sh: can't create {ad}: Is a directory\n"),
+            ),
         ] {
             let (_s, _o, err) = run(&src);
             assert_eq!(err, want, "src: {src}");
@@ -4972,9 +5271,15 @@ mod tests {
     #[test]
     fn only_a_running_builtin_gives_a_diagnostic_a_place() {
         // The builtin names itself and the line.
-        assert_eq!(run("cd /nope/x").2, "td-sh: cd: line 1: can't cd to /nope/x: No such file or directory\n");
+        assert_eq!(
+            run("cd /nope/x").2,
+            "td-sh: cd: line 1: can't cd to /nope/x: No such file or directory\n"
+        );
         // The line is the COMMAND's, not a constant.
-        assert_eq!(run(":\n:\ncd /nope/x").2, "td-sh: cd: line 3: can't cd to /nope/x: No such file or directory\n");
+        assert_eq!(
+            run(":\n:\ncd /nope/x").2,
+            "td-sh: cd: line 3: can't cd to /nope/x: No such file or directory\n"
+        );
         // Inside a function it is whatever `$LINENO` answers, which this shell
         // measures from the DEFINITION as dash does and ash measures
         // absolutely. Defined below line 1 on purpose: with `f() {` on line 1
@@ -4986,7 +5291,10 @@ mod tests {
         // Neither half for a failure that enters no builtin: a command that is
         // not found, and a redirection that cannot be opened.
         assert_eq!(run("nosuchcmd_xyz").2, "td-sh: nosuchcmd_xyz: not found\n");
-        assert_eq!(run(": < /nope/x").2, "td-sh: can't open /nope/x: no such file\n");
+        assert_eq!(
+            run(": < /nope/x").2,
+            "td-sh: can't open /nope/x: no such file\n"
+        );
         // A readonly refusal is raised by the assignment rather than by a
         // builtin, so it is in that second group even though `readonly` made it.
         assert_eq!(run("readonly r=1\nr=2").2, "td-sh: r: is read only\n");
@@ -4999,7 +5307,9 @@ mod tests {
     fn a_sourced_file_is_the_name_a_failure_inside_it_carries() {
         let dir = std::env::temp_dir().join(format!("td-sh-srcname-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let Ok(()) = std::fs::create_dir_all(&dir) else { return };
+        let Ok(()) = std::fs::create_dir_all(&dir) else {
+            return;
+        };
         let inner = dir.join("inner.sh");
         let _ = std::fs::write(&inner, ":\n:\nnosuchcmd_xyz\n");
         let path = inner.to_string_lossy().into_owned();
@@ -5029,16 +5339,24 @@ mod tests {
         let d = dir.display();
         // Missing, and NOT `no such file`: that word is the redirection's.
         let (_s, _o, err) = run(&format!("cd {d}/nope"));
-        assert_eq!(err, format!("td-sh: cd: line 1: can't cd to {d}/nope: No such file or directory\n"));
+        assert_eq!(
+            err,
+            format!("td-sh: cd: line 1: can't cd to {d}/nope: No such file or directory\n")
+        );
         // Resolves and is not a directory -- the arm no syscall answers, since
         // this shell's cwd is a variable and there is no `chdir` to fail.
         let (_s, _o, err) = run(&format!("cd {d}/f"));
-        assert_eq!(err, format!("td-sh: cd: line 1: can't cd to {d}/f: Not a directory\n"));
+        assert_eq!(
+            err,
+            format!("td-sh: cd: line 1: can't cd to {d}/f: Not a directory\n")
+        );
         // `.` quotes the name, which nothing else in the shell does, and both
         // spellings of the word name themselves.
         for word in ["source", "."] {
             let (_s, _o, err) = run(&format!("{word} {d}/nope.sh"));
-            let want = format!("td-sh: {word}: line 1: can't open '{d}/nope.sh': No such file or directory\n");
+            let want = format!(
+                "td-sh: {word}: line 1: can't open '{d}/nope.sh': No such file or directory\n"
+            );
             assert_eq!(err, want);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -5304,7 +5622,10 @@ mod tests {
             panic!("fixture");
         };
         let (_s, _o, err) = run(&format!("{both}set -C; sh_o >&'{}'", kept.display()));
-        assert_eq!(err, format!("td-sh: can't create {}: File exists\n", kept.display()));
+        assert_eq!(
+            err,
+            format!("td-sh: can't create {}: File exists\n", kept.display())
+        );
         assert_eq!(std::fs::read(&kept).ok(), Some(b"KEEP".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5675,7 +5996,10 @@ mod tests {
             // The NUMBER is part of the diagnostic: every case here names a
             // different descriptor as its destination, so a message that dropped
             // it would read the same for all of them.
-            assert!(err.contains("3: bad file descriptor"), "src: {src}, {err:?}");
+            assert!(
+                err.contains("3: bad file descriptor"),
+                "src: {src}, {err:?}"
+            );
         }
         // And the neighbours that must NOT become errors. Closing is idempotent
         // and may name a descriptor that was never open; a self-dup is skipped
@@ -5779,8 +6103,7 @@ mod tests {
         // than fatal.
         for w in ["&>", "1&>", "2&>", "3&>"] {
             std::fs::write(&f, "PRE\n").unwrap();
-            let (_s, out, err) =
-                run(&format!("set -C; {both} {w}'{d}'; echo st=$?"));
+            let (_s, out, err) = run(&format!("set -C; {both} {w}'{d}'; echo st=$?"));
             assert_eq!(out, "st=1\n", "{w}");
             assert!(!err.is_empty(), "{w}");
             assert_eq!(read(&f), "PRE\n", "{w}");
@@ -5848,7 +6171,10 @@ mod tests {
         // a transposed `>&` is invisible to all of them, and the text is
         // pinned where it is written instead.
         assert_eq!(crate::lexer::Op::AmpGreat.text(), "&>");
-        assert_eq!(run("for i in &>; do :; done").2, "td-sh: syntax error: unexpected redirection\n");
+        assert_eq!(
+            run("for i in &>; do :; done").2,
+            "td-sh: syntax error: unexpected redirection\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5912,8 +6238,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let uniq = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join(format!("td-sh-prefix-{}-{}", std::process::id(), uniq));
+        let path =
+            std::env::temp_dir().join(format!("td-sh-prefix-{}-{}", std::process::id(), uniq));
         {
             let mut f = std::fs::File::create(&path).unwrap();
             f.write_all(b"#!/bin/sh\nprintf %s \"$FOO\"\n").unwrap();
@@ -5943,8 +6269,7 @@ mod tests {
             "set -u; echo $undefined_var; echo SAME",
             "readonly RO=1; RO=2; echo SAME",
         ] {
-            let (status, out, _) =
-                run_capturing_interactive_units(&[bad, "set +u", "echo NEXT"]);
+            let (status, out, _) = run_capturing_interactive_units(&[bad, "set +u", "echo NEXT"]);
             assert_eq!(out, "NEXT\n", "{bad}");
             assert_eq!(status, 0, "{bad}");
         }
@@ -5957,8 +6282,7 @@ mod tests {
             "readonly N; read N </dev/null; echo SAME",
             "readonly O; getopts ab O -a; echo SAME",
         ] {
-            let (status, out, _) =
-                run_capturing_interactive_units(&[bad, "set +u", "echo NEXT"]);
+            let (status, out, _) = run_capturing_interactive_units(&[bad, "set +u", "echo NEXT"]);
             assert_eq!(out, "SAME\nNEXT\n", "{bad}");
             assert_eq!(status, 0, "{bad}");
         }
@@ -5985,10 +6309,19 @@ mod tests {
         // save/restore of the value the caller supplied.
         for (src, want) in [
             ("f() { :; }; D=dd f; echo [${D-unset}]", "[unset]\n"),
-            ("f() { echo in=$D; }; D=dd f; echo out=[$D]", "in=dd\nout=[]\n"),
-            ("D=orig; f() { echo in=$D; }; D=dd f; echo out=$D", "in=dd\nout=orig\n"),
+            (
+                "f() { echo in=$D; }; D=dd f; echo out=[$D]",
+                "in=dd\nout=[]\n",
+            ),
+            (
+                "D=orig; f() { echo in=$D; }; D=dd f; echo out=$D",
+                "in=dd\nout=orig\n",
+            ),
             ("D=orig; f() { D=mut; }; D=dd f; echo out=$D", "out=orig\n"),
-            ("D=orig; f() { unset D; }; D=dd f; echo out=${D-UNSET}", "out=orig\n"),
+            (
+                "D=orig; f() { unset D; }; D=dd f; echo out=${D-UNSET}",
+                "out=orig\n",
+            ),
             // Exported for the call, as an external command's environment is.
             ("f() { echo $D; }; D=dd f", "dd\n"),
         ] {
@@ -6001,7 +6334,10 @@ mod tests {
             "x=global; f() { echo x=$x; x=mutated-temp; echo x=$x; local x=local; \
              echo x=$x; unset x; echo x=$x; }; x=temp-binding f; echo x=$x",
         );
-        assert_eq!(out, "x=temp-binding\nx=mutated-temp\nx=local\nx=\nx=global\n");
+        assert_eq!(
+            out,
+            "x=temp-binding\nx=mutated-temp\nx=local\nx=\nx=global\n"
+        );
         // A non-function command word is unaffected: still transient for a regular
         // builtin, still persistent for a special one.
         let (_, out, _) = run("D=dd echo hi; echo out=[$D]");
@@ -6016,19 +6352,32 @@ mod tests {
         // survive with them, or `local` in the trap errors and the trap never
         // runs at all. Every value read off the td-built busybox ash.
         for (src, want) in [
-            ("f() { exit 7; }; trap 'local Q=1; echo t=ok' EXIT; f", "t=ok\n"),
-            ("f() { echo ${u:?bad}; }; trap 'local Q=1; echo t=ok' EXIT; f", "t=ok\n"),
-            ("g() { exit 7; }; f() { local D=f; g; }; trap 'local Q=1; echo t=ok' EXIT; f",
-             "t=ok\n"),
+            (
+                "f() { exit 7; }; trap 'local Q=1; echo t=ok' EXIT; f",
+                "t=ok\n",
+            ),
+            (
+                "f() { echo ${u:?bad}; }; trap 'local Q=1; echo t=ok' EXIT; f",
+                "t=ok\n",
+            ),
+            (
+                "g() { exit 7; }; f() { local D=f; g; }; trap 'local Q=1; echo t=ok' EXIT; f",
+                "t=ok\n",
+            ),
             // The trap sees the dead frame's `local`, and can shadow it with one
             // of its own.
-            ("D=g; f() { local D=f; exit 7; }; trap 'echo t=$D; local D=x; echo u=$D' EXIT; f",
-             "t=f\nu=x\n"),
+            (
+                "D=g; f() { local D=f; exit 7; }; trap 'echo t=$D; local D=x; echo u=$D' EXIT; f",
+                "t=f\nu=x\n",
+            ),
             // Not inside one: at the top level, after a plain `exit`, and after a
             // function that RETURNED, `local` is still an error in all three.
             ("trap 'local Q=1; echo BAD' EXIT; true", ""),
             ("trap 'local Q=1; echo BAD' EXIT; exit 3", ""),
-            ("f() { return 3; }; trap 'local Q=1; echo BAD' EXIT; f; exit 4", ""),
+            (
+                "f() { return 3; }; trap 'local Q=1; echo BAD' EXIT; f; exit 4",
+                "",
+            ),
         ] {
             let (_, out, _) = run(src);
             assert_eq!(out, want, "{src}");
@@ -6059,10 +6408,8 @@ mod tests {
         ]);
         assert_eq!(out, "after=2\n");
         assert!(err.contains("not in a function"), "{err}");
-        let (_, out, err) = run(
-            "h() { echo ${u:?bad}; }; g() { h; }; f() { g; }; \
-             command eval 'f'; local R=1; echo BAD",
-        );
+        let (_, out, err) = run("h() { echo ${u:?bad}; }; g() { h; }; f() { g; }; \
+             command eval 'f'; local R=1; echo BAD");
         assert_eq!(out, "");
         assert!(err.contains("not in a function"), "{err}");
         // Several frames dying at once each leave a marker, so the drain ORDER is
@@ -6081,17 +6428,14 @@ mod tests {
         assert!(err.contains("not in a function"), "{err}");
         // A swallow INSIDE a function that is still running must not take its
         // frame away: `local` there still works, and only the caller's does not.
-        let (_, out, _) = run(
-            "f() { command eval 'echo ${u:?bad}'; local Q=1; echo in=ok; }; f; echo done",
-        );
+        let (_, out, _) =
+            run("f() { command eval 'echo ${u:?bad}'; local Q=1; echo in=ok; }; f; echo done");
         assert_eq!(out, "in=ok\ndone\n");
         // Same, but with an inner function dying, so a marker really is pushed and
         // carries `true`. This is what makes the value load-bearing rather than the
         // marker's presence: applying a hard-coded `false` reds only here.
-        let (_, out, _) = run(
-            "g() { echo ${u:?bad}; }; \
-             f() { command eval 'g'; local Q=1; echo in=ok; }; f; echo done",
-        );
+        let (_, out, _) = run("g() { echo ${u:?bad}; }; \
+             f() { command eval 'g'; local Q=1; echo in=ok; }; f; echo done");
         assert_eq!(out, "in=ok\ndone\n");
     }
 
@@ -6151,7 +6495,11 @@ mod tests {
             ));
             assert_eq!(out, "", "{w}");
             assert!(err.contains("not in a function"), "{w}: {err}");
-            assert_eq!(run(&format!("{w}() {{ local Q=1; echo ok; }}; {w}")).1, "ok\n", "{w}");
+            assert_eq!(
+                run(&format!("{w}() {{ local Q=1; echo ok; }}; {w}")).1,
+                "ok\n",
+                "{w}"
+            );
         }
     }
 
@@ -6163,7 +6511,10 @@ mod tests {
         assert_eq!(run("f() { (local Q=1; echo ok); }; f").1, "ok\n");
         assert!(run("(local Q=1)").2.contains("not in a function"));
         // The child's own `local` must not follow the fork back out.
-        assert_eq!(run("D=out; f() { (local D=in); echo [$D]; }; f").1, "[out]\n");
+        assert_eq!(
+            run("D=out; f() { (local D=in); echo [$D]; }; f").1,
+            "[out]\n"
+        );
     }
 
     #[test]
@@ -6198,7 +6549,10 @@ mod tests {
             assert_eq!(err.contains("not in a function"), errors, "{src}: {err}");
         }
         // It is still a SCRATCH frame: what it declares must not outlive it.
-        assert_eq!(run("D=out; command eval 'local D=in'; echo [$D]").1, "[out]\n");
+        assert_eq!(
+            run("D=out; command eval 'local D=in'; echo [$D]").1,
+            "[out]\n"
+        );
         // ...and its drain stops at its OWN mark. Run from an EXIT trap it sits on
         // top of the dying function's deferred frame, which it must leave standing:
         // drain to zero instead and the trap reads the global `X` rather than the
@@ -6215,28 +6569,63 @@ mod tests {
         // the frame the shell died in and sees its bindings. Every value here was
         // read off the td-built busybox ash.
         for (src, want) in [
-            ("D=g; trap 'echo t=$D' EXIT; f() { D=body; exit 7; }; D=dd f", "t=body\n"),
-            ("D=g; trap 'echo t=$D' EXIT; f() { exit 7; }; D=dd f", "t=dd\n"),
-            ("D=g; trap 'echo t=$D' EXIT; f() { echo ${u:?bad}; }; D=dd f", "t=dd\n"),
-            ("D=g; trap 'echo t=$D' EXIT; set -e; f() { false; }; D=dd f", "t=dd\n"),
+            (
+                "D=g; trap 'echo t=$D' EXIT; f() { D=body; exit 7; }; D=dd f",
+                "t=body\n",
+            ),
+            (
+                "D=g; trap 'echo t=$D' EXIT; f() { exit 7; }; D=dd f",
+                "t=dd\n",
+            ),
+            (
+                "D=g; trap 'echo t=$D' EXIT; f() { echo ${u:?bad}; }; D=dd f",
+                "t=dd\n",
+            ),
+            (
+                "D=g; trap 'echo t=$D' EXIT; set -e; f() { false; }; D=dd f",
+                "t=dd\n",
+            ),
             // `local` is the same rule, and it applied to `local` first.
-            ("D=g; trap 'echo t=$D' EXIT; f() { local D=loc; exit 4; }; f", "t=loc\n"),
-            ("D=g; trap 'echo t=$D' EXIT; g() { D=in; exit 5; }; f() { D=mid g; }; D=out f",
-             "t=in\n"),
+            (
+                "D=g; trap 'echo t=$D' EXIT; f() { local D=loc; exit 4; }; f",
+                "t=loc\n",
+            ),
+            (
+                "D=g; trap 'echo t=$D' EXIT; g() { D=in; exit 5; }; f() { D=mid g; }; D=out f",
+                "t=in\n",
+            ),
             // A frame only half applied when a readonly name rejected the next
             // assignment stays too -- the error is a terminating unwind as well.
-            ("D=g; readonly R=r; trap 'echo t=$D' EXIT; f() { :; }; D=dd R=no f", "t=dd\n"),
+            (
+                "D=g; readonly R=r; trap 'echo t=$D' EXIT; f() { :; }; D=dd R=no f",
+                "t=dd\n",
+            ),
             // A regular builtin's frame follows the same rule -- it is `evalcommand`
             // that skips the cleanup, not anything about functions.
             ("D=g; trap 'echo t=$D' EXIT; D=dd command exit 7", "t=dd\n"),
-            ("D=g; readonly R=r; trap 'echo t=$D' EXIT; D=dd R=no true", "t=dd\n"),
-            ("D=g; trap 'echo t=$D' EXIT; D=dd Y=${u:?bad} true", "t=dd\n"),
+            (
+                "D=g; readonly R=r; trap 'echo t=$D' EXIT; D=dd R=no true",
+                "t=dd\n",
+            ),
+            (
+                "D=g; trap 'echo t=$D' EXIT; D=dd Y=${u:?bad} true",
+                "t=dd\n",
+            ),
             // Not terminating: `return` unwinds normally and undoes the frame.
-            ("D=g; trap 'echo t=$D' EXIT; f() { D=body; return 3; }; D=dd f", "t=g\n"),
-            ("D=g; trap 'echo t=$D' EXIT; f() { local D=loc; }; f", "t=g\n"),
+            (
+                "D=g; trap 'echo t=$D' EXIT; f() { D=body; return 3; }; D=dd f",
+                "t=g\n",
+            ),
+            (
+                "D=g; trap 'echo t=$D' EXIT; f() { local D=loc; }; f",
+                "t=g\n",
+            ),
             // Nor is a failed redirection, which reports rather than raises; nor
             // `set -e` on a builtin, which fires after the frame is already gone.
-            ("D=g; trap 'echo t=$D' EXIT; D=dd true >/nonexistent/d/f", "t=g\n"),
+            (
+                "D=g; trap 'echo t=$D' EXIT; D=dd true >/nonexistent/d/f",
+                "t=g\n",
+            ),
             ("D=g; trap 'echo t=$D' EXIT; set -e; D=dd false", "t=g\n"),
             // `command` wraps a builtin in a scratch `local` frame, which is a
             // frame like any other and stays standing on the way out.
@@ -6283,10 +6672,8 @@ mod tests {
         // A swallowed abort undoes the frames of the command that recovered, and
         // stops there: an OUTER unwind is still on its way out and its bindings
         // belong to the EXIT trap. Both values read off the td-built busybox ash.
-        let (_, out, _) = run(
-            "D=global; g() { local D=g; echo ${u:?bad}; }; \
-             f() { local D=f; command eval 'local D=scratch; g'; echo after=$D; }; f",
-        );
+        let (_, out, _) = run("D=global; g() { local D=g; echo ${u:?bad}; }; \
+             f() { local D=f; command eval 'local D=scratch; g'; echo after=$D; }; f");
         assert_eq!(out, "after=f\n");
         // The mark: `f` died with `local D=f` standing, then the EXIT trap
         // recovered from an abort inside `g`. Only `g`'s frame may go.
@@ -6337,13 +6724,16 @@ mod tests {
         // the value can ONLY have come back through the arm under test -- with
         // `shift bad` the arm is unobservable, because `badnum` sets `$?` anyway.
         for (src, want) in [
-            ("( echo ${x:?bad} ); echo $?", "2\n"),                 // subshell body
-            ("echo a | { echo ${x:?bad}; }; echo $?", "2\n"),       // pipeline stage
-            ("v=$(echo ${x:?bad}); echo $?", "2\n"),                // command sub
+            ("( echo ${x:?bad} ); echo $?", "2\n"), // subshell body
+            ("echo a | { echo ${x:?bad}; }; echo $?", "2\n"), // pipeline stage
+            ("v=$(echo ${x:?bad}); echo $?", "2\n"), // command sub
             ("( shift bad ); echo $?", "2\n"),
             // A background list reports 0 either way, so its own arm is only
             // visible from inside: the child's EXIT trap sees the aborted status.
-            ("{ trap 'echo $?' EXIT; echo ${x:?bad}; } & wait; echo $?", "2\n0\n"),
+            (
+                "{ trap 'echo $?' EXIT; echo ${x:?bad}; } & wait; echo $?",
+                "2\n0\n",
+            ),
         ] {
             let (status, out, _) = run(src);
             assert_eq!(out, want, "{src}");
@@ -6453,15 +6843,24 @@ mod tests {
     /// five tests was measured against dash 0.5.12 first.
     #[test]
     fn lineno_is_the_line_of_the_command() {
-        assert_eq!(run("echo $LINENO\necho $LINENO\n\necho $LINENO").1, "1\n2\n4\n");
+        assert_eq!(
+            run("echo $LINENO\necho $LINENO\n\necho $LINENO").1,
+            "1\n2\n4\n"
+        );
         // Blank and comment lines are counted but do not carry a command, so
         // the next one still reports its own.
         assert_eq!(run("# c\n\n# c\necho $LINENO").1, "4\n");
         // The word list of a `for` and the subject of a `case` belong to the
         // compound's own node, which is why both report the keyword's line and
         // the loop body reports its own on every iteration.
-        assert_eq!(run("set -- a b\nfor x; do\n  echo $LINENO\ndone").1, "3\n3\n");
-        assert_eq!(run("case $LINENO in\n  1) echo one ;;\n  *) echo no ;;\nesac").1, "one\n");
+        assert_eq!(
+            run("set -- a b\nfor x; do\n  echo $LINENO\ndone").1,
+            "3\n3\n"
+        );
+        assert_eq!(
+            run("case $LINENO in\n  1) echo one ;;\n  *) echo no ;;\nesac").1,
+            "one\n"
+        );
         // Both assignments of one command see one line, and a word carried
         // across a fold reports where its command OPENED, not where it sits.
         assert_eq!(run("a=$LINENO b=$LINENO\necho $a $b").1, "1 1\n");
@@ -6485,12 +6884,18 @@ mod tests {
         assert_eq!(run("true |\n  { read _; echo $LINENO; }").1, "2\n");
         // The stages run as concurrent threads, so this also pins that the
         // line is not one cell they share: each stage forks its own `Shell`.
-        assert_eq!(run("echo $LINENO |\n  { read a; echo $a $LINENO; }").1, "1 2\n");
+        assert_eq!(
+            run("echo $LINENO |\n  { read a; echo $a $LINENO; }").1,
+            "1 2\n"
+        );
         // A stage that is a SIMPLE command is the only one that pins the
         // publish: a `{ …; }` stage has an inner command whose own line
         // overwrites it, so it passes even when nothing published the stage's.
         // The leading `:` is what makes the inherited line differ from 2.
-        assert_eq!(run(":\necho $LINENO |\n  { read a; echo got=$a; }").1, "got=2\n");
+        assert_eq!(
+            run(":\necho $LINENO |\n  { read a; echo got=$a; }").1,
+            "got=2\n"
+        );
     }
 
     /// dash reports a line inside a function RELATIVE to where the function
@@ -6510,7 +6915,10 @@ mod tests {
         assert_eq!(run(src).1, "2\n2\n4\n10\n");
         // A definition made INSIDE a call records its absolute parse line, not
         // one already relative to the enclosing function.
-        assert_eq!(run("f() {\n  g() {\n    echo $LINENO\n  }\n  g\n}\nf").1, "2\n");
+        assert_eq!(
+            run("f() {\n  g() {\n    echo $LINENO\n  }\n  g\n}\nf").1,
+            "2\n"
+        );
         // The definition's line is the `)` TOKEN's, which is neither the name's
         // nor the body's: a definition folded across a `\` counts from the
         // parentheses, and a `{` on the next line does not move it. dash gives
@@ -6520,9 +6928,13 @@ mod tests {
         // The BODY is a command node too, so its own header expands under its
         // own line and not the CALLER's: a body with no inner command to
         // overwrite the line is the only place that shows.
-        assert_eq!(run("f() for x in \"$LINENO\"; do echo $x; done\necho top\nf").1, "top\n1\n");
         assert_eq!(
-            run("g() case $LINENO in 1) echo ONE;; *) echo \"OTHER=$LINENO\";; esac\necho top\ng").1,
+            run("f() for x in \"$LINENO\"; do echo $x; done\necho top\nf").1,
+            "top\n1\n"
+        );
+        assert_eq!(
+            run("g() case $LINENO in 1) echo ONE;; *) echo \"OTHER=$LINENO\";; esac\necho top\ng")
+                .1,
             "top\nONE\n"
         );
         // And it really can go NEGATIVE, which is dash's plain signed
@@ -6538,15 +6950,25 @@ mod tests {
     /// file's line 4 report 5, which is a line number no line has.
     #[test]
     fn an_alias_body_is_lexed_where_the_name_stood() {
-        assert_eq!(run("alias x='echo $LINENO'\necho top\nx\necho $LINENO").1, "top\n3\n4\n");
+        assert_eq!(
+            run("alias x='echo $LINENO'\necho top\nx\necho $LINENO").1,
+            "top\n3\n4\n"
+        );
         // Including a `$( )` inside the body, which a separately-lexed
         // replacement would report as 1.
-        assert_eq!(run("alias x='echo $(echo $LINENO)'\necho top\nx").1, "top\n3\n");
+        assert_eq!(
+            run("alias x='echo $(echo $LINENO)'\necho top\nx").1,
+            "top\n3\n"
+        );
         // A body with a newline in it reports the line after for its second
         // command, as dash does -- and the line AFTER the invocation is still
         // its own, where dash shifts it to 5.
         let two = "alias x='echo $LINENO\necho $LINENO'\nx\necho $LINENO";
-        assert_eq!(run(two).1, "3\n4\n4\n", "dash gives 3 4 5, shifting the rest of the file");
+        assert_eq!(
+            run(two).1,
+            "3\n4\n4\n",
+            "dash gives 3 4 5, shifting the rest of the file"
+        );
     }
 
     /// A substitution body is numbered the way it is PARSED. dash reads a
@@ -6570,9 +6992,18 @@ mod tests {
         // `${...}` word, an arithmetic body or a here-document body counts on
         // from the script too -- all three re-lex the text, and starting that
         // sub-lexer at 1 would report 1 where dash reports 3, 3 and 4.
-        assert_eq!(run("echo a\necho b\necho \"${u:-$(echo $LINENO)}\"").1, "a\nb\n3\n");
-        assert_eq!(run("echo a\necho b\necho $(( $(echo $LINENO) + 0 ))").1, "a\nb\n3\n");
-        assert_eq!(run("echo a\necho b\nread x <<EOF\n$(echo $LINENO)\nEOF\necho $x").1, "a\nb\n4\n");
+        assert_eq!(
+            run("echo a\necho b\necho \"${u:-$(echo $LINENO)}\"").1,
+            "a\nb\n3\n"
+        );
+        assert_eq!(
+            run("echo a\necho b\necho $(( $(echo $LINENO) + 0 ))").1,
+            "a\nb\n3\n"
+        );
+        assert_eq!(
+            run("echo a\necho b\nread x <<EOF\n$(echo $LINENO)\nEOF\necho $x").1,
+            "a\nb\n4\n"
+        );
         // An operand's own offset inside the braces counts as well.
         assert_eq!(run("echo a\necho $((1 +\n$(echo $LINENO) ))").1, "a\n4\n");
         // A patsub REPLACEMENT is the one operand a newline can precede,
@@ -6615,7 +7046,10 @@ mod tests {
         assert_eq!(seen("export LINENO").as_deref(), Some(""));
         assert_eq!(seen("export LINENO\n:\n:\n:").as_deref(), Some(""));
         // ...then the value the LAST read produced, not the current line.
-        assert_eq!(seen("export LINENO\necho $LINENO >&-\n:\n:").as_deref(), Some("2"));
+        assert_eq!(
+            seen("export LINENO\necho $LINENO >&-\n:\n:").as_deref(),
+            Some("2")
+        );
         // A frozen LINENO exports what was stored, like any other variable.
         assert_eq!(seen("export LINENO\nLINENO=42").as_deref(), Some("42"));
     }
@@ -6635,8 +7069,14 @@ mod tests {
         // is for `local` generally: its `mklocal` keeps the text, so `local
         // LINENO` there still reports the line (measured: `[1]`, and `got=1`
         // rather than an abort under `set -u`).
-        assert_eq!(run("f() { local LINENO; echo \"[$LINENO]\"; }\nf\necho $LINENO").1, "[]\n3\n");
-        assert_eq!(run("f() { local LINENO; LINENO=7; echo $LINENO; }\nf\necho $LINENO").1, "7\n3\n");
+        assert_eq!(
+            run("f() { local LINENO; echo \"[$LINENO]\"; }\nf\necho $LINENO").1,
+            "[]\n3\n"
+        );
+        assert_eq!(
+            run("f() { local LINENO; LINENO=7; echo $LINENO; }\nf\necho $LINENO").1,
+            "7\n3\n"
+        );
         // The readonly exemption is RANDOM's alone -- ash grants it to its one
         // dynamic name, and dash refuses this with `is read only`, measured.
         let (status, _out, err) = run("readonly LINENO\nLINENO=5\necho after");

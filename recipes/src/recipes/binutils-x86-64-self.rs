@@ -149,8 +149,7 @@ mod tests {
             .iter()
             .filter_map(|step| match step {
                 Step::Run { argv, env, .. }
-                    if argv.first().map(String::as_str)
-                        == Some("{in:make-mesboot}/bin/make") =>
+                    if argv.first().map(String::as_str) == Some("{in:make-mesboot}/bin/make") =>
                 {
                     Some(env)
                 }
@@ -158,7 +157,11 @@ mod tests {
             })
             .collect();
         // The build `make` and the `make install`.
-        assert_eq!(make_steps.len(), 2, "expected a build and an install make step");
+        assert_eq!(
+            make_steps.len(),
+            2,
+            "expected a build and an install make step"
+        );
         for env in make_steps {
             let cinc = env
                 .iter()

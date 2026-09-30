@@ -232,11 +232,7 @@ pub fn problems(message: &str, paths: &[String]) -> Vec<String> {
     // the human was actually asked, so what the gate CAN do is bound what a
     // waiver reaches: stacked ones get to "no reviews at all" in four extra
     // words, and a commit with two reviewers down is one to stop on anyway.
-    let reviewer_waivers = rec
-        .waivers
-        .iter()
-        .filter(|(s, _)| s != DOCS_ONLY)
-        .count();
+    let reviewer_waivers = rec.waivers.iter().filter(|(s, _)| s != DOCS_ONLY).count();
     if reviewer_waivers > 1 {
         out.push(format!(
             "{reviewer_waivers} reviewers waived at once — ask a human rather than record around it"
@@ -258,8 +254,11 @@ pub fn problems(message: &str, paths: &[String]) -> Vec<String> {
         // A waiver stands in for a review only with a reason; the roster check
         // above has already reported an unknown subject.
         // Only a waiver that names its approver stands in for a review.
-        let waived =
-            |who: &str| rec.waivers.iter().any(|(s, r)| s == who && approver(r).is_some());
+        let waived = |who: &str| {
+            rec.waivers
+                .iter()
+                .any(|(s, r)| s == who && approver(r).is_some())
+        };
         let model_of = |who: &str| {
             rec.reviewers
                 .iter()
@@ -422,7 +421,10 @@ fn run_at(
 
     // The fallback affected-checks makes, for the same reason: a clone without
     // an `origin` still has a main to measure against.
-    if !affected::git_ok(&root, &["rev-parse", "--verify", &format!("{base}^{{commit}}")]) {
+    if !affected::git_ok(
+        &root,
+        &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+    ) {
         if base == "origin/main"
             && affected::git_ok(&root, &["rev-parse", "--verify", "main^{commit}"])
         {
@@ -498,7 +500,14 @@ fn run_at(
         // `i18n.logOutputEncoding` asks for.
         let raw = git_try(
             &root,
-            &["-c", "i18n.logOutputEncoding=UTF-8", "show", "-s", "--format=%P%x00%B", oid],
+            &[
+                "-c",
+                "i18n.logOutputEncoding=UTF-8",
+                "show",
+                "-s",
+                "--format=%P%x00%B",
+                oid,
+            ],
         );
         let Some((parents, message)) = raw.as_deref().and_then(|r| r.split_once('\0')) else {
             unready += 1;
@@ -575,7 +584,10 @@ fn run_at(
             // A different WORD, not a different exit status — `--record-only`
             // did what it was asked, so it exits 0 and a `&&` chain cannot tell
             // the two apart. The word is for the human reading the output.
-            println!("RECORD OK: {} commit(s) over {base} — checks NOT run", commits.len());
+            println!(
+                "RECORD OK: {} commit(s) over {base} — checks NOT run",
+                commits.len()
+            );
         } else {
             println!("READY: {} commit(s) over {base}", commits.len());
         }
@@ -600,7 +612,6 @@ fn run_at(
     }
     ExitCode::FAILURE
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -669,7 +680,10 @@ mod tests {
             local_ready(root.clone(), &["--base".into(), "missing".into()]),
             ExitCode::from(2)
         );
-        assert_eq!(local_ready(root.clone(), &["--base".into()]), ExitCode::from(2));
+        assert_eq!(
+            local_ready(root.clone(), &["--base".into()]),
+            ExitCode::from(2)
+        );
         std::fs::write(root.join("notes.md"), "Dirty\n").unwrap();
         assert_eq!(local_ready(root.clone(), &[]), ExitCode::FAILURE);
         git(&["checkout", "--", "notes.md"]);
@@ -767,7 +781,11 @@ Checks: affected-checks --committed-only (green)
                  Reviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
         let p = probs(m);
         assert_eq!(p.len(), 1);
-        assert!(p.first().is_some_and(|s| s.contains("model that is not acting")), "{p:?}");
+        assert!(
+            p.first()
+                .is_some_and(|s| s.contains("model that is not acting")),
+            "{p:?}"
+        );
 
         // The same shape the other way round, which is the Codex actor's.
         let m = "s\n\nReviewed-by: subagent/gpt-5.6-sol\nReviewed-by: codex/gpt-5.6-sol\n\
@@ -811,12 +829,17 @@ Checks: affected-checks --committed-only (green)
         let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/some-new-thing\n\
                  Reviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
         let p = probs(m);
-        assert!(p.iter().any(|s| s.contains("is not a known model")), "{p:?}");
+        assert!(
+            p.iter().any(|s| s.contains("is not a known model")),
+            "{p:?}"
+        );
     }
 
     #[test]
     fn agy_alone_is_not_enough_either() {
-        let p = probs("s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: agy/gemini-3.1-pro\nChecks: g\n");
+        let p = probs(
+            "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: agy/gemini-3.1-pro\nChecks: g\n",
+        );
         assert_eq!(p.len(), 1);
         assert!(p
             .first()
@@ -872,7 +895,10 @@ Checks: affected-checks --committed-only (green)
         let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
                  Review-waiver: agy — the CLI is not installed on this host\nChecks: g\n";
         let p = probs(m);
-        assert!(p.iter().any(|s| s.contains("names nobody who approved it")), "{p:?}");
+        assert!(
+            p.iter().any(|s| s.contains("names nobody who approved it")),
+            "{p:?}"
+        );
         assert!(p.iter().any(|s| s.starts_with("no agy review")), "{p:?}");
     }
 
@@ -881,7 +907,11 @@ Checks: affected-checks --committed-only (green)
         let m = "s\n\nReviewed-by: codex/gpt-5.6-sol\nReviewed-by: agy/gemini-3.1-pro\n\
                  Review-waiver: subagent — skipped, approved by tester\nChecks: g\n";
         let p = probs(m);
-        assert!(p.iter().any(|s| s == "the subagent review cannot be waived"), "{p:?}");
+        assert!(
+            p.iter()
+                .any(|s| s == "the subagent review cannot be waived"),
+            "{p:?}"
+        );
     }
 
     #[test]
@@ -894,7 +924,10 @@ Checks: affected-checks --committed-only (green)
 
         let m = "s\n\nReview-waiver: subagent — skipped\nReview-waiver: agy — skipped\n\
                  Review-waiver: codex — skipped\nChecks: green\n";
-        assert!(!probs(m).is_empty(), "a commit with no reviews at all must not pass");
+        assert!(
+            !probs(m).is_empty(),
+            "a commit with no reviews at all must not pass"
+        );
     }
 
     #[test]
@@ -903,7 +936,9 @@ Checks: affected-checks --committed-only (green)
         assert!(problems(m, &code(&["AGENTS.md", "README.md"])).is_empty());
         let p = problems(m, &code(&["AGENTS.md", "builder/src/ready.rs"]));
         assert_eq!(p.len(), 1);
-        assert!(p.first().is_some_and(|s| s.contains("builder/src/ready.rs")));
+        assert!(p
+            .first()
+            .is_some_and(|s| s.contains("builder/src/ready.rs")));
     }
 
     /// A rename must not launder a source file into a docs-only waiver.

@@ -31,7 +31,15 @@
 //!     set and override order (the TMPDIR group wins over drv env). The trusted
 //!     mesboot runner receives the hashed TD_STEPS data path through TD_STEPS_FILE.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 #![allow(unsafe_code)] // confined raw-syscall / low-level layer (UNSAFE.md)
 
 use std::collections::BTreeSet;
@@ -87,7 +95,11 @@ fn isolate_ipc(fresh_proc: &Path) -> io::Result<()> {
 fn require_no_ipc_facilities(fresh_proc: &Path) -> io::Result<()> {
     for relative in ["sysvipc", "sys/fs/mqueue"] {
         match fs::symlink_metadata(fresh_proc.join(relative)) {
-            Ok(_) => return Err(err(format!("kernel exposes {relative} without an IPC namespace"))),
+            Ok(_) => {
+                return Err(err(format!(
+                    "kernel exposes {relative} without an IPC namespace"
+                )))
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
@@ -102,9 +114,13 @@ fn require_no_ipc_facilities(fresh_proc: &Path) -> io::Result<()> {
     let mut has_proc = false;
     for line in filesystems.lines() {
         let mut words = line.split_whitespace();
-        let first = words.next().ok_or_else(|| err("empty kernel filesystem row".into()))?;
+        let first = words
+            .next()
+            .ok_or_else(|| err("empty kernel filesystem row".into()))?;
         let kind = if first == "nodev" {
-            words.next().ok_or_else(|| err("incomplete kernel filesystem row".into()))?
+            words
+                .next()
+                .ok_or_else(|| err("incomplete kernel filesystem row".into()))?
         } else {
             first
         };
@@ -112,7 +128,9 @@ fn require_no_ipc_facilities(fresh_proc: &Path) -> io::Result<()> {
             return Err(err("malformed kernel filesystem row".into()));
         }
         if kind == "mqueue" {
-            return Err(err("kernel exposes POSIX message queues without an IPC namespace".into()));
+            return Err(err(
+                "kernel exposes POSIX message queues without an IPC namespace".into(),
+            ));
         }
         has_proc |= kind == "proc";
     }
@@ -126,11 +144,7 @@ fn trusted_recipe_builder(builder: &str) -> bool {
     builder == format!("{}/bin/td-builder", crate::store::builder_identity_path())
 }
 
-fn forward_trusted_check_policy(
-    command: &mut Command,
-    builder: &str,
-    inherited: Option<&OsStr>,
-) {
+fn forward_trusted_check_policy(command: &mut Command, builder: &str, inherited: Option<&OsStr>) {
     if trusted_recipe_builder(builder) {
         if let Some(value) = inherited {
             command.env(crate::check_memory::JOB_BUDGET_ENV, value);
@@ -203,7 +217,7 @@ fn configure_builder_env(
         && application_policy == Some(ApplicationManifestPolicy::Reserve)
     {
         return Err(err(
-            "non-application phase received application metadata".to_string(),
+            "non-application phase received application metadata".to_string()
         ));
     }
     let mut steps = None;
@@ -295,10 +309,7 @@ fn unique_drv_env<'a>(drv: &'a Derivation, key: &str) -> io::Result<Option<&'a s
     unique_env(&drv.env, key)
 }
 
-fn finalize_application_output(
-    drv: &Derivation,
-    outputs: &[(String, PathBuf)],
-) -> io::Result<()> {
+fn finalize_application_output(drv: &Derivation, outputs: &[(String, PathBuf)]) -> io::Result<()> {
     let Some(policy) = application_manifest_policy(drv) else {
         if trusted_recipe_builder(&drv.builder)
             && (unique_drv_env(drv, "TD_APPLICATION_MANIFEST")?.is_some()
@@ -324,7 +335,7 @@ fn finalize_application_output(
         && (manifest.is_some() || spec.is_some() || launcher.is_some())
     {
         return Err(err(
-            "non-application phase received application metadata".to_string(),
+            "non-application phase received application metadata".to_string()
         ));
     }
     let mut output_names = BTreeSet::new();
@@ -364,7 +375,7 @@ fn finalize_application_output(
                 .map_err(|error| err(format!("application metadata finalization: {error}")))
         }
         (None, Some(_), Some(_), Some(_)) => Err(err(
-            "application declaration requires an `out' output".to_string()
+            "application declaration requires an `out' output".to_string(),
         )),
         (None, None, None, None) => Ok(()),
         _ => Err(err("application metadata is incomplete".to_string())),
@@ -379,7 +390,12 @@ fn finalize_application_output(
 /// (CVE-2014-8989). `host_uid`/`host_gid` are the real ids as seen from OUTSIDE the
 /// namespace (the map's second column); `uid_target`/`gid_target` are what the process
 /// appears as INSIDE it (the map's first column).
-pub fn map_userns_id(host_uid: u32, host_gid: u32, uid_target: u32, gid_target: u32) -> io::Result<()> {
+pub fn map_userns_id(
+    host_uid: u32,
+    host_gid: u32,
+    uid_target: u32,
+    gid_target: u32,
+) -> io::Result<()> {
     fs::write("/proc/self/setgroups", "deny")?;
     fs::write("/proc/self/uid_map", format!("{uid_target} {host_uid} 1"))?;
     fs::write("/proc/self/gid_map", format!("{gid_target} {host_gid} 1"))?;
@@ -499,10 +515,7 @@ fn mount_backing_from(mountinfo: &str, path: &Path) -> Option<MountBacking> {
 }
 
 fn memory_backed_fs(fs_type: &str) -> bool {
-    matches!(
-        fs_type,
-        "tmpfs" | "ramfs" | "hugetlbfs" | "devtmpfs"
-    )
+    matches!(fs_type, "tmpfs" | "ramfs" | "hugetlbfs" | "devtmpfs")
 }
 
 fn require_disk_backed_from(
@@ -763,7 +776,11 @@ pub(crate) fn reclaim_leased_tree(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return ScratchReclaim::Absent,
         Err(e) => return ScratchReclaim::Unreadable(e),
     }
-    let lease = match fs::OpenOptions::new().read(true).write(true).open(lease_path) {
+    let lease = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lease_path)
+    {
         Ok(lease) => match lease.try_lock() {
             Ok(()) => Some(lease),
             Err(fs::TryLockError::WouldBlock) => return ScratchReclaim::Leased,
@@ -1078,11 +1095,12 @@ pub fn contain_pid_namespace(cmd: &mut Command) -> io::Result<()> {
     let proc_type = CString::new("proc").map_err(io::Error::other)?;
     unsafe {
         cmd.pre_exec(move || {
-            sys::unshare(sys::CLONE_NEWUSER | sys::CLONE_NEWNS | sys::CLONE_NEWPID)
-                .map_err(|e| {
+            sys::unshare(sys::CLONE_NEWUSER | sys::CLONE_NEWNS | sys::CLONE_NEWPID).map_err(
+                |e| {
                     sys::warn(b"td-builder check: FAILED creating the PID lifetime namespace\n");
                     e
-                })?;
+                },
+            )?;
             map_userns_id(host_uid, host_gid, host_uid, host_gid).map_err(|e| {
                 sys::warn(b"td-builder check: FAILED mapping the PID namespace identity\n");
                 e
@@ -1103,14 +1121,7 @@ pub fn contain_pid_namespace(cmd: &mut Command) -> io::Result<()> {
             // The answer is in, and init below would otherwise hold this end
             // open for the program's whole life.
             let _ = sys::close(live_r);
-            sys::mount(
-                Some(&proc_type),
-                &proc_path,
-                Some(&proc_type),
-                0,
-                None,
-            )
-            .map_err(|e| {
+            sys::mount(Some(&proc_type), &proc_path, Some(&proc_type), 0, None).map_err(|e| {
                 sys::warn(b"td-builder check: FAILED mounting the PID namespace procfs\n");
                 e
             })?;
@@ -1136,9 +1147,9 @@ fn exit_code_of(status: i32) -> i32 {
 /// exec'd is important: its caller can start RSS/deadline monitoring as soon as
 /// this wrapper exists, while the wrapper waits for namespace PID 1 below.
 pub fn pid_namespace_status(args: &[String]) -> io::Result<ExitStatus> {
-    let program = args
-        .first()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "PID namespace has no command"))?;
+    let program = args.first().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "PID namespace has no command")
+    })?;
     let mut command = Command::new(program);
     command.args(args.get(1..).unwrap_or_default());
     die_with_parent(&mut command);
@@ -1185,13 +1196,16 @@ fn pid1_confirm_parent(live_r: i32, live_w: i32) -> io::Result<()> {
     // would be the writer it is waiting to outlive. Load-bearing enough to
     // report — a write end left open answers "alive" forever, which is the
     // check silently becoming a no-op.
-    sys::close(live_w)
-        .map_err(|e| { sys::warn(b"td-builder sandbox: FAILED closing the liveness write end\n"); e })?;
+    sys::close(live_w).map_err(|e| {
+        sys::warn(b"td-builder sandbox: FAILED closing the liveness write end\n");
+        e
+    })?;
     // An unreadable channel is NOT a dead parent, so its errno propagates
     // rather than taking the bail below.
-    if sys::pipe_peer_open(live_r)
-        .map_err(|e| { sys::warn(b"td-builder sandbox: FAILED reading the parent-liveness pipe\n"); e })?
-    {
+    if sys::pipe_peer_open(live_r).map_err(|e| {
+        sys::warn(b"td-builder sandbox: FAILED reading the parent-liveness pipe\n");
+        e
+    })? {
         return Ok(());
     }
     sys::warn(b"td-builder sandbox: parent died before pid 1 armed PR_SET_PDEATHSIG\n");
@@ -1351,7 +1365,10 @@ pub(crate) fn nar_hash_of(path: &Path) -> io::Result<String> {
     }
     let mut w = W(crate::sha256::Sha256::new());
     crate::nar::write_nar(&mut w, path)?;
-    Ok(format!("sha256:{}", crate::sha256::to_base16(&w.0.finalize())))
+    Ok(format!(
+        "sha256:{}",
+        crate::sha256::to_base16(&w.0.finalize())
+    ))
 }
 
 /// Verify ONE closure item against the provenance manifest — split out of
@@ -1408,7 +1425,9 @@ fn plan_staged_item(
     } else {
         // A symlink cannot be bind-mounted; no pinned-channel closure
         // has top-level symlink store items — refuse rather than guess.
-        return Err(err(format!("closure item {canonical}: unsupported file type")));
+        return Err(err(format!(
+            "closure item {canonical}: unsupported file type"
+        )));
     }
     Ok(vec![(on_disk.to_string(), target)])
 }
@@ -1668,8 +1687,7 @@ pub fn build(
     );
     let group_body = format!("root:x:0:\nnixbld:x:{GUEST_GID}:\nnogroup:x:65534:\n");
     let build_dir_owned = build_dir.clone();
-    let mesboot_steps_file =
-        PathBuf::from(&build_dir).join(crate::build::MESBOOT_STEPS_FILE);
+    let mesboot_steps_file = PathBuf::from(&build_dir).join(crate::build::MESBOOT_STEPS_FILE);
 
     let inherited_job_budget = crate::check_memory::request_job_budget()
         .map(|bytes| std::ffi::OsString::from(bytes.to_string()));
@@ -1692,11 +1710,7 @@ pub fn build(
         &drv.env,
         &mesboot_steps_file,
     )?;
-    forward_trusted_check_policy(
-        &mut cmd,
-        &drv.builder,
-        inherited_job_budget.as_deref(),
-    );
+    forward_trusted_check_policy(&mut cmd, &drv.builder, inherited_job_budget.as_deref());
     for k in ["NIX_BUILD_TOP", "TMPDIR", "TEMPDIR", "TMP", "TEMP", "PWD"] {
         cmd.env(k, &build_dir);
     }
@@ -1791,13 +1805,25 @@ pub fn build(
             fs::create_dir_all(&oldroot_rel)?;
             // Staged store → /gnu/store (rbind carries the per-item binds); outputs
             // the build writes under /gnu/store land in newstore on the host.
-            sys::mount(Some(&newstore_c), &store_dir_c, None, sys::MS_BIND | sys::MS_REC, None)?;
+            sys::mount(
+                Some(&newstore_c),
+                &store_dir_c,
+                None,
+                sys::MS_BIND | sys::MS_REC,
+                None,
+            )?;
             // … and at every EXTRA prefix the closure spans (e.g. /td/store toolchain inputs):
             // the SAME newstore (basename-keyed) rbind'd there too, so those canonical paths
             // resolve. Empty for a single-store build, so this is a no-op in the common case.
             for (i, dst) in extra_store_cs.iter().enumerate() {
                 fs::create_dir_all(&extra_store_dirs[i])?;
-                sys::mount(Some(&newstore_c), dst, None, sys::MS_BIND | sys::MS_REC, None)?;
+                sys::mount(
+                    Some(&newstore_c),
+                    dst,
+                    None,
+                    sys::MS_BIND | sys::MS_REC,
+                    None,
+                )?;
             }
             // Keep large source and object trees on private disk-backed scratch,
             // rather than charging them as tmpfs memory.
@@ -1809,12 +1835,20 @@ pub fn build(
                 None,
             )?;
             // /dev rbind'd whole (preserves working device binds; see note above).
-            sys::mount(Some(&dev_src_c), &dev_dir_c, None, sys::MS_BIND | sys::MS_REC, None)?;
+            sys::mount(
+                Some(&dev_src_c),
+                &dev_dir_c,
+                None,
+                sys::MS_BIND | sys::MS_REC,
+                None,
+            )?;
             // A FRESH procfs reflecting the build's OWN pid namespace (we are PID 1),
             // not the invoking namespace's /proc.
             sys::mount(Some(&procfs_c), &proc_dir_c, Some(&procfs_c), 0, None)?;
-            isolate_ipc(&proc_dir)
-                .map_err(|e| { sys::warn(b"td-builder build: FAILED isolating IPC\n"); e })?;
+            isolate_ipc(&proc_dir).map_err(|e| {
+                sys::warn(b"td-builder build: FAILED isolating IPC\n");
+                e
+            })?;
             // Minimal /etc.
             fs::write(&etc_passwd, &passwd_body)?;
             fs::write(&etc_group, &group_body)?;
@@ -1827,7 +1861,9 @@ pub fn build(
             fs::DirBuilder::new().mode(0o700).create(&build_dir_owned)?;
             write_mesboot_steps_file(&mesboot_steps_file, mesboot_steps.as_deref())?;
             std::env::set_current_dir(&build_dir_owned)?;
-            pid1_serve_as_init(b"td-builder sandbox: FAILED waiting as the build's PID namespace init\n")
+            pid1_serve_as_init(
+                b"td-builder sandbox: FAILED waiting as the build's PID namespace init\n",
+            )
         });
     }
 
@@ -1835,9 +1871,7 @@ pub fn build(
     drop(build_tmp_cleanup);
     let status = status.map_err(|e| err(format!("spawning builder {}: {e}", drv.builder)))?;
     if !status.success() {
-        return Err(err(format!(
-            "builder for {drv_path} failed: {status}"
-        )));
+        return Err(err(format!("builder for {drv_path} failed: {status}")));
     }
 
     let mut outputs = Vec::with_capacity(drv.outputs.len());
@@ -2047,8 +2081,10 @@ pub fn host_shell(
     let dev_pts_dir = dev_dir.join("pts");
     let dev_pts_c = CString::new(dev_pts_dir.as_os_str().as_encoded_bytes()).unwrap();
     let devpts_c = CString::new("devpts").unwrap();
-    let devpts_data =
-        CString::new(format!("newinstance,ptmxmode=0666,mode=0620,gid={host_gid}")).unwrap();
+    let devpts_data = CString::new(format!(
+        "newinstance,ptmxmode=0666,mode=0620,gid={host_gid}"
+    ))
+    .unwrap();
     // (symlink path under <newroot>/dev, its target). /dev/ptmx → the private pts
     // instance; the std-stream links point into the private /proc mounted below.
     let dev_symlinks: Vec<(PathBuf, &str)> = vec![
@@ -2317,19 +2353,37 @@ mod tests {
     fn ipc_absence_requires_no_kernel_facilities_and_a_complete_inventory() {
         struct Scratch(PathBuf);
         impl Drop for Scratch {
-            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
         }
-        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir().join(format!("td-ipc-capabilities-{}-{nonce}", std::process::id()));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "td-ipc-capabilities-{}-{nonce}",
+            std::process::id()
+        ));
         fs::create_dir(&root).unwrap();
         let _scratch = Scratch(root.clone());
         fs::create_dir_all(root.join("sys/fs")).unwrap();
         assert!(require_no_ipc_facilities(&root).is_err());
-        for content in ["", "nodev\n", "nodev proc extra\n", "nodev tmpfs\n", "nodev proc\nnodev mqueue\n"] {
+        for content in [
+            "",
+            "nodev\n",
+            "nodev proc extra\n",
+            "nodev tmpfs\n",
+            "nodev proc\nnodev mqueue\n",
+        ] {
             fs::write(root.join("filesystems"), content).unwrap();
             assert!(require_no_ipc_facilities(&root).is_err(), "{content:?}");
         }
-        fs::write(root.join("filesystems"), "nodev\tproc\nnodev\ttmpfs\n\text4\n").unwrap();
+        fs::write(
+            root.join("filesystems"),
+            "nodev\tproc\nnodev\ttmpfs\n\text4\n",
+        )
+        .unwrap();
         require_no_ipc_facilities(&root).unwrap();
         isolate_ipc(&root).unwrap();
         fs::create_dir_all(root.join("self/ns")).unwrap();
@@ -2356,7 +2410,11 @@ mod tests {
         assert_eq!(production.matches("isolate_ipc(").count(), 3);
         assert_eq!(production.matches("sys::CLONE_NEWIPC").count(), 1);
         assert!(production.contains("sys::unshare(sys::CLONE_NEWIPC)?;"));
-        let normalize = |text: &str| text.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+        let normalize = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        };
         let compact = normalize(production);
         assert!(compact.contains(&normalize("sys::mount(Some(&procfs_c), &proc_dir_c, Some(&procfs_c), 0, None)?; isolate_ipc(&proc_dir)")));
         assert!(compact.contains(&normalize("sys::warn(b\"td-builder host-sandbox: FAILED mounting a fresh /proc\\n\"); e })?; isolate_ipc(&proc_target_dir)")));
@@ -2379,29 +2437,44 @@ mod tests {
         // No record at all → refused before any hashing.
         let empty = StageManifest::new();
         let err = verify_staged_item(&empty, canonical, on_disk).unwrap_err();
-        assert!(err.to_string().contains("no td-owned store-db record"), "{err}");
+        assert!(
+            err.to_string().contains("no td-owned store-db record"),
+            "{err}"
+        );
 
         // A record whose hash the on-disk bytes do not match → refused.
         let mut tampered = StageManifest::new();
         tampered.insert(
             canonical.to_string(),
-            StagedInput { nar_hash: "sha256:0000".to_string(), origin: InputOrigin::AuditedSeed },
+            StagedInput {
+                nar_hash: "sha256:0000".to_string(),
+                origin: InputOrigin::AuditedSeed,
+            },
         );
         let err = verify_staged_item(&tampered, canonical, on_disk).unwrap_err();
-        assert!(err.to_string().contains("refusing to stage tampered bytes"), "{err}");
+        assert!(
+            err.to_string().contains("refusing to stage tampered bytes"),
+            "{err}"
+        );
 
         // The vouched bytes pass.
         let mut vouched = StageManifest::new();
         vouched.insert(
             canonical.to_string(),
-            StagedInput { nar_hash: good_hash, origin: InputOrigin::AuditedSeed },
+            StagedInput {
+                nar_hash: good_hash,
+                origin: InputOrigin::AuditedSeed,
+            },
         );
         verify_staged_item(&vouched, canonical, on_disk).unwrap();
 
         // …and stop passing the moment the bytes change under the same record.
         fs::write(&item, b"tampered bytes").unwrap();
         let err = verify_staged_item(&vouched, canonical, on_disk).unwrap_err();
-        assert!(err.to_string().contains("refusing to stage tampered bytes"), "{err}");
+        assert!(
+            err.to_string().contains("refusing to stage tampered bytes"),
+            "{err}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -2457,14 +2530,7 @@ mod tests {
         let mut command = Command::new(&builder);
         command.env_clear();
         let steps_file = Path::new("/tmp/build/.td-steps.json");
-        let steps = configure_builder_env(
-            &mut command,
-            &builder,
-            &args,
-            &env,
-            steps_file,
-        )
-        .unwrap();
+        let steps = configure_builder_env(&mut command, &builder, &args, &env, steps_file).unwrap();
         assert_eq!(steps.as_deref(), Some(large.as_str()));
         assert!(
             command
@@ -2507,30 +2573,22 @@ mod tests {
         let mut missing = Command::new("/td/store/builder/bin/td-builder");
         missing.env_clear();
         assert!(
-            configure_builder_env(
-                &mut missing,
-                &builder,
-                &args,
-                &[],
-                steps_file,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("missing its TD_STEPS file payload")
+            configure_builder_env(&mut missing, &builder, &args, &[], steps_file,)
+                .unwrap_err()
+                .to_string()
+                .contains("missing its TD_STEPS file payload")
         );
         let mut other_builder = Command::new("/td/store/other/bin/builder");
         other_builder.env_clear();
-        assert!(
-            configure_builder_env(
-                &mut other_builder,
-                "/td/store/other/bin/builder",
-                &args,
-                &env,
-                steps_file,
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(configure_builder_env(
+            &mut other_builder,
+            "/td/store/other/bin/builder",
+            &args,
+            &env,
+            steps_file,
+        )
+        .unwrap()
+        .is_none());
         assert!(
             other_builder
                 .get_envs()
@@ -2570,17 +2628,15 @@ mod tests {
         );
         let mut other_command = Command::new(&builder);
         other_command.env_clear();
-        assert!(
-            configure_builder_env(
-                &mut other_command,
-                &builder,
-                &["autotools-build".to_string()],
-                &env,
-                steps_file,
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(configure_builder_env(
+            &mut other_command,
+            &builder,
+            &["autotools-build".to_string()],
+            &env,
+            steps_file,
+        )
+        .unwrap()
+        .is_none());
         assert!(
             other_command
                 .get_envs()
@@ -2597,24 +2653,24 @@ mod tests {
             steps_file,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("has no metadata policy"), "{error}");
+        assert!(
+            error.to_string().contains("has no metadata policy"),
+            "{error}"
+        );
         let mut manifest_free_phase = Command::new(&builder);
         manifest_free_phase.env_clear();
         let manifest_free_env = vec![("TD_STEPS".to_string(), large.clone())];
-        assert!(
-            configure_builder_env(
-                &mut manifest_free_phase,
-                &builder,
-                &["mesboot-build".to_string(), "extra".to_string()],
-                &manifest_free_env,
-                steps_file,
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(configure_builder_env(
+            &mut manifest_free_phase,
+            &builder,
+            &["mesboot-build".to_string(), "extra".to_string()],
+            &manifest_free_env,
+            steps_file,
+        )
+        .unwrap()
+        .is_none());
         assert!(manifest_free_phase.get_envs().any(|(key, value)| {
-            key == std::ffi::OsStr::new("TD_STEPS")
-                && value == Some(std::ffi::OsStr::new(&large))
+            key == std::ffi::OsStr::new("TD_STEPS") && value == Some(std::ffi::OsStr::new(&large))
         }));
         let mut policy_collision = Command::new(&builder);
         policy_collision.env_clear();
@@ -2647,9 +2703,9 @@ mod tests {
             "/td/store/other/bin/td-builder",
             Some(inherited),
         );
-        assert!(untrusted.get_envs().all(|(key, _)| {
-            key != std::ffi::OsStr::new(crate::check_memory::JOB_BUDGET_ENV)
-        }));
+        assert!(untrusted
+            .get_envs()
+            .all(|(key, _)| { key != std::ffi::OsStr::new(crate::check_memory::JOB_BUDGET_ENV) }));
 
         let mut bootstrap_application = Command::new(&builder);
         bootstrap_application.env_clear();
@@ -2661,7 +2717,10 @@ mod tests {
             steps_file,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("non-application phase"), "{error}");
+        assert!(
+            error.to_string().contains("non-application phase"),
+            "{error}"
+        );
         let dir =
             std::env::temp_dir().join(format!("td-mesboot-steps-file-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -2671,7 +2730,10 @@ mod tests {
             crate::build::consume_mesboot_steps_file(&path).unwrap(),
             large
         );
-        assert!(!path.exists(), "the composed handoff consumes its input file");
+        assert!(
+            !path.exists(),
+            "the composed handoff consumes its input file"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -2681,10 +2743,7 @@ mod tests {
             input_drvs: Vec::new(),
             input_srcs: Vec::new(),
             platform: "x86_64-linux".into(),
-            builder: format!(
-                "{}/bin/td-builder",
-                crate::store::builder_identity_path()
-            ),
+            builder: format!("{}/bin/td-builder", crate::store::builder_identity_path()),
             args: vec![runner.to_string()],
             env,
         }
@@ -2806,7 +2865,10 @@ mod tests {
             ],
         );
         finalize_application_output(&drv, &[("out".into(), directory.clone())]).unwrap();
-        assert_eq!(fs::read_to_string(directory.join("manifest")).unwrap(), text);
+        assert_eq!(
+            fs::read_to_string(directory.join("manifest")).unwrap(),
+            text
+        );
         assert_eq!(
             fs::read_to_string(directory.join("spec")).unwrap(),
             spec_text
@@ -2828,7 +2890,10 @@ mod tests {
         let other = directory.join("duplicate");
         fs::create_dir_all(&other).unwrap();
         let error = finalize_application_output(&duplicate, &[("out".into(), other)]).unwrap_err();
-        assert!(error.to_string().contains("duplicate environment key"), "{error}");
+        assert!(
+            error.to_string().contains("duplicate environment key"),
+            "{error}"
+        );
 
         let primary = directory.join("multi-out");
         let secondary = directory.join("multi-dev");
@@ -2859,7 +2924,10 @@ mod tests {
         let missing_out = directory.join("missing-out");
         fs::create_dir_all(&missing_out).unwrap();
         let error = finalize_application_output(&drv, &[("bin".into(), missing_out)]).unwrap_err();
-        assert!(error.to_string().contains("requires an `out' output"), "{error}");
+        assert!(
+            error.to_string().contains("requires an `out' output"),
+            "{error}"
+        );
 
         let duplicate_out_a = directory.join("duplicate-out-a");
         let duplicate_out_b = directory.join("duplicate-out-b");
@@ -2873,7 +2941,10 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert!(error.to_string().contains("duplicate output name"), "{error}");
+        assert!(
+            error.to_string().contains("duplicate output name"),
+            "{error}"
+        );
         assert!(!duplicate_out_a.join("manifest").exists());
         assert!(!duplicate_out_b.join("manifest").exists());
 
@@ -2887,7 +2958,10 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert!(error.to_string().contains("duplicate output path"), "{error}");
+        assert!(
+            error.to_string().contains("duplicate output path"),
+            "{error}"
+        );
         fs::remove_dir_all(&directory).ok();
     }
 
@@ -2942,7 +3016,8 @@ mod tests {
             // where the bytes are. The flag must key on the FORMER.
             "/gnu/store/ghi-bash\t/td/store/ghi-bash".to_string(),
         ];
-        let plan = plan_bind_restrictions(&drv_with_payloads(&["/td/store/def-firefox"]), &closure).unwrap();
+        let plan = plan_bind_restrictions(&drv_with_payloads(&["/td/store/def-firefox"]), &closure)
+            .unwrap();
         assert_eq!(
             plan,
             vec![
@@ -2972,8 +3047,14 @@ mod tests {
         // matching against it would let the restriction pass while applying to
         // a path the build never sees.
         let interned = vec!["/gnu/store/def-firefox\t/td/store/def-firefox".to_string()];
-        assert!(plan_bind_restrictions(&drv_with_payloads(&["/td/store/def-firefox"]), &interned).is_err());
-        assert!(plan_bind_restrictions(&drv_with_payloads(&["/gnu/store/def-firefox"]), &interned).is_ok());
+        assert!(
+            plan_bind_restrictions(&drv_with_payloads(&["/td/store/def-firefox"]), &interned)
+                .is_err()
+        );
+        assert!(
+            plan_bind_restrictions(&drv_with_payloads(&["/gnu/store/def-firefox"]), &interned)
+                .is_ok()
+        );
     }
 
     /// Items stage flat under `newstore/<basename>`, so two entries sharing one
@@ -3152,8 +3233,16 @@ mod tests {
         let meta = fs::symlink_metadata(&tree).unwrap();
         let binds = plan_staged_item(&newstore, canonical, on_disk, &meta).unwrap();
         assert_eq!(binds.len(), 1, "a dir stages as one whole-tree bind");
-        assert_eq!(binds[0].0.as_str(), on_disk, "the whole tree is the bind source");
-        assert_eq!(binds[0].1, newstore.join("wzxy-td-tool-1.0"), "keyed by store basename");
+        assert_eq!(
+            binds[0].0.as_str(),
+            on_disk,
+            "the whole tree is the bind source"
+        );
+        assert_eq!(
+            binds[0].1,
+            newstore.join("wzxy-td-tool-1.0"),
+            "keyed by store basename"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
@@ -3202,10 +3291,7 @@ mod tests {
     #[test]
     fn scratch_cleanup_recovers_read_only_build_directories() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!(
-            "td-readonly-scratch-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("td-readonly-scratch-{}", std::process::id()));
         let nested = root.join("readonly/nested");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("artifact"), b"bytes").unwrap();
@@ -3221,8 +3307,8 @@ mod tests {
         // daemon-request exercised concurrently by another test may sweep its
         // own broad scratch root; that must not make this lock-lifetime test
         // race an unrelated sweeper.
-        let fixture_root = std::env::temp_dir()
-            .join(format!("td-build-scratch-sweep-{}", std::process::id()));
+        let fixture_root =
+            std::env::temp_dir().join(format!("td-build-scratch-sweep-{}", std::process::id()));
         let fixture = fixture_root.join("fixture/a");
         let root = fixture.join("root");
         let _ = fs::remove_dir_all(&fixture_root);
@@ -3281,10 +3367,8 @@ mod tests {
         // A FILE wearing a build tree's name is not a tree, so the sweep does
         // not remove it — but a corrupt layout left in silence is the thing
         // this report exists to prevent, so it is counted and named.
-        let root = std::env::temp_dir().join(format!(
-            "td-build-scratch-foreign-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("td-build-scratch-foreign-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let odd = root.join("odd");
         fs::create_dir_all(&odd).unwrap();
@@ -3298,11 +3382,17 @@ mod tests {
         assert_eq!(report.unreadable, 1, "{report:?}");
         assert!(report.incomplete(), "{report:?}");
         assert_eq!(
-            report.first_unreadable.as_ref().map(|(path, _)| path.clone()),
+            report
+                .first_unreadable
+                .as_ref()
+                .map(|(path, _)| path.clone()),
             Some(odd.join("build-tmp")),
             "the report names the path it could not reclaim: {report:?}"
         );
-        assert!(report.first_failure.is_none(), "nothing was removed: {report:?}");
+        assert!(
+            report.first_failure.is_none(),
+            "nothing was removed: {report:?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -3310,10 +3400,8 @@ mod tests {
     fn overdeep_scratch_cannot_poison_unrelated_recovery() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = std::env::temp_dir().join(format!(
-            "td-build-scratch-depth-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("td-build-scratch-depth-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let poison = root.join("poison");
         let mut deep = poison.join("build-tmp");

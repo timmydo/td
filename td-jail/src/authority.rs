@@ -8,9 +8,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{
-    DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
-};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const CONFIG_PATH: &str = "/etc/td-app.conf";
@@ -100,11 +98,9 @@ const FIREFOX_AUDIT_CMDLINE_TOKEN: &str = "td.firefox-seccomp-audit=1";
 const KERNEL_AUDIT_CMDLINE_TOKEN: &str = "audit=1";
 const FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN: &str = "audit_backlog_limit=8192";
 const FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN: &str = "log_buf_len=8M";
-const FIREFOX_AUTOTEST_POLICY_PATH: &str =
-    "/run/td-firefox-autotest/policies.json";
+const FIREFOX_AUTOTEST_POLICY_PATH: &str = "/run/td-firefox-autotest/policies.json";
 const FIREFOX_AUTOTEST_CA_PATH: &str = "/run/td-firefox-autotest/ca.pem";
-const FIREFOX_SECCOMP_PROBE_SOURCE: &str =
-    "/var/lib/td-test/td-jail-seccomp-probe";
+const FIREFOX_SECCOMP_PROBE_SOURCE: &str = "/var/lib/td-test/td-jail-seccomp-probe";
 const MAX_FIREFOX_AUTOTEST_POLICY_BYTES: u64 = 1024;
 const MAX_FIREFOX_AUTOTEST_CA_BYTES: u64 = 64 * 1024;
 const MAX_FIREFOX_SECCOMP_PROBE_BYTES: u64 = 4 * 1024 * 1024;
@@ -363,8 +359,17 @@ where
 {
     let identity = effective_identity()?;
     let mut config = target_config()?;
-    config.real_home = Some(PathBuf::from(format!("/var/lib/td/applications/{}", identity.0)));
-    resolve_with_config(name, arguments, identity, (APPLICATION_UID, APPLICATION_GID), config)
+    config.real_home = Some(PathBuf::from(format!(
+        "/var/lib/td/applications/{}",
+        identity.0
+    )));
+    resolve_with_config(
+        name,
+        arguments,
+        identity,
+        (APPLICATION_UID, APPLICATION_GID),
+        config,
+    )
 }
 
 pub(crate) fn is_host_argument(argument: &OsStr) -> bool {
@@ -408,15 +413,13 @@ where
     let arguments = collect_arguments(arguments)?;
     let (package, spec) = read_application_spec(name, &config)?;
 
-    let package_files =
-        canonical_child_directory(&package, "files", "application files")?;
+    let package_files = canonical_child_directory(&package, "files", "application files")?;
     let runtime = physical_store_directory(
         &config.package_root,
         Path::new(&spec.runtime),
         "application runtime",
     )?;
-    let runtime_files =
-        canonical_child_directory(&runtime, "files", "application runtime files")?;
+    let runtime_files = canonical_child_directory(&runtime, "files", "application runtime files")?;
 
     let relative_entry = spec
         .entry
@@ -504,20 +507,15 @@ where
             )
         };
         require_owned_directory(&runtime, identity, false)?;
-        let runtime = fs::canonicalize(&runtime).map_err(|error| {
-            invalid(format!("{what} runtime {}: {error}", runtime.display()))
-        })?;
+        let runtime = fs::canonicalize(&runtime)
+            .map_err(|error| invalid(format!("{what} runtime {}: {error}", runtime.display())))?;
         require_owned_directory(&runtime, identity, false)?;
         if !config.host_mode {
             require_exact_mode(&runtime, 0o755, "td-audio runtime")?;
         }
         let socket = resolved_socket(&socket, identity.0, what)?;
         if !config.host_mode {
-            require_exact_mode(
-                &socket,
-                crate::permissions::TD_AUDIO_SOCKET_MODE,
-                what,
-            )?;
+            require_exact_mode(&socket, crate::permissions::TD_AUDIO_SOCKET_MODE, what)?;
         }
         if socket.parent() != Some(runtime.as_path()) {
             return Err(invalid(format!(
@@ -551,20 +549,13 @@ where
             "td-fetch authority"
         };
         let runtime = runtime_root.join(FETCH_RUNTIME_NAME);
-        require_owned_directory(&runtime, outside_identity, true).map_err(|error| {
-            invalid(format!("{what} runtime {}: {error}", runtime.display()))
-        })?;
-        let runtime = fs::canonicalize(&runtime).map_err(|error| {
-            invalid(format!("{what} runtime {}: {error}", runtime.display()))
-        })?;
-        require_owned_directory(&runtime, outside_identity, true).map_err(|error| {
-            invalid(format!("{what} runtime {}: {error}", runtime.display()))
-        })?;
-        let socket = resolved_socket(
-            &runtime.join(FETCH_SOCKET_FILE),
-            outside_identity.0,
-            what,
-        )?;
+        require_owned_directory(&runtime, outside_identity, true)
+            .map_err(|error| invalid(format!("{what} runtime {}: {error}", runtime.display())))?;
+        let runtime = fs::canonicalize(&runtime)
+            .map_err(|error| invalid(format!("{what} runtime {}: {error}", runtime.display())))?;
+        require_owned_directory(&runtime, outside_identity, true)
+            .map_err(|error| invalid(format!("{what} runtime {}: {error}", runtime.display())))?;
+        let socket = resolved_socket(&runtime.join(FETCH_SOCKET_FILE), outside_identity.0, what)?;
         // Mode 0600 is the whole of the service's authentication (§W.8),
         // checked here as Pulse's mode is, and required again by the
         // readback.
@@ -642,9 +633,9 @@ where
     };
     let firefox_autotest_policy = resolve_firefox_autotest_policy_at(
         name,
-        firefox_cmdline.as_deref().is_some_and(|cmdline| {
-            cmdline_has_exact_token(cmdline, AUTOTEST_CMDLINE_TOKEN)
-        }),
+        firefox_cmdline
+            .as_deref()
+            .is_some_and(|cmdline| cmdline_has_exact_token(cmdline, AUTOTEST_CMDLINE_TOKEN)),
         Path::new(FIREFOX_AUTOTEST_POLICY_PATH),
         Path::new(FIREFOX_AUTOTEST_CA_PATH),
     )?;
@@ -653,9 +644,7 @@ where
     } else {
         resolve_firefox_seccomp_probe_at(
             name,
-            firefox_cmdline
-                .as_deref()
-                .is_some_and(firefox_audit_boot),
+            firefox_cmdline.as_deref().is_some_and(firefox_audit_boot),
             Path::new(FIREFOX_SECCOMP_PROBE_SOURCE),
         )?
     };
@@ -708,9 +697,16 @@ fn stock_session(owner: u32, name: &str) -> io::Result<(&'static Path, u32, Path
     application_session(owner, name, &policy)
 }
 
-fn application_session(owner: u32, name: &str, policy: &crate::app_policy::Policy)
-    -> io::Result<(&'static Path, u32, PathBuf)> {
-    if policy.owner() != 1000 || !policy.for_uid(owner).is_some_and(|rule| rule.application == name) {
+fn application_session(
+    owner: u32,
+    name: &str,
+    policy: &crate::app_policy::Policy,
+) -> io::Result<(&'static Path, u32, PathBuf)> {
+    if policy.owner() != 1000
+        || !policy
+            .for_uid(owner)
+            .is_some_and(|rule| rule.application == name)
+    {
         return Err(invalid("kernel UID does not own the installed application"));
     }
     Ok((
@@ -827,11 +823,7 @@ fn host_config(path: &Path, identity: (u32, u32)) -> io::Result<ProductConfig> {
         RESOLV_CONF_PREFIX,
         "host resolver configuration",
     )?);
-    let cgroup_root = prefixed_line(
-        &mut lines,
-        CGROUP_ROOT_PREFIX,
-        "host cgroup root",
-    )?;
+    let cgroup_root = prefixed_line(&mut lines, CGROUP_ROOT_PREFIX, "host cgroup root")?;
     if lines.next().is_some() {
         return Err(invalid("host configuration has trailing rows"));
     }
@@ -920,10 +912,7 @@ fn validate_absolute_config_path(path: &Path, label: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn read_application_spec(
-    name: &str,
-    config: &ProductConfig,
-) -> io::Result<(PathBuf, ParsedSpec)> {
+fn read_application_spec(name: &str, config: &ProductConfig) -> io::Result<(PathBuf, ParsedSpec)> {
     validate_application_name(name)?;
     let registry_text = read_bounded_path(&config.registry, MAX_APPLICATION_TABLE_BYTES)?;
     let logical_package = registry_entry(&registry_text, name)?
@@ -1063,9 +1052,9 @@ pub(crate) fn validate_environment_list(
         return Err(invalid("application environment lacks FLATPAK_ID"));
     }
     if terminal {
-        let term = environment.iter().find_map(|(key, value)| {
-            (key == "TERM").then(|| value.to_string_lossy().into_owned())
-        });
+        let term = environment
+            .iter()
+            .find_map(|(key, value)| (key == "TERM").then(|| value.to_string_lossy().into_owned()));
         if !term.as_deref().is_some_and(valid_terminal_name) {
             return Err(invalid(format!(
                 "application environment TERM is {term:?}, expected the terminal grant's name"
@@ -1216,9 +1205,7 @@ fn parse_spec(text: &str) -> io::Result<ParsedSpec> {
     ResolvedResourceLimits::from_policy(permissions.resources())?;
     let runtime_aliases = dynamic_runtime(&runtime)?;
     let loader_library_path = reviewed_loader_library_path(&name, &runtime)?.map(str::to_string);
-    if environment.get("LD_LIBRARY_PATH").map(String::as_str)
-        != loader_library_path.as_deref()
-    {
+    if environment.get("LD_LIBRARY_PATH").map(String::as_str) != loader_library_path.as_deref() {
         return Err(invalid(
             "application spec does not carry its exact reviewed loader path",
         ));
@@ -1246,12 +1233,12 @@ fn runtime_output_name(runtime: &str) -> io::Result<&str> {
         .as_bytes()
         .get(..32)
         .ok_or_else(|| invalid("application runtime has no 32-character store digest"))?;
-    if !digest
-        .iter()
-        .all(|byte| STORE_HASH_ALPHABET.contains(byte))
+    if !digest.iter().all(|byte| STORE_HASH_ALPHABET.contains(byte))
         || basename.as_bytes().get(32) != Some(&b'-')
     {
-        return Err(invalid("application runtime has a malformed store basename"));
+        return Err(invalid(
+            "application runtime has a malformed store basename",
+        ));
     }
     basename
         .get(33..)
@@ -1312,21 +1299,17 @@ fn resolve_filesystem_grants(
     bus_socket: &Path,
     fetch_runtime: &Path,
 ) -> io::Result<Vec<FilesystemGrant>> {
-    resolve_filesystem_grants_with_boundary(
-        permissions,
-        state,
-        |mountinfo| {
-            GrantBoundary::new(
-                mountinfo,
-                state,
-                package_files,
-                runtime_files,
-                wayland_socket,
-                bus_socket,
-                fetch_runtime,
-            )
-        },
-    )
+    resolve_filesystem_grants_with_boundary(permissions, state, |mountinfo| {
+        GrantBoundary::new(
+            mountinfo,
+            state,
+            package_files,
+            runtime_files,
+            wayland_socket,
+            bus_socket,
+            fetch_runtime,
+        )
+    })
 }
 
 fn resolve_filesystem_grants_with_boundary<F>(
@@ -1425,9 +1408,7 @@ where
     }
 
     for candidate in &admitted {
-        if candidate.source_kind.is_none()
-            && !(candidate.create || candidate.implicit_xdg_create)
-        {
+        if candidate.source_kind.is_none() && !(candidate.create || candidate.implicit_xdg_create) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
@@ -1452,11 +1433,7 @@ where
     for mut denied in denied {
         denied.source = canonical_candidate(&denied.requested_source)?;
         denied.mount_identities = mount_tree_identities(&post_mountinfo, &denied.source)?;
-        let metadata = preflight_filesystem_source(
-            &denied.source,
-            FilesystemAccess::Deny,
-            false,
-        )?;
+        let metadata = preflight_filesystem_source(&denied.source, FilesystemAccess::Deny, false)?;
         denied.source_kind = metadata.map(|metadata| metadata.source_kind);
         denied.file_identity = metadata.and_then(|metadata| metadata.file_identity());
         post_denied.push(denied);
@@ -1569,13 +1546,8 @@ fn preflight_filesystem_source(
             {
                 return Ok(None);
             }
-            require_filesystem_source_metadata(
-                source,
-                &metadata,
-                require_directory,
-                false,
-            )
-            .map(Some)
+            require_filesystem_source_metadata(source, &metadata, require_directory, false)
+                .map(Some)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(io::Error::new(
@@ -1630,8 +1602,7 @@ fn filesystem_permissions_overlap(
     paths_overlap(&left.source, &right.source)
         || mount_identity_sets_overlap(&left.mount_identities, &right.mount_identities)
         || paths_overlap(&left.target, &right.target)
-        || left.file_identity.is_some()
-            && left.file_identity == right.file_identity
+        || left.file_identity.is_some() && left.file_identity == right.file_identity
 }
 
 fn filesystem_location(location: &str, real_home: &Path) -> io::Result<(PathBuf, PathBuf, bool)> {
@@ -1753,9 +1724,14 @@ struct GrantBoundary {
 }
 
 fn private_application_home(home: &Path) -> bool {
-    let Some(uid) = home.strip_prefix("/var/lib/td/applications").ok()
+    let Some(uid) = home
+        .strip_prefix("/var/lib/td/applications")
+        .ok()
         .and_then(|suffix| suffix.to_str())
-        .and_then(|text| text.parse::<u32>().ok()) else { return false; };
+        .and_then(|text| text.parse::<u32>().ok())
+    else {
+        return false;
+    };
     (65536..=2147483647).contains(&uid)
         && home.as_os_str() == std::ffi::OsStr::new(&format!("/var/lib/td/applications/{uid}"))
 }
@@ -1766,7 +1742,9 @@ fn human_projection(mountinfo: &str, home: &Path) -> io::Result<Option<(PathBuf,
     if !private_application_home(home) {
         return Ok(None);
     }
-    let uid = home.file_name().and_then(|name| name.to_str())
+    let uid = home
+        .file_name()
+        .and_then(|name| name.to_str())
         .and_then(|name| name.parse::<u32>().ok())
         .ok_or_else(|| invalid("invalid private application home"))?;
     let policy = crate::app_policy::load().map_err(invalid)?;
@@ -1778,14 +1756,27 @@ fn human_projection(mountinfo: &str, home: &Path) -> io::Result<Option<(PathBuf,
     let view = home.join(component);
     let mut found = false;
     for line in mountinfo.lines() {
-        let left = line.split_once(" - ").ok_or_else(|| invalid("invalid mount table"))?.0;
+        let left = line
+            .split_once(" - ")
+            .ok_or_else(|| invalid("invalid mount table"))?
+            .0;
         let fields = left.split_whitespace().collect::<Vec<_>>();
-        let path = decode_mountinfo_path(fields.get(4).ok_or_else(|| invalid("missing mountpoint"))?)?;
-        if path != view { continue; }
-        let options = fields.get(5).ok_or_else(|| invalid("missing mount options"))?;
-        if found || !["rw", "nosuid", "nodev", "noexec"].iter()
-            .all(|required| options.split(',').any(|option| option == *required)) {
-            return Err(invalid("declared human projection is stacked or lacks mount restrictions"));
+        let path =
+            decode_mountinfo_path(fields.get(4).ok_or_else(|| invalid("missing mountpoint"))?)?;
+        if path != view {
+            continue;
+        }
+        let options = fields
+            .get(5)
+            .ok_or_else(|| invalid("missing mount options"))?;
+        if found
+            || !["rw", "nosuid", "nodev", "noexec"]
+                .iter()
+                .all(|required| options.split(',').any(|option| option == *required))
+        {
+            return Err(invalid(
+                "declared human projection is stacked or lacks mount restrictions",
+            ));
         }
         found = true;
     }
@@ -1807,7 +1798,9 @@ fn projection_identity(
     let identity = mount_identity_for_path(mountinfo, view)?;
     let human = mount_identity_for_path(mountinfo, &account.persistent_home().join(component))?;
     if identity != human {
-        return Err(invalid("application projection does not name its declared human directory"));
+        return Err(invalid(
+            "application projection does not name its declared human directory",
+        ));
     }
     Ok(identity)
 }
@@ -1819,14 +1812,16 @@ fn require_projection_mounts(
 ) -> io::Result<()> {
     for identity in source {
         if identity.device != projection.device
-            || !path_is_same_or_child(&identity.root, &projection.root) {
+            || !path_is_same_or_child(&identity.root, &projection.root)
+        {
             return Err(invalid("human projection contains an undeclared mount"));
         }
         for protected in reserved {
             if mount_identities_overlap(identity, protected)
                 && !(protected.device == projection.device
                     && protected.root != projection.root
-                    && path_is_same_or_child(&projection.root, &protected.root)) {
+                    && path_is_same_or_child(&projection.root, &protected.root))
+            {
                 return Err(invalid("human projection aliases a reserved mount"));
             }
         }
@@ -2042,8 +2037,11 @@ fn mount_identity_sets_overlap(
     left: &BTreeSet<MountIdentity>,
     right: &BTreeSet<MountIdentity>,
 ) -> bool {
-    left.iter()
-        .any(|left| right.iter().any(|right| mount_identities_overlap(left, right)))
+    left.iter().any(|left| {
+        right
+            .iter()
+            .any(|right| mount_identities_overlap(left, right))
+    })
 }
 
 pub(crate) fn require_grant_mount_identities(
@@ -2720,15 +2718,12 @@ fn resolve_timezone_at(
         return Ok(None);
     };
     let zoneinfo = runtime_files.join(ZONEINFO_SUBDIR);
-    let root = canonical_directory(&zoneinfo, "application runtime zoneinfo")
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "system timezone {name} needs a runtime zoneinfo: {error}"
-                ),
-            )
-        })?;
+    let root = canonical_directory(&zoneinfo, "application runtime zoneinfo").map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("system timezone {name} needs a runtime zoneinfo: {error}"),
+        )
+    })?;
     if !root.starts_with(runtime_files) {
         return Err(invalid(
             "application runtime zoneinfo resolves outside the runtime",
@@ -2957,9 +2952,9 @@ fn resolve_product_ca_bundle(path: &Path) -> io::Result<ResolvedFile> {
         ));
     }
     let canonical = fs::canonicalize(path)?;
-    let relative = canonical.strip_prefix(PACKAGE_ROOT).map_err(|_| {
-        invalid("application CA bundle does not resolve into the product store")
-    })?;
+    let relative = canonical
+        .strip_prefix(PACKAGE_ROOT)
+        .map_err(|_| invalid("application CA bundle does not resolve into the product store"))?;
     let object = relative
         .components()
         .next()
@@ -3067,9 +3062,8 @@ fn resolved_socket(path: &Path, uid: u32, what: &str) -> io::Result<PathBuf> {
     // with no path and no noun, ambiguous between two sockets since there are
     // two. `require_regular` and `require_directory` in this file already say
     // which thing they were looking at; this is that habit applied here.
-    let path = fs::canonicalize(path).map_err(|error| {
-        invalid(format!("{what} {}: {error}", path.display()))
-    })?;
+    let path = fs::canonicalize(path)
+        .map_err(|error| invalid(format!("{what} {}: {error}", path.display())))?;
     require_session_socket(&path, uid, what)?;
     Ok(path)
 }
@@ -3078,8 +3072,8 @@ fn host_session_sockets(
     identity: (u32, u32),
     runtime_root: Option<&Path>,
 ) -> io::Result<(PathBuf, PathBuf, PathBuf)> {
-    let runtime_root = runtime_root
-        .ok_or_else(|| invalid("host mode has no validated runtime directory"))?;
+    let runtime_root =
+        runtime_root.ok_or_else(|| invalid("host mode has no validated runtime directory"))?;
     let display = env::var_os("WAYLAND_DISPLAY")
         .ok_or_else(|| invalid("host mode requires WAYLAND_DISPLAY"))?;
     let display_path = Path::new(&display);
@@ -3108,12 +3102,8 @@ fn host_session_sockets(
 
     let bus = runtime_root.join("bus");
     require_session_socket(&bus, identity.0, "host td-busd authority")?;
-    let bus = fs::canonicalize(&bus).map_err(|error| {
-        invalid(format!(
-            "host td-busd authority {}: {error}",
-            bus.display()
-        ))
-    })?;
+    let bus = fs::canonicalize(&bus)
+        .map_err(|error| invalid(format!("host td-busd authority {}: {error}", bus.display())))?;
     require_session_socket(&bus, identity.0, "host td-busd authority")?;
     if wayland == bus {
         return Err(invalid(
@@ -3274,7 +3264,10 @@ fn ensure_application_machine_id(application: &Path, identity: (u32, u32)) -> io
         let _ = fs::remove_file(&staged);
         return Err(io::Error::new(
             error.kind(),
-            format!("initialize application machine id {}: {error}", path.display()),
+            format!(
+                "initialize application machine id {}: {error}",
+                path.display()
+            ),
         ));
     }
     read_application_machine_id(&path, identity)
@@ -3327,11 +3320,7 @@ fn remove_staged_machine_id(
     directory.sync_all()
 }
 
-fn interrupted_machine_id(
-    metadata: &fs::Metadata,
-    identity: (u32, u32),
-    modes: &[u32],
-) -> bool {
+fn interrupted_machine_id(metadata: &fs::Metadata, identity: (u32, u32), modes: &[u32]) -> bool {
     metadata.file_type().is_file()
         && metadata.uid() == identity.0
         && metadata.gid() == identity.1
@@ -3346,12 +3335,14 @@ fn mint_machine_id() -> io::Result<String> {
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     let mut machine_id = String::with_capacity(33);
     for byte in bytes {
-        machine_id.push(char::from_digit(u32::from(byte >> 4), 16).ok_or_else(|| {
-            io::Error::other("machine-id high nibble is outside hexadecimal")
-        })?);
-        machine_id.push(char::from_digit(u32::from(byte & 0x0f), 16).ok_or_else(|| {
-            io::Error::other("machine-id low nibble is outside hexadecimal")
-        })?);
+        machine_id
+            .push(char::from_digit(u32::from(byte >> 4), 16).ok_or_else(|| {
+                io::Error::other("machine-id high nibble is outside hexadecimal")
+            })?);
+        machine_id.push(
+            char::from_digit(u32::from(byte & 0x0f), 16)
+                .ok_or_else(|| io::Error::other("machine-id low nibble is outside hexadecimal"))?,
+        );
     }
     machine_id.push('\n');
     Ok(machine_id)
@@ -3466,10 +3457,7 @@ fn ensure_state_component(
     fs::canonicalize(path)
 }
 
-fn require_owned_directory_identity(
-    path: &Path,
-    identity: (u32, u32),
-) -> io::Result<fs::Metadata> {
+fn require_owned_directory_identity(path: &Path, identity: (u32, u32)) -> io::Result<fs::Metadata> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_dir()
         || metadata.uid() != identity.0
@@ -3505,10 +3493,7 @@ fn read_bounded(path: &str, limit: usize) -> io::Result<String> {
 
 fn read_bounded_path(path: &Path, limit: usize) -> io::Result<String> {
     let file = OpenOptions::new().read(true).open(path).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("open {}: {error}", path.display()),
-        )
+        io::Error::new(error.kind(), format!("open {}: {error}", path.display()))
     })?;
     require_open_regular(&file, path)?;
     let mut bytes = Vec::new();
@@ -3606,10 +3591,18 @@ mod tests {
         let mounts = "1 0 0:1 / / rw - erofs none rw\n2 1 0:9 /@var /var rw,nosuid,nodev - btrfs none rw\n3 2 0:9 /@var/home/alice/Downloads /var/lib/td/applications/65536/Downloads rw,nosuid,nodev,noexec - btrfs none rw\n";
         let view = Path::new("/var/lib/td/applications/65536/Downloads");
         for name in ["alice", "tester"] {
-            let account = crate::primary_account::parse(&format!("{name}:x:1000:1000:human:/home/{name}:/bin/sh\n")).unwrap();
-            let source = mount_identity_for_path(mounts, &account.persistent_home().join("Downloads")).unwrap();
+            let account = crate::primary_account::parse(&format!(
+                "{name}:x:1000:1000:human:/home/{name}:/bin/sh\n"
+            ))
+            .unwrap();
+            let source =
+                mount_identity_for_path(mounts, &account.persistent_home().join("Downloads"))
+                    .unwrap();
             assert_eq!(source.device, "0:9");
-            assert_eq!(source.root, Path::new(&format!("/@var/home/{name}/Downloads")));
+            assert_eq!(
+                source.root,
+                Path::new(&format!("/@var/home/{name}/Downloads"))
+            );
             let admitted = projection_identity(mounts, view, &account, "Downloads");
             if name == "alice" {
                 assert_eq!(admitted.unwrap(), source);
@@ -3622,21 +3615,53 @@ mod tests {
     #[test]
     fn human_projection_cannot_smuggle_sibling_or_reserved_mounts() {
         let identity = |device: &str, path: &str| MountIdentity {
-            device: device.into(), root: path.into(),
+            device: device.into(),
+            root: path.into(),
         };
         let projection = identity("0:9", "/@var/home/tester/Downloads");
         let backing = BTreeSet::from([identity("0:9", "/")]);
-        assert!(require_projection_mounts(&BTreeSet::from([projection.clone()]), &projection, &backing).is_ok());
+        assert!(require_projection_mounts(
+            &BTreeSet::from([projection.clone()]),
+            &projection,
+            &backing
+        )
+        .is_ok());
         let child = identity("0:9", "/@var/home/tester/Downloads/nested");
-        assert!(require_projection_mounts(&BTreeSet::from([child.clone()]), &projection, &backing).is_ok());
-        for wrong in [identity("0:9", "/@var/lib/td/secrets"), identity("0:9", "/@var/home/tester/src"), identity("0:8", "/@var/home/tester/Downloads"), identity("0:9", "/@var/home/tester")] {
-            assert!(require_projection_mounts(&BTreeSet::from([projection.clone(), wrong]), &projection, &backing).is_err());
+        assert!(
+            require_projection_mounts(&BTreeSet::from([child.clone()]), &projection, &backing)
+                .is_ok()
+        );
+        for wrong in [
+            identity("0:9", "/@var/lib/td/secrets"),
+            identity("0:9", "/@var/home/tester/src"),
+            identity("0:8", "/@var/home/tester/Downloads"),
+            identity("0:9", "/@var/home/tester"),
+        ] {
+            assert!(require_projection_mounts(
+                &BTreeSet::from([projection.clone(), wrong]),
+                &projection,
+                &backing
+            )
+            .is_err());
         }
         for protected in [projection.clone(), child] {
-            assert!(require_projection_mounts(&BTreeSet::from([projection.clone()]), &projection, &BTreeSet::from([protected])).is_err());
+            assert!(require_projection_mounts(
+                &BTreeSet::from([projection.clone()]),
+                &projection,
+                &BTreeSet::from([protected])
+            )
+            .is_err());
         }
-        assert!(private_application_home(Path::new("/var/lib/td/applications/65536")));
-        for path in ["/var/lib/td/applications/065536", "/var/lib/td/applications/1000", "/var/lib/td/applications/65536/child", "/var/lib/td/applications/65536/", "/tmp/65536"] {
+        assert!(private_application_home(Path::new(
+            "/var/lib/td/applications/65536"
+        )));
+        for path in [
+            "/var/lib/td/applications/065536",
+            "/var/lib/td/applications/1000",
+            "/var/lib/td/applications/65536/child",
+            "/var/lib/td/applications/65536/",
+            "/tmp/65536",
+        ] {
             assert!(!private_application_home(Path::new(path)));
         }
     }
@@ -3644,8 +3669,9 @@ mod tests {
     #[test]
     fn stock_display_belongs_to_compositor_and_runtime_to_the_assigned_app() {
         let policy = crate::app_policy::Policy::parse(
-            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n"
-        ).unwrap();
+            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n",
+        )
+        .unwrap();
         let (display, uid, runtime) = application_session(65536, "firefox", &policy).unwrap();
         assert_eq!(display, Path::new("/run/td-compositor/1000/wayland-0"));
         assert_eq!(uid, 993);
@@ -3679,10 +3705,8 @@ mod tests {
         fn new(label: &str) -> io::Result<Self> {
             loop {
                 let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-                let path = std::env::temp_dir().join(format!(
-                    "td-jail-{label}-{}-{sequence}",
-                    std::process::id()
-                ));
+                let path = std::env::temp_dir()
+                    .join(format!("td-jail-{label}-{}-{sequence}", std::process::id()));
                 match fs::create_dir(&path) {
                     Ok(()) => return Ok(Self(path)),
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -3786,30 +3810,21 @@ mod tests {
             AUTOTEST_CMDLINE_TOKEN,
         ));
         let missing = Path::new("/definitely/missing/td-firefox-autotest");
-        assert!(resolve_firefox_autotest_policy_at(
-            "not-firefox",
-            true,
-            missing,
-            missing,
-        )
-        .unwrap()
-        .is_none());
-        assert!(resolve_firefox_autotest_policy_at(
-            FIREFOX_NAME,
-            false,
-            missing,
-            missing,
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            resolve_firefox_autotest_policy_at("not-firefox", true, missing, missing,)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resolve_firefox_autotest_policy_at(FIREFOX_NAME, false, missing, missing,)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn firefox_seccomp_probe_is_selected_only_by_the_complete_audit_plan() {
-        assert_eq!(
-            FIREFOX_AUDIT_CMDLINE_TOKEN,
-            "td.firefox-seccomp-audit=1"
-        );
+        assert_eq!(FIREFOX_AUDIT_CMDLINE_TOKEN, "td.firefox-seccomp-audit=1");
         let complete = "console=ttyS0 td.autotest=1 td.firefox-input=1 \
                         td.firefox-seccomp-audit=1 audit=1 \
                         audit_backlog_limit=8192 log_buf_len=8M";
@@ -3840,12 +3855,16 @@ mod tests {
             assert!(!firefox_audit_boot(incomplete), "accepted {incomplete:?}");
         }
         let missing = Path::new("/definitely/missing/td-jail-seccomp-probe");
-        assert!(resolve_firefox_seccomp_probe_at("not-firefox", true, missing)
-            .unwrap()
-            .is_none());
-        assert!(resolve_firefox_seccomp_probe_at(FIREFOX_NAME, false, missing)
-            .unwrap()
-            .is_none());
+        assert!(
+            resolve_firefox_seccomp_probe_at("not-firefox", true, missing)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resolve_firefox_seccomp_probe_at(FIREFOX_NAME, false, missing)
+                .unwrap()
+                .is_none()
+        );
         assert!(resolve_firefox_seccomp_probe_at(FIREFOX_NAME, true, missing).is_err());
         assert!(is_root_executable(0, 0, 0o100555));
         assert!(!is_root_executable(1000, 0, 0o100555));
@@ -3863,9 +3882,7 @@ mod tests {
         };
         assert!(pair_firefox_autotest_files(Some(file.clone()), None).is_err());
         assert!(pair_firefox_autotest_files(None, Some(file)).is_err());
-        assert!(pair_firefox_autotest_files(None, None)
-            .unwrap()
-            .is_none());
+        assert!(pair_firefox_autotest_files(None, None).unwrap().is_none());
         assert!(is_root_read_only(0, 0, 0o100444));
         assert!(!is_root_read_only(1000, 0, 0o100444));
         assert!(!is_root_read_only(0, 1000, 0o100444));
@@ -3916,8 +3933,9 @@ mod tests {
             "fixture alias",
         )
         .is_err());
-        assert!(physical_store_directory(&root, Path::new("/elsewhere/object"), "fixture")
-            .is_err());
+        assert!(
+            physical_store_directory(&root, Path::new("/elsewhere/object"), "fixture").is_err()
+        );
     }
 
     /// The zone-name grammar, which is a PATH COMPONENT set before it is a
@@ -3963,9 +3981,9 @@ mod tests {
             assert!(!valid_timezone_name(name), "{name:?} is not a zone name");
         }
         assert!(valid_timezone_name(&"A".repeat(MAX_TIMEZONE_NAME_BYTES)));
-        assert!(!valid_timezone_name(&"A".repeat(
-            MAX_TIMEZONE_NAME_BYTES.saturating_add(1)
-        )));
+        assert!(!valid_timezone_name(
+            &"A".repeat(MAX_TIMEZONE_NAME_BYTES.saturating_add(1))
+        ));
     }
 
     /// A machine nobody has configured and a machine configured WRONGLY must
@@ -4267,10 +4285,7 @@ mod tests {
         // A static empty runtime has no loader to alias.
         assert!(!spec.runtime_aliases);
 
-        let shared_network = text.replace(
-            "sockets=wayland\n",
-            "shared=network\nsockets=wayland\n",
-        );
+        let shared_network = text.replace("sockets=wayland\n", "shared=network\nsockets=wayland\n");
         let spec = parse_spec(&shared_network).unwrap();
         assert!(spec.permissions.network());
 
@@ -4319,17 +4334,11 @@ mod tests {
                 cpu_period_usec: 100_000,
             }
         );
-        assert!(ResolvedResourceLimits::from_stage2(
-            4096, u64::MAX, 1, 50_000, 100_000
-        )
-        .is_err());
-        assert!(ResolvedResourceLimits::from_stage2(
-            4096, 8192, u32::MAX, 50_000, 100_000
-        )
-        .is_err());
+        assert!(ResolvedResourceLimits::from_stage2(4096, u64::MAX, 1, 50_000, 100_000).is_err());
         assert!(
-            ResolvedResourceLimits::from_stage2(4096, 8192, 1, 999, 100_000).is_err()
+            ResolvedResourceLimits::from_stage2(4096, 8192, u32::MAX, 50_000, 100_000).is_err()
         );
+        assert!(ResolvedResourceLimits::from_stage2(4096, 8192, 1, 999, 100_000).is_err());
 
         let partial = text.replace(
             "sockets=wayland\n",
@@ -4389,10 +4398,7 @@ mod tests {
             text.replace("LD_LIBRARY_PATH=/app/lib:/app/lib/firefox\n", ""),
             text.replace(FIREFOX_LIBRARY_PATH, "/app/lib"),
             text.replace("name=firefox\n", "name=other\n"),
-            text.replace(
-                "freedesktop-platform-25-08-25.08",
-                "empty-runtime-1",
-            ),
+            text.replace("freedesktop-platform-25-08-25.08", "empty-runtime-1"),
             text.replace(
                 "0123456789abcdfghijklmnpqrsvwxyz-",
                 "0123456789abcdfghijklmnpqrsvwxyz_",
@@ -4437,7 +4443,10 @@ mod tests {
         assert_eq!(spec.loader_library_path, None);
         assert!(spec.runtime_aliases, "a dynamic runtime aliases its loader");
         for altered in [
-            text.replace("DISABLE_UPDATES=1\n", "DISABLE_UPDATES=1\nLD_LIBRARY_PATH=\n"),
+            text.replace(
+                "DISABLE_UPDATES=1\n",
+                "DISABLE_UPDATES=1\nLD_LIBRARY_PATH=\n",
+            ),
             text.replace(
                 "DISABLE_UPDATES=1\n",
                 "DISABLE_UPDATES=1\nLD_LIBRARY_PATH=/app/lib\n",
@@ -4533,9 +4542,7 @@ mod tests {
             .unwrap()
             .with_filesystem("~/Downloads/private", FilesystemAccess::Deny, false)
             .unwrap();
-        assert!(
-            resolve(&denied).unwrap().is_empty()
-        );
+        assert!(resolve(&denied).unwrap().is_empty());
 
         let denied_create = real_home.join("DeniedCreate");
         let denied = PermissionPolicy::new()
@@ -4545,9 +4552,7 @@ mod tests {
             .unwrap()
             .with_filesystem("~/DeniedCreate/private", FilesystemAccess::Deny, false)
             .unwrap();
-        assert!(
-            resolve(&denied).unwrap().is_empty()
-        );
+        assert!(resolve(&denied).unwrap().is_empty());
         assert!(!denied_create.exists());
 
         let reserved_create = state_root.join("new");
@@ -4569,9 +4574,7 @@ mod tests {
             .unwrap()
             .with_filesystem("~/Projects/code", FilesystemAccess::ReadOnly, true)
             .unwrap();
-        assert!(
-            resolve(&overlapping).is_err()
-        );
+        assert!(resolve(&overlapping).is_err());
 
         symlink(&state_root, real_home.join("state-alias")).unwrap();
         let reserved = PermissionPolicy::new()
@@ -4598,23 +4601,17 @@ mod tests {
             .unwrap()
             .with_filesystem("~/.config", FilesystemAccess::ReadOnly, true)
             .unwrap();
-        assert!(
-            resolve(&private_state)
-                .unwrap_err()
-                .to_string()
-                .contains("overlaps reserved jail tree")
-        );
+        assert!(resolve(&private_state)
+            .unwrap_err()
+            .to_string()
+            .contains("overlaps reserved jail tree"));
         assert!(!real_home.join(".config").exists());
 
         let preflight_create = real_home.join("A-PreflightCreate");
         let invalid_after_create = PermissionPolicy::new()
             .with_socket(PermissionSocket::Wayland)
             .unwrap()
-            .with_filesystem(
-                "~/A-PreflightCreate",
-                FilesystemAccess::ReadWrite,
-                true,
-            )
+            .with_filesystem("~/A-PreflightCreate", FilesystemAccess::ReadWrite, true)
             .unwrap()
             .with_filesystem("~/Z-MissingRequired", FilesystemAccess::ReadOnly, false)
             .unwrap();
@@ -4712,11 +4709,7 @@ mod tests {
         let hardlink_reserved = PermissionPolicy::new()
             .with_socket(PermissionSocket::Wayland)
             .unwrap()
-            .with_filesystem(
-                "~/reserved-file-alias",
-                FilesystemAccess::ReadOnly,
-                false,
-            )
+            .with_filesystem("~/reserved-file-alias", FilesystemAccess::ReadOnly, false)
             .unwrap();
         assert!(resolve(&hardlink_reserved)
             .unwrap_err()
@@ -4733,24 +4726,26 @@ mod tests {
 
     #[test]
     fn grant_overlap_includes_underlying_mount_identity() {
-        let candidate = |source: &str, target: &str, root: &str| {
-            CandidateFilesystemPermission {
-                location: source.into(),
-                requested_source: PathBuf::from(source),
-                source: PathBuf::from(source),
-                target: PathBuf::from(target),
-                access: FilesystemAccess::ReadOnly,
-                create: false,
-                implicit_xdg_create: false,
-                mount_identities: BTreeSet::from([MountIdentity {
-                    device: "8:1".into(),
-                    root: PathBuf::from(root),
-                }]),
-                source_kind: Some(FilesystemSourceKind::Directory),
-                file_identity: None,
-            }
+        let candidate = |source: &str, target: &str, root: &str| CandidateFilesystemPermission {
+            location: source.into(),
+            requested_source: PathBuf::from(source),
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            access: FilesystemAccess::ReadOnly,
+            create: false,
+            implicit_xdg_create: false,
+            mount_identities: BTreeSet::from([MountIdentity {
+                device: "8:1".into(),
+                root: PathBuf::from(root),
+            }]),
+            source_kind: Some(FilesystemSourceKind::Directory),
+            file_identity: None,
         };
-        let direct = candidate("/home/test/Pictures", "/home/td/Pictures", "/home/test/Pictures");
+        let direct = candidate(
+            "/home/test/Pictures",
+            "/home/td/Pictures",
+            "/home/test/Pictures",
+        );
         let alias = candidate("/mnt/pics", "/mnt/pics", "/home/test/Pictures");
         let sibling = candidate("/mnt/music", "/mnt/music", "/home/test/Music");
         assert!(filesystem_permissions_overlap(&direct, &alias));
@@ -4781,7 +4776,10 @@ mod tests {
         let base = || {
             vec![
                 (OsString::from("HOME"), OsString::from("/home/td")),
-                (OsString::from("XDG_RUNTIME_DIR"), OsString::from("/run/user/1000")),
+                (
+                    OsString::from("XDG_RUNTIME_DIR"),
+                    OsString::from("/run/user/1000"),
+                ),
             ]
         };
         let name = terminal_name(Some(OsString::from("td-term"))).unwrap();
@@ -4806,22 +4804,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            late.iter().map(|(key, _)| key.as_os_str()).collect::<Vec<_>>(),
+            late.iter()
+                .map(|(key, _)| key.as_os_str())
+                .collect::<Vec<_>>(),
             ["A", "TERM", "TERMINFO"]
         );
-        let early = with_terminal_environment(
-            vec![(OsString::from("ZZ"), OsString::from("1"))],
-            "vt100",
-        )
-        .unwrap();
+        let early =
+            with_terminal_environment(vec![(OsString::from("ZZ"), OsString::from("1"))], "vt100")
+                .unwrap();
         assert_eq!(
-            early.iter().map(|(key, _)| key.as_os_str()).collect::<Vec<_>>(),
+            early
+                .iter()
+                .map(|(key, _)| key.as_os_str())
+                .collect::<Vec<_>>(),
             ["TERM", "TERMINFO", "ZZ"]
         );
         for (term, reason) in [
             (None, "requires TERM"),
             (Some(OsString::from("")), "terminal-name grammar"),
-            (Some(OsString::from("a".repeat(65))), "terminal-name grammar"),
+            (
+                Some(OsString::from("a".repeat(65))),
+                "terminal-name grammar",
+            ),
             (Some(OsString::from("td term")), "terminal-name grammar"),
             (Some(OsString::from("xterm;id")), "terminal-name grammar"),
             (Some(OsString::from("../vt100")), "terminal-name grammar"),
@@ -4840,7 +4844,9 @@ mod tests {
             preset.push((OsString::from(preset_key), OsString::from("dumb")));
             let error = with_terminal_environment(preset, "td-term").unwrap_err();
             assert!(
-                error.to_string().contains(&format!("spec sets {preset_key}")),
+                error
+                    .to_string()
+                    .contains(&format!("spec sets {preset_key}")),
                 "{error}"
             );
         }
@@ -4856,7 +4862,10 @@ mod tests {
                     OsString::from("DBUS_SESSION_BUS_ADDRESS"),
                     OsString::from("unix:path=/run/user/1000/bus"),
                 ),
-                (OsString::from("FLATPAK_ID"), OsString::from("org.td.Fixture")),
+                (
+                    OsString::from("FLATPAK_ID"),
+                    OsString::from("org.td.Fixture"),
+                ),
                 (OsString::from("HOME"), OsString::from("/home/td")),
             ];
             if let Some(term) = term {
@@ -4865,8 +4874,14 @@ mod tests {
             if let Some(terminfo) = terminfo {
                 environment.push((OsString::from("TERMINFO"), OsString::from(terminfo)));
             }
-            environment.push((OsString::from("WAYLAND_DISPLAY"), OsString::from("wayland-0")));
-            environment.push((OsString::from("XDG_RUNTIME_DIR"), OsString::from("/run/user/1000")));
+            environment.push((
+                OsString::from("WAYLAND_DISPLAY"),
+                OsString::from("wayland-0"),
+            ));
+            environment.push((
+                OsString::from("XDG_RUNTIME_DIR"),
+                OsString::from("/run/user/1000"),
+            ));
             environment
         };
         let granted = required(Some("td-term"), Some("/etc/terminfo"));
@@ -4897,7 +4912,10 @@ mod tests {
         assert_eq!(full.len(), MAX_ENVIRONMENT_ENTRIES);
         assert!(validate_environment_list(&full, 1000, None, false, false).is_ok());
         let derived = with_terminal_environment(full.clone(), "td-term").unwrap();
-        assert_eq!(derived.len(), MAX_ENVIRONMENT_ENTRIES + TERMINAL_ENVIRONMENT_ENTRIES);
+        assert_eq!(
+            derived.len(),
+            MAX_ENVIRONMENT_ENTRIES + TERMINAL_ENVIRONMENT_ENTRIES
+        );
         assert!(validate_environment_list(&derived, 1000, None, false, true).is_ok());
         assert!(validate_environment_list(&derived, 1000, None, false, false).is_err());
         let mut over = derived.clone();
@@ -4909,10 +4927,8 @@ mod tests {
     /// resolving inside the database, or no grant.
     #[test]
     fn the_terminal_description_is_one_bounded_entry_of_the_image_database() {
-        let root = std::env::temp_dir().join(format!(
-            "td-jail-authority-terminfo-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("td-jail-authority-terminfo-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("database/t")).unwrap();
         fs::write(root.join("database/t/td-term"), b"td-term|td terminal,\n").unwrap();
@@ -4920,8 +4936,7 @@ mod tests {
         std::os::unix::fs::symlink("../t/td-term", root.join("database/e/echo")).unwrap();
         fs::create_dir_all(root.join("database/o")).unwrap();
         fs::write(root.join("outside"), b"x").unwrap();
-        std::os::unix::fs::symlink(root.join("outside"), root.join("database/o/outside"))
-            .unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("database/o/outside")).unwrap();
         fs::write(
             root.join("database/t/tall"),
             vec![b'x'; usize::try_from(MAX_TERMINFO_ENTRY_BYTES).unwrap() + 1],
@@ -4938,13 +4953,25 @@ mod tests {
         // An alias that resolves inside the database is that entry; one that
         // resolves outside is refused however it is spelled.
         assert_eq!(
-            resolve_terminfo_entry(database.as_deref(), "echo").unwrap().path,
+            resolve_terminfo_entry(database.as_deref(), "echo")
+                .unwrap()
+                .path,
             entry.path
         );
         let error = resolve_terminfo_entry(database.as_deref(), "outside").unwrap_err();
-        assert!(error.to_string().contains("outside the terminal description database"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the terminal description database"),
+            "{error}"
+        );
         let error = resolve_terminfo_entry(database.as_deref(), "vt100").unwrap_err();
-        assert!(error.to_string().contains("no description for TERM \"vt100\""), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("no description for TERM \"vt100\""),
+            "{error}"
+        );
         assert!(resolve_terminfo_entry(database.as_deref(), "tall").is_err());
         assert!(resolve_terminfo_entry(database.as_deref(), "../t/td-term").is_err());
         let error = resolve_terminfo_entry(None, "td-term").unwrap_err();
@@ -4995,7 +5022,11 @@ mod tests {
                 .filter(|(key, _)| key != dropped)
                 .cloned()
                 .collect::<Vec<_>>();
-            assert_eq!(without.len(), environment.len() - 1, "{dropped} was not there");
+            assert_eq!(
+                without.len(),
+                environment.len() - 1,
+                "{dropped} was not there"
+            );
             assert!(
                 validate_environment_list(&without, 1000, None, false, false).is_err(),
                 "a spec missing {dropped} was accepted"

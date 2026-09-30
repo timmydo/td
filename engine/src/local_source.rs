@@ -25,7 +25,10 @@ use std::path::{Component, Path, PathBuf};
 /// staging excludes ..."). Excluded from BOTH the staged tree and its
 /// content address — a design document must not be a build input.
 pub fn excluded_entry(name: &OsStr) -> bool {
-    matches!(name.to_str(), Some("target") | Some(".git") | Some("DESIGN.md"))
+    matches!(
+        name.to_str(),
+        Some("target") | Some(".git") | Some("DESIGN.md")
+    )
 }
 
 /// Resolve and validate a repo-relative local-source path against `root`: a
@@ -275,17 +278,32 @@ mod tests {
         let rows = parse_roster("# c\nk1 path1\n\nk2 path2 a,b,c\n").unwrap();
         assert_eq!(
             rows,
-            vec![("k1", "path1", vec![]), ("k2", "path2", vec!["a", "b", "c"])]
+            vec![
+                ("k1", "path1", vec![]),
+                ("k2", "path2", vec!["a", "b", "c"])
+            ]
         );
     }
 
     #[test]
     fn parse_roster_rejects_garbage() {
         assert!(parse_roster("k1\n").is_err(), "missing path must red");
-        assert!(parse_roster("k1 path1 a,b extra\n").is_err(), "extra field must red");
-        assert!(parse_roster("k1 path1\nk1 path2\n").is_err(), "a duplicate key must red");
-        assert!(parse_roster("k1 path1 \n").is_ok(), "trailing whitespace is not a field");
-        assert!(parse_roster("k1 pa,th1\n").is_err(), "a comma in the path is not a plain path");
+        assert!(
+            parse_roster("k1 path1 a,b extra\n").is_err(),
+            "extra field must red"
+        );
+        assert!(
+            parse_roster("k1 path1\nk1 path2\n").is_err(),
+            "a duplicate key must red"
+        );
+        assert!(
+            parse_roster("k1 path1 \n").is_ok(),
+            "trailing whitespace is not a field"
+        );
+        assert!(
+            parse_roster("k1 pa,th1\n").is_err(),
+            "a comma in the path is not a plain path"
+        );
         assert_eq!(
             parse_roster("k1 path1 \n").unwrap(),
             vec![("k1", "path1", vec![])]

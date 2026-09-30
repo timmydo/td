@@ -2,30 +2,102 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 const SOURCES: &[(&str, &str)] = &[
-    ("src/primary_account.rs", include_str!("../../../td-authd/src/primary_account.rs")),
-    ("tests/deployment.rs", include_str!("../../../td-authd/tests/deployment.rs")),
-    ("src/deployment.rs", include_str!("../../../td-authd/src/deployment.rs")),
-    ("tests/secret_intake.rs", include_str!("../../../td-authd/tests/secret_intake.rs")),
-    ("tests/secret_sys.rs", include_str!("../../../td-authd/tests/secret_sys.rs")),
-    ("src/secret_sys.rs", include_str!("../../../td-authd/src/secret_sys.rs")),
-    ("src/secret_request.rs", include_str!("../../../td-authd/src/secret_request.rs")),
-    ("src/secret_intake.rs", include_str!("../../../td-authd/src/secret_intake.rs")),
-    ("src/inspection.rs", include_str!("../../../td-authd/src/inspection.rs")),
-    ("tests/inspection.rs", include_str!("../../../td-authd/tests/inspection.rs")),
-    ("src/session.rs", include_str!("../../../td-authd/src/session.rs")),
-    ("tests/session.rs", include_str!("../../../td-authd/tests/session.rs")),
-    ("src/unlock.rs", include_str!("../../../td-authd/src/unlock.rs")),
-    ("tests/unlock.rs", include_str!("../../../td-authd/tests/unlock.rs")),
-    ("src/consent.rs", include_str!("../../../td-authd/src/consent.rs")),
-    ("src/application_files.rs", include_str!("../../../td-authd/src/application_files.rs")),
-    ("src/application_shell.rs", include_str!("../../../td-authd/src/application_shell.rs")),
-    ("src/shell_channel.rs", include_str!("../../../td-authd/src/shell_channel.rs")),
-    ("src/terminal.rs", include_str!("../../../td-authd/src/terminal.rs")),
-    ("src/terminal_sys.rs", include_str!("../../../td-authd/src/terminal_sys.rs")),
-    ("src/application.rs", include_str!("../../../td-authd/src/application.rs")),
-    ("src/mount_sys.rs", include_str!("../../../td-authd/src/mount_sys.rs")),
-    ("src/portal_files.rs", include_str!("../../../td-authd/src/portal_files.rs")),
-    ("tests/portal_files.rs", include_str!("../../../td-authd/tests/portal_files.rs")),
+    (
+        "src/primary_account.rs",
+        include_str!("../../../td-authd/src/primary_account.rs"),
+    ),
+    (
+        "tests/deployment.rs",
+        include_str!("../../../td-authd/tests/deployment.rs"),
+    ),
+    (
+        "src/deployment.rs",
+        include_str!("../../../td-authd/src/deployment.rs"),
+    ),
+    (
+        "tests/secret_intake.rs",
+        include_str!("../../../td-authd/tests/secret_intake.rs"),
+    ),
+    (
+        "tests/secret_sys.rs",
+        include_str!("../../../td-authd/tests/secret_sys.rs"),
+    ),
+    (
+        "src/secret_sys.rs",
+        include_str!("../../../td-authd/src/secret_sys.rs"),
+    ),
+    (
+        "src/secret_request.rs",
+        include_str!("../../../td-authd/src/secret_request.rs"),
+    ),
+    (
+        "src/secret_intake.rs",
+        include_str!("../../../td-authd/src/secret_intake.rs"),
+    ),
+    (
+        "src/inspection.rs",
+        include_str!("../../../td-authd/src/inspection.rs"),
+    ),
+    (
+        "tests/inspection.rs",
+        include_str!("../../../td-authd/tests/inspection.rs"),
+    ),
+    (
+        "src/session.rs",
+        include_str!("../../../td-authd/src/session.rs"),
+    ),
+    (
+        "tests/session.rs",
+        include_str!("../../../td-authd/tests/session.rs"),
+    ),
+    (
+        "src/unlock.rs",
+        include_str!("../../../td-authd/src/unlock.rs"),
+    ),
+    (
+        "tests/unlock.rs",
+        include_str!("../../../td-authd/tests/unlock.rs"),
+    ),
+    (
+        "src/consent.rs",
+        include_str!("../../../td-authd/src/consent.rs"),
+    ),
+    (
+        "src/application_files.rs",
+        include_str!("../../../td-authd/src/application_files.rs"),
+    ),
+    (
+        "src/application_shell.rs",
+        include_str!("../../../td-authd/src/application_shell.rs"),
+    ),
+    (
+        "src/shell_channel.rs",
+        include_str!("../../../td-authd/src/shell_channel.rs"),
+    ),
+    (
+        "src/terminal.rs",
+        include_str!("../../../td-authd/src/terminal.rs"),
+    ),
+    (
+        "src/terminal_sys.rs",
+        include_str!("../../../td-authd/src/terminal_sys.rs"),
+    ),
+    (
+        "src/application.rs",
+        include_str!("../../../td-authd/src/application.rs"),
+    ),
+    (
+        "src/mount_sys.rs",
+        include_str!("../../../td-authd/src/mount_sys.rs"),
+    ),
+    (
+        "src/portal_files.rs",
+        include_str!("../../../td-authd/src/portal_files.rs"),
+    ),
+    (
+        "tests/portal_files.rs",
+        include_str!("../../../td-authd/tests/portal_files.rs"),
+    ),
     ("Cargo.toml", include_str!("../../../td-authd/Cargo.toml")),
     (
         "src/launch.rs",
@@ -93,15 +165,33 @@ pub fn recipe() -> Recipe {
         });
     }
     for directory in ["{src}/td-firstboot/src", "{src}/engine/src"] {
-        steps.push(Step::MkDir { path: directory.into() });
+        steps.push(Step::MkDir {
+            path: directory.into(),
+        });
     }
     for (path, source) in [
-        ("{src}/td-firstboot/src/principals.rs", include_str!("../../../td-firstboot/src/principals.rs")),
-        ("{src}/td-firstboot/src/principals_tests.rs", include_str!("../../../td-firstboot/src/principals_tests.rs")),
-        ("{src}/engine/src/sha256.rs", include_str!("../../../engine/src/sha256.rs")),
-        ("{src}/engine/src/principals.rs", include_str!("../../../engine/src/principals.rs")),
+        (
+            "{src}/td-firstboot/src/principals.rs",
+            include_str!("../../../td-firstboot/src/principals.rs"),
+        ),
+        (
+            "{src}/td-firstboot/src/principals_tests.rs",
+            include_str!("../../../td-firstboot/src/principals_tests.rs"),
+        ),
+        (
+            "{src}/engine/src/sha256.rs",
+            include_str!("../../../engine/src/sha256.rs"),
+        ),
+        (
+            "{src}/engine/src/principals.rs",
+            include_str!("../../../engine/src/principals.rs"),
+        ),
     ] {
-        steps.push(Step::WriteFile { path: path.into(), content: source.into(), exec: false });
+        steps.push(Step::WriteFile {
+            path: path.into(),
+            content: source.into(),
+            exec: false,
+        });
     }
     steps.push(Step::MkDir {
         path: "{root}/eh".into(),
@@ -216,7 +306,10 @@ mod tests {
                 assert!(entry.file_type().unwrap().is_file());
                 let name = format!("{directory}/{}", entry.file_name().to_str().unwrap());
                 // This standalone QEMU driver is host-only diagnostic code.
-                if !matches!(name.as_str(), "tests/launch_vm.rs" | "tests/launch_taskmgr_vm.rs") {
+                if !matches!(
+                    name.as_str(),
+                    "tests/launch_vm.rs" | "tests/launch_taskmgr_vm.rs"
+                ) {
                     actual.push(name);
                 }
             }

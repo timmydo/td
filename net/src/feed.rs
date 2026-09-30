@@ -1586,7 +1586,9 @@ fn is_warm_complete(vendor: &Path, lock: &Path) -> bool {
 /// non-regular file: a marker or lock replaced by a symlink to something huge
 /// must read as "not warm", not exhaust memory deciding.
 fn lock_digest(lock: &Path) -> Option<String> {
-    read_locked_cargo_sources(lock).ok().map(|(_, digest)| digest)
+    read_locked_cargo_sources(lock)
+        .ok()
+        .map(|(_, digest)| digest)
 }
 
 /// The marker is one digest line and one count line. Read it under a small
@@ -1942,8 +1944,7 @@ fn fetch_locked_registry(
             deadline: Instant::now() + RESPONSE_DEADLINE,
             client: None,
         };
-        let (mut file, _) =
-            serve_crate_before(store, &package.name, &package.version, &guard)?;
+        let (mut file, _) = serve_crate_before(store, &package.name, &package.version, &guard)?;
         let got = reader_sha256_before(&mut file, MAX_ARTIFACT_BYTES, Some(&guard))
             .map_err(|e| format!("hash {}-{}: {e}", package.name, package.version))?;
         if got != package.checksum {
@@ -2121,12 +2122,7 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
         if srcparent.exists() {
             std::fs::remove_dir_all(&srcparent).map_err(|e| e.to_string())?;
         }
-        vendor::prepare_package_metadata(
-            &srccrate,
-            &checksum,
-            &format!("{krate}-{ver}"),
-            &srcdir,
-        )
+        vendor::prepare_package_metadata(&srccrate, &checksum, &format!("{krate}-{ver}"), &srcdir)
     })();
     if let Err(error) = prepared {
         eprintln!("td-feed warm crate: prepare {krate}-{ver} metadata: {error}");
@@ -2992,8 +2988,14 @@ fn prepare_kernel_headers(root: &Path, arch: &str, pins: &[SourcePin], cache: &P
         },
     };
     let produced = (|| -> Result<(), String> {
-        let lease = tmp_cleanup._directory_lock.try_clone().map_err(|e| e.to_string())?;
-        let output = tmp_cleanup._reservation.try_clone().map_err(|e| e.to_string())?;
+        let lease = tmp_cleanup
+            ._directory_lock
+            .try_clone()
+            .map_err(|e| e.to_string())?;
+        let output = tmp_cleanup
+            ._reservation
+            .try_clone()
+            .map_err(|e| e.to_string())?;
         let status = Command::new(builder)
             .arg("kernel-headers")
             .arg(&src)
@@ -3007,11 +3009,17 @@ fn prepare_kernel_headers(root: &Path, arch: &str, pins: &[SourcePin], cache: &P
         if !status.success() {
             return Err(format!("native header preparation: {status}"));
         }
-        tmp_cleanup._reservation.sync_all().map_err(|e| e.to_string())?;
+        tmp_cleanup
+            ._reservation
+            .sync_all()
+            .map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &out).map_err(|e| e.to_string())
     })();
     match produced {
-        Ok(()) => eprintln!(">> td-feed warm kernel-headers ({arch}): produced {} from the pinned {file}", out.display()),
+        Ok(()) => eprintln!(
+            ">> td-feed warm kernel-headers ({arch}): produced {} from the pinned {file}",
+            out.display()
+        ),
         Err(error) => eprintln!(">> td-feed warm kernel-headers ({arch}): {error} — skipping"),
     }
     drop(tmp_cleanup);
@@ -3403,9 +3411,11 @@ pub fn run(a: &[String]) {
         Some(action @ ("export" | "consume"))
             if matches!(a.len(), 3 | 4) && a.get(2).map(String::as_str) == Some("vendors") =>
         {
-            if let Err(error) =
-                vendor::run(&repo_root(), a.get(3).map(String::as_str), action == "consume")
-            {
+            if let Err(error) = vendor::run(
+                &repo_root(),
+                a.get(3).map(String::as_str),
+                action == "consume",
+            ) {
                 die(format!("{action} vendors: {error}"));
             }
         }
@@ -3906,8 +3916,10 @@ pub(crate) mod tests {
         let dir = unique_tmp_dir("consumer-reserved");
         for name in [".td-feed-download.lock", ".td-feed-download-12-3.tmp"] {
             let pin = super::SourcePin {
-                key: "fixture".into(), url: "https://example.invalid/source".into(),
-                sha256: super::hex_sha256(b"bytes"), file: name.into(),
+                key: "fixture".into(),
+                url: "https://example.invalid/source".into(),
+                sha256: super::hex_sha256(b"bytes"),
+                file: name.into(),
             };
             let error = super::consume_source_pins(&[pin], &dir, "http://127.0.0.1:0").unwrap_err();
             assert!(error.contains("unsafe source cache filename"), "{error}");
@@ -3983,7 +3995,9 @@ pub(crate) mod tests {
     impl Drop for ConsumerServer {
         fn drop(&mut self) {
             self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
         }
     }
 
@@ -4422,8 +4436,10 @@ pub(crate) mod tests {
         let origin = ConsumerServer::start(dir.join("upstream"), None);
         let bytes = b"one pinned source, two private caches";
         let pin = super::SourcePin {
-            key: "fixture".into(), url: format!("{}/source.tar", origin.base),
-            sha256: super::hex_sha256(bytes), file: "source.tar".into(),
+            key: "fixture".into(),
+            url: format!("{}/source.tar", origin.base),
+            sha256: super::hex_sha256(bytes),
+            file: "source.tar".into(),
         };
         let host_file = store.join(super::strip_scheme(&pin.url));
         std::fs::create_dir_all(host_file.parent().unwrap()).unwrap();
@@ -4510,8 +4526,10 @@ pub(crate) mod tests {
         let dir = unique_tmp_dir("consumer-refusal");
         let origin = ConsumerServer::start(dir.join("upstream"), None);
         let pin = super::SourcePin {
-            key: "fixture".into(), url: format!("{}/source.tar", origin.base),
-            sha256: super::hex_sha256(b"expected"), file: "source.tar".into(),
+            key: "fixture".into(),
+            url: format!("{}/source.tar", origin.base),
+            sha256: super::hex_sha256(b"expected"),
+            file: "source.tar".into(),
         };
         for (index, response) in [
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
@@ -4639,12 +4657,20 @@ pub(crate) mod tests {
         }];
         for arch in ["i386", "x86_64"] {
             super::prepare_kernel_headers(&root, arch, &pins, &cache);
-            let bytes = std::fs::read(cache.join(format!("linux-headers-4.14.67-{arch}.tar"))).unwrap();
+            let bytes =
+                std::fs::read(cache.join(format!("linux-headers-4.14.67-{arch}.tar"))).unwrap();
             assert_eq!(bytes.len(), 5160960);
-            assert_eq!(super::hex_sha256(&bytes), "e395d859211f8924fdf19a2ef7ee37e2d92bb1fdbc5fa083a2bdf03f6fd04ce0");
+            assert_eq!(
+                super::hex_sha256(&bytes),
+                "e395d859211f8924fdf19a2ef7ee37e2d92bb1fdbc5fa083a2bdf03f6fd04ce0"
+            );
         }
         assert!(std::fs::read_dir(&cache).unwrap().all(|entry| {
-            !entry.unwrap().file_name().to_string_lossy().starts_with(".td-feed-kh-")
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".td-feed-kh-")
         }));
     }
 

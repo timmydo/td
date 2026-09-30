@@ -24,7 +24,10 @@ impl SynErr {
     /// ash spells this case several ways with no common opening, and a
     /// `SynErr` cannot be passed in: that would keep the flag through a wrap.
     pub fn incomplete(msg: impl Into<String>) -> Self {
-        Self { msg: msg.into(), incomplete: true }
+        Self {
+            msg: msg.into(),
+            incomplete: true,
+        }
     }
 
     pub fn is_incomplete(&self) -> bool {
@@ -37,13 +40,19 @@ impl SynErr {
 /// flag, which is what that caller wants: no further input completes an alias.
 impl From<String> for SynErr {
     fn from(msg: String) -> Self {
-        Self { msg, incomplete: false }
+        Self {
+            msg,
+            incomplete: false,
+        }
     }
 }
 
 impl From<&str> for SynErr {
     fn from(msg: &str) -> Self {
-        Self { msg: msg.to_string(), incomplete: false }
+        Self {
+            msg: msg.to_string(),
+            incomplete: false,
+        }
     }
 }
 
@@ -109,7 +118,10 @@ pub enum Seg {
     },
     /// `$((...))` — the inner text is itself a word (it may contain `$x`), so it
     /// is expanded first and then evaluated as an arithmetic expression.
-    Arith { expr: Word, quoted: bool },
+    Arith {
+        expr: Word,
+        quoted: bool,
+    },
     /// `<(...)` / `>(...)` — the raw source. Expanding the word runs it
     /// CONCURRENTLY behind a pipe and leaves the path of this shell's end of
     /// that pipe in its place (`process::dev_fd_path`). `write` is the `>(`
@@ -284,11 +296,18 @@ pub enum CondExpr {
     /// A bare word: true when it expands to a non-empty string.
     Word(Word),
     /// `-X word`, the unary operators `test` already serves, plus `-v`.
-    Unary { op: String, arg: Word },
+    Unary {
+        op: String,
+        arg: Word,
+    },
     /// `lhs OP rhs`. The RHS of `==`/`!=`/`=` is a PATTERN, which is why it
     /// stays a `Word` here: its quoting decides, per character, whether a `*`
     /// matches anything or itself.
-    Binary { op: CondOp, lhs: Word, rhs: Word },
+    Binary {
+        op: CondOp,
+        lhs: Word,
+        rhs: Word,
+    },
     Not(Box<CondExpr>),
     And(Box<CondExpr>, Box<CondExpr>),
     Or(Box<CondExpr>, Box<CondExpr>),

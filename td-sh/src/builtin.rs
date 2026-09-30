@@ -51,8 +51,8 @@ pub enum Builtin {
 /// holds them together -- the compiler cannot.
 pub const NAMES: &[&str] = &[
     ":", "[", ".", "alias", "break", "cd", "command", "continue", "echo", "eval", "exec", "exit",
-    "export", "false", "getopts", "jobs", "local", "printf", "pwd", "read", "readonly", "return", "set",
-    "shift", "source", "test", "times", "trap", "true", "type", "umask", "unalias", "unset",
+    "export", "false", "getopts", "jobs", "local", "printf", "pwd", "read", "readonly", "return",
+    "set", "shift", "source", "test", "times", "trap", "true", "type", "umask", "unalias", "unset",
     "wait",
 ];
 
@@ -347,7 +347,11 @@ fn wait(sh: &mut Shell, argv: &[String]) -> R<()> {
         // operand, so the ones after an unknown id are still waited for. bash
         // agrees -- `wait <unknown> $p` reports `$p`'s status and `wait $p
         // <unknown>` reports 127 -- where returning here waited for neither.
-        last = operand.parse::<u32>().ok().and_then(|id| sh.jobs.wait_id(id)).unwrap_or(127);
+        last = operand
+            .parse::<u32>()
+            .ok()
+            .and_then(|id| sh.jobs.wait_id(id))
+            .unwrap_or(127);
     }
     status(sh, last)
 }
@@ -426,7 +430,9 @@ fn echo(sh: &mut Shell, argv: &[String]) -> R<()> {
     // across words. `E` is accepted and does NOTHING: it never clears the flag,
     // so `echo -e -E` still interprets. That is busybox, not bash.
     while let Some(arg) = argv.get(i) {
-        let Some(letters) = arg.strip_prefix('-') else { break };
+        let Some(letters) = arg.strip_prefix('-') else {
+            break;
+        };
         if letters.is_empty() || !letters.chars().all(|c| matches!(c, 'n' | 'e' | 'E')) {
             break;
         }
@@ -494,7 +500,12 @@ fn printf(sh: &mut Shell, argv: &[String]) -> R<()> {
     };
     let args: Vec<&str> = argv.iter().skip(idx + 1).map(String::as_str).collect();
     let mut out_buf: Vec<u8> = Vec::new();
-    let mut st = Pf { ai: 0, error: false, stop: false, errors: Vec::new() };
+    let mut st = Pf {
+        ai: 0,
+        error: false,
+        stop: false,
+        errors: Vec::new(),
+    };
     loop {
         let before = st.ai;
         format_once(format, &args, &mut out_buf, &mut st);
@@ -515,9 +526,9 @@ fn printf(sh: &mut Shell, argv: &[String]) -> R<()> {
 
 // printf run state threaded through the format walk.
 struct Pf {
-    ai: usize,           // next argument index
-    error: bool,         // a conversion/parse error occurred => exit status 1
-    stop: bool,          // `\c`, from `%b` or the format string: stop ALL
+    ai: usize,   // next argument index
+    error: bool, // a conversion/parse error occurred => exit status 1
+    stop: bool,  // `\c`, from `%b` or the format string: stop ALL
     // further output, format cycling included
     errors: Vec<String>, // stderr lines, emitted once after the walk
 }
@@ -578,7 +589,13 @@ fn format_once(format: &str, args: &[&str], out: &mut Vec<u8>, st: &mut Pf) {
 // panic=abort. No real format approaches this (the corpus max is ~10).
 const MAX_FIELD: usize = 65535;
 
-fn conversion(chars: &[char], start: usize, args: &[&str], out: &mut Vec<u8>, st: &mut Pf) -> usize {
+fn conversion(
+    chars: &[char],
+    start: usize,
+    args: &[&str],
+    out: &mut Vec<u8>,
+    st: &mut Pf,
+) -> usize {
     let mut i = start;
     if chars.get(i) == Some(&'%') {
         out.push(b'%');
@@ -644,7 +661,12 @@ fn conversion(chars: &[char], start: usize, args: &[&str], out: &mut Vec<u8>, st
     i += 1;
     let width = width.min(MAX_FIELD);
     let prec = prec.map(|p| if p < 0 { p } else { p.min(MAX_FIELD as i64) });
-    let spec = Spec { flags, width, left, prec };
+    let spec = Spec {
+        flags,
+        width,
+        left,
+        prec,
+    };
     match conv {
         's' => emit_str(out, args, st, &spec),
         'c' => emit_char(out, args, st, &spec),
@@ -754,7 +776,15 @@ fn emit_int(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, conv: char, spec: &Sp
     }
     // The 0 flag is ignored when a precision is given, or when left-justifying.
     let zero = flags.zero && !spec.left && spec.prec.is_none();
-    pad_bytes(out, &sign, &prefix, mag.as_bytes(), spec.width, spec.left, zero);
+    pad_bytes(
+        out,
+        &sign,
+        &prefix,
+        mag.as_bytes(),
+        spec.width,
+        spec.left,
+        zero,
+    );
 }
 
 fn emit_float(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, conv: char, spec: &Spec) {
@@ -768,11 +798,16 @@ fn emit_float(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, conv: char, spec: &
     // an error — but the (partially converted) value is still printed. An operand
     // absent altogether, or empty, converts to 0 with no complaint.
     if num.consumed < raw.len() {
-        let why = if num.consumed == 0 { "expected a numeric value" } else { "not completely converted" };
+        let why = if num.consumed == 0 {
+            "expected a numeric value"
+        } else {
+            "not completely converted"
+        };
         st.errors.push(format!("{raw}: {why}"));
         st.error = true;
     } else if num.erange {
-        st.errors.push(format!("{raw}: Numerical result out of range"));
+        st.errors
+            .push(format!("{raw}: Numerical result out of range"));
         st.error = true;
     }
     let value = num.value;
@@ -807,7 +842,15 @@ fn emit_float(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, conv: char, spec: &
     };
     // Unlike integers, a precision does NOT disable the 0 flag for floats.
     let zero = flags.zero && !spec.left && numeric;
-    pad_bytes(out, &sign, &[], body.as_bytes(), spec.width, spec.left, zero);
+    pad_bytes(
+        out,
+        &sign,
+        &[],
+        body.as_bytes(),
+        spec.width,
+        spec.left,
+        zero,
+    );
 }
 
 // C `%f`: `prec` fraction digits, and `#` keeps the point that `.0` would drop.
@@ -853,7 +896,11 @@ fn fmt_g(mag: f64, prec: usize, upper: bool, hash: bool) -> String {
             // `%#.6g` of 999999.5 is `1.e+06`, not C's `1.00000e+06`. Only a value
             // style f would have taken UNROUNDED carries like that; one already in
             // style e (exponent below -4) is formatted normally.
-            if (-4..p as i32).contains(&decimal_exponent(mag)) { "" } else { frac }
+            if (-4..p as i32).contains(&decimal_exponent(mag)) {
+                ""
+            } else {
+                frac
+            }
         } else {
             frac.trim_end_matches('0')
         };
@@ -950,7 +997,11 @@ struct Num {
 // hex float, or a decimal float. Stops at the first byte that cannot extend the
 // number, so `"1 "` converts 1.0 AND reports a tail (dash's status 1).
 fn strtod(s: &str) -> Num {
-    let none = Num { value: 0.0, consumed: 0, erange: false };
+    let none = Num {
+        value: 0.0,
+        consumed: 0,
+        erange: false,
+    };
     let b = s.as_bytes();
     let mut i = 0usize;
     while matches!(b.get(i), Some(&c) if c == b' ' || (0x09..=0x0d).contains(&c)) {
@@ -967,12 +1018,17 @@ fn strtod(s: &str) -> Num {
         }
         _ => false,
     };
-    let Some((mag, end, erange)) =
-        parse_inf_nan(b, i).or_else(|| parse_hex_float(b, i)).or_else(|| parse_dec_float(b, i))
+    let Some((mag, end, erange)) = parse_inf_nan(b, i)
+        .or_else(|| parse_hex_float(b, i))
+        .or_else(|| parse_dec_float(b, i))
     else {
         return none;
     };
-    Num { value: if neg { -mag } else { mag }, consumed: end, erange }
+    Num {
+        value: if neg { -mag } else { mag },
+        consumed: end,
+        erange,
+    }
 }
 
 // `inf`/`infinity`/`nan`/`nan(chars)`, case-insensitive. A longer word that only
@@ -1001,7 +1057,9 @@ fn parse_inf_nan(b: &[u8], i: usize) -> Option<(f64, usize, bool)> {
 }
 
 fn word_at(b: &[u8], i: usize, word: &[u8]) -> bool {
-    word.iter().enumerate().all(|(k, w)| b.get(i + k).is_some_and(|c| c.eq_ignore_ascii_case(w)))
+    word.iter()
+        .enumerate()
+        .all(|(k, w)| b.get(i + k).is_some_and(|c| c.eq_ignore_ascii_case(w)))
 }
 
 // C99 hex float `0x<hex digits>[.<hex digits>][p[±]<decimal digits>]`. Without a
@@ -1079,7 +1137,10 @@ fn parse_hex_float(b: &[u8], i: usize) -> Option<(f64, usize, bool)> {
             j = k;
         }
     }
-    let e = dropped.saturating_sub(nfrac).saturating_mul(4).saturating_add(pexp);
+    let e = dropped
+        .saturating_sub(nfrac)
+        .saturating_mul(4)
+        .saturating_add(pexp);
     let (mag, erange) = scale_pow2(mant, e, sticky);
     Some((mag, j, erange))
 }
@@ -1131,7 +1192,11 @@ fn scale_pow2(mant: u128, e: i64, sticky: bool) -> (f64, bool) {
         ((m << (exp + 1074).clamp(0, 52)) & ((1u128 << 52) - 1)) as u64
     } else {
         let shift = 53 - bits;
-        let m53 = if shift >= 0 { m << shift } else { m >> shift.unsigned_abs() };
+        let m53 = if shift >= 0 {
+            m << shift
+        } else {
+            m >> shift.unsigned_abs()
+        };
         (((msb + 1023) as u64) << 52) | ((m53 as u64) & ((1u64 << 52) - 1))
     };
     (f64::from_bits(raw), tiny && lost)
@@ -1237,7 +1302,9 @@ fn read_dec(chars: &[char], start: usize) -> (i64, usize) {
     let mut j = start;
     while let Some(&c) = chars.get(j) {
         if c.is_ascii_digit() {
-            v = v.saturating_mul(10).saturating_add((c as i64) - ('0' as i64));
+            v = v
+                .saturating_mul(10)
+                .saturating_add((c as i64) - ('0' as i64));
             j += 1;
         } else {
             break;
@@ -1426,7 +1493,15 @@ fn range_ok(v: i128, conv: char) -> bool {
 // Apply a field width to `sign + prefix + body`: space- or zero-pad on the left,
 // or space-pad on the right when left-justifying. Zero padding lands between the
 // sign/prefix and the body.
-fn pad_bytes(out: &mut Vec<u8>, sign: &[u8], prefix: &[u8], body: &[u8], width: usize, left: bool, zero: bool) {
+fn pad_bytes(
+    out: &mut Vec<u8>,
+    sign: &[u8],
+    prefix: &[u8],
+    body: &[u8],
+    width: usize,
+    left: bool,
+    zero: bool,
+) {
     let len = sign.len() + prefix.len() + body.len();
     let pad = width.saturating_sub(len);
     if left {
@@ -1502,7 +1577,10 @@ fn loop_ctl(sh: &mut Shell, argv: &[String], is_break: bool) -> R<()> {
     let n = match argv.get(1) {
         // `breakcmd` runs the operand through `number` and THEN rejects a
         // non-positive count, so `break 0` reports the same way `break oops` does.
-        Some(s) => match parse_number(s).filter(|n| *n > 0).and_then(|n| u32::try_from(n).ok()) {
+        Some(s) => match parse_number(s)
+            .filter(|n| *n > 0)
+            .and_then(|n| u32::try_from(n).ok())
+        {
             Some(n) => n,
             None => return Err(badnum(sh, s)),
         },
@@ -1643,8 +1721,8 @@ pub fn apply_named_option(sh: &mut Shell, name: &str, on: bool) -> bool {
         "noexec" => sh.opts.noexec = on,
         "allexport" => sh.opts.allexport = on,
         "stdin" => sh.opts.stdin = on,
-        "ignoreeof" | "interactive" | "monitor" | "vi" | "emacs" | "notify" | "nolog"
-        | "debug" | "errtrace" => {}
+        "ignoreeof" | "interactive" | "monitor" | "vi" | "emacs" | "notify" | "nolog" | "debug"
+        | "errtrace" => {}
         _ => return false,
     }
     true
@@ -1963,7 +2041,9 @@ fn getopts(sh: &mut Shell, argv: &[String]) -> R<()> {
 
     // Continue inside the word already being consumed, else enter the next one.
     let inword = if off >= 1 && optind >= 2 {
-        args.get((optind - 2) as usize).filter(|w| (w.len() as i64) > off).cloned()
+        args.get((optind - 2) as usize)
+            .filter(|w| (w.len() as i64) > off)
+            .cloned()
     } else {
         None
     };
@@ -2009,7 +2089,8 @@ fn getopts(sh: &mut Shell, argv: &[String]) -> R<()> {
         Some(true) => {
             off = -1;
             if at < word.len() {
-                let tail = String::from_utf8_lossy(word.as_bytes().get(at..).unwrap_or(&[])).into_owned();
+                let tail =
+                    String::from_utf8_lossy(word.as_bytes().get(at..).unwrap_or(&[])).into_owned();
                 getopts_write(sh, "OPTARG", &tail)?;
             } else if let Some(a) = args.get((optind - 1) as usize).cloned() {
                 getopts_write(sh, "OPTARG", &a)?;
@@ -2461,7 +2542,10 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
                     break;
                 }
             }
-            let first_ifs = buffer.iter().position(|&b| is_ifs(b)).unwrap_or(buffer.len());
+            let first_ifs = buffer
+                .iter()
+                .position(|&b| is_ifs(b))
+                .unwrap_or(buffer.len());
             if first_ifs >= keep {
                 buffer.truncate(keep);
             }
@@ -2742,7 +2826,8 @@ fn apply_disposition(sh: &mut Shell, signo: u8, want: crate::sys::Disposition) -
     if sh.cloned {
         if let Some(prev) = prev {
             if !sh.sig_undo.iter().any(|(n, _)| *n == signo) {
-                sh.sig_undo.push((signo, prev == crate::sys::Disposition::Ignore));
+                sh.sig_undo
+                    .push((signo, prev == crate::sys::Disposition::Ignore));
             }
         }
     }
@@ -2857,9 +2942,7 @@ fn alias(sh: &mut Shell, argv: &[String]) -> R<()> {
             // BROKEN one ends the shell there, for the reason `sigpipe` gives.
             match write_fd(sh, 1, line.as_bytes()) {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                    return Err(sigpipe())
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Err(sigpipe()),
                 Err(_) => ret = 1,
             }
         }
@@ -3003,12 +3086,7 @@ pub fn exec_keeps_redirections(argv: &[String]) -> bool {
 }
 
 fn eval(sh: &mut Shell, argv: &[String]) -> R<()> {
-    let joined = argv
-        .iter()
-        .skip(1)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let joined = argv.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
     if joined.trim().is_empty() {
         return ok(sh);
     }
@@ -3248,7 +3326,11 @@ fn parse_mode(text: &str, current_mode: u32, umask_now: u32) -> Option<u32> {
                 // `=` clears BEFORE the perms are read, which is why `X` and a
                 // permcopy in the same clause see the cleared value: `umask 0;
                 // umask a=X` leaves execute off and so is 0777, not 0666.
-                new_mode &= if wholist != 0 { !wholist } else { !FILEMODEBITS };
+                new_mode &= if wholist != 0 {
+                    !wholist
+                } else {
+                    !FILEMODEBITS
+                };
             }
             i += 1;
 
@@ -3267,8 +3349,9 @@ fn parse_mode(text: &str, current_mode: u32, umask_now: u32) -> Option<u32> {
                 }
                 None => {
                     let mut pl = 0u32;
-                    while let Some(k) =
-                        b.get(i).and_then(|c| PERM_CHARS.iter().position(|p| p == c))
+                    while let Some(k) = b
+                        .get(i)
+                        .and_then(|c| PERM_CHARS.iter().position(|p| p == c))
                     {
                         // `X` is execute only where execute already is.
                         if PERM_CHARS.get(k) != Some(&b'X') || new_mode & 0o111 != 0 {
@@ -3423,7 +3506,11 @@ fn dot_path(sh: &Shell, name: &str) -> Option<(std::path::PathBuf, String)> {
     for dir in path.split(':') {
         // An empty entry is the cwd and contributes NO prefix, so the name is
         // reported bare -- `padvance`'s handling, checked against ash.
-        let found = if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") };
+        let found = if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dir}/{name}")
+        };
         let candidate = sh.resolve(&found);
         if candidate.is_file() {
             return Some((candidate, found));
@@ -3478,7 +3565,11 @@ fn format_ticks(t: u64, hz: u64) -> String {
 fn times_text(ticks: [u64; 4]) -> String {
     let [ut, st, cut, cst] = ticks;
     let line = |a: u64, b: u64| {
-        format!("{} {}\n", format_ticks(a, USER_HZ), format_ticks(b, USER_HZ))
+        format!(
+            "{} {}\n",
+            format_ticks(a, USER_HZ),
+            format_ticks(b, USER_HZ)
+        )
     };
     line(ut, st) + &line(cut, cst)
 }
@@ -3859,7 +3950,12 @@ fn eval_test(sh: &Shell, args: &[String]) -> Result<bool, String> {
             Ok(!three_arg(sh, args.get(1..).unwrap_or(&[]))?)
         }
         _ => {
-            let mut p = TestParser { args, pos: 0, depth: 0, sh };
+            let mut p = TestParser {
+                args,
+                pos: 0,
+                depth: 0,
+                sh,
+            };
             let v = p.or_expr()?;
             if p.pos != args.len() {
                 return Err(format!("unexpected argument `{}`", s(args, p.pos)));
@@ -3919,7 +4015,18 @@ fn s(args: &[String], i: usize) -> &str {
 fn is_binary(op: &str) -> bool {
     matches!(
         op,
-        "=" | "!=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "<" | ">" | "-nt" | "-ot" | "-ef"
+        "=" | "!="
+            | "-eq"
+            | "-ne"
+            | "-lt"
+            | "-le"
+            | "-gt"
+            | "-ge"
+            | "<"
+            | ">"
+            | "-nt"
+            | "-ot"
+            | "-ef"
     )
 }
 
@@ -3969,8 +4076,12 @@ pub fn unary_op(sh: &Shell, op: &str, arg: &str) -> Result<bool, String> {
             .symlink_metadata()
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false),
-        "b" => path().metadata().is_ok_and(|m| m.file_type().is_block_device()),
-        "c" => path().metadata().is_ok_and(|m| m.file_type().is_char_device()),
+        "b" => path()
+            .metadata()
+            .is_ok_and(|m| m.file_type().is_block_device()),
+        "c" => path()
+            .metadata()
+            .is_ok_and(|m| m.file_type().is_char_device()),
         "p" => path().metadata().is_ok_and(|m| m.file_type().is_fifo()),
         "S" => path().metadata().is_ok_and(|m| m.file_type().is_socket()),
         "u" => mode_bit(&path(), 0o4000),
@@ -4008,7 +4119,9 @@ fn file_cmp(sh: &Shell, a: &str, op: &str, b: &str) -> bool {
 }
 
 fn read_only(p: &std::path::Path) -> bool {
-    p.metadata().map(|m| m.permissions().readonly()).unwrap_or(false)
+    p.metadata()
+        .map(|m| m.permissions().readonly())
+        .unwrap_or(false)
 }
 
 fn is_executable(p: &std::path::Path) -> bool {
@@ -4094,7 +4207,11 @@ impl TestParser<'_> {
         // Unary op: `-z STR`, `-f FILE`, …
         if let Some(u) = a.strip_prefix('-') {
             if is_unary(&a) {
-                let arg = self.args.get(self.pos + 1).map(String::as_str).unwrap_or("");
+                let arg = self
+                    .args
+                    .get(self.pos + 1)
+                    .map(String::as_str)
+                    .unwrap_or("");
                 self.pos += 2;
                 return unary_op(self.sh, u, arg);
             }
@@ -4102,7 +4219,11 @@ impl TestParser<'_> {
         // Binary op: `A OP B`.
         if let Some(op) = self.args.get(self.pos + 1).map(String::as_str) {
             if is_binary(op) {
-                let b = self.args.get(self.pos + 2).map(String::as_str).unwrap_or("");
+                let b = self
+                    .args
+                    .get(self.pos + 2)
+                    .map(String::as_str)
+                    .unwrap_or("");
                 let v = binary_op(self.sh, &a, op, b)?;
                 self.pos += 3;
                 return Ok(v);
@@ -4250,7 +4371,10 @@ mod tests {
             arms.push(lit);
             rest = tail;
         }
-        assert!(arms.len() > 20, "the match arms did not parse out of the source");
+        assert!(
+            arms.len() > 20,
+            "the match arms did not parse out of the source"
+        );
         arms.sort_unstable();
         let mut names = super::NAMES.to_vec();
         names.sort_unstable();
@@ -4357,7 +4481,10 @@ mod tests {
 
     #[test]
     fn shift_drops_leading_params() {
-        assert_eq!(run_capturing("set -- a b c d; shift 2; echo $# $1").1, "2 c\n");
+        assert_eq!(
+            run_capturing("set -- a b c d; shift 2; echo $# $1").1,
+            "2 c\n"
+        );
     }
 
     #[test]
@@ -4382,7 +4509,11 @@ mod tests {
             let (status, out, err) =
                 run_capturing(&format!("set -- -a -b; getopts ab {bad}; echo \"rc=$?\""));
             assert_eq!((status, out.as_str()), (0, "rc=2\n"), "getopts ab {bad}");
-            assert_eq!(err, format!("td-sh: getopts: line 1: {named}: bad variable name\n"), "{bad}");
+            assert_eq!(
+                err,
+                format!("td-sh: getopts: line 1: {named}: bad variable name\n"),
+                "{bad}"
+            );
         }
         // A good name is untouched in every respect, which needs the letter and
         // the cursor asserted and not merely the absence of a complaint.
@@ -4390,7 +4521,11 @@ mod tests {
             let (status, out, err) = run_capturing(&format!(
                 "set -- -a -b; getopts ab {ok}; echo \"${ok}/$OPTIND\""
             ));
-            assert_eq!((status, out.as_str(), err.as_str()), (0, "a/2\n", ""), "{ok}");
+            assert_eq!(
+                (status, out.as_str(), err.as_str()),
+                (0, "a/2\n", ""),
+                "{ok}"
+            );
         }
         // Status 2 on EVERY path: the end-of-options one reached no name check
         // at all before, and reported 1.
@@ -4512,8 +4647,7 @@ mod tests {
         // what makes the silence above a choice rather than a missing check.
         // Fatal with it, `shift` being special, so the status is half the claim.
         for bad in ["oops", "-1", "+1", "' 2'", "1x"] {
-            let (status, out, err) =
-                run_capturing(&format!("set -- a b; shift {bad}; echo SAME"));
+            let (status, out, err) = run_capturing(&format!("set -- a b; shift {bad}; echo SAME"));
             assert_eq!((status, out.as_str()), (2, ""), "shift {bad}");
             assert!(err.contains("Illegal number"), "shift {bad}: {err:?}");
         }
@@ -4521,17 +4655,25 @@ mod tests {
         // so 2^31 SEGFAULTS busybox 1.37.0 (exit 139) and 99999999999999999999
         // leaves `$#` at 3 over two parameters.
         for bad in ["2147483648", "4294967296", "99999999999999999999"] {
-            let (status, out, err) =
-                run_capturing(&format!("set -- a b; shift {bad}; echo SAME"));
+            let (status, out, err) = run_capturing(&format!("set -- a b; shift {bad}; echo SAME"));
             assert_eq!((status, out.as_str()), (2, ""), "shift {bad}");
             assert!(err.contains("Illegal number"), "shift {bad}: {err:?}");
         }
         // ash resets the getopts cursor only AFTER that early return, so a
         // FAILED shift leaves it where it was and a successful one restarts it.
         for (src, want) in [
-            ("set -- -a -b; getopts ab o; shift 99; getopts ab p", "ab 3\n"),
-            ("set -- -a -b -c; getopts abc o; shift 1; getopts abc p", "ab 2\n"),
-            ("set -- -a -b; getopts ab o; shift 0; getopts ab p", "aa 2\n"),
+            (
+                "set -- -a -b; getopts ab o; shift 99; getopts ab p",
+                "ab 3\n",
+            ),
+            (
+                "set -- -a -b -c; getopts abc o; shift 1; getopts abc p",
+                "ab 2\n",
+            ),
+            (
+                "set -- -a -b; getopts ab o; shift 0; getopts ab p",
+                "aa 2\n",
+            ),
         ] {
             let (_, out, err) = run_capturing(&format!("{src}; echo \"$o$p $OPTIND\""));
             assert_eq!(out, want, "{src}");
@@ -4576,8 +4718,14 @@ mod tests {
         // unspecified and bash unsets the function there; the chain does not.
         for (src, want) in [
             ("a() { echo FUNC; }; unset a; a", "FUNC\n"),
-            ("a=v; a() { echo FUNC; }; unset a; a; echo \"[${a-U}]\"", "FUNC\n[U]\n"),
-            ("a=v; a() { echo FUNC; }; unset -v a; a; echo \"[${a-U}]\"", "FUNC\n[U]\n"),
+            (
+                "a=v; a() { echo FUNC; }; unset a; a; echo \"[${a-U}]\"",
+                "FUNC\n[U]\n",
+            ),
+            (
+                "a=v; a() { echo FUNC; }; unset -v a; a; echo \"[${a-U}]\"",
+                "FUNC\n[U]\n",
+            ),
             // `-f` still takes it, and the LAST flag wins as the option loop keeps it.
             ("a() { echo FUNC; }; unset -f a; a; echo done", "done\n"),
             ("a() { echo FUNC; }; unset -v -f a; a; echo done", "done\n"),
@@ -4597,10 +4745,14 @@ mod tests {
         // Only a child sees the difference; the in-process half is that both read
         // as absent.
         for (src, want) in [
-            ("a=A; f() { local a=L; unset a; echo \"[${a-U}]\"; }; f; echo \"after[$a]\"",
-             "[U]\nafter[A]\n"),
-            ("a=A; f() { local a; unset a; echo \"[${a-U}]\"; }; f; echo \"after[$a]\"",
-             "[U]\nafter[A]\n"),
+            (
+                "a=A; f() { local a=L; unset a; echo \"[${a-U}]\"; }; f; echo \"after[$a]\"",
+                "[U]\nafter[A]\n",
+            ),
+            (
+                "a=A; f() { local a; unset a; echo \"[${a-U}]\"; }; f; echo \"after[$a]\"",
+                "[U]\nafter[A]\n",
+            ),
             ("export a=A; unset a; echo \"[${a-U}]\"", "[U]\n"),
         ] {
             let (_, out, err) = run_capturing(src);
@@ -4647,7 +4799,10 @@ mod tests {
         for (src, want) in [
             ("a=1; unset -- a; echo \"[${a-U}]\"", "[U]\n"),
             ("f() { echo FUNC; }; unset -fv f; f", "FUNC\n"),
-            ("a=1; f() { echo FUNC; }; unset -vf a f; echo \"a=[$a]\"", "a=[1]\n"),
+            (
+                "a=1; f() { echo FUNC; }; unset -vf a f; echo \"a=[$a]\"",
+                "a=[1]\n",
+            ),
             ("a=1; unset -v -- a; echo \"[${a-U}]\"", "[U]\n"),
         ] {
             let (_, out, err) = run_capturing(src);
@@ -4674,21 +4829,38 @@ mod tests {
         // dash leaves the outer value visible, and td-sh followed dash. ash is the
         // first reference, and every expectation here was read off it.
         for (src, want) in [
-            ("a=A; f() { local a; echo \"[$a]\"; }; f; echo \"after[$a]\"", "[]\nafter[A]\n"),
+            (
+                "a=A; f() { local a; echo \"[$a]\"; }; f; echo \"after[$a]\"",
+                "[]\nafter[A]\n",
+            ),
             // Only the valueless form: `=` still assigns, and a later plain
             // assignment is unaffected.
             ("a=A; f() { local a=B; echo \"[$a]\"; }; f", "[B]\n"),
-            ("a=A; f() { local a; a=C; echo \"[$a]\"; }; f; echo \"after[$a]\"", "[C]\nafter[A]\n"),
+            (
+                "a=A; f() { local a; a=C; echo \"[$a]\"; }; f; echo \"after[$a]\"",
+                "[C]\nafter[A]\n",
+            ),
             // Every name in the list, not just the first.
-            ("a=A; f() { local b a c; echo \"[$a][$b][$c]\"; }; f", "[][][]\n"),
+            (
+                "a=A; f() { local b a c; echo \"[$a][$b][$c]\"; }; f",
+                "[][][]\n",
+            ),
             // A REPEAT declaration in the same frame is the one case ash skips, so
             // this must NOT unset what the first one assigned.
-            ("x=0; f() { local x=1; echo $x; local x; echo $x; }; f; echo $x", "1\n1\n0\n"),
+            (
+                "x=0; f() { local x=1; echo $x; local x; echo $x; }; f; echo $x",
+                "1\n1\n0\n",
+            ),
             // ...and a repeat that DOES carry a value still assigns.
-            ("x=0; f() { local x; local x=9; echo \"[$x]\"; }; f; echo $x", "[9]\n0\n"),
+            (
+                "x=0; f() { local x; local x=9; echo \"[$x]\"; }; f; echo $x",
+                "[9]\n0\n",
+            ),
             // A nested frame unsets what the outer frame localised.
-            ("x=0; g() { local x; echo \"g[$x]\"; }; f() { local x=1; g; echo \"f[$x]\"; }; f",
-             "g[]\nf[1]\n"),
+            (
+                "x=0; g() { local x; echo \"g[$x]\"; }; f() { local x=1; g; echo \"f[$x]\"; }; f",
+                "g[]\nf[1]\n",
+            ),
         ] {
             let (_, out, err) = run_capturing(src);
             assert_eq!(out, want, "{src}: {err}");
@@ -4704,15 +4876,26 @@ mod tests {
         // localised name reads unset while its attributes survive. Only a child can
         // see the attribute half; `a_localised_name_still_exports_once_assigned` in
         // tests/conformance.rs covers that. These are the in-process half.
-        assert_eq!(run_capturing("export x=G; f() { local x; echo \"[${x-UNSET}]\"; }; f").1,
-                   "[UNSET]\n");
-        assert_eq!(run_capturing("export x=G; f() { local x; }; f; echo \"[$x]\"").1, "[G]\n");
+        assert_eq!(
+            run_capturing("export x=G; f() { local x; echo \"[${x-UNSET}]\"; }; f").1,
+            "[UNSET]\n"
+        );
+        assert_eq!(
+            run_capturing("export x=G; f() { local x; }; f; echo \"[$x]\"").1,
+            "[G]\n"
+        );
         // The same state reached the other way: `export x` before any value.
-        assert_eq!(run_capturing("export x; echo \"[${x-UNSET}]\"").1, "[UNSET]\n");
+        assert_eq!(
+            run_capturing("export x; echo \"[${x-UNSET}]\"").1,
+            "[UNSET]\n"
+        );
         assert_eq!(run_capturing("export x; x=H; echo \"[$x]\"").1, "[H]\n");
         // An attributes-only entry is still a VARIABLE, so `unset` takes it and
         // leaves a function of the same name alone.
-        assert_eq!(run_capturing("export x; x() { echo fn; }; unset x; x").1, "fn\n");
+        assert_eq!(
+            run_capturing("export x; x() { echo fn; }; unset x; x").1,
+            "fn\n"
+        );
     }
 
     #[test]
@@ -4722,14 +4905,28 @@ mod tests {
         // terminating unwind defers it for the EXIT trap. Miss either and the
         // repeat looks fresh and wrongly unsets. All measured on ash.
         for (src, want) in [
-            ("x=G; f() { local x=F; (local x; echo \"${x-UNSET}\"); }; f", "F\n"),
-            ("x=G; f() { local x=F; echo \"$(local x; echo ${x-UNSET})\"; }; f", "F\n"),
-            ("x=G; trap 'local x; echo ${x-UNSET}' EXIT; f() { local x=F; exit 7; }; f", "F\n"),
+            (
+                "x=G; f() { local x=F; (local x; echo \"${x-UNSET}\"); }; f",
+                "F\n",
+            ),
+            (
+                "x=G; f() { local x=F; echo \"$(local x; echo ${x-UNSET})\"; }; f",
+                "F\n",
+            ),
+            (
+                "x=G; trap 'local x; echo ${x-UNSET}' EXIT; f() { local x=F; exit 7; }; f",
+                "F\n",
+            ),
             // A name the dead frame did NOT declare is still a fresh declaration.
-            ("x=G; trap 'local y; echo ${y-UNSET}' EXIT; f() { local x=F; exit 7; }; f",
-             "UNSET\n"),
+            (
+                "x=G; trap 'local y; echo ${y-UNSET}' EXIT; f() { local x=F; exit 7; }; f",
+                "UNSET\n",
+            ),
             // A subshell's own `local` is still its own: it does not escape.
-            ("x=G; f() { (local x=S; echo \"in[$x]\"); echo \"out[$x]\"; }; f", "in[S]\nout[G]\n"),
+            (
+                "x=G; f() { (local x=S; echo \"in[$x]\"); echo \"out[$x]\"; }; f",
+                "in[S]\nout[G]\n",
+            ),
         ] {
             let (_, out, err) = run_capturing(src);
             assert_eq!(out, want, "{src}: {err}");
@@ -4744,9 +4941,14 @@ mod tests {
         // kept them in a list of their own, where the repeat check could not see
         // them; they are in the frame's list now. All measured on ash.
         for (src, want) in [
-            ("a=A; f() { local a; echo \"[${a-U}]\"; }; a=B f; echo \"after[$a]\"",
-             "[B]\nafter[A]\n"),
-            ("a=A; f() { local a b; echo \"[${a-U}][${b-U}]\"; }; a=B b=C f", "[B][C]\n"),
+            (
+                "a=A; f() { local a; echo \"[${a-U}]\"; }; a=B f; echo \"after[$a]\"",
+                "[B]\nafter[A]\n",
+            ),
+            (
+                "a=A; f() { local a b; echo \"[${a-U}][${b-U}]\"; }; a=B b=C f",
+                "[B][C]\n",
+            ),
             // The `=` form assigns over it, as it always did.
             ("f() { local a=C; echo \"[$a]\"; }; a=B f", "[C]\n"),
             // A name the call did NOT prefix is still a fresh declaration.
@@ -4783,10 +4985,16 @@ mod tests {
         ] {
             let (code, out, err) = run_capturing(src);
             assert_eq!((code, out.as_str()), (2, ""), "{src}: {err}");
-            assert!(err.contains("local: line 1: r: is read only"), "{src}: {err}");
+            assert!(
+                err.contains("local: line 1: r: is read only"),
+                "{src}: {err}"
+            );
         }
         let (_, _, err) = run_capturing("readonly r=1; r=2");
-        assert!(err.contains("r: is read only") && !err.contains("local:"), "{err}");
+        assert!(
+            err.contains("r: is read only") && !err.contains("local:"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -4806,7 +5014,8 @@ mod tests {
         );
         assert_eq!(out, "in=2\nout=g\n");
         // A second, valueless declaration assigns nothing, so the value survives.
-        let (_, out, _) = run_capturing("f() { local foo=bar; local foo; echo \"[${foo-u}]\"; }; f");
+        let (_, out, _) =
+            run_capturing("f() { local foo=bar; local foo; echo \"[${foo-u}]\"; }; f");
         assert_eq!(out, "[bar]\n");
     }
 
@@ -4845,7 +5054,12 @@ mod tests {
         }
         // Options dash HAS are accepted, whether or not td-sh acts on them, and a
         // bare `-o` is not an option name.
-        for src in ["set -e -u -x", "set -a; set -n; set -m", "set -o noglob", "set -o"] {
+        for src in [
+            "set -e -u -x",
+            "set -a; set -n; set -m",
+            "set -o noglob",
+            "set -o",
+        ] {
             let (status, _, err) = run_capturing(src);
             assert_eq!((status, err.as_str()), (0, ""), "{src}");
         }
@@ -4860,39 +5074,144 @@ mod tests {
         // A FATAL refusal reaches no `echo`, so the two output columns are what
         // says which of the two kinds it was.
         for (src, err, out, code) in [
-            ("jobs -Z", "td-sh: jobs: line 1: illegal option -Z\n", "after=2\n", 0),
-            ("wait -Z", "td-sh: wait: line 1: illegal option -Z\n", "after=2\n", 0),
-            ("read -Z", "td-sh: read: line 1: illegal option -Z\n", "after=2\n", 0),
-            ("unalias -Z", "td-sh: unalias: line 1: illegal option -Z\n", "after=2\n", 0),
-            ("cd -Z", "td-sh: cd: line 1: illegal option -Z\n", "after=2\n", 0),
-            ("umask -Z", "td-sh: umask: line 1: illegal option -Z\n", "after=2\n", 0),
-            ("pwd -Z", "td-sh: pwd: line 1: illegal option -Z\n", "after=2\n", 0),
-            ("command -x true", "td-sh: command: line 1: illegal option -x\n", "after=2\n", 0),
-            ("set -o bogus", "td-sh: set: line 1: illegal option -o bogus\n", "after=1\n", 0),
-            ("set +o bogus", "td-sh: set: line 1: illegal option +o bogus\n", "after=1\n", 0),
+            (
+                "jobs -Z",
+                "td-sh: jobs: line 1: illegal option -Z\n",
+                "after=2\n",
+                0,
+            ),
+            (
+                "wait -Z",
+                "td-sh: wait: line 1: illegal option -Z\n",
+                "after=2\n",
+                0,
+            ),
+            (
+                "read -Z",
+                "td-sh: read: line 1: illegal option -Z\n",
+                "after=2\n",
+                0,
+            ),
+            (
+                "unalias -Z",
+                "td-sh: unalias: line 1: illegal option -Z\n",
+                "after=2\n",
+                0,
+            ),
+            (
+                "cd -Z",
+                "td-sh: cd: line 1: illegal option -Z\n",
+                "after=2\n",
+                0,
+            ),
+            (
+                "umask -Z",
+                "td-sh: umask: line 1: illegal option -Z\n",
+                "after=2\n",
+                0,
+            ),
+            (
+                "pwd -Z",
+                "td-sh: pwd: line 1: illegal option -Z\n",
+                "after=2\n",
+                0,
+            ),
+            (
+                "command -x true",
+                "td-sh: command: line 1: illegal option -x\n",
+                "after=2\n",
+                0,
+            ),
+            (
+                "set -o bogus",
+                "td-sh: set: line 1: illegal option -o bogus\n",
+                "after=1\n",
+                0,
+            ),
+            (
+                "set +o bogus",
+                "td-sh: set: line 1: illegal option +o bogus\n",
+                "after=1\n",
+                0,
+            ),
             ("set -q", "td-sh: set: line 1: illegal option -q\n", "", 2),
-            ("unset -z", "td-sh: unset: line 1: illegal option -z\n", "", 2),
-            ("export -q", "td-sh: export: line 1: illegal option -q\n", "", 2),
-            ("readonly -q", "td-sh: readonly: line 1: illegal option -q\n", "", 2),
+            (
+                "unset -z",
+                "td-sh: unset: line 1: illegal option -z\n",
+                "",
+                2,
+            ),
+            (
+                "export -q",
+                "td-sh: export: line 1: illegal option -q\n",
+                "",
+                2,
+            ),
+            (
+                "readonly -q",
+                "td-sh: readonly: line 1: illegal option -q\n",
+                "",
+                2,
+            ),
             ("trap -Z", "td-sh: trap: line 1: illegal option -Z\n", "", 2),
             (". -Z", "td-sh: .: line 1: illegal option -Z\n", "", 2),
-            ("source -Z", "td-sh: source: line 1: illegal option -Z\n", "", 2),
+            (
+                "source -Z",
+                "td-sh: source: line 1: illegal option -Z\n",
+                "",
+                2,
+            ),
             ("exec -Z", "td-sh: exec: line 1: illegal option -Z\n", "", 2),
             // The option scan runs BEFORE the no-command check, so a bad one is
             // fatal even where `exec` would otherwise have done nothing.
-            ("exec -aX -Z", "td-sh: exec: line 1: illegal option -Z\n", "", 2),
+            (
+                "exec -aX -Z",
+                "td-sh: exec: line 1: illegal option -Z\n",
+                "",
+                2,
+            ),
             // A CLUSTER is read letter by letter, so the refusal names the one
             // it stopped on rather than the word that carried it -- whichever
             // position in the word the bad letter is in.
-            ("cd -Zq", "td-sh: cd: line 1: illegal option -Z\n", "after=2\n", 0),
-            ("jobs -xy", "td-sh: jobs: line 1: illegal option -x\n", "after=2\n", 0),
-            ("jobs -pZ", "td-sh: jobs: line 1: illegal option -Z\n", "after=2\n", 0),
-            ("wait -xy", "td-sh: wait: line 1: illegal option -x\n", "after=2\n", 0),
+            (
+                "cd -Zq",
+                "td-sh: cd: line 1: illegal option -Z\n",
+                "after=2\n",
+                0,
+            ),
+            (
+                "jobs -xy",
+                "td-sh: jobs: line 1: illegal option -x\n",
+                "after=2\n",
+                0,
+            ),
+            (
+                "jobs -pZ",
+                "td-sh: jobs: line 1: illegal option -Z\n",
+                "after=2\n",
+                0,
+            ),
+            (
+                "wait -xy",
+                "td-sh: wait: line 1: illegal option -x\n",
+                "after=2\n",
+                0,
+            ),
             // `exec` can only ever show the bad-first one: `a` eats its word.
-            ("exec -Za", "td-sh: exec: line 1: illegal option -Z\n", "", 2),
+            (
+                "exec -Za",
+                "td-sh: exec: line 1: illegal option -Z\n",
+                "",
+                2,
+            ),
             // The one ash spells with a capital, and the one that carries no
             // name: a bare `fprintf` (ash.c:11714), not `nextopt`'s.
-            ("set -- -Z; getopts a: o", "Illegal option -Z\n", "after=0\n", 0),
+            (
+                "set -- -Z; getopts a: o",
+                "Illegal option -Z\n",
+                "after=0\n",
+                0,
+            ),
         ] {
             let (status, o, e) = run_capturing(&format!("{src}; echo after=$?"));
             assert_eq!((status, o.as_str(), e.as_str()), (code, out, err), "{src}");
@@ -4907,22 +5226,67 @@ mod tests {
     #[test]
     fn a_missing_option_argument_and_a_non_option_are_ashs_too() {
         for (src, err, out, code) in [
-            ("read -p", "td-sh: read: line 1: no arg for -p option\n", "after=2\n", 0),
-            ("read -u", "td-sh: read: line 1: no arg for -u option\n", "after=2\n", 0),
+            (
+                "read -p",
+                "td-sh: read: line 1: no arg for -p option\n",
+                "after=2\n",
+                0,
+            ),
+            (
+                "read -u",
+                "td-sh: read: line 1: no arg for -u option\n",
+                "after=2\n",
+                0,
+            ),
             // `exec`'s is `nextopt`'s too, and fatal because `exec` is special.
-            ("exec -a", "td-sh: exec: line 1: no arg for -a option\n", "", 2),
-            ("set -- -a; getopts a: o", "No arg for -a option\n", "after=0\n", 0),
-            ("wait -", "td-sh: wait: line 1: Illegal number: -\n", "after=2\n", 0),
-            ("wait -- -5", "td-sh: wait: line 1: Illegal number: -5\n", "after=2\n", 0),
+            (
+                "exec -a",
+                "td-sh: exec: line 1: no arg for -a option\n",
+                "",
+                2,
+            ),
+            (
+                "set -- -a; getopts a: o",
+                "No arg for -a option\n",
+                "after=0\n",
+                0,
+            ),
+            (
+                "wait -",
+                "td-sh: wait: line 1: Illegal number: -\n",
+                "after=2\n",
+                0,
+            ),
+            (
+                "wait -- -5",
+                "td-sh: wait: line 1: Illegal number: -5\n",
+                "after=2\n",
+                0,
+            ),
             // `999` is a number, so the scan has STOPPED by `-Z`; `wait x -Z`
             // would fail on `x` first and pin nothing.
-            ("wait 999 -Z", "td-sh: wait: line 1: Illegal number: -Z\n", "after=2\n", 0),
+            (
+                "wait 999 -Z",
+                "td-sh: wait: line 1: Illegal number: -Z\n",
+                "after=2\n",
+                0,
+            ),
             // Still td-sh's word for an operand rather than ash's `no such
             // job`; what this pins is that `-` reaches that path at all.
-            ("jobs -", "td-sh: jobs: line 1: -: selecting a job is not supported\n", "after=2\n", 0),
+            (
+                "jobs -",
+                "td-sh: jobs: line 1: -: selecting a job is not supported\n",
+                "after=2\n",
+                0,
+            ),
             // `unaliascmd` returns on the `a` without reading the rest, so the
             // cluster's ORDER decides -- the one builtin where it does.
-            ("alias q=x; unalias -Za", "td-sh: unalias: line 1: illegal option -Z\n", "after=2\n", 0),
+            (
+                "alias q=x; unalias -Za",
+                "td-sh: unalias: line 1: illegal option -Z\n",
+                "after=2\n",
+                0,
+            ),
         ] {
             let (status, o, e) = run_capturing(&format!("{src}; echo after=$?"));
             assert_eq!((status, o.as_str(), e.as_str()), (code, out, err), "{src}");
@@ -4946,7 +5310,10 @@ mod tests {
     fn traps_two_refusals_are_worded_alike() {
         for src in ["trap - -Z", "trap '' -Z"] {
             let (status, _o, e) = run_capturing(&format!("{src}; echo after=$?"));
-            assert_eq!((status, e.as_str()), (0, "td-sh: trap: line 1: -Z: invalid signal specification\n"));
+            assert_eq!(
+                (status, e.as_str()),
+                (0, "td-sh: trap: line 1: -Z: invalid signal specification\n")
+            );
         }
         let (_s, out, _e) = run_capturing("trap a BOGUS; echo after=$?");
         assert_eq!(out, "after=1\n");
@@ -4979,11 +5346,17 @@ mod tests {
         let (status, out, err) =
             run_capturing("for i in 1 2 3; do echo hi; break oops; done; echo AFTER");
         assert_eq!((status, out.as_str()), (2, "hi\n"));
-        assert!(err.contains("break: line 1: Illegal number: oops"), "{err:?}");
+        assert!(
+            err.contains("break: line 1: Illegal number: oops"),
+            "{err:?}"
+        );
         let (status, out, err) =
             run_capturing("for i in 1 2 3; do echo hi; continue oops; done; echo AFTER");
         assert_eq!((status, out.as_str()), (2, "hi\n"));
-        assert!(err.contains("continue: line 1: Illegal number: oops"), "{err:?}");
+        assert!(
+            err.contains("continue: line 1: Illegal number: oops"),
+            "{err:?}"
+        );
         // `is_all_digits` is busybox's rule, so a sign disqualifies either way even
         // though dash's `atomax10` accepts `+1`.
         for bad in ["0", "-1", "+1", "1x", "''", "' 1'"] {
@@ -4994,10 +5367,12 @@ mod tests {
         // NUMBER, not a huge count, so it must not reach the non-fatal overrun
         // branch below it.
         for bad in ["oops", "2147483648"] {
-            let (status, out, err) =
-                run_capturing(&format!("set -- a b; shift {bad}; echo AFTER"));
+            let (status, out, err) = run_capturing(&format!("set -- a b; shift {bad}; echo AFTER"));
             assert_eq!((status, out.as_str()), (2, ""), "shift {bad}");
-            assert!(err.contains(&format!("shift: line 1: Illegal number: {bad}")), "{err:?}");
+            assert!(
+                err.contains(&format!("shift: line 1: Illegal number: {bad}")),
+                "{err:?}"
+            );
         }
     }
 
@@ -5005,11 +5380,14 @@ mod tests {
     fn a_wide_status_is_narrowed_to_a_byte_as_ashs_uint8_t_is() {
         // `number()` accepts these, so what narrows them is the STORE, not the
         // parse. dash keeps 256/257/300/2147483647; ash is `uint8_t exitstatus`.
-        for (operand, want) in
-            [("255", "255"), ("256", "0"), ("257", "1"), ("300", "44"), ("2147483647", "255")]
-        {
-            let (_, out, _) =
-                run_capturing(&format!("f() {{ return {operand}; }}; f; echo $?"));
+        for (operand, want) in [
+            ("255", "255"),
+            ("256", "0"),
+            ("257", "1"),
+            ("300", "44"),
+            ("2147483647", "255"),
+        ] {
+            let (_, out, _) = run_capturing(&format!("f() {{ return {operand}; }}; f; echo $?"));
             assert_eq!(out, format!("{want}\n"), "return {operand}");
         }
         // Everywhere `$?` can be reached from, not just a function return: a
@@ -5036,14 +5414,28 @@ mod tests {
         // Sign, non-digit and empty fail `number()` in both references; the two
         // over-INT_MAX operands are dash's rule, since ash's `atoi` overflows there.
         // These are special builtins, so the failure ends the script.
-        for bad in ["-1", "-2", "abc", "1x", "''", "2147483648", "99999999999999999999"] {
+        for bad in [
+            "-1",
+            "-2",
+            "abc",
+            "1x",
+            "''",
+            "2147483648",
+            "99999999999999999999",
+        ] {
             let (status, out, err) = run_capturing(&format!("exit {bad}; echo AFTER"));
             assert_eq!((status, out.as_str()), (2, ""), "exit {bad}");
-            assert!(err.contains("exit: line 1: Illegal number:"), "exit {bad}: {err:?}");
+            assert!(
+                err.contains("exit: line 1: Illegal number:"),
+                "exit {bad}: {err:?}"
+            );
             let (status, out, err) =
                 run_capturing(&format!("f() {{ return {bad}; }}; f; echo AFTER"));
             assert_eq!((status, out.as_str()), (2, ""), "return {bad}");
-            assert!(err.contains("return: line 1: Illegal number:"), "return {bad}: {err:?}");
+            assert!(
+                err.contains("return: line 1: Illegal number:"),
+                "return {bad}: {err:?}"
+            );
         }
     }
 
@@ -5199,8 +5591,7 @@ mod tests {
         assert!(sh.get_var("PWD").is_none());
         let _ = super::cd(&mut sh, &["cd".into(), "/tmp".into()]);
         let _ = super::cd(&mut sh, &["cd".into(), "/".into()]);
-        let exported: Vec<String> =
-            sh.exported_env().into_iter().map(|(k, _)| k).collect();
+        let exported: Vec<String> = sh.exported_env().into_iter().map(|(k, _)| k).collect();
         for want in ["PWD", "OLDPWD"] {
             assert!(exported.contains(&want.to_string()), "{want} not exported");
         }
@@ -5320,7 +5711,11 @@ mod tests {
         std::fs::write(dir.join("s.sh"), "echo \"in:[$1][$2] n=$#\"\n").unwrap();
         std::fs::write(dir.join("r.sh"), "echo \"in:[$1] n=$#\"; return 3\n").unwrap();
         std::fs::write(dir.join("set.sh"), "set -- SRC\n").unwrap();
-        std::fs::write(dir.join("opt.sh"), "getopts ab i; echo \"inner:[$i][$OPTIND]\"\n").unwrap();
+        std::fs::write(
+            dir.join("opt.sh"),
+            "getopts ab i; echo \"inner:[$i][$OPTIND]\"\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("exit.sh"), "exit 0\n").unwrap();
         let d = dir.display();
         for w in [".", "source"] {
@@ -5362,7 +5757,11 @@ mod tests {
             for src in ["--x ./s.sh", "---", "--x"] {
                 let (st, _o, err) = sh(&format!("{w} {src}; echo AFTER"));
                 assert_eq!(st, 2, "{w} {src}");
-                assert_eq!(err.trim_end(), format!("td-sh: {w}: line 1: illegal option --"), "{w} {src}");
+                assert_eq!(
+                    err.trim_end(),
+                    format!("td-sh: {w}: line 1: illegal option --"),
+                    "{w} {src}"
+                );
             }
             // `--` with NO operand after it is the no-operand case, not an
             // option error: status 2 and the script CARRIES ON. That is the one
@@ -5373,13 +5772,15 @@ mod tests {
             }
 
             // Operands become the file's parameters and the caller's come back.
-            let (_s, out, _e) =
-                sh(&format!("set -- keep me; {w} ./s.sh a b; echo \"after:[$1][$2] n=$#\""));
+            let (_s, out, _e) = sh(&format!(
+                "set -- keep me; {w} ./s.sh a b; echo \"after:[$1][$2] n=$#\""
+            ));
             assert_eq!(out, "in:[a][b] n=2\nafter:[keep][me] n=2\n", "{w}");
             // Fewer operands than the caller had, and none at all where the
             // caller had some -- `$#` has to follow, not just `$1`.
-            let (_s, out, _e) =
-                sh(&format!("set -- keep me; {w} ./s.sh solo; echo \"after:[$1] n=$#\""));
+            let (_s, out, _e) = sh(&format!(
+                "set -- keep me; {w} ./s.sh solo; echo \"after:[$1] n=$#\""
+            ));
             assert_eq!(out, "in:[solo][] n=1\nafter:[keep] n=2\n", "{w}");
             let (_s, out, _e) = sh(&format!("{w} ./s.sh a b; echo \"after:[$1] n=$#\""));
             assert_eq!(out, "in:[a][b] n=2\nafter:[] n=0\n", "{w}");
@@ -5387,20 +5788,24 @@ mod tests {
             // nothing was saved, so the file's own `set --` leaks out. With
             // operands the same `set --` is undone. That pair is what makes the
             // save conditional rather than unconditional over an empty vector.
-            let (_s, out, _e) =
-                sh(&format!("set -- keep me; {w} ./s.sh; echo \"after:[$1] n=$#\""));
+            let (_s, out, _e) = sh(&format!(
+                "set -- keep me; {w} ./s.sh; echo \"after:[$1] n=$#\""
+            ));
             assert_eq!(out, "in:[keep][me] n=2\nafter:[keep] n=2\n", "{w}");
-            let (_s, out, _e) =
-                sh(&format!("set -- keep me; {w} ./set.sh; echo \"after:[$1] n=$#\""));
+            let (_s, out, _e) = sh(&format!(
+                "set -- keep me; {w} ./set.sh; echo \"after:[$1] n=$#\""
+            ));
             assert_eq!(out, "after:[SRC] n=1\n", "{w}");
-            let (_s, out, _e) =
-                sh(&format!("set -- keep me; {w} ./set.sh a; echo \"after:[$1] n=$#\""));
+            let (_s, out, _e) = sh(&format!(
+                "set -- keep me; {w} ./set.sh a; echo \"after:[$1] n=$#\""
+            ));
             assert_eq!(out, "after:[keep] n=2\n", "{w}");
             // An EMPTY operand is still an operand: ash decides on the argument
             // being THERE (`args_need_save = argv[0]`, a pointer) and not on
             // what it holds, so `. f ""` saves the frame and `$1` is empty.
-            let (_s, out, _e) =
-                sh(&format!("set -- keep me; {w} ./set.sh ''; echo \"after:[$1] n=$#\""));
+            let (_s, out, _e) = sh(&format!(
+                "set -- keep me; {w} ./set.sh ''; echo \"after:[$1] n=$#\""
+            ));
             assert_eq!(out, "after:[keep] n=2\n", "{w} empty operand");
             let (_s, out, _e) = sh(&format!("{w} ./s.sh ''"));
             assert_eq!(out, "in:[][] n=1\n", "{w} empty operand is $1");
@@ -5471,13 +5876,25 @@ mod tests {
         // On a special builtin an unknown option ends the script. `n` and `p`
         // are the only two that are not (`nextopt("np")`, ash.c:14137).
         for (src, err) in [
-            ("export -z x; echo reached", "td-sh: export: line 1: illegal option -z\n"),
-            ("readonly -q x; echo reached", "td-sh: readonly: line 1: illegal option -q\n"),
+            (
+                "export -z x; echo reached",
+                "td-sh: export: line 1: illegal option -z\n",
+            ),
+            (
+                "readonly -q x; echo reached",
+                "td-sh: readonly: line 1: illegal option -q\n",
+            ),
             // ash reads the WHOLE cluster, so a bad letter after a good one is
             // still fatal -- and names the letter it stopped on, not the word.
             // dash calls nextopt once and would list and exit 0.
-            ("export -px; echo reached", "td-sh: export: line 1: illegal option -x\n"),
-            ("readonly -pq; echo reached", "td-sh: readonly: line 1: illegal option -q\n"),
+            (
+                "export -px; echo reached",
+                "td-sh: export: line 1: illegal option -x\n",
+            ),
+            (
+                "readonly -pq; echo reached",
+                "td-sh: readonly: line 1: illegal option -q\n",
+            ),
         ] {
             let (status, out, e) = run_capturing(src);
             assert_eq!((status, out.as_str(), e.as_str()), (2, "", err), "{src}");
@@ -5496,7 +5913,10 @@ mod tests {
             let src = format!("TDN=1; export TDN; export {opts} TDN; export -p");
             let (status, out, err) = run_capturing(&src);
             assert_eq!((status, err.as_str()), (0, ""), "{opts}");
-            assert!(!out.contains("export TDN"), "{opts} left it exported: {out:?}");
+            assert!(
+                !out.contains("export TDN"),
+                "{opts} left it exported: {out:?}"
+            );
         }
         // `-p` on its own must NOT do that: it is accepted and ignored, so a
         // name beside it stays exported.
@@ -5529,7 +5949,11 @@ mod tests {
         // A CLONE must not carry it back: these are threads over one `Shell`,
         // so "the subshell did not leak" is a property of this shell rather
         // than of the fork every other one gets it from.
-        for form in ["(export -n TDN)", "x=$(export -n TDN)", "export -n TDN | cat"] {
+        for form in [
+            "(export -n TDN)",
+            "x=$(export -n TDN)",
+            "export -n TDN | cat",
+        ] {
             let src = format!("TDN=1; export TDN; {form}; export -p");
             let (_, out, _) = run_capturing(&src);
             assert!(out.contains("export TDN='1'"), "{form} leaked: {out:?}");
@@ -5545,7 +5969,10 @@ mod tests {
         // making this name readonly: preserving an attribute it never applied
         // would pass the obvious spelling and still be wrong. The third is the
         // other half of "ignores it" -- it must not unexport either.
-        for src in ["readonly -n R; R=2; echo reached", "R=1; readonly R; readonly -n R; R=2"] {
+        for src in [
+            "readonly -n R; R=2; echo reached",
+            "R=1; readonly R; readonly -n R; R=2",
+        ] {
             let (status, out, err) = run_capturing(src);
             assert_eq!((status, out.as_str()), (2, ""), "{src}");
             assert!(err.contains("is read only"), "{src}: {err:?}");
@@ -5566,7 +5993,10 @@ mod tests {
         assert_eq!(out, "[UNSET]\n");
         // EVERY operand, not just the first.
         let (_, out, _) = run_capturing("A=1; B=2; export A B; export -n A B; export -p");
-        assert!(!out.contains("export A") && !out.contains("export B"), "{out:?}");
+        assert!(
+            !out.contains("export A") && !out.contains("export B"),
+            "{out:?}"
+        );
     }
 
     /// A frame's binding for a name that did not exist is undone by UNSETTING
@@ -5641,7 +6071,8 @@ mod tests {
         }
         // The flag would outlive `set +a`, so a survivor here reaches a CHILD's
         // environment and not just the listing.
-        let (_, out, _) = run_capturing("set -a; f() { local MAIL; }; f; set +a; MAIL=x; export -p");
+        let (_, out, _) =
+            run_capturing("set -a; f() { local MAIL; }; f; set +a; MAIL=x; export -p");
         assert!(!lists(&out, "MAIL"), "{out:?}");
         // A name ash does NOT seed still gets the survivor -- `LC_ALL` is in
         // `varinit_data` but under an `#if` this build has off, which is why
@@ -5765,7 +6196,10 @@ mod tests {
         for name in SEEDED {
             let src = format!("unset {name}; set -a; readonly {name}; {name}=x");
             let (_, _, err) = run_capturing(&src);
-            assert!(err.contains(&format!("{name}: is read only")), "{src}: {err:?}");
+            assert!(
+                err.contains(&format!("{name}: is read only")),
+                "{src}: {err:?}"
+            );
         }
     }
 
@@ -5789,7 +6223,10 @@ mod tests {
         // the insert that consults `set -a` never runs. The second spelling is
         // the one that pins it -- the first passes even if the existing arm
         // consults `set -a` too, since it is off.
-        for src in ["TDR=1; readonly TDR; export -p", "TDR=1; set -a; readonly TDR; set +a; export -p"] {
+        for src in [
+            "TDR=1; readonly TDR; export -p",
+            "TDR=1; set -a; readonly TDR; set +a; export -p",
+        ] {
             let (_, out, _) = run_capturing(src);
             assert!(!out.contains("export TDR"), "{src}: {out:?}");
         }
@@ -5808,7 +6245,10 @@ mod tests {
             ("x='a b'; command export n=$x; echo \"[$n]\"", "[a b]\n"),
             // ... however many times it is repeated, and through `-p`, `--` and a
             // cluster, which is where ash's loop goes round again.
-            ("x='a b'; command command export n=$x; echo \"[$n]\"", "[a b]\n"),
+            (
+                "x='a b'; command command export n=$x; echo \"[$n]\"",
+                "[a b]\n",
+            ),
             ("x='a b'; command -p export n=$x; echo \"[$n]\"", "[a b]\n"),
             ("x='a b'; command -pp export n=$x; echo \"[$n]\"", "[a b]\n"),
             ("x='a b'; command -- export n=$x; echo \"[$n]\"", "[a b]\n"),
@@ -5818,12 +6258,24 @@ mod tests {
                 "x='a b'; set -- command -p; \"$@\" export n=$x; echo \"[$n]\"",
                 "[a b]\n",
             ),
-            ("x='a b'; e=; command $e export n=$x; echo \"[$n]\"", "[a b]\n"),
+            (
+                "x='a b'; e=; command $e export n=$x; echo \"[$n]\"",
+                "[a b]\n",
+            ),
             // An option `command` does not take, or a bare `-`, means `command`
             // itself runs -- and it is a regular builtin, so nothing is spared.
-            ("x='a b'; command -pv export n=$x; echo \"[$n]\"", "export\n[]\n"),
-            ("x='a b'; command -x export n=$x 2>/dev/null; echo \"[$n]\"", "[]\n"),
-            ("x='a b'; command - export n=$x 2>/dev/null; echo \"[$n]\"", "[]\n"),
+            (
+                "x='a b'; command -pv export n=$x; echo \"[$n]\"",
+                "export\n[]\n",
+            ),
+            (
+                "x='a b'; command -x export n=$x 2>/dev/null; echo \"[$n]\"",
+                "[]\n",
+            ),
+            (
+                "x='a b'; command - export n=$x 2>/dev/null; echo \"[$n]\"",
+                "[]\n",
+            ),
             // A function named `command` is not the builtin, so the walk never
             // starts and all three fields reach it.
             (
@@ -5837,7 +6289,10 @@ mod tests {
                 "[a b]\n",
             ),
             // Several operands, and only the assignment-shaped ones are spared.
-            ("x='a b'; export a=1 n=$x b=2; echo \"[$a][$n][$b]\"", "[1][a b][2]\n"),
+            (
+                "x='a b'; export a=1 n=$x b=2; echo \"[$a][$n][$b]\"",
+                "[1][a b][2]\n",
+            ),
             // HOME after `=` and after an unquoted `:`, which plain assignment
             // already did and these did not.
             ("HOME=/h; export n=~/x; echo \"[$n]\"", "[/h/x]\n"),
@@ -5866,7 +6321,10 @@ mod tests {
             // word is resolved once and nothing re-decides it.
             ("x='a b'; f() { echo \"[$#]\"; }; f n=$x", "[2]\n"),
             ("x='a b'; f() { echo \"[$#]\"; }; f export n=$x", "[3]\n"),
-            ("x='a b'; printf '[%s]' export n=$x; echo", "[export][n=a][b]\n"),
+            (
+                "x='a b'; printf '[%s]' export n=$x; echo",
+                "[export][n=a][b]\n",
+            ),
             // The walk stops at the FIRST field that is not `command`, even when
             // one word carried several and a later one names a declaration builtin.
             (
@@ -5971,12 +6429,18 @@ mod tests {
         for src in ["type -p cd", "type -- cd", "type -x cd"] {
             assert_eq!(run_capturing(src).1, "cd\n", "{src}");
         }
-        assert_eq!(run_capturing("type -p -p"), (127, String::new(), String::new()));
+        assert_eq!(
+            run_capturing("type -p -p"),
+            (127, String::new(), String::new())
+        );
         // A bare `-` IS that first option: ash tests the first byte and never
         // asks how long the word is, so it is not a name that cannot be placed.
         assert_eq!(run_capturing("type -"), (0, String::new(), String::new()));
         assert_eq!(run_capturing("type - cd").1, "cd\n");
-        assert_eq!(run_capturing("type -p td_sh_zz"), (127, String::new(), String::new()));
+        assert_eq!(
+            run_capturing("type -p td_sh_zz"),
+            (127, String::new(), String::new())
+        );
     }
 
     #[test]
@@ -5998,7 +6462,11 @@ mod tests {
             "q is an alias for ls -l\n"
         );
         // `-V` only ever SETS the verbose wording: `-v` after it cannot clear it.
-        for src in ["command -vV export", "command -Vv export", "command -VV export"] {
+        for src in [
+            "command -vV export",
+            "command -Vv export",
+            "command -VV export",
+        ] {
             assert_eq!(
                 run_capturing(src).1,
                 "export is a special shell builtin\n",
@@ -6039,7 +6507,10 @@ mod tests {
         assert_eq!(run_capturing("PATH=. command -p echo hi").1, "hi\n");
         assert_eq!(run_capturing("PATH=zz; command -p :; echo $PATH").1, "zz\n");
         // `type` has no such option: its lone flag only turns the wording off.
-        assert_eq!(run_capturing("PATH=. type -p Cargo.toml").1, "./Cargo.toml\n");
+        assert_eq!(
+            run_capturing("PATH=. type -p Cargo.toml").1,
+            "./Cargo.toml\n"
+        );
         // `-p` counts wherever it sits in the cluster, including after a query
         // letter -- the two are read independently.
         for src in ["command -vp Cargo.toml", "command -Vp Cargo.toml"] {
@@ -6135,7 +6606,10 @@ mod tests {
             "[00042][+42][ 42][ -0042]"
         );
         // Dynamic width/precision consumed from `*` arguments, in order.
-        assert_eq!(run_capturing("printf '[%*.*f]' 8 2 3.14159").1, "[    3.14]");
+        assert_eq!(
+            run_capturing("printf '[%*.*f]' 8 2 3.14159").1,
+            "[    3.14]"
+        );
     }
 
     #[test]
@@ -6145,7 +6619,10 @@ mod tests {
             run_capturing("printf '[%x][%#x][%o][%#o][%X]' 255 255 8 8 255").1,
             "[ff][0xff][10][010][FF]"
         );
-        assert_eq!(run_capturing("printf '[%u]' -1").1, "[18446744073709551615]");
+        assert_eq!(
+            run_capturing("printf '[%u]' -1").1,
+            "[18446744073709551615]"
+        );
         // Base-0 parsing: 0x hex and leading-0 octal in the argument.
         assert_eq!(run_capturing("printf '%d %d' 0x55 055").1, "85 45");
         // `'c` uses the first byte's code.
@@ -6161,7 +6638,10 @@ mod tests {
         // %b \c stops all further output.
         assert_eq!(run_capturing("printf 'x%by' 'a\\cb'").1, "xa");
         // %f defaults to 6 digits of precision; honour width and the 0 flag.
-        assert_eq!(run_capturing("printf '[%.2f][%08.3f]' 3.14159 3.14").1, "[3.14][0003.140]");
+        assert_eq!(
+            run_capturing("printf '[%.2f][%08.3f]' 3.14159 3.14").1,
+            "[3.14][0003.140]"
+        );
     }
 
     #[test]
@@ -6183,10 +6663,16 @@ mod tests {
         // Both printf paths take busybox's converter, so both know `\e`, take a
         // two-digit `\xHH`, and stop an octal run before it leaves a byte.
         assert_eq!(run_capturing("printf '[\\x41\\e\\777]'").1, "[A\x1b?7]");
-        assert_eq!(run_capturing("printf '[%b]' '\\x41\\e\\777'").1, "[A\x1b?7]");
+        assert_eq!(
+            run_capturing("printf '[%b]' '\\x41\\e\\777'").1,
+            "[A\x1b?7]"
+        );
         // The `\0` marker is `%b`'s alone: in a format string `\0101` is the
         // three-digit `\010` and a literal `1`, not `\101`.
-        assert_eq!(run_capturing("printf '[\\0101][%b]' '\\0101'").1, "[\u{8}1][A]");
+        assert_eq!(
+            run_capturing("printf '[\\0101][%b]' '\\0101'").1,
+            "[\u{8}1][A]"
+        );
         // Format-string `\c` abandons the whole run -- the rest of the format,
         // and the cycling that would consume the remaining arguments -- but is
         // not an error.
@@ -6232,7 +6718,10 @@ mod tests {
             "[3.140000e+00][3.140000E+00][3e+00][3.e+00][-3.140e+00]"
         );
         // A three-digit exponent keeps all three digits.
-        assert_eq!(run_capturing("printf '[%e][%e]' 1e300 1e-300").1, "[1.000000e+300][1.000000e-300]");
+        assert_eq!(
+            run_capturing("printf '[%e][%e]' 1e300 1e-300").1,
+            "[1.000000e+300][1.000000e-300]"
+        );
         // %g picks style f or e by exponent and drops trailing zeros; `#` keeps
         // them (and the point), and precision 0 means 1 significant digit.
         assert_eq!(
@@ -6244,18 +6733,25 @@ mod tests {
             "[1.23e+03][0.0001][3.][0.000123457]"
         );
         // Rounding that carries into the next decade must re-pick the style.
-        assert_eq!(run_capturing("printf '[%g][%g]' 9.9999995 999999.5").1, "[10][1e+06]");
+        assert_eq!(
+            run_capturing("printf '[%g][%g]' 9.9999995 999999.5").1,
+            "[10][1e+06]"
+        );
         // With `#`, that carry keeps style f's (zero) fraction count -- glibc's
         // spelling, which dash/ash inherit. A carry that stays inside style e
         // (9995 at .3g), and a value style f never applied to (exponent below
         // -4), both keep the full fraction.
         assert_eq!(
-            run_capturing("printf '[%#.6g][%#.3g][%#.3g][%#.6g][%#.6g]' 999999.5 999.5 9995 1000000 0.00001").1,
+            run_capturing(
+                "printf '[%#.6g][%#.3g][%#.3g][%#.6g][%#.6g]' 999999.5 999.5 9995 1000000 0.00001"
+            )
+            .1,
             "[1.e+06][1.e+03][1.00e+04][1.00000e+06][1.00000e-05]"
         );
         // Width/justification/zero-fill apply to the whole converted field.
         assert_eq!(
-            run_capturing("printf '[%12.3e][%-12.3e][%012.3e][%015.4g]' -3.14 -3.14 -3.14 1234567").1,
+            run_capturing("printf '[%12.3e][%-12.3e][%012.3e][%015.4g]' -3.14 -3.14 -3.14 1234567")
+                .1,
             "[  -3.140e+00][-3.140e+00  ][-003.140e+00][0000001.235e+06]"
         );
     }
@@ -6268,12 +6764,21 @@ mod tests {
             run_capturing("printf '[%f][%F][%e][%E][%g][%G]' inf inf inf -inf nan nan").1,
             "[inf][INF][inf][-INF][nan][NAN]"
         );
-        assert_eq!(run_capturing("printf '[%08f][%-8f][%+f]' inf inf inf").1, "[     inf][inf     ][+inf]");
+        assert_eq!(
+            run_capturing("printf '[%08f][%-8f][%+f]' inf inf inf").1,
+            "[     inf][inf     ][+inf]"
+        );
         // The sign bit survives, including on NaN and negative zero.
-        assert_eq!(run_capturing("printf '[%f][%g][%e]' -nan -0.0 -0").1, "[-nan][-0][-0.000000e+00]");
+        assert_eq!(
+            run_capturing("printf '[%f][%g][%e]' -nan -0.0 -0").1,
+            "[-nan][-0][-0.000000e+00]"
+        );
         // INFINITY/NAN spellings are case-insensitive; a longer word keeps only
         // the prefix that converted, which is then an unconverted tail.
-        assert_eq!(run_capturing("printf '[%f][%f]' INFINITY Inf").1, "[inf][inf]");
+        assert_eq!(
+            run_capturing("printf '[%f][%f]' INFINITY Inf").1,
+            "[inf][inf]"
+        );
         let (status, out, _) = run_capturing("printf '[%f]' infinit");
         assert_eq!(out, "[inf]");
         assert_eq!(status, 1);
@@ -6283,7 +6788,10 @@ mod tests {
     fn printf_float_operands_follow_strtod() {
         // C99 hex floats convert like strtod, including a bare `0x` (which is not
         // a prefix at all, so only the `0` converts and `x` is a tail).
-        assert_eq!(run_capturing("printf '[%g][%g][%g][%g]' 0x1p2 0x1.8p1 0X1P-1 0x10").1, "[4][3][0.5][16]");
+        assert_eq!(
+            run_capturing("printf '[%g][%g][%g][%g]' 0x1p2 0x1.8p1 0X1P-1 0x10").1,
+            "[4][3][0.5][16]"
+        );
         // Exactly representable subnormals are in range; inexact ones are not.
         assert_eq!(run_capturing("printf '[%.0e]' 0x1p-1074").1, "[5e-324]");
         assert_eq!(run_capturing("printf '[%.0e]' 0x1p-1074").0, 0);
@@ -6308,7 +6816,14 @@ mod tests {
         assert_eq!(out, "[inf]");
         assert_eq!(status, 1);
         assert!(err.contains("out of range"), "err: {err:?}");
-        assert_eq!(run_capturing("printf '[%f]' 1e-400"), (1, "[0.000000]".into(), "td-sh: 1e-400: Numerical result out of range\n".into()));
+        assert_eq!(
+            run_capturing("printf '[%f]' 1e-400"),
+            (
+                1,
+                "[0.000000]".into(),
+                "td-sh: 1e-400: Numerical result out of range\n".into()
+            )
+        );
         // Leading whitespace is skipped; a wholly unconvertible operand is 0.
         assert_eq!(run_capturing("printf '[%g]' '  42'").1, "[42]");
         let (status, out, err) = run_capturing("printf '[%f]' abc");
@@ -6316,8 +6831,14 @@ mod tests {
         assert_eq!(status, 1);
         assert!(err.contains("expected a numeric value"), "err: {err:?}");
         // An operand that is absent, or present but empty, is a silent zero.
-        assert_eq!(run_capturing("printf '[%f]'"), (0, "[0.000000]".into(), String::new()));
-        assert_eq!(run_capturing("printf '[%f]' ''"), (0, "[0.000000]".into(), String::new()));
+        assert_eq!(
+            run_capturing("printf '[%f]'"),
+            (0, "[0.000000]".into(), String::new())
+        );
+        assert_eq!(
+            run_capturing("printf '[%f]' ''"),
+            (0, "[0.000000]".into(), String::new())
+        );
     }
 
     #[test]
@@ -6329,13 +6850,28 @@ mod tests {
             "2 a []\n2 b []\n"
         );
         // An option argument may be smooshed or the following word.
-        assert_eq!(run_capturing("set -- -c10; getopts 'c:' o; echo \"$OPTIND $o $OPTARG\"").1, "2 c 10\n");
-        assert_eq!(run_capturing("set -- -c 10; getopts 'c:' o; echo \"$OPTIND $o $OPTARG\"").1, "3 c 10\n");
+        assert_eq!(
+            run_capturing("set -- -c10; getopts 'c:' o; echo \"$OPTIND $o $OPTARG\"").1,
+            "2 c 10\n"
+        );
+        assert_eq!(
+            run_capturing("set -- -c 10; getopts 'c:' o; echo \"$OPTIND $o $OPTARG\"").1,
+            "3 c 10\n"
+        );
         // End of options: status 1 and `?`, both for exhaustion and for `--`.
-        assert_eq!(run_capturing("set -- ; getopts 'a' o; echo \"$? $o\"").1, "1 ?\n");
-        assert_eq!(run_capturing("set -- -- -a; getopts 'a' o; echo \"$? $o $OPTIND\"").1, "1 ? 2\n");
+        assert_eq!(
+            run_capturing("set -- ; getopts 'a' o; echo \"$? $o\"").1,
+            "1 ?\n"
+        );
+        assert_eq!(
+            run_capturing("set -- -- -a; getopts 'a' o; echo \"$? $o $OPTIND\"").1,
+            "1 ? 2\n"
+        );
         // A non-option word stops the scan without being consumed.
-        assert_eq!(run_capturing("set -- x -a; getopts 'a' o; echo \"$? $OPTIND\"").1, "1 1\n");
+        assert_eq!(
+            run_capturing("set -- x -a; getopts 'a' o; echo \"$? $OPTIND\"").1,
+            "1 1\n"
+        );
     }
 
     #[test]
@@ -6352,12 +6888,21 @@ mod tests {
         assert_eq!(err, "No arg for -a option\n");
         // A leading `:` selects silent mode: the letter comes back in OPTARG, and a
         // missing argument reports `:` instead of `?`.
-        assert_eq!(run_capturing("set -- -Z; getopts ':a:' o; echo \"$o $OPTARG\"").1, "? Z\n");
-        assert_eq!(run_capturing("set -- -a; getopts ':a:' o; echo \"$o $OPTARG\"").1, ": a\n");
+        assert_eq!(
+            run_capturing("set -- -Z; getopts ':a:' o; echo \"$o $OPTARG\"").1,
+            "? Z\n"
+        );
+        assert_eq!(
+            run_capturing("set -- -a; getopts ':a:' o; echo \"$o $OPTARG\"").1,
+            ": a\n"
+        );
         // New positional parameters restart the scan (dash), so a second loop over
         // a fresh argument list does not resume at the old OPTIND.
         assert_eq!(
-            run_capturing("set -- -a; getopts 'a' o; set -- -b; getopts 'b' o; echo \"$o $OPTIND\"").1,
+            run_capturing(
+                "set -- -a; getopts 'a' o; set -- -b; getopts 'b' o; echo \"$o $OPTIND\""
+            )
+            .1,
             "b 2\n"
         );
         // Assigning OPTIND restarts at a word boundary even when the value does
@@ -6372,14 +6917,26 @@ mod tests {
         // from the start, the caller resumes where it left off, and `shift` (which
         // renumbers them) restarts it.
         assert_eq!(
-            run_capturing("set -- -a; getopts a o; f() { getopts b i; echo \"$? $i $OPTIND\"; }; f -b").1,
+            run_capturing(
+                "set -- -a; getopts a o; f() { getopts b i; echo \"$? $i $OPTIND\"; }; f -b"
+            )
+            .1,
             "0 b 2\n"
         );
-        assert_eq!(run_capturing("set -- -a -b; getopts a o; shift; getopts b o; echo $o").1, "b\n");
+        assert_eq!(
+            run_capturing("set -- -a -b; getopts a o; shift; getopts b o; echo $o").1,
+            "b\n"
+        );
         // `set` moves only the hidden cursor: $OPTIND keeps the value the last
         // getopts published, so a readonly OPTIND is not disturbed either.
-        assert_eq!(run_capturing("set -- -a; getopts a o; set -- x; echo $OPTIND").1, "2\n");
-        assert_eq!(run_capturing("readonly OPTIND; set -- x; echo ok=$?").1, "ok=0\n");
+        assert_eq!(
+            run_capturing("set -- -a; getopts a o; set -- x; echo $OPTIND").1,
+            "2\n"
+        );
+        assert_eq!(
+            run_capturing("readonly OPTIND; set -- x; echo ok=$?").1,
+            "ok=0\n"
+        );
         // ash's `getoptsreset`: all-digits is taken, anything else IS the number
         // 1, silently -- `is_number` guards the only `Illegal number` raise, so
         // no OPTIND value reaches it.
@@ -6418,7 +6975,10 @@ mod tests {
         let long = "set -- -a -a -a -a -a -a -a -b -b -c -c -c";
         for (v, want) in [("010", "c 11\n"), ("10", "c 11\n"), ("8", "b 9\n")] {
             assert_eq!(
-                run_capturing(&format!("{long}; OPTIND={v}; getopts abc o; echo \"$o $OPTIND\"")).1,
+                run_capturing(&format!(
+                    "{long}; OPTIND={v}; getopts abc o; echo \"$o $OPTIND\""
+                ))
+                .1,
                 want,
                 "OPTIND={v}"
             );
@@ -6528,7 +7088,10 @@ mod tests {
         for bad in ["1bad", "a-b", ""] {
             let (status, _, err) = run_capturing(&format!("echo hi | read '{bad}'"));
             assert_eq!(status, 1, "read '{bad}'");
-            assert!(err.contains(&format!("'{bad}': bad variable name")), "err: {err:?}");
+            assert!(
+                err.contains(&format!("'{bad}': bad variable name")),
+                "err: {err:?}"
+            );
         }
     }
 
@@ -6541,9 +7104,18 @@ mod tests {
             "[a\\b]\n"
         );
         // A value-taking letter swallows the rest of its word, so `-rn1` is `-r -n 1`.
-        assert_eq!(run_capturing("echo hi | { read -rn1 v; echo var=$v; }").1, "var=h\n");
-        assert_eq!(run_capturing("echo hi | { read -pfoo v; echo $v; }").1, "hi\n");
-        assert_eq!(run_capturing("echo hi | { read -p 'x? ' v; echo $v; }"), (0, "hi\n".into(), String::new()));
+        assert_eq!(
+            run_capturing("echo hi | { read -rn1 v; echo var=$v; }").1,
+            "var=h\n"
+        );
+        assert_eq!(
+            run_capturing("echo hi | { read -pfoo v; echo $v; }").1,
+            "hi\n"
+        );
+        assert_eq!(
+            run_capturing("echo hi | { read -p 'x? ' v; echo $v; }"),
+            (0, "hi\n".into(), String::new())
+        );
         // An unknown letter is still a usage error rather than silently ignored.
         for bad in ["-N 1", "-q", "-zz"] {
             let (status, _, err) = run_capturing(&format!("echo hi | {{ read {bad} v; }}"));
@@ -6557,30 +7129,57 @@ mod tests {
         // With no names there is no field splitting AND no IFS trimming, so the
         // surrounding blanks survive -- `read` and `read REPLY` are not the same
         // command, which is the whole point of the `argv[0]` test in ash.
-        assert_eq!(run_capturing("printf ' a \\n' | { read; printf '[%s]' \"$REPLY\"; }").1, "[ a ]");
-        assert_eq!(run_capturing("printf ' a \\n' | { read REPLY; printf '[%s]' \"$REPLY\"; }").1, "[a]");
+        assert_eq!(
+            run_capturing("printf ' a \\n' | { read; printf '[%s]' \"$REPLY\"; }").1,
+            "[ a ]"
+        );
+        assert_eq!(
+            run_capturing("printf ' a \\n' | { read REPLY; printf '[%s]' \"$REPLY\"; }").1,
+            "[a]"
+        );
     }
 
     #[test]
     fn read_counts_bytes_for_dash_n() {
-        assert_eq!(run_capturing("printf abcd | { read -n 2 v; echo \"[$v] $?\"; }").1, "[ab] 0\n");
+        assert_eq!(
+            run_capturing("printf abcd | { read -n 2 v; echo \"[$v] $?\"; }").1,
+            "[ab] 0\n"
+        );
         // `-n 0` is no limit, not "read nothing" (bash 3.2 does this too).
-        assert_eq!(run_capturing("printf abcd | { read -n 0 v; echo \"[$v] $?\"; }").1, "[abcd] 1\n");
+        assert_eq!(
+            run_capturing("printf abcd | { read -n 0 v; echo \"[$v] $?\"; }").1,
+            "[abcd] 1\n"
+        );
         // The count ticks on a SWALLOWED byte too -- ash's `continue` reaches the
         // `while (--nchars)` -- so the backslash of `\ab` spends one of the two.
-        assert_eq!(run_capturing("printf '\\\\ab\\n' | { read -n 2 v; echo \"[$v]\"; }").1, "[a]\n");
+        assert_eq!(
+            run_capturing("printf '\\\\ab\\n' | { read -n 2 v; echo \"[$v]\"; }").1,
+            "[a]\n"
+        );
         // A delimiter still ends it early, and that is not a failure.
-        assert_eq!(run_capturing("echo b | { read -n 2 v; echo \"[$v] $?\"; }").1, "[b] 0\n");
+        assert_eq!(
+            run_capturing("echo b | { read -n 2 v; echo \"[$v] $?\"; }").1,
+            "[b] 0\n"
+        );
     }
 
     #[test]
     fn read_delimiter_is_dash_d() {
-        assert_eq!(run_capturing("printf 'a:b' | { read -d : v; echo \"[$v] $?\"; }").1, "[a] 0\n");
+        assert_eq!(
+            run_capturing("printf 'a:b' | { read -d : v; echo \"[$v] $?\"; }").1,
+            "[a] 0\n"
+        );
         // `-d ''` leaves the delimiter at the string terminator, so it is NUL --
         // and it works only because ash tests the delimiter BEFORE skipping NULs.
-        assert_eq!(run_capturing("printf 'a\\0b\\n' | { read -d '' v; echo \"[$v] $?\"; }").1, "[a] 0\n");
+        assert_eq!(
+            run_capturing("printf 'a\\0b\\n' | { read -d '' v; echo \"[$v] $?\"; }").1,
+            "[a] 0\n"
+        );
         // The value may look like an option; it is consumed as `-d`'s argument.
-        assert_eq!(run_capturing("echo foo-bar | { read -d -; echo reply=$REPLY; }").1, "reply=foo\n");
+        assert_eq!(
+            run_capturing("echo foo-bar | { read -d -; echo reply=$REPLY; }").1,
+            "reply=foo\n"
+        );
         // An ESCAPED delimiter is literal and does not end the read -- ash tests
         // the backslash before the delimiter, so `\:` survives a `-d :`. Under
         // `-r` there is no escape and the backslash itself is the value's last byte.
@@ -6608,12 +7207,18 @@ mod tests {
         // that with a two-step `startword`, and collapsing it to one step makes
         // this `[X][:Y]`.
         assert_eq!(
-            run_capturing("printf 'X :Y\\n' | { IFS=': ' read x y; printf '[%s][%s]' \"$x\" \"$y\"; }").1,
+            run_capturing(
+                "printf 'X :Y\\n' | { IFS=': ' read x y; printf '[%s][%s]' \"$x\" \"$y\"; }"
+            )
+            .1,
             "[X][Y]"
         );
         // A NUL byte is DROPPED, not stored -- and not merely tested after the
         // delimiter, which is a weaker property that `-d ''` alone would show.
-        assert_eq!(run_capturing("printf 'a\\0b\\n' | { read v; printf '[%s]' \"$v\"; }").1, "[ab]");
+        assert_eq!(
+            run_capturing("printf 'a\\0b\\n' | { read v; printf '[%s]' \"$v\"; }").1,
+            "[ab]"
+        );
     }
 
     #[test]
@@ -6621,13 +7226,24 @@ mod tests {
         // The last name takes the remainder WITH its delimiters, except that a
         // single trailing non-space delimiter is dropped when the fields exactly
         // filled the names.
-        let f = |s: &str| run_capturing(&format!("printf '{s}' | {{ IFS=: read x y; echo \"|$x|$y|\"; }}")).1;
+        let f = |s: &str| {
+            run_capturing(&format!(
+                "printf '{s}' | {{ IFS=: read x y; echo \"|$x|$y|\"; }}"
+            ))
+            .1
+        };
         assert_eq!(f("X:Y:\\n"), "|X|Y|\n");
         assert_eq!(f("X:Y:Z:\\n"), "|X|Y:Z:|\n");
         assert_eq!(f("X:Y:Z\\n"), "|X|Y:Z|\n");
         // Trailing whitespace IFS goes regardless, and an unfilled name is empty.
-        assert_eq!(run_capturing("printf 'a b \\n' | { read v; echo \"[$v]\"; }").1, "[a b]\n");
-        assert_eq!(run_capturing("printf 'one\\n' | { read a b c; echo \"|$a|$b|$c|\"; }").1, "|one|||\n");
+        assert_eq!(
+            run_capturing("printf 'a b \\n' | { read v; echo \"[$v]\"; }").1,
+            "[a b]\n"
+        );
+        assert_eq!(
+            run_capturing("printf 'one\\n' | { read a b c; echo \"|$a|$b|$c|\"; }").1,
+            "|one|||\n"
+        );
     }
 
     #[test]
@@ -6635,7 +7251,11 @@ mod tests {
         // busybox's `bb_strtou` takes decimal digits and nothing else, so a sign,
         // a leading space or a trailing letter is an error -- with a message naming
         // which option, and status 2.
-        for (opt, msg) in [("n", "invalid count"), ("u", "invalid file descriptor"), ("t", "invalid timeout")] {
+        for (opt, msg) in [
+            ("n", "invalid count"),
+            ("u", "invalid file descriptor"),
+            ("t", "invalid timeout"),
+        ] {
             for bad in ["-1", "+2", " 2", "2x", "x"] {
                 let (status, _, err) = run_capturing(&format!("read -{opt} '{bad}' v </dev/null"));
                 assert_eq!(status, 2, "read -{opt} '{bad}'");
@@ -6646,7 +7266,8 @@ mod tests {
         // read, a non-digit among those three is an error, and anything past them
         // is ignored. So `0.123x` is invalid while `0.123456xyz` is not.
         for good in ["1", "0.5", "1.", "00.5", "0.123x", "0.123456xyz"] {
-            let (status, _, err) = run_capturing(&format!("read -t {good} v </dev/null; echo rc=$?"));
+            let (status, _, err) =
+                run_capturing(&format!("read -t {good} v </dev/null; echo rc=$?"));
             assert_eq!((status, err.as_str()), (0, ""), "read -t {good}");
         }
         // `-n` and `-u` land in an `int` and stop at INT_MAX; `-t`'s milliseconds
@@ -6656,14 +7277,20 @@ mod tests {
             assert_eq!(status, 2, "read -{opt} 2147483648");
             assert!(err.contains(msg), "err: {err:?}");
         }
-        assert_eq!(run_capturing("read -t 2147483648 v </dev/null; echo $?").1, "1\n");
+        assert_eq!(
+            run_capturing("read -t 2147483648 v </dev/null; echo $?").1,
+            "1\n"
+        );
         let (status, _, err) = run_capturing("read -t 4294967296 v </dev/null");
         assert_eq!(status, 2);
         assert!(err.contains("invalid timeout"), "err: {err:?}");
         for bad in [".5", "0.x", "0.1x", "0.12x", "1e3"] {
             let (status, _, err) = run_capturing(&format!("read -t {bad} v </dev/null"));
             assert_eq!(status, 2, "read -t {bad}");
-            assert!(err.contains("invalid timeout"), "read -t {bad} err: {err:?}");
+            assert!(
+                err.contains("invalid timeout"),
+                "read -t {bad} err: {err:?}"
+            );
         }
     }
 
@@ -6754,10 +7381,19 @@ mod tests {
         assert_eq!(run_capturing(&format!("test -u {dir}; echo $?")).1, "1\n");
         std::fs::remove_dir_all(&sticky).unwrap();
         // `-ef` is identity, so a path is always the same file as itself.
-        assert_eq!(run_capturing("test /dev/zero -ef /dev/zero; echo $?").1, "0\n");
-        assert_eq!(run_capturing("test /dev/zero -ef /dev/null; echo $?").1, "1\n");
+        assert_eq!(
+            run_capturing("test /dev/zero -ef /dev/zero; echo $?").1,
+            "0\n"
+        );
+        assert_eq!(
+            run_capturing("test /dev/zero -ef /dev/null; echo $?").1,
+            "1\n"
+        );
         // `-nt`/`-ot` are false when either operand cannot be stat'd.
-        assert_eq!(run_capturing("test /nonexistent -nt /dev/zero; echo $?").1, "1\n");
+        assert_eq!(
+            run_capturing("test /nonexistent -nt /dev/zero; echo $?").1,
+            "1\n"
+        );
         // `-t` takes a descriptor number: any integer is answerable, a word is not.
         assert_eq!(run_capturing("test -t 12345678910; echo $?").1, "1\n");
         assert_eq!(run_capturing("test -t invalid; echo $?").1, "2\n");
@@ -6824,7 +7460,10 @@ mod tests {
             run_capturing("alias e=echo ll='ls -l'\nalias e ll").1,
             "e='echo'\nll='ls -l'\n"
         );
-        assert_eq!(run_capturing("alias q=\"it's\"\nalias q").1, "q='it'\"'\"'s'\n");
+        assert_eq!(
+            run_capturing("alias q=\"it's\"\nalias q").1,
+            "q='it'\"'\"'s'\n"
+        );
         // A name with no `=` is a lookup, and a miss is status 1.
         assert_eq!(
             run_capturing("alias e=echo nonexistentZ; echo status=$?").1,
@@ -6835,7 +7474,10 @@ mod tests {
             "status=1\n"
         );
         // The `=` is looked for from the SECOND byte, so `--` is a lookup.
-        assert_eq!(run_capturing("alias -- foo=echo; echo status=$?").1, "status=1\n");
+        assert_eq!(
+            run_capturing("alias -- foo=echo; echo status=$?").1,
+            "status=1\n"
+        );
         assert_eq!(run_capturing("alias -- foo=echo\nfoo x").1, "x\n");
     }
 
@@ -6853,7 +7495,10 @@ mod tests {
             "127\n"
         );
         let (status, _, err) = run_capturing("unalias -z");
-        assert_eq!((status, err.as_str()), (2, "td-sh: unalias: line 1: illegal option -z\n"));
+        assert_eq!(
+            (status, err.as_str()),
+            (2, "td-sh: unalias: line 1: illegal option -z\n")
+        );
     }
 
     #[test]
@@ -6905,7 +7550,10 @@ mod tests {
     fn alias_substitution_follows_dashs_scan_rules() {
         // Only an unquoted literal in command position is a candidate, and an
         // alias is not re-entered while its own replacement is being scanned.
-        assert_eq!(run_capturing("alias echo='echo foo'\necho bar").1, "foo bar\n");
+        assert_eq!(
+            run_capturing("alias echo='echo foo'\necho bar").1,
+            "foo bar\n"
+        );
         assert_eq!(
             run_capturing("alias hi='echo hello world'\nhi\necho hi\n'hi' || echo failed").1,
             "hello world\nhi\nfailed\n"
@@ -6943,15 +7591,24 @@ mod tests {
             run_capturing("alias e_='for i in 1 2 3; do echo $i;'\ne_ done").1,
             "1\n2\n3\n"
         );
-        assert_eq!(run_capturing("alias L='{'\nL echo one; echo two; }").1, "one\ntwo\n");
-        assert_eq!(run_capturing("alias L='('\nL echo one; echo two )").1, "one\ntwo\n");
+        assert_eq!(
+            run_capturing("alias L='{'\nL echo one; echo two; }").1,
+            "one\ntwo\n"
+        );
+        assert_eq!(
+            run_capturing("alias L='('\nL echo one; echo two )").1,
+            "one\ntwo\n"
+        );
         assert_eq!(
             run_capturing("alias e_='echo 1\necho 2\necho 3'\nvar='echo foo'\ne_ ${var}").1,
             "1\n2\n3 echo foo\n"
         );
         // A reserved word wins over an alias of the same name (dash checks
         // keywords first), and a redirection target is never a candidate.
-        assert_eq!(run_capturing("alias done=echo\nfor i in 1; do echo $i; done").1, "1\n");
+        assert_eq!(
+            run_capturing("alias done=echo\nfor i in 1; do echo $i; done").1,
+            "1\n"
+        );
     }
 
     #[test]
@@ -6964,11 +7621,18 @@ mod tests {
             "right\n"
         );
         // The arm's body IS a command position, in both pattern forms.
-        assert_eq!(run_capturing("alias e=echo\ncase z in\nz) e ARM;;\nesac").1, "ARM\n");
-        assert_eq!(run_capturing("alias e=echo\ncase z in\n(z) e ARM;;\nesac").1, "ARM\n");
+        assert_eq!(
+            run_capturing("alias e=echo\ncase z in\nz) e ARM;;\nesac").1,
+            "ARM\n"
+        );
+        assert_eq!(
+            run_capturing("alias e=echo\ncase z in\n(z) e ARM;;\nesac").1,
+            "ARM\n"
+        );
         // A nested case restores the outer state on `esac`.
         assert_eq!(
-            run_capturing("alias e=echo\ncase a in\na) case b in\nb) e IN;;\nesac\ne OUT;;\nesac").1,
+            run_capturing("alias e=echo\ncase a in\na) case b in\nb) e IN;;\nesac\ne OUT;;\nesac")
+                .1,
             "IN\nOUT\n"
         );
         // A pattern list opens after `(` and continues after `|`, so neither
@@ -7001,7 +7665,10 @@ mod tests {
         );
         // A replacement that trails off in a comment comments out the rest of the
         // line it was written on, which is text the replacement does not contain.
-        assert_eq!(run_capturing("alias a='#'\na echo SURVIVES\necho after").1, "after\n");
+        assert_eq!(
+            run_capturing("alias a='#'\na echo SURVIVES\necho after").1,
+            "after\n"
+        );
         assert_eq!(
             run_capturing("alias a='echo hi #'\na SURVIVES\necho after").1,
             "hi\nafter\n"
@@ -7079,14 +7746,29 @@ mod tests {
         // ash's `showvars`: one line per name in lexicographic order, the value
         // single-quoted, and no `=` at all for a name that has no value.
         for (src, want) in [
-            ("export a=1; export b; export -p", "export a='1'\nexport b\n"),
+            (
+                "export a=1; export b; export -p",
+                "export a='1'\nexport b\n",
+            ),
             // Sorted, not insertion-ordered -- the table is a hash.
-            ("export z=1; export a=2; export -p", "export a='2'\nexport z='1'\n"),
+            (
+                "export z=1; export a=2; export -p",
+                "export a='2'\nexport z='1'\n",
+            ),
             // Bare `export` is the same listing; `-p` only suppresses nothing.
-            ("export z=1; export a=2; export", "export a='2'\nexport z='1'\n"),
-            ("export z=1; export a=2; export -pp", "export a='2'\nexport z='1'\n"),
+            (
+                "export z=1; export a=2; export",
+                "export a='2'\nexport z='1'\n",
+            ),
+            (
+                "export z=1; export a=2; export -pp",
+                "export a='2'\nexport z='1'\n",
+            ),
             // `--` ends the options and is NOT an operand, so this still lists.
-            ("export z=1; export a=2; export --", "export a='2'\nexport z='1'\n"),
+            (
+                "export z=1; export a=2; export --",
+                "export a='2'\nexport z='1'\n",
+            ),
             ("export e=; export -p", "export e=''\n"),
             // The value goes in raw: single quotes are literal for everything but
             // a quote, which closes and re-opens around a `"`-quoted run.
@@ -7329,21 +8011,36 @@ mod tests {
         assert_eq!(out, "1\n0\n");
         assert_eq!(run_capturing("trap 'echo x' INT\ntrap - int\ntrap").1, "");
         // Numbers name signals, and 0 is EXIT.
-        assert_eq!(run_capturing("trap 'echo x' 1\ntrap").1, "trap -- 'echo x' HUP\n");
-        assert_eq!(run_capturing("trap 'echo x' 0\ntrap").1, "trap -- 'echo x' EXIT\nx\n");
+        assert_eq!(
+            run_capturing("trap 'echo x' 1\ntrap").1,
+            "trap -- 'echo x' HUP\n"
+        );
+        assert_eq!(
+            run_capturing("trap 'echo x' 0\ntrap").1,
+            "trap -- 'echo x' EXIT\nx\n"
+        );
         // Untrappable signals are still accepted, as dash accepts them.
         assert_eq!(run_capturing("trap 'echo hi' KILL STOP\necho $?").1, "0\n");
         // POSIX: an unsigned first operand means every operand is a CONDITION, so
         // this resets rather than setting the action to `0`.
-        assert_eq!(run_capturing("trap 'echo noprint' EXIT\ntrap 0 EXIT\necho ok").1, "ok\n");
+        assert_eq!(
+            run_capturing("trap 'echo noprint' EXIT\ntrap 0 EXIT\necho ok").1,
+            "ok\n"
+        );
         // Out of range is a bad CONDITION, not an action that happens to be digits.
         let (_, out, _) = run_capturing("trap 'echo noprint' EXIT\ntrap 256 EXIT\necho $?");
         assert_eq!(out, "1\n");
         // Digits ONLY, as dash's `is_number` has it: with a blank in it this is an
         // action again, so it REPLACES the EXIT trap rather than resetting it.
-        assert_eq!(run_capturing("trap 'echo noprint' EXIT\ntrap ' echo spaced ' EXIT").1, "spaced\n");
+        assert_eq!(
+            run_capturing("trap 'echo noprint' EXIT\ntrap ' echo spaced ' EXIT").1,
+            "spaced\n"
+        );
         // A single operand is a condition too: `trap EXIT` clears it.
-        assert_eq!(run_capturing("trap 'echo noprint' EXIT\ntrap EXIT\necho ok").1, "ok\n");
+        assert_eq!(
+            run_capturing("trap 'echo noprint' EXIT\ntrap EXIT\necho ok").1,
+            "ok\n"
+        );
     }
 
     #[test]
@@ -7418,7 +8115,10 @@ mod tests {
             run_capturing("trap '' KILL\ntrap\necho $?").1,
             "trap -- '' KILL\n0\n"
         );
-        assert!(crate::sys::signal_get(9).is_err(), "SIGKILL is not readable or writable");
+        assert!(
+            crate::sys::signal_get(9).is_err(),
+            "SIGKILL is not readable or writable"
+        );
     }
 
     /// SIGCHLD is recorded like any other condition and NEVER handed to the
@@ -7441,7 +8141,10 @@ mod tests {
         assert_eq!(super::decode_signal("CHLD"), Some(super::SIGCHLD));
         let _held = Dispositions::held(&[super::SIGCHLD]);
         assert_eq!(run_capturing("trap '' CHLD\ntrap").1, "trap -- '' CHLD\n");
-        assert!(defaulted(super::SIGCHLD), "`trap '' CHLD` would auto-reap every child");
+        assert!(
+            defaulted(super::SIGCHLD),
+            "`trap '' CHLD` would auto-reap every child"
+        );
         assert_eq!(run_capturing("trap - CHLD\necho $?").1, "0\n");
         assert!(defaulted(super::SIGCHLD));
     }
@@ -7510,14 +8213,22 @@ mod tests {
             "sub\nshell\nEXIT TRAP\n"
         );
         // ... but a trap the subshell sets ITSELF runs when it ends.
-        assert_eq!(run_capturing("( trap 'echo inner' EXIT; echo body )\necho after").1,
-            "body\ninner\nafter\n");
+        assert_eq!(
+            run_capturing("( trap 'echo inner' EXIT; echo body )\necho after").1,
+            "body\ninner\nafter\n"
+        );
         // And it does not leak back out.
-        assert_eq!(run_capturing("( trap 'echo inner' EXIT )\ntrap").1, "inner\n");
+        assert_eq!(
+            run_capturing("( trap 'echo inner' EXIT )\ntrap").1,
+            "inner\n"
+        );
         // A trap set to IGNORE is the exception: POSIX keeps it ignored in the
         // subshell, so it is still reported there.
         assert_eq!(run_capturing("trap '' INT\n( trap )").1, "trap -- '' INT\n");
-        assert_eq!(run_capturing("trap 'echo x' INT\n( trap )\necho end").1, "end\n");
+        assert_eq!(
+            run_capturing("trap 'echo x' INT\n( trap )\necho end").1,
+            "end\n"
+        );
         // A FAILED `exec` never replaced anything, so the trap still runs. (The
         // succeeding case -- where the emulated `exec` must drop the trap the way a
         // real `execve` drops the image -- needs an external, which this harness's
@@ -7530,9 +8241,15 @@ mod tests {
     fn alias_reaches_the_positions_the_grammar_reads_by_name() {
         // A function body is a command position of its own (dash sets its checks
         // before parsing one), so an alias may supply the whole compound.
-        assert_eq!(run_capturing("alias B='{ echo yes; }'\nf()\nB\nf").1, "yes\n");
+        assert_eq!(
+            run_capturing("alias B='{ echo yes; }'\nf()\nB\nf").1,
+            "yes\n"
+        );
         // `case … in` takes the check the same way `for … in` does.
-        assert_eq!(run_capturing("alias I=in\ncase x I x) echo hit;; esac").1, "hit\n");
+        assert_eq!(
+            run_capturing("alias I=in\ncase x I x) echo hit;; esac").1,
+            "hit\n"
+        );
         // The token after a COMPOUND command is where dash looks for the
         // redirections that may follow it, and it looks with keywords and aliases
         // both on -- so an alias may supply that redirection, or a separator.
@@ -7540,7 +8257,10 @@ mod tests {
             run_capturing("alias R='>/dev/null'\n{ echo hidden; } R\necho after").1,
             "after\n"
         );
-        assert_eq!(run_capturing("alias foo='; echo X'\n(echo a) foo").1, "a\nX\n");
+        assert_eq!(
+            run_capturing("alias foo='; echo X'\n(echo a) foo").1,
+            "a\nX\n"
+        );
     }
 
     #[test]
@@ -7558,7 +8278,11 @@ mod tests {
         // options and no command, so the descriptor has to survive.
         for opts in ["--", "-a NAME", "-aNAME", "-a NAME --"] {
             let (st, out, err) = run_capturing(&format!("exec {opts} 3>&1\necho hi 1>&3"));
-            assert_eq!((st, out.as_str(), err.as_str()), (0, "hi\n", ""), "exec {opts}");
+            assert_eq!(
+                (st, out.as_str(), err.as_str()),
+                (0, "hi\n", ""),
+                "exec {opts}"
+            );
         }
     }
 
@@ -7589,7 +8313,11 @@ mod tests {
         // Attached and separate spellings both consume, leaving no command.
         for src in ["exec -a renamed", "exec -arenamed", "exec -a x -a y"] {
             let (status, out, err) = run_capturing(&format!("{src}; echo after=$?"));
-            assert_eq!((status, out.as_str(), err.as_str()), (0, "after=0\n", ""), "{src}");
+            assert_eq!(
+                (status, out.as_str(), err.as_str()),
+                (0, "after=0\n", ""),
+                "{src}"
+            );
         }
     }
 
@@ -7606,8 +8334,7 @@ mod tests {
     fn exec_failure_is_confined_to_a_subshell() {
         // `exec` must never take the rest of the script with it from an
         // in-process clone: the subshell ends, the parent carries on.
-        let (status, out, _) =
-            run_capturing("( exec no_such_cmd_xyz ) 2>/dev/null; echo after=$?");
+        let (status, out, _) = run_capturing("( exec no_such_cmd_xyz ) 2>/dev/null; echo after=$?");
         assert_eq!((status, out.as_str()), (0, "after=127\n"));
         let (_, out, _) =
             run_capturing("for i in 1 2; do ( exec no_such_cmd_xyz ) 2>/dev/null; done; echo done");
@@ -7643,13 +8370,21 @@ mod tests {
         ] {
             let (status, _, err) = run_capturing(&format!("unset {op}; echo NOTREACHED"));
             assert_eq!(status, 2, "unset {op}");
-            assert_eq!(err, format!("td-sh: unset: line 1: {named}: bad variable name\n"), "unset {op}");
+            assert_eq!(
+                err,
+                format!("td-sh: unset: line 1: {named}: bad variable name\n"),
+                "unset {op}"
+            );
         }
         // `-v` is the same path; `-f` judges no name at all, in either shell,
         // so its stderr is asserted too -- silence is the property.
         assert_eq!(
             run_capturing("unset -v '1b=c'; echo NOTREACHED"),
-            (2, String::new(), "td-sh: unset: line 1: 1b: bad variable name\n".into())
+            (
+                2,
+                String::new(),
+                "td-sh: unset: line 1: 1b: bad variable name\n".into()
+            )
         );
         assert_eq!(
             run_capturing("unset -f '1b=c'; echo rc=$?"),
@@ -7659,7 +8394,11 @@ mod tests {
         // could regress the same way, so it is pinned in the `=` form too.
         assert_eq!(
             run_capturing("readonly R=1; unset 'R=x'; echo NOTREACHED"),
-            (2, String::new(), "td-sh: unset: line 1: R: is read only\n".into())
+            (
+                2,
+                String::new(),
+                "td-sh: unset: line 1: R: is read only\n".into()
+            )
         );
         // The last of `-f`/`-v` wins, as in dash's option loop.
         assert_eq!(

@@ -137,8 +137,7 @@ impl Capture {
             // "lines dropped" marker nothing will ever write.
             return;
         }
-        if queue.lines.len() >= CAPACITY
-            || queue.bytes.saturating_add(line.len()) > CAPACITY_BYTES
+        if queue.lines.len() >= CAPACITY || queue.bytes.saturating_add(line.len()) > CAPACITY_BYTES
         {
             queue.dropped = queue.dropped.saturating_add(1);
             return;
@@ -231,7 +230,11 @@ impl Sink {
                 // world-writable log directory lets anyone replace the file
                 // this then appends to. Only components it CREATES take this
                 // mode, so an existing /var/log keeps its own.
-                match fs::DirBuilder::new().recursive(true).mode(DIR_MODE).create(dir) {
+                match fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(DIR_MODE)
+                    .create(dir)
+                {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(e) => return Err(e),
@@ -372,12 +375,13 @@ fn writer(capture: &Arc<Capture>, mut sink: Sink) {
         {
             let mut queue = lock(&capture.queue);
             while queue.lines.is_empty() && !queue.stopping {
-                let (next, _) = capture.wake.wait_timeout(queue, WRITER_TICK).unwrap_or_else(
-                    |poisoned| {
+                let (next, _) = capture
+                    .wake
+                    .wait_timeout(queue, WRITER_TICK)
+                    .unwrap_or_else(|poisoned| {
                         let (guard, timeout) = poisoned.into_inner();
                         (guard, timeout)
-                    },
-                );
+                    });
                 queue = next;
             }
             batch.extend(queue.lines.drain(..));
@@ -688,7 +692,10 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&buf), "ok");
         assert!(next_line(&mut reader, &mut buf).unwrap());
         assert_eq!(String::from_utf8_lossy(&buf), "\u{fffd}\u{fffd}");
-        assert!(!next_line(&mut reader, &mut buf).unwrap(), "EOF not reported");
+        assert!(
+            !next_line(&mut reader, &mut buf).unwrap(),
+            "EOF not reported"
+        );
 
         let unframed = vec![b'z'; MAX_LINE * 2];
         let mut reader = io::BufReader::new(&unframed[..]);

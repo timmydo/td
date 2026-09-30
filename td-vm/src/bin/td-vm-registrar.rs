@@ -73,15 +73,27 @@ impl Request {
             if *expected != "main" {
                 origin::Origin::new((*repository).into(), (*expected).into())?;
             }
-            let Self::Reserve { repository, id, branch } = request else {
+            let Self::Reserve {
+                repository,
+                id,
+                branch,
+            } = request
+            else {
                 return Err("invalid starting-commit request".into());
             };
-            return Ok(Self::Start { repository, id, branch, expected: (*expected).into() });
+            return Ok(Self::Start {
+                repository,
+                id,
+                branch,
+                expected: (*expected).into(),
+            });
         }
         let (repository, id, branch, key) = match words.as_slice() {
             ["ping"] => return Ok(Self::Ping),
             ["origin"] => return Ok(Self::Origin),
-            ["enroll", repository, id, branch, key] => (*repository, *id, Some(*branch), Some(*key)),
+            ["enroll", repository, id, branch, key] => {
+                (*repository, *id, Some(*branch), Some(*key))
+            }
             ["reserve", repository, id, branch] => (*repository, *id, Some(*branch), None),
             ["revoke", repository, id] => (*repository, *id, None, None),
             _ => return Err("invalid registrar request".into()),
@@ -122,7 +134,10 @@ impl Request {
                 branch: branch.into(),
             });
         }
-        Ok(Self::Revoke { repository: repository.into(), id: id.into() })
+        Ok(Self::Revoke {
+            repository: repository.into(),
+            id: id.into(),
+        })
     }
 }
 
@@ -298,12 +313,23 @@ impl Drop for Scratch {
     }
 }
 
-fn execute(policy: &Path, dispatcher: &Path, request: Request, lifetime: Option<&File>) -> Result<String> {
+fn execute(
+    policy: &Path,
+    dispatcher: &Path,
+    request: Request,
+    lifetime: Option<&File>,
+) -> Result<String> {
     let mut command = Command::new(dispatcher);
     command
         .env_clear()
         .current_dir("/")
-        .stdin(lifetime.map(File::try_clone).transpose()?.map(Stdio::from).unwrap_or_else(Stdio::null))
+        .stdin(
+            lifetime
+                .map(File::try_clone)
+                .transpose()?
+                .map(Stdio::from)
+                .unwrap_or_else(Stdio::null),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     let mut scratch = None;
@@ -315,7 +341,12 @@ fn execute(policy: &Path, dispatcher: &Path, request: Request, lifetime: Option<
         Request::Origin => {
             command.arg("origin").arg(policy).stdout(Stdio::piped());
         }
-        Request::Enroll { repository, id, branch, key } => {
+        Request::Enroll {
+            repository,
+            id,
+            branch,
+            key,
+        } => {
             let parent = policy.parent().ok_or("missing registry parent")?;
             let directory = parent.join(format!(
                 "registrar-{}-{}",
@@ -332,20 +363,46 @@ fn execute(policy: &Path, dispatcher: &Path, request: Request, lifetime: Option<
                 .open(&key_path)?;
             writeln!(file, "ssh-ed25519 {key}")?;
             command
-                .arg("change-origin").arg(repository).arg("enroll")
+                .arg("change-origin")
+                .arg(repository)
+                .arg("enroll")
                 .arg(policy)
                 .args([id, branch])
                 .arg(key_path);
         }
-        Request::Reserve { repository, id, branch } => {
-            command.arg("change-origin").arg(repository).arg("reserve").arg(policy).args([id, branch]);
+        Request::Reserve {
+            repository,
+            id,
+            branch,
+        } => {
+            command
+                .arg("change-origin")
+                .arg(repository)
+                .arg("reserve")
+                .arg(policy)
+                .args([id, branch]);
         }
-        Request::Start { repository, id, branch, expected } => {
-            command.arg("change-origin").arg(repository).arg("start").arg(policy)
-                .args([id, branch, expected]).stdout(Stdio::piped());
+        Request::Start {
+            repository,
+            id,
+            branch,
+            expected,
+        } => {
+            command
+                .arg("change-origin")
+                .arg(repository)
+                .arg("start")
+                .arg(policy)
+                .args([id, branch, expected])
+                .stdout(Stdio::piped());
         }
         Request::Revoke { repository, id } => {
-            command.arg("change-origin").arg(repository).arg("revoke").arg(policy).arg(id);
+            command
+                .arg("change-origin")
+                .arg(repository)
+                .arg("revoke")
+                .arg(policy)
+                .arg(id);
         }
     }
     let mut child = command.spawn()?;
@@ -422,7 +479,10 @@ fn serve(directory: &Path, policy: &Path, dispatcher: &Path, operator: u32) -> R
 fn request(directory: &Path, server: u32, words: &[String]) -> Result<()> {
     absolute(directory)?;
     let frame = format!("{HEADER}{}\n", words.join(" "));
-    let inspect_origin = matches!(Request::parse(&frame)?, Request::Origin | Request::Start { .. });
+    let inspect_origin = matches!(
+        Request::parse(&frame)?,
+        Request::Origin | Request::Start { .. }
+    );
     let mut stream = UnixStream::connect(directory.join("control"))?;
     if sys::peer_uid(&stream)? != server {
         return Err("registrar server account mismatch".into());
@@ -477,7 +537,10 @@ mod tests {
             Request::parse(&format!("{HEADER}ping\n")).ok(),
             Some(Request::Ping)
         );
-        assert!(Request::parse(&format!("{HEADER}reserve /srv/git/td.git {id} topic/subtask\n")).is_ok());
+        assert!(Request::parse(&format!(
+            "{HEADER}reserve /srv/git/td.git {id} topic/subtask\n"
+        ))
+        .is_ok());
         for body in [
             "ping\nrevoke anything",
             "ping extra",

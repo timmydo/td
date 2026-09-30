@@ -97,10 +97,7 @@ pub(crate) fn table_digest() -> Result<String, String> {
 
 /// The compiled expected basename for a seed key, if pinned.
 pub(crate) fn expected(key: &str) -> Result<Option<&'static str>, String> {
-    Ok(rows()?
-        .into_iter()
-        .find(|(k, _)| *k == key)
-        .map(|(_, b)| b))
+    Ok(rows()?.into_iter().find(|(k, _)| *k == key).map(|(_, b)| b))
 }
 
 /// Enforce the table against a freshly DERIVED basename: the key must be
@@ -147,8 +144,14 @@ mod tests {
         assert_eq!(rows, vec![("k1", "aaa-x"), ("k2", "bbb-y")]);
         assert!(parse("k1\n").is_err(), "missing basename must red");
         assert!(parse("k1 a b\n").is_err(), "extra field must red");
-        assert!(parse("k1 /td/store/aaa-x\n").is_err(), "a path is not a basename");
-        assert!(parse("k1 aaa-x\nk1 bbb-y\n").is_err(), "a duplicate key must red");
+        assert!(
+            parse("k1 /td/store/aaa-x\n").is_err(),
+            "a path is not a basename"
+        );
+        assert!(
+            parse("k1 aaa-x\nk1 bbb-y\n").is_err(),
+            "a duplicate key must red"
+        );
     }
 
     #[test]

@@ -27,11 +27,11 @@ mod scene {
     }
 }
 
+pub mod dialog;
+pub mod file_chooser;
 #[path = "../../td-compositor/src/keyboard.rs"]
 #[allow(
     dead_code,
     reason = "the shared keyboard profile is broader than one chooser"
 )]
 pub mod keyboard;
-pub mod dialog;
-pub mod file_chooser;

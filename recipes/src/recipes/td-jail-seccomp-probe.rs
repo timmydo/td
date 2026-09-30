@@ -464,7 +464,9 @@ mod tests {
         let inherited = source.find("if (argc >= 3").unwrap();
         let status = source[inherited..].find("require_status()").unwrap();
         let probes = source[inherited..].find("prove_denied_calls()").unwrap();
-        let exec = source[inherited..].find("execv(argv[2], &argv[2]);").unwrap();
+        let exec = source[inherited..]
+            .find("execv(argv[2], &argv[2]);")
+            .unwrap();
         assert!(status < probes && probes < exec);
         let denied = source
             .split_once("static int prove_denied_calls(void)")
@@ -503,13 +505,20 @@ mod tests {
         let source = source();
         let main = source.split("int main(int argc").nth(1).unwrap();
         let before = main.find("prove_i386_boundary(0)").unwrap();
-        let install = main.find("syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0").unwrap();
+        let install = main
+            .find("syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0")
+            .unwrap();
         let after = main.find("prove_i386_boundary(1)").unwrap();
         assert!(before < install && install < after);
         assert!(source.contains("WIFEXITED(status) || WEXITSTATUS(status) != 0"));
         assert!(source.contains("WIFSIGNALED(status) || WTERMSIG(status) != SIGSYS"));
-        let inherited = source.split("if (argc >= 3").nth(1).unwrap()
-            .split("if (argc == 3").next().unwrap();
+        let inherited = source
+            .split("if (argc >= 3")
+            .nth(1)
+            .unwrap()
+            .split("if (argc == 3")
+            .next()
+            .unwrap();
         assert!(!inherited.contains("prove_i386_boundary"));
     }
 
@@ -523,7 +532,10 @@ mod tests {
             "install_audit_marker_filter(SECCOMP_RET_ERRNO | EPERM)",
             "getuid() != 0 || getgid() != 0",
         ] {
-            assert!(source.contains(required), "audit barrier omitted {required}");
+            assert!(
+                source.contains(required),
+                "audit barrier omitted {required}"
+            );
         }
         assert_eq!(source.matches("return emit_audit_marker(").count(), 2);
     }

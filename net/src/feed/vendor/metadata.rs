@@ -185,7 +185,9 @@ fn read_tar(bytes: &[u8], package: &str) -> Result<Metadata, String> {
             {
                 return Err("invalid or repeated GNU crate long-name record".into());
             }
-            let name = data.strip_suffix(&[0]).ok_or("GNU crate long name is not terminated")?;
+            let name = data
+                .strip_suffix(&[0])
+                .ok_or("GNU crate long name is not terminated")?;
             let name = std::str::from_utf8(name).map_err(|_| "GNU crate long name is not UTF-8")?;
             if name.contains('\0') || !relative(name) {
                 return Err("GNU crate long name is not a plain relative path".into());
@@ -346,7 +348,10 @@ pub(super) mod tests {
     fn selected_metadata_can_use_gnu_long_names() {
         let package = "p".repeat(100);
         let mut bytes = Vec::new();
-        for (name, data) in [("Cargo.lock", "selected lock"), ("Cargo.toml", "selected manifest")] {
+        for (name, data) in [
+            ("Cargo.lock", "selected lock"),
+            ("Cargo.toml", "selected manifest"),
+        ] {
             let full = format!("{package}/{name}\0");
             gnu_entry(&mut bytes, "././@LongLink", b'L', full.as_bytes());
             gnu_entry(&mut bytes, "truncated", b'0', data.as_bytes());
@@ -359,8 +364,13 @@ pub(super) mod tests {
 
     #[test]
     fn ambiguous_and_malformed_gnu_long_names_are_refused() {
-        for data in [b"no terminator".to_vec(), b"../escape\0".to_vec(),
-            b"/absolute\0".to_vec(), b"p/inner\0hidden\0".to_vec(), format!("{}\0", "x".repeat(4096)).into_bytes()] {
+        for data in [
+            b"no terminator".to_vec(),
+            b"../escape\0".to_vec(),
+            b"/absolute\0".to_vec(),
+            b"p/inner\0hidden\0".to_vec(),
+            format!("{}\0", "x".repeat(4096)).into_bytes(),
+        ] {
             let mut bytes = archive();
             bytes.truncate(bytes.len() - BLOCK * 2);
             gnu_entry(&mut bytes, "././@LongLink", b'L', &data);

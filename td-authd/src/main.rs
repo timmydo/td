@@ -1,11 +1,8 @@
 #![deny(unsafe_code)]
 
 mod application;
-mod application_shell;
-mod shell_channel;
-mod terminal;
-mod terminal_sys;
 mod application_files;
+mod application_shell;
 mod channel;
 #[allow(
     dead_code,
@@ -13,22 +10,31 @@ mod channel;
 )]
 mod consent;
 mod deployment;
-#[allow(dead_code, reason = "shared dependency-free SHA-256 implementation")]
-#[path = "../../engine/src/sha256.rs"]
-mod sha256;
-mod launch;
-mod unlock;
-mod secret_intake;
-#[allow(dead_code, reason = "shared public credential transport and client codec")]
-mod secret_request;
-#[allow(dead_code, reason = "shared public credential transport and client codec")]
-mod secret_sys;
-mod session;
 mod inspection;
+mod launch;
 mod mount_sys;
 mod portal_files;
 mod primary_account;
+mod secret_intake;
+#[allow(
+    dead_code,
+    reason = "shared public credential transport and client codec"
+)]
+mod secret_request;
+#[allow(
+    dead_code,
+    reason = "shared public credential transport and client codec"
+)]
+mod secret_sys;
+mod session;
+#[allow(dead_code, reason = "shared dependency-free SHA-256 implementation")]
+#[path = "../../engine/src/sha256.rs"]
+mod sha256;
+mod shell_channel;
 mod sys;
+mod terminal;
+mod terminal_sys;
+mod unlock;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -46,7 +52,9 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
 
 fn run(arguments: &[String]) -> Result<(), String> {
     if let [verb, source, deployment] = arguments {
-        if verb == "request-update" { return deployment::request(source, deployment); }
+        if verb == "request-update" {
+            return deployment::request(source, deployment);
+        }
     }
     if arguments == ["prepare-portal-files"] {
         return portal_files::prepare();

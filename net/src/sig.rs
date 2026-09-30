@@ -77,7 +77,9 @@ pub(crate) fn sign_msg(pkcs8: &[u8], msg: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 pub(crate) fn verify_msg(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
-    UnparsedPublicKey::new(&ED25519, pubkey).verify(msg, sig).is_ok()
+    UnparsedPublicKey::new(&ED25519, pubkey)
+        .verify(msg, sig)
+        .is_ok()
 }
 
 /// A fresh keypair: pkcs8 private half, raw 32-byte public half.
@@ -87,8 +89,8 @@ pub(crate) fn verify_msg(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
 /// diagnostic, not a backtrace.
 pub(crate) fn keygen() -> Result<(Vec<u8>, Vec<u8>), String> {
     let rng = SystemRandom::new();
-    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
-        .map_err(|e| format!("generate ed25519 key: {e}"))?;
+    let pkcs8 =
+        Ed25519KeyPair::generate_pkcs8(&rng).map_err(|e| format!("generate ed25519 key: {e}"))?;
     let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
         .map_err(|e| format!("parse generated key: {e}"))?;
     Ok((pkcs8.as_ref().to_vec(), kp.public_key().as_ref().to_vec()))
@@ -104,7 +106,12 @@ pub(crate) fn keygen() -> Result<(Vec<u8>, Vec<u8>), String> {
 /// created exclusively (`create_new`), so an existing path is an error rather
 /// than a replacement, and the private half is `0600` from the moment it
 /// exists rather than chmod'ed after — a window is all a reader needs.
-pub(crate) fn write_keypair(priv_path: &str, pkcs8: &[u8], pub_path: &str, pubkey: &[u8]) -> Result<(), String> {
+pub(crate) fn write_keypair(
+    priv_path: &str,
+    pkcs8: &[u8],
+    pub_path: &str,
+    pubkey: &[u8],
+) -> Result<(), String> {
     write_new(priv_path, pkcs8, 0o600)?;
     write_new(pub_path, format!("{}\n", to_hex(pubkey)).as_bytes(), 0o644)
 }
@@ -132,7 +139,11 @@ mod tests {
         assert_eq!(from_hex("00017f80ff\n").unwrap(), bytes);
         assert!(from_hex("abc").is_err(), "odd length");
         assert!(from_hex("zz").is_err(), "not hex");
-        assert_eq!(from_hex("00017F80FF").unwrap(), bytes, "uppercase decodes too");
+        assert_eq!(
+            from_hex("00017F80FF").unwrap(),
+            bytes,
+            "uppercase decodes too"
+        );
         // `from_str_radix` took a sign; a signature parser must not.
         assert!(from_hex("+f").is_err(), "a signed nibble is not hex");
     }
@@ -144,7 +155,12 @@ mod tests {
     fn a_multi_byte_character_is_an_error_and_not_a_panic() {
         // All even-length, so each reaches the decoder the old form panicked in
         // rather than stopping at the length check.
-        for s in ["a\u{20ac}", "\u{20ac}\u{20ac}", "\u{00e9}\u{00e9}", "ab\u{00e9}"] {
+        for s in [
+            "a\u{20ac}",
+            "\u{20ac}\u{20ac}",
+            "\u{00e9}\u{00e9}",
+            "ab\u{00e9}",
+        ] {
             assert!(from_hex(s).is_err(), "{s:?} must be refused, not fatal");
         }
     }
@@ -160,12 +176,21 @@ mod tests {
         // The rejection half: an acceptance-only test passes against a verifier
         // that returns true unconditionally.
         let (_, other) = keygen().unwrap();
-        assert!(!verify_msg(&other, msg, &sig), "a different key must not verify");
-        assert!(!verify_msg(&pubkey, b"td-deployment-v2\n", &sig), "a changed message must not verify");
+        assert!(
+            !verify_msg(&other, msg, &sig),
+            "a different key must not verify"
+        );
+        assert!(
+            !verify_msg(&pubkey, b"td-deployment-v2\n", &sig),
+            "a changed message must not verify"
+        );
         let mut bad = sig.clone();
         if let Some(b) = bad.first_mut() {
             *b ^= 1;
         }
-        assert!(!verify_msg(&pubkey, msg, &bad), "a mangled signature must not verify");
+        assert!(
+            !verify_msg(&pubkey, msg, &bad),
+            "a mangled signature must not verify"
+        );
     }
 }

@@ -73,8 +73,7 @@ fn usage() -> String {
          FILE defaults to {DEFAULT_PATH}; everything but check/run talks to {socket}\n\
          ({sentinel} is internal: `run` spawns it to catch Ctrl-Alt-Del, and it \
          blocks on stdin until its parent lets go)\n\
-         (pair-run is internal: `run` uses it to launch pair-exec daemons)"
-    ,
+         (pair-run is internal: `run` uses it to launch pair-exec daemons)",
         socket = control::PATH,
         sentinel = cad::SENTINEL_VERB
     )
@@ -347,10 +346,7 @@ mod tests {
         assert!(matches!(route(&argv(&[])), Route::Usage(_)));
         assert!(matches!(route(&argv(&["runn"])), Route::Usage(_)));
         assert!(matches!(route(&argv(&["check", "-f"])), Route::Usage(_)));
-        assert!(matches!(
-            route(&argv(&["check", "extra"])),
-            Route::Usage(_)
-        ));
+        assert!(matches!(route(&argv(&["check", "extra"])), Route::Usage(_)));
     }
 
     /// The four control verbs address the RUNNING supervisor, not a file, and
@@ -928,18 +924,27 @@ mod confinement {
         // the inner form a new module could carry at its top, and a multi-lint
         // group with the lint somewhere in the middle of it.
         assert_eq!(
-            sources().iter().map(|(_, t)| unsafe_allows(t)).sum::<usize>(),
+            sources()
+                .iter()
+                .map(|(_, t)| unsafe_allows(t))
+                .sum::<usize>(),
             1,
             "the crate must carry exactly ONE scoped unsafe allow (the asm body in sys.rs)"
         );
         assert_eq!(
-            sources().iter().map(|(_, t)| unsafe_blocks(t)).sum::<usize>(),
+            sources()
+                .iter()
+                .map(|(_, t)| unsafe_blocks(t))
+                .sum::<usize>(),
             1,
             "the crate must carry exactly ONE unsafe block (the asm body in sys.rs)"
         );
         for form in ["fn", "impl", "trait"] {
             assert_eq!(
-                sources().iter().map(|(_, t)| unsafe_items(t, form)).sum::<usize>(),
+                sources()
+                    .iter()
+                    .map(|(_, t)| unsafe_items(t, form))
+                    .sum::<usize>(),
                 0,
                 "no item of this form may exist in this crate: {form}"
             );
@@ -977,14 +982,14 @@ mod confinement {
             "the unsafe lint must be named exactly twice: the crate deny and the one scoped allow"
         );
         assert_eq!(
-            squeezed
-                .matches(&format!("{}![deny({lint})]", "#"))
-                .count(),
+            squeezed.matches(&format!("{}![deny({lint})]", "#")).count(),
             1,
             concat!("the crate root must DENY unsafe", "_code")
         );
         assert_eq!(
-            squeezed.matches(&format!("{}![forbid({lint})]", "#")).count(),
+            squeezed
+                .matches(&format!("{}![forbid({lint})]", "#"))
+                .count(),
             0,
             "forbid cannot host the scoped allow sys.rs needs; this must be deny"
         );
@@ -1129,7 +1134,10 @@ mod confinement {
         }
         selected.sort();
         let roster: Vec<String> = AMENDED.iter().map(|(n, _)| (*n).to_string()).collect();
-        assert_eq!(selected, roster, "the amended syscall is issued exactly once");
+        assert_eq!(
+            selected, roster,
+            "the amended syscall is issued exactly once"
+        );
         assert_eq!(sites, 1, "expected exactly one call site");
         // ...and the definition, and NOTHING else. The loop skips any mention
         // not followed by `(`, which is the function ITEM: bind it once and
@@ -1183,7 +1191,11 @@ mod confinement {
     #[test]
     fn every_call_site_is_pinned_whole() {
         const ARGUMENTS: &[&str] = &["(SYS_KILL,targetasisizeasusize,signalasisizeasusize,)"];
-        assert_eq!(ARGUMENTS.len(), AMENDED.len(), "one pin per amended syscall");
+        assert_eq!(
+            ARGUMENTS.len(),
+            AMENDED.len(),
+            "one pin per amended syscall"
+        );
         let sys = squeeze(&source("sys.rs"));
         for arguments in ARGUMENTS {
             assert_eq!(
@@ -1208,8 +1220,11 @@ mod confinement {
         // would let a SECOND, unannotated definition satisfy "declared exactly
         // once" as long as the annotated one moved elsewhere in the file.
         assert_eq!(
-            sys.matches(&format!("{}{CALL}(", concat!("#[allow(un", "safe_code)]fn")))
-                .count(),
+            sys.matches(&format!(
+                "{}{CALL}(",
+                concat!("#[allow(un", "safe_code)]fn")
+            ))
+            .count(),
             1,
             "the raw entry point must be declared exactly once, under the scoped allow"
         );
@@ -1253,8 +1268,7 @@ mod confinement {
         let rest = body.get(start..).unwrap_or_default();
         let closed = at(rest, "self.close_logs()")
             .expect("finish_shutdown must close the logs; /var will not unmount otherwise");
-        let teardown =
-            at(rest, "run_teardown(").expect("finish_shutdown must run the teardown");
+        let teardown = at(rest, "run_teardown(").expect("finish_shutdown must run the teardown");
         assert!(
             closed < teardown,
             "close_logs must come BEFORE run_teardown: /etc/shutdown is what unmounts /var, \
@@ -1326,7 +1340,10 @@ mod confinement {
                     "supervise.rs must reach kill(2) exactly once, from send_signal"
                 );
             } else {
-                assert_eq!(calls, 0, "{name} calls the kill wrapper; only send_signal may");
+                assert_eq!(
+                    calls, 0,
+                    "{name} calls the kill wrapper; only send_signal may"
+                );
             }
         }
         // Inside sys.rs the wrapper is reachable UNQUALIFIED, which no scan

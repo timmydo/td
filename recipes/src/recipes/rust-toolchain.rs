@@ -423,26 +423,43 @@ jemalloc = false
         )
         .env("PATH", &path),
     );
-    steps.push(Step::split_debug_tree(
-        "{out}",
-        &format!("{nbin}/objcopy"),
-    ));
+    steps.push(Step::split_debug_tree("{out}", &format!("{nbin}/objcopy")));
     for binary in ["cargo-clippy", "clippy-driver"] {
-        steps.push(Step::run("{out}", &[&format!("{{out}}/bin/{binary}"), "--version"])
-            .env("PATH", &path));
+        steps.push(
+            Step::run("{out}", &[&format!("{{out}}/bin/{binary}"), "--version"]).env("PATH", &path),
+        );
     }
     steps.push(Step::WriteFile {
         path: "{root}/clippy-proof/probe.rs".into(),
         content: include_str!("../probes/rust_clippy.rs").into(),
         exec: false,
     });
-    steps.push(target_rustc(
-        "{root}/clippy-proof", "{out}/bin/rustc",
-        &["--edition=2021", "probe.rs", "-Clinker={root}/wb/cc", "-o", "{root}/clippy-proof/probe"],
-    ).env("PATH", &path));
-    steps.push(Step::run("{root}/clippy-proof", &[
-        "{root}/clippy-proof/probe", "{out}/bin/cargo", "{out}/bin/rustc", "{root}/wb/cc",
-    ]).env("PATH", "{out}/bin:{tools}"));
+    steps.push(
+        target_rustc(
+            "{root}/clippy-proof",
+            "{out}/bin/rustc",
+            &[
+                "--edition=2021",
+                "probe.rs",
+                "-Clinker={root}/wb/cc",
+                "-o",
+                "{root}/clippy-proof/probe",
+            ],
+        )
+        .env("PATH", &path),
+    );
+    steps.push(
+        Step::run(
+            "{root}/clippy-proof",
+            &[
+                "{root}/clippy-proof/probe",
+                "{out}/bin/cargo",
+                "{out}/bin/rustc",
+                "{root}/wb/cc",
+            ],
+        )
+        .env("PATH", "{out}/bin:{tools}"),
+    );
     steps.push(Step::assert_debug_size(
         "{out}",
         "{out}/share/td/debug-size",

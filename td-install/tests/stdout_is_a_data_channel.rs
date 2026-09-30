@@ -358,10 +358,12 @@ fn the_staged_directories_do_not_take_the_ambient_umask() -> Res<()> {
         use std::os::unix::fs::PermissionsExt;
         let staging = dir.join("td-volume-root");
         for directory in ["@var", "td", "td/boot", "td/deployments"] {
-            let mode = std::fs::metadata(staging.join(directory))?.permissions().mode() & 0o777;
+            let mode = std::fs::metadata(staging.join(directory))?
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(
-                mode,
-                0o755,
+                mode, 0o755,
                 "{directory} came out {mode:#o} under umask {mask}"
             );
         }
@@ -373,7 +375,10 @@ fn the_staged_directories_do_not_take_the_ambient_umask() -> Res<()> {
         // is closed by construction and observed by nothing here.
         let key = staging.join("td/trusted.pub");
         let mode = std::fs::metadata(&key)?.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o644, "the trust root came out {mode:#o} under umask {mask}");
+        assert_eq!(
+            mode, 0o644,
+            "the trust root came out {mode:#o} under umask {mask}"
+        );
         std::fs::remove_dir_all(&dir)?;
     }
     Ok(())
@@ -480,10 +485,14 @@ fn invalid_timezone_refuses_before_disk_or_scratch_changes() -> Res<()> {
         .arg(&dir)
         .output()?;
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid installation timezone identifier"));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("invalid installation timezone identifier"));
     assert!(output.stdout.is_empty());
     assert_eq!(std::fs::read(&disk)?, b"preserve destination");
-    assert_eq!(std::fs::read(staging.join("sentinel"))?, b"preserve scratch");
+    assert_eq!(
+        std::fs::read(staging.join("sentinel"))?,
+        b"preserve scratch"
+    );
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
@@ -495,8 +504,12 @@ fn invalid_hostname_refuses_before_destination_or_scratch_access() -> Res<()> {
     let scratch = dir.join("scratch");
     std::fs::write(&disk, b"unchanged target")?;
     for name in ["", "UPPER", "two words", "td\n", "../../outside"] {
-        let output = Command::new(BIN).args(["volume", "--hostname", name])
-            .arg(&disk).arg("/does-not-exist/mkfs").arg(&scratch).output()?;
+        let output = Command::new(BIN)
+            .args(["volume", "--hostname", name])
+            .arg(&disk)
+            .arg("/does-not-exist/mkfs")
+            .arg(&scratch)
+            .output()?;
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         assert_eq!(std::fs::read(&disk)?, b"unchanged target");

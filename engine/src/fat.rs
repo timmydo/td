@@ -249,7 +249,12 @@ pub fn build<'a>(volume: &Volume<'a>) -> Result<Image<'a>, String> {
     });
     extents.push(Extent {
         offset: u64::from(bps),
-        bytes: Cow::Owned(fsinfo_sector(bps, free_clusters, next_free, geometry.cluster_count)?),
+        bytes: Cow::Owned(fsinfo_sector(
+            bps,
+            free_clusters,
+            next_free,
+            geometry.cluster_count,
+        )?),
     });
     // The backup pair. Firmware and fsck both fall back to these, so a volume
     // whose primary is damaged and whose backup was never written is a volume
@@ -264,7 +269,12 @@ pub fn build<'a>(volume: &Volume<'a>) -> Result<Image<'a>, String> {
         offset: u64::from(BACKUP_BOOT_SECTOR + 1)
             .checked_mul(u64::from(bps))
             .ok_or_else(|| "fat: backup FSInfo offset overflows".to_string())?,
-        bytes: Cow::Owned(fsinfo_sector(bps, free_clusters, next_free, geometry.cluster_count)?),
+        bytes: Cow::Owned(fsinfo_sector(
+            bps,
+            free_clusters,
+            next_free,
+            geometry.cluster_count,
+        )?),
     });
 
     // One FAT image, written twice. Only the live prefix is emitted: the rest
@@ -334,7 +344,9 @@ fn solve_geometry(volume: &Volume<'_>) -> Result<Geometry, String> {
     let candidates: Vec<u32> = match volume.sectors_per_cluster {
         Some(spc) => {
             if spc == 0 || !spc.is_power_of_two() {
-                return Err(format!("fat: {spc} sectors per cluster is not a power of two"));
+                return Err(format!(
+                    "fat: {spc} sectors per cluster is not a power of two"
+                ));
             }
             if spc.saturating_mul(bps) > MAX_CLUSTER_BYTES {
                 return Err(format!(
@@ -472,98 +484,102 @@ impl Planner {
         extra_entries: u64,
         depth: usize,
     ) -> Result<Plan<'a>, String> {
-    let cluster_bytes = self.cluster_bytes;
-    if depth > MAX_DEPTH {
-        return Err(format!(
-            "fat: {path} nests deeper than the {MAX_DEPTH} directory levels this writer takes"
-        ));
-    }
-    // A non-root directory carries `.` and `..` before its children; the root
-    // may carry a volume-label entry instead.
-    let dots = if is_root { 0u64 } else { 2 };
-    let count = u64::try_from(entries.len())
-        .map_err(|_| "fat: absurd directory size".to_string())?
-        .checked_add(dots)
-        .and_then(|n| n.checked_add(extra_entries))
-        .ok_or_else(|| "fat: directory entry count overflows".to_string())?;
-    let bytes = count
-        .checked_mul(u64::from(DIR_ENTRY_SIZE))
-        .ok_or_else(|| "fat: directory size overflows".to_string())?;
-    // A directory always occupies at least one cluster, even when empty.
-    let clusters = u32::try_from(bytes.div_ceil(cluster_bytes).max(1))
-        .map_err(|_| "fat: directory needs more clusters than FAT32 can address".to_string())?;
-    let first = self.take(clusters)?;
-
-    let mut seen: Vec<[u8; 11]> = Vec::with_capacity(entries.len());
-    let mut children = Vec::with_capacity(entries.len());
-    for (name, node) in entries {
-        let short = short_name(name)?;
-        if seen.contains(&short) {
+        let cluster_bytes = self.cluster_bytes;
+        if depth > MAX_DEPTH {
             return Err(format!(
-                "fat: {path}\\{name} collides with an earlier entry — FAT names are \
-                 case-insensitive, so two that differ only in case are one name"
+                "fat: {path} nests deeper than the {MAX_DEPTH} directory levels this writer takes"
             ));
         }
-        seen.push(short);
-        let child_path = format!("{path}\\{}", display_name(&short));
-        children.push(match node {
-            Node::Dir(sub) => {
-                let mut plan = self.plan_dir(&child_path, sub, false, 0, depth + 1)?;
-                plan.name = short;
-                plan
+        // A non-root directory carries `.` and `..` before its children; the root
+        // may carry a volume-label entry instead.
+        let dots = if is_root { 0u64 } else { 2 };
+        let count = u64::try_from(entries.len())
+            .map_err(|_| "fat: absurd directory size".to_string())?
+            .checked_add(dots)
+            .and_then(|n| n.checked_add(extra_entries))
+            .ok_or_else(|| "fat: directory entry count overflows".to_string())?;
+        let bytes = count
+            .checked_mul(u64::from(DIR_ENTRY_SIZE))
+            .ok_or_else(|| "fat: directory size overflows".to_string())?;
+        // A directory always occupies at least one cluster, even when empty.
+        let clusters = u32::try_from(bytes.div_ceil(cluster_bytes).max(1))
+            .map_err(|_| "fat: directory needs more clusters than FAT32 can address".to_string())?;
+        let first = self.take(clusters)?;
+
+        let mut seen: Vec<[u8; 11]> = Vec::with_capacity(entries.len());
+        let mut children = Vec::with_capacity(entries.len());
+        for (name, node) in entries {
+            let short = short_name(name)?;
+            if seen.contains(&short) {
+                return Err(format!(
+                    "fat: {path}\\{name} collides with an earlier entry — FAT names are \
+                 case-insensitive, so two that differ only in case are one name"
+                ));
             }
-            // A file, with or without its bytes in hand — the length is all the
-            // layout depends on, which is what lets `Stream` exist.
-            Node::File(_) | Node::Stream(_) => {
-                let (len, data) = match node {
-                    Node::File(bytes) => (
-                        u64::try_from(bytes.len())
-                            .map_err(|_| "fat: file length overflows".to_string())?,
-                        Some(*bytes),
-                    ),
-                    Node::Stream(len) => (*len, None),
-                    Node::Dir(_) => (0, None),
-                };
-                let size = u32::try_from(len).map_err(|_| {
-                    format!("fat: {child_path} is larger than FAT32's 4 GiB file limit")
-                })?;
-                let clusters = u32::try_from(len.div_ceil(cluster_bytes)).map_err(|_| {
-                    "fat: file needs more clusters than FAT32 can address".to_string()
-                })?;
-                // An empty file owns no clusters and points at cluster 0, which
-                // is FAT's spelling of "no chain".
-                let first = if clusters == 0 { 0 } else { self.take(clusters)? };
-                Plan {
-                    name: short,
-                    attr: ATTR_ARCHIVE,
-                    first_cluster: first,
-                    clusters,
-                    size,
-                    children: None,
-                    is_root: false,
-                    data,
+            seen.push(short);
+            let child_path = format!("{path}\\{}", display_name(&short));
+            children.push(match node {
+                Node::Dir(sub) => {
+                    let mut plan = self.plan_dir(&child_path, sub, false, 0, depth + 1)?;
+                    plan.name = short;
+                    plan
                 }
-            }
-        });
-    }
-    Ok(Plan {
-        name: [b' '; 11],
-        attr: ATTR_DIRECTORY,
-        first_cluster: first,
-        clusters,
-        size: 0,
-        children: Some(children),
-        is_root,
-        data: None,
-    })
+                // A file, with or without its bytes in hand — the length is all the
+                // layout depends on, which is what lets `Stream` exist.
+                Node::File(_) | Node::Stream(_) => {
+                    let (len, data) = match node {
+                        Node::File(bytes) => (
+                            u64::try_from(bytes.len())
+                                .map_err(|_| "fat: file length overflows".to_string())?,
+                            Some(*bytes),
+                        ),
+                        Node::Stream(len) => (*len, None),
+                        Node::Dir(_) => (0, None),
+                    };
+                    let size = u32::try_from(len).map_err(|_| {
+                        format!("fat: {child_path} is larger than FAT32's 4 GiB file limit")
+                    })?;
+                    let clusters = u32::try_from(len.div_ceil(cluster_bytes)).map_err(|_| {
+                        "fat: file needs more clusters than FAT32 can address".to_string()
+                    })?;
+                    // An empty file owns no clusters and points at cluster 0, which
+                    // is FAT's spelling of "no chain".
+                    let first = if clusters == 0 {
+                        0
+                    } else {
+                        self.take(clusters)?
+                    };
+                    Plan {
+                        name: short,
+                        attr: ATTR_ARCHIVE,
+                        first_cluster: first,
+                        clusters,
+                        size,
+                        children: None,
+                        is_root: false,
+                        data,
+                    }
+                }
+            });
+        }
+        Ok(Plan {
+            name: [b' '; 11],
+            attr: ATTR_DIRECTORY,
+            first_cluster: first,
+            clusters,
+            size: 0,
+            children: Some(children),
+            is_root,
+            data: None,
+        })
     }
 }
 
 /// The FAT itself: entry 0 is the media descriptor, entry 1 is reserved, and
 /// every allocated run is a chain ending in `EOC`.
 fn build_fat(root: &Plan, next_free: u32) -> Result<Vec<u8>, String> {
-    let entries = usize::try_from(next_free)
-        .map_err(|_| "fat: FAT prefix exceeds usize".to_string())?;
+    let entries =
+        usize::try_from(next_free).map_err(|_| "fat: FAT prefix exceeds usize".to_string())?;
     let mut table = vec![0u8; entries.saturating_mul(4)];
     put32(&mut table, 0, 0x0fff_fff8)?;
     put32(&mut table, 4, EOC)?;
@@ -578,9 +594,7 @@ fn chain_into(plan: &Plan, table: &mut [u8]) -> Result<(), String> {
                 .first_cluster
                 .checked_add(i)
                 .ok_or_else(|| "fat: chain overflows".to_string())?;
-            let last = i
-                .checked_add(1)
-                .is_some_and(|next| next == plan.clusters);
+            let last = i.checked_add(1).is_some_and(|next| next == plan.clusters);
             let value = if last {
                 EOC
             } else {
@@ -736,7 +750,11 @@ fn dir_entry(name: &[u8], attr: u8, cluster: u32, size: u32) -> Result<[u8; 32],
     // is not a legal date, so it carries FAT's own epoch — a fixed value, so
     // one tree is still one image.
     put(&mut e, 24, &FAT_EPOCH_DATE.to_le_bytes())?;
-    put(&mut e, 20, &u16::try_from(cluster >> 16).unwrap_or(0).to_le_bytes())?;
+    put(
+        &mut e,
+        20,
+        &u16::try_from(cluster >> 16).unwrap_or(0).to_le_bytes(),
+    )?;
     put(
         &mut e,
         26,
@@ -752,10 +770,8 @@ fn boot_sector(
     label: Option<&[u8; 11]>,
 ) -> Result<Vec<u8>, String> {
     let bps = volume.bytes_per_sector;
-    let mut s = vec![
-        0u8;
-        usize::try_from(bps).map_err(|_| "fat: sector exceeds usize".to_string())?
-    ];
+    let mut s =
+        vec![0u8; usize::try_from(bps).map_err(|_| "fat: sector exceeds usize".to_string())?];
     // A jump nothing executes: firmware reads the BPB, but a volume whose first
     // bytes are not a jump is rejected by readers that check.
     put(&mut s, 0, &[0xeb, 0x58, 0x90])?;
@@ -836,10 +852,8 @@ fn fsinfo_sector(
     next_free: u32,
     cluster_count: u32,
 ) -> Result<Vec<u8>, String> {
-    let mut s = vec![
-        0u8;
-        usize::try_from(bps).map_err(|_| "fat: sector exceeds usize".to_string())?
-    ];
+    let mut s =
+        vec![0u8; usize::try_from(bps).map_err(|_| "fat: sector exceeds usize".to_string())?];
     // On a FULL volume the running allocator stands one past the last cluster,
     // which is not a cluster number; the hint has to be the "unknown" sentinel
     // rather than a value a reader would try to use.
@@ -878,9 +892,7 @@ fn label_field(label: &str) -> Result<[u8; 11], String> {
 /// FAT's own allowed set for a short name, minus the space — a leading or
 /// embedded space is legal and is a name nothing can type.
 fn short_name_char(c: char) -> bool {
-    c.is_ascii_uppercase()
-        || c.is_ascii_digit()
-        || "!#$%&'()-@^_`{}~".contains(c)
+    c.is_ascii_uppercase() || c.is_ascii_digit() || "!#$%&'()-@^_`{}~".contains(c)
 }
 
 /// Encode `name` as the 11-byte 8.3 field, or say why it cannot be.
@@ -931,9 +943,7 @@ fn short_name(name: &str) -> Result<[u8; 11], String> {
 
 /// The 11-byte field back as `BASE.EXT`, for error messages and placements.
 fn display_name(raw: &[u8; 11]) -> String {
-    let text = |bytes: &[u8]| -> String {
-        String::from_utf8_lossy(bytes).trim_end().to_string()
-    };
+    let text = |bytes: &[u8]| -> String { String::from_utf8_lossy(bytes).trim_end().to_string() };
     let base = text(raw.get(..8).unwrap_or_default());
     let ext = text(raw.get(8..).unwrap_or_default());
     if ext.is_empty() {
@@ -1222,7 +1232,8 @@ mod tests {
         let at = cluster_at(&img, efi);
         assert_eq!(bytes.get(at..at + 11), Some(b".          ".as_slice()));
         assert_eq!(bytes.get(at + 32..at + 43), Some(b"..         ".as_slice()));
-        let dot_cluster = (u32::from(u16_at(&bytes, at + 20)) << 16) | u32::from(u16_at(&bytes, at + 26));
+        let dot_cluster =
+            (u32::from(u16_at(&bytes, at + 20)) << 16) | u32::from(u16_at(&bytes, at + 26));
         assert_eq!(dot_cluster, efi, "`.` must name the directory itself");
         let up = (u32::from(u16_at(&bytes, at + 52)) << 16) | u32::from(u16_at(&bytes, at + 58));
         assert_eq!(up, 0, "`..` naming the root is written as cluster 0");
@@ -1307,9 +1318,9 @@ mod tests {
             "",
             ".",
             "..",
-            "A B.C",     // a space is legal FAT and a name nothing can type
+            "A B.C",      // a space is legal FAT and a name nothing can type
             "HELLO+.TXT", // '+' is not in FAT's short-name set
-            ".CONFIG",   // a leading dot is base, not extension
+            ".CONFIG",    // a leading dot is base, not extension
         ] {
             let v = esp(vec![(bad.into(), Node::File(b"x"))]);
             assert!(build(&v).is_err(), "{bad:?} was accepted");
@@ -1374,7 +1385,10 @@ mod tests {
         ranges.sort_unstable();
         let mut previous_end = 0u64;
         for (start, end) in ranges {
-            assert!(end <= img.total_bytes, "extent {start}..{end} runs past the volume");
+            assert!(
+                end <= img.total_bytes,
+                "extent {start}..{end} runs past the volume"
+            );
             assert!(
                 start >= previous_end,
                 "extent {start}..{end} overlaps the one ending at {previous_end}"
@@ -1472,7 +1486,10 @@ mod tests {
         // Writing the bytes at the placement reproduces the held-bytes image.
         let mut filled = image;
         let at = usize::try_from(p.offset).unwrap();
-        filled.get_mut(at..at + 5000).unwrap().copy_from_slice(&bytes);
+        filled
+            .get_mut(at..at + 5000)
+            .unwrap()
+            .copy_from_slice(&bytes);
         assert_eq!(filled, held.to_vec().unwrap());
     }
 

@@ -35,8 +35,15 @@ pub(crate) fn directory(path: &Path, owner: u32, trusted: bool) -> Result<File, 
     {
         return Err(format!(
             "file-grant directory {} has uid/gid {}/{} mode {:04o}; expected {owner}/{owner}{}",
-            path.display(), metadata.uid(), metadata.gid(), metadata.mode() & 0o7777,
-            if trusted { " without other writers" } else { "" },
+            path.display(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.mode() & 0o7777,
+            if trusted {
+                " without other writers"
+            } else {
+                ""
+            },
         ));
     }
     Ok(file)
@@ -251,15 +258,20 @@ pub(crate) fn release() -> Result<(), String> {
 #[path = "../tests/portal_files.rs"]
 mod tests;
 
-
 #[cfg(test)]
 #[test]
 #[allow(clippy::unwrap_used)]
 fn application_mount_lookup_uses_its_exact_view_and_refuses_stacks() {
     let view = "/var/lib/td/applications/65537/Downloads";
     let row = format!("7 1 0:1 / {view} rw,nosuid,nodev,noexec - btrfs none rw\n");
-    assert_eq!(mount_options_for(&row, view).unwrap().as_deref(),
-        Some("rw,nosuid,nodev,noexec"));
-    assert!(mount_options_for(&row, "/var/lib/td/applications/65536/Downloads").unwrap().is_none());
+    assert_eq!(
+        mount_options_for(&row, view).unwrap().as_deref(),
+        Some("rw,nosuid,nodev,noexec")
+    );
+    assert!(
+        mount_options_for(&row, "/var/lib/td/applications/65536/Downloads")
+            .unwrap()
+            .is_none()
+    );
     assert!(mount_options_for(&format!("{row}{row}"), view).is_err());
 }

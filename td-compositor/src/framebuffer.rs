@@ -215,7 +215,8 @@ impl Framebuffer {
             .map_err(|error| format!("size headless output: {error}"))?;
         let allocate = || -> Result<Vec<u8>, String> {
             let mut bytes = Vec::new();
-            bytes.try_reserve_exact(size)
+            bytes
+                .try_reserve_exact(size)
                 .map_err(|error| format!("allocate headless output: {error}"))?;
             bytes.resize(size, 0);
             Ok(bytes)
@@ -416,8 +417,10 @@ impl OutputBackend for Framebuffer {
 
 #[cfg(test)]
 mod tests {
-    const CAPTURE_STAMP: crate::headless::OutputStamp =
-        crate::headless::OutputStamp { session: 7, output: 1 };
+    const CAPTURE_STAMP: crate::headless::OutputStamp = crate::headless::OutputStamp {
+        session: 7,
+        output: 1,
+    };
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -473,10 +476,18 @@ mod tests {
         let header = format!("P6\n# td-output-v1 {}\n8 4\n255\n", CAPTURE_STAMP.record());
         let pixels = ppm.strip_prefix(header.as_bytes()).unwrap();
         let backing = fs::read(&cleanup.0).unwrap();
-        let expected: Vec<u8> = backing.as_chunks::<40>().0.iter().flat_map(|row| {
-            row[..32].as_chunks::<4>().0.iter()
-                .flat_map(|pixel| [pixel[2], pixel[1], pixel[0]])
-        }).collect();
+        let expected: Vec<u8> = backing
+            .as_chunks::<40>()
+            .0
+            .iter()
+            .flat_map(|row| {
+                row[..32]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|pixel| [pixel[2], pixel[1], pixel[0]])
+            })
+            .collect();
         assert_eq!(pixels, expected);
         assert_eq!(pixels.len(), 8 * 4 * 3);
     }

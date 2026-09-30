@@ -175,7 +175,10 @@ fn check_head(url: &str, headers: &[(&str, &str)]) -> Result<(), Error> {
         return Err(Error::Malformed("the url carries a control byte".into()));
     }
     for (name, value) in headers {
-        if name.bytes().any(|b| b.is_ascii_control() || b == b':' || b == b' ') {
+        if name
+            .bytes()
+            .any(|b| b.is_ascii_control() || b == b':' || b == b' ')
+        {
             return Err(Error::Malformed(format!(
                 "header name {name:?} carries a separator or a control byte"
             )));
@@ -298,7 +301,10 @@ mod tests {
     fn a_body_past_the_limit_is_not_read() {
         let wire = format!("{PROTOCOL}\nstatus 200\nbody 11\n\nhello world");
         let err = read_reply(&mut BufReader::new(wire.as_bytes()), 10).unwrap_err();
-        assert!(matches!(err, Error::Io(ref m) if m.contains("11 bytes past the 10")), "{err}");
+        assert!(
+            matches!(err, Error::Io(ref m) if m.contains("11 bytes past the 10")),
+            "{err}"
+        );
         let ok = read_reply(&mut BufReader::new(wire.as_bytes()), 11).unwrap();
         assert_eq!(ok.body, b"hello world");
     }
@@ -317,7 +323,10 @@ mod tests {
             ("https://h/x", &[("a", "c\r")][..]),
         ] {
             let err = check_head(url, headers).unwrap_err();
-            assert!(matches!(err, Error::Malformed(_)), "{url:?} {headers:?}: {err}");
+            assert!(
+                matches!(err, Error::Malformed(_)),
+                "{url:?} {headers:?}: {err}"
+            );
         }
     }
 

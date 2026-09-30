@@ -87,7 +87,9 @@ impl Ctx {
         self.source_pins
             .iter()
             .find(|pin| pin.key == key)
-            .ok_or_else(|| format!("recipe source pin `{key}` is missing from td-recipe-eval source-pins"))
+            .ok_or_else(|| {
+                format!("recipe source pin `{key}` is missing from td-recipe-eval source-pins")
+            })
     }
 }
 
@@ -172,7 +174,10 @@ fn parse_source_pins(text: &str) -> Result<Vec<SourcePin>, String> {
             ));
         }
         if pins.iter().any(|pin: &SourcePin| pin.key == key) {
-            return Err(format!("source-pins line {} duplicates key `{key}`", idx + 1));
+            return Err(format!(
+                "source-pins line {} duplicates key `{key}`",
+                idx + 1
+            ));
         }
         pins.push(SourcePin {
             key: key.to_string(),
@@ -1073,8 +1078,8 @@ M2-Planet \\\n\
             .source_pin(STAGE0_SOURCE_KEY)
             .expect("stage0 pin loaded")
             .clone();
-        bad_pin.sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-            .to_string();
+        bad_pin.sha256 =
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string();
         cx.source_pins.retain(|pin| pin.key != STAGE0_SOURCE_KEY);
         cx.source_pins.push(bad_pin);
         let recipe = Recipe {

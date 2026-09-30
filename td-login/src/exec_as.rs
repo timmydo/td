@@ -46,7 +46,9 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         // `exec-as` has no options, so a leading dash is a mistyped invocation
         // rather than a user named `-l`. Refusing beats resolving an account
         // nobody meant.
-        return Err(format!("{user:?} is not a user name; exec-as takes no options"));
+        return Err(format!(
+            "{user:?} is not a user name; exec-as takes no options"
+        ));
     }
     match args.get(1).map(String::as_str) {
         Some("--") => {}
@@ -62,7 +64,9 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     if program.ends_with('/') {
         // Its basename is `""`, and every program these units start dispatches
         // ON argv[0]. The exec fails anyway; this says why.
-        return Err(format!("{program:?} ends in a slash, so it names no program"));
+        return Err(format!(
+            "{program:?} ends in a slash, so it names no program"
+        ));
     }
     Ok(Options {
         user: user.clone(),
@@ -118,8 +122,8 @@ pub fn run(args: &[String]) -> Result<u8, String> {
 /// account authorization differs: this path accepts the exact service marker
 /// and rejects every interactive, hashed, or ordinarily locked account.
 pub fn run_service(args: &[String]) -> Result<u8, String> {
-    let opts = parse(args)
-        .map_err(|e| format!("{e}\nusage: exec-service-as USER -- PROGRAM [ARG…]"))?;
+    let opts =
+        parse(args).map_err(|e| format!("{e}\nusage: exec-service-as USER -- PROGRAM [ARG…]"))?;
     let account = login::authorize_service(&opts.user)?;
     let groups = db::supplementary(&opts.user)?;
     let session = session_for(&account, &groups, opts, &session::inherited());

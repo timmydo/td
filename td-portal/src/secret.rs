@@ -132,9 +132,14 @@ pub(super) fn identity_reply(
         )?;
         return Ok(true);
     };
-    let result = secret_store::Store::open_owned(&secret_store::user_path(UI_UID), UI_UID, PORTAL_UID, false)
-        .and_then(|store| store.application_secret(&app, &pending.name))
-        .and_then(|secret| secret.ok_or_else(|| "credential is not provisioned".into()));
+    let result = secret_store::Store::open_owned(
+        &secret_store::user_path(UI_UID),
+        UI_UID,
+        PORTAL_UID,
+        false,
+    )
+    .and_then(|store| store.application_secret(&app, &pending.name))
+    .and_then(|secret| secret.ok_or_else(|| "credential is not provisioned".into()));
     let mut secret = match result {
         Ok(secret) => secret,
         Err(_) => {

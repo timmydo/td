@@ -29,8 +29,7 @@ pub const TD_APPLICATION_CONFIG_PATH: &str = "/etc/td-app.conf";
 pub const TD_APPLICATION_REGISTRY: &str = "/etc/td-applications.tsv";
 pub const TD_APPLICATION_LAUNCHER_TABLE: &str = "/etc/td-launcher.tsv";
 pub const TD_APPLICATION_CGROUP_ROOT: &str = "/sys/fs/cgroup/td-user-1000";
-pub const TD_APPLICATION_CGROUP_SESSION: &str =
-    "/sys/fs/cgroup/td-user-1000/session";
+pub const TD_APPLICATION_CGROUP_SESSION: &str = "/sys/fs/cgroup/td-user-1000/session";
 pub const TD_APPLICATION_CGROUP_MEMBERSHIP_ROOT: &str = "/td-user-1000";
 /// Parent of td-svc's per-service leaves. A sibling of the delegated
 /// application root rather than a child of it: these are the SYSTEM services,
@@ -48,8 +47,7 @@ pub const TD_JAIL_FIXTURE_PICTURES_PERMISSION: &str = "xdg-pictures";
 pub const TD_JAIL_FIXTURE_PICTURES_TARGET: &str = "/home/td/Pictures";
 pub const TD_JAIL_FIXTURE_GRANT_FILE: &str = "/var/td-jail-fixture-file";
 pub const TD_JAIL_FIXTURE_GRANT_ROOT: &str = "/mnt/td-jail-fixture-pictures";
-pub const TD_JAIL_FIXTURE_SEARCH_TERMS: &[&str] =
-    &["jail", "fixture", "sandbox", "wayland"];
+pub const TD_JAIL_FIXTURE_SEARCH_TERMS: &[&str] = &["jail", "fixture", "sandbox", "wayland"];
 // The two terminal applications: td-owned static programs on the empty
 // runtime, each a `/bin` launcher that td-term runs as its `--command` in
 // a window of its own at boot. `mail` is td-mail, `news` is td-news; the
@@ -441,9 +439,7 @@ END {
 "#;
 
 fn debug_line_validation_command(producer: &str, source: &str, source_root: &str) -> String {
-    format!(
-        "{producer} | awk -v source='{source}' -v root='{source_root}' '{DEBUG_LINE_AWK}'"
-    )
+    format!("{producer} | awk -v source='{source}' -v root='{source_root}' '{DEBUG_LINE_AWK}'")
 }
 
 /// Validate one retained DWARF-5 source file against the line-table-only
@@ -909,8 +905,7 @@ pub const TD_BUSD_RUNTIME_MARKER: &str = "TD-BUSD-RUN-OK";
 /// pins the literal and the call that emits it. The host recognizes the exact
 /// `portal-evidence: <marker>` line after td-svc applies its trusted service
 /// prefix, not this unframed substring.
-pub const TD_PORTAL_RUNTIME_MARKER: &str =
-    "TD-PORTAL-READY namespaces=2 settings=11 version=1";
+pub const TD_PORTAL_RUNTIME_MARKER: &str = "TD-PORTAL-READY namespaces=2 settings=11 version=1";
 
 /// Printed by that same live client only after it pre-subscribes to the exact
 /// caller-derived path, receives the Background method reply carrying that
@@ -918,8 +913,7 @@ pub const TD_PORTAL_RUNTIME_MARKER: &str =
 ///
 /// DUPLICATED as `REQUEST_READY_MARKER` in td-portal/src/main.rs and pinned by
 /// the td-portal recipe.
-pub const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str =
-    "TD-PORTAL-REQUEST-READY response=2";
+pub const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str = "TD-PORTAL-REQUEST-READY response=2";
 
 /// Printed by the live portal client only after the version-property and
 /// GetAll discovery paths return exact `UnknownInterface` errors for
@@ -1172,8 +1166,7 @@ pub const TD_FIREFOX_INPUT_MARKER: &str = "TD-FIREFOX-INPUT-OK";
 pub const TD_FIREFOX_SOAK_MARKER: &str = "TD-FIREFOX-SOAK-OK minimum-seconds=300 navigations=31";
 /// Emitted by the root audit oracle after the ordered end barrier proves every
 /// outer-filter denial in the interval arrived and matches the compiled roster.
-pub const TD_FIREFOX_SECCOMP_AUDIT_MARKER: &str =
-    "TD-FIREFOX-SECCOMP-OK probes=17";
+pub const TD_FIREFOX_SECCOMP_AUDIT_MARKER: &str = "TD-FIREFOX-SECCOMP-OK probes=17";
 /// Emitted by the trusted Claude Code evidence unit after Claude Code, a
 /// foreign-payload terminal program, was refused a launch with no terminal of
 /// its own and then ran `--version` to exit status 0 inside a fresh
@@ -1192,12 +1185,10 @@ pub const TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER: &str = "TD-FIREFOX-CLIPBOAR
 pub const TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER: &str = "TD-FIREFOX-CLIPBOARD-WINDOW-ARMED";
 /// Requests the first bounded physical Control+L retry after Firefox reports
 /// that the initial location-bar focus command did not settle.
-pub const TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER: &str =
-    "TD-FIREFOX-CLIPBOARD-FOCUS-RETRY-1";
+pub const TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER: &str = "TD-FIREFOX-CLIPBOARD-FOCUS-RETRY-1";
 /// Requests the final bounded physical Control+L retry before the input unit
 /// fails closed.
-pub const TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER: &str =
-    "TD-FIREFOX-CLIPBOARD-FOCUS-RETRY-2";
+pub const TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER: &str = "TD-FIREFOX-CLIPBOARD-FOCUS-RETRY-2";
 pub const TD_FIREFOX_CLIPBOARD_ARMED_MARKER: &str = "TD-FIREFOX-CLIPBOARD-ARMED";
 pub const TD_FIREFOX_CLIPBOARD_RETRY_MARKER: &str = "TD-FIREFOX-CLIPBOARD-RETRY-ARMED";
 pub const TD_FIREFOX_CLIPBOARD_MARKER: &str = "TD-FIREFOX-CLIPBOARD-OK";
@@ -1206,21 +1197,18 @@ pub const TD_FIREFOX_DOWNLOAD_MARKER: &str = "TD-FIREFOX-DOWNLOAD-OK bytes=23";
 pub const TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER: &str = "TD-FIREFOX-FILE-CHOOSER-ARMED";
 pub const TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER: &str =
     "TD-FIREFOX-FILE-CHOOSER-REFOCUS-ARMED";
-pub const TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER: &str =
-    "TD-FIREFOX-FILE-CHOOSER-FOCUSED";
+pub const TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER: &str = "TD-FIREFOX-FILE-CHOOSER-FOCUSED";
 pub const TD_FIREFOX_FILE_CHOOSER_MARKER: &str = "TD-FIREFOX-FILE-CHOOSER-OK bytes=23";
 /// Selects the physical-input oracle without changing an ordinary Firefox boot.
 pub const FIREFOX_INPUT_CMDLINE_TOKEN: &str = "td.firefox-input=1";
 /// Selects the dedicated Firefox outer-filter audit variant.
-pub const FIREFOX_AUDIT_CMDLINE_TOKEN: &str =
-    "td.firefox-seccomp-audit=1";
+pub const FIREFOX_AUDIT_CMDLINE_TOKEN: &str = "td.firefox-seccomp-audit=1";
 /// Enables the kernel audit subsystem for that closed proof variant.
 pub const KERNEL_AUDIT_CMDLINE_TOKEN: &str = "audit=1";
 /// Prevents even unconditional seccomp-kill records on non-audit QEMU boots.
 pub const KERNEL_AUDIT_OFF_CMDLINE_TOKEN: &str = "audit=0";
 /// Keeps the proof's bounded 4096-record interval below the kernel queue.
-pub const FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN: &str =
-    "audit_backlog_limit=8192";
+pub const FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN: &str = "audit_backlog_limit=8192";
 /// Keeps the proof-only kernel ring above its bounded audit interval.
 pub const FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN: &str = "log_buf_len=8M";
 /// Must match the compositor's independently pinned client-cursor dimension cap.
@@ -1974,7 +1962,10 @@ mod tests {
             let next = bytes.get(i + 1).copied();
             match byte {
                 b'/' if next == Some(b'/') => {
-                    i = match bytes.get(i..).and_then(|r| r.iter().position(|c| *c == b'\n')) {
+                    i = match bytes
+                        .get(i..)
+                        .and_then(|r| r.iter().position(|c| *c == b'\n'))
+                    {
                         Some(n) => i + n + 1,
                         None => bytes.len(),
                     };
@@ -2348,9 +2339,7 @@ mod tests {
             }
         }
         assert!(!command_glob_is_build_local("{root}/../input/*"));
-        assert!(!command_glob_is_build_local(
-            "{in:binutils-mesboot0}/bin/*"
-        ));
+        assert!(!command_glob_is_build_local("{in:binutils-mesboot0}/bin/*"));
         assert!(command_glob_is_build_local("{src}/objects/*.o"));
         assert!(command_glob_is_build_local("{tools}/wrappers/*"));
     }
@@ -2460,7 +2449,8 @@ mod tests {
     fn executable_write_files_use_declared_shebangs() {
         let mut seen_guest_shebangs = HashSet::new();
         let expected_guest_shebangs: HashSet<(String, String)> = GUEST_LITERAL_SHEBANGS
-            .iter().copied()
+            .iter()
+            .copied()
             // The secret fixture derives the exact stock guest scripts.
             .chain(GUEST_LITERAL_SHEBANGS.iter().filter_map(|(stem, path)| {
                 (*stem == "system-x86-64").then_some(("system-secret-vm-test", *path))
@@ -2826,7 +2816,10 @@ mod tests {
         // A link NAMED for the tool but pointing elsewhere is not a busybox
         // link, so naming it right does not excuse it.
         let liar = farm(vec![("find".into(), "{root}/tools/find".into())]);
-        assert_eq!(host_tool_invocation("probe", &liar), Some(("find", "find".into())));
+        assert_eq!(
+            host_tool_invocation("probe", &liar),
+            Some(("find", "find".into()))
+        );
 
         // ...and the exemption is not narrowed to the bare tool name: a link
         // whose name merely tokenises to it is still a declared busybox link.
@@ -2884,7 +2877,10 @@ mod tests {
         // lands at `{tools}/sub/find` and so is harmless, but refusing it is
         // the fail-closed direction and pins the rule as written.
         let nested = farm(vec![("sub/find".into(), BB.into())]);
-        assert_eq!(host_tool_invocation("probe", &nested), Some(("find", "sub/find".into())));
+        assert_eq!(
+            host_tool_invocation("probe", &nested),
+            Some(("find", "sub/find".into()))
+        );
 
         // A name is excused only while it is a bare filename. ALONE in the
         // farm, so nothing else can catch it: `tools.join("/usr/bin/find")`
@@ -2981,7 +2977,10 @@ mod tests {
                 dir: String::new(),
             },
         ]);
-        assert_eq!(host_tool_invocation("td-txt", &ran), Some(("find", "find".into())));
+        assert_eq!(
+            host_tool_invocation("td-txt", &ran),
+            Some(("find", "find".into()))
+        );
 
         let farm = Recipe::gnu("td-txt", "1").steps(vec![
             diagnostic.clone(),
@@ -2989,7 +2988,10 @@ mod tests {
                 links: vec![("find".into(), "{root}/tools/find".into())],
             },
         ]);
-        assert_eq!(host_tool_invocation("td-txt", &farm), Some(("find", "find".into())));
+        assert_eq!(
+            host_tool_invocation("td-txt", &farm),
+            Some(("find", "find".into()))
+        );
 
         let edited = Recipe::gnu("td-txt", "1").steps(vec![
             diagnostic,
@@ -3122,7 +3124,10 @@ mod tests {
     #[test]
     fn the_rostered_recipes_still_cannot_spawn() {
         for (stem, recipe) in catalog::all() {
-            if !RUST_NOT_A_COMMAND_SURFACE.iter().any(|(name, _)| *name == stem) {
+            if !RUST_NOT_A_COMMAND_SURFACE
+                .iter()
+                .any(|(name, _)| *name == stem)
+            {
                 continue;
             }
             if let Some(why) = spawn_tripwire(&recipe) {
@@ -3333,7 +3338,10 @@ mod tests {
             ("nothing found here", "find"),
             ("target x86-64 needs no xargsy tool", "xargs"),
         ] {
-            assert!(!invokes(text, cmd), "`{text}' is not an invocation of `{cmd}'");
+            assert!(
+                !invokes(text, cmd),
+                "`{text}' is not an invocation of `{cmd}'"
+            );
         }
         // ...and every spelling that IS one still is: a bare word, an absolute
         // PATH, after a pipe, after a separator, as the head of a line, and in
@@ -3430,14 +3438,18 @@ mod tests {
     fn efi_defaults_fit_the_selector_command_line_grammar() {
         let line = super::efi_default_cmdline();
         // td-boot receives /proc/cmdline verbatim and refuses quotes/backslashes.
-        assert!(line.bytes().all(|b| (b' '..=b'~').contains(&b)
-            && !matches!(b, b'\\' | b'\"' | b'\'')), "{line}");
+        assert!(
+            line.bytes()
+                .all(|b| (b' '..=b'~').contains(&b) && !matches!(b, b'\\' | b'\"' | b'\'')),
+            "{line}"
+        );
     }
 
     #[test]
     fn efi_defaults_leave_audit_policy_to_the_boot_caller() {
         // Linux permanently disables audit initialization on any earlier audit=0.
-        assert!(!super::efi_default_cmdline().split_ascii_whitespace()
+        assert!(!super::efi_default_cmdline()
+            .split_ascii_whitespace()
             .any(|token| token.starts_with("audit=")));
     }
 

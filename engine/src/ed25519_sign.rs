@@ -36,9 +36,7 @@
 //     from source. That file's own header states this at length; it is repeated
 //     here so the count is not read as three gated checks.
 
-use crate::ed25519::{
-    at_least_l, load_words, reduce_wide, store_words, sub_l, Point, BASE_POINT,
-};
+use crate::ed25519::{at_least_l, load_words, reduce_wide, store_words, sub_l, Point, BASE_POINT};
 use crate::sha512;
 
 /// The 32-byte seed an ed25519 private key is. The seed is this module's own;
@@ -129,7 +127,11 @@ pub fn sign(seed: &[u8; SEED_LEN], message: &[u8]) -> Option<[u8; SIGNATURE_LEN]
 }
 
 fn base_mul(scalar: &[u8; 32]) -> Option<[u8; 32]> {
-    Some(Point::decompress(&BASE_POINT)?.scalar_mul(scalar).compress())
+    Some(
+        Point::decompress(&BASE_POINT)?
+            .scalar_mul(scalar)
+            .compress(),
+    )
 }
 
 /// `(k * s + r) mod L`, the scalar half of a signature.
@@ -341,7 +343,11 @@ mod tests {
         hasher.update(b"abc");
         let digest = hasher.finalize();
         let last = vectors.last().expect("five vectors");
-        assert_eq!(hex_bytes(last.2), digest.to_vec(), "TEST SHA(abc)'s message");
+        assert_eq!(
+            hex_bytes(last.2),
+            digest.to_vec(),
+            "TEST SHA(abc)'s message"
+        );
     }
 
     /// The round-trip, over seeds and message lengths the vectors do not cover
@@ -369,13 +375,19 @@ mod tests {
     #[test]
     fn a_signature_stops_verifying_when_anything_moves() {
         let seed = [7u8; 32];
-        let (a, message) = (public_key(&seed).expect("base point"), b"td-deployment-v1\n");
+        let (a, message) = (
+            public_key(&seed).expect("base point"),
+            b"td-deployment-v1\n",
+        );
         let sig = sign(&seed, message).expect("base point");
         assert!(ed25519::verify(&a, message, &sig));
 
         let other = public_key(&[8u8; 32]).expect("base point");
         assert!(!ed25519::verify(&other, message, &sig), "a different key");
-        assert!(!ed25519::verify(&a, b"td-deployment-v2\n", &sig), "a changed message");
+        assert!(
+            !ed25519::verify(&a, b"td-deployment-v2\n", &sig),
+            "a changed message"
+        );
         for i in 0..64 {
             let mut broken = sig;
             if let Some(byte) = broken.get_mut(i) {
@@ -388,7 +400,10 @@ mod tests {
             if let Some(byte) = broken.get_mut(i) {
                 *byte ^= 1;
             }
-            assert!(!ed25519::verify(&broken, message, &sig), "public key byte {i}");
+            assert!(
+                !ed25519::verify(&broken, message, &sig),
+                "public key byte {i}"
+            );
         }
     }
 
@@ -445,10 +460,13 @@ mod tests {
         if let Some(first) = one.first_mut() {
             *first = 1;
         }
-        let x: [u8; 32] = from_hex("0123456789abcdeffedcba98765432100f1e2d3c4b5a69788796a5b4c3d2e1f0");
+        let x: [u8; 32] =
+            from_hex("0123456789abcdeffedcba98765432100f1e2d3c4b5a69788796a5b4c3d2e1f0");
         let product = mul_wide(&one, &x);
         assert_eq!(product.get(..32), Some(&x[..]), "low half is x");
-        assert!(product.get(32..).is_some_and(|hi| hi.iter().all(|b| *b == 0)));
+        assert!(product
+            .get(32..)
+            .is_some_and(|hi| hi.iter().all(|b| *b == 0)));
 
         // The largest inputs: (2^256 - 1)^2 = 2^512 - 2^257 + 1, whose bytes are
         // 01 then thirty-one 00 then fe then thirty-one ff.

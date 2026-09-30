@@ -8,8 +8,7 @@ use td_engine::launcher::{ApplicationRegistry, LauncherTable};
 
 const HOST_PACKAGE: &str = "/td/store/00000000000000000000000000000000-td-jail-fixture-0.1";
 const HOST_RUNTIME: &str = "/td/store/00000000000000000000000000000000-empty-runtime-1";
-const HOST_FIREFOX_PACKAGE: &str =
-    "/td/store/00000000000000000000000000000000-firefox-154.0";
+const HOST_FIREFOX_PACKAGE: &str = "/td/store/00000000000000000000000000000000-firefox-154.0";
 const HOST_FIREFOX_RUNTIME: &str =
     "/td/store/00000000000000000000000000000000-freedesktop-platform-25-08-25.08";
 const HOST_FIREFOX_MARKER: &str = "TD-FIREFOX-JAIL-SMOKE-OK";
@@ -68,12 +67,9 @@ fn host_fixture() -> Result<HostFixture, String> {
         &firefox_version,
         ApplicationProvenance::Foreign,
     )?;
-    let firefox_spec = ApplicationSpec::compile(
-        &firefox_manifest,
-        HOST_FIREFOX_RUNTIME,
-        firefox_permissions,
-    )?
-    .to_keyfile();
+    let firefox_spec =
+        ApplicationSpec::compile(&firefox_manifest, HOST_FIREFOX_RUNTIME, firefox_permissions)?
+            .to_keyfile();
     let registry = ApplicationRegistry::new(vec![
         (firefox_name.clone(), HOST_FIREFOX_PACKAGE.to_string()),
         (name.clone(), HOST_PACKAGE.to_string()),
@@ -329,8 +325,8 @@ exec "$TD_RECIPE_EVAL" check-run td-jail-test 1
 #[cfg(test)]
 mod tests {
     use super::{
-        host_fixture, HOST_DEGRADATION_CGROUP, HOST_DEGRADATION_WAYLAND,
-        HOST_FIREFOX_MARKER, HOST_FIREFOX_RUNTIME,
+        host_fixture, HOST_DEGRADATION_CGROUP, HOST_DEGRADATION_WAYLAND, HOST_FIREFOX_MARKER,
+        HOST_FIREFOX_RUNTIME,
     };
 
     #[test]

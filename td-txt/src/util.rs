@@ -359,7 +359,10 @@ pub fn give_back_stdin(fd0: &mut std::fs::File, unread: u64) -> std::io::Result<
         return Ok(());
     }
     let back = i64::try_from(unread).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "read past what a seek can undo")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "read past what a seek can undo",
+        )
     })?;
     fd0.seek(std::io::SeekFrom::Current(-back))?;
     Ok(())
@@ -587,7 +590,10 @@ impl<R: std::io::Read> Records<R> {
     /// The count, and whether any of it was absorbed by an open record rather
     /// than standing as empty records `-B` could show.
     pub fn take_skipped(&mut self) -> (u64, bool) {
-        (std::mem::take(&mut self.skipped), std::mem::take(&mut self.skipped_joined))
+        (
+            std::mem::take(&mut self.skipped),
+            std::mem::take(&mut self.skipped_joined),
+        )
     }
 
     /// Input offset just PAST the record `line()` returns: its separator, and any
@@ -767,8 +773,7 @@ impl<R: std::io::Read> Records<R> {
                     false => e.saturating_sub(s),
                 };
                 // The separator is a byte of the input too, so it counts.
-                self.emitted =
-                    self.emitted.saturating_add(len as u64).saturating_add(1);
+                self.emitted = self.emitted.saturating_add(len as u64).saturating_add(1);
                 return Ok(true);
             }
             // No separator in what is held: carry the remainder and refill. The
@@ -784,8 +789,7 @@ impl<R: std::io::Read> Records<R> {
                 // A final record carrying no separator of its own.
                 let live = self.spilled && !self.spill.is_empty();
                 if live {
-                    self.emitted =
-                        self.emitted.saturating_add(self.spill.len() as u64);
+                    self.emitted = self.emitted.saturating_add(self.spill.len() as u64);
                 }
                 return Ok(live);
             }
@@ -881,7 +885,13 @@ impl StdioBuf {
             _ => Self::BUFSIZ,
         };
         let line = file.is_terminal();
-        Self { file, held: Vec::with_capacity(cap), cap, line, allocated: false }
+        Self {
+            file,
+            held: Vec::with_capacity(cap),
+            cap,
+            line,
+            allocated: false,
+        }
     }
 
     /// The most a caller may hand over in one `put` and still get the boundaries
@@ -907,7 +917,9 @@ impl StdioBuf {
     /// so a record and its separator reach a concurrent reader as two writes.
     /// Safe: `try_clone_to_owned` needs no `unsafe`.
     pub fn over_stdout() -> std::io::Result<Self> {
-        Ok(Self::over(std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?)))
+        Ok(Self::over(std::fs::File::from(
+            std::io::stdout().as_fd().try_clone_to_owned()?,
+        )))
     }
 
     /// stdio scans for the newline only when the write FITS in what is left of
@@ -917,7 +929,8 @@ impl StdioBuf {
     pub fn put(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         if self.line && bytes.len() <= self.room() {
             if let Some(i) = bytes.iter().rposition(|b| *b == b'\n') {
-                self.held.extend_from_slice(bytes.get(..=i).unwrap_or_default());
+                self.held
+                    .extend_from_slice(bytes.get(..=i).unwrap_or_default());
                 self.flush()?;
                 return self.fill(bytes.get(i + 1..).unwrap_or_default());
             }
@@ -932,7 +945,8 @@ impl StdioBuf {
     /// descriptor as 8192 then 1 rather than as 4096, 4096, 1.
     fn fill(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         let take = self.room().min(bytes.len());
-        self.held.extend_from_slice(bytes.get(..take).unwrap_or_default());
+        self.held
+            .extend_from_slice(bytes.get(..take).unwrap_or_default());
         let rest = bytes.get(take..).unwrap_or_default();
         // An exact fill is not a reason to write: stdio flushes because it has
         // more to put and nowhere to put it, which is this test and not a full
@@ -958,7 +972,8 @@ impl StdioBuf {
         let mut left = rest.get(whole..).unwrap_or_default();
         if self.line {
             while let Some(i) = left.iter().position(|b| *b == b'\n') {
-                self.held.extend_from_slice(left.get(..=i).unwrap_or_default());
+                self.held
+                    .extend_from_slice(left.get(..=i).unwrap_or_default());
                 self.flush()?;
                 left = left.get(i + 1..).unwrap_or_default();
             }
@@ -1040,7 +1055,11 @@ impl Out {
     /// The dup can only fail on a closed or exhausted descriptor table, which is
     /// exactly when a silent fallback to a second buffering layer would be worst.
     pub fn new() -> std::io::Result<Self> {
-        Ok(Self { inner: StdioBuf::over_stdout()?, broken: false, unbuffered: false })
+        Ok(Self {
+            inner: StdioBuf::over_stdout()?,
+            broken: false,
+            unbuffered: false,
+        })
     }
 
     /// Write through from here on, which is what `-u` asks for.
@@ -1188,7 +1207,11 @@ pub struct Walked {
 /// afterwards. It is asked with the directory's path and whether that path is
 /// the root, since the two are matched against different things.
 pub fn walk(root: &Path, logical: bool, prune: &dyn Fn(&Path, bool) -> bool) -> Walked {
-    let mut out = Walked { files: Vec::new(), diags: Vec::new(), descended: false };
+    let mut out = Walked {
+        files: Vec::new(),
+        diags: Vec::new(),
+        descended: false,
+    };
     out.descended = walk_from(root, true, logical, prune, &mut Vec::new(), &mut out);
     out
 }
@@ -1226,7 +1249,11 @@ fn walk_from(
     if !meta.is_dir() {
         // `follow` is true here, so this is the walk's ROOT: an operand that
         // happened not to be a directory, and a command-line name to the policy.
-        out.files.push(Found { path: root.to_path_buf(), device: is_device(&meta), root: true });
+        out.files.push(Found {
+            path: root.to_path_buf(),
+            device: is_device(&meta),
+            root: true,
+        });
         return false;
     }
     chain.push(ident(&meta));
@@ -1284,14 +1311,22 @@ fn walk_from(
             // and device nodes included -- which of them is SEARCHED is the
             // `--devices` policy's answer, and it is carried rather than re-asked.
             Ok(meta) if logical || !meta.file_type().is_symlink() => {
-                out.files.push(Found { path, device: is_device(&meta), root: false });
+                out.files.push(Found {
+                    path,
+                    device: is_device(&meta),
+                    root: false,
+                });
             }
             Ok(_) => {}
             // Only a logical walk gets here, on a link that does not resolve. Passed
             // on for the same reason the root is: the OPEN reports it, so a search
             // that never opens stays silent as GNU's does.
             Err(e) => match std::fs::symlink_metadata(&path).is_ok() {
-                true => out.files.push(Found { path, device: false, root: false }),
+                true => out.files.push(Found {
+                    path,
+                    device: false,
+                    root: false,
+                }),
                 false => out.diags.push((path, Diag::Failed(e))),
             },
         }
@@ -1459,7 +1494,9 @@ fn glob_class(pat: &[u8], open: usize, g: u8, caret: bool) -> Class {
                 Err(class) => class,
             };
         }
-        let Some(&c) = pat.get(i) else { return Class::Literal };
+        let Some(&c) = pat.get(i) else {
+            return Class::Literal;
+        };
         if c == b']' && !first {
             return Class::Closed(i.saturating_add(1), found != negate);
         }
@@ -1666,7 +1703,9 @@ fn glob_range(
 fn glob_skip(pat: &[u8], from: usize) -> Result<usize, Class> {
     let mut i = from;
     loop {
-        let Some(&c) = pat.get(i) else { return Err(Class::Literal) };
+        let Some(&c) = pat.get(i) else {
+            return Err(Class::Literal);
+        };
         i = i.saturating_add(1);
         if c == b']' {
             return Ok(i);
@@ -1758,7 +1797,9 @@ fn glob_class_name(pat: &[u8], from: usize) -> Result<usize, Class> {
         if i.saturating_sub(from) == CLASS_NAME_CAP {
             return Err(Class::Invalid);
         }
-        let Some(&c) = pat.get(i) else { return Err(Class::Literal) };
+        let Some(&c) = pat.get(i) else {
+            return Err(Class::Literal);
+        };
         if c == b':' && pat.get(i.saturating_add(1)) == Some(&b']') {
             return Ok(i);
         }
@@ -1870,10 +1911,17 @@ mod tests {
         };
         let first: Vec<u8> = b"0123456789".iter().copied().cycle().take(1000).collect();
         buf.put(&first).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap().as_slice(), first.get(..768).unwrap());
+        assert_eq!(
+            std::fs::read(&path).unwrap().as_slice(),
+            first.get(..768).unwrap()
+        );
         // An EXACT fill still leaves it held: stdio overflows rather than tops up.
         buf.put(&[b'z'; 24]).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap().len(), 768, "an exact fill does not write");
+        assert_eq!(
+            std::fs::read(&path).unwrap().len(),
+            768,
+            "an exact fill does not write"
+        );
         // Having more to put and nowhere to put it is what writes.
         buf.put(b"!").unwrap();
         assert_eq!(std::fs::read(&path).unwrap().len(), 1024);
@@ -1911,7 +1959,10 @@ mod tests {
         };
         let sized = StdioBuf::over(file);
         assert_eq!(sized.cap, want);
-        assert!(sized.cap <= StdioBuf::BUFSIZ, "a descriptor may only lower it");
+        assert!(
+            sized.cap <= StdioBuf::BUFSIZ,
+            "a descriptor may only lower it"
+        );
         assert!(!sized.line, "a regular file is not a terminal");
 
         drop((buf, sized));
@@ -2063,7 +2114,9 @@ mod tests {
             match self.0.remove(0) {
                 Ok(bytes) => {
                     let n = bytes.len().min(buf.len());
-                    buf.get_mut(..n).unwrap_or_default().copy_from_slice(&bytes[..n]);
+                    buf.get_mut(..n)
+                        .unwrap_or_default()
+                        .copy_from_slice(&bytes[..n]);
                     Ok(n)
                 }
                 Err(e) => Err(e),
@@ -2084,7 +2137,10 @@ mod tests {
         assert!(rec.next().unwrap(), "the partial record was dropped");
         assert_eq!(rec.line(), b"match");
         assert!(!rec.terminated());
-        assert!(rec.next().is_err(), "the deferred failure was never reported");
+        assert!(
+            rec.next().is_err(),
+            "the deferred failure was never reported"
+        );
     }
 
     /// The partial record a failed read leaves behind is counted like the EOF
@@ -2151,11 +2207,17 @@ mod tests {
         assert_eq!(rec.line(), b"a");
         assert!(rec.next().unwrap());
         assert_eq!(rec.line(), b"b");
-        assert!(!rec.next().unwrap(), "the empty read should be end of input");
+        assert!(
+            !rec.next().unwrap(),
+            "the empty read should be end of input"
+        );
         // Latched: without clearing it, nothing later is ever read.
         assert!(!rec.next().unwrap());
         rec.forget_eof();
-        assert!(rec.next().unwrap(), "a cleared end of input should read again");
+        assert!(
+            rec.next().unwrap(),
+            "a cleared end of input should read again"
+        );
         assert_eq!(rec.line(), b"c");
     }
 
@@ -2165,7 +2227,9 @@ mod tests {
     /// at a block.
     #[test]
     fn a_record_costs_one_block_of_the_source_and_no_more() {
-        let data: Vec<u8> = (0..2500u32).flat_map(|i| format!("{i:07}\n").into_bytes()).collect();
+        let data: Vec<u8> = (0..2500u32)
+            .flat_map(|i| format!("{i:07}\n").into_bytes())
+            .collect();
         assert!(data.len() > 8192, "the source must span several blocks");
         let mut rec = Records::with_buffer(std::io::Cursor::new(data.clone()), b'\n', 4096);
         assert!(rec.next().unwrap());
@@ -2204,7 +2268,10 @@ mod tests {
         assert!(rec.next().unwrap());
         assert!(!rec.binary(), "a NUL-free first buffer reported binary");
         assert!(rec.next().unwrap());
-        assert!(rec.binary(), "the buffer holding the NUL did not report binary");
+        assert!(
+            rec.binary(),
+            "the buffer holding the NUL did not report binary"
+        );
         assert!(rec.next().unwrap());
         assert!(rec.binary(), "a later NUL-free buffer cleared the verdict");
     }
@@ -2220,9 +2287,17 @@ mod tests {
         let mut rec = Records::new(src, b'\n');
         rec.zap_nuls(true);
         assert!(rec.next().unwrap());
-        assert_eq!(rec.line(), b"ax", "the NUL did not end the record it landed in");
+        assert_eq!(
+            rec.line(),
+            b"ax",
+            "the NUL did not end the record it landed in"
+        );
         assert!(rec.next().unwrap());
-        assert_eq!(rec.line(), b"y", "the rest of that buffer is a record of its own");
+        assert_eq!(
+            rec.line(),
+            b"y",
+            "the rest of that buffer is a record of its own"
+        );
     }
 
     /// A fill that is nothing but zeros is DROPPED rather than handed over as
@@ -2240,8 +2315,16 @@ mod tests {
         assert_eq!(rec.line(), b"a");
         assert_eq!(rec.take_skipped().0, 0);
         assert!(rec.next().unwrap());
-        assert_eq!(rec.line(), b"b", "the all-zero fill was handed over rather than dropped");
-        assert_eq!(rec.take_skipped().0, 4, "the dropped records were not counted");
+        assert_eq!(
+            rec.line(),
+            b"b",
+            "the all-zero fill was handed over rather than dropped"
+        );
+        assert_eq!(
+            rec.take_skipped().0,
+            4,
+            "the dropped records were not counted"
+        );
         // And the debt is owed once: asking again after taking it reports none.
         assert_eq!(rec.take_skipped().0, 0);
     }
@@ -2252,16 +2335,28 @@ mod tests {
     /// Measured against GNU 3.11, where `^foo.*bar$` selects such a record.
     #[test]
     fn an_open_record_is_joined_across_a_dropped_fill() {
-        let src =
-            Scripted(vec![Ok(b"a\x00"), Ok(b"ab"), Ok(b"\x00\x00\x00\x00"), Ok(b"c\n")]);
+        let src = Scripted(vec![
+            Ok(b"a\x00"),
+            Ok(b"ab"),
+            Ok(b"\x00\x00\x00\x00"),
+            Ok(b"c\n"),
+        ]);
         let mut rec = Records::with_buffer(src, b'\n', 4);
         rec.zap_nuls(true);
         rec.skip_zero_fills(true);
         assert!(rec.next().unwrap());
         assert_eq!(rec.line(), b"a");
         assert!(rec.next().unwrap());
-        assert_eq!(rec.line(), b"abc", "the open record was split by a dropped fill");
-        assert_eq!(rec.take_skipped().0, 4, "the dropped records were not counted");
+        assert_eq!(
+            rec.line(),
+            b"abc",
+            "the open record was split by a dropped fill"
+        );
+        assert_eq!(
+            rec.take_skipped().0,
+            4,
+            "the dropped records were not counted"
+        );
     }
 
     /// The read that TRIPS the verdict is never dropped, only later ones. GNU
@@ -2280,7 +2375,11 @@ mod tests {
         rec.zap_nuls(true);
         rec.skip_zero_fills(true);
         assert!(rec.next().unwrap());
-        assert_eq!(rec.line(), b"ab", "the read that tripped the verdict was dropped");
+        assert_eq!(
+            rec.line(),
+            b"ab",
+            "the read that tripped the verdict was dropped"
+        );
         assert_eq!(rec.take_skipped().0, 0);
     }
 
@@ -2326,19 +2425,22 @@ mod tests {
     /// has to be present when asked for and absent when not.
     #[test]
     fn the_nonblock_flag_is_the_one_the_kernel_took() {
-        let dir =
-            std::env::temp_dir().join(format!("td-txt-oflag-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("td-txt-oflag-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("f");
         std::fs::write(&path, b"x").unwrap();
         let name = path_bytes(&path);
         for (asked, want) in [(false, false), (true, true)] {
             let input = Input::open_maybe_nonblock(&name, false, asked).unwrap();
-            let Input::File(file) = &input else { panic!("not a file") };
+            let Input::File(file) = &input else {
+                panic!("not a file")
+            };
             use std::os::unix::io::AsRawFd;
             let info = format!("/proc/self/fdinfo/{}", file.as_raw_fd());
             // No /proc is not a failure of the flag: say nothing rather than red.
-            let Ok(text) = std::fs::read_to_string(&info) else { return };
+            let Ok(text) = std::fs::read_to_string(&info) else {
+                return;
+            };
             let flags = text.lines().find_map(|l| l.strip_prefix("flags:"));
             let Some(flags) = flags else { return };
             let bits = u32::from_str_radix(flags.trim(), 8).unwrap();
@@ -2380,8 +2482,16 @@ mod tests {
             (b"[^]", b"^", false, true),
         ];
         for (pat, name, unset, set) in rows {
-            assert_eq!(glob_match_with(pat, name, true), *unset, "{pat:?} {name:?} unset");
-            assert_eq!(glob_match_with(pat, name, false), *set, "{pat:?} {name:?} set");
+            assert_eq!(
+                glob_match_with(pat, name, true),
+                *unset,
+                "{pat:?} {name:?} unset"
+            );
+            assert_eq!(
+                glob_match_with(pat, name, false),
+                *set,
+                "{pat:?} {name:?} set"
+            );
         }
     }
 
@@ -2398,7 +2508,10 @@ mod tests {
             p
         };
         assert!(glob_match_with(&pat(2047), b"[", true), "2047 backs off");
-        assert!(!glob_match_with(&pat(2048), b"[", true), "2048 gives the pattern up");
+        assert!(
+            !glob_match_with(&pat(2048), b"[", true),
+            "2048 gives the pattern up"
+        );
     }
 
     #[test]
@@ -2412,8 +2525,14 @@ mod tests {
             p.extend_from_slice(b":]]");
             p
         };
-        assert!(glob_match_with(&pat(2046), b"a", true), "2046 is still a set");
-        assert!(!glob_match_with(&pat(2047), b"a", true), "2047 gives the pattern up");
+        assert!(
+            glob_match_with(&pat(2046), b"a", true),
+            "2046 is still a set"
+        );
+        assert!(
+            !glob_match_with(&pat(2047), b"a", true),
+            "2047 gives the pattern up"
+        );
     }
 
     #[test]
@@ -2423,8 +2542,18 @@ mod tests {
             ("*.c", "a.h", false, ""),
             ("?.c", "a.c", true, "one byte, exactly one"),
             ("?.c", "ab.c", false, ""),
-            ("*", "a/b", true, "a star crosses a slash, there being no FNM_PATHNAME"),
-            ("*", ".hidden", true, "and matches a leading dot, there being no FNM_PERIOD"),
+            (
+                "*",
+                "a/b",
+                true,
+                "a star crosses a slash, there being no FNM_PATHNAME",
+            ),
+            (
+                "*",
+                ".hidden",
+                true,
+                "and matches a leading dot, there being no FNM_PERIOD",
+            ),
             ("[ab].c", "b.c", true, "a set"),
             ("[!ab].c", "c.c", true, "and its negation"),
             ("[^ab].c", "c.c", true, "^ negates too"),
@@ -2432,56 +2561,241 @@ mod tests {
             ("[c-a].c", "b.c", false, ""),
             ("a\\*c", "a*c", true, "a backslash escapes the star"),
             ("a\\*c", "abc", false, ""),
-            ("a\\", "a\\", false, "a TRAILING backslash matches nothing at all"),
+            (
+                "a\\",
+                "a\\",
+                false,
+                "a TRAILING backslash matches nothing at all",
+            ),
             ("a\\", "a", false, ""),
-            ("[abc", "[abc", true, "an unclosed bracket falls back to a literal ["),
-            ("[a-", "[a-", false, "except mid-RANGE, where it matches nothing"),
-            ("[[-", "[[-", true, "and except [[-, which falls back anyway"),
+            (
+                "[abc",
+                "[abc",
+                true,
+                "an unclosed bracket falls back to a literal [",
+            ),
+            (
+                "[a-",
+                "[a-",
+                false,
+                "except mid-RANGE, where it matches nothing",
+            ),
+            (
+                "[[-",
+                "[[-",
+                true,
+                "and except [[-, which falls back anyway",
+            ),
             ("[[.a", "[[.a", false, "mid-[. matches nothing"),
-            ("[[:bogus:]]", "a", false, "an unknown class name aborts the pattern"),
-            ("[a[:bogus:]]", "a", true, "unless an item already matched, when the scan carries on"),
-            ("[:alpha:]", "a", true, "a bare [: with no :] is literal while the bracket closes"),
-            ("[:alpha:]", ":", true, "the same pattern is the SET of those bytes"),
-            ("[[.a.]-c]", "b", true, "only a COLLATING element may end a range"),
+            (
+                "[[:bogus:]]",
+                "a",
+                false,
+                "an unknown class name aborts the pattern",
+            ),
+            (
+                "[a[:bogus:]]",
+                "a",
+                true,
+                "unless an item already matched, when the scan carries on",
+            ),
+            (
+                "[:alpha:]",
+                "a",
+                true,
+                "a bare [: with no :] is literal while the bracket closes",
+            ),
+            (
+                "[:alpha:]",
+                ":",
+                true,
+                "the same pattern is the SET of those bytes",
+            ),
+            (
+                "[[.a.]-c]",
+                "b",
+                true,
+                "only a COLLATING element may end a range",
+            ),
             // glibc asks "is this a range?" differently after a collating
             // element than after a plain byte, and these four rows are the
             // whole of the difference.
-            ("[[.a.]-]", "a", false, "after `[.a.]` a `-]` IS a range, so the item is never tested"),
-            ("[[.a.]-]", "-", true, "...but the `-` it declines to use is still an item"),
-            ("[a-]", "a", true, "after a plain byte the same `-]` is NOT a range, so `a` stands"),
-            ("[[=a=]-]", "a", true, "and an equivalence class is not a collating element"),
-            ("[[.a.]-x]", "b", true, "a genuine range from a collating low end is unaffected"),
-            ("[a-[.z.]]", "q", true, "a COLLATING element ends a range: this is [a-z]"),
-            ("[a-[:alpha:]]", "a", false, "a CLASS does not, so the `[` is the endpoint BYTE"),
-            ("[a-[:alpha:]]", "a]", true, "...the bracket closes at the FIRST ], and the second is literal"),
-            ("[a-[=z=]]", "b", false, "an equivalence class is not an endpoint either"),
-            ("[a-[=z=]q]", "q", false, "`q` is past that first ], so it is not in the set"),
-            ("[x-[:alpha:]", "a", true, "unclosed: x..[ is empty and `:alpha:` are the items"),
-            ("[x-[:alpha:]", "x", false, "...and `x` is not among them, which is what tells the two apart"),
-            ("[[:alpha:]-c]", "-", true, "BEFORE the -, the class is an item and the - a byte"),
+            (
+                "[[.a.]-]",
+                "a",
+                false,
+                "after `[.a.]` a `-]` IS a range, so the item is never tested",
+            ),
+            (
+                "[[.a.]-]",
+                "-",
+                true,
+                "...but the `-` it declines to use is still an item",
+            ),
+            (
+                "[a-]",
+                "a",
+                true,
+                "after a plain byte the same `-]` is NOT a range, so `a` stands",
+            ),
+            (
+                "[[=a=]-]",
+                "a",
+                true,
+                "and an equivalence class is not a collating element",
+            ),
+            (
+                "[[.a.]-x]",
+                "b",
+                true,
+                "a genuine range from a collating low end is unaffected",
+            ),
+            (
+                "[a-[.z.]]",
+                "q",
+                true,
+                "a COLLATING element ends a range: this is [a-z]",
+            ),
+            (
+                "[a-[:alpha:]]",
+                "a",
+                false,
+                "a CLASS does not, so the `[` is the endpoint BYTE",
+            ),
+            (
+                "[a-[:alpha:]]",
+                "a]",
+                true,
+                "...the bracket closes at the FIRST ], and the second is literal",
+            ),
+            (
+                "[a-[=z=]]",
+                "b",
+                false,
+                "an equivalence class is not an endpoint either",
+            ),
+            (
+                "[a-[=z=]q]",
+                "q",
+                false,
+                "`q` is past that first ], so it is not in the set",
+            ),
+            (
+                "[x-[:alpha:]",
+                "a",
+                true,
+                "unclosed: x..[ is empty and `:alpha:` are the items",
+            ),
+            (
+                "[x-[:alpha:]",
+                "x",
+                false,
+                "...and `x` is not among them, which is what tells the two apart",
+            ),
+            (
+                "[[:alpha:]-c]",
+                "-",
+                true,
+                "BEFORE the -, the class is an item and the - a byte",
+            ),
             ("[[=a=]-c]", "-", true, "the same for an equivalence class"),
-            ("[[.a.]-c]", "b", true, "but a collating element there DOES open a range"),
+            (
+                "[[.a.]-c]",
+                "b",
+                true,
+                "but a collating element there DOES open a range",
+            ),
             ("[[.a.]-c]", "-", false, ""),
-            ("[[=a=]-c]", "b", false, "[=x=] is a plain item, so the - beside it is a byte"),
+            (
+                "[[=a=]-c]",
+                "b",
+                false,
+                "[=x=] is a plain item, so the - beside it is a byte",
+            ),
             ("[[=a=]-c]", "-", true, "and that byte is matchable"),
             ("[[:alpha:]-c]", "-", true, "a class is a plain item too"),
-            ("[[:alpha:]]", "q", true, "a class inside a bracket is a class"),
+            (
+                "[[:alpha:]]",
+                "q",
+                true,
+                "a class inside a bracket is a class",
+            ),
             ("[[:digit:]]", "q", false, ""),
             // Once an item matches, glibc re-walks the REST of the set under
             // different rules than the scan that got there. These pin that walk.
-            ("[a[=]", "a", false, "a malformed [= in the walk voids the whole pattern"),
-            ("[a[=]", "[", true, "...so the set is exactly the two bytes the scan read first"),
+            (
+                "[a[=]",
+                "a",
+                false,
+                "a malformed [= in the walk voids the whole pattern",
+            ),
+            (
+                "[a[=]",
+                "[",
+                true,
+                "...so the set is exactly the two bytes the scan read first",
+            ),
             ("[a[=]", "=", true, ""),
-            ("[a[.xy.]]", "a", true, "the walk SEARCHES for the next .], multi-byte or not"),
-            ("[a[.xy.]]", "x", false, "where the scan takes one byte, so it never matched here"),
-            ("[a[:]", "a", true, "a bad class name backs the walk off to its own colon"),
-            ("[a[:zz:]]", "a", false, "z is outside a..y, so this backs off and ends at the FIRST ]"),
-            ("[a[:zz:]]", "a]", true, "...leaving the second ] in the pattern, which is what proves it"),
-            ("[a[:alpha:]]", "a", true, "a well-formed class name is shape-checked, never looked up"),
-            ("*[[", "[[", true, "but an unterminated set still falls back after a match"),
-            ("*[a[.xy.]]", "xa", true, "and a void is local to ONE star attempt, not the match"),
-            ("low/c.c", "low/c.c", true, "the slash is an ordinary byte here"),
-            ("", "", true, "the empty pattern matches only the empty name"),
+            (
+                "[a[.xy.]]",
+                "a",
+                true,
+                "the walk SEARCHES for the next .], multi-byte or not",
+            ),
+            (
+                "[a[.xy.]]",
+                "x",
+                false,
+                "where the scan takes one byte, so it never matched here",
+            ),
+            (
+                "[a[:]",
+                "a",
+                true,
+                "a bad class name backs the walk off to its own colon",
+            ),
+            (
+                "[a[:zz:]]",
+                "a",
+                false,
+                "z is outside a..y, so this backs off and ends at the FIRST ]",
+            ),
+            (
+                "[a[:zz:]]",
+                "a]",
+                true,
+                "...leaving the second ] in the pattern, which is what proves it",
+            ),
+            (
+                "[a[:alpha:]]",
+                "a",
+                true,
+                "a well-formed class name is shape-checked, never looked up",
+            ),
+            (
+                "*[[",
+                "[[",
+                true,
+                "but an unterminated set still falls back after a match",
+            ),
+            (
+                "*[a[.xy.]]",
+                "xa",
+                true,
+                "and a void is local to ONE star attempt, not the match",
+            ),
+            (
+                "low/c.c",
+                "low/c.c",
+                true,
+                "the slash is an ordinary byte here",
+            ),
+            (
+                "",
+                "",
+                true,
+                "the empty pattern matches only the empty name",
+            ),
             ("", "a", false, ""),
             ("*", "", true, "a star matches nothing at all"),
         ];

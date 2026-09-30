@@ -99,10 +99,11 @@ fn primary_arguments(
     // files. This parser placeholder is replaced before authorization.
     let mut forwarded = vec!["primary".into()];
     forwarded.extend_from_slice(args);
-    exec_as::parse(&forwarded).map_err(|error| {
-        format!("{error}\nusage: td-login exec-primary -- PROGRAM [ARG…]")
-    })?;
-    let user = forwarded.first_mut().ok_or("missing primary argument slot")?;
+    exec_as::parse(&forwarded)
+        .map_err(|error| format!("{error}\nusage: td-login exec-primary -- PROGRAM [ARG…]"))?;
+    let user = forwarded
+        .first_mut()
+        .ok_or("missing primary argument slot")?;
     *user = load()?.name().into();
     Ok(forwarded)
 }
@@ -220,8 +221,14 @@ fn route(argv: &[String]) -> Route<'_> {
         Some(v) if v == VERIFY => Route::Verify { args_from: 2 },
         Some(v) if v == EXEC_AS => Route::ExecAs { args_from: 2 },
         Some(v) if v == EXEC_SERVICE_AS => Route::ExecServiceAs { args_from: 2 },
-        Some(v) if v == EXEC_PRIMARY => Route::Primary { args_from: 2, login: false },
-        Some(v) if v == LOGIN_PRIMARY => Route::Primary { args_from: 2, login: true },
+        Some(v) if v == EXEC_PRIMARY => Route::Primary {
+            args_from: 2,
+            login: false,
+        },
+        Some(v) if v == LOGIN_PRIMARY => Route::Primary {
+            args_from: 2,
+            login: true,
+        },
         Some("--list") => Route::List,
         _ => Route::Usage,
     }
@@ -327,10 +334,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         Route::Verify { args_from } => (VERIFY, verify(argv.get(args_from..).unwrap_or(&[]))),
-        Route::ExecAs { args_from } => (
-            EXEC_AS,
-            exec_as::run(argv.get(args_from..).unwrap_or(&[])),
-        ),
+        Route::ExecAs { args_from } => {
+            (EXEC_AS, exec_as::run(argv.get(args_from..).unwrap_or(&[])))
+        }
         Route::ExecServiceAs { args_from } => (
             EXEC_SERVICE_AS,
             exec_as::run_service(argv.get(args_from..).unwrap_or(&[])),
@@ -408,18 +414,37 @@ mod tests {
     }
 
     fn alice() -> Result<primary_account::PrimaryAccount, String> {
-        primary_account::parse("root:x:0:0:Root:/root:/bin/sh\nalice:x:1000:1000:Alice:/home/alice:/bin/sh\n")
-            .map_err(|error| error.to_string())
+        primary_account::parse(
+            "root:x:0:0:Root:/root:/bin/sh\nalice:x:1000:1000:Alice:/home/alice:/bin/sh\n",
+        )
+        .map_err(|error| error.to_string())
     }
 
     #[test]
     fn primary_routes_are_explicit_and_forward_only_the_resolved_identity() {
         for (verb, login) in [(LOGIN_PRIMARY, true), (EXEC_PRIMARY, false)] {
-            assert_eq!(route(&argv(&["td-login", verb])), Route::Primary { args_from: 2, login });
+            assert_eq!(
+                route(&argv(&["td-login", verb])),
+                Route::Primary {
+                    args_from: 2,
+                    login
+                }
+            );
             assert_eq!(route(&argv(&[&format!("/bin/{verb}")])), Route::Usage);
         }
-        assert_eq!(primary_arguments(&[], true, alice).unwrap(), argv(&["-f", "alice"]));
-        let args = argv(&["--", "/bin/tool", "two words", "$(command)", "*", "--user", "root"]);
+        assert_eq!(
+            primary_arguments(&[], true, alice).unwrap(),
+            argv(&["-f", "alice"])
+        );
+        let args = argv(&[
+            "--",
+            "/bin/tool",
+            "two words",
+            "$(command)",
+            "*",
+            "--user",
+            "root",
+        ]);
         let forwarded = primary_arguments(&args, false, alice).unwrap();
         let parsed = exec_as::parse(&forwarded).unwrap();
         assert_eq!(parsed.user, "alice");
@@ -439,15 +464,21 @@ mod tests {
             (false, argv(&["--", "/bin/"])),
         ] {
             let mut loaded = false;
-            let error = primary_arguments(&args, login, || { loaded = true; alice() }).unwrap_err();
+            let error = primary_arguments(&args, login, || {
+                loaded = true;
+                alice()
+            })
+            .unwrap_err();
             if !login {
                 assert!(error.contains("usage: td-login exec-primary -- PROGRAM [ARG…]"));
             }
             assert!(!loaded);
         }
         for (login, args) in [(true, vec![]), (false, argv(&["--", "/bin/true"]))] {
-            assert_eq!(primary_arguments(&args, login, || Err("invalid account database".into())),
-                Err("invalid account database".into()));
+            assert_eq!(
+                primary_arguments(&args, login, || Err("invalid account database".into())),
+                Err("invalid account database".into())
+            );
         }
     }
 
@@ -479,7 +510,13 @@ mod tests {
             Route::Verify { args_from: 2 }
         );
         assert_eq!(
-            route(&argv(&["td-login", EXEC_AS, "tester", "--", "/bin/td-busd"])),
+            route(&argv(&[
+                "td-login",
+                EXEC_AS,
+                "tester",
+                "--",
+                "/bin/td-busd"
+            ])),
             Route::ExecAs { args_from: 2 }
         );
         assert_eq!(
@@ -513,13 +550,22 @@ mod tests {
     /// `--list` prints and the shipped `/bin` symlink farm is built from.
     #[test]
     fn the_subcommands_are_not_in_the_applet_roster() {
-        for name in [VERIFY, EXEC_AS, EXEC_SERVICE_AS, EXEC_PRIMARY, LOGIN_PRIMARY] {
+        for name in [
+            VERIFY,
+            EXEC_AS,
+            EXEC_SERVICE_AS,
+            EXEC_PRIMARY,
+            LOGIN_PRIMARY,
+        ] {
             assert!(
                 !names().contains(&name),
                 "{name} is a subcommand, so a /bin/{name} symlink would be an \
                  unaccounted name on the image"
             );
-            assert!(lookup(name).is_none(), "{name} must not resolve as an applet");
+            assert!(
+                lookup(name).is_none(),
+                "{name} must not resolve as an applet"
+            );
         }
     }
 
@@ -529,14 +575,19 @@ mod tests {
     #[test]
     fn the_readback_probe_parses_and_compares() {
         assert!(verify(&argv(&["--uid"])).is_err());
-        assert!(verify(&argv(&["--uid", "1000"])).is_err(), "needs --gid too");
+        assert!(
+            verify(&argv(&["--uid", "1000"])).is_err(),
+            "needs --gid too"
+        );
         assert!(verify(&argv(&["--uid", "x", "--gid", "1"])).is_err());
         // A repeated flag means two different assertions; last-wins would
         // silently make the probe prove the weaker one.
         for repeated in [
             vec!["--uid", "0", "--uid", "1000", "--gid", "0"],
             vec!["--uid", "0", "--gid", "0", "--gid", "1000"],
-            vec!["--uid", "0", "--gid", "0", "--groups", "0", "--groups", "10"],
+            vec![
+                "--uid", "0", "--gid", "0", "--groups", "0", "--groups", "10",
+            ],
         ] {
             let err = verify(&argv(&repeated)).unwrap_err();
             assert!(err.contains("more than once"), "got: {err}");
@@ -634,7 +685,10 @@ mod confinement {
         let (mut out, mut other) = (Vec::new(), Vec::new());
         collect(base, base, &mut out, &mut other);
         let shared = base.join("../../td-authd/src/primary_account.rs");
-        out.push(("primary_account.rs".into(), strip_comments(&std::fs::read_to_string(shared).unwrap())));
+        out.push((
+            "primary_account.rs".into(),
+            strip_comments(&std::fs::read_to_string(shared).unwrap()),
+        ));
         out.sort();
         other.sort();
         (out, other)
@@ -988,8 +1042,18 @@ mod confinement {
         assert_eq!(
             paths,
             [
-                "cgroup.rs", "creds.rs", "db.rs", "exec_as.rs", "login.rs", "main.rs",
-                "primary_account.rs", "session.rs", "status.rs", "su.rs", "sys.rs", "tty.rs",
+                "cgroup.rs",
+                "creds.rs",
+                "db.rs",
+                "exec_as.rs",
+                "login.rs",
+                "main.rs",
+                "primary_account.rs",
+                "session.rs",
+                "status.rs",
+                "su.rs",
+                "sys.rs",
+                "tty.rs",
             ],
             "the crate's file set changed"
         );
@@ -1140,7 +1204,10 @@ mod confinement {
         // source, so `hidden!(unsafe)` is an unsafe block the block count cannot
         // see and a macro can expand one audited call into two.
         let permitted_path = concat!("#[", "path=\"../../td-authd/src/primary_account.rs\"]");
-        assert_eq!(squeeze(&source("main.rs")).matches(permitted_path).count(), 1);
+        assert_eq!(
+            squeeze(&source("main.rs")).matches(permitted_path).count(),
+            1
+        );
         let squeezed = squeezed().replacen(permitted_path, "", 1);
         for construct in [
             concat!("[", "path="),
@@ -1177,15 +1244,26 @@ mod confinement {
         let mut total = 0;
         for (path, text) in sources() {
             let count = text.matches(LINT).count();
-            let expected = if path == "main.rs" { 2 } else { usize::from(path == "sys.rs") };
+            let expected = if path == "main.rs" {
+                2
+            } else {
+                usize::from(path == "sys.rs")
+            };
             assert_eq!(
                 count, expected,
                 "'{path}' names the unsafe lint {count} time(s), expected {expected}"
             );
             total += count;
         }
-        assert_eq!(total, 3, "denied at root, forbidden on the shared module, allowed on the syscall body");
-        assert!(source("main.rs").contains(concat!("#[forbid(un", "safe_code)]\n#[", "path = \"../../td-authd/src/primary_account.rs\"]\nmod primary_account;")));
+        assert_eq!(
+            total, 3,
+            "denied at root, forbidden on the shared module, allowed on the syscall body"
+        );
+        assert!(source("main.rs").contains(concat!(
+            "#[forbid(un",
+            "safe_code)]\n#[",
+            "path = \"../../td-authd/src/primary_account.rs\"]\nmod primary_account;"
+        )));
     }
 
     /// Inline assembly has more than one entry point, and the block pin only
@@ -1260,11 +1338,15 @@ mod confinement {
     #[test]
     fn every_call_site_is_pinned_whole() {
         const ARGUMENTS: &[&str] = &[
-            "(SYS_SETGROUPS,list.len(),list.as_ptr()asusize,)",
+            "(SYS_SETGROUPS,list.len(),list.as_ptr()asusize)",
             "(SYS_SETGID,gidasusize,0)",
             "(SYS_SETUID,uidasusize,0)",
         ];
-        assert_eq!(ARGUMENTS.len(), AMENDED.len(), "one pin per amended syscall");
+        assert_eq!(
+            ARGUMENTS.len(),
+            AMENDED.len(),
+            "one pin per amended syscall"
+        );
         let sys = squeeze(&source("sys.rs"));
         for arguments in ARGUMENTS {
             assert_eq!(
@@ -1348,8 +1430,11 @@ mod confinement {
     fn the_raw_entry_point_is_private_to_its_module() {
         let sys = squeeze(&source("sys.rs"));
         assert_eq!(
-            sys.matches(&format!("{}{CALL}(", concat!("#[allow(un", "safe_code)]fn")))
-                .count(),
+            sys.matches(&format!(
+                "{}{CALL}(",
+                concat!("#[allow(un", "safe_code)]fn")
+            ))
+            .count(),
             1,
             "the raw entry point must be the item under the scoped allow, with no visibility"
         );
@@ -1485,15 +1570,23 @@ mod confinement {
     fn the_child_process_api_is_never_used_to_set_credentials() {
         // MetadataExt reads take no argument; CommandExt setters require one.
         let metadata_read = concat!(".u", "id()");
-        assert_eq!(squeeze(&source("primary_account.rs")).matches(metadata_read).count(), 4);
-        let squeezed: String = sources().into_iter().map(|(path, text)| {
-            let text = squeeze(&text);
-            if path == "primary_account.rs" {
-                text.replace(metadata_read, "")
-            } else {
-                text
-            }
-        }).collect();
+        assert_eq!(
+            squeeze(&source("primary_account.rs"))
+                .matches(metadata_read)
+                .count(),
+            4
+        );
+        let squeezed: String = sources()
+            .into_iter()
+            .map(|(path, text)| {
+                let text = squeeze(&text);
+                if path == "primary_account.rs" {
+                    text.replace(metadata_read, "")
+                } else {
+                    text
+                }
+            })
+            .collect();
         for shut in [
             concat!(".u", "id("),
             concat!(".g", "id("),
@@ -1525,15 +1618,18 @@ mod confinement {
         assert!(!reader.contains(MODE), "the account reader writes no modes");
         assert_eq!(tests.matches(&format!("{MODE}0o644)")).count(), 2);
         assert_eq!(tests.matches(&format!("{MODE}0o666)")).count(), 1);
-        let squeezed: String = sources().into_iter().map(|(path, text)| {
-            let text = squeeze(&text);
-            if path == "primary_account.rs" {
-                text.replace(&format!("{MODE}0o644)"), "")
-                    .replace(&format!("{MODE}0o666)"), "")
-            } else {
-                text
-            }
-        }).collect();
+        let squeezed: String = sources()
+            .into_iter()
+            .map(|(path, text)| {
+                let text = squeeze(&text);
+                if path == "primary_account.rs" {
+                    text.replace(&format!("{MODE}0o644)"), "")
+                        .replace(&format!("{MODE}0o666)"), "")
+                } else {
+                    text
+                }
+            })
+            .collect();
         assert_eq!(
             squeezed.matches(MODE).count(),
             2,

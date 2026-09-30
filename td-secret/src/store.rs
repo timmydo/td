@@ -92,11 +92,18 @@ pub struct MigrationFailure {
 
 pub fn migrate_owner(parent: &File, uid: u32, owner: u32) -> Result<(), MigrationFailure> {
     let mut quarantined = false;
-    migrate_owner_inner(parent, uid, owner, &mut quarantined)
-        .map_err(|message| MigrationFailure { quarantined, message })
+    migrate_owner_inner(parent, uid, owner, &mut quarantined).map_err(|message| MigrationFailure {
+        quarantined,
+        message,
+    })
 }
 
-fn migrate_owner_inner(parent: &File, uid: u32, owner: u32, quarantined: &mut bool) -> Result<(), String> {
+fn migrate_owner_inner(
+    parent: &File,
+    uid: u32,
+    owner: u32,
+    quarantined: &mut bool,
+) -> Result<(), String> {
     require_root()?;
     if !(1000..=65533).contains(&uid) || !(1..=999).contains(&owner) {
         return Err("invalid credential service ownership assignment".into());
@@ -115,7 +122,9 @@ fn migrate_owner_inner(parent: &File, uid: u32, owner: u32, quarantined: &mut bo
     let already_published = metadata.uid() == owner;
     // Restrict traversal before inspecting children. No user process from the
     // preceding boot survives this sysinit migration; root remains trusted.
-    directory.set_permissions(fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    directory
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(|e| e.to_string())?;
     std::os::unix::fs::fchown(&directory, Some(0), Some(0)).map_err(|e| e.to_string())?;
     directory.sync_all().map_err(|e| e.to_string())?;
     *quarantined = true;
@@ -129,7 +138,8 @@ fn migrate_owner_inner(parent: &File, uid: u32, owner: u32, quarantined: &mut bo
         .open(&lock_path)
     {
         Ok(file) => {
-            file.set_permissions(fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
             file
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
@@ -147,17 +157,24 @@ fn migrate_owner_inner(parent: &File, uid: u32, owner: u32, quarantined: &mut bo
         return Err("credential ownership lock has an invalid identity or length".into());
     }
     // An interrupted empty-lock creation may have only umask-masked owner bits.
-    lock.set_permissions(fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-    lock.try_lock().map_err(|e| format!("lock credential ownership migration: {e}"))?;
+    lock.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|e| e.to_string())?;
+    lock.try_lock()
+        .map_err(|e| format!("lock credential ownership migration: {e}"))?;
     let result = (|| {
         let mut files = Vec::new();
         for entry in fs::read_dir(pinned(&directory)).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
-            let name = entry.file_name().into_string().map_err(|_| "invalid credential filename")?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "invalid credential filename")?;
             if name == "lock" {
                 continue;
             }
-            let record = name.split_once('.').is_some_and(|(app, name)| valid_name(app) && valid_name(name));
+            let record = name
+                .split_once('.')
+                .is_some_and(|(app, name)| valid_name(app) && valid_name(name));
             let temporary = name.strip_prefix("tmp-").is_some_and(|suffix| {
                 suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
             });
@@ -171,10 +188,17 @@ fn migrate_owner_inner(parent: &File, uid: u32, owner: u32, quarantined: &mut bo
                 .map_err(|e| e.to_string())?;
             let metadata = file.metadata().map_err(|e| e.to_string())?;
             let mode = metadata.mode() & 0o7777;
-            let interrupted_root = temporary && metadata.uid() == 0 && metadata.len() == 0
-                && mode & !0o600 == 0;
-            private_metadata(&file, metadata.uid(), if interrupted_root { mode } else { 0o600 }, false)?;
-            if (!interrupted_root && metadata.uid() != owner && (already_published || metadata.uid() != uid))
+            let interrupted_root =
+                temporary && metadata.uid() == 0 && metadata.len() == 0 && mode & !0o600 == 0;
+            private_metadata(
+                &file,
+                metadata.uid(),
+                if interrupted_root { mode } else { 0o600 },
+                false,
+            )?;
+            if (!interrupted_root
+                && metadata.uid() != owner
+                && (already_published || metadata.uid() != uid))
                 || metadata.len() > MAX_BUNDLE as u64
             {
                 return Err("credential file has an invalid migration identity or length".into());
@@ -190,19 +214,23 @@ fn migrate_owner_inner(parent: &File, uid: u32, owner: u32, quarantined: &mut bo
                 // atomic_write has not written bytes before its ownership switch.
                 fs::remove_file(pinned(&directory).join(name)).map_err(|e| e.to_string())?;
             } else {
-                std::os::unix::fs::fchown(file, Some(owner), Some(owner)).map_err(|e| e.to_string())?;
+                std::os::unix::fs::fchown(file, Some(owner), Some(owner))
+                    .map_err(|e| e.to_string())?;
                 file.sync_all().map_err(|e| e.to_string())?;
             }
         }
         std::os::unix::fs::fchown(&lock, Some(owner), Some(owner)).map_err(|e| e.to_string())?;
         lock.sync_all().map_err(|e| e.to_string())?;
         directory.sync_all().map_err(|e| e.to_string())?;
-        std::os::unix::fs::fchown(&directory, Some(owner), Some(owner)).map_err(|e| e.to_string())?;
+        std::os::unix::fs::fchown(&directory, Some(owner), Some(owner))
+            .map_err(|e| e.to_string())?;
         *quarantined = false;
         directory.sync_all().map_err(|e| e.to_string())?;
         parent.sync_all().map_err(|e| e.to_string())
     })();
-    let unlocked = lock.unlock().map_err(|e| format!("unlock credential ownership migration: {e}"));
+    let unlocked = lock
+        .unlock()
+        .map_err(|e| format!("unlock credential ownership migration: {e}"));
     result.and(unlocked)
 }
 
@@ -274,8 +302,8 @@ impl Store {
                 };
                 let (_, aad) = Self::record(app, name)?;
                 let nonce = random::<12>()?;
-                let mut secret = read(app, name, previous)?
-                    .ok_or("credential disappeared during sealing")?;
+                let mut secret =
+                    read(app, name, previous)?.ok_or("credential disappeared during sealing")?;
                 let mut derived = crypto::derive(&master, app);
                 let mut record = MAGIC.to_vec();
                 record.extend_from_slice(&nonce);
@@ -382,7 +410,9 @@ impl Store {
     }
 
     pub fn token_protected(&self) -> Result<bool, String> {
-        Ok(self.bundle()?.is_some_and(|bundle| bundle.token_protected()))
+        Ok(self
+            .bundle()?
+            .is_some_and(|bundle| bundle.token_protected()))
     }
 
     pub fn sealed(&self) -> Result<bool, String> {
@@ -391,18 +421,27 @@ impl Store {
 
     /// Firstboot never releases a key, including for legacy platform stores.
     pub fn prepare_boot(&self) -> Result<(), String> {
-        if self.bundle()?.is_none() { return Ok(()); }
+        if self.bundle()?.is_none() {
+            return Ok(());
+        }
         require_root()?;
         lock_runtime(&runtime_directory(self.uid, true)?)?;
         self.retire_legacy()?;
-        eprintln!("td-secret: session {} remains locked pending secure attention", self.uid);
+        eprintln!(
+            "td-secret: session {} remains locked pending secure attention",
+            self.uid
+        );
         Ok(())
     }
 
     /// Only a token-protected and currently released store serves applications.
     pub fn application_secret(&self, app: &str, name: &str) -> Result<Option<Vec<u8>>, String> {
-        let bundle = self.bundle()?.ok_or("credential store requires token enrollment")?;
-        if !bundle.token_protected() { return Err("credential store requires token enrollment".into()); }
+        let bundle = self
+            .bundle()?
+            .ok_or("credential store requires token enrollment")?;
+        if !bundle.token_protected() {
+            return Err("credential store requires token enrollment".into());
+        }
         self.get_from(app, name, Some(&bundle))
     }
 
@@ -488,7 +527,9 @@ impl Store {
         info: &super::fido_enroll::Info,
     ) -> Result<super::fido_metadata::BoundRelease, String> {
         require_root()?;
-        let bundle = self.bundle()?.ok_or("credential store is not token enrolled")?;
+        let bundle = self
+            .bundle()?
+            .ok_or("credential store is not token enrolled")?;
         if !bundle.token_protected() {
             return Err("credential store is not token enrolled".into());
         }
@@ -515,7 +556,9 @@ impl Store {
         client: tpm::Client<T>,
     ) -> Result<(), String> {
         lock_runtime(runtime)?;
-        let bundle = self.bundle()?.ok_or("credential store is not token enrolled")?;
+        let bundle = self
+            .bundle()?
+            .ok_or("credential store is not token enrolled")?;
         if !bundle.token_protected() {
             return Err("credential store is not token enrolled".into());
         }
@@ -766,7 +809,12 @@ impl Store {
         self.get_from(app, name, bundle.as_ref())
     }
 
-    fn get_from(&self, app: &str, name: &str, bundle: Option<&Bundle>) -> Result<Option<Vec<u8>>, String> {
+    fn get_from(
+        &self,
+        app: &str,
+        name: &str,
+        bundle: Option<&Bundle>,
+    ) -> Result<Option<Vec<u8>>, String> {
         self.get_from_key(app, name, bundle, || self.key(app, bundle))
     }
 
@@ -843,9 +891,8 @@ fn lock_runtime(runtime: &File) -> Result<(), String> {
         let name = entry.file_name();
         let name = name.to_str().ok_or("invalid credential runtime entry")?;
         if !name.strip_prefix("tmp-").is_some_and(|suffix| {
-                suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-        {
+            suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
             return Err("unknown credential runtime entry".into());
         }
         fs::remove_file(entry.path()).map_err(|e| format!("lock credential runtime: {e}"))?;
@@ -869,7 +916,12 @@ impl Bundle {
         if self.records.len() > MAX_ENTRIES {
             return Err("sealed store holds at most 128 credentials".into());
         }
-        let mut bytes = if self.token_protected() { b"TDSEAL02" } else { b"TDSEAL01" }.to_vec();
+        let mut bytes = if self.token_protected() {
+            b"TDSEAL02"
+        } else {
+            b"TDSEAL01"
+        }
+        .to_vec();
         field(&mut bytes, &self.key)?;
         bytes.extend_from_slice(&(self.records.len() as u32).to_be_bytes());
         for (name, record) in &self.records {
@@ -890,7 +942,11 @@ impl Bundle {
             b"TDSEAL02" => true,
             _ => return Err("invalid sealed store format".into()),
         };
-        let limit = if token { super::fido_metadata::MAX_PROTECTION } else { tpm::MAX_PACKET };
+        let limit = if token {
+            super::fido_metadata::MAX_PROTECTION
+        } else {
+            tpm::MAX_PACKET
+        };
         let key = read_field(&mut bytes, limit)?.to_vec();
         if token != key.starts_with(b"TDFIDO01") {
             return Err("sealed store and protector versions disagree".into());
@@ -1179,8 +1235,13 @@ mod tests {
             path
         };
         let read = |uid: u32, path: &Path| {
-            std::process::Command::new(&busybox).arg("cat").arg(path)
-                .uid(uid).gid(uid).output().unwrap()
+            std::process::Command::new(&busybox)
+                .arg("cat")
+                .arg(path)
+                .uid(uid)
+                .gid(uid)
+                .output()
+                .unwrap()
         };
         let path = make(1000);
         let master = fs::read(path.join("master")).unwrap();
@@ -1196,18 +1257,35 @@ mod tests {
         }
         assert_eq!(read(991, &path.join("master")).stdout, master);
         assert_eq!(fs::read(path.join("mail.main")).unwrap(), record);
-        assert_eq!(Store::open_owned(&path, 1000, 991, false).unwrap()
-            .get("mail", "main").unwrap().unwrap(), b"preserved credential");
+        assert_eq!(
+            Store::open_owned(&path, 1000, 991, false)
+                .unwrap()
+                .get("mail", "main")
+                .unwrap()
+                .unwrap(),
+            b"preserved credential"
+        );
 
         // A crash after the leaf restriction and one file transfer is resumable.
         let path = make(1001);
         std::os::unix::fs::chown(&path, Some(0), Some(0)).unwrap();
         std::os::unix::fs::chown(path.join("master"), Some(991), Some(991)).unwrap();
         migrate_owner(&parent, 1001, 991).unwrap();
-        assert_eq!(Store::open_owned(&path, 1001, 991, false).unwrap()
-            .get("mail", "main").unwrap().unwrap(), b"preserved credential");
+        assert_eq!(
+            Store::open_owned(&path, 1001, 991, false)
+                .unwrap()
+                .get("mail", "main")
+                .unwrap()
+                .unwrap(),
+            b"preserved credential"
+        );
 
-        for (uid, bad) in [(1002, "unknown"), (1003, "symlink"), (1004, "hardlink"), (1005, "owner")] {
+        for (uid, bad) in [
+            (1002, "unknown"),
+            (1003, "symlink"),
+            (1004, "hardlink"),
+            (1005, "owner"),
+        ] {
             let path = make(uid);
             match bad {
                 "unknown" => fs::write(path.join("foreign"), b"foreign").unwrap(),
@@ -1225,24 +1303,43 @@ mod tests {
         assert!(migrate_owner(&parent, 1006, 991).is_err());
         drop(store);
         migrate_owner(&parent, 1006, 991).unwrap();
-        for (uid, mode, published) in [(1007, 0o600, false), (1008, 0, false), (1009, 0o600, true), (1010, 0, true)] {
+        for (uid, mode, published) in [
+            (1007, 0o600, false),
+            (1008, 0, false),
+            (1009, 0o600, true),
+            (1010, 0, true),
+        ] {
             let path = make(uid);
-            if published { migrate_owner(&parent, uid, 991).unwrap(); }
+            if published {
+                migrate_owner(&parent, uid, 991).unwrap();
+            }
             let scratch = path.join("tmp-0123456789abcdef0123456789abcdef");
             fs::write(&scratch, b"").unwrap();
             fs::set_permissions(&scratch, fs::Permissions::from_mode(mode)).unwrap();
             assert_eq!(fs::metadata(&scratch).unwrap().uid(), 0);
             migrate_owner(&parent, uid, 991).unwrap();
             assert!(!scratch.exists());
-            assert_eq!(Store::open_owned(&path, uid, 991, false).unwrap()
-                .get("mail", "main").unwrap().unwrap(), b"preserved credential");
+            assert_eq!(
+                Store::open_owned(&path, uid, 991, false)
+                    .unwrap()
+                    .get("mail", "main")
+                    .unwrap()
+                    .unwrap(),
+                b"preserved credential"
+            );
         }
         let path = make(1011);
         std::os::unix::fs::chown(path.join("lock"), Some(0), Some(0)).unwrap();
         fs::set_permissions(path.join("lock"), fs::Permissions::from_mode(0o000)).unwrap();
         migrate_owner(&parent, 1011, 991).unwrap();
-        assert_eq!(Store::open_owned(&path, 1011, 991, false).unwrap()
-            .get("mail", "main").unwrap().unwrap(), b"preserved credential");
+        assert_eq!(
+            Store::open_owned(&path, 1011, 991, false)
+                .unwrap()
+                .get("mail", "main")
+                .unwrap()
+                .unwrap(),
+            b"preserved credential"
+        );
         let path = make(1012);
         std::os::unix::fs::chown(&path, Some(999), Some(999)).unwrap();
         assert!(!migrate_owner(&parent, 1012, 991).unwrap_err().quarantined);
@@ -1252,7 +1349,11 @@ mod tests {
 
     #[test]
     fn token_enrollment_is_one_atomic_rotation_and_never_uses_legacy_fallback() {
-        let root = std::env::temp_dir().join(format!("td-token-store-{}-{}", std::process::id(), u64::from_le_bytes(random::<8>().unwrap())));
+        let root = std::env::temp_dir().join(format!(
+            "td-token-store-{}-{}",
+            std::process::id(),
+            u64::from_le_bytes(random::<8>().unwrap())
+        ));
         fs::create_dir(&root).unwrap();
         let owner = fs::metadata(&root).unwrap().uid();
         let path = root.join("store");
@@ -1260,19 +1361,43 @@ mod tests {
         store.set("mail", "main", b"mail credential").unwrap();
         store.set("news", "work", b"news credential").unwrap();
         let original = store.read("master", 32).unwrap();
-        let protection = super::super::fido_metadata::tests::protection_fixture(1000, true).encode().unwrap();
-        assert!(store.rotate_with(|_| Ok(protection.clone()), |_,_| Err("roundtrip refused".into())).is_err());
-        assert_eq!(store.get("mail", "main").unwrap().unwrap(), b"mail credential");
+        let protection = super::super::fido_metadata::tests::protection_fixture(1000, true)
+            .encode()
+            .unwrap();
+        assert!(store
+            .rotate_with(
+                |_| Ok(protection.clone()),
+                |_, _| Err("roundtrip refused".into())
+            )
+            .is_err());
+        assert_eq!(
+            store.get("mail", "main").unwrap().unwrap(),
+            b"mail credential"
+        );
         assert!(!path.join("sealed").exists());
-        let master = std::cell::Cell::new([0;32]);
-        store.rotate_with(|key| {master.set(*key); Ok(protection.clone())}, |_,_| Ok(())).unwrap();
+        let master = std::cell::Cell::new([0; 32]);
+        store
+            .rotate_with(
+                |key| {
+                    master.set(*key);
+                    Ok(protection.clone())
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
         assert!(store.token_protected().unwrap());
         assert!(!path.join("master").exists());
         assert!(!path.join("mail.main").exists());
         assert!(!path.join("news.work").exists());
         let bundle = store.bundle().unwrap().unwrap();
-        assert_eq!(decrypt(&bundle, &master.get(), "mail", "main").unwrap(), b"mail credential");
-        assert_eq!(decrypt(&bundle, &master.get(), "news", "work").unwrap(), b"news credential");
+        assert_eq!(
+            decrypt(&bundle, &master.get(), "mail", "main").unwrap(),
+            b"mail credential"
+        );
+        assert_eq!(
+            decrypt(&bundle, &master.get(), "news", "work").unwrap(),
+            b"news credential"
+        );
         assert!(store.get("mail", "main").is_err());
         store.write("master", &original).unwrap();
         assert!(store.get("mail", "main").is_err());
@@ -1280,12 +1405,16 @@ mod tests {
         assert_eq!(encoded.get(..8).unwrap(), b"TDSEAL02");
         assert!(!encoded.windows(32).any(|value| value == master.get()));
         assert!(!encoded.windows(15).any(|value| value == b"mail credential"));
-        let mut downgraded = encoded.clone();downgraded[7] = b'1';
+        let mut downgraded = encoded.clone();
+        downgraded[7] = b'1';
         assert!(Bundle::decode(&downgraded, 1000).is_err());
         assert!(Bundle::decode(&encoded, 1001).is_err());
         store.retire_legacy().unwrap();
         drop(store);
-        assert!(Store::open_owned(&path, 1000, owner, false).unwrap().token_protected().unwrap());
+        assert!(Store::open_owned(&path, 1000, owner, false)
+            .unwrap()
+            .token_protected()
+            .unwrap());
         fs::remove_file(path.join("sealed")).unwrap();
         assert!(Store::open_owned(&path, 1000, owner, true).is_err());
         assert!(!path.join("master").exists());
@@ -1325,8 +1454,13 @@ mod tests {
         let runtime = root.join("runtime");
         fs::create_dir(&runtime).unwrap();
         let runtime = directory(&runtime).unwrap();
-        store.release_into(&bundle, &runtime, |_| Ok(key.get())).unwrap();
-        assert_eq!(runtime_key_in(&runtime, file_owner, &bundle.key).unwrap(), key.get());
+        store
+            .release_into(&bundle, &runtime, |_| Ok(key.get()))
+            .unwrap();
+        assert_eq!(
+            runtime_key_in(&runtime, file_owner, &bundle.key).unwrap(),
+            key.get()
+        );
         assert!(runtime_key_in(&runtime, session, &bundle.key).is_err());
         drop(store);
         assert!(Store::open_owned(&path, file_owner, file_owner, false).is_err());
@@ -1492,14 +1626,18 @@ mod tests {
         let unknown = pinned(&runtime).join("unknown");
         fs::write(&unknown, b"unexpected runtime entry").unwrap();
         let unsealed = std::cell::Cell::new(false);
-        assert!(store.release_into(&bundle, &runtime, |_| {
-            unsealed.set(true);
-            Ok(master.get())
-        }).is_err());
+        assert!(store
+            .release_into(&bundle, &runtime, |_| {
+                unsealed.set(true);
+                Ok(master.get())
+            })
+            .is_err());
         assert!(!unsealed.get());
         assert!(!key_path.exists());
         fs::remove_file(unknown).unwrap();
-        store.release_into(&bundle, &runtime, |_| Ok(master.get())).unwrap();
+        store
+            .release_into(&bundle, &runtime, |_| Ok(master.get()))
+            .unwrap();
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(runtime_key_in(&runtime, uid, &bundle.key).is_err());
         assert!(runtime_directory_at(&root, uid.wrapping_add(1), uid, false).is_err());
@@ -1514,7 +1652,11 @@ mod tests {
     #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
     fn emulator_token_store_reopens_and_releases_only_the_bound_role() {
         use crate::fido_metadata::{tests as fixtures, Protection, Role};
-        let root = std::env::temp_dir().join(format!("td-fido-store-{}-{}", std::process::id(), u64::from_le_bytes(random::<8>().unwrap())));
+        let root = std::env::temp_dir().join(format!(
+            "td-fido-store-{}-{}",
+            std::process::id(),
+            u64::from_le_bytes(random::<8>().unwrap())
+        ));
         assert!(!root.exists());
         fs::create_dir(&root).unwrap();
         let owner = fs::metadata(&root).unwrap().uid();
@@ -1523,13 +1665,19 @@ mod tests {
         emulator.extend(&[9; 32]);
         let path = root.join("store");
         let store = Store::open_owned(&path, uid, owner, true).unwrap();
-        store.set("mail", "main", b"token protected credential").unwrap();
+        store
+            .set("mail", "main", b"token protected credential")
+            .unwrap();
         let runtime = runtime_directory_at(&root, owner, uid, true).unwrap();
         atomic_write(&runtime, owner, "key", &[42; 64]).unwrap();
-        store.enroll_tokens_into(
-            fixtures::metadata_fixture(uid, true), tpm::Pcrs::parse("7").unwrap(),
-            &runtime, || Ok(emulator.client()),
-        ).unwrap();
+        store
+            .enroll_tokens_into(
+                fixtures::metadata_fixture(uid, true),
+                tpm::Pcrs::parse("7").unwrap(),
+                &runtime,
+                || Ok(emulator.client()),
+            )
+            .unwrap();
         assert!(!pinned(&runtime).join("key").exists());
         drop(store);
         let store = Store::open_owned(&path, uid, owner, false).unwrap();
@@ -1537,38 +1685,61 @@ mod tests {
         let protection = Protection::decode(&bundle.key, uid).unwrap();
         for role in [Role::Primary, Role::Recovery] {
             let (request, response) = fixtures::release_fixture(&protection, role);
-            store.release_token_into(&runtime, request, &response, emulator.client()).unwrap();
+            store
+                .release_token_into(&runtime, request, &response, emulator.client())
+                .unwrap();
             let master = runtime_key_in(&runtime, owner, &bundle.key).unwrap();
-            assert_eq!(decrypt(&bundle, &master, "mail", "main").unwrap(), b"token protected credential");
+            assert_eq!(
+                decrypt(&bundle, &master, "mail", "main").unwrap(),
+                b"token protected credential"
+            );
             for entry in fs::read_dir(&path).unwrap() {
                 let bytes = fs::read(entry.unwrap().path()).unwrap();
                 assert!(!bytes.windows(32).any(|bytes| bytes == master));
-                assert!(!bytes.windows(26).any(|bytes| bytes == b"token protected credential"));
+                assert!(!bytes
+                    .windows(26)
+                    .any(|bytes| bytes == b"token protected credential"));
             }
             let (request, mut response) = fixtures::release_fixture(&protection, role);
             *response.last_mut().unwrap() ^= 1;
-            assert!(store.release_token_into(&runtime, request, &response, emulator.client()).is_err());
+            assert!(store
+                .release_token_into(&runtime, request, &response, emulator.client())
+                .is_err());
             assert!(runtime_key_in(&runtime, owner, &bundle.key).is_err());
         }
         let (request, response) = fixtures::release_fixture(&protection, Role::Primary);
-        store.release_token_into(&runtime, request, &response, emulator.client()).unwrap();
+        store
+            .release_token_into(&runtime, request, &response, emulator.client())
+            .unwrap();
         let alternate = fixtures::protection_fixture(uid, false);
         let (request, response) = fixtures::release_fixture(&alternate, Role::Primary);
-        assert!(store.release_token_into(&runtime, request, &response, emulator.client()).is_err());
+        assert!(store
+            .release_token_into(&runtime, request, &response, emulator.client())
+            .is_err());
         assert!(runtime_key_in(&runtime, owner, &bundle.key).is_err());
         let (request, response) = fixtures::release_fixture(&protection, Role::Recovery);
-        store.release_token_into(&runtime, request, &response, emulator.client()).unwrap();
+        store
+            .release_token_into(&runtime, request, &response, emulator.client())
+            .unwrap();
         let interrupted = Store::open_owned(&root.join("interrupted"), uid, owner, true).unwrap();
-        interrupted.set("mail", "main", b"retained after cleanup failure").unwrap();
+        interrupted
+            .set("mail", "main", b"retained after cleanup failure")
+            .unwrap();
         let calls = std::cell::Cell::new(0);
-        let failure = interrupted.enroll_tokens_into(
-            fixtures::metadata_fixture(uid, false), tpm::Pcrs::parse("7").unwrap(), &runtime,
-            || {
-                calls.set(calls.get() + 1);
-                if calls.get() == 2 { interrupted.write("unknown", b"cleanup refusal")?; }
-                Ok(emulator.client())
-            },
-        ).unwrap_err();
+        let failure = interrupted
+            .enroll_tokens_into(
+                fixtures::metadata_fixture(uid, false),
+                tpm::Pcrs::parse("7").unwrap(),
+                &runtime,
+                || {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 2 {
+                        interrupted.write("unknown", b"cleanup refusal")?;
+                    }
+                    Ok(emulator.client())
+                },
+            )
+            .unwrap_err();
         assert!(failure.contains("unknown entry"), "{failure}");
         assert!(interrupted.token_protected().unwrap());
         assert!(!pinned(&runtime).join("key").exists());
@@ -1577,7 +1748,9 @@ mod tests {
         drop(interrupted);
         emulator.extend(&[8; 32]);
         let (request, response) = fixtures::release_fixture(&protection, Role::Recovery);
-        assert!(store.release_token_into(&runtime, request, &response, emulator.client()).is_err());
+        assert!(store
+            .release_token_into(&runtime, request, &response, emulator.client())
+            .is_err());
         assert!(runtime_key_in(&runtime, owner, &bundle.key).is_err());
         drop(runtime);
         drop(store);
@@ -1588,7 +1761,8 @@ mod tests {
     #[test]
     fn refused_enrollment_clears_release_before_metadata_or_protector_admission() {
         let root = std::env::temp_dir().join(format!(
-            "td-enroll-refused-{}-{}", std::process::id(),
+            "td-enroll-refused-{}-{}",
+            std::process::id(),
             u64::from_le_bytes(random::<8>().unwrap()),
         ));
         fs::create_dir(&root).unwrap();
@@ -1601,25 +1775,33 @@ mod tests {
                 store.write("sealed", b"malformed protector").unwrap();
             } else if case == 2 {
                 let bundle = Bundle {
-                    key: crate::fido_metadata::tests::protection_fixture(1000, false).encode().unwrap(),
+                    key: crate::fido_metadata::tests::protection_fixture(1000, false)
+                        .encode()
+                        .unwrap(),
                     records: BTreeMap::new(),
                 };
                 store.write("sealed", &bundle.encode().unwrap()).unwrap();
             }
             let before = store.read("sealed", MAX_BUNDLE).ok();
             atomic_write(&runtime, owner, "key", &[42; 64]).unwrap();
-            let error = store.enroll_tokens_into(
-                crate::fido_metadata::tests::metadata_fixture(1001, false),
-                tpm::Pcrs::parse("7").unwrap(), &runtime,
-                || -> Result<tpm::Client<tpm::tests::Socket>, String> {
-                    panic!("refused metadata or protector reached the TPM");
-                },
-            ).unwrap_err();
-            assert_eq!(error, match case {
-                0 => "enrollment metadata belongs to another session",
-                1 => "invalid sealed store format",
-                _ => "credential store is already token enrolled",
-            });
+            let error = store
+                .enroll_tokens_into(
+                    crate::fido_metadata::tests::metadata_fixture(1001, false),
+                    tpm::Pcrs::parse("7").unwrap(),
+                    &runtime,
+                    || -> Result<tpm::Client<tpm::tests::Socket>, String> {
+                        panic!("refused metadata or protector reached the TPM");
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(
+                error,
+                match case {
+                    0 => "enrollment metadata belongs to another session",
+                    1 => "invalid sealed store format",
+                    _ => "credential store is already token enrolled",
+                }
+            );
             assert!(!key_path.exists(), "refused enrollment retained a release");
             assert_eq!(store.read("sealed", MAX_BUNDLE).ok(), before);
             if case == 0 {
@@ -1637,7 +1819,8 @@ mod tests {
     fn emulator_enrolls_a_locked_tpm_store_without_a_portal_release() {
         use crate::fido_metadata::{tests as fixtures, Protection, Role};
         let root = std::env::temp_dir().join(format!(
-            "td-enroll-locked-{}-{}", std::process::id(),
+            "td-enroll-locked-{}-{}",
+            std::process::id(),
             u64::from_le_bytes(random::<8>().unwrap()),
         ));
         fs::create_dir(&root).unwrap();
@@ -1650,38 +1833,53 @@ mod tests {
         let key_path = pinned(&runtime).join("key");
         let path = root.join("store");
         let store = Store::open_owned(&path, uid, owner, true).unwrap();
-        store.set("mail", "main", b"mail migration credential").unwrap();
-        store.set("news", "account", b"news migration credential").unwrap();
-        store.seal_with(
-            |master| emulator.client().seal(uid, pcrs, master)?.encode(),
-            |blob| emulator.client().unseal(&tpm::SealedKey::decode(blob)?),
-        ).unwrap();
+        store
+            .set("mail", "main", b"mail migration credential")
+            .unwrap();
+        store
+            .set("news", "account", b"news migration credential")
+            .unwrap();
+        store
+            .seal_with(
+                |master| emulator.client().seal(uid, pcrs, master)?.encode(),
+                |blob| emulator.client().unseal(&tpm::SealedKey::decode(blob)?),
+            )
+            .unwrap();
         let before = store.read("sealed", MAX_BUNDLE).unwrap();
         assert!(!key_path.exists());
         assert!(!path.join("master").exists());
         let old_bundle = store.bundle().unwrap().unwrap();
-        let old_master = emulator.client().unseal(
-            &tpm::SealedKey::decode(&old_bundle.key).unwrap(),
-        ).unwrap();
+        let old_master = emulator
+            .client()
+            .unseal(&tpm::SealedKey::decode(&old_bundle.key).unwrap())
+            .unwrap();
 
         // An unseal failure must preserve the entire old store and stay locked.
-        let failed = store.enroll_tokens_into(
-            fixtures::metadata_fixture(uid, true), pcrs, &runtime,
-            || Err::<tpm::Client<tpm::tests::Socket>, _>("TPM unavailable".into()),
-        ).unwrap_err();
+        let failed = store
+            .enroll_tokens_into(
+                fixtures::metadata_fixture(uid, true),
+                pcrs,
+                &runtime,
+                || Err::<tpm::Client<tpm::tests::Socket>, _>("TPM unavailable".into()),
+            )
+            .unwrap_err();
         assert_eq!(failed, "TPM unavailable");
         assert_eq!(store.read("sealed", MAX_BUNDLE).unwrap(), before);
         assert!(!key_path.exists());
 
         let calls = std::cell::Cell::new(0);
-        store.enroll_tokens_into(
-            fixtures::metadata_fixture(uid, true), pcrs, &runtime,
-            || {
-                assert!(!key_path.exists(), "migration published a portal key");
-                calls.set(calls.get() + 1);
-                Ok(emulator.client())
-            },
-        ).unwrap();
+        store
+            .enroll_tokens_into(
+                fixtures::metadata_fixture(uid, true),
+                pcrs,
+                &runtime,
+                || {
+                    assert!(!key_path.exists(), "migration published a portal key");
+                    calls.set(calls.get() + 1);
+                    Ok(emulator.client())
+                },
+            )
+            .unwrap();
         assert_eq!(calls.get(), 3); // old unseal, new seal, new roundtrip
         assert!(!key_path.exists());
         drop(store);
@@ -1691,22 +1889,41 @@ mod tests {
         assert!(decrypt(&bundle, &old_master, "mail", "main").is_err());
         for role in [Role::Primary, Role::Recovery] {
             let (request, response) = fixtures::release_fixture(&protection, role);
-            store.release_token_into(&runtime, request, &response, emulator.client()).unwrap();
+            store
+                .release_token_into(&runtime, request, &response, emulator.client())
+                .unwrap();
             let master = runtime_key_in(&runtime, owner, &bundle.key).unwrap();
-            assert_eq!(decrypt(&bundle, &master, "mail", "main").unwrap(), b"mail migration credential");
-            assert_eq!(decrypt(&bundle, &master, "news", "account").unwrap(), b"news migration credential");
+            assert_eq!(
+                decrypt(&bundle, &master, "mail", "main").unwrap(),
+                b"mail migration credential"
+            );
+            assert_eq!(
+                decrypt(&bundle, &master, "news", "account").unwrap(),
+                b"news migration credential"
+            );
         }
         let enrolled = store.read("sealed", MAX_BUNDLE).unwrap();
-        for private in [old_master.as_slice(), b"mail migration credential", b"news migration credential"] {
-            assert!(!enrolled.windows(private.len()).any(|bytes| bytes == private));
+        for private in [
+            old_master.as_slice(),
+            b"mail migration credential",
+            b"news migration credential",
+        ] {
+            assert!(!enrolled
+                .windows(private.len())
+                .any(|bytes| bytes == private));
         }
         assert!(key_path.exists());
-        assert!(store.enroll_tokens_into(
-            fixtures::metadata_fixture(uid, false), pcrs, &runtime,
-            || -> Result<tpm::Client<tpm::tests::Socket>, String> {
-                panic!("token replacement reached the TPM");
-            },
-        ).unwrap_err().contains("already token enrolled"));
+        assert!(store
+            .enroll_tokens_into(
+                fixtures::metadata_fixture(uid, false),
+                pcrs,
+                &runtime,
+                || -> Result<tpm::Client<tpm::tests::Socket>, String> {
+                    panic!("token replacement reached the TPM");
+                },
+            )
+            .unwrap_err()
+            .contains("already token enrolled"));
         assert!(!key_path.exists());
         assert_eq!(store.read("sealed", MAX_BUNDLE).unwrap(), enrolled);
         drop(store);
@@ -2096,19 +2313,54 @@ mod tests {
 
     #[test]
     fn applications_refuse_unenrolled_backends_even_with_readable_credentials() {
-        let root = std::env::temp_dir().join(format!("td-app-secret-{}-{}", std::process::id(), u64::from_le_bytes(random::<8>().unwrap())));
+        let root = std::env::temp_dir().join(format!(
+            "td-app-secret-{}-{}",
+            std::process::id(),
+            u64::from_le_bytes(random::<8>().unwrap())
+        ));
         fs::create_dir(&root).unwrap();
         let owner = fs::metadata(&root).unwrap().uid();
         let path = root.join("store");
         let store = Store::open_owned(&path, 1000, owner, true).unwrap();
         store.set("mail", "main", b"unenrolled credential").unwrap();
-        assert_eq!(store.get("mail", "main").unwrap().unwrap(), b"unenrolled credential");
-        assert_eq!(store.application_secret("mail", "main").unwrap_err(), "credential store requires token enrollment");
-        store.write("sealed", &Bundle { key: tpm::tests::fixture(1000), records: BTreeMap::new() }.encode().unwrap()).unwrap();
-        assert_eq!(store.application_secret("mail", "main").unwrap_err(), "credential store requires token enrollment");
+        assert_eq!(
+            store.get("mail", "main").unwrap().unwrap(),
+            b"unenrolled credential"
+        );
+        assert_eq!(
+            store.application_secret("mail", "main").unwrap_err(),
+            "credential store requires token enrollment"
+        );
+        store
+            .write(
+                "sealed",
+                &Bundle {
+                    key: tpm::tests::fixture(1000),
+                    records: BTreeMap::new(),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.application_secret("mail", "main").unwrap_err(),
+            "credential store requires token enrollment"
+        );
         for recovery in [false, true] {
-            let key = super::super::fido_metadata::tests::protection_fixture(1000, recovery).encode().unwrap();
-            store.write("sealed", &Bundle { key, records: BTreeMap::new() }.encode().unwrap()).unwrap();
+            let key = super::super::fido_metadata::tests::protection_fixture(1000, recovery)
+                .encode()
+                .unwrap();
+            store
+                .write(
+                    "sealed",
+                    &Bundle {
+                        key,
+                        records: BTreeMap::new(),
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
             // The enrolled policy admits lookup; a missing entry stays missing.
             assert_eq!(store.application_secret("mail", "absent").unwrap(), None);
         }
@@ -2118,19 +2370,31 @@ mod tests {
 
     #[test]
     fn inspection_preserves_store_bytes_and_refuses_missing_or_invalid_state() {
-        let root = std::env::temp_dir().join(format!("td-inspect-{}-{}", std::process::id(), u64::from_le_bytes(random::<8>().unwrap())));
+        let root = std::env::temp_dir().join(format!(
+            "td-inspect-{}-{}",
+            std::process::id(),
+            u64::from_le_bytes(random::<8>().unwrap())
+        ));
         fs::create_dir(&root).unwrap();
         let owner = fs::metadata(&root).unwrap().uid();
         let path = root.join("store");
         assert!(Store::inspect_owned(&path, 1000, owner).is_err());
         assert!(!path.exists());
         let store = Store::open_owned(&path, 1000, owner, true).unwrap();
-        store.set("mail", "main", b"private inspection fixture").unwrap();
+        store
+            .set("mail", "main", b"private inspection fixture")
+            .unwrap();
         assert!(Store::inspect_owned(&path, 1000, owner).is_err());
         drop(store);
-        let snapshot = || fs::read_dir(&path).unwrap().map(|entry| {
-            let entry = entry.unwrap(); (entry.file_name(), fs::read(entry.path()).unwrap())
-        }).collect::<BTreeMap<_,_>>();
+        let snapshot = || {
+            fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
         let initial = snapshot();
         assert_eq!(Store::inspect_owned(&path, 1000, owner).unwrap(), 0);
         assert_eq!(snapshot(), initial);
@@ -2143,9 +2407,23 @@ mod tests {
             assert!(Store::inspect_owned(&path, 1000, owner).is_err());
             assert_eq!(fs::read(path.join("master")).unwrap(), bytes);
         }
-        fs::write(path.join("master"), initial.get(std::ffi::OsStr::new("master")).unwrap()).unwrap();
+        fs::write(
+            path.join("master"),
+            initial.get(std::ffi::OsStr::new("master")).unwrap(),
+        )
+        .unwrap();
         let store = Store::open_owned(&path, 1000, owner, false).unwrap();
-        store.write("sealed", &Bundle { key: tpm::tests::fixture(1000), records: BTreeMap::new() }.encode().unwrap()).unwrap();
+        store
+            .write(
+                "sealed",
+                &Bundle {
+                    key: tpm::tests::fixture(1000),
+                    records: BTreeMap::new(),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
         drop(store);
         let initial = snapshot();
         assert_eq!(Store::inspect_owned(&path, 1000, owner).unwrap(), 1);
@@ -2153,12 +2431,27 @@ mod tests {
         assert_eq!(snapshot(), initial);
         fs::remove_file(path.join("sealed")).unwrap();
         for recovery in [false, true] {
-            let protection = super::super::fido_metadata::tests::protection_fixture(1000, recovery).encode().unwrap();
+            let protection = super::super::fido_metadata::tests::protection_fixture(1000, recovery)
+                .encode()
+                .unwrap();
             let store = Store::open_owned(&path, 1000, owner, false).unwrap();
-            store.write("sealed", &Bundle { key: protection, records: BTreeMap::new() }.encode().unwrap()).unwrap();
+            store
+                .write(
+                    "sealed",
+                    &Bundle {
+                        key: protection,
+                        records: BTreeMap::new(),
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
             drop(store);
             let initial = snapshot();
-            assert_eq!(Store::inspect_owned(&path, 1000, owner).unwrap(), if recovery { 3 } else { 2 });
+            assert_eq!(
+                Store::inspect_owned(&path, 1000, owner).unwrap(),
+                if recovery { 3 } else { 2 }
+            );
             assert_eq!(snapshot(), initial);
             assert!(Store::inspect_owned(&path, 1001, owner).is_err());
             fs::remove_file(path.join("sealed")).unwrap();

@@ -44,9 +44,12 @@ struct Process {
 
 impl Process {
     fn to_file(command: &mut Command, log: &Path, output: &Path) -> Self {
-        let child = command.stdin(Stdio::null())
+        let child = command
+            .stdin(Stdio::null())
             .stdout(fs::File::create(output).unwrap())
-            .stderr(fs::File::create(log).unwrap()).spawn().unwrap();
+            .stderr(fs::File::create(log).unwrap())
+            .spawn()
+            .unwrap();
         let (_send, output) = mpsc::channel();
         Self { child, output }
     }
@@ -158,18 +161,25 @@ fn query_cli_args(path: &Path, root: &Path, name: &str, args: &[&str]) -> (ExitS
 }
 
 fn ready_session(line: &str) -> &str {
-    let session = line.strip_prefix("TD-COMPOSITOR-HEADLESS-READY version=2 session=").unwrap()
-        .strip_suffix(" width=800 height=600 scale=1\n").unwrap();
+    let session = line
+        .strip_prefix("TD-COMPOSITOR-HEADLESS-READY version=2 session=")
+        .unwrap()
+        .strip_suffix(" width=800 height=600 scale=1\n")
+        .unwrap();
     assert_eq!(session.len(), 32);
-    assert!(session.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    assert!(session
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
     session
 }
 
 fn captured_output(ppm: &[u8]) -> (&str, u64, &[u8]) {
     let mut lines = ppm.splitn(5, |b| *b == b'\n');
     assert_eq!(lines.next(), Some(b"P6".as_slice()));
-    let stamp = std::str::from_utf8(lines.next().unwrap()).unwrap()
-        .strip_prefix("# td-output-v1 session=").unwrap();
+    let stamp = std::str::from_utf8(lines.next().unwrap())
+        .unwrap()
+        .strip_prefix("# td-output-v1 session=")
+        .unwrap();
     let (session, output) = stamp.split_once(" output=").unwrap();
     assert_eq!(lines.next(), Some(b"800 600".as_slice()));
     assert_eq!(lines.next(), Some(b"255".as_slice()));
@@ -185,39 +195,61 @@ fn native_client_publications_correlate_routed_input_with_captured_output() {
     let mut command = headless(&session);
     command.args(["--input-control", "enabled", "--capture-control", "enabled"]);
     let mut compositor = Process::start(
-        &mut command, &root.0.join("compositor.log"), "TD-COMPOSITOR-HEADLESS-READY",
+        &mut command,
+        &root.0.join("compositor.log"),
+        "TD-COMPOSITOR-HEADLESS-READY",
     );
     let ready = compositor.ready();
     let identity = ready_session(&ready);
     let control = session.join("td-control");
     let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
-    command.arg0("td-ui-demo").args(["run", "--socket"])
-        .arg(session.join("wayland-0")).arg("--ready-socket")
+    command
+        .arg0("td-ui-demo")
+        .args(["run", "--socket"])
+        .arg(session.join("wayland-0"))
+        .arg("--ready-socket")
         .arg(root.0.join("client.ready"));
     let mut client = Process::start(
-        &mut command, &root.0.join("client.log"), "TD-UI-CLIENT-READY",
+        &mut command,
+        &root.0.join("client.log"),
+        "TD-UI-CLIENT-READY",
     );
     client.ready();
     let layout = request(&control, b"layout\n");
-    let window = layout.lines().find_map(|line| line.strip_prefix("window id="))
-        .unwrap().split_whitespace().next().unwrap();
+    let window = layout
+        .lines()
+        .find_map(|line| line.strip_prefix("window id="))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
     let decode = |reply: &str| {
         let prefix = format!("td-client-v1 session={identity} window={window} client=");
         let body = reply.strip_prefix(&prefix).unwrap();
         let (client, body) = body.split_once(" commit=").unwrap();
         let (commit, body) = body.split_once(" output=").unwrap();
         let output = body.strip_suffix(" current=yes\n").unwrap();
-        (client.parse::<u64>().unwrap(), commit.parse::<u64>().unwrap(),
-            output.parse::<u64>().unwrap())
+        (
+            client.parse::<u64>().unwrap(),
+            commit.parse::<u64>().unwrap(),
+            output.parse::<u64>().unwrap(),
+        )
     };
     let observe = || {
-        let reply = request(&control, format!("observe-client {identity} {window}\n").as_bytes());
+        let reply = request(
+            &control,
+            format!("observe-client {identity} {window}\n").as_bytes(),
+        );
         decode(reply.strip_prefix("ok\n").unwrap())
     };
     let (client_id, first_commit, first_output) = observe();
     assert!(client_id > 0 && first_commit >= 2 && first_output > 0);
-    let (status, cli) = query_cli_args(&control, &root.0, "client-observe",
-        &["observe-client", identity, window]);
+    let (status, cli) = query_cli_args(
+        &control,
+        &root.0,
+        "client-observe",
+        &["observe-client", identity, window],
+    );
     assert!(status.success());
     let (cli_client, cli_commit, cli_output) = decode(std::str::from_utf8(&cli).unwrap());
     assert_eq!(cli_client, client_id);
@@ -225,7 +257,10 @@ fn native_client_publications_correlate_routed_input_with_captured_output() {
     // Readiness does not order the independent seat worker's focus events.
     let deadline = Instant::now() + TIMEOUT;
     let initial_commit = loop {
-        assert!(Instant::now() < deadline, "initial client publication did not settle");
+        assert!(
+            Instant::now() < deadline,
+            "initial client publication did not settle"
+        );
         let (observed_client, commit, output) = observe();
         assert_eq!(observed_client, client_id);
         let (status, before) = capture(&control, &root.0, "before");
@@ -241,11 +276,20 @@ fn native_client_publications_correlate_routed_input_with_captured_output() {
         assert!(!demo_a_up_visible(pixels));
         break commit;
     };
-    assert_eq!(input_request(&control, identity, "key 1 30 down\n"), input_receipt(identity, 1));
-    assert_eq!(input_request(&control, identity, "key 2 30 up\n"), input_receipt(identity, 2));
+    assert_eq!(
+        input_request(&control, identity, "key 1 30 down\n"),
+        input_receipt(identity, 1)
+    );
+    assert_eq!(
+        input_request(&control, identity, "key 2 30 up\n"),
+        input_receipt(identity, 2)
+    );
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        assert!(Instant::now() < deadline, "native input did not produce correlated client output");
+        assert!(
+            Instant::now() < deadline,
+            "native input did not produce correlated client output"
+        );
         let (observed_client, commit, output) = observe();
         assert_eq!(observed_client, client_id);
         if commit <= initial_commit {
@@ -271,19 +315,29 @@ fn native_client_publications_correlate_routed_input_with_captured_output() {
     } else {
         "00000000000000000000000000000000"
     };
-    let (status, body) = query_cli_args(&control, &root.0, "stale-observe",
-        &["observe-client", stale, window]);
+    let (status, body) = query_cli_args(
+        &control,
+        &root.0,
+        "stale-observe",
+        &["observe-client", stale, window],
+    );
     assert_eq!(status.code(), Some(1));
     assert!(body.is_empty());
     client.child.kill().unwrap();
     assert!(!client.wait().success());
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        let reply = request(&control, format!("observe-client {identity} {window}\n").as_bytes());
+        let reply = request(
+            &control,
+            format!("observe-client {identity} {window}\n").as_bytes(),
+        );
         if reply == "unavailable client observation window is gone\n" {
             break;
         }
-        assert!(Instant::now() < deadline, "disconnected client observation remained live");
+        assert!(
+            Instant::now() < deadline,
+            "disconnected client observation remained live"
+        );
     }
     compositor.child.stdin.take();
     assert!(compositor.wait().success());
@@ -306,12 +360,17 @@ fn demo_a_up_visible(pixels: &[u8]) -> bool {
             if !yellow(x + 2, y) {
                 continue;
             }
-            let matches = (0..14).all(|dy| (0..48).all(|dx| {
-                let column = (dx / 2) % 6;
-                let row = glyphs.get(dx / 12).and_then(|glyph| glyph.get(dy / 2)).unwrap();
-                let ink = column < 5 && row & (1 << (4 - column)) != 0;
-                yellow(x + dx, y + dy) == ink
-            }));
+            let matches = (0..14).all(|dy| {
+                (0..48).all(|dx| {
+                    let column = (dx / 2) % 6;
+                    let row = glyphs
+                        .get(dx / 12)
+                        .and_then(|glyph| glyph.get(dy / 2))
+                        .unwrap();
+                    let ink = column < 5 && row & (1 << (4 - column)) != 0;
+                    yellow(x + dx, y + dy) == ink
+                })
+            });
             if matches {
                 return true;
             }
@@ -329,31 +388,47 @@ fn reusing_a_session_path_starts_a_new_capture_identity() {
         let mut command = headless(&session);
         command.args(["--capture-control", "enabled", "--input-control", "enabled"]);
         let mut compositor = Process::start(
-            &mut command, &root.0.join(format!("compositor-{generation}.log")),
+            &mut command,
+            &root.0.join(format!("compositor-{generation}.log")),
             "TD-COMPOSITOR-HEADLESS-READY",
         );
         let ready = compositor.ready();
         let identity = ready_session(&ready);
-        let (status, ppm) = capture(&session.join("td-control"), &root.0,
-            &format!("capture-{generation}"));
+        let (status, ppm) = capture(
+            &session.join("td-control"),
+            &root.0,
+            &format!("capture-{generation}"),
+        );
         assert!(status.success());
         let (captured_session, output, _) = captured_output(&ppm);
         assert_eq!(captured_session, identity);
         assert_eq!(output, 2, "a new runtime inherited old output numbering");
-        assert_ne!(previous.as_deref(), Some(identity), "a restarted session reused its nonce");
+        assert_ne!(
+            previous.as_deref(),
+            Some(identity),
+            "a restarted session reused its nonce"
+        );
         if let Some(old_session) = previous.as_deref() {
             let control = session.join("td-control");
             let before = request(&control, b"layout\n");
-            for line in ["key 1 125 down\n", "key 2 3 down\n", "pointer 3 1 1 1 0 0\n",
-                "release-keys 4\n", "release-input 5\n"]
-            {
-                assert_eq!(input_request(&control, old_session, line),
-                    "error input session identity does not match\n");
+            for line in [
+                "key 1 125 down\n",
+                "key 2 3 down\n",
+                "pointer 3 1 1 1 0 0\n",
+                "release-keys 4\n",
+                "release-input 5\n",
+            ] {
+                assert_eq!(
+                    input_request(&control, old_session, line),
+                    "error input session identity does not match\n"
+                );
             }
             assert_eq!(request(&control, b"layout\n"), before);
         }
-        assert_eq!(input_request(&session.join("td-control"), identity, "release-input 6\n"),
-            input_receipt(identity, 1));
+        assert_eq!(
+            input_request(&session.join("td-control"), identity, "release-input 6\n"),
+            input_receipt(identity, 1)
+        );
         previous = Some(identity.to_string());
         compositor.child.stdin.take();
         assert!(compositor.wait().success());
@@ -368,22 +443,39 @@ fn clipboard_startup_grant_is_separate_and_owner_eof_still_reaps_session() {
     let mut command = headless(&session);
     command.args(["--clipboard-control", "enabled"]);
     let mut compositor = Process::start(
-        &mut command, &root.0.join("compositor.log"), "TD-COMPOSITOR-HEADLESS-READY",
+        &mut command,
+        &root.0.join("compositor.log"),
+        "TD-COMPOSITOR-HEADLESS-READY",
     );
     let ready = compositor.ready();
     let identity = ready_session(&ready);
     let control = session.join("td-control");
-    assert_eq!(request(&control, format!("clipboard-arm {identity} @1\n").as_bytes()),
-        "unavailable clipboard receiver window is gone\n");
-    for verb in ["clipboard-arm", "clipboard-status", "clipboard-release", "clipboard-drop"] {
+    assert_eq!(
+        request(
+            &control,
+            format!("clipboard-arm {identity} @1\n").as_bytes()
+        ),
+        "unavailable clipboard receiver window is gone\n"
+    );
+    for verb in [
+        "clipboard-arm",
+        "clipboard-status",
+        "clipboard-release",
+        "clipboard-drop",
+    ] {
         let argument = if verb == "clipboard-arm" { "@1" } else { "1" };
         let (status, output) = query_cli_args(&control, &root.0, verb, &[verb, identity, argument]);
         assert_eq!(status.code(), Some(1));
         assert!(output.is_empty());
     }
-    assert_eq!(request(&control, format!("key {identity} 1 30 down\n").as_bytes()),
-        "error input automation is disabled\n");
-    assert_eq!(request(&control, b"observe\n"), "error capture automation is disabled\n");
+    assert_eq!(
+        request(&control, format!("key {identity} 1 30 down\n").as_bytes()),
+        "error input automation is disabled\n"
+    );
+    assert_eq!(
+        request(&control, b"observe\n"),
+        "error capture automation is disabled\n"
+    );
     compositor.child.stdin.take();
     assert!(compositor.wait().success());
     assert!(!session.exists());
@@ -404,25 +496,49 @@ fn binary_capture_cli_requires_its_own_grant_and_captures_real_client_output() {
             command.args(["--capture-control", "enabled"]);
         }
         let mut compositor = Process::start(
-            &mut command, &case.join("compositor.log"), "TD-COMPOSITOR-HEADLESS-READY",
+            &mut command,
+            &case.join("compositor.log"),
+            "TD-COMPOSITOR-HEADLESS-READY",
         );
         let ready = compositor.ready();
         let identity = ready_session(&ready);
         let control = session.join("td-control");
         // Neither input nor capture grants clipboard scheduling authority.
-        for verb in ["clipboard-arm", "clipboard-status", "clipboard-release", "clipboard-drop"] {
+        for verb in [
+            "clipboard-arm",
+            "clipboard-status",
+            "clipboard-release",
+            "clipboard-drop",
+        ] {
             let argument = if verb == "clipboard-arm" { "@1" } else { "1" };
-            assert_eq!(request(&control, format!("{verb} {identity} {argument}\n").as_bytes()),
-                "unavailable clipboard control disabled or session unavailable\n");
+            assert_eq!(
+                request(
+                    &control,
+                    format!("{verb} {identity} {argument}\n").as_bytes()
+                ),
+                "unavailable clipboard control disabled or session unavailable\n"
+            );
         }
         if capture_enabled {
             let expected = format!("ok\ntd-output-v1 session={identity} output=1 current=yes\n");
             assert_eq!(request(&control, b"observe\n"), expected);
-            assert_eq!(request(&control, b"observe\n"), expected, "observe caused a paint");
+            assert_eq!(
+                request(&control, b"observe\n"),
+                expected,
+                "observe caused a paint"
+            );
         } else {
-            assert_eq!(request(&control, b"observe\n"), "error capture automation is disabled\n");
-            assert_eq!(request(&control, format!("observe-client {identity} @1\n").as_bytes()),
-                "error capture automation is disabled\n");
+            assert_eq!(
+                request(&control, b"observe\n"),
+                "error capture automation is disabled\n"
+            );
+            assert_eq!(
+                request(
+                    &control,
+                    format!("observe-client {identity} @1\n").as_bytes()
+                ),
+                "error capture automation is disabled\n"
+            );
         }
         let (status, empty) = capture(&control, &case, "empty");
         let mut mapped_client = None;
@@ -436,34 +552,45 @@ fn binary_capture_cli_requires_its_own_grant_and_captures_real_client_output() {
             assert_eq!(output_stamp, 2);
             let (status, observed) = query_cli(&control, &case, "observe", "observe");
             assert!(status.success());
-            assert_eq!(observed, format!(
-                "td-output-v1 session={identity} output=2 current=yes\n",
-            ).as_bytes());
-            let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
-            command.arg0("td-ui-demo").args(["run", "--socket"])
-                .arg(session.join("wayland-0")).arg("--ready-socket")
-                .arg(case.join("client.ready"));
-            let client = Process::start(
-                &mut command, &case.join("client.log"), "TD-UI-CLIENT-READY",
+            assert_eq!(
+                observed,
+                format!("td-output-v1 session={identity} output=2 current=yes\n",).as_bytes()
             );
+            let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
+            command
+                .arg0("td-ui-demo")
+                .args(["run", "--socket"])
+                .arg(session.join("wayland-0"))
+                .arg("--ready-socket")
+                .arg(case.join("client.ready"));
+            let client =
+                Process::start(&mut command, &case.join("client.log"), "TD-UI-CLIENT-READY");
             client.ready();
             let (status, mapped) = capture(&control, &case, "mapped");
             assert!(status.success());
             let (session_stamp, mapped_stamp, mapped_pixels) = captured_output(&mapped);
             assert_eq!(session_stamp, identity);
             assert!(mapped_stamp > output_stamp);
-            assert_ne!(mapped_pixels, empty_pixels, "capture did not contain the mapped client");
+            assert_ne!(
+                mapped_pixels, empty_pixels,
+                "capture did not contain the mapped client"
+            );
             assert_eq!(request(&control, b"workspace 2\n"), "ok\n");
             let (status, hidden) = capture(&control, &case, "hidden");
             assert!(status.success());
             let (session_stamp, hidden_stamp, hidden_pixels) = captured_output(&hidden);
             assert_eq!(session_stamp, identity);
             assert!(hidden_stamp > mapped_stamp);
-            assert_ne!(hidden_pixels, mapped_pixels, "capture returned stale visible-client output");
+            assert_ne!(
+                hidden_pixels, mapped_pixels,
+                "capture returned stale visible-client output"
+            );
             assert!(request(&control, b"capture extra\n").starts_with("error "));
             if !input {
-                assert_eq!(input_request(&control, identity, "key 1 30 down\n"),
-                    "error input automation is disabled\n");
+                assert_eq!(
+                    input_request(&control, identity, "key 1 30 down\n"),
+                    "error input automation is disabled\n"
+                );
             }
             mapped_client = Some(client);
         }
@@ -481,7 +608,11 @@ fn keyboard_grant_routes_workspace_chords_across_one_shot_connections() {
     let root = Root::new();
     for enabled in [false, true] {
         let session = root.0.join(if enabled { "enabled" } else { "disabled" });
-        let log = root.0.join(if enabled { "enabled.log" } else { "disabled.log" });
+        let log = root.0.join(if enabled {
+            "enabled.log"
+        } else {
+            "disabled.log"
+        });
         let mut command = headless(&session);
         if enabled {
             command.args(["--input-control", "enabled"]);
@@ -490,36 +621,72 @@ fn keyboard_grant_routes_workspace_chords_across_one_shot_connections() {
         let ready = compositor.ready();
         let identity = ready_session(&ready);
         let control = session.join("td-control");
-        let expected = |action| if enabled { input_receipt(identity, action) }
-            else { "error input automation is disabled\n".into() };
+        let expected = |action| {
+            if enabled {
+                input_receipt(identity, action)
+            } else {
+                "error input automation is disabled\n".into()
+            }
+        };
         for (index, line) in ["key 1 125 down\n", "key 2 3 down\n", "release-keys 3\n"]
-            .into_iter().enumerate()
+            .into_iter()
+            .enumerate()
         {
-            assert_eq!(input_request(&control, identity, line), expected(index as u64 + 1));
+            assert_eq!(
+                input_request(&control, identity, line),
+                expected(index as u64 + 1)
+            );
         }
         let layout = request(&control, b"layout\n");
-        assert!(layout.contains(if enabled { "workspace active=2 " } else { "workspace active=1 " }));
+        assert!(layout.contains(if enabled {
+            "workspace active=2 "
+        } else {
+            "workspace active=1 "
+        }));
         // Releasing Super must prevent a subsequent bare '1' from switching.
-        assert_eq!(input_request(&control, identity, "key 4 2 down\n"), expected(4));
-        assert_eq!(input_request(&control, identity, "release-keys 5\n"), expected(5));
+        assert_eq!(
+            input_request(&control, identity, "key 4 2 down\n"),
+            expected(4)
+        );
+        assert_eq!(
+            input_request(&control, identity, "release-keys 5\n"),
+            expected(5)
+        );
         assert_eq!(request(&control, b"layout\n"), layout);
         assert!(input_request(&control, identity, "key 6 248 down\n").starts_with("error "));
         if enabled {
-            assert_eq!(input_request(&control, identity, "key 7 125 down\n"), expected(6));
-            assert!(input_request(&control, identity, "key 8 20 down\n").starts_with("unavailable "));
+            assert_eq!(
+                input_request(&control, identity, "key 7 125 down\n"),
+                expected(6)
+            );
+            assert!(
+                input_request(&control, identity, "key 8 20 down\n").starts_with("unavailable ")
+            );
             let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
-            command.arg0("td-ctl").arg("--socket").arg(&control)
-                .args(["release-keys", identity, "9"]);
+            command.arg0("td-ctl").arg("--socket").arg(&control).args([
+                "release-keys",
+                identity,
+                "9",
+            ]);
             let output = root.0.join("ctl.out");
             let mut ctl = Process::to_file(&mut command, &root.0.join("ctl.log"), &output);
             assert!(ctl.wait().success());
-            assert_eq!(fs::read_to_string(output).unwrap(),
-                expected(7).strip_prefix("ok\n").unwrap());
+            assert_eq!(
+                fs::read_to_string(output).unwrap(),
+                expected(7).strip_prefix("ok\n").unwrap()
+            );
         }
         // EOF terminates the owning keyboard generation, even with held keys.
-        assert_eq!(input_request(&control, identity, "key 10 42 down\n"), expected(8));
+        assert_eq!(
+            input_request(&control, identity, "key 10 42 down\n"),
+            expected(8)
+        );
         compositor.child.stdin.take();
-        assert!(compositor.wait().success(), "{}", fs::read_to_string(log).unwrap());
+        assert!(
+            compositor.wait().success(),
+            "{}",
+            fs::read_to_string(log).unwrap()
+        );
         assert!(!session.exists());
     }
 }
@@ -531,34 +698,61 @@ fn pointer_control_hits_real_workspace_chrome_with_a_mapped_native_client() {
     let mut command = headless(&session);
     command.args(["--input-control", "enabled"]);
     let mut compositor = Process::start(
-        &mut command, &root.0.join("compositor.log"), "TD-COMPOSITOR-HEADLESS-READY",
+        &mut command,
+        &root.0.join("compositor.log"),
+        "TD-COMPOSITOR-HEADLESS-READY",
     );
     let ready = compositor.ready();
     let identity = ready_session(&ready);
     let control = session.join("td-control");
     let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
-    command.arg0("td-ui-demo").args(["run", "--socket"])
-        .arg(session.join("wayland-0")).arg("--ready-socket")
+    command
+        .arg0("td-ui-demo")
+        .args(["run", "--socket"])
+        .arg(session.join("wayland-0"))
+        .arg("--ready-socket")
         .arg(root.0.join("client.ready"));
-    let mut client = Process::start(&mut command, &root.0.join("client.log"), "TD-UI-CLIENT-READY");
+    let mut client = Process::start(
+        &mut command,
+        &root.0.join("client.log"),
+        "TD-UI-CLIENT-READY",
+    );
     client.ready();
     assert_eq!(request(&control, b"workspace 2\n"), "ok\n");
     assert!(request(&control, b"layout\n").contains("visible=false focused=false"));
     // Workspace 1 holds the client and occupies the first top-bar cell.
-    assert_eq!(input_request(&control, identity, "pointer 1 1 1 1 0 0\n"), input_receipt(identity, 1));
-    assert_eq!(input_request(&control, identity, "release-input 2\n"), input_receipt(identity, 2));
+    assert_eq!(
+        input_request(&control, identity, "pointer 1 1 1 1 0 0\n"),
+        input_receipt(identity, 1)
+    );
+    assert_eq!(
+        input_request(&control, identity, "release-input 2\n"),
+        input_receipt(identity, 2)
+    );
     let layout = request(&control, b"layout\n");
     assert!(layout.contains("workspace active=1 "), "{layout}");
     assert!(layout.contains("visible=true focused=true"), "{layout}");
     for line in ["pointer 3 800 0 1 0 0\n", "pointer 3 0 600 1 0 0\n"] {
-        assert_eq!(input_request(&control, identity, line), "error pointer coordinates outside the output\n");
+        assert_eq!(
+            input_request(&control, identity, line),
+            "error pointer coordinates outside the output\n"
+        );
     }
     assert_eq!(request(&control, b"layout\n"), layout);
     for (index, line) in [
-        "pointer 4 300 300 1 0 0\n", "key 4 42 down\n",
-        "release-keys 5\n", "pointer 6 310 310 1 1 -1\n", "release-input 7\n",
-    ].into_iter().enumerate() {
-        assert_eq!(input_request(&control, identity, line), input_receipt(identity, index as u64 + 3));
+        "pointer 4 300 300 1 0 0\n",
+        "key 4 42 down\n",
+        "release-keys 5\n",
+        "pointer 6 310 310 1 1 -1\n",
+        "release-input 7\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            input_request(&control, identity, line),
+            input_receipt(identity, index as u64 + 3)
+        );
     }
     compositor.child.stdin.take();
     assert!(compositor.wait().success());

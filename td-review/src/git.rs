@@ -69,17 +69,22 @@ impl Run {
     /// this must stay a single row: a multi-line blob would be collapsed into
     /// one clipped smear by the frame renderer.
     pub fn failure(&self) -> String {
-        let text = if self.stderr.trim().is_empty() { &self.stdout } else { &self.stderr };
+        let text = if self.stderr.trim().is_empty() {
+            &self.stdout
+        } else {
+            &self.stderr
+        };
         // Prefer git's own diagnostic: it routinely prints warnings ahead of the
         // fatal line, and the first line alone would report the wrong cause.
         // `!` first, because on a rejected push the useful line is
         // `! [remote rejected] … (deletion of the current branch prohibited)`
         // while the `error:` line is only "failed to push some refs".
         let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
-        let first = lines
-            .clone()
-            .find(|l| l.starts_with('!'))
-            .or_else(|| lines.clone().find(|l| l.starts_with("fatal:") || l.starts_with("error:")));
+        let first = lines.clone().find(|l| l.starts_with('!')).or_else(|| {
+            lines
+                .clone()
+                .find(|l| l.starts_with("fatal:") || l.starts_with("error:"))
+        });
         match first.or_else(|| lines.next()) {
             Some(line) => line.to_string(),
             None => match self.code {
@@ -330,7 +335,9 @@ impl Git {
         if run.ok {
             return Ok(run.stdout);
         }
-        Err(io::Error::other(String::from_utf8_lossy(&run.stderr).trim().to_string()))
+        Err(io::Error::other(
+            String::from_utf8_lossy(&run.stderr).trim().to_string(),
+        ))
     }
 
     /// Every commit in `range`, with its message and the paths it touches, for
@@ -396,8 +403,11 @@ impl Git {
         if b.nothing_ahead() {
             return Prospect::Outstanding;
         }
-        base.and_then(|base| self.prospect(base, &format!("refs/remotes/{}", b.refname)).ok())
-            .unwrap_or(Prospect::Outstanding)
+        base.and_then(|base| {
+            self.prospect(base, &format!("refs/remotes/{}", b.refname))
+                .ok()
+        })
+        .unwrap_or(Prospect::Outstanding)
     }
 
     /// What a landing would find on `branch`: nothing, a conflict, or work.
@@ -518,7 +528,13 @@ impl Git {
     /// refused by the count before reaching this.
     fn carries_an_empty_commit(&self, base_oid: &str, oid: &str) -> io::Result<bool> {
         let range = format!("{base_oid}...{oid}");
-        let list = self.run(&["--no-replace-objects", "rev-list", "--right-only", &range, "--"])?;
+        let list = self.run(&[
+            "--no-replace-objects",
+            "rev-list",
+            "--right-only",
+            &range,
+            "--",
+        ])?;
         if !list.ok {
             return Err(io::Error::other(list.failure()));
         }
@@ -573,7 +589,11 @@ impl Git {
             return Err(io::Error::other(path.failure()));
         }
         let file = PathBuf::from(path.line());
-        let file = if file.is_absolute() { file } else { self.repo.join(file) };
+        let file = if file.is_absolute() {
+            file
+        } else {
+            self.repo.join(file)
+        };
         // `try_exists`, not `exists`: the latter reads an I/O error as "no
         // graft", which is the one direction this function may not fail in.
         if file.try_exists()? {
@@ -681,8 +701,15 @@ impl Git {
     /// bases.
     fn unlanded_by_patch(&self, base_oid: &str, branch: &str) -> io::Result<usize> {
         let range = format!("{base_oid}...{branch}");
-        let argv =
-            ["--no-replace-objects", "rev-list", "--count", "--cherry-pick", "--right-only", &range, "--"];
+        let argv = [
+            "--no-replace-objects",
+            "rev-list",
+            "--count",
+            "--cherry-pick",
+            "--right-only",
+            &range,
+            "--",
+        ];
         let out = self.run_ok(&argv)?;
         out.trim()
             .parse()
@@ -708,7 +735,11 @@ impl Git {
     /// both report zero unlanded commits.
     pub fn commits_over(&self, base: &str, branch: &str) -> io::Result<usize> {
         let range = format!("refs/heads/{base}..refs/heads/{branch}");
-        Ok(self.run_ok(&["rev-list", "--count", &range])?.trim().parse().unwrap_or(0))
+        Ok(self
+            .run_ok(&["rev-list", "--count", &range])?
+            .trim()
+            .parse()
+            .unwrap_or(0))
     }
 
     /// Remotes that still carry `branch`, by the same split a delete uses — a
@@ -720,7 +751,9 @@ impl Git {
             .lines()
             .filter_map(|r| {
                 let (remote, short) = split_remote(r.trim(), &names);
-                (short == branch).then(|| remote.map(str::to_string)).flatten()
+                (short == branch)
+                    .then(|| remote.map(str::to_string))
+                    .flatten()
             })
             .collect())
     }
@@ -745,7 +778,10 @@ impl Git {
     /// td-review's own stdin or stdout is redirected.
     pub fn run_interactive(&self, args: &[&str]) -> io::Result<()> {
         let open = |write: bool| -> io::Result<std::fs::File> {
-            std::fs::OpenOptions::new().read(!write).write(write).open("/dev/tty")
+            std::fs::OpenOptions::new()
+                .read(!write)
+                .write(write)
+                .open("/dev/tty")
         };
         let status = Command::new("git")
             .current_dir(&self.repo)
@@ -790,7 +826,10 @@ impl Git {
 
     /// `--verify`: resolve exactly one object, and never read `rev` as a flag.
     pub fn rev_parse(&self, rev: &str) -> io::Result<String> {
-        Ok(self.run_ok(&["rev-parse", "--verify", "--end-of-options", rev])?.trim().to_string())
+        Ok(self
+            .run_ok(&["rev-parse", "--verify", "--end-of-options", rev])?
+            .trim()
+            .to_string())
     }
 
     /// Resolve a branch argument the way the list means it. `rev-parse` DWIM
@@ -799,8 +838,13 @@ impl Git {
     /// pin and the merge could then name different commits.
     pub fn branch_oid(&self, name: &str) -> io::Result<String> {
         for qualified in [format!("refs/remotes/{name}"), format!("refs/heads/{name}")] {
-            let run =
-                self.run(&["rev-parse", "--verify", "--quiet", "--end-of-options", &qualified])?;
+            let run = self.run(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &qualified,
+            ])?;
             if run.ok {
                 return Ok(run.line().to_string());
             }
@@ -811,7 +855,9 @@ impl Git {
     pub fn merge_base(&self, a: &str, b: &str) -> io::Result<String> {
         let run = self.run(&["merge-base", a, b])?;
         if !run.ok {
-            return Err(io::Error::other(format!("no merge base between {a} and {b}")));
+            return Err(io::Error::other(format!(
+                "no merge base between {a} and {b}"
+            )));
         }
         Ok(run.line().to_string())
     }
@@ -832,13 +878,23 @@ impl Git {
             )
         };
         let with_counts = fmt(&format!("%(ahead-behind:refs/heads/{base})"));
-        let run = self.run(&["for-each-ref", "--sort=-committerdate", &with_counts, "refs/remotes"])?;
+        let run = self.run(&[
+            "for-each-ref",
+            "--sort=-committerdate",
+            &with_counts,
+            "refs/remotes",
+        ])?;
         let remotes = self.remote_names()?;
         if run.ok {
             return Ok(parse_branches(&run.stdout, base, &remotes));
         }
         // Leave the counts field empty so the record shape is unchanged.
-        let out = self.run_ok(&["for-each-ref", "--sort=-committerdate", &fmt(""), "refs/remotes"])?;
+        let out = self.run_ok(&[
+            "for-each-ref",
+            "--sort=-committerdate",
+            &fmt(""),
+            "refs/remotes",
+        ])?;
         Ok(parse_branches(&out, base, &remotes))
     }
 
@@ -898,7 +954,14 @@ impl Git {
             return Ok(None);
         }
         let range = format!("refs/remotes/{remote}/{base}..refs/heads/{base}");
-        let run = self.run(&["log", "--reverse", "--oneline", "--no-decorate", &range, "--"])?;
+        let run = self.run(&[
+            "log",
+            "--reverse",
+            "--oneline",
+            "--no-decorate",
+            &range,
+            "--",
+        ])?;
         if !run.ok {
             // The tracking ref is there, so this is git declining to walk the
             // range — not the same state as "no copy here", and it must not be
@@ -912,7 +975,11 @@ impl Git {
     pub fn remote_branch_oid(&self, remote: &str, short: &str) -> io::Result<Option<String>> {
         let refname = format!("refs/remotes/{remote}/{short}");
         let run = self.run(&["rev-parse", "--verify", "--quiet", &refname])?;
-        Ok(if run.ok { Some(run.line().to_string()) } else { None })
+        Ok(if run.ok {
+            Some(run.line().to_string())
+        } else {
+            None
+        })
     }
 
     /// The tree `git merge --squash <branch>` would stage onto `base`, computed
@@ -938,8 +1005,13 @@ impl Git {
         if !run.ok {
             return Err(io::Error::other(run.failure()));
         }
-        let urls: Vec<String> =
-            run.stdout.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
+        let urls: Vec<String> = run
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
         if urls.is_empty() {
             return Err(io::Error::other(format!("{remote} has no push URL")));
         }
@@ -957,8 +1029,14 @@ impl Git {
         let refname = format!("refs/heads/{short}");
         let mut unnamed = false;
         for url in self.push_urls(remote)? {
-            let run =
-                self.run(&["ls-remote", "--symref", "--end-of-options", &url, "HEAD", &refname])?;
+            let run = self.run(&[
+                "ls-remote",
+                "--symref",
+                "--end-of-options",
+                &url,
+                "HEAD",
+                &refname,
+            ])?;
             if !run.ok {
                 return Err(io::Error::other(run.failure()));
             }
@@ -969,7 +1047,11 @@ impl Git {
                 HeadClaim::NotDefault => {}
             }
         }
-        Ok(if unnamed { HeadClaim::Unnamed } else { HeadClaim::NotDefault })
+        Ok(if unnamed {
+            HeadClaim::Unnamed
+        } else {
+            HeadClaim::NotDefault
+        })
     }
 
     /// The one remote a plain refresh means: whichever `branch.<base>.remote`
@@ -1066,8 +1148,12 @@ pub fn parse_branches(out: &str, base: &str, remotes: &[String]) -> Vec<Branch> 
             _ => continue,
         };
         let commit = fields.next().unwrap_or_default().to_string();
-        let committed_unix =
-            fields.next().unwrap_or_default().trim().parse::<i64>().unwrap_or(0);
+        let committed_unix = fields
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .parse::<i64>()
+            .unwrap_or(0);
         let counts = parse_ahead_behind(fields.next().unwrap_or_default());
         let author = fields.next().unwrap_or_default().to_string();
         let subject = fields.next().unwrap_or_default().to_string();
@@ -1079,7 +1165,14 @@ pub fn parse_branches(out: &str, base: &str, remotes: &[String]) -> Vec<Branch> 
         if short == "HEAD" || short == base {
             continue;
         }
-        branches.push(Branch { refname, commit, committed_unix, author, subject, counts });
+        branches.push(Branch {
+            refname,
+            commit,
+            committed_unix,
+            author,
+            subject,
+            counts,
+        });
     }
     branches
 }
@@ -1104,7 +1197,11 @@ fn parse_head_claim(out: &str, refname: &str) -> HeadClaim {
             // A symref for HEAD settles it either way, including one aimed
             // outside refs/heads: whatever it is, it is not this branch.
             (Some(target), "HEAD") => {
-                return if target == refname { HeadClaim::Default } else { HeadClaim::NotDefault }
+                return if target == refname {
+                    HeadClaim::Default
+                } else {
+                    HeadClaim::NotDefault
+                }
             }
             (Some(_), _) => {}
             (None, "HEAD") => head_oid = Some(value),
@@ -1188,7 +1285,11 @@ mod tests {
         // not detection was ever on.
         let detected = git(&["show", "--name-only", "--format=", "HEAD"]);
         let detected: Vec<&str> = detected.lines().filter(|l| !l.trim().is_empty()).collect();
-        assert_eq!(detected, vec!["notes.md"], "rename detection did not hide it");
+        assert_eq!(
+            detected,
+            vec!["notes.md"],
+            "rename detection did not hide it"
+        );
 
         let recs = Git::new(root.clone()).commit_records("HEAD~1..HEAD");
         std::fs::remove_dir_all(&root).ok();
@@ -1469,7 +1570,10 @@ mod tests {
             "a string containing // must not hide the query"
         );
         // …and a real comment IS stripped, or this file reds itself.
-        assert_eq!(bare_name_only(&strip_comments("// mentions --name-only\n")), None);
+        assert_eq!(
+            bare_name_only(&strip_comments("// mentions --name-only\n")),
+            None
+        );
         // A bracket inside a string must not desynchronise the span.
         let braced = r#"g.run(&["diff", "--no-renames", "--name-only", "--format=[x"]);"#;
         assert_eq!(bare_name_only(braced), None, "{braced}");
@@ -1482,20 +1586,32 @@ mod tests {
         );
         // Block comments NEST, so the inner close may not end the outer one.
         let nested_block = "g.run(&[\"diff\", \"--name-only\", /* a /* b */ --no-renames */]);";
-        assert!(bare_name_only(&strip_comments(nested_block)).is_some(), "{nested_block}");
+        assert!(
+            bare_name_only(&strip_comments(nested_block)).is_some(),
+            "{nested_block}"
+        );
         // The two constructs the stripper cannot lex are refused, not guessed.
         assert_eq!(unlexable("let s = r#\"x\"#;"), Some("a hashed raw string"));
         assert_eq!(unlexable("let c = '\"';"), Some("a quote char literal"));
         // A hashless raw string holds no quote, so the plain toggle is right
         // about it — and `"-r"` must not be mistaken for one.
         assert_eq!(unlexable("let s = r\"x\";"), None);
-        assert_eq!(unlexable(r#"g.run(&["-r", "--no-renames", "--name-only"]);"#), None);
+        assert_eq!(
+            unlexable(r#"g.run(&["-r", "--no-renames", "--name-only"]);"#),
+            None
+        );
         // Any hash count, or `325-cargo-test.rs`'s `r##"` gate body walks past.
-        assert_eq!(unlexable("let s = r##\"x\"##;"), Some("a hashed raw string"));
+        assert_eq!(
+            unlexable("let s = r##\"x\"##;"),
+            Some("a hashed raw string")
+        );
         assert_eq!(unlexable("let s = r#type;"), None);
         // The flag must be an ARGUMENT, not any occurrence in the span.
         let faked = r#"g.run(&["diff", "--format=--no-renames", "--name-only"]);"#;
-        assert!(bare_name_only(faked).is_some(), "a flag named inside another must not pass");
+        assert!(
+            bare_name_only(faked).is_some(),
+            "a flag named inside another must not pass"
+        );
     }
 
     /// `--name-only` reports only the DESTINATION of a detected rename, so any
@@ -1518,7 +1634,10 @@ mod tests {
     fn no_shipped_name_only_query_lets_git_detect_renames() {
         const TEST_MOD: &str = "#[cfg(test)]\nmod tests";
         let mut sources = Vec::new();
-        collect_rs_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut sources);
+        collect_rs_files(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
         assert!(!sources.is_empty(), "no sources to scan");
         let mut checked = 0usize;
         for f in &sources {
@@ -1556,16 +1675,25 @@ mod tests {
     #[test]
     fn a_ref_is_split_on_the_longest_remote_that_prefixes_it() {
         let remotes = ["origin".to_string(), "origin/mirror".to_string()];
-        assert_eq!(split_remote("origin/work-1", &remotes), (Some("origin"), "work-1"));
+        assert_eq!(
+            split_remote("origin/work-1", &remotes),
+            (Some("origin"), "work-1")
+        );
         assert_eq!(
             split_remote("origin/mirror/work-1", &remotes),
             (Some("origin/mirror"), "work-1")
         );
         // A slashed BRANCH name on a plain remote still keeps its slashes.
-        assert_eq!(split_remote("origin/feature/x", &remotes), (Some("origin"), "feature/x"));
+        assert_eq!(
+            split_remote("origin/feature/x", &remotes),
+            (Some("origin"), "feature/x")
+        );
         // Nothing matches: the whole thing is the branch name.
         assert_eq!(split_remote("work-1", &remotes), (None, "work-1"));
-        assert_eq!(split_remote("upstream/work-1", &remotes), (None, "upstream/work-1"));
+        assert_eq!(
+            split_remote("upstream/work-1", &remotes),
+            (None, "upstream/work-1")
+        );
         // A remote name alone is not a branch on that remote.
         assert_eq!(split_remote("origin", &remotes), (None, "origin"));
     }
@@ -1582,12 +1710,17 @@ mod tests {
             record("foo/bar/work-1", "1 0", "a", "s"),
         ]
         .join("\n");
-        assert_eq!(names(&parse_branches(&out, "main", &remotes)), vec!["foo/bar/work-1"]);
+        assert_eq!(
+            names(&parse_branches(&out, "main", &remotes)),
+            vec!["foo/bar/work-1"]
+        );
     }
 
     /// One `for-each-ref` record in the shipped field order.
     fn record(refname: &str, counts: &str, author: &str, subject: &str) -> String {
-        format!("refs/remotes/{refname}{FS}abc123{FS}1700000000{FS}{counts}{FS}{author}{FS}{subject}\n")
+        format!(
+            "refs/remotes/{refname}{FS}abc123{FS}1700000000{FS}{counts}{FS}{author}{FS}{subject}\n"
+        )
     }
 
     #[test]
@@ -1631,7 +1764,10 @@ mod tests {
         // The structural fields all precede the free text, so they survive.
         assert_eq!(branches.first().and_then(|b| b.counts), Some((2, 0)));
         assert_eq!(branches.first().map(|b| b.author.as_str()), Some("Ada"));
-        assert_eq!(branches.first().map(|b| b.subject.as_str()), Some(hostile.as_str()));
+        assert_eq!(
+            branches.first().map(|b| b.subject.as_str()),
+            Some(hostile.as_str())
+        );
     }
 
     #[test]
@@ -1639,7 +1775,9 @@ mod tests {
         let out = record("origin/feat/x", "2 0", "A B", "a: b/c d");
         let branches = parse_branches(&out, "main", &["origin".to_string()]);
         assert_eq!(
-            branches.first().map(|b| (b.refname.as_str(), b.subject.as_str())),
+            branches
+                .first()
+                .map(|b| (b.refname.as_str(), b.subject.as_str())),
             Some(("origin/feat/x", "a: b/c d"))
         );
     }
@@ -1685,8 +1823,14 @@ mod tests {
     /// No symref capability: the oid is the only evidence either way.
     #[test]
     fn an_unnamed_head_counts_only_where_the_oids_do_not_clear_it() {
-        assert_eq!(claim("aaa\tHEAD\naaa\trefs/heads/work-1\n"), HeadClaim::Unnamed);
-        assert_eq!(claim("bbb\tHEAD\naaa\trefs/heads/work-1\n"), HeadClaim::NotDefault);
+        assert_eq!(
+            claim("aaa\tHEAD\naaa\trefs/heads/work-1\n"),
+            HeadClaim::Unnamed
+        );
+        assert_eq!(
+            claim("bbb\tHEAD\naaa\trefs/heads/work-1\n"),
+            HeadClaim::NotDefault
+        );
         // HEAD resolved but the branch was not advertised, so there is no oid to
         // clear it with. A hidden ref must not read as an absent one.
         assert_eq!(claim("aaa\tHEAD\n"), HeadClaim::Unnamed);

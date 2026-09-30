@@ -115,7 +115,11 @@ mod tests {
             "the later file was not emitted (the loop stopped), or a diagnostic \
              reached stdout, which /etc/bootsuccess would read as a deployment id"
         );
-        assert_eq!(problems.len(), 1, "the missing file was not reported at all");
+        assert_eq!(
+            problems.len(),
+            1,
+            "the missing file was not reported at all"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

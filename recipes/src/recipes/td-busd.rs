@@ -8,10 +8,16 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-busd/src/app_policy.rs"),
     ),
     ("auth", include_str!("../../../td-busd/src/auth.rs")),
-    ("authscript", include_str!("../../../td-busd/src/authscript.rs")),
+    (
+        "authscript",
+        include_str!("../../../td-busd/src/authscript.rs"),
+    ),
     ("corpus", include_str!("../../../td-busd/src/corpus.rs")),
     ("lineage", include_str!("../../../td-busd/src/lineage.rs")),
-    ("match_rule", include_str!("../../../td-busd/src/match_rule.rs")),
+    (
+        "match_rule",
+        include_str!("../../../td-busd/src/match_rule.rs"),
+    ),
     ("message", include_str!("../../../td-busd/src/message.rs")),
     ("name", include_str!("../../../td-busd/src/name.rs")),
     ("policy", include_str!("../../../td-busd/src/policy.rs")),
@@ -19,7 +25,10 @@ const MODULES: &[(&str, &str)] = &[
     ("registry", include_str!("../../../td-busd/src/registry.rs")),
     ("session", include_str!("../../../td-busd/src/session.rs")),
     ("sys", include_str!("../../../td-busd/src/sys.rs")),
-    ("transport", include_str!("../../../td-busd/src/transport.rs")),
+    (
+        "transport",
+        include_str!("../../../td-busd/src/transport.rs"),
+    ),
     ("wire", include_str!("../../../td-busd/src/wire.rs")),
 ];
 

@@ -109,8 +109,22 @@ impl Message {
 }
 
 fn valid_verb(verb: &str) -> bool {
-    matches!(verb, SNAPSHOT | PUT | GET | FEED | KEY | WORKSPACE | WORKSPACE_ENSURE
-        | WORKSPACE_TERMINAL | WORKSPACE_CODEX | WORKSPACE_CLAUDE | POWEROFF | OK | ERROR)
+    matches!(
+        verb,
+        SNAPSHOT
+            | PUT
+            | GET
+            | FEED
+            | KEY
+            | WORKSPACE
+            | WORKSPACE_ENSURE
+            | WORKSPACE_TERMINAL
+            | WORKSPACE_CODEX
+            | WORKSPACE_CLAUDE
+            | POWEROFF
+            | OK
+            | ERROR
+    )
 }
 
 fn decimal(value: Option<&str>) -> Result<u64, String> {
@@ -424,7 +438,6 @@ pub mod git_key {
     }
 }
 
-
 #[allow(dead_code)] // Shared public provisioning contract at all three boundaries.
 pub mod workspace {
     pub const REQUEST: &str = "/run/td-compositor/1000/vm-workspace";
@@ -626,10 +639,16 @@ pub mod workspace {
         Failed(String),
     }
     pub fn pending(plan: &Plan) -> Vec<u8> {
-        [b"TDVM-CLONE-PENDING-1\n".as_slice(), plan.encode().as_slice()].concat()
+        [
+            b"TDVM-CLONE-PENDING-1\n".as_slice(),
+            plan.encode().as_slice(),
+        ]
+        .concat()
     }
     pub fn progress(bytes: &[u8], expected: &Plan) -> Result<Progress, String> {
-        if bytes.len() > 4096 { return Err("workspace response exceeds limit".into()); }
+        if bytes.len() > 4096 {
+            return Err("workspace response exceeds limit".into());
+        }
         if let Some(rest) = bytes.strip_prefix(b"TDVM-CLONE-PENDING-1\n") {
             if Plan::parse(rest)? != *expected {
                 return Err("workspace pending reply differs from this request".into());
@@ -661,10 +680,21 @@ pub mod workspace {
     }
     #[cfg(test)]
     pub fn example() -> Plan {
-        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
-        Plan { id: "0123456789abcdef0123456789abcdef".into(), branch: "task".into(), commit: "a".repeat(40),
-            repository: "/srv/git/td.git".into(), address: "10.0.2.2".into(), port: 22, user: "test".into(),
-            host_key: key.into(), guest_key: key.into(), author_name: "Fixture".into(), author_email: "fixture@example.invalid".into() }
+        let key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+        Plan {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            branch: "task".into(),
+            commit: "a".repeat(40),
+            repository: "/srv/git/td.git".into(),
+            address: "10.0.2.2".into(),
+            port: 22,
+            user: "test".into(),
+            host_key: key.into(),
+            guest_key: key.into(),
+            author_name: "Fixture".into(),
+            author_email: "fixture@example.invalid".into(),
+        }
     }
     #[cfg(test)]
     mod tests {
@@ -673,10 +703,14 @@ pub mod workspace {
         #[test]
         fn automatic_progress_is_typed_bounded_and_binds_the_full_plan() {
             let plan = example();
-            for (bytes, expected) in [(pending(&plan), Progress::Pending), (ready(&plan), Progress::Ready),
-                (failure(&plan, "failed"), Progress::Failed("failed".into()))] {
+            for (bytes, expected) in [
+                (pending(&plan), Progress::Pending),
+                (ready(&plan), Progress::Ready),
+                (failure(&plan, "failed"), Progress::Failed("failed".into())),
+            ] {
                 assert_eq!(progress(&bytes, &plan).unwrap(), expected);
-                let mut other = plan.clone(); other.author_email = "other@example.invalid".into();
+                let mut other = plan.clone();
+                other.author_email = "other@example.invalid".into();
                 assert!(progress(&bytes, &other).is_err());
                 assert!(progress(&[bytes, b"extra\n".to_vec()].concat(), &plan).is_err());
             }
@@ -688,19 +722,31 @@ pub mod workspace {
             let text = String::from_utf8(plan.encode()).unwrap();
             assert_eq!(Plan::parse(text.as_bytes()).unwrap(), plan);
             for bad in [
-                text.replace("\ntask\n", "\nmain\n"), text.replace("\ntask\n", "\n--option\n"),
-                text.replace("10.0.2.2", "host -oProxyCommand=bad"), text.replace("10.0.2.2", "999.0.0.1"),
-                text.replace("/srv/git/td.git", "/srv/../repo"), text.replace("/srv/git/td.git", "/repo;command"),
-                text.replace("\n22\n", "\n022\n"), text.replace("\n22\n", "\n0\n"),
-                text.replace(&"a".repeat(40), &"0".repeat(40)), text.replace("Fixture", "Bad\rName"),
-                format!("{text}extra\n"), text.trim_end().into(),
-            ] { assert!(Plan::parse(bad.as_bytes()).is_err(), "{bad}"); }
+                text.replace("\ntask\n", "\nmain\n"),
+                text.replace("\ntask\n", "\n--option\n"),
+                text.replace("10.0.2.2", "host -oProxyCommand=bad"),
+                text.replace("10.0.2.2", "999.0.0.1"),
+                text.replace("/srv/git/td.git", "/srv/../repo"),
+                text.replace("/srv/git/td.git", "/repo;command"),
+                text.replace("\n22\n", "\n022\n"),
+                text.replace("\n22\n", "\n0\n"),
+                text.replace(&"a".repeat(40), &"0".repeat(40)),
+                text.replace("Fixture", "Bad\rName"),
+                format!("{text}extra\n"),
+                text.trim_end().into(),
+            ] {
+                assert!(Plan::parse(bad.as_bytes()).is_err(), "{bad}");
+            }
             assert!(parse_ready(&ready(&plan), &plan).is_ok());
-            let mut other = plan.clone(); other.branch = "other".into();
+            let mut other = plan.clone();
+            other.branch = "other".into();
             assert!(parse_ready(&ready(&other), &plan).is_err());
-            assert!(status(&failure(&plan, "fixed failure"), &plan).unwrap_err().contains("fixed failure"));
-            assert!(status(&failure(&other, "fixed failure"), &plan).unwrap_err().contains("differs"));
+            assert!(status(&failure(&plan, "fixed failure"), &plan)
+                .unwrap_err()
+                .contains("fixed failure"));
+            assert!(status(&failure(&other, "fixed failure"), &plan)
+                .unwrap_err()
+                .contains("differs"));
         }
     }
-
 }

@@ -6,7 +6,10 @@
 #![deny(unsafe_code)]
 
 #[allow(dead_code, reason = "shared immutable application policy")]
-#[cfg_attr(not(feature = "target-recipe"), path = "../../td-busd/src/app_policy.rs")]
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../td-busd/src/app_policy.rs"
+)]
 mod app_policy;
 
 mod authority;
@@ -20,7 +23,10 @@ mod firefox;
     path = "../../engine/src/permissions.rs"
 )]
 mod permissions;
-#[cfg_attr(not(feature = "target-recipe"), path = "../../td-authd/src/primary_account.rs")]
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../td-authd/src/primary_account.rs"
+)]
 mod primary_account;
 mod seccomp;
 mod sys;
@@ -78,9 +84,7 @@ fn run() -> std::io::Result<()> {
         transition::Mode::FirefoxSeccompAuditProbe { firefox_pid } => {
             transition::probe_firefox_seccomp_audit(firefox_pid)
         }
-        transition::Mode::FirefoxInputProbe { stage } => {
-            transition::probe_firefox_input(stage)
-        }
+        transition::Mode::FirefoxInputProbe { stage } => transition::probe_firefox_input(stage),
         transition::Mode::FirefoxDownloadProbe => transition::probe_firefox_download(),
         transition::Mode::WriteFilter => transition::write_standard_filter(),
         transition::Mode::CgroupCleanupBootstrap { membership } => {
@@ -103,9 +107,7 @@ fn run() -> std::io::Result<()> {
         transition::Mode::KillReapsStage1 {
             expected_parent,
             instance,
-        } => {
-            transition::run_kill_reaps_stage_1(expected_parent, &instance)
-        }
+        } => transition::run_kill_reaps_stage_1(expected_parent, &instance),
         transition::Mode::KillHoldChild => transition::run_kill_hold_child(),
     }
 }
@@ -648,7 +650,9 @@ mod confinement {
         // explicit `/` above and the entry's. A fourth reds this.
         assert_eq!(TRANSITION.matches(".current_dir(").count(), 3);
         assert_eq!(
-            TRANSITION.matches("command.current_dir(directory);").count(),
+            TRANSITION
+                .matches("command.current_dir(directory);")
+                .count(),
             1
         );
         // The entry is started through the fallback rather than directly,
@@ -701,20 +705,26 @@ mod confinement {
             .unwrap()
             .0;
         assert!(
-            abandoned.find("fs::symlink_metadata(&directory)")
+            abandoned
+                .find("fs::symlink_metadata(&directory)")
                 .unwrap_or_else(|| panic!("abandoned leaf inspection is absent"))
-                < abandoned.find("require_delegation(&root, uid, gid)?")
+                < abandoned
+                    .find("require_delegation(&root, uid, gid)?")
                     .unwrap_or_else(|| panic!("delegation ownership check is absent"))
         );
         assert!(
-            abandoned.find("owned_membership(expected, uid)?")
+            abandoned
+                .find("owned_membership(expected, uid)?")
                 .unwrap_or_else(|| panic!("cleanup identity planner is absent"))
-                < abandoned.find("fs::symlink_metadata(&root)")
+                < abandoned
+                    .find("fs::symlink_metadata(&root)")
                     .unwrap_or_else(|| panic!("delegation inspection is absent"))
         );
-        let planner = CGROUP.split_once("fn owned_membership(")
+        let planner = CGROUP
+            .split_once("fn owned_membership(")
             .unwrap_or_else(|| panic!("cleanup identity planner definition is absent"))
-            .1.split_once("pub(crate) fn remove_abandoned")
+            .1
+            .split_once("pub(crate) fn remove_abandoned")
             .unwrap_or_else(|| panic!("abandoned cleanup definition is absent"))
             .0;
         assert!(planner.contains("delegation.require_uid(uid)?"));
@@ -737,9 +747,8 @@ mod confinement {
             kill_stage1.find("ManagedCgroup::create(").unwrap()
                 < kill_stage1.find("start_probe_instance(").unwrap()
         );
-        assert!(kill_stage1.contains(
-            "ManagedCgroup::create(&executable, instance, limits, identity, false)?"
-        ));
+        assert!(kill_stage1
+            .contains("ManagedCgroup::create(&executable, instance, limits, identity, false)?"));
         let shared_transition = TRANSITION
             .split_once("fn start_probe_instance(")
             .unwrap()
@@ -759,7 +768,9 @@ mod confinement {
             shared_transition
                 .find("application_cgroup.attach(child.id())")
                 .unwrap()
-                < shared_transition.find("proof_writer.write_all(&token)").unwrap()
+                < shared_transition
+                    .find("proof_writer.write_all(&token)")
+                    .unwrap()
         );
         assert!(TRANSITION.contains(
             "Stage2Action::KillHold { cgroup_membership } => {\n            \
@@ -780,13 +791,11 @@ mod confinement {
         );
         assert!(
             observe.find("stage1.kill()?").unwrap()
-                < observe
-                    .find("cgroup::wait_until_removed(")
-                    .unwrap()
+                < observe.find("cgroup::wait_until_removed(").unwrap()
         );
-        assert!(CGROUP.contains(
-            "pub(crate) fn wait_until_removed(expected: &str, timeout: Duration)"
-        ));
+        assert!(
+            CGROUP.contains("pub(crate) fn wait_until_removed(expected: &str, timeout: Duration)")
+        );
     }
 
     #[test]
@@ -863,7 +872,12 @@ mod confinement {
         );
         assert!(at("stage2_output = if application.terminal") < at(".stdout(stage2_output)"));
         assert_eq!(TRANSITION.matches("acquire_fresh_terminal()?").count(), 1);
-        assert_eq!(TRANSITION.matches("sys::acquire_controlling_terminal()").count(), 1);
+        assert_eq!(
+            TRANSITION
+                .matches("sys::acquire_controlling_terminal()")
+                .count(),
+            1
+        );
 
         let acquire = TRANSITION
             .split_once("fn acquire_fresh_terminal()")
@@ -874,8 +888,13 @@ mod confinement {
                 .find(needle)
                 .unwrap_or_else(|| panic!("acquire_fresh_terminal no longer contains {needle}"))
         };
-        assert!(at("PTY_SLAVE_MAJORS.contains(&stdin.device.0)") < at("sys::acquire_controlling_terminal()"));
-        assert!(at("before.session != std::process::id()") < at("sys::acquire_controlling_terminal()"));
+        assert!(
+            at("PTY_SLAVE_MAJORS.contains(&stdin.device.0)")
+                < at("sys::acquire_controlling_terminal()")
+        );
+        assert!(
+            at("before.session != std::process::id()") < at("sys::acquire_controlling_terminal()")
+        );
         assert!(
             at("sys::acquire_controlling_terminal()")
                 < at("require_terminal_numbers(\"launcher stdin\"")
@@ -893,7 +912,8 @@ mod confinement {
             at("require_stage2_terminal(terminal")
                 < at("run_application(\n                &entry,")
         );
-        assert!(TRANSITION.contains("const PTY_SLAVE_MAJORS: std::ops::RangeInclusive<u64> = 136..=143;"));
+        assert!(TRANSITION
+            .contains("const PTY_SLAVE_MAJORS: std::ops::RangeInclusive<u64> = 136..=143;"));
         assert!(TRANSITION.contains("const TERMINAL_NODE: (&str, u64, u64) = (\"tty\", 5, 0);"));
 
         // One open terminal is device, filesystem AND inode: two devpts
@@ -906,7 +926,9 @@ mod confinement {
             .unwrap()
             .1;
         assert!(
-            clone.find("io::stdin().as_fd().try_clone_to_owned()").unwrap()
+            clone
+                .find("io::stdin().as_fd().try_clone_to_owned()")
+                .unwrap()
                 < clone.find('}').unwrap()
         );
         // The transition probe runs in its caller's session and asserts
@@ -923,8 +945,13 @@ mod confinement {
         // cleanup tree gets no duplicate of the terminal.
         let etc = TRANSITION.split_once("fn require_etc_plan(").unwrap().1;
         assert!(etc.contains("require_bound_terminfo(mountinfo, name)?"));
-        let cleanup = TRANSITION.split_once("fn spawn(executable: &Path, membership: &str, terminal: bool)").unwrap().1;
-        assert!(cleanup.find("Stdio::null()").unwrap() < cleanup.find(".stderr(diagnostics)").unwrap());
+        let cleanup = TRANSITION
+            .split_once("fn spawn(executable: &Path, membership: &str, terminal: bool)")
+            .unwrap()
+            .1;
+        assert!(
+            cleanup.find("Stdio::null()").unwrap() < cleanup.find(".stderr(diagnostics)").unwrap()
+        );
     }
 
     #[test]
@@ -1028,9 +1055,9 @@ mod confinement {
             .split_once("fn last_capability")
             .unwrap()
             .0;
-        assert!(
-            reaper_mount.contains("sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV,")
-        );
+        assert!(reaper_mount.contains(
+            "remount_read_only(&target, sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV)?;"
+        ));
         assert!(TRANSITION.contains(
             "REAPER_PROBE_PATH,\n            None,\n            &[\"ro\", \"nosuid\", \"nodev\"],\n            &[\"rw\", \"noexec\"],"
         ));
@@ -1041,19 +1068,18 @@ mod confinement {
     fn transition_is_the_only_syscall_caller() {
         let shipped_main = MAIN.split_once("#[cfg(test)]").unwrap().0;
         assert_eq!(
-            TRANSITION.matches("sys::unshare_namespaces(true)?;").count(),
+            TRANSITION
+                .matches("sys::unshare_namespaces(true)?;")
+                .count(),
             1
         );
         assert_eq!(TRANSITION.matches("sys::unshare_namespaces(").count(), 2);
-        assert!(TRANSITION.contains(
-            "sys::unshare_namespaces(application.isolate_network).map_err(|error|"
-        ));
-        assert!(TRANSITION.contains(
-            ".require_application_change(&before, application.isolate_network)?;"
-        ));
-        assert!(TRANSITION.contains(
-            "if application.isolate_network {\n            sys::bring_up_loopback()"
-        ));
+        assert!(TRANSITION
+            .contains("sys::unshare_namespaces(application.isolate_network).map_err(|error|"));
+        assert!(TRANSITION
+            .contains(".require_application_change(&before, application.isolate_network)?;"));
+        assert!(TRANSITION
+            .contains("if application.isolate_network {\n            sys::bring_up_loopback()"));
         assert!(TRANSITION.contains(
             "let flags = sys::MS_BIND\n        | if source_kind == FilesystemSourceKind::Directory {\n            sys::MS_REC"
         ));
@@ -1119,9 +1145,8 @@ mod confinement {
         assert!(TRANSITION.contains(".into_raw_fd()"));
         assert!(TRANSITION.contains("require_descriptor_closed(descriptor)?;"));
         assert!(TRANSITION.contains("clear_and_require_empty_capabilities()?;"));
-        assert!(TRANSITION.contains(
-            "install_standard_seccomp_filter(firefox_seccomp_probe).map_err(|error|"
-        ));
+        assert!(TRANSITION
+            .contains("install_standard_seccomp_filter(firefox_seccomp_probe).map_err(|error|"));
         assert!(TRANSITION.contains("probe_pid1_lifecycle()?;"));
         assert_eq!(TRANSITION.matches(".env_clear()").count(), 4);
         assert_eq!(TRANSITION.matches(".envs(").count(), 1);

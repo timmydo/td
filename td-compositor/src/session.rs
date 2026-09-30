@@ -6,13 +6,16 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 static APPLICATION_POLICY: OnceLock<Result<crate::app_policy::Policy, String>> = OnceLock::new();
 
 pub(crate) fn application_policy() -> Result<&'static crate::app_policy::Policy, String> {
-    APPLICATION_POLICY.get_or_init(crate::app_policy::load).as_ref().map_err(Clone::clone)
+    APPLICATION_POLICY
+        .get_or_init(crate::app_policy::load)
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 pub(crate) const HUMAN_UID: u32 = 1000;
@@ -56,7 +59,9 @@ fn require_application(uid: u32, policy: &crate::app_policy::Policy) -> Result<(
     if policy.owner() == HUMAN_UID && policy.for_uid(uid).is_some() {
         Ok(())
     } else {
-        Err(format!("compositor application socket refuses peer uid {uid}"))
+        Err(format!(
+            "compositor application socket refuses peer uid {uid}"
+        ))
     }
 }
 
@@ -303,8 +308,9 @@ mod tests {
     #[test]
     fn application_display_admission_does_not_grant_human_control() {
         let policy = crate::app_policy::Policy::parse(
-            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n"
-        ).unwrap();
+            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n",
+        )
+        .unwrap();
         for uid in [65536, 65537] {
             assert!(require_application(uid, &policy).is_ok());
             assert!(require_human(uid).is_err());

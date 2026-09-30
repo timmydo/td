@@ -169,9 +169,7 @@ pub fn grid_for_tile(
     cell_height: usize,
 ) -> Result<(usize, usize), String> {
     if cell_width == 0 || cell_height == 0 {
-        return Err(format!(
-            "font cell {cell_width}x{cell_height} has no area"
-        ));
+        return Err(format!("font cell {cell_width}x{cell_height} has no area"));
     }
     let columns = width.checked_div(cell_width).unwrap_or(0).max(1);
     let rows = height.checked_div(cell_height).unwrap_or(0).max(1);
@@ -179,8 +177,7 @@ pub fn grid_for_tile(
 }
 
 fn read_bounded(path: &Path, limit: usize) -> Result<String, String> {
-    let metadata =
-        std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let metadata = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
     if metadata.len() > limit as u64 {
         return Err(format!(
             "{} is larger than the {limit}-byte bound",
@@ -988,15 +985,19 @@ mod tests {
     fn an_explicit_command_is_literal_argv_without_the_wrapper() {
         use std::os::unix::ffi::OsStringExt;
         let words = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        let explicit =
-            child_command(Path::new(CTTYHACK), &words(&["/bin/mail", "--cli", "echo hi"]))
-                .unwrap();
+        let explicit = child_command(
+            Path::new(CTTYHACK),
+            &words(&["/bin/mail", "--cli", "echo hi"]),
+        )
+        .unwrap();
         assert_eq!(explicit.program, PathBuf::from("/bin/mail"));
         assert_eq!(explicit.arguments, vec!["--cli", "echo hi"]);
         // A caller that wants the wrapper spells it out and gets exactly that.
-        let wrapped =
-            child_command(Path::new(CTTYHACK), &words(&[CTTYHACK, CTTYHACK_STDIN, "/bin/sh"]))
-                .unwrap();
+        let wrapped = child_command(
+            Path::new(CTTYHACK),
+            &words(&[CTTYHACK, CTTYHACK_STDIN, "/bin/sh"]),
+        )
+        .unwrap();
         assert_eq!(wrapped.program, PathBuf::from(CTTYHACK));
         assert_eq!(wrapped.arguments, vec!["--stdin", "/bin/sh"]);
         // Literal means bytes: an argument that is not UTF-8 is carried as-is.

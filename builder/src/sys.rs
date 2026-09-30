@@ -6,7 +6,15 @@
 //! hand-rolled SHA-256; the rung's differential proves behavior, and the drv
 //! platform field is checked to be x86_64-linux before any of this runs).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 #![allow(unsafe_code)] // confined raw-syscall / low-level layer (UNSAFE.md)
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
@@ -163,7 +171,16 @@ pub fn unshare(flags: usize) -> io::Result<()> {
 
 /// Only in a forked Command child: preserve std's exec-error pipe until exec.
 pub fn mark_extra_descriptors_cloexec() -> io::Result<()> {
-    check(unsafe { syscall5(SYS_CLOSE_RANGE, 3, u32::MAX as usize, CLOSE_RANGE_CLOEXEC, 0, 0) })
+    check(unsafe {
+        syscall5(
+            SYS_CLOSE_RANGE,
+            3,
+            u32::MAX as usize,
+            CLOSE_RANGE_CLOEXEC,
+            0,
+            0,
+        )
+    })
 }
 
 /// Only the namespace reaper's newly created exec-barrier writer may remain.
@@ -174,7 +191,16 @@ pub fn close_reaper_descriptors(writer: i32) -> io::Result<()> {
     if writer > 3 {
         check(unsafe { syscall5(SYS_CLOSE_RANGE, 3, writer as usize - 1, 0, 0, 0) })?;
     }
-    check(unsafe { syscall5(SYS_CLOSE_RANGE, writer as usize + 1, u32::MAX as usize, 0, 0, 0) })
+    check(unsafe {
+        syscall5(
+            SYS_CLOSE_RANGE,
+            writer as usize + 1,
+            u32::MAX as usize,
+            0,
+            0,
+            0,
+        )
+    })
 }
 
 /// mount(2). `src`/`fstype`/`data` may be None (NULL) — e.g. the
@@ -191,7 +217,14 @@ pub fn mount(
     let t = fstype.map_or(std::ptr::null(), CStr::as_ptr);
     let d = data.map_or(std::ptr::null(), CStr::as_ptr);
     check(unsafe {
-        syscall5(SYS_MOUNT, s as usize, target.as_ptr() as usize, t as usize, flags, d as usize)
+        syscall5(
+            SYS_MOUNT,
+            s as usize,
+            target.as_ptr() as usize,
+            t as usize,
+            flags,
+            d as usize,
+        )
     })
 }
 
@@ -237,7 +270,14 @@ pub fn restrict_mount(target: &CStr, noexec: bool, recursive: bool) -> io::Resul
 /// `put_old`. Both must be directories; `new_root` must be a mount point.
 pub fn pivot_root(new_root: &CStr, put_old: &CStr) -> io::Result<()> {
     check(unsafe {
-        syscall5(SYS_PIVOT_ROOT, new_root.as_ptr() as usize, put_old.as_ptr() as usize, 0, 0, 0)
+        syscall5(
+            SYS_PIVOT_ROOT,
+            new_root.as_ptr() as usize,
+            put_old.as_ptr() as usize,
+            0,
+            0,
+            0,
+        )
     })
 }
 
@@ -369,9 +409,7 @@ pub fn pipe_liveness() -> io::Result<(i32, i32)> {
 /// Blocking pipe: the workload must wait for completed reaper cleanup.
 pub fn pipe_exec_barrier() -> io::Result<(i32, i32)> {
     let mut fds = [-1i32; 2];
-    check(unsafe {
-        syscall5(SYS_PIPE2, fds.as_mut_ptr() as usize, O_CLOEXEC, 0, 0, 0)
-    })?;
+    check(unsafe { syscall5(SYS_PIPE2, fds.as_mut_ptr() as usize, O_CLOEXEC, 0, 0, 0) })?;
     let [reader, writer] = fds;
     if reader < 3 || writer < 3 {
         let _ = close(reader);
@@ -387,10 +425,21 @@ pub fn await_exec_barrier(reader: i32) -> io::Result<()> {
     let mut acknowledged = false;
     loop {
         let ret = unsafe {
-            syscall5(SYS_READ, reader as usize, byte.as_mut_ptr() as usize, 1, 0, 0)
+            syscall5(
+                SYS_READ,
+                reader as usize,
+                byte.as_mut_ptr() as usize,
+                1,
+                0,
+                0,
+            )
         };
         if ret == 0 {
-            return if acknowledged { Ok(()) } else { Err(io::Error::from_raw_os_error(32)) };
+            return if acknowledged {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(32))
+            };
         }
         if ret == 1 {
             if acknowledged || byte != [1] {
@@ -408,9 +457,7 @@ pub fn await_exec_barrier(reader: i32) -> io::Result<()> {
 pub fn release_exec_barrier(writer: i32) -> io::Result<()> {
     let byte = [1u8];
     loop {
-        let ret = unsafe {
-            syscall5(SYS_WRITE, writer as usize, byte.as_ptr() as usize, 1, 0, 0)
-        };
+        let ret = unsafe { syscall5(SYS_WRITE, writer as usize, byte.as_ptr() as usize, 1, 0, 0) };
         if ret == 1 {
             return close(writer);
         }
@@ -567,7 +614,10 @@ pub fn kill_recorded(target: KillTarget, sig: usize, reason: &str) -> io::Result
 /// recorded, so nothing but signals stands between the first member and the
 /// last. Results in the callers' order.
 pub fn kill_all_recorded(kills: &[(KillTarget, String)], sig: usize) -> Vec<io::Result<()>> {
-    let cmdlines: Vec<String> = kills.iter().map(|(target, _)| target_cmdline(*target)).collect();
+    let cmdlines: Vec<String> = kills
+        .iter()
+        .map(|(target, _)| target_cmdline(*target))
+        .collect();
     let results: Vec<io::Result<()>> = kills.iter().map(|(target, _)| send(*target, sig)).collect();
     for (((target, reason), cmdline), result) in kills.iter().zip(&cmdlines).zip(&results) {
         record_kill(*target, sig, cmdline, reason, result);
@@ -691,7 +741,13 @@ fn target_cmdline(target: KillTarget) -> String {
     capped
 }
 
-fn record_kill(target: KillTarget, sig: usize, cmdline: &str, reason: &str, result: &io::Result<()>) {
+fn record_kill(
+    target: KillTarget,
+    sig: usize,
+    cmdline: &str,
+    reason: &str,
+    result: &io::Result<()>,
+) {
     use std::io::Write as _;
     let line = kill_audit_line(target, sig, cmdline, reason, result);
     // Not `eprintln!`: that panics when stderr is gone, and this runs on
@@ -720,7 +776,11 @@ fn append_kill_audit_line(path: &std::path::Path, line: &str) {
     if !path.parent().is_some_and(create_audit_dir) {
         return;
     }
-    let opened = std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(path);
+    let opened = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(path);
     if let Ok(mut file) = opened {
         // The line and its newline in one buffer, which for a short record
         // on a regular file is one write(2): `writeln!` on a bare `File`
@@ -778,7 +838,14 @@ pub fn fork() -> io::Result<i64> {
 pub fn waitpid(pid: i64) -> io::Result<i32> {
     let mut status: i32 = 0;
     let ret = unsafe {
-        syscall5(SYS_WAIT4, pid as usize, &mut status as *mut i32 as usize, 0, 0, 0)
+        syscall5(
+            SYS_WAIT4,
+            pid as usize,
+            &mut status as *mut i32 as usize,
+            0,
+            0,
+            0,
+        )
     };
     if ret < 0 {
         Err(io::Error::from_raw_os_error(-ret as i32))
@@ -797,7 +864,14 @@ pub fn wait_any() -> io::Result<(i64, i32)> {
     let mut status: i32 = 0;
     loop {
         let ret = unsafe {
-            syscall5(SYS_WAIT4, ANY_CHILD as usize, &mut status as *mut i32 as usize, 0, 0, 0)
+            syscall5(
+                SYS_WAIT4,
+                ANY_CHILD as usize,
+                &mut status as *mut i32 as usize,
+                0,
+                0,
+                0,
+            )
         };
         if ret >= 0 {
             return Ok((ret as i64, status));
@@ -850,7 +924,16 @@ pub fn wait_exited_no_reap(pid: u32) -> io::Result<()> {
 /// EPERM/EACCES, which callers treat as "already nice enough". Scheduling-only:
 /// build OUTPUT is unaffected, so reproducibility is intact.
 pub fn set_self_priority(prio: i32) -> io::Result<()> {
-    check(unsafe { syscall5(SYS_SETPRIORITY, PRIO_PROCESS, 0, prio as isize as usize, 0, 0) })
+    check(unsafe {
+        syscall5(
+            SYS_SETPRIORITY,
+            PRIO_PROCESS,
+            0,
+            prio as isize as usize,
+            0,
+            0,
+        )
+    })
 }
 
 /// getpriority(2) for the calling process, as the nice value (-20..=19). The raw
@@ -870,9 +953,7 @@ pub fn get_self_priority() -> io::Result<i32> {
 /// syscall), so no setrlimit/getrlimit split.
 pub fn get_rlimit(resource: usize) -> io::Result<(u64, u64)> {
     let mut old: [u64; 2] = [0, 0];
-    check(unsafe {
-        syscall5(SYS_PRLIMIT64, 0, resource, 0, old.as_mut_ptr() as usize, 0)
-    })?;
+    check(unsafe { syscall5(SYS_PRLIMIT64, 0, resource, 0, old.as_mut_ptr() as usize, 0) })?;
     Ok((old[0], old[1]))
 }
 
@@ -885,9 +966,7 @@ pub fn get_rlimit(resource: usize) -> io::Result<(u64, u64)> {
 /// is intact (a build over the cap FAILS, it does not produce different bytes).
 pub fn set_rlimit(resource: usize, soft: u64, hard: u64) -> io::Result<()> {
     let new: [u64; 2] = [soft, hard];
-    check(unsafe {
-        syscall5(SYS_PRLIMIT64, 0, resource, new.as_ptr() as usize, 0, 0)
-    })
+    check(unsafe { syscall5(SYS_PRLIMIT64, 0, resource, new.as_ptr() as usize, 0, 0) })
 }
 
 /// mmap(2) a private anonymous read/write region of `len` bytes. Returns the
@@ -899,7 +978,17 @@ pub fn set_rlimit(resource: usize, soft: u64, hard: u64) -> io::Result<()> {
 /// probes the cap with this rather than a heap allocation in a forked child.
 pub fn mmap_anon(len: usize) -> isize {
     // fd = -1 (usize::MAX) for an anonymous mapping; offset 0.
-    unsafe { syscall6(SYS_MMAP, 0, len, PROT_READ_WRITE, MAP_PRIVATE_ANON, usize::MAX, 0) }
+    unsafe {
+        syscall6(
+            SYS_MMAP,
+            0,
+            len,
+            PROT_READ_WRITE,
+            MAP_PRIVATE_ANON,
+            usize::MAX,
+            0,
+        )
+    }
 }
 
 pub fn exit_group(code: i32) -> ! {
@@ -916,45 +1005,120 @@ mod tests {
     fn descriptor_exec_boundary_is_value_pinned() {
         assert_eq!(super::SYS_CLOSE_RANGE, 436);
         assert_eq!(super::CLOSE_RANGE_CLOEXEC, 4);
-        let compact = |text: &str| text.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        };
         let source = compact(shipped_part(include_str!("sys.rs")));
         assert_eq!(source.matches("SYS_CLOSE_RANGE,").count(), 3);
-        assert!(source.contains("syscall5(SYS_CLOSE_RANGE,3,u32::MAXasusize,CLOSE_RANGE_CLOEXEC,0,0)"));
+        assert!(
+            source.contains("syscall5(SYS_CLOSE_RANGE,3,u32::MAXasusize,CLOSE_RANGE_CLOEXEC,0,0,)")
+        );
         assert!(source.contains("syscall5(SYS_CLOSE_RANGE,3,writerasusize-1,0,0,0)"));
-        assert!(source.contains("syscall5(SYS_CLOSE_RANGE,writerasusize+1,u32::MAXasusize,0,0,0)"));
+        assert!(source.contains("syscall5(SYS_CLOSE_RANGE,writerasusize+1,u32::MAXasusize,0,0,0,)"));
         assert!(source.contains("ifwriter<3{returnErr(io::Error::from_raw_os_error(22));}"));
         assert!(source.contains("syscall5(SYS_PIPE2,fds.as_mut_ptr()asusize,O_CLOEXEC,0,0,0)"));
-        let sandbox = include_str!("sandbox.rs").split("#[cfg(test)]\nmod tests").next().unwrap();
-        assert_eq!(sandbox.matches("sys::mark_extra_descriptors_cloexec()").count(), 1);
-        assert_eq!(sandbox.matches("sys::close_reaper_descriptors(writer)").count(), 1);
+        let sandbox = include_str!("sandbox.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert_eq!(
+            sandbox
+                .matches("sys::mark_extra_descriptors_cloexec()")
+                .count(),
+            1
+        );
+        assert_eq!(
+            sandbox
+                .matches("sys::close_reaper_descriptors(writer)")
+                .count(),
+            1
+        );
         assert_eq!(sandbox.matches("sys::pipe_exec_barrier()").count(), 1);
-        assert_eq!(sandbox.matches("sys::await_exec_barrier(reader)").count(), 1);
-        assert_eq!(sandbox.matches("sys::release_exec_barrier(writer)").count(), 1);
-        let boundary = sandbox.split("fn pid1_serve_as_init(").nth(1).unwrap().split("\n}\n").next().unwrap();
-        assert!(boundary.find("sys::mark_extra_descriptors_cloexec()").unwrap()
-            < boundary.find("sys::fork()").unwrap());
-        assert!(boundary.find("sys::close_reaper_descriptors(writer)").unwrap()
-            < boundary.find("sys::release_exec_barrier(writer)").unwrap());
-        assert!(boundary.find("sys::release_exec_barrier(writer)").unwrap()
-            < boundary.find("sys::wait_any()").unwrap());
-        assert_eq!(sandbox.matches("pid1_serve_as_init(b\"").count(), 3);
+        assert_eq!(
+            sandbox.matches("sys::await_exec_barrier(reader)").count(),
+            1
+        );
+        assert_eq!(
+            sandbox.matches("sys::release_exec_barrier(writer)").count(),
+            1
+        );
+        let boundary = sandbox
+            .split("fn pid1_serve_as_init(")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(
+            boundary
+                .find("sys::mark_extra_descriptors_cloexec()")
+                .unwrap()
+                < boundary.find("sys::fork()").unwrap()
+        );
+        assert!(
+            boundary
+                .find("sys::close_reaper_descriptors(writer)")
+                .unwrap()
+                < boundary.find("sys::release_exec_barrier(writer)").unwrap()
+        );
+        assert!(
+            boundary.find("sys::release_exec_barrier(writer)").unwrap()
+                < boundary.find("sys::wait_any()").unwrap()
+        );
+        // A call spelled either way rustfmt lays one out: the byte string on
+        // the call's line, or alone on the next.
+        let calls = sandbox.matches("pid1_serve_as_init(b\"").count()
+            + sandbox
+                .split("pid1_serve_as_init(\n")
+                .skip(1)
+                .filter(|rest| rest.trim_start_matches(' ').starts_with("b\""))
+                .count();
+        assert_eq!(calls, 3);
     }
 
     #[test]
     #[ignore = "exec-only inherited descriptor fixture"]
     fn descriptor_exec_probe() {
         assert_eq!(std::env::var("TD_DESCRIPTOR_EXEC_PROBE").unwrap(), "1");
-        let mut descriptors = std::fs::read_dir("/proc/self/fd").unwrap()
-            .map(|entry| entry.unwrap().file_name().to_str().unwrap().parse::<u32>().unwrap())
+        let mut descriptors = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .parse::<u32>()
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         descriptors.sort_unstable();
-        assert_eq!(descriptors, [0, 1, 2, 3], "workload inherited ambient descriptors");
+        assert_eq!(
+            descriptors,
+            [0, 1, 2, 3],
+            "workload inherited ambient descriptors"
+        );
         // Must be clean at workload entry, not merely eventually clean.
-        let mut reaper = std::fs::read_dir("/proc/1/fd").unwrap()
-            .map(|entry| entry.unwrap().file_name().to_str().unwrap().parse::<u32>().unwrap())
+        let mut reaper = std::fs::read_dir("/proc/1/fd")
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .parse::<u32>()
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         reaper.sort_unstable();
-        assert_eq!(reaper, [0, 1, 2], "workload can reopen the reaper's ambient descriptors");
+        assert_eq!(
+            reaper,
+            [0, 1, 2],
+            "workload can reopen the reaper's ambient descriptors"
+        );
         println!("TD-DESCRIPTOR-EXEC-OK");
     }
 
@@ -967,13 +1131,21 @@ mod tests {
         let sentinel = std::fs::File::open("/dev/null").unwrap();
         let fd = sentinel.as_raw_fd();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.args(["--exact", "sys::tests::descriptor_exec_probe", "--ignored", "--nocapture"])
-            .env_clear().env("TD_DESCRIPTOR_EXEC_PROBE", "1");
+        command
+            .args([
+                "--exact",
+                "sys::tests::descriptor_exec_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("TD_DESCRIPTOR_EXEC_PROBE", "1");
         unsafe {
             command.pre_exec(move || {
                 // Test-only fcntl(F_DUPFD, 64): inject a non-CLOEXEC copy in
                 // this child alone, never into the parallel parent harness.
-                crate::sandbox::DELAY_REAPER_CLEANUP.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::sandbox::DELAY_REAPER_CLEANUP
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 check(syscall5(SYS_FCNTL, fd as usize, F_DUPFD, 64, 0, 0))
             });
         }
@@ -981,7 +1153,10 @@ mod tests {
         let output = command.output().unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(String::from_utf8_lossy(&output.stdout).contains("TD-DESCRIPTOR-EXEC-OK"));
-        assert!(sentinel.metadata().is_ok(), "child cleanup changed the parent's descriptor");
+        assert!(
+            sentinel.metadata().is_ok(),
+            "child cleanup changed the parent's descriptor"
+        );
     }
 
     #[test]
@@ -1033,10 +1208,15 @@ mod tests {
             send.send(result).unwrap();
         });
         writer.write_all(&[1]).unwrap();
-        assert!(matches!(receive.recv_timeout(std::time::Duration::from_millis(50)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        assert!(matches!(
+            receive.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
         drop(writer);
-        receive.recv_timeout(std::time::Duration::from_secs(10)).unwrap().unwrap();
+        receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
         child.join().unwrap();
     }
 
@@ -1056,7 +1236,10 @@ mod tests {
         for noexec in [false, true] {
             let attr = super::readonly_mount_attr(noexec);
             assert_eq!(attr.attr_set, if noexec { 9 } else { 1 });
-            assert_eq!(attr.attr_clr, 0, "inherited restrictions must not be cleared");
+            assert_eq!(
+                attr.attr_clr, 0,
+                "inherited restrictions must not be cleared"
+            );
             assert_eq!(attr.propagation, 0);
             assert_eq!(attr.userns_fd, 0);
         }
@@ -1174,7 +1357,10 @@ mod tests {
         );
         set_rlimit(RLIMIT_DATA, target, hard).expect("lowering the soft data limit must succeed");
         let (soft_after, hard_after) = get_rlimit(RLIMIT_DATA).expect("getrlimit");
-        assert_eq!(soft_after, target, "soft data limit should be exactly the set value");
+        assert_eq!(
+            soft_after, target,
+            "soft data limit should be exactly the set value"
+        );
         assert_eq!(hard_after, hard, "hard limit must be unchanged");
         set_rlimit(RLIMIT_DATA, orig_soft, hard)
             .expect("restoring the soft data limit must succeed");
@@ -1201,7 +1387,11 @@ mod tests {
                 exit_group(if r >= 0 { 0 } else { 1 });
             }
             let status = waitpid(pid).expect("waitpid");
-            assert_eq!(status & 0x7f, 0, "child should exit normally, not be signalled");
+            assert_eq!(
+                status & 0x7f,
+                0,
+                "child should exit normally, not be signalled"
+            );
             (status >> 8) & 0xff
         };
         // "Uncapped" means only that THIS test sets no cap; the child still
@@ -1214,7 +1404,11 @@ mod tests {
         let (ambient_soft, _) = get_rlimit(RLIMIT_DATA).expect("getrlimit");
         let headroom = BIG as u64 + 64 * 1024 * 1024;
         if ambient_soft >= headroom {
-            assert_eq!(run(None), 0, "an uncapped child must be able to map {BIG} bytes");
+            assert_eq!(
+                run(None),
+                0,
+                "an uncapped child must be able to map {BIG} bytes"
+            );
         }
         assert_eq!(
             run(Some(32 * 1024 * 1024)),
@@ -1230,11 +1424,20 @@ mod tests {
         // read as death (that would abort every healthy sandbox), and a closed
         // one must not read as life (that is the orphan this exists to catch).
         let (r, w) = pipe_liveness().expect("pipe2");
-        assert!(pipe_peer_open(r).expect("read"), "an open write end must read as alive");
+        assert!(
+            pipe_peer_open(r).expect("read"),
+            "an open write end must read as alive"
+        );
         close(w).expect("close");
-        assert!(!pipe_peer_open(r).expect("read"), "the last writer closing must read as EOF");
+        assert!(
+            !pipe_peer_open(r).expect("read"),
+            "the last writer closing must read as EOF"
+        );
         // EOF is level-triggered, so asking twice must not consume the answer.
-        assert!(!pipe_peer_open(r).expect("read"), "EOF must stay EOF on a second ask");
+        assert!(
+            !pipe_peer_open(r).expect("read"),
+            "EOF must stay EOF on a second ask"
+        );
         // The THIRD answer, and the dangerous one: an unreadable channel is not
         // a dead parent. Folding every errno into `Ok(false)` would satisfy both
         // asserts above while making pid 1 kill every sandbox it cannot ask.
@@ -1281,8 +1484,16 @@ mod tests {
             "the child must have exited and still hold its pid: {stat}"
         );
         let status = waitpid(pid).expect("the pid must still be reapable");
-        assert_eq!(status & 0x7f, 0, "child should exit normally, not be signalled");
-        assert_eq!((status >> 8) & 0xff, 7, "the exit code must survive the no-reap wait");
+        assert_eq!(
+            status & 0x7f,
+            0,
+            "child should exit normally, not be signalled"
+        );
+        assert_eq!(
+            (status >> 8) & 0xff,
+            7,
+            "the exit code must survive the no-reap wait"
+        );
         // The control: the REAP is what frees the pid, which is what makes
         // waiting without one worth doing.
         assert_eq!(
@@ -1302,7 +1513,10 @@ mod tests {
         let target = (before + 2).min(19);
         set_self_priority(target).expect("raising niceness must succeed");
         let after = get_self_priority().expect("getpriority");
-        assert_eq!(after, target, "niceness should be exactly the raised target");
+        assert_eq!(
+            after, target,
+            "niceness should be exactly the raised target"
+        );
     }
 
     /// The shipped part of a source file: everything before the first line
@@ -1331,7 +1545,8 @@ mod tests {
     /// Bounded, and the child does not outlive a failed wait.
     fn await_exec(mut child: std::process::Child) -> std::process::Child {
         for _ in 0..500 {
-            let cmdline = std::fs::read(format!("/proc/{}/cmdline", child.id())).unwrap_or_default();
+            let cmdline =
+                std::fs::read(format!("/proc/{}/cmdline", child.id())).unwrap_or_default();
             if cmdline.starts_with(b"sleep\0300\0") {
                 return child;
             }
@@ -1397,7 +1612,9 @@ mod tests {
         );
         let line = recorded_line(&reason);
         assert!(
-            line.ends_with(&format!(" SIGTERM pid {pid} because {reason}; sent; cmdline: sleep 300")),
+            line.ends_with(&format!(
+                " SIGTERM pid {pid} because {reason}; sent; cmdline: sleep 300"
+            )),
             "{line}"
         );
         let verb = std::env::args_os()
@@ -1451,7 +1668,10 @@ mod tests {
         let token = format!("test: fanning out over {} and {}", leader.id(), lone.id());
         let kills = vec![
             (KillTarget::Group(leader.id()), token.clone()),
-            (KillTarget::Pid(i64::from(lone.id())), format!("{token}; descendant")),
+            (
+                KillTarget::Pid(i64::from(lone.id())),
+                format!("{token}; descendant"),
+            ),
         ];
         let results = kill_all_recorded(&kills, SIGKILL);
         assert!(results.iter().all(Result::is_ok), "{results:?}");
@@ -1487,7 +1707,9 @@ mod tests {
         assert_eq!(signal_of(&status), Some(SIGKILL as i32));
         let line = recorded_line(&reason);
         assert!(
-            line.ends_with(&format!(" SIGKILL pid {pid} because {reason}; sent; cmdline: sleep 300")),
+            line.ends_with(&format!(
+                " SIGKILL pid {pid} because {reason}; sent; cmdline: sleep 300"
+            )),
             "{line}"
         );
     }
@@ -1524,7 +1746,11 @@ mod tests {
             // could not take this test binary's own group with it.
             let reason = format!("test: refusing {what}");
             let sent = kill_recorded(target, 0, &reason);
-            assert_eq!(sent.map_err(|e| e.kind()), Err(io::ErrorKind::InvalidInput), "{what}");
+            assert_eq!(
+                sent.map_err(|e| e.kind()),
+                Err(io::ErrorKind::InvalidInput),
+                "{what}"
+            );
             assert!(recorded_line(&reason).contains("; not sent: "), "{what}");
         }
     }
@@ -1541,18 +1767,24 @@ mod tests {
             assert_eq!(dir, std::path::PathBuf::from(home).join(".td/kill-audit"));
             assert_eq!(kill_audit_path().unwrap(), dir.join("log"));
         }
-        let root = std::env::temp_dir()
-            .join(format!("td-kill-audit-file-test-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("td-kill-audit-file-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         let file = root.join(".td/kill-audit/log");
         append_kill_audit_line(&file, "lost");
-        assert!(!root.join(".td").exists(), "no `.td` may be created for a record");
+        assert!(
+            !root.join(".td").exists(),
+            "no `.td` may be created for a record"
+        );
         std::fs::create_dir(root.join(".td")).unwrap();
         append_kill_audit_line(&file, "first");
         append_kill_audit_line(&file, "second");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "first\nsecond\n");
-        let dir_mode = std::fs::metadata(root.join(".td/kill-audit")).unwrap().permissions().mode();
+        let dir_mode = std::fs::metadata(root.join(".td/kill-audit"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(dir_mode & 0o777, 0o700);
         let file_mode = std::fs::metadata(&file).unwrap().permissions().mode();
         assert_eq!(file_mode & 0o777, 0o600);
@@ -1607,7 +1839,9 @@ mod tests {
         assert!(calls_kill("child.kill ()"));
         assert!(calls_kill("std::process::Child::kill(&mut child)"));
         assert!(!calls_kill("kill_child_recorded(&mut child, why)"));
-        assert!(!calls_kill("crate::sys::kill_recorded(target, SIGKILL, why)"));
+        assert!(!calls_kill(
+            "crate::sys::kill_recorded(target, SIGKILL, why)"
+        ));
         assert_eq!(
             shipped_part("a\n// mentions #[cfg(test)] in prose\nb\n#[cfg(test)]\nmod tests {}\n"),
             "a\n// mentions #[cfg(test)] in prose\nb\n"
@@ -1618,9 +1852,14 @@ mod tests {
         let shipped_sys = shipped_part(include_str!("sys.rs"));
         // The split is at the attribute, not at this file's mention of it:
         // the shipped part reaches this file's last shipped items.
-        assert!(shipped_sys.contains("fn kill_audit_sink(") && shipped_sys.contains("fn exit_group("));
+        assert!(
+            shipped_sys.contains("fn kill_audit_sink(") && shipped_sys.contains("fn exit_group(")
+        );
         assert!(!shipped_sys.contains("mod tests"));
-        assert_eq!(shipped_sys.lines().filter(|line| calls_kill(line)).count(), 1);
+        assert_eq!(
+            shipped_sys.lines().filter(|line| calls_kill(line)).count(),
+            1
+        );
         assert_eq!(shipped_sys.matches("fn kill_pid(").count(), 1);
         assert_eq!(shipped_sys.matches("fn kill_process_group(").count(), 1);
         assert!(!shipped_sys.contains("pub fn kill_pid("));

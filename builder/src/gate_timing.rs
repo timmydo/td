@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 
 /// `run-*.log` files under `dir`, newest (mtime) first.
 fn run_logs_newest_first(dir: &Path) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut logs: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
     for e in rd.flatten() {
         let name = e.file_name();
@@ -51,7 +53,9 @@ fn reduce(text: &str, heavy: &[String]) -> Vec<Row> {
         if gate.is_empty() {
             continue;
         }
-        let Ok(ts) = ts.trim().parse::<u128>() else { continue };
+        let Ok(ts) = ts.trim().parse::<u128>() else {
+            continue;
+        };
         let e = span.entry(gate).or_insert((None, None));
         match ev {
             "START" => e.0 = Some(e.0.map_or(ts, |old| old.min(ts))),
@@ -77,7 +81,11 @@ fn reduce(text: &str, heavy: &[String]) -> Vec<Row> {
 
 /// Nanoseconds → `S.mmm` (the table's SECONDS column).
 fn fmt_secs(ns: u128) -> String {
-    format!("{}.{:03}", ns / 1_000_000_000, (ns % 1_000_000_000) / 1_000_000)
+    format!(
+        "{}.{:03}",
+        ns / 1_000_000_000,
+        (ns % 1_000_000_000) / 1_000_000
+    )
 }
 
 /// Unix seconds → `YYYY-MM-DDTHH:MM:SSZ` (pure std; civil-from-days,
@@ -104,9 +112,15 @@ fn utc_iso(secs: u64) -> String {
 /// `#` comments and the `GATE` header.
 fn render(rows: &[Row], log_name: &str, when_secs: u64) -> String {
     let mut s = String::new();
-    s.push_str(&format!("# td gate wall-clock — {} — {}\n", utc_iso(when_secs), log_name));
+    s.push_str(&format!(
+        "# td gate wall-clock — {} — {}\n",
+        utc_iso(when_secs),
+        log_name
+    ));
     s.push_str("# per-gate wall span (gates run in parallel; the sum is NOT the wall time).\n");
-    s.push_str("# heavy rows drive the heavy-gate LPT start order (gate-run reads this table back).\n");
+    s.push_str(
+        "# heavy rows drive the heavy-gate LPT start order (gate-run reads this table back).\n",
+    );
     s.push_str(&format!("{:<34} {:<6} {:>10}\n", "GATE", "KIND", "SECONDS"));
     let mut sum_heavy: u128 = 0;
     for r in rows {
@@ -114,7 +128,12 @@ fn render(rows: &[Row], log_name: &str, when_secs: u64) -> String {
         if r.heavy {
             sum_heavy += r.dur_ns;
         }
-        s.push_str(&format!("{:<34} {:<6} {:>10}\n", r.gate, kind, fmt_secs(r.dur_ns)));
+        s.push_str(&format!(
+            "{:<34} {:<6} {:>10}\n",
+            r.gate,
+            kind,
+            fmt_secs(r.dur_ns)
+        ));
     }
     s.push_str(&format!(
         "# heavy work total (sum across heavy gates, not wall): {}s\n",
@@ -138,7 +157,10 @@ pub fn report(root: &Path, heavy_gates: &[String]) {
         }
         Some((p.clone(), text))
     }) else {
-        println!("gate-timing: no run log in {} yet (nothing to report)", dir.display());
+        println!(
+            "gate-timing: no run log in {} yet (nothing to report)",
+            dir.display()
+        );
         return;
     };
     let rows = reduce(&text, heavy_gates);
@@ -146,7 +168,10 @@ pub fn report(root: &Path, heavy_gates: &[String]) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let log_name = log.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let log_name = log
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let report = render(&rows, &log_name, now);
     print!("{report}");
     let _ = std::fs::create_dir_all(&dir);
@@ -181,8 +206,10 @@ mod tests {
         ]
         .join("\n");
         let rows = reduce(&log, &["b".to_string()]);
-        let got: Vec<(String, u128, bool)> =
-            rows.iter().map(|r| (r.gate.clone(), r.dur_ns, r.heavy)).collect();
+        let got: Vec<(String, u128, bool)> = rows
+            .iter()
+            .map(|r| (r.gate.clone(), r.dur_ns, r.heavy))
+            .collect();
         // longest first: b spans 7s, a spans 2.5s
         assert_eq!(
             got,
@@ -215,8 +242,16 @@ mod tests {
         // The table this writes is the one gates.rs::duration_table reads back
         // for the LPT order — prove the round trip on this exact bytes.
         let rows = vec![
-            Row { dur_ns: 83_412_000_000, heavy: true, gate: "build-recipes".to_string() },
-            Row { dur_ns: 1_002_000_000, heavy: false, gate: "eval".to_string() },
+            Row {
+                dur_ns: 83_412_000_000,
+                heavy: true,
+                gate: "build-recipes".to_string(),
+            },
+            Row {
+                dur_ns: 1_002_000_000,
+                heavy: false,
+                gate: "eval".to_string(),
+            },
         ];
         let text = render(&rows, "run-1.log", 0);
         let table = crate::gates::parse_duration_table(&text);

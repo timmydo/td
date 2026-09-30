@@ -10,54 +10,58 @@
 )]
 
 mod client;
-mod set_client;
-#[path = "../../td-authd/src/secret_request.rs"]
-#[allow(dead_code, reason = "shared public credential request codec")]
-mod secret_request;
-#[path = "../../td-authd/src/secret_sys.rs"]
-#[allow(dead_code, reason = "shared public credential descriptor transport")]
-mod secret_sys;
 #[path = "../../td-authd/src/consent.rs"]
 #[allow(dead_code, reason = "shared immutable consent description")]
 mod consent;
-mod operation;
+#[allow(dead_code, reason = "the portal shares the authenticated store reader")]
+mod crypto;
 mod enrollment_operation;
-mod write_operation;
-#[allow(dead_code, reason = "shared physical token transport")]
-mod fido_device;
-#[allow(dead_code, reason = "shared FIDO2 framing and cancellation codec")]
-mod fido_hid;
-#[allow(dead_code, reason = "shared enrollment and recovery metadata")]
-mod fido_metadata;
 #[allow(dead_code, reason = "private CTAP AES and PIN protocol support")]
 mod fido_aes;
 #[allow(dead_code, reason = "shared CTAP enrollment and assertion codec")]
 mod fido_cbor;
 #[allow(dead_code, reason = "shared CTAP enrollment and assertion codec")]
 mod fido_ctap;
-#[allow(dead_code, reason = "enrollment construction and verified assertion support")]
+#[allow(dead_code, reason = "shared physical token transport")]
+mod fido_device;
+#[allow(
+    dead_code,
+    reason = "enrollment construction and verified assertion support"
+)]
 mod fido_enroll;
+#[allow(dead_code, reason = "shared FIDO2 framing and cancellation codec")]
+mod fido_hid;
+#[allow(dead_code, reason = "shared enrollment and recovery metadata")]
+mod fido_metadata;
 #[allow(dead_code, reason = "private P-256 and portable protocol support")]
 mod fido_p256;
 #[allow(dead_code, reason = "portable PIN protocol and manual token check")]
 mod fido_pin;
 #[allow(dead_code, reason = "private portable transaction runner")]
 mod fido_transaction;
-mod pin_sys;
-mod pin_terminal;
-mod token_check;
-#[path = "../../td-firstboot/src/principals.rs"]
-#[allow(dead_code, reason = "shared immutable session identity loader")]
-mod principals;
-#[allow(dead_code, reason = "the portal shares the authenticated store reader")]
-mod crypto;
-#[allow(dead_code, reason = "portable envelope prerequisite; no public unlock yet")]
-mod portable;
 #[path = "../../td-busd/src/message.rs"]
 #[allow(dead_code, reason = "shared bounded D-Bus codec")]
 mod message;
 #[path = "../../td-busd/src/name.rs"]
 mod name;
+mod operation;
+mod pin_sys;
+mod pin_terminal;
+#[allow(
+    dead_code,
+    reason = "portable envelope prerequisite; no public unlock yet"
+)]
+mod portable;
+#[path = "../../td-firstboot/src/principals.rs"]
+#[allow(dead_code, reason = "shared immutable session identity loader")]
+mod principals;
+#[path = "../../td-authd/src/secret_request.rs"]
+#[allow(dead_code, reason = "shared public credential request codec")]
+mod secret_request;
+#[path = "../../td-authd/src/secret_sys.rs"]
+#[allow(dead_code, reason = "shared public credential descriptor transport")]
+mod secret_sys;
+mod set_client;
 #[allow(dead_code, reason = "the portal shares the authenticated store reader")]
 mod store;
 #[allow(
@@ -65,17 +69,21 @@ mod store;
     reason = "shared descriptor transport also sends Wayland files"
 )]
 mod sys;
+mod token_check;
 #[allow(dead_code, reason = "TPM entry points are shared with the provisioner")]
 mod tpm;
 #[path = "../../td-busd/src/wire.rs"]
 #[allow(dead_code, reason = "shared bounded D-Bus codec")]
 mod wire;
+mod write_operation;
 
 use std::io;
 
 fn run(args: &[String]) -> Result<(), String> {
     match args {
-        [command, flag] if command == "check-portable-token" && flag == "--create-test-credential" => {
+        [command, flag]
+            if command == "check-portable-token" && flag == "--create-test-credential" =>
+        {
             token_check::run()
         }
         [command] if command == "selftest" => crypto::selftest(),
@@ -119,8 +127,9 @@ fn run(args: &[String]) -> Result<(), String> {
             result
         }
         [command, target] if command == "set" => set_client::set(target, consent::Role::Primary),
-        [command, flag, target] if command == "set" && flag == "--recovery" =>
-            set_client::set(target, consent::Role::Recovery),
+        [command, flag, target] if command == "set" && flag == "--recovery" => {
+            set_client::set(target, consent::Role::Recovery)
+        }
         _ => Err(concat!(
             "usage: td-secret set [--recovery] APPLICATION/NAME < credential-input; ",
             "use physical secure attention to enroll or unlock the store; ",
@@ -179,21 +188,41 @@ mod confinement {
             vec!["check-portable-token"],
             vec!["check-portable-token", "--pin", "1234"],
             vec!["check-portable-token", "--create-test-credential", "1234"],
-            vec!["check-portable-token", "--create-test-credential", "--device", "0"],
+            vec![
+                "check-portable-token",
+                "--create-test-credential",
+                "--device",
+                "0",
+            ],
         ] {
-            assert!(super::run(&args.into_iter().map(String::from).collect::<Vec<_>>())
-                .unwrap_err().starts_with("usage:"));
+            assert!(
+                super::run(&args.into_iter().map(String::from).collect::<Vec<_>>())
+                    .unwrap_err()
+                    .starts_with("usage:")
+            );
         }
     }
 
     #[test]
     fn private_unlock_controller_and_shared_description_are_pinned() {
-        let fingerprint = |source: &str| source.bytes().fold(0xcbf29ce484222325u64,
-            |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
-        assert_eq!(fingerprint(include_str!("operation.rs")), 0x9e52120007bef08f);
-        assert_eq!(fingerprint(include_str!("write_operation.rs")), 0x2f5050ddd2493660);
-        assert_eq!(fingerprint(include_str!("enrollment_operation.rs")), 0x30dcb428ed75a535);
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x60d62ec39aea1d04, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        let fingerprint = |source: &str| {
+            source.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            })
+        };
+        assert_eq!(
+            fingerprint(include_str!("operation.rs")),
+            0x9e52120007bef08f
+        );
+        assert_eq!(
+            fingerprint(include_str!("write_operation.rs")),
+            0x2f5050ddd2493660
+        );
+        assert_eq!(
+            fingerprint(include_str!("enrollment_operation.rs")),
+            0x30dcb428ed75a535
+        );
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0xadb03ad6a8495644, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
     }
 
     #[test]
@@ -213,10 +242,19 @@ mod confinement {
             ("main.rs", include_str!("main.rs")),
             ("client.rs", include_str!("client.rs")),
             ("set_client.rs", include_str!("set_client.rs")),
-            ("secret_request.rs", include_str!("../../td-authd/src/secret_request.rs")),
-            ("secret_sys.rs", include_str!("../../td-authd/src/secret_sys.rs")),
+            (
+                "secret_request.rs",
+                include_str!("../../td-authd/src/secret_request.rs"),
+            ),
+            (
+                "secret_sys.rs",
+                include_str!("../../td-authd/src/secret_sys.rs"),
+            ),
             ("operation.rs", include_str!("operation.rs")),
-            ("enrollment_operation.rs", include_str!("enrollment_operation.rs")),
+            (
+                "enrollment_operation.rs",
+                include_str!("enrollment_operation.rs"),
+            ),
             ("write_operation.rs", include_str!("write_operation.rs")),
             ("crypto.rs", include_str!("crypto.rs")),
             ("portable.rs", include_str!("portable.rs")),
@@ -242,8 +280,10 @@ mod confinement {
         for (name, source) in sources {
             let production = source.split("#[cfg(test)]").next().unwrap();
             for (operation, owner) in [
-                ("mode", "pin_terminal.rs"), ("set_mode", "pin_terminal.rs"),
-                ("readable", "pin_terminal.rs"), ("protect_process", "token_check.rs"),
+                ("mode", "pin_terminal.rs"),
+                ("set_mode", "pin_terminal.rs"),
+                ("readable", "pin_terminal.rs"),
+                ("protect_process", "token_check.rs"),
             ] {
                 if production.contains(&format!("pin_sys::{operation}(")) {
                     assert_eq!(name, owner, "unexpected PIN syscall caller");
@@ -252,18 +292,49 @@ mod confinement {
             let keyword = format!("un{}", "safe");
             let lint = format!("{keyword}_code");
             let raw = production.matches(&keyword).count() - production.matches(&lint).count();
-            let scopes = 2 * usize::from(matches!(name, "sys.rs" | "secret_sys.rs")) + usize::from(name == "pin_sys.rs");
+            let scopes = 2 * usize::from(matches!(name, "sys.rs" | "secret_sys.rs"))
+                + usize::from(name == "pin_sys.rs");
             assert_eq!(raw, scopes, "{name}");
             assert_eq!(
                 production.matches(&format!("#[allow({lint})]")).count(),
                 scopes
             );
         }
-        let fingerprint = |source: &str| source.bytes().fold(0xcbf29ce484222325u64,
-            |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/secret_sys.rs").split("#[cfg(test)]").next().unwrap()), 0x320c8b6ddbfe29af, "intake raw source changed");
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/secret_request.rs").split("#[cfg(test)]").next().unwrap()), 0x188c619caba6ceb8, "intake request source changed");
-        assert_eq!(fingerprint(include_str!("set_client.rs").split("#[cfg(test)]").next().unwrap()), 0xf402e082e7175844, "credential client changed");
+        let fingerprint = |source: &str| {
+            source.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            })
+        };
+        assert_eq!(
+            fingerprint(
+                include_str!("../../td-authd/src/secret_sys.rs")
+                    .split("#[cfg(test)]")
+                    .next()
+                    .unwrap()
+            ),
+            0x320c8b6ddbfe29af,
+            "intake raw source changed"
+        );
+        assert_eq!(
+            fingerprint(
+                include_str!("../../td-authd/src/secret_request.rs")
+                    .split("#[cfg(test)]")
+                    .next()
+                    .unwrap()
+            ),
+            0x188c619caba6ceb8,
+            "intake request source changed"
+        );
+        assert_eq!(
+            fingerprint(
+                include_str!("set_client.rs")
+                    .split("#[cfg(test)]")
+                    .next()
+                    .unwrap()
+            ),
+            0xf402e082e7175844,
+            "credential client changed"
+        );
         let sys = include_str!("sys.rs");
         assert_eq!(sys.matches("core::arch::asm!").count(), 1);
         assert_eq!(sys.matches("const SYS_").count(), 3);

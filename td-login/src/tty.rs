@@ -75,8 +75,7 @@ fn controlling_terminal() -> Result<Option<(PathBuf, u32)>, String> {
     check_name(&path)?;
     // 3. The OPEN FILE must be a character device. A regular file, directory,
     //    socket or pipe on fd 0 stops here, whatever it is called.
-    let open = fs::metadata(STDIN_LINK)
-        .map_err(|e| format!("cannot stat {STDIN_LINK}: {e}"))?;
+    let open = fs::metadata(STDIN_LINK).map_err(|e| format!("cannot stat {STDIN_LINK}: {e}"))?;
     if open.mode() & S_IFMT != S_IFCHR {
         return Err(format!(
             "fd 0 is not a character device (mode {:#o}); not touching {}",
@@ -119,7 +118,9 @@ fn check_name(path: &Path) -> Result<(), String> {
         return Err(format!("fd 0 resolves to a non-UTF-8 path: {path:?}"));
     };
     let Some(rest) = text.strip_prefix("/dev/") else {
-        return Err(format!("fd 0 resolves to {text:?}, which is not under /dev/"));
+        return Err(format!(
+            "fd 0 resolves to {text:?}, which is not under /dev/"
+        ));
     };
     if rest.is_empty() {
         return Err("fd 0 resolves to /dev/ itself".into());
@@ -188,7 +189,10 @@ mod tests {
     #[test]
     fn tty_nr_is_counted_from_the_last_close_paren() {
         // A plain line: pid comm state ppid pgrp session tty_nr ...
-        assert_eq!(tty_nr("412 (sh) S 411 412 412 34816 412 4194304").unwrap(), 34816);
+        assert_eq!(
+            tty_nr("412 (sh) S 411 412 412 34816 412 4194304").unwrap(),
+            34816
+        );
         // No controlling terminal.
         assert_eq!(tty_nr("2 (kthreadd) S 0 0 0 0 -1 2129984").unwrap(), 0);
         // A comm containing spaces AND parens and a decoy field run.

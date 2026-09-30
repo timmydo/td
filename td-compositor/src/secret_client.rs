@@ -88,7 +88,9 @@ impl Attempt {
     }
 
     fn commit(&self) -> bool {
-        if !self.active() || (self.selection == Selection::Install && !self.confirmed.load(Ordering::SeqCst)) {
+        if !self.active()
+            || (self.selection == Selection::Install && !self.confirmed.load(Ordering::SeqCst))
+        {
             return false;
         }
         self.state
@@ -140,18 +142,28 @@ impl Attempt {
         let completed = receipt.completed();
         let request = receipt.into_request();
         if self.selection == Selection::Install {
-            *self.presentation.lock().map_err(|_| "installation receipt lock poisoned")? = Some((request.clone(), completed));
+            *self
+                .presentation
+                .lock()
+                .map_err(|_| "installation receipt lock poisoned")? =
+                Some((request.clone(), completed));
         }
         Ok(request)
     }
 
     /// Only the physical evdev adapter can offer a confirmation key.
     pub fn confirm_install(&self, _origin: &EvdevOrigin, timestamp: u128) -> Result<(), String> {
-        if self.selection != Selection::Install || !self.active() { return Ok(()); }
+        if self.selection != Selection::Install || !self.active() {
+            return Ok(());
+        }
         let runtime = self.runtime.lock().map_err(|_| "runtime lock poisoned")?;
-        let presentation = self.presentation.lock().map_err(|_| "installation receipt lock poisoned")?;
+        let presentation = self
+            .presentation
+            .lock()
+            .map_err(|_| "installation receipt lock poisoned")?;
         if let Some((request, completed)) = &*presentation {
-            if timestamp > *completed && self.active() && runtime.attention_request_visible(request) {
+            if timestamp > *completed && self.active() && runtime.attention_request_visible(request)
+            {
                 self.confirmed.store(true, Ordering::SeqCst);
             }
         }
@@ -235,8 +247,20 @@ impl Client {
         let selected = match attempt.selection.operation() {
             Some(operation) => request.operation() == &operation,
             None => match attempt.selection {
-                Selection::Write => matches!(request.operation(), Operation::Set { requester: 1000, .. }),
-                Selection::Install => matches!(request.operation(), Operation::Install { requester: 1000, .. }),
+                Selection::Write => matches!(
+                    request.operation(),
+                    Operation::Set {
+                        requester: 1000,
+                        ..
+                    }
+                ),
+                Selection::Install => matches!(
+                    request.operation(),
+                    Operation::Install {
+                        requester: 1000,
+                        ..
+                    }
+                ),
                 _ => false,
             },
         };
@@ -299,8 +323,12 @@ impl Client {
                 && !pending.committed
                 && !pending.cancelled =>
             {
-                if pending.attempt.selection == Selection::Install && pending.attempt.active()
-                    && !pending.attempt.confirmed.load(Ordering::SeqCst) { return Ok(()); }
+                if pending.attempt.selection == Selection::Install
+                    && pending.attempt.active()
+                    && !pending.attempt.confirmed.load(Ordering::SeqCst)
+                {
+                    return Ok(());
+                }
                 // This CAS chooses between physical cancellation and consent.
                 // No runtime lock spans the subsequent bounded exchange.
                 if pending.attempt.commit() {
@@ -453,25 +481,67 @@ mod tests {
     fn installation_waits_for_fresh_enter_after_complete_presentation() {
         let mut screen = Screen::new();
         Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
-        let request = Request::new([42; 32], 1000, Operation::Install { deployment: "ab".repeat(32), requester: 1000 }).unwrap();
+        let request = Request::new(
+            [42; 32],
+            1000,
+            Operation::Install {
+                deployment: "ab".repeat(32),
+                requester: 1000,
+            },
+        )
+        .unwrap();
         let tagged = |tag: &[u8]| [tag, request.encode().as_slice()].concat();
-        let mut wire = wire(vec![tagged(&[0x92]), tagged(&[0x91, 4]), vec![0x93],
-            tagged(&[0x91, 5]), tagged(&[0x91, 5]), vec![0x94], tagged(&[0x91, 6])]);
+        let mut wire = wire(vec![
+            tagged(&[0x92]),
+            tagged(&[0x91, 4]),
+            vec![0x93],
+            tagged(&[0x91, 5]),
+            tagged(&[0x91, 5]),
+            vec![0x94],
+            tagged(&[0x91, 6]),
+        ]);
         let mut client = Client::default();
-        client.start(&mut wire, Arc::clone(&screen.attempt)).unwrap();
-        screen.attempt.confirm_install(&crate::input::test_origin(), u128::MAX).unwrap();
+        client
+            .start(&mut wire, Arc::clone(&screen.attempt))
+            .unwrap();
+        screen
+            .attempt
+            .confirm_install(&crate::input::test_origin(), u128::MAX)
+            .unwrap();
         assert!(!screen.attempt.confirmed.load(Ordering::SeqCst));
         client.tick(&mut wire).unwrap();
-        let completed = screen.attempt.presentation.lock().unwrap().as_ref().unwrap().1;
-        screen.attempt.confirm_install(&crate::input::test_origin(), completed).unwrap();
+        let completed = screen
+            .attempt
+            .presentation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1;
+        screen
+            .attempt
+            .confirm_install(&crate::input::test_origin(), completed)
+            .unwrap();
         client.tick(&mut wire).unwrap();
         assert!(!wire.calls.iter().any(|call| call.first() == Some(&0x14)));
-        screen.attempt.confirm_install(&crate::input::test_origin(), completed + 1).unwrap();
+        screen
+            .attempt
+            .confirm_install(&crate::input::test_origin(), completed + 1)
+            .unwrap();
         client.tick(&mut wire).unwrap();
-        screen.attempt.confirm_install(&crate::input::test_origin(), completed + 2).unwrap();
+        screen
+            .attempt
+            .confirm_install(&crate::input::test_origin(), completed + 2)
+            .unwrap();
         client.tick(&mut wire).unwrap();
         assert!(client.pending.is_none());
-        assert_eq!(wire.calls.iter().filter(|call| call.first() == Some(&0x14)).count(), 1);
+        assert_eq!(
+            wire.calls
+                .iter()
+                .filter(|call| call.first() == Some(&0x14))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -479,11 +549,34 @@ mod tests {
         for cancel in [false, true] {
             let mut screen = Screen::new();
             Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
-            let request = Request::new([42; 32], 1000, Operation::Install { deployment: "ab".repeat(32), requester: 1000 }).unwrap();
+            let request = Request::new(
+                [42; 32],
+                1000,
+                Operation::Install {
+                    deployment: "ab".repeat(32),
+                    requester: 1000,
+                },
+            )
+            .unwrap();
             screen.attempt.present(request).unwrap();
-            if cancel { screen.attempt.cancel(); }
-            else { screen.attempt.runtime.lock().unwrap().attention_notice(&crate::input::test_origin(), crate::attention::Notice::Failed).unwrap(); }
-            screen.attempt.confirm_install(&crate::input::test_origin(), u128::MAX).unwrap();
+            if cancel {
+                screen.attempt.cancel();
+            } else {
+                screen
+                    .attempt
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .attention_notice(
+                        &crate::input::test_origin(),
+                        crate::attention::Notice::Failed,
+                    )
+                    .unwrap();
+            }
+            screen
+                .attempt
+                .confirm_install(&crate::input::test_origin(), u128::MAX)
+                .unwrap();
             assert!(!screen.attempt.commit());
         }
     }
@@ -766,25 +859,51 @@ mod tests {
         for role in [Role::Primary, Role::Recovery] {
             let mut screen = Screen::new();
             Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Write;
-            let request = Request::new([43; 32], 1000, Operation::Set {
-                application: "mail".into(), name: "main".into(), application_uid: 65537,
-                requester: 1000, role,
-            }).unwrap();
+            let request = Request::new(
+                [43; 32],
+                1000,
+                Operation::Set {
+                    application: "mail".into(),
+                    name: "main".into(),
+                    application_uid: 65537,
+                    requester: 1000,
+                    role,
+                },
+            )
+            .unwrap();
             let mut wire = wire(vec![
-                description(&[0x92], &request), description(&[0x91, 4], &request), vec![0x93],
-                description(&[0x91, 5], &request), vec![0x94], description(&[0x91, 6], &request),
+                description(&[0x92], &request),
+                description(&[0x91, 4], &request),
+                vec![0x93],
+                description(&[0x91, 5], &request),
+                vec![0x94],
+                description(&[0x91, 6], &request),
             ]);
             let mut client = Client::default();
-            client.start(&mut wire, Arc::clone(&screen.attempt)).unwrap();
+            client
+                .start(&mut wire, Arc::clone(&screen.attempt))
+                .unwrap();
             let before = std::fs::read(&screen.path).unwrap();
             client.tick(&mut wire).unwrap();
             assert_ne!(std::fs::read(&screen.path).unwrap(), before);
-            assert_eq!(client.pending.as_ref().unwrap().receipt, Some(request.clone()));
+            assert_eq!(
+                client.pending.as_ref().unwrap().receipt,
+                Some(request.clone())
+            );
             client.tick(&mut wire).unwrap();
             client.tick(&mut wire).unwrap();
             assert!(client.pending.is_none());
-            assert_eq!(wire.calls, [vec![0x18], vec![0x11], description(&[0x13], &request),
-                vec![0x11], description(&[0x14], &request), vec![0x11]]);
+            assert_eq!(
+                wire.calls,
+                [
+                    vec![0x18],
+                    vec![0x11],
+                    description(&[0x13], &request),
+                    vec![0x11],
+                    description(&[0x14], &request),
+                    vec![0x11]
+                ]
+            );
         }
     }
 
@@ -796,7 +915,10 @@ mod tests {
             let mut client = Client::default();
             let no_write = response == [0x98, 0];
             let mut wire = wire(vec![response]);
-            assert_eq!(client.start(&mut wire, Arc::clone(&screen.attempt)).is_ok(), no_write);
+            assert_eq!(
+                client.start(&mut wire, Arc::clone(&screen.attempt)).is_ok(),
+                no_write
+            );
             assert!(client.pending.is_none());
             assert_eq!(wire.calls, [vec![0x18]]);
         }

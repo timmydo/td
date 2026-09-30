@@ -294,7 +294,8 @@ fn the_engine_signer_produces_exactly_what_ring_produces() {
         assert_eq!(
             crate::ed25519_sign::public_key(&seed).expect("the base point decompresses"),
             ring_public,
-            "public key for seed {i} ({})", hex(&seed)
+            "public key for seed {i} ({})",
+            hex(&seed)
         );
         for len in [0usize, 1, 32, 63, 64, 65, 127, 128, 300] {
             let msg = message(len);
@@ -306,8 +307,10 @@ fn the_engine_signer_produces_exactly_what_ring_produces() {
             let engine_sig =
                 crate::ed25519_sign::sign(&seed, &msg).expect("the base point decompresses");
             assert_eq!(
-                engine_sig, ring_sig,
-                "signature for seed {i} ({}), message length {len}", hex(&seed)
+                engine_sig,
+                ring_sig,
+                "signature for seed {i} ({}), message length {len}",
+                hex(&seed)
             );
         }
     }
@@ -320,8 +323,7 @@ fn ring_accepts_what_the_engine_signer_produces() {
     // because it is the property that actually matters and would survive a
     // future change to either side's encoding conventions.
     for seed in cross_seeds() {
-        let public =
-            crate::ed25519_sign::public_key(&seed).expect("the base point decompresses");
+        let public = crate::ed25519_sign::public_key(&seed).expect("the base point decompresses");
         for len in [0usize, 17, 64, 129] {
             let msg = message(len);
             let sig = crate::ed25519_sign::sign(&seed, &msg).expect("base point");

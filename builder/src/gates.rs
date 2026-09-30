@@ -229,7 +229,11 @@ fn load() -> Result<GateSet, String> {
         });
     }
 
-    let mut set = GateSet { gates, index, build_specs };
+    let mut set = GateSet {
+        gates,
+        index,
+        build_specs,
+    };
     derive_graph(&mut set, &build_gates)?;
     Ok(set)
 }
@@ -304,7 +308,10 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
     for g in &set.gates {
         for d in &g.deps {
             if !known.contains(d) {
-                return Err(format!("gate-run: gate `{}` depends on unknown `{d}`", g.name));
+                return Err(format!(
+                    "gate-run: gate `{}` depends on unknown `{d}`",
+                    g.name
+                ));
             }
         }
     }
@@ -324,7 +331,9 @@ pub(crate) fn goals_include(goals: &[String], name: &str, disabled: &str) -> Res
     let set = load()?;
     let selected = expand_goals(&set, goals)?;
     let (selected, _) = filter_disabled(&set, &selected, disabled);
-    Ok(selected.into_iter().any(|i| set.gates.get(i).is_some_and(|g| g.name == name)))
+    Ok(selected
+        .into_iter()
+        .any(|i| set.gates.get(i).is_some_and(|g| g.name == name)))
 }
 
 /// Expand goals including their transitive prerequisites.
@@ -433,7 +442,9 @@ fn scope_build_recipes(set: &mut GateSet, selected: &HashSet<usize>, goals: &[St
     if goals.iter().any(|g| g == "check" || g == BUILD_RECIPES) {
         return;
     }
-    let Some(bi) = set.index.get(BUILD_RECIPES).copied() else { return };
+    let Some(bi) = set.index.get(BUILD_RECIPES).copied() else {
+        return;
+    };
     if !selected.contains(&bi) {
         return;
     }
@@ -452,7 +463,9 @@ fn scope_build_recipes(set: &mut GateSet, selected: &HashSet<usize>, goals: &[St
             .collect();
         kept.join(" ")
     };
-    let Some(br) = set.gates.get_mut(bi) else { return };
+    let Some(br) = set.gates.get_mut(bi) else {
+        return;
+    };
     for (k, v) in br.extra_env.iter_mut() {
         if k == "TD_BUILD_SPECS" {
             *v = specs.clone();
@@ -669,7 +682,11 @@ fn timing_event(log: Option<&Path>, gate: &str, kind: &str) {
     if let Some(parent) = log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+    {
         let _ = writeln!(f, "{gate}\t{kind}\t{}", now_ns());
     }
 }
@@ -744,10 +761,16 @@ fn kill_process_tree(root: u32, reason: &str) {
     // Every signal goes before anything is written: see `kill_all_recorded`.
     let mut kills = vec![
         (crate::sys::KillTarget::Group(root), reason.to_string()),
-        (crate::sys::KillTarget::Pid(i64::from(root)), reason.to_string()),
+        (
+            crate::sys::KillTarget::Pid(i64::from(root)),
+            reason.to_string(),
+        ),
     ];
     kills.extend(pids.into_iter().map(|pid| {
-        (crate::sys::KillTarget::Pid(i64::from(pid)), format!("{reason}; descendant"))
+        (
+            crate::sys::KillTarget::Pid(i64::from(pid)),
+            format!("{reason}; descendant"),
+        )
     }));
     let _ = crate::sys::kill_all_recorded(&kills, crate::sys::SIGKILL);
 }
@@ -758,13 +781,20 @@ fn kill_process_tree(root: u32, reason: &str) {
 /// the kernel removes even descendants that escaped this group.
 fn live_survivors(pgid: u32) -> Vec<u32> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else { return out };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
     for e in entries.flatten() {
         let name = e.file_name();
-        let Some(pid) = name.to_str().filter(|n| n.bytes().all(|b| b.is_ascii_digit())) else {
+        let Some(pid) = name
+            .to_str()
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        else {
             continue;
         };
-        let Some((state, _parent, group)) = proc_state_parent_pgrp(pid) else { continue };
+        let Some((state, _parent, group)) = proc_state_parent_pgrp(pid) else {
+            continue;
+        };
         if group != pgid || state == 'Z' {
             continue;
         }
@@ -837,7 +867,12 @@ fn format_cmdline(pid: u32, raw: &[u8]) -> String {
     let mut cut = false;
     // The terminating NUL is stripped rather than the parts filtered, so an
     // argument that IS empty stays in the line it is printed on.
-    for (n, arg) in raw.strip_suffix(&[0]).unwrap_or(raw).split(|b| *b == 0).enumerate() {
+    for (n, arg) in raw
+        .strip_suffix(&[0])
+        .unwrap_or(raw)
+        .split(|b| *b == 0)
+        .enumerate()
+    {
         // Checked HERE as well as per char, because the separator is what an
         // empty argument contributes: a NUL-padded cmdline is all separators
         // and would otherwise grow the line without ever entering the loop
@@ -919,10 +954,7 @@ fn log_has_unprovisioned_sentinel(log_path: &Path, upto: u64) -> bool {
     let mut matched = 0usize;
     for index in 1..needle.len() {
         while matched > 0 && needle.get(index) != needle.get(matched) {
-            matched = prefix
-                .get(matched.saturating_sub(1))
-                .copied()
-                .unwrap_or(0);
+            matched = prefix.get(matched.saturating_sub(1)).copied().unwrap_or(0);
         }
         if needle.get(index) == needle.get(matched) {
             matched = matched.saturating_add(1);
@@ -947,10 +979,7 @@ fn log_has_unprovisioned_sentinel(log_path: &Path, upto: u64) -> bool {
         };
         for byte in bytes {
             while matched > 0 && Some(byte) != needle.get(matched) {
-                matched = prefix
-                    .get(matched.saturating_sub(1))
-                    .copied()
-                    .unwrap_or(0);
+                matched = prefix.get(matched.saturating_sub(1)).copied().unwrap_or(0);
             }
             if Some(byte) == needle.get(matched) {
                 matched = matched.saturating_add(1);
@@ -989,7 +1018,11 @@ fn run_gate(
     let self_exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            let _ = writeln!(logf, "gate-run: FAIL: gate {}: cannot resolve current_exe: {e}", g.name);
+            let _ = writeln!(
+                logf,
+                "gate-run: FAIL: gate {}: cannot resolve current_exe: {e}",
+                g.name
+            );
             timing_event(timing, &g.name, "END");
             return Outcome::Failed;
         }
@@ -1117,8 +1150,11 @@ fn run_gate(
         let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
-                let _ =
-                    writeln!(logf, "gate-run: FAIL: gate {}: cannot spawn {what}: {e}", g.name);
+                let _ = writeln!(
+                    logf,
+                    "gate-run: FAIL: gate {}: cannot spawn {what}: {e}",
+                    g.name
+                );
                 timing_event(timing, &g.name, "END");
                 return Outcome::Failed;
             }
@@ -1309,7 +1345,11 @@ fn run_gate(
                     }
                 }
             }
-            if let Some(more) = survivors.len().checked_sub(CMDLINE_LINES_MAX).filter(|n| *n > 0) {
+            if let Some(more) = survivors
+                .len()
+                .checked_sub(CMDLINE_LINES_MAX)
+                .filter(|n| *n > 0)
+            {
                 let _ = writeln!(logf, "gate-run:   left behind: … and {more} more");
             }
         }
@@ -1502,7 +1542,11 @@ fn journal_pass(root: &Path, key: &str, gate: &str) {
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+    {
         let _ = writeln!(f, "{gate}");
     }
 }
@@ -1621,7 +1665,9 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
     // gate is assumed long until measured). Ties: registration (<NNN>) order.
     let durations = duration_table(&cfg.root);
     let prio = |i: usize| -> f64 {
-        let Some(g) = set.gates.get(i) else { return 0.0 };
+        let Some(g) = set.gates.get(i) else {
+            return 0.0;
+        };
         if g.name == BUILD_RECIPES {
             return f64::INFINITY;
         }
@@ -1634,7 +1680,12 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
     let dep_idx: Vec<Vec<usize>> = set
         .gates
         .iter()
-        .map(|g| g.deps.iter().filter_map(|d| set.index.get(d).copied()).collect())
+        .map(|g| {
+            g.deps
+                .iter()
+                .filter_map(|d| set.index.get(d).copied())
+                .collect()
+        })
         .collect();
 
     // --resume: gates journaled green for THIS tree key start as Done — loudly,
@@ -1648,7 +1699,10 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                 let Some(g) = set.gates.get(i) else { continue };
                 if green.contains(&g.name) {
                     *st = St::Done;
-                    println!("[gate-run] {}: SKIPPED(resume — green for this exact tree)", g.name);
+                    println!(
+                        "[gate-run] {}: SKIPPED(resume — green for this exact tree)",
+                        g.name
+                    );
                     skipped += 1;
                 }
             }
@@ -1659,7 +1713,11 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
             }
         }
     }
-    let sched = Mutex::new(Sched { st: initial, fail: false, running: 0 });
+    let sched = Mutex::new(Sched {
+        st: initial,
+        fail: false,
+        running: 0,
+    });
     let cv = Condvar::new();
 
     let pick_ready = |s: &Sched| -> Option<usize> {
@@ -1812,8 +1870,7 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
 
     let s = lock_sched(&sched);
     let names = |want: St| -> Vec<&str> {
-        s.st
-            .iter()
+        s.st.iter()
             .filter(|(_, st)| **st == want)
             .filter_map(|(i, _)| set.gates.get(*i).map(|g| g.name.as_str()))
             .collect()
@@ -1828,7 +1885,9 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
         if *st != St::SoftFailed {
             continue;
         }
-        let Some(name) = set.gates.get(*i).map(|g| g.name.as_str()) else { continue };
+        let Some(name) = set.gates.get(*i).map(|g| g.name.as_str()) else {
+            continue;
+        };
         if cfg.explicit_goals.contains(i) {
             explicit_soft.push(name);
         } else {
@@ -1883,7 +1942,11 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
             } else {
                 String::new()
             },
-            if skipped > 0 { format!(" ({skipped} gates not started)") } else { String::new() }
+            if skipped > 0 {
+                format!(" ({skipped} gates not started)")
+            } else {
+                String::new()
+            }
         );
     }
     Ok(green)
@@ -2049,7 +2112,9 @@ pub fn cli(args: &[String]) -> ExitCode {
         .unwrap_or(1)
         .saturating_mul(crate::check_memory::TOKEN_BYTES / (1024 * 1024));
     let gate_mem_mib = gate_budget_mib.min(4096);
-    let tree_key = std::env::var("TD_CHECK_TREE").ok().filter(|k| !k.is_empty());
+    let tree_key = std::env::var("TD_CHECK_TREE")
+        .ok()
+        .filter(|k| !k.is_empty());
     if resume && tree_key.is_none() {
         eprintln!(
             "gate-run: --resume needs the TD_CHECK_TREE key (td-builder check computes it from git); refusing to guess — running everything"
@@ -2251,7 +2316,10 @@ mod tests {
             p = pidfile.display(),
             r = release.display()
         );
-        let orphaned = std::process::Command::new("sh").arg("-c").arg(script).status();
+        let orphaned = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .status();
         if !orphaned.map(|s| s.success()).unwrap_or(false) {
             fail(125, "could not fork the orphan");
         }
@@ -2269,7 +2337,10 @@ mod tests {
                 }
             }
             if std::time::Instant::now() >= deadline {
-                fail(125, "the orphan never reported itself, or was never adopted by PID 1");
+                fail(
+                    125,
+                    "the orphan never reported itself, or was never adopted by PID 1",
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         };
@@ -2396,7 +2467,11 @@ mod tests {
         // (zero headroom, matching the pre-#397 convention: 19/32/51 were exact matches
         // too) — these guard against ACCIDENTAL loss, so slack beyond the deliberate
         // retirement just lets a future PR silently drop more gates unnoticed.
-        assert!(heavy.len() >= 23, "heavy pool shrank below the retirement floor: {}", heavy.len());
+        assert!(
+            heavy.len() >= 23,
+            "heavy pool shrank below the retirement floor: {}",
+            heavy.len()
+        );
         for g in ["cargo-test", "store-verify", "recipe-checks"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
         }
@@ -2406,10 +2481,17 @@ mod tests {
         // The derived graph holds: the synthetic build-recipes prelude node is present.
         let br = set.gates.iter().find(|g| g.name == BUILD_RECIPES).unwrap();
         assert!(br.extra_env.iter().any(|(k, _)| k == "TD_BUILD_SPECS"));
-        assert!(takes_slot(br), "build-recipes performs compiler work and needs a grant");
+        assert!(
+            takes_slot(br),
+            "build-recipes performs compiler work and needs a grant"
+        );
         for (_, def) in defs().into_iter().filter(|(_, def)| def.build_gate) {
             let gate = set.gates.iter().find(|gate| gate.name == def.name).unwrap();
-            assert!(takes_slot(gate), "build gate {} bypassed memory admission", def.name);
+            assert!(
+                takes_slot(gate),
+                "build gate {} bypassed memory admission",
+                def.name
+            );
         }
         // Every bash body is non-empty plain bash (no make-isms survived
         // conversion). A NATIVE (typed-Rust) gate (#318 axis 3) legitimately has
@@ -2418,7 +2500,11 @@ mod tests {
         // that `load` enforces).
         for g in &set.gates {
             if crate::gate_bodies::is_native(&g.name) {
-                assert!(g.body.trim().is_empty(), "{} is native but carries bash", g.name);
+                assert!(
+                    g.body.trim().is_empty(),
+                    "{} is native but carries bash",
+                    g.name
+                );
                 continue;
             }
             assert!(!g.body.trim().is_empty(), "{} has an empty body", g.name);
@@ -2460,7 +2546,10 @@ mod tests {
                 }
             }
         }
-        assert!(seen >= 3, "expected the x86_64 gate bodies to drive check-run");
+        assert!(
+            seen >= 3,
+            "expected the x86_64 gate bodies to drive check-run"
+        );
     }
 
     /// `check` is the ONE behavioral tier — it selects every gate in a pool
@@ -2495,7 +2584,10 @@ mod tests {
         // the real coverage.
         for goal in ["check-engine", "check"] {
             let sel = expand_goals(&set, &[goal.to_string()]).unwrap();
-            assert!(!sel.is_empty(), "tier keyword `{goal}` expanded to the empty set");
+            assert!(
+                !sel.is_empty(),
+                "tier keyword `{goal}` expanded to the empty set"
+            );
         }
     }
 
@@ -2514,13 +2606,19 @@ mod tests {
         // PRELUDE body (stage0 seed + td-recipe-eval; load_recipe_eval fails-fast without
         // its sentinel) still runs for a build_gate selection, never no-op'd.
         let mut set = load().unwrap();
-        assert!(set.build_specs.is_empty(), "no corpus specs after the guix-corpus retirement");
+        assert!(
+            set.build_specs.is_empty(),
+            "no corpus specs after the guix-corpus retirement"
+        );
         let goals = vec!["store-verify".to_string()];
         let sel = expand_goals(&set, &goals).unwrap();
         scope_build_recipes(&mut set, &sel, &goals);
         assert_eq!(br_specs(&set), "");
         let br = set.gates.iter().find(|g| g.name == BUILD_RECIPES).unwrap();
-        assert!(br.body.contains("build-recipes.sh"), "the prelude body must survive scoping");
+        assert!(
+            br.body.contains("build-recipes.sh"),
+            "the prelude body must survive scoping"
+        );
     }
 
     /// A tiny synthetic gate set exercising the REAL scheduler + bash execution
@@ -2542,7 +2640,11 @@ mod tests {
                 non_blocking: false,
             });
         }
-        GateSet { gates, index, build_specs: Vec::new() }
+        GateSet {
+            gates,
+            index,
+            build_specs: Vec::new(),
+        }
     }
 
     fn cfg(dir: &Path, jobs: usize, _slots: Option<(PathBuf, usize)>) -> RunCfg {
@@ -2595,8 +2697,18 @@ mod tests {
         let set = synth(
             &d,
             &[
-                ("a", Pool::Cheap, "test ! -e {D}/b.ran && touch {D}/a.ran", &[]),
-                ("b", Pool::Cheap, "test -e {D}/a.ran && touch {D}/b.ran", &["a"]),
+                (
+                    "a",
+                    Pool::Cheap,
+                    "test ! -e {D}/b.ran && touch {D}/a.ran",
+                    &[],
+                ),
+                (
+                    "b",
+                    Pool::Cheap,
+                    "test -e {D}/a.ran && touch {D}/b.ran",
+                    &["a"],
+                ),
             ],
         );
         let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
@@ -2616,7 +2728,10 @@ mod tests {
         );
         let sel = expand_goals(&set, &["check".to_string()]).unwrap();
         assert!(!run_selected(&set, &sel, &cfg(&d, 4, None)).unwrap());
-        assert!(!d.join("late.ran").exists(), "gate behind a red gate must not start");
+        assert!(
+            !d.join("late.ran").exists(),
+            "gate behind a red gate must not start"
+        );
     }
 
     #[test]
@@ -2649,7 +2764,10 @@ mod tests {
             d.join("after.ran").exists(),
             "a dependent of a soft-failed non-blocking gate must still run"
         );
-        assert!(d.join("indep.ran").exists(), "an independent gate must still run");
+        assert!(
+            d.join("indep.ran").exists(),
+            "an independent gate must still run"
+        );
 
         // Contrast: WITHOUT the tag the same failure reds the run + fail-fasts the
         // dependent (this is the existing blocking behavior).
@@ -2666,7 +2784,10 @@ mod tests {
             !run_selected(&set2, &sel2, &cfg(&d2, 4, None)).unwrap(),
             "an untagged (blocking) failure must still red the run"
         );
-        assert!(!d2.join("after.ran").exists(), "blocking failure must fail-fast the dependent");
+        assert!(
+            !d2.join("after.ran").exists(),
+            "blocking failure must fail-fast the dependent"
+        );
     }
 
     #[test]
@@ -2710,7 +2831,10 @@ mod tests {
         // The 69 is tolerated ONLY when the body ALSO emits the sentinel td's own
         // provisioning path prints (proof the 69 is a real toolchain gap, not a
         // stray EX_UNAVAILABLE) — a bare `exit 69` reds, asserted below.
-        let unprov = format!("echo '{}' >&2; exit 69", crate::check_loop::UNPROVISIONED_SENTINEL);
+        let unprov = format!(
+            "echo '{}' >&2; exit 69",
+            crate::check_loop::UNPROVISIONED_SENTINEL
+        );
         let d = tmpdir("unprov");
         let set = synth(
             &d,
@@ -2730,7 +2854,10 @@ mod tests {
             d.join("after.ran").exists(),
             "a dependent of an unprovisioned (skipped) gate must still run"
         );
-        assert!(d.join("indep.ran").exists(), "an independent gate must still run");
+        assert!(
+            d.join("indep.ran").exists(),
+            "an independent gate must still run"
+        );
 
         // Contrast: any OTHER nonzero from an untagged gate is a real regression —
         // it reds and fail-fasts, exactly as before this fix.
@@ -2782,7 +2909,10 @@ mod tests {
         // (`td-builder check cargo-test` on a toolchain-less host) reports an honest
         // skip, not a red. Asking "is this gate green here?" when it cannot run at
         // all is answered "skipped", never a fabricated failure.
-        let unprov = format!("echo '{}' >&2; exit 69", crate::check_loop::UNPROVISIONED_SENTINEL);
+        let unprov = format!(
+            "echo '{}' >&2; exit 69",
+            crate::check_loop::UNPROVISIONED_SENTINEL
+        );
         let d = tmpdir("unprov-explicit");
         let set = synth(&d, &[("compile", Pool::Cheap, unprov.as_str(), &[])]);
         let sel = expand_goals(&set, &["compile".to_string()]).unwrap();
@@ -2817,8 +2947,7 @@ mod tests {
 
         // Drive the real entry point: a spec mixing a pool token, a bare name, and
         // a bogus token — commas AND spaces as separators.
-        let (kept, unknown) =
-            filter_disabled(&set, &selected, "pool:heavy, fastgate  bogus-name");
+        let (kept, unknown) = filter_disabled(&set, &selected, "pool:heavy, fastgate  bogus-name");
         let names: HashSet<&str> = kept
             .iter()
             .filter_map(|i| set.gates.get(*i).map(|g| g.name.as_str()))
@@ -2857,10 +2986,16 @@ mod tests {
         // and the gate reds cleanly (no box OOM).
         let mut c = cfg(&d, 2, None);
         c.gate_mem_mib = 16;
-        assert!(!run_selected(&set, &sel, &c).unwrap(), "16MiB cap must red the hog");
+        assert!(
+            !run_selected(&set, &sel, &c).unwrap(),
+            "16MiB cap must red the hog"
+        );
         // Green half: with the cap off the same body passes.
         let c = cfg(&d, 2, None);
-        assert!(run_selected(&set, &sel, &c).unwrap(), "uncapped hog must pass");
+        assert!(
+            run_selected(&set, &sel, &c).unwrap(),
+            "uncapped hog must pass"
+        );
     }
 
     #[test]
@@ -2877,10 +3012,16 @@ mod tests {
         // far under any per-process cap — only the aggregate trips).
         let mut c = cfg(&d, 2, None);
         c.gate_tree_mem_mib = 64;
-        assert!(!run_selected(&set, &sel, &c).unwrap(), "64MiB tree budget must red the group");
+        assert!(
+            !run_selected(&set, &sel, &c).unwrap(),
+            "64MiB tree budget must red the group"
+        );
         // Green half: watchdog off, the same tree passes.
         let c = cfg(&d, 2, None);
-        assert!(run_selected(&set, &sel, &c).unwrap(), "unbudgeted tree must pass");
+        assert!(
+            run_selected(&set, &sel, &c).unwrap(),
+            "unbudgeted tree must pass"
+        );
     }
 
     #[test]
@@ -2970,9 +3111,12 @@ mod tests {
         let d = tmpdir("bg");
         let mut set = synth(
             &d,
-            &[
-                ("consumer", Pool::Heavy, "test -e {D}/br.ran && touch {D}/ok", &["build-recipes"]),
-            ],
+            &[(
+                "consumer",
+                Pool::Heavy,
+                "test -e {D}/br.ran && touch {D}/ok",
+                &["build-recipes"],
+            )],
         );
         let idx = set.gates.len();
         set.gates.push(Gate {
@@ -2994,7 +3138,9 @@ mod tests {
     fn resume_skips_journaled_greens_only_for_the_identical_tree_key() {
         let d = tmpdir("resume");
         let runs = |f: &str| -> usize {
-            std::fs::read_to_string(d.join(f)).map(|t| t.lines().count()).unwrap_or(0)
+            std::fs::read_to_string(d.join(f))
+                .map(|t| t.lines().count())
+                .unwrap_or(0)
         };
         // `a` passes and is journaled; `b` reds every time (so each run's
         // journal state is observable through a's re-execution count).
@@ -3018,7 +3164,11 @@ mod tests {
         assert_eq!((runs("a.runs"), runs("b.runs")), (1, 1));
         // Resume, same key: a SKIPPED (not re-run), b re-runs.
         assert!(!run_selected(&set, &sel, &with(Some("k1"), true)).unwrap());
-        assert_eq!((runs("a.runs"), runs("b.runs")), (1, 2), "a must be skipped on resume");
+        assert_eq!(
+            (runs("a.runs"), runs("b.runs")),
+            (1, 2),
+            "a must be skipped on resume"
+        );
         // VERIFIED-RED half: a DIFFERENT key (any tree change) invalidates the
         // whole journal — a re-runs.
         assert!(!run_selected(&set, &sel, &with(Some("k2"), true)).unwrap());
@@ -3073,7 +3223,10 @@ mod tests {
 
         // The ceiling bounds the ratchet: a gate killed at a 4h budget records
         // that span, and scaling from it would ask for 40h next run.
-        assert_eq!(gate_timeout_budget(4 * 3600, 10, CAP, Some(4.0 * 3600.0)), CAP);
+        assert_eq!(
+            gate_timeout_budget(4 * 3600, 10, CAP, Some(4.0 * 3600.0)),
+            CAP
+        );
         // It is a cap on the SCALED term, never a cut below the floor: a
         // ceiling misconfigured under the floor must not tighten the budget.
         assert_eq!(gate_timeout_budget(3600, 10, 60, Some(1000.0)), 3600);
@@ -3129,7 +3282,10 @@ mod tests {
         let set = synth(&d, &[("leaky", Pool::Cheap, body, &[])]);
         let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
         let c = cfg(&d, 1, None);
-        assert!(run_selected(&set, &sel, &c).unwrap(), "the body exits 0, so the gate passes");
+        assert!(
+            run_selected(&set, &sel, &c).unwrap(),
+            "the body exits 0, so the gate passes"
+        );
         std::thread::sleep(Duration::from_millis(1200));
         assert!(
             !d.join("escaped").exists(),
@@ -3144,9 +3300,19 @@ mod tests {
     fn a_survivors_argv_cannot_forge_a_log_line() {
         let raw = b"sleep\0\ngate-run: gate x is UNPROVISIONED\0".as_slice();
         let line = format_cmdline(41, raw);
-        assert_eq!(line.lines().count(), 1, "one survivor is one line; got {line:?}");
-        assert!(line.contains("\\x0a"), "the newline must be escaped; got {line:?}");
-        assert!(!line.contains('\n'), "and must not survive as itself; got {line:?}");
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "one survivor is one line; got {line:?}"
+        );
+        assert!(
+            line.contains("\\x0a"),
+            "the newline must be escaped; got {line:?}"
+        );
+        assert!(
+            !line.contains('\n'),
+            "and must not survive as itself; got {line:?}"
+        );
     }
 
     /// The escape has to be unambiguous, or an argv can spell it: `\x0a` typed
@@ -3165,10 +3331,18 @@ mod tests {
         assert_eq!(format_cmdline(9, &raw), "9: prog  tail");
         raw = [b"prog\0".as_slice(), &b"x".repeat(100_000), b"\0"].concat();
         let line = format_cmdline(9, &raw);
-        assert!(line.ends_with("..."), "a cut line must say so; got {} bytes", line.len());
+        assert!(
+            line.ends_with("..."),
+            "a cut line must say so; got {} bytes",
+            line.len()
+        );
         // A soft bound: the char that crosses CMDLINE_MAX is escaped whole, so
         // the worst case is 199 + 8 (a two-byte C1 control at `\xNN\xNN`) + 3.
-        assert!(line.len() <= CMDLINE_MAX + 10, "and must be bounded; got {} bytes", line.len());
+        assert!(
+            line.len() <= CMDLINE_MAX + 10,
+            "and must be bounded; got {} bytes",
+            line.len()
+        );
     }
 
     /// The bounded read must not make a short argv look truncated, nor a long
@@ -3182,12 +3356,26 @@ mod tests {
     fn the_bounded_cmdline_read_still_marks_what_it_cut() {
         let long = [b"p\0".as_slice(), &b"y".repeat(4096)].concat();
         let capped = long.get(..CMDLINE_READ as usize).unwrap();
-        assert!(format_cmdline(3, capped).ends_with("..."), "a capped read is still a cut line");
+        assert!(
+            format_cmdline(3, capped).ends_with("..."),
+            "a capped read is still a cut line"
+        );
         let padded = format_cmdline(3, &[0u8; CMDLINE_READ as usize]);
-        assert!(padded.ends_with("..."), "and so is one that is all separators; got {padded:?}");
-        assert!(padded.len() <= CMDLINE_MAX + 10, "and bounded; got {} bytes", padded.len());
+        assert!(
+            padded.ends_with("..."),
+            "and so is one that is all separators; got {padded:?}"
+        );
+        assert!(
+            padded.len() <= CMDLINE_MAX + 10,
+            "and bounded; got {} bytes",
+            padded.len()
+        );
         let short = b"p\0-v\0";
-        assert_eq!(format_cmdline(3, short), "3: p -v", "and a short argv is untouched");
+        assert_eq!(
+            format_cmdline(3, short),
+            "3: p -v",
+            "and a short argv is untouched"
+        );
     }
 
     /// A survivor's argv is text a gate chose and the unprovisioned sentinel is
@@ -3231,11 +3419,17 @@ mod tests {
     #[test]
     fn an_unbudgeted_gate_is_left_alone() {
         let d = tmpdir("timeout-off");
-        let set = synth(&d, &[("slow", Pool::Cheap, "sleep 2; touch {D}/slow.ran", &[])]);
+        let set = synth(
+            &d,
+            &[("slow", Pool::Cheap, "sleep 2; touch {D}/slow.ran", &[])],
+        );
         let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
         let c = cfg(&d, 1, None); // gate_timeout_secs = 0
         assert!(run_selected(&set, &sel, &c).unwrap());
-        assert!(d.join("slow.ran").exists(), "an unbudgeted gate must run to completion");
+        assert!(
+            d.join("slow.ran").exists(),
+            "an unbudgeted gate must run to completion"
+        );
     }
 
     /// A gate must not outlive the runner that spawned it. The incident this
@@ -3336,7 +3530,10 @@ mod tests {
                 );
             }
         }
-        assert!(gone, "an armed child must die with the process that spawned it");
+        assert!(
+            gone,
+            "an armed child must die with the process that spawned it"
+        );
         assert!(
             bare_survived,
             "the control must OUTLIVE its spawner, or the armed half proves nothing"

@@ -125,8 +125,11 @@ mod tests {
     fn the_recipe_stages_a_complete_compilable_source_tree() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!("td-update-recipe-{}-{}",
-            std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
+        let root = std::env::temp_dir().join(format!(
+            "td-update-recipe-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir(&root).unwrap();
         for step in recipe().steps.unwrap() {
             if let Step::WriteFile { path, content, .. } = step {
@@ -139,10 +142,20 @@ mod tests {
         }
         let result = std::process::Command::new("rustc")
             .current_dir(&root)
-            .args(["--edition=2021", "--emit=metadata", "td-update/src/main.rs", "-o", "update.rmeta"])
+            .args([
+                "--edition=2021",
+                "--emit=metadata",
+                "td-update/src/main.rs",
+                "-o",
+                "update.rmeta",
+            ])
             .output();
         let _ = std::fs::remove_dir_all(root);
         let result = result.unwrap();
-        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 }

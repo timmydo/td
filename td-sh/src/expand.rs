@@ -404,7 +404,12 @@ fn slice_chars(sh: &mut Shell, chars: &[char], offset: i64, length: Option<i64>)
 /// and a NEGATIVE offset counts back over that same list rather than over the
 /// positionals alone, which is why `${@: -4}` with three of them yields `$0`
 /// and all three. One step further back is empty, as it is for a string.
-fn slice_items(sh: &mut Shell, items: &[String], offset: i64, length: Option<i64>) -> R<Vec<String>> {
+fn slice_items(
+    sh: &mut Shell,
+    items: &[String],
+    offset: i64,
+    length: Option<i64>,
+) -> R<Vec<String>> {
     let (a, b) = slice_range(sh, items.len(), offset, length, false)?;
     Ok(items.get(a..b).unwrap_or_default().to_vec())
 }
@@ -1186,7 +1191,10 @@ mod tests {
         assert_eq!(lookup(&mut sh, "!"), None);
         sh.opts.nounset = true;
         for src in ["${!}", "${#!}", "${!#x}", "${!/x/y}"] {
-            assert!(try_expand(&mut sh, src).is_err(), "{src} should trip nounset");
+            assert!(
+                try_expand(&mut sh, src).is_err(),
+                "{src} should trip nounset"
+            );
         }
         assert!(try_expand(&mut sh, "${!-none}").is_ok());
         // The check fires BEFORE the pattern and replacement are expanded, so a
@@ -1196,7 +1204,11 @@ mod tests {
         let mut sh = sh_with(&[]);
         sh.opts.nounset = true;
         assert!(try_expand(&mut sh, "${v/${w:=D}/z}").is_err());
-        assert_eq!(lookup(&mut sh, "w"), None, "the replacement must not have run");
+        assert_eq!(
+            lookup(&mut sh, "w"),
+            None,
+            "the replacement must not have run"
+        );
         assert!(try_expand(&mut sh, "${v#${w:=D}}").is_err());
         assert_eq!(lookup(&mut sh, "w"), None, "the pattern must not have run");
         // With the subject SET both run, which is what makes the above a
@@ -1206,7 +1218,10 @@ mod tests {
         assert_eq!(lookup(&mut sh, "w").as_deref(), Some("D"));
         sh.last_bg = Some(4321);
         for src in ["${!}", "${#!}"] {
-            assert!(try_expand(&mut sh, src).is_ok(), "{src} after a background job");
+            assert!(
+                try_expand(&mut sh, src).is_ok(),
+                "{src} after a background job"
+            );
         }
     }
 
@@ -1506,7 +1521,10 @@ mod tests {
         sh.params = vec!["a".into(), "b".into()];
         let _ = sh.set_var("IFS", "");
         assert_eq!(expand_single(&mut sh, &word("$*")).ok(), Some("ab".into()));
-        assert_eq!(expand_single(&mut sh, &word("-$*-")).ok(), Some("-ab-".into()));
+        assert_eq!(
+            expand_single(&mut sh, &word("-$*-")).ok(),
+            Some("-ab-".into())
+        );
         // `$@` has always been rejoined on a space here, and still is.
         assert_eq!(expand_single(&mut sh, &word("$@")).ok(), Some("a b".into()));
     }

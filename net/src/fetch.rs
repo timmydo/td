@@ -76,7 +76,10 @@ fn file_sha256(path: &Path) -> Result<(String, u64), String> {
 fn feed_url(url: &str) -> String {
     match std::env::var("TD_FEED_BASE") {
         Ok(base) if !base.is_empty() => {
-            match url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) {
+            match url
+                .strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"))
+            {
                 Some(rest) => format!("{}/{}", base.trim_end_matches('/'), rest),
                 None => url.to_string(),
             }
@@ -230,9 +233,7 @@ pub fn run(a: &[String]) {
             }
             println!(
                 "td-fetch: loopback round-trip OK ({} bytes, sha256 {}) via 127.0.0.1:{}",
-                got_len,
-                want,
-                port
+                got_len, want, port
             );
         }
         _ => {

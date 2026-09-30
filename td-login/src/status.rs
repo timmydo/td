@@ -108,7 +108,9 @@ impl Status {
             Some(cap_eff),
             Some(cap_amb),
             Some(cap_inh),
-        ) = (uid, gid, groups, threads, cap_prm, cap_eff, cap_amb, cap_inh)
+        ) = (
+            uid, gid, groups, threads, cap_prm, cap_eff, cap_amb, cap_inh,
+        )
         else {
             return Err(
                 "missing one of the Uid/Gid/Groups/Threads/CapPrm/CapEff/CapAmb/CapInh \
@@ -251,12 +253,19 @@ mod tests {
                 "a status with no {drop_line} line must not parse"
             );
         }
-        assert!(Status::parse(&SAMPLE.replace("\t1000\t1000\t1000\t1000", "\t1000\t1000")).is_err());
+        assert!(
+            Status::parse(&SAMPLE.replace("\t1000\t1000\t1000\t1000", "\t1000\t1000")).is_err()
+        );
         assert!(Status::parse(&SAMPLE.replace("Threads:\t1", "Threads:\tmany")).is_err());
         assert!(Status::parse(&SAMPLE.replace("Groups:\t1000 10 ", "Groups:\t1000 -1 ")).is_err());
-        assert!(Status::parse(&SAMPLE.replace("CapEff:\t0000000000000000", "CapEff:\tzz")).is_err());
+        assert!(
+            Status::parse(&SAMPLE.replace("CapEff:\t0000000000000000", "CapEff:\tzz")).is_err()
+        );
         // Five ids is as wrong as three: it means the format moved under us.
-        assert!(Status::parse(&SAMPLE.replace("Gid:\t1000\t1000\t1000\t1000", "Gid:\t1\t1\t1\t1\t1")).is_err());
+        assert!(Status::parse(
+            &SAMPLE.replace("Gid:\t1000\t1000\t1000\t1000", "Gid:\t1\t1\t1\t1\t1")
+        )
+        .is_err());
     }
 
     /// The live kernel must carry every field the fixture does, with the values
@@ -288,15 +297,28 @@ mod tests {
             Vec::new()
         };
         let uid = field("Uid:");
-        assert_eq!(uid.len(), 4, "the kernel's Uid: line is no longer four columns");
+        assert_eq!(
+            uid.len(),
+            4,
+            "the kernel's Uid: line is no longer four columns"
+        );
         for (column, seen) in [REAL, EFFECTIVE, SAVED, FILESYSTEM].iter().zip(uid.iter()) {
-            assert_eq!(s.uid.get(*column).map(u32::to_string).as_deref(), Some(seen.as_str()));
+            assert_eq!(
+                s.uid.get(*column).map(u32::to_string).as_deref(),
+                Some(seen.as_str())
+            );
         }
         assert_eq!(field("Gid:").len(), 4);
-        assert_eq!(field("Threads:").first().map(String::as_str), Some(s.threads.to_string().as_str()));
+        assert_eq!(
+            field("Threads:").first().map(String::as_str),
+            Some(s.threads.to_string().as_str())
+        );
         assert!(s.threads >= 1, "a live process has at least one thread");
         // Groups are sorted on the way in, whatever order the kernel printed.
-        let mut raw: Vec<u32> = field("Groups:").iter().filter_map(|g| g.parse().ok()).collect();
+        let mut raw: Vec<u32> = field("Groups:")
+            .iter()
+            .filter_map(|g| g.parse().ok())
+            .collect();
         raw.sort_unstable();
         raw.dedup();
         assert_eq!(s.groups, raw);

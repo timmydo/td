@@ -38,30 +38,65 @@ pub struct Style {
 }
 
 impl Style {
-    pub const PLAIN: Style = Style { fg: None, bold: false, dim: false, invert: false };
+    pub const PLAIN: Style = Style {
+        fg: None,
+        bold: false,
+        dim: false,
+        invert: false,
+    };
 
     pub const fn fg(code: u8) -> Style {
-        Style { fg: Some(code), bold: false, dim: false, invert: false }
+        Style {
+            fg: Some(code),
+            bold: false,
+            dim: false,
+            invert: false,
+        }
     }
 
     pub const fn bold() -> Style {
-        Style { fg: None, bold: true, dim: false, invert: false }
+        Style {
+            fg: None,
+            bold: true,
+            dim: false,
+            invert: false,
+        }
     }
 
     pub const fn dim() -> Style {
-        Style { fg: None, bold: false, dim: true, invert: false }
+        Style {
+            fg: None,
+            bold: false,
+            dim: true,
+            invert: false,
+        }
     }
 
     pub const fn bar(code: u8) -> Style {
-        Style { fg: Some(code), bold: true, dim: false, invert: true }
+        Style {
+            fg: Some(code),
+            bold: true,
+            dim: false,
+            invert: true,
+        }
     }
 
     pub const fn with_bold(self) -> Style {
-        Style { fg: self.fg, bold: true, dim: self.dim, invert: self.invert }
+        Style {
+            fg: self.fg,
+            bold: true,
+            dim: self.dim,
+            invert: self.invert,
+        }
     }
 
     pub const fn with_invert(self) -> Style {
-        Style { fg: self.fg, bold: self.bold, dim: self.dim, invert: true }
+        Style {
+            fg: self.fg,
+            bold: self.bold,
+            dim: self.dim,
+            invert: true,
+        }
     }
 
     fn sgr(&self) -> String {
@@ -95,7 +130,10 @@ pub struct Line {
 
 impl Line {
     pub fn new(text: impl Into<String>, style: Style) -> Line {
-        Line { text: text.into(), style }
+        Line {
+            text: text.into(),
+            style,
+        }
     }
 
     pub fn plain(text: impl Into<String>) -> Line {
@@ -114,8 +152,7 @@ const REPLACEMENT: char = '\u{b7}';
 /// C0 and C1 controls (U+009B is CSI on xterm) plus the bidi overrides that
 /// make a diff render in an order the bytes do not have.
 fn is_hostile(ch: char) -> bool {
-    ch.is_control()
-        || matches!(ch as u32, 0x202a..=0x202e | 0x2066..=0x2069 | 0x200e | 0x200f)
+    ch.is_control() || matches!(ch as u32, 0x202a..=0x202e | 0x2066..=0x2069 | 0x200e | 0x200f)
 }
 
 /// Display columns for `ch` — a dependency-free stand-in for `wcwidth(3)`.
@@ -335,7 +372,10 @@ pub fn decode(bytes: &[u8]) -> Vec<Key> {
             _ => {
                 // Multi-byte UTF-8, or a byte we have no meaning for.
                 let len = utf8_len(b);
-                match bytes.get(i..i + len).and_then(|s| std::str::from_utf8(s).ok()) {
+                match bytes
+                    .get(i..i + len)
+                    .and_then(|s| std::str::from_utf8(s).ok())
+                {
                     Some(s) => {
                         for ch in s.chars() {
                             keys.push(Key::Char(ch));
@@ -424,7 +464,10 @@ pub trait Ui {
     fn drain_input(&mut self) -> io::Result<()>;
     /// Leave the alternate screen, run `body`, come back. `&mut dyn FnMut` and
     /// not a generic so the trait stays object-safe.
-    fn suspend_run(&mut self, body: &mut dyn FnMut() -> io::Result<()>) -> io::Result<io::Result<()>>;
+    fn suspend_run(
+        &mut self,
+        body: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<io::Result<()>>;
 }
 
 impl Ui for Terminal {
@@ -451,13 +494,21 @@ impl Ui for Terminal {
 impl Terminal {
     pub fn open() -> io::Result<Terminal> {
         let input = OpenOptions::new().read(true).open(TTY).map_err(|e| {
-            io::Error::new(e.kind(), format!("opening {TTY} for input: {e} (no terminal?)"))
+            io::Error::new(
+                e.kind(),
+                format!("opening {TTY} for input: {e} (no terminal?)"),
+            )
         })?;
         let output = OpenOptions::new()
             .write(true)
             .open(TTY)
             .map_err(|e| io::Error::new(e.kind(), format!("opening {TTY} for output: {e}")))?;
-        let mut term = Terminal { input, output, saved_mode: None, raw: false };
+        let mut term = Terminal {
+            input,
+            output,
+            saved_mode: None,
+            raw: false,
+        };
         term.enter()?;
         Ok(term)
     }
@@ -507,8 +558,14 @@ impl Terminal {
             Err(_) => return (DEFAULT_ROWS, DEFAULT_COLS),
         };
         let mut parts = raw.split_whitespace();
-        let rows = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(DEFAULT_ROWS);
-        let cols = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(DEFAULT_COLS);
+        let rows = parts
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_ROWS);
+        let cols = parts
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_COLS);
         (rows.max(4), cols.max(20))
     }
 
@@ -612,7 +669,10 @@ mod tests {
 
     #[test]
     fn decodes_batched_input_and_utf8() {
-        assert_eq!(decode(b"jj\x1b[B"), vec![Key::Char('j'), Key::Char('j'), Key::Down]);
+        assert_eq!(
+            decode(b"jj\x1b[B"),
+            vec![Key::Char('j'), Key::Char('j'), Key::Down]
+        );
         assert_eq!(decode("é".as_bytes()), vec![Key::Char('é')]);
     }
 
@@ -654,7 +714,13 @@ mod tests {
 
     #[test]
     fn every_sanitized_row_fits_its_frame() {
-        for text in ["plain", "世界世界世界", "e\u{301}\u{301}x", "a\tb", "🚀🚀🚀"] {
+        for text in [
+            "plain",
+            "世界世界世界",
+            "e\u{301}\u{301}x",
+            "a\tb",
+            "🚀🚀🚀",
+        ] {
             for cols in 1..12 {
                 let (_, width) = sanitize(text, cols);
                 assert!(width <= cols, "{text:?} at {cols} cols produced {width}");

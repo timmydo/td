@@ -118,7 +118,11 @@ fn refuse_if_writable(device: &str, readonly: bool) -> io::Result<()> {
 fn read_only(loop_device: &File) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let rdev = loop_device.metadata()?.rdev();
-    let path = format!("/sys/dev/block/{}:{}/ro", devt::major(rdev), devt::minor(rdev));
+    let path = format!(
+        "/sys/dev/block/{}:{}/ro",
+        devt::major(rdev),
+        devt::minor(rdev)
+    );
     let text = std::fs::read_to_string(&path)
         .map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
     Ok(ro_flag(&text))

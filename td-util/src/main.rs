@@ -670,18 +670,27 @@ mod confinement {
         // the inner form a new module could carry at its top, and a multi-lint
         // group with the lint somewhere in the middle of it.
         assert_eq!(
-            sources().iter().map(|(_, t)| unsafe_allows(t)).sum::<usize>(),
+            sources()
+                .iter()
+                .map(|(_, t)| unsafe_allows(t))
+                .sum::<usize>(),
             1,
             "the crate must carry exactly ONE scoped unsafe allow (the asm body in sys.rs)"
         );
         assert_eq!(
-            sources().iter().map(|(_, t)| unsafe_blocks(t)).sum::<usize>(),
+            sources()
+                .iter()
+                .map(|(_, t)| unsafe_blocks(t))
+                .sum::<usize>(),
             1,
             "the crate must carry exactly ONE unsafe block (the asm body in sys.rs)"
         );
         for form in ["fn", "impl", "trait"] {
             assert_eq!(
-                sources().iter().map(|(_, t)| unsafe_items(t, form)).sum::<usize>(),
+                sources()
+                    .iter()
+                    .map(|(_, t)| unsafe_items(t, form))
+                    .sum::<usize>(),
                 0,
                 "no item of this form may exist in this crate: {form}"
             );
@@ -725,7 +734,9 @@ mod confinement {
             concat!("the crate root must DENY unsafe", "_code")
         );
         assert_eq!(
-            squeezed.matches(&format!("{}![forbid({lint})]", "#")).count(),
+            squeezed
+                .matches(&format!("{}![forbid({lint})]", "#"))
+                .count(),
             0,
             "forbid cannot host the scoped allow sys.rs needs; this must be deny"
         );
@@ -813,7 +824,6 @@ mod confinement {
              declaration nor one of its three call sites; it may be shadowed there"
         );
     }
-
 
     /// The three requests are declared once each, value-pinned, in `sys.rs`.
     ///
@@ -1000,8 +1010,11 @@ mod confinement {
         // would let a SECOND, unannotated definition satisfy "declared exactly
         // once" as long as the annotated one moved elsewhere in the file.
         assert_eq!(
-            sys.matches(&format!("{}{CALL}(", concat!("#[allow(un", "safe_code)]fn")))
-                .count(),
+            sys.matches(&format!(
+                "{}{CALL}(",
+                concat!("#[allow(un", "safe_code)]fn")
+            ))
+            .count(),
             1,
             "the raw entry point must be declared exactly once, under the scoped allow"
         );
@@ -1177,7 +1190,10 @@ mod confinement {
         // would be answered by some other function — or by this module's own
         // tests, which legitimately spell all of these.
         let ends = at(body, "pubfnsize(");
-        assert!(ends.is_some(), "term::size must follow raw(); the scan needs a bound");
+        assert!(
+            ends.is_some(),
+            "term::size must follow raw(); the scan needs a bound"
+        );
         let rest = body.get(..ends.unwrap_or(body.len())).unwrap_or_default();
         // Including the `?;`: that one IS allowed, because if the patch itself
         // fails the terminal was never changed and there is nothing to put back.
@@ -1266,7 +1282,10 @@ mod confinement {
             "the guard must restore the terminal in Drop, not on the happy path only"
         );
         assert!(
-            term.contains(concat!("sys", "::termios_set(self.fd.as_raw_fd(),&self.saved)")),
+            term.contains(concat!(
+                "sys",
+                "::termios_set(self.fd.as_raw_fd(),&self.saved)"
+            )),
             "Drop must write back the bytes the kernel gave us, not a reconstructed termios"
         );
     }

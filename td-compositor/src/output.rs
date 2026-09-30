@@ -472,11 +472,23 @@ pub(crate) fn completed_public_ppm(
     let completed = completed
         .ok_or("output completion is not established")?
         .checked()?;
-    fit(comparison, completed.pixels.len(), "reserve public capture comparison")?;
-    scene.render(comparison, completed.width, completed.height, completed.stride);
+    fit(
+        comparison,
+        completed.pixels.len(),
+        "reserve public capture comparison",
+    )?;
+    scene.render(
+        comparison,
+        completed.width,
+        completed.height,
+        completed.stride,
+    );
     // Visible bytes only: the renderer never writes row padding, and what a
     // backend's padding holds is not part of the picture.
-    let visible = completed.width.checked_mul(4).ok_or("capture row overflow")?;
+    let visible = completed
+        .width
+        .checked_mul(4)
+        .ok_or("capture row overflow")?;
     let rows = comparison
         .chunks_exact(completed.stride)
         .zip(completed.pixels.chunks_exact(completed.stride))
@@ -497,11 +509,17 @@ pub(crate) fn completed_public_ppm(
         completed.width,
         completed.height
     );
-    let length = pixels.checked_add(header.len()).ok_or("capture size overflow")?;
+    let length = pixels
+        .checked_add(header.len())
+        .ok_or("capture size overflow")?;
     let mut ppm = Vec::new();
-    ppm.try_reserve_exact(length).map_err(|_| "reserve public capture")?;
+    ppm.try_reserve_exact(length)
+        .map_err(|_| "reserve public capture")?;
     ppm.extend_from_slice(header.as_bytes());
-    let row_bytes = completed.width.checked_mul(4).ok_or("capture row overflow")?;
+    let row_bytes = completed
+        .width
+        .checked_mul(4)
+        .ok_or("capture row overflow")?;
     for row in completed
         .pixels
         .chunks_exact(completed.stride)
@@ -532,7 +550,11 @@ pub(crate) fn surface_rgb_pixel_counts(
         return Ok([0; 2]);
     }
     let composed = composed.checked()?;
-    fit(comparison, composed.pixels.len(), "reserve application comparison frame")?;
+    fit(
+        comparison,
+        composed.pixels.len(),
+        "reserve application comparison frame",
+    )?;
     scene.render_omitting(
         comparison,
         composed.width,
@@ -548,7 +570,9 @@ pub(crate) fn surface_rgb_pixel_counts(
 fn fit(scratch: &mut Vec<u8>, length: usize, what: &str) -> Result<(), String> {
     if scratch.len() != length {
         let additional = length.saturating_sub(scratch.len());
-        scratch.try_reserve_exact(additional).map_err(|_| what.to_string())?;
+        scratch
+            .try_reserve_exact(additional)
+            .map_err(|_| what.to_string())?;
         scratch.resize(length, 0);
     }
     Ok(())
@@ -604,7 +628,9 @@ mod tests {
 
     #[test]
     fn application_color_counts_exclude_stride_padding() {
-        let rendered = [0xff, 0x00, 0xff, 0, 0x00, 0xff, 0x00, 0, 0x00, 0xff, 0x00, 0];
+        let rendered = [
+            0xff, 0x00, 0xff, 0, 0x00, 0xff, 0x00, 0, 0x00, 0xff, 0x00, 0,
+        ];
         let mut omitted = [0u8; 12];
         let colors = [[0xff, 0x00, 0xff], [0x00, 0xff, 0x00]];
         let view = FrameView {
@@ -618,8 +644,10 @@ mod tests {
         assert_eq!(attributed_rgb_counts(view, &omitted, colors), [1, 0]);
     }
 
-    const STAMP: crate::headless::OutputStamp =
-        crate::headless::OutputStamp { session: 7, output: 1 };
+    const STAMP: crate::headless::OutputStamp = crate::headless::OutputStamp {
+        session: 7,
+        output: 1,
+    };
 
     #[test]
     fn a_view_whose_geometry_does_not_describe_its_bytes_is_refused_not_sliced() {
@@ -632,7 +660,9 @@ mod tests {
         };
         for (width, height, stride) in [(0, 4, 16), (4, 0, 16), (4, 4, 0), (4, 4, 12), (4, 5, 16)] {
             let bad = view(width, height, stride);
-            assert!(completed_public_ppm(Some(bad), &mut Vec::new(), &Scene::new(), STAMP).is_err());
+            assert!(
+                completed_public_ppm(Some(bad), &mut Vec::new(), &Scene::new(), STAMP).is_err()
+            );
             let key = SurfaceKey {
                 client: 1,
                 object: 1,
@@ -642,7 +672,10 @@ mod tests {
             assert!(counts.is_err());
         }
         assert!(view(4, 4, 16).checked().is_ok());
-        assert_eq!(attributed_rgb_counts(view(4, 4, 0), &bytes, [[0; 3]; 2]), [0; 2]);
+        assert_eq!(
+            attributed_rgb_counts(view(4, 4, 0), &bytes, [[0; 3]; 2]),
+            [0; 2]
+        );
     }
 
     /// Row padding is not the picture: a backend whose padding holds

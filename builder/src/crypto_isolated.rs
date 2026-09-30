@@ -87,11 +87,22 @@ pub(crate) fn cargo_manifest(verb: &str, manifest: &Path) -> Command {
     command
 }
 
-pub(crate) fn bounded_output(command: &mut Command, name: &str, limit: u64, seconds: u64) -> Result<String> {
+pub(crate) fn bounded_output(
+    command: &mut Command,
+    name: &str,
+    limit: u64,
+    seconds: u64,
+) -> Result<String> {
     bounded_exit_output(command, name, limit, seconds, 0)
 }
 
-pub(crate) fn bounded_exit_output(command: &mut Command, name: &str, limit: u64, seconds: u64, expected: i32) -> Result<String> {
+pub(crate) fn bounded_exit_output(
+    command: &mut Command,
+    name: &str,
+    limit: u64,
+    seconds: u64,
+    expected: i32,
+) -> Result<String> {
     let path = Path::new("/output").join(format!("{name}.log"));
     let file = fs::OpenOptions::new()
         .write(true)
@@ -104,7 +115,9 @@ pub(crate) fn bounded_exit_output(command: &mut Command, name: &str, limit: u64,
         .checked_add(Duration::from_secs(seconds))
         .ok_or("portable command deadline overflow")?;
     let _ = crate::host_bin::wait_with_deadline(&mut child, Some(deadline));
-    let status = child.try_wait().map_err(|e| format!("inspect {name} status: {e}"))?;
+    let status = child
+        .try_wait()
+        .map_err(|e| format!("inspect {name} status: {e}"))?;
     if Instant::now() >= deadline || status.and_then(|status| status.code()) != Some(expected) {
         return Err(format!("portable {name} failed or exceeded its deadline"));
     }
@@ -426,16 +439,27 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
         }
         names.insert(entry.file_name());
     }
-    let expected = ["COMMANDS", "td-mta", "td-crypto-smoke", "td-mta-config-smoke", "td-mta-format-smoke"]
-        .map(std::ffi::OsString::from)
-        .into_iter()
-        .collect();
+    let expected = [
+        "COMMANDS",
+        "td-mta",
+        "td-crypto-smoke",
+        "td-mta-config-smoke",
+        "td-mta-format-smoke",
+    ]
+    .map(std::ffi::OsString::from)
+    .into_iter()
+    .collect();
     if names != expected {
         return Err("unexpected build artifact inventory".into());
     }
     let receipt = read_output(&source.join("COMMANDS"), "commands", 64 * 1024)?;
     fs::create_dir(destination).map_err(|e| format!("create private artifact directory: {e}"))?;
-    for name in ["td-mta", "td-crypto-smoke", "td-mta-config-smoke", "td-mta-format-smoke"] {
+    for name in [
+        "td-mta",
+        "td-crypto-smoke",
+        "td-mta-config-smoke",
+        "td-mta-format-smoke",
+    ] {
         copy_binary(&source.join(name), &destination.join(name))?;
     }
     Ok(receipt)
@@ -595,11 +619,15 @@ fn enter(
 
 fn stack_evidence(output: &str, prefix: &str, ceiling: usize) -> Result<usize> {
     let mut values = output.lines().filter_map(|line| line.strip_prefix(prefix));
-    let value = values.next().ok_or("portable stack measurement is missing")?;
+    let value = values
+        .next()
+        .ok_or("portable stack measurement is missing")?;
     if values.next().is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return Err("portable stack measurement is ambiguous or malformed".into());
     }
-    let bytes = value.parse::<usize>().map_err(|_| "portable stack measurement overflows")?;
+    let bytes = value
+        .parse::<usize>()
+        .map_err(|_| "portable stack measurement overflows")?;
     if bytes == 0 || bytes > ceiling {
         return Err("portable stack measurement exceeds its ceiling".into());
     }
@@ -607,7 +635,13 @@ fn stack_evidence(output: &str, prefix: &str, ceiling: usize) -> Result<usize> {
 }
 
 pub(crate) fn runtime_inner() -> Result<()> {
-    require_namespace(&["/artifacts/td-mta", "/artifacts/td-crypto-smoke", "/artifacts/td-mta-config-smoke", "/artifacts/td-mta-format-smoke", "/output"])?;
+    require_namespace(&[
+        "/artifacts/td-mta",
+        "/artifacts/td-crypto-smoke",
+        "/artifacts/td-mta-config-smoke",
+        "/artifacts/td-mta-format-smoke",
+        "/output",
+    ])?;
     let mut command = Command::new("/artifacts/td-mta");
     command.arg("--version").env_clear().stdin(Stdio::null());
     crate::host_bin::arm_check_child(&mut command);
@@ -803,7 +837,12 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
     )?;
     let artifacts = scratch.0.join("artifacts");
     receipt.push_str(&collect_artifacts(&output, &artifacts)?);
-    for binary in ["td-mta", "td-crypto-smoke", "td-mta-config-smoke", "td-mta-format-smoke"] {
+    for binary in [
+        "td-mta",
+        "td-crypto-smoke",
+        "td-mta-config-smoke",
+        "td-mta-format-smoke",
+    ] {
         qualify_binary(&artifacts.join(binary))?;
     }
     let runtime = vec![
@@ -890,18 +929,36 @@ mod tests {
     fn stack_measurement_requires_one_bounded_decimal_observation() {
         for (prefix, ceiling, size) in [
             ("config_stack_mapping_bytes=", 176 * 1024, 167936),
-            ("config_materialized_stack_mapping_bytes=", 256 * 1024, 249856),
+            (
+                "config_materialized_stack_mapping_bytes=",
+                256 * 1024,
+                249856,
+            ),
         ] {
-            assert_eq!(stack_evidence(&format!("noise\n{prefix}{size}\n"), prefix, ceiling).unwrap(), size);
-            assert_eq!(stack_evidence(&format!("{prefix}{ceiling}"), prefix, ceiling).unwrap(), ceiling);
+            assert_eq!(
+                stack_evidence(&format!("noise\n{prefix}{size}\n"), prefix, ceiling).unwrap(),
+                size
+            );
+            assert_eq!(
+                stack_evidence(&format!("{prefix}{ceiling}"), prefix, ceiling).unwrap(),
+                ceiling
+            );
             let other = if prefix == "config_stack_mapping_bytes=" {
                 "config_materialized_stack_mapping_bytes="
-            } else { "config_stack_mapping_bytes=" };
+            } else {
+                "config_stack_mapping_bytes="
+            };
             assert!(stack_evidence(&format!("{other}1000"), prefix, ceiling).is_err());
-            for bad in [String::new(), prefix.to_owned(), format!("{prefix}0"),
-                format!("{prefix}{}", ceiling + 1), format!("{prefix}+1"),
+            for bad in [
+                String::new(),
+                prefix.to_owned(),
+                format!("{prefix}0"),
+                format!("{prefix}{}", ceiling + 1),
+                format!("{prefix}+1"),
                 format!("{prefix}9999999999999999999999999999"),
-                format!("{prefix}1\n{prefix}1"), "unrelated_mapping=1".into()] {
+                format!("{prefix}1\n{prefix}1"),
+                "unrelated_mapping=1".into(),
+            ] {
                 assert!(stack_evidence(&bad, prefix, ceiling).is_err(), "{bad}");
             }
         }
@@ -913,7 +970,13 @@ mod tests {
         let output = scratch.0.join("output");
         let source = output.join("artifacts");
         fs::create_dir_all(&source).unwrap();
-        for name in ["td-mta", "td-crypto-smoke", "td-mta-config-smoke", "td-mta-format-smoke", "COMMANDS"] {
+        for name in [
+            "td-mta",
+            "td-crypto-smoke",
+            "td-mta-config-smoke",
+            "td-mta-format-smoke",
+            "COMMANDS",
+        ] {
             fs::write(source.join(name), name).unwrap();
         }
         fs::remove_file(source.join("td-mta-format-smoke")).unwrap();
@@ -976,7 +1039,12 @@ mod tests {
             artifact_path(record, "td-mta", ArtifactKind::Installed).unwrap(),
             Path::new("/output/target/td-mta")
         );
-        assert!(artifact_path(&format!("{record}\n{record}"), "td-mta", ArtifactKind::Installed).is_err());
+        assert!(artifact_path(
+            &format!("{record}\n{record}"),
+            "td-mta",
+            ArtifactKind::Installed
+        )
+        .is_err());
         assert!(artifact_path(record, "td-mta", ArtifactKind::LibraryTest).is_err());
         assert!(artifact_path(record, "td_crypto", ArtifactKind::Installed).is_err());
         assert!(artifact_path(
@@ -993,7 +1061,9 @@ mod tests {
             .replace("\"bin\"", "\"lib\"")
             .replace("false", "true");
         assert!(artifact_path(&test, "td_crypto", ArtifactKind::LibraryTest).is_ok());
-        let integration = test.replace("td_crypto", "config_stack").replace("\"lib\"", "\"test\"");
+        let integration = test
+            .replace("td_crypto", "config_stack")
+            .replace("\"lib\"", "\"test\"");
         assert!(artifact_path(&integration, "config_stack", ArtifactKind::IntegrationTest).is_ok());
         assert!(artifact_path(&test, "td_crypto", ArtifactKind::IntegrationTest).is_err());
         assert!(artifact_path(&integration, "config_stack", ArtifactKind::LibraryTest).is_err());
@@ -1013,7 +1083,11 @@ mod tests {
             fs::create_dir(path.join(".cargo")).unwrap();
             fs::write(path.join(".cargo/config.toml"), "do not copy").unwrap();
         }
-        for relative in ["engine/src/sha256.rs", "td-secret/src/fido_p256.rs", "td-secret/tests/p256_vectors.txt"] {
+        for relative in [
+            "engine/src/sha256.rs",
+            "td-secret/src/fido_p256.rs",
+            "td-secret/tests/p256_vectors.txt",
+        ] {
             let input = root.join(relative);
             fs::create_dir_all(input.parent().unwrap()).unwrap();
             fs::write(input, relative).unwrap();
@@ -1021,25 +1095,54 @@ mod tests {
         fs::write(root.join("engine/src/not-an-oracle.rs"), "excluded").unwrap();
         let destination = scratch.0.join("staged");
         stage_sources(&root, &destination).unwrap();
-        for relative in ["engine/src/sha256.rs", "td-secret/src/fido_p256.rs", "td-secret/tests/p256_vectors.txt"] {
-            assert_eq!(fs::read(destination.join(relative)).unwrap(), relative.as_bytes());
+        for relative in [
+            "engine/src/sha256.rs",
+            "td-secret/src/fido_p256.rs",
+            "td-secret/tests/p256_vectors.txt",
+        ] {
+            assert_eq!(
+                fs::read(destination.join(relative)).unwrap(),
+                relative.as_bytes()
+            );
         }
         assert!(!destination.join("engine/src/not-an-oracle.rs").exists());
         fs::remove_file(root.join("td-secret/tests/p256_vectors.txt")).unwrap();
         assert!(stage_sources(&root, &scratch.0.join("missing-oracle"))
-            .unwrap_err().starts_with("inspect oracle source:"));
-        symlink("../../engine/src/sha256.rs", root.join("td-secret/tests/p256_vectors.txt")).unwrap();
-        assert_eq!(stage_sources(&root, &scratch.0.join("linked-oracle")).unwrap_err(),
-            "oracle sources must be regular files, not links");
+            .unwrap_err()
+            .starts_with("inspect oracle source:"));
+        symlink(
+            "../../engine/src/sha256.rs",
+            root.join("td-secret/tests/p256_vectors.txt"),
+        )
+        .unwrap();
+        assert_eq!(
+            stage_sources(&root, &scratch.0.join("linked-oracle")).unwrap_err(),
+            "oracle sources must be regular files, not links"
+        );
         fs::remove_file(root.join("td-secret/tests/p256_vectors.txt")).unwrap();
         fs::write(root.join("td-secret/tests/p256_vectors.txt"), "restored").unwrap();
-        for (index, relative) in ["engine", "engine/src", "td-secret", "td-secret/src", "td-secret/tests"].iter().enumerate() {
+        for (index, relative) in [
+            "engine",
+            "engine/src",
+            "td-secret",
+            "td-secret/src",
+            "td-secret/tests",
+        ]
+        .iter()
+        .enumerate()
+        {
             let source = root.join(relative);
             let retained = scratch.0.join("retained-oracle-directory");
             fs::rename(&source, &retained).unwrap();
             symlink(&retained, &source).unwrap();
-            assert_eq!(stage_sources(&root, &scratch.0.join(format!("linked-oracle-parent-{index}"))).unwrap_err(),
-                "oracle source ancestors must be directories, not links");
+            assert_eq!(
+                stage_sources(
+                    &root,
+                    &scratch.0.join(format!("linked-oracle-parent-{index}"))
+                )
+                .unwrap_err(),
+                "oracle source ancestors must be directories, not links"
+            );
             fs::remove_file(&source).unwrap();
             fs::rename(&retained, &source).unwrap();
         }

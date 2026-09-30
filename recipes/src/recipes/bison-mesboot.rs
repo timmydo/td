@@ -1,4 +1,4 @@
-use crate::ladder::{SH, mesboot0_inputs, mesboot0_path, unpack_into};
+use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, SH};
 use crate::types::{Recipe, Step};
 
 // GNU Bison 3.8.2 — the parser generator glibc 2.41's configure requires
@@ -97,7 +97,13 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("bison-mesboot", "3.8.2")
         .source_input("bison-mesboot-source")
-        .native_inputs(&["gcc-14", "glibc-mesboot", "binutils-244", "make-mesboot", "m4-mesboot"])
+        .native_inputs(&[
+            "gcc-14",
+            "glibc-mesboot",
+            "binutils-244",
+            "make-mesboot",
+            "m4-mesboot",
+        ])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
 }

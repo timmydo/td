@@ -3,7 +3,7 @@
 //! hex0-seed + 618-byte kaem-optional-seed (inside the pinned upstream stage0-posix source).
 //! This gate runs the seed kaem build with guix/Guile SCRUBBED from env, producing the first
 //! stage0 artifacts (a full hex0 + kaem-0) — no guix process, no /gnu/store in the build.
-//! 
+//!
 //! The driver is a STRUCTURED Rust recipe — `td-builder bootstrap-recipe seed`
 //! (builder/src/bootstrap.rs, rust-migration C2): the old shell tests/bootstrap-seed.sh was
 //! ported to typed Rust data + the shared leg runner and DELETED — no shell oracle kept (this is

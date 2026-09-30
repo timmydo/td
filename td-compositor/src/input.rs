@@ -202,20 +202,36 @@ impl KeyBindings {
             return decision;
         }
         if self.attention != AttentionState::Closed {
-            if self.attention == AttentionState::Open && !self.secret_selected && !logical_pressed && event.value == KEY_PRESS {
+            if self.attention == AttentionState::Open
+                && !self.secret_selected
+                && !logical_pressed
+                && event.value == KEY_PRESS
+            {
                 decision.secret = match event.code {
                     KEY_W => Some(crate::secret_client::Selection::Write),
                     KEY_I => Some(crate::secret_client::Selection::Install),
-                    KEY_U => Some(crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Primary)),
-                    KEY_R => Some(crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Recovery)),
-                    KEY_E => Some(crate::secret_client::Selection::Enroll(crate::authority::consent::Recovery::SecondToken)),
-                    KEY_X => Some(crate::secret_client::Selection::Enroll(crate::authority::consent::Recovery::Unrecoverable)),
+                    KEY_U => Some(crate::secret_client::Selection::Unlock(
+                        crate::authority::consent::Role::Primary,
+                    )),
+                    KEY_R => Some(crate::secret_client::Selection::Unlock(
+                        crate::authority::consent::Role::Recovery,
+                    )),
+                    KEY_E => Some(crate::secret_client::Selection::Enroll(
+                        crate::authority::consent::Recovery::SecondToken,
+                    )),
+                    KEY_X => Some(crate::secret_client::Selection::Enroll(
+                        crate::authority::consent::Recovery::Unrecoverable,
+                    )),
                     _ => None,
                 };
                 self.secret_selected |= decision.secret.is_some();
             }
-            if self.attention == AttentionState::Open && self.secret_selected && !logical_pressed
-                && event.value == KEY_PRESS && event.code == KEY_ENTER {
+            if self.attention == AttentionState::Open
+                && self.secret_selected
+                && !logical_pressed
+                && event.value == KEY_PRESS
+                && event.code == KEY_ENTER
+            {
                 decision.confirm_install = Some(event.timestamp);
             }
             if self.attention == AttentionState::Open
@@ -706,7 +722,9 @@ struct PointerFrame {
 }
 
 trait InputTarget {
-    fn confirm_install(&mut self, _timestamp: u128) -> Result<(), String> { Ok(()) }
+    fn confirm_install(&mut self, _timestamp: u128) -> Result<(), String> {
+        Ok(())
+    }
     fn secret_request(&mut self, _role: crate::secret_client::Selection) -> Result<(), String> {
         Err("secret requests unavailable on this input target".into())
     }
@@ -825,7 +843,11 @@ impl AutomationSeat {
                 value: if pressed { KEY_PRESS } else { KEY_RELEASE },
             },
         );
-        deliver_key_decision(&mut AutomationTarget { runtime }, &mut self.bindings, decision)
+        deliver_key_decision(
+            &mut AutomationTarget { runtime },
+            &mut self.bindings,
+            decision,
+        )
     }
 
     pub(crate) fn release_keys(&mut self, runtime: &mut Runtime, time: u32) -> Result<(), String> {
@@ -844,36 +866,60 @@ impl AutomationSeat {
         report: AutomationPointer,
     ) -> Result<(), AutomationFailure> {
         Self::admit(runtime)?;
-        report.validate(runtime.width(), runtime.height()).map_err(AutomationFailure::Refused)?;
-        let width = u32::try_from(runtime.width())
-            .map_err(|_| "output width outside u32".to_string())?;
-        let height = u32::try_from(runtime.height())
-            .map_err(|_| "output height outside u32".to_string())?;
+        report
+            .validate(runtime.width(), runtime.height())
+            .map_err(AutomationFailure::Refused)?;
+        let width =
+            u32::try_from(runtime.width()).map_err(|_| "output width outside u32".to_string())?;
+        let height =
+            u32::try_from(runtime.height()).map_err(|_| "output height outside u32".to_string())?;
         let mut pressed = BTreeSet::new();
         let mut buttons = Vec::new();
         for code in BTN_MOUSE..=BTN_TASK {
-            let bit = 1u8.checked_shl(u32::from(code - BTN_MOUSE))
+            let bit = 1u8
+                .checked_shl(u32::from(code - BTN_MOUSE))
                 .ok_or_else(|| "automation button code exceeds its mask".to_string())?;
             let down = report.buttons & bit != 0;
             if down {
                 pressed.insert(code);
             }
-            if down != self.bindings.pointer_pressed.contains(&(Self::POINTER, code)) {
-                buttons.push(PointerButtonTransition { code, pressed: down });
+            if down
+                != self
+                    .bindings
+                    .pointer_pressed
+                    .contains(&(Self::POINTER, code))
+            {
+                buttons.push(PointerButtonTransition {
+                    code,
+                    pressed: down,
+                });
             }
         }
         let frame = PointerFrame {
             time: report.time,
             place: PointerPlace::At {
-                x: Fraction { numerator: report.x, denominator: width },
-                y: Fraction { numerator: report.y, denominator: height },
+                x: Fraction {
+                    numerator: report.x,
+                    denominator: width,
+                },
+                y: Fraction {
+                    numerator: report.y,
+                    denominator: height,
+                },
             },
             buttons,
-            scroll: PointerScroll { vertical: report.vertical, horizontal: report.horizontal },
+            scroll: PointerScroll {
+                vertical: report.vertical,
+                horizontal: report.horizontal,
+            },
         };
         let mut target = AutomationTarget { runtime };
         let delivery = deliver_pointer_frame(
-            &mut target, &mut self.bindings, Self::POINTER, &frame, &pressed,
+            &mut target,
+            &mut self.bindings,
+            Self::POINTER,
+            &frame,
+            &pressed,
         );
         // A control request is a complete batch; settle cursor paint even if
         // another part of delivery failed after changing the scene.
@@ -884,7 +930,10 @@ impl AutomationSeat {
         Self::admit(runtime)?;
         let keyboard = self.release_keys(runtime, time);
         let pointer = release_device_locked(
-            &Mutex::new(AutomationTarget { runtime }), Self::POINTER, &mut self.bindings, time,
+            &Mutex::new(AutomationTarget { runtime }),
+            Self::POINTER,
+            &mut self.bindings,
+            time,
         );
         automation_outcome([keyboard, pointer, runtime.flush_paint()])
     }
@@ -1001,12 +1050,20 @@ impl LiveInputTarget {
 
 impl InputTarget for LiveInputTarget {
     fn confirm_install(&mut self, timestamp: u128) -> Result<(), String> {
-        if let Some(attempt) = &self.secret_attempt { attempt.confirm_install(&EvdevOrigin { _private: () }, timestamp)?; }
+        if let Some(attempt) = &self.secret_attempt {
+            attempt.confirm_install(&EvdevOrigin { _private: () }, timestamp)?;
+        }
         Ok(())
     }
     fn secret_request(&mut self, role: crate::secret_client::Selection) -> Result<(), String> {
-        if self.secret_attempt.is_some() { return Err("physical attention already consumed a request".into()); }
-        let attempt = crate::secret_client::Attempt::new(EvdevOrigin { _private: () }, Arc::clone(&self.runtime), role);
+        if self.secret_attempt.is_some() {
+            return Err("physical attention already consumed a request".into());
+        }
+        let attempt = crate::secret_client::Attempt::new(
+            EvdevOrigin { _private: () },
+            Arc::clone(&self.runtime),
+            role,
+        );
         self.secret_attempt = Some(Arc::clone(&attempt));
         if let Err(error) = attempt.notice(crate::attention::Notice::Pending) {
             let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
@@ -1026,7 +1083,9 @@ impl InputTarget for LiveInputTarget {
     }
 
     fn drain_attention(&mut self) -> Result<(), String> {
-        if let Some(attempt) = &self.secret_attempt { attempt.cancel(); }
+        if let Some(attempt) = &self.secret_attempt {
+            attempt.cancel();
+        }
         self.runtime
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
@@ -1035,7 +1094,9 @@ impl InputTarget for LiveInputTarget {
 
     fn attention(&mut self, visible: bool) -> Result<u128, String> {
         if !visible {
-            if let Some(attempt) = &self.secret_attempt { attempt.cancel(); }
+            if let Some(attempt) = &self.secret_attempt {
+                attempt.cancel();
+            }
         }
         self.runtime
             .lock()
@@ -1572,7 +1633,9 @@ fn deliver_key_decision<T: InputTarget>(
             finish_attention(runtime, bindings)?;
         }
     }
-    if let Some(timestamp) = decision.confirm_install { runtime.confirm_install(timestamp)?; }
+    if let Some(timestamp) = decision.confirm_install {
+        runtime.confirm_install(timestamp)?;
+    }
     if let Some(role) = decision.secret {
         runtime.secret_request(role)?;
     }
@@ -2013,7 +2076,11 @@ pub fn start(
         attention_enabled,
         ..KeyBindings::default()
     }));
-    let target = Arc::new(Mutex::new(LiveInputTarget { runtime, launches, secret_attempt: None }));
+    let target = Arc::new(Mutex::new(LiveInputTarget {
+        runtime,
+        launches,
+        secret_attempt: None,
+    }));
     for (device, (path, mut file)) in devices.into_iter().enumerate() {
         if attention_enabled {
             sys::input_monotonic_clock(&file)?;
@@ -2141,24 +2208,40 @@ mod tests {
 
     fn automation_runtime() -> (Cleanup, Runtime) {
         let cleanup = Cleanup(std::env::temp_dir().join(format!(
-            "td-automation-input-{}-{}", std::process::id(),
+            "td-automation-input-{}-{}",
+            std::process::id(),
             TEST_SEQ.fetch_add(1, Ordering::Relaxed),
         )));
-        let framebuffer = crate::framebuffer::Framebuffer::test_file(
-            &cleanup.0, 320, 200, 320 * 4,
-        ).unwrap();
+        let framebuffer =
+            crate::framebuffer::Framebuffer::test_file(&cleanup.0, 320, 200, 320 * 4).unwrap();
         let mut runtime = Runtime::new(framebuffer);
-        runtime.commit(
-            crate::scene::SurfaceKey { client: 1, object: 1 },
-            crate::buffer::Surface::from_shm_pixels(
-                100, 100, [1, 2, 3, 0].repeat(10_000), crate::scene::SHM_XRGB8888,
-            ).unwrap(),
-        ).unwrap();
+        runtime
+            .commit(
+                crate::scene::SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                crate::buffer::Surface::from_shm_pixels(
+                    100,
+                    100,
+                    [1, 2, 3, 0].repeat(10_000),
+                    crate::scene::SHM_XRGB8888,
+                )
+                .unwrap(),
+            )
+            .unwrap();
         (cleanup, runtime)
     }
 
     fn pointer_report(x: u32, y: u32, buttons: u8) -> AutomationPointer {
-        AutomationPointer { time: 10, x, y, buttons, vertical: 0, horizontal: 0 }
+        AutomationPointer {
+            time: 10,
+            x,
+            y,
+            buttons,
+            vertical: 0,
+            horizontal: 0,
+        }
     }
 
     #[test]
@@ -2167,14 +2250,26 @@ mod tests {
         use crate::runtime::KeyboardDelivery;
         let (_cleanup, mut runtime) = automation_runtime();
         let active = || Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let (events, _stop) = runtime.subscribe_input_with_activity(1, active(), active())
-            .unwrap().split();
+        let (events, _stop) = runtime
+            .subscribe_input_with_activity(1, active(), active())
+            .unwrap()
+            .split();
         let mut seat = AutomationSeat::default();
         runtime.take_writes();
-        seat.pointer(&mut runtime, pointer_report(70, 90, 0)).unwrap();
-        assert!(!runtime.take_writes().is_empty(), "cursor paint was left pending");
+        seat.pointer(&mut runtime, pointer_report(70, 90, 0))
+            .unwrap();
+        assert!(
+            !runtime.take_writes().is_empty(),
+            "cursor paint was left pending"
+        );
         let target = runtime.pointer_snapshot().focus.unwrap();
-        assert_eq!(target.surface, crate::scene::SurfaceKey { client: 1, object: 1 });
+        assert_eq!(
+            target.surface,
+            crate::scene::SurfaceKey {
+                client: 1,
+                object: 1
+            }
+        );
         let mut report = pointer_report(75, 95, 1);
         report.vertical = 2;
         report.horizontal = -3;
@@ -2182,25 +2277,42 @@ mod tests {
         let focused = runtime.pointer_snapshot().focus.unwrap();
         assert_eq!((focused.x - target.x, focused.y - target.y), (5, 5));
         let pointer_events = |events: &std::sync::mpsc::Receiver<KeyboardDelivery>| {
-            events.try_iter().filter_map(|delivery| match delivery {
-                KeyboardDelivery::Pointer(frame) => Some(frame.events),
-                _ => None,
-            }).flatten().collect::<Vec<_>>()
+            events
+                .try_iter()
+                .filter_map(|delivery| match delivery {
+                    KeyboardDelivery::Pointer(frame) => Some(frame.events),
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>()
         };
         let delivered = pointer_events(&events);
-        assert_eq!(delivered.iter().filter(|event| matches!(event,
+        assert_eq!(
+            delivered
+                .iter()
+                .filter(|event| matches!(event,
             PointerEvent::Button { input, .. } if input.state == PointerButtonState::Pressed
-                && input.button == 272 && input.time == 10)).count(), 1);
+                && input.button == 272 && input.time == 10))
+                .count(),
+            1
+        );
         for (axis, detents) in [(PointerAxis::Vertical, -2), (PointerAxis::Horizontal, -3)] {
             assert!(delivered.iter().any(|event| matches!(event,
                 PointerEvent::Axis { step, time: 10, .. }
                     if step.axis == axis && step.detents == detents)));
         }
-        seat.pointer(&mut runtime, pointer_report(75, 95, 1)).unwrap();
-        assert!(pointer_events(&events).is_empty(), "unchanged held mask pressed twice");
+        seat.pointer(&mut runtime, pointer_report(75, 95, 1))
+            .unwrap();
+        assert!(
+            pointer_events(&events).is_empty(),
+            "unchanged held mask pressed twice"
+        );
         // The client grab keeps motion and release even over compositor chrome.
         seat.pointer(&mut runtime, pointer_report(3, 3, 1)).unwrap();
-        assert_eq!(runtime.pointer_snapshot().focus.unwrap().surface, target.surface);
+        assert_eq!(
+            runtime.pointer_snapshot().focus.unwrap().surface,
+            target.surface
+        );
         seat.key(&mut runtime, 11, KEY_LEFTSHIFT, true).unwrap();
         seat.release_keys(&mut runtime, 12).unwrap();
         assert!(seat.bindings.pointer_forwarded.contains(&272));
@@ -2210,9 +2322,15 @@ mod tests {
         assert!(seat.bindings.pointer_pressed.is_empty());
         assert!(seat.bindings.pointer_forwarded.is_empty());
         let released = pointer_events(&events);
-        assert_eq!(released.iter().filter(|event| matches!(event,
+        assert_eq!(
+            released
+                .iter()
+                .filter(|event| matches!(event,
             PointerEvent::Button { input, .. } if input.state == PointerButtonState::Released
-                && input.button == 272 && input.time == 13)).count(), 1);
+                && input.button == 272 && input.time == 13))
+                .count(),
+            1
+        );
         seat.release_all(&mut runtime, 14).unwrap();
         assert!(pointer_events(&events).is_empty());
     }
@@ -2221,14 +2339,22 @@ mod tests {
     fn automation_pointer_refuses_bounds_and_attention_without_mutation() {
         let (_cleanup, mut runtime) = automation_runtime();
         let mut seat = AutomationSeat::default();
-        seat.pointer(&mut runtime, pointer_report(70, 90, 1)).unwrap();
+        seat.pointer(&mut runtime, pointer_report(70, 90, 1))
+            .unwrap();
         let before = runtime.pointer_snapshot();
         let owned = seat.bindings.pointer_pressed.clone();
         for report in [
-            pointer_report(320, 0, 0), pointer_report(0, 200, 0),
+            pointer_report(320, 0, 0),
+            pointer_report(0, 200, 0),
             pointer_report(u32::MAX, 0, 0),
-            AutomationPointer { vertical: i32::MIN, ..pointer_report(70, 90, 0) },
-            AutomationPointer { horizontal: 121, ..pointer_report(70, 90, 0) },
+            AutomationPointer {
+                vertical: i32::MIN,
+                ..pointer_report(70, 90, 0)
+            },
+            AutomationPointer {
+                horizontal: 121,
+                ..pointer_report(70, 90, 0)
+            },
         ] {
             assert!(seat.pointer(&mut runtime, report).is_err());
             assert_eq!(runtime.pointer_snapshot(), before);
@@ -2251,7 +2377,9 @@ mod tests {
         let (_cleanup, mut runtime) = automation_runtime();
         let mut seat = AutomationSeat::default();
         runtime.fail_next_repaint();
-        assert!(seat.pointer(&mut runtime, pointer_report(70, 90, 255)).is_err());
+        assert!(seat
+            .pointer(&mut runtime, pointer_report(70, 90, 255))
+            .is_err());
         assert_eq!(seat.bindings.pointer_pressed.len(), 8);
         assert_eq!(seat.bindings.pointer_forwarded.len(), 8);
         runtime.clear_repaint_failure();
@@ -2272,29 +2400,43 @@ mod tests {
         keys.key(&mut runtime, 12, KEY_A, true).unwrap();
         assert_eq!(runtime.keyboard_snapshot().keys, [30, 42]);
         assert_eq!(runtime.keyboard_snapshot().modifiers.depressed, MOD_SHIFT);
-        let delivered: Vec<_> = events.try_iter().filter_map(|delivery| match delivery {
-            KeyboardDelivery::Event(event) => Some(event.event),
-            _ => None,
-        }).collect();
-        let pressed: Vec<_> = delivered.iter().filter_map(|event| match event {
-            KeyboardEvent::Key { input, .. } => Some((input.time, input.key, input.state)),
-            _ => None,
-        }).collect();
-        assert_eq!(pressed, [(10, 42, KeyState::Pressed), (11, 30, KeyState::Pressed)]);
+        let delivered: Vec<_> = events
+            .try_iter()
+            .filter_map(|delivery| match delivery {
+                KeyboardDelivery::Event(event) => Some(event.event),
+                _ => None,
+            })
+            .collect();
+        let pressed: Vec<_> = delivered
+            .iter()
+            .filter_map(|event| match event {
+                KeyboardEvent::Key { input, .. } => Some((input.time, input.key, input.state)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pressed,
+            [(10, 42, KeyState::Pressed), (11, 30, KeyState::Pressed)]
+        );
         assert!(delivered.iter().any(|event| matches!(event,
             KeyboardEvent::Modifiers { state, .. } if state.depressed == MOD_SHIFT)));
         keys.release_keys(&mut runtime, 13).unwrap();
         assert!(runtime.keyboard_snapshot().keys.is_empty());
         assert_eq!(runtime.keyboard_snapshot().modifiers.depressed, 0);
-        let released: Vec<_> = events.try_iter().filter_map(|delivery| match delivery {
-            KeyboardDelivery::Event(event) => match event.event {
-                KeyboardEvent::Key { input, .. } => Some(input),
+        let released: Vec<_> = events
+            .try_iter()
+            .filter_map(|delivery| match delivery {
+                KeyboardDelivery::Event(event) => match event.event {
+                    KeyboardEvent::Key { input, .. } => Some(input),
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
-        }).collect();
+            })
+            .collect();
         assert_eq!(released.len(), 2);
-        assert!(released.iter().all(|input| input.time == 13 && input.state == KeyState::Released));
+        assert!(released
+            .iter()
+            .all(|input| input.time == 13 && input.state == KeyState::Released));
         keys.release_keys(&mut runtime, 14).unwrap();
         keys.key(&mut runtime, 15, KEY_A, false).unwrap();
         assert!(events.try_recv().is_err());
@@ -2311,7 +2453,10 @@ mod tests {
         for code in [KEY_LEFTCTRL, KEY_LEFTALT, KEY_ESC] {
             keys.key(&mut runtime, 1, code, true).unwrap();
         }
-        assert!(runtime.keyboard_snapshot().keys.contains(&u32::from(KEY_ESC)));
+        assert!(runtime
+            .keyboard_snapshot()
+            .keys
+            .contains(&u32::from(KEY_ESC)));
         assert!(runtime.keyboard_snapshot().focus.is_some());
         assert!(keys.bindings.attention == AttentionState::Closed);
         keys.release_keys(&mut runtime, 2).unwrap();
@@ -2326,12 +2471,25 @@ mod tests {
             assert!(keys.key(&mut runtime, 4, code, true).is_err());
         }
         assert_eq!(runtime.keyboard_snapshot(), before);
-        let mut target = AutomationTarget { runtime: &mut runtime };
+        let mut target = AutomationTarget {
+            runtime: &mut runtime,
+        };
         assert!(target.attention(true).is_err());
         assert!(target.drain_attention().is_err());
-        let source = include_str!("input.rs").split_once("impl AutomationSeat {").unwrap().1
-            .split_once("impl LiveInputTarget {").unwrap().0;
-        for forbidden in ["EvdevOrigin", "sys::", "Command::new", "enable_attention(", ".attention("] {
+        let source = include_str!("input.rs")
+            .split_once("impl AutomationSeat {")
+            .unwrap()
+            .1
+            .split_once("impl LiveInputTarget {")
+            .unwrap()
+            .0;
+        for forbidden in [
+            "EvdevOrigin",
+            "sys::",
+            "Command::new",
+            "enable_attention(",
+            ".attention(",
+        ] {
             assert!(!source.contains(forbidden), "{forbidden}");
         }
     }
@@ -2359,8 +2517,10 @@ mod tests {
             "key 00000000000000000000000000000007 0 30 down",
             "release-keys 00000000000000000000000000000007 1",
         ] {
-            assert_eq!(crate::control::answer(&runtime, request),
-                "error input automation is disabled\n");
+            assert_eq!(
+                crate::control::answer(&runtime, request),
+                "error input automation is disabled\n"
+            );
         }
         assert_eq!(runtime.lock().unwrap().keyboard_snapshot(), before);
     }
@@ -5608,18 +5768,39 @@ mod tests {
     }
     #[test]
     fn physical_attention_notice_failure_retains_capture_and_accepts_escape() {
-        let cleanup = Cleanup(std::env::temp_dir().join(format!("td-input-secret-notice-{}-{}", std::process::id(), TEST_SEQ.fetch_add(1, Ordering::Relaxed))));
-        let framebuffer = crate::framebuffer::Framebuffer::test_file(&cleanup.0, 800, 600, 3200).unwrap();
+        let cleanup = Cleanup(std::env::temp_dir().join(format!(
+            "td-input-secret-notice-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let framebuffer =
+            crate::framebuffer::Framebuffer::test_file(&cleanup.0, 800, 600, 3200).unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         runtime.lock().unwrap().enable_attention(true);
         let launches = LaunchProcesses::new(LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
             client: Some(PathBuf::from("/bin/td-ui-demo")),
-            terminal: PathBuf::from("/bin/td-term"), application: None,
-        }).unwrap();
-        let mut target = LiveInputTarget { runtime: Arc::clone(&runtime), launches: LaunchBackend::Direct(launches), secret_attempt: None };
-        let mut bindings = KeyBindings { attention_enabled: true, ..KeyBindings::default() };
-        for event in [key(KEY_LEFTCTRL, KEY_PRESS), key(KEY_LEFTALT, KEY_PRESS), key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE), key(KEY_LEFTCTRL, KEY_RELEASE), key(KEY_LEFTALT, KEY_RELEASE)] {
+            terminal: PathBuf::from("/bin/td-term"),
+            application: None,
+        })
+        .unwrap();
+        let mut target = LiveInputTarget {
+            runtime: Arc::clone(&runtime),
+            launches: LaunchBackend::Direct(launches),
+            secret_attempt: None,
+        };
+        let mut bindings = KeyBindings {
+            attention_enabled: true,
+            ..KeyBindings::default()
+        };
+        for event in [
+            key(KEY_LEFTCTRL, KEY_PRESS),
+            key(KEY_LEFTALT, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_ESC, KEY_RELEASE),
+            key(KEY_LEFTCTRL, KEY_RELEASE),
+            key(KEY_LEFTALT, KEY_RELEASE),
+        ] {
             let decision = bindings.feed(event);
             deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
         }
@@ -5664,11 +5845,17 @@ mod tests {
             }
             assert!(target.lock().unwrap().secret_roles.is_empty());
             for event in [
-                key(KEY_LEFTCTRL, KEY_PRESS), key(KEY_LEFTALT, KEY_PRESS),
-                key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE),
-                key(KEY_LEFTCTRL, KEY_RELEASE), key(KEY_LEFTALT, KEY_RELEASE),
-                key(code, KEY_PRESS), key(code, KEY_REPEAT), key(code, KEY_RELEASE),
-                key(KEY_U, KEY_PRESS), key(KEY_U, KEY_RELEASE),
+                key(KEY_LEFTCTRL, KEY_PRESS),
+                key(KEY_LEFTALT, KEY_PRESS),
+                key(KEY_ESC, KEY_PRESS),
+                key(KEY_ESC, KEY_RELEASE),
+                key(KEY_LEFTCTRL, KEY_RELEASE),
+                key(KEY_LEFTALT, KEY_RELEASE),
+                key(code, KEY_PRESS),
+                key(code, KEY_REPEAT),
+                key(code, KEY_RELEASE),
+                key(KEY_U, KEY_PRESS),
+                key(KEY_U, KEY_RELEASE),
             ] {
                 apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
             }
@@ -5682,19 +5869,43 @@ mod tests {
     fn physical_attention_requires_a_fresh_explicit_enrollment_choice() {
         use crate::authority::consent::Recovery;
         use crate::secret_client::Selection;
-        for (code, selection) in [(KEY_E, Selection::Enroll(Recovery::SecondToken)), (KEY_X, Selection::Enroll(Recovery::Unrecoverable)), (KEY_W, Selection::Write), (KEY_I, Selection::Install)] {
-            let mut bindings = KeyBindings { attention_enabled: true, ..KeyBindings::default() };
+        for (code, selection) in [
+            (KEY_E, Selection::Enroll(Recovery::SecondToken)),
+            (KEY_X, Selection::Enroll(Recovery::Unrecoverable)),
+            (KEY_W, Selection::Write),
+            (KEY_I, Selection::Install),
+        ] {
+            let mut bindings = KeyBindings {
+                attention_enabled: true,
+                ..KeyBindings::default()
+            };
             let mut target = RecordingTarget::default();
             assert!(bindings.feed(key(code, KEY_PRESS)).secret.is_none());
-            for event in [key(KEY_LEFTCTRL, KEY_PRESS), key(KEY_LEFTALT, KEY_PRESS), key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE), key(KEY_LEFTCTRL, KEY_RELEASE), key(KEY_LEFTALT, KEY_RELEASE)] {
+            for event in [
+                key(KEY_LEFTCTRL, KEY_PRESS),
+                key(KEY_LEFTALT, KEY_PRESS),
+                key(KEY_ESC, KEY_PRESS),
+                key(KEY_ESC, KEY_RELEASE),
+                key(KEY_LEFTCTRL, KEY_RELEASE),
+                key(KEY_LEFTALT, KEY_RELEASE),
+            ] {
                 let decision = bindings.feed(event);
                 deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
             }
             assert!(bindings.feed(key(code, KEY_REPEAT)).secret.is_none());
-            assert!(bindings.feed_device(1, key(code, KEY_PRESS)).secret.is_none());
+            assert!(bindings
+                .feed_device(1, key(code, KEY_PRESS))
+                .secret
+                .is_none());
             bindings.feed_device(1, key(code, KEY_RELEASE));
             bindings.feed(key(code, KEY_RELEASE));
-            for event in [key(code, KEY_PRESS), key(code, KEY_REPEAT), key(code, KEY_RELEASE), key(KEY_U, KEY_PRESS), key(KEY_U, KEY_RELEASE)] {
+            for event in [
+                key(code, KEY_PRESS),
+                key(code, KEY_REPEAT),
+                key(code, KEY_RELEASE),
+                key(KEY_U, KEY_PRESS),
+                key(KEY_U, KEY_RELEASE),
+            ] {
                 let decision = bindings.feed(event);
                 deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
             }
@@ -5704,31 +5915,66 @@ mod tests {
 
     #[test]
     fn physical_attention_selects_only_one_token_role_per_open() {
-        let mut bindings = KeyBindings { attention_enabled: true, ..KeyBindings::default() };
+        let mut bindings = KeyBindings {
+            attention_enabled: true,
+            ..KeyBindings::default()
+        };
         let mut target = RecordingTarget::default();
         for event in [key(KEY_U, KEY_PRESS), key(KEY_U, KEY_RELEASE)] {
             assert!(bindings.feed(event).secret.is_none());
         }
-        for event in [key(KEY_LEFTCTRL, KEY_PRESS), key(KEY_LEFTALT, KEY_PRESS), key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE), key(KEY_LEFTCTRL, KEY_RELEASE), key(KEY_LEFTALT, KEY_RELEASE)] {
+        for event in [
+            key(KEY_LEFTCTRL, KEY_PRESS),
+            key(KEY_LEFTALT, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_ESC, KEY_RELEASE),
+            key(KEY_LEFTCTRL, KEY_RELEASE),
+            key(KEY_LEFTALT, KEY_RELEASE),
+        ] {
             let decision = bindings.feed(event);
             deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
         }
-        for event in [key(KEY_R, KEY_PRESS), key(KEY_R, KEY_REPEAT), key(KEY_R, KEY_RELEASE), key(KEY_U, KEY_PRESS), key(KEY_U, KEY_RELEASE)] {
+        for event in [
+            key(KEY_R, KEY_PRESS),
+            key(KEY_R, KEY_REPEAT),
+            key(KEY_R, KEY_RELEASE),
+            key(KEY_U, KEY_PRESS),
+            key(KEY_U, KEY_RELEASE),
+        ] {
             let decision = bindings.feed(event);
             deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
         }
-        assert_eq!(target.secret_roles, [crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Recovery)]);
-        assert!(target.keys.iter().all(|key| key.key != u32::from(KEY_U) && key.key != u32::from(KEY_R)));
+        assert_eq!(
+            target.secret_roles,
+            [crate::secret_client::Selection::Unlock(
+                crate::authority::consent::Role::Recovery
+            )]
+        );
+        assert!(target
+            .keys
+            .iter()
+            .all(|key| key.key != u32::from(KEY_U) && key.key != u32::from(KEY_R)));
         for event in [key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE)] {
             let decision = bindings.feed(event);
             deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
         }
         assert!(bindings.attention == AttentionState::Closed);
-        for event in [key(KEY_LEFTCTRL, KEY_PRESS), key(KEY_LEFTALT, KEY_PRESS), key(KEY_ESC, KEY_PRESS), key(KEY_U, KEY_PRESS)] {
+        for event in [
+            key(KEY_LEFTCTRL, KEY_PRESS),
+            key(KEY_LEFTALT, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_U, KEY_PRESS),
+        ] {
             let decision = bindings.feed(event);
             deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
         }
-        assert_eq!(target.secret_roles, [crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Recovery), crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Primary)]);
+        assert_eq!(
+            target.secret_roles,
+            [
+                crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Recovery),
+                crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Primary)
+            ]
+        );
     }
 
     #[test]

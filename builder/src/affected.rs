@@ -141,9 +141,10 @@ fn local_source_crate(p: &str) -> Option<&'static str> {
     if p.contains("..") {
         return None;
     }
-    ["td-install-qemu-test"]
-        .into_iter()
-        .find(|name| p.strip_prefix(name).is_some_and(|rest| rest.starts_with('/')))
+    ["td-install-qemu-test"].into_iter().find(|name| {
+        p.strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -372,8 +373,14 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-login/src", "recipes/src/recipes/td-login.rs"),
     ("td-netd/src", "recipes/src/recipes/td-netd.rs"),
     ("td-secret/src", "recipes/src/recipes/td-secret.rs"),
-    ("recipes/src/fixtures", "recipes/src/recipes/td-secret-vm-test.rs"),
-    ("recipes/src/fixtures", "recipes/src/recipes/td-photo-test.rs"),
+    (
+        "recipes/src/fixtures",
+        "recipes/src/recipes/td-secret-vm-test.rs",
+    ),
+    (
+        "recipes/src/fixtures",
+        "recipes/src/recipes/td-photo-test.rs",
+    ),
     ("td-profiler/src", "recipes/src/recipes/td-profiler.rs"),
     ("td-seatd/src", "recipes/src/recipes/td-seatd.rs"),
     ("td-vm-guest/src", "recipes/src/recipes/td-vm-guest.rs"),
@@ -410,7 +417,12 @@ fn staged_destination(src_dir: &str, included: &str) -> Option<String> {
 
 /// `path` relative to the repository root, with `/` separators.
 fn repo_relative(root: &Path, path: &Path) -> Option<String> {
-    Some(path.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/"))
+    Some(
+        path.strip_prefix(root)
+            .ok()?
+            .to_string_lossy()
+            .replace('\\', "/"),
+    )
 }
 
 /// The DIRECTORY holding `path`, relative to the repository root. `#[path]`
@@ -449,7 +461,8 @@ fn path_includes(text: &str) -> Vec<(String, bool)> {
             }
             gated
         };
-        let gated = attr_run(&mut (0..i).rev()) || attr_run(&mut (i.saturating_add(1)..lines.len()));
+        let gated =
+            attr_run(&mut (0..i).rev()) || attr_run(&mut (i.saturating_add(1)..lines.len()));
         out.push((included.to_string(), gated));
     }
     out
@@ -1283,7 +1296,10 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // recipe-checks (which statically links + shape-asserts it via
     // td-netd-test). Its RECIPE files under recipes/src/recipes/ are routed by the
     // recipes arm above, not here.
-    if pattern_matches("td-netd/*|td-netd/src/*|td-netd/Cargo.toml|td-netd/Cargo.lock", p) {
+    if pattern_matches(
+        "td-netd/*|td-netd/src/*|td-netd/Cargo.toml|td-netd/Cargo.lock",
+        p,
+    ) {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
         sel.add_target("recipe-checks");
@@ -1663,9 +1679,7 @@ fn preflight_cmd(root: &Path, name: &str, changed: &[String]) -> Option<String> 
             Some("  CC=gcc cargo test --frozen --manifest-path net/Cargo.toml".to_string())
         }
         "affected-self-test" => Some("  td-builder affected-checks --self-test".to_string()),
-        "local-source-roster" => {
-            Some("  td-recipe-eval local-source-roster --check".to_string())
-        }
+        "local-source-roster" => Some("  td-recipe-eval local-source-roster --check".to_string()),
         _ => None,
     }
 }
@@ -1818,11 +1832,7 @@ pub(crate) fn blocking_untracked<'a>(root: &Path, paths: &[&'a str]) -> Vec<&'a 
 
 /// Whether ONE path routes to any check at all. Asking the real mapping beats
 /// guessing by extension.
-fn selects_checks_with(
-    root: &Path,
-    roster: &Result<Vec<GateCrate>, String>,
-    path: &str,
-) -> bool {
+fn selects_checks_with(root: &Path, roster: &Result<Vec<GateCrate>, String>, path: &str) -> bool {
     let mut sel = Selection::default();
     map_path(root, roster, path, &mut sel);
     // The catch-all arm adds `check` to EVERY unmapped path, so "selected
@@ -1949,7 +1959,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     macro_rules! assert_no_preflight {
         ($path:expr, $preflight:expr) => {
             if selects_preflight($path, $preflight) {
-                fail(format!("{}: must NOT select preflight '{}'", $path, $preflight));
+                fail(format!(
+                    "{}: must NOT select preflight '{}'",
+                    $path, $preflight
+                ));
             }
         };
     }
@@ -2087,11 +2100,17 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("builder/src/gate_bodies.rs", "store-native-profile");
     assert_target!("builder/src/gate_bodies.rs", "sandbox-hardening");
     assert_target!("builder/src/gate_bodies.rs", "toolchain-input-addressed");
-    assert_target!("builder/src/gate_bodies.rs", "toolchain-x86_64-input-addressed");
+    assert_target!(
+        "builder/src/gate_bodies.rs",
+        "toolchain-x86_64-input-addressed"
+    );
     // Their deleted shell drivers are tombstoned to the gate that absorbed each.
     assert_target!("tests/store-native-profile.sh", "store-native-profile");
     assert_target!("tests/sandbox-hardening.sh", "sandbox-hardening");
-    assert_target!("tests/toolchain-input-addressed.sh", "toolchain-input-addressed");
+    assert_target!(
+        "tests/toolchain-input-addressed.sh",
+        "toolchain-input-addressed"
+    );
     // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
     // catalog edit runs recipe-rs and the package build gates.
     assert_target!("recipes/src/catalog.rs", "recipe-rs");
@@ -2215,7 +2234,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // the self-comparison the note assertions had to avoid.
     for (src, _) in TARGET_INCLUDED_ENGINE_SOURCES {
         if !root.join(src).is_file() {
-            fail(format!("{src} is in TARGET_INCLUDED_ENGINE_SOURCES but does not exist"));
+            fail(format!(
+                "{src} is in TARGET_INCLUDED_ENGINE_SOURCES but does not exist"
+            ));
         }
     }
     // The ed25519 SPLIT, asserted against the tree because the compiler cannot
@@ -2268,7 +2289,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         let mut sources = Vec::new();
         collect_rs_recursive(&root.join(src_dir), &mut sources);
         if sources.is_empty() {
-            fail(format!("{src_dir} has no .rs files to check against {recipe_path}"));
+            fail(format!(
+                "{src_dir} has no .rs files to check against {recipe_path}"
+            ));
             continue;
         }
         // Comment-stripped, and that is not tidiness: a recipe's own prose
@@ -2423,7 +2446,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // `td-busd/*` already matches both, so these passed before the corpus
     // existed and would notice only a future narrowing of the matcher.
     assert_preflight!("td-busd/spec/libdbus-listnames.conversation", "cargo-test");
-    assert_preflight!("td-busd/spec/auth/external-successful.auth-script", "cargo-test");
+    assert_preflight!(
+        "td-busd/spec/auth/external-successful.auth-script",
+        "cargo-test"
+    );
     assert_preflight!("td-busd/examples/dbus-capture.rs", "cargo-test");
     assert_target!("td-busd/Cargo.lock", "check");
     assert_target!("td-busd/Cargo.lock", "recipe-checks");
@@ -2706,10 +2732,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-compositor/tools/import-libvterm.rs", "check");
     assert_preflight!("td-compositor/tools/import-libvterm.rs", "cargo-test");
     assert_target!("td-compositor/tools/libvterm-0.3.3.sources", "check");
-    assert_preflight!(
-        "td-compositor/tools/libvterm-0.3.3.sources",
-        "cargo-test"
-    );
+    assert_preflight!("td-compositor/tools/libvterm-0.3.3.sources", "cargo-test");
     assert_target!("td-compositor/spec/term/cursor.term", "check");
     assert_preflight!("td-compositor/spec/term/cursor.term", "cargo-test");
     assert_target!("td-compositor/Cargo.lock", "recipe-checks");
@@ -2762,7 +2785,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "td-boot/src/protocol.rs",
         "bootstrap-x86_64-native-gcc-store-native"
     );
-    assert_target!("td-boot/src/protocol.rs", "bootstrap-x86_64-self-gcc-store-native");
+    assert_target!(
+        "td-boot/src/protocol.rs",
+        "bootstrap-x86_64-self-gcc-store-native"
+    );
     assert_preflight!("td-boot/src/protocol.rs", "cargo-test");
     // realfile.rs is in that same class and pinned the same way: td-net
     // `#[path]`-includes it so the signer refuses what the verifier refuses,
@@ -2778,7 +2804,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "td-boot/src/realfile.rs",
         "bootstrap-x86_64-native-gcc-store-native"
     );
-    assert_target!("td-boot/src/realfile.rs", "bootstrap-x86_64-self-gcc-store-native");
+    assert_target!(
+        "td-boot/src/realfile.rs",
+        "bootstrap-x86_64-self-gcc-store-native"
+    );
     assert_preflight!("td-boot/src/realfile.rs", "cargo-test");
     assert_no_target!(
         "td-boot/src/main.rs",
@@ -2788,7 +2817,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "td-boot/src/main.rs",
         "bootstrap-x86_64-native-gcc-store-native"
     );
-    assert_no_target!("td-boot/src/main.rs", "bootstrap-x86_64-self-gcc-store-native");
+    assert_no_target!(
+        "td-boot/src/main.rs",
+        "bootstrap-x86_64-self-gcc-store-native"
+    );
     // Nothing builds td-review as a target artifact, so no -test recipe links
     // it — and it selects no check target at all, so these assert what RUNS
     // rather than only what is recorded: `cargo-test` is the whole selection,
@@ -2922,10 +2954,17 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
 /// git's lines, or `None` if the command failed — for the queries whose empty
 /// answer would otherwise be indistinguishable from success with no results.
 fn git_lines_checked(root: &Path, args: &[&str]) -> Option<Vec<String>> {
-    let out = Command::new("git").args(args).current_dir(root).output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect())
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .ok()?;
+    out.status.success().then(|| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    })
 }
 
 pub(crate) fn git_ok(root: &Path, args: &[&str]) -> bool {
@@ -2981,7 +3020,10 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
                     return fail(&e);
                 }
             }
-            println!("{} lock(s) verified against their named dependency policies", locks.len());
+            println!(
+                "{} lock(s) verified against their named dependency policies",
+                locks.len()
+            );
             ExitCode::SUCCESS
         }
         [op] if op == "cargo-cmds" => match gate_cargo_cmds(&root) {
@@ -2996,7 +3038,9 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
         },
         [op, action, flag, manifest] if op == "crypto-cargo" && flag == "--manifest-path" => {
             // The same manifest/config policy applies to direct wrapper calls.
-            if let Err(e) = dependency_free_locks(&root) { return fail(&e); }
+            if let Err(e) = dependency_free_locks(&root) {
+                return fail(&e);
+            }
             match crate::crypto_build::run(&root, action, manifest) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e),
@@ -3032,9 +3076,14 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
         [op, flag, archives] if op == "crypto-portable-build" && flag == "--archives" => {
             if let Err(e) = crate::crypto_build::validate(&root)
                 .and_then(|()| crate::check_loop::warm_crypto_sources(&root))
-            { return fail(&e); }
+            {
+                return fail(&e);
+            }
             match crate::crypto_isolated::build(&root, Path::new(archives)) {
-                Ok(path) => { println!("{}", path.display()); ExitCode::SUCCESS }
+                Ok(path) => {
+                    println!("{}", path.display());
+                    ExitCode::SUCCESS
+                }
                 Err(e) => fail(&e),
             }
         }
@@ -3064,7 +3113,9 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
                 return fail("native tests require the td-compositor roster crate");
             }
             match crate::native_tests::run(
-                &root, manifest, krate.trusted_test_root,
+                &root,
+                manifest,
+                krate.trusted_test_root,
                 krate.native_fixture_feature.as_deref(),
             ) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -3076,7 +3127,9 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             eprintln!("       td-builder gate-crates cargo-cmds");
             eprintln!("       td-builder gate-crates names");
             eprintln!("       td-builder gate-crates crypto-cargo test|clippy --manifest-path CRATE/Cargo.toml");
-            eprintln!("       td-builder gate-crates crypto-musl-headers --archive musl-1.2.5.tar.gz");
+            eprintln!(
+                "       td-builder gate-crates crypto-musl-headers --archive musl-1.2.5.tar.gz"
+            );
             eprintln!("       td-builder gate-crates crypto-portable-prepare --archives DIRECTORY");
             eprintln!("       td-builder gate-crates crypto-portable-build --archives DIRECTORY");
             eprintln!(concat!(
@@ -3170,7 +3223,9 @@ fn run_cargo_groups(root: &Path, cmds: &[String]) -> i32 {
         println!(
             "affected-checks: {} cargo groups, {width} at a time, {jobs} build job(s) each{}",
             groups.len(),
-            caller.map_or(String::new(), |t| format!(" (CARGO_BUILD_JOBS={t} for the run)"))
+            caller.map_or(String::new(), |t| format!(
+                " (CARGO_BUILD_JOBS={t} for the run)"
+            ))
         );
     }
     let next = AtomicUsize::new(0);
@@ -3599,7 +3654,12 @@ fn discover_gate_crates(root: &Path) -> Result<Vec<GateCrate>, String> {
             // A `td-*` directory that is not a crate is not a gate member.
             Ok(_) => continue,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("{} could not be inspected: {e}", manifest.display())),
+            Err(e) => {
+                return Err(format!(
+                    "{} could not be inspected: {e}",
+                    manifest.display()
+                ))
+            }
         }
         // It IS a crate. Only now must its name be one a command can spell: the
         // name is interpolated into the same `bash -c` string as the declared
@@ -3758,8 +3818,16 @@ fn manifest_path_dependencies(
             // matched whole, so a `no-dependencies` feature is not one.
             if let Some((key, _)) = line.split_once('=') {
                 let key = key.trim().trim_matches(['"', '\'']);
-                let base = key.split('.').next().unwrap_or(key).trim().trim_matches(['"', '\'']);
-                if matches!(base, "dependencies" | "dev-dependencies" | "build-dependencies") {
+                let base = key
+                    .split('.')
+                    .next()
+                    .unwrap_or(key)
+                    .trim()
+                    .trim_matches(['"', '\'']);
+                if matches!(
+                    base,
+                    "dependencies" | "dev-dependencies" | "build-dependencies"
+                ) {
                     return Err(format!(
                         "{name}: `{line}` names a dependency table outside the admitted \
                          headers — a roster crate declares dependencies only under a \
@@ -3806,7 +3874,10 @@ fn manifest_path_dependencies(
 /// working directory, so a roster crate may carry no `.cargo` directory of
 /// its own: the repository's is the only one.
 fn refuse_cargo_config_overrides(root: &Path, roster: &[GateCrate]) -> Result<(), String> {
-    if roster.iter().any(|k| crate::crypto_policy::admitted(&k.name)) {
+    if roster
+        .iter()
+        .any(|k| crate::crypto_policy::admitted(&k.name))
+    {
         crate::crypto_policy::cargo_config(root)?;
         for name in ["td-crypto", "td-mta"] {
             crate::crypto_policy::no_build_script(root, name)?;
@@ -3861,7 +3932,9 @@ fn refuse_cargo_config_overrides(root: &Path, roster: &[GateCrate]) -> Result<()
             let segment = head.split(['.', ']']).next().unwrap_or(head).trim();
             // An escape spells a table name the eye does not see:
             // `"paths"` is `paths`. No key here needs one.
-            if head.contains('\\') || (segment.trim_matches(['"', '\'']) == "env" && line.contains('\\')) {
+            if head.contains('\\')
+                || (segment.trim_matches(['"', '\'']) == "env" && line.contains('\\'))
+            {
                 return Err(format!(
                     "{name} spells a key with an escape (`{line}`) — the cargo \
                      config's keys are bare, so each can be read for what it is \
@@ -4047,8 +4120,14 @@ fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
         match key.trim() {
             "native-compositor-fixture-feature" => {
                 let feature = gate_string(name, key.trim(), value.trim())?;
-                if feature.is_empty() || !feature.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-                    return Err(format!("{name}: native fixture feature must be one ASCII feature name"));
+                if feature.is_empty()
+                    || !feature
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                {
+                    return Err(format!(
+                        "{name}: native fixture feature must be one ASCII feature name"
+                    ));
                 }
                 out.native_fixture_feature = Some(feature);
             }
@@ -4074,7 +4153,9 @@ fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
         }
     }
     if out.native_fixture_feature.is_some() && !out.native_compositor_tests {
-        return Err(format!("{name}: native fixture feature requires native-compositor-tests"));
+        return Err(format!(
+            "{name}: native fixture feature requires native-compositor-tests"
+        ));
     }
     Ok(out)
 }
@@ -4088,7 +4169,9 @@ fn gate_bool(krate: &str, key: &str, value: &str) -> Result<bool, String> {
     match value.split('#').next().unwrap_or(value).trim() {
         "true" => Ok(true),
         "false" => Ok(false),
-        _ => Err(format!("{krate}: `{key}` wants true or false, got `{value}`")),
+        _ => Err(format!(
+            "{krate}: `{key}` wants true or false, got `{value}`"
+        )),
     }
 }
 
@@ -4120,10 +4203,9 @@ fn gate_string(krate: &str, key: &str, value: &str) -> Result<String, String> {
     // `--config` hands cargo a config file or key the lock guard never reads,
     // and `-Z` unlocks unstable behaviour of the same reach; neither is a
     // test argument. Tokens are matched whole, on either side of `--`.
-    if inner
-        .split(' ')
-        .any(|token| token == "--config" || token.starts_with("--config=") || token.starts_with("-Z"))
-    {
+    if inner.split(' ').any(|token| {
+        token == "--config" || token.starts_with("--config=") || token.starts_with("-Z")
+    }) {
         return Err(format!(
             "{krate}: `{key}` may not carry `--config` or `-Z` — the repository's \
              cargo config is the only one a gate command reads (AGENTS.md 'Rust code')"
@@ -4213,12 +4295,23 @@ pub(crate) fn dependency_free_locks(root: &Path) -> Result<Vec<(String, LockMemb
     for krate in &roster {
         let closure = roster_closure(&roster, &krate.name);
         let members = if crate::crypto_policy::admitted(&krate.name) {
-            LockMembers::Crypto { own: krate.name.clone() }
-        } else {
-            if closure.iter().any(|name| crate::crypto_policy::admitted(name)) {
-                return Err(format!("{} may not inherit the external crypto closure", krate.name));
+            LockMembers::Crypto {
+                own: krate.name.clone(),
             }
-            LockMembers::Roster { own: krate.name.clone(), allowed: closure }
+        } else {
+            if closure
+                .iter()
+                .any(|name| crate::crypto_policy::admitted(name))
+            {
+                return Err(format!(
+                    "{} may not inherit the external crypto closure",
+                    krate.name
+                ));
+            }
+            LockMembers::Roster {
+                own: krate.name.clone(),
+                allowed: closure,
+            }
         };
         out.push((format!("{}/Cargo.lock", krate.name), members));
     }
@@ -4379,8 +4472,10 @@ fn sources_under(dir: &Path, required: bool) -> Result<String, String> {
 /// td-busd's directory in a test's argument string, which is no read at all
 /// and only widens.
 fn crate_readers(root: &Path, roster: &[GateCrate]) -> Result<Vec<(String, Vec<String>)>, String> {
-    let mut out: Vec<(String, Vec<String>)> =
-        roster.iter().map(|c| (c.name.clone(), Vec::new())).collect();
+    let mut out: Vec<(String, Vec<String>)> = roster
+        .iter()
+        .map(|c| (c.name.clone(), Vec::new()))
+        .collect();
     for reader in roster {
         let base = root.join(&reader.name);
         let mut text = sources_under(&base.join("src"), true)?;
@@ -4488,9 +4583,11 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
     // exit 0 having tested that crate not at all.
     // `every_roster_crate_narrows_to_its_own_commands` keeps this unreachable;
     // this is what happens if it ever is not.
-    let each_has_commands = selected
-        .iter()
-        .all(|s| narrowed.iter().any(|c| cmd_manifest_crate(c) == Some(s.as_str())));
+    let each_has_commands = selected.iter().all(|s| {
+        narrowed
+            .iter()
+            .any(|c| cmd_manifest_crate(c) == Some(s.as_str()))
+    });
     match each_has_commands {
         true => Ok(narrowed),
         false => Ok(all),
@@ -4629,9 +4726,15 @@ fn crate_cargo_command(krate: &GateCrate, action: &str) -> Result<String, String
     if crate::crypto_policy::admitted(&krate.name) {
         let binary = std::env::current_exe().map_err(|e| format!("gate executable: {e}"))?;
         let quoted = shell_quote(&binary).ok_or("gate executable path cannot be shell-quoted")?;
-        Ok(format!("{quoted} gate-crates crypto-cargo {action} --manifest-path {}/Cargo.toml", krate.name))
+        Ok(format!(
+            "{quoted} gate-crates crypto-cargo {action} --manifest-path {}/Cargo.toml",
+            krate.name
+        ))
     } else {
-        Ok(format!("cargo {action} --frozen --manifest-path {}/Cargo.toml", krate.name))
+        Ok(format!(
+            "cargo {action} --frozen --manifest-path {}/Cargo.toml",
+            krate.name
+        ))
     }
 }
 
@@ -4714,7 +4817,10 @@ fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
                     return 1;
                 }
             };
-            if cmds.iter().any(|cmd| cmd.contains(" gate-crates crypto-cargo ")) {
+            if cmds
+                .iter()
+                .any(|cmd| cmd.contains(" gate-crates crypto-cargo "))
+            {
                 if let Err(e) = crate::check_loop::warm_crypto_sources(root) {
                     eprintln!("affected-checks: {e}");
                     return 1;
@@ -4980,8 +5086,11 @@ pub(crate) fn run_selected(root: &Path, args: &[String], defer_checks: bool) -> 
 #[cfg(test)]
 mod tests {
     fn cargo_driver(command: &str, driver: &str) -> bool {
-        command.starts_with(driver) || driver.trim().strip_prefix("cargo ")
-            .is_some_and(|verb| command.contains(&format!(" gate-crates crypto-cargo {verb} ")))
+        command.starts_with(driver)
+            || driver
+                .trim()
+                .strip_prefix("cargo ")
+                .is_some_and(|verb| command.contains(&format!(" gate-crates crypto-cargo {verb} ")))
     }
 
     use super::*;
@@ -5133,13 +5242,16 @@ mod tests {
     fn the_comment_strip_keeps_code_and_drops_prose() {
         // The shape that made this necessary: td-boot's header names the
         // signer in order to say it is absent.
-        assert!(!strip_line_comments("// ed25519_sign.rs is deliberately absent")
-            .contains("ed25519_sign"));
+        assert!(
+            !strip_line_comments("// ed25519_sign.rs is deliberately absent")
+                .contains("ed25519_sign")
+        );
         assert!(!strip_line_comments("    //! reaches ed25519_sign").contains("ed25519_sign"));
         // Code survives, including code with a comment after it — the case a
         // naive "drop any line containing //" would lose.
-        assert!(strip_line_comments("mod ed25519_sign; // the signer")
-            .contains("mod ed25519_sign;"));
+        assert!(
+            strip_line_comments("mod ed25519_sign; // the signer").contains("mod ed25519_sign;")
+        );
         assert!(strip_line_comments("let x = 1;\nlet y = 2;").contains("let y = 2;"));
         // And the strip must not join lines: two declarations on separate lines
         // stay on separate lines, or a needle could straddle the seam.
@@ -5206,7 +5318,12 @@ mod tests {
         // `.#100-real.rs` is the one the dot-skip is for — an emacs lock whose
         // extension IS `rs`. The `.swp` and the `.txt` ride the pre-existing
         // extension filter, and are here so dropping that filter also reds.
-        for n in ["100-real.rs", ".100-real.rs.swp", ".#100-real.rs", "notes.txt"] {
+        for n in [
+            "100-real.rs",
+            ".100-real.rs.swp",
+            ".#100-real.rs",
+            "notes.txt",
+        ] {
             std::fs::write(defs.join(n), "").unwrap();
         }
         let got: Vec<String> = gate_files(&root)
@@ -5264,14 +5381,48 @@ mod tests {
         // a tool edge (not a source read) discovered by the native runner.
         assert_eq!(
             readers_of("td-compositor"),
-            ["td-authd", "td-editor", "td-jail", "td-mail", "td-photo", "td-portal", "td-seatd", "td-secret", "td-setup", "td-taskmgr", "td-ui", "td-vm", "td-vm-guest"]
+            [
+                "td-authd",
+                "td-editor",
+                "td-jail",
+                "td-mail",
+                "td-photo",
+                "td-portal",
+                "td-seatd",
+                "td-secret",
+                "td-setup",
+                "td-taskmgr",
+                "td-ui",
+                "td-vm",
+                "td-vm-guest"
+            ]
         );
         // Jail, login and the VM helper share the primary-account reader.
-        assert_eq!(readers_of("td-authd"), ["td-compositor", "td-firstboot", "td-jail", "td-login", "td-secret", "td-vm-guest"]);
+        assert_eq!(
+            readers_of("td-authd"),
+            [
+                "td-compositor",
+                "td-firstboot",
+                "td-jail",
+                "td-login",
+                "td-secret",
+                "td-vm-guest"
+            ]
+        );
         // td-login is here for a test's argument string `/bin/td-busd/`, no
         // read at all: the edge only widens, and pinning it pins the rule that
         // a name is a name wherever it is spelled.
-        assert_eq!(readers_of("td-busd"), ["td-audio", "td-compositor", "td-jail", "td-login", "td-portal", "td-secret"]);
+        assert_eq!(
+            readers_of("td-busd"),
+            [
+                "td-audio",
+                "td-compositor",
+                "td-jail",
+                "td-login",
+                "td-portal",
+                "td-secret"
+            ]
+        );
         assert_eq!(readers_of("td-boot"), ["td-install", "td-update"]);
         assert_eq!(readers_of("td-install"), ["td-setup"]);
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
@@ -5287,9 +5438,15 @@ mod tests {
         assert!(readers_of("td-sh").is_empty(), "{readers:?}");
         for (read, its_readers) in &readers {
             assert!(!its_readers.contains(read), "{read} reads itself");
-            assert!(roster.iter().any(|c| c.name == *read), "{read} is not on the roster");
+            assert!(
+                roster.iter().any(|c| c.name == *read),
+                "{read} is not on the roster"
+            );
             for reader in its_readers {
-                assert!(roster.iter().any(|c| c.name == *reader), "{reader} is off the roster");
+                assert!(
+                    roster.iter().any(|c| c.name == *reader),
+                    "{reader} is off the roster"
+                );
             }
         }
     }
@@ -5333,12 +5490,29 @@ mod tests {
                 "td-vm-guest"
             ]))
         );
-        assert_eq!(check_scope(&root, &paths(&["td-sh/src/lib.rs"]), &check), Some(paths(&["td-sh"])));
-        assert_eq!(check_scope(&root, &paths(&["td-sh/src/lib.rs", "builder/src/x.rs"]), &check), None);
-        assert_eq!(check_scope(&root, &paths(&["td-sh/../td-txt/x.rs"]), &check), None);
+        assert_eq!(
+            check_scope(&root, &paths(&["td-sh/src/lib.rs"]), &check),
+            Some(paths(&["td-sh"]))
+        );
+        assert_eq!(
+            check_scope(
+                &root,
+                &paths(&["td-sh/src/lib.rs", "builder/src/x.rs"]),
+                &check
+            ),
+            None
+        );
+        assert_eq!(
+            check_scope(&root, &paths(&["td-sh/../td-txt/x.rs"]), &check),
+            None
+        );
         assert_eq!(check_scope(&root, &[], &check), None);
         assert_eq!(
-            check_scope(&root, &paths(&["td-sh/src/lib.rs"]), &paths(&["check-engine"])),
+            check_scope(
+                &root,
+                &paths(&["td-sh/src/lib.rs"]),
+                &paths(&["check-engine"])
+            ),
             None
         );
         let out = path_output(&root, "td-sh/src/lib.rs");
@@ -5365,10 +5539,19 @@ mod tests {
         let root = std::env::temp_dir().join(format!("td-declared-target-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for (rel, text) in [
-            ("td-aa/Cargo.toml", "[package]\nname = \"td-aa\"\n[[bin]]\nname = \"t\"\npath = \"tools/t.rs\"\n"),
+            (
+                "td-aa/Cargo.toml",
+                "[package]\nname = \"td-aa\"\n[[bin]]\nname = \"t\"\npath = \"tools/t.rs\"\n",
+            ),
             ("td-aa/src/lib.rs", "pub fn aa() {}\n"),
-            ("td-aa/tools/t.rs", "const S: &str = include_str!(\"../../td-bb/src/lib.rs\");\n"),
-            ("td-bb/Cargo.toml", "[package]\nname = \"td-bb\"\n[dependencies.td-cc]\npath = \"../td-cc\"\n"),
+            (
+                "td-aa/tools/t.rs",
+                "const S: &str = include_str!(\"../../td-bb/src/lib.rs\");\n",
+            ),
+            (
+                "td-bb/Cargo.toml",
+                "[package]\nname = \"td-bb\"\n[dependencies.td-cc]\npath = \"../td-cc\"\n",
+            ),
             ("td-bb/src/lib.rs", "pub fn bb() {}\n"),
             ("td-cc/Cargo.toml", "[package]\nname = \"td-cc\"\n"),
             ("td-cc/src/lib.rs", "pub fn cc() {}\n"),
@@ -5411,9 +5594,18 @@ mod tests {
     /// matches a longer name or a comment.
     #[test]
     fn a_reader_is_found_however_the_path_is_spelled_and_prefixes_are_not() {
-        assert!(names_crate_dir("#[path = \"../../td-busd/src/wire.rs\"]", "td-busd"));
-        assert!(names_crate_dir("include_str!(\n    \"../../td-busd/spec/x\"\n)", "td-busd"));
-        assert!(names_crate_dir("let p = root.join(\"td-boot/src/x.rs\");\nread(p)", "td-boot"));
+        assert!(names_crate_dir(
+            "#[path = \"../../td-busd/src/wire.rs\"]",
+            "td-busd"
+        ));
+        assert!(names_crate_dir(
+            "include_str!(\n    \"../../td-busd/spec/x\"\n)",
+            "td-busd"
+        ));
+        assert!(names_crate_dir(
+            "let p = root.join(\"td-boot/src/x.rs\");\nread(p)",
+            "td-boot"
+        ));
         assert!(!names_crate_dir("\"../td-shell/src/x.rs\"", "td-sh"));
         assert!(!names_crate_dir("\"xtd-sh/src/x.rs\"", "td-sh"));
         assert!(!names_crate_dir("\"td-sh\"", "td-sh"));
@@ -5421,9 +5613,18 @@ mod tests {
             &strip_line_comments("// see td-compositor/DESIGN.md\nlet x = 1;"),
             "td-compositor"
         ));
-        assert!(manifest_names("td-boot = { path = \"../td-boot\" }", "td-boot"));
-        assert!(!manifest_names("# td-boot = { path = \"../td-boot\" }", "td-boot"));
-        assert!(!manifest_names("td-booted = 1\nname = \"td-bootloader\"", "td-boot"));
+        assert!(manifest_names(
+            "td-boot = { path = \"../td-boot\" }",
+            "td-boot"
+        ));
+        assert!(!manifest_names(
+            "# td-boot = { path = \"../td-boot\" }",
+            "td-boot"
+        ));
+        assert!(!manifest_names(
+            "td-booted = 1\nname = \"td-bootloader\"",
+            "td-boot"
+        ));
     }
 
     /// A tree the scan cannot read is an error, not a crate that reads
@@ -5439,9 +5640,18 @@ mod tests {
         std::fs::write(sealed.join("m.rs"), "fn b() {}\n").unwrap();
         let readable = sources_under(&root.join("src"), true).expect("a readable tree");
         assert!(readable.contains("fn a() {}") && readable.contains("fn b() {}"));
-        assert!(!readable.contains("td-sh/"), "comments must be stripped: {readable:?}");
-        assert_eq!(sources_under(&root.join("tests"), false).expect("absent optional"), "");
-        assert!(sources_under(&root.join("tests"), true).is_err(), "absent required");
+        assert!(
+            !readable.contains("td-sh/"),
+            "comments must be stripped: {readable:?}"
+        );
+        assert_eq!(
+            sources_under(&root.join("tests"), false).expect("absent optional"),
+            ""
+        );
+        assert!(
+            sources_under(&root.join("tests"), true).is_err(),
+            "absent required"
+        );
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
         let got = sources_under(&root.join("src"), true);
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -5450,13 +5660,20 @@ mod tests {
             eprintln!("SKIP: root reads a sealed directory");
             return;
         }
-        assert!(got.is_err(), "an unlistable subdirectory must be an error: {got:?}");
+        assert!(
+            got.is_err(),
+            "an unlistable subdirectory must be an error: {got:?}"
+        );
     }
 
     fn is_root() -> bool {
         std::fs::read_to_string("/proc/self/status")
             .ok()
-            .and_then(|s| s.lines().find(|l| l.starts_with("Uid:")).map(|l| l.contains("\t0\t")))
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("Uid:"))
+                    .map(|l| l.contains("\t0\t"))
+            })
             .unwrap_or(false)
     }
 
@@ -5757,7 +5974,10 @@ mod tests {
                 let mut depth = 1usize;
                 i = i.saturating_add(2);
                 while depth > 0 {
-                    match (chars.get(i).copied(), chars.get(i.saturating_add(1)).copied()) {
+                    match (
+                        chars.get(i).copied(),
+                        chars.get(i.saturating_add(1)).copied(),
+                    ) {
                         (None, _) => break,
                         (Some('/'), Some('*')) => {
                             depth = depth.saturating_add(1);
@@ -5802,8 +6022,9 @@ mod tests {
                     loop {
                         match chars.get(i).copied() {
                             None => break,
-                            Some('"') if (1..=hashes)
-                                .all(|k| chars.get(i.saturating_add(k)) == Some(&'#')) =>
+                            Some('"')
+                                if (1..=hashes)
+                                    .all(|k| chars.get(i.saturating_add(k)) == Some(&'#')) =>
                             {
                                 out.push('"');
                                 i = i.saturating_add(hashes).saturating_add(1);
@@ -5842,7 +6063,6 @@ mod tests {
         }
         out
     }
-
 
     /// `--no-renames` present as an ARGUMENT of `span` rather than anywhere in
     /// its bytes. `&["diff", "--format=--no-renames", "--name-only"]` names the
@@ -6333,14 +6553,26 @@ mod tests {
                     }
                 }
             }
-            files.push(Scanned { path: f.clone(), rel, host, shipped, code });
+            files.push(Scanned {
+                path: f.clone(),
+                rel,
+                host,
+                shipped,
+                code,
+            });
         }
 
         let mut named: Vec<String> = Vec::new();
         let mut verbs_seen: Vec<String> = Vec::new();
         let mut engine_files = 0usize;
         for sc in &files {
-            let Scanned { path, rel, host, shipped, code } = sc;
+            let Scanned {
+                path,
+                rel,
+                host,
+                shipped,
+                code,
+            } = sc;
             if *host {
                 for stem in &stems {
                     if names(code, stem) {
@@ -6348,8 +6580,9 @@ mod tests {
                     }
                 }
                 for header in impl_headers(code) {
-                    let (module, ty) = impl_target(&header)
-                        .unwrap_or_else(|| panic!("{rel}: an impl header this scan cannot read: {header}"));
+                    let (module, ty) = impl_target(&header).unwrap_or_else(|| {
+                        panic!("{rel}: an impl header this scan cannot read: {header}")
+                    });
                     match module {
                         Some(m) => assert!(
                             stems.contains(&m),
@@ -6406,7 +6639,10 @@ mod tests {
                         continue;
                     }
                     let verbs = dispatch_verbs(text_line, stem).unwrap_or_else(|| {
-                        panic!("main.rs names {stem} outside a dispatch arm: {}", text_line.trim())
+                        panic!(
+                            "main.rs names {stem} outside a dispatch arm: {}",
+                            text_line.trim()
+                        )
                     });
                     for verb in verbs {
                         assert!(
@@ -6421,7 +6657,9 @@ mod tests {
             }
             if rel == "main.rs" {
                 assert!(
-                    !code.lines().any(|l| l.trim_start().starts_with("#[macro_use]")),
+                    !code
+                        .lines()
+                        .any(|l| l.trim_start().starts_with("#[macro_use]")),
                     "main.rs uses #[macro_use]: a host module's macros would reach every \
                      module after it"
                 );
@@ -6454,54 +6692,94 @@ mod tests {
             "the gate runner's composed registry include is the shape rule 2 refuses"
         );
         assert!(names(&by_rel("ready.rs").code, "affected"));
-        assert!(!names(&by_rel("build.rs").code, "affected"), "the engine's build.rs is not host code");
+        assert!(
+            !names(&by_rel("build.rs").code, "affected"),
+            "the engine's build.rs is not host code"
+        );
         for ty in ["GateSet", "SlotPool", "CheckError"] {
-            assert!(host_types.contains(&ty.to_string()), "{ty} is declared host-side");
+            assert!(
+                host_types.contains(&ty.to_string()),
+                "{ty} is declared host-side"
+            );
         }
-        assert!(imports("use crate::{\n    ready as r,\n};", "ready"), "a group across lines");
-        assert!(imports("pub(crate) use ready as r;", "ready") && !imports("use readying::x;", "ready"));
-        assert!(imports("pub(in crate::x) use ready as r;", "ready") && imports("pub (crate) use ready;", "ready"));
-        assert!(module_paths_named("use super::{check_loop as loops};").contains(&"check_loop".to_string()));
+        assert!(
+            imports("use crate::{\n    ready as r,\n};", "ready"),
+            "a group across lines"
+        );
+        assert!(
+            imports("pub(crate) use ready as r;", "ready") && !imports("use readying::x;", "ready")
+        );
+        assert!(
+            imports("pub(in crate::x) use ready as r;", "ready")
+                && imports("pub (crate) use ready;", "ready")
+        );
+        assert!(module_paths_named("use super::{check_loop as loops};")
+            .contains(&"check_loop".to_string()));
         // A non-host stem: the from-source tier's own scan forbids this file
         // from spelling the `ready` path even in a literal.
-        assert!(module_paths_named("self::check_memory::nproc").contains(&"check_memory".to_string()));
+        assert!(
+            module_paths_named("self::check_memory::nproc").contains(&"check_memory".to_string())
+        );
         let plain = "include_str!( \"a/b.rs\" ); #[path=\"c.rs\"]";
         assert_eq!(included_paths(plain, plain).unwrap(), ["a/b.rs", "c.rs"]);
         let composed = "include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"))";
         assert!(included_paths(composed, composed).is_err());
         let quoted = "let m = \"include_str!(\"; let p = \"gate_defs/x\";";
-        assert_eq!(included_paths(&blank_strings(quoted), quoted).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            included_paths(&blank_strings(quoted), quoted).unwrap(),
+            Vec::<String>::new()
+        );
         assert_eq!(
             impl_target("impl<'a> fmt::Display for crate::drv::Drv<'a> {"),
             Some((Some("drv".into()), "Drv".into()))
         );
-        assert_eq!(impl_target("impl SlotPool {"), Some((None, "SlotPool".into())));
-        assert_eq!(impl_target("impl<T: Clone> Wrap<T> {"), Some((None, "Wrap".into())));
+        assert_eq!(
+            impl_target("impl SlotPool {"),
+            Some((None, "SlotPool".into()))
+        );
+        assert_eq!(
+            impl_target("impl<T: Clone> Wrap<T> {"),
+            Some((None, "Wrap".into()))
+        );
         assert_eq!(
             impl_target("impl Drop for super::gates::GateSet {"),
             Some((Some("gates".into()), "GateSet".into()))
         );
         assert_eq!(impl_target("    let x = 1;"), None);
         assert_eq!(
-            impl_headers("impl<'a, T: Long>\n    Trait for GateSet<'a>\n{\n    fn f() {}\n}\nimpl X {}\n"),
+            impl_headers(
+                "impl<'a, T: Long>\n    Trait for GateSet<'a>\n{\n    fn f() {}\n}\nimpl X {}\n"
+            ),
             ["impl<'a, T: Long> Trait for GateSet<'a> {", "impl X {}"]
         );
         assert_eq!(impl_headers("impl\n    Y\n{\n"), ["impl Y {"]);
         assert_eq!(impl_target("impl Y {"), Some((None, "Y".into())));
-        assert_eq!(impl_headers("unsafe impl Send for X {}\n"), ["unsafe impl Send for X {}"]);
+        assert_eq!(
+            impl_headers("unsafe impl Send for X {}\n"),
+            ["unsafe impl Send for X {}"]
+        );
         assert_eq!(
             impl_target("unsafe impl Send for crate::drv::Drv {}"),
             Some((Some("drv".into()), "Drv".into()))
         );
         assert_eq!(
-            dispatch_verbs("        Some(\"check\") if mode == \"x\" => check_loop::cli(args),", "check_loop"),
+            dispatch_verbs(
+                "        Some(\"check\") if mode == \"x\" => check_loop::cli(args),",
+                "check_loop"
+            ),
             Some(vec!["check".into()])
         );
         let arm = "        Some(\"gate-run\" | \"gate-body\") => gates::cli(args),";
-        assert_eq!(dispatch_verbs(arm, "gates"), Some(vec!["gate-run".into(), "gate-body".into()]));
+        assert_eq!(
+            dispatch_verbs(arm, "gates"),
+            Some(vec!["gate-run".into(), "gate-body".into()])
+        );
         assert_eq!(dispatch_verbs(arm, "affected"), None);
         assert_eq!(
-            dispatch_verbs("        Some(\"check\") if x == 1 => check_loop::cli(args),", "check_loop"),
+            dispatch_verbs(
+                "        Some(\"check\") if x == 1 => check_loop::cli(args),",
+                "check_loop"
+            ),
             Some(vec!["check".into()])
         );
 
@@ -6518,7 +6796,9 @@ mod tests {
             while let Some(at) = code[search..].find("\n#[cfg(test)]\nmod ") {
                 let attr = search + at + 1;
                 let mod_start = attr + "#[cfg(test)]\n".len();
-                let mod_end = code[mod_start..].find('\n').map_or(code.len(), |e| mod_start + e);
+                let mod_end = code[mod_start..]
+                    .find('\n')
+                    .map_or(code.len(), |e| mod_start + e);
                 let mod_line = &code[mod_start..mod_end];
                 search = mod_end;
                 if !mod_line.trim_end().ends_with('{') {
@@ -6639,7 +6919,9 @@ mod tests {
                 Some((_, after)) => after,
                 None => rest,
             };
-            let mut target = target.trim_start().trim_start_matches(|c: char| c == '&' || c == '(');
+            let mut target = target
+                .trim_start()
+                .trim_start_matches(|c: char| c == '&' || c == '(');
             loop {
                 let t = target.trim_start();
                 if let Some(r) = t.strip_prefix('\'') {
@@ -6663,7 +6945,9 @@ mod tests {
                 return None;
             }
             let module = match segments.first().copied() {
-                Some("crate" | "super") if segments.len() > 2 => segments.get(1).map(|s| s.to_string()),
+                Some("crate" | "super") if segments.len() > 2 => {
+                    segments.get(1).map(|s| s.to_string())
+                }
                 _ => None,
             };
             Some((module, last))
@@ -6767,7 +7051,8 @@ mod tests {
                         None => r,
                     }
                 });
-                let starts = t.starts_with("use ") || after_pub.is_some_and(|r| r.starts_with("use "));
+                let starts =
+                    t.starts_with("use ") || after_pub.is_some_and(|r| r.starts_with("use "));
                 if item.is_none() && starts {
                     item = Some(String::new());
                 }
@@ -6785,7 +7070,8 @@ mod tests {
 
         /// `word` as a whole identifier somewhere in `text`.
         fn word_in(text: &str, word: &str) -> bool {
-            let boundary = |c: Option<char>| !c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            let boundary =
+                |c: Option<char>| !c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
             let mut from = 0usize;
             while let Some(at) = text[from..].find(word) {
                 let abs = from + at;
@@ -7025,11 +7311,14 @@ mod tests {
         assert!(bare_name_only(&read(trailing)).is_some(), "{trailing}");
         // …an ordinary literal SPANNING LINES, whose second line the per-line
         // toggle read as code and cut at the `//` in the URL…
-        let spans_lines = "run_shell(root, \"git -c\nurl.https://x.insteadOf=y diff --name-only\");";
+        let spans_lines =
+            "run_shell(root, \"git -c\nurl.https://x.insteadOf=y diff --name-only\");";
         assert!(!strip_comments(spans_lines).contains("--name-only"));
-        assert!(bare_name_only(&read(spans_lines)).is_some(), "{spans_lines}");
-        let compliant =
-            "run_shell(root, \"git -c\nurl.https://x diff --no-renames --name-only\");";
+        assert!(
+            bare_name_only(&read(spans_lines)).is_some(),
+            "{spans_lines}"
+        );
+        let compliant = "run_shell(root, \"git -c\nurl.https://x diff --no-renames --name-only\");";
         assert_eq!(bare_name_only(&read(compliant)), None);
         // …and a SHEBANG, which is not Rust, may hold an unmatched quote, and
         // carried a string into the file under it. A BOM before it is not Rust
@@ -7038,7 +7327,10 @@ mod tests {
                        \"url.https://x\", \"diff\", \"--name-only\"]); }";
         assert!(bare_name_only(&read(shebang)).is_some(), "{shebang}");
         let bom = format!("\u{feff}{shebang}");
-        assert!(bare_name_only(&read(&bom)).is_some(), "a BOM hid the shebang");
+        assert!(
+            bare_name_only(&read(&bom)).is_some(),
+            "a BOM hid the shebang"
+        );
         // An inner attribute is not a shebang, and `#![forbid(unsafe_code)]`
         // opens most of this tree's files — nor is `#! [attr]`, which rustc
         // reads past the space.
@@ -7083,14 +7375,26 @@ mod tests {
         // a string. Two rounds of review wrote the second as `"other"` and as
         // `"-r"` followed by a comment ending in an escaped quote, and watched
         // a heuristic refuse the whole file for it.
-        assert_eq!(read("let s = \"-r\"; // spell a quote as \\\""), "let s = \"-r\"; ");
+        assert_eq!(
+            read("let s = \"-r\"; // spell a quote as \\\""),
+            "let s = \"-r\"; "
+        );
         let prefixed: Vec<char> = "let s = br\"x\";".chars().collect();
-        assert!(opens_raw(&prefixed, 9), "`b` is the prefix, not the boundary");
+        assert!(
+            opens_raw(&prefixed, 9),
+            "`b` is the prefix, not the boundary"
+        );
         let ident: Vec<char> = "let s = foor\"x\";".chars().collect();
-        assert!(!opens_raw(&ident, 11), "an `r` ending an identifier opens nothing");
+        assert!(
+            !opens_raw(&ident, 11),
+            "an `r` ending an identifier opens nothing"
+        );
         // The flag must be an ARGUMENT, not any occurrence in the span.
         let faked = r#"g.run(&["diff", "--format=--no-renames", "--name-only"]);"#;
-        assert!(bare_name_only(faked).is_some(), "a flag named inside another must not pass");
+        assert!(
+            bare_name_only(faked).is_some(),
+            "a flag named inside another must not pass"
+        );
         // …and an ESCAPED quote is not the boundary that would make it one.
         // `lex` writes those, rewriting a raw string's inner quote, so a
         // single argument holding the flag's spelling must not read as two.
@@ -7103,7 +7407,10 @@ mod tests {
         // A char literal holding a BRACKET is data too, and `bracket_spans`
         // counts brackets — so the span judged would be a different argv.
         let bracketed = "g.run(&[arg(']'), \"--name-only\", arg('[')]);";
-        assert_eq!(read(bracketed), "g.run(&[arg('x'), \"--name-only\", arg('x')]);");
+        assert_eq!(
+            read(bracketed),
+            "g.run(&[arg('x'), \"--name-only\", arg('x')]);"
+        );
         assert!(bare_name_only(&read(bracketed)).is_some(), "{bracketed}");
         // WHITESPACE splits a shell string and not an argv literal. The flag
         // inside one argument is passed to git as part of that argument, so
@@ -7160,7 +7467,10 @@ mod tests {
         // opened an inner attribute, so one that spans lines is not a shebang
         // and its content is not code. Cutting only its first line left the
         // rest to be read as code, quote and all.
-        assert_eq!(lex("#!/*\n\"\n*/[allow(x)]\nq();"), "#!\n\n[allow(x)]\nq();");
+        assert_eq!(
+            lex("#!/*\n\"\n*/[allow(x)]\nq();"),
+            "#!\n\n[allow(x)]\nq();"
+        );
         // A flag in ANOTHER command of the same string is not this query's:
         // both of these pass git a flag on a query that is not the one asking
         // for `--name-only`, and judging the whole string read that as
@@ -7170,7 +7480,8 @@ mod tests {
         let substituted = "run_shell(root, \"git diff --name-only $(true --no-renames )\")";
         assert!(bare_name_only(substituted).is_some(), "{substituted}");
         // …while a separator inside quotes divides nothing.
-        let quoted_semi = "run_shell(root, \"git -c core.pager='a;b' diff --no-renames --name-only\")";
+        let quoted_semi =
+            "run_shell(root, \"git -c core.pager='a;b' diff --no-renames --name-only\")";
         assert_eq!(bare_name_only(quoted_semi), None, "{quoted_semi}");
         // An argv ELEMENT holding two flags is not a command line: git gets
         // one argument it rejects. A literal is judged as shell only if it
@@ -7184,7 +7495,8 @@ mod tests {
         // …and a literal inside a NESTED expression is not an argument: this
         // one builds one config value git accepts, and the flag never reaches
         // it as an option.
-        let nested = r#"g.run(&["-c", concat!("core.pager=x ", "--no-renames"), "diff", "--name-only"]);"#;
+        let nested =
+            r#"g.run(&["-c", concat!("core.pager=x ", "--no-renames"), "diff", "--name-only"]);"#;
         assert!(bare_name_only(nested).is_some(), "{nested}");
         // A `#` beginning a word opens a bash comment, so the flag after one
         // is never passed. This was a silent pass.
@@ -7203,7 +7515,10 @@ mod tests {
         assert_eq!(shipped_half("let x = 1;"), owned("let x = 1;"));
         let split = format!("shipped();\n{TEST_MOD} {{ let s = \"}}\"; }}");
         assert_eq!(shipped_half(&split), owned("shipped();\n"));
-        assert_eq!(shipped_half(&format!("{split}\nbelow();")), owned("shipped();\n\nbelow();"));
+        assert_eq!(
+            shipped_half(&format!("{split}\nbelow();")),
+            owned("shipped();\n\nbelow();")
+        );
         assert_eq!(shipped_half(&format!("{split}\n{TEST_MOD} {{}}")), None);
         // A marker inside a STRING is data: `lex` has already taken the
         // comments, so blanking the strings leaves nothing that can spell one
@@ -7302,14 +7617,24 @@ mod tests {
     #[test]
     fn both_crypto_legs_require_the_offline_wrapper() {
         let root = repo_root();
-        for commands in [cargo_test_cmds_all(&root).unwrap(), gate_cargo_cmds(&root).unwrap()] {
+        for commands in [
+            cargo_test_cmds_all(&root).unwrap(),
+            gate_cargo_cmds(&root).unwrap(),
+        ] {
             for name in ["td-crypto", "td-mta"] {
                 for action in ["test", "clippy"] {
-                    let selected: Vec<_> = commands.iter().filter(|cmd|
-                        cmd_manifest_crate(cmd) == Some(name) && cargo_driver(cmd, &format!("cargo {action}"))
-                    ).collect();
+                    let selected: Vec<_> = commands
+                        .iter()
+                        .filter(|cmd| {
+                            cmd_manifest_crate(cmd) == Some(name)
+                                && cargo_driver(cmd, &format!("cargo {action}"))
+                        })
+                        .collect();
                     assert_eq!(selected.len(), 1);
-                    assert!(selected.first().unwrap().contains(&format!(" gate-crates crypto-cargo {action} ")));
+                    assert!(selected
+                        .first()
+                        .unwrap()
+                        .contains(&format!(" gate-crates crypto-cargo {action} ")));
                 }
             }
         }
@@ -7331,8 +7656,8 @@ mod tests {
             return;
         };
         for krate in roster {
-            let mine = cargo_test_cmds(&root, &[format!("{}/src/lib.rs", krate.name)])
-                .expect("narrowing");
+            let mine =
+                cargo_test_cmds(&root, &[format!("{}/src/lib.rs", krate.name)]).expect("narrowing");
             for want in ["cargo test ", "cargo clippy "] {
                 assert!(
                     mine.iter().any(|c| cargo_driver(c, want)
@@ -7476,8 +7801,13 @@ mod tests {
         );
         // The order holds within a narrowed list: every test before any clippy,
         // the workspace first.
-        assert!(comp.first().is_some_and(|c| c.starts_with("cargo test --frozen --workspace")));
-        let last_test = comp.iter().rposition(|c| c.starts_with("cargo test ")).unwrap_or(0);
+        assert!(comp
+            .first()
+            .is_some_and(|c| c.starts_with("cargo test --frozen --workspace")));
+        let last_test = comp
+            .iter()
+            .rposition(|c| c.starts_with("cargo test "))
+            .unwrap_or(0);
         let first_clippy = comp
             .iter()
             .position(|c| c.starts_with("cargo clippy "))
@@ -7496,7 +7826,10 @@ mod tests {
         // Two crates take the union of what each brings.
         let two = cargo_test_cmds(
             &root,
-            &["td-review/src/land.rs".to_string(), "td-sh/src/main.rs".to_string()],
+            &[
+                "td-review/src/land.rs".to_string(),
+                "td-sh/src/main.rs".to_string(),
+            ],
         )
         .expect("narrowing");
         assert_eq!(two.len(), 6, "{two:?}");
@@ -7505,7 +7838,10 @@ mod tests {
         assert_eq!(
             cargo_test_cmds(
                 &root,
-                &["td-review/src/land.rs".to_string(), "builder/src/gates.rs".to_string()]
+                &[
+                    "td-review/src/land.rs".to_string(),
+                    "builder/src/gates.rs".to_string()
+                ]
             )
             .expect("narrowing")
             .len(),
@@ -7640,19 +7976,26 @@ mod tests {
         assert!(commands.len() > 5, "{commands:?}");
         for name in ["td-editor", "td-news"] {
             let manifest = format!("--manifest-path {name}/Cargo.toml");
-            assert!(commands.iter().any(|c| c.contains(&manifest)), "{commands:?}");
+            assert!(
+                commands.iter().any(|c| c.contains(&manifest)),
+                "{commands:?}"
+            );
         }
-        assert!(commands.iter().any(|c| c.starts_with("cargo test --frozen ")));
-        assert!(commands.iter().any(|c| {
-            c.starts_with("cargo clippy --frozen ") && c.contains("--all-targets")
-        }));
+        assert!(commands
+            .iter()
+            .any(|c| c.starts_with("cargo test --frozen ")));
+        assert!(commands
+            .iter()
+            .any(|c| { c.starts_with("cargo clippy --frozen ") && c.contains("--all-targets") }));
         assert!(gate_locks().iter().any(|(lock, members)| {
             lock == "td-editor/Cargo.lock"
                 && matches!(members, LockMembers::Roster { own, .. } if own == "td-editor")
         }));
         paths.push("builder/src/affected.rs".to_string());
         assert_eq!(cargo_test_cmds(&root, &paths).unwrap(), gate_cmds());
-        assert!(compute_selection(&root, &paths).targets.contains(&"check".to_string()));
+        assert!(compute_selection(&root, &paths)
+            .targets
+            .contains(&"check".to_string()));
         // The toolkit brings its six consumers and their native fixtures,
         // and through td-news the rest of the compositor's reader closure:
         // td-firstboot and td-editor spell `td-news/` (the configuration
@@ -7661,7 +8004,11 @@ mod tests {
         // widening is the cheap direction; a td-ui edit now runs the same
         // set a compositor edit does, td-news's own two commands included.
         let comp = cargo_test_cmds(&root, &["td-compositor/src/lib.rs".to_string()]).unwrap();
-        for path in ["td-ui/src/keyboard.rs", "td-ui/Cargo.toml", "td-ui/tests/xkb.rs"] {
+        for path in [
+            "td-ui/src/keyboard.rs",
+            "td-ui/Cargo.toml",
+            "td-ui/tests/xkb.rs",
+        ] {
             let toolkit = [path.to_string()];
             let targets = compute_selection(&root, &toolkit).targets;
             assert!(targets.contains(&"check".to_string()), "{path}");
@@ -7678,17 +8025,34 @@ mod tests {
             };
             assert_eq!(crates(&commands), crates(&comp), "{path}");
             for consumer in [
-                "td-ui", "td-editor", "td-setup", "td-portal", "td-photo", "td-taskmgr", "td-news", "td-mail",
+                "td-ui",
+                "td-editor",
+                "td-setup",
+                "td-portal",
+                "td-photo",
+                "td-taskmgr",
+                "td-news",
+                "td-mail",
             ] {
                 let manifest = format!("--manifest-path {consumer}/Cargo.toml");
                 // Test and clippy, plus the native fixture where declared.
                 assert_eq!(
                     commands.iter().filter(|c| c.contains(&manifest)).count(),
-                    if matches!(consumer, "td-news" | "td-ui") { 2 } else { 3 },
+                    if matches!(consumer, "td-news" | "td-ui") {
+                        2
+                    } else {
+                        3
+                    },
                     "{path}: {consumer}"
                 );
             }
-            assert!(commands.iter().filter(|c| c.contains("--workspace")).count() == 2);
+            assert!(
+                commands
+                    .iter()
+                    .filter(|c| c.contains("--workspace"))
+                    .count()
+                    == 2
+            );
         }
         for path in [
             "td-editor-extra/src/main.rs",
@@ -7696,7 +8060,10 @@ mod tests {
             "td-ui-extra/src/lib.rs",
             "td-ui/../td-sh/src/main.rs",
         ] {
-            assert_eq!(cargo_test_cmds(&root, &[path.to_string()]).unwrap(), gate_cmds());
+            assert_eq!(
+                cargo_test_cmds(&root, &[path.to_string()]).unwrap(),
+                gate_cmds()
+            );
             assert!(path_output(&root, path).contains("td-builder check check"));
         }
     }
@@ -7799,8 +8166,14 @@ mod tests {
         // though b failed too...
         assert_eq!(code, 3);
         // ...b still ran to its end, and a stopped at its first failure.
-        assert!(root.join("b-clippy-ran").is_file(), "every group runs to its end");
-        assert!(!root.join("a-clippy-ran").is_file(), "a group stops at its first failure");
+        assert!(
+            root.join("b-clippy-ran").is_file(),
+            "every group runs to its end"
+        );
+        assert!(
+            !root.join("a-clippy-ran").is_file(),
+            "a group stops at its first failure"
+        );
         assert_eq!(run_cargo_groups(&root, &["true".to_string()]), 0);
         assert_eq!(run_cargo_groups(&root, &[]), 0);
         let (got, out) = run_shell_captured(&root, "echo one; echo two >&2; echo three", "1");
@@ -7855,8 +8228,14 @@ mod tests {
                 );
             }
         }
-        for driver in ["cargo clippy --frozen --workspace", "cargo test --frozen --workspace"] {
-            assert!(cmds.iter().any(|c| c == driver), "gate 325 drops `{driver}`");
+        for driver in [
+            "cargo clippy --frozen --workspace",
+            "cargo test --frozen --workspace",
+        ] {
+            assert!(
+                cmds.iter().any(|c| c == driver),
+                "gate 325 drops `{driver}`"
+            );
         }
         assert_eq!(
             cmds.len(),
@@ -7884,7 +8263,8 @@ mod tests {
                 .map(String::as_str)
                 .unwrap_or_default();
             assert_eq!(
-                clippy.ends_with(" --all-targets") || clippy.contains(" gate-crates crypto-cargo clippy "),
+                clippy.ends_with(" --all-targets")
+                    || clippy.contains(" gate-crates crypto-cargo clippy "),
                 k.clippy_all_targets,
                 "{}: --all-targets does not follow its declaration: `{clippy}`",
                 k.name
@@ -7958,9 +8338,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "td-root-roster-{}-{stamp:x}", std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("td-root-roster-{}-{stamp:x}", std::process::id()));
         std::fs::create_dir(&root).unwrap();
         let _cleanup = Cleanup(root.clone());
         for (name, option) in [("td-yes", "true"), ("td-no", "false")] {
@@ -7969,10 +8348,12 @@ mod tests {
             std::fs::write(
                 dir.join("Cargo.toml"),
                 format!("[package]\n[package.metadata.td-gate]\ntrusted-test-root = {option}\n"),
-            ).unwrap();
+            )
+            .unwrap();
         }
         for commands in [
-            cargo_test_cmds_all(&root).unwrap(), gate_cargo_cmds(&root).unwrap(),
+            cargo_test_cmds_all(&root).unwrap(),
+            gate_cargo_cmds(&root).unwrap(),
         ] {
             for command in commands {
                 assert_eq!(
@@ -7980,11 +8361,14 @@ mod tests {
                     command.starts_with("cargo test ") && command.contains("td-yes/Cargo.toml"),
                 );
                 if command.starts_with("cargo test ") && command.contains("td-yes/Cargo.toml") {
-                    assert_eq!(command, concat!(
-                        "cargo test --frozen --manifest-path td-yes/Cargo.toml",
-                        " --config 'env.TD_TEST_TRUSTED_ROOT.value=\"1\"'",
-                        " --config 'env.TD_TEST_TRUSTED_ROOT.force=true'",
-                    ));
+                    assert_eq!(
+                        command,
+                        concat!(
+                            "cargo test --frozen --manifest-path td-yes/Cargo.toml",
+                            " --config 'env.TD_TEST_TRUSTED_ROOT.value=\"1\"'",
+                            " --config 'env.TD_TEST_TRUSTED_ROOT.force=true'",
+                        )
+                    );
                 }
             }
         }
@@ -7992,7 +8376,8 @@ mod tests {
             assert!(parse_gate_crate(
                 "td-x",
                 &format!("[package.metadata.td-gate]\ntrusted-test-root = {invalid}\n"),
-            ).is_err());
+            )
+            .is_err());
         }
     }
 
@@ -8000,12 +8385,26 @@ mod tests {
     fn native_compositor_tests_follow_metadata_in_both_legs_without_widening_consumers() {
         let prefix = "[package.metadata.td-gate]\nnative-compositor-tests = true\n";
         let feature = "native-compositor-fixture-feature";
-        assert_eq!(parse_gate_crate("td-x", &format!("{prefix}{feature} = \"test-file-barrier\"\n"))
-            .unwrap().native_fixture_feature.as_deref(), Some("test-file-barrier"));
+        assert_eq!(
+            parse_gate_crate(
+                "td-x",
+                &format!("{prefix}{feature} = \"test-file-barrier\"\n")
+            )
+            .unwrap()
+            .native_fixture_feature
+            .as_deref(),
+            Some("test-file-barrier")
+        );
         for value in ["", "a,b", "a b", "../a", "a/b", "é", "--features=bad"] {
-            assert!(parse_gate_crate("td-x", &format!("{prefix}{feature} = \"{value}\"\n")).is_err());
+            assert!(
+                parse_gate_crate("td-x", &format!("{prefix}{feature} = \"{value}\"\n")).is_err()
+            );
         }
-        assert!(parse_gate_crate("td-x", &format!("[package.metadata.td-gate]\n{feature} = \"x\"\n")).is_err());
+        assert!(parse_gate_crate(
+            "td-x",
+            &format!("[package.metadata.td-gate]\n{feature} = \"x\"\n")
+        )
+        .is_err());
         assert_eq!(
             cmd_manifest_crate(concat!(
                 "'/repo/--manifest-path td-decoy/tool' gate-crates native-compositor ",
@@ -8033,7 +8432,9 @@ mod tests {
             .map(|k| k.name.as_str())
             .collect();
         assert_eq!(
-            host.iter().filter_map(|c| cmd_manifest_crate(c)).collect::<Vec<_>>(),
+            host.iter()
+                .filter_map(|c| cmd_manifest_crate(c))
+                .collect::<Vec<_>>(),
             declared
         );
         assert!(declared.contains(&"td-editor"));
@@ -8048,18 +8449,27 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         );
-        assert!(!photo.iter().any(|c| cmd_manifest_crate(c) == Some("td-compositor")));
+        assert!(!photo
+            .iter()
+            .any(|c| cmd_manifest_crate(c) == Some("td-compositor")));
         assert!(render_cargo_test(&photo).contains("[native compositor tool + tests]"));
         let compositor = cargo_test_cmds(&root, &["td-compositor/src/main.rs".into()]).unwrap();
         assert_eq!(native(compositor), host);
-        assert!(native(cargo_test_cmds(&root, &["td-review/src/main.rs".into()]).unwrap()).is_empty());
+        assert!(
+            native(cargo_test_cmds(&root, &["td-review/src/main.rs".into()]).unwrap()).is_empty()
+        );
         for invalid in ["1", "yes", "\"true\"", ""] {
             assert!(parse_gate_crate(
                 "td-x",
                 &format!("[package.metadata.td-gate]\nnative-compositor-tests = {invalid}\n")
-            ).is_err());
+            )
+            .is_err());
         }
-        assert!(!parse_gate_crate("td-x", "[package]\n").unwrap().native_compositor_tests);
+        assert!(
+            !parse_gate_crate("td-x", "[package]\n")
+                .unwrap()
+                .native_compositor_tests
+        );
     }
 
     #[test]
@@ -8072,9 +8482,8 @@ mod tests {
         }
         let root = (0..100)
             .find_map(|attempt| {
-                let path = std::env::temp_dir().join(format!(
-                    "td-native-reader-{}-{attempt}", std::process::id()
-                ));
+                let path = std::env::temp_dir()
+                    .join(format!("td-native-reader-{}-{attempt}", std::process::id()));
                 match std::fs::create_dir(&path) {
                     Ok(()) => Some(Ok(path)),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
@@ -8090,8 +8499,11 @@ mod tests {
             std::fs::write(base.join("src/main.rs"), "fn main() {}\n").unwrap();
             std::fs::write(
                 base.join("Cargo.toml"),
-                format!("[package]\n[package.metadata.td-gate]\nnative-compositor-tests = {native}\n"),
-            ).unwrap();
+                format!(
+                    "[package]\n[package.metadata.td-gate]\nnative-compositor-tests = {native}\n"
+                ),
+            )
+            .unwrap();
         }
         let roster = discover_gate_crates(&root).unwrap();
         let readers = crate_readers(&root, &roster).unwrap();
@@ -8101,8 +8513,12 @@ mod tests {
         close_over_readers(&mut selected, &readers);
         assert!(selected.contains(&"td-consumer".into()));
         let commands = cargo_test_cmds(&root, &["td-consumer/src/main.rs".into()]).unwrap();
-        assert!(commands.iter().any(|c| c.contains(" gate-crates native-compositor ")));
-        assert!(!commands.iter().any(|c| cmd_manifest_crate(c) == Some("td-compositor")));
+        assert!(commands
+            .iter()
+            .any(|c| c.contains(" gate-crates native-compositor ")));
+        assert!(!commands
+            .iter()
+            .any(|c| cmd_manifest_crate(c) == Some("td-compositor")));
     }
 
     /// The declaration parser, over manifest TEXT so its cases are literals
@@ -8148,7 +8564,9 @@ mod tests {
             "[ package.metadata.td-gate ]\nclippy-all-targets = true\n",
         ] {
             assert!(
-                parse_gate_crate("td-x", ok).expect("accepted spelling").clippy_all_targets,
+                parse_gate_crate("td-x", ok)
+                    .expect("accepted spelling")
+                    .clippy_all_targets,
                 "{ok:?} declares the flag and must be read"
             );
         }
@@ -8157,8 +8575,11 @@ mod tests {
         // bare so the dependency reader can be exact, so the spelling reds by
         // name rather than being read or silently dropped.
         assert!(
-            parse_gate_crate("td-x", "[package.metadata.\"td-gate\"]\nclippy-all-targets = true\n")
-                .is_err_and(|e| e.contains("bare")),
+            parse_gate_crate(
+                "td-x",
+                "[package.metadata.\"td-gate\"]\nclippy-all-targets = true\n"
+            )
+            .is_err_and(|e| e.contains("bare")),
             "a quoted header is refused, not folded"
         );
         // …and every NEAR MISS reds rather than declaring nothing, including the
@@ -8220,10 +8641,18 @@ mod tests {
         // A trailing comment on the HEADER does not hide the block…
         let commented = "[package.metadata.td-gate] # how this crate is gated\n\
                          clippy-all-targets = true\n";
-        assert!(parse_gate_crate("td-x", commented).expect("commented").clippy_all_targets);
+        assert!(
+            parse_gate_crate("td-x", commented)
+                .expect("commented")
+                .clippy_all_targets
+        );
         // …a bool tolerates the comment a string already did, space or not…
         let tight = "[package.metadata.td-gate]\nclippy-all-targets = true#no space\n";
-        assert!(parse_gate_crate("td-x", tight).expect("tight").clippy_all_targets);
+        assert!(
+            parse_gate_crate("td-x", tight)
+                .expect("tight")
+                .clippy_all_targets
+        );
         // …and a NEAR-MISS header reds rather than declaring nothing, which is
         // the one way the per-key strictness below could be talked out of.
         for miss in [
@@ -8236,10 +8665,18 @@ mod tests {
         // A later section ENDS the block, so a key below it is not ours…
         let after = "[package.metadata.td-gate]\nclippy-all-targets = true\n\
                      [profile.release]\nclippy-all-targets = false\n";
-        assert!(parse_gate_crate("td-x", after).expect("scoped").clippy_all_targets);
+        assert!(
+            parse_gate_crate("td-x", after)
+                .expect("scoped")
+                .clippy_all_targets
+        );
         // …and neither is a different metadata table.
         let other = "[package.metadata.docs.rs]\nclippy-all-targets = true\n";
-        assert!(!parse_gate_crate("td-x", other).expect("other").clippy_all_targets);
+        assert!(
+            !parse_gate_crate("td-x", other)
+                .expect("other")
+                .clippy_all_targets
+        );
 
         // Every malformed shape REDS rather than reading as a default. A typo
         // that parsed as "no flag" would silently drop lint coverage, which is
@@ -8263,7 +8700,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("td-gate-discover-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(root.join("td-new")).unwrap();
-        std::fs::write(root.join("td-new/Cargo.toml"), "[package]\nname = \"td-new\"\n").unwrap();
+        std::fs::write(
+            root.join("td-new/Cargo.toml"),
+            "[package]\nname = \"td-new\"\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(root.join("td-loud")).unwrap();
         std::fs::write(
             root.join("td-loud/Cargo.toml"),
@@ -8274,15 +8715,23 @@ mod tests {
         // — `net` is the external-dependency tier and must never be gated here.
         std::fs::create_dir_all(root.join("td-notacrate")).unwrap();
         std::fs::create_dir_all(root.join("net")).unwrap();
-        std::fs::write(root.join("net/Cargo.toml"), "[package]\nname = \"td-net\"\n").unwrap();
+        std::fs::write(
+            root.join("net/Cargo.toml"),
+            "[package]\nname = \"td-net\"\n",
+        )
+        .unwrap();
 
         let got = discover_gate_crates(&root);
         std::fs::remove_dir_all(&root).ok();
         let got = got.expect("discovery");
         let names: Vec<&str> = got.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["td-loud", "td-new"], "alphabetical, crates only");
-        assert!(got.iter().any(|c| c.name == "td-loud" && c.clippy_all_targets));
-        assert!(got.iter().any(|c| c.name == "td-new" && !c.clippy_all_targets));
+        assert!(got
+            .iter()
+            .any(|c| c.name == "td-loud" && c.clippy_all_targets));
+        assert!(got
+            .iter()
+            .any(|c| c.name == "td-new" && !c.clippy_all_targets));
     }
 
     /// A crate the roster discovered, that no arm above maps, still reaches the
@@ -8378,7 +8827,10 @@ mod tests {
 
         let got = discover_gate_crates(&root);
         std::fs::remove_dir_all(&root).ok();
-        assert!(got.is_err(), "a crate-shaped `td-sh.orig` must red: {got:?}");
+        assert!(
+            got.is_err(),
+            "a crate-shaped `td-sh.orig` must red: {got:?}"
+        );
     }
 
     /// An EMPTY discovery is refused rather than returned: the preflight's loop
@@ -8419,21 +8871,43 @@ mod tests {
     #[test]
     fn other_roster_consumers_cannot_inherit_crypto() {
         let source = repo_root();
-        if !source.join("td-crypto/Cargo.toml").exists() { return; }
+        if !source.join("td-crypto/Cargo.toml").exists() {
+            return;
+        }
         let temp = std::env::temp_dir().join(format!("td-crypto-consumers-{}", std::process::id()));
         struct Cleanup(PathBuf);
-        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         std::fs::create_dir(&temp).unwrap();
         let _cleanup = Cleanup(temp.clone());
         std::fs::create_dir(temp.join(".cargo")).unwrap();
-        std::fs::copy(source.join(".cargo/config.toml"), temp.join(".cargo/config.toml")).unwrap();
-        std::fs::write(temp.join("Cargo.toml"), "[workspace]\nmembers = [\"builder\"]\n").unwrap();
+        std::fs::copy(
+            source.join(".cargo/config.toml"),
+            temp.join(".cargo/config.toml"),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"builder\"]\n",
+        )
+        .unwrap();
         for name in ["td-crypto", "td-mta"] {
             std::fs::create_dir(temp.join(name)).unwrap();
-            std::fs::copy(source.join(name).join("Cargo.toml"), temp.join(name).join("Cargo.toml")).unwrap();
+            std::fs::copy(
+                source.join(name).join("Cargo.toml"),
+                temp.join(name).join("Cargo.toml"),
+            )
+            .unwrap();
         }
         assert!(dependency_free_locks(&temp).is_ok());
-        for (name, dep) in [("td-reader", "td-crypto"), ("td-reader", "td-mta"), ("td-indirect", "td-reader")] {
+        for (name, dep) in [
+            ("td-reader", "td-crypto"),
+            ("td-reader", "td-mta"),
+            ("td-indirect", "td-reader"),
+        ] {
             std::fs::create_dir_all(temp.join(name)).unwrap();
             std::fs::write(temp.join(name).join("Cargo.toml"), format!(
                 "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n[dependencies]\n{dep} = {{ path = \"../{dep}\" }}\n"
@@ -8525,7 +8999,10 @@ mod tests {
             sourced.is_err_and(|e| e.contains("external `source = `")),
             "a registry crate must red on its source line, before any name check"
         );
-        assert!(dependency_free(lock, "", &own(&[])).is_err(), "an empty lock is not a pass");
+        assert!(
+            dependency_free(lock, "", &own(&[])).is_err(),
+            "an empty lock is not a pass"
+        );
         assert!(
             dependency_free(lock, "[[package]]\nname = \"td-vm\"\n", &own(&["td-vm"]))
                 .is_err_and(|e| e.contains("its own package")),
@@ -8550,8 +9027,12 @@ mod tests {
             "an escaped key is refused unread"
         );
         assert!(
-            dependency_free(lock, "[[package]]\nname = \"td-review\"\n", &own(&["td-vm"]))
-                .is_err_and(|e| e.contains("does not list `td-vm`")),
+            dependency_free(
+                lock,
+                "[[package]]\nname = \"td-review\"\n",
+                &own(&["td-vm"])
+            )
+            .is_err_and(|e| e.contains("does not list `td-vm`")),
             "a lock missing a declared sibling is stale, not a pass"
         );
         assert!(
@@ -8565,20 +9046,37 @@ mod tests {
         );
         // Spellings cargo accepts but never writes read the same as cargo's
         // own, rather than as silence.
-        assert!(dependency_free(lock, "[[ package ]] # note\nname='td-review' # note\n", &own(&[])).is_ok());
+        assert!(dependency_free(
+            lock,
+            "[[ package ]] # note\nname='td-review' # note\n",
+            &own(&[])
+        )
+        .is_ok());
         assert!(
-            dependency_free(lock, "[[package]]\nname = \"td-review\"\nsource='registry+x'\n", &own(&[]))
-                .is_err_and(|e| e.contains("external `source = `")),
+            dependency_free(
+                lock,
+                "[[package]]\nname = \"td-review\"\nsource='registry+x'\n",
+                &own(&[])
+            )
+            .is_err_and(|e| e.contains("external `source = `")),
             "a literal-string source line is a source line"
         );
         assert!(
-            dependency_free(lock, "[[package]]\nname = \"td-review\"\n\"source\" = \"registry+x\"\n", &own(&[]))
-                .is_err_and(|e| e.contains("external `source = `")),
+            dependency_free(
+                lock,
+                "[[package]]\nname = \"td-review\"\n\"source\" = \"registry+x\"\n",
+                &own(&[])
+            )
+            .is_err_and(|e| e.contains("external `source = `")),
             "a quoted source key is a source key"
         );
         assert!(
-            dependency_free(lock, "[[package]]\nname = \"td-review\"\nname = \"td-vm\"\n", &own(&["td-vm"]))
-                .is_err_and(|e| e.contains("two names")),
+            dependency_free(
+                lock,
+                "[[package]]\nname = \"td-review\"\nname = \"td-vm\"\n",
+                &own(&["td-vm"])
+            )
+            .is_err_and(|e| e.contains("two names")),
             "a second name in one block is malformed, not a second package"
         );
         for table in ["[metadata]\n", "[[patch.unused]]\nname = \"td-vm\"\n"] {
@@ -8589,12 +9087,18 @@ mod tests {
             );
         }
         assert!(
-            dependency_free(lock, "[[package]]\nname = \"td-review\" trailing\n", &own(&[])).is_err(),
+            dependency_free(
+                lock,
+                "[[package]]\nname = \"td-review\" trailing\n",
+                &own(&[])
+            )
+            .is_err(),
             "a name line with trailing text is refused, not truncated"
         );
         // The workspace root carries three path members, and a fourth is the
         // shape that must red there.
-        let three = "[[package]]\nname = \"a\"\n[[package]]\nname = \"b\"\n[[package]]\nname = \"c\"\n";
+        let three =
+            "[[package]]\nname = \"a\"\n[[package]]\nname = \"b\"\n[[package]]\nname = \"c\"\n";
         assert!(dependency_free("Cargo.lock", three, &LockMembers::Count(3)).is_ok());
         assert!(dependency_free("Cargo.lock", three, &LockMembers::Count(1)).is_err());
 
@@ -8618,7 +9122,10 @@ mod tests {
                 for dep in allowed {
                     assert!(roster.contains(dep), "{lock} expects off-roster `{dep}`");
                     assert!(
-                        !matches!(dep.as_str(), "td-engine" | "td-net" | "td-builder" | "td-recipe"),
+                        !matches!(
+                            dep.as_str(),
+                            "td-engine" | "td-net" | "td-builder" | "td-recipe"
+                        ),
                         "{lock} expects the engine or net tier as a package"
                     );
                 }
@@ -8720,7 +9227,10 @@ mod tests {
             krate("td-dd", &[], &[]),
             krate("td-ee", &[], &[]),
         ];
-        assert_eq!(roster_closure(&roster, "td-aa"), ["td-bb", "td-cc", "td-ee"]);
+        assert_eq!(
+            roster_closure(&roster, "td-aa"),
+            ["td-bb", "td-cc", "td-ee"]
+        );
         assert_eq!(roster_closure(&roster, "td-bb"), ["td-cc", "td-dd"]);
         assert!(roster_closure(&roster, "td-cc").is_empty());
     }
@@ -8742,19 +9252,30 @@ mod tests {
         write("Cargo.lock", "[[package]]\nname = \"td-engine\"\n");
         write("td-aa/Cargo.toml", "[package]\nname = \"td-aa\"\n\n[dependencies]\ntd-bb = { path = \"../td-bb\" }\n\n[workspace]\n");
         write("td-aa/Cargo.lock", "[[package]]\nname = \"td-aa\"\ndependencies = [\n \"td-bb\",\n]\n\n[[package]]\nname = \"td-bb\"\n");
-        write("td-bb/Cargo.toml", "[package]\nname = \"td-bb\"\n\n[workspace]\n");
+        write(
+            "td-bb/Cargo.toml",
+            "[package]\nname = \"td-bb\"\n\n[workspace]\n",
+        );
         write("td-bb/Cargo.lock", "[[package]]\nname = \"td-bb\"\n");
         let locks = dependency_free_locks(&root).expect("a sibling dependency is admitted");
         for (lock, members) in &locks {
-            assert!(assert_dependency_free(&root, lock, members).is_ok(), "{lock}");
+            assert!(
+                assert_dependency_free(&root, lock, members).is_ok(),
+                "{lock}"
+            );
         }
         assert!(locks.iter().any(|(lock, members)| {
             lock == "td-aa/Cargo.lock"
-                && *members == LockMembers::Roster { own: "td-aa".into(), allowed: vec!["td-bb".into()] }
+                && *members
+                    == LockMembers::Roster {
+                        own: "td-aa".into(),
+                        allowed: vec!["td-bb".into()],
+                    }
         }));
         // The same lock text, from a manifest that reaches an outside copy.
         write("td-aa/Cargo.toml", "[package]\nname = \"td-aa\"\n\n[dependencies]\ntd-bb = { path = \"../vendor/td-bb\" }\n\n[workspace]\n");
-        assert!(dependency_free_locks(&root).is_err_and(|e| e.contains("td-aa") && e.contains("../vendor/td-bb")));
+        assert!(dependency_free_locks(&root)
+            .is_err_and(|e| e.contains("td-aa") && e.contains("../vendor/td-bb")));
         // A declared name that is not on the roster at all.
         write("td-aa/Cargo.toml", "[package]\nname = \"td-aa\"\n\n[dependencies]\ntd-zz = { path = \"../td-zz\" }\n\n[workspace]\n");
         assert!(dependency_free_locks(&root).is_err_and(|e| e.contains("`td-zz`")));
@@ -8762,8 +9283,14 @@ mod tests {
         // redirect an admitted name are refused before any lock is read.
         write("td-aa/Cargo.toml", "[package]\nname = \"td-aa\"\n\n[dependencies]\ntd-bb = { path = \"../td-bb\" }\n\n[workspace]\n");
         assert!(dependency_free_locks(&root).is_ok());
-        write(".cargo/config.toml", "[target.x86_64-unknown-linux-gnu]\nrunner = [\"x\"]\n");
-        assert!(dependency_free_locks(&root).is_ok(), "the runner config is not a redirect");
+        write(
+            ".cargo/config.toml",
+            "[target.x86_64-unknown-linux-gnu]\nrunner = [\"x\"]\n",
+        );
+        assert!(
+            dependency_free_locks(&root).is_ok(),
+            "the runner config is not a redirect"
+        );
         for redirect in [
             "paths = [\"../vendor/td-bb\"]\n",
             "\"paths\" = [\"../vendor/td-bb\"]\n",
@@ -8800,19 +9327,31 @@ mod tests {
             }
         }
         // Codex's escape: `"paths"` is `paths` once TOML decodes it.
-        write(".cargo/config.toml", "\"pa\\u0074hs\" = [\"../vendor/td-bb\"]\n");
+        write(
+            ".cargo/config.toml",
+            "\"pa\\u0074hs\" = [\"../vendor/td-bb\"]\n",
+        );
         assert!(
             dependency_free_locks(&root).is_err_and(|e| e.contains("escape")),
             "an escaped key is refused unread"
         );
-        write(".cargo/config.toml", "[build]\nrustdocflags = \"\"\"\npaths\n\"\"\"\n");
+        write(
+            ".cargo/config.toml",
+            "[build]\nrustdocflags = \"\"\"\npaths\n\"\"\"\n",
+        );
         assert!(
             dependency_free_locks(&root).is_err_and(|e| e.contains("multi-line")),
             "a multi-line string is refused unread"
         );
         // A continued array element that happens to say `paths` is a value.
-        write(".cargo/config.toml", "[build]\nrustflags = [\n  \"paths\",\n  \"source\",\n]\n");
-        assert!(dependency_free_locks(&root).is_ok(), "array items are not keys");
+        write(
+            ".cargo/config.toml",
+            "[build]\nrustflags = [\n  \"paths\",\n  \"source\",\n]\n",
+        );
+        assert!(
+            dependency_free_locks(&root).is_ok(),
+            "array items are not keys"
+        );
         std::fs::remove_file(root.join(".cargo/config.toml")).unwrap();
         write("td-aa/.cargo/config.toml", "[build]\n");
         assert!(
@@ -8829,8 +9368,14 @@ mod tests {
         std::os::unix::fs::symlink("notes.txt", root.join("td-notes.txt")).unwrap();
         std::os::unix::fs::symlink("missing", root.join("td-missing")).unwrap();
         std::os::unix::fs::symlink("vendor", root.join("scratch")).unwrap();
-        assert!(root.join("scratch").is_dir(), "the outside link resolves to a directory");
-        assert!(dependency_free_locks(&root).is_ok(), "linked files are skipped");
+        assert!(
+            root.join("scratch").is_dir(),
+            "the outside link resolves to a directory"
+        );
+        assert!(
+            dependency_free_locks(&root).is_ok(),
+            "linked files are skipped"
+        );
         // A link whose target cannot be told apart is refused, not skipped.
         std::os::unix::fs::symlink("td-loop", root.join("td-loop")).unwrap();
         assert!(
@@ -8838,7 +9383,10 @@ mod tests {
             "a symlink loop is an error"
         );
         std::fs::remove_file(root.join("td-loop")).unwrap();
-        write("vendor/td-cc/Cargo.toml", "[package]\nname = \"td-cc\"\n\n[workspace]\n");
+        write(
+            "vendor/td-cc/Cargo.toml",
+            "[package]\nname = \"td-cc\"\n\n[workspace]\n",
+        );
         std::os::unix::fs::symlink("vendor/td-cc", root.join("td-cc")).unwrap();
         assert!(
             discover_gate_crates(&root).is_err_and(|e| e.contains("symlink")),
@@ -8864,7 +9412,9 @@ mod tests {
                 );
                 continue;
             };
-            let Some(krate) = rest.split('/').next() else { continue };
+            let Some(krate) = rest.split('/').next() else {
+                continue;
+            };
             let lock = format!("{krate}/Cargo.lock");
             assert!(
                 locks.iter().any(|(l, _)| *l == lock),
@@ -8897,8 +9447,7 @@ mod tests {
             let manifest = format!("--manifest-path {krate}/Cargo.toml");
             for driver in ["cargo test", "cargo clippy"] {
                 assert!(
-                    cmds
-                        .iter()
+                    cmds.iter()
                         .any(|cmd| cargo_driver(cmd, driver) && cmd.contains(&manifest)),
                     "{krate} is in the lock roster but no `{driver}` in the \
                      command list compiles it — its lints and tests never run \
@@ -8933,14 +9482,20 @@ mod tests {
         for path in &recipes {
             let text = strip_line_comments(&std::fs::read_to_string(path).unwrap());
             let stages_rust = text.lines().any(|line| {
-                line.split("\"{src}/")
-                    .skip(1)
-                    .any(|rest| rest.split(DQUOTE as char).next().is_some_and(|p| p.ends_with(".rs")))
+                line.split("\"{src}/").skip(1).any(|rest| {
+                    rest.split(DQUOTE as char)
+                        .next()
+                        .is_some_and(|p| p.ends_with(".rs"))
+                })
             });
             if !stages_rust {
                 continue;
             }
-            let rel = path.strip_prefix(repo_root()).unwrap().to_string_lossy().replace('\\', "/");
+            let rel = path
+                .strip_prefix(repo_root())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
             assert!(
                 TARGET_STATIC_RECIPES.iter().any(|(_, r)| *r == rel),
                 "{rel} stages Rust sources but is not in TARGET_STATIC_RECIPES, \

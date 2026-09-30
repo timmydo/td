@@ -427,12 +427,7 @@ fn parse_umount(args: &[String]) -> Result<UmountPlan, String> {
             // whoever writes `-arx`.
             "--exclude" => match rest.next() {
                 Some(path) => plan.exclude.push(path.clone()),
-                None => {
-                    return Err(format!(
-                        "--exclude needs a mount point\n{}",
-                        umount_usage()
-                    ))
-                }
+                None => return Err(format!("--exclude needs a mount point\n{}", umount_usage())),
             },
             "--force" => plan.flags |= sys::MNT_FORCE,
             "--lazy" => plan.flags |= sys::MNT_DETACH,
@@ -632,14 +627,8 @@ fn unmount_one(target: &Target, flags: usize, remount_ro: bool) -> Result<(), St
     // The kernel ignores `source` for a remount, so the target names itself
     // rather than being looked back up in a table `-a` may already have
     // unmounted its way past.
-    sys::mount(
-        &c,
-        &c,
-        None,
-        remount_ro_flags(mounted_with),
-        None,
-    )
-    .map_err(|re| format!("{shown}: {e}; remounting read-only: {re}"))
+    sys::mount(&c, &c, None, remount_ro_flags(mounted_with), None)
+        .map_err(|re| format!("{shown}: {e}; remounting read-only: {re}"))
 }
 
 pub fn umount(args: &[String]) -> Result<u8, String> {
@@ -753,10 +742,7 @@ mod tests {
     #[test]
     fn an_option_that_clears_a_bit_beats_an_earlier_one_that_set_it() {
         assert_eq!(mounted(&["-o", "ro,rw", "d", "/t"]).flags, 0);
-        assert_eq!(
-            mounted(&["-o", "rw,ro", "d", "/t"]).flags,
-            sys::MS_RDONLY
-        );
+        assert_eq!(mounted(&["-o", "rw,ro", "d", "/t"]).flags, sys::MS_RDONLY);
         assert_eq!(mounted(&["-r", "-w", "d", "/t"]).flags, 0);
         assert_eq!(mounted(&["-w", "-r", "d", "/t"]).flags, sys::MS_RDONLY);
         assert_eq!(
@@ -927,7 +913,10 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             parse_table(b"x /mnt/a\\999 ext4 rw 0 0\n")[0].target,
             b"/mnt/a\\999"
         );
-        assert_eq!(parse_table(b"x /mnt/a\\134b ext4 rw 0 0\n")[0].target, b"/mnt/a\\b");
+        assert_eq!(
+            parse_table(b"x /mnt/a\\134b ext4 rw 0 0\n")[0].target,
+            b"/mnt/a\\b"
+        );
         // A short line contributes nothing — and does not end the walk, which
         // for `umount -a` would be a silently shortened list.
         let ragged = parse_table(b"garbage\n\nproc /proc proc rw 0 0\n");
@@ -954,10 +943,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         assert_eq!(table.len(), 1);
         assert_eq!(table[0].target, b"/mnt/\xff\xfe");
         // ...and it is still a legal argument to the syscall wrapper.
-        assert_eq!(
-            cstr(&table[0].target).unwrap().as_bytes(),
-            b"/mnt/\xff\xfe"
-        );
+        assert_eq!(cstr(&table[0].target).unwrap().as_bytes(), b"/mnt/\xff\xfe");
         // A NUL is the one byte a path cannot hold, and it is refused rather
         // than silently truncating the path the kernel would act on.
         assert!(cstr(b"/mnt/a\0b").is_err());
@@ -1000,7 +986,11 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         let text = table_text(&parse_table(
             b"x /mnt/a\\012b ext4 rw 0 0\ny /mnt/c\\040d ext4 rw 0 0\n",
         ));
-        assert_eq!(text.lines().count(), 2, "an entry split across lines: {text:?}");
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "an entry split across lines: {text:?}"
+        );
         assert!(text.contains("/mnt/a\\012b"), "{text}");
         assert!(text.contains("/mnt/c\\040d"), "{text}");
         // A round trip: what is printed parses back to what was read.
@@ -1063,7 +1053,10 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         assert_eq!(flags_from_options(b""), 0);
         // A non-UTF-8 option word is skipped rather than aborting the read, so
         // one odd token cannot cost the whole flag set.
-        assert_eq!(flags_from_options(b"ro,\xff\xfe,nodev"), sys::MS_RDONLY | sys::MS_NODEV);
+        assert_eq!(
+            flags_from_options(b"ro,\xff\xfe,nodev"),
+            sys::MS_RDONLY | sys::MS_NODEV
+        );
     }
 
     /// A target the mount table does not list has nothing to remount, and that
@@ -1072,10 +1065,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     #[test]
     fn a_target_absent_from_the_table_has_no_flags_to_carry() {
         let table = parse_table(b"/dev/vda /var btrfs rw,nodev 0 0\n");
-        assert_eq!(
-            table_flags(&table, b"/var"),
-            Some(sys::MS_NODEV)
-        );
+        assert_eq!(table_flags(&table, b"/var"), Some(sys::MS_NODEV));
         assert_eq!(table_flags(&table, b"/not-mounted"), None);
         assert_eq!(table_flags(&[], b"/var"), None);
     }
@@ -1113,9 +1103,8 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
     /// answers a device with EINVAL. The operand resolves through the table.
     #[test]
     fn an_operand_naming_a_device_resolves_to_its_mount_point() {
-        let table = parse_table(
-            b"/dev/vda /var btrfs rw,nodev 0 0\nproc /proc proc rw,nosuid 0 0\n",
-        );
+        let table =
+            parse_table(b"/dev/vda /var btrfs rw,nodev 0 0\nproc /proc proc rw,nosuid 0 0\n");
         let by_device = resolve(&table, b"/dev/vda");
         assert_eq!(by_device.path, b"/var");
         assert_eq!(by_device.mounted_with, Some(sys::MS_NODEV));
@@ -1163,7 +1152,6 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
             Some("proc")
         );
     }
-
 
     /// `--exclude` is EXACT, not a prefix.
     ///

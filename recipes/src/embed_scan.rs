@@ -299,15 +299,27 @@ mod tests {
             d("x")
         );
         assert!(td_dirs_embedded(&concat).is_empty(), "{concat}");
-        assert_eq!(td_dirs_named(&concat), vec!["td-x"], "the wide scan still sees it");
-        let comment = format!("// include_str!(\"../{}a.rs\")\n/// #[path = \"{}b\"]\n", d("c"), d("c"));
+        assert_eq!(
+            td_dirs_named(&concat),
+            vec!["td-x"],
+            "the wide scan still sees it"
+        );
+        let comment = format!(
+            "// include_str!(\"../{}a.rs\")\n/// #[path = \"{}b\"]\n",
+            d("c"),
+            d("c")
+        );
         assert!(td_dirs_embedded(&comment).is_empty());
         assert!(td_dirs_named(&strip_comments(&comment)).is_empty());
     }
 
     #[test]
     fn a_comment_is_cut_and_a_slash_pair_inside_a_string_is_kept() {
-        let text = format!("let u = \"https://{}\"; // {}\nlet v = \"a \\\" // b\"; // c\n", d("k"), d("m"));
+        let text = format!(
+            "let u = \"https://{}\"; // {}\nlet v = \"a \\\" // b\"; // c\n",
+            d("k"),
+            d("m")
+        );
         let code = strip_comments(&text);
         assert_eq!(td_dirs_named(&code), vec!["td-k"]);
         assert!(code.contains("// b\""), "{code}");
@@ -336,7 +348,10 @@ mod tests {
         );
         assert!(td_dirs_named(&code).is_empty(), "{code}");
         // An unclosed block runs to the end, and a `/*` in a string opens none.
-        assert_eq!(strip_comments("let s = \"/*\"; /* x\ny"), "let s = \"/*\"; \n");
+        assert_eq!(
+            strip_comments("let s = \"/*\"; /* x\ny"),
+            "let s = \"/*\"; \n"
+        );
         assert_eq!(char_literal_len("'\\''x"), 4);
         assert_eq!(char_literal_len("'\\\\'"), 4);
     }

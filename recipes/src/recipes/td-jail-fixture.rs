@@ -15,8 +15,7 @@ pub fn recipe() -> Recipe {
     else {
         return invalid_recipe("declaration");
     };
-    let Ok(launcher) =
-        LauncherDeclaration::new(APPLICATION_DISPLAY_NAME, APPLICATION_SEARCH_TERMS)
+    let Ok(launcher) = LauncherDeclaration::new(APPLICATION_DISPLAY_NAME, APPLICATION_SEARCH_TERMS)
     else {
         return invalid_recipe("launcher");
     };
@@ -109,10 +108,7 @@ mod tests {
             launcher.search_terms().collect::<Vec<_>>(),
             APPLICATION_SEARCH_TERMS
         );
-        assert_eq!(
-            recipe.payload_inputs,
-            Some(vec!["empty-runtime".into()])
-        );
+        assert_eq!(recipe.payload_inputs, Some(vec!["empty-runtime".into()]));
         assert_eq!(
             recipe
                 .application_permissions

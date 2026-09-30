@@ -17,25 +17,25 @@
 //!     `td-builder check` rung.
 
 mod affected;
-mod native_tests;
 mod application;
 mod bootstrap;
 mod build;
 mod build_daemon;
 mod bzip2;
 mod cargo_lock;
-mod crypto_policy;
-mod crypto_build;
-mod crypto_headers;
-mod crypto_portable;
-mod crypto_isolated;
-mod crypto_api;
 mod check_host;
 mod check_loop;
 mod check_memory;
+mod crypto_api;
+mod crypto_build;
+mod crypto_headers;
+mod crypto_isolated;
+mod crypto_policy;
+mod crypto_portable;
 mod drv;
 mod efi;
 mod elf;
+mod native_tests;
 // The build script compiles it in by path and the tests read it; the binary
 // itself never does.
 #[cfg(test)]
@@ -44,10 +44,10 @@ mod erofs;
 // The comment-splice static guard (#300) is exercised only by its own `#[test]`
 // (the cargo-test tier) — gate it to test builds so it adds no dead-code surface
 // to the release binary or the clippy pass.
-#[cfg(test)]
-mod gate_lint;
 mod gate_bodies;
 mod gate_inputs;
+#[cfg(test)]
+mod gate_lint;
 mod gate_timing;
 mod gates;
 use td_engine::gzip;
@@ -97,7 +97,15 @@ fn nar_hash_path(path: &Path) -> Result<String, std::io::Error> {
     sandbox::nar_hash_of(path)
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn nar_hash(path: &str) -> Result<String, std::io::Error> {
     nar_hash_path(Path::new(path))
 }
@@ -109,7 +117,15 @@ struct HashSizeWriter {
     size: u64,
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 impl std::io::Write for HashSizeWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.hasher.update(buf);
@@ -122,19 +138,32 @@ impl std::io::Write for HashSizeWriter {
 }
 
 /// The (NAR hash, NAR size) of a path — one serialization pass.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn nar_hash_size_path(path: &Path) -> Result<(String, u64), std::io::Error> {
-    let mut w = HashSizeWriter { hasher: sha256::Sha256::new(), size: 0 };
+    let mut w = HashSizeWriter {
+        hasher: sha256::Sha256::new(),
+        size: 0,
+    };
     nar::write_nar(&mut w, path)?;
-    Ok((format!("sha256:{}", sha256::to_base16(&w.hasher.finalize())), w.size))
+    Ok((
+        format!("sha256:{}", sha256::to_base16(&w.hasher.finalize())),
+        w.size,
+    ))
 }
 
 fn read_arg_bytes(path: &str) -> Result<Vec<u8>, String> {
     if path == "-" {
         let mut buf = Vec::new();
         let mut stdin = std::io::stdin();
-        std::io::Read::read_to_end(&mut stdin, &mut buf)
-            .map_err(|e| format!("read stdin: {e}"))?;
+        std::io::Read::read_to_end(&mut stdin, &mut buf).map_err(|e| format!("read stdin: {e}"))?;
         return Ok(buf);
     }
     std::fs::read(path).map_err(|e| format!("read {path}: {e}"))
@@ -327,14 +356,17 @@ fn text_cli(args: &[String]) -> ExitCode {
 }
 
 fn collect_regular_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let meta =
+        std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
     if meta.is_file() {
         out.push(path.to_path_buf());
         return Ok(());
     }
     if meta.is_dir() {
         let mut entries: Vec<PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(path).map_err(|e| format!("read dir {}: {e}", path.display()))? {
+        for entry in
+            std::fs::read_dir(path).map_err(|e| format!("read dir {}: {e}", path.display()))?
+        {
             let entry = entry.map_err(|e| format!("read dir {}: {e}", path.display()))?;
             entries.push(entry.path());
         }
@@ -357,10 +389,13 @@ fn regular_files_under(args: &[String]) -> Result<Vec<PathBuf>, String> {
 }
 
 fn collect_named_file_entries(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let meta =
+        std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
     if meta.is_dir() {
         let mut entries: Vec<PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(path).map_err(|e| format!("read dir {}: {e}", path.display()))? {
+        for entry in
+            std::fs::read_dir(path).map_err(|e| format!("read dir {}: {e}", path.display()))?
+        {
             let entry = entry.map_err(|e| format!("read dir {}: {e}", path.display()))?;
             entries.push(entry.path());
         }
@@ -433,7 +468,8 @@ fn tree_fingerprint(args: &[String]) -> Result<String, String> {
     let mut h = sha256::Sha256::new();
     for file in files {
         let path = file.to_string_lossy();
-        let digest = sha256::sha256_file(&file).map_err(|e| format!("sha256 {}: {e}", file.display()))?;
+        let digest =
+            sha256::sha256_file(&file).map_err(|e| format!("sha256 {}: {e}", file.display()))?;
         h.update(path.as_bytes());
         h.update(b"\0");
         h.update(digest.as_bytes());
@@ -503,7 +539,11 @@ fn lock_paths(lock_file: &str, prefix: Option<&str>) -> Result<Vec<String>, Stri
     Ok(out)
 }
 
-fn rewrite_gcc_toolchain_lock_body(text: &str, toolchain: &str, glibc: &str) -> Result<String, String> {
+fn rewrite_gcc_toolchain_lock_body(
+    text: &str,
+    toolchain: &str,
+    glibc: &str,
+) -> Result<String, String> {
     let mut out = String::new();
     let mut replaced = false;
     for raw in text.lines() {
@@ -569,8 +609,8 @@ fn lock_cli(args: &[String]) -> ExitCode {
         },
         [op, input, output, toolchain, glibc] if op == "rewrite-gcc-toolchain" => {
             let run = || -> Result<(), String> {
-                let text = std::fs::read_to_string(input)
-                    .map_err(|e| format!("read {input}: {e}"))?;
+                let text =
+                    std::fs::read_to_string(input).map_err(|e| format!("read {input}: {e}"))?;
                 let body = rewrite_gcc_toolchain_lock_body(&text, toolchain, glibc)?;
                 std::fs::write(output, body).map_err(|e| format!("write {output}: {e}"))
             };
@@ -664,7 +704,15 @@ struct SubstMember {
 }
 
 /// The basename (`<hash>-name`) of a store path.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn store_basename(p: &str) -> &str {
     p.rsplit('/').next().unwrap_or(p)
 }
@@ -672,7 +720,15 @@ fn store_basename(p: &str) -> &str {
 /// Render a td-native narinfo (minimal, line-oriented). References are recorded as
 /// basenames so the record is store-location independent; the consumer rebases them onto
 /// its own store dir. The signature line (`Sig:`) is appended later by the signer.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn narinfo_text(
     store_path: &str,
     narhash: &str,
@@ -688,7 +744,15 @@ fn narinfo_text(
 
 /// Write a serve-able substitute directory for MEMBERS into OUTDIR. Returns the basenames
 /// written. Each member yields `OUTDIR/<basename>.narinfo` + `OUTDIR/nar/<narhash>.nar`.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn subst_export(outdir: &Path, members: &[SubstMember]) -> std::io::Result<Vec<String>> {
     let nardir = outdir.join("nar");
     std::fs::create_dir_all(&nardir)?;
@@ -701,8 +765,11 @@ fn subst_export(outdir: &Path, members: &[SubstMember]) -> std::io::Result<Vec<S
         nar::write_nar(&mut f, &m.physical)?;
         drop(f);
         let base = store_basename(&m.store_path);
-        let refbases: Vec<String> =
-            m.refs.iter().map(|r| store_basename(r).to_string()).collect();
+        let refbases: Vec<String> = m
+            .refs
+            .iter()
+            .map(|r| store_basename(r).to_string())
+            .collect();
         let text = narinfo_text(&m.store_path, &narhash, narsize, &narfile, &refbases);
         std::fs::write(outdir.join(format!("{base}.narinfo")), text)?;
         written.push(base.to_string());
@@ -718,7 +785,15 @@ fn subst_export(outdir: &Path, members: &[SubstMember]) -> std::io::Result<Vec<S
 /// narinfo still lists each path's refs as basenames either way, so a consumer can scan-verify
 /// the restored bytes. (td-builder's OWN substitute-consumer hook was deleted, re #469; the
 /// format's consumer half is proven by the `restore_substitute` round-trip test.)
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn subst_export_members(
     db: &store_db_read::Db,
     store_dir: &str,
@@ -788,7 +863,15 @@ fn harness_subst_export(outdir: &Path, harness_dir: &Path) -> Result<Vec<String>
 }
 
 /// The `path` column (index 1) of a read `ValidPaths` row, or "" if absent.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn path_at(cols: &[store_db_read::Value]) -> &str {
     match cols.get(1) {
         Some(store_db_read::Value::Text(p)) => p,
@@ -804,7 +887,15 @@ fn path_at(cols: &[store_db_read::Value]) -> &str {
 /// reproduced (dirs are left writable so the scratch copy can be cleaned up);
 /// regular files get the canonical `0555`/`0444` by their source exec bit, which
 /// is the one perm NAR encodes. Mirrors `(guix serialization) write-file`.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn copy_canonical(src: &Path, dst: &Path) -> Result<(), String> {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let md = std::fs::symlink_metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
@@ -847,7 +938,11 @@ fn copy_canonical(src: &Path, dst: &Path) -> Result<(), String> {
 fn try_reflink(src: &Path, dst: &Path) -> Result<bool, String> {
     use std::os::unix::io::AsRawFd;
     let s = std::fs::File::open(src).map_err(|e| format!("{}: {e}", src.display()))?;
-    let d = match std::fs::OpenOptions::new().write(true).create_new(true).open(dst) {
+    let d = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+    {
         Ok(f) => f,
         Err(e) => return Err(format!("{}: {e}", dst.display())),
     };
@@ -998,7 +1093,11 @@ fn remove_store_path_aside(path: &Path) -> Result<bool, String> {
             Ok(true)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("rename {} aside to {}: {e}", path.display(), tmp.display())),
+        Err(e) => Err(format!(
+            "rename {} aside to {}: {e}",
+            path.display(),
+            tmp.display()
+        )),
     }
 }
 
@@ -1102,11 +1201,8 @@ fn sweep_host_sandbox_scratch(parent: &Path) -> sandbox::ScratchSweep {
         make_host_scratch_run_accessible(&run);
         // A run with no `.live` at all crashed before it published one, so
         // here a missing lease is the crash rather than an older builder.
-        let outcome = sandbox::reclaim_leased_tree(
-            &run.join(".live"),
-            &run,
-            sandbox::MissingLease::Reclaim,
-        );
+        let outcome =
+            sandbox::reclaim_leased_tree(&run.join(".live"), &run, sandbox::MissingLease::Reclaim);
         report.record(&run, outcome);
     }
     report
@@ -1129,7 +1225,12 @@ fn host_sandbox_scratch(worktree: &Path) -> Result<HostSandboxScratch, String> {
         .write(true)
         .truncate(false)
         .open(&coordination_path)
-        .map_err(|e| format!("open check scratch lock {}: {e}", coordination_path.display()))?;
+        .map_err(|e| {
+            format!(
+                "open check scratch lock {}: {e}",
+                coordination_path.display()
+            )
+        })?;
     coordination
         .lock()
         .map_err(|e| format!("lock check scratch {}: {e}", coordination_path.display()))?;
@@ -1161,12 +1262,18 @@ fn host_sandbox_scratch(worktree: &Path) -> Result<HostSandboxScratch, String> {
             Ok(file) => file,
             Err(e) => {
                 let _ = sandbox::remove_scratch_tree(&run);
-                return Err(format!("create check scratch lease {}: {e}", live_path.display()));
+                return Err(format!(
+                    "create check scratch lease {}: {e}",
+                    live_path.display()
+                ));
             }
         };
         if let Err(e) = live.lock() {
             let _ = sandbox::remove_scratch_tree(&run);
-            return Err(format!("lock check scratch lease {}: {e}", live_path.display()));
+            return Err(format!(
+                "lock check scratch lease {}: {e}",
+                live_path.display()
+            ));
         }
         let tmp = run.join("tmp");
         let namespace = run.join("namespace");
@@ -1403,7 +1510,15 @@ struct OutputReg {
 /// references resolve to another output's id or to a scaffolding `ValidPaths` row
 /// (path only) — the same shape `store-add-referenced` writes. registrationTime is
 /// a fixed sentinel (excluded from the daemon differential, as in `store-register`).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn write_output_db(regs: &[OutputReg], out_db: &Path) -> Result<(), String> {
     use std::collections::BTreeMap;
     use store_db::{Table, Value};
@@ -1504,7 +1619,15 @@ fn write_output_db(regs: &[OutputReg], out_db: &Path) -> Result<(), String> {
 /// Scope is the GC/closure authority — `ValidPaths` + `Refs`; a persistent commit DB
 /// does not carry `DerivationOutputs` (as `store-gc-sweep`'s swept DB does not: the
 /// drv→output mapping is rebuilt by registration, not by accumulation).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn merge_regs(existing: Option<&[u8]>, new_regs: &[OutputReg]) -> Result<Vec<u8>, String> {
     use std::collections::{BTreeMap, BTreeSet};
     use store_db::{Table, Value as WV};
@@ -1630,7 +1753,15 @@ fn merge_regs(existing: Option<&[u8]>, new_regs: &[OutputReg]) -> Result<Vec<u8>
 /// Read-modify-write `merge_regs` against an on-disk persistent DB: load DEST-DB if
 /// it exists (a missing file = the first commit), union the NEW outputs in, write it
 /// back. The store dir's bytes are interned by the caller (`store-commit`).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn merge_output_db(dest_db: &Path, new_regs: &[OutputReg]) -> Result<(), String> {
     let existing = match std::fs::read(dest_db) {
         Ok(b) => Some(b),
@@ -1937,7 +2068,11 @@ struct StoreGcReport {
 
 impl StoreGcReport {
     fn lines(&self) -> Vec<String> {
-        let verb = if self.dry_run { "would remove" } else { "removed" };
+        let verb = if self.dry_run {
+            "would remove"
+        } else {
+            "removed"
+        };
         vec![
             format!(
                 "store-gc: {} registered paths: {} live ({}), {} unused ({})",
@@ -2085,7 +2220,10 @@ fn store_gc_unused(
     for (path, base, deriver, _) in &rows {
         by_base.insert(base.as_str(), path.as_str());
         if let Some(d) = deriver {
-            by_deriver.entry(d.as_str()).or_default().push(path.as_str());
+            by_deriver
+                .entry(d.as_str())
+                .or_default()
+                .push(path.as_str());
         }
     }
     // Receipts: the regular files `<drv-basename>.receipt`, judged by last use WITHOUT
@@ -2211,9 +2349,7 @@ fn store_gc_unused(
     // the file's identity.
     if let (Some(db), true) = (&db, report.dead_rows > 0) {
         let (_dropped, deleted, _kept) =
-            retain_registered_paths(store_dir, db_path, db, |path, _base| {
-                live.contains(path)
-            })?;
+            retain_registered_paths(store_dir, db_path, db, |path, _base| live.contains(path))?;
         report.deleted_trees = deleted;
     }
     // A receipt that can never hit again holds no authority; remove it. Its row (if any)
@@ -2382,7 +2518,15 @@ fn store_add_builder(
 /// shape. Returns the per-output registration facts (for `realize` to write a td
 /// store-db). Shared by `build` (CLOSURE handed in as a file) and `realize`
 /// (CLOSURE computed by td itself from the store DB's Refs graph).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_and_register(
     drv_path: &str,
     closure: &[String],
@@ -2453,7 +2597,15 @@ fn build_and_register(
 /// separated. Written by `build_and_register` after a real build and by a
 /// persistent-store read-back (so a fresh scratch that reused a prior build's output
 /// still carries the same registration a real build would have).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn registration_text(regs: &[OutputReg]) -> String {
     let mut record = String::new();
     for r in regs {
@@ -2472,10 +2624,25 @@ fn registration_text(regs: &[OutputReg]) -> String {
 /// PERSISTENT store and MERGE its registration into the accumulating DB — the build-into
 /// half of an incremental store. Idempotent (a content path already present is a no-op).
 /// Shared by the `store-commit` subcommand and build-recipe's persistent-store build-into.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result<Vec<String>, String> {
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+fn commit_scratch_to_store(
+    scratch: &Path,
+    store_dir: &str,
+    db: &Path,
+) -> Result<Vec<String>, String> {
     let reg = std::fs::read_to_string(scratch.join("registration")).map_err(|e| {
-        format!("read {}/registration: {e} (build into this scratch first)", scratch.display())
+        format!(
+            "read {}/registration: {e} (build into this scratch first)",
+            scratch.display()
+        )
     })?;
     let regs = parse_registration_blocks(&reg);
     if regs.is_empty() {
@@ -2516,7 +2683,13 @@ fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result
         // Commit atomically and fail closed only on a REGISTERED mismatch (a torn orphan is
         // recovered) — see commit_tree_checked. Byte-COPY (link=false): this is the durable
         // store, and its scratch source is discarded, so it must own independent bytes.
-        commit_tree_checked(&src, &dest, &r.nar_hash, registered.contains(&r.store_path), false)?;
+        commit_tree_checked(
+            &src,
+            &dest,
+            &r.nar_hash,
+            registered.contains(&r.store_path),
+            false,
+        )?;
         committed.push(r.store_path.clone());
     }
     merge_output_db(db, &regs)?;
@@ -2678,7 +2851,13 @@ struct PersistIndex {
 /// the db via `write_atomic` (temp + RENAME), so dev+inode changes on any rewrite even when len or
 /// a coarse mtime don't; len+mtime just corroborate. A stale key only ever causes a safe spurious
 /// MISS — reuse identity is re-gated against the freshly-read receipt, never the cache.
-type PersistKey = (std::path::PathBuf, u64, u64, u64, Option<std::time::SystemTime>);
+type PersistKey = (
+    std::path::PathBuf,
+    u64,
+    u64,
+    u64,
+    Option<std::time::SystemTime>,
+);
 
 /// The `persist_index` single-slot cache: the last-parsed db's key + its shared index.
 type PersistCacheSlot = std::sync::Mutex<Option<(PersistKey, std::sync::Arc<PersistIndex>)>>;
@@ -2759,7 +2938,15 @@ fn persist_index(persist_db: &Path) -> Result<Option<std::sync::Arc<PersistIndex
 /// td.db from them), so the build is SKIPPED. Any missing/identity-mismatched leg ⇒ None
 /// (rebuild), and any tree staged so far is unwound. The daemon's valid-path skip, sourced
 /// across process boundaries from an on-disk store.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn persistent_realization(
     parsed: &drv::Derivation,
     persist_store: &str,
@@ -2868,7 +3055,15 @@ fn persistent_realization(
 /// writes — one block per output, a `path ` line opening each. Order is preserved.
 /// Shared by `cached_realization` (the build cache) and `store-commit` (interning a
 /// finished build into the persistent store), so both read the registration the same way.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn parse_registration_blocks(text: &str) -> Vec<OutputReg> {
     let mut recs: Vec<OutputReg> = Vec::new();
     let mut cur: Option<OutputReg> = None;
@@ -3117,7 +3312,10 @@ fn receipt_text(expect: &ReceiptExpect, regs: &[OutputReg]) -> String {
     t.push_str(&format!("builder {}\n", expect.builder));
     t.push_str("producer local-build\n");
     for r in regs {
-        t.push_str(&format!("output {} {} {}\n", r.store_path, r.nar_hash, r.nar_size));
+        t.push_str(&format!(
+            "output {} {} {}\n",
+            r.store_path, r.nar_hash, r.nar_size
+        ));
     }
     t
 }
@@ -3172,7 +3370,11 @@ fn receipt_outputs(
         && manifest_sha == Some(expect.manifest_sha256.as_str())
         && builder == Some(expect.builder.as_str())
         && producer == Some("local-build");
-    if ok { Some(outputs) } else { None }
+    if ok {
+        Some(outputs)
+    } else {
+        None
+    }
 }
 
 /// AUTHENTICATE a `--recipe-output-db DB` before its rows can be typed
@@ -3281,7 +3483,15 @@ fn authenticate_recipe_output_db(dbp: &str) -> Result<(), String> {
 /// reuse decision is bound to the same typed authority a fresh build would
 /// stage from; the reproducibility `check` force-rebuilds, so reuse here never
 /// weakens the repro proof.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn cached_realization(
     parsed: &drv::Derivation,
     scratch: &Path,
@@ -3355,7 +3565,15 @@ fn narinfo_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 /// inputs): it survives as the consumer half of the subst-export FORMAT proof,
 /// exercised by `restore_substitute_round_trips_and_rejects_corruption`.
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn restore_substitute(
     narinfo: &str,
     narfile: &Path,
@@ -3476,11 +3694,17 @@ fn source_overrides_for_lock(
             .to_os_string();
         overrides.push(SrcOverride {
             canonical,
-            on_disk: Path::new(store_dir).join(base).to_string_lossy().into_owned(),
+            on_disk: Path::new(store_dir)
+                .join(base)
+                .to_string_lossy()
+                .into_owned(),
             db: db_path.to_string(),
         });
     }
-    if !overrides.iter().any(|override_| override_.canonical == primary_source) {
+    if !overrides
+        .iter()
+        .any(|override_| override_.canonical == primary_source)
+    {
         return Err(format!(
             "lock {lock_file} does not name the source `{primary_source}' registered by {db_path}"
         ));
@@ -3538,9 +3762,7 @@ fn daemon_budget_probe(req: &str, enabled: bool) -> Result<Option<String>, Strin
 const DAEMON_STDOUT_TAIL_BYTES: usize = 64 * 1024;
 const MAX_DERIVATION_BYTES: u64 = 16 * 1024 * 1024;
 
-fn read_daemon_stdout_tail(
-    mut reader: impl std::io::Read,
-) -> Result<(Vec<u8>, bool), String> {
+fn read_daemon_stdout_tail(mut reader: impl std::io::Read) -> Result<(Vec<u8>, bool), String> {
     let mut tail = std::collections::VecDeque::with_capacity(DAEMON_STDOUT_TAIL_BYTES);
     let mut chunk = [0u8; 8192];
     let mut truncated = false;
@@ -3572,7 +3794,10 @@ fn read_daemon_stdout_tail(
 
 fn daemon_ok_line(tail: &[u8], truncated: bool) -> Option<String> {
     let safe = if truncated {
-        let start = tail.iter().position(|byte| *byte == b'\n')?.saturating_add(1);
+        let start = tail
+            .iter()
+            .position(|byte| *byte == b'\n')?
+            .saturating_add(1);
         tail.get(start..)?
     } else {
         tail
@@ -3585,9 +3810,7 @@ fn daemon_ok_line(tail: &[u8], truncated: bool) -> Option<String> {
 }
 
 type DaemonKeyMap = std::sync::Arc<
-    std::sync::Mutex<
-        std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>,
-    >,
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
 >;
 
 struct DaemonKeyUse {
@@ -3624,7 +3847,10 @@ fn verify_builder_lineage(ov: &BuilderOverride) -> Result<(), String> {
     let data = std::fs::read(&ov.db).map_err(|e| format!("read builder db {}: {e}", ov.db))?;
     let rows = store_db_read::Db::open(data)?.hashes_by_path()?;
     let hash = rows.get(&ov.canonical).ok_or_else(|| {
-        format!("builder db {} has no hashed row for {}", ov.db, ov.canonical)
+        format!(
+            "builder db {} has no hashed row for {}",
+            ov.db, ov.canonical
+        )
     })?;
     let dir = stage0::builder_lineage_dir()?;
     if stage0::builder_lineage_recorded_in(&dir, hash)? {
@@ -3662,9 +3888,7 @@ fn builder_override_from_env() -> Result<Option<BuilderOverride>, String> {
             Ok(Some(ov))
         }
         (None, None, None) => Ok(None),
-        _ => {
-            Err("TD_BUILDER_PATH/TD_BUILDER_STORE/TD_BUILDER_DB must be set together".to_string())
-        }
+        _ => Err("TD_BUILDER_PATH/TD_BUILDER_STORE/TD_BUILDER_DB must be set together".to_string()),
     }
 }
 
@@ -3704,7 +3928,11 @@ fn daemon_host_path(scr: &Path, canon: &str) -> Result<String, String> {
     let base = canon
         .strip_prefix(&prefix)
         .ok_or_else(|| format!("{canon}: not a store path (active store: {prefix})"))?;
-    Ok(scr.join("newstore").join(base).to_string_lossy().into_owned())
+    Ok(scr
+        .join("newstore")
+        .join(base)
+        .to_string_lossy()
+        .into_owned())
 }
 
 /// Is every one of `canons`' output trees present under `dir` (a keyed build scratch)?
@@ -3757,7 +3985,15 @@ fn daemon_realize_one(
     // full manifest remains what realize_drv enforces.
     let manifest_now = assemble_input_manifest(&extra_dbs, &[], ov.as_ref())?;
     let seed_dirs = [seed_dir.to_string()];
-    let ic = stage_input_closure(&parsed, &seed_dirs, &store::store_dir(), &extra_dbs, &[], ov.as_ref(), None)?;
+    let ic = stage_input_closure(
+        &parsed,
+        &seed_dirs,
+        &store::store_dir(),
+        &extra_dbs,
+        &[],
+        ov.as_ref(),
+        None,
+    )?;
     let expect = ReceiptExpect {
         drv_sha256: sha256_hex(&content),
         // The reuse key folds the drv's DECLARED ABI builder identity (parsed.builder) and
@@ -3781,7 +4017,16 @@ fn daemon_realize_one(
         return Ok((c, h, true));
     }
     eprintln!("td-builder: daemon CACHE MISS for {drv} — realizing");
-    let regs = realize_drv(drv, &seed_dirs, &store::store_dir(), &extra_dbs, &scr, &[], ov.as_ref(), None)?;
+    let regs = realize_drv(
+        drv,
+        &seed_dirs,
+        &store::store_dir(),
+        &extra_dbs,
+        &scr,
+        &[],
+        ov.as_ref(),
+        None,
+    )?;
     let (c, h) = mk(&regs)?;
     Ok((c, h, false))
 }
@@ -3813,7 +4058,16 @@ fn daemon_check_one(
     let r1 = scr.join("r1");
     // No seed-store bytes carry manifest authority (the guix bless db is retired).
     let extra_dbs: Vec<(String, sandbox::InputOrigin)> = Vec::new();
-    let regs1 = realize_drv(drv, &seed_dirs, &store::store_dir(), &extra_dbs, &r1, &[], ov.as_ref(), None)?;
+    let regs1 = realize_drv(
+        drv,
+        &seed_dirs,
+        &store::store_dir(),
+        &extra_dbs,
+        &r1,
+        &[],
+        ov.as_ref(),
+        None,
+    )?;
     // Baseline for the comparison: the build verb's already-realized output at
     // scratch_base/<key> when every output tree is present there (the loop's normal path,
     // ⇒ 2 builds total), else a SECOND fresh build (bare-CHECK fallback ⇒ the original 3).
@@ -3823,7 +4077,16 @@ fn daemon_check_one(
         built
     } else {
         let r2 = scr.join("r2");
-        let _ = realize_drv(drv, &seed_dirs, &store::store_dir(), &extra_dbs, &r2, &[], ov.as_ref(), None)?;
+        let _ = realize_drv(
+            drv,
+            &seed_dirs,
+            &store::store_dir(),
+            &extra_dbs,
+            &r2,
+            &[],
+            ov.as_ref(),
+            None,
+        )?;
         r2
     };
     for reg in &regs1 {
@@ -3852,7 +4115,15 @@ fn daemon_check_one(
 /// skipped (a caller may pass an optional td-store dir). This is the hoisted candidate set a
 /// `scan::Scanner` matches against (store-closure-scan / #260): building it ONCE and
 /// `reset()`-ing between paths keeps a whole-live-store walk O(bytes), not O(candidates).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn scan_candidate_index(
     store_dirs: &[String],
     canonical_prefix: &str,
@@ -3918,8 +4189,12 @@ fn recanonicalize_candidates(
     overrides: &std::collections::HashMap<String, String>,
 ) {
     for c in candidates.iter_mut() {
-        let Some(h) = store::hash_from_store_path(c) else { continue };
-        let Some(true_canonical) = overrides.get(h) else { continue };
+        let Some(h) = store::hash_from_store_path(c) else {
+            continue;
+        };
+        let Some(true_canonical) = overrides.get(h) else {
+            continue;
+        };
         if true_canonical == c {
             continue;
         }
@@ -3939,7 +4214,15 @@ fn recanonicalize_candidates(
 /// reference (the only unsafe direction is under-staging). SCANNER carries the candidate
 /// index built ONCE; it is `reset()` between paths, so this is O(bytes scanned), not
 /// O(candidates × paths). Returns the reachable canonical paths (ROOTS included).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn scan_closure_hybrid(
     scanner: &mut scan::Scanner,
     on_disk: &std::collections::HashMap<String, String>,
@@ -4013,7 +4296,9 @@ fn scan_closure_hybrid(
                         .iter()
                         .filter_map(|r| store::hash_from_store_path(r).map(str::to_string))
                         .collect();
-                    memo.lock().unwrap_or_else(|e| e.into_inner()).insert(key, hashes);
+                    memo.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(key, hashes);
                     refs.extend(scanned);
                 }
             }
@@ -4038,9 +4323,11 @@ fn scan_closure_hybrid(
 /// ONCE instead of per rung, while a caller with a different candidate set never sees a
 /// set-specific match. Same OnceLock<Mutex> + poison-recovery shape as `persist_index`;
 /// single-threaded in practice.
-fn closure_ref_memo() -> &'static std::sync::Mutex<std::collections::HashMap<([u8; 32], String), Vec<String>>> {
-    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<([u8; 32], String), Vec<String>>>> =
-        std::sync::OnceLock::new();
+fn closure_ref_memo(
+) -> &'static std::sync::Mutex<std::collections::HashMap<([u8; 32], String), Vec<String>>> {
+    static MEMO: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<([u8; 32], String), Vec<String>>>,
+    > = std::sync::OnceLock::new();
     MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -4156,7 +4443,15 @@ fn resolve_link_closure(
 /// map, for `scan_closure_hybrid`. These DBs are td's OWN registration (never `/var/guix`);
 /// they carry a td-built dep whose bytes live outside the content-scanned seed dirs, so
 /// its refs are read from the DB it wrote.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn merge_extra_refs(
     extra_dbs: &[(String, sandbox::InputOrigin)],
 ) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
@@ -4194,7 +4489,13 @@ fn manifest_add_db(
             }
             Some(_) => {}
             None => {
-                m.insert(p, sandbox::StagedInput { nar_hash: h, origin });
+                m.insert(
+                    p,
+                    sandbox::StagedInput {
+                        nar_hash: h,
+                        origin,
+                    },
+                );
             }
         }
     }
@@ -4316,12 +4617,11 @@ fn assemble_input_manifest(
 ) -> Result<sandbox::StageManifest, String> {
     let mut manifest = manifest_from_typed_dbs(extra_dbs)?;
     for ov in src_overrides {
-        let items_dir = Path::new(&ov.on_disk).parent().ok_or_else(|| {
-            format!("source placement {} has no parent store dir", ov.on_disk)
-        })?;
+        let items_dir = Path::new(&ov.on_disk)
+            .parent()
+            .ok_or_else(|| format!("source placement {} has no parent store dir", ov.on_disk))?;
         authenticate_ca_db(&ov.db, items_dir, "source placement")?;
-        let data =
-            std::fs::read(&ov.db).map_err(|e| format!("read source db {}: {e}", ov.db))?;
+        let data = std::fs::read(&ov.db).map_err(|e| format!("read source db {}: {e}", ov.db))?;
         manifest_add_db(
             &mut manifest,
             &store_db_read::Db::open(data)?,
@@ -4330,12 +4630,11 @@ fn assemble_input_manifest(
         )?;
     }
     if let Some(ov) = builder_override {
-        let items_dir = Path::new(&ov.on_disk).parent().ok_or_else(|| {
-            format!("builder placement {} has no parent store dir", ov.on_disk)
-        })?;
+        let items_dir = Path::new(&ov.on_disk)
+            .parent()
+            .ok_or_else(|| format!("builder placement {} has no parent store dir", ov.on_disk))?;
         authenticate_ca_db(&ov.db, items_dir, "builder placement")?;
-        let data =
-            std::fs::read(&ov.db).map_err(|e| format!("read builder db {}: {e}", ov.db))?;
+        let data = std::fs::read(&ov.db).map_err(|e| format!("read builder db {}: {e}", ov.db))?;
         manifest_add_db(
             &mut manifest,
             &store_db_read::Db::open(data)?,
@@ -4373,7 +4672,10 @@ fn enforce_realize_input_policy(
     // whole path) — defensive: an empty root is not an admissible manifest entry.
     let owns = |r: &str| {
         !r.is_empty()
-            && (drv_builder == r || drv_builder.strip_prefix(r).is_some_and(|t| t.starts_with('/')))
+            && (drv_builder == r
+                || drv_builder
+                    .strip_prefix(r)
+                    .is_some_and(|t| t.starts_with('/')))
     };
     if !self_tree.filter(|t| !t.is_empty()).is_some_and(owns) {
         let admissible = roots.iter().any(|r| {
@@ -4488,7 +4790,15 @@ struct InputClosure {
 /// (which scope the reuse digest to it BEFORE the cache read). Reads only INPUT
 /// trees/dbs — all materialized before this step's build — so read and write see
 /// the same bytes and derive the same closure.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn stage_input_closure(
     parsed: &drv::Derivation,
     seed_store_dirs: &[String],
@@ -4714,7 +5024,12 @@ fn stage_input_closure(
             e
         })
         .collect();
-    Ok(InputClosure { real_builder_cb, builder_exec, roots, closure })
+    Ok(InputClosure {
+        real_builder_cb,
+        builder_exec,
+        roots,
+        closure,
+    })
 }
 
 /// Realize DRV with NO guix-daemon and NO guix store DB: compute the input closure ITSELF by
@@ -4744,7 +5059,15 @@ fn stage_input_closure(
 /// live `store::store_dir()` when scanning the active store itself; per-entry truth
 /// (a td-built copy inside a foreign-prefix seed dir, or vice versa) is restored from the drv roots +
 /// td-owned DBs by `recanonicalize_candidates` (#292).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn realize_drv(
     drv_path: &str,
     seed_store_dirs: &[String],
@@ -4763,16 +5086,20 @@ fn realize_drv(
     // very cache miss the scoping removes. Destructured into the same locals the enforce /
     // stage / builder-re-key logic below has always used.
     let stable_builder_id = store::builder_identity_path();
-    let InputClosure { real_builder_cb, builder_exec, roots, closure } =
-        stage_input_closure(
-            &parsed,
-            seed_store_dirs,
-            seed_canonical_prefix,
-            extra_dbs,
-            src_overrides,
-            builder_override,
-            td_store,
-        )?;
+    let InputClosure {
+        real_builder_cb,
+        builder_exec,
+        roots,
+        closure,
+    } = stage_input_closure(
+        &parsed,
+        seed_store_dirs,
+        seed_canonical_prefix,
+        extra_dbs,
+        src_overrides,
+        builder_override,
+        td_store,
+    )?;
     // A readable label for this recipe's progress lines (e.g. `mes-0.27.1`), taken from
     // its first output's store path; falls back to a generic name for an output-less drv.
     let disp = parsed
@@ -4819,8 +5146,12 @@ fn realize_drv(
     // re-derives the identical key, and an output-neutral builder recompile (same BUILDER_ABI)
     // does not move it whether the builder ran in-process or as an override. The full
     // `manifest` above stays the ENFORCEMENT input, untouched.
-    let reuse_manifest_sha256 =
-        reuse_key_manifest_digest(&closure, &manifest, &parsed.builder, real_builder_cb.as_deref());
+    let reuse_manifest_sha256 = reuse_key_manifest_digest(
+        &closure,
+        &manifest,
+        &parsed.builder,
+        real_builder_cb.as_deref(),
+    );
     // ABI: provenance is now enforced over the real builder path, so re-key the builder's
     // OWN closure entry from its real content path to the stable ABI identity path the drv
     // names (its runtime refs keep their real canonical paths). The sandbox binds the real
@@ -4837,7 +5168,8 @@ fn realize_drv(
     // path the re-keyed closure entry now names (verify_staged_item keys on the canonical
     // half); mirror the real builder's record onto it. The authority `manifest` is left
     // untouched, and the reuse digest was already taken (above) over the real, vouched builder.
-    let staging_manifest = manifest_with_builder_alias(&manifest, &real_builder_cb, &stable_builder_id);
+    let staging_manifest =
+        manifest_with_builder_alias(&manifest, &real_builder_cb, &stable_builder_id);
     // The durable audit beside closure.txt: what may stage, under which hash + provenance
     // class (the origin column). Written from the STAGING manifest so the two files DESCRIBE
     // each other — the re-keyed builder entry's stable-id path in closure.txt appears here
@@ -4901,7 +5233,15 @@ fn realize_drv(
 /// The td-builder store path of the RUNNING binary (…/td-builder-<v>), stripped of
 /// the trailing `/bin/td-builder` — so a recipe built by td references the very
 /// builder that built it, with no Guile resolution.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn self_store_path() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let s = exe.to_string_lossy();
@@ -4928,12 +5268,19 @@ struct Timed {
 impl Drop for Timed {
     fn drop(&mut self) {
         if timing_on() {
-            eprintln!("[timing] {} {}ms", self.label, self.start.elapsed().as_millis());
+            eprintln!(
+                "[timing] {} {}ms",
+                self.label,
+                self.start.elapsed().as_millis()
+            );
         }
     }
 }
 fn timed(label: impl Into<String>) -> Timed {
-    Timed { label: label.into(), start: std::time::Instant::now() }
+    Timed {
+        label: label.into(),
+        start: std::time::Instant::now(),
+    }
 }
 
 /// build-recipe: build a TS-authored recipe with NO Guile and NO guix-daemon in the
@@ -4963,7 +5310,15 @@ fn timed(label: impl Into<String>) -> Timed {
 /// STORE_DBS (the closure's store-db set) and TD_STORE (td's own store dir for td-BUILT
 /// deps) thread straight through to realize_drv — build-plan passes the multi-db set +
 /// td-store so a downstream step consumes an upstream step's td-built output.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_recipe(
     recipe_json: &str,
     lock_file: &str,
@@ -5223,15 +5578,24 @@ fn build_recipe(
 /// Only the toolchain input is swapped; every other build input + the order are untouched. Returns
 /// true iff at least one input was substituted (callers no-op silently when none — see the override
 /// site). A multi-match dedup is the caller's (`inputs.dedup()` after sort).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn substitute_gcc_toolchain(inputs: &mut [String], tc: &str) -> bool {
     let mut swapped = false;
     for p in inputs.iter_mut() {
         let base = p.rsplit('/').next().unwrap_or(p);
         // store basename = `<nix-base32 hash>-<package name>`; match the gcc-toolchain PACKAGE,
         // anchored at the name (split at the first `-`), not an interior substring.
-        let is_toolchain =
-            base.split_once('-').is_some_and(|(_hash, name)| name.starts_with("gcc-toolchain-"));
+        let is_toolchain = base
+            .split_once('-')
+            .is_some_and(|(_hash, name)| name.starts_with("gcc-toolchain-"));
         if is_toolchain {
             *p = tc.to_string();
             swapped = true;
@@ -5276,10 +5640,7 @@ fn derive_native_rust_link_env(entries: &[lock::Entry]) -> Option<NativeRustLink
     let glibc_root = find("glibc-x86-64")?;
     let gcc_path = format!("{gcc_root}/{NATIVE_GCC_STAGE}");
     let binutils_path = format!("{binutils_root}/bin");
-    let glibc_path = format!(
-        "{glibc_root}/{}",
-        toolchain_x86_64::GLIBC_X86_64_STAGE
-    );
+    let glibc_path = format!("{glibc_root}/{}", toolchain_x86_64::GLIBC_X86_64_STAGE);
     Some(NativeRustLinkEnv {
         interp: format!("{glibc_path}/lib/ld-linux-x86-64.so.2"),
         rpath: format!("{glibc_path}/lib"),
@@ -5318,10 +5679,7 @@ fn payload_map_json(
 /// Duplicate detection runs over ALL entries, not just the selected ones: a name
 /// repeated across the two maps is exactly the ambiguity this refuses, and checking
 /// per-map would let it through.
-fn map_json(
-    entries: &[lock::Entry],
-    keep: impl Fn(&str) -> bool,
-) -> Result<json::Json, String> {
+fn map_json(entries: &[lock::Entry], keep: impl Fn(&str) -> bool) -> Result<json::Json, String> {
     let mut seen = std::collections::BTreeSet::new();
     let mut kvs = Vec::with_capacity(entries.len());
     for e in entries {
@@ -5425,9 +5783,8 @@ fn payload_names(
         }
     }
     if foreign_source {
-        let entry = source_entry.ok_or_else(|| {
-            "recipe: foreignSource has no local source lock entry".to_string()
-        })?;
+        let entry = source_entry
+            .ok_or_else(|| "recipe: foreignSource has no local source lock entry".to_string())?;
         names.insert(entry.to_string());
     }
     for channel in TOOL_CHANNELS {
@@ -5510,9 +5867,7 @@ fn validate_application_step_contract(
         return Ok(());
     };
     let declaration = declaration.ok_or_else(|| {
-        format!(
-            "recipe `{name}': {marker_operation} requires an application declaration"
-        )
+        format!("recipe `{name}': {marker_operation} requires an application declaration")
     })?;
     if marker_index.checked_add(1) != Some(steps.len()) {
         return Err(format!(
@@ -5540,9 +5895,11 @@ fn validate_application_step_contract(
             ));
         }
     }
-    let Some((operation, value)) = sole_object_field(steps.get(marker_index).ok_or_else(|| {
-        format!("recipe `{name}': application validator index is missing")
-    })?) else {
+    let Some((operation, value)) = sole_object_field(
+        steps
+            .get(marker_index)
+            .ok_or_else(|| format!("recipe `{name}': application validator index is missing"))?,
+    ) else {
         return Err(format!(
             "recipe `{name}': {marker_operation} must be the marker step's only operation"
         ));
@@ -5570,11 +5927,7 @@ fn validate_application_step_contract(
                 && fields.iter().all(|(key, _)| {
                     matches!(
                         key.as_str(),
-                        "entry"
-                            | "runtime"
-                            | "libraryPaths"
-                            | "optionalTargets"
-                            | "optionalLinks"
+                        "entry" | "runtime" | "libraryPaths" | "optionalTargets" | "optionalLinks"
                     )
                 })
                 && value
@@ -5597,15 +5950,11 @@ fn validate_application_step_contract(
     let entry = marker_value
         .get("entry")
         .and_then(json::Json::as_str)
-        .ok_or_else(|| {
-            format!("recipe `{name}': {marker_operation} entry is not a string")
-        })?;
+        .ok_or_else(|| format!("recipe `{name}': {marker_operation} entry is not a string"))?;
     let runtime = marker_value
         .get("runtime")
         .and_then(json::Json::as_str)
-        .ok_or_else(|| {
-            format!("recipe `{name}': {marker_operation} runtime is not a string")
-        })?;
+        .ok_or_else(|| format!("recipe `{name}': {marker_operation} runtime is not a string"))?;
     if entry != declaration.entry() || runtime != declaration.runtime() {
         return Err(format!(
             "recipe `{name}': {marker_operation} entry/runtime must exactly match the \
@@ -5613,15 +5962,11 @@ fn validate_application_step_contract(
         ));
     }
     if marker_operation == "validateDynamicApplication" {
-        let policy = td_engine::application_spec::dynamic_application_policy(
-            name,
-            declaration.runtime(),
-        )
-        .ok_or_else(|| {
-            format!(
-                "recipe `{name}': dynamic application validator has no reviewed policy"
-            )
-        })?;
+        let policy =
+            td_engine::application_spec::dynamic_application_policy(name, declaration.runtime())
+                .ok_or_else(|| {
+                    format!("recipe `{name}': dynamic application validator has no reviewed policy")
+                })?;
         let exact_strings = |field: &str, expected: &[&str]| {
             marker_value
                 .get(field)
@@ -5855,9 +6200,7 @@ fn resolved_cargo_git_sources_json(
 
 fn push_drv_env_line(spec: &mut String, name: &str, value: &str) -> Result<(), String> {
     if name.contains('=') {
-        return Err(format!(
-            "recipe: derivation env name {name:?} contains `='"
-        ));
+        return Err(format!("recipe: derivation env name {name:?} contains `='"));
     }
     if name
         .bytes()
@@ -5880,7 +6223,15 @@ fn push_drv_env_line(spec: &mut String, name: &str, value: &str) -> Result<(), S
 /// (assemble-only, so a SEPARATE process — the build daemon — realizes the td-assembled
 /// drv). Splitting assembly from realization is what lets td's own daemon, not a `guix
 /// repl`-emitted drv, be the build's input (own-builder-daemon §5).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn assemble_recipe_drv(
     recipe_json: &str,
     lock_file: &str,
@@ -5888,8 +6239,14 @@ fn assemble_recipe_drv(
     vendor_dir: Option<&str>,
 ) -> Result<(String, std::path::PathBuf, drv::Derivation, String), String> {
     let alist = json::parse(recipe_json).map_err(|e| format!("recipe JSON: {e}"))?;
-    let name = alist.get("name").and_then(json::Json::as_str).ok_or("recipe: no name")?;
-    let version = alist.get("version").and_then(json::Json::as_str).ok_or("recipe: no version")?;
+    let name = alist
+        .get("name")
+        .and_then(json::Json::as_str)
+        .ok_or("recipe: no name")?;
+    let version = alist
+        .get("version")
+        .and_then(json::Json::as_str)
+        .ok_or("recipe: no version")?;
     let source_input = match alist.get("sourceInput") {
         None => None,
         Some(json::Json::Str(value)) => Some(value.as_str()),
@@ -5899,7 +6256,10 @@ fn assemble_recipe_drv(
     // The build system selects the td-builder phase runner. "gnu" (default) is the
     // autotools path; "rust" is the cargo path (build::run_rust), used to SELF-HOST
     // td-builder itself off Guile-construction + the daemon.
-    let build_system = alist.get("buildSystem").and_then(json::Json::as_str).unwrap_or("gnu");
+    let build_system = alist
+        .get("buildSystem")
+        .and_then(json::Json::as_str)
+        .unwrap_or("gnu");
     let cargo_lock = match alist.get("cargoLock") {
         None => None,
         Some(json::Json::Str(value)) if !value.is_empty() => Some(value.as_str()),
@@ -5924,9 +6284,7 @@ fn assemble_recipe_drv(
         Some(json::Json::Str(value)) if value == "." => None,
         Some(json::Json::Str(value)) if build::valid_cargo_subdir(value) => Some(value.as_str()),
         Some(json::Json::Str(_)) => {
-            return Err(
-                "recipe: `cargoSubdir' must be a non-empty plain relative path".into(),
-            )
+            return Err("recipe: `cargoSubdir' must be a non-empty plain relative path".into())
         }
         Some(_) => return Err("recipe: `cargoSubdir' must be a string".into()),
     };
@@ -5944,13 +6302,15 @@ fn assemble_recipe_drv(
     };
     let cargo_git_sources = match alist.get("cargoGitSources") {
         None => Vec::new(),
-        Some(value) => build::parse_cargo_git_sources(value)
-            .map_err(|error| format!("recipe: {error}"))?,
+        Some(value) => {
+            build::parse_cargo_git_sources(value).map_err(|error| format!("recipe: {error}"))?
+        }
     };
     let cargo_source_patches = match alist.get("cargoSourcePatches") {
         None => Vec::new(),
-        Some(value) => build::parse_cargo_source_patches(value)
-            .map_err(|error| format!("recipe: {error}"))?,
+        Some(value) => {
+            build::parse_cargo_source_patches(value).map_err(|error| format!("recipe: {error}"))?
+        }
     };
     let static_link = match alist.get("staticLink") {
         None => false,
@@ -5981,8 +6341,7 @@ fn assemble_recipe_drv(
     }
     if cargo_lock.is_some() && vendor_dir.is_none() {
         return Err(
-            "recipe: `cargoLock' requires the exact committed lock staged in TD_VENDOR_DIR"
-                .into(),
+            "recipe: `cargoLock' requires the exact committed lock staged in TD_VENDOR_DIR".into(),
         );
     }
     let foreign_source = foreign_source_of(name, &alist)?;
@@ -6379,7 +6738,11 @@ fn assemble_recipe_drv(
                 push_drv_env(&mut spec, "TD_RUST_STATIC", "1")?;
             }
             if cargo_lock.is_some() {
-                let policy = if replace_cargo_lock { "replace" } else { "verify" };
+                let policy = if replace_cargo_lock {
+                    "replace"
+                } else {
+                    "verify"
+                };
                 push_drv_env(&mut spec, "TD_CARGO_LOCK_POLICY", policy)?;
             }
             if !cargo_git_sources.is_empty() {
@@ -6445,7 +6808,10 @@ fn assemble_recipe_drv(
                 ("TD_RUST_STORE_BDIR", derived.as_ref().map(|d| &d.bdir)),
                 ("TD_RUST_STORE_CC", derived.as_ref().map(|d| &d.cc)),
                 ("TD_RUST_STORE_CXX", derived.as_ref().map(|d| &d.cxx)),
-                ("TD_RUST_STORE_INCLUDE", derived.as_ref().map(|d| &d.include)),
+                (
+                    "TD_RUST_STORE_INCLUDE",
+                    derived.as_ref().map(|d| &d.include),
+                ),
             ] {
                 let v = match std::env::var(k) {
                     Ok(v) if !v.is_empty() => Some(v),
@@ -6457,10 +6823,7 @@ fn assemble_recipe_drv(
                     }
                 }
             }
-            if let Some(protobuf) = entries
-                .iter()
-                .find(|entry| entry.name == "protobuf-x86-64")
-            {
+            if let Some(protobuf) = entries.iter().find(|entry| entry.name == "protobuf-x86-64") {
                 push_drv_env(
                     &mut spec,
                     "TD_RUST_PROTOC",
@@ -6472,7 +6835,10 @@ fn assemble_recipe_drv(
             // drops the crate's default features — e.g. fd's `use-jemalloc`, whose
             // jemalloc-sys runs a C ./configure the scrubbed build-env can't satisfy;
             // `features` adds back the wanted ones (e.g. "completions").
-            if alist.get("noDefaultFeatures").is_some_and(json::Json::is_true) {
+            if alist
+                .get("noDefaultFeatures")
+                .is_some_and(json::Json::is_true)
+            {
                 push_drv_env(&mut spec, "TD_CARGO_NO_DEFAULT", "1")?;
             }
             if let Some(feats) = alist.get("features").and_then(json::Json::as_arr) {
@@ -6520,8 +6886,12 @@ fn builder_store_env() -> Result<Option<(String, String, String)>, String> {
 /// None → build-plan owns its own in-run td-store and rebuilds the whole chain (the
 /// clean-room default). Mirrors the `store-build` subcommand's persist convention.
 fn persist_store_env() -> Result<Option<(String, String)>, String> {
-    let ps = std::env::var("TD_PERSIST_STORE").ok().filter(|s| !s.is_empty());
-    let pd = std::env::var("TD_PERSIST_DB").ok().filter(|s| !s.is_empty());
+    let ps = std::env::var("TD_PERSIST_STORE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let pd = std::env::var("TD_PERSIST_DB")
+        .ok()
+        .filter(|s| !s.is_empty());
     match (ps, pd) {
         (Some(s), Some(d)) => Ok(Some((s, d))),
         (None, None) => Ok(None),
@@ -6543,7 +6913,12 @@ fn read_confined_repo_file(root: &Path, rel: &str) -> Result<(PathBuf, String), 
         .read(true)
         .custom_flags(flags)
         .open(root)
-        .map_err(|e| format!("open repo root {} without following symlinks: {e}", root.display()))?;
+        .map_err(|e| {
+            format!(
+                "open repo root {} without following symlinks: {e}",
+                root.display()
+            )
+        })?;
     if !directory
         .metadata()
         .map_err(|e| format!("inspect open repo root {}: {e}", root.display()))?
@@ -6561,7 +6936,9 @@ fn read_confined_repo_descriptor(
 ) -> Result<(PathBuf, String), String> {
     let relp = Path::new(rel);
     if relp.is_absolute() {
-        return Err(format!("cargoLock `{rel}' must be repo-relative, not absolute"));
+        return Err(format!(
+            "cargoLock `{rel}' must be repo-relative, not absolute"
+        ));
     }
     let component_count = relp.components().count();
     if component_count == 0 {
@@ -6778,12 +7155,7 @@ fn provision_auto_vendor(
         .map_err(|e| format!("--auto rust `{name}': {e}"))?;
     let vendor_dir = root.join(format!(".td-build-cache/crate-vendor/{name}/vendor"));
     let staged = step_scratch.join("vendor-verified");
-    let n = stage_verified_vendor(
-        &vendor_dir,
-        &lock_text,
-        &staged,
-        lock_sources.registry == 0,
-    )
+    let n = stage_verified_vendor(&vendor_dir, &lock_text, &staged, lock_sources.registry == 0)
         .map_err(|e| format!("--auto rust `{name}': {e}"))?;
     let self_exe = std::env::current_exe()
         .map_err(|e| format!("--auto rust `{name}': locate td-builder: {e}"))?
@@ -6844,8 +7216,8 @@ fn build_plan(
     local_seed_db: Option<&str>,
 ) -> Result<(), String> {
     use std::collections::BTreeMap;
-    let plan = std::fs::read_to_string(plan_file)
-        .map_err(|e| format!("read plan {plan_file}: {e}"))?;
+    let plan =
+        std::fs::read_to_string(plan_file).map_err(|e| format!("read plan {plan_file}: {e}"))?;
     std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     // The shared td-store: each step copies its output here, and a downstream step
     // stages a td-built dep FROM here — realize_drv re-keys a closure entry whose tree
@@ -6899,11 +7271,16 @@ fn build_plan(
         let toks: Vec<&str> = line.split_whitespace().collect();
         let (recipe_json, lock_file) = match toks.as_slice() {
             ["step", r, l] => (*r, *l),
-            _ => return Err(format!("malformed plan line (want `step RECIPE-JSON LOCK'): {line}")),
+            _ => {
+                return Err(format!(
+                    "malformed plan line (want `step RECIPE-JSON LOCK'): {line}"
+                ))
+            }
         };
         let recipe_text = std::fs::read_to_string(recipe_json)
             .map_err(|e| format!("read recipe {recipe_json}: {e}"))?;
-        let alist = json::parse(&recipe_text).map_err(|e| format!("recipe JSON {recipe_json}: {e}"))?;
+        let alist =
+            json::parse(&recipe_text).map_err(|e| format!("recipe JSON {recipe_json}: {e}"))?;
         let name = alist
             .get("name")
             .and_then(json::Json::as_str)
@@ -6969,7 +7346,10 @@ fn build_plan(
         if substituted.is_empty() {
             eprintln!("td-builder: build-plan step `{name}': no td-built deps to substitute");
         } else {
-            eprintln!("td-builder: build-plan step `{name}': substituted td outputs -> {}", substituted.join(" "));
+            eprintln!(
+                "td-builder: build-plan step `{name}': substituted td outputs -> {}",
+                substituted.join(" ")
+            );
         }
 
         // A `rust` step's crate closure is interned from its committed-lock-verified warm
@@ -6992,11 +7372,11 @@ fn build_plan(
             &seed_dirs,
             &seed_canonical, // interned seeds are canonically /td/store (store-add-recursive)
             &td_dbs,
-            None,            // src_store: build-plan locks carry resolved paths
-            vendor_arg,      // vendor_store: a rust step's committed-lock-verified crate tree, else None
-            builder_store,   // builder_store: the td-placed stage0 (TD_BUILDER_*), or None → self
-            Some(&tdstore),  // td_store: stage td-built deps from the shared td-store
-            persist,         // persist: reuse-or-commit each rung across runs (re #469), or None → clean-room in-run store
+            None,           // src_store: build-plan locks carry resolved paths
+            vendor_arg, // vendor_store: a rust step's committed-lock-verified crate tree, else None
+            builder_store, // builder_store: the td-placed stage0 (TD_BUILDER_*), or None → self
+            Some(&tdstore), // td_store: stage td-built deps from the shared td-store
+            persist, // persist: reuse-or-commit each rung across runs (re #469), or None → clean-room in-run store
         )?;
         // Single-output recipes (the gnu corpus): the dep is regs[0].
         let out = regs
@@ -7018,7 +7398,10 @@ fn build_plan(
         let tc = std::time::Instant::now();
         commit_tree_checked(&physical, &dest, &out.nar_hash, true, true)?;
         if timing_on() {
-            eprintln!("[timing] recipe {name} tdstore-commit={}ms", tc.elapsed().as_millis());
+            eprintln!(
+                "[timing] recipe {name} tdstore-commit={}ms",
+                tc.elapsed().as_millis()
+            );
         }
         built.insert(name.to_string(), out.store_path.clone());
         td_dbs.push((
@@ -7105,7 +7488,15 @@ fn names_in_channel(alist: &json::Json, key: &str) -> Result<Vec<String>, String
         .collect()
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_recipe_json(recipe_dir: &str, name: &str) -> Result<json::Json, String> {
     let p = format!("{recipe_dir}/{name}.json");
     let text = std::fs::read_to_string(&p).map_err(|e| format!("read recipe {p}: {e}"))?;
@@ -7211,7 +7602,11 @@ fn foreign_source_of(name: &str, alist: &json::Json) -> Result<bool, String> {
             "recipe `{name}': `foreignSource' requires the aggregate `foreign' mark"
         ));
     }
-    if alist.get("sourceInput").and_then(json::Json::as_str).is_none() {
+    if alist
+        .get("sourceInput")
+        .and_then(json::Json::as_str)
+        .is_none()
+    {
         return Err(format!(
             "recipe `{name}': `foreignSource' requires a string `sourceInput'"
         ));
@@ -7222,14 +7617,30 @@ fn foreign_source_of(name: &str, alist: &json::Json) -> Result<bool, String> {
 /// An input is OWNED (td reconstructs it) iff its recipe JSON exists in RECIPE-DIR;
 /// otherwise it is an external seed/tool (the toolchain, retired last) resolved
 /// through the --auto MAP instead (#429 — no per-rung hand-written base lock).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_is_owned(recipe_dir: &str, name: &str) -> bool {
     Path::new(&format!("{recipe_dir}/{name}.json")).exists()
 }
 
 /// Post-order DFS over the OWNED-input subgraph: appends each recipe AFTER its owned
 /// deps → a topo order (deps first). Cycles error.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_topo(
     recipe_dir: &str,
     name: &str,
@@ -7270,7 +7681,8 @@ fn auto_parse_map(text: &str) -> std::collections::BTreeMap<String, String> {
             continue;
         }
         if let Some((n, p)) = line.split_once(' ') {
-            m.entry(n.trim().to_string()).or_insert_with(|| p.trim().to_string());
+            m.entry(n.trim().to_string())
+                .or_insert_with(|| p.trim().to_string());
         }
     }
     m
@@ -7280,7 +7692,10 @@ fn auto_parse_map(text: &str) -> std::collections::BTreeMap<String, String> {
 /// that is NOT itself an owned recipe (a host tool, a pinned seed/source tarball)
 /// must be in MAP or synthesis fails loudly: a recipe declaring an input nothing
 /// interned is a bug to surface, not an edge to silently drop.
-fn auto_map_lookup(map: &std::collections::BTreeMap<String, String>, name: &str) -> Result<String, String> {
+fn auto_map_lookup(
+    map: &std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> Result<String, String> {
     map.get(name).cloned().ok_or_else(|| {
         format!("no map entry for `{name}' (not an owned recipe, not interned by ladder_setup)")
     })
@@ -7430,7 +7845,11 @@ enum SeedOrigin {
 /// ambiguous between a committed hash and a live re-derivation. Parameterized
 /// over the two membership booleans (not the compiled constants) so this is
 /// directly testable without perturbing them.
-fn reject_if_pinned_both_ways(key: &str, digest_pinned: bool, roster_pinned: bool) -> Result<(), String> {
+fn reject_if_pinned_both_ways(
+    key: &str,
+    digest_pinned: bool,
+    roster_pinned: bool,
+) -> Result<(), String> {
     if digest_pinned && roster_pinned {
         return Err(format!(
             "provenance rejected: seed key `{key}' is pinned by BOTH seed/seed-digests.txt \
@@ -7469,8 +7888,7 @@ fn classify_seed_key(key: &str) -> Result<Option<SeedOrigin>, String> {
 /// never blows away a live sibling run's tree by unconditionally
 /// `remove_dir_all`-ing a shared name first.
 fn claim_local_source_scratch_dir(scratch: &Path, key: &str) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(scratch)
-        .map_err(|e| format!("mkdir {}: {e}", scratch.display()))?;
+    std::fs::create_dir_all(scratch).map_err(|e| format!("mkdir {}: {e}", scratch.display()))?;
     for nonce in 0u64..1_000_000 {
         let dir = scratch.join(format!("local-source-roster-{key}-{nonce}"));
         match std::fs::create_dir(&dir) {
@@ -7616,10 +8034,14 @@ fn verify_local_source_roster_basename(
     // `expected_base` still short-circuit the expensive stage+hash and only
     // repeat the cheap comparison.
     use std::sync::{Mutex, OnceLock};
-    static MEMO: OnceLock<Mutex<std::collections::HashMap<(String, String), String>>> = OnceLock::new();
+    static MEMO: OnceLock<Mutex<std::collections::HashMap<(String, String), String>>> =
+        OnceLock::new();
     let memo = MEMO.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let memo_key = (repo_root.clone(), key.to_string());
-    let cached = memo.lock().ok().and_then(|guard| guard.get(&memo_key).cloned());
+    let cached = memo
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&memo_key).cloned());
     let derived_base = if let Some(cached) = cached {
         cached
     } else {
@@ -7640,7 +8062,11 @@ fn verify_local_source_roster_basename(
         let derived = result.map_err(|e| {
             format!("provenance rejected: local-source key `{key}' from {repo_root}: {e}")
         })?;
-        let base = derived.rsplit('/').next().unwrap_or(derived.as_str()).to_string();
+        let base = derived
+            .rsplit('/')
+            .next()
+            .unwrap_or(derived.as_str())
+            .to_string();
         if let Ok(mut guard) = memo.lock() {
             guard.insert(memo_key, base.clone());
         }
@@ -7941,7 +8367,15 @@ fn auto_synthesize_lock(
 /// for anything that names no local-source-roster key; a plan that DOES need
 /// one then reds at per-entry provenance (`auto_seed_provenance`) or
 /// manifest assembly, naming the key, never silently succeeding.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 #[allow(clippy::too_many_arguments)] // seed_db (#468) + persist (#474 cache) + local_seed_db (#469 blocker fix) all thread through this arm
 fn build_plan_auto(
     target: &str,
@@ -7955,17 +8389,21 @@ fn build_plan_auto(
     local_seed_db: Option<&str>,
 ) -> Result<(), String> {
     if !auto_is_owned(recipe_dir, target) {
-        return Err(format!("--auto target `{target}': need {recipe_dir}/{target}.json"));
+        return Err(format!(
+            "--auto target `{target}': need {recipe_dir}/{target}.json"
+        ));
     }
     std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
-    let map_text =
-        std::fs::read_to_string(map_file).map_err(|e| format!("read --auto map {map_file}: {e}"))?;
+    let map_text = std::fs::read_to_string(map_file)
+        .map_err(|e| format!("read --auto map {map_file}: {e}"))?;
     let map = auto_parse_map(&map_text);
     let mut order: Vec<String> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut stack: Vec<String> = Vec::new();
     let mut marks = std::collections::BTreeMap::new();
-    auto_topo(recipe_dir, target, &mut order, &mut seen, &mut stack, &mut marks)?;
+    auto_topo(
+        recipe_dir, target, &mut order, &mut seen, &mut stack, &mut marks,
+    )?;
     eprintln!(
         "td-builder: build-plan --auto {target}: derived a {}-step plan from the recipe graph: {}",
         order.len(),
@@ -8017,7 +8455,15 @@ fn build_plan_auto(
 /// with a non-zero exit on an unknown stem, which we surface as the loud "no td
 /// recipe for PKG" error — td shell resolves PKG to a td recipe or fails; it never
 /// falls back to guix.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn emit_recipe_json(pkg: &str) -> Result<String, String> {
     let eval = std::env::var("TD_RECIPE_EVAL").map_err(|_| {
         "TD_RECIPE_EVAL must point at td's td-recipe-eval binary (the Rust recipe catalog evaluator)"
@@ -8130,7 +8576,15 @@ impl NativeToolchain {
 /// Usage: shell PKG... [-- CMD ARGS...]
 ///   PKG...      td package names (a recipe must exist; no guix fallback)
 ///   -- CMD...   the command to run in the composed env; omitted → interactive $SHELL
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
     // Everything before the first `--` is a package name; after it, the command.
     let sep = rest.iter().position(|a| a == "--");
@@ -8297,7 +8751,15 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
 /// (`store-add-recursive`) — no `guix repl`, no guix-daemon. Returns the
 /// content-addressed `source` store path td computed from the path's recursive
 /// NAR sha256 and restored under `store_dir` (+ `db`).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn run_store_add(
     self_exe: &str,
     name: &str,
@@ -8333,7 +8795,15 @@ fn run_store_add(
 /// crates ride the separately interned vendor tree and the build platform is
 /// appended from authenticated recipe outputs below; no retired package lock or
 /// host-tool line is carried forward.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn source_lock_body(sourcekey: &str, src_canonical: &str) -> String {
     format!("{sourcekey} {src_canonical} source\n")
 }
@@ -8391,12 +8861,16 @@ fn parse_shell_source_pins(pins: &str) -> Result<Vec<ShellSourcePin>, String> {
                 .iter()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
         {
-            return Err(format!("recipe source pin `{key}' has a non-canonical sha256"));
+            return Err(format!(
+                "recipe source pin `{key}' has a non-canonical sha256"
+            ));
         }
         if file.is_empty()
             || Path::new(file).file_name().and_then(|name| name.to_str()) != Some(file)
         {
-            return Err(format!("recipe source pin `{key}' has a non-basename file `{file}'"));
+            return Err(format!(
+                "recipe source pin `{key}' has a non-basename file `{file}'"
+            ));
         }
         if !keys.insert(key.to_string()) {
             return Err(format!("td shell recipe source pins duplicate key `{key}'"));
@@ -8419,7 +8893,9 @@ fn verify_shell_source_archive(path: &Path, pin: &ShellSourcePin) -> Result<(), 
     if got != pin.sha256 {
         return Err(format!(
             "warmed source archive {} sha256 {got} != recipe source pin {} for `{}`",
-            path.display(), pin.sha256, pin.key
+            path.display(),
+            pin.sha256,
+            pin.key
         ));
     }
     Ok(())
@@ -8482,7 +8958,10 @@ fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<Str
                 "td shell package source lock line is not a canonical /td/store source or seed: {line}"
             ));
         }
-        let name = fields.first().copied().ok_or("source lock line has no name")?;
+        let name = fields
+            .first()
+            .copied()
+            .ok_or("source lock line has no name")?;
         if !names.insert(name) {
             return Err(format!("td shell package source lock duplicates `{name}'"));
         }
@@ -8504,7 +8983,9 @@ fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<Str
     for line in native.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() != 3
-            || fields.get(1).is_none_or(|path| !path.starts_with("/td/store/"))
+            || fields
+                .get(1)
+                .is_none_or(|path| !path.starts_with("/td/store/"))
             || fields.get(2).copied() != Some("td-recipe-output")
         {
             return Err(format!(
@@ -8548,7 +9029,15 @@ fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<Str
 /// (`TD_SHELL_VENDOR_ROOT` unset, or no registry vendor directory for a recipe
 /// without Git sources); the caller fails closed because the legacy shell
 /// fallback was retired with the corpus.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn provision_rust_inputs(
     pkg: &str,
     recipe_json: &str,
@@ -8611,7 +9100,10 @@ fn provision_rust_inputs(
             .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "crate"))
             .count(),
         Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound && !cargo_git_sources.is_empty() => 0,
+            if error.kind() == std::io::ErrorKind::NotFound && !cargo_git_sources.is_empty() =>
+        {
+            0
+        }
         Err(error) => return Err(format!("read {}: {error}", vendor.display())),
     };
     if ncrate == 0 && cargo_git_sources.is_empty() {
@@ -8660,9 +9152,7 @@ fn provision_rust_inputs(
                 index.saturating_add(1),
             )
             .map_err(|error| {
-                format!(
-                    "td shell rust `{pkg}': {error}; run `td-feed warm sources'"
-                )
+                format!("td shell rust `{pkg}': {error}; run `td-feed warm sources'")
             })?;
             let canonical = run_store_add(
                 self_exe,
@@ -8683,7 +9173,7 @@ fn provision_rust_inputs(
         &staged_vendor,
         lock_sources.registry == 0,
     )
-        .map_err(|e| format!("td shell rust `{pkg}': {e}"))?;
+    .map_err(|e| format!("td shell rust `{pkg}': {e}"))?;
     let vendor_store = work.join("vendorstore");
     let vendor_db = work.join("vendor.db");
     let _ = std::fs::remove_dir_all(&vendor_store);
@@ -8728,7 +9218,15 @@ fn provision_rust_inputs(
 /// — so the profile resolves inside a store-ns own-root where `prefix` (e.g. `/td/store`) is
 /// the bound store but the physical scratch dir is absent. `None` keeps the thin-view behavior
 /// (link straight at PKG-OUT as given). Enumeration always reads the physical PKG-OUT dir.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_profile(
     profile_dir: &str,
     pkgs: &[String],
@@ -8781,14 +9279,17 @@ fn build_profile(
                     }
                     None => ent.path(),
                 };
-                symlink(&target, &dst)
-                    .map_err(|e| format!("symlink {} -> {}: {e}", dst.display(), target.display()))?;
+                symlink(&target, &dst).map_err(|e| {
+                    format!("symlink {} -> {}: {e}", dst.display(), target.display())
+                })?;
                 linked += 1;
             }
         }
     }
     if linked == 0 {
-        return Err("no bin/sbin entries in any package — refusing to write an empty profile".into());
+        return Err(
+            "no bin/sbin entries in any package — refusing to write an empty profile".into(),
+        );
     }
     Ok(linked)
 }
@@ -8797,9 +9298,19 @@ fn build_profile(
 /// from the raw env value so the policy is unit-testable without touching real
 /// process state. Clamped to the kernel's -20..=19 range; a missing/garbage value
 /// falls back to the default.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn parse_build_nice(raw: Option<String>) -> i32 {
-    raw.and_then(|v| v.trim().parse::<i32>().ok()).unwrap_or(10).clamp(-20, 19)
+    raw.and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(10)
+        .clamp(-20, 19)
 }
 
 /// Raise THIS process's niceness so the compilers/`make` it spawns (which inherit
@@ -8808,23 +9319,47 @@ fn parse_build_nice(raw: Option<String>) -> i32 {
 /// increase-only: the kernel rejects an unprivileged DEcrease with EPERM, which
 /// just means we were already at least this nice, so we ignore the result. Purely
 /// a scheduling knob — build OUTPUT (and thus reproducibility) is unaffected.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn nice_self_for_builds() {
     let _ = sys::set_self_priority(parse_build_nice(std::env::var("TD_BUILD_NICE").ok()));
 }
 
 /// Parse an `oci-image`/`oci-image-closure` CONFIG-JSON ({"repoTag","env","entrypoint",
 /// "cmd"}, all optional; repoTag defaults to td:latest) into an `oci::ImageConfig`.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn image_config_from_json(cj: &json::Json) -> oci::ImageConfig {
     let strs = |key: &str| -> Vec<String> {
         cj.get(key)
             .and_then(json::Json::as_arr)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     oci::ImageConfig {
-        repo_tag: cj.get("repoTag").and_then(json::Json::as_str).unwrap_or("td:latest").to_string(),
+        repo_tag: cj
+            .get("repoTag")
+            .and_then(json::Json::as_str)
+            .unwrap_or("td:latest")
+            .to_string(),
         env: strs("env"),
         entrypoint: strs("entrypoint"),
         cmd: strs("cmd"),
@@ -8882,7 +9417,15 @@ struct HostSandboxArgs {
 
 /// Parse the full `td-builder host-sandbox …` argv (args[0]=prog, args[1]=subcommand,
 /// flags…, `--`, CMD, CMD-ARGS…). Returns the parsed form or a user-facing message.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn parse_host_sandbox_args(args: &[String]) -> Result<HostSandboxArgs, String> {
     let mut i = 2usize;
     let mut expose_cwd = false;
@@ -8965,8 +9508,12 @@ fn run_mount_applet(args: &[String]) -> Result<i32, String> {
     if args.get(1).map(String::as_str) != Some("--bind") || args.len() != 4 {
         return Err("usage: mount --bind SRC DEST".to_string());
     }
-    let src = args.get(2).ok_or_else(|| "missing bind source".to_string())?;
-    let dest = args.get(3).ok_or_else(|| "missing bind target".to_string())?;
+    let src = args
+        .get(2)
+        .ok_or_else(|| "missing bind source".to_string())?;
+    let dest = args
+        .get(3)
+        .ok_or_else(|| "missing bind target".to_string())?;
     if !Path::new(dest).exists() && std::env::var("TD_HOST_SANDBOX").as_deref() == Ok("1") {
         let src_md = std::fs::metadata(src).map_err(|e| format!("bind source `{src}`: {e}"))?;
         if src_md.is_dir() {
@@ -8974,8 +9521,12 @@ fn run_mount_applet(args: &[String]) -> Result<i32, String> {
                 .map_err(|e| format!("create sandbox bind target dir `{dest}`: {e}"))?;
         } else {
             if let Some(parent) = Path::new(dest).parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("create sandbox bind target parent `{}`: {e}", parent.display()))?;
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "create sandbox bind target parent `{}`: {e}",
+                        parent.display()
+                    )
+                })?;
             }
             std::fs::File::create(dest)
                 .map_err(|e| format!("create sandbox bind target file `{dest}`: {e}"))?;
@@ -9088,7 +9639,10 @@ fn parse_recipe_output_options(args: &[String]) -> Result<RecipeOutputOptions, S
     let mut dbs = Vec::new();
     let mut store = None;
     while positional_len >= 8 {
-        match args.get(positional_len.saturating_sub(2)).map(String::as_str) {
+        match args
+            .get(positional_len.saturating_sub(2))
+            .map(String::as_str)
+        {
             Some("--recipe-output-db") => {
                 let db = args
                     .get(positional_len.saturating_sub(1))
@@ -9114,15 +9668,30 @@ fn parse_recipe_output_options(args: &[String]) -> Result<RecipeOutputOptions, S
     })
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let applet = Path::new(args.first().map_or("", String::as_str))
         .file_name()
         .and_then(|n| n.to_str());
     match applet {
-        Some("td-crypto-host-linker") => return applet_exit("td-crypto-host-linker", crypto_isolated::host_linker(args.get(1..).unwrap_or(&[])).map(|()| 0)),
-        Some("td-crypto-decoy") => return applet_exit("td-crypto-decoy", crypto_isolated::decoy().map(|()| 0)),
+        Some("td-crypto-host-linker") => {
+            return applet_exit(
+                "td-crypto-host-linker",
+                crypto_isolated::host_linker(args.get(1..).unwrap_or(&[])).map(|()| 0),
+            )
+        }
+        Some("td-crypto-decoy") => {
+            return applet_exit("td-crypto-decoy", crypto_isolated::decoy().map(|()| 0))
+        }
         Some("mount") => return applet_exit("mount", run_mount_applet(&args)),
         Some("flock") => return applet_exit("flock", run_flock_applet(&args)),
         _ => {}
@@ -9160,7 +9729,10 @@ fn main() -> ExitCode {
     }
     // Builds run nicer than the loop's other work so a shared desktop stays smooth.
     // Scope to the build-executing subcommands; their spawned compilers inherit it.
-    if matches!(args.get(1).map(String::as_str), Some("build" | "realize" | "autotools-build")) {
+    if matches!(
+        args.get(1).map(String::as_str),
+        Some("build" | "realize" | "autotools-build")
+    ) {
         nice_self_for_builds();
     }
     match args.get(1).map(String::as_str) {
@@ -9277,11 +9849,11 @@ fn main() -> ExitCode {
                     eprintln!("td-builder: files: {e}");
                     ExitCode::FAILURE
                 }
-            }
+            },
             None => {
                 eprintln!("usage: td-builder files PATH...");
                 ExitCode::from(2)
-            },
+            }
         },
         Some("files-name-first") => match (args.get(2), args.get(3..)) {
             (Some(pattern), Some(roots)) if !roots.is_empty() => {
@@ -9300,7 +9872,7 @@ fn main() -> ExitCode {
             _ => {
                 eprintln!("usage: td-builder files-name-first PATTERN PATH...");
                 ExitCode::from(2)
-            },
+            }
         },
         Some("tree-fingerprint") => match args.get(2..).filter(|roots| !roots.is_empty()) {
             Some(roots) => match tree_fingerprint(roots) {
@@ -9312,42 +9884,50 @@ fn main() -> ExitCode {
                     eprintln!("td-builder: tree-fingerprint: {e}");
                     ExitCode::FAILURE
                 }
-            }
+            },
             None => {
                 eprintln!("usage: td-builder tree-fingerprint PATH...");
                 ExitCode::from(2)
-            },
+            }
         },
         Some("tree-contains") => match (args.get(2), args.get(3..)) {
-            (Some(needle), Some(roots)) if !roots.is_empty() => match tree_first_containing(needle, roots) {
-                Ok(Some(_)) => ExitCode::SUCCESS,
-                Ok(None) => ExitCode::FAILURE,
-                Err(e) => {
-                    eprintln!("td-builder: tree-contains: {e}");
-                    ExitCode::FAILURE
+            (Some(needle), Some(roots)) if !roots.is_empty() => {
+                match tree_first_containing(needle, roots) {
+                    Ok(Some(_)) => ExitCode::SUCCESS,
+                    Ok(None) => ExitCode::FAILURE,
+                    Err(e) => {
+                        eprintln!("td-builder: tree-contains: {e}");
+                        ExitCode::FAILURE
+                    }
                 }
-            },
+            }
             _ => {
                 eprintln!("usage: td-builder tree-contains NEEDLE PATH...");
                 ExitCode::from(2)
-            },
+            }
         },
         Some("tree-not-contains") => match (args.get(2), args.get(3..)) {
-            (Some(needle), Some(roots)) if !roots.is_empty() => match tree_first_containing(needle, roots) {
-                Ok(Some(p)) => {
-                    eprintln!("td-builder: tree-not-contains: {} contains {}", p.display(), needle);
-                    ExitCode::FAILURE
+            (Some(needle), Some(roots)) if !roots.is_empty() => {
+                match tree_first_containing(needle, roots) {
+                    Ok(Some(p)) => {
+                        eprintln!(
+                            "td-builder: tree-not-contains: {} contains {}",
+                            p.display(),
+                            needle
+                        );
+                        ExitCode::FAILURE
+                    }
+                    Ok(None) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("td-builder: tree-not-contains: {e}");
+                        ExitCode::FAILURE
+                    }
                 }
-                Ok(None) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("td-builder: tree-not-contains: {e}");
-                    ExitCode::FAILURE
-                }
-            },
+            }
             _ => {
                 eprintln!("usage: td-builder tree-not-contains NEEDLE PATH...");
                 ExitCode::from(2)
-            },
+            }
         },
         Some("tree-first-containing") => match (args.get(2), args.get(3..)) {
             (Some(needle), Some(roots)) if !roots.is_empty() => {
@@ -9366,7 +9946,7 @@ fn main() -> ExitCode {
             _ => {
                 eprintln!("usage: td-builder tree-first-containing NEEDLE PATH...");
                 ExitCode::from(2)
-            },
+            }
         },
         Some("path-older-than") => match (args.get(2), args.get(3), args.get(4)) {
             (Some(path), Some(days), None) => match path_older_than(path, days) {
@@ -9376,11 +9956,11 @@ fn main() -> ExitCode {
                     eprintln!("td-builder: path-older-than: {e}");
                     ExitCode::FAILURE
                 }
-            }
+            },
             _ => {
                 eprintln!("usage: td-builder path-older-than PATH DAYS");
                 ExitCode::from(2)
-            },
+            }
         },
         Some("daemon-budget-check") => match (args.get(2), args.get(3), args.get(4)) {
             (Some(log), Some(budget), None) => match daemon_budget_check(log, budget) {
@@ -9396,7 +9976,7 @@ fn main() -> ExitCode {
             _ => {
                 eprintln!("usage: td-builder daemon-budget-check LOG BUDGET");
                 ExitCode::from(2)
-            },
+            }
         },
         // Test-only raw client for daemon-budget. Unlike `daemon-request`, it
         // deliberately does not enter the rootless host or acquire another
@@ -9473,8 +10053,8 @@ fn main() -> ExitCode {
                     .map_err(|e| format!("read {config_file}: {e}"))?;
                 let cj = json::parse(&cfg_text).map_err(|e| format!("config JSON: {e}"))?;
                 let cfg = image_config_from_json(&cj);
-                let mut w =
-                    std::fs::File::create(out_file).map_err(|e| format!("create {out_file}: {e}"))?;
+                let mut w = std::fs::File::create(out_file)
+                    .map_err(|e| format!("create {out_file}: {e}"))?;
                 oci::write_docker_archive(&mut w, Path::new(rootfs), &cfg)
                     .map_err(|e| format!("write docker-archive: {e}"))?;
                 Ok(())
@@ -9565,8 +10145,8 @@ fn main() -> ExitCode {
                     .map_err(|e| format!("read {config_file}: {e}"))?;
                 let cj = json::parse(&cfg_text).map_err(|e| format!("config JSON: {e}"))?;
                 let cfg = image_config_from_json(&cj);
-                let mut w =
-                    std::fs::File::create(out_file).map_err(|e| format!("create {out_file}: {e}"))?;
+                let mut w = std::fs::File::create(out_file)
+                    .map_err(|e| format!("create {out_file}: {e}"))?;
                 oci::write_docker_archive_from_closure(
                     &mut w,
                     Path::new(store_dir),
@@ -9616,8 +10196,8 @@ fn main() -> ExitCode {
                     .map_err(|e| format!("read {config_file}: {e}"))?;
                 let cj = json::parse(&cfg_text).map_err(|e| format!("config JSON: {e}"))?;
                 let cfg = image_config_from_json(&cj);
-                let mut w =
-                    std::fs::File::create(out_file).map_err(|e| format!("create {out_file}: {e}"))?;
+                let mut w = std::fs::File::create(out_file)
+                    .map_err(|e| format!("create {out_file}: {e}"))?;
                 oci::write_docker_archive_from_store_paths(
                     &mut w,
                     Path::new(store_dir),
@@ -10020,7 +10600,10 @@ fn main() -> ExitCode {
                         ],
                     ));
                     for r in &refs {
-                        ref_rows.push((ref_rowid, vec![Value::Int(id_of(p)?), Value::Int(id_of(r)?)]));
+                        ref_rows.push((
+                            ref_rowid,
+                            vec![Value::Int(id_of(p)?), Value::Int(id_of(r)?)],
+                        ));
                         ref_rowid += 1;
                     }
                 }
@@ -10140,13 +10723,20 @@ fn main() -> ExitCode {
                         let mut deriver_of = std::collections::HashMap::new();
                         for (rowid, cols) in db.table("ValidPaths")? {
                             if let Some(p) = cols.get(1).and_then(text) {
-                                deriver_of.insert(p.clone(), cols.get(4).and_then(text).unwrap_or_default());
+                                deriver_of.insert(
+                                    p.clone(),
+                                    cols.get(4).and_then(text).unwrap_or_default(),
+                                );
                                 path_of.insert(rowid, p);
                             }
                         }
                         let mut lines = Vec::new();
                         for (_rowid, cols) in db.table("DerivationOutputs")? {
-                            match (cols.first().and_then(int), cols.get(1).and_then(text), cols.get(2).and_then(text)) {
+                            match (
+                                cols.first().and_then(int),
+                                cols.get(1).and_then(text),
+                                cols.get(2).and_then(text),
+                            ) {
                                 (Some(drv_id), Some(id), Some(outpath)) => {
                                     let drvpath = path_of.get(&drv_id).cloned().ok_or_else(|| {
                                         format!("DerivationOutputs drv {drv_id} has no ValidPaths row")
@@ -10156,13 +10746,18 @@ fn main() -> ExitCode {
                                     })?;
                                     lines.push(format!("{outpath}|{deriver}|{drvpath}|{id}"));
                                 }
-                                _ => return Err("DerivationOutputs row has non-int/text columns".to_string()),
+                                _ => {
+                                    return Err("DerivationOutputs row has non-int/text columns"
+                                        .to_string())
+                                }
                             }
                         }
                         lines
                     }
                     other => {
-                        return Err(format!("unknown query mode `{other}' (info|references|references-only|outputs)"))
+                        return Err(format!(
+                        "unknown query mode `{other}' (info|references|references-only|outputs)"
+                    ))
                     }
                 };
                 out.sort();
@@ -10223,8 +10818,7 @@ fn main() -> ExitCode {
                 // `scan_candidate_index` + `scan_closure_hybrid` — the same content-scan
                 // realize_drv uses. Index built ONCE, reset() between paths, so even a
                 // ~500k-entry live store is fast.
-                let (candidates, on_disk) =
-                    scan_candidate_index(&store_dirs, &canonical_prefix)?;
+                let (candidates, on_disk) = scan_candidate_index(&store_dirs, &canonical_prefix)?;
                 let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
                 let empty = std::collections::HashMap::new();
                 let seen = scan_closure_hybrid(&mut scanner, &on_disk, &empty, &roots)?;
@@ -10294,7 +10888,11 @@ fn main() -> ExitCode {
                 let mut rs: Vec<String> = refs.to_vec();
                 rs.sort();
                 rs.dedup();
-                let refstr = if rs.is_empty() { "-".to_string() } else { rs.join(",") };
+                let refstr = if rs.is_empty() {
+                    "-".to_string()
+                } else {
+                    rs.join(",")
+                };
                 format!("{p} {hash} {size} {refstr}")
             };
             let run = || -> Result<Vec<String>, String> {
@@ -10306,8 +10904,7 @@ fn main() -> ExitCode {
                     let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
                     let empty = std::collections::HashMap::new();
                     // BFS the runtime closure over content-scanned refs (== guix gc -R).
-                    let closure_set =
-                        scan_closure_hybrid(&mut scanner, &on_disk, &empty, roots)?;
+                    let closure_set = scan_closure_hybrid(&mut scanner, &on_disk, &empty, roots)?;
                     // Refs restricted to the (ref-closed) closure — a member's real direct
                     // refs are all closure members, so scanning against the closure set finds
                     // exactly them and drops nothing (superset-safe; matches the DB form).
@@ -10315,8 +10912,7 @@ fn main() -> ExitCode {
                     let mut lines = Vec::with_capacity(closure.len());
                     for p in &closure {
                         let od = on_disk.get(p).map(String::as_str).unwrap_or(p.as_str());
-                        let mut s =
-                            scan::Scanner::new(&closure).map_err(|e| e.to_string())?;
+                        let mut s = scan::Scanner::new(&closure).map_err(|e| e.to_string())?;
                         nar::write_nar(&mut s, Path::new(od))
                             .map_err(|e| format!("nar of {p} (at {od}): {e}"))?;
                         // finish() gives (nar-hash, nar-size, sorted refs) in the ONE pass —
@@ -10417,8 +11013,7 @@ fn main() -> ExitCode {
         // Prints the store path. Flat/text case, no references — the recursive
         // directory case (canonical tree restore) is a later increment.
         Some("store-add-text") if args.len() == 6 => {
-            let (name, content_file, store_dir, out_db) =
-                (&args[2], &args[3], &args[4], &args[5]);
+            let (name, content_file, store_dir, out_db) = (&args[2], &args[3], &args[4], &args[5]);
             let run = || -> Result<String, String> {
                 use std::os::unix::fs::PermissionsExt;
                 use store_db::{Table, Value};
@@ -10436,8 +11031,9 @@ fn main() -> ExitCode {
                 std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
                 let disk = Path::new(store_dir).join(&base);
                 std::fs::write(&disk, &content).map_err(|e| e.to_string())?;
-                let mut perm =
-                    std::fs::metadata(&disk).map_err(|e| e.to_string())?.permissions();
+                let mut perm = std::fs::metadata(&disk)
+                    .map_err(|e| e.to_string())?
+                    .permissions();
                 perm.set_mode(0o444);
                 std::fs::set_permissions(&disk, perm).map_err(|e| e.to_string())?;
                 // Register it: NAR-hash + size of the file td just wrote (the `build`
@@ -10511,8 +11107,7 @@ fn main() -> ExitCode {
         // Prints the store path. No-reference sources (this increment); referenced
         // sources are a later increment.
         Some("store-add-recursive") if args.len() == 6 => {
-            let (name, src, store_dir, out_db) =
-                (&args[2], &args[3], &args[4], &args[5]);
+            let (name, src, store_dir, out_db) = (&args[2], &args[3], &args[4], &args[5]);
             match store_add_recursive(name, src, store_dir, out_db) {
                 Ok(path) => {
                     println!("{path}");
@@ -10690,8 +11285,9 @@ fn main() -> ExitCode {
                 std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
                 let disk = Path::new(store_dir).join(&base);
                 std::fs::write(&disk, &content).map_err(|e| e.to_string())?;
-                let mut perm =
-                    std::fs::metadata(&disk).map_err(|e| e.to_string())?.permissions();
+                let mut perm = std::fs::metadata(&disk)
+                    .map_err(|e| e.to_string())?
+                    .permissions();
                 perm.set_mode(0o444);
                 std::fs::set_permissions(&disk, perm).map_err(|e| e.to_string())?;
                 // NAR hash + size of what td wrote (for the registration record).
@@ -10851,7 +11447,11 @@ fn main() -> ExitCode {
                 }
                 let drv_out = vec![(
                     1i64,
-                    vec![Value::Int(2), Value::Text("out".to_string()), Value::Text(output.to_string())],
+                    vec![
+                        Value::Int(2),
+                        Value::Text("out".to_string()),
+                        Value::Text(output.to_string()),
+                    ],
                 )];
                 let tables = [
                     Table {
@@ -10897,8 +11497,7 @@ fn main() -> ExitCode {
         //   store-commit STORE-DIR DB SCRATCH
         Some("store-commit") if args.len() == 5 => {
             let (store_dir, db_path, scratch) = (&args[2], &args[3], &args[4]);
-            let run =
-                || commit_scratch_to_store(Path::new(scratch), store_dir, Path::new(db_path));
+            let run = || commit_scratch_to_store(Path::new(scratch), store_dir, Path::new(db_path));
             match run() {
                 Ok(paths) => {
                     for p in paths {
@@ -11288,13 +11887,11 @@ fn main() -> ExitCode {
             // so the drv builds once (the 2nd cache-hits) and two builds never race the same
             // content-addressed scratch — the guix-daemon "a valid path is built once"
             // property, preserved across concurrency and across agents (one shared daemon).
-            let keymap: DaemonKeyMap = std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            ));
-            let handle = move |
-                req: &str,
-                cancelled: &std::sync::atomic::AtomicBool,
-            | -> Result<String, String> {
+            let keymap: DaemonKeyMap =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let handle = move |req: &str,
+                               cancelled: &std::sync::atomic::AtomicBool|
+                  -> Result<String, String> {
                 let (request_budget, req) = match req.strip_prefix("BUDGET ") {
                     Some(rest) => {
                         let (raw, request) = rest
@@ -11303,16 +11900,19 @@ fn main() -> ExitCode {
                         let bytes = raw
                             .parse::<u64>()
                             .ok()
-                            .filter(|bytes| *bytes > 0 && *bytes <= crate::check_memory::MAX_WORK_BYTES)
-                            .ok_or_else(|| "BUDGET request has an invalid byte grant".to_string())?;
+                            .filter(|bytes| {
+                                *bytes > 0 && *bytes <= crate::check_memory::MAX_WORK_BYTES
+                            })
+                            .ok_or_else(|| {
+                                "BUDGET request has an invalid byte grant".to_string()
+                            })?;
                         (Some(bytes), request)
                     }
                     None => (None, req),
                 };
-                if let Some(response) = daemon_budget_probe(
-                    req,
-                    std::env::var_os("TD_DAEMON_TEST_SLEEP_MS").is_some(),
-                )? {
+                if let Some(response) =
+                    daemon_budget_probe(req, std::env::var_os("TD_DAEMON_TEST_SLEEP_MS").is_some())?
+                {
                     return Ok(response);
                 }
                 // Request grammar: "<drv> [SEED-DIR BP BS BD]" (build) or "CHECK <drv> [SEED-DIR
@@ -11327,7 +11927,11 @@ fn main() -> ExitCode {
                 let mut toks = req.split_whitespace();
                 let first = toks.next().ok_or_else(|| "empty request".to_string())?;
                 let (sub, drv) = if first == "CHECK" {
-                    ("daemon-check", toks.next().ok_or_else(|| "CHECK: missing drv".to_string())?)
+                    (
+                        "daemon-check",
+                        toks.next()
+                            .ok_or_else(|| "CHECK: missing drv".to_string())?,
+                    )
                 } else {
                     ("daemon-build", first)
                 };
@@ -11368,7 +11972,9 @@ fn main() -> ExitCode {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Err("daemon requester disconnected before its build started".to_string());
+                    return Err(
+                        "daemon requester disconnected before its build started".to_string()
+                    );
                 }
                 let swept = crate::sandbox::sweep_abandoned_build_temps(Path::new(&scratch));
                 if swept.incomplete() {
@@ -11376,9 +11982,7 @@ fn main() -> ExitCode {
                     // one rather than failing this request — but the reason is
                     // reported, since a `build-tmp` still on disk cannot say
                     // whether a builder holds its lease or removal failed.
-                    eprintln!(
-                        "td-builder: incomplete build scratch sweep in {scratch}: {swept:?}"
-                    );
+                    eprintln!("td-builder: incomplete build scratch sweep in {scratch}: {swept:?}");
                 }
                 // Each build runs in its OWN child td-builder process (Command = the safe
                 // fork+exec): an in-process fork on a daemon thread is unsound (sandbox::build
@@ -11463,9 +12067,7 @@ fn main() -> ExitCode {
                             let _ = crate::sys::kill_recorded(
                                 crate::sys::KillTarget::Group(child.id()),
                                 crate::sys::SIGKILL,
-                                &format!(
-                                    "waiting for {sub} for {drv} failed: {e} (build daemon)"
-                                ),
+                                &format!("waiting for {sub} for {drv} failed: {e} (build daemon)"),
                             );
                             let _ = child.wait();
                             let _ = reader.join();
@@ -11530,8 +12132,7 @@ fn main() -> ExitCode {
         //   daemon-request SOCKET REQUEST
         Some("daemon-request") if args.len() == 4 => {
             let (socket, drv) = (&args[2], &args[3]);
-            let held_by_gate = std::env::var_os(crate::check_memory::GATE_GRANT_HELD_ENV)
-                .is_some();
+            let held_by_gate = std::env::var_os(crate::check_memory::GATE_GRANT_HELD_ENV).is_some();
             let _gate_request = if held_by_gate && drv != "SHUTDOWN" {
                 match crate::check_memory::lock_gate_request() {
                     Ok(lock) => Some(lock),
@@ -11645,8 +12246,7 @@ fn main() -> ExitCode {
                 );
                 return ExitCode::FAILURE;
             }
-            let (recipe_file, lock, scratch, store_dir) =
-                (&args[2], &args[3], &args[4], &args[5]);
+            let (recipe_file, lock, scratch, store_dir) = (&args[2], &args[3], &args[4], &args[5]);
             let src_store = if pos_len >= 8 {
                 Some((args[6].as_str(), args[7].as_str()))
             } else {
@@ -11680,24 +12280,21 @@ fn main() -> ExitCode {
                 // error into run() exactly as the prior inline match did.
                 let pov = persist_store_env()?;
                 let persist = pov.as_ref().map(|(s, d)| (s.as_str(), d.as_str()));
-                let builder_store = match (&bp, &bs, &bd) {
-                    (Some(p), Some(s), Some(d)) => Some((p.as_str(), s.as_str(), d.as_str())),
-                    (None, None, None) => None,
-                    _ => {
-                        return Err(
+                let builder_store =
+                    match (&bp, &bs, &bd) {
+                        (Some(p), Some(s), Some(d)) => Some((p.as_str(), s.as_str(), d.as_str())),
+                        (None, None, None) => None,
+                        _ => return Err(
                             "TD_BUILDER_PATH/TD_BUILDER_STORE/TD_BUILDER_DB must be set together"
                                 .into(),
-                        )
-                    }
-                };
+                        ),
+                    };
                 // The scanned dir IS the live store, canonical where it sits (or the
                 // `--recipe-output-store` when one is given); td-built copies are
                 // restored to their /td/store canonicals from the roots + the typed
                 // recipe-output dbs.
-                let (seed_store_dirs, seed_prefix, td_store) = build_recipe_store_layout(
-                    recipe_output_store.as_deref(),
-                    store_dir,
-                )?;
+                let (seed_store_dirs, seed_prefix, td_store) =
+                    build_recipe_store_layout(recipe_output_store.as_deref(), store_dir)?;
                 // The typed db set: the argv `--recipe-output-db` entries (prior td
                 // recipe outputs whose bytes live OUTSIDE the scanned dir — their refs
                 // come from the db they wrote; the FILES stage from td_store/<base>).
@@ -11759,9 +12356,7 @@ fn main() -> ExitCode {
         // poisons a db every worktree on the same digest table shares. A
         // direct invocation naming no LOCAL-SEED-DB works exactly as before
         // the split for any plan that needs no local source.
-        Some("build-plan")
-            if (args.len() == 9 || args.len() == 10) && args[2] == "--auto" =>
-        {
+        Some("build-plan") if (args.len() == 9 || args.len() == 10) && args[2] == "--auto" => {
             let (target, recipe_dir, map_file, seed_store, seed_db, scratch) =
                 (&args[3], &args[4], &args[5], &args[6], &args[7], &args[8]);
             let local_seed_db = args.get(9).map(String::as_str);
@@ -11772,7 +12367,9 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let builder_store = bov.as_ref().map(|(p, s, d)| (p.as_str(), s.as_str(), d.as_str()));
+            let builder_store = bov
+                .as_ref()
+                .map(|(p, s, d)| (p.as_str(), s.as_str(), d.as_str()));
             let pov = match persist_store_env() {
                 Ok(p) => p,
                 Err(e) => {
@@ -11833,7 +12430,11 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             } else {
                 let sd = store::store_dir();
-                let prefix = if store_native { Some(sd.as_str()) } else { None };
+                let prefix = if store_native {
+                    Some(sd.as_str())
+                } else {
+                    None
+                };
                 match build_profile(&rest[0], &rest[1..], prefix) {
                     Ok(n) => {
                         eprintln!(
@@ -11955,8 +12556,15 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            let HostSandboxArgs { expose_cwd, store_from, store_at, store_items, no_daemon, cmd, cmd_args } =
-                parsed;
+            let HostSandboxArgs {
+                expose_cwd,
+                store_from,
+                store_at,
+                store_items,
+                no_daemon,
+                cmd,
+                cmd_args,
+            } = parsed;
             let _daemon_bind_compat = no_daemon;
             let run = || -> Result<std::process::ExitStatus, String> {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/home/td".to_string());
@@ -12021,7 +12629,12 @@ fn main() -> ExitCode {
                         .into_owned();
                     // Worktree (rw, like guix shell -C's shared cwd). HOME is a
                     // dir on the writable root tmpfs, so no HOME tmpfs.
-                    binds.push(sandbox::Bind { src: cwd.clone(), dest: None, readonly: false, ro_optional: false });
+                    binds.push(sandbox::Bind {
+                        src: cwd.clone(),
+                        dest: None,
+                        readonly: false,
+                        ro_optional: false,
+                    });
                     let allocated = host_sandbox_scratch(Path::new(&cwd))?;
                     binds.push(sandbox::Bind {
                         src: allocated.tmp.to_string_lossy().into_owned(),
@@ -12056,7 +12669,12 @@ fn main() -> ExitCode {
                     // declared, exposed input — no network egress (resolve-toolchain serves loopback).
                     let subst = format!("{home}/.td/subst");
                     if Path::new(&subst).is_dir() {
-                        binds.push(sandbox::Bind { src: subst, dest: None, readonly: true, ro_optional: false });
+                        binds.push(sandbox::Bind {
+                            src: subst,
+                            dest: None,
+                            readonly: true,
+                            ro_optional: false,
+                        });
                     }
                     // The ONE shared build daemon's socket + output store (~/.td/build-daemon,
                     // started on the host by the `td-builder check` prelude). The corpus build
@@ -12083,7 +12701,12 @@ fn main() -> ExitCode {
                     // not be able to mutate the shared source cache. Bound only when present.
                     let sources = format!("{home}/.td/sources");
                     if Path::new(&sources).is_dir() {
-                        binds.push(sandbox::Bind { src: sources, dest: None, readonly: true, ro_optional: false });
+                        binds.push(sandbox::Bind {
+                            src: sources,
+                            dest: None,
+                            readonly: true,
+                            ro_optional: false,
+                        });
                     }
                     // The kill audit directory (~/.td/kill-audit): the gate
                     // runner inside this sandbox records every signal its
@@ -12120,7 +12743,9 @@ fn main() -> ExitCode {
                     if let Some(runtime) = sandbox_host_runtime {
                         let token_name = std::env::var_os(crate::check_memory::TOKEN_DIR_ENV)
                             .and_then(|path| {
-                                PathBuf::from(path).file_name().map(|name| name.to_os_string())
+                                PathBuf::from(path)
+                                    .file_name()
+                                    .map(|name| name.to_os_string())
                             })
                             .ok_or_else(|| {
                                 format!(
@@ -12132,14 +12757,9 @@ fn main() -> ExitCode {
                             .join(token_name)
                             .to_string_lossy()
                             .into_owned();
-                        extra_env.push((
-                            crate::check_memory::HOST_RUNTIME_ENV.to_string(),
-                            runtime,
-                        ));
-                        extra_env.push((
-                            crate::check_memory::TOKEN_DIR_ENV.to_string(),
-                            token_dir,
-                        ));
+                        extra_env
+                            .push((crate::check_memory::HOST_RUNTIME_ENV.to_string(), runtime));
+                        extra_env.push((crate::check_memory::TOKEN_DIR_ENV.to_string(), token_dir));
                     }
                 } else {
                     tmpfs.push("/tmp".to_string());
@@ -12147,8 +12767,11 @@ fn main() -> ExitCode {
                 }
                 let scratch = match &check_scratch {
                     Some(allocated) => allocated.namespace.clone(),
-                    None => std::env::temp_dir()
-                        .join(format!("td-host-sandbox-{}-{}", sys::getuid(), std::process::id())),
+                    None => std::env::temp_dir().join(format!(
+                        "td-host-sandbox-{}-{}",
+                        sys::getuid(),
+                        std::process::id()
+                    )),
                 };
                 if check_scratch.is_none() {
                     let _ = std::fs::remove_dir_all(&scratch);
@@ -12202,12 +12825,24 @@ fn main() -> ExitCode {
                 let tmpfs = vec!["/tmp".to_string()];
                 let home = "/tmp".to_string();
                 let path_env = "/td/store/bin".to_string();
-                let scratch = std::env::temp_dir()
-                    .join(format!("td-store-ns-{}-{}", sys::getuid(), std::process::id()));
+                let scratch = std::env::temp_dir().join(format!(
+                    "td-store-ns-{}-{}",
+                    sys::getuid(),
+                    std::process::id()
+                ));
                 let _ = std::fs::remove_dir_all(&scratch);
                 std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
                 let result = sandbox::host_shell(
-                    &cmd, &cmd_args, &binds, &tmpfs, &path_env, &home, "", &[], &[], &scratch,
+                    &cmd,
+                    &cmd_args,
+                    &binds,
+                    &tmpfs,
+                    &path_env,
+                    &home,
+                    "",
+                    &[],
+                    &[],
+                    &scratch,
                 )
                 .map_err(|e| e.to_string());
                 let _ = std::fs::remove_dir_all(&scratch);
@@ -12365,10 +13000,14 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-add-recursive NAME SRC STORE-DIR OUT-DB");
             eprintln!("       td-builder store-path-recursive NAME SRC   # the address, interning nothing");
             eprintln!("       td-builder store-add-referenced NAME CONTENT-FILE REFS-FILE STORE-DIR OUT-DB");
-            eprintln!("       td-builder store-add-output OUTPUT DERIVER CLOSURE-FILE STORE-DIR OUT-DB");
+            eprintln!(
+                "       td-builder store-add-output OUTPUT DERIVER CLOSURE-FILE STORE-DIR OUT-DB"
+            );
             eprintln!("       td-builder store-verify DB STORE-ROOT");
             eprintln!("       td-builder store-gc-sweep STORE-DIR DB ROOT");
-            eprintln!("       td-builder store-gc-unused STORE-DIR DB DAYS [--dry-run] [--roots FILE]");
+            eprintln!(
+                "       td-builder store-gc-unused STORE-DIR DB DAYS [--dry-run] [--roots FILE]"
+            );
             eprintln!("       td-builder resolve LOCKFILE NAME...");
             eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DIR [SRC-STORE-DIR SRC-DB] [--recipe-output-store STORE] [--recipe-output-db DB]...");
             eprintln!("       td-builder build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH");
@@ -12398,15 +13037,16 @@ mod tests {
         );
         assert!(daemon_budget_probe("PROBE 7", false).is_err());
         assert!(daemon_budget_probe("PROBE ../../real.drv", true).is_err());
-        assert_eq!(daemon_budget_probe("/td/store/real.drv", true).unwrap(), None);
+        assert_eq!(
+            daemon_budget_probe("/td/store/real.drv", true).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn check_scratch_sweep_preserves_a_live_run_and_reclaims_a_crash() {
-        let parent = std::env::temp_dir().join(format!(
-            "td-check-scratch-sweep-{}",
-            std::process::id()
-        ));
+        let parent =
+            std::env::temp_dir().join(format!("td-check-scratch-sweep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&parent);
         let stale = parent.join("run-1-0");
         let active = parent.join("run-2-0");
@@ -12456,10 +13096,8 @@ mod tests {
 
     #[test]
     fn check_scratch_cleanup_reclaims_mode_000_trees() {
-        let parent = std::env::temp_dir().join(format!(
-            "td-check-scratch-mode-{}",
-            std::process::id()
-        ));
+        let parent =
+            std::env::temp_dir().join(format!("td-check-scratch-mode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&parent);
         let run = parent.join("run-1-0");
         let nested = run.join("tmp/closed");
@@ -12498,9 +13136,8 @@ mod tests {
 
     #[test]
     fn daemon_dedup_keys_leave_when_the_last_request_finishes() {
-        let map: DaemonKeyMap = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        ));
+        let map: DaemonKeyMap =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
         map.lock().unwrap().insert("key".to_string(), lock.clone());
         let first = DaemonKeyUse {
@@ -12538,16 +13175,31 @@ mod tests {
             std::fs::write(p, b"out").unwrap();
         };
         // Empty ⇒ false: a drv with no outputs must never reuse a vacuous baseline.
-        assert!(!output_trees_present(&dir, &[]), "empty canon set must not reuse");
+        assert!(
+            !output_trees_present(&dir, &[]),
+            "empty canon set must not reuse"
+        );
         // Missing ⇒ false (the fallback trigger — VERIFIED-RED for the reuse guard).
-        assert!(!output_trees_present(&dir, &[a.clone()]), "absent output must force a rebuild");
+        assert!(
+            !output_trees_present(&dir, &[a.clone()]),
+            "absent output must force a rebuild"
+        );
         // Present ⇒ true (the loop's normal 2-build path).
         touch(&a);
-        assert!(output_trees_present(&dir, &[a.clone()]), "present output must be reusable");
+        assert!(
+            output_trees_present(&dir, &[a.clone()]),
+            "present output must be reusable"
+        );
         // Multi-output: reuse only when EVERY output is present.
-        assert!(!output_trees_present(&dir, &[a.clone(), b.clone()]), "one missing output must force a rebuild");
+        assert!(
+            !output_trees_present(&dir, &[a.clone(), b.clone()]),
+            "one missing output must force a rebuild"
+        );
         touch(&b);
-        assert!(output_trees_present(&dir, &[a, b]), "all outputs present must be reusable");
+        assert!(
+            output_trees_present(&dir, &[a, b]),
+            "all outputs present must be reusable"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12558,18 +13210,12 @@ mod tests {
     #[test]
     fn source_lock_body_contains_only_the_interned_source() {
         let lock = source_lock_body("ripgrep-source", "/td/store/zzz-ripgrep-src");
-        assert_eq!(
-            lock,
-            "ripgrep-source /td/store/zzz-ripgrep-src source\n"
-        );
+        assert_eq!(lock, "ripgrep-source /td/store/zzz-ripgrep-src source\n");
     }
 
     #[test]
     fn source_overrides_cover_every_registered_lock_root() {
-        let dir = std::env::temp_dir().join(format!(
-            "td-source-overrides-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("td-source-overrides-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let primary = "/td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tool-src";
@@ -12626,20 +13272,19 @@ mod tests {
         assert_eq!(parse_shell_source_pins(&second).unwrap().len(), 2);
         let malformed_second = format!("{pins}not-a-tab-separated-pin\n");
         let err = parse_shell_source_pins(&malformed_second).err().unwrap();
-        assert!(err.contains("malformed td shell recipe source pin"), "{err}");
+        assert!(
+            err.contains("malformed td shell recipe source pin"),
+            "{err}"
+        );
 
-        let dir = std::env::temp_dir().join(format!(
-            "td-shell-source-pin-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("td-shell-source-pin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let archive = dir.join("ripgrep.crate");
         std::fs::write(&archive, b"abc").unwrap();
         verify_shell_source_archive(&archive, &pin).unwrap();
         let private = dir.join("private");
-        let staged =
-            stage_verified_shell_source_archive(&archive, &pin, &private, 0).unwrap();
+        let staged = stage_verified_shell_source_archive(&archive, &pin, &private, 0).unwrap();
         std::fs::write(&archive, b"abd").unwrap();
         verify_shell_source_archive(&staged, &pin).unwrap();
         let err = verify_shell_source_archive(&archive, &pin).unwrap_err();
@@ -12667,9 +13312,7 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
         assert!(!out.contains("/gnu/store"));
         let padded = format!("\n{source}\n");
         assert_eq!(recipe_toolchain_lock_body(&padded, native).unwrap(), out);
-        let with_git = format!(
-            "{source}codex-crossterm-source /td/store/git-crossterm seed\n"
-        );
+        let with_git = format!("{source}codex-crossterm-source /td/store/git-crossterm seed\n");
         let git_out = recipe_toolchain_lock_body(&with_git, native).unwrap();
         assert!(git_out.starts_with(&with_git));
     }
@@ -12692,11 +13335,9 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
             "rust-stage0 /td/store/downloaded-rust-stage0 td-recipe-output\n"
         )
         .is_err());
-        assert!(recipe_toolchain_lock_body(
-            source,
-            "rust-toolchain /td/store/final seed\n"
-        )
-        .is_err());
+        assert!(
+            recipe_toolchain_lock_body(source, "rust-toolchain /td/store/final seed\n").is_err()
+        );
         assert!(recipe_toolchain_lock_body(
             "ripgrep-source /td/store/src-ripgrep source\nextra /td/store/extra source\n",
             "rust-toolchain /td/store/final td-recipe-output\n"
@@ -12711,11 +13352,10 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
 
     #[test]
     fn recipe_toolchain_lock_requires_a_build_platform() {
-        assert!(recipe_toolchain_lock_body(
-            "ripgrep-source /td/store/src-ripgrep source\n",
-            ""
-        )
-        .is_err());
+        assert!(
+            recipe_toolchain_lock_body("ripgrep-source /td/store/src-ripgrep source\n", "")
+                .is_err()
+        );
     }
 
     #[test]
@@ -12777,13 +13417,26 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
     #[test]
     fn loop_text_helpers_extract_and_count() {
         let text = "alpha\nDRV=/tmp/a.drv\nSTEP gcc /td/store/gcc\nSTEP gcc /td/store/gcc2\n\n";
-        assert_eq!(first_line_with_prefix(text, "DRV="), Some("/tmp/a.drv".to_string()));
-        assert_eq!(last_line_with_prefix(text, "STEP gcc "), Some("/td/store/gcc2".to_string()));
-        assert_eq!(first_line_containing(text, "store/gcc"), Some("STEP gcc /td/store/gcc".to_string()));
+        assert_eq!(
+            first_line_with_prefix(text, "DRV="),
+            Some("/tmp/a.drv".to_string())
+        );
+        assert_eq!(
+            last_line_with_prefix(text, "STEP gcc "),
+            Some("/td/store/gcc2".to_string())
+        );
+        assert_eq!(
+            first_line_containing(text, "store/gcc"),
+            Some("STEP gcc /td/store/gcc".to_string())
+        );
         assert_eq!(count_line_exact(text, "alpha"), 1);
         assert_eq!(count_nonempty_lines(text), 4);
-        assert!(cargo_test_reported_nonzero_tests("test result: ok. 12 passed; 0 failed"));
-        assert!(!cargo_test_reported_nonzero_tests("test result: ok. 0 passed; 0 failed"));
+        assert!(cargo_test_reported_nonzero_tests(
+            "test result: ok. 12 passed; 0 failed"
+        ));
+        assert!(!cargo_test_reported_nonzero_tests(
+            "test result: ok. 0 passed; 0 failed"
+        ));
     }
 
     #[test]
@@ -12800,15 +13453,22 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
             d.join("a/b/libstdc++.so.6")
         );
         assert_eq!(
-            first_file_named("libstdc++.so.6*", &roots).unwrap().unwrap(),
+            first_file_named("libstdc++.so.6*", &roots)
+                .unwrap()
+                .unwrap(),
             d.join("a/b/libstdc++.so.6")
         );
         assert_eq!(
             tree_first_containing("/td/store", &roots).unwrap().unwrap(),
             d.join("a/b/libstdc++.so.6.0")
         );
-        assert_eq!(first_file_named("cc1", &roots).unwrap().unwrap(), d.join("a/cc1"));
-        assert!(tree_first_containing("/gnu/store", &roots).unwrap().is_none());
+        assert_eq!(
+            first_file_named("cc1", &roots).unwrap().unwrap(),
+            d.join("a/cc1")
+        );
+        assert!(tree_first_containing("/gnu/store", &roots)
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -12843,8 +13503,15 @@ daemon build START (2/2 active)
         assert_eq!(daemon_budget_stats(log, 2).unwrap(), (2, 3));
         let d = std::env::temp_dir().join(format!("td-daemon-budget-{}.log", std::process::id()));
         std::fs::write(&d, log).unwrap();
-        assert_eq!(daemon_budget_check(d.to_str().unwrap(), "2").unwrap(), (2, 3));
-        std::fs::write(&d, "daemon: budget 2 concurrent builds\ndaemon build START (2/2 active)\n").unwrap();
+        assert_eq!(
+            daemon_budget_check(d.to_str().unwrap(), "2").unwrap(),
+            (2, 3)
+        );
+        std::fs::write(
+            &d,
+            "daemon: budget 2 concurrent builds\ndaemon build START (2/2 active)\n",
+        )
+        .unwrap();
         let err = daemon_budget_check(d.to_str().unwrap(), "2").unwrap_err();
         assert!(err.contains("expected at least 3"), "got: {err}");
         let _ = std::fs::remove_file(&d);
@@ -12893,7 +13560,10 @@ daemon build START (2/2 active)
         let bytes = merge_regs(None, &[reg(A, "hashA", &[X])]).unwrap();
         let db = store_db_read::Db::open(bytes).unwrap();
         assert_eq!(full_row(&db, A).map(|r| r.1), Some("hashA".to_string()));
-        assert!(full_row(&db, X).is_none(), "a bare reference is a scaffold (no hash)");
+        assert!(
+            full_row(&db, X).is_none(),
+            "a bare reference is a scaffold (no hash)"
+        );
         assert_eq!(sorted_closure(&db, A), vec![A.to_string(), X.to_string()]);
     }
 
@@ -12905,7 +13575,11 @@ daemon build START (2/2 active)
         let db1 = merge_regs(None, &[reg(A, "hashA", &[])]).unwrap();
         let db2 = merge_regs(Some(&db1), &[reg(B, "hashB", &[A])]).unwrap();
         let db = store_db_read::Db::open(db2).unwrap();
-        assert_eq!(full_row(&db, A).map(|r| r.1), Some("hashA".to_string()), "A NOT clobbered by B's commit");
+        assert_eq!(
+            full_row(&db, A).map(|r| r.1),
+            Some("hashA".to_string()),
+            "A NOT clobbered by B's commit"
+        );
         assert_eq!(full_row(&db, B).map(|r| r.1), Some("hashB".to_string()));
         // B's closure spans the earlier-committed A (read-back across commits).
         assert_eq!(sorted_closure(&db, B), vec![A.to_string(), B.to_string()]);
@@ -12916,8 +13590,12 @@ daemon build START (2/2 active)
         // Re-committing the same set reproduces the bytes exactly (sorted rowids),
         // so a redundant commit is a safe no-op on the db.
         let once = merge_regs(None, &[reg(A, "hashA", &[X]), reg(B, "hashB", &[A])]).unwrap();
-        let twice = merge_regs(Some(&once), &[reg(A, "hashA", &[X]), reg(B, "hashB", &[A])]).unwrap();
-        assert_eq!(once, twice, "re-merging the same outputs must be byte-identical");
+        let twice =
+            merge_regs(Some(&once), &[reg(A, "hashA", &[X]), reg(B, "hashB", &[A])]).unwrap();
+        assert_eq!(
+            once, twice,
+            "re-merging the same outputs must be byte-identical"
+        );
         // Commit ORDER must not matter either (rowids assigned by sorted path).
         let other = merge_regs(None, &[reg(B, "hashB", &[A]), reg(A, "hashA", &[X])]).unwrap();
         assert_eq!(once, other, "merge result is independent of commit order");
@@ -12931,7 +13609,11 @@ daemon build START (2/2 active)
         assert!(full_row(&store_db_read::Db::open(db1.clone()).unwrap(), A).is_none());
         let db2 = merge_regs(Some(&db1), &[reg(A, "hashA", &[])]).unwrap();
         let db = store_db_read::Db::open(db2).unwrap();
-        assert_eq!(full_row(&db, A).map(|r| r.1), Some("hashA".to_string()), "scaffold A upgraded to full");
+        assert_eq!(
+            full_row(&db, A).map(|r| r.1),
+            Some("hashA".to_string()),
+            "scaffold A upgraded to full"
+        );
         let a_rows = db
             .table("ValidPaths")
             .unwrap()
@@ -13031,7 +13713,10 @@ daemon build START (2/2 active)
         let no_receipt =
             persistent_realization(&one_output_drv(&path), sd, &db, &s0, &expect, &deriver)
                 .unwrap();
-        assert!(no_receipt.is_none(), "a valid row+tree without an engine receipt must MISS");
+        assert!(
+            no_receipt.is_none(),
+            "a valid row+tree without an engine receipt must MISS"
+        );
 
         // Write the engine receipt sidecar for this deriver, dated long ago: the hit
         // below must stamp it as used (what `store-gc-unused` judges it by), and a
@@ -13049,7 +13734,10 @@ daemon build START (2/2 active)
             .unwrap()
             .expect("expected a persistent-store HIT");
         assert_eq!(regs[0].store_path, path);
-        assert!(s1.join("newstore").join(base).join("bin/run").exists(), "output tree staged into newstore");
+        assert!(
+            s1.join("newstore").join(base).join("bin/run").exists(),
+            "output tree staged into newstore"
+        );
         let mtime = |p: &Path| std::fs::symlink_metadata(p).unwrap().modified().unwrap();
         assert!(mtime(&rp) > long_ago, "a hit stamps its receipt as used");
 
@@ -13059,11 +13747,17 @@ daemon build START (2/2 active)
         set_times(&rp, long_ago, long_ago);
         let s_id = tmp.join("s-wrong-identity");
         std::fs::create_dir_all(&s_id).unwrap();
-        let other = ReceiptExpect { manifest_sha256: "99".repeat(32), ..expect.clone() };
+        let other = ReceiptExpect {
+            manifest_sha256: "99".repeat(32),
+            ..expect.clone()
+        };
         let wrong_id =
             persistent_realization(&one_output_drv(&path), sd, &db, &s_id, &other, &deriver)
                 .unwrap();
-        assert!(wrong_id.is_none(), "a receipt issued for another plan identity must MISS");
+        assert!(
+            wrong_id.is_none(),
+            "a receipt issued for another plan identity must MISS"
+        );
         assert_eq!(mtime(&rp), long_ago, "a miss leaves the receipt unstamped");
 
         // Rows minted for a DIFFERENT deriver → MISS even with a matching sidecar:
@@ -13074,9 +13768,11 @@ daemon build START (2/2 active)
         let s_al = tmp.join("s-alien-deriver");
         std::fs::create_dir_all(&s_al).unwrap();
         let alien_hit =
-            persistent_realization(&one_output_drv(&path), sd, &db, &s_al, &expect, alien)
-                .unwrap();
-        assert!(alien_hit.is_none(), "rows derived by another drv must not vouch this one");
+            persistent_realization(&one_output_drv(&path), sd, &db, &s_al, &expect, alien).unwrap();
+        assert!(
+            alien_hit.is_none(),
+            "rows derived by another drv must not vouch this one"
+        );
 
         // MISS: an output path not registered in the persistent DB.
         let s2 = tmp.join("s-miss");
@@ -13099,11 +13795,15 @@ daemon build START (2/2 active)
         std::fs::write(tree.join("bin/run"), b"tampered\n").unwrap();
         let s3 = tmp.join("s-tampered");
         std::fs::create_dir_all(&s3).unwrap();
-        let tampered = persistent_realization(&one_output_drv(&path), sd, &db, &s3, &expect, &deriver)
-            .unwrap()
-            .expect("reuse trusts the store: a tampered-but-registered tree still HITS");
+        let tampered =
+            persistent_realization(&one_output_drv(&path), sd, &db, &s3, &expect, &deriver)
+                .unwrap()
+                .expect("reuse trusts the store: a tampered-but-registered tree still HITS");
         assert_eq!(tampered[0].store_path, path);
-        assert_eq!(tampered[0].nar_hash, reg.nar_hash, "the HIT returns the RECORDED hash, not the tree's");
+        assert_eq!(
+            tampered[0].nar_hash, reg.nar_hash,
+            "the HIT returns the RECORDED hash, not the tree's"
+        );
         assert!(
             s3.join("newstore").join(base).join("bin/run").exists(),
             "the trusted tree is staged even though its bytes changed"
@@ -13139,13 +13839,23 @@ daemon build START (2/2 active)
         let (dbs, roots) = (db.to_str().unwrap(), store.to_str().unwrap());
 
         // Intact store verifies clean.
-        assert!(store_verify_paths(dbs, roots).is_ok(), "an intact store must verify");
+        assert!(
+            store_verify_paths(dbs, roots).is_ok(),
+            "an intact store must verify"
+        );
 
         // Tamper the tree; the fsck now FAILS (the reuse path would have trusted it).
         std::fs::write(tree.join("bin/run"), b"tampered\n").unwrap();
-        let err = store_verify_paths(dbs, roots).expect_err("a tampered tree must fail verification");
-        assert!(err.contains("FAILED verification"), "unexpected error: {err}");
-        assert!(err.contains(&path), "the failure must name the tampered path");
+        let err =
+            store_verify_paths(dbs, roots).expect_err("a tampered tree must fail verification");
+        assert!(
+            err.contains("FAILED verification"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains(&path),
+            "the failure must name the tampered path"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -13160,9 +13870,11 @@ daemon build START (2/2 active)
         // A CANONICAL (0444) file — hardlinked (shared inode); a NON-canonical (0644) file —
         // copied (canonicalized, independent inode), so DST never shares a writable inode.
         std::fs::write(src.join("bin/run"), b"hi\n").unwrap();
-        std::fs::set_permissions(src.join("bin/run"), std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(src.join("bin/run"), std::fs::Permissions::from_mode(0o444))
+            .unwrap();
         std::fs::write(src.join("bin/raw"), b"raw\n").unwrap();
-        std::fs::set_permissions(src.join("bin/raw"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(src.join("bin/raw"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
         std::os::unix::fs::symlink("bin/run", src.join("link")).unwrap();
         let dst = tmp.join("dst");
         link_canonical(&src, &dst).unwrap();
@@ -13180,13 +13892,20 @@ daemon build START (2/2 active)
             "a non-canonical 0644 file must be copied, not hardlinked"
         );
         assert_eq!(
-            std::fs::metadata(dst.join("bin/raw")).unwrap().permissions().mode() & 0o7777,
+            std::fs::metadata(dst.join("bin/raw"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
             0o444,
             "the copied file is canonicalized to 0444"
         );
         // Symlink recreated verbatim (not followed).
         let lm = std::fs::symlink_metadata(dst.join("link")).unwrap();
-        assert!(lm.file_type().is_symlink(), "the symlink must be recreated as a symlink");
+        assert!(
+            lm.file_type().is_symlink(),
+            "the symlink must be recreated as a symlink"
+        );
         assert_eq!(
             std::fs::read_link(dst.join("link")).unwrap(),
             std::path::Path::new("bin/run")
@@ -13202,11 +13921,20 @@ daemon build START (2/2 active)
                     deriver /gnu/store/cccccccccccccccccccccccccccccccc-o.drv\n";
         let regs = parse_registration_blocks(blob);
         assert_eq!(regs.len(), 1);
-        assert_eq!(regs[0].store_path, "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-o");
+        assert_eq!(
+            regs[0].store_path,
+            "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-o"
+        );
         assert_eq!(regs[0].nar_hash, "sha256:deadbeef");
         assert_eq!(regs[0].nar_size, 7);
-        assert_eq!(regs[0].refs, vec!["/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep".to_string()]);
-        assert_eq!(regs[0].deriver, "/gnu/store/cccccccccccccccccccccccccccccccc-o.drv");
+        assert_eq!(
+            regs[0].refs,
+            vec!["/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep".to_string()]
+        );
+        assert_eq!(
+            regs[0].deriver,
+            "/gnu/store/cccccccccccccccccccccccccccccccc-o.drv"
+        );
     }
 
     // TD_BUILD_NICE policy: default 10 when unset/garbage, honor a valid value,
@@ -13214,10 +13942,22 @@ daemon build START (2/2 active)
     #[test]
     fn build_nice_target_parses_and_clamps() {
         assert_eq!(parse_build_nice(None), 10, "unset -> default 10");
-        assert_eq!(parse_build_nice(Some("garbage".into())), 10, "garbage -> default");
+        assert_eq!(
+            parse_build_nice(Some("garbage".into())),
+            10,
+            "garbage -> default"
+        );
         assert_eq!(parse_build_nice(Some("".into())), 10, "empty -> default");
-        assert_eq!(parse_build_nice(Some(" 15 ".into())), 15, "trimmed valid value");
-        assert_eq!(parse_build_nice(Some("0".into())), 0, "0 is honored (opt out)");
+        assert_eq!(
+            parse_build_nice(Some(" 15 ".into())),
+            15,
+            "trimmed valid value"
+        );
+        assert_eq!(
+            parse_build_nice(Some("0".into())),
+            0,
+            "0 is honored (opt out)"
+        );
         assert_eq!(parse_build_nice(Some("99".into())), 19, "clamp above max");
         assert_eq!(parse_build_nice(Some("-99".into())), -20, "clamp below min");
     }
@@ -13235,9 +13975,19 @@ daemon build START (2/2 active)
     #[test]
     fn host_sandbox_store_at_for_td_store_harness() {
         // The inc2c path: bind td's own harness at /td/store.
-        let p = hs(&["--store-from", "/h/store", "--store-at", "/td/store", "--no-daemon",
-                     "--", "/td/store/bin/busybox", "sh", "-c", "true"])
-            .expect("valid");
+        let p = hs(&[
+            "--store-from",
+            "/h/store",
+            "--store-at",
+            "/td/store",
+            "--no-daemon",
+            "--",
+            "/td/store/bin/busybox",
+            "sh",
+            "-c",
+            "true",
+        ])
+        .expect("valid");
         assert_eq!(p.store_from.as_deref(), Some("/h/store"));
         assert_eq!(p.store_at.as_deref(), Some("/td/store"));
         assert!(p.no_daemon, "--no-daemon parsed");
@@ -13252,10 +14002,20 @@ daemon build START (2/2 active)
         // handler then defaults the dest to store_dir() (the td store). The
         // daemon/cwd flags parse as before. Asserting store_at==None keeps the
         // default wired here.
-        let p = hs(&["--expose-cwd", "--store-from", "/seed", "--", "make", "check"])
-            .expect("valid");
+        let p = hs(&[
+            "--expose-cwd",
+            "--store-from",
+            "/seed",
+            "--",
+            "make",
+            "check",
+        ])
+        .expect("valid");
         assert_eq!(p.store_from.as_deref(), Some("/seed"));
-        assert_eq!(p.store_at, None, "no --store-at -> handler binds at the active store dir");
+        assert_eq!(
+            p.store_at, None,
+            "no --store-at -> handler binds at the active store dir"
+        );
         assert!(p.expose_cwd);
         assert!(!p.no_daemon);
         assert_eq!(p.cmd, "make");
@@ -13293,11 +14053,21 @@ daemon build START (2/2 active)
 
     #[test]
     fn host_sandbox_flag_errors() {
-        assert!(hs(&["--store-from", "--", "true"]).unwrap_err().contains("--store-from needs a DIR"));
-        assert!(hs(&["--store-at", "--", "true"]).unwrap_err().contains("--store-at needs a DIR"));
-        assert!(hs(&["--store-item", "--", "true"]).unwrap_err().contains("--store-item needs a PATH"));
-        assert!(hs(&["--store-item-at", "/src", "--", "true"]).unwrap_err().contains("--store-item-at needs SRC and DEST"));
-        assert!(hs(&["--bogus", "--", "true"]).unwrap_err().contains("unknown flag"));
+        assert!(hs(&["--store-from", "--", "true"])
+            .unwrap_err()
+            .contains("--store-from needs a DIR"));
+        assert!(hs(&["--store-at", "--", "true"])
+            .unwrap_err()
+            .contains("--store-at needs a DIR"));
+        assert!(hs(&["--store-item", "--", "true"])
+            .unwrap_err()
+            .contains("--store-item needs a PATH"));
+        assert!(hs(&["--store-item-at", "/src", "--", "true"])
+            .unwrap_err()
+            .contains("--store-item-at needs SRC and DEST"));
+        assert!(hs(&["--bogus", "--", "true"])
+            .unwrap_err()
+            .contains("unknown flag"));
         // a `--` with no command after it is a usage error (no vacuous empty cmd).
         assert!(hs(&["--expose-cwd", "--"]).unwrap_err().contains("usage:"));
     }
@@ -13308,17 +14078,32 @@ daemon build START (2/2 active)
     // (the td-built userland's durable host copy appears at its /td/store path).
     #[test]
     fn host_sandbox_store_items_repeat_and_stay_directory_free() {
-        let p = hs(&["--expose-cwd", "--no-daemon",
-                     "--store-item", "/seed/store/aaa-rust-1.93.0",
-                     "--store-item-at", "/home/u/.td/loop/bbb-busybox-1.37.0",
-                                        "/td/store/bbb-busybox-1.37.0",
-                     "--", "gate-run"])
-            .expect("valid");
-        assert_eq!(p.store_items,
-                   vec![("/seed/store/aaa-rust-1.93.0".to_string(), None),
-                        ("/home/u/.td/loop/bbb-busybox-1.37.0".to_string(),
-                         Some("/td/store/bbb-busybox-1.37.0".to_string()))]);
-        assert_eq!(p.store_from, None, "per-item exposure implies no store-dir bind");
+        let p = hs(&[
+            "--expose-cwd",
+            "--no-daemon",
+            "--store-item",
+            "/seed/store/aaa-rust-1.93.0",
+            "--store-item-at",
+            "/home/u/.td/loop/bbb-busybox-1.37.0",
+            "/td/store/bbb-busybox-1.37.0",
+            "--",
+            "gate-run",
+        ])
+        .expect("valid");
+        assert_eq!(
+            p.store_items,
+            vec![
+                ("/seed/store/aaa-rust-1.93.0".to_string(), None),
+                (
+                    "/home/u/.td/loop/bbb-busybox-1.37.0".to_string(),
+                    Some("/td/store/bbb-busybox-1.37.0".to_string())
+                )
+            ]
+        );
+        assert_eq!(
+            p.store_from, None,
+            "per-item exposure implies no store-dir bind"
+        );
         assert_eq!(p.cmd, "gate-run");
     }
 
@@ -13371,8 +14156,12 @@ daemon build START (2/2 active)
             dir.join("aaaa-a").to_string_lossy().into_owned(),
             dir.join("bbbb-b").to_string_lossy().into_owned(),
         ];
-        let err = build_profile(dir.join("profile").to_str().unwrap(), &pkgs, Some("/td/store"))
-            .unwrap_err();
+        let err = build_profile(
+            dir.join("profile").to_str().unwrap(),
+            &pkgs,
+            Some("/td/store"),
+        )
+        .unwrap_err();
         assert!(err.contains("collision"), "unexpected: {err}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -13389,7 +14178,10 @@ daemon build START (2/2 active)
         let put = |name: &str, json: &str| {
             std::fs::write(rj.join(format!("{name}.json")), json).unwrap();
         };
-        put("bash", r#"{"name":"bash","inputs":["readline","ncurses","gcc-toolchain"]}"#);
+        put(
+            "bash",
+            r#"{"name":"bash","inputs":["readline","ncurses","gcc-toolchain"]}"#,
+        );
         put("readline", r#"{"name":"readline","inputs":["ncurses"]}"#);
         put("ncurses", r#"{"name":"ncurses"}"#);
         // gcc-toolchain has no recipe JSON → not owned → not a node.
@@ -13397,7 +14189,15 @@ daemon build START (2/2 active)
         let mut order = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         let mut stack = Vec::new();
-        auto_topo(&rjs, "bash", &mut order, &mut seen, &mut stack, &mut Default::default()).unwrap();
+        auto_topo(
+            &rjs,
+            "bash",
+            &mut order,
+            &mut seen,
+            &mut stack,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(order, vec!["ncurses", "readline", "bash"]);
         std::fs::remove_dir_all(&d).ok();
     }
@@ -13420,7 +14220,15 @@ daemon build START (2/2 active)
         let walk = |target: &str| {
             let (mut order, mut seen, mut stack) =
                 (Vec::new(), std::collections::BTreeSet::new(), Vec::new());
-            auto_topo(&rjs, target, &mut order, &mut seen, &mut stack, &mut Default::default()).map(|()| order)
+            auto_topo(
+                &rjs,
+                target,
+                &mut order,
+                &mut seen,
+                &mut stack,
+                &mut Default::default(),
+            )
+            .map(|()| order)
         };
 
         for (stem, json) in [
@@ -13435,7 +14243,10 @@ daemon build START (2/2 active)
         // The DATA channel is what the marker exists to permit — an image must be
         // able to consume an application to place it in root.erofs — and the
         // payload is still a NODE, so the plan builds it.
-        put("image", r#"{"name":"image","inputs":["gcc"],"payloadInputs":["firefox"]}"#);
+        put(
+            "image",
+            r#"{"name":"image","inputs":["gcc"],"payloadInputs":["firefox"]}"#,
+        );
         let order = walk("image").expect("a payload may be staged as data");
         assert!(order.contains(&"firefox".to_string()), "{order:?}");
 
@@ -13491,7 +14302,11 @@ daemon build START (2/2 active)
             names_in_channel(&parse(r#"{"inputs":["a","b"]}"#), "inputs").unwrap(),
             vec!["a".to_string(), "b".to_string()]
         );
-        for bad in [r#"{"inputs":"firefox"}"#, r#"{"inputs":[{"n":"x"}]}"#, r#"{"inputs":7}"#] {
+        for bad in [
+            r#"{"inputs":"firefox"}"#,
+            r#"{"inputs":[{"n":"x"}]}"#,
+            r#"{"inputs":7}"#,
+        ] {
             let e = names_in_channel(&parse(bad), "inputs")
                 .expect_err("a malformed channel must refuse");
             assert!(e.contains("inputs"), "{e}");
@@ -13501,8 +14316,7 @@ daemon build START (2/2 active)
         let rj = d.join("rj");
         std::fs::create_dir_all(&rj).unwrap();
         std::fs::write(rj.join("s.json"), r#"{"name":"s","inputs":"firefox"}"#).unwrap();
-        let (mut o, mut s2, mut st) =
-            (Vec::new(), std::collections::BTreeSet::new(), Vec::new());
+        let (mut o, mut s2, mut st) = (Vec::new(), std::collections::BTreeSet::new(), Vec::new());
         assert!(auto_topo(
             &rj.to_string_lossy(),
             "s",
@@ -13539,8 +14353,14 @@ daemon build START (2/2 active)
     fn auto_parse_map_skips_blanks_and_comments_first_wins() {
         let text = "# a comment\n\nbash /td/store/aaa-bash\nbash /td/store/zzz-bash-dup\nmake /td/store/bbb-make\n";
         let m = auto_parse_map(text);
-        assert_eq!(m.get("bash").map(String::as_str), Some("/td/store/aaa-bash"));
-        assert_eq!(m.get("make").map(String::as_str), Some("/td/store/bbb-make"));
+        assert_eq!(
+            m.get("bash").map(String::as_str),
+            Some("/td/store/aaa-bash")
+        );
+        assert_eq!(
+            m.get("make").map(String::as_str),
+            Some("/td/store/bbb-make")
+        );
         assert_eq!(m.len(), 2);
     }
 
@@ -13561,7 +14381,10 @@ daemon build START (2/2 active)
 
     fn seed_repo_root() -> PathBuf {
         // builder/ → repo root.
-        Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf()
     }
 
     // The declaration a test stages comes from the COMPILED roster, never from
@@ -13571,7 +14394,10 @@ daemon build START (2/2 active)
         let (rel, trees) = local_source_roster_expected(key)
             .unwrap()
             .expect("key must be in the compiled local-source roster");
-        (rel.to_string(), trees.iter().map(|t| t.to_string()).collect())
+        (
+            rel.to_string(),
+            trees.iter().map(|t| t.to_string()).collect(),
+        )
     }
 
     fn stage_roster_key(root: &Path, key: &str, dest: &Path) -> PathBuf {
@@ -13646,7 +14472,9 @@ daemon build START (2/2 active)
     fn intern_real_patch_seed(seeds: &Path, key: &str) -> String {
         let stem = key.strip_prefix("patch-").unwrap();
         let bytes = std::fs::read(
-            seed_repo_root().join("seed/patches").join(format!("{stem}.patch")),
+            seed_repo_root()
+                .join("seed/patches")
+                .join(format!("{stem}.patch")),
         )
         .unwrap();
         let path = intern_test_seed(seeds, key, &bytes);
@@ -13659,7 +14487,6 @@ daemon build START (2/2 active)
         );
         path
     }
-
 
     // authenticate_ca_db (re #469 round-8): a placement db carries authority
     // only for rows whose on-disk bytes reproduce BOTH the recorded NAR hash
@@ -13699,7 +14526,10 @@ daemon build START (2/2 active)
         write_output_db(std::slice::from_ref(&reg(&path2, &hash)), &tamper_db).unwrap();
         std::fs::write(items2.join(base2), b"tampered").unwrap();
         let err = authenticate_ca_db(&tamper_db.to_string_lossy(), &items2, "test").unwrap_err();
-        assert!(err.contains("vouches only for bytes it can reproduce"), "{err}");
+        assert!(
+            err.contains("vouches only for bytes it can reproduce"),
+            "{err}"
+        );
         // Red (name leg): bytes hash correctly but the claimed store name is
         // not the one those bytes derive — a valid-looking db over chosen
         // bytes at a chosen address.
@@ -13710,7 +14540,11 @@ daemon build START (2/2 active)
         std::fs::write(items3.join(alien_base), b"alien bytes").unwrap();
         let alien_hash = nar_hash_path(&items3.join(alien_base)).unwrap();
         let alien_db = d.join("ca-alien.db");
-        write_output_db(std::slice::from_ref(&reg(&alien_path, &alien_hash)), &alien_db).unwrap();
+        write_output_db(
+            std::slice::from_ref(&reg(&alien_path, &alien_hash)),
+            &alien_db,
+        )
+        .unwrap();
         let err = authenticate_ca_db(&alien_db.to_string_lossy(), &items3, "test").unwrap_err();
         assert!(err.contains("do not reproduce its own name"), "{err}");
         std::fs::remove_dir_all(&d).ok();
@@ -13780,7 +14614,10 @@ daemon build START (2/2 active)
         let mut low: sandbox::StageManifest = sandbox::StageManifest::new();
         low.insert(src.clone(), si("11", sandbox::InputOrigin::AuditedSeed));
         low.insert(seed_a.clone(), si("22", sandbox::InputOrigin::AuditedSeed));
-        low.insert(builder.clone(), si("bb", sandbox::InputOrigin::ControlPlaneBuilder));
+        low.insert(
+            builder.clone(),
+            si("bb", sandbox::InputOrigin::ControlPlaneBuilder),
+        );
         // The HIGH target's manifest: the same closure PLUS unrelated seeds folded into
         // the shared seed db.
         let mut high = low.clone();
@@ -13892,7 +14729,10 @@ daemon build START (2/2 active)
             let mut m: sandbox::StageManifest = sandbox::StageManifest::new();
             m.insert(src.clone(), si("11", sandbox::InputOrigin::AuditedSeed));
             m.insert(seed.clone(), si("22", sandbox::InputOrigin::AuditedSeed));
-            m.insert(bpath.to_string(), si(bhash, sandbox::InputOrigin::ControlPlaneBuilder));
+            m.insert(
+                bpath.to_string(),
+                si(bhash, sandbox::InputOrigin::ControlPlaneBuilder),
+            );
             (closure, m)
         };
         let (cl1, m1) = mk(&builder_v1, "b1");
@@ -13948,7 +14788,10 @@ daemon build START (2/2 active)
         let dep = format!("/td/store/{}-newlib", "7".repeat(32));
         let mut cl_with_dep = cl1.clone();
         cl_with_dep.push(dep.clone()); // in the closure, but deliberately absent from m1
-        assert!(!m1.contains_key(&dep), "dep must be unvouched for this test");
+        assert!(
+            !m1.contains_key(&dep),
+            "dep must be unvouched for this test"
+        );
         assert_ne!(
             reuse_key_manifest_digest(&cl1, &m1, &identity, Some(&builder_v1)),
             reuse_key_manifest_digest(&cl_with_dep, &m1, &identity, Some(&builder_v1)),
@@ -13969,8 +14812,18 @@ daemon build START (2/2 active)
         let dep_lib = format!("/td/store/{}-dep-lib", "2".repeat(32));
         let dep = drv::Derivation {
             outputs: vec![
-                drv::Output { name: "out".to_string(), path: dep_out.clone(), hash_algo: String::new(), hash: String::new() },
-                drv::Output { name: "lib".to_string(), path: dep_lib.clone(), hash_algo: String::new(), hash: String::new() },
+                drv::Output {
+                    name: "out".to_string(),
+                    path: dep_out.clone(),
+                    hash_algo: String::new(),
+                    hash: String::new(),
+                },
+                drv::Output {
+                    name: "lib".to_string(),
+                    path: dep_lib.clone(),
+                    hash_algo: String::new(),
+                    hash: String::new(),
+                },
             ],
             input_drvs: vec![],
             input_srcs: vec![],
@@ -13986,16 +14839,20 @@ daemon build START (2/2 active)
         let mut parent = one_output_drv(&format!("/td/store/{}-parent", "e".repeat(32)));
         parent.input_srcs = vec![src.clone()];
         // Request BOTH the `lib` and `out` outputs of the dep (order as written).
-        parent.input_drvs =
-            vec![(dep_path.to_string_lossy().into_owned(), vec!["lib".to_string(), "out".to_string()])];
+        parent.input_drvs = vec![(
+            dep_path.to_string_lossy().into_owned(),
+            vec!["lib".to_string(), "out".to_string()],
+        )];
 
         let roots = drv_declared_inputs(&parent).unwrap();
         // input-srcs first (verbatim), then the resolved input-drv outputs in request order.
         assert_eq!(roots, vec![src.clone(), dep_lib.clone(), dep_out.clone()]);
 
         // An unknown output NAME is a hard error, never a silent drop.
-        parent.input_drvs =
-            vec![(dep_path.to_string_lossy().into_owned(), vec!["nope".to_string()])];
+        parent.input_drvs = vec![(
+            dep_path.to_string_lossy().into_owned(),
+            vec!["nope".to_string()],
+        )];
         let err = drv_declared_inputs(&parent).unwrap_err();
         assert!(err.contains("has no output `nope'"), "{err}");
         std::fs::remove_dir_all(&tmp).ok();
@@ -14156,7 +15013,9 @@ daemon build START (2/2 active)
             .split_once("mod tests {")
             .map(|(before, _)| before)
             .unwrap_or(src);
-        let dbs = body.matches("write_output_db(&regs, &scratch.join(\"td.db\"))").count();
+        let dbs = body
+            .matches("write_output_db(&regs, &scratch.join(\"td.db\"))")
+            .count();
         let sidecars = body
             .matches("write_step_receipt_sidecar(scratch, &expect, &regs)")
             .count();
@@ -14243,14 +15102,20 @@ daemon build START (2/2 active)
     fn a_host_tool_is_never_a_drv_builder() {
         let bash_tree = format!("/gnu/store/{}-bash-5.2.37", "c".repeat(32));
         let builder = format!("{bash_tree}/bin/bash");
-        let si = |origin| sandbox::StagedInput { nar_hash: "sha256:00".to_string(), origin };
+        let si = |origin| sandbox::StagedInput {
+            nar_hash: "sha256:00".to_string(),
+            origin,
+        };
         let mut manifest = sandbox::StageManifest::new();
         manifest.insert(bash_tree.clone(), si(sandbox::InputOrigin::AuditedSeed));
         let roots = vec![bash_tree.clone()];
         let closure = vec![bash_tree.clone()];
-        let err = enforce_realize_input_policy(&builder, &roots, &closure, &manifest, None)
-            .unwrap_err();
-        assert!(err.contains("not admissible executable provenance"), "{err}");
+        let err =
+            enforce_realize_input_policy(&builder, &roots, &closure, &manifest, None).unwrap_err();
+        assert!(
+            err.contains("not admissible executable provenance"),
+            "{err}"
+        );
         // A td recipe output IS an admissible builder.
         let tool_tree = format!("/gnu/store/{}-td-tool-1.0", "d".repeat(32));
         let tool = format!("{tool_tree}/bin/td-tool");
@@ -14285,16 +15150,22 @@ daemon build START (2/2 active)
     fn an_unvouched_closure_item_is_rejected() {
         let tree = format!("/gnu/store/{}-td-tool-1.0", "a".repeat(32));
         let builder = format!("{tree}/bin/td-tool");
-        let si = |origin| sandbox::StagedInput { nar_hash: "sha256:00".to_string(), origin };
+        let si = |origin| sandbox::StagedInput {
+            nar_hash: "sha256:00".to_string(),
+            origin,
+        };
         let mut manifest = sandbox::StageManifest::new();
         manifest.insert(tree.clone(), si(sandbox::InputOrigin::RecipeOutput));
         let roots = vec![tree.clone()];
         // The builder itself is admissible, but the closure names an item with no record.
         let stray = format!("/gnu/store/{}-stray-1.0", "b".repeat(32));
         let closure = vec![tree.clone(), stray.clone()];
-        let err = enforce_realize_input_policy(&builder, &roots, &closure, &manifest, None)
-            .unwrap_err();
-        assert!(err.contains(&stray) && err.contains("no td-owned store-db record"), "{err}");
+        let err =
+            enforce_realize_input_policy(&builder, &roots, &closure, &manifest, None).unwrap_err();
+        assert!(
+            err.contains(&stray) && err.contains("no td-owned store-db record"),
+            "{err}"
+        );
         // Vouch it and the same closure passes.
         manifest.insert(stray, si(sandbox::InputOrigin::RecipeOutput));
         enforce_realize_input_policy(&builder, &roots, &closure, &manifest, None).unwrap();
@@ -14363,7 +15234,10 @@ daemon build START (2/2 active)
         let bad_db = d.join("seed-bad.db");
         write_output_db(std::slice::from_ref(&reg(&upath, &uhash)), &bad_db).unwrap();
         let err = authenticate_seed_db(&bad_db.to_string_lossy(), &items2).unwrap_err();
-        assert!(err.contains("not a basename the compiled seed-digest table pins"), "{err}");
+        assert!(
+            err.contains("not a basename the compiled seed-digest table pins"),
+            "{err}"
+        );
         // Absent db: authenticates vacuously — no rows means no authority.
         authenticate_seed_db(&d.join("absent.db").to_string_lossy(), &items).unwrap();
         std::fs::remove_dir_all(&d).ok();
@@ -14387,7 +15261,9 @@ daemon build START (2/2 active)
             let Some(stem) = key.strip_prefix("patch-") else {
                 continue;
             };
-            let file = seed_repo_root().join("seed/patches").join(format!("{stem}.patch"));
+            let file = seed_repo_root()
+                .join("seed/patches")
+                .join(format!("{stem}.patch"));
             if !file.is_file() {
                 continue; // a `patch-`-prefixed SOURCE pin (tarball), not a repo patch
             }
@@ -14402,7 +15278,10 @@ daemon build START (2/2 active)
             );
             verified += 1;
         }
-        assert!(verified > 0, "no in-repo patch rows verified — table missing patches?");
+        assert!(
+            verified > 0,
+            "no in-repo patch rows verified — table missing patches?"
+        );
     }
 
     // store_path_recursive computes the address store_add_recursive would intern at,
@@ -14421,7 +15300,10 @@ daemon build START (2/2 active)
         let computed = store_path_recursive("thing", &src_s).unwrap();
         let store = d.join("store");
         let db = d.join("db");
-        assert!(!store.exists() && !db.exists(), "computing an address must write nothing");
+        assert!(
+            !store.exists() && !db.exists(),
+            "computing an address must write nothing"
+        );
 
         let interned = store_add_recursive(
             "thing",
@@ -14470,7 +15352,11 @@ daemon build START (2/2 active)
             |_p, _base| false,
         )
         .unwrap();
-        assert_eq!((dropped, deleted, kept), (3, 0, 0), "rows drop, nothing is deleted");
+        assert_eq!(
+            (dropped, deleted, kept),
+            (3, 0, 0),
+            "rows drop, nothing is deleted"
+        );
         assert!(items.is_dir(), "the store dir survives");
         assert!(bystander.is_dir(), "so does its sibling");
         assert!(d.is_dir(), "and above all the store's PARENT");
@@ -14495,7 +15381,11 @@ daemon build START (2/2 active)
             std::fs::create_dir_all(tree.join("bin")).unwrap();
             std::fs::write(tree.join("bin/prog"), base).unwrap();
             let drv_base = r.deriver.rsplit('/').next().unwrap();
-            std::fs::write(receipts.join(format!("{drv_base}.receipt")), "td-receipt v1\n").unwrap();
+            std::fs::write(
+                receipts.join(format!("{drv_base}.receipt")),
+                "td-receipt v1\n",
+            )
+            .unwrap();
         }
         (d, store, db)
     }
@@ -14564,7 +15454,9 @@ daemon build START (2/2 active)
         ];
         let (d, store, db) = gc_fixture("closure", &regs);
         let receipts = d.join("db.receipts");
-        let receipt_of = |r: &OutputReg| receipts.join(format!("{}.receipt", r.deriver.rsplit('/').next().unwrap()));
+        let receipt_of = |r: &OutputReg| {
+            receipts.join(format!("{}.receipt", r.deriver.rsplit('/').next().unwrap()))
+        };
         // Everything was built long ago; only `app` has been hit since.
         for r in &regs {
             set_times(&receipt_of(r), long_ago, long_ago);
@@ -14576,7 +15468,11 @@ daemon build START (2/2 active)
         // is a miss, so it still goes), a dotfile that is not a receipt of ours, a
         // directory wearing a receipt's name, an orphan tree, a tree no row names but a
         // fresh memo does, and a live committer's temp.
-        std::fs::write(receipts.join("gggggggggggggggggggggggggggggggg-gone-1.0.drv.receipt"), "x").unwrap();
+        std::fs::write(
+            receipts.join("gggggggggggggggggggggggggggggggg-gone-1.0.drv.receipt"),
+            "x",
+        )
+        .unwrap();
         let dotfile = receipts.join(".hidden.receipt");
         std::fs::write(&dotfile, "x").unwrap();
         set_times(&dotfile, long_ago, long_ago);
@@ -14597,7 +15493,10 @@ daemon build START (2/2 active)
         ]
         .into_iter()
         .collect();
-        let (store_s, db_s) = (store.to_string_lossy().to_string(), db.to_string_lossy().to_string());
+        let (store_s, db_s) = (
+            store.to_string_lossy().to_string(),
+            db.to_string_lossy().to_string(),
+        );
 
         // Dry run: the report, and not one byte moved.
         let dry = store_gc_unused(&store_s, &db_s, cutoff, &extra, true).unwrap();
@@ -14619,37 +15518,77 @@ daemon build START (2/2 active)
                 dry_run: true,
             }
         );
-        assert!(store.join(old.store_path.rsplit('/').next().unwrap()).is_dir());
+        assert!(store
+            .join(old.store_path.rsplit('/').next().unwrap())
+            .is_dir());
         assert!(orphan.is_dir());
         assert_eq!(std::fs::read_dir(&receipts).unwrap().count(), 9);
 
         let got = store_gc_unused(&store_s, &db_s, cutoff, &extra, false).unwrap();
-        assert_eq!(got.deleted_trees, 3, "the two dead rows' trees and the orphan");
-        assert_eq!((got.live_rows, got.dead_rows, got.stale_receipts), (5, 2, 3));
-        assert!(dotfile.is_file(), "a dotfile is not a receipt, and not ours to remove");
-        assert!(dir_receipt.is_dir(), "nor is a directory, whatever its name");
+        assert_eq!(
+            got.deleted_trees, 3,
+            "the two dead rows' trees and the orphan"
+        );
+        assert_eq!(
+            (got.live_rows, got.dead_rows, got.stale_receipts),
+            (5, 2, 3)
+        );
+        assert!(
+            dotfile.is_file(),
+            "a dotfile is not a receipt, and not ours to remove"
+        );
+        assert!(
+            dir_receipt.is_dir(),
+            "nor is a directory, whatever its name"
+        );
         let base = |r: &OutputReg| r.store_path.rsplit('/').next().unwrap().to_string();
         for kept in [&app, &lib, &memo, &read, &pair_bin] {
-            assert!(store.join(base(kept)).join("bin/prog").is_file(), "{} survives", base(kept));
+            assert!(
+                store.join(base(kept)).join("bin/prog").is_file(),
+                "{} survives",
+                base(kept)
+            );
         }
         for kept in [&app, &lib, &memo, &read] {
-            assert!(receipt_of(kept).is_file(), "{}'s receipt survives", base(kept));
+            assert!(
+                receipt_of(kept).is_file(),
+                "{}'s receipt survives",
+                base(kept)
+            );
         }
         assert!(!store.join(base(&old)).exists(), "the unused tree is gone");
         assert!(!receipt_of(&old).exists(), "and its receipt");
-        assert!(!store.join(base(&pair_dev)).exists(), "the unreferenced second output is gone");
-        assert!(!receipt_of(&pair_bin).exists(), "and a receipt that named it can never hit again");
+        assert!(
+            !store.join(base(&pair_dev)).exists(),
+            "the unreferenced second output is gone"
+        );
+        assert!(
+            !receipt_of(&pair_bin).exists(),
+            "and a receipt that named it can never hit again"
+        );
         assert!(!orphan.exists(), "the orphan tree is gone");
-        assert!(memo_only.is_dir(), "a tree a fresh memo names is kept, row or no row");
-        assert!(!receipts.join("gggggggggggggggggggggggggggggggg-gone-1.0.drv.receipt").exists());
-        assert!(temp.is_dir(), "a live pid's staging temp is not ours to reap");
+        assert!(
+            memo_only.is_dir(),
+            "a tree a fresh memo names is kept, row or no row"
+        );
+        assert!(!receipts
+            .join("gggggggggggggggggggggggggggggggg-gone-1.0.drv.receipt")
+            .exists());
+        assert!(
+            temp.is_dir(),
+            "a live pid's staging temp is not ours to reap"
+        );
         let dotfiles: Vec<_> = std::fs::read_dir(&store)
             .unwrap()
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
             .map(|e| e.path())
             .collect();
-        assert_eq!(dotfiles, vec![temp.clone()], "every tree went aside and then away");
+        assert_eq!(
+            dotfiles,
+            vec![temp.clone()],
+            "every tree went aside and then away"
+        );
         let after = store_db_read::Db::open(std::fs::read(&db).unwrap()).unwrap();
         let mut paths: Vec<String> = after.hashes_by_path().unwrap().into_keys().collect();
         paths.sort();
@@ -14665,13 +15604,24 @@ daemon build START (2/2 active)
         );
         assert_eq!(
             after.closure(&app.store_path).unwrap(),
-            vec![app.store_path.clone(), lib.store_path.clone(), pair_bin.store_path.clone(), seed.to_string()],
+            vec![
+                app.store_path.clone(),
+                lib.store_path.clone(),
+                pair_bin.store_path.clone(),
+                seed.to_string()
+            ],
             "Refs survive renumbering, the live scaffold and its edge with them"
         );
         let rows_after = after.table("ValidPaths").unwrap();
-        assert_eq!(rows_after.len(), 6, "five content rows and the one live scaffold");
+        assert_eq!(
+            rows_after.len(),
+            6,
+            "five content rows and the one live scaffold"
+        );
         assert!(
-            !rows_after.iter().any(|(_, cols)| path_at(cols) == dead_seed),
+            !rows_after
+                .iter()
+                .any(|(_, cols)| path_at(cols) == dead_seed),
             "the dead row's scaffold went with it"
         );
 
@@ -14679,7 +15629,15 @@ daemon build START (2/2 active)
         use std::os::unix::fs::MetadataExt;
         let ino = std::fs::metadata(&db).unwrap().ino();
         let again = store_gc_unused(&store_s, &db_s, cutoff, &extra, false).unwrap();
-        assert_eq!((again.dead_rows, again.stale_receipts, again.orphan_trees, again.deleted_trees), (0, 0, 0, 0));
+        assert_eq!(
+            (
+                again.dead_rows,
+                again.stale_receipts,
+                again.orphan_trees,
+                again.deleted_trees
+            ),
+            (0, 0, 0, 0)
+        );
         assert_eq!(std::fs::metadata(&db).unwrap().ino(), ino);
         std::fs::remove_dir_all(&d).ok();
         std::fs::remove_file(d.with_extension("commit.lock")).ok();
@@ -14695,7 +15653,10 @@ daemon build START (2/2 active)
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let store = d.join("store");
-        let (store_s, db_s) = (store.to_string_lossy().to_string(), d.join("db").to_string_lossy().to_string());
+        let (store_s, db_s) = (
+            store.to_string_lossy().to_string(),
+            d.join("db").to_string_lossy().to_string(),
+        );
         let now = std::time::SystemTime::now();
         let got = store_gc_unused(&store_s, &db_s, now, &Default::default(), false).unwrap();
         assert_eq!(got, StoreGcReport::default());
@@ -14704,9 +15665,19 @@ daemon build START (2/2 active)
         std::fs::create_dir_all(torn.join("bin")).unwrap();
         std::fs::create_dir_all(named.join("bin")).unwrap();
         let extra: std::collections::HashSet<String> =
-            ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-named-1.0".to_string()].into_iter().collect();
+            ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-named-1.0".to_string()]
+                .into_iter()
+                .collect();
         let got = store_gc_unused(&store_s, &db_s, now, &extra, false).unwrap();
-        assert_eq!((got.rows, got.orphan_trees, got.deleted_trees, got.extra_roots_found), (0, 1, 1, 0));
+        assert_eq!(
+            (
+                got.rows,
+                got.orphan_trees,
+                got.deleted_trees,
+                got.extra_roots_found
+            ),
+            (0, 1, 1, 0)
+        );
         assert!(!torn.exists() && named.is_dir());
         assert!(!d.join("db").exists(), "no db was conjured");
         std::fs::remove_dir_all(&d).ok();
@@ -14717,7 +15688,10 @@ daemon build START (2/2 active)
     fn gc_cutoff_refuses_zero_days_and_counts_whole_days() {
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
         assert!(gc_cutoff(now, 0).unwrap_err().contains("clear-store"));
-        assert_eq!(gc_cutoff(now, 1).unwrap(), now - std::time::Duration::from_secs(86_400));
+        assert_eq!(
+            gc_cutoff(now, 1).unwrap(),
+            now - std::time::Duration::from_secs(86_400)
+        );
         assert!(gc_cutoff(now, u64::MAX).is_err(), "overflow");
     }
 
@@ -14730,7 +15704,12 @@ daemon build START (2/2 active)
         assert!(got.contains("aaa-x-1.0") && got.contains("bbb-y-2.0"));
         assert!(parse_extra_roots("").unwrap().is_empty());
         for bad in ["../x", "a/b", ".", ".."] {
-            assert!(parse_extra_roots(bad).unwrap_err().contains("not a store basename"), "{bad}");
+            assert!(
+                parse_extra_roots(bad)
+                    .unwrap_err()
+                    .contains("not a store basename"),
+                "{bad}"
+            );
         }
     }
 
@@ -14763,7 +15742,11 @@ daemon build START (2/2 active)
             r#"{"name":"gcc-mesboot0","sourceInput":"patch-gcc-boot-2.95.3","nativeInputs":["binutils-mesboot0"],"inputs":["patch-glibc-boot-2.16.0","patch-glibc-boot-2.2.5"]}"#,
         )
         .unwrap();
-        std::fs::write(d.join("binutils-mesboot0.json"), r#"{"name":"binutils-mesboot0"}"#).unwrap();
+        std::fs::write(
+            d.join("binutils-mesboot0.json"),
+            r#"{"name":"binutils-mesboot0"}"#,
+        )
+        .unwrap();
         let mut map = std::collections::BTreeMap::new();
         let src = intern_real_patch_seed(&seeds, "patch-gcc-boot-2.95.3");
         let in_a = intern_real_patch_seed(&seeds, "patch-glibc-boot-2.16.0");
@@ -14781,7 +15764,9 @@ daemon build START (2/2 active)
         )
         .unwrap();
         assert!(got.contains(&format!("gcc-mesboot0-source {src} source")));
-        assert!(got.contains("binutils-mesboot0 /td/store/pending-binutils-mesboot0 td-recipe-output"));
+        assert!(
+            got.contains("binutils-mesboot0 /td/store/pending-binutils-mesboot0 td-recipe-output")
+        );
         assert!(got.contains(&format!("patch-glibc-boot-2.16.0 {in_a} seed")));
         assert!(got.contains(&format!("patch-glibc-boot-2.2.5 {in_b} seed")));
         std::fs::remove_dir_all(&d).ok();
@@ -14796,7 +15781,8 @@ daemon build START (2/2 active)
     // a valid rung with "no compiled expected digest" for `{name}-source`.
     #[test]
     fn seed_gate_key_resolves_a_recipe_source_to_its_pin_key() {
-        let renamed = json::parse(r#"{"name":"mesboot-headers","sourceInput":"linux-headers"}"#).unwrap();
+        let renamed =
+            json::parse(r#"{"name":"mesboot-headers","sourceInput":"linux-headers"}"#).unwrap();
         // The rung's own source entry gates by the sourceInput pin key, not its name.
         assert_eq!(
             seed_gate_key("mesboot-headers-source", "mesboot-headers-source", &renamed),
@@ -14804,15 +15790,25 @@ daemon build START (2/2 active)
         );
         // A sibling seed entry gates by its OWN name even though a sourceInput exists.
         assert_eq!(
-            seed_gate_key("patch-glibc-boot-2.16.0", "mesboot-headers-source", &renamed),
+            seed_gate_key(
+                "patch-glibc-boot-2.16.0",
+                "mesboot-headers-source",
+                &renamed
+            ),
             "patch-glibc-boot-2.16.0"
         );
         // A conventional rung (sourceInput == `{name}-source`) is unchanged.
         let conventional = json::parse(r#"{"name":"mes","sourceInput":"mes-source"}"#).unwrap();
-        assert_eq!(seed_gate_key("mes-source", "mes-source", &conventional), "mes-source");
+        assert_eq!(
+            seed_gate_key("mes-source", "mes-source", &conventional),
+            "mes-source"
+        );
         // A recipe with no sourceInput falls back to the entry name.
         let none = json::parse(r#"{"name":"make-test"}"#).unwrap();
-        assert_eq!(seed_gate_key("make-test-source", "make-test-source", &none), "make-test-source");
+        assert_eq!(
+            seed_gate_key("make-test-source", "make-test-source", &none),
+            "make-test-source"
+        );
     }
 
     // The registered-host-item behavioral reds (re #469): `store-add-recursive` is a
@@ -14926,11 +15922,17 @@ daemon build START (2/2 active)
             }
             let mut it = line.split_whitespace();
             let key = it.next().unwrap_or_else(|| {
-                panic!("seed/seed-digests.txt line {}: malformed row `{line}'", n + 1)
+                panic!(
+                    "seed/seed-digests.txt line {}: malformed row `{line}'",
+                    n + 1
+                )
             });
             digest_keys.push(key);
         }
-        assert!(!digest_keys.is_empty(), "the compiled digest table must not be empty");
+        assert!(
+            !digest_keys.is_empty(),
+            "the compiled digest table must not be empty"
+        );
         for key in &digest_keys {
             assert!(
                 local_source_roster_expected(key).unwrap().is_none(),
@@ -14944,18 +15946,26 @@ daemon build START (2/2 active)
         // Every roster row's key: no key may also be a digest-table key, and
         // classify_seed_key must resolve it as LocalSource.
         let roster_rows = local_source_roster_rows().unwrap();
-        assert!(!roster_rows.is_empty(), "the compiled roster must not be empty");
+        assert!(
+            !roster_rows.is_empty(),
+            "the compiled roster must not be empty"
+        );
         for (key, _, _) in roster_rows {
             assert!(
                 seed_digests_expected(key).unwrap().is_none(),
                 "roster key `{key}' must not also be a digest-table key"
             );
             assert!(
-                matches!(classify_seed_key(key).unwrap(), Some(SeedOrigin::LocalSource)),
+                matches!(
+                    classify_seed_key(key).unwrap(),
+                    Some(SeedOrigin::LocalSource)
+                ),
                 "roster key `{key}' must classify as LocalSource"
             );
         }
-        assert!(classify_seed_key("no-such-seed-key-at-all").unwrap().is_none());
+        assert!(classify_seed_key("no-such-seed-key-at-all")
+            .unwrap()
+            .is_none());
     }
 
     // Every loud-red path in `verify_local_source_roster_basename` before it
@@ -14969,37 +15979,37 @@ daemon build START (2/2 active)
     #[test]
     fn verify_local_source_roster_basename_reds_loudly_naming_the_key_before_touching_the_checkout()
     {
-        let scratch = std::env::temp_dir()
-            .join(format!("td-verify-lsr-loud-reds-{}", std::process::id()));
+        let scratch =
+            std::env::temp_dir().join(format!("td-verify-lsr-loud-reds-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
 
         with_repo_root_env_raw(None, || {
-            let err =
-                verify_local_source_roster_basename("td-mail-source", "irrelevant", &scratch)
-                    .unwrap_err();
+            let err = verify_local_source_roster_basename("td-mail-source", "irrelevant", &scratch)
+                .unwrap_err();
             assert!(err.contains("td-mail-source"), "{err}");
             assert!(err.contains("unset"), "{err}");
         });
 
         with_repo_root_env_raw(Some(""), || {
-            let err =
-                verify_local_source_roster_basename("td-mail-source", "irrelevant", &scratch)
-                    .unwrap_err();
+            let err = verify_local_source_roster_basename("td-mail-source", "irrelevant", &scratch)
+                .unwrap_err();
             assert!(err.contains("td-mail-source"), "{err}");
             assert!(err.contains("unset"), "{err}");
         });
 
         with_repo_root_env_raw(Some("/this/path/should/not/exist/re-469-loud-red"), || {
-            let err =
-                verify_local_source_roster_basename("td-mail-source", "irrelevant", &scratch)
-                    .unwrap_err();
+            let err = verify_local_source_roster_basename("td-mail-source", "irrelevant", &scratch)
+                .unwrap_err();
             assert!(err.contains("td-mail-source"), "{err}");
             assert!(err.contains("is not a directory"), "{err}");
         });
 
         // None of the three reds should have touched the scratch dir at all —
         // they all return before ever calling `claim_local_source_scratch_dir`.
-        assert!(!scratch.exists(), "a loud red before staging must not create scratch");
+        assert!(
+            !scratch.exists(),
+            "a loud red before staging must not create scratch"
+        );
     }
 
     // `verify_local_source_roster_basename` is what both `auto_seed_provenance`
@@ -15035,7 +16045,9 @@ daemon build START (2/2 active)
             verify_local_source_roster_basename("td-mail-source", expected_base, &scratch)
                 .expect("the real checkout must re-derive to its own current basename");
             assert_eq!(
-                std::fs::read_dir(&scratch).map(Iterator::count).unwrap_or(0),
+                std::fs::read_dir(&scratch)
+                    .map(Iterator::count)
+                    .unwrap_or(0),
                 0,
                 "a successful re-derivation must leave its claimed scratch dir empty behind it"
             );
@@ -15090,7 +16102,10 @@ daemon build START (2/2 active)
         };
         let err = run(&fake_root).unwrap_err();
         assert!(err.contains("td-mail-source"), "{err}");
-        assert!(err.contains("no readable seed/local-source-roster.txt"), "{err}");
+        assert!(
+            err.contains("no readable seed/local-source-roster.txt"),
+            "{err}"
+        );
 
         std::fs::create_dir_all(fake_root.join("seed")).unwrap();
         std::fs::write(
@@ -15101,8 +16116,11 @@ daemon build START (2/2 active)
         let err = run(&fake_root).unwrap_err();
         assert!(err.contains("differs from the one compiled"), "{err}");
 
-        std::fs::write(fake_root.join("seed/local-source-roster.txt"), LOCAL_SOURCE_ROSTER)
-            .unwrap();
+        std::fs::write(
+            fake_root.join("seed/local-source-roster.txt"),
+            LOCAL_SOURCE_ROSTER,
+        )
+        .unwrap();
         run(&fake_root).expect("an anchored root re-derives the staged basename");
 
         std::fs::remove_dir_all(&d).ok();
@@ -15123,7 +16141,8 @@ daemon build START (2/2 active)
             std::fs::create_dir_all(&seeds).unwrap();
             let scratch = d.join("stage");
             let staged = stage_roster_key(root, "td-mail-source", &scratch);
-            let expected = store_path_recursive("td-mail-source", staged.to_str().unwrap()).unwrap();
+            let expected =
+                store_path_recursive("td-mail-source", staged.to_str().unwrap()).unwrap();
             let base = expected.rsplit('/').next().unwrap();
             std::fs::create_dir_all(seeds.join(base)).unwrap();
 
@@ -15173,8 +16192,10 @@ daemon build START (2/2 active)
     #[test]
     fn authenticate_seed_db_refuses_a_local_source_roster_row() {
         with_repo_root_env(|root| {
-            let d = std::env::temp_dir()
-                .join(format!("td-auth-keyed-refuses-local-{}", std::process::id()));
+            let d = std::env::temp_dir().join(format!(
+                "td-auth-keyed-refuses-local-{}",
+                std::process::id()
+            ));
             let _ = std::fs::remove_dir_all(&d);
             let items = d.join("items");
             std::fs::create_dir_all(&items).unwrap();
@@ -15210,7 +16231,10 @@ daemon build START (2/2 active)
         let absent = d.join("absent.db").to_string_lossy().into_owned();
         assert_eq!(present_local_seed_db(Some(&absent)).unwrap(), None);
         let file = d.join("a-file.db").to_string_lossy().into_owned();
-        assert_eq!(present_local_seed_db(Some(&file)).unwrap(), Some(file.as_str()));
+        assert_eq!(
+            present_local_seed_db(Some(&file)).unwrap(),
+            Some(file.as_str())
+        );
         let dir = d.join("a-directory").to_string_lossy().into_owned();
         let err = present_local_seed_db(Some(&dir)).unwrap_err();
         assert!(err.contains("not a regular file"), "{err}");
@@ -15230,8 +16254,8 @@ daemon build START (2/2 active)
     fn authenticate_local_seed_db_accepts_the_current_derivation_and_rejects_a_different_trees_one()
     {
         with_repo_root_env(|root| {
-            let d = std::env::temp_dir()
-                .join(format!("td-auth-local-seed-db-{}", std::process::id()));
+            let d =
+                std::env::temp_dir().join(format!("td-auth-local-seed-db-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&d);
             let items = d.join("items");
             std::fs::create_dir_all(&items).unwrap();
@@ -15246,7 +16270,9 @@ daemon build START (2/2 active)
             )
             .unwrap();
             authenticate_local_seed_db(&db.to_string_lossy(), &items, &d.join("run-scratch"))
-                .expect("a real local-source item must authenticate against the local-source seed db");
+                .expect(
+                    "a real local-source item must authenticate against the local-source seed db",
+                );
 
             let other_staged = stage_roster_key(root, "td-news-source", &d.join("stage-news"));
             let bad_db = d.join("local-seed-bad.db");
@@ -15257,9 +16283,12 @@ daemon build START (2/2 active)
                 &bad_db.to_string_lossy(),
             )
             .unwrap();
-            let err =
-                authenticate_local_seed_db(&bad_db.to_string_lossy(), &items, &d.join("run-scratch-2"))
-                    .unwrap_err();
+            let err = authenticate_local_seed_db(
+                &bad_db.to_string_lossy(),
+                &items,
+                &d.join("run-scratch-2"),
+            )
+            .unwrap_err();
             assert!(err.contains("td-mail-source"), "{err}");
             assert!(err.contains("re-derives"), "{err}");
 
@@ -15277,13 +16306,22 @@ daemon build START (2/2 active)
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
         std::fs::write(d.join("mes.json"), r#"{"name":"mes","inputs":["bash"]}"#).unwrap();
-        for bad in ["/usr/bin/env", "/gnu/store/aaa-bash", "bash", "/td/store/a/b"] {
+        for bad in [
+            "/usr/bin/env",
+            "/gnu/store/aaa-bash",
+            "bash",
+            "/td/store/a/b",
+        ] {
             let mut map = std::collections::BTreeMap::new();
             map.insert("bash".to_string(), bad.to_string());
-            let err = auto_synthesize_lock(&d.to_string_lossy(), &map, "mes", "/td/store", &seeds, &d)
-                .unwrap_err();
+            let err =
+                auto_synthesize_lock(&d.to_string_lossy(), &map, "mes", "/td/store", &seeds, &d)
+                    .unwrap_err();
             assert!(err.contains("provenance rejected"), "`{bad}': {err}");
-            assert!(err.contains("not a canonical /td/store item"), "`{bad}': {err}");
+            assert!(
+                err.contains("not a canonical /td/store item"),
+                "`{bad}': {err}"
+            );
         }
         std::fs::remove_dir_all(&d).ok();
     }
@@ -15302,8 +16340,14 @@ daemon build START (2/2 active)
         for (lock_body, want) in [
             ("bash /usr/bin/env seed\n", "provenance rejected"),
             ("bash /gnu/store/aaa-bash seed\n", "provenance rejected"),
-            ("mes-source /gnu/store/bbb-mes.tar.gz source\n", "provenance rejected"),
-            ("itoa-1.0.11.crate /td/store/ccc-itoa.crate crate\n", "vendored crate"),
+            (
+                "mes-source /gnu/store/bbb-mes.tar.gz source\n",
+                "provenance rejected",
+            ),
+            (
+                "itoa-1.0.11.crate /td/store/ccc-itoa.crate crate\n",
+                "vendored crate",
+            ),
             // The unavailable-prior-output red (re #469): a td-recipe-output
             // entry whose producing step never ran is a loud planning error,
             // never a silent fall-through to some other resolution.
@@ -15384,7 +16428,10 @@ daemon build START (2/2 active)
         let p1 = store_add_recursive("seed-one", &one, &store_s, &db_s).unwrap();
         let p2 = store_add_recursive("seed-two", &two, &store_s, &db_s).unwrap();
         // Re-interning is idempotent — same path, no duplicate row.
-        assert_eq!(p1, store_add_recursive("seed-one", &one, &store_s, &db_s).unwrap());
+        assert_eq!(
+            p1,
+            store_add_recursive("seed-one", &one, &store_s, &db_s).unwrap()
+        );
         let hashes = store_db_read::Db::open(std::fs::read(&db).unwrap())
             .unwrap()
             .hashes_by_path()
@@ -15392,7 +16439,9 @@ daemon build START (2/2 active)
         assert_eq!(hashes.len(), 2, "both seeds stay vouched: {hashes:?}");
         for p in [&p1, &p2] {
             assert!(
-                hashes.get(p.as_str()).is_some_and(|h| h.starts_with("sha256:")),
+                hashes
+                    .get(p.as_str())
+                    .is_some_and(|h| h.starts_with("sha256:")),
                 "{p} missing from the merged seed db: {hashes:?}"
             );
         }
@@ -15437,10 +16486,16 @@ daemon build START (2/2 active)
             .unwrap()
             .hashes_by_path()
             .unwrap();
-        assert_eq!(hashes.len(), N, "every concurrent intern stays vouched: {hashes:?}");
+        assert_eq!(
+            hashes.len(),
+            N,
+            "every concurrent intern stays vouched: {hashes:?}"
+        );
         for p in &paths {
             assert!(
-                hashes.get(p.as_str()).is_some_and(|h| h.starts_with("sha256:")),
+                hashes
+                    .get(p.as_str())
+                    .is_some_and(|h| h.starts_with("sha256:")),
                 "{p} lost from the merged seed db: {hashes:?}"
             );
         }
@@ -15510,7 +16565,11 @@ daemon build START (2/2 active)
         let _ = std::fs::remove_dir_all(&d);
         let tree = d.join("tree");
         std::fs::create_dir_all(tree.join("bin")).unwrap();
-        std::fs::write(tree.join("bin").join("tool"), "no store refs in this tree\n").unwrap();
+        std::fs::write(
+            tree.join("bin").join("tool"),
+            "no store refs in this tree\n",
+        )
+        .unwrap();
         let tree_s = tree.to_string_lossy().to_string();
         let store = d.join("store");
         let store_s = store.to_string_lossy().to_string();
@@ -15521,7 +16580,10 @@ daemon build START (2/2 active)
         let p1 = store_add_builder("probe-0.1.0", &tree_s, &store_s, &db1, &absent_s).unwrap();
         let p2 = store_add_builder("probe-0.1.0", &tree_s, &store_s, &db2, &absent_s)
             .expect("re-placing an already-present builder must succeed, not EEXIST");
-        assert_eq!(p1, p2, "the content-addressed path must not move on re-intern");
+        assert_eq!(
+            p1, p2,
+            "the content-addressed path must not move on re-intern"
+        );
         // The re-intern still registers: a warm run's OUT-DB is as usable as a cold one's.
         let hashes = store_db_read::Db::open(std::fs::read(&db2).unwrap())
             .unwrap()
@@ -15541,7 +16603,10 @@ daemon build START (2/2 active)
         std::fs::write(&victim, "corrupted\n").unwrap();
         let err = store_add_builder("probe-0.1.0", &tree_s, &store_s, &db2, &absent_s)
             .expect_err("a store item that no longer hashes to its name must not be reused");
-        assert!(err.contains("corrupt content-addressed item"), "unexpected error: {err}");
+        assert!(
+            err.contains("corrupt content-addressed item"),
+            "unexpected error: {err}"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -15589,9 +16654,14 @@ daemon build START (2/2 active)
             r#"{"name":"mes","inputs":["patch-glibc-boot-2.16.0"]}"#,
         )
         .unwrap();
-        let pinned = seed_digests_expected("patch-glibc-boot-2.16.0").unwrap().unwrap();
+        let pinned = seed_digests_expected("patch-glibc-boot-2.16.0")
+            .unwrap()
+            .unwrap();
         let mut map = std::collections::BTreeMap::new();
-        map.insert("patch-glibc-boot-2.16.0".to_string(), format!("/td/store/{pinned}"));
+        map.insert(
+            "patch-glibc-boot-2.16.0".to_string(),
+            format!("/td/store/{pinned}"),
+        );
         let err = auto_synthesize_lock(&d.to_string_lossy(), &map, "mes", "/td/store", &seeds, &d)
             .unwrap_err();
         assert!(err.contains("provenance rejected"), "{err}");
@@ -15605,11 +16675,16 @@ daemon build START (2/2 active)
     fn auto_synthesize_lock_omits_the_source_line_when_none_declared() {
         let d = std::env::temp_dir().join(format!("td-auto-synth-nosrc-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("make-test.json"), r#"{"name":"make-test","nativeInputs":["make-x86-64"]}"#).unwrap();
+        std::fs::write(
+            d.join("make-test.json"),
+            r#"{"name":"make-test","nativeInputs":["make-x86-64"]}"#,
+        )
+        .unwrap();
         std::fs::write(d.join("make-x86-64.json"), r#"{"name":"make-x86-64"}"#).unwrap();
         let map = std::collections::BTreeMap::new();
         let got =
-            auto_synthesize_lock(&d.to_string_lossy(), &map, "make-test", "/td/store", &d, &d).unwrap();
+            auto_synthesize_lock(&d.to_string_lossy(), &map, "make-test", "/td/store", &d, &d)
+                .unwrap();
         assert!(!got.contains("-source"), "unexpected source line: {got}");
         assert!(got.contains("make-x86-64 /td/store/pending-make-x86-64 td-recipe-output"));
         std::fs::remove_dir_all(&d).ok();
@@ -15621,10 +16696,14 @@ daemon build START (2/2 active)
     fn auto_synthesize_lock_errors_on_an_unresolvable_input() {
         let d = std::env::temp_dir().join(format!("td-auto-synth-err-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("tcc.json"), r#"{"name":"tcc","inputs":["mystery-tool"]}"#).unwrap();
+        std::fs::write(
+            d.join("tcc.json"),
+            r#"{"name":"tcc","inputs":["mystery-tool"]}"#,
+        )
+        .unwrap();
         let map = std::collections::BTreeMap::new();
-        let err =
-            auto_synthesize_lock(&d.to_string_lossy(), &map, "tcc", "/td/store", &d, &d).unwrap_err();
+        let err = auto_synthesize_lock(&d.to_string_lossy(), &map, "tcc", "/td/store", &d, &d)
+            .unwrap_err();
         assert!(err.contains("mystery-tool"), "unexpected error: {err}");
         std::fs::remove_dir_all(&d).ok();
     }
@@ -15647,9 +16726,15 @@ daemon build START (2/2 active)
             r#"{"name":"gcc-mesboot0","inputs":["patch-glibc-boot-2.16.0"]}"#,
         )
         .unwrap();
-        let before =
-            auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0", "/td/store", &seeds, &d)
-                .unwrap();
+        let before = auto_synthesize_lock(
+            &d.to_string_lossy(),
+            &map,
+            "gcc-mesboot0",
+            "/td/store",
+            &seeds,
+            &d,
+        )
+        .unwrap();
         assert!(before.contains("patch-glibc-boot-2.16.0"));
         assert!(!before.contains("patch-glibc-boot-2.2.5"));
         std::fs::write(
@@ -15657,11 +16742,20 @@ daemon build START (2/2 active)
             r#"{"name":"gcc-mesboot0","inputs":["patch-glibc-boot-2.16.0","patch-glibc-boot-2.2.5"]}"#,
         )
         .unwrap();
-        let after =
-            auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0", "/td/store", &seeds, &d)
-                .unwrap();
+        let after = auto_synthesize_lock(
+            &d.to_string_lossy(),
+            &map,
+            "gcc-mesboot0",
+            "/td/store",
+            &seeds,
+            &d,
+        )
+        .unwrap();
         assert!(after.contains(&format!("patch-glibc-boot-2.2.5 {in_b} seed")));
-        assert_ne!(before, after, "synthesized lock did not change when declared inputs changed");
+        assert_ne!(
+            before, after,
+            "synthesized lock did not change when declared inputs changed"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -15683,19 +16777,38 @@ daemon build START (2/2 active)
         std::fs::write(phys_app.join("run"), b"app\n").unwrap();
 
         let members = vec![
-            SubstMember { store_path: lib.into(), physical: phys_lib.clone(), refs: vec![] },
-            SubstMember { store_path: app.into(), physical: phys_app.clone(), refs: vec![lib.into()] },
+            SubstMember {
+                store_path: lib.into(),
+                physical: phys_lib.clone(),
+                refs: vec![],
+            },
+            SubstMember {
+                store_path: app.into(),
+                physical: phys_app.clone(),
+                refs: vec![lib.into()],
+            },
         ];
         let outdir = base.join("out");
         let written = subst_export(&outdir, &members).unwrap();
         assert_eq!(written.len(), 2);
 
         // The app narinfo carries the right StorePath and records the ref as a BASENAME.
-        let ni = std::fs::read_to_string(outdir.join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app.narinfo")).unwrap();
+        let ni =
+            std::fs::read_to_string(outdir.join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app.narinfo"))
+                .unwrap();
         assert!(ni.contains(&format!("StorePath: {app}\n")), "narinfo: {ni}");
-        assert!(ni.contains("References: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-lib\n"), "narinfo: {ni}");
-        let narhash = ni.lines().find_map(|l| l.strip_prefix("NarHash: ")).unwrap();
-        let narfile = ni.lines().find_map(|l| l.strip_prefix("NarFile: ")).unwrap();
+        assert!(
+            ni.contains("References: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-lib\n"),
+            "narinfo: {ni}"
+        );
+        let narhash = ni
+            .lines()
+            .find_map(|l| l.strip_prefix("NarHash: "))
+            .unwrap();
+        let narfile = ni
+            .lines()
+            .find_map(|l| l.strip_prefix("NarFile: "))
+            .unwrap();
         // The recorded NarHash is the TRUE nar hash of the source path.
         assert_eq!(narhash, nar_hash_size_path(&phys_app).unwrap().0);
         // The served nar RESTORES to the original tree (durable round-trip).
@@ -15729,31 +16842,57 @@ daemon build START (2/2 active)
         }
         std::fs::write(hdir.join("store").join("ld"), b"loader bytes\n").unwrap();
         std::fs::write(hdir.join("rel"), format!("{rel}\n")).unwrap();
-        std::fs::write(hdir.join("toolchain"), b"HT_TARGET=x86_64-pc-linux-gnu\nHT_GCC=g\n").unwrap();
+        std::fs::write(
+            hdir.join("toolchain"),
+            b"HT_TARGET=x86_64-pc-linux-gnu\nHT_GCC=g\n",
+        )
+        .unwrap();
 
         let outdir = base.join("out");
         let written = harness_subst_export(&outdir, &hdir).unwrap();
         assert_eq!(written, vec!["td-harness".to_string()]);
         let ni = std::fs::read_to_string(outdir.join("td-harness.narinfo")).unwrap();
-        assert!(ni.contains("StorePath: /td/store/td-harness\n"), "narinfo: {ni}");
+        assert!(
+            ni.contains("StorePath: /td/store/td-harness\n"),
+            "narinfo: {ni}"
+        );
         assert!(ni.contains("References: \n"), "harness has no refs: {ni}");
-        let narfile = ni.lines().find_map(|l| l.strip_prefix("NarFile: ")).unwrap();
+        let narfile = ni
+            .lines()
+            .find_map(|l| l.strip_prefix("NarFile: "))
+            .unwrap();
 
         // The served nar RESTORES the WHOLE tree — the store subdir (its entry + the loose ld)
         // and both metadata files — byte-for-byte, exec bit preserved on the binary.
         let restored = base.join("restored");
         let mut r = std::io::BufReader::new(std::fs::File::open(outdir.join(narfile)).unwrap());
         nar::read_nar(&mut r, &restored).unwrap();
-        assert_eq!(std::fs::read(restored.join("store").join(rel).join("bin/busybox")).unwrap(),
-                   b"#!/bin/sh\necho hi\n");
-        assert_eq!(std::fs::read(restored.join("store").join("ld")).unwrap(), b"loader bytes\n");
-        assert_eq!(std::fs::read_to_string(restored.join("rel")).unwrap(), format!("{rel}\n"));
-        assert!(std::fs::read_to_string(restored.join("toolchain")).unwrap().contains("HT_GCC=g"));
+        assert_eq!(
+            std::fs::read(restored.join("store").join(rel).join("bin/busybox")).unwrap(),
+            b"#!/bin/sh\necho hi\n"
+        );
+        assert_eq!(
+            std::fs::read(restored.join("store").join("ld")).unwrap(),
+            b"loader bytes\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(restored.join("rel")).unwrap(),
+            format!("{rel}\n")
+        );
+        assert!(std::fs::read_to_string(restored.join("toolchain"))
+            .unwrap()
+            .contains("HT_GCC=g"));
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(restored.join("store").join(rel).join("bin/busybox"))
-                .unwrap().permissions().mode();
-            assert_eq!(mode & 0o111, 0o111, "exec bit not preserved through the harness nar");
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o111,
+                0o111,
+                "exec bit not preserved through the harness nar"
+            );
         }
 
         // A non-harness dir (no store/ or rel) is rejected — the producer never ships junk.
@@ -15821,7 +16960,15 @@ daemon build START (2/2 active)
 
         // Export it (the server side) → a narinfo + nar, exactly what `fetch` would write.
         let served = base.join("served");
-        subst_export(&served, &[SubstMember { store_path: store_path.into(), physical: phys.clone(), refs: vec![] }]).unwrap();
+        subst_export(
+            &served,
+            &[SubstMember {
+                store_path: store_path.into(),
+                physical: phys.clone(),
+                refs: vec![],
+            }],
+        )
+        .unwrap();
         let ni = std::fs::read_to_string(served.join(format!("{app_base}.narinfo"))).unwrap();
         let narfile = served.join(narinfo_field(&ni, "NarFile").unwrap());
 
@@ -15830,7 +16977,10 @@ daemon build START (2/2 active)
         let reg = restore_substitute(&ni, &narfile, store_path, &newstore, "x.drv").unwrap();
         assert_eq!(reg.store_path, store_path);
         assert_eq!(reg.nar_hash, narinfo_field(&ni, "NarHash").unwrap());
-        assert_eq!(std::fs::read(newstore.join(app_base).join("run")).unwrap(), b"app payload\n");
+        assert_eq!(
+            std::fs::read(newstore.join(app_base).join("run")).unwrap(),
+            b"app payload\n"
+        );
 
         // Self-discrimination (wrong output): the narinfo is a perfectly valid,
         // hash-consistent export of `store_path`, but we ask restore to treat it as a
@@ -15848,7 +16998,10 @@ daemon build START (2/2 active)
         // The whole PAYLOAD, not a bare "app": three bytes match inside a length word or
         // a token too, and the cut would then prove something else.
         let payload = b"app payload\n";
-        let pos = bytes.windows(payload.len()).position(|w| w == payload).expect("payload in nar");
+        let pos = bytes
+            .windows(payload.len())
+            .position(|w| w == payload)
+            .expect("payload in nar");
         bytes[pos] ^= 0xff;
         std::fs::write(&narfile, &bytes).unwrap();
         assert!(
@@ -15875,7 +17028,15 @@ daemon build START (2/2 active)
         std::fs::write(phys.join("run"), b"app payload\n").unwrap();
 
         let served = base.join("served");
-        subst_export(&served, &[SubstMember { store_path: store_path.into(), physical: phys.clone(), refs: vec![] }]).unwrap();
+        subst_export(
+            &served,
+            &[SubstMember {
+                store_path: store_path.into(),
+                physical: phys.clone(),
+                refs: vec![],
+            }],
+        )
+        .unwrap();
         let ni = std::fs::read_to_string(served.join(format!("{app_base}.narinfo"))).unwrap();
         let narfile = served.join(narinfo_field(&ni, "NarFile").unwrap());
 
@@ -15885,7 +17046,10 @@ daemon build START (2/2 active)
         // The whole PAYLOAD, not a bare "app": three bytes match inside a length word or
         // a token too, and the cut would then prove something else.
         let payload = b"app payload\n";
-        let pos = bytes.windows(payload.len()).position(|w| w == payload).expect("payload in nar");
+        let pos = bytes
+            .windows(payload.len())
+            .position(|w| w == payload)
+            .expect("payload in nar");
         let truncated = base.join("truncated.nar");
         std::fs::write(&truncated, &bytes[..pos + 4]).unwrap();
 
@@ -15921,7 +17085,15 @@ daemon build START (2/2 active)
         std::fs::write(&phys, b"app payload\n").unwrap();
 
         let served = base.join("served");
-        subst_export(&served, &[SubstMember { store_path: store_path.into(), physical: phys.clone(), refs: vec![] }]).unwrap();
+        subst_export(
+            &served,
+            &[SubstMember {
+                store_path: store_path.into(),
+                physical: phys.clone(),
+                refs: vec![],
+            }],
+        )
+        .unwrap();
         let ni = std::fs::read_to_string(served.join(format!("{app_base}.narinfo"))).unwrap();
         let narfile = served.join(narinfo_field(&ni, "NarFile").unwrap());
 
@@ -15932,7 +17104,10 @@ daemon build START (2/2 active)
         std::fs::write(newstore.join(app_base), b"stale\n").unwrap();
         let reg = restore_substitute(&ni, &narfile, store_path, &newstore, "x.drv").unwrap();
         assert_eq!(reg.nar_hash, narinfo_field(&ni, "NarHash").unwrap());
-        assert_eq!(std::fs::read(newstore.join(app_base)).unwrap(), b"app payload\n");
+        assert_eq!(
+            std::fs::read(newstore.join(app_base)).unwrap(),
+            b"app payload\n"
+        );
 
         // Leg 2: the cleanup-on-failure half of the same gap — a truncated single-file
         // NAR must leave NO partial file under newstore, as the directory case already
@@ -15941,7 +17116,10 @@ daemon build START (2/2 active)
         // The whole PAYLOAD, not a bare "app": three bytes match inside a length word or
         // a token too, and the cut would then prove something else.
         let payload = b"app payload\n";
-        let pos = bytes.windows(payload.len()).position(|w| w == payload).expect("payload in nar");
+        let pos = bytes
+            .windows(payload.len())
+            .position(|w| w == payload)
+            .expect("payload in nar");
         let truncated = base.join("truncated.nar");
         std::fs::write(&truncated, &bytes[..pos + 4]).unwrap();
         let fresh = base.join("fresh");
@@ -15971,7 +17149,9 @@ daemon build START (2/2 active)
         let _ = std::fs::remove_dir_all(&base);
         let scratch = base.join("b");
         let store_path = "/gnu/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-thing-1.0";
-        let outdir = scratch.join("newstore").join("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-thing-1.0");
+        let outdir = scratch
+            .join("newstore")
+            .join("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-thing-1.0");
         std::fs::create_dir_all(&outdir).unwrap();
         std::fs::write(outdir.join("data"), b"hello cache").unwrap();
         // Real NAR hash of the output (same scan/nar the registration is written with).
@@ -16012,30 +17192,42 @@ daemon build START (2/2 active)
                 refs: vec![],
                 deriver: "x.drv".to_string(),
             };
-            std::fs::write(scratch.join("receipt"), receipt_text(e, std::slice::from_ref(&reg)))
-                .unwrap();
+            std::fs::write(
+                scratch.join("receipt"),
+                receipt_text(e, std::slice::from_ref(&reg)),
+            )
+            .unwrap();
         };
 
         // (a0) valid registration + bytes but NO engine receipt -> MISS: a record
         // beside the bytes is not its own authority.
         write_reg(&hash);
         assert!(
-            cached_realization(&drv, &scratch, &expect).unwrap().is_none(),
+            cached_realization(&drv, &scratch, &expect)
+                .unwrap()
+                .is_none(),
             "a registration without the engine receipt must miss"
         );
 
         // (a) present + matching hash + current-plan receipt -> HIT.
         write_receipt(&expect, &hash);
         assert!(
-            cached_realization(&drv, &scratch, &expect).unwrap().is_some(),
+            cached_realization(&drv, &scratch, &expect)
+                .unwrap()
+                .is_some(),
             "valid entry must hit"
         );
 
         // (a1) the CURRENT plan moved (input-manifest digest changed) -> MISS: the
         // stored receipt cannot vouch a plan it was not issued for.
-        let moved = ReceiptExpect { manifest_sha256: "cc".repeat(32), ..expect.clone() };
+        let moved = ReceiptExpect {
+            manifest_sha256: "cc".repeat(32),
+            ..expect.clone()
+        };
         assert!(
-            cached_realization(&drv, &scratch, &moved).unwrap().is_none(),
+            cached_realization(&drv, &scratch, &moved)
+                .unwrap()
+                .is_none(),
             "an identity-mismatched receipt must miss"
         );
 
@@ -16044,7 +17236,9 @@ daemon build START (2/2 active)
         write_reg("sha256:0123");
         write_receipt(&expect, &hash);
         assert!(
-            cached_realization(&drv, &scratch, &expect).unwrap().is_none(),
+            cached_realization(&drv, &scratch, &expect)
+                .unwrap()
+                .is_none(),
             "a registration disagreeing with the receipt must miss"
         );
 
@@ -16053,7 +17247,9 @@ daemon build START (2/2 active)
         write_reg("sha256:deadbeef");
         write_receipt(&expect, "sha256:deadbeef");
         assert!(
-            cached_realization(&drv, &scratch, &expect).unwrap().is_none(),
+            cached_realization(&drv, &scratch, &expect)
+                .unwrap()
+                .is_none(),
             "hash mismatch must miss"
         );
 
@@ -16062,14 +17258,18 @@ daemon build START (2/2 active)
         write_receipt(&expect, &hash);
         std::fs::remove_dir_all(&outdir).unwrap();
         assert!(
-            cached_realization(&drv, &scratch, &expect).unwrap().is_none(),
+            cached_realization(&drv, &scratch, &expect)
+                .unwrap()
+                .is_none(),
             "absent output must miss"
         );
 
         // (d) never built here (no registration) -> MISS.
         std::fs::remove_file(scratch.join("registration")).unwrap();
         assert!(
-            cached_realization(&drv, &scratch, &expect).unwrap().is_none(),
+            cached_realization(&drv, &scratch, &expect)
+                .unwrap()
+                .is_none(),
             "no registration must miss"
         );
 
@@ -16088,14 +17288,20 @@ daemon build START (2/2 active)
         std::fs::create_dir_all(src.join("sub")).unwrap();
         std::fs::write(src.join("a.txt"), b"hello").unwrap();
         std::fs::write(src.join("sub/run.sh"), b"#!/bin/sh\necho hi\n").unwrap();
-        std::fs::set_permissions(src.join("sub/run.sh"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(
+            src.join("sub/run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         // A GROUP-exec-only file (0o654): NAR keys off OWNER-exec, so this must be
         // restored NON-executable — a regression guard for the `& 0o100` (not `0o111`)
         // exec test, matching nar.rs / the daemon.
         std::fs::write(src.join("group-exec"), b"data").unwrap();
-        std::fs::set_permissions(src.join("group-exec"), std::fs::Permissions::from_mode(0o654))
-            .unwrap();
+        std::fs::set_permissions(
+            src.join("group-exec"),
+            std::fs::Permissions::from_mode(0o654),
+        )
+        .unwrap();
         std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
 
         copy_canonical(&src, &dst).unwrap();
@@ -16107,10 +17313,16 @@ daemon build START (2/2 active)
             "canonical copy is NAR-identical to the source"
         );
         // The executable bit (the one perm NAR distinguishes) is preserved.
-        let mode = std::fs::metadata(dst.join("sub/run.sh")).unwrap().permissions().mode();
+        let mode = std::fs::metadata(dst.join("sub/run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o111, 0o111, "exec bit preserved on dst");
         // The symlink is recreated as a symlink, not followed.
-        assert!(std::fs::symlink_metadata(dst.join("link")).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(dst.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -16161,11 +17373,18 @@ daemon build START (2/2 active)
         // Absent dest -> a plain (atomic) copy, NAR-identical to the source, no staging temp.
         commit_tree_checked(&src, &dst, &want, false, false).unwrap();
         assert_eq!(nar_hash_path(&dst).unwrap(), want, "absent dest copied");
-        assert!(!has_commit_temp(&base), "no staging temp left after a clean commit");
+        assert!(
+            !has_commit_temp(&base),
+            "no staging temp left after a clean commit"
+        );
 
         // Present dest with the SAME bytes -> idempotent skip, no error, no change.
         commit_tree_checked(&src, &dst, &want, false, false).unwrap();
-        assert_eq!(nar_hash_path(&dst).unwrap(), want, "matching dest unchanged");
+        assert_eq!(
+            nar_hash_path(&dst).unwrap(),
+            want,
+            "matching dest unchanged"
+        );
 
         // Present REGISTERED dest with DIFFERENT bytes at the SAME (ABI-token) path -> fail
         // closed with an ABI-bump demand, and the stale tree is left intact.
@@ -16173,8 +17392,15 @@ daemon build START (2/2 active)
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("out"), b"stale-different-bytes").unwrap();
         let err = commit_tree_checked(&src, &stale, &want, true, false).unwrap_err();
-        assert!(err.contains("BUILDER_ABI"), "mismatch must demand an ABI bump: {err}");
-        assert_ne!(nar_hash_path(&stale).unwrap(), want, "stale dest left intact");
+        assert!(
+            err.contains("BUILDER_ABI"),
+            "mismatch must demand an ABI bump: {err}"
+        );
+        assert_ne!(
+            nar_hash_path(&stale).unwrap(),
+            want,
+            "stale dest left intact"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -16194,25 +17420,34 @@ daemon build START (2/2 active)
         let want = nar_hash_path(&src).unwrap();
         let dst = base.join("dst");
         commit_tree_checked(&src, &dst, &want, false, true).unwrap();
-        assert_eq!(nar_hash_path(&dst).unwrap(), want, "linked dest is NAR-identical");
+        assert_eq!(
+            nar_hash_path(&dst).unwrap(),
+            want,
+            "linked dest is NAR-identical"
+        );
         assert_eq!(
             std::fs::metadata(src.join("out")).unwrap().ino(),
             std::fs::metadata(dst.join("out")).unwrap().ino(),
             "link=true shares a canonical file's inode (hardlink)"
         );
-        assert!(!has_commit_temp(&base), "no staging temp left after a clean linked commit");
+        assert!(
+            !has_commit_temp(&base),
+            "no staging temp left after a clean linked commit"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Any `.commit-tmp.*` staging entry left under DIR (a leaked/uncleaned commit temp).
     fn has_commit_temp(dir: &Path) -> bool {
-        std::fs::read_dir(dir).map(|rd| {
-            rd.flatten().any(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with(".commit-tmp."))
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten().any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with(".commit-tmp."))
+                })
             })
-        }).unwrap_or(false)
+            .unwrap_or(false)
     }
 
     // The poisoning fix: a torn tree an interrupted commit left at the final path is
@@ -16232,11 +17467,19 @@ daemon build START (2/2 active)
         let dest = base.join("dest");
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::write(dest.join("out"), b"partial-torn").unwrap();
-        assert_ne!(nar_hash_path(&dest).unwrap(), want, "precondition: dest is torn");
+        assert_ne!(
+            nar_hash_path(&dest).unwrap(),
+            want,
+            "precondition: dest is torn"
+        );
 
         // Unregistered mismatch -> recovered: the orphan is replaced with the real tree.
         commit_tree_checked(&src, &dest, &want, false, false).unwrap();
-        assert_eq!(nar_hash_path(&dest).unwrap(), want, "torn orphan recovered to the real tree");
+        assert_eq!(
+            nar_hash_path(&dest).unwrap(),
+            want,
+            "torn orphan recovered to the real tree"
+        );
         assert!(!has_commit_temp(&base), "recovery leaves no staging temp");
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -16259,7 +17502,10 @@ daemon build START (2/2 active)
         sweep_commit_temps(&dir);
         assert!(!dead.exists(), "a dead pid's orphan temp is reaped");
         assert!(live.exists(), "a live pid's staging temp is left alone");
-        assert!(keep.exists(), "a real store item is never mistaken for a temp");
+        assert!(
+            keep.exists(),
+            "a real store item is never mistaken for a temp"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16275,7 +17521,10 @@ daemon build START (2/2 active)
         assert_eq!(std::fs::read(&f).unwrap(), b"first");
         write_atomic(&f, b"second-longer-and-different").unwrap();
         assert_eq!(std::fs::read(&f).unwrap(), b"second-longer-and-different");
-        assert!(!has_commit_temp(&dir), "no staging temp left after atomic writes");
+        assert!(
+            !has_commit_temp(&dir),
+            "no staging temp left after atomic writes"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16288,7 +17537,10 @@ daemon build START (2/2 active)
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("db");
-        assert!(read_registered_paths(&db).unwrap().is_empty(), "missing db -> first commit");
+        assert!(
+            read_registered_paths(&db).unwrap().is_empty(),
+            "missing db -> first commit"
+        );
 
         let out_path = format!("/td/store/{}-out-1.0", "a".repeat(32));
         write_output_db(
@@ -16303,11 +17555,17 @@ daemon build START (2/2 active)
         )
         .unwrap();
         let reg = read_registered_paths(&db).unwrap();
-        assert!(reg.contains(&out_path), "a written db vouches its path: {reg:?}");
+        assert!(
+            reg.contains(&out_path),
+            "a written db vouches its path: {reg:?}"
+        );
 
         std::fs::write(&db, b"not-a-valid-store-db").unwrap();
         let err = read_registered_paths(&db).unwrap_err();
-        assert!(err.contains("unreadable"), "a torn db is surfaced, not read as empty: {err}");
+        assert!(
+            err.contains("unreadable"),
+            "a torn db is surfaced, not read as empty: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16322,7 +17580,10 @@ daemon build START (2/2 active)
         let db = dir.join("db");
         std::os::unix::fs::symlink(dir.join("no-such-target"), &db).unwrap();
         let err = read_registered_paths(&db).unwrap_err();
-        assert!(err.contains("unreadable"), "a dangling db symlink fails closed: {err}");
+        assert!(
+            err.contains("unreadable"),
+            "a dangling db symlink fails closed: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16342,14 +17603,23 @@ daemon build START (2/2 active)
         // The lock is a SIBLING of the store dir, not inside it — so eviction (which renames the
         // store dir aside) never changes the lock inode.
         let lock_path = dir.join("build-cache.commit.lock");
-        assert!(lock_path.exists(), "lock sits beside the store dir, not inside it");
-        assert!(!store.join("db.commit.lock").exists(), "lock is not inside the evictable store dir");
+        assert!(
+            lock_path.exists(),
+            "lock sits beside the store dir, not inside it"
+        );
+        assert!(
+            !store.join("db.commit.lock").exists(),
+            "lock is not inside the evictable store dir"
+        );
         let contender = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&lock_path)
             .unwrap();
-        assert!(contender.try_lock().is_err(), "commit lock held exclusively while in use");
+        assert!(
+            contender.try_lock().is_err(),
+            "commit lock held exclusively while in use"
+        );
         drop(held);
         // Not instantly: a sibling test's spawn can hold a fork-duplicated
         // copy of this descriptor until it execs.
@@ -16369,7 +17639,10 @@ daemon build START (2/2 active)
             "/gnu/store/bbb-gcc-toolchain-15.2.0".to_string(),
             "/gnu/store/ccc-make-4.4.1".to_string(),
         ];
-        assert!(super::substitute_gcc_toolchain(&mut inputs, tc), "should report a swap");
+        assert!(
+            super::substitute_gcc_toolchain(&mut inputs, tc),
+            "should report a swap"
+        );
         assert_eq!(
             inputs,
             vec![
@@ -16443,7 +17716,10 @@ daemon build START (2/2 active)
         // An EMPTY declaration is byte-identical, hash included.
         let (empty_path, empty_inputs, empty_payload) =
             assemble(format!(r#"{{{base},"payloadInputs":[]}}"#));
-        assert!(empty_payload.is_none(), "an empty payload list emits no line");
+        assert!(
+            empty_payload.is_none(),
+            "an empty payload list emits no line"
+        );
         assert_eq!(empty_inputs.as_deref(), Some(inputs.as_str()));
         assert_eq!(
             empty_path, bare_path,
@@ -16485,13 +17761,18 @@ daemon build START (2/2 active)
             );
             let error = assemble_recipe_drv(&damaged, lockp, &dir, None)
                 .expect_err("the local source entry may not be declared as payload data");
-            assert!(error.contains("local source entry `seed-source'"), "{error}");
+            assert!(
+                error.contains("local source entry `seed-source'"),
+                "{error}"
+            );
         }
-        let absent_source_input =
-            r#"{"name":"seed","version":"1","buildSystem":"mesboot","steps":[],"payloadInputs":["seed-source"]}"#;
+        let absent_source_input = r#"{"name":"seed","version":"1","buildSystem":"mesboot","steps":[],"payloadInputs":["seed-source"]}"#;
         let error = assemble_recipe_drv(absent_source_input, lockp, &dir, None)
             .expect_err("an undeclared local source entry may not be payload data");
-        assert!(error.contains("local source entry `seed-source'"), "{error}");
+        assert!(
+            error.contains("local source entry `seed-source'"),
+            "{error}"
+        );
 
         let malformed_source_input = r#"{"name":"seed","version":"1","buildSystem":"mesboot","steps":[],"sourceInput":7,"payloadInputs":["seed-source"]}"#;
         let error = assemble_recipe_drv(malformed_source_input, lockp, &dir, None)
@@ -16512,8 +17793,7 @@ daemon build START (2/2 active)
 
     #[test]
     fn application_metadata_binds_final_recipe_answers_into_every_application_phase_contract() {
-        let dir =
-            std::env::temp_dir().join(format!("td-application-spec-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("td-application-spec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("fixture.lock");
@@ -16669,10 +17949,8 @@ daemon build START (2/2 active)
 
     #[test]
     fn static_application_validation_is_manifest_bound_terminal_and_non_spawning() {
-        let dir = std::env::temp_dir().join(format!(
-            "td-static-application-spec-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("td-static-application-spec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("fixture.lock");
@@ -16684,7 +17962,8 @@ daemon build START (2/2 active)
         .unwrap();
         let prefix = r#"{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","payloadInputs":["empty-runtime"],"application":{"runtime":"empty-runtime","entry":"/app/bin/app"},"applicationLauncher":{"displayName":"Fixture","searchTerms":[]},"applicationPermissions":"format=1\n","steps":["#;
         let native = r#"{"unpack":{"input":"{in:fixture-source}","dest":"{root}/seed","keepTop":false}},{"mkDir":"{out}/files/bin"},{"copyFiles":{"files":["{root}/seed/app"],"dest":"{out}/files/bin"}}"#;
-        let marker = r#"{"validateStaticApplication":{"entry":"/app/bin/app","runtime":"empty-runtime"}}"#;
+        let marker =
+            r#"{"validateStaticApplication":{"entry":"/app/bin/app","runtime":"empty-runtime"}}"#;
         let assemble = |steps: &str| {
             let recipe = format!("{prefix}{steps}]}}");
             assemble_recipe_drv(&recipe, lock.to_str().unwrap(), &dir, None)
@@ -16724,25 +18003,18 @@ daemon build START (2/2 active)
         let no_application = format!(
             r#"{{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","steps":[{marker}]}}"#
         );
-        let error = assemble_recipe_drv(
-            &no_application,
-            lock.to_str().unwrap(),
-            &dir,
-            None,
-        )
-        .expect_err("a validation marker without an application must refuse");
-        assert!(error.contains("requires an application declaration"), "{error}");
+        let error = assemble_recipe_drv(&no_application, lock.to_str().unwrap(), &dir, None)
+            .expect_err("a validation marker without an application must refuse");
+        assert!(
+            error.contains("requires an application declaration"),
+            "{error}"
+        );
 
         let missing_marker = format!(
             r#"{{"name":"fixture","version":"1","buildSystem":"mesboot","sourceInput":"fixture-pin","foreign":true,"foreignSource":true,"payloadInputs":["empty-runtime"],"application":{{"runtime":"empty-runtime","entry":"/app/bin/app"}},"applicationLauncher":{{"displayName":"Fixture","searchTerms":[]}},"applicationPermissions":"format=1\n","steps":[{native},{{"run":{{"cwd":"{{out}}","argv":["{{out}}/files/bin/app"],"environment":[]}}}}]}}"#
         );
-        let error = assemble_recipe_drv(
-            &missing_marker,
-            lock.to_str().unwrap(),
-            &dir,
-            None,
-        )
-        .expect_err("a damaged foreign application must not omit its validator");
+        let error = assemble_recipe_drv(&missing_marker, lock.to_str().unwrap(), &dir, None)
+            .expect_err("a damaged foreign application must not omit its validator");
         assert!(
             error.contains("foreign-source application requires exactly one"),
             "{error}"
@@ -16833,8 +18105,7 @@ daemon build START (2/2 active)
         assert!(error.contains("reserved for assembled metadata"), "{error}");
         let error = push_drv_env(&mut spec, "TD_APPLICATION_LAUNCHER", "forged").unwrap_err();
         assert!(error.contains("reserved for assembled metadata"), "{error}");
-        let error =
-            push_drv_env(&mut spec, "TD_APPLICATION_MANIFEST=forged", "value").unwrap_err();
+        let error = push_drv_env(&mut spec, "TD_APPLICATION_MANIFEST=forged", "value").unwrap_err();
         assert!(error.contains("contains `='"), "{error}");
         for value in ["value\nenv TD_APPLICATION_MANIFEST=forged", "value\rforged"] {
             let error = push_drv_env(&mut spec, "TD_INPUTS", value).unwrap_err();
@@ -16853,8 +18124,7 @@ daemon build START (2/2 active)
 
     #[test]
     fn malformed_or_oversized_application_metadata_refuses_drv_assembly() {
-        let dir =
-            std::env::temp_dir().join(format!("td-bad-application-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("td-bad-application-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("fixture.lock");
@@ -16934,11 +18204,9 @@ daemon build START (2/2 active)
 
     #[test]
     fn application_runtime_resolution_requires_one_declared_typed_store_output() {
-        let declaration = td_engine::application::ApplicationDeclaration::new(
-            "empty-runtime",
-            "/app/bin/app",
-        )
-        .unwrap();
+        let declaration =
+            td_engine::application::ApplicationDeclaration::new("empty-runtime", "/app/bin/app")
+                .unwrap();
         let payloads = ["empty-runtime".to_string()].into();
         let good = lock::parse(
             "empty-runtime /td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-empty-runtime-1 td-recipe-output\n",
@@ -17019,7 +18287,11 @@ daemon build START (2/2 active)
         let lockp = lock.to_str().unwrap();
         let tc = "/td/store/ffffffffffffffffffffffffffffffff-gcc-toolchain-tdstore";
         let td_inputs = |drv: &drv::Derivation| {
-            drv.env.iter().find(|(k, _)| k == "TD_INPUTS").map(|(_, v)| v.clone()).unwrap()
+            drv.env
+                .iter()
+                .find(|(k, _)| k == "TD_INPUTS")
+                .map(|(_, v)| v.clone())
+                .unwrap()
         };
 
         // WITH the override: the guix gcc-toolchain is swapped for the /td/store toolchain.
@@ -17027,21 +18299,41 @@ daemon build START (2/2 active)
         let (_p, _f, drv, _s) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
         std::env::remove_var("TD_GCC_TOOLCHAIN");
         let ti = td_inputs(&drv);
-        assert!(ti.contains(tc), "TD_INPUTS carries the /td/store toolchain: {ti}");
-        assert!(!ti.contains("gcc-toolchain-15.2.0"), "guix gcc-toolchain swapped OUT of TD_INPUTS: {ti}");
-        assert!(ti.contains("-glibc-2.41") && ti.contains("-make-4.4.1"), "other inputs untouched: {ti}");
-        // The swapped path is an input-src too (staged into the build), not just an env value.
-        assert!(drv.input_srcs.iter().any(|s| s == tc), "override is an input-src");
         assert!(
-            !drv.input_srcs.iter().any(|s| s.contains("gcc-toolchain-15.2.0")),
+            ti.contains(tc),
+            "TD_INPUTS carries the /td/store toolchain: {ti}"
+        );
+        assert!(
+            !ti.contains("gcc-toolchain-15.2.0"),
+            "guix gcc-toolchain swapped OUT of TD_INPUTS: {ti}"
+        );
+        assert!(
+            ti.contains("-glibc-2.41") && ti.contains("-make-4.4.1"),
+            "other inputs untouched: {ti}"
+        );
+        // The swapped path is an input-src too (staged into the build), not just an env value.
+        assert!(
+            drv.input_srcs.iter().any(|s| s == tc),
+            "override is an input-src"
+        );
+        assert!(
+            !drv.input_srcs
+                .iter()
+                .any(|s| s.contains("gcc-toolchain-15.2.0")),
             "guix gcc-toolchain is not an input-src (dropped from the drv closure)"
         );
 
         // WITHOUT the override (default): unchanged — the guix gcc-toolchain stays.
         let (_p, _f, drv0, _s) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
         let ti0 = td_inputs(&drv0);
-        assert!(ti0.contains("gcc-toolchain-15.2.0"), "default keeps the guix gcc-toolchain: {ti0}");
-        assert!(!ti0.contains(tc), "default has no /td/store toolchain: {ti0}");
+        assert!(
+            ti0.contains("gcc-toolchain-15.2.0"),
+            "default keeps the guix gcc-toolchain: {ti0}"
+        );
+        assert!(
+            !ti0.contains(tc),
+            "default has no /td/store toolchain: {ti0}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -17086,10 +18378,8 @@ daemon build START (2/2 active)
 
     #[test]
     fn assemble_recipe_drv_hashes_typed_split_debug_policy() {
-        let dir = std::env::temp_dir().join(format!(
-            "td-split-debug-policy-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("td-split-debug-policy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("fixture.lock");
@@ -17143,9 +18433,16 @@ daemon build START (2/2 active)
         let (drv_path, _f, drv, _s) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
 
         // The builder line is the stable identity path's td-builder — not a real Cb.
-        assert_eq!(drv.builder, format!("{id}/bin/td-builder"), "builder line is the ABI identity");
+        assert_eq!(
+            drv.builder,
+            format!("{id}/bin/td-builder"),
+            "builder line is the ABI identity"
+        );
         // The identity path is a builder input-src (the closure root realize stages)...
-        assert!(drv.input_srcs.iter().any(|s| s == &id), "identity path is a builder input-src");
+        assert!(
+            drv.input_srcs.iter().any(|s| s == &id),
+            "identity path is a builder input-src"
+        );
         // ...and NO builder BINARY path (only the identity DIR) is baked into the drv.
         assert!(
             !drv.input_srcs.iter().any(|s| s.contains("/bin/td-builder")),
@@ -17156,7 +18453,10 @@ daemon build START (2/2 active)
         // Re-assembly is byte-deterministic — same drv path AND same output path — so a
         // builder-binary change (absent from the spec now) cannot move either.
         let (drv_path2, _f2, drv2, _s2) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
-        assert_eq!(drv_path, drv_path2, "drv store path is stable across re-assembly");
+        assert_eq!(
+            drv_path, drv_path2,
+            "drv store path is stable across re-assembly"
+        );
         assert_eq!(
             drv.outputs.first().map(|o| &o.path),
             drv2.outputs.first().map(|o| &o.path),
@@ -17174,25 +18474,40 @@ daemon build START (2/2 active)
     // sees them) but are NOT reachable through PT_INTERP or DT_RUNPATH, mirroring glibc's
     // libc.so.6 baking the bash-static path into its `_PATH_BSHELL` string constant.
     fn synth_link_elf(interp: Option<&str>, runpath: Option<&str>, embed: &[&str]) -> Vec<u8> {
-        fn le64(b: &mut [u8], off: usize, v: u64) { b[off..off + 8].copy_from_slice(&v.to_le_bytes()); }
-        fn le32(b: &mut [u8], off: usize, v: u32) { b[off..off + 4].copy_from_slice(&v.to_le_bytes()); }
-        fn le16(b: &mut [u8], off: usize, v: u16) { b[off..off + 2].copy_from_slice(&v.to_le_bytes()); }
+        fn le64(b: &mut [u8], off: usize, v: u64) {
+            b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        fn le32(b: &mut [u8], off: usize, v: u32) {
+            b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        fn le16(b: &mut [u8], off: usize, v: u16) {
+            b[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        }
         let (ehdr, phent) = (64usize, 56usize);
         let phnum = if interp.is_some() { 3 } else { 2 };
         let ph_off = ehdr;
         let interp_off = ehdr + phnum * phent;
         let mut interp_bytes: Vec<u8> = Vec::new();
-        if let Some(s) = interp { interp_bytes.extend_from_slice(s.as_bytes()); interp_bytes.push(0); }
+        if let Some(s) = interp {
+            interp_bytes.extend_from_slice(s.as_bytes());
+            interp_bytes.push(0);
+        }
         let dyn_off = interp_off + interp_bytes.len();
         let n_dyn = 2 + usize::from(runpath.is_some());
         let dyn_size = n_dyn * 16;
         let strtab_off = dyn_off + dyn_size;
         let mut dynstr: Vec<u8> = vec![0]; // index 0: the conventional empty string
         let rp_off = dynstr.len();
-        if let Some(rp) = runpath { dynstr.extend_from_slice(rp.as_bytes()); dynstr.push(0); }
+        if let Some(rp) = runpath {
+            dynstr.extend_from_slice(rp.as_bytes());
+            dynstr.push(0);
+        }
         let embed_off = strtab_off + dynstr.len();
         let mut embed_bytes: Vec<u8> = Vec::new();
-        for s in embed { embed_bytes.extend_from_slice(s.as_bytes()); embed_bytes.push(0); }
+        for s in embed {
+            embed_bytes.extend_from_slice(s.as_bytes());
+            embed_bytes.push(0);
+        }
         let total = embed_off + embed_bytes.len();
 
         let mut b = vec![0u8; total];
@@ -17219,11 +18534,16 @@ daemon build START (2/2 active)
         le64(&mut b, pi + 16, dyn_off as u64);
         le64(&mut b, pi + 32, dyn_size as u64);
         let mut de = dyn_off;
-        le64(&mut b, de, 5); le64(&mut b, de + 8, strtab_off as u64); de += 16; // DT_STRTAB
+        le64(&mut b, de, 5);
+        le64(&mut b, de + 8, strtab_off as u64);
+        de += 16; // DT_STRTAB
         if runpath.is_some() {
-            le64(&mut b, de, 29); le64(&mut b, de + 8, rp_off as u64); de += 16; // DT_RUNPATH
+            le64(&mut b, de, 29);
+            le64(&mut b, de + 8, rp_off as u64);
+            de += 16; // DT_RUNPATH
         }
-        le64(&mut b, de, 0); le64(&mut b, de + 8, 0); // DT_NULL
+        le64(&mut b, de, 0);
+        le64(&mut b, de + 8, 0); // DT_NULL
         b[strtab_off..strtab_off + dynstr.len()].copy_from_slice(&dynstr);
         b[embed_off..embed_off + embed_bytes.len()].copy_from_slice(&embed_bytes);
         b
@@ -17252,13 +18572,29 @@ daemon build START (2/2 active)
         let ld = format!("/gnu/store/{glibc}/lib/ld-linux-x86-64.so.2");
         let bash_bin = format!("/gnu/store/{bash}/bin/bash");
         // libc.so.6: interp -> ld, NO run-path, but EMBEDS the bash path (the leak).
-        std::fs::write(seed.join(glibc).join("lib/libc.so.6"), synth_link_elf(Some(&ld), None, &[&bash_bin])).unwrap();
+        std::fs::write(
+            seed.join(glibc).join("lib/libc.so.6"),
+            synth_link_elf(Some(&ld), None, &[&bash_bin]),
+        )
+        .unwrap();
         // ld-linux: fully static — no interp, no run-path.
-        std::fs::write(seed.join(glibc).join("lib/ld-linux-x86-64.so.2"), synth_link_elf(None, None, &[])).unwrap();
+        std::fs::write(
+            seed.join(glibc).join("lib/ld-linux-x86-64.so.2"),
+            synth_link_elf(None, None, &[]),
+        )
+        .unwrap();
         // glibc bin/ldd: a helper SCRIPT that shebangs bash (a content ref, not a link edge).
-        std::fs::write(seed.join(glibc).join("bin/ldd"), format!("#!{bash_bin}\nexec ...\n").into_bytes()).unwrap();
+        std::fs::write(
+            seed.join(glibc).join("bin/ldd"),
+            format!("#!{bash_bin}\nexec ...\n").into_bytes(),
+        )
+        .unwrap();
         // libgcc_s.so.1: run-path -> glibc/lib (the real cross-package link edge).
-        std::fs::write(seed.join(gcclib).join("lib/libgcc_s.so.1"), synth_link_elf(None, Some(&format!("/gnu/store/{glibc}/lib")), &[])).unwrap();
+        std::fs::write(
+            seed.join(gcclib).join("lib/libgcc_s.so.1"),
+            synth_link_elf(None, Some(&format!("/gnu/store/{glibc}/lib")), &[]),
+        )
+        .unwrap();
         // bash-static: the runnable host shell — the regression target.
         std::fs::write(seed.join(bash).join("bin/bash"), b"a runnable host shell").unwrap();
 
@@ -17270,10 +18606,20 @@ daemon build START (2/2 active)
         on_disk.insert(format!("/gnu/store/{gcclib}"), od(gcclib));
 
         // The builder DB's direct runtime refs (glibc + gcc-lib).
-        let roots = vec![format!("/gnu/store/{glibc}"), format!("/gnu/store/{gcclib}")];
-        let link = resolve_link_closure(&roots, std::slice::from_ref(&seed_dir), cp, &on_disk).unwrap();
-        assert!(link.contains(&format!("/gnu/store/{glibc}")), "glibc is a real runtime lib: {link:?}");
-        assert!(link.contains(&format!("/gnu/store/{gcclib}")), "gcc-lib is a real runtime lib: {link:?}");
+        let roots = vec![
+            format!("/gnu/store/{glibc}"),
+            format!("/gnu/store/{gcclib}"),
+        ];
+        let link =
+            resolve_link_closure(&roots, std::slice::from_ref(&seed_dir), cp, &on_disk).unwrap();
+        assert!(
+            link.contains(&format!("/gnu/store/{glibc}")),
+            "glibc is a real runtime lib: {link:?}"
+        );
+        assert!(
+            link.contains(&format!("/gnu/store/{gcclib}")),
+            "gcc-lib is a real runtime lib: {link:?}"
+        );
         assert!(
             !link.contains(&format!("/gnu/store/{bash}")),
             "bash-static (a string-only reference) must be ABSENT from the builder runtime closure: {link:?}"
@@ -17282,9 +18628,19 @@ daemon build START (2/2 active)
         // Prove the fix is load-bearing: a CONTENT scan of the same roots DOES pull bash-static
         // in (via libc.so.6's constant + bin/ldd), which is exactly what used to stage a host
         // shell into the sandbox.
-        let candidates = vec![format!("/gnu/store/{glibc}"), format!("/gnu/store/{bash}"), format!("/gnu/store/{gcclib}")];
+        let candidates = vec![
+            format!("/gnu/store/{glibc}"),
+            format!("/gnu/store/{bash}"),
+            format!("/gnu/store/{gcclib}"),
+        ];
         let mut scanner = scan::Scanner::new(&candidates).unwrap();
-        let content = scan_closure_hybrid(&mut scanner, &on_disk, &std::collections::HashMap::new(), &roots).unwrap();
+        let content = scan_closure_hybrid(
+            &mut scanner,
+            &on_disk,
+            &std::collections::HashMap::new(),
+            &roots,
+        )
+        .unwrap();
         assert!(
             content.contains(&format!("/gnu/store/{bash}")),
             "a content scan SHOULD leak bash-static (the pre-fix behavior) — otherwise this test proves nothing: {content:?}"
@@ -17332,9 +18688,13 @@ daemon build START (2/2 active)
         }
 
         // The arm: root the LINKAGE walk on the builder tree, drop the bare self.
-        let mut linkage =
-            resolve_link_closure(std::slice::from_ref(&sp(bld)), std::slice::from_ref(&seed_dir), cp, &on_disk)
-                .unwrap();
+        let mut linkage = resolve_link_closure(
+            std::slice::from_ref(&sp(bld)),
+            std::slice::from_ref(&seed_dir),
+            cp,
+            &on_disk,
+        )
+        .unwrap();
         linkage.remove(&sp(bld));
         assert!(
             linkage.is_empty(),
@@ -17373,18 +18733,41 @@ daemon build START (2/2 active)
             "/td/store/tttttttttttttttttttttttttttttttt-make-4.4.1\t/cache/tttttttttttttttttttttttttttttttt-make-4.4.1".to_string(),
         ];
         let out = rekey_builder_entry(closure, real, stable);
-        assert_eq!(out.first().map(String::as_str), Some(format!("{stable}\t{real}").as_str()), "bare builder -> stable\\treal");
-        assert_eq!(out.get(1).map(String::as_str), Some("/gnu/store/gggggggggggggggggggggggggggggggg-glibc-2.41"), "runtime ref untouched");
-        assert!(out.get(2).is_some_and(|e| e.starts_with("/td/store/tttt")), "other on-disk entry untouched");
+        assert_eq!(
+            out.first().map(String::as_str),
+            Some(format!("{stable}\t{real}").as_str()),
+            "bare builder -> stable\\treal"
+        );
+        assert_eq!(
+            out.get(1).map(String::as_str),
+            Some("/gnu/store/gggggggggggggggggggggggggggggggg-glibc-2.41"),
+            "runtime ref untouched"
+        );
+        assert!(
+            out.get(2).is_some_and(|e| e.starts_with("/td/store/tttt")),
+            "other on-disk entry untouched"
+        );
 
         // The override form: `real\ton-disk` -> `stable\ton-disk` (real bytes at stable).
-        let ov = vec![format!("{real}\t/bstore/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-td-builder-0.1.0")];
+        let ov = vec![format!(
+            "{real}\t/bstore/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-td-builder-0.1.0"
+        )];
         let ovo = rekey_builder_entry(ov, real, stable);
-        assert_eq!(ovo.first().map(String::as_str), Some(format!("{stable}\t/bstore/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-td-builder-0.1.0").as_str()));
+        assert_eq!(
+            ovo.first().map(String::as_str),
+            Some(
+                format!("{stable}\t/bstore/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-td-builder-0.1.0")
+                    .as_str()
+            )
+        );
 
         // No builder entry present -> a no-op.
         let none = vec!["/gnu/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-foo".to_string()];
-        assert_eq!(rekey_builder_entry(none.clone(), real, stable), none, "no builder entry -> unchanged");
+        assert_eq!(
+            rekey_builder_entry(none.clone(), real, stable),
+            none,
+            "no builder entry -> unchanged"
+        );
     }
 
     // The staging manifest mirrors the real builder's record onto the stable identity path,
@@ -17416,20 +18799,39 @@ daemon build START (2/2 active)
         // The stable id carries the SAME record as the real builder (same hash + origin),
         // and the real record + every other row are left in place.
         let staged = manifest_with_builder_alias(&manifest, &Some(real.clone()), stable);
-        assert_eq!(staged.get(stable), manifest.get(&real), "stable id mirrors the real builder record");
-        assert_eq!(staged.get(&real), manifest.get(&real), "real builder record kept");
-        assert_eq!(staged.get(&glibc), manifest.get(&glibc), "non-builder row untouched");
+        assert_eq!(
+            staged.get(stable),
+            manifest.get(&real),
+            "stable id mirrors the real builder record"
+        );
+        assert_eq!(
+            staged.get(&real),
+            manifest.get(&real),
+            "real builder record kept"
+        );
+        assert_eq!(
+            staged.get(&glibc),
+            manifest.get(&glibc),
+            "non-builder row untouched"
+        );
 
         // A non-td drv (no real builder) mirrors nothing.
         let none = manifest_with_builder_alias(&manifest, &None, stable);
         assert!(none.get(stable).is_none(), "no real builder -> no alias");
-        assert_eq!(none.len(), manifest.len(), "no-op leaves the manifest as-is");
+        assert_eq!(
+            none.len(),
+            manifest.len(),
+            "no-op leaves the manifest as-is"
+        );
 
         // A real builder absent from the manifest mirrors nothing (enforcement would reject
         // it first): there is no record to copy onto the stable id.
         let absent = "/gnu/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-td-builder-0.1.0".to_string();
         let norec = manifest_with_builder_alias(&manifest, &Some(absent), stable);
-        assert!(norec.get(stable).is_none(), "real builder absent from manifest -> no alias");
+        assert!(
+            norec.get(stable).is_none(),
+            "real builder absent from manifest -> no alias"
+        );
     }
 
     // The final GCC lives below its recipe output, so run_rust needs exact
@@ -17452,14 +18854,19 @@ daemon build START (2/2 active)
         let recipe = r#"{"name":"ripgrep","version":"14.1.1","buildSystem":"rust","bins":["rg"],"cargoSubdir":"workspace","cargoPackage":"ripgrep"}"#;
         let lockp = lock.to_str().unwrap();
         let env_of = |drv: &drv::Derivation, k: &str| {
-            drv.env.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone())
+            drv.env
+                .iter()
+                .find(|(kk, _)| kk == k)
+                .map(|(_, v)| v.clone())
         };
-        let interp = "/td/store/cccccccccccccccccccccccccccccccc-glibc-2.41-x86_64/lib/ld-linux-x86-64.so.2";
+        let interp =
+            "/td/store/cccccccccccccccccccccccccccccccc-glibc-2.41-x86_64/lib/ld-linux-x86-64.so.2";
         let rpath = "/td/store/cccccccccccccccccccccccccccccccc-glibc-2.41-x86_64/lib";
         let bdir = rpath;
         let cc = "/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc/stage/td/store/gcc/bin/gcc";
         let cxx = "/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc/stage/td/store/gcc/bin/g++";
-        let include = "/td/store/dddddddddddddddddddddddddddddddd-glibc/stage/td/store/glibc/include";
+        let include =
+            "/td/store/dddddddddddddddddddddddddddddddd-glibc/stage/td/store/glibc/include";
 
         // WITH the vars set: the rust drv carries them so run_rust can bake interp/RUNPATH/-B.
         std::env::set_var("TD_RUST_STORE_INTERP", interp);
@@ -17475,12 +18882,36 @@ daemon build START (2/2 active)
         std::env::remove_var("TD_RUST_STORE_CC");
         std::env::remove_var("TD_RUST_STORE_CXX");
         std::env::remove_var("TD_RUST_STORE_INCLUDE");
-        assert_eq!(env_of(&drv, "TD_RUST_STORE_INTERP").as_deref(), Some(interp), "interp forwarded to the drv env");
-        assert_eq!(env_of(&drv, "TD_RUST_STORE_RPATH").as_deref(), Some(rpath), "rpath forwarded");
-        assert_eq!(env_of(&drv, "TD_RUST_STORE_BDIR").as_deref(), Some(bdir), "bdir forwarded");
-        assert_eq!(env_of(&drv, "TD_RUST_STORE_CC").as_deref(), Some(cc), "cc forwarded");
-        assert_eq!(env_of(&drv, "TD_RUST_STORE_CXX").as_deref(), Some(cxx), "cxx forwarded");
-        assert_eq!(env_of(&drv, "TD_RUST_STORE_INCLUDE").as_deref(), Some(include), "include forwarded");
+        assert_eq!(
+            env_of(&drv, "TD_RUST_STORE_INTERP").as_deref(),
+            Some(interp),
+            "interp forwarded to the drv env"
+        );
+        assert_eq!(
+            env_of(&drv, "TD_RUST_STORE_RPATH").as_deref(),
+            Some(rpath),
+            "rpath forwarded"
+        );
+        assert_eq!(
+            env_of(&drv, "TD_RUST_STORE_BDIR").as_deref(),
+            Some(bdir),
+            "bdir forwarded"
+        );
+        assert_eq!(
+            env_of(&drv, "TD_RUST_STORE_CC").as_deref(),
+            Some(cc),
+            "cc forwarded"
+        );
+        assert_eq!(
+            env_of(&drv, "TD_RUST_STORE_CXX").as_deref(),
+            Some(cxx),
+            "cxx forwarded"
+        );
+        assert_eq!(
+            env_of(&drv, "TD_RUST_STORE_INCLUDE").as_deref(),
+            Some(include),
+            "include forwarded"
+        );
         assert_eq!(
             env_of(&drv, "TD_RUST_OBJCOPY").as_deref(),
             Some("/td/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-binutils-x86-64-self/bin/objcopy"),
@@ -17493,48 +18924,64 @@ daemon build START (2/2 active)
             Some(expected_policy.as_str()),
             "the splitter policy is a derivation-hashed input"
         );
-        assert_eq!(env_of(&drv, "TD_CARGO_SUBDIR").as_deref(), Some("workspace"));
+        assert_eq!(
+            env_of(&drv, "TD_CARGO_SUBDIR").as_deref(),
+            Some("workspace")
+        );
         assert_eq!(env_of(&drv, "TD_CARGO_PACKAGE").as_deref(), Some("ripgrep"));
 
         // WITHOUT the native-link vars: none of those six are emitted.
         let (_p, _f, drv0, _s) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
-        assert!(env_of(&drv0, "TD_RUST_STORE_INTERP").is_none(), "no interp in the drv env by default");
-        assert!(env_of(&drv0, "TD_RUST_STORE_RPATH").is_none(), "no rpath by default");
-        assert!(env_of(&drv0, "TD_RUST_STORE_BDIR").is_none(), "no bdir by default");
-        assert!(env_of(&drv0, "TD_RUST_STORE_CC").is_none(), "no cc by default");
-        assert!(env_of(&drv0, "TD_RUST_STORE_CXX").is_none(), "no cxx by default");
-        assert!(env_of(&drv0, "TD_RUST_STORE_INCLUDE").is_none(), "no include by default");
+        assert!(
+            env_of(&drv0, "TD_RUST_STORE_INTERP").is_none(),
+            "no interp in the drv env by default"
+        );
+        assert!(
+            env_of(&drv0, "TD_RUST_STORE_RPATH").is_none(),
+            "no rpath by default"
+        );
+        assert!(
+            env_of(&drv0, "TD_RUST_STORE_BDIR").is_none(),
+            "no bdir by default"
+        );
+        assert!(
+            env_of(&drv0, "TD_RUST_STORE_CC").is_none(),
+            "no cc by default"
+        );
+        assert!(
+            env_of(&drv0, "TD_RUST_STORE_CXX").is_none(),
+            "no cxx by default"
+        );
+        assert!(
+            env_of(&drv0, "TD_RUST_STORE_INCLUDE").is_none(),
+            "no include by default"
+        );
 
         // A recipe omitting the workspace selectors emits neither env line, so
         // existing Rust derivations retain their prior environment shape.
         let plain_recipe =
             r#"{"name":"ripgrep","version":"14.1.1","buildSystem":"rust","bins":["rg"]}"#;
-        let (_p, _f, plain_drv, _s) =
-            assemble_recipe_drv(plain_recipe, lockp, &dir, None).unwrap();
+        let (_p, _f, plain_drv, _s) = assemble_recipe_drv(plain_recipe, lockp, &dir, None).unwrap();
         assert!(env_of(&plain_drv, "TD_CARGO_SUBDIR").is_none());
         assert!(env_of(&plain_drv, "TD_CARGO_PACKAGE").is_none());
 
         // `cargoSubdir: "."` names the archive root explicitly for the warm
         // plan's benefit and selects nothing, so the derivation is exactly the
         // plain shape above.
-        let root_recipe =
-            r#"{"name":"tn","version":"0.1.0","buildSystem":"rust","bins":["tn"],"cargoSubdir":"."}"#;
-        let (_p, _f, root_drv, _s) =
-            assemble_recipe_drv(root_recipe, lockp, &dir, None).unwrap();
+        let root_recipe = r#"{"name":"tn","version":"0.1.0","buildSystem":"rust","bins":["tn"],"cargoSubdir":"."}"#;
+        let (_p, _f, root_drv, _s) = assemble_recipe_drv(root_recipe, lockp, &dir, None).unwrap();
         assert!(env_of(&root_drv, "TD_CARGO_SUBDIR").is_none());
         assert!(env_of(&root_drv, "TD_CARGO_PACKAGE").is_none());
         assert!(env_of(&root_drv, "TD_RUST_STATIC").is_none());
 
         // `staticLink` reaches the runner as one exact flag and nothing else
         // changes: the runner, not the derivation, pins the target for it.
-        let static_recipe =
-            r#"{"name":"tmc","version":"0.1.0","buildSystem":"rust","bins":["tmc"],"cargoSubdir":".","staticLink":true}"#;
+        let static_recipe = r#"{"name":"tmc","version":"0.1.0","buildSystem":"rust","bins":["tmc"],"cargoSubdir":".","staticLink":true}"#;
         let (_p, _f, static_drv, _s) =
             assemble_recipe_drv(static_recipe, lockp, &dir, None).unwrap();
         assert_eq!(env_of(&static_drv, "TD_RUST_STATIC").as_deref(), Some("1"));
         assert!(env_of(&static_drv, "TD_CARGO_SUBDIR").is_none());
-        let unstatic_recipe =
-            r#"{"name":"tmc","version":"0.1.0","buildSystem":"rust","bins":["tmc"],"staticLink":false}"#;
+        let unstatic_recipe = r#"{"name":"tmc","version":"0.1.0","buildSystem":"rust","bins":["tmc"],"staticLink":false}"#;
         let (_p, _f, unstatic_drv, _s) =
             assemble_recipe_drv(unstatic_recipe, lockp, &dir, None).unwrap();
         assert!(env_of(&unstatic_drv, "TD_RUST_STATIC").is_none());
@@ -17605,10 +19052,7 @@ daemon build START (2/2 active)
 
     #[test]
     fn assemble_recipe_drv_hashes_and_validates_cargo_lock_policy() {
-        let dir = std::env::temp_dir().join(format!(
-            "td-cargo-lock-policy-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("td-cargo-lock-policy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("tool.lock");
@@ -17643,14 +19087,16 @@ daemon build START (2/2 active)
             env_of(&replace_drv, "TD_CARGO_LOCK_POLICY").as_deref(),
             Some("replace")
         );
-        assert_ne!(verify_path, replace_path, "lock policy must change the derivation");
+        assert_ne!(
+            verify_path, replace_path,
+            "lock policy must change the derivation"
+        );
 
         let commit = "0123456789abcdef0123456789abcdef01234567";
         let with_git = format!(
             r#"{{"name":"tool","version":"1","buildSystem":"rust","sourceInput":"tool-source","bins":["tool"],"cargoLock":"recipes/locks/tool/Cargo.lock","cargoGitSources":[{{"source":"git+https://example.invalid/tool?rev={commit}#{commit}","input":"tool-git-source","packages":[{{"name":"git-tool","version":"1.2.3","path":"crate"}}]}}]}}"#
         );
-        let (_, _, git_drv, _) =
-            assemble_recipe_drv(&with_git, lockp, &dir, Some(vendor)).unwrap();
+        let (_, _, git_drv, _) = assemble_recipe_drv(&with_git, lockp, &dir, Some(vendor)).unwrap();
         let git_env = env_of(&git_drv, "TD_CARGO_GIT_SOURCES")
             .expect("Cargo Git declarations must enter the runner environment");
         let parsed_git_env = build::parse_cargo_git_sources(
@@ -17676,9 +19122,7 @@ daemon build START (2/2 active)
         );
         assert_eq!(
             env_of(&patch_drv, "TD_RUST_PROTOC").as_deref(),
-            Some(
-                "/td/store/pppppppppppppppppppppppppppppppp-protobuf-x86-64/bin/protoc"
-            )
+            Some("/td/store/pppppppppppppppppppppppppppppppp-protobuf-x86-64/bin/protoc")
         );
 
         let plain = r#"{"name":"tool","version":"1","buildSystem":"rust","sourceInput":"tool-source","bins":["tool"]}"#;
@@ -17754,12 +19198,21 @@ daemon build START (2/2 active)
         let binutils = "/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-binutils-x86-64-self";
         let glibc = "/td/store/llllllllllllllllllllllllllllllll-glibc-x86-64";
         let entries = vec![
-            mk("uutils-source", "/td/store/ssssssssssssssssssssssssssssssss-uutils-source"),
-            mk("rust-toolchain", "/td/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-rust-toolchain"),
+            mk(
+                "uutils-source",
+                "/td/store/ssssssssssssssssssssssssssssssss-uutils-source",
+            ),
+            mk(
+                "rust-toolchain",
+                "/td/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-rust-toolchain",
+            ),
             mk("gcc-x86-64-self", gcc),
             mk("binutils-x86-64-self", binutils),
             mk("glibc-x86-64", glibc),
-            mk("busybox-x86-64", "/td/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-busybox-x86-64"),
+            mk(
+                "busybox-x86-64",
+                "/td/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-busybox-x86-64",
+            ),
         ];
         let d = derive_native_rust_link_env(&entries).expect("all three inputs present");
         let gp = format!("{glibc}/{}", toolchain_x86_64::GLIBC_X86_64_STAGE);
@@ -17787,7 +19240,10 @@ daemon build START (2/2 active)
         let ok = lock::parse("a /td/store/pa\nb /td/store/pb\n", "").unwrap();
         let none = std::collections::BTreeSet::new();
         let map = input_map_json(&ok, &none).expect("unique names build a map");
-        assert_eq!(map.to_json_string(), r#"{"a":"/td/store/pa","b":"/td/store/pb"}"#);
+        assert_eq!(
+            map.to_json_string(),
+            r#"{"a":"/td/store/pa","b":"/td/store/pb"}"#
+        );
         // A duplicate input name is ambiguous for {in:NAME} resolution and would emit
         // duplicate JSON keys the parser rejects — caught here with a clear message.
         let dup = lock::parse("a /td/store/pa\na /td/store/pb\n", "").unwrap();
@@ -17812,7 +19268,9 @@ daemon build START (2/2 active)
             r#"{"gcc":"/td/store/pg"}"#
         );
         assert_eq!(
-            payload_map_json(&entries, &payload).unwrap().to_json_string(),
+            payload_map_json(&entries, &payload)
+                .unwrap()
+                .to_json_string(),
             r#"{"firefox":"/td/store/pf"}"#
         );
     }
@@ -17849,44 +19307,37 @@ daemon build START (2/2 active)
     #[test]
     fn a_payload_may_not_also_be_a_tool_and_may_not_resolve_to_nothing() {
         let entries = lock::parse("gcc /td/store/pg\nfirefox /td/store/pf\n", "").unwrap();
-        let both = json::parse(
-            r#"{"inputs":["gcc","firefox"],"payloadInputs":["firefox"]}"#,
-        )
-        .unwrap();
+        let both =
+            json::parse(r#"{"inputs":["gcc","firefox"],"payloadInputs":["firefox"]}"#).unwrap();
         let err =
             payload_names(&both, &entries, None, false).expect_err("both channels must be refused");
-        assert!(err.contains("both the DATA channel and `inputs'"), "got: {err}");
+        assert!(
+            err.contains("both the DATA channel and `inputs'"),
+            "got: {err}"
+        );
         // ...and through nativeInputs, which is the same channel by another name.
-        let native = json::parse(
-            r#"{"nativeInputs":["firefox"],"payloadInputs":["firefox"]}"#,
-        )
-        .unwrap();
+        let native =
+            json::parse(r#"{"nativeInputs":["firefox"],"payloadInputs":["firefox"]}"#).unwrap();
         let err = payload_names(&native, &entries, None, false).expect_err("nativeInputs too");
         assert!(err.contains("`nativeInputs'"), "got: {err}");
         // ...and through sourceInput, which reaches the build as TD_SRC.
-        let src = json::parse(
-            r#"{"sourceInput":"firefox","payloadInputs":["firefox"]}"#,
-        )
-        .unwrap();
+        let src = json::parse(r#"{"sourceInput":"firefox","payloadInputs":["firefox"]}"#).unwrap();
         let err = payload_names(&src, &entries, None, false).expect_err("sourceInput too");
         assert!(err.contains("`sourceInput'"), "got: {err}");
         // A payload nothing resolves would read as enforcement and be none.
         let ghost = json::parse(r#"{"payloadInputs":["nowhere"]}"#).unwrap();
-        let err = payload_names(&ghost, &entries, None, false)
-            .expect_err("an unresolved payload");
+        let err = payload_names(&ghost, &entries, None, false).expect_err("an unresolved payload");
         assert!(err.contains("no lock entry resolves"), "got: {err}");
         // A MALFORMED declaration is refused rather than read as an absent one. This
         // is the sharpest of the lot: `"payloadInputs":"firefox"` through a filtering
         // read yields NO payloads, so the name stays in TD_INPUT_MAP, mounts
         // executable, and sails past the duplicate-channel refusal above.
-        let scalar =
-            json::parse(r#"{"inputs":["firefox"],"payloadInputs":"firefox"}"#).unwrap();
+        let scalar = json::parse(r#"{"inputs":["firefox"],"payloadInputs":"firefox"}"#).unwrap();
         let err =
             payload_names(&scalar, &entries, None, false).expect_err("a string is not a list");
         assert!(err.contains("must be an ARRAY"), "got: {err}");
         let mixed = json::parse(r#"{"payloadInputs":["firefox",7]}"#).unwrap();
-        let err = payload_names(&mixed, &entries, None, false)
-            .expect_err("a non-string element");
+        let err = payload_names(&mixed, &entries, None, false).expect_err("a non-string element");
         assert!(err.contains("non-string entry"), "got: {err}");
         // The ordinary case still passes, or every assertion above is vacuous.
         let fine = json::parse(r#"{"inputs":["gcc"],"payloadInputs":["firefox"]}"#).unwrap();
@@ -17900,10 +19351,7 @@ daemon build START (2/2 active)
             "seed-source",
         )
         .unwrap();
-        let seed = json::parse(
-            r#"{"sourceInput":"archive","payloadInputs":["runtime"]}"#,
-        )
-        .unwrap();
+        let seed = json::parse(r#"{"sourceInput":"archive","payloadInputs":["runtime"]}"#).unwrap();
         assert_eq!(
             payload_names(&seed, &entries, Some("seed-source"), true).unwrap(),
             ["runtime".to_string(), "seed-source".to_string()].into(),
@@ -17941,10 +19389,8 @@ daemon build START (2/2 active)
 
     #[test]
     fn confined_repo_lock_refuses_symlinks_and_nonregular_nodes() {
-        let root = std::env::temp_dir().join(format!(
-            "td-confined-cargo-lock-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("td-confined-cargo-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("locks")).unwrap();
         std::fs::write(root.join("locks/Cargo.lock"), "version = 4\n").unwrap();
@@ -18000,7 +19446,10 @@ daemon build START (2/2 active)
 
         let (_path, text) =
             read_confined_repo_descriptor(directory, &root, "locks/Cargo.lock").unwrap();
-        assert_eq!(text, "original\n", "a renamed parent redirected the lock read");
+        assert_eq!(
+            text, "original\n",
+            "a renamed parent redirected the lock read"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -18010,8 +19459,7 @@ daemon build START (2/2 active)
     #[test]
     fn stage_verified_vendor_gates_on_the_committed_checksums() {
         let dir = std::env::temp_dir().join(format!("td-vendorverify-{}", std::process::id()));
-        let staged =
-            std::env::temp_dir().join(format!("td-vendorstaged-{}", std::process::id()));
+        let staged = std::env::temp_dir().join(format!("td-vendorstaged-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let write_crate = |nv: &str, bytes: &[u8]| {
@@ -18031,9 +19479,7 @@ daemon build START (2/2 active)
         let _ = std::fs::remove_dir_all(&absent);
         let error = stage_verified_vendor(&absent, &lock, &staged, false).unwrap_err();
         assert!(
-            error.contains(
-                "\n  cargo run --release --manifest-path builder/Cargo.toml -- check\n"
-            ),
+            error.contains("\n  cargo run --release --manifest-path builder/Cargo.toml -- check\n"),
             "a source checkout must receive a directly runnable provisioning command: {error}"
         );
         assert!(
@@ -18046,7 +19492,10 @@ daemon build START (2/2 active)
         );
         // All present + matching (root without a checksum is excluded ⇒ 2 verified), and
         // exactly the verified crates land in the fresh private staged tree.
-        assert_eq!(stage_verified_vendor(&dir, &lock, &staged, false).unwrap(), 2);
+        assert_eq!(
+            stage_verified_vendor(&dir, &lock, &staged, false).unwrap(),
+            2
+        );
         assert!(staged.join("foo-1.2.3.crate").is_file());
         assert!(staged.join("bar-0.1.0.crate").is_file());
         assert_eq!(
@@ -18055,7 +19504,9 @@ daemon build START (2/2 active)
             "the exact committed lock bytes join the content-addressed vendor input"
         );
         // A committed crate absent from the vendor dir fails closed.
-        let missing = format!("{lock}\n[[package]]\nname = \"baz\"\nversion = \"2.0.0\"\nchecksum = \"{foo}\"\n");
+        let missing = format!(
+            "{lock}\n[[package]]\nname = \"baz\"\nversion = \"2.0.0\"\nchecksum = \"{foo}\"\n"
+        );
         assert!(stage_verified_vendor(&dir, &missing, &staged, false).is_err());
         // A checksum mismatch on a PINNED crate (bar re-pinned to foo's sha) fails closed
         // at the per-crate hash. Pin the full dir set (foo+bar) so set-equality passes and
@@ -18110,9 +19561,7 @@ daemon build START (2/2 active)
         let tight_git = "version = 4\n\n[[package]]\nname=\"bar\"\nversion=\"0.1.0\"\nsource=\"git+https://example.com/bar#deadbeef\"\n";
         assert!(build::validate_cargo_lock_sources(tight_git, &[]).is_err());
         let commit = "0123456789abcdef0123456789abcdef01234567";
-        let exact_source = format!(
-            "git+https://example.com/bar?rev={commit}#{commit}"
-        );
+        let exact_source = format!("git+https://example.com/bar?rev={commit}#{commit}");
         let declared_json = json::parse(&format!(
             r#"[{{"source":"{exact_source}","input":"bar-source","packages":[{{"name":"bar","version":"0.1.0","path":"."}}]}}]"#
         ))
@@ -18125,7 +19574,10 @@ daemon build START (2/2 active)
         let wrong_version = exact_lock.replace("0.1.0", "0.2.0");
         assert!(build::validate_cargo_lock_sources(&wrong_version, &declared).is_err());
         // The actual committed uutils lock (verbatim upstream) must pass the gate.
-        let real = concat!(env!("CARGO_MANIFEST_DIR"), "/../recipes/locks/uutils/Cargo.lock");
+        let real = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../recipes/locks/uutils/Cargo.lock"
+        );
         if let Ok(text) = std::fs::read_to_string(real) {
             assert!(
                 build::validate_cargo_lock_sources(&text, &[]).is_ok(),
@@ -18176,7 +19628,10 @@ daemon build START (2/2 active)
         .unwrap();
         let recipe = r#"{"name":"gcc-14","version":"14.3.0","buildSystem":"mesboot","sourceInput":"gcc-14-source","nativeInputs":["binutils-mesboot"],"steps":[]}"#;
         let err = assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, None).unwrap_err();
-        assert!(err.contains("lock has no `gcc-14-source' entry"), "unexpected error: {err}");
+        assert!(
+            err.contains("lock has no `gcc-14-source' entry"),
+            "unexpected error: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -18202,7 +19657,11 @@ daemon build START (2/2 active)
         // glibc: a leaf with no store references. gcc: references glibc (its 32-char hash is
         // literally in the bytes, the daemon's own reference criterion). A `.lock` aux file
         // shares glibc's hash and MUST be skipped by the candidate index.
-        std::fs::write(od(&format!("{glibc_h}-glibc-2.41")), b"a leaf, no store references here\n").unwrap();
+        std::fs::write(
+            od(&format!("{glibc_h}-glibc-2.41")),
+            b"a leaf, no store references here\n",
+        )
+        .unwrap();
         std::fs::write(
             od(&format!("{gcc_h}-gcc-14")),
             format!("gcc links libc at /gnu/store/{glibc_h}-glibc-2.41/lib\n").as_bytes(),
@@ -18213,29 +19672,54 @@ daemon build START (2/2 active)
         let dirs = [dir.to_string_lossy().into_owned()];
         let (candidates, on_disk) = scan_candidate_index(&dirs, "/gnu/store").unwrap();
         // Two candidates (the .lock aux file is skipped), keyed by CANONICAL path.
-        assert_eq!(candidates.len(), 2, "candidates (lock aux file skipped): {candidates:?}");
+        assert_eq!(
+            candidates.len(),
+            2,
+            "candidates (lock aux file skipped): {candidates:?}"
+        );
         assert!(candidates.contains(&canon(&format!("{glibc_h}-glibc-2.41"))));
         assert!(candidates.contains(&canon(&format!("{gcc_h}-gcc-14"))));
         // Canonical path maps to the ON-DISK bytes (here dir == canonical prefix's stand-in).
-        assert_eq!(on_disk[&canon(&format!("{glibc_h}-glibc-2.41"))], od(&format!("{glibc_h}-glibc-2.41")));
+        assert_eq!(
+            on_disk[&canon(&format!("{glibc_h}-glibc-2.41"))],
+            od(&format!("{glibc_h}-glibc-2.41"))
+        );
 
         let mut scanner = scan::Scanner::new(&candidates).unwrap();
         let empty: HashMap<String, Vec<String>> = HashMap::new();
 
         // Pure content-scan from the gcc root: BFS finds glibc via gcc's bytes.
-        let cl = scan_closure_hybrid(&mut scanner, &on_disk, &empty, &[canon(&format!("{gcc_h}-gcc-14"))]).unwrap();
+        let cl = scan_closure_hybrid(
+            &mut scanner,
+            &on_disk,
+            &empty,
+            &[canon(&format!("{gcc_h}-gcc-14"))],
+        )
+        .unwrap();
         let cl: Vec<String> = cl.into_iter().collect();
         assert_eq!(
             cl,
-            vec![canon(&format!("{glibc_h}-glibc-2.41")), canon(&format!("{gcc_h}-gcc-14"))],
+            vec![
+                canon(&format!("{glibc_h}-glibc-2.41")),
+                canon(&format!("{gcc_h}-gcc-14"))
+            ],
             "content-scan closure of gcc must be {{gcc, glibc}}"
         );
 
         // Hybrid: a td-built dep whose bytes live OUTSIDE the scanned dir. Its refs come from
         // the extra-db map (td.db), then that ref (gcc) is content-scanned into glibc.
         let mut extra: HashMap<String, Vec<String>> = HashMap::new();
-        extra.insert(canon(&format!("{tddep_h}-mylib-1")), vec![canon(&format!("{gcc_h}-gcc-14"))]);
-        let hy = scan_closure_hybrid(&mut scanner, &on_disk, &extra, &[canon(&format!("{tddep_h}-mylib-1"))]).unwrap();
+        extra.insert(
+            canon(&format!("{tddep_h}-mylib-1")),
+            vec![canon(&format!("{gcc_h}-gcc-14"))],
+        );
+        let hy = scan_closure_hybrid(
+            &mut scanner,
+            &on_disk,
+            &extra,
+            &[canon(&format!("{tddep_h}-mylib-1"))],
+        )
+        .unwrap();
         let hy: Vec<String> = hy.into_iter().collect();
         assert_eq!(
             hy,
@@ -18278,19 +19762,28 @@ daemon build START (2/2 active)
         // Rung 1 (prefix /gnu/store): MISS — content-scans gcc, populates the memo.
         let (cand1, od1) = scan_candidate_index(&dirs, "/gnu/store").unwrap();
         let mut sc1 = scan::Scanner::new(&cand1).unwrap();
-        let c1 = scan_closure_hybrid(&mut sc1, &od1, &empty, &[format!("/gnu/store/{gcc_h}-gcc-14")])
-            .unwrap();
+        let c1 = scan_closure_hybrid(
+            &mut sc1,
+            &od1,
+            &empty,
+            &[format!("/gnu/store/{gcc_h}-gcc-14")],
+        )
+        .unwrap();
         assert!(c1.contains(&format!("/gnu/store/{glibc_h}-glibc-2.41")));
 
         // Rung 2 (prefix /td/store): SAME bytes ⇒ memo HIT, must resolve to /td/store, not the
         // stale /gnu/store canonical from rung 1.
         let (cand2, od2) = scan_candidate_index(&dirs, "/td/store").unwrap();
         let mut sc2 = scan::Scanner::new(&cand2).unwrap();
-        let c2: Vec<String> =
-            scan_closure_hybrid(&mut sc2, &od2, &empty, &[format!("/td/store/{gcc_h}-gcc-14")])
-                .unwrap()
-                .into_iter()
-                .collect();
+        let c2: Vec<String> = scan_closure_hybrid(
+            &mut sc2,
+            &od2,
+            &empty,
+            &[format!("/td/store/{gcc_h}-gcc-14")],
+        )
+        .unwrap()
+        .into_iter()
+        .collect();
         assert_eq!(
             c2,
             vec![
@@ -18387,16 +19880,31 @@ daemon build START (2/2 active)
         let subject_c = canon(&format!("{subject_h}-subject-1.0"));
         let glibc_c = canon(&format!("{glibc_h}-glibc-2.41"));
         assert!(candidates.contains(&subject_c) && candidates.contains(&glibc_c));
-        assert_eq!(on_disk[&subject_c], newstore.join(format!("{subject_h}-subject-1.0")).to_string_lossy());
-        assert_eq!(on_disk[&glibc_c], seed.join(format!("{glibc_h}-glibc-2.41")).to_string_lossy());
+        assert_eq!(
+            on_disk[&subject_c],
+            newstore
+                .join(format!("{subject_h}-subject-1.0"))
+                .to_string_lossy()
+        );
+        assert_eq!(
+            on_disk[&glibc_c],
+            seed.join(format!("{glibc_h}-glibc-2.41")).to_string_lossy()
+        );
 
         let mut scanner = scan::Scanner::new(&candidates).unwrap();
         let empty: HashMap<String, Vec<String>> = HashMap::new();
         // Closing from the subject root pulls glibc out of the OTHER store dir, by hash.
         let mut cl: Vec<String> =
-            scan_closure_hybrid(&mut scanner, &on_disk, &empty, &[subject_c.clone()]).unwrap().into_iter().collect();
+            scan_closure_hybrid(&mut scanner, &on_disk, &empty, &[subject_c.clone()])
+                .unwrap()
+                .into_iter()
+                .collect();
         cl.sort();
-        assert_eq!(cl, vec![glibc_c, subject_c], "multi-store closure must span both stores");
+        assert_eq!(
+            cl,
+            vec![glibc_c, subject_c],
+            "multi-store closure must span both stores"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -18422,10 +19930,24 @@ daemon build START (2/2 active)
         std::fs::create_dir_all(&dir).unwrap();
         let wr = |name: &str, bytes: String| std::fs::write(dir.join(name), bytes).unwrap();
         // A captured-seed staging dir mixes foreign-prefix entries and copied-in td-built ones.
-        wr(&format!("{cu_h}-coreutils-9.1"), format!("expr RPATHs /gnu/store/{gmp_h}-gmp-6.3.0/lib\n"));
-        wr(&format!("{gmp_h}-gmp-6.3.0"), "a guix-built leaf\n".to_string());
-        wr(&format!("{tc_h}-gcc-toolchain-tdstore"), format!("wrapper: -Wl,--dynamic-linker /td/store/{gl_h}-glibc-2.41/lib/ld-linux.so.2\n"));
-        wr(&format!("{gl_h}-glibc-2.41"), "a td-built leaf\n".to_string());
+        wr(
+            &format!("{cu_h}-coreutils-9.1"),
+            format!("expr RPATHs /gnu/store/{gmp_h}-gmp-6.3.0/lib\n"),
+        );
+        wr(
+            &format!("{gmp_h}-gmp-6.3.0"),
+            "a guix-built leaf\n".to_string(),
+        );
+        wr(
+            &format!("{tc_h}-gcc-toolchain-tdstore"),
+            format!(
+                "wrapper: -Wl,--dynamic-linker /td/store/{gl_h}-glibc-2.41/lib/ld-linux.so.2\n"
+            ),
+        );
+        wr(
+            &format!("{gl_h}-glibc-2.41"),
+            "a td-built leaf\n".to_string(),
+        );
         let dirs = [dir.to_string_lossy().into_owned()];
         // The gate's roots: guix seed entries at /gnu/store + the td-built toolchain pair
         // at /td/store (the substituted lock lines).
@@ -18439,7 +19961,10 @@ daemon build START (2/2 active)
         let mut overrides: HashMap<String, String> = HashMap::new();
         overrides.insert(gl_h.to_string(), gl_c.clone()); // a typed recipe-output-db registration
         for r in &roots {
-            overrides.insert(store::hash_from_store_path(r).unwrap().to_string(), r.clone());
+            overrides.insert(
+                store::hash_from_store_path(r).unwrap().to_string(),
+                r.clone(),
+            );
         }
         let (mut candidates, mut on_disk) = scan_candidate_index(&dirs, "/gnu/store").unwrap();
         recanonicalize_candidates(&mut candidates, &mut on_disk, &overrides);
@@ -18460,7 +19985,11 @@ daemon build START (2/2 active)
             "td-built glibc duplicated under /gnu/store: {cl:?}"
         );
         // All four members, each at exactly its true canonical.
-        assert_eq!(cl.len(), 4, "closure must be exactly the 4 true-canonical members: {cl:?}");
+        assert_eq!(
+            cl.len(),
+            4,
+            "closure must be exactly the 4 true-canonical members: {cl:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

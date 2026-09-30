@@ -38,17 +38,50 @@ pub(crate) const MAIN_RS: &str = include_str!("../../../td-firstboot/src/main.rs
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
-    ("primary_profile", include_str!("../../../td-firstboot/src/primary_profile.rs")),
-    ("ssh_policy", include_str!("../../../td-firstboot/src/ssh_policy.rs")),
-    ("primary_home", include_str!("../../../td-firstboot/src/primary_home.rs")),
-    ("hostname", include_str!("../../../td-firstboot/src/hostname.rs")),
-    ("fido_cbor", include_str!("../../../td-secret/src/fido_cbor.rs")),
-    ("fido_ctap", include_str!("../../../td-secret/src/fido_ctap.rs")),
-    ("fido_enroll", include_str!("../../../td-secret/src/fido_enroll.rs")),
-    ("fido_hid", include_str!("../../../td-secret/src/fido_hid.rs")),
-    ("fido_metadata", include_str!("../../../td-secret/src/fido_metadata.rs")),
-    ("application_runtime", include_str!("../../../td-firstboot/src/application_runtime.rs")),
-    ("application_state", include_str!("../../../td-firstboot/src/application_state.rs")),
+    (
+        "primary_profile",
+        include_str!("../../../td-firstboot/src/primary_profile.rs"),
+    ),
+    (
+        "ssh_policy",
+        include_str!("../../../td-firstboot/src/ssh_policy.rs"),
+    ),
+    (
+        "primary_home",
+        include_str!("../../../td-firstboot/src/primary_home.rs"),
+    ),
+    (
+        "hostname",
+        include_str!("../../../td-firstboot/src/hostname.rs"),
+    ),
+    (
+        "fido_cbor",
+        include_str!("../../../td-secret/src/fido_cbor.rs"),
+    ),
+    (
+        "fido_ctap",
+        include_str!("../../../td-secret/src/fido_ctap.rs"),
+    ),
+    (
+        "fido_enroll",
+        include_str!("../../../td-secret/src/fido_enroll.rs"),
+    ),
+    (
+        "fido_hid",
+        include_str!("../../../td-secret/src/fido_hid.rs"),
+    ),
+    (
+        "fido_metadata",
+        include_str!("../../../td-secret/src/fido_metadata.rs"),
+    ),
+    (
+        "application_runtime",
+        include_str!("../../../td-firstboot/src/application_runtime.rs"),
+    ),
+    (
+        "application_state",
+        include_str!("../../../td-firstboot/src/application_state.rs"),
+    ),
     (
         "credentials",
         include_str!("../../../td-firstboot/src/credentials.rs"),
@@ -63,7 +96,10 @@ const MODULES: &[(&str, &str)] = &[
         "machineid",
         include_str!("../../../td-firstboot/src/machineid.rs"),
     ),
-    ("mounts", include_str!("../../../td-firstboot/src/mounts.rs")),
+    (
+        "mounts",
+        include_str!("../../../td-firstboot/src/mounts.rs"),
+    ),
     (
         "principals",
         include_str!("../../../td-firstboot/src/principals.rs"),
@@ -152,7 +188,9 @@ pub fn recipe() -> Recipe {
     steps.push(Step::MkDir {
         path: "{root}/eh".into(),
     });
-    steps.push(Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
+    steps.push(
+        Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
+    );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
     steps.push(
         target_rustc(
@@ -363,7 +401,10 @@ mod tests {
         }
         let mine = rustc_argv("td-firstboot");
         let proven = rustc_argv("td-util");
-        assert!(!mine.is_empty() && !proven.is_empty(), "no rustc step found");
+        assert!(
+            !mine.is_empty() && !proven.is_empty(),
+            "no rustc step found"
+        );
         // The ONLY differences may be the output path and the crate root; every
         // other argument is toolchain/link configuration and must match.
         let normalize = |argv: Vec<String>| -> Vec<String> {

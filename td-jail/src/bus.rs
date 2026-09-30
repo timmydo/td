@@ -114,11 +114,7 @@ pub struct Registration<'a> {
 /// way to enforce one — the broker is the component that decides whether a
 /// connection may take a name, and this is how the permission file reaches
 /// it.
-pub fn register(
-    socket: &Path,
-    uid: u32,
-    registration: Registration<'_>,
-) -> io::Result<String> {
+pub fn register(socket: &Path, uid: u32, registration: Registration<'_>) -> io::Result<String> {
     let Registration {
         instance,
         app_id,
@@ -131,13 +127,7 @@ pub fn register(
     body.string(app_id)?;
     body.array_of_strings(services)?;
     body.array_of_strings(owned)?;
-    let reply = connection.call(
-        JAIL_PATH,
-        JAIL_INTERFACE,
-        "Register",
-        "ssasas",
-        &body.bytes,
-    )?;
+    let reply = connection.call(JAIL_PATH, JAIL_INTERFACE, "Register", "ssasas", &body.bytes)?;
     reply.one_string()
 }
 
@@ -243,11 +233,7 @@ pub(crate) fn require_accepting_endpoint(
     }
 }
 
-fn connect_endpoint_within(
-    socket: &Path,
-    budget: Duration,
-    what: &str,
-) -> io::Result<UnixStream> {
+fn connect_endpoint_within(socket: &Path, budget: Duration, what: &str) -> io::Result<UnixStream> {
     let path = socket.to_path_buf();
     match within(budget, move || UnixStream::connect(&path)) {
         Some(Ok(stream)) => Ok(stream),
@@ -664,9 +650,9 @@ fn read_message(stream: &mut impl Read) -> io::Result<Reply> {
     // lines away and a future change to `rest` would make these live. They are
     // the one kind of branch this file does not claim a test for.
     let mut fields = Decoder {
-        bytes: tail.get(..fields_length as usize).ok_or_else(|| {
-            io::Error::other("the bus announced more header fields than it sent")
-        })?,
+        bytes: tail
+            .get(..fields_length as usize)
+            .ok_or_else(|| io::Error::other("the bus announced more header fields than it sent"))?,
         at: 0,
         little,
     };
@@ -1022,10 +1008,14 @@ fn u32_at(bytes: &[u8], at: usize, little: bool) -> io::Result<u32> {
     })
 }
 
-
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::unwrap_used)]
+    #![allow(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unwrap_used
+    )]
 
     use super::*;
 
@@ -1068,14 +1058,18 @@ mod tests {
         out
     }
 
-
     /// A reply frame a broker would send, built with this module's own encoder.
     ///
     /// Only usable to check the CLIENT's side of an exchange, since a bug
     /// shared by both would cancel out. What it is for is the plumbing the
     /// recordings cannot reach: connect, handshake, `Hello`, serial
     /// allocation, and the two public functions end to end.
-    fn reply_frame(kind: u8, reply_serial: u32, error: Option<&str>, text: Option<&str>) -> Vec<u8> {
+    fn reply_frame(
+        kind: u8,
+        reply_serial: u32,
+        error: Option<&str>,
+        text: Option<&str>,
+    ) -> Vec<u8> {
         reply_frame_from(BUS_NAME, kind, reply_serial, error, text)
     }
 
@@ -1149,7 +1143,11 @@ mod tests {
 
     fn fake_broker(
         replies: Vec<Vec<u8>>,
-    ) -> (std::path::PathBuf, std::thread::JoinHandle<Vec<Vec<u8>>>, std::path::PathBuf) {
+    ) -> (
+        std::path::PathBuf,
+        std::thread::JoinHandle<Vec<Vec<u8>>>,
+        std::path::PathBuf,
+    ) {
         use std::os::unix::net::UnixListener;
         let dir = scratch();
         let socket = dir.join("bus");
@@ -1210,7 +1208,12 @@ mod tests {
     #[test]
     fn a_registration_runs_from_connect_to_token() {
         let hello = reply_frame(METHOD_RETURN, 1, None, Some(":1.9"));
-        let token = reply_frame(METHOD_RETURN, 2, None, Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0"));
+        let token = reply_frame(
+            METHOD_RETURN,
+            2,
+            None,
+            Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0"),
+        );
         let (socket, broker, dir) = fake_broker(vec![hello, token]);
 
         let got = register(
@@ -1235,7 +1238,8 @@ mod tests {
         let mut body = Encoder::default();
         body.string("firefox-0011223344556677").unwrap();
         body.string("firefox").unwrap();
-        body.array_of_strings(&["ca.desrt.dconf".to_string()]).unwrap();
+        body.array_of_strings(&["ca.desrt.dconf".to_string()])
+            .unwrap();
         // DIFFERENT lists, which is what makes this assertion say the grant
         // was sent. Two identical lists would be satisfied by a `register`
         // that encoded its services twice and never looked at its grant.
@@ -1275,11 +1279,7 @@ mod tests {
         );
         let (socket, broker, dir) = fake_broker(vec![hello, refusal]);
 
-        let got = register(
-            &socket,
-            1000,
-            nothing_declared("firefox-1", "firefox"),
-        );
+        let got = register(&socket, 1000, nothing_declared("firefox-1", "firefox"));
         let _ = broker.join();
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -1315,11 +1315,7 @@ mod tests {
             }
         });
 
-        let error = register(
-            &socket,
-            1000,
-            nothing_declared("firefox-1", "firefox"),
-        ).unwrap_err();
+        let error = register(&socket, 1000, nothing_declared("firefox-1", "firefox")).unwrap_err();
         let _ = handle.join();
         let _ = std::fs::remove_dir_all(&dir);
         let text = error.to_string();
@@ -1331,11 +1327,7 @@ mod tests {
     #[test]
     fn an_absent_broker_is_named() {
         let missing = std::env::temp_dir().join("td-jail-bus-test-nothing-is-bound-here/bus");
-        let error = register(
-            &missing,
-            1000,
-            nothing_declared("firefox-1", "firefox"),
-        )
+        let error = register(&missing, 1000, nothing_declared("firefox-1", "firefox"))
             .unwrap_err()
             .to_string();
         assert!(error.contains("connect to the session bus"), "{error}");
@@ -1351,21 +1343,14 @@ mod tests {
         let dir = scratch();
         let socket = dir.join("native");
         let listener = UnixListener::bind(&socket).unwrap();
-        require_accepting_endpoint(
-            &socket,
-            Duration::from_secs(1),
-            "test audio authority",
-        )
-        .unwrap();
+        require_accepting_endpoint(&socket, Duration::from_secs(1), "test audio authority")
+            .unwrap();
         drop(listener);
 
-        let error = require_accepting_endpoint(
-            &socket,
-            Duration::from_secs(1),
-            "test audio authority",
-        )
-        .unwrap_err()
-        .to_string();
+        let error =
+            require_accepting_endpoint(&socket, Duration::from_secs(1), "test audio authority")
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("test audio authority"), "{error}");
         assert!(error.contains("refused"), "{error}");
         let _ = std::fs::remove_dir_all(dir);
@@ -1383,7 +1368,10 @@ mod tests {
         })
         .unwrap_err()
         .to_string();
-        assert!(error.contains("bounded authority-connect helper"), "{error}");
+        assert!(
+            error.contains("bounded authority-connect helper"),
+            "{error}"
+        );
         assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 
@@ -1437,11 +1425,7 @@ mod tests {
         let hello = reply_frame(METHOD_RETURN, 1, None, Some(":1.9"));
         let empty = reply_frame(METHOD_RETURN, 2, None, None);
         let (socket, broker, dir) = fake_broker(vec![hello, empty]);
-        let error = register(
-            &socket,
-            1000,
-            nothing_declared("firefox-1", "firefox"),
-        ).unwrap_err();
+        let error = register(&socket, 1000, nothing_declared("firefox-1", "firefox")).unwrap_err();
         let _ = broker.join();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
@@ -1478,19 +1462,49 @@ mod tests {
     #[test]
     fn a_reply_in_the_other_byte_order_decodes() {
         let frame: Vec<u8> = vec![
-            b'B', METHOD_RETURN, 0, PROTOCOL_VERSION, // 0..4
-            0, 0, 0, 7,  // body length, big-endian
-            0, 0, 0, 1,  // serial
-            0, 0, 0, 15, // field array length
+            b'B',
+            METHOD_RETURN,
+            0,
+            PROTOCOL_VERSION, // 0..4
+            0,
+            0,
+            0,
+            7, // body length, big-endian
+            0,
+            0,
+            0,
+            1, // serial
+            0,
+            0,
+            0,
+            15, // field array length
             // REPLY_SERIAL: code, signature "u", then the value four-aligned.
-            FIELD_REPLY_SERIAL, 1, b'u', 0, // 16..20
-            0, 0, 0, 1,                     // 20..24
+            FIELD_REPLY_SERIAL,
+            1,
+            b'u',
+            0, // 16..20
+            0,
+            0,
+            0,
+            1, // 20..24
             // SIGNATURE: code, signature "g", then the signature "s". The
             // field array ends at 31, which is 15 bytes of tail.
-            FIELD_SIGNATURE, 1, b'g', 0, 1, b's', 0, // 24..31
+            FIELD_SIGNATURE,
+            1,
+            b'g',
+            0,
+            1,
+            b's',
+            0, // 24..31
             0, // 31: one byte of padding takes the body to 32, eight-aligned
             // The body: one string, whose length is big-endian too.
-            0, 0, 0, 2, b'h', b'i', 0,
+            0,
+            0,
+            0,
+            2,
+            b'h',
+            b'i',
+            0,
         ];
         let reply = read_message(&mut frame.as_slice()).unwrap();
         assert!(!reply.little, "the endianness byte was not read");
@@ -1583,11 +1597,7 @@ mod tests {
         padded.push(0);
         let hello = reply_frame(METHOD_RETURN, 1, None, Some(":1.9"));
         let (socket, broker, dir) = fake_broker(vec![hello, padded]);
-        let error = register(
-            &socket,
-            1000,
-            nothing_declared("firefox-1", "firefox"),
-        ).unwrap_err();
+        let error = register(&socket, 1000, nothing_declared("firefox-1", "firefox")).unwrap_err();
         let _ = broker.join();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
@@ -1604,7 +1614,10 @@ mod tests {
         let error = complete(&socket, 1000, "0f1e2d3c", 4242).unwrap_err();
         let _ = broker.join();
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(error.to_string().contains("expected an empty body"), "{error}");
+        assert!(
+            error.to_string().contains("expected an empty body"),
+            "{error}"
+        );
     }
 
     /// Work that does not finish inside its budget is given up on.
@@ -1631,7 +1644,10 @@ mod tests {
         );
         // And work that DOES finish is not thrown away, which is the half a
         // deadline that always fires would still pass.
-        assert_eq!(within(Duration::from_secs(30), || "promptly"), Some("promptly"));
+        assert_eq!(
+            within(Duration::from_secs(30), || "promptly"),
+            Some("promptly")
+        );
     }
 
     /// And the connect is the work that budget is spent on.
@@ -1702,7 +1718,11 @@ mod tests {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
             "inline"
         });
-        assert_eq!(answer, Some("inline"), "the work was dropped with the helper");
+        assert_eq!(
+            answer,
+            Some("inline"),
+            "the work was dropped with the helper"
+        );
         assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
 
         // And work that takes LONGER than the budget still completes, because
@@ -1959,15 +1979,14 @@ mod tests {
     #[test]
     fn an_array_of_strings_is_encoded_the_way_a_real_daemon_encodes_it() {
         let server = frames(LISTNAMES, 'S');
-        let reply = server.get(3).expect("the recording holds a ListNames reply");
+        let reply = server
+            .get(3)
+            .expect("the recording holds a ListNames reply");
         // The recording's own header says the body is 0x29 bytes.
         let body = reply.get(reply.len() - 0x29..).unwrap();
         let mut mine = Encoder::default();
-        mine.array_of_strings(&[
-            "org.freedesktop.DBus".to_string(),
-            ":1.7".to_string(),
-        ])
-        .unwrap();
+        mine.array_of_strings(&["org.freedesktop.DBus".to_string(), ":1.7".to_string()])
+            .unwrap();
         assert_eq!(
             mine.bytes, body,
             "this module's array encoding differs from dbus-daemon's"
@@ -1990,9 +2009,7 @@ mod tests {
         register.string("one").unwrap();
         register.string("fixture").unwrap();
         register.array_of_strings(&[]).unwrap();
-        register
-            .array_of_strings(&["a.b".to_string()])
-            .unwrap();
+        register.array_of_strings(&["a.b".to_string()]).unwrap();
         assert_eq!(
             register.bytes,
             [
@@ -2047,9 +2064,12 @@ mod tests {
         // Built here rather than recorded: the corpus holds no refusal, and
         // what this checks is the plumbing from ERROR_NAME to the caller.
         let mut body = Encoder::default();
-        body.string("instance \"one\" is already registered").unwrap();
+        body.string("instance \"one\" is already registered")
+            .unwrap();
         let mut fields = Encoder::default();
-        fields.field(FIELD_ERROR_NAME, "s", "td.Jail1.Error.Refused").unwrap();
+        fields
+            .field(FIELD_ERROR_NAME, "s", "td.Jail1.Error.Refused")
+            .unwrap();
         fields.align(8);
         fields.byte(FIELD_REPLY_SERIAL);
         fields.signature("u").unwrap();
@@ -2139,7 +2159,11 @@ mod tests {
         // And the hex is of the decimal TEXT, which the line above would also
         // satisfy if 1001 happened to encode to itself. It does not, but the
         // canonical example is worth stating once.
-        assert!(auth_line(1000).contains("31303030"), "{:?}", auth_line(1000));
+        assert!(
+            auth_line(1000).contains("31303030"),
+            "{:?}",
+            auth_line(1000)
+        );
     }
 
     /// This client does not negotiate file-descriptor passing.
@@ -2152,7 +2176,10 @@ mod tests {
     /// passing does arrive, this reads as a decision rather than an oversight.
     #[test]
     fn the_handshake_claims_no_descriptor_passing() {
-        let shipped = BUS_SOURCE.split_once("#[cfg(test)]").unwrap_or((BUS_SOURCE, "")).0;
+        let shipped = BUS_SOURCE
+            .split_once("#[cfg(test)]")
+            .unwrap_or((BUS_SOURCE, ""))
+            .0;
         assert!(
             !shipped.contains("NEGOTIATE_UNIX_FD"),
             "this client now negotiates fd passing but still cannot carry one"

@@ -1,41 +1,34 @@
 #[path = "../../../td-firstboot/src/ssh_policy.rs"]
 pub(super) mod ssh_policy;
 use ssh_policy::{
-    OPENSSH_CIPHERS, OPENSSH_KEX_ALGORITHMS, OPENSSH_KEY_ALGORITHMS,
-    SSHD_HOST_KEY, SSHD_SELFTEST_AUTHORIZED_KEYS,
+    OPENSSH_CIPHERS, OPENSSH_KEX_ALGORITHMS, OPENSSH_KEY_ALGORITHMS, SSHD_HOST_KEY,
+    SSHD_SELFTEST_AUTHORIZED_KEYS,
 };
 
 #[cfg(test)]
 use ssh_policy::SSHD_AUTHORIZED_KEYS;
 
 use crate::ladder::{
-    entry_program, post_bootstrap_path, AUTOTEST_CMDLINE_TOKEN,
-    BOOT_FAIL_TARGET_CMDLINE_TOKEN,
+    entry_program, post_bootstrap_path, AUTOTEST_CMDLINE_TOKEN, BOOT_FAIL_TARGET_CMDLINE_TOKEN,
     BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, CODEX_BWRAP_VERSION_OUTPUT, CODEX_RUNTIME_MARKER,
-    CODEX_VERSION_OUTPUT, DEPLOY_INSTALL_CMDLINE_TOKEN,
-    FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN, FIREFOX_AUDIT_CMDLINE_TOKEN,
-    FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN, FIREFOX_INPUT_CMDLINE_TOKEN,
-    FIREFOX_NETWORK_RUNTIME_MARKER, GIT_HTTPS_RUNTIME_MARKER,
-    GIT_HTTPS_TEST_URL, GIT_RUNTIME_MARKER, GREETER_MARKER,
-    KERNEL_AUDIT_CMDLINE_TOKEN, NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST,
-    NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN, PERSIST_WRITE_CMDLINE_TOKEN,
-    POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER, SSHD_MARKER,
+    CODEX_VERSION_OUTPUT, DEPLOY_INSTALL_CMDLINE_TOKEN, FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN,
+    FIREFOX_AUDIT_CMDLINE_TOKEN, FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN,
+    FIREFOX_INPUT_CMDLINE_TOKEN, FIREFOX_NETWORK_RUNTIME_MARKER, GIT_HTTPS_RUNTIME_MARKER,
+    GIT_HTTPS_TEST_URL, GIT_RUNTIME_MARKER, GREETER_MARKER, KERNEL_AUDIT_CMDLINE_TOKEN,
+    NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
+    PERSIST_WRITE_CMDLINE_TOKEN, POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER, SSHD_MARKER,
     SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_DEPLOY_ROLLBACK_MARKER,
     SYSTEM_ETC_MUTABLE_MARKER, SYSTEM_ETC_RO_MARKER, SYSTEM_NET_REACH_MARKER,
-    SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
-    SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
-    SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_BUSD_RUNTIME_MARKER, TD_CLAUDE_TERMINAL_MARKER, TD_FIREFOX_BOOT_MARKER,
-    TD_FIREFOX_CONTENT_MARKER,
-    TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER,
-    TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER,
-    TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
-    TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER,
-    TD_APPLICATIONS_PLACED_MARKER,
-    TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
-    TD_FETCH_BOOT_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
-    TD_MAIL_BOOT_MARKER,
-    TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
+    SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER, SYSTEM_PERSIST_READ_MARKER,
+    SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER, SYSTEM_SHUTDOWN_MARKER,
+    SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER, TD_APPLICATIONS_PLACED_MARKER,
+    TD_BUSD_RUNTIME_MARKER, TD_CLAUDE_TERMINAL_MARKER, TD_FETCH_BOOT_MARKER,
+    TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER,
+    TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER, TD_FIREFOX_CONTENT_MARKER,
+    TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER, TD_FIREFOX_SUPPORT_MARKER,
+    TD_INIT_RUNTIME_MARKER, TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
+    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY,
+    TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
     TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER,
     TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
@@ -208,8 +201,7 @@ struct SystemDef {
 }
 
 const APPLICATION_REGISTRY: &str = crate::ladder::TD_APPLICATION_REGISTRY;
-const APPLICATION_LAUNCHER_TABLE: &str =
-    crate::ladder::TD_APPLICATION_LAUNCHER_TABLE;
+const APPLICATION_LAUNCHER_TABLE: &str = crate::ladder::TD_APPLICATION_LAUNCHER_TABLE;
 const APPLICATION_CONFIG: &str = crate::ladder::TD_APPLICATION_CONFIG_PATH;
 const PROFILER_OBJECT_INDEX: &str = "/etc/td-profiler-objects.tsv";
 const PROFILER_APPLICATION_ROOTS: &str = "/etc/td-profiler-application-roots.tsv";
@@ -289,26 +281,21 @@ const PORTAL_WAYLAND_SOCKET: &str = "/run/td-compositor/1000/td-portal-wayland-0
 /// cannot advertise a socket it did not bind.
 const CONTROL_SOCKET: &str = "/run/td-compositor/1000/td-control";
 const PORTAL_SERVICE_LOG: &str = "/run/td-portal.log";
-const PORTAL_FILE_CHOOSER_COMPLETED: &str =
-    "TD-PORTAL-FILE-CHOOSER-COMPLETED";
+const PORTAL_FILE_CHOOSER_COMPLETED: &str = "TD-PORTAL-FILE-CHOOSER-COMPLETED";
 const FIREFOX_DOWNLOAD_NAME: &str = "td-firefox-download.txt";
 const FIREFOX_XDG_MOUNT_MARKER: &str = "/run/td-firefox-downloads-mounted";
 const FIREFOX_EVIDENCE_PATH: &str = "/run/td-firefox-evidence-ok";
 const FIREFOX_EVIDENCE_TMP_PATH: &str = "/run/.td-firefox-evidence.tmp";
 const FIREFOX_EVIDENCE: &str = "td-firefox-evidence-v1";
 const FIREFOX_COMPLETION_PATH: &str = "/run/td-firefox-evidence-complete";
-const FIREFOX_COMPLETION_TMP_PATH: &str =
-    "/run/.td-firefox-evidence-complete.tmp";
+const FIREFOX_COMPLETION_TMP_PATH: &str = "/run/.td-firefox-evidence-complete.tmp";
 const FIREFOX_COMPLETION: &str = "td-firefox-evidence-complete-v1";
 const FIREFOX_INPUT_COMPLETION_PATH: &str = "/run/td-firefox-input-complete";
 const FIREFOX_INPUT_COMPLETION_TMP_PATH: &str = "/run/.td-firefox-input-complete.tmp";
 const FIREFOX_INPUT_COMPLETION: &str = "td-firefox-input-complete-v1";
-const FIREFOX_INPUT_STAGES_COMPLETION: &str =
-    "td-firefox-input-stages-complete-v1";
-const FIREFOX_SECCOMP_PROBE_PATH: &str =
-    "/var/lib/td-test/td-jail-seccomp-probe";
-const FIREFOX_SECCOMP_AUDIT_ERROR_PATH: &str =
-    "/run/td-firefox-seccomp-audit.err";
+const FIREFOX_INPUT_STAGES_COMPLETION: &str = "td-firefox-input-stages-complete-v1";
+const FIREFOX_SECCOMP_PROBE_PATH: &str = "/var/lib/td-test/td-jail-seccomp-probe";
+const FIREFOX_SECCOMP_AUDIT_ERROR_PATH: &str = "/run/td-firefox-seccomp-audit.err";
 // kauditd stores notice-level records in the kernel ring even when this
 // console threshold keeps them off the emulated serial device. Warnings and
 // more severe diagnostics remain visible.
@@ -325,9 +312,9 @@ const FIREFOX_DOWNLOAD_TIMEOUT_SECS: u16 = 40;
 const FIREFOX_FILE_CHOOSER_TIMEOUT_SECS: u16 = 60;
 const FIREFOX_FILE_CHOOSER_STAGES: u16 = 4;
 const FIREFOX_DOWNLOAD_OBSERVE_ATTEMPTS: u16 = 20;
-const FIREFOX_INPUT_POLL_SLEEP_SECS: u16 =
-    FIREFOX_RETRIED_INPUT_STAGES * FIREFOX_INPUT_ATTEMPTS.saturating_sub(1)
-        + FIREFOX_DOWNLOAD_OBSERVE_ATTEMPTS;
+const FIREFOX_INPUT_POLL_SLEEP_SECS: u16 = FIREFOX_RETRIED_INPUT_STAGES
+    * FIREFOX_INPUT_ATTEMPTS.saturating_sub(1)
+    + FIREFOX_DOWNLOAD_OBSERVE_ATTEMPTS;
 const FIREFOX_READY_TIMEOUT_SECS: u16 = 180;
 const FIREFOX_READY_ATTEMPTS: u16 = 2;
 const FIREFOX_RETRY_MARGIN_SECS: u16 = 60;
@@ -342,35 +329,29 @@ const FIREFOX_SOAK_BRACKET_MARGIN_SECS: u16 = 30;
 // The evidence unit polls itself so its deadline is not widened by td-svc's
 // exponential restart backoff. Autotest allows two cold starts plus margin.
 const FIREFOX_EVIDENCE_WAIT_ITERATIONS: u16 =
-    FIREFOX_READY_TIMEOUT_SECS * FIREFOX_READY_ATTEMPTS
-        + FIREFOX_RETRY_MARGIN_SECS;
+    FIREFOX_READY_TIMEOUT_SECS * FIREFOX_READY_ATTEMPTS + FIREFOX_RETRY_MARGIN_SECS;
 // `after=` releases this daemon when firefox-evidence starts, not when its
 // atomic completion appears. Cover the evidence poll loop plus every support
 // session that can legally extend one of those iterations.
-const FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS: u16 =
-    FIREFOX_EVIDENCE_WAIT_ITERATIONS
-        + FIREFOX_SUPPORT_TIMEOUT_SECS * FIREFOX_SUPPORT_ATTEMPTS
-        + FIREFOX_NETWORK_TIMEOUT_SECS;
+const FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS: u16 = FIREFOX_EVIDENCE_WAIT_ITERATIONS
+    + FIREFOX_SUPPORT_TIMEOUT_SECS * FIREFOX_SUPPORT_ATTEMPTS
+    + FIREFOX_NETWORK_TIMEOUT_SECS;
 // The greeter may observe deployment health before Firefox's first ready
 // timeout starts the evidence unit. Its allowance includes that offset and
 // each separately bounded Firefox support and staged-input attempt.
-const FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS: u16 =
-    FIREFOX_READY_TIMEOUT_SECS
-        + FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS
-        + FIREFOX_INPUT_TIMEOUT_SECS
-            * FIREFOX_INPUT_ATTEMPTS
-            * FIREFOX_RETRIED_INPUT_STAGES
-        + FIREFOX_FOCUS_TIMEOUT_SECS
-        + FIREFOX_DOWNLOAD_TIMEOUT_SECS
-        + FIREFOX_FILE_CHOOSER_TIMEOUT_SECS * FIREFOX_FILE_CHOOSER_STAGES
-        + FIREFOX_INPUT_POLL_SLEEP_SECS;
+const FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS: u16 = FIREFOX_READY_TIMEOUT_SECS
+    + FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS
+    + FIREFOX_INPUT_TIMEOUT_SECS * FIREFOX_INPUT_ATTEMPTS * FIREFOX_RETRIED_INPUT_STAGES
+    + FIREFOX_FOCUS_TIMEOUT_SECS
+    + FIREFOX_DOWNLOAD_TIMEOUT_SECS
+    + FIREFOX_FILE_CHOOSER_TIMEOUT_SECS * FIREFOX_FILE_CHOOSER_STAGES
+    + FIREFOX_INPUT_POLL_SLEEP_SECS;
 // By this many iterations every Firefox oracle has published or failed,
 // whichever variant the boot runs.
-const FIREFOX_ORACLES_WAIT_ITERATIONS: u16 =
-    FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS
-        + FIREFOX_SOAK_TIMEOUT_SECS
-        + FIREFOX_SOAK_BRACKET_MARGIN_SECS
-        + FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS;
+const FIREFOX_ORACLES_WAIT_ITERATIONS: u16 = FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS
+    + FIREFOX_SOAK_TIMEOUT_SECS
+    + FIREFOX_SOAK_BRACKET_MARGIN_SECS
+    + FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS;
 const CLAUDE_NAME: &str = "claude";
 const CLAUDE_COMPLETION_PATH: &str = "/run/td-claude-evidence-complete";
 const CLAUDE_COMPLETION_TMP_PATH: &str = "/run/.td-claude-evidence-complete.tmp";
@@ -740,7 +721,10 @@ const TD_INIT_FARM: &[(&str, Probe)] = &[
     // MOUNTS, and the greeter is unprivileged so a real run would EPERM anyway. The
     // refusal proves the packed name and that arguments are read before /dev is touched.
     // Its boot use is the sysinit line below, which is where the real exercise happens.
-    ("devpts", Probe::Refuses("--not-an-option", "takes no arguments")),
+    (
+        "devpts",
+        Probe::Refuses("--not-an-option", "takes no arguments"),
+    ),
     // Probed by REFUSAL, and this one could not be anything else: a getty that RAN
     // would claim a terminal, put a session on it and exec the login program — on the
     // greeter's own console, mid-boot. The refusal still proves the packed name, the
@@ -749,7 +733,10 @@ const TD_INIT_FARM: &[(&str, Probe)] = &[
     // made. Its success path is proven by the boot itself, since this applet is how
     // the machine reaches a login prompt at all.
     ("getty", Probe::Refuses("", "usage: getty")),
-    ("halt", Probe::Refuses("--not-an-option", "unrecognised argument")),
+    (
+        "halt",
+        Probe::Refuses("--not-an-option", "unrecognised argument"),
+    ),
     ("hostname", Probe::ReadsBackHostname),
     // The shipped table, parsed by the binary that will be PID 1 next boot.
     ("init", Probe::Runs("--dry-run -f /etc/inittab")),
@@ -845,7 +832,9 @@ fn in_command_position(before: &str) -> bool {
         return true;
     }
     // `)` closes a `case` pattern, and this file writes that shape.
-    for sep in ["\n", "\r", ";", "&", "|", "(", ")", "`", "{", "&&", "||", "!"] {
+    for sep in [
+        "\n", "\r", ";", "&", "|", "(", ")", "`", "{", "&&", "||", "!",
+    ] {
         if head.ends_with(sep) {
             return true;
         }
@@ -861,9 +850,10 @@ fn in_command_position(before: &str) -> bool {
     // An assignment prefix (`VAR=value cmd`) also leaves a command next.
     if head.rsplit([' ', '\t', '\n']).next().is_some_and(|w| {
         let mut parts = w.splitn(2, '=');
-        parts.next().is_some_and(|n| {
-            !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_')
-        }) && parts.next().is_some()
+        parts
+            .next()
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_'))
+            && parts.next().is_some()
     }) {
         return true;
     }
@@ -892,7 +882,11 @@ fn applet_table(source: &str) -> Vec<String> {
         return names;
     };
     let body = source.get(start..).unwrap_or("");
-    let end = body.match_indices("];").next().map(|(i, _)| i).unwrap_or(body.len());
+    let end = body
+        .match_indices("];")
+        .next()
+        .map(|(i, _)| i)
+        .unwrap_or(body.len());
     for (idx, _) in body.get(..end).unwrap_or("").match_indices("(\"") {
         let rest = body.get(idx.saturating_add(2)..).unwrap_or("");
         let name: String = rest.chars().take_while(|c| *c != '"').collect();
@@ -1101,7 +1095,9 @@ fn build_passwd(sys: &SystemDef) -> String {
     }
     for application in sys.applications {
         let uid = application.external_uid;
-        s.push_str(&format!("tda{uid}:x:{uid}:{uid}:td application:/var/lib/td/applications/{uid}:/bin/false\n"));
+        s.push_str(&format!(
+            "tda{uid}:x:{uid}:{uid}:td application:/var/lib/td/applications/{uid}:/bin/false\n"
+        ));
     }
     s.push_str(&format!(
         "{SSHD_PRIVSEP_USER}:x:{SSHD_PRIVSEP_UID}:{SSHD_PRIVSEP_GID}:OpenSSH privilege separation:{SSHD_PRIVSEP_PATH}:/bin/false\n"
@@ -1119,9 +1115,7 @@ fn build_group(sys: &SystemDef) -> String {
         let uid = application.external_uid;
         s.push_str(&format!("tda{uid}:x:{uid}:\n"));
     }
-    s.push_str(&format!(
-        "{SSHD_PRIVSEP_USER}:x:{SSHD_PRIVSEP_GID}:\n"
-    ));
+    s.push_str(&format!("{SSHD_PRIVSEP_USER}:x:{SSHD_PRIVSEP_GID}:\n"));
     // A `wheel` group (gid 10) whose members are the users that declare it.
     let wheel: Vec<&str> = sys
         .users
@@ -1158,11 +1152,12 @@ fn build_shadow(sys: &SystemDef) -> String {
         s.push_str(&format!("{}:{}:19000:0:99999:7:::\n", u.name, pw));
     }
     for application in sys.applications {
-        s.push_str(&format!("tda{}:!td-service:19000:0:99999:7:::\n", application.external_uid));
+        s.push_str(&format!(
+            "tda{}:!td-service:19000:0:99999:7:::\n",
+            application.external_uid
+        ));
     }
-    s.push_str(&format!(
-        "{SSHD_PRIVSEP_USER}:!:19000:0:99999:7:::\n"
-    ));
+    s.push_str(&format!("{SSHD_PRIVSEP_USER}:!:19000:0:99999:7:::\n"));
     s
 }
 
@@ -2150,7 +2145,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
     }
     init.push_str(
         "\n/bin/td-util chown 0:0 /sysroot/var /sysroot/var/home\n\
-         /bin/td-util chmod 0755 /sysroot/var /sysroot/var/home\n"
+         /bin/td-util chmod 0755 /sysroot/var /sysroot/var/home\n",
     );
     init.push_str(&format!(
         "/bin/td-util mkdir -p /sysroot/var/lib/td-profiler/captures\n\
@@ -2291,7 +2286,11 @@ fn build_shutdown() -> String {
 fn build_autologin(sys: &SystemDef) -> String {
     // getty (-n -l) execs this with the tty already set up; force-login the
     // configured user with no authentication.
-    if sys.users.iter().any(|user| user.name == sys.autologin && user.uid == UI_UID) {
+    if sys
+        .users
+        .iter()
+        .any(|user| user.name == sys.autologin && user.uid == UI_UID)
+    {
         "#!/bin/sh\nexec /bin/td-login login-primary\n".into()
     } else {
         format!("#!/bin/sh\nexec /bin/login -f {}\n", sys.autologin)
@@ -2485,9 +2484,7 @@ fn build_mutable_etc_check(sys: &SystemDef) -> String {
         }
     }
     // The id must be the shape every reader expects, read back THROUGH /etc.
-    s.push_str(
-        "/bin/grep -Eq '^[0-9a-f]{32}$' /etc/machine-id || me=0\n",
-    );
+    s.push_str("/bin/grep -Eq '^[0-9a-f]{32}$' /etc/machine-id || me=0\n");
     if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
         if user.uid != 0 {
             // Require one successful child to prove both halves. A failed
@@ -3549,7 +3546,8 @@ const MUTABLE_ETC: &[MutableEtc] = &[
         etc: "hostname",
         target: "/var/lib/td/hostname",
         state: State::Persistent,
-        why: "td-install saves the chosen hostname; td-firstboot supplies a default only when absent",
+        why:
+            "td-install saves the chosen hostname; td-firstboot supplies a default only when absent",
     },
     MutableEtc {
         etc: "timezone",
@@ -3615,7 +3613,6 @@ fn build_ssh_config() -> String {
          \tVerifyHostKeyDNS no\n"
     )
 }
-
 
 /// Every parent directory needed by either `/etc` table, including intermediate
 /// parents. The same list drives staging and the fail-closed directory and symlink
@@ -3720,10 +3717,18 @@ fn profiler_application_roots(sys: &SystemDef) -> String {
                 application.name,
                 package.name,
                 package.version,
-                if package.is_foreign() { "foreign" } else { "source" },
+                if package.is_foreign() {
+                    "foreign"
+                } else {
+                    "source"
+                },
                 runtime.name,
                 runtime.version,
-                if runtime.is_foreign() { "foreign" } else { "source" },
+                if runtime.is_foreign() {
+                    "foreign"
+                } else {
+                    "source"
+                },
             )
         })
         .collect();
@@ -3995,7 +4000,15 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
     let mut s = String::new();
     // Both phases discover the volume through sysfs. The selected phase also
     // reads back the root loop's read-only state through sysfs.
-    for d in ["/dev", "/proc", "/run", "/sys", "/sysroot", "/td", "/td/store"] {
+    for d in [
+        "/dev",
+        "/proc",
+        "/run",
+        "/sys",
+        "/sysroot",
+        "/td",
+        "/td/store",
+    ] {
         s.push_str(&format!("dir {d} 0755 0 0\n"));
     }
     s.push_str("dir /volume 0700 0 0\n");
@@ -4363,18 +4376,12 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         ("rg", "{in:ripgrep}/bin/rg"),
         ("fd", "{in:fd}/bin/fd"),
         ("git", "{in:git-x86-64}/bin/git"),
-        (
-            "git-receive-pack",
-            "{in:git-x86-64}/bin/git-receive-pack",
-        ),
+        ("git-receive-pack", "{in:git-x86-64}/bin/git-receive-pack"),
         (
             "git-upload-archive",
             "{in:git-x86-64}/bin/git-upload-archive",
         ),
-        (
-            "git-upload-pack",
-            "{in:git-x86-64}/bin/git-upload-pack",
-        ),
+        ("git-upload-pack", "{in:git-x86-64}/bin/git-upload-pack"),
         ("openssl", "{in:libressl-x86-64}/bin/openssl"),
         ("codex", "{in:codex}/bin/codex"),
         ("bwrap", "{in:codex-bwrap}/bin/bwrap"),
@@ -4477,7 +4484,9 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             link: format!("{{root}}/real-root/bin/{name}"),
         });
     }
-    for name in ["ar", "as", "ld", "nm", "ranlib", "objcopy", "objdump", "readelf", "strip"] {
+    for name in [
+        "ar", "as", "ld", "nm", "ranlib", "objcopy", "objdump", "readelf", "strip",
+    ] {
         steps.push(Step::Symlink {
             target: format!("{{in:binutils-x86-64-self}}/bin/{name}"),
             link: format!("{{root}}/real-root/bin/{name}"),
@@ -5293,7 +5302,6 @@ mod hostname;
 mod tests {
     use super::*;
 
-
     /// Every unit whose leader is td-login declares `cgroup=session`, and no
     /// other unit does.
     ///
@@ -5359,10 +5367,19 @@ mod tests {
         assert!(config.contains("exec=/bin/td-login exec-primary -- /bin/td-update init"));
         assert!(!config.contains(&format!("/bin/td-login exec-as {UI_USER} --")));
         assert!(!config.contains("/bin/su"));
-        assert_eq!(build_autologin(&SYSTEM), "#!/bin/sh\nexec /bin/td-login login-primary\n");
+        assert_eq!(
+            build_autologin(&SYSTEM),
+            "#!/bin/sh\nexec /bin/td-login login-primary\n"
+        );
         // A tailored non-primary console still uses the named login interface.
-        let diagnostic = SystemDef { autologin: "root", ..SYSTEM };
-        assert_eq!(build_autologin(&diagnostic), "#!/bin/sh\nexec /bin/login -f root\n");
+        let diagnostic = SystemDef {
+            autologin: "root",
+            ..SYSTEM
+        };
+        assert_eq!(
+            build_autologin(&diagnostic),
+            "#!/bin/sh\nexec /bin/login -f root\n"
+        );
         let source = super::super::td_login::source("main").unwrap();
         assert!(source.contains("const EXEC_PRIMARY: &str = \"exec-primary\";"));
         assert!(source.contains("const LOGIN_PRIMARY: &str = \"login-primary\";"));
@@ -5464,7 +5481,9 @@ mod tests {
         let mut seen: Vec<(u32, &str)> = Vec::new();
         for line in passwd.lines().filter(|l| !l.trim().is_empty()) {
             let mut fields = line.split(':');
-            let name = fields.next().unwrap_or_else(|| unreachable!("split yields one"));
+            let name = fields
+                .next()
+                .unwrap_or_else(|| unreachable!("split yields one"));
             let uid = fields
                 .nth(1)
                 .unwrap_or_else(|| panic!("{line:?} has no uid field"))
@@ -5502,9 +5521,9 @@ mod tests {
         assert!(build_passwd(&SYSTEM).contains(&format!(
             "{SSHD_PRIVSEP_USER}:x:{SSHD_PRIVSEP_UID}:{SSHD_PRIVSEP_GID}:OpenSSH privilege separation:{SSHD_PRIVSEP_PATH}:/bin/false\n"
         )));
-        assert!(build_group(&SYSTEM).contains(&format!(
-            "{SSHD_PRIVSEP_USER}:x:{SSHD_PRIVSEP_GID}:\n"
-        )));
+        assert!(
+            build_group(&SYSTEM).contains(&format!("{SSHD_PRIVSEP_USER}:x:{SSHD_PRIVSEP_GID}:\n"))
+        );
         assert!(build_shadow(&SYSTEM).contains(&format!("{SSHD_PRIVSEP_USER}:!:")));
 
         let rootcheck = build_rootcheck(&SYSTEM);
@@ -5548,12 +5567,8 @@ mod tests {
         assert!(build_passwd(&SYSTEM).contains(&format!(
             "{AUDIO_USER}:x:{AUDIO_UID}:{AUDIO_GID}:System Audio:{AUDIO_RUNTIME}:/bin/false\n"
         )));
-        assert!(build_group(&SYSTEM).contains(&format!(
-            "{AUDIO_USER}:x:{AUDIO_GID}:\n"
-        )));
-        assert!(
-            build_shadow(&SYSTEM).contains(&format!("{AUDIO_USER}:!td-service:"))
-        );
+        assert!(build_group(&SYSTEM).contains(&format!("{AUDIO_USER}:x:{AUDIO_GID}:\n")));
+        assert!(build_shadow(&SYSTEM).contains(&format!("{AUDIO_USER}:!td-service:")));
         let init = build_deployment_init(&SYSTEM);
         let rootcheck = build_rootcheck(&SYSTEM);
         assert!(!init.contains("/sysroot/var/run/td-audio"));
@@ -5611,9 +5626,7 @@ mod tests {
             (PROFILER_UID, PROFILER_GID, false)
         );
         assert!(
-            build_group(&SYSTEM).contains(&format!(
-                "profiler-read:x:{PROFILER_READ_GID}:\n"
-            )),
+            build_group(&SYSTEM).contains(&format!("profiler-read:x:{PROFILER_READ_GID}:\n")),
             "the reader group must exist without enrolling an interactive account"
         );
         assert!(build_shadow(&SYSTEM).contains("profiler:!:"));
@@ -5626,13 +5639,13 @@ mod tests {
             "printf '%s\\n' 2 > /proc/sys/kernel/perf_event_paranoid",
             "cat /proc/sys/kernel/perf_event_paranoid)\" = 2",
         ] {
-            assert!(init.contains(required), "missing persistent profiler setup: {required}");
+            assert!(
+                init.contains(required),
+                "missing persistent profiler setup: {required}"
+            );
         }
 
-        assert_eq!(
-            unit_key("profiler", "after").as_deref(),
-            Some("rootcheck")
-        );
+        assert_eq!(unit_key("profiler", "after").as_deref(), Some("rootcheck"));
         assert_eq!(
             unit_key("profiler", "requires").as_deref(),
             Some("rootcheck")
@@ -5646,18 +5659,22 @@ mod tests {
             "--deployment {out}",
             "--profiler-build {in:td-profiler}",
         ] {
-            assert!(collector.contains(required), "collector unit omitted {required}");
+            assert!(
+                collector.contains(required),
+                "collector unit omitted {required}"
+            );
         }
-        assert_eq!(unit_key("profiler", "restart").as_deref(), Some("on-failure"));
+        assert_eq!(
+            unit_key("profiler", "restart").as_deref(),
+            Some("on-failure")
+        );
         assert_eq!(
             unit_key("profiler-evidence", "after").as_deref(),
             Some("profiler")
         );
-        assert!(
-            unit_key("profiler-evidence", "exec")
-                .unwrap_or_default()
-                .contains(PROFILER_CAPTURE_ROOT)
-        );
+        assert!(unit_key("profiler-evidence", "exec")
+            .unwrap_or_default()
+            .contains(PROFILER_CAPTURE_ROOT));
         let evidence = unit_key("profiler-evidence", "exec").unwrap_or_default();
         for required in [
             "--timeout-secs 300",
@@ -5666,7 +5683,10 @@ mod tests {
             "--gid 996",
             "--attribution-cmdline-token td.autotest=1",
         ] {
-            assert!(evidence.contains(required), "evidence unit omitted {required}");
+            assert!(
+                evidence.contains(required),
+                "evidence unit omitted {required}"
+            );
         }
         assert_eq!(
             unit_key("profiler-evidence", "log").as_deref(),
@@ -5702,10 +5722,10 @@ mod tests {
             Step::WriteFile { path, content, exec: false }
                 if path == "{root}/real-root/etc/td-profiler-application-roots.tsv"
                     && content == "td-profiler-application-roots-v1\n\
-claude\tclaude-2.1.260\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n\
-firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n\
-mail\tmail-0.1\tsource\tstatic-runtime-1\tsource\n\
-news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
+        claude\tclaude-2.1.260\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n\
+        firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n\
+        mail\tmail-0.1\tsource\tstatic-runtime-1\tsource\n\
+        news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         )));
         assert!(steps.iter().any(|step| matches!(
             step,
@@ -5726,13 +5746,11 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                     "{root}/real-root/etc/td-profiler-application-roots.tsv",
                 ]
         )));
-        assert!(
-            recipe()
-                .native_inputs
-                .as_deref()
-                .unwrap_or_default()
-                .contains(&"td-profiler".to_string())
-        );
+        assert!(recipe()
+            .native_inputs
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&"td-profiler".to_string()));
     }
 
     /// PID 1 keeps ONLY what it must own. Everything else is a unit.
@@ -5809,7 +5827,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         let declared: Vec<String> = parse_td_svc_conf().into_iter().map(|(n, _)| n).collect();
         assert_eq!(
             declared,
-            TD_SVC_UNITS.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+            TD_SVC_UNITS
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>(),
             "TD_SVC_UNITS is what shape_check greps `td-svc check`'s plan for; a unit \
              missing from it is a unit whose absence from the plan nothing would catch"
         );
@@ -5949,7 +5970,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             "/var/lib/td-test/td-jail-seccomp-probe --audit-marker begin",
             &audit_branch,
         ] {
-            assert!(tls_setup.contains(required), "TLS setup omitted {required:?}");
+            assert!(
+                tls_setup.contains(required),
+                "TLS setup omitted {required:?}"
+            );
         }
         let ratelimit_write = tls_setup
             .find("printf '%s\\n' 0 > /proc/sys/kernel/printk_ratelimit")
@@ -5997,7 +6021,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             "-verify_return_error",
             "TD-FIREFOX-HTTPS-CONTENT-V1",
         ] {
-            assert!(tls_ready.contains(required), "TLS ready omitted {required:?}");
+            assert!(
+                tls_ready.contains(required),
+                "TLS ready omitted {required:?}"
+            );
         }
         for forbidden in [
             "acceptInsecureCerts",
@@ -6010,12 +6037,8 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         }
         let jail_authority = include_str!("../../../td-jail/src/authority.rs");
         assert!(jail_authority.contains("FIREFOX_AUTOTEST_POLICY"));
-        assert!(jail_authority.contains(
-            r#""{\"policies\":{\"Certificates\":{\"Install\":["#
-        ));
-        assert!(jail_authority.contains(
-            "\\\"/etc/firefox/policies/td-firefox-autotest-ca.pem\\\""
-        ));
+        assert!(jail_authority.contains(r#""{\"policies\":{\"Certificates\":{\"Install\":["#));
+        assert!(jail_authority.contains("\\\"/etc/firefox/policies/td-firefox-autotest-ca.pem\\\""));
         assert!(jail_authority.contains(r#""]}}}\n","#));
         let firefox_probe = include_str!("../../../td-jail/src/firefox.rs");
         assert!(firefox_probe.contains(&format!(
@@ -6035,18 +6058,11 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             "const FOCUS_PROBE_DEADLINE: Duration = Duration::from_secs({});",
             FIREFOX_FOCUS_TIMEOUT_SECS
         )));
-        assert!(firefox_probe.contains(
-            "event.isTrusted && event.target === input &&"
-        ));
-        assert!(firefox_probe.contains(
-            "event.clientX >= 360 && event.clientX <= 380)"
-        ));
-        assert!(FIREFOX_HTTPS_DOCUMENT.contains(
-            "left:58%;top:0;width:28%;height:100vh;"
-        ));
-        assert!(FIREFOX_HTTPS_DOCUMENT.contains(
-            "box-sizing:border-box;border:0;outline:0;opacity:0;z-index:1"
-        ));
+        assert!(firefox_probe.contains("event.isTrusted && event.target === input &&"));
+        assert!(firefox_probe.contains("event.clientX >= 360 && event.clientX <= 380)"));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains("left:58%;top:0;width:28%;height:100vh;"));
+        assert!(FIREFOX_HTTPS_DOCUMENT
+            .contains("box-sizing:border-box;border:0;outline:0;opacity:0;z-index:1"));
         assert_eq!(
             firefox_probe
                 .matches(&format!(
@@ -6056,8 +6072,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 .count(),
             1
         );
-        let firefox_autotest =
-            unit_key("firefox-autotest", "exec").unwrap_or_default();
+        let firefox_autotest = unit_key("firefox-autotest", "exec").unwrap_or_default();
         assert!(firefox_autotest.starts_with(&format!(
             "/bin/td-login exec-service-as tda65536 -- /bin/sh -c 'case \" $(/bin/cat \
              /proc/cmdline) \" in *\" {AUTOTEST_CMDLINE_TOKEN} \"*) \
@@ -6112,18 +6127,15 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert!(FIREFOX_HTTPS_DOCUMENT.contains("width:100%;min-height:300vh"));
         assert!(FIREFOX_HTTPS_DOCUMENT.contains("<input id=td-input"));
         assert!(FIREFOX_HTTPS_DOCUMENT.contains("<input id=td-upload type=file"));
-        assert!(FIREFOX_HTTPS_DOCUMENT.contains(
-            "#td-upload{position:fixed;left:58%;top:104px;z-index:1}"
-        ));
-        assert!(FIREFOX_HTTPS_DOCUMENT.contains(
-            "#td-upload::file-selector-button{width:100%;height:100%}"
-        ));
-        assert!(FIREFOX_HTTPS_DOCUMENT.contains(
-            "<a id=td-download href=download.txt download=td-firefox-download.txt>"
-        ));
-        assert!(!FIREFOX_HTTPS_DOCUMENT.bytes().any(|byte| {
-            matches!(byte, b'\'' | b'"' | b'$' | b'\\' | b'\n') || byte == 0x60
-        }));
+        assert!(FIREFOX_HTTPS_DOCUMENT
+            .contains("#td-upload{position:fixed;left:58%;top:104px;z-index:1}"));
+        assert!(FIREFOX_HTTPS_DOCUMENT
+            .contains("#td-upload::file-selector-button{width:100%;height:100%}"));
+        assert!(FIREFOX_HTTPS_DOCUMENT
+            .contains("<a id=td-download href=download.txt download=td-firefox-download.txt>"));
+        assert!(!FIREFOX_HTTPS_DOCUMENT
+            .bytes()
+            .any(|byte| { matches!(byte, b'\'' | b'"' | b'$' | b'\\' | b'\n') || byte == 0x60 }));
         assert_eq!(
             FIREFOX_HTTPS_DOCUMENT
                 .matches("TD-FIREFOX-HTTPS-CONTENT-V1")
@@ -6132,13 +6144,12 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
         assert!(FIREFOX_HTTPS_DOCUMENT
             .contains("<span id=td-soak hidden>TD-FIREFOX-SOAK-CONTENT-A-V1</span>"));
-        assert!(FIREFOX_HTTPS_SOAK_DOCUMENT
-            .contains("<title>TD-FIREFOX-HTTPS-SOAK-ALT-V1</title>"));
+        assert!(FIREFOX_HTTPS_SOAK_DOCUMENT.contains("<title>TD-FIREFOX-HTTPS-SOAK-ALT-V1</title>"));
         assert!(FIREFOX_HTTPS_SOAK_DOCUMENT
             .contains("<span id=td-soak hidden>TD-FIREFOX-SOAK-CONTENT-B-V1</span>"));
-        assert!(!FIREFOX_HTTPS_SOAK_DOCUMENT.bytes().any(|byte| {
-            matches!(byte, b'\'' | b'"' | b'$' | b'\\' | b'\n') || byte == 0x60
-        }));
+        assert!(!FIREFOX_HTTPS_SOAK_DOCUMENT
+            .bytes()
+            .any(|byte| { matches!(byte, b'\'' | b'"' | b'$' | b'\\' | b'\n') || byte == 0x60 }));
         assert_eq!(
             unit_key("firefox", "requires").as_deref(),
             Some("wayland,firefox-autotest,firefox-tls-origin,firefox-files,td-firstboot")
@@ -6168,8 +6179,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
         assert_eq!(
             FIREFOX_EVIDENCE_WAIT_ITERATIONS,
-            FIREFOX_READY_TIMEOUT_SECS * FIREFOX_READY_ATTEMPTS
-                + FIREFOX_RETRY_MARGIN_SECS
+            FIREFOX_READY_TIMEOUT_SECS * FIREFOX_READY_ATTEMPTS + FIREFOX_RETRY_MARGIN_SECS
         );
         assert_eq!(
             FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS,
@@ -6190,7 +6200,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 + FIREFOX_SOAK_BRACKET_MARGIN_SECS
                 + FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS
         );
-        assert_eq!(CLAUDE_PRE_RUN_WAIT_ITERATIONS, FIREFOX_ORACLES_WAIT_ITERATIONS);
+        assert_eq!(
+            CLAUDE_PRE_RUN_WAIT_ITERATIONS,
+            FIREFOX_ORACLES_WAIT_ITERATIONS
+        );
         assert_eq!(
             APPLICATION_GREETER_WAIT_ITERATIONS,
             CLAUDE_PRE_RUN_WAIT_ITERATIONS + CLAUDE_EVIDENCE_BUDGET_SECS
@@ -6232,24 +6245,19 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
              && exit 0; exit 1; fi; s=$((s+1))"
         )));
         let firefox_probe = include_str!("../../../td-jail/src/firefox.rs");
-        assert!(firefox_probe.contains(
-            "const NETWORK_PROBE_DEADLINE: Duration = Duration::from_secs(60);"
-        ));
+        assert!(firefox_probe
+            .contains("const NETWORK_PROBE_DEADLINE: Duration = Duration::from_secs(60);"));
         assert!(firefox_probe.contains(&format!(
             "const FIREFOX_NETWORK_TEST_URL: &str = \
              \"{}\";",
             crate::ladder::FIREFOX_NETWORK_TEST_URL
         )));
-        assert!(firefox_probe.contains(&format!(
-            "\"{FIREFOX_NETWORK_RUNTIME_MARKER}\""
-        )));
+        assert!(firefox_probe.contains(&format!("\"{FIREFOX_NETWORK_RUNTIME_MARKER}\"")));
         assert!(evidence.contains(&format!(
             "/bin/rm -f {FIREFOX_EVIDENCE_TMP_PATH} {FIREFOX_COMPLETION_TMP_PATH}"
         )));
         let evidence_write = evidence
-            .find(&format!(
-                "{FIREFOX_EVIDENCE} > {FIREFOX_EVIDENCE_TMP_PATH}"
-            ))
+            .find(&format!("{FIREFOX_EVIDENCE} > {FIREFOX_EVIDENCE_TMP_PATH}"))
             .expect("Firefox evidence temporary write missing");
         let evidence_chmod = evidence
             .find(&format!(
@@ -6324,12 +6332,8 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             unit_key("firefox-evidence", "restart").as_deref(),
             Some("never")
         );
-        assert!(
-            unit_after("firefox-evidence").contains(&"firefox".to_string())
-        );
-        assert!(
-            unit_after("firefox-evidence").contains(&"netup".to_string())
-        );
+        assert!(unit_after("firefox-evidence").contains(&"firefox".to_string()));
+        assert!(unit_after("firefox-evidence").contains(&"netup".to_string()));
         assert!(unit_key("firefox-evidence", "requires").is_none());
 
         let input = unit_key("firefox-input", "exec").unwrap_or_default();
@@ -6370,7 +6374,9 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
         for stage in stages {
             assert_eq!(
-                input.matches(&format!("--probe-firefox-input {stage}")).count(),
+                input
+                    .matches(&format!("--probe-firefox-input {stage}"))
+                    .count(),
                 1
             );
         }
@@ -6416,9 +6422,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert_eq!(input.matches(&clipboard_retry_protocol).count(), 1);
         let download = input.find("--probe-firefox-input download ||").unwrap();
         let file_probe = input.find("--probe-firefox-download").unwrap();
-        let file_chooser = input
-            .find("--probe-firefox-input file-chooser ||")
-            .unwrap();
+        let file_chooser = input.find("--probe-firefox-input file-chooser ||").unwrap();
         let file_chooser_focus = input
             .find("--probe-firefox-input file-chooser-focus ||")
             .unwrap();
@@ -6487,35 +6491,23 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         for exact in [
             format!("[ \"$n\" -lt {FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS} ]"),
             format!("[ \"$input\" = {FIREFOX_INPUT_STAGES_COMPLETION} ]"),
-            format!(
-                "/bin/td-jail --probe-process-token {FIREFOX_NAME} --marionette"
-            ),
+            format!("/bin/td-jail --probe-process-token {FIREFOX_NAME} --marionette"),
             "set -- $process_before; [ \"$#\" = 5 ]".to_string(),
             "case \"$4\" in pid=*) firefox_pid=${4#pid=};;".to_string(),
-            "case \"$firefox_pid\" in \"\"|*[!0-9]*|0) exit 1;;"
-                .to_string(),
-            format!(
-                "/bin/td-busd application {SESSION_BUS_SOCKET} {FIREFOX_NAME}"
-            ),
+            "case \"$firefox_pid\" in \"\"|*[!0-9]*|0) exit 1;;".to_string(),
+            format!("/bin/td-busd application {SESSION_BUS_SOCKET} {FIREFOX_NAME}"),
             "/bin/td-jail --probe-firefox-soak".to_string(),
             format!("[ \"$soak\" = \"{TD_FIREFOX_SOAK_MARKER}\" ]"),
             audit_case.clone(),
             format!("{FIREFOX_SECCOMP_PROBE_PATH} --audit-marker end"),
-            format!(
-                "[ \"$n\" -lt {FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS} ]"
-            ),
+            format!("[ \"$n\" -lt {FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS} ]"),
             "/bin/dmesg | /bin/td-jail --probe-firefox-seccomp-audit \
              \"$firefox_pid\""
                 .to_string(),
             format!("2>{FIREFOX_SECCOMP_AUDIT_ERROR_PATH}"),
-            format!(
-                "/bin/td-util cat {FIREFOX_SECCOMP_AUDIT_ERROR_PATH} >&2"
-            ),
-            format!(
-                "[ \"$seccomp\" = \"{TD_FIREFOX_SECCOMP_AUDIT_MARKER}\" ]"
-            ),
-            "[ -z \"$seccomp\" ] || /bin/td-util printf \"%s\\n\" \"$seccomp\""
-                .to_string(),
+            format!("/bin/td-util cat {FIREFOX_SECCOMP_AUDIT_ERROR_PATH} >&2"),
+            format!("[ \"$seccomp\" = \"{TD_FIREFOX_SECCOMP_AUDIT_MARKER}\" ]"),
+            "[ -z \"$seccomp\" ] || /bin/td-util printf \"%s\\n\" \"$seccomp\"".to_string(),
             format!(
                 "/bin/td-compositor probe-application {FIREFOX_WINDOW_READY_SOCKET} \
                  {FIREFOX_APP_ID} {FIREFOX_CONTENT_RGB_A} {FIREFOX_CONTENT_RGB_B}"
@@ -6526,7 +6518,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         }
         assert_eq!(soak.matches("--probe-process-token").count(), 2);
         assert_eq!(soak.matches("/bin/td-busd application").count(), 2);
-        assert_eq!(soak.matches("/bin/td-compositor probe-application").count(), 2);
+        assert_eq!(
+            soak.matches("/bin/td-compositor probe-application").count(),
+            2
+        );
         assert_eq!(soak.matches("--probe-firefox-soak").count(), 1);
         assert_eq!(
             soak.matches(&format!(
@@ -6542,7 +6537,9 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         let before_wayland = soak.find("wayland_before=").unwrap();
         let navigation = soak.find("soak=$(").unwrap();
         let after_process = soak.find("process_after=").unwrap();
-        let same_process = soak.find("[ \"$process_after\" = \"$process_before\" ]").unwrap();
+        let same_process = soak
+            .find("[ \"$process_after\" = \"$process_before\" ]")
+            .unwrap();
         let after_bus = soak.find("bus_after=").unwrap();
         let same_bus = soak.find("[ \"$bus_after\" = \"$bus_before\" ]").unwrap();
         let after_wayland = soak.find("wayland_after=").unwrap();
@@ -6552,7 +6549,9 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         let audit_case = soak.find(&audit_case).unwrap();
         let audit_end = soak.find("--audit-marker end").unwrap();
         let seccomp = soak.find("seccomp=$(/bin/dmesg |").unwrap();
-        let marker = soak.find("/bin/td-util printf \"%s\\n\" \"$soak\"").unwrap();
+        let marker = soak
+            .find("/bin/td-util printf \"%s\\n\" \"$soak\"")
+            .unwrap();
         let seccomp_marker = soak
             .find("/bin/td-util printf \"%s\\n\" \"$seccomp\"")
             .unwrap();
@@ -6578,7 +6577,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
         assert_eq!(unit_after("firefox-soak"), vec!["firefox-input"]);
         assert_eq!(unit_key("firefox-soak", "type").as_deref(), Some("daemon"));
-        assert_eq!(unit_key("firefox-soak", "restart").as_deref(), Some("never"));
+        assert_eq!(
+            unit_key("firefox-soak", "restart").as_deref(),
+            Some("never")
+        );
         assert!(unit_key("firefox-soak", "requires").is_none());
 
         assert!(
@@ -6610,17 +6612,33 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
              first is the shell's and Firefox's, whose tiles the physical-input oracle binds"
         );
         for (unit, workspace, after) in [
-            ("applications-workspace", TERMINAL_APPLICATION_WORKSPACE, vec!["terminal"]),
+            (
+                "applications-workspace",
+                TERMINAL_APPLICATION_WORKSPACE,
+                vec!["terminal"],
+            ),
             ("shell-workspace", 1, vec!["mail", "news"]),
         ] {
             let switch = format!(
                 "/bin/td-login exec-primary -- /bin/td-ctl --socket {CONTROL_SOCKET} \
                  workspace {workspace}"
             );
-            assert_eq!(unit_key(unit, "exec").as_deref(), Some(switch.as_str()), "{unit}");
+            assert_eq!(
+                unit_key(unit, "exec").as_deref(),
+                Some(switch.as_str()),
+                "{unit}"
+            );
             assert_eq!(unit_key(unit, "type").as_deref(), Some("oneshot"), "{unit}");
-            assert_eq!(unit_key(unit, "cgroup").as_deref(), Some("session"), "{unit}");
-            assert_eq!(unit_key(unit, "requires").as_deref(), Some("wayland"), "{unit}");
+            assert_eq!(
+                unit_key(unit, "cgroup").as_deref(),
+                Some("session"),
+                "{unit}"
+            );
+            assert_eq!(
+                unit_key(unit, "requires").as_deref(),
+                Some("wayland"),
+                "{unit}"
+            );
             assert_eq!(
                 unit_key(unit, "timeout").as_deref(),
                 Some(svc_timeouts::APPLICATION_PLACE.to_string().as_str()),
@@ -6640,7 +6658,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             // A td-ui window of its own, launched direct as Firefox is;
             // ready is the compositor's report naming its toplevel by
             // the app id the client sets, which is the program's name.
-            assert_eq!(exec, format!("/bin/td-authd application-start {UI_UID} {name} direct --"));
+            assert_eq!(
+                exec,
+                format!("/bin/td-authd application-start {UI_UID} {name} direct --")
+            );
             assert_eq!(
                 ready,
                 format!(
@@ -6649,11 +6670,23 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             );
             assert_eq!(unit_key(&format!("{name}-fetch"), "exec"), Some(format!("/bin/td-login exec-service-as tda{uid} -- /bin/td-fetchd run --socket /run/user/{uid}/td-fetch/socket")));
             assert_eq!(unit_key(unit, "type").as_deref(), Some("daemon"), "{unit}");
-            assert_eq!(unit_key(unit, "restart").as_deref(), Some("never"), "{unit}");
-            assert_eq!(unit_key(unit, "cgroup").as_deref(), Some("session"), "{unit}");
+            assert_eq!(
+                unit_key(unit, "restart").as_deref(),
+                Some("never"),
+                "{unit}"
+            );
+            assert_eq!(
+                unit_key(unit, "cgroup").as_deref(),
+                Some("session"),
+                "{unit}"
+            );
             assert_eq!(
                 unit_key(unit, "requires").as_deref(),
-                Some(if name == "mail" { "wayland,busd,mail-fetch,mail-files,td-firstboot" } else { "wayland,busd,news-fetch,td-firstboot" }),
+                Some(if name == "mail" {
+                    "wayland,busd,mail-fetch,mail-files,td-firstboot"
+                } else {
+                    "wayland,busd,news-fetch,td-firstboot"
+                }),
                 "{unit}"
             );
             // The switch is an ordering, not a requirement: a channel that
@@ -6663,7 +6696,14 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             assert_eq!(
                 unit_after(unit),
                 if unit == "mail" {
-                    vec!["busd", "portal", "mail-fetch", "mail-files", "applications-workspace", "firefox-tls-setup"]
+                    vec![
+                        "busd",
+                        "portal",
+                        "mail-fetch",
+                        "mail-files",
+                        "applications-workspace",
+                        "firefox-tls-setup",
+                    ]
                 } else {
                     vec!["busd", "news-fetch", "applications-workspace"]
                 },
@@ -6678,9 +6718,20 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 )),
                 "{exec}"
             );
-            assert_eq!(unit_key(&evidence, "requires").as_deref(), Some(unit), "{evidence}");
-            assert!(exec.contains(&format!("/bin/td-util sleep {APPLICATION_SETTLE_SECS};")), "{exec}");
-            assert_eq!(unit_key(&evidence, "type").as_deref(), Some("oneshot"), "{evidence}");
+            assert_eq!(
+                unit_key(&evidence, "requires").as_deref(),
+                Some(unit),
+                "{evidence}"
+            );
+            assert!(
+                exec.contains(&format!("/bin/td-util sleep {APPLICATION_SETTLE_SECS};")),
+                "{exec}"
+            );
+            assert_eq!(
+                unit_key(&evidence, "type").as_deref(),
+                Some("oneshot"),
+                "{evidence}"
+            );
             assert_eq!(
                 unit_key(&evidence, "timeout").as_deref(),
                 Some(svc_timeouts::APPLICATION_EVIDENCE.to_string().as_str()),
@@ -6688,7 +6739,11 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             );
             // The marker is one exact console line; TLS setup's progress dots
             // would prefix it, so the probe waits for that unit's decision.
-            assert_eq!(unit_after(&evidence), vec![unit, "firefox-tls-setup"], "{evidence}");
+            assert_eq!(
+                unit_after(&evidence),
+                vec![unit, "firefox-tls-setup"],
+                "{evidence}"
+            );
         }
         let exec = unit_key("placement-evidence", "exec").unwrap_or_default();
         assert!(exec.contains(AUTOTEST_CMDLINE_TOKEN), "{exec}");
@@ -6712,9 +6767,18 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             exec.contains("/bin/grep -c \"^window id=[^ ]* object=[^ ]* workspace=1 \")\" -eq 1"),
             "{exec}"
         );
-        assert!(exec.ends_with(&format!("&& /bin/echo {TD_APPLICATIONS_PLACED_MARKER}'")), "{exec}");
-        assert_eq!(unit_key("placement-evidence", "type").as_deref(), Some("oneshot"));
-        assert_eq!(unit_key("placement-evidence", "requires").as_deref(), Some("shell-workspace"));
+        assert!(
+            exec.ends_with(&format!("&& /bin/echo {TD_APPLICATIONS_PLACED_MARKER}'")),
+            "{exec}"
+        );
+        assert_eq!(
+            unit_key("placement-evidence", "type").as_deref(),
+            Some("oneshot")
+        );
+        assert_eq!(
+            unit_key("placement-evidence", "requires").as_deref(),
+            Some("shell-workspace")
+        );
         assert_eq!(
             unit_key("placement-evidence", "timeout").as_deref(),
             Some(svc_timeouts::APPLICATION_PLACE.to_string().as_str())
@@ -6738,9 +6802,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         let control = include_str!("../../../td-compositor/src/control.rs");
         assert!(control.contains("\"workspace active={} occupied={}\\n\","));
         assert!(control.contains("occupied.join(\",\")"));
-        assert!(control.contains(
-            "\"window id={} object={}:{} workspace={} x={} y={} width={} \\"
-        ));
+        assert!(control.contains("\"window id={} object={}:{} workspace={} x={} y={} width={} \\"));
         let layout = include_str!("../../../td-compositor/src/layout.rs");
         assert!(layout.contains("pub(crate) const INITIAL_WORKSPACE: u8 = 1;"));
         assert!(layout.contains("pub(crate) const FINAL_WORKSPACE: u8 = 9;"));
@@ -6748,12 +6810,9 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
 
     #[test]
     fn seccomp_audit_wire_markers_are_bound_across_components() {
-        const TD_UTIL_DMESG: &str =
-            include_str!("../../../td-util/src/dmesg.rs");
-        const TD_JAIL_SECCOMP: &str =
-            include_str!("../../../td-jail/src/seccomp.rs");
-        const TD_JAIL_AUTHORITY: &str =
-            include_str!("../../../td-jail/src/authority.rs");
+        const TD_UTIL_DMESG: &str = include_str!("../../../td-util/src/dmesg.rs");
+        const TD_JAIL_SECCOMP: &str = include_str!("../../../td-jail/src/seccomp.rs");
+        const TD_JAIL_AUTHORITY: &str = include_str!("../../../td-jail/src/authority.rs");
         assert_eq!(
             TD_UTIL_DMESG
                 .matches("pub const INCOMPLETE_MARKER: &str = \"TD-DMESG-INCOMPLETE\";")
@@ -6770,10 +6829,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             TD_FIREFOX_SECCOMP_AUDIT_MARKER,
             "TD-FIREFOX-SECCOMP-OK probes=17"
         );
-        assert_eq!(
-            FIREFOX_AUDIT_CMDLINE_TOKEN,
-            "td.firefox-seccomp-audit=1"
-        );
+        assert_eq!(FIREFOX_AUDIT_CMDLINE_TOKEN, "td.firefox-seccomp-audit=1");
         for declaration in [
             "const AUTOTEST_CMDLINE_TOKEN: &str = \"td.autotest=1\";",
             "const FIREFOX_INPUT_CMDLINE_TOKEN: &str = \"td.firefox-input=1\";",
@@ -6790,7 +6846,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert_eq!(
             TD_JAIL_SECCOMP
                 .matches(
-                    "pub(crate) const FIREFOX_AUDIT_MARKER: &str =\n    \
+                    "pub(crate) const FIREFOX_AUDIT_MARKER: &str = \
                      \"TD-FIREFOX-SECCOMP-OK probes=17\";"
                 )
                 .count(),
@@ -6800,8 +6856,14 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
 
     #[test]
     fn human_grant_rosters_match_installed_permissions_and_lifecycle_units() {
-        let helper = include_str!("../../../td-authd/src/application_files.rs").split("#[cfg(test)]").next().unwrap();
-        let jail = include_str!("../../../td-jail/src/authority.rs").split("#[cfg(test)]").next().unwrap();
+        let helper = include_str!("../../../td-authd/src/application_files.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let jail = include_str!("../../../td-jail/src/authority.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
         let shutdown = build_shutdown();
         for (app, variant, location, consumer) in [
             ("firefox", "FirefoxDownloads", "xdg-download", "firefox"),
@@ -6810,16 +6872,37 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         ] {
             let recipe = crate::catalog::lookup(app).unwrap();
             let permissions = recipe.application_permissions.as_ref().unwrap();
-            assert!(permissions.to_keyfile().lines().any(|line| line == format!("{location}=rw:create")), "{app}");
-            assert!(helper.contains(&format!("[name] if name == {app:?} => Ok(Self::{variant})")), "{app}");
-            assert_eq!(unit_key(&format!("{app}-files"), "exec"), Some(format!("/bin/td-authd prepare-application-files {app}")));
-            assert!(unit_key(consumer, "requires").unwrap().split(',').any(|unit| unit == format!("{app}-files")));
+            assert!(
+                permissions
+                    .to_keyfile()
+                    .lines()
+                    .any(|line| line == format!("{location}=rw:create")),
+                "{app}"
+            );
+            assert!(
+                helper.contains(&format!("[name] if name == {app:?} => Ok(Self::{variant})")),
+                "{app}"
+            );
+            assert_eq!(
+                unit_key(&format!("{app}-files"), "exec"),
+                Some(format!("/bin/td-authd prepare-application-files {app}"))
+            );
+            assert!(unit_key(consumer, "requires")
+                .unwrap()
+                .split(',')
+                .any(|unit| unit == format!("{app}-files")));
             assert!(shutdown.contains(&format!("/bin/td-authd release-application-files {app} ||")));
         }
         assert_eq!(helper.matches("=> Ok(Self::").count(), 3);
         assert!(helper.contains("Self::FirefoxDownloads | Self::MailDownloads => \"Downloads\""));
         assert!(helper.contains("Self::Workspace => \"src\""));
-        let projection = jail.split("let component = match ").nth(1).unwrap().split("};").next().unwrap();
+        let projection = jail
+            .split("let component = match ")
+            .nth(1)
+            .unwrap()
+            .split("};")
+            .next()
+            .unwrap();
         assert!(projection.contains("Some(\"firefox\" | \"mail\") => \"Downloads\""));
         assert!(projection.contains("Some(\"claude\") => \"src\""));
         assert_eq!(projection.matches("Some(").count(), 2);
@@ -6842,11 +6925,16 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             format!("/run/td-compositor/{UI_UID}/td-control")
         );
         let jail = include_str!("../../../td-jail/src/authority.rs");
-        assert!(jail.contains(&format!("if policy.owner() != {UI_UID} ||")));
+        assert!(jail.contains(&format!(
+            "if policy.owner() != {UI_UID}\n        || !policy"
+        )));
         let account = crate::primary_account::parse(&build_passwd(&SYSTEM)).unwrap();
         assert_eq!(crate::primary_account::UID, UI_UID);
         assert_eq!(account.name(), UI_USER);
-        assert_eq!(account.persistent_home().to_str(), Some(format!("/var{UI_HOME}").as_str()));
+        assert_eq!(
+            account.persistent_home().to_str(),
+            Some(format!("/var{UI_HOME}").as_str())
+        );
         assert!(jail.contains("crate::primary_account::load()?"));
         assert!(jail.contains("account.persistent_home().join(component)"));
         let application_grants = include_str!("../../../td-authd/src/application_files.rs");
@@ -6902,14 +6990,22 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert!(portal.contains(&format!("const PORTAL_UID: u32 = {PORTAL_RESERVED_UID};")));
         assert!(portal.contains(&format!("const PORTAL_USER: &str = \"{PORTAL_USER}\";")));
         let policy = include_str!("../../../td-busd/src/app_policy.rs");
-        assert!(policy.contains(&format!("pub const PORTAL_UID: u32 = {PORTAL_RESERVED_UID};")));
+        assert!(policy.contains(&format!(
+            "pub const PORTAL_UID: u32 = {PORTAL_RESERVED_UID};"
+        )));
         let grants = include_str!("../../../td-authd/src/portal_files.rs");
         assert!(grants.contains(&format!("const HUMAN: u32 = {UI_UID};")));
         assert!(grants.contains(&format!("const PORTAL: u32 = {PORTAL_RESERVED_UID};")));
         assert_eq!(UI_HOME, format!("/home/{UI_USER}"));
         assert!(grants.contains("let human = child(&home, account.name(), HUMAN, true)?;"));
-        assert_eq!(unit_key("portal-files", "exec").as_deref(), Some("/bin/td-authd prepare-portal-files"));
-        assert_eq!(unit_key("portal-files", "requires").as_deref(), Some("td-firstboot"));
+        assert_eq!(
+            unit_key("portal-files", "exec").as_deref(),
+            Some("/bin/td-authd prepare-portal-files")
+        );
+        assert_eq!(
+            unit_key("portal-files", "requires").as_deref(),
+            Some("td-firstboot")
+        );
         let seat = include_str!("../../../td-seatd/src/main.rs");
         assert!(seat.contains(r#"const COMPOSITOR_RUNTIME_NAME: &str = "td-compositor";"#));
         assert!(seat.contains("shared_runtime(human_runtime, COMPOSITOR_RUNTIME_NAME)"));
@@ -6942,9 +7038,12 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             private_runtime_accounts,
             [PORTAL_USER, BROKER_USER, COMPOSITOR_USER, AUDIO_USER]
         );
-        assert_eq!(unit_key("wayland", "exec"), Some(format!(
-            "/bin/td-authd terminal-serve --primary --peer-uid {COMPOSITOR_RESERVED_UID}"
-        )));
+        assert_eq!(
+            unit_key("wayland", "exec"),
+            Some(format!(
+                "/bin/td-authd terminal-serve --primary --peer-uid {COMPOSITOR_RESERVED_UID}"
+            ))
+        );
         let peer = unit_key("wayland", "pair-exec").unwrap_or_default();
         assert!(peer.starts_with(&format!(
             "/bin/td-login exec-service-as {COMPOSITOR_USER} -- /bin/td-compositor run "
@@ -7093,8 +7192,8 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         let serial = u64::from(svc_timeouts::HOSTNAME)
             .saturating_add(u64::from(svc_timeouts::FIRSTBOOT))
             .saturating_add(u64::from(svc_timeouts::ROOTCHECK));
-        let predecessor = u64::from(PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS)
-            .max(u64::from(svc_timeouts::NETUP));
+        let predecessor =
+            u64::from(PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS).max(u64::from(svc_timeouts::NETUP));
         let required = serial
             .saturating_add(guest)
             .saturating_add(predecessor)
@@ -7125,9 +7224,21 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         const HEADROOM: u32 = 2;
         // (value, worst case in seconds, what that worst case is)
         let floors: [(u32, u32, &str); 9] = [
-            (svc_timeouts::HOSTNAME, 1, "one file read plus sethostname(2)"),
-            (svc_timeouts::FIRSTBOOT, 60, "ed25519 keygen, writes to /var, then sync"),
-            (svc_timeouts::ROOTCHECK, 50, "~50 process spawns incl. su, plus a sync"),
+            (
+                svc_timeouts::HOSTNAME,
+                1,
+                "one file read plus sethostname(2)",
+            ),
+            (
+                svc_timeouts::FIRSTBOOT,
+                60,
+                "ed25519 keygen, writes to /var, then sync",
+            ),
+            (
+                svc_timeouts::ROOTCHECK,
+                50,
+                "~50 process spawns incl. su, plus a sync",
+            ),
             (
                 svc_timeouts::SEAT,
                 1,
@@ -7183,32 +7294,59 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
 
     #[test]
     fn release_source_initialization_is_unprivileged_and_optional() {
-        assert_eq!(unit_key("release-source", "exec").as_deref(),
-            Some("/bin/td-login exec-primary -- /bin/td-update init"));
-        assert_eq!(unit_key("release-source", "type").as_deref(), Some("oneshot"));
-        assert_eq!(unit_key("release-source", "cgroup").as_deref(), Some("session"));
-        assert_eq!(unit_key("release-source", "requires").as_deref(), Some("td-firstboot"));
-        assert_eq!(unit_key("release-source", "after").as_deref(), Some("td-firstboot"));
+        assert_eq!(
+            unit_key("release-source", "exec").as_deref(),
+            Some("/bin/td-login exec-primary -- /bin/td-update init")
+        );
+        assert_eq!(
+            unit_key("release-source", "type").as_deref(),
+            Some("oneshot")
+        );
+        assert_eq!(
+            unit_key("release-source", "cgroup").as_deref(),
+            Some("session")
+        );
+        assert_eq!(
+            unit_key("release-source", "requires").as_deref(),
+            Some("td-firstboot")
+        );
+        assert_eq!(
+            unit_key("release-source", "after").as_deref(),
+            Some("td-firstboot")
+        );
         for unit in TD_SVC_UNITS {
-            assert!(!unit_key(unit, "requires").unwrap_or_default()
-                .split(',').any(|dependency| dependency == "release-source"));
+            assert!(!unit_key(unit, "requires")
+                .unwrap_or_default()
+                .split(',')
+                .any(|dependency| dependency == "release-source"));
         }
         let steps = recipe().steps.unwrap();
         assert!(steps.iter().any(|step| matches!(step, Step::Symlink { target, link }
             if target == "{in:td-update}/bin/td-update" && link == "{root}/real-root/bin/td-update")));
-        assert!(steps.iter().any(|step| matches!(step, Step::CopyTree { from, dest }
+        assert!(steps
+            .iter()
+            .any(|step| matches!(step, Step::CopyTree { from, dest }
             if from == "{in:td-update}" && dest == "{root}/real-root{in:td-update}")));
     }
 
     #[test]
     fn vm_guest_helper_runs_without_root_in_the_standard_image() {
-        assert_eq!(unit_key("vm-guest", "exec").as_deref(), Some("/bin/td-login exec-primary -- /bin/td-vm-guest serve"));
-        assert_eq!(unit_key("vm-power", "exec").as_deref(), Some("/bin/td-vm-guest power-serve"));
+        assert_eq!(
+            unit_key("vm-guest", "exec").as_deref(),
+            Some("/bin/td-login exec-primary -- /bin/td-vm-guest serve")
+        );
+        assert_eq!(
+            unit_key("vm-power", "exec").as_deref(),
+            Some("/bin/td-vm-guest power-serve")
+        );
         assert_eq!(unit_key("vm-power", "requires").as_deref(), Some("seat"));
         assert_eq!(unit_key("vm-power", "restart").as_deref(), Some("always"));
         assert!(ordered_before("seat", "vm-power"));
         assert_eq!(unit_key("vm-guest", "cgroup").as_deref(), Some("session"));
-        assert_eq!(unit_key("vm-guest", "requires").as_deref(), Some("seat,td-firstboot"));
+        assert_eq!(
+            unit_key("vm-guest", "requires").as_deref(),
+            Some("seat,td-firstboot")
+        );
         assert_eq!(unit_key("vm-guest", "restart").as_deref(), Some("always"));
         assert!(ordered_before("seat", "vm-guest"));
         assert!(ordered_before("netup", "vm-guest"));
@@ -7217,7 +7355,9 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             if target == "{in:td-vm-guest}/bin/td-vm-guest" && link == "{root}/real-root/bin/td-vm-guest")));
         assert!(steps.iter().any(|step| matches!(step, Step::Symlink { target, link }
             if target == "{in:td-vm-guest}/bin/td-vm-ssh" && link == "{root}/real-root/bin/td-vm-ssh")));
-        assert!(steps.iter().any(|step| matches!(step, Step::CopyTree { from, dest }
+        assert!(steps
+            .iter()
+            .any(|step| matches!(step, Step::CopyTree { from, dest }
             if from == "{in:td-vm-guest}" && dest == "{root}/real-root{in:td-vm-guest}")));
     }
 
@@ -7263,16 +7403,23 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             ("applications-workspace", vec!["terminal"]),
             (
                 "mail",
-                vec!["busd", "portal", "mail-fetch", "mail-files", "applications-workspace", "firefox-tls-setup"],
+                vec![
+                    "busd",
+                    "portal",
+                    "mail-fetch",
+                    "mail-files",
+                    "applications-workspace",
+                    "firefox-tls-setup",
+                ],
             ),
             ("mail-evidence", vec!["mail", "firefox-tls-setup"]),
-            (
-                "news",
-                vec!["busd", "news-fetch", "applications-workspace"],
-            ),
+            ("news", vec!["busd", "news-fetch", "applications-workspace"]),
             ("news-evidence", vec!["news", "firefox-tls-setup"]),
             ("shell-workspace", vec!["mail", "news"]),
-            ("placement-evidence", vec!["shell-workspace", "firefox-tls-setup"]),
+            (
+                "placement-evidence",
+                vec!["shell-workspace", "firefox-tls-setup"],
+            ),
             ("firefox-tls-setup", vec!["seat"]),
             ("firefox-tls-origin", vec!["firefox-tls-setup"]),
             ("firefox-autotest", vec!["seat", "td-firstboot"]),
@@ -7296,7 +7443,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             ),
             ("firefox-input", vec!["terminal-authority-evidence"]),
             ("firefox-soak", vec!["firefox-input"]),
-            ("claude-evidence", vec!["firefox-soak", "claude-files", "claude-launch"]),
+            (
+                "claude-evidence",
+                vec!["firefox-soak", "claude-files", "claude-launch"],
+            ),
             (
                 "bootsuccess",
                 sysinit
@@ -7431,7 +7581,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             // app, the foreign firefox/claude oracles are daemons that never
             // restart. Either way it is a defined unit, not just a name.
             assert!(
-                matches!(unit_key(&unit, "type").as_deref(), Some("oneshot") | Some("daemon")),
+                matches!(
+                    unit_key(&unit, "type").as_deref(),
+                    Some("oneshot") | Some("daemon")
+                ),
                 "{unit} is not a defined oracle unit"
             );
         }
@@ -7447,8 +7600,14 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
     #[test]
     fn claude_evidence_refuses_without_a_terminal_and_runs_inside_one() {
         let exec = unit_key("claude-evidence", "exec").unwrap_or_default();
-        assert_eq!(unit_after("claude-evidence"), vec!["firefox-soak", "claude-files", "claude-launch"]);
-        assert_eq!(unit_key("claude-evidence", "requires").as_deref(), Some("td-firstboot,claude-files,claude-launch"));
+        assert_eq!(
+            unit_after("claude-evidence"),
+            vec!["firefox-soak", "claude-files", "claude-launch"]
+        );
+        assert_eq!(
+            unit_key("claude-evidence", "requires").as_deref(),
+            Some("td-firstboot,claude-files,claude-launch")
+        );
         assert!(unit_key("claude-evidence", "timeout").is_none());
         for needle in [
             format!("*\" {AUTOTEST_CMDLINE_TOKEN} \"*) :;; *) exit 0;; esac"),
@@ -7495,7 +7654,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             format!("{CLAUDE_COMPLETION} > {CLAUDE_COMPLETION_TMP_PATH}"),
             format!("/bin/mv {CLAUDE_COMPLETION_TMP_PATH} {CLAUDE_COMPLETION_PATH} && exit 0"),
         ] {
-            assert!(exec.contains(needle.as_str()), "claude-evidence lacks {needle:?}");
+            assert!(
+                exec.contains(needle.as_str()),
+                "claude-evidence lacks {needle:?}"
+            );
         }
         // The payload's captured bytes never reach the console: each capture
         // is read once by the check and once by the write to the file.
@@ -7591,7 +7753,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             "root must retain the broker capability while supervising its direct child"
         );
         assert_eq!(unit_key("portal", "ready"), Some(probe.clone()));
-        assert_eq!(unit_key("portal", "after").as_deref(), Some("busd,portal-files"));
+        assert_eq!(
+            unit_key("portal", "after").as_deref(),
+            Some("busd,portal-files")
+        );
         assert_eq!(unit_key("portal", "requires").as_deref(), Some("busd"));
         assert_eq!(unit_key("portal", "restart").as_deref(), Some("always"));
         assert_eq!(unit_key("portal", "ready-timeout").as_deref(), Some("30"));
@@ -7974,9 +8139,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         let libressl_copies: Vec<(&str, &str)> = steps
             .iter()
             .filter_map(|step| match step {
-                Step::CopyTree { from, dest }
-                    if from.starts_with("{in:libressl-x86-64}/") =>
-                {
+                Step::CopyTree { from, dest } if from.starts_with("{in:libressl-x86-64}/") => {
                     Some((from.as_str(), dest.as_str()))
                 }
                 _ => None,
@@ -8000,18 +8163,12 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             ("rg", "{in:ripgrep}/bin/rg"),
             ("fd", "{in:fd}/bin/fd"),
             ("git", "{in:git-x86-64}/bin/git"),
-            (
-                "git-receive-pack",
-                "{in:git-x86-64}/bin/git-receive-pack",
-            ),
+            ("git-receive-pack", "{in:git-x86-64}/bin/git-receive-pack"),
             (
                 "git-upload-archive",
                 "{in:git-x86-64}/bin/git-upload-archive",
             ),
-            (
-                "git-upload-pack",
-                "{in:git-x86-64}/bin/git-upload-pack",
-            ),
+            ("git-upload-pack", "{in:git-x86-64}/bin/git-upload-pack"),
             ("codex", "{in:codex}/bin/codex"),
             ("bwrap", "{in:codex-bwrap}/bin/bwrap"),
             ("openssl", "{in:libressl-x86-64}/bin/openssl"),
@@ -8054,7 +8211,15 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         }
 
         let native_inputs = recipe().native_inputs.expect("system native inputs");
-        for required in ["codex", "codex-bwrap", "libressl-x86-64", "rust-toolchain", "gcc-x86-64-self", "binutils-x86-64-self", "td-cc"] {
+        for required in [
+            "codex",
+            "codex-bwrap",
+            "libressl-x86-64",
+            "rust-toolchain",
+            "gcc-x86-64-self",
+            "binutils-x86-64-self",
+            "td-cc",
+        ] {
             assert!(
                 native_inputs.iter().any(|input| input == required),
                 "shipped input {required} must be declared"
@@ -8135,7 +8300,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             .collect();
         for (name, gid) in &groups {
             assert_eq!(
-                groups.iter().filter(|(candidate, _)| candidate == name).count(),
+                groups
+                    .iter()
+                    .filter(|(candidate, _)| candidate == name)
+                    .count(),
                 1,
                 "group name '{name}' must be unique"
             );
@@ -8283,9 +8451,8 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             // loops); reject it.
             let packed_applet = u.shell.strip_prefix("/bin/");
             assert!(
-                packed_applet.is_some_and(|a| {
-                    TD_SH_APPLETS.contains(&a) || UUTILS_APPLETS.contains(&a)
-                }),
+                packed_applet
+                    .is_some_and(|a| { TD_SH_APPLETS.contains(&a) || UUTILS_APPLETS.contains(&a) }),
                 "user '{}' login shell '{}' must be \"/bin/<applet>\" packed by a /bin farm \
                  (td-login execs it by absolute path)",
                 u.name,
@@ -8312,8 +8479,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
         for application in SYSTEM.applications {
             assert!(
-                td_engine::application::validate_application_identity(application.name)
-                    .is_ok(),
+                td_engine::application::validate_application_identity(application.name).is_ok(),
                 "shipped application name {:?} is not a valid launcher key",
                 application.name
             );
@@ -8482,7 +8648,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
              group- or world-access would green a terminal the next session can read"
         );
         assert!(
-            profile.contains(&format!("[ \"$3\" = {} ] && [ \"$4\" = {} ]", user.uid, user.gid)),
+            profile.contains(&format!(
+                "[ \"$3\" = {} ] && [ \"$4\" = {} ]",
+                user.uid, user.gid
+            )),
             "the terminal must be checked against the autologin account's OWN ids, \
              not merely against 'not root'"
         );
@@ -8529,7 +8698,15 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 "credential applet '{a}' missing from the td-login farm"
             );
         }
-        for a in ["init", "reboot", "switch_root", "hostname", "mount", "umount", "getty"] {
+        for a in [
+            "init",
+            "reboot",
+            "switch_root",
+            "hostname",
+            "mount",
+            "umount",
+            "getty",
+        ] {
             assert!(
                 td_init_applets().contains(&a),
                 "boot-glue applet '{a}' missing from the td-init farm"
@@ -8664,7 +8841,11 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         let td_init = td_init_applets();
         let applications = application_names(&SYSTEM);
         let farms = bin_farms(&td_init, &applications);
-        assert_eq!(farms.len(), 7, "the open application farm must stay registered");
+        assert_eq!(
+            farms.len(),
+            7,
+            "the open application farm must stay registered"
+        );
         for (i, (a_name, a_set)) in farms.iter().enumerate() {
             for (b_name, b_set) in farms.iter().skip(i + 1) {
                 for a in a_set.iter() {
@@ -8682,12 +8863,17 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             "application names collide with existing direct or farmed /bin providers: {collisions:?}"
         );
         for a in [
-            "hostname", "mount", "umount", "sh", "init", "switch_root", "login", "su",
+            "hostname",
+            "mount",
+            "umount",
+            "sh",
+            "init",
+            "switch_root",
+            "login",
+            "su",
         ] {
             assert!(
-                TD_SH_APPLETS.contains(&a)
-                    || td_init.contains(&a)
-                    || TD_LOGIN_APPLETS.contains(&a),
+                TD_SH_APPLETS.contains(&a) || td_init.contains(&a) || TD_LOGIN_APPLETS.contains(&a),
                 "boot-critical applet '{a}' must be served by a STATIC binary (td-sh, \
                  td-init or td-login) - it runs where no dynamic loader is reachable"
             );
@@ -8823,24 +9009,24 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
     #[test]
     fn command_position_is_recognised_in_the_shapes_this_file_writes() {
         for yes in [
-            "",                      // start of text
-            "foo\n",                 // start of line
-            "cmd; ",                 // after a separator
+            "",      // start of text
+            "foo\n", // start of line
+            "cmd; ", // after a separator
             "a && ",
             "a || ",
             "a | ",
-            "if ! ",                 // negation
+            "if ! ", // negation
             "if ",
             "while ",
             "then ",
             "do ",
-            "case x in x) ",         // a case arm's body
+            "case x in x) ", // a case arm's body
             "exec ",
             "env ",
-            "TDVAR=1 ",              // an assignment prefix
-            "sh -c '",               // the -c body this file writes five times
+            "TDVAR=1 ", // an assignment prefix
+            "sh -c '",  // the -c body this file writes five times
             "/bin/sh -c \"",
-            "cmd \\\n     ",          // a line continuation
+            "cmd \\\n     ", // a line continuation
         ] {
             assert!(
                 in_command_position(yes),
@@ -8848,13 +9034,13 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             );
         }
         for no in [
-            "echo \"td-util: ",       // prose — the diagnostics this file emits
+            "echo \"td-util: ", // prose — the diagnostics this file emits
             "echo 'td-init: ",
-            "dir {in:",              // a store-path component
-            "TD_UTIL",               // a marker name
-            "/bin/",                 // handled by the caller, not here
-            "grep -q ",              // an operand, not a command
-            "motif ",                // ends with a keyword but is not one
+            "dir {in:", // a store-path component
+            "TD_UTIL",  // a marker name
+            "/bin/",    // handled by the caller, not here
+            "grep -q ", // an operand, not a command
+            "motif ",   // ends with a keyword but is not one
             "ado ",
         ] {
             assert!(
@@ -8864,7 +9050,6 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             );
         }
     }
-
 
     /// The words of the `test` expression starting at `rest`, up to the first shell
     /// separator OUTSIDE quotes and `$( )`.
@@ -9072,7 +9257,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             // A scan that matched nothing proves nothing. Both multicalls ARE called by
             // the generated scripts, so zero here means the spelling moved and the check
             // silently stopped looking.
-            assert!(calls > 0, "no /bin/{token} <applet> call sites found; the scan is inert");
+            assert!(
+                calls > 0,
+                "no /bin/{token} <applet> call sites found; the scan is inert"
+            );
         }
     }
 
@@ -9283,9 +9471,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             "for a in {}; do",
             application_names(&SYSTEM).join(" ")
         )));
-        assert!(shape.contains(
-            "[ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ]"
-        ));
+        assert!(shape.contains("[ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ]"));
     }
 
     /// The mirror of the busybox-multiplexer ban, for the form this commit actually
@@ -9321,7 +9507,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         // The pre-pivot half is the strict one, and it lives entirely in the sources that
         // carry a cpio /bin. Pin their count here: a script_sources() that stopped returning
         // the two inits would make that half vacuous with every remaining assertion green.
-        let cpio_backed = script_sources().iter().filter(|(_, _, c)| c.is_some()).count();
+        let cpio_backed = script_sources()
+            .iter()
+            .filter(|(_, _, c)| c.is_some())
+            .count();
         assert_eq!(
             cpio_backed, 2,
             "expected the selector and deployment inits to be checked against their own cpio \
@@ -9354,9 +9543,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 };
                 let called: String = rest
                     .chars()
-                    .take_while(|c| {
-                        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '[')
-                    })
+                    .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '['))
                     .collect();
                 // Fail CLOSED, as the multiplexer scan does: `/bin/"$cmd"` and `/bin//ls`
                 // both leave this empty, and skipping them would let the calls that most
@@ -9469,10 +9656,16 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         // Every PERSISTENT entry must be one td-firstboot actually creates: a table
         // entry with no provisioner is a symlink that dangles for the life of the
         // machine, which is worse than no entry at all.
-        let provisioned = ["HOSTNAME", "MACHINE_ID", "HOST_KEY", "HOST_KEY_PUB", "AUTHORIZED_KEYS"]
-            .iter()
-            .filter_map(|name| firstboot_const(name))
-            .collect::<Vec<_>>();
+        let provisioned = [
+            "HOSTNAME",
+            "MACHINE_ID",
+            "HOST_KEY",
+            "HOST_KEY_PUB",
+            "AUTHORIZED_KEYS",
+        ]
+        .iter()
+        .filter_map(|name| firstboot_const(name))
+        .collect::<Vec<_>>();
         for entry in MUTABLE_ETC.iter().filter(|e| e.state == State::Persistent) {
             assert!(
                 provisioned.contains(&entry.etc),
@@ -9484,20 +9677,41 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
 
     #[test]
     fn hostname_startup_reads_the_persistent_choice_and_has_its_applet() {
-        assert_eq!(hostname::Hostname::parse(SYSTEM.hostname).unwrap().name(), SYSTEM.hostname);
-        let saved = MUTABLE_ETC.iter().find(|entry| entry.etc == "hostname").unwrap();
+        assert_eq!(
+            hostname::Hostname::parse(SYSTEM.hostname).unwrap().name(),
+            SYSTEM.hostname
+        );
+        let saved = MUTABLE_ETC
+            .iter()
+            .find(|entry| entry.etc == "hostname")
+            .unwrap();
         assert_eq!(saved.state, State::Persistent);
         assert_eq!(saved.target, "/var/lib/td/hostname");
         assert!(include_str!("../../../td-install/src/main.rs")
             .contains("const HOSTNAME_STATE_RELATIVE: &str = \"lib/td/hostname\";"));
-        assert_eq!(firstboot_const("HOSTNAME_DEFAULT"), Some("/etc/hostname-default"));
+        assert_eq!(
+            firstboot_const("HOSTNAME_DEFAULT"),
+            Some("/etc/hostname-default")
+        );
         assert_eq!(firstboot_const("HOSTNAME_PROGRAM"), Some("/bin/hostname"));
         assert!(td_init_applets().contains(&"hostname"));
-        assert_eq!(unit_key("hostname", "exec").as_deref(), Some("/bin/td-firstboot hostname"));
-        assert!(etc_files(&SYSTEM).unwrap().iter().any(|(path, text, _)|
-            *path == "hostname-default" && *text == format!("{}\n", SYSTEM.hostname)));
-        assert!(!etc_files(&SYSTEM).unwrap().iter().any(|(path, _, _)| *path == "hostname"));
-        assert!(unit_key("bootsuccess", "requires").unwrap().split(',').any(|unit| unit == "hostname"));
+        assert_eq!(
+            unit_key("hostname", "exec").as_deref(),
+            Some("/bin/td-firstboot hostname")
+        );
+        assert!(etc_files(&SYSTEM)
+            .unwrap()
+            .iter()
+            .any(|(path, text, _)| *path == "hostname-default"
+                && *text == format!("{}\n", SYSTEM.hostname)));
+        assert!(!etc_files(&SYSTEM)
+            .unwrap()
+            .iter()
+            .any(|(path, _, _)| *path == "hostname"));
+        assert!(unit_key("bootsuccess", "requires")
+            .unwrap()
+            .split(',')
+            .any(|unit| unit == "hostname"));
     }
 
     #[test]
@@ -9540,8 +9754,9 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             );
             for (label, path) in [("etc", etc), ("target", entry.target)] {
                 assert!(
-                    path.bytes().all(|b| b.is_ascii_alphanumeric()
-                        || matches!(b, b'.' | b'_' | b'-' | b'/')),
+                    path.bytes().all(
+                        |b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/')
+                    ),
                     "{label} {path:?} has a character that is not safe unquoted in the \
                      generated shell (or that td-builder's ASCII config reader would mangle)"
                 );
@@ -9743,7 +9958,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 !etc.contains("..") && !etc.contains("//"),
                 "/etc/{etc}: a traversal or empty component would escape /etc"
             );
-            assert!(safe(etc), "/etc/{etc} is not safe unquoted in the generated shell");
+            assert!(
+                safe(etc),
+                "/etc/{etc} is not safe unquoted in the generated shell"
+            );
             // The target is a store reference rather than a literal path: the
             // hash a package lands under is not knowable here.
             let rest = entry
@@ -9755,9 +9973,11 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                     rest
                 });
             let Some(rest) = rest else {
-                panic!("/etc/{etc} points at {:?}, which is not a {{in:…}} store reference \
+                panic!(
+                    "/etc/{etc} points at {:?}, which is not a {{in:…}} store reference \
                         - an absolute path would name a store hash this file cannot know",
-                       entry.target);
+                    entry.target
+                );
             };
             assert!(
                 rest.starts_with('/') && safe(rest),
@@ -9888,7 +10108,9 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
 
     #[test]
     fn primary_server_policy_is_required_before_entering_the_deployment() {
-        assert!(!etc_files(&SYSTEM).expect("generated etc").iter()
+        assert!(!etc_files(&SYSTEM)
+            .expect("generated etc")
+            .iter()
             .any(|(path, _, _)| *path == "ssh/sshd_config"));
         let init = build_deployment_init(&SYSTEM);
         let render = format!(
@@ -9896,7 +10118,9 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
              /bin/td-firstboot render-primary-sshd /sysroot > /sysroot{SSHD_CONFIG} && \
              /bin/td-util chmod 0600 /sysroot{SSHD_CONFIG}' || exit 1"
         );
-        let at = init.find(&render).expect("required account-derived server policy");
+        let at = init
+            .find(&render)
+            .expect("required account-derived server policy");
         assert!(at < init.find("/bin/umount /proc").expect("proc cleanup"));
         assert!(init.contains(&format!("/bin/td-util chmod 0600 /sysroot{SSHD_CONFIG}")));
         assert_eq!(
@@ -9912,7 +10136,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
     fn boot_health_leaves_the_card_to_the_compositor() {
         let bootsuccess = build_bootsuccess(&SYSTEM);
         assert!(!bootsuccess.contains("/dev/dri"), "{bootsuccess}");
-        assert!(!bootsuccess.contains("td-compositor probe-"), "{bootsuccess}");
+        assert!(
+            !bootsuccess.contains("td-compositor probe-"),
+            "{bootsuccess}"
+        );
     }
 
     #[test]
@@ -9929,9 +10156,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             .unwrap_or_else(|| unreachable!("the persistent administrator path is not used"));
         assert!(gate_at < key_at && key_at < login_at);
         assert!(
-            bootsuccess.contains(&format!(
-                "{AUTOTEST_CMDLINE_TOKEN}) admin_fixture=1"
-            )),
+            bootsuccess.contains(&format!("{AUTOTEST_CMDLINE_TOKEN}) admin_fixture=1")),
             "only an explicit QEMU autotest boot may expect the disposable admin fixture"
         );
         assert!(
@@ -9950,11 +10175,9 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             "the tester must not be able to rewrite the file that authorizes it"
         );
         assert!(
-            bootsuccess.contains(&format!(
-                "/bin/chown 0:0 {SSHD_SELFTEST_AUTHORIZED_KEYS}"
-            )) && bootsuccess.contains(&format!(
-                "/bin/chmod 0644 {SSHD_SELFTEST_AUTHORIZED_KEYS}"
-            )),
+            bootsuccess.contains(&format!("/bin/chown 0:0 {SSHD_SELFTEST_AUTHORIZED_KEYS}"))
+                && bootsuccess
+                    .contains(&format!("/bin/chmod 0644 {SSHD_SELFTEST_AUTHORIZED_KEYS}")),
             "the tester authorization must stay root-owned but be readable after \
              sshd drops privilege"
         );
@@ -10064,10 +10287,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 "if o=$(/bin/cat /tmp/td-uutils-probe/hard 2>&1); then \
                  if [ \"$o\" = td-uutils-after ]; then h=1",
             ),
-            (
-                "unlink removal",
-                "/bin/unlink /tmp/td-uutils-probe/hard",
-            ),
+            ("unlink removal", "/bin/unlink /tmp/td-uutils-probe/hard"),
             (
                 "unlink entry absence",
                 "if [ -e /tmp/td-uutils-probe/hard ] || \
@@ -10191,8 +10411,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
              EIO and a greeter that cannot reach td-svc looks like a hang with no explanation"
         );
         let shutdown = build_shutdown();
-        let xdg_guard =
-            format!("if /bin/td-util test -e {FIREFOX_XDG_MOUNT_MARKER}; then");
+        let xdg_guard = format!("if /bin/td-util test -e {FIREFOX_XDG_MOUNT_MARKER}; then");
         let download_unmount = "/bin/umount \"$downloads\" || {";
         assert!(
             shutdown.contains("/bin/td-init sync || {")
@@ -10304,7 +10523,9 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                     "the hand-over precedes the mode, as the Downloads setup does"
                 );
             } else if user.uid == UI_UID {
-                assert!(init.contains("primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot)"));
+                assert!(init.contains(
+                    "primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot)"
+                ));
                 assert!(!init.contains(&path));
             } else if user.uid == 0 {
                 assert!(init.contains("/sysroot/var/root"));
@@ -10321,22 +10542,17 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             init.contains("chown 0:0 /sysroot/var")
                 && init.contains("chmod 0755 /sysroot/var")
                 && init.contains("chmod 0700 /sysroot/var/root")
-                && init.contains(
-                    "chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-test"
-                )
-                && init.contains(
-                    "chmod 0555 /sysroot/var/lib/td-test/td-jail-seccomp-probe"
-                )
+                && init.contains("chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-test")
+                && init.contains("chmod 0555 /sysroot/var/lib/td-test/td-jail-seccomp-probe")
                 && init.contains(&format!(
                     "chmod 0600 /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY}",
                 ))
-                && init.contains(&format!(
-                    "/sysroot{SSHD_AUTHORIZED_KEYS_STATE}"
-                )),
+                && init.contains(&format!("/sysroot{SSHD_AUTHORIZED_KEYS_STATE}")),
             "selected init must normalize persistent state ownership and modes"
         );
         assert!(
-            init.trim_end().ends_with("exec /bin/switch_root /sysroot /init"),
+            init.trim_end()
+                .ends_with("exec /bin/switch_root /sysroot /init"),
             "stage-1 init must END by exec-ing switch_root so the pivot inherits PID 1"
         );
     }
@@ -10369,28 +10585,20 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
     #[test]
     fn firefox_downloads_is_prepared_once_before_switch_root() {
         let init = build_deployment_init(&SYSTEM);
-        let source_mkdir = format!(
-            "elif /bin/td-util mkdir -p \"/sysroot$downloads\"; then"
-        );
-        let download_mount = format!(
-            "/bin/mount -o bind \"/sysroot$downloads\" \"/sysroot$downloads\""
-        );
-        let download_link_guard = format!(
-            "if /bin/td-util readlink \"/sysroot$downloads\" >/dev/null 2>&1; then"
-        );
+        let source_mkdir = format!("elif /bin/td-util mkdir -p \"/sysroot$downloads\"; then");
+        let download_mount =
+            format!("/bin/mount -o bind \"/sysroot$downloads\" \"/sysroot$downloads\"");
+        let download_link_guard =
+            format!("if /bin/td-util readlink \"/sysroot$downloads\" >/dev/null 2>&1; then");
         let download_directory_guard = format!(
             "elif /bin/td-util test -e \"/sysroot$downloads\" && ! /bin/td-util test -d \"/sysroot$downloads\"; then"
         );
-        let source_chown = format!(
-            "/bin/td-util chown {UI_UID}:{UI_GID} \"/sysroot$downloads\""
+        let source_chown = format!("/bin/td-util chown {UI_UID}:{UI_GID} \"/sysroot$downloads\"");
+        let source_chmod = format!("/bin/td-util chmod 0700 \"/sysroot$downloads\"");
+        let mount_marker = format!(
+            "/bin/td-util printf '%s\\n' \"$downloads\" > /sysroot{FIREFOX_XDG_MOUNT_MARKER}"
         );
-        let source_chmod = format!(
-            "/bin/td-util chmod 0700 \"/sysroot$downloads\""
-        );
-        let mount_marker =
-            format!("/bin/td-util printf '%s\\n' \"$downloads\" > /sysroot{FIREFOX_XDG_MOUNT_MARKER}");
-        let downloads_end =
-            "/bin/sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'";
+        let downloads_end = "/bin/sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'";
         assert_eq!(init.matches(&source_mkdir).count(), 1);
         assert_eq!(init.matches(&download_link_guard).count(), 1);
         assert_eq!(init.matches(&download_directory_guard).count(), 1);
@@ -10447,13 +10655,21 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
 
     fn renamed_primary_system() -> SystemDef {
         static USERS: std::sync::LazyLock<Vec<User>> = std::sync::LazyLock::new(|| {
-            SYSTEM.users.iter().map(|user| {
-                if user.uid == UI_UID {
-                    User { name: "alice", home: "/home/alice", ..*user }
-                } else {
-                    User { ..*user }
-                }
-            }).collect()
+            SYSTEM
+                .users
+                .iter()
+                .map(|user| {
+                    if user.uid == UI_UID {
+                        User {
+                            name: "alice",
+                            home: "/home/alice",
+                            ..*user
+                        }
+                    } else {
+                        User { ..*user }
+                    }
+                })
+                .collect()
         });
         SystemDef {
             users: USERS.as_slice(),
@@ -10468,18 +10684,33 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         let stock = build_rootcheck(&SYSTEM);
         assert_eq!(stock, build_rootcheck(&renamed));
         assert!(!stock.contains("/home/tester") && !stock.contains("/bin/su "));
-        assert_eq!(stock.matches("/bin/td-login exec-primary -- /bin/sh -c").count(), 2);
-        assert_eq!(stock.matches("/bin/td-util rm -f \"$HOME/.tdwr-su\"").count(), 2);
+        assert_eq!(
+            stock
+                .matches("/bin/td-login exec-primary -- /bin/sh -c")
+                .count(),
+            2
+        );
+        assert_eq!(
+            stock
+                .matches("/bin/td-util rm -f \"$HOME/.tdwr-su\"")
+                .count(),
+            2
+        );
     }
 
     #[test]
     fn deployment_prepares_the_checked_home_before_releasing_boot_filesystems() {
         let init = build_deployment_init(&SYSTEM);
         assert_eq!(init, build_deployment_init(&renamed_primary_system()));
-        let prepare = "primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot) || exit 1";
+        let prepare =
+            "primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot) || exit 1";
         assert_eq!(init.matches(prepare).count(), 1);
         assert!(init.find("mount-var /sysroot/var").unwrap() < init.find(prepare).unwrap());
-        assert!(init.find("/bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-profiler").unwrap() < init.find(prepare).unwrap());
+        assert!(
+            init.find("/bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-profiler")
+                .unwrap()
+                < init.find(prepare).unwrap()
+        );
         assert!(init.find(prepare).unwrap() < init.find("render-primary-sshd /sysroot").unwrap());
         assert!(init.find(prepare).unwrap() < init.find("/bin/umount /proc").unwrap());
         assert_eq!(init.matches("/bin/umount /dev").count(), 1);
@@ -10489,26 +10720,42 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert!(!init.contains("/home/tester") && !init.contains("/home/alice"));
         assert!(init.contains("downloads=\"$primary_home/Downloads\""));
         assert!(init.contains("/bin/mount -o bind \"/sysroot$downloads\" \"/sysroot$downloads\""));
-        assert!(init.contains(&format!("/bin/td-util chmod 0600 /sysroot{FIREFOX_XDG_MOUNT_MARKER}")));
+        assert!(init.contains(&format!(
+            "/bin/td-util chmod 0600 /sysroot{FIREFOX_XDG_MOUNT_MARKER}"
+        )));
         let deployment = build_initramfs_spec("deployment-init", Phase::Deployment);
         let selector = build_initramfs_spec("selector-init", Phase::Selector);
-        assert!(deployment.contains("file {in:td-firstboot}/bin/td-firstboot {in:td-firstboot}/bin/td-firstboot 0755 0 0"));
-        assert!(deployment.contains("slink /bin/td-firstboot {in:td-firstboot}/bin/td-firstboot 0777 0 0"));
+        assert!(deployment.contains(
+            "file {in:td-firstboot}/bin/td-firstboot {in:td-firstboot}/bin/td-firstboot 0755 0 0"
+        ));
+        assert!(deployment
+            .contains("slink /bin/td-firstboot {in:td-firstboot}/bin/td-firstboot 0777 0 0"));
         assert!(!selector.contains("td-firstboot"));
         let steps = recipe().steps.unwrap();
-        let normalized = steps.iter().position(|step| matches!(step,
-            Step::Run { argv, .. } if argv.iter().any(|arg|
-                arg.contains("chmod 0755 '{root}/real-root'"))
-        )).unwrap();
-        let checked = steps.iter().position(|step| matches!(step,
-            Step::Run { argv, .. } if argv == &[
-                "{in:td-firstboot}/bin/td-firstboot", "check-primary-name",
-                "{root}/real-root", UI_USER,
-            ]
-        )).unwrap();
-        let packed = steps.iter().position(|step|
-            matches!(step, Step::PackErofs { .. })
-        ).unwrap();
+        let normalized = steps
+            .iter()
+            .position(|step| {
+                matches!(step,
+                    Step::Run { argv, .. } if argv.iter().any(|arg|
+                        arg.contains("chmod 0755 '{root}/real-root'"))
+                )
+            })
+            .unwrap();
+        let checked = steps
+            .iter()
+            .position(|step| {
+                matches!(step,
+                    Step::Run { argv, .. } if argv == &[
+                        "{in:td-firstboot}/bin/td-firstboot", "check-primary-name",
+                        "{root}/real-root", UI_USER,
+                    ]
+                )
+            })
+            .unwrap();
+        let packed = steps
+            .iter()
+            .position(|step| matches!(step, Step::PackErofs { .. }))
+            .unwrap();
         assert!(normalized < checked && checked < packed);
     }
 
@@ -10522,13 +10769,18 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert!(script.find(setup).unwrap() < script.find(su).unwrap());
         assert_eq!(script.matches(su).count(), 14);
         assert_eq!(script.matches("/bin/su ").count(), 14);
-        assert!(script.contains("/bin/td-login exec-as \"$health_user\" -- /bin/td-login verify-credentials"));
+        assert!(script.contains(
+            "/bin/td-login exec-as \"$health_user\" -- /bin/td-login verify-credentials"
+        ));
         assert!(!script.contains("tester") && !script.contains("alice"));
     }
 
     #[test]
     fn boot_health_reports_a_missing_configured_account_before_probes() {
-        let invalid = SystemDef { autologin: "nobody-here", ..SYSTEM };
+        let invalid = SystemDef {
+            autologin: "nobody-here",
+            ..SYSTEM
+        };
         let script = build_bootsuccess(&invalid);
         let refusal = "echo \"td-boot: no autologin account for health probes\"; fail";
         assert!(script.find(refusal).unwrap() < script.find("/bin/su ").unwrap());
@@ -10550,11 +10802,26 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         };
         const USERS: &[User] = &[
             DIAGNOSTIC,
-            User { name: "other", uid: 1002, gid: 1002, home: "/home/other", ..DIAGNOSTIC },
+            User {
+                name: "other",
+                uid: 1002,
+                gid: 1002,
+                home: "/home/other",
+                ..DIAGNOSTIC
+            },
         ];
-        let diagnostic = SystemDef { users: USERS, autologin: "diagnostic", ..SYSTEM };
+        let diagnostic = SystemDef {
+            users: USERS,
+            autologin: "diagnostic",
+            ..SYSTEM
+        };
         let script = build_rootcheck(&diagnostic);
-        assert_eq!(script.matches("/bin/td-login exec-as diagnostic -- /bin/sh -c").count(), 2);
+        assert_eq!(
+            script
+                .matches("/bin/td-login exec-as diagnostic -- /bin/sh -c")
+                .count(),
+            2
+        );
         assert!(!script.contains("exec-primary") && !script.contains("/home/diagnostic"));
         assert!(script.contains("for d in /var /run /tmp /home /root /home/other; do "));
     }
@@ -10857,9 +11124,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                         .find("&& /bin/td-boot on-volume success")
                         .unwrap()
                 && bootsuccess.find("/bin/td-util --list").unwrap()
-                    < bootsuccess
-                        .find("if [ \"$healthy\" = 1 ]")
-                        .unwrap(),
+                    < bootsuccess.find("if [ \"$healthy\" = 1 ]").unwrap(),
             "deployment success must follow every unprivileged runtime probe"
         );
         assert!(
@@ -10900,8 +11165,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 && !configured_bootsuccess.contains("configured.host /etc/hostname"),
             "runtime probes must read the installed hostname rather than the deployment default"
         );
-        assert!(etc_files(&configured).unwrap().iter().any(|(path, text, _)|
-            *path == "hostname-default" && text == "configured.host\n"));
+        assert!(etc_files(&configured)
+            .unwrap()
+            .iter()
+            .any(|(path, text, _)| *path == "hostname-default" && text == "configured.host\n"));
         assert!(
             bootsuccess.contains(DEPLOY_INSTALL_CMDLINE_TOKEN)
                 && bootsuccess.contains(&format!(
@@ -11090,7 +11357,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // the refused pass stops testing what it says it does while staying green.
         let pattern = td_boot_protocol::MANIFEST_UNAUTHENTICATED;
         assert!(
-            pattern.len() >= 8 && !pattern.chars().any(|c| c == '\'' || c == '\\' || c.is_control()),
+            pattern.len() >= 8
+                && !pattern
+                    .chars()
+                    .any(|c| c == '\'' || c == '\\' || c.is_control()),
             "the refusal pattern must be a non-trivial, single-quotable string: {pattern:?}"
         );
         assert!(
@@ -11171,7 +11441,9 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(
             bootsuccess.contains("/bin/cat /etc/os-release")
                 && bootsuccess.find("/bin/cat /etc/os-release").unwrap()
-                    < bootsuccess.find(&format!("echo {UUTILS_RUNTIME_MARKER}")).unwrap(),
+                    < bootsuccess
+                        .find(&format!("echo {UUTILS_RUNTIME_MARKER}"))
+                        .unwrap(),
             "the uutils marker must follow a successful unprivileged absolute-path invocation"
         );
         assert!(
@@ -11189,7 +11461,8 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // markers. Each marker must be gated on its real operation so a failure drops
         // the marker and reds the qemu-boot-net oracle rather than false-passing.
         let netup = build_netup();
-        let user_lookup = "health_user=$(/bin/td-login exec-primary -- /bin/printenv USER) || exit 1";
+        let user_lookup =
+            "health_user=$(/bin/td-login exec-primary -- /bin/printenv USER) || exit 1";
         let user_probe = "/bin/su -s /bin/sh \"$health_user\" -c";
         assert!(netup.find(user_lookup).unwrap() < netup.find(user_probe).unwrap());
         assert!(!netup.contains("tester"));
@@ -11240,13 +11513,21 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     fn shape_check_asks_the_initramfs_for_members_it_actually_packs() {
         let check = shape_check();
         let specs = [
-            ("selector", build_initramfs_spec("selector-init", Phase::Selector)),
-            ("deployment", build_initramfs_spec("deployment-init", Phase::Deployment)),
+            (
+                "selector",
+                build_initramfs_spec("selector-init", Phase::Selector),
+            ),
+            (
+                "deployment",
+                build_initramfs_spec("deployment-init", Phase::Deployment),
+            ),
         ];
         // The `for m in … ; do` sweep: every name is a cpio member path, and both
         // archives are swept with the same list.
         let marker = "for m in ";
-        let start = check.find(marker).expect("shape_check sweeps the cpio members");
+        let start = check
+            .find(marker)
+            .expect("shape_check sweeps the cpio members");
         let rest = check.get(start + marker.len()..).unwrap_or_default();
         let list = rest.split(';').next().unwrap_or_default();
         // No filter: the top-level members (`init`, `proc`, `run`, `volume`,
@@ -11377,7 +11658,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         }
         // Exact for the same reason: a floor stays green while shape_check quietly
         // stops asking one archive for a payload the other still gets checked for.
-        assert_eq!(greps, 10, "{greps} store-member greps found - the scan has gone stale");
+        assert_eq!(
+            greps, 10,
+            "{greps} store-member greps found - the scan has gone stale"
+        );
     }
 
     /// The td-term terminfo entry ships at `0444`, the mode td-jail's terminal
@@ -11416,16 +11700,21 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         let chmod = format!("chmod 0444 '{TERMINFO_ENTRY}'");
         let restored = steps
             .iter()
-            .position(|step| matches!(
-                step,
-                Step::Run { argv, .. } if argv.iter().any(|arg| arg.contains(&chmod))
-            ))
+            .position(|step| {
+                matches!(
+                    step,
+                    Step::Run { argv, .. } if argv.iter().any(|arg| arg.contains(&chmod))
+                )
+            })
             .expect("no step restores the entry's mode");
         let packed = steps
             .iter()
             .position(|step| matches!(step, Step::PackErofs { .. }))
             .expect("the image is packed");
-        assert!(restored < packed, "the mode is restored after the packer read the tree");
+        assert!(
+            restored < packed,
+            "the mode is restored after the packer read the tree"
+        );
         // `ls -ld` and `cut`, because the check runs under the post-bootstrap
         // applet set and `stat` is not in it: a check that named `stat`
         // refused every image build.
@@ -11529,8 +11818,14 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     #[test]
     fn nothing_on_the_image_is_busybox() {
         for (phase, spec) in [
-            ("selector", build_initramfs_spec("selector-init", Phase::Selector)),
-            ("deployment", build_initramfs_spec("deployment-init", Phase::Deployment)),
+            (
+                "selector",
+                build_initramfs_spec("selector-init", Phase::Selector),
+            ),
+            (
+                "deployment",
+                build_initramfs_spec("deployment-init", Phase::Deployment),
+            ),
         ] {
             assert!(
                 !spec.contains("busybox"),
@@ -11654,9 +11949,8 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // not carry the applet that would.
         for (phase, spec) in [("selector", &selector), ("deployment", &deployment)] {
             assert!(
-                spec.contains(
-                    "file {in:td-init}/bin/td-init {in:td-init}/bin/td-init 0755 0 0"
-                ) && spec.contains("slink /bin/mount {in:td-init}/bin/td-init 0777 0 0")
+                spec.contains("file {in:td-init}/bin/td-init {in:td-init}/bin/td-init 0755 0 0")
+                    && spec.contains("slink /bin/mount {in:td-init}/bin/td-init 0777 0 0")
                     && spec.contains("slink /bin/umount {in:td-init}/bin/td-init 0777 0 0"),
                 "the {phase} initramfs must pack td-init and expose its mount pair - its \
                  /init mounts devtmpfs and proc before it does anything else"
@@ -12531,7 +12825,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // Exactly one Symlink step per farm name: Step::Symlink is last-writer-wins, so a
         // name left in two farms would ship whichever loop ran last while a first-match probe
         // still found the other and passed.
-        assert!(!TD_LOGIN_APPLETS.is_empty(), "an empty farm makes this vacuous");
+        assert!(
+            !TD_LOGIN_APPLETS.is_empty(),
+            "an empty farm makes this vacuous"
+        );
         for applet in TD_LOGIN_APPLETS {
             let link = format!("{{root}}/real-root/bin/{applet}");
             let targets: Vec<&str> = steps
@@ -12658,7 +12955,9 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // whole-leg assertion above, so nothing here repeats that.
         let exec_as = td_login_exec_as_probe(&SYSTEM);
         assert!(
-            exec_as.contains("/bin/td-login exec-as \"$health_user\" -- /bin/td-login verify-credentials"),
+            exec_as.contains(
+                "/bin/td-login exec-as \"$health_user\" -- /bin/td-login verify-credentials"
+            ),
             "the exec-as leg must point exec-as at the readback, so the process reporting \
              the switch is the one exec-as started: {exec_as}"
         );
@@ -12720,7 +13019,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
              valid_account_name from it"
         );
         for good in ["root", "tester", "td.user", "a_b-c"] {
-            assert!(valid_account_name(good), "{good} should be a legal account name");
+            assert!(
+                valid_account_name(good),
+                "{good} should be a legal account name"
+            );
         }
         // Each of these reaches a ROOT shell unquoted through /etc/rootcheck,
         // /etc/bootsuccess or /etc/autologin, or restructures /etc/passwd.
@@ -12756,8 +13058,8 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// `include_str!`, so the link costs nothing.
     #[test]
     fn the_credential_readback_probe_uses_flags_td_login_parses() {
-        let source = super::super::td_login::source("main")
-            .expect("the td-login recipe embeds src/main.rs");
+        let source =
+            super::super::td_login::source("main").expect("the td-login recipe embeds src/main.rs");
         for spelling in ["verify-credentials", "--uid", "--gid", "--groups"] {
             assert!(
                 source.contains(spelling),
@@ -13144,11 +13446,14 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     fn td_net_is_packed_and_not_merely_symlinked() {
         let steps = real_root_steps(&SYSTEM).unwrap();
         for applet in ["td-feed", "td-deploy"] {
-            assert!(steps.iter().any(|step| matches!(step,
-                Step::Symlink { target, link }
-                    if target == "{in:td-net}/bin/td-net"
-                        && link == &format!("{{root}}/real-root/bin/{applet}")
-            )), "the installed control-plane applet must be available: {applet}");
+            assert!(
+                steps.iter().any(|step| matches!(step,
+                    Step::Symlink { target, link }
+                        if target == "{in:td-net}/bin/td-net"
+                            && link == &format!("{{root}}/real-root/bin/{applet}")
+                )),
+                "the installed control-plane applet must be available: {applet}"
+            );
         }
         assert!(
             steps.iter().any(|s| matches!(
@@ -13278,10 +13583,27 @@ mod principal_tests {
         let group = build_group(&SYSTEM);
         let shadow = build_shadow(&SYSTEM);
         for name in [UI_USER, "alice", "user_2"] {
-            registry.check_primary_name(&passwd, &group, &shadow, name).unwrap();
+            registry
+                .check_primary_name(&passwd, &group, &shadow, name)
+                .unwrap();
         }
-        for name in ["root", "profiler", "wheel", "tty", "profiler-read", "tdc1000", "tdb1000", "tdp1000", "tda65536"] {
-            assert!(registry.check_primary_name(&passwd, &group, &shadow, name).is_err(), "accepted {name}");
+        for name in [
+            "root",
+            "profiler",
+            "wheel",
+            "tty",
+            "profiler-read",
+            "tdc1000",
+            "tdb1000",
+            "tdp1000",
+            "tda65536",
+        ] {
+            assert!(
+                registry
+                    .check_primary_name(&passwd, &group, &shadow, name)
+                    .is_err(),
+                "accepted {name}"
+            );
         }
     }
 
@@ -13300,11 +13622,19 @@ mod principal_tests {
             (session.compositor, session.broker, session.portal),
             (993, 992, 991)
         );
-        for (name, uid) in [("firefox", 65536), ("mail", 65537), ("news", 65538), ("claude", 65539)] {
+        for (name, uid) in [
+            ("firefox", 65536),
+            ("mail", 65537),
+            ("news", 65538),
+            ("claude", 65539),
+        ] {
             assert_eq!(registry.application(UI_UID, name).unwrap().uid, uid);
-            assert!(build_passwd(&SYSTEM).contains(&format!("tda{uid}:x:{uid}:{uid}:td application:/var/lib/td/applications/{uid}:/bin/false\n")));
+            assert!(build_passwd(&SYSTEM).contains(&format!(
+                "tda{uid}:x:{uid}:{uid}:td application:/var/lib/td/applications/{uid}:/bin/false\n"
+            )));
             assert!(build_group(&SYSTEM).contains(&format!("tda{uid}:x:{uid}:\n")));
-            assert!(build_shadow(&SYSTEM).contains(&format!("tda{uid}:!td-service:19000:0:99999:7:::\n")));
+            assert!(build_shadow(&SYSTEM)
+                .contains(&format!("tda{uid}:!td-service:19000:0:99999:7:::\n")));
         }
         assert!(build_td_svc_conf().contains("--application-primary --enroll-principals\n"));
         assert!(etc_files(&SYSTEM)

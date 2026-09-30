@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::os::unix::net::UnixStream;
-use std::time::{Duration, Instant};
 use std::thread;
+use std::time::{Duration, Instant};
 
 const LIMIT: u64 = 8192;
 const FILE: &str = "git-profile";
@@ -191,13 +191,25 @@ impl Profile {
         Ok(text.trim_end_matches('\n').into())
     }
 
-    pub fn clone_plan(&self, id: &str, branch: &str, commit: &str, key: &str) -> Result<crate::vm_wire::workspace::Plan> {
+    pub fn clone_plan(
+        &self,
+        id: &str,
+        branch: &str,
+        commit: &str,
+        key: &str,
+    ) -> Result<crate::vm_wire::workspace::Plan> {
         let plan = crate::vm_wire::workspace::Plan {
-            id: id.into(), branch: branch.into(), commit: commit.into(),
-            repository: self.repository()?.into(), address: self.get("address")?.into(),
+            id: id.into(),
+            branch: branch.into(),
+            commit: commit.into(),
+            repository: self.repository()?.into(),
+            address: self.get("address")?.into(),
             port: self.get("port")?.parse().map_err(|_| "invalid SSH port")?,
-            user: self.get("user")?.into(), host_key: self.get("host-key")?.into(), guest_key: key.into(),
-            author_name: self.get("author-name")?.into(), author_email: self.get("author-email")?.into(),
+            user: self.get("user")?.into(),
+            host_key: self.get("host-key")?.into(),
+            guest_key: key.into(),
+            author_name: self.get("author-name")?.into(),
+            author_email: self.get("author-email")?.into(),
         };
         crate::vm_wire::workspace::Plan::parse(&plan.encode())
     }
@@ -211,35 +223,70 @@ impl Profile {
     }
 
     pub fn revoke(&self, id: &str, lock: &File) -> Result<()> {
-        if !crate::vm_git_names::instance_valid(id) { return Err("invalid workspace revocation identity".into()); }
+        if !crate::vm_git_names::instance_valid(id) {
+            return Err("invalid workspace revocation identity".into());
+        }
         self.check()?;
         self.change(&["revoke", self.repository()?, id], lock)
     }
 
-    pub fn start(&self, id: &str, branch: &str, expected: Option<&str>, lock: &File) -> Result<String> {
+    pub fn start(
+        &self,
+        id: &str,
+        branch: &str,
+        expected: Option<&str>,
+        lock: &File,
+    ) -> Result<String> {
         if !crate::vm_git_names::instance_valid(id) || !crate::vm_git_names::branch_valid(branch) {
             return Err("invalid starting-commit identity or branch".into());
         }
-        if let Some(oid) = expected { Origin::new(self.repository()?.into(), oid.into())?; }
-        let output = self.request(&["start", self.repository()?, id, branch, expected.unwrap_or("main")], lock)?;
-        let origin = Origin::parse(std::str::from_utf8(&output).map_err(|_| "invalid starting-commit reply")?)?;
-        if origin.repository != self.repository()? || expected.is_some_and(|oid| oid != origin.head) {
+        if let Some(oid) = expected {
+            Origin::new(self.repository()?.into(), oid.into())?;
+        }
+        let output = self.request(
+            &[
+                "start",
+                self.repository()?,
+                id,
+                branch,
+                expected.unwrap_or("main"),
+            ],
+            lock,
+        )?;
+        let origin = Origin::parse(
+            std::str::from_utf8(&output).map_err(|_| "invalid starting-commit reply")?,
+        )?;
+        if origin.repository != self.repository()? || expected.is_some_and(|oid| oid != origin.head)
+        {
             return Err("registrar starting commit differs from the workspace".into());
         }
         Ok(origin.head)
     }
 
     fn change(&self, args: &[&str], lock: &File) -> Result<()> {
-        if !self.request(args, lock)?.is_empty() { return Err("unexpected registrar mutation output".into()); }
+        if !self.request(args, lock)?.is_empty() {
+            return Err("unexpected registrar mutation output".into());
+        }
         Ok(())
     }
 
     fn request(&self, args: &[&str], lock: &File) -> Result<Vec<u8>> {
         let registrar = trusted_program(self.get("registrar")?)?;
         let mut command = Command::new(registrar);
-        command.env_clear().current_dir("/").arg("request")
-            .arg(self.get("socket")?).arg(self.get("server-uid")?).args(args);
-        capture_input(command, Stdio::from(io(lock.try_clone(), "retain instance lock in registrar client")?))
+        command
+            .env_clear()
+            .current_dir("/")
+            .arg("request")
+            .arg(self.get("socket")?)
+            .arg(self.get("server-uid")?)
+            .args(args);
+        capture_input(
+            command,
+            Stdio::from(io(
+                lock.try_clone(),
+                "retain instance lock in registrar client",
+            )?),
+        )
     }
 
     pub fn check(&self) -> Result<Origin> {
@@ -286,10 +333,7 @@ pub(crate) fn trusted_program(value: &str) -> Result<PathBuf> {
     trusted_program_with_boundary(value, None)
 }
 
-fn trusted_program_with_boundary(
-    value: &str,
-    boundary: Option<&Path>,
-) -> Result<PathBuf> {
+fn trusted_program_with_boundary(value: &str, boundary: Option<&Path>) -> Result<PathBuf> {
     let uid = io(fs::metadata("/proc/self"), "inspect current UID")?.uid();
     let path = io(
         fs::canonicalize(absolute(value)?),
@@ -336,12 +380,25 @@ fn capture_input(command: Command, input: Stdio) -> Result<Vec<u8>> {
     capture_until(command, input, Duration::from_secs(15))
 }
 
-pub(crate) fn capture_until(mut command: Command, input: Stdio, timeout: Duration) -> Result<Vec<u8>> {
+pub(crate) fn capture_until(
+    mut command: Command,
+    input: Stdio,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     let (mut output, writer) = io(UnixStream::pair(), "create profile output channel")?;
-    io(output.set_nonblocking(true), "set profile output nonblocking")?;
+    io(
+        output.set_nonblocking(true),
+        "set profile output nonblocking",
+    )?;
     let deadline = Instant::now() + timeout;
-    let mut child = io(command.stdin(input).stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
-        .stderr(Stdio::inherit()).spawn(), "start Git profile probe")?;
+    let mut child = io(
+        command
+            .stdin(input)
+            .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+            .stderr(Stdio::inherit())
+            .spawn(),
+        "start Git profile probe",
+    )?;
     // Command retains its Stdio socket; EOF requires releasing that copy.
     drop(command);
     let result = (|| {
@@ -349,7 +406,11 @@ pub(crate) fn capture_until(mut command: Command, input: Stdio, timeout: Duratio
         let mut buffer = [0; 1024];
         let mut eof = false;
         loop {
-            if Instant::now() >= deadline { return Err("Git profile probe timed out; mutation outcome may be unconfirmed".into()); }
+            if Instant::now() >= deadline {
+                return Err(
+                    "Git profile probe timed out; mutation outcome may be unconfirmed".into(),
+                );
+            }
             if !eof {
                 match output.read(&mut buffer) {
                     Ok(0) => eof = true,
@@ -357,20 +418,33 @@ pub(crate) fn capture_until(mut command: Command, input: Stdio, timeout: Duratio
                         if bytes.len().saturating_add(count) as u64 > LIMIT {
                             return Err("profile probe output exceeds limit".into());
                         }
-                        bytes.extend_from_slice(buffer.get(..count).ok_or("invalid profile read length")?);
+                        bytes.extend_from_slice(
+                            buffer.get(..count).ok_or("invalid profile read length")?,
+                        );
                     }
-                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
                     Err(e) => return Err(format!("read profile probe: {e}")),
                 }
             }
             if let Some(status) = io(child.try_wait(), "inspect profile probe")? {
-                if !status.success() { return Err("Git profile probe failed; inspect its diagnostics".into()); }
-                if eof { return Ok(bytes); }
+                if !status.success() {
+                    return Err("Git profile probe failed; inspect its diagnostics".into());
+                }
+                if eof {
+                    return Ok(bytes);
+                }
             }
             thread::sleep(Duration::from_millis(5));
         }
     })();
-    if result.is_err() { let _ = child.kill(); let _ = child.wait(); }
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     result
 }
 
@@ -464,14 +538,29 @@ mod tests {
     #[test]
     #[ignore = "subprocess fixture, invoked by bounded_capture"]
     fn profile_child() {
-        let Ok(mode) = std::env::var("TD_VM_PROFILE_CHILD") else { return; };
-        fs::write(std::env::var("TD_VM_PROFILE_PID").unwrap(), std::process::id().to_string()).unwrap();
+        let Ok(mode) = std::env::var("TD_VM_PROFILE_CHILD") else {
+            return;
+        };
+        fs::write(
+            std::env::var("TD_VM_PROFILE_PID").unwrap(),
+            std::process::id().to_string(),
+        )
+        .unwrap();
         match mode.as_str() {
-            "ok" => { std::io::stdout().write_all(b"profile-ok").unwrap(); }
-            "large" => { std::io::stdout().write_all(&[b'x'; 8193]).unwrap(); }
+            "ok" => {
+                std::io::stdout().write_all(b"profile-ok").unwrap();
+            }
+            "large" => {
+                std::io::stdout().write_all(&[b'x'; 8193]).unwrap();
+            }
             "backlog" => {
                 let mut streams = Vec::new();
-                for _ in 0..10000 { streams.push(UnixStream::connect(std::env::var("TD_VM_PROFILE_SOCKET").unwrap()).unwrap()); }
+                for _ in 0..10000 {
+                    streams.push(
+                        UnixStream::connect(std::env::var("TD_VM_PROFILE_SOCKET").unwrap())
+                            .unwrap(),
+                    );
+                }
             }
             _ => thread::sleep(Duration::from_secs(60)),
         }
@@ -484,16 +573,30 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(root.join("socket")).unwrap();
         for mode in ["ok", "large", "sleep", "backlog"] {
             let mut command = Command::new(std::env::current_exe().unwrap());
-            command.args(["--exact", "vm_git_profile::tests::profile_child", "--ignored", "--nocapture"])
-                .env("TD_VM_PROFILE_CHILD", mode).env("TD_VM_PROFILE_PID", root.join("pid"))
+            command
+                .args([
+                    "--exact",
+                    "vm_git_profile::tests::profile_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("TD_VM_PROFILE_CHILD", mode)
+                .env("TD_VM_PROFILE_PID", root.join("pid"))
                 .env("TD_VM_PROFILE_SOCKET", root.join("socket"));
             let start = Instant::now();
             let result = capture_until(command, Stdio::null(), Duration::from_millis(500));
             assert_eq!(result.is_ok(), mode == "ok", "{mode}: {result:?}");
-            if mode == "ok" { assert!(String::from_utf8(result.unwrap()).unwrap().contains("profile-ok")); }
+            if mode == "ok" {
+                assert!(String::from_utf8(result.unwrap())
+                    .unwrap()
+                    .contains("profile-ok"));
+            }
             assert!(start.elapsed() < Duration::from_secs(3));
             let pid = fs::read_to_string(root.join("pid")).unwrap();
-            assert!(!Path::new("/proc").join(pid).exists(), "child must be reaped");
+            assert!(
+                !Path::new("/proc").join(pid).exists(),
+                "child must be reaped"
+            );
         }
         drop(listener);
         fs::remove_dir_all(root).unwrap();

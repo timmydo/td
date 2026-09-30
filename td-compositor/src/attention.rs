@@ -28,7 +28,12 @@ pub(crate) struct Prepared {
 
 impl Prepared {
     #[cfg(test)]
-    pub fn new(request: Request, width: usize, height: usize, stride: usize) -> Result<Self, String> {
+    pub fn new(
+        request: Request,
+        width: usize,
+        height: usize,
+        stride: usize,
+    ) -> Result<Self, String> {
         Self::with_time(request, width, height, stride, None)
     }
 
@@ -66,7 +71,9 @@ impl Prepared {
             .ok_or("output cannot hold a complete trusted prompt")?;
         let mut lines = request.lines();
         if let Some(seconds) = remaining {
-            if !(1..=120).contains(&seconds) { return Err("invalid trusted operation time budget".into()); }
+            if !(1..=120).contains(&seconds) {
+                return Err("invalid trusted operation time budget".into());
+            }
             let unit = if seconds == 1 { "SECOND" } else { "SECONDS" };
             lines.push(format!("TIME LEFT WHEN SHOWN: {seconds} {unit}"));
         }
@@ -186,10 +193,26 @@ pub(crate) fn paint(
                 Notice::Busy => "PREVIOUS REQUEST IS STILL FINISHING",
             }
         },
-        if notice == Notice::Menu && !draining { "E: ENROLL TWO TOKENS (HAVE BOTH READY)" } else { "" },
-        if notice == Notice::Menu && !draining { "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL" } else { "" },
-        if notice == Notice::Menu && !draining { "W: REVIEW PENDING CREDENTIAL WRITE" } else { "" },
-        if notice == Notice::Menu && !draining { "I: REVIEW PENDING SYSTEM INSTALLATION" } else { "" },
+        if notice == Notice::Menu && !draining {
+            "E: ENROLL TWO TOKENS (HAVE BOTH READY)"
+        } else {
+            ""
+        },
+        if notice == Notice::Menu && !draining {
+            "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL"
+        } else {
+            ""
+        },
+        if notice == Notice::Menu && !draining {
+            "W: REVIEW PENDING CREDENTIAL WRITE"
+        } else {
+            ""
+        },
+        if notice == Notice::Menu && !draining {
+            "I: REVIEW PENDING SYSTEM INSTALLATION"
+        } else {
+            ""
+        },
         if draining {
             "RELEASE KEYS AND BUTTONS"
         } else {

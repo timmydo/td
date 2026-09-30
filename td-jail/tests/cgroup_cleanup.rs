@@ -167,10 +167,7 @@ fn next_field<'a>(fields: &mut impl Iterator<Item = &'a str>, name: &str) -> io:
         .ok_or_else(|| io::Error::other(format!("process stat has no {name} field")))
 }
 
-fn parse_field<'a, T>(
-    fields: &mut impl Iterator<Item = &'a str>,
-    name: &str,
-) -> io::Result<T>
+fn parse_field<'a, T>(fields: &mut impl Iterator<Item = &'a str>, name: &str) -> io::Result<T>
 where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,

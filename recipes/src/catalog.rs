@@ -99,7 +99,10 @@ mod tests {
             let reparsed = crate::json::parse(&canon)
                 .unwrap_or_else(|e| panic!("{stem}: emitted invalid JSON: {e}"));
             assert_eq!(reparsed.to_canonical(), canon, "{stem}: not idempotent");
-            assert!(!r.name.is_empty() && !r.version.is_empty(), "{stem}: missing fields");
+            assert!(
+                !r.name.is_empty() && !r.version.is_empty(),
+                "{stem}: missing fields"
+            );
         }
     }
 
@@ -117,7 +120,10 @@ mod tests {
     #[test]
     fn first_seed_binds_one_foreign_pin_to_one_payload_runtime() {
         let seed = lookup("ripgrep-seed").expect("ripgrep seed recipe");
-        assert!(seed.is_foreign(), "the prebuilt source pin must mark its recipe");
+        assert!(
+            seed.is_foreign(),
+            "the prebuilt source pin must mark its recipe"
+        );
         assert!(seed.is_foreign_source());
         assert_eq!(seed.name, "ripgrep-seed");
         assert_eq!(seed.version, "15.2.0");
@@ -238,24 +244,30 @@ mod tests {
                 let build_remaps: Vec<&str> = argv
                     .iter()
                     .filter(|arg| {
-                        arg.starts_with("--remap-path-prefix=")
-                            && arg.ends_with("=/td-build-root")
+                        arg.starts_with("--remap-path-prefix=") && arg.ends_with("=/td-build-root")
                     })
                     .map(String::as_str)
                     .collect();
                 let source_remaps: Vec<&str> = argv
                     .iter()
                     .filter(|arg| {
-                        arg.starts_with("--remap-path-prefix=")
-                            && arg.ends_with("=/td-build")
+                        arg.starts_with("--remap-path-prefix=") && arg.ends_with("=/td-build")
                     })
                     .map(String::as_str)
                     .collect();
                 assert_eq!(build_remaps.len(), 1, "{stem}: build-root remap drifted");
                 assert_eq!(source_remaps.len(), 1, "{stem}: source-root remap drifted");
                 remap_sources.push((
-                    build_remaps.first().copied().unwrap_or_default().to_string(),
-                    source_remaps.first().copied().unwrap_or_default().to_string(),
+                    build_remaps
+                        .first()
+                        .copied()
+                        .unwrap_or_default()
+                        .to_string(),
+                    source_remaps
+                        .first()
+                        .copied()
+                        .unwrap_or_default()
+                        .to_string(),
                 ));
                 let strip_options: Vec<&str> = argv
                     .iter()
@@ -314,10 +326,14 @@ mod tests {
             if matches!(stem, "gcc-x86-64-stage1" | "gcc-x86-64-native") {
                 continue;
             }
-            let generic_cargo_split = matches!(recipe.build_system, crate::types::BuildSystem::Rust);
-            let typed_split = recipe.steps.as_deref().unwrap_or_default().iter().any(|step| {
-                matches!(step, crate::types::Step::SplitDebugTree { .. })
-            });
+            let generic_cargo_split =
+                matches!(recipe.build_system, crate::types::BuildSystem::Rust);
+            let typed_split = recipe
+                .steps
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|step| matches!(step, crate::types::Step::SplitDebugTree { .. }));
             assert!(
                 generic_cargo_split || typed_split,
                 "{stem}: assembly exception would not reach the marker-producing splitter"
@@ -327,9 +343,11 @@ mod tests {
         // These compiler rungs are build-only provenance for libgcc objects
         // linked into later outputs. They do not need companions of their own,
         // but the marker on each split consumer must name the actual rung.
-        assert!(td_engine::target_profile::output_assembly_exceptions("glibc-x86-64")
-            .iter()
-            .any(|(source, _)| *source == "gcc-x86-64-stage1"));
+        assert!(
+            td_engine::target_profile::output_assembly_exceptions("glibc-x86-64")
+                .iter()
+                .any(|(source, _)| *source == "gcc-x86-64-stage1")
+        );
         for stem in ["binutils-x86-64-self", "gcc-x86-64-self"] {
             assert!(td_engine::target_profile::output_assembly_exceptions(stem)
                 .iter()
@@ -340,14 +358,19 @@ mod tests {
             .into_iter()
             .filter_map(|(stem, recipe)| {
                 let cargo = matches!(recipe.build_system, crate::types::BuildSystem::Rust);
-                let direct = recipe.steps.as_deref().unwrap_or_default().iter().any(|step| {
-                    matches!(
-                        step,
-                        crate::types::Step::Run { argv, .. }
-                            if argv.first().is_some_and(|arg| arg.ends_with("/rustc"))
-                                && argv.iter().any(|arg| arg.ends_with(".rs"))
-                    )
-                });
+                let direct = recipe
+                    .steps
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|step| {
+                        matches!(
+                            step,
+                            crate::types::Step::Run { argv, .. }
+                                if argv.first().is_some_and(|arg| arg.ends_with("/rustc"))
+                                    && argv.iter().any(|arg| arg.ends_with(".rs"))
+                        )
+                    });
                 (cargo || direct || stem == "rust-toolchain").then_some(stem)
             })
             .collect();
@@ -435,12 +458,17 @@ mod tests {
     #[test]
     fn every_line_attribution_exception_reaches_the_target_splitter() {
         for (stem, _) in td_engine::target_profile::LINE_ATTRIBUTION_EXCEPTIONS {
-            let recipe = lookup(stem)
-                .unwrap_or_else(|| panic!("line-attribution exception names missing recipe {stem}"));
-            let generic_cargo_split = matches!(recipe.build_system, crate::types::BuildSystem::Rust);
-            let typed_split = recipe.steps.as_deref().unwrap_or_default().iter().any(|step| {
-                matches!(step, crate::types::Step::SplitDebugTree { .. })
+            let recipe = lookup(stem).unwrap_or_else(|| {
+                panic!("line-attribution exception names missing recipe {stem}")
             });
+            let generic_cargo_split =
+                matches!(recipe.build_system, crate::types::BuildSystem::Rust);
+            let typed_split = recipe
+                .steps
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|step| matches!(step, crate::types::Step::SplitDebugTree { .. }));
             assert!(
                 generic_cargo_split || typed_split,
                 "{stem}: line-attribution exception would not reach the marker-producing splitter"
@@ -482,11 +510,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 sizes,
-                [(
-                    expected_scope,
-                    expected_report,
-                    expected_ceiling,
-                )],
+                [(expected_scope, expected_report, expected_ceiling,)],
                 "{stem}: debug measurement must use its reviewed scope ceiling"
             );
         }
@@ -581,9 +605,18 @@ mod named_dirs_tests {
         for dir in ["td-authd", "td-portal"] {
             assert!(portal.contains(&dir), "td-portal: {portal:?}");
         }
-        assert!(!portal.contains(&"td-secret"), "local-source sibling is not an embed");
-        assert!(portal.contains(&"td-compositor"), "shared timezone reader: {portal:?}");
-        assert!(named_dirs("td-sh").contains(&"td-busd"), "lib.rs embeds td-busd everywhere");
+        assert!(
+            !portal.contains(&"td-secret"),
+            "local-source sibling is not an embed"
+        );
+        assert!(
+            portal.contains(&"td-compositor"),
+            "shared timezone reader: {portal:?}"
+        );
+        assert!(
+            named_dirs("td-sh").contains(&"td-busd"),
+            "lib.rs embeds td-busd everywhere"
+        );
         assert!(named_dirs("td-sh").contains(&"td-sh"));
         assert!(named_dirs("td-sh").contains(&"td-compositor"));
         for (stem, _) in all() {
@@ -594,7 +627,10 @@ mod named_dirs_tests {
                 dirs.iter().zip(dirs.iter().skip(1)).all(|(a, b)| a < b),
                 "{stem}: {dirs:?}"
             );
-            assert!(dirs.iter().all(|d| d.starts_with("td-")), "{stem}: {dirs:?}");
+            assert!(
+                dirs.iter().all(|d| d.starts_with("td-")),
+                "{stem}: {dirs:?}"
+            );
         }
         assert!(named_dirs("no-such-recipe").is_empty());
     }
@@ -634,7 +670,10 @@ mod named_dirs_tests {
                     if after_attr && text.starts_with("mod ") && text.ends_with('{') {
                         let open = offset + line.rfind('{').expect("brace");
                         let close = block_end(&code, open).unwrap_or_else(|| {
-                            panic!("{}: test module at byte {open} never closes", path.display())
+                            panic!(
+                                "{}: test module at byte {open} never closes",
+                                path.display()
+                            )
                         });
                         spans.push((open, close));
                     }
@@ -648,7 +687,9 @@ mod named_dirs_tests {
                         || line.contains("#[path");
                     if embeds && line.contains("td-") {
                         assert!(
-                            spans.iter().any(|(open, close)| (*open..*close).contains(&offset)),
+                            spans
+                                .iter()
+                                .any(|(open, close)| (*open..*close).contains(&offset)),
                             "{}:{}: embed of a crate file outside a test module: {}",
                             path.display(),
                             n + 1,
@@ -662,6 +703,9 @@ mod named_dirs_tests {
             }
         }
         assert!(seen > 3, "scanned {seen} evaluator sources");
-        assert!(in_tests >= 4, "the test modules' own embeds prove the spans: {in_tests}");
+        assert!(
+            in_tests >= 4,
+            "the test modules' own embeds prove the spans: {in_tests}"
+        );
     }
 }

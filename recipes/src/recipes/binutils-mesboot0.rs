@@ -1,4 +1,4 @@
-use crate::ladder::{SH, apply_patch, mesboot0_inputs, mesboot0_path, unpack_into};
+use crate::ladder::{apply_patch, mesboot0_inputs, mesboot0_path, unpack_into, SH};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.20.1a — bootstrap rung 6 (#378, guix's binutils-mesboot0):

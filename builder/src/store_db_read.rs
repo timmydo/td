@@ -16,7 +16,15 @@
 //! big-endian; lengths are SQLite varints (big-endian base-128, high bit =
 //! continue, up to 9 bytes — the 9th byte contributes a full 8 bits).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 use std::collections::{HashMap, HashSet};
 
@@ -235,17 +243,16 @@ impl Db {
             LEAF => {
                 let ptr_array = hdr + 8; // leaf header is 8 bytes
                 for i in 0..num_cells {
-                    let off = u16::from_be_bytes([
-                        page[ptr_array + 2 * i],
-                        page[ptr_array + 2 * i + 1],
-                    ]) as usize;
+                    let off =
+                        u16::from_be_bytes([page[ptr_array + 2 * i], page[ptr_array + 2 * i + 1]])
+                            as usize;
                     let (payload_len, n1) = read_varint(page, off)?;
                     let (rowid, n2) = read_varint(page, off + n1)?;
                     let body_start = off + n1 + n2;
                     let body_end = body_start + payload_len as usize;
-                    let payload = page
-                        .get(body_start..body_end)
-                        .ok_or_else(|| "leaf cell payload overruns page (overflow unsupported)".to_string())?;
+                    let payload = page.get(body_start..body_end).ok_or_else(|| {
+                        "leaf cell payload overruns page (overflow unsupported)".to_string()
+                    })?;
                     out.push((rowid as i64, parse_record(payload)?));
                 }
                 Ok(())
@@ -254,22 +261,29 @@ impl Db {
                 // Interior header is 12 bytes; bytes 8..12 are the right-most child.
                 let ptr_array = hdr + 12;
                 for i in 0..num_cells {
-                    let off = u16::from_be_bytes([
-                        page[ptr_array + 2 * i],
-                        page[ptr_array + 2 * i + 1],
-                    ]) as usize;
+                    let off =
+                        u16::from_be_bytes([page[ptr_array + 2 * i], page[ptr_array + 2 * i + 1]])
+                            as usize;
                     // Cell = left-child page number (u32 BE) + rowid key varint.
                     let child = u32::from_be_bytes([
-                        page[off], page[off + 1], page[off + 2], page[off + 3],
+                        page[off],
+                        page[off + 1],
+                        page[off + 2],
+                        page[off + 3],
                     ]) as usize;
                     self.walk_table(child, out)?;
                 }
                 let right = u32::from_be_bytes([
-                    page[hdr + 8], page[hdr + 9], page[hdr + 10], page[hdr + 11],
+                    page[hdr + 8],
+                    page[hdr + 9],
+                    page[hdr + 10],
+                    page[hdr + 11],
                 ]) as usize;
                 self.walk_table(right, out)
             }
-            other => Err(format!("unexpected b-tree page type 0x{other:02x} (index/overflow unsupported)")),
+            other => Err(format!(
+                "unexpected b-tree page type 0x{other:02x} (index/overflow unsupported)"
+            )),
         }
     }
 }
@@ -361,7 +375,11 @@ fn read_value(st: u64, b: &[u8]) -> Result<(Value, usize), String> {
 
 /// A big-endian signed integer of `b.len()` bytes (1..=8), sign-extended.
 fn be_signed(b: &[u8]) -> i64 {
-    let mut v: i64 = if !b.is_empty() && b[0] & 0x80 != 0 { -1 } else { 0 };
+    let mut v: i64 = if !b.is_empty() && b[0] & 0x80 != 0 {
+        -1
+    } else {
+        0
+    };
     for &byte in b {
         v = (v << 8) | byte as i64;
     }
@@ -385,7 +403,17 @@ mod tests {
 
     #[test]
     fn varint_roundtrip() {
-        for n in [0u64, 1, 127, 128, 282616, 1_887_497, 41_145_793, (1u64 << 56) - 1, u64::MAX] {
+        for n in [
+            0u64,
+            1,
+            127,
+            128,
+            282616,
+            1_887_497,
+            41_145_793,
+            (1u64 << 56) - 1,
+            u64::MAX,
+        ] {
             let mut enc = Vec::new();
             store_db::put_varint_for_test(&mut enc, n);
             let (got, used) = read_varint(&enc, 0).unwrap();
@@ -460,11 +488,14 @@ mod tests {
         let dout = Table {
             name: "DerivationOutputs",
             sql: "CREATE TABLE DerivationOutputs (drv integer, id text, path text)",
-            rows: vec![(1, vec![
-                store_db::Value::Int(2),
-                store_db::Value::Text("out".to_string()),
-                store_db::Value::Text("/gnu/store/x".to_string()),
-            ])],
+            rows: vec![(
+                1,
+                vec![
+                    store_db::Value::Int(2),
+                    store_db::Value::Text("out".to_string()),
+                    store_db::Value::Text("/gnu/store/x".to_string()),
+                ],
+            )],
         };
         let db = Db::open(store_db::write_db(&[valid, refs, dout])).unwrap();
         // ValidPaths: the self-reference resolves via the rowid.
@@ -486,14 +517,17 @@ mod tests {
     fn closure_follows_the_refs_graph() {
         // /a -> /b -> /c, /a self-ref; /d is unreachable from /a.
         let vp = |rid: i64, p: &str| {
-            (rid, vec![
-                store_db::Value::Null,
-                store_db::Value::Text(p.to_string()),
-                store_db::Value::Text("sha256:00".to_string()),
-                store_db::Value::Int(1),
-                store_db::Value::Null,
-                store_db::Value::Int(1),
-            ])
+            (
+                rid,
+                vec![
+                    store_db::Value::Null,
+                    store_db::Value::Text(p.to_string()),
+                    store_db::Value::Text("sha256:00".to_string()),
+                    store_db::Value::Int(1),
+                    store_db::Value::Null,
+                    store_db::Value::Int(1),
+                ],
+            )
         };
         let valid = Table {
             name: "ValidPaths",
@@ -518,14 +552,17 @@ mod tests {
     fn closure_roots_unions_and_dedups() {
         // /a -> /b -> /c ; /d -> /b ; /e isolated. /a and /d overlap on /b,/c.
         let vp = |rid: i64, p: &str| {
-            (rid, vec![
-                store_db::Value::Null,
-                store_db::Value::Text(p.to_string()),
-                store_db::Value::Text("sha256:00".to_string()),
-                store_db::Value::Int(1),
-                store_db::Value::Null,
-                store_db::Value::Int(1),
-            ])
+            (
+                rid,
+                vec![
+                    store_db::Value::Null,
+                    store_db::Value::Text(p.to_string()),
+                    store_db::Value::Text("sha256:00".to_string()),
+                    store_db::Value::Int(1),
+                    store_db::Value::Null,
+                    store_db::Value::Int(1),
+                ],
+            )
         };
         let valid = Table {
             name: "ValidPaths",
@@ -544,14 +581,19 @@ mod tests {
         // Union of two roots whose closures overlap on /b,/c — deduped, sorted
         // (== guix gc --requisites /a /d).
         assert_eq!(
-            db.closure_roots(&["/a".to_string(), "/d".to_string()]).unwrap(),
+            db.closure_roots(&["/a".to_string(), "/d".to_string()])
+                .unwrap(),
             vec!["/a", "/b", "/c", "/d"]
         );
         // Single root in a slice matches closure() exactly.
-        assert_eq!(db.closure_roots(&["/a".to_string()]).unwrap(), db.closure("/a").unwrap());
+        assert_eq!(
+            db.closure_roots(&["/a".to_string()]).unwrap(),
+            db.closure("/a").unwrap()
+        );
         // Overlapping/duplicate roots fold into one closure.
         assert_eq!(
-            db.closure_roots(&["/b".to_string(), "/b".to_string(), "/c".to_string()]).unwrap(),
+            db.closure_roots(&["/b".to_string(), "/b".to_string(), "/c".to_string()])
+                .unwrap(),
             vec!["/b", "/c"]
         );
         // An isolated root contributes only itself.
@@ -559,7 +601,9 @@ mod tests {
         // No roots => empty closure.
         assert_eq!(db.closure_roots(&[]).unwrap(), Vec::<String>::new());
         // A missing root among valid ones fails loudly (no partial closure).
-        assert!(db.closure_roots(&["/a".to_string(), "/missing".to_string()]).is_err());
+        assert!(db
+            .closure_roots(&["/a".to_string(), "/missing".to_string()])
+            .is_err());
     }
 
     #[test]

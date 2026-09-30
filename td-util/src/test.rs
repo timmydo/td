@@ -57,8 +57,7 @@ const BINARY: &[&str] = &["=", "!=", "-eq", "-ne", "-lt", "-le", "-gt", "-ge"];
 const REFUSED: &[&str] = &["-r", "-w", "-x"];
 
 fn usage() -> String {
-    "usage: test EXPRESSION  (-b -d -e -f -n -s -z, = != -eq -ne -lt -le -gt -ge, !)"
-        .to_string()
+    "usage: test EXPRESSION  (-b -d -e -f -n -s -z, = != -eq -ne -lt -le -gt -ge, !)".to_string()
 }
 
 fn truth(b: bool) -> u8 {
@@ -221,7 +220,11 @@ mod tests {
         assert_eq!(t(&["-f", &ds]), Ok(1));
         assert_eq!(t(&["-s", &fs]), Ok(0));
         assert_eq!(t(&["-e", "/nonexistent/td-util-test"]), Ok(1));
-        assert_eq!(t(&["-b", &fs]), Ok(1), "a regular file is not a block device");
+        assert_eq!(
+            t(&["-b", &fs]),
+            Ok(1),
+            "a regular file is not a block device"
+        );
         // A DANGLING symlink is `! -e`: these follow links, as POSIX says.
         let dangle = d.join("dangle");
         std::os::unix::fs::symlink(d.join("gone"), &dangle).unwrap();
@@ -261,9 +264,18 @@ mod tests {
     fn the_credential_operators_are_refused_rather_than_approximated() {
         for op in ["-r", "-w", "-x"] {
             let err = t(&[op, "/tmp"]).unwrap_err();
-            assert!(err.contains("access(2)"), "{op}: the refusal must say why: {err}");
-            assert!(err.contains(op), "{op}: the refusal must name the operator: {err}");
-            assert!(t(&["!", op, "/tmp"]).is_err(), "negated {op} is refused too");
+            assert!(
+                err.contains("access(2)"),
+                "{op}: the refusal must say why: {err}"
+            );
+            assert!(
+                err.contains(op),
+                "{op}: the refusal must name the operator: {err}"
+            );
+            assert!(
+                t(&["!", op, "/tmp"]).is_err(),
+                "negated {op} is refused too"
+            );
         }
         // ...and the predicates that are NOT about the caller still answer.
         assert_eq!(t(&["-d", "/tmp"]), Ok(0), "-d is not a credential question");
@@ -279,8 +291,14 @@ mod tests {
         assert_eq!(t(&[" 1 ", "-eq", "1"]), Ok(0));
         assert_eq!(t(&["1", "-lt", " 5"]), Ok(0));
         assert_eq!(t(&["\t2\n", "-gt", "1"]), Ok(0));
-        assert!(t(&["  ", "-lt", "5"]).is_err(), "blanks alone are not an integer");
-        assert!(t(&[" x ", "-lt", "5"]).is_err(), "trimming must not admit non-integers");
+        assert!(
+            t(&["  ", "-lt", "5"]).is_err(),
+            "blanks alone are not an integer"
+        );
+        assert!(
+            t(&[" x ", "-lt", "5"]).is_err(),
+            "trimming must not admit non-integers"
+        );
     }
 
     /// An error EXITS 2, not 1.
@@ -293,11 +311,23 @@ mod tests {
     #[test]
     fn an_error_exits_two_and_never_one() {
         let call = |a: &[&str]| run(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
-        assert_eq!(call(&["-w", "/tmp"]), Ok(2), "-w is refused, not answered false");
+        assert_eq!(
+            call(&["-w", "/tmp"]),
+            Ok(2),
+            "-w is refused, not answered false"
+        );
         assert_eq!(call(&["-r", "/tmp"]), Ok(2));
         assert_eq!(call(&["-x", "/tmp"]), Ok(2));
-        assert_eq!(call(&["", "-lt", "5"]), Ok(2), "a bad integer operand is an error");
-        assert_eq!(call(&["-q", "/tmp"]), Ok(2), "an unknown operator is an error");
+        assert_eq!(
+            call(&["", "-lt", "5"]),
+            Ok(2),
+            "a bad integer operand is an error"
+        );
+        assert_eq!(
+            call(&["-q", "/tmp"]),
+            Ok(2),
+            "an unknown operator is an error"
+        );
         assert_eq!(call(&["a", "b", "c", "d", "e"]), Ok(2));
         // ...and the ordinary answers still come through unchanged.
         assert_eq!(call(&["-n", "x"]), Ok(0));
@@ -311,6 +341,10 @@ mod tests {
         assert!(t(&["1", "-foo", "2"]).is_err());
         assert!(t(&["a", "b", "c", "d", "e"]).is_err());
         // ...but an operand that LOOKS like an operator still compares.
-        assert_eq!(t(&["=", "=", "="]), Ok(0), "operands may look like operators");
+        assert_eq!(
+            t(&["=", "=", "="]),
+            Ok(0),
+            "operands may look like operators"
+        );
     }
 }

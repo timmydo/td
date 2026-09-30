@@ -210,10 +210,7 @@ fn raw_lflag(current: u32) -> u32 {
 }
 
 /// Whether `got` differs from `saved` ONLY where the patch was applied.
-fn only_the_patch_changed(
-    got: &[u8; sys::TERMIOS_LEN],
-    saved: &[u8; sys::TERMIOS_LEN],
-) -> bool {
+fn only_the_patch_changed(got: &[u8; sys::TERMIOS_LEN], saved: &[u8; sys::TERMIOS_LEN]) -> bool {
     for i in 0..sys::TERMIOS_LEN {
         let patched =
             (LFLAG_AT..LFLAG_AT + 4).contains(&i) || i == CC_AT + VMIN || i == CC_AT + VTIME;
@@ -304,7 +301,10 @@ mod tests {
         write_u32(&mut patched, LFLAG_AT, 0);
         set_cc(&mut patched, VMIN, 1);
         set_cc(&mut patched, VTIME, 0);
-        assert!(only_the_patch_changed(&patched, &saved), "the patch itself is allowed");
+        assert!(
+            only_the_patch_changed(&patched, &saved),
+            "the patch itself is allowed"
+        );
 
         // c_cflag = 0 is B0, a hang-up on a serial console -- the exact case a
         // zeroed buffer would smuggle past the flag check.
@@ -358,14 +358,16 @@ mod tests {
     #[test]
     fn the_ioctl_is_issued_and_the_kernel_answers() {
         use std::os::fd::AsFd;
-        let path =
-            std::env::temp_dir().join(format!("td-sh-term-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("td-sh-term-{}", std::process::id()));
         let f = std::fs::File::create(&path).unwrap();
         let err = match raw(f.as_fd()) {
             Ok(_) => panic!("a regular file entered raw mode"),
             Err(e) => e,
         };
-        assert!(err.contains("25"), "expected ENOTTY from a regular file, got {err}");
+        assert!(
+            err.contains("25"),
+            "expected ENOTTY from a regular file, got {err}"
+        );
         assert_eq!(width(f.as_fd()), None, "a regular file has no width");
         let _ = std::fs::remove_file(&path);
     }
@@ -399,14 +401,20 @@ mod tests {
     fn the_width_comes_from_the_columns_field() {
         let mut buf = [0u8; sys::WINSIZE_LEN];
         // rows = 24, columns = 80, then the two pixel fields td ignores.
-        buf.get_mut(..2).map(|s| s.copy_from_slice(&24u16.to_le_bytes()));
-        buf.get_mut(2..4).map(|s| s.copy_from_slice(&80u16.to_le_bytes()));
-        buf.get_mut(4..6).map(|s| s.copy_from_slice(&640u16.to_le_bytes()));
-        buf.get_mut(6..8).map(|s| s.copy_from_slice(&480u16.to_le_bytes()));
+        buf.get_mut(..2)
+            .map(|s| s.copy_from_slice(&24u16.to_le_bytes()));
+        buf.get_mut(2..4)
+            .map(|s| s.copy_from_slice(&80u16.to_le_bytes()));
+        buf.get_mut(4..6)
+            .map(|s| s.copy_from_slice(&640u16.to_le_bytes()));
+        buf.get_mut(6..8)
+            .map(|s| s.copy_from_slice(&480u16.to_le_bytes()));
         assert_eq!(columns_of(&buf), Some(80));
         // A terminal that does not know its width says zero, which is not one.
         let mut unknown = buf;
-        unknown.get_mut(2..4).map(|s| s.copy_from_slice(&0u16.to_le_bytes()));
+        unknown
+            .get_mut(2..4)
+            .map(|s| s.copy_from_slice(&0u16.to_le_bytes()));
         assert_eq!(columns_of(&unknown), None);
     }
 
@@ -420,7 +428,10 @@ mod tests {
         set_cc(&mut saved, VEOF, 0x02); // ^B, a value neither default could be
         use std::os::fd::AsFd;
         let f = std::fs::File::open("/dev/null").unwrap();
-        let raw = Raw { fd: f.as_fd(), saved };
+        let raw = Raw {
+            fd: f.as_fd(),
+            saved,
+        };
         assert_eq!(raw.intr(), Some(0x18));
         assert_eq!(raw.eof(), Some(0x02));
         // `_POSIX_VDISABLE` is a zero byte: the character is OFF, not bound to
@@ -428,7 +439,10 @@ mod tests {
         let mut off = [0u8; sys::TERMIOS_LEN];
         set_cc(&mut off, VINTR, 0);
         set_cc(&mut off, VEOF, 0);
-        let raw = Raw { fd: f.as_fd(), saved: off };
+        let raw = Raw {
+            fd: f.as_fd(),
+            saved: off,
+        };
         assert_eq!(raw.intr(), None);
         assert_eq!(raw.eof(), None);
     }

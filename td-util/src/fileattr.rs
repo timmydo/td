@@ -21,7 +21,10 @@ fn usage_chown() -> String {
 /// would strip every bit off a path the boot depends on.
 fn parse_mode(spec: &str) -> Result<u32, String> {
     if spec.is_empty() || spec.len() > 4 || !spec.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
-        return Err(format!("invalid mode '{spec}' (octal only)\n{}", usage_chmod()));
+        return Err(format!(
+            "invalid mode '{spec}' (octal only)\n{}",
+            usage_chmod()
+        ));
     }
     u32::from_str_radix(spec, 8).map_err(|e| format!("invalid mode '{spec}': {e}"))
 }
@@ -99,7 +102,12 @@ mod tests {
     /// The four modes td issues, and the shapes that must NOT be guessed at.
     #[test]
     fn only_octal_modes_are_accepted() {
-        for (spec, want) in [("0755", 0o755), ("0700", 0o700), ("0644", 0o644), ("600", 0o600)] {
+        for (spec, want) in [
+            ("0755", 0o755),
+            ("0700", 0o700),
+            ("0644", 0o644),
+            ("600", 0o600),
+        ] {
             assert_eq!(parse_mode(spec), Ok(want), "{spec}");
         }
         for bad in ["u+x", "", "8", "0o755", "07555", "-rwx", "a=r"] {
@@ -116,15 +124,32 @@ mod tests {
     fn only_numeric_owners_are_accepted() {
         assert_eq!(parse_owner("0:0"), Ok((0, 0)));
         assert_eq!(parse_owner("1000:1000"), Ok((1000, 1000)));
-        for bad in ["root:root", "1000", "1000:", ":1000", "", "1000:1000:1", "-1:0"] {
-            assert!(parse_owner(bad).is_err(), "'{bad}' was accepted as an owner");
+        for bad in [
+            "root:root",
+            "1000",
+            "1000:",
+            ":1000",
+            "",
+            "1000:1000:1",
+            "-1:0",
+        ] {
+            assert!(
+                parse_owner(bad).is_err(),
+                "'{bad}' was accepted as an owner"
+            );
         }
     }
 
     #[test]
     fn an_operand_is_required() {
-        assert!(chmod(&args(&["0755"])).is_err(), "a mode with no path is a usage error");
-        assert!(chown(&args(&["0:0"])).is_err(), "an owner with no path is a usage error");
+        assert!(
+            chmod(&args(&["0755"])).is_err(),
+            "a mode with no path is a usage error"
+        );
+        assert!(
+            chown(&args(&["0:0"])).is_err(),
+            "an owner with no path is a usage error"
+        );
         assert!(chmod(&args(&[])).is_err());
         assert!(chown(&args(&[])).is_err());
     }

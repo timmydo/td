@@ -2,29 +2,86 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 const MAIN_RS: &str = include_str!("../../../td-secret/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
-    ("set_client", include_str!("../../../td-secret/src/set_client.rs")),
-    ("secret_sys", include_str!("../../../td-authd/src/secret_sys.rs")),
-    ("secret_request", include_str!("../../../td-authd/src/secret_request.rs")),
-    ("write_operation", include_str!("../../../td-secret/src/write_operation.rs")),
-    ("operation", include_str!("../../../td-secret/src/operation.rs")),
-    ("enrollment_operation", include_str!("../../../td-secret/src/enrollment_operation.rs")),
+    (
+        "set_client",
+        include_str!("../../../td-secret/src/set_client.rs"),
+    ),
+    (
+        "secret_sys",
+        include_str!("../../../td-authd/src/secret_sys.rs"),
+    ),
+    (
+        "secret_request",
+        include_str!("../../../td-authd/src/secret_request.rs"),
+    ),
+    (
+        "write_operation",
+        include_str!("../../../td-secret/src/write_operation.rs"),
+    ),
+    (
+        "operation",
+        include_str!("../../../td-secret/src/operation.rs"),
+    ),
+    (
+        "enrollment_operation",
+        include_str!("../../../td-secret/src/enrollment_operation.rs"),
+    ),
     ("consent", include_str!("../../../td-authd/src/consent.rs")),
     ("client", include_str!("../../../td-secret/src/client.rs")),
     ("crypto", include_str!("../../../td-secret/src/crypto.rs")),
-    ("portable", include_str!("../../../td-secret/src/portable.rs")),
-    ("fido_aes", include_str!("../../../td-secret/src/fido_aes.rs")),
-    ("fido_cbor", include_str!("../../../td-secret/src/fido_cbor.rs")),
-    ("fido_ctap", include_str!("../../../td-secret/src/fido_ctap.rs")),
-    ("fido_device", include_str!("../../../td-secret/src/fido_device.rs")),
-    ("fido_enroll", include_str!("../../../td-secret/src/fido_enroll.rs")),
-    ("fido_hid", include_str!("../../../td-secret/src/fido_hid.rs")),
-    ("fido_metadata", include_str!("../../../td-secret/src/fido_metadata.rs")),
-    ("fido_p256", include_str!("../../../td-secret/src/fido_p256.rs")),
-    ("fido_pin", include_str!("../../../td-secret/src/fido_pin.rs")),
-    ("fido_transaction", include_str!("../../../td-secret/src/fido_transaction.rs")),
+    (
+        "portable",
+        include_str!("../../../td-secret/src/portable.rs"),
+    ),
+    (
+        "fido_aes",
+        include_str!("../../../td-secret/src/fido_aes.rs"),
+    ),
+    (
+        "fido_cbor",
+        include_str!("../../../td-secret/src/fido_cbor.rs"),
+    ),
+    (
+        "fido_ctap",
+        include_str!("../../../td-secret/src/fido_ctap.rs"),
+    ),
+    (
+        "fido_device",
+        include_str!("../../../td-secret/src/fido_device.rs"),
+    ),
+    (
+        "fido_enroll",
+        include_str!("../../../td-secret/src/fido_enroll.rs"),
+    ),
+    (
+        "fido_hid",
+        include_str!("../../../td-secret/src/fido_hid.rs"),
+    ),
+    (
+        "fido_metadata",
+        include_str!("../../../td-secret/src/fido_metadata.rs"),
+    ),
+    (
+        "fido_p256",
+        include_str!("../../../td-secret/src/fido_p256.rs"),
+    ),
+    (
+        "fido_pin",
+        include_str!("../../../td-secret/src/fido_pin.rs"),
+    ),
+    (
+        "fido_transaction",
+        include_str!("../../../td-secret/src/fido_transaction.rs"),
+    ),
     ("pin_sys", include_str!("../../../td-secret/src/pin_sys.rs")),
-    ("pin_terminal", include_str!("../../../td-secret/src/pin_terminal.rs")),
-    ("token_check", include_str!("../../../td-secret/src/token_check.rs")),
+    (
+        "pin_terminal",
+        include_str!("../../../td-secret/src/pin_terminal.rs"),
+    ),
+    (
+        "token_check",
+        include_str!("../../../td-secret/src/token_check.rs"),
+    ),
     ("tpm", include_str!("../../../td-secret/src/tpm.rs")),
     ("store", include_str!("../../../td-secret/src/store.rs")),
     ("sys", include_str!("../../../td-secret/src/sys.rs")),
@@ -88,20 +145,60 @@ pub fn recipe() -> Recipe {
         });
     }
     for (path, source) in [
-        ("{src}/td-secret/src/portable_store.rs", include_str!("../../../td-secret/src/portable_store.rs")),
-        ("{src}/td-authd/src/terminal_sys.rs", include_str!("../../../td-authd/src/terminal_sys.rs")),
-        ("{src}/td-authd/src/primary_account.rs", include_str!("../../../td-authd/src/primary_account.rs")),
-        ("{src}/td-secret/tests/aes_vectors.txt", include_str!("../../../td-secret/tests/aes_vectors.txt")),
-        ("{src}/td-secret/tests/p256_vectors.txt", include_str!("../../../td-secret/tests/p256_vectors.txt")),
-        ("{src}/td-secret/tests/pin_vectors.txt", include_str!("../../../td-secret/tests/pin_vectors.txt")),
-        ("{src}/td-secret/tests/token_check_vectors.txt", include_str!("../../../td-secret/tests/token_check_vectors.txt")),
-        ("{src}/td-secret/src/system_vm.rs", include_str!("../../../td-secret/src/system_vm.rs")),
-        ("{src}/td-authd/tests/secret_sys.rs", include_str!("../../../td-authd/tests/secret_sys.rs")),
-        ("{src}/td-firstboot/src/principals.rs", include_str!("../../../td-firstboot/src/principals.rs")),
-        ("{src}/td-firstboot/src/principals_tests.rs", include_str!("../../../td-firstboot/src/principals_tests.rs")),
-        ("{src}/engine/src/principals.rs", include_str!("../../../engine/src/principals.rs")),
+        (
+            "{src}/td-secret/src/portable_store.rs",
+            include_str!("../../../td-secret/src/portable_store.rs"),
+        ),
+        (
+            "{src}/td-authd/src/terminal_sys.rs",
+            include_str!("../../../td-authd/src/terminal_sys.rs"),
+        ),
+        (
+            "{src}/td-authd/src/primary_account.rs",
+            include_str!("../../../td-authd/src/primary_account.rs"),
+        ),
+        (
+            "{src}/td-secret/tests/aes_vectors.txt",
+            include_str!("../../../td-secret/tests/aes_vectors.txt"),
+        ),
+        (
+            "{src}/td-secret/tests/p256_vectors.txt",
+            include_str!("../../../td-secret/tests/p256_vectors.txt"),
+        ),
+        (
+            "{src}/td-secret/tests/pin_vectors.txt",
+            include_str!("../../../td-secret/tests/pin_vectors.txt"),
+        ),
+        (
+            "{src}/td-secret/tests/token_check_vectors.txt",
+            include_str!("../../../td-secret/tests/token_check_vectors.txt"),
+        ),
+        (
+            "{src}/td-secret/src/system_vm.rs",
+            include_str!("../../../td-secret/src/system_vm.rs"),
+        ),
+        (
+            "{src}/td-authd/tests/secret_sys.rs",
+            include_str!("../../../td-authd/tests/secret_sys.rs"),
+        ),
+        (
+            "{src}/td-firstboot/src/principals.rs",
+            include_str!("../../../td-firstboot/src/principals.rs"),
+        ),
+        (
+            "{src}/td-firstboot/src/principals_tests.rs",
+            include_str!("../../../td-firstboot/src/principals_tests.rs"),
+        ),
+        (
+            "{src}/engine/src/principals.rs",
+            include_str!("../../../engine/src/principals.rs"),
+        ),
     ] {
-        steps.push(Step::WriteFile { path: path.into(), content: source.into(), exec: false });
+        steps.push(Step::WriteFile {
+            path: path.into(),
+            content: source.into(),
+            exec: false,
+        });
     }
     steps.push(Step::WriteFile {
         path: "{src}/engine/src/sha256.rs".into(),
@@ -157,12 +254,27 @@ pub fn recipe() -> Recipe {
             "{src}",
             rustc,
             &[
-                "--edition", "2021", "--test", "--crate-name", "td_secret_tests",
-                "--target", "x86_64-unknown-linux-gnu",
-                "-C", "target-feature=+crt-static", "-C", "relocation-model=static",
-                &linker, "-L", glib, &lib_b, &bin_b,
-                "-Clink-arg=-L{root}/eh", "-Clink-arg=-static-libgcc",
-                "-o", "{root}/secret-tests", "{src}/td-secret/src/main.rs",
+                "--edition",
+                "2021",
+                "--test",
+                "--crate-name",
+                "td_secret_tests",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                &linker,
+                "-L",
+                glib,
+                &lib_b,
+                &bin_b,
+                "-Clink-arg=-L{root}/eh",
+                "-Clink-arg=-static-libgcc",
+                "-o",
+                "{root}/secret-tests",
+                "{src}/td-secret/src/main.rs",
             ],
         )
         .env("PATH", &path)
@@ -196,7 +308,15 @@ mod tests {
             if !path.ends_with(".rs") {
                 continue;
             }
-            for token in ["{root}", "{src}", "{out}", "{tools}", "{jobs}", "{in:", "{payload:"] {
+            for token in [
+                "{root}",
+                "{src}",
+                "{out}",
+                "{tools}",
+                "{jobs}",
+                "{in:",
+                "{payload:",
+            ] {
                 assert!(
                     !content.contains(token),
                     "embedded source {path} contains recipe substitution token {token}"
@@ -208,17 +328,24 @@ mod tests {
     #[test]
     fn recipe_embeds_every_declared_module() {
         let production = MAIN_RS.split("#[cfg(test)]").next().unwrap();
-        let code = production.lines().map(|line| line.split("//").next().unwrap()).collect::<Vec<_>>().join("\n");
+        let code = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut words = code.split_whitespace();
         let mut declared = Vec::new();
         while let Some(word) = words.next() {
             if word == "mod" {
-                if let Some(name) = words.next().and_then(|name| name.strip_suffix(';')) { declared.push(name); }
+                if let Some(name) = words.next().and_then(|name| name.strip_suffix(';')) {
+                    declared.push(name);
+                }
             }
         }
         let mut embedded: Vec<_> = MODULES.iter().map(|(name, _)| *name).collect();
         embedded.push("principals");
-        declared.sort_unstable(); embedded.sort_unstable();
+        declared.sort_unstable();
+        embedded.sort_unstable();
         assert_eq!(declared, embedded);
         assert!(recipe().steps.iter().flatten().any(|step| matches!(step,
             Step::WriteFile { path, content, .. } if path == "{src}/td-firstboot/src/principals.rs"

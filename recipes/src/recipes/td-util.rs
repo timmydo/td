@@ -134,7 +134,9 @@ pub fn recipe() -> Recipe {
     steps.push(Step::MkDir {
         path: "{root}/eh".into(),
     });
-    steps.push(Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
+    steps.push(
+        Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
+    );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
     steps.push(
         target_rustc(
@@ -263,11 +265,20 @@ mod tests {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../td-util/src");
         let read = |name: &str| std::fs::read_to_string(src.join(name)).unwrap_or_default();
         let main = read("main.rs");
-        assert!(!main.is_empty(), "td-util/src/main.rs must be readable, or this is vacuous");
-        assert_eq!(MAIN_RS, main, "the embedded crate root is not td-util/src/main.rs");
+        assert!(
+            !main.is_empty(),
+            "td-util/src/main.rs must be readable, or this is vacuous"
+        );
+        assert_eq!(
+            MAIN_RS, main,
+            "the embedded crate root is not td-util/src/main.rs"
+        );
         for (name, source) in MODULES {
             let on_disk = read(&format!("{name}.rs"));
-            assert!(!on_disk.is_empty(), "td-util/src/{name}.rs must be readable");
+            assert!(
+                !on_disk.is_empty(),
+                "td-util/src/{name}.rs must be readable"
+            );
             assert_eq!(
                 *source, on_disk,
                 "the embedded '{name}' is not td-util/src/{name}.rs; the confinement \

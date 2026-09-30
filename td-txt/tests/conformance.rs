@@ -83,7 +83,6 @@ fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-
 /// Run every corpus case, classified against the overlay. Green iff there is no
 /// regression (an unlisted case that fails), no unexpected pass (a listed `xfail`
 /// that now passes — promote it), and no stale overlay entry.
@@ -93,8 +92,9 @@ fn corpus_conformance() -> Result<(), Box<dyn std::error::Error>> {
     let cases = load_corpus(&spec_dir)?;
     // Must EXIST. Treating a missing overlay as empty would turn a lost file
     // into "no known gaps", which reds only by accident.
-    let exp_text = std::fs::read_to_string(spec_dir.join("expectations.txt"))
-        .map_err(|e| format!("spec/expectations.txt: {e} (regenerate with examples/gen_expectations.rs)"))?;
+    let exp_text = std::fs::read_to_string(spec_dir.join("expectations.txt")).map_err(|e| {
+        format!("spec/expectations.txt: {e} (regenerate with examples/gen_expectations.rs)")
+    })?;
     let exp = Expectations::parse(&exp_text).map_err(|e| format!("expectations.txt: {e}"))?;
 
     let (outcomes, stale) = run_all_classified(&bin(), &cases, &exp)?;
@@ -104,13 +104,21 @@ fn corpus_conformance() -> Result<(), Box<dyn std::error::Error>> {
         s.pass, s.xfail, s.skip, s.fail, s.xpass, stale.len()
     );
 
-    let regressions: Vec<&_> =
-        outcomes.iter().filter(|o| o.disposition == Disposition::Fail).collect();
+    let regressions: Vec<&_> = outcomes
+        .iter()
+        .filter(|o| o.disposition == Disposition::Fail)
+        .collect();
     for o in &regressions {
-        eprintln!("REGRESSION {}: {}", o.key, o.detail.clone().unwrap_or_default());
+        eprintln!(
+            "REGRESSION {}: {}",
+            o.key,
+            o.detail.clone().unwrap_or_default()
+        );
     }
-    let to_promote: Vec<&_> =
-        outcomes.iter().filter(|o| o.disposition == Disposition::XPass).collect();
+    let to_promote: Vec<&_> = outcomes
+        .iter()
+        .filter(|o| o.disposition == Disposition::XPass)
+        .collect();
     for o in &to_promote {
         eprintln!("XPASS (remove from expectations.txt) {}", o.key);
     }
@@ -118,7 +126,10 @@ fn corpus_conformance() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("STALE expectations.txt entry (matches no case): {k}");
     }
 
-    assert!(s.pass > 0, "corpus produced zero passing cases — harness or build broken");
+    assert!(
+        s.pass > 0,
+        "corpus produced zero passing cases — harness or build broken"
+    );
     assert!(
         regressions.is_empty(),
         "{} regression(s) — see REGRESSION lines above",
@@ -129,7 +140,11 @@ fn corpus_conformance() -> Result<(), Box<dyn std::error::Error>> {
         "{} xfail now pass(es) — promote them, see XPASS lines",
         to_promote.len()
     );
-    assert!(stale.is_empty(), "{} stale overlay entr(ies) — see STALE lines above", stale.len());
+    assert!(
+        stale.is_empty(),
+        "{} stale overlay entr(ies) — see STALE lines above",
+        stale.len()
+    );
     Ok(())
 }
 
@@ -152,7 +167,11 @@ fn a_large_case_streams_without_deadlocking() -> Result<(), Box<dyn std::error::
         files: Vec::new(),
         env: Vec::new(),
         stdin: input.clone(),
-        expect: Expect { status: Some(0), stdout: Some(input), ..Expect::default() },
+        expect: Expect {
+            status: Some(0),
+            stdout: Some(input),
+            ..Expect::default()
+        },
     };
     let start = std::time::Instant::now();
     let outcome = run_case(&bin(), &case)?;
@@ -181,10 +200,18 @@ fn a_long_line_does_not_overflow_the_matcher_stack() -> Result<(), Box<dyn std::
         files: Vec::new(),
         env: Vec::new(),
         stdin: line.clone(),
-        expect: Expect { status: Some(0), stdout: Some(b"1\n".to_vec()), ..Expect::default() },
+        expect: Expect {
+            status: Some(0),
+            stdout: Some(b"1\n".to_vec()),
+            ..Expect::default()
+        },
     };
     let outcome = run_case(&bin(), &counted)?;
-    assert!(outcome.passed, "long-line repetition failed: {:?}", outcome.detail);
+    assert!(
+        outcome.passed,
+        "long-line repetition failed: {:?}",
+        outcome.detail
+    );
 
     // A grouped body cannot use the flat path, so the step budget must stop it
     // with an error rather than a segfault.
@@ -207,8 +234,8 @@ fn a_long_line_does_not_overflow_the_matcher_stack() -> Result<(), Box<dyn std::
 /// by running one iteration under the cap through the built binary. A frame that
 /// grew past the reserved budget aborts here instead of in a user's pipeline.
 #[test]
-fn a_repetition_just_under_the_depth_cap_does_not_abort(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn a_repetition_just_under_the_depth_cap_does_not_abort() -> Result<(), Box<dyn std::error::Error>>
+{
     let mut line = Vec::new();
     for _ in 0..19_999 {
         line.extend_from_slice(b"ab");
@@ -221,10 +248,18 @@ fn a_repetition_just_under_the_depth_cap_does_not_abort(
         files: Vec::new(),
         env: Vec::new(),
         stdin: line,
-        expect: Expect { status: Some(0), stdout: Some(b"1\n".to_vec()), ..Expect::default() },
+        expect: Expect {
+            status: Some(0),
+            stdout: Some(b"1\n".to_vec()),
+            ..Expect::default()
+        },
     };
     let outcome = run_case(&bin(), &case)?;
-    assert!(outcome.passed, "depth just under the cap: {:?}", outcome.detail);
+    assert!(
+        outcome.passed,
+        "depth just under the cap: {:?}",
+        outcome.detail
+    );
     Ok(())
 }
 
@@ -242,7 +277,9 @@ fn a_pattern_past_the_concat_cap_is_refused() -> Result<(), Box<dyn std::error::
         stdin: b"a\n".to_vec(),
         expect: Expect {
             status: Some(2),
-            stderr: Some(Stream::Contains(b"regular expression is too complex".to_vec())),
+            stderr: Some(Stream::Contains(
+                b"regular expression is too complex".to_vec(),
+            )),
             ..Expect::default()
         },
     };
@@ -274,7 +311,9 @@ fn nesting_past_the_cap_is_refused_rather_than_aborting() -> Result<(), Box<dyn 
         stdin: b"a\n".to_vec(),
         expect: Expect {
             status: Some(2),
-            stderr: Some(Stream::Contains(b"regular expression is too complex".to_vec())),
+            stderr: Some(Stream::Contains(
+                b"regular expression is too complex".to_vec(),
+            )),
             ..Expect::default()
         },
     };
@@ -371,7 +410,9 @@ fn sed_in_place_replaces_a_symlink_rather_than_following_it(
     let out = sed_in(&dir, &["-i", "s/a/b/", "link"])?;
     assert!(out.status.success(), "sed -i on a symlink: {out:?}");
     assert!(
-        !std::fs::symlink_metadata(dir.join("link"))?.file_type().is_symlink(),
+        !std::fs::symlink_metadata(dir.join("link"))?
+            .file_type()
+            .is_symlink(),
         "-i left `link' a symlink, so it followed it and edited the target"
     );
     assert_eq!(std::fs::read(dir.join("link"))?, b"b\n");
@@ -419,7 +460,11 @@ fn sed_in_place_keeps_the_mode_and_rewrites_a_read_only_file(
     let out = sed_in(&dir, &["-i", "s/a/b/", "exec", "readonly"])?;
     assert!(out.status.success(), "sed -i mode case: {out:?}");
     for (name, mode) in [("exec", 0o754u32), ("readonly", 0o444)] {
-        assert_eq!(std::fs::read(dir.join(name))?, b"b\n", "{name} was not rewritten");
+        assert_eq!(
+            std::fs::read(dir.join(name))?,
+            b"b\n",
+            "{name} was not rewritten"
+        );
         assert_eq!(
             std::fs::metadata(dir.join(name))?.permissions().mode() & 0o777,
             mode,
@@ -450,7 +495,10 @@ fn a_failed_in_place_backup_is_exit_4_and_leaves_no_scratch_file(
     let out = sed_in(&dir, &["-inodir/*", "s/a/b/", "f"])?;
     assert_eq!(out.status.code(), Some(4), "want exit 4, got {out:?}");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.starts_with("sed: cannot rename f:"), "unexpected diagnostic: {err:?}");
+    assert!(
+        err.starts_with("sed: cannot rename f:"),
+        "unexpected diagnostic: {err:?}"
+    );
     assert!(
         !err.contains("expression"),
         "a filesystem failure blamed the script: {err:?}"
@@ -458,8 +506,16 @@ fn a_failed_in_place_backup_is_exit_4_and_leaves_no_scratch_file(
     let names: Vec<String> = std::fs::read_dir(&dir.0)?
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
         .collect();
-    assert_eq!(names, vec!["f".to_string()], "a scratch file was left behind");
-    assert_eq!(std::fs::read(dir.join("f"))?, b"a\n", "the original was modified anyway");
+    assert_eq!(
+        names,
+        vec!["f".to_string()],
+        "a scratch file was left behind"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("f"))?,
+        b"a\n",
+        "the original was modified anyway"
+    );
     Ok(())
 }
 
@@ -489,7 +545,11 @@ fn grep_r_skips_a_non_regular_file_it_finds() -> Result<(), Box<dyn std::error::
     let out = grep_in(&dir, &["-rl", "a", "t"])?;
     assert_eq!(out.status.code(), Some(0), "want exit 0, got {out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "t/f\n");
-    assert_eq!(String::from_utf8_lossy(&out.stderr), "", "the socket was opened anyway");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "",
+        "the socket was opened anyway"
+    );
     Ok(())
 }
 
@@ -546,8 +606,15 @@ fn grep_r_searches_a_walked_file_named_dash() -> Result<(), Box<dyn std::error::
     // claim is about the LABEL, not about the bytes: this asserts that setting
     // it changes nothing here, whatever the two names above happen to be.
     let labelled = grep_in(&dir, &["--label=LBL", "-rn", "a"])?;
-    assert_eq!(labelled.status.code(), Some(0), "want exit 0, got {labelled:?}");
-    assert_eq!(labelled.stdout, out.stdout, "the label reached a walked file");
+    assert_eq!(
+        labelled.status.code(),
+        Some(0),
+        "want exit 0, got {labelled:?}"
+    );
+    assert_eq!(
+        labelled.stdout, out.stdout,
+        "the label reached a walked file"
+    );
     Ok(())
 }
 
@@ -569,7 +636,11 @@ fn grep_r_reads_stdin_for_a_dash_operand() -> Result<(), Box<dyn std::error::Err
         .spawn()?;
     // Not `if let`: a missing pipe would leave the child blocking on stdin, so the
     // one test here that could hang the gate must fail instead.
-    child.stdin.take().ok_or("no stdin pipe")?.write_all(b"a\nb\n")?;
+    child
+        .stdin
+        .take()
+        .ok_or("no stdin pipe")?
+        .write_all(b"a\nb\n")?;
     let out = child.wait_with_output()?;
     assert_eq!(out.status.code(), Some(0), "want exit 0, got {out:?}");
     assert_eq!(
@@ -594,7 +665,11 @@ fn grep_upper_r_follows_what_the_walk_finds_and_reads_devices(
     std::os::unix::fs::symlink("../real", dir.join("t").join("link"))?;
 
     let logical = grep_in(&dir, &["-Rl", "a", "t"])?;
-    assert_eq!(logical.status.code(), Some(0), "want exit 0, got {logical:?}");
+    assert_eq!(
+        logical.status.code(),
+        Some(0),
+        "want exit 0, got {logical:?}"
+    );
     assert_eq!(
         String::from_utf8_lossy(&logical.stdout),
         "t/g\nt/link/f\n",
@@ -604,7 +679,11 @@ fn grep_upper_r_follows_what_the_walk_finds_and_reads_devices(
     let _sock = std::os::unix::net::UnixListener::bind(dir.join("t").join("s"))?;
     let physical = grep_in(&dir, &["-rl", "a", "t"])?;
     assert_eq!(String::from_utf8_lossy(&physical.stdout), "t/g\n");
-    assert_eq!(String::from_utf8_lossy(&physical.stderr), "", "-r opened the socket");
+    assert_eq!(
+        String::from_utf8_lossy(&physical.stderr),
+        "",
+        "-r opened the socket"
+    );
     let read_devices = grep_in(&dir, &["-Rl", "a", "t"])?;
     assert!(
         String::from_utf8_lossy(&read_devices.stderr).contains("t/s:"),
@@ -617,15 +696,19 @@ fn grep_upper_r_follows_what_the_walk_finds_and_reads_devices(
 /// the logical walk carries its ancestor chain. GNU WARNS and carries on — the
 /// exit status is whatever the search concluded, here a match.
 #[test]
-fn grep_upper_r_warns_on_a_directory_loop_and_keeps_going(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn grep_upper_r_warns_on_a_directory_loop_and_keeps_going() -> Result<(), Box<dyn std::error::Error>>
+{
     let dir = TempDir::new("grep-R-loop")?;
     std::fs::create_dir(dir.join("t"))?;
     std::fs::write(dir.join("t").join("f"), b"a\n")?;
     std::os::unix::fs::symlink(".", dir.join("t").join("self"))?;
 
     let out = grep_in(&dir, &["-Rl", "a", "t"])?;
-    assert_eq!(out.status.code(), Some(0), "a loop made the status an error: {out:?}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a loop made the status an error: {out:?}"
+    );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "t/f\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
@@ -685,9 +768,15 @@ fn grep_counts_what_it_opened_and_could_not_read_but_not_what_it_could_not_open(
         .arg("grep")
         .args(["-c", "alpha", "-"])
         .current_dir(&dir.0)
-        .stdin(std::process::Stdio::from(std::fs::File::open(dir.join("d"))?))
+        .stdin(std::process::Stdio::from(std::fs::File::open(
+            dir.join("d"),
+        )?))
         .output()?;
-    assert_eq!(as_stdin.status.code(), Some(2), "want exit 2, got {as_stdin:?}");
+    assert_eq!(
+        as_stdin.status.code(),
+        Some(2),
+        "want exit 2, got {as_stdin:?}"
+    );
     assert_eq!(String::from_utf8_lossy(&as_stdin.stdout), "0\n");
     assert_eq!(
         String::from_utf8_lossy(&as_stdin.stderr),
@@ -703,8 +792,8 @@ fn grep_counts_what_it_opened_and_could_not_read_but_not_what_it_could_not_open(
 /// take it, and that half of the rule has no corpus case — the harness can hand a
 /// case a pipe or a file, but not a pre-positioned one.
 #[test]
-fn sed_hash_n_wants_a_script_stream_that_started_at_its_beginning()
--> Result<(), Box<dyn std::error::Error>> {
+fn sed_hash_n_wants_a_script_stream_that_started_at_its_beginning(
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Seek;
     let dir = TempDir::new("sed-hash-n-offset")?;
     std::fs::write(dir.join("data"), b"A\nB\n")?;
@@ -720,7 +809,11 @@ fn sed_hash_n_wants_a_script_stream_that_started_at_its_beginning()
         .stdin(std::process::Stdio::from(part_read))
         .output()?;
     assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "A\nA\nB\nB\n", "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "A\nA\nB\nB\n",
+        "{out:?}"
+    );
 
     // The control: the same two bytes at the file's own start DO carry it.
     let whole = std::fs::File::open(dir.join("s0"))?;
@@ -751,11 +844,13 @@ fn sed_hash_n_wants_a_script_stream_that_started_at_its_beginning()
 /// It also reads `src/sed.rs` ALONE, so the same probe in another module is
 /// invisible to it -- which is fine only while `read_script` lives here.
 #[test]
-fn sed_script_stdin_seekability_is_a_stat_not_a_reopen()
--> Result<(), Box<dyn std::error::Error>> {
-    let src =
-        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sed.rs"))?;
-    let (_, after) = src.split_once("fn read_script(").ok_or("read_script is gone")?;
+fn sed_script_stdin_seekability_is_a_stat_not_a_reopen() -> Result<(), Box<dyn std::error::Error>> {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sed.rs"),
+    )?;
+    let (_, after) = src
+        .split_once("fn read_script(")
+        .ok_or("read_script is gone")?;
     // The EARLIEST top-level item ends the body, not `fn` alone: the function is
     // followed by its error type now, so stopping at the next `fn` would swallow
     // that and quietly widen what the assertion below is allowed to match.
@@ -1064,7 +1159,12 @@ fn a_diagnostic_names_a_file_in_raw_bytes() -> Result<(), Box<dyn std::error::Er
         }
         let out = cmd.current_dir(&dir.0).output()?;
         let (got, want) = if r.first_line_only {
-            let first = out.stderr.split(|b| *b == b'\n').next().unwrap_or_default().to_vec();
+            let first = out
+                .stderr
+                .split(|b| *b == b'\n')
+                .next()
+                .unwrap_or_default()
+                .to_vec();
             (first, r.want.clone())
         } else {
             let mut want = r.want.clone();
@@ -1076,7 +1176,10 @@ fn a_diagnostic_names_a_file_in_raw_bytes() -> Result<(), Box<dyn std::error::Er
             want,
             "row {i} ({} {:?}) did not name the file the way GNU does",
             r.applet,
-            r.args.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect::<Vec<_>>()
+            r.args
+                .iter()
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect::<Vec<_>>()
         );
         assert_eq!(out.status.code(), Some(r.status), "row {i} status");
     }
@@ -1113,7 +1216,12 @@ fn a_diverging_diagnostic_still_names_in_raw_bytes() -> Result<(), Box<dyn std::
         .current_dir(&dir.0)
         .output()?;
     // The usage line follows it, and its wording is a divergence of its own.
-    let first = amb.stderr.split(|b| *b == b'\n').next().unwrap_or_default().to_vec();
+    let first = amb
+        .stderr
+        .split(|b| *b == b'\n')
+        .next()
+        .unwrap_or_default()
+        .to_vec();
     assert_eq!(
         first,
         b"sed: option '--s=\xff' is ambiguous; possibilities: '--silent' '--sandbox' '--separate'"
@@ -1141,7 +1249,8 @@ fn a_diverging_diagnostic_still_names_in_raw_bytes() -> Result<(), Box<dyn std::
     // Put it back before `TempDir` tries to remove the tree.
     std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755))?;
     assert!(
-        tmp.stderr.starts_with(b"sed: couldn't open temporary file d\xffir/sed"),
+        tmp.stderr
+            .starts_with(b"sed: couldn't open temporary file d\xffir/sed"),
         "the scratch file's directory was not named raw: {:?}",
         String::from_utf8_lossy(&tmp.stderr)
     );
@@ -1179,7 +1288,11 @@ fn a_dev_null_stdout_takes_the_l_exemption_away() -> Result<(), Box<dyn std::err
     );
     // Into `/dev/null` it names nothing, so the short cut applies and nothing is
     // compiled at all.
-    assert_eq!(String::from_utf8_lossy(&run(true)?), "", "-L -m0 into /dev/null should be silent");
+    assert_eq!(
+        String::from_utf8_lossy(&run(true)?),
+        "",
+        "-L -m0 into /dev/null should be silent"
+    );
     Ok(())
 }
 
@@ -1213,12 +1326,18 @@ fn grep_answers_from_a_stream_that_has_not_ended() -> Result<(), Box<dyn std::er
             }
             if waited >= 10_000 {
                 let _ = child.kill();
-                return Err(format!("grep {args:?} never answered while the pipe stayed open").into());
+                return Err(
+                    format!("grep {args:?} never answered while the pipe stayed open").into(),
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
             waited += 20;
         };
-        assert_eq!(code, Some(0), "grep {args:?} answered, but not with a match");
+        assert_eq!(
+            code,
+            Some(0),
+            "grep {args:?} answered, but not with a match"
+        );
         drop(sink);
         let _ = child.wait();
     }
@@ -1242,11 +1361,12 @@ fn grep_answers_from_a_stream_that_has_not_ended() -> Result<(), Box<dyn std::er
 /// gets. It hands over after the first BLOCK so sed's one read cannot see a
 /// short buffer — the assertion below is about exactly which bytes are left.
 #[test]
-fn sed_leaves_the_rest_of_a_pipe_for_the_next_reader()
--> Result<(), Box<dyn std::error::Error>> {
+fn sed_leaves_the_rest_of_a_pipe_for_the_next_reader() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{Read, Write};
     // 2500 lines of 8 bytes = 20000, several blocks, so the leftover is exact.
-    let feed: Vec<u8> = (0..2500u32).flat_map(|i| format!("{i:07}\n").into_bytes()).collect();
+    let feed: Vec<u8> = (0..2500u32)
+        .flat_map(|i| format!("{i:07}\n").into_bytes())
+        .collect();
     // `-s` opens its operands on a path of its own, so it is asked separately.
     for args in [&["1q"][..], &["-s", "1q"][..]] {
         let (reader, writer) = std::io::pipe()?;
@@ -1299,7 +1419,12 @@ fn sed_leaves_the_rest_of_a_pipe_for_the_next_reader()
 #[test]
 fn sed_answers_from_a_stream_that_has_not_ended() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
-    for (script, sep) in [("1q", false), ("1{p;q}", false), ("$!{1q}", false), ("1q", true)] {
+    for (script, sep) in [
+        ("1q", false),
+        ("1{p;q}", false),
+        ("$!{1q}", false),
+        ("1q", true),
+    ] {
         let mut args = vec!["-n"];
         if sep {
             args.push("-s");
@@ -1321,7 +1446,9 @@ fn sed_answers_from_a_stream_that_has_not_ended() -> Result<(), Box<dyn std::err
             }
             if waited >= 10_000 {
                 let _ = child.kill();
-                return Err(format!("sed {args:?} {script:?} never answered on an open pipe").into());
+                return Err(
+                    format!("sed {args:?} {script:?} never answered on an open pipe").into(),
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
             waited += 20;
@@ -1397,7 +1524,18 @@ fn r_dumps_a_source_that_never_ends() -> Result<(), Box<dyn std::error::Error>> 
     std::fs::create_dir(dir.0.join("DIR"))?;
     let mut child = std::process::Command::new(bin())
         .arg("sed")
-        .args(["-n", "-e", "r /dev/zero", "-e", "r DIR", "-e", "r /dev/zero", "-e", "p", "IN"])
+        .args([
+            "-n",
+            "-e",
+            "r /dev/zero",
+            "-e",
+            "r DIR",
+            "-e",
+            "r /dev/zero",
+            "-e",
+            "p",
+            "IN",
+        ])
         .current_dir(&dir.0)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1421,7 +1559,11 @@ fn r_dumps_a_source_that_never_ends() -> Result<(), Box<dyn std::error::Error>> 
     }?;
     // The line `p` printed first, then the source's own bytes.
     assert_eq!(buf.get(..2), Some(b"a\n".as_slice()));
-    assert_eq!(buf.get(2..), Some([0u8; 14].as_slice()), "the dump is /dev/zero's bytes");
+    assert_eq!(
+        buf.get(2..),
+        Some([0u8; 14].as_slice()),
+        "the dump is /dev/zero's bytes"
+    );
 
     let mut waited = 0;
     let status = loop {
@@ -1436,7 +1578,10 @@ fn r_dumps_a_source_that_never_ends() -> Result<(), Box<dyn std::error::Error>> 
         std::thread::sleep(std::time::Duration::from_millis(20));
         waited += 20;
     };
-    assert!(status.success(), "a closed reader is not a failure: {status:?}");
+    assert!(
+        status.success(),
+        "a closed reader is not a failure: {status:?}"
+    );
     Ok(())
 }
 
@@ -1473,21 +1618,34 @@ fn a_w_target_flushes_on_the_buffer_boundary() -> Result<(), Box<dyn std::error:
             input.extend(std::iter::repeat_n(b'x', 95));
             input.push(b'\n');
         }
-        assert_eq!(input.len(), *total, "the input is not the length the row says");
+        assert_eq!(
+            input.len(),
+            *total,
+            "the input is not the length the row says"
+        );
         std::fs::write(dir.0.join("h"), &input)?;
         let out = std::process::Command::new(bin())
             .arg("sed")
             .args(["-n", "-e", "w wf", "-e", "$r wf", "h"])
             .current_dir(&dir.0)
             .output()?;
-        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert_eq!(
             out.stdout.len(),
             *want,
             "{total} bytes written to the w target: the r saw the wrong amount"
         );
         // What it saw must be the PREFIX of what was written, not merely its size.
-        assert_eq!(out.stdout, input.get(..*want).unwrap_or_default(), "at {total}");
+        assert_eq!(
+            out.stdout,
+            input.get(..*want).unwrap_or_default(),
+            "at {total}"
+        );
         // And the file itself is whole once the run ends.
         assert_eq!(std::fs::read(dir.0.join("wf"))?.len(), *total, "at {total}");
     }
@@ -1499,12 +1657,8 @@ fn a_w_target_flushes_on_the_buffer_boundary() -> Result<(), Box<dyn std::error:
     // flushing at capacity would show it all 4096. Each row is one record of
     // `len` bytes including its separator, repeated `times`, and `want` is again
     // GNU sed 4.9's own answer for what the `r` sees across the whole run.
-    let exact: &[(usize, usize, usize)] = &[
-        (4096, 1, 0),
-        (4095, 1, 0),
-        (4097, 1, 4096),
-        (4096, 2, 4096),
-    ];
+    let exact: &[(usize, usize, usize)] =
+        &[(4096, 1, 0), (4095, 1, 0), (4097, 1, 4096), (4096, 2, 4096)];
     for (len, times, want) in exact {
         let mut input = Vec::new();
         for _ in 0..*times {
@@ -1517,7 +1671,12 @@ fn a_w_target_flushes_on_the_buffer_boundary() -> Result<(), Box<dyn std::error:
             .args(["-n", "-e", "w wf", "-e", "r wf", "h"])
             .current_dir(&dir.0)
             .output()?;
-        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert_eq!(out.stdout.len(), *want, "{times} record(s) of {len} bytes");
         assert_eq!(std::fs::read(dir.0.join("wf"))?, input, "{times} of {len}");
     }
@@ -1535,8 +1694,8 @@ fn a_w_target_flushes_on_the_buffer_boundary() -> Result<(), Box<dyn std::error:
 /// the SINK's buffer size -- the flushed TOTAL is `floor(n / 4096) * 4096` for
 /// any scheme that fills before it writes, so nothing else here can see it.
 #[test]
-fn a_posix_w_of_dev_stdout_is_a_second_buffer_over_one_pipe()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_posix_w_of_dev_stdout_is_a_second_buffer_over_one_pipe(
+) -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("posix-stdout-buffer")?;
     // 41 records of 100 bytes: enough that the sink crosses 4096 and the `w`
     // target, at half the volume, does not.
@@ -1549,15 +1708,28 @@ fn a_posix_w_of_dev_stdout_is_a_second_buffer_over_one_pipe()
         doubled.extend_from_slice(&rec);
         doubled.extend_from_slice(&rec);
     }
-    assert_eq!(input.len(), 4100, "the input is not the length this test needs");
+    assert_eq!(
+        input.len(),
+        4100,
+        "the input is not the length this test needs"
+    );
     std::fs::write(dir.0.join("h"), &input)?;
     let out = std::process::Command::new(bin())
         .arg("sed")
         .args(["--posix", "-e", "p", "-e", "w /dev/stdout", "h"])
         .current_dir(&dir.0)
         .output()?;
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(out.stdout.len(), input.len() * 3, "the p, the auto-print and the w target");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout.len(),
+        input.len() * 3,
+        "the p, the auto-print and the w target"
+    );
     assert_eq!(
         out.stdout.get(..4096),
         doubled.get(..4096),
@@ -1602,8 +1774,10 @@ fn a_cycle_stops_once_the_reader_has_gone() -> Result<(), Box<dyn std::error::Er
     // the `w` has already run and the swallowed input matches the record exactly.
     // Miss the between-cycles check and the second reads one more record before
     // anything notices, which is the whole of the placement argument.
-    for (script, extra) in [(vec!["-n", "-e", "p", "-e", "w OUT"], 100u64), (vec!["-e", "w OUT"], 0)]
-    {
+    for (script, extra) in [
+        (vec!["-n", "-e", "p", "-e", "w OUT"], 100u64),
+        (vec!["-e", "w OUT"], 0),
+    ] {
         let _ = std::fs::remove_file(dir.0.join("OUT"));
         // Through STDIN, and a `try_clone` of it kept here: the child shares that
         // file DESCRIPTION, so its final offset is readable from this side and says
@@ -1627,10 +1801,21 @@ fn a_cycle_stops_once_the_reader_has_gone() -> Result<(), Box<dyn std::error::Er
             e.read_to_end(&mut err)?;
         }
         let status = wait_bounded(&mut child, 20)?.ok_or("the run never ended")?;
-        assert_eq!(status.code(), Some(0), "{script:?}: {}", String::from_utf8_lossy(&err));
-        assert!(err.is_empty(), "{script:?}: a closed reader is not a diagnostic: {err:?}");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{script:?}: {}",
+            String::from_utf8_lossy(&err)
+        );
+        assert!(
+            err.is_empty(),
+            "{script:?}: a closed reader is not a diagnostic: {err:?}"
+        );
         let wrote = std::fs::metadata(dir.0.join("OUT"))?.len();
-        assert!(wrote < input.len() as u64, "{script:?}: did not stop at all: wrote {wrote}");
+        assert!(
+            wrote < input.len() as u64,
+            "{script:?}: did not stop at all: wrote {wrote}"
+        );
         assert!(
             wrote <= 250_000,
             "{script:?}: kept going long past the closed reader: wrote {wrote} of {}",
@@ -1748,8 +1933,8 @@ fn a_script_loop_stops_once_the_reader_has_gone() -> Result<(), Box<dyn std::err
 /// a FIFO nobody opens for writing hung outright. The second is left out of the
 /// test for the reason it is a bug: it does not terminate when it regresses.
 #[test]
-fn a_separate_run_stops_at_the_operand_the_reader_broke_on()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_separate_run_stops_at_the_operand_the_reader_broke_on(
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Read as _;
     let dir = TempDir::new("broken-sink-separate")?;
     let mut input = Vec::new();
@@ -1760,7 +1945,10 @@ fn a_separate_run_stops_at_the_operand_the_reader_broke_on()
     // Both places the stop can be decided, since each returns to the operand loop
     // by its own route: `p` alone breaks between cycles, and `p` followed by
     // another command breaks inside one.
-    for script in [vec!["-s", "-n", "p"], vec!["-s", "-n", "-e", "p", "-e", "w OUT"]] {
+    for script in [
+        vec!["-s", "-n", "p"],
+        vec!["-s", "-n", "-e", "p", "-e", "w OUT"],
+    ] {
         let mut child = std::process::Command::new(bin())
             .arg("sed")
             .args(&script)
@@ -1780,7 +1968,11 @@ fn a_separate_run_stops_at_the_operand_the_reader_broke_on()
             "{script:?}: the operand after the broken one was opened: {}",
             String::from_utf8_lossy(&err)
         );
-        assert_eq!(done.code(), Some(0), "{script:?}: a closed reader is not an error");
+        assert_eq!(
+            done.code(),
+            Some(0),
+            "{script:?}: a closed reader is not an error"
+        );
     }
     Ok(())
 }
@@ -1838,7 +2030,9 @@ fn a_listing_is_submitted_in_pieces_the_buffer_can_hold() -> Result<(), Box<dyn 
 fn an_r_source_crosses_read_blocks() -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("r-blocks-dump")?;
     // Two blocks and a bit, and every line distinct, so a repeat is not a match.
-    let source: Vec<u8> = (0..1200u32).flat_map(|i| format!("s{i:06}\n").into_bytes()).collect();
+    let source: Vec<u8> = (0..1200u32)
+        .flat_map(|i| format!("s{i:06}\n").into_bytes())
+        .collect();
     assert!(source.len() > 2 * 4096, "the source has to span blocks");
     std::fs::write(dir.0.join("SRC"), &source)?;
     std::fs::write(dir.0.join("IN"), b"a\nb\n")?;
@@ -1848,14 +2042,23 @@ fn an_r_source_crosses_read_blocks() -> Result<(), Box<dyn std::error::Error>> {
         .args(["-n", "-e", "r SRC", "-e", "p", "IN"])
         .current_dir(&dir.0)
         .output()?;
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     // `r` dumps the WHOLE source once per cycle, after that cycle's own line.
     let mut want = Vec::new();
     for line in [b"a\n".as_slice(), b"b\n".as_slice()] {
         want.extend_from_slice(line);
         want.extend_from_slice(&source);
     }
-    assert_eq!(out.stdout.len(), want.len(), "the dump is not the source's length");
+    assert_eq!(
+        out.stdout.len(),
+        want.len(),
+        "the dump is not the source's length"
+    );
     assert_eq!(out.stdout, want);
     Ok(())
 }
@@ -1867,8 +2070,7 @@ fn an_r_source_crosses_read_blocks() -> Result<(), Box<dyn std::error::Error>> {
 /// which a reader that kept its buffer would fail by handing back records from
 /// before the seek.
 #[test]
-fn an_r_source_crosses_read_blocks_and_still_rewinds()
--> Result<(), Box<dyn std::error::Error>> {
+fn an_r_source_crosses_read_blocks_and_still_rewinds() -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("r-blocks")?;
     // Line 900 is 9 KiB long, so it spans blocks however they fall.
     let mut source = Vec::new();
@@ -1885,7 +2087,9 @@ fn an_r_source_crosses_read_blocks_and_still_rewinds()
 
     // One operand of 1000 lines: `R` hands over one source line per cycle, so the
     // 1000th comes from well past the first block and past the long record.
-    let operand: Vec<u8> = (0..1000u32).flat_map(|i| format!("o{i}\n").into_bytes()).collect();
+    let operand: Vec<u8> = (0..1000u32)
+        .flat_map(|i| format!("o{i}\n").into_bytes())
+        .collect();
     std::fs::write(dir.0.join("IN"), &operand)?;
 
     let out = std::process::Command::new(bin())
@@ -1893,12 +2097,24 @@ fn an_r_source_crosses_read_blocks_and_still_rewinds()
         .args(["-n", "-e", "R SRC", "-e", "p", "IN"])
         .current_dir(&dir.0)
         .output()?;
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let got: Vec<&[u8]> = out.stdout.split(|b| *b == b'\n').collect();
     // Interleaved: operand line, source line, operand line, source line ...
     for i in 0..1000usize {
-        assert_eq!(got.get(i * 2), Some(&format!("o{i}").into_bytes().as_slice()));
-        assert_eq!(got.get(i * 2 + 1), lines.get(i), "source line {i} came back wrong");
+        assert_eq!(
+            got.get(i * 2),
+            Some(&format!("o{i}").into_bytes().as_slice())
+        );
+        assert_eq!(
+            got.get(i * 2 + 1),
+            lines.get(i),
+            "source line {i} came back wrong"
+        );
     }
 
     // `-s` restarts a seekable source per operand, so the second file gets line 0
@@ -1963,7 +2179,11 @@ fn a_late_nul_does_not_unprint_an_early_match() -> Result<(), Box<dyn std::error
         .args(["matchme", "early"])
         .current_dir(&dir.0)
         .output()?;
-    assert_eq!(out.stdout, Vec::new(), "a NUL before the match still printed the line");
+    assert_eq!(
+        out.stdout,
+        Vec::new(),
+        "a NUL before the match still printed the line"
+    );
     assert_eq!(out.stderr, b"grep: early: binary file matches\n".to_vec());
 
     // STICKY: a NUL in one buffer keeps the file binary even where the buffer
@@ -2018,7 +2238,10 @@ fn before_context_survives_a_buffer_boundary() -> Result<(), Box<dyn std::error:
         .current_dir(&dir.0)
         .output()?;
     let got = String::from_utf8_lossy(&out.stdout);
-    let nums: Vec<&str> = got.lines().filter_map(|l| l.split(['-', ':']).next()).collect();
+    let nums: Vec<&str> = got
+        .lines()
+        .filter_map(|l| l.split(['-', ':']).next())
+        .collect();
     assert_eq!(
         nums,
         vec![
@@ -2041,8 +2264,8 @@ fn before_context_survives_a_buffer_boundary() -> Result<(), Box<dyn std::error:
 /// symlinks, so the claim that `logical` survives a later `-d recurse` has
 /// nowhere else to live.
 #[test]
-fn directory_actions_answer_from_the_descriptor_and_leave_r_sticky()
--> Result<(), Box<dyn std::error::Error>> {
+fn directory_actions_answer_from_the_descriptor_and_leave_r_sticky(
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::fs::PermissionsExt;
     let dir = TempDir::new("dirs-desc")?;
     std::fs::write(dir.0.join("f1"), b"a\n")?;
@@ -2060,10 +2283,17 @@ fn directory_actions_answer_from_the_descriptor_and_leave_r_sticky()
     };
 
     // Silent + exit 1 is what a name-based stat gives; GNU gives both of these.
-    for args in [&["-d", "skip", "a", "noperm"][..], &["-c", "-d", "skip", "a", "noperm"]] {
+    for args in [
+        &["-d", "skip", "a", "noperm"][..],
+        &["-c", "-d", "skip", "a", "noperm"],
+    ] {
         let (code, _, stderr) = run(args)?;
         assert_eq!(code, 2, "{args:?} did not report the unopenable directory");
-        assert_eq!(stderr, b"grep: noperm: Permission denied\n".to_vec(), "{args:?}");
+        assert_eq!(
+            stderr,
+            b"grep: noperm: Permission denied\n".to_vec(),
+            "{args:?}"
+        );
     }
     // `-s` suppresses the message and KEEPS the status, as it does elsewhere.
     let (code, _, stderr) = run(&["-s", "-d", "skip", "a", "noperm"])?;
@@ -2087,17 +2317,29 @@ fn directory_actions_answer_from_the_descriptor_and_leave_r_sticky()
             .args(args)
             .current_dir(&tree.0)
             .output()?;
-        let mut lines: Vec<Vec<u8>> =
-            out.stdout.split(|b| *b == b'\n').filter(|l| !l.is_empty()).map(<[u8]>::to_vec).collect();
+        let mut lines: Vec<Vec<u8>> = out
+            .stdout
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect();
         lines.sort();
         Ok(lines.join(&b'\n'))
     };
     let follows = b"t/link/hit:a\nt/real/hit:a".to_vec();
     let does_not = b"t/real/hit:a".to_vec();
-    assert_eq!(walked(&["-R", "-d", "recurse", "a", "t"])?, follows, "-R lost its deref to -d");
+    assert_eq!(
+        walked(&["-R", "-d", "recurse", "a", "t"])?,
+        follows,
+        "-R lost its deref to -d"
+    );
     assert_eq!(walked(&["-d", "recurse", "-R", "a", "t"])?, follows);
     assert_eq!(walked(&["-R", "a", "t"])?, follows);
-    assert_eq!(walked(&["-d", "recurse", "a", "t"])?, does_not, "-d recurse followed a symlink");
+    assert_eq!(
+        walked(&["-d", "recurse", "a", "t"])?,
+        does_not,
+        "-d recurse followed a symlink"
+    );
     assert_eq!(walked(&["-r", "a", "t"])?, does_not);
     Ok(())
 }
@@ -2116,8 +2358,8 @@ fn directory_actions_answer_from_the_descriptor_and_leave_r_sticky()
 /// was derived under and the only one td's image sets. A UTF-8 locale would pick
 /// U+2018/U+2019 for the quotes; the escaping is the same either way.
 #[test]
-fn a_bad_directories_argument_is_quoted_the_way_gnu_quotes_it()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_bad_directories_argument_is_quoted_the_way_gnu_quotes_it(
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::ffi::OsStrExt;
     let dir = TempDir::new("dirs-quote")?;
     std::fs::write(dir.0.join("IN"), b"a\n")?;
@@ -2181,15 +2423,21 @@ fn a_bad_directories_argument_is_quoted_the_way_gnu_quotes_it()
 ///
 /// Measured against GNU grep 3.11 under `LC_ALL=C`.
 #[test]
-fn a_label_renames_standard_input_in_the_read_failure_too()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_label_renames_standard_input_in_the_read_failure_too() -> Result<(), Box<dyn std::error::Error>>
+{
     let dir = TempDir::new("label-dir-stdin")?;
     // No `-d` here on purpose: measured, every `-d` action answers a directory
     // ARRIVING AS STANDARD INPUT the same way. `-d` decides what a NAMED
     // directory operand does, which is a different question.
     for (args, want) in [
-        (&["--label=LBL", "match", "-"][..], &b"grep: LBL: Is a directory\n"[..]),
-        (&["match", "-"][..], &b"grep: (standard input): Is a directory\n"[..]),
+        (
+            &["--label=LBL", "match", "-"][..],
+            &b"grep: LBL: Is a directory\n"[..],
+        ),
+        (
+            &["match", "-"][..],
+            &b"grep: (standard input): Is a directory\n"[..],
+        ),
     ] {
         let out = std::process::Command::new(bin())
             .arg("grep")
@@ -2197,7 +2445,10 @@ fn a_label_renames_standard_input_in_the_read_failure_too()
             .stdin(std::fs::File::open(&dir.0)?)
             .current_dir(&dir.0)
             .output()?;
-        assert_eq!(out.stderr, want, "{args:?} did not name standard input as GNU does");
+        assert_eq!(
+            out.stderr, want,
+            "{args:?} did not name standard input as GNU does"
+        );
         assert!(out.stdout.is_empty(), "{args:?} printed output");
         assert_eq!(out.status.code(), Some(2), "{args:?} status");
     }
@@ -2271,7 +2522,10 @@ fn max_count_leaves_standard_input_after_the_last_selected_record(
     // Twenty four-byte records: `L01\n` .. `L20\n`, so a boundary is a multiple
     // of four and the arithmetic in each expectation is readable.
     let path = dir.0.join("f");
-    std::fs::write(&path, (1..=20).map(|i| format!("L{i:02}\n")).collect::<String>())?;
+    std::fs::write(
+        &path,
+        (1..=20).map(|i| format!("L{i:02}\n")).collect::<String>(),
+    )?;
     for (args, want) in [
         (&["-m1", "L"][..], 4),
         (&["-m2", "L"][..], 8),
@@ -2307,8 +2561,16 @@ fn max_count_leaves_standard_input_after_the_last_selected_record(
             .stdin(given)
             .current_dir(&dir.0)
             .output()?;
-        assert!(out.stderr.is_empty(), "{args:?} wrote to stderr: {:?}", out.stderr);
-        assert_eq!(held.stream_position()?, want, "{args:?} left stdin in the wrong place");
+        assert!(
+            out.stderr.is_empty(),
+            "{args:?} wrote to stderr: {:?}",
+            out.stderr
+        );
+        assert_eq!(
+            held.stream_position()?,
+            want,
+            "{args:?} left stdin in the wrong place"
+        );
     }
     Ok(())
 }
@@ -2621,17 +2883,19 @@ fn a_binary_file_stops_at_the_first_selected_record_where_gnu_counts_differently
 /// record long, where end-of-record and end-of-file are the same number and the
 /// case would prove nothing. Goldens from GNU grep 3.11.
 #[test]
-fn max_count_counts_nul_terminated_records_under_z(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn max_count_counts_nul_terminated_records_under_z() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Seek;
     let dir = TempDir::new("mrepos-z")?;
     let path = dir.0.join("z");
-    let body: Vec<u8> =
-        (1..=20).flat_map(|i| format!("Z{i:02}\0").into_bytes()).collect();
+    let body: Vec<u8> = (1..=20)
+        .flat_map(|i| format!("Z{i:02}\0").into_bytes())
+        .collect();
     std::fs::write(&path, &body)?;
-    for (args, want) in
-        [(&["-z", "-m1", "Z"][..], 4), (&["-z", "-m2", "Z"][..], 8), (&["-z", "-m1", "-c", "Z"][..], 4)]
-    {
+    for (args, want) in [
+        (&["-z", "-m1", "Z"][..], 4),
+        (&["-z", "-m2", "Z"][..], 8),
+        (&["-z", "-m1", "-c", "Z"][..], 4),
+    ] {
         let mut held = std::fs::File::open(&path)?;
         let given = held.try_clone()?;
         let out = std::process::Command::new(bin())
@@ -2640,9 +2904,17 @@ fn max_count_counts_nul_terminated_records_under_z(
             .stdin(given)
             .current_dir(&dir.0)
             .output()?;
-        assert!(out.stderr.is_empty(), "{args:?} wrote to stderr: {:?}", out.stderr);
+        assert!(
+            out.stderr.is_empty(),
+            "{args:?} wrote to stderr: {:?}",
+            out.stderr
+        );
         assert_eq!(out.status.code(), Some(0), "{args:?} status");
-        assert_eq!(held.stream_position()?, want, "{args:?} left stdin in the wrong place");
+        assert_eq!(
+            held.stream_position()?,
+            want,
+            "{args:?} left stdin in the wrong place"
+        );
     }
     Ok(())
 }
@@ -2707,7 +2979,10 @@ fn a_write_only_descriptor_zero_is_a_read_failure_not_an_empty_input(
             .stdin(stdin)
             .current_dir(&dir.0)
             .output()?;
-        assert_eq!(out.stderr, want, "{args:?} did not report the bad descriptor");
+        assert_eq!(
+            out.stderr, want,
+            "{args:?} did not report the bad descriptor"
+        );
         assert!(out.stdout.is_empty(), "{args:?} printed output");
         assert_eq!(out.status.code(), Some(code), "{args:?} status");
     }
@@ -2723,8 +2998,7 @@ fn a_write_only_descriptor_zero_is_a_read_failure_not_an_empty_input(
 /// machinery and not a preference: `compile_file` binds the name `-` alone to
 /// `stdin`, and `utils_fp_name` reports that stream as `stdin`.
 #[test]
-fn a_dash_f_script_read_from_a_directory_is_refused(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn a_dash_f_script_read_from_a_directory_is_refused() -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("fdash-dir")?;
     let sub = dir.0.join("D");
     std::fs::create_dir_all(&sub)?;
@@ -2758,8 +3032,7 @@ fn a_dash_f_script_read_from_a_directory_is_refused(
 /// while opening the name waits for a writer that never comes, and the shell
 /// hangs outright.
 #[test]
-fn an_r_source_of_dev_stdin_continues_the_descriptor(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn an_r_source_of_dev_stdin_continues_the_descriptor() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Seek as _;
 
     let dir = TempDir::new("r-stdin-offset")?;
@@ -2856,8 +3129,7 @@ fn a_dash_f_open_failure_is_named_by_the_call_not_the_errno(
 /// a case supplies stdin as BYTES, and a directory is the reachable way to make
 /// that read fail.
 #[test]
-fn an_r_read_error_on_standard_input_names_the_stream(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn an_r_read_error_on_standard_input_names_the_stream() -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("r-stdin-dir")?;
     let sub = dir.0.join("D");
     std::fs::create_dir_all(&sub)?;
@@ -2894,7 +3166,10 @@ fn a_special_stream_refuses_by_direction_not_by_descriptor(
     let dir = TempDir::new("special-direction")?;
     std::fs::write(dir.0.join("IN"), b"LINE\n")?;
     let both_ways = |name: &str| -> std::io::Result<std::fs::File> {
-        std::fs::OpenOptions::new().read(true).write(true).open(dir.0.join(name))
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.0.join(name))
     };
 
     std::fs::write(dir.0.join("OUT"), b"KEPT\n")?;
@@ -2939,7 +3214,17 @@ fn a_special_stream_refuses_by_direction_not_by_descriptor(
     // file behind fd 0 to lose.
     std::fs::write(dir.0.join("KEEP"), b"PRECIOUS\n")?;
     let promoted = std::process::Command::new(bin())
-        .args(["sed", "-n", "-e", "v", "-e", "w /dev/stdin", "-e", "p", "IN"])
+        .args([
+            "sed",
+            "-n",
+            "-e",
+            "v",
+            "-e",
+            "w /dev/stdin",
+            "-e",
+            "p",
+            "IN",
+        ])
         .env("POSIXLY_CORRECT", "1")
         .stdin(std::process::Stdio::from(both_ways("KEEP")?))
         .current_dir(&dir.0)
@@ -3009,7 +3294,11 @@ fn a_dying_run_repositions_standard_input_once() -> Result<(), Box<dyn std::erro
         // EXACTLY the one diagnostic: a second give-back would add its own.
         assert_eq!(out.stderr, want_err.to_vec(), "{args:?}: stderr");
         assert_eq!(out.status.code(), Some(4), "{args:?}");
-        assert_eq!(rest, want_rest.to_vec(), "{args:?}: what was left on descriptor 0");
+        assert_eq!(
+            rest,
+            want_rest.to_vec(),
+            "{args:?}: what was left on descriptor 0"
+        );
     }
     // The operand the `-i` run DID edit keeps what `R` gave it, which is what says
     // the run got that far.
@@ -3046,7 +3335,9 @@ fn sed_leaves_a_seekable_stdin_after_the_last_record_it_read(
     // A named operand to pair stdin with, for the multi-operand rows.
     std::fs::write(dir.0.join("one"), b"ONE\n")?;
 
-    let rest_after = |file: &str, args: &[&str]| -> Result<(Vec<u8>, Vec<u8>, Option<i32>), Box<dyn std::error::Error>> {
+    let rest_after = |file: &str,
+                      args: &[&str]|
+     -> Result<(Vec<u8>, Vec<u8>, Option<i32>), Box<dyn std::error::Error>> {
         let given = std::fs::File::open(dir.0.join(file))?;
         let mut mine = given.try_clone()?;
         let out = std::process::Command::new(bin())
@@ -3080,7 +3371,12 @@ fn sed_leaves_a_seekable_stdin_after_the_last_record_it_read(
         // the only one where stdin is opened mid-cycle rather than by the reader:
         // `$!` on the last line of `one` opens `-`, reads it whole, and the `q`
         // then owes ALL of it back.
-        ("four", &["-n", "-e", "1{$!p}", "-e", "1q", "one", "-"], b"ONE\n", b"l1\nl2\nl3\nl4\n"),
+        (
+            "four",
+            &["-n", "-e", "1{$!p}", "-e", "1q", "one", "-"],
+            b"ONE\n",
+            b"l1\nl2\nl3\nl4\n",
+        ),
         // Multiple operands: only the OPEN one can owe anything, so which side
         // stdin is on decides how much.
         ("four", &["-n", "2q", "-", "one"], b"", b"l3\nl4\n"),
@@ -3092,18 +3388,52 @@ fn sed_leaves_a_seekable_stdin_after_the_last_record_it_read(
         // as much as a cycle's record is -- it was printed -- and handing it back
         // would repeat it to whoever reads next. Before the one shared reader
         // these left NOTHING: `R` swallowed standard input to end of file.
-        ("four", &["-n", "-e", "R /dev/stdin", "-e", "p", "one"], b"ONE\nl1\n", b"l2\nl3\nl4\n"),
-        ("four", &["-n", "-e", "R /dev/stdin", "-e", "R /dev/stdin", "-e", "p", "one"], b"ONE\nl1\nl2\n", b"l3\nl4\n"),
+        (
+            "four",
+            &["-n", "-e", "R /dev/stdin", "-e", "p", "one"],
+            b"ONE\nl1\n",
+            b"l2\nl3\nl4\n",
+        ),
+        (
+            "four",
+            &[
+                "-n",
+                "-e",
+                "R /dev/stdin",
+                "-e",
+                "R /dev/stdin",
+                "-e",
+                "p",
+                "one",
+            ],
+            b"ONE\nl1\nl2\n",
+            b"l3\nl4\n",
+        ),
         // A `q` before the source is spent owes back the rest, as it does for a
         // record the cycle read.
-        ("four", &["-n", "-e", "R /dev/stdin", "-e", "p", "-e", "q", "one"], b"ONE\nl1\n", b"l2\nl3\nl4\n"),
+        (
+            "four",
+            &["-n", "-e", "R /dev/stdin", "-e", "p", "-e", "q", "one"],
+            b"ONE\nl1\n",
+            b"l2\nl3\nl4\n",
+        ),
         // Both roles on one descriptor: the `-` operand goes on from where `R`
         // left it, so between them they reach the end and nothing is owed.
-        ("four", &["-n", "-e", "R /dev/stdin", "-e", "p", "one", "-"], b"ONE\nl1\nl2\nl3\nl4\n", b""),
+        (
+            "four",
+            &["-n", "-e", "R /dev/stdin", "-e", "p", "one", "-"],
+            b"ONE\nl1\nl2\nl3\nl4\n",
+            b"",
+        ),
         // `-s` makes a stream per operand while the reader is the RUN's, which is
         // why the give-back is the run's too: repositioning between operands would
         // rewind a descriptor whose buffered records the next operand still reads.
-        ("four", &["-s", "-n", "-e", "R /dev/stdin", "-e", "p", "one", "one"], b"ONE\nl1\nONE\nl2\n", b"l3\nl4\n"),
+        (
+            "four",
+            &["-s", "-n", "-e", "R /dev/stdin", "-e", "p", "one", "one"],
+            b"ONE\nl1\nONE\nl2\n",
+            b"l3\nl4\n",
+        ),
         // `-u` reads a RECORD at a time instead of a block, so there is nothing
         // to give back -- and the descriptor must still come out in the same
         // place, since the count is the reader's rather than the block's.
@@ -3111,7 +3441,12 @@ fn sed_leaves_a_seekable_stdin_after_the_last_record_it_read(
         ("four", &["-u", "-n", "-e", "N;q"], b"", b"l3\nl4\n"),
         ("unterm", &["-u", "-n", "2q"], b"", b"u3"),
         ("four", &["-u", "-s", "-n", "1q"], b"", b"l2\nl3\nl4\n"),
-        ("four", &["-u", "-n", "-e", "R /dev/stdin", "-e", "p", "one"], b"ONE\nl1\n", b"l2\nl3\nl4\n"),
+        (
+            "four",
+            &["-u", "-n", "-e", "R /dev/stdin", "-e", "p", "one"],
+            b"ONE\nl1\n",
+            b"l2\nl3\nl4\n",
+        ),
         // The two rows that are NOT GNU's answer, deliberately. The `$' lookahead
         // is a pushback, and glibc does not return a pushed-back byte to the file
         // offset on an unbuffered stream, so GNU leaves each of these ONE BYTE
@@ -3121,11 +3456,26 @@ fn sed_leaves_a_seekable_stdin_after_the_last_record_it_read(
         // record the lookahead opened `-' to peek at, the second from the one the
         // `q' was about to leave behind.
         // GNU offset 1, this 0 -- GNU's next reader gets `1\nl2\nl3\nl4\n'.
-        ("four", &["-u", "-n", "-e", "1{$!p}", "-e", "1q", "one", "-"], b"ONE\n", b"l1\nl2\nl3\nl4\n"),
+        (
+            "four",
+            &["-u", "-n", "-e", "1{$!p}", "-e", "1q", "one", "-"],
+            b"ONE\n",
+            b"l1\nl2\nl3\nl4\n",
+        ),
         // GNU offset 4, this 3 -- GNU's next reader gets `2\nl3\nl4\n'. Unflagged
         // both leave 3, which is the row below it.
-        ("four", &["-u", "-n", "-e", "1{$!p}", "-e", "1q"], b"l1\n", b"l2\nl3\nl4\n"),
-        ("four", &["-n", "-e", "1{$!p}", "-e", "1q"], b"l1\n", b"l2\nl3\nl4\n"),
+        (
+            "four",
+            &["-u", "-n", "-e", "1{$!p}", "-e", "1q"],
+            b"l1\n",
+            b"l2\nl3\nl4\n",
+        ),
+        (
+            "four",
+            &["-n", "-e", "1{$!p}", "-e", "1q"],
+            b"l1\n",
+            b"l2\nl3\nl4\n",
+        ),
         // The controls. A script that reads to the end leaves nothing, which is
         // what says the rewind is not unconditional; and no `q` at all is the
         // same.
@@ -3156,14 +3506,21 @@ fn sed_leaves_a_seekable_stdin_after_the_last_record_it_read(
         .spawn()?;
     {
         use std::io::Write;
-        let mut w = child.stdin.take().ok_or("the child was given no stdin pipe")?;
+        let mut w = child
+            .stdin
+            .take()
+            .ok_or("the child was given no stdin pipe")?;
         // Propagated: a write that never arrived would leave the child reading an
         // empty stream, where the give-back has nothing to decline in the first
         // place and the test would prove nothing.
         w.write_all(b"p1\np2\np3\n")?;
     }
     let piped = child.wait_with_output()?;
-    assert_eq!(piped.status.code(), Some(0), "a pipe made the give-back fail");
+    assert_eq!(
+        piped.status.code(),
+        Some(0),
+        "a pipe made the give-back fail"
+    );
     assert_eq!(piped.stderr, b"".to_vec(), "{piped:?}");
     Ok(())
 }
@@ -3175,8 +3532,8 @@ fn sed_leaves_a_seekable_stdin_after_the_last_record_it_read(
 /// result and the repositioning are both errors, and the run's is the one that
 /// must be reported.
 #[test]
-fn a_run_that_dies_still_gives_back_what_it_did_not_read(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn a_run_that_dies_still_gives_back_what_it_did_not_read() -> Result<(), Box<dyn std::error::Error>>
+{
     use std::io::Read;
 
     let dir = TempDir::new("sed-stdin-offset-fatal")?;
@@ -3247,8 +3604,14 @@ fn a_skipped_run_of_nuls_still_counts_its_lines() -> Result<(), Box<dyn std::err
     std::fs::write(dir.0.join("z"), &data)?;
     // Goldens measured from GNU grep 3.11 under LC_ALL=C.
     for (args, want) in [
-        (vec!["grep", "-z", "-n", "hello", "z"], format!("{}:hello\0", run + 1)),
-        (vec!["grep", "-z", "-n", "world", "z"], format!("{}:world\0", run + 2)),
+        (
+            vec!["grep", "-z", "-n", "hello", "z"],
+            format!("{}:hello\0", run + 1),
+        ),
+        (
+            vec!["grep", "-z", "-n", "world", "z"],
+            format!("{}:world\0", run + 2),
+        ),
         (vec!["grep", "-z", "-c", "hello", "z"], "1\n".to_string()),
         (
             vec!["grep", "-z", "-n", "-A", "1", "hello", "z"],
@@ -3258,7 +3621,10 @@ fn a_skipped_run_of_nuls_still_counts_its_lines() -> Result<(), Box<dyn std::err
         // dropped at all: the count is the proof it was not.
         (vec!["grep", "-z", "-c", "^$", "z"], format!("{run}\n")),
         (vec!["grep", "-z", "-c", "^", "z"], format!("{}\n", run + 2)),
-        (vec!["grep", "-z", "-v", "-c", "hello", "z"], format!("{}\n", run + 1)),
+        (
+            vec!["grep", "-z", "-v", "-c", "hello", "z"],
+            format!("{}\n", run + 1),
+        ),
     ] {
         let out = std::process::Command::new(bin())
             .args(&args)
@@ -3352,8 +3718,8 @@ fn a_dropped_run_joins_an_open_record_as_gnu_does() -> Result<(), Box<dyn std::e
 /// there are no such records, and replaying them would be context GNU does not
 /// print. Both halves are here. Goldens from GNU grep 3.11.
 #[test]
-fn context_across_a_dropped_run_is_numbered_as_gnu_numbers_it()
--> Result<(), Box<dyn std::error::Error>> {
+fn context_across_a_dropped_run_is_numbered_as_gnu_numbers_it(
+) -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("skip-ctx")?;
     let buf = 96 * 1024;
     // Nothing open when the whole-zero fills arrive: they stand as empty records.
@@ -3377,7 +3743,10 @@ fn context_across_a_dropped_run_is_numbered_as_gnu_numbers_it()
             format!("{}-\0{}-\0{}-\0{}:hello\0", n - 1, n, n + 1, n + 2),
         ),
         // Joined: one record, numbered past the gap, and nothing before it.
-        (vec!["grep", "-z", "-n", "-B", "1", "hello", "j"], String::new()),
+        (
+            vec!["grep", "-z", "-n", "-B", "1", "hello", "j"],
+            String::new(),
+        ),
     ] {
         let out = std::process::Command::new(bin())
             .args(&args)
@@ -3391,7 +3760,11 @@ fn context_across_a_dropped_run_is_numbered_as_gnu_numbers_it()
                 "{args:?}: a joined gap was given context: {:?}",
                 got.get(..60)
             );
-            assert_eq!(got.matches('\0').count(), 1, "{args:?}: more than one record out");
+            assert_eq!(
+                got.matches('\0').count(),
+                1,
+                "{args:?}: more than one record out"
+            );
         } else {
             assert_eq!(got, want, "{args:?}");
         }
@@ -3406,19 +3779,43 @@ fn context_across_a_dropped_run_is_numbered_as_gnu_numbers_it()
 /// where `-d`'s does both, and exiting 2 where `-d` exits 1. Three divergences
 /// between adjacent letters. Goldens from GNU grep 3.11 under LC_ALL=C.
 #[test]
-fn the_devices_argument_is_exact_where_the_directories_one_is_a_prefix()
--> Result<(), Box<dyn std::error::Error>> {
+fn the_devices_argument_is_exact_where_the_directories_one_is_a_prefix(
+) -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("dev-arg")?;
     std::fs::write(dir.join("f"), b"hello\n")?;
     for (args, code, err) in [
         (vec!["grep", "-D", "read", "hello", "f"], 0, ""),
         (vec!["grep", "-D", "skip", "hello", "f"], 0, ""),
-        (vec!["grep", "-D", "rea", "hello", "f"], 2, "grep: unknown devices method\n"),
-        (vec!["grep", "-D", "r", "hello", "f"], 2, "grep: unknown devices method\n"),
-        (vec!["grep", "-D", "ski", "hello", "f"], 2, "grep: unknown devices method\n"),
-        (vec!["grep", "-D", "", "hello", "f"], 2, "grep: unknown devices method\n"),
-        (vec!["grep", "-D", "READ", "hello", "f"], 2, "grep: unknown devices method\n"),
-        (vec!["grep", "--devices=nope", "hello", "f"], 2, "grep: unknown devices method\n"),
+        (
+            vec!["grep", "-D", "rea", "hello", "f"],
+            2,
+            "grep: unknown devices method\n",
+        ),
+        (
+            vec!["grep", "-D", "r", "hello", "f"],
+            2,
+            "grep: unknown devices method\n",
+        ),
+        (
+            vec!["grep", "-D", "ski", "hello", "f"],
+            2,
+            "grep: unknown devices method\n",
+        ),
+        (
+            vec!["grep", "-D", "", "hello", "f"],
+            2,
+            "grep: unknown devices method\n",
+        ),
+        (
+            vec!["grep", "-D", "READ", "hello", "f"],
+            2,
+            "grep: unknown devices method\n",
+        ),
+        (
+            vec!["grep", "--devices=nope", "hello", "f"],
+            2,
+            "grep: unknown devices method\n",
+        ),
         (vec!["grep", "--devices=skip", "hello", "f"], 0, ""),
         (vec!["grep", "--devices", "skip", "hello", "f"], 0, ""),
     ] {
@@ -3462,8 +3859,7 @@ fn the_devices_argument_is_exact_where_the_directories_one_is_a_prefix()
 /// operand is read, and the same device found by the WALK is skipped without a
 /// word. Goldens from GNU grep 3.11.
 #[test]
-fn a_device_is_read_when_named_and_skipped_when_found()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_device_is_read_when_named_and_skipped_when_found() -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("dev-default")?;
     std::fs::create_dir(dir.join("d"))?;
     std::fs::write(dir.join("d").join("plain"), b"hello\n")?;
@@ -3472,7 +3868,11 @@ fn a_device_is_read_when_named_and_skipped_when_found()
         // Found by the walk: skipped by the default and by -D skip alike, and
         // SILENTLY -- no diagnostic, no effect on the status.
         (vec!["grep", "-r", "hello", "d"], 0, "d/plain:hello\n"),
-        (vec!["grep", "-r", "-D", "skip", "hello", "d"], 0, "d/plain:hello\n"),
+        (
+            vec!["grep", "-r", "-D", "skip", "hello", "d"],
+            0,
+            "d/plain:hello\n",
+        ),
         // A device named as an operand is read unless asked otherwise, and
         // /dev/null reads as empty rather than as a missing file.
         (vec!["grep", "hello", "/dev/null"], 1, ""),
@@ -3485,7 +3885,11 @@ fn a_device_is_read_when_named_and_skipped_when_found()
         ),
         // A DIRECTORY is not a device: -D skip leaves -d's answer alone, and the
         // two skips compose rather than one standing in for the other.
-        (vec!["grep", "-D", "skip", "-d", "skip", "hello", "d"], 1, ""),
+        (
+            vec!["grep", "-D", "skip", "-d", "skip", "hello", "d"],
+            1,
+            "",
+        ),
     ] {
         let out = std::process::Command::new(bin())
             .args(&args)
@@ -3510,8 +3914,8 @@ fn a_device_is_read_when_named_and_skipped_when_found()
 /// after the open instead turns the first row into a diagnostic GNU never
 /// prints. Goldens from GNU grep 3.11.
 #[test]
-fn where_the_device_question_is_asked_differs_between_walk_and_operand()
--> Result<(), Box<dyn std::error::Error>> {
+fn where_the_device_question_is_asked_differs_between_walk_and_operand(
+) -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("dev-where")?;
     std::fs::create_dir(dir.join("t"))?;
     std::fs::write(dir.join("t").join("f"), b"a\n")?;
@@ -3520,9 +3924,19 @@ fn where_the_device_question_is_asked_differs_between_walk_and_operand()
     for (args, code, out_want, err_want) in [
         // Found by the walk and skipped: never opened, so never reported.
         (vec!["grep", "-rl", "a", "t"], 0, "t/f\n", ""),
-        (vec!["grep", "-r", "-D", "skip", "-l", "a", "t"], 0, "t/f\n", ""),
+        (
+            vec!["grep", "-r", "-D", "skip", "-l", "a", "t"],
+            0,
+            "t/f\n",
+            "",
+        ),
         // Found by the walk and READ: now it is opened, and the open fails.
-        (vec!["grep", "-r", "-D", "read", "-l", "a", "t"], 2, "t/f\n", enxio),
+        (
+            vec!["grep", "-r", "-D", "read", "-l", "a", "t"],
+            2,
+            "t/f\n",
+            enxio,
+        ),
         // Named as an operand: opened under every policy, so always reported.
         (vec!["grep", "-l", "a", "t/s"], 2, "", enxio),
         (vec!["grep", "-D", "skip", "-l", "a", "t/s"], 2, "", enxio),
@@ -3546,8 +3960,7 @@ fn where_the_device_question_is_asked_differs_between_walk_and_operand()
 /// explicit `-D skip` still wins, whichever order the two came in. Goldens from
 /// GNU grep 3.11.
 #[test]
-fn dereference_recursive_flips_the_device_default()
--> Result<(), Box<dyn std::error::Error>> {
+fn dereference_recursive_flips_the_device_default() -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("dev-flip")?;
     std::fs::create_dir(dir.join("t"))?;
     std::fs::write(dir.join("t").join("f"), b"a\n")?;
@@ -3572,7 +3985,6 @@ fn dereference_recursive_flips_the_device_default()
     Ok(())
 }
 
-
 /// A command-line device whose READ and SKIP are TOLD APART, which `/dev/null`
 /// cannot do: it reads as empty, so both answers are exit 1 with no output, and
 /// a drift axis that made the default skip argv-named devices came back green
@@ -3586,8 +3998,8 @@ fn dereference_recursive_flips_the_device_default()
 /// silently over a named socket instead of reporting its failed open. Goldens
 /// from GNU grep 3.11.
 #[test]
-fn a_named_device_is_read_and_the_walks_root_is_still_a_named_one()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_named_device_is_read_and_the_walks_root_is_still_a_named_one(
+) -> Result<(), Box<dyn std::error::Error>> {
     for (args, code) in [
         (vec!["grep", "-zam1", "^", "/dev/zero"], 0),
         (vec!["grep", "-zam1", "-D", "read", "^", "/dev/zero"], 0),
@@ -3614,8 +4026,8 @@ fn a_named_device_is_read_and_the_walks_root_is_still_a_named_one()
 /// socket one level down is silent. One file, two provenances, opposite answers.
 /// Goldens from GNU grep 3.11.
 #[test]
-fn a_socket_named_as_the_walk_root_is_opened_where_one_below_it_is_not()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_socket_named_as_the_walk_root_is_opened_where_one_below_it_is_not(
+) -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("dev-root")?;
     std::fs::create_dir(dir.join("t"))?;
     std::fs::write(dir.join("t").join("f"), b"a\n")?;
@@ -3623,7 +4035,12 @@ fn a_socket_named_as_the_walk_root_is_opened_where_one_below_it_is_not()
     let enxio = "grep: t/s: No such device or address\n";
     for (args, code, out_want, err_want) in [
         (vec!["grep", "-rl", "a", "t/s"], 2, "", enxio),
-        (vec!["grep", "-r", "-D", "skip", "-l", "a", "t/s"], 2, "", enxio),
+        (
+            vec!["grep", "-r", "-D", "skip", "-l", "a", "t/s"],
+            2,
+            "",
+            enxio,
+        ),
         (vec!["grep", "-rl", "a", "t"], 0, "t/f\n", ""),
     ] {
         let out = std::process::Command::new(bin())
@@ -3637,7 +4054,6 @@ fn a_socket_named_as_the_walk_root_is_opened_where_one_below_it_is_not()
     }
     Ok(())
 }
-
 
 /// A DIRECTORY is not a device, so `-D` must not quietly take over what `-d`
 /// answers. The two compose: `-D skip` alone leaves a directory operand to `-d`'s
@@ -3655,10 +4071,25 @@ fn a_directory_is_not_a_device() -> Result<(), Box<dyn std::error::Error>> {
         (vec!["grep", "-D", "skip", "hello", "d"], 2, "", isdir),
         (vec!["grep", "-D", "read", "hello", "d"], 2, "", isdir),
         (vec!["grep", "hello", "d"], 2, "", isdir),
-        (vec!["grep", "-D", "skip", "-c", "hello", "d"], 2, "0\n", isdir),
+        (
+            vec!["grep", "-D", "skip", "-c", "hello", "d"],
+            2,
+            "0\n",
+            isdir,
+        ),
         // `-d` is what answers for a directory, and it still does.
-        (vec!["grep", "-D", "skip", "-d", "skip", "hello", "d"], 1, "", ""),
-        (vec!["grep", "-D", "skip", "-d", "recurse", "hello", "d"], 0, "d/plain:hello\n", ""),
+        (
+            vec!["grep", "-D", "skip", "-d", "skip", "hello", "d"],
+            1,
+            "",
+            "",
+        ),
+        (
+            vec!["grep", "-D", "skip", "-d", "recurse", "hello", "d"],
+            0,
+            "d/plain:hello\n",
+            "",
+        ),
     ] {
         let out = std::process::Command::new(bin())
             .args(&args)
@@ -3671,7 +4102,6 @@ fn a_directory_is_not_a_device() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
-
 
 /// `-b` across a run of NULs the reader SKIPPED, where td-txt deliberately does
 /// not print what GNU prints. GNU credits `totalnl` for a dropped read
@@ -3693,8 +4123,8 @@ fn a_directory_is_not_a_device() -> Result<(), Box<dyn std::error::Error>> {
 /// This is the same trade the streaming entry makes elsewhere: reproduce GNU's
 /// RULE, decline arithmetic that contradicts the rule's own neighbour.
 #[test]
-fn a_byte_offset_past_a_skipped_run_counts_the_bytes_that_were_there()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_byte_offset_past_a_skipped_run_counts_the_bytes_that_were_there(
+) -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("b-skip")?;
     // A whole number of 96 KiB read buffers, so every NUL lands in a fill that
     // can be dropped and `hello` opens a fresh one.
@@ -3705,8 +4135,14 @@ fn a_byte_offset_past_a_skipped_run_counts_the_bytes_that_were_there()
     let want_at = run.to_string();
     let want_no = (run + 1).to_string();
     for (args, want) in [
-        (vec!["grep", "-z", "-b", "hello", "z"], format!("{want_at}:hello\0")),
-        (vec!["grep", "-z", "-n", "hello", "z"], format!("{want_no}:hello\0")),
+        (
+            vec!["grep", "-z", "-b", "hello", "z"],
+            format!("{want_at}:hello\0"),
+        ),
+        (
+            vec!["grep", "-z", "-n", "hello", "z"],
+            format!("{want_no}:hello\0"),
+        ),
         // Both together: the two fields describe the same record, which is the
         // property GNU loses here.
         (
@@ -3775,8 +4211,8 @@ fn a_byte_offset_past_a_skipped_run_counts_the_bytes_that_were_there()
 /// `alpha` sorting between `adir` and `mid`, so descent-where-met and
 /// directories-first disagree about where it goes.
 #[test]
-fn a_recursive_walk_sorts_each_directory_where_gnu_takes_the_kernels_order()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_recursive_walk_sorts_each_directory_where_gnu_takes_the_kernels_order(
+) -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("walk-order")?;
     let root = dir.join("root");
     std::fs::create_dir_all(root.join("mid"))?;
@@ -3784,8 +4220,7 @@ fn a_recursive_walk_sorts_each_directory_where_gnu_takes_the_kernels_order()
     std::fs::create_dir_all(root.join("zdir"))?;
     // Created in an order that is neither sorted nor the expected one.
     for rel in [
-        "zeta", "alpha", "mid/beta", "mid/aaa", "adir/x", "zdir/y", "mmm",
-        "mid-z", "mid.a",
+        "zeta", "alpha", "mid/beta", "mid/aaa", "adir/x", "zdir/y", "mmm", "mid-z", "mid.a",
     ] {
         std::fs::write(root.join(rel), b"hit\n")?;
     }
@@ -3794,8 +4229,10 @@ fn a_recursive_walk_sorts_each_directory_where_gnu_takes_the_kernels_order()
         .current_dir(&dir.0)
         .env("LC_ALL", "C")
         .output()?;
-    let got: Vec<String> =
-        String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
+    let got: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
     let want = [
         "root/adir/x",
         "root/alpha",
@@ -3827,14 +4264,19 @@ fn a_recursive_walk_sorts_each_directory_where_gnu_takes_the_kernels_order()
     // the test keeps passing against a new `want`.
     let mut by_path = got.clone();
     by_path.sort();
-    assert_ne!(got, by_path, "this tree no longer tells the two sorts apart");
+    assert_ne!(
+        got, by_path,
+        "this tree no longer tells the two sorts apart"
+    );
     // A root FILE emitted before a root DIRECTORY's contents is the whole of
     // what this tree adds over the corpus case, which has one directory and so
     // cannot distinguish a directories-first walk from this one. Both paths are
     // resolved rather than compared as `Option`s: a missing one is the fixture
     // change this guard exists to catch, and `None < Some` would call it a pass.
     let pos = |p: &str| {
-        got.iter().position(|g| g == p).ok_or_else(|| format!("{p} left the fixture"))
+        got.iter()
+            .position(|g| g == p)
+            .ok_or_else(|| format!("{p} left the fixture"))
     };
     assert!(
         pos("root/alpha")? < pos("root/mid/aaa")?,
@@ -3850,8 +4292,7 @@ fn a_recursive_walk_sorts_each_directory_where_gnu_takes_the_kernels_order()
 /// Without that split the joined record would report the offset of its TAIL,
 /// which is a position it does not occupy.
 #[test]
-fn a_joined_record_keeps_the_offset_it_began_at()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_joined_record_keeps_the_offset_it_began_at() -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new("b-join")?;
     let buf = 96 * 1024;
     // The carry fills a whole buffer, so the run starts exactly at the next one.

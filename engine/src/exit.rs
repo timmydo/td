@@ -65,10 +65,7 @@ pub const CHECK_MEMO_SENTINEL: &str = "[td-check-memo:pass]";
 /// it believes, so accepting a bare 69 lets any other failure mint a skip and
 /// hide behind it.
 pub fn child_reported_host_gap(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> bool {
-    host_gap_from_parts(
-        code,
-        contains_sentinel(stderr) || contains_sentinel(stdout),
-    )
+    host_gap_from_parts(code, contains_sentinel(stderr) || contains_sentinel(stdout))
 }
 
 /// The same rule for callers that cannot hand over the bytes — a streamed tee

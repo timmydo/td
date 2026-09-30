@@ -1,4 +1,4 @@
-use crate::ladder::{SH, apply_patch, link_bins, mesboot0_inputs, mesboot0_path, unpack_into};
+use crate::ladder::{apply_patch, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, SH};
 use crate::types::{Recipe, Step, TextEdit};
 
 // GCC 2.95.3 #2 — bootstrap rung 9 (#378, guix's gcc-mesboot0): the FIRST gcc
@@ -20,7 +20,8 @@ use crate::types::{Recipe, Step, TextEdit};
 pub fn recipe() -> Recipe {
     let path = mesboot0_path();
     let gccdir1 = "{in:gcc-core-mesboot0}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
-    let cip = format!("{{in:glibc-mesboot0}}/include:{gccdir1}/include:{{in:mesboot-headers}}/include");
+    let cip =
+        format!("{{in:glibc-mesboot0}}/include:{gccdir1}/include:{{in:mesboot-headers}}/include");
     let lp = format!("{{in:glibc-mesboot0}}/lib:{gccdir1}");
     let gccdir2 = "{out}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
     let mut steps = unpack_into("gcc-mesboot0-source", "{src}");
@@ -77,7 +78,11 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     steps.push(
-        Step::run("{src}", &["{in:coreutils-mesboot0}/bin/rm", "-rf", "texinfo"]).env("PATH", &path),
+        Step::run(
+            "{src}",
+            &["{in:coreutils-mesboot0}/bin/rm", "-rf", "texinfo"],
+        )
+        .env("PATH", &path),
     );
     steps.push(Step::MkDir {
         path: "{src}/gcc".into(),
@@ -126,14 +131,23 @@ pub fn recipe() -> Recipe {
         .env("C_INCLUDE_PATH", &cip)
         .env("LIBRARY_PATH", &lp),
     );
-    steps.push(Step::MkDir { path: gccdir2.into() });
-    steps.push(Step::MkDir { path: "{root}/tg".into() });
+    steps.push(Step::MkDir {
+        path: gccdir2.into(),
+    });
+    steps.push(Step::MkDir {
+        path: "{root}/tg".into(),
+    });
     let ar = "{in:binutils-mesboot0}/bin/ar";
     steps.push(Step::run("{root}/tg", &[ar, "x", "{src}/gcc/libgcc2.a"]).env("PATH", &path));
     steps.push(
         Step::run(
             "{root}/tg",
-            &[ar, "r", &format!("{gccdir2}/libgcc.a"), "glob:{root}/tg/*.o"],
+            &[
+                ar,
+                "r",
+                &format!("{gccdir2}/libgcc.a"),
+                "glob:{root}/tg/*.o",
+            ],
         )
         .env("PATH", &path),
     );

@@ -99,21 +99,29 @@ mod tests {
     fn shared_download_view_is_outside_private_reserved_mount_trees() {
         let view = MAIN_RS
             .split_once("const FIREFOX_HOST_DOWNLOADS: &str = \"")
-            .unwrap().1.split('"').next().unwrap();
+            .unwrap()
+            .1
+            .split('"')
+            .next()
+            .unwrap();
         let view = std::path::Path::new(view);
         for reserved in crate::permissions::RESERVED_FILESYSTEM_TREES {
             let reserved = std::path::Path::new(reserved);
-            assert!(!view.starts_with(reserved) && !reserved.starts_with(view),
+            assert!(
+                !view.starts_with(reserved) && !reserved.starts_with(view),
                 "shared Downloads view {} would reserve the original grant through {}",
-                view.display(), reserved.display());
+                view.display(),
+                reserved.display()
+            );
         }
     }
 
     #[test]
     fn portal_and_firefox_share_the_exact_download_grant_pair() {
         assert_eq!(TD_JAIL_FIXTURE_DOWNLOAD_TARGET, "/home/td/Downloads");
-        assert!(MAIN_RS
-            .contains("const FIREFOX_HOST_DOWNLOADS: &str = \"/var/td-portal-files/1000/Downloads\";"));
+        assert!(MAIN_RS.contains(
+            "const FIREFOX_HOST_DOWNLOADS: &str = \"/var/td-portal-files/1000/Downloads\";"
+        ));
         assert!(MAIN_RS.contains("const FIREFOX_GUEST_DOWNLOADS: &str = \"/home/td/Downloads\";"));
         let grant = include_str!("../../../td-authd/src/portal_files.rs");
         assert!(grant.contains("const VIEW: &str = \"/var/td-portal-files/1000/Downloads\";"));
@@ -124,14 +132,15 @@ mod tests {
             "let account = crate::primary_account::load().map_err(|error| error.to_string())?;",
             "let human = child(&home, account.name(), HUMAN, true)?;",
             "let source = child(&human, \"Downloads\", HUMAN, false)?;",
-        ] { assert!(grant.contains(step), "{step}"); }
+        ] {
+            assert!(grant.contains(step), "{step}");
+        }
         let init = super::super::system_x86_64::deployment_init_fixture();
         assert!(init.contains(
             "primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot) || exit 1"
         ));
         assert!(init.contains("downloads=\"$primary_home/Downloads\""));
-        assert!(SYSTEM_X86_64_RS.contains(
-            r#"user_pref(\\\"browser.download.dir\\\", \\\"/home/td/Downloads\\\");"#
-        ));
+        assert!(SYSTEM_X86_64_RS
+            .contains(r#"user_pref(\\\"browser.download.dir\\\", \\\"/home/td/Downloads\\\");"#));
     }
 }

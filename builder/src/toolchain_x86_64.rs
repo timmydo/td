@@ -128,8 +128,7 @@ impl BuildInputs {
 
 // --- CLI -------------------------------------------------------------------------
 
-const USAGE: &str =
-    "usage: td-builder toolchain-recipe {x86_64-self}  (inputs via TDXS_* env)";
+const USAGE: &str = "usage: td-builder toolchain-recipe {x86_64-self}  (inputs via TDXS_* env)";
 
 /// `td-builder toolchain-recipe <name>`. The downloaded Rust transform is a
 /// first-class, stage0-only recipe (`rust-stage0`); it is not a CLI subcommand.
@@ -271,14 +270,21 @@ impl RustStage0Inputs {
             map.get(name)
                 .and_then(crate::json::Json::as_str)
                 .map(PathBuf::from)
-                .ok_or_else(|| format!("rust-stage0: lock is missing the `{name}' input (needed by the transform)"))
+                .ok_or_else(|| {
+                    format!(
+                        "rust-stage0: lock is missing the `{name}' input (needed by the transform)"
+                    )
+                })
         };
         // #410: inputs resolved BY RECIPE NAME to their staged install prefixes — the
         // recipe-graph model (glibc/libgcc/libz are the rungs build-plan --auto chained).
         let glibc = pick("glibc-x86-64")?.join(GLIBC_X86_64_STAGE);
         let gcc = pick("gcc-x86-64-stage2")?.join(GCC_X86_64_STAGE);
         let libgcc = find_file(&gcc, "libgcc_s.so.1").ok_or_else(|| {
-            format!("rust-stage0: no libgcc_s.so.1 under the gcc-x86-64-stage2 input {}", gcc.display())
+            format!(
+                "rust-stage0: no libgcc_s.so.1 under the gcc-x86-64-stage2 input {}",
+                gcc.display()
+            )
         })?;
         let libgcc_dir = libgcc
             .parent()
@@ -324,11 +330,7 @@ impl RustStage0Inputs {
 /// `tar::MAX_TAR_ENTRY_BYTES` (256 MiB) — a limit host `tar` never imposed. Today's
 /// members are well under it; a future release with a >256 MiB member (a fat
 /// libLLVM/debuginfo blob) would red here, and the cap would need raising in lockstep.
-fn unpack_rust_component(
-    tarball: &Path,
-    dest: &Path,
-    required: &str,
-) -> Result<(), String> {
+fn unpack_rust_component(tarball: &Path, dest: &Path, required: &str) -> Result<(), String> {
     crate::tar::unpack_archive(tarball, dest, false)?;
     if !dest.join(required).exists() {
         return Err(format!(
@@ -360,8 +362,11 @@ fn assemble_rust_tree(inp: &RustStage0Inputs) -> Result<(), String> {
         )
         .map_err(ioerr("cp rustc component binary"))?;
     }
-    fs::copy(inp.cargo_src.join("cargo/bin/cargo"), tree.join("bin/cargo"))
-        .map_err(ioerr("cp cargo"))?;
+    fs::copy(
+        inp.cargo_src.join("cargo/bin/cargo"),
+        tree.join("bin/cargo"),
+    )
+    .map_err(ioerr("cp cargo"))?;
     // librustc_driver, libLLVM, libstd*.so, AND rustc's own rustlib/.
     copy_tree_contents(&inp.rustc_src.join("rustc/lib"), &tree.join("lib"))
         .map_err(ioerr("cp rustc/lib"))?;
@@ -369,7 +374,8 @@ fn assemble_rust_tree(inp: &RustStage0Inputs) -> Result<(), String> {
         .std_src
         .join("rust-std-x86_64-unknown-linux-gnu/lib/rustlib");
     if std_rustlib.is_dir() {
-        copy_tree_contents(&std_rustlib, &tree.join("lib/rustlib")).map_err(ioerr("merge rustlib"))?;
+        copy_tree_contents(&std_rustlib, &tree.join("lib/rustlib"))
+            .map_err(ioerr("merge rustlib"))?;
     }
     make_writable(tree).map_err(ioerr("chmod tree"))?;
 
@@ -390,23 +396,38 @@ fn assemble_rust_tree(inp: &RustStage0Inputs) -> Result<(), String> {
     }
     for b in &provenance {
         if contains_gnu_store(b)? {
-            return Err(format!("{} contains /gnu/store bytes — not guix-free upstream", b.display()));
+            return Err(format!(
+                "{} contains /gnu/store bytes — not guix-free upstream",
+                b.display()
+            ));
         }
     }
 
     // co-locate the full external runtime closure in lib/ (found via RUNPATH $ORIGIN/../lib):
     // glibc sonames + libgcc_s (+ the bare .so link the rust link's -lgcc_s resolves) + libz.
-    for soname in ["libc.so.6", "libdl.so.2", "librt.so.1", "libpthread.so.0", "libm.so.6"] {
+    for soname in [
+        "libc.so.6",
+        "libdl.so.2",
+        "librt.so.1",
+        "libpthread.so.0",
+        "libm.so.6",
+    ] {
         let src = inp.glibc.join("lib").join(soname);
         if !src.exists() {
             return Err(format!("x86_64 glibc 2.41 is missing {soname}"));
         }
         copy_deref(&src, &tree.join("lib").join(soname))?;
     }
-    copy_deref(&inp.libgcc_dir.join("libgcc_s.so.1"), &tree.join("lib/libgcc_s.so.1"))?;
+    copy_deref(
+        &inp.libgcc_dir.join("libgcc_s.so.1"),
+        &tree.join("lib/libgcc_s.so.1"),
+    )?;
     symlink_force("libgcc_s.so.1", &tree.join("lib/libgcc_s.so"))?;
     let libz = glob_first_in(&inp.libz_dir, "libz.so.1", "").ok_or_else(|| {
-        format!("rust-stage0: no libz.so.1* under the zlib-x86-64 input {}", inp.libz_dir.display())
+        format!(
+            "rust-stage0: no libz.so.1* under the zlib-x86-64 input {}",
+            inp.libz_dir.display()
+        )
     })?;
     copy_deref(&libz, &tree.join("lib/libz.so.1"))?;
     make_writable(tree).map_err(ioerr("chmod tree"))?;
@@ -423,7 +444,9 @@ fn relink_rust_interp(tree: &Path, glibc_interp: &str) -> Result<(), String> {
         let got = crate::elf::read_interp(&bin)?.unwrap_or_default();
         let ok = got.starts_with("/td/store/") && got.ends_with("/lib/ld-linux-x86-64.so.2");
         if !ok {
-            return Err(format!("interp of {b} not relinked to the /td/store glibc loader (got: {got})"));
+            return Err(format!(
+                "interp of {b} not relinked to the /td/store glibc loader (got: {got})"
+            ));
         }
     }
     Ok(())
@@ -463,7 +486,12 @@ fn build_binutils_x86_64(inp: &BuildInputs) -> Result<PathBuf, String> {
     let src = mktemp_dir("td-xn-binutils")?;
     untar(&xz, &inp.binutils_tar, &src, 1, TarComp::Xz)?;
 
-    let bp = format!("{}:{}:{}", inp.builder_tools.display(), tb.display(), inp.cpath);
+    let bp = format!(
+        "{}:{}:{}",
+        inp.builder_tools.display(),
+        tb.display(),
+        inp.cpath
+    );
 
     // configure
     let mut cfg = Command::new(&csh);
@@ -471,7 +499,10 @@ fn build_binutils_x86_64(inp: &BuildInputs) -> Result<PathBuf, String> {
         .arg("--build=x86_64-pc-linux-gnu")
         .arg("--host=x86_64-pc-linux-gnu")
         .arg("--target=x86_64-pc-linux-gnu")
-        .arg(format!("--prefix=/td/store/binutils-2.44-x86_64-{}", inp.flavor.suffix()))
+        .arg(format!(
+            "--prefix=/td/store/binutils-2.44-x86_64-{}",
+            inp.flavor.suffix()
+        ))
         .arg("--disable-nls")
         .arg("--disable-gold")
         .arg("--disable-werror")
@@ -518,7 +549,10 @@ fn build_binutils_x86_64(inp: &BuildInputs) -> Result<PathBuf, String> {
         }
     }
     // native 'as' must itself be ELF64.
-    if !readelf_is_elf64(&out.join("bin").join("readelf"), &out.join("bin").join("as"))? {
+    if !readelf_is_elf64(
+        &out.join("bin").join("readelf"),
+        &out.join("bin").join("as"),
+    )? {
         return Err("native binutils 'as' is not ELF64 x86_64".into());
     }
     Ok(out)
@@ -597,12 +631,21 @@ fn build_gcc_x86_64(inp: &BuildInputs, fresh_binutils: &Path) -> Result<PathBuf,
     // configure
     let mut cfg = Command::new(&csh);
     cfg.arg("../configure")
-        .arg(format!("--prefix=/td/store/gcc-14.3.0-x86_64-{}", inp.flavor.suffix()))
+        .arg(format!(
+            "--prefix=/td/store/gcc-14.3.0-x86_64-{}",
+            inp.flavor.suffix()
+        ))
         .arg("--build=x86_64-pc-linux-gnu")
         .arg("--host=x86_64-pc-linux-gnu")
         .arg("--target=x86_64-pc-linux-gnu")
-        .arg(format!("--with-as={}", fresh_binutils.join("bin/as").display()))
-        .arg(format!("--with-ld={}", fresh_binutils.join("bin/ld").display()))
+        .arg(format!(
+            "--with-as={}",
+            fresh_binutils.join("bin/as").display()
+        ))
+        .arg(format!(
+            "--with-ld={}",
+            fresh_binutils.join("bin/ld").display()
+        ))
         .arg(format!("--with-build-sysroot={}", sysroot.display()))
         .arg("--with-native-system-header-dir=/include")
         .arg("--disable-bootstrap")
@@ -670,7 +713,10 @@ fn build_gcc_x86_64(inp: &BuildInputs, fresh_binutils: &Path) -> Result<PathBuf,
     clear_makeflags(&mut inst);
     run(inst, "native x86_64 gcc-14.3.0 install")?;
 
-    let g = out.join(format!("stage/td/store/gcc-14.3.0-x86_64-{}", inp.flavor.suffix()));
+    let g = out.join(format!(
+        "stage/td/store/gcc-14.3.0-x86_64-{}",
+        inp.flavor.suffix()
+    ));
     if !is_exec(&g.join("bin/gcc")) || !is_exec(&g.join("bin/g++")) {
         return Err("no native gcc/g++ produced".into());
     }
@@ -693,7 +739,12 @@ fn build_gcc_x86_64(inp: &BuildInputs, fresh_binutils: &Path) -> Result<PathBuf,
 /// a shared module) — an x86_64-specific R_X86_64_32-vs-non-PIC-crt guard. Optional
 /// header dir added with `-idirafter` (NOT -isystem: must come after gcc's own C++ dirs
 /// so libstdc++'s `<cstdlib> #include_next <stdlib.h>` resolves).
-fn mk_native_static_wrapper(cc: &Path, glibc: &Path, dst: &Path, hdr: Option<&Path>) -> Result<(), String> {
+fn mk_native_static_wrapper(
+    cc: &Path,
+    glibc: &Path,
+    dst: &Path,
+    hdr: Option<&Path>,
+) -> Result<(), String> {
     let bsh = shell();
     let ida = match hdr {
         Some(h) => format!(" -idirafter {}", h.display()),
@@ -791,7 +842,10 @@ fn rewrite_binsh_shebangs(root: &Path, shell: &str) -> Result<(), String> {
                     Err(_) => continue,
                 };
                 // only touch files starting with `#!` and a first-line /bin/sh.
-                let first_end = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
+                let first_end = bytes
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .unwrap_or(bytes.len());
                 let first = match bytes.get(..first_end) {
                     Some(f) => f,
                     None => continue,
@@ -804,7 +858,11 @@ fn rewrite_binsh_shebangs(root: &Path, shell: &str) -> Result<(), String> {
                 // next whitespace); it must end in /bin/sh (matches `^#! */bin/sh`).
                 let after_bang = line.get(2..).unwrap_or("");
                 let ws_len = after_bang.len() - after_bang.trim_start().len();
-                let interp = after_bang.trim_start().split(char::is_whitespace).next().unwrap_or("");
+                let interp = after_bang
+                    .trim_start()
+                    .split(char::is_whitespace)
+                    .next()
+                    .unwrap_or("");
                 if !interp.ends_with("/bin/sh") {
                     continue;
                 }
@@ -871,7 +929,10 @@ fn untar(xz: &Path, tarball: &Path, dest: &Path, strip: u32, comp: TarComp) -> R
                 .stdout(Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("{what}: spawn xz: {e}"))?;
-            let stdout = dec.stdout.take().ok_or_else(|| format!("{what}: xz produced no stdout"))?;
+            let stdout = dec
+                .stdout
+                .take()
+                .ok_or_else(|| format!("{what}: xz produced no stdout"))?;
             let mut tar = Command::new("tar");
             tar.arg("-xf").arg("-").arg("-C").arg(dest);
             if strip > 0 {
@@ -936,7 +997,9 @@ fn set_mode(p: &Path, mode: u32) -> Result<(), String> {
 }
 
 fn is_exec(p: &Path) -> bool {
-    fs::metadata(p).map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0).unwrap_or(false)
+    fs::metadata(p)
+        .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+        .unwrap_or(false)
 }
 
 fn make_writable(root: &Path) -> io::Result<()> {
@@ -1046,7 +1109,6 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-
 /// `cp -L SRC DST` — copy following a symlink (fs::copy reads through the symlink),
 /// making the destination writable (the source .so may be 0444).
 fn copy_deref(src: &Path, dst: &Path) -> Result<(), String> {
@@ -1153,7 +1215,7 @@ mod tests {
             h.get_mut(156).map(|b| *b = b'0'); // typeflag: regular file
             put(&mut h, 257, "ustar\0"); // magic
             put(&mut h, 263, "00"); // version
-            // Checksum: sum of all bytes with the checksum field taken as spaces.
+                                    // Checksum: sum of all bytes with the checksum field taken as spaces.
             h.get_mut(148..156).map(|s| s.fill(b' '));
             let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
             put(&mut h, 148, &format!("{sum:06o}\0 "));
@@ -1182,14 +1244,19 @@ mod tests {
         let out = d.join("good-out");
         unpack_rust_component(&good, &out, "rustc/bin/rustc")
             .expect("well-formed component unpacks");
-        assert!(out.join("rustc/bin/rustc").is_file(), "rustc not stripped into place");
+        assert!(
+            out.join("rustc/bin/rustc").is_file(),
+            "rustc not stripped into place"
+        );
 
         // The same archive cannot masquerade as the separately pinned Cargo component.
         let bad = d.join("bad.tar");
-        fs::write(&bad, ustar(&[(&format!("{top}/rustc/bin/rustc"), b"#!rustc\n")]))
-            .expect("write bad tar");
-        let err = unpack_rust_component(&bad, &d.join("bad-out"), "cargo/bin/cargo")
-            .unwrap_err();
+        fs::write(
+            &bad,
+            ustar(&[(&format!("{top}/rustc/bin/rustc"), b"#!rustc\n")]),
+        )
+        .expect("write bad tar");
+        let err = unpack_rust_component(&bad, &d.join("bad-out"), "cargo/bin/cargo").unwrap_err();
         assert!(err.contains("missing cargo/bin/cargo"), "{err}");
         let _ = fs::remove_dir_all(&d);
     }
@@ -1207,13 +1274,22 @@ mod tests {
         .expect("write wrapper");
         let body = fs::read_to_string(&dst).expect("read wrapper");
         // executable path present, -static on the default line, -shared drops -static.
-        assert!(body.contains("/xg/bin/x86_64-pc-linux-gnu-gcc"), "body:\n{body}");
+        assert!(
+            body.contains("/xg/bin/x86_64-pc-linux-gnu-gcc"),
+            "body:\n{body}"
+        );
         assert!(body.contains("-idirafter /gl/include"), "body:\n{body}");
         assert!(body.contains("-B/gl/lib"), "body:\n{body}");
         assert!(body.contains("-shared)"), "body:\n{body}");
         // the default (non -shared) exec line carries -static; the -shared branch does not.
-        let default_line = body.lines().find(|l| l.contains("-static")).expect("a -static line");
-        assert!(default_line.contains("-static -idirafter /gl/include -B/gl/lib"), "line: {default_line}");
+        let default_line = body
+            .lines()
+            .find(|l| l.contains("-static"))
+            .expect("a -static line");
+        assert!(
+            default_line.contains("-static -idirafter /gl/include -B/gl/lib"),
+            "line: {default_line}"
+        );
         // mode is 0555 (executable).
         let mode = fs::metadata(&dst).expect("meta").permissions().mode() & 0o777;
         assert_eq!(mode, 0o555, "wrapper not 0555");
@@ -1224,9 +1300,13 @@ mod tests {
     fn native_wrapper_without_hdr_omits_idirafter() {
         let d = tmp("td-xn-test-wrap2");
         let dst = d.join("cc");
-        mk_native_static_wrapper(Path::new("/xg/gcc"), Path::new("/gl"), &dst, None).expect("write");
+        mk_native_static_wrapper(Path::new("/xg/gcc"), Path::new("/gl"), &dst, None)
+            .expect("write");
         let body = fs::read_to_string(&dst).expect("read");
-        assert!(!body.contains("-idirafter"), "unexpected -idirafter:\n{body}");
+        assert!(
+            !body.contains("-idirafter"),
+            "unexpected -idirafter:\n{body}"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -1236,7 +1316,11 @@ mod tests {
         // libgcc_s.so.1 nested under a gcc-style tree; a decoy dir sorts earlier.
         fs::create_dir_all(d.join("aaa/decoy")).unwrap();
         fs::create_dir_all(d.join("lib/gcc/x86_64-pc-linux-gnu/14.3.0")).unwrap();
-        fs::write(d.join("lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc_s.so.1"), b"x").unwrap();
+        fs::write(
+            d.join("lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc_s.so.1"),
+            b"x",
+        )
+        .unwrap();
         let hit = find_file(&d, "libgcc_s.so.1").expect("found libgcc");
         assert!(
             hit.ends_with("lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc_s.so.1"),
@@ -1275,14 +1359,27 @@ mod tests {
         let script = "/* GNU ld script */\nGROUP ( /td/store/glibc-2.41-x86_64/lib/libc.so.6 /td/store/glibc-2.41-x86_64/lib/libc_nonshared.a )\n";
         fs::write(lib.join("libc.so"), script).unwrap();
         // a real (binary-ish) .so that is NOT a GNU ld script → untouched.
-        fs::write(lib.join("libc.so.6"), b"\x7fELF fake binary /td/store/glibc-2.41-x86_64/lib/keep").unwrap();
+        fs::write(
+            lib.join("libc.so.6"),
+            b"\x7fELF fake binary /td/store/glibc-2.41-x86_64/lib/keep",
+        )
+        .unwrap();
         relocate_ld_scripts(&lib).expect("relocate");
         let got = fs::read_to_string(lib.join("libc.so")).unwrap();
-        assert!(got.contains("GROUP ( libc.so.6 libc_nonshared.a )"), "got: {got}");
-        assert!(!got.contains("/td/store/glibc-2.41-x86_64/lib/"), "prefix not stripped: {got}");
+        assert!(
+            got.contains("GROUP ( libc.so.6 libc_nonshared.a )"),
+            "got: {got}"
+        );
+        assert!(
+            !got.contains("/td/store/glibc-2.41-x86_64/lib/"),
+            "prefix not stripped: {got}"
+        );
         // the non-script file keeps its bytes (prefix NOT stripped).
         let bin = fs::read(lib.join("libc.so.6")).unwrap();
-        assert!(contains_sub(&bin, b"/td/store/glibc-2.41-x86_64/lib/keep"), "binary was rewritten");
+        assert!(
+            contains_sub(&bin, b"/td/store/glibc-2.41-x86_64/lib/keep"),
+            "binary was rewritten"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -1295,14 +1392,26 @@ mod tests {
         fs::write(d.join("c.pl"), "#!/usr/bin/perl\nprint 1;\n").unwrap();
         fs::write(d.join("d.txt"), "not a script /bin/sh inside\n").unwrap();
         rewrite_binsh_shebangs(&d, "/curated/bash").expect("rewrite");
-        assert_eq!(fs::read_to_string(d.join("a.sh")).unwrap(), "#!/curated/bash\necho hi\n");
+        assert_eq!(
+            fs::read_to_string(d.join("a.sh")).unwrap(),
+            "#!/curated/bash\necho hi\n"
+        );
         // the shebang TAIL (args like ` -e`) is preserved, exactly as the shell sed keeps
         // everything past /bin/sh — dropping it would change the script's error behavior.
-        assert_eq!(fs::read_to_string(d.join("sub/b.sh")).unwrap(), "#!/curated/bash -e\necho ho\n");
+        assert_eq!(
+            fs::read_to_string(d.join("sub/b.sh")).unwrap(),
+            "#!/curated/bash -e\necho ho\n"
+        );
         // non-/bin/sh interpreter untouched.
-        assert_eq!(fs::read_to_string(d.join("c.pl")).unwrap(), "#!/usr/bin/perl\nprint 1;\n");
+        assert_eq!(
+            fs::read_to_string(d.join("c.pl")).unwrap(),
+            "#!/usr/bin/perl\nprint 1;\n"
+        );
         // non-shebang file untouched.
-        assert_eq!(fs::read_to_string(d.join("d.txt")).unwrap(), "not a script /bin/sh inside\n");
+        assert_eq!(
+            fs::read_to_string(d.join("d.txt")).unwrap(),
+            "not a script /bin/sh inside\n"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -1332,7 +1441,13 @@ mod tests {
         assert!(!glob_exists(&d, "libstd-", ".dylib"));
         // name-sorted first match.
         let hit = glob_first_in(&d, "lib", ".rlib").unwrap();
-        assert!(hit.file_name().unwrap().to_string_lossy().starts_with("libcore-"), "got {hit:?}");
+        assert!(
+            hit.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("libcore-"),
+            "got {hit:?}"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -1376,8 +1491,14 @@ mod tests {
         // copy through the symlink → the destination holds the TARGET's bytes and is writable.
         copy_deref(&link, &dst).unwrap();
         assert_eq!(fs::read(&dst).unwrap(), b"REALBYTES");
-        assert!(!fs::symlink_metadata(&dst).unwrap().file_type().is_symlink(), "dst should be a real file, not a symlink");
-        assert!(fs::metadata(&dst).unwrap().permissions().mode() & 0o200 != 0, "dst should be writable");
+        assert!(
+            !fs::symlink_metadata(&dst).unwrap().file_type().is_symlink(),
+            "dst should be a real file, not a symlink"
+        );
+        assert!(
+            fs::metadata(&dst).unwrap().permissions().mode() & 0o200 != 0,
+            "dst should be writable"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 }

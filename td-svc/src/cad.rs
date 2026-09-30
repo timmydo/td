@@ -181,7 +181,10 @@ mod tests {
         let unwritable = format!("{path}-dir");
         let _ = fs::create_dir_all(&unwritable);
         let err = disable_hard_reset(&unwritable).unwrap_err();
-        assert!(err.contains(&unwritable), "the failure must name the path: {err}");
+        assert!(
+            err.contains(&unwritable),
+            "the failure must name the path: {err}"
+        );
 
         let pidpath = scratch("pid");
         assert_eq!(point_kernel_at(&pidpath, 4321), Ok(()));
@@ -235,7 +238,8 @@ mod tests {
         // Held: the read must NOT finish.
         let _ = writer.write_all(b"noise that is not a message\n");
         assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
             "the sentinel stopped blocking while the write end was still held"
         );
 

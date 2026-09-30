@@ -291,7 +291,10 @@ mod tests {
         let (_, other) = keygen().unwrap();
         let mut opk = [0u8; 32];
         opk.copy_from_slice(&other);
-        assert!(!crate::ed25519::verify(&opk, body, &s), "wrong key must be refused");
+        assert!(
+            !crate::ed25519::verify(&opk, body, &s),
+            "wrong key must be refused"
+        );
     }
 
     #[test]
@@ -304,7 +307,10 @@ mod tests {
         std::fs::write(&manifest, body).unwrap();
         let (pkcs8, pubkey) = keygen().unwrap();
         let sig = from_hex(&sign_manifest(&manifest, &pkcs8).unwrap()).unwrap();
-        assert!(verify_msg(&pubkey, body, &sig), "signed bytes are the file's bytes");
+        assert!(
+            verify_msg(&pubkey, body, &sig),
+            "signed bytes are the file's bytes"
+        );
     }
 
     #[test]
@@ -319,11 +325,18 @@ mod tests {
         let sig_a = from_hex(&sign_manifest(&manifest, &a_priv).unwrap()).unwrap();
         let sig_b = from_hex(&sign_manifest(&manifest, &b_priv).unwrap()).unwrap();
         // D3: the id is sha256(manifest), and signing did not touch the manifest.
-        assert_eq!(before, std::fs::read(&manifest).unwrap(), "signing must not rewrite the manifest");
+        assert_eq!(
+            before,
+            std::fs::read(&manifest).unwrap(),
+            "signing must not rewrite the manifest"
+        );
         assert_ne!(sig_a, sig_b, "different keys, different signatures");
         assert!(verify_msg(&a_pub, body, &sig_a));
         assert!(verify_msg(&b_pub, body, &sig_b));
-        assert!(!verify_msg(&a_pub, body, &sig_b), "keys are not interchangeable");
+        assert!(
+            !verify_msg(&a_pub, body, &sig_b),
+            "keys are not interchangeable"
+        );
     }
 
     /// A signing key readable by anyone forges whatever it authorises, and a
@@ -345,7 +358,10 @@ mod tests {
         let mode = std::fs::metadata(&priv_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "private key must not be group/world readable");
         // Refuses rather than truncating — either half already present is an error.
-        assert!(write_keypair(&ps, &p, &pps, &pubkey).is_err(), "must not replace a key");
+        assert!(
+            write_keypair(&ps, &p, &pps, &pubkey).is_err(),
+            "must not replace a key"
+        );
         let kept = std::fs::read(&priv_path).unwrap();
         assert_eq!(kept, p, "the existing key survived the refusal");
     }
@@ -360,7 +376,10 @@ mod tests {
         let (pkcs8, _) = keygen().unwrap();
         let good = dir.join("good");
         std::fs::write(&good, b"td-deployment-v1\nzz  bzImage\n").unwrap();
-        assert!(sign_manifest(&good, &pkcs8).is_ok(), "the real header signs");
+        assert!(
+            sign_manifest(&good, &pkcs8).is_ok(),
+            "the real header signs"
+        );
         for (name, body) in [
             ("wrong", &b"td-deployment-v2\nzz  bzImage\n"[..]),
             ("blob", &b"anything at all\n"[..]),
@@ -381,7 +400,10 @@ mod tests {
         let manifest = dir.join("manifest");
         std::fs::write(&manifest, b"td-deployment-v1\nzz  bzImage\n").unwrap();
         let sig = dir.join("manifest.sig");
-        assert!(refuse_signing_over_the_manifest(&manifest, &sig).is_ok(), "beside it is fine");
+        assert!(
+            refuse_signing_over_the_manifest(&manifest, &sig).is_ok(),
+            "beside it is fine"
+        );
         assert!(
             refuse_signing_over_the_manifest(&manifest, &manifest).is_err(),
             "the same path must be refused"

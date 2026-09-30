@@ -284,7 +284,9 @@ const IOCTL_REQUESTS: [usize; 3] = [TCGETS, TCSETS, TIOCGWINSZ];
 /// session). A fourth request is an amendment to UNSAFE.md.
 fn ioctl(fd: RawFd, request: usize, arg: usize) -> Result<(), String> {
     if !IOCTL_REQUESTS.contains(&request) {
-        return Err(format!("ioctl: request {request:#x} is not td-sh's to issue"));
+        return Err(format!(
+            "ioctl: request {request:#x} is not td-sh's to issue"
+        ));
     }
     check("ioctl", syscall4(SYS_IOCTL, fd as usize, request, arg, 0))
 }
@@ -324,9 +326,7 @@ const POLLFD_COUNT: usize = 1;
 /// through the pointer and writes `revents` back through it, with no length
 /// negotiation, so a short buffer is an out-of-bounds kernel write from code the
 /// compiler reads as `deny(unsafe_code)` clean.
-const _: () = assert!(
-    POLLFD_COUNT * POLLFD_WORDS * core::mem::size_of::<u32>() == 8
-);
+const _: () = assert!(POLLFD_COUNT * POLLFD_WORDS * core::mem::size_of::<u32>() == 8);
 
 /// The event bits this shell asks about and the ones it accepts as an answer.
 ///
@@ -484,7 +484,9 @@ fn decode(action: &[usize; SIGACTION_WORDS]) -> Option<Disposition> {
 /// `signo`'s current disposition, or `None` if a handler is installed.
 pub fn signal_get(signo: u8) -> Result<Option<Disposition>, String> {
     if !changeable(signo) {
-        return Err(format!("rt_sigaction: signal {signo} is not td-sh's to set"));
+        return Err(format!(
+            "rt_sigaction: signal {signo} is not td-sh's to set"
+        ));
     }
     Ok(decode(&query(signo)?))
 }
@@ -512,7 +514,9 @@ fn handler_word(want: Disposition) -> usize {
 /// something nobody asked for — would be the one path that recorded none.
 pub fn signal_set(signo: u8, want: Disposition) -> Result<Option<Disposition>, String> {
     if !changeable(signo) {
-        return Err(format!("rt_sigaction: signal {signo} is not td-sh's to set"));
+        return Err(format!(
+            "rt_sigaction: signal {signo} is not td-sh's to set"
+        ));
     }
     let prev = decode(&install(signo, handler_word(want))?);
     let took = decode(&query(signo)?);
@@ -616,7 +620,10 @@ mod tests {
         // wrong one is caught independently of the declaration, and one that
         // does not: 0x004 is POLLOUT, never requested and never an answer about
         // reading.
-        assert_eq!((POLLIN, POLLERR, POLLHUP, POLLNVAL), (0x001, 0x008, 0x010, 0x020));
+        assert_eq!(
+            (POLLIN, POLLERR, POLLHUP, POLLNVAL),
+            (0x001, 0x008, 0x010, 0x020)
+        );
         assert_eq!(POLL_READY, 0x001 | 0x008 | 0x010 | 0x020);
         assert_eq!(POLL_READY & 0x004, 0);
         // One descriptor, and the buffer the kernel is told about is the one it
@@ -693,7 +700,11 @@ mod tests {
         // their flakiness rather than as this test's reach.
         for want in [0o022u32, 0o077, 0o000, 0o377, 0o027] {
             umask_set(want).unwrap();
-            assert_eq!(umask_get(), want, "umask_get disagrees with what was installed");
+            assert_eq!(
+                umask_get(),
+                want,
+                "umask_get disagrees with what was installed"
+            );
             if let Some(text) = proc_status_field("Umask:") {
                 let seen = u32::from_str_radix(&text, 8).unwrap();
                 assert_eq!(seen, want, "/proc/self/status says {text}, not {want:04o}");
@@ -721,7 +732,11 @@ mod tests {
         let _serial = serial();
         let restore = umask_get();
         umask_set(0o7377).unwrap();
-        assert_eq!(umask_get(), 0o377, "setuid/setgid/sticky are not part of a umask");
+        assert_eq!(
+            umask_get(),
+            0o377,
+            "setuid/setgid/sticky are not part of a umask"
+        );
         umask_set(0o10000 | 0o022).unwrap();
         assert_eq!(umask_get(), 0o022);
         umask_set(restore).unwrap();
@@ -757,7 +772,11 @@ mod tests {
             }
 
             let prev = signal_set(signo, Disposition::Ignore).unwrap();
-            assert_eq!(prev, Some(Disposition::Default), "the replaced action came back");
+            assert_eq!(
+                prev,
+                Some(Disposition::Default),
+                "the replaced action came back"
+            );
             assert_eq!(signal_get(signo).unwrap(), Some(Disposition::Ignore));
             if let Some(seen) = proc_ignored(signo) {
                 assert!(seen, "/proc/self/status does not list {signo} as ignored");

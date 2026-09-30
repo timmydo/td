@@ -297,8 +297,12 @@ fn run() -> Result<String, String> {
     let _ = client_stop.shutdown(std::net::Shutdown::Both);
     let _ = upstream_stop.shutdown(std::net::Shutdown::Both);
     let outcomes = [
-        to_upstream.join().unwrap_or_else(|_| Err("the client pump panicked".to_string())),
-        to_client.join().unwrap_or_else(|_| Err("the daemon pump panicked".to_string())),
+        to_upstream
+            .join()
+            .unwrap_or_else(|_| Err("the client pump panicked".to_string())),
+        to_client
+            .join()
+            .unwrap_or_else(|_| Err("the daemon pump panicked".to_string())),
     ];
     while let Ok(frame) = rx.try_recv() {
         frames.push(frame);
@@ -331,8 +335,7 @@ with --allow-fds if you have checked that no message carries one."
     }
 
     let rendered = render(&args, &frames);
-    fs::write(&args.out, &rendered)
-        .map_err(|e| format!("writing {}: {e}", args.out.display()))?;
+    fs::write(&args.out, &rendered).map_err(|e| format!("writing {}: {e}", args.out.display()))?;
     let bytes: usize = frames.iter().map(|f| f.bytes.len()).sum();
     Ok(format!(
         "recorded {} frames, {bytes} bytes, to {}",

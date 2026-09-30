@@ -44,8 +44,7 @@ pub fn recipe() -> Recipe {
     else {
         return invalid_recipe("declaration");
     };
-    let Ok(launcher) =
-        LauncherDeclaration::new("Claude Code", &["claude", "code", "agent", "ai"])
+    let Ok(launcher) = LauncherDeclaration::new("Claude Code", &["claude", "code", "agent", "ai"])
     else {
         return invalid_recipe("launcher");
     };

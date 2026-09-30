@@ -29,7 +29,9 @@ impl Mode {
 /// What the landing did. Anything other than `Committed` left HEAD unmoved.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    Committed { sha: String },
+    Committed {
+        sha: String,
+    },
     /// The branch contributes no staged change over the base.
     Nothing,
     /// `merge --squash` left unmerged index entries.
@@ -105,7 +107,14 @@ pub fn preview(git: &Git, base: &str, branch: &str) -> io::Result<Preview> {
     let merge_base = git.merge_base(&base_oid, &branch_oid)?;
     let range = format!("{merge_base}..{branch_oid}");
     let commits = git
-        .run_ok(&["log", "--reverse", "--oneline", "--no-decorate", &range, "--"])?
+        .run_ok(&[
+            "log",
+            "--reverse",
+            "--oneline",
+            "--no-decorate",
+            &range,
+            "--",
+        ])?
         .lines()
         .map(str::to_string)
         .collect();
@@ -144,7 +153,17 @@ pub fn preview(git: &Git, base: &str, branch: &str) -> io::Result<Preview> {
             )),
         ),
     };
-    Ok(Preview { branch_oid, base_oid, merge_base, commits, records, message, stat, diff, note })
+    Ok(Preview {
+        branch_oid,
+        base_oid,
+        merge_base,
+        commits,
+        records,
+        message,
+        stat,
+        diff,
+        note,
+    })
 }
 
 /// True while the sequencer holds a stopped cherry-pick or revert.
@@ -155,10 +174,14 @@ pub fn preview(git: &Git, base: &str, branch: &str) -> io::Result<Preview> {
 /// inherited sequence rewinds the base to wherever that sequence began — past
 /// commits this run never made.
 fn replay_in_progress(git: &Git) -> bool {
-    if git.run(&["rev-parse", "--verify", "--quiet", "CHERRY_PICK_HEAD"]).is_ok_and(|r| r.ok) {
+    if git
+        .run(&["rev-parse", "--verify", "--quiet", "CHERRY_PICK_HEAD"])
+        .is_ok_and(|r| r.ok)
+    {
         return true;
     }
-    git.git_dir().is_ok_and(|dir| dir.join("sequencer").exists())
+    git.git_dir()
+        .is_ok_and(|dir| dir.join("sequencer").exists())
 }
 
 /// Refuse to land unless the work tree is clean, the base branch is checked out
@@ -183,14 +206,25 @@ pub fn preflight(git: &Git, base: &str) -> io::Result<Result<(), String>> {
                 "HEAD is on '{head}', not '{base}' — check out {base} first"
             )))
         }
-        None => return Ok(Err("HEAD is detached — check out the base branch first".to_string())),
+        None => {
+            return Ok(Err(
+                "HEAD is detached — check out the base branch first".to_string()
+            ))
+        }
     }
     let dirty = git.dirty_entries()?;
     if !dirty.is_empty() {
         let shown: Vec<&str> = dirty.iter().map(String::as_str).take(5).collect();
         let more = dirty.len().saturating_sub(shown.len());
-        let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
-        return Ok(Err(format!("working tree not clean: {}{suffix}", shown.join(", "))));
+        let suffix = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        return Ok(Err(format!(
+            "working tree not clean: {}{suffix}",
+            shown.join(", ")
+        )));
     }
     Ok(Ok(()))
 }
@@ -245,7 +279,10 @@ fn pin(
 
     if let Err(why) = preflight(git, base)? {
         log.push(err_line(format!("refusing: {why}")));
-        return Ok(Err(Landing { log, outcome: Outcome::Blocked(why) }));
+        return Ok(Err(Landing {
+            log,
+            outcome: Outcome::Blocked(why),
+        }));
     }
 
     let branch_oid = match git.branch_oid(branch) {
@@ -301,11 +338,23 @@ fn pin(
     log.push(step_line(format!("merge-base {base}..{branch}")));
     log.push(note_line(format!("  {merge_base}")));
 
-    let out = git.run_ok(&["log", "--reverse", "--oneline", "--no-decorate", &range, "--"])?;
+    let out = git.run_ok(&[
+        "log",
+        "--reverse",
+        "--oneline",
+        "--no-decorate",
+        &range,
+        "--",
+    ])?;
     let commits: Vec<String> = out.lines().map(str::to_string).collect();
     if commits.is_empty() {
-        log.push(err_line(format!("refusing: {branch} has no commits beyond {base}")));
-        return Ok(Err(Landing { log, outcome: Outcome::Nothing }));
+        log.push(err_line(format!(
+            "refusing: {branch} has no commits beyond {base}"
+        )));
+        return Ok(Err(Landing {
+            log,
+            outcome: Outcome::Nothing,
+        }));
     }
     let noun = match mode {
         Mode::Squash => "squash",
@@ -316,19 +365,34 @@ fn pin(
         log.push(note_line(format!("  {c}")));
     }
 
-    Ok(Ok(Pinned { log, branch_oid, head_before, range, commits }))
+    Ok(Ok(Pinned {
+        log,
+        branch_oid,
+        head_before,
+        range,
+        commits,
+    }))
 }
 
 /// Stage the whole branch as one commit and commit it with the branch's own
 /// commit messages.
 fn squash(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Landing> {
-    let Pinned { mut log, branch_oid, head_before, range, .. } = pinned;
+    let Pinned {
+        mut log,
+        branch_oid,
+        head_before,
+        range,
+        ..
+    } = pinned;
 
     // Build the message before the merge, so a blank one refuses while the
     // work tree is still pristine. Bytes, not text: it is committed verbatim.
     let message = git.message_bytes(&range)?;
     if message.iter().all(u8::is_ascii_whitespace) {
-        return Ok(blocked(log, format!("{branch}'s commits carry an empty message")));
+        return Ok(blocked(
+            log,
+            format!("{branch}'s commits carry an empty message"),
+        ));
     }
 
     log.push(step_line(format!("git merge --squash {branch}")));
@@ -364,7 +428,10 @@ fn squash(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
             let why = merge.failure();
             log.push(err_line(format!("merge failed: {why}")));
             log.push(note_line("  the work tree was not modified"));
-            return Ok(Landing { log, outcome: Outcome::Failed(why) });
+            return Ok(Landing {
+                log,
+                outcome: Outcome::Failed(why),
+            });
         }
         log.push(err_line(
             "merge --squash hit conflicts — resolve them, or discard with reset --hard".to_string(),
@@ -374,7 +441,10 @@ fn squash(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
                 "  SQUASH_MSG holds the branch's message for the hand-finished commit",
             ));
         }
-        return Ok(Landing { log, outcome: Outcome::Conflict });
+        return Ok(Landing {
+            log,
+            outcome: Outcome::Conflict,
+        });
     }
 
     // `git diff --cached --quiet` exits non-zero when something is staged.
@@ -385,13 +455,22 @@ fn squash(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
         )));
         let reset = git.run(&["reset", "--hard", "HEAD"])?;
         if !reset.ok {
-            log.push(err_line(format!("  reset --hard failed: {}", reset.failure())));
+            log.push(err_line(format!(
+                "  reset --hard failed: {}",
+                reset.failure()
+            )));
         }
-        return Ok(Landing { log, outcome: Outcome::Nothing });
+        return Ok(Landing {
+            log,
+            outcome: Outcome::Nothing,
+        });
     }
 
     let Some(squash_msg) = squash_msg else {
-        return Ok(staged_failure(log, "the squash message could not be written".to_string()));
+        return Ok(staged_failure(
+            log,
+            "the squash message could not be written".to_string(),
+        ));
     };
 
     // Last look before the commit: the squash is staged against `head_before`,
@@ -410,7 +489,7 @@ fn squash(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
                 ),
                 "do NOT commit this by hand — its tree predates the move. \
                  Discard with reset --hard HEAD and land again",
-            ))
+            ));
         }
         Err(e) => return Ok(staged_failure(log, e.to_string())),
     }
@@ -458,7 +537,10 @@ fn squash(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
     let (true, Some(sha), Some(parent), Some(tree)) =
         (head.ok, fields.next(), fields.next(), fields.next())
     else {
-        return Ok(staged_failure(log, format!("committed, but unreadable: {}", head.failure())));
+        return Ok(staged_failure(
+            log,
+            format!("committed, but unreadable: {}", head.failure()),
+        ));
     };
     if parent != head_before || tree != staged_tree {
         // Undo only what this run created: HEAD^ keeps whatever arrived in
@@ -471,7 +553,11 @@ fn squash(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
         let recovery = if undo.ok {
             format!("rolled back to {}", short(&parent))
         } else {
-            format!("ROLLBACK FAILED ({}) — reset --hard {} by hand", undo.failure(), short(&parent))
+            format!(
+                "ROLLBACK FAILED ({}) — reset --hard {} by hand",
+                undo.failure(),
+                short(&parent)
+            )
         };
         let why = if parent != head_before {
             format!(
@@ -491,7 +577,10 @@ fn squash(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
         };
         let why = format!("{why}. NOT published; {recovery}");
         log.push(err_line(format!("failed: {why}")));
-        return Ok(Landing { log, outcome: Outcome::Failed(why) });
+        return Ok(Landing {
+            log,
+            outcome: Outcome::Failed(why),
+        });
     }
     let sha = sha.to_string();
     let subject = git
@@ -499,7 +588,10 @@ fn squash(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
         .map(|r| r.line().to_string())
         .unwrap_or_default();
     log.push(ok_line(format!("committed {}  {subject}", short(&sha))));
-    Ok(Landing { log, outcome: Outcome::Committed { sha } })
+    Ok(Landing {
+        log,
+        outcome: Outcome::Committed { sha },
+    })
 }
 
 /// Replay the branch's own commits onto the base with the sequencer, then check
@@ -511,7 +603,13 @@ fn squash(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
 /// left for the operator: half a branch on the base is work nobody approved as
 /// a set, and it is one `p` from being published.
 fn rebase(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Landing> {
-    let Pinned { mut log, branch_oid, head_before, range, commits } = pinned;
+    let Pinned {
+        mut log,
+        branch_oid,
+        head_before,
+        range,
+        commits,
+    } = pinned;
 
     // cherry-pick replays one parent's changes; a merge commit has two and
     // nothing in the range says which. Squashing takes the same tree without
@@ -571,7 +669,10 @@ fn rebase(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
         log.push(err_line(format!(
             "nothing to replay: {branch} changes nothing on top of {base} (already landed?)"
         )));
-        return Ok(Landing { log, outcome: Outcome::Nothing });
+        return Ok(Landing {
+            log,
+            outcome: Outcome::Nothing,
+        });
     }
 
     // What `git rebase` replays: the branch's commits less the ones whose patch
@@ -600,7 +701,10 @@ fn rebase(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
         log.push(err_line(format!(
             "nothing to replay: every commit on {branch} is already on {base} by patch"
         )));
-        return Ok(Landing { log, outcome: Outcome::Nothing });
+        return Ok(Landing {
+            log,
+            outcome: Outcome::Nothing,
+        });
     }
 
     // --ff so a branch already sitting on the base tip lands the very commits
@@ -634,7 +738,10 @@ fn rebase(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
         // which reported success did not do what success means.
         let why = format!("cherry-pick reported success but {base} did not move");
         log.push(err_line(format!("failed: {why}")));
-        return Ok(Landing { log, outcome: Outcome::Failed(why) });
+        return Ok(Landing {
+            log,
+            outcome: Outcome::Failed(why),
+        });
     }
     // Both structural checks come before any rollback: only once the base still
     // descends from where it started, by exactly the commits that were picked,
@@ -657,9 +764,16 @@ fn rebase(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
     // being dropped from it, so every pick made exactly one commit. Anything
     // else means something committed here that we did not — and a count that
     // could not be read is a different state from one that came out wrong.
-    let why = match git.run(&["rev-list", "--count", &format!("{head_before}..{head_after}"), "--"])
-    {
-        Ok(run) if !run.ok => Some(format!("{base}'s new commits could not be counted: {}", run.failure())),
+    let why = match git.run(&[
+        "rev-list",
+        "--count",
+        &format!("{head_before}..{head_after}"),
+        "--",
+    ]) {
+        Ok(run) if !run.ok => Some(format!(
+            "{base}'s new commits could not be counted: {}",
+            run.failure()
+        )),
         Err(e) => Some(format!("{base}'s new commits could not be counted: {e}")),
         Ok(run) if run.line() != picks.len().to_string() => Some(format!(
             "{} commit(s) were replayed but {base} gained {}",
@@ -700,7 +814,10 @@ fn rebase(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
         if picks.len() == 1 { "" } else { "s" },
         short(&head_after)
     )));
-    Ok(Landing { log, outcome: Outcome::Committed { sha: head_after } })
+    Ok(Landing {
+        log,
+        outcome: Outcome::Committed { sha: head_after },
+    })
 }
 
 /// Put a stopped replay back: the sequencer's own abort restores both the base
@@ -723,7 +840,10 @@ fn abort_replay(
         let abort = git.run(&["cherry-pick", "--abort"])?;
         log_output(&mut log, &abort);
     }
-    let restored = git.rev_parse("HEAD").map(|head| head == head_before).unwrap_or(false);
+    let restored = git
+        .rev_parse("HEAD")
+        .map(|head| head == head_before)
+        .unwrap_or(false);
     let clean = git.dirty_entries().map(|d| d.is_empty()).unwrap_or(false);
     if !restored || !clean {
         return Ok(left_standing(
@@ -741,14 +861,20 @@ fn abort_replay(
         "  {base} is back at {} — nothing was applied",
         short(head_before)
     )));
-    Ok(Landing { log, outcome: Outcome::Blocked(format!("{branch} does not replay onto {base}: {why}")) })
+    Ok(Landing {
+        log,
+        outcome: Outcome::Blocked(format!("{branch} does not replay onto {base}: {why}")),
+    })
 }
 
 /// Remove the commits a replay put on the base. Only reached once both
 /// structural checks have passed, so `head_before..HEAD` is exactly what this
 /// run added and nothing else goes with it.
 fn roll_back(git: &Git, mut log: Vec<Line>, why: String, head_before: &str) -> Landing {
-    log.push(step_line(format!("git reset --hard {}", short(head_before))));
+    log.push(step_line(format!(
+        "git reset --hard {}",
+        short(head_before)
+    )));
     let reset = match git.run(&["reset", "--hard", head_before]) {
         Ok(run) => run,
         Err(e) => {
@@ -757,12 +883,18 @@ fn roll_back(git: &Git, mut log: Vec<Line>, why: String, head_before: &str) -> L
                 short(head_before)
             );
             log.push(err_line(why.clone()));
-            return Landing { log, outcome: Outcome::Failed(why) };
+            return Landing {
+                log,
+                outcome: Outcome::Failed(why),
+            };
         }
     };
     log_output(&mut log, &reset);
     let why = if reset.ok {
-        format!("{why}. NOT published; rolled back to {}", short(head_before))
+        format!(
+            "{why}. NOT published; rolled back to {}",
+            short(head_before)
+        )
     } else {
         format!(
             "{why}. ROLLBACK FAILED ({}) — reset --hard {} by hand",
@@ -771,7 +903,10 @@ fn roll_back(git: &Git, mut log: Vec<Line>, why: String, head_before: &str) -> L
         )
     };
     log.push(err_line(format!("failed: {why}")));
-    Landing { log, outcome: Outcome::Failed(why) }
+    Landing {
+        log,
+        outcome: Outcome::Failed(why),
+    }
 }
 
 /// Report a replay whose commits are still on the base and must NOT be removed
@@ -788,16 +923,26 @@ fn left_standing(mut log: Vec<Line>, why: String, head_before: &str) -> Landing 
     log.push(err_line(
         "and the next p WILL PUBLISH them — remove them by hand first".to_string(),
     ));
-    Landing { log, outcome: Outcome::Failed(why) }
+    Landing {
+        log,
+        outcome: Outcome::Failed(why),
+    }
 }
 
 fn blocked(mut log: Vec<Line>, why: String) -> Landing {
     log.push(err_line(format!("refusing: {why}")));
-    Landing { log, outcome: Outcome::Blocked(why) }
+    Landing {
+        log,
+        outcome: Outcome::Blocked(why),
+    }
 }
 
 fn staged_failure(log: Vec<Line>, why: String) -> Landing {
-    staged_failure_with(log, why, "the squash is still staged — commit by hand, or discard with reset --hard")
+    staged_failure_with(
+        log,
+        why,
+        "the squash is still staged — commit by hand, or discard with reset --hard",
+    )
 }
 
 /// Same, for the failures where finishing the commit by hand is the WRONG move:
@@ -805,7 +950,10 @@ fn staged_failure(log: Vec<Line>, why: String) -> Landing {
 fn staged_failure_with(mut log: Vec<Line>, why: String, remedy: &str) -> Landing {
     log.push(err_line(format!("failed: {why}")));
     log.push(err_line(remedy.to_string()));
-    Landing { log, outcome: Outcome::Failed(why) }
+    Landing {
+        log,
+        outcome: Outcome::Failed(why),
+    }
 }
 
 pub fn short(sha: &str) -> String {
@@ -854,7 +1002,10 @@ pub fn discard(git: &Git) -> io::Result<Vec<Line>> {
         log.push(ok_line("discarded — working tree back at HEAD"));
     } else {
         log.push(Line::new(
-            format!("reset, but {} untracked leftover(s) remain:", leftovers.len()),
+            format!(
+                "reset, but {} untracked leftover(s) remain:",
+                leftovers.len()
+            ),
             Style::fg(YELLOW),
         ));
         for l in leftovers.iter().take(10) {
@@ -964,24 +1115,40 @@ pub fn delete_branch(
         // receive.denyDeleteCurrent is a server-side default we do not control.
         // An unanswerable remote refuses: "unknown" is the state in which the
         // branch could be exactly the one that must not go.
-        targets.iter().find_map(|t| match git.head_claim(&t.remote, short) {
-            Ok(HeadClaim::Default) => Some(format!("it is {}'s default branch", t.remote)),
-            // Never the URL: a push URL routinely carries a credential.
-            Ok(HeadClaim::Unnamed) => Some(format!(
-                "{} reported HEAD without naming a branch, and it could be this one",
-                t.remote
-            )),
-            Ok(HeadClaim::NotDefault) => None,
-            Err(e) => Some(format!("{}'s default branch could not be established ({e})", t.remote)),
-        })
+        targets
+            .iter()
+            .find_map(|t| match git.head_claim(&t.remote, short) {
+                Ok(HeadClaim::Default) => Some(format!("it is {}'s default branch", t.remote)),
+                // Never the URL: a push URL routinely carries a credential.
+                Ok(HeadClaim::Unnamed) => Some(format!(
+                    "{} reported HEAD without naming a branch, and it could be this one",
+                    t.remote
+                )),
+                Ok(HeadClaim::NotDefault) => None,
+                Err(e) => Some(format!(
+                    "{}'s default branch could not be established ({e})",
+                    t.remote
+                )),
+            })
     };
     if let Some(reason) = reason {
         log.push(err_line(format!("refusing to delete '{short}': {reason}")));
-        return Ok(Pushed { log, all_ok: false, reached: Vec::new() });
+        return Ok(Pushed {
+            log,
+            all_ok: false,
+            reached: Vec::new(),
+        });
     }
     if targets.is_empty() {
-        log.push(Line::new(format!("no pushable remote carries {short}"), Style::fg(YELLOW)));
-        return Ok(Pushed { log, all_ok: true, reached: Vec::new() });
+        log.push(Line::new(
+            format!("no pushable remote carries {short}"),
+            Style::fg(YELLOW),
+        ));
+        return Ok(Pushed {
+            log,
+            all_ok: true,
+            reached: Vec::new(),
+        });
     }
     // Fully qualified: an unqualified name is ambiguous when the remote also
     // carries a tag of the same name.
@@ -995,7 +1162,9 @@ pub fn delete_branch(
         // refuses rather than dropping work nobody here has seen.
         let lease = format!("--force-with-lease={refname}:{}", t.oid);
         let name = &t.remote;
-        log.push(step_line(format!("==> {name}  git push {lease} {name} {delete}")));
+        log.push(step_line(format!(
+            "==> {name}  git push {lease} {name} {delete}"
+        )));
         let del = git.run(&["push", &lease, name, &delete])?;
         log_output(&mut log, &del);
         if del.ok {
@@ -1003,10 +1172,17 @@ pub fn delete_branch(
             log.push(ok_line(format!("  deleted {short} from {name}")));
         } else {
             all_ok = false;
-            log.push(err_line(format!("  delete on {name} failed: {}", del.failure())));
+            log.push(err_line(format!(
+                "  delete on {name} failed: {}",
+                del.failure()
+            )));
         }
     }
-    Ok(Pushed { log, all_ok, reached })
+    Ok(Pushed {
+        log,
+        all_ok,
+        reached,
+    })
 }
 
 /// Why a push-all left a remote alone.
@@ -1080,7 +1256,11 @@ pub fn push_all(
             short(&current),
             short(sha)
         )));
-        return Ok(Pushed { log, all_ok: false, reached: Vec::new() });
+        return Ok(Pushed {
+            log,
+            all_ok: false,
+            reached: Vec::new(),
+        });
     }
 
     if remotes.is_empty() {
@@ -1088,7 +1268,11 @@ pub fn push_all(
         // is as likely to be every remote opting out, and the caller has
         // already said which by name.
         log.push(Line::new("no remote to publish to", Style::fg(YELLOW)));
-        return Ok(Pushed { log, all_ok: true, reached: Vec::new() });
+        return Ok(Pushed {
+            log,
+            all_ok: true,
+            reached: Vec::new(),
+        });
     }
     let refspec = format!("{sha}:refs/heads/{base}");
     let mut all_ok = true;
@@ -1106,7 +1290,10 @@ pub fn push_all(
             log.push(ok_line(format!("  pushed to {name}")));
         } else {
             all_ok = false;
-            log.push(err_line(format!("  push to {name} failed: {}", push.failure())));
+            log.push(err_line(format!(
+                "  push to {name} failed: {}",
+                push.failure()
+            )));
         }
     }
     if reached.is_empty() && all_ok {
@@ -1115,7 +1302,11 @@ pub fn push_all(
             Style::fg(YELLOW),
         ));
     }
-    Ok(Pushed { log, all_ok, reached })
+    Ok(Pushed {
+        log,
+        all_ok,
+        reached,
+    })
 }
 
 #[cfg(test)]
@@ -1123,13 +1314,20 @@ mod tests {
     use super::*;
 
     fn target(remote: &str, oid: &str) -> DeleteTarget {
-        DeleteTarget { remote: remote.to_string(), oid: oid.to_string() }
+        DeleteTarget {
+            remote: remote.to_string(),
+            oid: oid.to_string(),
+        }
     }
 
     #[test]
     fn a_same_named_branch_at_another_oid_is_not_ours_to_delete() {
         let (landed, diverged) = partition_landed(
-            vec![target("origin", "aaa"), target("backup", "bbb"), target("mirror", "aaa")],
+            vec![
+                target("origin", "aaa"),
+                target("backup", "bbb"),
+                target("mirror", "aaa"),
+            ],
             "aaa",
         );
         assert_eq!(
@@ -1137,7 +1335,10 @@ mod tests {
             vec!["origin", "mirror"]
         );
         assert_eq!(
-            diverged.iter().map(|t| t.remote.as_str()).collect::<Vec<_>>(),
+            diverged
+                .iter()
+                .map(|t| t.remote.as_str())
+                .collect::<Vec<_>>(),
             vec!["backup"]
         );
     }

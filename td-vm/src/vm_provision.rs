@@ -30,7 +30,12 @@ pub struct Provision {
 
 impl Provision {
     pub fn new(now: Instant) -> Self {
-        Self { phase: Phase::Key, next: now, unavailable_until: now + UNAVAILABLE, last: String::new() }
+        Self {
+            phase: Phase::Key,
+            next: now,
+            unavailable_until: now + UNAVAILABLE,
+            last: String::new(),
+        }
     }
 
     fn report(&mut self, host: &mut impl Host, message: String) {
@@ -46,20 +51,30 @@ impl Provision {
             self.report(host, format!("Blocked: {stage} unavailable for ten minutes: {error}. Inspect the guest and use explicit workspace enrollment/clone to retry."));
         } else {
             // Avoid a changing transport diagnostic flooding retained logs.
-            self.report(host, format!("Waiting for {stage}; inspect guest logs if this persists."));
+            self.report(
+                host,
+                format!("Waiting for {stage}; inspect guest logs if this persists."),
+            );
         }
     }
 
-    pub fn due(&self, now: Instant) -> bool { !matches!(self.phase, Phase::Done) && now >= self.next }
+    pub fn due(&self, now: Instant) -> bool {
+        !matches!(self.phase, Phase::Done) && now >= self.next
+    }
 
     pub fn poll(&mut self, host: &mut impl Host, now: Instant) {
-        if now < self.next { return; }
+        if now < self.next {
+            return;
+        }
         self.next = now + RETRY;
         match &self.phase {
             Phase::Key => match host.key() {
                 Ok(()) => {
                     self.phase = Phase::Enroll;
-                    self.report(host, "Enrolling the guest Git key and retaining its starting commit.".into());
+                    self.report(
+                        host,
+                        "Enrolling the guest Git key and retaining its starting commit.".into(),
+                    );
                 }
                 Err(error) => self.unavailable(host, now, "the guest Git key", error),
             },
@@ -67,7 +82,10 @@ impl Provision {
                 Ok(plan) => {
                     self.phase = Phase::Clone(Box::new(plan));
                     self.unavailable_until = now + UNAVAILABLE;
-                    self.report(host, "Preparing the private guest clone and task worktree.".into());
+                    self.report(
+                        host,
+                        "Preparing the private guest clone and task worktree.".into(),
+                    );
                 }
                 Err(error) => {
                     self.phase = Phase::Done;
@@ -78,12 +96,18 @@ impl Provision {
                 Ok(Progress::Pending) => {
                     // Slow object transfer is not an unavailable bridge.
                     self.unavailable_until = now + UNAVAILABLE;
-                    self.report(host, "Preparing the private guest clone and task worktree.".into());
+                    self.report(
+                        host,
+                        "Preparing the private guest clone and task worktree.".into(),
+                    );
                 }
                 Ok(Progress::Ready) => {
                     self.phase = Phase::Launch(plan.clone());
                     self.unavailable_until = now + UNAVAILABLE;
-                    self.report(host, "Opening a task terminal in the primary task worktree.".into());
+                    self.report(
+                        host,
+                        "Opening a task terminal in the primary task worktree.".into(),
+                    );
                 }
                 Ok(Progress::Failed(error)) => {
                     self.phase = Phase::Done;
@@ -114,43 +138,70 @@ pub struct Worker {
 }
 impl Worker {
     pub fn start(root: std::path::PathBuf, name: String, lifetime: std::fs::File) -> Self {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let cancel = Arc::clone(&stop);
-        let thread = std::thread::Builder::new().name("vm-provision".into()).spawn(move || {
-            let _lifetime = lifetime;
-            let result = (|| -> Result<(), String> {
-                let manager = crate::Manager::existing(&root)?;
-                let dir = manager.instance(&name)?;
-                if crate::vm_workspace::load(&dir)?.is_none() { return Ok(()); }
-                let mut provision = Provision::new(Instant::now());
-                while !cancel.load(Ordering::Relaxed) && !matches!(provision.phase, Phase::Done) {
-                    if provision.due(Instant::now()) {
-                        // Contention is not an attempted or uncertain mutation.
-                        if let Some(lock) = crate::optional_lock(&root.join("locks").join(format!("instance-{name}")), &name, false)? {
-                            if cancel.load(Ordering::Relaxed) { break; }
-                            let mut host = crate::ProvisionHost { manager: &manager, dir: &dir, lock: &lock };
-                            provision.poll(&mut host, Instant::now());
-                        }
+        let thread = std::thread::Builder::new()
+            .name("vm-provision".into())
+            .spawn(move || {
+                let _lifetime = lifetime;
+                let result = (|| -> Result<(), String> {
+                    let manager = crate::Manager::existing(&root)?;
+                    let dir = manager.instance(&name)?;
+                    if crate::vm_workspace::load(&dir)?.is_none() {
+                        return Ok(());
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    let mut provision = Provision::new(Instant::now());
+                    while !cancel.load(Ordering::Relaxed) && !matches!(provision.phase, Phase::Done)
+                    {
+                        if provision.due(Instant::now()) {
+                            // Contention is not an attempted or uncertain mutation.
+                            if let Some(lock) = crate::optional_lock(
+                                &root.join("locks").join(format!("instance-{name}")),
+                                &name,
+                                false,
+                            )? {
+                                if cancel.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                let mut host = crate::ProvisionHost {
+                                    manager: &manager,
+                                    dir: &dir,
+                                    lock: &lock,
+                                };
+                                provision.poll(&mut host, Instant::now());
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    eprintln!("automatic workspace provisioning unavailable: {error}");
                 }
-                Ok(())
-            })();
-            if let Err(error) = result { eprintln!("automatic workspace provisioning unavailable: {error}"); }
-        });
+            });
         let thread = match thread {
             Ok(thread) => Some(thread),
-            Err(error) => { eprintln!("start automatic workspace provisioning: {error}"); None }
+            Err(error) => {
+                eprintln!("start automatic workspace provisioning: {error}");
+                None
+            }
         };
         Self { stop, thread }
     }
-    pub fn cancel(&self) { self.stop.store(true, std::sync::atomic::Ordering::Relaxed); }
+    pub fn cancel(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 impl Drop for Worker {
     fn drop(&mut self) {
         self.cancel();
-        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -171,45 +222,73 @@ mod tests {
     }
     impl Host for Fixture {
         fn key(&mut self) -> Result<(), String> {
-            self.calls.push("key"); self.key.pop_front().unwrap_or(Ok(()))
+            self.calls.push("key");
+            self.key.pop_front().unwrap_or(Ok(()))
         }
         fn enroll(&mut self) -> Result<Plan, String> {
             self.calls.push("enroll");
-            self.enrollment_error.take().map_or_else(|| Ok(crate::vm_wire::workspace::example()), Err)
+            self.enrollment_error
+                .take()
+                .map_or_else(|| Ok(crate::vm_wire::workspace::example()), Err)
         }
         fn ensure(&mut self, plan: &Plan) -> Result<Progress, String> {
             assert_eq!(*plan, crate::vm_wire::workspace::example());
-            self.calls.push("ensure"); self.replies.pop_front().unwrap_or(Ok(Progress::Pending))
+            self.calls.push("ensure");
+            self.replies.pop_front().unwrap_or(Ok(Progress::Pending))
         }
         fn launch(&mut self, plan: &Plan) -> Result<(), String> {
             assert_eq!(*plan, crate::vm_wire::workspace::example());
             self.calls.push("launch");
             self.launches.pop_front().unwrap_or(Ok(()))
         }
-        fn report(&mut self, value: &str) { self.reports.push(value.into()); }
+        fn report(&mut self, value: &str) {
+            self.reports.push(value.into());
+        }
     }
     #[test]
     #[ignore = "host subprocess shutdown fixture"]
     fn shutdown_joins_blocked_capture_before_releasing_its_instance_lease() {
         use std::fs::{self, File};
         use std::process::{Command, Stdio};
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
         let root = std::env::temp_dir().join(format!("td-vm-worker-exit-{}", std::process::id()));
         fs::create_dir(&root).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(root.join("socket")).unwrap();
-        let lease = File::create(root.join("lease")).unwrap(); lease.lock().unwrap();
+        let lease = File::create(root.join("lease")).unwrap();
+        lease.lock().unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
-        command.args(["--exact", "vm_git_profile::tests::profile_child", "--ignored", "--nocapture"])
-            .env("TD_VM_PROFILE_CHILD", "backlog").env("TD_VM_PROFILE_PID", root.join("pid"))
+        command
+            .args([
+                "--exact",
+                "vm_git_profile::tests::profile_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TD_VM_PROFILE_CHILD", "backlog")
+            .env("TD_VM_PROFILE_PID", root.join("pid"))
             .env("TD_VM_PROFILE_SOCKET", root.join("socket"));
-        let finished = Arc::new(AtomicBool::new(false)); let completed = Arc::clone(&finished);
+        let finished = Arc::new(AtomicBool::new(false));
+        let completed = Arc::clone(&finished);
         let thread = std::thread::spawn(move || {
-            assert!(crate::vm_git_profile::capture_until(command, Stdio::from(lease), Duration::from_millis(800)).is_err());
+            assert!(crate::vm_git_profile::capture_until(
+                command,
+                Stdio::from(lease),
+                Duration::from_millis(800)
+            )
+            .is_err());
             completed.store(true, Ordering::Relaxed);
         });
-        let worker = Worker { stop: Arc::new(AtomicBool::new(false)), thread: Some(thread) };
+        let worker = Worker {
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: Some(thread),
+        };
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !root.join("pid").exists() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(5)); }
+        while !root.join("pid").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let pid = fs::read_to_string(root.join("pid")).unwrap();
         assert!(File::open(root.join("lease")).unwrap().try_lock().is_err());
         drop(worker);
@@ -217,28 +296,52 @@ mod tests {
         assert!(Instant::now() < deadline);
         assert!(!std::path::Path::new("/proc").join(pid).exists());
         assert!(File::open(root.join("lease")).unwrap().try_lock().is_ok());
-        drop(listener); fs::remove_dir_all(root).unwrap();
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn slow_clone_polls_without_reenrolling_or_restarting_and_stops_at_ready() {
-        let now = Instant::now(); let mut run = Provision::new(now);
-        let mut host = Fixture { key: [Err("booting".into()), Ok(())].into(),
-            replies: [Ok(Progress::Pending), Err("carrier disconnected".into()), Ok(Progress::Pending), Ok(Progress::Ready)].into(), ..Fixture::default() };
+        let now = Instant::now();
+        let mut run = Provision::new(now);
+        let mut host = Fixture {
+            key: [Err("booting".into()), Ok(())].into(),
+            replies: [
+                Ok(Progress::Pending),
+                Err("carrier disconnected".into()),
+                Ok(Progress::Pending),
+                Ok(Progress::Ready),
+            ]
+            .into(),
+            ..Fixture::default()
+        };
         for seconds in [0, 1, 2, 4, 6, 8, 10, 900, 1800] {
             run.poll(&mut host, now + Duration::from_secs(seconds));
         }
-        assert_eq!(host.calls, ["key", "key", "enroll", "ensure", "ensure", "ensure", "ensure", "launch"]);
+        assert_eq!(
+            host.calls,
+            ["key", "key", "enroll", "ensure", "ensure", "ensure", "ensure", "launch"]
+        );
         assert!(host.reports.last().unwrap().starts_with("Prepared:"));
     }
     #[test]
     fn failed_clones_and_unconfirmed_enrollment_wait_for_explicit_recovery() {
         for enrollment in [false, true] {
-            let now = Instant::now(); let mut run = Provision::new(now);
-            let mut host = Fixture { enrollment_error: enrollment.then(|| "lost registrar reply".into()),
-                replies: [Ok(Progress::Failed("wrong host key".into()))].into(), ..Fixture::default() };
-            for seconds in [0, 2, 4, 6, 900] { run.poll(&mut host, now + Duration::from_secs(seconds)); }
-            let expected = if enrollment { vec!["key", "enroll"] } else { vec!["key", "enroll", "ensure"] };
+            let now = Instant::now();
+            let mut run = Provision::new(now);
+            let mut host = Fixture {
+                enrollment_error: enrollment.then(|| "lost registrar reply".into()),
+                replies: [Ok(Progress::Failed("wrong host key".into()))].into(),
+                ..Fixture::default()
+            };
+            for seconds in [0, 2, 4, 6, 900] {
+                run.poll(&mut host, now + Duration::from_secs(seconds));
+            }
+            let expected = if enrollment {
+                vec!["key", "enroll"]
+            } else {
+                vec!["key", "enroll", "ensure"]
+            };
             assert_eq!(host.calls, expected);
             assert!(host.reports.last().unwrap().starts_with("Blocked:"));
         }
@@ -260,9 +363,15 @@ mod tests {
     }
     #[test]
     fn missing_guest_times_out_but_a_new_supervisor_can_resume() {
-        let now = Instant::now(); let mut run = Provision::new(now);
-        let mut host = Fixture { key: [Err("offline".into()), Err("offline".into())].into(), ..Fixture::default() };
-        for seconds in [0, 600, 1200] { run.poll(&mut host, now + Duration::from_secs(seconds)); }
+        let now = Instant::now();
+        let mut run = Provision::new(now);
+        let mut host = Fixture {
+            key: [Err("offline".into()), Err("offline".into())].into(),
+            ..Fixture::default()
+        };
+        for seconds in [0, 600, 1200] {
+            run.poll(&mut host, now + Duration::from_secs(seconds));
+        }
         assert_eq!(host.calls, ["key", "key"]);
         assert!(host.reports.last().unwrap().starts_with("Blocked:"));
         let mut resumed = Provision::new(now);

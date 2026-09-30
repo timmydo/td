@@ -35,8 +35,8 @@
 //! it needs full grapheme segmentation rather than a range table.
 
 use std::io::{IsTerminal, Read, Seek, Write};
-use std::os::fd::AsFd;
 use std::num::NonZeroUsize;
+use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -131,7 +131,12 @@ const HISTORY_READ_MAX: u64 = 1 << 20;
 
 impl Editor {
     pub fn new() -> Self {
-        Self { history: Vec::new(), max: DEFAULT_MAX, hist: None, kill: String::new() }
+        Self {
+            history: Vec::new(),
+            max: DEFAULT_MAX,
+            hist: None,
+            kill: String::new(),
+        }
     }
 
     /// Take the session's history file: load what is in it, and append every
@@ -288,8 +293,11 @@ impl Editor {
         buf.push('\n');
         // 0600 because a shell history is a record of what someone typed,
         // passwords on argv included; busybox opens it with the same mode.
-        let opened =
-            std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(&h.path);
+        let opened = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(&h.path);
         let Ok(mut f) = opened else {
             return;
         };
@@ -600,7 +608,13 @@ impl Editor {
         let mut pending: Option<u8> = None;
         loop {
             *width = (keys.width)().unwrap_or(*width);
-            draw(out, &format!("(reverse-i-search)'{pattern}': "), buf, *pos, *width);
+            draw(
+                out,
+                &format!("(reverse-i-search)'{pattern}': "),
+                buf,
+                *pos,
+                *width,
+            );
             let Some(b) = pending.take().or_else(&mut *keys.next) else {
                 // Closed stdin. Put the real prompt back on the way out, so
                 // EVERY exit from the search leaves one -- otherwise the last
@@ -754,7 +768,11 @@ fn read_history(path: &Path, max: usize) -> Option<Loaded> {
         Ok(f) => f,
         // Absent is an empty history, which is what a first session has.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Some(Loaded { kept: Vec::new(), total: 0, terminated: true });
+            return Some(Loaded {
+                kept: Vec::new(),
+                total: 0,
+                terminated: true,
+            });
         }
         Err(_) => return None,
     };
@@ -778,7 +796,10 @@ fn read_history(path: &Path, max: usize) -> Option<Loaded> {
     // The window opened mid-file, so its first line is whatever was left of
     // the line the cut landed in -- half a command, which is not one.
     let text = match clipped {
-        true => text.split_once('\n').map_or("", |(_, rest)| rest).to_string(),
+        true => text
+            .split_once('\n')
+            .map_or("", |(_, rest)| rest)
+            .to_string(),
         false => text.into_owned(),
     };
     // COUNTED first and collected second, so only the lines actually kept are
@@ -793,7 +814,11 @@ fn read_history(path: &Path, max: usize) -> Option<Loaded> {
         .skip(total.saturating_sub(max))
         .map(str::to_string)
         .collect();
-    Some(Loaded { kept, total, terminated })
+    Some(Loaded {
+        kept,
+        total,
+        terminated,
+    })
 }
 
 /// Rewrite the file with only the lines that are kept, and answer how many
@@ -835,7 +860,11 @@ fn rewrite_history(path: &Path, max: usize) -> Option<usize> {
     // there, and `create(true).truncate(true)` would follow it and write the
     // operator's history over whatever it points at. Nothing is removed on
     // this arm: the file that is there is not ours.
-    let opened = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp);
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp);
     let Ok(mut f) = opened else {
         return None;
     };
@@ -1892,12 +1921,18 @@ mod tests {
     fn prompt_tilde_is_a_path_prefix_not_a_string_prefix() {
         let home = "/home/ada";
         assert_eq!(render_prompt(r"\w", &facts(home, home, false)), "~");
-        assert_eq!(render_prompt(r"\w", &facts("/home/ada/x", home, false)), "~/x");
+        assert_eq!(
+            render_prompt(r"\w", &facts("/home/ada/x", home, false)),
+            "~/x"
+        );
         assert_eq!(
             render_prompt(r"\w", &facts("/home/adamant", home, false)),
             "/home/adamant"
         );
-        assert_eq!(render_prompt(r"\W", &facts("/home/ada/x", home, false)), "x");
+        assert_eq!(
+            render_prompt(r"\W", &facts("/home/ada/x", home, false)),
+            "x"
+        );
         assert_eq!(render_prompt(r"\W", &facts("/", home, false)), "/");
         // `\W` is the basename of the TILDE form, so the home directory itself
         // is `~` and not the last component of `$HOME`.
@@ -1908,8 +1943,14 @@ mod tests {
     #[test]
     fn prompt_character_escapes() {
         let f = facts("/", "/home/ada", false);
-        assert_eq!(render_prompt(r"a\nb\rc\ad\ee\\f", &f), "a\nb\rc\x07d\x1be\\f");
-        assert_eq!(render_prompt(r"\[\e[32m\]x\[\e[0m\]", &f), "\x1b[32mx\x1b[0m");
+        assert_eq!(
+            render_prompt(r"a\nb\rc\ad\ee\\f", &f),
+            "a\nb\rc\x07d\x1be\\f"
+        );
+        assert_eq!(
+            render_prompt(r"\[\e[32m\]x\[\e[0m\]", &f),
+            "\x1b[32mx\x1b[0m"
+        );
     }
 
     /// `\nnn` is read the way bash's `read_octal` reads it, which is neither
@@ -1947,7 +1988,10 @@ mod tests {
         let status = "Name:\tsh\nUid:\t1000\t0\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n";
         assert_eq!(effective_uid_in(status), Some(0));
         // A real one, where they agree.
-        assert_eq!(effective_uid_in("Uid:\t1001\t1001\t1001\t1001\n"), Some(1001));
+        assert_eq!(
+            effective_uid_in("Uid:\t1001\t1001\t1001\t1001\n"),
+            Some(1001)
+        );
         // No `Uid:` line at all, and a malformed one.
         assert_eq!(effective_uid_in("Name:\tsh\n"), None);
         assert_eq!(effective_uid_in("Uid:\t1000\n"), None);
@@ -1990,9 +2034,15 @@ mod tests {
         let drawn = render_prompt(r"\[\e[32m\]\w\[\e[0m\]\$ ", &f);
         assert_eq!(display_cols(&drawn), "~$ ".len());
         // An OSC window title occupies no columns, however long it is.
-        assert_eq!(display_cols(&render_prompt(r"\[\e]0;a title\a\]\$ ", &f)), 2);
+        assert_eq!(
+            display_cols(&render_prompt(r"\[\e]0;a title\a\]\$ ", &f)),
+            2
+        );
         // ...and the ST-terminated spelling of the same thing.
-        assert_eq!(display_cols(&render_prompt("\\[\\e]0;a title\\e\\\\\\]\\$ ", &f)), 2);
+        assert_eq!(
+            display_cols(&render_prompt("\\[\\e]0;a title\\e\\\\\\]\\$ ", &f)),
+            2
+        );
         // A carriage return returns to the margin, so what preceded it is not
         // width; a bell draws nothing.
         assert_eq!(display_cols(&render_prompt(r"xxx\ry\a", &f)), 1);
@@ -2127,22 +2177,43 @@ mod tests {
     #[test]
     fn the_alt_keys_move_by_a_word() {
         let mut ed = Editor::new();
-        assert_eq!(submitted(&mut ed, b"echo foo bar baz\x1bbX\r"), "echo foo bar Xbaz");
-        assert_eq!(submitted(&mut ed, b"echo foo bar baz\x1bb\x1bbX\r"), "echo foo Xbar baz");
+        assert_eq!(
+            submitted(&mut ed, b"echo foo bar baz\x1bbX\r"),
+            "echo foo bar Xbaz"
+        );
+        assert_eq!(
+            submitted(&mut ed, b"echo foo bar baz\x1bb\x1bbX\r"),
+            "echo foo Xbar baz"
+        );
         assert_eq!(submitted(&mut ed, b"echo foo-bar\x1bbX\r"), "echo foo-Xbar");
         // At either end the move is a no-op rather than an error.
         assert_eq!(submitted(&mut ed, b"echo foo\x01\x1bbX\r"), "Xecho foo");
         assert_eq!(submitted(&mut ed, b"echo foo\x1bfX\r"), "echo fooX");
-        assert_eq!(submitted(&mut ed, b"echo foo bar\x01\x1bfX\r"), "echoX foo bar");
-        assert_eq!(submitted(&mut ed, b"echo foo bar\x01\x1bf\x1bfX\r"), "echo fooX bar");
+        assert_eq!(
+            submitted(&mut ed, b"echo foo bar\x01\x1bfX\r"),
+            "echoX foo bar"
+        );
+        assert_eq!(
+            submitted(&mut ed, b"echo foo bar\x01\x1bf\x1bfX\r"),
+            "echo fooX bar"
+        );
         // Uppercase is the same binding -- for all three letters, since each
         // is a separate arm and an unbound one types its byte instead.
         assert_eq!(submitted(&mut ed, b"echo foo bar\x1bBX\r"), "echo foo Xbar");
-        assert_eq!(submitted(&mut ed, b"echo foo bar\x01\x1bFX\r"), "echoX foo bar");
+        assert_eq!(
+            submitted(&mut ed, b"echo foo bar\x01\x1bFX\r"),
+            "echoX foo bar"
+        );
         let mut ed = Editor::new();
-        assert_eq!(submitted(&mut ed, b"echo aa bb\x01\x1bD\x05\x19\r"), " aa bbecho");
+        assert_eq!(
+            submitted(&mut ed, b"echo aa bb\x01\x1bD\x05\x19\r"),
+            " aa bbecho"
+        );
         // The cursor moves by BYTES over characters that are not one byte.
-        assert_eq!(submitted(&mut ed, "echo 日本 x\x1bb\x1bbX\r".as_bytes()), "echo X日本 x");
+        assert_eq!(
+            submitted(&mut ed, "echo 日本 x\x1bb\x1bbX\r".as_bytes()),
+            "echo X日本 x"
+        );
     }
 
     /// Alt-Backspace and Ctrl-W take DIFFERENT words, which is the whole
@@ -2161,7 +2232,10 @@ mod tests {
     #[test]
     fn the_alt_kills_feed_the_kill_buffer() {
         let mut ed = Editor::new();
-        assert_eq!(submitted(&mut ed, b"echo foo-bar\x1b\x7f\x19\r"), "echo foo-bar");
+        assert_eq!(
+            submitted(&mut ed, b"echo foo-bar\x1b\x7f\x19\r"),
+            "echo foo-bar"
+        );
         // Alt-D is a FORWARD kill, so a second one appends: `aa` then ` bb`.
         let mut ed = Editor::new();
         let mut keys = b"echo aa bb cc\x01".to_vec();
@@ -2178,7 +2252,10 @@ mod tests {
         // An Alt-D with nothing in front of it keeps the buffer, as every
         // other empty kill does.
         let mut ed = Editor::new();
-        assert_eq!(submitted(&mut ed, b"echo aa bb\x17\x05\x1bd\x19\r"), "echo aa bb");
+        assert_eq!(
+            submitted(&mut ed, b"echo aa bb\x17\x05\x1bd\x19\r"),
+            "echo aa bb"
+        );
         // Alt-Backspace is a BACKWARD kill, which only shows when it is the
         // SECOND kill of a run -- the same blind spot Ctrl-K has, since a
         // first kill lands the same way whichever side it is put on. Alt-D
@@ -2205,10 +2282,16 @@ mod tests {
     #[test]
     fn a_kill_can_be_yanked_back() {
         let mut ed = Editor::new();
-        assert_eq!(submitted(&mut ed, b"echo abc def\x17\x19\r"), "echo abc def");
+        assert_eq!(
+            submitted(&mut ed, b"echo abc def\x17\x19\r"),
+            "echo abc def"
+        );
         // The `X` proves where the cursor was left.
         assert_eq!(submitted(&mut ed, b"echo abc \x17\x19X\r"), "echo abc X");
-        assert_eq!(submitted(&mut ed, b"echo abc def\x17\x19\x19\r"), "echo abc defdef");
+        assert_eq!(
+            submitted(&mut ed, b"echo abc def\x17\x19\x19\r"),
+            "echo abc defdef"
+        );
         // Ctrl-Y with nothing killed is a no-op, not an empty insert that
         // moves the cursor.
         let mut ed = Editor::new();
@@ -2221,12 +2304,21 @@ mod tests {
     #[test]
     fn consecutive_kills_accumulate_in_typing_order() {
         let mut ed = Editor::new();
-        assert_eq!(submitted(&mut ed, b"echo abc def ghi\x17\x17\x19\r"), "echo abc def ghi");
-        assert_eq!(submitted(&mut ed, b"echo a b c d\x17\x17\x17\x19\r"), "echo a b c d");
+        assert_eq!(
+            submitted(&mut ed, b"echo abc def ghi\x17\x17\x19\r"),
+            "echo abc def ghi"
+        );
+        assert_eq!(
+            submitted(&mut ed, b"echo a b c d\x17\x17\x17\x19\r"),
+            "echo a b c d"
+        );
         // A FORWARD kill appends where a backward one prepends: Ctrl-K takes
         // `abc def`, Ctrl-U then takes `echo ` from in front of it.
         assert_eq!(
-            submitted(&mut ed, b"echo abc def\x01\x06\x06\x06\x06\x06\x0b\x15\x19\r"),
+            submitted(
+                &mut ed,
+                b"echo abc def\x01\x06\x06\x06\x06\x06\x0b\x15\x19\r"
+            ),
             "echo abc def"
         );
         // The same pair the other way round, which is the only way a Ctrl-K
@@ -2234,7 +2326,10 @@ mod tests {
         // shows: Ctrl-U leaves the rest of the line with the cursor at its
         // start, and the Ctrl-K after it appends rather than prepending.
         assert_eq!(
-            submitted(&mut ed, b"echo abc def\x01\x06\x06\x06\x06\x06\x15\x0b\x19\r"),
+            submitted(
+                &mut ed,
+                b"echo abc def\x01\x06\x06\x06\x06\x06\x15\x0b\x19\r"
+            ),
             "echo abc def"
         );
     }
@@ -2247,15 +2342,24 @@ mod tests {
         let mut ed = Editor::new();
         // Ctrl-B Ctrl-F leaves the cursor exactly where it was, so what breaks
         // the run is the KEY rather than the movement.
-        assert_eq!(submitted(&mut ed, b"echo abc def ghi\x17\x02\x06\x17\x19\r"), "echo abc def ");
+        assert_eq!(
+            submitted(&mut ed, b"echo abc def ghi\x17\x02\x06\x17\x19\r"),
+            "echo abc def "
+        );
         // A yank between two kills likewise: the second Ctrl-W starts fresh,
         // so the third accumulates onto it alone.
-        assert_eq!(submitted(&mut ed, b"echo abc def\x17\x19\x17\x17\x19\r"), "echo abc def");
+        assert_eq!(
+            submitted(&mut ed, b"echo abc def\x17\x19\x17\x17\x19\r"),
+            "echo abc def"
+        );
         // Ctrl-P: the recalled line's own Ctrl-W must not prepend to what was
         // killed off the line it replaced.
         let mut ed = Editor::new();
         ed.remember("echo hello world");
-        assert_eq!(submitted(&mut ed, b"echo aa bb\x17\x10\x17\x19\r"), "echo hello world");
+        assert_eq!(
+            submitted(&mut ed, b"echo aa bb\x17\x10\x17\x19\r"),
+            "echo hello world"
+        );
     }
 
     /// A kill that takes NOTHING keeps the buffer -- Ctrl-K at the end of a
@@ -2263,17 +2367,26 @@ mod tests {
     #[test]
     fn a_kill_that_takes_nothing_keeps_the_buffer_and_ends_the_run() {
         let mut ed = Editor::new();
-        assert_eq!(submitted(&mut ed, b"echo abc\x01\x0b\x0b\x19\r"), "echo abc");
+        assert_eq!(
+            submitted(&mut ed, b"echo abc\x01\x0b\x0b\x19\r"),
+            "echo abc"
+        );
         // The empty Ctrl-K sits between two kills: with the run ended, the
         // second Ctrl-W replaces `def` rather than prepending to it.
         let mut ed = Editor::new();
-        assert_eq!(submitted(&mut ed, b"echo abc def\x17\x0b\x17\x19\r"), "echo abc ");
+        assert_eq!(
+            submitted(&mut ed, b"echo abc def\x17\x0b\x17\x19\r"),
+            "echo abc "
+        );
         // ...and with the run ALREADY closed, which is the case an operator
         // reaches by killing, moving, and pressing Ctrl-K at the end of a
         // line. Both branches keep the buffer, and only one of them was
         // reachable from the two cases above.
         let mut ed = Editor::new();
-        assert_eq!(submitted(&mut ed, b"echo aa bb\x17\x02\x06\x0b\x19\r"), "echo aa bb");
+        assert_eq!(
+            submitted(&mut ed, b"echo aa bb\x17\x02\x06\x0b\x19\r"),
+            "echo aa bb"
+        );
     }
 
     /// Every kill ends the run when it takes nothing, not only Ctrl-K. An
@@ -2309,7 +2422,10 @@ mod tests {
         assert_eq!(submitted(&mut ed, b"abc\x01\x0b\x19\x7f\x19\r"), "ababc");
         let mut ed = Editor::new();
         // Same with delete-forward, which is Ctrl-D anywhere but an empty line.
-        assert_eq!(submitted(&mut ed, b"abc\x01\x0b\x19\x01\x04\x19\r"), "abcbc");
+        assert_eq!(
+            submitted(&mut ed, b"abc\x01\x0b\x19\x01\x04\x19\r"),
+            "abcbc"
+        );
     }
 
     /// Both halves work at the CURSOR: Ctrl-W takes the word in front of it
@@ -2327,7 +2443,10 @@ mod tests {
         // A yank with text after the cursor lands where the cursor is.
         let mut ed = Editor::new();
         assert_eq!(submitted(&mut ed, b"echo aa bb\x17\r"), "echo aa ");
-        assert_eq!(submitted(&mut ed, b"echo XY\x01\x06\x06\x06\x06\x06\x19\r"), "echo bbXY");
+        assert_eq!(
+            submitted(&mut ed, b"echo XY\x01\x06\x06\x06\x06\x06\x19\r"),
+            "echo bbXY"
+        );
     }
 
     /// The buffer outlives the LINE, which is what makes the kill keys a way
@@ -2341,7 +2460,10 @@ mod tests {
         // empty, so its first kill takes nothing and closes the run itself
         // whatever it inherited. This pins only that the Ctrl-W replaces
         // `def` rather than prepending `two` to it.
-        assert_eq!(submitted(&mut ed, b"echo one two\x17\x19\r"), "echo one two");
+        assert_eq!(
+            submitted(&mut ed, b"echo one two\x17\x19\r"),
+            "echo one two"
+        );
     }
 
     /// The buffer is text rather than bytes, so a kill that ends mid-character
@@ -2378,7 +2500,11 @@ mod tests {
             // Never INTO the last column: a character printed there arms the
             // auto-wrap on a terminal that wraps at once, and the redraw's `\r`
             // then lands a row below the prompt, every keystroke.
-            assert!(text.chars().count() < 20, "row is {} wide", text.chars().count());
+            assert!(
+                text.chars().count() < 20,
+                "row is {} wide",
+                text.chars().count()
+            );
             assert!(col < 19, "cursor at column {col} is off the row");
         }
         // At the end, the cursor sits just inside the reserved column with the
@@ -2411,7 +2537,11 @@ mod tests {
         for pos in [0usize, 3, 6, 9, 12, 15] {
             let at = prev_boundary(&wide, pos.min(wide.len()));
             let (text, col) = visible("$ ", &wide, at, 10);
-            assert!(display_cols(&text) < 10, "row is {} wide: {text:?}", display_cols(&text));
+            assert!(
+                display_cols(&text) < 10,
+                "row is {} wide: {text:?}",
+                display_cols(&text)
+            );
             assert!(col < 10, "cursor at {col} is off a ten-column row");
         }
         // The narrow case is unchanged: five `a`s fit beside the prompt.
@@ -2433,8 +2563,14 @@ mod tests {
 
         let coloured = "\x1b[32m$ \x1b[0m";
         let (text, col) = visible(coloured, "echo hi", 7, 80);
-        assert!(text.starts_with(coloured), "the colours must still be drawn");
-        assert_eq!(col, 9, "measured as two columns, exactly as a plain `$ ` is");
+        assert!(
+            text.starts_with(coloured),
+            "the colours must still be drawn"
+        );
+        assert_eq!(
+            col, 9,
+            "measured as two columns, exactly as a plain `$ ` is"
+        );
         assert_eq!(visible("$ ", "echo hi", 7, 80).1, col);
     }
 
@@ -2471,7 +2607,11 @@ mod tests {
 
         ed.browse(-1, &mut browse, &mut buf, &mut pos, &mut draft);
         assert_eq!((buf.as_str(), draft.as_str()), ("second", "typing"));
-        assert_eq!(pos, buf.len(), "the cursor lands at the end of a recalled line");
+        assert_eq!(
+            pos,
+            buf.len(),
+            "the cursor lands at the end of a recalled line"
+        );
         ed.browse(-1, &mut browse, &mut buf, &mut pos, &mut draft);
         assert_eq!(buf, "first");
         // Past the oldest entry, nothing moves.
@@ -2495,7 +2635,10 @@ mod tests {
         ed.remember("   ");
         ed.remember("");
         ed.remember("echo two");
-        assert_eq!(ed.history, vec!["echo one".to_string(), "echo two".to_string()]);
+        assert_eq!(
+            ed.history,
+            vec!["echo one".to_string(), "echo two".to_string()]
+        );
 
         let mut ed = Editor::new();
         for i in 0..HISTORY_MAX + 10 {
@@ -2529,7 +2672,11 @@ mod tests {
         ] {
             let mut rest = bytes.iter().skip(1).copied();
             let first = bytes.first().copied().unwrap_or(0);
-            assert_eq!(character(|| rest.next(), first), (want, back), "{bytes:02x?}");
+            assert_eq!(
+                character(|| rest.next(), first),
+                (want, back),
+                "{bytes:02x?}"
+            );
         }
     }
 
@@ -2599,7 +2746,10 @@ mod tests {
         // the completion ones is about.
         let c = |_: &str| Vec::new();
         let e = |_: &str, _: &str| Vec::new();
-        let comp = complete::Source { commands: &c, entries: &e };
+        let comp = complete::Source {
+            commands: &c,
+            entries: &e,
+        };
         typed_in(ed, keys, width, interruptible, &comp)
     }
 
@@ -2613,8 +2763,12 @@ mod tests {
         let mut src = keys.iter().copied();
         let mut next = || src.next();
         let mut w = || Some(width);
-        let mut k =
-            Keys { next: &mut next, width: &mut w, intr: Some(0x03), eof: Some(0x04) };
+        let mut k = Keys {
+            next: &mut next,
+            width: &mut w,
+            intr: Some(0x03),
+            eof: Some(0x04),
+        };
         let mut out: Vec<u8> = Vec::new();
         let got = ed.edit("$ ", &mut k, &mut out, interruptible, comp);
         (got, String::from_utf8_lossy(&out).into_owned())
@@ -2634,7 +2788,10 @@ mod tests {
     #[test]
     fn tab_completes_and_a_second_tab_lists() {
         let mut ed = Editor::new();
-        let cmds: Vec<String> = ["echo", "echoes"].iter().map(|s| (*s).to_string()).collect();
+        let cmds: Vec<String> = ["echo", "echoes"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         let c = |p: &str| cmds.iter().filter(|s| s.starts_with(p)).cloned().collect();
         // TWO entries, so a Tab on an empty word would LIST -- which is what
         // the unique-match case below has to not do.
@@ -2644,7 +2801,10 @@ mod tests {
                 .filter(|(n, _)| n.starts_with(p))
                 .collect()
         };
-        let comp = complete::Source { commands: &c, entries: &e };
+        let comp = complete::Source {
+            commands: &c,
+            entries: &e,
+        };
         // One Tab puts the shared prefix in and lists nothing.
         let (got, drawn) = typed_in(&mut ed, b"ec\t\r", 80, true, &comp);
         assert!(matches!(got, Input::Line(ref t) if t == "echo"), "{got:?}");
@@ -2655,12 +2815,21 @@ mod tests {
         assert!(drawn.contains("echo    echoes\n"), "no listing: {drawn:?}");
         // A key between the two Tabs clears it, as ash's `lastWasTab` is.
         let (_, drawn) = typed_in(&mut ed, b"ec\t\x06\t\r", 80, true, &comp);
-        assert!(!drawn.contains("echo    echoes\n"), "listed anyway: {drawn:?}");
+        assert!(
+            !drawn.contains("echo    echoes\n"),
+            "listed anyway: {drawn:?}"
+        );
         // A unique match finishes the word with a space, a directory with `/`.
         let (got, _) = typed_in(&mut ed, b"echoe\t\r", 80, true, &comp);
-        assert!(matches!(got, Input::Line(ref t) if t == "echoes "), "{got:?}");
+        assert!(
+            matches!(got, Input::Line(ref t) if t == "echoes "),
+            "{got:?}"
+        );
         let (got, _) = typed_in(&mut ed, b"cat e\t\r", 80, true, &comp);
-        assert!(matches!(got, Input::Line(ref t) if t == "cat elm/"), "{got:?}");
+        assert!(
+            matches!(got, Input::Line(ref t) if t == "cat elm/"),
+            "{got:?}"
+        );
         // Nothing matches: the tab is typed.
         let (got, _) = typed_in(&mut ed, b"zz\t\r", 80, true, &comp);
         assert!(matches!(got, Input::Line(ref t) if t == "zz\t"), "{got:?}");
@@ -2668,7 +2837,10 @@ mod tests {
         // double-tab: without that, `echoe<Tab><Tab>` sees an empty word past
         // a command and dumps the whole directory.
         let (_, drawn) = typed_in(&mut ed, b"echoe\t\t\r", 80, true, &comp);
-        assert!(!drawn.contains("elm"), "the second Tab listed a directory: {drawn:?}");
+        assert!(
+            !drawn.contains("elm"),
+            "the second Tab listed a directory: {drawn:?}"
+        );
         // ...and the Tab after a LISTING does nothing, with the one after that
         // listing again -- so four Tabs print two listings, not three.
         let (_, drawn) = typed_in(&mut ed, b"ec\t\t\t\t\r", 80, true, &comp);
@@ -2681,7 +2853,10 @@ mod tests {
         // Ctrl-A to the start, Ctrl-F twice, insert, Ctrl-E to the end.
         assert_eq!(submitted(&mut ed, b"cde\x01\x06\x06X\x05Z\r"), "cdXeZ");
         // Ctrl-K cuts to the end, Ctrl-U to the start.
-        assert_eq!(submitted(&mut ed, b"keep-this\x02\x02\x02\x02\x0b\r"), "keep-");
+        assert_eq!(
+            submitted(&mut ed, b"keep-this\x02\x02\x02\x02\x0b\r"),
+            "keep-"
+        );
         assert_eq!(submitted(&mut ed, b"drop me\x15kept\r"), "kept");
         // Ctrl-W takes the word before the cursor. readline's rubout skips the
         // blanks BEFORE the word and stops at the ones after it.
@@ -2725,7 +2900,10 @@ mod tests {
         // Drawn as a space: one buffer character, one column, so every column
         // this module computes stays where the terminal put it.
         let (_, drawn) = typed(&mut ed, b"a\tb\r", 80, true);
-        assert!(drawn.contains("$ a b"), "tab was not drawn as one column: {drawn:?}");
+        assert!(
+            drawn.contains("$ a b"),
+            "tab was not drawn as one column: {drawn:?}"
+        );
         // Backspacing over it removes one character, not a column of them.
         assert_eq!(submitted(&mut ed, b"a\tb\x7f\x7f\r"), "a");
     }
@@ -2736,7 +2914,10 @@ mod tests {
         // `trap '' INT` in force: the byte stands in for a signal that does
         // nothing, so it does nothing here either.
         let (got, _) = typed(&mut ed, b"keep\x03 going\r", 80, false);
-        assert!(matches!(got, Input::Line(ref t) if t == "keep going"), "{got:?}");
+        assert!(
+            matches!(got, Input::Line(ref t) if t == "keep going"),
+            "{got:?}"
+        );
         // Interruptible: the line is abandoned and the shell told so.
         let (got, drawn) = typed(&mut ed, b"junk\x03", 80, true);
         assert!(matches!(got, Input::Interrupted), "{got:?}");
@@ -2752,14 +2933,25 @@ mod tests {
         let mut src = b"a\x00b\r".iter().copied();
         let mut next = || src.next();
         let mut w = || Some(80u16);
-        let mut k = Keys { next: &mut next, width: &mut w, intr: None, eof: None };
+        let mut k = Keys {
+            next: &mut next,
+            width: &mut w,
+            intr: None,
+            eof: None,
+        };
         let mut out: Vec<u8> = Vec::new();
         let c = |_: &str| Vec::new();
         let e = |_: &str, _: &str| Vec::new();
-        let got = ed.edit("$ ", &mut k, &mut out, true, &complete::Source {
-            commands: &c,
-            entries: &e,
-        });
+        let got = ed.edit(
+            "$ ",
+            &mut k,
+            &mut out,
+            true,
+            &complete::Source {
+                commands: &c,
+                entries: &e,
+            },
+        );
         assert!(matches!(got, Input::Line(ref t) if t == "ab"), "{got:?}");
     }
 
@@ -2769,7 +2961,10 @@ mod tests {
         // Ctrl-D on an empty line ends the session, on its own row.
         let (got, drawn) = typed(&mut ed, b"\x04", 80, true);
         assert!(matches!(got, Input::Eof), "{got:?}");
-        assert!(drawn.ends_with('\n'), "the cursor was left on the prompt: {drawn:?}");
+        assert!(
+            drawn.ends_with('\n'),
+            "the cursor was left on the prompt: {drawn:?}"
+        );
         // Mid-line it deletes forward, so a stray one cannot end it.
         assert_eq!(submitted(&mut ed, b"abc\x02\x04\r"), "ab");
         // A closed stdin mid-line is end of input, not an empty line.
@@ -2837,11 +3032,18 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 16);
         ed.remember("line16");
         // Now rewritten to the last four, newest last.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "line13\nline14\nline15\nline16\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "line13\nline14\nline15\nline16\n"
+        );
         // ...and the in-memory list agrees with the file.
         assert_eq!(ed.history, ["line13", "line14", "line15", "line16"]);
         // No temporary left beside it.
-        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
         assert_eq!(left.len(), 1, "a temporary was left behind: {left:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2862,7 +3064,10 @@ mod tests {
         }
         // A sibling appends without this session knowing.
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(b"sibling\n").unwrap();
         }
         // ...and the next line takes the count past 2 * 4 and trims.
@@ -2894,7 +3099,11 @@ mod tests {
         for i in 0..10 {
             ed.remember(&format!("x{i}"));
         }
-        assert_eq!(std::fs::read_to_string(&decoy).unwrap(), "PRECIOUS\n", "the decoy was written");
+        assert_eq!(
+            std::fs::read_to_string(&decoy).unwrap(),
+            "PRECIOUS\n",
+            "the decoy was written"
+        );
         // The trim declined, so the history is whole rather than truncated --
         // and the symlink is still there, since it was never ours to remove.
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 10);
@@ -2920,14 +3129,20 @@ mod tests {
         for i in 0..10 {
             ed.remember(&format!("y{i}"));
         }
-        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink(), "the link was replaced");
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "the link was replaced"
+        );
         // The trim fired on `y8`, keeping two, and `y9` was appended after it:
         // between trims the file is allowed to stand above the kept size,
         // which is what makes trimming lazy.
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "y7\ny8\ny9\n");
         // ...and appending after the trim still reaches the target.
         ed.remember("after");
-        assert_eq!(std::fs::read_to_string(&real).unwrap(), "y7\ny8\ny9\nafter\n");
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "y7\ny8\ny9\nafter\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2948,11 +3163,22 @@ mod tests {
         }
         std::fs::write(&path, &body).unwrap();
         let kept = read_history(&path, 3).unwrap().kept;
-        assert_eq!(kept, [format!("cmd{}", n - 3), format!("cmd{}", n - 2), format!("cmd{}", n - 1)]);
+        assert_eq!(
+            kept,
+            [
+                format!("cmd{}", n - 3),
+                format!("cmd{}", n - 2),
+                format!("cmd{}", n - 1)
+            ]
+        );
         // Every line that came back is whole -- the partial one at the window's
         // edge was dropped rather than offered as a command.
         let all = read_history(&path, 100_000).unwrap().kept;
-        assert!(all.iter().all(|l| l.starts_with("cmd")), "a fragment survived: {:?}", all.first());
+        assert!(
+            all.iter().all(|l| l.starts_with("cmd")),
+            "a fragment survived: {:?}",
+            all.first()
+        );
         // A file with no end at all returns rather than growing without bound.
         if std::fs::metadata("/dev/zero").is_ok() {
             let kept = read_history(Path::new("/dev/zero"), 5).unwrap().kept;
@@ -2993,7 +3219,12 @@ mod tests {
         ed.open_history(&mut sh);
         ed.remember("secret");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "a history readable by anyone else: {:o}", mode);
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "a history readable by anyone else: {:o}",
+            mode
+        );
         // A mode the operator chose survives the trim.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
         for i in 0..10 {
@@ -3018,10 +3249,16 @@ mod tests {
         let mut ed = Editor::new();
         ed.open_history(&mut sh);
         ed.remember("gamma");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta\ngamma\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha\nbeta\ngamma\n"
+        );
         // Once, not before every line.
         ed.remember("delta");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta\ngamma\ndelta\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha\nbeta\ngamma\ndelta\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3040,8 +3277,14 @@ mod tests {
             return;
         }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(read_history(&path, 2).is_none(), "an unreadable file read as empty");
-        assert!(rewrite_history(&path, 2).is_none(), "an unreadable file was rewritten");
+        assert!(
+            read_history(&path, 2).is_none(),
+            "an unreadable file read as empty"
+        );
+        assert!(
+            rewrite_history(&path, 2).is_none(),
+            "an unreadable file was rewritten"
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep1\nkeep2\n");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3062,7 +3305,11 @@ mod tests {
             v.value = None;
         }
         assert_eq!(history_path(&mut sh), Some(dir.join(".ash_history")));
-        assert_eq!(sh.get_var("HISTFILE"), None, "the readonly name was written to");
+        assert_eq!(
+            sh.get_var("HISTFILE"),
+            None,
+            "the readonly name was written to"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3077,7 +3324,10 @@ mod tests {
         // Unset: defaulted to $HOME/.ash_history and written back, so
         // `echo $HISTFILE` names the file in use.
         assert_eq!(history_path(&mut sh), Some(dir.join(".ash_history")));
-        assert_eq!(sh.get_var("HISTFILE").as_deref(), Some(&*dir.join(".ash_history").to_string_lossy()));
+        assert_eq!(
+            sh.get_var("HISTFILE").as_deref(),
+            Some(&*dir.join(".ash_history").to_string_lossy())
+        );
         // Set-and-empty names no file, and is not defaulted over.
         sh.set_var("HISTFILE", "").unwrap();
         assert_eq!(history_path(&mut sh), None);
@@ -3087,13 +3337,25 @@ mod tests {
         s.set_var("HISTFILESIZE", "10").unwrap();
         assert_eq!(history_size(&s).get(), 10);
         s.set_var("HISTFILESIZE", "0").unwrap();
-        assert_eq!(history_size(&s).get(), 1, "zero asks for one line, not for none");
+        assert_eq!(
+            history_size(&s).get(),
+            1,
+            "zero asks for one line, not for none"
+        );
         s.set_var("HISTFILESIZE", "-5").unwrap();
         assert_eq!(history_size(&s).get(), 1);
         s.set_var("HISTFILESIZE", "99999").unwrap();
-        assert_eq!(history_size(&s).get(), HISTORY_MAX, "capped at the built-in maximum");
+        assert_eq!(
+            history_size(&s).get(),
+            HISTORY_MAX,
+            "capped at the built-in maximum"
+        );
         s.set_var("HISTFILESIZE", "50x").unwrap();
-        assert_eq!(history_size(&s).get(), 50, "atoi stops at the first non-digit");
+        assert_eq!(
+            history_size(&s).get(),
+            50,
+            "atoi stops at the first non-digit"
+        );
         s.set_var("HISTFILESIZE", "x").unwrap();
         assert_eq!(history_size(&s).get(), 1, "...and reads nothing as zero");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3163,7 +3425,10 @@ mod tests {
         // prompt the cursor is at column 7.
         let (_, drawn) = typed(&mut ed, b"\x12alpha\r", 80, true);
         assert!(drawn.contains("(reverse-i-search)'alpha': "), "{drawn:?}");
-        assert!(drawn.contains("$ grep alpha\x1b[K\r\x1b[7C"), "cursor not on the match: {drawn:?}");
+        assert!(
+            drawn.contains("$ grep alpha\x1b[K\r\x1b[7C"),
+            "cursor not on the match: {drawn:?}"
+        );
     }
 
     /// Backspace widens the pattern again, and a key that would match nothing
@@ -3176,8 +3441,14 @@ mod tests {
         ed.remember("ls -l");
         // `echo hello` has no `x`, so the `x` is dropped and `ech` stands.
         let (got, drawn) = typed(&mut ed, b"\x12echx\r", 80, true);
-        assert!(matches!(got, Input::Line(ref t) if t == "echo hello"), "{got:?}");
-        assert!(drawn.contains('\x07'), "no bell for a key that matched nothing");
+        assert!(
+            matches!(got, Input::Line(ref t) if t == "echo hello"),
+            "{got:?}"
+        );
+        assert!(
+            drawn.contains('\x07'),
+            "no bell for a key that matched nothing"
+        );
         assert_eq!(last_search(&drawn), "ech", "the failed key stuck");
 
         // Backspace widens the pattern, and the proof is that a WIDER one
@@ -3231,7 +3502,10 @@ mod tests {
         // continuation byte, so the character is dropped and the `l` is the
         // next key -- leaving `hell`, not `hel`.
         let (got, drawn) = typed(&mut ed, b"\x12hel\xc3l\r", 80, true);
-        assert!(matches!(got, Input::Line(ref t) if t == "echo hello"), "{got:?}");
+        assert!(
+            matches!(got, Input::Line(ref t) if t == "echo hello"),
+            "{got:?}"
+        );
         assert_eq!(last_search(&drawn), "hell", "the pushed-back byte was lost");
     }
 
@@ -3245,7 +3519,10 @@ mod tests {
         // next lands there.
         assert_eq!(submitted(&mut ed, b"\x12hello\x01X\r"), "Xecho hello");
         // Ctrl-C abandons the line, as it does anywhere else.
-        assert!(matches!(typed(&mut ed, b"\x12hello\x03", 80, true).0, Input::Interrupted));
+        assert!(matches!(
+            typed(&mut ed, b"\x12hello\x03", 80, true).0,
+            Input::Interrupted
+        ));
         // An arrow key arrives as ESC and is re-dispatched whole, so it browses
         // rather than typing `[A` into the line.
         assert_eq!(submitted(&mut ed, b"\x12hello\x1b[A\r"), "echo hello");
@@ -3253,7 +3530,10 @@ mod tests {
         assert_eq!(submitted(&mut ed, b"draft\x12zz\r"), "draft");
         // ...and the real prompt is back before the line is handed over.
         let (_, drawn) = typed(&mut ed, b"\x12hello\r", 80, true);
-        assert!(drawn.ends_with("$ echo hello\x1b[K\r\x1b[7C"), "prompt not restored: {drawn:?}");
+        assert!(
+            drawn.ends_with("$ echo hello\x1b[K\r\x1b[7C"),
+            "prompt not restored: {drawn:?}"
+        );
     }
 
     /// A multi-byte pattern is matched by CHARACTER and the cursor lands on a
@@ -3274,11 +3554,17 @@ mod tests {
         // then inserts ON the boundary rather than aborting inside `insert`.
         // (Typing WITHOUT leaving would narrow the pattern instead: inside a
         // search every printable key is pattern text.)
-        assert_eq!(submitted(&mut ed, b"\x12\xe6\x9c\xac\x0cX\r"), "echo 日X本語");
+        assert_eq!(
+            submitted(&mut ed, b"\x12\xe6\x9c\xac\x0cX\r"),
+            "echo 日X本語"
+        );
         // Backspacing the pattern takes a whole CHARACTER, so it is empty
         // again rather than half of one -- and an empty pattern matches at
         // the start of the line it is already on.
-        assert_eq!(submitted(&mut ed, b"\x12\xe6\x9c\xac\x7f\x0cq\r"), "qecho 日本語");
+        assert_eq!(
+            submitted(&mut ed, b"\x12\xe6\x9c\xac\x7f\x0cq\r"),
+            "qecho 日本語"
+        );
     }
 
     /// A REBOUND interrupt or end-of-input byte ends the search too. With
@@ -3294,14 +3580,25 @@ mod tests {
         let mut src = b"\x12hellox".iter().copied();
         let mut next = || src.next();
         let mut w = || Some(80u16);
-        let mut k = Keys { next: &mut next, width: &mut w, intr: Some(b'x'), eof: Some(0x04) };
+        let mut k = Keys {
+            next: &mut next,
+            width: &mut w,
+            intr: Some(b'x'),
+            eof: Some(0x04),
+        };
         let mut out: Vec<u8> = Vec::new();
         let c = |_: &str| Vec::new();
         let e = |_: &str, _: &str| Vec::new();
-        let got = ed.edit("$ ", &mut k, &mut out, true, &complete::Source {
-            commands: &c,
-            entries: &e,
-        });
+        let got = ed.edit(
+            "$ ",
+            &mut k,
+            &mut out,
+            true,
+            &complete::Source {
+                commands: &c,
+                entries: &e,
+            },
+        );
         assert!(matches!(got, Input::Interrupted), "{got:?}");
     }
 
@@ -3356,7 +3653,9 @@ mod tests {
         // than a dependency, seeded fixed so a failure reproduces.
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut rand = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as u32
         };
         let mut ed = Editor::new();

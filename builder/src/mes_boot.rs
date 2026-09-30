@@ -547,9 +547,13 @@ enum Ia32Verdict {
 /// runtime override the config alone can't see; that path still ENOEXECs at
 /// the exec below, just with a less specific message.)
 fn ia32_from_kconfig(text: &str) -> Ia32Verdict {
-    if ["CONFIG_IA32_EMULATION=y", "CONFIG_COMPAT_32=y", "CONFIG_X86_32=y"]
-        .iter()
-        .any(|k| text.contains(k))
+    if [
+        "CONFIG_IA32_EMULATION=y",
+        "CONFIG_COMPAT_32=y",
+        "CONFIG_X86_32=y",
+    ]
+    .iter()
+    .any(|k| text.contains(k))
     {
         return Ia32Verdict::Supported;
     }
@@ -605,14 +609,12 @@ fn preflight_ia32() -> Result<(), String> {
 /// unprovable case).
 fn ia32_preflight_result(verdict: Ia32Verdict) -> Result<(), String> {
     match verdict {
-        Ia32Verdict::Unsupported => Err(
-            "the build kernel cannot execute 32-bit ELF binaries \
+        Ia32Verdict::Unsupported => Err("the build kernel cannot execute 32-bit ELF binaries \
              (CONFIG_IA32_EMULATION is not set): the mes rung builds and runs bin/mes-m2, an \
              i686/ELFCLASS32 binary, and every i686 mesboot rung up to the x86-64 cross \
              transition the same — none can execute on this kernel. Build on a kernel with \
              CONFIG_IA32_EMULATION=y (and without the ia32_emulation=0 boot parameter)."
-                .to_string(),
-        ),
+            .to_string()),
         // Supported, or Unknown (unproven — do not hard-fail; the exec is the backstop).
         Ia32Verdict::Supported | Ia32Verdict::Unknown => Ok(()),
     }
@@ -730,10 +732,16 @@ fn configure(cfg: &Cfg) -> Result<(), String> {
             ("AR", format!("{top}/pre-inst-env mesar")),
             ("CC", format!("{top}/pre-inst-env mescc")),
             ("DIFF", format!("{top}/pre-inst-env diff.scm")),
-            ("BLOOD_ELF", ps(&cfg.stage0)?.to_string() + "/AMD64/artifact/blood-elf-0"),
+            (
+                "BLOOD_ELF",
+                ps(&cfg.stage0)?.to_string() + "/AMD64/artifact/blood-elf-0",
+            ),
             ("HEX2", ps(&cfg.stage0)?.to_string() + "/AMD64/bin/hex2"),
             ("M1", ps(&cfg.stage0)?.to_string() + "/AMD64/bin/M1"),
-            ("M2_PLANET", ps(&cfg.stage0)?.to_string() + "/AMD64/bin/M2-Planet"),
+            (
+                "M2_PLANET",
+                ps(&cfg.stage0)?.to_string() + "/AMD64/bin/M2-Planet",
+            ),
             ("KAEM", ps(&cfg.stage0)?.to_string() + "/AMD64/bin/kaem"),
         ]
         .into_iter()
@@ -749,7 +757,11 @@ fn configure(cfg: &Cfg) -> Result<(), String> {
 
     write(
         &cfg.top.join("include/mes/config.h"),
-        format!("#undef SYSTEM_LIBC\n#define MES_VERSION \"{}\"\n", cfg.version).as_bytes(),
+        format!(
+            "#undef SYSTEM_LIBC\n#define MES_VERSION \"{}\"\n",
+            cfg.version
+        )
+        .as_bytes(),
     )?;
     for h in ["kernel-stat.h", "signal.h", "syscall.h"] {
         cp(
@@ -857,8 +869,20 @@ fn mescc(cfg: &Cfg, dir: &Path, args: &[String]) -> Result<(), String> {
 /// `$AM_CPPFLAGS $CPPFLAGS $AM_CFLAGS $CFLAGS` word-split in that order.
 fn mescc_lib_flags() -> Vec<String> {
     s_vec(&[
-        "-D", "HAVE_CONFIG_H=1", "-I", "../include", "-I", "../include", "-I", "include",
-        "-D", "HAVE_CONFIG_H=1", "-I", "include", "-L", "../lib",
+        "-D",
+        "HAVE_CONFIG_H=1",
+        "-I",
+        "../include",
+        "-I",
+        "../include",
+        "-I",
+        "include",
+        "-D",
+        "HAVE_CONFIG_H=1",
+        "-I",
+        "include",
+        "-L",
+        "../lib",
     ])
 }
 
@@ -918,7 +942,8 @@ fn mescc_lib_phase(cfg: &Cfg) -> Result<(), String> {
     }
 
     cp(
-        &cfg.top.join(format!("lib/linux/{MES_CPU}-mes-mescc/crt1.c")),
+        &cfg.top
+            .join(format!("lib/linux/{MES_CPU}-mes-mescc/crt1.c")),
         &lib.join("crt1.c"),
     )?;
     let mut crt_args = vec!["-c".to_string()];
@@ -940,8 +965,20 @@ fn mescc_lib_phase(cfg: &Cfg) -> Result<(), String> {
 /// `bin/mes` (which until now was mes-m2).
 fn mes_link_phase(cfg: &Cfg) -> Result<(), String> {
     let flags = s_vec(&[
-        "-D", "HAVE_CONFIG_H=1", "-I", "include", "-I", "../include", "-I", "include",
-        "-D", "HAVE_CONFIG_H=1", "-I", "include", "-L", "lib",
+        "-D",
+        "HAVE_CONFIG_H=1",
+        "-I",
+        "include",
+        "-I",
+        "../include",
+        "-I",
+        "include",
+        "-D",
+        "HAVE_CONFIG_H=1",
+        "-I",
+        "include",
+        "-L",
+        "lib",
     ]);
     let mut objects = Vec::new();
     for c in &mes_sources() {
@@ -953,7 +990,13 @@ fn mes_link_phase(cfg: &Cfg) -> Result<(), String> {
         objects.push(o);
     }
     let mut link = s_vec(&[
-        "-L", "lib", "-nostdlib", "-o", "bin/mes-mescc", "-L", "mescc-lib",
+        "-L",
+        "lib",
+        "-nostdlib",
+        "-o",
+        "bin/mes-mescc",
+        "-L",
+        "mescc-lib",
         "mescc-lib/crt1.o",
     ]);
     link.extend(objects);
@@ -976,9 +1019,7 @@ fn gcc_source_lib_phase(cfg: &Cfg) -> Result<(), String> {
 
     let crt_dir = cfg.top.join(format!("lib/{MES_KERNEL}/{MES_CPU}-mes-gcc"));
     let mut found_crt = false;
-    for ent in
-        fs::read_dir(&crt_dir).map_err(|e| format!("read {}: {e}", crt_dir.display()))?
-    {
+    for ent in fs::read_dir(&crt_dir).map_err(|e| format!("read {}: {e}", crt_dir.display()))? {
         let ent = ent.map_err(|e| format!("read {}: {e}", crt_dir.display()))?;
         let name = ent.file_name();
         let n = name
@@ -1017,7 +1058,10 @@ fn gcc_source_lib_phase(cfg: &Cfg) -> Result<(), String> {
         write(&gcc_lib.join(name), &body)?;
         cp(&gcc_lib.join(name), &dest.join(name))?;
     }
-    cp(&cfg.top.join("lib/posix/getopt.c"), &dest.join("libgetopt.c"))
+    cp(
+        &cfg.top.join("lib/posix/getopt.c"),
+        &dest.join("libgetopt.c"),
+    )
 }
 
 /// install.sh under the rung's config: the bins and wrapper scripts, the doc
@@ -1047,7 +1091,14 @@ fn install_phase(cfg: &Cfg) -> Result<(), String> {
 
     let docdir = out.join("share/doc/mes");
     for doc in [
-        "AUTHORS", "BOOTSTRAP", "COPYING", "HACKING", "NEWS", "README", "ROADMAP", "ChangeLog",
+        "AUTHORS",
+        "BOOTSTRAP",
+        "COPYING",
+        "HACKING",
+        "NEWS",
+        "README",
+        "ROADMAP",
+        "ChangeLog",
     ] {
         cp(&top.join(doc), &docdir.join(doc))?;
     }
@@ -1062,7 +1113,10 @@ fn install_phase(cfg: &Cfg) -> Result<(), String> {
         &top.join(format!("lib/{MES_KERNEL}/{MES_CPU}-mes")),
         &out.join(format!("lib/{MES_KERNEL}/{MES_CPU}-mes")),
     )?;
-    t(&top.join(format!("gcc-lib/{MES_CPU}-mes")), &out.join("lib"))?;
+    t(
+        &top.join(format!("gcc-lib/{MES_CPU}-mes")),
+        &out.join("lib"),
+    )?;
     t(
         &top.join(format!("mescc-lib/{MES_CPU}-mes")),
         &out.join(format!("lib/{MES_CPU}-mes")),
@@ -1109,21 +1163,35 @@ mod tests {
             Ia32Verdict::Supported
         ));
         // Older/other configs where the compat symbols carry 32-bit support.
-        assert!(matches!(ia32_from_kconfig("CONFIG_COMPAT_32=y\n"), Ia32Verdict::Supported));
-        assert!(matches!(ia32_from_kconfig("CONFIG_X86_32=y\n"), Ia32Verdict::Supported));
+        assert!(matches!(
+            ia32_from_kconfig("CONFIG_COMPAT_32=y\n"),
+            Ia32Verdict::Supported
+        ));
+        assert!(matches!(
+            ia32_from_kconfig("CONFIG_X86_32=y\n"),
+            Ia32Verdict::Supported
+        ));
         // Explicitly disabled — both Kconfig spellings are a definitive NO.
         assert!(matches!(
             ia32_from_kconfig("# CONFIG_IA32_EMULATION is not set\n"),
             Ia32Verdict::Unsupported
         ));
-        assert!(matches!(ia32_from_kconfig("CONFIG_IA32_EMULATION=n\n"), Ia32Verdict::Unsupported));
+        assert!(matches!(
+            ia32_from_kconfig("CONFIG_IA32_EMULATION=n\n"),
+            Ia32Verdict::Unsupported
+        ));
         // Neither present — cannot prove a negative, so Unknown (caller passes).
-        assert!(matches!(ia32_from_kconfig("CONFIG_SMP=y\n"), Ia32Verdict::Unknown));
+        assert!(matches!(
+            ia32_from_kconfig("CONFIG_SMP=y\n"),
+            Ia32Verdict::Unknown
+        ));
         assert!(matches!(ia32_from_kconfig(""), Ia32Verdict::Unknown));
         // The "is not set" comment must NOT be read as enabled by a loose
         // substring match: an enabled `=y` line elsewhere still wins.
         assert!(matches!(
-            ia32_from_kconfig("# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set\nCONFIG_IA32_EMULATION=y\n"),
+            ia32_from_kconfig(
+                "# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set\nCONFIG_IA32_EMULATION=y\n"
+            ),
             Ia32Verdict::Supported
         ));
     }

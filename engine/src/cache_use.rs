@@ -62,7 +62,13 @@ mod tests {
 
     fn set_times(path: &Path, accessed: SystemTime, modified: SystemTime) {
         File::open(path)
-            .and_then(|f| f.set_times(FileTimes::new().set_accessed(accessed).set_modified(modified)))
+            .and_then(|f| {
+                f.set_times(
+                    FileTimes::new()
+                        .set_accessed(accessed)
+                        .set_modified(modified),
+                )
+            })
             .unwrap();
     }
 
@@ -91,7 +97,11 @@ mod tests {
             Some(t1),
             "the stamp leaves atime alone"
         );
-        assert_eq!(fs::read_to_string(&f).ok().as_deref(), Some("td-receipt v1\n"), "bytes untouched");
+        assert_eq!(
+            fs::read_to_string(&f).ok().as_deref(),
+            Some("td-receipt v1\n"),
+            "bytes untouched"
+        );
         assert!(last_used(&d.join("absent")).is_err());
         stamp(&d.join("absent"));
         assert!(!d.join("absent").exists(), "a stamp creates nothing");
@@ -116,7 +126,11 @@ mod tests {
         set_times(&f, old, old);
         let err = read_to_string_leaving_no_use(&f).err().map(|e| e.kind());
         assert_eq!(err, Some(io::ErrorKind::InvalidData));
-        assert_eq!(last_used(&f).ok(), Some(old), "a failed read was not a use either");
+        assert_eq!(
+            last_used(&f).ok(),
+            Some(old),
+            "a failed read was not a use either"
+        );
         assert!(read_to_string_leaving_no_use(&d.join("absent")).is_err());
         let _ = fs::remove_dir_all(&d);
     }

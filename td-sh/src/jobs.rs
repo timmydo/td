@@ -132,7 +132,11 @@ pub struct Jobs {
 
 impl Jobs {
     pub fn new() -> Self {
-        Self { jobs: Vec::new(), free: std::collections::BinaryHeap::new(), next_number: 1 }
+        Self {
+            jobs: Vec::new(),
+            free: std::collections::BinaryHeap::new(),
+            next_number: 1,
+        }
     }
 
     /// Give a number back, so the lowest free one is reused -- which is what
@@ -216,7 +220,12 @@ impl Jobs {
                 n
             }
         };
-        self.jobs.push(Job { number, id, handle: Some(handle), status: None });
+        self.jobs.push(Job {
+            number,
+            id,
+            handle: Some(handle),
+            status: None,
+        });
         id
     }
 
@@ -230,7 +239,12 @@ impl Jobs {
         let rest = spec.strip_prefix('%')?;
         // "Current" and "previous" are by START order, which is the table's
         // order: nothing reorders it, and `retain`/`remove` keep it.
-        let nth_from_end = |n: usize| self.jobs.len().checked_sub(n).and_then(|i| self.jobs.get(i));
+        let nth_from_end = |n: usize| {
+            self.jobs
+                .len()
+                .checked_sub(n)
+                .and_then(|i| self.jobs.get(i))
+        };
         let job = match rest {
             "%" | "+" => nth_from_end(1),
             "-" => nth_from_end(2),
@@ -242,7 +256,10 @@ impl Jobs {
                 // tokens -- comments included, so the name cannot be written
                 // here either. The recipe documents the rule; this is the first
                 // module to have tripped it.
-                self.jobs.iter().position(|j| j.number == number).and_then(|at| self.jobs.get(at))
+                self.jobs
+                    .iter()
+                    .position(|j| j.number == number)
+                    .and_then(|at| self.jobs.get(at))
             }
             _ => None,
         };
@@ -393,11 +410,9 @@ mod tests {
     /// that simply queues statuses from passing.
     #[test]
     fn each_job_keeps_its_own_id_and_status() {
-        let (_, out, _) = run(
-            "{ exit 7; } & a=$!\n{ exit 9; } & b=$!\n\
+        let (_, out, _) = run("{ exit 7; } & a=$!\n{ exit 9; } & b=$!\n\
              [ \"$a\" != \"$b\" ] && echo distinct\n\
-             wait $b; echo $?\nwait $a; echo $?",
-        );
+             wait $b; echo $?\nwait $a; echo $?");
         assert_eq!(out, "distinct\n9\n7\n");
     }
 
@@ -406,11 +421,9 @@ mod tests {
     /// with recycling would have.
     #[test]
     fn a_collected_id_is_gone_rather_than_reused() {
-        let (_, out, _) = run(
-            "{ exit 1; } & a=$!\nwait $a; echo first=$?\n\
+        let (_, out, _) = run("{ exit 1; } & a=$!\nwait $a; echo first=$?\n\
              wait $a; echo again=$?\n{ exit 2; } & b=$!\n\
-             [ \"$a\" != \"$b\" ] && echo distinct\nwait $b; echo second=$?",
-        );
+             [ \"$a\" != \"$b\" ] && echo distinct\nwait $b; echo second=$?");
         assert_eq!(out, "first=1\nagain=127\ndistinct\nsecond=2\n");
     }
 
@@ -420,7 +433,10 @@ mod tests {
     #[test]
     fn wait_reports_zero_for_all_and_the_last_id_for_a_list() {
         assert_eq!(run("{ exit 3; } & wait; echo $?").1, "0\n");
-        assert_eq!(run("{ exit 8; } & a=$!\n{ exit 9; } & b=$!\nwait $a $b; echo $?").1, "9\n");
+        assert_eq!(
+            run("{ exit 8; } & a=$!\n{ exit 9; } & b=$!\nwait $a $b; echo $?").1,
+            "9\n"
+        );
         assert_eq!(run("wait; echo $?").1, "0\n");
     }
 
@@ -429,11 +445,20 @@ mod tests {
     /// one waited for NEITHER. bash agrees on both orders.
     #[test]
     fn an_unknown_id_does_not_abandon_the_operands_after_it() {
-        assert_eq!(run("{ exit 7; } & p=$!\nwait 12345678 $p; echo $?").1, "7\n");
-        assert_eq!(run("{ exit 7; } & p=$!\nwait $p 12345678; echo $?").1, "127\n");
+        assert_eq!(
+            run("{ exit 7; } & p=$!\nwait 12345678 $p; echo $?").1,
+            "7\n"
+        );
+        assert_eq!(
+            run("{ exit 7; } & p=$!\nwait $p 12345678; echo $?").1,
+            "127\n"
+        );
         // ...and the job really was collected, rather than the status having
         // come from somewhere else: a second `wait` for it is now 127.
-        assert_eq!(run("{ exit 7; } & p=$!\nwait 12345678 $p\nwait $p; echo $?").1, "127\n");
+        assert_eq!(
+            run("{ exit 7; } & p=$!\nwait 12345678 $p\nwait $p; echo $?").1,
+            "127\n"
+        );
     }
 
     /// Ids come from ONE allocator for the process, not one per table. Every
@@ -444,13 +469,11 @@ mod tests {
     /// this shell's has to be.
     #[test]
     fn an_id_from_one_shell_never_names_another_shells_job() {
-        let (_, out, _) = run(
-            "{ exit 7; } & a=$!\n\
+        let (_, out, _) = run("{ exit 7; } & a=$!\n\
              ( { exit 3; } & b=$!\n\
                [ \"$a\" != \"$b\" ] && echo distinct\n\
                wait $a; echo inner=$? )\n\
-             wait $a; echo outer=$?",
-        );
+             wait $a; echo outer=$?");
         assert_eq!(out, "distinct\ninner=127\nouter=7\n");
     }
 
@@ -459,13 +482,14 @@ mod tests {
     #[test]
     fn a_jobspec_names_the_same_job_an_id_does() {
         // `%N` by number, and `%%`/`%+`/`%-` by how recently it started.
-        let (_, out, _) = run(
-            "{ exit 8; } & { exit 9; } &\n\
-             wait %-; echo prev=$?\nwait %+; echo cur=$?",
-        );
+        let (_, out, _) = run("{ exit 8; } & { exit 9; } &\n\
+             wait %-; echo prev=$?\nwait %+; echo cur=$?");
         assert_eq!(out, "prev=8\ncur=9\n");
         assert_eq!(run("{ exit 5; } &\nwait %%; echo $?").1, "5\n");
-        assert_eq!(run("{ exit 6; } & p=$!\nwait %1; echo $?\nwait $p; echo $?").1, "6\n127\n");
+        assert_eq!(
+            run("{ exit 6; } & p=$!\nwait %1; echo $?\nwait $p; echo $?").1,
+            "6\n127\n"
+        );
         // A spelling this shell cannot resolve is a usage error, not a silent
         // 127: `%foo` names a COMMAND, whose text is not kept.
         assert_eq!(run("wait %nope").0, 2);
@@ -479,11 +503,9 @@ mod tests {
     /// job.
     #[test]
     fn a_job_number_is_reused_where_an_id_is_not() {
-        let (_, out, _) = run(
-            "{ exit 3; } & a=$!\nwait %1; echo a=$?\n\
+        let (_, out, _) = run("{ exit 3; } & a=$!\nwait %1; echo a=$?\n\
              { exit 4; } & b=$!\nwait %1; echo b=$?\n\
-             [ \"$a\" != \"$b\" ] && echo ids-differ",
-        );
+             [ \"$a\" != \"$b\" ] && echo ids-differ");
         assert_eq!(out, "a=3\nb=4\nids-differ\n");
     }
 
@@ -497,18 +519,20 @@ mod tests {
     /// separate `free`/`next_number` bookkeeping exists for.
     #[test]
     fn a_freed_number_is_taken_before_a_fresh_one() {
-        let (_, out, _) = run(
-            "{ exit 1; } & { exit 2; } & { exit 3; } &\n\
+        let (_, out, _) = run("{ exit 1; } & { exit 2; } & { exit 3; } &\n\
              wait %2; echo second=$?\n\
              { exit 9; } &\n\
              jobs\n\
-             wait %2; echo reused=$?\nwait %3; echo third=$?",
-        );
+             wait %2; echo reused=$?\nwait %3; echo third=$?");
         let lines: Vec<&str> = out.lines().collect();
         // The fourth job took 2 back, so the listing is 1, 2, 3 with no
         // duplicate -- and it is SORTED, where the table itself reads 1, 3, 2.
         let numbers: Vec<&str> = lines.iter().filter_map(|l| l.split(']').next()).collect();
-        assert_eq!(numbers, ["second=2", "[1", "[2", "[3", "reused=9", "third=3"], "{out}");
+        assert_eq!(
+            numbers,
+            ["second=2", "[1", "[2", "[3", "reused=9", "third=3"],
+            "{out}"
+        );
     }
 
     /// `jobs` lists this shell's own, `-p` gives the ids alone, and a CLONE
@@ -524,13 +548,20 @@ mod tests {
         // from one allocator for the process, so a concurrent test moves them.
         let (_, out, _) = run("{ exit 0; } & { exit 0; } &\njobs -p");
         assert_eq!(out.lines().count(), 2, "{out}");
-        assert!(out.lines().all(|l| l.split_whitespace().count() == 1), "{out}");
+        assert!(
+            out.lines().all(|l| l.split_whitespace().count() == 1),
+            "{out}"
+        );
         // And they are the IDS -- what `$!` gave and what `wait` takes -- not the
         // small `%N` numbers, which would also be one word on a line each. Both
         // are printed by the same run, since an id cannot be spelled ahead of
         // time: they come from one allocator for the process.
         let (_, out, _) = run("{ exit 0; } & echo bg=$!\njobs -p");
-        let want = out.lines().next().and_then(|l| l.strip_prefix("bg=")).unwrap_or("");
+        let want = out
+            .lines()
+            .next()
+            .and_then(|l| l.strip_prefix("bg="))
+            .unwrap_or("");
         assert!(!want.is_empty(), "{out}");
         assert_eq!(out.lines().nth(1), Some(want), "{out}");
         // In a PIPELINE the stage has a table of its own, so it lists nothing --
@@ -543,9 +574,18 @@ mod tests {
         let (_, out, _) = run("{ exit 0; } & { exit 0; } & { exit 0; } &\njobs");
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3, "{out}");
-        assert!(lines.first().is_some_and(|l| l.starts_with("[1]   ")), "{out}");
-        assert!(lines.get(1).is_some_and(|l| l.starts_with("[2] - ")), "{out}");
-        assert!(lines.get(2).is_some_and(|l| l.starts_with("[3] + ")), "{out}");
+        assert!(
+            lines.first().is_some_and(|l| l.starts_with("[1]   ")),
+            "{out}"
+        );
+        assert!(
+            lines.get(1).is_some_and(|l| l.starts_with("[2] - ")),
+            "{out}"
+        );
+        assert!(
+            lines.get(2).is_some_and(|l| l.starts_with("[3] + ")),
+            "{out}"
+        );
     }
 
     /// A job that has FINISHED is listed as such. Nothing else joins a thread,
@@ -561,10 +601,15 @@ mod tests {
     /// `wait` is owed is a wrong answer.
     #[test]
     fn a_finished_job_is_listed_as_done_and_still_waitable() {
-        let (_, out, _) = run(&format!("{{ exit 4; }} & p=$!\n{SLOW}\njobs\njobs\nwait $p; echo w=$?"));
+        let (_, out, _) = run(&format!(
+            "{{ exit 4; }} & p=$!\n{SLOW}\njobs\njobs\nwait $p; echo w=$?"
+        ));
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3, "{out}");
-        assert!(lines.first().is_some_and(|l| l.contains("Done(4)")), "{out}");
+        assert!(
+            lines.first().is_some_and(|l| l.contains("Done(4)")),
+            "{out}"
+        );
         // Listed AGAIN, deliberately -- see above.
         assert_eq!(lines.first(), lines.get(1), "{out}");
         assert_eq!(lines.get(2), Some(&"w=4"), "{out}");
@@ -582,7 +627,11 @@ mod tests {
         // An OPERAND is told apart from an option, so the diagnostic names the
         // mistake that was made: `jobs %1` asks to select, `jobs -l` asks for a
         // flag.
-        assert!(run("jobs %1").2.contains("select"), "{:?}", run("jobs %1").2);
+        assert!(
+            run("jobs %1").2.contains("select"),
+            "{:?}",
+            run("jobs %1").2
+        );
         // `--` ends the options here as it does for `wait`.
         assert_eq!(run("jobs --").0, 0);
         assert_eq!(run("{ exit 0; } &\njobs -p --").1.lines().count(), 1);
@@ -605,7 +654,10 @@ mod tests {
     /// 7 here, and reading `$?` instead reported 0.
     #[test]
     fn a_return_in_a_job_is_that_jobs_status() {
-        assert_eq!(run("f() { return 7 & p=$!; wait $p; echo $?; }\nf").1, "7\n");
+        assert_eq!(
+            run("f() { return 7 & p=$!; wait $p; echo $?; }\nf").1,
+            "7\n"
+        );
     }
 
     /// POSIX 2.9.3: with job control disabled, an asynchronous list's stdin is
@@ -618,7 +670,10 @@ mod tests {
         // The job has to REPORT what it read: a variable it sets is its own, so
         // asking the parent for `$x` is empty either way and would pass against
         // a job that had eaten the input.
-        assert_eq!(run("echo hi | { { read x; echo \"job[$x]\"; } & wait; }").1, "job[]\n");
+        assert_eq!(
+            run("echo hi | { { read x; echo \"job[$x]\"; } & wait; }").1,
+            "job[]\n"
+        );
         // A redirect the list writes for ITSELF still wins, which is what
         // "before any explicit redirection" means. Through a path of its own:
         // `run` inherits the PROCESS's cwd, which is the crate directory, so a
@@ -628,7 +683,9 @@ mod tests {
         let created = std::fs::create_dir_all(&dir).is_ok();
         assert!(created, "could not make a scratch directory");
         let file = dir.join("f").to_string_lossy().into_owned();
-        let out = run(&format!("echo hi > {file}\n{{ read x < {file}; echo \"[$x]\"; }} &\nwait"));
+        let out = run(&format!(
+            "echo hi > {file}\n{{ read x < {file}; echo \"[$x]\"; }} &\nwait"
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(out.1, "[hi]\n");
     }
@@ -680,10 +737,16 @@ mod tests {
         assert_eq!(run(&format!("{{ {SLOW}; echo late; }} &")).1, "late\n");
         // A SUBSHELL, which ends long before the shell does and is the only
         // thing holding its own job.
-        assert_eq!(run(&format!("( {{ {SLOW}; echo x; }} & ); echo after")).1, "x\nafter\n");
+        assert_eq!(
+            run(&format!("( {{ {SLOW}; echo x; }} & ); echo after")).1,
+            "x\nafter\n"
+        );
         // A command substitution, whose capture must not be read until the job
         // that writes into it is done -- `hi` is what bash captures here.
-        assert_eq!(run(&format!("x=$( {{ {SLOW}; echo hi; }} & ); echo got=$x")).1, "got=hi\n");
+        assert_eq!(
+            run(&format!("x=$( {{ {SLOW}; echo hi; }} & ); echo got=$x")).1,
+            "got=hi\n"
+        );
     }
 
     /// A job is a subshell, so what it changes is its own. Concurrency does not
@@ -695,7 +758,10 @@ mod tests {
         assert_eq!(out, "job=2\nshell=1\n");
         // `cd` included, which a `&` that ran in the shell's own state would
         // move.
-        assert_eq!(run("p=$PWD; cd / &\nwait\n[ \"$PWD\" = \"$p\" ] && echo same").1, "same\n");
+        assert_eq!(
+            run("p=$PWD; cd / &\nwait\n[ \"$PWD\" = \"$p\" ] && echo same").1,
+            "same\n"
+        );
     }
 
     /// `&` reports 0 for the START, never the job's own status -- the job has

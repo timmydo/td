@@ -853,12 +853,20 @@ mod tests {
         state.frames(4, Some(focus), None, &[]).unwrap();
         let press = button(5, 272, PointerButtonState::Pressed);
         assert_eq!(
-            state.unclaimed(5, Some(focus), None, &[press]).unwrap().owners,
+            state
+                .unclaimed(5, Some(focus), None, &[press])
+                .unwrap()
+                .owners,
             [PressOwner::Free],
             "a press already held routed a second event"
         );
         state
-            .unclaimed(6, None, None, &[button(6, 272, PointerButtonState::Released)])
+            .unclaimed(
+                6,
+                None,
+                None,
+                &[button(6, 272, PointerButtonState::Released)],
+            )
             .unwrap();
 
         // And a CLAIM is its own answer, named per transition for the same

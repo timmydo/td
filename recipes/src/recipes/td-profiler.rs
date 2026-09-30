@@ -8,11 +8,20 @@ use crate::types::{Recipe, Step};
 // sibling module beside main.rs for direct rustc module resolution.
 const MAIN_RS: &str = include_str!("../../../td-profiler/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
-    ("collector", include_str!("../../../td-profiler/src/collector.rs")),
-    ("contract", include_str!("../../../td-profiler/src/contract.rs")),
+    (
+        "collector",
+        include_str!("../../../td-profiler/src/collector.rs"),
+    ),
+    (
+        "contract",
+        include_str!("../../../td-profiler/src/contract.rs"),
+    ),
     ("cpuset", include_str!("../../../td-profiler/src/cpuset.rs")),
     ("dwarf", include_str!("../../../td-profiler/src/dwarf.rs")),
-    ("evidence", include_str!("../../../td-profiler/src/evidence.rs")),
+    (
+        "evidence",
+        include_str!("../../../td-profiler/src/evidence.rs"),
+    ),
     ("event", include_str!("../../../td-profiler/src/event.rs")),
     ("index", include_str!("../../../td-profiler/src/index.rs")),
     ("json", include_str!("../../../td-profiler/src/json.rs")),
@@ -22,7 +31,10 @@ const MODULES: &[(&str, &str)] = &[
     ("state", include_str!("../../../td-profiler/src/state.rs")),
     ("symbol", include_str!("../../../td-profiler/src/symbol.rs")),
     ("sys", include_str!("../../../td-profiler/src/sys.rs")),
-    ("topology", include_str!("../../../td-profiler/src/topology.rs")),
+    (
+        "topology",
+        include_str!("../../../td-profiler/src/topology.rs"),
+    ),
 ];
 
 #[cfg(test)]
@@ -40,8 +52,7 @@ fn declared_modules() -> Vec<&'static str> {
 pub fn recipe() -> Recipe {
     let rustc = "{in:rust-toolchain}/bin/rustc";
     let gcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let gccbin =
-        "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin";
+    let gccbin = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin";
     let bbin = "{in:binutils-x86-64-self}/bin";
     let glib = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64/lib";
     let objcopy = "{in:binutils-x86-64-self}/bin/objcopy";
@@ -73,12 +84,9 @@ pub fn recipe() -> Recipe {
         path: "{root}/eh".into(),
     });
     steps.push(
-        Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"])
-            .env("PATH", &path),
+        Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
     );
-    steps.push(
-        Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
-    );
+    steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
     steps.push(
         target_rustc(
             "{src}",
@@ -165,7 +173,9 @@ mod tests {
         assert!(collector.contains("/proc/sys/kernel/perf_event_paranoid"));
         assert!(collector.contains("if paranoid < 1"));
         assert!(
-            collector.find("start_observation(&config)").unwrap_or(usize::MAX)
+            collector
+                .find("start_observation(&config)")
+                .unwrap_or(usize::MAX)
                 < collector.find("drop_credentials").unwrap_or(0),
             "perf descriptors must be opened before the service drops credentials"
         );

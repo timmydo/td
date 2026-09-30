@@ -169,7 +169,10 @@ fn parse_run_args(args: &[String]) -> Result<(String, Policy), String> {
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok((socket.ok_or_else(|| "--socket is required".to_string())?, policy))
+    Ok((
+        socket.ok_or_else(|| "--socket is required".to_string())?,
+        policy,
+    ))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -339,8 +342,8 @@ fn bind(path: &Path) -> Result<UnixListener, String> {
     }
     let staging = parent.join(format!(".{name}.{}", std::process::id()));
     let _ = std::fs::remove_file(&staging);
-    let listener = UnixListener::bind(&staging)
-        .map_err(|e| format!("bind {}: {e}", staging.display()))?;
+    let listener =
+        UnixListener::bind(&staging).map_err(|e| format!("bind {}: {e}", staging.display()))?;
     std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("chmod 0600 {}: {e}", staging.display()))?;
     std::fs::rename(&staging, path).map_err(|e| {
@@ -381,7 +384,10 @@ fn time_is_up() -> io::Error {
 /// The socket's own timeout, set to what was left, reports as `WouldBlock`;
 /// it is the same deadline.
 fn at_the_deadline(error: io::Error) -> io::Error {
-    if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ) {
         time_is_up()
     } else {
         error
@@ -563,7 +569,9 @@ fn parse_header(text: &str) -> Result<(String, String), Fault> {
         )));
     }
     if CONNECTION_HEADERS.contains(&name) || SERVICE_HEADERS.contains(&name) {
-        return Err(Fault::Malformed(format!("header {name:?} is the service's")));
+        return Err(Fault::Malformed(format!(
+            "header {name:?} is the service's"
+        )));
     }
     Ok((name.to_string(), value.to_string()))
 }
@@ -652,7 +660,11 @@ fn perform(request: Request, policy: Policy) -> Result<Reply, Fault> {
         // An answer is an answer: the application reads the status.
         Err(ureq::Error::Status(_, response)) => response,
         Err(ureq::Error::Transport(transport)) => {
-            let refusal = resolver.refusal.lock().ok().and_then(|refusal| refusal.clone());
+            let refusal = resolver
+                .refusal
+                .lock()
+                .ok()
+                .and_then(|refusal| refusal.clone());
             return Err(match refusal {
                 Some(reason) => Fault::Refused(reason),
                 None => Fault::Transport(transport.to_string()),
@@ -677,7 +689,9 @@ fn perform(request: Request, policy: Policy) -> Result<Reply, Fault> {
         }
         for value in response.all(&name) {
             if headers.len() >= MAX_HEADERS {
-                return Err(Fault::Refused(format!("response over {MAX_HEADERS} headers")));
+                return Err(Fault::Refused(format!(
+                    "response over {MAX_HEADERS} headers"
+                )));
             }
             // The reply keeps the request's line bound: `header name: value\n`.
             if "header ".len() + name.len() + ": ".len() + value.len() + 1 > MAX_LINE {
@@ -769,7 +783,11 @@ fn write_reply(writer: &mut impl Write, reply: &Reply) -> io::Result<()> {
         head.push_str(": ");
         // A value with a newline would end the head early; the client sees
         // spaces instead, and the bytes it cares about are the body's.
-        head.extend(value.chars().map(|c| if c.is_ascii_control() { ' ' } else { c }));
+        head.extend(
+            value
+                .chars()
+                .map(|c| if c.is_ascii_control() { ' ' } else { c }),
+        );
         head.push('\n');
     }
     head.push_str(&format!("body {}\n\n", reply.body.len()));
@@ -808,8 +826,7 @@ fn bounded_line(text: &str) -> String {
 /// Connect, ask for the loopback URL, expect the policy's refusal: the
 /// socket is served, the framing is understood and the policy is on.
 fn probe(socket: &Path) -> Result<(), String> {
-    let mut stream =
-        UnixStream::connect(socket).map_err(|e| format!("connect: {e}"))?;
+    let mut stream = UnixStream::connect(socket).map_err(|e| format!("connect: {e}"))?;
     stream
         .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
         .map_err(|e| e.to_string())?;
@@ -828,7 +845,10 @@ fn probe(socket: &Path) -> Result<(), String> {
         return Err(format!("first line {:?}, not {PROTOCOL:?}", lines.first()));
     }
     if lines.get(1).map(String::as_str) != Some(PROBE_EXPECTED) {
-        return Err(format!("second line {:?}, not {PROBE_EXPECTED:?}", lines.get(1)));
+        return Err(format!(
+            "second line {:?}, not {PROBE_EXPECTED:?}",
+            lines.get(1)
+        ));
     }
     Ok(())
 }
@@ -885,7 +905,10 @@ mod tests {
         let request = parse(&bytes).unwrap();
         assert_eq!(request.method, Method::Post);
         assert_eq!(request.url, "https://h/p");
-        assert_eq!(request.headers, [("accept".to_string(), "text/xml".to_string())]);
+        assert_eq!(
+            request.headers,
+            [("accept".to_string(), "text/xml".to_string())]
+        );
         assert_eq!(request.limit, 10);
         assert_eq!(request.body, b"abc");
         // Defaults: no body, the service's own limit.
@@ -895,10 +918,22 @@ mod tests {
             ("method PUT\nurl http://h/\n", "method"),
             ("url http://h/\n", "no method"),
             ("method GET\n", "no url"),
-            ("method GET\nurl http://h/\nheader Accept: x\n", "lower-case token"),
-            ("method GET\nurl http://h/\nheader host: h\n", "the service's"),
-            ("method GET\nurl http://h/\nheader upgrade: h2c\n", "the service's"),
-            ("method GET\nurl http://h/\nheader te: trailers\n", "the service's"),
+            (
+                "method GET\nurl http://h/\nheader Accept: x\n",
+                "lower-case token",
+            ),
+            (
+                "method GET\nurl http://h/\nheader host: h\n",
+                "the service's",
+            ),
+            (
+                "method GET\nurl http://h/\nheader upgrade: h2c\n",
+                "the service's",
+            ),
+            (
+                "method GET\nurl http://h/\nheader te: trailers\n",
+                "the service's",
+            ),
             ("method GET\nurl \n", "url is empty"),
             ("method GET\nurl http://h/\nbody 1\n", "a GET with a body"),
             ("method GET\nurl http://h/\nlimit 0\n", "limit"),
@@ -912,7 +947,10 @@ mod tests {
         }
         let err = parse(b"td-fetch 2\n\n").unwrap_err();
         assert!(err.contains("first line"), "{err}");
-        assert!(matches!(read_request(&mut BufReader::new(&b""[..])), Err(Fault::Closed)));
+        assert!(matches!(
+            read_request(&mut BufReader::new(&b""[..])),
+            Err(Fault::Closed)
+        ));
         let err = parse(&request_bytes("method GET\nurl http://h/\r\n", b"")).unwrap_err();
         assert!(err.contains("control byte"), "{err}");
         let long = format!("method GET\nurl http://h/{}\n", "a".repeat(MAX_LINE));
@@ -923,16 +961,29 @@ mod tests {
             "header x-n: v\n".repeat(MAX_HEADERS + 1)
         );
         let err = parse(&request_bytes(&many, b"")).unwrap_err();
-        assert!(err.contains(&format!("more than {MAX_HEADERS} headers")), "{err}");
+        assert!(
+            err.contains(&format!("more than {MAX_HEADERS} headers")),
+            "{err}"
+        );
         let enough = format!(
             "method GET\nurl http://h/\n{}",
             "header x-n: v\n".repeat(MAX_HEADERS)
         );
-        assert_eq!(parse(&request_bytes(&enough, b"")).unwrap().headers.len(), MAX_HEADERS);
-        let err = parse(&request_bytes("method POST\nurl http://h/\nbody 5\n", b"ab")).unwrap_err();
+        assert_eq!(
+            parse(&request_bytes(&enough, b"")).unwrap().headers.len(),
+            MAX_HEADERS
+        );
+        let err = parse(&request_bytes(
+            "method POST\nurl http://h/\nbody 5\n",
+            b"ab",
+        ))
+        .unwrap_err();
         assert!(err.contains("body short"), "{err}");
         let err = parse(&request_bytes(
-            &format!("method POST\nurl http://h/\nbody {}\n", MAX_REQUEST_BODY + 1),
+            &format!(
+                "method POST\nurl http://h/\nbody {}\n",
+                MAX_REQUEST_BODY + 1
+            ),
             b"",
         ))
         .unwrap_err();
@@ -946,10 +997,16 @@ mod tests {
             ("ftp://h/", "scheme \"ftp\""),
             ("FILE://h/", "scheme \"FILE\""),
         ] {
-            let err = check_scheme(url).err().map(|f| f.line()).unwrap_or_default();
+            let err = check_scheme(url)
+                .err()
+                .map(|f| f.line())
+                .unwrap_or_default();
             assert!(err.contains(reason), "{url}: {err:?}");
         }
-        assert!(check_scheme("h/p").unwrap_err().line().contains("no scheme"));
+        assert!(check_scheme("h/p")
+            .unwrap_err()
+            .line()
+            .contains("no scheme"));
         assert!(check_scheme("https://h/p").is_ok());
         assert!(check_scheme("HTTP://h/p").is_ok());
         // The run arguments: the socket is required, the flag is off unless given.
@@ -958,9 +1015,17 @@ mod tests {
         let (_, policy) =
             parse_run_args(&["--socket".into(), "/s".into(), "--allow-loopback".into()]).unwrap();
         assert!(policy.allow_loopback);
-        assert!(parse_run_args(&["--allow-loopback".into()]).unwrap_err().contains("required"));
-        assert!(parse_run_args(&["--socket".into()]).unwrap_err().contains("needs a path"));
-        assert!(parse_run_args(&["--socket".into(), "/s".into(), "-v".into()]).unwrap_err().contains("unknown"));
+        assert!(parse_run_args(&["--allow-loopback".into()])
+            .unwrap_err()
+            .contains("required"));
+        assert!(parse_run_args(&["--socket".into()])
+            .unwrap_err()
+            .contains("needs a path"));
+        assert!(
+            parse_run_args(&["--socket".into(), "/s".into(), "-v".into()])
+                .unwrap_err()
+                .contains("unknown")
+        );
         for (address, reason) in [
             ("127.0.0.1", "loopback address"),
             ("127.5.6.7", "loopback address"),
@@ -980,7 +1045,11 @@ mod tests {
             let ip: IpAddr = address.parse().unwrap();
             assert_eq!(refused_address(ip, STRICT), Some(reason), "{address}");
         }
-        for address in ["93.184.216.34", "2606:2800:21f:cb07:6820:80da:af6b:8b2c", "10.0.0.1"] {
+        for address in [
+            "93.184.216.34",
+            "2606:2800:21f:cb07:6820:80da:af6b:8b2c",
+            "10.0.0.1",
+        ] {
             let ip: IpAddr = address.parse().unwrap();
             assert_eq!(refused_address(ip, STRICT), None, "{address}");
         }
@@ -998,7 +1067,10 @@ mod tests {
             refusal: Mutex::new(None),
         };
         let resolved = resolver.resolve("93.184.216.34:443").unwrap();
-        assert_eq!(resolved, ["93.184.216.34:443".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(
+            resolved,
+            ["93.184.216.34:443".parse::<SocketAddr>().unwrap()]
+        );
         assert_eq!(*resolver.refusal.lock().unwrap(), None);
         for (netloc, reason) in [
             ("127.0.0.1:8080", "loopback address"),
@@ -1009,7 +1081,11 @@ mod tests {
         ] {
             let err = resolver.resolve(netloc).unwrap_err().to_string();
             assert!(err.contains(reason), "{netloc}: {err}");
-            assert_eq!(resolver.refusal.lock().unwrap().as_deref(), Some(reason), "{netloc}");
+            assert_eq!(
+                resolver.refusal.lock().unwrap().as_deref(),
+                Some(reason),
+                "{netloc}"
+            );
         }
     }
 
@@ -1075,7 +1151,10 @@ mod tests {
                     .iter()
                     .find(|(p, _)| *p == path)
                     .map(|(_, r)| r.clone())
-                    .unwrap_or_else(|| "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into());
+                    .unwrap_or_else(|| {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .into()
+                    });
                 let _ = conn.write_all(body.as_bytes());
                 let _ = conn.flush();
                 seen.push(raw);
@@ -1163,7 +1242,9 @@ mod tests {
     fn a_request_is_served_over_the_socket_within_its_bounds() {
         let dir = scratch("serve");
         let socket = dir.join("td-fetch");
-        let Some(()) = served(&socket, LENIENT) else { return };
+        let Some(()) = served(&socket, LENIENT) else {
+            return;
+        };
         assert_eq!(
             std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1195,13 +1276,33 @@ mod tests {
         );
         assert_eq!(lines[0], PROTOCOL);
         assert_eq!(lines[1], "status 200");
-        assert!(lines.contains(&"header content-type: text/xml".to_string()), "{lines:?}");
-        assert_eq!(lines.iter().filter(|l| *l == "header x-two: a").count(), 1, "{lines:?}");
-        assert_eq!(lines.iter().filter(|l| *l == "header x-two: b").count(), 1, "{lines:?}");
+        assert!(
+            lines.contains(&"header content-type: text/xml".to_string()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| *l == "header x-two: a").count(),
+            1,
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| *l == "header x-two: b").count(),
+            1,
+            "{lines:?}"
+        );
         // A control byte in a value is a space; the connection's headers are not relayed.
-        assert!(lines.contains(&"header x-ctl: a b".to_string()), "{lines:?}");
-        assert!(!lines.iter().any(|l| l.starts_with("header connection")), "{lines:?}");
-        assert!(!lines.iter().any(|l| l.starts_with("header keep-alive")), "{lines:?}");
+        assert!(
+            lines.contains(&"header x-ctl: a b".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("header connection")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("header keep-alive")),
+            "{lines:?}"
+        );
         assert_eq!(lines.last().map(String::as_str), Some("body 6"));
         assert_eq!(body, b"<rss/>");
         // POST: the body and the headers reach the origin, identity encoding asked.
@@ -1213,34 +1314,75 @@ mod tests {
         assert_eq!(lines[1], "status 201");
         assert_eq!(body, b"made");
         // Over the client's limit: refused, with the limit named.
-        let (lines, body) = ask(&socket, &format!("method GET\nurl {base}/big\nlimit 99\n"), b"");
+        let (lines, body) = ask(
+            &socket,
+            &format!("method GET\nurl {base}/big\nlimit 99\n"),
+            b"",
+        );
         assert_eq!(lines, [PROTOCOL, "error refused: response over 99 bytes"]);
         assert!(body.is_empty());
         // A redirect is followed for GET and not for POST.
         let (lines, body) = ask(&socket, &format!("method GET\nurl {base}/moved\n"), b"");
         assert_eq!(lines[1], "status 200");
         assert_eq!(body, b"<rss/>");
-        let (lines, _) = ask(&socket, &format!("method POST\nurl {base}/postmoved\nbody 0\n"), b"");
+        let (lines, _) = ask(
+            &socket,
+            &format!("method POST\nurl {base}/postmoved\nbody 0\n"),
+            b"",
+        );
         assert_eq!(lines[1], "status 302");
         // A client that follows redirects itself, to carry a credential the
         // service would drop, asks for none and is handed the redirect; more
         // than the ceiling is refused whatever the method, and a POST asking
         // for one to five is malformed.
-        let (lines, _) = ask(&socket, &format!("method GET\nurl {base}/moved\nredirects 0\n"), b"");
+        let (lines, _) = ask(
+            &socket,
+            &format!("method GET\nurl {base}/moved\nredirects 0\n"),
+            b"",
+        );
         assert_eq!(lines[1], "status 302");
-        assert!(lines.iter().any(|line| line == "header location: /feed"), "{lines:?}");
-        let (lines, _) = ask(&socket, &format!("method GET\nurl {base}/moved\nredirects 6\n"), b"");
-        assert_eq!(lines[1], format!("error refused: redirects over {MAX_REDIRECTS}"));
-        let (lines, _) = ask(&socket, &format!("method POST\nurl {base}/post\nredirects 1\nbody 0\n"), b"");
+        assert!(
+            lines.iter().any(|line| line == "header location: /feed"),
+            "{lines:?}"
+        );
+        let (lines, _) = ask(
+            &socket,
+            &format!("method GET\nurl {base}/moved\nredirects 6\n"),
+            b"",
+        );
+        assert_eq!(
+            lines[1],
+            format!("error refused: redirects over {MAX_REDIRECTS}")
+        );
+        let (lines, _) = ask(
+            &socket,
+            &format!("method POST\nurl {base}/post\nredirects 1\nbody 0\n"),
+            b"",
+        );
         assert_eq!(lines[1], "error malformed: a POST with redirects");
-        let (lines, _) = ask(&socket, &format!("method POST\nurl {base}/post\nredirects 9\nbody 0\n"), b"");
-        assert_eq!(lines[1], format!("error refused: redirects over {MAX_REDIRECTS}"));
+        let (lines, _) = ask(
+            &socket,
+            &format!("method POST\nurl {base}/post\nredirects 9\nbody 0\n"),
+            b"",
+        );
+        assert_eq!(
+            lines[1],
+            format!("error refused: redirects over {MAX_REDIRECTS}")
+        );
         // One asked for is one followed, not one request: the hop lands, and
         // a second hop on that budget is ureq's refusal, handed on.
-        let (lines, body) = ask(&socket, &format!("method GET\nurl {base}/moved\nredirects 1\n"), b"");
+        let (lines, body) = ask(
+            &socket,
+            &format!("method GET\nurl {base}/moved\nredirects 1\n"),
+            b"",
+        );
         assert_eq!(lines[1], "status 200");
         assert_eq!(body, b"<rss/>");
-        let (lines, _) = ask(&socket, &format!("method GET\nurl {base}/twice\nredirects 1\n"), b"");
+        let (lines, _) = ask(
+            &socket,
+            &format!("method GET\nurl {base}/twice\nredirects 1\n"),
+            b"",
+        );
         assert!(
             lines[1].starts_with("error transport: ") && lines[1].contains("Too Many Redirects"),
             "{lines:?}"
@@ -1254,7 +1396,10 @@ mod tests {
         assert_eq!(lines[1], "error refused: unspecified address");
         // A response header the reply's line bound cannot carry is refused.
         let (lines, _) = ask(&socket, &format!("method GET\nurl {base}/wide\n"), b"");
-        assert_eq!(lines[1], format!("error refused: response header over {MAX_LINE} bytes"));
+        assert_eq!(
+            lines[1],
+            format!("error refused: response header over {MAX_LINE} bytes")
+        );
         // Policy and framing faults are answered on the socket too.
         let (lines, _) = ask(&socket, "method GET\nurl ftp://127.0.0.1/\n", b"");
         assert_eq!(lines[1], "error refused: scheme \"ftp\"");
@@ -1262,7 +1407,11 @@ mod tests {
         assert_eq!(lines[1], "error malformed: no url");
         // The address policy is applied to what ureq parses: this authority
         // reads as a public host to a naive split and as 0.0.0.1 to ureq.
-        let (lines, _) = ask(&socket, "method GET\nurl http://0.0.0.1:1\\@93.184.216.34/\n", b"");
+        let (lines, _) = ask(
+            &socket,
+            "method GET\nurl http://0.0.0.1:1\\@93.184.216.34/\n",
+            b"",
+        );
         assert_eq!(lines[1], "error refused: unspecified address");
         // A connect-and-close is a liveness probe: nothing is written back
         // and the next request is served.
@@ -1301,9 +1450,13 @@ mod tests {
     fn a_slow_client_is_cut_off_at_the_budget_and_told() {
         let dir = scratch("slow");
         let socket = dir.join("td-fetch");
-        let Some(()) = served(&socket, LENIENT) else { return };
+        let Some(()) = served(&socket, LENIENT) else {
+            return;
+        };
         let mut stream = UnixStream::connect(&socket).unwrap();
-        stream.write_all(format!("{PROTOCOL}\nmethod GET\n").as_bytes()).unwrap();
+        stream
+            .write_all(format!("{PROTOCOL}\nmethod GET\n").as_bytes())
+            .unwrap();
         std::thread::sleep(TEST_BUDGET + Duration::from_millis(500));
         let (lines, _) = read_reply(stream);
         assert_eq!(lines[0], PROTOCOL);
@@ -1319,14 +1472,19 @@ mod tests {
     fn the_probe_expects_the_policys_own_refusal() {
         let dir = scratch("probe");
         let socket = dir.join("td-fetch");
-        let Some(()) = served(&socket, STRICT) else { return };
+        let Some(()) = served(&socket, STRICT) else {
+            return;
+        };
         probe(&socket).unwrap();
         // A served socket is not rebound; a stale one is replaced in place.
         assert!(bind(&socket).unwrap_err().contains("already served"));
         let stale = dir.join("stale");
         drop(UnixListener::bind(&stale).unwrap());
         let listener = bind(&stale).unwrap();
-        assert_eq!(std::fs::metadata(&stale).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&stale).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(UnixStream::connect(&stale).is_ok());
         drop(listener);
         let file = dir.join("file");
@@ -1342,7 +1500,9 @@ mod tests {
         );
         assert_eq!(std::fs::read_dir(&service).unwrap().count(), 1);
         drop(listener);
-        assert!(bind(&file.join("socket")).unwrap_err().contains("not a directory"));
+        assert!(bind(&file.join("socket"))
+            .unwrap_err()
+            .contains("not a directory"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -71,7 +71,9 @@ impl Readings {
         let loadavg = std::fs::read_to_string(proc_root.join("loadavg")).ok();
         let meminfo = std::fs::read_to_string(proc_root.join("meminfo")).ok();
         let uptime = std::fs::read_to_string(proc_root.join("uptime")).ok();
-        let total_kb = meminfo.as_deref().and_then(|text| meminfo_kb(text, "MemTotal"));
+        let total_kb = meminfo
+            .as_deref()
+            .and_then(|text| meminfo_kb(text, "MemTotal"));
         let available_kb = meminfo
             .as_deref()
             .and_then(|text| meminfo_kb(text, "MemAvailable"));
@@ -260,11 +262,7 @@ fn parse_uptime_secs(text: &str) -> Option<u64> {
 /// Round to one decimal in the largest unit that keeps the number small.
 /// Integer arithmetic throughout: a bar is not worth a float.
 fn human_bytes(kb: u64) -> String {
-    const UNITS: &[(u64, &str)] = &[
-        (1024 * 1024 * 1024, "T"),
-        (1024 * 1024, "G"),
-        (1024, "M"),
-    ];
+    const UNITS: &[(u64, &str)] = &[(1024 * 1024 * 1024, "T"), (1024 * 1024, "G"), (1024, "M")];
     for (divisor, suffix) in UNITS {
         if kb >= *divisor {
             // The multiply is done in `u128`. `kb.saturating_mul(10)` clamps
@@ -306,13 +304,18 @@ pub fn line(clock: &Clock, readings: &Readings) -> String {
         }
         _ => "MEM ?".to_string(),
     };
-    let uptime = readings
-        .uptime_secs
-        .map_or_else(|| "UP ?".to_string(), |secs| format!("UP {}", human_uptime(secs)));
+    let uptime = readings.uptime_secs.map_or_else(
+        || "UP ?".to_string(),
+        |secs| format!("UP {}", human_uptime(secs)),
+    );
     let clock = clock.stamp(readings.epoch_secs);
     // Leftmost, as the ethernet stanza is in the config this follows, and
     // for the same reason the clock is rightmost.
-    let net = match (&readings.link.name, readings.link.up, &readings.link.address) {
+    let net = match (
+        &readings.link.name,
+        readings.link.up,
+        &readings.link.address,
+    ) {
         (None, _, _) => "NET ?".to_string(),
         // DOWN outranks any address still configured on the interface: a
         // stale address on a link with no carrier is not somewhere to reach
@@ -631,7 +634,14 @@ pub fn start(
                 // A paint failure is REPORTED, never fatal: the bar is the
                 // least important thing on the screen and must not take the
                 // session down with it.
-                match tick(&runtime, &proc_root, &sys_root, unix_epoch_secs(), &clock, &mut reported) {
+                match tick(
+                    &runtime,
+                    &proc_root,
+                    &sys_root,
+                    unix_epoch_secs(),
+                    &clock,
+                    &mut reported,
+                ) {
                     Tick::Continue(report) => {
                         if let Some(report) = report {
                             eprintln!("td-compositor: status bar: {report}");
@@ -770,7 +780,10 @@ Local:
         let readings = Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0));
         assert_eq!(readings.link.name.as_deref(), Some("eth0"));
         assert_eq!(readings.link.up, Some(true));
-        assert_eq!(readings.link.address, Address::Known("10.0.2.15".to_string()));
+        assert_eq!(
+            readings.link.address,
+            Address::Known("10.0.2.15".to_string())
+        );
         assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 10.0.2.15  LOAD"));
     }
 
@@ -851,8 +864,13 @@ Local:
         assert_eq!(operational("down\n"), Some(false));
         assert_eq!(operational("lowerlayerdown\n"), Some(false));
 
-        let unknown =
-            Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[("eth0", "unknown\n")], FIB_TRIE);
+        let unknown = Fixture::with_net(
+            "0 0 0\n",
+            MEMINFO,
+            "0\n",
+            &[("eth0", "unknown\n")],
+            FIB_TRIE,
+        );
         let readings = Readings::sample(&unknown.proc_root, &unknown.sys_root, Some(0));
         assert_eq!(readings.link.up, None);
         // The address still shows: an unknown link state is no reason to
@@ -922,12 +940,18 @@ Local:
 
         let only_loopback =
             Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[("lo", "unknown\n")], "");
-        assert_eq!(choose_interface(&interface_names(&only_loopback.sys_root)), None);
+        assert_eq!(
+            choose_interface(&interface_names(&only_loopback.sys_root)),
+            None
+        );
     }
 
     #[test]
     fn the_routing_table_gives_one_local_address_or_none() {
-        assert_eq!(local_ipv4(FIB_TRIE), Address::Known("10.0.2.15".to_string()));
+        assert_eq!(
+            local_ipv4(FIB_TRIE),
+            Address::Known("10.0.2.15".to_string())
+        );
         // Loopback is not this machine's address in any useful sense, and it
         // is present in every routing table, so it must not be the answer.
         assert_eq!(
@@ -969,7 +993,10 @@ Local:
         ));
         let readings = Readings::sample(&empty, &empty, None);
         assert_eq!(readings, Readings::default());
-        assert_eq!(line(&Clock::Utc, &readings), "NET ?  LOAD ?  MEM ?  UP ?  CLOCK ?");
+        assert_eq!(
+            line(&Clock::Utc, &readings),
+            "NET ?  LOAD ?  MEM ?  UP ?  CLOCK ?"
+        );
 
         // Present but unparseable is the same answer, and each field fails on
         // its own: a garbled loadavg must not take the clock down with it.
@@ -1248,14 +1275,23 @@ Local:
     #[test]
     fn a_repeated_failure_is_reported_once_and_a_returning_one_again() {
         let mut reported = Reported::default();
-        assert_eq!(reported.note(Some("no framebuffer")).as_deref(), Some("no framebuffer"));
+        assert_eq!(
+            reported.note(Some("no framebuffer")).as_deref(),
+            Some("no framebuffer")
+        );
         assert_eq!(reported.note(Some("no framebuffer")), None);
         assert_eq!(reported.note(Some("no framebuffer")), None);
         // A different fault is news even while the first is unresolved.
-        assert_eq!(reported.note(Some("short write")).as_deref(), Some("short write"));
+        assert_eq!(
+            reported.note(Some("short write")).as_deref(),
+            Some("short write")
+        );
         assert_eq!(reported.note(Some("short write")), None);
         assert_eq!(reported.note(None), None);
-        assert_eq!(reported.note(Some("short write")).as_deref(), Some("short write"));
+        assert_eq!(
+            reported.note(Some("short write")).as_deref(),
+            Some("short write")
+        );
     }
 
     #[test]
@@ -1266,7 +1302,11 @@ Local:
         let mut reported = Reported::default();
         let mut lines = 0usize;
         for turn in 0..50 {
-            let error = if turn % 2 == 0 { "odd write" } else { "even write" };
+            let error = if turn % 2 == 0 {
+                "odd write"
+            } else {
+                "even write"
+            };
             if reported.note(Some(error)).is_some() {
                 lines = lines.saturating_add(1);
             }
@@ -1298,10 +1338,21 @@ Local:
         let mut at = 1_770_000_000u64;
         let mut next = |reported: &mut Reported| {
             at = at.saturating_add(1);
-            tick(&runtime, &fixture.proc_root, &fixture.sys_root, Some(at), &Clock::Utc, reported)
+            tick(
+                &runtime,
+                &fixture.proc_root,
+                &fixture.sys_root,
+                Some(at),
+                &Clock::Utc,
+                reported,
+            )
         };
 
-        assert_eq!(next(&mut reported), Tick::Continue(None), "a good paint says nothing");
+        assert_eq!(
+            next(&mut reported),
+            Tick::Continue(None),
+            "a good paint says nothing"
+        );
 
         runtime.lock().unwrap().fail_next_repaint();
         let Tick::Continue(Some(first)) = next(&mut reported) else {
@@ -1324,17 +1375,38 @@ Local:
     #[test]
     fn the_sampler_publishes_the_selected_clock_to_the_runtime() {
         let path = std::env::temp_dir().join(format!(
-            "td-bar-clock-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed),
+            "td-bar-clock-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
         ));
-        let framebuffer = crate::framebuffer::Framebuffer::test_file(&path, 320, 200, 320 * 4).unwrap();
+        let framebuffer =
+            crate::framebuffer::Framebuffer::test_file(&path, 320, 200, 320 * 4).unwrap();
         let runtime = Mutex::new(crate::runtime::Runtime::new(framebuffer));
         let fixture = Fixture::new("0.42 0.31 0.28 2/517 9182\n", MEMINFO, "187245.31 91.2\n");
-        let clock = Clock::Local(crate::timezone::Zone::parse(&crate::timezone::fixture(
-            &[], &[(0, false, "UTC")], "JST-9",
-        )).unwrap());
+        let clock = Clock::Local(
+            crate::timezone::Zone::parse(&crate::timezone::fixture(
+                &[],
+                &[(0, false, "UTC")],
+                "JST-9",
+            ))
+            .unwrap(),
+        );
         let mut reported = Reported::default();
-        assert_eq!(tick(&runtime, &fixture.proc_root, &fixture.sys_root, Some(0), &clock, &mut reported), Tick::Continue(None));
-        let expected = line(&clock, &Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0)));
+        assert_eq!(
+            tick(
+                &runtime,
+                &fixture.proc_root,
+                &fixture.sys_root,
+                Some(0),
+                &clock,
+                &mut reported
+            ),
+            Tick::Continue(None)
+        );
+        let expected = line(
+            &clock,
+            &Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0)),
+        );
         let mut runtime = runtime.lock().unwrap();
         runtime.fail_next_repaint();
         // An identical published line requires no paint. A UTC line from the
@@ -1347,9 +1419,16 @@ Local:
     #[test]
     fn the_line_uses_the_selected_clock_and_keeps_other_fields_on_failure() {
         let zone = crate::timezone::Zone::parse(&crate::timezone::fixture(
-            &[], &[(0, false, "UTC")], "JST-9",
-        )).unwrap();
-        let readings = Readings { epoch_secs: Some(0), load_centi: Some(42), ..Readings::default() };
+            &[],
+            &[(0, false, "UTC")],
+            "JST-9",
+        ))
+        .unwrap();
+        let readings = Readings {
+            epoch_secs: Some(0),
+            load_centi: Some(42),
+            ..Readings::default()
+        };
         let local = line(&Clock::Local(zone), &readings);
         assert!(local.ends_with("1970-01-01 09:00:00 UTC+09:00"));
         let unavailable = line(&Clock::Unavailable, &readings);
@@ -1364,35 +1443,45 @@ Local:
         // reading it could not take — so `LOAD 0.42` and `LOAD ?` looked the
         // same. Both a full line and an all-failed one are checked, since the
         // failure marker is a character of the vocabulary too.
-        let full = line(&Clock::Utc, &Readings {
-            load_centi: Some(1_234),
-            used_kb: Some(2_800_000),
-            total_kb: Some(8_039_384),
-            uptime_secs: Some(187_245),
-            epoch_secs: Some(1_770_000_000),
-            link: Link {
-                name: Some("eth0".to_string()),
-                up: Some(true),
-                address: Address::Known("10.0.2.15".to_string()),
+        let full = line(
+            &Clock::Utc,
+            &Readings {
+                load_centi: Some(1_234),
+                used_kb: Some(2_800_000),
+                total_kb: Some(8_039_384),
+                uptime_secs: Some(187_245),
+                epoch_secs: Some(1_770_000_000),
+                link: Link {
+                    name: Some("eth0".to_string()),
+                    up: Some(true),
+                    address: Address::Known("10.0.2.15".to_string()),
+                },
             },
-        });
+        );
         let failed = line(&Clock::Utc, &Readings::default());
         // `DOWN` spells a `W` that neither of the others does, and the
         // interface NAME is a kernel-supplied string flowing into a 43-glyph
         // font — `dev_valid_name` forbids only `/`, `:` and whitespace, so a
         // name is not guaranteed to be spellable and this is what would say
         // so.
-        let down = line(&Clock::Utc, &Readings {
-            link: Link {
-                name: Some("br-1a2b3c".to_string()),
-                up: Some(false),
-                address: Address::Absent,
+        let down = line(
+            &Clock::Utc,
+            &Readings {
+                link: Link {
+                    name: Some("br-1a2b3c".to_string()),
+                    up: Some(false),
+                    address: Address::Absent,
+                },
+                ..Readings::default()
             },
-            ..Readings::default()
-        });
+        );
         for text in [full.as_str(), failed.as_str(), down.as_str()] {
             for byte in text.bytes() {
-                assert!(ui::is_mapped(byte), "{:?} in {text:?} has no glyph", byte as char);
+                assert!(
+                    ui::is_mapped(byte),
+                    "{:?} in {text:?} has no glyph",
+                    byte as char
+                );
             }
         }
         assert!(full.contains('.') && failed.contains('?') && down.contains("DOWN"));
@@ -1437,7 +1526,11 @@ Local:
                 })
             })
             .collect();
-        assert_eq!(rows.first(), Some(&TEXT_TOP), "the text does not start at TEXT_TOP");
+        assert_eq!(
+            rows.first(),
+            Some(&TEXT_TOP),
+            "the text does not start at TEXT_TOP"
+        );
         assert_eq!(
             rows.last(),
             Some(&(TEXT_TOP + ui::GLYPH_HEIGHT * SCALE - 1)),

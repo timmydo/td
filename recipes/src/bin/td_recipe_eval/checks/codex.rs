@@ -1,5 +1,5 @@
-use crate::check_runner::{is_executable, RecipeCheckRunner, TD_STORE_DIR};
 use super::rust_toolchain::{path_basename, GLIBC_STAGE};
+use crate::check_runner::{is_executable, RecipeCheckRunner, TD_STORE_DIR};
 use td_recipe::ladder::CODEX_VERSION_OUTPUT;
 
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {

@@ -151,10 +151,7 @@ fn run(args: &[String]) -> Result<i32, String> {
                         } else if !builtin::apply_named_option(&mut sh, name, on) {
                             // Not a typo: `ash_msg` sets no status and `procargs`
                             // unwinds on the non-zero return (ash.c:14595).
-                            let _ = exec::diag(
-                                &sh,
-                                &format!("illegal option {sign}o {name}"),
-                            );
+                            let _ = exec::diag(&sh, &format!("illegal option {sign}o {name}"));
                             return Ok(0);
                         }
                         consumed += 1;
@@ -439,13 +436,15 @@ fn stdin_script(sh: &mut Shell) -> i32 {
             sh.set_status(2);
             return 2;
         }
-        let Some(outcome) = unit else { return sh.status };
+        let Some(outcome) = unit else {
+            return sh.status;
+        };
         match outcome {
             Ok(list) => match exec::run_list(sh, &list) {
                 Ok(()) => {}
-                Err(exec::Sig::Exit(code) | exec::Sig::Abort(code) | exec::Sig::Interrupt(code)) => {
-                    return code
-                }
+                Err(
+                    exec::Sig::Exit(code) | exec::Sig::Abort(code) | exec::Sig::Interrupt(code),
+                ) => return code,
                 // Anything else -- a top-level `return`, which `run_source`
                 // propagated with `?` -- ends the script at `$?`, as the
                 // whole-of-stdin path did. `break`/`continue` never reach here;
@@ -529,11 +528,7 @@ enum ReadResult {
 
 /// Read lines into `buffer` until it parses (or fails with a non-continuation
 /// error), or input ends.
-fn read_complete(
-    editor: &mut line::Editor,
-    sh: &mut Shell,
-    buffer: &mut String,
-) -> ReadResult {
+fn read_complete(editor: &mut line::Editor, sh: &mut Shell, buffer: &mut String) -> ReadResult {
     // Expanded per call rather than once, because `\w` is a fact about where
     // the shell is NOW and the command just run may have been a `cd`. The cwd
     // is the shell's LOGICAL one -- what `$PWD` and `pwd` report, and what
@@ -545,8 +540,10 @@ fn read_complete(
         user: user.as_deref(),
         cwd: &sh.logical_cwd.clone(),
     };
-    let mut prompt =
-        line::expand_prompt(&sh.get_var("PS1").unwrap_or_else(|| r"\$ ".to_string()), &env);
+    let mut prompt = line::expand_prompt(
+        &sh.get_var("PS1").unwrap_or_else(|| r"\$ ".to_string()),
+        &env,
+    );
     loop {
         // `trap '' INT` makes SIGINT do nothing, and the Ctrl-C keystroke only
         // stands in for SIGINT while the editor has signal generation off — so
@@ -561,13 +558,16 @@ fn read_complete(
         // ask for `SIG_DFL` or `SIG_IGN` and nothing else — and it is where
         // td-sh differs from dash, which runs the action.
         let ignored_on_entry = !builtin::may_set_signal(sh, SIGINT);
-        let interruptible = !ignored_on_entry
-            && !sh.traps.get(&SIGINT).is_some_and(String::is_empty);
+        let interruptible =
+            !ignored_on_entry && !sh.traps.get(&SIGINT).is_some_and(String::is_empty);
         // Built per line rather than once: `commands` reads `PATH` and the
         // filesystem, and the command just run may have changed either.
         let cmds = |p: &str| complete::commands(sh, p);
         let ents = |d: &str, p: &str| complete::entries(sh, d, p);
-        let src = complete::Source { commands: &cmds, entries: &ents };
+        let src = complete::Source {
+            commands: &cmds,
+            entries: &ents,
+        };
         match editor.read(&prompt, interruptible, &src) {
             line::Input::Eof => return ReadResult::Eof,
             // Ctrl-C throws away the WHOLE unit, not just the line it arrived
@@ -585,8 +585,10 @@ fn read_complete(
         match parser::parse_probe(buffer, &sh.aliases) {
             Ok(_) => return ReadResult::Ready,
             Err(e) if e.is_incomplete() => {
-                prompt =
-                    line::expand_prompt(&sh.get_var("PS2").unwrap_or_else(|| "> ".to_string()), &env);
+                prompt = line::expand_prompt(
+                    &sh.get_var("PS2").unwrap_or_else(|| "> ".to_string()),
+                    &env,
+                );
             }
             // A real syntax error: hand the buffer back so the caller reports it.
             Err(_) => return ReadResult::Ready,
@@ -844,9 +846,15 @@ mod confinement {
         let open = concat!("/", "*");
         let shut = concat!("*", "/");
         // The decoy: a block comment carrying a declaration.
-        assert_eq!(code_only(&format!("let a = 1;\n{open} struct Funcs {shut}\n")), "let a = 1;\n");
+        assert_eq!(
+            code_only(&format!("let a = 1;\n{open} struct Funcs {shut}\n")),
+            "let a = 1;\n"
+        );
         // Nested, as Rust allows.
-        assert_eq!(code_only(&format!("a{open} b {open} c {shut} d {shut}e")), "a e");
+        assert_eq!(
+            code_only(&format!("a{open} b {open} c {shut} d {shut}e")),
+            "a e"
+        );
         // A line comment, as before.
         assert_eq!(code_only("keep // drop\n"), "keep");
         // An opener INSIDE a line comment opens nothing.
@@ -858,7 +866,10 @@ mod confinement {
         assert_eq!(code_only(&pat), pat);
         // And the code BETWEEN two of them is not swallowed.
         let pair = format!("{glob}\nkeepme\n{pat}");
-        assert!(code_only(&pair).contains("keepme"), "code between two literals was swallowed");
+        assert!(
+            code_only(&pair).contains("keepme"),
+            "code between two literals was swallowed"
+        );
         // A raw string keeps its hashes and its contents.
         let raw = "let r = r#\"a\"b\"#;";
         assert_eq!(code_only(raw), raw);
@@ -881,7 +892,10 @@ mod confinement {
         // And a comment spanning LINES keeps them apart: without the newlines
         // inside it, `foo` and `bar` below join into one line and a
         // line-shaped needle straddles what was removed.
-        assert_eq!(code_only(&format!("foo\n{open} c\n{shut} bar")), "foo\n\nbar");
+        assert_eq!(
+            code_only(&format!("foo\n{open} c\n{shut} bar")),
+            "foo\n\nbar"
+        );
         // The forms below are the ones that DIVERGE. Review found the first
         // draft of each passing with the arm it was meant to pin removed: a
         // space after `'r`, a `'\''` for the character arm, and a `br` body
@@ -898,13 +912,19 @@ mod confinement {
         // has 31 of these, most of them in `lexer.rs`.
         let quote = format!("let q = '\"'; {open} gone {shut} after");
         let out = code_only(&quote);
-        assert!(!out.contains("gone"), "comment survived a char literal: {out}");
+        assert!(
+            !out.contains("gone"),
+            "comment survived a char literal: {out}"
+        );
         assert!(out.contains("after"), "code after it was eaten: {out}");
         // The `br` prefix, twin of the `cr` case above. The body needs a
         // quote in it or both readings consume the same span.
         let braw = format!("let s = br#\"x\"{open}\"#; after");
         let out = code_only(&braw);
-        assert!(out.contains("after"), "a byte raw string was mis-ended: {out}");
+        assert!(
+            out.contains("after"),
+            "a byte raw string was mis-ended: {out}"
+        );
         assert_eq!(out, braw, "a byte raw string is a literal, kept whole");
     }
 
@@ -928,7 +948,11 @@ mod confinement {
     #[test]
     fn the_diagnostic_sink_has_exactly_three_callers() {
         let needle = concat!("write_", "stderr(");
-        assert_eq!(count_code(needle), 4, "a new caller of {needle} would bypass `$0`");
+        assert_eq!(
+            count_code(needle),
+            4,
+            "a new caller of {needle} would bypass `$0`"
+        );
         assert_eq!(count_code(concat!("pub fn write_", "stderr(")), 1);
         // Named whole, so a fourth caller cannot arrive by REPLACING one. The
         // full sink builds its prefix over several lines now, so what is
@@ -971,7 +995,9 @@ mod confinement {
     fn the_map_carries_no_visibility_and_only_completion_enumerates() {
         let decl = "structFuncs{table:HashMap<String,Func>,}";
         assert_eq!(
-            squeeze(&code_only(source("funcs.rs"))).matches(decl).count(),
+            squeeze(&code_only(source("funcs.rs")))
+                .matches(decl)
+                .count(),
             1,
             "the map must be the one field of `Funcs` and carry no visibility"
         );
@@ -979,7 +1005,9 @@ mod confinement {
         for (module, _) in SOURCES.iter().filter(|(n, _)| *n != "funcs.rs") {
             let want = usize::from(*module == "complete.rs");
             assert_eq!(
-                squeeze(&code_only(source(module))).matches(enumerate).count(),
+                squeeze(&code_only(source(module)))
+                    .matches(enumerate)
+                    .count(),
                 want,
                 "{module}: completion names the enumeration once, every other module never"
             );
@@ -1010,7 +1038,10 @@ mod confinement {
         declared.sort_unstable();
         let mut listed: Vec<String> = SOURCES.iter().map(|(n, _)| (*n).to_string()).collect();
         listed.sort_unstable();
-        assert_eq!(declared, listed, "SOURCES and main.rs's `mod` lines disagree");
+        assert_eq!(
+            declared, listed,
+            "SOURCES and main.rs's `mod` lines disagree"
+        );
     }
 
     /// Exactly one scoped allow and exactly one unsafe block, both in `sys.rs`.
@@ -1090,8 +1121,7 @@ mod confinement {
         // something admitted: the two `TCSETS` variants that drain or discard
         // pending I/O, the winsize SETTER, the input injector, and the
         // controlling-terminal call that is td-init's.
-        const REFUSED: &[&str] =
-            &["TCSETSW", "TCSETSF", "TIOCSWINSZ", "TIOCSTI", "TIOCSCTTY"];
+        const REFUSED: &[&str] = &["TCSETSW", "TCSETSF", "TIOCSWINSZ", "TIOCSTI", "TIOCSCTTY"];
         // The crate's own tests name these freely, so the scan stops where they
         // begin -- and comments go too, or a `// TIOCSTI` would red it.
         let shipped = source("sys.rs")
@@ -1186,14 +1216,20 @@ mod confinement {
             concat!("constPOLL", "FD_COUNT:usize=1;"),
             concat!("constPOLL", "FD_WORDS:usize=2;"),
         ] {
-            assert_eq!(sys.matches(decl).count(), 1, "`{decl}` must be pinned by value");
+            assert_eq!(
+                sys.matches(decl).count(),
+                1,
+                "`{decl}` must be pinned by value"
+            );
         }
         // The length assertion is in the SHIPPED build, not a test, and it is
         // the two constants MULTIPLIED -- a count and a width each right on
         // their own still overrun if their product is not the buffer.
         assert_eq!(
             sys.matches(concat!(
-                "const_:()=assert!(POLL", "FD_COUNT*POLL", "FD_WORDS*core::mem::size_of::<u32>()==8);"
+                "const_:()=assert!(POLL",
+                "FD_COUNT*POLL",
+                "FD_WORDS*core::mem::size_of::<u32>()==8);"
             ))
             .count(),
             1,
@@ -1216,7 +1252,8 @@ mod confinement {
         );
         // ... and exactly one request is ever built, asking for POLLIN alone.
         assert_eq!(
-            sys.matches(concat!("poll", "fd(fd_word,POLL", "IN)")).count(),
+            sys.matches(concat!("poll", "fd(fd_word,POLL", "IN)"))
+                .count(),
             1,
             "one request, one event"
         );
@@ -1256,12 +1293,20 @@ mod confinement {
             concat!("constSIG", "_DFL:usize=0;"),
             concat!("constSIG", "_IGN:usize=1;"),
         ] {
-            assert_eq!(sys.matches(decl).count(), 1, "`{decl}` must be pinned by value");
+            assert_eq!(
+                sys.matches(decl).count(),
+                1,
+                "`{decl}` must be pinned by value"
+            );
         }
         // Both appear exactly three times in code: the declaration, the decode
         // that reads one back, and the `Disposition` arm that asks for it.
         for name in [concat!("SIG", "_DFL"), concat!("SIG", "_IGN")] {
-            assert_eq!(sys.matches(name).count(), 3, "{name} is named somewhere new");
+            assert_eq!(
+                sys.matches(name).count(),
+                3,
+                "{name} is named somewhere new"
+            );
         }
         for (name, text) in SOURCES {
             if *name == "sys.rs" {
@@ -1276,7 +1321,10 @@ mod confinement {
         // The struct is four words and the handler is the FIRST, written out
         // rather than indexed so the order is visible at the one write.
         assert!(
-            sys.contains(concat!("letact:[usize;SIGACTION", "_WORDS]=[handler,0,0,0];")),
+            sys.contains(concat!(
+                "letact:[usize;SIGACTION",
+                "_WORDS]=[handler,0,0,0];"
+            )),
             "the installed action is no longer `handler` followed by three zeros"
         );
     }
@@ -1290,7 +1338,9 @@ mod confinement {
     fn the_confined_block_is_pinned_whole() {
         let sys = squeeze(source("sys.rs"));
         let body = squeeze(concat!(
-            "core::arch::", "asm", "!(\n",
+            "core::arch::",
+            "asm",
+            "!(\n",
             "    \"syscall\",\n",
             "    inlateout(\"rax\") n as isize => ret,\n",
             "    in(\"rdi\") a1,\n",
@@ -1398,7 +1448,9 @@ mod confinement {
             concat!("SYS", "_POLL,"),
         ] {
             assert_eq!(
-                squeezed.matches(&format!("{}{number}", concat!("syscall", "4("))).count(),
+                squeezed
+                    .matches(&format!("{}{number}", concat!("syscall", "4(")))
+                    .count(),
                 1,
                 "each call must pass the named syscall number"
             );

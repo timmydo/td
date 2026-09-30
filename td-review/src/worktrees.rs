@@ -177,7 +177,9 @@ pub struct Planned {
 /// error as the reason: the sweep never removes on a failed query.
 pub fn plan(git: &Git, base: &str) -> io::Result<Vec<Planned>> {
     let out = git.run_ok(&["worktree", "list", "--porcelain"])?;
-    let here = git.run_ok(&["rev-parse", "--show-toplevel"]).unwrap_or_default();
+    let here = git
+        .run_ok(&["rev-parse", "--show-toplevel"])
+        .unwrap_or_default();
     let mut planned = Vec::new();
     for worktree in parse_list(&out, Some(here.trim()).filter(|h| !h.is_empty())) {
         let verdict = match early_verdict(&worktree) {

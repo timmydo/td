@@ -101,9 +101,10 @@ fn main() -> ExitCode {
         Some(b"--list") => tell(&names().join("\n")),
         Some(b"--help" | b"-h") => tell(&usage()),
         Some(name) => match lookup(name) {
-            Some(run) => {
-                ExitCode::from(clamp(spawn(run, argv.get(1..).unwrap_or_default().to_vec())))
-            }
+            Some(run) => ExitCode::from(clamp(spawn(
+                run,
+                argv.get(1..).unwrap_or_default().to_vec(),
+            ))),
             None => {
                 use std::io::Write;
                 let msg = util::name_in("td-txt: unknown applet `", name, "'\n");
@@ -178,7 +179,9 @@ mod tests {
         // into a failure.
         let marker = concat!("#[cfg", "(test)]");
         for name in ["main.rs", "grep.rs", "regex.rs", "sed.rs", "util.rs"] {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name);
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join(name);
             let text = std::fs::read_to_string(&path).unwrap();
             // Truncating at the marker strips the WHOLE test half only while
             // there is exactly one, which is what makes this scan complete.
@@ -207,7 +210,10 @@ mod tests {
     #[test]
     fn every_applet_name_resolves() {
         for name in names() {
-            assert!(lookup(name.as_bytes()).is_some(), "{name} is listed but does not dispatch");
+            assert!(
+                lookup(name.as_bytes()).is_some(),
+                "{name} is listed but does not dispatch"
+            );
         }
         assert!(lookup(b"awk").is_none());
     }

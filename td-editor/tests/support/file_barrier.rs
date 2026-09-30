@@ -70,10 +70,7 @@ impl Barrier {
                     break;
                 }
                 let mut line = Vec::new();
-                let read = reader
-                    .by_ref()
-                    .take(65)
-                    .read_until(b'\n', &mut line);
+                let read = reader.by_ref().take(65).read_until(b'\n', &mut line);
                 // No request is expected while the editor is idle. A partial
                 // frame must still fail instead of losing its consumed bytes.
                 let count = match read {
@@ -82,7 +79,10 @@ impl Barrier {
                             && matches!(
                                 error.kind(),
                                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                            ) => continue,
+                            ) =>
+                    {
+                        continue
+                    }
                     result => result.expect("barrier request frame"),
                 };
                 if count == 0 {
@@ -496,11 +496,9 @@ fn admitted_deletion_preserves_edits_and_incidental_directory_views() {
         .unwrap();
     let job = response.strip_prefix("pending\t").unwrap();
     let held = barrier.held();
-    assert!(
-        editor
-            .ok("state")
-            .contains(&format!("job={job},delete,2,1,0,pending,-"))
-    );
+    assert!(editor
+        .ok("state")
+        .contains(&format!("job={job},delete,2,1,0,pending,-")));
     editor.ok("select-tab\t1\t1");
     editor.ok("insert\t1\t1\t1\t1\t62");
     compositor.chord(Some(KEY_LEFT_CTRL), KEY_SPACE);

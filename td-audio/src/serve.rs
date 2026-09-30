@@ -107,9 +107,11 @@ impl Policy {
     }
 
     pub fn for_deployment(own: u32) -> io::Result<Self> {
-        Self::deployment_policy(own, std::fs::symlink_metadata(crate::app_policy::PATH).map(|_| ()), || {
-            crate::app_policy::load().map_err(io::Error::other)
-        })
+        Self::deployment_policy(
+            own,
+            std::fs::symlink_metadata(crate::app_policy::PATH).map(|_| ()),
+            || crate::app_policy::load().map_err(io::Error::other),
+        )
     }
 
     fn deployment_policy(
@@ -2078,25 +2080,46 @@ mod tests {
 
     #[test]
     fn deployment_audio_admits_only_the_assigned_browser_and_fails_closed() {
-        let installed = || crate::app_policy::Policy::parse(
+        let installed = || {
+            crate::app_policy::Policy::parse(
             "td-bus-applications-v1\t1000\n65539\tclaude\t\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n65538\tnews\t\n"
-        ).map_err(io::Error::other);
+        ).map_err(io::Error::other)
+        };
         let policy = Policy::deployment_policy(994, Ok(()), installed).unwrap();
         for uid in [994, 1000, 65536] {
-            assert!(policy.admits(&sys::Peer { pid: 1, uid, gid: uid }));
+            assert!(policy.admits(&sys::Peer {
+                pid: 1,
+                uid,
+                gid: uid
+            }));
         }
         for uid in [0, 991, 993, 1001, 65537, 65538, 65539] {
-            assert!(!policy.admits(&sys::Peer { pid: 1, uid, gid: uid }));
+            assert!(!policy.admits(&sys::Peer {
+                pid: 1,
+                uid,
+                gid: uid
+            }));
         }
         let fallback = Policy::deployment_policy(994, Err(io::ErrorKind::NotFound.into()), || {
             panic!("missing deployment must not call loader")
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(fallback.allowed_uids, [994, 1000]);
-        assert!(Policy::deployment_policy(994, Err(io::ErrorKind::PermissionDenied.into()), installed).is_err());
-        assert!(Policy::deployment_policy(994, Ok(()), || Err(io::Error::other("invalid policy"))).is_err());
+        assert!(Policy::deployment_policy(
+            994,
+            Err(io::ErrorKind::PermissionDenied.into()),
+            installed
+        )
+        .is_err());
+        assert!(
+            Policy::deployment_policy(994, Ok(()), || Err(io::Error::other("invalid policy")))
+                .is_err()
+        );
         let no_browser = Policy::deployment_policy(994, Ok(()), || {
-            crate::app_policy::Policy::parse("td-bus-applications-v1\t1000\n65537\tmail\t\n").map_err(io::Error::other)
-        }).unwrap();
+            crate::app_policy::Policy::parse("td-bus-applications-v1\t1000\n65537\tmail\t\n")
+                .map_err(io::Error::other)
+        })
+        .unwrap();
         assert_eq!(no_browser.allowed_uids, [994, 1000]);
     }
 

@@ -7,9 +7,9 @@
 //! `td-install/DESIGN.md` §6 is why.
 #![forbid(unsafe_code)]
 
-mod protocol;
 #[path = "measurement.rs"]
 mod measurement;
+mod protocol;
 #[path = "volume.rs"]
 mod volume;
 // The real-regular-bounded file rule, shared with `td-install` for
@@ -46,19 +46,19 @@ mod sha256;
 // verifies and never signs, since a signer here would be a crypto surface
 // serving no boot-time purpose. That is not left to a comment —
 // `builder/src/affected.rs` refuses any file under `td-boot/src` that names it.
-#[path = "../../engine/src/sha512.rs"]
-#[allow(dead_code)]
-mod sha512;
 #[path = "../../engine/src/ed25519.rs"]
 #[allow(dead_code)]
 mod ed25519;
+#[path = "../../engine/src/sha512.rs"]
+#[allow(dead_code)]
+mod sha512;
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
 use std::io::{self, Seek, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{
-    DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink,
+    symlink, DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -82,9 +82,17 @@ const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const UPDATE_LOCK_DIR: &str = "/run/td-boot-locks";
 
 enum Mode {
-    OnVolume { operation: Box<Mode> },
-    MountVolume { device: PathBuf, mountpoint: PathBuf, var: bool },
-    Volume { uuid: Option<volume::Uuid> },
+    OnVolume {
+        operation: Box<Mode>,
+    },
+    MountVolume {
+        device: PathBuf,
+        mountpoint: PathBuf,
+        var: bool,
+    },
+    Volume {
+        uuid: Option<volume::Uuid>,
+    },
     Verify {
         root: PathBuf,
     },
@@ -260,18 +268,37 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
     match args.next().as_deref() {
         Some(mode) if mode == OsStr::new("on-volume") => {
             let verb = args.next().ok_or_else(usage_error)?;
-            if !matches!(verb.to_str(), Some("boot" | "install" | "update" | "rollback" | "success" | "mount-root" | "mount-var")) {
+            if !matches!(
+                verb.to_str(),
+                Some(
+                    "boot"
+                        | "install"
+                        | "update"
+                        | "rollback"
+                        | "success"
+                        | "mount-root"
+                        | "mount-var"
+                )
+            ) {
                 return Err(usage_error());
             }
             let mut inner = vec![verb, OsString::from("/volume-device")];
             inner.extend(args);
-            Ok(Mode::OnVolume { operation: Box::new(parse_args(inner.into_iter())?) })
+            Ok(Mode::OnVolume {
+                operation: Box::new(parse_args(inner.into_iter())?),
+            })
         }
         Some(mode) if mode == OsStr::new("mount-root") || mode == OsStr::new("mount-var") => {
             let device = PathBuf::from(args.next().ok_or_else(usage_error)?);
             let mountpoint = PathBuf::from(args.next().ok_or_else(usage_error)?);
-            if args.next().is_some() { return Err(usage_error()); }
-            Ok(Mode::MountVolume { device, mountpoint, var: mode == OsStr::new("mount-var") })
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::MountVolume {
+                device,
+                mountpoint,
+                var: mode == OsStr::new("mount-var"),
+            })
         }
         Some(mode) if mode == OsStr::new("volume") => {
             let uuid = args
@@ -575,16 +602,17 @@ fn open_bundle(directory: &Path, trust: Option<&TrustRoot>) -> io::Result<Verifi
     require_absolute(directory, "deployment directory")?;
     require_real_directory(directory, "deployment directory")?;
     let manifest_path = directory.join(protocol::MANIFEST_NAME);
-    let manifest =
-        read_bounded_real_file(&manifest_path, "deployment manifest", protocol::MAX_MANIFEST_BYTES)?;
+    let manifest = read_bounded_real_file(
+        &manifest_path,
+        "deployment manifest",
+        protocol::MAX_MANIFEST_BYTES,
+    )?;
     let signature = read_optional_signature(signature_path(directory))?;
     if let Some(key) = trust {
         // An UNSIGNED bundle is refused rather than treated as unverifiable,
         // or the check would be escapable by deleting `manifest.sig`.
         let detached = signature.as_ref().ok_or_else(|| {
-            invalid(
-                "deployment carries no signature and a trust root was supplied".to_string(),
-            )
+            invalid("deployment carries no signature and a trust root was supplied".to_string())
         })?;
         authenticate_manifest(&manifest, detached, key)?;
     }
@@ -665,12 +693,10 @@ mod detached {
                 error.kind(),
                 format!("deployment signature {}: {error}", path.display()),
             )),
-            Ok(_) => read_bounded_real_file(
-                &path,
-                "deployment signature",
-                protocol::MAX_SIGNATURE_BYTES,
-            )
-            .map(|bytes| Some(DetachedSignature { path, bytes })),
+            Ok(_) => {
+                read_bounded_real_file(&path, "deployment signature", protocol::MAX_SIGNATURE_BYTES)
+                    .map(|bytes| Some(DetachedSignature { path, bytes }))
+            }
         }
     }
 
@@ -683,7 +709,7 @@ mod detached {
     }
 }
 
-use detached::{DetachedSignature, read_optional_signature};
+use detached::{read_optional_signature, DetachedSignature};
 
 /// Decode exactly `N` bytes of hex, tolerating surrounding ASCII whitespace —
 /// `td-deploy` writes a trailing newline after both the signature and the key,
@@ -1951,9 +1977,8 @@ fn select_boot_deployment(root: &Path, key: &TrustRoot) -> io::Result<BootDecisi
     )?;
     // Invalid attempt metadata cannot authorize a write, but must not prevent
     // conservative verified-previous recovery.
-    let attempts = attempts_directory(root, false).map_err(|error| {
-        io::Error::other(format!("boot attempt bookkeeping rejected: {error}"))
-    })?;
+    let attempts = attempts_directory(root, false)
+        .map_err(|error| io::Error::other(format!("boot attempt bookkeeping rejected: {error}")))?;
     if let Some(attempts) = attempts {
         reap_attempt_temporaries(&attempts)?;
     }
@@ -2009,26 +2034,24 @@ fn select_boot_deployment(root: &Path, key: &TrustRoot) -> io::Result<BootDecisi
                 }),
             }
         }
-        Err(error) => {
-            match verified_previous_decision(root, Some(error.to_string()), None, key) {
-                Ok(decision) => {
-                    replace_selector(root, "current", &decision.deployment_id)?;
-                    Ok(decision)
-                }
-                Err(previous) => Ok(BootDecision {
-                    slot: "current",
-                    deployment_id: current.id,
-                    current_error: None,
-                    exhausted_deployment: None,
-                    fallback_error: None,
-                    bookkeeping_error: Some(format!(
-                        "current attempt state rejected ({error}); \
-                         previous unavailable ({previous})"
-                    )),
-                    remaining_attempts: None,
-                }),
+        Err(error) => match verified_previous_decision(root, Some(error.to_string()), None, key) {
+            Ok(decision) => {
+                replace_selector(root, "current", &decision.deployment_id)?;
+                Ok(decision)
             }
-        }
+            Err(previous) => Ok(BootDecision {
+                slot: "current",
+                deployment_id: current.id,
+                current_error: None,
+                exhausted_deployment: None,
+                fallback_error: None,
+                bookkeeping_error: Some(format!(
+                    "current attempt state rejected ({error}); \
+                         previous unavailable ({previous})"
+                )),
+                remaining_attempts: None,
+            }),
+        },
     }
 }
 
@@ -2271,7 +2294,6 @@ fn report_boot_decision(out: &mut dyn Write, decision: &BootDecision) -> io::Res
     diagnostic(out, format_args!("{marker} {}", decision.deployment_id))
 }
 
-
 fn attempt_status(state: Option<u8>) -> String {
     match state {
         None => "successful".to_string(),
@@ -2300,7 +2322,8 @@ fn run_verify(root: &Path) -> io::Result<()> {
     writeln!(
         io::stdout(),
         "{} {} {status}",
-        selection.slot, selection.deployment.id
+        selection.slot,
+        selection.deployment.id
     )
 }
 
@@ -2427,10 +2450,7 @@ fn decode_mountinfo_field(field: &[u8]) -> io::Result<OsString> {
     Ok(OsString::from_vec(decoded))
 }
 
-fn mounted_btrfs_source(
-    mountinfo: &[u8],
-    mountpoint: &Path,
-) -> io::Result<Option<OsString>> {
+fn mounted_btrfs_source(mountinfo: &[u8], mountpoint: &Path) -> io::Result<Option<OsString>> {
     let mut found = None;
     for line in mountinfo.split(|byte| *byte == b'\n') {
         let mut fields = line.split(|byte| *byte == b' ');
@@ -2458,7 +2478,10 @@ fn mounted_btrfs_source(
             b"nosuid".as_slice(),
             b"noexec".as_slice(),
         ] {
-            if !options.split(|byte| *byte == b',').any(|option| option == required) {
+            if !options
+                .split(|byte| *byte == b',')
+                .any(|option| option == required)
+            {
                 return Err(invalid(format!(
                     "update mountpoint has unexpected mount options: {}",
                     mountpoint.display()
@@ -2645,7 +2668,8 @@ fn run_on_prelocked_writable_volume<T>(
     device_id: u64,
     operation: impl FnOnce(&Path) -> io::Result<T>,
 ) -> Result<T, WritableVolumeFailure<T>> {
-    prepare_update_mountpoint(mountpoint, device, device_id).map_err(WritableVolumeFailure::Transaction)?;
+    prepare_update_mountpoint(mountpoint, device, device_id)
+        .map_err(WritableVolumeFailure::Transaction)?;
     run_command(
         &mut writable_mount_command(device, mountpoint),
         "read-write Btrfs mount",
@@ -2757,7 +2781,11 @@ fn kexec_boot_decision(
     )?;
     if measured {
         let pcr = measurement::measure(&deployment.id, cmdline.as_bytes())?;
-        writeln!(io::stderr(), "td-boot: TD-BOOT-MEASURED-PCR11 {}", sha256::to_base16(&pcr))?;
+        writeln!(
+            io::stderr(),
+            "td-boot: TD-BOOT-MEASURED-PCR11 {}",
+            sha256::to_base16(&pcr)
+        )?;
     }
     let Deployment {
         kernel, initramfs, ..
@@ -2801,55 +2829,54 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
         return result;
     }
 
-    let decision =
-        match run_on_prelocked_writable_volume(device, mountpoint, device_id, |root| {
-            select_boot_deployment(root, &key)
-        }) {
-            Ok(decision) => decision,
-            Err(WritableVolumeFailure::Committed {
-                value: decision,
-                unmount_error,
-            }) => {
-                let result = (|| {
-                    writeln!(
-                        io::stderr(),
-                        "td-boot: selection committed but Btrfs unmount failed \
+    let decision = match run_on_prelocked_writable_volume(device, mountpoint, device_id, |root| {
+        select_boot_deployment(root, &key)
+    }) {
+        Ok(decision) => decision,
+        Err(WritableVolumeFailure::Committed {
+            value: decision,
+            unmount_error,
+        }) => {
+            let result = (|| {
+                writeln!(
+                    io::stderr(),
+                    "td-boot: selection committed but Btrfs unmount failed \
                          ({unmount_error}); booting the committed deployment"
-                    )?;
-                    let deployment =
-                        authenticated_deployment(mountpoint, &decision.deployment_id, &key)?;
-                    kexec_boot_decision(deployment, &decision, base_cmdline, measured)
-                })();
-                best_effort_unmount(mountpoint);
-                return result;
-            }
-            Err(WritableVolumeFailure::Mounted(transaction_error)) => {
-                let result = (|| {
-                    let (decision, deployment) =
-                        read_only_recovery(mountpoint, &transaction_error, &key)?;
-                    kexec_boot_decision(deployment, &decision, base_cmdline, measured)
-                })();
-                best_effort_unmount(mountpoint);
-                return result;
-            }
-            Err(WritableVolumeFailure::Transaction(transaction_error)) => {
-                // Update APIs fail closed on semantic errors; PID 1 still tries the
-                // verified payload-only recovery path before giving up.
-                best_effort_unmount(mountpoint);
-                prepare_update_mountpoint(mountpoint, device, device_id)?;
-                run_command(
-                    &mut mount_command(device, mountpoint),
-                    "read-only Btrfs recovery mount",
                 )?;
-                let result = (|| {
-                    let (decision, deployment) =
-                        read_only_recovery(mountpoint, &transaction_error, &key)?;
-                    kexec_boot_decision(deployment, &decision, base_cmdline, measured)
-                })();
-                best_effort_unmount(mountpoint);
-                return result;
-            }
-        };
+                let deployment =
+                    authenticated_deployment(mountpoint, &decision.deployment_id, &key)?;
+                kexec_boot_decision(deployment, &decision, base_cmdline, measured)
+            })();
+            best_effort_unmount(mountpoint);
+            return result;
+        }
+        Err(WritableVolumeFailure::Mounted(transaction_error)) => {
+            let result = (|| {
+                let (decision, deployment) =
+                    read_only_recovery(mountpoint, &transaction_error, &key)?;
+                kexec_boot_decision(deployment, &decision, base_cmdline, measured)
+            })();
+            best_effort_unmount(mountpoint);
+            return result;
+        }
+        Err(WritableVolumeFailure::Transaction(transaction_error)) => {
+            // Update APIs fail closed on semantic errors; PID 1 still tries the
+            // verified payload-only recovery path before giving up.
+            best_effort_unmount(mountpoint);
+            prepare_update_mountpoint(mountpoint, device, device_id)?;
+            run_command(
+                &mut mount_command(device, mountpoint),
+                "read-only Btrfs recovery mount",
+            )?;
+            let result = (|| {
+                let (decision, deployment) =
+                    read_only_recovery(mountpoint, &transaction_error, &key)?;
+                kexec_boot_decision(deployment, &decision, base_cmdline, measured)
+            })();
+            best_effort_unmount(mountpoint);
+            return result;
+        }
+    };
 
     prepare_update_mountpoint(mountpoint, device, device_id)?;
     run_command(
@@ -3287,7 +3314,11 @@ fn mount_volume(device: &Path, mountpoint: &Path, var: bool) -> io::Result<()> {
 fn dispatch(mode: Mode) -> io::Result<()> {
     match mode {
         Mode::OnVolume { operation } => on_volume(*operation),
-        Mode::MountVolume { device, mountpoint, var } => mount_volume(&device, &mountpoint, var),
+        Mode::MountVolume {
+            device,
+            mountpoint,
+            var,
+        } => mount_volume(&device, &mountpoint, var),
         Mode::Volume { uuid } => {
             let (uuid, path) = volume::resolve(uuid.as_ref())?;
             writeln!(io::stdout(), "{uuid} {}", path.display())
@@ -3864,7 +3895,12 @@ mod tests {
                 ..
             })
         ));
-        match parse_args(args(&["publish", "/volume", "/incoming/deployment", "/key.pub"])) {
+        match parse_args(args(&[
+            "publish",
+            "/volume",
+            "/incoming/deployment",
+            "/key.pub",
+        ])) {
             Ok(Mode::Publish { trusted_key, .. }) => {
                 assert_eq!(trusted_key.as_deref(), Some(Path::new("/key.pub")));
             }
@@ -4421,7 +4457,9 @@ mod tests {
         fs::write(&key, format!("{FIXTURE_PUBLIC_KEY}\n")).unwrap();
 
         assert!(
-            update_decision(any_mount_point(), &channel, &key).unwrap().is_none(),
+            update_decision(any_mount_point(), &channel, &key)
+                .unwrap()
+                .is_none(),
             "an empty channel decides on nothing"
         );
 
@@ -4675,7 +4713,10 @@ mod tests {
     /// test cannot create either.
     #[test]
     fn a_volume_does_not_contain_its_name_plus_more_letters() {
-        assert!(is_within(Path::new("/run/td"), Path::new("/run/td/key.pub")));
+        assert!(is_within(
+            Path::new("/run/td"),
+            Path::new("/run/td/key.pub")
+        ));
         assert!(is_within(Path::new("/run/td"), Path::new("/run/td")));
         assert!(is_within(Path::new("/"), Path::new("/anything/at/all")));
         assert!(
@@ -4827,12 +4868,19 @@ mod tests {
             "the installed signature must be the one just supplied"
         );
         // And nothing is left over from the in-place replacement.
-        let entries = fs::read_dir(fixture.root.join(protocol::DEPLOYMENTS_DIR).join(&candidate))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>();
+        let entries = fs::read_dir(
+            fixture
+                .root
+                .join(protocol::DEPLOYMENTS_DIR)
+                .join(&candidate),
+        )
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
         assert!(
-            entries.iter().all(|name| !name.as_bytes().starts_with(b".")),
+            entries
+                .iter()
+                .all(|name| !name.as_bytes().starts_with(b".")),
             "no staging temporary survives: {entries:?}"
         );
     }
@@ -4857,13 +4905,20 @@ mod tests {
         // Held, so the first name is still taken when the second is staged.
         let (second, keep_second) = write_signature_temporary(&directory, b"bb22\n").unwrap();
         assert_ne!(first, second, "a second staging must not reuse the name");
-        assert_eq!(fs::read(&first).unwrap(), b"aa11\n", "and must not clobber it");
+        assert_eq!(
+            fs::read(&first).unwrap(),
+            b"aa11\n",
+            "and must not clobber it"
+        );
         assert_eq!(fs::read(&second).unwrap(), b"bb22\n");
 
         // Both are still this function's own to remove.
         drop(keep_first);
         drop(keep_second);
-        assert!(!first.exists() && !second.exists(), "the guards remove both");
+        assert!(
+            !first.exists() && !second.exists(),
+            "the guards remove both"
+        );
     }
 
     /// A rotation that cannot rename must not leave its temporary behind, or
@@ -4880,7 +4935,10 @@ mod tests {
 
         // A directory at the destination makes the rename fail with the
         // temporary already written.
-        let published = fixture.root.join(protocol::DEPLOYMENTS_DIR).join(&candidate);
+        let published = fixture
+            .root
+            .join(protocol::DEPLOYMENTS_DIR)
+            .join(&candidate);
         fs::remove_file(published.join(protocol::MANIFEST_SIG_NAME)).unwrap();
         fs::create_dir(published.join(protocol::MANIFEST_SIG_NAME)).unwrap();
         assert!(replace_signature(&published, b"bb22\n").is_err());
@@ -4947,7 +5005,10 @@ mod tests {
         );
         // And one byte more is not.
         fs::write(&path, vec![b'a'; 161]).unwrap();
-        assert!(open_bundle(&source, None).map(|_| ()).is_err(), "one past the bound");
+        assert!(
+            open_bundle(&source, None).map(|_| ()).is_err(),
+            "one past the bound"
+        );
     }
 
     /// Upgrading an already-installed unsigned deployment to a signed one is
@@ -5009,9 +5070,16 @@ mod tests {
         // `VerifiedBundle` holds open files and is deliberately not `Debug`.
         let refusal = |r: io::Result<VerifiedBundle>| r.map(|_| ()).unwrap_err();
 
-        fs::write(&path, vec![b'a'; (protocol::MAX_SIGNATURE_BYTES + 1) as usize]).unwrap();
+        fs::write(
+            &path,
+            vec![b'a'; (protocol::MAX_SIGNATURE_BYTES + 1) as usize],
+        )
+        .unwrap();
         let error = refusal(open_bundle(&source, None));
-        assert!(error.to_string().contains("deployment signature"), "{error}");
+        assert!(
+            error.to_string().contains("deployment signature"),
+            "{error}"
+        );
 
         fs::remove_file(&path).unwrap();
         symlink("manifest", &path).unwrap();
@@ -5358,7 +5426,9 @@ mod tests {
         let attempts = fixture.root.join(protocol::ATTEMPTS_DIR);
         fs::set_permissions(&attempts, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let error = select_boot_deployment(&fixture.root, &fixture.key()).err().unwrap();
+        let error = select_boot_deployment(&fixture.root, &fixture.key())
+            .err()
+            .unwrap();
         let (decision, _) = read_only_recovery(&fixture.root, &error, &fixture.key()).unwrap();
 
         assert!(error.to_string().contains("mode 0700"));
@@ -5713,7 +5783,10 @@ mod tests {
         fixture.selector("previous", &first);
         let (source, second) = fixture.source_bundle("incoming", "next");
         install_deployment(&fixture.root, &source, None).unwrap();
-        assert_ne!(first, second, "the two fixtures must differ to tell slots apart");
+        assert_ne!(
+            first, second,
+            "the two fixtures must differ to tell slots apart"
+        );
 
         let boot = fixture.root.join(protocol::BOOT_DIR);
         for (slot, want) in [
@@ -5744,8 +5817,12 @@ mod tests {
     fn every_committed_fixture_signature_verifies_over_its_own_manifest() {
         let key: TrustRoot =
             decode_hex(FIXTURE_PUBLIC_KEY.as_bytes(), "fixture key", fixture_path()).unwrap();
-        let other: TrustRoot =
-            decode_hex(FIXTURE_OTHER_PUBLIC_KEY.as_bytes(), "other key", fixture_path()).unwrap();
+        let other: TrustRoot = decode_hex(
+            FIXTURE_OTHER_PUBLIC_KEY.as_bytes(),
+            "other key",
+            fixture_path(),
+        )
+        .unwrap();
         assert_ne!(key, other, "the negative control must be a different key");
 
         for (tag, hex) in FIXTURE_SIGNATURES {
@@ -5885,7 +5962,10 @@ mod tests {
             .split("Existing::Resigned(signature) =>")
             .nth(1)
             .unwrap_or_default();
-        let arm = guarded.split("Existing::SignatureWithdrawn").next().unwrap_or_default();
+        let arm = guarded
+            .split("Existing::SignatureWithdrawn")
+            .next()
+            .unwrap_or_default();
         assert!(
             arm.contains("if !authenticated"),
             "the resign warning must be guarded by whether anything checked it"
@@ -5902,7 +5982,11 @@ mod tests {
         let path = fixture.root.join(measurement::POLICY_PATH);
         assert!(!measurement::enabled(&fixture.root).unwrap());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        for bytes in [b"".as_slice(), b"td-selector-pcr11-v2\n", b"td-selector-pcr11-v1\nextra"] {
+        for bytes in [
+            b"".as_slice(),
+            b"td-selector-pcr11-v2\n",
+            b"td-selector-pcr11-v1\nextra",
+        ] {
             fs::write(&path, bytes).unwrap();
             assert!(measurement::enabled(&fixture.root).is_err());
         }
@@ -5916,15 +6000,31 @@ mod tests {
     #[test]
     fn measurement_stays_between_authenticated_selection_and_kexec() {
         let source = include_str!("main.rs");
-        let boot = source.split_once("\nfn run_boot(").unwrap().1.split_once("\n}\n").unwrap().0;
+        let boot = source
+            .split_once("\nfn run_boot(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
         assert!(boot.contains("measurement::enabled(Path::new(BOOT_ROOTFS))?"));
         for call in boot.split("kexec_boot_decision(").skip(1) {
             assert!(call.split_once(')').unwrap().0.ends_with(", measured"));
         }
-        let handoff = source.split_once("\nfn kexec_boot_decision(").unwrap().1.split_once("\n}\n").unwrap().0;
+        let handoff = source
+            .split_once("\nfn kexec_boot_decision(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
         let arguments = handoff.find("let cmdline = kernel_cmdline(").unwrap();
-        let measure = handoff.find("measurement::measure(&deployment.id, cmdline.as_bytes())?").unwrap();
-        let execute = handoff.find("&mut kexec_command(kernel, initramfs, cmdline.as_os_str())").unwrap();
+        let measure = handoff
+            .find("measurement::measure(&deployment.id, cmdline.as_bytes())?")
+            .unwrap();
+        let execute = handoff
+            .find("&mut kexec_command(kernel, initramfs, cmdline.as_os_str())")
+            .unwrap();
         assert!(arguments < measure && measure < execute);
         assert!(handoff.contains("if measured {"));
     }
@@ -6027,7 +6127,8 @@ mod tests {
         fixture.selector("current", &initial);
         fixture.selector("previous", &initial);
         assert_eq!(
-            read_only_current(&fixture.root, &fixture.key()).map(|(decision, _)| decision.deployment_id),
+            read_only_current(&fixture.root, &fixture.key())
+                .map(|(decision, _)| decision.deployment_id),
             Some(initial.clone())
         );
 
@@ -6048,7 +6149,8 @@ mod tests {
         install_deployment(&fixture.root, &source, None).unwrap();
         let transaction_error = io::Error::other("read-write mount rejected");
 
-        let (decision, _) = read_only_recovery(&fixture.root, &transaction_error, &fixture.key()).unwrap();
+        let (decision, _) =
+            read_only_recovery(&fixture.root, &transaction_error, &fixture.key()).unwrap();
 
         assert_eq!(decision.slot, "previous");
         assert_eq!(decision.deployment_id, initial);
@@ -6061,7 +6163,8 @@ mod tests {
                 .join(&decision.deployment_id),
         )
         .unwrap();
-        let (decision, _) = read_only_recovery(&fixture.root, &transaction_error, &fixture.key()).unwrap();
+        let (decision, _) =
+            read_only_recovery(&fixture.root, &transaction_error, &fixture.key()).unwrap();
         assert_eq!(decision.slot, "current");
         assert_eq!(decision.deployment_id, candidate);
     }
@@ -6278,7 +6381,8 @@ mod tests {
         let read_only =
             b"36 25 0:35 / /run/td\\040update ro,nodev,nosuid,noexec - btrfs /dev/vda ro\n";
         assert!(mounted_btrfs_source(read_only, mountpoint).is_err());
-        let stacked = b"36 25 0:35 / /run/td\\040update rw,nodev,nosuid,noexec - btrfs /dev/vda rw\n\
+        let stacked =
+            b"36 25 0:35 / /run/td\\040update rw,nodev,nosuid,noexec - btrfs /dev/vda rw\n\
 37 25 0:36 / /run/td\\040update rw,nodev,nosuid,noexec - btrfs /dev/vda rw\n";
         assert!(mounted_btrfs_source(stacked, mountpoint).is_err());
         assert!(decode_mountinfo_field(b"/run/bad\\09x").is_err());
@@ -6286,10 +6390,8 @@ mod tests {
 
     #[test]
     fn writable_failures_preserve_transaction_outcomes() {
-        let operation = finish_writable_operation::<()>(
-            Err(invalid("invalid attempt state")),
-            Ok(()),
-        );
+        let operation =
+            finish_writable_operation::<()>(Err(invalid("invalid attempt state")), Ok(()));
         assert!(matches!(
             operation,
             Err(WritableVolumeFailure::Transaction(_))
@@ -6458,10 +6560,12 @@ mod tests {
         let other: [u8; ed25519::PUBLIC_KEY_LEN] =
             decode_hex(FIXTURE_OTHER_KEY, "other key", fixture_path()).expect("64 hex characters");
         assert_ne!(other, fixture_key(), "the two fixture keys must differ");
-        assert!(
-            authenticate_manifest(FIXTURE_MANIFEST, &detached_fixture(FIXTURE_SIGNATURE), &other)
-                .is_err()
-        );
+        assert!(authenticate_manifest(
+            FIXTURE_MANIFEST,
+            &detached_fixture(FIXTURE_SIGNATURE),
+            &other
+        )
+        .is_err());
     }
 
     #[test]
@@ -6520,7 +6624,9 @@ mod tests {
     #[test]
     fn a_malformed_signature_is_refused_and_never_fatal() {
         let key = fixture_key();
-        let good = String::from_utf8_lossy(FIXTURE_SIGNATURE).trim().to_string();
+        let good = String::from_utf8_lossy(FIXTURE_SIGNATURE)
+            .trim()
+            .to_string();
         let mut cases: Vec<Vec<u8>> = vec![
             Vec::new(),
             b"\n".to_vec(),
@@ -6554,7 +6660,9 @@ mod tests {
     #[test]
     fn a_signature_may_be_written_with_or_without_a_trailing_newline() {
         let key = fixture_key();
-        let trimmed = String::from_utf8_lossy(FIXTURE_SIGNATURE).trim().to_string();
+        let trimmed = String::from_utf8_lossy(FIXTURE_SIGNATURE)
+            .trim()
+            .to_string();
         for spelling in [
             trimmed.clone(),
             format!("{trimmed}\n"),
@@ -6632,7 +6740,10 @@ mod tests {
         fs::write(&target, FIXTURE_KEY).unwrap();
         let link = fixture.root.join("link.pub");
         symlink(&target, &link).unwrap();
-        assert!(read_trusted_key(&link).is_err(), "a symlinked key is refused");
+        assert!(
+            read_trusted_key(&link).is_err(),
+            "a symlinked key is refused"
+        );
     }
 
     /// EVERY refusal names the file, which is the property `read_trusted_key`
@@ -6787,7 +6898,9 @@ mod tests {
             fs::write(&path, b"tampered").unwrap();
             output.clear();
             let error = run_validate_source(&directory, &key, &mut output).unwrap_err();
-            assert!(error.to_string().contains(&format!("{name} hash mismatch:")));
+            assert!(error
+                .to_string()
+                .contains(&format!("{name} hash mismatch:")));
             assert!(output.is_empty());
             assert_eq!(fs::read(&path).unwrap(), b"tampered");
             fs::write(&path, &original).unwrap();
@@ -6867,7 +6980,9 @@ mod tests {
         fs::write(&key, FIXTURE_OTHER_PUBLIC_KEY).unwrap();
         let mut output = Vec::new();
         let error = run_validate_source(&directory, &key, &mut output).unwrap_err();
-        assert!(error.to_string().contains(protocol::MANIFEST_UNAUTHENTICATED));
+        assert!(error
+            .to_string()
+            .contains(protocol::MANIFEST_UNAUTHENTICATED));
         assert!(output.is_empty());
         fs::write(&key, FIXTURE_PUBLIC_KEY).unwrap();
         fs::remove_file(directory.join(protocol::MANIFEST_SIG_NAME)).unwrap();
@@ -6925,9 +7040,8 @@ mod tests {
         // selector initramfs. Spelled as a LITERAL: comparing it to the
         // constant would agree with itself however wrong the constant was, and
         // wrong here is a key nothing ever reads.
-        let defaulted = parse_args(
-            [OsString::from("authenticate"), OsString::from("/bundle")].into_iter(),
-        );
+        let defaulted =
+            parse_args([OsString::from("authenticate"), OsString::from("/bundle")].into_iter());
         let Ok(Mode::Authenticate { trusted_key, .. }) = defaulted else {
             panic!("authenticate must parse with the key omitted");
         };
@@ -6955,13 +7069,34 @@ mod tests {
 
     #[test]
     fn decode_hex_is_exact_about_length_and_alphabet() {
-        assert_eq!(decode_hex::<2>(b"00ff", "x", fixture_path()).unwrap(), [0x00, 0xff]);
-        assert_eq!(decode_hex::<2>(b"00FF\n", "x", fixture_path()).unwrap(), [0x00, 0xff]);
-        assert!(decode_hex::<2>(b"00f", "x", fixture_path()).is_err(), "odd length");
-        assert!(decode_hex::<2>(b"00ff00", "x", fixture_path()).is_err(), "too long");
-        assert!(decode_hex::<2>(b"00 ff", "x", fixture_path()).is_err(), "inner space");
-        assert!(decode_hex::<2>(b"00g0", "x", fixture_path()).is_err(), "not hex");
+        assert_eq!(
+            decode_hex::<2>(b"00ff", "x", fixture_path()).unwrap(),
+            [0x00, 0xff]
+        );
+        assert_eq!(
+            decode_hex::<2>(b"00FF\n", "x", fixture_path()).unwrap(),
+            [0x00, 0xff]
+        );
+        assert!(
+            decode_hex::<2>(b"00f", "x", fixture_path()).is_err(),
+            "odd length"
+        );
+        assert!(
+            decode_hex::<2>(b"00ff00", "x", fixture_path()).is_err(),
+            "too long"
+        );
+        assert!(
+            decode_hex::<2>(b"00 ff", "x", fixture_path()).is_err(),
+            "inner space"
+        );
+        assert!(
+            decode_hex::<2>(b"00g0", "x", fixture_path()).is_err(),
+            "not hex"
+        );
         // `from_str_radix` accepted a sign; a key parser must not.
-        assert!(decode_hex::<1>(b"+f", "x", fixture_path()).is_err(), "a signed nibble is not hex");
+        assert!(
+            decode_hex::<1>(b"+f", "x", fixture_path()).is_err(),
+            "a signed nibble is not hex"
+        );
     }
 }

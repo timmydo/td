@@ -164,16 +164,11 @@ impl Policy {
 
 /// The immutable image owns both the policy file and its parent.
 pub fn load() -> Result<Policy, String> {
-    let directory = Path::new(PATH)
-        .parent()
-        .ok_or("bus policy has no parent")?;
+    let directory = Path::new(PATH).parent().ok_or("bus policy has no parent")?;
     load_policy_from(directory, (0, 0))
 }
 
-fn load_policy_from(
-    directory: &Path,
-    owner: (u32, u32),
-) -> Result<Policy, String> {
+fn load_policy_from(directory: &Path, owner: (u32, u32)) -> Result<Policy, String> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
@@ -267,7 +262,11 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
     #[test]
     fn policy_loader_refuses_mutable_redirected_and_noncanonical_files() {
-        let root = std::env::temp_dir().join(format!("td-bus-policy-{}-{}", std::process::id(), module_path!()));
+        let root = std::env::temp_dir().join(format!(
+            "td-bus-policy-{}-{}",
+            std::process::id(),
+            module_path!()
+        ));
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         let metadata = fs::metadata(&root).unwrap();

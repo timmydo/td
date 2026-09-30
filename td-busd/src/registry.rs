@@ -22,11 +22,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::lineage::{Caller, Identity, Named, Procfs};
-use crate::match_rule::{
-    Rule, MAX_RULES_PER_CONNECTION, MAX_RULE_TEXT_PER_CONNECTION,
-};
-use crate::{message, policy};
+use crate::match_rule::{Rule, MAX_RULES_PER_CONNECTION, MAX_RULE_TEXT_PER_CONNECTION};
 use crate::transport::MAX_MESSAGE;
+use crate::{message, policy};
 
 /// The most bytes one connection may have waiting to be written.
 ///
@@ -175,8 +173,7 @@ impl DescriptorCharge {
             if wanted > ceiling {
                 return Err(held);
             }
-            match counter.compare_exchange_weak(held, wanted, Ordering::AcqRel, Ordering::Acquire)
-            {
+            match counter.compare_exchange_weak(held, wanted, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return Ok(Self::new(Arc::clone(counter), count)),
                 Err(seen) => held = seen,
             }
@@ -239,10 +236,7 @@ pub struct Descriptors {
 }
 
 impl Descriptors {
-    pub(crate) fn new(
-        fds: Vec<OwnedFd>,
-        charge: DescriptorCharge,
-    ) -> Result<Self, String> {
+    pub(crate) fn new(fds: Vec<OwnedFd>, charge: DescriptorCharge) -> Result<Self, String> {
         if fds.len() != charge.count() {
             return Err(format!(
                 "{} owned descriptors carry a charge for {}",
@@ -448,10 +442,18 @@ impl Outbox {
             // A poisoned queue belongs to a connection whose thread died
             // holding it. Treating that as closed is right and is also the
             // only option that does not panic on a broker's routing path.
-            Err(_) => return Err(Rejected { why: Overflow::Closed, frame }),
+            Err(_) => {
+                return Err(Rejected {
+                    why: Overflow::Closed,
+                    frame,
+                })
+            }
         };
         if !queue.accepting {
-            return Err(Rejected { why: Overflow::Closed, frame });
+            return Err(Rejected {
+                why: Overflow::Closed,
+                frame,
+            });
         }
         let size = frame.bytes.len();
         let fds = frame.fd_count();
@@ -547,24 +549,27 @@ impl Outbox {
     /// reads a queue nothing drains.
     #[cfg(test)]
     pub(crate) fn frames_pending(&self) -> usize {
-        self.queue.lock().map(|queue| queue.frames.len()).unwrap_or(0)
+        self.queue
+            .lock()
+            .map(|queue| queue.frames.len())
+            .unwrap_or(0)
     }
 
     /// The queue's lock, for a test to hold as a barrier at the hand-off.
     #[cfg(test)]
     pub(crate) fn hold_queue(&self) -> QueueHold<'_> {
         QueueHold {
-            _held: self.queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            _held: self
+                .queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
         }
     }
 
     /// Descriptor attachments this connection is holding, queued or in the
     /// writer's hands. This is the descriptor-budget analogue of `pending`.
     pub fn pending_descriptors(&self) -> usize {
-        self.queue
-            .lock()
-            .map(|queue| queue.fds_held())
-            .unwrap_or(0)
+        self.queue.lock().map(|queue| queue.fds_held()).unwrap_or(0)
     }
 
     /// Stop accepting, wake the writer, and take the socket down so a reader
@@ -1146,8 +1151,7 @@ impl Bus {
             || names.len() > MAX_NAMES_PER_CONNECTION
             || distinct.len() != names.len()
             || names.iter().any(|name| {
-                !crate::name::valid_well_known_name(name)
-                    || !policy::is_portal_service_name(name)
+                !crate::name::valid_well_known_name(name) || !policy::is_portal_service_name(name)
             })
         {
             return Err(format!(
@@ -1232,12 +1236,7 @@ impl Bus {
     /// `reserve` and `publish` together, for callers with nothing to say in
     /// between. Tests use this; `say_hello` deliberately does not.
     #[cfg(test)]
-    pub(crate) fn join(
-        &self,
-        outbox: &Arc<Outbox>,
-        uid: u32,
-        pid: i32,
-    ) -> Result<String, String> {
+    pub(crate) fn join(&self, outbox: &Arc<Outbox>, uid: u32, pid: i32) -> Result<String, String> {
         let unique = self.reserve()?;
         self.publish(&unique, outbox, uid, pid, Identity::Unconfined)?;
         Ok(unique)
@@ -1303,8 +1302,7 @@ impl Bus {
         sender: &str,
         subject: Option<&str>,
     ) -> Vec<Subscriber> {
-        if broadcast.kind != message::MessageType::Signal
-            || broadcast.fields.destination.is_some()
+        if broadcast.kind != message::MessageType::Signal || broadcast.fields.destination.is_some()
         {
             return Vec::new();
         }
@@ -1548,7 +1546,6 @@ impl Bus {
             .unwrap_or(0)
     }
 
-
     /// `RequestName`. The caller asks for a well-known name; this says what
     /// it got.
     ///
@@ -1658,10 +1655,7 @@ impl Bus {
         let Some(owned) = directory.owned.iter_mut().find(|owned| owned.name == name) else {
             return (Requested::Exists, None);
         };
-        let mine = owned
-            .queue
-            .iter()
-            .position(|claim| claim.unique == unique);
+        let mine = owned.queue.iter().position(|claim| claim.unique == unique);
 
         // Already the holder: the flags are updated in place, which is what
         // asking again is for, and nothing changes hands.
@@ -1768,10 +1762,7 @@ impl Bus {
     /// authorizes. This covers both current owners and queued successors, so
     /// neither can outlive the exact process-and-name capability that created
     /// it.
-    fn revoke_portal_claims(
-        directory: &mut Directory,
-        grant: &PortalGrant,
-    ) -> Vec<Handover> {
+    fn revoke_portal_claims(directory: &mut Directory, grant: &PortalGrant) -> Vec<Handover> {
         let mut handovers = Vec::new();
         let mut emptied = Vec::new();
         for (at, owned) in directory.owned.iter_mut().enumerate() {
@@ -1780,9 +1771,9 @@ impl Bus {
             }
             let before = owned.queue.first().map(|claim| claim.unique.clone());
             let name_allowed = grant.names.iter().any(|name| name == &owned.name);
-            owned.queue.retain(|claim| {
-                name_allowed && claim.portal == Some(grant.process)
-            });
+            owned
+                .queue
+                .retain(|claim| name_allowed && claim.portal == Some(grant.process));
             let after = owned.queue.first().map(|claim| claim.unique.clone());
             if before != after {
                 handovers.push(Handover {
@@ -1822,11 +1813,7 @@ impl Bus {
         let Some(owned) = directory.owned.get_mut(at) else {
             return (Released::NonExistent, None);
         };
-        let Some(mine) = owned
-            .queue
-            .iter()
-            .position(|claim| claim.unique == unique)
-        else {
+        let Some(mine) = owned.queue.iter().position(|claim| claim.unique == unique) else {
             return (Released::NotOwner, None);
         };
         owned.queue.remove(mine);
@@ -1855,11 +1842,7 @@ impl Bus {
         let mut handovers = Vec::new();
         let mut emptied = Vec::new();
         for (at, owned) in directory.owned.iter_mut().enumerate() {
-            let Some(mine) = owned
-                .queue
-                .iter()
-                .position(|claim| claim.unique == unique)
-            else {
+            let Some(mine) = owned.queue.iter().position(|claim| claim.unique == unique) else {
                 continue;
             };
             owned.queue.remove(mine);
@@ -1941,12 +1924,7 @@ impl Bus {
 
     /// Whether this caller may learn that `target` exists, including the
     /// current unique-name holder of a visible well-known name.
-    pub fn may_see(
-        &self,
-        identity: &Identity,
-        own: Option<&str>,
-        target: &str,
-    ) -> bool {
+    pub fn may_see(&self, identity: &Identity, own: Option<&str>, target: &str) -> bool {
         let Ok(directory) = self.directory.lock() else {
             return false;
         };
@@ -1956,12 +1934,7 @@ impl Bus {
     /// Whether this caller may address `target`, with the same current-holder
     /// alias rule as visibility. Routing repeats this decision under the lock
     /// that resolves the destination.
-    pub fn may_talk(
-        &self,
-        identity: &Identity,
-        own: Option<&str>,
-        target: &str,
-    ) -> bool {
+    pub fn may_talk(&self, identity: &Identity, own: Option<&str>, target: &str) -> bool {
         let Ok(directory) = self.directory.lock() else {
             return false;
         };
@@ -2122,16 +2095,16 @@ impl Bus {
         // moving.
         let (name, outbox) = {
             let directory = self.directory.lock().ok()?;
-        // Each `pending()` takes its own outbox's lock, so these are samples
-        // taken at slightly different instants rather than one consistent
-        // snapshot — making them consistent would mean holding every queue
-        // lock at once, which is a lock-ordering problem far worse than the
-        // one it would solve. The residual is that a peer which is no longer
-        // THE largest can still be chosen, which is unfairness rather than
-        // unsoundness. The one outcome worth ruling out is disconnecting a
-        // peer that is holding NOTHING, so the choice is re-read before it is
-        // acted on: if the pressure resolved itself in the meantime, nobody is
-        // relieved and the caller's retry finds the room anyway.
+            // Each `pending()` takes its own outbox's lock, so these are samples
+            // taken at slightly different instants rather than one consistent
+            // snapshot — making them consistent would mean holding every queue
+            // lock at once, which is a lock-ordering problem far worse than the
+            // one it would solve. The residual is that a peer which is no longer
+            // THE largest can still be chosen, which is unfairness rather than
+            // unsoundness. The one outcome worth ruling out is disconnecting a
+            // peer that is holding NOTHING, so the choice is re-read before it is
+            // acted on: if the pressure resolved itself in the meantime, nobody is
+            // relieved and the caller's retry finds the room anyway.
             let worst = directory
                 .peers
                 .iter()
@@ -2227,11 +2200,8 @@ mod tests {
             pid: 4001,
             starttime: 71,
         };
-        bus.activate_portal_for_test(
-            portal,
-            vec!["org.freedesktop.portal.Desktop".to_string()],
-        )
-        .expect("install a portal grant");
+        bus.activate_portal_for_test(portal, vec!["org.freedesktop.portal.Desktop".to_string()])
+            .expect("install a portal grant");
 
         for (process, name) in [
             (
@@ -2250,21 +2220,11 @@ mod tests {
         }
 
         assert!(matches!(
-            bus.request_portal_name(
-                portal,
-                ":1.1",
-                "org.freedesktop.portal.Desktop",
-                0
-            ),
+            bus.request_portal_name(portal, ":1.1", "org.freedesktop.portal.Desktop", 0),
             PortalRequested::Requested(Requested::PrimaryOwner, Some(_))
         ));
         assert!(matches!(
-            bus.request_portal_name(
-                portal,
-                ":1.2",
-                "org.freedesktop.portal.Desktop",
-                0
-            ),
+            bus.request_portal_name(portal, ":1.2", "org.freedesktop.portal.Desktop", 0),
             PortalRequested::Requested(Requested::InQueue, None)
         ));
         assert_eq!(bus.wanting("org.freedesktop.portal.Desktop"), 2);
@@ -2332,15 +2292,14 @@ mod tests {
         assert!(bus.activate_portal_for_test(portal, too_many).is_err());
         let file = std::fs::File::open("/dev/null").expect("open a harmless descriptor");
         let pidfd: OwnedFd = file.into();
-        assert!(
-            bus.prepare_portal(
+        assert!(bus
+            .prepare_portal(
                 portal,
                 pidfd,
                 vec!["org.freedesktop.portal.Desktop".to_string()],
                 "not-a-token".to_string(),
             )
-            .is_err()
-        );
+            .is_err());
     }
 
     /// A queue is bounded in BYTES, and one maximum-sized message always fits.
@@ -2512,10 +2471,7 @@ mod tests {
         let taken = outbox.take().expect("a frame to write");
         assert_eq!(taken.bytes.len(), 1);
         assert!(
-            matches!(
-                outbox.offer(vec![0u8; 1]),
-                Err(Overflow::Connection { .. })
-            ),
+            matches!(outbox.offer(vec![0u8; 1]), Err(Overflow::Connection { .. })),
             "taking a frame off the deque made room past the count ceiling"
         );
         outbox.finished(1, 0);
@@ -2580,9 +2536,7 @@ mod tests {
             let (client, server) = pair();
             kept.push(client);
             let outbox = bus.outbox_for(server, fresh_share());
-            let name = bus
-                .join(&outbox, 1000, 5000 + which as i32)
-                .expect("join");
+            let name = bus.join(&outbox, 1000, 5000 + which as i32).expect("join");
             names.push(name);
             boxes.push(outbox);
         }

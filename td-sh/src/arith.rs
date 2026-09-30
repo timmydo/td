@@ -72,9 +72,9 @@ enum Tk {
 
 /// Multi-character operators, longest first so `<<=` beats `<<` beats `<`.
 const OPS: &[&str] = &[
-    "<<=", ">>=", "**", "&&", "||", "<<", ">>", "<=", ">=", "==", "!=", "+=", "-=",
-    "*=", "/=", "%=", "&=", "^=", "|=", "+", "-", "*", "/", "%", "<", ">", "!", "~",
-    "&", "^", "|", "?", ":", "(", ")", "=", ",",
+    "<<=", ">>=", "**", "&&", "||", "<<", ">>", "<=", ">=", "==", "!=", "+=", "-=", "*=", "/=",
+    "%=", "&=", "^=", "|=", "+", "-", "*", "/", "%", "<", ">", "!", "~", "&", "^", "|", "?", ":",
+    "(", ")", "=", ",",
 ];
 
 const PREC_UNARY: u8 = 15;
@@ -328,7 +328,11 @@ fn base_digit(c: char, base: u32) -> Option<u32> {
             return None;
         }
     }
-    if digit >= base { None } else { Some(digit) }
+    if digit >= base {
+        None
+    } else {
+        Some(digit)
+    }
 }
 
 /// `BASE#DIGITS` once the base is known. Out of range WRAPS, as everywhere else
@@ -371,7 +375,11 @@ fn explicit_base(chars: &[char], start: usize) -> Option<(u32, usize)> {
         return None;
     }
     let base = d0 * 10 + d1;
-    if base <= 64 { Some((base, start + 3)) } else { None }
+    if base <= 64 {
+        Some((base, start + 3))
+    } else {
+        None
+    }
 }
 
 /// `BASE#DIGITS`, `0x` hex, leading-`0` octal, else decimal — the C conventions
@@ -477,7 +485,10 @@ impl Arith {
         // TOKENS, never by parsing: `$((1:n=5))` would assign on the way to
         // deciding which message to print.
         let mut i = self.pos + 1;
-        while matches!(self.toks.get(i), Some(Tk::Op("-" | "+" | "!" | "~" | "++" | "--"))) {
+        while matches!(
+            self.toks.get(i),
+            Some(Tk::Op("-" | "+" | "!" | "~" | "++" | "--"))
+        ) {
             i += 1;
         }
         match self.toks.get(i) {
@@ -858,7 +869,11 @@ impl Arith {
     /// One `++`/`--` step, returning the value before and after it.
     fn step(&mut self, sh: &mut Shell, name: &str, up: bool) -> A<(i64, i64)> {
         let cur = self.name_value(sh, name)?;
-        let new = if up { cur.wrapping_add(1) } else { cur.wrapping_sub(1) };
+        let new = if up {
+            cur.wrapping_add(1)
+        } else {
+            cur.wrapping_sub(1)
+        };
         if self.live {
             sh.set_var(name, &new.to_string())?;
         }
@@ -1087,7 +1102,9 @@ mod tests {
         // same fallback reached the other way: a two-digit base's second slot
         // must be a DECIMAL digit, so `a` is not one and `1a` is read as a
         // number rather than as base 26.
-        for src in ["1#0", "1#1", "65#10", "66#1", "0#0", "05#4", "01#1", "1a#5", "1F#5"] {
+        for src in [
+            "1#0", "1#1", "65#10", "66#1", "0#0", "05#4", "01#1", "1a#5", "1F#5",
+        ] {
             assert!(ev(src).is_err(), "{src}");
         }
         Ok(())
@@ -1181,8 +1198,16 @@ mod tests {
         // pair splits into signs that vanish, and this steps `n` and answers 6
         // -- the shortest shape that tells the two rules apart.
         for src in [
-            "n*++-n", "n*--    -n", "n*++!n", "n*++~n", "n*++ ++n", "n*++++n",
-            "n*++ +1", "n*++(n)", "n*+++ ++ +n", "n*-- + ++ +n",
+            "n*++-n",
+            "n*--    -n",
+            "n*++!n",
+            "n*++~n",
+            "n*++ ++n",
+            "n*++++n",
+            "n*++ +1",
+            "n*++(n)",
+            "n*+++ ++ +n",
+            "n*-- + ++ +n",
         ] {
             let mut sh = Shell::new_for_test();
             sh.set_var("n", "2").map_err(|_| "set failed".to_string())?;
@@ -1200,7 +1225,8 @@ mod tests {
     fn increment_binds_to_a_name_and_to_nothing_else() -> Result<(), String> {
         let ev = |src: &str, start: &str| -> Result<(i64, String), String> {
             let mut sh = Shell::new_for_test();
-            sh.set_var("n", start).map_err(|_| "set failed".to_string())?;
+            sh.set_var("n", start)
+                .map_err(|_| "set failed".to_string())?;
             let v = eval(&mut sh, src).map_err(|_| format!("eval {src}"))?;
             Ok((v, sh.get_var("n").unwrap_or_default()))
         };
@@ -1240,7 +1266,9 @@ mod tests {
         // operator, which leaves the binary position empty. `1 ++ b` is a
         // syntax error rather than `1 + (+b)`, and b is not stepped.
         // The gap before the name is skipped WHOLE, so two spaces bind as one.
-        for src in ["1 ++ b", "1 ++  b", "1++b", "1 -- b", "1--b", "0--n", "(n)--m", "n----n"] {
+        for src in [
+            "1 ++ b", "1 ++  b", "1++b", "1 -- b", "1--b", "0--n", "(n)--m", "n----n",
+        ] {
             let mut sh = Shell::new_for_test();
             sh.set_var("b", "3").map_err(|_| "set failed".to_string())?;
             sh.set_var("m", "2").map_err(|_| "set failed".to_string())?;
@@ -1265,7 +1293,8 @@ mod tests {
         // A name may begin with `_`, which the forward test has to accept or
         // the pair splits and the step is silently lost.
         let mut sh = Shell::new_for_test();
-        sh.set_var("_x", "5").map_err(|_| "set failed".to_string())?;
+        sh.set_var("_x", "5")
+            .map_err(|_| "set failed".to_string())?;
         assert_eq!(eval(&mut sh, "1+++_x").map_err(|_| "eval")?, 7);
         assert_eq!(sh.get_var("_x").as_deref(), Some("6"));
         // Precedence: the step happens before the surrounding unary applies.
@@ -1276,8 +1305,14 @@ mod tests {
         assert_eq!(ev("n+++1", "1")?, (2, "2".into()));
         assert_eq!(ev("++ ++n", "1")?, (2, "2".into()));
         // Stepping past the bound wraps, as every operator here does.
-        assert_eq!(ev("n++", "9223372036854775807")?, (i64::MAX, i64::MIN.to_string()));
-        assert_eq!(ev("n--", "-9223372036854775808")?, (i64::MIN, i64::MAX.to_string()));
+        assert_eq!(
+            ev("n++", "9223372036854775807")?,
+            (i64::MAX, i64::MIN.to_string())
+        );
+        assert_eq!(
+            ev("n--", "-9223372036854775808")?,
+            (i64::MIN, i64::MAX.to_string())
+        );
         // An unset name steps from zero rather than refusing.
         let mut sh = Shell::new_for_test();
         assert_eq!(eval(&mut sh, "x++").map_err(|_| "eval")?, 0);
@@ -1294,10 +1329,20 @@ mod tests {
         // since arithmetic wraps it tells them apart by ANSWER rather than by
         // which of them overflows.
         let mut sh = Shell::new_for_test();
-        sh.set_var("n", &i64::MIN.to_string()).map_err(|_| "set failed".to_string())?;
-        assert_eq!(eval(&mut sh, "1--(n)/2").map_err(|_| "eval")?, 4611686018427387905);
-        assert_eq!(eval(&mut sh, "1 - -(n)/2").map_err(|_| "eval")?, 4611686018427387905);
-        assert_eq!(eval(&mut sh, "1 - (-(n/2))").map_err(|_| "eval")?, -4611686018427387903);
+        sh.set_var("n", &i64::MIN.to_string())
+            .map_err(|_| "set failed".to_string())?;
+        assert_eq!(
+            eval(&mut sh, "1--(n)/2").map_err(|_| "eval")?,
+            4611686018427387905
+        );
+        assert_eq!(
+            eval(&mut sh, "1 - -(n)/2").map_err(|_| "eval")?,
+            4611686018427387905
+        );
+        assert_eq!(
+            eval(&mut sh, "1 - (-(n/2))").map_err(|_| "eval")?,
+            -4611686018427387903
+        );
         // Away from the bound the two spellings agree, which is what makes the
         // pair above a statement about parsing rather than about overflow.
         sh.set_var("n", "8").map_err(|_| "set failed".to_string())?;
@@ -1413,8 +1458,16 @@ mod tests {
         // completes an operand where a prefix one does not -- both observable
         // only through what the pair after them does.
         assert_eq!(arith_fixture("a<b?--1:0")?, Some(1), "`?` reduces `<`");
-        assert_eq!(arith_fixture("a+++--1")?, Some(3), "a postfix ends an operand");
-        assert_eq!(arith_fixture("a---++1")?, Some(1), "and so does a postfix `--`");
+        assert_eq!(
+            arith_fixture("a+++--1")?,
+            Some(3),
+            "a postfix ends an operand"
+        );
+        assert_eq!(
+            arith_fixture("a---++1")?,
+            Some(1),
+            "and so does a postfix `--`"
+        );
         for (src, why) in [
             ("a+b*+--1", "an operator does not end one"),
             ("a=b=--1", "assignment is right-associative"),
@@ -1449,7 +1502,11 @@ mod tests {
         ] {
             let mut sh = Shell::new_for_test();
             sh.set_var("b", "3").map_err(|_| "set failed".to_string())?;
-            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+            assert_eq!(
+                eval(&mut sh, src).map_err(|_| format!("eval {src}"))?,
+                want,
+                "{src}"
+            );
             assert_eq!(sh.get_var("b").as_deref(), Some(after), "{src}");
         }
         Ok(())
@@ -1465,7 +1522,13 @@ mod tests {
         // on each. Copying it would mean copying the refusal too, since they are
         // the same rule -- and the value of an untaken arm is discarded, so all
         // that is at stake is whether it parses.
-        for src in ["1?0:m--1", "0?m--1:0", "1?0:b+--1", "0?b=--1:0", "1?0:m--(n)"] {
+        for src in [
+            "1?0:m--1",
+            "0?m--1:0",
+            "1?0:b+--1",
+            "0?b=--1:0",
+            "1?0:m--(n)",
+        ] {
             assert_eq!(arith_fixture(src)?, None, "{src}");
         }
         for src in ["1?0:m++", "0?m--:0"] {
@@ -1495,8 +1558,7 @@ mod tests {
     }
 
     #[test]
-    fn exponentiation_binds_tighter_than_multiply_and_looser_than_a_sign()
-    -> Result<(), String> {
+    fn exponentiation_binds_tighter_than_multiply_and_looser_than_a_sign() -> Result<(), String> {
         let mut sh = Shell::new_for_test();
         let ev = |sh: &mut Shell, src: &str| {
             try_eval(sh, src).map_err(|e| format!("eval {src}: {}", words(e)))
@@ -1537,7 +1599,10 @@ mod tests {
         // A negative exponent is refused rather than rounded to zero, and the
         // refusal is the operator's own rather than a parse failure.
         for src in ["2**-1", "2**-2", "0**-1", "1**-2", "2**(1-2)"] {
-            let e = try_eval(&mut sh, src).map_err(words).err().ok_or(format!("{src} evaluated"))?;
+            let e = try_eval(&mut sh, src)
+                .map_err(words)
+                .err()
+                .ok_or(format!("{src} evaluated"))?;
             assert!(e.contains("exponent less than 0"), "{src}: {e}");
         }
         // Inside the arm the conditional disables, that refusal is not raised,
@@ -1598,7 +1663,11 @@ mod tests {
             ("0 && (m=7) && (m=8)", 0, "8"),
         ] {
             let mut sh = Shell::new_for_test();
-            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+            assert_eq!(
+                eval(&mut sh, src).map_err(|_| format!("eval {src}"))?,
+                want,
+                "{src}"
+            );
             assert_eq!(sh.get_var("m").as_deref(), Some(m), "{src}");
         }
         // The error an operand raises is raised on either side, which is the
@@ -1611,18 +1680,30 @@ mod tests {
         // disables, not just the bare `/` one: `%` and both compound forms.
         for (src, want) in [("0 ? 1%0 : 3", 3), ("0 ? 1/0 : 3", 3)] {
             let mut sh = Shell::new_for_test();
-            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+            assert_eq!(
+                eval(&mut sh, src).map_err(|_| format!("eval {src}"))?,
+                want,
+                "{src}"
+            );
         }
         for src in ["0 ? (m/=0) : 3", "0 ? (m%=0) : 3"] {
             let mut sh = Shell::new_for_test();
             sh.set_var("m", "2").map_err(|_| "set failed".to_string())?;
-            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, 3, "{src}");
+            assert_eq!(
+                eval(&mut sh, src).map_err(|_| format!("eval {src}"))?,
+                3,
+                "{src}"
+            );
             assert_eq!(sh.get_var("m").as_deref(), Some("2"), "{src}");
         }
         // The conditional still disables its untaken arm, both ways round.
         for (src, want) in [("1 ? 2 : (0 && (m=7))", 2), ("0 ? (m=7) && 1 : 2", 2)] {
             let mut sh = Shell::new_for_test();
-            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+            assert_eq!(
+                eval(&mut sh, src).map_err(|_| format!("eval {src}"))?,
+                want,
+                "{src}"
+            );
             assert_eq!(sh.get_var("m"), None, "{src}");
         }
         // Both operands of a logical operator step, so a repeated one steps
@@ -1630,7 +1711,11 @@ mod tests {
         for (src, want) in [("m++ && m++", 0), ("m++ || m++", 1)] {
             let mut sh = Shell::new_for_test();
             sh.set_var("m", "0").map_err(|_| "set failed".to_string())?;
-            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+            assert_eq!(
+                eval(&mut sh, src).map_err(|_| format!("eval {src}"))?,
+                want,
+                "{src}"
+            );
             assert_eq!(sh.get_var("m").as_deref(), Some("2"), "{src}");
         }
         // A step on either side of one now TAKES, where the untaken `?:` arm
@@ -1638,7 +1723,11 @@ mod tests {
         for (src, want) in [("0 && m++", 0), ("1 || m++", 1)] {
             let mut sh = Shell::new_for_test();
             sh.set_var("m", "5").map_err(|_| "set failed".to_string())?;
-            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+            assert_eq!(
+                eval(&mut sh, src).map_err(|_| format!("eval {src}"))?,
+                want,
+                "{src}"
+            );
             assert_eq!(sh.get_var("m").as_deref(), Some("6"), "{src}");
         }
         Ok(())
@@ -1663,7 +1752,11 @@ mod tests {
             (&[("e", "1+2")][..], "e + 3", 6),
             (&[("n", "m"), ("m", "5")][..], "n", 5),
             (&[("n", "m+1"), ("m", "5")][..], "n*2", 12),
-            (&[("a", "b"), ("b", "c"), ("c", "d"), ("d", "7")][..], "a", 7),
+            (
+                &[("a", "b"), ("b", "c"), ("c", "d"), ("d", "7")][..],
+                "a",
+                7,
+            ),
             (&[("n", " 1 + 2 ")][..], "n", 3),
             (&[("n", "(1)")][..], "n", 1),
             (&[("n", "1,2")][..], "n", 2),
@@ -1680,7 +1773,11 @@ mod tests {
             (&[("x", "y"), ("y", "2")][..], "x*x", 4),
         ] {
             let mut sh = shell_with(vars)?;
-            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
+            assert_eq!(
+                eval(&mut sh, src).map_err(|_| format!("eval {src}"))?,
+                want,
+                "{src}"
+            );
         }
         // An error inside the value is the value's own error, not `bad number`.
         for (vars, src) in [
@@ -1713,7 +1810,10 @@ mod tests {
         // still that name, which is what puts the cycle guard ahead of the
         // fast path -- `a` holds `5` by the time the inner read reaches it.
         let mut sh = shell_with(&[("a", "b"), ("b", "a=5,a")])?;
-        let err = try_eval(&mut sh, "a").map_err(words).err().ok_or("reassigned cycle evaluated")?;
+        let err = try_eval(&mut sh, "a")
+            .map_err(words)
+            .err()
+            .ok_or("reassigned cycle evaluated")?;
         assert!(err.contains("recursion loop"), "{err}");
         // The guard is exact-name, in BOTH directions, and neither value may be
         // a plain decimal -- that answers before the guard is ever asked, which
@@ -1723,7 +1823,11 @@ mod tests {
             (&[("aa", "a+0"), ("a", "1+0")][..], "aa"),
         ] {
             let mut sh = shell_with(vars)?;
-            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, 1, "{src}");
+            assert_eq!(
+                eval(&mut sh, src).map_err(|_| format!("eval {src}"))?,
+                1,
+                "{src}"
+            );
         }
         // A name followed by `=` is never LOOKED UP, so assigning to the name
         // being resolved terminates where `n+1` would not.
@@ -1762,13 +1866,45 @@ mod tests {
     fn the_fast_path_agrees_with_the_evaluator() -> Result<(), String> {
         let mut sh = Shell::new_for_test();
         let mut texts: Vec<String> = [
-            "0", "1", "9", "10", "-0", "+0", "-1", "+7", "123456789",
-            "9223372036854775807", "-9223372036854775808", "1000000000000000000",
+            "0",
+            "1",
+            "9",
+            "10",
+            "-0",
+            "+0",
+            "-1",
+            "+7",
+            "123456789",
+            "9223372036854775807",
+            "-9223372036854775808",
+            "1000000000000000000",
             // Each of these the fast path must refuse, and the reason differs.
-            "01", "010", "08", "0x1f", "", " ", " 5 ", "5 ", "1+2", "-", "+", "--5",
-            "9223372036854775808", "99999999999999999999", "1e3", "5a", ".5", "0b1",
+            "01",
+            "010",
+            "08",
+            "0x1f",
+            "",
+            " ",
+            " 5 ",
+            "5 ",
+            "1+2",
+            "-",
+            "+",
+            "--5",
+            "9223372036854775808",
+            "99999999999999999999",
+            "1e3",
+            "5a",
+            ".5",
+            "0b1",
             // The bytes just past `9`, which a digit test off by a few takes.
-            ":", "1:", "9;", "2<", "3=", "4>", "8?",
+            ":",
+            "1:",
+            "9;",
+            "2<",
+            "3=",
+            "4>",
+            "8?",
         ]
         .iter()
         .map(|s| (*s).to_string())
@@ -1792,7 +1928,11 @@ mod tests {
         // evaluates to something other than its digits read as decimal.
         for (text, want) in [("010", 8), ("9223372036854775808", i64::MIN), ("", 0)] {
             assert_eq!(plain_decimal(text), None, "{text:?}");
-            assert_eq!(try_eval(&mut sh, text).map_err(|_| "eval")?, want, "{text:?}");
+            assert_eq!(
+                try_eval(&mut sh, text).map_err(|_| "eval")?,
+                want,
+                "{text:?}"
+            );
         }
         Ok(())
     }
@@ -1800,12 +1940,26 @@ mod tests {
     #[test]
     fn only_the_c_blanks_separate_tokens() -> Result<(), String> {
         let mut sh = Shell::new_for_test();
-        for text in [" 1 ", "\t1\t", "\r1\r", "\u{b}1\u{c}", "\n1\n", " 1 + 1 - 1 "] {
+        for text in [
+            " 1 ",
+            "\t1\t",
+            "\r1\r",
+            "\u{b}1\u{c}",
+            "\n1\n",
+            " 1 + 1 - 1 ",
+        ] {
             assert_eq!(try_eval(&mut sh, text).map_err(words)?, 1, "{text:?}");
         }
         // ash refuses a Unicode space outright rather than skipping it, so a
         // value or expression carrying one is an error and not a number.
-        for text in ["\u{a0}1", "1\u{a0}", "1\u{a0}+1", "\u{2003}1", "1 +\u{2003}1", "1\u{3000}"] {
+        for text in [
+            "\u{a0}1",
+            "1\u{a0}",
+            "1\u{a0}+1",
+            "\u{2003}1",
+            "1 +\u{2003}1",
+            "1\u{3000}",
+        ] {
             assert!(try_eval(&mut sh, text).is_err(), "{text:?}");
         }
         Ok(())
@@ -1842,8 +1996,10 @@ mod tests {
         // shrunken bound reads as passing.
         for (links, deep) in [(49, false), (50, true)] {
             let names = chain(links);
-            let refs: Vec<(&str, &str)> =
-                names.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let refs: Vec<(&str, &str)> = names
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
             let mut sh = shell_with(&refs)?;
             match try_eval(&mut sh, "v0") {
                 Ok(v) => {
@@ -1865,9 +2021,15 @@ mod tests {
         let names: Vec<(String, String)> = (0..deep)
             .map(|i| (format!("v{i}"), format!("v{}+=0", i + 1)))
             .collect();
-        let refs: Vec<(&str, &str)> = names.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let refs: Vec<(&str, &str)> = names
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         let mut sh = shell_with(&refs)?;
-        let e = try_eval(&mut sh, "v0").map_err(words).err().ok_or("lvalue chain evaluated")?;
+        let e = try_eval(&mut sh, "v0")
+            .map_err(words)
+            .err()
+            .ok_or("lvalue chain evaluated")?;
         assert!(e.contains("too deeply"), "{e}");
         Ok(())
     }
@@ -1927,8 +2089,16 @@ mod tests {
             let mut sh = Shell::new_for_test();
             sh.set_var("n", &init.to_string())
                 .map_err(|_| "set failed".to_string())?;
-            assert_eq!(eval(&mut sh, src).map_err(|_| format!("eval {src}"))?, want, "{src}");
-            assert_eq!(sh.get_var("n").as_deref(), Some(&want.to_string()[..]), "{src}");
+            assert_eq!(
+                eval(&mut sh, src).map_err(|_| format!("eval {src}"))?,
+                want,
+                "{src}"
+            );
+            assert_eq!(
+                sh.get_var("n").as_deref(),
+                Some(&want.to_string()[..]),
+                "{src}"
+            );
         }
         Ok(())
     }
@@ -1950,8 +2120,8 @@ mod tests {
     #[test]
     fn a_parse_failure_takes_ashs_one_word_for_it() {
         for src in [
-            "1+", "1?", "*", "1 2", "0x", "2#", "2#9", "1+*2", "a b", "++", "1++",
-            "$", "#", "1@2", "~~", "!", "1?2", "1?2?3", "[", "..", "0b12", "99#1",
+            "1+", "1?", "*", "1 2", "0x", "2#", "2#9", "1+*2", "a b", "++", "1++", "$", "#", "1@2",
+            "~~", "!", "1?2", "1?2?3", "[", "..", "0b12", "99#1",
             // A colon that never got a right operand, and one where a value was
             // expected: neither is APPLIED, so neither is ash's ternary message.
             "1:", ":", ":2", "1?2::3", "1??2:3",

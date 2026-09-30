@@ -22,17 +22,17 @@ mod protocol;
 mod realfile;
 // `gpt.rs` reaches its checksum as `crate::crc32`, the spelling that resolves
 // identically inside the engine lib and here, so the two are declared as a PAIR.
+#[path = "../../engine/src/cpio.rs"]
+mod cpio;
 #[path = "../../engine/src/crc32.rs"]
 #[allow(dead_code)]
 mod crc32;
-#[path = "../../engine/src/gpt.rs"]
-#[allow(dead_code)]
-mod gpt;
 #[path = "../../engine/src/fat.rs"]
 #[allow(dead_code)]
 mod fat;
-#[path = "../../engine/src/cpio.rs"]
-mod cpio;
+#[path = "../../engine/src/gpt.rs"]
+#[allow(dead_code)]
+mod gpt;
 // Test-only, and declared with the same redundant `#[path]` as td-boot's own
 // files, so that `every_compiled_file_is_one_the_guards_read` counts it and
 // both guards read it: a file compiled only into the test binary ships in
@@ -75,7 +75,9 @@ const USAGE: &str =
 
 fn candidate_output_allowed(terminal: bool) -> io::Result<()> {
     if terminal {
-        Err(invalid("candidate-record is binary; redirect stdout to a pipe or file".into()))
+        Err(invalid(
+            "candidate-record is binary; redirect stdout to a pipe or file".into(),
+        ))
     } else {
         Ok(())
     }
@@ -88,7 +90,11 @@ enum Mode {
     Destinations,
     CandidateRecord,
     ObservePlan,
-    ObserveSourcePlan { td_boot: PathBuf, source: PathBuf, trusted_key: PathBuf },
+    ObserveSourcePlan {
+        td_boot: PathBuf,
+        source: PathBuf,
+        trusted_key: PathBuf,
+    },
     PrepareSelector {
         template: PathBuf,
         uuid: VolumeUuid,
@@ -140,8 +146,12 @@ impl PrimarySelection {
     // Keep this cheap CLI grammar aligned with td-authd/src/primary_account.rs;
     // the bound firstboot validator still owns complete account admission.
     fn syntax(name: &str) -> io::Result<()> {
-        if name.len() > 32 || !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-            || !name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)) {
+        if name.len() > 32
+            || !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
+            })
+        {
             return Err(invalid("username requires 1-32 lowercase ASCII letters, digits, underscores or hyphens, starting with a letter".into()));
         }
         Ok(())
@@ -150,13 +160,22 @@ impl PrimarySelection {
     fn check(&self) -> io::Result<()> {
         Self::syntax(&self.name)?;
         let status = std::process::Command::new(&self.firstboot)
-            .arg("check-primary-name").arg(&self.root).arg(&self.name)
+            .arg("check-primary-name")
+            .arg(&self.root)
+            .arg(&self.name)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .status().map_err(|error| io::Error::new(error.kind(),
-                format!("validate selected primary account: {error}")))?;
+            .status()
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("validate selected primary account: {error}"),
+                )
+            })?;
         if !status.success() {
-            return Err(invalid(format!("selected primary account validation failed: {status}")));
+            return Err(invalid(format!(
+                "selected primary account validation failed: {status}"
+            )));
         }
         Ok(())
     }
@@ -236,12 +255,23 @@ impl BootInput {
             })?;
         let mut extra = [0u8; 1];
         if copied != self.len
-            || self.file.read(&mut extra).map_err(|error| io::Error::new(
-                error.kind(), format!("check EFI input {}: {error}", self.path.display())
-            ))? != 0
-            || self.file.metadata().map_err(|error| io::Error::new(
-                error.kind(), format!("stat EFI input {}: {error}", self.path.display())
-            ))?.len() != self.len
+            || self.file.read(&mut extra).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("check EFI input {}: {error}", self.path.display()),
+                )
+            })? != 0
+            || self
+                .file
+                .metadata()
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("stat EFI input {}: {error}", self.path.display()),
+                    )
+                })?
+                .len()
+                != self.len
         {
             return Err(invalid(format!(
                 "EFI input changed size: {}",
@@ -395,12 +425,18 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     let (verb, boot) = if verb == "format" {
         let kernel = args.next().ok_or_else(|| invalid(USAGE.into()))?;
         let initramfs = args.next().ok_or_else(|| invalid(USAGE.into()))?;
-        if [&kernel, &initramfs].iter().any(|path| path.as_encoded_bytes().starts_with(b"-")) {
+        if [&kernel, &initramfs]
+            .iter()
+            .any(|path| path.as_encoded_bytes().starts_with(b"-"))
+        {
             return Err(invalid("format requires EFI kernel and selector paths before volume options; prefix relative paths beginning with '-' with './'".into()));
         }
         (
             OsString::from("volume"),
-            Some(BootFiles { kernel: kernel.into(), initramfs: initramfs.into() }),
+            Some(BootFiles {
+                kernel: kernel.into(),
+                initramfs: initramfs.into(),
+            }),
         )
     } else {
         (verb, None)
@@ -422,7 +458,10 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     } else {
         (None, rest.as_slice())
     };
-    let (timezone, rest) = if rest.first().is_some_and(|arg| arg.as_os_str() == "--timezone") {
+    let (timezone, rest) = if rest
+        .first()
+        .is_some_and(|arg| arg.as_os_str() == "--timezone")
+    {
         if verb != "volume" {
             return Err(invalid("--timezone is only supported by volume".into()));
         }
@@ -437,35 +476,66 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     } else {
         (None, rest)
     };
-    let (hostname, rest) = if rest.first().is_some_and(|arg| arg.as_os_str() == "--hostname") {
+    let (hostname, rest) = if rest
+        .first()
+        .is_some_and(|arg| arg.as_os_str() == "--hostname")
+    {
         if verb != "volume" {
             return Err(invalid("--hostname is only supported by volume".into()));
         }
-        let name = rest.get(1).and_then(|arg| arg.to_str())
+        let name = rest
+            .get(1)
+            .and_then(|arg| arg.to_str())
             .ok_or_else(|| invalid("--hostname requires a canonical name".into()))?;
-        (Some(hostname::Hostname::parse(name).map_err(invalid)?),
-            rest.get(2..).ok_or_else(|| invalid(USAGE.into()))?)
-    } else { (None, rest) };
-    let (username, rest) = if rest.first().is_some_and(|arg| arg.as_os_str() == "--username") {
+        (
+            Some(hostname::Hostname::parse(name).map_err(invalid)?),
+            rest.get(2..).ok_or_else(|| invalid(USAGE.into()))?,
+        )
+    } else {
+        (None, rest)
+    };
+    let (username, rest) = if rest
+        .first()
+        .is_some_and(|arg| arg.as_os_str() == "--username")
+    {
         if verb != "volume" {
             return Err(invalid("--username is only supported by volume".into()));
         }
         let Some([name, root, firstboot, tail @ ..]) = rest.get(1..) else {
-            return Err(invalid("--username requires NAME VERIFIED-ROOT TD-FIRSTBOOT".into()));
+            return Err(invalid(
+                "--username requires NAME VERIFIED-ROOT TD-FIRSTBOOT".into(),
+            ));
         };
-        let name = name.to_str().filter(|name| !name.is_empty() && name.len() <= 32)
+        let name = name
+            .to_str()
+            .filter(|name| !name.is_empty() && name.len() <= 32)
             .ok_or_else(|| invalid("--username requires a UTF-8 name of 1..=32 bytes".into()))?;
         PrimarySelection::syntax(name)?;
         if !root.is_absolute() || !firstboot.is_absolute() {
-            return Err(invalid("--username requires absolute deployment-root and validator paths".into()));
+            return Err(invalid(
+                "--username requires absolute deployment-root and validator paths".into(),
+            ));
         }
-        (Some(Box::new(PrimarySelection { name: name.into(), root: root.clone(), firstboot: firstboot.clone() })), tail)
-    } else { (None, rest) };
+        (
+            Some(Box::new(PrimarySelection {
+                name: name.into(),
+                root: root.clone(),
+                firstboot: firstboot.clone(),
+            })),
+            tail,
+        )
+    } else {
+        (None, rest)
+    };
     if rest.iter().any(|arg| arg.as_os_str() == "--username") {
-        return Err(invalid("--username must appear once after regional settings and before volume operands".into()));
+        return Err(invalid(
+            "--username must appear once after regional settings and before volume operands".into(),
+        ));
     }
     if rest.iter().any(|arg| arg.as_os_str() == "--hostname") {
-        return Err(invalid("--hostname must appear once after timezone and before the volume operands".into()));
+        return Err(invalid(
+            "--hostname must appear once after timezone and before the volume operands".into(),
+        ));
     }
     if rest.iter().any(|arg| arg.as_os_str() == "--timezone") {
         return Err(invalid(
@@ -480,9 +550,16 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         }));
     }
     if rest.iter().any(|arg| arg.as_os_str() == "--trusted-key")
-        && !(verb == "volume" && rest.len() == 5
-            && rest.get(3).is_some_and(|arg| arg.as_os_str() == "--trusted-key")
-            && rest.iter().filter(|arg| arg.as_os_str() == "--trusted-key").count() == 1)
+        && !(verb == "volume"
+            && rest.len() == 5
+            && rest
+                .get(3)
+                .is_some_and(|arg| arg.as_os_str() == "--trusted-key")
+            && rest
+                .iter()
+                .filter(|arg| arg.as_os_str() == "--trusted-key")
+                .count()
+                == 1)
     {
         return Err(invalid(if verb == "volume" {
             "--trusted-key requires exactly one key after the volume operands".into()
@@ -495,15 +572,20 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         (Some("destinations"), []) => Ok(Mode::Destinations),
         (Some("candidate-record"), []) => Ok(Mode::CandidateRecord),
         (Some("observe-plan"), []) => Ok(Mode::ObservePlan),
-        (Some("observe-source-plan"), [td_boot, source, trusted_key]) => Ok(Mode::ObserveSourcePlan {
-            td_boot: PathBuf::from(td_boot),
-            source: PathBuf::from(source),
-            trusted_key: PathBuf::from(trusted_key),
-        }),
+        (Some("observe-source-plan"), [td_boot, source, trusted_key]) => {
+            Ok(Mode::ObserveSourcePlan {
+                td_boot: PathBuf::from(td_boot),
+                source: PathBuf::from(source),
+                trusted_key: PathBuf::from(trusted_key),
+            })
+        }
         (Some("new-volume-uuid"), []) => Ok(Mode::NewVolumeUuid),
         (Some("prepare-selector"), [template, uuid, output]) => Ok(Mode::PrepareSelector {
             template: template.clone(),
-            uuid: VolumeUuid::parse(uuid.to_str().ok_or_else(|| invalid("volume UUID must be UTF-8".into()))?)?,
+            uuid: VolumeUuid::parse(
+                uuid.to_str()
+                    .ok_or_else(|| invalid("volume UUID must be UTF-8".into()))?,
+            )?,
             output: output.clone(),
         }),
         (Some("timezones"), []) => Ok(Mode::Timezones),
@@ -523,7 +605,9 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
             }),
         }),
         (Some("volume"), [destination, mkfs, scratch, flag, trusted_key])
-            if flag.as_os_str() == "--trusted-key" => Ok(Mode::Volume {
+            if flag.as_os_str() == "--trusted-key" =>
+        {
+            Ok(Mode::Volume {
                 boot,
                 uuid,
                 timezone,
@@ -533,7 +617,8 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 mkfs: mkfs.clone(),
                 scratch: scratch.clone(),
                 seed: Some(VolumeSeed::Trust(trusted_key.clone())),
-            }),
+            })
+        }
         (Some("volume"), [destination, mkfs, scratch, td_boot, deployment, trusted_key]) => {
             Ok(Mode::Volume {
                 boot,
@@ -601,7 +686,9 @@ fn observe_source_plan(
     trusted_key: &Path,
 ) -> io::Result<()> {
     if !td_boot.is_absolute() || !source.is_absolute() || !trusted_key.is_absolute() {
-        return Err(invalid("td-boot, source and trusted key must be absolute paths".into()));
+        return Err(invalid(
+            "td-boot, source and trusted key must be absolute paths".into(),
+        ));
     }
     let plan = read_plan(input)?;
     let _claim = inventory::claim_plan(&plan)?;
@@ -610,7 +697,11 @@ fn observe_source_plan(
     output.flush()
 }
 
-fn write_source_plan_report(output: &mut impl Write, plan: &installation_plan::Plan, id: &str) -> io::Result<()> {
+fn write_source_plan_report(
+    output: &mut impl Write,
+    plan: &installation_plan::Plan,
+    id: &str,
+) -> io::Result<()> {
     writeln!(output, "{{\"version\":1,\"scope\":\"held-source-plan-observation-only\",\"destination\":\"{}\",\"deployment\":\"{id}\"}}", plan.destination().name())
 }
 
@@ -636,11 +727,19 @@ fn validate_source_plan(
         .map_err(|_| invalid("source validator returned a non-UTF-8 ID".into()))?
         .strip_suffix('\n')
         .ok_or_else(|| invalid("source validator ID lacks newline".into()))?;
-    if id.len() != 64 || !id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
-        return Err(invalid("source validator returned a noncanonical ID".into()));
+    if id.len() != 64
+        || !id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(invalid(
+            "source validator returned a noncanonical ID".into(),
+        ));
     }
     if !plan.matches_deployment_id(id) {
-        return Err(invalid("reviewed deployment differs from authenticated source".into()));
+        return Err(invalid(
+            "reviewed deployment differs from authenticated source".into(),
+        ));
     }
     Ok(id.to_owned())
 }
@@ -763,7 +862,9 @@ impl Plan {
     }
 
     fn volume_bytes(&self) -> Option<u64> {
-        self.volume_end.checked_sub(self.volume_start)?.checked_add(1)?
+        self.volume_end
+            .checked_sub(self.volume_start)?
+            .checked_add(1)?
             .checked_mul(self.sector_size)
     }
 }
@@ -1017,7 +1118,10 @@ mod paths {
         if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!("{}: destination claims require x86-64 Linux", path.display()),
+                format!(
+                    "{}: destination claims require x86-64 Linux",
+                    path.display()
+                ),
             ));
         }
         // Linux claims block devices through O_EXCL, including their partitions.
@@ -1346,18 +1450,22 @@ fn prepare_layout(
     )?;
 
     let cluster_bytes = u64::from(esp.bytes_per_sector)
-        .checked_mul(u64::from(esp.sectors_per_cluster)).filter(|bytes| *bytes != 0)
+        .checked_mul(u64::from(esp.sectors_per_cluster))
+        .filter(|bytes| *bytes != 0)
         .ok_or_else(|| invalid("invalid EFI cluster size".into()))?;
-    let data_start = metadata_bytes(&esp).and_then(|end| end.checked_sub(cluster_bytes))
+    let data_start = metadata_bytes(&esp)
+        .and_then(|end| end.checked_sub(cluster_bytes))
         .ok_or_else(|| invalid("EFI data offset overflow".into()))?;
     // Round relative to the data area, not the start of the FAT filesystem.
-    let metadata = metadata.checked_sub(data_start)
+    let metadata = metadata
+        .checked_sub(data_start)
         .and_then(|span| span.checked_add(cluster_bytes - 1))
         .and_then(|span| (span / cluster_bytes).checked_mul(cluster_bytes))
         .and_then(|span| data_start.checked_add(span))
         .filter(|end| *end <= esp.total_bytes)
         .ok_or_else(|| invalid("EFI metadata exceeds the ESP".into()))?;
-    let esp_end = esp_offset.checked_add(esp.total_bytes)
+    let esp_end = esp_offset
+        .checked_add(esp.total_bytes)
         .ok_or_else(|| invalid("EFI partition end overflow".into()))?;
 
     // Resolve every placement and offset before invalidating the old GPT.
@@ -1374,7 +1482,9 @@ fn prepare_layout(
                 )));
             };
             if placement.len != input.len {
-                return Err(invalid(format!("EFI placement length disagrees with input: {name}")));
+                return Err(invalid(format!(
+                    "EFI placement length disagrees with input: {name}"
+                )));
             }
             let offset = esp_offset
                 .checked_add(placement.offset)
@@ -1383,7 +1493,10 @@ fn prepare_layout(
                 .checked_add(placement.len)
                 .ok_or_else(|| invalid("EFI file padding offset overflow".into()))?;
             let padding = (cluster_bytes - placement.len % cluster_bytes) % cluster_bytes;
-            if end.checked_add(padding).is_none_or(|padded_end| padded_end > esp_end) {
+            if end
+                .checked_add(padding)
+                .is_none_or(|padded_end| padded_end > esp_end)
+            {
                 return Err(invalid(format!("EFI file padding exceeds the ESP: {name}")));
             }
             payloads.push((input, offset, end, padding));
@@ -1393,7 +1506,13 @@ fn prepare_layout(
         return Err(invalid("unexpected EFI file placement".into()));
     }
 
-    Ok(PreparedLayout { plan, table, esp, metadata, payloads })
+    Ok(PreparedLayout {
+        plan,
+        table,
+        esp,
+        metadata,
+        payloads,
+    })
 }
 
 impl PreparedLayout {
@@ -1707,7 +1826,11 @@ fn zero_edges(file: &mut File, offset: u64, len: u64) -> io::Result<()> {
 /// whatever the original was, so without this the snapshot would launder a
 /// key past every refusal the real reader makes.
 fn read_trusted_key(path: &Path) -> io::Result<Vec<u8>> {
-    realfile::read_bounded_real_file(path, "trusted deployment key", protocol::MAX_PUBLIC_KEY_BYTES)
+    realfile::read_bounded_real_file(
+        path,
+        "trusted deployment key",
+        protocol::MAX_PUBLIC_KEY_BYTES,
+    )
 }
 
 /// Initialize trust directories and optionally publish through `td-boot`.
@@ -1782,7 +1905,12 @@ fn seed_into(staging: &Path, seed: &VolumeSeed, key: &[u8]) -> io::Result<()> {
     // reverse of the widening two blocks down.
     let private = staging
         .parent()
-        .ok_or_else(|| invalid(format!("the staging tree {} has no parent", staging.display())))?
+        .ok_or_else(|| {
+            invalid(format!(
+                "the staging tree {} has no parent",
+                staging.display()
+            ))
+        })?
         .join("td-install-key");
     paths::remove_dir_all_if_present(&private)?;
     paths::create_dir_with_mode(&private, 0o700)?;
@@ -1820,10 +1948,7 @@ fn seed_into(staging: &Path, seed: &VolumeSeed, key: &[u8]) -> io::Result<()> {
             // command line that names four other paths any of which a reader would
             // suspect first.
             .map_err(|error| {
-                invalid(format!(
-                    "cannot run {}: {error}",
-                    publish.td_boot.display()
-                ))
+                invalid(format!("cannot run {}: {error}", publish.td_boot.display()))
             })?;
         let _ = io::stderr().write_all(&output.stdout);
         if !output.status.success() {
@@ -1919,8 +2044,9 @@ fn seed_setting(subvol: &Path, relative: &str, value: &str) -> io::Result<()> {
     }
     let path = subvol.join(relative);
     let mut file = paths::create_new_with_mode(&path, 0o644)?;
-    writeln!(file, "{value}")
-        .map_err(|error| io::Error::new(error.kind(), format!("write {}: {error}", path.display())))?;
+    writeln!(file, "{value}").map_err(|error| {
+        io::Error::new(error.kind(), format!("write {}: {error}", path.display()))
+    })?;
     paths::set_mode(&path, 0o644)?;
     file.sync_all()
         .map_err(|error| io::Error::new(error.kind(), format!("sync {}: {error}", path.display())))
@@ -1956,7 +2082,9 @@ fn run_format(
 ) -> io::Result<()> {
     let mut destination = FormatDestination::open(destination)?;
     let layout = prepare_layout(&mut destination, Some(boot))?;
-    let len = layout.plan.volume_bytes()
+    let len = layout
+        .plan
+        .volume_bytes()
         .ok_or_else(|| invalid("planned volume length overflowed".into()))?;
     let image = prepare_volume_image(prepared, &destination, len)?;
     // Guard layout too; write_to keeps its own check for standalone volume use.
@@ -1996,7 +2124,12 @@ fn prepare_volume<'a>(
     for (label, program) in [
         ("mkfs.btrfs", Some(mkfs)),
         ("td-boot", publish.map(|publish| publish.td_boot.as_path())),
-        ("td-firstboot", settings.username.map(|selection| selection.firstboot.as_path())),
+        (
+            "td-firstboot",
+            settings
+                .username
+                .map(|selection| selection.firstboot.as_path()),
+        ),
     ] {
         if let Some(program) = program {
             if !program.is_absolute() {
@@ -2217,14 +2350,16 @@ fn prepare_volume_image(
         use std::os::unix::fs::MetadataExt;
         if created.dev() != prepared.dev() || created.ino() != prepared.ino() {
             return Err(invalid(format!(
-                "prepared Btrfs image was replaced: {}", image_path.display()
+                "prepared Btrfs image was replaced: {}",
+                image_path.display()
             )));
         }
     }
     if prepared.len() != len {
         return Err(invalid(format!(
             "prepared Btrfs image {} is {} bytes, not the required {len}",
-            image_path.display(), prepared.len()
+            image_path.display(),
+            prepared.len()
         )));
     }
     // Surface delayed scratch allocation/write errors before erasing a disk.
@@ -2239,7 +2374,9 @@ impl PreparedVolumeImage {
         let source = self.file.metadata()?;
         let target = destination.metadata()?;
         if (source.dev(), source.ino()) == (target.dev(), target.ino()) {
-            return Err(invalid("prepared Btrfs image is the destination itself".into()));
+            return Err(invalid(
+                "prepared Btrfs image is the destination itself".into(),
+            ));
         }
         let got = source.len();
         if got != self.len {
@@ -2251,11 +2388,7 @@ impl PreparedVolumeImage {
         Ok(())
     }
 
-    fn write_to(
-        self,
-        destination: &mut FormatDestination,
-        out: &mut dyn Write,
-    ) -> io::Result<()> {
+    fn write_to(self, destination: &mut FormatDestination, out: &mut dyn Write) -> io::Result<()> {
         let file = &mut destination.file;
         self.check_source(file)?;
         let (offset, len) = destination_volume(file)?;
@@ -2342,51 +2475,62 @@ fn main() -> ExitCode {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
             new_volume_uuid(&mut output).and_then(|()| output.flush())
-        },
+        }
         Mode::Timezones => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
-            timezones::run(Path::new(TIMEZONE_ROOT), &mut output)
-                .and_then(|()| output.flush())
-        },
-        Mode::PrepareSelector { template, uuid, output } => prepare_selector(&template, &uuid, &output),
+            timezones::run(Path::new(TIMEZONE_ROOT), &mut output).and_then(|()| output.flush())
+        }
+        Mode::PrepareSelector {
+            template,
+            uuid,
+            output,
+        } => prepare_selector(&template, &uuid, &output),
         Mode::Destinations => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
             inventory::destinations(&mut output).and_then(|()| output.flush())
-        },
+        }
         Mode::CandidateRecord => {
             let stdout = io::stdout();
             candidate_output_allowed(stdout.is_terminal()).and_then(|()| {
                 let mut output = io::BufWriter::new(stdout.lock());
                 inventory::candidate_record(&mut output).and_then(|()| output.flush())
             })
-        },
+        }
         Mode::ObservePlan => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
             observe_plan(&mut io::stdin().lock(), &mut output)
-        },
-        Mode::ObserveSourcePlan { td_boot, source, trusted_key } => {
+        }
+        Mode::ObserveSourcePlan {
+            td_boot,
+            source,
+            trusted_key,
+        } => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
-            observe_source_plan(&mut io::stdin().lock(), &mut output, &td_boot, &source, &trusted_key)
-        },
+            observe_source_plan(
+                &mut io::stdin().lock(),
+                &mut output,
+                &td_boot,
+                &source,
+                &trusted_key,
+            )
+        }
         Mode::Inventory => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
-            inventory::run(Path::new("/sys/class/block"), &mut output)
-                .and_then(|()| output.flush())
-        },
+            inventory::run(Path::new("/sys/class/block"), &mut output).and_then(|()| output.flush())
+        }
         Mode::LayoutPreview {
             sector_bytes,
             capacity_bytes,
         } => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
-            layout_preview(sector_bytes, capacity_bytes, &mut output)
-                .and_then(|()| output.flush())
-        },
+            layout_preview(sector_bytes, capacity_bytes, &mut output).and_then(|()| output.flush())
+        }
         Mode::Layout { destination, boot } => match boot {
             Some(boot) => run_layout_with_boot(&destination, Some(&boot), &mut io::stdout()),
             None => run_layout(&destination, &mut io::stdout()),
@@ -2406,9 +2550,14 @@ fn main() -> ExitCode {
             .map(|id| timezones::Selection::load(Path::new(TIMEZONE_ROOT), id))
             .transpose()
             .and_then(|timezone| {
-                let settings = VolumeSettings { timezone: timezone.as_ref(), hostname: hostname.as_ref(), username: username.as_deref() };
+                let settings = VolumeSettings {
+                    timezone: timezone.as_ref(),
+                    hostname: hostname.as_ref(),
+                    username: username.as_deref(),
+                };
                 if let Some(boot) = boot {
-                    let prepared = prepare_volume(settings, uuid.as_ref(), &mkfs, &scratch, seed.as_ref())?;
+                    let prepared =
+                        prepare_volume(settings, uuid.as_ref(), &mkfs, &scratch, seed.as_ref())?;
                     return run_format(prepared, &destination, &boot, &mut io::stdout());
                 }
                 run_volume(
@@ -2446,9 +2595,16 @@ mod tests {
             Mode::ObservePlan
         );
         for extra in ["/dev/vda", "--uuid", "plan.bin"] {
-            assert!(parse_args([OsString::from("observe-plan"), OsString::from(extra)].into_iter()).is_err());
+            assert!(parse_args(
+                [OsString::from("observe-plan"), OsString::from(extra)].into_iter()
+            )
+            .is_err());
         }
-        for bytes in [Vec::new(), b"TDPLAN01".to_vec(), vec![0; installation_plan::MAX_BYTES + 1]] {
+        for bytes in [
+            Vec::new(),
+            b"TDPLAN01".to_vec(),
+            vec![0; installation_plan::MAX_BYTES + 1],
+        ] {
             let mut output = Vec::new();
             assert!(observe_plan(&mut io::Cursor::new(bytes), &mut output).is_err());
             assert!(output.is_empty());
@@ -2458,12 +2614,16 @@ mod tests {
     #[test]
     fn source_plan_requires_explicit_paths_and_rejects_bad_wire_before_execution() {
         assert_eq!(
-            parse_args([
-                OsString::from("observe-source-plan"),
-                OsString::from("/bin/td-boot"),
-                OsString::from("/source"),
-                OsString::from("/trusted.pub"),
-            ].into_iter()).unwrap(),
+            parse_args(
+                [
+                    OsString::from("observe-source-plan"),
+                    OsString::from("/bin/td-boot"),
+                    OsString::from("/source"),
+                    OsString::from("/trusted.pub"),
+                ]
+                .into_iter()
+            )
+            .unwrap(),
             Mode::ObserveSourcePlan {
                 td_boot: PathBuf::from("/bin/td-boot"),
                 source: PathBuf::from("/source"),
@@ -2472,18 +2632,43 @@ mod tests {
         );
         for args in [
             vec![OsString::from("observe-source-plan")],
-            vec![OsString::from("observe-source-plan"), OsString::from("/source")],
-            vec![OsString::from("observe-source-plan"), OsString::from("/bin/td-boot"), OsString::from("/source")],
-            vec![OsString::from("observe-source-plan"), OsString::from("/bin/td-boot"), OsString::from("/source"), OsString::from("/trusted.pub"), OsString::from("extra")],
+            vec![
+                OsString::from("observe-source-plan"),
+                OsString::from("/source"),
+            ],
+            vec![
+                OsString::from("observe-source-plan"),
+                OsString::from("/bin/td-boot"),
+                OsString::from("/source"),
+            ],
+            vec![
+                OsString::from("observe-source-plan"),
+                OsString::from("/bin/td-boot"),
+                OsString::from("/source"),
+                OsString::from("/trusted.pub"),
+                OsString::from("extra"),
+            ],
         ] {
             assert!(parse_args(args.into_iter()).is_err());
         }
         let mut output = Vec::new();
-        assert!(observe_source_plan(&mut io::Cursor::new(b"bad"), &mut output,
-            Path::new("/bin/td-boot"), Path::new("/source"), Path::new("/trusted.pub")).is_err());
+        assert!(observe_source_plan(
+            &mut io::Cursor::new(b"bad"),
+            &mut output,
+            Path::new("/bin/td-boot"),
+            Path::new("/source"),
+            Path::new("/trusted.pub")
+        )
+        .is_err());
         assert!(output.is_empty());
-        let error = observe_source_plan(&mut io::Cursor::new(Vec::<u8>::new()), &mut output,
-            Path::new("/bin/td-boot"), Path::new("source"), Path::new("/trusted.pub")).unwrap_err();
+        let error = observe_source_plan(
+            &mut io::Cursor::new(Vec::<u8>::new()),
+            &mut output,
+            Path::new("/bin/td-boot"),
+            Path::new("source"),
+            Path::new("/trusted.pub"),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("absolute paths"));
         assert!(output.is_empty());
     }
@@ -2497,23 +2682,37 @@ mod tests {
         let validator = directory.join("td-boot");
         let source = directory.join("source");
         let key = directory.join("trusted.pub");
-        let destination = installation_plan::Destination::new(
-            installation_plan::DestinationObservation {
-                name: "vda", major: 253, minor: 0, sequence: 1,
-                capacity: DISK, sector: 512, removable: false,
-                model: None, serial: None, wwid: None,
-            },
-        ).unwrap();
+        let destination =
+            installation_plan::Destination::new(installation_plan::DestinationObservation {
+                name: "vda",
+                major: 253,
+                minor: 0,
+                sequence: 1,
+                capacity: DISK,
+                sector: 512,
+                removable: false,
+                model: None,
+                serial: None,
+                wwid: None,
+            })
+            .unwrap();
         let settings = installation_plan::Settings::new("tester", "td", "us", "Etc/UTC").unwrap();
         let mut uuid = [0; 16];
         uuid[6] = 0x40;
         uuid[8] = 0x80;
-        let plan = installation_plan::Plan::new([1; 32], destination, [0xab; 32], uuid, settings).unwrap();
+        let plan =
+            installation_plan::Plan::new([1; 32], destination, [0xab; 32], uuid, settings).unwrap();
         for (body, reason) in [
             (format!("printf '{}\\n'\n", "ab".repeat(32)), None),
-            (format!("printf '{}\\n'\n", "ac".repeat(32)), Some("reviewed deployment differs")),
+            (
+                format!("printf '{}\\n'\n", "ac".repeat(32)),
+                Some("reviewed deployment differs"),
+            ),
             ("printf 'bad\\n'\n".into(), Some("noncanonical ID")),
-            ("printf 'invalid source\\n' >&2; exit 1\n".into(), Some("invalid source")),
+            (
+                "printf 'invalid source\\n' >&2; exit 1\n".into(),
+                Some("invalid source"),
+            ),
         ] {
             std::fs::write(&validator, format!("#!/bin/sh\n[ \"$1\" = validate-source ] || exit 2\n[ \"$2\" = \"{}\" ] || exit 3\n[ \"$3\" = \"{}\" ] || exit 4\n{body}", source.display(), key.display())).unwrap();
             std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2610,7 +2809,11 @@ mod tests {
                 0o600
             );
             let mut at = (length + 3) & !3;
-            assert_eq!(bytes.len() - at, 532, "keep the exact-limit accounting tied to the real appendix");
+            assert_eq!(
+                bytes.len() - at,
+                532,
+                "keep the exact-limit accounting tied to the real appendix"
+            );
             assert!(bytes[length..at].iter().all(|b| *b == 0));
             let mut names = Vec::new();
             loop {
@@ -2721,10 +2924,10 @@ mod tests {
             Mode::Timezones
         );
         for operand in ["/tmp", "--root", "--uuid", "--trusted-key"] {
-            assert!(parse_args(
-                [OsString::from("timezones"), OsString::from(operand)].into_iter()
-            )
-            .is_err());
+            assert!(
+                parse_args([OsString::from("timezones"), OsString::from(operand)].into_iter())
+                    .is_err()
+            );
         }
     }
 
@@ -2802,49 +3005,208 @@ mod tests {
     #[test]
     fn hostname_selection_is_validated_before_volume_operands() {
         let parse = |values: &[&str]| parse_args(values.iter().map(OsString::from));
-        assert!(matches!(parse(&["volume", "--hostname", "my-td", "disk", "/mkfs", "scratch"]).unwrap(),
-            Mode::Volume { hostname: Some(ref name), .. } if name.name() == "my-td"));
-        assert!(parse(&["volume", "--timezone", "Etc/UTC", "--hostname", "my-td", "disk", "/mkfs", "scratch"]).is_ok());
+        assert!(
+            matches!(parse(&["volume", "--hostname", "my-td", "disk", "/mkfs", "scratch"]).unwrap(),
+            Mode::Volume { hostname: Some(ref name), .. } if name.name() == "my-td")
+        );
+        assert!(parse(&[
+            "volume",
+            "--timezone",
+            "Etc/UTC",
+            "--hostname",
+            "my-td",
+            "disk",
+            "/mkfs",
+            "scratch"
+        ])
+        .is_ok());
         for args in [
             vec!["volume", "--hostname"],
             vec!["volume", "--hostname", "MY-TD", "disk", "/mkfs", "scratch"],
             vec!["volume", "disk", "/mkfs", "scratch", "--hostname", "my-td"],
-            vec!["volume", "--hostname", "my-td", "--hostname", "my-td", "disk", "/mkfs", "scratch"],
-            vec!["volume", "--hostname", "my-td", "--timezone", "Etc/UTC", "disk", "/mkfs", "scratch"],
+            vec![
+                "volume",
+                "--hostname",
+                "my-td",
+                "--hostname",
+                "my-td",
+                "disk",
+                "/mkfs",
+                "scratch",
+            ],
+            vec![
+                "volume",
+                "--hostname",
+                "my-td",
+                "--timezone",
+                "Etc/UTC",
+                "disk",
+                "/mkfs",
+                "scratch",
+            ],
             vec!["layout", "--hostname", "my-td", "disk"],
-        ] { assert!(parse(&args).is_err(), "{args:?}"); }
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
         use std::os::unix::ffi::OsStringExt;
-        assert!(parse_args([OsString::from("volume"), OsString::from("--hostname"),
-            OsString::from_vec(vec![0xff]), OsString::from("disk"), OsString::from("/mkfs"),
-            OsString::from("scratch")].into_iter()).is_err());
+        assert!(parse_args(
+            [
+                OsString::from("volume"),
+                OsString::from("--hostname"),
+                OsString::from_vec(vec![0xff]),
+                OsString::from("disk"),
+                OsString::from("/mkfs"),
+                OsString::from("scratch")
+            ]
+            .into_iter()
+        )
+        .is_err());
     }
 
     #[test]
     fn username_operands_require_one_bound_validator_and_verified_root() {
-        let parsed = parse_args(args(&["volume", "--timezone", "Etc/UTC", "--hostname",
-            "my-td", "--username", "alice", "/verified", "/firstboot", "disk", "/mkfs", "scratch"])).unwrap();
-        assert!(matches!(parsed, Mode::Volume { username: Some(ref choice), .. }
-            if choice.as_ref() == &PrimarySelection { name: "alice".into(), root: "/verified".into(), firstboot: "/firstboot".into() }));
+        let parsed = parse_args(args(&[
+            "volume",
+            "--timezone",
+            "Etc/UTC",
+            "--hostname",
+            "my-td",
+            "--username",
+            "alice",
+            "/verified",
+            "/firstboot",
+            "disk",
+            "/mkfs",
+            "scratch",
+        ]))
+        .unwrap();
+        assert!(
+            matches!(parsed, Mode::Volume { username: Some(ref choice), .. }
+            if choice.as_ref() == &PrimarySelection { name: "alice".into(), root: "/verified".into(), firstboot: "/firstboot".into() })
+        );
         for bad in [
             vec!["volume", "--username"],
             vec!["volume", "--username", "alice", "/verified"],
-            vec!["volume", "--username", "", "/verified", "/firstboot", "disk", "/mkfs", "scratch"],
-            vec!["volume", "--username", "alice", "verified", "/firstboot", "disk", "/mkfs", "scratch"],
-            vec!["volume", "--username", "alice", "/verified", "firstboot", "disk", "/mkfs", "scratch"],
-            vec!["volume", "disk", "/mkfs", "scratch", "--username", "alice", "/verified", "/firstboot"],
-            vec!["volume", "--username", "alice", "/verified", "/firstboot", "--username", "bob", "/verified", "/firstboot", "disk", "/mkfs", "scratch"],
-            vec!["layout", "--username", "alice", "/verified", "/firstboot", "disk"],
-        ] { assert!(parse_args(args(&bad)).is_err(), "{bad:?}"); }
-        for name in ["a", "tester", "a-b_c1", &"a".repeat(32)] {
-            assert!(parse_args(args(&["volume", "--username", name, "/verified", "/firstboot", "disk", "/mkfs", "scratch"])).is_ok(), "{name:?}");
+            vec![
+                "volume",
+                "--username",
+                "",
+                "/verified",
+                "/firstboot",
+                "disk",
+                "/mkfs",
+                "scratch",
+            ],
+            vec![
+                "volume",
+                "--username",
+                "alice",
+                "verified",
+                "/firstboot",
+                "disk",
+                "/mkfs",
+                "scratch",
+            ],
+            vec![
+                "volume",
+                "--username",
+                "alice",
+                "/verified",
+                "firstboot",
+                "disk",
+                "/mkfs",
+                "scratch",
+            ],
+            vec![
+                "volume",
+                "disk",
+                "/mkfs",
+                "scratch",
+                "--username",
+                "alice",
+                "/verified",
+                "/firstboot",
+            ],
+            vec![
+                "volume",
+                "--username",
+                "alice",
+                "/verified",
+                "/firstboot",
+                "--username",
+                "bob",
+                "/verified",
+                "/firstboot",
+                "disk",
+                "/mkfs",
+                "scratch",
+            ],
+            vec![
+                "layout",
+                "--username",
+                "alice",
+                "/verified",
+                "/firstboot",
+                "disk",
+            ],
+        ] {
+            assert!(parse_args(args(&bad)).is_err(), "{bad:?}");
         }
-        for name in ["", "Alice", "alice\n", "alice:root", "alice,root", "a b", "../alice", "1alice", "-alice", "_alice", "é", &"a".repeat(33)] {
-            assert!(parse_args(args(&["volume", "--username", name, "/verified", "/firstboot", "disk", "/mkfs", "scratch"])).is_err(), "{name:?}");
+        for name in ["a", "tester", "a-b_c1", &"a".repeat(32)] {
+            assert!(
+                parse_args(args(&[
+                    "volume",
+                    "--username",
+                    name,
+                    "/verified",
+                    "/firstboot",
+                    "disk",
+                    "/mkfs",
+                    "scratch"
+                ]))
+                .is_ok(),
+                "{name:?}"
+            );
+        }
+        for name in [
+            "",
+            "Alice",
+            "alice\n",
+            "alice:root",
+            "alice,root",
+            "a b",
+            "../alice",
+            "1alice",
+            "-alice",
+            "_alice",
+            "é",
+            &"a".repeat(33),
+        ] {
+            assert!(
+                parse_args(args(&[
+                    "volume",
+                    "--username",
+                    name,
+                    "/verified",
+                    "/firstboot",
+                    "disk",
+                    "/mkfs",
+                    "scratch"
+                ]))
+                .is_err(),
+                "{name:?}"
+            );
         }
         use std::os::unix::ffi::OsStringExt;
         let mut bad = args(&["volume", "--username"]).collect::<Vec<_>>();
         bad.push(OsString::from_vec(vec![0xff]));
-        bad.extend(args(&["/verified", "/firstboot", "disk", "/mkfs", "scratch"]));
+        bad.extend(args(&[
+            "/verified",
+            "/firstboot",
+            "disk",
+            "/mkfs",
+            "scratch",
+        ]));
         assert!(parse_args(bad.into_iter()).is_err());
     }
 
@@ -2855,21 +3217,41 @@ mod tests {
         let sentinel = dir.join("td-volume-root/keep");
         std::fs::create_dir(sentinel.parent().unwrap()).unwrap();
         std::fs::write(&sentinel, b"untouched").unwrap();
-        let selection = PrimarySelection { name: "root".into(), root: "/verified".into(), firstboot: dir.join("mkfs.btrfs") };
+        let selection = PrimarySelection {
+            name: "root".into(),
+            root: "/verified".into(),
+            firstboot: dir.join("mkfs.btrfs"),
+        };
         let mut output = Vec::new();
         // Neither a valid layout nor even an existing destination is required
         // to reach the account refusal, and the preexisting stage survives it.
         for destination in [&disk.path, &dir.join("absent")] {
-            let error = run_volume(VolumeSettings { username: Some(&selection), ..VolumeSettings::default() },
-                None, destination, &dir.join("mkfs.btrfs"), &dir, None, &mut output).unwrap_err();
-            assert!(error.to_string().contains("selected primary account validation failed"));
+            let error = run_volume(
+                VolumeSettings {
+                    username: Some(&selection),
+                    ..VolumeSettings::default()
+                },
+                None,
+                destination,
+                &dir.join("mkfs.btrfs"),
+                &dir,
+                None,
+                &mut output,
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("selected primary account validation failed"));
         }
         assert!(output.is_empty());
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"untouched");
         assert!(!dir.join("absent").exists());
         assert!(!dir.join("td-volume.img").exists());
         let mut bytes = [1; 512];
-        File::open(&disk.path).unwrap().read_exact(&mut bytes).unwrap();
+        File::open(&disk.path)
+            .unwrap()
+            .read_exact(&mut bytes)
+            .unwrap();
         assert_eq!(bytes, [0; 512]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2881,16 +3263,44 @@ mod tests {
         run_layout(&disk.path, &mut Vec::new()).unwrap();
         let validator = fake_mkfs(RECORDING_MKFS);
         let formatter = fake_mkfs(RECORDING_MKFS);
-        let selection = PrimarySelection { name: "alice".into(), root: "/verified root".into(), firstboot: validator.join("mkfs.btrfs") };
-        run_volume(VolumeSettings { username: Some(&selection), ..VolumeSettings::default() },
-            None, &disk.path, &formatter.join("mkfs.btrfs"), &formatter, None, &mut Vec::new()).unwrap();
-        assert_eq!(std::fs::read(validator.join("argv")).unwrap(), b"check-primary-name\n/verified root\nalice\n");
+        let selection = PrimarySelection {
+            name: "alice".into(),
+            root: "/verified root".into(),
+            firstboot: validator.join("mkfs.btrfs"),
+        };
+        run_volume(
+            VolumeSettings {
+                username: Some(&selection),
+                ..VolumeSettings::default()
+            },
+            None,
+            &disk.path,
+            &formatter.join("mkfs.btrfs"),
+            &formatter,
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(validator.join("argv")).unwrap(),
+            b"check-primary-name\n/verified root\nalice\n"
+        );
         let state = formatter.join("td-volume-root/@var");
         let file = state.join(USERNAME_STATE_RELATIVE);
         assert_eq!(std::fs::read(&file).unwrap(), b"alice\n");
-        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777, 0o644);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
         for parent in ["", "lib", "lib/td"] {
-            assert_eq!(std::fs::metadata(state.join(parent)).unwrap().permissions().mode() & 0o7777, 0o755);
+            assert_eq!(
+                std::fs::metadata(state.join(parent))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o755
+            );
         }
         assert!(seed_setting(&state, USERNAME_STATE_RELATIVE, "bob").is_err());
         assert_eq!(std::fs::read(file).unwrap(), b"alice\n");
@@ -2906,7 +3316,10 @@ mod tests {
         seed_setting(&root, "lib/td/hostname", "my-td").unwrap();
         let path = root.join("lib/td/hostname");
         assert_eq!(std::fs::read(&path).unwrap(), b"my-td\n");
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o644);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
         assert!(seed_setting(&root, "lib/td/hostname", "other").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"my-td\n");
         std::fs::remove_dir_all(root).unwrap();
@@ -3159,8 +3572,11 @@ mod tests {
         let snapshot = || {
             let mut file = File::open(&disk.path).unwrap();
             let mut bytes = Vec::new();
-            for (offset, len) in table_ranges(512, DISK / 512).unwrap().into_iter()
-                .chain([(MIB, 16 * MIB)]) {
+            for (offset, len) in table_ranges(512, DISK / 512)
+                .unwrap()
+                .into_iter()
+                .chain([(MIB, 16 * MIB)])
+            {
                 bytes.extend_from_slice(&read_at(&mut file, offset, len).unwrap());
             }
             bytes
@@ -3248,7 +3664,10 @@ mod tests {
         std::fs::write(&disk.path, b"replacement must survive").unwrap();
         let mut output = Vec::new();
         format_layout(&mut destination, Some(&boot), &mut output).unwrap();
-        assert_eq!(std::fs::read(&disk.path).unwrap(), b"replacement must survive");
+        assert_eq!(
+            std::fs::read(&disk.path).unwrap(),
+            b"replacement must survive"
+        );
         assert_eq!(String::from_utf8(output).unwrap(), "1048576 537919488\n");
         let bpb = read_at(&mut file, MIB, 512).unwrap();
         let u16le = |bytes: &[u8]| u16::from_le_bytes(bytes.try_into().unwrap()) as u64;
@@ -3298,7 +3717,10 @@ mod tests {
 
     #[test]
     fn the_verb_and_its_arity_are_exact() {
-        assert_eq!(parse_args(args(&["candidate-record"])).unwrap(), Mode::CandidateRecord);
+        assert_eq!(
+            parse_args(args(&["candidate-record"])).unwrap(),
+            Mode::CandidateRecord
+        );
         assert!(parse_args(args(&["candidate-record", "/dev/vda"])).is_err());
         assert!(parse_args(args(&["candidate-record", "--uuid"])).is_err());
         assert!(parse_args(args(&["candidate-record", "--trusted-key"])).is_err());
@@ -3311,7 +3733,10 @@ mod tests {
                 boot: None,
             }
         );
-        assert!(parse_args(args(&["layout"])).is_err(), "missing destination");
+        assert!(
+            parse_args(args(&["layout"])).is_err(),
+            "missing destination"
+        );
         assert!(
             parse_args(args(&["layout", "/dev/sda", "extra"])).is_err(),
             "a third argument is not silently ignored"
@@ -3343,7 +3768,14 @@ mod tests {
             assert!(parse_args(args(&short)).is_err(), "{short:?} is incomplete");
         }
         assert!(
-            parse_args(args(&["volume", "/dev/sda", "/bin/mkfs.btrfs", "/tmp", "x"])).is_err(),
+            parse_args(args(&[
+                "volume",
+                "/dev/sda",
+                "/bin/mkfs.btrfs",
+                "/tmp",
+                "x"
+            ]))
+            .is_err(),
             "a fourth argument is not silently ignored"
         );
     }
@@ -3376,8 +3808,7 @@ mod tests {
         let dir = fake_mkfs(RECORDING_MKFS);
         let _directory = ScratchDirectory(dir.clone());
         let mkfs = dir.join("mkfs.btrfs");
-        let prepared =
-            prepare_volume(VolumeSettings::default(), None, &mkfs, &dir, None).unwrap();
+        let prepared = prepare_volume(VolumeSettings::default(), None, &mkfs, &dir, None).unwrap();
         let mut destination = FormatDestination::open(&disk.path).unwrap();
         std::fs::rename(&disk.path, &retained.path).unwrap();
         std::fs::write(&disk.path, b"replacement must survive").unwrap();
@@ -3385,7 +3816,10 @@ mod tests {
         let mut layout_report = Vec::new();
         format_layout(&mut destination, None, &mut layout_report).unwrap();
         assert_eq!(layout_report, b"1048576 537919488\n");
-        assert_eq!(std::fs::read(&disk.path).unwrap(), b"replacement must survive");
+        assert_eq!(
+            std::fs::read(&disk.path).unwrap(),
+            b"replacement must survive"
+        );
         let (offset, len) = volume_region(&mut destination.file, 512, DISK / 512).unwrap();
         write_at(&mut destination.file, offset, &[0xa5; 512]).unwrap();
         write_at(&mut destination.file, offset + len - 512, &[0x5a; 512]).unwrap();
@@ -3393,8 +3827,14 @@ mod tests {
         let mut volume_report = Vec::new();
         format_volume(prepared, &mut destination, &mut volume_report).unwrap();
         assert_eq!(volume_report, format!("{offset} {len} 0\n").as_bytes());
-        assert_eq!(std::fs::read(&disk.path).unwrap(), b"replacement must survive");
-        assert_eq!(read_at(&mut destination.file, offset, 512).unwrap(), vec![0; 512]);
+        assert_eq!(
+            std::fs::read(&disk.path).unwrap(),
+            b"replacement must survive"
+        );
+        assert_eq!(
+            read_at(&mut destination.file, offset, 512).unwrap(),
+            vec![0; 512]
+        );
         assert_eq!(
             read_at(&mut destination.file, offset + len - 512, 512).unwrap(),
             vec![0; 512]
@@ -3548,7 +3988,11 @@ mod tests {
             seen.push(uuid);
             std::fs::remove_dir_all(&dir).unwrap();
         }
-        assert_ne!(seen.first(), seen.get(1), "two installs shared a volume UUID");
+        assert_ne!(
+            seen.first(),
+            seen.get(1),
+            "two installs shared a volume UUID"
+        );
     }
 
     /// A table with TWO partitions of the volume's name is refused rather than
@@ -3734,10 +4178,15 @@ mod tests {
             &dir,
             None,
             &mut out,
-        ).unwrap();
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         let fields: Vec<&str> = text.split_whitespace().collect();
-        assert_eq!(fields.len(), 3, "the line is <off> <len> <written>: {text:?}");
+        assert_eq!(
+            fields.len(),
+            3,
+            "the line is <off> <len> <written>: {text:?}"
+        );
         let plan = plan(512, DISK).unwrap();
         assert_eq!(
             fields.first().map(|f| f.parse::<u64>().unwrap()),
@@ -3835,7 +4284,9 @@ mod tests {
             "12345678-90ab-cdef-1234-567890abcdeg",
             "12345678-90ab-cdef-1234-567890abcdef\n",
         ] {
-            assert!(parse_args(args(&["volume", "--uuid", bad, "disk", "/mkfs", "scratch"])).is_err());
+            assert!(
+                parse_args(args(&["volume", "--uuid", bad, "disk", "/mkfs", "scratch"])).is_err()
+            );
         }
         for bad in [
             vec!["volume", "--uuid"],
@@ -4238,9 +4689,15 @@ mod tests {
         );
         // The snapshot is gone once promoted — it was RENAMED, so the volume's
         // key is the very file td-boot authenticated under.
-        assert!(!snapshot.exists(), "the snapshot was copied rather than renamed");
         assert!(
-            staging.join(protocol::DEPLOYMENTS_DIR).join(STAND_IN_ID).is_dir(),
+            !snapshot.exists(),
+            "the snapshot was copied rather than renamed"
+        );
+        assert!(
+            staging
+                .join(protocol::DEPLOYMENTS_DIR)
+                .join(STAND_IN_ID)
+                .is_dir(),
             "the deployments directory was not there when td-boot ran"
         );
         let order = std::fs::read_to_string(dir.join("order")).unwrap();
@@ -4348,7 +4805,11 @@ mod tests {
         assert!(refused.contains("must be a real regular file"), "{refused}");
 
         let big = dir.join("big.pub");
-        std::fs::write(&big, vec![b'a'; protocol::MAX_PUBLIC_KEY_BYTES as usize + 1]).unwrap();
+        std::fs::write(
+            &big,
+            vec![b'a'; protocol::MAX_PUBLIC_KEY_BYTES as usize + 1],
+        )
+        .unwrap();
         let refused = read_trusted_key(&big).unwrap_err().to_string();
         // The whole phrase: the message carries the path, which holds a pid,
         // and a pid containing the bound would satisfy a bare digit check.
@@ -4394,7 +4855,10 @@ mod tests {
             read_trusted_key(&edge).unwrap().len(),
             protocol::MAX_PUBLIC_KEY_BYTES as usize
         );
-        assert_eq!(read_trusted_key(&real).unwrap(), std::fs::read(&real).unwrap());
+        assert_eq!(
+            read_trusted_key(&real).unwrap(),
+            std::fs::read(&real).unwrap()
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -4414,7 +4878,9 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
 
         let absent = dir.join("no-such-disk");
-        let refused = run_layout(&absent, &mut Vec::new()).unwrap_err().to_string();
+        let refused = run_layout(&absent, &mut Vec::new())
+            .unwrap_err()
+            .to_string();
         assert!(
             refused.contains(&absent.display().to_string()),
             "layout must name the destination it could not open, got {refused:?}"
@@ -4429,8 +4895,8 @@ mod tests {
             None,
             &mut Vec::new(),
         )
-            .unwrap_err()
-            .to_string();
+        .unwrap_err()
+        .to_string();
         assert!(
             refused.contains(&absent.display().to_string()),
             "volume must name the destination it could not open, got {refused:?}"
@@ -4735,10 +5201,26 @@ mod tests {
                 include_str!("../../td-boot/src/realfile.rs"),
                 REALFILE_CHOKE.as_slice(),
             ),
-            ("gpt.rs", include_str!("../../engine/src/gpt.rs"), [].as_slice()),
-            ("fat.rs", include_str!("../../engine/src/fat.rs"), [].as_slice()),
-            ("cpio.rs", include_str!("../../engine/src/cpio.rs"), [].as_slice()),
-            ("crc32.rs", include_str!("../../engine/src/crc32.rs"), [].as_slice()),
+            (
+                "gpt.rs",
+                include_str!("../../engine/src/gpt.rs"),
+                [].as_slice(),
+            ),
+            (
+                "fat.rs",
+                include_str!("../../engine/src/fat.rs"),
+                [].as_slice(),
+            ),
+            (
+                "cpio.rs",
+                include_str!("../../engine/src/cpio.rs"),
+                [].as_slice(),
+            ),
+            (
+                "crc32.rs",
+                include_str!("../../engine/src/crc32.rs"),
+                [].as_slice(),
+            ),
             (
                 "protocol.rs",
                 include_str!("../../td-boot/src/protocol.rs"),
@@ -4746,9 +5228,17 @@ mod tests {
             ),
             ("scratch.rs", include_str!("scratch.rs"), [].as_slice()),
             ("inventory.rs", include_str!("inventory.rs"), [].as_slice()),
-            ("installation_plan.rs", include_str!("installation_plan.rs"), [].as_slice()),
+            (
+                "installation_plan.rs",
+                include_str!("installation_plan.rs"),
+                [].as_slice(),
+            ),
             ("timezones.rs", include_str!("timezones.rs"), [].as_slice()),
-            ("hostname.rs", include_str!("../../td-firstboot/src/hostname.rs"), [].as_slice()),
+            (
+                "hostname.rs",
+                include_str!("../../td-firstboot/src/hostname.rs"),
+                [].as_slice(),
+            ),
         ]
     }
 
@@ -4773,7 +5263,10 @@ mod tests {
         let text = uncommented(include_str!("main.rs"));
         let source = unspaced(&text);
         let source = source.as_str();
-        let labels: Vec<&str> = compiled_files().iter().map(|(label, _, _)| *label).collect();
+        let labels: Vec<&str> = compiled_files()
+            .iter()
+            .map(|(label, _, _)| *label)
+            .collect();
         // The TABLE's own body, because `include_str!` below has to bind a
         // declaration to the file the guards read and a `contains` over the
         // whole source binds it to any TEXT: review spelled the missing
@@ -5751,7 +6244,10 @@ mod tests {
     /// command-surface scan reds on the bare token that method would leave in
     /// the text — the same reason a comment here cannot spell it either.
     fn index_of(haystack: &str, needle: &str) -> Option<usize> {
-        haystack.match_indices(needle).next().map(|(index, _)| index)
+        haystack
+            .match_indices(needle)
+            .next()
+            .map(|(index, _)| index)
     }
 
     /// The LAST index of `needle`, spelled without its method for the same
@@ -5827,7 +6323,10 @@ mod tests {
     fn the_trust_roots_path_is_relative_and_outside_the_deployments() {
         assert_eq!(protocol::VOLUME_TRUSTED_KEY, "td/trusted.pub");
         let path = Path::new(protocol::VOLUME_TRUSTED_KEY);
-        assert!(path.is_relative(), "an absolute key path discards the volume");
+        assert!(
+            path.is_relative(),
+            "an absolute key path discards the volume"
+        );
         assert!(!path.starts_with(protocol::DEPLOYMENTS_DIR));
         assert_eq!(
             Path::new("/vol").join(protocol::VOLUME_TRUSTED_KEY),
@@ -5900,8 +6399,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !dir
-                .join("td-volume-root")
+            !dir.join("td-volume-root")
                 .join(protocol::VOLUME_TRUSTED_KEY)
                 .exists(),
             "a volume with no deployment carries a trust root"
@@ -6110,8 +6608,7 @@ mod tests {
         // written first would outlive the publish it belonged to and be the
         // root a later, unrelated publish into the same scratch inherited.
         assert!(
-            !dir
-                .join("td-volume-root")
+            !dir.join("td-volume-root")
                 .join(protocol::VOLUME_TRUSTED_KEY)
                 .exists(),
             "a failed publish left its trust root behind"
@@ -6224,8 +6721,7 @@ mod tests {
         File::create(&path).unwrap().set_len(DISK).unwrap();
         run_layout(&path, &mut Vec::new()).unwrap();
         let fake = fake_mkfs("#!/bin/sh\nexit 0\n");
-        let error =
-            run_volume(
+        let error = run_volume(
             VolumeSettings::default(),
             None,
             &path,
@@ -6233,7 +6729,8 @@ mod tests {
             &dir,
             None,
             &mut Vec::new(),
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert!(
             format!("{error}").contains("is the destination itself"),
             "the alias must be refused: {error}"
@@ -6314,7 +6811,11 @@ mod tests {
             [0xee; 4],
             "the deferred chunk's destination was not touched"
         );
-        assert_eq!(dest.read_at(3 * CHUNK, 4), [0xcd; 4], "the in-range chunk landed");
+        assert_eq!(
+            dest.read_at(3 * CHUNK, 4),
+            [0xcd; 4],
+            "the in-range chunk landed"
+        );
         // ...and the deferred pass then lands it, at its own offset.
         let first = copy_sparse(&mut image, &mut file, CHUNK, 0, CHUNK).unwrap();
         assert_eq!(first, CHUNK);
@@ -6342,9 +6843,14 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert!(!stale.exists(), "a stale staging file survived into the volume");
         assert!(
-            dir.join("td-volume-root").join(protocol::VOLUME_SUBVOL).is_dir(),
+            !stale.exists(),
+            "a stale staging file survived into the volume"
+        );
+        assert!(
+            dir.join("td-volume-root")
+                .join(protocol::VOLUME_SUBVOL)
+                .is_dir(),
             "the subvolume directory is still staged"
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -6430,13 +6936,29 @@ mod tests {
 
     #[test]
     fn format_cli_explains_options_before_boot_files() {
-        for pair in [["--uuid", "12345678-1234-4234-8234-123456789abc"],
-            ["/kernel", "--timezone"], ["-kernel", "/initrd"]] {
-            let error = parse_args(args(&["format", pair[0], pair[1], "disk", "/mkfs", "scratch"]))
-                .unwrap_err();
-            assert!(error.to_string().contains("paths before volume options"), "{error}");
+        for pair in [
+            ["--uuid", "12345678-1234-4234-8234-123456789abc"],
+            ["/kernel", "--timezone"],
+            ["-kernel", "/initrd"],
+        ] {
+            let error = parse_args(args(&[
+                "format", pair[0], pair[1], "disk", "/mkfs", "scratch",
+            ]))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("paths before volume options"),
+                "{error}"
+            );
         }
-        assert!(parse_args(args(&["format", "./-kernel", "/initrd", "disk", "/mkfs", "scratch"])).is_ok());
+        assert!(parse_args(args(&[
+            "format",
+            "./-kernel",
+            "/initrd",
+            "disk",
+            "/mkfs",
+            "scratch"
+        ]))
+        .is_ok());
     }
 
     fn combined_fixture(body: &str) -> (Scratch, ScratchDirectory, BootFiles) {
@@ -6578,12 +7100,16 @@ mod tests {
     fn combined_format_succeeds_without_an_existing_gpt() {
         let disk = Scratch::disk(DISK);
         let dir = ScratchDirectory(fake_mkfs(RECORDING_MKFS));
-        let boot = BootFiles { kernel: dir.0.join("kernel"), initramfs: dir.0.join("initrd") };
+        let boot = BootFiles {
+            kernel: dir.0.join("kernel"),
+            initramfs: dir.0.join("initrd"),
+        };
         std::fs::write(&boot.kernel, b"kernel").unwrap();
         std::fs::write(&boot.initramfs, b"initrd").unwrap();
         assert!(destination_volume(&mut File::open(&disk.path).unwrap()).is_err());
         let mkfs = dir.0.join("mkfs.btrfs");
-        let prepared = prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, None).unwrap();
+        let prepared =
+            prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, None).unwrap();
         let mut output = Vec::new();
         run_format(prepared, &disk.path, &boot, &mut output).unwrap();
         let (offset, len) = destination_volume(&mut File::open(&disk.path).unwrap()).unwrap();
@@ -6611,30 +7137,56 @@ mod tests {
         let plan = plan(512, DISK).unwrap();
         let offset = plan.volume_start * 512;
         let len = (plan.volume_end - plan.volume_start + 1) * 512;
-        [(0, 2 * MIB), (offset, MIB), (offset + len / 2, 4096),
-            (offset + len - MIB, MIB), (DISK - 65536, 65536)]
-            .into_iter().map(|(at, len)| disk.read_at(at, len as usize)).collect()
+        [
+            (0, 2 * MIB),
+            (offset, MIB),
+            (offset + len / 2, 4096),
+            (offset + len - MIB, MIB),
+            (DISK - 65536, 65536),
+        ]
+        .into_iter()
+        .map(|(at, len)| disk.read_at(at, len as usize))
+        .collect()
     }
 
-    fn unlaid_volume_image(len: u64) -> (Scratch, ScratchDirectory, FormatDestination, PreparedVolumeImage) {
+    fn unlaid_volume_image(
+        len: u64,
+    ) -> (
+        Scratch,
+        ScratchDirectory,
+        FormatDestination,
+        PreparedVolumeImage,
+    ) {
         let disk = Scratch::disk(DISK);
         let mut destination = FormatDestination::open(&disk.path).unwrap();
         let plan = plan(512, DISK).unwrap();
         let offset = plan.volume_start * 512;
         let volume_len = (plan.volume_end - plan.volume_start + 1) * 512;
-        for (at, count) in [(0, 4096), (MIB, 4096), (DISK - 4096, 4096),
-            (offset, MIB), (offset + volume_len / 2, 4096),
-            (offset + volume_len - MIB, MIB)] {
+        for (at, count) in [
+            (0, 4096),
+            (MIB, 4096),
+            (DISK - 4096, 4096),
+            (offset, MIB),
+            (offset + volume_len / 2, 4096),
+            (offset + volume_len - MIB, MIB),
+        ] {
             write_at(&mut destination.file, at, &vec![0xa5; count as usize]).unwrap();
         }
         let before = volume_write_snapshot(&disk);
         let dir = ScratchDirectory(fake_mkfs(RECORDING_MKFS));
         let mkfs = dir.0.join("mkfs.btrfs");
-        let prepared = prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, None).unwrap();
+        let prepared =
+            prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, None).unwrap();
         let image = prepare_volume_image(prepared, &destination, len).unwrap();
-        assert!(before == volume_write_snapshot(&disk), "preparation wrote the destination");
+        assert!(
+            before == volume_write_snapshot(&disk),
+            "preparation wrote the destination"
+        );
         assert_eq!(std::fs::metadata(&disk.path).unwrap().len(), DISK);
-        assert!(destination_volume(&mut destination.file).is_err(), "preparation laid out a disk");
+        assert!(
+            destination_volume(&mut destination.file).is_err(),
+            "preparation laid out a disk"
+        );
         (disk, dir, destination, image)
     }
 
@@ -6662,9 +7214,15 @@ mod tests {
         assert_eq!(disk.read_at(offset + 65536, 23), b"original prepared bytes");
         assert_eq!(output, format!("{offset} {len} {MIB}\n").as_bytes());
         let mut replacement = File::open(&image_path).unwrap();
-        assert_eq!(read_at(&mut replacement, 65536, 24).unwrap(), b"replacement must survive");
+        assert_eq!(
+            read_at(&mut replacement, 65536, 24).unwrap(),
+            b"replacement must survive"
+        );
         assert_eq!(replacement.metadata().unwrap().len(), len);
-        assert_eq!(destination_volume(&mut destination.file).unwrap(), (offset, len));
+        assert_eq!(
+            destination_volume(&mut destination.file).unwrap(),
+            (offset, len)
+        );
         assert_eq!(std::fs::metadata(&disk.path).unwrap().len(), DISK);
     }
 
@@ -6679,7 +7237,10 @@ mod tests {
         let mut output = Vec::new();
         let error = image.write_to(&mut alias, &mut output).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "prepared Btrfs image is the destination itself");
+        assert_eq!(
+            error.to_string(),
+            "prepared Btrfs image is the destination itself"
+        );
         assert_eq!(read_at(&mut alias.file, 0, 4096).unwrap(), vec![0x5a; 4096]);
         assert_eq!(alias.file.metadata().unwrap().len(), len);
         assert!(before == volume_write_snapshot(&disk));
@@ -6696,9 +7257,15 @@ mod tests {
             let before = volume_write_snapshot(&disk);
             let mut output = Vec::new();
             let result = image.write_to(&mut destination, &mut output);
-            assert!(before == volume_write_snapshot(&disk), "extent refusal wrote the destination");
+            assert!(
+                before == volume_write_snapshot(&disk),
+                "extent refusal wrote the destination"
+            );
             let error = result.unwrap_err();
-            assert!(error.to_string().contains("but the destination volume has"), "{error}");
+            assert!(
+                error.to_string().contains("but the destination volume has"),
+                "{error}"
+            );
             assert_eq!(std::fs::metadata(&disk.path).unwrap().len(), DISK);
             assert!(output.is_empty());
         }
@@ -6711,14 +7278,26 @@ mod tests {
         for changed_len in [len - 512, len + 512] {
             let (disk, dir, mut destination, image) = unlaid_volume_image(len);
             format_layout(&mut destination, None, &mut Vec::new()).unwrap();
-            OpenOptions::new().write(true).open(dir.0.join("td-volume.img")).unwrap()
-                .set_len(changed_len).unwrap();
+            OpenOptions::new()
+                .write(true)
+                .open(dir.0.join("td-volume.img"))
+                .unwrap()
+                .set_len(changed_len)
+                .unwrap();
             let before = volume_write_snapshot(&disk);
             let mut output = Vec::new();
             let result = image.write_to(&mut destination, &mut output);
-            assert!(before == volume_write_snapshot(&disk), "source refusal wrote the destination");
+            assert!(
+                before == volume_write_snapshot(&disk),
+                "source refusal wrote the destination"
+            );
             let error = result.unwrap_err();
-            assert!(error.to_string().contains("prepared Btrfs image changed size"), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("prepared Btrfs image changed size"),
+                "{error}"
+            );
             assert_eq!(std::fs::metadata(&disk.path).unwrap().len(), DISK);
             assert!(output.is_empty());
         }
@@ -6753,23 +7332,39 @@ mod tests {
             write_at(&mut file, *at, &vec![0xa5; *count as usize]).unwrap();
         }
         drop(file);
-        let snapshot = || ranges.iter()
-            .map(|(at, count)| disk.read_at(*at, *count as usize))
-            .collect::<Vec<_>>();
+        let snapshot = || {
+            ranges
+                .iter()
+                .map(|(at, count)| disk.read_at(*at, *count as usize))
+                .collect::<Vec<_>>()
+        };
         let before = snapshot();
         let (action, expected_kind, reason) = match fault {
             PreparedImageFault::Missing => (
-                "rm -- \"$image\"", io::ErrorKind::NotFound, "prepared Btrfs image"),
+                "rm -- \"$image\"",
+                io::ErrorKind::NotFound,
+                "prepared Btrfs image",
+            ),
             PreparedImageFault::Truncated => (
-                ": > \"$image\"", io::ErrorKind::InvalidData, "bytes, not the required"),
+                ": > \"$image\"",
+                io::ErrorKind::InvalidData,
+                "bytes, not the required",
+            ),
             PreparedImageFault::Grown => (
-                "printf x >> \"$image\"", io::ErrorKind::InvalidData, "bytes, not the required"),
+                "printf x >> \"$image\"",
+                io::ErrorKind::InvalidData,
+                "bytes, not the required",
+            ),
             PreparedImageFault::Replaced => (
-                "mv -- \"$image.replacement\" \"$image\"", io::ErrorKind::InvalidData,
-                "prepared Btrfs image was replaced"),
+                "mv -- \"$image.replacement\" \"$image\"",
+                io::ErrorKind::InvalidData,
+                "prepared Btrfs image was replaced",
+            ),
             PreparedImageFault::Aliased => (
-                "mv -- \"$image.replacement\" \"$image\"", io::ErrorKind::InvalidData,
-                "prepared Btrfs image must be a real regular file"),
+                "mv -- \"$image.replacement\" \"$image\"",
+                io::ErrorKind::InvalidData,
+                "prepared Btrfs image must be a real regular file",
+            ),
         };
         let observe_retention = concat!(
             "#!/bin/sh\nset -eu\nfor image in \"$@\"; do :; done\n",
@@ -6783,22 +7378,44 @@ mod tests {
         let alternate = dir.join("td-volume.img.replacement");
         match fault {
             PreparedImageFault::Replaced => File::create(&alternate).unwrap().set_len(len).unwrap(),
-            PreparedImageFault::Aliased => std::os::unix::fs::symlink(&disk.path, &alternate).unwrap(),
-            _ => {},
+            PreparedImageFault::Aliased => {
+                std::os::unix::fs::symlink(&disk.path, &alternate).unwrap()
+            }
+            _ => {}
         }
         let mut output = Vec::new();
-        let result = run_volume(VolumeSettings::default(), None, &disk.path,
-            &dir.join("mkfs.btrfs"), &dir, None, &mut output);
+        let result = run_volume(
+            VolumeSettings::default(),
+            None,
+            &disk.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            None,
+            &mut output,
+        );
         let completed = dir.join("td-volume.img.done").is_file();
         let after = snapshot();
         let disk_len = std::fs::metadata(&disk.path).unwrap().len();
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(completed, "formatter did not observe the held inode and complete its mutation");
+        assert!(
+            completed,
+            "formatter did not observe the held inode and complete its mutation"
+        );
         let error = result.expect_err("invalid prepared image was accepted");
-        assert_eq!(error.kind(), expected_kind, "wrong refusal for {fault:?}: {error}");
-        assert!(error.to_string().contains(reason), "wrong refusal for {fault:?}: {error}");
+        assert_eq!(
+            error.kind(),
+            expected_kind,
+            "wrong refusal for {fault:?}: {error}"
+        );
+        assert!(
+            error.to_string().contains(reason),
+            "wrong refusal for {fault:?}: {error}"
+        );
         assert!(output.is_empty(), "a refused volume reported success");
-        assert!(before == after, "prepared-image refusal changed destination bytes");
+        assert!(
+            before == after,
+            "prepared-image refusal changed destination bytes"
+        );
         assert_eq!(disk_len, DISK);
     }
 
@@ -6935,7 +7552,10 @@ mod tests {
         // first unusable one — a disk's final sector is addressable.
         let last = gpt::last_usable_lba(512, DISK / 512).unwrap();
         assert_eq!(p.volume_end, last);
-        assert!(p.volume_end < p.disk_sectors, "the end is an LBA, not a count");
+        assert!(
+            p.volume_end < p.disk_sectors,
+            "the end is an LBA, not a count"
+        );
     }
 
     #[test]
@@ -7195,12 +7815,12 @@ mod tests {
         }
 
         for (major, minor) in [
-            (8, 0),               // /dev/sda
-            (8, 1),               // /dev/sda1
-            (259, 5),             // an NVMe namespace, major past one byte
-            (0xfff, 0xff_ffff),   // every bit of both low fields
-            (0x1000, 3),          // the first EXTENDED major
-            (0xf_ffff, 0xff_ffff),// every bit of both
+            (8, 0),                // /dev/sda
+            (8, 1),                // /dev/sda1
+            (259, 5),              // an NVMe namespace, major past one byte
+            (0xfff, 0xff_ffff),    // every bit of both low fields
+            (0x1000, 3),           // the first EXTENDED major
+            (0xf_ffff, 0xff_ffff), // every bit of both
             (0x1234, 0x9_abcd),
         ] {
             let rdev = makedev(major, minor);

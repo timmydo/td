@@ -85,10 +85,7 @@ fn append(bytes: &mut Vec<u8>, value: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
-fn workspace(
-    cwd: &Path,
-    account: &crate::primary_account::PrimaryAccount,
-) -> io::Result<PathBuf> {
+fn workspace(cwd: &Path, account: &crate::primary_account::PrimaryAccount) -> io::Result<PathBuf> {
     if !cwd.is_absolute() || cwd.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(io::Error::other("invalid Claude launch working directory"));
     }
@@ -408,10 +405,8 @@ mod tests {
     }
 
     fn primary(name: &str) -> crate::primary_account::PrimaryAccount {
-        crate::primary_account::parse(&format!(
-            "{name}:x:1000:1000:human:/home/{name}:/bin/sh\n"
-        ))
-        .unwrap()
+        crate::primary_account::parse(&format!("{name}:x:1000:1000:human:/home/{name}:/bin/sh\n"))
+            .unwrap()
     }
 
     fn decode(bytes: &[u8]) -> io::Result<Request> {
@@ -429,10 +424,17 @@ mod tests {
                     assert_eq!(request.cwd, Path::new(HOME).join(format!("src{suffix}")));
                 }
             }
-            for cwd in ["/home/tester/src/project", "/home/alice-sibling/src", "/var/lib/td/secrets", "/etc"] {
+            for cwd in [
+                "/home/tester/src/project",
+                "/home/alice-sibling/src",
+                "/var/lib/td/secrets",
+                "/etc",
+            ] {
                 assert_eq!(workspace(Path::new(cwd), &account).unwrap(), Path::new("/"));
             }
-            assert!(workspace(Path::new(&format!("/home/{name}/src/../secret")), &account).is_err());
+            assert!(
+                workspace(Path::new(&format!("/home/{name}/src/../secret")), &account).is_err()
+            );
         }
     }
 
@@ -454,7 +456,10 @@ mod tests {
             workspace(Path::new("/var/home/tester/src/sub"), &primary("tester")).unwrap(),
             Path::new(HOME).join("src/sub")
         );
-        assert_eq!(workspace(Path::new("/etc"), &primary("tester")).unwrap(), Path::new("/"));
+        assert_eq!(
+            workspace(Path::new("/etc"), &primary("tester")).unwrap(),
+            Path::new("/")
+        );
         assert!(workspace(Path::new("/home/tester/src/../secret"), &primary("tester")).is_err());
         assert!(workspace(Path::new("relative"), &primary("tester")).is_err());
     }

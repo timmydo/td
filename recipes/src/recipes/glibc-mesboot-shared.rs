@@ -1,4 +1,6 @@
-use crate::ladder::{SH, apply_patch, link_bins, mesboot0_inputs, mesboot0_path, sed_i, unpack_into, unpack_keep_top};
+use crate::ladder::{
+    apply_patch, link_bins, mesboot0_inputs, mesboot0_path, sed_i, unpack_into, unpack_keep_top, SH,
+};
 use crate::types::{Recipe, Step, TextEdit};
 
 // glibc 2.16.0 SHARED — rung 17 (#378): the runtime libc dynamic /td/store
@@ -11,10 +13,14 @@ pub fn recipe() -> Recipe {
     let btinc = "{src}/sunrpc:{in:glibc-mesboot0}/include:{root}/kh";
     let btlib = "{in:glibc-mesboot0}/lib";
     let cc = "{in:gcc-mesboot1}/bin/gcc -I {src}/nptl/sysdeps/pthread/bits -D BOOTSTRAP_GLIBC=1 -L {src} -L {in:glibc-mesboot0}/lib";
-    let cpp = "{in:gcc-mesboot1}/bin/gcc -E -I {src}/nptl/sysdeps/pthread/bits -D BOOTSTRAP_GLIBC=1";
+    let cpp =
+        "{in:gcc-mesboot1}/bin/gcc -E -I {src}/nptl/sysdeps/pthread/bits -D BOOTSTRAP_GLIBC=1";
     let mut steps = unpack_into("glibc-mesboot-shared-source", "{src}");
     steps.push(apply_patch("patch-mesboot", "patch-glibc-boot-2.16.0"));
-    steps.push(apply_patch("patch-mesboot", "patch-glibc-bootstrap-system-2.16.0"));
+    steps.push(apply_patch(
+        "patch-mesboot",
+        "patch-glibc-bootstrap-system-2.16.0",
+    ));
     steps.extend(unpack_keep_top("linux-headers", "{root}/kh"));
     steps.push(Step::ToolFarm {
         links: vec![
@@ -31,7 +37,10 @@ pub fn recipe() -> Recipe {
         "s,\\${vdso_symver//\\./_},$(echo $vdso_symver | sed -e \"s/\\\\./_/g\"),",
         &["sysdeps/unix/make-syscalls.sh"],
     ));
-    steps.push(sed_i("s,de\\.po,en_GB.po,", &["catgets/Makefile", "intl/Makefile"]));
+    steps.push(sed_i(
+        "s,de\\.po,en_GB.po,",
+        &["catgets/Makefile", "intl/Makefile"],
+    ));
     steps.push(sed_i("s,/bin/pwd,pwd,", &["configure"]));
     steps.push(sed_i(
         "/^others *+= *nscd/d; /^others-pie *+= *nscd/d; /^install-sbin *:= *nscd/d",
@@ -41,7 +50,10 @@ pub fn recipe() -> Recipe {
         "s/^extra-libs[[:space:]]*=.*/extra-libs =/; s/^extra-libs-others[[:space:]]*=.*/extra-libs-others =/",
         &["nis/Makefile"],
     ));
-    steps.push(sed_i("s/wctype manual shadow/wctype shadow/", &["Makeconfig"]));
+    steps.push(sed_i(
+        "s/wctype manual shadow/wctype shadow/",
+        &["Makeconfig"],
+    ));
     steps.push(sed_i(
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
@@ -172,6 +184,10 @@ pub fn recipe() -> Recipe {
             "glibc-mesboot0",
             "gawk-mesboot",
         ])
-        .inputs_owned(mesboot0_inputs(&["patch-glibc-boot-2.16.0", "patch-glibc-bootstrap-system-2.16.0", "linux-headers"]))
+        .inputs_owned(mesboot0_inputs(&[
+            "patch-glibc-boot-2.16.0",
+            "patch-glibc-bootstrap-system-2.16.0",
+            "linux-headers",
+        ]))
         .steps(steps)
 }

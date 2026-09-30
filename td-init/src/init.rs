@@ -217,7 +217,9 @@ pub fn parse_inittab(text: &str) -> (Vec<Entry>, Vec<String>) {
         let (id, action, process) = match parsed {
             (Some(id), Some(_runlevels), Some(action), Some(process)) => (id, action, process),
             _ => {
-                problems.push(format!("line {number}: expected id:runlevels:action:process"));
+                problems.push(format!(
+                    "line {number}: expected id:runlevels:action:process"
+                ));
                 continue;
             }
         };
@@ -273,7 +275,9 @@ fn load(path: &str) -> (Vec<Entry>, Vec<String>) {
     // all-comment file, and a table whose every action td rejects all land here.
     // busybox init installs its defaults on an empty action list for the same
     // reason.
-    let (entries, note) = fall_back(format!("{path}: no usable entries; using the built-in table"));
+    let (entries, note) = fall_back(format!(
+        "{path}: no usable entries; using the built-in table"
+    ));
     let mut all = problems;
     all.extend(note);
     (entries, all)
@@ -458,7 +462,11 @@ fn supervise(entries: Vec<Entry>, mut once: Vec<(i32, String)>) -> ! {
                         // Poll finely only when the restart is imminent. A job
                         // held for five minutes would otherwise keep PID 1
                         // waking ten times a second for the whole hold.
-                        left.min(if left > IDLE_SLICE { IDLE_SLICE } else { POLL_SLICE })
+                        left.min(if left > IDLE_SLICE {
+                            IDLE_SLICE
+                        } else {
+                            POLL_SLICE
+                        })
                     }
                     None => POLL_SLICE,
                 };
@@ -487,9 +495,7 @@ fn collect(jobs: &mut [Respawn], once: &mut Vec<(i32, String)>, pid: i32, status
             continue;
         }
         job.pid = None;
-        let brief = job
-            .started
-            .is_some_and(|at| at.elapsed() < MIN_UPTIME);
+        let brief = job.started.is_some_and(|at| at.elapsed() < MIN_UPTIME);
         if brief {
             job.fast_failures = job.fast_failures.saturating_add(1);
             let (delay, say) = throttle(job.fast_failures);
@@ -552,8 +558,9 @@ fn boot(entries: Vec<Entry>) -> ! {
 ///
 /// Matched anywhere in a word: the splitter groups `cmd>/dev/log` and `a|b`
 /// into ONE word each.
-const METACHARACTERS: [char; 14] =
-    ['>', '<', '|', '&', ';', '(', ')', '$', '`', '*', '?', '[', ']', '~'];
+const METACHARACTERS: [char; 14] = [
+    '>', '<', '|', '&', ';', '(', ')', '$', '`', '*', '?', '[', ']', '~',
+];
 
 /// Does a `-c` in this argv introduce a script? `mytool -c cfg > /dev/log`
 /// hands the redirect over literally, so the answer turns on which program
@@ -590,7 +597,9 @@ fn invokes_a_shell(argv: &[String]) -> bool {
         }
         // `busybox` alone is not a shell — `busybox sh` is.
         if prog == "busybox" {
-            return words.next().is_some_and(|a| SHELLS.contains(&crate::basename(a)));
+            return words
+                .next()
+                .is_some_and(|a| SHELLS.contains(&crate::basename(a)));
         }
         if !WRAPPERS.contains(&prog) {
             return false;
@@ -669,7 +678,11 @@ fn report(entries: &[Entry], problems: &[String]) -> String {
         out.push_str(&format!("# {problem}\n"));
     }
     for entry in entries {
-        let tty = if entry.tty.is_empty() { "-" } else { &entry.tty };
+        let tty = if entry.tty.is_empty() {
+            "-"
+        } else {
+            &entry.tty
+        };
         out.push_str(&format!(
             "{} {tty} {}\n",
             entry.action.name(),
@@ -775,7 +788,10 @@ mod tests {
     use super::*;
 
     fn split_argv(text: &str) -> Result<Vec<String>, String> {
-        Ok(split_argv_marked(text)?.into_iter().map(|(w, _)| w).collect())
+        Ok(split_argv_marked(text)?
+            .into_iter()
+            .map(|(w, _)| w)
+            .collect())
     }
 
     fn entry(tty: &str, action: Action, argv: &[&str]) -> Entry {
@@ -789,9 +805,8 @@ mod tests {
 
     #[test]
     fn the_four_field_form_parses_with_runlevels_ignored() {
-        let (entries, problems) = parse_inittab(
-            "::sysinit:/etc/init.d/rcS\nttyS0:2345:respawn:/bin/cttyhack /bin/sh\n",
-        );
+        let (entries, problems) =
+            parse_inittab("::sysinit:/etc/init.d/rcS\nttyS0:2345:respawn:/bin/cttyhack /bin/sh\n");
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(
             entries,
@@ -853,10 +868,22 @@ mod tests {
         );
         // Inside double quotes a backslash escapes only " \ $ ` — before
         // anything else it is literal, as a shell would have left it.
-        assert_eq!(split_argv(r#"/bin/echo "a\nb""#).unwrap(), vec!["/bin/echo", r"a\nb"]);
-        assert_eq!(split_argv(r#"/bin/echo "a\$b""#).unwrap(), vec!["/bin/echo", "a$b"]);
-        assert_eq!(split_argv(r#"/bin/echo "a\\b""#).unwrap(), vec!["/bin/echo", r"a\b"]);
-        assert_eq!(split_argv(r"/bin/echo a\ b").unwrap(), vec!["/bin/echo", "a b"]);
+        assert_eq!(
+            split_argv(r#"/bin/echo "a\nb""#).unwrap(),
+            vec!["/bin/echo", r"a\nb"]
+        );
+        assert_eq!(
+            split_argv(r#"/bin/echo "a\$b""#).unwrap(),
+            vec!["/bin/echo", "a$b"]
+        );
+        assert_eq!(
+            split_argv(r#"/bin/echo "a\\b""#).unwrap(),
+            vec!["/bin/echo", r"a\b"]
+        );
+        assert_eq!(
+            split_argv(r"/bin/echo a\ b").unwrap(),
+            vec!["/bin/echo", "a b"]
+        );
         // An empty quoted word is still a word.
         assert_eq!(split_argv("/bin/echo ''").unwrap(), vec!["/bin/echo", ""]);
         assert!(split_argv("").unwrap().is_empty());
@@ -885,7 +912,10 @@ mod tests {
     fn a_missing_inittab_falls_back_to_the_built_in_table() {
         let (entries, problems) = load("/nonexistent/inittab");
         assert_eq!(entries.len(), 2);
-        assert!(problems.first().unwrap().contains("using the built-in table"));
+        assert!(problems
+            .first()
+            .unwrap()
+            .contains("using the built-in table"));
     }
 
     /// A table that OPENS but yields no jobs is just as unusable as one that
@@ -906,12 +936,17 @@ mod tests {
             ("comments", "# nothing but a comment\n\n"),
             // Every line rejected — the shape an inittab written for busybox's
             // richer action set has when td-init reads it.
-            ("rejected", "::ctrlaltdel:/bin/reboot\n::shutdown:/bin/umount -a -r\n"),
+            (
+                "rejected",
+                "::ctrlaltdel:/bin/reboot\n::shutdown:/bin/umount -a -r\n",
+            ),
         ] {
             let (entries, problems) = load(&write(name, text));
             assert_eq!(entries.len(), 2, "{name} did not fall back: {problems:?}");
             assert!(
-                problems.iter().any(|p| p.contains("using the built-in table")),
+                problems
+                    .iter()
+                    .any(|p| p.contains("using the built-in table")),
                 "{name}: {problems:?}"
             );
         }
@@ -919,7 +954,10 @@ mod tests {
         // A table with even ONE usable job is the operator's, and is left alone.
         let (entries, problems) = load(&write("one", "::once:/bin/true\n::bogus:/bin/false\n"));
         assert_eq!(entries.len(), 1);
-        assert!(!problems.iter().any(|p| p.contains("built-in")), "{problems:?}");
+        assert!(
+            !problems.iter().any(|p| p.contains("built-in")),
+            "{problems:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -952,7 +990,10 @@ mod tests {
             "expected a PID-1 refusal, got {err:?}"
         );
         // …and the validation path is unaffected by that refusal.
-        assert_eq!(run(&["--dry-run".into(), "-f".into(), "/nonexistent".into()]), Ok(1));
+        assert_eq!(
+            run(&["--dry-run".into(), "-f".into(), "/nonexistent".into()]),
+            Ok(1)
+        );
     }
 
     /// The jobs printed may not be the operator's at all: `load` substitutes the
@@ -989,9 +1030,18 @@ mod tests {
         fn sw(argv: &[String]) -> Option<&String> {
             shell_word(argv, &[])
         }
-        assert_eq!(sw(&args(&["/bin/foo", ">", "/dev/log"])), Some(&">".to_string()));
-        assert_eq!(sw(&args(&["/bin/foo", "|", "logger"])), Some(&"|".to_string()));
-        assert_eq!(sw(&args(&["/bin/foo", "$HOME"])), Some(&"$HOME".to_string()));
+        assert_eq!(
+            sw(&args(&["/bin/foo", ">", "/dev/log"])),
+            Some(&">".to_string())
+        );
+        assert_eq!(
+            sw(&args(&["/bin/foo", "|", "logger"])),
+            Some(&"|".to_string())
+        );
+        assert_eq!(
+            sw(&args(&["/bin/foo", "$HOME"])),
+            Some(&"$HOME".to_string())
+        );
         // The compact forms, which the splitter leaves as ONE word each. These
         // are how a real table writes a redirect or a pipe, and requiring the
         // whole word to be operators missed every one of them.
@@ -1012,7 +1062,10 @@ mod tests {
         assert_eq!(sw(&args(&["/bin/sh", "-c", "echo $HOME >/dev/log"])), None);
         assert_eq!(sw(&args(&["/bin/sh", "-c", "exec `which getty`"])), None);
         // Before the `-c` the words are still init's to pass through literally.
-        assert_eq!(sw(&args(&["$SHELL", "-c", "true"])), Some(&"$SHELL".to_string()));
+        assert_eq!(
+            sw(&args(&["$SHELL", "-c", "true"])),
+            Some(&"$SHELL".to_string())
+        );
         // ...and `-c` only means "a script follows" to a SHELL. To most programs
         // it is a config flag, and the redirect after one is still handed over
         // literally — exactly what the note exists to say.
@@ -1068,17 +1121,35 @@ mod tests {
         );
         // chroot's NEWROOT operand, and su, which always execs a login shell.
         assert_eq!(
-            sw(&args(&["/usr/sbin/chroot", "/newroot", "/bin/sh", "-c", "echo $HOME"])),
+            sw(&args(&[
+                "/usr/sbin/chroot",
+                "/newroot",
+                "/bin/sh",
+                "-c",
+                "echo $HOME"
+            ])),
             None
         );
         assert_eq!(sw(&args(&["/bin/su", "-c", "echo $HOME", "root"])), None);
         // A wrapper's own flags and assignments sit before the program it runs.
         assert_eq!(
-            sw(&args(&["/usr/bin/env", "FOO=bar", "/bin/sh", "-c", "echo $HOME"])),
+            sw(&args(&[
+                "/usr/bin/env",
+                "FOO=bar",
+                "/bin/sh",
+                "-c",
+                "echo $HOME"
+            ])),
             None
         );
         assert_eq!(
-            sw(&args(&["/sbin/setsid", "-w", "/bin/sh", "-c", "echo $HOME"])),
+            sw(&args(&[
+                "/sbin/setsid",
+                "-w",
+                "/bin/sh",
+                "-c",
+                "echo $HOME"
+            ])),
             None
         );
         // ...but a wrapper around a non-shell is still literal.
@@ -1133,10 +1204,7 @@ mod tests {
             sw(&args(&["/bin/foo", "[ab].conf"])),
             Some(&"[ab].conf".to_string())
         );
-        assert_eq!(
-            sw(&args(&["~/bin/tool"])),
-            Some(&"~/bin/tool".to_string())
-        );
+        assert_eq!(sw(&args(&["~/bin/tool"])), Some(&"~/bin/tool".to_string()));
         assert_eq!(sw(&args(&["/sbin/getty", "-L", "115200", "ttyS0"])), None);
         assert_eq!(sw(&args(&["/bin/foo", "--flag=a,b"])), None);
 
@@ -1181,11 +1249,17 @@ mod tests {
         // whoever is reading the console after the wrong file.
         let (opts, notes) = parse_args(&args(&["-f", "/custom/tab", "-f"]), true).unwrap();
         assert_eq!(opts.path, "/custom/tab");
-        assert!(notes.iter().any(|n| n.contains("using /custom/tab")), "{notes:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("using /custom/tab")),
+            "{notes:?}"
+        );
         // ...and an explicit --dry-run is refused with a note saying why.
         let (opts, notes) = parse_args(&args(&["--dry-run"]), true).unwrap();
         assert!(!opts.dry);
-        assert!(notes.iter().any(|n| n.contains("PID 1 must not exit")), "{notes:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("PID 1 must not exit")),
+            "{notes:?}"
+        );
     }
 
     /// Respawn accounting: a job's own pid clears its slot, and a brief life

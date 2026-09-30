@@ -202,8 +202,7 @@ fn prove_td_shell_userland(
          glibc-x86-64 {TD_STORE_DIR}/{glibc_base} td-recipe-output\n\
          busybox-x86-64 {TD_STORE_DIR}/{busybox_base} td-recipe-output\n"
     );
-    fs::write(&native_lock, lock)
-        .map_err(|e| format!("write {}: {e}", native_lock.display()))?;
+    fs::write(&native_lock, lock).map_err(|e| format!("write {}: {e}", native_lock.display()))?;
 
     let dbs = runner.recipe_output_dbs(build_out)?;
     let dbs = dbs
@@ -216,8 +215,7 @@ fn prove_td_shell_userland(
         .join(":");
     let tdstore = runner.tdstore_path();
     let store_ns_builder = runner.control_builder_path();
-    let evaluator = std::env::current_exe()
-        .map_err(|e| format!("locate td-recipe-eval: {e}"))?;
+    let evaluator = std::env::current_exe().map_err(|e| format!("locate td-recipe-eval: {e}"))?;
     let stage0_base = path_basename(stage0_tree)?;
     let interp = format!("{glibc_path}/lib/ld-linux-x86-64.so.2");
     let script = format!(

@@ -202,7 +202,9 @@ fn run(args: Args) -> io::Result<ExitCode> {
         return Err(io::Error::other("--squash is only meaningful with --land"));
     }
     if args.land.is_none() && (args.expect.is_some() || args.expect_base.is_some()) {
-        return Err(io::Error::other("--expect/--expect-base are only meaningful with --land"));
+        return Err(io::Error::other(
+            "--expect/--expect-base are only meaningful with --land",
+        ));
     }
     if args.land.is_none() && args.delete.is_none() && !args.prune_worktrees && args.yes {
         return Err(io::Error::other(
@@ -210,7 +212,9 @@ fn run(args: Args) -> io::Result<ExitCode> {
         ));
     }
     if args.delete_landed && !(args.land.is_some() && args.push) {
-        return Err(io::Error::other("--delete-landed needs --land <branch> --push"));
+        return Err(io::Error::other(
+            "--delete-landed needs --land <branch> --push",
+        ));
     }
     if args.list {
         return list_branches(&git, &args.base).map(|()| ExitCode::SUCCESS);
@@ -294,7 +298,10 @@ fn prune_worktrees(git: &Git, base: &str, yes: bool) -> io::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if !yes {
-        writeln!(out, "\n{removable} worktree(s) would be removed; re-run with --yes")?;
+        writeln!(
+            out,
+            "\n{removable} worktree(s) would be removed; re-run with --yes"
+        )?;
         return Ok(ExitCode::SUCCESS);
     }
     let mut failed = 0usize;
@@ -360,12 +367,17 @@ fn delete_headless(
     };
     let (targets, diverged) = land::delete_plan(git, short, only.as_deref(), landed_oid)?;
     for d in &diverged {
-        println!("{}/{} is not the landed commit — left alone", scrub(&d.remote), scrub(short));
+        println!(
+            "{}/{} is not the landed commit — left alone",
+            scrub(&d.remote),
+            scrub(short)
+        );
     }
     let targets = match landed {
         Some((_, reached)) => {
-            let (theirs, mine): (Vec<_>, Vec<_>) =
-                targets.into_iter().partition(|t| !reached.contains(&t.remote));
+            let (theirs, mine): (Vec<_>, Vec<_>) = targets
+                .into_iter()
+                .partition(|t| !reached.contains(&t.remote));
             for t in &theirs {
                 println!(
                     "{}/{} kept: the push did not reach {}",
@@ -394,7 +406,10 @@ fn delete_headless(
         }
         // Not "no pushable remote": one that sat the push-all out is pushable
         // and was simply never asked, and it is named above as kept.
-        println!("no remote this push reached carries the landed {}", scrub(short));
+        println!(
+            "no remote this push reached carries the landed {}",
+            scrub(short)
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -411,7 +426,11 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
     // Replay by default: the workflow AGENTS.md documents lands each commit
     // verbatim, and a default that quietly squashes them would collapse the
     // per-commit records and checkpoints that whole model rests on.
-    let mode = if args.squash { land::Mode::Squash } else { land::Mode::Rebase };
+    let mode = if args.squash {
+        land::Mode::Squash
+    } else {
+        land::Mode::Rebase
+    };
     let landing = land::land(
         git,
         base,
@@ -426,7 +445,9 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
     match &landing.outcome {
         Outcome::Committed { .. } => {}
         Outcome::Conflict => {
-            eprintln!("td-review: conflicts left in the work tree — resolve or `git reset --hard HEAD`");
+            eprintln!(
+                "td-review: conflicts left in the work tree — resolve or `git reset --hard HEAD`"
+            );
             return Ok(ExitCode::FAILURE);
         }
         Outcome::Nothing => return Ok(ExitCode::FAILURE),
@@ -439,7 +460,10 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
         let Outcome::Committed { sha } = &landing.outcome else {
             return Ok(ExitCode::FAILURE);
         };
-        let land::PushAllTargets { targets: remotes, left_out } = land::push_all_targets(git)?;
+        let land::PushAllTargets {
+            targets: remotes,
+            left_out,
+        } = land::push_all_targets(git)?;
         for (name, why) in &left_out {
             println!("{}", scrub(&why.line(name)));
         }
@@ -484,7 +508,9 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
             }
             // A failed cleanup is not a failed landing: the work is published.
             // Report it distinctly rather than as "nothing landed".
-            let landed = landed_oid.as_deref().map(|oid| (oid, pushed.reached.as_slice()));
+            let landed = landed_oid
+                .as_deref()
+                .map(|oid| (oid, pushed.reached.as_slice()));
             if delete_headless(git, base, branch, true, landed)? != ExitCode::SUCCESS {
                 eprintln!("td-review: landed and published, but the branch delete failed");
                 return Ok(ExitCode::from(3));

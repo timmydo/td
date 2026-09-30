@@ -50,8 +50,10 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     // [behavioral] RUN the built make → it drives the build (produces greeting.txt).
-    steps
-        .push(Step::run("{root}/t", &[make, "SHELL={in:bash-mesboot}/bin/bash"]).env("PATH", &mesboot0_path()));
+    steps.push(
+        Step::run("{root}/t", &[make, "SHELL={in:bash-mesboot}/bin/bash"])
+            .env("PATH", &mesboot0_path()),
+    );
     // assert make actually produced the expected output (not just exited 0).
     steps.push(
         Step::run(

@@ -25,7 +25,9 @@ pub fn recipe() -> Recipe {
         },
         Step::WriteFile {
             path: "{out}/result".into(),
-            content: "PASS: td-portal is a static target executable whose own selftest runs green\n".into(),
+            content:
+                "PASS: td-portal is a static target executable whose own selftest runs green\n"
+                    .into(),
             exec: false,
         },
         Step::Require {

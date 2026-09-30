@@ -321,9 +321,7 @@ mod tests {
             assert!(config.contains(required), "missing Git policy {required}");
         }
         assert!(config.contains("CURL_LDFLAGS = {in:curl-x86-64}/lib/libcurl.a"));
-        assert!(config.contains(
-            "override EXTLIBS = {in:zlib-x86-64-self}/lib/libz.a"
-        ));
+        assert!(config.contains("override EXTLIBS = {in:zlib-x86-64-self}/lib/libz.a"));
         assert!(!config.contains("CURLDIR ="));
         assert!(!config.contains("CURL_CFLAGS ="));
         assert!(!config.contains("SANE_TOOL_PATH ="));

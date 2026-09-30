@@ -361,7 +361,11 @@ mod tests {
         let mut manifest_names = 0usize;
         let mut target_stems = 0usize;
         let entries = std::fs::read_dir(&root);
-        assert!(entries.is_ok(), "cannot walk {} to sweep target names", root.display());
+        assert!(
+            entries.is_ok(),
+            "cannot walk {} to sweep target names",
+            root.display()
+        );
         let Ok(entries) = entries else { return };
         for crate_dir in entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
             // Explicit [[bin]]/[[example]] names, and the auto-discovered

@@ -464,9 +464,13 @@ fn run_teardown(script: &str) {
             Ok(errors) => {
                 cmd.stdout(Stdio::from(console)).stderr(Stdio::from(errors));
             }
-            Err(e) => log(&format!("{CONSOLE}: {e}; the teardown keeps our own output")),
+            Err(e) => log(&format!(
+                "{CONSOLE}: {e}; the teardown keeps our own output"
+            )),
         },
-        Err(e) => log(&format!("{CONSOLE}: {e}; the teardown keeps our own output")),
+        Err(e) => log(&format!(
+            "{CONSOLE}: {e}; the teardown keeps our own output"
+        )),
     }
     match cmd.status() {
         Ok(status) if status.success() => {}
@@ -801,10 +805,7 @@ fn release_capture(service: &Service) {
 fn attach_tty(cmd: &mut Command, unit: &Unit, report: bool) -> Attached {
     let mut said = Vec::new();
     let Some(tty) = &unit.tty else {
-        return Attached {
-            said,
-            device: None,
-        };
+        return Attached { said, device: None };
     };
     let path = tty_path(tty);
     // Gated for the same reason as `build`'s: a greeter whose terminal is
@@ -836,10 +837,7 @@ fn attach_tty(cmd: &mut Command, unit: &Unit, report: bool) -> Attached {
         }
     };
     let Some(file) = opened else {
-        return Attached {
-            said,
-            device: None,
-        };
+        return Attached { said, device: None };
     };
     // Read off the OPEN descriptor, before anything can replace the node, and
     // after the `/dev/console` fallback has had its say.
@@ -1389,7 +1387,8 @@ impl Runtime {
                     return;
                 }
                 if unit.pair_argv.is_some() {
-                    if let Err(why) = crate::pair::release_start(pair_start, pair_placed, recorded) {
+                    if let Err(why) = crate::pair::release_start(pair_start, pair_placed, recorded)
+                    {
                         log(&format!("{}: {why}", unit.name));
                         return;
                     }
@@ -1463,8 +1462,8 @@ impl Runtime {
         service.deadline = None;
         service.kill_at = None;
         service.fast_failures = service.fast_failures.saturating_add(1);
-        let restarts = service.unit.kind == Kind::Daemon
-            && !matches!(service.unit.restart, Restart::Never);
+        let restarts =
+            service.unit.kind == Kind::Daemon && !matches!(service.unit.restart, Restart::Never);
         if !restarts {
             // Nothing will retry it, so say so once and stop.
             service.phase = Phase::Failed;
@@ -1636,10 +1635,12 @@ impl Runtime {
     fn enforce_deadlines(&mut self) {
         let now = Instant::now();
         for index in 0..self.services.len() {
-            let due = self
-                .services
-                .get(index)
-                .map(|s| (s.deadline.is_some_and(|at| at <= now), s.kill_at.is_some_and(|at| at <= now)));
+            let due = self.services.get(index).map(|s| {
+                (
+                    s.deadline.is_some_and(|at| at <= now),
+                    s.kill_at.is_some_and(|at| at <= now),
+                )
+            });
             match due {
                 Some((true, _)) => self.time_out(index),
                 Some((false, true)) => self.escalate(index),
@@ -1680,7 +1681,9 @@ impl Runtime {
             cancel.store(true, Ordering::Relaxed);
         }
         match timeout {
-            Some(t) => log(&format!("{name}: still running after {t:?}; giving up on it")),
+            Some(t) => log(&format!(
+                "{name}: still running after {t:?}; giving up on it"
+            )),
             None => log(&format!("{name}: giving up on it")),
         }
         // The waiter thread still owns the `Child`, so the process is reaped
@@ -1756,8 +1759,7 @@ impl Runtime {
                     // killed, never retried, and never released.
                     if let Some(service) = self.services.get_mut(index) {
                         if service.kill_at.is_none() {
-                            service.kill_at =
-                                Instant::now().checked_add(service.unit.stop_timeout);
+                            service.kill_at = Instant::now().checked_add(service.unit.stop_timeout);
                         }
                     }
                     return;
@@ -1949,8 +1951,14 @@ impl Runtime {
             Some(Ok(true)) => 0,
             Some(Ok(false)) => 1,
             Some(Err(why)) => {
-                if self.services.get(index).is_some_and(|s| s.next_sweep.is_none()) {
-                    log(&format!("{name}: cannot confirm paired containment is empty: {why}"));
+                if self
+                    .services
+                    .get(index)
+                    .is_some_and(|s| s.next_sweep.is_none())
+                {
+                    log(&format!(
+                        "{name}: cannot confirm paired containment is empty: {why}"
+                    ));
                 }
                 1
             }
@@ -1983,7 +1991,9 @@ impl Runtime {
             service.next_sweep = Instant::now().checked_add(STOP_SWEEP_INTERVAL);
             if first {
                 if paired {
-                    log(&format!("{name}: paired containment is not proven empty; not stopped yet"));
+                    log(&format!(
+                        "{name}: paired containment is not proven empty; not stopped yet"
+                    ));
                 } else {
                     log(&format!(
                         "{name}: leader exited but {remaining} process(es) remain in its \
@@ -2011,7 +2021,9 @@ impl Runtime {
         } else if let Some((phase, retry_at)) = pair_resume {
             service.phase = phase;
             service.retry_at = retry_at;
-            log(&format!("{name}: paired containment drained; applying restart policy"));
+            log(&format!(
+                "{name}: paired containment drained; applying restart policy"
+            ));
         } else {
             service.phase = Phase::Stopped;
             log(&format!("{name}: stopped"));
@@ -2042,7 +2054,9 @@ impl Runtime {
         let path = self.table_path.clone();
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
-            Err(e) => return format!("error: reload: cannot read {path}: {e}; kept the running table\n"),
+            Err(e) => {
+                return format!("error: reload: cannot read {path}: {e}; kept the running table\n")
+            }
         };
         let (units, problems) = crate::table::parse(&text);
         if !problems.is_empty() {
@@ -2056,9 +2070,7 @@ impl Runtime {
             );
         }
         if units.is_empty() {
-            return format!(
-                "error: reload: {path} declares no units; kept the running table\n"
-            );
+            return format!("error: reload: {path} declares no units; kept the running table\n");
         }
         let plan = order::plan(&units);
         let complaints = plan.complaints();
@@ -2167,7 +2179,10 @@ impl Runtime {
             }
             let reply = self.control_stop(name, false);
             if let Some(why) = reply.strip_prefix("error: ") {
-                log(&format!("{name}: no longer declared, and {}", why.trim_end()));
+                log(&format!(
+                    "{name}: no longer declared, and {}",
+                    why.trim_end()
+                ));
             } else {
                 log(&format!("{name}: no longer in the table; stopping it"));
             }
@@ -2459,17 +2474,14 @@ impl Runtime {
     /// before releasing their coordinator's start gate.
     fn persist_started(&self) -> bool {
         let mut entries: Vec<crate::evict::Entry> = self.unevicted.clone();
-        entries.extend(self
-            .services
-            .iter()
-            .filter_map(|service| {
-                Some(crate::evict::Entry {
-                    pid: service.pid?,
-                    starttime: service.starttime?,
-                    tty: service.tty_dev.unwrap_or(0),
-                    name: service.unit.name.clone(),
-                })
-            }));
+        entries.extend(self.services.iter().filter_map(|service| {
+            Some(crate::evict::Entry {
+                pid: service.pid?,
+                starttime: service.starttime?,
+                tty: service.tty_dev.unwrap_or(0),
+                name: service.unit.name.clone(),
+            })
+        }));
         if let Err(e) = crate::evict::write(&self.started_path, &entries) {
             log(&format!(
                 "cannot record what is running in {}: {e}; a replacement \
@@ -2677,7 +2689,10 @@ impl Runtime {
             })
             .collect();
         for (entry, mode) in &stubborn {
-            log(&format!("{}: still there after TERM; killing it", entry.name));
+            log(&format!(
+                "{}: still there after TERM; killing it",
+                entry.name
+            ));
             let _ = self.signal(*mode, crate::sys::SIGKILL);
         }
         self.wait_until_evicted(&stubborn, EVICT_SETTLE);
@@ -2741,8 +2756,7 @@ impl Runtime {
         } else {
             Containment::Group(entry.pid)
         };
-        let found = procfs::members(mode, self.self_pid)
-            .is_ok_and(|scan| !scan.pids.is_empty());
+        let found = procfs::members(mode, self.self_pid).is_ok_and(|scan| !scan.pids.is_empty());
         found.then_some(mode)
     }
 
@@ -3079,11 +3093,7 @@ impl Runtime {
         // A retired unit is out of the order for a different reason, and saying
         // "dependency cycle" would send an operator hunting a graph problem
         // that does not exist.
-        if self
-            .services
-            .get(index)
-            .is_some_and(|s| s.retired)
-        {
+        if self.services.get(index).is_some_and(|s| s.retired) {
             return format!(
                 "error: {name}: no longer in the table; reload after declaring it again\n"
             );
@@ -3887,11 +3897,19 @@ mod tests {
     fn a_daemon_that_crashes_just_above_min_uptime_still_escalates() {
         let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
         for _ in 0..40 {
-            mark_running(&mut rt, "a", backoff::MIN_UPTIME + Duration::from_millis(200));
+            mark_running(
+                &mut rt,
+                "a",
+                backoff::MIN_UPTIME + Duration::from_millis(200),
+            );
             rt.on_exit("a", Some(1));
         }
         let a = rt.lookup("a").unwrap();
-        assert_eq!(a.phase, Phase::Held, "a slow crash-loop must reach the hold");
+        assert_eq!(
+            a.phase,
+            Phase::Held,
+            "a slow crash-loop must reach the hold"
+        );
     }
 
     /// ...while a run that lasted AND ended cleanly still resets it.
@@ -3999,7 +4017,11 @@ mod tests {
         );
         // `slow` is spawned and simply never finishes.
         rt.lookup_mut("slow").unwrap().phase = Phase::Starting;
-        let greeter = rt.services.iter().position(|s| s.unit.name == "greeter").unwrap();
+        let greeter = rt
+            .services
+            .iter()
+            .position(|s| s.unit.name == "greeter")
+            .unwrap();
         let now = Instant::now();
         assert!(
             matches!(rt.dependency_verdict(greeter, now), Verdict::Wait(_)),
@@ -4016,9 +4038,16 @@ mod tests {
              [svc]\ntype=daemon\nexec=/bin/y\nafter=slow\n",
         );
         rt.lookup_mut("slow").unwrap().phase = Phase::Starting;
-        let svc = rt.services.iter().position(|s| s.unit.name == "svc").unwrap();
+        let svc = rt
+            .services
+            .iter()
+            .position(|s| s.unit.name == "svc")
+            .unwrap();
         rt.lookup_mut("svc").unwrap().waiting_since = Some(now);
-        assert!(matches!(rt.dependency_verdict(svc, later), Verdict::Wait(_)));
+        assert!(matches!(
+            rt.dependency_verdict(svc, later),
+            Verdict::Wait(_)
+        ));
     }
 
     /// "starting it anyway, last, with its ordering ignored" has to be true at
@@ -4034,7 +4063,11 @@ mod tests {
         let (rt, complaints) = Runtime::new(units, "<test>");
         assert_eq!(complaints.len(), 2);
         for name in ["c1", "c2"] {
-            let at = rt.services.iter().position(|s| s.unit.name == name).unwrap();
+            let at = rt
+                .services
+                .iter()
+                .position(|s| s.unit.name == name)
+                .unwrap();
             assert!(rt.lookup(name).unwrap().forced, "{name} should be forced");
             assert!(
                 matches!(rt.dependency_verdict(at, Instant::now()), Verdict::Go),
@@ -4179,7 +4212,10 @@ mod tests {
         let a = rt.lookup("a").unwrap();
         assert_eq!(a.pid, Some(4242), "identity must survive a wait error");
         assert_eq!(a.phase, Phase::Ready);
-        assert!(a.retry_at.is_none(), "a wait error must not schedule a restart");
+        assert!(
+            a.retry_at.is_none(),
+            "a wait error must not schedule a restart"
+        );
     }
 
     /// Containment is not a union. A unit td-svc grouped keeps td-svc's own
@@ -4485,7 +4521,10 @@ mod tests {
         rt.on_exit("sshd", None);
         let service = rt.lookup("sshd").unwrap();
         assert_eq!(service.phase, Phase::Stopped);
-        assert!(service.retry_at.is_none(), "a stopped unit scheduled a retry");
+        assert!(
+            service.retry_at.is_none(),
+            "a stopped unit scheduled a retry"
+        );
         assert!(!service.stopping);
 
         // ...and nothing starts it again.
@@ -4521,7 +4560,10 @@ mod tests {
             Phase::Down,
             "a restarted unit must be eligible again, not Stopped"
         );
-        assert_eq!(service.fast_failures, 0, "restart did not clear the backoff");
+        assert_eq!(
+            service.fast_failures, 0,
+            "restart did not clear the backoff"
+        );
         assert!(service.retry_at.is_none());
     }
 
@@ -4701,7 +4743,10 @@ mod tests {
             Phase::Ready,
             "the unit settled at TERM time; the process has not exited yet"
         );
-        assert!(service.pid.is_some(), "the pid was released before the exit");
+        assert!(
+            service.pid.is_some(),
+            "the pid was released before the exit"
+        );
     }
 
     /// ...and it must ARM the escalation, or a daemon that ignores TERM is left
@@ -4924,7 +4969,6 @@ mod tests {
         );
     }
 
-
     /// A runtime whose table is a real file, so `reload` has one to re-read.
     fn reloadable(text: &str, tag: &str) -> (Runtime, String) {
         let dir = format!(
@@ -4955,7 +4999,10 @@ mod tests {
         let before: Vec<String> = rt.services.iter().map(|s| s.unit.name.clone()).collect();
 
         for (why, text) in [
-            ("a malformed line", "[a]\ntype=daemon\nexec=/x\nrequires firewall\n"),
+            (
+                "a malformed line",
+                "[a]\ntype=daemon\nexec=/x\nrequires firewall\n",
+            ),
             ("an unknown key value", "[a]\ntype=nonsense\nexec=/x\n"),
             (
                 "a dependency cycle",
@@ -5020,7 +5067,11 @@ mod tests {
 
         // The running process is untouched...
         let keep = rt.lookup("keep").unwrap();
-        assert_eq!(keep.pid, Some(live.pid), "a reload restarted a live service");
+        assert_eq!(
+            keep.pid,
+            Some(live.pid),
+            "a reload restarted a live service"
+        );
         assert_eq!(keep.phase, Phase::Ready);
         // ...and it picked up its NEW definition for next time.
         assert_eq!(keep.unit.stop_timeout, Duration::from_secs(3));
@@ -5100,7 +5151,11 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = format!("{dir}/shutdown");
 
-        assert_eq!(read_marker(&path), None, "no marker must read as no shutdown");
+        assert_eq!(
+            read_marker(&path),
+            None,
+            "no marker must read as no shutdown"
+        );
         for power in [Power::Reboot, Power::Off, Power::Halt] {
             write_marker(&path, power).unwrap();
             assert_eq!(read_marker(&path), Some(power));
@@ -5125,10 +5180,8 @@ mod tests {
     /// unmounting underneath it.
     #[test]
     fn the_marker_is_written_before_anything_is_stopped() {
-        let (mut rt, dir) = shutdown_runtime(
-            "[a]\ntype=daemon\nexec=/x\nrestart=always\n",
-            "before",
-        );
+        let (mut rt, dir) =
+            shutdown_runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n", "before");
         mark_running(&mut rt, "a", Duration::from_secs(5));
         let reply = rt.control("poweroff");
         assert!(reply.contains("poweroff requested"), "{reply}");
@@ -5166,10 +5219,8 @@ mod tests {
     /// Once the teardown begins, nothing may start a service again.
     #[test]
     fn a_shutdown_refuses_start_restart_and_reload() {
-        let (mut rt, dir) = shutdown_runtime(
-            "[a]\ntype=daemon\nexec=/x\nrestart=always\n",
-            "refuse",
-        );
+        let (mut rt, dir) =
+            shutdown_runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n", "refuse");
         assert!(rt.control("reboot").contains("reboot requested"));
         for verb in ["start a", "restart a", "reload"] {
             let reply = rt.control(verb);
@@ -5476,7 +5527,10 @@ mod tests {
         let (mut rt, dir) = shutdown_runtime("[a]\ntype=oneshot\nexec=/x\n", "cad-stale");
         let first = arm_at(&mut rt, &dir);
         let second = arm_at(&mut rt, &dir);
-        assert_ne!(first, second, "the re-arm reused the retired sentinel's pid");
+        assert_ne!(
+            first, second,
+            "the re-arm reused the retired sentinel's pid"
+        );
 
         rt.on_sentinel_died(first, None);
         assert_eq!(
@@ -5517,7 +5571,10 @@ mod tests {
         rt.cad_pid_path = blocked;
 
         rt.arm_cad();
-        assert!(rt.cad.is_none(), "a failed arming recorded a sentinel anyway");
+        assert!(
+            rt.cad.is_none(),
+            "a failed arming recorded a sentinel anyway"
+        );
         assert!(
             rt.cad_retry_at.is_some(),
             "a failure that left the hard reset disabled did not schedule a retry"
@@ -5547,7 +5604,10 @@ mod tests {
         rt.cad_enabled_path = format!("{dir}/no-such-sysctl/ctrl-alt-del");
         rt.cad_pid_path = format!("{dir}/cad_pid");
         rt.arm_cad();
-        assert!(rt.cad.is_none(), "arming succeeded against a missing sysctl");
+        assert!(
+            rt.cad.is_none(),
+            "arming succeeded against a missing sysctl"
+        );
         assert!(
             rt.cad_retry_at.is_none(),
             "a sysctl that will never appear was put on a retry timer"
@@ -5558,7 +5618,10 @@ mod tests {
         let _ = std::fs::create_dir_all(&present);
         rt.cad_enabled_path = present;
         rt.arm_cad();
-        assert!(rt.cad.is_none(), "arming succeeded against an unwritable sysctl");
+        assert!(
+            rt.cad.is_none(),
+            "arming succeeded against an unwritable sysctl"
+        );
         assert!(
             rt.cad_retry_at.is_some(),
             "a sysctl that is THERE and failed to take was not retried"
@@ -5599,7 +5662,10 @@ mod tests {
 
         // A second failure waits longer than the first.
         rt.on_sentinel_died(next.unwrap_or(0), None);
-        assert_eq!(rt.cad_failures, 2, "consecutive failures are not accumulating");
+        assert_eq!(
+            rt.cad_failures, 2,
+            "consecutive failures are not accumulating"
+        );
         assert!(
             crate::backoff::delay(2) > crate::backoff::delay(1),
             "the backoff does not grow, so this test proves nothing"
@@ -5837,7 +5903,11 @@ mod tests {
             "[a]\ntype=oneshot\nexec=/bin/sh -c 'echo hello'\nlog={path}\n"
         ));
         rt.start_eligible();
-        if rt.lookup("a").and_then(|service| service.log.clone()).is_none() {
+        if rt
+            .lookup("a")
+            .and_then(|service| service.log.clone())
+            .is_none()
+        {
             eprintln!("note: the unit did not spawn here; skipping");
             let _ = std::fs::remove_dir_all(&dir);
             return;
@@ -5848,8 +5918,7 @@ mod tests {
         let held = std::fs::read_dir("/proc/self/fd")
             .map(|entries| {
                 entries.flatten().any(|entry| {
-                    std::fs::read_link(entry.path())
-                        .is_ok_and(|t| t == std::path::Path::new(&path))
+                    std::fs::read_link(entry.path()).is_ok_and(|t| t == std::path::Path::new(&path))
                 })
             })
             .unwrap_or(false);
@@ -5944,7 +6013,9 @@ mod tests {
         let reply = rt.control("reload");
         assert!(!reply.starts_with("error:"), "{reply}");
         assert!(
-            rt.lookup("a").and_then(|service| service.log.clone()).is_none(),
+            rt.lookup("a")
+                .and_then(|service| service.log.clone())
+                .is_none(),
             "the capture opened on the OLD path survived the reload; output would keep going there"
         );
         let mut closed = false;
@@ -6317,7 +6388,10 @@ mod tests {
         rt.persist_started();
 
         let (entries, problems) = crate::evict::read(&rt.started_path);
-        assert!(problems.is_empty(), "the record did not parse: {problems:?}");
+        assert!(
+            problems.is_empty(),
+            "the record did not parse: {problems:?}"
+        );
         assert_eq!(
             entries,
             vec![crate::evict::Entry {
@@ -6716,11 +6790,11 @@ mod tests {
         );
         // With no stop in flight there is nothing recorded to honour, and a
         // leader that is no longer ours leaves nothing safe to address.
+        assert_eq!(kill_target(false, true, None, Some(derived)), Some(derived));
         assert_eq!(
-            kill_target(false, true, None, Some(derived)),
-            Some(derived)
+            kill_target(false, false, Some(recorded), Some(derived)),
+            None
         );
-        assert_eq!(kill_target(false, false, Some(recorded), Some(derived)), None);
     }
 
     /// `start` during a stop whose leader is already reaped.
@@ -6829,7 +6903,10 @@ mod tests {
             "a recycled pid was signalled anyway: {reply:?}"
         );
         let service = rt.lookup("a").unwrap();
-        assert!(!service.stopping, "a refused stop was recorded as in flight");
+        assert!(
+            !service.stopping,
+            "a refused stop was recorded as in flight"
+        );
         assert!(service.kill_at.is_none(), "a refused stop armed a KILL");
     }
 
@@ -6929,7 +7006,12 @@ mod tests {
             // actually opened.
             service.tty_dev = Some(expect);
         }
-        let mode = rt.lookup("greeter").unwrap().containment().unwrap().unwrap();
+        let mode = rt
+            .lookup("greeter")
+            .unwrap()
+            .containment()
+            .unwrap()
+            .unwrap();
         assert_eq!(
             mode,
             Containment::Console {
@@ -6951,7 +7033,11 @@ mod tests {
         let elsewhere = expect.wrapping_add(1);
         rt.lookup_mut("greeter").unwrap().tty_dev = Some(elsewhere);
         assert_eq!(
-            rt.lookup("greeter").unwrap().containment().unwrap().unwrap(),
+            rt.lookup("greeter")
+                .unwrap()
+                .containment()
+                .unwrap()
+                .unwrap(),
             Containment::Console {
                 leader: child,
                 tty: elsewhere
@@ -7113,7 +7199,10 @@ mod tests {
         rt.enforce_deadlines();
         let slow = rt.lookup("slow").unwrap();
         assert_eq!(slow.phase, Phase::Failed);
-        assert!(slow.kill_at.is_some(), "the KILL must be scheduled, not skipped");
+        assert!(
+            slow.kill_at.is_some(),
+            "the KILL must be scheduled, not skipped"
+        );
         assert_eq!(slow.pid, Some(4242), "the pid is the only handle on it");
 
         // ...and once that elapses, the escalation runs and lets the pid go.

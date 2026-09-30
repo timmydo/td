@@ -212,7 +212,9 @@ impl ByteSet {
 
     fn contains(&self, b: u8) -> bool {
         let word = usize::from(b >> 6);
-        self.bits.get(word).is_some_and(|w| w & (1u64 << (b & 63)) != 0)
+        self.bits
+            .get(word)
+            .is_some_and(|w| w & (1u64 << (b & 63)) != 0)
     }
 
     fn insert_range(&mut self, lo: u8, hi: u8) {
@@ -596,7 +598,9 @@ impl<'a> Parser<'a> {
             branches.push(branch?);
         }
         if branches.len() == 1 {
-            return branches.pop().ok_or_else(|| Error::new("empty alternation"));
+            return branches
+                .pop()
+                .ok_or_else(|| Error::new("empty alternation"));
         }
         Ok(Node::Alt(branches))
     }
@@ -687,9 +691,7 @@ impl<'a> Parser<'a> {
                         }
                         break;
                     }
-                    if let Some(close) =
-                        self.drop_eats_paren(self.pos, dropped_op, !brace_text)
-                    {
+                    if let Some(close) = self.drop_eats_paren(self.pos, dropped_op, !brace_text) {
                         self.eat_paren(close, depth);
                     }
                     // What is left may be the end of the branch: `-E '*'` is empty.
@@ -703,8 +705,7 @@ impl<'a> Parser<'a> {
             // run of them keeps it: `{{{{}` compiles. Reaching `parse_atom` with a
             // `{` ahead is itself the test -- a brace that opened an interval was
             // consumed as one long before this.
-            let brace_lit =
-                self.opts.ere && !self.opts.strict_repeats && self.peek() == Some(b'{');
+            let brace_lit = self.opts.ere && !self.opts.strict_repeats && self.peek() == Some(b'{');
             let atom = self.parse_atom(depth, first, bol_ok)?;
             // An assertion is not something to repeat, so it does not give a
             // following operator one either. In a BRE that makes the operator a
@@ -875,7 +876,11 @@ impl<'a> Parser<'a> {
                 repeated = false;
                 continue;
             }
-            atom = Node::Repeat { node: Box::new(atom), min, max };
+            atom = Node::Repeat {
+                node: Box::new(atom),
+                min,
+                max,
+            };
             repeated = true;
         }
         Ok((atom, interval))
@@ -991,7 +996,9 @@ impl<'a> Parser<'a> {
     /// leading anchor. They differ after a `^`: it consumes the anchor but still leaves
     /// a following repetition operator nothing to repeat.
     fn parse_atom(&mut self, depth: usize, first: bool, bol_ok: bool) -> Result<Node, Error> {
-        let b = self.bump().ok_or_else(|| Error::new("unexpected end of pattern"))?;
+        let b = self
+            .bump()
+            .ok_or_else(|| Error::new("unexpected end of pattern"))?;
         match b {
             // sed's `M` flag is POSIX REG_NEWLINE, which is two rules, not one: `^`/`$`
             // gain the embedded separators (see `State::at_bol`) AND `.` loses them.
@@ -1196,7 +1203,10 @@ impl<'a> Parser<'a> {
                 // at both ends, a NON-COLON somewhere between them, and neither a
                 // sub-expression nor a range in it. So `[:*:]` is refused while
                 // `[::]`, `[::::]`, `[:a[.b.]:]` and `[:a-z:]` are ordinary lists.
-                let raw = self.pat.get(body..self.pos.saturating_sub(1)).unwrap_or_default();
+                let raw = self
+                    .pat
+                    .get(body..self.pos.saturating_sub(1))
+                    .unwrap_or_default();
                 if !sub
                     && !ranged
                     && raw.first() == Some(&b':')
@@ -1213,7 +1223,9 @@ impl<'a> Parser<'a> {
             // A range, unless `-` is the last character before `]`.
             if self.peek() == Some(b'-') && self.peek_at(1).is_some_and(|c| c != b']') {
                 self.pos += 1;
-                let h = self.bump().ok_or_else(|| Error::new("Unmatched [, [^, [:, [., or [="))?;
+                let h = self
+                    .bump()
+                    .ok_or_else(|| Error::new("Unmatched [, [^, [:, [., or [="))?;
                 let hi = self.bracket_member(h, &mut set, true)?;
                 sub = sub || hi.is_sub_expr();
                 match (lo.bound(), hi.bound()) {
@@ -1409,19 +1421,18 @@ const STEP_BUDGET: u64 = 40_000_000;
 
 impl Regex {
     pub fn compile(pattern: &[u8], opts: Options) -> Result<Self, Error> {
-        let mut p =
-            Parser {
-                pat: pattern,
-                pos: 0,
-                opts,
-                ngroups: 0,
-                open: Vec::new(),
-                sibling: Vec::new(),
-                class_syntax: false,
-                paren_debt: 0,
-                eaten: None,
-                strays: Vec::new(),
-            };
+        let mut p = Parser {
+            pat: pattern,
+            pos: 0,
+            opts,
+            ngroups: 0,
+            open: Vec::new(),
+            sibling: Vec::new(),
+            class_syntax: false,
+            paren_debt: 0,
+            eaten: None,
+            strays: Vec::new(),
+        };
         let root = p.parse_alt(0)?;
         if p.pos < pattern.len() {
             // Only an unbalanced `)` can stop the top-level parse early.
@@ -1489,9 +1500,10 @@ impl Regex {
         from: usize,
     ) -> Result<Option<Captures>, Error> {
         let reading = Reading {
-            reg_newline: self
-                .reg_newline
-                .map(|a| Anchor { sep: a.sep, newline_anchor: a.sep == b'\n' }),
+            reg_newline: self.reg_newline.map(|a| Anchor {
+                sep: a.sep,
+                newline_anchor: a.sep == b'\n',
+            }),
             ..self.reading(true)
         };
         self.scan_reading(hay, from, None, OnBudget::Fail, reading, &mut 0)
@@ -1550,7 +1562,10 @@ impl Regex {
         if at > hay.len() {
             return Ok(None);
         }
-        let reading = Reading { not_eol: true, ..self.reading(false) };
+        let reading = Reading {
+            not_eol: true,
+            ..self.reading(false)
+        };
         let found = self.match_from(hay, at, steps, None, OnBudget::Fail, reading)?;
         Ok(found.map(|c| c.end() - at))
     }
@@ -1675,7 +1690,10 @@ impl Regex {
         // pass is neither -- so `None` states the intent rather than an
         // observable, and no case can pin it.
         (a.newline_anchor && a.sep != b'\n').then_some(Reading {
-            reg_newline: Some(Anchor { sep: b'\n', newline_anchor: true }),
+            reg_newline: Some(Anchor {
+                sep: b'\n',
+                newline_anchor: true,
+            }),
             segment: None,
             subst: false,
             approx_backref: true,
@@ -1713,9 +1731,7 @@ impl Regex {
             // rediscover spans the word test then throws away.
             skippable = skippable || filter.is_some_and(|f| !(f.start)(at));
             if !skippable {
-                if let Some(caps) =
-                    self.match_from(hay, at, steps, filter, on_budget, reading)?
-                {
+                if let Some(caps) = self.match_from(hay, at, steps, filter, on_budget, reading)? {
                     return Ok(Some(caps));
                 }
             }
@@ -1738,12 +1754,15 @@ impl Regex {
     /// later use reads the run's delimiter, an address's included.
     pub fn is_match_recompiled(&self, hay: &[u8]) -> Result<bool, Error> {
         let reading = Reading {
-            reg_newline: self
-                .reg_newline
-                .map(|a| Anchor { sep: a.sep, newline_anchor: a.sep == b'\n' }),
+            reg_newline: self.reg_newline.map(|a| Anchor {
+                sep: a.sep,
+                newline_anchor: a.sep == b'\n',
+            }),
             ..self.reading(false)
         };
-        Ok(self.scan_reading(hay, 0, None, OnBudget::Existence, reading, &mut 0)?.is_some())
+        Ok(self
+            .scan_reading(hay, 0, None, OnBudget::Existence, reading, &mut 0)?
+            .is_some())
     }
 
     /// Does some match cover `hay` exactly? Used by `grep -x`, which cannot be
@@ -1752,7 +1771,14 @@ impl Regex {
     /// seen even when a greedier one does not.
     pub fn matches_whole(&self, hay: &[u8]) -> Result<bool, Error> {
         let mut steps = 0u64;
-        match self.match_from(hay, 0, &mut steps, None, OnBudget::Fail, self.reading(false))? {
+        match self.match_from(
+            hay,
+            0,
+            &mut steps,
+            None,
+            OnBudget::Fail,
+            self.reading(false),
+        )? {
             Some(caps) => Ok(caps.end() == hay.len()),
             None => Ok(false),
         }
@@ -1940,9 +1966,9 @@ impl State<'_> {
 
     fn at_bol(&self, pos: usize) -> bool {
         pos == 0
-            || self.reg_newline.is_some_and(|a| {
-                self.byte(pos.wrapping_sub(1)).is_some_and(|b| a.holds(b))
-            })
+            || self
+                .reg_newline
+                .is_some_and(|a| self.byte(pos.wrapping_sub(1)).is_some_and(|b| a.holds(b)))
     }
 
     fn at_eol(&self, pos: usize) -> bool {
@@ -1970,16 +1996,19 @@ impl State<'_> {
     /// the backref-free `N;/\`bcc/Mp` matches.
     fn buf_anchor(&self) -> Option<Anchor> {
         match self.subst || self.has_backref {
-            true => self.segment.map(|sep| Anchor { sep, newline_anchor: false }),
+            true => self.segment.map(|sep| Anchor {
+                sep,
+                newline_anchor: false,
+            }),
             false => self.reg_newline,
         }
     }
 
     fn at_buf_start(&self, pos: usize) -> bool {
         pos == 0
-            || self.buf_anchor().is_some_and(|a| {
-                self.byte(pos.wrapping_sub(1)).is_some_and(|b| a.holds(b))
-            })
+            || self
+                .buf_anchor()
+                .is_some_and(|a| self.byte(pos.wrapping_sub(1)).is_some_and(|b| a.holds(b)))
     }
 
     fn at_buf_end(&self, pos: usize) -> bool {
@@ -2009,7 +2038,12 @@ impl State<'_> {
 /// `true` to stop the search or `false` to keep exploring; the return value propagates
 /// that "stop" signal. `match_from`'s `k` keeps exploring until an end reaches the last
 /// byte, which no later end can beat.
-fn m(st: &mut State, node: &Node, pos: usize, k: &mut dyn FnMut(&mut State, usize) -> bool) -> bool {
+fn m(
+    st: &mut State,
+    node: &Node,
+    pos: usize,
+    k: &mut dyn FnMut(&mut State, usize) -> bool,
+) -> bool {
     st.steps += 1;
     if st.steps >= STEP_BUDGET {
         return true; // unwind; the caller turns an exhausted budget into an error
@@ -2291,7 +2325,10 @@ mod tests {
     /// invocation but one: `-z` placed after the `-e` it applies to. That one
     /// has its own test.
     fn m(sep: u8) -> Option<Anchor> {
-        Some(Anchor { sep, newline_anchor: sep == b'\n' })
+        Some(Anchor {
+            sep,
+            newline_anchor: sep == b'\n',
+        })
     }
 
     /// The escapes GNU lints as strays, over every byte, in both dialects.
@@ -2327,7 +2364,10 @@ mod tests {
                     continue;
                 }
                 let pat = [b'\\', b];
-                let opts = Options { ere, ..Options::default() };
+                let opts = Options {
+                    ere,
+                    ..Options::default()
+                };
                 let got = Regex::compile(&pat, opts);
                 if err.contains(&b) {
                     assert!(got.is_err(), "ere={ere} 0x{b:02x} should not compile");
@@ -2360,7 +2400,11 @@ mod tests {
         assert_eq!(bre("\\{2\\}\\{3\\}").strays, vec![b'{']);
         assert_eq!(bre("\\?\\?").strays, vec![b'?']);
         for pat in ["\\?", "a\\?", "\\{", "a\\{2\\}"] {
-            assert_eq!(ere(pat).strays, Vec::<u8>::new(), "ERE {pat} should be quiet");
+            assert_eq!(
+                ere(pat).strays,
+                Vec::<u8>::new(),
+                "ERE {pat} should be quiet"
+            );
         }
     }
 
@@ -2377,7 +2421,14 @@ mod tests {
     }
 
     fn ere(pat: &str) -> Regex {
-        Regex::compile(pat.as_bytes(), Options { ere: true, ..Options::default() }).unwrap()
+        Regex::compile(
+            pat.as_bytes(),
+            Options {
+                ere: true,
+                ..Options::default()
+            },
+        )
+        .unwrap()
     }
 
     fn matched(re: &Regex, s: &str) -> bool {
@@ -2389,7 +2440,11 @@ mod tests {
     fn sed_bre(pat: &str) -> Result<Regex, Error> {
         Regex::compile(
             pat.as_bytes(),
-            Options { strict_repeats: true, glibc_engine: true, ..Options::default() },
+            Options {
+                strict_repeats: true,
+                glibc_engine: true,
+                ..Options::default()
+            },
         )
     }
 
@@ -2414,9 +2469,17 @@ mod tests {
         assert!(!matched(&bre("[[.a.]-z]"), "-"));
         assert!(matched(&bre("[a-[.z.]]"), "m"));
         assert!(matched(&bre("[[.a.]-[.z.]]"), "m"));
-        for bad in ["[[:alpha:]-z]", "[[=a=]-z]", "[a-[:digit:]]", "[a-[=z=]]", "[z-a]"] {
+        for bad in [
+            "[[:alpha:]-z]",
+            "[[=a=]-z]",
+            "[a-[:digit:]]",
+            "[a-[=z=]]",
+            "[z-a]",
+        ] {
             assert_eq!(
-                Regex::compile(bad.as_bytes(), Options::default()).err().map(|e| e.msg),
+                Regex::compile(bad.as_bytes(), Options::default())
+                    .err()
+                    .map(|e| e.msg),
                 Some("Invalid range end".to_string()),
                 "{bad}"
             );
@@ -2424,7 +2487,9 @@ mod tests {
         // A completed range names no single character either.
         for bad in ["[a-b-c]", "[a-z-9]", "[[.a.]-z-x]"] {
             assert_eq!(
-                Regex::compile(bad.as_bytes(), Options::default()).err().map(|e| e.msg),
+                Regex::compile(bad.as_bytes(), Options::default())
+                    .err()
+                    .map(|e| e.msg),
                 Some("Invalid range end".to_string()),
                 "{bad}"
             );
@@ -2439,9 +2504,18 @@ mod tests {
     /// the list: colons at both ends, something between, no sub-expression.
     #[test]
     fn a_class_missing_its_outer_bracket_is_refused_by_shape_not_by_name() {
-        for bad in ["[:alpha:]", "[:bogus:]", "[:*:]", "[:0:]", "[^:a:]", "[:a[b:]"] {
+        for bad in [
+            "[:alpha:]",
+            "[:bogus:]",
+            "[:*:]",
+            "[:0:]",
+            "[^:a:]",
+            "[:a[b:]",
+        ] {
             assert_eq!(
-                Regex::compile(bad.as_bytes(), Options::default()).err().map(|e| e.msg),
+                Regex::compile(bad.as_bytes(), Options::default())
+                    .err()
+                    .map(|e| e.msg),
                 Some(CLASS_SYNTAX.to_string()),
                 "{bad}"
             );
@@ -2450,7 +2524,10 @@ mod tests {
         // already parsed as the ordinary bracket expression GNU matches with, so
         // this pins the SET. `[:alpha:]` is {:, a, l, p, h} -- the name is text,
         // which is the whole reason GNU warns about the spelling.
-        let ok = Options { confusing_bracket_ok: true, ..Options::default() };
+        let ok = Options {
+            confusing_bracket_ok: true,
+            ..Options::default()
+        };
         let re = Regex::compile(b"[:alpha:]", ok).unwrap();
         for m in [":", "a", "l", "p", "h"] {
             assert!(matched(&re, m), "{m} is a member");
@@ -2461,7 +2538,9 @@ mod tests {
         // and the refusal is all that moves: a member error still outranks it.
         assert_eq!(
             Regex::compile(b"[:a-:]", ok).err().map(|e| e.msg),
-            Regex::compile(b"[:a-:]", Options::default()).err().map(|e| e.msg),
+            Regex::compile(b"[:a-:]", Options::default())
+                .err()
+                .map(|e| e.msg),
         );
         // Only colons between the colons, or a range in the list, and it is an
         // ordinary set again -- both found by fuzzing, not by reading.
@@ -2477,12 +2556,16 @@ mod tests {
         assert!(matched(&bre("[:a[.b.]:]"), "a"));
         // A member error outranks the heuristic.
         assert_eq!(
-            Regex::compile(b"[:a-:]", Options::default()).err().map(|e| e.msg),
+            Regex::compile(b"[:a-:]", Options::default())
+                .err()
+                .map(|e| e.msg),
             Some("Invalid range end".to_string())
         );
         // And the class-name message is GNU's, which says `name`.
         assert_eq!(
-            Regex::compile(b"[[:a:]]", Options::default()).err().map(|e| e.msg),
+            Regex::compile(b"[[:a:]]", Options::default())
+                .err()
+                .map(|e| e.msg),
             Some("Invalid character class name".to_string())
         );
         // GNU lints this only once the WHOLE pattern compiles, so any other
@@ -2542,11 +2625,20 @@ mod tests {
     fn seds_grammar_differs_from_greps_where_nothing_is_repeatable() {
         // An operator after an assertion is a literal ANYWHERE in sed's BRE,
         // where grep repeats the assertion past the start of a branch.
-        assert!(matched(&sed_bre("x\\b*").unwrap(), "x*y"), "sed reads a literal star");
+        assert!(
+            matched(&sed_bre("x\\b*").unwrap(), "x*y"),
+            "sed reads a literal star"
+        );
         // Both dialects select `x*y` for that one, by different readings and over
         // different spans; `\B\+` is where the two readings disagree outright.
-        assert!(!matched(&sed_bre("x\\B\\+b").unwrap(), "xb"), "a literal + needs one");
-        assert!(matched(&bre("x\\B\\+b"), "xb"), "grep asserts the boundary instead");
+        assert!(
+            !matched(&sed_bre("x\\B\\+b").unwrap(), "xb"),
+            "a literal + needs one"
+        );
+        assert!(
+            matched(&bre("x\\B\\+b"), "xb"),
+            "grep asserts the boundary instead"
+        );
         // Stacking, and an interval with nothing to repeat, are sed's refusals.
         assert!(sed_bre("a**").is_err());
         assert!(bre("a**").is_match(b"a").unwrap());
@@ -2563,7 +2655,10 @@ mod tests {
             sed_ere("a{a}").err().map(|e| e.msg),
             Some("Invalid content of \\{\\}".to_string())
         );
-        assert_eq!(sed_ere("a{a").err().map(|e| e.msg), Some("Unmatched \\{".to_string()));
+        assert_eq!(
+            sed_ere("a{a").err().map(|e| e.msg),
+            Some("Unmatched \\{".to_string())
+        );
         // grep reads both as text.
         assert!(matched(&ere("a{a}"), "a{a}"));
         assert!(matched(&ere("a{a"), "a{a"));
@@ -2582,15 +2677,24 @@ mod tests {
             );
         }
         // With something to repeat, whether it CLOSES decides which error.
-        assert_eq!(sed_ere("a{").err().map(|e| e.msg), Some("Unmatched \\{".to_string()));
-        assert_eq!(sed_ere("a{2").err().map(|e| e.msg), Some("Unmatched \\{".to_string()));
+        assert_eq!(
+            sed_ere("a{").err().map(|e| e.msg),
+            Some("Unmatched \\{".to_string())
+        );
+        assert_eq!(
+            sed_ere("a{2").err().map(|e| e.msg),
+            Some("Unmatched \\{".to_string())
+        );
         assert_eq!(
             sed_ere("a{x}").err().map(|e| e.msg),
             Some("Invalid content of \\{\\}".to_string())
         );
         // An ESCAPED brace closes nothing; a real one after it does, and an
         // escaped backslash is skipped whole so the brace behind it counts.
-        assert_eq!(sed_ere(r"a{x\}").err().map(|e| e.msg), Some("Unmatched \\{".to_string()));
+        assert_eq!(
+            sed_ere(r"a{x\}").err().map(|e| e.msg),
+            Some("Unmatched \\{".to_string())
+        );
         assert_eq!(
             sed_ere(r"a{x\}}").err().map(|e| e.msg),
             Some("Invalid content of \\{\\}".to_string())
@@ -2599,7 +2703,10 @@ mod tests {
             sed_ere(r"a{x\\}").err().map(|e| e.msg),
             Some("Invalid content of \\{\\}".to_string())
         );
-        assert_eq!(sed_ere(r"a{x\\\}").err().map(|e| e.msg), Some("Unmatched \\{".to_string()));
+        assert_eq!(
+            sed_ere(r"a{x\\\}").err().map(|e| e.msg),
+            Some("Unmatched \\{".to_string())
+        );
         // A readable one is still an interval, and `{,}` still reads as `{0,}`.
         assert!(sed_ere("a{1,2}").is_ok());
         assert!(sed_ere("a{,}").is_ok());
@@ -2611,17 +2718,22 @@ mod tests {
             );
             // `--posix` drops that extension and the character is ordinary again;
             // it does NOT relax the interval rules above.
-            let posix =
-                Options {
-                    ere: true,
-                    strict_repeats: true,
-                    posix: true,
-                    unmatched_rparen_ordinary: true,
-                    ..Options::default()
-                };
-            assert!(Regex::compile(pat.as_bytes(), posix).is_ok(), "--posix {pat}");
+            let posix = Options {
+                ere: true,
+                strict_repeats: true,
+                posix: true,
+                unmatched_rparen_ordinary: true,
+                ..Options::default()
+            };
+            assert!(
+                Regex::compile(pat.as_bytes(), posix).is_ok(),
+                "--posix {pat}"
+            );
         }
-        assert!(sed_ere("()").is_ok(), "an empty group is not an unmatched paren");
+        assert!(
+            sed_ere("()").is_ok(),
+            "an empty group is not an unmatched paren"
+        );
         let posix = Options {
             ere: true,
             strict_repeats: true,
@@ -2629,7 +2741,10 @@ mod tests {
             unmatched_rparen_ordinary: true,
             ..Options::default()
         };
-        assert!(Regex::compile(b"a{x}", posix).is_err(), "--posix leaves intervals alone");
+        assert!(
+            Regex::compile(b"a{x}", posix).is_err(),
+            "--posix leaves intervals alone"
+        );
         // The paren field ALONE, which is what POSIXLY_CORRECT hands the
         // compiler: the close-paren goes ordinary and every other extension --
         // `\w`, `\+`, `\|` -- stays, since `RE_NO_GNU_OPS` is BASIC's alone.
@@ -2638,14 +2753,26 @@ mod tests {
             unmatched_rparen_ordinary: true,
             ..Options::default()
         };
-        assert!(Regex::compile(b"a\\)", correct).is_ok(), "CORRECT: \\) is ordinary");
+        assert!(
+            Regex::compile(b"a\\)", correct).is_ok(),
+            "CORRECT: \\) is ordinary"
+        );
         // Anchored, and judged on text only the OPERATOR reading matches: `\w`
         // read as the literal `w` still matches a `w`, so only a non-letter
         // separates the two readings.
-        let basic = Options { posix: true, ..correct };
+        let basic = Options {
+            posix: true,
+            ..correct
+        };
         for (pat, operator_only) in [(&b"^\\w$"[..], "4"), (&b"^a\\+$"[..], "aa")] {
-            assert!(matched(&Regex::compile(pat, correct).unwrap(), operator_only));
-            assert!(!matched(&Regex::compile(pat, basic).unwrap(), operator_only));
+            assert!(matched(
+                &Regex::compile(pat, correct).unwrap(),
+                operator_only
+            ));
+            assert!(!matched(
+                &Regex::compile(pat, basic).unwrap(),
+                operator_only
+            ));
         }
         // grep reads every one of them as text, which is why this is a flag and
         // not a fix.
@@ -2759,7 +2886,10 @@ mod tests {
         let easy = bre(r"x:*");
         assert_eq!(
             easy.search(hay.as_bytes(), 0).unwrap().unwrap().end(),
-            easy.search_existence(hay.as_bytes(), 0).unwrap().unwrap().end(),
+            easy.search_existence(hay.as_bytes(), 0)
+                .unwrap()
+                .unwrap()
+                .end(),
         );
     }
 
@@ -2767,7 +2897,10 @@ mod tests {
     /// and a NON-MATCHING bracket list stop at a separator.
     #[test]
     fn reg_newline_keeps_dot_and_negated_lists_off_the_newline() {
-        let opts = Options { reg_newline: m(b'\n'), ..Options::default() };
+        let opts = Options {
+            reg_newline: m(b'\n'),
+            ..Options::default()
+        };
         let dot = Regex::compile(b"c.d", opts).unwrap();
         assert!(dot.search(b"abc\ndef", 0).unwrap().is_none());
         let neg = Regex::compile(b"[^abc]", opts).unwrap();
@@ -2777,9 +2910,18 @@ mod tests {
         assert_eq!(star.search(b"abc\ndef", 0).unwrap().unwrap().end(), 3);
         // Without the flag, all three cross it.
         let plain = Options::default();
-        assert!(Regex::compile(b"c.d", plain).unwrap().search(b"abc\ndef", 0).unwrap().is_some());
+        assert!(Regex::compile(b"c.d", plain)
+            .unwrap()
+            .search(b"abc\ndef", 0)
+            .unwrap()
+            .is_some());
         assert_eq!(
-            Regex::compile(b"[^abc]", plain).unwrap().search(b"abc\ndef", 0).unwrap().unwrap().start(),
+            Regex::compile(b"[^abc]", plain)
+                .unwrap()
+                .search(b"abc\ndef", 0)
+                .unwrap()
+                .unwrap()
+                .start(),
             3
         );
         // A newline named EXPLICITLY in a positive list still matches under the flag.
@@ -2792,25 +2934,71 @@ mod tests {
     /// the anchor half takes the separator ALONE, the exclusion half takes both.
     #[test]
     fn reg_newline_anchors_on_the_separator_but_excludes_the_newline_too() {
-        let nul = Options { reg_newline: m(0), ..Options::default() };
+        let nul = Options {
+            reg_newline: m(0),
+            ..Options::default()
+        };
         // Anchors at the NUL, for EITHER caller...
-        assert!(Regex::compile(b"^b", nul).unwrap().search(b"a\0b", 0).unwrap().is_some());
-        assert!(Regex::compile(b"^b", nul).unwrap().search_subst(b"a\0b", 0).unwrap().is_some());
-        assert!(Regex::compile(b"a$", nul).unwrap().search(b"a\0b", 0).unwrap().is_some());
+        assert!(Regex::compile(b"^b", nul)
+            .unwrap()
+            .search(b"a\0b", 0)
+            .unwrap()
+            .is_some());
+        assert!(Regex::compile(b"^b", nul)
+            .unwrap()
+            .search_subst(b"a\0b", 0)
+            .unwrap()
+            .is_some());
+        assert!(Regex::compile(b"a$", nul)
+            .unwrap()
+            .search(b"a\0b", 0)
+            .unwrap()
+            .is_some());
         // ...but not at a newline, which is not the separator here.
-        assert!(Regex::compile(b"^d", nul).unwrap().search(b"abc\ndef", 0).unwrap().is_none());
-        assert!(Regex::compile(b"c$", nul).unwrap().search(b"abc\ndef", 0).unwrap().is_none());
+        assert!(Regex::compile(b"^d", nul)
+            .unwrap()
+            .search(b"abc\ndef", 0)
+            .unwrap()
+            .is_none());
+        assert!(Regex::compile(b"c$", nul)
+            .unwrap()
+            .search(b"abc\ndef", 0)
+            .unwrap()
+            .is_none());
         // REG_NEWLINE drops the NEWLINE from `.` and a non-matching list in either
         // path, while the SEPARATOR is only out of reach in a substitution.
-        assert!(Regex::compile(b"c.d", nul).unwrap().search(b"abc\ndef", 0).unwrap().is_none());
-        assert!(Regex::compile(b"a.b", nul).unwrap().search_subst(b"a\0b", 0).unwrap().is_none());
-        assert!(Regex::compile(b"a.b", nul).unwrap().search(b"a\0b", 0).unwrap().is_some());
-        assert!(Regex::compile(b"[^a]", nul).unwrap().search_subst(b"a\0b", 0).unwrap()
+        assert!(Regex::compile(b"c.d", nul)
+            .unwrap()
+            .search(b"abc\ndef", 0)
+            .unwrap()
+            .is_none());
+        assert!(Regex::compile(b"a.b", nul)
+            .unwrap()
+            .search_subst(b"a\0b", 0)
+            .unwrap()
+            .is_none());
+        assert!(Regex::compile(b"a.b", nul)
+            .unwrap()
+            .search(b"a\0b", 0)
+            .unwrap()
+            .is_some());
+        assert!(Regex::compile(b"[^a]", nul)
+            .unwrap()
+            .search_subst(b"a\0b", 0)
+            .unwrap()
             .is_some_and(|c| c.start() == 2));
         // Without the flag both bytes are ordinary.
         let plain = Options::default();
-        assert!(Regex::compile(b"a.b", plain).unwrap().search(b"a\0b", 0).unwrap().is_some());
-        assert!(Regex::compile(b"^b", plain).unwrap().search(b"a\0b", 0).unwrap().is_none());
+        assert!(Regex::compile(b"a.b", plain)
+            .unwrap()
+            .search(b"a\0b", 0)
+            .unwrap()
+            .is_some());
+        assert!(Regex::compile(b"^b", plain)
+            .unwrap()
+            .search(b"a\0b", 0)
+            .unwrap()
+            .is_none());
     }
 
     /// `newline_anchor` set while the separator is a NUL -- sed's `-z` placed
@@ -2825,19 +3013,33 @@ mod tests {
     #[test]
     fn a_newline_anchor_over_a_nul_separator_holds_at_both_bytes() {
         let both = Options {
-            reg_newline: Some(Anchor { sep: 0, newline_anchor: true }),
+            reg_newline: Some(Anchor {
+                sep: 0,
+                newline_anchor: true,
+            }),
             ..Options::default()
         };
-        let nul = Options { reg_newline: m(0), ..Options::default() };
+        let nul = Options {
+            reg_newline: m(0),
+            ..Options::default()
+        };
         // `N` under `-z` joins two records, one of which holds a newline -- so
         // one buffer carries both bytes and the pair is observable in it.
         let hay = &b"a\nb\0c"[..];
         let at = |o, pat: &[u8], from| {
-            Regex::compile(pat, o).unwrap().search(hay, from).unwrap().map(|c| c.start())
+            Regex::compile(pat, o)
+                .unwrap()
+                .search(hay, from)
+                .unwrap()
+                .map(|c| c.start())
         };
         // The newline anchors `b`, the NUL anchors `c`, under ONE pattern.
         assert_eq!(at(both, b"^[bc]", 0), Some(2));
-        assert_eq!(at(both, b"^[bc]", 3), Some(4), "the veto is not re-run past 0");
+        assert_eq!(
+            at(both, b"^[bc]", 3),
+            Some(4),
+            "the veto is not re-run past 0"
+        );
         // The NUL-only reading has the second alone.
         assert_eq!(at(nul, b"^[bc]", 0), Some(4));
         // The veto: `c` follows no newline, so the compile-time reading finds
@@ -2848,24 +3050,49 @@ mod tests {
         // The BUFFER anchors take the segment alone in a substitution, so the
         // compiled newline does not reach them -- while an address has them as
         // `^`/`$` by another spelling and does.
-        assert!(Regex::compile(b"\\`d", both).unwrap().search(b"abc\ndef", 0).unwrap().is_some());
-        assert!(Regex::compile(b"\\`d", both).unwrap().search_subst(b"abc\ndef", 0).unwrap()
+        assert!(Regex::compile(b"\\`d", both)
+            .unwrap()
+            .search(b"abc\ndef", 0)
+            .unwrap()
+            .is_some());
+        assert!(Regex::compile(b"\\`d", both)
+            .unwrap()
+            .search_subst(b"abc\ndef", 0)
+            .unwrap()
             .is_none());
         // The exclusion half was never about the separator, so it is unmoved.
-        assert!(Regex::compile(b"c.d", both).unwrap().search(b"abc\ndef", 0).unwrap().is_none());
+        assert!(Regex::compile(b"c.d", both)
+            .unwrap()
+            .search(b"abc\ndef", 0)
+            .unwrap()
+            .is_none());
         // And the segment is still what a substitution may not consume.
-        assert!(Regex::compile(b"a.b", both).unwrap().search_subst(b"a\0b", 0).unwrap().is_none());
+        assert!(Regex::compile(b"a.b", both)
+            .unwrap()
+            .search_subst(b"a\0b", 0)
+            .unwrap()
+            .is_none());
         // A BACKREFERENCE is filtered too, with the reference APPROXIMATED as
         // the dfa approximates it. Enforced, `\1*` could take nothing that
         // keeps `$` on a newline and the first would be rejected; unfiltered,
         // the second would be accepted. Neither simpler answer gives both.
         let br = &b"\na\0b\n"[..];
-        assert!(Regex::compile(b"^\\(.\\)\\1*$", both).unwrap().search(br, 0).unwrap().is_some());
-        assert!(Regex::compile(b"^c\\(x\\)\\1", both).unwrap()
-            .search(b"a\nb\0cxx", 0).unwrap().is_none());
+        assert!(Regex::compile(b"^\\(.\\)\\1*$", both)
+            .unwrap()
+            .search(br, 0)
+            .unwrap()
+            .is_some());
+        assert!(Regex::compile(b"^c\\(x\\)\\1", both)
+            .unwrap()
+            .search(b"a\nb\0cxx", 0)
+            .unwrap()
+            .is_none());
         // ...and with no filter to disagree, the same pattern matches.
-        assert!(Regex::compile(b"^c\\(x\\)\\1", nul).unwrap()
-            .search(b"a\nb\0cxx", 0).unwrap().is_some());
+        assert!(Regex::compile(b"^c\\(x\\)\\1", nul)
+            .unwrap()
+            .search(b"a\nb\0cxx", 0)
+            .unwrap()
+            .is_some());
     }
 
     /// A separator that is not a newline confines a SUBSTITUTION to the segments
@@ -2874,15 +3101,28 @@ mod tests {
     /// REG_NEWLINE, touching only `.` and a non-matching list) applies to both.
     #[test]
     fn a_non_newline_separator_is_consumed_by_nothing_in_a_substitution() {
-        let nul = Options { reg_newline: m(0), ..Options::default() };
+        let nul = Options {
+            reg_newline: m(0),
+            ..Options::default()
+        };
         // Nothing may cover the separator at index 1 in a substitution. The NUL is
         // written raw because sed decodes `\x00` before a pattern reaches this layer;
         // `[\0]` is here for the fast paths' sake, and `\s` because a NUL is not
         // whitespace either way.
-        for pat in [&b"\0"[..], b"[\0]", b"\\W", b"\\s", b"[^a]", b".", b"\\(.\\)\\1"] {
+        for pat in [
+            &b"\0"[..],
+            b"[\0]",
+            b"\\W",
+            b"\\s",
+            b"[^a]",
+            b".",
+            b"\\(.\\)\\1",
+        ] {
             let re = Regex::compile(pat, nul).unwrap();
             assert!(
-                re.search_subst(b"a\0a", 0).unwrap().is_none_or(|c| c.end() <= 1 || c.start() >= 2),
+                re.search_subst(b"a\0a", 0)
+                    .unwrap()
+                    .is_none_or(|c| c.end() <= 1 || c.start() >= 2),
                 "{:?} consumed the separator",
                 String::from_utf8_lossy(pat)
             );
@@ -2893,20 +3133,43 @@ mod tests {
         for pat in [&b"\0"[..], b"[\0]", b"\\W", b"[^a]", b"."] {
             let re = Regex::compile(pat, nul).unwrap();
             let hit = re.search(b"a\0a", 0).unwrap();
-            assert!(hit.is_some(), "{:?} found nothing", String::from_utf8_lossy(pat));
+            assert!(
+                hit.is_some(),
+                "{:?} found nothing",
+                String::from_utf8_lossy(pat)
+            );
         }
-        assert!(Regex::compile(b"a.a", nul).unwrap().search(b"a\0a", 0).unwrap().is_some());
-        assert!(Regex::compile(b"a.a", nul).unwrap().search_subst(b"a\0a", 0).unwrap().is_none());
+        assert!(Regex::compile(b"a.a", nul)
+            .unwrap()
+            .search(b"a\0a", 0)
+            .unwrap()
+            .is_some());
+        assert!(Regex::compile(b"a.a", nul)
+            .unwrap()
+            .search_subst(b"a\0a", 0)
+            .unwrap()
+            .is_none());
         // The newline is NOT confined either way: `\W` matches one under the flag,
         // which is what makes the two mechanisms distinguishable.
         let nl = Regex::compile(b"\\W", nul).unwrap();
         assert_eq!(nl.search_subst(b"a\nb", 0).unwrap().unwrap().start(), 1);
         assert_eq!(nl.search(b"a\nb", 0).unwrap().unwrap().start(), 1);
         // ...while `.` and a non-matching list still lose it, in EITHER path.
-        assert!(Regex::compile(b"a.b", nul).unwrap().search(b"a\nb", 0).unwrap().is_none());
-        assert!(Regex::compile(b"a.b", nul).unwrap().search_subst(b"a\nb", 0).unwrap().is_none());
+        assert!(Regex::compile(b"a.b", nul)
+            .unwrap()
+            .search(b"a\nb", 0)
+            .unwrap()
+            .is_none());
+        assert!(Regex::compile(b"a.b", nul)
+            .unwrap()
+            .search_subst(b"a\nb", 0)
+            .unwrap()
+            .is_none());
         // With a NEWLINE separator nothing is confined; REG_NEWLINE alone applies.
-        let opts = Options { reg_newline: m(b'\n'), ..Options::default() };
+        let opts = Options {
+            reg_newline: m(b'\n'),
+            ..Options::default()
+        };
         let w = Regex::compile(b"\\W", opts).unwrap();
         assert_eq!(w.search(b"a\nb", 0).unwrap().unwrap().start(), 1);
         assert_eq!(w.search_subst(b"a\nb", 0).unwrap().unwrap().start(), 1);
@@ -2917,11 +3180,23 @@ mod tests {
     #[test]
     fn the_buffer_anchors_follow_the_separator_only_where_gnu_moves_them() {
         for (sep, hay) in [(b'\n', &b"a\nb"[..]), (0, b"a\0b")] {
-            let opts = Options { reg_newline: m(sep), ..Options::default() };
-            let (open, close) = (Regex::compile(b"\\`b", opts).unwrap(), Regex::compile(b"a\\'", opts).unwrap());
+            let opts = Options {
+                reg_newline: m(sep),
+                ..Options::default()
+            };
+            let (open, close) = (
+                Regex::compile(b"\\`b", opts).unwrap(),
+                Regex::compile(b"a\\'", opts).unwrap(),
+            );
             // An address moves them to the record separator, whatever it is.
-            assert!(open.search(hay, 0).unwrap().is_some(), "sep {sep}: address lost \\`");
-            assert!(close.search(hay, 0).unwrap().is_some(), "sep {sep}: address lost \\'");
+            assert!(
+                open.search(hay, 0).unwrap().is_some(),
+                "sep {sep}: address lost \\`"
+            );
+            assert!(
+                close.search(hay, 0).unwrap().is_some(),
+                "sep {sep}: address lost \\'"
+            );
             // A substitution moves them only for a SEGMENT, which a newline is not.
             let moved = sep != b'\n';
             assert_eq!(open.search_subst(hay, 0).unwrap().is_some(), moved);
@@ -2930,30 +3205,67 @@ mod tests {
         // Without the flag neither caller moves them, and `^` is the contrast that
         // does move: `s/\`a/X/Mg` over `a\na` rewrites one `a`, `s/^a/X/Mg` both.
         let plain = Options::default();
-        assert!(Regex::compile(b"\\`b", plain).unwrap().search(b"a\nb", 0).unwrap().is_none());
-        let m = Options { reg_newline: m(b'\n'), ..Options::default() };
-        assert!(Regex::compile(b"^b", m).unwrap().search_subst(b"a\nb", 0).unwrap().is_some());
+        assert!(Regex::compile(b"\\`b", plain)
+            .unwrap()
+            .search(b"a\nb", 0)
+            .unwrap()
+            .is_none());
+        let m = Options {
+            reg_newline: m(b'\n'),
+            ..Options::default()
+        };
+        assert!(Regex::compile(b"^b", m)
+            .unwrap()
+            .search_subst(b"a\nb", 0)
+            .unwrap()
+            .is_some());
     }
 
     /// A backreference confines an ADDRESS too, which no rule about `M` predicts —
     /// see `Regex::has_backref`.
     #[test]
     fn a_backreference_confines_the_address_path_as_well() {
-        let nul = Options { reg_newline: m(0), ..Options::default() };
+        let nul = Options {
+            reg_newline: m(0),
+            ..Options::default()
+        };
         let hay = &b"a\0\0b"[..];
         // Nothing crosses the separator once a backref is in the pattern, whether the
         // backref does the crossing or a literal does.
         for pat in [&b"\\(.\\)\\1"[..], b"\\(a\\)\0\\1*"] {
             let re = Regex::compile(pat, nul).unwrap();
-            assert!(re.search(hay, 0).unwrap().is_none(), "{:?} crossed", String::from_utf8_lossy(pat));
+            assert!(
+                re.search(hay, 0).unwrap().is_none(),
+                "{:?} crossed",
+                String::from_utf8_lossy(pat)
+            );
         }
         // Without one, an address crosses; and a match inside a segment is unaffected.
-        assert!(Regex::compile(b"..", nul).unwrap().search(hay, 0).unwrap().is_some());
-        assert!(Regex::compile(b"\\(a\\)\0", nul).unwrap().search(hay, 0).unwrap().is_some());
-        assert!(Regex::compile(b"\\(b\\)\\1*", nul).unwrap().search(hay, 0).unwrap().is_some());
+        assert!(Regex::compile(b"..", nul)
+            .unwrap()
+            .search(hay, 0)
+            .unwrap()
+            .is_some());
+        assert!(Regex::compile(b"\\(a\\)\0", nul)
+            .unwrap()
+            .search(hay, 0)
+            .unwrap()
+            .is_some());
+        assert!(Regex::compile(b"\\(b\\)\\1*", nul)
+            .unwrap()
+            .search(hay, 0)
+            .unwrap()
+            .is_some());
         // A newline separator has no segment, so a doubled NUL is an ordinary pair.
-        let nl = Options { reg_newline: m(b'\n'), ..Options::default() };
-        assert!(Regex::compile(b"\\(.\\)\\1", nl).unwrap().search(hay, 0).unwrap().is_some());
+        let nl = Options {
+            reg_newline: m(b'\n'),
+            ..Options::default()
+        };
+        assert!(Regex::compile(b"\\(.\\)\\1", nl)
+            .unwrap()
+            .search(hay, 0)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -2970,7 +3282,14 @@ mod tests {
         assert!(matched(&bre(r"\(^^\)b"), "^b"));
         assert!(!matched(&bre(r"\(^^\)b"), "xb"));
         // ERE anchors anywhere, so there the same pattern matches everything.
-        let ere = Regex::compile(b"^^", Options { ere: true, ..Options::default() }).unwrap();
+        let ere = Regex::compile(
+            b"^^",
+            Options {
+                ere: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
         assert!(matched(&ere, "x"));
     }
 
@@ -3001,7 +3320,10 @@ mod tests {
         assert!(!matched(&bre(r"\(x$|\)"), "x$|"));
         // grep lexes its `-e`/`-f` patterns JOINED by `\n`, so for every one but the
         // last there is a further byte and the literal is gone.
-        let joined = Options { lex_continues: true, ..Options::default() };
+        let joined = Options {
+            lex_continues: true,
+            ..Options::default()
+        };
         assert!(!matched(&Regex::compile(b"x$|", joined).unwrap(), "ax$|z"));
         assert!(!matched(&Regex::compile(b"x$)", joined).unwrap(), "ax$)z"));
     }
@@ -3023,7 +3345,14 @@ mod tests {
 
     #[test]
     fn case_folding_covers_literals_and_classes() {
-        let re = Regex::compile(b"[a-z]bc", Options { icase: true, ..Options::default() }).unwrap();
+        let re = Regex::compile(
+            b"[a-z]bc",
+            Options {
+                icase: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
         assert!(matched(&re, "ABC"));
     }
 

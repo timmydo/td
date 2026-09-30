@@ -522,9 +522,10 @@ mod tests {
                 .unwrap()
                 .bind(name)
                 .is_err());
-            assert!(ApplicationRegistry::new(vec![
-                ((*name).to_string(), "/td/store/package".into()),
-            ])
+            assert!(ApplicationRegistry::new(vec![(
+                (*name).to_string(),
+                "/td/store/package".into()
+            ),])
             .is_err());
         }
     }

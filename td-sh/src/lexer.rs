@@ -209,7 +209,10 @@ impl Scanner {
 
 /// Characters that end a word without being part of it.
 fn is_word_end(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\n' | '|' | '&' | ';' | '<' | '>' | '(' | ')')
+    matches!(
+        c,
+        ' ' | '\t' | '\n' | '|' | '&' | ';' | '<' | '>' | '(' | ')'
+    )
 }
 
 /// Where a `case` has got to. A `)` that ends a PATTERN closes nothing, and
@@ -242,7 +245,9 @@ enum Took {
 /// Words after which a command can START, so a `case` following one opens a
 /// case statement rather than being an argument. `is_word_end` cannot answer
 /// this: it is about characters, and this is about position.
-const OPENS_COMMAND: &[&str] = &["do", "then", "else", "elif", "{", "!", "if", "while", "until"];
+const OPENS_COMMAND: &[&str] = &[
+    "do", "then", "else", "elif", "{", "!", "if", "while", "until",
+];
 
 /// Advance the case walk by one token. `depth` pins each open `case` to the
 /// paren depth it began at, so a `)` inside a subshell in an arm's body is
@@ -393,7 +398,11 @@ fn close_paren(lx: &mut Lexer) -> Syn<(usize, usize)> {
                     return Ok((before, lx.sc.pos));
                 }
             }
-            Tok::Eof => return Err(SynErr::incomplete("syntax error: unexpected end of file (expecting \")\")")),
+            Tok::Eof => {
+                return Err(SynErr::incomplete(
+                    "syntax error: unexpected end of file (expecting \")\")",
+                ))
+            }
             _ => {}
         }
     }
@@ -558,7 +567,10 @@ fn decode_ansi_c(body: &[char]) -> Vec<u8> {
             Some(Esc::Point(n)) if n > 0x7fff_ffff => {}
             Some(Esc::Point(n)) => {
                 if !done {
-                    push_utf8(&mut bytes, char::from_u32(n).unwrap_or(char::REPLACEMENT_CHARACTER));
+                    push_utf8(
+                        &mut bytes,
+                        char::from_u32(n).unwrap_or(char::REPLACEMENT_CHARACTER),
+                    );
                 }
             }
             None => {
@@ -586,7 +598,6 @@ fn take_digits(body: &[char], i: &mut usize, radix: u32, max: usize) -> Option<u
     }
     value
 }
-
 
 /// Accumulates a word, merging runs of like segments so `abc` is one `Lit`.
 #[derive(Default)]
@@ -786,8 +797,7 @@ impl Scan {
     /// an unfilled slot is indistinguishable from a legitimately EMPTY body --
     /// the pending list is the only thing that can tell them apart.
     pub fn heredoc_pending(&self, id: usize) -> bool {
-        self.lx.awaiting.is_some_and(|(a, _)| a == id)
-            || self.lx.pending.iter().any(|p| p.id == id)
+        self.lx.awaiting.is_some_and(|(a, _)| a == id) || self.lx.pending.iter().any(|p| p.id == id)
     }
 
     /// Adopt bodies scanned elsewhere -- an alias replacement is lexed on its
@@ -814,7 +824,11 @@ impl Scan {
             match self.lx.next_tok() {
                 Ok(Tok::Eof) if !self.sealed => {
                     self.lx.restore(mark);
-                    return Chunk { toks, incomplete: true, error: None };
+                    return Chunk {
+                        toks,
+                        incomplete: true,
+                        error: None,
+                    };
                 }
                 Ok(tok) => {
                     let last = matches!(tok, Tok::Eof);
@@ -836,9 +850,16 @@ impl Scan {
                     // pushed back. It differs from the line the token opens on
                     // only when the token itself spans lines, and there dash
                     // reports the later one -- `x="a\nb" y=$LINENO` is 2.
-                    toks.push(Placed { line: self.lx.sc.line, tok });
+                    toks.push(Placed {
+                        line: self.lx.sc.line,
+                        tok,
+                    });
                     if last {
-                        return Chunk { toks, incomplete: false, error: None };
+                        return Chunk {
+                            toks,
+                            incomplete: false,
+                            error: None,
+                        };
                     }
                 }
                 // Unsealed, an unfinished construct is a request for more input
@@ -850,12 +871,26 @@ impl Scan {
                     // makes a large body quadratic. Progress stays; the scan is
                     // resumable from exactly where it stopped.
                     if std::mem::take(&mut self.lx.committed) {
-                        return Chunk { toks, incomplete: true, error: None };
+                        return Chunk {
+                            toks,
+                            incomplete: true,
+                            error: None,
+                        };
                     }
                     self.lx.restore(mark);
-                    return Chunk { toks, incomplete: true, error: None };
+                    return Chunk {
+                        toks,
+                        incomplete: true,
+                        error: None,
+                    };
                 }
-                Err(e) => return Chunk { toks, incomplete: false, error: Some(e) },
+                Err(e) => {
+                    return Chunk {
+                        toks,
+                        incomplete: false,
+                        error: Some(e),
+                    }
+                }
             }
         }
     }
@@ -1119,8 +1154,7 @@ impl Lexer {
             // scanner, which is why the whole token is one (ash.c:12676); this
             // shell decides it here, before the operator scan, and the word
             // scanner below re-asks for the ones that start mid-word.
-            if matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')') && self.at_procsub().is_none()
-            {
+            if matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')') && self.at_procsub().is_none() {
                 let op = self.scan_op()?;
                 match op {
                     // `&&`, `||` and `(` are the conditional's own connectives
@@ -1161,10 +1195,7 @@ impl Lexer {
                     Some('&') => self.sc.peek_at(1) == Some('>'),
                     _ => false,
                 };
-                if !text.is_empty()
-                    && text.chars().all(|c| c.is_ascii_digit())
-                    && starts_redirect
-                {
+                if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) && starts_redirect {
                     if let Ok(n) = text.parse::<u32>() {
                         return Ok(Tok::IoNumber(n));
                     }
@@ -1186,9 +1217,7 @@ impl Lexer {
             // The cost is a newline written directly after `[[`, which stops
             // arming the regex mode -- and that costs a glued `|` in a regex in
             // that one shape, where the alternative silently ate a pipe.
-            Some("[[") if self.cmd_position => {
-                self.cond_depth = self.cond_depth.saturating_add(1)
-            }
+            Some("[[") if self.cmd_position => self.cond_depth = self.cond_depth.saturating_add(1),
             Some("]]") => {
                 self.cond_depth = self.cond_depth.saturating_sub(1);
                 self.cond_continues = false;
@@ -1358,7 +1387,9 @@ impl Lexer {
                         self.heredoc_ran_out.get_or_insert_with(|| delim.clone());
                         break;
                     }
-                    return Err(SynErr::incomplete(format!("syntax error: unexpected end of file (expecting {delim:?})")));
+                    return Err(SynErr::incomplete(format!(
+                        "syntax error: unexpected end of file (expecting {delim:?})"
+                    )));
                 };
                 let line = if strip_tabs {
                     raw.trim_start_matches('\t')
@@ -1530,7 +1561,11 @@ impl Lexer {
                     let before = buf.segs.len();
                     loop {
                         match self.sc.bump() {
-                            None => return Err(SynErr::incomplete("syntax error: unterminated quoted string")),
+                            None => {
+                                return Err(SynErr::incomplete(
+                                    "syntax error: unterminated quoted string",
+                                ))
+                            }
                             Some('\'') => break,
                             Some(ch) => buf.push_quoted(ch),
                         }
@@ -1639,7 +1674,9 @@ impl Lexer {
     fn scan_double(&mut self, buf: &mut WordBuf) -> Syn<()> {
         loop {
             let Some(c) = self.sc.peek() else {
-                return Err(SynErr::incomplete("syntax error: unterminated quoted string"));
+                return Err(SynErr::incomplete(
+                    "syntax error: unterminated quoted string",
+                ));
             };
             match c {
                 '"' => {
@@ -1706,7 +1743,9 @@ impl Lexer {
         let mut body: Vec<char> = Vec::new();
         loop {
             let Some(c) = self.sc.bump() else {
-                return Err(SynErr::incomplete("syntax error: unterminated quoted string"));
+                return Err(SynErr::incomplete(
+                    "syntax error: unterminated quoted string",
+                ));
             };
             if c == '\'' {
                 break;
@@ -1714,7 +1753,9 @@ impl Lexer {
             body.push(c);
             if c == '\\' {
                 let Some(esc) = self.sc.bump() else {
-                    return Err(SynErr::incomplete("syntax error: unterminated quoted string"));
+                    return Err(SynErr::incomplete(
+                        "syntax error: unterminated quoted string",
+                    ));
                 };
                 body.push(esc);
             }
@@ -1729,14 +1770,13 @@ impl Lexer {
         Ok(())
     }
 
-
     /// A `$`-expansion. `in_dq` marks it as appearing inside double quotes, so
     /// its result is neither field-split nor globbed.
     fn scan_dollar(&mut self, buf: &mut WordBuf, in_dq: bool) -> Syn<()> {
         self.sc.bump(); // '$'
-        // The opener is read through any fold, so `$\<newline>{a}` is `${a}`
-        // and `$\<newline>(cmd)` a substitution. At end of input the fold is
-        // spent and a bare `$` is left, which is a literal.
+                        // The opener is read through any fold, so `$\<newline>{a}` is `${a}`
+                        // and `$\<newline>(cmd)` a substitution. At end of input the fold is
+                        // spent and a bare `$` is left, which is a literal.
         self.sc.skip_folds();
         let push_dollar = |buf: &mut WordBuf| {
             if in_dq {
@@ -1934,7 +1974,9 @@ impl Lexer {
                     out.push('`');
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(SynErr::incomplete("syntax error: EOF in backquote substitution"));
+                            return Err(SynErr::incomplete(
+                                "syntax error: EOF in backquote substitution",
+                            ));
                         };
                         out.push(q);
                         if q == '\\' {
@@ -1962,7 +2004,9 @@ impl Lexer {
                     self.sc.bump();
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(SynErr::incomplete("syntax error: unterminated quoted string"));
+                            return Err(SynErr::incomplete(
+                                "syntax error: unterminated quoted string",
+                            ));
                         };
                         out.push(q);
                         if q == '\\' {
@@ -1986,7 +2030,9 @@ impl Lexer {
                     // mistaken for the closing brace.
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(SynErr::incomplete("syntax error: unterminated quoted string"));
+                            return Err(SynErr::incomplete(
+                                "syntax error: unterminated quoted string",
+                            ));
                         };
                         out.push(q);
                         if q == '\\' && c == '"' {
@@ -2065,7 +2111,9 @@ impl Lexer {
         let mut depth = 1usize;
         loop {
             let Some(c) = self.sc.bump() else {
-                return Err(SynErr::incomplete("syntax error: unexpected end of file (expecting \")\")"));
+                return Err(SynErr::incomplete(
+                    "syntax error: unexpected end of file (expecting \")\")",
+                ));
             };
             match c {
                 '(' => depth = depth.saturating_add(1),
@@ -2092,7 +2140,9 @@ impl Lexer {
                     self.sc.bump();
                     loop {
                         let Some(q) = self.sc.bump() else {
-                            return Err(SynErr::incomplete("syntax error: unterminated quoted string"));
+                            return Err(SynErr::incomplete(
+                                "syntax error: unterminated quoted string",
+                            ));
                         };
                         out.push(q);
                         if q == '\\' {
@@ -2218,7 +2268,9 @@ impl Lexer {
         let mut out = String::new();
         loop {
             let Some(c) = self.sc.bump() else {
-                return Err(SynErr::incomplete("syntax error: EOF in backquote substitution"));
+                return Err(SynErr::incomplete(
+                    "syntax error: EOF in backquote substitution",
+                ));
             };
             match c {
                 '`' => return Ok(out),
@@ -2405,7 +2457,9 @@ fn parse_braced(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Seg> {
                 repl: word_from_str_at(
                     &repl,
                     depth + 1,
-                    line.saturating_add(u32::try_from(pat.matches('\n').count()).unwrap_or(u32::MAX)),
+                    line.saturating_add(
+                        u32::try_from(pat.matches('\n').count()).unwrap_or(u32::MAX),
+                    ),
                 )?,
                 all: doubled,
             }),
@@ -2639,7 +2693,10 @@ mod tests {
         assert_eq!(split("${a:-x}:2"), ("${a:-x}".into(), Some("2".into())));
         // Quoted runs do too, and an ESCAPED quote does not end one early.
         assert_eq!(split("'a:b':2"), ("'a:b'".into(), Some("2".into())));
-        assert_eq!(split("\"a\\\":b\":2"), ("\"a\\\":b\"".into(), Some("2".into())));
+        assert_eq!(
+            split("\"a\\\":b\":2"),
+            ("\"a\\\":b\"".into(), Some("2".into()))
+        );
         assert_eq!(split("`a\\`:b`:2"), ("`a\\`:b`".into(), Some("2".into())));
     }
 
@@ -2669,8 +2726,14 @@ mod tests {
         // A bracket inside quotes closes nothing, so the `)` of `printf ")"` must
         // not end the substitution -- otherwise the delimiter is taken from
         // inside it and the pattern is cut in half.
-        assert_eq!(split("$(printf \")\")/X"), ("$(printf \")\")".into(), "X".into()));
-        assert_eq!(split("$(printf ')')/X"), ("$(printf ')')".into(), "X".into()));
+        assert_eq!(
+            split("$(printf \")\")/X"),
+            ("$(printf \")\")".into(), "X".into())
+        );
+        assert_eq!(
+            split("$(printf ')')/X"),
+            ("$(printf ')')".into(), "X".into())
+        );
         // An escaped `"` does not end a double-quoted region; a single-quoted one
         // has no escapes, so there the backslash is just data.
         assert_eq!(split("\"a\\\"b\"/X"), ("\"a\\\"b\"".into(), "X".into()));
@@ -2687,7 +2750,8 @@ mod tests {
     }
 
     fn nth(ws: &[Word], i: usize) -> Syn<&Word> {
-        ws.get(i).ok_or_else(|| format!("no word at index {i}").into())
+        ws.get(i)
+            .ok_or_else(|| format!("no word at index {i}").into())
     }
 
     fn heredoc0(src: &str) -> Syn<Word> {
@@ -2741,8 +2805,10 @@ mod tests {
         assert!(matches!(nth(&ws, 1)?.0.as_slice(),
             [Seg::ProcSub { code, write: false, .. }] if code == "true"));
         // `>(` is the other direction and otherwise the same word.
-        assert!(matches!(words("echo >(true)")?.get(1).map(|w| w.0.as_slice()),
-            Some([Seg::ProcSub { write: true, .. }])));
+        assert!(matches!(
+            words("echo >(true)")?.get(1).map(|w| w.0.as_slice()),
+            Some([Seg::ProcSub { write: true, .. }])
+        ));
         // Mid-word, which is where ash reads it -- its word scanner asks whether
         // the character that would END the word is followed by `(`. Measured:
         // `echo x<(true)y` prints `x/dev/fd/64y`, one field.
@@ -2792,15 +2858,24 @@ mod tests {
 
     #[test]
     fn io_number_is_recognised_only_when_glued() -> Syn<()> {
-        assert!(matches!(tokenize("echo 2>x", 1)?.toks.get(1).map(|p| &p.tok), Some(Tok::IoNumber(2))));
-        assert!(matches!(tokenize("echo 2 >x", 1)?.toks.get(1).map(|p| &p.tok), Some(Tok::Word(_))));
+        assert!(matches!(
+            tokenize("echo 2>x", 1)?.toks.get(1).map(|p| &p.tok),
+            Some(Tok::IoNumber(2))
+        ));
+        assert!(matches!(
+            tokenize("echo 2 >x", 1)?.toks.get(1).map(|p| &p.tok),
+            Some(Tok::Word(_))
+        ));
         Ok(())
     }
 
     #[test]
     fn heredoc_body_is_collected_after_the_line() -> Syn<()> {
         assert!(matches!(
-            tokenize("cat <<EOF\nhi\nEOF\n", 1)?.toks.get(1).map(|p| &p.tok),
+            tokenize("cat <<EOF\nhi\nEOF\n", 1)?
+                .toks
+                .get(1)
+                .map(|p| &p.tok),
             Some(Tok::Op(Op::DLess(0)))
         ));
         assert!(matches!(heredoc0("cat <<EOF\nhi\nEOF\n")?.0.as_slice(),
@@ -2822,8 +2897,10 @@ mod tests {
 
     #[test]
     fn heredoc_dash_strips_leading_tabs() -> Syn<()> {
-        assert!(matches!(heredoc0("cat <<-EOF\n\t\thi\n\tEOF\n")?.0.as_slice(),
-            [Seg::Quoted(s)] if s == "hi\n"));
+        assert!(
+            matches!(heredoc0("cat <<-EOF\n\t\thi\n\tEOF\n")?.0.as_slice(),
+            [Seg::Quoted(s)] if s == "hi\n")
+        );
         Ok(())
     }
 
@@ -2893,14 +2970,13 @@ mod tests {
         // reaches the arithmetic lexer, which rejects them — as dash does.
         for src in ["'1' + 2", "\"1\" + 2", "1 \\+ 2", "\\1"] {
             let w = arith_from_str_at(src, 0, 1)?;
-            let text: String = w
-                .0
-                .iter()
-                .map(|s| match s {
-                    Seg::Lit(t) | Seg::Quoted(t) => t.as_str(),
-                    _ => "",
-                })
-                .collect();
+            let text: String =
+                w.0.iter()
+                    .map(|s| match s {
+                        Seg::Lit(t) | Seg::Quoted(t) => t.as_str(),
+                        _ => "",
+                    })
+                    .collect();
             assert_eq!(text, src);
         }
         // The expansions a double-quoted body still performs are unaffected.
@@ -2984,7 +3060,10 @@ mod tests {
         assert_eq!(shape(&split(">", "&"))?, "x GreatAnd y EOF");
         assert_eq!(shape(&split("<", "&"))?, "x LessAnd y EOF");
         assert_eq!(shape(&split("<", ">"))?, "x LessGreat y EOF");
-        assert_eq!(shape("case x in x) y ;\\\n; esac")?, "case x in x RParen y DSemi esac EOF");
+        assert_eq!(
+            shape("case x in x) y ;\\\n; esac")?,
+            "case x in x RParen y DSemi esac EOF"
+        );
         // The heredoc pair and the `-` that strips its tabs are two more. The
         // fold spends a newline, so the delimiter and `y` are on ONE line and
         // the body begins after the next.
@@ -3050,7 +3129,10 @@ mod tests {
         assert!(chunk.error.is_none(), "{:?}", chunk.error);
         let bodies = scan.take_heredocs();
         let body = bodies.first().and_then(Word::delimiter);
-        assert_eq!(body.as_ref().map(|(t, _)| t.as_str()), Some("unterminated\n"));
+        assert_eq!(
+            body.as_ref().map(|(t, _)| t.as_str()),
+            Some("unterminated\n")
+        );
         // The owed newline is EMITTED, not swallowed. Without this a regression
         // that returned `Eof` straight away would bank the same body, raise no
         // error, and still pass -- while no longer reaching the stall at all.
@@ -3087,7 +3169,10 @@ mod tests {
 
     #[test]
     fn ansi_c_quoting_decodes_the_named_escapes() -> Syn<()> {
-        assert_eq!(ansi_c(r"\a\b\e\E\f\n\r\t\v")?, "\u{7}\u{8}\u{1b}\u{1b}\u{c}\n\r\t\u{b}");
+        assert_eq!(
+            ansi_c(r"\a\b\e\E\f\n\r\t\v")?,
+            "\u{7}\u{8}\u{1b}\u{1b}\u{c}\n\r\t\u{b}"
+        );
         assert_eq!(ansi_c(r"\\")?, "\\");
         assert_eq!(ansi_c(r"\'")?, "'");
         assert_eq!(ansi_c(r#"\""#)?, "\"");
@@ -3250,7 +3335,9 @@ mod tests {
     fn no_ansi_c_body_panics_the_decoder() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut rand = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as u32
         };
         // Oversample what the walk turns on: backslashes, the escapes that
@@ -3258,8 +3345,14 @@ mod tests {
         let pick = |r: u32| -> char {
             match r % 10 {
                 0..=2 => '\\',
-                3 => "cxuU01234567".chars().nth((r >> 8) as usize % 12).unwrap_or('c'),
-                4 => "89abcdefABCDEF".chars().nth((r >> 8) as usize % 14).unwrap_or('a'),
+                3 => "cxuU01234567"
+                    .chars()
+                    .nth((r >> 8) as usize % 12)
+                    .unwrap_or('c'),
+                4 => "89abcdefABCDEF"
+                    .chars()
+                    .nth((r >> 8) as usize % 14)
+                    .unwrap_or('a'),
                 5 => '\'',
                 6 => ['é', '日', '\u{ff}', '\u{10fffd}'][(r >> 8) as usize % 4],
                 _ => char::from_u32(0x20 + (r >> 8) % 0x60).unwrap_or('a'),
@@ -3389,7 +3482,10 @@ mod tests {
     fn ansi_c_quoting_is_not_a_construct_inside_double_quotes() -> Syn<()> {
         // bash leaves `$'x'` as those four characters there, measured.
         let ws = words("echo \"$'a\\tb'\"")?;
-        assert_eq!(nth(&ws, 1)?.delimiter().map(|(t, _)| t), Some("$'a\\tb'".into()));
+        assert_eq!(
+            nth(&ws, 1)?.delimiter().map(|(t, _)| t),
+            Some("$'a\\tb'".into())
+        );
         Ok(())
     }
 

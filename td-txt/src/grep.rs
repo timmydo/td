@@ -67,8 +67,8 @@
 
 use crate::regex::{Error, Filter, OnBudget, Options, Regex};
 use crate::util::{
-    byte_in, errmsg, name_in, number, path_bytes, posixly_correct, print_line, read_input,
-    open_search, records, walk, DeviceRule, Diag, Input, Out, Records, VERSION,
+    byte_in, errmsg, name_in, number, open_search, path_bytes, posixly_correct, print_line,
+    read_input, records, walk, DeviceRule, Diag, Input, Out, Records, VERSION,
 };
 
 /// How many significant digits `-NUM` takes before refusing the run. GNU's own
@@ -129,7 +129,12 @@ impl Operand {
     /// An operand as WRITTEN, which is every input that did not come from a walk.
     /// Its type is not read here: an operand is opened before it is judged.
     fn named(name: Vec<u8>) -> Self {
-        Self { name, from_walk: false, command_line: true, device: false }
+        Self {
+            name,
+            from_walk: false,
+            command_line: true,
+            device: false,
+        }
     }
 }
 
@@ -717,9 +722,10 @@ fn gnu_runs_regex_matcher(conf: &Conf, pats: &[&Vec<u8>]) -> bool {
 /// its own `fstat` fails.
 fn stdout_is_dev_null() -> bool {
     use std::os::unix::fs::MetadataExt;
-    let (Ok(out), Ok(null)) =
-        (std::fs::metadata("/proc/self/fd/1"), std::fs::metadata("/dev/null"))
-    else {
+    let (Ok(out), Ok(null)) = (
+        std::fs::metadata("/proc/self/fd/1"),
+        std::fs::metadata("/dev/null"),
+    ) else {
         return false;
     };
     out.dev() == null.dev() && out.ino() == null.ino()
@@ -756,7 +762,11 @@ fn stray_note(b: u8) -> String {
 /// the fixed-string matcher? Read over the patterns joined by newlines, as GNU
 /// reads them, so a `\` before the join is the `\<newline>` that refuses.
 fn all_literal(ere: bool, pats: &[&Vec<u8>]) -> bool {
-    let joined = pats.iter().map(|p| p.as_slice()).collect::<Vec<_>>().join(&b'\n');
+    let joined = pats
+        .iter()
+        .map(|p| p.as_slice())
+        .collect::<Vec<_>>()
+        .join(&b'\n');
     let mut i = 0;
     while let Some(&c) = joined.get(i) {
         match c {
@@ -767,8 +777,18 @@ fn all_literal(ere: bool, pats: &[&Vec<u8>]) -> bool {
                 match joined.get(i + 1) {
                     // An operator or an assertion in both dialects.
                     Some(
-                        b'\n' | b'B' | b'S' | b'W' | b'\'' | b'<' | b'b' | b's' | b'w' | b'`'
-                        | b'>' | b'1'..=b'9',
+                        b'\n'
+                        | b'B'
+                        | b'S'
+                        | b'W'
+                        | b'\''
+                        | b'<'
+                        | b'b'
+                        | b's'
+                        | b'w'
+                        | b'`'
+                        | b'>'
+                        | b'1'..=b'9',
                     ) => return false,
                     // A BRE's operators, where an ERE reads the escape as making
                     // them literal. `\)` rides with them so GEAcompile can
@@ -812,7 +832,8 @@ enum Want {
 /// lets the scan rule out a start position without matching there (see `regex::Filter`),
 /// so both callers must agree on it — hence one function rather than two copies.
 fn word_start_ok(line: &[u8], s: usize) -> bool {
-    s.checked_sub(1).is_none_or(|i| line.get(i).is_none_or(|b| !is_word(*b)))
+    s.checked_sub(1)
+        .is_none_or(|i| line.get(i).is_none_or(|b| !is_word(*b)))
 }
 
 /// The other half: the byte AFTER the span must not be a word byte either. Past the
@@ -831,7 +852,11 @@ fn eq_fold(a: u8, b: u8, icase: bool) -> bool {
 /// Leftmost occurrence of `needle` in `hay` at or after `from`.
 fn locate(hay: &[u8], needle: &[u8], from: usize, icase: bool) -> Option<(usize, usize)> {
     if needle.is_empty() {
-        return if from <= hay.len() { Some((from, from)) } else { None };
+        return if from <= hay.len() {
+            Some((from, from))
+        } else {
+            None
+        };
     }
     let mut start = from;
     while start + needle.len() <= hay.len() {
@@ -944,7 +969,10 @@ impl Grep {
                         // the byte BEFORE it, so the scan can rule one out without
                         // matching — see `Filter`.
                         let start = |s: usize| word_start_ok(line, s);
-                        let filter = Filter { span: &span, start: &start };
+                        let filter = Filter {
+                            span: &span,
+                            start: &start,
+                        };
                         // Searching every end costs more than testing one, so a
                         // pathological `-w` pattern can exhaust the budget where the
                         // one-span-per-start algorithm this replaced would have
@@ -1082,7 +1110,9 @@ impl Grep {
     fn selects(&self, line: &[u8]) -> Result<bool, String> {
         // Selection asks only WHETHER the line matches, so a budget exhausted with
         // a match in hand still answers it. `-o` below consumes the span and cannot.
-        let hit = self.match_at(line, 0, OnBudget::Existence, Want::Selection)?.is_some();
+        let hit = self
+            .match_at(line, 0, OnBudget::Existence, Want::Selection)?
+            .is_some();
         Ok(hit != self.conf.invert)
     }
 }
@@ -1463,7 +1493,10 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             // `Syntax::Fixed` guard is for rather than the lint.
             Some(p) => {
                 let skip = conf.syntax != Syntax::Fixed && p.starts_with(b"\\-");
-                push_expr(&mut patterns, p.get(usize::from(skip)..).unwrap_or_default());
+                push_expr(
+                    &mut patterns,
+                    p.get(usize::from(skip)..).unwrap_or_default(),
+                );
             }
             None => {
                 usage();
@@ -1634,7 +1667,12 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     // GNU decides the name from the OPERANDS, not from how many files the walk
     // turned them into.
     let show_name = conf.with_filename.unwrap_or(files.len() > 1 || descended);
-    let grep = Grep { conf, pats, only_empty, regex_matcher };
+    let grep = Grep {
+        conf,
+        pats,
+        only_empty,
+        regex_matcher,
+    };
     // Fallible because the sink DUPLICATES descriptor 1; grep's own error status.
     let mut out = match Out::new() {
         Ok(out) => out,
@@ -1670,8 +1708,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             true if op.command_line => DeviceRule::Descriptor,
             true => DeviceRule::Walked(op.device),
         };
-        let input =
-            match open_search(path, from_walk, grep.conf.dirs == Dirs::Skip, rule) {
+        let input = match open_search(path, from_walk, grep.conf.dirs == Dirs::Skip, rule) {
             Ok(Some(input)) => input,
             // `-d skip` passes over a directory WITHOUT A WORD: no diagnostic
             // and no effect on the status, which is what distinguishes it from
@@ -2025,8 +2062,11 @@ fn binary_files_arg(value: &[u8]) -> Option<bool> {
 /// message is the same either way -- and it exits 1, not the 2 every other usage
 /// error uses.
 fn dirs_arg(value: &[u8]) -> Option<Dirs> {
-    const NAMES: [(&[u8], Dirs); 3] =
-        [(b"read", Dirs::Read), (b"recurse", Dirs::Recurse), (b"skip", Dirs::Skip)];
+    const NAMES: [(&[u8], Dirs); 3] = [
+        (b"read", Dirs::Read),
+        (b"recurse", Dirs::Recurse),
+        (b"skip", Dirs::Skip),
+    ];
     match argmatch(value, &NAMES) {
         Ok(action) => Some(action),
         Err(no) => complain_dirs(value, matches!(no, NoMatch::Ambiguous)),
@@ -2064,7 +2104,8 @@ fn parse_long(
     };
     let count = |value: Option<&[u8]>| -> Result<usize, LongErr> {
         let v = need(value)?;
-        parse_count(&v).ok_or_else(|| LongErr::Message(name_in("", &v, ": invalid context length argument")))
+        parse_count(&v)
+            .ok_or_else(|| LongErr::Message(name_in("", &v, ": invalid context length argument")))
     };
     match name {
         b"extended-regexp" => {
@@ -2142,11 +2183,7 @@ fn parse_long(
         // at all differs and is the module doc's. The usage block goes with it
         // because this is an OPTION error, where the value errors above are
         // GNU's `die()` and print none.
-        b"binary"
-        | b"initial-tab"
-        | b"perl-regexp"
-        | b"no-ignore-case"
-        | b"line-buffered" => {
+        b"binary" | b"initial-tab" | b"perl-regexp" | b"no-ignore-case" | b"line-buffered" => {
             errb(&name_in("unsupported option '--", name, "'"));
             usage();
             return Err(LongErr::Handled);
@@ -2288,7 +2325,9 @@ fn parse_num(v: &[u8]) -> Option<Num> {
         // The guard above makes every byte a digit, so the subtraction cannot
         // wrap; it saturates rather than `-` only because a bare `-` would
         // panic in debug if that guard were ever widened.
-        value = value.saturating_mul(10).saturating_add(u64::from(b.saturating_sub(b'0')));
+        value = value
+            .saturating_mul(10)
+            .saturating_add(u64::from(b.saturating_sub(b'0')));
     }
     Some(Num { negative, value })
 }
@@ -2401,7 +2440,10 @@ fn compile(conf: &Conf, lines: &[Vec<u8>]) -> Result<Patterns, String> {
     let mut res = Vec::with_capacity(lines.len());
     let wrapped = conf.whole_line || conf.word;
     for (i, line) in lines.iter().enumerate() {
-        let opts = Options { lex_continues: wrapped || i + 1 < lines.len(), ..opts };
+        let opts = Options {
+            lex_continues: wrapped || i + 1 < lines.len(),
+            ..opts
+        };
         res.push(Regex::compile(line, opts).map_err(|e| e.msg)?);
     }
     Ok(Patterns::Regex(res))
@@ -2660,7 +2702,11 @@ impl Before {
     /// refused), and reserving that many would abort before the first line was
     /// read. The ring can never need more slots than the file has lines.
     fn new(cap: usize) -> Self {
-        Self { cap, slots: Vec::new(), head: 0 }
+        Self {
+            cap,
+            slots: Vec::new(),
+            head: 0,
+        }
     }
 
     /// `Err` is an allocation that failed. `-B N` retains N whole records, so
@@ -2702,7 +2748,9 @@ impl Before {
     ) -> impl Iterator<Item = &(Vec<u8>, bool, u64, u64)> {
         let n = self.slots.len();
         let base = if n < self.cap { 0 } else { self.head };
-        let skip = usize::try_from(first.saturating_sub(oldest)).unwrap_or(usize::MAX).min(n);
+        let skip = usize::try_from(first.saturating_sub(oldest))
+            .unwrap_or(usize::MAX)
+            .min(n);
         (skip..n).filter_map(move |i| self.slots.get(base.saturating_add(i) % n.max(1)))
     }
 
@@ -2764,10 +2812,8 @@ fn search_file(
     // A binary file's MATCHING LINES are replaced by a notice — so `-o`, which
     // prints matched text, is suppressed too. `-c`/`-l`/`-L`/`-q` print no line
     // content at all, so they run normally and emit no notice.
-    let counts_only = grep.conf.count
-        || grep.conf.files_with
-        || grep.conf.files_without
-        || grep.conf.quiet;
+    let counts_only =
+        grep.conf.count || grep.conf.files_with || grep.conf.files_without || grep.conf.quiet;
     let mut count: u64 = 0;
     // How far the output reaches, as a LINE NUMBER: the last line printed OR
     // covered by context, 0 for none. `-o` drops context lines but not the range
@@ -2783,7 +2829,9 @@ fn search_file(
     // trailing context, and the common `-m` stop takes the other one.
     let mut stop_at: Option<u64> = None;
 
-    let io = |r: std::io::Result<()>| -> Result<(), String> { r.map_err(|e| format!("write error: {}", errmsg(&e))) };
+    let io = |r: std::io::Result<()>| -> Result<(), String> {
+        r.map_err(|e| format!("write error: {}", errmsg(&e)))
+    };
     if grep.settled() {
         // Nothing can match, but the operand was OPENED, and only a READ
         // discovers that it cannot be read -- `grep -L -m 0 a DIR f` reports
@@ -2844,8 +2892,10 @@ fn search_file(
             let replay = dropped.min(before_cap as u64);
             // They occupy `lineno + 1 ..= lineno + dropped`, so the tail of that
             // range starts one PAST the subtraction.
-            let first =
-                lineno.saturating_add(dropped).saturating_sub(replay).saturating_add(1);
+            let first = lineno
+                .saturating_add(dropped)
+                .saturating_sub(replay)
+                .saturating_add(1);
             // Their BYTES are the tail of the run, which ended where this
             // record begins -- one byte each, being a separator and nothing else.
             let first_at = rec.offset().saturating_sub(replay);
@@ -2935,12 +2985,18 @@ fn search_file(
                     for (ctx, ctx_term, no, ctx_at) in window.iter_from(ctx_start, oldest) {
                         if grep.conf.only {
                             if grep.conf.prints_context_spans() {
-                                let w = At { no: Some(*no), byte: Some(*ctx_at) };
+                                let w = At {
+                                    no: Some(*no),
+                                    byte: Some(*ctx_at),
+                                };
                                 write_spans(grep, out, display, show_name, w, b'-', ctx)?;
                             }
                             continue;
                         }
-                        let w = At { no: Some(*no), byte: Some(*ctx_at) };
+                        let w = At {
+                            no: Some(*no),
+                            byte: Some(*ctx_at),
+                        };
                         io(prefix(out, grep, display, show_name, w, b'-'))?;
                         // Only the LAST record can lack a separator, so this is
                         // the same test the whole-file form spelled as "or there
@@ -2950,11 +3006,17 @@ fn search_file(
                 }
                 if grep.conf.only {
                     if grep.conf.prints_selected_spans() {
-                        let w = At { no: Some(lineno), byte: Some(at) };
+                        let w = At {
+                            no: Some(lineno),
+                            byte: Some(at),
+                        };
                         write_spans(grep, out, display, show_name, w, b':', line)?;
                     }
                 } else {
-                    let w = At { no: Some(lineno), byte: Some(at) };
+                    let w = At {
+                        no: Some(lineno),
+                        byte: Some(at),
+                    };
                     io(prefix(out, grep, display, show_name, w, b':'))?;
                     // GNU terminates every line it prints, including a final
                     // input line that carried no newline of its own.
@@ -2976,11 +3038,17 @@ fn search_file(
         } else if pending_after > 0 && !grep.conf.count {
             if grep.conf.only {
                 if grep.conf.prints_context_spans() {
-                    let w = At { no: Some(lineno), byte: Some(at) };
+                    let w = At {
+                        no: Some(lineno),
+                        byte: Some(at),
+                    };
                     write_spans(grep, out, display, show_name, w, b'-', line)?;
                 }
             } else {
-                let w = At { no: Some(lineno), byte: Some(at) };
+                let w = At {
+                    no: Some(lineno),
+                    byte: Some(at),
+                };
                 io(prefix(out, grep, display, show_name, w, b'-'))?;
                 write_body(grep, out, line, false, sep, true)?;
             }
@@ -2990,7 +3058,11 @@ fn search_file(
         if out.is_broken() {
             break;
         }
-        if keep_window && window.push(rec.line(), rec.terminated(), lineno, at).is_err() {
+        if keep_window
+            && window
+                .push(rec.line(), rec.terminated(), lineno, at)
+                .is_err()
+        {
             if !grep.conf.no_messages {
                 errb(&name_in("", display, ": out of memory"));
             }
@@ -3009,7 +3081,17 @@ fn search_file(
     // `-l`/`-L` outrank `-c` the same way: GNU goes quiet for everything but the
     // NAME, so `grep -cl a f` prints `f` and not the count before it.
     if grep.conf.count && !grep.conf.files_with && !grep.conf.files_without {
-        io(prefix(out, grep, display, show_name, At { no: None, byte: None }, b':'))?;
+        io(prefix(
+            out,
+            grep,
+            display,
+            show_name,
+            At {
+                no: None,
+                byte: None,
+            },
+            b':',
+        ))?;
         io(out.write(&number(count)))?;
         io(out.write(b"\n"))?;
     }
@@ -3076,21 +3158,37 @@ mod tests {
         }
         let pats = compile(&conf, &patterns).unwrap();
         let only_empty = !patterns.is_empty() && patterns.iter().all(Vec::is_empty);
-        let regex_matcher =
-            gnu_runs_regex_matcher(&conf, &deduped(&patterns));
-        Grep { conf, pats, only_empty, regex_matcher }
+        let regex_matcher = gnu_runs_regex_matcher(&conf, &deduped(&patterns));
+        Grep {
+            conf,
+            pats,
+            only_empty,
+            regex_matcher,
+        }
     }
 
     #[test]
     fn word_option_rejects_a_match_inside_a_word() {
-        let g = grep_with(Conf { word: true, ..conf() }, &["cat"]);
+        let g = grep_with(
+            Conf {
+                word: true,
+                ..conf()
+            },
+            &["cat"],
+        );
         assert!(g.selects(b"the cat sat").unwrap());
         assert!(!g.selects(b"concatenate").unwrap());
     }
 
     #[test]
     fn word_option_retries_at_a_later_start() {
-        let g = grep_with(Conf { word: true, ..conf() }, &["cat"]);
+        let g = grep_with(
+            Conf {
+                word: true,
+                ..conf()
+            },
+            &["cat"],
+        );
         assert!(g.selects(b"concatenate cat").unwrap());
     }
 
@@ -3099,16 +3197,32 @@ mod tests {
     /// the first position and called `a.` no match.
     #[test]
     fn word_option_scans_for_a_word_bounded_gap_under_an_empty_pattern() {
-        let g = grep_with(Conf { word: true, ..conf() }, &[""]);
+        let g = grep_with(
+            Conf {
+                word: true,
+                ..conf()
+            },
+            &[""],
+        );
         // The only word-bounded gap in `a.` is the one after the dot.
-        assert_eq!(g.match_at(b"a.", 0, OnBudget::Fail, Want::Selection).unwrap(), Some((2, 2)));
+        assert_eq!(
+            g.match_at(b"a.", 0, OnBudget::Fail, Want::Selection)
+                .unwrap(),
+            Some((2, 2))
+        );
         assert!(g.selects(b"a.").unwrap());
         assert!(g.selects(b"a ").unwrap());
         // Every gap in `ab`/`a.b` touches a word character.
         assert!(!g.selects(b"ab").unwrap());
         assert!(!g.selects(b"a.b").unwrap());
         // `-x` is unaffected: an empty pattern still selects only the empty line.
-        let x = grep_with(Conf { whole_line: true, ..conf() }, &[""]);
+        let x = grep_with(
+            Conf {
+                whole_line: true,
+                ..conf()
+            },
+            &[""],
+        );
         assert!(x.selects(b"").unwrap());
         assert!(!x.selects(b"a").unwrap());
     }
@@ -3118,20 +3232,46 @@ mod tests {
     /// greedy one — or empty. Testing only the greedy span reported no match here.
     #[test]
     fn word_option_retries_a_shorter_span_at_the_same_start() {
-        let g = grep_with(Conf { word: true, ..conf() }, &[r"\.*"]);
+        let g = grep_with(
+            Conf {
+                word: true,
+                ..conf()
+            },
+            &[r"\.*"],
+        );
         // Greedy at 0 is `..`, not word-bounded (`a` follows); `.` is.
-        assert_eq!(g.match_at(b"..a", 0, OnBudget::Fail, Want::Selection).unwrap(), Some((0, 1)));
+        assert_eq!(
+            g.match_at(b"..a", 0, OnBudget::Fail, Want::Selection)
+                .unwrap(),
+            Some((0, 1))
+        );
         // Greedy at 0 is `.`, not word-bounded; only the EMPTY span is.
-        assert_eq!(g.match_at(b".a", 0, OnBudget::Fail, Want::Selection).unwrap(), Some((0, 0)));
+        assert_eq!(
+            g.match_at(b".a", 0, OnBudget::Fail, Want::Selection)
+                .unwrap(),
+            Some((0, 0))
+        );
         // ...and that span is where the two questions part company: GNU's retry
         // loop rejects an empty SHRINK, so the line selects with no span to print.
-        assert_eq!(g.match_at(b".a", 0, OnBudget::Fail, Want::Span).unwrap(), None);
+        assert_eq!(
+            g.match_at(b".a", 0, OnBudget::Fail, Want::Span).unwrap(),
+            None
+        );
         // Where the shorter span is not empty both agree on it.
-        assert_eq!(g.match_at(b"..a", 0, OnBudget::Fail, Want::Span).unwrap(), Some((0, 1)));
+        assert_eq!(
+            g.match_at(b"..a", 0, OnBudget::Fail, Want::Span).unwrap(),
+            Some((0, 1))
+        );
         assert!(g.selects(b"..a").unwrap());
         assert!(g.selects(b".a").unwrap());
         // A word character on either side blocks the empty span too.
-        let g2 = grep_with(Conf { word: true, ..conf() }, &["a*"]);
+        let g2 = grep_with(
+            Conf {
+                word: true,
+                ..conf()
+            },
+            &["a*"],
+        );
         assert!(!g2.selects(b"ab").unwrap());
     }
 
@@ -3141,8 +3281,18 @@ mod tests {
     /// begin at a word edge, never inside one.
     #[test]
     fn word_option_starts_only_at_a_word_edge() {
-        let g = grep_with(Conf { word: true, ..conf() }, &["at"]);
-        assert_eq!(g.match_at(b"cat at", 0, OnBudget::Fail, Want::Selection).unwrap(), Some((4, 6)));
+        let g = grep_with(
+            Conf {
+                word: true,
+                ..conf()
+            },
+            &["at"],
+        );
+        assert_eq!(
+            g.match_at(b"cat at", 0, OnBudget::Fail, Want::Selection)
+                .unwrap(),
+            Some((4, 6))
+        );
         assert!(!g.selects(b"cat cat").unwrap());
     }
 
@@ -3156,7 +3306,13 @@ mod tests {
         let line = "key=val ".repeat(80);
         let costly = r"[^:]*.*a\(ab\)*a*";
         for pats in [vec!["key", costly], vec![costly, "key"]] {
-            let g = grep_with(Conf { word: true, ..conf() }, &pats);
+            let g = grep_with(
+                Conf {
+                    word: true,
+                    ..conf()
+                },
+                &pats,
+            );
             assert!(g.selects(line.as_bytes()).unwrap(), "order {pats:?}");
         }
     }
@@ -3168,7 +3324,13 @@ mod tests {
     /// and this one does not finish.
     #[test]
     fn word_option_refuses_rather_than_guessing_when_out_of_budget() {
-        let g = grep_with(Conf { word: true, ..conf() }, &[r"[^:]*.*a\(ab\)*a*"]);
+        let g = grep_with(
+            Conf {
+                word: true,
+                ..conf()
+            },
+            &[r"[^:]*.*a\(ab\)*a*"],
+        );
         let line = "key=val ".repeat(80);
         let err = g.selects(line.as_bytes()).unwrap_err();
         assert!(err.contains("too complex"), "{err}");
@@ -3176,21 +3338,39 @@ mod tests {
 
     #[test]
     fn line_option_requires_the_whole_line() {
-        let g = grep_with(Conf { whole_line: true, ..conf() }, &["a*"]);
+        let g = grep_with(
+            Conf {
+                whole_line: true,
+                ..conf()
+            },
+            &["a*"],
+        );
         assert!(g.selects(b"aaa").unwrap());
         assert!(!g.selects(b"aaab").unwrap());
     }
 
     #[test]
     fn invert_flips_selection() {
-        let g = grep_with(Conf { invert: true, ..conf() }, &["x"]);
+        let g = grep_with(
+            Conf {
+                invert: true,
+                ..conf()
+            },
+            &["x"],
+        );
         assert!(g.selects(b"abc").unwrap());
         assert!(!g.selects(b"xbc").unwrap());
     }
 
     #[test]
     fn fixed_strings_take_no_metacharacters() {
-        let g = grep_with(Conf { syntax: Syntax::Fixed, ..conf() }, &["a.c"]);
+        let g = grep_with(
+            Conf {
+                syntax: Syntax::Fixed,
+                ..conf()
+            },
+            &["a.c"],
+        );
         assert!(g.selects(b"xa.cy").unwrap());
         assert!(!g.selects(b"abc").unwrap());
     }
@@ -3206,8 +3386,16 @@ mod tests {
     #[test]
     fn only_matching_reports_leftmost_longest_spans() {
         let g = grep_with(conf(), &["ab*"]);
-        assert_eq!(g.match_at(b"xabb yab", 0, OnBudget::Fail, Want::Span).unwrap(), Some((1, 4)));
-        assert_eq!(g.match_at(b"xabb yab", 4, OnBudget::Fail, Want::Span).unwrap(), Some((6, 8)));
+        assert_eq!(
+            g.match_at(b"xabb yab", 0, OnBudget::Fail, Want::Span)
+                .unwrap(),
+            Some((1, 4))
+        );
+        assert_eq!(
+            g.match_at(b"xabb yab", 4, OnBudget::Fail, Want::Span)
+                .unwrap(),
+            Some((6, 8))
+        );
     }
 
     #[test]
@@ -3237,7 +3425,10 @@ mod tests {
     fn parse_num_saturates_rather_than_failing() {
         assert_eq!(parse_count(b"18446744073709551616"), Some(usize::MAX));
         assert_eq!(parse_count(b"99999999999999999999999999"), Some(usize::MAX));
-        assert_eq!(parse_max_count(b"18446744073709551616"), Some(Some(u64::MAX)));
+        assert_eq!(
+            parse_max_count(b"18446744073709551616"),
+            Some(Some(u64::MAX))
+        );
     }
 
     #[test]
@@ -3253,7 +3444,18 @@ mod tests {
 
     #[test]
     fn parse_num_refuses_what_is_not_a_plain_decimal() {
-        for bad in [&b"++1"[..], b"+-1", b"- 1", b"0x10", b"1e2", b"1_0", b"+", b"-", b".", b" "] {
+        for bad in [
+            &b"++1"[..],
+            b"+-1",
+            b"- 1",
+            b"0x10",
+            b"1e2",
+            b"1_0",
+            b"+",
+            b"-",
+            b".",
+            b" ",
+        ] {
             assert_eq!(parse_count(bad), None, "{bad:?}");
         }
         // Leading zeros are decimal, not octal.
@@ -3269,7 +3471,10 @@ mod tests {
         let names: [(&[u8], u8); 3] = [(b"skip-all", 1), (b"skip-any", 2), (b"skip", 3)];
         assert_eq!(argmatch(b"skip", &names).ok(), Some(3));
         // Still ambiguous when nothing matches exactly, and order-independent.
-        assert!(matches!(argmatch(b"skip-a", &names), Err(NoMatch::Ambiguous)));
+        assert!(matches!(
+            argmatch(b"skip-a", &names),
+            Err(NoMatch::Ambiguous)
+        ));
         assert!(matches!(argmatch(b"", &names), Err(NoMatch::Ambiguous)));
         assert_eq!(argmatch(b"skip-al", &names).ok(), Some(1));
         assert!(matches!(argmatch(b"nope", &names), Err(NoMatch::Invalid)));
@@ -3291,11 +3496,17 @@ mod tests {
     fn the_newest_matching_group_decides_and_the_oldest_sets_the_default() {
         let inc = globs(&[(Pick::Include, "*.c")]);
         assert!(inc.selects(b"a.c", false), "the glob matches");
-        assert!(!inc.selects(b"a.h", false), "no group matches, and the oldest is an include");
+        assert!(
+            !inc.selects(b"a.h", false),
+            "no group matches, and the oldest is an include"
+        );
 
         let exc = globs(&[(Pick::Exclude, "*.c")]);
         assert!(!exc.selects(b"a.c", false));
-        assert!(exc.selects(b"a.h", false), "the oldest is an exclude, so the default is to search");
+        assert!(
+            exc.selects(b"a.h", false),
+            "the oldest is an exclude, so the default is to search"
+        );
 
         // The same two options in each order. `a.c` matches BOTH, so only the
         // group order can decide it -- and it decides opposite ways.
@@ -3321,9 +3532,15 @@ mod tests {
             (Pick::Exclude, "*.h"),
         ]);
         assert_eq!(g.groups.len(), 2, "the two excludes are one group, not two");
-        assert!(g.selects(b"keep.c", false), "past the exclude group to the include");
+        assert!(
+            g.selects(b"keep.c", false),
+            "past the exclude group to the include"
+        );
         assert!(!g.selects(b"x.h", false), "named by the newest group");
-        assert!(!g.selects(b"other.txt", false), "no group names it, and the oldest is an include");
+        assert!(
+            !g.selects(b"other.txt", false),
+            "no group names it, and the oldest is an include"
+        );
     }
 
     /// A COMMAND-LINE name is matched whole and then at every `/`; a name the
@@ -3332,8 +3549,14 @@ mod tests {
     #[test]
     fn a_command_line_name_is_matched_at_every_slash_and_a_walked_one_is_not() {
         let g = globs(&[(Pick::Include, "low/c.c")]);
-        assert!(g.selects(b"deep/mid/low/c.c", true), "a suffix at a component");
-        assert!(!g.selects(b"deep/mid/low/c.c", false), "the walk offers `c.c` alone");
+        assert!(
+            g.selects(b"deep/mid/low/c.c", true),
+            "a suffix at a component"
+        );
+        assert!(
+            !g.selects(b"deep/mid/low/c.c", false),
+            "the walk offers `c.c` alone"
+        );
 
         // The other direction, and the one that tells the walk's rule from a
         // whole-path compare: a bare last component answers for a walked name.
@@ -3341,7 +3564,10 @@ mod tests {
         // left the test GREEN -- the case above passes either way.
         let base = globs(&[(Pick::Include, "c.c")]);
         assert!(base.selects(b"deep/mid/low/c.c", false), "matched on `c.c`");
-        assert!(base.selects(b"deep/mid/low/c.c", true), "the last suffix is that same `c.c`");
+        assert!(
+            base.selects(b"deep/mid/low/c.c", true),
+            "the last suffix is that same `c.c`"
+        );
 
         let partial = globs(&[(Pick::Include, "ow/c.c")]);
         assert!(
@@ -3364,5 +3590,4 @@ mod tests {
         assert!(g.selects(b"anything", true));
         assert!(g.selects(b"anything", false));
     }
-
 }

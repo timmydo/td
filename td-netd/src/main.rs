@@ -420,13 +420,7 @@ fn make_xid(mac: [u8; 6]) -> u32 {
 /// tolerates a lost request or a link a moment slow to carry (e.g. an E1000 whose
 /// carrier lags); a non-matching broadcast is drained within the current window
 /// rather than costing a retransmit.
-fn dhcp_round(
-    sock: &UdpSocket,
-    pkt: &[u8],
-    xid: u32,
-    want: u8,
-    tries: u32,
-) -> io::Result<Lease> {
+fn dhcp_round(sock: &UdpSocket, pkt: &[u8], xid: u32, want: u8, tries: u32) -> io::Result<Lease> {
     let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 67));
     // Room for an option-heavy reply; recv_from truncates anything larger, which
     // would then fail to parse.
@@ -467,13 +461,7 @@ fn dhcp_configure(mac: [u8; 6]) -> io::Result<Lease> {
     let discover = build_dhcp(DHCP_DISCOVER, mac, xid, None, None);
     let offer = dhcp_round(&sock, &discover, xid, DHCP_OFFER, 3)?;
 
-    let request = build_dhcp(
-        DHCP_REQUEST,
-        mac,
-        xid,
-        Some(offer.yiaddr),
-        offer.server_id,
-    );
+    let request = build_dhcp(DHCP_REQUEST, mac, xid, Some(offer.yiaddr), offer.server_id);
     let mut ack = dhcp_round(&sock, &request, xid, DHCP_ACK, 3)?;
     // Prefer the OFFER's config for any option the ACK omits (some servers send a
     // terse ACK), so the applied lease is complete.
@@ -930,7 +918,13 @@ mod tests {
     #[test]
     fn rtentry_field_offsets() {
         let dev = CString::new("eth0").unwrap();
-        let rt = build_rtentry([1, 2, 3, 4], [255, 255, 255, 0], [10, 0, 2, 2], RTF_UP | RTF_GATEWAY, Some(&dev));
+        let rt = build_rtentry(
+            [1, 2, 3, 4],
+            [255, 255, 255, 0],
+            [10, 0, 2, 2],
+            RTF_UP | RTF_GATEWAY,
+            Some(&dev),
+        );
         // rt_dst / rt_gateway / rt_genmask carry AF_INET + their addresses.
         assert_eq!(&rt[RT_DST..RT_DST + 2], &[2, 0]);
         assert_eq!(&rt[RT_DST + 4..RT_DST + 8], &[1, 2, 3, 4]);
@@ -939,18 +933,36 @@ mod tests {
         // rt_flags (host order) = RTF_UP|RTF_GATEWAY.
         assert_eq!(u16::from_ne_bytes([rt[RT_FLAGS], rt[RT_FLAGS + 1]]), 0x0003);
         // rt_dev pointer is non-null.
-        assert_ne!(usize::from_ne_bytes(rt[RT_DEV..RT_DEV + 8].try_into().unwrap()), 0);
+        assert_ne!(
+            usize::from_ne_bytes(rt[RT_DEV..RT_DEV + 8].try_into().unwrap()),
+            0
+        );
     }
 
     #[test]
     fn default_route_has_null_dev() {
-        let rt = build_rtentry([0, 0, 0, 0], [0, 0, 0, 0], [10, 0, 2, 2], RTF_UP | RTF_GATEWAY, None);
-        assert_eq!(usize::from_ne_bytes(rt[RT_DEV..RT_DEV + 8].try_into().unwrap()), 0);
+        let rt = build_rtentry(
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [10, 0, 2, 2],
+            RTF_UP | RTF_GATEWAY,
+            None,
+        );
+        assert_eq!(
+            usize::from_ne_bytes(rt[RT_DEV..RT_DEV + 8].try_into().unwrap()),
+            0
+        );
     }
 
     #[test]
     fn dhcp_discover_shape() {
-        let pkt = build_dhcp(DHCP_DISCOVER, [0x52, 0x54, 0, 0x12, 0x34, 0x56], 0xdeadbeef, None, None);
+        let pkt = build_dhcp(
+            DHCP_DISCOVER,
+            [0x52, 0x54, 0, 0x12, 0x34, 0x56],
+            0xdeadbeef,
+            None,
+            None,
+        );
         assert_eq!(&pkt[..4], &[1, 1, 6, 0]); // op/htype/hlen/hops
         assert_eq!(&pkt[4..8], &0xdeadbeefu32.to_be_bytes()); // xid
         assert_eq!(&pkt[10..12], &[0x80, 0x00]); // broadcast flag
@@ -963,7 +975,13 @@ mod tests {
 
     #[test]
     fn dhcp_request_carries_requested_ip_and_server_id() {
-        let pkt = build_dhcp(DHCP_REQUEST, [1, 2, 3, 4, 5, 6], 7, Some([10, 0, 2, 15]), Some([10, 0, 2, 2]));
+        let pkt = build_dhcp(
+            DHCP_REQUEST,
+            [1, 2, 3, 4, 5, 6],
+            7,
+            Some([10, 0, 2, 15]),
+            Some([10, 0, 2, 2]),
+        );
         // The option TLVs appear in the payload.
         let opts = &pkt[240..];
         // 53,1,3 then 50,4,ip then 54,4,sid.
@@ -1041,7 +1059,7 @@ mod tests {
         assert_eq!(&q[..2], &[0x12, 0x34]); // id
         assert_eq!(&q[2..4], &[0x01, 0x00]); // RD flag
         assert_eq!(&q[4..6], &[0x00, 0x01]); // qdcount 1
-        // qname: 1 'a' 2 'b' 'c' then root 0
+                                             // qname: 1 'a' 2 'b' 'c' then root 0
         assert_eq!(&q[12..17], &[1, b'a', 2, b'b', b'c']);
         assert_eq!(q[17], 0); // root label
         assert_eq!(&q[18..22], &[0, 1, 0, 1]); // A / IN
@@ -1062,7 +1080,7 @@ mod tests {
         r.extend_from_slice(&1u16.to_be_bytes()); // qd
         r.extend_from_slice(&1u16.to_be_bytes()); // an
         r.extend_from_slice(&[0, 0, 0, 0]); // ns/ar
-        // question: 3 'w' 'w' 'w' 0, A, IN
+                                            // question: 3 'w' 'w' 'w' 0, A, IN
         r.extend_from_slice(&[3, b'w', b'w', b'w', 0]);
         r.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
         r.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
@@ -1156,7 +1174,10 @@ mod tests {
 
     #[test]
     fn ip_list_splits_and_drops_partial() {
-        assert_eq!(ip_list(&[10, 0, 2, 2, 8, 8, 8, 8]), vec![[10, 0, 2, 2], [8, 8, 8, 8]]);
+        assert_eq!(
+            ip_list(&[10, 0, 2, 2, 8, 8, 8, 8]),
+            vec![[10, 0, 2, 2], [8, 8, 8, 8]]
+        );
         assert_eq!(ip_list(&[10, 0, 2, 2, 9, 9]), vec![[10, 0, 2, 2]]);
         assert!(ip_list(&[]).is_empty());
     }

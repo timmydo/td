@@ -273,7 +273,10 @@ pub enum Sent {
     /// Both, because the refusal has to ask about one and print the other, and
     /// resolving the name here rather than at the answer keeps `apply` from
     /// having to invent one for a window the scene no longer names.
-    FollowsParent { root: SurfaceKey, named: u64 },
+    FollowsParent {
+        root: SurfaceKey,
+        named: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -490,7 +493,9 @@ pub(crate) struct PresentedRequest {
 
 #[allow(dead_code, reason = "trusted authority request consumer follows")]
 impl PresentedRequest {
-    pub fn completed(&self) -> u128 { self.completed }
+    pub fn completed(&self) -> u128 {
+        self.completed
+    }
     pub fn request(&self) -> &crate::authority::consent::Request {
         &self.request
     }
@@ -642,7 +647,10 @@ struct ClipboardHold {
 
 enum ClipboardStage {
     Armed,
-    Held { mime_type: String, file: TransferEndpoint },
+    Held {
+        mime_type: String,
+        file: TransferEndpoint,
+    },
     Released,
     Dropped,
     Expired,
@@ -876,7 +884,8 @@ impl Runtime {
         }
         self.client_resources.insert(client, resources);
         if self.headless_output.is_some() {
-            self.headless_commits.insert(client, ClientCommit::default());
+            self.headless_commits
+                .insert(client, ClientCommit::default());
         }
         Ok(())
     }
@@ -922,8 +931,10 @@ impl Runtime {
     }
 
     pub(crate) fn enable_clipboard_control(&mut self) -> Result<(), String> {
-        if self.headless_output.is_none() || self.attention_enabled
-            || self.scene.attention_visible() || self.clipboard_control.is_some()
+        if self.headless_output.is_none()
+            || self.attention_enabled
+            || self.scene.attention_visible()
+            || self.clipboard_control.is_some()
         {
             return Err("clipboard control requires a fresh public headless runtime".into());
         }
@@ -932,9 +943,12 @@ impl Runtime {
     }
 
     fn admit_clipboard_control(&self, session: u128) -> Result<(), String> {
-        if self.clipboard_control.is_none() || self.attention_enabled
+        if self.clipboard_control.is_none()
+            || self.attention_enabled
             || self.scene.attention_visible()
-            || self.headless_output.is_none_or(|stamp| stamp.session != session)
+            || self
+                .headless_output
+                .is_none_or(|stamp| stamp.session != session)
         {
             return Err("clipboard control disabled or session unavailable".into());
         }
@@ -942,7 +956,11 @@ impl Runtime {
     }
 
     fn invalidate_clipboard_hold(&mut self) {
-        if let Some(hold) = self.clipboard_control.as_mut().and_then(|c| c.hold.as_mut()) {
+        if let Some(hold) = self
+            .clipboard_control
+            .as_mut()
+            .and_then(|c| c.hold.as_mut())
+        {
             if hold.stage.active() {
                 hold.stage = ClipboardStage::Invalidated;
             }
@@ -950,7 +968,11 @@ impl Runtime {
     }
 
     pub(crate) fn expire_clipboard_hold(&mut self, now: std::time::Instant) {
-        let Some(hold) = self.clipboard_control.as_ref().and_then(|c| c.hold.as_ref()) else {
+        let Some(hold) = self
+            .clipboard_control
+            .as_ref()
+            .and_then(|c| c.hold.as_ref())
+        else {
             return;
         };
         if !hold.stage.active() {
@@ -958,7 +980,8 @@ impl Runtime {
         }
         let stage = if now >= hold.deadline {
             ClipboardStage::Expired
-        } else if self.attention_enabled || self.scene.attention_visible()
+        } else if self.attention_enabled
+            || self.scene.attention_visible()
             || self.window_for_handle(hold.window) != Some(hold.receiver)
             || self.keyboard.snapshot().focus != Some(hold.receiver)
             || self.selection.as_ref().map(|s| s.identity) != Some(hold.source)
@@ -967,46 +990,85 @@ impl Runtime {
         } else {
             return;
         };
-        if let Some(hold) = self.clipboard_control.as_mut().and_then(|c| c.hold.as_mut()) {
+        if let Some(hold) = self
+            .clipboard_control
+            .as_mut()
+            .and_then(|c| c.hold.as_mut())
+        {
             hold.stage = stage;
         }
     }
 
-    pub(crate) fn arm_clipboard_hold(&mut self, session: u128, window: u64) -> Result<String, String> {
+    pub(crate) fn arm_clipboard_hold(
+        &mut self,
+        session: u128,
+        window: u64,
+    ) -> Result<String, String> {
         self.admit_clipboard_control(session)?;
         let now = std::time::Instant::now();
         self.expire_clipboard_hold(now);
-        let receiver = self.window_for_handle(window).ok_or("clipboard receiver window is gone")?;
+        let receiver = self
+            .window_for_handle(window)
+            .ok_or("clipboard receiver window is gone")?;
         if self.keyboard.snapshot().focus != Some(receiver) {
             return Err("clipboard receiver does not have keyboard focus".into());
         }
-        let source = self.selection.as_ref().map(|s| s.identity)
-            .filter(|s| s.client != 0).ok_or("clipboard has no client selection")?;
-        let control = self.clipboard_control.as_mut().ok_or("clipboard control disabled")?;
-        if control.hold.as_ref().is_some_and(|hold| hold.stage.active()) {
+        let source = self
+            .selection
+            .as_ref()
+            .map(|s| s.identity)
+            .filter(|s| s.client != 0)
+            .ok_or("clipboard has no client selection")?;
+        let control = self
+            .clipboard_control
+            .as_mut()
+            .ok_or("clipboard control disabled")?;
+        if control
+            .hold
+            .as_ref()
+            .is_some_and(|hold| hold.stage.active())
+        {
             return Err("clipboard hold is already active".into());
         }
-        let number = control.number.checked_add(1).ok_or("clipboard hold identity exhausted")?;
-        let deadline = now.checked_add(std::time::Duration::from_secs(10))
+        let number = control
+            .number
+            .checked_add(1)
+            .ok_or("clipboard hold identity exhausted")?;
+        let deadline = now
+            .checked_add(std::time::Duration::from_secs(10))
             .ok_or("clipboard hold deadline overflow")?;
         control.number = number;
         control.hold = Some(ClipboardHold {
-            number, window, receiver, source, deadline, stage: ClipboardStage::Armed,
+            number,
+            window,
+            receiver,
+            source,
+            deadline,
+            stage: ClipboardStage::Armed,
         });
         self.clipboard_hold_record(session, number)
     }
 
     fn clipboard_hold_record(&self, session: u128, number: u64) -> Result<String, String> {
-        let hold = self.clipboard_control.as_ref().and_then(|c| c.hold.as_ref())
-            .filter(|hold| hold.number == number).ok_or("clipboard hold identity is not current")?;
+        let hold = self
+            .clipboard_control
+            .as_ref()
+            .and_then(|c| c.hold.as_ref())
+            .filter(|hold| hold.number == number)
+            .ok_or("clipboard hold identity is not current")?;
         Ok(format!(
             "td-clipboard-v1 session={session:032x} hold={} window=@{} state={}\n",
-            hold.number, hold.window, hold.stage.word(),
+            hold.number,
+            hold.window,
+            hold.stage.word(),
         ))
     }
 
     pub(crate) fn clipboard_hold(
-        &mut self, session: u128, number: u64, action: crate::control::ClipboardAction,
+        &mut self,
+        session: u128,
+        number: u64,
+        action: crate::control::ClipboardAction,
     ) -> Result<String, String> {
         use crate::control::ClipboardAction;
         self.admit_clipboard_control(session)?;
@@ -1014,7 +1076,10 @@ impl Runtime {
         // consume a newer controller's descriptor.
         self.clipboard_hold_record(session, number)?;
         self.expire_clipboard_hold(std::time::Instant::now());
-        let hold = self.clipboard_control.as_mut().and_then(|c| c.hold.as_mut())
+        let hold = self
+            .clipboard_control
+            .as_mut()
+            .and_then(|c| c.hold.as_mut())
             .ok_or("clipboard hold is unavailable")?;
         match action {
             ClipboardAction::Status => {}
@@ -1031,12 +1096,22 @@ impl Runtime {
                 let source = hold.source;
                 let stage = std::mem::replace(&mut hold.stage, ClipboardStage::Failed);
                 if let ClipboardStage::Held { mime_type, file } = stage {
-                    let sent = self.queue_transfer_delivery(source.client,
-                        KeyboardDelivery::DataSourceSend { source, mime_type, file })?;
+                    let sent = self.queue_transfer_delivery(
+                        source.client,
+                        KeyboardDelivery::DataSourceSend {
+                            source,
+                            mime_type,
+                            file,
+                        },
+                    )?;
                     if !sent {
                         return Err("clipboard source unavailable or busy".into());
                     }
-                    if let Some(hold) = self.clipboard_control.as_mut().and_then(|c| c.hold.as_mut()) {
+                    if let Some(hold) = self
+                        .clipboard_control
+                        .as_mut()
+                        .and_then(|c| c.hold.as_mut())
+                    {
                         hold.stage = ClipboardStage::Released;
                     }
                 }
@@ -1083,7 +1158,9 @@ impl Runtime {
     /// A passive snapshot. Historical completion does not settle pending work.
     pub(crate) fn observe_output(&self) -> Result<String, String> {
         self.admit_public_observation()?;
-        let stamp = self.headless_output.ok_or("not a headless automation runtime")?;
+        let stamp = self
+            .headless_output
+            .ok_or("not a headless automation runtime")?;
         let current = !self.pending_paint
             && self.compound_settle.is_none()
             && self.last_submission == Some(Submission::Presented);
@@ -1132,11 +1209,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) fn observe_client(
-        &self,
-        session: u128,
-        window: u64,
-    ) -> Result<String, String> {
+    pub(crate) fn observe_client(&self, session: u128, window: u64) -> Result<String, String> {
         self.admit_public_observation()?;
         let stamp = self
             .headless_output
@@ -1185,7 +1258,9 @@ impl Runtime {
         if self.pending_paint || self.last_submission != Some(Submission::Presented) {
             return Err("capture requires completed output, not queued submission".into());
         }
-        let stamp = self.headless_output.ok_or("not a headless automation runtime")?;
+        let stamp = self
+            .headless_output
+            .ok_or("not a headless automation runtime")?;
         crate::output::completed_public_ppm(
             self.backend.completed(),
             &mut self.comparison,
@@ -1213,9 +1288,15 @@ impl Runtime {
         if self.in_flight.is_some() {
             return Ok(());
         }
-        let next_output = self.headless_output.map(|stamp| {
-            stamp.output.checked_add(1).ok_or("headless output identity exhausted")
-        }).transpose()?;
+        let next_output = self
+            .headless_output
+            .map(|stamp| {
+                stamp
+                    .output
+                    .checked_add(1)
+                    .ok_or("headless output identity exhausted")
+            })
+            .transpose()?;
         let epoch = self.paints.checked_add(1).ok_or("paint epochs exhausted")?;
         // The damage is cleared only on success, so a failed paint still owes
         // the whole output — which is what the backend's own shadow-copy
@@ -1363,8 +1444,7 @@ impl Runtime {
         match event {
             OutputEvent::Presented(frame) => self.frame_presented(frame),
             OutputEvent::Changed => Err(
-                "the output changed, and td does not yet follow a mode or connection change"
-                    .into(),
+                "the output changed, and td does not yet follow a mode or connection change".into(),
             ),
         }
     }
@@ -1848,8 +1928,7 @@ impl Runtime {
 
     pub fn popup_constraint(&self, parent: SurfaceKey) -> Option<PopupConstraint> {
         let size = self.backend.dimensions();
-        self.scene
-            .popup_constraint(parent, size.width, size.height)
+        self.scene.popup_constraint(parent, size.width, size.height)
     }
 
     #[cfg(test)]
@@ -2282,9 +2361,7 @@ impl Runtime {
         let Some(content_pixels) = self
             .application_ready
             .as_ref()
-            .filter(|ready| {
-                ready.published_client.is_none() && ready.candidates.contains(&root)
-            })
+            .filter(|ready| ready.published_client.is_none() && ready.candidates.contains(&root))
             .and_then(|ready| ready.surface_content.get(&key))
             .copied()
         else {
@@ -2366,7 +2443,6 @@ impl Runtime {
             }
         }
     }
-
 
     /// Judge readiness against what is ON GLASS: `completed()`, not the frame
     /// last composed, which under a flip in flight is not yet shown.
@@ -2569,7 +2645,10 @@ impl Runtime {
     }
 
     pub fn remove_client(&mut self, client: u64) -> Result<(), String> {
-        if self.clipboard_control.as_ref().and_then(|c| c.hold.as_ref())
+        if self
+            .clipboard_control
+            .as_ref()
+            .and_then(|c| c.hold.as_ref())
             .is_some_and(|hold| hold.receiver.client == client || hold.source.client == client)
         {
             self.invalidate_clipboard_hold();
@@ -2581,9 +2660,7 @@ impl Runtime {
                 ready.connection_live.store(false, Ordering::Release);
             }
             ready.candidates.retain(|key| key.client != client);
-            ready
-                .surface_content
-                .retain(|key, _| key.client != client);
+            ready.surface_content.retain(|key, _| key.client != client);
         }
         self.portal_dialogs.retain(|key, _| key.client != client);
         let reparented = self.reparent_around_client(client);
@@ -2719,8 +2796,13 @@ impl Runtime {
         }
     }
 
-    pub(crate) fn attention_request_visible(&self, request: &crate::authority::consent::Request) -> bool {
-        self.attention_enabled && self.scene.attention_visible() && !self.scene.attention_draining()
+    pub(crate) fn attention_request_visible(
+        &self,
+        request: &crate::authority::consent::Request,
+    ) -> bool {
+        self.attention_enabled
+            && self.scene.attention_visible()
+            && !self.scene.attention_draining()
             && self.scene.attention_request() == Some(request)
     }
 
@@ -2729,7 +2811,10 @@ impl Runtime {
         _origin: &crate::input::EvdevOrigin,
         notice: crate::attention::Notice,
     ) -> Result<(), String> {
-        if !self.attention_enabled || !self.scene.attention_visible() || self.scene.attention_draining() {
+        if !self.attention_enabled
+            || !self.scene.attention_visible()
+            || self.scene.attention_draining()
+        {
             return Err("secret notice requires active physical attention".into());
         }
         self.scene.set_attention_notice(notice);
@@ -3023,12 +3108,11 @@ impl Runtime {
         // anything the operator did.
         let grab_surface = self.pointer.grab_surface();
         let grabbed = grab_surface.is_some();
-        let portal_owns_grab = grab_surface
-            .is_some_and(|surface| self.scene.portal_modal_owns_surface(surface));
+        let portal_owns_grab =
+            grab_surface.is_some_and(|surface| self.scene.portal_modal_owns_surface(surface));
         let (hover, grab) = self.routed_pointer_targets();
         let mut modal_buttons = Vec::new();
-        let blocks_new_gestures =
-            overlay_modal || (portal_modal && grabbed && !portal_owns_grab);
+        let blocks_new_gestures = overlay_modal || (portal_modal && grabbed && !portal_owns_grab);
         let buttons = if blocks_new_gestures {
             modal_buttons.extend(
                 buttons
@@ -3151,13 +3235,9 @@ impl Runtime {
             && !input_modal
             && self.dragging.is_none()
             && !grabbed
-            && self
-                .scene
-                .topmost_grab(size.width, size.height)
-                .is_none()
+            && self.scene.topmost_grab(size.width, size.height).is_none()
         {
-            self.scene
-                .window_at_pointer(size.width, size.height)
+            self.scene.window_at_pointer(size.width, size.height)
         } else {
             None
         };
@@ -3867,11 +3947,7 @@ impl Runtime {
         let Some(parent) = parent else {
             return Ok(None);
         };
-        self.set_toplevel_parent(
-            child,
-            Some(parent),
-            ToplevelParentSource::Foreign(identity),
-        )
+        self.set_toplevel_parent(child, Some(parent), ToplevelParentSource::Foreign(identity))
     }
 
     /// Associate one portal-owned toplevel with the mapped toplevel named by
@@ -3907,8 +3983,7 @@ impl Runtime {
                 self.toplevel_parents.remove(&child);
             }
         }
-        self.portal_dialogs
-            .insert(child, PortalDialog { manager });
+        self.portal_dialogs.insert(child, PortalDialog { manager });
         self.dragging = None;
         let layout_changed = self.scene.set_portal_dialog(child, parent);
         self.settle(layout_changed)
@@ -4486,7 +4561,10 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) fn vm_writer(&mut self, writer: Option<SyncSender<crate::vm_bridge::ClipboardWrite>>) {
+    pub(crate) fn vm_writer(
+        &mut self,
+        writer: Option<SyncSender<crate::vm_bridge::ClipboardWrite>>,
+    ) {
         self.vm_writer = writer;
     }
 
@@ -4637,7 +4715,11 @@ impl Runtime {
             return Ok(false);
         }
         self.expire_clipboard_hold(std::time::Instant::now());
-        if let Some(hold) = self.clipboard_control.as_mut().and_then(|c| c.hold.as_mut()) {
+        if let Some(hold) = self
+            .clipboard_control
+            .as_mut()
+            .and_then(|c| c.hold.as_mut())
+        {
             if hold.receiver.client == receiver && hold.source == source {
                 if matches!(hold.stage, ClipboardStage::Armed) {
                     hold.stage = ClipboardStage::Held { mime_type, file };
@@ -4651,9 +4733,12 @@ impl Runtime {
         if let Some((identity, bytes)) = &self.vm_text {
             if *identity == source {
                 return Ok(self.vm_writer.as_ref().is_some_and(|writer| {
-                    writer.try_send(crate::vm_bridge::ClipboardWrite {
-                        file: file.into_file(), bytes: Arc::clone(bytes),
-                    }).is_ok()
+                    writer
+                        .try_send(crate::vm_bridge::ClipboardWrite {
+                            file: file.into_file(),
+                            bytes: Arc::clone(bytes),
+                        })
+                        .is_ok()
                 }));
             }
         }
@@ -4904,7 +4989,10 @@ impl Runtime {
     fn refresh_layout(&mut self) -> bool {
         let next: BTreeMap<SurfaceKey, ViewLayout> = self
             .scene
-            .views(self.backend.dimensions().width, self.backend.dimensions().height)
+            .views(
+                self.backend.dimensions().width,
+                self.backend.dimensions().height,
+            )
             .into_iter()
             .map(|view| (view.key, view))
             .collect();
@@ -4923,13 +5011,18 @@ impl Runtime {
     }
 
     fn publish_keyboard(&mut self, events: Vec<RoutedKeyboardEvent>) -> Result<(), String> {
-        if events.iter().any(|event| matches!(event.event,
-            crate::keyboard::KeyboardEvent::Leave { .. }
-                | crate::keyboard::KeyboardEvent::Enter { .. }))
-        {
+        if events.iter().any(|event| {
+            matches!(
+                event.event,
+                crate::keyboard::KeyboardEvent::Leave { .. }
+                    | crate::keyboard::KeyboardEvent::Enter { .. }
+            )
+        }) {
             self.invalidate_clipboard_hold();
         }
-        if !events.is_empty() { self.bump_vm_revision()?; }
+        if !events.is_empty() {
+            self.bump_vm_revision()?;
+        }
         let leaving = events.iter().find_map(|event| match event.event {
             crate::keyboard::KeyboardEvent::Leave { surface } => Some(surface.client),
             _ => None,
@@ -5191,8 +5284,7 @@ mod tests {
         for alpha in pixels.iter_mut().skip(3).step_by(4) {
             *alpha = 0;
         }
-        Surface::from_shm_pixels(opaque.width(), opaque.height(), pixels, SHM_ARGB8888)
-            .unwrap()
+        Surface::from_shm_pixels(opaque.width(), opaque.height(), pixels, SHM_ARGB8888).unwrap()
     }
 
     fn lend_application_resources(runtime: &mut Runtime, client: u64) {
@@ -5268,12 +5360,14 @@ mod tests {
             Ok(KeyboardDelivery::PopupDone { surface, .. }) => {
                 panic!("unexpected menu dismissal for surface {surface}")
             }
-            Ok(KeyboardDelivery::Selection(_)
-            | KeyboardDelivery::SelectionFocusLost(_)
-            | KeyboardDelivery::DataSourceCancelled(_)
-            | KeyboardDelivery::DataSourceSend { .. }
-            | KeyboardDelivery::ForeignDestroyed(_)
-            | KeyboardDelivery::PortalDialogsStandalone(_)) => {
+            Ok(
+                KeyboardDelivery::Selection(_)
+                | KeyboardDelivery::SelectionFocusLost(_)
+                | KeyboardDelivery::DataSourceCancelled(_)
+                | KeyboardDelivery::DataSourceSend { .. }
+                | KeyboardDelivery::ForeignDestroyed(_)
+                | KeyboardDelivery::PortalDialogsStandalone(_),
+            ) => {
                 panic!("unexpected data-device delivery")
             }
             Err(error) => panic!("no keyboard event was published: {error}"),
@@ -5692,21 +5786,45 @@ mod tests {
         assert_eq!(runtime.last_submission(), Some(Submission::Presented));
     }
 
-    fn clipboard_fixture() -> (Cleanup, Runtime, Receiver<KeyboardDelivery>, DataSourceIdentity, u64) {
+    fn clipboard_fixture() -> (
+        Cleanup,
+        Runtime,
+        Receiver<KeyboardDelivery>,
+        DataSourceIdentity,
+        u64,
+    ) {
         let cleanup = Cleanup(std::env::temp_dir().join(format!(
-            "td-runtime-hold-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed),
+            "td-runtime-hold-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
         )));
-        let mut runtime = Runtime::headless(
-            Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap(), 7,
-        );
+        let mut runtime =
+            Runtime::headless(Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap(), 7);
         let (events, _) = runtime.subscribe_keyboard(1).unwrap().split();
-        let source_key = SurfaceKey { client: 1, object: 10 };
+        let source_key = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
         runtime.commit(source_key, surface([1, 2, 3, 0])).unwrap();
-        let source = DataSourceIdentity { client: 1, object: 20, generation: 1 };
-        runtime.set_selection(1, Some(SelectionSource {
-            identity: source, mime_types: Arc::new(vec!["text/plain".into()]),
-        })).unwrap().unwrap();
-        let receiver = SurfaceKey { client: 2, object: 30 };
+        let source = DataSourceIdentity {
+            client: 1,
+            object: 20,
+            generation: 1,
+        };
+        runtime
+            .set_selection(
+                1,
+                Some(SelectionSource {
+                    identity: source,
+                    mime_types: Arc::new(vec!["text/plain".into()]),
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        let receiver = SurfaceKey {
+            client: 2,
+            object: 30,
+        };
         runtime.commit(receiver, surface([4, 5, 6, 0])).unwrap();
         runtime.control_focus(receiver).unwrap();
         let window = runtime.scene.handle(receiver).unwrap();
@@ -5717,9 +5835,10 @@ mod tests {
     fn clipboard_endpoint() -> (std::os::unix::net::UnixStream, TransferEndpoint) {
         let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
         reader.set_nonblocking(true).unwrap();
-        (reader, TransferEndpoint::from_file(std::fs::File::from(
-            std::os::fd::OwnedFd::from(writer),
-        )))
+        (
+            reader,
+            TransferEndpoint::from_file(std::fs::File::from(std::os::fd::OwnedFd::from(writer))),
+        )
     }
 
     #[test]
@@ -5729,30 +5848,58 @@ mod tests {
         let (_cleanup, mut runtime, events, source, window) = clipboard_fixture();
         // An ordinary headless session still routes immediately.
         let (_reader, file) = clipboard_endpoint();
-        assert!(runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap());
-        assert!(matches!(events.try_recv().unwrap(), KeyboardDelivery::DataSourceSend { .. }));
+        assert!(runtime
+            .send_selection_data(2, source, "text/plain".into(), file)
+            .unwrap());
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            KeyboardDelivery::DataSourceSend { .. }
+        ));
         assert!(runtime.arm_clipboard_hold(7, window).is_err());
         runtime.enable_clipboard_control().unwrap();
         assert!(runtime.enable_clipboard_control().is_err());
         let armed = runtime.arm_clipboard_hold(7, window).unwrap();
-        assert_eq!(armed, format!(
-            "td-clipboard-v1 session={:032x} hold=1 window=@{window} state=armed\n", 7,
-        ));
+        assert_eq!(
+            armed,
+            format!(
+                "td-clipboard-v1 session={:032x} hold=1 window=@{window} state=armed\n",
+                7,
+            )
+        );
         assert!(runtime.arm_clipboard_hold(7, window).is_err());
         assert!(runtime.clipboard_hold(7, 1, Release).is_err());
         let (mut reader, file) = clipboard_endpoint();
-        assert!(runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap());
+        assert!(runtime
+            .send_selection_data(2, source, "text/plain".into(), file)
+            .unwrap());
         assert_eq!(events.try_recv().err(), Some(TryRecvError::Empty));
-        assert_eq!(reader.read(&mut [0]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
-        assert!(runtime.clipboard_hold(7, 1, Status).unwrap().ends_with("state=held\n"));
+        assert_eq!(
+            reader.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(runtime
+            .clipboard_hold(7, 1, Status)
+            .unwrap()
+            .ends_with("state=held\n"));
         assert!(runtime.clipboard_hold(8, 1, Drop).is_err());
         assert!(runtime.clipboard_hold(7, 2, Drop).is_err());
         let (mut extra, file) = clipboard_endpoint();
-        assert!(!runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap());
+        assert!(!runtime
+            .send_selection_data(2, source, "text/plain".into(), file)
+            .unwrap());
         assert_eq!(extra.read(&mut [0]).unwrap(), 0);
-        assert!(runtime.clipboard_hold(7, 1, Release).unwrap().ends_with("state=released\n"));
-        let KeyboardDelivery::DataSourceSend { source: sent, mime_type, file } = events.try_recv().unwrap()
-            else { panic!("no source delivery") };
+        assert!(runtime
+            .clipboard_hold(7, 1, Release)
+            .unwrap()
+            .ends_with("state=released\n"));
+        let KeyboardDelivery::DataSourceSend {
+            source: sent,
+            mime_type,
+            file,
+        } = events.try_recv().unwrap()
+        else {
+            panic!("no source delivery")
+        };
         assert_eq!(sent, source);
         assert_eq!(mime_type, "text/plain");
         let mut writer = file.into_file();
@@ -5763,37 +5910,81 @@ mod tests {
         assert_eq!(bytes, b"exact payload");
         assert!(runtime.clipboard_hold(7, 1, Release).is_err());
         assert!(runtime.clipboard_hold(7, 1, Drop).is_err());
-        assert!(runtime.arm_clipboard_hold(7, window).unwrap().contains("hold=2 "));
+        assert!(runtime
+            .arm_clipboard_hold(7, window)
+            .unwrap()
+            .contains("hold=2 "));
         assert!(runtime.clipboard_hold(7, 1, Status).is_err());
-        assert!(runtime.clipboard_hold(7, 2, Drop).unwrap().ends_with("state=dropped\n"));
+        assert!(runtime
+            .clipboard_hold(7, 2, Drop)
+            .unwrap()
+            .ends_with("state=dropped\n"));
         runtime.clipboard_control.as_mut().unwrap().number = u64::MAX;
         assert!(runtime.arm_clipboard_hold(7, window).is_err());
-        assert!(runtime.clipboard_hold(7, 2, Status).unwrap().ends_with("state=dropped\n"));
+        assert!(runtime
+            .clipboard_hold(7, 2, Status)
+            .unwrap()
+            .ends_with("state=dropped\n"));
     }
 
     #[test]
     fn clipboard_hold_drops_descriptors_on_expiry_invalidation_and_explicit_drop() {
         use crate::control::ClipboardAction::{Drop, Release, Status};
         use std::io::Read;
-        for cause in ["drop", "expiry", "focus", "selection", "source", "receiver", "attention"] {
+        for cause in [
+            "drop",
+            "expiry",
+            "focus",
+            "selection",
+            "source",
+            "receiver",
+            "attention",
+        ] {
             let (_cleanup, mut runtime, _events, source, window) = clipboard_fixture();
             runtime.enable_clipboard_control().unwrap();
             runtime.arm_clipboard_hold(7, window).unwrap();
             let (mut reader, file) = clipboard_endpoint();
-            assert!(runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap());
+            assert!(runtime
+                .send_selection_data(2, source, "text/plain".into(), file)
+                .unwrap());
             match cause {
-                "drop" => { runtime.clipboard_hold(7, 1, Drop).unwrap(); }
+                "drop" => {
+                    runtime.clipboard_hold(7, 1, Drop).unwrap();
+                }
                 "expiry" => {
-                    let deadline = runtime.clipboard_control.as_ref().unwrap().hold.as_ref().unwrap().deadline;
+                    let deadline = runtime
+                        .clipboard_control
+                        .as_ref()
+                        .unwrap()
+                        .hold
+                        .as_ref()
+                        .unwrap()
+                        .deadline;
                     runtime.expire_clipboard_hold(deadline);
                 }
                 "focus" => {
-                    runtime.control_focus(SurfaceKey { client: 1, object: 10 }).unwrap();
-                    runtime.control_focus(SurfaceKey { client: 2, object: 30 }).unwrap();
+                    runtime
+                        .control_focus(SurfaceKey {
+                            client: 1,
+                            object: 10,
+                        })
+                        .unwrap();
+                    runtime
+                        .control_focus(SurfaceKey {
+                            client: 2,
+                            object: 30,
+                        })
+                        .unwrap();
                 }
-                "selection" => { runtime.clear_selection(source, None).unwrap(); }
-                "source" => { runtime.remove_client(1).unwrap(); }
-                "receiver" => { runtime.remove_client(2).unwrap(); }
+                "selection" => {
+                    runtime.clear_selection(source, None).unwrap();
+                }
+                "source" => {
+                    runtime.remove_client(1).unwrap();
+                }
+                "receiver" => {
+                    runtime.remove_client(2).unwrap();
+                }
                 "attention" => {
                     runtime.enable_attention(true);
                     assert!(runtime.clipboard_hold(7, 1, Release).is_err());
@@ -5803,8 +5994,15 @@ mod tests {
                 _ => panic!("unknown cause"),
             }
             assert_eq!(reader.read(&mut [0]).unwrap(), 0, "{cause}");
-            let state = match cause { "drop" => "dropped", "expiry" => "expired", _ => "invalidated" };
-            assert!(runtime.clipboard_hold(7, 1, Status).unwrap().ends_with(&format!("state={state}\n")));
+            let state = match cause {
+                "drop" => "dropped",
+                "expiry" => "expired",
+                _ => "invalidated",
+            };
+            assert!(runtime
+                .clipboard_hold(7, 1, Status)
+                .unwrap()
+                .ends_with(&format!("state={state}\n")));
             assert!(runtime.clipboard_hold(7, 1, Release).is_err());
         }
     }
@@ -5816,28 +6014,56 @@ mod tests {
         let (_cleanup, mut runtime, _events, source, window) = clipboard_fixture();
         runtime.headless_output = None;
         assert!(runtime.enable_clipboard_control().is_err());
-        runtime.headless_output = Some(crate::headless::OutputStamp { session: 7, output: 0 });
+        runtime.headless_output = Some(crate::headless::OutputStamp {
+            session: 7,
+            output: 0,
+        });
         runtime.enable_attention(true);
         assert!(runtime.enable_clipboard_control().is_err());
         runtime.enable_attention(false);
         runtime.enable_clipboard_control().unwrap();
         assert!(runtime.arm_clipboard_hold(8, window).is_err());
         assert!(runtime.arm_clipboard_hold(7, u64::MAX).is_err());
-        let other = runtime.scene.handle(SurfaceKey { client: 1, object: 10 }).unwrap();
+        let other = runtime
+            .scene
+            .handle(SurfaceKey {
+                client: 1,
+                object: 10,
+            })
+            .unwrap();
         assert!(runtime.arm_clipboard_hold(7, other).is_err());
         runtime.arm_clipboard_hold(7, window).unwrap();
-        for (receiver, source) in [(1, source), (2, DataSourceIdentity { generation: 2, ..source })] {
+        for (receiver, source) in [
+            (1, source),
+            (
+                2,
+                DataSourceIdentity {
+                    generation: 2,
+                    ..source
+                },
+            ),
+        ] {
             let (mut reader, file) = clipboard_endpoint();
-            assert!(!runtime.send_selection_data(receiver, source, "text/plain".into(), file).unwrap());
+            assert!(!runtime
+                .send_selection_data(receiver, source, "text/plain".into(), file)
+                .unwrap());
             assert_eq!(reader.read(&mut [0]).unwrap(), 0);
-            assert!(runtime.clipboard_hold(7, 1, Status).unwrap().ends_with("state=armed\n"));
+            assert!(runtime
+                .clipboard_hold(7, 1, Status)
+                .unwrap()
+                .ends_with("state=armed\n"));
         }
         let (mut reader, file) = clipboard_endpoint();
-        runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap();
+        runtime
+            .send_selection_data(2, source, "text/plain".into(), file)
+            .unwrap();
         runtime.unsubscribe_keyboard(1);
         assert!(runtime.clipboard_hold(7, 1, Release).is_err());
         assert_eq!(reader.read(&mut [0]).unwrap(), 0);
-        assert!(runtime.clipboard_hold(7, 1, Status).unwrap().ends_with("state=failed\n"));
+        assert!(runtime
+            .clipboard_hold(7, 1, Status)
+            .unwrap()
+            .ends_with("state=failed\n"));
     }
 
     #[test]
@@ -5846,13 +6072,31 @@ mod tests {
         let (_cleanup, mut runtime, events, source, window) = clipboard_fixture();
         runtime.enable_clipboard_control().unwrap();
         runtime.arm_clipboard_hold(7, window).unwrap();
-        let deadline = runtime.clipboard_control.as_ref().unwrap().hold.as_ref().unwrap().deadline;
+        let deadline = runtime
+            .clipboard_control
+            .as_ref()
+            .unwrap()
+            .hold
+            .as_ref()
+            .unwrap()
+            .deadline;
         runtime.expire_clipboard_hold(deadline);
-        assert!(runtime.clipboard_hold(7, 1, Status).unwrap().ends_with("state=expired\n"));
+        assert!(runtime
+            .clipboard_hold(7, 1, Status)
+            .unwrap()
+            .ends_with("state=expired\n"));
         let (_reader, file) = clipboard_endpoint();
-        assert!(runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap());
-        assert!(matches!(events.try_recv().unwrap(), KeyboardDelivery::DataSourceSend { .. }));
-        assert!(runtime.arm_clipboard_hold(7, window).unwrap().contains("hold=2 "));
+        assert!(runtime
+            .send_selection_data(2, source, "text/plain".into(), file)
+            .unwrap());
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            KeyboardDelivery::DataSourceSend { .. }
+        ));
+        assert!(runtime
+            .arm_clipboard_hold(7, window)
+            .unwrap()
+            .contains("hold=2 "));
         assert_eq!(runtime.clipboard_control.as_ref().unwrap().number, 2);
     }
 
@@ -5862,26 +6106,42 @@ mod tests {
         use std::io::Read;
         for held in [false, true] {
             let (_cleanup, mut runtime, events, source, window) = clipboard_fixture();
-            let original = SurfaceKey { client: 2, object: 30 };
-            let other = SurfaceKey { client: 2, object: 31 };
+            let original = SurfaceKey {
+                client: 2,
+                object: 30,
+            };
+            let other = SurfaceKey {
+                client: 2,
+                object: 31,
+            };
             runtime.commit(other, surface([7, 8, 9, 0])).unwrap();
             runtime.control_focus(original).unwrap();
             runtime.enable_clipboard_control().unwrap();
             runtime.arm_clipboard_hold(7, window).unwrap();
             let (mut reader, file) = clipboard_endpoint();
             if held {
-                assert!(runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap());
+                assert!(runtime
+                    .send_selection_data(2, source, "text/plain".into(), file)
+                    .unwrap());
             } else {
                 drop(file);
             }
             let revision = runtime.selection_revision;
             runtime.control_focus(other).unwrap();
             runtime.control_focus(original).unwrap();
-            assert_eq!(runtime.selection_revision, revision, "same-client offers need no revision");
+            assert_eq!(
+                runtime.selection_revision, revision,
+                "same-client offers need no revision"
+            );
             assert_eq!(reader.read(&mut [0]).unwrap(), 0);
-            assert!(runtime.clipboard_hold(7, 1, Status).unwrap().ends_with("state=invalidated\n"));
+            assert!(runtime
+                .clipboard_hold(7, 1, Status)
+                .unwrap()
+                .ends_with("state=invalidated\n"));
             assert!(runtime.clipboard_hold(7, 1, Release).is_err());
-            assert!(!events.try_iter().any(|event| matches!(event, KeyboardDelivery::DataSourceSend { .. })));
+            assert!(!events
+                .try_iter()
+                .any(|event| matches!(event, KeyboardDelivery::DataSourceSend { .. })));
         }
     }
 
@@ -5892,10 +6152,21 @@ mod tests {
         runtime.enable_clipboard_control().unwrap();
         runtime.arm_clipboard_hold(7, window).unwrap();
         let (mut reader, file) = clipboard_endpoint();
-        runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap();
-        runtime.clipboard_control.as_mut().unwrap().hold.as_mut().unwrap().deadline = std::time::Instant::now();
+        runtime
+            .send_selection_data(2, source, "text/plain".into(), file)
+            .unwrap();
+        runtime
+            .clipboard_control
+            .as_mut()
+            .unwrap()
+            .hold
+            .as_mut()
+            .unwrap()
+            .deadline = std::time::Instant::now();
         reader.set_nonblocking(false).unwrap();
-        reader.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
         let (ended, outcome) = mpsc::channel();
         let peer = std::thread::spawn(move || {
             let result = match reader.read(&mut [0]) {
@@ -5911,14 +6182,17 @@ mod tests {
     #[test]
     fn headless_output_identity_counts_only_completed_paints_and_never_wraps() {
         let cleanup = Cleanup(std::env::temp_dir().join(format!(
-            "td-runtime-output-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed),
+            "td-runtime-output-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
         )));
-        let mut runtime = Runtime::headless(
-            Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap(), 7,
-        );
-        let expected = |output, current| format!(
+        let mut runtime =
+            Runtime::headless(Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap(), 7);
+        let expected = |output, current| {
+            format!(
             "td-output-v1 session=00000000000000000000000000000007 output={output} current={current}\n",
-        );
+        )
+        };
         assert_eq!(runtime.observe_output().unwrap(), expected(0, "no"));
         assert_eq!(runtime.observe_output().unwrap(), expected(0, "no"));
         assert!(runtime.take_writes().is_empty());
@@ -5949,18 +6223,28 @@ mod tests {
     #[test]
     fn client_observations_refuse_stale_failed_pending_and_retired_state() {
         let cleanup = Cleanup(std::env::temp_dir().join(format!(
-            "td-runtime-client-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed),
+            "td-runtime-client-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
         )));
-        let mut runtime = Runtime::headless(
-            Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap(), 7,
-        );
-        let key = SurfaceKey { client: 3, object: 5 };
-        runtime.register_client_resources(3, Arc::new(ClientResourceHighWater::default())).unwrap();
-        assert!(runtime.register_client_resources(3,
-            Arc::new(ClientResourceHighWater::default())).is_err());
+        let mut runtime =
+            Runtime::headless(Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap(), 7);
+        let key = SurfaceKey {
+            client: 3,
+            object: 5,
+        };
+        runtime
+            .register_client_resources(3, Arc::new(ClientResourceHighWater::default()))
+            .unwrap();
+        assert!(runtime
+            .register_client_resources(3, Arc::new(ClientResourceHighWater::default()))
+            .is_err());
         runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
         let handle = runtime.scene.handle(key).unwrap();
-        assert!(runtime.observe_client(7, handle).unwrap().contains("commit=0 output=1 current=no"));
+        assert!(runtime
+            .observe_client(7, handle)
+            .unwrap()
+            .contains("commit=0 output=1 current=no"));
         assert!(runtime.observe_client(8, handle).is_err());
         assert!(runtime.observe_client(7, handle + 1).is_err());
         let number = runtime.begin_client_commit(3).unwrap();
@@ -5969,26 +6253,43 @@ mod tests {
         assert!(runtime.finish_client_commit(3, number).is_err());
         let current = runtime.observe_client(7, handle).unwrap();
         assert!(current.contains("commit=1 output=1 current=yes"));
-        runtime.register_client_resources(4, Arc::new(ClientResourceHighWater::default())).unwrap();
+        runtime
+            .register_client_resources(4, Arc::new(ClientResourceHighWater::default()))
+            .unwrap();
         let other = runtime.begin_client_commit(4).unwrap();
         runtime.finish_client_commit(4, other).unwrap();
         assert_eq!(runtime.observe_client(7, handle).unwrap(), current);
         runtime.unregister_client_resources(4);
         runtime.begin_compound_commit().unwrap();
-        assert!(runtime.observe_client(7, handle).unwrap().ends_with("current=no\n"));
+        assert!(runtime
+            .observe_client(7, handle)
+            .unwrap()
+            .ends_with("current=no\n"));
         runtime.finish_compound_commit().unwrap();
         runtime.defer_repaint();
-        assert!(runtime.observe_client(7, handle).unwrap().ends_with("current=no\n"));
+        assert!(runtime
+            .observe_client(7, handle)
+            .unwrap()
+            .ends_with("current=no\n"));
         runtime.fail_next_repaint();
         assert!(runtime.repaint().is_err());
-        assert!(runtime.observe_client(7, handle).unwrap().ends_with("current=no\n"));
+        assert!(runtime
+            .observe_client(7, handle)
+            .unwrap()
+            .ends_with("current=no\n"));
         runtime.repaint().unwrap();
         runtime.begin_client_commit(3).unwrap();
         // Even a successful fresh paint cannot repair a failed transaction.
         runtime.capture_public_ppm().unwrap();
-        assert!(runtime.observe_client(7, handle).unwrap().ends_with("current=no\n"));
+        assert!(runtime
+            .observe_client(7, handle)
+            .unwrap()
+            .ends_with("current=no\n"));
         runtime.finish_client_commit(3, Some(2)).unwrap();
-        assert!(runtime.observe_client(7, handle).unwrap().ends_with("current=yes\n"));
+        assert!(runtime
+            .observe_client(7, handle)
+            .unwrap()
+            .ends_with("current=yes\n"));
         runtime.headless_commits.get_mut(&3).unwrap().number = u64::MAX;
         let exhausted = runtime.observe_client(7, handle).unwrap();
         assert!(runtime.begin_client_commit(3).is_err());
@@ -6010,17 +6311,20 @@ mod tests {
     #[test]
     fn input_receipt_counter_refuses_exhaustion_and_out_of_sequence_completion() {
         let cleanup = Cleanup(std::env::temp_dir().join(format!(
-            "td-runtime-action-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed),
+            "td-runtime-action-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
         )));
-        let mut runtime = Runtime::headless(
-            Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap(), 7,
-        );
+        let mut runtime =
+            Runtime::headless(Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap(), 7);
         assert!(runtime.prepare_input_action(8).is_err());
         assert_eq!(runtime.prepare_input_action(7).unwrap(), 1);
         assert!(runtime.finish_input_action(2).is_err());
         assert_eq!(runtime.headless_action, 0);
-        assert_eq!(runtime.finish_input_action(1).unwrap(),
-            "td-action-v1 session=00000000000000000000000000000007 action=1\n");
+        assert_eq!(
+            runtime.finish_input_action(1).unwrap(),
+            "td-action-v1 session=00000000000000000000000000000007 action=1\n"
+        );
         assert!(runtime.finish_input_action(1).is_err());
         assert_eq!(runtime.prepare_input_action(7).unwrap(), 2);
         runtime.headless_action = u64::MAX;
@@ -6062,7 +6366,13 @@ mod tests {
 
         runtime.begin_compound_commit().unwrap();
         runtime
-            .commit(SurfaceKey { client: 1, object: 1 }, surface([1, 2, 3, 0]))
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                surface([1, 2, 3, 0]),
+            )
             .unwrap();
         assert_eq!(runtime.last_submission(), None);
         runtime.fail_next_repaint();
@@ -6090,7 +6400,10 @@ mod tests {
     fn a_queued_frame_owes_later_paints_until_its_completion_takes_one() {
         let (chain, log) = crate::drm::testing::chain(120, 80);
         let mut runtime = Runtime::new(chain);
-        let key = SurfaceKey { client: 1, object: 1 };
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
         runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
         let first = crate::drm::FIRST_FLIP;
         assert_eq!(runtime.last_submission(), Some(Submission::Queued(first)));
@@ -6116,7 +6429,9 @@ mod tests {
         assert_eq!(runtime.last_submission(), Some(Submission::Queued(second)));
 
         // Nothing owed this time, so the completion settles the answer.
-        runtime.output_event(OutputEvent::Presented(second)).unwrap();
+        runtime
+            .output_event(OutputEvent::Presented(second))
+            .unwrap();
         assert_eq!(flips(&log), 2);
         assert_eq!(runtime.frame_in_flight(), None);
         assert_eq!(runtime.last_submission(), Some(Submission::Presented));
@@ -6129,7 +6444,13 @@ mod tests {
         let (chain, log) = crate::drm::testing::chain(120, 80);
         let mut runtime = Runtime::new(chain);
         runtime
-            .commit(SurfaceKey { client: 1, object: 1 }, surface([1, 2, 3, 0]))
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                surface([1, 2, 3, 0]),
+            )
             .unwrap();
         let first = crate::drm::FIRST_FLIP;
         assert!(runtime
@@ -6143,7 +6464,11 @@ mod tests {
         let late = queued + FLIP_DEADLINE + Duration::from_secs(1);
         log.lock().unwrap().fail_next_set = true;
         runtime.output_watchdog(late).unwrap();
-        assert_eq!(runtime.frame_in_flight(), Some(first), "a failed recovery released it");
+        assert_eq!(
+            runtime.frame_in_flight(),
+            Some(first),
+            "a failed recovery released it"
+        );
 
         runtime.output_watchdog(late).unwrap();
         assert_eq!(
@@ -6169,7 +6494,13 @@ mod tests {
         let (chain, _log) = crate::drm::testing::chain(120, 80);
         let mut runtime = Runtime::new(chain);
         runtime
-            .commit(SurfaceKey { client: 1, object: 1 }, surface([1, 2, 3, 0]))
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                surface([1, 2, 3, 0]),
+            )
             .unwrap();
         runtime
             .pointer_frame(1, 30, 30, &[], PointerScroll::default())
@@ -6183,8 +6514,14 @@ mod tests {
         assert_eq!(runtime.frame_in_flight(), Some(second));
 
         runtime.output_event(OutputEvent::Presented(first)).unwrap();
-        assert_eq!(runtime.frame_in_flight(), Some(second), "the late one released the next");
-        runtime.output_event(OutputEvent::Presented(second)).unwrap();
+        assert_eq!(
+            runtime.frame_in_flight(),
+            Some(second),
+            "the late one released the next"
+        );
+        runtime
+            .output_event(OutputEvent::Presented(second))
+            .unwrap();
         assert_eq!(runtime.frame_in_flight(), None);
         assert_eq!(runtime.last_submission(), Some(Submission::Presented));
     }
@@ -6195,7 +6532,13 @@ mod tests {
         let (chain, log) = crate::drm::testing::chain(120, 80);
         let mut runtime = Runtime::new(chain);
         runtime
-            .commit(SurfaceKey { client: 1, object: 1 }, surface([1, 2, 3, 0]))
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                surface([1, 2, 3, 0]),
+            )
             .unwrap();
         let late = Instant::now() + FLIP_DEADLINE + Duration::from_secs(1);
         for _ in 1..MAX_FAILED_RECOVERIES {
@@ -6215,7 +6558,13 @@ mod tests {
         let (chain, _log) = crate::drm::testing::chain(120, 80);
         let mut runtime = Runtime::new(chain);
         runtime
-            .commit(SurfaceKey { client: 1, object: 1 }, surface([1, 2, 3, 0]))
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                surface([1, 2, 3, 0]),
+            )
             .unwrap();
         let mut stalled = Vec::new();
         for at in 0..=MAX_RECOVERED_FRAMES {
@@ -6245,7 +6594,10 @@ mod tests {
     fn a_completion_or_a_recovery_resets_the_failed_recovery_count() {
         let (chain, log) = crate::drm::testing::chain(120, 80);
         let mut runtime = Runtime::new(chain);
-        let key = SurfaceKey { client: 1, object: 1 };
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
         for (at, heal) in [(30, "completion"), (60, "recovery")] {
             runtime
                 .pointer_frame(1, at, at, &[], PointerScroll::default())
@@ -6287,7 +6639,13 @@ mod tests {
         let (chain, log) = crate::drm::testing::chain(120, 80);
         let mut runtime = Runtime::new(chain);
         runtime
-            .commit(SurfaceKey { client: 1, object: 1 }, surface([1, 2, 3, 0]))
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                surface([1, 2, 3, 0]),
+            )
             .unwrap();
         runtime
             .pointer_frame(1, 30, 30, &[], PointerScroll::default())
@@ -6301,7 +6659,10 @@ mod tests {
         assert!(runtime.paint_pending());
 
         runtime.output_watchdog(Instant::now()).unwrap();
-        assert_eq!(runtime.frame_in_flight(), Some(crate::drm::FIRST_FLIP.next()));
+        assert_eq!(
+            runtime.frame_in_flight(),
+            Some(crate::drm::FIRST_FLIP.next())
+        );
         assert!(!runtime.paint_pending());
     }
 
@@ -6486,7 +6847,9 @@ mod tests {
             .unwrap();
         assert!(presentation.wait(Instant::now()).is_err());
 
-        runtime.output_event(OutputEvent::Presented(overlay)).unwrap();
+        runtime
+            .output_event(OutputEvent::Presented(overlay))
+            .unwrap();
         let prompt = runtime.frame_in_flight().unwrap();
         assert_ne!(prompt, overlay);
         assert!(
@@ -6494,7 +6857,9 @@ mod tests {
             "the overlay's completion stood in for the prompt's"
         );
 
-        runtime.output_event(OutputEvent::Presented(prompt)).unwrap();
+        runtime
+            .output_event(OutputEvent::Presented(prompt))
+            .unwrap();
         presentation.wait(Instant::now()).unwrap();
         let receipt = runtime.finish_attention_presentation(presentation).unwrap();
         assert_eq!(receipt.into_request(), request);
@@ -8024,8 +8389,9 @@ mod tests {
         };
         let cell = |runtime: &Runtime, number: u8| {
             let desks = runtime.scene.desks();
-            let (left, width) = crate::bar::desk_cell(&desks, number)
-                .unwrap_or_else(|| panic!("the strip is not showing workspace {number}: {desks:?}"));
+            let (left, width) = crate::bar::desk_cell(&desks, number).unwrap_or_else(|| {
+                panic!("the strip is not showing workspace {number}: {desks:?}")
+            });
             (left + width / 2, crate::bar::BAR_HEIGHT / 2)
         };
         let on_screen = |runtime: &Runtime| {
@@ -8047,7 +8413,11 @@ mod tests {
         let before = runtime.pointer_snapshot().revision;
         goto(&mut runtime, x, y, &[press(1)], still);
         assert_eq!(runtime.scene.layout().active_workspace(), 2);
-        assert_eq!(on_screen(&runtime), Vec::<u32>::new(), "workspace 2 is empty");
+        assert_eq!(
+            on_screen(&runtime),
+            Vec::<u32>::new(),
+            "workspace 2 is empty"
+        );
         // The WINDOW stayed where it was: a press on a cell switches, and only
         // a drag onto one moves anything.
         assert_eq!(runtime.scene.layout().workspace_of(key), Some(1));
@@ -8337,8 +8707,17 @@ mod tests {
             &[press(20)],
             still,
         );
-        assert!(runtime.dragging.is_some(), "the band press picked nothing up");
-        goto(&mut runtime, far_right, crate::bar::BAR_HEIGHT / 2, &[], still);
+        assert!(
+            runtime.dragging.is_some(),
+            "the band press picked nothing up"
+        );
+        goto(
+            &mut runtime,
+            far_right,
+            crate::bar::BAR_HEIGHT / 2,
+            &[],
+            still,
+        );
         goto(
             &mut runtime,
             far_right,
@@ -8378,7 +8757,10 @@ mod tests {
             &[press(24)],
             still,
         );
-        assert!(runtime.dragging.is_some(), "the band press picked nothing up");
+        assert!(
+            runtime.dragging.is_some(),
+            "the band press picked nothing up"
+        );
         let (x, y) = cell(&runtime, 2);
         // The motion, the release and the notch in ONE report, which the
         // reader's batching makes the common shape and the only one that can
@@ -8428,7 +8810,10 @@ mod tests {
             &[press(26)],
             still,
         );
-        assert!(runtime.dragging.is_some(), "the band press picked nothing up");
+        assert!(
+            runtime.dragging.is_some(),
+            "the band press picked nothing up"
+        );
         let (x, y) = cell(&runtime, 1);
         goto(&mut runtime, x, y, &[], still);
         goto(&mut runtime, x, y, &[release(27)], still);
@@ -8593,9 +8978,8 @@ mod tests {
             width: 10,
             height: 10,
         };
-        let paint = || {
-            Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888).unwrap()
-        };
+        let paint =
+            || Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888).unwrap();
         let open = |runtime: &mut Runtime, menu: SurfaceKey| {
             runtime.grab_popup(menu).unwrap();
             runtime
@@ -10883,9 +11267,8 @@ mod tests {
             object: 30,
         };
         runtime.commit(window, surface([1, 2, 3, 0])).unwrap();
-        let small = || {
-            Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888).unwrap()
-        };
+        let small =
+            || Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888).unwrap();
         let at = |parent, x, y| PopupPlacement {
             parent,
             x,
@@ -10985,9 +11368,8 @@ mod tests {
             width: 10,
             height: 10,
         };
-        let paint = || {
-            Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888).unwrap()
-        };
+        let paint =
+            || Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888).unwrap();
         runtime
             .commit_popup(menu, Some(paint()), placement, None, None)
             .unwrap();
@@ -12518,12 +12900,7 @@ mod tests {
             .set_application_id(decoy_toplevel, "org.mozilla.firefox")
             .unwrap();
         runtime
-            .apply_commit(
-                decoy_toplevel,
-                Some(surface([4, 5, 6, 0])),
-                None,
-                None,
-            )
+            .apply_commit(decoy_toplevel, Some(surface([4, 5, 6, 0])), None, None)
             .unwrap();
         runtime
             .set_cursor(
@@ -14183,10 +14560,7 @@ mod tests {
             Ok(Some(replacement))
         );
         assert!(runtime.dismiss_portal_dialog(dialog, manager).unwrap());
-        assert_eq!(
-            runtime.effective_toplevel_parent(dialog),
-            Some(replacement)
-        );
+        assert_eq!(runtime.effective_toplevel_parent(dialog), Some(replacement));
 
         assert_eq!(
             runtime.set_portal_parent(dialog, "portal-handle", manager, 3),
@@ -14315,7 +14689,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            runtime.pointer_snapshot().focus.map(|target| target.surface),
+            runtime
+                .pointer_snapshot()
+                .focus
+                .map(|target| target.surface),
             Some(first)
         );
 
@@ -14348,9 +14725,10 @@ mod tests {
         assert!(runtime.dismiss_portal_dialog(first, manager).unwrap());
         assert_eq!(runtime.scene.portal_modal(), None);
         assert_eq!(runtime.effective_toplevel_parent(first), Some(neighbour));
-        assert!(runtime.layout_snapshot().get(&first).is_some_and(|view| {
-            view.visible && view.activated && view.rect != dialog_rect
-        }));
+        assert!(runtime
+            .layout_snapshot()
+            .get(&first)
+            .is_some_and(|view| { view.visible && view.activated && view.rect != dialog_rect }));
     }
 
     #[test]
@@ -14432,7 +14810,10 @@ mod tests {
         runtime.command(Command::SwitchWorkspace(1)).unwrap();
         runtime.commit(child, surface([4, 5, 6, 0])).unwrap();
 
-        assert_eq!(runtime.set_local_parent(child, Some(parent)), Ok(Some(parent)));
+        assert_eq!(
+            runtime.set_local_parent(child, Some(parent)),
+            Ok(Some(parent))
+        );
         assert!(runtime.scene.toplevels_share_workspace(child, parent));
         assert!(runtime
             .layout_snapshot()
@@ -14480,9 +14861,7 @@ mod tests {
             object: 20,
             generation: 1,
         };
-        runtime
-            .commit(application, surface([1, 2, 3, 0]))
-            .unwrap();
+        runtime.commit(application, surface([1, 2, 3, 0])).unwrap();
         runtime.commit(dialog, surface([4, 5, 6, 0])).unwrap();
         let rect = runtime.layout_snapshot().get(&application).unwrap().rect;
         runtime
@@ -14559,7 +14938,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            runtime.pointer_snapshot().focus.map(|target| target.surface),
+            runtime
+                .pointer_snapshot()
+                .focus
+                .map(|target| target.surface),
             Some(dialog)
         );
 
@@ -14815,9 +15197,7 @@ mod tests {
         runtime
             .export_foreign_toplevel(second_parent, "second".to_string())
             .unwrap();
-        assert!(runtime
-            .import_foreign_toplevel(second, "second")
-            .unwrap());
+        assert!(runtime.import_foreign_toplevel(second, "second").unwrap());
         runtime.remove_client(1).unwrap();
         assert!(matches!(
             deliveries.recv().unwrap(),
@@ -14913,7 +15293,9 @@ mod tests {
         runtime
             .set_application_id(key, "org.mozilla.firefox")
             .unwrap();
-        runtime.apply_commit(key, Some(application_content_surface()), None, None).unwrap();
+        runtime
+            .apply_commit(key, Some(application_content_surface()), None, None)
+            .unwrap();
         assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
         // Query colors actually present on the private screen, so removing
         // the explicit guard would expose its pixels to this observer.
@@ -15005,16 +15387,30 @@ mod tests {
         use crate::authority::consent::{Operation, Request, Role};
         for fail_prompt in [false, true] {
             let cleanup = Cleanup(std::env::temp_dir().join(format!(
-                "td-prompt-slot-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)
+                "td-prompt-slot-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
             )));
-            let mut runtime = Runtime::new(Framebuffer::test_file(&cleanup.0, 800, 600, 3200).unwrap());
+            let mut runtime =
+                Runtime::new(Framebuffer::test_file(&cleanup.0, 800, 600, 3200).unwrap());
             let origin = crate::input::test_origin();
-            let request = Request::new([1; 32], 1000, Operation::Unlock { role: Role::Primary }).unwrap();
+            let request = Request::new(
+                [1; 32],
+                1000,
+                Operation::Unlock {
+                    role: Role::Primary,
+                },
+            )
+            .unwrap();
             runtime.enable_attention(true);
             runtime.attention(&origin, true).unwrap();
-            if fail_prompt { runtime.fail_next_repaint(); }
+            if fail_prompt {
+                runtime.fail_next_repaint();
+            }
             assert_eq!(
-                runtime.present_attention_request(&origin, request.clone()).is_err(),
+                runtime
+                    .present_attention_request(&origin, request.clone())
+                    .is_err(),
                 fail_prompt
             );
             runtime.attention(&origin, true).unwrap();
@@ -15049,8 +15445,15 @@ mod tests {
                 };
                 runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
                 let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
-                runtime.pointer_frame(1, i32::try_from(rect.x + 4).unwrap(),
-                    i32::try_from(rect.y + 4).unwrap(), &[], PointerScroll::default()).unwrap();
+                runtime
+                    .pointer_frame(
+                        1,
+                        i32::try_from(rect.x + 4).unwrap(),
+                        i32::try_from(rect.y + 4).unwrap(),
+                        &[],
+                        PointerScroll::default(),
+                    )
+                    .unwrap();
                 assert!(runtime.pointer_snapshot().focus.is_some());
                 runtime.enable_attention(true);
                 let origin = crate::input::test_origin();

@@ -160,10 +160,14 @@ fn print_source_pins() {
 fn print_recipe_source_pins(stem: &str) {
     let recipe = lookup_or_die(stem);
     let Some(pins) = recipe.source_pins else {
-        die(&format!("recipe `{stem}' declares no fixed-output source pin"));
+        die(&format!(
+            "recipe `{stem}' declares no fixed-output source pin"
+        ));
     };
     if pins.is_empty() {
-        die(&format!("recipe `{stem}' declares no fixed-output source pin"));
+        die(&format!(
+            "recipe `{stem}' declares no fixed-output source pin"
+        ));
     }
     for pin in pins {
         println!("{}\t{}\t{}\t{}", pin.key, pin.url, pin.sha256, pin.file);
@@ -620,12 +624,8 @@ mod tests {
         assert!(pins.iter().any(|pin| pin.key == "cmake-x86-64-source"));
         assert!(pins.iter().any(|pin| pin.key == "codex-source"));
         assert!(pins.iter().any(|pin| pin.key == "claude-code-source"));
-        assert!(pins
-            .iter()
-            .any(|pin| pin.key == "abseil-cpp-x86-64-source"));
-        assert!(pins
-            .iter()
-            .any(|pin| pin.key == "protobuf-x86-64-source"));
+        assert!(pins.iter().any(|pin| pin.key == "abseil-cpp-x86-64-source"));
+        assert!(pins.iter().any(|pin| pin.key == "protobuf-x86-64-source"));
         for key in [
             "codex-cargo-crossterm-source",
             "codex-cargo-nucleo-source",

@@ -1,8 +1,8 @@
 use crate::application::ApplicationDeclaration;
 use crate::types::{Recipe, Step};
+use td_engine::application_spec::dynamic_application_policy;
 use td_engine::launcher::LauncherDeclaration;
 use td_engine::permissions::{BusAccess, FilesystemAccess, PermissionPolicy, PermissionSocket};
-use td_engine::application_spec::dynamic_application_policy;
 
 const RUNTIME: &str = "freedesktop-platform-25-08";
 const ENTRY: &str = "/app/bin/firefox";

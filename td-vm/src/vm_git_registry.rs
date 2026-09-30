@@ -257,21 +257,32 @@ fn start_ref(id: &str) -> Result<String> {
 }
 
 fn retained(policy: &Policy, name: &str) -> Result<Option<String>> {
-    let status = policy.command().args(["symbolic-ref", "--quiet", name])
-        .stdin(Stdio::null()).stdout(Stdio::null()).status()?;
+    let status = policy
+        .command()
+        .args(["symbolic-ref", "--quiet", name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()?;
     if status.code() != Some(1) {
         return Err("starting-commit ref is symbolic or could not be inspected".into());
     }
     // Listing silently skips some damaged refs, including an all-zero object ID.
-    let exists = policy.command().args(["show-ref", "--verify", "--quiet", name])
-        .stdin(Stdio::null()).stdout(Stdio::null()).status()?;
+    let exists = policy
+        .command()
+        .args(["show-ref", "--verify", "--quiet", name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()?;
     if !matches!(exists.code(), Some(0 | 1)) {
         return Err("starting-commit ref is damaged or could not be inspected".into());
     }
     let text = policy.query(&["for-each-ref", "--format=%(refname) %(objectname)", name])?;
     if text.is_empty() {
-        return if exists.code() == Some(1) { Ok(None) }
-            else { Err("starting-commit ref disappeared during inspection".into()) };
+        return if exists.code() == Some(1) {
+            Ok(None)
+        } else {
+            Err("starting-commit ref disappeared during inspection".into())
+        };
     }
     let (found, oid) = text.split_once(' ').ok_or("invalid starting-commit ref")?;
     if found != name || text.contains('\n') {
@@ -286,7 +297,8 @@ fn retained(policy: &Policy, name: &str) -> Result<Option<String>> {
 
 fn start(policy: &Policy, id: &str, branch: &str, expected: &str) -> Result<super::origin::Origin> {
     let name = start_ref(id)?;
-    if !branch_valid(branch) || !policy.keys.contains_key(id)
+    if !branch_valid(branch)
+        || !policy.keys.contains_key(id)
         || policy.branches.get(branch).map(String::as_str) != Some(id)
     {
         return Err("starting commit needs this instance's enrolled task branch".into());
@@ -303,7 +315,9 @@ fn start(policy: &Policy, id: &str, branch: &str, expected: &str) -> Result<supe
         }
         None => {
             if expected != "main" {
-                return Err("recorded starting-commit ref is missing; repair the host origin".into());
+                return Err(
+                    "recorded starting-commit ref is missing; repair the host origin".into(),
+                );
             }
             if policy.query(&["rev-parse", "--is-bare-repository"])? != "true"
                 || policy.query(&["symbolic-ref", "HEAD"])? != "refs/heads/main"
@@ -319,7 +333,11 @@ fn start(policy: &Policy, id: &str, branch: &str, expected: &str) -> Result<supe
         }
     };
     Ok(super::origin::Origin::new(
-        fs::canonicalize(&policy.repository)?.to_str().ok_or("origin path must be UTF-8")?.into(), oid,
+        fs::canonicalize(&policy.repository)?
+            .to_str()
+            .ok_or("origin path must be UTF-8")?
+            .into(),
+        oid,
     )?)
 }
 
@@ -451,7 +469,9 @@ pub(super) fn cli(args: &[OsString]) -> Option<Result<bool>> {
             Ok(true)
         })()),
         "origin" => Some((|| {
-            let [path] = remaining else { return Err("usage: td-vm-git origin POLICY".into()); };
+            let [path] = remaining else {
+                return Err("usage: td-vm-git origin POLICY".into());
+            };
             let policy = Policy::load(Path::new(path))?;
             if policy.query(&["rev-parse", "--is-bare-repository"])? != "true"
                 || policy.query(&["symbolic-ref", "HEAD"])? != "refs/heads/main"
@@ -460,8 +480,11 @@ pub(super) fn cli(args: &[OsString]) -> Option<Result<bool>> {
             }
             let repository = fs::canonicalize(&policy.repository)?;
             let origin = super::origin::Origin::new(
-                repository.to_str().ok_or("origin path must be UTF-8")?.into(),
-                policy.query(&["rev-parse", "--verify", "HEAD^{commit}"])?
+                repository
+                    .to_str()
+                    .ok_or("origin path must be UTF-8")?
+                    .into(),
+                policy.query(&["rev-parse", "--verify", "HEAD^{commit}"])?,
             )?;
             io::stdout().lock().write_all(origin.encode().as_bytes())?;
             Ok(true)
@@ -471,8 +494,11 @@ pub(super) fn cli(args: &[OsString]) -> Option<Result<bool>> {
             let [expected, verb, args @ ..] = remaining else {
                 return Err("usage: td-vm-git change-origin REPOSITORY enroll|reserve|start|revoke POLICY ARGS".into());
             };
-            change_origin(Some(expected.to_str().ok_or("invalid expected origin")?),
-                verb.to_str().ok_or("invalid registry verb")?, args)
+            change_origin(
+                Some(expected.to_str().ok_or("invalid expected origin")?),
+                verb.to_str().ok_or("invalid registry verb")?,
+                args,
+            )
         })()),
         "enroll" | "reserve" | "start" | "revoke" => Some(change(verb.to_str()?, remaining)),
         "authorized-keys" => Some(authorized_keys(remaining)),

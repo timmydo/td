@@ -1,5 +1,5 @@
 use crate::ladder::{
-    SH, apply_patch, link_bins, mesboot0_inputs, mesboot0_path, sed_i, unpack_into,
+    apply_patch, link_bins, mesboot0_inputs, mesboot0_path, sed_i, unpack_into, SH,
 };
 use crate::types::{Recipe, Step, TextEdit};
 
@@ -17,13 +17,17 @@ use crate::types::{Recipe, Step, TextEdit};
 pub fn recipe() -> Recipe {
     let path = mesboot0_path();
     let gccdir = "{in:gcc-core-mesboot0}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
-    let cip = format!("{{in:gcc-core-mesboot0}}/include:{gccdir}/include:{{in:mesboot-headers}}/include");
+    let cip =
+        format!("{{in:gcc-core-mesboot0}}/include:{gccdir}/include:{{in:mesboot-headers}}/include");
     let lp = format!("{{in:gcc-core-mesboot0}}/lib:{gccdir}:{{in:tcc}}/lib");
     let cc = "{in:gcc-core-mesboot0}/bin/gcc -D MES_BOOTSTRAP=1 -D BOOTSTRAP_GLIBC=1 -L {src}";
     let cpp = "{in:gcc-core-mesboot0}/bin/gcc -E -D MES_BOOTSTRAP=1 -D BOOTSTRAP_GLIBC=1";
     let mut steps = unpack_into("glibc-mesboot0-source", "{src}");
     steps.push(apply_patch("patch-mesboot", "patch-glibc-boot-2.2.5"));
-    steps.push(apply_patch("patch-mesboot", "patch-glibc-bootstrap-system-2.2.5"));
+    steps.push(apply_patch(
+        "patch-mesboot",
+        "patch-glibc-bootstrap-system-2.2.5",
+    ));
     // Host-gzip-free locale charmap install (re #469). glibc 2.2.5's
     // localedata/Makefile installs each charmap by copying it uncompressed to the
     // raw name ($(INSTALL_DATA) $< $(@:.gz=)) then `gzip -9`-ing it onto the `.gz`

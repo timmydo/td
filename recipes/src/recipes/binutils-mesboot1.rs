@@ -1,4 +1,6 @@
-use crate::ladder::{SH, apply_patch, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
+use crate::ladder::{
+    apply_patch, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH,
+};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.20.1a #2 — rung 10 (#378, guix's binutils-mesboot1): rebuilt
@@ -96,6 +98,9 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot0",
             "glibc-mesboot0",
         ])
-        .inputs_owned(mesboot0_inputs(&["patch-binutils-boot-2.20.1a", "linux-headers"]))
+        .inputs_owned(mesboot0_inputs(&[
+            "patch-binutils-boot-2.20.1a",
+            "linux-headers",
+        ]))
         .steps(steps)
 }

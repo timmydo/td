@@ -81,16 +81,29 @@ pub const FIDO_CASES: &[(&str, &str)] = &[
         "fido_device::vm_tests::desktop::qemu_desktop_recovers_persistent_store_without_primary",
     ),
 ];
-pub const SYSTEM_TEST: &str = "fido_device::vm_tests::desktop::system::qemu_installed_system_secret_lifecycle";
+pub const SYSTEM_TEST: &str =
+    "fido_device::vm_tests::desktop::system::qemu_installed_system_secret_lifecycle";
 pub const SYSTEM_PASS: &str = "TD-SECRET-SYSTEM-PASS";
 pub const SYSTEM_CUT: &str = "TD-SECRET-SYSTEM-CUT";
-pub const SYSTEM_PHASES: &[&str] = &["create", "recover", "cut-queued", "cut-written", "recover-written"];
+pub const SYSTEM_PHASES: &[&str] = &[
+    "create",
+    "recover",
+    "cut-queued",
+    "cut-written",
+    "recover-written",
+];
 
 pub fn system_phase(cmdline: &str) -> Result<&str, String> {
-    let mut phases = cmdline.split_ascii_whitespace().filter_map(|token| token.strip_prefix("td.secret-system="));
-    let phase = phases.next().filter(|phase| SYSTEM_PHASES.contains(phase))
+    let mut phases = cmdline
+        .split_ascii_whitespace()
+        .filter_map(|token| token.strip_prefix("td.secret-system="));
+    let phase = phases
+        .next()
+        .filter(|phase| SYSTEM_PHASES.contains(phase))
         .ok_or("unknown or missing system secret phase")?;
-    if phases.next().is_some() { return Err("duplicate system secret phase".into()); }
+    if phases.next().is_some() {
+        return Err("duplicate system secret phase".into());
+    }
     Ok(phase)
 }
 
@@ -185,26 +198,45 @@ fn system() -> Result<(), String> {
     if std::process::id() == 1 {
         return Err("system fixture must run beneath the stock supervisor".into());
     }
-    let cmdline = fs::read_to_string("/proc/cmdline").map_err(|e| format!("read command line: {e}"))?;
+    let cmdline =
+        fs::read_to_string("/proc/cmdline").map_err(|e| format!("read command line: {e}"))?;
     let tokens: Vec<_> = cmdline.split_ascii_whitespace().collect();
     if !tokens.contains(&"td.hid-fixture=1")
         || system_phase(&cmdline).is_err()
-        || fs::read("/case").map_err(|e| format!("read image fixture marker: {e}"))? != b"fido-system"
+        || fs::read("/case").map_err(|e| format!("read image fixture marker: {e}"))?
+            != b"fido-system"
     {
         return Err("system secret fixture was not explicitly selected".into());
     }
-    let log = File::create("/run/td-secret-system-test.log").map_err(|e| format!("create system test log: {e}"))?;
-    let errors = log.try_clone().map_err(|e| format!("clone system test log: {e}"))?;
+    let log = File::create("/run/td-secret-system-test.log")
+        .map_err(|e| format!("create system test log: {e}"))?;
+    let errors = log
+        .try_clone()
+        .map_err(|e| format!("clone system test log: {e}"))?;
     let status = Command::new("/bin/td-secret-tests")
-        .args(["--exact", SYSTEM_TEST, "--ignored", "--test-threads=1", "--nocapture"])
-        .env_clear().current_dir("/").stdin(Stdio::null()).stdout(log).stderr(errors).status()
+        .args([
+            "--exact",
+            SYSTEM_TEST,
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(errors)
+        .status()
         .map_err(|e| format!("run system secret test: {e}"))?;
     let mut bytes = Vec::new();
-    File::open("/run/td-secret-system-test.log").and_then(|file| file.take(1_048_577).read_to_end(&mut bytes))
+    File::open("/run/td-secret-system-test.log")
+        .and_then(|file| file.take(1_048_577).read_to_end(&mut bytes))
         .map_err(|e| format!("read system test log: {e}"))?;
     print!("{}", String::from_utf8_lossy(&bytes));
     if bytes.len() > 1_048_576 || !test_passed(status.success(), &String::from_utf8_lossy(&bytes)) {
-        return Err(format!("system secret test failed or exceeded its log ceiling: {status}"));
+        return Err(format!(
+            "system secret test failed or exceeded its log ceiling: {status}"
+        ));
     }
     println!("{SYSTEM_PASS}");
     Ok(())
@@ -212,10 +244,15 @@ fn system() -> Result<(), String> {
 
 fn main() -> std::process::ExitCode {
     if std::env::args().skip(1).eq(["--system"]) {
-        if let Err(error) = system() { eprintln!("{FAIL}: {error}"); }
+        if let Err(error) = system() {
+            eprintln!("{FAIL}: {error}");
+        }
         match Command::new("/bin/td-svc").arg("poweroff").status() {
             Ok(status) if status.success() => return std::process::ExitCode::SUCCESS,
-            result => { eprintln!("{FAIL}: system shutdown: {result:?}"); return std::process::ExitCode::FAILURE; }
+            result => {
+                eprintln!("{FAIL}: system shutdown: {result:?}");
+                return std::process::ExitCode::FAILURE;
+            }
         }
     }
     if std::process::id() != 1 {

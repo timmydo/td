@@ -69,7 +69,9 @@ pub fn recipe() -> Recipe {
     steps.push(Step::MkDir {
         path: "{root}/eh".into(),
     });
-    steps.push(Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
+    steps.push(
+        Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
+    );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
     steps.push(
         target_rustc(

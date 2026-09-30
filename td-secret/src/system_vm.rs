@@ -12,50 +12,71 @@ fn notice_pixels() -> Vec<u8> {
     use std::os::unix::fs::FileExt;
     let mut pixels = vec![0; STRIDE * 14];
     // The full-system QEMU output is fixed at 1280x800, with 32-bit pixels.
-    File::open("/dev/fb0").unwrap().read_exact_at(&mut pixels, (STRIDE * 330) as u64).unwrap();
+    File::open("/dev/fb0")
+        .unwrap()
+        .read_exact_at(&mut pixels, (STRIDE * 330) as u64)
+        .unwrap();
     pixels
 }
 
 fn notice(text: &str) {
     // Independent bitmap expectations for the visible 5x7 status face.
-    let glyphs: Vec<[u8; 7]> = text.bytes().map(|byte| match byte {
-        b' ' => [0; 7],
-        b':' => [0, 4, 4, 0, 4, 4, 0],
-        b'A' => [14, 17, 17, 31, 17, 17, 17],
-        b'C' => [14, 17, 16, 16, 16, 17, 14],
-        b'D' => [30, 17, 17, 17, 17, 17, 30],
-        b'E' => [31, 16, 16, 30, 16, 16, 31],
-        b'I' => [14, 4, 4, 4, 4, 4, 14],
-        b'K' => [17, 18, 20, 24, 20, 18, 17],
-        b'L' => [16, 16, 16, 16, 16, 16, 31],
-        b'N' => [17, 25, 21, 19, 17, 17, 17],
-        b'O' => [14, 17, 17, 17, 17, 17, 14],
-        b'R' => [30, 17, 17, 30, 20, 18, 17],
-        b'S' => [15, 16, 16, 14, 1, 1, 30],
-        b'T' => [31, 4, 4, 4, 4, 4, 4],
-        b'U' => [17, 17, 17, 17, 17, 17, 14],
-        b'Y' => [17, 17, 10, 4, 4, 4, 4],
-        _ => panic!("unsupported notice glyph"),
-    }).collect();
+    let glyphs: Vec<[u8; 7]> = text
+        .bytes()
+        .map(|byte| match byte {
+            b' ' => [0; 7],
+            b':' => [0, 4, 4, 0, 4, 4, 0],
+            b'A' => [14, 17, 17, 31, 17, 17, 17],
+            b'C' => [14, 17, 16, 16, 16, 17, 14],
+            b'D' => [30, 17, 17, 17, 17, 17, 30],
+            b'E' => [31, 16, 16, 30, 16, 16, 31],
+            b'I' => [14, 4, 4, 4, 4, 4, 14],
+            b'K' => [17, 18, 20, 24, 20, 18, 17],
+            b'L' => [16, 16, 16, 16, 16, 16, 31],
+            b'N' => [17, 25, 21, 19, 17, 17, 17],
+            b'O' => [14, 17, 17, 17, 17, 17, 14],
+            b'R' => [30, 17, 17, 30, 20, 18, 17],
+            b'S' => [15, 16, 16, 14, 1, 1, 30],
+            b'T' => [31, 4, 4, 4, 4, 4, 4],
+            b'U' => [17, 17, 17, 17, 17, 17, 14],
+            b'Y' => [17, 17, 10, 4, 4, 4, 4],
+            _ => panic!("unsupported notice glyph"),
+        })
+        .collect();
     wait(&format!("visible attention notice {text}"), || {
         let pixels = notice_pixels();
-        glyphs.iter().enumerate().all(|(column, glyph)| glyph.iter().enumerate().all(|(row, bits)| {
-            (0..6).all(|x| {
-                let at = row * 2 * STRIDE + (24 + column * 12 + x * 2) * 4;
-                let ink = x < 5 && bits & (1 << (4 - x)) != 0;
-                &pixels[at..at + 3] == if ink { &[255, 255, 255] } else { ATTENTION_BACKGROUND }
+        glyphs.iter().enumerate().all(|(column, glyph)| {
+            glyph.iter().enumerate().all(|(row, bits)| {
+                (0..6).all(|x| {
+                    let at = row * 2 * STRIDE + (24 + column * 12 + x * 2) * 4;
+                    let ink = x < 5 && bits & (1 << (4 - x)) != 0;
+                    &pixels[at..at + 3]
+                        == if ink {
+                            &[255, 255, 255]
+                        } else {
+                            ATTENTION_BACKGROUND
+                        }
+                })
             })
-        }))
+        })
     });
     eprintln!("system visible notice: {text}");
 }
 
 fn select(keyboard: &mut Keyboard, key: u8) {
-    assert!(fs::read_dir("/sys/class/input").unwrap().any(|entry| {
-        let path = entry.unwrap().path();
-        path.file_name().unwrap().to_str().unwrap().starts_with("event")
-            && fs::read_to_string(path.join("device/name")).ok().as_deref() == Some("td desktop keyboard\n")
-    }), "fixture keyboard disappeared");
+    assert!(
+        fs::read_dir("/sys/class/input").unwrap().any(|entry| {
+            let path = entry.unwrap().path();
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("event")
+                && fs::read_to_string(path.join("device/name")).ok().as_deref()
+                    == Some("td desktop keyboard\n")
+        }),
+        "fixture keyboard disappeared"
+    );
     keyboard.key(0x39); // Fresh report drains the post-close quarantine.
     keyboard.report(5, 0);
     keyboard.report(5, 0x29);
@@ -78,46 +99,87 @@ fn close(keyboard: &mut Keyboard) {
 fn system_wait(label: &str, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(180);
     while !done() {
-        assert!(Instant::now() < deadline, "system fixture timed out: {label}");
+        assert!(
+            Instant::now() < deadline,
+            "system fixture timed out: {label}"
+        );
         thread::sleep(Duration::from_millis(100));
     }
 }
 
 fn service(args: &[&str]) -> String {
     let output = Command::new("/bin/td-svc").args(args).output().unwrap();
-    assert!(output.status.success(), "td-svc {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "td-svc {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8(output.stdout).unwrap()
 }
 
 fn ready(names: &[&str]) {
     system_wait("stock services ready", || {
         let status = service(&["status"]);
-        names.iter().all(|name| status.lines().any(|line| line.starts_with(&format!("{name} ready "))))
+        names.iter().all(|name| {
+            status
+                .lines()
+                .any(|line| line.starts_with(&format!("{name} ready ")))
+        })
     });
 }
 
 fn receipt_count(locked: bool) -> usize {
-    let marker = if locked { "TD-SECRET-LOCKED app=mail name=main" } else { "TD-SECRET-READY app=mail name=main" };
-    fs::read_to_string("/run/td-portal.log").unwrap_or_default().lines().filter(|line| *line == marker).count()
+    let marker = if locked {
+        "TD-SECRET-LOCKED app=mail name=main"
+    } else {
+        "TD-SECRET-READY app=mail name=main"
+    };
+    fs::read_to_string("/run/td-portal.log")
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == marker)
+        .count()
 }
 
 fn restart_mail(locked: bool) {
     let before = receipt_count(locked);
     service(&["restart", "mail"]);
-    system_wait("fresh jailed mail credential response", || receipt_count(locked) > before);
+    system_wait("fresh jailed mail credential response", || {
+        receipt_count(locked) > before
+    });
     ready(&["mail"]);
     let output = Command::new("/bin/td-login")
-        .args(["exec-service-as", "tda65537", "--", "/bin/td-jail", "--probe-process-token", "mail", "td-mail"])
-        .output().unwrap();
-    assert!(output.status.success(), "jailed mail process: {}", String::from_utf8_lossy(&output.stderr));
+        .args([
+            "exec-service-as",
+            "tda65537",
+            "--",
+            "/bin/td-jail",
+            "--probe-process-token",
+            "mail",
+            "td-mail",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "jailed mail process: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn released(expected: &[u8]) {
     // Polling Store::open before publication can steal the worker's lock.
-    wait("system key publication", || Path::new("/run/td-secret/1000/key").exists());
+    wait("system key publication", || {
+        Path::new("/run/td-secret/1000/key").exists()
+    });
     wait("released store admission", || {
-        let Ok(store) = crate::owned_store(1000) else { return false; };
-        assert_eq!(store.application_secret("mail", "main").unwrap().unwrap(), expected);
+        let Ok(store) = crate::owned_store(1000) else {
+            return false;
+        };
+        assert_eq!(
+            store.application_secret("mail", "main").unwrap().unwrap(),
+            expected
+        );
         true
     });
 }
@@ -125,14 +187,18 @@ fn released(expected: &[u8]) {
 fn queue_write(recovery: bool, value: &[u8]) -> Process {
     let mut command = Command::new("/bin/td-login");
     command.args(["exec-as", "tester", "--", "/bin/td-secret", "set"]);
-    if recovery { command.arg("--recovery"); }
+    if recovery {
+        command.arg("--recovery");
+    }
     command.arg("mail/main").stdin(Stdio::piped());
     let mut client = Process::start(command, "/run/desktop-set.log");
     // The client prints attention instructions only after root admits the slot.
     client.0.stdin.take().unwrap().write_all(value).unwrap();
     wait("system write admitted", || {
         assert!(client.exited().is_none());
-        fs::read_to_string("/run/desktop-set.log").unwrap().contains("then W")
+        fs::read_to_string("/run/desktop-set.log")
+            .unwrap()
+            .contains("then W")
     });
     client
 }
@@ -140,7 +206,10 @@ fn queue_write(recovery: bool, value: &[u8]) -> Process {
 fn finish_write(client: &mut Process, keyboard: &mut Keyboard) {
     select(keyboard, 0x1a); // W.
     let mut status = None;
-    wait("system write finished", || { status = client.exited(); status.is_some() });
+    wait("system write finished", || {
+        status = client.exited();
+        status.is_some()
+    });
     assert!(status.unwrap().success());
     notice("CREDENTIAL STORED");
 }
@@ -151,35 +220,76 @@ fn cut(phase: &str) -> ! {
     let mut console = OpenOptions::new().write(true).open("/dev/console").unwrap();
     writeln!(console, "TD-SECRET-SYSTEM-CUT {phase}").unwrap();
     console.flush().unwrap();
-    loop { thread::sleep(Duration::from_secs(1)); }
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
 }
 
-fn checked_token(token: &VirtualCredential, expected: &'static [u8], requests: Arc<AtomicUsize>, recovery: bool) -> Token {
+fn checked_token(
+    token: &VirtualCredential,
+    expected: &'static [u8],
+    requests: Arc<AtomicUsize>,
+    recovery: bool,
+) -> Token {
     token.checked(move |request, index| {
         use crate::fido_cbor::{self, Value};
-        eprintln!("system CTAP recovery={recovery} index={index} command={}", request[0]);
+        eprintln!(
+            "system CTAP recovery={recovery} index={index} command={}",
+            request[0]
+        );
         assert_eq!(request[0], expected[index]);
         if request[0] != 4 {
             let value = fido_cbor::decode(&request[1..]).unwrap();
             if request[0] == 1 {
-                let user = value.required(&Value::Unsigned(3)).unwrap()
-                    .required(&Value::Text("id")).unwrap().bytes().unwrap();
+                let user = value
+                    .required(&Value::Unsigned(3))
+                    .unwrap()
+                    .required(&Value::Text("id"))
+                    .unwrap()
+                    .bytes()
+                    .unwrap();
                 let path = format!("{COLD_STATE}/user");
                 if recovery {
                     assert_eq!(fs::read(path).unwrap(), user);
-                    let Value::Array(excluded) = value.required(&Value::Unsigned(5)).unwrap() else { panic!("missing primary exclusion"); };
+                    let Value::Array(excluded) = value.required(&Value::Unsigned(5)).unwrap()
+                    else {
+                        panic!("missing primary exclusion");
+                    };
                     assert_eq!(excluded.len(), 1);
-                    assert_eq!(excluded[0].required(&Value::Text("id")).unwrap().bytes().unwrap(), [44; 32]);
-                } else { fs::write(path, user).unwrap(); }
+                    assert_eq!(
+                        excluded[0]
+                            .required(&Value::Text("id"))
+                            .unwrap()
+                            .bytes()
+                            .unwrap(),
+                        [44; 32]
+                    );
+                } else {
+                    fs::write(path, user).unwrap();
+                }
             }
             let field = if request[0] == 1 { 1 } else { 2 };
-            let hash: [u8; 32] = value.required(&Value::Unsigned(field)).unwrap().bytes().unwrap().try_into().unwrap();
+            let hash: [u8; 32] = value
+                .required(&Value::Unsigned(field))
+                .unwrap()
+                .bytes()
+                .unwrap()
+                .try_into()
+                .unwrap();
             assert_ne!(hash, [0; 32]);
             let path = format!("{COLD_STATE}/challenges");
             let prior = fs::read(&path).unwrap_or_default();
             assert!(prior.len().is_multiple_of(32));
-            assert!(!prior.as_chunks::<32>().0.contains(&hash), "reused token challenge");
-            let mut ledger = OpenOptions::new().append(true).create(true).mode(0o600).open(path).unwrap();
+            assert!(
+                !prior.as_chunks::<32>().0.contains(&hash),
+                "reused token challenge"
+            );
+            let mut ledger = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
             ledger.write_all(&hash).unwrap();
             // Retain freshness evidence across cuts before the token response,
             // never by flushing unrelated persistent files after a store commit.
@@ -192,17 +302,29 @@ fn checked_token(token: &VirtualCredential, expected: &'static [u8], requests: A
 struct SystemDiagnostics;
 impl Drop for SystemDiagnostics {
     fn drop(&mut self) {
-        if !thread::panicking() { return; }
+        if !thread::panicking() {
+            return;
+        }
         eprintln!("system status: {}", service(&["status"]));
         let pixels = notice_pixels();
         for row in 0..7 {
-            let line: String = (0..250).map(|column| {
-                let at = row * 2 * STRIDE + (24 + column * 2) * 4;
-                if pixels[at..at + 3] == [255, 255, 255] { '#' } else { ' ' }
-            }).collect();
+            let line: String = (0..250)
+                .map(|column| {
+                    let at = row * 2 * STRIDE + (24 + column * 2) * 4;
+                    if pixels[at..at + 3] == [255, 255, 255] {
+                        '#'
+                    } else {
+                        ' '
+                    }
+                })
+                .collect();
             eprintln!("attention pixels: {line}");
         }
-        for path in ["/run/td-portal.log", "/run/desktop-set.log", "/var/log/svc/td-profiler.log"] {
+        for path in [
+            "/run/td-portal.log",
+            "/run/desktop-set.log",
+            "/var/log/svc/td-profiler.log",
+        ] {
             if let Ok(file) = File::open(path) {
                 let mut bytes = Vec::new();
                 if file.take(65_536).read_to_end(&mut bytes).is_ok() {
@@ -222,8 +344,10 @@ fn qemu_installed_system_secret_lifecycle() {
     // Independently encode the selector event from the booted kernel's own
     // arguments. No fixture extends PCR 11 or imports the producer codec.
     let measured_cmdline = cmdline.strip_suffix('\n').unwrap();
-    let deployments: Vec<_> = measured_cmdline.split_ascii_whitespace()
-        .filter_map(|token| token.strip_prefix("td.deployment=")).collect();
+    let deployments: Vec<_> = measured_cmdline
+        .split_ascii_whitespace()
+        .filter_map(|token| token.strip_prefix("td.deployment="))
+        .collect();
     assert_eq!(deployments.len(), 1);
     assert_eq!(deployments[0].len(), 64);
     let mut event = b"td/selector-deployment/v1\0".to_vec();
@@ -233,31 +357,67 @@ fn qemu_installed_system_secret_lifecycle() {
     let mut extension = vec![0; 32];
     extension.extend_from_slice(&crate::crypto::digest(&event));
     let expected_pcr = crate::crypto::digest(&extension);
-    assert_eq!(crate::tpm::tests::qemu_boot_pcr_digest(), crate::crypto::digest(&expected_pcr),
-        "booted arguments/deployment do not match selector PCR 11");
+    assert_eq!(
+        crate::tpm::tests::qemu_boot_pcr_digest(),
+        crate::crypto::digest(&expected_pcr),
+        "booted arguments/deployment do not match selector PCR 11"
+    );
     eprintln!("\nsystem selector PCR verified after kexec");
-    let phases: Vec<_> = cmdline.split_ascii_whitespace().filter_map(|token| token.strip_prefix("td.secret-system=")).collect();
+    let phases: Vec<_> = cmdline
+        .split_ascii_whitespace()
+        .filter_map(|token| token.strip_prefix("td.secret-system="))
+        .collect();
     assert_eq!(phases.len(), 1);
     let phase = phases[0];
-    assert!(["create", "recover", "cut-queued", "cut-written", "recover-written"].contains(&phase));
+    assert!([
+        "create",
+        "recover",
+        "cut-queued",
+        "cut-written",
+        "recover-written"
+    ]
+    .contains(&phase));
     let recover = phase != "create";
     let written = phase == "recover-written";
     let mounts = fs::read_to_string("/proc/mounts").unwrap();
-    for (mount, kind, flags) in [("/", "erofs", &["ro"][..]), ("/var", "btrfs", &["rw", "nosuid", "nodev"][..])] {
-        assert!(mounts.lines().any(|line| {
-            let fields: Vec<_> = line.split_ascii_whitespace().collect();
-            fields.get(1) == Some(&mount) && fields.get(2) == Some(&kind)
-                && flags.iter().all(|flag| fields[3].split(',').any(|part| part == *flag))
-        }), "missing mounted {mount} {kind} {flags:?}");
+    for (mount, kind, flags) in [
+        ("/", "erofs", &["ro"][..]),
+        ("/var", "btrfs", &["rw", "nosuid", "nodev"][..]),
+    ] {
+        assert!(
+            mounts.lines().any(|line| {
+                let fields: Vec<_> = line.split_ascii_whitespace().collect();
+                fields.get(1) == Some(&mount)
+                    && fields.get(2) == Some(&kind)
+                    && flags
+                        .iter()
+                        .all(|flag| fields[3].split(',').any(|part| part == *flag))
+            }),
+            "missing mounted {mount} {kind} {flags:?}"
+        );
     }
     let initial = if recover {
         let bytes = sealed_bytes();
         let baseline = fs::read(format!("{COLD_STATE}/bundle-hash")).unwrap();
-        if written { assert_ne!(crate::crypto::digest(&bytes).as_slice(), baseline); }
-        else { assert_eq!(crate::crypto::digest(&bytes).as_slice(), baseline); }
-        assert_ne!(fs::read("/proc/sys/kernel/random/boot_id").unwrap(), fs::read(format!("{COLD_STATE}/boot-id")).unwrap());
-        for (path, saved) in [(CONFIG, "config"), ("/var/lib/td/principals.tsv", "principals"), ("/var/lib/td/machine-id", "machine-id")] {
-            assert_eq!(fs::read(path).unwrap(), fs::read(format!("{COLD_STATE}/{saved}")).unwrap(), "firstboot changed {path}");
+        if written {
+            assert_ne!(crate::crypto::digest(&bytes).as_slice(), baseline);
+        } else {
+            assert_eq!(crate::crypto::digest(&bytes).as_slice(), baseline);
+        }
+        assert_ne!(
+            fs::read("/proc/sys/kernel/random/boot_id").unwrap(),
+            fs::read(format!("{COLD_STATE}/boot-id")).unwrap()
+        );
+        for (path, saved) in [
+            (CONFIG, "config"),
+            ("/var/lib/td/principals.tsv", "principals"),
+            ("/var/lib/td/machine-id", "machine-id"),
+        ] {
+            assert_eq!(
+                fs::read(path).unwrap(),
+                fs::read(format!("{COLD_STATE}/{saved}")).unwrap(),
+                "firstboot changed {path}"
+            );
         }
         assert!(!store::user_path(1000).join("master").exists());
         assert!(!store::user_path(1000).join("mail.main").exists());
@@ -266,19 +426,52 @@ fn qemu_installed_system_secret_lifecycle() {
         assert!(!Path::new(COLD_STATE).exists());
         assert!(store::user_path(1000).join("master").exists());
         assert!(!store::user_path(1000).join("sealed").exists());
-        assert_eq!(crate::owned_store(1000).unwrap().get("mail", "main").unwrap().unwrap(), b"replace-me\n");
+        assert_eq!(
+            crate::owned_store(1000)
+                .unwrap()
+                .get("mail", "main")
+                .unwrap()
+                .unwrap(),
+            b"replace-me\n"
+        );
         Vec::new()
     };
-    assert!(fs::read_to_string(CONFIG).unwrap().contains("secret = \"portal\""));
+    assert!(fs::read_to_string(CONFIG)
+        .unwrap()
+        .contains("secret = \"portal\""));
     assert!(!Path::new(CONFIG).with_file_name("password").exists());
     no_release();
     assert!(Device::discover().unwrap().is_empty());
     let mut keyboard = Keyboard::new();
     fs::write(INPUT_READY, b"ready").unwrap();
-    ready(&["td-firstboot", "rootcheck", "seat", "busd", "portal", "wayland", "mail", "news"]);
-    assert_eq!(fs::read_to_string("/sys/class/graphics/fb0/virtual_size").unwrap().trim(), "1280,800");
-    assert_eq!(fs::read_to_string("/sys/class/graphics/fb0/bits_per_pixel").unwrap().trim(), "32");
-    assert_eq!(fs::read_to_string("/sys/class/graphics/fb0/stride").unwrap().trim(), STRIDE.to_string());
+    ready(&[
+        "td-firstboot",
+        "rootcheck",
+        "seat",
+        "busd",
+        "portal",
+        "wayland",
+        "mail",
+        "news",
+    ]);
+    assert_eq!(
+        fs::read_to_string("/sys/class/graphics/fb0/virtual_size")
+            .unwrap()
+            .trim(),
+        "1280,800"
+    );
+    assert_eq!(
+        fs::read_to_string("/sys/class/graphics/fb0/bits_per_pixel")
+            .unwrap()
+            .trim(),
+        "32"
+    );
+    assert_eq!(
+        fs::read_to_string("/sys/class/graphics/fb0/stride")
+            .unwrap()
+            .trim(),
+        STRIDE.to_string()
+    );
     system_wait("initial locked mail refusal", || receipt_count(true) > 0);
     assert_eq!(receipt_count(false), 0);
     no_release();
@@ -286,28 +479,49 @@ fn qemu_installed_system_secret_lifecycle() {
     crate::tpm::tests::qemu_extend(&[9; 32]);
     let token = persistent_token(!recover, recover);
     let requests = Arc::new(AtomicUsize::new(0));
-    let expected: &[u8] = if phase == "cut-written" { &[4, 2, 4, 2] }
-        else if recover { &[4, 2] } else { &[4, 1, 2, 4, 2, 4, 2] };
+    let expected: &[u8] = if phase == "cut-written" {
+        &[4, 2, 4, 2]
+    } else if recover {
+        &[4, 2]
+    } else {
+        &[4, 1, 2, 4, 2, 4, 2]
+    };
     let hid = checked_token(&token, expected, Arc::clone(&requests), false);
     discover_one();
     restart_mail(true);
     assert_eq!(requests.load(Ordering::SeqCst), 0);
     if !recover {
         select(&mut keyboard, 0x08); // E.
-        wait("primary proof request", || requests.load(Ordering::SeqCst) == 3);
+        wait("primary proof request", || {
+            requests.load(Ordering::SeqCst) == 3
+        });
         let second = persistent_token(true, true);
-        assert_ne!(token.signer.lock().unwrap().cose, second.signer.lock().unwrap().cose);
+        assert_ne!(
+            token.signer.lock().unwrap().cose,
+            second.signer.lock().unwrap().cose
+        );
         let second_requests = Arc::new(AtomicUsize::new(0));
         let second_hid = checked_token(&second, &[4, 1, 2], Arc::clone(&second_requests), true);
-        wait("system enrollment", || store::user_path(1000).join("sealed").exists());
+        wait("system enrollment", || {
+            store::user_path(1000).join("sealed").exists()
+        });
         notice("STORE ENROLLED");
         no_release();
         assert_eq!(second_hid.finish(), (3, 0));
-        wait("second token removal", || Device::discover().unwrap().len() == 1);
+        wait("second token removal", || {
+            Device::discover().unwrap().len() == 1
+        });
         close(&mut keyboard);
     } else {
-        let hashes = match phase { "cut-written" => 7, "recover-written" => 9, _ => 6 };
-        assert_eq!(fs::read(format!("{COLD_STATE}/challenges")).unwrap().len(), hashes * 32);
+        let hashes = match phase {
+            "cut-written" => 7,
+            "recover-written" => 9,
+            _ => 6,
+        };
+        assert_eq!(
+            fs::read(format!("{COLD_STATE}/challenges")).unwrap().len(),
+            hashes * 32
+        );
         select(&mut keyboard, 0x1a); // A previous boot's request cannot survive.
         notice("NO READY");
         assert_eq!(requests.load(Ordering::SeqCst), 0);
@@ -315,7 +529,13 @@ fn qemu_installed_system_secret_lifecycle() {
         close(&mut keyboard);
     }
     select(&mut keyboard, if recover { 0x15 } else { 0x18 }); // R or U.
-    released(if written { REPLACEMENT } else if recover { VALUE } else { b"replace-me\n" });
+    released(if written {
+        REPLACEMENT
+    } else if recover {
+        VALUE
+    } else {
+        b"replace-me\n"
+    });
     notice("SECRETS UNLOCKED");
     restart_mail(false);
     if !recover {
@@ -329,7 +549,11 @@ fn qemu_installed_system_secret_lifecycle() {
         restart_mail(false);
     }
     if phase.starts_with("cut-") {
-        assert_eq!(sealed_bytes(), initial, "recovery changed the persistent bundle");
+        assert_eq!(
+            sealed_bytes(),
+            initial,
+            "recovery changed the persistent bundle"
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         close(&mut keyboard);
         let mut client = queue_write(true, REPLACEMENT);
@@ -357,8 +581,17 @@ fn qemu_installed_system_secret_lifecycle() {
     if recover {
         assert_eq!(bundle, initial, "recovery changed the persistent bundle");
     } else {
-        fs::write(format!("{COLD_STATE}/bundle-hash"), crate::crypto::digest(&bundle)).unwrap();
-        for (path, saved) in [(CONFIG, "config"), ("/var/lib/td/principals.tsv", "principals"), ("/var/lib/td/machine-id", "machine-id"), ("/proc/sys/kernel/random/boot_id", "boot-id")] {
+        fs::write(
+            format!("{COLD_STATE}/bundle-hash"),
+            crate::crypto::digest(&bundle),
+        )
+        .unwrap();
+        for (path, saved) in [
+            (CONFIG, "config"),
+            ("/var/lib/td/principals.tsv", "principals"),
+            ("/var/lib/td/machine-id", "machine-id"),
+            ("/proc/sys/kernel/random/boot_id", "boot-id"),
+        ] {
             fs::copy(path, format!("{COLD_STATE}/{saved}")).unwrap();
         }
     }

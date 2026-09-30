@@ -30,11 +30,7 @@ pub fn recipe() -> Recipe {
         "{src}/libgcc/Makefile.in",
         vec![
             TextEdit::new("LIBGCC2_DEBUG_CFLAGS = -g", "LIBGCC2_DEBUG_CFLAGS = -g1", 1),
-            TextEdit::new(
-                "$(MULTILIB_CFLAGS) -g0 \\",
-                "$(MULTILIB_CFLAGS) -g1 \\",
-                1,
-            ),
+            TextEdit::new("$(MULTILIB_CFLAGS) -g0 \\", "$(MULTILIB_CFLAGS) -g1 \\", 1),
         ],
     ));
     steps.push(Step::Symlink {

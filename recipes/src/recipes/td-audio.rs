@@ -14,7 +14,10 @@ use crate::types::{Recipe, Step};
 // account before its unit selects and starts this output.
 const MAIN_RS: &str = include_str!("../../../td-audio/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
-    ("app_policy", include_str!("../../../td-busd/src/app_policy.rs")),
+    (
+        "app_policy",
+        include_str!("../../../td-busd/src/app_policy.rs"),
+    ),
     ("alsa", include_str!("../../../td-audio/src/alsa.rs")),
     ("device", include_str!("../../../td-audio/src/device.rs")),
     ("mixer", include_str!("../../../td-audio/src/mixer.rs")),
@@ -194,10 +197,12 @@ mod tests {
 
         let mut staged: Vec<String> = staged_files().into_iter().map(|(name, _)| name).collect();
         let mut expected: Vec<String> = std::iter::once("td-audio/src/main.rs".to_string())
-            .chain(MODULES.iter().map(|(name, _)| if *name == "app_policy" {
-                "td-busd/src/app_policy.rs".to_string()
-            } else {
-                format!("td-audio/src/{name}.rs")
+            .chain(MODULES.iter().map(|(name, _)| {
+                if *name == "app_policy" {
+                    "td-busd/src/app_policy.rs".to_string()
+                } else {
+                    format!("td-audio/src/{name}.rs")
+                }
             }))
             .collect();
         staged.sort_unstable();
@@ -278,7 +283,9 @@ mod tests {
         // second unsafe block that no test could see.
         assert!(MAIN_RS.contains(concat!("#![deny(un", "safe_code)]")));
         assert_eq!(
-            MAIN_RS.matches(concat!("#[allow(un", "safe_code)]")).count(),
+            MAIN_RS
+                .matches(concat!("#[allow(un", "safe_code)]"))
+                .count(),
             0
         );
         // Derived from the steps this recipe EMITS, not from the module list
@@ -311,12 +318,19 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let squeezed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
-        for (form, expected) in [("{", 1usize), ("fn", 0), ("impl", 0), ("trait", 0), ("extern", 0)] {
+        for (form, expected) in [
+            ("{", 1usize),
+            ("fn", 0),
+            ("impl", 0),
+            ("trait", 0),
+            ("extern", 0),
+        ] {
             let uses = squeezed
                 .matches(&format!("{}{form}", concat!("un", "safe")))
                 .count();
             assert_eq!(
-                uses, expected,
+                uses,
+                expected,
                 "the staged tree has {uses} `{}{form}`, expected {expected}",
                 concat!("un", "safe")
             );

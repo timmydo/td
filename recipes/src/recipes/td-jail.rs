@@ -5,7 +5,10 @@ const MAIN_RS: &str = include_str!("../../../td-jail/src/main.rs");
 #[cfg(test)]
 const BUILDER_APPLICATION_RS: &str = include_str!("../../../builder/src/application.rs");
 const MODULES: &[(&str, &str)] = &[
-    ("app_policy", include_str!("../../../td-busd/src/app_policy.rs")),
+    (
+        "app_policy",
+        include_str!("../../../td-busd/src/app_policy.rs"),
+    ),
     (
         "authority",
         include_str!("../../../td-jail/src/authority.rs"),
@@ -17,7 +20,10 @@ const MODULES: &[(&str, &str)] = &[
         "permissions",
         include_str!("../../../engine/src/permissions.rs"),
     ),
-    ("primary_account", include_str!("../../../td-authd/src/primary_account.rs")),
+    (
+        "primary_account",
+        include_str!("../../../td-authd/src/primary_account.rs"),
+    ),
     ("seccomp", include_str!("../../../td-jail/src/seccomp.rs")),
     ("sys", include_str!("../../../td-jail/src/sys.rs")),
     (
@@ -161,9 +167,7 @@ mod tests {
 
     #[test]
     fn embedded_rust_does_not_contain_live_recipe_templates() {
-        for (name, source) in
-            std::iter::once(("main", MAIN_RS)).chain(MODULES.iter().copied())
-        {
+        for (name, source) in std::iter::once(("main", MAIN_RS)).chain(MODULES.iter().copied()) {
             for template in [
                 "{root}",
                 "{src}",
@@ -253,7 +257,9 @@ mod tests {
         // either call alone, and a reviewer's mutation deleting the second
         // one stayed green until this counted them.
         assert_eq!(
-            driver.matches("require_instance_shape(stage2, descendant,").count(),
+            driver
+                .matches("require_instance_shape(stage2, descendant,")
+                .count(),
             2,
             "the driver must check the instance shape on both readings"
         );
@@ -332,9 +338,7 @@ mod tests {
             .find("recv_timeout(KILL_REAPS_POST_CEILING)")
             .expect("teardown watchdog phase");
         assert!(before < teardown);
-        assert!(watchdog_body.contains(
-            "Err(mpsc::RecvTimeoutError::Disconnected) => return"
-        ));
+        assert!(watchdog_body.contains("Err(mpsc::RecvTimeoutError::Disconnected) => return"));
     }
 
     /// The two things stage 1 must NOT do, both of which it once did.
@@ -497,35 +501,31 @@ mod tests {
         ));
         assert!(transition.contains("fn mount_reaper_probe(executable: &Path)"));
         assert!(!transition.contains("fs::copy(executable"));
-        assert!(transition.contains(
-            "Stage2Action::Probe => {\n            probe_pid1_lifecycle()?;"
-        ));
+        assert!(
+            transition.contains("Stage2Action::Probe => {\n            probe_pid1_lifecycle()?;")
+        );
         assert_eq!(transition.matches("probe_pid1_lifecycle()?").count(), 1);
         // The entry's stdio is three null devices, or under `devices=tty`
         // three clones of the terminal stage 2 proved; never anything else.
         assert!(transition.contains("let (input, output, error) = if terminal {"));
         assert!(transition.contains("Stdio::from(terminal.try_clone_to_owned()?),"));
         assert!(transition.contains("Stdio::from(fs::File::open(\"/dev/null\")?),"));
-        assert!(transition.contains(
-            "Stdio::from(OpenOptions::new().write(true).open(\"/dev/null\")?),"
-        ));
+        assert!(transition
+            .contains("Stdio::from(OpenOptions::new().write(true).open(\"/dev/null\")?),"));
         // Built per attempt, inside the closure the entry is started
         // through, so the chain sits one level deeper than it used to.
-        assert!(transition.contains(
-            ".stdin(input)\n            .stdout(output)\n            .stderr(error);"
-        ));
+        assert!(transition
+            .contains(".stdin(input)\n            .stdout(output)\n            .stderr(error);"));
         assert!(transition.contains("let (mut stage2_error, stage2_error_writer) = io::pipe()?;"));
         assert!(transition.contains("let mut child = command.spawn()?;\n        drop(command);"));
         assert!(transition.contains("sys::set_dumpable(false)?;"));
         assert!(transition.contains("sys::set_parent_death_signal()?;"));
         assert!(transition.contains("start_stage1_liveness_watcher()?;"));
         assert_eq!(transition.matches("sys::bring_up_loopback()").count(), 2);
-        assert!(transition.contains(
-            ".require_application_change(&before, application.isolate_network)?;"
-        ));
-        assert!(transition.contains(
-            "if application.isolate_network {\n            sys::bring_up_loopback()"
-        ));
+        assert!(transition
+            .contains(".require_application_change(&before, application.isolate_network)?;"));
+        assert!(transition
+            .contains("if application.isolate_network {\n            sys::bring_up_loopback()"));
         let sys = source("sys").expect("syscall source");
         for row in [
             "const SYS_IOCTL: usize = 16;",
@@ -571,27 +571,30 @@ mod tests {
             "stage 2 must install confinement and the inherited data limit before it creates a thread or launches the app"
         );
         assert!(transition.contains("if pid == application_pid {"));
-        assert!(transition.contains(
-            "application_status = Some(status);\n                    break;"
-        ));
-        assert!(transition.contains(
-            "Some(_) => terminate_and_reap_survivors().err(),\n        None => None,"
-        ));
-        assert_eq!(transition.matches("terminate_and_reap_survivors()?").count(), 1);
+        assert!(
+            transition.contains("application_status = Some(status);\n                    break;")
+        );
+        assert!(transition
+            .contains("Some(_) => terminate_and_reap_survivors().err(),\n        None => None,"));
+        assert_eq!(
+            transition
+                .matches("terminate_and_reap_survivors()?")
+                .count(),
+            1
+        );
         assert!(transition.contains("Some(_) => terminate_and_reap_survivors().err(),"));
         assert!(transition.contains("sys::terminate_namespace,"));
-        assert!(transition.contains(
-            "const SURVIVOR_TERM_TIMEOUT: Duration = Duration::from_secs(2);"
-        ));
-        assert!(transition.contains(
-            "const SURVIVOR_KILL_TIMEOUT: Duration = Duration::from_secs(2);"
-        ));
+        assert!(
+            transition.contains("const SURVIVOR_TERM_TIMEOUT: Duration = Duration::from_secs(2);")
+        );
+        assert!(
+            transition.contains("const SURVIVOR_KILL_TIMEOUT: Duration = Duration::from_secs(2);")
+        );
         assert!(transition.contains(
             "drain(SURVIVOR_TERM_TIMEOUT, &mut reaped, false)? == DrainOutcome::Drained"
         ));
-        assert!(transition.contains(
-            "drain(SURVIVOR_KILL_TIMEOUT, &mut reaped, true)? == DrainOutcome::Drained"
-        ));
+        assert!(transition
+            .contains("drain(SURVIVOR_KILL_TIMEOUT, &mut reaped, true)? == DrainOutcome::Drained"));
         assert!(transition.contains("probe_pid1_survivor_cleanup()"));
         assert!(transition.contains(
             "require_single_survivor_signal(&term_reaped, term_pid, sys::SIGTERM, \"TERM cleanup\")"
@@ -703,12 +706,12 @@ mod tests {
             assert!(authority.contains(fragment));
         }
 
-        let declaration = ApplicationDeclaration::new(
-            "empty-runtime",
-            crate::ladder::TD_JAIL_FIXTURE_ENTRY,
-        )
-        .and_then(|declaration| declaration.with_alias(crate::ladder::TD_JAIL_FIXTURE_ALIAS))
-        .expect("fixture declaration");
+        let declaration =
+            ApplicationDeclaration::new("empty-runtime", crate::ladder::TD_JAIL_FIXTURE_ENTRY)
+                .and_then(|declaration| {
+                    declaration.with_alias(crate::ladder::TD_JAIL_FIXTURE_ALIAS)
+                })
+                .expect("fixture declaration");
         let manifest = declaration
             .manifest(
                 crate::ladder::TD_JAIL_FIXTURE_NAME,
@@ -719,11 +722,7 @@ mod tests {
         let permissions = PermissionPolicy::new()
             .with_socket(PermissionSocket::Wayland)
             .and_then(|permissions| {
-                permissions.with_filesystem(
-                    "xdg-download",
-                    FilesystemAccess::ReadWrite,
-                    true,
-                )
+                permissions.with_filesystem("xdg-download", FilesystemAccess::ReadWrite, true)
             })
             .and_then(|permissions| permissions.with_memory_high(48 * 1024 * 1024))
             .and_then(|permissions| permissions.with_memory_max(64 * 1024 * 1024))
@@ -765,7 +764,10 @@ mod tests {
                 td_engine::application_spec::APPLICATION_UID
             ),
         );
-        assert_ne!(elsewhere, spec, "the compiled spec must name the bus at all");
+        assert_ne!(
+            elsewhere, spec,
+            "the compiled spec must name the bus at all"
+        );
         assert!(
             target_authority::test_validate_spec_environment(
                 &elsewhere,

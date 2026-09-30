@@ -149,7 +149,11 @@ pub(crate) fn run(
     // operator's data.
     let scratch = Scratch::new(runner.ladder_work_dir())?;
     let source_directory = scratch.dir.join("release-source");
-    source.stage_with_upstream(runner.repo_root(), &source_directory, Some(&options.source_upstream))?;
+    source.stage_with_upstream(
+        runner.repo_root(),
+        &source_directory,
+        Some(&options.source_upstream),
+    )?;
     println!("   [bundle] including source commit {}", source.revision());
 
     println!("   [bundle] staging boot payloads");

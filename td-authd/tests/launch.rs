@@ -3,10 +3,8 @@ use super::*;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 fn primary(name: &str) -> crate::primary_account::PrimaryAccount {
-    crate::primary_account::parse(&format!(
-        "{name}:x:1000:1000:human:/home/{name}:/bin/sh\n"
-    ))
-    .unwrap()
+    crate::primary_account::parse(&format!("{name}:x:1000:1000:human:/home/{name}:/bin/sh\n"))
+        .unwrap()
 }
 
 fn config() -> Config {
@@ -51,18 +49,39 @@ fn primary_configuration_resolves_once_and_keeps_the_ledger_and_helper_checks() 
     let mut loads = 0;
     let config = Config::parse_with_primary(
         &["--primary", "--peer-uid", "993"].map(String::from),
-        || { loads += 1; Ok(primary("alice")) },
-    ).unwrap();
+        || {
+            loads += 1;
+            Ok(primary("alice"))
+        },
+    )
+    .unwrap();
     assert_eq!(loads, 1);
     assert_eq!(config.peer_uid(), 993);
-    assert_eq!(config.checker().get_args().collect::<Vec<_>>(),
-        ["check-launch-session", "alice", "1000", "993"]);
-    assert_eq!(config.terminal("generation", 1, Program::Home).get_args().collect::<Vec<_>>(),
-        ["exec-as", "alice", "--", "/bin/td-authd", "terminal-exec", "1000", "generation", "1"]);
+    assert_eq!(
+        config.checker().get_args().collect::<Vec<_>>(),
+        ["check-launch-session", "alice", "1000", "993"]
+    );
+    assert_eq!(
+        config
+            .terminal("generation", 1, Program::Home)
+            .get_args()
+            .collect::<Vec<_>>(),
+        [
+            "exec-as",
+            "alice",
+            "--",
+            "/bin/td-authd",
+            "terminal-exec",
+            "1000",
+            "generation",
+            "1"
+        ]
+    );
     assert!(Config::parse_with_primary(
         &["--primary", "--peer-uid", "993"].map(String::from),
         || Err("invalid primary database".into()),
-    ).is_err_and(|error| error == "invalid primary database"));
+    )
+    .is_err_and(|error| error == "invalid primary database"));
 }
 
 #[test]
@@ -81,17 +100,30 @@ fn malformed_primary_configuration_never_reads_the_account_database() {
         vec!["--primary", "--peer-uid", "993", "extra"],
         vec!["--primary", "--uid", "1000", "--peer-uid", "993"],
         vec!["--primary", "--user", "alice", "--peer-uid", "993"],
-        vec!["--user", "alice", "--primary", "--uid", "1000", "--peer-uid", "993"],
+        vec![
+            "--user",
+            "alice",
+            "--primary",
+            "--uid",
+            "1000",
+            "--peer-uid",
+            "993",
+        ],
     ] {
         let mut loaded = false;
         let args: Vec<_> = args.into_iter().map(String::from).collect();
-        assert!(Config::parse_with_primary(&args, || { loaded = true; Ok(primary("alice")) }).is_err());
+        assert!(Config::parse_with_primary(&args, || {
+            loaded = true;
+            Ok(primary("alice"))
+        })
+        .is_err());
         assert!(!loaded, "{args:?}");
     }
     assert!(Config::parse_with_primary(
         &["--user", "alice", "--uid", "1000", "--peer-uid", "993"].map(String::from),
         || Err("named configuration must not resolve a primary".into()),
-    ).is_ok());
+    )
+    .is_ok());
 }
 
 #[test]
@@ -434,22 +466,10 @@ fn readiness_names_include_fresh_generations_and_fit_unix_socket_bounds() {
     assert_ne!(a, b);
     assert_eq!(a.len(), 32);
     assert_eq!(b.len(), 32);
-    let first = terminal_command(
-        1000,
-        &a,
-        u64::MAX,
-        Program::Home,
-        || Ok(primary("tester")),
-    )
-    .unwrap();
-    let second = terminal_command(
-        1000,
-        &b,
-        u64::MAX,
-        Program::Home,
-        || Ok(primary("tester")),
-    )
-    .unwrap();
+    let first =
+        terminal_command(1000, &a, u64::MAX, Program::Home, || Ok(primary("tester"))).unwrap();
+    let second =
+        terminal_command(1000, &b, u64::MAX, Program::Home, || Ok(primary("tester"))).unwrap();
     assert_ne!(first.get_args().last(), second.get_args().last());
     assert!(first.get_args().last().unwrap().len() < 108);
 }
@@ -566,18 +586,22 @@ fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
 fn task_and_agent_directories_follow_the_validated_primary_account() {
     for name in ["alice", "bob"] {
         for program in [Program::Task, Program::Codex, Program::Claude] {
-            let command = terminal_command(
-                1000,
-                "000102030405060708090a0b0c0d0e0f",
-                1,
-                program,
-                || Ok(primary(name)),
-            )
-            .unwrap();
+            let command =
+                terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 1, program, || {
+                    Ok(primary(name))
+                })
+                .unwrap();
             let expected = format!("/home/{name}/src/td-vm/work");
-            assert!(command.get_args().collect::<Vec<_>>().windows(2).any(|pair| {
-                pair == [std::ffi::OsStr::new("--working-directory"), std::ffi::OsStr::new(&expected)]
-            }));
+            assert!(command
+                .get_args()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|pair| {
+                    pair == [
+                        std::ffi::OsStr::new("--working-directory"),
+                        std::ffi::OsStr::new(&expected),
+                    ]
+                }));
         }
     }
 }

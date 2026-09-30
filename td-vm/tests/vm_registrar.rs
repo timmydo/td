@@ -175,7 +175,10 @@ fn launch(directory: &Path, policy: &Path, operator: u32) -> Result<Server> {
 fn request(directory: &Path, uid: u32, args: &[&str], success: bool) -> Result<Output> {
     let repository = directory.parent().ok_or("fixture root")?.join("origin.git");
     let mut words = args.to_vec();
-    if matches!(args.first(), Some(&"enroll" | &"reserve" | &"start" | &"revoke")) {
+    if matches!(
+        args.first(),
+        Some(&"enroll" | &"reserve" | &"start" | &"revoke")
+    ) {
         words.insert(1, repository.to_str().ok_or("origin path")?);
     }
     invoke(
@@ -190,7 +193,9 @@ fn request(directory: &Path, uid: u32, args: &[&str], success: bool) -> Result<O
 
 #[test]
 fn starting_commits_survive_moving_refs_gc_and_revoke_retries() -> Result<()> {
-    if in_trusted_root("starting_commits_survive_moving_refs_gc_and_revoke_retries")? { return Ok(()); }
+    if in_trusted_root("starting_commits_survive_moving_refs_gc_and_revoke_retries")? {
+        return Ok(());
+    }
     for format in ["sha1", "sha256"] {
         let (root, policy) = fixture_format(format)?;
         let uid = fs::metadata("/proc/self")?.uid();
@@ -199,7 +204,10 @@ fn starting_commits_survive_moving_refs_gc_and_revoke_retries() -> Result<()> {
         let git = host_git()?;
         let repo = root.0.join("origin.git");
         let run = |args: &[&str], success| -> Result<String> {
-            let output = invoke(Command::new(&git).arg("--git-dir").arg(&repo).args(args), success)?;
+            let output = invoke(
+                Command::new(&git).arg("--git-dir").arg(&repo).args(args),
+                success,
+            )?;
             Ok(String::from_utf8(output.stdout)?.trim_end().into())
         };
         let start_ref = format!("refs/td-vm/start/{ID}");
@@ -207,14 +215,31 @@ fn starting_commits_survive_moving_refs_gc_and_revoke_retries() -> Result<()> {
         assert!(run(&["for-each-ref", &start_ref], true)?.is_empty());
         request(&directory, uid, &["enroll", ID, "task", KEY], true)?;
         request(&directory, uid, &["start", ID, "other", "main"], false)?;
-        invoke(Command::new(BIN).arg("request").arg(&directory).arg(uid.to_string())
-            .args(["start", "/srv/git/wrong.git", ID, "task", "main"]), false)?;
+        invoke(
+            Command::new(BIN)
+                .arg("request")
+                .arg(&directory)
+                .arg(uid.to_string())
+                .args(["start", "/srv/git/wrong.git", ID, "task", "main"]),
+            false,
+        )?;
         // A lost reply is harmless: the next request reads the already selected ref.
         let first = request(&directory, uid, &["start", ID, "task", "main"], true)?.stdout;
         let old = run(&["rev-parse", "HEAD"], true)?;
         assert_eq!(run(&["rev-parse", &start_ref], true)?, old);
-        let replacement = run(&["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-            "commit-tree", "HEAD^{tree}", "-m", "unrelated replacement"], true)?;
+        let replacement = run(
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit-tree",
+                "HEAD^{tree}",
+                "-m",
+                "unrelated replacement",
+            ],
+            true,
+        )?;
         assert_ne!(old, replacement);
         for name in ["refs/heads/main", "refs/heads/task"] {
             run(&["update-ref", name, &replacement], true)?;
@@ -224,22 +249,55 @@ fn starting_commits_survive_moving_refs_gc_and_revoke_retries() -> Result<()> {
         run(&["gc", "--prune=now"], true)?;
         drop(server);
         let _server = launch(&directory, &policy, uid)?;
-        assert_eq!(request(&directory, uid, &["start", ID, "task", "main"], true)?.stdout, first);
-        assert_eq!(request(&directory, uid, &["start", ID, "task", &old], true)?.stdout, first);
+        assert_eq!(
+            request(&directory, uid, &["start", ID, "task", "main"], true)?.stdout,
+            first
+        );
+        assert_eq!(
+            request(&directory, uid, &["start", ID, "task", &old], true)?.stdout,
+            first
+        );
         request(&directory, uid, &["start", ID, "task", &replacement], false)?;
         // A normal clone's head mapping excludes internal refs. Fetch the anchor explicitly.
         let clone = root.0.join("clone");
-        invoke(Command::new(&git).args(["init", "--initial-branch=main"])
-            .arg(format!("--object-format={format}")).arg(&clone), true)?;
-        invoke(Command::new(&git).arg("-C").arg(&clone).args(["fetch", "--no-tags"])
-            .arg(&repo).arg(&start_ref), true)?;
-        let fetched = invoke(Command::new(&git).arg("-C").arg(&clone)
-            .args(["rev-parse", "FETCH_HEAD"]), true)?;
+        invoke(
+            Command::new(&git)
+                .args(["init", "--initial-branch=main"])
+                .arg(format!("--object-format={format}"))
+                .arg(&clone),
+            true,
+        )?;
+        invoke(
+            Command::new(&git)
+                .arg("-C")
+                .arg(&clone)
+                .args(["fetch", "--no-tags"])
+                .arg(&repo)
+                .arg(&start_ref),
+            true,
+        )?;
+        let fetched = invoke(
+            Command::new(&git)
+                .arg("-C")
+                .arg(&clone)
+                .args(["rev-parse", "FETCH_HEAD"]),
+            true,
+        )?;
         assert_eq!(String::from_utf8(fetched.stdout)?.trim(), old);
         let sibling = "1123456789abcdef0123456789abcdef";
         let sibling_key = KEY.replace("IAEB", "IAgI");
-        request(&directory, uid, &["enroll", sibling, "sibling", &sibling_key], true)?;
-        request(&directory, uid, &["start", sibling, "sibling", "main"], true)?;
+        request(
+            &directory,
+            uid,
+            &["enroll", sibling, "sibling", &sibling_key],
+            true,
+        )?;
+        request(
+            &directory,
+            uid,
+            &["start", sibling, "sibling", "main"],
+            true,
+        )?;
         let sibling_ref = format!("refs/td-vm/start/{sibling}");
         assert_eq!(run(&["rev-parse", &sibling_ref], true)?, replacement);
         // Ref-lock failure revokes the key but cannot acknowledge completed cleanup.
@@ -259,9 +317,19 @@ fn starting_commits_survive_moving_refs_gc_and_revoke_retries() -> Result<()> {
         assert_eq!(run(&["rev-parse", &sibling_ref], true)?, replacement);
         // A damaged/deleted recorded anchor is refused, never silently reselected.
         run(&["update-ref", "-d", &sibling_ref], true)?;
-        request(&directory, uid, &["start", sibling, "sibling", &replacement], false)?;
+        request(
+            &directory,
+            uid,
+            &["start", sibling, "sibling", &replacement],
+            false,
+        )?;
         run(&["symbolic-ref", &sibling_ref, "refs/heads/main"], true)?;
-        request(&directory, uid, &["start", sibling, "sibling", "main"], false)?;
+        request(
+            &directory,
+            uid,
+            &["start", sibling, "sibling", "main"],
+            false,
+        )?;
         request(&directory, uid, &["revoke", sibling], false)?;
         assert_eq!(run(&["rev-parse", "refs/heads/main"], true)?, replacement);
     }
@@ -303,8 +371,14 @@ fn registrar_authenticates_accounts_and_preserves_registry_across_restart() -> R
     request(&directory, uid, &["enroll", ID, "task", KEY], true)?;
     request(&directory, uid, &["reserve", ID, "followup"], true)?;
     let enrolled = fs::read(&policy)?;
-    invoke(Command::new(BIN).arg("request").arg(&directory).arg(uid.to_string())
-        .args(["revoke", "/srv/git/wrong.git", ID]), false)?;
+    invoke(
+        Command::new(BIN)
+            .arg("request")
+            .arg(&directory)
+            .arg(uid.to_string())
+            .args(["revoke", "/srv/git/wrong.git", ID]),
+        false,
+    )?;
     assert_eq!(fs::read(&policy)?, enrolled);
     let mut bad = UnixStream::connect(directory.join("control"))?;
     bad.write_all(b"TDVM-REGISTRAR-2\nrevoke ../private/registry\n")?;
@@ -509,26 +583,50 @@ fn clone_reply(home: &Path, mismatch: bool) -> Result<Output> {
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(pair) => break pair,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
                 Err(e) => return Err(e.to_string()),
             }
         };
-        stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|e| e.to_string())?;
         let mut bytes = Vec::new();
         std::io::BufReader::new((&stream).take(vm_wire::MAX_LINE as u64 + 1))
-            .read_until(b'\n', &mut bytes).map_err(|e| e.to_string())?;
+            .read_until(b'\n', &mut bytes)
+            .map_err(|e| e.to_string())?;
         let message = vm_wire::Message::decode(&bytes)?;
         assert_eq!(message.verb, vm_wire::WORKSPACE);
         let mut plan = vm_wire::workspace::Plan::parse(&message.data)?;
-        assert_eq!(plan.id, id); assert_eq!(plan.commit, start); assert_eq!(plan.branch, "one");
+        assert_eq!(plan.id, id);
+        assert_eq!(plan.commit, start);
+        assert_eq!(plan.branch, "one");
         assert_eq!(plan.guest_key, format!("ssh-ed25519 {KEY}"));
-        if mismatch { plan.branch = "other".into(); }
-        stream.write_all(&vm_wire::Message::new(message.id, vm_wire::OK, 0, vm_wire::workspace::ready(&plan)).encode()?)
+        if mismatch {
+            plan.branch = "other".into();
+        }
+        stream
+            .write_all(
+                &vm_wire::Message::new(
+                    message.id,
+                    vm_wire::OK,
+                    0,
+                    vm_wire::workspace::ready(&plan),
+                )
+                .encode()?,
+            )
             .map_err(|e| e.to_string())?;
         Ok(())
     });
-    let result = invoke(Command::new(env!("CARGO_BIN_EXE_td-vm")).env("TD_VM_HOME", home)
-        .args(["workspace", "clone", "one"]), !mismatch);
+    let result = invoke(
+        Command::new(env!("CARGO_BIN_EXE_td-vm"))
+            .env("TD_VM_HOME", home)
+            .args(["workspace", "clone", "one"]),
+        !mismatch,
+    );
     let joined = peer.join().map_err(|_| "clone peer fixture panicked")?;
     fs::remove_file(path)?;
     joined?;
@@ -539,7 +637,11 @@ fn enroll_reply(home: &Path, name: &str, key: &str, success: bool) -> Result<Out
     use std::io::BufRead;
     let directory = home.join("instances").join(name);
     let record = fs::read_to_string(directory.join("workspace"))?;
-    let id = record.lines().nth(1).ok_or("missing instance ID")?.to_string();
+    let id = record
+        .lines()
+        .nth(1)
+        .ok_or("missing instance ID")?
+        .to_string();
     let path = directory.join("bridge");
     let listener = UnixListener::bind(&path)?;
     listener.set_nonblocking(true)?;
@@ -549,13 +651,21 @@ fn enroll_reply(home: &Path, name: &str, key: &str, success: bool) -> Result<Out
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(pair) => break pair,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
                 Err(e) => return Err(format!("guest fixture accept: {e}")),
             }
         };
-        stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|e| e.to_string())?;
         let mut line = String::new();
-        std::io::BufReader::new((&stream).take(1024)).read_line(&mut line).map_err(|e| e.to_string())?;
+        std::io::BufReader::new((&stream).take(1024))
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
         let mut fields = line.split_whitespace();
         assert_eq!(fields.next(), Some("TDVM1"));
         let request = fields.next().ok_or("missing request ID")?;
@@ -567,10 +677,16 @@ fn enroll_reply(home: &Path, name: &str, key: &str, success: bool) -> Result<Out
         assert!(fields.next().is_none());
         let data = format!("TDVM-GIT-KEY-1\n{id}\nssh-ed25519 {key}\n");
         let encoded: String = data.bytes().map(|byte| format!("{byte:02x}")).collect();
-        writeln!(stream, "TDVM1 {request} ok 0 {} {encoded}", data.len()).map_err(|e| e.to_string())?;
+        writeln!(stream, "TDVM1 {request} ok 0 {} {encoded}", data.len())
+            .map_err(|e| e.to_string())?;
         Ok(())
     });
-    let result = invoke(Command::new(env!("CARGO_BIN_EXE_td-vm")).env("TD_VM_HOME", home).args(["workspace", "enroll", name]), success);
+    let result = invoke(
+        Command::new(env!("CARGO_BIN_EXE_td-vm"))
+            .env("TD_VM_HOME", home)
+            .args(["workspace", "enroll", name]),
+        success,
+    );
     let joined = peer.join().map_err(|_| "guest fixture panicked")?;
     fs::remove_file(path)?;
     joined?;
@@ -579,7 +695,9 @@ fn enroll_reply(home: &Path, name: &str, key: &str, success: bool) -> Result<Out
 
 #[test]
 fn manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion() -> Result<()> {
-    if in_trusted_root("manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion")? { return Ok(()); }
+    if in_trusted_root("manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion")? {
+        return Ok(());
+    }
     let (root, policy) = fixture()?;
     let uid = fs::metadata("/proc/self")?.uid();
     let socket = root.0.join("socket");
@@ -595,16 +713,42 @@ fn manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion() -> R
     let input = root.0.join("profile");
     fs::write(&input, format!("TDVM-GIT-PROFILE-1\nrepository={}\naddress=10.0.2.2\nport=22\nuser=test\nserver-uid={uid}\nsocket={}\nregistrar={}\ngit={}\nhost-key=ssh-ed25519 {KEY}\nauthor-name=Fixture\nauthor-email=fixture@example.invalid\n", repository.display(), socket.display(), client.display(), git.display()))?;
     fs::set_permissions(&input, fs::Permissions::from_mode(0o600))?;
-    let manager = |args: &[&str], success| invoke(Command::new(env!("CARGO_BIN_EXE_td-vm")).env("TD_VM_HOME", &home).args(args), success);
-    manager(&["git-profile", "set", input.to_str().ok_or("profile path")?], true)?;
+    let manager = |args: &[&str], success| {
+        invoke(
+            Command::new(env!("CARGO_BIN_EXE_td-vm"))
+                .env("TD_VM_HOME", &home)
+                .args(args),
+            success,
+        )
+    };
+    manager(
+        &["git-profile", "set", input.to_str().ok_or("profile path")?],
+        true,
+    )?;
     let template = home.join("templates/base");
     DirBuilder::new().mode(0o700).create(&template)?;
-    invoke(Command::new("qemu-img").args(["create", "-f", "qcow2"]).arg(template.join("disk.qcow2")).arg("4M"), true)?;
-    for name in ["one", "two"] { manager(&["create", name, "base"], true)?; }
+    invoke(
+        Command::new("qemu-img")
+            .args(["create", "-f", "qcow2"])
+            .arg(template.join("disk.qcow2"))
+            .arg("4M"),
+        true,
+    )?;
+    for name in ["one", "two"] {
+        manager(&["create", name, "base"], true)?;
+    }
     let record = home.join("instances/one/workspace");
     let original = fs::read_to_string(&record)?;
     let id = original.lines().nth(1).ok_or("missing ID")?;
-    let git_cmd = |args: &[&str]| invoke(Command::new(&git).arg("--git-dir").arg(&repository).args(args), true);
+    let git_cmd = |args: &[&str]| {
+        invoke(
+            Command::new(&git)
+                .arg("--git-dir")
+                .arg(&repository)
+                .args(args),
+            true,
+        )
+    };
     let main = git_cmd(&["rev-parse", "refs/heads/main"])?.stdout;
     // An existing unowned branch refuses enrollment after the pending record
     // is durable. Clearing this fixture conflict allows the same-key retry.
@@ -625,8 +769,15 @@ fn manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion() -> R
     assert!(enrolled.contains(&format!("\nenrolled\nssh-ed25519 {KEY}\n")));
     let authority = fs::read(&policy)?;
     // Simulate loss of the host acknowledgement before publishing the v3 record.
-    fs::write(&record, enrolled.replace("TDVM-WORKSPACE-3", "TDVM-WORKSPACE-2")
-        .replace(&format!("{start}\nTDVM-GIT-PROFILE-1"), "TDVM-GIT-PROFILE-1"))?;
+    fs::write(
+        &record,
+        enrolled
+            .replace("TDVM-WORKSPACE-3", "TDVM-WORKSPACE-2")
+            .replace(
+                &format!("{start}\nTDVM-GIT-PROFILE-1"),
+                "TDVM-GIT-PROFILE-1",
+            ),
+    )?;
     enroll_reply(&home, "one", KEY, true)?;
     assert_eq!(fs::read_to_string(&record)?, enrolled);
     assert_eq!(fs::read(&policy)?, authority);
@@ -668,15 +819,23 @@ fn manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion() -> R
     assert!(authority.contains(&format!("key={second_id} {other_key}")));
     assert_eq!(git_cmd(&["rev-parse", "refs/heads/main"])?.stdout, main);
     assert_eq!(git_cmd(&["rev-parse", "refs/heads/one"])?.stdout, main);
-    assert_eq!(fs::read_to_string(home.join("instances/two/workspace"))?, second);
+    assert_eq!(
+        fs::read_to_string(home.join("instances/two/workspace"))?,
+        second
+    );
     assert!(git_cmd(&["for-each-ref", &anchor])?.stdout.is_empty());
-    assert_eq!(git_cmd(&["rev-parse", &format!("refs/td-vm/start/{second_id}")])?.stdout, main);
+    assert_eq!(
+        git_cmd(&["rev-parse", &format!("refs/td-vm/start/{second_id}")])?.stdout,
+        main
+    );
     Ok(())
 }
 
 #[test]
 fn registrar_crash_retains_dispatcher_lifetime_before_rebind() -> Result<()> {
-    if in_trusted_root("registrar_crash_retains_dispatcher_lifetime_before_rebind")? { return Ok(()); }
+    if in_trusted_root("registrar_crash_retains_dispatcher_lifetime_before_rebind")? {
+        return Ok(());
+    }
     let (root, policy) = fixture()?;
     let uid = fs::metadata("/proc/self")?.uid();
     let socket = root.0.join("socket");
@@ -685,7 +844,10 @@ fn registrar_crash_retains_dispatcher_lifetime_before_rebind() -> Result<()> {
     let release = root.0.join("release");
     let done = root.0.join("done");
     // A host-only Rust dispatcher fixture keeps the production stdin contract.
-    fs::write(&source, format!(r#"
+    fs::write(
+        &source,
+        format!(
+            r#"
 use std::{{fs, path::Path, process::{{Command, Stdio}}, time::{{Duration, Instant}}}};
 fn main() {{
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -702,17 +864,29 @@ fn main() {{
     if delayed {{ fs::write({done:?}, b"done").unwrap(); }}
     std::process::exit(status.code().unwrap_or(125));
 }}
-"#))?;
-    invoke(Command::new("rustc").args(["--edition", "2021", "-C", "linker=gcc"]).arg(&source).arg("-o").arg(installed(&policy)?), true)?;
+"#
+        ),
+    )?;
+    invoke(
+        Command::new("rustc")
+            .args(["--edition", "2021", "-C", "linker=gcc"])
+            .arg(&source)
+            .arg("-o")
+            .arg(installed(&policy)?),
+        true,
+    )?;
     let mut server = launch(&socket, &policy, uid)?;
     let client_socket = socket.clone();
     let client = std::thread::spawn(move || {
         request(&client_socket, uid, &["enroll", ID, "task", KEY], false)
-            .map(|_| ()).map_err(|error| error.to_string())
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     });
     let deadline = Instant::now() + Duration::from_secs(10);
     while !marker.exists() {
-        if Instant::now() >= deadline { return Err("delayed dispatcher did not start".into()); }
+        if Instant::now() >= deadline {
+            return Err("delayed dispatcher did not start".into());
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
     server.0.kill()?;
@@ -724,10 +898,15 @@ fn main() {{
     fs::write(&release, b"release")?;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done.exists() {
-        if Instant::now() >= deadline { return Err("delayed dispatcher did not finish".into()); }
+        if Instant::now() >= deadline {
+            return Err("delayed dispatcher did not finish".into());
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(refused, "replacement listener overtook an unfinished enrollment");
+    assert!(
+        refused,
+        "replacement listener overtook an unfinished enrollment"
+    );
     assert!(fs::read_to_string(&policy)?.contains(&format!("key={ID} {KEY}")));
     let _server = loop {
         match launch(&socket, &policy, uid) {

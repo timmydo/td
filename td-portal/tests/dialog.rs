@@ -146,7 +146,9 @@ impl Peer {
     }
 
     fn send_fd(&mut self, object: u32, opcode: u16, body: Builder, file: &File) {
-        self.connection.send(object, opcode, body, Some(file)).unwrap();
+        self.connection
+            .send(object, opcode, body, Some(file))
+            .unwrap();
     }
 
     /// Read one frame the client submitted: the pool and its descriptor, the
@@ -429,7 +431,10 @@ fn dialog_presents_pixels_and_accepts_a_physical_return() {
     };
     match receiver.recv_timeout(timeout).unwrap() {
         Notice::Completed(Ok(Outcome::Accepted(uris))) => {
-            assert_eq!(uris, vec!["file:///home/td/Downloads/report.txt".to_string()]);
+            assert_eq!(
+                uris,
+                vec!["file:///home/td/Downloads/report.txt".to_string()]
+            );
         }
         other => panic!("expected an accepted completion, got {other:?}"),
     }

@@ -58,7 +58,10 @@ const MODULES: &[(&str, &str)] = &[
     ("order", include_str!("../../../td-svc/src/order.rs")),
     ("pair", include_str!("../../../td-svc/src/pair.rs")),
     ("procfs", include_str!("../../../td-svc/src/procfs.rs")),
-    ("supervise", include_str!("../../../td-svc/src/supervise.rs")),
+    (
+        "supervise",
+        include_str!("../../../td-svc/src/supervise.rs"),
+    ),
     ("sys", include_str!("../../../td-svc/src/sys.rs")),
     ("table", include_str!("../../../td-svc/src/table.rs")),
 ];
@@ -122,7 +125,9 @@ pub fn recipe() -> Recipe {
     steps.push(Step::MkDir {
         path: "{root}/eh".into(),
     });
-    steps.push(Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
+    steps.push(
+        Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
+    );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
     steps.push(
         target_rustc(
@@ -224,10 +229,24 @@ mod tests {
     fn embedded_rust_does_not_contain_live_recipe_templates() {
         for (name, source) in std::iter::once(("main", MAIN_RS))
             .chain(MODULES.iter().copied())
-            .chain(std::iter::once(("pair-tests", include_str!("../../../td-svc/tests/pair.rs"))))
+            .chain(std::iter::once((
+                "pair-tests",
+                include_str!("../../../td-svc/tests/pair.rs"),
+            )))
         {
-            for template in ["{root}", "{src}", "{out}", "{tools}", "{jobs}", "{in:", "{payload:"] {
-                assert!(!source.contains(template), "{name}.rs contains recipe template {template}");
+            for template in [
+                "{root}",
+                "{src}",
+                "{out}",
+                "{tools}",
+                "{jobs}",
+                "{in:",
+                "{payload:",
+            ] {
+                assert!(
+                    !source.contains(template),
+                    "{name}.rs contains recipe template {template}"
+                );
             }
         }
     }
@@ -291,7 +310,10 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        assert!(cgroup.contains(&roster), "the controller roster is not {roster}");
+        assert!(
+            cgroup.contains(&roster),
+            "the controller roster is not {roster}"
+        );
         assert!(
             cgroup.contains("write!(request, \"+{controller} \")"),
             "the subtree write no longer derives from the roster"

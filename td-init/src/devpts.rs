@@ -83,11 +83,7 @@ fn devpts_options(table: &str, target: &str) -> Option<String> {
     for line in table.lines() {
         let mut fields = line.split_whitespace();
         let found = match (fields.next(), fields.next(), fields.next(), fields.next()) {
-            (Some(_), Some(mounted), Some("devpts"), Some(options))
-                if mounted == target =>
-            {
-                options
-            }
+            (Some(_), Some(mounted), Some("devpts"), Some(options)) if mounted == target => options,
             _ => continue,
         };
         return Some(found.to_string());
@@ -122,8 +118,12 @@ fn verify(table: &str, dir: &Path) -> Result<Verified, String> {
         }
     }
     let ptmx = dir.join("ptmx");
-    let stat = fs::metadata(&ptmx)
-        .map_err(|e| format!("{}: {e} — devpts mounted without its own ptmx", ptmx.display()))?;
+    let stat = fs::metadata(&ptmx).map_err(|e| {
+        format!(
+            "{}: {e} — devpts mounted without its own ptmx",
+            ptmx.display()
+        )
+    })?;
     if !stat.file_type().is_char_device() {
         return Err(format!("{} is not a character device", ptmx.display()));
     }
@@ -279,7 +279,10 @@ mod tests {
     #[test]
     fn a_missing_mount_is_named_rather_than_its_options_scanned() {
         let error = verify("", Path::new("/dev/pts")).unwrap_err();
-        assert!(error.contains("no devpts is mounted on /dev/pts"), "{error}");
+        assert!(
+            error.contains("no devpts is mounted on /dev/pts"),
+            "{error}"
+        );
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {

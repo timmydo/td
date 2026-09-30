@@ -145,7 +145,10 @@ fn rustc_sysroot(rustc: &Path) -> Result<String, String> {
         .output()
         .map_err(|e| format!("spawn {}: {e}", rustc.display()))?;
     if !out.status.success() {
-        return Err(format!("`rustc --print sysroot` failed for {}", rustc.display()));
+        return Err(format!(
+            "`rustc --print sysroot` failed for {}",
+            rustc.display()
+        ));
     }
     let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_string();
     // A wrapper rustc that exits 0 without handling `--print sysroot` answers with
@@ -301,7 +304,10 @@ fn musl_std_in(sysroot: &str) -> Result<(), MuslErr> {
              rust-std ships the self-contained musl libc.a",
             libc_a.display()
         ))),
-        Err(e) => Err(MuslErr::Undiagnosed(format!("stat {}: {e}", libc_a.display()))),
+        Err(e) => Err(MuslErr::Undiagnosed(format!(
+            "stat {}: {e}",
+            libc_a.display()
+        ))),
     }
 }
 
@@ -443,8 +449,7 @@ pub(crate) fn provision_rust(env: &ProvisionEnv) -> Result<String, ProvisionErr>
                             tc.bin
                         ))
                     })?;
-                    musl_std_in(&tc.sysroot)
-                        .map_err(|e| ProvisionErr::Broken(e.into_message()))?;
+                    musl_std_in(&tc.sysroot).map_err(|e| ProvisionErr::Broken(e.into_message()))?;
                 }
             }
             return Ok(frag);
@@ -681,7 +686,10 @@ pub(crate) fn rustc_host_triple(rustc: &Path) -> Result<String, String> {
 /// cargo normalizes BOTH `-` and `.` to `_` in the `CARGO_TARGET_<triple>_*`
 /// env-var name (host triples are dot-free today, but match cargo's rule exactly).
 pub(crate) fn target_linker_var(triple: &str) -> String {
-    format!("CARGO_TARGET_{}_LINKER", triple.to_uppercase().replace(['-', '.'], "_"))
+    format!(
+        "CARGO_TARGET_{}_LINKER",
+        triple.to_uppercase().replace(['-', '.'], "_")
+    )
 }
 
 /// Produce a STAGE0 td-builder from the checked-in builder/ source using ONLY
@@ -874,8 +882,8 @@ fn ensure_builder_lineage(db: &Path, cb: &str, source_fp: &str) -> Result<(), St
 /// reason has to be legible — "unprovisioned" alone sends the reader looking for
 /// a missing toolchain when the real event is a memo that did not match.
 fn stage0_memo_hit(meta: &Path, fp: &str, store: &Path, db: &Path) -> Result<String, String> {
-    let text = std::fs::read_to_string(meta)
-        .map_err(|e| format!("no memo at {}: {e}", meta.display()))?;
+    let text =
+        std::fs::read_to_string(meta).map_err(|e| format!("no memo at {}: {e}", meta.display()))?;
     let mut lines = text.lines();
     let old_fp = lines
         .next()
@@ -1031,8 +1039,8 @@ fn recipe_eval_memo_hit(meta: &Path, fp: &str) -> Result<String, String> {
         .next()
         .ok_or_else(|| format!("memo {} records no digest", meta.display()))?
         .trim();
-    let got = crate::sha256::sha256_file(Path::new(bin))
-        .map_err(|e| format!("sha256 {bin}: {e}"))?;
+    let got =
+        crate::sha256::sha256_file(Path::new(bin)).map_err(|e| format!("sha256 {bin}: {e}"))?;
     if got != want {
         return Err(format!("built evaluator {bin} is not the one memoized"));
     }
@@ -1111,7 +1119,8 @@ fn build_recipe_eval(root: &Path, base: &Path, penv: &ProvisionEnv) -> Result<Pa
     let log_path = base.join("build.log");
     let log = std::fs::File::create(&log_path)
         .map_err(|error| format!("create evaluator log {}: {error}", log_path.display()))?;
-    let stderr = log.try_clone()
+    let stderr = log
+        .try_clone()
         .map_err(|error| format!("clone evaluator log {}: {error}", log_path.display()))?;
     let status = Command::new(cargo)
         .args([
@@ -1178,8 +1187,14 @@ fn report_evaluator_log_tail(path: &Path) {
         Ok(tail)
     })();
     match result {
-        Ok(tail) => eprintln!("evaluator build log tail:\n{}", String::from_utf8_lossy(&tail)),
-        Err(error) => eprintln!("could not read evaluator build log {}: {error}", path.display()),
+        Ok(tail) => eprintln!(
+            "evaluator build log tail:\n{}",
+            String::from_utf8_lossy(&tail)
+        ),
+        Err(error) => eprintln!(
+            "could not read evaluator build log {}: {error}",
+            path.display()
+        ),
     }
 }
 
@@ -1280,7 +1295,10 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
     // About to COMPILE. Say so and say why the memo did not serve, because in the
     // loop sandbox this cannot succeed and the bare provisioning error that
     // follows names a missing toolchain rather than the reuse that failed.
-    eprintln!("td-builder: stage0-place: rebuilding under {} — {why}", base.display());
+    eprintln!(
+        "td-builder: stage0-place: rebuilding under {} — {why}",
+        base.display()
+    );
 
     // 1. cargo-compile stage0 from builder/ source (guix/Guile-free, offline).
     let work = scratch_dir("stage0-place")?;
@@ -1299,8 +1317,7 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
     //    registered as refs) → a self-only closure, exactly right guix-free.
     std::fs::create_dir_all(&store).map_err(|e| format!("mkdir {}: {e}", store.display()))?;
     let seedscan = work.join("empty-seedscan");
-    std::fs::create_dir_all(&seedscan)
-        .map_err(|e| format!("mkdir {}: {e}", seedscan.display()))?;
+    std::fs::create_dir_all(&seedscan).map_err(|e| format!("mkdir {}: {e}", seedscan.display()))?;
     let place = Command::new(&s0)
         .args(["store-add-builder", "td-builder-0.1.0"])
         .arg(&s0_dir)
@@ -1498,7 +1515,12 @@ mod tests {
         assert!(is_td_system("NAME=td\nID=td\n"));
         assert!(is_td_system("ID=\"td\"\n"));
         assert!(is_td_system("ID='td'\n"));
-        for other in ["ID_LIKE=td\n", "ID=other\n", "ID=td\nID=other\n", "ID=td-extra\n"] {
+        for other in [
+            "ID_LIKE=td\n",
+            "ID=other\n",
+            "ID=td\nID=other\n",
+            "ID=td-extra\n",
+        ] {
             assert!(!is_td_system(other));
         }
     }
@@ -1507,10 +1529,13 @@ mod tests {
         let root = scratch(tag);
         let bin = root.join("toolchain/bin");
         let sysroot = root.join("toolchain");
-        write_exec(&bin.join("rustc"), &format!(
-            "case \"$1\" in --print) echo '{}' ;; -vV) echo 'host: {GNU_TARGET}' ;; esac\n",
-            sysroot.display()
-        ));
+        write_exec(
+            &bin.join("rustc"),
+            &format!(
+                "case \"$1\" in --print) echo '{}' ;; -vV) echo 'host: {GNU_TARGET}' ;; esac\n",
+                sysroot.display()
+            ),
+        );
         exec_file(&bin.join("cargo"));
         exec_file(&bin.join("cc"));
         let lib = sysroot.join("lib/rustlib").join(GNU_TARGET).join("lib");
@@ -1529,7 +1554,12 @@ mod tests {
         assert!(!musl_libc_path(&root.join("toolchain")).exists());
         env.rust_home = Some(root.join("toolchain").to_string_lossy().into_owned());
         assert_eq!(provision_rust(&env).unwrap(), env.search_path);
-        std::fs::remove_file(root.join("toolchain/lib/rustlib").join(GNU_TARGET).join("lib/libstd-fixture.rlib")).unwrap();
+        std::fs::remove_file(
+            root.join("toolchain/lib/rustlib")
+                .join(GNU_TARGET)
+                .join("lib/libstd-fixture.rlib"),
+        )
+        .unwrap();
         assert!(matches!(provision_rust(&env), Err(ProvisionErr::Broken(_))));
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1549,13 +1579,20 @@ mod tests {
     fn td_does_not_download_a_replacement_toolchain_when_missing() {
         let root = scratch("native-no-rust");
         let marker = root.join("called");
-        write_exec(&root.join("rustup"), &format!(
-            "case \"$1\" in --td-fixture-probe) ;; *) echo called > '{}' ;; esac\n", marker.display()
-        ));
+        write_exec(
+            &root.join("rustup"),
+            &format!(
+                "case \"$1\" in --td-fixture-probe) ;; *) echo called > '{}' ;; esac\n",
+                marker.display()
+            ),
+        );
         let mut env = base_env();
         env.native_td = true;
         env.search_path = root.to_string_lossy().into_owned();
-        assert!(matches!(provision_rust(&env), Err(ProvisionErr::Unavailable(_))));
+        assert!(matches!(
+            provision_rust(&env),
+            Err(ProvisionErr::Unavailable(_))
+        ));
         assert!(!marker.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1566,7 +1603,9 @@ mod tests {
         env.native_td = true;
         let flags = control_plane_flags(&env, Path::new("/declared path/bin/cc")).unwrap();
         assert_eq!(control_plane_target(&env), GNU_TARGET);
-        assert!(flags.split('\u{1f}').any(|arg| arg == "-Clinker=/declared path/bin/cc"));
+        assert!(flags
+            .split('\u{1f}')
+            .any(|arg| arg == "-Clinker=/declared path/bin/cc"));
         assert!(control_plane_flags(&env, Path::new("/bad\u{1f}path")).is_err());
         assert!(!flags.contains("rust-lld"));
     }
@@ -1574,10 +1613,13 @@ mod tests {
     #[test]
     fn evaluator_cargo_failure_cannot_become_a_provisioning_skip() {
         let (root, env) = native_fixture("native-td-cargo-failure");
-        write_exec(&root.join("toolchain/bin/cargo"), &format!(
-            "case \"$1\" in build) echo '{}'; exit 69 ;; esac\n",
-            td_engine::exit::UNPROVISIONED_SENTINEL
-        ));
+        write_exec(
+            &root.join("toolchain/bin/cargo"),
+            &format!(
+                "case \"$1\" in build) echo '{}'; exit 69 ;; esac\n",
+                td_engine::exit::UNPROVISIONED_SENTINEL
+            ),
+        );
         let error = build_recipe_eval(&root, &root, &env).unwrap_err();
         assert!(error.contains("Cargo build failed"), "{error}");
         assert!(!error.starts_with(td_engine::exit::UNPROVISIONED_TAG));
@@ -1683,7 +1725,10 @@ mod tests {
         write_fake_rustup(&rustup, &rbin.join("rustc"), &d.join("toolchain"));
         let mut env = base_env();
         env.search_path = format!("{}:{}", rbin.display(), rustup.display());
-        assert!(matches!(provision_rust(&env).unwrap_err(), ProvisionErr::Broken(_)));
+        assert!(matches!(
+            provision_rust(&env).unwrap_err(),
+            ProvisionErr::Broken(_)
+        ));
         assert!(
             !musl_libc_path(&d.join("toolchain")).exists(),
             "a sysroot failure triggered a target install"
@@ -1909,7 +1954,10 @@ mod tests {
         let mut env = base_env();
         env.search_path = format!("{}:{}", rbin.display(), rustup.display());
         assert_eq!(provision_rust(&env).unwrap(), rbin.to_string_lossy());
-        assert!(musl_libc_path(&toolchain).is_file(), "the musl std was not added");
+        assert!(
+            musl_libc_path(&toolchain).is_file(),
+            "the musl std was not added"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1944,7 +1992,10 @@ mod tests {
             matches!(&err, ProvisionErr::Broken(m) if m.contains(MUSL_TARGET)),
             "unexpected error: {err}"
         );
-        assert!(!libc.is_file(), "the musl std was added to the wrong toolchain");
+        assert!(
+            !libc.is_file(),
+            "the musl std was added to the wrong toolchain"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1999,7 +2050,10 @@ mod tests {
 
         let found = embedded_include_paths(&[recipe.clone()]).unwrap();
         let has = |needle: &str| found.iter().any(|p| p.ends_with(needle));
-        assert!(has("td-util/src/free.rs"), "must follow the crate: {found:?}");
+        assert!(
+            has("td-util/src/free.rs"),
+            "must follow the crate: {found:?}"
+        );
         assert!(has("local.h"), "and keep in-tree includes: {found:?}");
         // A literal naming nothing on disk invents no root (a commented-out or
         // stale include must not make the fingerprint unresolvable).

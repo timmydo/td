@@ -145,62 +145,412 @@ enum Kind {
 /// assert that correspondence in both directions.
 const KEYS: &[(&str, u16, Kind)] = &[
     ("escape", 1, Kind::Fixed(b"\x1b")),
-    ("1", 2, Kind::Text { base: b'1', shifted: b'!' }),
-    ("2", 3, Kind::Text { base: b'2', shifted: b'@' }),
-    ("3", 4, Kind::Text { base: b'3', shifted: b'#' }),
-    ("4", 5, Kind::Text { base: b'4', shifted: b'$' }),
-    ("5", 6, Kind::Text { base: b'5', shifted: b'%' }),
-    ("6", 7, Kind::Text { base: b'6', shifted: b'^' }),
-    ("7", 8, Kind::Text { base: b'7', shifted: b'&' }),
-    ("8", 9, Kind::Text { base: b'8', shifted: b'*' }),
-    ("9", 10, Kind::Text { base: b'9', shifted: b'(' }),
-    ("0", 11, Kind::Text { base: b'0', shifted: b')' }),
-    ("minus", 12, Kind::Text { base: b'-', shifted: b'_' }),
-    ("equal", 13, Kind::Text { base: b'=', shifted: b'+' }),
+    (
+        "1",
+        2,
+        Kind::Text {
+            base: b'1',
+            shifted: b'!',
+        },
+    ),
+    (
+        "2",
+        3,
+        Kind::Text {
+            base: b'2',
+            shifted: b'@',
+        },
+    ),
+    (
+        "3",
+        4,
+        Kind::Text {
+            base: b'3',
+            shifted: b'#',
+        },
+    ),
+    (
+        "4",
+        5,
+        Kind::Text {
+            base: b'4',
+            shifted: b'$',
+        },
+    ),
+    (
+        "5",
+        6,
+        Kind::Text {
+            base: b'5',
+            shifted: b'%',
+        },
+    ),
+    (
+        "6",
+        7,
+        Kind::Text {
+            base: b'6',
+            shifted: b'^',
+        },
+    ),
+    (
+        "7",
+        8,
+        Kind::Text {
+            base: b'7',
+            shifted: b'&',
+        },
+    ),
+    (
+        "8",
+        9,
+        Kind::Text {
+            base: b'8',
+            shifted: b'*',
+        },
+    ),
+    (
+        "9",
+        10,
+        Kind::Text {
+            base: b'9',
+            shifted: b'(',
+        },
+    ),
+    (
+        "0",
+        11,
+        Kind::Text {
+            base: b'0',
+            shifted: b')',
+        },
+    ),
+    (
+        "minus",
+        12,
+        Kind::Text {
+            base: b'-',
+            shifted: b'_',
+        },
+    ),
+    (
+        "equal",
+        13,
+        Kind::Text {
+            base: b'=',
+            shifted: b'+',
+        },
+    ),
     ("backspace", 14, Kind::Fixed(b"\x7f")),
-    ("tab", 15, Kind::ShiftFixed { plain: b"\t", shifted: b"\x1b[Z" }),
-    ("q", 16, Kind::Letter { lower: b'q', upper: b'Q' }),
-    ("w", 17, Kind::Letter { lower: b'w', upper: b'W' }),
-    ("e", 18, Kind::Letter { lower: b'e', upper: b'E' }),
-    ("r", 19, Kind::Letter { lower: b'r', upper: b'R' }),
-    ("t", 20, Kind::Letter { lower: b't', upper: b'T' }),
-    ("y", 21, Kind::Letter { lower: b'y', upper: b'Y' }),
-    ("u", 22, Kind::Letter { lower: b'u', upper: b'U' }),
-    ("i", 23, Kind::Letter { lower: b'i', upper: b'I' }),
-    ("o", 24, Kind::Letter { lower: b'o', upper: b'O' }),
-    ("p", 25, Kind::Letter { lower: b'p', upper: b'P' }),
-    ("leftbracket", 26, Kind::Text { base: b'[', shifted: b'{' }),
-    ("rightbracket", 27, Kind::Text { base: b']', shifted: b'}' }),
+    (
+        "tab",
+        15,
+        Kind::ShiftFixed {
+            plain: b"\t",
+            shifted: b"\x1b[Z",
+        },
+    ),
+    (
+        "q",
+        16,
+        Kind::Letter {
+            lower: b'q',
+            upper: b'Q',
+        },
+    ),
+    (
+        "w",
+        17,
+        Kind::Letter {
+            lower: b'w',
+            upper: b'W',
+        },
+    ),
+    (
+        "e",
+        18,
+        Kind::Letter {
+            lower: b'e',
+            upper: b'E',
+        },
+    ),
+    (
+        "r",
+        19,
+        Kind::Letter {
+            lower: b'r',
+            upper: b'R',
+        },
+    ),
+    (
+        "t",
+        20,
+        Kind::Letter {
+            lower: b't',
+            upper: b'T',
+        },
+    ),
+    (
+        "y",
+        21,
+        Kind::Letter {
+            lower: b'y',
+            upper: b'Y',
+        },
+    ),
+    (
+        "u",
+        22,
+        Kind::Letter {
+            lower: b'u',
+            upper: b'U',
+        },
+    ),
+    (
+        "i",
+        23,
+        Kind::Letter {
+            lower: b'i',
+            upper: b'I',
+        },
+    ),
+    (
+        "o",
+        24,
+        Kind::Letter {
+            lower: b'o',
+            upper: b'O',
+        },
+    ),
+    (
+        "p",
+        25,
+        Kind::Letter {
+            lower: b'p',
+            upper: b'P',
+        },
+    ),
+    (
+        "leftbracket",
+        26,
+        Kind::Text {
+            base: b'[',
+            shifted: b'{',
+        },
+    ),
+    (
+        "rightbracket",
+        27,
+        Kind::Text {
+            base: b']',
+            shifted: b'}',
+        },
+    ),
     ("enter", 28, Kind::Fixed(b"\r")),
     ("leftcontrol", 29, Kind::Modifier),
-    ("a", 30, Kind::Letter { lower: b'a', upper: b'A' }),
-    ("s", 31, Kind::Letter { lower: b's', upper: b'S' }),
-    ("d", 32, Kind::Letter { lower: b'd', upper: b'D' }),
-    ("f", 33, Kind::Letter { lower: b'f', upper: b'F' }),
-    ("g", 34, Kind::Letter { lower: b'g', upper: b'G' }),
-    ("h", 35, Kind::Letter { lower: b'h', upper: b'H' }),
-    ("j", 36, Kind::Letter { lower: b'j', upper: b'J' }),
-    ("k", 37, Kind::Letter { lower: b'k', upper: b'K' }),
-    ("l", 38, Kind::Letter { lower: b'l', upper: b'L' }),
-    ("semicolon", 39, Kind::Text { base: b';', shifted: b':' }),
-    ("apostrophe", 40, Kind::Text { base: b'\'', shifted: b'"' }),
-    ("grave", 41, Kind::Text { base: b'`', shifted: b'~' }),
+    (
+        "a",
+        30,
+        Kind::Letter {
+            lower: b'a',
+            upper: b'A',
+        },
+    ),
+    (
+        "s",
+        31,
+        Kind::Letter {
+            lower: b's',
+            upper: b'S',
+        },
+    ),
+    (
+        "d",
+        32,
+        Kind::Letter {
+            lower: b'd',
+            upper: b'D',
+        },
+    ),
+    (
+        "f",
+        33,
+        Kind::Letter {
+            lower: b'f',
+            upper: b'F',
+        },
+    ),
+    (
+        "g",
+        34,
+        Kind::Letter {
+            lower: b'g',
+            upper: b'G',
+        },
+    ),
+    (
+        "h",
+        35,
+        Kind::Letter {
+            lower: b'h',
+            upper: b'H',
+        },
+    ),
+    (
+        "j",
+        36,
+        Kind::Letter {
+            lower: b'j',
+            upper: b'J',
+        },
+    ),
+    (
+        "k",
+        37,
+        Kind::Letter {
+            lower: b'k',
+            upper: b'K',
+        },
+    ),
+    (
+        "l",
+        38,
+        Kind::Letter {
+            lower: b'l',
+            upper: b'L',
+        },
+    ),
+    (
+        "semicolon",
+        39,
+        Kind::Text {
+            base: b';',
+            shifted: b':',
+        },
+    ),
+    (
+        "apostrophe",
+        40,
+        Kind::Text {
+            base: b'\'',
+            shifted: b'"',
+        },
+    ),
+    (
+        "grave",
+        41,
+        Kind::Text {
+            base: b'`',
+            shifted: b'~',
+        },
+    ),
     ("leftshift", 42, Kind::Modifier),
-    ("backslash", 43, Kind::Text { base: b'\\', shifted: b'|' }),
-    ("z", 44, Kind::Letter { lower: b'z', upper: b'Z' }),
-    ("x", 45, Kind::Letter { lower: b'x', upper: b'X' }),
-    ("c", 46, Kind::Letter { lower: b'c', upper: b'C' }),
-    ("v", 47, Kind::Letter { lower: b'v', upper: b'V' }),
-    ("b", 48, Kind::Letter { lower: b'b', upper: b'B' }),
-    ("n", 49, Kind::Letter { lower: b'n', upper: b'N' }),
-    ("m", 50, Kind::Letter { lower: b'm', upper: b'M' }),
-    ("comma", 51, Kind::Text { base: b',', shifted: b'<' }),
-    ("period", 52, Kind::Text { base: b'.', shifted: b'>' }),
-    ("slash", 53, Kind::Text { base: b'/', shifted: b'?' }),
+    (
+        "backslash",
+        43,
+        Kind::Text {
+            base: b'\\',
+            shifted: b'|',
+        },
+    ),
+    (
+        "z",
+        44,
+        Kind::Letter {
+            lower: b'z',
+            upper: b'Z',
+        },
+    ),
+    (
+        "x",
+        45,
+        Kind::Letter {
+            lower: b'x',
+            upper: b'X',
+        },
+    ),
+    (
+        "c",
+        46,
+        Kind::Letter {
+            lower: b'c',
+            upper: b'C',
+        },
+    ),
+    (
+        "v",
+        47,
+        Kind::Letter {
+            lower: b'v',
+            upper: b'V',
+        },
+    ),
+    (
+        "b",
+        48,
+        Kind::Letter {
+            lower: b'b',
+            upper: b'B',
+        },
+    ),
+    (
+        "n",
+        49,
+        Kind::Letter {
+            lower: b'n',
+            upper: b'N',
+        },
+    ),
+    (
+        "m",
+        50,
+        Kind::Letter {
+            lower: b'm',
+            upper: b'M',
+        },
+    ),
+    (
+        "comma",
+        51,
+        Kind::Text {
+            base: b',',
+            shifted: b'<',
+        },
+    ),
+    (
+        "period",
+        52,
+        Kind::Text {
+            base: b'.',
+            shifted: b'>',
+        },
+    ),
+    (
+        "slash",
+        53,
+        Kind::Text {
+            base: b'/',
+            shifted: b'?',
+        },
+    ),
     ("rightshift", 54, Kind::Modifier),
-    ("kpasterisk", 55, Kind::Text { base: b'*', shifted: b'*' }),
+    (
+        "kpasterisk",
+        55,
+        Kind::Text {
+            base: b'*',
+            shifted: b'*',
+        },
+    ),
     ("leftalt", 56, Kind::Modifier),
-    ("space", 57, Kind::Text { base: b' ', shifted: b' ' }),
+    (
+        "space",
+        57,
+        Kind::Text {
+            base: b' ',
+            shifted: b' ',
+        },
+    ),
     ("capslock", 58, Kind::Modifier),
     ("f1", 59, Kind::Function(b"\x1bOP")),
     ("f2", 60, Kind::Function(b"\x1bOQ")),
@@ -214,42 +564,210 @@ const KEYS: &[(&str, u16, Kind)] = &[
     ("f10", 68, Kind::Function(b"\x1b[21~")),
     ("numlock", 69, Kind::Modifier),
     ("scrolllock", 70, Kind::Modifier),
-    ("kp7", 71, Kind::Text { base: b'7', shifted: b'7' }),
-    ("kp8", 72, Kind::Text { base: b'8', shifted: b'8' }),
-    ("kp9", 73, Kind::Text { base: b'9', shifted: b'9' }),
-    ("kpminus", 74, Kind::Text { base: b'-', shifted: b'-' }),
-    ("kp4", 75, Kind::Text { base: b'4', shifted: b'4' }),
-    ("kp5", 76, Kind::Text { base: b'5', shifted: b'5' }),
-    ("kp6", 77, Kind::Text { base: b'6', shifted: b'6' }),
-    ("kpplus", 78, Kind::Text { base: b'+', shifted: b'+' }),
-    ("kp1", 79, Kind::Text { base: b'1', shifted: b'1' }),
-    ("kp2", 80, Kind::Text { base: b'2', shifted: b'2' }),
-    ("kp3", 81, Kind::Text { base: b'3', shifted: b'3' }),
-    ("kp0", 82, Kind::Text { base: b'0', shifted: b'0' }),
-    ("kpperiod", 83, Kind::Text { base: b'.', shifted: b'.' }),
-    ("less", 86, Kind::Text { base: b'<', shifted: b'>' }),
+    (
+        "kp7",
+        71,
+        Kind::Text {
+            base: b'7',
+            shifted: b'7',
+        },
+    ),
+    (
+        "kp8",
+        72,
+        Kind::Text {
+            base: b'8',
+            shifted: b'8',
+        },
+    ),
+    (
+        "kp9",
+        73,
+        Kind::Text {
+            base: b'9',
+            shifted: b'9',
+        },
+    ),
+    (
+        "kpminus",
+        74,
+        Kind::Text {
+            base: b'-',
+            shifted: b'-',
+        },
+    ),
+    (
+        "kp4",
+        75,
+        Kind::Text {
+            base: b'4',
+            shifted: b'4',
+        },
+    ),
+    (
+        "kp5",
+        76,
+        Kind::Text {
+            base: b'5',
+            shifted: b'5',
+        },
+    ),
+    (
+        "kp6",
+        77,
+        Kind::Text {
+            base: b'6',
+            shifted: b'6',
+        },
+    ),
+    (
+        "kpplus",
+        78,
+        Kind::Text {
+            base: b'+',
+            shifted: b'+',
+        },
+    ),
+    (
+        "kp1",
+        79,
+        Kind::Text {
+            base: b'1',
+            shifted: b'1',
+        },
+    ),
+    (
+        "kp2",
+        80,
+        Kind::Text {
+            base: b'2',
+            shifted: b'2',
+        },
+    ),
+    (
+        "kp3",
+        81,
+        Kind::Text {
+            base: b'3',
+            shifted: b'3',
+        },
+    ),
+    (
+        "kp0",
+        82,
+        Kind::Text {
+            base: b'0',
+            shifted: b'0',
+        },
+    ),
+    (
+        "kpperiod",
+        83,
+        Kind::Text {
+            base: b'.',
+            shifted: b'.',
+        },
+    ),
+    (
+        "less",
+        86,
+        Kind::Text {
+            base: b'<',
+            shifted: b'>',
+        },
+    ),
     ("f11", 87, Kind::Function(b"\x1b[23~")),
     ("f12", 88, Kind::Function(b"\x1b[24~")),
     ("kpenter", 96, Kind::Fixed(b"\r")),
     ("rightcontrol", 97, Kind::Modifier),
-    ("kpslash", 98, Kind::Text { base: b'/', shifted: b'/' }),
+    (
+        "kpslash",
+        98,
+        Kind::Text {
+            base: b'/',
+            shifted: b'/',
+        },
+    ),
     ("print", 99, Kind::Silent),
     ("rightalt", 100, Kind::Modifier),
-    ("home", 102, Kind::Cursor { normal: b"\x1b[H", application: b"\x1bOH" }),
-    ("up", 103, Kind::Cursor { normal: b"\x1b[A", application: b"\x1bOA" }),
-    ("pageup", 104, Kind::Paging { bytes: b"\x1b[5~", shifted: Scroll::Back }),
-    ("left", 105, Kind::Cursor { normal: b"\x1b[D", application: b"\x1bOD" }),
-    ("right", 106, Kind::Cursor { normal: b"\x1b[C", application: b"\x1bOC" }),
-    ("end", 107, Kind::Cursor { normal: b"\x1b[F", application: b"\x1bOF" }),
-    ("down", 108, Kind::Cursor { normal: b"\x1b[B", application: b"\x1bOB" }),
-    ("pagedown", 109, Kind::Paging { bytes: b"\x1b[6~", shifted: Scroll::Forward }),
+    (
+        "home",
+        102,
+        Kind::Cursor {
+            normal: b"\x1b[H",
+            application: b"\x1bOH",
+        },
+    ),
+    (
+        "up",
+        103,
+        Kind::Cursor {
+            normal: b"\x1b[A",
+            application: b"\x1bOA",
+        },
+    ),
+    (
+        "pageup",
+        104,
+        Kind::Paging {
+            bytes: b"\x1b[5~",
+            shifted: Scroll::Back,
+        },
+    ),
+    (
+        "left",
+        105,
+        Kind::Cursor {
+            normal: b"\x1b[D",
+            application: b"\x1bOD",
+        },
+    ),
+    (
+        "right",
+        106,
+        Kind::Cursor {
+            normal: b"\x1b[C",
+            application: b"\x1bOC",
+        },
+    ),
+    (
+        "end",
+        107,
+        Kind::Cursor {
+            normal: b"\x1b[F",
+            application: b"\x1bOF",
+        },
+    ),
+    (
+        "down",
+        108,
+        Kind::Cursor {
+            normal: b"\x1b[B",
+            application: b"\x1bOB",
+        },
+    ),
+    (
+        "pagedown",
+        109,
+        Kind::Paging {
+            bytes: b"\x1b[6~",
+            shifted: Scroll::Forward,
+        },
+    ),
     ("insert", 110, Kind::Tilde(b"\x1b[2~")),
     ("delete", 111, Kind::Tilde(b"\x1b[3~")),
     ("mute", 113, Kind::Silent),
     ("volumedown", 114, Kind::Silent),
     ("volumeup", 115, Kind::Silent),
     ("power", 116, Kind::Silent),
-    ("kpequal", 117, Kind::Text { base: b'=', shifted: b'=' }),
+    (
+        "kpequal",
+        117,
+        Kind::Text {
+            base: b'=',
+            shifted: b'=',
+        },
+    ),
     ("pause", 119, Kind::Silent),
     ("leftmeta", 125, Kind::Modifier),
     ("rightmeta", 126, Kind::Modifier),
@@ -278,8 +796,12 @@ fn kind(code: u16) -> Option<Kind> {
 fn control(character: u8) -> Option<u8> {
     match character {
         b'@' | b' ' => Some(0x00),
-        b'a'..=b'z' => character.checked_sub(b'a').and_then(|base| base.checked_add(1)),
-        b'A'..=b'Z' => character.checked_sub(b'A').and_then(|base| base.checked_add(1)),
+        b'a'..=b'z' => character
+            .checked_sub(b'a')
+            .and_then(|base| base.checked_add(1)),
+        b'A'..=b'Z' => character
+            .checked_sub(b'A')
+            .and_then(|base| base.checked_add(1)),
         b'[' => Some(0x1b),
         b'\\' => Some(0x1c),
         b']' => Some(0x1d),
@@ -337,9 +859,7 @@ pub fn sequence(code: u16, modifiers: u32, modes: Modes) -> Option<Sequence> {
         }
         _ if control_held => return None,
         Kind::Fixed(bytes) => Sequence::new(bytes)?,
-        Kind::ShiftFixed { plain, shifted } => {
-            Sequence::new(if shift { shifted } else { plain })?
-        }
+        Kind::ShiftFixed { plain, shifted } => Sequence::new(if shift { shifted } else { plain })?,
         Kind::Cursor {
             normal,
             application,
@@ -465,7 +985,9 @@ impl Viewport {
             return 0;
         }
         let back = history.pushed.saturating_sub(anchor.line);
-        usize::try_from(back).unwrap_or(usize::MAX).min(history.lines)
+        usize::try_from(back)
+            .unwrap_or(usize::MAX)
+            .min(history.lines)
     }
 
     /// Whether anything but the live screen is showing. This is the question
@@ -493,9 +1015,9 @@ impl Viewport {
             // different thing, and on an empty history it is a delayed jump —
             // the chord looks inert, then the first line of output brings the
             // anchor into range and pins the view at the oldest line.
-            Action::Scroll(Scroll::Back) => current
-                .saturating_add(page_lines(rows))
-                .min(history.lines),
+            Action::Scroll(Scroll::Back) => {
+                current.saturating_add(page_lines(rows)).min(history.lines)
+            }
             Action::Scroll(Scroll::Forward) => current.saturating_sub(page_lines(rows)),
         };
         self.anchor_at(next, history);
@@ -749,13 +1271,13 @@ pub fn selftest() -> Result<(), String> {
     let application = Modes {
         application_cursor: true,
     };
-    let text = sequence(30, 0, escape).ok_or_else(|| "keys selftest lost a text key".to_string())?;
+    let text =
+        sequence(30, 0, escape).ok_or_else(|| "keys selftest lost a text key".to_string())?;
     let control =
         sequence(46, MOD_CONTROL, escape).ok_or_else(|| "keys selftest lost Ctrl+C".to_string())?;
     let meta =
         sequence(30, MOD_ALT, escape).ok_or_else(|| "keys selftest lost Alt+a".to_string())?;
-    let normal_up =
-        sequence(103, 0, escape).ok_or_else(|| "keys selftest lost Up".to_string())?;
+    let normal_up = sequence(103, 0, escape).ok_or_else(|| "keys selftest lost Up".to_string())?;
     let applied =
         sequence(103, 0, application).ok_or_else(|| "keys selftest lost SS3 Up".to_string())?;
     if text.as_slice() != b"a"
@@ -1229,7 +1751,11 @@ mod tests {
                     let prefixed = sequence(*code, modifiers | MOD_ALT, modes)
                         .unwrap_or_else(|| panic!("Alt+{name} overflowed the sequence buffer"));
                     assert_eq!(prefixed.as_slice().first(), Some(&ESC), "{name}");
-                    assert_eq!(prefixed.as_slice().get(1..), Some(plain.as_slice()), "{name}");
+                    assert_eq!(
+                        prefixed.as_slice().get(1..),
+                        Some(plain.as_slice()),
+                        "{name}"
+                    );
                 }
             }
         }
@@ -1412,7 +1938,10 @@ mod tests {
         assert!(parse_chord("a+ctrl").is_err());
         assert!(parse_chord("ctrl+ctrl+a").is_err());
         assert_eq!(parse_chord("a").unwrap(), (30, 0));
-        assert_eq!(parse_chord("ctrl+alt+a").unwrap(), (30, MOD_CONTROL | MOD_ALT));
+        assert_eq!(
+            parse_chord("ctrl+alt+a").unwrap(),
+            (30, MOD_CONTROL | MOD_ALT)
+        );
     }
 
     #[test]
@@ -1440,7 +1969,10 @@ mod tests {
         };
         let up = key_code("up").unwrap();
         repeat.press(up, 0, normal, false, 0);
-        assert_eq!(repetition(&mut repeat, 600, normal), Some(b"\x1b[A".to_vec()));
+        assert_eq!(
+            repetition(&mut repeat, 600, normal),
+            Some(b"\x1b[A".to_vec())
+        );
         assert_eq!(
             repetition(&mut repeat, 640, application),
             Some(b"\x1bOA".to_vec())
@@ -1563,7 +2095,11 @@ mod tests {
             assert!(matches!(act("pagedown", viewing), Action::Bytes(_)));
         }
         // A further modifier makes the chord unlisted rather than a scroll.
-        for chord in ["ctrl+shift+pageup", "alt+shift+pagedown", "super+shift+pageup"] {
+        for chord in [
+            "ctrl+shift+pageup",
+            "alt+shift+pagedown",
+            "super+shift+pageup",
+        ] {
             assert_eq!(act(chord, true), Action::Silent, "{chord}");
         }
     }
@@ -1747,8 +2283,14 @@ mod tests {
         let (code, modifiers) = parse_chord("shift+pageup").unwrap();
         repeat.press(code, modifiers, modes, true, 0);
         assert!(repeat.armed());
-        assert_eq!(repeat.due(600, modes, true), Some(Action::Scroll(Scroll::Back)));
-        assert_eq!(repeat.due(640, modes, true), Some(Action::Scroll(Scroll::Back)));
+        assert_eq!(
+            repeat.due(600, modes, true),
+            Some(Action::Scroll(Scroll::Back))
+        );
+        assert_eq!(
+            repeat.due(640, modes, true),
+            Some(Action::Scroll(Scroll::Back))
+        );
     }
 
     /// A repetition is routed when it is emitted, so a held End closes the

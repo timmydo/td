@@ -547,10 +547,7 @@ pub fn set_and_require_data_limit(bytes: u64) -> io::Result<()> {
     Ok(())
 }
 
-pub fn install_seccomp_filter(
-    instructions: &[SockFilter],
-    log_denials: bool,
-) -> io::Result<()> {
+pub fn install_seccomp_filter(instructions: &[SockFilter], log_denials: bool) -> io::Result<()> {
     if instructions.len() > SECCOMP_MAX_FILTER_INSNS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

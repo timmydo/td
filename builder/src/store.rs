@@ -647,8 +647,14 @@ mod tests {
     fn builder_abi_token_prefers_a_nonempty_override() {
         // The pure derivation (no env): the override string wins when Some + non-empty,
         // else the compiled BUILDER_ABI. An empty override falls through to the default.
-        assert_eq!(builder_abi_token_for(None), format!("td-builder-abi-{BUILDER_ABI}"));
-        assert_eq!(builder_abi_token_for(Some("")), format!("td-builder-abi-{BUILDER_ABI}"));
+        assert_eq!(
+            builder_abi_token_for(None),
+            format!("td-builder-abi-{BUILDER_ABI}")
+        );
+        assert_eq!(
+            builder_abi_token_for(Some("")),
+            format!("td-builder-abi-{BUILDER_ABI}")
+        );
         assert_eq!(builder_abi_token_for(Some("7")), "td-builder-abi-7");
         assert_eq!(builder_abi_token_for(Some("dev-x")), "td-builder-abi-dev-x");
     }
@@ -660,18 +666,35 @@ mod tests {
         // content in it), and DIFFERENT for a different token. This is what decouples a
         // recipe's identity from the builder ELF.
         let p = builder_identity_path();
-        assert!(p.starts_with(&format!("{}/", store_dir())), "under the store dir: {p}");
-        assert_eq!(name_from_store_path(&p).as_deref(), Some("td-builder"), "named td-builder: {p}");
-        assert!(hash_from_store_path(&p).is_some(), "well-formed store digest: {p}");
+        assert!(
+            p.starts_with(&format!("{}/", store_dir())),
+            "under the store dir: {p}"
+        );
+        assert_eq!(
+            name_from_store_path(&p).as_deref(),
+            Some("td-builder"),
+            "named td-builder: {p}"
+        );
+        assert!(
+            hash_from_store_path(&p).is_some(),
+            "well-formed store digest: {p}"
+        );
         // Determinism: recomputing the same token gives the same path (no env set here, so
         // the token is the compiled default both times).
         assert_eq!(p, builder_identity_path(), "identity path is deterministic");
         // Token-sensitivity, checked WITHOUT env (directly on the derivation): a different
         // ABI token yields a different identity path.
         let path_for = |tok: &str| {
-            input_addressed_path(&sha256::to_base16(&sha256_bytes(tok.as_bytes())), "td-builder")
+            input_addressed_path(
+                &sha256::to_base16(&sha256_bytes(tok.as_bytes())),
+                "td-builder",
+            )
         };
-        assert_eq!(p, path_for(&format!("td-builder-abi-{BUILDER_ABI}")), "default == abi token path");
+        assert_eq!(
+            p,
+            path_for(&format!("td-builder-abi-{BUILDER_ABI}")),
+            "default == abi token path"
+        );
         assert_ne!(
             path_for("td-builder-abi-1"),
             path_for("td-builder-abi-2"),

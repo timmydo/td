@@ -95,7 +95,10 @@ mod tests {
         assert!(!is_host_only_dir("gate_defs/"));
         assert!(!is_host_only_dir("gate_defs/x"));
         assert!(!is_host_only_dir("gate_defsx"));
-        assert!(!is_host_only_dir("affected.rs"), "a file is not a directory entry");
+        assert!(
+            !is_host_only_dir("affected.rs"),
+            "a file is not a directory entry"
+        );
     }
 
     #[test]
@@ -104,14 +107,20 @@ mod tests {
         assert!(is_host_only("ready.rs"));
         assert!(is_host_only("gate_defs/325-cargo-test.rs"));
         assert!(is_host_only("gate_defs/deep/x.rs"));
-        assert!(!is_host_only("gate_defs"), "the directory entry itself is not a file");
+        assert!(
+            !is_host_only("gate_defs"),
+            "the directory entry itself is not a file"
+        );
         assert!(!is_host_only("gate_defsx/a.rs"));
         assert!(!is_host_only("affected.rs.bak"));
         assert!(!is_host_only("main.rs"));
         assert!(!is_host_only("build.rs"));
         assert!(!is_host_only("check_host.rs"));
         assert!(!is_host_only("run_record.rs"));
-        assert!(!is_host_only("gate_inputs.rs"), "the store-path helper is engine code");
+        assert!(
+            !is_host_only("gate_inputs.rs"),
+            "the store-path helper is engine code"
+        );
     }
 
     /// Every entry exists, so a rename cannot leave the list naming nothing

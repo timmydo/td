@@ -1236,7 +1236,12 @@ struct DrmModeFbCmd2 {
 /// above for what it does and does not cost. The screen changes at the
 /// `SETCRTC`, not here.
 pub fn drm_set_master(card: &impl AsRawFd) -> Result<(), String> {
-    drm_ioctl(card.as_raw_fd(), DRM_IOCTL_SET_MASTER, 0, "DRM_IOCTL_SET_MASTER")?;
+    drm_ioctl(
+        card.as_raw_fd(),
+        DRM_IOCTL_SET_MASTER,
+        0,
+        "DRM_IOCTL_SET_MASTER",
+    )?;
     Ok(())
 }
 
@@ -1266,8 +1271,12 @@ pub fn drm_set_crtc(
     connectors: &mut [u32],
 ) -> Result<(), String> {
     let mut request = *state;
-    request.count_connectors = u32::try_from(connectors.len())
-        .map_err(|_| format!("DRM_IOCTL_MODE_SETCRTC: {} connectors is not a u32", connectors.len()))?;
+    request.count_connectors = u32::try_from(connectors.len()).map_err(|_| {
+        format!(
+            "DRM_IOCTL_MODE_SETCRTC: {} connectors is not a u32",
+            connectors.len()
+        )
+    })?;
     request.set_connectors_ptr = address_of(connectors);
     drm_ioctl(
         card.as_raw_fd(),
@@ -1538,9 +1547,7 @@ pub fn drm_resources(card: &impl AsRawFd) -> Result<DrmResources, String> {
             "DRM_IOCTL_MODE_GETRESOURCES",
         )?;
 
-        if fill.count_crtcs > probe.count_crtcs
-            || fill.count_connectors > probe.count_connectors
-        {
+        if fill.count_crtcs > probe.count_crtcs || fill.count_connectors > probe.count_connectors {
             continue;
         }
         crtcs.truncate(drm_count(fill.count_crtcs, MAX_DRM_OBJECTS, "CRTCs")?);
@@ -1608,11 +1615,7 @@ pub fn drm_connector(card: &impl AsRawFd, connector_id: u32) -> Result<DrmConnec
             continue;
         }
         modes.truncate(drm_count(fill.count_modes, MAX_DRM_MODES, "modes")?);
-        encoders.truncate(drm_count(
-            fill.count_encoders,
-            MAX_DRM_OBJECTS,
-            "encoders",
-        )?);
+        encoders.truncate(drm_count(fill.count_encoders, MAX_DRM_OBJECTS, "encoders")?);
         return Ok(DrmConnector {
             id: fill.connector_id,
             connection: fill.connection,
@@ -1635,7 +1638,11 @@ pub fn drm_connector(card: &impl AsRawFd, connector_id: u32) -> Result<DrmConnec
 /// for the master discovery runs as; 1, with room for one, reads the empty
 /// list instead.
 const fn connector_fill_modes(counted: u32) -> u32 {
-    if counted == 0 { 1 } else { counted }
+    if counted == 0 {
+        1
+    } else {
+        counted
+    }
 }
 
 /// Read one encoder.
@@ -2369,7 +2376,10 @@ mod tests {
         control[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
         control[12..16].copy_from_slice(&99i32.to_ne_bytes());
         control[16..].fill(1);
-        assert_eq!(parse_fds(&control).unwrap_err(), "truncated ancillary header");
+        assert_eq!(
+            parse_fds(&control).unwrap_err(),
+            "truncated ancillary header"
+        );
     }
 
     /// The kernel reads eight bytes and takes the row count from the first
@@ -2393,7 +2403,10 @@ mod tests {
     #[test]
     fn an_unreviewed_ioctl_request_is_refused_before_the_syscall() {
         let error = ioctl(0, 0x5401, 0, "TCGETS").unwrap_err();
-        assert!(error.contains("refusing unreviewed ioctl request 0x5401"), "{error}");
+        assert!(
+            error.contains("refusing unreviewed ioctl request 0x5401"),
+            "{error}"
+        );
         for request in [
             TIOCSPTLCK,
             TIOCGPTPEER,
@@ -2495,7 +2508,11 @@ mod tests {
     fn an_event_shorter_than_its_header_is_refused() {
         for absurd in [0u32, 1, 7] {
             let bytes = flip_event(DRM_EVENT_FLIP_COMPLETE, absurd, 7, 1, 29);
-            assert_eq!(parse_drm_event(&bytes), None, "length {absurd} was accepted");
+            assert_eq!(
+                parse_drm_event(&bytes),
+                None,
+                "length {absurd} was accepted"
+            );
         }
     }
 
@@ -2617,7 +2634,10 @@ mod tests {
             std::mem::size_of::<DrmModeFbCmd2>()
         );
         // `RMFB` carries a bare `unsigned int`, not a struct.
-        assert_eq!(argument_size(DRM_IOCTL_MODE_RMFB), std::mem::size_of::<u32>());
+        assert_eq!(
+            argument_size(DRM_IOCTL_MODE_RMFB),
+            std::mem::size_of::<u32>()
+        );
         // `SET_MASTER` is a `DRM_IO`: no argument at all, so no size field.
         assert_eq!(argument_size(DRM_IOCTL_SET_MASTER), 0);
     }

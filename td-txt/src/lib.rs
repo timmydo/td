@@ -77,7 +77,10 @@ pub struct SpecError {
 
 impl SpecError {
     fn new(line: usize, msg: impl Into<String>) -> Self {
-        Self { line, msg: msg.into() }
+        Self {
+            line,
+            msg: msg.into(),
+        }
     }
 }
 
@@ -188,13 +191,18 @@ fn hex_byte(hex: &[u8]) -> Option<u8> {
 fn json_decode(value: &str, line: usize) -> Result<Vec<u8>, SpecError> {
     let chars: Vec<char> = value.trim().chars().collect();
     if chars.first() != Some(&'"') || chars.last() != Some(&'"') || chars.len() < 2 {
-        return Err(SpecError::new(line, "a -json value must be a quoted string"));
+        return Err(SpecError::new(
+            line,
+            "a -json value must be a quoted string",
+        ));
     }
     let mut out: Vec<u8> = Vec::new();
     let mut i = 1usize;
     let end = chars.len() - 1;
     while i < end {
-        let Some(c) = chars.get(i).copied() else { break };
+        let Some(c) = chars.get(i).copied() else {
+            break;
+        };
         i += 1;
         if c != '\\' {
             let mut buf = [0u8; 4];
@@ -376,15 +384,24 @@ pub fn parse_cases(text: &str, file: &str) -> Result<Vec<Case>, SpecError> {
             });
             continue;
         }
-        if let Some(content) = trimmed.strip_prefix("## ").or_else(|| trimmed.strip_prefix("##")) {
+        if let Some(content) = trimmed
+            .strip_prefix("## ")
+            .or_else(|| trimmed.strip_prefix("##"))
+        {
             if content.trim() == "END" {
                 return Err(SpecError::new(lineno, "`## END' outside a block"));
             }
             let Some(case) = cur.as_mut() else {
-                return Err(SpecError::new(lineno, "annotation before the first `####' case"));
+                return Err(SpecError::new(
+                    lineno,
+                    "annotation before the first `####' case",
+                ));
             };
             let Some((key, value)) = split_annotation(content) else {
-                return Err(SpecError::new(lineno, "annotation needs `## <key>: <value>'"));
+                return Err(SpecError::new(
+                    lineno,
+                    "annotation needs `## <key>: <value>'",
+                ));
             };
             let value = match value {
                 Some(v) => v.into_bytes(),
@@ -410,7 +427,10 @@ pub fn parse_cases(text: &str, file: &str) -> Result<Vec<Case>, SpecError> {
     }
     for case in &cases {
         if case.argv.is_empty() {
-            return Err(SpecError::new(0, format!("case {:?} has no `## argv:'", case.name)));
+            return Err(SpecError::new(
+                0,
+                format!("case {:?} has no `## argv:'", case.name),
+            ));
         }
     }
     Ok(cases)
@@ -444,7 +464,9 @@ fn apply_annotation(
             // way to write a file that holds a NUL or no trailing newline.
             if let Some(name) = other.strip_prefix("file-after-json ") {
                 let bytes = json_decode(&text(), line)?;
-                case.expect.files_after.push((name.trim().to_string(), bytes));
+                case.expect
+                    .files_after
+                    .push((name.trim().to_string(), bytes));
                 return Ok(());
             }
             if let Some(name) = other.strip_prefix("file-json ") {
@@ -453,7 +475,9 @@ fn apply_annotation(
                 return Ok(());
             }
             if let Some(name) = other.strip_prefix("file-after ") {
-                case.expect.files_after.push((name.trim().to_string(), value));
+                case.expect
+                    .files_after
+                    .push((name.trim().to_string(), value));
                 return Ok(());
             }
             if let Some(name) = other.strip_prefix("file ") {
@@ -528,7 +552,10 @@ pub fn parse_spencer(text: &str, file: &str, ere: bool) -> Result<Vec<Case>, Spe
             env: Vec::new(),
             stdin,
             // Only the status: upstream's driver discards the output.
-            expect: Expect { status: Some(status), ..Expect::default() },
+            expect: Expect {
+                status: Some(status),
+                ..Expect::default()
+            },
         });
     }
     Ok(cases)
@@ -611,7 +638,11 @@ pub fn load_corpus(spec_dir: &Path) -> Result<Vec<Case>, Box<dyn std::error::Err
     }
     own.sort();
     for path in &own {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
         let text = String::from_utf8(read_file(path)?)?;
         cases.extend(parse_cases(&text, &name)?);
     }
@@ -642,7 +673,11 @@ pub fn load_corpus(spec_dir: &Path) -> Result<Vec<Case>, Box<dyn std::error::Err
         ],
         env: Vec::new(),
         stdin: Vec::new(),
-        expect: Expect { status: Some(0), stdout: Some(lines), ..Expect::default() },
+        expect: Expect {
+            status: Some(0),
+            stdout: Some(lines),
+            ..Expect::default()
+        },
     });
 
     // 3. The vendored GNU sed triples.
@@ -654,11 +689,19 @@ pub fn load_corpus(spec_dir: &Path) -> Result<Vec<Case>, Box<dyn std::error::Err
         cases.push(Case {
             file: "gnu-sed".to_string(),
             name: (*stem).to_string(),
-            argv: vec![b"sed".to_vec(), b"-f".to_vec(), format!("{stem}.sed").into_bytes()],
+            argv: vec![
+                b"sed".to_vec(),
+                b"-f".to_vec(),
+                format!("{stem}.sed").into_bytes(),
+            ],
             files: vec![(format!("{stem}.sed"), script)],
             env: Vec::new(),
             stdin: input,
-            expect: Expect { status: Some(0), stdout: Some(good), ..Expect::default() },
+            expect: Expect {
+                status: Some(0),
+                stdout: Some(good),
+                ..Expect::default()
+            },
         });
     }
     Ok(cases)
@@ -822,12 +865,20 @@ pub fn run_case(bin: &Path, case: &Case) -> Result<CaseOutcome, Box<dyn std::err
     }
     if let Some(want) = &case.expect.stdout {
         if *want != stdout {
-            problems.push(format!("stdout: want {}, got {}", describe(want), describe(&stdout)));
+            problems.push(format!(
+                "stdout: want {}, got {}",
+                describe(want),
+                describe(&stdout)
+            ));
         }
     }
     match &case.expect.stderr {
         Some(Stream::Exact(want)) if *want != stderr => {
-            problems.push(format!("stderr: want {}, got {}", describe(want), describe(&stderr)));
+            problems.push(format!(
+                "stderr: want {}, got {}",
+                describe(want),
+                describe(&stderr)
+            ));
         }
         Some(Stream::Contains(want)) if !contains(&stderr, want) => {
             problems.push(format!(
@@ -864,7 +915,11 @@ pub fn run_case(bin: &Path, case: &Case) -> Result<CaseOutcome, Box<dyn std::err
     }
     Ok(CaseOutcome {
         passed: problems.is_empty(),
-        detail: if problems.is_empty() { None } else { Some(problems.join("; ")) },
+        detail: if problems.is_empty() {
+            None
+        } else {
+            Some(problems.join("; "))
+        },
         timed_out,
     })
 }
@@ -920,7 +975,9 @@ pub fn case_keys(cases: &[Case]) -> Vec<String> {
         std::collections::HashMap::new();
     let mut keys = Vec::with_capacity(cases.len());
     for case in cases {
-        let entry = seen.entry((case.file.clone(), case.name.clone())).or_insert(0);
+        let entry = seen
+            .entry((case.file.clone(), case.name.clone()))
+            .or_insert(0);
         if *entry == 0 {
             keys.push(case_key(&case.file, &case.name));
         } else {
@@ -949,7 +1006,10 @@ impl Expectations {
             })?;
             let key = key.trim();
             if !key.contains("::") {
-                return Err(SpecError::new(ln, "expectation key must be `<file>::<case>'"));
+                return Err(SpecError::new(
+                    ln,
+                    "expectation key must be `<file>::<case>'",
+                ));
             }
             let inserted = match disp {
                 "xfail" => xfail.insert(key.to_string()),
@@ -966,7 +1026,10 @@ impl Expectations {
             }
         }
         if let Some(k) = xfail.intersection(&skip).next() {
-            return Err(SpecError::new(0, format!("{k:?} listed as both xfail and skip")));
+            return Err(SpecError::new(
+                0,
+                format!("{k:?} listed as both xfail and skip"),
+            ));
         }
         Ok(Self { xfail, skip })
     }
@@ -1031,7 +1094,11 @@ fn classify(key: String, outcome: &CaseOutcome, exp: &Expectations) -> Classifie
         (true, true) => Disposition::XPass,
         (false, false) => Disposition::Fail,
     };
-    ClassifiedOutcome { key, disposition, detail: outcome.detail.clone() }
+    ClassifiedOutcome {
+        key,
+        disposition,
+        detail: outcome.detail.clone(),
+    }
 }
 
 /// Run every case, classifying each against `exp`. `skip` cases are not executed.
@@ -1066,7 +1133,11 @@ pub fn run_all_classified(
             continue;
         }
         if exp.is_skip(&key) {
-            slots.push(Some(ClassifiedOutcome { key, disposition: Disposition::Skip, detail: None }));
+            slots.push(Some(ClassifiedOutcome {
+                key,
+                disposition: Disposition::Skip,
+                detail: None,
+            }));
             continue;
         }
         queued.push((slots.len(), key, case));
@@ -1144,7 +1215,9 @@ fn run_cases_concurrently(bin: &Path, cases: &[&Case]) -> Vec<Result<CaseOutcome
                 let Some(case) = cases.get(i) else { break };
                 let outcome = run_case(bin, case).map_err(|e| e.to_string());
                 if let Some(slot) = slots.get(i) {
-                    *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+                    *slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
                 }
             });
         }
@@ -1193,13 +1266,19 @@ b
         assert_eq!(cases.len(), 2);
         let first = cases.first().unwrap();
         assert_eq!(first.name, "grep counts matching lines");
-        assert_eq!(first.argv, vec![b"grep".to_vec(), b"-c".to_vec(), b"foo".to_vec()]);
+        assert_eq!(
+            first.argv,
+            vec![b"grep".to_vec(), b"-c".to_vec(), b"foo".to_vec()]
+        );
         assert_eq!(first.stdin, b"foo\nbar\n".to_vec());
         assert_eq!(first.expect.stdout, Some(b"1\n".to_vec()));
         assert_eq!(first.expect.status, Some(0));
         let second = cases.get(1).unwrap();
         assert_eq!(second.files, vec![("f.txt".to_string(), b"a\n".to_vec())]);
-        assert_eq!(second.expect.files_after, vec![("f.txt".to_string(), b"b\n".to_vec())]);
+        assert_eq!(
+            second.expect.files_after,
+            vec![("f.txt".to_string(), b"b\n".to_vec())]
+        );
     }
 
     #[test]
@@ -1250,13 +1329,21 @@ b
     /// Punctuation still escapes itself, which is what `\\` and `\"` need.
     #[test]
     fn argv_tokenizer_refuses_an_unknown_letter_escape() {
-        assert_eq!(tokenize(r#"sed "a\rb""#, 1).unwrap(), vec![b"sed".to_vec(), b"a\rb".to_vec()]);
+        assert_eq!(
+            tokenize(r#"sed "a\rb""#, 1).unwrap(),
+            vec![b"sed".to_vec(), b"a\rb".to_vec()]
+        );
         for bad in [r#"sed "a\0b""#, r#"sed "a\e""#] {
             assert!(tokenize(bad, 1).is_err(), "{bad} was accepted");
         }
         assert_eq!(
             tokenize(r#"sed "a\\b" "c\"d" "e\$f""#, 1).unwrap(),
-            vec![b"sed".to_vec(), br"a\b".to_vec(), b"c\"d".to_vec(), b"e$f".to_vec()]
+            vec![
+                b"sed".to_vec(),
+                br"a\b".to_vec(),
+                b"c\"d".to_vec(),
+                b"e$f".to_vec()
+            ]
         );
     }
 
@@ -1272,12 +1359,20 @@ b
         // A short or non-hex run is refused rather than read as the letter.
         // `\x+4` is the one that needs saying: `from_str_radix` takes a leading
         // `+`, so without the digit check it would quietly be 0x04.
-        for bad in [r#"sed "a\x4""#, r#"sed "a\xzz""#, r#"sed "a\x""#, r#"sed "a\x+4""#] {
+        for bad in [
+            r#"sed "a\x4""#,
+            r#"sed "a\xzz""#,
+            r#"sed "a\x""#,
+            r#"sed "a\x+4""#,
+        ] {
             assert!(tokenize(bad, 1).is_err(), "{bad} was accepted");
         }
         // A NUL is spellable now and argv cannot hold one, so it is refused
         // here rather than at `Command::spawn`, which would end the whole run.
-        assert!(tokenize(r#"sed "a\x00b""#, 1).is_err(), "a NUL in argv was accepted");
+        assert!(
+            tokenize(r#"sed "a\x00b""#, 1).is_err(),
+            "a NUL in argv was accepted"
+        );
         // The same escape in the `-json` table, which shares the reader.
         assert_eq!(json_decode(r#""\x41\x80""#, 1).unwrap(), b"A\x80".to_vec());
         for bad in [r#""\x+4""#, r#""\xzz""#, r#""\x4""#] {
@@ -1306,7 +1401,10 @@ b
         // The 4-field row is upstream's non-conformance marker: not asserted.
         assert_eq!(cases.len(), 2);
         let first = cases.first().unwrap();
-        assert_eq!(first.argv, vec![b"grep".to_vec(), b"-e".to_vec(), b"abc".to_vec()]);
+        assert_eq!(
+            first.argv,
+            vec![b"grep".to_vec(), b"-e".to_vec(), b"abc".to_vec()]
+        );
         assert_eq!(first.stdin, b"abc\n".to_vec());
         assert_eq!(first.expect.status, Some(0));
         assert!(first.expect.stdout.is_none());
@@ -1318,7 +1416,12 @@ b
         let cases = parse_spencer("0@a+@aa\n", "gnu-grep/ere.tests", true).unwrap();
         assert_eq!(
             cases.first().map(|c| c.argv.clone()),
-            Some(vec![b"grep".to_vec(), b"-E".to_vec(), b"-e".to_vec(), b"a+".to_vec()])
+            Some(vec![
+                b"grep".to_vec(),
+                b"-E".to_vec(),
+                b"-e".to_vec(),
+                b"a+".to_vec()
+            ])
         );
     }
 
@@ -1345,7 +1448,13 @@ b
         let text = "#### c\n## argv: grep a\n## env A: 1\n## env B:\n## END\n";
         let cases = parse_cases(text, "f").unwrap();
         let env = &cases.first().unwrap().env;
-        assert_eq!(env, &[("A".to_string(), b"1".to_vec()), ("B".to_string(), Vec::new())]);
+        assert_eq!(
+            env,
+            &[
+                ("A".to_string(), b"1".to_vec()),
+                ("B".to_string(), Vec::new())
+            ]
+        );
     }
 
     #[test]
@@ -1360,12 +1469,32 @@ b
     #[test]
     fn classification_reds_a_regression_and_an_unexpected_pass() {
         let exp = Expectations::parse("xfail f::known\n").unwrap();
-        let fail = CaseOutcome { passed: false, detail: None, timed_out: false };
-        let pass = CaseOutcome { passed: true, detail: None, timed_out: false };
-        assert_eq!(classify("f::known".into(), &fail, &exp).disposition, Disposition::XFail);
-        assert_eq!(classify("f::known".into(), &pass, &exp).disposition, Disposition::XPass);
-        assert_eq!(classify("f::new".into(), &fail, &exp).disposition, Disposition::Fail);
-        assert_eq!(classify("f::new".into(), &pass, &exp).disposition, Disposition::Pass);
+        let fail = CaseOutcome {
+            passed: false,
+            detail: None,
+            timed_out: false,
+        };
+        let pass = CaseOutcome {
+            passed: true,
+            detail: None,
+            timed_out: false,
+        };
+        assert_eq!(
+            classify("f::known".into(), &fail, &exp).disposition,
+            Disposition::XFail
+        );
+        assert_eq!(
+            classify("f::known".into(), &pass, &exp).disposition,
+            Disposition::XPass
+        );
+        assert_eq!(
+            classify("f::new".into(), &fail, &exp).disposition,
+            Disposition::Fail
+        );
+        assert_eq!(
+            classify("f::new".into(), &pass, &exp).disposition,
+            Disposition::Pass
+        );
         let summary = summarize(&[
             classify("f::new".into(), &fail, &exp),
             classify("f::known".into(), &fail, &exp),
@@ -1426,9 +1555,22 @@ mod runner_tests {
         let (out, stale) =
             run_all_classified(sh, &cases, &Expectations::default()).expect("the run");
         let keys: Vec<&str> = out.iter().map(|o| o.key.as_str()).collect();
-        assert_eq!(keys, ["runner.tests::slow", "runner.tests::quick", "runner.tests::last"]);
+        assert_eq!(
+            keys,
+            [
+                "runner.tests::slow",
+                "runner.tests::quick",
+                "runner.tests::last"
+            ]
+        );
         for o in &out {
-            assert_eq!(o.disposition, Disposition::Pass, "{}: {:?}", o.key, o.detail);
+            assert_eq!(
+                o.disposition,
+                Disposition::Pass,
+                "{}: {:?}",
+                o.key,
+                o.detail
+            );
         }
         assert!(stale.is_empty());
     }

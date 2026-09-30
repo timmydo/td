@@ -921,8 +921,7 @@ fn verify_jail_filesystems(require_nested_mount: bool) -> Result<(), String> {
         file.write_all(b"td-jail-filesystem-rw-v1")
             .map_err(|e| format!("write read-write filesystem grant {writable}: {e}"))?;
         drop(file);
-        fs::read(&writable)
-            .map_err(|e| format!("read read-write filesystem grant {writable}: {e}"))
+        fs::read(&writable).map_err(|e| format!("read read-write filesystem grant {writable}: {e}"))
     })();
     let removed = fs::remove_file(&writable)
         .map_err(|e| format!("remove read-write filesystem grant probe {writable}: {e}"));
@@ -1174,7 +1173,9 @@ pub fn selftest(shared_network: bool) -> Result<(), ClientRunFailure> {
         .get(pixels.len().saturating_sub(4)..)
         .ok_or_else(|| "demo pattern has no last pixel".to_string())?;
     if first == last {
-        return Err("demo pattern did not vary across the surface".to_string().into());
+        return Err("demo pattern did not vary across the surface"
+            .to_string()
+            .into());
     }
 
     let (sender, receiver) =
@@ -1187,11 +1188,9 @@ pub fn selftest(shared_network: bool) -> Result<(), ClientRunFailure> {
         sys::recv_with_fds(&receiver, &mut bytes).map_err(|error| error.to_string())?;
     if received.count != 4 || bytes.get(..4) != Some(b"demo") || received.fds.len() != 1 {
         sys::discard_received(&received.fds);
-        return Err(
-            "demo descriptor transport did not preserve its message"
-                .to_string()
-                .into(),
-        );
+        return Err("demo descriptor transport did not preserve its message"
+            .to_string()
+            .into());
     }
     let fd = received
         .fds
@@ -1212,14 +1211,13 @@ pub fn selftest(shared_network: bool) -> Result<(), ClientRunFailure> {
     file.read_exact_at(&mut content, 0)
         .map_err(|e| format!("read received demo descriptor: {e}"))?;
     if content != first {
-        return Err(
-            "demo descriptor transport did not preserve pixels"
-                .to_string()
-                .into(),
-        );
+        return Err("demo descriptor transport did not preserve pixels"
+            .to_string()
+            .into());
     }
     let mut out = std::io::stdout().lock();
-    writeln!(out, "TD-UI-DEMO-SELFTEST-OK").map_err(|e| format!("write demo selftest marker: {e}"))?;
+    writeln!(out, "TD-UI-DEMO-SELFTEST-OK")
+        .map_err(|e| format!("write demo selftest marker: {e}"))?;
     Ok(())
 }
 

@@ -104,11 +104,8 @@ mod tests {
         assert!(production.contains(&format!("const AUDIO_RUNTIME: &str = {AUDIO_RUNTIME:?};")));
         assert!(production.contains("verify_runtime_base(base, require_root_base)?;"));
         assert!(production.contains("prepare_owned_runtime(path, account, 0o755)"));
-        assert!(production.contains(
-            "prepare_audio_runtime(audio_runtime, assignment.audio, require_char)?;"
-        ));
-        assert!(production.contains(
-            "verify_owner_mode(audio_runtime, assignment.audio, 0o755)?;"
-        ));
+        assert!(production
+            .contains("prepare_audio_runtime(audio_runtime, assignment.audio, require_char)?;"));
+        assert!(production.contains("verify_owner_mode(audio_runtime, assignment.audio, 0o755)?;"));
     }
 }

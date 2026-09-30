@@ -14,7 +14,15 @@
 //! names in sets (dedup, last-wins); we keep file order with duplicates —
 //! identical for real drvs, which are emitted from those sorted structures.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 /// One (name,path,hashAlgo,hash) output entry, in file order.
 #[derive(Debug)]
@@ -55,7 +63,10 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn fail<T>(&self, what: impl Into<String>) -> Result<T, ParseError> {
-        Err(ParseError { offset: self.pos, what: what.into() })
+        Err(ParseError {
+            offset: self.pos,
+            what: what.into(),
+        })
     }
 
     fn next(&mut self) -> Result<u8, ParseError> {
@@ -136,7 +147,11 @@ impl<'a> Parser<'a> {
     fn strings(&mut self, are_paths: bool) -> Result<Vec<String>, ParseError> {
         let mut res = Vec::new();
         while !self.end_of_list()? {
-            res.push(if are_paths { self.path()? } else { self.string()? });
+            res.push(if are_paths {
+                self.path()?
+            } else {
+                self.string()?
+            });
         }
         Ok(res)
     }
@@ -158,7 +173,12 @@ pub fn parse(input: &[u8]) -> Result<Derivation, ParseError> {
         p.expect(",")?;
         let hash = p.string()?;
         p.expect(")")?;
-        outputs.push(Output { name, path, hash_algo, hash });
+        outputs.push(Output {
+            name,
+            path,
+            hash_algo,
+            hash,
+        });
     }
 
     let mut input_drvs = Vec::new();
@@ -209,7 +229,15 @@ pub fn parse(input: &[u8]) -> Result<Derivation, ParseError> {
         return p.fail("trailing bytes after the closing `)`");
     }
 
-    Ok(Derivation { outputs, input_drvs, input_srcs, platform, builder, args, env })
+    Ok(Derivation {
+        outputs,
+        input_drvs,
+        input_srcs,
+        platform,
+        builder,
+        args,
+        env,
+    })
 }
 
 /// Escape a value for the one-line `drv-parse` dump (the ATerm escapes,
@@ -237,7 +265,11 @@ pub fn dump(drv: &Derivation) -> String {
             "output {} {} {} {}\n",
             o.name,
             o.path,
-            if o.hash_algo.is_empty() { "-" } else { &o.hash_algo },
+            if o.hash_algo.is_empty() {
+                "-"
+            } else {
+                &o.hash_algo
+            },
             if o.hash.is_empty() { "-" } else { &o.hash }
         ));
     }
@@ -272,7 +304,13 @@ pub fn serialize(drv: &Derivation) -> String {
     }
     let mut o = String::from("Derive([");
     o.push_str(&join(&drv.outputs, |out| {
-        format!("({},{},{},{})", q(&out.name), q(&out.path), q(&out.hash_algo), q(&out.hash))
+        format!(
+            "({},{},{},{})",
+            q(&out.name),
+            q(&out.path),
+            q(&out.hash_algo),
+            q(&out.hash)
+        )
     }));
     o.push_str("],[");
     o.push_str(&join(&drv.input_drvs, |(path, names)| {
@@ -345,14 +383,25 @@ mod tests {
         assert_eq!(drv.outputs[0].name, "out");
         assert_eq!(drv.outputs[0].path, "/gnu/store/aaa-x");
         assert_eq!(drv.outputs[0].hash_algo, "");
-        assert_eq!(drv.input_drvs, vec![("/gnu/store/bbb-dep.drv".to_string(),
-                                         vec!["lib".to_string(), "out".to_string()])]);
+        assert_eq!(
+            drv.input_drvs,
+            vec![(
+                "/gnu/store/bbb-dep.drv".to_string(),
+                vec!["lib".to_string(), "out".to_string()]
+            )]
+        );
         assert_eq!(drv.input_srcs, vec!["/gnu/store/ccc-src"]);
         assert_eq!(drv.platform, "x86_64-linux");
         assert_eq!(drv.builder, "/gnu/store/ddd-guile/bin/guile");
         assert_eq!(drv.args, vec!["--no-auto-compile", "/gnu/store/ccc-src"]);
-        assert_eq!(drv.env[0], ("out".to_string(), "/gnu/store/aaa-x".to_string()));
-        assert_eq!(drv.env[1], ("allowSubstitutes".to_string(), "0".to_string()));
+        assert_eq!(
+            drv.env[0],
+            ("out".to_string(), "/gnu/store/aaa-x".to_string())
+        );
+        assert_eq!(
+            drv.env[1],
+            ("allowSubstitutes".to_string(), "0".to_string())
+        );
     }
 
     #[test]
@@ -383,7 +432,11 @@ mod tests {
         assert!(parse(one.as_bytes()).is_ok());
         let twice = r#"Derive([("out","/gnu/store/aaa-x","","")],[],[],"s","/b",[],[("TD_PAYLOAD_MAP","{}"),("TD_PAYLOAD_MAP","{\"f\":\"/td/store/def-f\"}")])"#;
         let err = parse(twice.as_bytes()).unwrap_err();
-        assert!(err.what.contains("TD_PAYLOAD_MAP"), "must name the key: {}", err.what);
+        assert!(
+            err.what.contains("TD_PAYLOAD_MAP"),
+            "must name the key: {}",
+            err.what
+        );
         assert!(err.what.contains("more than once"), "{}", err.what);
         // Not special-cased to that one variable: any repeat is malformed.
         let other = r#"Derive([("out","/gnu/store/aaa-x","","")],[],[],"s","/b",[],[("A","1"),("B","2"),("A","3")])"#;
@@ -402,7 +455,10 @@ mod tests {
         assert!(err.what.contains("bad path"));
         // Trailing garbage after the final `)` (fail-closed deviation).
         let trailer = format!("{}x", sample());
-        assert!(parse(trailer.as_bytes()).unwrap_err().what.contains("trailing"));
+        assert!(parse(trailer.as_bytes())
+            .unwrap_err()
+            .what
+            .contains("trailing"));
     }
 
     #[test]

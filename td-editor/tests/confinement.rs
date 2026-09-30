@@ -10,12 +10,15 @@ fn file_barrier_is_excluded_from_default_builds() {
     let manifest = include_str!("../Cargo.toml");
     assert!(library.contains("#[cfg(feature = \"test-file-barrier\")]\nmod test_file_barrier;"));
     assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n    let mut barrier ="));
-    assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n        if let Some(barrier)"));
+    assert!(
+        worker.contains("#[cfg(feature = \"test-file-barrier\")]\n        if let Some(barrier)")
+    );
     assert_eq!(worker.matches("barrier.checkpoint(").count(), 1);
     assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n    queue_gate:"));
     assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n        let queue_gate ="));
     assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n        if let Some(gate)"));
-    assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n        if matches!(self.pending"));
+    assert!(worker
+        .contains("#[cfg(feature = \"test-file-barrier\")]\n        if matches!(self.pending"));
     assert_eq!(worker.matches("gate.begin(").count(), 1);
     assert_eq!(worker.matches("gate.poll(").count(), 1);
     assert!(manifest.contains("[features]\ntest-file-barrier = []"));
@@ -233,7 +236,13 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     }
     // The clipboard destination's status commands went to td-ui with the
     // writer (UNSAFE.md §19): no fcntl, no descriptor owner here.
-    for gone in ["SYS_FCNTL", "F_GETFL", "F_SETFL", "O_NONBLOCK", "Destination"] {
+    for gone in [
+        "SYS_FCNTL",
+        "F_GETFL",
+        "F_SETFL",
+        "O_NONBLOCK",
+        "Destination",
+    ] {
         assert!(!raw.contains(gone), "{gone} is td-ui's");
     }
     assert!(!raw.contains("#![allow("));
@@ -312,11 +321,19 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         1
     );
     assert!(!production.contains("Connection"));
-    assert_eq!(production.matches("Client::new(stream, temporary)?").count(), 1);
+    assert_eq!(
+        production
+            .matches("Client::new(stream, temporary)?")
+            .count(),
+        1
+    );
     assert_eq!(production.matches("self.client.connection()").count(), 4);
     assert_eq!(production.matches(".pop_descriptor()").count(), 0);
     assert_eq!(production.matches("self.client.receive(").count(), 1);
-    assert_eq!(production.matches("self.client.offer_selection(").count(), 1);
+    assert_eq!(
+        production.matches("self.client.offer_selection(").count(),
+        1
+    );
     assert_eq!(production.matches(".unconfigure(").count(), 0);
     assert_eq!(production.matches(".input_mut(").count(), 0);
     assert_eq!(
@@ -374,17 +391,27 @@ fn native_prompt_inspection_is_borrow_only_and_cannot_dispatch_or_poll() {
     ] {
         assert!(!query.contains(forbidden), "{forbidden}");
     }
-    let dispatch = production.split("fn control_response_inner(").nth(1).unwrap();
+    let dispatch = production
+        .split("fn control_response_inner(")
+        .nth(1)
+        .unwrap();
     let dispatch = dispatch.split("\n    fn ").next().unwrap();
     assert!(
         dispatch.find("Operation::PromptState").unwrap()
             < dispatch.find("request.is_mutating()").unwrap()
     );
-    let wrapper = production.split("fn control_response(").nth(1).unwrap()
-        .split("\n    fn ").next().unwrap();
+    let wrapper = production
+        .split("fn control_response(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
     assert!(wrapper.contains("request.is_mutating() && matches!(response.split('\\t').nth(2), Some(\"ok\" | \"pending\"))"));
-    assert!(wrapper.find("request.is_mutating()").unwrap()
-        < wrapper.find("self.sync_prompt_layout()").unwrap());
+    assert!(
+        wrapper.find("request.is_mutating()").unwrap()
+            < wrapper.find("self.sync_prompt_layout()").unwrap()
+    );
     let control = include_str!("../src/control.rs");
     let fields = control
         .split("fn fields(&self, generation: u64, notice: &str)")
@@ -440,12 +467,7 @@ fn native_prompt_answers_pin_context_before_cleanup_and_never_route_global_keys(
         assert!(!answer.contains(forbidden), "{forbidden}");
         assert!(!entry.contains(forbidden), "entry: {forbidden}");
     }
-    for forbidden in [
-        ".dispatch(",
-        "self.client",
-        "self.frames.",
-        "self.find(",
-    ] {
+    for forbidden in [".dispatch(", "self.client", "self.frames.", "self.find("] {
         assert!(!entry.contains(forbidden), "entry: {forbidden}");
     }
     assert_eq!(entry.matches("prompt.type_chord(").count(), 4);
@@ -481,7 +503,10 @@ fn native_prompt_answers_pin_context_before_cleanup_and_never_route_global_keys(
     ] {
         assert!(answer.contains(required), "{required}");
     }
-    let dispatch = production.split("fn control_response_inner(").nth(1).unwrap();
+    let dispatch = production
+        .split("fn control_response_inner(")
+        .nth(1)
+        .unwrap();
     let dispatch = dispatch.split("\n    fn ").next().unwrap();
     assert!(
         dispatch.find("Operation::PromptAnswer").unwrap()
@@ -507,7 +532,10 @@ fn test_files_mount_no_sibling_source() {
         }
     }
     let mut files = Vec::new();
-    walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"), &mut files);
+    walk(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"),
+        &mut files,
+    );
     assert!(files.len() > 5, "{files:?}");
     for file in files {
         let text = std::fs::read_to_string(&file).unwrap();
@@ -667,15 +695,18 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     assert!(production.contains("control: None"));
     assert!(production.contains("fn control_response(&mut self,"));
     assert!(production.contains("let response = request.response(&self.ui);"));
-    let dispatch = production.split("fn control_response_inner(").nth(1).unwrap();
+    let dispatch = production
+        .split("fn control_response_inner(")
+        .nth(1)
+        .unwrap();
     let dispatch = dispatch.split("\n    fn ").next().unwrap();
     assert!(
         dispatch.find("self.frames.generation()").unwrap()
             < dispatch.find("request.is_mutating()").unwrap()
     );
-    assert!(dispatch.contains(
-        "self.client.closed() || self.pointer_modal() || self.menu.is_some()"
-    ));
+    assert!(
+        dispatch.contains("self.client.closed() || self.pointer_modal() || self.menu.is_some()")
+    );
     assert!(
         dispatch.find("request.is_mutating()").unwrap()
             < dispatch.find("Operation::CloseTab").unwrap()

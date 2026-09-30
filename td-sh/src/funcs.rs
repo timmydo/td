@@ -78,7 +78,10 @@ mod tests {
             line: 1,
             body: Arc::new(Stage {
                 line: 1,
-                cmd: Cmd::Subshell { body: List { items: Vec::new() }, redirs: Vec::new() },
+                cmd: Cmd::Subshell {
+                    body: List { items: Vec::new() },
+                    redirs: Vec::new(),
+                },
             }),
         }
     }
@@ -90,7 +93,10 @@ mod tests {
         let mut funcs = Funcs::default();
         funcs.define("a/b".to_string(), func());
         funcs.define("ab".to_string(), func());
-        assert!(funcs.get("a/b").is_none(), "a `/` name is not what a word names");
+        assert!(
+            funcs.get("a/b").is_none(),
+            "a `/` name is not what a word names"
+        );
         assert!(funcs.get("ab").is_some(), "and every other name still is");
         let mut names: Vec<&String> = funcs.defined_names().collect();
         names.sort();

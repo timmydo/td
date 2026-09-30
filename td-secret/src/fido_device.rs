@@ -1985,7 +1985,10 @@ mod vm_tests {
                 .take(65_537)
                 .read_to_end(&mut bytes)
                 .unwrap();
-            assert!(bytes.len() <= 65_536, "private worker stderr exceeded 64 KiB");
+            assert!(
+                bytes.len() <= 65_536,
+                "private worker stderr exceeded 64 KiB"
+            );
             let log = String::from_utf8(bytes).expect("private worker stderr was not UTF-8");
             assert_eq!(status.success(), error.is_none(), "{log}");
             if let Some(error) = error {
@@ -2010,7 +2013,11 @@ mod vm_tests {
     ) -> Vec<u8> {
         let mut frame = wire.receive().unwrap();
         let encoded = request.encode();
-        assert_eq!(frame.len(), 33 + encoded.len(), "unexpected private invitation length");
+        assert_eq!(
+            frame.len(),
+            33 + encoded.len(),
+            "unexpected private invitation length"
+        );
         assert_eq!(frame[0], tag);
         assert_eq!(&frame[33..], encoded);
         frame[0] += 1;
@@ -2220,7 +2227,11 @@ mod vm_tests {
         if cancel || absent_role || value.is_none() {
             assert_eq!(sealed_bytes(), before);
         } else {
-            assert_ne!(sealed_bytes(), before, "successful write left the bundle unchanged");
+            assert_ne!(
+                sealed_bytes(),
+                before,
+                "successful write left the bundle unchanged"
+            );
         }
         if cancel || absent_role || value.is_some() {
             no_release();
@@ -2302,7 +2313,9 @@ mod vm_tests {
 
     mod desktop {
         use super::*;
-        mod system { include!("system_vm.rs"); }
+        mod system {
+            include!("system_vm.rs");
+        }
         use std::os::unix::fs::{chown, PermissionsExt};
         use std::path::Path;
         use std::sync::atomic::AtomicUsize;
@@ -2310,11 +2323,16 @@ mod vm_tests {
         struct Diagnostics;
         impl Drop for Diagnostics {
             fn drop(&mut self) {
-                if !thread::panicking() { return; }
+                if !thread::panicking() {
+                    return;
+                }
                 for log in [
-                    "/run/desktop-authd.log", "/run/desktop-compositor.log",
-                    "/run/desktop-set.log", "/run/desktop-busd.log",
-                    "/run/desktop-portal.log", "/run/desktop-mail.log",
+                    "/run/desktop-authd.log",
+                    "/run/desktop-compositor.log",
+                    "/run/desktop-set.log",
+                    "/run/desktop-busd.log",
+                    "/run/desktop-portal.log",
+                    "/run/desktop-mail.log",
                     "/run/desktop-news.log",
                 ] {
                     if let Ok(file) = File::open(log) {
@@ -2330,7 +2348,10 @@ mod vm_tests {
         fn wait(label: &str, mut done: impl FnMut() -> bool) {
             let deadline = Instant::now() + Duration::from_secs(15);
             while !done() {
-                assert!(Instant::now() < deadline, "desktop fixture timed out: {label}");
+                assert!(
+                    Instant::now() < deadline,
+                    "desktop fixture timed out: {label}"
+                );
                 thread::sleep(Duration::from_millis(10));
             }
         }
@@ -2341,8 +2362,14 @@ mod vm_tests {
                 let Ok(store) = crate::owned_store(1000) else {
                     return false;
                 };
-                assert_eq!(store.application_secret("mail", "main").unwrap().unwrap(), expected);
-                assert_eq!(store.application_secret("news", "main").unwrap().unwrap(), b"untouched fixture");
+                assert_eq!(
+                    store.application_secret("mail", "main").unwrap().unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    store.application_secret("news", "main").unwrap().unwrap(),
+                    b"untouched fixture"
+                );
                 true
             });
         }
@@ -2411,12 +2438,17 @@ mod vm_tests {
                                 .unwrap().write_all(text.as_bytes()).unwrap();
                         }
             if reopen {
-                assert_eq!(fs::read("/etc/td-principals.tsv").unwrap(),
-                    fs::read("/var/lib/td/principals.tsv").unwrap());
+                assert_eq!(
+                    fs::read("/etc/td-principals.tsv").unwrap(),
+                    fs::read("/var/lib/td/principals.tsv").unwrap()
+                );
             } else {
                 fs::copy("/etc/td-principals.tsv", "/var/lib/td/principals.tsv").unwrap();
-                fs::set_permissions("/var/lib/td/principals.tsv",
-                    fs::Permissions::from_mode(0o600)).unwrap();
+                fs::set_permissions(
+                    "/var/lib/td/principals.tsv",
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
             }
             fs::write(
                 "/etc/td-bus-applications.tsv",
@@ -2468,7 +2500,8 @@ mod vm_tests {
                 }
                 let package = format!("/td/store/portal-{app}");
                 directory(format!("{package}/files/bin"), 0, 0o755);
-                fs::hard_link("/bin/td-secret-tests", format!("{package}/files/bin/probe")).unwrap();
+                fs::hard_link("/bin/td-secret-tests", format!("{package}/files/bin/probe"))
+                    .unwrap();
                 fs::hard_link("/bin/td-secret", format!("{package}/files/bin/td-secret")).unwrap();
                 fs::write(
                     format!("{package}/manifest"),
@@ -2627,7 +2660,8 @@ mod vm_tests {
                 fs::rename(self.home.join("request.next"), self.home.join("request")).unwrap();
                 wait("application portal response", || {
                     assert!(self.process.exited().is_none());
-                    let response = fs::read_to_string(self.home.join("response")).unwrap_or_default();
+                    let response =
+                        fs::read_to_string(self.home.join("response")).unwrap_or_default();
                     if !response.starts_with(&format!("{sequence}\t")) {
                         return false;
                     }
@@ -2700,8 +2734,8 @@ mod vm_tests {
         // Standard keyboard: eight modifiers, padding, and six key usages.
         const KEYBOARD: &[u8] = &[
             5, 1, 9, 6, 0xa1, 1, 5, 7, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8,
-            0x81, 2, 0x95, 1, 0x75, 8, 0x81, 1, 0x95, 6, 0x75, 8, 0x15, 0, 0x25, 0x65, 5, 7, 0x19, 0,
-            0x29, 0x65, 0x81, 0, 0xc0,
+            0x81, 2, 0x95, 1, 0x75, 8, 0x81, 1, 0x95, 6, 0x75, 8, 0x15, 0, 0x25, 0x65, 5, 7, 0x19,
+            0, 0x29, 0x65, 0x81, 0, 0xc0,
         ];
 
         struct Keyboard(File);
@@ -2883,11 +2917,21 @@ mod vm_tests {
         }
 
         fn setup(reopen: bool) {
-            if reopen { prepare_operation_accounts(); } else { prepare_operation_store(); }
-            fs::write("/etc/td-bus-applications.tsv",
-                "td-bus-applications-v1\t1000\n65537\tmail\t\n").unwrap();
-            fs::set_permissions("/etc/td-bus-applications.tsv",
-                fs::Permissions::from_mode(0o444)).unwrap();
+            if reopen {
+                prepare_operation_accounts();
+            } else {
+                prepare_operation_store();
+            }
+            fs::write(
+                "/etc/td-bus-applications.tsv",
+                "td-bus-applications-v1\t1000\n65537\tmail\t\n",
+            )
+            .unwrap();
+            fs::set_permissions(
+                "/etc/td-bus-applications.tsv",
+                fs::Permissions::from_mode(0o444),
+            )
+            .unwrap();
             for (name, text) in [
                 (
                     "passwd",
@@ -2916,10 +2960,19 @@ mod vm_tests {
             }
             for entry in fs::read_dir("/dev/input").unwrap() {
                 let path = entry.unwrap().path();
-                if !path.file_name().unwrap().to_str().unwrap().starts_with("event") {
+                if !path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("event")
+                {
                     continue;
                 }
-                assert!(fs::symlink_metadata(&path).unwrap().file_type().is_char_device());
+                assert!(fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_char_device());
                 chown(&path, Some(993), Some(993)).unwrap();
                 fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
             }
@@ -2939,19 +2992,33 @@ mod vm_tests {
             let _diagnostics = Diagnostics;
             assert!(Command::new("/bin/td-init")
                 .args(["hostname", "td-secret-fixture"])
-                .status().unwrap().success());
+                .status()
+                .unwrap()
+                .success());
             let mut keyboard = Keyboard::new();
             // Mail's declared idmapped view needs a mountable backing filesystem.
             fs::create_dir_all("/var").unwrap();
             if persistent {
                 mount_persistent_var(true);
             } else {
-                applet(&["mount", "-t", "tmpfs", "-o", "nosuid,nodev,mode=0755", "tmpfs", "/var"]);
+                applet(&[
+                    "mount",
+                    "-t",
+                    "tmpfs",
+                    "-o",
+                    "nosuid,nodev,mode=0755",
+                    "tmpfs",
+                    "/var",
+                ]);
             }
             setup(false);
             setup_portal(false);
             crate::tpm::tests::qemu_extend(&[9; 32]);
-            let token = if persistent { persistent_token(true, false) } else { VirtualCredential::new(44) };
+            let token = if persistent {
+                persistent_token(true, false)
+            } else {
+                VirtualCredential::new(44)
+            };
             let requests = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&requests);
             let enrollment_user = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
@@ -2965,12 +3032,25 @@ mod vm_tests {
                     use crate::fido_cbor::{self, Value};
                     let value = fido_cbor::decode(&request[1..]).unwrap();
                     if request[0] == 1 {
-                        *primary_user.lock().unwrap() = Some(value.required(&Value::Unsigned(3)).unwrap()
-                            .required(&Value::Text("id")).unwrap().bytes().unwrap().to_vec());
+                        *primary_user.lock().unwrap() = Some(
+                            value
+                                .required(&Value::Unsigned(3))
+                                .unwrap()
+                                .required(&Value::Text("id"))
+                                .unwrap()
+                                .bytes()
+                                .unwrap()
+                                .to_vec(),
+                        );
                     }
                     let field = if request[0] == 1 { 1 } else { 2 };
-                    let hash: [u8; 32] = value.required(&Value::Unsigned(field)).unwrap()
-                        .bytes().unwrap().try_into().unwrap();
+                    let hash: [u8; 32] = value
+                        .required(&Value::Unsigned(field))
+                        .unwrap()
+                        .bytes()
+                        .unwrap()
+                        .try_into()
+                        .unwrap();
                     assert_ne!(hash, [0; 32]);
                     assert!(challenges.insert(hash), "desktop reused a token challenge");
                     if persistent {
@@ -2979,8 +3059,14 @@ mod vm_tests {
                             let prior = fs::read(&path).unwrap();
                             assert!(!prior.as_chunks::<32>().0.contains(&hash));
                         }
-                        OpenOptions::new().append(true).create(true)
-                            .mode(0o600).open(path).unwrap().write_all(&hash).unwrap();
+                        OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .mode(0o600)
+                            .open(path)
+                            .unwrap()
+                            .write_all(&hash)
+                            .unwrap();
                     }
                 }
                 observed.store(index + 1, Ordering::SeqCst);
@@ -2997,42 +3083,74 @@ mod vm_tests {
             assert!(!Path::new("/var/lib/td/secrets/1000/sealed").exists());
             keyboard.select(if recovery { 0x08 } else { 0x1b }); // E: recovery; X: unrecoverable.
             let recovery_hid = if recovery {
-                wait("primary proof request", || requests.load(Ordering::SeqCst) == 3);
+                wait("primary proof request", || {
+                    requests.load(Ordering::SeqCst) == 3
+                });
                 let second = persistent_token(true, true);
-                assert_ne!(token.signer.lock().unwrap().cose, second.signer.lock().unwrap().cose);
+                assert_ne!(
+                    token.signer.lock().unwrap().cose,
+                    second.signer.lock().unwrap().cose
+                );
                 Some(second.checked(move |request, index| {
                     use crate::fido_cbor::{self, Value};
                     assert_eq!(request[0], [4, 1, 2][index]);
                     if request[0] != 4 {
                         let value = fido_cbor::decode(&request[1..]).unwrap();
                         if request[0] == 1 {
-                            let user = value.required(&Value::Unsigned(3)).unwrap()
-                                .required(&Value::Text("id")).unwrap().bytes().unwrap();
+                            let user = value
+                                .required(&Value::Unsigned(3))
+                                .unwrap()
+                                .required(&Value::Text("id"))
+                                .unwrap()
+                                .bytes()
+                                .unwrap();
                             assert_eq!(Some(user), enrollment_user.lock().unwrap().as_deref());
-                            let Value::Array(excluded) = value.required(&Value::Unsigned(5)).unwrap() else {
+                            let Value::Array(excluded) =
+                                value.required(&Value::Unsigned(5)).unwrap()
+                            else {
                                 panic!("recovery creation omitted the primary exclusion");
                             };
                             assert_eq!(excluded.len(), 1);
-                            assert_eq!(excluded[0].required(&Value::Text("id")).unwrap().bytes().unwrap(), [44; 32]);
+                            assert_eq!(
+                                excluded[0]
+                                    .required(&Value::Text("id"))
+                                    .unwrap()
+                                    .bytes()
+                                    .unwrap(),
+                                [44; 32]
+                            );
                         }
                         let field = if request[0] == 1 { 1 } else { 2 };
-                        let hash = value.required(&Value::Unsigned(field)).unwrap().bytes().unwrap();
+                        let hash = value
+                            .required(&Value::Unsigned(field))
+                            .unwrap()
+                            .bytes()
+                            .unwrap();
                         assert_eq!(hash.len(), 32);
                         assert_ne!(hash, [0; 32]);
                         let path = format!("{COLD_STATE}/challenges");
                         let prior = fs::read(&path).unwrap();
                         assert!(!prior.as_chunks::<32>().0.iter().any(|old| old == hash));
-                        OpenOptions::new().append(true).open(path).unwrap().write_all(hash).unwrap();
+                        OpenOptions::new()
+                            .append(true)
+                            .open(path)
+                            .unwrap()
+                            .write_all(hash)
+                            .unwrap();
                     }
                 }))
-            } else { None };
+            } else {
+                None
+            };
             wait("desktop enrollment", || {
                 Path::new("/var/lib/td/secrets/1000/sealed").exists()
             });
             no_release();
             if let Some(hid) = recovery_hid {
                 assert_eq!(hid.finish(), (3, 0));
-                wait("recovery device removal", || Device::discover().unwrap().len() == 1);
+                wait("recovery device removal", || {
+                    Device::discover().unwrap().len() == 1
+                });
             }
             assert_eq!(requests.load(Ordering::SeqCst), 3);
             mail.retrieve("main", "unavailable");
@@ -3068,7 +3186,11 @@ mod vm_tests {
                 .write_all(b"desktop fixture")
                 .unwrap();
             wait("public credential queue", || {
-                assert!(client.exited().is_none(), "{}", fs::read_to_string("/run/desktop-set.log").unwrap());
+                assert!(
+                    client.exited().is_none(),
+                    "{}",
+                    fs::read_to_string("/run/desktop-set.log").unwrap()
+                );
                 fs::read_to_string("/run/desktop-set.log")
                     .unwrap()
                     .contains("then W")
@@ -3115,8 +3237,16 @@ mod vm_tests {
             application_files("release-application-files");
             assert_eq!(hid.finish(), (9, 0));
             if persistent {
-                fs::write(format!("{COLD_STATE}/bundle-hash"), crate::crypto::digest(&sealed_bytes())).unwrap();
-                fs::copy("/proc/sys/kernel/random/boot_id", format!("{COLD_STATE}/boot-id")).unwrap();
+                fs::write(
+                    format!("{COLD_STATE}/bundle-hash"),
+                    crate::crypto::digest(&sealed_bytes()),
+                )
+                .unwrap();
+                fs::copy(
+                    "/proc/sys/kernel/random/boot_id",
+                    format!("{COLD_STATE}/boot-id"),
+                )
+                .unwrap();
                 applet(&["umount", "/var"]);
             }
         }
@@ -3124,33 +3254,74 @@ mod vm_tests {
         const COLD_STATE: &str = "/var/lib/td/secret-fixture";
 
         fn applet(args: &[&str]) {
-            assert!(Command::new("/bin/td-init").args(args).status().unwrap().success(), "{args:?}");
+            assert!(
+                Command::new("/bin/td-init")
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "{args:?}"
+            );
         }
 
         fn mount_persistent_var(create: bool) {
-            assert!(fs::metadata("/dev/vda").unwrap().file_type().is_block_device());
+            assert!(fs::metadata("/dev/vda")
+                .unwrap()
+                .file_type()
+                .is_block_device());
             fs::create_dir_all("/var").unwrap();
             if create {
                 let mut prefix = [0; 4096];
-                File::open("/dev/vda").unwrap().read_exact(&mut prefix).unwrap();
+                File::open("/dev/vda")
+                    .unwrap()
+                    .read_exact(&mut prefix)
+                    .unwrap();
                 assert_eq!(prefix, [0; 4096], "fixture disk is not fresh");
-                assert!(Command::new("/bin/mkfs.btrfs").args(["-q", "/dev/vda"])
-                    .status().unwrap().success());
+                assert!(Command::new("/bin/mkfs.btrfs")
+                    .args(["-q", "/dev/vda"])
+                    .status()
+                    .unwrap()
+                    .success());
                 fs::create_dir("/volume").unwrap();
-                applet(&["mount", "-t", "btrfs", "-o", "nosuid,nodev", "/dev/vda", "/volume"]);
-                assert!(Command::new("/bin/btrfs").args(["subvolume", "create", "/volume/@var"])
-                    .status().unwrap().success());
+                applet(&[
+                    "mount",
+                    "-t",
+                    "btrfs",
+                    "-o",
+                    "nosuid,nodev",
+                    "/dev/vda",
+                    "/volume",
+                ]);
+                assert!(Command::new("/bin/btrfs")
+                    .args(["subvolume", "create", "/volume/@var"])
+                    .status()
+                    .unwrap()
+                    .success());
                 applet(&["umount", "/volume"]);
             }
-            applet(&["mount", "-t", "btrfs", "-o", "nosuid,nodev,subvol=@var", "/dev/vda", "/var"]);
-            assert!(fs::read_to_string("/proc/self/mountinfo").unwrap().lines().any(|line| {
-                let fields: Vec<_> = line.split_whitespace().collect();
-                fields.get(3) == Some(&"/@var") && fields.get(4) == Some(&"/var")
-                    && fields.get(5).is_some_and(|options|
-                        ["rw", "nosuid", "nodev"].iter().all(|required|
-                            options.split(',').any(|option| option == *required)))
-                    && line.contains(" - btrfs ")
-            }));
+            applet(&[
+                "mount",
+                "-t",
+                "btrfs",
+                "-o",
+                "nosuid,nodev,subvol=@var",
+                "/dev/vda",
+                "/var",
+            ]);
+            assert!(fs::read_to_string("/proc/self/mountinfo")
+                .unwrap()
+                .lines()
+                .any(|line| {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    fields.get(3) == Some(&"/@var")
+                        && fields.get(4) == Some(&"/var")
+                        && fields.get(5).is_some_and(|options| {
+                            ["rw", "nosuid", "nodev"].iter().all(|required| {
+                                options.split(',').any(|option| option == *required)
+                            })
+                        })
+                        && line.contains(" - btrfs ")
+                }));
         }
 
         fn persistent_token(create: bool, recovery: bool) -> VirtualCredential {
@@ -3159,12 +3330,25 @@ mod vm_tests {
                 directory(COLD_STATE, 0, 0o700);
                 fs::write(format!("{COLD_STATE}/{role}-template"), fresh()).unwrap();
             }
-            let seed: [u8; 32] = fs::read(format!("{COLD_STATE}/{role}-template")).unwrap().try_into().unwrap();
+            let seed: [u8; 32] = fs::read(format!("{COLD_STATE}/{role}-template"))
+                .unwrap()
+                .try_into()
+                .unwrap();
             let signer = crate::tpm::tests::SigningKey::persistent(&seed);
             let public = format!("{COLD_STATE}/{role}-public");
-            if create { fs::write(public, &signer.cose).unwrap(); }
-            else { assert_eq!(fs::read(public).unwrap(), signer.cose, "cold token changed key"); }
-            VirtualCredential { id: vec![if recovery { 45 } else { 44 }; 32], signer: Arc::new(std::sync::Mutex::new(signer)) }
+            if create {
+                fs::write(public, &signer.cose).unwrap();
+            } else {
+                assert_eq!(
+                    fs::read(public).unwrap(),
+                    signer.cose,
+                    "cold token changed key"
+                );
+            }
+            VirtualCredential {
+                id: vec![if recovery { 45 } else { 44 }; 32],
+                signer: Arc::new(std::sync::Mutex::new(signer)),
+            }
         }
 
         #[test]
@@ -3200,11 +3384,15 @@ mod vm_tests {
             applet(&["hostname", "td-secret-fixture"]);
             let mut keyboard = Keyboard::new();
             mount_persistent_var(false);
-            assert_ne!(fs::read("/proc/sys/kernel/random/boot_id").unwrap(),
-                fs::read(format!("{COLD_STATE}/boot-id")).unwrap());
+            assert_ne!(
+                fs::read("/proc/sys/kernel/random/boot_id").unwrap(),
+                fs::read(format!("{COLD_STATE}/boot-id")).unwrap()
+            );
             let before = sealed_bytes();
-            assert_eq!(crate::crypto::digest(&before).as_slice(),
-                fs::read(format!("{COLD_STATE}/bundle-hash")).unwrap());
+            assert_eq!(
+                crate::crypto::digest(&before).as_slice(),
+                fs::read(format!("{COLD_STATE}/bundle-hash")).unwrap()
+            );
             for name in ["master", "mail.main", "news.main", "mail.private"] {
                 assert!(!store::user_path(1000).join(name).exists());
             }
@@ -3223,10 +3411,17 @@ mod vm_tests {
                 if request[0] == 2 {
                     use crate::fido_cbor::{self, Value};
                     let value = fido_cbor::decode(&request[1..]).unwrap();
-                    let hash = value.required(&Value::Unsigned(2)).unwrap().bytes().unwrap();
+                    let hash = value
+                        .required(&Value::Unsigned(2))
+                        .unwrap()
+                        .bytes()
+                        .unwrap();
                     assert_eq!(hash.len(), 32);
                     assert_ne!(hash, [0; 32]);
-                    assert!(!prior.as_chunks::<32>().0.iter().any(|old| old == hash), "cold unlock replayed a challenge");
+                    assert!(
+                        !prior.as_chunks::<32>().0.iter().any(|old| old == hash),
+                        "cold unlock replayed a challenge"
+                    );
                 }
                 observed.store(index + 1, Ordering::SeqCst);
             });
@@ -3239,7 +3434,9 @@ mod vm_tests {
             news.retrieve("main", "unavailable");
             assert_eq!(requests.load(Ordering::SeqCst), 0);
             keyboard.select(if recovery { 0x15 } else { 0x18 }); // R or U.
-            wait("cold desktop unlock", || Path::new("/run/td-secret/1000/key").exists());
+            wait("cold desktop unlock", || {
+                Path::new("/run/td-secret/1000/key").exists()
+            });
             read_released(b"desktop fixture");
             assert_eq!(requests.load(Ordering::SeqCst), 2);
             mail.retrieve("main", "desktop fixture");

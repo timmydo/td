@@ -26,10 +26,7 @@ pub fn recipe() -> Recipe {
         exec: true,
     });
     steps.push(Step::ToolFarm {
-        links: vec![(
-            "find".into(),
-            "{in:busybox-x86-64}/bin/busybox".into(),
-        )],
+        links: vec![("find".into(), "{in:busybox-x86-64}/bin/busybox".into())],
     });
     steps.push(
         Step::run(

@@ -23,7 +23,15 @@
 //!            | "SHUTDOWN\n"             clean stop
 //!   response = "OK <payload>\n" | "ERR <msg>\n"
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -480,10 +488,9 @@ mod tests {
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let (a, p) = (active.clone(), peak.clone());
-        let handle = move |
-            _req: &str,
-            _cancelled: &std::sync::atomic::AtomicBool,
-        | -> Result<String, String> {
+        let handle = move |_req: &str,
+                           _cancelled: &std::sync::atomic::AtomicBool|
+              -> Result<String, String> {
             let now = a.fetch_add(1, Ordering::SeqCst) + 1;
             p.fetch_max(now, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(80)); // hold the slot so builds overlap
@@ -523,19 +530,15 @@ mod tests {
 
     #[test]
     fn requester_disconnect_cancels_the_bounded_handler() {
-        let dir = std::env::temp_dir().join(format!(
-            "td-daemon-disconnect-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("td-daemon-disconnect-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let socket = dir.join("sock");
         let socket_s = socket.to_string_lossy().into_owned();
         let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handler_observed = observed.clone();
-        let handle = move |
-            _req: &str,
-            cancelled: &std::sync::atomic::AtomicBool,
-        | -> Result<String, String> {
+        let handle = move |_req: &str,
+                           cancelled: &std::sync::atomic::AtomicBool|
+              -> Result<String, String> {
             while !cancelled.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(5));
             }
@@ -583,10 +586,9 @@ mod tests {
         let socket = dir.join("sock");
         let socket_s = socket.to_string_lossy().into_owned();
 
-        let handle = move |
-            _req: &str,
-            _cancelled: &std::sync::atomic::AtomicBool,
-        | -> Result<String, String> { Ok("done".to_string()) };
+        let handle = move |_req: &str,
+                           _cancelled: &std::sync::atomic::AtomicBool|
+              -> Result<String, String> { Ok("done".to_string()) };
         let sock_for_serve = socket_s.clone();
         let server = thread::spawn(move || serve(&sock_for_serve, 2, handle).unwrap());
         for _ in 0..200 {
@@ -621,5 +623,4 @@ mod tests {
         std::env::remove_var("TD_DAEMON_READ_TIMEOUT_MS");
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }

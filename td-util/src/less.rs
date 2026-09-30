@@ -494,7 +494,10 @@ mod tests {
     fn output_halts_at_the_first_screenful() {
         let (out, stopped) = page_raw(&body(100), "", WIDE);
         assert!(out.contains("line5"), "the first page must be shown");
-        assert!(!out.contains("line6"), "it must not run past the page: {out:?}");
+        assert!(
+            !out.contains("line6"),
+            "it must not run past the page: {out:?}"
+        );
         assert_eq!(stopped, Stopped::Quit, "an exhausted command source quits");
     }
 
@@ -502,7 +505,10 @@ mod tests {
     #[test]
     fn one_keystroke_pages_in_raw_mode() {
         let (out, _) = page_raw(&body(100), " ", WIDE);
-        assert!(out.contains("line10"), "space alone must deliver a second page");
+        assert!(
+            out.contains("line10"),
+            "space alone must deliver a second page"
+        );
         assert!(!out.contains("line11"), "and exactly one: {out:?}");
     }
 
@@ -519,10 +525,16 @@ mod tests {
     fn q_quits_in_both_modes() {
         assert_eq!(page_raw(&body(100), "q", WIDE).1, Stopped::Quit);
         assert_eq!(page_raw(&body(100), "Q", WIDE).1, Stopped::Quit);
-        assert_eq!(run_pager(&body(100), "q\n", WIDE, false, 0).1, Stopped::Quit);
+        assert_eq!(
+            run_pager(&body(100), "q\n", WIDE, false, 0).1,
+            Stopped::Quit
+        );
         // ...and an unrecognised key pages on rather than exiting on a typo.
         let (out, _) = page_raw(&body(100), "z", WIDE);
-        assert!(out.contains("line10"), "an unknown key pages forward: {out:?}");
+        assert!(
+            out.contains("line10"),
+            "an unknown key pages forward: {out:?}"
+        );
     }
 
     /// Line mode is the fallback when raw mode could not be had, and Enter pages.
@@ -530,7 +542,10 @@ mod tests {
     fn line_mode_still_pages() {
         let (out, _) = run_pager(&body(100), "\n\n", WIDE, false, 0);
         // Enter is `j` — one line each — so two commands show two more lines.
-        assert!(out.contains("line7"), "two Enters advance two lines: {out:?}");
+        assert!(
+            out.contains("line7"),
+            "two Enters advance two lines: {out:?}"
+        );
         assert!(!out.contains("line8"));
         let (out, _) = run_pager(&body(100), " \n", WIDE, false, 0);
         assert!(out.contains("line10"), "space in line mode pages: {out:?}");
@@ -542,7 +557,10 @@ mod tests {
         let (out, stopped) = page_raw("only\ntwo\n", "", WIDE);
         assert_eq!(out, "only\ntwo\n");
         assert_eq!(stopped, Stopped::Eof);
-        assert!(!out.contains("--More--"), "nothing to page, so nothing to ask");
+        assert!(
+            !out.contains("--More--"),
+            "nothing to page, so nothing to ask"
+        );
     }
 
     /// An input ending EXACTLY on a page boundary does not prompt either — the one
@@ -551,14 +569,20 @@ mod tests {
     fn a_page_boundary_at_eof_does_not_prompt() {
         let (out, stopped) = page_raw(&body(5), "", WIDE);
         assert_eq!(stopped, Stopped::Eof, "five lines in five rows is done");
-        assert!(!out.contains("--More--"), "must not prompt at a clean end: {out:?}");
+        assert!(
+            !out.contains("--More--"),
+            "must not prompt at a clean end: {out:?}"
+        );
     }
 
     /// The prompt appears when there IS more.
     #[test]
     fn the_prompt_appears_only_when_more_follows() {
         let (out, _) = page_raw(&body(6), "q", WIDE);
-        assert!(out.contains("--More--"), "a sixth line means a prompt: {out:?}");
+        assert!(
+            out.contains("--More--"),
+            "a sixth line means a prompt: {out:?}"
+        );
     }
 
     /// A last line with no trailing newline is not lost.
@@ -580,7 +604,11 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let (stopped, _) = paginate(&mut input, &mut out, &mut cmds, WIDE, true, 0).unwrap();
         assert_eq!(stopped, Stopped::Eof);
-        assert_eq!(out, vec![b'o', b'k', b'\n', 0xff, 0xfe, b'\n'], "bytes pass through");
+        assert_eq!(
+            out,
+            vec![b'o', b'k', b'\n', 0xff, 0xfe, b'\n'],
+            "bytes pass through"
+        );
     }
 
     /// A WRAPPED line costs the rows it really occupies, or the page overflows and
@@ -588,14 +616,22 @@ mod tests {
     #[test]
     fn a_wrapped_line_costs_the_rows_it_occupies() {
         let x = |n: usize| vec![b'x'; n];
-        assert_eq!(rows_used(b"", 80), 1, "an empty line still occupies one row");
+        assert_eq!(
+            rows_used(b"", 80),
+            1,
+            "an empty line still occupies one row"
+        );
         assert_eq!(rows_used(&x(1), 80), 1);
         assert_eq!(rows_used(&x(80), 80), 1, "exactly the width is one row");
         assert_eq!(rows_used(&x(81), 80), 2, "one over wraps");
         assert_eq!(rows_used(&x(240), 80), 3);
         // The trailing newline is not a column, or every full-width line would
         // claim a second row it does not use.
-        assert_eq!(rows_used(b"12345678\n", 8), 1, "the newline is not a column");
+        assert_eq!(
+            rows_used(b"12345678\n", 8),
+            1,
+            "the newline is not a column"
+        );
         // A TAB is one byte and up to eight columns. Counting it as one byte
         // under-counts, and under-counting overflows the page and scrolls its top
         // away — the direction that actually loses the reader's data.
@@ -604,7 +640,11 @@ mod tests {
         assert_eq!(rows_used(b"a\tb", 8), 2, "a tab advances to the next stop");
         assert_eq!(display_cols(b"a\tb"), 9, "1 col, tab to 8, then 1 more");
         assert_eq!(display_cols(b"\t"), 8);
-        assert_eq!(display_cols(b"12345678\t"), 16, "a full stop advances a whole tab");
+        assert_eq!(
+            display_cols(b"12345678\t"),
+            16,
+            "a full stop advances a whole tab"
+        );
         // ...and the pager charges for it: three 80-column lines fill a 5-row page.
         let wide = format!("{}\n{}\n", "x".repeat(160), "y".repeat(160));
         let (out, stopped) = page_raw(&wide, "", Screen { rows: 6, cols: 80 });
@@ -616,8 +656,14 @@ mod tests {
     #[test]
     fn a_header_costs_rows_from_the_page_it_precedes() {
         let (out, _) = run_pager(&body(100), "", WIDE, true, 3);
-        assert!(out.contains("line2"), "five rows less a three-row header: {out:?}");
-        assert!(!out.contains("line3"), "the header must not push lines off: {out:?}");
+        assert!(
+            out.contains("line2"),
+            "five rows less a three-row header: {out:?}"
+        );
+        assert!(
+            !out.contains("line3"),
+            "the header must not push lines off: {out:?}"
+        );
     }
 
     /// Geometry falls back in order, and nonsense is ignored.
@@ -724,8 +770,16 @@ mod tests {
         assert_eq!(line.len(), MAX_LINE, "the cap must bound the buffer");
         assert_eq!(read_line_capped(&mut input, &mut line).unwrap(), MAX_LINE);
         assert_eq!(read_line_capped(&mut input, &mut line).unwrap(), MAX_LINE);
-        assert_eq!(read_line_capped(&mut input, &mut line).unwrap(), 17, "the tail");
-        assert_eq!(read_line_capped(&mut input, &mut line).unwrap(), 0, "then EOF");
+        assert_eq!(
+            read_line_capped(&mut input, &mut line).unwrap(),
+            17,
+            "the tail"
+        );
+        assert_eq!(
+            read_line_capped(&mut input, &mut line).unwrap(),
+            0,
+            "then EOF"
+        );
         // ...and a NORMAL line is still returned whole, newline included.
         let mut small = Cursor::new(b"one\ntwo\n".to_vec());
         assert_eq!(read_line_capped(&mut small, &mut line).unwrap(), 4);
@@ -850,7 +904,10 @@ mod tests {
         // A missing operand is reported and the others still copy.
         let mut out2: Vec<u8> = Vec::new();
         let status = copy_through(
-            &["/no/such/file".to_string(), path.to_string_lossy().into_owned()],
+            &[
+                "/no/such/file".to_string(),
+                path.to_string_lossy().into_owned(),
+            ],
             &mut out2,
         )
         .unwrap();

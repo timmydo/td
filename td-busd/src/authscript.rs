@@ -44,8 +44,7 @@ mod tests {
     /// Why a script naming a peer the kernel cannot identify is not replayed.
     /// Named once, because `DEVIATIONS` cites it and `run` returns it, and an
     /// exemption that quotes a message nothing produces exempts nothing.
-    const ABSENT_CREDENTIAL: &str =
-        "NO_CREDENTIALS: this crate has no credential-absent identity";
+    const ABSENT_CREDENTIAL: &str = "NO_CREDENTIALS: this crate has no credential-absent identity";
 
     /// A script this replay does not require to pass, and why. Everything in
     /// `spec/auth` not named here MUST pass; a name here that is missing from
@@ -153,9 +152,7 @@ mod tests {
             match text {
                 "WAITING_FOR_INPUT" => Ok(State::WaitingForInput),
                 "AUTHENTICATED" => Ok(State::Authenticated),
-                "AUTHENTICATED_WITH_UNUSED_BYTES" => {
-                    Ok(State::AuthenticatedWithUnusedBytes)
-                }
+                "AUTHENTICATED_WITH_UNUSED_BYTES" => Ok(State::AuthenticatedWithUnusedBytes),
                 "NEED_DISCONNECT" => Ok(State::NeedDisconnect),
                 other => Err(format!("unknown EXPECT_STATE {other}")),
             }
@@ -292,15 +289,9 @@ mod tests {
                 "SEND" => steps.push(Step::Send(quoted(&substitute(rest))?)),
                 "EXPECT_COMMAND" => steps.push(Step::ExpectCommand(rest.into())),
                 "EXPECT_STATE" => steps.push(Step::ExpectState(State::parse(rest)?)),
-                "EXPECT_UNUSED" => {
-                    steps.push(Step::ExpectUnused(quoted(&substitute(rest))?))
-                }
-                "EXPECT_HAVE_NO_CREDENTIALS" => {
-                    steps.push(Step::ExpectCredentials(false))
-                }
-                "EXPECT_HAVE_SOME_CREDENTIALS" => {
-                    steps.push(Step::ExpectCredentials(true))
-                }
+                "EXPECT_UNUSED" => steps.push(Step::ExpectUnused(quoted(&substitute(rest))?)),
+                "EXPECT_HAVE_NO_CREDENTIALS" => steps.push(Step::ExpectCredentials(false)),
+                "EXPECT_HAVE_SOME_CREDENTIALS" => steps.push(Step::ExpectCredentials(true)),
                 other => return Err(format!("line {at}: unknown directive {other}")),
             }
         }
@@ -457,10 +448,7 @@ mod tests {
     /// which only the mapped replay interrogates — so a disagreement arrives
     /// solely from a regression in the crate, and would otherwise be logic
     /// nothing ever executed. `the_two_peers_are_ruled_on_together` runs it.
-    fn rule_on(
-        faithful: Result<(), String>,
-        mapped: Result<(), String>,
-    ) -> Result<(), String> {
+    fn rule_on(faithful: Result<(), String>, mapped: Result<(), String>) -> Result<(), String> {
         match (faithful, mapped) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(one), Err(two)) if one == two => Err(one),
@@ -479,11 +467,7 @@ mod tests {
     /// `charged` is the credential the connection must end up recorded
     /// against, when the peer was built so that this can be told apart from
     /// the claim. `None` where the two coincide and the question is unaskable.
-    fn run_as(
-        script: &Script,
-        identity: PeerIdentity,
-        charged: Option<u32>,
-    ) -> Result<(), String> {
+    fn run_as(script: &Script, identity: PeerIdentity, charged: Option<u32>) -> Result<(), String> {
         let guid = Guid::new(GUID).map_err(|e| format!("{e:?}"))?;
         let mut run = Run {
             shake: Handshake::new(identity, guid),
@@ -574,8 +558,7 @@ mod tests {
     /// adding a file is enough to have it replayed.
     fn scripts() -> Vec<(String, String)> {
         let mut found = Vec::new();
-        let entries = fs::read_dir(SPEC)
-            .unwrap_or_else(|e| panic!("{SPEC} is not readable: {e}"));
+        let entries = fs::read_dir(SPEC).unwrap_or_else(|e| panic!("{SPEC} is not readable: {e}"));
         for entry in entries {
             let path = entry.unwrap_or_else(|e| panic!("{SPEC}: {e}")).path();
             let name = Path::new(&path)
@@ -586,8 +569,8 @@ mod tests {
             if !name.ends_with(".auth-script") {
                 continue;
             }
-            let text = fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{name} is not readable: {e}"));
+            let text =
+                fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name} is not readable: {e}"));
             found.push((name, text));
         }
         assert!(!found.is_empty(), "{SPEC} holds no scripts");
@@ -632,8 +615,7 @@ mod tests {
     fn the_reference_suite_holds_against_this_handshake() {
         let mut ran = 0;
         for (file, text) in scripts() {
-            let script = parse(&text)
-                .unwrap_or_else(|e| panic!("{file} did not parse: {e}"));
+            let script = parse(&text).unwrap_or_else(|e| panic!("{file} did not parse: {e}"));
             if let Err(why) = verdict(&file, run(&script)) {
                 panic!("{why}");
             }
@@ -669,15 +651,18 @@ mod tests {
     /// nothing, and the reason a suite quietly shrinks.
     #[test]
     fn every_deviation_names_a_committed_script() {
-        let files: BTreeSet<String> =
-            scripts().into_iter().map(|(file, _)| file).collect();
+        let files: BTreeSet<String> = scripts().into_iter().map(|(file, _)| file).collect();
         for entry in DEVIATIONS {
             assert!(
                 files.contains(entry.file),
                 "{} is exempted and not committed",
                 entry.file
             );
-            assert!(!entry.why.is_empty(), "{} is exempted with no reason", entry.file);
+            assert!(
+                !entry.why.is_empty(),
+                "{} is exempted with no reason",
+                entry.file
+            );
             // A deviation with nothing to expect is one that passes on any
             // failure at all, which is where this overlay started.
             assert!(
@@ -753,7 +738,10 @@ mod tests {
         assert_eq!(substitute("WRONG_USERID_HEX"), hex("1001"));
         assert_eq!(substitute("USERNAME_HEX"), hex(SCRIPT_USERNAME));
         assert_eq!(substitute("WRONG_USERNAME_HEX"), hex(WRONG_USERNAME));
-        assert_eq!(substitute("AUTH EXTERNAL USERID_HEX"), "AUTH EXTERNAL 31303030");
+        assert_eq!(
+            substitute("AUTH EXTERNAL USERID_HEX"),
+            "AUTH EXTERNAL 31303030"
+        );
     }
 
     /// The replay must be able to fail. A runner that reported success whatever
@@ -829,7 +817,11 @@ mod tests {
             .map(|(_, text)| text)
             .unwrap_or_else(|| panic!("external-root.auth-script is not committed"));
         let script = parse(&text).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(script.credential, Credential::Uid(0), "not ROOT_CREDENTIALS");
+        assert_eq!(
+            script.credential,
+            Credential::Uid(0),
+            "not ROOT_CREDENTIALS"
+        );
 
         let guid = Guid::new(GUID).unwrap_or_else(|e| panic!("{e:?}"));
         let mut root = Handshake::new(PeerIdentity::unmapped(0), guid);
@@ -888,15 +880,17 @@ mod tests {
     fn the_absent_credential_exemption_quotes_what_the_replay_says() {
         let mut exempted = 0;
         for (file, text) in scripts() {
-            let script = parse(&text)
-                .unwrap_or_else(|e| panic!("{file} did not parse: {e}"));
+            let script = parse(&text).unwrap_or_else(|e| panic!("{file} did not parse: {e}"));
             if script.credential != Credential::Absent {
                 continue;
             }
             exempted += 1;
-            let entry = deviation(&file)
-                .unwrap_or_else(|| panic!("{file} needs NO_CREDENTIALS and is \
-                                           not exempted"));
+            let entry = deviation(&file).unwrap_or_else(|| {
+                panic!(
+                    "{file} needs NO_CREDENTIALS and is \
+                                           not exempted"
+                )
+            });
             assert_eq!(entry.expects, ABSENT_CREDENTIAL, "{file}");
             // The message is the one the replay actually returns, so the
             // exemption expires with the refusal rather than outliving it.
@@ -926,21 +920,24 @@ mod tests {
         let mapped_only = rule_on(Ok(()), two()).unwrap_err();
         assert!(mapped_only.contains("not a mapped one"), "{mapped_only}");
         let faithful_only = rule_on(one(), Ok(())).unwrap_err();
-        assert!(faithful_only.contains("not a faithful one"), "{faithful_only}");
+        assert!(
+            faithful_only.contains("not a faithful one"),
+            "{faithful_only}"
+        );
     }
 
     /// A malformed script is an error, not a shorter script that passes.
     #[test]
     fn a_script_that_does_not_parse_is_refused() {
         for text in [
-            "SEND 'AUTH'\n",                                  // no side marker
-            "CLIENT\nSEND 'AUTH'\n",                          // the wrong role
-            "SERVER\nSEND 'AUTH'\nWHAT_IS_THIS foo\n",        // unknown directive
-            "SERVER\nEXPECT_STATE NO_SUCH_STATE\n",           // unknown state
-            "SERVER\nSERVER\n",                               // two markers
-            "SERVER\nSEND 'AUTH'\nROOT_CREDENTIALS\n",        // credentials late
-            "SERVER\nROOT_CREDENTIALS\nSILLY_CREDENTIALS\n",  // two of them
-            "SERVER\nSEND '\\q'\n",                           // bad escape
+            "SEND 'AUTH'\n",                                 // no side marker
+            "CLIENT\nSEND 'AUTH'\n",                         // the wrong role
+            "SERVER\nSEND 'AUTH'\nWHAT_IS_THIS foo\n",       // unknown directive
+            "SERVER\nEXPECT_STATE NO_SUCH_STATE\n",          // unknown state
+            "SERVER\nSERVER\n",                              // two markers
+            "SERVER\nSEND 'AUTH'\nROOT_CREDENTIALS\n",       // credentials late
+            "SERVER\nROOT_CREDENTIALS\nSILLY_CREDENTIALS\n", // two of them
+            "SERVER\nSEND '\\q'\n",                          // bad escape
         ] {
             assert!(parse(text).is_err(), "parsed {text:?}");
         }
@@ -959,7 +956,8 @@ mod tests {
             opened: false,
         };
         // A bare newline is §D's BareNewline, and every auth error latches.
-        run.send(b"\nAUTH EXTERNAL 31303030\r\n").unwrap_or_else(|e| panic!("{e}"));
+        run.send(b"\nAUTH EXTERNAL 31303030\r\n")
+            .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(run.state(), State::NeedDisconnect);
         // WHICH error, because that is the contrast the supplied NUL creates:
         // through `send` the stream opened correctly and then carried a bare
@@ -976,8 +974,7 @@ mod tests {
         // handshake fed a newline first has not reached the line scanner, so
         // this is the missing NUL and never `BareNewline`.
         assert!(matches!(
-            Handshake::new(PeerIdentity::unmapped(SCRIPT_UID), guid)
-                .feed(b"\nx\r\n"),
+            Handshake::new(PeerIdentity::unmapped(SCRIPT_UID), guid).feed(b"\nx\r\n"),
             Err(AuthError::MissingNulPrefix(b'\n'))
         ));
     }

@@ -31,7 +31,15 @@
 //! Scope (brick 1): pack a PREPARED rootfs directory into the archive. Laying a store
 //! CLOSURE into the rootfs (brick 2) and the load/run/oracle gate (brick 3) come next.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 use crate::sha256::Sha256;
 use std::fs;
@@ -172,13 +180,20 @@ fn append_subtree(out: &mut Vec<u8>, src: &Path, prefix: &str) -> io::Result<()>
                 .collect::<io::Result<_>>()?;
             names.sort();
             for n in names {
-                let child = if tarname.is_empty() { n.clone() } else { format!("{tarname}/{n}") };
+                let child = if tarname.is_empty() {
+                    n.clone()
+                } else {
+                    format!("{tarname}/{n}")
+                };
                 walk(out, &abspath.join(&n), &child)?;
             }
         } else if ft.is_symlink() {
             let target = fs::read_link(abspath)?;
             let target = target.to_str().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 symlink target in layer")
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "non-UTF8 symlink target in layer",
+                )
             })?;
             tar_entry(out, tarname, b'2', 0o777, &[], target);
         } else if ft.is_file() {
@@ -191,7 +206,10 @@ fn append_subtree(out: &mut Vec<u8>, src: &Path, prefix: &str) -> io::Result<()>
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{}: unsupported file type for an OCI layer", abspath.display()),
+                format!(
+                    "{}: unsupported file type for an OCI layer",
+                    abspath.display()
+                ),
             ));
         }
         Ok(())
@@ -228,7 +246,11 @@ pub fn build_layer_tar_from_closure(
     // Emit each parent component (gnu/, gnu/store/) once, before the closure entries.
     let mut acc = String::new();
     for comp in store_rel.split('/').filter(|c| !c.is_empty()) {
-        acc = if acc.is_empty() { comp.to_string() } else { format!("{acc}/{comp}") };
+        acc = if acc.is_empty() {
+            comp.to_string()
+        } else {
+            format!("{acc}/{comp}")
+        };
         tar_entry(&mut out, &format!("{acc}/"), b'5', 0o755, &[], "");
     }
     let mut sorted: Vec<&(String, String)> = members.iter().collect();
@@ -245,9 +267,14 @@ pub fn build_layer_tar_from_closure(
         }
     }
     for (canonical, on_disk) in sorted {
-        let base =
-            Path::new(canonical).file_name().and_then(|b| b.to_str()).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("bad store path: {canonical}"))
+        let base = Path::new(canonical)
+            .file_name()
+            .and_then(|b| b.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad store path: {canonical}"),
+                )
             })?;
         append_subtree(&mut out, Path::new(on_disk), &format!("{store_rel}/{base}"))?;
     }
@@ -257,12 +284,8 @@ pub fn build_layer_tar_from_closure(
 
 /// A layer tar laying each store PATH's tree at its location under the store dir — the
 /// bytes are read from the path itself (canonical == on-disk; a live store).
-pub fn build_layer_tar_from_store_paths(
-    store_dir: &Path,
-    paths: &[String],
-) -> io::Result<Vec<u8>> {
-    let members: Vec<(String, String)> =
-        paths.iter().map(|p| (p.clone(), p.clone())).collect();
+pub fn build_layer_tar_from_store_paths(store_dir: &Path, paths: &[String]) -> io::Result<Vec<u8>> {
+    let members: Vec<(String, String)> = paths.iter().map(|p| (p.clone(), p.clone())).collect();
     build_layer_tar_from_closure(store_dir, &members)
 }
 
@@ -337,16 +360,49 @@ fn assemble_archive(out: &mut impl Write, layer: &[u8], cfg: &ImageConfig) -> io
         "{{\"id\":\"{id}\",\"created\":\"1970-01-01T00:00:01Z\",\"container_config\":null}}"
     );
     let (repo, tag) = split_repo_tag(&cfg.repo_tag);
-    let repositories = format!("{{{}:{{{}:{}}}}}", json_quote(repo), json_quote(tag), json_quote(&id));
+    let repositories = format!(
+        "{{{}:{{{}:{}}}}}",
+        json_quote(repo),
+        json_quote(tag),
+        json_quote(&id)
+    );
 
     let mut buf = Vec::new();
     tar_entry(&mut buf, &format!("{id}/"), b'5', 0o755, &[], "");
     tar_entry(&mut buf, &format!("{id}/VERSION"), b'0', 0o644, b"1.0", "");
-    tar_entry(&mut buf, &format!("{id}/json"), b'0', 0o644, layer_json.as_bytes(), "");
+    tar_entry(
+        &mut buf,
+        &format!("{id}/json"),
+        b'0',
+        0o644,
+        layer_json.as_bytes(),
+        "",
+    );
     tar_entry(&mut buf, &format!("{id}/layer.tar"), b'0', 0o644, layer, "");
-    tar_entry(&mut buf, "config.json", b'0', 0o644, config_json.as_bytes(), "");
-    tar_entry(&mut buf, "manifest.json", b'0', 0o644, manifest_json.as_bytes(), "");
-    tar_entry(&mut buf, "repositories", b'0', 0o644, repositories.as_bytes(), "");
+    tar_entry(
+        &mut buf,
+        "config.json",
+        b'0',
+        0o644,
+        config_json.as_bytes(),
+        "",
+    );
+    tar_entry(
+        &mut buf,
+        "manifest.json",
+        b'0',
+        0o644,
+        manifest_json.as_bytes(),
+        "",
+    );
+    tar_entry(
+        &mut buf,
+        "repositories",
+        b'0',
+        0o644,
+        repositories.as_bytes(),
+        "",
+    );
     buf.resize(buf.len() + BLOCK * 2, 0);
     out.write_all(&buf)
 }
@@ -371,7 +427,11 @@ pub fn write_docker_archive_from_store_paths(
     paths: &[String],
     cfg: &ImageConfig,
 ) -> io::Result<()> {
-    assemble_archive(out, &build_layer_tar_from_store_paths(store_dir, paths)?, cfg)
+    assemble_archive(
+        out,
+        &build_layer_tar_from_store_paths(store_dir, paths)?,
+        cfg,
+    )
 }
 
 /// Write a docker-archive whose single layer is the closure MEMBERS — `(canonical,
@@ -402,7 +462,11 @@ mod tests {
     }
 
     fn octal_at(field: &[u8]) -> u64 {
-        let s: String = field.iter().take_while(|&&b| b != 0 && b != b' ').map(|&b| b as char).collect();
+        let s: String = field
+            .iter()
+            .take_while(|&&b| b != 0 && b != b' ')
+            .map(|&b| b as char)
+            .collect();
         u64::from_str_radix(s.trim(), 8).unwrap_or(0)
     }
 
@@ -425,11 +489,24 @@ mod tests {
             hh.copy_from_slice(h);
             hh[148..156].fill(b' ');
             let sum: u32 = hh.iter().map(|&b| b as u32).sum();
-            assert_eq!(sum, stored, "tar header checksum mismatch at block {}", pos / BLOCK);
-            let name_field: String = h[..100].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            assert_eq!(
+                sum,
+                stored,
+                "tar header checksum mismatch at block {}",
+                pos / BLOCK
+            );
+            let name_field: String = h[..100]
+                .iter()
+                .take_while(|&&b| b != 0)
+                .map(|&b| b as char)
+                .collect();
             let mode = octal_at(&h[100..108]) as u32;
             let typeflag = h[156];
-            let link_field: String = h[157..257].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            let link_field: String = h[157..257]
+                .iter()
+                .take_while(|&&b| b != 0)
+                .map(|&b| b as char)
+                .collect();
             // size: GNU base-256 when the high bit of byte 0 is set, else octal.
             let sz = &h[124..136];
             let size = if sz[0] & 0x80 != 0 {
@@ -485,7 +562,9 @@ mod tests {
     fn make_rootfs(dir: &Path) {
         fs::create_dir_all(dir.join("gnu/store/pkg/bin")).unwrap();
         fs::write(dir.join("gnu/store/pkg/bin/hello"), b"#!/bin/sh\necho hi\n").unwrap();
-        let mut p = fs::metadata(dir.join("gnu/store/pkg/bin/hello")).unwrap().permissions();
+        let mut p = fs::metadata(dir.join("gnu/store/pkg/bin/hello"))
+            .unwrap()
+            .permissions();
         p.set_mode(0o755);
         fs::set_permissions(dir.join("gnu/store/pkg/bin/hello"), p).unwrap();
         fs::write(dir.join("gnu/store/pkg/readme"), b"hello\n").unwrap();
@@ -509,10 +588,16 @@ mod tests {
         let mut out = Vec::new();
         write_docker_archive(&mut out, &rootfs, &sample_cfg()).unwrap();
         let names: Vec<String> = read_tar(&out).into_iter().map(|e| e.name).collect();
-        assert!(names.iter().any(|n| n == "manifest.json"), "no manifest.json: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "manifest.json"),
+            "no manifest.json: {names:?}"
+        );
         assert!(names.iter().any(|n| n == "config.json"), "no config.json");
         assert!(names.iter().any(|n| n == "repositories"), "no repositories");
-        assert!(names.iter().any(|n| n.ends_with("/layer.tar")), "no layer.tar");
+        assert!(
+            names.iter().any(|n| n.ends_with("/layer.tar")),
+            "no layer.tar"
+        );
         assert!(names.iter().any(|n| n.ends_with("/VERSION")), "no VERSION");
         fs::remove_dir_all(&d).unwrap();
     }
@@ -526,8 +611,16 @@ mod tests {
         let mut out = Vec::new();
         write_docker_archive(&mut out, &rootfs, &sample_cfg()).unwrap();
         let entries = read_tar(&out);
-        let layer = &entries.iter().find(|e| e.name.ends_with("/layer.tar")).unwrap().body;
-        let config = &entries.iter().find(|e| e.name == "config.json").unwrap().body;
+        let layer = &entries
+            .iter()
+            .find(|e| e.name.ends_with("/layer.tar"))
+            .unwrap()
+            .body;
+        let config = &entries
+            .iter()
+            .find(|e| e.name == "config.json")
+            .unwrap()
+            .body;
         let want = format!("sha256:{}", crate::sha256::to_base16(&sha256_bytes(layer)));
         let config_str = String::from_utf8(config.clone()).unwrap();
         assert!(
@@ -562,7 +655,10 @@ mod tests {
         let d = tmpdir("longname");
         let rootfs = d.join("rootfs");
         // A store-path-length name (>100 bytes) to exercise the GNU @LongLink path.
-        let long = format!("gnu/store/{}-some-very-long-package-name-2.0", "a".repeat(80));
+        let long = format!(
+            "gnu/store/{}-some-very-long-package-name-2.0",
+            "a".repeat(80)
+        );
         assert!(long.len() > 100);
         let full = rootfs.join(&long);
         fs::create_dir_all(full.parent().unwrap()).unwrap();
@@ -571,9 +667,16 @@ mod tests {
         write_docker_archive(&mut out, &rootfs, &sample_cfg()).unwrap();
         // The layer.tar inside must carry the full long name (recovered via @LongLink).
         let entries = read_tar(&out);
-        let layer = &entries.iter().find(|e| e.name.ends_with("/layer.tar")).unwrap().body;
+        let layer = &entries
+            .iter()
+            .find(|e| e.name.ends_with("/layer.tar"))
+            .unwrap()
+            .body;
         let inner: Vec<String> = read_tar(layer).into_iter().map(|e| e.name).collect();
-        assert!(inner.iter().any(|n| n == &long), "long name not recovered: {inner:?}");
+        assert!(
+            inner.iter().any(|n| n == &long),
+            "long name not recovered: {inner:?}"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -612,9 +715,16 @@ mod tests {
         let mut out = Vec::new();
         write_docker_archive(&mut out, &rootfs, &sample_cfg()).unwrap();
         let entries = read_tar(&out);
-        let layer = &entries.iter().find(|e| e.name.ends_with("/layer.tar")).unwrap().body;
+        let layer = &entries
+            .iter()
+            .find(|e| e.name.ends_with("/layer.tar"))
+            .unwrap()
+            .body;
         let inner = read_tar(layer);
-        let link = inner.iter().find(|e| e.name == "bin/x").expect("symlink missing");
+        let link = inner
+            .iter()
+            .find(|e| e.name == "bin/x")
+            .expect("symlink missing");
         assert_eq!(link.typeflag, b'2', "not a symlink entry");
         assert_eq!(link.link, target, "long symlink target was truncated");
         fs::remove_dir_all(&d).unwrap();
@@ -630,13 +740,27 @@ mod tests {
         write_docker_archive(&mut out, &rootfs, &sample_cfg()).unwrap();
         let entries = read_tar(&out);
         let config = String::from_utf8(
-            entries.iter().find(|e| e.name == "config.json").unwrap().body.clone(),
+            entries
+                .iter()
+                .find(|e| e.name == "config.json")
+                .unwrap()
+                .body
+                .clone(),
         )
         .unwrap();
         // OCI/docker image-config spec: Env/Entrypoint (PascalCase), not env/entrypoint.
-        assert!(config.contains("\"Env\":"), "config not PascalCase: {config}");
-        assert!(config.contains("\"Entrypoint\":"), "config not PascalCase: {config}");
-        assert!(!config.contains("\"env\":"), "config has lowercase env: {config}");
+        assert!(
+            config.contains("\"Env\":"),
+            "config not PascalCase: {config}"
+        );
+        assert!(
+            config.contains("\"Entrypoint\":"),
+            "config not PascalCase: {config}"
+        );
+        assert!(
+            !config.contains("\"env\":"),
+            "config has lowercase env: {config}"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -657,12 +781,28 @@ mod tests {
         let layer = build_layer_tar_from_store_paths(&store, &paths).unwrap();
         let names: Vec<String> = read_tar(&layer).into_iter().map(|e| e.name).collect();
         let rel = store.to_string_lossy().trim_start_matches('/').to_string();
-        assert!(names.iter().any(|n| n == &format!("{rel}/")), "no store dir entry: {names:?}");
-        assert!(names.iter().any(|n| n == &format!("{rel}/aaa-pkg-a/bin/a")), "pkg-a file missing");
-        assert!(names.iter().any(|n| n == &format!("{rel}/bbb-pkg-b/readme")), "pkg-b file missing");
+        assert!(
+            names.iter().any(|n| n == &format!("{rel}/")),
+            "no store dir entry: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == &format!("{rel}/aaa-pkg-a/bin/a")),
+            "pkg-a file missing"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n == &format!("{rel}/bbb-pkg-b/readme")),
+            "pkg-b file missing"
+        );
         // Deterministic + sorted regardless of input order.
-        let layer2 = build_layer_tar_from_store_paths(&store, &[paths[1].clone(), paths[0].clone()]).unwrap();
-        assert_eq!(layer, layer2, "closure layer must be order-independent + deterministic");
+        let layer2 =
+            build_layer_tar_from_store_paths(&store, &[paths[1].clone(), paths[0].clone()])
+                .unwrap();
+        assert_eq!(
+            layer, layer2,
+            "closure layer must be order-independent + deterministic"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -690,11 +830,15 @@ mod tests {
         let names: Vec<String> = read_tar(&layer).into_iter().map(|e| e.name).collect();
         let rel = store.to_string_lossy().trim_start_matches('/').to_string();
         assert!(
-            names.iter().any(|n| n == &format!("{rel}/ddd-td-built/bin/hello")),
+            names
+                .iter()
+                .any(|n| n == &format!("{rel}/ddd-td-built/bin/hello")),
             "td-built tree not at its canonical store name: {names:?}"
         );
         assert!(
-            names.iter().any(|n| n == &format!("{rel}/ccc-dep/lib/libd.so")),
+            names
+                .iter()
+                .any(|n| n == &format!("{rel}/ccc-dep/lib/libd.so")),
             "seed dep missing: {names:?}"
         );
         assert!(
@@ -716,7 +860,10 @@ mod tests {
         let canonical = store.join("eee-pkg").to_string_lossy().into_owned();
         let members = vec![
             (canonical.clone(), canonical.clone()),
-            (canonical, alt.join("eee-pkg").to_string_lossy().into_owned()),
+            (
+                canonical,
+                alt.join("eee-pkg").to_string_lossy().into_owned(),
+            ),
         ];
         let err = build_layer_tar_from_closure(&store, &members).unwrap_err();
         assert!(
@@ -739,10 +886,22 @@ mod tests {
         let mut out = Vec::new();
         write_docker_archive(&mut out, &rootfs, &sample_cfg()).unwrap();
         let entries = read_tar(&out);
-        let layer = &entries.iter().find(|e| e.name.ends_with("/layer.tar")).unwrap().body;
+        let layer = &entries
+            .iter()
+            .find(|e| e.name.ends_with("/layer.tar"))
+            .unwrap()
+            .body;
         let inner = read_tar(layer);
-        let su = inner.iter().find(|e| e.name == "bin/su").expect("bin/su missing");
-        assert_eq!(su.mode & 0o4000, 0o4000, "setuid bit dropped (mode {:o})", su.mode);
+        let su = inner
+            .iter()
+            .find(|e| e.name == "bin/su")
+            .expect("bin/su missing");
+        assert_eq!(
+            su.mode & 0o4000,
+            0o4000,
+            "setuid bit dropped (mode {:o})",
+            su.mode
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 }

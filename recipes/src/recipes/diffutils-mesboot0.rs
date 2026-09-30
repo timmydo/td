@@ -164,7 +164,10 @@ pub fn recipe() -> Recipe {
     // cmp on byte-identical files: plain, then silent (-s, exit-code only). Both
     // exit 0 iff cmp walks the bytes and finds no difference.
     steps.push(Step::run("{src}", &["{out}/bin/cmp", "a.txt", "b.txt"]));
-    steps.push(Step::run("{src}", &["{out}/bin/cmp", "-s", "a.txt", "b.txt"]));
+    steps.push(Step::run(
+        "{src}",
+        &["{out}/bin/cmp", "-s", "a.txt", "b.txt"],
+    ));
     // cmp --ignore-initial: skip the first 4 bytes of each, compare equal tails.
     steps.push(Step::run(
         "{src}",
@@ -173,7 +176,10 @@ pub fn recipe() -> Recipe {
 
     // diff on byte-identical files: full, then brief (-q). Both exit 0 (no diff).
     steps.push(Step::run("{src}", &["{out}/bin/diff", "a.txt", "b.txt"]));
-    steps.push(Step::run("{src}", &["{out}/bin/diff", "-q", "a.txt", "b.txt"]));
+    steps.push(Step::run(
+        "{src}",
+        &["{out}/bin/diff", "-q", "a.txt", "b.txt"],
+    ));
     // diff -w folds the whitespace-only difference (C_TXT) back to equal (exit 0).
     steps.push(Step::run(
         "{src}",

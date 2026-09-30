@@ -20,23 +20,38 @@
 #[path = "../../td-busd/src/app_policy.rs"]
 #[allow(dead_code)]
 mod app_policy;
-#[path = "../../td-secret/src/fido_cbor.rs"]
-#[allow(dead_code, reason = "shared token-protected store format and trusted release") ]
-mod fido_cbor;
-#[path = "../../td-secret/src/fido_ctap.rs"]
-#[allow(dead_code, reason = "shared token-protected store format and trusted release") ]
-mod fido_ctap;
-#[path = "../../td-secret/src/fido_enroll.rs"]
-#[allow(dead_code, reason = "shared token-protected store format and trusted release") ]
-mod fido_enroll;
-#[path = "../../td-secret/src/fido_hid.rs"]
-#[allow(dead_code, reason = "shared token-protected store format and trusted release") ]
-mod fido_hid;
-#[path = "../../td-secret/src/fido_metadata.rs"]
-#[allow(dead_code, reason = "shared token-protected store format and trusted release") ]
-mod fido_metadata;
 #[path = "../../td-secret/src/crypto.rs"]
 mod crypto;
+#[path = "../../td-secret/src/fido_cbor.rs"]
+#[allow(
+    dead_code,
+    reason = "shared token-protected store format and trusted release"
+)]
+mod fido_cbor;
+#[path = "../../td-secret/src/fido_ctap.rs"]
+#[allow(
+    dead_code,
+    reason = "shared token-protected store format and trusted release"
+)]
+mod fido_ctap;
+#[path = "../../td-secret/src/fido_enroll.rs"]
+#[allow(
+    dead_code,
+    reason = "shared token-protected store format and trusted release"
+)]
+mod fido_enroll;
+#[path = "../../td-secret/src/fido_hid.rs"]
+#[allow(
+    dead_code,
+    reason = "shared token-protected store format and trusted release"
+)]
+mod fido_hid;
+#[path = "../../td-secret/src/fido_metadata.rs"]
+#[allow(
+    dead_code,
+    reason = "shared token-protected store format and trusted release"
+)]
+mod fido_metadata;
 mod handles;
 #[path = "../../td-busd/src/message.rs"]
 #[allow(
@@ -50,9 +65,6 @@ mod secret;
 #[path = "../../td-secret/src/store.rs"]
 #[allow(dead_code, reason = "firstboot and the console share the store writer")]
 mod secret_store;
-#[path = "../../td-secret/src/tpm.rs"]
-#[allow(dead_code, reason = "shared sealed-store format and root enrollment entry points")]
-mod tpm;
 mod settings;
 #[path = "../../td-secret/src/sys.rs"]
 #[allow(
@@ -60,6 +72,12 @@ mod settings;
     reason = "the shared syscall surface is broader than the secret store's use"
 )]
 mod sys;
+#[path = "../../td-secret/src/tpm.rs"]
+#[allow(
+    dead_code,
+    reason = "shared sealed-store format and root enrollment entry points"
+)]
+mod tpm;
 #[path = "../../td-busd/src/wire.rs"]
 #[allow(
     dead_code,
@@ -945,7 +963,12 @@ fn oversized_call(prefix: &[u8], endian: Endian) -> io::Result<Option<OversizedC
     }
     let mut fields_reader = wire::Reader::at(prefix, 12, endian);
     let fields = fields_reader
-        .value("a(yv)", Limits { fds: message::MAX_FDS_PER_MESSAGE })
+        .value(
+            "a(yv)",
+            Limits {
+                fds: message::MAX_FDS_PER_MESSAGE,
+            },
+        )
         .map_err(wire_error)?
         .as_seq()
         .ok_or_else(|| io::Error::other("an oversized D-Bus call has malformed fields"))?;
@@ -1131,7 +1154,11 @@ fn run(paths: &Paths) -> Result<(), String> {
         .map_err(|error| format!("the portal service connection ended: {error}"))
 }
 
-fn serve(connection: &mut Connection, settings: &Settings, application_policy: app_policy::Policy) -> io::Result<()> {
+fn serve(
+    connection: &mut Connection,
+    settings: &Settings,
+    application_policy: app_policy::Policy,
+) -> io::Result<()> {
     let reader = connection.service_reader()?;
     let (sender, receiver) = mpsc::sync_channel(MAX_QUEUED_SERVICE_EVENTS);
     let bus_sender = sender.clone();
@@ -1164,8 +1191,13 @@ fn serve(connection: &mut Connection, settings: &Settings, application_policy: a
     };
     // Calls can precede the reply that grants our public name.
     for bytes in std::mem::take(&mut connection.setup_events) {
-        consume_bus_frame(connection, settings, &mut state, &sender,
-            IncomingFrame::Message(bytes))?;
+        consume_bus_frame(
+            connection,
+            settings,
+            &mut state,
+            &sender,
+            IncomingFrame::Message(bytes),
+        )?;
     }
     loop {
         let event = receiver
@@ -1573,8 +1605,12 @@ fn consume_identity_reply(
         return refuse_open_file_limit(connection, &pending).map(|()| true);
     }
     if !download_grant_ready(Path::new(FIREFOX_HOST_DOWNLOADS), PORTAL_UID) {
-        return refuse_open_file_identity(connection, &pending, "FileChooser Downloads grant is unavailable")
-            .map(|()| true);
+        return refuse_open_file_identity(
+            connection,
+            &pending,
+            "FileChooser Downloads grant is unavailable",
+        )
+        .map(|()| true);
     }
     let path = match state
         .handles
@@ -2706,7 +2742,10 @@ fn background_token<'a>(call: &'a Message<'a>) -> Result<Option<&'a str>, &'stat
     Ok(token)
 }
 
-fn credentials_app_id(reply: &Message<'_>, policy: Option<&app_policy::Policy>) -> io::Result<Option<String>> {
+fn credentials_app_id(
+    reply: &Message<'_>,
+    policy: Option<&app_policy::Policy>,
+) -> io::Result<Option<String>> {
     if reply.kind != MessageType::MethodReturn || reply.fields.signature != Some("a{sv}") {
         return Err(io::Error::other(
             "GetConnectionCredentials returned the wrong message shape",
@@ -2760,10 +2799,14 @@ fn credentials_app_id(reply: &Message<'_>, policy: Option<&app_policy::Policy>) 
             _ => {}
         }
     }
-    let Some(app) = app_id else { return Ok(None); };
+    let Some(app) = app_id else {
+        return Ok(None);
+    };
     let expected = policy.and_then(|policy| uid.and_then(|uid| policy.for_uid(uid)));
     if !expected.is_some_and(|rule| rule.application == app) {
-        return Err(io::Error::other("broker UID and application do not match the immutable assignment"));
+        return Err(io::Error::other(
+            "broker UID and application do not match the immutable assignment",
+        ));
     }
     Ok(Some(app))
 }
@@ -2868,44 +2911,38 @@ fn file_chooser_response(
         .body("ua{sv}", |writer| {
             writer.uint32(response);
             match outcome {
-                Ok(file_chooser::Outcome::Accepted(uris)) => {
-                    writer.array("{sv}", |writer| {
-                        writer.dict_entry(|writer| {
-                            writer.string("uris")?;
-                            writer.variant("as", |writer| {
-                                writer.array("s", |writer| {
-                                    for uri in uris {
-                                        writer.string(uri)?;
-                                    }
-                                    Ok(())
-                                })
+                Ok(file_chooser::Outcome::Accepted(uris)) => writer.array("{sv}", |writer| {
+                    writer.dict_entry(|writer| {
+                        writer.string("uris")?;
+                        writer.variant("as", |writer| {
+                            writer.array("s", |writer| {
+                                for uri in uris {
+                                    writer.string(uri)?;
+                                }
+                                Ok(())
                             })
-                        })?;
-                        if let Some(filter) = filter {
-                            writer.dict_entry(|writer| {
-                                writer.string("current_filter")?;
-                                writer.variant("(sa(us))", |writer| {
-                                    writer.structure(|writer| {
-                                        writer.string(filter.label())?;
-                                        writer.array("(us)", |writer| {
-                                            writer.structure(|writer| {
-                                                writer.uint32(0);
-                                                writer.string(filter.pattern())
-                                            })
+                        })
+                    })?;
+                    if let Some(filter) = filter {
+                        writer.dict_entry(|writer| {
+                            writer.string("current_filter")?;
+                            writer.variant("(sa(us))", |writer| {
+                                writer.structure(|writer| {
+                                    writer.string(filter.label())?;
+                                    writer.array("(us)", |writer| {
+                                        writer.structure(|writer| {
+                                            writer.uint32(0);
+                                            writer.string(filter.pattern())
                                         })
                                     })
                                 })
-                            })?;
-                        }
-                        Ok(())
-                    })
-                }
-                Ok(file_chooser::Outcome::Cancelled) => {
-                    writer.array("{sv}", |_| Ok(()))
-                }
-                Ok(file_chooser::Outcome::Pending) | Err(_) => {
-                    writer.array("{sv}", |_| Ok(()))
-                }
+                            })
+                        })?;
+                    }
+                    Ok(())
+                }),
+                Ok(file_chooser::Outcome::Cancelled) => writer.array("{sv}", |_| Ok(())),
+                Ok(file_chooser::Outcome::Pending) | Err(_) => writer.array("{sv}", |_| Ok(())),
             }
         })
         .map_err(wire_error)?
@@ -2931,10 +2968,7 @@ fn file_chooser_completion(
 ) -> io::Result<(Vec<u8>, String)> {
     let response = file_chooser_response_code(outcome);
     let frame = file_chooser_response(endian, serial, path, destination, outcome, filter)?;
-    Ok((
-        frame,
-        file_chooser_completion_record(path, response),
-    ))
+    Ok((frame, file_chooser_completion_record(path, response)))
 }
 
 fn file_chooser_completion_record(path: &str, response: u32) -> String {
@@ -3340,7 +3374,11 @@ fn probe(paths: &Paths) -> Result<(), String> {
     }
     let secret_denial = connection
         .call_outcome(
-            PORTAL_NAME, PORTAL_PATH, SECRET_INTERFACE, "Retrieve", "s",
+            PORTAL_NAME,
+            PORTAL_PATH,
+            SECRET_INTERFACE,
+            "Retrieve",
+            "s",
             |writer| writer.string("main"),
         )
         .map_err(|error| format!("the unconfined credential probe failed: {error}"))?;
@@ -3585,7 +3623,10 @@ mod confinement {
         ("settings.rs", include_str!("settings.rs")),
         ("secret.rs", include_str!("secret.rs")),
         ("sys.rs", include_str!("../../td-secret/src/sys.rs")),
-        ("app_policy.rs", include_str!("../../td-busd/src/app_policy.rs")),
+        (
+            "app_policy.rs",
+            include_str!("../../td-busd/src/app_policy.rs"),
+        ),
     ];
     const SYS: &str = include_str!("../../td-secret/src/sys.rs");
 
@@ -3726,14 +3767,24 @@ mod tests {
     #[test]
     fn credential_identity_requires_the_assigned_external_uid_and_broker_app() {
         let state = service_state();
-        for (uid, name, allowed) in [(65536, "firefox", true), (65537, "mail", true), (1000, "mail", false), (65536, "mail", false), (65537, "firefox", false), (0, "firefox", false), (65540, "unknown", false)] {
+        for (uid, name, allowed) in [
+            (65536, "firefox", true),
+            (65537, "mail", true),
+            (1000, "mail", false),
+            (65536, "mail", false),
+            (65537, "firefox", false),
+            (0, "firefox", false),
+            (65540, "unknown", false),
+        ] {
             let bytes = credentials_reply(41, uid, Some(name));
             let (reply, _) = message::decode(&bytes, 0).unwrap();
-            assert_eq!(credentials_app_id(&reply, state.application_policy.as_ref()).is_ok(), allowed);
+            assert_eq!(
+                credentials_app_id(&reply, state.application_policy.as_ref()).is_ok(),
+                allowed
+            );
             assert!(credentials_app_id(&reply, None).is_err());
         }
     }
-
 
     #[test]
     fn download_grant_requires_an_owned_directory_without_following_links() {
@@ -4057,8 +4108,7 @@ mod tests {
                 })
             })
         });
-        let (standalone_current, _) =
-            message::decode(&standalone_current, 0).unwrap();
+        let (standalone_current, _) = message::decode(&standalone_current, 0).unwrap();
         assert_eq!(
             parse_open_file(&standalone_current).unwrap_err().name,
             UNSUPPORTED_OPEN
@@ -4101,12 +4151,9 @@ mod tests {
                 })
             })
         });
-        let (multiple_without_current, _) =
-            message::decode(&multiple_without_current, 0).unwrap();
+        let (multiple_without_current, _) = message::decode(&multiple_without_current, 0).unwrap();
         assert_eq!(
-            parse_open_file(&multiple_without_current)
-                .unwrap_err()
-                .name,
+            parse_open_file(&multiple_without_current).unwrap_err().name,
             UNSUPPORTED_OPEN
         );
 
@@ -4133,8 +4180,7 @@ mod tests {
                 })
             })
         });
-        let (invalid_after_mime, _) =
-            message::decode(&invalid_after_mime, 0).unwrap();
+        let (invalid_after_mime, _) = message::decode(&invalid_after_mime, 0).unwrap();
         assert_eq!(
             parse_open_file(&invalid_after_mime).unwrap_err().name,
             INVALID_OPEN
@@ -4149,11 +4195,7 @@ mod tests {
                 writer.variant("a(sa(us))", |writer| {
                     writer.array("(sa(us))", |writer| {
                         for index in 0..32 {
-                            write_file_filter(
-                                writer,
-                                &format!("All Files {index}"),
-                                &[(0, "*")],
-                            )?;
+                            write_file_filter(writer, &format!("All Files {index}"), &[(0, "*")])?;
                         }
                         Ok(())
                     })
@@ -4166,8 +4208,7 @@ mod tests {
                 })
             })
         });
-        let (filters_at_limit, _) =
-            message::decode(&filters_at_limit, 0).unwrap();
+        let (filters_at_limit, _) = message::decode(&filters_at_limit, 0).unwrap();
         assert_eq!(
             parse_open_file(&filters_at_limit)
                 .unwrap()
@@ -4183,19 +4224,14 @@ mod tests {
                 writer.variant("a(sa(us))", |writer| {
                     writer.array("(sa(us))", |writer| {
                         for index in 0..33 {
-                            write_file_filter(
-                                writer,
-                                &format!("All Files {index}"),
-                                &[(0, "*")],
-                            )?;
+                            write_file_filter(writer, &format!("All Files {index}"), &[(0, "*")])?;
                         }
                         Ok(())
                     })
                 })
             })
         });
-        let (filters_over_limit, _) =
-            message::decode(&filters_over_limit, 0).unwrap();
+        let (filters_over_limit, _) = message::decode(&filters_over_limit, 0).unwrap();
         let error = parse_open_file(&filters_over_limit).unwrap_err();
         assert_eq!(error.name, INVALID_OPEN);
         assert_eq!(error.text, "filters exceeds 32 entries");
@@ -4211,8 +4247,7 @@ mod tests {
                 })
             })
         });
-        let (rules_at_limit, _) =
-            message::decode(&rules_at_limit, 0).unwrap();
+        let (rules_at_limit, _) = message::decode(&rules_at_limit, 0).unwrap();
         assert_eq!(
             parse_open_file(&rules_at_limit).unwrap_err().name,
             UNSUPPORTED_OPEN
@@ -4229,8 +4264,7 @@ mod tests {
                 })
             })
         });
-        let (rules_over_limit, _) =
-            message::decode(&rules_over_limit, 0).unwrap();
+        let (rules_over_limit, _) = message::decode(&rules_over_limit, 0).unwrap();
         let error = parse_open_file(&rules_over_limit).unwrap_err();
         assert_eq!(error.name, INVALID_OPEN);
         assert_eq!(error.text, "a file filter exceeds 32 rules");
@@ -5384,10 +5418,17 @@ mod tests {
         let per_call = MAX_QUEUED_SERVICE_EVENTS / 3 + 1;
         assert!(per_call < MAX_UNRELATED_MESSAGES);
         for serial in 1..=3 {
-            for _ in 0..per_call { broker.write_all(&ping).unwrap(); }
+            for _ in 0..per_call {
+                broker.write_all(&ping).unwrap();
+            }
             let reply = message::Builder::method_return(Endian::Little, serial)
-                .sender(BUS_NAME).destination(":1.10").serial(20 + serial)
-                .body("", |_| Ok(())).unwrap().encode().unwrap();
+                .sender(BUS_NAME)
+                .destination(":1.10")
+                .serial(20 + serial)
+                .body("", |_| Ok(()))
+                .unwrap()
+                .encode()
+                .unwrap();
             broker.write_all(&reply).unwrap();
         }
         subscribe_to_owner_departures(&mut connection).unwrap();
@@ -5400,7 +5441,9 @@ mod tests {
     #[test]
     fn calls_arriving_during_name_acquisition_and_subscription_are_served() {
         let (service_stream, mut broker) = UnixStream::pair().unwrap();
-        broker.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        broker
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         thread::scope(|scope| {
             let service = scope.spawn(move || {
                 let mut connection = Connection {
@@ -5413,8 +5456,11 @@ mod tests {
                 request_name(&mut connection).unwrap();
                 subscribe_to_owner_departures(&mut connection).unwrap();
                 connection.finish_setup().unwrap();
-                serve(&mut connection, &Settings::parse(settings::DEFAULT_CONFIG).unwrap(),
-                    service_state().application_policy.unwrap())
+                serve(
+                    &mut connection,
+                    &Settings::parse(settings::DEFAULT_CONFIG).unwrap(),
+                    service_state().application_policy.unwrap(),
+                )
             });
             for (serial, member) in [(1, "RequestName"), (2, "AddMatch")] {
                 let IncomingFrame::Message(request) = read_frame(&mut broker).unwrap() else {
@@ -5428,20 +5474,38 @@ mod tests {
                 } else {
                     (SECRET_INTERFACE, "Retrieve", "s")
                 };
-                let call = message::Builder::method_call(Endian::Little, PORTAL_PATH,
-                    Some(interface), method)
-                    .sender(":1.9").destination(PORTAL_NAME).serial(10 + serial)
-                    .body(signature, |writer| {
-                        if serial == 2 { writer.string("main")?; }
-                        Ok(())
-                    }).unwrap().encode().unwrap();
+                let call = message::Builder::method_call(
+                    Endian::Little,
+                    PORTAL_PATH,
+                    Some(interface),
+                    method,
+                )
+                .sender(":1.9")
+                .destination(PORTAL_NAME)
+                .serial(10 + serial)
+                .body(signature, |writer| {
+                    if serial == 2 {
+                        writer.string("main")?;
+                    }
+                    Ok(())
+                })
+                .unwrap()
+                .encode()
+                .unwrap();
                 broker.write_all(&call).unwrap();
                 let reply = message::Builder::method_return(Endian::Little, serial)
-                    .sender(BUS_NAME).destination(":1.10").serial(20 + serial)
+                    .sender(BUS_NAME)
+                    .destination(":1.10")
+                    .serial(20 + serial)
                     .body(if serial == 1 { "u" } else { "" }, |writer| {
-                        if serial == 1 { writer.uint32(REQUEST_NAME_PRIMARY_OWNER); }
+                        if serial == 1 {
+                            writer.uint32(REQUEST_NAME_PRIMARY_OWNER);
+                        }
                         Ok(())
-                    }).unwrap().encode().unwrap();
+                    })
+                    .unwrap()
+                    .encode()
+                    .unwrap();
                 broker.write_all(&reply).unwrap();
             }
             let IncomingFrame::Message(reply) = read_frame(&mut broker).unwrap() else {
@@ -5458,7 +5522,9 @@ mod tests {
             assert_eq!(query.fields.member, Some("GetConnectionCredentials"));
             assert_eq!(query.fields.destination, Some(BUS_NAME));
             assert_eq!(query.args(), vec![Value::Str(":1.9")]);
-            broker.write_all(&credentials_reply(query.serial, 0, None)).unwrap();
+            broker
+                .write_all(&credentials_reply(query.serial, 0, None))
+                .unwrap();
             let IncomingFrame::Message(reply) = read_frame(&mut broker).unwrap() else {
                 panic!("missing queued Retrieve refusal");
             };
@@ -5466,7 +5532,10 @@ mod tests {
             assert_eq!(reply.kind, MessageType::Error);
             assert_eq!(reply.fields.reply_serial, Some(12));
             assert_eq!(reply.fields.destination, Some(":1.9"));
-            assert_eq!(reply.fields.error_name, Some("org.freedesktop.portal.Error.NotAllowed"));
+            assert_eq!(
+                reply.fields.error_name,
+                Some("org.freedesktop.portal.Error.NotAllowed")
+            );
             drop(broker);
             assert!(service.join().unwrap().is_err());
         });
@@ -5493,7 +5562,11 @@ mod tests {
                     until: None,
                     setup_events: Vec::new(),
                 };
-                serve(&mut connection, &settings, service_state().application_policy.unwrap())
+                serve(
+                    &mut connection,
+                    &settings,
+                    service_state().application_policy.unwrap(),
+                )
             });
             client_stream.write_all(&oversized).unwrap();
             client_stream.write_all(&ping).unwrap();

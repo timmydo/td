@@ -121,7 +121,10 @@ fn safe_path(root: &Path, rel: &str) -> Option<PathBuf> {
     if rel.is_empty() || rel.starts_with('/') {
         return None;
     }
-    if rel.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+    if rel
+        .split('/')
+        .any(|c| c.is_empty() || c == "." || c == "..")
+    {
         return None;
     }
     Some(root.join(rel))
@@ -146,12 +149,14 @@ fn try_get(url: &str) -> Result<Vec<u8>, String> {
 
 fn write_before(conn: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
     while !bytes.is_empty() {
-        let remaining = deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "substitute response deadline expired",
-            )
-        })?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "substitute response deadline expired",
+                )
+            })?;
         conn.set_write_timeout(Some(remaining.min(REQUEST_IO_TIMEOUT)))?;
         let count = conn.write(bytes)?;
         if count == 0 {
@@ -171,12 +176,14 @@ fn write_before(conn: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> io
 }
 
 fn flush_before(conn: &mut TcpStream, deadline: Instant) -> io::Result<()> {
-    let remaining = deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "substitute response deadline expired",
-        )
-    })?;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "substitute response deadline expired",
+            )
+        })?;
     conn.set_write_timeout(Some(remaining.min(REQUEST_IO_TIMEOUT)))?;
     conn.flush()
 }
@@ -242,7 +249,10 @@ fn read_request_head(conn: &mut TcpStream) -> io::Result<Vec<u8>> {
             ));
         }
         let bytes = chunk.get(..n).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "request read exceeded its buffer")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request read exceeded its buffer",
+            )
         })?;
         if head.len().saturating_add(bytes.len()) > MAX_REQUEST_HEAD_BYTES {
             return Err(io::Error::new(
@@ -275,7 +285,12 @@ fn handle_conn(mut conn: TcpStream, root: &Path) -> io::Result<()> {
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
     if method != "GET" {
-        return respond(&mut conn, 405, "Method Not Allowed", b"method not allowed\n");
+        return respond(
+            &mut conn,
+            405,
+            "Method Not Allowed",
+            b"method not allowed\n",
+        );
     }
     let full = match safe_path(root, target.trim_start_matches('/')) {
         Some(p) => p,
@@ -345,8 +360,7 @@ fn download_nar(url: &str, dst: &Path, want: &str) -> Result<(), String> {
     let parent = dst
         .parent()
         .ok_or_else(|| format!("substitute path {} has no parent", dst.display()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     let lock_path = parent.join(".td-subst-download.lock");
     let directory_lock = OpenOptions::new()
         .create(true)
@@ -387,9 +401,7 @@ fn download_nar(url: &str, dst: &Path, want: &str) -> Result<(), String> {
     crate::http::get_to_file(url, &tmp.path, MAX_NAR_BYTES)?;
     let got = file_sha256(&tmp.path)?;
     if got != want {
-        return Err(format!(
-            "nar sha256 mismatch\n  want {want}\n  got  {got}"
-        ));
+        return Err(format!("nar sha256 mismatch\n  want {want}\n  got  {got}"));
     }
     std::fs::rename(&tmp.path, dst).map_err(|e| format!("publish {}: {e}", dst.display()))
 }
@@ -405,7 +417,8 @@ fn sign_dir(dir: &Path, pkcs8: &[u8]) -> Result<usize, String> {
         if path.extension().and_then(|x| x.to_str()) != Some("narinfo") {
             continue;
         }
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let (body, existing) = split_sig(&text);
         if existing.is_some() {
             continue; // already signed; don't double-sign
@@ -430,12 +443,15 @@ fn fetch(baseurl: &str, name: &str, outdir: &Path, pubkey: &[u8]) -> Result<Stri
     if !verify_msg(pubkey, body.as_bytes(), &sig) {
         return Err(format!("narinfo signature does not verify for {name}"));
     }
-    let store_path = field(body, "StorePath").ok_or("narinfo has no StorePath")?.to_string();
+    let store_path = field(body, "StorePath")
+        .ok_or("narinfo has no StorePath")?
+        .to_string();
     let narhash = field(body, "NarHash").ok_or("narinfo has no NarHash")?;
     let narfile = field(body, "NarFile").ok_or("narinfo has no NarFile")?;
     let want = narhash.strip_prefix("sha256:").unwrap_or(narhash);
     // Safe: narfile comes from the SIGNED body, but re-check it can't escape OUTDIR.
-    let nar_dst = safe_path(outdir, narfile).ok_or_else(|| format!("unsafe NarFile {narfile:?}"))?;
+    let nar_dst =
+        safe_path(outdir, narfile).ok_or_else(|| format!("unsafe NarFile {narfile:?}"))?;
     download_nar(&format!("{base}/{narfile}"), &nar_dst, want)
         .map_err(|e| format!("{e} for {name}"))?;
     write_atomic(&outdir.join(format!("{name}.narinfo")), ni.as_bytes())?;
@@ -551,17 +567,23 @@ pub fn run(a: &[String]) {
         }
         Some("sign") if a.len() == 4 => {
             let (dir, priv_path) = (PathBuf::from(&a[2]), &a[3]);
-            let pkcs8 = std::fs::read(priv_path).unwrap_or_else(|e| die(format!("read {priv_path}: {e}")));
+            let pkcs8 =
+                std::fs::read(priv_path).unwrap_or_else(|e| die(format!("read {priv_path}: {e}")));
             match sign_dir(&dir, &pkcs8) {
-                Ok(n) => println!("td-subst: sign OK — signed {n} narinfo(s) in {}", dir.display()),
+                Ok(n) => println!(
+                    "td-subst: sign OK — signed {n} narinfo(s) in {}",
+                    dir.display()
+                ),
                 Err(e) => die(e),
             }
         }
         Some("serve") if a.len() == 4 => {
             let (dir, addr) = (PathBuf::from(&a[2]), &a[3]);
-            let listener =
-                TcpListener::bind(addr.as_str()).unwrap_or_else(|e| die(format!("bind {addr}: {e}")));
-            let bound = listener.local_addr().unwrap_or_else(|e| die(format!("local_addr: {e}")));
+            let listener = TcpListener::bind(addr.as_str())
+                .unwrap_or_else(|e| die(format!("bind {addr}: {e}")));
+            let bound = listener
+                .local_addr()
+                .unwrap_or_else(|e| die(format!("local_addr: {e}")));
             println!("td-subst: serving {} on http://{}/", dir.display(), bound);
             let _ = io::stdout().flush();
             serve_loop(listener, Arc::new(dir));
@@ -572,7 +594,10 @@ pub fn run(a: &[String]) {
                 .unwrap_or_else(|e| die(format!("read {pub_path}: {e}")));
             let pubkey = from_hex(&pub_hex).unwrap_or_else(|e| die(format!("public key: {e}")));
             match fetch(url, name, &outdir, &pubkey) {
-                Ok(sp) => println!("td-subst: fetch OK — {name} verified -> {} (StorePath {sp})", outdir.display()),
+                Ok(sp) => println!(
+                    "td-subst: fetch OK — {name} verified -> {} (StorePath {sp})",
+                    outdir.display()
+                ),
                 Err(e) => die(e),
             }
         }
@@ -593,10 +618,8 @@ mod tests {
 
     #[test]
     fn hash_rejects_an_oversized_existing_nar_before_reading() {
-        let dir = std::env::temp_dir().join(format!(
-            "td-subst-oversized-hash-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("td-subst-oversized-hash-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("artifact.nar");

@@ -636,8 +636,8 @@ mod tests {
                 }
             }
         });
-        let err = get_body(&format!("http://127.0.0.1:{port}/missing"))
-            .expect_err("404 is not a body");
+        let err =
+            get_body(&format!("http://127.0.0.1:{port}/missing")).expect_err("404 is not a body");
         assert!(err.contains("404"), "{err}");
         assert!(
             !err.contains("attempts"),

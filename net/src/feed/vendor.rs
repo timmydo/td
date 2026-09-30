@@ -818,7 +818,10 @@ mod tests {
         let mut tar = Vec::new();
         for (name, bytes) in [
             ("Cargo.lock", lock.as_bytes()),
-            ("Cargo.toml", b"[package]\nname = \"fixture\"\nversion = \"1.0.0\"\n".as_slice()),
+            (
+                "Cargo.toml",
+                b"[package]\nname = \"fixture\"\nversion = \"1.0.0\"\n".as_slice(),
+            ),
             ("unselected-source", b"do not materialize".as_slice()),
         ] {
             let start = tar.len();
@@ -837,7 +840,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(selected).unwrap(), lock);
         assert_eq!(std::fs::read(&archive).unwrap(), original);
         assert!(!source.join("unselected-source").exists());
-        assert!(std::fs::read_to_string(source.join("Cargo.toml")).unwrap().contains("[workspace]"));
+        assert!(std::fs::read_to_string(source.join("Cargo.toml"))
+            .unwrap()
+            .contains("[workspace]"));
         let refused = dir.join("refused");
         assert!(prepare_package_metadata(&archive, &"0".repeat(64), package, &refused).is_err());
         assert!(!refused.exists());

@@ -528,9 +528,10 @@ impl<'a> Handshake<'a> {
         // carries one. It does not canonicalise — "01000" still authenticates
         // — which is harmless because the claim is compared as a number and
         // then discarded.
-        let Some(text) = std::str::from_utf8(&decoded).ok().filter(|text| {
-            !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
-        }) else {
+        let Some(text) = std::str::from_utf8(&decoded)
+            .ok()
+            .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+        else {
             return self.reject_identity();
         };
         let Ok(claimed) = text.parse::<u32>() else {
@@ -588,7 +589,10 @@ fn error() -> Vec<u8> {
 /// Split off the first space-delimited word, returning it and the remainder
 /// with its leading spaces removed.
 fn split_word(line: &[u8]) -> (&[u8], &[u8]) {
-    let end = line.iter().position(|byte| *byte == b' ').unwrap_or(line.len());
+    let end = line
+        .iter()
+        .position(|byte| *byte == b' ')
+        .unwrap_or(line.len());
     let head = line.get(..end).unwrap_or(&[]);
     let mut tail = line.get(end..).unwrap_or(&[]);
     while tail.first() == Some(&b' ') {
@@ -712,7 +716,10 @@ mod tests {
             format!("OK {GUID}\r\n")
         );
         assert_eq!(shake.uid(), Some(1000));
-        assert_eq!(feed(&mut shake, b"NEGOTIATE_UNIX_FD\r\n"), "AGREE_UNIX_FD\r\n");
+        assert_eq!(
+            feed(&mut shake, b"NEGOTIATE_UNIX_FD\r\n"),
+            "AGREE_UNIX_FD\r\n"
+        );
         assert!(shake.unix_fd());
         assert_eq!(feed(&mut shake, b"BEGIN\r\n"), "");
         assert!(shake.begun());
@@ -780,7 +787,10 @@ mod tests {
         // ...and via DATA with the identity stated.
         let mut shake = Handshake::new(mapped, guid());
         feed(&mut shake, b"\0AUTH EXTERNAL\r\n");
-        assert_eq!(feed(&mut shake, b"DATA 31303030\r\n"), format!("OK {GUID}\r\n"));
+        assert_eq!(
+            feed(&mut shake, b"DATA 31303030\r\n"),
+            format!("OK {GUID}\r\n")
+        );
         assert_eq!(shake.uid(), Some(100_000));
 
         // The same claim against an unmapped peer of that credential fails,
@@ -806,7 +816,10 @@ mod tests {
         // ...and a hex identity in DATA is resolved exactly as in AUTH.
         let mut shake = handshake();
         feed(&mut shake, b"\0AUTH EXTERNAL\r\n");
-        assert_eq!(feed(&mut shake, b"DATA 31303030\r\n"), format!("OK {GUID}\r\n"));
+        assert_eq!(
+            feed(&mut shake, b"DATA 31303030\r\n"),
+            format!("OK {GUID}\r\n")
+        );
         let mut shake = handshake();
         feed(&mut shake, b"\0AUTH EXTERNAL\r\n");
         assert_eq!(feed(&mut shake, b"DATA 39\r\n"), "REJECTED EXTERNAL\r\n");
@@ -837,14 +850,14 @@ mod tests {
     #[test]
     fn a_malformed_identity_is_refused() {
         for identity in [
-            "6162",       // "ab" — decodes, but is not numeric
-            "2d31",       // "-1"
+            "6162", // "ab" — decodes, but is not numeric
+            "2d31", // "-1"
             // "+1000" — the one `parse::<u32>` would ACCEPT, which is why the
             // digit filter is not redundant with it: a signed spelling is a
             // second text for one uid.
             "2b31303030",
-            "00",         // a NUL as text
-            "3130303030303030303030303030",  // "10000000000000" — over a u32
+            "00",                           // a NUL as text
+            "3130303030303030303030303030", // "10000000000000" — over a u32
         ] {
             let mut shake = handshake();
             let line = format!("\0AUTH EXTERNAL {identity}\r\n");
@@ -902,7 +915,10 @@ mod tests {
     fn an_unknown_command_does_not_move_the_state() {
         let mut shake = handshake();
         assert_eq!(feed(&mut shake, b"\0WHAT IS THIS\r\n"), "ERROR\r\n");
-        assert_eq!(feed(&mut shake, b"AUTH EXTERNAL 31303030\r\n"), format!("OK {GUID}\r\n"));
+        assert_eq!(
+            feed(&mut shake, b"AUTH EXTERNAL 31303030\r\n"),
+            format!("OK {GUID}\r\n")
+        );
         assert_eq!(feed(&mut shake, b"NONSENSE\r\n"), "ERROR\r\n");
         // Still authenticated, so BEGIN still works.
         assert_eq!(feed(&mut shake, b"BEGIN\r\n"), "");
@@ -1061,7 +1077,10 @@ mod tests {
         assert_eq!(shake.feed(b"\0AUTH\n"), Err(AuthError::BareNewline));
 
         let mut shake = handshake();
-        assert_eq!(shake.feed(b"\0AUTH\rX"), Err(AuthError::StrayCarriageReturn));
+        assert_eq!(
+            shake.feed(b"\0AUTH\rX"),
+            Err(AuthError::StrayCarriageReturn)
+        );
 
         let mut shake = handshake();
         assert_eq!(shake.feed(b"\0AUTH\0X\r\n"), Err(AuthError::InteriorNul));
@@ -1134,7 +1153,11 @@ mod tests {
             "0123456789ABCDEF0123456789ABCDEF",  // uppercase
             "0123456789abcdef0123456789abcdeg",  // not hex
         ] {
-            assert_eq!(Guid::new(bad), Err(AuthError::BadGuid), "{bad} was accepted");
+            assert_eq!(
+                Guid::new(bad),
+                Err(AuthError::BadGuid),
+                "{bad} was accepted"
+            );
         }
     }
 

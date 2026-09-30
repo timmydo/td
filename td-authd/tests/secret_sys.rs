@@ -56,10 +56,30 @@ fn missing_sender_and_extra_rights_are_refused_after_ownership() {
     let rights = vec![OwnedFd::from(first_right), OwnedFd::from(second_right)];
     let (mut third, receiver) = UnixStream::pair().unwrap();
     let fake_pidfd = OwnedFd::from(receiver);
-    assert!(admit(1, 128, 0, (Some(Credentials { pid: 1, uid: 1000, gid: 1000 }), vec![fake_pidfd], rights, true)).is_err());
+    assert!(admit(
+        1,
+        128,
+        0,
+        (
+            Some(Credentials {
+                pid: 1,
+                uid: 1000,
+                gid: 1000
+            }),
+            vec![fake_pidfd],
+            rights,
+            true
+        )
+    )
+    .is_err());
     for peer in [&mut first, &mut second, &mut third] {
-        peer.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
-        assert_eq!(peer.read(&mut [0]).unwrap(), 0, "refusal leaked an installed owner");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(
+            peer.read(&mut [0]).unwrap(),
+            0,
+            "refusal leaked an installed owner"
+        );
     }
     assert!(admit(1, 0, 0, (None, vec![], vec![], true)).is_err());
     assert!(require_sealed(&File::open("/dev/null").unwrap()).is_err());

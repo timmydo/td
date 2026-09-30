@@ -215,7 +215,10 @@ mod tests {
     #[test]
     fn raw_emits_the_syslog_priority_prefix_not_the_wire_record() {
         let r = Record::parse(LINE).unwrap();
-        assert_eq!(r.render(true, true), "<6>[    5.116980] Linux version 6.12.0");
+        assert_eq!(
+            r.render(true, true),
+            "<6>[    5.116980] Linux version 6.12.0"
+        );
         assert_eq!(r.render(false, true), "<6>Linux version 6.12.0");
         // The sequence number and flags field must never reach the output.
         assert!(!r.render(true, true).contains("339"));
@@ -282,7 +285,10 @@ mod tests {
         assert_eq!(render(&body, false, false).lines().count(), 2);
 
         let _ = std::fs::remove_file(&path);
-        assert!(read_kmsg(&path_s).is_err(), "a missing ring buffer must be an error");
+        assert!(
+            read_kmsg(&path_s).is_err(),
+            "a missing ring buffer must be an error"
+        );
     }
 
     /// The drain must terminate on a source that never signals EAGAIN. Without

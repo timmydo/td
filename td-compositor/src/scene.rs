@@ -1232,7 +1232,8 @@ impl Scene {
     pub fn set_portal_dialog(&mut self, key: SurfaceKey, parent: Option<SurfaceKey>) -> bool {
         let was_last = self.portal_dialog_order.last().copied() == Some(key);
         self.portal_dialogs.insert(key);
-        self.portal_dialog_order.retain(|candidate| *candidate != key);
+        self.portal_dialog_order
+            .retain(|candidate| *candidate != key);
         self.portal_dialog_order.push(key);
         let moved = self.layout.float(key, parent);
         self.hint = None;
@@ -1246,9 +1247,9 @@ impl Scene {
         if !self.portal_dialogs.remove(&key) {
             return false;
         }
-        self.portal_dialog_order.retain(|candidate| *candidate != key);
-        if self.is_mapped(key)
-            && !parent.is_some_and(|parent| self.layout.place_after(key, parent))
+        self.portal_dialog_order
+            .retain(|candidate| *candidate != key);
+        if self.is_mapped(key) && !parent.is_some_and(|parent| self.layout.place_after(key, parent))
         {
             self.layout.map(key);
         }
@@ -1261,7 +1262,8 @@ impl Scene {
     pub fn forget_portal_dialog(&mut self, key: SurfaceKey) -> bool {
         let removed = self.portal_dialogs.remove(&key);
         if removed {
-            self.portal_dialog_order.retain(|candidate| *candidate != key);
+            self.portal_dialog_order
+                .retain(|candidate| *candidate != key);
         }
         removed
     }
@@ -1669,8 +1671,7 @@ impl Scene {
     pub fn client_holds_grab(&self, client: u64) -> bool {
         let modal = self.portal_modal();
         self.grabs.iter().any(|key| {
-            key.client == client
-                && modal.is_none_or(|root| self.popup_root(*key) == Some(root))
+            key.client == client && modal.is_none_or(|root| self.popup_root(*key) == Some(root))
         })
     }
 
@@ -2139,8 +2140,7 @@ impl Scene {
         });
         self.grabs.retain(|key| key.client != client);
         self.portal_dialogs.retain(|key| key.client != client);
-        self.portal_dialog_order
-            .retain(|key| key.client != client);
+        self.portal_dialog_order.retain(|key| key.client != client);
         self.titles.retain(|key, _| key.client != client);
         self.app_ids.retain(|key, _| key.client != client);
         self.handles.retain(|key, _| key.client != client);
@@ -2283,9 +2283,11 @@ impl Scene {
     /// dismissed, which gives the scene one modal input owner at a time.
     pub fn portal_modal(&self) -> Option<SurfaceKey> {
         let active = self.layout.active_workspace();
-        self.portal_dialog_order.iter().rev().copied().find(|key| {
-            self.is_mapped(*key) && self.layout.workspace_of(*key) == Some(active)
-        })
+        self.portal_dialog_order
+            .iter()
+            .rev()
+            .copied()
+            .find(|key| self.is_mapped(*key) && self.layout.workspace_of(*key) == Some(active))
     }
 
     /// Whether an input surface belongs to the dialog that currently owns
@@ -2572,11 +2574,7 @@ impl Scene {
     /// drag costs nothing worth caching: nine numbers and a `Vec` of them.
     pub(crate) fn desks(&self) -> Vec<u8> {
         let (occupied, spare) = self.workspace_records();
-        bar::desks(
-            occupied,
-            self.layout.active_workspace(),
-            spare,
-        )
+        bar::desks(occupied, self.layout.active_workspace(), spare)
     }
 
     /// Which workspaces are in use, and the lowest free one. One derivation,
@@ -3213,7 +3211,11 @@ impl Scene {
             return Err("trusted prompt requires active attention".into());
         }
         if self.attention_request_attempted {
-            let following = self.attention_request().map(|previous| previous.following_enrollment_step()).transpose()?.flatten();
+            let following = self
+                .attention_request()
+                .map(|previous| previous.following_enrollment_step())
+                .transpose()?
+                .flatten();
             self.attention_request = None;
             if following.as_ref() != Some(&request) {
                 return Err("trusted prompt must follow the exact enrollment step".into());
@@ -3251,7 +3253,14 @@ impl Scene {
                     Err("trusted prompt raster does not match output target".into())
                 };
             }
-            crate::attention::paint(frame, width, height, stride, self.attention_draining, self.attention_notice);
+            crate::attention::paint(
+                frame,
+                width,
+                height,
+                stride,
+                self.attention_draining,
+                self.attention_notice,
+            );
         } else {
             self.render(frame, width, height, stride);
         }
@@ -3399,10 +3408,7 @@ impl Scene {
         // cannot cover the broker's UI, then draw only popups rooted in that
         // dialog above it. Lower portal dialogs remain configured and hidden.
         if let Some(modal) = modal {
-            if let Some(placement) = placements
-                .iter()
-                .find(|placement| placement.key == modal)
-            {
+            if let Some(placement) = placements.iter().find(|placement| placement.key == modal) {
                 self.draw_title(frame, width, height, stride, placement);
                 let outline = frame_rect(placement);
                 if outline.width != 0 && outline.height != 0 {
@@ -3419,8 +3425,7 @@ impl Scene {
                     );
                 }
                 if placement.rect.width != 0 && placement.rect.height != 0 {
-                    for layer in
-                        self.surface_layers(placement.key, ImageRect::tile(placement.rect))
+                    for layer in self.surface_layers(placement.key, ImageRect::tile(placement.rect))
                     {
                         if omitted == Some(layer.key) {
                             continue;
@@ -4198,7 +4203,11 @@ mod tests {
         // 1. the role object goes, leaving the wl_surface alive.
         assert!(scene.set_app_id(key, "org.td.term"));
         scene.forget_title(key);
-        assert_eq!(scene.app_id(key), None, "a destroyed toplevel kept its name");
+        assert_eq!(
+            scene.app_id(key),
+            None,
+            "a destroyed toplevel kept its name"
+        );
 
         // 2. the surface goes.
         assert!(scene.set_app_id(key, "org.td.term"));
@@ -4305,7 +4314,11 @@ mod tests {
             scene.forget_title(key),
             "forgetting a named window answered that nothing was forgotten"
         );
-        assert_eq!(scene.handle(key), None, "a destroyed toplevel kept its name");
+        assert_eq!(
+            scene.handle(key),
+            None,
+            "a destroyed toplevel kept its name"
+        );
         scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
         assert_ne!(
             scene.handle(key),
@@ -4436,7 +4449,10 @@ mod tests {
         let refused = scene
             .commit(key, surface([1, 2, 3, 0], 8, 8))
             .expect_err("the ceiling passed a surface it cannot hold");
-        assert!(refused.contains("exceeding"), "refused for another reason: {refused}");
+        assert!(
+            refused.contains("exceeding"),
+            "refused for another reason: {refused}"
+        );
         assert_eq!(scene.handle(key), None, "a refused commit minted a name");
 
         // And the counter did not move: the window that DOES take pixels gets
@@ -6872,15 +6888,29 @@ mod tests {
     #[test]
     fn unroled_reservations_share_scene_budget_without_creating_tiles() {
         let mut scene = Scene::new();
-        let first = SurfaceKey { client: 4, object: 20 };
-        let second = SurfaceKey { client: 5, object: 20 };
-        scene.replace_inactive_surface(first, BufferCharge::shm(MAX_SCENE_BYTES)).unwrap();
+        let first = SurfaceKey {
+            client: 4,
+            object: 20,
+        };
+        let second = SurfaceKey {
+            client: 5,
+            object: 20,
+        };
+        scene
+            .replace_inactive_surface(first, BufferCharge::shm(MAX_SCENE_BYTES))
+            .unwrap();
         assert!(!scene.layout.contains(first));
         assert!(!scene.surfaces.contains_key(&first));
-        assert!(scene.replace_inactive_surface(second, BufferCharge::shm(4)).is_err());
+        assert!(scene
+            .replace_inactive_surface(second, BufferCharge::shm(4))
+            .is_err());
         assert_eq!(scene.surface_charge.host_bytes(), MAX_SCENE_BYTES);
-        scene.replace_inactive_surface(first, BufferCharge::shm(4)).unwrap();
-        scene.replace_inactive_surface(second, BufferCharge::shm(4)).unwrap();
+        scene
+            .replace_inactive_surface(first, BufferCharge::shm(4))
+            .unwrap();
+        scene
+            .replace_inactive_surface(second, BufferCharge::shm(4))
+            .unwrap();
         assert_eq!(scene.surface_charge.host_bytes(), 8);
         scene.remove(first);
         assert_eq!(scene.surface_charge.host_bytes(), 4);
@@ -7049,14 +7079,8 @@ mod tests {
             let offset = y.saturating_mul(stride).saturating_add(x.saturating_mul(4));
             frame.get(offset..offset.saturating_add(4)).unwrap()
         };
-        assert_eq!(
-            pixel(first_placement.rect.x, first_placement.rect.y),
-            blue
-        );
-        assert_ne!(
-            pixel(second_placement.band.x, second_placement.band.y),
-            red
-        );
+        assert_eq!(pixel(first_placement.rect.x, first_placement.rect.y), blue);
+        assert_ne!(pixel(second_placement.band.x, second_placement.band.y), red);
         assert_eq!(
             pixel(second_placement.rect.x, second_placement.rect.y),
             clipped_edge

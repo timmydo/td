@@ -289,7 +289,10 @@ mod tests {
     fn basename_strips_every_leading_component() {
         assert_eq!(basename("/sbin/init"), "init");
         assert_eq!(basename("reboot"), "reboot");
-        assert_eq!(basename("/td/store/abc-td-init/bin/switch_root"), "switch_root");
+        assert_eq!(
+            basename("/td/store/abc-td-init/bin/switch_root"),
+            "switch_root"
+        );
         // A trailing slash yields an empty basename rather than the parent -- it
         // is not an applet, so dispatch falls through to the argv[1] form.
         assert_eq!(basename("/bin/"), "");
@@ -360,12 +363,18 @@ mod tests {
         assert_eq!(route(&[], true), rescue);
         // A real applet still wins over the rescue, so `/sbin/init` and an
         // explicit `td-init init` are unaffected by it.
-        assert_eq!(route(&argv(&["/sbin/init", "-f", "/etc/x"]), true), applet("init", 1));
+        assert_eq!(
+            route(&argv(&["/sbin/init", "-f", "/etc/x"]), true),
+            applet("init", 1)
+        );
         assert_eq!(route(&argv(&["td-init", "init"]), true), applet("init", 2));
         // ...including the irreversible ones: an initramfs runs switch_root as
         // PID 1 and must not be turned into an init by this rule.
         assert_eq!(
-            route(&argv(&["td-init", "switch_root", "/mnt", "/sbin/init"]), true),
+            route(
+                &argv(&["td-init", "switch_root", "/mnt", "/sbin/init"]),
+                true
+            ),
             applet("switch_root", 2)
         );
     }
@@ -377,7 +386,10 @@ mod tests {
     /// different — PID 1 exiting 0 panics exactly as PID 1 exiting 1 does.
     #[test]
     fn pid_1_never_exits_whatever_the_applet_returned() {
-        assert_eq!(outcome(&Err("no init in the new root".into()), true), Outcome::Rescue);
+        assert_eq!(
+            outcome(&Err("no init in the new root".into()), true),
+            Outcome::Rescue
+        );
         assert_eq!(outcome(&Ok(0), true), Outcome::Rescue);
         // Anywhere else the exit status is the applet's own, and an error is 1.
         assert_eq!(outcome(&Ok(0), false), Outcome::Exit(0));
@@ -795,7 +807,10 @@ mod confinement {
                     Some((end, _)) => rest.get(..end).unwrap_or(rest),
                     None => rest,
                 };
-                if group.split(|c: char| !c.is_alphanumeric() && c != '_').any(|t| t == lint) {
+                if group
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .any(|t| t == lint)
+                {
                     count += 1;
                 }
             }
@@ -842,7 +857,11 @@ mod confinement {
                 declared.push(target);
             }
         }
-        assert_eq!(declared.len(), 15, "expected fifteen modules beside the crate root");
+        assert_eq!(
+            declared.len(),
+            15,
+            "expected fifteen modules beside the crate root"
+        );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model,
         // and either way the counts above stop meaning what they say. Matching on
@@ -959,7 +978,9 @@ mod confinement {
             );
         }
         assert_eq!(
-            source("main.rs").matches(concat!("#![deny(un", "safe_code)]")).count(),
+            source("main.rs")
+                .matches(concat!("#![deny(un", "safe_code)]"))
+                .count(),
             1,
             "the crate root must deny the unsafe lint so the scoped allow is the confinement"
         );
@@ -1135,11 +1156,17 @@ mod confinement {
             "constTCSETS:usize=0x5402;",
             "constBLKRRPART:usize=0x125f;",
         ] {
-            assert_eq!(sys.matches(decl).count(), 1, "the pinned request {decl} changed");
+            assert_eq!(
+                sys.matches(decl).count(),
+                1,
+                "the pinned request {decl} changed"
+            );
         }
         assert_eq!(
-            sys.matches("constIOCTL_REQUESTS:[usize;5]=[TIOCSCTTY,LOOP_SET_FD,TCGETS,TCSETS,BLKRRPART];")
-                .count(),
+            sys.matches(
+                "constIOCTL_REQUESTS:[usize;5]=[TIOCSCTTY,LOOP_SET_FD,TCGETS,TCSETS,BLKRRPART];"
+            )
+            .count(),
             1,
             "the ioctl roster changed; a sixth request is an UNSAFE.md amendment"
         );
@@ -1172,16 +1199,17 @@ mod confinement {
     /// a reboot that silently does nothing — and for `mount`'s flags and data
     /// arriving from the option table rather than being composed here.
     ///
-    /// Squeezed, so reformatting the multi-line calls does not red this; the
-    /// argument lists are literals but `CALL` is assembled, since main.rs may
-    /// not name the raw entry point.
+    /// Squeezed, so re-indenting a call does not red this, though the trailing
+    /// comma rustfmt adds when it breaks one across lines does; the argument
+    /// lists are literals but `CALL` is assembled, since main.rs may not name
+    /// the raw entry point.
     #[test]
     fn every_call_site_is_pinned_whole() {
         const ARGUMENTS: &[&str] = &[
-            "(SYS_REBOOT,LINUX_REBOOT_MAGIC1,LINUX_REBOOT_MAGIC2,cmd,0,0)",
+            "(SYS_REBOOT,LINUX_REBOOT_MAGIC1,LINUX_REBOOT_MAGIC2,cmd,0,0,)",
             "(SYS_SYNC,0,0,0,0,0)",
             "(SYS_MOUNT,source.as_ptr()asusize,target.as_ptr()asusize,nullable(fstype),flags,nullable(data),)",
-            "(SYS_UMOUNT2,target.as_ptr()asusize,flags,0,0,0)",
+            "(SYS_UMOUNT2,target.as_ptr()asusize,flags,0,0,0,)",
             "(SYS_CHROOT,path.as_ptr()asusize,0,0,0,0)",
             "(SYS_SETHOSTNAME,name.as_ptr()asusize,name.len(),0,0,0,)",
             "(SYS_SETSID,0,0,0,0,0)",
@@ -1263,7 +1291,8 @@ mod confinement {
             "TERMIOS_LEN must stay the kernel's 36-byte struct"
         );
         assert_eq!(
-            sys.matches("const_:()=assert!(TERMIOS_LEN==4*4+1+19);").count(),
+            sys.matches("const_:()=assert!(TERMIOS_LEN==4*4+1+19);")
+                .count(),
             1,
             "the length must stay derived from the field layout that explains it"
         );
@@ -1374,13 +1403,19 @@ mod confinement {
     #[test]
     fn the_filesystem_wrappers_are_called_only_from_the_two_permitted_modules() {
         for (call, permitted) in [
-            (concat!("sys::", "mount"), &["mount.rs", "switchroot.rs"][..]),
+            (
+                concat!("sys::", "mount"),
+                &["mount.rs", "switchroot.rs"][..],
+            ),
             (concat!("sys::", "umount"), &["mount.rs"][..]),
             // `attach_loop` takes two raw descriptors, so any module that can
             // call it can bind an arbitrary open file to an arbitrary loop
             // device. One caller is what keeps the read-back below meaningful.
             (concat!("sys::", "attach_loop"), &["losetup.rs"][..]),
-            (concat!("sys::", "reread_partitions"), &["partitions.rs"][..]),
+            (
+                concat!("sys::", "reread_partitions"),
+                &["partitions.rs"][..],
+            ),
             // `mknod` takes `mode`, whose top bits are the node TYPE and so choose
             // the driver class. A caller outside `mknod.rs` could compose a
             // character node and skip the readback that makes this applet safe.
@@ -1615,11 +1650,20 @@ mod confinement {
         let sys = squeeze(&code_only(&source("sys.rs")));
         assert!(sys.contains("pubfnreread_partitions(device:&File)->io::Result<()>{ioctl(device.as_raw_fd(),BLKRRPART,0)}"));
         let applet = squeeze(&code_only(&source("partitions.rs")));
-        assert_eq!(applet.matches(concat!("sys::", "reread_partitions(&disk)")).count(), 1);
+        assert_eq!(
+            applet
+                .matches(concat!("sys::", "reread_partitions(&disk)"))
+                .count(),
+            1
+        );
         assert!(applet.contains("constO_NONBLOCK:i32=0o4000;"));
         assert!(applet.contains("constO_NOFOLLOW:i32=0o400000;"));
-        assert!(applet.contains("OpenOptions::new().read(true).custom_flags(O_NONBLOCK|O_NOFOLLOW).open(path)?"));
-        assert!(applet.contains("letbefore=fs::symlink_metadata(path)?;if!before.file_type().is_block_device()"));
+        assert!(applet.contains(
+            "OpenOptions::new().read(true).custom_flags(O_NONBLOCK|O_NOFOLLOW).open(path)?"
+        ));
+        assert!(applet.contains(
+            "letbefore=fs::symlink_metadata(path)?;if!before.file_type().is_block_device()"
+        ));
         assert!(applet.contains("letopened=file.metadata()?;if!opened.file_type().is_block_device()||(before.dev(),before.ino(),before.rdev())!=(opened.dev(),opened.ino(),opened.rdev())"));
     }
 
@@ -1669,7 +1713,8 @@ mod confinement {
     fn the_ioctl_entry_point_is_private_to_its_module() {
         let sys = squeeze(&source("sys.rs"));
         assert_eq!(
-            sys.matches("fnioctl(fd:RawFd,request:usize,arg:usize)").count(),
+            sys.matches("fnioctl(fd:RawFd,request:usize,arg:usize)")
+                .count(),
             1,
             "the ioctl entry point's signature changed; re-audit and update the pin"
         );
@@ -1694,7 +1739,11 @@ mod confinement {
         // fixes the definition's visibility as the empty one.
         let sys = squeeze(&source("sys.rs"));
         assert_eq!(
-            sys.matches(&format!("{}{CALL}(", concat!("#[allow(un", "safe_code)]fn"))).count(),
+            sys.matches(&format!(
+                "{}{CALL}(",
+                concat!("#[allow(un", "safe_code)]fn")
+            ))
+            .count(),
             1,
             "the raw entry point must be the item under the scoped allow, with no visibility"
         );

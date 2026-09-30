@@ -312,7 +312,10 @@ fn probe_helper(
         // a `mkdir` that silently did nothing, a `touch` that truncated instead
         // of creating, or an `rm` that removed the wrong thing all show up here
         // rather than as a hundred unexplained shell gaps.
-        ("mkdir -p d/e && touch d/e/f && echo yes > d/e/f && cat d/e/f", "yes\n"),
+        (
+            "mkdir -p d/e && touch d/e/f && echo yes > d/e/f && cat d/e/f",
+            "yes\n",
+        ),
         // `touch` must not TRUNCATE what it touches, which is the one way this
         // applet can be wrong and still look like it worked.
         ("echo keep > g && touch g && cat g", "keep\n"),
@@ -340,7 +343,10 @@ fn probe_helper(
         // fails exactly as it does on a read-only one. The `;` is the other
         // half — after `&&` a chmod that did nothing would skip the echo
         // and print nothing rather than the wrong word.
-        ("touch m && chmod -w m; test -w m && echo writable || echo ro", "ro\n"),
+        (
+            "touch m && chmod -w m; test -w m && echo writable || echo ro",
+            "ro\n",
+        ),
         // `sleep` must take a FRACTION: every use in the corpus is one, and an
         // integer-only parse would sleep zero and look like it worked.
         ("sleep 0.01 && echo slept", "slept\n"),
@@ -450,18 +456,26 @@ fn json_string(s: &str) -> String {
 /// background job (`backgrounds_a_timed_job`); `main` aborts on either, so
 /// neither a rename nor a rewrite can quietly turn an entry into a hole. A
 /// golden loosened under an unchanged shape defeats both and needs re-measuring.
-const HOST_SCHEDULED: &[&str] =
-    &["background.test.sh::wait for N parallel jobs and check failure"];
+const HOST_SCHEDULED: &[&str] = &["background.test.sh::wait for N parallel jobs and check failure"];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let shell = PathBuf::from(args.next().ok_or("usage: gen_expectations <shell-binary> <spec-helpers-binary> <spec-dir>")?);
+    let shell = PathBuf::from(
+        args.next()
+            .ok_or("usage: gen_expectations <shell-binary> <spec-helpers-binary> <spec-dir>")?,
+    );
     // The `argv.py` stand-in, REQUIRED rather than derived from the shell's
     // directory: without it the 294 cases that ask what a word expanded to fail
     // with a 127 indistinguishable from a shell gap, and this tool would write
     // that into the committed overlay.
-    let helpers = PathBuf::from(args.next().ok_or("usage: gen_expectations <shell-binary> <spec-helpers-binary> <spec-dir>")?);
-    let dir = PathBuf::from(args.next().ok_or("usage: gen_expectations <shell-binary> <spec-helpers-binary> <spec-dir>")?);
+    let helpers = PathBuf::from(
+        args.next()
+            .ok_or("usage: gen_expectations <shell-binary> <spec-helpers-binary> <spec-dir>")?,
+    );
+    let dir = PathBuf::from(
+        args.next()
+            .ok_or("usage: gen_expectations <shell-binary> <spec-helpers-binary> <spec-dir>")?,
+    );
 
     let mut xfail: Vec<String> = Vec::new();
     let mut skip: Vec<String> = Vec::new();
@@ -490,8 +504,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     probe_helper(&shell, &helpers, &mut errors)?;
 
     for path in &spec_paths(&dir)? {
-        let file =
-            path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        let file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
         let text = std::fs::read_to_string(path)?;
         let cases = match parse_spec(&text) {
             Ok(c) => c,
@@ -525,10 +542,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `/tmp/spam` CREATED it on the build host on the way to being
             // classified as a skip: shared state this harness neither owns nor
             // cleans, left behind by the very run that decided to ignore it.
-            if reads_repo_tree(&exec)
-                || depends_on_shared_tmp(&exec)
-                || measures_syscalls(&exec)
-            {
+            if reads_repo_tree(&exec) || depends_on_shared_tmp(&exec) || measures_syscalls(&exec) {
                 skip.push(key);
                 continue;
             }

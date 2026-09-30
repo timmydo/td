@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 mod apply;
-mod upstream;
 #[path = "../../td-boot/src/protocol.rs"]
 #[allow(dead_code, reason = "shared boot deployment contract")]
 mod protocol;
 #[path = "../../engine/src/sha256.rs"]
 #[allow(dead_code, reason = "shared streaming SHA-256 implementation")]
 mod sha256;
+mod upstream;
 
 type Result<T> = std::result::Result<T, String>;
 const SOURCE: &str = "/run/td-volume/td/source";
@@ -257,7 +257,10 @@ fn initialize(source: &Path, home: &Path, tool: &Path) -> Result<Initialization>
         &lease,
         "clone bundled source",
     )?;
-    let branch = upstream.as_ref().map(|value| value.branch.as_str()).unwrap_or("main");
+    let branch = upstream
+        .as_ref()
+        .map(|value| value.branch.as_str())
+        .unwrap_or("main");
     run_git(
         git(tool, &staging).args(["switch", "--create", branch, &commit]),
         &lease,
@@ -271,14 +274,21 @@ fn initialize(source: &Path, home: &Path, tool: &Path) -> Result<Initialization>
     if let Some(upstream) = &upstream {
         run_git(
             git(tool, &staging).args(["remote", "add", "origin", &upstream.origin]),
-            &lease, "configure source origin",
+            &lease,
+            "configure source origin",
         )?;
         for (key, value) in [
             (format!("branch.{branch}.remote"), "origin".to_string()),
-            (format!("branch.{branch}.merge"), format!("refs/heads/{branch}")),
+            (
+                format!("branch.{branch}.merge"),
+                format!("refs/heads/{branch}"),
+            ),
         ] {
-            run_git(git(tool, &staging).args(["config", "--local", &key, &value]),
-                &lease, "configure source tracking branch")?;
+            run_git(
+                git(tool, &staging).args(["config", "--local", &key, &value]),
+                &lease,
+                "configure source tracking branch",
+            )?;
         }
     }
     let actual = run_git(
@@ -393,16 +403,27 @@ fn build_with_tools(root: &Path, home: &Path, cargo: &Path, feed: &Path) -> Resu
         "warm system",
     )?;
     eprintln!("td-update: building the system image");
-    let mut child = io(command(&bin.join("td-recipe-eval"), root, home)
-        .args(["build-run", "system-x86-64"])
-        .env("TD_BUILDER_SELF", bin.join("td-builder"))
-        .stdout(Stdio::piped()).spawn(), "build system")?;
-    let result = child.stdout.take().ok_or("missing build output".into())
+    let mut child = io(
+        command(&bin.join("td-recipe-eval"), root, home)
+            .args(["build-run", "system-x86-64"])
+            .env("TD_BUILDER_SELF", bin.join("td-builder"))
+            .stdout(Stdio::piped())
+            .spawn(),
+        "build system",
+    )?;
+    let result = child
+        .stdout
+        .take()
+        .ok_or("missing build output".into())
         .and_then(|stdout| build_output(BufReader::new(stdout), &mut std::io::stdout().lock()));
-    if result.is_err() { let _ = child.kill(); }
+    if result.is_err() {
+        let _ = child.kill();
+    }
     let status = io(child.wait(), "wait for system build")?;
     let output = result.map_err(|error| format!("{error} (system build status: {status})"))?;
-    if !status.success() { return Err(format!("build system failed ({status})")); }
+    if !status.success() {
+        return Err(format!("build system failed ({status})"));
+    }
     Ok(output.join("deployment"))
 }
 
@@ -412,16 +433,32 @@ fn build_output(mut input: impl BufRead, output: &mut impl Write) -> Result<Path
     let mut line = Vec::new();
     loop {
         line.clear();
-        let count = io(input.by_ref().take(65537).read_until(b'\n', &mut line), "read build output")?;
-        if count == 0 { break; }
-        if count > 65536 { return Err("system build emitted an oversized output line".into()); }
+        let count = io(
+            input.by_ref().take(65537).read_until(b'\n', &mut line),
+            "read build output",
+        )?;
+        if count == 0 {
+            break;
+        }
+        if count > 65536 {
+            return Err("system build emitted an oversized output line".into());
+        }
         io(output.write_all(&line), "display build output")?;
         if let Some(path) = line.strip_prefix(PREFIX) {
-            if deployment.is_some() { return Err("system build returned duplicate output receipts".into()); }
+            if deployment.is_some() {
+                return Err("system build returned duplicate output receipts".into());
+            }
             let text = std::str::from_utf8(path).map_err(|_| "build output path is not UTF-8")?;
-            let text = text.strip_suffix('\n').ok_or("incomplete build output receipt")?;
+            let text = text
+                .strip_suffix('\n')
+                .ok_or("incomplete build output receipt")?;
             let path = Path::new(text);
-            if !path.is_absolute() || text.contains('\0') || path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+            if !path.is_absolute()
+                || text.contains('\0')
+                || path
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
                 return Err("invalid system build output path".into());
             }
             deployment = Some(path.to_path_buf());
@@ -432,19 +469,34 @@ fn build_output(mut input: impl BufRead, output: &mut impl Write) -> Result<Path
 
 fn install(root: &Path, home: &Path) -> Result<()> {
     let source = build(root, home)?;
-    let manifest = io(OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_NONBLOCK)
-        .open(source.join("manifest")), "open built manifest")?;
+    let manifest = io(
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+            .open(source.join("manifest")),
+        "open built manifest",
+    )?;
     let metadata = io(manifest.metadata(), "inspect built manifest")?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 4096 {
         return Err("built manifest is not a bounded regular file".into());
     }
     let mut bytes = Vec::new();
-    io(manifest.take(4097).read_to_end(&mut bytes), "read built manifest")?;
-    if bytes.len() > 4096 { return Err("built manifest grew while reading".into()); }
+    io(
+        manifest.take(4097).read_to_end(&mut bytes),
+        "read built manifest",
+    )?;
+    if bytes.len() > 4096 {
+        return Err("built manifest grew while reading".into());
+    }
     let deployment = sha256::hex_digest(&bytes);
     eprintln!("td-update: requesting installation of {deployment}");
-    success(command(Path::new("/bin/td-authd"), root, home)
-        .arg("request-update").arg(source).arg(deployment), "request system installation")
+    success(
+        command(Path::new("/bin/td-authd"), root, home)
+            .arg("request-update")
+            .arg(source)
+            .arg(deployment),
+        "request system installation",
+    )
 }
 
 fn run(args: &[String]) -> Result<()> {
@@ -457,7 +509,12 @@ fn run(args: &[String]) -> Result<()> {
     if matches!(args.first().map(String::as_str), Some("--help" | "-h")) && args.len() == 1 {
         return io(std::io::stdout().write_all(HELP.as_bytes()), "write help");
     }
-    if args.len() > 1 || !matches!(args.first().map(String::as_str), None | Some("init" | "build" | "install")) {
+    if args.len() > 1
+        || !matches!(
+            args.first().map(String::as_str),
+            None | Some("init" | "build" | "install")
+        )
+    {
         return Err(HELP.into());
     }
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?);
@@ -474,8 +531,12 @@ fn run(args: &[String]) -> Result<()> {
         Some("build") if args.len() == 1 => build(
             &io(std::env::current_dir(), "read current directory")?,
             &home,
-        ).map(|_| ()),
-        None | Some("install") => install(&io(std::env::current_dir(), "read current directory")?, &home),
+        )
+        .map(|_| ()),
+        None | Some("install") => install(
+            &io(std::env::current_dir(), "read current directory")?,
+            &home,
+        ),
         _ => Err(HELP.into()),
     }
 }
@@ -661,13 +722,22 @@ fn main() {
 
     #[test]
     fn build_receipt_is_bounded_complete_and_required() {
-        for bytes in [b"ordinary log\n".as_slice(), b"TD_RECIPE_RUN_OUT system-x86-64 relative\n", b"TD_RECIPE_RUN_OUT system-x86-64 /tmp/../other\n", b"TD_RECIPE_RUN_OUT system-x86-64 /output", b"TD_RECIPE_RUN_OUT system-x86-64 /one\nTD_RECIPE_RUN_OUT system-x86-64 /two\n"] {
+        for bytes in [
+            b"ordinary log\n".as_slice(),
+            b"TD_RECIPE_RUN_OUT system-x86-64 relative\n",
+            b"TD_RECIPE_RUN_OUT system-x86-64 /tmp/../other\n",
+            b"TD_RECIPE_RUN_OUT system-x86-64 /output",
+            b"TD_RECIPE_RUN_OUT system-x86-64 /one\nTD_RECIPE_RUN_OUT system-x86-64 /two\n",
+        ] {
             assert!(build_output(std::io::Cursor::new(bytes), &mut Vec::new()).is_err());
         }
         assert!(build_output(std::io::Cursor::new(vec![b'x'; 65537]), &mut Vec::new()).is_err());
         let input = b"working\nTD_RECIPE_RUN_OUT system-x86-64 /output with spaces\n";
         let mut output = Vec::new();
-        assert_eq!(build_output(std::io::Cursor::new(input), &mut output).unwrap(), PathBuf::from("/output with spaces"));
+        assert_eq!(
+            build_output(std::io::Cursor::new(input), &mut output).unwrap(),
+            PathBuf::from("/output with spaces")
+        );
         assert_eq!(output, input);
     }
 
@@ -799,21 +869,51 @@ fn main() {
     fn bundled_upstream_configures_tracking_without_fetching_and_preserves_user_settings() {
         let repository = Fixture::new();
         let source = repository.export("sha1");
-        let settings = upstream::Upstream::new("https://example.invalid/td.git", "releases/stable").unwrap();
+        let settings =
+            upstream::Upstream::new("https://example.invalid/td.git", "releases/stable").unwrap();
         fs::write(source.join(upstream::NAME), settings.encode()).unwrap();
         let home = Fixture::new();
-        assert_eq!(initialize(&source, &home.0, &host_git()).unwrap(), Initialization::Created);
+        assert_eq!(
+            initialize(&source, &home.0, &host_git()).unwrap(),
+            Initialization::Created
+        );
         let checkout = Fixture(home.0.join("src/td"));
-        assert_eq!(checkout.git(&["branch", "--show-current"]), "releases/stable\n");
-        assert_eq!(checkout.git(&["config", "remote.origin.url"]), format!("{}\n", settings.origin));
-        assert_eq!(checkout.git(&["config", "branch.releases/stable.remote"]), "origin\n");
-        assert_eq!(checkout.git(&["config", "branch.releases/stable.merge"]), "refs/heads/releases/stable\n");
-        assert_eq!(checkout.git(&["rev-parse", "HEAD"]), repository.git(&["rev-parse", "HEAD"]));
+        assert_eq!(
+            checkout.git(&["branch", "--show-current"]),
+            "releases/stable\n"
+        );
+        assert_eq!(
+            checkout.git(&["config", "remote.origin.url"]),
+            format!("{}\n", settings.origin)
+        );
+        assert_eq!(
+            checkout.git(&["config", "branch.releases/stable.remote"]),
+            "origin\n"
+        );
+        assert_eq!(
+            checkout.git(&["config", "branch.releases/stable.merge"]),
+            "refs/heads/releases/stable\n"
+        );
+        assert_eq!(
+            checkout.git(&["rev-parse", "HEAD"]),
+            repository.git(&["rev-parse", "HEAD"])
+        );
         assert!(!checkout.0.join(".git/FETCH_HEAD").exists());
-        checkout.git(&["remote", "set-url", "origin", "https://example.invalid/my-fork.git"]);
+        checkout.git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.invalid/my-fork.git",
+        ]);
         fs::write(source.join(upstream::NAME), "invalid replacement").unwrap();
-        assert_eq!(initialize(&source, &home.0, Path::new("/absent/git")).unwrap(), Initialization::Existing);
-        assert_eq!(checkout.git(&["config", "remote.origin.url"]), "https://example.invalid/my-fork.git\n");
+        assert_eq!(
+            initialize(&source, &home.0, Path::new("/absent/git")).unwrap(),
+            Initialization::Existing
+        );
+        assert_eq!(
+            checkout.git(&["config", "remote.origin.url"]),
+            "https://example.invalid/my-fork.git\n"
+        );
         let other = Fixture::new();
         assert!(initialize(&source, &other.0, Path::new("/absent/git")).is_err());
         assert!(!other.0.join("src/td").exists());

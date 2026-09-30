@@ -548,7 +548,8 @@ impl EditorProcess {
         let socket = directory.0.join("control");
         let log = directory.0.join("stderr");
         let mut command = Command::new(env!("CARGO_BIN_EXE_td-editor"));
-        command.args(["--window", "--control-socket"])
+        command
+            .args(["--window", "--control-socket"])
             .arg(&socket)
             .arg("--dictionary")
             .arg(dictionary)
@@ -1420,7 +1421,11 @@ fn control_edit_jobs_and_close_dialogs(editor: &mut EditorProcess, file: &Path) 
     editor.wait_field("state", "tab", "1,4,0,15,15,15,0,72,1,crlf");
     editor.wait_tab(4, "warm one\nwrong\n");
     assert_eq!(
-        editor.ok("state").split('\t').filter(|field| field.starts_with("tab=")).count(),
+        editor
+            .ok("state")
+            .split('\t')
+            .filter(|field| field.starts_with("tab="))
+            .count(),
         1
     );
 }

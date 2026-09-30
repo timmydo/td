@@ -180,7 +180,10 @@ fn raw_errno(value: isize) -> Option<io::Error> {
 
 fn errno_result(value: isize, operation: &str) -> io::Result<usize> {
     if let Some(error) = raw_errno(value) {
-        return Err(io::Error::new(error.kind(), format!("{operation}: {error}")));
+        return Err(io::Error::new(
+            error.kind(),
+            format!("{operation}: {error}"),
+        ));
     }
     usize::try_from(value).map_err(|_| {
         io::Error::new(
@@ -413,7 +416,10 @@ fn harvest(control: &[u8]) -> Vec<RawFd> {
     let mut found = Vec::new();
     let mut at = 0usize;
     while at + CMSG_HEADER <= control.len() {
-        let len = match control.get(at..at + 8).and_then(|bytes| bytes.try_into().ok()) {
+        let len = match control
+            .get(at..at + 8)
+            .and_then(|bytes| bytes.try_into().ok())
+        {
             Some(bytes) => usize::from_ne_bytes(bytes),
             None => break,
         };
@@ -476,7 +482,11 @@ pub fn send(stream: &UnixStream, bytes: &[u8], fds: &[RawFd]) -> io::Result<usiz
     }
     let mut control = ControlBuffer([0u8; CONTROL_CAPACITY]);
     let payload = fds.len() * 4;
-    let control_len = if fds.is_empty() { 0 } else { CMSG_HEADER + payload };
+    let control_len = if fds.is_empty() {
+        0
+    } else {
+        CMSG_HEADER + payload
+    };
     if !fds.is_empty() {
         let header = CMSG_HEADER + payload;
         if let Some(slot) = control.0.get_mut(..8) {
@@ -610,7 +620,11 @@ mod tests {
         let (a, _b) = UnixStream::pair().expect("socketpair");
         assert!(send(&a, b"", &[]).is_err(), "an empty frame was sent");
         let too_many = vec![a.as_raw_fd(); MAX_FDS + 1];
-        assert!(send(&a, b"x", &too_many).is_err(), "{} sent", too_many.len());
+        assert!(
+            send(&a, b"x", &too_many).is_err(),
+            "{} sent",
+            too_many.len()
+        );
         let mut nothing: [u8; 0] = [];
         assert!(receive(&a, &mut nothing).is_err(), "an empty read was made");
     }
@@ -743,7 +757,11 @@ mod tests {
         ));
         std::fs::write(&path, b"x").expect("scratch file");
         let spare = std::fs::File::open(&path).expect("open scratch");
-        assert_eq!(descriptors_onto(&path), 1, "the count does not see its file");
+        assert_eq!(
+            descriptors_onto(&path),
+            1,
+            "the count does not see its file"
+        );
 
         let (a, b) = UnixStream::pair().expect("socketpair");
         let too_many = vec![spare.as_raw_fd(); MAX_FDS + 8];
@@ -759,7 +777,8 @@ mod tests {
         let held = descriptors_onto(&path);
         let _ = std::fs::remove_file(&path);
         assert_eq!(
-            held, 1,
+            held,
+            1,
             "the refusal leaked {} descriptors",
             held.saturating_sub(1)
         );
@@ -836,8 +855,7 @@ mod tests {
         let mut buffer = [0u8; 16];
         let received = receive(&a, &mut buffer).expect("receive");
         let fd = received.fds.first().expect("one descriptor").as_raw_fd();
-        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
-            .expect("fdinfo");
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).expect("fdinfo");
         let flags = info
             .lines()
             .find_map(|line| line.strip_prefix("flags:"))
@@ -859,6 +877,9 @@ mod tests {
         other[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
         other[12..16].copy_from_slice(&2i32.to_ne_bytes()); // SCM_CREDENTIALS
         other[16..20].copy_from_slice(&7i32.to_ne_bytes());
-        assert!(harvest(&other).is_empty(), "a non-SCM_RIGHTS cmsg was mined");
+        assert!(
+            harvest(&other).is_empty(),
+            "a non-SCM_RIGHTS cmsg was mined"
+        );
     }
 }

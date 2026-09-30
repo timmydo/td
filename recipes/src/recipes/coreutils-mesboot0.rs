@@ -46,25 +46,49 @@ const MAKEFILE: &str = include_str!("coreutils-mesboot0.mk");
 // ignores text before the first `---`/`diff` line anyway).
 const PATCHES: &[(&str, &str)] = &[
     // lib/modechange.c: move the modechange.h include after <sys/stat.h>.
-    ("modechange", include_str!("coreutils-mesboot0-modechange.patch")),
+    (
+        "modechange",
+        include_str!("coreutils-mesboot0-modechange.patch"),
+    ),
     // lib/quotearg.c + NEW lib/mbstate_t.h: mes libc has no mbstate_t; supply the
     // glibc-2.32 struct (the patch creates the header).
     ("mbstate", include_str!("coreutils-mesboot0-mbstate.patch")),
     // src/ls.c: strcoll -> strcmp (mes libc has no strcoll).
-    ("ls-strcmp", include_str!("coreutils-mesboot0-ls-strcmp.patch")),
+    (
+        "ls-strcmp",
+        include_str!("coreutils-mesboot0-ls-strcmp.patch"),
+    ),
     // src/touch.c: no bison-generated get_date() yet — stub the -d parse to 0.
-    ("touch-getdate", include_str!("coreutils-mesboot0-touch-getdate.patch")),
+    (
+        "touch-getdate",
+        include_str!("coreutils-mesboot0-touch-getdate.patch"),
+    ),
     // src/touch.c: add -h/--no-dereference (applied AFTER touch-getdate).
-    ("touch-dereference", include_str!("coreutils-mesboot0-touch-dereference.patch")),
+    (
+        "touch-dereference",
+        include_str!("coreutils-mesboot0-touch-dereference.patch"),
+    ),
     // lib/tempname.c: uint64_t -> unsigned long long (tcc 0.9.26 lacks uint64_t).
-    ("tac-uint64", include_str!("coreutils-mesboot0-tac-uint64.patch")),
+    (
+        "tac-uint64",
+        include_str!("coreutils-mesboot0-tac-uint64.patch"),
+    ),
     // src/expr.c: strcoll -> strcmp.
-    ("expr-strcmp", include_str!("coreutils-mesboot0-expr-strcmp.patch")),
+    (
+        "expr-strcmp",
+        include_str!("coreutils-mesboot0-expr-strcmp.patch"),
+    ),
     // lib/memcoll.c strcoll -> strcmp + src/sort.c: hoist hard_LC_COLLATE decl
     // out of the compiled-out HAVE_SETLOCALE block.
-    ("sort-locale", include_str!("coreutils-mesboot0-sort-locale.patch")),
+    (
+        "sort-locale",
+        include_str!("coreutils-mesboot0-sort-locale.patch"),
+    ),
     // src/uniq.c: fopen_safer (don't let fopen return stdin/stdout).
-    ("uniq-fopen", include_str!("coreutils-mesboot0-uniq-fopen.patch")),
+    (
+        "uniq-fopen",
+        include_str!("coreutils-mesboot0-uniq-fopen.patch"),
+    ),
 ];
 
 // The three lib/*_.h templates live-bootstrap copies to their include names
@@ -83,13 +107,11 @@ const COPIED_HEADERS: &[(&str, &str)] = &[
 // time). Asserting the whole set, not a slice, is the strong provenance claim.
 const ALL_BINS: &[&str] = &[
     // The 54 single-obj COREUTILS (built by the static pattern rule), in .mk order.
-    "basename", "cat", "chmod", "cksum", "csplit", "cut", "dirname", "echo",
-    "expand", "expr", "factor", "false", "fmt", "fold", "head", "hostname", "id",
-    "join", "kill", "link", "ln", "logname", "mkfifo", "mkdir", "mknod", "nl",
-    "od", "paste", "pathchk", "pr", "printf", "ptx", "pwd", "readlink", "rmdir",
-    "seq", "sleep", "sort", "split", "sum", "tail", "tee", "tr", "tsort",
-    "unexpand", "uniq", "unlink", "wc", "whoami", "tac", "test", "touch", "true",
-    "yes",
+    "basename", "cat", "chmod", "cksum", "csplit", "cut", "dirname", "echo", "expand", "expr",
+    "factor", "false", "fmt", "fold", "head", "hostname", "id", "join", "kill", "link", "ln",
+    "logname", "mkfifo", "mkdir", "mknod", "nl", "od", "paste", "pathchk", "pr", "printf", "ptx",
+    "pwd", "readlink", "rmdir", "seq", "sleep", "sort", "split", "sum", "tail", "tee", "tr",
+    "tsort", "unexpand", "uniq", "unlink", "wc", "whoami", "tac", "test", "touch", "true", "yes",
     // The seven multi-obj binaries (their own explicit .mk rules).
     "cp", "ls", "install", "md5sum", "mv", "rm", "sha1sum",
 ];
@@ -246,7 +268,10 @@ pub fn recipe() -> Recipe {
         content: SMOKE_SHA1.into(),
         exec: false,
     });
-    steps.push(Step::run("{src}", &["{out}/bin/sha1sum", "-c", "smoke.sha1"]));
+    steps.push(Step::run(
+        "{src}",
+        &["{out}/bin/sha1sum", "-c", "smoke.sha1"],
+    ));
 
     Recipe::mesboot("coreutils-mesboot0", "5.0")
         .source_input("coreutils-mesboot0-source")

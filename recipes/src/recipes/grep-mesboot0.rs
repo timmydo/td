@@ -134,7 +134,10 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     steps.push(Step::run("{src}", &["{out}/bin/grep", "ap", "fruit.txt"]));
-    steps.push(Step::run("{src}", &["{out}/bin/grep", "-v", "ap", "fruit.txt"]));
+    steps.push(Step::run(
+        "{src}",
+        &["{out}/bin/grep", "-v", "ap", "fruit.txt"],
+    ));
     steps.push(Step::run(
         "{src}",
         &["{out}/bin/grep", "-E", "a(pp|pr)", "fruit.txt"],
@@ -143,14 +146,20 @@ pub fn recipe() -> Recipe {
         "{src}",
         &["{out}/bin/grep", "-E", "-v", "a(pp|pr)", "fruit.txt"],
     ));
-    steps.push(Step::run("{src}", &["{out}/bin/grep", "-F", ".*", "fruit.txt"]));
+    steps.push(Step::run(
+        "{src}",
+        &["{out}/bin/grep", "-F", ".*", "fruit.txt"],
+    ));
     steps.push(Step::run(
         "{src}",
         &["{out}/bin/grep", "-F", "-v", ".*", "fruit.txt"],
     ));
     steps.push(Step::run("{src}", &["{out}/bin/grep", "--version"]));
     steps.push(Step::run("{src}", &["{out}/bin/egrep", "ap", "fruit.txt"]));
-    steps.push(Step::run("{src}", &["{out}/bin/fgrep", "apple", "fruit.txt"]));
+    steps.push(Step::run(
+        "{src}",
+        &["{out}/bin/fgrep", "apple", "fruit.txt"],
+    ));
 
     Recipe::mesboot("grep-mesboot0", "2.4")
         .source_input("grep-mesboot0-source")

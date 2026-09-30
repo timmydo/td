@@ -29,10 +29,8 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use td_ui::client::{
-    run, App, Client, ClipboardEvent, Handled, KeyboardEvent, DISPLAY, SURFACE,
-};
 use td_ui::client::Tag;
+use td_ui::client::{run, App, Client, ClipboardEvent, Handled, KeyboardEvent, DISPLAY, SURFACE};
 use td_ui::wire::{Builder, Cursor, Message};
 
 type Result<T> = std::result::Result<T, String>;
@@ -253,8 +251,16 @@ impl<'a, F: Fn(Notice) -> Result<()>> Dialog<'a, F> {
     fn configure(&mut self, size: Option<(i32, i32)>, serial: u32) -> Result<()> {
         if let Some((width, height)) = size {
             let (current_w, current_h) = self.size;
-            let width = if width <= 0 { current_w } else { width as usize };
-            let height = if height <= 0 { current_h } else { height as usize };
+            let width = if width <= 0 {
+                current_w
+            } else {
+                width as usize
+            };
+            let height = if height <= 0 {
+                current_h
+            } else {
+                height as usize
+            };
             if (width, height) != self.size {
                 self.chooser.set_viewport(width, height)?;
                 self.size = (width, height);
@@ -737,7 +743,10 @@ mod tests {
         assert_eq!(key_action(19, 0, 0), Some(Action::Insert('r')));
         assert_eq!(key_action(19, MOD_SHIFT, 0), Some(Action::Insert('R')));
         assert_eq!(key_action(19, MOD_CAPS, 0), Some(Action::Insert('R')));
-        assert_eq!(key_action(19, MOD_SHIFT | MOD_CAPS, 0), Some(Action::Insert('r')));
+        assert_eq!(
+            key_action(19, MOD_SHIFT | MOD_CAPS, 0),
+            Some(Action::Insert('r'))
+        );
         // Alt, Super and a non-zero layout group are refused entirely.
         assert_eq!(key_action(19, MOD_ALT, 0), None);
         assert_eq!(key_action(28, MOD_LOGO, 0), None);
@@ -863,8 +872,12 @@ mod tests {
     fn a_stalled_handshake_trips_the_progress_deadline() {
         let temp = Temp::new("stall");
         let notice = |_: Notice| Ok(());
-        let mut dialog =
-            Dialog::new(config(&temp, "report"), UnixStream::pair().unwrap().0, &notice).unwrap();
+        let mut dialog = Dialog::new(
+            config(&temp, "report"),
+            UnixStream::pair().unwrap().0,
+            &notice,
+        )
+        .unwrap();
         // The first turn arms the handshake deadline at t=0; twenty seconds on,
         // with no frame presented, the worker fails closed instead of hanging.
         dialog.maintain(0).unwrap();
@@ -878,8 +891,12 @@ mod tests {
         let empty = Dialog::new(config(&temp, ""), UnixStream::pair().unwrap().0, &notice).unwrap();
         assert_eq!(empty.window_title, "firefox — Open file");
         let maximum = "a".repeat(file_chooser::MAX_RENDERED_TITLE_BYTES - "firefox — ".len());
-        let dialog =
-            Dialog::new(config(&temp, &maximum), UnixStream::pair().unwrap().0, &notice).unwrap();
+        let dialog = Dialog::new(
+            config(&temp, &maximum),
+            UnixStream::pair().unwrap().0,
+            &notice,
+        )
+        .unwrap();
         assert!(dialog.window_title.starts_with("firefox — "));
         assert!(dialog.window_title.len() <= file_chooser::MAX_RENDERED_TITLE_BYTES);
     }
@@ -919,8 +936,6 @@ mod tests {
         }
         assert!(!connector.load(Ordering::Acquire));
         let deadline = Instant::now().checked_add(Duration::from_secs(1)).unwrap();
-        assert!(
-            bounded_connect(connector, deadline, || Ok(UnixStream::pair().unwrap().0)).is_ok()
-        );
+        assert!(bounded_connect(connector, deadline, || Ok(UnixStream::pair().unwrap().0)).is_ok());
     }
 }

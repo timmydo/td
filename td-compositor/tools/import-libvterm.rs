@@ -2643,7 +2643,10 @@ mod tests {
         let mut counts = Counts::default();
         convert_file(&file, &mut ids, &mut native, &mut counts).unwrap();
         assert_eq!(native.len(), 1);
-        assert_eq!(native.first().unwrap().id, "libvterm/15state-mode/dec-origin-mode");
+        assert_eq!(
+            native.first().unwrap().id,
+            "libvterm/15state-mode/dec-origin-mode"
+        );
         assert_eq!(
             counts.excluded_cases.get(
                 "insert, newline, query, and horizontal-margin modes are outside the first profile"

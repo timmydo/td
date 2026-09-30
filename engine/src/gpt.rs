@@ -293,7 +293,13 @@ pub fn build(layout: &Layout) -> Result<Image, String> {
         .checked_sub(entry_sectors)
         .ok_or_else(|| "gpt: backup entry array does not fit".to_string())?;
     let primary_header = encode_header(
-        layout, 1, last_lba, 2, first_usable, last_usable, entries_crc,
+        layout,
+        1,
+        last_lba,
+        2,
+        first_usable,
+        last_usable,
+        entries_crc,
     )?;
     let backup_header = encode_header(
         layout,
@@ -348,9 +354,9 @@ fn protective_mbr(layout: &Layout) -> Result<Vec<u8>, String> {
     write_at(&mut mbr, 446, &[0x00])?; // not bootable
     write_at(&mut mbr, 447, &[0x00, 0x02, 0x00])?; // starting CHS of LBA 1
     write_at(&mut mbr, 450, &[0xee])?; // GPT protective
-    // Ending CHS: unrepresentable for any modern disk, and firmware reads the
-    // LBA fields, so the spec's "not possible" value is what every partitioner
-    // writes here.
+                                       // Ending CHS: unrepresentable for any modern disk, and firmware reads the
+                                       // LBA fields, so the spec's "not possible" value is what every partitioner
+                                       // writes here.
     write_at(&mut mbr, 451, &[0xff, 0xff, 0xff])?;
     write_at(&mut mbr, 454, &1u32.to_le_bytes())?;
     write_at(&mut mbr, 458, &size_in_lba.to_le_bytes())?;
@@ -530,7 +536,8 @@ fn encode_header(
 /// anything recovers from the backup.
 pub fn parse(primary: &[u8], backup: &[u8], sector_size: u64) -> Result<Table, String> {
     check_sector_size(sector_size)?;
-    let ss = usize::try_from(sector_size).map_err(|_| "gpt: sector size exceeds usize".to_string())?;
+    let ss =
+        usize::try_from(sector_size).map_err(|_| "gpt: sector size exceeds usize".to_string())?;
     let mbr = read_at(primary, 0, 512)?;
     if read_at(mbr, 510, 2)? != [0x55, 0xaa] {
         return Err("gpt: no 0x55AA signature in the protective MBR".into());
@@ -722,7 +729,9 @@ fn parse_header(sector: &[u8], sector_size: u64) -> Result<Header, String> {
     write_at(&mut copy, 16, &0u32.to_le_bytes())?;
     let got = crc32(&copy);
     if got != want {
-        return Err(format!("gpt: header CRC is {got:08x}, header says {want:08x}"));
+        return Err(format!(
+            "gpt: header CRC is {got:08x}, header says {want:08x}"
+        ));
     }
     let entry_size = u32_at(sector, 84)?;
     if entry_size != ENTRY_SIZE {
@@ -1192,7 +1201,10 @@ mod tests {
             .collect();
         let img = build(&l).unwrap();
         assert_eq!(
-            parse(&img.primary, &img.backup, 512).unwrap().partitions.len(),
+            parse(&img.primary, &img.backup, 512)
+                .unwrap()
+                .partitions
+                .len(),
             128
         );
         l.partitions.push(Partition {
@@ -1213,7 +1225,10 @@ mod tests {
         let mut l = layout();
         l.partitions.clear();
         let img = build(&l).unwrap();
-        assert!(parse(&img.primary, &img.backup, 512).unwrap().partitions.is_empty());
+        assert!(parse(&img.primary, &img.backup, 512)
+            .unwrap()
+            .partitions
+            .is_empty());
     }
 
     /// Recompute a header's two CRCs so a MUTATED table is as checksum-clean as
@@ -1358,7 +1373,12 @@ mod tests {
         let img = build(&l).unwrap();
         for (at, value) in [(454u64, 2u32), (458, 4096)] {
             let mut broken = img.primary.clone();
-            write_at(&mut broken, usize::try_from(at).unwrap(), &value.to_le_bytes()).unwrap();
+            write_at(
+                &mut broken,
+                usize::try_from(at).unwrap(),
+                &value.to_le_bytes(),
+            )
+            .unwrap();
             let err = parse(&broken, &img.backup, 512).unwrap_err();
             assert!(err.contains("protective MBR record"), "{err}");
         }

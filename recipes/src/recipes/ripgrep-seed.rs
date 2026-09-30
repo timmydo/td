@@ -15,10 +15,9 @@ pub fn recipe() -> Recipe {
                 exec: false,
             }]);
     };
-    let Ok(launcher) = LauncherDeclaration::new(
-        "Ripgrep",
-        &["ripgrep", "rg", "search", "text", "files"],
-    ) else {
+    let Ok(launcher) =
+        LauncherDeclaration::new("Ripgrep", &["ripgrep", "rg", "search", "text", "files"])
+    else {
         return Recipe::mesboot("ripgrep-seed", "15.2.0")
             .source_input("ripgrep-seed-source")
             .steps(vec![Step::Require {

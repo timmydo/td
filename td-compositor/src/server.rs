@@ -7,16 +7,16 @@ use crate::output::{Output, OutputDimensions};
 use crate::pointer::{PointerEvent, PointerSnapshot, RoutedPointerFrame};
 use crate::positioner::{Anchor, Gravity, Positioner, Rect as PositionerRect};
 use crate::runtime::{
-    ApplicationCursorEvidence, ApplicationEvidence, MAX_APPLICATION_PIXEL_SCAN,
-    MIN_APPLICATION_CONTENT_PIXELS, DataSourceIdentity, ForeignImportIdentity, KeyboardDelivery,
-    KeyboardSubscriptionStop, PopupRegistration, PopupRegistrations, PortalDialogNotice,
-    PortalManagerIdentity, Runtime, SelectionSource, SelectionUpdate, SubscriptionStop,
-    ToplevelParentError,
+    ApplicationCursorEvidence, ApplicationEvidence, DataSourceIdentity, ForeignImportIdentity,
+    KeyboardDelivery, KeyboardSubscriptionStop, PopupRegistration, PopupRegistrations,
+    PortalDialogNotice, PortalManagerIdentity, Runtime, SelectionSource, SelectionUpdate,
+    SubscriptionStop, ToplevelParentError, MAX_APPLICATION_PIXEL_SCAN,
+    MIN_APPLICATION_CONTENT_PIXELS,
 };
 use crate::scene::{
-    CursorRequest, InputRegion, PopupPlacement, SharedInputRegion, SurfaceKey,
-    WindowGeometry, MAX_CURSOR_DIMENSION, MAX_INPUT_REGION_OPERATIONS, MAX_SUBSURFACE_DEPTH,
-    SHM_ARGB8888, SHM_XRGB8888,
+    CursorRequest, InputRegion, PopupPlacement, SharedInputRegion, SurfaceKey, WindowGeometry,
+    MAX_CURSOR_DIMENSION, MAX_INPUT_REGION_OPERATIONS, MAX_SUBSURFACE_DEPTH, SHM_ARGB8888,
+    SHM_XRGB8888,
 };
 #[cfg(test)]
 use crate::scene::{GAP, TITLE_HEIGHT};
@@ -26,9 +26,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{Read, Write};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, RawFd};
 #[cfg(test)]
 use std::os::fd::IntoRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -223,8 +223,7 @@ const PUBLIC_GLOBALS: [(u32, &str, u32); 10] = [
     (GLOBAL_XDG_IMPORTER, "zxdg_importer_v2", XDG_FOREIGN_VERSION),
     (GLOBAL_SEAT, "wl_seat", SEAT_VERSION),
 ];
-const PORTAL_MANAGER_GLOBAL: (u32, &str, u32) =
-    (GLOBAL_PORTAL_MANAGER, "td_portal_manager_v1", 1);
+const PORTAL_MANAGER_GLOBAL: (u32, &str, u32) = (GLOBAL_PORTAL_MANAGER, "td_portal_manager_v1", 1);
 const MAX_FOREIGN_HANDLE_BYTES: usize = 128;
 const DND_ACTION_MASK: u32 = 1 | 2 | 4;
 
@@ -233,7 +232,9 @@ static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 fn allocate_client_id(next: &AtomicU64) -> Result<u64, String> {
     let mut value = next.load(Ordering::Relaxed);
     loop {
-        let successor = value.checked_add(1).ok_or("Wayland client identity exhausted")?;
+        let successor = value
+            .checked_add(1)
+            .ok_or("Wayland client identity exhausted")?;
         match next.compare_exchange_weak(value, successor, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(value) => return Ok(value),
             Err(current) => value = current,
@@ -443,9 +444,7 @@ impl DataObjectState {
         }
     }
 
-    fn lock(
-        &self,
-    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, DataObjects>> {
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, DataObjects>> {
         self.objects.lock()
     }
 
@@ -1059,7 +1058,10 @@ fn configure_worker(
             let mut runtime = runtime
                 .lock()
                 .map_err(|_| "runtime lock poisoned".to_string())?;
-            (runtime.layout_snapshot(), runtime.take_presented_callbacks(client))
+            (
+                runtime.layout_snapshot(),
+                runtime.take_presented_callbacks(client),
+            )
         };
         let configurations = configurations
             .lock()
@@ -1581,8 +1583,7 @@ fn data_selection_messages(
                 .then_some(*id)
         })
         .collect();
-    if update.source.is_some()
-        && data.offers.len().saturating_add(targets.len()) > MAX_DATA_OFFERS
+    if update.source.is_some() && data.offers.len().saturating_add(targets.len()) > MAX_DATA_OFFERS
     {
         return Err(format!(
             "selection would exceed the {MAX_DATA_OFFERS}-offer client limit"
@@ -1667,19 +1668,14 @@ fn send_data_selection(
     Ok(())
 }
 
-fn invalidate_data_selection(
-    data: &SharedDataObjects,
-    revision: u64,
-) -> Result<(), String> {
+fn invalidate_data_selection(data: &SharedDataObjects, revision: u64) -> Result<(), String> {
     let mut data = data
         .lock()
         .map_err(|_| "data-object registration lock poisoned".to_string())?;
     let devices: Vec<u32> = data
         .devices
         .iter()
-        .filter_map(|(id, registration)| {
-            (revision > registration.after_revision).then_some(*id)
-        })
+        .filter_map(|(id, registration)| (revision > registration.after_revision).then_some(*id))
         .collect();
     for device in devices {
         let old_offer = {
@@ -1709,8 +1705,12 @@ fn data_source_is_live(data: &DataObjects, source: DataSourceIdentity) -> bool {
 pub(crate) struct TransferEndpoint(std::fs::File);
 
 impl TransferEndpoint {
-    pub(crate) fn from_file(file: std::fs::File) -> Self { Self(file) }
-    pub(crate) fn into_file(self) -> std::fs::File { self.0 }
+    pub(crate) fn from_file(file: std::fs::File) -> Self {
+        Self(file)
+    }
+    pub(crate) fn into_file(self) -> std::fs::File {
+        self.0
+    }
 
     fn adopt(fd: RawFd) -> Result<TransferEndpoint, String> {
         sys::ReceivedFd::adopt(fd).map(|fd| TransferEndpoint(sys::ReceivedFd::into_file(fd)))
@@ -2066,11 +2066,7 @@ struct ShmUsage {
     bytes: usize,
 }
 
-fn retain_shm_reference(
-    pools: &mut BTreeMap<usize, usize>,
-    file: &Arc<File>,
-    size: usize,
-) {
+fn retain_shm_reference(pools: &mut BTreeMap<usize, usize>, file: &Arc<File>, size: usize) {
     let identity = Arc::as_ptr(file) as usize;
     pools
         .entry(identity)
@@ -2114,16 +2110,10 @@ fn object_retains_shm(object: &Object) -> bool {
     match object {
         Object::Pool(_) | Object::Buffer(_) => true,
         Object::Surface(surface) => {
-            matches!(
-                &surface.pending_buffer,
-                Some(PendingBuffer::Buffer { .. })
-            )
+            matches!(&surface.pending_buffer, Some(PendingBuffer::Buffer { .. }))
         }
         Object::Subsurface { cached, .. } => {
-            matches!(
-                &cached.pending_buffer,
-                Some(PendingBuffer::Buffer { .. })
-            )
+            matches!(&cached.pending_buffer, Some(PendingBuffer::Buffer { .. }))
         }
         _ => false,
     }
@@ -2823,11 +2813,11 @@ impl Client {
         self.objects
             .values()
             .filter_map(|object| match object {
-                Object::DataSource { mime_types, .. } => Some(
-                    mime_types
-                        .iter()
-                        .fold(0usize, |total, mime_type| total.saturating_add(mime_type.len())),
-                ),
+                Object::DataSource { mime_types, .. } => {
+                    Some(mime_types.iter().fold(0usize, |total, mime_type| {
+                        total.saturating_add(mime_type.len())
+                    }))
+                }
                 _ => None,
             })
             .fold(0usize, usize::saturating_add)
@@ -2835,7 +2825,9 @@ impl Client {
 
     fn offer_data_source(&mut self, id: u32, mime_type: String) -> Result<(), String> {
         if mime_type.is_empty() || mime_type.contains('\0') {
-            return Err(format!("wl_data_source {id} offered an invalid empty MIME type"));
+            return Err(format!(
+                "wl_data_source {id} offered an invalid empty MIME type"
+            ));
         }
         if mime_type.len() > MAX_MIME_TYPE_BYTES {
             return Err(format!(
@@ -3062,20 +3054,10 @@ impl Client {
         if let Some(source) = change.local_cancel {
             send_data_source_cancelled(&self.data_objects, &self.outbound, source)?;
         }
-        send_data_selection(
-            &self.data_objects,
-            &self.outbound,
-            &change.update,
-            None,
-        )
+        send_data_selection(&self.data_objects, &self.outbound, &change.update, None)
     }
 
-    fn start_cancelled_drag(
-        &mut self,
-        source: u32,
-        origin: u32,
-        icon: u32,
-    ) -> Result<(), String> {
+    fn start_cancelled_drag(&mut self, source: u32, origin: u32, icon: u32) -> Result<(), String> {
         if !matches!(self.objects.get(&origin), Some(Object::Surface(_))) {
             return Err(format!("drag origin {origin} is no wl_surface"));
         }
@@ -3170,7 +3152,10 @@ impl Client {
                 let mime_type = args.string()?;
                 args.finish()?;
                 let fd = fds.pop_front().ok_or_else(|| {
-                    format!("wl_data_offer {} receive lacked a descriptor", message.object)
+                    format!(
+                        "wl_data_offer {} receive lacked a descriptor",
+                        message.object
+                    )
                 })?;
                 let file = TransferEndpoint::adopt(fd)?;
                 if !offer.valid {
@@ -3182,8 +3167,7 @@ impl Client {
                         &format!("wl_data_offer {} lacks {mime_type}", message.object),
                     );
                 }
-                self
-                    .runtime
+                self.runtime
                     .lock()
                     .map_err(|_| "runtime lock poisoned".to_string())?
                     .send_selection_data(self.id, offer.source, mime_type, file)?;
@@ -3209,7 +3193,10 @@ impl Client {
                 args.finish()?;
                 self.fail_protocol(
                     WL_DATA_OFFER_ERROR_INVALID_FINISH,
-                    &format!("selection offer {} cannot be finished as a drag", message.object),
+                    &format!(
+                        "selection offer {} cannot be finished as a drag",
+                        message.object
+                    ),
                 )
             }
             4 if offer.version >= 3 => {
@@ -3701,12 +3688,7 @@ impl Client {
             .portal_managers
             .lock()
             .map_err(|_| "portal-manager registration lock poisoned".to_string())?;
-        if managers
-            .managers
-            .get(&identity.object)
-            .copied()
-            != Some(identity)
-        {
+        if managers.managers.get(&identity.object).copied() != Some(identity) {
             return Err(format!(
                 "portal-manager object {} lost generation {}",
                 identity.object, identity.generation
@@ -3757,12 +3739,7 @@ impl Client {
         let mut managers = portal_managers
             .lock()
             .map_err(|_| "portal-manager registration lock poisoned".to_string())?;
-        if managers
-            .managers
-            .get(&manager.object)
-            .copied()
-            != Some(manager)
-        {
+        if managers.managers.get(&manager.object).copied() != Some(manager) {
             return Err(format!(
                 "portal-manager object {} lost generation {}",
                 manager.object, manager.generation
@@ -3814,12 +3791,7 @@ impl Client {
         let mut managers = portal_managers
             .lock()
             .map_err(|_| "portal-manager registration lock poisoned".to_string())?;
-        if managers
-            .managers
-            .get(&manager.object)
-            .copied()
-            != Some(manager)
-        {
+        if managers.managers.get(&manager.object).copied() != Some(manager) {
             return Err(format!(
                 "portal-manager object {} lost generation {}",
                 manager.object, manager.generation
@@ -5755,10 +5727,8 @@ impl Client {
                         charge: Arc::clone(&pool.charge),
                         size,
                     });
-                    let usage = self.retained_shm_usage_replacing(
-                        Some(message.object),
-                        Some(&replacement),
-                    )?;
+                    let usage = self
+                        .retained_shm_usage_replacing(Some(message.object), Some(&replacement))?;
                     require_shm_usage(usage)?;
                     pool.charge.store(size, Ordering::Relaxed);
                     self.objects.insert(message.object, replacement);
@@ -7196,9 +7166,7 @@ fn serve_client_with_access(
             }
         },
         Err(poisoned) => {
-            poisoned
-                .into_inner()
-                .unregister_client_resources(id);
+            poisoned.into_inner().unregister_client_resources(id);
             return Err("runtime lock poisoned".to_string());
         }
     };
@@ -7439,9 +7407,9 @@ fn announce(out: &mut impl Write, path: &Path) -> Result<(), String> {
 fn valid_expected_app_id(app_id: &str) -> bool {
     !app_id.is_empty()
         && app_id.len() <= 128
-        && app_id.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-        })
+        && app_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn parse_content_rgb(text: &str) -> Result<[u8; 3], String> {
@@ -7450,8 +7418,9 @@ fn parse_content_rgb(text: &str) -> Result<[u8; 3], String> {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err("expected application content RGB must be six lowercase hexadecimal digits"
-            .to_string());
+        return Err(
+            "expected application content RGB must be six lowercase hexadecimal digits".to_string(),
+        );
     }
     let red = text
         .get(0..2)
@@ -7506,9 +7475,11 @@ fn application_evidence_line(
     if !valid_application_generation(generation) {
         return Err("application evidence contains an invalid compositor generation".to_string());
     }
-    if !evidence.content_pixels.iter().all(|count| {
-        (MIN_APPLICATION_CONTENT_PIXELS..=MAX_APPLICATION_PIXEL_SCAN).contains(count)
-    }) {
+    if !evidence
+        .content_pixels
+        .iter()
+        .all(|count| (MIN_APPLICATION_CONTENT_PIXELS..=MAX_APPLICATION_PIXEL_SCAN).contains(count))
+    {
         return Err("application evidence content-pixel count is outside its bound".to_string());
     }
     let [content_rgb_a, content_rgb_b] = evidence.content_rgbs;
@@ -7598,9 +7569,10 @@ fn parse_application_evidence(
         parse_evidence_usize(&mut fields, "content-pixels-a=")?,
         parse_evidence_usize(&mut fields, "content-pixels-b=")?,
     ];
-    if !content_pixels.iter().all(|count| {
-        (MIN_APPLICATION_CONTENT_PIXELS..=MAX_APPLICATION_PIXEL_SCAN).contains(count)
-    }) {
+    if !content_pixels
+        .iter()
+        .all(|count| (MIN_APPLICATION_CONTENT_PIXELS..=MAX_APPLICATION_PIXEL_SCAN).contains(count))
+    {
         return Err("application evidence content-pixel count is outside its bound".to_string());
     }
     let resources = ClientResourceSnapshot {
@@ -7751,7 +7723,8 @@ pub fn watch_application(
             };
             if evidence.app_id != app_id || evidence.content_rgbs != content_rgbs {
                 eprintln!(
-                    "td-compositor: application readiness identity changed before publication");
+                    "td-compositor: application readiness identity changed before publication"
+                );
                 std::process::exit(1);
             }
             let answer = match application_evidence_line(&evidence, &generation) {
@@ -7832,9 +7805,7 @@ fn require_portal_peer(uid: u32) -> Result<(), String> {
     if uid == PORTAL_UID {
         Ok(())
     } else {
-        Err(format!(
-            "reject peer uid {uid}, expected {PORTAL_UID}"
-        ))
+        Err(format!("reject peer uid {uid}, expected {PORTAL_UID}"))
     }
 }
 
@@ -8203,8 +8174,14 @@ mod tests {
             events.into_inner(),
             ["bind-private", "bind-public", "start-private", "announce"]
         );
-        assert_eq!(fs::metadata(&public).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(fs::metadata(&private).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&public).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _public_peer = UnixStream::connect(&public).unwrap();
         let _private_peer = UnixStream::connect(&private).unwrap();
         drop(public_listener);
@@ -8333,11 +8310,12 @@ mod tests {
     fn application_probe_connect_and_read_share_absolute_deadlines() {
         let (connected, _peer) = UnixStream::pair().unwrap();
         let deadline = Instant::now() + Duration::from_millis(20);
-        let error = connect_application_with("stalled test socket".to_string(), deadline, move || {
-            thread::sleep(Duration::from_millis(60));
-            Ok(connected)
-        })
-        .expect_err("stalled connect escaped deadline");
+        let error =
+            connect_application_with("stalled test socket".to_string(), deadline, move || {
+                thread::sleep(Duration::from_millis(60));
+                Ok(connected)
+            })
+            .expect_err("stalled connect escaped deadline");
         assert!(error.contains("deadline"), "{error}");
 
         let (mut reader, mut writer) = UnixStream::pair().unwrap();
@@ -9521,7 +9499,10 @@ mod tests {
         let _outbound = Outbound::for_test(server);
         // The kernel keeps the timeout in jiffies, so it reads back rounded.
         let slice = inspection.write_timeout().unwrap().unwrap();
-        assert!(slice >= CLIENT_WRITE_SLICE && slice < CLIENT_WRITE_SLICE * 2, "{slice:?}");
+        assert!(
+            slice >= CLIENT_WRITE_SLICE && slice < CLIENT_WRITE_SLICE * 2,
+            "{slice:?}"
+        );
         assert_eq!(inspection.read_timeout().unwrap(), None);
         let public = WriteDeadline::for_access(ClientAccess::Public);
         let portal = WriteDeadline::for_access(ClientAccess::Portal);
@@ -9536,14 +9517,18 @@ mod tests {
         let (deadline, readings) = stepped_deadline(Duration::from_secs(3600));
         let mut outbound = Outbound::new(server, deadline).unwrap();
         let error = outbound.send(&vec![0u8; 8 * 1024 * 1024]).unwrap_err();
-        assert!(error.contains("write Wayland event: client left the event stalled for 3600000ms"), "{error}");
+        assert!(
+            error.contains("write Wayland event: client left the event stalled for 3600000ms"),
+            "{error}"
+        );
         assert!(outbound.disconnected);
         // One reading starts the stall and the next is past the budget.
         assert_eq!(readings.load(Ordering::SeqCst), 2);
         assert!(outbound.send(b"must-not-follow-a-partial-frame").is_ok());
         // The socket was shut, which is what wakes the dispatch reader: the
         // peer drains the partial prefix and then reads end-of-stream.
-        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut drained = Vec::new();
         peer.read_to_end(&mut drained).unwrap();
         assert!(drained.len() < 8 * 1024 * 1024);
@@ -9568,7 +9553,9 @@ mod tests {
         let mut outbound = Outbound::new(server, deadline).unwrap();
         // Well inside the socket's buffer, so no call can block: every
         // chunk is taken whole and none may be mistaken for a stall.
-        let message: Vec<u8> = (0..3 * CLIENT_WRITE_CHUNK + 5).map(|index| index as u8).collect();
+        let message: Vec<u8> = (0..3 * CLIENT_WRITE_CHUNK + 5)
+            .map(|index| index as u8)
+            .collect();
         outbound.send(&message).unwrap();
         assert_eq!(readings.load(Ordering::SeqCst), 0);
         let mut received = vec![0u8; message.len()];
@@ -9643,8 +9630,12 @@ mod tests {
         fs::remove_dir(directory).unwrap();
         let (deadline, readings) = stepped_deadline(Duration::from_secs(3600));
         let mut outbound = Outbound::new(server, deadline).unwrap();
-        let message: Vec<u8> = (0..3 * CLIENT_WRITE_CHUNK + 5).map(|index| index as u8).collect();
-        outbound.send_with_fd(&message, keymap.file.as_raw_fd()).unwrap();
+        let message: Vec<u8> = (0..3 * CLIENT_WRITE_CHUNK + 5)
+            .map(|index| index as u8)
+            .collect();
+        outbound
+            .send_with_fd(&message, keymap.file.as_raw_fd())
+            .unwrap();
         outbound.send(b"next").unwrap();
         let mut received = Vec::new();
         let mut fds = Vec::new();
@@ -9682,11 +9673,16 @@ mod tests {
         assert_eq!(readings.load(Ordering::SeqCst), 2);
         // Everything the peer can read is the filler, then end-of-stream:
         // no byte of the event and no descriptor ever left.
-        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut incoming = [0u8; 64 * 1024];
         loop {
             let received = sys::recv_with_fds(&peer, &mut incoming).unwrap();
-            assert!(received.fds.is_empty(), "a descriptor left: {:?}", received.fds);
+            assert!(
+                received.fds.is_empty(),
+                "a descriptor left: {:?}",
+                received.fds
+            );
             if received.count == 0 {
                 break;
             }
@@ -11283,8 +11279,7 @@ mod tests {
             TEST_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
-        let framebuffer =
-            Framebuffer::test_file(&framebuffer_path, 800, 600, 800 * 4).unwrap();
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 800, 600, 800 * 4).unwrap();
         let mut observed_runtime = Runtime::new(framebuffer);
         let (wake, ready) = std::sync::mpsc::sync_channel(1);
         observed_runtime
@@ -11329,7 +11324,10 @@ mod tests {
         client
             .dispatch(request(10, 2, title).unwrap(), &mut VecDeque::new())
             .unwrap();
-        assert_eq!(runtime.lock().unwrap().title(key), Some("TD-TERM".to_string()));
+        assert_eq!(
+            runtime.lock().unwrap().title(key),
+            Some("TD-TERM".to_string())
+        );
 
         // The title follows the toplevel, so a second one replaces it.
         let mut renamed = wire::Builder::new();
@@ -11716,20 +11714,14 @@ mod tests {
         let mut public =
             Client::new(88, public_server, Arc::clone(&runtime), test_keymap()).unwrap();
         assert!(public
-            .bind_global(
-                GLOBAL_PORTAL_MANAGER,
-                "td_portal_manager_v1",
-                1,
-                20,
-            )
+            .bind_global(GLOBAL_PORTAL_MANAGER, "td_portal_manager_v1", 1, 20,)
             .is_err());
 
         let (portal_server, mut portal_peer) = UnixStream::pair().unwrap();
         portal_peer
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let mut portal =
-            Client::new_portal(89, portal_server, runtime, test_keymap()).unwrap();
+        let mut portal = Client::new_portal(89, portal_server, runtime, test_keymap()).unwrap();
         portal.advertise_globals(2).unwrap();
         let globals = receive_messages(&mut portal_peer, PRIVATE_GLOBAL_COUNT);
         let manager = globals.last().unwrap();
@@ -11739,12 +11731,7 @@ mod tests {
         assert_eq!(payload.u32().unwrap(), 1);
         payload.finish().unwrap();
         portal
-            .bind_global(
-                GLOBAL_PORTAL_MANAGER,
-                "td_portal_manager_v1",
-                1,
-                20,
-            )
+            .bind_global(GLOBAL_PORTAL_MANAGER, "td_portal_manager_v1", 1, 20)
             .unwrap();
         assert!(matches!(
             portal.objects.get(&20),
@@ -11771,7 +11758,14 @@ mod tests {
             let timeout = Duration::from_millis(25);
             let prepared =
                 prepare_client_stream(stream, access, timeout, SocketPolicy::HumanSession);
-            assert_eq!(prepared.is_ok(), uid == if access == ClientAccess::Public { 1000 } else { PORTAL_UID });
+            assert_eq!(
+                prepared.is_ok(),
+                uid == if access == ClientAccess::Public {
+                    1000
+                } else {
+                    PORTAL_UID
+                }
+            );
             let expected = if uid == PORTAL_UID && access == ClientAccess::Portal {
                 Some(timeout)
             } else {
@@ -11932,7 +11926,10 @@ mod tests {
         assert_eq!(payload.u32().unwrap(), 5);
         assert_eq!(payload.u32().unwrap(), PORTAL_DIALOG_STANDALONE);
         payload.finish().unwrap();
-        assert_eq!(runtime.lock().unwrap().effective_toplevel_parent(dialog), None);
+        assert_eq!(
+            runtime.lock().unwrap().effective_toplevel_parent(dialog),
+            None
+        );
 
         runtime
             .lock()
@@ -11962,7 +11959,10 @@ mod tests {
         assert_eq!(payload.u32().unwrap(), 5);
         assert_eq!(payload.u32().unwrap(), PORTAL_DIALOG_DISMISSED);
         payload.finish().unwrap();
-        assert_eq!(runtime.lock().unwrap().effective_toplevel_parent(dialog), None);
+        assert_eq!(
+            runtime.lock().unwrap().effective_toplevel_parent(dialog),
+            None
+        );
 
         let mut get = wire::Builder::new();
         get.u32(5);
@@ -12162,20 +12162,9 @@ mod tests {
         importer_peer
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let mut owner = Client::new(
-            1,
-            owner_stream,
-            Arc::clone(&runtime),
-            test_keymap(),
-        )
-        .unwrap();
-        let mut importer = Client::new(
-            2,
-            importer_stream,
-            Arc::clone(&runtime),
-            test_keymap(),
-        )
-        .unwrap();
+        let mut owner = Client::new(1, owner_stream, Arc::clone(&runtime), test_keymap()).unwrap();
+        let mut importer =
+            Client::new(2, importer_stream, Arc::clone(&runtime), test_keymap()).unwrap();
         install_foreign_toplevel(&mut owner, 5, 6, 7, 8);
         install_foreign_toplevel(&mut importer, 5, 6, 7, 8);
         {
@@ -12233,7 +12222,10 @@ mod tests {
             .unwrap();
         let handles = receive_messages(&mut owner_peer, 1);
         let handle_event = handles.first().unwrap();
-        assert_eq!((handle_event.object, handle_event.opcode), (21, XDG_EXPORTED_HANDLE));
+        assert_eq!(
+            (handle_event.object, handle_event.opcode),
+            (21, XDG_EXPORTED_HANDLE)
+        );
         let mut payload = wire::Cursor::new(&handle_event.payload);
         let handle = payload.string().unwrap();
         payload.finish().unwrap();
@@ -12252,10 +12244,13 @@ mod tests {
             .dispatch(request(21, 1, parent).unwrap(), &mut VecDeque::new())
             .unwrap();
         assert_eq!(
-            runtime.lock().unwrap().effective_toplevel_parent(SurfaceKey {
-                client: 2,
-                object: 5,
-            }),
+            runtime
+                .lock()
+                .unwrap()
+                .effective_toplevel_parent(SurfaceKey {
+                    client: 2,
+                    object: 5,
+                }),
             Some(SurfaceKey {
                 client: 1,
                 object: 5,
@@ -12299,10 +12294,7 @@ mod tests {
             for (object, color) in [(5, [1, 2, 3, 0]), (12, [4, 5, 6, 0])] {
                 runtime
                     .commit(
-                        SurfaceKey {
-                            client: 88,
-                            object,
-                        },
+                        SurfaceKey { client: 88, object },
                         Surface::from_shm_pixels(1, 1, color.to_vec(), SHM_XRGB8888).unwrap(),
                     )
                     .unwrap();
@@ -12315,10 +12307,13 @@ mod tests {
             .dispatch(request(10, 1, set_parent).unwrap(), &mut VecDeque::new())
             .unwrap();
         assert_eq!(
-            runtime.lock().unwrap().effective_toplevel_parent(SurfaceKey {
-                client: 88,
-                object: 5,
-            }),
+            runtime
+                .lock()
+                .unwrap()
+                .effective_toplevel_parent(SurfaceKey {
+                    client: 88,
+                    object: 5,
+                }),
             Some(SurfaceKey {
                 client: 88,
                 object: 12,
@@ -12331,10 +12326,13 @@ mod tests {
             .dispatch(request(10, 1, unset).unwrap(), &mut VecDeque::new())
             .unwrap();
         assert_eq!(
-            runtime.lock().unwrap().effective_toplevel_parent(SurfaceKey {
-                client: 88,
-                object: 5,
-            }),
+            runtime
+                .lock()
+                .unwrap()
+                .effective_toplevel_parent(SurfaceKey {
+                    client: 88,
+                    object: 5,
+                }),
             None
         );
 
@@ -12350,7 +12348,10 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("parent"));
         assert_eq!(client.protocol_error_object, Some(14));
-        assert_eq!(client.protocol_error_code, XDG_TOPLEVEL_ERROR_INVALID_PARENT);
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_TOPLEVEL_ERROR_INVALID_PARENT
+        );
         let _ = fs::remove_file(&framebuffer_path);
     }
 
@@ -12380,10 +12381,7 @@ mod tests {
         let mut stale_parent = wire::Builder::new();
         stale_parent.u32(999);
         client
-            .dispatch(
-                request(22, 1, stale_parent).unwrap(),
-                &mut VecDeque::new(),
-            )
+            .dispatch(request(22, 1, stale_parent).unwrap(), &mut VecDeque::new())
             .unwrap();
         let _ = fs::remove_file(&framebuffer_path);
     }
@@ -12404,7 +12402,10 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("non-toplevel"));
         assert_eq!(client.protocol_error_object, Some(20));
-        assert_eq!(client.protocol_error_code, XDG_FOREIGN_ERROR_INVALID_SURFACE);
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_FOREIGN_ERROR_INVALID_SURFACE
+        );
 
         client.protocol_error_object = None;
         client.insert(22, Object::XdgImporter).unwrap();
@@ -12432,7 +12433,10 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("non-toplevel"));
         assert_eq!(client.protocol_error_object, Some(23));
-        assert_eq!(client.protocol_error_code, XDG_FOREIGN_ERROR_INVALID_SURFACE);
+        assert_eq!(
+            client.protocol_error_code,
+            XDG_FOREIGN_ERROR_INVALID_SURFACE
+        );
         let _ = fs::remove_file(&framebuffer_path);
     }
 
@@ -12523,7 +12527,10 @@ mod tests {
         if expect_initial_selection {
             let initial = receive_messages(peer, 1);
             let event = initial.first().unwrap();
-            assert_eq!((event.object, event.opcode), (device, WL_DATA_DEVICE_SELECTION));
+            assert_eq!(
+                (event.object, event.opcode),
+                (device, WL_DATA_DEVICE_SELECTION)
+            );
             let mut payload = wire::Cursor::new(&event.payload);
             assert_eq!(payload.u32().unwrap(), 0);
             payload.finish().unwrap();
@@ -12717,11 +12724,7 @@ mod tests {
         replace_selection.u32(14);
         replace_selection.u32(88);
         send(&mut destination_peer, 12, 1, replace_selection);
-        advertised_selection(
-            &receive_messages(&mut destination_peer, 3),
-            12,
-            "text/html",
-        );
+        advertised_selection(&receive_messages(&mut destination_peer, 3), 12, "text/html");
         let cancelled = receive_messages(&mut source_peer, 1);
         let cancelled = cancelled.first().unwrap();
         assert_eq!(
@@ -12776,12 +12779,7 @@ mod tests {
         let pointer_active = Arc::new(AtomicBool::new(false));
         let data_active = Arc::new(AtomicBool::new(true));
         let subscription = runtime
-            .subscribe_seat_with_activity(
-                2,
-                keyboard_active,
-                pointer_active,
-                data_active,
-            )
+            .subscribe_seat_with_activity(2, keyboard_active, pointer_active, data_active)
             .unwrap();
         let (receiver, stop) = subscription.split();
         let after_revision = runtime.keyboard_snapshot().revision;
@@ -12869,20 +12867,16 @@ mod tests {
         runtime.clear_client_selection(1).unwrap();
         let cleared = receive_messages(&mut peer, 1);
         assert_eq!(
-            (cleared.first().unwrap().object, cleared.first().unwrap().opcode),
+            (
+                cleared.first().unwrap().object,
+                cleared.first().unwrap().opcode
+            ),
             (12, WL_DATA_DEVICE_SELECTION)
         );
         let mut payload = wire::Cursor::new(&cleared.first().unwrap().payload);
         assert_eq!(payload.u32().unwrap(), 0);
         payload.finish().unwrap();
-        assert!(!data
-            .lock()
-            .unwrap()
-            .offers
-            .values()
-            .next()
-            .unwrap()
-            .valid);
+        assert!(!data.lock().unwrap().offers.values().next().unwrap().valid);
 
         stop.stop();
         worker.join().unwrap().unwrap();
@@ -12975,14 +12969,19 @@ mod tests {
         client.start_cancelled_drag(8, 20, 0).unwrap();
         let cancelled = receive_messages(&mut peer, 1);
         assert_eq!(
-            (cancelled.first().unwrap().object, cancelled.first().unwrap().opcode),
+            (
+                cancelled.first().unwrap().object,
+                cancelled.first().unwrap().opcode
+            ),
             (8, WL_DATA_SOURCE_CANCELLED)
         );
         assert!(client.start_cancelled_drag(8, 20, 0).is_err());
         assert_eq!(client.protocol_error_code, WL_DATA_DEVICE_ERROR_USED_SOURCE);
 
         client.create_data_source(9, 3).unwrap();
-        client.offer_data_source(9, "text/plain".to_string()).unwrap();
+        client
+            .offer_data_source(9, "text/plain".to_string())
+            .unwrap();
         client.set_data_device_selection(9).unwrap();
         advertised_selection(&receive_messages(&mut peer, 3), 7, "text/plain");
         client
@@ -12999,7 +12998,10 @@ mod tests {
         client.set_data_source_actions(10, 1).unwrap();
         assert!(client.set_data_device_selection(10).is_err());
         assert_eq!(client.protocol_error_object, Some(10));
-        assert_eq!(client.protocol_error_code, WL_DATA_SOURCE_ERROR_INVALID_SOURCE);
+        assert_eq!(
+            client.protocol_error_code,
+            WL_DATA_SOURCE_ERROR_INVALID_SOURCE
+        );
 
         client.create_data_source(11, 3).unwrap();
         assert!(client.set_data_source_actions(11, 8).is_err());
@@ -13011,7 +13013,10 @@ mod tests {
         client.create_data_source(12, 3).unwrap();
         assert!(client.start_cancelled_drag(12, 20, 0).is_err());
         assert_eq!(client.protocol_error_object, Some(12));
-        assert_eq!(client.protocol_error_code, WL_DATA_SOURCE_ERROR_INVALID_SOURCE);
+        assert_eq!(
+            client.protocol_error_code,
+            WL_DATA_SOURCE_ERROR_INVALID_SOURCE
+        );
 
         client.create_data_source(13, 2).unwrap();
         client.start_cancelled_drag(13, 20, 0).unwrap();
@@ -13044,12 +13049,13 @@ mod tests {
         assert!(!client.data_device_active.load(Ordering::Acquire));
         let released = receive_messages(&mut peer, 1);
         assert_eq!(
-            (released.first().unwrap().object, released.first().unwrap().opcode),
+            (
+                released.first().unwrap().object,
+                released.first().unwrap().opcode
+            ),
             (1, 1)
         );
-        assert!(client
-            .insert(WL_SERVER_ID_START, Object::Callback)
-            .is_err());
+        assert!(client.insert(WL_SERVER_ID_START, Object::Callback).is_err());
 
         fs::remove_file(framebuffer_path).unwrap();
     }
@@ -13073,7 +13079,10 @@ mod tests {
         client.set_data_device_selection(8).unwrap();
         let cancelled = receive_messages(&mut peer, 1);
         assert_eq!(
-            (cancelled.first().unwrap().object, cancelled.first().unwrap().opcode),
+            (
+                cancelled.first().unwrap().object,
+                cancelled.first().unwrap().opcode
+            ),
             (8, WL_DATA_SOURCE_CANCELLED)
         );
         assert!(client.set_data_device_selection(8).is_err());
@@ -13123,7 +13132,14 @@ mod tests {
         assert!(fds.is_empty());
         assert_eq!(observer.read(&mut [0u8; 1]).unwrap(), 0);
 
-        client.data_objects.lock().unwrap().offers.get_mut(&offer).unwrap().valid = false;
+        client
+            .data_objects
+            .lock()
+            .unwrap()
+            .offers
+            .get_mut(&offer)
+            .unwrap()
+            .valid = false;
         let (endpoint, mut observer) = UnixStream::pair().unwrap();
         observer
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -13161,7 +13177,10 @@ mod tests {
         client.destroy_data_source(8, stale).unwrap();
         let deleted = receive_messages(&mut peer, 1);
         assert_eq!(
-            (deleted.first().unwrap().object, deleted.first().unwrap().opcode),
+            (
+                deleted.first().unwrap().object,
+                deleted.first().unwrap().opcode
+            ),
             (1, 1)
         );
         client.create_data_source(8, 3).unwrap();
@@ -13191,7 +13210,10 @@ mod tests {
 
         let messages = receive_messages(&mut peer, 1);
         assert_eq!(
-            (messages.first().unwrap().object, messages.first().unwrap().opcode),
+            (
+                messages.first().unwrap().object,
+                messages.first().unwrap().opcode
+            ),
             (live.object, WL_DATA_SOURCE_CANCELLED)
         );
         assert_eq!(observer.read(&mut [0u8; 1]).unwrap(), 0);
@@ -13256,10 +13278,7 @@ mod tests {
         let mut first = None;
         for index in 0..MAX_DATA_SOURCE_MIME_TYPES {
             let prefix = format!("application/x-td-{index:02};");
-            let mime_type = format!(
-                "{prefix}{}",
-                "x".repeat(MAX_MIME_TYPE_BYTES - prefix.len())
-            );
+            let mime_type = format!("{prefix}{}", "x".repeat(MAX_MIME_TYPE_BYTES - prefix.len()));
             assert_eq!(mime_type.len(), MAX_MIME_TYPE_BYTES);
             client.offer_data_source(8, mime_type.clone()).unwrap();
             if first.is_none() {
@@ -13267,14 +13286,20 @@ mod tests {
             }
         }
         client.offer_data_source(8, first.unwrap()).unwrap();
-        assert_eq!(client.retained_data_mime_bytes(), MAX_DATA_SOURCE_MIME_BYTES);
+        assert_eq!(
+            client.retained_data_mime_bytes(),
+            MAX_DATA_SOURCE_MIME_BYTES
+        );
         assert!(client
             .offer_data_source(8, "application/x-one-too-many".to_string())
             .is_err());
 
         client.create_data_source(9, 3).unwrap();
         assert!(client.offer_data_source(9, "x".to_string()).is_err());
-        assert_eq!(client.retained_data_mime_bytes(), MAX_DATA_SOURCE_MIME_BYTES);
+        assert_eq!(
+            client.retained_data_mime_bytes(),
+            MAX_DATA_SOURCE_MIME_BYTES
+        );
 
         fs::remove_file(framebuffer_path).unwrap();
     }
@@ -13336,7 +13361,8 @@ mod tests {
     }
 
     fn subsurface_fixture_mode(
-        label: &str, headless: bool,
+        label: &str,
+        headless: bool,
     ) -> (Client, UnixStream, Arc<Mutex<Runtime>>, PathBuf, PathBuf) {
         let stem = format!(
             "td-subsurface-{label}-{}-{}",
@@ -13433,45 +13459,94 @@ mod tests {
         assert!(observe().contains("commit=0 "));
         get_subsurface(&mut client, 30, 6, 5).unwrap();
         attach_surface(&mut client, 6, 40).unwrap();
-        client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap();
-        assert!(observe().contains("commit=0 "), "cached child was published early");
-        client.dispatch(request(5, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(
+            observe().contains("commit=0 "),
+            "cached child was published early"
+        );
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
         assert!(observe().contains("commit=1 "));
         assert!(observe().ends_with("current=yes\n"));
         attach_surface(&mut client, 6, 41).unwrap();
-        client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
         assert!(observe().contains("commit=1 "));
-        client.dispatch(request(30, 5, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap();
-        assert!(observe().contains("commit=2 "), "desync publication was missed");
+        client
+            .dispatch(
+                request(30, 5, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(
+            observe().contains("commit=2 "),
+            "desync publication was missed"
+        );
         runtime.lock().unwrap().capture_public_ppm().unwrap();
-        assert!(observe().contains("commit=2 "), "compositor paint counted as client commit");
+        assert!(
+            observe().contains("commit=2 "),
+            "compositor paint counted as client commit"
+        );
         let Some(Object::Surface(retired)) = client.objects.get_mut(&7) else {
             panic!("missing fixture surface");
         };
         retired.role = Some(SurfaceRole::XdgRetired);
         attach_surface(&mut client, 7, 42).unwrap();
-        assert!(client.dispatch(request(7, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).is_err(), "retired XDG surface accepted a commit");
+        assert!(
+            client
+                .dispatch(
+                    request(7, 6, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new()
+                )
+                .is_err(),
+            "retired XDG surface accepted a commit"
+        );
         runtime.lock().unwrap().capture_public_ppm().unwrap();
-        assert!(observe().contains("commit=2 "), "rejected operation got a number");
+        assert!(
+            observe().contains("commit=2 "),
+            "rejected operation got a number"
+        );
         assert!(observe().ends_with("current=no\n"));
         // Production disconnects after the error; direct dispatch can recover
         // here to exercise the independent failed-settlement branch as well.
         attach_surface(&mut client, 6, 40).unwrap();
-        client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
         assert!(observe().contains("commit=3 "));
         attach_surface(&mut client, 6, 42).unwrap();
         runtime.lock().unwrap().fail_next_repaint();
-        assert!(client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).is_err());
-        assert!(observe().contains("commit=3 "), "failed transaction got a number");
+        assert!(client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new()
+            )
+            .is_err());
+        assert!(
+            observe().contains("commit=3 "),
+            "failed transaction got a number"
+        );
         runtime.lock().unwrap().capture_public_ppm().unwrap();
-        assert!(observe().ends_with("current=no\n"), "paint hid a failed transaction");
+        assert!(
+            observe().ends_with("current=no\n"),
+            "paint hid a failed transaction"
+        );
         runtime.lock().unwrap().remove_client(88).unwrap();
         assert!(runtime.lock().unwrap().observe_client(7, 1).is_err());
         let _ = fs::remove_file(framebuffer_path);
@@ -13701,10 +13776,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             client.objects.get(&31),
-            Some(Object::Subsurface {
-                surface: None,
-                ..
-            })
+            Some(Object::Subsurface { surface: None, .. })
         ));
         client
             .dispatch(
@@ -13769,41 +13841,84 @@ mod tests {
     fn unroled_contents_replace_detach_and_gain_subsurface_visibility() {
         let (mut client, mut peer, runtime, framebuffer_path, pool_path) =
             subsurface_fixture("unroled-content");
-        let key = SurfaceKey { client: 88, object: 6 };
+        let key = SurfaceKey {
+            client: 88,
+            object: 6,
+        };
         for (buffer, color) in [(40, [0x21, 0x43, 0x65, 0]), (41, [0x76, 0x54, 0x32, 0])] {
             attach_surface(&mut client, 6, buffer).unwrap();
             let mut frame = wire::Builder::new();
             frame.u32(50);
-            client.dispatch(request(6, 3, frame).unwrap(), &mut VecDeque::new()).unwrap();
-            client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
-                &mut VecDeque::new()).unwrap();
+            client
+                .dispatch(request(6, 3, frame).unwrap(), &mut VecDeque::new())
+                .unwrap();
+            client
+                .dispatch(
+                    request(6, 6, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
             let replies = receive_messages(&mut peer, 3);
-            assert_eq!(replies.iter().map(|reply| (reply.object, reply.opcode)).collect::<Vec<_>>(),
-                [(buffer, WL_BUFFER_RELEASE), (50, WL_CALLBACK_DONE), (1, 1)]);
+            assert_eq!(
+                replies
+                    .iter()
+                    .map(|reply| (reply.object, reply.opcode))
+                    .collect::<Vec<_>>(),
+                [(buffer, WL_BUFFER_RELEASE), (50, WL_CALLBACK_DONE), (1, 1)]
+            );
             assert_eq!(client.mapped_total.host_bytes(), 4);
             assert_eq!(runtime.lock().unwrap().surface_size(key), None);
             assert!(!runtime.lock().unwrap().layout_snapshot().contains_key(&key));
-            assert!(!fs::read(&framebuffer_path).unwrap().as_chunks::<4>().0.contains(&color));
+            assert!(!fs::read(&framebuffer_path)
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .contains(&color));
         }
         get_subsurface(&mut client, 30, 6, 5).unwrap();
         assert_eq!(client.mapped_total.host_bytes(), 4);
-        assert!(!fs::read(&framebuffer_path).unwrap().as_chunks::<4>().0
+        assert!(!fs::read(&framebuffer_path)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
             .contains(&[0x76, 0x54, 0x32, 0]));
-        client.dispatch(request(5, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap();
-        assert!(fs::read(&framebuffer_path).unwrap().as_chunks::<4>().0
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(fs::read(&framebuffer_path)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
             .contains(&[0x76, 0x54, 0x32, 0]));
-        client.dispatch(request(6, 0, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap();
+        client
+            .dispatch(
+                request(6, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
         assert_eq!(client.mapped_total.host_bytes(), 0);
         for buffer in [40, 0, 41] {
             attach_surface(&mut client, 7, buffer).unwrap();
-            client.dispatch(request(7, 6, wire::Builder::new()).unwrap(),
-                &mut VecDeque::new()).unwrap();
-            assert_eq!(client.mapped_total.host_bytes(), if buffer == 0 { 0 } else { 4 });
+            client
+                .dispatch(
+                    request(7, 6, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
+            assert_eq!(
+                client.mapped_total.host_bytes(),
+                if buffer == 0 { 0 } else { 4 }
+            );
         }
-        client.dispatch(request(7, 0, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap();
+        client
+            .dispatch(
+                request(7, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
         assert_eq!(client.mapped_total.host_bytes(), 0);
         fs::remove_file(pool_path).unwrap();
         fs::remove_file(framebuffer_path).unwrap();
@@ -13817,28 +13932,43 @@ mod tests {
         attach_surface(&mut client, 6, 40).unwrap();
         for committed in [false, true] {
             if committed {
-                client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
-                    &mut VecDeque::new()).unwrap();
+                client
+                    .dispatch(
+                        request(6, 6, wire::Builder::new()).unwrap(),
+                        &mut VecDeque::new(),
+                    )
+                    .unwrap();
             }
             let mut xdg = wire::Builder::new();
             xdg.u32(30);
             xdg.u32(6);
-            assert!(client.dispatch(request(21, 2, xdg).unwrap(),
-                &mut VecDeque::new()).unwrap_err().contains("attached or committed buffer"));
-            assert_eq!(client.protocol_error_code, XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE);
+            assert!(client
+                .dispatch(request(21, 2, xdg).unwrap(), &mut VecDeque::new())
+                .unwrap_err()
+                .contains("attached or committed buffer"));
+            assert_eq!(
+                client.protocol_error_code,
+                XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE
+            );
             assert_eq!(client.protocol_error_object, Some(21));
             assert!(!client.objects.contains_key(&30));
         }
         // Direct dispatch can recover; production disconnects on either error.
         attach_surface(&mut client, 6, 0).unwrap();
-        client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
         // A pending null attach on this empty core surface carries no buffer.
         attach_surface(&mut client, 6, 0).unwrap();
         let mut xdg = wire::Builder::new();
         xdg.u32(30);
         xdg.u32(6);
-        client.dispatch(request(21, 2, xdg).unwrap(), &mut VecDeque::new()).unwrap();
+        client
+            .dispatch(request(21, 2, xdg).unwrap(), &mut VecDeque::new())
+            .unwrap();
         assert_eq!(client.mapped_total.host_bytes(), 0);
         fs::remove_file(pool_path).unwrap();
         fs::remove_file(framebuffer_path).unwrap();
@@ -13851,8 +13981,12 @@ mod tests {
         fs::write(&pool_path, []).unwrap(); // Any attempted copy would fail.
         client.mapped_total = BufferCharge::shm(MAX_UI_FRAME_BYTES);
         attach_surface(&mut client, 6, 40).unwrap();
-        let error = client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap_err();
+        let error = client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap_err();
         assert!(error.contains("client surfaces need"), "{error}");
         client.mapped_total = BufferCharge::none();
         let Some(Object::Buffer(buffer)) = client.objects.get_mut(&40) else {
@@ -13860,8 +13994,12 @@ mod tests {
         };
         buffer.width = 80 * MAX_SURFACE_OUTPUT_MULTIPLIER + 1;
         attach_surface(&mut client, 6, 40).unwrap();
-        let error = client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap_err();
+        let error = client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap_err();
         assert!(error.contains("scale-1 output bound"), "{error}");
         assert_eq!(client.mapped_total.host_bytes(), 0);
         fs::remove_file(pool_path).unwrap();
@@ -14365,10 +14503,7 @@ mod tests {
 
         let excess_surface = root + u32::try_from(MAX_SUBSURFACE_DEPTH).unwrap() + 1;
         client
-            .insert(
-                excess_surface,
-                Object::Surface(SurfaceState::default()),
-            )
+            .insert(excess_surface, Object::Surface(SurfaceState::default()))
             .unwrap();
         let error = get_subsurface(&mut client, 400, excess_surface, parent).unwrap_err();
         assert!(error.contains("depth"), "{error}");
@@ -15479,9 +15614,7 @@ mod tests {
             };
             pools.push(pool.clone());
             if id < overflow_pool_id {
-                client
-                    .insert(id, Object::Pool(pool))
-                    .unwrap();
+                client.insert(id, Object::Pool(pool)).unwrap();
             }
         }
         assert_eq!(
@@ -15497,15 +15630,7 @@ mod tests {
         let first = pools.first().unwrap().clone();
         let buffer_id = overflow_pool_id.checked_add(1).unwrap();
         client
-            .create_buffer(
-                first,
-                buffer_id,
-                0,
-                1,
-                1,
-                4,
-                SHM_XRGB8888,
-            )
+            .create_buffer(first, buffer_id, 0, 1, 1, 4, SHM_XRGB8888)
             .unwrap();
         client.remove_object(first_pool_id).unwrap();
         assert_eq!(
@@ -15632,7 +15757,9 @@ mod tests {
             .write(true)
             .open(&pool_path)
             .unwrap();
-        pool_file.set_len(u64::try_from(MAX_POOL_BYTES).unwrap()).unwrap();
+        pool_file
+            .set_len(u64::try_from(MAX_POOL_BYTES).unwrap())
+            .unwrap();
         drop(pool_file);
         let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
         let (server, _peer) = UnixStream::pair().unwrap();
@@ -15658,7 +15785,10 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            client.retained_shm_usage_replacing(None, None).unwrap().bytes,
+            client
+                .retained_shm_usage_replacing(None, None)
+                .unwrap()
+                .bytes,
             254 * mib
         );
 
@@ -15883,9 +16013,7 @@ mod tests {
         for _ in 0..MAX_DEFERRED_EVENTS {
             client.send(1, 0, wire::Builder::new()).unwrap();
         }
-        let error = client
-            .send(1, 0, wire::Builder::new())
-            .unwrap_err();
+        let error = client.send(1, 0, wire::Builder::new()).unwrap_err();
         assert!(error.contains("events=2049"), "{error}");
         client.discard_deferred_outbound();
 
@@ -15902,9 +16030,7 @@ mod tests {
             client.deferred_outbound.as_ref().unwrap().bytes,
             MAX_DEFERRED_EVENT_BYTES
         );
-        let error = client
-            .send(1, 0, wire::Builder::new())
-            .unwrap_err();
+        let error = client.send(1, 0, wire::Builder::new()).unwrap_err();
         assert!(error.contains("bytes=262152"), "{error}");
         client.discard_deferred_outbound();
 
@@ -15960,9 +16086,15 @@ mod tests {
             .dispatch(request(5, 3, frame).unwrap(), &mut VecDeque::new())
             .unwrap();
         client
-            .dispatch(request(5, 6, wire::Builder::new()).unwrap(), &mut VecDeque::new())
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
             .unwrap();
-        assert!(drain_messages(&mut peer).is_empty(), "answered before its paint landed");
+        assert!(
+            drain_messages(&mut peer).is_empty(),
+            "answered before its paint landed"
+        );
         assert_eq!(client.pending_frame_callbacks().unwrap(), 1);
         let reused = client.insert(50, Object::Callback).unwrap_err();
         assert!(reused.contains("reused before delete_id"), "{reused}");
@@ -15979,7 +16111,10 @@ mod tests {
         // The worker reports them sent after writing, so a moment later.
         let deadline = Instant::now() + Duration::from_secs(2);
         while client.pending_frame_callbacks().unwrap() != 0 {
-            assert!(Instant::now() < deadline, "the worker never reported them sent");
+            assert!(
+                Instant::now() < deadline,
+                "the worker never reported them sent"
+            );
             thread::sleep(Duration::from_millis(5));
         }
         client.insert(50, Object::Callback).unwrap();
@@ -16060,11 +16195,9 @@ mod tests {
         drop(held);
         let (mut client, destroyed) = result.recv_timeout(Duration::from_secs(2)).unwrap();
         destroyed.unwrap();
-        assert!(
-            callbacks
-                .iter()
-                .all(|callback| !client.objects.contains_key(callback))
-        );
+        assert!(callbacks
+            .iter()
+            .all(|callback| !client.objects.contains_key(callback)));
         assert_eq!(client.pending_frame_callbacks().unwrap(), 0);
         client
             .insert(7, Object::Surface(SurfaceState::default()))
@@ -16096,9 +16229,13 @@ mod tests {
         let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
         let pixels = [0x21u8, 0x43, 0x65, 0];
         fs::write(&pool_path, pixels).unwrap();
-        let framebuffer =
-            Framebuffer::test_file(&framebuffer_path, 8, crate::scene::least_output_height(2), 32)
-                .unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &framebuffer_path,
+            8,
+            crate::scene::least_output_height(2),
+            32,
+        )
+        .unwrap();
         let (server, _peer) = UnixStream::pair().unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let mut client = Client::new(2, server, runtime, test_keymap()).unwrap();
@@ -16257,12 +16394,20 @@ mod tests {
         let mut xdg = wire::Builder::new();
         xdg.u32(8);
         xdg.u32(5);
-        client.dispatch(request(7, 2, xdg).unwrap(), &mut VecDeque::new()).unwrap();
+        client
+            .dispatch(request(7, 2, xdg).unwrap(), &mut VecDeque::new())
+            .unwrap();
         let mut toplevel = wire::Builder::new();
         toplevel.u32(9);
-        client.dispatch(request(8, 1, toplevel).unwrap(), &mut VecDeque::new()).unwrap();
-        client.dispatch(request(5, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap();
+        client
+            .dispatch(request(8, 1, toplevel).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
 
         let mut add = wire::Builder::new();
         for value in [1, 2, 3, 4] {
@@ -16627,16 +16772,26 @@ mod tests {
         };
         client.insert(14, Object::Buffer(first_buffer)).unwrap();
         attach_surface(&mut client, 5, 14).unwrap();
-        client.dispatch(request(5, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap();
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
         let release = receive_messages(&mut peer, 1);
         assert_eq!((release[0].object, release[0].opcode), (14, 0));
-        assert!(matches!(client.objects.get(&5), Some(Object::Surface(state))
-            if state.role.is_none() && state.inactive_contents.is_some()));
+        assert!(
+            matches!(client.objects.get(&5), Some(Object::Surface(state))
+            if state.role.is_none() && state.inactive_contents.is_some())
+        );
         assert_eq!(client.mapped_total.host_bytes(), 4);
-        assert_eq!(runtime.lock().unwrap().surface_size(SurfaceKey {
-            client: 2, object: 5,
-        }), None);
+        assert_eq!(
+            runtime.lock().unwrap().surface_size(SurfaceKey {
+                client: 2,
+                object: 5,
+            }),
+            None
+        );
         assert_eq!(runtime.lock().unwrap().cursor_image(), None);
         runtime
             .lock()
@@ -16670,8 +16825,11 @@ mod tests {
             }))
         ));
         assert_eq!(client.mapped_total.host_bytes(), 0);
-        assert_eq!(runtime.lock().unwrap().cursor_image(), Some((1, 2, 1, 1)),
-            "valid set_cursor adopts the pre-role pixels without another commit");
+        assert_eq!(
+            runtime.lock().unwrap().cursor_image(),
+            Some((1, 2, 1, 1)),
+            "valid set_cursor adopts the pre-role pixels without another commit"
+        );
         client
             .insert(
                 12,
@@ -16779,46 +16937,71 @@ mod tests {
         let wide = MAX_CURSOR_DIMENSION + 1;
         let wide_path = pool_path.with_extension("wide");
         fs::write(&wide_path, vec![1; wide * 4]).unwrap();
-        client.insert(16, Object::Surface(SurfaceState::default())).unwrap();
-        client.insert(17, Object::Buffer(Buffer {
-            serial: 3,
-            file: Arc::new(File::open(&wide_path).unwrap()),
-            pool_charge: Arc::new(AtomicUsize::new(wide * 4)),
-            offset: 0,
-            width: wide,
-            height: 1,
-            stride: wide * 4,
-            format: SHM_XRGB8888,
-        })).unwrap();
+        client
+            .insert(16, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        client
+            .insert(
+                17,
+                Object::Buffer(Buffer {
+                    serial: 3,
+                    file: Arc::new(File::open(&wide_path).unwrap()),
+                    pool_charge: Arc::new(AtomicUsize::new(wide * 4)),
+                    offset: 0,
+                    width: wide,
+                    height: 1,
+                    stride: wide * 4,
+                    format: SHM_XRGB8888,
+                }),
+            )
+            .unwrap();
         attach_surface(&mut client, 16, 17).unwrap();
-        client.dispatch(request(16, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).unwrap();
+        client
+            .dispatch(
+                request(16, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
         let release = receive_messages(&mut peer, 1);
-        assert_eq!((release[0].object, release[0].opcode), (17, WL_BUFFER_RELEASE));
+        assert_eq!(
+            (release[0].object, release[0].opcode),
+            (17, WL_BUFFER_RELEASE)
+        );
         assert_eq!(client.mapped_total.host_bytes(), wide * 4);
         let mut oversized = wire::Builder::new();
         oversized.u32(serial);
         oversized.u32(16);
         oversized.i32(0);
         oversized.i32(0);
-        client.dispatch(request(6, 0, oversized).unwrap(), &mut VecDeque::new()).unwrap();
+        client
+            .dispatch(request(6, 0, oversized).unwrap(), &mut VecDeque::new())
+            .unwrap();
         assert_eq!(client.mapped_total.host_bytes(), 0);
         assert!(!client.mapped_charges.contains_key(&16));
-        let oversized_key = SurfaceKey { client: 2, object: 16 };
+        let oversized_key = SurfaceKey {
+            client: 2,
+            object: 16,
+        };
         assert_eq!(runtime.lock().unwrap().surface_size(oversized_key), None);
         assert_eq!(runtime.lock().unwrap().cursor_image(), None);
-        let error = runtime.lock().unwrap().restore_inactive_subsurface(
-            oversized_key,
-            Surface::from_shm_pixels(1, 1, vec![1; 4], SHM_XRGB8888).unwrap(),
-            None,
-        ).unwrap_err();
+        let error = runtime
+            .lock()
+            .unwrap()
+            .restore_inactive_subsurface(
+                oversized_key,
+                Surface::from_shm_pixels(1, 1, vec![1; 4], SHM_XRGB8888).unwrap(),
+                None,
+            )
+            .unwrap_err();
         assert!(error.contains("no inactive charge reservation"), "{error}");
         let mut restore = wire::Builder::new();
         restore.u32(serial);
         restore.u32(5);
         restore.i32(1);
         restore.i32(2);
-        client.dispatch(request(6, 0, restore).unwrap(), &mut VecDeque::new()).unwrap();
+        client
+            .dispatch(request(6, 0, restore).unwrap(), &mut VecDeque::new())
+            .unwrap();
         assert_eq!(runtime.lock().unwrap().cursor_image(), Some((1, 2, 1, 1)));
         fs::remove_file(wide_path).unwrap();
 
@@ -17619,10 +17802,7 @@ mod tests {
         anchor_rect.i32(0);
         anchor_rect.i32(0);
         client
-            .dispatch(
-                request(30, 2, anchor_rect).unwrap(),
-                &mut VecDeque::new(),
-            )
+            .dispatch(request(30, 2, anchor_rect).unwrap(), &mut VecDeque::new())
             .unwrap();
         for (opcode, value) in [(3, 8), (4, 8), (5, 1 | 2 | 16 | 32)] {
             let mut body = wire::Builder::new();
@@ -17652,9 +17832,7 @@ mod tests {
         runtime
             .lock()
             .unwrap()
-            .command(crate::layout::Command::Move(
-                crate::layout::Direction::Left,
-            ))
+            .command(crate::layout::Command::Move(crate::layout::Direction::Left))
             .unwrap();
         let constraint = runtime
             .lock()

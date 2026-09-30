@@ -167,7 +167,10 @@ fn store_parent(state: &Path) -> Result<File, Failure> {
 }
 
 /// Protect every existing session store even when its application home is broken.
-pub(super) fn isolate_stores(state: &Path, registry: &crate::principals::Registry) -> Result<(), Failure> {
+pub(super) fn isolate_stores(
+    state: &Path,
+    registry: &crate::principals::Registry,
+) -> Result<(), Failure> {
     let parent = store_parent(state)?;
     for session in registry.sessions() {
         if let Err(error) = secret_store::migrate_owner(&parent, session.owner, session.portal) {
@@ -183,7 +186,8 @@ pub(super) fn isolate_stores(state: &Path, registry: &crate::principals::Registr
             continue;
         }
         let name = session.owner.to_string();
-        let held_path = std::path::PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(&name);
+        let held_path =
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(&name);
         match fs::symlink_metadata(held_path) {
             Ok(_) => {
                 if let Err(error) = secret_store::lock_session(session.owner) {
@@ -194,8 +198,13 @@ pub(super) fn isolate_stores(state: &Path, registry: &crate::principals::Registr
                     continue;
                 }
                 if let Err(error) = secret_store::Store::open_owned(
-                    &state.join("secrets").join(name), session.owner, session.portal, true,
-                ).and_then(|store| store.prepare_boot()) {
+                    &state.join("secrets").join(name),
+                    session.owner,
+                    session.portal,
+                    true,
+                )
+                .and_then(|store| store.prepare_boot())
+                {
                     super::emit_err(&format!(
                         "td-firstboot: credentials for uid {} remain unavailable: {error}\n",
                         session.owner,
@@ -203,7 +212,11 @@ pub(super) fn isolate_stores(state: &Path, registry: &crate::principals::Registr
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            Err(e) => return Err(Failure::Failed(format!("inspect session credential store: {e}"))),
+            Err(e) => {
+                return Err(Failure::Failed(format!(
+                    "inspect session credential store: {e}"
+                )))
+            }
         }
     }
     Ok(())
@@ -217,8 +230,13 @@ pub(super) fn provision(
     logical_uid: u32,
 ) -> Result<(), Failure> {
     let _parent = store_parent(state)?;
-    let store = secret_store::Store::open_owned(&state.join("secrets").join(logical_uid.to_string()), logical_uid, file_owner, true)
-        .map_err(Failure::Failed)?;
+    let store = secret_store::Store::open_owned(
+        &state.join("secrets").join(logical_uid.to_string()),
+        logical_uid,
+        file_owner,
+        true,
+    )
+    .map_err(Failure::Failed)?;
     if file_owner == logical_uid {
         store.prepare_boot().map_err(Failure::Failed)?;
     }
@@ -232,7 +250,9 @@ pub(super) fn provision(
     if store.sealed().map_err(Failure::Failed)? {
         if let Some(bytes) = legacy.as_mut() {
             bytes.fill(0);
-            return Err(Failure::Failed("sealed store has an unmigrated plaintext credential".into()));
+            return Err(Failure::Failed(
+                "sealed store has an unmigrated plaintext credential".into(),
+            ));
         }
         migrate_config(config.as_deref(), false)?;
         return Ok(());
@@ -279,7 +299,10 @@ mod tests {
     #[ignore = "requires an explicitly selected disposable root VM without a TPM"]
     fn token_store_boot_stays_locked_and_provisioning_preserves_records() {
         secret_store::require_root().unwrap();
-        assert_eq!(std::env::var("TD_TEST_ROOT_BUSYBOX").unwrap(), "/bin/busybox");
+        assert_eq!(
+            std::env::var("TD_TEST_ROOT_BUSYBOX").unwrap(),
+            "/bin/busybox"
+        );
         assert!(!Path::new("/dev/tpmrm0").exists());
         let root = std::env::temp_dir().join(format!("td-token-boot-{}", std::process::id()));
         fs::create_dir(&root).unwrap();
@@ -287,21 +310,33 @@ mod tests {
         drop(store_parent(&root).unwrap());
         let path = root.join("secrets/1000");
         let store = secret_store::Store::open(&path, 1000, true).unwrap();
-        store.set("mail", "main", b"preserved locked credential").unwrap();
+        store
+            .set("mail", "main", b"preserved locked credential")
+            .unwrap();
         fs::create_dir_all("/run/td-secret").unwrap();
         fs::set_permissions("/run/td-secret", fs::Permissions::from_mode(0o777)).unwrap();
-        let refusal = store.enroll_tokens(
-            crate::fido_metadata::tests::metadata_fixture(1000, true),
-            crate::tpm::Pcrs::parse("7").unwrap(),
-        ).unwrap_err();
-        assert!(refusal.contains("invalid owner, mode, type, or link count"), "{refusal}");
-        assert_eq!(store.get("mail", "main").unwrap().unwrap(), b"preserved locked credential");
+        let refusal = store
+            .enroll_tokens(
+                crate::fido_metadata::tests::metadata_fixture(1000, true),
+                crate::tpm::Pcrs::parse("7").unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            refusal.contains("invalid owner, mode, type, or link count"),
+            "{refusal}"
+        );
+        assert_eq!(
+            store.get("mail", "main").unwrap().unwrap(),
+            b"preserved locked credential"
+        );
         assert!(!path.join("sealed").exists());
         fs::set_permissions("/run/td-secret", fs::Permissions::from_mode(0o755)).unwrap();
         drop(store);
         let record = fs::read(path.join("mail.main")).unwrap();
         // Structural fixture only: this test must never attempt an unseal.
-        let protector = crate::fido_metadata::tests::protection_fixture(1000, true).encode().unwrap();
+        let protector = crate::fido_metadata::tests::protection_fixture(1000, true)
+            .encode()
+            .unwrap();
         let mut bundle = b"TDSEAL02".to_vec();
         bundle.extend_from_slice(&(protector.len() as u32).to_be_bytes());
         bundle.extend_from_slice(&protector);
@@ -310,9 +345,15 @@ mod tests {
             bundle.extend_from_slice(&(field.len() as u32).to_be_bytes());
             bundle.extend_from_slice(field);
         }
-        let human = ApplicationHome { home: root.clone(), uid: 1000, gid: 1000 };
+        let human = ApplicationHome {
+            home: root.clone(),
+            uid: 1000,
+            gid: 1000,
+        };
         write_durably_owned(&path.join("sealed"), &bundle, 0o600, Some(&human)).unwrap();
-        let registry = crate::principals::Registry::parse("td-principals-v1\nsession\t1000\t993\t992\t991\n").unwrap();
+        let registry =
+            crate::principals::Registry::parse("td-principals-v1\nsession\t1000\t993\t992\t991\n")
+                .unwrap();
         for _ in 0..2 {
             isolate_stores(&root, &registry).unwrap();
             assert_eq!(fs::metadata(&path).unwrap().uid(), 991);
@@ -320,14 +361,28 @@ mod tests {
             assert!(!path.join("mail.main").exists());
             assert!(!Path::new("/run/td-secret/1000/key").exists());
             assert_eq!(fs::read(path.join("sealed")).unwrap(), bundle);
-            let service = ApplicationHome { home: root.clone(), uid: 991, gid: 991 };
-            write_durably_owned(Path::new("/run/td-secret/1000/key"), &[42; 64], 0o600, Some(&service)).unwrap();
+            let service = ApplicationHome {
+                home: root.clone(),
+                uid: 991,
+                gid: 991,
+            };
+            write_durably_owned(
+                Path::new("/run/td-secret/1000/key"),
+                &[42; 64],
+                0o600,
+                Some(&service),
+            )
+            .unwrap();
         }
         isolate_stores(&root, &registry).unwrap();
         assert!(!Path::new("/run/td-secret/1000/key").exists());
         let config_path = root.join("mail-config");
         fs::create_dir(&config_path).unwrap();
-        let app = ApplicationHome { home: root.clone(), uid: 65537, gid: 65537 };
+        let app = ApplicationHome {
+            home: root.clone(),
+            uid: 65537,
+            gid: 65537,
+        };
         std::os::unix::fs::chown(&config_path, Some(app.uid), Some(app.gid)).unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o700)).unwrap();
         let config = b"[account.main]\nsecret = \"portal\"\n";
@@ -336,14 +391,39 @@ mod tests {
         provision(&root, &app, &directory, 991, 1000).unwrap();
         assert_eq!(fs::read(path.join("sealed")).unwrap(), bundle);
         assert_eq!(fs::read(config_path.join("config.toml")).unwrap(), config);
-        write_durably_owned(&config_path.join("password"), b"legacy plaintext", 0o600, Some(&app)).unwrap();
+        write_durably_owned(
+            &config_path.join("password"),
+            b"legacy plaintext",
+            0o600,
+            Some(&app),
+        )
+        .unwrap();
         assert!(provision(&root, &app, &directory, 991, 1000).is_err());
-        assert_eq!(fs::read(config_path.join("password")).unwrap(), b"legacy plaintext");
+        assert_eq!(
+            fs::read(config_path.join("password")).unwrap(),
+            b"legacy plaintext"
+        );
         assert_eq!(fs::read(path.join("sealed")).unwrap(), bundle);
         assert!(!Path::new("/run/td-secret/1000/key").exists());
-        let service = ApplicationHome { home: root.clone(), uid: 991, gid: 991 };
-        write_durably_owned(&path.join("sealed"), b"corrupt protector", 0o600, Some(&service)).unwrap();
-        write_durably_owned(Path::new("/run/td-secret/1000/key"), &[42; 64], 0o600, Some(&service)).unwrap();
+        let service = ApplicationHome {
+            home: root.clone(),
+            uid: 991,
+            gid: 991,
+        };
+        write_durably_owned(
+            &path.join("sealed"),
+            b"corrupt protector",
+            0o600,
+            Some(&service),
+        )
+        .unwrap();
+        write_durably_owned(
+            Path::new("/run/td-secret/1000/key"),
+            &[42; 64],
+            0o600,
+            Some(&service),
+        )
+        .unwrap();
         isolate_stores(&root, &registry).unwrap();
         assert!(!Path::new("/run/td-secret/1000/key").exists());
         assert_eq!(fs::read(path.join("sealed")).unwrap(), b"corrupt protector");
@@ -360,7 +440,10 @@ mod tests {
     #[ignore = "requires an explicitly selected disposable root VM without a TPM"]
     fn legacy_tpm_boot_never_unseals_and_rejects_a_stale_release() {
         secret_store::require_root().unwrap();
-        assert_eq!(std::env::var("TD_TEST_ROOT_BUSYBOX").unwrap(), "/bin/busybox");
+        assert_eq!(
+            std::env::var("TD_TEST_ROOT_BUSYBOX").unwrap(),
+            "/bin/busybox"
+        );
         assert!(!Path::new("/dev/tpmrm0").exists());
         let root = std::env::temp_dir().join(format!("td-isolated-release-{}", std::process::id()));
         fs::create_dir(&root).unwrap();
@@ -368,7 +451,9 @@ mod tests {
         drop(store_parent(&root).unwrap());
         let path = root.join("secrets/1000");
         let store = secret_store::Store::open(&path, 1000, true).unwrap();
-        store.set("mail", "main", b"recoverable credential").unwrap();
+        store
+            .set("mail", "main", b"recoverable credential")
+            .unwrap();
         drop(store);
         let master = fs::read(path.join("master")).unwrap();
         let record = fs::read(path.join("mail.main")).unwrap();
@@ -381,9 +466,15 @@ mod tests {
             bundle.extend_from_slice(&(field.len() as u32).to_be_bytes());
             bundle.extend_from_slice(field);
         }
-        let owner = ApplicationHome { home: root.clone(), uid: 1000, gid: 1000 };
+        let owner = ApplicationHome {
+            home: root.clone(),
+            uid: 1000,
+            gid: 1000,
+        };
         write_durably_owned(&path.join("sealed"), &bundle, 0o600, Some(&owner)).unwrap();
-        let registry = crate::principals::Registry::parse("td-principals-v1\nsession\t1000\t993\t992\t991\n").unwrap();
+        let registry =
+            crate::principals::Registry::parse("td-principals-v1\nsession\t1000\t993\t992\t991\n")
+                .unwrap();
         // Boot isolation succeeds without any TPM device.
         isolate_stores(&root, &registry).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().uid(), 991);
@@ -393,10 +484,26 @@ mod tests {
         // A stale TPM-only runtime key cannot satisfy application policy.
         let mut released = crate::crypto::digest(&envelope).to_vec();
         released.extend_from_slice(&master);
-        let service = ApplicationHome { home: root.clone(), uid: 991, gid: 991 };
-        write_durably_owned(Path::new("/run/td-secret/1000/key"), &released, 0o600, Some(&service)).unwrap();
-        assert_eq!(store.get("mail", "main").unwrap().unwrap(), b"recoverable credential");
-        assert_eq!(store.application_secret("mail", "main").unwrap_err(), "credential store requires token enrollment");
+        let service = ApplicationHome {
+            home: root.clone(),
+            uid: 991,
+            gid: 991,
+        };
+        write_durably_owned(
+            Path::new("/run/td-secret/1000/key"),
+            &released,
+            0o600,
+            Some(&service),
+        )
+        .unwrap();
+        assert_eq!(
+            store.get("mail", "main").unwrap().unwrap(),
+            b"recoverable credential"
+        );
+        assert_eq!(
+            store.application_secret("mail", "main").unwrap_err(),
+            "credential store requires token enrollment"
+        );
         store.prepare_boot().unwrap();
         assert!(!Path::new("/run/td-secret/1000/key").exists());
         assert_eq!(fs::read(path.join("sealed")).unwrap(), bundle);
@@ -404,9 +511,13 @@ mod tests {
         for published in [false, true] {
             fs::remove_dir_all(&path).unwrap();
             let store = secret_store::Store::open(&path, 1000, true).unwrap();
-            store.set("mail", "main", b"quarantined credential").unwrap();
+            store
+                .set("mail", "main", b"quarantined credential")
+                .unwrap();
             drop(store);
-            if published { isolate_stores(&root, &registry).unwrap(); }
+            if published {
+                isolate_stores(&root, &registry).unwrap();
+            }
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
             fs::write(path.join("notes"), b"unrecognized entry").unwrap();
             isolate_stores(&root, &registry).unwrap();
@@ -416,14 +527,23 @@ mod tests {
             for uid in [1000, 991] {
                 use std::os::unix::process::CommandExt;
                 assert!(!std::process::Command::new("/bin/busybox")
-                    .arg("cat").arg(path.join("master")).uid(uid).gid(uid)
-                    .output().unwrap().status.success());
+                    .arg("cat")
+                    .arg(path.join("master"))
+                    .uid(uid)
+                    .gid(uid)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success());
             }
         }
         fs::remove_dir_all(&path).unwrap();
         std::os::unix::fs::symlink("missing", &path).unwrap();
         isolate_stores(&root, &registry).unwrap();
-        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert!(secret_store::Store::open_owned(&path, 1000, 991, false).is_err());
         fs::remove_dir_all(root).unwrap();
     }

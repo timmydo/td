@@ -551,7 +551,9 @@ fn assign(
         require_char,
     )?;
     prepare_compositor_runtime(
-        &shared_runtime(runtime, "td-guest")?, assignment.seat, require_char,
+        &shared_runtime(runtime, "td-guest")?,
+        assignment.seat,
+        require_char,
     )?;
     prepare_audio_runtime(audio_runtime, assignment.audio, require_char)?;
     assign_path(display.framebuffer, assignment.compositor, require_char)?;
@@ -611,7 +613,10 @@ fn probe(
     )?;
     verify_owner_mode(&compositor_runtime, assignment.compositor, 0o755)?;
     let vm_runtime = shared_runtime(runtime, "td-guest")?;
-    verify_runtime_base(vm_runtime.parent().ok_or("missing VM parent")?, require_char)?;
+    verify_runtime_base(
+        vm_runtime.parent().ok_or("missing VM parent")?,
+        require_char,
+    )?;
     verify_owner_mode(&vm_runtime, assignment.seat, 0o755)?;
     verify_owner_mode(audio_runtime, assignment.audio, 0o755)?;
     checked_metadata(display.framebuffer, require_char)?;
@@ -1139,7 +1144,10 @@ mod tests {
     fn vm_port_assignment_clears_absence_and_refuses_renumber_before_mutation() {
         let scratch = Scratch::new();
         let meta = fs::metadata(&scratch.path).unwrap();
-        let account = Account { uid: meta.uid(), gid: meta.gid() };
+        let account = Account {
+            uid: meta.uid(),
+            gid: meta.gid(),
+        };
         let old = scratch.path.join("vport0p1");
         let new = scratch.path.join("vport0p2");
         fs::write(&old, b"").unwrap();
@@ -1148,11 +1156,16 @@ mod tests {
         assign_vm_port_path(&scratch.path, account, Some(&old), false).unwrap();
         assign_vm_port_path(&scratch.path, account, Some(&old), false).unwrap();
         assert_eq!(fs::metadata(&old).unwrap().mode() & 0o777, 0o600);
-        assert!(assign_vm_port_path(&scratch.path, account, Some(&new), false)
-            .unwrap_err().contains("assignment changed"));
+        assert!(
+            assign_vm_port_path(&scratch.path, account, Some(&new), false)
+                .unwrap_err()
+                .contains("assignment changed")
+        );
         assert_eq!(fs::metadata(&new).unwrap().mode() & 0o777, 0o644);
-        assert_eq!(fs::read(scratch.path.join("vm-port")).unwrap(),
-            old.as_os_str().as_encoded_bytes());
+        assert_eq!(
+            fs::read(scratch.path.join("vm-port")).unwrap(),
+            old.as_os_str().as_encoded_bytes()
+        );
         fs::remove_file(&old).unwrap();
         assign_vm_port_path(&scratch.path, account, None, false).unwrap();
         assert!(!scratch.path.join("vm-port").exists());
@@ -1164,7 +1177,10 @@ mod tests {
     fn optional_vm_failure_clears_authority_but_cleanup_failure_refuses() {
         let scratch = Scratch::new();
         let meta = fs::metadata(&scratch.path).unwrap();
-        let account = Account { uid: meta.uid(), gid: meta.gid() };
+        let account = Account {
+            uid: meta.uid(),
+            gid: meta.gid(),
+        };
         let record = scratch.path.join("vm-port");
         fs::write(&record, b"stale").unwrap();
         optional_vm_assignment(&scratch.path, account, Err("duplicate ports".into())).unwrap();
@@ -1177,7 +1193,10 @@ mod tests {
     fn vm_port_lookup_errors_refuse_before_delegation() {
         let scratch = Scratch::new();
         let meta = fs::metadata(&scratch.path).unwrap();
-        let account = Account { uid: meta.uid(), gid: meta.gid() };
+        let account = Account {
+            uid: meta.uid(),
+            gid: meta.gid(),
+        };
         let runtime = scratch.path.join("not-a-directory");
         let device = scratch.path.join("vport0p1");
         fs::write(&runtime, b"").unwrap();
@@ -1228,7 +1247,10 @@ mod tests {
             },
         };
         let count = assign(
-            Display { framebuffer: &dev.join("fb0"), card: &dev.join("dri/card0") },
+            Display {
+                framebuffer: &dev.join("fb0"),
+                card: &dev.join("dri/card0"),
+            },
             &input,
             &sound,
             &runtime,
@@ -1253,10 +1275,16 @@ mod tests {
         assert_eq!(fs::read(sound.join("controlC0")).unwrap(), b"control");
         verify_owner_mode(&dev.join("dri/card0"), assignment.compositor, 0o600).unwrap();
         // The render node is not the display and stays as it was.
-        assert_eq!(fs::metadata(dev.join("dri/renderD128")).unwrap().mode() & 0o777, 0o644);
+        assert_eq!(
+            fs::metadata(dev.join("dri/renderD128")).unwrap().mode() & 0o777,
+            0o644
+        );
         assert_eq!(
             probe(
-                Display { framebuffer: &dev.join("fb0"), card: &dev.join("dri/card0") },
+                Display {
+                    framebuffer: &dev.join("fb0"),
+                    card: &dev.join("dri/card0")
+                },
                 &input,
                 &sound,
                 &runtime,
@@ -1283,7 +1311,19 @@ mod tests {
         verify_owner_mode(&vm_runtime, assignment.seat, 0o755).unwrap();
         verify_runtime_base(vm_runtime.parent().unwrap(), false).unwrap();
         fs::set_permissions(&vm_runtime, Permissions::from_mode(0o777)).unwrap();
-        assert!(probe(Display { framebuffer: &dev.join("fb0"), card: &dev.join("dri/card0") }, &input, &sound, &runtime, &audio_runtime, assignment, false).is_err());
+        assert!(probe(
+            Display {
+                framebuffer: &dev.join("fb0"),
+                card: &dev.join("dri/card0")
+            },
+            &input,
+            &sound,
+            &runtime,
+            &audio_runtime,
+            assignment,
+            false
+        )
+        .is_err());
         let base = fs::symlink_metadata(run.join("user")).unwrap();
         assert!(base.file_type().is_dir());
         assert_eq!(base.permissions().mode() & 0o7777, 0o755);
@@ -1320,21 +1360,50 @@ mod tests {
             inputs: 1,
             playback: 0,
         };
-        let assigned =
-            assign(Display { framebuffer: &dev.join("fb0"), card: &card }, &input, &sound, &runtime, &audio_runtime, assignment, false);
+        let assigned = assign(
+            Display {
+                framebuffer: &dev.join("fb0"),
+                card: &card,
+            },
+            &input,
+            &sound,
+            &runtime,
+            &audio_runtime,
+            assignment,
+            false,
+        );
         assert_eq!(assigned.unwrap(), expected);
-        let probed =
-            probe(Display { framebuffer: &dev.join("fb0"), card: &card }, &input, &sound, &runtime, &audio_runtime, assignment, false);
+        let probed = probe(
+            Display {
+                framebuffer: &dev.join("fb0"),
+                card: &card,
+            },
+            &input,
+            &sound,
+            &runtime,
+            &audio_runtime,
+            assignment,
+            false,
+        );
         assert_eq!(probed.unwrap(), expected);
         // A card that appears later is not silently taken as assigned.
         fs::create_dir(dev.join("dri")).unwrap();
         fs::write(&card, b"").unwrap();
         fs::set_permissions(&card, Permissions::from_mode(0o644)).unwrap();
-        assert!(
-            probe(Display { framebuffer: &dev.join("fb0"), card: &card }, &input, &sound, &runtime, &audio_runtime, assignment, false)
-                .unwrap_err()
-                .contains("expected 0600")
-        );
+        assert!(probe(
+            Display {
+                framebuffer: &dev.join("fb0"),
+                card: &card
+            },
+            &input,
+            &sound,
+            &runtime,
+            &audio_runtime,
+            assignment,
+            false
+        )
+        .unwrap_err()
+        .contains("expected 0600"));
     }
 
     #[test]
@@ -1368,10 +1437,29 @@ mod tests {
             compositor: account,
             audio: account,
         };
-        let display = Display { framebuffer: &dev.join("fb0"), card: &card };
-        let assigned = assign(display, &input, &sound, &runtime, &audio_runtime, assignment, false);
+        let display = Display {
+            framebuffer: &dev.join("fb0"),
+            card: &card,
+        };
+        let assigned = assign(
+            display,
+            &input,
+            &sound,
+            &runtime,
+            &audio_runtime,
+            assignment,
+            false,
+        );
         assert!(assigned.unwrap_err().contains("refusing symlink"));
-        let probed = probe(display, &input, &sound, &runtime, &audio_runtime, assignment, false);
+        let probed = probe(
+            display,
+            &input,
+            &sound,
+            &runtime,
+            &audio_runtime,
+            assignment,
+            false,
+        );
         assert!(probed.unwrap_err().contains("refusing symlink"));
         assert_eq!(fs::metadata(&target).unwrap().mode() & 0o777, 0o644);
     }

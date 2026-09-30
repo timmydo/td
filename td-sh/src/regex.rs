@@ -119,7 +119,12 @@ pub struct Regex {
 /// string cannot carry that distinction, which is the same reason `case`'s
 /// patterns are `QChar`s.
 pub fn compile(pat: &[QChar]) -> Result<Regex, String> {
-    let mut p = Parser { pat, i: 0, depth: 0, classes: Vec::new() };
+    let mut p = Parser {
+        pat,
+        i: 0,
+        depth: 0,
+        classes: Vec::new(),
+    };
     let node = p.alt()?;
     // A backstop rather than a reachable path: every character is consumable
     // somewhere at the top level, `)` included, so `alt` should always arrive
@@ -132,7 +137,10 @@ pub fn compile(pat: &[QChar]) -> Result<Regex, String> {
     let mut fuel = MAX_EMIT;
     emit(&node, &mut prog, &mut fuel)?;
     prog.push(Inst::Match);
-    Ok(Regex { prog, classes: p.classes })
+    Ok(Regex {
+        prog,
+        classes: p.classes,
+    })
 }
 
 struct Parser<'a> {
@@ -172,7 +180,9 @@ impl Parser<'_> {
             branches.push(self.cat()?);
         }
         if branches.len() == 1 {
-            return branches.pop().ok_or_else(|| "empty alternation".to_string());
+            return branches
+                .pop()
+                .ok_or_else(|| "empty alternation".to_string());
         }
         Ok(Node::Alt(branches))
     }
@@ -214,7 +224,10 @@ impl Parser<'_> {
             // expression to repeat. Measured -- bash answers 2 where this
             // compiled and matched the empty prefix.
             if matches!(node, Node::Start | Node::End | Node::Assert(_))
-                && (self.at_meta('*') || self.at_meta('+') || self.at_meta('?') || self.at_meta('{'))
+                && (self.at_meta('*')
+                    || self.at_meta('+')
+                    || self.at_meta('?')
+                    || self.at_meta('{'))
             {
                 return Err("nothing to repeat before a repetition".to_string());
             }
@@ -236,7 +249,11 @@ impl Parser<'_> {
             if chain > MAX_DEPTH {
                 return Err("too many repetitions in a row".to_string());
             }
-            node = Node::Rep { node: Box::new(node), min, max };
+            node = Node::Rep {
+                node: Box::new(node),
+                min,
+                max,
+            };
         }
         Ok(node)
     }
@@ -688,7 +705,13 @@ mod tests {
     use super::*;
 
     fn q(s: &str) -> Vec<QChar> {
-        s.chars().map(|c| QChar { c, quoted: false, expanded: false }).collect()
+        s.chars()
+            .map(|c| QChar {
+                c,
+                quoted: false,
+                expanded: false,
+            })
+            .collect()
     }
 
     fn m(pat: &str, text: &str) -> bool {
@@ -789,8 +812,13 @@ mod tests {
 
     #[test]
     fn malformed_patterns_are_refused() {
-        for bad in ["a[", "*", "+", "?", "a{", "a{2", "a{3,2}", "(a", "a\\", "{", "{2}"] {
-            assert!(compile(&q(bad)).is_err(), "should have been refused: {bad:?}");
+        for bad in [
+            "a[", "*", "+", "?", "a{", "a{2", "a{3,2}", "(a", "a\\", "{", "{2}",
+        ] {
+            assert!(
+                compile(&q(bad)).is_err(),
+                "should have been refused: {bad:?}"
+            );
         }
         // ...but a stray `)` is a literal, as glibc reads it.
         assert!(!m("a)", "abc"));
@@ -842,7 +870,10 @@ mod tests {
     #[test]
     fn invalid_bracket_expressions_are_refused() {
         for bad in ["[[:bogus:]]", "[^[:bogus:]]", "[z-a]", "[[:Alpha:]]"] {
-            assert!(compile(&q(bad)).is_err(), "should have been refused: {bad:?}");
+            assert!(
+                compile(&q(bad)).is_err(),
+                "should have been refused: {bad:?}"
+            );
         }
         // A single-character range is legal and is not "reversed".
         assert!(compile(&q("[a-a]")).unwrap().is_match("a"));
@@ -853,7 +884,10 @@ mod tests {
     #[test]
     fn a_repeated_anchor_is_refused() {
         for bad in ["^*", "^+", "^?", "$*", "^{2}"] {
-            assert!(compile(&q(bad)).is_err(), "should have been refused: {bad:?}");
+            assert!(
+                compile(&q(bad)).is_err(),
+                "should have been refused: {bad:?}"
+            );
         }
         assert!(compile(&q("^a")).unwrap().is_match("ab"));
         // A PARENTHESISED anchor is a group, and repeating a group is legal --
@@ -875,7 +909,10 @@ mod tests {
         let big: String = std::iter::repeat_n('b', 10_000).collect();
         let re = compile(&q(&format!("[{big}]{{10000}}"))).unwrap();
         assert!(!re.is_match("x"));
-        assert!(compile(&q(&format!("[{big}]{{100000}}"))).is_err(), "budget still bounds it");
+        assert!(
+            compile(&q(&format!("[{big}]{{100000}}"))).is_err(),
+            "budget still bounds it"
+        );
     }
 
     /// glibc's ERE extensions, which bash inherits. Served as ordinary escaped
@@ -903,7 +940,10 @@ mod tests {
     #[test]
     fn the_boundary_assertions_straddle_a_position() {
         assert!(m(r"\bfoo\b", "a foo b"));
-        assert!(m(r"\bfoo\b", "foo"), "both ends of the subject are boundaries");
+        assert!(
+            m(r"\bfoo\b", "foo"),
+            "both ends of the subject are boundaries"
+        );
         assert!(!m(r"\bfoo\b", "afoob"));
         assert!(m(r"\Bbc", "abc"));
         assert!(!m(r"\Bbc", "a bc"));
@@ -969,7 +1009,10 @@ mod tests {
     #[test]
     fn a_backreference_is_refused_rather_than_misread() {
         for bad in [r"(a)\1", r"\1", r"(a)(b)\2"] {
-            assert!(compile(&q(bad)).is_err(), "should have been refused: {bad:?}");
+            assert!(
+                compile(&q(bad)).is_err(),
+                "should have been refused: {bad:?}"
+            );
         }
         // `\0` is not a backreference and stays a literal, as does any other
         // escaped character the roster does not claim.
@@ -985,8 +1028,16 @@ mod tests {
     /// per `emit` CALL instead. bash hangs on the third of these.
     #[test]
     fn a_repetition_of_nothing_cannot_spin_the_compiler() {
-        for bad in ["(){4000000000}", "a{4000000000}", "(){1000}{1000}{1000}", "(){100000}"] {
-            assert!(compile(&q(bad)).is_err(), "should have been refused: {bad:?}");
+        for bad in [
+            "(){4000000000}",
+            "a{4000000000}",
+            "(){1000}{1000}{1000}",
+            "(){100000}",
+        ] {
+            assert!(
+                compile(&q(bad)).is_err(),
+                "should have been refused: {bad:?}"
+            );
         }
     }
 

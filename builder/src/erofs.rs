@@ -108,12 +108,21 @@ enum Body {
     /// A directory: its sorted `(raw-name-bytes, child-index)` entries plus the parent's
     /// index (for the `..` dirent; the root's parent is itself). Names are stored as raw
     /// bytes — erofs and Linux permit any non-NUL byte sequence, not just UTF-8.
-    Dir { children: Vec<(Vec<u8>, usize)>, parent: usize },
-    File { data: Vec<u8> },
-    Symlink { target: Vec<u8> },
+    Dir {
+        children: Vec<(Vec<u8>, usize)>,
+        parent: usize,
+    },
+    File {
+        data: Vec<u8>,
+    },
+    Symlink {
+        target: Vec<u8>,
+    },
     /// FIFO / socket / char / block device — no data blocks; `rdev` is the encoded
     /// device number (0 for FIFO/socket).
-    Special { rdev: u32 },
+    Special {
+        rdev: u32,
+    },
 }
 
 /// One inode of the image, in assignment (nid) order. `nid == index into the node
@@ -192,7 +201,10 @@ fn walk(
 
     let my_idx = nodes.len();
     // Reserve this node's slot with a placeholder; filled in after recursion.
-    nodes.push(Node { mode: 0, body: Body::Special { rdev: 0 } });
+    nodes.push(Node {
+        mode: 0,
+        body: Body::Special { rdev: 0 },
+    });
 
     let (mode, body) = if ft.is_dir() {
         let perm = (meta.mode() & 0o7777) as u16;
@@ -216,7 +228,10 @@ fn walk(
         if target.is_empty() || target.len() > BLOCK_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("symlink target at {} is empty or over one block", path.display()),
+                format!(
+                    "symlink target at {} is empty or over one block",
+                    path.display()
+                ),
             ));
         }
         (S_IFLNK as u16 | 0o777, Body::Symlink { target })
@@ -227,7 +242,10 @@ fn walk(
         if data.len() > u32::MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("file {} exceeds the 4 GiB compact-inode size limit", path.display()),
+                format!(
+                    "file {} exceeds the 4 GiB compact-inode size limit",
+                    path.display()
+                ),
             ));
         }
         let perm = (meta.mode() & 0o7777) as u16;
@@ -237,7 +255,11 @@ fn walk(
         let raw = meta.mode();
         let perm = (raw & 0o7777) as u16;
         let ifmt = raw & S_IFMT;
-        let rdev = if ifmt == S_IFCHR || ifmt == S_IFBLK { new_encode_dev(meta.rdev()) } else { 0 };
+        let rdev = if ifmt == S_IFCHR || ifmt == S_IFBLK {
+            new_encode_dev(meta.rdev())
+        } else {
+            0
+        };
         match ifmt {
             S_IFCHR | S_IFBLK | S_IFIFO | S_IFSOCK => {
                 ((ifmt as u16) | perm, Body::Special { rdev })
@@ -245,7 +267,10 @@ fn walk(
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("{}: unsupported file type for an erofs image", path.display()),
+                    format!(
+                        "{}: unsupported file type for an erofs image",
+                        path.display()
+                    ),
                 ))
             }
         }
@@ -281,9 +306,7 @@ fn build_dir_data(
     for (name, cidx) in children {
         let ft = match nodes.get(*cidx) {
             Some(n) => file_type_of(n.mode),
-            None => {
-                return Err(io::Error::other("internal: dangling child index"))
-            }
+            None => return Err(io::Error::other("internal: dangling child index")),
         };
         entries.push((name.clone(), *cidx as u64, ft));
     }
@@ -318,9 +341,7 @@ fn build_dir_data(
         for j in 0..count {
             let (name, nid, ft) = match entries.get(i + j) {
                 Some(e) => e,
-                None => {
-                    return Err(io::Error::other("internal: dirent index slipped"))
-                }
+                None => return Err(io::Error::other("internal: dirent index slipped")),
             };
             block.extend_from_slice(&nid.to_le_bytes());
             block.extend_from_slice(&nameoff.to_le_bytes());
@@ -371,7 +392,9 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
         // i_size is a 32-bit field in the compact inode. Files are checked at read time;
         // this also covers a directory whose dirent blocks would exceed 4 GiB.
         if d.len() > u32::MAX as usize {
-            return Err(io::Error::other("erofs: inode data exceeds the 32-bit i_size limit"));
+            return Err(io::Error::other(
+                "erofs: inode data exceeds the 32-bit i_size limit",
+            ));
         }
         datas.push(d);
     }
@@ -423,7 +446,9 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
                 let subdirs = children
                     .iter()
                     .filter(|(_, cidx)| {
-                        nodes.get(*cidx).is_some_and(|c| u32::from(c.mode) & S_IFMT == S_IFDIR)
+                        nodes
+                            .get(*cidx)
+                            .is_some_and(|c| u32::from(c.mode) & S_IFMT == S_IFDIR)
                     })
                     .count();
                 2 + subdirs
@@ -665,7 +690,11 @@ mod tests {
     /// into it, nested dirs, an executable, and empty dirs.
     fn make_rootfs(dir: &Path) {
         fs::create_dir_all(dir.join("td/store/abc-busybox/bin")).unwrap();
-        fs::write(dir.join("td/store/abc-busybox/bin/busybox"), vec![0x7f, b'E', b'L', b'F', 42]).unwrap();
+        fs::write(
+            dir.join("td/store/abc-busybox/bin/busybox"),
+            vec![0x7f, b'E', b'L', b'F', 42],
+        )
+        .unwrap();
         set_mode(&dir.join("td/store/abc-busybox/bin/busybox"), 0o755);
         fs::create_dir_all(dir.join("bin")).unwrap();
         symlink("/td/store/abc-busybox/bin/busybox", dir.join("bin/sh")).unwrap();
@@ -686,9 +715,17 @@ mod tests {
         let (root_nid, blocks, meta) = read_super(&img);
         assert_eq!(root_nid, 0, "root nid must be 0");
         assert_eq!(meta, META_BLKADDR);
-        assert_eq!(img.len(), blocks as usize * BLOCK_SIZE, "image length must be blocks*blocksize");
+        assert_eq!(
+            img.len(),
+            blocks as usize * BLOCK_SIZE,
+            "image length must be blocks*blocksize"
+        );
         let root_ino = read_inode(&img, meta, 0);
-        assert_eq!(u32::from(root_ino.mode) & S_IFMT, S_IFDIR, "root must be a directory");
+        assert_eq!(
+            u32::from(root_ino.mode) & S_IFMT,
+            S_IFDIR,
+            "root must be a directory"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -702,9 +739,16 @@ mod tests {
 
         // /bin/sh is a symlink into the store.
         let sh = lookup(&img, &["bin", "sh"]);
-        assert_eq!(u32::from(sh.mode) & S_IFMT, S_IFLNK, "bin/sh is not a symlink");
+        assert_eq!(
+            u32::from(sh.mode) & S_IFMT,
+            S_IFLNK,
+            "bin/sh is not a symlink"
+        );
         let target = read_file(&img, &sh);
-        assert_eq!(target, b"/td/store/abc-busybox/bin/busybox", "wrong symlink target");
+        assert_eq!(
+            target, b"/td/store/abc-busybox/bin/busybox",
+            "wrong symlink target"
+        );
 
         // the packed store binary is a regular file with its exact bytes + 0755.
         let bb = lookup(&img, &["td", "store", "abc-busybox", "bin", "busybox"]);
@@ -739,13 +783,24 @@ mod tests {
         let names: Vec<String> = entries.iter().map(|(n, _, _)| n.clone()).collect();
         let mut sorted = names.clone();
         sorted.sort();
-        assert_eq!(names, sorted, "root dirents not globally sorted (kernel bsearch needs this)");
-        assert_eq!(names.first().map(String::as_str), Some("."), ". should sort first");
+        assert_eq!(
+            names, sorted,
+            "root dirents not globally sorted (kernel bsearch needs this)"
+        );
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("."),
+            ". should sort first"
+        );
         // "." nid points back at the root; ".." at the parent (root itself here).
         let dot = entries.iter().find(|(n, _, _)| n == ".").unwrap();
         let dotdot = entries.iter().find(|(n, _, _)| n == "..").unwrap();
         assert_eq!(dot.1, u64::from(root_nid), ". must reference self");
-        assert_eq!(dotdot.1, u64::from(root_nid), ".. of root must reference root");
+        assert_eq!(
+            dotdot.1,
+            u64::from(root_nid),
+            ".. of root must reference root"
+        );
         // the root's nlink is 2 + subdir count (bin, dev, etc, proc, td = 5).
         assert_eq!(root_ino.nlink, 2 + 5, "root nlink wrong");
         fs::remove_dir_all(&d).unwrap();
@@ -776,7 +831,12 @@ mod tests {
         set_mode(&su, 0o4755);
         let img = build_image(&root).unwrap();
         let ino = lookup(&img, &["bin", "su"]);
-        assert_eq!(u32::from(ino.mode) & 0o4000, 0o4000, "setuid bit dropped (mode {:o})", ino.mode);
+        assert_eq!(
+            u32::from(ino.mode) & 0o4000,
+            0o4000,
+            "setuid bit dropped (mode {:o})",
+            ino.mode
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -792,14 +852,24 @@ mod tests {
         }
         let img = build_image(&root).unwrap();
         let bin = lookup(&img, &["bin"]);
-        assert!(bin.size as usize > BLOCK_SIZE, "big dir should span >1 block");
+        assert!(
+            bin.size as usize > BLOCK_SIZE,
+            "big dir should span >1 block"
+        );
         let entries = read_dir(&img, &bin);
         let names: Vec<String> = entries.iter().map(|(n, _, _)| n.clone()).collect();
         let mut sorted = names.clone();
         sorted.sort();
-        assert_eq!(names, sorted, "multi-block dirents must stay globally sorted");
+        assert_eq!(
+            names, sorted,
+            "multi-block dirents must stay globally sorted"
+        );
         assert!(names.contains(&"cmd0000".to_string()) && names.contains(&"cmd0599".to_string()));
-        assert_eq!(names.len(), 600 + 2, "all entries plus ./.. must be present");
+        assert_eq!(
+            names.len(),
+            600 + 2,
+            "all entries plus ./.. must be present"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -848,7 +918,10 @@ mod tests {
         fs::create_dir_all(root.join("sbin")).unwrap();
         fs::hard_link(&a, root.join("bin/b")).unwrap();
         fs::hard_link(&a, root.join("sbin/c")).unwrap();
-        assert!(fs::metadata(&a).unwrap().nlink() >= 3, "test setup: need >1 link");
+        assert!(
+            fs::metadata(&a).unwrap().nlink() >= 3,
+            "test setup: need >1 link"
+        );
 
         let img = build_image(&root).unwrap();
 
@@ -861,7 +934,11 @@ mod tests {
 
         let ino = lookup(&img, &["bin", "a"]);
         assert_eq!(ino.nlink, 3, "nlink must count the in-image references");
-        assert_eq!(read_file(&img, &ino), b"shared-bytes", "shared data must round-trip");
+        assert_eq!(
+            read_file(&img, &ino),
+            b"shared-bytes",
+            "shared data must round-trip"
+        );
 
         // Determinism holds with hard links present.
         let b = d.join("r2");
@@ -870,7 +947,11 @@ mod tests {
         fs::write(b.join("bin/a"), b"shared-bytes").unwrap();
         fs::hard_link(b.join("bin/a"), b.join("bin/b")).unwrap();
         fs::hard_link(b.join("bin/a"), b.join("sbin/c")).unwrap();
-        assert_eq!(build_image(&b).unwrap(), img, "hard-linked tree must pack deterministically");
+        assert_eq!(
+            build_image(&b).unwrap(),
+            img,
+            "hard-linked tree must pack deterministically"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 

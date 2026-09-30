@@ -8,7 +8,7 @@
 //! reached EXACTLY K — it parallelized up to the budget AND never exceeded it. The requests
 //! use nonexistent drvs (they ERR fast); the build OUTCOME is irrelevant — the FEATURE under
 //! test is the concurrency cap, and each request still occupies a build slot for the hold.
-//! 
+//!
 //! Verified-red: drop the semaphore in build_daemon::serve → the log shows "(6/2 active)",
 //! so the typed log check yields peak 6 != 2 and the gate reds; force it serial → peak 1 != 2. (The cap
 //! logic is also covered hermetically + deterministically by the build_daemon budget unit

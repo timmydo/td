@@ -21,9 +21,7 @@ pub fn recipe() -> Recipe {
 
     steps.push(Step::WriteFile {
         path: format!("{source}/config.h"),
-        content: format!(
-            "#pragma once\n#define PACKAGE_STRING \"{CODEX_BWRAP_VERSION_OUTPUT}\"\n"
-        ),
+        content: format!("#pragma once\n#define PACKAGE_STRING \"{CODEX_BWRAP_VERSION_OUTPUT}\"\n"),
         exec: false,
     });
     steps.push(Step::WriteFile {

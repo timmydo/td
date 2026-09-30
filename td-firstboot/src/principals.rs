@@ -7,11 +7,15 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-#[path = "../../engine/src/principals.rs"]
-mod table;
-#[allow(dead_code, clippy::duplicate_mod, reason = "firstboot shares live primary lookup and preflight parsing; authd also embeds these validators")]
+#[allow(
+    dead_code,
+    clippy::duplicate_mod,
+    reason = "firstboot shares live primary lookup and preflight parsing; authd also embeds these validators"
+)]
 #[path = "../../td-authd/src/primary_account.rs"]
 pub(crate) mod primary_account;
+#[path = "../../engine/src/principals.rs"]
+mod table;
 use table::decimal;
 pub(crate) use table::{Application, Registry, MAX_BYTES};
 
@@ -298,7 +302,11 @@ impl Registry {
             name.strip_prefix(prefix).is_some_and(|suffix| {
                 !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
             })
-        }) || self.account_names().values().any(|reserved| reserved == name) {
+        }) || self
+            .account_names()
+            .values()
+            .any(|reserved| reserved == name)
+        {
             return Err("primary name is reserved for a service or application".into());
         }
         let mut names = BTreeSet::new();
@@ -330,7 +338,9 @@ impl Registry {
             // A currently unresolved member must not acquire authority by rename.
             let mut seen = BTreeSet::new();
             if !members.is_empty()
-                && members.split(',').any(|member| !names.contains(member) || !seen.insert(member))
+                && members
+                    .split(',')
+                    .any(|member| !names.contains(member) || !seen.insert(member))
             {
                 return Err("group contains an unknown or duplicate account member".into());
             }
@@ -364,14 +374,19 @@ impl Registry {
                 return Err("invalid principal passwd row".into());
             };
             let uid = decimal(uid, 0..=u32::MAX)?;
-            if let Some(application) = self.applications().find(|application| application.uid == uid) {
+            if let Some(application) = self
+                .applications()
+                .find(|application| application.uid == uid)
+            {
                 if *name != format!("tda{uid}")
                     || *gid != uid.to_string()
                     || std::ffi::OsStr::new(home) != application_home(uid).as_os_str()
                     || *shell != "/bin/false"
                     || active.iter().any(|prior: &Application| prior.uid == uid)
                 {
-                    return Err("application account does not match its private identity and home".into());
+                    return Err(
+                        "application account does not match its private identity and home".into(),
+                    );
                 }
                 active.push(application.clone());
             }

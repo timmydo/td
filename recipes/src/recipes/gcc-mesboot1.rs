@@ -1,4 +1,6 @@
-use crate::ladder::{SH, apply_patch, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
+use crate::ladder::{
+    apply_patch, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH,
+};
 use crate::types::{Recipe, Step, TextEdit};
 
 // GCC 4.6.4 (c,c++) — rung 12 (#378, guix's gcc-mesboot1): gcc-mesboot0 builds
@@ -18,7 +20,8 @@ use crate::types::{Recipe, Step, TextEdit};
 pub fn recipe() -> Recipe {
     let path = format!("{{in:gcc-mesboot0}}/bin:{}", mesboot0_path());
     let gccdir1 = "{in:gcc-mesboot0}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
-    let cip = format!("{gccdir1}/include:{{root}}/kh:{{in:glibc-mesboot0}}/include:{{src}}/mpfr/src");
+    let cip =
+        format!("{gccdir1}/include:{{root}}/kh:{{in:glibc-mesboot0}}/include:{{src}}/mpfr/src");
     let lp = "{in:glibc-mesboot0}/lib:{in:gcc-mesboot0}/lib";
     let ldf = "-static -B{in:glibc-mesboot0}/lib";
     let mut steps = unpack_into("gcc-mesboot1-source", "{src}");
@@ -242,6 +245,13 @@ pub fn recipe() -> Recipe {
             "glibc-mesboot0",
             "make-mesboot",
         ])
-        .inputs_owned(mesboot0_inputs(&["gcc-464-gpp", "patch-gcc-boot-4.6.4", "gmp", "mpfr", "mpc", "linux-headers"]))
+        .inputs_owned(mesboot0_inputs(&[
+            "gcc-464-gpp",
+            "patch-gcc-boot-4.6.4",
+            "gmp",
+            "mpfr",
+            "mpc",
+            "linux-headers",
+        ]))
         .steps(steps)
 }

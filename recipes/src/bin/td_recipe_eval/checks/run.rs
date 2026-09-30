@@ -72,7 +72,8 @@ const TCG_NO_NODE_HINT: &str = "This host has no usable /dev/kvm, so the guest i
 /// The other reason KVM is unavailable needs its OWN advice: telling an operator whose
 /// host is not x86_64 to get at /dev/kvm sends them after access that changes nothing,
 /// and they may well have it already.
-const TCG_WRONG_ARCH_HINT: &str = "KVM accelerates only a guest of the host's OWN architecture,\n         \
+const TCG_WRONG_ARCH_HINT: &str =
+    "KVM accelerates only a guest of the host's OWN architecture,\n         \
      so an x86_64 guest is emulated instruction-by-instruction here no matter what\n         \
      /dev/kvm permits — TCG is what makes it bootable on this host at all.";
 
@@ -405,9 +406,7 @@ fn boot_interactive(
         disk,
         host_display_available(),
     );
-    let status = command
-        .status()
-        .map_err(|e| format!("spawn {qemu}: {e}"))?;
+    let status = command.status().map_err(|e| format!("spawn {qemu}: {e}"))?;
     // The legitimate interactive exits all return 0: a guest `poweroff`/`reboot` under
     // `-no-reboot` and a `Ctrl-A X` quit both make qemu exit successfully. So a non-zero
     // status is a genuine failure (qemu could not start - bad image, missing accelerator,
@@ -476,17 +475,16 @@ fn interactive_command(
 }
 
 fn host_display_available() -> bool {
-    let nonempty = |name| {
-        std::env::var_os(name)
-            .is_some_and(|value| !value.is_empty())
-    };
+    let nonempty = |name| std::env::var_os(name).is_some_and(|value| !value.is_empty());
     if nonempty("DISPLAY") {
         return true;
     }
-    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) else {
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty())
+    else {
         return false;
     };
-    let Some(display) = std::env::var_os("WAYLAND_DISPLAY").filter(|value| !value.is_empty()) else {
+    let Some(display) = std::env::var_os("WAYLAND_DISPLAY").filter(|value| !value.is_empty())
+    else {
         return false;
     };
     Path::new(&runtime).join(display).exists()
@@ -633,14 +631,16 @@ mod tests {
                 .map(String::as_str)
                 .eq(["-m", SYSTEM_GUEST_MEMORY_MIB])
         }));
-        assert!(!arguments.iter().any(|argument| argument.contains("hostfwd")));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument.contains("hostfwd")));
         assert!(!arguments.iter().any(|argument| argument == "-nic"));
-        for expected in [
-            "none,id=audio0",
-            "intel-hda",
-            "hda-output,audiodev=audio0",
-        ] {
-            assert_eq!(count(expected), 1, "missing exact audio argument {expected}");
+        for expected in ["none,id=audio0", "intel-hda", "hda-output,audiodev=audio0"] {
+            assert_eq!(
+                count(expected),
+                1,
+                "missing exact audio argument {expected}"
+            );
         }
     }
 
@@ -686,10 +686,7 @@ mod tests {
         assert_eq!(kvm_status_from("aarch64", false), KvmStatus::WrongArch);
         assert_eq!(kvm_status_from("x86_64", true), KvmStatus::Usable);
         // The group case: node present, this user cannot open it.
-        assert_eq!(
-            kvm_status_from("x86_64", false),
-            KvmStatus::NodeUnavailable
-        );
+        assert_eq!(kvm_status_from("x86_64", false), KvmStatus::NodeUnavailable);
     }
 
     #[test]
@@ -743,7 +740,9 @@ mod tests {
     #[test]
     fn surrounding_whitespace_still_selects() {
         assert_eq!(
-            accel_plan(|| KvmStatus::NodeUnavailable, Some("  kvm ")).unwrap().names,
+            accel_plan(|| KvmStatus::NodeUnavailable, Some("  kvm "))
+                .unwrap()
+                .names,
             ["kvm"]
         );
     }

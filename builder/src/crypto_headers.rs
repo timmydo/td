@@ -61,8 +61,7 @@ fn read(path: &Path, limit: u64) -> Result<Vec<u8>> {
 }
 
 fn text(path: &Path) -> Result<String> {
-    String::from_utf8(read(path, 1024 * 1024)?)
-        .map_err(|e| format!("header input UTF-8: {e}"))
+    String::from_utf8(read(path, 1024 * 1024)?).map_err(|e| format!("header input UTF-8: {e}"))
 }
 
 fn alltypes(input: &str) -> Result<String> {
@@ -111,15 +110,26 @@ fn files(root: &Path, relative: &str, depth: usize, out: &mut Files) -> Result<(
         return Err("header tree exceeds depth or file limit".into());
     }
     // Joining an empty suffix adds '/', which makes lstat follow a root link.
-    let path = if relative.is_empty() { root.to_path_buf() } else { root.join(relative) };
+    let path = if relative.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(relative)
+    };
     let kind = fs::symlink_metadata(&path)
         .map_err(|e| format!("stat {}: {e}", path.display()))?
         .file_type();
     if kind.is_dir() {
         for entry in fs::read_dir(&path).map_err(|e| format!("read directory: {e}"))? {
             let entry = entry.map_err(|e| format!("header entry: {e}"))?;
-            let name = entry.file_name().into_string().map_err(|_| "header name UTF-8")?;
-            let next = if relative.is_empty() { name } else { format!("{relative}/{name}") };
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "header name UTF-8")?;
+            let next = if relative.is_empty() {
+                name
+            } else {
+                format!("{relative}/{name}")
+            };
             files(root, &next, depth + 1, out)?;
         }
     } else if kind.is_file() {
@@ -157,7 +167,10 @@ fn collect_headers(source: &Path) -> Result<Files> {
     }
     let declarations = text(&source.join("arch/x86_64/bits/alltypes.h.in"))?
         + &text(&source.join("include/alltypes.h.in"))?;
-    headers.insert("bits/alltypes.h".into(), alltypes(&declarations)?.into_bytes());
+    headers.insert(
+        "bits/alltypes.h".into(),
+        alltypes(&declarations)?.into_bytes(),
+    );
     headers.insert(
         "bits/syscall.h".into(),
         syscalls(&text(&source.join("arch/x86_64/bits/syscall.h.in"))?).into_bytes(),
@@ -170,8 +183,14 @@ fn generate(source: &Path) -> Result<Files> {
     if headers.len() != 218 || header_digest(&headers) != HEADER_SHA {
         return Err("musl headers differ from upstream install-headers output".into());
     }
-    let mut output: Files = headers.into_iter().map(|(name, bytes)| (format!("include/{name}"), bytes)).collect();
-    output.insert("COPYRIGHT".into(), read(&source.join("COPYRIGHT"), 1024 * 1024)?);
+    let mut output: Files = headers
+        .into_iter()
+        .map(|(name, bytes)| (format!("include/{name}"), bytes))
+        .collect();
+    output.insert(
+        "COPYRIGHT".into(),
+        read(&source.join("COPYRIGHT"), 1024 * 1024)?,
+    );
     output.insert("SOURCE".into(), source_receipt().into_bytes());
     Ok(output)
 }
@@ -201,7 +220,10 @@ pub(crate) fn prepare(root: &Path, archive: &Path) -> Result<PathBuf> {
 }
 
 fn publish(scratch: &Scratch, parent: &Path, expected: &Files) -> Result<PathBuf> {
-    let destination = parent.join(format!("crypto-musl-x86_64-1.2.5-{}", header_digest(expected)));
+    let destination = parent.join(format!(
+        "crypto-musl-x86_64-1.2.5-{}",
+        header_digest(expected)
+    ));
     match fs::symlink_metadata(&destination) {
         Ok(_) => {
             verify_tree(&destination, expected)?;
@@ -220,7 +242,8 @@ fn publish(scratch: &Scratch, parent: &Path, expected: &Files) -> Result<PathBuf
     verify_tree(&output, expected)?;
     // A concurrent preparer may publish identical bytes first. Never merge.
     if let Err(e) = fs::rename(&output, &destination) {
-        verify_tree(&destination, expected).map_err(|why| format!("publish headers: {e}; {why}"))?;
+        verify_tree(&destination, expected)
+            .map_err(|why| format!("publish headers: {e}; {why}"))?;
     }
     Ok(destination)
 }
@@ -236,7 +259,10 @@ mod tests {
         assert_eq!(alltypes("STRUCT point { int x; };\nUNION value { int x; };\n").unwrap(),
             "#if defined(__NEED_struct_point) && !defined(__DEFINED_struct_point)\nstruct point { int x; };\n#define __DEFINED_struct_point\n#endif\n\n#if defined(__NEED_union_value) && !defined(__DEFINED_union_value)\nunion value { int x; };\n#define __DEFINED_union_value\n#endif\n\n");
         assert!(alltypes("TYPEDEF invalid\n").is_err());
-        assert_eq!(alltypes("#define value 1\n\n").unwrap(), "#define value 1\n\n");
+        assert_eq!(
+            alltypes("#define value 1\n\n").unwrap(),
+            "#define value 1\n\n"
+        );
     }
 
     #[test]
@@ -273,9 +299,13 @@ mod tests {
         let scratch = Scratch::new(&std::env::temp_dir()).unwrap();
         let archive = scratch.0.join("source.tar.gz");
         fs::write(&archive, b"not the pinned musl archive").unwrap();
-        assert!(prepare(&scratch.0, &archive).unwrap_err().contains("SHA-256 mismatch"));
+        assert!(prepare(&scratch.0, &archive)
+            .unwrap_err()
+            .contains("SHA-256 mismatch"));
         fs::write(&archive, vec![0; ARCHIVE_SIZE as usize]).unwrap();
-        assert!(prepare(&scratch.0, &archive).unwrap_err().contains("SHA-256 mismatch"));
+        assert!(prepare(&scratch.0, &archive)
+            .unwrap_err()
+            .contains("SHA-256 mismatch"));
         assert!(!scratch.0.join(".td-build-cache").exists());
     }
 
@@ -303,9 +333,17 @@ mod tests {
         assert_eq!(headers.get("bits/retained.h").unwrap(), b"retained\n");
         assert!(headers.contains_key("header.h"));
         assert!(headers.contains_key("sys/public.h"));
-        assert!(headers.get("bits/alltypes.h").unwrap().starts_with(b"#define _Addr long\n#if defined(__NEED_pid_t)"));
-        assert_eq!(headers.get("bits/syscall.h").unwrap(), b"#define __NR_read 0\n#define SYS_read 0\n");
-        assert!(generate(&scratch.0).unwrap_err().contains("upstream install-headers"));
+        assert!(headers
+            .get("bits/alltypes.h")
+            .unwrap()
+            .starts_with(b"#define _Addr long\n#if defined(__NEED_pid_t)"));
+        assert_eq!(
+            headers.get("bits/syscall.h").unwrap(),
+            b"#define __NR_read 0\n#define SYS_read 0\n"
+        );
+        assert!(generate(&scratch.0)
+            .unwrap_err()
+            .contains("upstream install-headers"));
     }
 
     #[test]
@@ -313,8 +351,10 @@ mod tests {
         let scratch = Scratch::new(&std::env::temp_dir()).unwrap();
         let parent = scratch.0.join("cache");
         fs::create_dir(&parent).unwrap();
-        let expected = Files::from([("include/header.h".into(), b"header".to_vec()),
-            ("SOURCE".into(), source_receipt().into_bytes())]);
+        let expected = Files::from([
+            ("include/header.h".into(), b"header".to_vec()),
+            ("SOURCE".into(), source_receipt().into_bytes()),
+        ]);
         let first = publish(&scratch, &parent, &expected).unwrap();
         assert_eq!(publish(&scratch, &parent, &expected).unwrap(), first);
         let mut changed = expected.clone();
@@ -324,7 +364,9 @@ mod tests {
         verify_tree(&first, &expected).unwrap();
         verify_tree(&second, &changed).unwrap();
         fs::write(first.join("include/header.h"), b"changed").unwrap();
-        assert!(publish(&scratch, &parent, &expected).unwrap_err().contains("remove this cache entry and retry"));
+        assert!(publish(&scratch, &parent, &expected)
+            .unwrap_err()
+            .contains("remove this cache entry and retry"));
         assert!(source_receipt().contains(ARCHIVE_SHA));
     }
 }

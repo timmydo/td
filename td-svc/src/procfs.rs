@@ -241,9 +241,7 @@ pub fn matches(mode: Containment, pid: i32, stat: &Stat) -> bool {
         // would select every daemon on the machine. The leader is still
         // reached, which is what makes a console unit stoppable before getty
         // has claimed the device at all.
-        Containment::Console { leader, tty } => {
-            pid == leader || (tty != 0 && stat.tty_nr == tty)
-        }
+        Containment::Console { leader, tty } => pid == leader || (tty != 0 && stat.tty_nr == tty),
     }
 }
 

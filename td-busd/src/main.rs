@@ -109,10 +109,7 @@ fn serve_bound(
     // Validated once HERE, so a guid this bus cannot use fails at startup
     // rather than once per peer in a thread whose failure nobody is reading.
     auth::Guid::new(&text).map_err(|error| format!("bad guid: {error:?}"))?;
-    eprintln!(
-        "td-busd: listening on {} as {text}",
-        bound.path().display()
-    );
+    eprintln!("td-busd: listening on {} as {text}", bound.path().display());
 
     // The quota is shared with every connection thread and outlives this
     // function's frame, so it is an `Arc` rather than a borrow. Same for the
@@ -609,10 +606,22 @@ mod tests {
         });
         match (reserved, spawned, identified, charged, served) {
             (Some(reserved), Some(spawned), Some(identified), Some(charged), Some(served)) => {
-                assert!(reserved < spawned, "lineage starts without a reserved place");
-                assert!(spawned < identified, "lineage still runs on the listener thread");
-                assert!(identified < charged, "admission precedes the identity answer");
-                assert!(charged < served, "the charged identity is not the one served");
+                assert!(
+                    reserved < spawned,
+                    "lineage starts without a reserved place"
+                );
+                assert!(
+                    spawned < identified,
+                    "lineage still runs on the listener thread"
+                );
+                assert!(
+                    identified < charged,
+                    "admission precedes the identity answer"
+                );
+                assert!(
+                    charged < served,
+                    "the charged identity is not the one served"
+                );
             }
             shape => panic!("the accept/identify/admit path changed shape: {shape:?}"),
         }
@@ -650,7 +659,9 @@ mod tests {
             "main.rs must deny the lint exactly once"
         );
         assert_eq!(
-            source("main").matches(&format!("#![forbid({lint})]")).count(),
+            source("main")
+                .matches(&format!("#![forbid({lint})]"))
+                .count(),
             0,
             "forbid would make the scoped allows impossible"
         );
@@ -892,9 +903,9 @@ mod tests {
                 claimed < filtered,
                 "a reply is filtered by the talk set before its ownership is asked"
             ),
-            (claimed, filtered) => panic!(
-                "the send path no longer both claims and filters: {claimed:?} {filtered:?}"
-            ),
+            (claimed, filtered) => {
+                panic!("the send path no longer both claims and filters: {claimed:?} {filtered:?}")
+            }
         }
     }
 
@@ -989,8 +1000,10 @@ mod tests {
     fn a_holder_is_told_about_itself_and_not_about_the_name() {
         let transport = without_line_comments(&without_block_comments(source("transport")));
         let Some(from) = transport.find("fn askable(") else {
-            panic!("askable is gone, so the holder exemption moved somewhere \
-                    this test does not watch");
+            panic!(
+                "askable is gone, so the holder exemption moved somewhere \
+                    this test does not watch"
+            );
         };
         let body = transport.get(from..).unwrap_or("");
         let Some(span) = body.find("\n    }") else {
@@ -1022,8 +1035,10 @@ mod tests {
         let transport = without_line_comments(&without_block_comments(source("transport")));
         let production = transport.split("\nmod tests {").next().unwrap_or("");
         let Some(from) = production.find("fn pid_to_tell(") else {
-            panic!("pid_to_tell is gone, so the pid rule moved somewhere this \
-                    test does not watch");
+            panic!(
+                "pid_to_tell is gone, so the pid rule moved somewhere this \
+                    test does not watch"
+            );
         };
         let body = production.get(from..).unwrap_or("");
         let Some(span) = body.find("\n    }") else {
@@ -1039,8 +1054,7 @@ mod tests {
             .count()
             .saturating_sub(production.matches("fn usable_pid(").count());
         assert_eq!(
-            calls,
-            1,
+            calls, 1,
             "a host pid is read somewhere other than pid_to_tell, which the \
              policy does not guard"
         );

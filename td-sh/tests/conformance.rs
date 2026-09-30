@@ -56,8 +56,8 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use td_sh::{
-    graded_identity, parse_spec, resolve, run_case, run_dir_classified, summarize,
-    CaseWorkdir, Disposition, Expectations, ASH_DASH_CHAIN,
+    graded_identity, parse_spec, resolve, run_case, run_dir_classified, summarize, CaseWorkdir,
+    Disposition, Expectations, ASH_DASH_CHAIN,
 };
 
 fn spec_dir() -> PathBuf {
@@ -105,9 +105,9 @@ fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
             // disappear. Versioned names (`bash-4.4`, `zsh-5.9`) are real.
             for token in case.compare_shells() {
                 let ok = token.starts_with(|c: char| c.is_ascii_lowercase())
-                    && token
-                        .chars()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
+                    && token.chars().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.'
+                    });
                 assert!(
                     ok,
                     "{}: `## compare_shells:` token {token:?} is not a plain shell identity — \
@@ -167,7 +167,10 @@ fn looks_up_a_staged_applet(code: &str) -> bool {
             return false;
         };
         let before = line.get(..at).unwrap_or_default();
-        before.contains('>') || MUTATORS.iter().any(|verb| before.trim_start().starts_with(verb))
+        before.contains('>')
+            || MUTATORS
+                .iter()
+                .any(|verb| before.trim_start().starts_with(verb))
     })
 }
 
@@ -295,8 +298,8 @@ fn a_redirect_onto_a_staged_name_is_caught_however_it_is_spelled() {
 /// is graded on its STATUS as much as its output") resting on nothing, so this
 /// runs the built binary through a symlink the way `run_case` does.
 #[test]
-fn the_binary_reports_its_applets_status_and_diagnostic(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn the_binary_reports_its_applets_status_and_diagnostic() -> Result<(), Box<dyn std::error::Error>>
+{
     // A Drop guard, not a tidy-up at the end: every step below can return early
     // on `?`, and a leaked directory of symlinks into `target/` outlives the run.
     struct Scratch(PathBuf);
@@ -360,7 +363,10 @@ fn the_binary_reports_its_applets_status_and_diagnostic(
     let out = run("sleep", &["0.05"])?;
     assert_eq!(out.status.code(), Some(0), "sleep: {:?}", out.stderr);
     assert!(out.stdout.is_empty() && out.stderr.is_empty());
-    assert!(start.elapsed() >= std::time::Duration::from_millis(45), "sleep did not sleep");
+    assert!(
+        start.elapsed() >= std::time::Duration::from_millis(45),
+        "sleep did not sleep"
+    );
     // The grep family is THREE dispatch arms onto one applet, differing only
     // in the preset each passes. Wired to the same preset — or to each other —
     // the unit tests would still pass, since they call `grep` directly with
@@ -392,7 +398,11 @@ fn the_binary_reports_its_applets_status_and_diagnostic(
             false => Some(0),
         };
         assert_eq!(out.status.code(), expect, "{name}: {:?}", out.stderr);
-        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{name} read `{pat}` wrongly");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            want,
+            "{name} read `{pat}` wrongly"
+        );
     }
     // The byte-slicing four. `head` and `tail` answer the SAME question about
     // opposite ends of one stream, so a swapped pair is the mis-wiring their
@@ -423,7 +433,11 @@ fn the_binary_reports_its_applets_status_and_diagnostic(
         }
         let out = child.wait_with_output()?;
         assert_eq!(out.status.code(), Some(0), "{name}: {:?}", out.stderr);
-        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{name} answered wrongly");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            want,
+            "{name} answered wrongly"
+        );
     }
     // `head`'s multi-file banner needs OPERANDS, and it is the one output shape
     // in these four that the corpus goldens carry verbatim.
@@ -431,11 +445,23 @@ fn the_binary_reports_its_applets_status_and_diagnostic(
     std::fs::write(dir.join("hb2"), b"B\n")?;
     let out = run(
         "head",
-        &["--", &dir.join("hb1").to_string_lossy(), &dir.join("hb2").to_string_lossy()],
+        &[
+            "--",
+            &dir.join("hb1").to_string_lossy(),
+            &dir.join("hb2").to_string_lossy(),
+        ],
     )?;
-    assert_eq!(out.status.code(), Some(0), "head of two files: {:?}", out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "head of two files: {:?}",
+        out.stderr
+    );
     let banner = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(banner.contains("<==\nA\n\n==> "), "no blank line between files: {banner:?}");
+    assert!(
+        banner.contains("<==\nA\n\n==> "),
+        "no blank line between files: {banner:?}"
+    );
     // …and `-` among them is bannered `standard input`, not `-`. Here rather
     // than in a unit test for `wc -`'s reason: calling the function directly
     // would inherit whatever stdin `cargo test` was handed and block on a
@@ -453,10 +479,16 @@ fn the_binary_reports_its_applets_status_and_diagnostic(
     let out = child.wait_with_output()?;
     assert_eq!(out.status.code(), Some(0), "head - : {:?}", out.stderr);
     let banner = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(banner.starts_with("==> standard input <==\nS\n\n==> "), "{banner:?}");
+    assert!(
+        banner.starts_with("==> standard input <==\nS\n\n==> "),
+        "{banner:?}"
+    );
     // The other three applets whose dispatch arms nothing else here reaches.
     let out = run("seq", &["3"])?;
-    assert_eq!((out.status.code(), out.stdout.as_slice()), (Some(0), b"1\n2\n3\n".as_slice()));
+    assert_eq!(
+        (out.status.code(), out.stdout.as_slice()),
+        (Some(0), b"1\n2\n3\n".as_slice())
+    );
     let out = run("mkdir", &[&dir.join("d").to_string_lossy()])?;
     assert_eq!(out.status.code(), Some(0), "mkdir: {:?}", out.stderr);
     assert!(dir.join("d").is_dir());
@@ -486,16 +518,31 @@ fn the_binary_reports_its_applets_status_and_diagnostic(
         let target = victim.to_string_lossy().into_owned();
         argv.push(&target);
         let out = confined(applet, &argv)?;
-        assert_eq!(out.status.code(), Some(2), "{applet} outside a workdir was allowed");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("refusing"), "{applet} was quiet");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{applet} outside a workdir was allowed"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("refusing"),
+            "{applet} was quiet"
+        );
     }
-    assert!(std::fs::read(&victim).is_ok(), "the file outside the workdir did not survive");
+    assert!(
+        std::fs::read(&victim).is_ok(),
+        "the file outside the workdir did not survive"
+    );
     // …and the same applet still serves a file INSIDE that workspace, so the
     // refusal above is the confinement and not the applet failing outright.
     let ok = dir.join("case/f");
     std::fs::write(&ok, b"x")?;
     let out = confined("chmod", &["600", &ok.to_string_lossy()])?;
-    assert_eq!(out.status.code(), Some(0), "chmod inside the workdir: {:?}", out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "chmod inside the workdir: {:?}",
+        out.stderr
+    );
     Ok(())
 }
 
@@ -659,7 +706,12 @@ no-externals
 ";
     for case in parse_spec(spec)? {
         let outcome = run_case(&shell, &spec_helpers_bin(), &case, ASH_DASH_CHAIN)?;
-        assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
+        assert!(
+            outcome.passed,
+            "{}: {}",
+            case.name,
+            outcome.detail.unwrap_or_default()
+        );
     }
     // And it follows the chain rather than being a fixed `ash`.
     let spec = "\
@@ -671,7 +723,12 @@ DASH
 ";
     for case in parse_spec(spec)? {
         let outcome = run_case(&shell, &spec_helpers_bin(), &case, &["dash"])?;
-        assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
+        assert!(
+            outcome.passed,
+            "{}: {}",
+            case.name,
+            outcome.detail.unwrap_or_default()
+        );
     }
 
     // The identity follows the golden. A file that designates no ash grades
@@ -707,7 +764,12 @@ ASH
 ";
     for case in parse_spec(spec)? {
         let outcome = run_case(&shell, &spec_helpers_bin(), &case, ASH_DASH_CHAIN)?;
-        assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
+        assert!(
+            outcome.passed,
+            "{}: {}",
+            case.name,
+            outcome.detail.unwrap_or_default()
+        );
     }
     let spec = "\
 ## compare_shells: bash mksh
@@ -720,7 +782,12 @@ ASH
 ";
     for case in parse_spec(spec)? {
         let outcome = run_case(&shell, &spec_helpers_bin(), &case, ASH_DASH_CHAIN)?;
-        assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
+        assert!(
+            outcome.passed,
+            "{}: {}",
+            case.name,
+            outcome.detail.unwrap_or_default()
+        );
     }
     // And the identity a case is graded as is readable without running it, so an
     // analysis can tell which reference shell is the right one to grade a case
@@ -729,7 +796,9 @@ ASH
         "## compare_shells: bash dash mksh\n\n#### x\ntrue\n## OK ash STDOUT:\n## END\n",
     )?;
     assert_eq!(
-        cases.first().and_then(|c| graded_identity(c, ASH_DASH_CHAIN)),
+        cases
+            .first()
+            .and_then(|c| graded_identity(c, ASH_DASH_CHAIN)),
         Some("ash")
     );
     // A block for a LATER chain element decides it when nothing earlier is
@@ -737,7 +806,9 @@ ASH
     // otherwise grade a dash divergence while running as ash.
     let cases = parse_spec("#### x\ntrue\n## N-I dash status: 2\n")?;
     assert_eq!(
-        cases.first().and_then(|c| graded_identity(c, ASH_DASH_CHAIN)),
+        cases
+            .first()
+            .and_then(|c| graded_identity(c, ASH_DASH_CHAIN)),
         Some("dash")
     );
     // An annotation's shell name matches EXACTLY, because `pick` matches it
@@ -746,7 +817,9 @@ ASH
     // would then decline to use.
     let cases = parse_spec("#### x\ntrue\n## N-I dash-0.5.12 status: 2\n")?;
     assert_eq!(
-        cases.first().and_then(|c| graded_identity(c, ASH_DASH_CHAIN)),
+        cases
+            .first()
+            .and_then(|c| graded_identity(c, ASH_DASH_CHAIN)),
         Some("ash")
     );
 
@@ -771,7 +844,12 @@ ash
 ";
     for case in parse_spec(spec)? {
         let outcome = run_case(&shell, &spec_helpers_bin(), &case, ASH_DASH_CHAIN)?;
-        assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
+        assert!(
+            outcome.passed,
+            "{}: {}",
+            case.name,
+            outcome.detail.unwrap_or_default()
+        );
     }
 
     // The PATH entry is a symlink to the binary under test, so `: > "$PATH/$SH"`
@@ -788,7 +866,12 @@ ash
 ";
     for case in parse_spec(spec)? {
         let outcome = run_case(&shell, &spec_helpers_bin(), &case, ASH_DASH_CHAIN)?;
-        assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
+        assert!(
+            outcome.passed,
+            "{}: {}",
+            case.name,
+            outcome.detail.unwrap_or_default()
+        );
     }
     assert_eq!(
         std::fs::metadata(&shell)?.len(),
@@ -820,20 +903,34 @@ fn corpus_conformance() -> Result<(), Box<dyn std::error::Error>> {
     let exp_text = std::fs::read_to_string(spec_dir.join("expectations.txt")).unwrap_or_default();
     let exp = Expectations::parse(&exp_text).map_err(|e| format!("expectations.txt: {e}"))?;
 
-    let (outcomes, stale) = run_dir_classified(&shell, &spec_helpers_bin(), &spec_dir, ASH_DASH_CHAIN, &exp)?;
+    let (outcomes, stale) =
+        run_dir_classified(&shell, &spec_helpers_bin(), &spec_dir, ASH_DASH_CHAIN, &exp)?;
     let s = summarize(&outcomes);
     eprintln!(
         "td-sh conformance: {} pass, {} xfail, {} skip  |  {} regressions, {} to-promote, {} stale",
-        s.pass, s.xfail, s.skip, s.fail, s.xpass, stale.len()
+        s.pass,
+        s.xfail,
+        s.skip,
+        s.fail,
+        s.xpass,
+        stale.len()
     );
 
-    let regressions: Vec<&_> =
-        outcomes.iter().filter(|o| o.disposition == Disposition::Fail).collect();
+    let regressions: Vec<&_> = outcomes
+        .iter()
+        .filter(|o| o.disposition == Disposition::Fail)
+        .collect();
     for o in &regressions {
-        eprintln!("REGRESSION {}: {}", o.key, o.detail.clone().unwrap_or_default());
+        eprintln!(
+            "REGRESSION {}: {}",
+            o.key,
+            o.detail.clone().unwrap_or_default()
+        );
     }
-    let to_promote: Vec<&_> =
-        outcomes.iter().filter(|o| o.disposition == Disposition::XPass).collect();
+    let to_promote: Vec<&_> = outcomes
+        .iter()
+        .filter(|o| o.disposition == Disposition::XPass)
+        .collect();
     for o in &to_promote {
         eprintln!("XPASS (remove from expectations.txt) {}", o.key);
     }
@@ -841,10 +938,25 @@ fn corpus_conformance() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("STALE expectations.txt entry (matches no case): {k}");
     }
 
-    assert!(s.pass > 0, "corpus produced zero passing cases — harness or build broken");
-    assert!(regressions.is_empty(), "{} regression(s) — see REGRESSION lines above", regressions.len());
-    assert!(to_promote.is_empty(), "{} xfail now pass(es) — promote them, see XPASS lines", to_promote.len());
-    assert!(stale.is_empty(), "{} stale overlay entr(ies) — see STALE lines above", stale.len());
+    assert!(
+        s.pass > 0,
+        "corpus produced zero passing cases — harness or build broken"
+    );
+    assert!(
+        regressions.is_empty(),
+        "{} regression(s) — see REGRESSION lines above",
+        regressions.len()
+    );
+    assert!(
+        to_promote.is_empty(),
+        "{} xfail now pass(es) — promote them, see XPASS lines",
+        to_promote.len()
+    );
+    assert!(
+        stale.is_empty(),
+        "{} stale overlay entr(ies) — see STALE lines above",
+        stale.len()
+    );
     Ok(())
 }
 
@@ -866,7 +978,11 @@ fn large_output_case_is_captured_without_deadlock() -> Result<(), Box<dyn std::e
     let case = cases.first().ok_or("no case parsed")?;
     let start = std::time::Instant::now();
     let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
-    assert!(outcome.passed, "large-output case failed: {:?}", outcome.detail);
+    assert!(
+        outcome.passed,
+        "large-output case failed: {:?}",
+        outcome.detail
+    );
     assert!(
         start.elapsed() < std::time::Duration::from_secs(5),
         "large-output case took {:?} — a drain deadlock hitting CASE_TIMEOUT",
@@ -910,7 +1026,10 @@ fn an_endless_case_is_bounded_and_reported() -> Result<(), Box<dyn std::error::E
     let cases = parse_spec(spec)?;
     let case = cases.first().ok_or("no case parsed")?;
     let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
-    assert!(!outcome.passed, "an endless stderr case was graded as a pass");
+    assert!(
+        !outcome.passed,
+        "an endless stderr case was graded as a pass"
+    );
     assert!(outcome.truncated, "stderr's truncation was not reported");
     Ok(())
 }
@@ -936,7 +1055,11 @@ fn a_case_sees_the_shell_identity_as_its_argv0() -> Result<(), Box<dyn std::erro
     let cases = parse_spec(spec)?;
     let case = cases.first().ok_or("no case parsed")?;
     let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
-    assert!(outcome.passed, "nested argv0 case failed: {:?}", outcome.detail);
+    assert!(
+        outcome.passed,
+        "nested argv0 case failed: {:?}",
+        outcome.detail
+    );
     Ok(())
 }
 
@@ -946,8 +1069,8 @@ fn a_case_sees_the_shell_identity_as_its_argv0() -> Result<(), Box<dyn std::erro
 /// td-sh is both parent and child because it is the only argv-reporting
 /// program the gate may assume exists.
 #[test]
-fn argv0_is_the_word_the_shell_was_given_not_the_path_it_resolved()
--> Result<(), Box<dyn std::error::Error>> {
+fn argv0_is_the_word_the_shell_was_given_not_the_path_it_resolved(
+) -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     // Exclusively created and dropped with the test, so a planted symlink at a
     // predictable name cannot redirect the link written just below.
@@ -958,7 +1081,9 @@ fn argv0_is_the_word_the_shell_was_given_not_the_path_it_resolved()
     std::os::unix::fs::symlink(&shell, &link)?;
 
     // Its OWN `$0`: the name it was reached by, verbatim.
-    let out = std::process::Command::new(&link).args(["-c", "echo $0"]).output()?;
+    let out = std::process::Command::new(&link)
+        .args(["-c", "echo $0"])
+        .output()?;
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         format!("{}\n", link.display())
@@ -970,7 +1095,9 @@ fn argv0_is_the_word_the_shell_was_given_not_the_path_it_resolved()
     assert_eq!(String::from_utf8_lossy(&out.stdout), "NAME\n");
     let script_file = work.path().join("s.sh");
     std::fs::write(&script_file, "echo $0\n")?;
-    let out = std::process::Command::new(&link).arg(&script_file).output()?;
+    let out = std::process::Command::new(&link)
+        .arg(&script_file)
+        .output()?;
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         format!("{}\n", script_file.display())
@@ -991,39 +1118,57 @@ fn argv0_is_the_word_the_shell_was_given_not_the_path_it_resolved()
     // What it hands a CHILD found on PATH: `mysh`, the word, where the resolved
     // path was going out before -- a name the caller never wrote.
     let script = format!("PATH='{dir}'\nmysh -c 'echo $0'\n");
-    let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
+    let out = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg(&script)
+        .output()?;
     assert_eq!(String::from_utf8_lossy(&out.stdout), "mysh\n");
 
     // A slash-bearing word goes through as WRITTEN rather than canonicalised,
     // so a relative spelling stays relative.
     let script = format!("cd '{dir}'\n./mysh -c 'echo $0'\n");
-    let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
+    let out = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg(&script)
+        .output()?;
     assert_eq!(String::from_utf8_lossy(&out.stdout), "./mysh\n");
 
     // `exec` is a SECOND call site -- `CommandExt::exec` rather than `spawn` --
     // which the plain-command case above does not reach.
     let script = format!("PATH='{dir}'\nexec mysh -c 'echo $0'\n");
-    let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
+    let out = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg(&script)
+        .output()?;
     assert_eq!(String::from_utf8_lossy(&out.stdout), "mysh\n");
 
     // `exec -a NAME` is the one thing that overrides the word, in both
     // spellings. The LAST `-a` wins.
     for form in ["-a renamed", "-arenamed", "-a first -a renamed"] {
         let script = format!("PATH='{dir}'\nexec {form} mysh -c 'echo $0'\n");
-        let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
+        let out = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(&script)
+            .output()?;
         assert_eq!(String::from_utf8_lossy(&out.stdout), "renamed\n", "{form}");
     }
     // The OTHER call site: a subshell cannot replace the process, so it falls
     // back to the ordinary spawn, which has its own `arg0`.
     let script = format!("PATH='{dir}'\n(exec -a renamed mysh -c 'echo $0')\n");
-    let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
+    let out = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg(&script)
+        .output()?;
     assert_eq!(String::from_utf8_lossy(&out.stdout), "renamed\n");
 
     // `-a` takes the next word RAW, so `--` is a NAME and not a terminator.
     // Spelled absolutely: a bare name would meet ash's search divergence below
     // and so could not be measured against it.
     let script = format!("exec -a -- '{}' -c 'echo $0'\n", shell.display());
-    let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
+    let out = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg(&script)
+        .output()?;
     assert_eq!(String::from_utf8_lossy(&out.stdout), "--\n");
 
     // It renames WITHOUT redirecting the search, unlike ash (ash.c:8354). The
@@ -1039,8 +1184,15 @@ fn argv0_is_the_word_the_shell_was_given_not_the_path_it_resolved()
     for form in ["exec -a decoy mysh", "(exec -a decoy mysh"] {
         let close = if form.starts_with('(') { ")" } else { "" };
         let script = format!("PATH='{dir}'\n{form} -c 'echo $0 ran'{close}\n");
-        let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "decoy ran\n", "{form}");
+        let out = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(&script)
+            .output()?;
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "decoy ran\n",
+            "{form}"
+        );
     }
     Ok(())
 }
@@ -1051,8 +1203,8 @@ fn argv0_is_the_word_the_shell_was_given_not_the_path_it_resolved()
 /// `ash_msg`, which sets no status, and startup unwinds on it at 0. Only the
 /// binary reaches this; `run_capturing` starts after it.
 #[test]
-fn the_command_lines_own_option_refusal_splits_the_way_sets_does()
--> Result<(), Box<dyn std::error::Error>> {
+fn the_command_lines_own_option_refusal_splits_the_way_sets_does(
+) -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     // The command never runs in EITHER case -- what differs is the status.
     // A diagnostic names the shell by `$0`, which for a spawned binary is the
@@ -1062,12 +1214,24 @@ fn the_command_lines_own_option_refusal_splits_the_way_sets_does()
     let args: [(&[&str], &str, i32); 4] = [
         (&["-z", "-c", "echo ALIVE"], "illegal option -z\n", 2),
         (&["+z", "-c", "echo ALIVE"], "illegal option +z\n", 2),
-        (&["-o", "bogus", "-c", "echo ALIVE"], "illegal option -o bogus\n", 0),
-        (&["+o", "bogus", "-c", "echo ALIVE"], "illegal option +o bogus\n", 0),
+        (
+            &["-o", "bogus", "-c", "echo ALIVE"],
+            "illegal option -o bogus\n",
+            0,
+        ),
+        (
+            &["+o", "bogus", "-c", "echo ALIVE"],
+            "illegal option +o bogus\n",
+            0,
+        ),
     ];
     for (args, err, code) in args {
         let out = std::process::Command::new(&shell).args(args).output()?;
-        assert_eq!(String::from_utf8_lossy(&out.stderr), format!("{me}: {err}"), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("{me}: {err}"),
+            "{args:?}"
+        );
         assert_eq!(out.stdout, b"", "{args:?}");
         assert_eq!(out.status.code(), Some(code), "{args:?}");
     }
@@ -1087,15 +1251,21 @@ fn the_command_lines_own_option_refusal_splits_the_way_sets_does()
 /// source, not a command line -- and it is the property the corpus's
 /// parse-only differential turns on, so it is pinned rather than assumed.
 #[test]
-fn a_body_this_shell_cannot_serve_is_silent_under_dash_n()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_body_this_shell_cannot_serve_is_silent_under_dash_n() -> Result<(), Box<dyn std::error::Error>>
+{
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
-    for body in ["${}", "${%}", "${!r}", "${a[@]}", "${PS1@P}", "${x^}", "${!x'}'"] {
+    for body in [
+        "${}", "${%}", "${!r}", "${a[@]}", "${PS1@P}", "${x^}", "${!x'}'",
+    ] {
         let out = std::process::Command::new(&shell)
             .args(["-n", "-c", &format!("echo \"{body}\"")])
             .output()?;
         assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{body:?}");
-        assert_eq!((out.stdout.as_slice(), out.status.code()), (b"".as_slice(), Some(0)), "{body:?}");
+        assert_eq!(
+            (out.stdout.as_slice(), out.status.code()),
+            (b"".as_slice(), Some(0)),
+            "{body:?}"
+        );
     }
     // A body that could not be READ is not deferred, so `-n` still refuses it.
     for body in ["${x:}", "${x:-$((1+}"] {
@@ -1115,17 +1285,17 @@ fn a_body_this_shell_cannot_serve_is_silent_under_dash_n()
 /// produced. `sh -n -c '! true'` exited 1, which is a syntax check reporting
 /// failure for a script whose syntax is fine.
 #[test]
-fn dash_n_evaluates_nothing_including_a_negation()
--> Result<(), Box<dyn std::error::Error>> {
+fn dash_n_evaluates_nothing_including_a_negation() -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
-    let check = |args: &[&str]| -> Result<(Option<i32>, String, String), Box<dyn std::error::Error>> {
-        let out = std::process::Command::new(&shell).args(args).output()?;
-        Ok((
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        ))
-    };
+    let check =
+        |args: &[&str]| -> Result<(Option<i32>, String, String), Box<dyn std::error::Error>> {
+            let out = std::process::Command::new(&shell).args(args).output()?;
+            Ok((
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ))
+        };
     // A valid script checks clean whatever it would have RETURNED, and prints
     // nothing whatever it would have PRINTED. The `!` rows are the bug; the
     // rest are the neighbours that must not move with them.
@@ -1148,7 +1318,11 @@ fn dash_n_evaluates_nothing_including_a_negation()
         "f() { ! true; }; f",
         "! cat | cat | cat",
     ] {
-        assert_eq!(check(&["-n", "-c", code])?, (Some(0), String::new(), String::new()), "{code:?}");
+        assert_eq!(
+            check(&["-n", "-c", code])?,
+            (Some(0), String::new(), String::new()),
+            "{code:?}"
+        );
     }
     // WHERE the guard sits is load-bearing, and this is what says so. Guarding
     // the `!` alone answers every row above identically, because each stage's
@@ -1188,7 +1362,11 @@ fn dash_n_evaluates_nothing_including_a_negation()
         (format!(": > {}/plain", dir.display()), "plain"),
         (format!(": > {}/job &", dir.display()), "job"),
     ] {
-        assert_eq!(check(&["-n", "-c", &code])?, (Some(0), String::new(), String::new()), "{what}");
+        assert_eq!(
+            check(&["-n", "-c", &code])?,
+            (Some(0), String::new(), String::new()),
+            "{what}"
+        );
         assert!(!dir.join(what).exists(), "`-n` ran a redirection: {what}");
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -1198,14 +1376,24 @@ fn dash_n_evaluates_nothing_including_a_negation()
     // returned early. So `-n` used to start one per `&` in a file it was only
     // checking. ash's `nflag` test is above `case NBACKGND` too.
     for code in [": &", "! : &", ": & : & : &", ": | : &", "{ ! : ; } &"] {
-        assert_eq!(check(&["-n", "-c", code])?, (Some(0), String::new(), String::new()), "{code:?}");
+        assert_eq!(
+            check(&["-n", "-c", code])?,
+            (Some(0), String::new(), String::new()),
+            "{code:?}"
+        );
     }
     // At a scale where starting one per `&` is visible: silent and 0, where
     // starting them reported `cannot start job` once per job under a
     // constrained address space and exited 1.
     let many = vec![": &"; 10000].join("\n");
-    assert_eq!(check(&["-n", "-c", &many])?, (Some(0), String::new(), String::new()));
-    assert_eq!(check(&["-c", &format!("set -n\n{many}")])?, (Some(0), String::new(), String::new()));
+    assert_eq!(
+        check(&["-n", "-c", &many])?,
+        (Some(0), String::new(), String::new())
+    );
+    assert_eq!(
+        check(&["-c", &format!("set -n\n{many}")])?,
+        (Some(0), String::new(), String::new())
+    );
     // How `-n` was reached is not the question -- `set -n` mid-script is the
     // same flag, and the commands BEFORE it really did run. These are the
     // shapes that actually REACHED the negation, since a compound entered
@@ -1219,7 +1407,11 @@ fn dash_n_evaluates_nothing_including_a_negation()
         "eval \"set -n; ! true\"",
         "f() { set -n; ! true; }; f",
     ] {
-        assert_eq!(check(&["-c", code])?, (Some(0), String::new(), String::new()), "{code:?}");
+        assert_eq!(
+            check(&["-c", code])?,
+            (Some(0), String::new(), String::new()),
+            "{code:?}"
+        );
     }
     let (status, out, err) = check(&["-c", "echo a; set -n; ! true"])?;
     assert_eq!((status, out.as_str(), err.as_str()), (Some(0), "a\n", ""));
@@ -1231,7 +1423,10 @@ fn dash_n_evaluates_nothing_including_a_negation()
     assert_eq!((status, out.as_str()), (Some(2), ""), "{err}");
     assert!(err.contains("syntax error: unexpected \"fi\""), "{err}");
     // Without the syntax error the shell still ends on that status, as ash does.
-    assert_eq!(check(&["-c", "set -e\n! set -n\n:\necho no"])?, (Some(1), String::new(), String::new()));
+    assert_eq!(
+        check(&["-c", "set -e\n! set -n\n:\necho no"])?,
+        (Some(1), String::new(), String::new())
+    );
     // What `-n` is FOR still works: the units are parsed, so a syntax error is
     // still reported and still carries its status.
     for code in ["! ! true", "! true | ! false", "fi", "if true"] {
@@ -1251,8 +1446,8 @@ fn dash_n_evaluates_nothing_including_a_negation()
 /// it through the same `setinputfile` the `.` builtin uses (ash.c:11257), so it
 /// takes that quoted form too.
 #[test]
-fn a_missing_script_operand_is_reported_the_way_ash_reports_it()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_missing_script_operand_is_reported_the_way_ash_reports_it(
+) -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     let dir = std::env::temp_dir().join(format!("td-sh-cliopen-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
@@ -1276,8 +1471,8 @@ fn a_missing_script_operand_is_reported_the_way_ash_reports_it()
 /// harness cannot reach: it buffers stdout, so both fall back to the piped
 /// spawn. Both errnos come back from `Command`, not from `resolve_program`.
 #[test]
-fn a_spawn_failure_with_real_stdio_gives_the_systems_reason()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_spawn_failure_with_real_stdio_gives_the_systems_reason(
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::fs::PermissionsExt;
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     let dir = std::env::temp_dir().join(format!("td-sh-spawnreal-{}", std::process::id()));
@@ -1293,9 +1488,15 @@ fn a_spawn_failure_with_real_stdio_gives_the_systems_reason()
         // `exec` is a builtin, so it is `commandname` while it runs and the
         // diagnostic carries a line; the bare spelling above enters no builtin
         // and `-c` sets none, so it carries neither name nor line.
-        (format!("exec {p}"), format!("{me}: exec: line 1: {p}: Permission denied\n")),
+        (
+            format!("exec {p}"),
+            format!("{me}: exec: line 1: {p}: Permission denied\n"),
+        ),
     ] {
-        let out = std::process::Command::new(&shell).arg("-c").arg(&src).output()?;
+        let out = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(&src)
+            .output()?;
         assert_eq!(String::from_utf8_lossy(&out.stderr), want, "src: {src}");
         assert_eq!(out.status.code(), Some(126), "src: {src}");
     }
@@ -1397,7 +1598,8 @@ fn an_ignore_trap_is_inherited_by_a_child() -> Result<(), Box<dyn std::error::Er
     let own = own_mask(&std::fs::read_to_string("/proc/self/status")?)?;
     let base = mask(child)?;
     assert_eq!(
-        base, own | pipe,
+        base,
+        own | pipe,
         "a fresh shell ignores more than it inherited: {base:#x} from {own:#x}"
     );
     // EVERY signal the baseline leaves free, not a preferred one: a spawn
@@ -1442,10 +1644,17 @@ fn an_ignore_trap_is_inherited_by_a_child() -> Result<(), Box<dyn std::error::Er
         ] {
             // The filter above already guarantees this for `extra` of `bit` or 0; it
             // is here so a row added with some OTHER signal's bit cannot be absorbed.
-            assert_eq!(base & extra, 0, "{body}: the baseline already ignores {extra:#x}");
+            assert_eq!(
+                base & extra,
+                0,
+                "{body}: the baseline already ignores {extra:#x}"
+            );
             let want = base | extra;
             let seen = mask(&body)?;
-            assert_eq!(seen, want, "{body}: child inherited {seen:#x}, wanted {want:#x}");
+            assert_eq!(
+                seen, want,
+                "{body}: child inherited {seen:#x}, wanted {want:#x}"
+            );
         }
     }
     Ok(())
@@ -1469,7 +1678,10 @@ fn a_regular_builtins_error_ends_the_command_not_the_shell(
             .arg(program)
             .env("TD_SH_BIN", &shell)
             .output()?;
-        let code = out.status.code().ok_or_else(|| format!("{program}: killed"))?;
+        let code = out
+            .status
+            .code()
+            .ok_or_else(|| format!("{program}: killed"))?;
         Ok((String::from_utf8_lossy(&out.stdout).into_owned(), code))
     };
     // The diagnostic goes to stderr, the status stands, and the line runs on.
@@ -1496,7 +1708,10 @@ fn a_regular_builtins_error_ends_the_command_not_the_shell(
     // so the next call rescans from word 1. Asserting only that the line ran on
     // would miss this entirely: the shell survives either way.
     for (program, want) in [
-        ("set -- -a -b; readonly O; getopts ab O; getopts ab X; echo \"$X/$OPTIND\"", "a/2\n"),
+        (
+            "set -- -a -b; readonly O; getopts ab O; getopts ab X; echo \"$X/$OPTIND\"",
+            "a/2\n",
+        ),
         (
             "set -- -a -b -c; getopts abc X; readonly Y; getopts abc Y; \
              getopts abc Z; echo \"$Z/$OPTIND\"",
@@ -1510,7 +1725,10 @@ fn a_regular_builtins_error_ends_the_command_not_the_shell(
         ),
         // OPTARG is UNSET when the scan ends (ash.c:11692), which td-sh skipped
         // -- and that one is visible with no `readonly` in play at all.
-        ("set -- -c val; getopts \"c:\" O; getopts \"c:\" O; echo \"[$OPTARG]\"", "[]\n"),
+        (
+            "set -- -c val; getopts \"c:\" O; getopts \"c:\" O; echo \"[$OPTARG]\"",
+            "[]\n",
+        ),
         // The unset is refusable exactly as the writes are, `unsetvar` being
         // `setvar(s, NULL, 0)`, so it ends the command and restarts the scan.
         (
@@ -1519,7 +1737,10 @@ fn a_regular_builtins_error_ends_the_command_not_the_shell(
         ),
         // ...and with nothing refused the scan simply runs on, so the rows above
         // are about the refusal rather than about `getopts` generally.
-        ("set -- -a -b; getopts ab O; getopts ab X; echo \"$X/$OPTIND\"", "b/3\n"),
+        (
+            "set -- -a -b; getopts ab O; getopts ab X; echo \"$X/$OPTIND\"",
+            "b/3\n",
+        ),
     ] {
         assert_eq!(run(program)?.0, want, "{program}");
     }
@@ -1531,9 +1752,15 @@ fn a_regular_builtins_error_ends_the_command_not_the_shell(
         )
     };
     // The refusal lands BEFORE the shell's idea of the directory moves...
-    assert_eq!(run(&cd("OLDPWD", "PWD=$PWD"))?.0, "builtin=/tmp child=/ PWD=/tmp\n");
+    assert_eq!(
+        run(&cd("OLDPWD", "PWD=$PWD"))?.0,
+        "builtin=/tmp child=/ PWD=/tmp\n"
+    );
     // ...and after it, for the write that comes second.
-    assert_eq!(run(&cd("PWD", "OLDPWD=$OLDPWD"))?.0, "builtin=/ child=/ OLDPWD=/tmp\n");
+    assert_eq!(
+        run(&cd("PWD", "OLDPWD=$OLDPWD"))?.0,
+        "builtin=/ child=/ OLDPWD=/tmp\n"
+    );
     Ok(())
 }
 
@@ -1604,7 +1831,10 @@ fn read_dash_t_waits_on_a_pipe_that_can_block() -> Result<(), Box<dyn std::error
     let waited = start.elapsed();
     let out = child.wait_with_output()?;
     drop(writer);
-    assert!(ended, "read -t 1 never returned on a pipe with no writer activity");
+    assert!(
+        ended,
+        "read -t 1 never returned on a pipe with no writer activity"
+    );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=1 []\n");
     assert!(
         waited >= std::time::Duration::from_millis(900),
@@ -1690,8 +1920,7 @@ fn read_dash_t_waits_on_a_pipe_that_can_block() -> Result<(), Box<dyn std::error
 /// to consume more of a non-seekable input than the commands it has executed
 /// need, and bash does not.
 #[test]
-fn a_stdin_script_leaves_the_rest_of_itself_for_read()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_stdin_script_leaves_the_rest_of_itself_for_read() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write as _;
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     for (script, want) in [
@@ -1708,7 +1937,10 @@ fn a_stdin_script_leaves_the_rest_of_itself_for_read()
             "i=1 v=A\ni=2 v=B\n",
         ),
         // A here-document is consumed by the parser, not by `read`.
-        ("cat <<EOF\nbody\nEOF\nread v\nAFTER\necho \"[$v]\"\n", "body\n[AFTER]\n"),
+        (
+            "cat <<EOF\nbody\nEOF\nread v\nAFTER\necho \"[$v]\"\n",
+            "body\n[AFTER]\n",
+        ),
     ] {
         let mut child = std::process::Command::new(&shell)
             .stdin(std::process::Stdio::piped())
@@ -1748,13 +1980,15 @@ fn a_stdin_script_leaves_the_rest_of_itself_for_read()
 /// Only builtins appear, so the assertion is about the descriptor rather than
 /// about what happens to be on PATH.
 #[test]
-fn a_file_stdin_script_agrees_with_a_piped_one()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_file_stdin_script_agrees_with_a_piped_one() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write as _;
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     let long = "x".repeat(700);
     let cases = [
-        ("read v\nDATA\necho \"got=[$v]\"\n".to_string(), "got=[DATA]\n"),
+        (
+            "read v\nDATA\necho \"got=[$v]\"\n".to_string(),
+            "got=[DATA]\n",
+        ),
         (
             "read a\nONE\nread b\nTWO\necho \"[$a][$b]\"\n".to_string(),
             "[ONE][TWO]\n",
@@ -1765,7 +1999,10 @@ fn a_file_stdin_script_agrees_with_a_piped_one()
         ),
         // A here-document is consumed by the PARSER rather than by `read`, so
         // its lines go through the reader under test.
-        ("read v <<EOF\nbody\nEOF\necho \"[$v]\"\n".to_string(), "[body]\n"),
+        (
+            "read v <<EOF\nbody\nEOF\necho \"[$v]\"\n".to_string(),
+            "[body]\n",
+        ),
         // Input ENDING in a fold. This reader reaches that decision by a route
         // of its own -- an unsealed pull rewinds, the source answers `Eof`, the
         // scan seals and the re-pull spends the fold -- so the whole-string
@@ -1791,12 +2028,18 @@ fn a_file_stdin_script_agrees_with_a_piped_one()
         // rewind is skipped. That is the one path through the arithmetic that
         // never issues a seek, and EOF is the only other way to reach it.
         (
-            format!("v={}\nread w\nDATA\necho \"[$w][${{#v}}]\"\n", "x".repeat(253)),
+            format!(
+                "v={}\nread w\nDATA\necho \"[$w][${{#v}}]\"\n",
+                "x".repeat(253)
+            ),
             "[DATA][253]\n",
         ),
         // No trailing newline, so the last line ends at end of input rather
         // than at a byte the rewind can point past.
-        ("read v\nDATA\necho \"end=[$v]\"".to_string(), "end=[DATA]\n"),
+        (
+            "read v\nDATA\necho \"end=[$v]\"".to_string(),
+            "end=[DATA]\n",
+        ),
         // A here-document the input ENDS inside. This reader gets there only by
         // sealing mid-body -- the pulls before it rewind, the source answers
         // `Eof`, and the re-pull ends the body -- where the whole-string reader
@@ -1873,8 +2116,7 @@ fn a_file_stdin_script_agrees_with_a_piped_one()
 /// pinned here: replacing the reader is the kind of change that would break
 /// `exit`, the EXIT trap or `set -e` without any of them being its subject.
 #[test]
-fn a_stdin_script_still_ends_where_it_should()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_stdin_script_still_ends_where_it_should() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write as _;
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     let mut child = std::process::Command::new(&shell)
@@ -1955,8 +2197,8 @@ fn a_stdin_script_still_ends_where_it_should()
 /// text under `-c` ran. Both spellings of each shape below run under busybox
 /// ash 1.37.0.
 #[test]
-fn an_operator_split_across_lines_reads_the_same_from_stdin()
--> Result<(), Box<dyn std::error::Error>> {
+fn an_operator_split_across_lines_reads_the_same_from_stdin(
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write as _;
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     for (script, want) in [
@@ -1985,7 +2227,10 @@ fn an_operator_split_across_lines_reads_the_same_from_stdin()
         // The `-c` spelling is the one that already worked, so it is what the
         // stdin answer is held against rather than only against `want`. All
         // three fields, or a diagnostic beside the right output would pass.
-        let same = std::process::Command::new(&shell).arg("-c").arg(script).output()?;
+        let same = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(script)
+            .output()?;
         assert_eq!(String::from_utf8_lossy(&same.stdout), want, "-c {script:?}");
         assert_eq!(String::from_utf8_lossy(&same.stderr), "", "-c {script:?}");
         assert_eq!(same.status.code(), Some(0), "-c {script:?}");
@@ -2002,8 +2247,7 @@ fn an_operator_split_across_lines_reads_the_same_from_stdin()
 /// shell's buffer are invisible to `poll(2)`, which can only see what is still
 /// in the kernel, so a line already in hand read as a timeout.
 #[test]
-fn read_leaves_the_rest_of_stdin_for_the_next_reader()
--> Result<(), Box<dyn std::error::Error>> {
+fn read_leaves_the_rest_of_stdin_for_the_next_reader() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write as _;
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     // `cat` is an external command the harness cannot rely on, so the second
@@ -2145,7 +2389,10 @@ fn the_export_listing_is_eval_safe() -> Result<(), Box<dyn std::error::Error>> {
     // not in order, and an implementation that sorted what it printed would be
     // wrong in exactly this shape.
     let listing = run("export -p")?;
-    let lines: Vec<&str> = listing.lines().filter(|l| !l.starts_with("export PWD=")).collect();
+    let lines: Vec<&str> = listing
+        .lines()
+        .filter(|l| !l.starts_with("export PWD="))
+        .collect();
     assert_eq!(
         lines,
         [
@@ -2199,26 +2446,50 @@ fn umask_is_ashs_including_the_symbolic_form() -> Result<(), Box<dyn std::error:
     assert_eq!(run("umask 22; umask")?, ("0022\n".to_string(), 0));
     assert_eq!(run("umask 0777; umask")?, ("0777\n".to_string(), 0));
     // `-S` reports what a new file WOULD get, not the mask.
-    assert_eq!(run("umask 022; umask -S")?, ("u=rwx,g=rx,o=rx\n".to_string(), 0));
+    assert_eq!(
+        run("umask 022; umask -S")?,
+        ("u=rwx,g=rx,o=rx\n".to_string(), 0)
+    );
     assert_eq!(run("umask 777; umask -S")?, ("u=,g=,o=\n".to_string(), 0));
     // Clauses are sequential and see the running value...
-    assert_eq!(run("umask 0; umask u=rwx,u-w; umask")?, ("0200\n".to_string(), 0));
-    assert_eq!(run("umask 0; umask u=rwx,g=rx,o=; umask")?, ("0027\n".to_string(), 0));
+    assert_eq!(
+        run("umask 0; umask u=rwx,u-w; umask")?,
+        ("0200\n".to_string(), 0)
+    );
+    assert_eq!(
+        run("umask 0; umask u=rwx,g=rx,o=; umask")?,
+        ("0027\n".to_string(), 0)
+    );
     // ...a permcopy reads that running value too...
-    assert_eq!(run("umask 022; umask g=u; umask")?, ("0002\n".to_string(), 0));
+    assert_eq!(
+        run("umask 022; umask g=u; umask")?,
+        ("0002\n".to_string(), 0)
+    );
     // ...`X` is execute only where execute is already permitted...
     assert_eq!(run("umask 0; umask u=X; umask")?, ("0600\n".to_string(), 0));
-    assert_eq!(run("umask 777; umask u=X; umask")?, ("0777\n".to_string(), 0));
+    assert_eq!(
+        run("umask 777; umask u=X; umask")?,
+        ("0777\n".to_string(), 0)
+    );
     // ...and a bare `who` means "all EXCEPT what the mask already covers", which
     // is why the same clause does different things from different masks.
     assert_eq!(run("umask 0; umask =r; umask")?, ("0333\n".to_string(), 0));
-    assert_eq!(run("umask 077; umask =r; umask")?, ("0377\n".to_string(), 0));
+    assert_eq!(
+        run("umask 077; umask =r; umask")?,
+        ("0377\n".to_string(), 0)
+    );
     // `=` CLEARS BEFORE THE PERMS ARE READ, so `X` and a permcopy in the same
     // clause see the cleared value. Reading them first is the plausible order
     // and it is wrong in both directions: `a=X` would be 0666 and `u=u` 0022.
     assert_eq!(run("umask 0; umask a=X; umask")?, ("0777\n".to_string(), 0));
-    assert_eq!(run("umask 022; umask u=u; umask")?, ("0722\n".to_string(), 0));
-    assert_eq!(run("umask 027; umask ugo=rX; umask")?, ("0333\n".to_string(), 0));
+    assert_eq!(
+        run("umask 022; umask u=u; umask")?,
+        ("0722\n".to_string(), 0)
+    );
+    assert_eq!(
+        run("umask 027; umask ugo=rX; umask")?,
+        ("0333\n".to_string(), 0)
+    );
     // A bare-`who` `=` clears all nine bits, NOT just the ones outside the
     // mask. Only visible once an earlier clause has pushed the running value
     // outside that set, which is why it needs a two-clause case.
@@ -2227,34 +2498,72 @@ fn umask_is_ashs_including_the_symbolic_form() -> Result<(), Box<dyn std::error:
         ("0377\n".to_string(), 0)
     );
     // One clause holds a LIST of actions, each seeing what the last left.
-    assert_eq!(run("umask 0; umask u+r-w; umask")?, ("0200\n".to_string(), 0));
+    assert_eq!(
+        run("umask 0; umask u+r-w; umask")?,
+        ("0200\n".to_string(), 0)
+    );
     // `s` and `t` are ordinary perms that happen to name bits outside the nine.
     // So neither is universally legal or universally inert: what decides is
     // whether the RESULT outgrew 0777. `o=rwxs` keeps no setuid bit and is
     // fine; `a+t` keeps sticky and so is an illegal mode.
     assert_eq!(run("umask 0; umask u=t; umask")?, ("0700\n".to_string(), 0));
-    assert_eq!(run("umask 022; umask o=rwxs; umask")?, ("0020\n".to_string(), 0));
-    assert_eq!(run("umask 022; umask u-s,g-w; umask")?, ("0022\n".to_string(), 0));
+    assert_eq!(
+        run("umask 022; umask o=rwxs; umask")?,
+        ("0020\n".to_string(), 0)
+    );
+    assert_eq!(
+        run("umask 022; umask u-s,g-w; umask")?,
+        ("0022\n".to_string(), 0)
+    );
     // A permcopy consumes ONE character, so anything after it must be another
     // action -- `u=gr` is an error, not a silently truncated `u=g`. Truncating
     // is the dangerous shape: a typo would set a DIFFERENT mask, not fail.
-    assert_eq!(run("umask 022; umask u=gr; echo st=$?; umask")?,
-        ("st=2\n0022\n".to_string(), 0));
+    assert_eq!(
+        run("umask 022; umask u=gr; echo st=$?; umask")?,
+        ("st=2\n0022\n".to_string(), 0)
+    );
     // Options bundle, `--` ends them, and a lone `-` is an operand. `-Sp` is
     // the case that proves EVERY character is checked: `-SS` alone passes
     // whether the loop reads one flag or all of them.
-    assert_eq!(run("umask 022; umask -SS")?, ("u=rwx,g=rx,o=rx\n".to_string(), 0));
-    assert_eq!(run("umask 022; umask -Sp; echo st=$?")?, ("st=2\n".to_string(), 0));
-    assert_eq!(run("umask 022; umask -SSp; echo st=$?")?, ("st=2\n".to_string(), 0));
+    assert_eq!(
+        run("umask 022; umask -SS")?,
+        ("u=rwx,g=rx,o=rx\n".to_string(), 0)
+    );
+    assert_eq!(
+        run("umask 022; umask -Sp; echo st=$?")?,
+        ("st=2\n".to_string(), 0)
+    );
+    assert_eq!(
+        run("umask 022; umask -SSp; echo st=$?")?,
+        ("st=2\n".to_string(), 0)
+    );
     assert_eq!(run("umask 022; umask --")?, ("0022\n".to_string(), 0));
-    assert_eq!(run("umask 022; umask -S -- 077; umask")?, ("0077\n".to_string(), 0));
+    assert_eq!(
+        run("umask 022; umask -S -- 077; umask")?,
+        ("0077\n".to_string(), 0)
+    );
     assert_eq!(run("umask 022; umask -; umask")?, ("0022\n".to_string(), 0));
     // Errors are status 2 and NOT fatal, so the script keeps going -- and the
     // mask is UNCHANGED. Asserting only that nothing printed would not tell a
     // rejected mode from one silently accepted, since neither prints.
     for bad in [
-        "8", "abc", "b=rwx", "99999999999", "07777", "+077", "u=s", "g+s", " ", "a+t",
-        "=t", "u=gr", "ao-ux", "u", "0778", "0x22", "22x",
+        "8",
+        "abc",
+        "b=rwx",
+        "99999999999",
+        "07777",
+        "+077",
+        "u=s",
+        "g+s",
+        " ",
+        "a+t",
+        "=t",
+        "u=gr",
+        "ao-ux",
+        "u",
+        "0778",
+        "0x22",
+        "22x",
     ] {
         let (stdout, code) = run(&format!("umask \"{bad}\"; echo after"))?;
         assert_eq!(code, 0, "`umask {bad}` must not end the script");
@@ -2264,10 +2573,19 @@ fn umask_is_ashs_including_the_symbolic_form() -> Result<(), Box<dyn std::error:
     }
     // A permcopy reads the RUNNING value, so a clause before it is visible:
     // entry-based copying would answer 0300 here, and 0227 below.
-    assert_eq!(run("umask 0; umask u=r,g=u; umask")?, ("0330\n".to_string(), 0));
-    assert_eq!(run("umask 077; umask u=rx,g=u; umask")?, ("0227\n".to_string(), 0));
+    assert_eq!(
+        run("umask 0; umask u=r,g=u; umask")?,
+        ("0330\n".to_string(), 0)
+    );
+    assert_eq!(
+        run("umask 077; umask u=rx,g=u; umask")?,
+        ("0227\n".to_string(), 0)
+    );
     // An empty operand and extra operands are both accepted silently.
-    assert_eq!(run("umask 077; umask \"\"; umask")?, ("0077\n".to_string(), 0));
+    assert_eq!(
+        run("umask 077; umask \"\"; umask")?,
+        ("0077\n".to_string(), 0)
+    );
     assert_eq!(run("umask 077 077; umask")?, ("0077\n".to_string(), 0));
     // An unknown option is an option error, not a mode error.
     assert_eq!(run("umask -p; echo after")?.0, "after\n");
@@ -2276,7 +2594,10 @@ fn umask_is_ashs_including_the_symbolic_form() -> Result<(), Box<dyn std::error:
     // reach the parent; td-sh's subshells are in-process clones sharing one
     // kernel mask, so this is the one piece of subshell state that needs an
     // explicit save/restore -- and it is invisible to every assertion above.
-    assert_eq!(run("umask 022; (umask 077); umask")?, ("0022\n".to_string(), 0));
+    assert_eq!(
+        run("umask 022; (umask 077); umask")?,
+        ("0022\n".to_string(), 0)
+    );
     assert_eq!(
         run("umask 022; (umask 077; umask); umask")?,
         ("0077\n0022\n".to_string(), 0)
@@ -2288,12 +2609,21 @@ fn umask_is_ashs_including_the_symbolic_form() -> Result<(), Box<dyn std::error:
         run("umask 022; x=$(umask 077; umask); echo $x; umask")?,
         ("0077\n0022\n".to_string(), 0)
     );
-    assert_eq!(run("umask 022; umask 077 | :; umask")?, ("0022\n".to_string(), 0));
-    assert_eq!(run("umask 022; : | umask 077; umask")?, ("0022\n".to_string(), 0));
+    assert_eq!(
+        run("umask 022; umask 077 | :; umask")?,
+        ("0022\n".to_string(), 0)
+    );
+    assert_eq!(
+        run("umask 022; : | umask 077; umask")?,
+        ("0022\n".to_string(), 0)
+    );
     // The async body prints nothing on purpose: td-sh runs it synchronously
     // (no job control yet), so a body that printed would pin THAT rather than
     // the mask.
-    assert_eq!(run("umask 022; (umask 077) & umask")?, ("0022\n".to_string(), 0));
+    assert_eq!(
+        run("umask 022; (umask 077) & umask")?,
+        ("0022\n".to_string(), 0)
+    );
     // ...nesting restores to the right level, not to the outermost...
     assert_eq!(
         run("umask 022; (umask 077; (umask 002; umask); umask); umask")?,
@@ -2301,9 +2631,15 @@ fn umask_is_ashs_including_the_symbolic_form() -> Result<(), Box<dyn std::error:
     );
     // ...and an `exit` out of the subshell still restores, which is why the
     // guard restores on Drop rather than at the end of the body.
-    assert_eq!(run("umask 022; (umask 077; exit 3); echo $?; umask")?, ("3\n0022\n".to_string(), 0));
+    assert_eq!(
+        run("umask 022; (umask 077; exit 3); echo $?; umask")?,
+        ("3\n0022\n".to_string(), 0)
+    );
     // A brace group is NOT a subshell, so there the mask does persist.
-    assert_eq!(run("umask 022; { umask 077; }; umask")?, ("0077\n".to_string(), 0));
+    assert_eq!(
+        run("umask 022; { umask 077; }; umask")?,
+        ("0077\n".to_string(), 0)
+    );
     Ok(())
 }
 
@@ -2340,10 +2676,17 @@ fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
         // same all-ones, which is why it matches -1 rather than 0.
         ("18446744073709551616", "29350 13153 5018 5161 8973 25390"),
     ] {
-        assert_eq!(run(&format!("RANDOM={seed}; {six}"))?, format!("{want}\n"), "seed {seed}");
+        assert_eq!(
+            run(&format!("RANDOM={seed}; {six}"))?,
+            format!("{want}\n"),
+            "seed {seed}"
+        );
     }
     // Re-seeding restarts the sequence rather than continuing it.
-    assert_eq!(run("RANDOM=1; echo $RANDOM; RANDOM=1; echo $RANDOM")?, "9882\n9882\n");
+    assert_eq!(
+        run("RANDOM=1; echo $RANDOM; RANDOM=1; echo $RANDOM")?,
+        "9882\n9882\n"
+    );
     // ARITHMETIC draws too, and draws once per mention: reading the stored text
     // instead would add the seed to itself.
     assert_eq!(run("RANDOM=1; echo $((RANDOM+RANDOM))")?, "41156\n");
@@ -2367,28 +2710,45 @@ fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
     // A subshell must NOT replay the parent's sequence -- ash clears the
     // generator in the child on purpose -- and must not disturb it either.
     let out = run("RANDOM=1; (echo $RANDOM >/dev/null); echo $RANDOM")?;
-    assert_eq!(out, "9882\n", "the subshell must not consume the parent's draw");
+    assert_eq!(
+        out, "9882\n",
+        "the subshell must not consume the parent's draw"
+    );
     // ...and must not INHERIT it either: an inheriting child would draw the
     // parent's un-consumed 9882, and five of them would draw it five times.
     let kids = run("RANDOM=1; for i in 1 2 3 4 5; do (echo $RANDOM); done")?;
     let kids: Vec<&str> = kids.split_whitespace().collect();
     assert_eq!(kids.len(), 5, "{kids:?}");
-    assert!(kids.iter().any(|v| *v != "9882"), "children inherited the parent generator: {kids:?}");
+    assert!(
+        kids.iter().any(|v| *v != "9882"),
+        "children inherited the parent generator: {kids:?}"
+    );
     for v in &kids {
-        assert!(v.parse::<u32>().is_ok_and(|n| n <= 32767), "out of range: {v}");
+        assert!(
+            v.parse::<u32>().is_ok_and(|n| n <= 32767),
+            "out of range: {v}"
+        );
     }
 
     // An INHERITED `RANDOM` seeds too: ash imports the environment through
     // `setvareq`, which fires the name's func. A shell that merely stored the
     // string would draw an unrelated sequence here.
-    for (seed, want) in [("1", "9882 31274"), ("42", "20351 9206"), ("5x", "3710 1948")] {
+    for (seed, want) in [
+        ("1", "9882 31274"),
+        ("42", "20351 9206"),
+        ("5x", "3710 1948"),
+    ] {
         let out = std::process::Command::new(&shell)
             .arg("-c")
             .arg("echo $RANDOM $RANDOM")
             .env_clear()
             .env("RANDOM", seed)
             .output()?;
-        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{want}\n"), "env RANDOM={seed}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{want}\n"),
+            "env RANDOM={seed}"
+        );
     }
 
     // A PREFIX assignment is undone by restoring the saved text, not by unsetting
@@ -2408,25 +2768,43 @@ fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
     );
     // With a VALUE the local assignment seeds like any other, and the outer
     // binding comes back on return.
-    assert_eq!(run("f(){ local RANDOM=7; echo $RANDOM; }; RANDOM=1; f; echo $RANDOM")?, "17008\n9882\n");
+    assert_eq!(
+        run("f(){ local RANDOM=7; echo $RANDOM; }; RANDOM=1; f; echo $RANDOM")?,
+        "17008\n9882\n"
+    );
 
     // `set -u` must not COST a draw. The nounset check and the expansion are two
     // lookups of the same name, and a dynamic lookup has a side effect -- so a
     // shell that checks by looking up skips every other number under `-u` alone.
-    assert_eq!(run("set -u; RANDOM=1; echo $RANDOM $RANDOM")?, "9882 31274\n");
-    assert_eq!(run("set -u; RANDOM=1; echo ${#RANDOM}; echo $RANDOM")?, "4\n31274\n");
-    assert_eq!(run("set -u; RANDOM=1; echo ${RANDOM#x}; echo $RANDOM")?, "9882\n31274\n");
+    assert_eq!(
+        run("set -u; RANDOM=1; echo $RANDOM $RANDOM")?,
+        "9882 31274\n"
+    );
+    assert_eq!(
+        run("set -u; RANDOM=1; echo ${#RANDOM}; echo $RANDOM")?,
+        "4\n31274\n"
+    );
+    assert_eq!(
+        run("set -u; RANDOM=1; echo ${RANDOM#x}; echo $RANDOM")?,
+        "9882\n31274\n"
+    );
 
     // `strtoul`'s range error is ULONG_MAX and is NOT negated afterwards, so an
     // absurd NEGATIVE seed is all-ones like an absurd positive one -- while a
     // magnitude that still fits is negated as usual.
-    assert_eq!(run("RANDOM=-18446744073709551616; echo $RANDOM")?, "29350\n");
+    assert_eq!(
+        run("RANDOM=-18446744073709551616; echo $RANDOM")?,
+        "29350\n"
+    );
     assert_eq!(run("RANDOM=-18446744073709551615; echo $RANDOM")?, "9882\n");
 
     // `readonly` does not block the UNSET, because ash applies the same
     // `(VREADONLY|VDYNAMIC)` exemption there -- but the attribute SURVIVES it, so
     // the next assignment is refused even though the name is no longer dynamic.
-    assert_eq!(run("readonly RANDOM; unset RANDOM; echo \"[$RANDOM]\"")?, "[]\n");
+    assert_eq!(
+        run("readonly RANDOM; unset RANDOM; echo \"[$RANDOM]\"")?,
+        "[]\n"
+    );
     let out = std::process::Command::new(&shell)
         .arg("-c")
         .arg("readonly RANDOM; unset RANDOM; RANDOM=1; echo reached")
@@ -2438,11 +2816,26 @@ fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
     // The untaken side of a `?:` is not evaluated AT ALL, so it must not draw --
     // while the dead side of `&&`/`||` IS evaluated by ash and must still draw.
     // One `live` flag cannot say both.
-    assert_eq!(run("RANDOM=1; echo $((1?0:RANDOM)); echo $RANDOM")?, "0\n9882\n");
-    assert_eq!(run("RANDOM=1; echo $((0?RANDOM:0)); echo $RANDOM")?, "0\n9882\n");
-    assert_eq!(run("RANDOM=1; echo $((0?RANDOM:RANDOM)); echo $RANDOM")?, "9882\n31274\n");
-    assert_eq!(run("RANDOM=1; echo $((0&&RANDOM)); echo $RANDOM")?, "0\n31274\n");
-    assert_eq!(run("RANDOM=1; echo $((1||RANDOM)); echo $RANDOM")?, "1\n31274\n");
+    assert_eq!(
+        run("RANDOM=1; echo $((1?0:RANDOM)); echo $RANDOM")?,
+        "0\n9882\n"
+    );
+    assert_eq!(
+        run("RANDOM=1; echo $((0?RANDOM:0)); echo $RANDOM")?,
+        "0\n9882\n"
+    );
+    assert_eq!(
+        run("RANDOM=1; echo $((0?RANDOM:RANDOM)); echo $RANDOM")?,
+        "9882\n31274\n"
+    );
+    assert_eq!(
+        run("RANDOM=1; echo $((0&&RANDOM)); echo $RANDOM")?,
+        "0\n31274\n"
+    );
+    assert_eq!(
+        run("RANDOM=1; echo $((1||RANDOM)); echo $RANDOM")?,
+        "1\n31274\n"
+    );
 
     // `unset` is the one thing that DOES retire it: the name is then genuinely
     // unset, so `set -u` fires on it.
@@ -2497,7 +2890,10 @@ fn the_shell_seeds_the_names_ash_seeds() -> Result<(), Box<dyn std::error::Error
     // An inherited value wins over the default, so these are defaults and not
     // constants the shell imposes.
     assert_eq!(run("echo \"$PS2\"", &[("PS2", "%")])?, "%\n");
-    assert_eq!(run("echo \"$HOSTNAME\"", &[("HOSTNAME", "given")])?, "given\n");
+    assert_eq!(
+        run("echo \"$HOSTNAME\"", &[("HOSTNAME", "given")])?,
+        "given\n"
+    );
     assert_eq!(run("echo \"$PATH\"", &[("PATH", "/given")])?, "/given\n");
     // PPID is the exception: ash sets it UNGUARDED (ash.c:14540), so a stale
     // exported value from a parent is replaced rather than believed. Asserting
@@ -2567,7 +2963,10 @@ fn a_non_utf8_environment_entry_does_not_abort_the_shell() -> Result<(), Box<dyn
     // The shell RUNS. This is the whole point: the abort came before any line of
     // the script, so every invocation died, not just one that named the entry.
     let out = run("echo ok")?;
-    assert_eq!((out.status.code(), out.stdout.as_slice()), (Some(0), b"ok\n".as_slice()));
+    assert_eq!(
+        (out.status.code(), out.stdout.as_slice()),
+        (Some(0), b"ok\n".as_slice())
+    );
 
     // A VALUE that does not decode reads back as U+FFFD, which is what `read` and
     // `$( )` already do with one. ash keeps the byte; that difference is the whole
@@ -2585,24 +2984,38 @@ fn a_non_utf8_environment_entry_does_not_abort_the_shell() -> Result<(), Box<dyn
         Ok(out.stdout.split(|&b| b == 0).map(<[u8]>::to_vec).collect())
     };
     let entries = child_env("exec cat /proc/self/environ")?;
-    assert!(entries.contains(&b"TD_SH_\xff=N\xfe".to_vec()), "{entries:?}");
+    assert!(
+        entries.contains(&b"TD_SH_\xff=N\xfe".to_vec()),
+        "{entries:?}"
+    );
     assert!(entries.contains(&b"TD_SH_\xfd=M".to_vec()), "{entries:?}");
     // The lossy value is what a CHILD gets too. Reading it back through `printf`
     // above cannot show that: an implementation that decoded lossily AND kept the
     // raw bytes aside would satisfy that assertion and still hand the child the
     // original, since the opaque entries are applied after the exported ones.
-    assert!(entries.contains(&"TD_SH_BADVAL=x\u{fffd}".as_bytes().to_vec()), "{entries:?}");
-    assert!(!entries.contains(&b"TD_SH_BADVAL=x\xfe".to_vec()), "{entries:?}");
+    assert!(
+        entries.contains(&"TD_SH_BADVAL=x\u{fffd}".as_bytes().to_vec()),
+        "{entries:?}"
+    );
+    assert!(
+        !entries.contains(&b"TD_SH_BADVAL=x\xfe".to_vec()),
+        "{entries:?}"
+    );
     // And nothing EXTRA: an import that both carried the entry and inserted a
     // lossy-named variable for it would pass every `contains` above while sending
     // the child a name ash never sends.
     assert!(
-        !entries.iter().any(|e| e.starts_with("TD_SH_\u{fffd}".as_bytes())),
+        !entries
+            .iter()
+            .any(|e| e.starts_with("TD_SH_\u{fffd}".as_bytes())),
         "{entries:?}"
     );
     // Again from a subshell, which reaches a child through the OTHER spawn site.
     let entries = child_env("( cat /proc/self/environ )")?;
-    assert!(entries.contains(&b"TD_SH_\xff=N\xfe".to_vec()), "{entries:?}");
+    assert!(
+        entries.contains(&b"TD_SH_\xff=N\xfe".to_vec()),
+        "{entries:?}"
+    );
     assert!(entries.contains(&b"TD_SH_\xfd=M".to_vec()), "{entries:?}");
     Ok(())
 }
@@ -2778,12 +3191,14 @@ impl ProbeDir {
 /// real child shows it: the builtin route already applied prefixes to shell state,
 /// so nothing in-process could tell the two models apart.
 #[test]
-fn a_prefix_assignment_reaches_the_external_lookup()
--> Result<(), Box<dyn std::error::Error>> {
+fn a_prefix_assignment_reaches_the_external_lookup() -> Result<(), Box<dyn std::error::Error>> {
     let probe = ProbeDir::new("prefix")?;
     let path = probe.0 .0.display();
     let ran = (0, "RAN\n".to_string());
-    assert_eq!(probe.run(&format!("PATH={path} td_sh_probe -c 'echo RAN'"))?, ran);
+    assert_eq!(
+        probe.run(&format!("PATH={path} td_sh_probe -c 'echo RAN'"))?,
+        ran
+    );
     // ... and the child sees it too, since it is EXPORTED for that run rather than
     // passed alongside.
     assert_eq!(
@@ -2793,11 +3208,15 @@ fn a_prefix_assignment_reaches_the_external_lookup()
     // The shell's own binding is restored afterwards -- on the failing path as
     // well, where the lookup never resolved.
     assert_eq!(
-        probe.run(&format!("PATH=orig; PATH={path} td_sh_probe -c ':'; echo [$PATH]"))?,
+        probe.run(&format!(
+            "PATH=orig; PATH={path} td_sh_probe -c ':'; echo [$PATH]"
+        ))?,
         (0, "[orig]\n".into())
     );
     assert_eq!(
-        probe.run("PATH=orig; PATH=zz td_sh_probe -c ':'; echo [$PATH]")?.1,
+        probe
+            .run("PATH=orig; PATH=zz td_sh_probe -c ':'; echo [$PATH]")?
+            .1,
         "[orig]\n"
     );
     assert_eq!(
@@ -2833,9 +3252,11 @@ fn a_prefix_assignment_reaches_the_external_lookup()
     // ... and one that fails to EXPAND leaves the old value standing, which is what
     // an EXIT trap then sees. Both halves of the order are observable.
     assert_eq!(
-        probe.run(&format!(
+        probe
+            .run(&format!(
             "trap 'echo trap=[$X]' EXIT; X=old; PATH={path} X=new td_sh_probe -c ':' >${{u:?boom}}"
-        ))?.1,
+        ))?
+            .1,
         "trap=[old]\n"
     );
     // The assignment's own expansion runs with the redirections already in force.
@@ -2847,7 +3268,9 @@ fn a_prefix_assignment_reaches_the_external_lookup()
     );
     // The LAST of a repeated name wins, as it would in a plain assignment.
     assert_eq!(
-        probe.run(&format!("PATH={path} v=1 v=2 td_sh_probe -c 'echo [$v]'"))?.1,
+        probe
+            .run(&format!("PATH={path} v=1 v=2 td_sh_probe -c 'echo [$v]'"))?
+            .1,
         "[2]\n"
     );
     // The export FLAG is restored, both directions: a variable that was not
@@ -2855,21 +3278,29 @@ fn a_prefix_assignment_reaches_the_external_lookup()
     // its export. A second child is the probe for both -- host-free, where reading
     // `export -p` through a pipe would need a `grep` on the machine.
     assert_eq!(
-        probe.run(&format!(
-            "PATH={path}; u=1; u=2 td_sh_probe -c ':'; td_sh_probe -c 'echo [$u]'"
-        ))?.1,
+        probe
+            .run(&format!(
+                "PATH={path}; u=1; u=2 td_sh_probe -c ':'; td_sh_probe -c 'echo [$u]'"
+            ))?
+            .1,
         "[]\n"
     );
     assert_eq!(
-        probe.run(&format!(
-            "PATH={path}; export x=orig; x=1 td_sh_probe -c ':'; td_sh_probe -c 'echo [$x]'"
-        ))?.1,
+        probe
+            .run(&format!(
+                "PATH={path}; export x=orig; x=1 td_sh_probe -c ':'; td_sh_probe -c 'echo [$x]'"
+            ))?
+            .1,
         "[orig]\n"
     );
     // A repeated name is rolled back to what it was BEFORE the first of them, not
     // to what the first one set.
     assert_eq!(
-        probe.run(&format!("PATH={path} x=1 x=2 td_sh_probe -c ':'; echo \"[$x]\""))?.1,
+        probe
+            .run(&format!(
+                "PATH={path} x=1 x=2 td_sh_probe -c ':'; echo \"[$x]\""
+            ))?
+            .1,
         "[]\n"
     );
     // An unwind part-way through the list leaves the frame standing for the EXIT
@@ -2877,14 +3308,18 @@ fn a_prefix_assignment_reaches_the_external_lookup()
     // `defer_vars` branch, which the redirect-word case above cannot reach because
     // nothing has been assigned by then.
     assert_eq!(
-        probe.run(&format!(
-            "trap 'echo t=[$x]' EXIT; PATH={path} x=1 y=${{u:?boom}} td_sh_probe -c ':'"
-        ))?.1,
+        probe
+            .run(&format!(
+                "trap 'echo t=[$x]' EXIT; PATH={path} x=1 y=${{u:?boom}} td_sh_probe -c ':'"
+            ))?
+            .1,
         "t=[1]\n"
     );
     // A readonly target is fatal before anything runs, as it is for a builtin.
     assert_eq!(
-        probe.run(&format!("readonly PATH=zz; PATH={path} td_sh_probe -c ':'"))?.0,
+        probe
+            .run(&format!("readonly PATH=zz; PATH={path} td_sh_probe -c ':'"))?
+            .0,
         2
     );
     Ok(())
@@ -2920,15 +3355,30 @@ fn command_p_moves_the_execution_lookup() -> Result<(), Box<dyn std::error::Erro
     );
     // A `command` wrapper inside another one keeps the outer `-p`, as ash's own
     // loop does -- but a QUERY inside one does not, because that re-parses.
-    assert_eq!(run(&format!("PATH={path} command -p command {probe_run}"))?.0, 127);
-    assert_eq!(run(&format!("PATH={path} command -p command command {probe_run}"))?.0, 127);
+    assert_eq!(
+        run(&format!("PATH={path} command -p command {probe_run}"))?.0,
+        127
+    );
+    assert_eq!(
+        run(&format!(
+            "PATH={path} command -p command command {probe_run}"
+        ))?
+        .0,
+        127
+    );
     assert_eq!(
         run(&format!("PATH={path} command -p command -v td_sh_probe"))?.1,
         format!("{path}/td_sh_probe\n")
     );
-    assert_eq!(run(&format!("PATH={path} command -- command {probe_run}"))?, ran);
+    assert_eq!(
+        run(&format!("PATH={path} command -- command {probe_run}"))?,
+        ran
+    );
     // `--` ends the level's options; it does not undo the `-p` already read.
-    assert_eq!(run(&format!("PATH={path} command -p -- {probe_run}"))?.0, 127);
+    assert_eq!(
+        run(&format!("PATH={path} command -p -- {probe_run}"))?.0,
+        127
+    );
     // A slash skips the search on BOTH sides, so the query answers under `-p` too
     // -- the half that would otherwise disagree with the execution above.
     assert_eq!(
@@ -2963,7 +3413,10 @@ fn file_writing_case_does_not_pollute_cwd() -> Result<(), Box<dyn std::error::Er
     let case = cases.first().ok_or("no case parsed")?;
     let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
     assert!(outcome.passed, "redirect case failed: {:?}", outcome.detail);
-    assert!(!Path::new(&marker).exists(), "case leaked {marker} into the cwd — isolation broken");
+    assert!(
+        !Path::new(&marker).exists(),
+        "case leaked {marker} into the cwd — isolation broken"
+    );
     Ok(())
 }
 
@@ -2989,7 +3442,10 @@ fn a_login_shell_reads_the_profiles() -> Result<(), Box<dyn std::error::Error>> 
         !control.contains("PROFILE-RAN"),
         "the host's /etc/profile prints this test's marker: {control:?}"
     );
-    std::fs::write(home.join(".profile"), "export FROM_PROFILE=yes\necho PROFILE-RAN\n")?;
+    std::fs::write(
+        home.join(".profile"),
+        "export FROM_PROFILE=yes\necho PROFILE-RAN\n",
+    )?;
 
     // The Bourne convention: a leading `-` on argv[0] IS the login flag, and it
     // is the only channel `login` has for saying so.
@@ -3001,7 +3457,10 @@ fn a_login_shell_reads_the_profiles() -> Result<(), Box<dyn std::error::Error>> 
          /etc/profile ended the login before ours was reached)"
     );
     // ...and asking outright does the same thing.
-    assert_eq!(run("td-sh", &["-l"])?.0, format!("{control}PROFILE-RAN\ngot=yes\n"));
+    assert_eq!(
+        run("td-sh", &["-l"])?.0,
+        format!("{control}PROFILE-RAN\ngot=yes\n")
+    );
     // A plain shell does NOT read them -- neither ours nor the host's, which is
     // why this one can still be exact: a profile run per subshell would re-export
     // the operator's environment under every command a script starts.
@@ -3062,11 +3521,24 @@ fn a_profile_is_sourced_into_the_session_it_sets_up() -> Result<(), Box<dyn std:
 
     // `exit` ends the login there, with its own status, and nothing the shell was
     // invoked to run happens after it.
-    std::fs::write(home.join(".profile"), "trap 'echo BYE' EXIT\nexit 7\necho NOT-REACHED\n")?;
+    std::fs::write(
+        home.join(".profile"),
+        "trap 'echo BYE' EXIT\nexit 7\necho NOT-REACHED\n",
+    )?;
     let (out, code) = login_run(&home, "-sh", &[], "echo NOT-REACHED-EITHER")?;
-    assert_eq!(code, Some(7), "an `exit` in a profile did not end the login");
-    assert!(!out.contains("NOT-REACHED"), "the profile ran on past its exit: {out:?}");
-    assert!(out.ends_with("BYE\n"), "the EXIT trap did not run on the way out: {out:?}");
+    assert_eq!(
+        code,
+        Some(7),
+        "an `exit` in a profile did not end the login"
+    );
+    assert!(
+        !out.contains("NOT-REACHED"),
+        "the profile ran on past its exit: {out:?}"
+    );
+    assert!(
+        out.ends_with("BYE\n"),
+        "the EXIT trap did not run on the way out: {out:?}"
+    );
 
     // A profile whose function ABORTS mid-way leaves nothing of itself behind.
     // `Sig::Abort` unwinds without undoing the bindings it passed, so recovering
@@ -3079,7 +3551,11 @@ fn a_profile_is_sourced_into_the_session_it_sets_up() -> Result<(), Box<dyn std:
         "f() { local FROM_PROFILE=leaked; : ${missing:?}; }\nf\n",
     )?;
     let (out, code) = login_run(&home, "-sh", &["-i"], "echo got=[$FROM_PROFILE] st=$?")?;
-    assert_eq!(code, Some(0), "the interactive login did not recover: {out:?}");
+    assert_eq!(
+        code,
+        Some(0),
+        "the interactive login did not recover: {out:?}"
+    );
     assert!(
         out.ends_with("got=[] st=2\n"),
         "an aborted profile function left its `local` or the wrong `$?`: {out:?}"
@@ -3090,7 +3566,10 @@ fn a_profile_is_sourced_into_the_session_it_sets_up() -> Result<(), Box<dyn std:
     std::fs::write(home.join(".profile"), "trap 'echo BYE' EXIT\n")?;
     let (out, code) = login_run(&home, "-sh", &[], "echo body")?;
     assert_eq!(code, Some(0));
-    assert!(out.ends_with("body\nBYE\n"), "the EXIT trap fired early: {out:?}");
+    assert!(
+        out.ends_with("body\nBYE\n"),
+        "the EXIT trap fired early: {out:?}"
+    );
     let _ = std::fs::remove_dir_all(&home);
     Ok(())
 }
@@ -3112,11 +3591,16 @@ fn the_shell_stops_listening_to_the_terminal_while_a_child_runs(
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     let sh = shell.display().to_string();
     let run = |program: &str| -> Result<Vec<u64>, Box<dyn std::error::Error>> {
-        let out = std::process::Command::new(&shell).args(["-c", program]).output()?;
+        let out = std::process::Command::new(&shell)
+            .args(["-c", program])
+            .output()?;
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         let mut masks = Vec::new();
         for line in text.lines() {
-            let hex = line.split('=').nth(1).ok_or_else(|| format!("probe said {text:?}"))?;
+            let hex = line
+                .split('=')
+                .nth(1)
+                .ok_or_else(|| format!("probe said {text:?}"))?;
             masks.push(u64::from_str_radix(hex.trim(), 16)?);
         }
         Ok(masks)
@@ -3142,19 +3626,28 @@ fn the_shell_stops_listening_to_the_terminal_while_a_child_runs(
     let base = *run(&read_mask("idle", "/proc/self/status"))?
         .first()
         .ok_or("no idle mask")?;
-    assert_eq!(base & 0b110, 0, "a fresh shell already ignores an interrupt: {base:#x}");
+    assert_eq!(
+        base & 0b110,
+        0,
+        "a fresh shell already ignores an interrupt: {base:#x}"
+    );
     let held = base | 0b110;
 
     // An ordinary external command: the shell is deaf to both for as long as it
     // waits, and the child is not -- which is the whole trick, since a child that
     // inherited the ignore would be a command Ctrl-C could not end.
-    assert_eq!(run(&format!(r#""{sh}" -c '{probe}' {feed}"#))?, vec![base, held]);
+    assert_eq!(
+        run(&format!(r#""{sh}" -c '{probe}' {feed}"#))?,
+        vec![base, held]
+    );
 
     // The same while the shell is draining a CAPTURED stderr rather than sitting
     // in `wait`: for `x=$(cmd 2>&1)` that read is where the command is spent, so
     // a guard taken beside the wait would arrive after it was already over.
     assert_eq!(
-        run(&format!(r#"x=$("{sh}" -c '{probe}' 2>&1 {feed}); echo "$x""#))?,
+        run(&format!(
+            r#"x=$("{sh}" -c '{probe}' 2>&1 {feed}); echo "$x""#
+        ))?,
         vec![base, held]
     );
 
@@ -3205,7 +3698,11 @@ fn a_stage_that_set_no_umask_restores_none() -> Result<(), Box<dyn std::error::E
     // The sibling exits while the setter is still running, which is the whole
     // shape: its restore lands between the `umask` and the file it guards.
     run("umask 022; { umask 077; sleep 0.3; : > a; } | sleep 0.05")?;
-    assert_eq!(mode("a")?, 0o600, "a sibling's exit undid the mask the stage set");
+    assert_eq!(
+        mode("a")?,
+        0o600,
+        "a sibling's exit undid the mask the stage set"
+    );
     // The ordinary subshell restore is untouched by that, in both directions.
     run("umask 022; ( umask 077; : > /dev/null ); : > b")?;
     assert_eq!(mode("b")?, 0o644, "a subshell's mask escaped it");
@@ -3226,16 +3723,20 @@ fn a_stage_that_set_no_umask_restores_none() -> Result<(), Box<dyn std::error::E
 /// the child. Read from `/proc` by the child, as the test above is, because
 /// nothing else can see the disposition at the instant it is copied.
 #[test]
-fn a_stages_trap_reaches_its_own_children_only(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn a_stages_trap_reaches_its_own_children_only() -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     let sh = shell.display().to_string();
     let run = |program: &str| -> Result<Vec<u64>, Box<dyn std::error::Error>> {
-        let out = std::process::Command::new(&shell).args(["-c", program]).output()?;
+        let out = std::process::Command::new(&shell)
+            .args(["-c", program])
+            .output()?;
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         let mut masks = Vec::new();
         for line in text.lines() {
-            let hex = line.split('=').nth(1).ok_or_else(|| format!("probe said {text:?}"))?;
+            let hex = line
+                .split('=')
+                .nth(1)
+                .ok_or_else(|| format!("probe said {text:?}"))?;
             masks.push(u64::from_str_radix(hex.trim(), 16)?);
         }
         Ok(masks)
@@ -3244,7 +3745,9 @@ fn a_stages_trap_reaches_its_own_children_only(
                  < /proc/self/status";
     // Everything below is a delta on what a fresh td-sh already ignores (Rust's
     // runtime does SIGPIPE), measured rather than assumed.
-    let base = *run(&format!(r#""{sh}" -c '{probe}'"#))?.first().ok_or("no base mask")?;
+    let base = *run(&format!(r#""{sh}" -c '{probe}'"#))?
+        .first()
+        .ok_or("no base mask")?;
     // A consumer written with builtins alone, so the pipeline needs nothing on
     // `PATH` beyond the shell under test.
     let sink = "while read l; do echo \"$l\"; done";
@@ -3253,7 +3756,9 @@ fn a_stages_trap_reaches_its_own_children_only(
     // guard moves -- so it is the case that a fix bounded to those would miss.
     let term = 1u64 << 14;
     assert_eq!(
-        run(&format!(r#"{{ trap '' TERM; "{sh}" -c '{probe}'; }} | {sink}"#))?,
+        run(&format!(
+            r#"{{ trap '' TERM; "{sh}" -c '{probe}'; }} | {sink}"#
+        ))?,
         vec![base | term],
         "a stage's own child did not inherit its ignore"
     );
@@ -3301,7 +3806,9 @@ fn a_stages_trap_reaches_its_own_children_only(
     // ...and the parent's ignore is still inherited by a stage that leaves it
     // alone, which is the half that must NOT change.
     assert_eq!(
-        run(&format!(r#"trap '' TERM; {{ "{sh}" -c '{probe}'; }} | {sink}"#))?,
+        run(&format!(
+            r#"trap '' TERM; {{ "{sh}" -c '{probe}'; }} | {sink}"#
+        ))?,
         vec![base | term],
         "a stage lost an ignore it never touched"
     );
@@ -3310,10 +3817,15 @@ fn a_stages_trap_reaches_its_own_children_only(
     // ignoring it is POSIX's request that children be AUTO-REAPED, which costs
     // the very status this is about to wait for. dash and bash both keep it.
     let status = |program: &str| -> Result<String, Box<dyn std::error::Error>> {
-        let out = std::process::Command::new(&shell).args(["-c", program]).output()?;
+        let out = std::process::Command::new(&shell)
+            .args(["-c", program])
+            .output()?;
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
-    assert_eq!(status(&format!(r#"trap '' CHLD; "{sh}" -c 'exit 3'; echo st=$?"#))?, "st=3");
+    assert_eq!(
+        status(&format!(r#"trap '' CHLD; "{sh}" -c 'exit 3'; echo st=$?"#))?,
+        "st=3"
+    );
     assert_eq!(
         status(&format!(
             r#"{{ trap '' CHLD; "{sh}" -c 'exit 3'; echo st=$?; }} | {sink}"#
@@ -3347,7 +3859,9 @@ fn an_interrupt_is_not_confined_to_a_clone() -> Result<(), Box<dyn std::error::E
     // POSIX puts a shell at this path and `kill` is one of its builtins. If the
     // host's cannot produce a signal-killed child there is nothing to observe,
     // and a green test would be saying otherwise.
-    let probe = std::process::Command::new("/bin/sh").args(["-c", "kill -INT $$"]).output();
+    let probe = std::process::Command::new("/bin/sh")
+        .args(["-c", "kill -INT $$"])
+        .output();
     assert!(
         matches!(&probe, Ok(o) if o.status.code().is_none()),
         "/bin/sh -c 'kill -INT $$' did not die of a signal ({probe:?}) - this test needs \
@@ -3363,7 +3877,9 @@ fn an_interrupt_is_not_confined_to_a_clone() -> Result<(), Box<dyn std::error::E
         format!("{dies} | :; echo AFTER"),
         format!("for i in 1 2; do {dies}; done; echo AFTER"),
     ] {
-        let out = std::process::Command::new(&shell).args(["-c", &boundary]).output()?;
+        let out = std::process::Command::new(&shell)
+            .args(["-c", &boundary])
+            .output()?;
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
             "",
@@ -3418,7 +3934,10 @@ fn an_interrupt_is_not_confined_to_a_clone() -> Result<(), Box<dyn std::error::E
     // which is why the case above cannot reach this arm and this one can. Drop
     // the disposition half of that test and the shell aborts here instead.
     let out = std::process::Command::new(&shell)
-        .args(["-c", "trap '' INT; /bin/sh -c 'trap - INT; kill -INT $$'; echo AFTER"])
+        .args([
+            "-c",
+            "trap '' INT; /bin/sh -c 'trap - INT; kill -INT $$'; echo AFTER",
+        ])
         .output()?;
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -3479,7 +3998,10 @@ fn login_run(
         .env("HOME", home)
         .env("PATH", "/nonexistent");
     let out = c.output()?;
-    Ok((String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code()))
+    Ok((
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code(),
+    ))
 }
 
 /// A DIAGNOSTIC writer ends on a broken pipe, as the stdout writer already did.
@@ -3506,7 +4028,11 @@ fn a_broken_pipe_ends_a_diagnostic_writer() -> Result<(), Box<dyn std::error::Er
         let out = std::process::Command::new("/bin/sh")
             .args([
                 "-c",
-                &format!("exec timeout 20 {} -c {}", shell.display(), shell_quote(program)),
+                &format!(
+                    "exec timeout 20 {} -c {}",
+                    shell.display(),
+                    shell_quote(program)
+                ),
             ])
             .output()?;
         assert_eq!(
@@ -3536,7 +4062,11 @@ fn a_broken_pipe_ends_a_diagnostic_writer() -> Result<(), Box<dyn std::error::Er
             ),
         ])
         .output()?;
-    assert_eq!(out.status.code(), Some(0), "`set -n` hid a pending broken pipe");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "`set -n` hid a pending broken pipe"
+    );
 
     // ...and AFTER the command, or the LAST one's diagnostic is never noticed:
     // the script ends and reports its own status where bash reports 141.
@@ -3621,7 +4151,9 @@ fn a_broken_pipe_ends_a_diagnostic_writer() -> Result<(), Box<dyn std::error::Er
         "set -x; cd /nope 2>&-; echo alive",
         "echo hi >&-; echo rc=$?; cd /nope; echo alive",
     ] {
-        let out = std::process::Command::new(&shell).args(["-c", program]).output()?;
+        let out = std::process::Command::new(&shell)
+            .args(["-c", program])
+            .output()?;
         assert!(
             String::from_utf8_lossy(&out.stdout).contains("alive"),
             "`{program}` ended the shell on a diagnostic that was not a broken pipe: {out:?}"
@@ -3816,8 +4348,8 @@ fn a_pipeline_can_still_be_interrupted() -> Result<(), Box<dyn std::error::Error
 /// pins, and it exists because `&` running its list synchronously used to make
 /// the question moot.
 #[test]
-fn a_shell_with_a_background_job_can_still_be_interrupted(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn a_shell_with_a_background_job_can_still_be_interrupted() -> Result<(), Box<dyn std::error::Error>>
+{
     use std::os::unix::process::CommandExt;
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     // The job has to be one that really BLOCKS, or it exits at once, no guard is
@@ -3825,7 +4357,9 @@ fn a_shell_with_a_background_job_can_still_be_interrupted(
     // nothing. That is the `/bin/sleep` mistake this test's own history records,
     // so `sleep` is checked to exist and to sleep before it is relied on.
     let probe = std::time::Instant::now();
-    let slept = std::process::Command::new("/bin/sh").args(["-c", "sleep 0.4"]).status();
+    let slept = std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 0.4"])
+        .status();
     assert!(
         matches!(&slept, Ok(s) if s.success()) && probe.elapsed().as_millis() >= 300,
         "`sleep` does not exist or does not sleep ({slept:?}) - this test needs a job \
@@ -3855,7 +4389,10 @@ fn a_shell_with_a_background_job_can_still_be_interrupted(
     loop {
         match child.try_wait()? {
             Some(status) => {
-                assert!(status.code() != Some(0), "reported success after being interrupted");
+                assert!(
+                    status.code() != Some(0),
+                    "reported success after being interrupted"
+                );
                 return Ok(());
             }
             None if start.elapsed() > std::time::Duration::from_secs(5) => {
@@ -3886,7 +4423,10 @@ fn a_shell_with_a_background_job_can_still_be_interrupted(
 fn a_loop_of_jobs_does_not_exhaust_the_process() -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     let out = std::process::Command::new(&shell)
-        .args(["-c", "i=0; while [ $i -lt 40000 ]; do true & i=$((i+1)); done; echo ok"])
+        .args([
+            "-c",
+            "i=0; while [ $i -lt 40000 ]; do true & i=$((i+1)); done; echo ok",
+        ])
         .output()?;
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
     // Not merely non-zero: an abort has no code at all, and saying which it was
@@ -3924,18 +4464,30 @@ fn where_a_diagnostic_says_it_happened_depends_on_how_the_shell_was_started(
     };
     // A script FILE: `commandname` equals `$0`, so the component is dropped
     // and the line survives alone.
-    assert_eq!(err(&[&sp])?, format!("{sp}: line 3: nosuchcmd_xyz: not found\n"));
+    assert_eq!(
+        err(&[&sp])?,
+        format!("{sp}: line 3: nosuchcmd_xyz: not found\n")
+    );
     // Bare `-c`: neither. The command entered no builtin, and nothing else set
     // a name.
-    assert_eq!(err(&["-c", "nosuchcmd_xyz"])?, format!("{}: nosuchcmd_xyz: not found\n", shell.display()));
+    assert_eq!(
+        err(&["-c", "nosuchcmd_xyz"])?,
+        format!("{}: nosuchcmd_xyz: not found\n", shell.display())
+    );
     // `-c` WITH a name: the name is `$0` and `commandname` both, so this is the
     // script shape again -- a line, no component.
-    assert_eq!(err(&["-c", "nosuchcmd_xyz", "myname"])?, "myname: line 1: nosuchcmd_xyz: not found\n");
+    assert_eq!(
+        err(&["-c", "nosuchcmd_xyz", "myname"])?,
+        "myname: line 1: nosuchcmd_xyz: not found\n"
+    );
     // And a builtin under bare `-c` DOES name itself, since it sets the name
     // for as long as it runs.
     assert_eq!(
         err(&["-c", "cd /nope/x"])?,
-        format!("{}: cd: line 1: can't cd to /nope/x: No such file or directory\n", shell.display())
+        format!(
+            "{}: cd: line 1: can't cd to /nope/x: No such file or directory\n",
+            shell.display()
+        )
     );
     // The component is dropped whenever it repeats `$0`, whatever `$0` is:
     // named `cd`, the builtin's own component disappears.
@@ -3968,8 +4520,13 @@ fn an_interactive_shell_reports_a_line_only_for_input_it_opened(
     let sp = script.to_string_lossy().into_owned();
     let want = "can't cd to /nope/x: No such file or directory\n";
 
-    let out = std::process::Command::new(&shell).args(["-i", &sp]).output()?;
-    assert_eq!(String::from_utf8_lossy(&out.stderr), format!("{sp}: cd: line 3: {want}"));
+    let out = std::process::Command::new(&shell)
+        .args(["-i", &sp])
+        .output()?;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("{sp}: cd: line 3: {want}")
+    );
     // The SAME source on stdin: a real file, but one the shell did not open,
     // which is ash's `pf_fd` being 0 rather than positive. This is the one shape
     // here that reaches the REPL rather than a script or `-c`, so it PROMPTS --
@@ -3997,7 +4554,9 @@ fn an_interactive_shell_reports_a_line_only_for_input_it_opened(
     // A subshell inherits both fields; without that this loses the line. Run
     // INTERACTIVELY, or `!iflag` alone carries it and only the name is tested.
     std::fs::write(&script, ":\n:\n( nosuchcmd_zz )\n")?;
-    let out = std::process::Command::new(&shell).args(["-i", &sp]).output()?;
+    let out = std::process::Command::new(&shell)
+        .args(["-i", &sp])
+        .output()?;
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         format!("{sp}: line 3: nosuchcmd_zz: not found\n")
@@ -4087,8 +4646,8 @@ fn exec_does_not_abandon_a_running_job() -> Result<(), Box<dyn std::error::Error
 /// shell waiting for the job. Unbounded, so not the documented "a job costs the
 /// shell its own exit time" trade.
 #[test]
-fn a_job_waiting_on_the_shells_own_descriptor_does_not_hang() -> Result<(), Box<dyn std::error::Error>>
-{
+fn a_job_waiting_on_the_shells_own_descriptor_does_not_hang(
+) -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     let dir = std::env::temp_dir().join(format!("td-sh-jobfifo-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
@@ -4152,26 +4711,37 @@ fn shell_quote(s: &str) -> String {
 /// stray-`break` catch-all before, which took bash's side without saying so and
 /// left `$?` untouched besides.
 #[test]
-fn an_interrupted_profile_ends_a_non_interactive_login() -> Result<(), Box<dyn std::error::Error>>
-{
-    let probe = std::process::Command::new("/bin/sh").args(["-c", "kill -INT $$"]).output();
+fn an_interrupted_profile_ends_a_non_interactive_login() -> Result<(), Box<dyn std::error::Error>> {
+    let probe = std::process::Command::new("/bin/sh")
+        .args(["-c", "kill -INT $$"])
+        .output();
     assert!(
         matches!(&probe, Ok(o) if o.status.code().is_none()),
         "/bin/sh -c 'kill -INT $$' did not die of a signal - this test cannot run"
     );
     let home = profile_home("profile-interrupt")?;
-    std::fs::write(home.join(".profile"), "/bin/sh -c 'kill -INT $$'\necho REST_OF_PROFILE\n")?;
+    std::fs::write(
+        home.join(".profile"),
+        "/bin/sh -c 'kill -INT $$'\necho REST_OF_PROFILE\n",
+    )?;
 
     // Non-interactive: the login ends at 130 and the command never runs.
     let (out, code) = login_run(&home, "-sh", &[], "echo RAN_COMMAND")?;
     assert_eq!(out, "", "an interrupted profile still started the session");
-    assert_eq!(code, Some(130), "an interrupted login did not report 128 + SIGINT");
+    assert_eq!(
+        code,
+        Some(130),
+        "an interrupted login did not report 128 + SIGINT"
+    );
 
     // Interactive: the prompt is what an operator gets back, so the rest of the
     // profile is abandoned but the session — and the command — survive, with the
     // interrupt's status standing.
     let (out, code) = login_run(&home, "-sh", &["-i"], "echo status=$?")?;
-    assert_eq!(out, "status=130\n", "an interactive login did not recover the interrupt");
+    assert_eq!(
+        out, "status=130\n",
+        "an interactive login did not recover the interrupt"
+    );
     assert_eq!(code, Some(0));
 
     let _ = std::fs::remove_dir_all(&home);
@@ -4205,7 +4775,10 @@ fn a_broken_profile_is_not_a_failed_login() -> Result<(), Box<dyn std::error::Er
 
     // A command that is not there, then one that is: the profile keeps going, and
     // neither its failure nor its status reaches the shell.
-    std::fs::write(home.join(".profile"), "no_such_command_at_all\nexport LATER=set\n")?;
+    std::fs::write(
+        home.join(".profile"),
+        "no_such_command_at_all\nexport LATER=set\n",
+    )?;
     let (out, _, ok) = run("echo later=$LATER status=$?")?;
     assert!(ok, "a failing profile ended the login");
     assert_eq!(out, format!("{host_out}later=set status=0\n"));
@@ -4226,11 +4799,20 @@ fn a_broken_profile_is_not_a_failed_login() -> Result<(), Box<dyn std::error::Er
     // The image is unaffected -- td-login starts an INTERACTIVE shell, which
     // recovers in both shells, so a typo in `/etc/profile` still does not cost
     // the operator their session.
-    for fatal in ["if\necho NOT-REACHED\n", ": ${missing:?}\necho NOT-REACHED\n"] {
+    for fatal in [
+        "if\necho NOT-REACHED\n",
+        ": ${missing:?}\necho NOT-REACHED\n",
+    ] {
         std::fs::write(home.join(".profile"), fatal)?;
         let (out, err, ok) = run("echo NOT-REACHED-EITHER")?;
-        assert!(!ok, "a fatal profile error did not end a non-interactive login");
-        assert_eq!(out, host_out, "the login ran on past a fatal profile error: {out:?}");
+        assert!(
+            !ok,
+            "a fatal profile error did not end a non-interactive login"
+        );
+        assert_eq!(
+            out, host_out,
+            "the login ran on past a fatal profile error: {out:?}"
+        );
         // ...and it is reported against the file it is in -- `$0: <path>: ...`,
         // the shape `.` gives a sourced file, because a diagnostic naming no file
         // is one an operator cannot act on. `$0` is this login shell's own `-sh`,
@@ -4307,14 +4889,26 @@ fn an_explicit_dash_i_is_interactive_on_a_pipe() -> Result<(), Box<dyn std::erro
         assert!(err.contains("syntax error: unexpected \")\""), "{err:?}");
     }
     // A script stops there; an interactive shell goes back to its prompt.
-    assert_eq!(sout, "ONE\n", "a script ran on past a syntax error: {sout:?}");
-    assert_eq!(iout, "ONE\nTWO\n", "a syntax error ended an interactive shell: {iout:?}");
+    assert_eq!(
+        sout, "ONE\n",
+        "a script ran on past a syntax error: {sout:?}"
+    );
+    assert_eq!(
+        iout, "ONE\nTWO\n",
+        "a syntax error ended an interactive shell: {iout:?}"
+    );
     // And only the interactive one prompts -- on STDERR, so the stdout above is
     // the program's output and nothing else. POSIX puts PS1/PS2 there and ash
     // does; a prompt on stdout is data in whatever the operator redirected it to.
-    assert!(ierr.contains("[P1]"), "an interactive shell wrote no prompt: {ierr:?}");
+    assert!(
+        ierr.contains("[P1]"),
+        "an interactive shell wrote no prompt: {ierr:?}"
+    );
     assert!(!serr.contains("[P1]"), "a script wrote a prompt: {serr:?}");
-    assert_eq!(pout, "ONE\nTWO\n", "`+i` did not ask for an interactive shell: {pout:?}");
+    assert_eq!(
+        pout, "ONE\nTWO\n",
+        "`+i` did not ask for an interactive shell: {pout:?}"
+    );
     assert!(perr.contains("[P1]"), "`+i` wrote no prompt: {perr:?}");
     Ok(())
 }
@@ -4330,8 +4924,8 @@ fn an_explicit_dash_i_is_interactive_on_a_pipe() -> Result<(), Box<dyn std::erro
 /// cannot touch the runner's own file; this one has to let the default be
 /// computed, or it would pass by naming no history rather than by keeping none.
 #[test]
-fn an_interactive_shell_keeps_no_history_for_a_session_nobody_typed_at()
--> Result<(), Box<dyn std::error::Error>> {
+fn an_interactive_shell_keeps_no_history_for_a_session_nobody_typed_at(
+) -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     let home = std::env::temp_dir().join(format!("td-sh-hist-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
@@ -4363,8 +4957,8 @@ fn an_interactive_shell_keeps_no_history_for_a_session_nobody_typed_at()
 /// line finishes it. This is the only end-to-end exercise of `parse_probe`'s
 /// incomplete arm -- every other caller of it is a unit test.
 #[test]
-fn an_interactive_shell_asks_for_the_rest_of_an_open_construct()
--> Result<(), Box<dyn std::error::Error>> {
+fn an_interactive_shell_asks_for_the_rest_of_an_open_construct(
+) -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     for (src, want) in [
         ("echo 'a\nb'\necho AFTER\n", "a\nb\nAFTER\n"),

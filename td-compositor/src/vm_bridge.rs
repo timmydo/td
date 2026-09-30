@@ -158,19 +158,28 @@ impl Session {
                 guest_key(
                     &feed_path.with_file_name("vm-git-identity"),
                     Path::new(wire::git_key::RESPONSE),
-                    &request.data, uid, 1000,
-                ).map(|data| (0, data))
+                    &request.data,
+                    uid,
+                    1000,
+                )
+                .map(|data| (0, data))
             }
             wire::WORKSPACE | wire::WORKSPACE_ENSURE if request.revision == 0 => {
                 self.lease = None;
                 let uid = fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid();
-                guest_workspace(&feed_path.with_file_name("vm-workspace"),
-                    Path::new(wire::workspace::RESPONSE), &request.data, uid, 1000,
-                    request.verb == wire::WORKSPACE_ENSURE)
-                    .map(|data| (0, data))
+                guest_workspace(
+                    &feed_path.with_file_name("vm-workspace"),
+                    Path::new(wire::workspace::RESPONSE),
+                    &request.data,
+                    uid,
+                    1000,
+                    request.verb == wire::WORKSPACE_ENSURE,
+                )
+                .map(|data| (0, data))
             }
             wire::WORKSPACE_TERMINAL | wire::WORKSPACE_CODEX | wire::WORKSPACE_CLAUDE
-                if request.revision == 0 => {
+                if request.revision == 0 =>
+            {
                 self.lease = None;
                 let plan = wire::workspace::Plan::parse(&request.data)?;
                 let uid = fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid();
@@ -187,7 +196,11 @@ impl Session {
             }
             wire::POWEROFF if request.revision == 0 && request.data.is_empty() => {
                 self.lease = None;
-                publish_request(&feed_path.with_file_name("vm-poweroff"), wire::POWER_RECORD, false)?;
+                publish_request(
+                    &feed_path.with_file_name("vm-poweroff"),
+                    wire::POWER_RECORD,
+                    false,
+                )?;
                 Ok((0, wire::POWER_QUEUED.to_vec()))
             }
             wire::FEED if request.revision == 0 => {
@@ -355,13 +368,26 @@ fn publish_public(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn publish_request(path: &Path, bytes: &[u8], reuse: bool) -> Result<(), String> {
-    if let Ok(file) = OpenOptions::new().read(true).custom_flags(0x20000 | 0x800).open(path) {
+    if let Ok(file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(0x20000 | 0x800)
+        .open(path)
+    {
         let mut current = Vec::new();
         let meta = file.metadata().map_err(|e| e.to_string())?;
-        if !meta.is_file() { return Err("invalid VM public configuration type".into()); }
-        if reuse && meta.uid() == fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid()
-            && meta.nlink() == 1 && meta.mode() & 0o022 == 0
-            && file.take((bytes.len() + 1) as u64).read_to_end(&mut current).is_ok() && current == bytes {
+        if !meta.is_file() {
+            return Err("invalid VM public configuration type".into());
+        }
+        if reuse
+            && meta.uid() == fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid()
+            && meta.nlink() == 1
+            && meta.mode() & 0o022 == 0
+            && file
+                .take((bytes.len() + 1) as u64)
+                .read_to_end(&mut current)
+                .is_ok()
+            && current == bytes
+        {
             return Ok(());
         }
     }
@@ -386,42 +412,71 @@ fn publish_request(path: &Path, bytes: &[u8], reuse: bool) -> Result<(), String>
     result
 }
 
-fn guest_key(request: &Path, response: &Path, bytes: &[u8], compositor: u32, human: u32) -> Result<Vec<u8>, String> {
+fn guest_key(
+    request: &Path,
+    response: &Path,
+    bytes: &[u8],
+    compositor: u32,
+    human: u32,
+) -> Result<Vec<u8>, String> {
     let id = wire::git_key::identity(bytes)?;
     for (path, owner) in [(request, compositor), (response, human)] {
         let parent = path.parent().ok_or("VM key endpoint has no parent")?;
-        let meta = fs::symlink_metadata(parent).map_err(|e| format!("inspect VM key runtime: {e}"))?;
+        let meta =
+            fs::symlink_metadata(parent).map_err(|e| format!("inspect VM key runtime: {e}"))?;
         if !meta.is_dir() || meta.uid() != owner || meta.mode() & 0o022 != 0 {
             return Err("VM key runtime has an untrusted type, owner or mode".into());
         }
     }
     publish_public(request, bytes)?;
-    let file = OpenOptions::new().read(true).custom_flags(0x20000 | 0x800).open(response)
-        .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
-            "Guest Git key pending; retry once the guest helper has generated it".into()
-        } else { format!("open guest public key: {e}") })?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(0x20000 | 0x800)
+        .open(response)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "Guest Git key pending; retry once the guest helper has generated it".into()
+            } else {
+                format!("open guest public key: {e}")
+            }
+        })?;
     let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() || meta.uid() != human || meta.nlink() != 1 || meta.mode() & 0o022 != 0 {
         return Err("guest public key has an untrusted type, owner or mode".into());
     }
     let mut reply = Vec::new();
-    file.take((wire::git_key::LIMIT + 1) as u64).read_to_end(&mut reply).map_err(|e| e.to_string())?;
+    file.take((wire::git_key::LIMIT + 1) as u64)
+        .read_to_end(&mut reply)
+        .map_err(|e| e.to_string())?;
     wire::git_key::parse(&reply, id)?;
     Ok(reply)
 }
 
-fn guest_workspace(request: &Path, response: &Path, bytes: &[u8], compositor: u32, human: u32, ensure: bool) -> Result<Vec<u8>, String> {
+fn guest_workspace(
+    request: &Path,
+    response: &Path,
+    bytes: &[u8],
+    compositor: u32,
+    human: u32,
+    ensure: bool,
+) -> Result<Vec<u8>, String> {
     let plan = wire::workspace::Plan::parse(bytes)?;
     trusted_workspace_directories(request, response, compositor, human)?;
     // Replacing the request allows an explicit retry after a failed clone.
     publish_request(request, bytes, ensure)?;
-    let file = match OpenOptions::new().read(true).custom_flags(0x20000 | 0x800).open(response) {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(0x20000 | 0x800)
+        .open(response)
+    {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && ensure => {
             return Ok(wire::workspace::pending(&plan));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err("Guest workspace preparation pending; retry clone to inspect completion".into());
+            return Err(
+                "Guest workspace preparation pending; retry clone to inspect completion".into(),
+            );
         }
         Err(e) => return Err(format!("read workspace status: {e}")),
     };
@@ -430,10 +485,17 @@ fn guest_workspace(request: &Path, response: &Path, bytes: &[u8], compositor: u3
         return Err("untrusted workspace response".into());
     }
     let mut reply = Vec::new();
-    file.take(4097).read_to_end(&mut reply).map_err(|e| e.to_string())?;
-    if reply.len() > 4096 { return Err("workspace response exceeds limit".into()); }
-    if ensure { wire::workspace::progress(&reply, &plan)?; }
-    else { wire::workspace::status(&reply, &plan)?; }
+    file.take(4097)
+        .read_to_end(&mut reply)
+        .map_err(|e| e.to_string())?;
+    if reply.len() > 4096 {
+        return Err("workspace response exceeds limit".into());
+    }
+    if ensure {
+        wire::workspace::progress(&reply, &plan)?;
+    } else {
+        wire::workspace::status(&reply, &plan)?;
+    }
     Ok(reply)
 }
 
@@ -471,11 +533,8 @@ fn trusted_workspace_directories(
     human: u32,
 ) -> Result<(), String> {
     for (path, owner) in [(request, compositor), (response, human)] {
-        let meta = fs::symlink_metadata(
-            path.parent()
-                .ok_or("workspace endpoint has no parent")?,
-        )
-        .map_err(|e| e.to_string())?;
+        let meta = fs::symlink_metadata(path.parent().ok_or("workspace endpoint has no parent")?)
+            .map_err(|e| e.to_string())?;
         if !meta.is_dir() || meta.uid() != owner || meta.mode() & 0o022 != 0 {
             return Err("untrusted workspace endpoint directory".into());
         }
@@ -583,17 +642,24 @@ mod tests {
             wire::workspace::failure(&plan, "failed"),
             wire::workspace::ready(&different),
         ] {
-            assert!(launch_task_terminal(&status, &plan, wire::WORKSPACE_TERMINAL, &mut |_| {
-                launches.set(launches.get().saturating_add(1));
-                Ok(())
-            })
-            .is_err());
+            assert!(
+                launch_task_terminal(&status, &plan, wire::WORKSPACE_TERMINAL, &mut |_| {
+                    launches.set(launches.get().saturating_add(1));
+                    Ok(())
+                })
+                .is_err()
+            );
         }
         assert_eq!(launches.get(), 0);
-        launch_task_terminal(&wire::workspace::ready(&plan), &plan, wire::WORKSPACE_TERMINAL, &mut |_| {
-            launches.set(launches.get().saturating_add(1));
-            Ok(())
-        })
+        launch_task_terminal(
+            &wire::workspace::ready(&plan),
+            &plan,
+            wire::WORKSPACE_TERMINAL,
+            &mut |_| {
+                launches.set(launches.get().saturating_add(1));
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(launches.get(), 1);
     }
@@ -615,19 +681,28 @@ mod tests {
                 wire::workspace::pending(&plan),
                 wire::workspace::failure(&plan, "failed"),
                 wire::workspace::ready(&wire::workspace::Plan {
-                    branch: "other".into(), ..plan.clone()
+                    branch: "other".into(),
+                    ..plan.clone()
                 }),
             ] {
                 assert!(launch_task_terminal(&status, &plan, verb, &mut launch).is_err());
             }
-            launch_task_terminal(&wire::workspace::ready(&plan), &plan, verb, &mut launch)
-                .unwrap();
+            launch_task_terminal(&wire::workspace::ready(&plan), &plan, verb, &mut launch).unwrap();
             assert_eq!(selections, [verb]);
-            assert!(launch_task_terminal(&wire::workspace::ready(&plan), &plan, verb,
-                &mut |_| Err("authority unavailable".into())).is_err());
+            assert!(
+                launch_task_terminal(&wire::workspace::ready(&plan), &plan, verb, &mut |_| Err(
+                    "authority unavailable".into()
+                ))
+                .is_err()
+            );
         }
-        assert!(launch_task_terminal(&wire::workspace::ready(&plan), &plan, "unknown",
-            &mut |_| panic!("unknown selection reached authority")).is_err());
+        assert!(launch_task_terminal(
+            &wire::workspace::ready(&plan),
+            &plan,
+            "unknown",
+            &mut |_| panic!("unknown selection reached authority")
+        )
+        .is_err());
     }
 
     #[test]
@@ -662,7 +737,10 @@ mod tests {
         let encoded = plan.encode();
         fs::write(&response, wire::workspace::ready(&plan)).unwrap();
         assert!(ready_workspace(&request, &response, &encoded, &plan, uid, uid).is_err());
-        assert!(!request.exists(), "terminal launch published a missing request");
+        assert!(
+            !request.exists(),
+            "terminal launch published a missing request"
+        );
 
         let mut different = plan.clone();
         different.branch = "different".into();
@@ -696,7 +774,11 @@ mod tests {
         let mut session = Session::default();
         let request = f.dir.join("vm-poweroff");
         for (revision, data) in [(1, &b""[..]), (0, &b"reboot"[..])] {
-            assert_eq!(f.request(&mut session, 1, wire::POWEROFF, revision, data).verb, wire::ERROR);
+            assert_eq!(
+                f.request(&mut session, 1, wire::POWEROFF, revision, data)
+                    .verb,
+                wire::ERROR
+            );
             assert!(!request.exists());
         }
         let reply = f.request(&mut session, 2, wire::POWEROFF, 0, b"");
@@ -705,7 +787,10 @@ mod tests {
         assert_eq!(fs::read(&request).unwrap(), wire::POWER_RECORD);
         let held = File::open(&request).unwrap();
         let previous = held.metadata().unwrap().ino();
-        assert_eq!(f.request(&mut session, 3, wire::POWEROFF, 0, b"").verb, wire::OK);
+        assert_eq!(
+            f.request(&mut session, 3, wire::POWEROFF, 0, b"").verb,
+            wire::OK
+        );
         assert_ne!(fs::metadata(&request).unwrap().ino(), previous);
         assert!(!f.dir.join("vm-workspace").exists());
     }
@@ -929,24 +1014,44 @@ mod tests {
         let request = f.dir.join("vm-git-identity");
         let response = f.dir.join("git-key");
         let id = "0123456789abcdef0123456789abcdef";
-        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+        let key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
         assert!(guest_key(&request, &response, b"../path", uid, uid).is_err());
         assert!(!request.exists());
-        assert!(guest_key(&request, &response, id.as_bytes(), uid, uid).unwrap_err().contains("pending"));
+        assert!(guest_key(&request, &response, id.as_bytes(), uid, uid)
+            .unwrap_err()
+            .contains("pending"));
         assert_eq!(fs::read(&request).unwrap(), id.as_bytes());
         fs::set_permissions(&request, fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(guest_key(&request, &response, id.as_bytes(), uid, uid).unwrap_err().contains("pending"));
+        assert!(guest_key(&request, &response, id.as_bytes(), uid, uid)
+            .unwrap_err()
+            .contains("pending"));
         assert_eq!(fs::metadata(&request).unwrap().mode() & 0o777, 0o644);
         let alias = f.dir.join("request-alias");
         fs::hard_link(&request, &alias).unwrap();
-        assert!(guest_key(&request, &response, id.as_bytes(), uid, uid).unwrap_err().contains("pending"));
+        assert!(guest_key(&request, &response, id.as_bytes(), uid, uid)
+            .unwrap_err()
+            .contains("pending"));
         assert_eq!(fs::metadata(&request).unwrap().nlink(), 1);
-        assert_ne!(fs::metadata(&request).unwrap().ino(), fs::metadata(&alias).unwrap().ino());
+        assert_ne!(
+            fs::metadata(&request).unwrap().ino(),
+            fs::metadata(&alias).unwrap().ino()
+        );
         let reply = wire::git_key::encode(id, key).unwrap();
         fs::write(&response, &reply).unwrap();
         fs::set_permissions(&response, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(guest_key(&request, &response, id.as_bytes(), uid, uid).unwrap(), reply);
-        assert!(guest_key(&request, &response, b"1123456789abcdef0123456789abcdef", uid, uid).is_err());
+        assert_eq!(
+            guest_key(&request, &response, id.as_bytes(), uid, uid).unwrap(),
+            reply
+        );
+        assert!(guest_key(
+            &request,
+            &response,
+            b"1123456789abcdef0123456789abcdef",
+            uid,
+            uid
+        )
+        .is_err());
         fs::set_permissions(&response, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(guest_key(&request, &response, id.as_bytes(), uid, uid).is_err());
         fs::set_permissions(&response, fs::Permissions::from_mode(0o644)).unwrap();
@@ -963,21 +1068,42 @@ mod tests {
     fn automatic_workspace_polling_preserves_request_inode_even_after_failure() {
         let f = Fixture::new();
         let uid = fs::metadata("/proc/self").unwrap().uid();
-        let request = f.dir.join("vm-workspace"); let response = f.dir.join("workspace-reply");
-        let plan = wire::workspace::example(); let encoded = plan.encode();
+        let request = f.dir.join("vm-workspace");
+        let response = f.dir.join("workspace-reply");
+        let plan = wire::workspace::example();
+        let encoded = plan.encode();
         assert!(encoded.len() > 129);
-        assert_eq!(guest_workspace(&request, &response, &encoded, uid, uid, true).unwrap(), wire::workspace::pending(&plan));
+        assert_eq!(
+            guest_workspace(&request, &response, &encoded, uid, uid, true).unwrap(),
+            wire::workspace::pending(&plan)
+        );
         let first = File::open(&request).unwrap();
-        for reply in [None, Some(wire::workspace::failure(&plan, "host unavailable")), Some(wire::workspace::ready(&plan))] {
-            if let Some(reply) = &reply { fs::write(&response, reply).unwrap(); }
+        for reply in [
+            None,
+            Some(wire::workspace::failure(&plan, "host unavailable")),
+            Some(wire::workspace::ready(&plan)),
+        ] {
+            if let Some(reply) = &reply {
+                fs::write(&response, reply).unwrap();
+            }
             let observed = guest_workspace(&request, &response, &encoded, uid, uid, true).unwrap();
-            assert_eq!(observed, reply.unwrap_or_else(|| wire::workspace::pending(&plan)));
-            assert_eq!(first.metadata().unwrap().ino(), fs::metadata(&request).unwrap().ino());
+            assert_eq!(
+                observed,
+                reply.unwrap_or_else(|| wire::workspace::pending(&plan))
+            );
+            assert_eq!(
+                first.metadata().unwrap().ino(),
+                fs::metadata(&request).unwrap().ino()
+            );
         }
         // Only an explicit Clone asks the helper to retry.
         guest_workspace(&request, &response, &encoded, uid, uid, false).unwrap();
-        assert_ne!(first.metadata().unwrap().ino(), fs::metadata(&request).unwrap().ino());
-        let mut other = plan.clone(); other.branch = "other".into();
+        assert_ne!(
+            first.metadata().unwrap().ino(),
+            fs::metadata(&request).unwrap().ino()
+        );
+        let mut other = plan.clone();
+        other.branch = "other".into();
         fs::write(&response, wire::workspace::failure(&other, "stale")).unwrap();
         assert!(guest_workspace(&request, &response, &encoded, uid, uid, true).is_err());
     }
@@ -986,23 +1112,41 @@ mod tests {
     fn workspace_exchange_retries_and_accepts_only_matching_owned_completion() {
         let f = Fixture::new();
         let uid = fs::metadata("/proc/self").unwrap().uid();
-        let request = f.dir.join("vm-workspace"); let response = f.dir.join("workspace-reply");
-        let plan = wire::workspace::example(); let encoded = plan.encode();
+        let request = f.dir.join("vm-workspace");
+        let response = f.dir.join("workspace-reply");
+        let plan = wire::workspace::example();
+        let encoded = plan.encode();
         assert!(guest_workspace(&request, &response, b"invalid", uid, uid, false).is_err());
         assert!(!request.exists());
-        assert!(guest_workspace(&request, &response, &encoded, uid, uid, false).unwrap_err().contains("pending"));
+        assert!(
+            guest_workspace(&request, &response, &encoded, uid, uid, false)
+                .unwrap_err()
+                .contains("pending")
+        );
         let first = fs::metadata(&request).unwrap();
         fs::write(&response, wire::workspace::ready(&plan)).unwrap();
         assert!(guest_workspace(&request, &response, &encoded, uid, uid, false).is_ok());
         assert_ne!(first.ino(), fs::metadata(&request).unwrap().ino());
-        let mut other = plan.clone(); other.commit = "b".repeat(40);
+        let mut other = plan.clone();
+        other.commit = "b".repeat(40);
         fs::write(&response, wire::workspace::ready(&other)).unwrap();
         assert!(guest_workspace(&request, &response, &encoded, uid, uid, false).is_err());
-        fs::write(&response, wire::workspace::failure(&plan, "Git clone failed")).unwrap();
-        assert!(guest_workspace(&request, &response, &encoded, uid, uid, false).unwrap_err().contains("Git clone failed"));
+        fs::write(
+            &response,
+            wire::workspace::failure(&plan, "Git clone failed"),
+        )
+        .unwrap();
+        assert!(
+            guest_workspace(&request, &response, &encoded, uid, uid, false)
+                .unwrap_err()
+                .contains("Git clone failed")
+        );
         fs::set_permissions(&response, fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(guest_workspace(&request, &response, &encoded, uid, uid, false).unwrap_err().contains("untrusted"));
+        assert!(
+            guest_workspace(&request, &response, &encoded, uid, uid, false)
+                .unwrap_err()
+                .contains("untrusted")
+        );
         assert!(guest_workspace(&request, &response, &encoded, uid + 1, uid, false).is_err());
     }
-
 }

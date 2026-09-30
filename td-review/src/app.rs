@@ -6,10 +6,8 @@ use std::io;
 use crate::git::{self, now_unix, Branch, DefaultRemote, Git};
 use crate::land::{self, Mode, Outcome, Preview};
 use crate::record;
+use crate::term::{self, Frame, Key, Line, Style, Ui, CYAN, GREEN, MAGENTA, RED, YELLOW};
 use crate::worktrees;
-use crate::term::{
-    self, Frame, Key, Line, Style, Ui, CYAN, GREEN, MAGENTA, RED, YELLOW,
-};
 
 pub enum Flow {
     Continue,
@@ -33,11 +31,16 @@ enum Prompt {
     /// unknown. The targets are pinned when the prompt is raised, so confirming
     /// cannot delete more than was shown. Branches landed in this session are
     /// swept by the push that publishes them and never come through here.
-    Delete { short: String, targets: Vec<land::DeleteTarget> },
+    Delete {
+        short: String,
+        targets: Vec<land::DeleteTarget>,
+    },
     /// Remove the worktrees whose branches have fully landed. Pinned when the
     /// prompt is raised, like a delete, so confirming cannot sweep more than
     /// the pane listed.
-    Sweep { paths: Vec<String> },
+    Sweep {
+        paths: Vec<String>,
+    },
 }
 
 /// What a push publishes to: the remotes and their push URLs, plus whoever a
@@ -221,15 +224,21 @@ impl App {
     pub fn reload(&mut self) -> io::Result<()> {
         self.stale_typeahead = true;
         self.branches = self.git.branches(&self.base)?;
-        self.readiness =
-            self.branches.iter().map(|b| readiness_of(&self.git, &self.base, b)).collect();
+        self.readiness = self
+            .branches
+            .iter()
+            .map(|b| readiness_of(&self.git, &self.base, b))
+            .collect();
         // One merge per branch that has anything ahead at all. Measured on this
         // repo's own remotes it costs what the record scan does, both around
         // 8ms a branch; the patch count behind a conflicted merge is a second
         // process, on the few branches that reach it.
         let base_tree = self.git.resolve_base(&self.base).ok();
-        self.prospects =
-            self.branches.iter().map(|b| self.git.prospect_of(base_tree.as_ref(), b)).collect();
+        self.prospects = self
+            .branches
+            .iter()
+            .map(|b| self.git.prospect_of(base_tree.as_ref(), b))
+            .collect();
         self.base_stale = self.git.base_behind_upstream(&self.base).unwrap_or(None);
         self.now = now_unix();
         self.apply_filter();
@@ -300,8 +309,11 @@ impl App {
                     // carries the full target list either way.
                     let first = targets.first().map(|t| &t.oid);
                     let mixed = targets.iter().any(|t| Some(&t.oid) != first);
-                    let where_ =
-                        targets.iter().map(|t| t.remote.as_str()).collect::<Vec<_>>().join(", ");
+                    let where_ = targets
+                        .iter()
+                        .map(|t| t.remote.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     format!(
                         " NOT VERIFIED AS LANDED.{} delete {short} from {where_} ?  [y] delete  [n] keep",
                         if mixed { " REMOTES DIFFER." } else { "" },
@@ -323,7 +335,10 @@ impl App {
         if self.status.is_empty() {
             f.push_text(keys, Style::dim());
         } else {
-            f.push_text(&format!(" {}", self.status), self.status_style.with_invert());
+            f.push_text(
+                &format!(" {}", self.status),
+                self.status_style.with_invert(),
+            );
         }
     }
 
@@ -353,8 +368,12 @@ impl App {
             );
         }
 
-        let name_width =
-            name_column(self.view.iter().filter_map(|&i| self.branches.get(i)).map(|b| &b.refname));
+        let name_width = name_column(
+            self.view
+                .iter()
+                .filter_map(|&i| self.branches.get(i))
+                .map(|b| &b.refname),
+        );
         // One cell per VIEW row, in view order — the order the loop below draws
         // them in, and what lets it read a verdict by position rather than
         // recomputing one.
@@ -365,7 +384,10 @@ impl App {
                 Some(b) => ready_cell(
                     b,
                     self.readiness.get(i),
-                    self.prospects.get(i).copied().unwrap_or(git::Prospect::Outstanding),
+                    self.prospects
+                        .get(i)
+                        .copied()
+                        .unwrap_or(git::Prospect::Outstanding),
                 ),
                 None => (record::Readiness::Unknown.label(), false),
             })
@@ -384,7 +406,10 @@ impl App {
             .map(|&i| match self.branches.get(i) {
                 Some(b) => counts_cell(
                     b,
-                    self.prospects.get(i).copied().unwrap_or(git::Prospect::Outstanding),
+                    self.prospects
+                        .get(i)
+                        .copied()
+                        .unwrap_or(git::Prospect::Outstanding),
                 ),
                 None => "?/?".to_string(),
             })
@@ -413,7 +438,9 @@ impl App {
             f.push_text("  no branches match", Style::dim());
         }
         for (row, &idx) in self.view.iter().enumerate().skip(top).take(height) {
-            let Some(b) = self.branches.get(idx) else { continue };
+            let Some(b) = self.branches.get(idx) else {
+                continue;
+            };
             let selected = row == self.sel;
             // Padded by measured columns: `{:<width$}` counts chars, so a
             // double-width name would shift the subject column right.
@@ -465,7 +492,10 @@ impl App {
         } else {
             // Bottom of the viewport, not its top: the top caps at total-height,
             // which reads as 80% when the last line is already on screen.
-            format!("{}%", (self.scroll.saturating_add(height).min(total) * 100) / total.max(1))
+            format!(
+                "{}%",
+                (self.scroll.saturating_add(height).min(total) * 100) / total.max(1)
+            )
         };
         self.title(f, &format!(" review  {name}  vs {}   [{pos}]", self.base));
         for line in r.lines.iter().skip(self.scroll).take(height) {
@@ -592,8 +622,11 @@ impl App {
             Key::Char('p') => self.push_base(false, term)?,
             Key::Char('P') => self.push_base(true, term)?,
             Key::Char('D') => {
-                if let Some(refname) =
-                    self.view.get(self.sel).and_then(|&i| self.branches.get(i)).map(|b| b.refname.clone())
+                if let Some(refname) = self
+                    .view
+                    .get(self.sel)
+                    .and_then(|&i| self.branches.get(i))
+                    .map(|b| b.refname.clone())
                 {
                     self.log.clear();
                     self.offer_delete(&refname, term)?;
@@ -622,7 +655,10 @@ impl App {
                     return Ok(());
                 }
                 Ok(DefaultRemote::Ambiguous) => {
-                    self.note("no default remote — F fetches all of them", Style::fg(YELLOW));
+                    self.note(
+                        "no default remote — F fetches all of them",
+                        Style::fg(YELLOW),
+                    );
                     return Ok(());
                 }
                 // Which remote to fetch is a query, not the fetch: report it
@@ -660,15 +696,19 @@ impl App {
         }
         let remotes = self.git.remotes()?;
         match self.git.default_remote(&self.base)? {
-            DefaultRemote::Remote(name) => {
-                Ok(Some((remotes.into_iter().filter(|(n, _)| n == &name).collect(), Vec::new())))
-            }
+            DefaultRemote::Remote(name) => Ok(Some((
+                remotes.into_iter().filter(|(n, _)| n == &name).collect(),
+                Vec::new(),
+            ))),
             DefaultRemote::NoRemotes => {
                 self.note("no remotes configured", Style::fg(YELLOW));
                 Ok(None)
             }
             DefaultRemote::Ambiguous => {
-                self.note("no default remote — P pushes to all of them", Style::fg(YELLOW));
+                self.note(
+                    "no default remote — P pushes to all of them",
+                    Style::fg(YELLOW),
+                );
                 Ok(None)
             }
         }
@@ -684,7 +724,8 @@ impl App {
                 land::LeftOut::OptedOut => Style::dim(),
                 land::LeftOut::Unreadable(_) => Style::fg(YELLOW),
             };
-            self.log.push(Line::new(format!("  {}", why.line(name)), style));
+            self.log
+                .push(Line::new(format!("  {}", why.line(name)), style));
         }
     }
 
@@ -722,8 +763,10 @@ impl App {
                     self.log.push(Line::blank());
                 }
                 self.log_title = format!("not pushing {}", self.base);
-                self.log
-                    .push(Line::new(format!("not pushing {}: {why}", self.base), Style::fg(YELLOW)));
+                self.log.push(Line::new(
+                    format!("not pushing {}: {why}", self.base),
+                    Style::fg(YELLOW),
+                ));
                 self.log_left_out(&left_out);
                 self.log_to_end(term);
             }
@@ -765,11 +808,17 @@ impl App {
         }
         // Per target, since they need not be level. What each remote holds is
         // read from its tracking ref, so it is only true as of the last fetch.
-        self.log.push(Line::new("what each target lacks, as of the last fetch:", Style::dim()));
+        self.log.push(Line::new(
+            "what each target lacks, as of the last fetch:",
+            Style::dim(),
+        ));
         for name in pushable(&remotes) {
             let lines = match self.git.unpushed_to(name, &self.base) {
                 Ok(Some(commits)) if commits.is_empty() => {
-                    vec![Line::new(format!("  {name} is already at this commit"), Style::dim())]
+                    vec![Line::new(
+                        format!("  {name} is already at this commit"),
+                        Style::dim(),
+                    )]
                 }
                 Ok(Some(commits)) => {
                     let mut lines = vec![Line::new(
@@ -789,7 +838,8 @@ impl App {
                             .take(SHOWN_COMMITS)
                             .map(|c| Line::new(format!("    {c}"), Style::fg(YELLOW))),
                     );
-                    if let Some(rest) = commits.len().checked_sub(SHOWN_COMMITS).filter(|n| *n > 0) {
+                    if let Some(rest) = commits.len().checked_sub(SHOWN_COMMITS).filter(|n| *n > 0)
+                    {
                         lines.push(Line::new(format!("    …and {rest} more"), Style::dim()));
                     }
                     lines
@@ -910,7 +960,8 @@ impl App {
                     _ => {
                         // The pane still says what the delete would have done,
                         // so it has to carry the record of what was kept.
-                        self.log.push(Line::new(format!("kept {short}"), Style::dim()));
+                        self.log
+                            .push(Line::new(format!("kept {short}"), Style::dim()));
                         self.log_to_end(term);
                         self.note(format!("kept {short}"), Style::dim());
                     }
@@ -1031,14 +1082,24 @@ impl App {
         self.screen = Screen::Log;
         self.redraw(term)?;
 
-        let landing =
-            land::land(&self.git, &self.base, &refname, mode, Some(&oid), Some(&base_oid))?;
+        let landing = land::land(
+            &self.git,
+            &self.base,
+            &refname,
+            mode,
+            Some(&oid),
+            Some(&base_oid),
+        )?;
         self.log = landing.log;
         self.log_to_end(term);
         match landing.outcome {
             Outcome::Committed { sha } => {
                 self.log.push(Line::new(
-                    format!("landed {} on {} — nothing published yet", land::short(&sha), self.base),
+                    format!(
+                        "landed {} on {} — nothing published yet",
+                        land::short(&sha),
+                        self.base
+                    ),
                     Style::fg(GREEN).with_bold(),
                 ));
                 // Named here because p asks nothing once pressed: what it will
@@ -1075,7 +1136,11 @@ impl App {
                 // for it would be re-popped and re-checked by every later push
                 // in the session, for ever.
                 if !rolling {
-                    self.landed.push_back(Landed { refname, oid, sha: sha.clone() });
+                    self.landed.push_back(Landed {
+                        refname,
+                        oid,
+                        sha: sha.clone(),
+                    });
                 }
                 self.log_to_end(term);
                 // A listing hiccup must not tear down the TUI after a good land.
@@ -1083,7 +1148,12 @@ impl App {
             }
             // Both leave work in the index or tree, so both need the bail-out.
             Outcome::Conflict | Outcome::Failed(_) => {
-                if self.git.dirty_entries().map(|d| !d.is_empty()).unwrap_or(true) {
+                if self
+                    .git
+                    .dirty_entries()
+                    .map(|d| !d.is_empty())
+                    .unwrap_or(true)
+                {
                     self.ask(Prompt::Conflict);
                 }
             }
@@ -1168,7 +1238,10 @@ impl App {
             // not reach, or a delete the remote refused, is for a later push.
             // An unanswerable git requeues too — a transient failure must not
             // be what makes a pending cleanup disappear for the session.
-            if self.landed_plan(&entry, None).map_or(true, |(_, t, _)| !t.is_empty()) {
+            if self
+                .landed_plan(&entry, None)
+                .map_or(true, |(_, t, _)| !t.is_empty())
+            {
                 self.landed.push_back(entry);
             }
         }
@@ -1237,8 +1310,7 @@ impl App {
     ) -> io::Result<(String, Vec<land::DeleteTarget>, Vec<land::DeleteTarget>)> {
         let names = self.git.remote_names()?;
         let (_, short) = git::split_remote(&entry.refname, &names);
-        let (targets, diverged) =
-            land::delete_plan(&self.git, short, only, Some(&entry.oid))?;
+        let (targets, diverged) = land::delete_plan(&self.git, short, only, Some(&entry.oid))?;
         Ok((short.to_string(), targets, diverged))
     }
 
@@ -1338,8 +1410,10 @@ impl App {
         // and then explains none of what it found.
         let mut proofs: Vec<String> = Vec::with_capacity(targets.len());
         if cell_reads_zero {
-            self.log
-                .push(Line::new(format!("checking what deleting {short} takes…"), Style::dim()));
+            self.log.push(Line::new(
+                format!("checking what deleting {short} takes…"),
+                Style::dim(),
+            ));
             self.log_to_end(term);
             self.redraw(term)?;
             for t in &targets {
@@ -1364,12 +1438,17 @@ impl App {
                 .get(self.sel)
                 .and_then(|&i| self.branches.get(i).zip(self.prospects.get(i)));
             let why = match row {
-                Some((b, _)) if b.refname != refname => "this row is not the branch that was aimed at",
-                Some((b, &p)) if !takes_nothing(b, p) => "this row still counts commits the base does not carry",
+                Some((b, _)) if b.refname != refname => {
+                    "this row is not the branch that was aimed at"
+                }
+                Some((b, &p)) if !takes_nothing(b, p) => {
+                    "this row still counts commits the base does not carry"
+                }
                 Some(_) => "this row describes a commit that is no longer the branch's tip",
                 None => "there is no row here to check it against",
             };
-            self.log.push(Line::new(format!("  {why}"), Style::fg(YELLOW)));
+            self.log
+                .push(Line::new(format!("  {why}"), Style::fg(YELLOW)));
         }
         let may_skip_prompt = cell_reads_zero && proofs.len() == targets.len();
         // The prompt bar is one clipped row, so the pane must carry the record
@@ -1390,7 +1469,12 @@ impl App {
         for (i, t) in targets.iter().enumerate() {
             let vouched = match proofs.get(i).map(String::as_str) {
                 Some(base) => {
-                    format!(", carried by {}/{} at {}", t.remote, self.base, land::short(base))
+                    format!(
+                        ", carried by {}/{} at {}",
+                        t.remote,
+                        self.base,
+                        land::short(base)
+                    )
                 }
                 None => String::new(),
             };
@@ -1422,10 +1506,14 @@ impl App {
         // the parents every proof below is built on, and `--no-replace-objects`
         // covers neither.
         if self.git.graph_is_rewritten()? {
-            return Ok(Proof::Refused("this repository's history is grafted or shallow"));
+            return Ok(Proof::Refused(
+                "this repository's history is grafted or shallow",
+            ));
         }
         if !self.git.push_reaches_fetch_url(&t.remote)? {
-            return Ok(Proof::Refused("a push would not reach the repository this read"));
+            return Ok(Proof::Refused(
+                "a push would not reach the repository this read",
+            ));
         }
         let Some(tracked) = self.git.remote_branch_oid(&t.remote, &self.base)? else {
             return Ok(Proof::Refused("no copy of the base here"));
@@ -1458,7 +1546,9 @@ impl App {
         // print it would name whatever it had become by then, which on a repo
         // several agents fetch in is not the same question.
         if live != tracked {
-            return Ok(Proof::Refused("the remote's base has moved since the last fetch"));
+            return Ok(Proof::Refused(
+                "the remote's base has moved since the last fetch",
+            ));
         }
         Ok(Proof::Carried(tracked))
     }
@@ -1515,8 +1605,10 @@ impl App {
             match swept.error {
                 None => {
                     removed += 1;
-                    self.log
-                        .push(Line::new(format!("removed {}", swept.path), Style::fg(GREEN)));
+                    self.log.push(Line::new(
+                        format!("removed {}", swept.path),
+                        Style::fg(GREEN),
+                    ));
                 }
                 Some(e) => {
                     failed += 1;
@@ -1537,7 +1629,11 @@ impl App {
         self.log_to_end(term);
         self.note(
             format!("removed {removed} worktree(s)"),
-            if failed > 0 { Style::fg(RED) } else { Style::fg(GREEN) },
+            if failed > 0 {
+                Style::fg(RED)
+            } else {
+                Style::fg(GREEN)
+            },
         );
         Ok(())
     }
@@ -1558,7 +1654,8 @@ impl App {
     ) -> io::Result<()> {
         self.log_title = format!("deleting {short} from the remotes");
         self.screen = Screen::Log;
-        self.log.push(Line::new(format!("deleting {short}…"), Style::fg(YELLOW)));
+        self.log
+            .push(Line::new(format!("deleting {short}…"), Style::fg(YELLOW)));
         self.log_to_end(term);
         self.redraw(term)?;
 
@@ -1568,12 +1665,13 @@ impl App {
         self.log.push(match (all_ok, count) {
             (true, 0) => Line::new("nothing to delete", Style::fg(YELLOW)),
             (true, n) => Line::new(
-                format!("deleted {short} from {n} remote{}", if n == 1 { "" } else { "s" }),
+                format!(
+                    "deleted {short} from {n} remote{}",
+                    if n == 1 { "" } else { "s" }
+                ),
                 Style::fg(GREEN).with_bold(),
             ),
-            (false, _) => {
-                Line::new("some deletes failed", Style::fg(RED).with_bold())
-            }
+            (false, _) => Line::new("some deletes failed", Style::fg(RED).with_bold()),
         });
         self.log_to_end(term);
         self.refresh_quietly();
@@ -1611,19 +1709,28 @@ fn help_lines() -> Vec<Line> {
             ("enter", "review the selected branch against the base"),
             ("f", "fetch + prune the base's remote (else origin)"),
             ("F", "fetch + prune every remote, mirrors included"),
-            ("p", "push the base to its remote (else origin), then delete"),
+            (
+                "p",
+                "push the base to its remote (else origin), then delete",
+            ),
             ("", "the branches that push published — no confirmation"),
             ("P", "the same, to every remote — bar the no_push ones and"),
             ("", "any with `git config remote.<name>.skipPushAll true`,"),
             ("", "which `p` and a hand-typed `git push` still reach"),
             ("r", "re-read branches"),
             ("/", "filter by branch name (esc clears)"),
-            ("D", "delete the selected branch from the remote its row names"),
+            (
+                "D",
+                "delete the selected branch from the remote its row names",
+            ),
             ("", "— asked first, unless every check can prove the"),
             ("", "delete takes nothing; the pane names the one that"),
             ("", "could not, and then it asks"),
             ("w", "sweep worktrees whose branch has fully landed (clean,"),
-            ("", "unpushed, not -rolling); every other one says why it stays"),
+            (
+                "",
+                "unpushed, not -rolling); every other one says why it stays",
+            ),
             ("?", "this help"),
             ("q", "quit"),
         ],
@@ -1673,12 +1780,18 @@ fn help_lines() -> Vec<Line> {
     section(
         "landing",
         &[
-            ("s then y", "squash + commit, message from the branch's commits"),
+            (
+                "s then y",
+                "squash + commit, message from the branch's commits",
+            ),
             ("r", "replays each commit onto the base tip, message,"),
             ("", "author and all — all of them or none, and with no"),
             ("", "confirmation: it commits, it does not publish"),
             ("q, then p", "publish it: push the base (P = every remote)"),
-            ("after the push", "the branches it published are deleted from the"),
+            (
+                "after the push",
+                "the branches it published are deleted from the",
+            ),
             ("", "remotes it reached — no further confirmation"),
         ],
     );
@@ -1725,7 +1838,11 @@ fn name_column<'a>(names: impl Iterator<Item = &'a String>) -> usize {
 /// which the frame's own clip bounds — a row is sanitized to the terminal
 /// width like any other, so nothing but that subject is lost.
 fn fitted<'a>(cells: impl Iterator<Item = &'a str>, floor: usize) -> usize {
-    cells.map(|c| c.chars().count()).chain([floor]).max().unwrap_or(floor)
+    cells
+        .map(|c| c.chars().count())
+        .chain([floor])
+        .max()
+        .unwrap_or(floor)
 }
 
 /// Whether every commit a landing would replay carries the record AGENTS.md
@@ -1978,7 +2095,11 @@ fn preview_lines(branch: &Branch, p: &Preview, base: &str, now: i64) -> Vec<Line
         None => format!("  {} · {} ago", branch.author, branch.age(now)),
     }));
     out.push(Line::new(
-        format!("  tip {}  merge-base {}", land::short(&branch.commit), land::short(&p.merge_base)),
+        format!(
+            "  tip {}  merge-base {}",
+            land::short(&branch.commit),
+            land::short(&p.merge_base)
+        ),
         Style::dim(),
     ));
     out.push(Line::blank());
@@ -2041,7 +2162,6 @@ fn preview_lines(branch: &Branch, p: &Preview, base: &str, now: i64) -> Vec<Line
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2059,7 +2179,11 @@ mod tests {
 
     impl FakeUi {
         fn new() -> FakeUi {
-            FakeUi { frames: Vec::new(), drains: 0, drain_fails: false }
+            FakeUi {
+                frames: Vec::new(),
+                drains: 0,
+                drain_fails: false,
+            }
         }
 
         fn last(&self) -> &str {
@@ -2122,12 +2246,18 @@ mod tests {
         let origin = root.join("origin.git");
         let work = root.join("work");
         std::fs::create_dir_all(&work).unwrap();
-        git_in(&root, &["init", "--bare", "-b", "main", &origin.to_string_lossy()]);
+        git_in(
+            &root,
+            &["init", "--bare", "-b", "main", &origin.to_string_lossy()],
+        );
         git_in(&root, &["init", "-b", "main", &work.to_string_lossy()]);
         std::fs::write(work.join("f"), "one\n").unwrap();
         git_in(&work, &["add", "f"]);
         git_in(&work, &["commit", "-m", "base"]);
-        git_in(&work, &["remote", "add", "origin", &origin.to_string_lossy()]);
+        git_in(
+            &work,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        );
         git_in(&work, &["push", "origin", "main"]);
         git_in(&work, &["checkout", "-b", "work-0001-feature"]);
         std::fs::write(work.join("f"), "two\n").unwrap();
@@ -2155,7 +2285,11 @@ mod tests {
         git_in(&work, &["config", "status.showUntrackedFiles", "bogus"]);
         let git = Git::discover(&work).unwrap();
         let log = land::discard(&git).unwrap();
-        let text = log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        let text = log
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("could not be checked"), "{text}");
         assert!(!text.contains("back at HEAD"), "{text}");
         let _ = std::fs::remove_dir_all(&root);
@@ -2176,9 +2310,18 @@ mod tests {
         app.redraw(&mut ui).unwrap();
 
         let frame = ui.last();
-        assert!(frame.contains("will delete"), "the pane must say what is at stake:\n{frame}");
-        assert!(frame.contains("work-0001-feature"), "the branch must be named:\n{frame}");
-        assert!(frame.contains("origin"), "the remote must be named:\n{frame}");
+        assert!(
+            frame.contains("will delete"),
+            "the pane must say what is at stake:\n{frame}"
+        );
+        assert!(
+            frame.contains("work-0001-feature"),
+            "the branch must be named:\n{frame}"
+        );
+        assert!(
+            frame.contains("origin"),
+            "the remote must be named:\n{frame}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2196,11 +2339,17 @@ mod tests {
         app.handle(Key::Char('s'), &mut ui).unwrap();
         app.redraw(&mut ui).unwrap();
         let frame = ui.last().to_string();
-        assert!(frame.contains("squash into one commit"), "s must say so:\n{frame}");
+        assert!(
+            frame.contains("squash into one commit"),
+            "s must say so:\n{frame}"
+        );
 
         app.handle(Key::Char('n'), &mut ui).unwrap();
         app.handle(Key::Char('a'), &mut ui).unwrap();
-        assert!(app.prompt.is_none(), "the retired approve key must not raise a landing");
+        assert!(
+            app.prompt.is_none(),
+            "the retired approve key must not raise a landing"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2217,7 +2366,10 @@ mod tests {
         app.handle(Key::Enter, &mut ui).unwrap();
         app.handle(Key::Char('r'), &mut ui).unwrap();
         assert!(app.prompt.is_none(), "r must not raise a confirmation");
-        assert!(app.stale_typeahead(), "the keys typed before the land must be dropped");
+        assert!(
+            app.stale_typeahead(),
+            "the keys typed before the land must be dropped"
+        );
         assert_ne!(
             git_in(&work, &["rev-parse", "main"]).trim(),
             before,
@@ -2232,7 +2384,11 @@ mod tests {
         app.handle(Key::Char('s'), &mut ui).unwrap();
         assert!(app.prompt.is_some(), "s must still confirm");
         app.handle(Key::Char('n'), &mut ui).unwrap();
-        assert_eq!(git_in(&work2, &["rev-parse", "main"]).trim(), before2, "cancel must cancel");
+        assert_eq!(
+            git_in(&work2, &["rev-parse", "main"]).trim(),
+            before2,
+            "cancel must cancel"
+        );
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(root2);
     }
@@ -2253,15 +2409,26 @@ mod tests {
         let mut ui = FakeUi::new();
 
         app.handle(Key::Enter, &mut ui).unwrap();
-        app.feed(vec![Key::Char('r'), Key::Char('q'), Key::Char('p')], &mut ui).unwrap();
+        app.feed(
+            vec![Key::Char('r'), Key::Char('q'), Key::Char('p')],
+            &mut ui,
+        )
+        .unwrap();
 
-        assert_ne!(git_in(&work, &["rev-parse", "main"]).trim(), before, "r must still land");
+        assert_ne!(
+            git_in(&work, &["rev-parse", "main"]).trim(),
+            before,
+            "r must still land"
+        );
         assert_eq!(
             git_in(&origin, &["rev-parse", "main"]).trim(),
             published,
             "the keys behind r reached the push"
         );
-        assert!(app.stale_typeahead(), "the rest of that read must be dropped");
+        assert!(
+            app.stale_typeahead(),
+            "the rest of that read must be dropped"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2288,7 +2455,11 @@ mod tests {
             "an empty pane must not land again"
         );
         app.redraw(&mut ui).unwrap();
-        assert!(ui.last().contains("nothing to land"), "and must say why:\n{}", ui.last());
+        assert!(
+            ui.last().contains("nothing to land"),
+            "and must say why:\n{}",
+            ui.last()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2300,12 +2471,19 @@ mod tests {
         // `s` is answered, `r` is not: it lands on the keystroke.
         for (tag, keys, same) in [
             ("land-r", vec![Key::Enter, Key::Char('r')], true),
-            ("land-s", vec![Key::Enter, Key::Char('s'), Key::Char('y')], false),
+            (
+                "land-s",
+                vec![Key::Enter, Key::Char('s'), Key::Char('y')],
+                false,
+            ),
         ] {
             let (root, work) = repo(tag);
-            let tip = git_in(&work, &["rev-parse", "refs/remotes/origin/work-0001-feature"])
-                .trim()
-                .to_string();
+            let tip = git_in(
+                &work,
+                &["rev-parse", "refs/remotes/origin/work-0001-feature"],
+            )
+            .trim()
+            .to_string();
             let before = git_in(&work, &["rev-parse", "main"]).trim().to_string();
             let mut app = app_on(&work);
             let mut ui = FakeUi::new();
@@ -2346,10 +2524,20 @@ mod tests {
             app.handle(key, &mut ui).unwrap();
         }
 
-        assert!(app.prompt.is_none(), "landing must not raise a confirmation of its own");
-        assert_eq!(git_in(&origin, &["rev-parse", "main"]).trim(), before, "landing published");
         assert!(
-            git_in(&origin, &["rev-parse", "--verify", "work-0001-feature"]).trim().len() >= 40,
+            app.prompt.is_none(),
+            "landing must not raise a confirmation of its own"
+        );
+        assert_eq!(
+            git_in(&origin, &["rev-parse", "main"]).trim(),
+            before,
+            "landing published"
+        );
+        assert!(
+            git_in(&origin, &["rev-parse", "--verify", "work-0001-feature"])
+                .trim()
+                .len()
+                >= 40,
             "the branch was deleted before its work was published"
         );
         let landed = git_in(&work, &["rev-parse", "main"]).trim().to_string();
@@ -2359,7 +2547,11 @@ mod tests {
             app.handle(key, &mut ui).unwrap();
         }
 
-        assert_eq!(git_in(&origin, &["rev-parse", "main"]).trim(), landed, "p did not publish");
+        assert_eq!(
+            git_in(&origin, &["rev-parse", "main"]).trim(),
+            landed,
+            "p did not publish"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2381,9 +2573,19 @@ mod tests {
         app.handle(Key::Char('p'), &mut ui).unwrap();
 
         assert!(app.prompt.is_none(), "p must not raise a confirmation");
-        assert_eq!(git_in(&origin, &["rev-parse", "main"]).trim(), landed, "p did not publish");
-        let heads = git_in(&origin, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
-        assert!(!heads.contains("work-0001-feature"), "the landed branch survived: {heads}");
+        assert_eq!(
+            git_in(&origin, &["rev-parse", "main"]).trim(),
+            landed,
+            "p did not publish"
+        );
+        let heads = git_in(
+            &origin,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        );
+        assert!(
+            !heads.contains("work-0001-feature"),
+            "the landed branch survived: {heads}"
+        );
         // Nothing left waiting: origin was the only remote and it is done.
         assert!(app.landed.is_empty(), "the swept landing is still queued");
         let _ = std::fs::remove_dir_all(root);
@@ -2397,8 +2599,14 @@ mod tests {
         let (root, work) = repo("push-targets");
         let origin = root.join("origin.git");
         let backup = root.join("backup.git");
-        git_in(&root, &["init", "--bare", "-b", "main", &backup.to_string_lossy()]);
-        git_in(&work, &["remote", "add", "backup", &backup.to_string_lossy()]);
+        git_in(
+            &root,
+            &["init", "--bare", "-b", "main", &backup.to_string_lossy()],
+        );
+        git_in(
+            &work,
+            &["remote", "add", "backup", &backup.to_string_lossy()],
+        );
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
@@ -2408,14 +2616,26 @@ mod tests {
         let landed = git_in(&work, &["rev-parse", "main"]).trim().to_string();
         app.handle(Key::Char('p'), &mut ui).unwrap();
 
-        assert_eq!(git_in(&origin, &["rev-parse", "main"]).trim(), landed, "p missed origin");
-        assert_ne!(git_in(&backup, &["rev-parse", "main"]).trim(), landed, "p reached the mirror");
+        assert_eq!(
+            git_in(&origin, &["rev-parse", "main"]).trim(),
+            landed,
+            "p missed origin"
+        );
+        assert_ne!(
+            git_in(&backup, &["rev-parse", "main"]).trim(),
+            landed,
+            "p reached the mirror"
+        );
 
         for key in [Key::Char('q'), Key::Char('P')] {
             app.handle(key, &mut ui).unwrap();
         }
 
-        assert_eq!(git_in(&backup, &["rev-parse", "main"]).trim(), landed, "P missed the mirror");
+        assert_eq!(
+            git_in(&backup, &["rev-parse", "main"]).trim(),
+            landed,
+            "P missed the mirror"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2445,7 +2665,10 @@ mod tests {
         app.handle(Key::Char('p'), &mut ui).unwrap();
 
         assert!(
-            git_in(&origin, &["rev-parse", "--verify", "work-0001-feature"]).trim().len() >= 40,
+            git_in(&origin, &["rev-parse", "--verify", "work-0001-feature"])
+                .trim()
+                .len()
+                >= 40,
             "the branch was cleaned up though its landing never went out"
         );
 
@@ -2456,7 +2679,10 @@ mod tests {
             app.handle(key, &mut ui).unwrap();
         }
 
-        let heads = git_in(&origin, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+        let heads = git_in(
+            &origin,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        );
         assert!(
             !heads.contains("work-0001-feature"),
             "the landing was forgotten by the push that skipped it: {heads}"
@@ -2472,26 +2698,53 @@ mod tests {
     fn cleanup_spares_the_branch_on_a_mirror_the_push_did_not_reach() {
         let (root, work) = repo("cleanup-reach");
         let backup = root.join("backup.git");
-        git_in(&root, &["init", "--bare", "-b", "main", &backup.to_string_lossy()]);
-        git_in(&work, &["remote", "add", "backup", &backup.to_string_lossy()]);
+        git_in(
+            &root,
+            &["init", "--bare", "-b", "main", &backup.to_string_lossy()],
+        );
+        git_in(
+            &work,
+            &["remote", "add", "backup", &backup.to_string_lossy()],
+        );
         git_in(&work, &["push", "backup", "main"]);
         git_in(
             &work,
-            &["push", "backup", "refs/remotes/origin/work-0001-feature:refs/heads/work-0001-feature"],
+            &[
+                "push",
+                "backup",
+                "refs/remotes/origin/work-0001-feature:refs/heads/work-0001-feature",
+            ],
         );
         git_in(&work, &["fetch", "backup"]);
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('s'), Key::Char('y'), Key::Char('q'), Key::Char('p')] {
+        for key in [
+            Key::Enter,
+            Key::Char('s'),
+            Key::Char('y'),
+            Key::Char('q'),
+            Key::Char('p'),
+        ] {
             app.handle(key, &mut ui).unwrap();
         }
 
-        let heads = |dir: &Path| git_in(dir, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+        let heads = |dir: &Path| {
+            git_in(
+                dir,
+                &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+            )
+        };
         let origin_heads = heads(&root.join("origin.git"));
         let backup_heads = heads(&backup);
-        assert!(!origin_heads.contains("work-0001-feature"), "origin kept it: {origin_heads}");
-        assert!(backup_heads.contains("work-0001-feature"), "the mirror lost it: {backup_heads}");
+        assert!(
+            !origin_heads.contains("work-0001-feature"),
+            "origin kept it: {origin_heads}"
+        );
+        assert!(
+            backup_heads.contains("work-0001-feature"),
+            "the mirror lost it: {backup_heads}"
+        );
 
         // The mirror still carries it, so the landing is not done with: the
         // push that does reach the mirror takes the rest.
@@ -2518,12 +2771,23 @@ mod tests {
         let mut ui = FakeUi::new();
 
         app.handle(Key::Char('D'), &mut ui).unwrap();
-        for key in [Key::Char('j'), Key::Char('k'), Key::PageDown, Key::Char('g')] {
+        for key in [
+            Key::Char('j'),
+            Key::Char('k'),
+            Key::PageDown,
+            Key::Char('g'),
+        ] {
             app.handle(key, &mut ui).unwrap();
-            assert!(matches!(app.prompt, Some(Prompt::Delete { .. })), "{key:?} answered it");
+            assert!(
+                matches!(app.prompt, Some(Prompt::Delete { .. })),
+                "{key:?} answered it"
+            );
         }
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        assert!(refs.contains("work-0001-feature"), "a scroll key deleted the branch: {refs}");
+        assert!(
+            refs.contains("work-0001-feature"),
+            "a scroll key deleted the branch: {refs}"
+        );
 
         // And a real answer still lands: the pane is readable, not inert.
         app.handle(Key::Char('n'), &mut ui).unwrap();
@@ -2552,10 +2816,17 @@ mod tests {
 
         assert!(app.prompt.is_none(), "the sweep must not ask");
         assert!(
-            git_in(&origin, &["rev-parse", "--verify", "work-0001-feature"]).trim().len() >= 40,
+            git_in(&origin, &["rev-parse", "--verify", "work-0001-feature"])
+                .trim()
+                .len()
+                >= 40,
             "the branch went despite the refusal"
         );
-        assert_eq!(app.landed.len(), 1, "the landing was dropped by a refused delete");
+        assert_eq!(
+            app.landed.len(),
+            1,
+            "the landing was dropped by a refused delete"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2565,11 +2836,25 @@ mod tests {
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
     fn a_partial_push_still_sweeps_the_remotes_it_reached() {
         let (root, work) = repo("partial-push");
-        git_in(&work, &["remote", "add", "backup", &root.join("gone.git").to_string_lossy()]);
+        git_in(
+            &work,
+            &[
+                "remote",
+                "add",
+                "backup",
+                &root.join("gone.git").to_string_lossy(),
+            ],
+        );
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('s'), Key::Char('y'), Key::Char('q'), Key::Char('P')] {
+        for key in [
+            Key::Enter,
+            Key::Char('s'),
+            Key::Char('y'),
+            Key::Char('q'),
+            Key::Char('P'),
+        ] {
             app.handle(key, &mut ui).unwrap();
         }
 
@@ -2577,7 +2862,10 @@ mod tests {
             &root.join("origin.git"),
             &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
         );
-        assert!(!heads.contains("work-0001-feature"), "the reached remote kept it: {heads}");
+        assert!(
+            !heads.contains("work-0001-feature"),
+            "the reached remote kept it: {heads}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2588,15 +2876,24 @@ mod tests {
     fn p_says_why_when_there_is_no_single_remote_to_push_to() {
         let (root, work) = repo("push-refusals");
         let mirror = root.join("mirror.git");
-        git_in(&root, &["init", "--bare", "-b", "main", &mirror.to_string_lossy()]);
-        git_in(&work, &["remote", "add", "mirror", &mirror.to_string_lossy()]);
+        git_in(
+            &root,
+            &["init", "--bare", "-b", "main", &mirror.to_string_lossy()],
+        );
+        git_in(
+            &work,
+            &["remote", "add", "mirror", &mirror.to_string_lossy()],
+        );
         git_in(&work, &["remote", "rename", "origin", "upstream"]);
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
         app.handle(Key::Char('p'), &mut ui).unwrap();
         assert_eq!(app.status, "no default remote — P pushes to all of them");
-        assert!(app.prompt.is_none(), "an ambiguous p must not raise a confirmation");
+        assert!(
+            app.prompt.is_none(),
+            "an ambiguous p must not raise a confirmation"
+        );
 
         // A push url of `no_push` is the "never push here" convention: with
         // every target marked, P has nowhere to go either.
@@ -2604,7 +2901,11 @@ mod tests {
             git_in(&work, &["remote", "set-url", "--push", name, "no_push"]);
         }
         app.handle(Key::Char('P'), &mut ui).unwrap();
-        assert!(app.status.starts_with("every target is marked no_push"), "{}", app.status);
+        assert!(
+            app.status.starts_with("every target is marked no_push"),
+            "{}",
+            app.status
+        );
         assert!(app.prompt.is_none(), "there was nothing to confirm");
 
         for name in ["upstream", "mirror"] {
@@ -2638,20 +2939,36 @@ mod tests {
             app.sel = app
                 .view
                 .iter()
-                .position(|&i| app.branches.get(i).is_some_and(|b| b.refname.ends_with(name)))
+                .position(|&i| {
+                    app.branches
+                        .get(i)
+                        .is_some_and(|b| b.refname.ends_with(name))
+                })
                 .unwrap();
             for key in [Key::Enter, Key::Char('s'), Key::Char('y'), Key::Char('q')] {
                 app.handle(key, &mut ui).unwrap();
             }
         }
-        assert!(app.prompt.is_none(), "two landings must still not have prompted");
+        assert!(
+            app.prompt.is_none(),
+            "two landings must still not have prompted"
+        );
 
         app.handle(Key::Char('p'), &mut ui).unwrap();
 
         assert!(app.prompt.is_none(), "the sweep must not ask");
-        let heads = git_in(&origin, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
-        assert!(!heads.contains("work-0001-feature"), "the first landing was skipped: {heads}");
-        assert!(!heads.contains("work-0002-second"), "the second landing was skipped: {heads}");
+        let heads = git_in(
+            &origin,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        );
+        assert!(
+            !heads.contains("work-0001-feature"),
+            "the first landing was skipped: {heads}"
+        );
+        assert!(
+            !heads.contains("work-0002-second"),
+            "the second landing was skipped: {heads}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2669,7 +2986,12 @@ mod tests {
         git_in(&work, &["commit", "-am", "someone else's commit"]);
 
         let pushed = land::push_all(&git, "main", &approved, &remotes).unwrap();
-        let text = pushed.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        let text = pushed
+            .log
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(!pushed.all_ok, "{text}");
         assert_eq!(pushed.count(), 0, "{text}");
         assert!(text.contains("refusing to push"), "{text}");
@@ -2685,22 +3007,42 @@ mod tests {
     fn a_remote_can_opt_out_of_push_all_without_opting_out_of_a_push_that_names_it() {
         let (root, work) = repo("skip-pushall");
         let laptop = root.join("laptop.git");
-        git_in(&root, &["init", "--bare", "-b", "main", &laptop.to_string_lossy()]);
-        git_in(&work, &["remote", "add", "laptop", &laptop.to_string_lossy()]);
+        git_in(
+            &root,
+            &["init", "--bare", "-b", "main", &laptop.to_string_lossy()],
+        );
+        git_in(
+            &work,
+            &["remote", "add", "laptop", &laptop.to_string_lossy()],
+        );
         git_in(&work, &["config", "remote.laptop.skipPushAll", "true"]);
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
         app.handle(Key::Char('P'), &mut ui).unwrap();
 
-        let log = app.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        let log = app
+            .log
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             log.contains("laptop left out: remote.laptop.skipPushAll is set"),
             "the pane must say which remote it left out, and why:\n{log}"
         );
-        assert!(!log.contains("==> laptop"), "P pushed to the opted-out remote:\n{log}");
-        let heads = git_in(&laptop, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
-        assert!(heads.trim().is_empty(), "P published to the opted-out remote: {heads}");
+        assert!(
+            !log.contains("==> laptop"),
+            "P pushed to the opted-out remote:\n{log}"
+        );
+        let heads = git_in(
+            &laptop,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        );
+        assert!(
+            heads.trim().is_empty(),
+            "P published to the opted-out remote: {heads}"
+        );
 
         // Same remote, now the base's own: `p` names it, so it goes. `q` first
         // — the push left the pane up, where `p` is a scroll.
@@ -2709,8 +3051,14 @@ mod tests {
             app.handle(key, &mut ui).unwrap();
         }
 
-        let heads = git_in(&laptop, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
-        assert!(heads.contains("main"), "p must reach the remote it names: {heads}");
+        let heads = git_in(
+            &laptop,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        );
+        assert!(
+            heads.contains("main"),
+            "p must reach the remote it names: {heads}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2729,9 +3077,20 @@ mod tests {
         app.handle(Key::Char('P'), &mut ui).unwrap();
 
         assert_eq!(app.status, "every remote was left out — nothing to push");
-        let log = app.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(log.contains("origin left out:"), "the pane must name the remote:\n{log}");
-        assert!(log.contains("sometimes"), "git's diagnostic must reach the pane:\n{log}");
+        let log = app
+            .log
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            log.contains("origin left out:"),
+            "the pane must name the remote:\n{log}"
+        );
+        assert!(
+            log.contains("sometimes"),
+            "git's diagnostic must reach the pane:\n{log}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2744,19 +3103,45 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('s'), Key::Char('y'), Key::Char('q'), Key::Char('p')] {
+        for key in [
+            Key::Enter,
+            Key::Char('s'),
+            Key::Char('y'),
+            Key::Char('q'),
+            Key::Char('p'),
+        ] {
             app.handle(key, &mut ui).unwrap();
         }
 
         // The whole buffer, not the frame: the pane parks on its tail, and by
         // the time the sweep has run the plan has scrolled off a 24-row screen.
-        let log = app.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(log.contains("pushing main at"), "the commit is not named:\n{log}");
+        let log = app
+            .log
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            log.contains("pushing main at"),
+            "the commit is not named:\n{log}"
+        );
         assert!(log.contains("to: origin"), "remotes not named:\n{log}");
-        assert!(log.contains("as of the last fetch"), "the pane must date its data:\n{log}");
-        assert!(log.contains("feature: step"), "the commits are not named:\n{log}");
-        assert!(log.contains("published main to 1 remote"), "the outcome is not named:\n{log}");
-        assert!(log.contains("deleted work-0001-feature"), "the sweep is not recorded:\n{log}");
+        assert!(
+            log.contains("as of the last fetch"),
+            "the pane must date its data:\n{log}"
+        );
+        assert!(
+            log.contains("feature: step"),
+            "the commits are not named:\n{log}"
+        );
+        assert!(
+            log.contains("published main to 1 remote"),
+            "the outcome is not named:\n{log}"
+        );
+        assert!(
+            log.contains("deleted work-0001-feature"),
+            "the sweep is not recorded:\n{log}"
+        );
         // The pane is titled by what is happening, not by a question nobody is
         // asked: `run_push` sets the title before the frame it draws over the
         // network call, and `run_delete` before its own.
@@ -2789,16 +3174,27 @@ mod tests {
 
         app.handle(Key::Char('p'), &mut ui).unwrap();
 
-        let log = app.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        let log = app
+            .log
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             log.contains("origin/work-0001-feature is not the landed commit"),
             "the skip must be reported, not silent:\n{log}"
         );
         assert!(
-            git_in(&origin, &["rev-parse", "--verify", "work-0001-feature"]).trim().len() >= 40,
+            git_in(&origin, &["rev-parse", "--verify", "work-0001-feature"])
+                .trim()
+                .len()
+                >= 40,
             "a branch that moved off the landing was deleted"
         );
-        assert!(app.landed.is_empty(), "nothing can be deleted for it, so it must not requeue");
+        assert!(
+            app.landed.is_empty(),
+            "nothing can be deleted for it, so it must not requeue"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2832,21 +3228,41 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
         let row = |app: &App, name: &str| {
-            app.view.iter().position(|&i| {
-                app.branches.get(i).is_some_and(|b| b.refname == name)
-            })
+            app.view
+                .iter()
+                .position(|&i| app.branches.get(i).is_some_and(|b| b.refname == name))
         };
         app.sel = row(&app, "origin/work-0001-feature").unwrap();
         app.handle(Key::Char('D'), &mut ui).unwrap();
 
-        assert!(app.prompt.is_none(), "a branch with nothing of its own must not ask");
+        assert!(
+            app.prompt.is_none(),
+            "a branch with nothing of its own must not ask"
+        );
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        assert!(!refs.contains("work-0001-feature"), "it was not deleted: {refs}");
-        let log = app.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(log.contains("carries nothing already published"), "unrecorded delete:\n{log}");
+        assert!(
+            !refs.contains("work-0001-feature"),
+            "it was not deleted: {refs}"
+        );
+        let log = app
+            .log
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            log.contains("carries nothing already published"),
+            "unrecorded delete:\n{log}"
+        );
         // The proof is per remote, so the record names whose base vouched.
-        assert!(log.contains("carried by origin/main"), "unattributed delete:\n{log}");
-        assert!(log.contains("deleted work-0001-feature from 1 remote"), "{log}");
+        assert!(
+            log.contains("carried by origin/main"),
+            "unattributed delete:\n{log}"
+        );
+        assert!(
+            log.contains("deleted work-0001-feature from 1 remote"),
+            "{log}"
+        );
 
         // The other row is untouched by the rule: it asks, and answering
         // anything but yes keeps it. `q` first, because an unconfirmed delete
@@ -2854,10 +3270,16 @@ mod tests {
         app.handle(Key::Char('q'), &mut ui).unwrap();
         app.sel = row(&app, "origin/work-0002-open").unwrap();
         app.handle(Key::Char('D'), &mut ui).unwrap();
-        assert!(app.prompt.is_some(), "a branch carrying its own commit must ask");
+        assert!(
+            app.prompt.is_some(),
+            "a branch carrying its own commit must ask"
+        );
         app.handle(Key::Char('n'), &mut ui).unwrap();
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        assert!(refs.contains("work-0002-open"), "a kept branch was deleted: {refs}");
+        assert!(
+            refs.contains("work-0002-open"),
+            "a kept branch was deleted: {refs}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2888,10 +3310,16 @@ mod tests {
         let mut ui = FakeUi::new();
         app.handle(Key::Char('D'), &mut ui).unwrap();
 
-        assert!(app.prompt.is_some(), "origin's only copy of that work went unasked");
+        assert!(
+            app.prompt.is_some(),
+            "origin's only copy of that work went unasked"
+        );
         app.handle(Key::Char('n'), &mut ui).unwrap();
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        assert!(refs.contains("work-0001-feature"), "it was deleted anyway: {refs}");
+        assert!(
+            refs.contains("work-0001-feature"),
+            "it was deleted anyway: {refs}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2928,12 +3356,25 @@ mod tests {
             .iter()
             .position(|&i| app.branches.get(i).is_some_and(|b| b.refname == aimed))
             .unwrap();
-        app.feed(vec![Key::Char('D'), Key::Char('q'), Key::Char('D')], &mut ui).unwrap();
+        app.feed(
+            vec![Key::Char('D'), Key::Char('q'), Key::Char('D')],
+            &mut ui,
+        )
+        .unwrap();
 
-        assert!(app.stale_typeahead(), "the keys typed before the delete must be dropped");
+        assert!(
+            app.stale_typeahead(),
+            "the keys typed before the delete must be dropped"
+        );
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        assert!(!refs.contains("work-0001-feature"), "the aimed-at delete must still run: {refs}");
-        assert!(refs.contains("work-0002-second"), "a blind D reached a second branch: {refs}");
+        assert!(
+            !refs.contains("work-0001-feature"),
+            "the aimed-at delete must still run: {refs}"
+        );
+        assert!(
+            refs.contains("work-0002-second"),
+            "a blind D reached a second branch: {refs}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2948,18 +3389,36 @@ mod tests {
     fn d_asks_about_a_branch_whose_only_commit_is_empty() {
         let (root, work) = repo("d-empty-commit");
         git_in(&work, &["checkout", "-b", "work-0004-parked"]);
-        git_in(&work, &["commit", "--allow-empty", "-m", "parked\n\nNext: pick up at the parser"]);
+        git_in(
+            &work,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "parked\n\nNext: pick up at the parser",
+            ],
+        );
         git_in(&work, &["push", "origin", "work-0004-parked"]);
         git_in(&work, &["checkout", "main"]);
         git_in(&work, &["branch", "-D", "work-0004-parked"]);
         // The collision partner: an empty commit of the base's own, sharing the
         // branch's patch id and nothing else.
-        git_in(&work, &["commit", "--allow-empty", "-m", "main: an unrelated empty commit"]);
+        git_in(
+            &work,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "main: an unrelated empty commit",
+            ],
+        );
         git_in(&work, &["push", "origin", "main"]);
 
         let git = Git::discover(&work).unwrap();
         let base = git.rev_parse("refs/remotes/origin/main").unwrap();
-        let tip = git.rev_parse("refs/remotes/origin/work-0004-parked").unwrap();
+        let tip = git
+            .rev_parse("refs/remotes/origin/work-0004-parked")
+            .unwrap();
         assert!(
             !git.carries_nothing_new(&base, &tip).unwrap(),
             "an empty commit has no patch to be vouched for by"
@@ -2970,16 +3429,24 @@ mod tests {
             .view
             .iter()
             .position(|&i| {
-                app.branches.get(i).is_some_and(|b| b.refname == "origin/work-0004-parked")
+                app.branches
+                    .get(i)
+                    .is_some_and(|b| b.refname == "origin/work-0004-parked")
             })
             .unwrap();
         let mut ui = FakeUi::new();
         app.handle(Key::Char('D'), &mut ui).unwrap();
 
-        assert!(app.prompt.is_some(), "a parking commit that exists nowhere else went unasked");
+        assert!(
+            app.prompt.is_some(),
+            "a parking commit that exists nowhere else went unasked"
+        );
         app.handle(Key::Char('n'), &mut ui).unwrap();
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        assert!(refs.contains("work-0004-parked"), "it was deleted anyway: {refs}");
+        assert!(
+            refs.contains("work-0004-parked"),
+            "it was deleted anyway: {refs}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2997,17 +3464,28 @@ mod tests {
         // the only thing the graft ADDS is the branch's tip.
         git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
         git_in(&work, &["push", "origin", "main"]);
-        let base = git_in(&work, &["rev-parse", "refs/remotes/origin/main"]).trim().to_string();
-        let tip =
-            git_in(&work, &["rev-parse", "refs/remotes/origin/work-0001-feature"]).trim().to_string();
-        let target = land::DeleteTarget { remote: "origin".to_string(), oid: tip.clone() };
+        let base = git_in(&work, &["rev-parse", "refs/remotes/origin/main"])
+            .trim()
+            .to_string();
+        let tip = git_in(
+            &work,
+            &["rev-parse", "refs/remotes/origin/work-0001-feature"],
+        )
+        .trim()
+        .to_string();
+        let target = land::DeleteTarget {
+            remote: "origin".to_string(),
+            oid: tip.clone(),
+        };
 
         let app = app_on(&work);
         // Without the graft the branch is plainly unlanded, by the same count.
         assert!(!app.git.carries_nothing_new(&base, &tip).unwrap());
 
         // The graft claims the branch's tip is already a parent of the base.
-        let parent = git_in(&work, &["rev-parse", &format!("{base}^")]).trim().to_string();
+        let parent = git_in(&work, &["rev-parse", &format!("{base}^")])
+            .trim()
+            .to_string();
         let dir = work.join(".git").join("info");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("grafts"), format!("{base} {parent} {tip}\n")).unwrap();
@@ -3018,7 +3496,10 @@ mod tests {
             "the graft must actually fool the patch count, or this proves nothing"
         );
         // …and the rule refuses on the shape rather than believing it.
-        assert!(app.git.graph_is_rewritten().unwrap(), "a graft file must be seen");
+        assert!(
+            app.git.graph_is_rewritten().unwrap(),
+            "a graft file must be seen"
+        );
         assert!(matches!(
             app.delete_takes_nothing(&target).unwrap(),
             Proof::Refused(why) if why.contains("grafted")
@@ -3029,12 +3510,17 @@ mod tests {
             .view
             .iter()
             .position(|&i| {
-                app.branches.get(i).is_some_and(|b| b.refname == "origin/work-0001-feature")
+                app.branches
+                    .get(i)
+                    .is_some_and(|b| b.refname == "origin/work-0001-feature")
             })
             .unwrap();
         let mut ui = FakeUi::new();
         app.handle(Key::Char('D'), &mut ui).unwrap();
-        assert!(app.prompt.is_some(), "a grafted history vouched for a delete");
+        assert!(
+            app.prompt.is_some(),
+            "a grafted history vouched for a delete"
+        );
         app.handle(Key::Char('n'), &mut ui).unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3063,12 +3549,19 @@ mod tests {
         let mut ui = FakeUi::new();
         // Filter to one row, then clear it: every hidden row comes back and the
         // cursor is left over a different branch than the one it was on.
-        app.feed(vec![Key::Char('/'), Key::Char('s'), Key::Char('e')], &mut ui).unwrap();
+        app.feed(
+            vec![Key::Char('/'), Key::Char('s'), Key::Char('e')],
+            &mut ui,
+        )
+        .unwrap();
         assert_eq!(app.view.len(), 1, "the filter must actually hide a row");
         let before = git_in(&work, &["ls-remote", "--heads", "origin"]);
         app.feed(vec![Key::Esc, Key::Char('D')], &mut ui).unwrap();
 
-        assert!(app.stale_typeahead(), "clearing a filter must drop what follows");
+        assert!(
+            app.stale_typeahead(),
+            "clearing a filter must drop what follows"
+        );
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
         assert_eq!(refs, before, "a blind D deleted a restored row: {refs}");
         let _ = std::fs::remove_dir_all(root);
@@ -3101,7 +3594,9 @@ mod tests {
             .view
             .iter()
             .position(|&i| {
-                app.branches.get(i).is_some_and(|b| b.refname == "origin/work-0001-feature")
+                app.branches
+                    .get(i)
+                    .is_some_and(|b| b.refname == "origin/work-0001-feature")
             })
             .unwrap();
         for key in [Key::Enter, Key::Char('r'), Key::Char('q')] {
@@ -3111,11 +3606,18 @@ mod tests {
         app.feed(vec![Key::Char('p')], &mut ui).unwrap();
         // The operator, having watched that finish, now types `q D` — a batch
         // of its own, against a list they last saw before any of it.
-        app.feed(vec![Key::Char('q'), Key::Char('D')], &mut ui).unwrap();
+        app.feed(vec![Key::Char('q'), Key::Char('D')], &mut ui)
+            .unwrap();
 
-        assert!(app.stale_typeahead(), "revealing the list must drop what follows");
+        assert!(
+            app.stale_typeahead(),
+            "revealing the list must drop what follows"
+        );
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        assert!(refs.contains("work-0002-second"), "a blind D reached a second branch: {refs}");
+        assert!(
+            refs.contains("work-0002-second"),
+            "a blind D reached a second branch: {refs}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3155,13 +3657,23 @@ mod tests {
             .collect();
         // Somebody else deletes a branch; the next fetch prunes it and every
         // row below it moves up under the cursor.
-        git_in(&origin, &["update-ref", "-d", "refs/heads/work-0001-feature"]);
+        git_in(
+            &origin,
+            &["update-ref", "-d", "refs/heads/work-0001-feature"],
+        );
 
-        app.feed(vec![Key::Char('f'), Key::Char('D')], &mut ui).unwrap();
+        app.feed(vec![Key::Char('f'), Key::Char('D')], &mut ui)
+            .unwrap();
 
-        assert!(app.stale_typeahead(), "keys typed behind a pruning fetch must be dropped");
+        assert!(
+            app.stale_typeahead(),
+            "keys typed behind a pruning fetch must be dropped"
+        );
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        for name in survivors.iter().filter(|n| !n.ends_with("work-0001-feature")) {
+        for name in survivors
+            .iter()
+            .filter(|n| !n.ends_with("work-0001-feature"))
+        {
             let short = name.rsplit('/').next().unwrap_or_default();
             assert!(refs.contains(short), "a blind D deleted {short}: {refs}");
         }
@@ -3196,7 +3708,10 @@ mod tests {
         // The branch makes that same change, from where the base was before it.
         git_in(&work, &["checkout", "-b", "work-0003-tree", &forked]);
         std::fs::write(work.join("f"), "three\n").unwrap();
-        git_in(&work, &["commit", "-am", "tree: the same change, on its own line"]);
+        git_in(
+            &work,
+            &["commit", "-am", "tree: the same change, on its own line"],
+        );
         git_in(&work, &["push", "origin", "work-0003-tree"]);
         git_in(&work, &["checkout", "main"]);
         git_in(&work, &["branch", "-D", "work-0003-tree"]);
@@ -3209,11 +3724,18 @@ mod tests {
             .unwrap();
         let target = land::DeleteTarget {
             remote: "origin".to_string(),
-            oid: app.git.remote_branch_oid("origin", "work-0003-tree").unwrap().unwrap(),
+            oid: app
+                .git
+                .remote_branch_oid("origin", "work-0003-tree")
+                .unwrap()
+                .unwrap(),
         };
         // The patch proof passes: this row is refused by the TREE alone.
         assert!(
-            matches!(app.delete_takes_nothing(&target).unwrap(), Proof::Carried(_)),
+            matches!(
+                app.delete_takes_nothing(&target).unwrap(),
+                Proof::Carried(_)
+            ),
             "the patch count must be 0"
         );
         app.sel = app.view.iter().position(|&v| v == i).unwrap();
@@ -3229,10 +3751,16 @@ mod tests {
         let mut ui = FakeUi::new();
         app.handle(Key::Char('D'), &mut ui).unwrap();
 
-        assert!(app.prompt.is_some(), "a row describing another tip vouched for a delete");
+        assert!(
+            app.prompt.is_some(),
+            "a row describing another tip vouched for a delete"
+        );
         app.handle(Key::Char('n'), &mut ui).unwrap();
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        assert!(refs.contains("work-0003-tree"), "it was deleted anyway: {refs}");
+        assert!(
+            refs.contains("work-0003-tree"),
+            "it was deleted anyway: {refs}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3254,24 +3782,40 @@ mod tests {
         git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
         git_in(&work, &["cherry-pick", "origin/work-rolling"]);
         git_in(&work, &["push", "origin", "main"]);
-        assert!(git::is_rolling("work-rolling"), "the fixture must be a rolling branch");
+        assert!(
+            git::is_rolling("work-rolling"),
+            "the fixture must be a rolling branch"
+        );
 
         let mut app = app_on(&work);
         app.sel = app
             .view
             .iter()
-            .position(|&i| app.branches.get(i).is_some_and(|b| b.refname == "origin/work-rolling"))
+            .position(|&i| {
+                app.branches
+                    .get(i)
+                    .is_some_and(|b| b.refname == "origin/work-rolling")
+            })
             .unwrap();
         let mut ui = FakeUi::new();
         app.handle(Key::Char('D'), &mut ui).unwrap();
 
-        assert!(app.prompt.is_none(), "an explicit ask on a landed branch must not stop to ask");
+        assert!(
+            app.prompt.is_none(),
+            "an explicit ask on a landed branch must not stop to ask"
+        );
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        assert!(!refs.contains("work-rolling"), "the remote copy must go: {refs}");
+        assert!(
+            !refs.contains("work-rolling"),
+            "the remote copy must go: {refs}"
+        );
         // The local branch is untouched, which is what makes this safe to do to
         // a workstream that is still going: its next push recreates the remote.
         let local = git_in(&work, &["branch", "--list", "work-rolling"]);
-        assert!(local.contains("work-rolling"), "the local branch was taken too: {local:?}");
+        assert!(
+            local.contains("work-rolling"),
+            "the local branch was taken too: {local:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3305,7 +3849,11 @@ mod tests {
         // not, which is the whole of this test.
         let target = land::DeleteTarget {
             remote: "origin".to_string(),
-            oid: app.git.remote_branch_oid("origin", "work-0001-feature").unwrap().unwrap(),
+            oid: app
+                .git
+                .remote_branch_oid("origin", "work-0001-feature")
+                .unwrap()
+                .unwrap(),
         };
         let Proof::Carried(proved) = app.delete_takes_nothing(&target).unwrap() else {
             panic!("origin's base must carry it")
@@ -3316,18 +3864,26 @@ mod tests {
             "the proof must name the base it held against"
         );
         let cell = counts_cell(app.branches.get(i).unwrap(), *app.prospects.get(i).unwrap());
-        assert!(!cell.starts_with("0/"), "the column must still count the work: {cell}");
+        assert!(
+            !cell.starts_with("0/"),
+            "the column must still count the work: {cell}"
+        );
 
         app.sel = app.view.iter().position(|&v| v == i).unwrap();
         let mut ui = FakeUi::new();
         app.handle(Key::Char('D'), &mut ui).unwrap();
 
-        assert!(app.prompt.is_some(), "a row reading {cell} vanished unasked");
+        assert!(
+            app.prompt.is_some(),
+            "a row reading {cell} vanished unasked"
+        );
         // And the pane says WHY it is asking, which is what the help promises
         // — this is the commonest refusal there is, so a silent one here would
         // make that promise false for nearly every prompt.
         assert!(
-            app.log.iter().any(|l| l.text.contains("still counts commits")),
+            app.log
+                .iter()
+                .any(|l| l.text.contains("still counts commits")),
             "the pane must name the check that refused: {:?}",
             app.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>()
         );
@@ -3364,17 +3920,29 @@ mod tests {
             .view
             .iter()
             .position(|&i| {
-                app.branches.get(i).is_some_and(|b| b.refname == "origin/work-0001-feature")
+                app.branches
+                    .get(i)
+                    .is_some_and(|b| b.refname == "origin/work-0001-feature")
             })
             .unwrap();
         for key in [Key::Enter, Key::Char('r'), Key::Char('q')] {
             app.handle(key, &mut ui).unwrap();
         }
-        app.feed(vec![Key::Char('p'), Key::Char('q'), Key::Char('D')], &mut ui).unwrap();
+        app.feed(
+            vec![Key::Char('p'), Key::Char('q'), Key::Char('D')],
+            &mut ui,
+        )
+        .unwrap();
 
-        assert!(app.stale_typeahead(), "keys typed behind a swept delete must be dropped");
+        assert!(
+            app.stale_typeahead(),
+            "keys typed behind a swept delete must be dropped"
+        );
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        assert!(refs.contains("work-0002-second"), "a blind D reached a second branch: {refs}");
+        assert!(
+            refs.contains("work-0002-second"),
+            "a blind D reached a second branch: {refs}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3388,13 +3956,20 @@ mod tests {
     fn d_asks_where_the_remote_has_rewound_the_base_since_the_last_fetch() {
         let (root, work) = repo("d-rewound");
         let origin = root.join("origin.git");
-        let published = git_in(&work, &["rev-parse", "origin/main"]).trim().to_string();
+        let published = git_in(&work, &["rev-parse", "origin/main"])
+            .trim()
+            .to_string();
         git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
         git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
         git_in(&work, &["push", "origin", "main"]);
         // Fetched, so the tracking ref records a base that carries the branch.
-        let tracked = git_in(&work, &["rev-parse", "origin/main"]).trim().to_string();
-        assert_ne!(tracked, published, "the landing must be on the tracking ref");
+        let tracked = git_in(&work, &["rev-parse", "origin/main"])
+            .trim()
+            .to_string();
+        assert_ne!(
+            tracked, published,
+            "the landing must be on the tracking ref"
+        );
         // …and then the remote goes back past it, behind this repo's back.
         git_in(&origin, &["update-ref", "refs/heads/main", &published]);
 
@@ -3410,16 +3985,24 @@ mod tests {
             .view
             .iter()
             .position(|&i| {
-                app.branches.get(i).is_some_and(|b| b.refname == "origin/work-0001-feature")
+                app.branches
+                    .get(i)
+                    .is_some_and(|b| b.refname == "origin/work-0001-feature")
             })
             .unwrap();
         let mut ui = FakeUi::new();
         app.handle(Key::Char('D'), &mut ui).unwrap();
 
-        assert!(app.prompt.is_some(), "a base the remote no longer has vouched for a delete");
+        assert!(
+            app.prompt.is_some(),
+            "a base the remote no longer has vouched for a delete"
+        );
         app.handle(Key::Char('n'), &mut ui).unwrap();
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        assert!(refs.contains("work-0001-feature"), "it was deleted anyway: {refs}");
+        assert!(
+            refs.contains("work-0001-feature"),
+            "it was deleted anyway: {refs}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3438,8 +4021,18 @@ mod tests {
         // Everything above is the case that skips; this one line is the whole
         // difference, and it is invisible to every ref the rule reads.
         let elsewhere = root.join("elsewhere.git");
-        git_in(&root, &["init", "--bare", "-b", "main", &elsewhere.to_string_lossy()]);
-        git_in(&work, &["config", "remote.origin.pushurl", &elsewhere.to_string_lossy()]);
+        git_in(
+            &root,
+            &["init", "--bare", "-b", "main", &elsewhere.to_string_lossy()],
+        );
+        git_in(
+            &work,
+            &[
+                "config",
+                "remote.origin.pushurl",
+                &elsewhere.to_string_lossy(),
+            ],
+        );
 
         let git = Git::discover(&work).unwrap();
         assert!(!git.push_reaches_fetch_url("origin").unwrap());
@@ -3447,27 +4040,54 @@ mod tests {
         // choosing what runs at the end of it. Asserted with the pushurl put
         // back, so it is this config alone that refuses.
         git_in(&work, &["config", "--unset", "remote.origin.pushurl"]);
-        assert!(git.push_reaches_fetch_url("origin").unwrap(), "the URLs must agree again");
-        git_in(&work, &["config", "remote.origin.receivepack", "git-receive-pack"]);
-        assert!(!git.push_reaches_fetch_url("origin").unwrap(), "a custom receivepack must refuse");
+        assert!(
+            git.push_reaches_fetch_url("origin").unwrap(),
+            "the URLs must agree again"
+        );
+        git_in(
+            &work,
+            &["config", "remote.origin.receivepack", "git-receive-pack"],
+        );
+        assert!(
+            !git.push_reaches_fetch_url("origin").unwrap(),
+            "a custom receivepack must refuse"
+        );
         git_in(&work, &["config", "--unset", "remote.origin.receivepack"]);
-        git_in(&work, &["config", "remote.origin.uploadpack", "git-upload-pack"]);
-        assert!(!git.push_reaches_fetch_url("origin").unwrap(), "a custom uploadpack must refuse");
+        git_in(
+            &work,
+            &["config", "remote.origin.uploadpack", "git-upload-pack"],
+        );
+        assert!(
+            !git.push_reaches_fetch_url("origin").unwrap(),
+            "a custom uploadpack must refuse"
+        );
         git_in(&work, &["config", "--unset", "remote.origin.uploadpack"]);
-        git_in(&work, &["config", "remote.origin.pushurl", &elsewhere.to_string_lossy()]);
+        git_in(
+            &work,
+            &[
+                "config",
+                "remote.origin.pushurl",
+                &elsewhere.to_string_lossy(),
+            ],
+        );
 
         let mut app = app_on(&work);
         app.sel = app
             .view
             .iter()
             .position(|&i| {
-                app.branches.get(i).is_some_and(|b| b.refname == "origin/work-0001-feature")
+                app.branches
+                    .get(i)
+                    .is_some_and(|b| b.refname == "origin/work-0001-feature")
             })
             .unwrap();
         let mut ui = FakeUi::new();
         app.handle(Key::Char('D'), &mut ui).unwrap();
 
-        assert!(app.prompt.is_some(), "a delete aimed at an unread repository went unasked");
+        assert!(
+            app.prompt.is_some(),
+            "a delete aimed at an unread repository went unasked"
+        );
         app.handle(Key::Char('n'), &mut ui).unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3501,16 +4121,25 @@ mod tests {
         // is the disagreement and not some other branch.
         assert_eq!(app.prospects.get(i).copied(), Some(git::Prospect::Nothing));
         let cell = counts_cell(app.branches.get(i).unwrap(), git::Prospect::Nothing);
-        assert!(cell.starts_with("0/"), "the cell must read zero, or this is another row: {cell}");
+        assert!(
+            cell.starts_with("0/"),
+            "the cell must read zero, or this is another row: {cell}"
+        );
 
         app.sel = app.view.iter().position(|&v| v == i).unwrap();
         let mut ui = FakeUi::new();
         app.handle(Key::Char('D'), &mut ui).unwrap();
 
-        assert!(app.prompt.is_some(), "two commits that exist nowhere else went unasked");
+        assert!(
+            app.prompt.is_some(),
+            "two commits that exist nowhere else went unasked"
+        );
         app.handle(Key::Char('n'), &mut ui).unwrap();
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        assert!(refs.contains("work-0003-net"), "it was deleted anyway: {refs}");
+        assert!(
+            refs.contains("work-0003-net"),
+            "it was deleted anyway: {refs}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3519,11 +4148,26 @@ mod tests {
     /// is a branch nothing here can vouch for.
     #[test]
     fn the_ahead_cell_reads_zero_only_where_a_landing_takes_nothing() {
-        assert!(takes_nothing(&listed(Some((3, 8))), git::Prospect::Nothing), "landed");
-        assert!(takes_nothing(&listed(Some((0, 8))), git::Prospect::Outstanding), "none ahead");
-        assert!(!takes_nothing(&listed(Some((3, 8))), git::Prospect::Outstanding));
-        assert!(!takes_nothing(&listed(Some((3, 8))), git::Prospect::Conflicted));
-        assert!(!takes_nothing(&listed(None), git::Prospect::Outstanding), "unknown is not zero");
+        assert!(
+            takes_nothing(&listed(Some((3, 8))), git::Prospect::Nothing),
+            "landed"
+        );
+        assert!(
+            takes_nothing(&listed(Some((0, 8))), git::Prospect::Outstanding),
+            "none ahead"
+        );
+        assert!(!takes_nothing(
+            &listed(Some((3, 8))),
+            git::Prospect::Outstanding
+        ));
+        assert!(!takes_nothing(
+            &listed(Some((3, 8))),
+            git::Prospect::Conflicted
+        ));
+        assert!(
+            !takes_nothing(&listed(None), git::Prospect::Outstanding),
+            "unknown is not zero"
+        );
         for (b, p) in [
             (listed(Some((3, 8))), git::Prospect::Nothing),
             (listed(Some((0, 8))), git::Prospect::Outstanding),
@@ -3549,11 +4193,18 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        app.feed(vec![Key::Char('D'), Key::Char('y')], &mut ui).unwrap();
+        app.feed(vec![Key::Char('D'), Key::Char('y')], &mut ui)
+            .unwrap();
 
-        assert!(app.prompt.is_some(), "the prompt was consumed by its own batch");
+        assert!(
+            app.prompt.is_some(),
+            "the prompt was consumed by its own batch"
+        );
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
-        assert!(refs.contains("work-0001-feature"), "the branch was deleted: {refs}");
+        assert!(
+            refs.contains("work-0001-feature"),
+            "the branch was deleted: {refs}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3566,16 +4217,32 @@ mod tests {
         let (root, work) = repo("fetch-default");
         // A branch only a fetch of origin can discover, plus a mirror that is
         // not there — pointed at a path that was never initialised.
-        git_in(&root.join("origin.git"), &["branch", "work-0002-later", "main"]);
-        git_in(&work, &["remote", "add", "backup", &root.join("gone.git").to_string_lossy()]);
+        git_in(
+            &root.join("origin.git"),
+            &["branch", "work-0002-later", "main"],
+        );
+        git_in(
+            &work,
+            &[
+                "remote",
+                "add",
+                "backup",
+                &root.join("gone.git").to_string_lossy(),
+            ],
+        );
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
         app.handle(Key::Char('f'), &mut ui).unwrap();
 
-        assert_eq!(app.status, "fetched origin", "f must not have swept every remote");
+        assert_eq!(
+            app.status, "fetched origin",
+            "f must not have swept every remote"
+        );
         assert!(
-            app.branches.iter().any(|b| b.refname == "origin/work-0002-later"),
+            app.branches
+                .iter()
+                .any(|b| b.refname == "origin/work-0002-later"),
             "f did not actually fetch origin"
         );
 
@@ -3600,8 +4267,14 @@ mod tests {
         assert_eq!(git.default_remote("main").unwrap(), remote("origin"));
 
         let mirror = root.join("mirror.git");
-        git_in(&root, &["init", "--bare", "-b", "main", &mirror.to_string_lossy()]);
-        git_in(&work, &["remote", "add", "mirror", &mirror.to_string_lossy()]);
+        git_in(
+            &root,
+            &["init", "--bare", "-b", "main", &mirror.to_string_lossy()],
+        );
+        git_in(
+            &work,
+            &["remote", "add", "mirror", &mirror.to_string_lossy()],
+        );
         git_in(&work, &["config", "branch.main.remote", "mirror"]);
         assert_eq!(git.default_remote("main").unwrap(), remote("mirror"));
 
@@ -3614,20 +4287,29 @@ mod tests {
         // tracking refs to prune.
         git_in(&work, &["config", "branch.main.remote", "gone"]);
         assert_eq!(git.default_remote("main").unwrap(), remote("origin"));
-        git_in(&work, &["config", "branch.main.remote", &mirror.to_string_lossy()]);
+        git_in(
+            &work,
+            &["config", "branch.main.remote", &mirror.to_string_lossy()],
+        );
         assert_eq!(git.default_remote("main").unwrap(), remote("origin"));
 
         // Several remotes, none of them origin and none tracked: nothing is
         // distinguished, so `f` says so rather than picking one.
         git_in(&work, &["config", "--unset", "branch.main.remote"]);
         git_in(&work, &["remote", "rename", "origin", "upstream"]);
-        assert_eq!(git.default_remote("main").unwrap(), DefaultRemote::Ambiguous);
+        assert_eq!(
+            git.default_remote("main").unwrap(),
+            DefaultRemote::Ambiguous
+        );
 
         git_in(&work, &["remote", "remove", "mirror"]);
         assert_eq!(git.default_remote("main").unwrap(), remote("upstream"));
 
         git_in(&work, &["remote", "remove", "upstream"]);
-        assert_eq!(git.default_remote("main").unwrap(), DefaultRemote::NoRemotes);
+        assert_eq!(
+            git.default_remote("main").unwrap(),
+            DefaultRemote::NoRemotes
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3640,10 +4322,19 @@ mod tests {
     fn f_without_a_default_remote_fetches_nothing_and_says_which_case_it_is() {
         let (root, work) = repo("no-default");
         // A branch that only a fetch would bring in — none must arrive below.
-        git_in(&root.join("origin.git"), &["branch", "work-0002-later", "main"]);
+        git_in(
+            &root.join("origin.git"),
+            &["branch", "work-0002-later", "main"],
+        );
         let mirror = root.join("mirror.git");
-        git_in(&root, &["init", "--bare", "-b", "main", &mirror.to_string_lossy()]);
-        git_in(&work, &["remote", "add", "mirror", &mirror.to_string_lossy()]);
+        git_in(
+            &root,
+            &["init", "--bare", "-b", "main", &mirror.to_string_lossy()],
+        );
+        git_in(
+            &work,
+            &["remote", "add", "mirror", &mirror.to_string_lossy()],
+        );
         git_in(&work, &["remote", "rename", "origin", "upstream"]);
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
@@ -3652,7 +4343,9 @@ mod tests {
 
         assert_eq!(app.status, "no default remote — F fetches all of them");
         assert!(
-            !app.branches.iter().any(|b| b.refname.ends_with("work-0002-later")),
+            !app.branches
+                .iter()
+                .any(|b| b.refname.ends_with("work-0002-later")),
             "f fetched despite having no default remote"
         );
 
@@ -3661,7 +4354,10 @@ mod tests {
         }
         app.handle(Key::Char('f'), &mut ui).unwrap();
 
-        assert_eq!(app.status, "no remotes configured", "a no-op must not read as a refresh");
+        assert_eq!(
+            app.status, "no remotes configured",
+            "a no-op must not read as a refresh"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3676,12 +4372,18 @@ mod tests {
         let mut ui = FakeUi::new();
 
         app.handle(Key::Char('D'), &mut ui).unwrap();
-        assert!(app.stale_typeahead(), "D must raise a prompt the loop then stops on");
+        assert!(
+            app.stale_typeahead(),
+            "D must raise a prompt the loop then stops on"
+        );
         assert!(app.prompt.is_some());
 
         // And the prompt is only answerable after the typeahead was dropped.
         app.settle_prompt(&mut ui).unwrap();
-        assert_eq!(ui.drains, 1, "the tty must be drained before the answer is read");
+        assert_eq!(
+            ui.drains, 1,
+            "the tty must be drained before the answer is read"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3697,7 +4399,10 @@ mod tests {
         ui.drain_fails = true;
 
         app.handle(Key::Char('D'), &mut ui).unwrap();
-        assert!(app.settle_prompt(&mut ui).is_err(), "a failed drain must propagate");
+        assert!(
+            app.settle_prompt(&mut ui).is_err(),
+            "a failed drain must propagate"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3710,15 +4415,29 @@ mod tests {
         let mut ui = FakeUi::new();
 
         app.offer_delete("origin/main", &mut ui).unwrap();
-        assert!(app.prompt.is_none(), "no confirmation may be offered for the base");
-        assert!(app.status.contains("base branch"), "status was {:?}", app.status);
+        assert!(
+            app.prompt.is_none(),
+            "no confirmation may be offered for the base"
+        );
+        assert!(
+            app.status.contains("base branch"),
+            "status was {:?}",
+            app.status
+        );
         // The refusal is THIS one, not `land::delete_branch`'s. Both leave the
         // ref standing and neither raises a prompt, so a surviving `main` and
         // an unset prompt cannot tell them apart — what can is that the plan
         // pane was never opened, which is only true if the early return ran
         // before the rule below it.
-        assert!(matches!(app.screen, Screen::List), "a delete pane was opened for the base");
-        assert!(app.log.is_empty(), "the base reached the plan: {:?}", app.log.len());
+        assert!(
+            matches!(app.screen, Screen::List),
+            "a delete pane was opened for the base"
+        );
+        assert!(
+            app.log.is_empty(),
+            "the base reached the plan: {:?}",
+            app.log.len()
+        );
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
         assert!(refs.contains("main"), "the base was deleted: {refs}");
         let _ = std::fs::remove_dir_all(root);
@@ -3727,7 +4446,10 @@ mod tests {
     #[test]
     fn a_long_branch_name_is_clipped_to_its_column() {
         assert_eq!(clip_cols("short", 10), ("short".to_string(), 5));
-        assert_eq!(clip_cols("origin/work-0001-a-very-long-name", 12).0, "origin/work\u{2026}");
+        assert_eq!(
+            clip_cols("origin/work-0001-a-very-long-name", 12).0,
+            "origin/work\u{2026}"
+        );
         assert_eq!(clip_cols("exactlyten", 10), ("exactlyten".to_string(), 10));
         assert_eq!(clip_cols("origin/wörk-über-lang", 10).1, 10);
         assert_eq!(clip_cols("abc", 0), (String::new(), 0));
@@ -3749,11 +4471,27 @@ mod tests {
         let wide = "origin/日本語日本語日本語".to_string();
         let width = name_column([&wide].into_iter());
         assert_eq!(width, term::sanitize(&wide, MAX_NAME_COL).1);
-        assert_eq!(clip_cols(&wide, width).0, wide, "sized right, it should not clip");
+        assert_eq!(
+            clip_cols(&wide, width).0,
+            wide,
+            "sized right, it should not clip"
+        );
 
-        assert_eq!(name_column([].into_iter()), 20, "no branches: a sane default");
-        assert_eq!(name_column([&"ab".to_string()].into_iter()), 12, "clamped up");
-        assert_eq!(name_column([&"x".repeat(80)].into_iter()), MAX_NAME_COL, "clamped down");
+        assert_eq!(
+            name_column([].into_iter()),
+            20,
+            "no branches: a sane default"
+        );
+        assert_eq!(
+            name_column([&"ab".to_string()].into_iter()),
+            12,
+            "clamped up"
+        );
+        assert_eq!(
+            name_column([&"x".repeat(80)].into_iter()),
+            MAX_NAME_COL,
+            "clamped down"
+        );
     }
 
     #[test]
@@ -3836,7 +4574,10 @@ mod tests {
             .collect();
         app.readiness = vec![
             record::Readiness::Ready,
-            record::Readiness::Missing { missing: 10, total: 100 },
+            record::Readiness::Missing {
+                missing: 10,
+                total: 100,
+            },
             record::Readiness::Empty,
         ];
         app.prospects = vec![git::Prospect::Outstanding; 3];
@@ -3895,7 +4636,9 @@ mod tests {
             let frame = app.render(24, 100);
             let mut rows = 0usize;
             for line in frame.lines() {
-                let Some(at) = line.find("origin/b") else { continue };
+                let Some(at) = line.find("origin/b") else {
+                    continue;
+                };
                 let n: usize = match line
                     .get(at.saturating_add(8)..at.saturating_add(10))
                     .and_then(|d| d.parse().ok())
@@ -3986,7 +4729,10 @@ mod tests {
         // Bounded, or a fixture that grew to `10/2` would satisfy `0/2` while
         // showing the very ancestry count this is about.
         assert!(row.contains(" 0/2 "), "a landed row takes nothing: {row}");
-        assert!(!row.contains(" 1/2 "), "the ancestry count must not stand: {row}");
+        assert!(
+            !row.contains(" 1/2 "),
+            "the ancestry count must not stand: {row}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4000,7 +4746,15 @@ mod tests {
     fn a_branch_landed_as_one_squash_commit_is_read_the_same_way() {
         let (root, work) = repo("squashed-flat");
         // Two commits, so the squash really is a different shape from the branch.
-        git_in(&work, &["checkout", "-b", "work-0003-two", "origin/work-0001-feature"]);
+        git_in(
+            &work,
+            &[
+                "checkout",
+                "-b",
+                "work-0003-two",
+                "origin/work-0001-feature",
+            ],
+        );
         std::fs::write(work.join("g"), "g\n").unwrap();
         git_in(&work, &["add", "g"]);
         git_in(&work, &["commit", "-m", "second step"]);
@@ -4047,7 +4801,15 @@ mod tests {
         git_in(&work, &["add", "h"]);
         git_in(&work, &["commit", "-m", "side: step"]);
         // A merge that adds a file NEITHER parent has.
-        git_in(&work, &["checkout", "-b", "work-0004-merged", "origin/work-0001-feature"]);
+        git_in(
+            &work,
+            &[
+                "checkout",
+                "-b",
+                "work-0004-merged",
+                "origin/work-0001-feature",
+            ],
+        );
         git_in(&work, &["merge", "--no-commit", "--no-ff", "side"]);
         std::fs::write(work.join("evil"), "resolved\n").unwrap();
         git_in(&work, &["add", "evil"]);
@@ -4116,9 +4878,17 @@ mod tests {
         let before = git_in(&work, &["rev-parse", "main"]).trim().to_string();
         app.handle(Key::Enter, &mut ui).unwrap();
         app.handle(Key::Char('r'), &mut ui).unwrap();
-        assert_eq!(git_in(&work, &["rev-parse", "main"]).trim(), before, "nothing may land");
+        assert_eq!(
+            git_in(&work, &["rev-parse", "main"]).trim(),
+            before,
+            "nothing may land"
+        );
         app.redraw(&mut ui).unwrap();
-        assert!(ui.last().contains("does not merge cleanly"), "{}", ui.last());
+        assert!(
+            ui.last().contains("does not merge cleanly"),
+            "{}",
+            ui.last()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4137,7 +4907,10 @@ mod tests {
         // With a COMPLETE record, because `ok` is the only cell `!merge`
         // replaces — the reported row had one, and without it this branch would
         // read as owing reviews and never reach the new word.
-        git_in(&work, &["commit", "-am", &format!("open: step\n\n{RECORD}")]);
+        git_in(
+            &work,
+            &["commit", "-am", &format!("open: step\n\n{RECORD}")],
+        );
         git_in(&work, &["push", "origin", "work-0002-open"]);
         git_in(&work, &["checkout", "main"]);
         git_in(&work, &["branch", "-D", "work-0002-open"]);
@@ -4177,7 +4950,15 @@ mod tests {
         std::fs::write(work.join("h"), "h\n").unwrap();
         git_in(&work, &["add", "h"]);
         git_in(&work, &["commit", "-m", "side: step"]);
-        git_in(&work, &["checkout", "-b", "work-0004-merged", "origin/work-0001-feature"]);
+        git_in(
+            &work,
+            &[
+                "checkout",
+                "-b",
+                "work-0004-merged",
+                "origin/work-0001-feature",
+            ],
+        );
         git_in(&work, &["merge", "--no-commit", "--no-ff", "side"]);
         std::fs::write(work.join("evil"), "resolved\n").unwrap();
         git_in(&work, &["add", "evil"]);
@@ -4233,7 +5014,8 @@ mod tests {
         let git = Git::discover(&work).unwrap();
         let base = git.resolve_base("main").unwrap();
         assert_eq!(
-            git.prospect(&base, "refs/remotes/origin/work-0001-feature").ok(),
+            git.prospect(&base, "refs/remotes/origin/work-0001-feature")
+                .ok(),
             Some(git::Prospect::Nothing),
             "main carries its tree"
         );
@@ -4241,7 +5023,8 @@ mod tests {
         // that does not resolve either, and an unreadable count must not become
         // an answer of nothing.
         assert_eq!(
-            git.prospect(&base, "refs/remotes/origin/no-such-branch").ok(),
+            git.prospect(&base, "refs/remotes/origin/no-such-branch")
+                .ok(),
             Some(git::Prospect::Conflicted),
             "a ref that does not resolve is not an answer of nothing to land"
         );
@@ -4260,7 +5043,10 @@ mod tests {
         // rather than one twice.
         assert!(
             matches!(
-                git.merge_tree(&git.rev_parse("refs/heads/main").unwrap(), "refs/remotes/origin/alien"),
+                git.merge_tree(
+                    &git.rev_parse("refs/heads/main").unwrap(),
+                    "refs/remotes/origin/alien"
+                ),
                 Ok(git::MergeResult::Unavailable(_))
             ),
             "unrelated histories are refused, not merged with conflicts"
@@ -4295,7 +5081,11 @@ mod tests {
         // The same branch with its patches genuinely outstanding is untouched —
         // the record is the answer while there is still something to land.
         assert_eq!(
-            ready_cell(&b, Some(&record::Readiness::Ready), git::Prospect::Outstanding),
+            ready_cell(
+                &b,
+                Some(&record::Readiness::Ready),
+                git::Prospect::Outstanding
+            ),
             ("ok".to_string(), false)
         );
     }
@@ -4309,12 +5099,19 @@ mod tests {
     fn a_branch_that_does_not_merge_does_not_read_ok() {
         let b = listed(Some((2, 18)));
         assert_eq!(
-            ready_cell(&b, Some(&record::Readiness::Ready), git::Prospect::Conflicted),
+            ready_cell(
+                &b,
+                Some(&record::Readiness::Ready),
+                git::Prospect::Conflicted
+            ),
             ("!merge".to_string(), false),
             "not dimmed: there is something here, and it needs a rebase"
         );
         for verdict in [
-            record::Readiness::Missing { missing: 1, total: 2 },
+            record::Readiness::Missing {
+                missing: 1,
+                total: 2,
+            },
             record::Readiness::Unknown,
         ] {
             assert_eq!(
@@ -4342,11 +5139,19 @@ mod tests {
         let empty = listed(Some((0, 4)));
         let landed = listed(Some((3, 8)));
         assert_eq!(
-            ready_cell(&empty, Some(&record::Readiness::Empty), git::Prospect::Outstanding),
+            ready_cell(
+                &empty,
+                Some(&record::Readiness::Empty),
+                git::Prospect::Outstanding
+            ),
             ("-".to_string(), true)
         );
         assert_eq!(
-            ready_cell(&landed, Some(&record::Readiness::Ready), git::Prospect::Nothing),
+            ready_cell(
+                &landed,
+                Some(&record::Readiness::Ready),
+                git::Prospect::Nothing
+            ),
             ("landed".to_string(), true)
         );
         assert_eq!(counts_cell(&empty, git::Prospect::Outstanding), "0/4");
@@ -4359,7 +5164,11 @@ mod tests {
     #[test]
     fn the_ahead_count_is_what_a_landing_would_take() {
         let b = listed(Some((10, 34)));
-        assert_eq!(counts_cell(&b, git::Prospect::Nothing), "0/34", "landed takes nothing");
+        assert_eq!(
+            counts_cell(&b, git::Prospect::Nothing),
+            "0/34",
+            "landed takes nothing"
+        );
         assert_eq!(counts_cell(&b, git::Prospect::Outstanding), "10/34");
         assert_eq!(
             counts_cell(&b, git::Prospect::Conflicted),
@@ -4369,7 +5178,10 @@ mod tests {
         // Pre-2.41 git reports no counts, and the landing's half is knowable
         // without them: `?/?` was never wrong, but `0/?` is more.
         assert_eq!(counts_cell(&listed(None), git::Prospect::Nothing), "0/?");
-        assert_eq!(counts_cell(&listed(None), git::Prospect::Outstanding), "?/?");
+        assert_eq!(
+            counts_cell(&listed(None), git::Prospect::Outstanding),
+            "?/?"
+        );
     }
 
     /// Where git reports no ahead-behind counts (pre-2.41), the tree question is
@@ -4379,7 +5191,11 @@ mod tests {
     #[test]
     fn a_branch_with_no_commits_says_so_rather_than_claiming_it_landed() {
         assert_eq!(
-            ready_cell(&listed(None), Some(&record::Readiness::Empty), git::Prospect::Nothing),
+            ready_cell(
+                &listed(None),
+                Some(&record::Readiness::Empty),
+                git::Prospect::Nothing
+            ),
             ("-".to_string(), true),
             "no commits over the base is not a landing"
         );
@@ -4416,23 +5232,44 @@ mod tests {
             record::Readiness::Ready,
             record::Readiness::Empty,
             record::Readiness::Unknown,
-            record::Readiness::Missing { missing: 10, total: 12 },
-            record::Readiness::Missing { missing: 10, total: 100 },
+            record::Readiness::Missing {
+                missing: 10,
+                total: 12,
+            },
+            record::Readiness::Missing {
+                missing: 10,
+                total: 100,
+            },
         ];
-        let mut labels: Vec<String> =
-            verdicts.iter().map(|v| ready_cell(&b, Some(v), git::Prospect::Outstanding).0).collect();
+        let mut labels: Vec<String> = verdicts
+            .iter()
+            .map(|v| ready_cell(&b, Some(v), git::Prospect::Outstanding).0)
+            .collect();
         labels.push(ready_cell(&b, None, git::Prospect::Nothing).0);
-        labels.push(ready_cell(&b, Some(&record::Readiness::Ready), git::Prospect::Conflicted).0);
+        labels.push(
+            ready_cell(
+                &b,
+                Some(&record::Readiness::Ready),
+                git::Prospect::Conflicted,
+            )
+            .0,
+        );
 
         let width = fitted(labels.iter().map(String::as_str), READY_COL);
         for label in &labels {
-            assert!(label.chars().count() <= width, "{label} overruns a {width}-wide READY");
+            assert!(
+                label.chars().count() <= width,
+                "{label} overruns a {width}-wide READY"
+            );
         }
         assert_eq!(width, 7, "widened for 10/100!");
         // `fitted` counts CHARS, so a verdict that was not ASCII would be
         // measured narrower than it draws and shift the columns right of it.
         for label in &labels {
-            assert!(label.is_ascii(), "{label} is measured in chars, so it must be ASCII");
+            assert!(
+                label.is_ascii(),
+                "{label} is measured in chars, so it must be ASCII"
+            );
         }
         // The floor holds when nothing needs the room, so the common table does
         // not jitter as branches come and go.
@@ -4451,7 +5288,10 @@ mod tests {
         assert_eq!(fitted(["3/8", "0/12"].into_iter(), COUNTS_COL), COUNTS_COL);
         assert_eq!(fitted(["100/1000"].into_iter(), COUNTS_COL), 8);
         assert_eq!(
-            fitted([listed(Some((100, 1000))).counts_label().as_str()].into_iter(), COUNTS_COL),
+            fitted(
+                [listed(Some((100, 1000))).counts_label().as_str()].into_iter(),
+                COUNTS_COL
+            ),
             8,
             "the label a branch that far ahead actually renders"
         );
@@ -4489,8 +5329,10 @@ mod tests {
             "the pane must not pin text to bright black"
         );
 
-        let body: Vec<&Line> =
-            lines.iter().filter(|l| l.text.trim_start().starts_with("body line")).collect();
+        let body: Vec<&Line> = lines
+            .iter()
+            .filter(|l| l.text.trim_start().starts_with("body line"))
+            .collect();
         assert_eq!(body.len(), 1, "expected the message body in the pane");
         assert!(
             body.iter().all(|l| l.style == Style::PLAIN),

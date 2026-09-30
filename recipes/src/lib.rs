@@ -7,15 +7,15 @@
 //! the same shape the Guile lowering bridge already consumes from boa, so no bridge
 //! change is needed (the consumer cutover is a follow-up).
 
-pub mod application;
 #[cfg(test)]
 #[path = "../../td-busd/src/app_policy.rs"]
 #[allow(dead_code)]
 mod app_policy;
+pub mod application;
+pub mod catalog;
 #[cfg(test)]
 #[path = "../../td-authd/src/primary_account.rs"]
 mod primary_account;
-pub mod catalog;
 // The build script's source scans, here for their tests only.
 #[cfg(test)]
 mod embed_scan;
@@ -40,19 +40,19 @@ pub mod td_boot_protocol;
 pub mod td_boot_realfile;
 // Shared check assertions must participate in the catalog dependency scan.
 use td_boot_realfile as realfile;
-#[path = "../../td-install/src/timezones.rs"]
-pub mod td_install_timezones;
 #[path = "../../td-compositor/src/timezone.rs"]
 pub mod td_compositor_timezone;
+#[path = "../../td-install/src/timezones.rs"]
+pub mod td_install_timezones;
 
 // Keep the native guest oracle contract inside the catalog dependency scan.
 #[path = "../../td-install-qemu-test/src/protocol.rs"]
 pub mod td_install_qemu_protocol;
 // The boot oracle and target evidence command consume one literal; loading the
 // crate-owned file here keeps the image and host check from drifting.
-pub mod source_pins;
 #[path = "../../td-update/src/upstream.rs"]
 pub mod release_upstream;
+pub mod source_pins;
 #[path = "../../td-profiler/src/contract.rs"]
 pub mod td_profiler_contract;
 pub mod types;

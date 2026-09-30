@@ -311,10 +311,7 @@ pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
         crate::primary_account::load,
     )
     .map_err(|error| error.to_string())?;
-    Err(format!(
-        "exec session terminal: {}",
-        command.exec()
-    ))
+    Err(format!("exec session terminal: {}", command.exec()))
 }
 
 fn generation() -> Result<String, String> {

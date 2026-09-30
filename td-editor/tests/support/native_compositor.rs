@@ -369,18 +369,14 @@ fn native_directory_marks_cancel_and_confirm_literal_deletion() {
         let state = editor.ok("state");
         let next = field(&state, "dialog").unwrap().split(',').next().unwrap();
         assert_ne!(id, next);
-        assert!(
-            editor
-                .request(&format!("dialog-answer\t{id}\t2\t3\tpath\t44454c455445"))
-                .unwrap()
-                .starts_with("error\tinvalid-argument")
-        );
+        assert!(editor
+            .request(&format!("dialog-answer\t{id}\t2\t3\tpath\t44454c455445"))
+            .unwrap()
+            .starts_with("error\tinvalid-argument"));
         let before = compositor.observe(&window);
-        assert!(
-            editor
-                .job(&format!("dialog-answer\t{next}\t2\t3\tpath\t44454c455445"))
-                .contains(",delete,2,3,0,complete,-")
-        );
+        assert!(editor
+            .job(&format!("dialog-answer\t{next}\t2\t3\tpath\t44454c455445"))
+            .contains(",delete,2,3,0,complete,-"));
         let listing = wait_directory_rows(&mut editor, 2, 4, &["z-keep"]);
         compositor.rendered_tab_text(&mut editor, &window, (2, 4), before, &listing[..10], 0);
         assert!(std::fs::symlink_metadata(victim).is_err());
@@ -509,13 +505,20 @@ fn native_directory_details_sort_and_copy_selected_entry() {
         std::fs::write(root.join("z"), b"larger payload").unwrap();
         for (name, mode, seconds) in [("a", 0o640, 0), ("z", 0o755, 951_782_400)] {
             let file = std::fs::File::open(root.join(name)).unwrap();
-            file.set_permissions(std::fs::Permissions::from_mode(mode)).unwrap();
-            file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds)).unwrap();
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds))
+                .unwrap();
         }
         let dictionary = directory.0.join("dictionary");
         std::fs::write(&dictionary, b"one\n").unwrap();
-        let mut editor = EditorProcess::start_with_profile(&directory,
-            &compositor.directory.join("wayland-0"), &root, &dictionary, profile);
+        let mut editor = EditorProcess::start_with_profile(
+            &directory,
+            &compositor.directory.join("wayland-0"),
+            &root,
+            &dictionary,
+            profile,
+        );
         editor.wait_keyboard(profile);
         let window = compositor.window();
         let before = compositor.observe(&window);
@@ -523,9 +526,17 @@ fn native_directory_details_sort_and_copy_selected_entry() {
         editor.wait_field("state", "window", "800,576,1");
         let listing = wait_directory_rows(&mut editor, 1, 0, &["child/", "a", "z"]);
         let meta = std::fs::metadata(root.join("a")).unwrap();
-        let expected = format!("  -rw-r-----   1 {:>5} {:>5}          3 1970-01-01 00:00Z a", meta.uid(), meta.gid());
+        let expected = format!(
+            "  -rw-r-----   1 {:>5} {:>5}          3 1970-01-01 00:00Z a",
+            meta.uid(),
+            meta.gid()
+        );
         assert_eq!(listing.lines().nth(1).unwrap(), expected);
-        assert!(listing.lines().nth(2).unwrap().contains("14 2000-02-29 00:00Z z"));
+        assert!(listing
+            .lines()
+            .nth(2)
+            .unwrap()
+            .contains("14 2000-02-29 00:00Z z"));
         editor.rendered_at(800, 576);
         compositor.rendered_rows(&window, before, 88, &[&expected], td_ui::raster::PAPER);
         compositor.chord(None, 31); // s: size
@@ -533,11 +544,18 @@ fn native_directory_details_sort_and_copy_selected_entry() {
         editor.wait_field("state", "directory-sort", "1,size,0");
         compositor.chord(None, 108);
         compositor.chord(None, 108);
-        let selected = format!("1,{}", td_editor::control::hex(root.join("a").as_os_str().as_encoded_bytes()));
+        let selected = format!(
+            "1,{}",
+            td_editor::control::hex(root.join("a").as_os_str().as_encoded_bytes())
+        );
         editor.wait_field("state", "directory-entry", &selected);
         compositor.chord(None, KEY_W);
         let expected_path = root.join("a").to_str().unwrap().to_owned();
-        editor.wait_field("clipboard-state", "source-bytes", &expected_path.len().to_string());
+        editor.wait_field(
+            "clipboard-state",
+            "source-bytes",
+            &expected_path.len().to_string(),
+        );
         compositor.click(270, 32); // Directory menu
         editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
         compositor.click(270, 132); // Sort by Modified
@@ -550,8 +568,11 @@ fn native_directory_details_sort_and_copy_selected_entry() {
         editor.wait_field("state", "directory-entry", &selected);
         compositor.chord(None, 108); // Select z; menu must replace the earlier a offer.
         let expected_path = root.join("z").to_str().unwrap().to_owned();
-        editor.wait_field("state", "directory-entry", &format!("1,{}",
-            td_editor::control::hex(expected_path.as_bytes())));
+        editor.wait_field(
+            "state",
+            "directory-entry",
+            &format!("1,{}", td_editor::control::hex(expected_path.as_bytes())),
+        );
         compositor.click(270, 32);
         editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
         compositor.click(270, 60); // Copy Entry Full Path
@@ -561,19 +582,33 @@ fn native_directory_details_sort_and_copy_selected_entry() {
         editor.wait_field("state", "directory-sort", "1,modified,1");
         // Decoded sorting uses the same revision/input fences.
         let state = editor.ok("state");
-        editor.ok(&format!("key\t1\t4\t{}\t73", field(&state, "input-generation").unwrap()));
+        editor.ok(&format!(
+            "key\t1\t4\t{}\t73",
+            field(&state, "input-generation").unwrap()
+        ));
         wait_directory_rows(&mut editor, 1, 5, &["child/", "z", "a"]);
         editor.wait_field("state", "directory-sort", "1,name,1");
         assert_eq!(editor.ok("new"), "2");
-        compositor.chord(Some(KEY_LEFT_CTRL), if profile == "windows" { 47 } else { KEY_Y });
+        compositor.chord(
+            Some(KEY_LEFT_CTRL),
+            if profile == "windows" { 47 } else { KEY_Y },
+        );
         let deadline = Instant::now() + TIMEOUT;
         loop {
             let state = editor.ok("state");
-            if state.split('\t').any(|f| f.starts_with("tab=2,1,")) { break; }
+            if state.split('\t').any(|f| f.starts_with("tab=2,1,")) {
+                break;
+            }
             assert!(Instant::now() < deadline, "entry clipboard paste: {state}");
         }
-        assert_eq!(editor.ok("text\t2\t1\t0\t4096"),
-            format!("{}\t{}", expected_path.len(), td_editor::control::hex(expected_path.as_bytes())));
+        assert_eq!(
+            editor.ok("text\t2\t1\t0\t4096"),
+            format!(
+                "{}\t{}",
+                expected_path.len(),
+                td_editor::control::hex(expected_path.as_bytes())
+            )
+        );
         editor.ok("undo\t2\t1");
         assert_eq!(std::fs::read(root.join("a")).unwrap(), b"one");
         editor.quit();
@@ -584,7 +619,9 @@ fn native_directory_details_sort_and_copy_selected_entry() {
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
 fn native_minibuffer_keeps_document_visible_and_pages_large_completions() {
-    let lines = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh"];
+    let lines = [
+        "first", "second", "third", "fourth", "fifth", "sixth", "seventh",
+    ];
     let contents = lines.join("\n");
     for profile in ["windows", "emacs"] {
         let compositor_directory = Directory::new();
@@ -592,18 +629,35 @@ fn native_minibuffer_keeps_document_visible_and_pages_large_completions() {
         let mut compositor = Compositor::start(&compositor_directory);
         std::fs::write(directory.0.join("draft"), &contents).unwrap();
         for i in 0..320 {
-            std::fs::write(directory.0.join(format!("item{i:04}")), format!("payload {i}")).unwrap();
+            std::fs::write(
+                directory.0.join(format!("item{i:04}")),
+                format!("payload {i}"),
+            )
+            .unwrap();
         }
         let socket = directory.0.join("control");
         let log = directory.0.join("stderr");
         let child = Command::new(env!("CARGO_BIN_EXE_td-editor"))
-            .arg("--control-socket").arg(&socket).arg(format!("--keys={profile}"))
-            .arg("draft").current_dir(&directory.0).env_clear()
+            .arg("--control-socket")
+            .arg(&socket)
+            .arg(format!("--keys={profile}"))
+            .arg("draft")
+            .current_dir(&directory.0)
+            .env_clear()
             .env("WAYLAND_DISPLAY", compositor.directory.join("wayland-0"))
-            .env("XDG_RUNTIME_DIR", &directory.0).env("TMPDIR", &directory.0)
-            .stdin(Stdio::null()).stdout(Stdio::null())
-            .stderr(Stdio::from(std::fs::File::create(&log).unwrap())).spawn().unwrap();
-        let mut editor = EditorProcess { child, socket, log, next: 0 };
+            .env("XDG_RUNTIME_DIR", &directory.0)
+            .env("TMPDIR", &directory.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .spawn()
+            .unwrap();
+        let mut editor = EditorProcess {
+            child,
+            socket,
+            log,
+            next: 0,
+        };
         editor.legacy_keyboard(profile);
         let window = compositor.window();
         assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
@@ -621,7 +675,10 @@ fn native_minibuffer_keeps_document_visible_and_pages_large_completions() {
                     compositor.click(68, 324);
                 }
                 (_, "windows") => compositor.chord(Some(KEY_LEFT_CTRL), 24),
-                _ => { compositor.chord(Some(KEY_LEFT_CTRL), KEY_X); compositor.chord(Some(KEY_LEFT_CTRL), 33); }
+                _ => {
+                    compositor.chord(Some(KEY_LEFT_CTRL), KEY_X);
+                    compositor.chord(Some(KEY_LEFT_CTRL), 33);
+                }
             }
             editor.wait_field("prompt-state", "prompt", prompt);
             editor.wait_field("state", "minibuffer", "6,96");
@@ -633,7 +690,9 @@ fn native_minibuffer_keeps_document_visible_and_pages_large_completions() {
                 editor.wait_field("prompt-state", "prompt", "none");
             }
         }
-        for code in [23, 20, 18, 50] { compositor.chord(None, code); } // item
+        for code in [23, 20, 18, 50] {
+            compositor.chord(None, code);
+        } // item
         let before = compositor.observe(&window);
         compositor.chord(None, 15);
         editor.wait_field("prompt-state", "completion", "ready");
@@ -645,7 +704,9 @@ fn native_minibuffer_keeps_document_visible_and_pages_large_completions() {
         editor.rendered_at(800, 576);
         compositor.rendered_rows(&window, before, 312, &lines, td_ui::raster::PAPER);
         compositor.rendered_rows(&window, before, 272, &["  item0011"], td_ui::raster::CHROME);
-        for _ in 0..26 { compositor.chord(None, 109); } // PageDown
+        for _ in 0..26 {
+            compositor.chord(None, 109);
+        } // PageDown
         editor.wait_field("prompt-state", "completion-selected", "312");
         let page = editor.ok("prompt-state");
         assert_eq!(page.matches("completion-item=").count(), 8);
@@ -657,9 +718,15 @@ fn native_minibuffer_keeps_document_visible_and_pages_large_completions() {
         editor.wait_field("prompt-state", "completion-selected", "319");
         compositor.chord(None, 28);
         editor.wait_field("state", "active", "2");
-        assert_eq!(editor.ok("text\t2\t0\t0\t100"), "11\t7061796c6f616420333139");
+        assert_eq!(
+            editor.ok("text\t2\t0\t0\t100"),
+            "11\t7061796c6f616420333139"
+        );
         editor.wait_tab(0, &contents);
-        assert_eq!(std::fs::read_to_string(directory.0.join("draft")).unwrap(), contents);
+        assert_eq!(
+            std::fs::read_to_string(directory.0.join("draft")).unwrap(),
+            contents
+        );
         editor.quit();
         compositor.stop();
     }
@@ -687,7 +754,10 @@ fn native_directory_tabs_reuse_shift_open_refresh_and_copy_path() {
         editor.rendered_at(800, 576);
         assert_eq!(field(&editor.ok("state"), "line-numbers"), Some("1"));
         let listing = wait_directory_rows(&mut editor, 1, 0, &["child/"]);
-        assert!(editor.request("insert\t1\t0\t0\t0\t78").unwrap().starts_with("error\tunavailable\t"));
+        assert!(editor
+            .request("insert\t1\t0\t0\t0\t78")
+            .unwrap()
+            .starts_with("error\tunavailable\t"));
         editor.wait_tab(0, &listing);
         let before = compositor.observe(&window);
         compositor.chord(None, 28); // Enter reuses tab 1.
@@ -763,7 +833,10 @@ fn native_directory_tabs_reuse_shift_open_refresh_and_copy_path() {
             )
         );
         editor.job("save\t2\t1");
-        editor.job(&format!("open\t{}", td_editor::control::hex(root.as_os_str().as_encoded_bytes())));
+        editor.job(&format!(
+            "open\t{}",
+            td_editor::control::hex(root.as_os_str().as_encoded_bytes())
+        ));
         editor.wait_field("state", "active", "4");
         let state = editor.ok("state");
         assert!(state.contains("tab-kind=4,directory"));
@@ -772,8 +845,13 @@ fn native_directory_tabs_reuse_shift_open_refresh_and_copy_path() {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             let state = editor.ok("state");
-            if state.split('\t').any(|row| row.starts_with("tab=4,1,")) { break; }
-            assert!(Instant::now() < deadline, "remote directory navigation: {state}");
+            if state.split('\t').any(|row| row.starts_with("tab=4,1,")) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "remote directory navigation: {state}"
+            );
         }
         wait_directory_rows(&mut editor, 4, 1, &["note"]);
         assert_eq!(
@@ -800,17 +878,26 @@ fn native_path_completion_lists_cycles_and_opens_literal_relative_file() {
         let socket = directory.0.join("control");
         let log = directory.0.join("stderr");
         let child = Command::new(env!("CARGO_BIN_EXE_td-editor"))
-            .arg("--control-socket").arg(&socket)
-            .arg(format!("--keys={profile}")).arg("draft")
+            .arg("--control-socket")
+            .arg(&socket)
+            .arg(format!("--keys={profile}"))
+            .arg("draft")
             .current_dir(&directory.0)
             .env_clear()
             .env("WAYLAND_DISPLAY", compositor.directory.join("wayland-0"))
             .env("XDG_RUNTIME_DIR", &directory.0)
             .env("TMPDIR", &directory.0)
-            .stdin(Stdio::null()).stdout(Stdio::null())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
             .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
-            .spawn().unwrap();
-        let mut editor = EditorProcess { child, socket, log, next: 0 };
+            .spawn()
+            .unwrap();
+        let mut editor = EditorProcess {
+            child,
+            socket,
+            log,
+            next: 0,
+        };
         editor.legacy_keyboard(profile);
         let window = compositor.window();
         assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
@@ -912,8 +999,11 @@ fn ordinary_invocation_keeps_foreground_lifetime_and_inherited_stdin() {
     std::fs::write(&input, b"caller-owned unread input\n").unwrap();
     let mut inherited = std::fs::File::open(&input).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_td-editor"))
-        .arg("--control-socket").arg(&socket)
-        .arg("--").arg(first_name).arg("new draft")
+        .arg("--control-socket")
+        .arg(&socket)
+        .arg("--")
+        .arg(first_name)
+        .arg("new draft")
         .current_dir(&directory.0)
         .env_clear()
         .env("WAYLAND_DISPLAY", compositor.directory.join("wayland-0"))
@@ -922,8 +1012,14 @@ fn ordinary_invocation_keeps_foreground_lifetime_and_inherited_stdin() {
         .stdin(Stdio::from(inherited.try_clone().unwrap()))
         .stdout(Stdio::from(std::fs::File::create(&output).unwrap()))
         .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
-        .spawn().unwrap();
-    let mut editor = EditorProcess { child, socket, log, next: 0 };
+        .spawn()
+        .unwrap();
+    let mut editor = EditorProcess {
+        child,
+        socket,
+        log,
+        next: 0,
+    };
     editor.wait_keyboard("windows");
     editor.wait_field("state", "active", "2");
     assert!(!second.exists());
@@ -1881,7 +1977,11 @@ fn native_file_menu_copies_full_path_to_another_editor_without_selection() {
             .into_os_string()
             .into_string()
             .unwrap();
-        source.wait_field("clipboard-state", "source-bytes", &expected.len().to_string());
+        source.wait_field(
+            "clipboard-state",
+            "source-bytes",
+            &expected.len().to_string(),
+        );
         source.wait_field("state", "tab", "1,0,0,10,0,0,0,72,0,lf");
         assert_eq!(std::fs::read(&source_path).unwrap(), b"unchanged\n");
         assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
@@ -1905,7 +2005,10 @@ fn native_file_menu_copies_full_path_to_another_editor_without_selection() {
         );
         destination.wait_tab(1, &expected);
         destination.job("save\t1\t1");
-        assert_eq!(std::fs::read(&destination_path).unwrap(), expected.as_bytes());
+        assert_eq!(
+            std::fs::read(&destination_path).unwrap(),
+            expected.as_bytes()
+        );
         source.wait_tab(0, "unchanged\n"); // Revision zero of tab one.
         destination.quit();
         source.quit();
@@ -1932,7 +2035,10 @@ fn select_clipboard_text(compositor: &mut Compositor, profile: &str) {
 }
 
 fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
-    assert!(matches!(profile, "windows" | "emacs"), "unsupported key profile");
+    assert!(
+        matches!(profile, "windows" | "emacs"),
+        "unsupported key profile"
+    );
     let compositor_directory = Directory::new();
     let source_directory = Directory::new();
     let destination_directory = Directory::new();
@@ -2051,7 +2157,11 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
         if reply == held.as_bytes() {
             break;
         }
-        assert_eq!(reply, armed.as_bytes(), "hold failed before receiving the transfer");
+        assert_eq!(
+            reply,
+            armed.as_bytes(),
+            "hold failed before receiving the transfer"
+        );
         assert!(
             Instant::now() < deadline,
             "native Paste never reached the hold: {}",
@@ -2081,25 +2191,42 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     );
     destination.wait_field("state", "tab", "1,0,0,0,0,0,0,72,0,lf");
     destination.wait_tab(0, "");
-    compositor.rendered_text(&mut destination, destination_window, 0, before_paste, " ", 0);
+    compositor.rendered_text(
+        &mut destination,
+        destination_window,
+        0,
+        before_paste,
+        " ",
+        0,
+    );
     let send_failed = b"Clipboard send failed:";
     let prior_notice = source.ok("prompt-state");
     let prior_notice = field(&prior_notice, "notice").unwrap();
     assert!(
         prior_notice == "-"
-            || !td_editor::control::unhex(prior_notice).unwrap().starts_with(send_failed)
+            || !td_editor::control::unhex(prior_notice)
+                .unwrap()
+                .starts_with(send_failed)
     );
     let release_started = Instant::now();
-    assert_eq!(compositor.request(&format!(
-        "clipboard-release {} 1", compositor.session,
-    ), 1024), released.as_bytes());
+    assert_eq!(
+        compositor.request(
+            &format!("clipboard-release {} 1", compositor.session,),
+            1024
+        ),
+        released.as_bytes()
+    );
     // Fence source processing, not just compositor queue admission or a
     // transient outgoing=0 observed before DataSourceSend reached it.
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let reply = source.ok("prompt-state");
         let notice = field(&reply, "notice").unwrap();
-        if notice != "-" && td_editor::control::unhex(notice).unwrap().starts_with(send_failed) {
+        if notice != "-"
+            && td_editor::control::unhex(notice)
+                .unwrap()
+                .starts_with(send_failed)
+        {
             break;
         }
         assert!(
@@ -2145,7 +2272,8 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let reply = compositor.request(
-            &format!("clipboard-status {} {hold_id}", compositor.session), 1024,
+            &format!("clipboard-status {} {hold_id}", compositor.session),
+            1024,
         );
         if reply == held.as_bytes() {
             break;
@@ -2161,26 +2289,36 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     destination.wait_field("prompt-state", "notice", &pasting);
     let before_focus = compositor.observe(destination_window);
     assert_eq!(
-        compositor.request(&format!("focus {source_window}"), 1024), b"ok\n",
+        compositor.request(&format!("focus {source_window}"), 1024),
+        b"ok\n",
     );
     destination.wait_field("state", "focus", "0");
     destination.wait_field("clipboard-state", "focus", "0");
     destination.wait_field("clipboard-state", "selection", "none");
     destination.wait_field("clipboard-state", "incoming", "0");
     assert_ne!(
-        field(&destination.ok("prompt-state"), "notice"), Some(pasting.as_str()),
+        field(&destination.ok("prompt-state"), "notice"),
+        Some(pasting.as_str()),
     );
     destination.wait_field("state", "tab", "1,0,0,0,0,0,0,72,0,lf");
     destination.wait_tab(0, "");
     source.wait_field("state", "focus", "1");
     source.wait_field("state", "tab", &collapsed);
     source.wait_tab(source_revision, "b");
-    assert_eq!(compositor.request(&format!(
-        "clipboard-status {} {hold_id}", compositor.session,
-    ), 1024), invalidated.as_bytes());
-    assert_eq!(compositor.request(&format!(
-        "clipboard-release {} {hold_id}", compositor.session,
-    ), 1024), b"unavailable clipboard hold has no releasable transfer\n");
+    assert_eq!(
+        compositor.request(
+            &format!("clipboard-status {} {hold_id}", compositor.session,),
+            1024
+        ),
+        invalidated.as_bytes()
+    );
+    assert_eq!(
+        compositor.request(
+            &format!("clipboard-release {} {hold_id}", compositor.session,),
+            1024
+        ),
+        b"unavailable clipboard hold has no releasable transfer\n"
+    );
     assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
     assert_eq!(std::fs::read(&destination_path).unwrap(), b"");
     assert!(
@@ -2188,7 +2326,8 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
         "focus loss exceeded its transfer evidence budget"
     );
     assert_eq!(
-        compositor.request(&format!("focus {destination_window}"), 1024), b"ok\n",
+        compositor.request(&format!("focus {destination_window}"), 1024),
+        b"ok\n",
     );
     destination.wait_field("state", "focus", "1");
     destination.wait_field("clipboard-state", "selection", "utf8");
@@ -2198,12 +2337,21 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     destination.wait_field("state", "tab", "1,0,0,0,0,0,0,72,0,lf");
     source.wait_field("state", "focus", "0");
     compositor.rendered_text(
-        &mut destination, destination_window, 0, before_focus, " ", 0,
+        &mut destination,
+        destination_window,
+        0,
+        before_focus,
+        " ",
+        0,
     );
     // Returning focus never revives the old descriptor or its hold identity.
-    assert_eq!(compositor.request(&format!(
-        "clipboard-status {} {hold_id}", compositor.session,
-    ), 1024), invalidated.as_bytes());
+    assert_eq!(
+        compositor.request(
+            &format!("clipboard-status {} {hold_id}", compositor.session,),
+            1024
+        ),
+        invalidated.as_bytes()
+    );
     let before_paste = compositor.observe(destination_window);
     // A fresh Paste after cancellation must still consume the original offer.
     compositor.chord(Some(KEY_LEFT_CTRL), paste_key);
@@ -2253,7 +2401,9 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
             break;
         }
         assert_eq!(
-            reply, armed.as_bytes(), "owner-exit hold failed before receive: {}",
+            reply,
+            armed.as_bytes(),
+            "owner-exit hold failed before receive: {}",
             String::from_utf8_lossy(&reply),
         );
         assert!(
@@ -2289,10 +2439,17 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     destination.wait_field("clipboard-state", "incoming", "0");
     destination.wait_field("state", "tab", &saved_destination);
     destination.wait_tab(1, text);
-    assert_eq!(compositor.request(&status_command, 1024), invalidated.as_bytes());
-    assert_eq!(compositor.request(&format!(
-        "clipboard-release {} {hold_id}", compositor.session,
-    ), 1024), b"unavailable clipboard hold has no releasable transfer\n");
+    assert_eq!(
+        compositor.request(&status_command, 1024),
+        invalidated.as_bytes()
+    );
+    assert_eq!(
+        compositor.request(
+            &format!("clipboard-release {} {hold_id}", compositor.session,),
+            1024
+        ),
+        b"unavailable clipboard hold has no releasable transfer\n"
+    );
     assert_eq!(std::fs::read(&destination_path).unwrap(), text.as_bytes());
     assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
     assert!(
@@ -2365,7 +2522,10 @@ fn native_control_edit_spelling_save_and_dirty_close() {
     control_edit_jobs_and_close_dialogs(&mut editor, &file);
     // Caret is on the final empty line, outside the first-row prefix.
     compositor.rendered_text(&mut editor, &window, 4, before, "warm", 4);
-    assert_eq!(std::fs::read(&file).unwrap(), b"\xef\xbb\xbfwarm one\r\nwrong\r\n");
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        b"\xef\xbb\xbfwarm one\r\nwrong\r\n"
+    );
     editor.quit();
     compositor.stop();
 }
@@ -2561,12 +2721,12 @@ fn native_open_and_save_as_preserve_literal_paths_and_dirty_duplicate() {
     let mut compositor = Compositor::start(&compositor_directory);
     let file = directory.0.join("draft");
     let dictionary = directory.0.join("dictionary");
-    let missing = directory.0.join(std::ffi::OsString::from_vec(
-        b"-missing \xff".to_vec(),
-    ));
-    let destination = directory.0.join(std::ffi::OsString::from_vec(
-        b"-saved \xfe".to_vec(),
-    ));
+    let missing = directory
+        .0
+        .join(std::ffi::OsString::from_vec(b"-missing \xff".to_vec()));
+    let destination = directory
+        .0
+        .join(std::ffi::OsString::from_vec(b"-saved \xfe".to_vec()));
     let missing_hex = td_editor::control::hex(missing.as_os_str().as_bytes());
     let destination_hex = td_editor::control::hex(destination.as_os_str().as_bytes());
     std::fs::write(&file, b"base\n").unwrap();
@@ -2582,21 +2742,32 @@ fn native_open_and_save_as_preserve_literal_paths_and_dirty_duplicate() {
         let state = process.ok("state");
         assert_eq!(field(&state, "active"), Some("2"));
         process.wait_tab(0, "base\n");
-        let tabs: Vec<_> = state.split('\t')
+        let tabs: Vec<_> = state
+            .split('\t')
             .filter(|field| field.starts_with("tab="))
             .collect();
         assert_eq!(tabs.len(), 2);
         assert_eq!(tabs.first().copied(), Some("tab=1,0,0,5,0,0,0,72,0,lf"));
-        assert_eq!(tabs.get(1).and_then(|tab| tab.strip_prefix("tab=")), Some(row));
+        assert_eq!(
+            tabs.get(1).and_then(|tab| tab.strip_prefix("tab=")),
+            Some(row)
+        );
         assert_eq!(
             process.ok(&format!("text\t2\t{revision}\t0\t100")),
-            format!("{}\t{}", text.len(), td_editor::control::hex(text.as_bytes()))
+            format!(
+                "{}\t{}",
+                text.len(),
+                td_editor::control::hex(text.as_bytes())
+            )
         );
     };
     let file_job = |process: &mut EditorProcess, request: &str, fields: &str| {
         let response = process.request(request).unwrap();
         let job = response.strip_prefix("pending\t").expect(&response);
-        assert_eq!(process.wait_job(job), format!("job={job},{fields},complete,-"));
+        assert_eq!(
+            process.wait_job(job),
+            format!("job={job},{fields},complete,-")
+        );
     };
     file_job(&mut editor, &format!("open\t{missing_hex}"), "open,2,0,0");
     second_tab(&mut editor, "2,0,1,0,0,0,0,72,0,lf", 0, "");
@@ -2615,7 +2786,11 @@ fn native_open_and_save_as_preserve_literal_paths_and_dirty_duplicate() {
     editor.ok("select-tab\t1\t0");
     editor.wait_field("state", "active", "1");
     let before = compositor.observe(&window);
-    file_job(&mut editor, &format!("open\t{destination_hex}"), "open,2,2,0");
+    file_job(
+        &mut editor,
+        &format!("open\t{destination_hex}"),
+        "open,2,2,0",
+    );
     second_tab(&mut editor, "2,2,1,5,1,1,0,72,0,lf", 2, "xnew\n");
     compositor.rendered_tab_text(&mut editor, &window, (2, 2), before, "xnew", 1);
     assert_eq!(std::fs::read(&destination).unwrap(), b"new\n");
@@ -2642,8 +2817,13 @@ fn ordinary_editor_ignores_file_barrier_environment() {
     let display = compositor.directory.join("wayland-0");
     let missing_barrier = directory.0.join("must-not-connect");
     let mut editor = EditorProcess::start_with_barriers(
-        &directory, &display, &file, &dictionary, "windows",
-        Some(&missing_barrier), Some(&missing_barrier),
+        &directory,
+        &display,
+        &file,
+        &dictionary,
+        "windows",
+        Some(&missing_barrier),
+        Some(&missing_barrier),
     );
     editor.wait_keyboard("windows");
     editor.wait_tab(0, "ordinary");

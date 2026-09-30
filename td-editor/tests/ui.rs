@@ -254,7 +254,13 @@ fn horizontal_scrollbar_pages_drags_and_preserves_wrap_and_tab_state() {
             false,
         );
         assert_eq!(
-            pointer(&mut ui, PointerPhase::Move, bar.thumb.x + 2, bar.thumb.y, false),
+            pointer(
+                &mut ui,
+                PointerPhase::Move,
+                bar.thumb.x + 2,
+                bar.thumb.y,
+                false
+            ),
             Outcome::Changed
         );
         ui.dispatch(Event::Wrap {
@@ -390,7 +396,13 @@ fn minibuffer_reserves_chrome_and_retains_document_pixels_and_hits() {
                 assert_eq!(&before[source..source + 4], &shifted[target..target + 4]);
             }
         }
-        pointer(&mut ui, PointerPhase::Press, 24 * scale as i64, 144 * scale as i64, false);
+        pointer(
+            &mut ui,
+            PointerPhase::Press,
+            24 * scale as i64,
+            144 * scale as i64,
+            false,
+        );
         assert_eq!(selection(&ui).caret, 2);
         assert_eq!(ui.dispatch(Event::PromptRows(16)), Err(Error::Limit));
         ui.dispatch(Event::PromptRows(0)).unwrap();

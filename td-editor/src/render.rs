@@ -74,9 +74,7 @@ impl Geometry {
     /// within it, so a raster over that surface paints the scene.
     pub fn pane(rect: Rect, surface: Surface) -> Result<Self> {
         surface.check()?;
-        if rect.width == 0
-            || rect.height == 0
-            || rect.intersection(surface.bounds()) != Some(rect)
+        if rect.width == 0 || rect.height == 0 || rect.intersection(surface.bounds()) != Some(rect)
         {
             return Err(Error::InvalidArgument);
         }
@@ -120,27 +118,35 @@ impl Geometry {
         let status = if self.pane { 0 } else { 24 };
         let chrome = status + if self.horizontal_scrollbar { 16 } else { 0 };
         self.height
-            .saturating_sub(chrome * self.scale.value() + self.top())
-            as u32
+            .saturating_sub(chrome * self.scale.value() + self.top()) as u32
     }
     pub fn with_prompt_rows(mut self, rows: usize) -> Result<Self> {
-        if rows > MAX_PROMPT_ROWS { return Err(Error::Limit); }
+        if rows > MAX_PROMPT_ROWS {
+            return Err(Error::Limit);
+        }
         self.prompt_rows = rows;
         Ok(self)
     }
-    pub fn prompt_rows(self) -> usize { self.prompt_rows }
+    pub fn prompt_rows(self) -> usize {
+        self.prompt_rows
+    }
     pub fn prompt(self) -> Rect {
         let scale = self.scale.value();
         let (rows, y) = if self.pane {
             (0, self.y)
         } else {
             (
-                self.prompt_rows.min(self.height.saturating_sub(72 * scale) / (16 * scale)),
+                self.prompt_rows
+                    .min(self.height.saturating_sub(72 * scale) / (16 * scale)),
                 self.y + 24 * scale,
             )
         };
-        Rect { x: self.x as i64, y: y as i64, width: self.width as u32,
-            height: (rows * 16 * scale) as u32 }
+        Rect {
+            x: self.x as i64,
+            y: y as i64,
+            width: self.width as u32,
+            height: (rows * 16 * scale) as u32,
+        }
     }
     pub(crate) fn with_line_numbers(mut self, lines: Option<usize>) -> Self {
         self.gutter_columns = lines.map_or(0, |n| n.to_string().len().max(2) + 1);
@@ -215,12 +221,7 @@ impl Geometry {
             height: document.height,
         };
         Some(Scrollbar::new(
-            track,
-            rows,
-            total_rows,
-            first_row,
-            self.scale,
-            false,
+            track, rows, total_rows, first_row, self.scale, false,
         ))
     }
     pub fn horizontal_scrollbar(
@@ -461,8 +462,7 @@ impl<'a> Scene<'a> {
         if !self.geometry.pane {
             Bar::new(surface, &MENU_LABELS).emit(clip, sink);
             let prompt = self.geometry.prompt();
-            let prompt_rows =
-                prompt.height as usize / (CELL_HEIGHT * self.geometry.scale.value());
+            let prompt_rows = prompt.height as usize / (CELL_HEIGHT * self.geometry.scale.value());
             if let Some(block) = Block::new(surface, prompt.y, prompt_rows) {
                 block.emit("", clip, sink);
             }
@@ -750,7 +750,15 @@ impl<'a> Scene<'a> {
         damage: Rect,
         sink: &mut dyn FnMut(Draw),
     ) {
-        text_run(self.geometry.scale, chars, origin, bounds, style, damage, sink);
+        text_run(
+            self.geometry.scale,
+            chars,
+            origin,
+            bounds,
+            style,
+            damage,
+            sink,
+        );
     }
 }
 

@@ -156,9 +156,7 @@ pub fn plan(units: &[Unit]) -> Plan {
     // still happens first, and its complaint survives to say so.
     let mut forced: Vec<(String, Skip)> = Vec::new();
     skipped.retain(|(name, why)| {
-        let is_console = units
-            .iter()
-            .any(|u| &u.name == name && u.is_console());
+        let is_console = units.iter().any(|u| &u.name == name && u.is_console());
         if is_console {
             forced.push((name.clone(), Skip::ConsoleForced(Box::new(why.clone()))));
             return false;
@@ -245,7 +243,11 @@ mod tests {
 
     #[test]
     fn a_dependency_starts_before_its_dependent() {
-        let p = plan(&[unit("sshd", &["netup"]), unit("netup", &["rootcheck"]), unit("rootcheck", &[])]);
+        let p = plan(&[
+            unit("sshd", &["netup"]),
+            unit("netup", &["rootcheck"]),
+            unit("rootcheck", &[]),
+        ]);
         assert_eq!(p.order, ["rootcheck", "netup", "sshd"]);
     }
 
@@ -283,7 +285,10 @@ mod tests {
         assert_eq!(p.order, ["fine"]);
         assert_eq!(p.skipped[0], ("a".into(), Skip::InCycle));
         assert_eq!(p.skipped[1], ("b".into(), Skip::InCycle));
-        assert_eq!(p.skipped[2], ("downstream".into(), Skip::Blocked("a".into())));
+        assert_eq!(
+            p.skipped[2],
+            ("downstream".into(), Skip::Blocked("a".into()))
+        );
     }
 
     #[test]
@@ -333,7 +338,10 @@ mod tests {
     /// the greeter's dependency is unstartable, and the greeter starts anyway.
     #[test]
     fn a_console_unit_starts_even_when_its_dependency_does_not_exist() {
-        let p = plan(&[unit("netup", &["nosuchunit"]), console("greeter", &["netup"])]);
+        let p = plan(&[
+            unit("netup", &["nosuchunit"]),
+            console("greeter", &["netup"]),
+        ]);
         assert!(p.order.contains(&"greeter".to_string()), "{p:?}");
         assert!(!p.order.contains(&"netup".to_string()));
         assert!(p

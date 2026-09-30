@@ -215,7 +215,9 @@ mod tests {
         let mut data = image();
         put16(&mut data, 84, 4097);
         assert_eq!(u16_at(&data, 86).unwrap(), 2);
-        assert!(validate(&data, 1024).unwrap_err().contains("optional-header size"));
+        assert!(validate(&data, 1024)
+            .unwrap_err()
+            .contains("optional-header size"));
     }
 
     #[test]

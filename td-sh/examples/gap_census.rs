@@ -72,8 +72,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use td_sh::{
-    annotates_field, case_keys, designates, graded_identity, parse_spec, run_case,
-    spec_paths, ASH_DASH_CHAIN,
+    annotates_field, case_keys, designates, graded_identity, parse_spec, run_case, spec_paths,
+    ASH_DASH_CHAIN,
 };
 
 /// The identity half of a bucket key for a case designating neither chain
@@ -139,10 +139,7 @@ fn command_words(code: &str) -> Vec<String> {
             };
             let word: String = token
                 .chars()
-                .take_while(|c| {
-                    c.is_ascii_alphanumeric()
-                        || matches!(c, '_' | '-' | '.' | '/')
-                })
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
                 .collect();
             // A bare `.` or `/` is a path fragment this scan cannot read as a
             // name, not a command.
@@ -150,11 +147,37 @@ fn command_words(code: &str) -> Vec<String> {
                 continue;
             }
             // Keywords are not names the shell looks up.
-            if matches!(word.as_str(), "if" | "then" | "else" | "elif" | "fi" | "for" | "while"
-                                     | "until" | "do" | "done" | "case" | "esac" | "in"
-                                     | "function" | "select" | "time" | "echo" | "true"
-                                     | "false" | "cd" | "set" | "unset" | "export" | "read"
-                                     | "shift" | "return" | "exit" | "eval" | "test") {
+            if matches!(
+                word.as_str(),
+                "if" | "then"
+                    | "else"
+                    | "elif"
+                    | "fi"
+                    | "for"
+                    | "while"
+                    | "until"
+                    | "do"
+                    | "done"
+                    | "case"
+                    | "esac"
+                    | "in"
+                    | "function"
+                    | "select"
+                    | "time"
+                    | "echo"
+                    | "true"
+                    | "false"
+                    | "cd"
+                    | "set"
+                    | "unset"
+                    | "export"
+                    | "read"
+                    | "shift"
+                    | "return"
+                    | "exit"
+                    | "eval"
+                    | "test"
+            ) {
                 continue;
             }
             out.push(word);
@@ -215,17 +238,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // that reason, and this reuses its recorded decision rather than
     // re-deriving it.
     let overlay = dir.join("expectations.txt");
-    let text = std::fs::read_to_string(&overlay)
-        .map_err(|e| format!("{}: {e}", overlay.display()))?;
+    let text =
+        std::fs::read_to_string(&overlay).map_err(|e| format!("{}: {e}", overlay.display()))?;
     let skipped: BTreeSet<String> = text
         .lines()
         .filter_map(|l| l.strip_prefix("skip "))
         .map(|k| k.trim().to_string())
         .collect();
     if skipped.is_empty() {
-        return Err(format!("{} lists no skips; refusing to census without it \
-                            (it is the set this must not run)", overlay.display())
-            .into());
+        return Err(format!(
+            "{} lists no skips; refusing to census without it \
+                            (it is the set this must not run)",
+            overlay.display()
+        )
+        .into());
     }
 
     // Split by the identity each case is GRADED as, which is the one thing the
@@ -297,11 +323,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // shell's own for the failure to be one.
             let own = id != NEITHER
                 && !outcome.mismatched.is_empty()
-                && outcome.mismatched.iter().all(|f| annotates_field(case, id, *f));
+                && outcome
+                    .mismatched
+                    .iter()
+                    .all(|f| annotates_field(case, id, *f));
             *by_identity.entry((id, own)).or_default() += 1;
-            *per_file_by_id.entry((id, own)).or_default().entry(file.clone()).or_default() += 1;
+            *per_file_by_id
+                .entry((id, own))
+                .or_default()
+                .entry(file.clone())
+                .or_default() += 1;
             if outcome.timed_out || outcome.truncated {
-                *buckets.entry("not evaluated (timeout/cap)".into()).or_default() += 1;
+                *buckets
+                    .entry("not evaluated (timeout/cap)".into())
+                    .or_default() += 1;
                 continue;
             }
             let detail = outcome.detail.unwrap_or_default();
@@ -363,14 +398,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // ash before dash before neither, and each shell's own block before the
     // ideal -- the order the tuple key already has.
-    let mut order: Vec<(&(&str, bool), &BTreeMap<String, usize>)> =
-        per_file_by_id.iter().collect();
+    let mut order: Vec<(&(&str, bool), &BTreeMap<String, usize>)> = per_file_by_id.iter().collect();
     order.sort_by_key(|((id, own), _)| {
-        let head = ASH_DASH_CHAIN.iter().position(|c| c == id).unwrap_or(ASH_DASH_CHAIN.len());
+        let head = ASH_DASH_CHAIN
+            .iter()
+            .position(|c| c == id)
+            .unwrap_or(ASH_DASH_CHAIN.len());
         (head, !*own, *id)
     });
     for (key, files) in order {
-        println!("\nWHERE THEY ARE, graded as {}, most-failing file first", label(*key));
+        println!(
+            "\nWHERE THEY ARE, graded as {}, most-failing file first",
+            label(*key)
+        );
         let mut files: Vec<(&String, &usize)> = files.iter().collect();
         files.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
         let shown = 15.min(files.len());

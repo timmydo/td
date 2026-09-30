@@ -30,23 +30,24 @@ mod vm_clipboard;
 #[path = "../../../td-compositor/src/vm_wire.rs"]
 mod vm_wire;
 
-#[path = "../vm_git_profile.rs"]
-mod vm_git_profile;
-#[path = "../vm_settings_profile.rs"]
-mod vm_settings_profile;
+#[path = "../vm_git_names.rs"]
+mod vm_git_names;
 #[path = "../vm_git_origin.rs"]
 #[allow(dead_code)]
 mod vm_git_origin;
-#[path = "../vm_git_names.rs"]
-mod vm_git_names;
-#[path = "../vm_workspace.rs"]
-mod vm_workspace;
+#[path = "../vm_git_profile.rs"]
+mod vm_git_profile;
 #[path = "../vm_provision.rs"]
 mod vm_provision;
+#[path = "../vm_settings_profile.rs"]
+mod vm_settings_profile;
+#[path = "../vm_workspace.rs"]
+mod vm_workspace;
 
 type Result<T> = std::result::Result<T, String>;
 const TABLE_HEADER: &str = "NAME                             STATE    ACCEL    TEMPLATE         CPU RAM MiB HOST MiB  CAP MiB";
-const DISK_LEGEND: &str = "HOST: allocated overlay; CAP: virtual capacity. Neither is guest free space.";
+const DISK_LEGEND: &str =
+    "HOST: allocated overlay; CAP: virtual capacity. Neither is guest free space.";
 const HELP: &str = "td-vm: manage persistent graphical td instances
 
   td-vm                              open the TUI
@@ -123,8 +124,13 @@ fn run(args: Vec<String>) -> Result<()> {
         }
     };
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
-    let read_only = matches!(words.first(), Some(&"list" | &"templates" | &"logs" | &"status"))
-        || matches!(words.as_slice(), ["git-profile" | "settings-profile", "show" | "check"] | ["workspace", "show", _]);
+    let read_only = matches!(
+        words.first(),
+        Some(&"list" | &"templates" | &"logs" | &"status")
+    ) || matches!(
+        words.as_slice(),
+        ["git-profile" | "settings-profile", "show" | "check"] | ["workspace", "show", _]
+    );
     let manager = if read_only {
         if !home.exists() && matches!(words.as_slice(), ["list"] | ["templates"]) {
             println!("No managed instances or templates yet.");
@@ -160,7 +166,10 @@ fn run(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         ["settings-profile", "show"] => {
-            println!("{}", term::scrub_lines(&vm_settings_profile::load(&manager.root)?.summary()?));
+            println!(
+                "{}",
+                term::scrub_lines(&vm_settings_profile::load(&manager.root)?.summary()?)
+            );
             Ok(())
         }
         ["settings-profile", "check"] => {
@@ -170,7 +179,10 @@ fn run(args: Vec<String>) -> Result<()> {
         }
         ["import", name, bundle] => manager.import(name, Path::new(bundle)),
         ["workspace", "prepare", name, branch] => {
-            println!("{}", term::scrub_lines(&manager.prepare_workspace(name, branch)?));
+            println!(
+                "{}",
+                term::scrub_lines(&manager.prepare_workspace(name, branch)?)
+            );
             Ok(())
         }
         ["workspace", "enroll", name] => {
@@ -186,7 +198,10 @@ fn run(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         ["workspace", "agent", name, agent] => {
-            println!("{}", term::scrub_lines(&manager.workspace_launch(name, agent_verb(agent)?)?));
+            println!(
+                "{}",
+                term::scrub_lines(&manager.workspace_launch(name, agent_verb(agent)?)?)
+            );
             Ok(())
         }
         ["workspace", "key", name] => {
@@ -205,7 +220,11 @@ fn run(args: Vec<String>) -> Result<()> {
             let (cpus, memory) = match resources {
                 [] => ("4", "8192"),
                 [cpus, memory] => (*cpus, *memory),
-                _ => return Err("create --branch needs either no resources or CPUS MEMORY_MIB".into()),
+                _ => {
+                    return Err(
+                        "create --branch needs either no resources or CPUS MEMORY_MIB".into(),
+                    )
+                }
             };
             manager.create_workspace(name, template, cpus, memory, Some(branch))
         }
@@ -227,7 +246,7 @@ fn run(args: Vec<String>) -> Result<()> {
         ["stop", name] => {
             println!("{}", manager.poweroff(name)?);
             Ok(())
-        },
+        }
         ["stop", name, "--force"] => manager.stop(name),
         ["clipboard", "put", name] => {
             let mut bytes = Vec::new();
@@ -629,22 +648,49 @@ impl Manager {
 
     fn enroll_locked(&self, dir: &Path, lock: &File) -> Result<vm_workspace::Workspace> {
         let mut workspace = vm_workspace::load(dir)?.ok_or("instance has no workspace plan")?;
-        if workspace.enrollment.as_ref().is_some_and(|state| state.phase == vm_workspace::Phase::Revoking) {
-            return Err("cannot enroll a revoking workspace; retry deletion, then create a fresh instance".into());
+        if workspace
+            .enrollment
+            .as_ref()
+            .is_some_and(|state| state.phase == vm_workspace::Phase::Revoking)
+        {
+            return Err(
+                "cannot enroll a revoking workspace; retry deletion, then create a fresh instance"
+                    .into(),
+            );
         }
         workspace.profile.check()?;
         let reply = vm_bridge::ask(dir, vm_wire::KEY, workspace.id.as_bytes().to_vec())?;
         let key = vm_wire::git_key::parse(&reply, &workspace.id)?;
         if let Some(state) = &workspace.enrollment {
-            if state.key != key { return Err("guest key differs from the saved enrollment; refusing replacement".into()); }
+            if state.key != key {
+                return Err(
+                    "guest key differs from the saved enrollment; refusing replacement".into(),
+                );
+            }
         }
-        let phase = workspace.enrollment.as_ref().map_or(vm_workspace::Phase::Pending, |state| state.phase);
+        let phase = workspace
+            .enrollment
+            .as_ref()
+            .map_or(vm_workspace::Phase::Pending, |state| state.phase);
         workspace.transition(dir, phase, &key)?;
-        workspace.profile.enroll(&workspace.id, &workspace.branch, &key, lock)
-            .map_err(|error| format!("Git enrollment is unconfirmed; retry with this same instance: {error}"))?;
+        workspace
+            .profile
+            .enroll(&workspace.id, &workspace.branch, &key, lock)
+            .map_err(|error| {
+                format!("Git enrollment is unconfirmed; retry with this same instance: {error}")
+            })?;
         workspace.transition(dir, vm_workspace::Phase::Enrolled, &key)?;
-        let start = workspace.profile.start(&workspace.id, &workspace.branch, workspace.start.as_deref(), lock)
-            .map_err(|error| format!("Git key enrolled; starting commit unconfirmed. Retry enrollment: {error}"))?;
+        let start = workspace
+            .profile
+            .start(
+                &workspace.id,
+                &workspace.branch,
+                workspace.start.as_deref(),
+                lock,
+            )
+            .map_err(|error| {
+                format!("Git key enrolled; starting commit unconfirmed. Retry enrollment: {error}")
+            })?;
         workspace.record_start(dir, &start)?;
         Ok(workspace)
     }
@@ -654,12 +700,25 @@ impl Manager {
         let lock = self.lock(&format!("instance-{value}"))?;
         let dir = self.instance(value)?;
         let workspace = vm_workspace::load(&dir)?.ok_or("instance has no workspace plan")?;
-        let enrollment = workspace.enrollment.as_ref().filter(|state| state.phase == vm_workspace::Phase::Enrolled)
+        let enrollment = workspace
+            .enrollment
+            .as_ref()
+            .filter(|state| state.phase == vm_workspace::Phase::Enrolled)
             .ok_or("enroll this workspace before cloning")?;
-        let start = workspace.start.as_deref().ok_or("enroll again to retain a starting commit")?;
+        let start = workspace
+            .start
+            .as_deref()
+            .ok_or("enroll again to retain a starting commit")?;
         workspace.profile.check()?;
-        workspace.profile.start(&workspace.id, &workspace.branch, Some(start), &lock)?;
-        let plan = workspace.profile.clone_plan(&workspace.id, &workspace.branch, start, &enrollment.key)?;
+        workspace
+            .profile
+            .start(&workspace.id, &workspace.branch, Some(start), &lock)?;
+        let plan = workspace.profile.clone_plan(
+            &workspace.id,
+            &workspace.branch,
+            start,
+            &enrollment.key,
+        )?;
         let reply = vm_bridge::ask(&dir, vm_wire::WORKSPACE, plan.encode())?;
         vm_wire::workspace::parse_ready(&reply, &plan)?;
         Ok(format!("Guest workspace and private build state prepared on {} in the primary task worktree. Terminal launch and agent setup remain pending.", workspace.branch))
@@ -822,16 +881,28 @@ impl Manager {
         self.create_workspace(value, template, cpus, memory, None)
     }
 
-    fn create_workspace(&self, value: &str, template: &str, cpus: &str, memory: &str, branch: Option<&str>) -> Result<()> {
+    fn create_workspace(
+        &self,
+        value: &str,
+        template: &str,
+        cpus: &str,
+        memory: &str,
+        branch: Option<&str>,
+    ) -> Result<()> {
         name(value)?;
         let workspace = match vm_git_profile::optional(&self.root)? {
             Some(profile) => {
                 if branch.is_none() && !vm_git_names::branch_valid(value) {
                     return Err("instance name is reserved as a task branch; select another with create NAME TEMPLATE --branch BRANCH".into());
                 }
-                Some(vm_workspace::Workspace::new(branch.unwrap_or(value), profile)?)
+                Some(vm_workspace::Workspace::new(
+                    branch.unwrap_or(value),
+                    profile,
+                )?)
             }
-            None if branch.is_some() => return Err("configure a Git profile before selecting a task branch".into()),
+            None if branch.is_some() => {
+                return Err("configure a Git profile before selecting a task branch".into())
+            }
             None => None,
         };
         let config = Config {
@@ -882,11 +953,18 @@ impl Manager {
     // Catalog lock serializes workspace publication across instance names.
     fn check_workspace(&self, value: &str, workspace: &vm_workspace::Workspace) -> Result<()> {
         for other in entries(&self.root.join("instances"))? {
-            if other == value { continue; }
-            if let Some(existing) = vm_workspace::load(&self.instance(&other)?)
-                .map_err(|error| format!("cannot inspect workspace for instance {other}: {error}"))? {
+            if other == value {
+                continue;
+            }
+            if let Some(existing) =
+                vm_workspace::load(&self.instance(&other)?).map_err(|error| {
+                    format!("cannot inspect workspace for instance {other}: {error}")
+                })?
+            {
                 if workspace.conflicts(&existing)? {
-                    return Err(format!("workspace identity or task branch overlaps instance {other}"));
+                    return Err(format!(
+                        "workspace identity or task branch overlaps instance {other}"
+                    ));
                 }
             }
         }
@@ -901,12 +979,19 @@ impl Manager {
         Config::read(&dir)?;
         if let Some(workspace) = vm_workspace::load(&dir)? {
             if workspace.branch != branch {
-                return Err("workspace is already bound to another task branch; create a new instance".into());
+                return Err(
+                    "workspace is already bound to another task branch; create a new instance"
+                        .into(),
+                );
             }
             return workspace.summary();
         }
-        let _lifetime = lock_file(&self.root.join("locks").join(format!("run-{value}")), "workspace", false)
-            .map_err(|error| format!("stop the instance before preparing its workspace: {error}"))?;
+        let _lifetime = lock_file(
+            &self.root.join("locks").join(format!("run-{value}")),
+            "workspace",
+            false,
+        )
+        .map_err(|error| format!("stop the instance before preparing its workspace: {error}"))?;
         if running(&dir)? {
             return Err("stop the instance before preparing its workspace".into());
         }
@@ -919,8 +1004,15 @@ impl Manager {
 
     fn workspace(&self, value: &str) -> Result<String> {
         match vm_workspace::load(&self.instance(value)?)? {
-            Some(workspace) => Ok(format!("{}\n\n{}\n\n{}", workspace.summary()?, workspace.profile.encode(), provisioning_observation(&self.instance(value)?)?)),
-            None => Ok("Workspace is unconfigured; prepare it while the instance is stopped.".into()),
+            Some(workspace) => Ok(format!(
+                "{}\n\n{}\n\n{}",
+                workspace.summary()?,
+                workspace.profile.encode(),
+                provisioning_observation(&self.instance(value)?)?
+            )),
+            None => {
+                Ok("Workspace is unconfigured; prepare it while the instance is stopped.".into())
+            }
         }
     }
 
@@ -1061,7 +1153,10 @@ impl Manager {
         let _lock = self.lock(&format!("instance-{value}"))?;
         let dir = self.instance(value)?;
         if running(&dir)? {
-            println!("{}", term::scrub_lines(&self.status(value).unwrap_or_else(|e| e)));
+            println!(
+                "{}",
+                term::scrub_lines(&self.status(value).unwrap_or_else(|e| e))
+            );
             println!("{value} already has a QEMU process; select its existing td-vm window");
             return Ok(());
         }
@@ -1096,7 +1191,10 @@ impl Manager {
                     Ok(None) => "workspace unconfigured; prepare it while stopped",
                     Err(_) => "workspace plan unavailable; inspect logs",
                 };
-                println!("opened {value} ({}); {workspace}", text(&dir.join("accel"))?.trim());
+                println!(
+                    "opened {value} ({}); {workspace}",
+                    text(&dir.join("accel"))?.trim()
+                );
                 return Ok(());
             }
             match completion.try_recv() {
@@ -1182,8 +1280,11 @@ impl Manager {
             }
             thread::sleep(Duration::from_millis(100));
         }
-        let provision = vm_provision::Worker::start(self.root.clone(), value.into(),
-            io(lifetime.try_clone(), "retain provisioning lifetime lock")?);
+        let provision = vm_provision::Worker::start(
+            self.root.clone(),
+            value.into(),
+            io(lifetime.try_clone(), "retain provisioning lifetime lock")?,
+        );
         let status = child.wait();
         provision.cancel();
         // Closing the listener also releases a worker queued in connect.
@@ -1201,15 +1302,19 @@ impl Manager {
     fn status(&self, value: &str) -> Result<String> {
         let dir = self.instance(value)?;
         if !running(&dir)? {
-            return Ok(format!("{value}: {}", if self.active(value)? {
-                "starting or finishing shutdown"
-            } else {
-                "stopped"
-            }));
+            return Ok(format!(
+                "{value}: {}",
+                if self.active(value)? {
+                    "starting or finishing shutdown"
+                } else {
+                    "stopped"
+                }
+            ));
         }
         let mut qmp = Qmp::connect(&dir.join("qmp"))
             .map_err(|e| format!("{value}: process live; QEMU status unavailable: {e}"))?;
-        Health::query(&mut qmp).map(|health| health.describe(value))
+        Health::query(&mut qmp)
+            .map(|health| health.describe(value))
             .map_err(|e| format!("{value}: process live; QEMU status unavailable: {e}"))
     }
 
@@ -1222,7 +1327,8 @@ impl Manager {
         }
         let mut qmp = Qmp::connect(&dir.join("qmp"))
             .map_err(|e| format!("{value}: process live; resume monitor unavailable: {e}"))?;
-        resume_qmp(&mut qmp).map(|health| health.describe(value))
+        resume_qmp(&mut qmp)
+            .map(|health| health.describe(value))
             .map_err(|e| format!("{value}: resume failed: {e}"))
     }
 
@@ -1235,7 +1341,9 @@ impl Manager {
         }
         vm_bridge::ask(&dir, vm_wire::POWEROFF, Vec::new())
             .map_err(|e| format!("Guest poweroff confirmation unavailable: {e}. Inspect status; no forced stop was sent."))?;
-        Ok(format!("Orderly guest poweroff queued for {value}; refresh status to observe exit."))
+        Ok(format!(
+            "Orderly guest poweroff queued for {value}; refresh status to observe exit."
+        ))
     }
 
     fn stop(&self, value: &str) -> Result<()> {
@@ -1281,9 +1389,14 @@ impl Manager {
             if let Some(state) = &workspace.enrollment {
                 let key = state.key.clone();
                 workspace.transition(&dir, vm_workspace::Phase::Revoking, &key)?;
-                workspace.profile.revoke(&workspace.id, &_lock).map_err(|error| format!(
+                workspace
+                    .profile
+                    .revoke(&workspace.id, &_lock)
+                    .map_err(|error| {
+                        format!(
                     "Git key revocation unconfirmed; disk retained. Retry deletion: {error}"
-                ))?;
+                )
+                    })?;
             }
         }
         io(fs::remove_dir_all(dir), "delete stopped instance")?;
@@ -1367,11 +1480,20 @@ impl vm_provision::Host for ProvisionHost<'_> {
     }
     fn enroll(&mut self) -> Result<vm_wire::workspace::Plan> {
         let workspace = self.manager.enroll_locked(self.dir, self.lock)?;
-        let enrollment = workspace.enrollment.as_ref()
+        let enrollment = workspace
+            .enrollment
+            .as_ref()
             .filter(|state| state.phase == vm_workspace::Phase::Enrolled)
             .ok_or("workspace is not enrolled")?;
-        workspace.profile.clone_plan(&workspace.id, &workspace.branch,
-            workspace.start.as_deref().ok_or("starting commit is not retained")?, &enrollment.key)
+        workspace.profile.clone_plan(
+            &workspace.id,
+            &workspace.branch,
+            workspace
+                .start
+                .as_deref()
+                .ok_or("starting commit is not retained")?,
+            &enrollment.key,
+        )
     }
     fn ensure(&mut self, plan: &vm_wire::workspace::Plan) -> Result<vm_wire::workspace::Progress> {
         let reply = vm_bridge::ask(self.dir, vm_wire::WORKSPACE_ENSURE, plan.encode())?;
@@ -1397,11 +1519,20 @@ fn provisioning_observation(dir: &Path) -> Result<String> {
     match File::open(dir.join("provisioning")) {
         Ok(file) => {
             let mut message = String::new();
-            io(file.take(4097).read_to_string(&mut message), "read provisioning observation")?;
-            if message.len() > 4096 { return Err("provisioning observation exceeds limit".into()); }
-            Ok(format!("Last Open provisioning observation (not a live check):\n{message}"))
+            io(
+                file.take(4097).read_to_string(&mut message),
+                "read provisioning observation",
+            )?;
+            if message.len() > 4096 {
+                return Err("provisioning observation exceeds limit".into());
+            }
+            Ok(format!(
+                "Last Open provisioning observation (not a live check):\n{message}"
+            ))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("Open provisioning has no recorded observation.".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok("Open provisioning has no recorded observation.".into())
+        }
         Err(error) => Err(format!("read provisioning observation: {error}")),
     }
 }
@@ -1697,9 +1828,14 @@ impl Health {
     }
 
     fn parse(status: &json::Json, blocks: &json::Json) -> Result<Self> {
-        let state = status.get("status").and_then(json::Json::as_str)
-            .filter(|s| !s.is_empty() && s.len() <= 64
-                && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'))
+        let state = status
+            .get("status")
+            .and_then(json::Json::as_str)
+            .filter(|s| {
+                !s.is_empty()
+                    && s.len() <= 64
+                    && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+            })
             .ok_or("QEMU status lacks a valid execution state")?;
         let runnable = match status.get("running") {
             Some(json::Json::Bool(value)) => *value,
@@ -1708,24 +1844,38 @@ impl Health {
         if runnable != (state == "running") {
             return Err("QEMU status has inconsistent execution fields".into());
         }
-        let blocks = blocks.as_arr().filter(|v| v.len() <= 256)
+        let blocks = blocks
+            .as_arr()
+            .filter(|v| v.len() <= 256)
             .ok_or("QEMU disk status is not a bounded device list")?;
         let mut disk_errors = Vec::new();
         for block in blocks {
-            let Some(io_status) = block.get("io-status") else { continue; };
-            let io_status = io_status.as_str().filter(|s| !s.is_empty() && s.len() <= 64)
+            let Some(io_status) = block.get("io-status") else {
+                continue;
+            };
+            let io_status = io_status
+                .as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 64)
                 .ok_or("QEMU disk I/O status is malformed")?;
-            if io_status == "ok" { continue; }
+            if io_status == "ok" {
+                continue;
+            }
             let device = [
                 block.get("device"),
                 block.get("qdev"),
                 block.get("inserted").and_then(|v| v.get("node-name")),
-            ].into_iter().flatten().filter_map(json::Json::as_str)
-                .find(|s| !s.is_empty() && s.len() <= 256)
-                .ok_or("QEMU disk identity is malformed")?;
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(json::Json::as_str)
+            .find(|s| !s.is_empty() && s.len() <= 256)
+            .ok_or("QEMU disk identity is malformed")?;
             disk_errors.push((device.to_string(), io_status.to_string()));
         }
-        Ok(Self { state: state.to_string(), disk_errors })
+        Ok(Self {
+            state: state.to_string(),
+            disk_errors,
+        })
     }
 
     fn runnable(&self) -> bool {
@@ -1737,16 +1887,27 @@ impl Health {
     }
 
     fn describe(&self, name: &str) -> String {
-        let mut report = format!("{name}: QEMU {}; guest CPUs {}", self.state,
-            if self.runnable() { "running" } else { "not running" });
+        let mut report = format!(
+            "{name}: QEMU {}; guest CPUs {}",
+            self.state,
+            if self.runnable() {
+                "running"
+            } else {
+                "not running"
+            }
+        );
         for (device, status) in &self.disk_errors {
             report.push_str(&format!("\ndisk {device}: {status}"));
         }
         if self.disk_errors.iter().any(|(_, state)| state == "nospace") {
-            report.push_str("\nThe host backing disk could not allocate space. Restore host capacity first.");
+            report.push_str(
+                "\nThe host backing disk could not allocate space. Restore host capacity first.",
+            );
         }
         if self.resumable() {
-            report.push_str(&format!("\nAfter correcting any fault, use td-vm resume {name} (R in the TUI)."));
+            report.push_str(&format!(
+                "\nAfter correcting any fault, use td-vm resume {name} (R in the TUI)."
+            ));
         }
         report
     }
@@ -1754,14 +1915,22 @@ impl Health {
 
 fn resume_qmp(qmp: &mut Qmp) -> Result<Health> {
     let health = Health::query(qmp)?;
-    if health.runnable() { return Ok(health); }
+    if health.runnable() {
+        return Ok(health);
+    }
     if !health.resumable() {
-        return Err(format!("refusing resume from QEMU {}; inspect status and logs", health.state));
+        return Err(format!(
+            "refusing resume from QEMU {}; inspect status and logs",
+            health.state
+        ));
     }
     qmp.execute("cont")?;
     let health = Health::query(qmp)?;
     if !health.runnable() {
-        return Err(format!("QEMU remains {}; inspect status and correct the fault before retrying", health.state));
+        return Err(format!(
+            "QEMU remains {}; inspect status and correct the fault before retrying",
+            health.state
+        ));
     }
     Ok(health)
 }
@@ -1804,7 +1973,10 @@ fn tui(manager: &Manager) -> Result<()> {
         selected = selected.min(rows.len().saturating_sub(1));
         let (height, width) = terminal.size();
         let mut frame = term::Frame::new(height, width);
-        frame.push_text("td-vm  Enter open · n new · i import · t templates · S stop · D delete · X cut power", term::Style::bar(term::CYAN));
+        frame.push_text(
+            "td-vm  Enter open · n new · i import · t templates · S stop · D delete · X cut power",
+            term::Style::bar(term::CYAN),
+        );
         frame.push_text("a agent · T terminal · h status · R resume · w workspace · W prepare · E enroll · C clone · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
         frame.push_text(TABLE_HEADER, term::Style::bold());
         let page = height.saturating_sub(8).max(1);
@@ -1820,7 +1992,10 @@ fn tui(manager: &Manager) -> Result<()> {
         if rows.is_empty() {
             frame.push_text("No instances yet.", term::Style::dim());
         }
-        frame.push_text("Live means a QEMU process exists. h inspects guest execution and disk faults.", term::Style::dim());
+        frame.push_text(
+            "Live means a QEMU process exists. h inspects guest execution and disk faults.",
+            term::Style::dim(),
+        );
         frame.push_text(DISK_LEGEND, term::Style::dim());
         frame.push_text(&status, term::Style::fg(term::YELLOW));
         terminal.draw(frame.finish()).map_err(|e| e.to_string())?;
@@ -1876,17 +2051,43 @@ fn tui(manager: &Manager) -> Result<()> {
                         template.as_str()
                     };
                     let branch = if vm_git_profile::optional(&manager.root)?.is_some() {
-                        let Some(branch) = prompt(&mut terminal, &format!("Task branch — blank uses {name}"))? else { break; };
-                        Some(if branch.is_empty() { name.clone() } else { branch })
-                    } else { None };
+                        let Some(branch) =
+                            prompt(&mut terminal, &format!("Task branch — blank uses {name}"))?
+                        else {
+                            break;
+                        };
+                        Some(if branch.is_empty() {
+                            name.clone()
+                        } else {
+                            branch
+                        })
+                    } else {
+                        None
+                    };
                     terminal
-                        .suspend(|| manager.create_workspace(&name, template, "4", "8192", branch.as_deref()))
+                        .suspend(|| {
+                            manager.create_workspace(
+                                &name,
+                                template,
+                                "4",
+                                "8192",
+                                branch.as_deref(),
+                            )
+                        })
                         .map_err(|e| e.to_string())?
                 }
                 term::Key::Char('W') if current.is_some() => {
                     let name = current.ok_or("no instance selected")?;
-                    let Some(branch) = prompt(&mut terminal, &format!("Task branch — blank uses {name}"))? else { break; };
-                    let branch = if branch.is_empty() { name } else { branch.as_str() };
+                    let Some(branch) =
+                        prompt(&mut terminal, &format!("Task branch — blank uses {name}"))?
+                    else {
+                        break;
+                    };
+                    let branch = if branch.is_empty() {
+                        name
+                    } else {
+                        branch.as_str()
+                    };
                     status = match manager.prepare_workspace(name, branch) {
                         Ok(_) => "Workspace plan saved. Press w for details; guest enrollment and cloning remain pending.".into(),
                         Err(error) => error,
@@ -1909,14 +2110,21 @@ fn tui(manager: &Manager) -> Result<()> {
                     break;
                 }
                 term::Key::Char('T') if current.is_some() => {
-                    status = match manager.workspace_terminal(current.ok_or("no instance selected")?) {
-                        Ok(message) => message,
-                        Err(error) => error,
-                    };
+                    status =
+                        match manager.workspace_terminal(current.ok_or("no instance selected")?) {
+                            Ok(message) => message,
+                            Err(error) => error,
+                        };
                     break;
                 }
                 term::Key::Char('a') if current.is_some() => {
-                    let Some(agent) = prompt(&mut terminal, "Task agent: codex or claude (login not configured)")? else { break; };
+                    let Some(agent) = prompt(
+                        &mut terminal,
+                        "Task agent: codex or claude (login not configured)",
+                    )?
+                    else {
+                        break;
+                    };
                     status = match agent_verb(&agent).and_then(|verb| {
                         manager.workspace_launch(current.ok_or("no instance selected")?, verb)
                     }) {
@@ -1940,7 +2148,13 @@ fn tui(manager: &Manager) -> Result<()> {
                 }
                 term::Key::Char('S') if current.is_some() => {
                     let name = current.ok_or("no instance selected")?;
-                    if prompt(&mut terminal, &format!("Shut down {name}? Running tasks will stop. Type yes"))?.as_deref() != Some("yes") {
+                    if prompt(
+                        &mut terminal,
+                        &format!("Shut down {name}? Running tasks will stop. Type yes"),
+                    )?
+                    .as_deref()
+                        != Some("yes")
+                    {
                         status = "Cancelled".into();
                     } else {
                         status = match manager.poweroff(name) {
@@ -1999,7 +2213,8 @@ fn tui(manager: &Manager) -> Result<()> {
                 }
                 term::Key::Char('c') if current.is_some() => {
                     let name = current.ok_or("no instance selected")?;
-                    manager.bridge(name, vm_wire::GET, Vec::new())
+                    manager
+                        .bridge(name, vm_wire::GET, Vec::new())
                         .and_then(|bytes| vm_clipboard::copy(&mut terminal, &bytes))
                 }
                 term::Key::Char('f') if current.is_some() => {
@@ -2065,8 +2280,9 @@ fn tui(manager: &Manager) -> Result<()> {
                 _ => continue,
             };
             status = match operation {
-                Ok(()) if key == term::Key::Char('c') =>
-                    "Copy requested through the host terminal (requires OSC 52 support).".into(),
+                Ok(()) if key == term::Key::Char('c') => {
+                    "Copy requested through the host terminal (requires OSC 52 support).".into()
+                }
                 Ok(()) => "Done".into(),
                 Err(e) => e,
             };
@@ -2099,22 +2315,40 @@ mod tests {
 
     #[test]
     fn automatic_worker_defers_contention_and_retains_only_its_own_lifetime() {
-        let scratch = Scratch::new(); let manager = Manager::new(&scratch.0).unwrap();
-        let dir = scratch.0.join("instances/worker"); private_dir(&dir).unwrap();
+        let scratch = Scratch::new();
+        let manager = Manager::new(&scratch.0).unwrap();
+        let dir = scratch.0.join("instances/worker");
+        private_dir(&dir).unwrap();
         let key = vm_wire::workspace::example().host_key;
         let profile = vm_git_profile::Profile::parse(&format!("TDVM-GIT-PROFILE-1\nrepository=/srv/git/td.git\naddress=10.0.2.2\nport=22\nuser=test\nserver-uid=1001\nsocket=/home/test/.td-vm-registrar\nregistrar=/usr/local/libexec/td-vm-registrar\ngit=/bin/git\nhost-key={key}\nauthor-name=Fixture\nauthor-email=fixture@example.invalid\n")).unwrap();
-        vm_workspace::Workspace::new("task", profile).unwrap().publish(&dir).unwrap();
+        vm_workspace::Workspace::new("task", profile)
+            .unwrap()
+            .publish(&dir)
+            .unwrap();
         let operation = manager.lock("instance-worker").unwrap();
-        let worker = vm_provision::Worker::start(scratch.0.clone(), "worker".into(), manager.lock("run-worker").unwrap());
+        let worker = vm_provision::Worker::start(
+            scratch.0.clone(),
+            "worker".into(),
+            manager.lock("run-worker").unwrap(),
+        );
         thread::sleep(Duration::from_millis(250));
         assert!(manager.active("worker").unwrap());
-        assert!(!dir.join("provisioning").exists(), "no attempt while another operation owns the instance");
+        assert!(
+            !dir.join("provisioning").exists(),
+            "no attempt while another operation owns the instance"
+        );
         drop(operation);
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !dir.join("provisioning").exists() && Instant::now() < deadline { thread::sleep(Duration::from_millis(10)); }
-        assert!(fs::read_to_string(dir.join("provisioning")).unwrap().starts_with("Waiting for"));
+        while !dir.join("provisioning").exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(fs::read_to_string(dir.join("provisioning"))
+            .unwrap()
+            .starts_with("Waiting for"));
         drop(worker);
-        while manager.active("worker").unwrap() && Instant::now() < deadline { thread::sleep(Duration::from_millis(10)); }
+        while manager.active("worker").unwrap() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         assert!(!manager.active("worker").unwrap());
     }
 
@@ -2290,11 +2524,19 @@ mod tests {
         assert!(report.contains("Restore host capacity"));
         assert!(report.contains("td-vm resume worker"));
         for (blocks, label) in [
-            (r#"[{"device":"","qdev":"/machine/disk","io-status":"nospace"}]"#, "/machine/disk"),
-            (r#"[{"device":"","inserted":{"node-name":"data"},"io-status":"failed"}]"#, "data"),
+            (
+                r#"[{"device":"","qdev":"/machine/disk","io-status":"nospace"}]"#,
+                "/machine/disk",
+            ),
+            (
+                r#"[{"device":"","inserted":{"node-name":"data"},"io-status":"failed"}]"#,
+                "data",
+            ),
         ] {
             let health = Health::parse(&status, &json::parse(blocks).unwrap()).unwrap();
-            assert!(health.describe("worker").contains(&format!("disk {label}:")));
+            assert!(health
+                .describe("worker")
+                .contains(&format!("disk {label}:")));
         }
         for bad in [
             r#"{"status":"paused","running":true}"#,
@@ -2313,21 +2555,41 @@ mod tests {
 
     fn scripted_qmp(script: Vec<(&'static str, &'static str)>) -> (Qmp, thread::JoinHandle<()>) {
         let (client, server) = UnixStream::pair().unwrap();
-        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let worker = thread::spawn(move || {
             let mut server = BufReader::new(server);
             for (verb, response) in script {
                 let mut request = String::new();
                 server.read_line(&mut request).unwrap();
                 let request = json::parse(&request).unwrap();
-                assert_eq!(request.get("execute").and_then(json::Json::as_str), Some(verb));
-                writeln!(server.get_mut(), "{{\"return\":{response},\"id\":\"td-vm\"}}").unwrap();
+                assert_eq!(
+                    request.get("execute").and_then(json::Json::as_str),
+                    Some(verb)
+                );
+                writeln!(
+                    server.get_mut(),
+                    "{{\"return\":{response},\"id\":\"td-vm\"}}"
+                )
+                .unwrap();
             }
             let mut request = String::new();
-            assert_eq!(server.read_line(&mut request).unwrap(), 0, "unexpected mutation: {request}");
+            assert_eq!(
+                server.read_line(&mut request).unwrap(),
+                0,
+                "unexpected mutation: {request}"
+            );
         });
-        (Qmp { stream: BufReader::new(client) }, worker)
+        (
+            Qmp {
+                stream: BufReader::new(client),
+            },
+            worker,
+        )
     }
 
     #[test]
@@ -2336,28 +2598,43 @@ mod tests {
         let active = r#"{"status":"running","running":true}"#;
         let blocks = r#"[{"device":"disk0","io-status":"nospace"}]"#;
         let (mut qmp, worker) = scripted_qmp(vec![
-            ("query-status", paused), ("query-block", blocks), ("cont", "{}"),
-            ("query-status", active), ("query-block", "[]"),
-        ]);
-        assert!(resume_qmp(&mut qmp).unwrap().runnable());
-        drop(qmp); worker.join().unwrap();
-        let (mut qmp, worker) = scripted_qmp(vec![
-            ("query-status", paused), ("query-block", blocks), ("cont", "{}"),
-            ("query-status", paused), ("query-block", blocks),
-        ]);
-        assert!(resume_qmp(&mut qmp).unwrap_err().contains("remains io-error"));
-        drop(qmp); worker.join().unwrap();
-        let (mut qmp, worker) = scripted_qmp(vec![
-            ("query-status", r#"{"status":"internal-error","running":false}"#),
+            ("query-status", paused),
+            ("query-block", blocks),
+            ("cont", "{}"),
+            ("query-status", active),
             ("query-block", "[]"),
         ]);
-        assert!(resume_qmp(&mut qmp).unwrap_err().contains("refusing resume"));
-        drop(qmp); worker.join().unwrap();
-        let (mut qmp, worker) = scripted_qmp(vec![
-            ("query-status", active), ("query-block", "[]"),
-        ]);
         assert!(resume_qmp(&mut qmp).unwrap().runnable());
-        drop(qmp); worker.join().unwrap();
+        drop(qmp);
+        worker.join().unwrap();
+        let (mut qmp, worker) = scripted_qmp(vec![
+            ("query-status", paused),
+            ("query-block", blocks),
+            ("cont", "{}"),
+            ("query-status", paused),
+            ("query-block", blocks),
+        ]);
+        assert!(resume_qmp(&mut qmp)
+            .unwrap_err()
+            .contains("remains io-error"));
+        drop(qmp);
+        worker.join().unwrap();
+        let (mut qmp, worker) = scripted_qmp(vec![
+            (
+                "query-status",
+                r#"{"status":"internal-error","running":false}"#,
+            ),
+            ("query-block", "[]"),
+        ]);
+        assert!(resume_qmp(&mut qmp)
+            .unwrap_err()
+            .contains("refusing resume"));
+        drop(qmp);
+        worker.join().unwrap();
+        let (mut qmp, worker) = scripted_qmp(vec![("query-status", active), ("query-block", "[]")]);
+        assert!(resume_qmp(&mut qmp).unwrap().runnable());
+        drop(qmp);
+        worker.join().unwrap();
     }
 
     #[test]
@@ -2733,16 +3010,20 @@ mod tests {
         let one = manager.instance("one").unwrap();
         let two = manager.instance("two").unwrap();
         assert_eq!(disk_usage(&one.join("disk.qcow2")).unwrap().1, 16);
-        assert_eq!(disk_usage(&one.join("disk.qcow2")).unwrap().0,
-            fs::metadata(one.join("disk.qcow2")).unwrap().blocks() / 2048);
+        assert_eq!(
+            disk_usage(&one.join("disk.qcow2")).unwrap().0,
+            fs::metadata(one.join("disk.qcow2")).unwrap().blocks() / 2048
+        );
         command(
             Command::new("qemu-io")
                 .args(["-f", "qcow2", "-c", "write -P 0x5a 0 4096"])
                 .arg(one.join("disk.qcow2")),
         )
         .unwrap();
-        assert_eq!(disk_usage(&one.join("disk.qcow2")).unwrap().0,
-            fs::metadata(one.join("disk.qcow2")).unwrap().blocks() / 2048);
+        assert_eq!(
+            disk_usage(&one.join("disk.qcow2")).unwrap().0,
+            fs::metadata(one.join("disk.qcow2")).unwrap().blocks() / 2048
+        );
         for path in [manager.template("base").unwrap(), two.clone()] {
             command(
                 Command::new("qemu-io")
@@ -2766,15 +3047,30 @@ mod tests {
         );
         assert!(manager.status("one").unwrap().contains("prelaunch"));
         manager.resume("one").unwrap();
-        Qmp::connect(&one.join("qmp")).unwrap().execute("stop").unwrap();
+        Qmp::connect(&one.join("qmp"))
+            .unwrap()
+            .execute("stop")
+            .unwrap();
         assert!(manager.status("one").unwrap().contains("paused"));
-        assert!(manager.rows().unwrap().iter().any(|(name, row)| name == "one" && row.contains("live")));
-        assert!(manager.delete("one").is_err(), "a paused guest still owns its disk");
+        assert!(manager
+            .rows()
+            .unwrap()
+            .iter()
+            .any(|(name, row)| name == "one" && row.contains("live")));
+        assert!(
+            manager.delete("one").is_err(),
+            "a paused guest still owns its disk"
+        );
         manager.resume("one").unwrap();
-        assert!(manager.status("one").unwrap().contains("guest CPUs running"));
+        assert!(manager
+            .status("one")
+            .unwrap()
+            .contains("guest CPUs running"));
         let held = Qmp::connect(&one.join("qmp")).unwrap();
-        assert!(manager.start("one", Launch::parse(&[]).unwrap()).is_ok(),
-            "an occupied monitor does not turn an existing open into a failed launch");
+        assert!(
+            manager.start("one", Launch::parse(&[]).unwrap()).is_ok(),
+            "an occupied monitor does not turn an existing open into a failed launch"
+        );
         drop(held);
         assert!(
             manager.start("one", Launch::parse(&[]).unwrap()).is_ok(),

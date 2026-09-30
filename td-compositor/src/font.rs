@@ -84,7 +84,9 @@ impl Font {
         }
         let header = size(word(bytes, 8)?, "headersize")?;
         if header != HEADER_BYTES {
-            return Err(format!("psf2 headersize is {header}, expected {HEADER_BYTES}"));
+            return Err(format!(
+                "psf2 headersize is {header}, expected {HEADER_BYTES}"
+            ));
         }
         let flags = word(bytes, 12)?;
         if flags & HAS_UNICODE_TABLE == 0 {
@@ -287,7 +289,9 @@ mod tests {
             assert!(font.covers(scalar), "missing U+{:04X}", scalar as u32);
         }
         // Line drawing and the replacement character the fallback needs.
-        for scalar in ['─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '\u{fffd}'] {
+        for scalar in [
+            '─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '\u{fffd}',
+        ] {
             assert!(font.covers(scalar), "missing U+{:04X}", scalar as u32);
         }
         // Double-width scalars are out of profile, so the face omits them and
@@ -303,7 +307,10 @@ mod tests {
         assert!(font.row(index, 0).is_some());
         assert!(font.row(index, 15).is_some());
         assert!(font.row(index, 16).is_none(), "past the last row");
-        assert!(font.row(font.glyph_count(), 0).is_none(), "past the last glyph");
+        assert!(
+            font.row(font.glyph_count(), 0).is_none(),
+            "past the last glyph"
+        );
         assert!(!font.pixel(index, 8, 0), "past the last column");
         assert!(!font.pixel(index, 0, 99), "past the last row");
         // A blank cell is genuinely blank, and a letter is genuinely not.

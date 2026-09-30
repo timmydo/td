@@ -326,7 +326,8 @@ fn userland_fingerprint(root: &Path, eval: &str) -> Result<String, String> {
 fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
     let dir = loop_userland_dir().map_err(|e| CheckError::Fatal(fatal(&e)))?;
     let eval = resolve_recipe_eval_bin(root)?;
-    let fingerprint = userland_fingerprint(root, &eval).map_err(|e| CheckError::Fatal(fatal(&e)))?;
+    let fingerprint =
+        userland_fingerprint(root, &eval).map_err(|e| CheckError::Fatal(fatal(&e)))?;
     let map_path = dir.join(format!("loop-userland.{fingerprint}.map"));
     if let Some(ul) = read_userland_map(&dir, &map_path, &fingerprint) {
         return Ok(ul);
@@ -399,8 +400,7 @@ fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
         ))));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| fatal(&format!("mkdir {}: {e}", dir.display())))?;
+    std::fs::create_dir_all(&dir).map_err(|e| fatal(&format!("mkdir {}: {e}", dir.display())))?;
     let mut map = format!("fingerprint {fingerprint}\n");
     for stem in LOOP_USERLAND_STEMS {
         let prefix = format!("TD_RECIPE_RUN_OUT {stem} ");
@@ -501,11 +501,8 @@ fn read_userland_map(dir: &Path, map_path: &Path, fingerprint: &str) -> Option<L
         let (base, want) = content.lines().find_map(|l| {
             let mut f = l.split_whitespace();
             let (k, base, want) = (f.next()?, f.next()?, f.next()?);
-            (k == *stem
-                && f.next().is_none()
-                && !base.contains('/')
-                && want.starts_with("sha256:"))
-            .then(|| (base.to_string(), want.to_string()))
+            (k == *stem && f.next().is_none() && !base.contains('/') && want.starts_with("sha256:"))
+                .then(|| (base.to_string(), want.to_string()))
         })?;
         let host = dir.join(&base);
         if !host.join("bin").is_dir() {
@@ -884,7 +881,6 @@ fn host_net_applet(root: &Path, applet: &str, deadline: Option<Instant>) -> Opti
     Some(link)
 }
 
-
 /// Prepare the admitted crypto closure before offline host or sandbox Cargo.
 pub(crate) fn warm_crypto_sources(root: &Path) -> Result<(), String> {
     crate::crypto_build::validate(root)?;
@@ -896,12 +892,17 @@ pub(crate) fn warm_crypto_sources(root: &Path) -> Result<(), String> {
         .or_else(|| host_net_applet(root, "td-feed", deadline))
         .ok_or("cannot prepare crypto sources: td-feed unavailable")?;
     let mut command = Command::new(feed);
-    command.args(["warm", "crate-local", "td-crypto", "td-crypto"])
-        .stdin(Stdio::null()).current_dir(root);
+    command
+        .args(["warm", "crate-local", "td-crypto", "td-crypto"])
+        .stdin(Stdio::null())
+        .current_dir(root);
     arm_check_child(&mut command);
-    let mut child = command.spawn().map_err(|e| format!("prepare crypto sources: {e}"))?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("prepare crypto sources: {e}"))?;
     if !wait_with_deadline(&mut child, deadline)
-        || !vendor_is_complete(root, "td-crypto", Some("td-crypto/Cargo.lock")) {
+        || !vendor_is_complete(root, "td-crypto", Some("td-crypto/Cargo.lock"))
+    {
         return Err("crypto source preparation incomplete".into());
     }
     Ok(())
@@ -1645,11 +1646,11 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     }
     sandbox_args.extend([s("--"), s("sh")]);
     cmd.args(sandbox_args)
-    .arg(harness)
-    .args(rest)
-    .env("PATH", toolchain)
-    .env("TD_BUILDER_SELF", &tb)
-    .current_dir(&root);
+        .arg(harness)
+        .args(rest)
+        .env("PATH", toolchain)
+        .env("TD_BUILDER_SELF", &tb)
+        .current_dir(&root);
     // Replace this process, exactly as the shell helper's `exec` did.
     use std::os::unix::process::CommandExt as _;
     // `exec` returns ONLY on failure, so the attempt never yields `Ok` — which
@@ -1698,7 +1699,11 @@ mod tests {
             Some("recipes/locks/codex/Cargo.lock")
         );
         let argv = super::vendor_argv(&line);
-        assert_eq!(argv.len(), line.len() - 1, "the lock is not passed to td-feed");
+        assert_eq!(
+            argv.len(),
+            line.len() - 1,
+            "the lock is not passed to td-feed"
+        );
         assert_eq!(
             argv.last().map(String::as_str),
             Some("codex"),
@@ -1802,10 +1807,21 @@ mod tests {
         let ul = read_userland_map(&d, &map, &fp).expect("valid map resolves");
         assert_eq!(ul.items.len(), LOOP_USERLAND_STEMS.len());
         for ((host, canon), stem) in ul.items.iter().zip(LOOP_USERLAND_STEMS) {
-            assert!(host.starts_with(d.to_str().unwrap()), "host copy under the durable dir");
-            assert_eq!(canon, &format!("{TD_STORE_DIR}/hash{}-{stem}-1.0",
-                LOOP_USERLAND_STEMS.iter().position(|s| s == stem).unwrap()));
-            assert!(ul.path.contains(&format!("{canon}/bin")), "bin dir on the PATH");
+            assert!(
+                host.starts_with(d.to_str().unwrap()),
+                "host copy under the durable dir"
+            );
+            assert_eq!(
+                canon,
+                &format!(
+                    "{TD_STORE_DIR}/hash{}-{stem}-1.0",
+                    LOOP_USERLAND_STEMS.iter().position(|s| s == stem).unwrap()
+                )
+            );
+            assert!(
+                ul.path.contains(&format!("{canon}/bin")),
+                "bin dir on the PATH"
+            );
         }
         // A fingerprint mismatch invalidates the WHOLE map: a userland built
         // by any other evaluator — e.g. one that still admitted host
@@ -1821,7 +1837,10 @@ mod tests {
             format!("#!{}\n", LOOP_USERLAND_STEMS[0]),
         )
         .unwrap();
-        assert!(read_userland_map(&d, &map, &fp).is_some(), "restored bytes verify again");
+        assert!(
+            read_userland_map(&d, &map, &fp).is_some(),
+            "restored bytes verify again"
+        );
         // A stem whose item lost its bin/ invalidates the whole map (the
         // caller re-provisions) — no partial userland.
         std::fs::remove_dir_all(item0.join("bin")).unwrap();
@@ -1831,7 +1850,9 @@ mod tests {
         // map with no fingerprint line at all.
         std::fs::write(
             &map,
-            format!("fingerprint {fp}\nbusybox-x86-64 ../escape sha256:aa\nmake-x86-64 x sha256:aa\n"),
+            format!(
+                "fingerprint {fp}\nbusybox-x86-64 ../escape sha256:aa\nmake-x86-64 x sha256:aa\n"
+            ),
         )
         .unwrap();
         assert!(read_userland_map(&d, &map, &fp).is_none());
@@ -1841,7 +1862,11 @@ mod tests {
         )
         .unwrap();
         assert!(read_userland_map(&d, &map, &fp).is_none());
-        std::fs::write(&map, "busybox-x86-64 x sha256:aa\nmake-x86-64 x sha256:aa\n").unwrap();
+        std::fs::write(
+            &map,
+            "busybox-x86-64 x sha256:aa\nmake-x86-64 x sha256:aa\n",
+        )
+        .unwrap();
         assert!(read_userland_map(&d, &map, &fp).is_none());
         // A missing map is simply cold.
         assert!(read_userland_map(&d, &d.join("absent.map"), &fp).is_none());
@@ -1955,7 +1980,10 @@ mod scope_key_tests {
         assert_ne!(sh, scoped_tree_key("abc", Some(&s(&["td-sh", "td-txt"]))));
         assert_ne!(sh, scoped_tree_key("abd", Some(&s(&["td-sh"]))));
         assert_eq!(sh, scoped_tree_key("abc", Some(&s(&["td-sh"]))));
-        assert_eq!(check_scope(false, Some("td-sh td-portal")), Some(s(&["td-sh", "td-portal"])));
+        assert_eq!(
+            check_scope(false, Some("td-sh td-portal")),
+            Some(s(&["td-sh", "td-portal"]))
+        );
         assert_eq!(check_scope(false, Some("  ")), None);
         assert_eq!(check_scope(false, None), None);
         assert_eq!(check_scope(true, Some("td-sh")), None);
@@ -1977,12 +2005,24 @@ mod vendor_prelude_tests {
         let target = root.join("marker-target");
         std::fs::write(&target, format!("{digest}\n0\n")).unwrap();
         std::os::unix::fs::symlink(&target, &marker).unwrap();
-        assert!(!super::vendor_is_complete(&root, "td-net", Some("net/Cargo.lock")));
+        assert!(!super::vendor_is_complete(
+            &root,
+            "td-net",
+            Some("net/Cargo.lock")
+        ));
         std::fs::remove_file(&marker).unwrap();
         std::fs::write(&marker, format!("{digest}\n{}", "x".repeat(4096))).unwrap();
-        assert!(!super::vendor_is_complete(&root, "td-net", Some("net/Cargo.lock")));
+        assert!(!super::vendor_is_complete(
+            &root,
+            "td-net",
+            Some("net/Cargo.lock")
+        ));
         std::fs::write(&marker, format!("{digest}\n0\n")).unwrap();
-        assert!(super::vendor_is_complete(&root, "td-net", Some("net/Cargo.lock")));
+        assert!(super::vendor_is_complete(
+            &root,
+            "td-net",
+            Some("net/Cargo.lock")
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,5 +1,13 @@
 #![forbid(unsafe_code)]
 
+mod development;
+mod power;
+#[cfg_attr(feature = "target-recipe", path = "primary_account.rs")]
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../td-authd/src/primary_account.rs"
+)]
+mod primary_account;
 #[allow(dead_code)] // Shared compositor codec also carries clipboard and feed operations.
 #[cfg_attr(feature = "target-recipe", path = "vm_wire.rs")]
 #[cfg_attr(
@@ -7,12 +15,7 @@
     path = "../../td-compositor/src/vm_wire.rs"
 )]
 mod vm_wire;
-#[cfg_attr(feature = "target-recipe", path = "primary_account.rs")]
-#[cfg_attr(not(feature = "target-recipe"), path = "../../td-authd/src/primary_account.rs")]
-mod primary_account;
-mod development;
 mod workspace;
-mod power;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
@@ -413,8 +416,16 @@ fn failure_state(
                 // reply churn must not trigger each other's failed attempts.
                 links: if m.is_dir() { 0 } else { m.nlink() },
                 size: if m.is_dir() { 0 } else { m.len() },
-                mtime: if m.is_dir() { (0, 0) } else { (m.mtime(), m.mtime_nsec()) },
-                ctime: if m.is_dir() { (0, 0) } else { (m.ctime(), m.ctime_nsec()) },
+                mtime: if m.is_dir() {
+                    (0, 0)
+                } else {
+                    (m.mtime(), m.mtime_nsec())
+                },
+                ctime: if m.is_dir() {
+                    (0, 0)
+                } else {
+                    (m.ctime(), m.ctime_nsec())
+                },
             })
             .map_err(|e| e.kind())
     })
@@ -463,7 +474,12 @@ fn serve() -> Result<()> {
         .map_err(|e| format!("guest key helper already active: {e}"))?;
     let mut workspace = workspace::Worker::default();
     let worker_lock = state.join("git-worker.lock");
-    let tools = workspace::Tools { git: Path::new("/bin/git"), keygen: Path::new("/bin/ssh-keygen"), launcher: Path::new("/bin/td-vm-ssh"), worker_lock: &worker_lock };
+    let tools = workspace::Tools {
+        git: Path::new("/bin/git"),
+        keygen: Path::new("/bin/ssh-keygen"),
+        launcher: Path::new("/bin/td-vm-ssh"),
+        worker_lock: &worker_lock,
+    };
     let mut workspace_error = String::new();
     let mut last_error = String::new();
     let mut published: Option<(Vec<u8>, Vec<u8>)> = None;
@@ -471,7 +487,10 @@ fn serve() -> Result<()> {
     let keygen = Path::new("/bin/ssh-keygen");
     loop {
         if let Err(error) = workspace.poll(&state, home, &lock, uid, &tools) {
-            if error != workspace_error { eprintln!("td-vm-guest: {error}"); workspace_error = error; }
+            if error != workspace_error {
+                eprintln!("td-vm-guest: {error}");
+                workspace_error = error;
+            }
         }
         let request = Path::new(protocol::REQUEST);
         let response = Path::new(protocol::RESPONSE);
@@ -521,10 +540,18 @@ fn serve() -> Result<()> {
 }
 
 fn main() -> ExitCode {
-    if std::env::args_os().next().as_deref().and_then(|s| Path::new(s).file_name()) == Some(std::ffi::OsStr::new("td-vm-ssh")) {
+    if std::env::args_os()
+        .next()
+        .as_deref()
+        .and_then(|s| Path::new(s).file_name())
+        == Some(std::ffi::OsStr::new("td-vm-ssh"))
+    {
         return match workspace::ssh(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(error) => { eprintln!("td-vm-ssh: {error}"); ExitCode::FAILURE }
+            Err(error) => {
+                eprintln!("td-vm-ssh: {error}");
+                ExitCode::FAILURE
+            }
         };
     }
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -651,34 +678,64 @@ FnRkLXFlbXUtYWRtaW4tc2VsZnRlc3QBAgMEBQYH
         write(&workspace_request, &plan.encode(), 0o644).unwrap();
         let worker_path = f.state().join("git-worker.lock");
         let tools = workspace::Tools {
-            git: Path::new("/missing-git"), keygen: &f.keygen,
-            launcher: Path::new("/missing-ssh"), worker_lock: &worker_path,
+            git: Path::new("/missing-git"),
+            keygen: &f.keygen,
+            launcher: Path::new("/missing-ssh"),
+            worker_lock: &worker_path,
         };
         let lock_path = f.state().join("lock");
         write(&lock_path, b"", 0o600).unwrap();
-        let lock = File::options().read(true).write(true).open(&lock_path).unwrap();
+        let lock = File::options()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
         lock.try_lock().unwrap();
         let endpoints = workspace::Endpoints {
-            request: &workspace_request, response: &workspace_response, owner: f.uid,
+            request: &workspace_request,
+            response: &workspace_response,
+            owner: f.uid,
         };
         let mut worker = workspace::Worker::default();
         let mut failed = None;
         let mut attempts = (0, 0);
         for _ in 0..4 {
-            if worker.poll_at(&f.state(), &f.root, &lock, f.uid, &tools, &endpoints).is_err() {
+            if worker
+                .poll_at(&f.state(), &f.root, &lock, f.uid, &tools, &endpoints)
+                .is_err()
+            {
                 attempts.0 += 1;
             }
             let observed = failure_state(&f.state(), &f.request(), &f.response(), &f.keygen);
             if failed.as_ref() != Some(&observed) {
                 assert!(f.exchange().is_err());
                 attempts.1 += 1;
-                failed = Some(failure_state(&f.state(), &f.request(), &f.response(), &f.keygen));
+                failed = Some(failure_state(
+                    &f.state(),
+                    &f.request(),
+                    &f.response(),
+                    &f.keygen,
+                ));
             }
         }
-        assert_eq!(attempts, (1, 1), "workers retried each other's directory churn");
+        assert_eq!(
+            attempts,
+            (1, 1),
+            "workers retried each other's directory churn"
+        );
         fs::write(&workspace_request, plan.encode()).unwrap();
-        assert!(worker.poll_at(&f.state(), &f.root, &lock, f.uid, &tools, &endpoints).is_err());
-        assert!(failed == Some(failure_state(&f.state(), &f.request(), &f.response(), &f.keygen)));
+        assert!(worker
+            .poll_at(&f.state(), &f.root, &lock, f.uid, &tools, &endpoints)
+            .is_err());
+        assert!(
+            failed
+                == Some(failure_state(
+                    &f.state(),
+                    &f.request(),
+                    &f.response(),
+                    &f.keygen
+                ))
+        );
         let failed = failure_state(&f.state(), &f.request(), &f.response(), &f.keygen);
         assert!(failed == failure_state(&f.state(), &f.request(), &f.response(), &f.keygen));
         fs::set_permissions(

@@ -79,7 +79,9 @@ pub fn parse(args: &[String]) -> Result<Request, String> {
         } else if arg == "-L" {
             local = true;
         } else if arg == "-l" {
-            let prog = rest.next().ok_or_else(|| "-l needs a program".to_string())?;
+            let prog = rest
+                .next()
+                .ok_or_else(|| "-l needs a program".to_string())?;
             login = Some(prog.clone());
         } else if arg.starts_with('-') && arg.len() > 1 {
             return Err(format!("unrecognised argument '{arg}'\n{}", usage()));
@@ -88,7 +90,10 @@ pub fn parse(args: &[String]) -> Result<Request, String> {
         }
     }
     let login = login.ok_or_else(|| {
-        format!("-l PROG is required; this getty does not prompt\n{}", usage())
+        format!(
+            "-l PROG is required; this getty does not prompt\n{}",
+            usage()
+        )
     })?;
     if !no_prompt {
         return Err(format!(
@@ -269,8 +274,16 @@ mod tests {
     /// image's greeter stops starting.
     #[test]
     fn the_shipped_invocation_parses() {
-        let r = parse(&args(&["-L", "-n", "-l", "/etc/autologin", "115200", "ttyS0", "vt100"]))
-            .unwrap();
+        let r = parse(&args(&[
+            "-L",
+            "-n",
+            "-l",
+            "/etc/autologin",
+            "115200",
+            "ttyS0",
+            "vt100",
+        ]))
+        .unwrap();
         assert_eq!(r.login, "/etc/autologin");
         assert_eq!(r.speed, 0x1002);
         assert_eq!(r.device, "ttyS0");
@@ -319,8 +332,16 @@ mod tests {
     /// settings or the login program differ from what the operator asked for.
     #[test]
     fn an_unimplemented_option_is_refused() {
-        let e = parse(&args(&["-n", "-l", "/bin/login", "-t", "60", "115200", "ttyS0"]))
-            .unwrap_err();
+        let e = parse(&args(&[
+            "-n",
+            "-l",
+            "/bin/login",
+            "-t",
+            "60",
+            "115200",
+            "ttyS0",
+        ]))
+        .unwrap_err();
         assert!(e.contains("unrecognised argument '-t'"), "{e}");
         assert!(e.contains("usage: getty"), "{e}");
     }
@@ -340,8 +361,16 @@ mod tests {
     /// exactly why silently dropping it would go unnoticed.
     #[test]
     fn a_fourth_operand_is_refused() {
-        let e = parse(&args(&["-n", "-l", "/bin/login", "115200", "ttyS0", "vt100", "extra"]))
-            .unwrap_err();
+        let e = parse(&args(&[
+            "-n",
+            "-l",
+            "/bin/login",
+            "115200",
+            "ttyS0",
+            "vt100",
+            "extra",
+        ]))
+        .unwrap_err();
         assert!(e.contains("4 operands"), "{e}");
         assert!(e.contains("usage: getty"), "{e}");
     }

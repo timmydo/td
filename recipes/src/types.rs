@@ -588,7 +588,10 @@ impl Step {
                     ("runtime".into(), Json::Str(runtime.clone())),
                     ("libraryPaths".into(), arr(library_paths)),
                     ("optionalTargets".into(), arr(optional_targets)),
-                    ("optionalLinks".into(), Json::Num(optional_links.to_string())),
+                    (
+                        "optionalLinks".into(),
+                        Json::Num(optional_links.to_string()),
+                    ),
                 ]),
             )]),
             Step::SubstituteText { file, edits } => Json::Obj(vec![(
@@ -980,11 +983,7 @@ pub struct CargoGitSource {
 }
 
 impl CargoGitSource {
-    pub fn new(
-        source: &str,
-        input: &str,
-        packages: Vec<CargoGitPackage>,
-    ) -> CargoGitSource {
+    pub fn new(source: &str, input: &str, packages: Vec<CargoGitPackage>) -> CargoGitSource {
         CargoGitSource {
             source: source.into(),
             input: input.into(),
@@ -1920,7 +1919,10 @@ mod tests {
         let other = Recipe::mesboot("other", "1")
             .source_input("stage0-source")
             .inputs(&["ripgrep-seed-source"]);
-        assert!(other.is_foreign(), "the aggregate mark still sees the other pin");
+        assert!(
+            other.is_foreign(),
+            "the aggregate mark still sees the other pin"
+        );
         assert!(!other.is_foreign_source());
         assert!(other.to_json().get("foreignSource").is_none());
     }
@@ -2027,7 +2029,10 @@ mod tests {
         }
         // Not a pin key: no pin, and no error either — these lists are mostly
         // other recipes' outputs.
-        assert!(Recipe::gnu("x", "1").native_inputs(&["gcc"]).source_pins.is_none());
+        assert!(Recipe::gnu("x", "1")
+            .native_inputs(&["gcc"])
+            .source_pins
+            .is_none());
         assert!(Recipe::gnu("x", "1").inputs(&["gcc"]).source_pins.is_none());
     }
 

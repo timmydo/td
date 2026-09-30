@@ -33,7 +33,12 @@ pub(crate) fn prepare_portal_runtimes(registry: &Registry) -> Result<(), String>
     let run = Directory::open(Path::new("/run"), 0, 0)?;
     let base = runtime_child(&run, "td-portal", (0, 0))?;
     for session in registry.sessions() {
-        runtime_child_mode(&base, &session.owner.to_string(), (session.portal, session.portal), 0o700)?;
+        runtime_child_mode(
+            &base,
+            &session.owner.to_string(),
+            (session.portal, session.portal),
+            0o700,
+        )?;
     }
     Ok(())
 }
@@ -53,12 +58,22 @@ fn runtime_child(parent: &Directory, name: &str, owner: (u32, u32)) -> Result<Di
     runtime_child_mode(parent, name, owner, 0o755)
 }
 
-fn runtime_child_mode(parent: &Directory, name: &str, owner: (u32, u32), mode: u32) -> Result<Directory, String> {
+fn runtime_child_mode(
+    parent: &Directory,
+    name: &str,
+    owner: (u32, u32),
+    mode: u32,
+) -> Result<Directory, String> {
     let path = parent.path(name);
     match fs::DirBuilder::new().mode(mode).create(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(format!("create service runtime {}: {error}", path.display())),
+        Err(error) => {
+            return Err(format!(
+                "create service runtime {}: {error}",
+                path.display()
+            ))
+        }
     }
     let metadata = fs::symlink_metadata(&path)
         .map_err(|error| format!("inspect service runtime {}: {error}", path.display()))?;

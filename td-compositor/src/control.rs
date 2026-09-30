@@ -101,21 +101,48 @@ pub enum Request {
     SendWindow(u64, u8),
     MoveWindow(u64, Direction),
     /// Evdev code and explicit Wayland milliseconds, never physical origin.
-    Key { session: u128, time: u32, code: u16, pressed: bool },
-    ReleaseKeys { session: u128, time: u32 },
-    Pointer { session: u128, report: crate::input::AutomationPointer },
-    ReleaseInput { session: u128, time: u32 },
+    Key {
+        session: u128,
+        time: u32,
+        code: u16,
+        pressed: bool,
+    },
+    ReleaseKeys {
+        session: u128,
+        time: u32,
+    },
+    Pointer {
+        session: u128,
+        report: crate::input::AutomationPointer,
+    },
+    ReleaseInput {
+        session: u128,
+        time: u32,
+    },
     Capture,
     Observe,
-    ObserveClient { session: u128, window: u64 },
-    ClipboardArm { session: u128, window: u64 },
-    Clipboard { session: u128, hold: u64, action: ClipboardAction },
+    ObserveClient {
+        session: u128,
+        window: u64,
+    },
+    ClipboardArm {
+        session: u128,
+        window: u64,
+    },
+    Clipboard {
+        session: u128,
+        hold: u64,
+        action: ClipboardAction,
+    },
 }
 
 /// The vocabulary, as one list, so the parser and the help text cannot drift:
 /// `td-ctl help` prints this and `parse` accepts exactly it.
 pub const USAGE: &[(&str, &str)] = &[
-    ("layout", "report the windows, their workspaces and their rectangles"),
+    (
+        "layout",
+        "report the windows, their workspaces and their rectangles",
+    ),
     ("workspace <1-9>", "show that workspace"),
     (
         "send <1-9>",
@@ -130,29 +157,67 @@ pub const USAGE: &[(&str, &str)] = &[
         "focus <@id>",
         "focus that window, showing its workspace when it is not in view",
     ),
-    ("move <left|right|up|down>", "move the focused window that way"),
+    (
+        "move <left|right|up|down>",
+        "move the focused window that way",
+    ),
     (
         "move <@id> <left|right|up|down>",
         "move that window that way, showing its workspace first",
     ),
     ("fullscreen", "toggle fullscreen for the focused window"),
-    ("present <split|stacked|tabbed>", "how its container shows its windows"),
-    ("group", "group the focused window's container, or ungroup it"),
-    ("key <session> <time-ms> <1-247> <down|up>", "route a key on the named headless session"),
-    ("release-keys <session> <time-ms>", "release all keys owned by that headless keyboard"),
-    ("pointer <session> <time-ms> <x> <y> <buttons> <vertical> <horizontal>",
-        "route one complete absolute pointer report on an enabled headless seat"),
-    ("release-input <session> <time-ms>", "release that headless seat's keys and pointer buttons"),
-    ("capture", "write a completed public PPM frame on an enabled headless capture channel"),
-    ("observe", "report headless session and completed-output identity without painting"),
+    (
+        "present <split|stacked|tabbed>",
+        "how its container shows its windows",
+    ),
+    (
+        "group",
+        "group the focused window's container, or ungroup it",
+    ),
+    (
+        "key <session> <time-ms> <1-247> <down|up>",
+        "route a key on the named headless session",
+    ),
+    (
+        "release-keys <session> <time-ms>",
+        "release all keys owned by that headless keyboard",
+    ),
+    (
+        "pointer <session> <time-ms> <x> <y> <buttons> <vertical> <horizontal>",
+        "route one complete absolute pointer report on an enabled headless seat",
+    ),
+    (
+        "release-input <session> <time-ms>",
+        "release that headless seat's keys and pointer buttons",
+    ),
+    (
+        "capture",
+        "write a completed public PPM frame on an enabled headless capture channel",
+    ),
+    (
+        "observe",
+        "report headless session and completed-output identity without painting",
+    ),
     (
         "observe-client <session> <@id>",
         "report that live client's applied commit and output identities",
     ),
-    ("clipboard-arm <session> <@id>", "hold that focused receiver's next selection transfer"),
-    ("clipboard-status <session> <hold>", "report the current bounded clipboard hold"),
-    ("clipboard-release <session> <hold>", "forward the held descriptor to its original source"),
-    ("clipboard-drop <session> <hold>", "discard an armed or held clipboard transfer"),
+    (
+        "clipboard-arm <session> <@id>",
+        "hold that focused receiver's next selection transfer",
+    ),
+    (
+        "clipboard-status <session> <hold>",
+        "report the current bounded clipboard hold",
+    ),
+    (
+        "clipboard-release <session> <hold>",
+        "forward the held descriptor to its original source",
+    ),
+    (
+        "clipboard-drop <session> <hold>",
+        "discard an armed or held clipboard transfer",
+    ),
 ];
 
 impl Request {
@@ -184,11 +249,13 @@ impl Request {
             "group" => Request::Group,
             "key" => key_request(&mut words)?,
             "release-keys" => Request::ReleaseKeys {
-                session: input_session(words.next())?, time: key_time(words.next())?,
+                session: input_session(words.next())?,
+                time: key_time(words.next())?,
             },
             "pointer" => pointer_request(&mut words)?,
             "release-input" => Request::ReleaseInput {
-                session: input_session(words.next())?, time: key_time(words.next())?,
+                session: input_session(words.next())?,
+                time: key_time(words.next())?,
             },
             "capture" => Request::Capture,
             "observe" => Request::Observe,
@@ -202,7 +269,10 @@ impl Request {
             },
             "clipboard-status" | "clipboard-release" | "clipboard-drop" => Request::Clipboard {
                 session: input_session(words.next())?,
-                hold: words.next().and_then(parse_counter).filter(|n| *n > 0)
+                hold: words
+                    .next()
+                    .and_then(parse_counter)
+                    .filter(|n| *n > 0)
                     .ok_or("clipboard hold must be a positive canonical u64")?,
                 action: if verb == "clipboard-status" {
                     ClipboardAction::Status
@@ -237,15 +307,25 @@ impl Request {
                 format!("present {}", presentation_word(presentation))
             }
             Request::Group => "group".to_string(),
-            Request::Key { session, time, code, pressed } => {
-                format!("key {session:032x} {time} {code} {}", if pressed { "down" } else { "up" })
+            Request::Key {
+                session,
+                time,
+                code,
+                pressed,
+            } => {
+                format!(
+                    "key {session:032x} {time} {code} {}",
+                    if pressed { "down" } else { "up" }
+                )
             }
             Request::ReleaseKeys { session, time } => format!("release-keys {session:032x} {time}"),
             Request::Pointer { session, report } => format!(
-                "pointer {session:032x} {} {} {} {} {} {}", report.time, report.x, report.y,
-                report.buttons, report.vertical, report.horizontal,
+                "pointer {session:032x} {} {} {} {} {} {}",
+                report.time, report.x, report.y, report.buttons, report.vertical, report.horizontal,
             ),
-            Request::ReleaseInput { session, time } => format!("release-input {session:032x} {time}"),
+            Request::ReleaseInput { session, time } => {
+                format!("release-input {session:032x} {time}")
+            }
             Request::Capture => "capture".into(),
             Request::Observe => "observe".into(),
             Request::ObserveClient { session, window } => {
@@ -254,7 +334,11 @@ impl Request {
             Request::ClipboardArm { session, window } => {
                 format!("clipboard-arm {session:032x} {}", handle_word(window))
             }
-            Request::Clipboard { session, hold, action } => {
+            Request::Clipboard {
+                session,
+                hold,
+                action,
+            } => {
                 format!("{} {session:032x} {hold}", action.verb())
             }
             Request::FocusWindow(handle) => format!("focus {}", handle_word(handle)),
@@ -262,11 +346,7 @@ impl Request {
                 format!("send {} {number}", handle_word(handle))
             }
             Request::MoveWindow(handle, direction) => {
-                format!(
-                    "move {} {}",
-                    handle_word(handle),
-                    direction_word(direction)
-                )
+                format!("move {} {}", handle_word(handle), direction_word(direction))
             }
         }
     }
@@ -293,7 +373,9 @@ fn key_time(word: Option<&str>) -> Result<u32, String> {
 
 fn parse_session(word: &str) -> Option<u128> {
     if word.len() != 32
-        || !word.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || !word
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
         return None;
     }
@@ -321,7 +403,12 @@ fn key_request<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<Request,
         Some("up") => false,
         _ => return Err("key state must be 'down' or 'up'".into()),
     };
-    Ok(Request::Key { session, time, code, pressed })
+    Ok(Request::Key {
+        session,
+        time,
+        code,
+        pressed,
+    })
 }
 
 fn pointer_unsigned(word: Option<&str>, field: &str, max: u32) -> Result<u32, String> {
@@ -329,7 +416,9 @@ fn pointer_unsigned(word: Option<&str>, field: &str, max: u32) -> Result<u32, St
     if word.is_empty() || !word.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(format!("pointer {field} must be unsigned decimal"));
     }
-    let value = word.parse::<u32>().map_err(|_| format!("pointer {field} outside u32"))?;
+    let value = word
+        .parse::<u32>()
+        .map_err(|_| format!("pointer {field} outside u32"))?;
     if value > max {
         return Err(format!("pointer {field} outside 0..={max}"));
     }
@@ -340,9 +429,13 @@ fn pointer_wheel(word: Option<&str>, field: &str) -> Result<i32, String> {
     let word = word.ok_or_else(|| format!("pointer needs {field}"))?;
     let digits = word.strip_prefix('-').unwrap_or(word);
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("pointer {field} must be signed decimal without '+'"));
+        return Err(format!(
+            "pointer {field} must be signed decimal without '+'"
+        ));
     }
-    let value = word.parse::<i32>().map_err(|_| format!("pointer {field} outside i32"))?;
+    let value = word
+        .parse::<i32>()
+        .map_err(|_| format!("pointer {field} outside i32"))?;
     if !(-120..=120).contains(&value) {
         return Err(format!("pointer {field} outside -120..=120 detents"));
     }
@@ -358,9 +451,17 @@ fn pointer_request<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<Requ
         .map_err(|_| "pointer buttons outside u8")?;
     let vertical = pointer_wheel(words.next(), "vertical")?;
     let horizontal = pointer_wheel(words.next(), "horizontal")?;
-    Ok(Request::Pointer { session, report: crate::input::AutomationPointer {
-        time, x, y, buttons, vertical, horizontal,
-    } })
+    Ok(Request::Pointer {
+        session,
+        report: crate::input::AutomationPointer {
+            time,
+            x,
+            y,
+            buttons,
+            vertical,
+            horizontal,
+        },
+    })
 }
 
 /// Whether a word NAMES a window rather than describing one.
@@ -399,10 +500,7 @@ fn window(word: Option<&str>, verb: &str) -> Result<u64, String> {
     // nothing, because 0 is not a name this compositor ever mints and telling
     // a caller its id is malformed beats telling it the window is gone.
     let leading_zero = digits.starts_with('0');
-    if digits.is_empty()
-        || leading_zero
-        || !digits.bytes().all(|byte| byte.is_ascii_digit())
-    {
+    if digits.is_empty() || leading_zero || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(bad());
     }
     digits.parse().map_err(|_| bad())
@@ -476,7 +574,11 @@ fn retired_address(word: &str) -> Option<String> {
     if client.is_empty() || object.is_empty() {
         return None;
     }
-    if !client.bytes().chain(object.bytes()).all(|b| b.is_ascii_digit()) {
+    if !client
+        .bytes()
+        .chain(object.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     Some(format!(
@@ -762,10 +864,18 @@ pub(crate) fn reportable(character: char) -> bool {
 pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> {
     let command = match request {
         Request::ClipboardArm { session, window } => {
-            return runtime.arm_clipboard_hold(session, window).map(Answer::Report);
+            return runtime
+                .arm_clipboard_hold(session, window)
+                .map(Answer::Report);
         }
-        Request::Clipboard { session, hold, action } => {
-            return runtime.clipboard_hold(session, hold, action).map(Answer::Report);
+        Request::Clipboard {
+            session,
+            hold,
+            action,
+        } => {
+            return runtime
+                .clipboard_hold(session, hold, action)
+                .map(Answer::Report);
         }
         Request::Layout => return Ok(Answer::Report(report(&runtime.control_snapshot()))),
         Request::Capture | Request::Observe | Request::ObserveClient { .. } => {
@@ -865,12 +975,7 @@ pub enum Answer {
 /// question nobody asked. The two cannot disagree today — `topmost_parented`
 /// follows only a mapped, overlapping, tiled child, which is never the
 /// floating case below — so this is a rule to keep rather than a bug to fix.
-fn found(
-    runtime: &Runtime,
-    handle: u64,
-    key: SurfaceKey,
-    acted: bool,
-) -> Result<Answer, String> {
+fn found(runtime: &Runtime, handle: u64, key: SurfaceKey, acted: bool) -> Result<Answer, String> {
     if acted {
         return Ok(Answer::Ok);
     }
@@ -896,7 +1001,9 @@ pub fn answer(runtime: &Mutex<Runtime>, line: &str) -> String {
 }
 
 fn apply_input(
-    runtime: &mut Runtime, request: Request, seat: &mut crate::input::AutomationSeat,
+    runtime: &mut Runtime,
+    request: Request,
+    seat: &mut crate::input::AutomationSeat,
 ) -> Result<Answer, String> {
     let session = request.input_session().ok_or("not an input request")?;
     let action = match runtime.prepare_input_action(session) {
@@ -907,7 +1014,12 @@ fn apply_input(
         Err(crate::input::AutomationFailure::Unavailable(error)) => return Err(error),
     };
     match request {
-        Request::Key { time, code, pressed, .. } => seat.key(runtime, time, code, pressed)?,
+        Request::Key {
+            time,
+            code,
+            pressed,
+            ..
+        } => seat.key(runtime, time, code, pressed)?,
         Request::ReleaseKeys { time, .. } => seat.release_keys(runtime, time)?,
         Request::Pointer { report, .. } => match seat.pointer(runtime, report) {
             Ok(()) => {}
@@ -1012,7 +1124,9 @@ pub(crate) fn serve_headless(
         .name("td-control".into())
         .spawn(move || {
             accept_with_input(
-                listener.incoming(), &runtime, SocketPolicy::Private,
+                listener.incoming(),
+                &runtime,
+                SocketPolicy::Private,
                 input_control.then(crate::input::AutomationSeat::default),
                 capture_control,
             );
@@ -1091,9 +1205,7 @@ fn converse(
     let line = match read_request(&mut stream, deadline) {
         Ok(line) => line,
         Err(error) => {
-            return write_answer(
-                &mut stream, format!("error {error}\n").as_bytes(), deadline,
-            );
+            return write_answer(&mut stream, format!("error {error}\n").as_bytes(), deadline);
         }
     };
     let request = Request::parse(&line);
@@ -1103,12 +1215,16 @@ fn converse(
             Ok(Request::Capture | Request::Observe | Request::ObserveClient { .. })
         )
     {
-        let outcome = runtime.lock().map_err(|_| "compositor runtime is poisoned".to_string())
+        let outcome = runtime
+            .lock()
+            .map_err(|_| "compositor runtime is poisoned".to_string())
             .and_then(|mut runtime| {
                 if request == Ok(Request::Capture) {
                     runtime.capture_public_ppm()
                 } else if let Ok(Request::ObserveClient { session, window }) = request {
-                    runtime.observe_client(session, window).map(String::into_bytes)
+                    runtime
+                        .observe_client(session, window)
+                        .map(String::into_bytes)
                 } else {
                     runtime.observe_output().map(String::into_bytes)
                 }
@@ -1119,7 +1235,9 @@ fn converse(
                 write_answer(&mut stream, &body, deadline)
             }
             Err(error) => write_answer(
-                &mut stream, format!("unavailable {error}\n").as_bytes(), deadline,
+                &mut stream,
+                format!("unavailable {error}\n").as_bytes(),
+                deadline,
             ),
         };
     }
@@ -1138,10 +1256,12 @@ fn read_request(stream: &mut UnixStream, deadline: Instant) -> Result<String, St
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 256];
     loop {
-        let remaining = deadline.checked_duration_since(Instant::now())
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
             .filter(|time| !time.is_zero())
             .ok_or_else(|| "control request timed out".to_string())?;
-        stream.set_read_timeout(Some(remaining))
+        stream
+            .set_read_timeout(Some(remaining))
             .map_err(|error| format!("set control read timeout: {error}"))?;
         match stream.read(&mut chunk) {
             Ok(0) => break,
@@ -1174,10 +1294,12 @@ fn read_request(stream: &mut UnixStream, deadline: Instant) -> Result<String, St
 fn write_answer(stream: &mut UnixStream, answer: &[u8], deadline: Instant) -> Result<(), String> {
     let mut written = 0;
     while written < answer.len() {
-        let remaining = deadline.checked_duration_since(Instant::now())
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
             .filter(|time| !time.is_zero())
             .ok_or_else(|| "control answer timed out".to_string())?;
-        stream.set_write_timeout(Some(remaining))
+        stream
+            .set_write_timeout(Some(remaining))
             .map_err(|error| format!("set control write timeout: {error}"))?;
         let Some(rest) = answer.get(written..) else {
             break;
@@ -1198,7 +1320,10 @@ fn write_answer(stream: &mut UnixStream, answer: &[u8], deadline: Instant) -> Re
 /// without reading the text — which is the whole reason the status is a line
 /// of its own rather than a word in front of the report.
 pub fn ask(path: &Path, request: Request) -> Result<String, ControlFailure> {
-    if matches!(request, Request::ClipboardArm { .. } | Request::Clipboard { .. }) {
+    if matches!(
+        request,
+        Request::ClipboardArm { .. } | Request::Clipboard { .. }
+    ) {
         let line = format!("{}\n", request.render());
         let answer = ask_bounded(path, line.as_bytes(), REQUEST_LIMIT)?;
         return decode_clipboard_record(&answer, request).map(str::to_string);
@@ -1227,9 +1352,8 @@ pub fn ask(path: &Path, request: Request) -> Result<String, ControlFailure> {
         .write_all(line.as_bytes())
         .map_err(|error| ControlFailure::Unreachable(format!("write control request: {error}")))?;
     let answer = read_answer(&mut stream)?;
-    let answer = String::from_utf8(answer).map_err(|_| {
-        ControlFailure::Unreachable("control answer is not UTF-8".to_string())
-    })?;
+    let answer = String::from_utf8(answer)
+        .map_err(|_| ControlFailure::Unreachable("control answer is not UTF-8".to_string()))?;
     split_answer(&answer, matches!(request, Request::Layout))
 }
 
@@ -1284,7 +1408,9 @@ pub fn ask_observe(path: &Path) -> Result<String, ControlFailure> {
         .map_err(|_| ControlFailure::Unreachable("observation reply is not UTF-8".into()))?;
     let Some(body) = text.strip_prefix("ok\ntd-output-v1 ") else {
         return split_answer(text, false).and_then(|_| {
-            Err(ControlFailure::Unreachable("observation reply has no identity".into()))
+            Err(ControlFailure::Unreachable(
+                "observation reply has no identity".into(),
+            ))
         });
     };
     decode_observation(body)?;
@@ -1315,28 +1441,51 @@ fn decode_clipboard_record(answer: &[u8], request: Request) -> Result<&str, Cont
     if fields.next() != Some("td-clipboard-v1") {
         return Err(bad());
     }
-    let session = fields.next().and_then(|s| s.strip_prefix("session="))
-        .and_then(parse_session).ok_or_else(bad)?;
-    let hold = fields.next().and_then(|s| s.strip_prefix("hold="))
-        .and_then(parse_counter).filter(|n| *n > 0).ok_or_else(bad)?;
-    let window = fields.next().and_then(|s| s.strip_prefix("window="))
-        .and_then(|s| window(Some(s), "clipboard").ok()).ok_or_else(bad)?;
-    let state = fields.next().and_then(|s| s.strip_prefix("state=")).ok_or_else(bad)?;
-    if fields.next().is_some() || !matches!(state,
-        "armed" | "held" | "released" | "dropped" | "expired" | "invalidated" | "failed")
+    let session = fields
+        .next()
+        .and_then(|s| s.strip_prefix("session="))
+        .and_then(parse_session)
+        .ok_or_else(bad)?;
+    let hold = fields
+        .next()
+        .and_then(|s| s.strip_prefix("hold="))
+        .and_then(parse_counter)
+        .filter(|n| *n > 0)
+        .ok_or_else(bad)?;
+    let window = fields
+        .next()
+        .and_then(|s| s.strip_prefix("window="))
+        .and_then(|s| window(Some(s), "clipboard").ok())
+        .ok_or_else(bad)?;
+    let state = fields
+        .next()
+        .and_then(|s| s.strip_prefix("state="))
+        .ok_or_else(bad)?;
+    if fields.next().is_some()
+        || !matches!(
+            state,
+            "armed" | "held" | "released" | "dropped" | "expired" | "invalidated" | "failed"
+        )
     {
         return Err(bad());
     }
     let matches_request = match request {
-        Request::ClipboardArm { session: expected, window: target } => {
-            session == expected && window == target && state == "armed"
-        }
-        Request::Clipboard { session: expected, hold: target, action } => {
-            session == expected && hold == target && match action {
-                ClipboardAction::Status => true,
-                ClipboardAction::Release => state == "released",
-                ClipboardAction::Drop => state == "dropped",
-            }
+        Request::ClipboardArm {
+            session: expected,
+            window: target,
+        } => session == expected && window == target && state == "armed",
+        Request::Clipboard {
+            session: expected,
+            hold: target,
+            action,
+        } => {
+            session == expected
+                && hold == target
+                && match action {
+                    ClipboardAction::Status => true,
+                    ClipboardAction::Release => state == "released",
+                    ClipboardAction::Drop => state == "dropped",
+                }
         }
         _ => false,
     };
@@ -1407,23 +1556,20 @@ fn decode_client_observation(
     Ok(body)
 }
 
-fn ask_bounded(
-    path: &Path,
-    request: &[u8],
-    limit: usize,
-) -> Result<Vec<u8>, ControlFailure> {
+fn ask_bounded(path: &Path, request: &[u8], limit: usize) -> Result<Vec<u8>, ControlFailure> {
     let mut stream = UnixStream::connect(path).map_err(|error| {
-        ControlFailure::Unreachable(format!("connect control socket {}: {error}", path.display()))
+        ControlFailure::Unreachable(format!(
+            "connect control socket {}: {error}",
+            path.display()
+        ))
     })?;
-    let deadline = Instant::now().checked_add(IO_TIMEOUT).ok_or_else(|| {
-        ControlFailure::Unreachable("control reply deadline overflow".into())
-    })?;
+    let deadline = Instant::now()
+        .checked_add(IO_TIMEOUT)
+        .ok_or_else(|| ControlFailure::Unreachable("control reply deadline overflow".into()))?;
     stream
         .set_write_timeout(Some(IO_TIMEOUT))
         .and_then(|()| stream.write_all(request))
-        .map_err(|error| {
-            ControlFailure::Unreachable(format!("write control request: {error}"))
-        })?;
+        .map_err(|error| ControlFailure::Unreachable(format!("write control request: {error}")))?;
     read_bounded(&mut stream, deadline, limit)
 }
 
@@ -1443,9 +1589,7 @@ fn read_bounded(
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .filter(|time| !time.is_zero())
-            .ok_or_else(|| {
-                ControlFailure::Unreachable("control reply deadline expired".into())
-            })?;
+            .ok_or_else(|| ControlFailure::Unreachable("control reply deadline expired".into()))?;
         stream.set_read_timeout(Some(remaining)).map_err(|error| {
             ControlFailure::Unreachable(format!("set control reply timeout: {error}"))
         })?;
@@ -1454,13 +1598,22 @@ fn read_bounded(
             Ok(count) => count,
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Err(error) => {
-                return Err(ControlFailure::Unreachable(format!("read control reply: {error}")));
+                return Err(ControlFailure::Unreachable(format!(
+                    "read control reply: {error}"
+                )));
             }
         };
-        if answer.len().checked_add(count).is_none_or(|length| length > limit) {
-            return Err(ControlFailure::Unreachable("control reply exceeds byte limit".into()));
+        if answer
+            .len()
+            .checked_add(count)
+            .is_none_or(|length| length > limit)
+        {
+            return Err(ControlFailure::Unreachable(
+                "control reply exceeds byte limit".into(),
+            ));
         }
-        answer.try_reserve(count)
+        answer
+            .try_reserve(count)
             .map_err(|_| ControlFailure::Unreachable("reserve control reply".into()))?;
         let bytes = chunk.get(..count).ok_or_else(|| {
             ControlFailure::Unreachable("invalid control reply read count".into())
@@ -1489,20 +1642,28 @@ fn decode_capture(answer: &[u8]) -> Result<&[u8], ControlFailure> {
     if parts.next() != Some(b"P6") {
         return Err(bad());
     }
-    let stamp = parts.next().and_then(|line| line.strip_prefix(b"# td-output-v1 "))
-        .filter(|line| line.len() <= 80).ok_or_else(bad)?;
+    let stamp = parts
+        .next()
+        .and_then(|line| line.strip_prefix(b"# td-output-v1 "))
+        .filter(|line| line.len() <= 80)
+        .ok_or_else(bad)?;
     let stamp = std::str::from_utf8(stamp).map_err(|_| bad())?;
     if decode_output_stamp(stamp)?.output == 0 {
         return Err(bad());
     }
-    let dimensions = parts.next().filter(|line| line.len() <= 64).ok_or_else(bad)?;
+    let dimensions = parts
+        .next()
+        .filter(|line| line.len() <= 64)
+        .ok_or_else(bad)?;
     let dimensions = std::str::from_utf8(dimensions).map_err(|_| bad())?;
     let (width, height) = dimensions.split_once(' ').ok_or_else(bad)?;
     let dimension = |word: &str| -> Result<usize, ControlFailure> {
         if word.is_empty() || !word.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(bad());
         }
-        word.parse::<usize>().ok().filter(|n| (1..=crate::MAX_UI_DIMENSION).contains(n))
+        word.parse::<usize>()
+            .ok()
+            .filter(|n| (1..=crate::MAX_UI_DIMENSION).contains(n))
             .ok_or_else(bad)
     };
     let width = dimension(width)?;
@@ -1511,7 +1672,10 @@ fn decode_capture(answer: &[u8]) -> Result<&[u8], ControlFailure> {
         return Err(bad());
     }
     let pixels = width.checked_mul(height).ok_or_else(bad)?;
-    if pixels.checked_mul(4).is_none_or(|n| n > crate::MAX_UI_FRAME_BYTES) {
+    if pixels
+        .checked_mul(4)
+        .is_none_or(|n| n > crate::MAX_UI_FRAME_BYTES)
+    {
         return Err(bad());
     }
     let rgb = parts.next().ok_or_else(bad)?;
@@ -1745,50 +1909,94 @@ mod tests {
 
     #[test]
     fn clipboard_control_grammar_and_reply_identity_are_strict() {
-        let arm = Request::ClipboardArm { session: 7, window: 12 };
+        let arm = Request::ClipboardArm {
+            session: 7,
+            window: 12,
+        };
         let reply = format!(
-            "ok\ntd-clipboard-v1 session={:032x} hold=1 window=@12 state=armed\n", 7,
+            "ok\ntd-clipboard-v1 session={:032x} hold=1 window=@12 state=armed\n",
+            7,
         );
         assert_eq!(Request::parse(&arm.render()).unwrap(), arm);
-        assert_eq!(decode_clipboard_record(reply.as_bytes(), arm).unwrap(), &reply[3..]);
+        assert_eq!(
+            decode_clipboard_record(reply.as_bytes(), arm).unwrap(),
+            &reply[3..]
+        );
         for end in 0..reply.len() {
             assert!(decode_clipboard_record(&reply.as_bytes()[..end], arm).is_err());
         }
         for (from, to) in [
-            ("hold=1", "hold=0"), ("hold=1", "hold=01"),
-            ("hold=1", "hold=18446744073709551616"), ("hold=1", "hold=+1"),
-            ("window=@12", "window=@012"), ("window=@12", "window=@13"),
-            ("state=armed", "state=held"), ("state=armed", "state=unknown"),
-            (" state=", "  state="), ("\n", "\r\n"),
+            ("hold=1", "hold=0"),
+            ("hold=1", "hold=01"),
+            ("hold=1", "hold=18446744073709551616"),
+            ("hold=1", "hold=+1"),
+            ("window=@12", "window=@012"),
+            ("window=@12", "window=@13"),
+            ("state=armed", "state=held"),
+            ("state=armed", "state=unknown"),
+            (" state=", "  state="),
+            ("\n", "\r\n"),
             ("state=armed\n", "state=armed\n\n"),
-            ("session=00000000000000000000000000000007", "session=00000000000000000000000000000008"),
+            (
+                "session=00000000000000000000000000000007",
+                "session=00000000000000000000000000000008",
+            ),
         ] {
             assert!(decode_clipboard_record(reply.replace(from, to).as_bytes(), arm).is_err());
         }
         assert!(decode_clipboard_record(&[b'x'; REQUEST_LIMIT + 1], arm).is_err());
         assert!(decode_clipboard_record(b"ok\n", arm).is_err());
-        assert_eq!(decode_clipboard_record(b"unavailable disabled\n", arm),
-            Err(ControlFailure::Unreachable("disabled".into())));
-        for action in [ClipboardAction::Status, ClipboardAction::Release, ClipboardAction::Drop] {
-            let request = Request::Clipboard { session: 7, hold: 1, action };
+        assert_eq!(
+            decode_clipboard_record(b"unavailable disabled\n", arm),
+            Err(ControlFailure::Unreachable("disabled".into()))
+        );
+        for action in [
+            ClipboardAction::Status,
+            ClipboardAction::Release,
+            ClipboardAction::Drop,
+        ] {
+            let request = Request::Clipboard {
+                session: 7,
+                hold: 1,
+                action,
+            };
             assert_eq!(Request::parse(&request.render()).unwrap(), request);
-            for state in ["armed", "held", "released", "dropped", "expired", "invalidated", "failed"] {
+            for state in [
+                "armed",
+                "held",
+                "released",
+                "dropped",
+                "expired",
+                "invalidated",
+                "failed",
+            ] {
                 let reply = reply.replace("state=armed", &format!("state={state}"));
                 let valid = action == ClipboardAction::Status
                     || (action == ClipboardAction::Release && state == "released")
                     || (action == ClipboardAction::Drop && state == "dropped");
-                assert_eq!(decode_clipboard_record(reply.as_bytes(), request).is_ok(), valid);
-                assert!(decode_clipboard_record(reply.replace("hold=1", "hold=2").as_bytes(), request).is_err());
+                assert_eq!(
+                    decode_clipboard_record(reply.as_bytes(), request).is_ok(),
+                    valid
+                );
+                assert!(decode_clipboard_record(
+                    reply.replace("hold=1", "hold=2").as_bytes(),
+                    request
+                )
+                .is_err());
             }
             for id in ["0", "01", "+1", "-1", "18446744073709551616", "1 extra"] {
                 assert!(Request::parse(&format!("{} {:032x} {id}", action.verb(), 7)).is_err());
             }
         }
-        for line in ["clipboard-arm", "clipboard-arm 7 @12",
+        for line in [
+            "clipboard-arm",
+            "clipboard-arm 7 @12",
             "clipboard-arm 00000000000000000000000000000007 @0",
             "clipboard-arm 00000000000000000000000000000007 @12 extra",
-            "clipboard-status", "clipboard-release", "clipboard-drop"]
-        {
+            "clipboard-status",
+            "clipboard-release",
+            "clipboard-drop",
+        ] {
             assert!(Request::parse(line).is_err());
         }
     }
@@ -1796,9 +2004,13 @@ mod tests {
     #[test]
     fn client_observation_grammar_is_exact_bounded_and_generation_guarded() {
         let reply = format!(
-            "ok\ntd-client-v1 session={:032x} window=@12 client=5 commit=8 output=9 current=yes\n", 7,
+            "ok\ntd-client-v1 session={:032x} window=@12 client=5 commit=8 output=9 current=yes\n",
+            7,
         );
-        assert_eq!(decode_client_observation(reply.as_bytes(), 7, 12).unwrap(), &reply[3..]);
+        assert_eq!(
+            decode_client_observation(reply.as_bytes(), 7, 12).unwrap(),
+            &reply[3..]
+        );
         for end in 0..reply.len() {
             assert!(decode_client_observation(&reply.as_bytes()[..end], 7, 12).is_err());
         }
@@ -1813,32 +2025,55 @@ mod tests {
         }
         for (from, to) in [
             ("session=00000000000000000000000000000007", "session=7"),
-            ("window=@12", "window=@012"), ("client=5", "client=0"),
-            ("client=5", "client=05"), ("commit=8", "commit=0"),
-            ("commit=8", "commit=+1"), ("commit=8", "commit=01"),
+            ("window=@12", "window=@012"),
+            ("client=5", "client=0"),
+            ("client=5", "client=05"),
+            ("commit=8", "commit=0"),
+            ("commit=8", "commit=+1"),
+            ("commit=8", "commit=01"),
             ("commit=8", "commit=18446744073709551616"),
-            ("output=9", "output=0"), ("current=yes", "current=true"),
+            ("output=9", "output=0"),
+            ("current=yes", "current=true"),
             ("current=yes\n", "current=yes\n\n"),
             ("current=yes\n", "current=yes extra\n"),
-            (" client=", "  client="), ("client=5", "other=5"),
+            (" client=", "  client="),
+            ("client=5", "other=5"),
         ] {
             let invalid = reply.replace(from, to);
-            assert!(decode_client_observation(invalid.as_bytes(), 7, 12).is_err(), "{invalid}");
+            assert!(
+                decode_client_observation(invalid.as_bytes(), 7, 12).is_err(),
+                "{invalid}"
+            );
         }
-        let zero = reply.replace("commit=8", "commit=0")
-            .replace("output=9", "output=0").replace("current=yes", "current=no");
+        let zero = reply
+            .replace("commit=8", "commit=0")
+            .replace("output=9", "output=0")
+            .replace("current=yes", "current=no");
         assert!(decode_client_observation(zero.as_bytes(), 7, 12).is_ok());
         assert!(decode_client_observation(&[b'x'; REQUEST_LIMIT + 1], 7, 12).is_err());
-        assert_eq!(decode_client_observation(b"error capture automation is disabled\n", 7, 12),
-            Err(ControlFailure::Refused("capture automation is disabled".into())));
-        assert_eq!(decode_client_observation(b"unavailable client observation window is gone\n", 7, 12),
-            Err(ControlFailure::Unreachable("client observation window is gone".into())));
-        let request = Request::ObserveClient { session: 7, window: 12 };
+        assert_eq!(
+            decode_client_observation(b"error capture automation is disabled\n", 7, 12),
+            Err(ControlFailure::Refused(
+                "capture automation is disabled".into()
+            ))
+        );
+        assert_eq!(
+            decode_client_observation(b"unavailable client observation window is gone\n", 7, 12),
+            Err(ControlFailure::Unreachable(
+                "client observation window is gone".into()
+            ))
+        );
+        let request = Request::ObserveClient {
+            session: 7,
+            window: 12,
+        };
         assert_eq!(Request::parse(&request.render()).unwrap(), request);
-        for line in ["observe-client", "observe-client 7 @12",
+        for line in [
+            "observe-client",
+            "observe-client 7 @12",
             "observe-client 00000000000000000000000000000007 @0",
-            "observe-client 00000000000000000000000000000007 @12 extra"]
-        {
+            "observe-client 00000000000000000000000000000007 @12 extra",
+        ] {
             assert!(Request::parse(line).is_err());
         }
     }
@@ -1846,54 +2081,103 @@ mod tests {
     #[test]
     fn input_receipts_bind_the_session_and_exact_positive_counter() {
         let reply = b"ok\ntd-action-v1 session=00000000000000000000000000000007 action=1\n";
-        assert_eq!(decode_input_receipt(reply, 7).unwrap(),
-            std::str::from_utf8(&reply[3..]).unwrap());
+        assert_eq!(
+            decode_input_receipt(reply, 7).unwrap(),
+            std::str::from_utf8(&reply[3..]).unwrap()
+        );
         for end in 0..reply.len() {
             assert!(decode_input_receipt(&reply[..end], 7).is_err());
         }
-        assert_eq!(decode_input_receipt(reply, 8), Err(ControlFailure::Unreachable(
-            "input receipt belongs to another session".into())));
-        for action in ["0", "00", "01", "+1", "-1", "18446744073709551616", "1\n", "1 extra"] {
+        assert_eq!(
+            decode_input_receipt(reply, 8),
+            Err(ControlFailure::Unreachable(
+                "input receipt belongs to another session".into()
+            ))
+        );
+        for action in [
+            "0",
+            "00",
+            "01",
+            "+1",
+            "-1",
+            "18446744073709551616",
+            "1\n",
+            "1 extra",
+        ] {
             let reply = format!("ok\ntd-action-v1 session={:032x} action={action}\n", 7);
-            assert!(decode_input_receipt(reply.as_bytes(), 7).is_err(), "{action}");
+            assert!(
+                decode_input_receipt(reply.as_bytes(), 7).is_err(),
+                "{action}"
+            );
         }
         let maximum = format!("ok\ntd-action-v1 session={:032x} action={}\n", 7, u64::MAX);
         assert!(decode_input_receipt(maximum.as_bytes(), 7).is_ok());
         assert!(decode_input_receipt(b"ok\n", 7).is_err());
         assert!(decode_input_receipt(&[b'x'; REQUEST_LIMIT + 1], 7).is_err());
-        assert_eq!(decode_input_receipt(b"error input session identity does not match\n", 7),
-            Err(ControlFailure::Refused("input session identity does not match".into())));
-        assert_eq!(decode_input_receipt(b"unavailable input delivery failed\n", 7),
-            Err(ControlFailure::Unreachable("input delivery failed".into())));
-        for session in ["", "7", "0000000000000000000000000000000F", "0000000000000000000000000000000g"] {
+        assert_eq!(
+            decode_input_receipt(b"error input session identity does not match\n", 7),
+            Err(ControlFailure::Refused(
+                "input session identity does not match".into()
+            ))
+        );
+        assert_eq!(
+            decode_input_receipt(b"unavailable input delivery failed\n", 7),
+            Err(ControlFailure::Unreachable("input delivery failed".into()))
+        );
+        for session in [
+            "",
+            "7",
+            "0000000000000000000000000000000F",
+            "0000000000000000000000000000000g",
+        ] {
             assert!(Request::parse(&format!("key {session} 0 30 down")).is_err());
             let reply = format!("ok\ntd-action-v1 session={session} action=1\n");
-            assert_eq!(decode_input_receipt(reply.as_bytes(), 7),
-                Err(ControlFailure::Unreachable("malformed input receipt".into())));
+            assert_eq!(
+                decode_input_receipt(reply.as_bytes(), 7),
+                Err(ControlFailure::Unreachable(
+                    "malformed input receipt".into()
+                ))
+            );
         }
     }
 
     #[test]
     fn stale_input_sessions_preserve_depressed_state_and_receipt_numbering() {
-        let (runtime, _frame) = session(SurfaceKey { client: 7, object: 7 });
+        let (runtime, _frame) = session(SurfaceKey {
+            client: 7,
+            object: 7,
+        });
         let mut seat = crate::input::AutomationSeat::default();
         let receipt = |action| format!("ok\ntd-action-v1 session={:032x} action={action}\n", 7);
-        assert_eq!(answer_with_input(&runtime, &input_line("key 0 42 down", 7), Some(&mut seat)),
-            receipt(1));
+        assert_eq!(
+            answer_with_input(&runtime, &input_line("key 0 42 down", 7), Some(&mut seat)),
+            receipt(1)
+        );
         let before = runtime.lock().unwrap().keyboard_snapshot();
         let pointer = runtime.lock().unwrap().pointer_snapshot();
-        for line in ["key 1 42 up", "release-keys 2", "pointer 3 0 0 1 0 0", "release-input 4"] {
-            assert_eq!(answer_with_input(&runtime, &input_line(line, 8), Some(&mut seat)),
-                "error input session identity does not match\n");
+        for line in [
+            "key 1 42 up",
+            "release-keys 2",
+            "pointer 3 0 0 1 0 0",
+            "release-input 4",
+        ] {
+            assert_eq!(
+                answer_with_input(&runtime, &input_line(line, 8), Some(&mut seat)),
+                "error input session identity does not match\n"
+            );
         }
         assert_eq!(runtime.lock().unwrap().keyboard_snapshot(), before);
         assert_eq!(runtime.lock().unwrap().pointer_snapshot(), pointer);
         // An accepted duplicate is still a completed request, not deduplication.
-        assert_eq!(answer_with_input(&runtime, &input_line("key 5 42 down", 7), Some(&mut seat)),
-            receipt(2));
+        assert_eq!(
+            answer_with_input(&runtime, &input_line("key 5 42 down", 7), Some(&mut seat)),
+            receipt(2)
+        );
         assert_eq!(runtime.lock().unwrap().keyboard_snapshot(), before);
-        assert_eq!(answer_with_input(&runtime, &input_line("release-input 6", 7), Some(&mut seat)),
-            receipt(3));
+        assert_eq!(
+            answer_with_input(&runtime, &input_line("release-input 6", 7), Some(&mut seat)),
+            receipt(3)
+        );
         assert!(runtime.lock().unwrap().keyboard_snapshot().keys.is_empty());
     }
 
@@ -1921,15 +2205,39 @@ mod tests {
             Request::FocusWindow(12),
             Request::SendWindow(12, 7),
             Request::MoveWindow(40, Direction::Right),
-            Request::Key { session: 0, time: 0, code: 1, pressed: true },
-            Request::Key { session: u128::MAX, time: u32::MAX, code: 247, pressed: false },
-            Request::ReleaseKeys { session: 7, time: u32::MAX },
-            Request::ReleaseInput { session: 7, time: u32::MAX },
+            Request::Key {
+                session: 0,
+                time: 0,
+                code: 1,
+                pressed: true,
+            },
+            Request::Key {
+                session: u128::MAX,
+                time: u32::MAX,
+                code: 247,
+                pressed: false,
+            },
+            Request::ReleaseKeys {
+                session: 7,
+                time: u32::MAX,
+            },
+            Request::ReleaseInput {
+                session: 7,
+                time: u32::MAX,
+            },
             Request::Capture,
             Request::Observe,
-            Request::Pointer { session: 7, report: crate::input::AutomationPointer {
-                time: u32::MAX, x: 16383, y: 0, buttons: 255, vertical: -120, horizontal: 120,
-            } },
+            Request::Pointer {
+                session: 7,
+                report: crate::input::AutomationPointer {
+                    time: u32::MAX,
+                    x: 16383,
+                    y: 0,
+                    buttons: 255,
+                    vertical: -120,
+                    horizontal: 120,
+                },
+            },
         ];
         for request in every {
             let line = request.render();
@@ -1969,11 +2277,23 @@ mod tests {
     #[test]
     fn keyboard_requests_refuse_malformed_or_out_of_range_fields() {
         for line in [
-            "key", "key 0", "key 0 30", "key 0 0 down", "key 0 248 down",
-            "key 0 65536 down", "key -1 30 down", "key +1 30 down",
-            "key 4294967296 30 down", "key 0 +30 down", "key 0 -30 down",
-            "key 0 30 repeat", "key 0 30 down extra", "release-keys",
-            "release-keys -1", "release-keys 4294967296", "release-keys 0 extra",
+            "key",
+            "key 0",
+            "key 0 30",
+            "key 0 0 down",
+            "key 0 248 down",
+            "key 0 65536 down",
+            "key -1 30 down",
+            "key +1 30 down",
+            "key 4294967296 30 down",
+            "key 0 +30 down",
+            "key 0 -30 down",
+            "key 0 30 repeat",
+            "key 0 30 down extra",
+            "release-keys",
+            "release-keys -1",
+            "release-keys 4294967296",
+            "release-keys 0 extra",
         ] {
             assert!(Request::parse(line).is_err(), "legacy input: {line}");
             assert!(Request::parse(&input_line(line, 7)).is_err(), "{line}");
@@ -1982,16 +2302,24 @@ mod tests {
 
     #[test]
     fn trusted_runtime_miswiring_has_a_framed_unavailable_reply() {
-        let (runtime, _frame) = session(SurfaceKey { client: 7, object: 7 });
+        let (runtime, _frame) = session(SurfaceKey {
+            client: 7,
+            object: 7,
+        });
         runtime.lock().unwrap().enable_attention(true);
         let before = runtime.lock().unwrap().keyboard_snapshot();
         let mut keys = crate::input::AutomationSeat::default();
         for line in [
-            "key 0 30 down", "release-keys 1", "pointer 2 0 0 0 0 0",
-            "pointer 2 16383 16383 1 0 0", "release-input 3",
+            "key 0 30 down",
+            "release-keys 1",
+            "pointer 2 0 0 0 0 0",
+            "pointer 2 16383 16383 1 0 0",
+            "release-input 3",
         ] {
-            assert_eq!(answer_with_input(&runtime, &input_line(line, 7), Some(&mut keys)),
-                "unavailable input automation refuses a trusted-attention runtime\n");
+            assert_eq!(
+                answer_with_input(&runtime, &input_line(line, 7), Some(&mut keys)),
+                "unavailable input automation refuses a trusted-attention runtime\n"
+            );
         }
         assert_eq!(runtime.lock().unwrap().keyboard_snapshot(), before);
     }
@@ -1999,27 +2327,42 @@ mod tests {
     #[test]
     fn pointer_wire_fields_and_runtime_coordinates_are_bounded() {
         for line in [
-            "pointer", "pointer 0 1 2 3 4", "pointer 0 -1 2 0 0 0",
-            "pointer 0 1 +2 0 0 0", "pointer 0 16384 0 0 0 0",
-            "pointer 0 0 0 256 0 0", "pointer 0 0 0 0 -121 0",
-            "pointer 0 0 0 0 0 121", "pointer 0 0 0 0 --1 0",
-            "pointer 0 0 0 0 +1 0", "pointer 0 0 0 0 0 0 extra",
-            "release-input", "release-input -1", "release-input 0 extra",
+            "pointer",
+            "pointer 0 1 2 3 4",
+            "pointer 0 -1 2 0 0 0",
+            "pointer 0 1 +2 0 0 0",
+            "pointer 0 16384 0 0 0 0",
+            "pointer 0 0 0 256 0 0",
+            "pointer 0 0 0 0 -121 0",
+            "pointer 0 0 0 0 0 121",
+            "pointer 0 0 0 0 --1 0",
+            "pointer 0 0 0 0 +1 0",
+            "pointer 0 0 0 0 0 0 extra",
+            "release-input",
+            "release-input -1",
+            "release-input 0 extra",
         ] {
             assert!(Request::parse(line).is_err(), "legacy input: {line}");
             assert!(Request::parse(&input_line(line, 7)).is_err(), "{line}");
         }
-        let (runtime, _frame) = session(SurfaceKey { client: 7, object: 7 });
+        let (runtime, _frame) = session(SurfaceKey {
+            client: 7,
+            object: 7,
+        });
         let width = runtime.lock().unwrap().width();
         let before = runtime.lock().unwrap().pointer_snapshot();
         let mut seat = crate::input::AutomationSeat::default();
         let line = input_line(&format!("pointer 0 {width} 0 1 0 0"), 7);
-        assert_eq!(answer_with_input(&runtime, &line, Some(&mut seat)),
-            "error pointer coordinates outside the output\n");
+        assert_eq!(
+            answer_with_input(&runtime, &line, Some(&mut seat)),
+            "error pointer coordinates outside the output\n"
+        );
         assert_eq!(runtime.lock().unwrap().pointer_snapshot(), before);
         for line in ["pointer 0 0 0 1 0 0", "release-input 1"] {
-            assert_eq!(answer(&runtime, &input_line(line, 7)),
-                "error input automation is disabled\n");
+            assert_eq!(
+                answer(&runtime, &input_line(line, 7)),
+                "error input automation is disabled\n"
+            );
         }
     }
 
@@ -2034,22 +2377,37 @@ mod tests {
         extra.push(0);
         assert!(decode_capture(&extra).is_err());
         for reply in [
-            "ok\nP3\n1 1\n255\nabc", "ok\nP6\n0 1\n255\n",
-            "ok\nP6\n16385 1\n255\n", "ok\nP6\n4096 2160\n255\n",
-            "ok\nP6\n1 1 1\n255\nabc", "ok\nP6\n+1 1\n255\nabc",
-            "ok\nP6\n1 1\n256\nabc", "ok\nP6\n18446744073709551616 1\n255\n",
-            "ok\nP6\n1 1\r\n255\nabc", "ok\nP6\n1\t1\n255\nabc",
-            "ok\nP6\n1  1\n255\nabc", "ok\nP6\n1 1 \n255\nabc",
+            "ok\nP3\n1 1\n255\nabc",
+            "ok\nP6\n0 1\n255\n",
+            "ok\nP6\n16385 1\n255\n",
+            "ok\nP6\n4096 2160\n255\n",
+            "ok\nP6\n1 1 1\n255\nabc",
+            "ok\nP6\n+1 1\n255\nabc",
+            "ok\nP6\n1 1\n256\nabc",
+            "ok\nP6\n18446744073709551616 1\n255\n",
+            "ok\nP6\n1 1\r\n255\nabc",
+            "ok\nP6\n1\t1\n255\nabc",
+            "ok\nP6\n1  1\n255\nabc",
+            "ok\nP6\n1 1 \n255\nabc",
         ] {
-            let stamped = reply.replacen("P6\n",
-                "P6\n# td-output-v1 session=00000000000000000000000000000001 output=1\n", 1);
+            let stamped = reply.replacen(
+                "P6\n",
+                "P6\n# td-output-v1 session=00000000000000000000000000000001 output=1\n",
+                1,
+            );
             assert!(decode_capture(stamped.as_bytes()).is_err(), "{reply}");
         }
         assert!(decode_capture(b"ok\nP6\n1 1\n255\nabc").is_err());
-        assert_eq!(decode_capture(b"error capture automation is disabled\n"),
-            Err(ControlFailure::Refused("capture automation is disabled".into())));
-        assert_eq!(decode_capture(b"unavailable output failed\n"),
-            Err(ControlFailure::Unreachable("output failed".into())));
+        assert_eq!(
+            decode_capture(b"error capture automation is disabled\n"),
+            Err(ControlFailure::Refused(
+                "capture automation is disabled".into()
+            ))
+        );
+        assert_eq!(
+            decode_capture(b"unavailable output failed\n"),
+            Err(ControlFailure::Unreachable("output failed".into()))
+        );
         assert!(Request::parse("capture extra").is_err());
     }
 
@@ -2059,11 +2417,17 @@ mod tests {
         assert!(read_capture(&mut reader, Instant::now() + Duration::from_millis(20)).is_err());
         let (mut reader, mut writer) = UnixStream::pair().unwrap();
         let worker = thread::spawn(move || {
-            writer.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            writer
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let _ = writer.write_all(&vec![0u8; MAX_CAPTURE_BYTES + 1]);
         });
-        assert_eq!(read_capture(&mut reader, Instant::now() + Duration::from_secs(2)),
-            Err(ControlFailure::Unreachable("control reply exceeds byte limit".into())));
+        assert_eq!(
+            read_capture(&mut reader, Instant::now() + Duration::from_secs(2)),
+            Err(ControlFailure::Unreachable(
+                "control reply exceeds byte limit".into()
+            ))
+        );
         drop(reader);
         worker.join().unwrap();
     }
@@ -2072,7 +2436,9 @@ mod tests {
     fn control_blocking_read_uses_only_the_remaining_conversation_budget() {
         let budget = Duration::from_millis(20);
         let (mut client, mut server) = UnixStream::pair().unwrap();
-        server.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         client.write_all(b"capt").unwrap();
         assert!(read_request(&mut server, Instant::now() + budget).is_err());
         assert!(server.read_timeout().unwrap().unwrap() <= budget);
@@ -2081,20 +2447,33 @@ mod tests {
     #[test]
     fn observation_reader_keeps_its_smaller_limit_and_deadline() {
         let (mut reader, _writer) = UnixStream::pair().unwrap();
-        assert!(read_bounded(&mut reader,
-            Instant::now() + Duration::from_millis(20), REQUEST_LIMIT).is_err());
+        assert!(read_bounded(
+            &mut reader,
+            Instant::now() + Duration::from_millis(20),
+            REQUEST_LIMIT
+        )
+        .is_err());
         for count in [REQUEST_LIMIT, REQUEST_LIMIT + 1] {
             let (mut reader, mut writer) = UnixStream::pair().unwrap();
-            writer.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+            writer
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
             writer.write_all(&vec![b'x'; count]).unwrap();
             drop(writer);
-            let answer = read_bounded(&mut reader,
-                Instant::now() + Duration::from_secs(1), REQUEST_LIMIT);
+            let answer = read_bounded(
+                &mut reader,
+                Instant::now() + Duration::from_secs(1),
+                REQUEST_LIMIT,
+            );
             if count == REQUEST_LIMIT {
                 assert_eq!(answer.unwrap().len(), count);
             } else {
-                assert_eq!(answer, Err(ControlFailure::Unreachable(
-                    "control reply exceeds byte limit".into())));
+                assert_eq!(
+                    answer,
+                    Err(ControlFailure::Unreachable(
+                        "control reply exceeds byte limit".into()
+                    ))
+                );
             }
         }
     }
@@ -2103,7 +2482,9 @@ mod tests {
     fn control_blocking_write_uses_only_the_remaining_conversation_budget() {
         let budget = Duration::from_millis(20);
         let (_client, mut server) = UnixStream::pair().unwrap();
-        server.set_write_timeout(Some(Duration::from_millis(200))).unwrap();
+        server
+            .set_write_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         let pixels = vec![0u8; MAX_CAPTURE_BYTES];
         assert!(write_answer(&mut server, &pixels, Instant::now() + budget).is_err());
         assert!(server.write_timeout().unwrap().unwrap() <= budget);
@@ -2112,20 +2493,28 @@ mod tests {
     #[test]
     fn capture_runtime_takes_a_fresh_paint_and_refuses_trusted_mode() {
         let frame = temporary("capture-fb");
-        let framebuffer = crate::framebuffer::Framebuffer::test_file(&frame.0, 240, 600, 960)
-            .unwrap();
+        let framebuffer =
+            crate::framebuffer::Framebuffer::test_file(&frame.0, 240, 600, 960).unwrap();
         let runtime = Mutex::new(Runtime::headless(framebuffer, 7));
-        assert_eq!(answer(&runtime, "capture"), "error capture automation is disabled\n");
+        assert_eq!(
+            answer(&runtime, "capture"),
+            "error capture automation is disabled\n"
+        );
         let mut runtime = runtime.lock().unwrap();
         let ppm = runtime.capture_public_ppm().unwrap();
         assert!(ppm.starts_with(b"P6\n"));
         runtime.defer_repaint();
         runtime.fail_next_repaint();
-        assert!(runtime.capture_public_ppm().is_err(), "capture returned stale output");
+        assert!(
+            runtime.capture_public_ppm().is_err(),
+            "capture returned stale output"
+        );
         let later = runtime.capture_public_ppm().unwrap();
         assert_ne!(later, ppm, "a later capture reused the output identity");
-        assert_eq!(later.splitn(5, |b| *b == b'\n').last().unwrap(),
-            ppm.splitn(5, |b| *b == b'\n').last().unwrap());
+        assert_eq!(
+            later.splitn(5, |b| *b == b'\n').last().unwrap(),
+            ppm.splitn(5, |b| *b == b'\n').last().unwrap()
+        );
         runtime.enable_attention(true);
         assert!(runtime.capture_public_ppm().is_err());
         assert!(runtime.observe_output().is_err());
@@ -2141,7 +2530,12 @@ mod tests {
         for value in ["", "+1", "-1", "01", "00", "1 ", "18446744073709551616"] {
             assert!(decode_output_stamp(&format!("session={session} output={value}")).is_err());
         }
-        for value in ["", "1", "0123456789abcdef0123456789abcdeF00", "g123456789abcdef0123456789abcdef"] {
+        for value in [
+            "",
+            "1",
+            "0123456789abcdef0123456789abcdeF00",
+            "g123456789abcdef0123456789abcdef",
+        ] {
             assert!(decode_output_stamp(&format!("session={value} output=1")).is_err());
         }
         for ending in ["yes", "yes\r\n", "yes\n\n", "yes extra\n", "1\n"] {
@@ -2149,7 +2543,8 @@ mod tests {
         }
         assert!(decode_observation(&format!("session={session} output=0 current=yes\n")).is_err());
         for output in ["0", "+1", "18446744073709551616"] {
-            let reply = format!("ok\nP6\n# td-output-v1 session={session} output={output}\n1 1\n255\nabc");
+            let reply =
+                format!("ok\nP6\n# td-output-v1 session={session} output={output}\n1 1\n255\nabc");
             assert!(decode_capture(reply.as_bytes()).is_err());
         }
         assert!(Request::parse("observe extra").is_err());
@@ -2165,7 +2560,10 @@ mod tests {
         assert_eq!(example("<1-9>"), "1");
         assert_eq!(example("<@id>"), "@12");
         assert_eq!(example("<left|right|up|down>"), "left");
-        assert!(Request::parse("focus @12").is_ok(), "the id example is not one");
+        assert!(
+            Request::parse("focus @12").is_ok(),
+            "the id example is not one"
+        );
     }
 
     #[test]
@@ -2206,9 +2604,9 @@ mod tests {
         // most — nothing about a window suggests it is spelled `@12`.
         for verb in ["send", "focus", "move"] {
             assert!(
-                USAGE.iter().any(|(form, _)| {
-                    form.starts_with(verb) && form.contains("<@id>")
-                }),
+                USAGE
+                    .iter()
+                    .any(|(form, _)| { form.starts_with(verb) && form.contains("<@id>") }),
                 "the help text does not document the addressed '{verb}'"
             );
         }
@@ -2508,9 +2906,7 @@ mod tests {
             .and_then(|line| line.split_whitespace().nth(1))
             .and_then(|field| field.strip_prefix("id=@"))
             .and_then(|handle| handle.parse().ok())
-            .unwrap_or_else(|| {
-                panic!("no handle for {}:{} in\n{report}", key.client, key.object)
-            })
+            .unwrap_or_else(|| panic!("no handle for {}:{} in\n{report}", key.client, key.object))
     }
 
     #[test]
@@ -2774,7 +3170,10 @@ mod tests {
         }
         let report = layout_of(&runtime);
         let live = handle_of(&report, key);
-        assert_ne!(live, retired, "the replacement inherited a dead name:\n{report}");
+        assert_ne!(
+            live, retired,
+            "the replacement inherited a dead name:\n{report}"
+        );
 
         // Every verb, because each resolves the handle in its own arm.
         for order in [
@@ -3390,19 +3789,16 @@ mod tests {
         // number could not be told from a workspace without guessing which
         // the caller meant.
         assert_eq!(Request::parse("focus @5"), Ok(Request::FocusWindow(5)));
-        assert_eq!(Request::parse("focus left"), Ok(Request::Focus(Direction::Left)));
-        assert_eq!(Request::parse("send 3"), Ok(Request::Send(3)));
         assert_eq!(
-            Request::parse("send @5 3"),
-            Ok(Request::SendWindow(5, 3))
+            Request::parse("focus left"),
+            Ok(Request::Focus(Direction::Left))
         );
+        assert_eq!(Request::parse("send 3"), Ok(Request::Send(3)));
+        assert_eq!(Request::parse("send @5 3"), Ok(Request::SendWindow(5, 3)));
         assert_eq!(Request::parse("move up"), Ok(Request::Move(Direction::Up)));
         assert_eq!(
             Request::parse("move @5 up"),
-            Ok(Request::MoveWindow(
-                5,
-                Direction::Up
-            ))
+            Ok(Request::MoveWindow(5, Direction::Up))
         );
 
         // A bare number stays the workspace form, so the two cannot collide.
@@ -3524,7 +3920,10 @@ mod tests {
         // string, so a space in it would put the fields after it somewhere no
         // reader expects — the same objection `clean_title` answers, needing
         // a different answer because the position is different.
-        assert_eq!(clean_app_id(Some("org.mozilla.firefox")), "org.mozilla.firefox");
+        assert_eq!(
+            clean_app_id(Some("org.mozilla.firefox")),
+            "org.mozilla.firefox"
+        );
         assert_eq!(clean_app_id(None), "", "absent must be an empty value");
         assert_eq!(clean_app_id(Some("two words")), "two_words");
         assert_eq!(clean_app_id(Some("a\tb\nc")), "a_b_c");
@@ -3534,9 +3933,15 @@ mod tests {
         assert_eq!(clean_app_id(Some("a\u{2029}b")), "a_b");
         assert_eq!(clean_app_id(Some("a\u{202e}b")), "a_b");
         // Ordinary text in other scripts survives, as it must.
-        assert_eq!(clean_app_id(Some("организация.браузер")), "организация.браузер");
+        assert_eq!(
+            clean_app_id(Some("организация.браузер")),
+            "организация.браузер"
+        );
         // And it is bounded, like the title.
-        assert_eq!(clean_app_id(Some(&"x".repeat(500))).chars().count(), TITLE_LIMIT);
+        assert_eq!(
+            clean_app_id(Some(&"x".repeat(500))).chars().count(),
+            TITLE_LIMIT
+        );
     }
 
     #[test]
@@ -3589,15 +3994,11 @@ mod tests {
             object: 2,
         };
         let (runtime, _frame) = session_of(&[first, second]);
-        let report = match apply(
-            &mut runtime.lock().expect("runtime"),
-            Request::Layout,
-        )
-        .expect("layout")
-        {
-            Answer::Report(report) => report,
-            _ => panic!("layout did not answer with a report"),
-        };
+        let report =
+            match apply(&mut runtime.lock().expect("runtime"), Request::Layout).expect("layout") {
+                Answer::Report(report) => report,
+                _ => panic!("layout did not answer with a report"),
+            };
         assert!(
             report.starts_with("output width=240 height=600 windows=2\n"),
             "the count does not lead the report:\n{report}"
@@ -3625,15 +4026,11 @@ mod tests {
                 .set_application_id(window, "org.mozilla.firefox")
                 .expect("app id");
         }
-        let report = match apply(
-            &mut runtime.lock().expect("runtime"),
-            Request::Layout,
-        )
-        .expect("layout")
-        {
-            Answer::Report(report) => report,
-            _ => panic!("layout did not answer with a report"),
-        };
+        let report =
+            match apply(&mut runtime.lock().expect("runtime"), Request::Layout).expect("layout") {
+                Answer::Report(report) => report,
+                _ => panic!("layout did not answer with a report"),
+            };
         assert!(
             record_for(&report, handle_of(&report, window)).contains("app_id=org.mozilla.firefox "),
             "the report does not carry the client's own name:\n{report}"
@@ -3683,13 +4080,20 @@ mod tests {
         );
         // The WINDOW stayed where it was — a switch shows a workspace, it does
         // not carry anything to it.
-        assert!(report.contains("window id=@1 object=1:1 workspace=1 "), "{report}");
+        assert!(
+            report.contains("window id=@1 object=1:1 workspace=1 "),
+            "{report}"
+        );
         assert!(
             report.contains("visible=false"),
             "a window on another workspace is not on screen:\n{report}"
         );
         assert_eq!(
-            runtime.lock().expect("runtime").control_snapshot().active_workspace,
+            runtime
+                .lock()
+                .expect("runtime")
+                .control_snapshot()
+                .active_workspace,
             2
         );
 
@@ -3711,7 +4115,8 @@ mod tests {
             "sending a window carried the view with it:\n{report}"
         );
         assert!(
-            report.contains("window id=@1 object=1:1 workspace=3 ") && report.contains("visible=false"),
+            report.contains("window id=@1 object=1:1 workspace=3 ")
+                && report.contains("visible=false"),
             "the window did not go on without the view:\n{report}"
         );
 
@@ -3804,7 +4209,11 @@ mod tests {
         stream.read_to_string(&mut answer).expect("read");
         assert_eq!(answer, "error no such request 'dance'; try 'help'\n");
         assert_eq!(
-            runtime.lock().expect("runtime").control_snapshot().active_workspace,
+            runtime
+                .lock()
+                .expect("runtime")
+                .control_snapshot()
+                .active_workspace,
             1,
             "a refused request moved the session anyway"
         );
@@ -3812,12 +4221,18 @@ mod tests {
         // writes and shuts down is answered like one that terminates its line.
         let mut stream = UnixStream::connect(&socket.0).expect("connect");
         stream.write_all(b"workspace 2").expect("write");
-        stream.shutdown(std::net::Shutdown::Write).expect("shutdown");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown");
         let mut answer = String::new();
         stream.read_to_string(&mut answer).expect("read");
         assert_eq!(answer, "ok\n");
         assert_eq!(
-            runtime.lock().expect("runtime").control_snapshot().active_workspace,
+            runtime
+                .lock()
+                .expect("runtime")
+                .control_snapshot()
+                .active_workspace,
             2
         );
     }
@@ -4096,7 +4511,11 @@ mod tests {
             "a run of failed accepts buried the caller after it"
         );
         assert_eq!(
-            runtime.lock().expect("runtime").control_snapshot().active_workspace,
+            runtime
+                .lock()
+                .expect("runtime")
+                .control_snapshot()
+                .active_workspace,
             2
         );
 
@@ -4115,7 +4534,11 @@ mod tests {
             "the listener answered past its own bound"
         );
         assert_eq!(
-            runtime.lock().expect("runtime").control_snapshot().active_workspace,
+            runtime
+                .lock()
+                .expect("runtime")
+                .control_snapshot()
+                .active_workspace,
             2,
             "a caller past the bound was served anyway"
         );

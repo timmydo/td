@@ -183,7 +183,8 @@ mod tests {
 
     // A real init line, plus the two shapes that break naive parsers.
     const INIT: &str = "1 (init) S 0 1 1 0 -1 4194560 1234 0 0 0 12 34 0 0 20 0 1 0 5 0 0 0 0\n";
-    const SPACED: &str = "42 (my proc) R 1 42 42 1025 42 0 0 0 0 0 100 200 0 0 20 0 1 0 5 0 0 0 0\n";
+    const SPACED: &str =
+        "42 (my proc) R 1 42 42 1025 42 0 0 0 0 0 100 200 0 0 20 0 1 0 5 0 0 0 0\n";
     const PARENS: &str = "7 ((sd-pam)) S 1 7 7 0 -1 0 0 0 0 0 1 2 0 0 20 0 1 0 5 0 0 0 0\n";
 
     #[test]
@@ -243,7 +244,10 @@ mod tests {
 
     #[test]
     fn cmdline_nuls_become_spaces_and_kernel_threads_bracket() {
-        assert_eq!(command("/bin/sh\0-c\0echo hi\0", Some("sh")), "/bin/sh -c echo hi");
+        assert_eq!(
+            command("/bin/sh\0-c\0echo hi\0", Some("sh")),
+            "/bin/sh -c echo hi"
+        );
         assert_eq!(command("", Some("kthreadd")), "[kthreadd]");
         assert_eq!(command("\0\0", Some("kthreadd")), "[kthreadd]");
         assert_eq!(command("", None), "[?]");
@@ -290,7 +294,11 @@ mod tests {
             std::fs::write(d.join("cmdline"), cmdline).unwrap();
         }
         let rows = collect(&root.display().to_string()).unwrap();
-        assert_eq!(rows.len(), 2, "a non-UTF-8 comm must not hide a process from ps");
+        assert_eq!(
+            rows.len(),
+            2,
+            "a non-UTF-8 comm must not hide a process from ps"
+        );
         // `position` + index rather than the search combinator, whose name the
         // ladder guard bans in embedded step content.
         let odd = &rows[rows.iter().position(|p| p.pid == 2).unwrap()];
@@ -299,7 +307,11 @@ mod tests {
             "a userspace process with a non-UTF-8 cmdline was rendered as a kernel thread: {:?}",
             odd.cmd
         );
-        assert!(odd.cmd.contains("-v"), "cmdline arguments were lost: {:?}", odd.cmd);
+        assert!(
+            odd.cmd.contains("-v"),
+            "cmdline arguments were lost: {:?}",
+            odd.cmd
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -307,12 +319,20 @@ mod tests {
     #[test]
     fn collect_reads_the_live_process_table() {
         let rows = collect("/proc").unwrap();
-        assert!(rows.iter().any(|p| p.pid == 1), "PID 1 missing from the scan");
+        assert!(
+            rows.iter().any(|p| p.pid == 1),
+            "PID 1 missing from the scan"
+        );
         // Every row must be fully populated -- a blank command or a degraded state
         // means the stat parse silently fell back on a real kernel's /proc.
         for p in &rows {
             assert!(!p.cmd.is_empty(), "pid {} has an empty CMD", p.pid);
-            assert!(p.state.is_ascii_alphabetic(), "pid {} has state {:?}", p.pid, p.state);
+            assert!(
+                p.state.is_ascii_alphabetic(),
+                "pid {} has state {:?}",
+                p.pid,
+                p.state
+            );
         }
     }
 

@@ -35,9 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::ast::{AndOr, Cmd, List, Redir, RedirKind, Sep, Stage, Word};
-use crate::exec::{
-    self, Shell, Sig, EACCES, EEXIST, ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR, R,
-};
+use crate::exec::{self, Shell, Sig, EACCES, EEXIST, ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR, R};
 
 /// One entry in the shell's descriptor table. Everything shareable is behind an
 /// `Arc` so a subshell or pipeline stage inherits the same open file (and its
@@ -137,7 +135,9 @@ pub fn write_fd(sh: &Shell, fd: u32, bytes: &[u8]) -> std::io::Result<()> {
 /// longer in the table -- dash's `preverrout`.
 pub fn write_target(target: Option<&Fd>, bytes: &[u8]) -> std::io::Result<()> {
     match target {
-        Some(Fd::Inherit(0)) | Some(Fd::Closed) | None => Err(std::io::Error::other("bad file descriptor")),
+        Some(Fd::Inherit(0)) | Some(Fd::Closed) | None => {
+            Err(std::io::Error::other("bad file descriptor"))
+        }
         Some(Fd::Inherit(1)) => {
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
@@ -159,9 +159,7 @@ pub fn write_target(target: Option<&Fd>, bytes: &[u8]) -> std::io::Result<()> {
                 Err(std::io::Error::other("poisoned buffer"))
             }
         }
-        Some(Fd::ReadBuf(_)) => Err(std::io::Error::other(
-            "descriptor not open for writing",
-        )),
+        Some(Fd::ReadBuf(_)) => Err(std::io::Error::other("descriptor not open for writing")),
         Some(Fd::Null) => Ok(()),
     }
 }
@@ -232,11 +230,7 @@ pub fn read_byte(sh: &Shell, fd: u32) -> std::io::Result<Option<u8>> {
             cur.read(&mut one)?
         }
         Some(Fd::Null) => 0,
-        _ => {
-            return Err(std::io::Error::other(
-                "descriptor not open for reading",
-            ))
-        }
+        _ => return Err(std::io::Error::other("descriptor not open for reading")),
     };
     Ok(if n == 0 { None } else { Some(one[0]) })
 }
@@ -423,8 +417,9 @@ pub const SHELL_THREAD_STACK: usize = 8 * 1024 * 1024;
 /// harnesses as status 2 -- a status many of them assert.
 pub fn on_shell_stack<T: Send>(f: impl FnOnce() -> T + Send) -> std::io::Result<T> {
     std::thread::scope(|scope| {
-        let handle =
-            std::thread::Builder::new().stack_size(SHELL_THREAD_STACK).spawn_scoped(scope, f)?;
+        let handle = std::thread::Builder::new()
+            .stack_size(SHELL_THREAD_STACK)
+            .spawn_scoped(scope, f)?;
         match handle.join() {
             Ok(v) => Ok(v),
             Err(payload) => std::panic::resume_unwind(payload),
@@ -626,7 +621,12 @@ fn open_planned(sh: &mut Shell, plan: &Plan) -> R<Result<Opened, ()>> {
                 Cursor::new(text.into_bytes()),
             ))))))
         }
-        Plan::Read(name) => Ok(open_file(sh, name, OpenOptions::new().read(true), OpenKind::Read)),
+        Plan::Read(name) => Ok(open_file(
+            sh,
+            name,
+            OpenOptions::new().read(true),
+            OpenKind::Read,
+        )),
         Plan::Write(name) => Ok(truncating_open(sh, name, sh.opts.noclobber)),
         Plan::Clobber(name) => Ok(truncating_open(sh, name, false)),
         Plan::Append(name) => {
@@ -777,12 +777,7 @@ fn open_error(name: &str, kind: OpenKind, e: &std::io::Error) -> String {
     format!("{} {name}: {}", kind.verb(), kind.errmsg(e))
 }
 
-fn open_file(
-    sh: &mut Shell,
-    name: &str,
-    opts: &OpenOptions,
-    kind: OpenKind,
-) -> Result<Opened, ()> {
+fn open_file(sh: &mut Shell, name: &str, opts: &OpenOptions, kind: OpenKind) -> Result<Opened, ()> {
     if name == "/dev/null" {
         return Ok(Opened::To(Fd::Null));
     }
@@ -921,10 +916,14 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Stage]) -> R<()> {
             }
         };
         if let Some(stage) = stages.get_mut(i) {
-            stage.fds.set(1, Fd::File(Arc::new(File::from(OwnedFd::from(w)))));
+            stage
+                .fds
+                .set(1, Fd::File(Arc::new(File::from(OwnedFd::from(w)))));
         }
         if let Some(stage) = stages.get_mut(i + 1) {
-            stage.fds.set(0, Fd::File(Arc::new(File::from(OwnedFd::from(r)))));
+            stage
+                .fds
+                .set(0, Fd::File(Arc::new(File::from(OwnedFd::from(r)))));
         }
     }
 
@@ -957,9 +956,7 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Stage]) -> R<()> {
                         // A stage killed by a signal never reaches an EXIT trap,
                         // so this returns before `run_exit_trap` rather than
                         // through it.
-                        Err(Sig::Interrupt(code)) => {
-                            return Err(StageError::Interrupted(code))
-                        }
+                        Err(Sig::Interrupt(code)) => return Err(StageError::Interrupted(code)),
                         Err(_) => stage.status,
                     };
                     Ok(exec::run_exit_trap(&mut stage, status))
@@ -1135,12 +1132,10 @@ fn bare_redirected_compound(and_or: &AndOr) -> Option<(Cmd, Vec<Redir>, u32)> {
             // nothing — so `&` sees straight through it to what is inside. Only a
             // single sequential item: two would be an `NSEMI`, which does get
             // wrapped. Iterative because the nesting is the script's to choose.
-            Cmd::Group { body, redirs } if redirs.is_empty() => {
-                match body.items.as_slice() {
-                    [(inner, Sep::Seq)] => current = inner,
-                    _ => return None,
-                }
-            }
+            Cmd::Group { body, redirs } if redirs.is_empty() => match body.items.as_slice() {
+                [(inner, Sep::Seq)] => current = inner,
+                _ => return None,
+            },
             _ => break stage,
         }
     };
@@ -1298,7 +1293,8 @@ fn spawn_uninherited(sh: &mut Shell, cmd: &mut Command) -> std::io::Result<std::
         .chain(sh.sig_installed.iter().copied())
         .filter(|sig| !HELD.contains(sig))
         .collect();
-    let mut want: Vec<(u8, crate::sys::Disposition)> = Vec::with_capacity(HELD.len() + touched.len());
+    let mut want: Vec<(u8, crate::sys::Disposition)> =
+        Vec::with_capacity(HELD.len() + touched.len());
     for sig in HELD.iter().copied().chain(touched) {
         if want.iter().any(|(s, _)| *s == sig) || !crate::builtin::may_install(sh, sig) {
             continue;
@@ -1485,7 +1481,10 @@ struct UmaskScope {
 
 impl UmaskScope {
     fn capture() -> Self {
-        Self { mask: crate::sys::umask_get(), armed: true }
+        Self {
+            mask: crate::sys::umask_get(),
+            armed: true,
+        }
     }
 
     /// Stand down, for a clone that never changed the mask. Sequentially that is
@@ -1877,9 +1876,17 @@ pub fn open_procsub(sh: &mut Shell, code: &str, write: bool, line: u32) -> R<Str
         }
     };
     let (ours, theirs, theirs_at) = if write {
-        (File::from(OwnedFd::from(w)), File::from(OwnedFd::from(r)), 0)
+        (
+            File::from(OwnedFd::from(w)),
+            File::from(OwnedFd::from(r)),
+            0,
+        )
     } else {
-        (File::from(OwnedFd::from(r)), File::from(OwnedFd::from(w)), 1)
+        (
+            File::from(OwnedFd::from(r)),
+            File::from(OwnedFd::from(w)),
+            1,
+        )
     };
     let raw = ours.as_raw_fd();
     let mut child = fork_shell(sh);
@@ -2026,9 +2033,8 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String], arg0: Option<&str>) -> R<()
     // in-process clone (subshell, `&`, command substitution) would take the whole
     // script with it, and an in-process buffer has no kernel fd to hand over; both
     // run the command and exit instead, which is what the caller would have seen.
-    let buffered = (0..=2).any(|fd| {
-        matches!(sh.fds.get(fd), Some(Fd::ReadBuf(_)) | Some(Fd::WriteBuf(_)))
-    });
+    let buffered =
+        (0..=2).any(|fd| matches!(sh.fds.get(fd), Some(Fd::ReadBuf(_)) | Some(Fd::WriteBuf(_))));
     if sh.cloned || buffered {
         // A real `execve` replaces the image, taking the trap table with it, so the
         // emulation has to drop it too -- otherwise this shell runs an EXIT trap
@@ -2367,7 +2373,10 @@ pub struct Unresolved {
 
 impl Unresolved {
     fn new() -> Self {
-        Self { errno: ENOENT, regular: false }
+        Self {
+            errno: ENOENT,
+            regular: false,
+        }
     }
 
     fn saw(&mut self, meta: Result<&std::fs::Metadata, &std::io::Error>) {
@@ -2509,13 +2518,14 @@ pub fn run_capturing_interactive_units(units: &[&str]) -> (i32, String, String) 
         let status = sh.status;
         drop(sh);
         let text = |b: &Arc<Mutex<Vec<u8>>>| {
-            b.lock().map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default()
+            b.lock()
+                .map(|v| String::from_utf8_lossy(&v).into_owned())
+                .unwrap_or_default()
         };
         (status, text(&out), text(&err))
     })
     .expect("could not start the shell thread")
 }
-
 
 #[cfg(test)]
 mod thread_state {
@@ -2691,7 +2701,10 @@ mod tests {
         // Read direction: the body writes, the command that named it reads. The
         // redirection here is opened by the shell itself, so this needs no
         // external command.
-        assert_eq!(run("read line < <(echo hello); echo \"[$line]\""), (0, "[hello]\n".into(), String::new()));
+        assert_eq!(
+            run("read line < <(echo hello); echo \"[$line]\""),
+            (0, "[hello]\n".into(), String::new())
+        );
         // Write direction: the body READS what the command writes to it.
         assert_eq!(
             run("{ echo one; echo two; } > >(while read x; do echo \"[$x]\"; done)").1,
@@ -2702,10 +2715,18 @@ mod tests {
         // command rather than this shell. See `dev_fd_path`.
         let (_, out, _) = run("echo <(true)");
         let mine = format!("/proc/{}/fd/", std::process::id());
-        assert!(out.starts_with(&mine), "{out} does not name pid {}", std::process::id());
+        assert!(
+            out.starts_with(&mine),
+            "{out} does not name pid {}",
+            std::process::id()
+        );
         // An EMPTY body gets no pipe and no thread, and a path that cannot open.
         // ash prints `/dev/fd/-1` for `<( )` and fails ENOENT on reading it.
-        assert!(run("echo <( )").1.trim_end().ends_with("/fd/-1"), "{:?}", run("echo <( )").1);
+        assert!(
+            run("echo <( )").1.trim_end().ends_with("/fd/-1"),
+            "{:?}",
+            run("echo <( )").1
+        );
         assert_ne!(run("read line < <( )").0, 0);
     }
 
@@ -2717,12 +2738,18 @@ mod tests {
     #[test]
     fn an_unbounded_body_is_bounded_by_the_pipe_and_ended_by_the_close() {
         let run = crate::process::run_capturing;
-        assert_eq!(run("read line < <(while true; do echo x; done); echo \"[$line]\"").1, "[x]\n");
+        assert_eq!(
+            run("read line < <(while true; do echo x; done); echo \"[$line]\"").1,
+            "[x]\n"
+        );
         // And for one that outlives the command that named it, so its own
         // `drop` is what ends it: the end has to GO before the wait, or the
         // wait is for a body this shell is itself blocking. Nothing here ever
         // opens the path -- the body is blocked on a full pipe from the start.
-        assert_eq!(run("for f in <(while true; do echo x; done); do echo ok; done").1, "ok\n");
+        assert_eq!(
+            run("for f in <(while true; do echo x; done); do echo ok; done").1,
+            "ok\n"
+        );
     }
 
     /// The descriptor lives exactly as long as the COMMAND whose word named it,
@@ -2751,7 +2778,10 @@ mod tests {
             live
         })
         .expect("could not start the shell thread");
-        assert_eq!(live, 0, "the assignment's descriptor outlived the assignment");
+        assert_eq!(
+            live, 0,
+            "the assignment's descriptor outlived the assignment"
+        );
         // A `for` list's descriptor belongs to the `for`, so it outlives every
         // command in the body. TWO of them, so the second iteration proves that
         // closing at the end of the body's command closed only what that
@@ -2813,7 +2843,10 @@ mod tests {
         );
         // A SET, for the reason the `exec 3>` case above gives: the body writes
         // as soon as its `read` has data, not when the shell is finished.
-        assert_eq!(sorted_lines(&crate::process::run_capturing(src).1), ["A:hi", "done"]);
+        assert_eq!(
+            sorted_lines(&crate::process::run_capturing(src).1),
+            ["A:hi", "done"]
+        );
     }
 
     /// A loop that opens one per iteration must not accumulate them. Each entry
@@ -2878,7 +2911,10 @@ mod tests {
             kept
         })
         .expect("could not start the shell thread");
-        assert!(kept <= 40, "{kept} entries left after 200 conditional substitutions");
+        assert!(
+            kept <= 40,
+            "{kept} entries left after 200 conditional substitutions"
+        );
     }
 
     /// Where ash reads no substitution, so neither does this: the two guards are
@@ -2902,6 +2938,9 @@ mod tests {
     /// `/`, which is the whole of the difference.
     #[test]
     fn the_path_is_split_like_any_other_expansion() {
-        assert_eq!(crate::process::run_capturing("IFS=/; set -- <(true); echo $#").1, "5\n");
+        assert_eq!(
+            crate::process::run_capturing("IFS=/; set -- <(true); echo $#").1,
+            "5\n"
+        );
     }
 }

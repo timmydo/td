@@ -168,7 +168,9 @@ pub fn read(path: &str) -> (Vec<Entry>, Vec<String>) {
         if fs::symlink_metadata(path).is_ok() && !crate::control::dir_is_trusted(dir) {
             return (
                 Vec::new(),
-                vec![format!("{dir}: not ours or writable by others; ignoring the record in it")],
+                vec![format!(
+                    "{dir}: not ours or writable by others; ignoring the record in it"
+                )],
             );
         }
     }
@@ -199,7 +201,10 @@ mod tests {
         let entries = vec![entry(41, 900, 0, "sshd"), entry(42, 901, 1032, "greeter")];
         let (back, problems) = parse(STATE, &render(&entries));
         assert_eq!(back, entries, "the record did not survive a round trip");
-        assert!(problems.is_empty(), "a clean record complained: {problems:?}");
+        assert!(
+            problems.is_empty(),
+            "a clean record complained: {problems:?}"
+        );
     }
 
     /// The tty is carried, because it cannot be recovered.
@@ -259,7 +264,14 @@ mod tests {
     /// A name with no fields before it, a short line, a missing name.
     #[test]
     fn a_line_missing_a_field_is_not_half_read() {
-        for bad in ["41", "41 900", "41 900 0", "41 900 0 ", "x 900 0 a", "41 y 0 a"] {
+        for bad in [
+            "41",
+            "41 900",
+            "41 900 0",
+            "41 900 0 ",
+            "x 900 0 a",
+            "41 y 0 a",
+        ] {
             let (entries, _) = parse(STATE, bad);
             assert!(entries.is_empty(), "'{bad}' parsed into an entry");
         }

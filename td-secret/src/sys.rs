@@ -578,7 +578,10 @@ mod tests {
         control[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
         control[12..16].copy_from_slice(&99i32.to_ne_bytes());
         control[16..].fill(1);
-        assert_eq!(parse_fds(&control).unwrap_err(), "truncated ancillary header");
+        assert_eq!(
+            parse_fds(&control).unwrap_err(),
+            "truncated ancillary header"
+        );
     }
 
     fn tempfile(name: &str) -> File {

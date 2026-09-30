@@ -232,11 +232,7 @@ pub fn problems(message: &str, paths: &[String]) -> Vec<String> {
     // the human was actually asked, so what the gate CAN do is bound what a
     // waiver reaches: stacked ones get to "no reviews at all" in four extra
     // words, and a commit with two reviewers down is one to stop on anyway.
-    let reviewer_waivers = rec
-        .waivers
-        .iter()
-        .filter(|(s, _)| s != DOCS_ONLY)
-        .count();
+    let reviewer_waivers = rec.waivers.iter().filter(|(s, _)| s != DOCS_ONLY).count();
     if reviewer_waivers > 1 {
         out.push(format!(
             "{reviewer_waivers} reviewers waived at once — ask a human rather than record around it"
@@ -256,8 +252,11 @@ pub fn problems(message: &str, paths: &[String]) -> Vec<String> {
 
     if !docs_only {
         // Only a waiver that names its approver stands in for a review.
-        let waived =
-            |who: &str| rec.waivers.iter().any(|(s, r)| s == who && approver(r).is_some());
+        let waived = |who: &str| {
+            rec.waivers
+                .iter()
+                .any(|(s, r)| s == who && approver(r).is_some())
+        };
         let model_of = |who: &str| {
             rec.reviewers
                 .iter()
@@ -539,7 +538,8 @@ mod tests {
     /// missing review record nobody counts, so the batch fails closed instead.
     #[test]
     fn a_body_cannot_drop_or_forge_a_record() {
-        let out = format!("\x1e{A}\x1f{A}\x1fsubject\n\nbody with \x1e and \x1f in it\n\x1f\nsrc/a.rs\n");
+        let out =
+            format!("\x1e{A}\x1f{A}\x1fsubject\n\nbody with \x1e and \x1f in it\n\x1f\nsrc/a.rs\n");
         assert!(parse_commits(&out).is_none());
     }
 

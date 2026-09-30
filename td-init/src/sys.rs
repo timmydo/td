@@ -104,7 +104,15 @@ pub const REBOOT_POWER_OFF: usize = 0x4321_fedc;
 /// `reboot(2)`. On success the kernel does not return, so a returned `Ok` is
 /// itself an anomaly the caller reports.
 pub fn reboot(cmd: usize) -> io::Result<()> {
-    check(syscall5(SYS_REBOOT, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, cmd, 0, 0)).map(|_| ())
+    check(syscall5(
+        SYS_REBOOT,
+        LINUX_REBOOT_MAGIC1,
+        LINUX_REBOOT_MAGIC2,
+        cmd,
+        0,
+        0,
+    ))
+    .map(|_| ())
 }
 
 /// `sync(2)` — flush every filesystem before power-down. It cannot fail and has
@@ -178,7 +186,15 @@ pub const MNT_DETACH: usize = 0x2;
 /// `umount2(target, flags)`. `umount(2)` proper takes no flags and is a strict
 /// subset, so this one call serves both — `flags` of 0 IS `umount(2)`.
 pub fn umount(target: &CStr, flags: usize) -> io::Result<()> {
-    check(syscall5(SYS_UMOUNT2, target.as_ptr() as usize, flags, 0, 0, 0)).map(|_| ())
+    check(syscall5(
+        SYS_UMOUNT2,
+        target.as_ptr() as usize,
+        flags,
+        0,
+        0,
+        0,
+    ))
+    .map(|_| ())
 }
 
 /// `chroot(2)`.
@@ -447,10 +463,21 @@ mod tests {
         let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
         let mut buf = [0u8; TERMIOS_LEN];
         let got = termios_get(fd, &mut buf).unwrap_err();
-        assert_eq!(got.raw_os_error(), Some(ENOTTY), "the read did not reach the kernel");
-        assert_eq!(buf, [0u8; TERMIOS_LEN], "a failed read must not have written");
+        assert_eq!(
+            got.raw_os_error(),
+            Some(ENOTTY),
+            "the read did not reach the kernel"
+        );
+        assert_eq!(
+            buf, [0u8; TERMIOS_LEN],
+            "a failed read must not have written"
+        );
         let set = termios_set(fd, &buf).unwrap_err();
-        assert_eq!(set.raw_os_error(), Some(ENOTTY), "the write did not reach the kernel");
+        assert_eq!(
+            set.raw_os_error(),
+            Some(ENOTTY),
+            "the write did not reach the kernel"
+        );
     }
 
     /// The roster is enforced in CODE, so an off-roster request is refused

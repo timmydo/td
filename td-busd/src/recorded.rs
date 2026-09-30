@@ -593,7 +593,11 @@ recording nothing replays"
             .collect::<Vec<_>>()
             .join("\n");
         let stripped = parse(first.file, &serverless).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(guid_of(&stripped), "", "a guid survived the daemon's removal");
+        assert_eq!(
+            guid_of(&stripped),
+            "",
+            "a guid survived the daemon's removal"
+        );
         assert!(split_server(&stripped).0.is_empty());
 
         // ...and the golden comparison must discriminate. If a corrupted

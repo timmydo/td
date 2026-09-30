@@ -327,9 +327,7 @@ pub fn validate_application_name(name: &str) -> Result<(), String> {
 pub fn validate_application_identity(name: &str) -> Result<(), String> {
     validate_application_name(name)?;
     if RESERVED_APPLICATION_NAMES.contains(&name) {
-        return Err(format!(
-            "application name {name:?} is reserved by td-jail"
-        ));
+        return Err(format!("application name {name:?} is reserved by td-jail"));
     }
     Ok(())
 }

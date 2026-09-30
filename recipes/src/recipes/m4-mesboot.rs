@@ -1,4 +1,4 @@
-use crate::ladder::{SH, mesboot0_inputs, mesboot0_path, unpack_into};
+use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, SH};
 use crate::types::{Recipe, Step};
 
 // GNU M4 1.4.19 — the macro processor the glibc rungs need (re #469): `bison`

@@ -49,17 +49,13 @@ pub(crate) fn covering(mounts: &str, path: &str) -> Option<Filesystem> {
     for line in mounts.lines() {
         let mut fields = line.split(' ');
         // <source> <point> <fstype> <options> <dump> <pass>
-        let (_source, point, fstype, options) = match (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-        ) {
-            (Some(source), Some(point), Some(fstype), Some(options)) => {
-                (source, point, fstype, options)
-            }
-            _ => continue,
-        };
+        let (_source, point, fstype, options) =
+            match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                (Some(source), Some(point), Some(fstype), Some(options)) => {
+                    (source, point, fstype, options)
+                }
+                _ => continue,
+            };
         let point = unescape(point);
         if !covers(&point, path) {
             continue;
@@ -192,7 +188,10 @@ tmpfs /run tmpfs rw,relatime,mode=755 0 0\n";
 /dev/vda /var btrfs rw,relatime 0 0\n\
 tmpfs /var tmpfs rw,relatime 0 0\n";
         let fs = covering(stacked, "/var/lib/td").unwrap();
-        assert_eq!(fs.fstype, "tmpfs", "the visible /var is the last one mounted");
+        assert_eq!(
+            fs.fstype, "tmpfs",
+            "the visible /var is the last one mounted"
+        );
     }
 
     #[test]
@@ -233,7 +232,10 @@ tmpfs /var tmpfs rw,relatime 0 0\n";
         let initramfs = "rootfs / rootfs rw 0 0\n";
         let fs = covering(initramfs, "/var/lib/td").unwrap();
         assert_eq!(fs.point, "/");
-        assert!(fs.writable, "the initramfs root IS writable, which is the trap");
+        assert!(
+            fs.writable,
+            "the initramfs root IS writable, which is the trap"
+        );
         assert!(fs.volatile(), "provisioning onto RAM must be refused");
     }
 

@@ -79,8 +79,7 @@ pub const MAX_INSTANCE_NAME: usize = 64;
 /// gone: what bounds a message is the codec refusing an oversized body or
 /// field array, and a second check that cannot fire is a dead branch shaped
 /// like a safety check.
-pub const MAX_MESSAGE: usize = (message::HEADER_LEN
-    + message::MAX_HEADER_FIELDS_BYTES as usize)
+pub const MAX_MESSAGE: usize = (message::HEADER_LEN + message::MAX_HEADER_FIELDS_BYTES as usize)
     .next_multiple_of(8)
     + message::MAX_BODY_BYTES as usize;
 
@@ -518,10 +517,7 @@ impl Quota {
     /// Reserve a global place before doing a lineage walk. The provisional
     /// per-pid share makes reconnect refusal cheap for one process; the
     /// instance share is enforced by `Reservation::admit` after resolution.
-    pub fn try_reserve(
-        self: &std::sync::Arc<Self>,
-        pid: i32,
-    ) -> Result<Reservation, String> {
+    pub fn try_reserve(self: &std::sync::Arc<Self>, pid: i32) -> Result<Reservation, String> {
         let mut live = self
             .live
             .lock()
@@ -549,8 +545,7 @@ impl Quota {
     }
 
     pub fn admission_succeeded(&self) {
-        self.refused
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.refused.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn admission_refused(&self) -> usize {
@@ -586,17 +581,19 @@ impl Quota {
         key: &AdmissionKey,
         count: usize,
     ) -> Result<FreightCharge, DescriptorRefusal> {
-        let share = DescriptorCharge::take(freight, count, MAX_QUEUED_FDS_PER_INSTANCE)
-            .map_err(|held| DescriptorRefusal::OverShare {
+        let share = DescriptorCharge::take(freight, count, MAX_QUEUED_FDS_PER_INSTANCE).map_err(
+            |held| DescriptorRefusal::OverShare {
                 key: key.clone(),
                 wanted: held.saturating_add(count),
-            })?;
+            },
+        )?;
         // The share was taken first, so a refusal here drops it on the way
         // out and a refusal charges nothing anywhere.
-        let bus = DescriptorCharge::take(&self.queued_fds, count, MAX_QUEUED_FDS_TOTAL)
-            .map_err(|held| DescriptorRefusal::OverBus {
+        let bus = DescriptorCharge::take(&self.queued_fds, count, MAX_QUEUED_FDS_TOTAL).map_err(
+            |held| DescriptorRefusal::OverBus {
                 wanted: held.saturating_add(count),
-            })?;
+            },
+        )?;
         Ok(FreightCharge { bus, share })
     }
 
@@ -867,9 +864,10 @@ impl Drop for Connection<'_> {
                 .body("s", |writer| {
                     writer.string("the peer this call was sent to disconnected")
                 });
-                if let Ok(frame) = built.map_err(|_| ()).and_then(|built| {
-                    built.encode().map_err(|_| ())
-                }) {
+                if let Ok(frame) = built
+                    .map_err(|_| ())
+                    .and_then(|built| built.encode().map_err(|_| ()))
+                {
                     // Through `deliver`, so §D's bus remedy runs here too. A
                     // draft pushed straight to the outbox, which is the same
                     // mistake `deliver` is documented against: during a mass
@@ -1224,9 +1222,10 @@ impl<'a> Connection<'a> {
             Err(refusal) => {
                 let (charge, relieved) = charge_under_pressure(
                     refusal,
-                    || self
-                        .quota
-                        .charge_freight(&self.freight_share, &self.key, arrived),
+                    || {
+                        self.quota
+                            .charge_freight(&self.freight_share, &self.key, arrived)
+                    },
                     || self.bus.relieve_largest_descriptors(),
                 );
                 if relieved != 0 {
@@ -1241,11 +1240,9 @@ impl<'a> Connection<'a> {
         // both draw on the counters this connection kept. A different Arc
         // means an internal ownership invariant was broken; it is not peer
         // input.
-        self.freight_charge
-            .absorb(charge)
-            .map_err(|_| {
-                Ended::Failed("descriptor charges came from different buses or keys".into())
-            })?;
+        self.freight_charge.absorb(charge).map_err(|_| {
+            Ended::Failed("descriptor charges came from different buses or keys".into())
+        })?;
         Ok(())
     }
 
@@ -1461,8 +1458,10 @@ impl<'a> Connection<'a> {
             // Hello", which is what a peer got when it sent a `Hello` this
             // broker did not recognise AS one.
             let what = match message.fields.member {
-                Some("Hello") => "a Hello that is not org.freedesktop.DBus.Hello \
-                                  at /org/freedesktop/DBus",
+                Some("Hello") => {
+                    "a Hello that is not org.freedesktop.DBus.Hello \
+                                  at /org/freedesktop/DBus"
+                }
                 Some(member) => member,
                 None => "a message",
             };
@@ -1501,9 +1500,7 @@ impl<'a> Connection<'a> {
         let outcome = match message.fields.destination {
             Some(BUS_NAME) | None if is_hello => self.say_hello(&message, wants_reply),
             Some(BUS_NAME) => self.bus_method(&message, wants_reply),
-            Some(destination) => {
-                self.route(&message, destination, wants_reply, descriptors.take())
-            }
+            Some(destination) => self.route(&message, destination, wants_reply, descriptors.take()),
             // No DESTINATION and not `Hello`. A SIGNAL without one is a
             // broadcast and is selected by each recipient's installed match
             // rules. A method CALL without one is the opposite case: the
@@ -1696,10 +1693,8 @@ impl<'a> Connection<'a> {
                 _ => Ok(()),
             };
         }
-        let match_method = matches!(member, "AddMatch" | "RemoveMatch")
-            && is_call
-            && here
-            && on(BUS_NAME);
+        let match_method =
+            matches!(member, "AddMatch" | "RemoveMatch") && is_call && here && on(BUS_NAME);
         if match_method {
             return self.change_match(message, member == "AddMatch", wants_reply);
         }
@@ -1955,12 +1950,7 @@ impl<'a> Connection<'a> {
             // A registrant that asked for no reply has still registered; it
             // simply cannot use what it did not wait for.
             Ok(_) => Ok(()),
-            Err(why) => self.refuse_if_wanted(
-                message,
-                "td.Jail1.Error.Refused",
-                &why,
-                wants_reply,
-            ),
+            Err(why) => self.refuse_if_wanted(message, "td.Jail1.Error.Refused", &why, wants_reply),
         }
     }
 
@@ -1994,21 +1984,13 @@ impl<'a> Connection<'a> {
                 wants_reply,
             );
         };
-        match self.instances.complete(
-            &RealProcfs,
-            &token,
-            pid,
-            self.credential.uid,
-            completer,
-        ) {
+        match self
+            .instances
+            .complete(&RealProcfs, &token, pid, self.credential.uid, completer)
+        {
             Ok(()) if wants_reply => self.answer(message, "", |_| Ok(())),
             Ok(()) => Ok(()),
-            Err(why) => self.refuse_if_wanted(
-                message,
-                "td.Jail1.Error.Refused",
-                &why,
-                wants_reply,
-            ),
+            Err(why) => self.refuse_if_wanted(message, "td.Jail1.Error.Refused", &why, wants_reply),
         }
     }
 
@@ -2168,11 +2150,7 @@ impl<'a> Connection<'a> {
     /// ADDRESSED, and a connection that has not yet said `Hello` has no name
     /// to address it to. Its arguments are ignored, which is what every other
     /// implementation does with them.
-    fn takes(
-        &mut self,
-        message: &message::Message<'_>,
-        signature: &str,
-    ) -> Result<bool, Ended> {
+    fn takes(&mut self, message: &message::Message<'_>, signature: &str) -> Result<bool, Ended> {
         if message.fields.signature.unwrap_or("") == signature {
             return Ok(true);
         }
@@ -2346,9 +2324,9 @@ impl<'a> Connection<'a> {
                 "this connection has reached its match-rule ceiling",
                 wants_reply,
             ),
-            Err(crate::registry::MatchChange::NoSuchPeer) => {
-                Err(Ended::Failed("the named connection vanished from its bus".into()))
-            }
+            Err(crate::registry::MatchChange::NoSuchPeer) => Err(Ended::Failed(
+                "the named connection vanished from its bus".into(),
+            )),
         }
     }
 
@@ -2499,9 +2477,7 @@ impl<'a> Connection<'a> {
             return Ok(None);
         }
         match message.args().first().and_then(crate::wire::Value::as_str) {
-            Some(text) if crate::name::valid_well_known_name(text) => {
-                Ok(Some(text.to_string()))
-            }
+            Some(text) if crate::name::valid_well_known_name(text) => Ok(Some(text.to_string())),
             _ => {
                 self.refuse_if_wanted(
                     message,
@@ -2857,9 +2833,10 @@ impl<'a> Connection<'a> {
         };
         let mut names = Vec::with_capacity(values.len());
         for value in &values {
-            let Some(name) = value.as_str().filter(|name| {
-                crate::name::valid_well_known_name(name)
-            }) else {
+            let Some(name) = value
+                .as_str()
+                .filter(|name| crate::name::valid_well_known_name(name))
+            else {
                 self.refuse_if_wanted(
                     message,
                     "org.freedesktop.DBus.Error.InvalidArgs",
@@ -2967,16 +2944,12 @@ impl<'a> Connection<'a> {
                 continue;
             };
             let serial = outbox.take_serial();
-            let built = message::Builder::signal(
-                crate::wire::Endian::Little,
-                BUS_PATH,
-                BUS_NAME,
-                member,
-            )
-            .sender(BUS_NAME)
-            .destination(unique)
-            .serial(serial)
-            .body("s", |writer| writer.string(&handover.name));
+            let built =
+                message::Builder::signal(crate::wire::Endian::Little, BUS_PATH, BUS_NAME, member)
+                    .sender(BUS_NAME)
+                    .destination(unique)
+                    .serial(serial)
+                    .body("s", |writer| writer.string(&handover.name));
             let Ok(frame) = built
                 .map_err(|_| ())
                 .and_then(|built| built.encode().map_err(|_| ()))
@@ -3093,9 +3066,7 @@ impl<'a> Connection<'a> {
             // broadcast fired. Its loss is expected backpressure, not a line
             // per subsequent signal in the broker journal.
             let frame = match descriptors.as_ref() {
-                Some(descriptors) => {
-                    QueuedFrame::carrying(forwarded.clone(), descriptors.clone())
-                }
+                Some(descriptors) => QueuedFrame::carrying(forwarded.clone(), descriptors.clone()),
                 None => QueuedFrame::plain(forwarded.clone()),
             };
             let _ = self.deliver_frame(&subscriber.outbox, frame);
@@ -3171,21 +3142,13 @@ impl<'a> Connection<'a> {
             // decoder has already taken would be a branch shaped like a check
             // that never runs, and `restamp` rejects the message afterwards
             // in any event.
-            Some(serial) => self
-                .bus
-                .claim_reply(self.named()?, destination, serial),
+            Some(serial) => self.bus.claim_reply(self.named()?, destination, serial),
             None => {
-                let direct = policy::may_talk(
-                    &self.identity,
-                    self.unique.as_deref(),
-                    destination,
-                );
+                let direct = policy::may_talk(&self.identity, self.unique.as_deref(), destination);
                 let permitted = direct
-                    || self.bus.may_talk(
-                        &self.identity,
-                        self.unique.as_deref(),
-                        destination,
-                    );
+                    || self
+                        .bus
+                        .may_talk(&self.identity, self.unique.as_deref(), destination);
                 permitted
                     && (message.kind != message::MessageType::Signal
                         || policy::may_signal(&self.identity))
@@ -3217,16 +3180,13 @@ impl<'a> Connection<'a> {
         } else if reply.is_some() {
             self.bus.route(destination)
         } else if recorded {
-            match self
-                .bus
-                .route_expecting(
-                    destination,
-                    self.named()?,
-                    message.serial,
-                    &self.identity,
-                    self.unique.as_deref(),
-                )
-            {
+            match self.bus.route_expecting(
+                destination,
+                self.named()?,
+                message.serial,
+                &self.identity,
+                self.unique.as_deref(),
+            ) {
                 Routing::Ready(outbox) => Some(outbox),
                 Routing::Absent => None,
                 Routing::TooMany => {
@@ -3409,11 +3369,7 @@ impl<'a> Connection<'a> {
 
     /// The same message with the broker's SENDER on it and nothing else
     /// changed.
-    fn restamp(
-        &self,
-        message: &message::Message<'_>,
-        sender: &str,
-    ) -> Result<Vec<u8>, String> {
+    fn restamp(&self, message: &message::Message<'_>, sender: &str) -> Result<Vec<u8>, String> {
         // Every field taken here is one `message.rs` already refused the
         // message for lacking, so none of these can be absent. A draft wrote
         // `unwrap_or` at each of them, which reads as a default and is not
@@ -3427,7 +3383,12 @@ impl<'a> Connection<'a> {
                 else {
                     return Err(missing());
                 };
-                message::Builder::method_call(message.endian, path, message.fields.interface, member)
+                message::Builder::method_call(
+                    message.endian,
+                    path,
+                    message.fields.interface,
+                    member,
+                )
             }
             message::MessageType::Signal => {
                 let (Some(path), Some(interface), Some(member)) = (
@@ -3460,7 +3421,10 @@ impl<'a> Connection<'a> {
                 return Err("an unknown message type reached the relay".into());
             }
         };
-        builder = builder.sender(sender).serial(message.serial).flags(message.flags);
+        builder = builder
+            .sender(sender)
+            .serial(message.serial)
+            .flags(message.flags);
         if let Some(destination) = message.fields.destination {
             builder = builder.destination(destination);
         }
@@ -3514,11 +3478,7 @@ impl<'a> Connection<'a> {
 
     /// Append bytes and any descriptor ownership to an outbox, applying the
     /// same bus-level remedy as a broker-originated plain frame.
-    fn deliver_frame(
-        &self,
-        outbox: &Arc<Outbox>,
-        frame: QueuedFrame,
-    ) -> Result<(), Overflow> {
+    fn deliver_frame(&self, outbox: &Arc<Outbox>, frame: QueuedFrame) -> Result<(), Overflow> {
         let rejected = match outbox.push_frame(frame) {
             Ok(()) => return Ok(()),
             Err(rejected) => rejected,
@@ -3572,7 +3532,6 @@ impl<'a> Connection<'a> {
     fn take_serial(&self) -> u32 {
         self.outbox.take_serial()
     }
-
 }
 
 /// Is this message addressed to the broker's own object?
@@ -3720,8 +3679,7 @@ pub fn probe(path: &Path, uid: u32) -> Result<String, String> {
 fn connect_within(path: &Path, timeout: std::time::Duration) -> Result<UnixStream, String> {
     let owned = path.to_path_buf();
     connect_by(path, timeout, move || {
-        UnixStream::connect(&owned)
-            .map_err(|error| format!("connect {}: {error}", owned.display()))
+        UnixStream::connect(&owned).map_err(|error| format!("connect {}: {error}", owned.display()))
     })
 }
 
@@ -3771,11 +3729,7 @@ where
 
 /// `probe` with the wait as an argument, so a test can prove the timeout
 /// exists without spending `PROBE_TIMEOUT` to do it.
-fn probe_within(
-    path: &Path,
-    uid: u32,
-    timeout: std::time::Duration,
-) -> Result<String, String> {
+fn probe_within(path: &Path, uid: u32, timeout: std::time::Duration) -> Result<String, String> {
     let (_, _, guid) = authenticate_probe(path, uid, timeout)?;
     Ok(format!("bus at {} answered OK {guid}", path.display()))
 }
@@ -3882,7 +3836,9 @@ fn probe_read_exact(
     while !bytes.is_empty() {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
-            return Err(format!("read {what}: the bus identity probe exceeded its deadline"));
+            return Err(format!(
+                "read {what}: the bus identity probe exceeded its deadline"
+            ));
         }
         stream
             .set_read_timeout(Some(left))
@@ -3921,7 +3877,9 @@ fn probe_write_all(
     while !bytes.is_empty() {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
-            return Err(format!("write {what}: the bus identity probe exceeded its deadline"));
+            return Err(format!(
+                "write {what}: the bus identity probe exceeded its deadline"
+            ));
         }
         stream
             .set_write_timeout(Some(left))
@@ -3951,7 +3909,12 @@ fn probe_write_all(
 
 fn probe_frame(stream: &mut UnixStream, deadline: std::time::Instant) -> Result<Vec<u8>, String> {
     let mut frame = vec![0_u8; message::HEADER_LEN];
-    probe_read_exact(stream, deadline, &mut frame, "identity-probe message header")?;
+    probe_read_exact(
+        stream,
+        deadline,
+        &mut frame,
+        "identity-probe message header",
+    )?;
     let total = message::frame_len(&frame)
         .map_err(|error| format!("decode identity-probe message length: {error}"))?
         .ok_or_else(|| "identity-probe message has no complete header".to_string())?;
@@ -4031,9 +3994,7 @@ fn probe_list_names_reply(
         let Some(name) = value.as_str() else {
             return Err("ListNames reply has a non-string name".into());
         };
-        if !(crate::name::valid_unique_name(name)
-            || crate::name::valid_well_known_name(name))
-        {
+        if !(crate::name::valid_unique_name(name) || crate::name::valid_well_known_name(name)) {
             return Err("ListNames reply has an invalid bus name".into());
         }
         if !distinct.insert(name.to_string()) {
@@ -4144,7 +4105,11 @@ fn probe_credentials_reply(
             "UnixUserID" | "ProcessID" | "td.AppId" => {
                 return Err(format!("GetConnectionCredentials has a mistyped {key}"));
             }
-            _ => return Err(format!("GetConnectionCredentials has an unknown key {key:?}")),
+            _ => {
+                return Err(format!(
+                    "GetConnectionCredentials has an unknown key {key:?}"
+                ))
+            }
         }
     }
     let uid = uid.ok_or_else(|| "GetConnectionCredentials omitted UnixUserID".to_string())?;
@@ -4190,7 +4155,9 @@ fn application_probe_subject(
     if observer != policy.owner() {
         return Err("application evidence requires the human session observer".into());
     }
-    policy.for_name(app_id).map(|rule| rule.uid)
+    policy
+        .for_name(app_id)
+        .map(|rule| rule.uid)
         .ok_or_else(|| "application evidence requires an installed application".into())
 }
 
@@ -4267,11 +4234,9 @@ fn probe_application_within(
         .encode()
         .map_err(|error| format!("encode application-probe call: {error}"))?;
         probe_call(&mut stream, deadline, &credentials)?;
-        let Some(credentials) = probe_credentials_reply(
-            &probe_frame(&mut stream, deadline)?,
-            serial,
-            &hello,
-        )? else {
+        let Some(credentials) =
+            probe_credentials_reply(&probe_frame(&mut stream, deadline)?, serial, &hello)?
+        else {
             serial = serial
                 .checked_add(1)
                 .ok_or_else(|| "application-probe serial overflow".to_string())?;
@@ -4320,10 +4285,7 @@ pub fn loopback(uid: u32) -> Result<String, String> {
     // one at a time.
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "td-busd-selftest-{}-{nth}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("td-busd-selftest-{}-{nth}", std::process::id()));
     fs::create_dir_all(&dir).map_err(|error| format!("cannot make {}: {error}", dir.display()))?;
     let path = dir.join("bus");
     let outcome = loopback_at(&path, uid);
@@ -4334,7 +4296,8 @@ pub fn loopback(uid: u32) -> Result<String, String> {
 }
 
 fn loopback_at(path: &Path, uid: u32) -> Result<String, String> {
-    let bound = bind(path).map_err(|error| format!("cannot listen on {}: {error}", path.display()))?;
+    let bound =
+        bind(path).map_err(|error| format!("cannot listen on {}: {error}", path.display()))?;
     let text = guid_text().map_err(|error| format!("cannot make a guid: {error}"))?;
     let guid = Guid::new(&text).map_err(|error| format!("bad guid: {error:?}"))?;
 
@@ -4365,8 +4328,7 @@ fn loopback_at(path: &Path, uid: u32) -> Result<String, String> {
                     Ok((stream, _)) => {
                         let bus = Bus::new();
                         let instances = Instances::new();
-                        let accepted =
-                            Connection::accept(stream, guid, &quota, &bus, &instances);
+                        let accepted = Connection::accept(stream, guid, &quota, &bus, &instances);
                         if let Ok(mut connection) = accepted {
                             let _ = connection.serve();
                         }
@@ -5032,7 +4994,11 @@ mod tests {
                 lines: if descriptors { 2 } else { 1 },
                 deferred: Vec::new(),
             };
-            let negotiate = if descriptors { "NEGOTIATE_UNIX_FD\r\n" } else { "" };
+            let negotiate = if descriptors {
+                "NEGOTIATE_UNIX_FD\r\n"
+            } else {
+                ""
+            };
             let mut opening =
                 format!("\0AUTH EXTERNAL {}\r\n{negotiate}BEGIN\r\n", uid_hex()).into_bytes();
             opening.extend_from_slice(&bus_call("Hello", 1));
@@ -5055,8 +5021,7 @@ mod tests {
             // what makes this connection routable enough to be told anything
             // — happens after that reply is queued.
             let frame = peer.frame();
-            let (gained, _) =
-                message::decode(&frame, 0).expect("decode the arrival announcement");
+            let (gained, _) = message::decode(&frame, 0).expect("decode the arrival announcement");
             assert_eq!(
                 (
                     gained.kind,
@@ -5081,8 +5046,7 @@ mod tests {
             // connection's own owner both waits for that and asserts it.
             peer.send(&name_query("GetNameOwner", &name, ARRIVAL_BARRIER));
             let frame = peer.frame();
-            let (settled, _) =
-                message::decode(&frame, 0).expect("decode the arrival barrier");
+            let (settled, _) = message::decode(&frame, 0).expect("decode the arrival barrier");
             // Type and sender as well as serial: a reply serial names nothing
             // on its own, since any peer may route a method return carrying
             // one.
@@ -5132,8 +5096,8 @@ mod tests {
                         break;
                     }
                     let frame: Vec<u8> = self.held.drain(..length).collect();
-                    let available = u32::try_from(freight.len())
-                        .expect("the test descriptor count fits u32");
+                    let available =
+                        u32::try_from(freight.len()).expect("the test descriptor count fits u32");
                     let (decoded, _) = message::decode(&frame, available)
                         .expect("decode the descriptor-bearing frame");
                     let declared = usize::try_from(decoded.fields.unix_fds.unwrap_or(0))
@@ -5150,7 +5114,10 @@ mod tests {
                     .extend_from_slice(chunk.get(..received.count).unwrap_or(&[]));
                 freight.extend(received.fds);
             }
-            assert!(freight.is_empty(), "descriptors arrived without a requested frame");
+            assert!(
+                freight.is_empty(),
+                "descriptors arrived without a requested frame"
+            );
             frames
         }
 
@@ -5270,11 +5237,16 @@ mod tests {
 
     /// A method call addressed to the broker itself.
     fn bus_call(member: &str, serial: u32) -> Vec<u8> {
-        message::Builder::method_call(crate::wire::Endian::Little, BUS_PATH, Some(BUS_NAME), member)
-            .destination(BUS_NAME)
-            .serial(serial)
-            .encode()
-            .expect("encode a bus call")
+        message::Builder::method_call(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            Some(BUS_NAME),
+            member,
+        )
+        .destination(BUS_NAME)
+        .serial(serial)
+        .encode()
+        .expect("encode a bus call")
     }
 
     fn match_call(member: &str, rule: &str, serial: u32) -> Vec<u8> {
@@ -5429,8 +5401,7 @@ mod tests {
     /// of them keeps checking that the announcement is where this says it is.
     fn takes_its_name(peer: &mut Peer) -> String {
         let frame = peer.frame();
-        let (gained, _) =
-            message::decode(&frame, 0).expect("decode the arrival announcement");
+        let (gained, _) = message::decode(&frame, 0).expect("decode the arrival announcement");
         assert_eq!(
             (gained.kind, gained.fields.sender, gained.fields.member),
             (
@@ -5463,8 +5434,7 @@ mod tests {
     /// The same, handing back the registry it registers into.
     fn registering_peer_watching() -> (Peer, mpsc::Receiver<Outcome>, Arc<Instances>) {
         let (mut client, hear, instances) = serving_watching();
-        let mut opening =
-            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
         opening.extend_from_slice(&bus_call("Hello", 1));
         client.write_all(&opening).expect("write");
         let mut peer = Peer {
@@ -5480,17 +5450,22 @@ mod tests {
 
     /// `RequestName(name, flags)`.
     fn request_name(name: &str, flags: u32, serial: u32) -> Vec<u8> {
-        message::Builder::method_call(crate::wire::Endian::Little, BUS_PATH, Some(BUS_NAME), "RequestName")
-            .destination(BUS_NAME)
-            .serial(serial)
-            .body("su", |writer| {
-                writer.string(name)?;
-                writer.uint32(flags);
-                Ok(())
-            })
-            .expect("body")
-            .encode()
-            .expect("encode a RequestName")
+        message::Builder::method_call(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            Some(BUS_NAME),
+            "RequestName",
+        )
+        .destination(BUS_NAME)
+        .serial(serial)
+        .body("su", |writer| {
+            writer.string(name)?;
+            writer.uint32(flags);
+            Ok(())
+        })
+        .expect("body")
+        .encode()
+        .expect("encode a RequestName")
     }
 
     /// `StartServiceByName(name, flags)`.
@@ -5528,7 +5503,11 @@ mod tests {
             reply.fields.error_name
         );
         (
-            reply.args().first().and_then(crate::wire::Value::as_u32).unwrap_or(0),
+            reply
+                .args()
+                .first()
+                .and_then(crate::wire::Value::as_u32)
+                .unwrap_or(0),
             reply.fields.reply_serial,
         )
     }
@@ -5641,8 +5620,7 @@ mod tests {
     #[test]
     fn registration_takes_two_calls_over_the_bus() {
         let (mut client, _hear) = serving();
-        let mut opening =
-            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
         opening.extend_from_slice(&bus_call("Hello", 1));
         opening.extend_from_slice(&register_call("fixture", "fixture", 2));
         client.write_all(&opening).expect("write");
@@ -5752,8 +5730,7 @@ mod tests {
         .encode()
         .expect("encode");
 
-        let mut opening =
-            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
         opening.extend_from_slice(&bus_call("Hello", 1));
         opening.extend_from_slice(&shout);
         client.write_all(&opening).expect("write");
@@ -5806,8 +5783,7 @@ mod tests {
         .encode()
         .expect("encode");
 
-        let mut opening =
-            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
         opening.extend_from_slice(&bus_call("Hello", 1));
         opening.extend_from_slice(&quiet);
         client.write_all(&opening).expect("write");
@@ -5917,8 +5893,7 @@ mod tests {
         let held = child.stdin.take();
 
         let (mut client, _hear) = serving();
-        let mut opening =
-            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
         opening.extend_from_slice(&bus_call("Hello", 1));
         opening.extend_from_slice(&register_call("real", "fixture", 2));
         client.write_all(&opening).expect("write");
@@ -6066,9 +6041,9 @@ mod tests {
         }
 
         for bad in [
-            ":1.7",                              // the broker's to hand out
-            "org.td..alias",                     // a `.` run
-            "-leading",                          // an id that reads as a flag
+            ":1.7",          // the broker's to hand out
+            "org.td..alias", // a `.` run
+            "-leading",      // an id that reads as a flag
             ".",
             "",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 33 bytes
@@ -6109,8 +6084,7 @@ mod tests {
         .expect("body")
         .encode()
         .expect("encode");
-        let mut opening =
-            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
         opening.extend_from_slice(&bus_call("Hello", 1));
         opening.extend_from_slice(&misplaced);
         client.write_all(&opening).expect("write");
@@ -6143,13 +6117,9 @@ mod tests {
         if !pidfd_available() {
             return;
         }
-        for (harness, expected) in [
-            (serving_as("fixture"), Some("fixture")),
-            (serving(), None),
-        ] {
+        for (harness, expected) in [(serving_as("fixture"), Some("fixture")), (serving(), None)] {
             let (mut client, _hear) = harness;
-            let mut opening =
-                format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+            let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
             opening.extend_from_slice(&bus_call("Hello", 1));
             client.write_all(&opening).expect("write");
             let mut peer = Peer {
@@ -6177,7 +6147,11 @@ mod tests {
             assert_eq!(parsed.uid, this_uid());
             // A confined caller is told no host pid, its own included; see
             // `a_confined_caller_is_told_no_host_pid`.
-            let pid_told = if expected.is_some() { None } else { Some(std::process::id()) };
+            let pid_told = if expected.is_some() {
+                None
+            } else {
+                Some(std::process::id())
+            };
             assert_eq!(parsed.pid, pid_told, "as {expected:?}");
             assert_eq!(parsed.app_id.as_deref(), expected);
             let entries = reply
@@ -6270,8 +6244,7 @@ mod tests {
     #[test]
     fn nothing_may_be_sent_before_hello() {
         let (mut client, hear) = serving();
-        let mut opening =
-            format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
+        let mut opening = format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", uid_hex()).into_bytes();
         opening.extend_from_slice(&bus_call("ListNames", 1));
         client.write_all(&opening).expect("write");
         match ended(&hear).ended {
@@ -6669,10 +6642,7 @@ mod tests {
         let (mut sender, sender_name) = Peer::arrive(free);
         let (mut recipient, _) = Peer::arrive(jailed);
 
-        for (serial, name) in [
-            (2, "org.example.Visible"),
-            (3, "org.example.Hidden"),
-        ] {
+        for (serial, name) in [(2, "org.example.Visible"), (3, "org.example.Hidden")] {
             sender.send(&request_name(name, 0, serial));
             assert_eq!(name_code(&sender.answer()).0, 1);
             let _ = sender.frame();
@@ -6811,10 +6781,7 @@ mod tests {
         assert_eq!(call.fields.sender, Some(caller_name.as_str()));
 
         let spare = fs::File::open("/dev/null").expect("/dev/null");
-        callee.send_with_fd(
-            &descriptor_return(&caller_name, 7, 8),
-            spare.as_raw_fd(),
-        );
+        callee.send_with_fd(&descriptor_return(&caller_name, 7, 8), spare.as_raw_fd());
 
         let frame = caller.frame();
         let (reply, _) = message::decode(&frame, 0).expect("decode broker refusal");
@@ -7731,7 +7698,8 @@ mod tests {
             answered.push(told.fields.reply_serial);
         }
         assert_ne!(
-            serials.first(), serials.get(1),
+            serials.first(),
+            serials.get(1),
             "two peers left at the same counter value and collided"
         );
         answered.sort_unstable();
@@ -7930,7 +7898,11 @@ mod tests {
         );
 
         // The caller can, because it is outside the jail.
-        caller.send(&peer_call(&name_callee, 3, "a question across the boundary"));
+        caller.send(&peer_call(
+            &name_callee,
+            3,
+            "a question across the boundary",
+        ));
         let frame = callee.frame();
         let (call, _) = message::decode(&frame, 0).expect("decode the call");
         assert_eq!(call.fields.sender, Some(name_caller.as_str()));
@@ -8077,7 +8049,11 @@ mod tests {
         let (mut two, _) = Peer::arrive(second);
 
         one.send(&request_name("org.example.Thing", 0, 2));
-        assert_eq!(name_code(&one.answer()), (1, Some(2)), "not the primary owner");
+        assert_eq!(
+            name_code(&one.answer()),
+            (1, Some(2)),
+            "not the primary owner"
+        );
         // The answer comes first, then the news, in the order `say_hello`
         // uses: what this peer asked about goes ahead of what it did not.
         assert_eq!(
@@ -8383,8 +8359,7 @@ mod tests {
 
         one.send(&request_name(
             "org.example.Thing",
-            crate::registry::NAME_FLAG_ALLOW_REPLACEMENT
-                | crate::registry::NAME_FLAG_DO_NOT_QUEUE,
+            crate::registry::NAME_FLAG_ALLOW_REPLACEMENT | crate::registry::NAME_FLAG_DO_NOT_QUEUE,
             2,
         ));
         assert_eq!(name_code(&one.answer()).0, 1);
@@ -8761,7 +8736,11 @@ mod tests {
             crate::registry::NAME_FLAG_DO_NOT_QUEUE,
             3,
         ));
-        assert_eq!(name_code(&two.answer()), (3, Some(3)), "it stayed in the queue");
+        assert_eq!(
+            name_code(&two.answer()),
+            (3, Some(3)),
+            "it stayed in the queue"
+        );
 
         // And it really left: the holder's release goes past it to three.
         one.send(&release_name("org.example.Thing", 4));
@@ -8902,7 +8881,11 @@ mod tests {
         two.send(&request_name("org.example.Thing", 0, 5));
         assert_eq!(name_code(&two.answer()).0, 2);
         two.send(&release_name("org.example.Thing", 6));
-        assert_eq!(name_code(&two.answer()), (1, Some(6)), "a waiter cannot leave");
+        assert_eq!(
+            name_code(&two.answer()),
+            (1, Some(6)),
+            "a waiter cannot leave"
+        );
         // And leaving the queue is not a handover: the holder keeps it and is
         // told nothing.
         one.expect_silence();
@@ -9041,10 +9024,7 @@ mod tests {
         ));
         assert_eq!(name_code(&portal.answer()), (1, Some(2)));
         let _acquired = portal.frame();
-        assert!(bus.holds(
-            &portal_unique,
-            "org.freedesktop.portal.Desktop"
-        ));
+        assert!(bus.holds(&portal_unique, "org.freedesktop.portal.Desktop"));
 
         app.send(&request_name(
             "org.freedesktop.portal.Desktop",
@@ -9057,10 +9037,7 @@ mod tests {
             refusal.fields.error_name,
             Some("org.freedesktop.DBus.Error.AccessDenied")
         );
-        assert!(!bus.holds(
-            &app_unique,
-            "org.freedesktop.portal.Desktop"
-        ));
+        assert!(!bus.holds(&app_unique, "org.freedesktop.portal.Desktop"));
     }
 
     /// Portal handles are ordinary object paths on one directed conversation:
@@ -9520,8 +9497,7 @@ mod tests {
         if !pidfd_available() {
             return;
         }
-        let (_bus, _instances, mut clients) =
-            confined_bus_granting(2, &["org.mozilla.firefox"]);
+        let (_bus, _instances, mut clients) = confined_bus_granting(2, &["org.mozilla.firefox"]);
         let second = clients.pop().expect("two clients");
         let first = clients.pop().expect("two clients");
         let (mut holder, holder_name) = Peer::arrive(first);
@@ -9608,8 +9584,7 @@ mod tests {
         if !pidfd_available() {
             return;
         }
-        let (_bus, _instances, mut clients) =
-            confined_bus_granting(2, &["org.mozilla.firefox"]);
+        let (_bus, _instances, mut clients) = confined_bus_granting(2, &["org.mozilla.firefox"]);
         let second = clients.pop().expect("two clients");
         let first = clients.pop().expect("two clients");
         let (mut holder, holder_name) = Peer::arrive(first);
@@ -9680,11 +9655,7 @@ mod tests {
         holder.send(&release_name("org.mozilla.firefox", 3));
         assert_eq!(name_code(&holder.answer()).0, 1);
         let _lost = holder.frame();
-        caller.send(&peer_call(
-            &unique,
-            serial.saturating_add(1),
-            "too late",
-        ));
+        caller.send(&peer_call(&unique, serial.saturating_add(1), "too late"));
         let frame = caller.answer();
         let (refusal, _) = message::decode(&frame, 0).expect("decode");
         assert_eq!(
@@ -9715,8 +9686,7 @@ mod tests {
         if !pidfd_available() {
             return;
         }
-        let (_bus, _instances, mut clients) =
-            confined_bus_granting(1, &["org.mozilla.firefox"]);
+        let (_bus, _instances, mut clients) = confined_bus_granting(1, &["org.mozilla.firefox"]);
         let only = clients.pop().expect("one client");
         let (mut holder, holder_name) = Peer::arrive(only);
 
@@ -9760,7 +9730,11 @@ mod tests {
 
         // And the answer is the holder, not merely non-empty: asking by the
         // well-known name and by its own unique name agree.
-        holder.send(&name_query("GetConnectionUnixUser", "org.mozilla.firefox", serial));
+        holder.send(&name_query(
+            "GetConnectionUnixUser",
+            "org.mozilla.firefox",
+            serial,
+        ));
         let by_name = holder.answer();
         let (by_name, _) = message::decode(&by_name, 0).expect("decode");
         serial = serial.saturating_add(1);
@@ -9769,7 +9743,10 @@ mod tests {
         let (by_unique, _) = message::decode(&by_unique, 0).expect("decode");
         assert_eq!(
             by_name.args().first().and_then(crate::wire::Value::as_u32),
-            by_unique.args().first().and_then(crate::wire::Value::as_u32),
+            by_unique
+                .args()
+                .first()
+                .and_then(crate::wire::Value::as_u32),
             "the two spellings of one peer answered differently"
         );
     }
@@ -10148,7 +10125,10 @@ mod tests {
                 .push(vec![0u8; crate::registry::MAX_OUTGOING_BYTES])
                 .expect("push");
         }
-        assert_eq!(bus.queued_bytes(), crate::registry::MAX_OUTGOING_BYTES_TOTAL);
+        assert_eq!(
+            bus.queued_bytes(),
+            crate::registry::MAX_OUTGOING_BYTES_TOTAL
+        );
 
         // An ordinary call from an innocent peer. It is answered.
         peer.send(&bus_call("GetId", 2));
@@ -10420,7 +10400,11 @@ mod tests {
 
         let frame = one.frame();
         let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
-        assert_eq!(reply.kind, message::MessageType::Error, "the sender was not told");
+        assert_eq!(
+            reply.kind,
+            message::MessageType::Error,
+            "the sender was not told"
+        );
         assert_eq!(
             reply.fields.error_name,
             Some("org.freedesktop.DBus.Error.LimitsExceeded")
@@ -10588,7 +10572,11 @@ mod tests {
         peer.send(&extra);
         let frame = peer.frame();
         let (reply, _) = message::decode(&frame, 0).expect("decode");
-        assert_eq!(reply.kind, message::MessageType::Error, "a spare argument was ignored");
+        assert_eq!(
+            reply.kind,
+            message::MessageType::Error,
+            "a spare argument was ignored"
+        );
         assert_eq!(
             reply.fields.error_name,
             Some("org.freedesktop.DBus.Error.InvalidArgs")
@@ -10700,7 +10688,11 @@ mod tests {
             .expect("read it");
         let mut keys = Vec::new();
         for entry in &entries {
-            let pair = entry.as_seq().expect("an entry").values(2).expect("read it");
+            let pair = entry
+                .as_seq()
+                .expect("an entry")
+                .values(2)
+                .expect("read it");
             if let Some(key) = pair.first().and_then(crate::wire::Value::as_str) {
                 keys.push(key.to_string());
             }
@@ -10714,13 +10706,18 @@ mod tests {
 
     /// A name lookup called with one string argument.
     fn name_query(member: &str, name: &str, serial: u32) -> Vec<u8> {
-        message::Builder::method_call(crate::wire::Endian::Little, BUS_PATH, Some(BUS_NAME), member)
-            .destination(BUS_NAME)
-            .serial(serial)
-            .body("s", |writer| writer.string(name))
-            .expect("body")
-            .encode()
-            .expect("encode a name query")
+        message::Builder::method_call(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            Some(BUS_NAME),
+            member,
+        )
+        .destination(BUS_NAME)
+        .serial(serial)
+        .body("s", |writer| writer.string(name))
+        .expect("body")
+        .encode()
+        .expect("encode a name query")
     }
 
     #[test]
@@ -10914,7 +10911,9 @@ mod tests {
         connection.unique = Some(":1.1".to_string());
         let call = register_call("one", "org.td.One", 2);
         let (message, _) = message::decode(&call, 0).expect("decode a Register");
-        connection.jail_register(&message, true).expect("the arm ran");
+        connection
+            .jail_register(&message, true)
+            .expect("the arm ran");
 
         let frame = connection.outbox.take().expect("a refusal was queued");
         assert_eq!(
@@ -11244,9 +11243,8 @@ mod tests {
             Connection::accept(supervisor_server, guid, &quota, &bus, &instances)
                 .expect("accept the supervisor");
         supervisor_connection.unique = Some(":1.1".to_string());
-        let mut child_connection =
-            Connection::accept(child_server, guid, &quota, &bus, &instances)
-                .expect("accept the child");
+        let mut child_connection = Connection::accept(child_server, guid, &quota, &bus, &instances)
+            .expect("accept the child");
         child_connection.unique = Some(":1.2".to_string());
         let supervisor = Caller {
             pid: 4100,
@@ -11479,7 +11477,10 @@ mod tests {
         let cases: [(&str, Staged); 6] = [
             // The oracle cannot be read: EMFILE, or an `fdinfo` this broker
             // does not recognise.
-            ("an unreadable pidfd", Staged::new(Named::Unreadable, a_stat(7))),
+            (
+                "an unreadable pidfd",
+                Staged::new(Named::Unreadable, a_stat(7)),
+            ),
             // ...and it is refused even when the /proc read would succeed,
             // which is the case a fake answering `Unreadable` to BOTH
             // questions cannot distinguish. A mutation lived here.
@@ -11511,7 +11512,11 @@ mod tests {
         // number was free in between, so the entry read while it was free
         // describes nobody in particular.
         let moved = Staged::new(Named::Pid(me), a_stat(7)).then(Named::Pid(me + 1));
-        assert_eq!(connection.caller(&moved), None, "the bracket accepted a new pid");
+        assert_eq!(
+            connection.caller(&moved),
+            None,
+            "the bracket accepted a new pid"
+        );
 
         // The control: both reads agree and the entry is readable, so the
         // pair is proved and carries the start time that was read.
@@ -11596,7 +11601,9 @@ mod tests {
             Ok(())
         });
         let (message, _) = message::decode(&call, 0).expect("decode a Complete");
-        connection.jail_complete(&message, true).expect("the arm ran");
+        connection
+            .jail_complete(&message, true)
+            .expect("the arm ran");
 
         let frame = connection.outbox.take().expect("a refusal was queued");
         assert_eq!(
@@ -11749,7 +11756,10 @@ mod tests {
 
             let (mut stream, _) = listener.accept().expect("accept");
             let authentication = line(&mut stream);
-            assert_eq!(authentication, format!("\0AUTH EXTERNAL {}\r\n", uid_hex()).as_bytes());
+            assert_eq!(
+                authentication,
+                format!("\0AUTH EXTERNAL {}\r\n", uid_hex()).as_bytes()
+            );
             stream
                 .write_all(format!("OK {GUID}\r\n").as_bytes())
                 .expect("answer authentication");
@@ -11855,8 +11865,7 @@ mod tests {
                 (6, firefox_name_two, Some(Some("firefox")), 4343),
             ] {
                 let frame = probe_frame(&mut stream, deadline).expect("read credentials call");
-                let (query, used) =
-                    message::decode(&frame, 0).expect("decode credentials call");
+                let (query, used) = message::decode(&frame, 0).expect("decode credentials call");
                 assert_eq!(used, frame.len());
                 assert_eq!(query.kind, message::MessageType::MethodCall);
                 assert_eq!(query.serial, serial);
@@ -11877,49 +11886,52 @@ mod tests {
                     .sender(BUS_NAME)
                     .destination(probe_name)
                     .serial(serial.saturating_add(1))
-                    .body("s", |writer| writer.string("no such connection on this bus"))
+                    .body("s", |writer| {
+                        writer.string("no such connection on this bus")
+                    })
                     .expect("departure body")
                     .encode()
                     .expect("departure reply"),
-                    Some(app_id) => message::Builder::method_return(
-                        crate::wire::Endian::Little,
-                        serial,
-                    )
-                    .sender(BUS_NAME)
-                    .destination(probe_name)
-                    .serial(serial.saturating_add(1))
-                    .body("a{sv}", |writer| {
-                        writer.array("{sv}", |entries| {
-                            entries.dict_entry(|entry| {
-                                entry.string("UnixUserID")?;
-                                entry.variant("u", |value| {
-                                    value.uint32(if app_id == Some("firefox") { 65536 } else { this_uid() });
+                    Some(app_id) => {
+                        message::Builder::method_return(crate::wire::Endian::Little, serial)
+                            .sender(BUS_NAME)
+                            .destination(probe_name)
+                            .serial(serial.saturating_add(1))
+                            .body("a{sv}", |writer| {
+                                writer.array("{sv}", |entries| {
+                                    entries.dict_entry(|entry| {
+                                        entry.string("UnixUserID")?;
+                                        entry.variant("u", |value| {
+                                            value.uint32(if app_id == Some("firefox") {
+                                                65536
+                                            } else {
+                                                this_uid()
+                                            });
+                                            Ok(())
+                                        })
+                                    })?;
+                                    entries.dict_entry(|entry| {
+                                        entry.string("ProcessID")?;
+                                        entry.variant("u", |value| {
+                                            value.uint32(pid);
+                                            Ok(())
+                                        })
+                                    })?;
+                                    if let Some(app_id) = app_id {
+                                        entries.dict_entry(|entry| {
+                                            entry.string("td.AppId")?;
+                                            entry.variant("s", |value| value.string(app_id))
+                                        })?;
+                                    }
                                     Ok(())
                                 })
-                            })?;
-                            entries.dict_entry(|entry| {
-                                entry.string("ProcessID")?;
-                                entry.variant("u", |value| {
-                                    value.uint32(pid);
-                                    Ok(())
-                                })
-                            })?;
-                            if let Some(app_id) = app_id {
-                                entries.dict_entry(|entry| {
-                                    entry.string("td.AppId")?;
-                                    entry.variant("s", |value| value.string(app_id))
-                                })?;
-                            }
-                            Ok(())
-                        })
-                    })
-                    .expect("credentials body")
-                    .encode()
-                    .expect("credentials reply"),
+                            })
+                            .expect("credentials body")
+                            .encode()
+                            .expect("credentials reply")
+                    }
                 };
-                stream
-                    .write_all(&answer)
-                    .expect("answer credentials call");
+                stream.write_all(&answer).expect("answer credentials call");
             }
         });
 
@@ -11932,9 +11944,7 @@ mod tests {
                 std::time::Duration::from_secs(5),
             )
             .expect("application probe"),
-            format!(
-                "guid={GUID} application=firefox connections=:1.10/4343,:1.42/4242"
-            )
+            format!("guid={GUID} application=firefox connections=:1.10/4343,:1.42/4242")
         );
         served.join().expect("server thread");
         fs::remove_dir_all(&dir).ok();
@@ -11944,18 +11954,33 @@ mod tests {
     fn the_application_probe_separates_human_observer_from_assigned_subject() {
         let policy = crate::app_policy::Policy::parse(
             "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n",
-        ).unwrap();
-        assert_eq!(application_probe_subject(&policy, 1000, "firefox").unwrap(), 65536);
+        )
+        .unwrap();
+        assert_eq!(
+            application_probe_subject(&policy, 1000, "firefox").unwrap(),
+            65536
+        );
         for observer in [0, 991, 1001, 65536, 65537] {
             assert!(application_probe_subject(&policy, observer, "firefox").is_err());
         }
         assert!(application_probe_subject(&policy, 1000, "missing").is_err());
         for uid in [0, 1000, 65537] {
-            let credentials = ProbeCredentials { uid, pid: Some(42), app_id: Some("firefox".into()) };
+            let credentials = ProbeCredentials {
+                uid,
+                pid: Some(42),
+                app_id: Some("firefox".into()),
+            };
             assert!(probe_application_connection(":1.42", &credentials, 65536, "firefox").is_err());
         }
-        let credentials = ProbeCredentials { uid: 65536, pid: Some(42), app_id: Some("firefox".into()) };
-        assert_eq!(probe_application_connection(":1.42", &credentials, 65536, "firefox").unwrap(), Some((":1.42".into(), 42)));
+        let credentials = ProbeCredentials {
+            uid: 65536,
+            pid: Some(42),
+            app_id: Some("firefox".into()),
+        };
+        assert_eq!(
+            probe_application_connection(":1.42", &credentials, 65536, "firefox").unwrap(),
+            Some((":1.42".into(), 42))
+        );
     }
 
     #[test]
@@ -12003,7 +12028,10 @@ mod tests {
             })
             .collect();
         let encoded = reply(&names);
-        assert!(encoded.len() > 64 * 1024, "the boundary stayed under the old cap");
+        assert!(
+            encoded.len() > 64 * 1024,
+            "the boundary stayed under the old cap"
+        );
         assert!(encoded.len() <= MAX_PROBE_FRAME);
         let (mut reader, mut writer) = UnixStream::pair().expect("socket pair");
         let served = thread::spawn(move || writer.write_all(&encoded));
@@ -12075,13 +12103,8 @@ mod tests {
         let credentials = probe_credentials_reply(&reply(None), 3, ":1.70")
             .expect("parse missing process id")
             .expect("connection is live");
-        let error = probe_application_connection(
-            ":1.42",
-            &credentials,
-            this_uid(),
-            "firefox",
-        )
-        .expect_err("a matching application without a process id was admitted");
+        let error = probe_application_connection(":1.42", &credentials, this_uid(), "firefox")
+            .expect_err("a matching application without a process id was admitted");
         assert!(error.contains("no kernel process id"), "{error}");
     }
 
@@ -12100,7 +12123,10 @@ mod tests {
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
         let error = probe_frame(&mut reader, deadline).expect_err("dribble escaped deadline");
-        assert!(error.contains("deadline") || error.contains("timed out"), "{error}");
+        assert!(
+            error.contains("deadline") || error.contains("timed out"),
+            "{error}"
+        );
         served.join().expect("server thread");
     }
 
@@ -12396,7 +12422,9 @@ mod tests {
             Err(why) => assert!(why.contains("already serving"), "{why}"),
         }
         drop(held.pop());
-        quota.try_reserve(4242).expect("a returned worker place stayed held");
+        quota
+            .try_reserve(4242)
+            .expect("a returned worker place stayed held");
     }
 
     #[test]
@@ -12580,8 +12608,7 @@ mod tests {
                 let fd: OwnedFd = file.into();
                 fds.push(fd);
             }
-            let descriptors =
-                Descriptors::new(fds, charge).expect("matching descriptor charge");
+            let descriptors = Descriptors::new(fds, charge).expect("matching descriptor charge");
             let copies = [descriptors.clone(), descriptors];
             for (copy, descriptors) in copies.into_iter().enumerate() {
                 let (client, server) = UnixStream::pair().expect("socketpair");
@@ -12600,7 +12627,10 @@ mod tests {
                     .expect("queue descriptor frame");
             }
         }
-        assert!(quota.take_fds(&probe, 1).is_err(), "the descriptor budget was not full");
+        assert!(
+            quota.take_fds(&probe, 1).is_err(),
+            "the descriptor budget was not full"
+        );
         // Every underlying batch is shared by two recipients. Relieving only
         // one largest queue drops one Arc clone and returns no global charge;
         // the retry must continue until the sibling is gone too.
@@ -12611,7 +12641,10 @@ mod tests {
                 "no descriptor holder was relieved"
             );
             relieved = relieved.saturating_add(1);
-            assert!(relieved <= MAX_CONNECTIONS, "descriptor relief did not converge");
+            assert!(
+                relieved <= MAX_CONNECTIONS,
+                "descriptor relief did not converge"
+            );
         }
         assert!(relieved >= 2, "shared ownership was not exercised");
         // The bus has room because one batch's last clone went; the two
@@ -12625,7 +12658,10 @@ mod tests {
                 queued_share_is_free(&quota, &key)
             })
             .count();
-        assert_eq!(freed, 2, "relief gave {freed} keys their share back rather than two");
+        assert_eq!(
+            freed, 2,
+            "relief gave {freed} keys their share back rather than two"
+        );
         let returned = quota
             .take_fds(&probe, sys::MAX_FDS)
             .expect("relieving one holder returned its descriptor batch");
@@ -12735,7 +12771,10 @@ mod tests {
             || attempts.next().expect("the script ran out"),
             || Some(":1.7".to_string()),
         );
-        assert!(outcome.is_ok(), "the bus made room and the charge was not taken");
+        assert!(
+            outcome.is_ok(),
+            "the bus made room and the charge was not taken"
+        );
         assert_eq!(relieved, 2, "the reliefs reported are not the reliefs made");
         drop(outcome);
 
@@ -12744,7 +12783,10 @@ mod tests {
             matches!(outcome, Err(DescriptorRefusal::OverBus { .. })),
             "an empty bus that still refuses was not reported as the bus refusing"
         );
-        assert_eq!(relieved, 0, "a relief was counted where nobody was relieved");
+        assert_eq!(
+            relieved, 0,
+            "a relief was counted where nobody was relieved"
+        );
     }
 
     /// Whether `key`'s QUEUED share is wholly free: the count a holder's
@@ -12813,7 +12855,9 @@ mod tests {
             .expect("read timeout");
         // Said Hello first: a call before it ends the connection for that
         // reason, which says nothing about descriptors.
-        client.write_all(&bus_call("Hello", 1)).expect("write Hello");
+        client
+            .write_all(&bus_call("Hello", 1))
+            .expect("write Hello");
         while connection.unique.is_none() {
             assert!(
                 connection.pump().expect("say Hello"),
@@ -12874,14 +12918,21 @@ mod tests {
         let mut holders = Vec::new();
         for which in 0..MAX_QUEUED_FDS_TOTAL / sys::MAX_FDS {
             let key = AdmissionKey::Instance(format!("holder-{which}"));
-            holders.push(queued_holder(&quota, &bus, &key, 7100 + i32::try_from(which).unwrap_or(0)));
+            holders.push(queued_holder(
+                &quota,
+                &bus,
+                &key,
+                7100 + i32::try_from(which).unwrap_or(0),
+            ));
         }
         let probe = AdmissionKey::Instance("probe".to_string());
         assert!(quota.take_fds(&probe, 1).is_err(), "the bus was not full");
 
         // Said Hello first: a call before it ends the connection for that
         // reason, which says nothing about descriptors.
-        client.write_all(&bus_call("Hello", 1)).expect("write Hello");
+        client
+            .write_all(&bus_call("Hello", 1))
+            .expect("write Hello");
         while connection.unique.is_none() {
             assert!(
                 connection.pump().expect("say Hello"),
@@ -12927,7 +12978,10 @@ mod tests {
             .iter()
             .filter(|(_, outbox)| outbox.pending_descriptors() == 0)
             .count();
-        assert_eq!(relieved, 1, "bus pressure relieved {relieved} holders rather than one");
+        assert_eq!(
+            relieved, 1,
+            "bus pressure relieved {relieved} holders rather than one"
+        );
         // The relieved holder's key has its share back with its queue, and
         // the others hold theirs.
         let freed = (0..MAX_QUEUED_FDS_TOTAL / sys::MAX_FDS)
@@ -12936,7 +12990,10 @@ mod tests {
                 queued_share_is_free(&quota, &key)
             })
             .count();
-        assert_eq!(freed, 1, "relief gave {freed} holder keys their share back rather than one");
+        assert_eq!(
+            freed, 1,
+            "relief gave {freed} holder keys their share back rather than one"
+        );
     }
 
     /// The share is the HOLDER's. A recipient key at its share, across two
@@ -12960,7 +13017,9 @@ mod tests {
             .stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .expect("read timeout");
-        client.write_all(&bus_call("Hello", 1)).expect("write Hello");
+        client
+            .write_all(&bus_call("Hello", 1))
+            .expect("write Hello");
         while connection.unique.is_none() {
             assert!(
                 connection.pump().expect("say Hello"),
@@ -12993,8 +13052,7 @@ mod tests {
         for (which, (_, outbox, name)) in recipients.iter().enumerate() {
             for queued in 1..=MAX_QUEUED_FDS_PER_INSTANCE / 2 {
                 let spare = fs::File::open("/dev/null").expect("/dev/null");
-                let call =
-                    descriptor_call_flagged(name, serial, message::FLAG_NO_REPLY_EXPECTED);
+                let call = descriptor_call_flagged(name, serial, message::FLAG_NO_REPLY_EXPECTED);
                 let sent = sys::send(&client, &call, &[spare.as_raw_fd()]).expect("send");
                 assert_eq!(sent, call.len());
                 spares.push(spare);
@@ -13007,13 +13065,20 @@ mod tests {
                         Err(ended) => panic!("the sender was ended while filling: {ended:?}"),
                     }
                     pumped = pumped.saturating_add(1);
-                    assert!(pumped < 64, "attachment {queued} never reached recipient {which}");
+                    assert!(
+                        pumped < 64,
+                        "attachment {queued} never reached recipient {which}"
+                    );
                 }
             }
         }
         assert!(
-            DescriptorCharge::take(&quota.share_of(&stalled).queued, 1, MAX_QUEUED_FDS_PER_INSTANCE)
-                .is_err(),
+            DescriptorCharge::take(
+                &quota.share_of(&stalled).queued,
+                1,
+                MAX_QUEUED_FDS_PER_INSTANCE
+            )
+            .is_err(),
             "the stalled key's queued share was not full"
         );
 
@@ -13091,7 +13156,9 @@ mod tests {
             .stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .expect("read timeout");
-        client.write_all(&bus_call("Hello", 1)).expect("write Hello");
+        client
+            .write_all(&bus_call("Hello", 1))
+            .expect("write Hello");
         while connection.unique.is_none() {
             assert!(
                 connection.pump().expect("say Hello"),
@@ -13173,7 +13240,9 @@ mod tests {
             .stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .expect("read timeout");
-        client.write_all(&bus_call("Hello", 1)).expect("write Hello");
+        client
+            .write_all(&bus_call("Hello", 1))
+            .expect("write Hello");
         while connection.unique.is_none() {
             assert!(
                 connection.pump().expect("say Hello"),
@@ -13273,7 +13342,10 @@ mod tests {
         let dir = scratch("mode");
         let path = dir.join("bus");
         let bound = bind(&path).expect("bind");
-        let mode = fs::metadata(bound.path()).expect("socket").permissions().mode();
+        let mode = fs::metadata(bound.path())
+            .expect("socket")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600, "socket is {mode:o}");
         fs::remove_dir_all(&dir).ok();
     }
@@ -13592,7 +13664,10 @@ mod tests {
         assert_eq!(mode & 0o777, 0o755, "the parent was chmodded to {mode:o}");
         // The socket itself is still private, which is what defends it when
         // the parent belongs to somebody else.
-        let socket = fs::metadata(bound.path()).expect("socket").permissions().mode();
+        let socket = fs::metadata(bound.path())
+            .expect("socket")
+            .permissions()
+            .mode();
         assert_eq!(socket & 0o777, 0o600, "socket is {socket:o}");
         fs::remove_dir_all(&dir).ok();
     }

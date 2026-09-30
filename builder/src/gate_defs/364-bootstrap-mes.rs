@@ -3,7 +3,7 @@
 //! SOURCE — the pinned mes-0.27.1.tar.gz (recipe-owned source pin), td-fetched (not vendored, not
 //! guix-fetched) in `td-builder check`'s prelude into ~/.td/sources/ — to compile + link a working
 //! GNU Mes Scheme interpreter, mes-m2 — guix-free.
-//! 
+//!
 //! The driver is a STRUCTURED Rust recipe — `td-builder bootstrap-recipe mes`
 //! (builder/src/bootstrap.rs, rust-migration C2): the old shell tests/bootstrap-mes.sh was ported
 //! to a typed Recipe (Pin::Source; the kaem.run input-list extraction + the M2P/blood-elf/M1/hex2

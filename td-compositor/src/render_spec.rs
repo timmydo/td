@@ -400,7 +400,10 @@ fn the_rendition_matrix_covers_exactly_the_models_attribute_flags() {
     named.sort_unstable();
     declared.sort_unstable();
     assert_eq!(named, declared);
-    assert!(flags.iter().all(|(_, set)| !*set), "BLANK claims a rendition");
+    assert!(
+        flags.iter().all(|(_, set)| !*set),
+        "BLANK claims a rendition"
+    );
 }
 
 #[test]
@@ -484,13 +487,20 @@ fn underline_and_strike_rule_fixed_full_width_cell_rows() {
     let width = face().width();
     let ink = palette().foreground();
     let background = palette().background();
-    for (select, ruled) in [(b"\x1b[4m".as_slice(), height - 2), (b"\x1b[9m", height / 2)] {
+    for (select, ruled) in [
+        (b"\x1b[4m".as_slice(), height - 2),
+        (b"\x1b[9m", height / 2),
+    ] {
         // A space has no glyph bits, so the rule is the only thing drawn.
         let cell = cell_of(select, ' ');
         for y in 0..height {
             for x in 0..width {
                 let expected = if y == ruled { ink } else { background };
-                assert_eq!(rgb_at(&cell, width, x, y), expected, "({x},{y}) row {ruled}");
+                assert_eq!(
+                    rgb_at(&cell, width, x, y),
+                    expected,
+                    "({x},{y}) row {ruled}"
+                );
             }
         }
     }
@@ -582,8 +592,8 @@ fn an_unfocused_cursor_is_a_hollow_one_pixel_box() {
         for x in 0..width {
             let inside = (cell_width..cell_width * 2).contains(&x);
             let local = x.saturating_sub(cell_width);
-            let edge = inside
-                && (y == 0 || local == 0 || y + 1 == cell_height || local + 1 == cell_width);
+            let edge =
+                inside && (y == 0 || local == 0 || y + 1 == cell_height || local + 1 == cell_width);
             let drawn = rgb_at(&shown, width, x, y);
             if edge {
                 assert_eq!(drawn, palette().foreground(), "({x},{y}) edge");
@@ -696,7 +706,11 @@ fn the_bell_ring_inverts_each_corner_exactly_once() {
         for (index, pixel) in chunks.iter().enumerate() {
             let (x, y) = (index % width, index / width);
             let ring = x == 0 || y == 0 || x + 1 == width || y + 1 == height;
-            let expected = if ring { [255, 255, 255, 0] } else { [0, 0, 0, 0] };
+            let expected = if ring {
+                [255, 255, 255, 0]
+            } else {
+                [0, 0, 0, 0]
+            };
             assert_eq!(*pixel, expected, "{width}x{height} ({x},{y})");
         }
     }
@@ -791,9 +805,16 @@ fn an_anchored_view_shows_the_same_lines_while_output_arrives() {
     for line in 5..9 {
         let digit = char::from_digit(line % 10, 10).unwrap();
         let mut bytes = vec![b'\r', b'\n'];
-        bytes.extend(std::iter::repeat_n(u8::try_from(u32::from(digit)).unwrap(), 3));
+        bytes.extend(std::iter::repeat_n(
+            u8::try_from(u32::from(digit)).unwrap(),
+            3,
+        ));
         terminal.feed(&bytes);
-        assert_eq!(seen(&terminal, &viewport), before, "line {line} moved the view");
+        assert_eq!(
+            seen(&terminal, &viewport),
+            before,
+            "line {line} moved the view"
+        );
     }
     // It moved further from the bottom, which is the same thing said the
     // other way: four more lines arrived under it.
@@ -957,7 +978,11 @@ fn diff_frames(pixels: &[u8], wanted: &[u8], width: usize) -> (Option<(usize, us
         if !same && first.is_none() && width != 0 {
             first = Some((index % width, index / width));
         }
-        diff.extend_from_slice(if same { &[0, 0, 0, 0] } else { &[255, 255, 255, 0] });
+        diff.extend_from_slice(if same {
+            &[0, 0, 0, 0]
+        } else {
+            &[255, 255, 255, 0]
+        });
     }
     (first, diff)
 }
@@ -1106,10 +1131,10 @@ fn the_committed_goldens_are_exactly_the_ones_a_case_renders() {
 fn every_golden_decodes_to_the_image_its_header_claims() {
     for name in GOLDENS {
         let path = PathBuf::from(GOLDEN_DIR).join(format!("{name}.ppm"));
-        let bytes = std::fs::read(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        let (pixels, width, height) = from_ppm(&bytes)
-            .unwrap_or_else(|error| panic!("decode {}: {error}", path.display()));
+        let bytes =
+            std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let (pixels, width, height) =
+            from_ppm(&bytes).unwrap_or_else(|error| panic!("decode {}: {error}", path.display()));
         assert_eq!(pixels.len(), width * height * BYTES_PER_PIXEL);
         assert!(width > 0 && height > 0);
         // The cell grid divides the surface exactly, so a golden cropped or
@@ -1149,7 +1174,11 @@ fn the_diff_marks_a_truncated_frame_rather_than_reading_past_it() {
     let (first, diff) = diff_frames(&pixels, &[], 2);
     assert_eq!(first, Some((0, 0)));
     assert_eq!(diff.len(), pixels.len());
-    assert!(diff.as_chunks::<BYTES_PER_PIXEL>().0.iter().all(|pixel| *pixel == [255, 255, 255, 0]));
+    assert!(diff
+        .as_chunks::<BYTES_PER_PIXEL>()
+        .0
+        .iter()
+        .all(|pixel| *pixel == [255, 255, 255, 0]));
 }
 
 // -------------------------------------------------------------- selftest

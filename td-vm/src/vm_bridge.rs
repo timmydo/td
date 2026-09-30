@@ -41,8 +41,9 @@ fn reply(
                 wire::SNAPSHOT => reply.revision != 0 && reply.data == b"clipboard-v1 feed-v1",
                 wire::POWEROFF => reply.revision == 0 && reply.data == wire::POWER_QUEUED,
                 wire::WORKSPACE_ENSURE => {
-                    reply.revision == 0 && wire::workspace::Plan::parse(&request.data)
-                        .is_ok_and(|plan| wire::workspace::progress(&reply.data, &plan).is_ok())
+                    reply.revision == 0
+                        && wire::workspace::Plan::parse(&request.data)
+                            .is_ok_and(|plan| wire::workspace::progress(&reply.data, &plan).is_ok())
                 }
                 wire::WORKSPACE_TERMINAL | wire::WORKSPACE_CODEX | wire::WORKSPACE_CLAUDE => {
                     reply.revision == 0
@@ -50,12 +51,15 @@ fn reply(
                         && wire::workspace::Plan::parse(&request.data).is_ok()
                 }
                 wire::WORKSPACE => {
-                    reply.revision == 0 && wire::workspace::Plan::parse(&request.data)
-                        .is_ok_and(|plan| wire::workspace::parse_ready(&reply.data, &plan).is_ok())
+                    reply.revision == 0
+                        && wire::workspace::Plan::parse(&request.data).is_ok_and(|plan| {
+                            wire::workspace::parse_ready(&reply.data, &plan).is_ok()
+                        })
                 }
                 wire::KEY => {
-                    reply.revision == 0 && wire::git_key::identity(&request.data)
-                        .is_ok_and(|id| wire::git_key::parse(&reply.data, id).is_ok())
+                    reply.revision == 0
+                        && wire::git_key::identity(&request.data)
+                            .is_ok_and(|id| wire::git_key::parse(&reply.data, id).is_ok())
                 }
                 wire::GET => {
                     reply.revision == request.revision
@@ -267,9 +271,14 @@ fn forward(dir: &Path, request: wire::Message, deadline: Instant) -> Result<wire
             }
         }
         wire::GET | wire::SNAPSHOT | wire::POWEROFF if request.data.is_empty() => {}
-        wire::KEY => { wire::git_key::identity(&request.data)?; }
-        wire::WORKSPACE | wire::WORKSPACE_ENSURE | wire::WORKSPACE_TERMINAL
-        | wire::WORKSPACE_CODEX | wire::WORKSPACE_CLAUDE => {
+        wire::KEY => {
+            wire::git_key::identity(&request.data)?;
+        }
+        wire::WORKSPACE
+        | wire::WORKSPACE_ENSURE
+        | wire::WORKSPACE_TERMINAL
+        | wire::WORKSPACE_CODEX
+        | wire::WORKSPACE_CLAUDE => {
             wire::workspace::Plan::parse(&request.data)?;
         }
         wire::FEED => {
@@ -320,23 +329,39 @@ mod tests {
 
     #[test]
     fn automatic_progress_crosses_both_relays_without_clipboard_permission() {
-        let temp = Temp::new(); sharing(&temp.0, "off").unwrap();
+        let temp = Temp::new();
+        sharing(&temp.0, "off").unwrap();
         let listener = UnixListener::bind(temp.0.join("guest")).unwrap();
         let plan = wire::workspace::example();
         let response_plan = plan.clone();
         let server = thread::spawn(move || {
-            for data in [wire::workspace::pending(&response_plan), wire::workspace::failure(&response_plan, "SSH refused"), wire::workspace::ready(&response_plan)] {
+            for data in [
+                wire::workspace::pending(&response_plan),
+                wire::workspace::failure(&response_plan, "SSH refused"),
+                wire::workspace::ready(&response_plan),
+            ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream.set_nonblocking(true).unwrap();
                 let deadline = Instant::now() + wire::TIMEOUT;
                 let request = wire::receive(&mut stream, None, deadline).unwrap();
                 assert_eq!(request.verb, wire::WORKSPACE_ENSURE);
                 assert_eq!(request.data, response_plan.encode());
-                wire::write_all(&mut stream, &wire::Message::new(request.id, wire::OK, 0, data).encode().unwrap(), deadline).unwrap();
+                wire::write_all(
+                    &mut stream,
+                    &wire::Message::new(request.id, wire::OK, 0, data)
+                        .encode()
+                        .unwrap(),
+                    deadline,
+                )
+                .unwrap();
             }
         });
         let _supervisor = Supervisor::start(&temp.0).unwrap();
-        for expected in [wire::workspace::Progress::Pending, wire::workspace::Progress::Failed("SSH refused".into()), wire::workspace::Progress::Ready] {
+        for expected in [
+            wire::workspace::Progress::Pending,
+            wire::workspace::Progress::Failed("SSH refused".into()),
+            wire::workspace::Progress::Ready,
+        ] {
             let reply = ask(&temp.0, wire::WORKSPACE_ENSURE, plan.encode()).unwrap();
             assert_eq!(wire::workspace::progress(&reply, &plan).unwrap(), expected);
         }
@@ -345,7 +370,11 @@ mod tests {
 
     #[test]
     fn task_terminal_crosses_both_relays_with_its_exact_plan_and_reply() {
-        for verb in [wire::WORKSPACE_TERMINAL, wire::WORKSPACE_CODEX, wire::WORKSPACE_CLAUDE] {
+        for verb in [
+            wire::WORKSPACE_TERMINAL,
+            wire::WORKSPACE_CODEX,
+            wire::WORKSPACE_CLAUDE,
+        ] {
             let temp = Temp::new();
             sharing(&temp.0, "off").unwrap();
             let listener = UnixListener::bind(temp.0.join("guest")).unwrap();
@@ -387,12 +416,33 @@ mod tests {
             let request = wire::receive(&mut stream, None, deadline).unwrap();
             assert_eq!(request.verb, wire::POWEROFF);
             assert!(request.data.is_empty());
-            wire::write_all(&mut stream, &wire::Message::new(request.id, wire::OK, 0, wire::POWER_QUEUED.to_vec()).encode().unwrap(), deadline).unwrap();
+            wire::write_all(
+                &mut stream,
+                &wire::Message::new(request.id, wire::OK, 0, wire::POWER_QUEUED.to_vec())
+                    .encode()
+                    .unwrap(),
+                deadline,
+            )
+            .unwrap();
         });
         for data in [b"reboot".to_vec(), b"/bin/poweroff".to_vec()] {
-            assert!(forward(&temp.0, wire::Message::new(1, wire::POWEROFF, 0, data), Instant::now() + wire::TIMEOUT).is_err());
+            assert!(forward(
+                &temp.0,
+                wire::Message::new(1, wire::POWEROFF, 0, data),
+                Instant::now() + wire::TIMEOUT
+            )
+            .is_err());
         }
-        assert_eq!(forward(&temp.0, wire::Message::new(2, wire::POWEROFF, 0, Vec::new()), Instant::now() + wire::TIMEOUT).unwrap().data, wire::POWER_QUEUED);
+        assert_eq!(
+            forward(
+                &temp.0,
+                wire::Message::new(2, wire::POWEROFF, 0, Vec::new()),
+                Instant::now() + wire::TIMEOUT
+            )
+            .unwrap()
+            .data,
+            wire::POWER_QUEUED
+        );
         server.join().unwrap();
     }
 
@@ -459,7 +509,8 @@ mod tests {
     fn public_key_relay_needs_no_clipboard_lease_and_refuses_wrong_identity() {
         let temp = Temp::new();
         let id = "0123456789abcdef0123456789abcdef";
-        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+        let key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
         let listener = UnixListener::bind(temp.0.join("guest")).unwrap();
         listener.set_nonblocking(true).unwrap();
         let peer = thread::spawn(move || {
@@ -468,7 +519,12 @@ mod tests {
                 let (mut stream, _) = loop {
                     match listener.accept() {
                         Ok(pair) => break pair,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5))
+                        }
                         Err(e) => panic!("guest accept: {e}"),
                     }
                 };
@@ -477,7 +533,12 @@ mod tests {
                 assert_eq!(request.verb, wire::KEY);
                 assert_eq!(request.data, id.as_bytes());
                 assert_eq!(request.revision, 0);
-                let reply = wire::Message::new(request.id, wire::OK, 0, wire::git_key::encode(identity, key).unwrap());
+                let reply = wire::Message::new(
+                    request.id,
+                    wire::OK,
+                    0,
+                    wire::git_key::encode(identity, key).unwrap(),
+                );
                 wire::write_all(&mut stream, &reply.encode().unwrap(), deadline).unwrap();
             }
         });
@@ -485,10 +546,11 @@ mod tests {
         sharing(&temp.0, "off").unwrap();
         let reply = ask(&temp.0, wire::KEY, id.as_bytes().to_vec()).unwrap();
         assert_eq!(wire::git_key::parse(&reply, id).unwrap(), key);
-        assert!(ask(&temp.0, wire::KEY, id.as_bytes().to_vec()).unwrap_err().contains("does not match"));
+        assert!(ask(&temp.0, wire::KEY, id.as_bytes().to_vec())
+            .unwrap_err()
+            .contains("does not match"));
         assert!(ask(&temp.0, wire::KEY, b"invalid".to_vec()).is_err());
         peer.join().unwrap();
         drop(supervisor);
     }
-
 }

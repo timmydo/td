@@ -128,8 +128,14 @@ mod tests {
     fn non_executables_and_directories_are_not_commands() {
         let root = scratch("modes");
         let path = root.join("a").display().to_string();
-        assert!(resolve("plain", &path, false).is_empty(), "0644 file is not a command");
-        assert!(resolve("sub", &path, false).is_empty(), "a directory is not a command");
+        assert!(
+            resolve("plain", &path, false).is_empty(),
+            "0644 file is not a command"
+        );
+        assert!(
+            resolve("sub", &path, false).is_empty(),
+            "a directory is not a command"
+        );
         assert!(resolve("absent", &path, false).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }

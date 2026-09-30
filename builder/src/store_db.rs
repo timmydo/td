@@ -19,7 +19,15 @@
 //! big-endian; lengths are SQLite varints (big-endian base-128, high bit =
 //! continue, up to 9 bytes).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 const PAGE_SIZE: usize = 4096;
 const HEADER_LEN: usize = 100;
@@ -125,7 +133,10 @@ fn record(values: &[Value]) -> Vec<u8> {
     // header-length varint is one byte and header_len = 1 + types.len().
     let mut out = Vec::new();
     let header_len = 1 + types.len() as u64;
-    debug_assert!(header_len < 128, "header length must be a 1-byte varint here");
+    debug_assert!(
+        header_len < 128,
+        "header length must be a 1-byte varint here"
+    );
     put_varint(&mut out, header_len);
     out.extend_from_slice(&types);
     out.extend_from_slice(&body);
@@ -164,7 +175,10 @@ fn leaf_page_from_cells(cells: &[Vec<u8>], page_is_first: bool) -> [u8; PAGE_SIZ
         page[ptr_off..ptr_off + 2].copy_from_slice(&p.to_be_bytes());
         ptr_off += 2;
     }
-    assert!(ptr_off <= content_end, "leaf page overflow (a single cell too large?)");
+    assert!(
+        ptr_off <= content_end,
+        "leaf page overflow (a single cell too large?)"
+    );
     page
 }
 
@@ -206,7 +220,10 @@ fn pack(costs: &[usize], avail: usize) -> Vec<(usize, usize)> {
     let mut start = 0usize;
     let mut used = 0usize;
     for (i, &c) in costs.iter().enumerate() {
-        assert!(c <= avail, "a single b-tree cell exceeds one page (overflow pages unsupported)");
+        assert!(
+            c <= avail,
+            "a single b-tree cell exceeds one page (overflow pages unsupported)"
+        );
         if i > start && used + c > avail {
             groups.push((start, i));
             start = i;
@@ -268,9 +285,18 @@ pub fn write_db(tables: &[Table]) -> Vec<u8> {
     let mut next_page: u32 = 2;
     let mut rootpages: Vec<u32> = Vec::with_capacity(tables.len());
     for t in tables {
-        let cells: Vec<Vec<u8>> = t.rows.iter().map(|(rid, vals)| leaf_cell(*rid, vals)).collect();
+        let cells: Vec<Vec<u8>> = t
+            .rows
+            .iter()
+            .map(|(rid, vals)| leaf_cell(*rid, vals))
+            .collect();
         let rowids: Vec<i64> = t.rows.iter().map(|(rid, _)| *rid).collect();
-        rootpages.push(build_btree(&cells, &rowids, &mut next_page, &mut table_pages));
+        rootpages.push(build_btree(
+            &cells,
+            &rowids,
+            &mut next_page,
+            &mut table_pages,
+        ));
     }
     let total_pages = next_page - 1;
 
@@ -292,8 +318,10 @@ pub fn write_db(tables: &[Table]) -> Vec<u8> {
             )
         })
         .collect();
-    let master_cells: Vec<Vec<u8>> =
-        master_rows.iter().map(|(rid, vals)| leaf_cell(*rid, vals)).collect();
+    let master_cells: Vec<Vec<u8>> = master_rows
+        .iter()
+        .map(|(rid, vals)| leaf_cell(*rid, vals))
+        .collect();
     let mut page1 = leaf_page_from_cells(&master_cells, true);
     write_file_header(&mut page1, total_pages);
 
@@ -315,13 +343,13 @@ fn write_file_header(page1: &mut [u8; PAGE_SIZE], total_pages: u32) {
     page1[23] = 32; // leaf payload fraction
     page1[24..28].copy_from_slice(&1u32.to_be_bytes()); // file change counter
     page1[28..32].copy_from_slice(&total_pages.to_be_bytes()); // db size in pages
-    // 32..36 first freelist page = 0; 36..40 freelist count = 0
+                                                               // 32..36 first freelist page = 0; 36..40 freelist count = 0
     page1[40..44].copy_from_slice(&1u32.to_be_bytes()); // schema cookie
     page1[44..48].copy_from_slice(&4u32.to_be_bytes()); // schema format number
-    // 48..52 default page cache size = 0
-    // 52..56 largest root btree page (autovacuum) = 0
+                                                        // 48..52 default page cache size = 0
+                                                        // 52..56 largest root btree page (autovacuum) = 0
     page1[56..60].copy_from_slice(&1u32.to_be_bytes()); // text encoding: UTF-8
-    // 60..64 user version = 0; 64..68 incremental-vacuum = 0; 68..92 reserved
+                                                        // 60..64 user version = 0; 64..68 incremental-vacuum = 0; 68..92 reserved
     page1[92..96].copy_from_slice(&1u32.to_be_bytes()); // version-valid-for
     page1[96..100].copy_from_slice(&3_046_000u32.to_be_bytes()); // SQLite version
 }
@@ -353,7 +381,10 @@ mod tests {
         // Boundary: (2^56 - 1) is the largest 8-byte varint; 2^56 needs 9; the
         // 9-byte form's last byte is a FULL 8 bits (not 7) — u64::MAX is all 0xff.
         // (2^56-1) is 8 groups of 7 bits: 7 continue bytes then a terminal 0x7f.
-        assert_eq!(varint((1u64 << 56) - 1), vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]);
+        assert_eq!(
+            varint((1u64 << 56) - 1),
+            vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]
+        );
         assert_eq!(varint(1u64 << 56).len(), 9);
         assert_eq!(varint(u64::MAX), vec![0xff; 9]);
     }
@@ -385,7 +416,10 @@ mod tests {
         let t = Table {
             name: "ValidPaths",
             sql: "CREATE TABLE ValidPaths (id integer primary key, path text)",
-            rows: vec![(1, vec![Value::Null, Value::Text("/gnu/store/x".to_string())])],
+            rows: vec![(
+                1,
+                vec![Value::Null, Value::Text("/gnu/store/x".to_string())],
+            )],
         };
         let db = write_db(&[t]);
         assert_eq!(&db[0..16], b"SQLite format 3\0");
@@ -396,18 +430,28 @@ mod tests {
         assert_eq!(db[HEADER_LEN], LEAF);
         // page 2 is the ValidPaths leaf with one cell.
         assert_eq!(db[PAGE_SIZE], LEAF);
-        assert_eq!(u16::from_be_bytes([db[PAGE_SIZE + 3], db[PAGE_SIZE + 4]]), 1);
+        assert_eq!(
+            u16::from_be_bytes([db[PAGE_SIZE + 3], db[PAGE_SIZE + 4]]),
+            1
+        );
     }
 
     #[test]
     fn empty_table_is_one_empty_leaf() {
         // The flat store-add case: a path with no refs / no deriver-output rows.
         // An empty table must be a single empty leaf page (not a panic on rowids[-1]).
-        let t = Table { name: "Refs", sql: "CREATE TABLE Refs (referrer integer, reference integer)", rows: vec![] };
+        let t = Table {
+            name: "Refs",
+            sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+            rows: vec![],
+        };
         let db = write_db(&[t]);
         assert_eq!(db.len(), 2 * PAGE_SIZE); // page 1 (master) + 1 empty leaf
         assert_eq!(db[PAGE_SIZE], LEAF); // page 2 is a leaf
-        assert_eq!(u16::from_be_bytes([db[PAGE_SIZE + 3], db[PAGE_SIZE + 4]]), 0); // 0 cells
+        assert_eq!(
+            u16::from_be_bytes([db[PAGE_SIZE + 3], db[PAGE_SIZE + 4]]),
+            0
+        ); // 0 cells
     }
 
     #[test]
@@ -415,7 +459,12 @@ mod tests {
         // Enough rows to overflow one leaf: the table b-tree grows an interior
         // root (type 0x05) above multiple leaves, and the page count reflects it.
         let rows: Vec<(i64, Vec<Value>)> = (1..=2000)
-            .map(|i| (i, vec![Value::Null, Value::Text(format!("/gnu/store/{i:0>40}-p"))]))
+            .map(|i| {
+                (
+                    i,
+                    vec![Value::Null, Value::Text(format!("/gnu/store/{i:0>40}-p"))],
+                )
+            })
             .collect();
         let t = Table {
             name: "ValidPaths",
@@ -424,7 +473,10 @@ mod tests {
         };
         let db = write_db(&[t]);
         let pages = u32::from_be_bytes([db[28], db[29], db[30], db[31]]) as usize;
-        assert!(pages > 3, "2000 rows must span multiple leaves + an interior page, got {pages}");
+        assert!(
+            pages > 3,
+            "2000 rows must span multiple leaves + an interior page, got {pages}"
+        );
         assert_eq!(db.len(), pages * PAGE_SIZE);
         // The ValidPaths rootpage (from sqlite_master) must be an INTERIOR page.
         // It is the last page written (built after its leaves).

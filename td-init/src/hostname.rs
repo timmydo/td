@@ -39,9 +39,9 @@ fn plan(args: &[String]) -> Result<Plan, String> {
         match a.as_str() {
             "-s" | "--short" => short = true,
             "-F" | "--file" => {
-                let f = rest.next().ok_or_else(|| {
-                    format!("option '{a}' needs a FILE argument\n{}", usage())
-                })?;
+                let f = rest
+                    .next()
+                    .ok_or_else(|| format!("option '{a}' needs a FILE argument\n{}", usage()))?;
                 if file.is_some() {
                     return Err(format!("'{a}' given twice\n{}", usage()));
                 }
@@ -107,8 +107,7 @@ fn short_form(name: &str) -> &str {
 
 fn set(name: &str) -> Result<u8, String> {
     validate(name)?;
-    sys::sethostname(name.as_bytes())
-        .map_err(|e| format!("sethostname('{name}'): {e}"))?;
+    sys::sethostname(name.as_bytes()).map_err(|e| format!("sethostname('{name}'): {e}"))?;
     Ok(0)
 }
 
@@ -124,8 +123,7 @@ pub fn run(args: &[String]) -> Result<u8, String> {
         }
         Plan::SetLiteral(name) => set(&name),
         Plan::SetFromFile(path) => {
-            let text =
-                std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
             let name = from_file_text(&text).map_err(|e| format!("{path}: {e}"))?;
             set(&name)
         }
@@ -177,7 +175,10 @@ mod tests {
     #[test]
     fn the_file_reader_skips_blanks_and_comments() {
         assert_eq!(from_file_text("td\n").unwrap(), "td");
-        assert_eq!(from_file_text("\n\n  # a comment\n  td.local \n").unwrap(), "td.local");
+        assert_eq!(
+            from_file_text("\n\n  # a comment\n  td.local \n").unwrap(),
+            "td.local"
+        );
         assert!(from_file_text("").is_err());
         assert!(from_file_text("# only a comment\n").is_err());
     }

@@ -1,6 +1,4 @@
-use crate::ladder::{
-    post_bootstrap_path, split_target_debug, unpack_into, POST_BOOTSTRAP_SH,
-};
+use crate::ladder::{post_bootstrap_path, split_target_debug, unpack_into, POST_BOOTSTRAP_SH};
 use crate::types::{Recipe, Step, TextEdit};
 
 // LibreSSL 4.3.2 provides the OpenSSL-compatible TLS surface curl and Git will

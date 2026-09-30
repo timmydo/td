@@ -10,8 +10,14 @@ use crate::types::{Recipe, Step};
 // of td-compositor's is on it.
 const MAIN_RS: &str = include_str!("../../../td-compositor/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
-    ("secret_client", include_str!("../../../td-compositor/src/secret_client.rs")),
-    ("app_policy", include_str!("../../../td-busd/src/app_policy.rs")),
+    (
+        "secret_client",
+        include_str!("../../../td-compositor/src/secret_client.rs"),
+    ),
+    (
+        "app_policy",
+        include_str!("../../../td-busd/src/app_policy.rs"),
+    ),
     (
         "attention",
         include_str!("../../../td-compositor/src/attention.rs"),
@@ -25,7 +31,10 @@ const MODULES: &[(&str, &str)] = &[
         "buffer",
         include_str!("../../../td-compositor/src/buffer.rs"),
     ),
-    ("client", include_str!("../../../td-compositor/src/client.rs")),
+    (
+        "client",
+        include_str!("../../../td-compositor/src/client.rs"),
+    ),
     (
         "client_resources",
         include_str!("../../../td-compositor/src/client_resources.rs"),
@@ -36,9 +45,15 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/configure.rs"),
     ),
     ("conn", include_str!("../../../td-compositor/src/conn.rs")),
-    ("control", include_str!("../../../td-compositor/src/control.rs")),
+    (
+        "control",
+        include_str!("../../../td-compositor/src/control.rs"),
+    ),
     ("drm", include_str!("../../../td-compositor/src/drm.rs")),
-    ("filter", include_str!("../../../td-compositor/src/filter.rs")),
+    (
+        "filter",
+        include_str!("../../../td-compositor/src/filter.rs"),
+    ),
     ("font", include_str!("../../../td-compositor/src/font.rs")),
     (
         "font_data",
@@ -63,7 +78,10 @@ const MODULES: &[(&str, &str)] = &[
         "launcher",
         include_str!("../../../td-compositor/src/launcher.rs"),
     ),
-    ("layout", include_str!("../../../td-compositor/src/layout.rs")),
+    (
+        "layout",
+        include_str!("../../../td-compositor/src/layout.rs"),
+    ),
     (
         "output",
         include_str!("../../../td-compositor/src/output.rs"),
@@ -95,7 +113,10 @@ const MODULES: &[(&str, &str)] = &[
         "session",
         include_str!("../../../td-compositor/src/session.rs"),
     ),
-    ("socket", include_str!("../../../td-compositor/src/socket.rs")),
+    (
+        "socket",
+        include_str!("../../../td-compositor/src/socket.rs"),
+    ),
     ("sys", include_str!("../../../td-compositor/src/sys.rs")),
     ("term", include_str!("../../../td-compositor/src/term.rs")),
     (
@@ -106,10 +127,19 @@ const MODULES: &[(&str, &str)] = &[
         "terminfo",
         include_str!("../../../td-compositor/src/terminfo.rs"),
     ),
-    ("timezone", include_str!("../../../td-compositor/src/timezone.rs")),
+    (
+        "timezone",
+        include_str!("../../../td-compositor/src/timezone.rs"),
+    ),
     ("ui", include_str!("../../../td-compositor/src/ui.rs")),
-    ("vm_bridge", include_str!("../../../td-compositor/src/vm_bridge.rs")),
-    ("vm_wire", include_str!("../../../td-compositor/src/vm_wire.rs")),
+    (
+        "vm_bridge",
+        include_str!("../../../td-compositor/src/vm_bridge.rs"),
+    ),
+    (
+        "vm_wire",
+        include_str!("../../../td-compositor/src/vm_wire.rs"),
+    ),
     ("wire", include_str!("../../../td-compositor/src/wire.rs")),
 ];
 
@@ -331,9 +361,8 @@ pub fn recipe() -> Recipe {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::ladder::{TD_COMPOSITOR_FLIP_MARKER, TD_COMPOSITOR_KMS_MARKER};
     use super::super::system_x86_64::{ROOTCHECK_ETC_NAME, SHADOW_ETC_NAME};
+    use super::*;
     use crate::ladder::{
         TD_APPLICATION_CONFIG_PATH, TD_APPLICATION_LAUNCHER_TABLE, TD_APPLICATION_REGISTRY,
         TD_JAIL_FIXTURE_ALIAS, TD_JAIL_FIXTURE_DOWNLOAD_TARGET, TD_JAIL_FIXTURE_ENTRY,
@@ -341,12 +370,11 @@ mod tests {
         TD_POINTER_ABSOLUTE_MARKER, TD_TERM_RUNTIME_MARKER, TD_UI_CLIENT_RUNTIME_MARKER,
         TD_WAYLAND_RUNTIME_MARKER,
     };
+    use crate::ladder::{TD_COMPOSITOR_FLIP_MARKER, TD_COMPOSITOR_KMS_MARKER};
 
     #[test]
     fn embedded_rust_does_not_contain_live_recipe_templates() {
-        for (name, source) in
-            std::iter::once(("main", MAIN_RS)).chain(MODULES.iter().copied())
-        {
+        for (name, source) in std::iter::once(("main", MAIN_RS)).chain(MODULES.iter().copied()) {
             for template in [
                 "{root}",
                 "{src}",
@@ -426,18 +454,23 @@ mod tests {
             .collect();
         let compile = runs
             .iter()
-            .position(|argv| {
-                argv.iter()
-                    .any(|arg| arg == "td_compositor_session_tests")
-            })
+            .position(|argv| argv.iter().any(|arg| arg == "td_compositor_session_tests"))
             .unwrap();
         let execute = runs
             .iter()
             .position(|argv| argv.as_slice() == ["{root}/session-tests", "authority::"])
             .unwrap();
         assert!(compile < execute);
-        for filter in ["secret_client::", "physical_attention_", "timezone::", "clock::", "bar::"] {
-            assert!(runs.iter().any(|argv| argv.as_slice() == ["{root}/session-tests", filter]));
+        for filter in [
+            "secret_client::",
+            "physical_attention_",
+            "timezone::",
+            "clock::",
+            "bar::",
+        ] {
+            assert!(runs
+                .iter()
+                .any(|argv| argv.as_slice() == ["{root}/session-tests", filter]));
         }
         let args = runs[compile];
         assert!(args.iter().any(|arg| arg == "--test"));
@@ -518,8 +551,7 @@ mod tests {
             );
         }
         assert!(fixture_mounts.contains("(\"/etc\", \"configuration\")"));
-        assert!(fixture_mounts
-            .contains("for immutable_root in [\"/app\", \"/usr\", \"/etc\"]"));
+        assert!(fixture_mounts.contains("for immutable_root in [\"/app\", \"/usr\", \"/etc\"]"));
         for row in [
             "const JAIL_FIXTURE_STATUS_EXIT_CODE: i32 = 70;",
             "const JAIL_FIXTURE_BOUNDARY_EXIT_CODE: i32 = 71;",
@@ -546,9 +578,9 @@ mod tests {
             td_engine::application::RESERVED_APPLICATION_NAMES
         )));
         assert!(launcher.contains("pub client: Option<PathBuf>"));
-        assert!(launcher.contains(
-            "exactly one launcher client or launcher application is required"
-        ));
+        assert!(
+            launcher.contains("exactly one launcher client or launcher application is required")
+        );
         for fragment in [
             "application.name.starts_with('-')",
             "application.name == \".\"",
@@ -565,9 +597,8 @@ mod tests {
             .iter()
             .find_map(|(name, source)| (*name == "input").then_some(*source))
             .expect("input source");
-        assert!(input.contains(
-            "request == LaunchRequest::UiDemo && self.launches.activates_application()"
-        ));
+        assert!(input
+            .contains("request == LaunchRequest::UiDemo && self.launches.activates_application()"));
         assert!(input.contains(".activate_application()?"));
         let server = MODULES
             .iter()

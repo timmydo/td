@@ -90,7 +90,8 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
 }
 
 pub fn run(args: &[String]) -> Result<u8, String> {
-    let opts = parse(args).map_err(|e| format!("{e}\nusage: login [-p] [-h HOST] [-f USER] [USER]"))?;
+    let opts =
+        parse(args).map_err(|e| format!("{e}\nusage: login [-p] [-h HOST] [-f USER] [USER]"))?;
     let status = Status::read()?;
     let (target, forced) = opts.target();
     // `-f` bypasses the account's own secret, so it is root's to use. Without
@@ -99,7 +100,11 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     if forced && !status.is_root() {
         return Err("only root may use -f (it starts a session without authenticating)".into());
     }
-    let mode = if opts.preserve { Env::Preserve } else { Env::Fresh };
+    let mode = if opts.preserve {
+        Env::Preserve
+    } else {
+        Env::Fresh
+    };
     match target {
         Some(name) => start(name, forced, mode, &status),
         None => ask(mode, &status),

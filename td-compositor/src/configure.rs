@@ -311,9 +311,7 @@ mod tests {
         let mut tracker = ConfigureTracker::new();
         tracker.initial(1).unwrap();
         tracker.acknowledge(1).unwrap();
-        tracker
-            .update(visible(320, 200, false, false), 2)
-            .unwrap();
+        tracker.update(visible(320, 200, false, false), 2).unwrap();
         assert!(tracker.update(ViewStatus::Unmapped, 3).unwrap().is_none());
         assert!(tracker
             .update(visible(320, 200, false, false), 4)

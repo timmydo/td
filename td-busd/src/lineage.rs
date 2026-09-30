@@ -756,9 +756,7 @@ impl Instances {
         let stat = match procfs.stat(pid) {
             Reading::Of(stat) => stat,
             Reading::Gone => return Err(format!("pid {pid} does not exist")),
-            Reading::Unreadable => {
-                return Err(format!("pid {pid} has no readable /proc entry"))
-            }
+            Reading::Unreadable => return Err(format!("pid {pid} has no readable /proc entry")),
         };
         let mut state = self
             .inner
@@ -817,7 +815,9 @@ impl Instances {
         // mislabelling a process it already owns, which is §D's v1 exposure,
         // rather than reaching one it does not.
         if stat.ppid != completer.pid {
-            return Err(format!("pid {pid} is not a child of the registering process"));
+            return Err(format!(
+                "pid {pid} is not a child of the registering process"
+            ));
         }
         if state.live.iter().any(|i| i.pid == pid) {
             return Err(format!("pid {pid} is already bound to an instance"));
@@ -1024,11 +1024,7 @@ impl Instances {
             match standing_of(procfs, instance) {
                 Standing::There => {}
                 Standing::Gone => {
-                    gone.push((
-                        instance.instance.clone(),
-                        instance.pid,
-                        instance.starttime,
-                    ));
+                    gone.push((instance.instance.clone(), instance.pid, instance.starttime));
                 }
                 // Refused, and NOT reaped. The distinction is the whole point
                 // of `Reading`: dropping a record the broker merely failed to
@@ -1559,7 +1555,9 @@ mod tests {
                 instances.constrain(uid, Identity::Unconfined),
                 Identity::Unconfined
             );
-            assert!(instances.constrain(uid, Identity::Unknown("unproved".into())).is_unknown());
+            assert!(instances
+                .constrain(uid, Identity::Unknown("unproved".into()))
+                .is_unknown());
         }
     }
 
@@ -1628,11 +1626,17 @@ mod tests {
     fn a_process_descending_from_no_instance_is_unconfined() {
         let table = Table::with(&[(1, 0, 1), (100, 1, 10), (400, 1, 40)]);
         let live = [instance("one", 100, 10)];
-        assert_eq!(resolve_against(&table, &live, &[], &[], 400), Identity::Unconfined);
+        assert_eq!(
+            resolve_against(&table, &live, &[], &[], 400),
+            Identity::Unconfined
+        );
         // An empty registry is the same claim about a smaller set, and it must
         // not accidentally be `Unknown` — the broker starts here, and every
         // peer on a bus with no jails is unconfined.
-        assert_eq!(resolve_against(&table, &[], &[], &[], 400), Identity::Unconfined);
+        assert_eq!(
+            resolve_against(&table, &[], &[], &[], 400),
+            Identity::Unconfined
+        );
     }
 
     /// The finding §D was written against: the substitution the ENDPOINT check
@@ -1656,12 +1660,22 @@ mod tests {
         let live = [instance("one", 100, 10)];
         // Undisturbed, 300 is unconfined: its parent 200 is a child of pid 1.
         let table = Table::with(&[(1, 0, 1), (100, 1, 10), (200, 1, 20), (300, 200, 30)]);
-        assert_eq!(resolve_against(&table, &live, &[], &[], 300), Identity::Unconfined);
+        assert_eq!(
+            resolve_against(&table, &live, &[], &[], 300),
+            Identity::Unconfined
+        );
 
         // Now let the walk read the impostor: swapped in after the first read
         // (300) and before the second (200).
         let table = Table::with(&[(1, 0, 1), (100, 1, 10), (200, 1, 20), (300, 200, 30)]);
-        table.swap_after(1, 200, Some(Stat { ppid: 100, starttime: 35 }));
+        table.swap_after(
+            1,
+            200,
+            Some(Stat {
+                ppid: 100,
+                starttime: 35,
+            }),
+        );
         match resolve_against(&table, &live, &[], &[], 300) {
             Identity::Unknown(why) => assert!(
                 why.contains("was reused"),
@@ -1694,10 +1708,9 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (100, 1, 10), (200, 100, 90), (300, 200, 30)]);
         let live = [instance("one", 100, 10)];
         match resolve_against(&table, &live, &[], &[], 300) {
-            Identity::Unknown(why) => assert!(
-                why.contains("was reused"),
-                "the reuse must be named: {why}"
-            ),
+            Identity::Unknown(why) => {
+                assert!(why.contains("was reused"), "the reuse must be named: {why}")
+            }
             other => panic!("a parent younger than its child resolved as {other:?}"),
         }
     }
@@ -1782,7 +1795,6 @@ mod tests {
 
         assert_eq!(parse_stat(b"nonsense with no paren"), None);
         assert_eq!(parse_stat(b"1 (short) S 0"), None);
-
     }
 
     /// A `comm` that is not UTF-8 must not make a process unreadable.
@@ -1834,7 +1846,12 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (400, 1, 40)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         instances
             .complete(&table, &token, 100, 1000, table.caller(900))
@@ -1914,10 +1931,20 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let first = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         let second = instances
-            .open(&table, registration("two", "org.td.Two"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("two", "org.td.Two"),
+                1000,
+                table.caller(900),
+            )
             .expect("a second instance opens");
         instances
             .complete(&table, &first, 100, 1000, table.caller(900))
@@ -1957,7 +1984,12 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         instances
             .complete(&table, &token, 100, 1000, table.caller(900))
@@ -1967,9 +1999,9 @@ mod tests {
         // dropping any one of them from the key fails here rather than
         // needing all three to be wrong at once.
         for stale in [
-            ("one".to_string(), 100, 10),  // same name and pid, older process
-            ("one".to_string(), 700, 95),  // same name and start time, other pid
-            ("two".to_string(), 100, 95),  // same pid and start time, other name
+            ("one".to_string(), 100, 10), // same name and pid, older process
+            ("one".to_string(), 700, 95), // same name and start time, other pid
+            ("two".to_string(), 100, 95), // same pid and start time, other name
         ] {
             instances.reap(std::slice::from_ref(&stale));
             assert_eq!(
@@ -1994,7 +2026,12 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (700, 1, 70)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
 
         for stranger in [1, 700] {
@@ -2020,7 +2057,12 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (901, 1, 91)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         let error = instances
             .complete(&table, &token, 100, 1000, table.caller(901))
@@ -2045,10 +2087,21 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
 
-        table.replace(900, Stat { ppid: 1, starttime: 91 });
+        table.replace(
+            900,
+            Stat {
+                ppid: 1,
+                starttime: 91,
+            },
+        );
         let error = instances
             .complete(&table, &token, 100, 1000, table.caller(900))
             .expect_err("a stranger wearing the registrant's pid completed it");
@@ -2076,7 +2129,12 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (901, 1, 90)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         let error = instances
             .complete(&table, &token, 100, 1000, table.caller(901))
@@ -2098,9 +2156,20 @@ mod tests {
             let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
             let instances = Instances::new();
             let token = instances
-                .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+                .open(
+                    &table,
+                    registration("one", "org.td.One"),
+                    1000,
+                    table.caller(900),
+                )
                 .expect("phase one opens");
-            table.replace(900, Stat { ppid: 1, starttime: theirs });
+            table.replace(
+                900,
+                Stat {
+                    ppid: 1,
+                    starttime: theirs,
+                },
+            );
             let error = instances
                 .complete(&table, &token, 100, 1000, table.caller(900))
                 .expect_err("a process of another age completed the registration");
@@ -2115,7 +2184,12 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         let Some(later) = Instant::now()
             .checked_add(PENDING_LIFETIME)
@@ -2145,10 +2219,20 @@ mod tests {
         let table = Table::with(&[(900, 1, 90)]);
         let instances = Instances::new();
         let first = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         let second = instances
-            .open(&table, registration("two", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("two", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("a second registration opens");
         assert_ne!(first, second);
         for token in [&first, &second] {
@@ -2174,7 +2258,12 @@ mod tests {
         // would hand out the same first token for the same instance name.
         let elsewhere = Instances::new();
         let same_name = elsewhere
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("a second registry opens");
         assert_ne!(
             first, same_name,
@@ -2195,7 +2284,10 @@ mod tests {
             panic!("this process has no readable /proc entry");
         };
         assert!(stat.ppid > 0, "a test process has a parent");
-        assert!(stat.starttime > 0, "a running process started at some point");
+        assert!(
+            stat.starttime > 0,
+            "a running process started at some point"
+        );
     }
 
     /// `fdinfo`, the four things it can say, against files rather than the
@@ -2332,7 +2424,12 @@ mod tests {
         let clean = Table::with(rows);
         let instances = Instances::new();
         let token = instances
-            .open(&clean, registration("one", "org.td.One"), 1000, clean.caller(900))
+            .open(
+                &clean,
+                registration("one", "org.td.One"),
+                1000,
+                clean.caller(900),
+            )
             .expect("phase one opens");
         instances
             .complete(&clean, &token, 400, 1000, clean.caller(900))
@@ -2344,7 +2441,12 @@ mod tests {
         let table = Table::with(rows);
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         instances
             .complete(&table, &token, 400, 1000, table.caller(900))
@@ -2379,7 +2481,12 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (400, 900, 95), (401, 400, 96)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         instances
             .complete(&table, &token, 400, 1000, table.caller(900))
@@ -2424,7 +2531,12 @@ mod tests {
         table.pidfd_always(Named::Pid(401));
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         instances
             .complete(&table, &token, 400, 1000, table.caller(900))
@@ -2500,13 +2612,20 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         let wrong = instances.complete(&table, &token, 100, 1001, table.caller(900));
         assert!(wrong.is_err(), "another uid completed the registration");
         // And the token survives a refused attempt rather than being burned by
         // it, or anyone could deny a launch by guessing at it once.
-        assert!(instances.complete(&table, &token, 100, 1000, table.caller(900)).is_ok());
+        assert!(instances
+            .complete(&table, &token, 100, 1000, table.caller(900))
+            .is_ok());
     }
 
     #[test]
@@ -2514,7 +2633,12 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         let error = instances
             .complete(&table, &token, 700, 1000, table.caller(900))
@@ -2558,7 +2682,12 @@ mod tests {
 
         let fresh = Instances::new();
         fresh
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("first");
         assert!(
             fresh
@@ -2733,7 +2862,12 @@ mod tests {
                 .expect("under the ceiling");
         }
         assert!(instances
-            .open(&table, registration("more", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("more", "org.td.One"),
+                1000,
+                table.caller(900)
+            )
             .is_err());
 
         let Some(later) = Instant::now()
@@ -2743,7 +2877,13 @@ mod tests {
             return;
         };
         instances
-            .open_at(&table, registration("more", "org.td.One"), 1000, table.caller(900), later)
+            .open_at(
+                &table,
+                registration("more", "org.td.One"),
+                1000,
+                table.caller(900),
+                later,
+            )
             .expect("the abandoned registrations no longer hold their slots");
         assert_eq!(instances.pending_count(), 1);
     }
@@ -2778,13 +2918,23 @@ mod tests {
         }
         assert_eq!(instances.live_count(), MAX_INSTANCES);
         assert!(instances
-            .open(&table, registration("more", "fixture"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("more", "fixture"),
+                1000,
+                table.caller(900)
+            )
             .is_err());
 
         // Every jail exits, and no connection arrives to notice.
         let after = Table::with(&[(1, 0, 1), (900, 1, 90)]);
         instances
-            .open(&after, registration("more", "fixture"), 1000, after.caller(900))
+            .open(
+                &after,
+                registration("more", "fixture"),
+                1000,
+                after.caller(900),
+            )
             .expect("dead instances still held their slots");
     }
 
@@ -2799,7 +2949,12 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95), (400, 1, 40)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         instances
             .complete(&table, &token, 100, 1000, table.caller(900))
@@ -2812,7 +2967,11 @@ mod tests {
         // same call.
         let after = Table::with(&[(1, 0, 1), (900, 1, 90), (400, 1, 40)]);
         assert_eq!(instances.resolve(&after, 400), Identity::Unconfined);
-        assert_eq!(instances.live_count(), 0, "the dead instance was not reaped");
+        assert_eq!(
+            instances.live_count(),
+            0,
+            "the dead instance was not reaped"
+        );
     }
 
     /// The reap refuses the connection it actually endangers, and only that
@@ -2833,7 +2992,12 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
         let instances = Instances::new();
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         instances
             .complete(&table, &token, 100, 1000, table.caller(900))
@@ -2844,7 +3008,11 @@ mod tests {
             Identity::Unknown(why) => assert!(why.contains("passes through it"), "{why}"),
             other => panic!("a peer descending from a reaped pid resolved as {other:?}"),
         }
-        assert_eq!(instances.live_count(), 0, "the dead instance was not reaped");
+        assert_eq!(
+            instances.live_count(),
+            0,
+            "the dead instance was not reaped"
+        );
         // A peer elsewhere in the tree is unaffected, which is the half a
         // blanket refusal gave away.
         assert_eq!(instances.resolve(&after, 500), Identity::Unconfined);
@@ -2872,7 +3040,12 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (950, 900, 95)]);
         let instances = Instances::new();
         instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         // While the registrant that opened it is still there, its descendant
         // is denied -- which is the rule working.
@@ -2883,7 +3056,13 @@ mod tests {
 
         // The registrant ends and its number is handed on. 950 is now a child
         // of a process that never registered anything.
-        table.replace(900, Stat { ppid: 1, starttime: 91 });
+        table.replace(
+            900,
+            Stat {
+                ppid: 1,
+                starttime: 91,
+            },
+        );
         assert_eq!(
             instances.resolve(&table, 950),
             Identity::Unconfined,
@@ -2910,7 +3089,12 @@ mod tests {
         ]);
         let instances = Instances::new();
         instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         match instances.resolve(&table, 950) {
             Identity::Unknown(why) => assert!(why.contains("in flight"), "{why}"),
@@ -2943,7 +3127,12 @@ mod tests {
         assert_eq!(instances.resolve(&table, 400), Identity::Unconfined);
 
         let token = instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
 
         // A peer that could belong to the pending instance is refused...
@@ -2986,7 +3175,12 @@ mod tests {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (950, 900, 95)]);
         let instances = Instances::new();
         instances
-            .open(&table, registration("one", "org.td.One"), 1000, table.caller(900))
+            .open(
+                &table,
+                registration("one", "org.td.One"),
+                1000,
+                table.caller(900),
+            )
             .expect("phase one opens");
         assert_eq!(instances.pending_count(), 1);
         assert!(matches!(
@@ -3004,7 +3198,10 @@ mod tests {
         let Some(later) = later else {
             return;
         };
-        assert_eq!(instances.resolve_at(&table, 950, later), Identity::Unconfined);
+        assert_eq!(
+            instances.resolve_at(&table, 950, later),
+            Identity::Unconfined
+        );
         assert_eq!(instances.pending_count(), 0, "resolve did not sweep");
     }
 

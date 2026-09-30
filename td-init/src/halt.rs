@@ -44,10 +44,7 @@ struct Plan {
 /// Options are parsed BEFORE anything irreversible happens, so a typo exits 1
 /// instead of powering the machine off.
 fn parse(name: &str, cmd: usize, args: &[String]) -> Result<Plan, String> {
-    let mut plan = Plan {
-        do_sync: true,
-        cmd,
-    };
+    let mut plan = Plan { do_sync: true, cmd };
     // `-p` means "power off INSTEAD of halting", so it is meaningful only where
     // halting is the default. `reboot -p` on a headless machine would mean
     // "never comes back" rather than "reboots".
@@ -188,7 +185,10 @@ mod tests {
             ("poweroff", sys::REBOOT_POWER_OFF),
         ] {
             assert!(plan(name, cmd, &["-p"]).is_err(), "{name} -p");
-            assert!(plan(name, cmd, &["--poweroff"]).is_err(), "{name} --poweroff");
+            assert!(
+                plan(name, cmd, &["--poweroff"]).is_err(),
+                "{name} --poweroff"
+            );
             assert!(plan(name, cmd, &["-fp"]).is_err(), "{name} -fp");
         }
         // The usage text only advertises it where it works.

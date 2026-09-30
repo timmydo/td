@@ -2043,8 +2043,7 @@ mod tests {
         fn new_in(parent: &Path) -> Self {
             for _ in 0..64 {
                 let n = TEMP_SERIAL.fetch_add(1, Ordering::Relaxed);
-                let path = parent
-                    .join(format!("td-editor-files-test-{}-{n}", std::process::id()));
+                let path = parent.join(format!("td-editor-files-test-{}-{n}", std::process::id()));
                 match fs::create_dir(&path) {
                     Ok(()) => return Self(path),
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -2168,19 +2167,30 @@ mod tests {
         // The trusted-root runner supplies a separately mounted /dev/shm.
         let source = Directory::new();
         let destination = Directory::new_in(Path::new("/dev/shm"));
-        assert_ne!(fs::metadata(&source.0).unwrap().dev(),
+        assert_ne!(
+            fs::metadata(&source.0).unwrap().dev(),
             fs::metadata(&destination.0).unwrap().dev(),
-            "run with TD_TEST_TRUSTED_ROOT=1 for distinct fixture filesystems");
+            "run with TD_TEST_TRUSTED_ROOT=1 for distinct fixture filesystems"
+        );
         let old = source.write("source", b"disk");
         let mut files = Session::default();
         let id = files.open(&old).unwrap();
         let before = Stamp::read(&fs::metadata(&old).unwrap());
-        let copied = files.copy(RenameSource::inspect(&old).unwrap(),
-            destination.path("copy").as_os_str()).unwrap();
+        let copied = files
+            .copy(
+                RenameSource::inspect(&old).unwrap(),
+                destination.path("copy").as_os_str(),
+            )
+            .unwrap();
         assert!(copied.warning.is_none());
         assert_eq!(fs::read(&copied.path).unwrap(), b"disk");
-        let error = files.rename(RenameSource::inspect(&old).unwrap(),
-            destination.path("move").as_os_str()).err().unwrap();
+        let error = files
+            .rename(
+                RenameSource::inspect(&old).unwrap(),
+                destination.path("move").as_os_str(),
+            )
+            .err()
+            .unwrap();
         assert_eq!(error.kind, Kind::Io);
         assert!(error.publication_attempted && !error.published);
         assert_eq!(Stamp::read(&fs::metadata(&old).unwrap()), before);

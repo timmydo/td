@@ -109,7 +109,12 @@ fn read(path: &str) -> Result<String, String> {
 /// Split one colon-separated line into exactly `want` fields, or fail. Trailing
 /// empty fields are real fields (`root:x:0:0::/root:/bin/sh` has two), so this
 /// counts separators rather than trimming.
-fn fields<'a>(line: &'a str, want: usize, path: &str, lineno: usize) -> Result<Vec<&'a str>, String> {
+fn fields<'a>(
+    line: &'a str,
+    want: usize,
+    path: &str,
+    lineno: usize,
+) -> Result<Vec<&'a str>, String> {
     let got: Vec<&str> = line.split(':').collect();
     if got.len() != want {
         return Err(format!(
@@ -296,7 +301,10 @@ mod tests {
         assert_eq!(tester.shell, "/bin/sh");
         assert_eq!(account_in(PW, PASSWD, "root").unwrap().uid, 0);
         assert_eq!(supplementary_in(GR, GROUP, "tester").unwrap(), vec![10]);
-        assert_eq!(supplementary_in(GR, GROUP, "root").unwrap(), Vec::<u32>::new());
+        assert_eq!(
+            supplementary_in(GR, GROUP, "root").unwrap(),
+            Vec::<u32>::new()
+        );
         assert_eq!(secret_in(SH, SHADOW, "tester").unwrap(), Secret::NoPassword);
     }
 
@@ -333,7 +341,10 @@ mod tests {
         assert!(account_in(PW, PASSWD, "nobody").is_err());
         assert!(secret_in(SH, SHADOW, "nobody").is_err());
         // ...but an unknown user simply belongs to no groups.
-        assert_eq!(supplementary_in(GR, GROUP, "nobody").unwrap(), Vec::<u32>::new());
+        assert_eq!(
+            supplementary_in(GR, GROUP, "nobody").unwrap(),
+            Vec::<u32>::new()
+        );
     }
 
     /// The duplicate-entry refusal, both files. "First wins" and "last wins" are
@@ -471,7 +482,10 @@ mod tests {
             Err(Denied::NeedsPassword)
         );
         assert_eq!(may_start_session(Secret::Hashed, true), Ok(()));
-        assert_eq!(may_start_session(Secret::Locked, false), Err(Denied::Locked));
+        assert_eq!(
+            may_start_session(Secret::Locked, false),
+            Err(Denied::Locked)
+        );
         assert_eq!(may_start_session(Secret::Locked, true), Err(Denied::Locked));
         assert_eq!(
             may_start_session(Secret::Service, false),

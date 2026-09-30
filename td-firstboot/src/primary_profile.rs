@@ -162,14 +162,20 @@ pub(crate) fn prepare(root: &Path) -> Result<String, String> {
         read_only(&root.join("etc").join(leaf))
             .map_err(|error| format!("primary {leaf}: {error}"))?;
     }
-    let published = principals::primary_in_root(root)
-        .map_err(|error| format!("verify published primary tables in {}: {error}", root.display()))?;
+    let published = principals::primary_in_root(root).map_err(|error| {
+        format!(
+            "verify published primary tables in {}: {error}",
+            root.display()
+        )
+    })?;
     if published.name() != expected {
         return Err("published primary account does not match the selected name".into());
     }
     let home = crate::primary_home::prepare(root)?;
     let marker = format!("TD-PRIMARY-PROFILE-READY {expected}\n");
-    io::stderr().lock().write_all(marker.as_bytes())
+    io::stderr()
+        .lock()
+        .write_all(marker.as_bytes())
         .map_err(|error| format!("report primary profile: {error}"))?;
     Ok(home)
 }

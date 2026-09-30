@@ -531,11 +531,13 @@ fn the_executable_replays_without_a_display_and_rejects_invalid_window_inputs() 
     assert!(output.status.success());
     assert!(output.stdout.ends_with(b"1\t1\tok\t1"));
     assert!(output.stderr.is_empty());
-    let failure = Process::new(binary).arg("--invalid-option").output().unwrap();
+    let failure = Process::new(binary)
+        .arg("--invalid-option")
+        .output()
+        .unwrap();
     assert!(!failure.status.success());
     assert!(failure.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&failure.stderr)
-        .contains("unknown window option"));
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("unknown window option"));
     let failure = Process::new(binary).env_clear().output().unwrap();
     assert!(!failure.status.success());
     assert!(failure.stdout.is_empty());
@@ -861,8 +863,8 @@ fn framed_replay_handles_split_reads_and_rejects_truncation_and_oversize() {
 /// toolkit and a chord named in the profile table are one language.
 #[test]
 fn profiles_translate_the_chords_the_shared_keymap_spells() {
-    let map = td_ui::keyboard::Keymap::parse(include_str!("../../td-ui/tests/fixtures/us.xkb"))
-        .unwrap();
+    let map =
+        td_ui::keyboard::Keymap::parse(include_str!("../../td-ui/tests/fixtures/us.xkb")).unwrap();
     let chord = |code: u32, mask: u32| {
         let modifiers = td_ui::keyboard::Modifiers {
             depressed: mask,

@@ -86,8 +86,9 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
 }
 
 pub fn run(args: &[String]) -> Result<u8, String> {
-    let opts = parse(args)
-        .map_err(|e| format!("{e}\nusage: su [-] [-l] [-m|-p] [-s SHELL] [-c CMD] [USER [ARG…]]"))?;
+    let opts = parse(args).map_err(|e| {
+        format!("{e}\nusage: su [-] [-l] [-m|-p] [-s SHELL] [-c CMD] [USER [ARG…]]")
+    })?;
     let name = opts.user.as_deref().unwrap_or(ROOT);
     // FORCED, and through the crate's one decision rather than a copy of it:
     // `su` had its own version of four of `authorize`'s five steps, which is a
@@ -105,7 +106,11 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     }
     argv.extend(opts.args.iter().cloned());
 
-    let mode = if opts.login { Env::Fresh } else { Env::Preserve };
+    let mode = if opts.login {
+        Env::Fresh
+    } else {
+        Env::Preserve
+    };
     // A login su moves to the account's home; a plain one stays where it is.
     // `None` is INHERIT, not `/`: chdir'ing into a directory the target user
     // cannot traverse would fail the exec for a reason that has nothing to do
@@ -157,7 +162,14 @@ mod tests {
     /// and run an interactive shell on a serial console instead.
     #[test]
     fn the_images_own_invocation_parses() {
-        let o = parse(&argv(&["-s", "/bin/sh", "tester", "-c", "/bin/cat /etc/os-release"])).unwrap();
+        let o = parse(&argv(&[
+            "-s",
+            "/bin/sh",
+            "tester",
+            "-c",
+            "/bin/cat /etc/os-release",
+        ]))
+        .unwrap();
         assert_eq!(o.user.as_deref(), Some("tester"));
         assert_eq!(o.shell.as_deref(), Some("/bin/sh"));
         assert_eq!(o.command.as_deref(), Some("/bin/cat /etc/os-release"));

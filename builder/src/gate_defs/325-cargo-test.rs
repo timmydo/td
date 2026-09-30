@@ -3,7 +3,7 @@
 //! engine crates (offline, toolchain-only). The loop-latency brainstorm's "push
 //! logic down into fast unit tests" first step, now also the enforcement point for
 //! the AGENTS.md Rust coding rules.
-//! 
+//!
 //! The crates are not listed here. This gate asks `td-builder gate-crates` for
 //! the same roster `affected.rs` derives from the tree, because the list it used
 //! to keep — a lock check, a clippy line, a test line and a closing sentence,
@@ -63,7 +63,7 @@
 //! FSDG crates and can't compile offline, so they are NOT linted here; their
 //! Cargo.toml still declares the same `[lints]` table so a local `cargo clippy`
 //! enforces it.
-//! 
+//!
 //! test leg: the `#[test]`s in builder/src/*.rs (NAR framing, SHA-256 vectors, drv
 //! parse/emit, the store-db SQLite encode/decode + reader, scan, sandbox) otherwise
 //! run ONLY inside the cargo-build-system package build — a full release rebuild that
@@ -71,7 +71,7 @@
 //! instead of deep in the td-builder/store/drv ladder. recipes/ tests run too —
 //! the evaluator's provenance classification and SHA-256 are enforcement code
 //! (re #469), and its regressions must red in-loop, not only in CI.
-//! 
+//!
 //! GUIX-FREE toolchain (R1 of the guix-retirement ladder, github issue #274): the Rust +
 //! C toolchain is resolved by `td-builder provision-{rust,cc}` (builder/src/stage0.rs) —
 //! the SAME guix-free resolvers the stage0 td-builder SEED build uses (a PROVIDED
@@ -80,7 +80,7 @@
 //! so a runner with no host cc/rustup and nothing mounted (the loop sandbox) can't
 //! provision one — provision-{rust,cc} then exit EXIT_UNPROVISIONED (69) and this gate
 //! degrades to a tolerated Unprovisioned/SKIP (below), while a real failure still REDs.
-//! 
+//!
 //! Offline by construction: the provisioned rust bin dir carries rustc + cargo-clippy +
 //! clippy-driver, the cargo bin dir carries cargo, and the cc bin dir (gcc-toolchain, rust's
 //! default linker driver) is prepended to PATH — all resolved guix-free by `provision-{rust,cc}`

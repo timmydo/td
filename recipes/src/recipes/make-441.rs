@@ -1,4 +1,4 @@
-use crate::ladder::{SH, mesboot0_inputs, mesboot0_path, unpack_into};
+use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, SH};
 use crate::types::{Recipe, Step};
 
 // GNU Make 4.4.1 — the make glibc 2.41's configure REQUIRES (critical version

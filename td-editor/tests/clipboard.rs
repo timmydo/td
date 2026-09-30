@@ -142,22 +142,44 @@ fn unselected_copy_and_cut_take_the_logical_line_with_its_newline() {
     let (tab, _) = target(&ui);
     let doc = ui.editor().document(tab).unwrap();
     assert_eq!(doc.text(), "é one\nlast");
-    assert_eq!(doc.selection(), Selection { anchor: 7, caret: 7 });
+    assert_eq!(
+        doc.selection(),
+        Selection {
+            anchor: 7,
+            caret: 7
+        }
+    );
     assert_eq!(doc.history_depth(), (1, 0));
     edit(&mut ui, Command::Undo);
     let doc = ui.editor().document(tab).unwrap();
     assert_eq!(doc.text(), "é one\nsecond line\nlast");
-    assert_eq!(doc.selection(), Selection { anchor: 8, caret: 8 });
+    assert_eq!(
+        doc.selection(),
+        Selection {
+            anchor: 8,
+            caret: 8
+        }
+    );
 
-    select(&mut ui, "é one\nsecond line\n".len() + 1, "é one\nsecond line\n".len() + 1);
+    select(
+        &mut ui,
+        "é one\nsecond line\n".len() + 1,
+        "é one\nsecond line\n".len() + 1,
+    );
     let captured = snapshot(&ui);
     assert_eq!(captured.text().as_ref(), "last");
     ui.dispatch(Event::Cut(captured)).unwrap();
-    assert_eq!(ui.editor().document(tab).unwrap().text(), "é one\nsecond line\n");
+    assert_eq!(
+        ui.editor().document(tab).unwrap().text(),
+        "é one\nsecond line\n"
+    );
     let (tab, revision) = target(&ui);
-    assert!(Snapshot::capture(ui.editor(), tab, revision)
-        .unwrap()
-        .is_none(), "the final empty line has no bytes to copy");
+    assert!(
+        Snapshot::capture(ui.editor(), tab, revision)
+            .unwrap()
+            .is_none(),
+        "the final empty line has no bytes to copy"
+    );
 }
 
 #[test]

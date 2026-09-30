@@ -321,8 +321,8 @@ fn open_card(path: &Path) -> Result<File, String> {
 /// most likely way this is pointed at the wrong file.
 fn discover(card: &File) -> Result<Discovery, String> {
     let driver = sys::drm_driver_name(card)?;
-    let resources = sys::drm_resources(card)
-        .map_err(|error| format!("{error} (driver {driver})"))?;
+    let resources =
+        sys::drm_resources(card).map_err(|error| format!("{error} (driver {driver})"))?;
     let scanout =
         select_scanout(card, &resources).map_err(|error| format!("{error} (driver {driver})"))?;
     Ok(Discovery { driver, scanout })
@@ -556,8 +556,7 @@ impl ScanoutBuffer {
         };
         buffer_covers_scanout(buffer.pitch, width, height, buffer.size)?;
         let region = sys::drm_map_dumb(&**card, &buffer)?;
-        registration.fb_id =
-            sys::drm_add_fb(&**card, width, height, buffer.pitch, buffer.handle)?;
+        registration.fb_id = sys::drm_add_fb(&**card, width, height, buffer.pitch, buffer.handle)?;
         Ok((
             ScanoutBuffer {
                 region,
@@ -1021,7 +1020,9 @@ impl FlipEvents {
                     .extend_from_slice(self.chunk.get(..read).unwrap_or_default()),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => {
-                    return Err(format!("read a page-flip completion from the card: {error}"))
+                    return Err(format!(
+                        "read a page-flip completion from the card: {error}"
+                    ))
                 }
             }
         }
@@ -1121,12 +1122,7 @@ pub fn open_kms(path: &Path) -> Result<(Kms, FlipEvents, String), String> {
         chunk: zeroed(4096)?,
     };
     let chain = SwapChain::new(crtc, [first, second], output, stride)?;
-    let described = format!(
-        "{} fb={},{} modeset=ok",
-        discovery.describe(),
-        fbs.0,
-        fbs.1
-    );
+    let described = format!("{} fb={},{} modeset=ok", discovery.describe(), fbs.0, fbs.1);
     Ok((chain, events, described))
 }
 
@@ -1240,7 +1236,12 @@ mod tests {
     use crate::output::{Damage, FrameId, OutputBackend, Submission};
     use testing::CrtcCall;
 
-    fn fill(chain: &mut testing::TestChain, damage: Damage, byte: u8, rows: std::ops::Range<usize>) {
+    fn fill(
+        chain: &mut testing::TestChain,
+        damage: Damage,
+        byte: u8,
+        rows: std::ops::Range<usize>,
+    ) {
         let target = chain.begin_frame(damage).unwrap();
         let stride = target.stride;
         for row in rows {
@@ -1264,14 +1265,20 @@ mod tests {
         assert_eq!(submission, Submission::Queued(FIRST_FLIP));
         assert_eq!(
             log.lock().unwrap().calls.last(),
-            Some(&CrtcCall::Flip { fb_id: 42, cookie: FIRST_FLIP.cookie() })
+            Some(&CrtcCall::Flip {
+                fb_id: 42,
+                cookie: FIRST_FLIP.cookie()
+            })
         );
         // Every row, including the two the frame left at zero: the 0xee the
         // test allocator left there is gone.
         assert_eq!(chain.buffer(1), chain.frame());
         // Nothing is known to be on glass while the flip is in flight.
         assert!(chain.completed().is_none());
-        assert!(chain.present().is_err(), "a second flip was queued over the first");
+        assert!(
+            chain.present().is_err(),
+            "a second flip was queued over the first"
+        );
 
         chain.frame_presented(FIRST_FLIP).unwrap();
         assert_eq!(chain.front_index(), 1);
@@ -1316,7 +1323,10 @@ mod tests {
     #[test]
     fn a_completion_for_another_frame_is_refused() {
         let (mut chain, _log) = testing::chain(2, 2);
-        assert!(chain.frame_presented(FIRST_FLIP).is_err(), "nothing was queued");
+        assert!(
+            chain.frame_presented(FIRST_FLIP).is_err(),
+            "nothing was queued"
+        );
         fill(&mut chain, Damage::Unknown, 5, 0..1);
         chain.present().unwrap();
         assert!(chain.frame_presented(FIRST_FLIP.next()).is_err());
@@ -1335,10 +1345,16 @@ mod tests {
         log.lock().unwrap().fail_next_set = true;
         assert!(chain.recover_stalled_frame(FIRST_FLIP).is_err());
         assert!(chain.completed().is_none());
-        assert!(chain.present().is_err(), "the failed recovery released the flip");
+        assert!(
+            chain.present().is_err(),
+            "the failed recovery released the flip"
+        );
 
         chain.recover_stalled_frame(FIRST_FLIP).unwrap();
-        assert_eq!(log.lock().unwrap().calls.last(), Some(&CrtcCall::Set { fb_id: 42 }));
+        assert_eq!(
+            log.lock().unwrap().calls.last(),
+            Some(&CrtcCall::Set { fb_id: 42 })
+        );
         assert_eq!(chain.front_index(), 1);
         assert_eq!(chain.completed().unwrap().pixels, chain.frame());
         // And the late completion the kernel may still send is not the
@@ -1384,10 +1400,8 @@ mod tests {
     /// then answers end-of-file the way `drm_read` answers an event too
     /// large for the buffer.
     fn events_from(bytes: &[u8], name: &str) -> FlipEvents {
-        let path = std::env::temp_dir().join(format!(
-            "td-flip-events-{name}-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("td-flip-events-{name}-{}", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
         let card = File::open(&path).unwrap();
         std::fs::remove_file(&path).unwrap();

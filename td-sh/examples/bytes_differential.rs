@@ -87,9 +87,18 @@ const COUNTS: &[&[&str]] = &[
 /// print the same two lines the other way up, and `-c -c` prints one twice.
 const OD_ADDRS: &[&[&str]] = &[&[], &["-A", "n"], &["-A", "o"], &["-A", "d"], &["-A", "x"]];
 
-const OD_TYPES: &[&[&str]] =
-    &[&["-t", "x1"], &["-c"], &["-t", "c"], &["-t", "c", "-t", "x1"], &["-t", "x1", "-t", "c"],
-      &["-c", "-c"], &["-tx1"], &["-tc"], &["-cc"], &["-c", "-t", "x1", "-c"]];
+const OD_TYPES: &[&[&str]] = &[
+    &["-t", "x1"],
+    &["-c"],
+    &["-t", "c"],
+    &["-t", "c", "-t", "x1"],
+    &["-t", "x1", "-t", "c"],
+    &["-c", "-c"],
+    &["-tx1"],
+    &["-tc"],
+    &["-cc"],
+    &["-c", "-t", "x1", "-c"],
+];
 
 /// Arguments OUTSIDE the served subset. Each must come back status 2: a
 /// plausible answer to one of these would be graded as the shell's output, which
@@ -179,7 +188,9 @@ fn run(bin: &str, applet: &str, args: &[String], input: &[u8]) -> Result<Ran, St
         // write is that program's answer rather than an error.
         let _ = w.write_all(input);
     }
-    let out = child.wait_with_output().map_err(|e| format!("{bin}: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("{bin}: {e}"))?;
     Ok(Ran {
         status: out.status.code().unwrap_or(-1),
         stdout: out.stdout,
@@ -261,8 +272,10 @@ fn compare(
         tally.refused += 1;
         if !may_refuse {
             tally.mismatched += 1;
-            println!("REFUSED (in-subset) {applet} args={args:?} input={:?}",
-                     String::from_utf8_lossy(input));
+            println!(
+                "REFUSED (in-subset) {applet} args={args:?} input={:?}",
+                String::from_utf8_lossy(input)
+            );
         }
         return Ok(());
     }
@@ -271,7 +284,10 @@ fn compare(
     if (theirs.status, &theirs.stdout, theirs.spoke) != (ours.status, &ours.stdout, ours.spoke) {
         tally.mismatched += 1;
         if tally.mismatched <= 20 {
-            println!("MISMATCH {applet} args={args:?} input={:?}", String::from_utf8_lossy(input));
+            println!(
+                "MISMATCH {applet} args={args:?} input={:?}",
+                String::from_utf8_lossy(input)
+            );
             println!(
                 "  reference -> {} spoke={} {:?}",
                 theirs.status,
@@ -361,14 +377,23 @@ fn sweep_files(reference: &str, helper: &str, tally: &mut Tally) -> Result<(), S
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let (Some(reference), Some(helper)) = (argv.first(), argv.get(1)) else {
-        return Err("usage: bytes_differential <reference-bin-dir> <spec-helpers-binary> \
+        return Err(
+            "usage: bytes_differential <reference-bin-dir> <spec-helpers-binary> \
                     [rounds] [seed]"
-            .into());
+                .into(),
+        );
     };
     let rounds: usize = argv.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);
-    let seed: u64 = argv.get(3).and_then(|s| s.parse().ok()).unwrap_or(0x2026_0811);
+    let seed: u64 = argv
+        .get(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x2026_0811);
 
-    let mut tally = Tally { compared: 0, refused: 0, mismatched: 0 };
+    let mut tally = Tally {
+        compared: 0,
+        refused: 0,
+        mismatched: 0,
+    };
 
     // --- the refusal contract --------------------------------------------
     let mut wrongly_accepted = 0usize;
@@ -377,10 +402,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ours = run(helper, applet, &args, b"abc\ndef\n")?;
         if ours.status != 2 {
             wrongly_accepted += 1;
-            println!("ACCEPTED (should refuse) {applet} {args:?} -> status {}", ours.status);
+            println!(
+                "ACCEPTED (should refuse) {applet} {args:?} -> status {}",
+                ours.status
+            );
         }
     }
-    println!("refusals: {} checked, {wrongly_accepted} wrongly accepted", REFUSALS.len());
+    println!(
+        "refusals: {} checked, {wrongly_accepted} wrongly accepted",
+        REFUSALS.len()
+    );
 
     // --- the systematic sweep --------------------------------------------
     for input in INPUTS {
@@ -409,7 +440,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rng = Rng(seed | 1);
     for _ in 0..rounds {
         let input = generated_input(&mut rng);
-        let applet = rng.pick(&["head", "tail", "tac", "od"]).copied().unwrap_or("od");
+        let applet = rng
+            .pick(&["head", "tail", "tac", "od"])
+            .copied()
+            .unwrap_or("od");
         let mut args: Vec<String> = Vec::new();
         match applet {
             "head" | "tail" => {

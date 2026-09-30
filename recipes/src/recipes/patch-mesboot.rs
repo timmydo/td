@@ -45,7 +45,8 @@ const STDBOOL_H: &str = include_str!("patch-mesboot-stdbool.h");
 // the built i386 static ELF actually parses and applies a patch (not just
 // --version) — the rung's whole purpose.
 const SMOKE_TXT: &str = "hello\nworld\n";
-const SMOKE_DIFF: &str = "--- smoke.txt\n+++ smoke.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+PATCHED\n";
+const SMOKE_DIFF: &str =
+    "--- smoke.txt\n+++ smoke.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+PATCHED\n";
 
 pub fn recipe() -> Recipe {
     let mut steps = unpack_into("patch-mesboot-source", "{src}");

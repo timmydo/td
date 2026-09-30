@@ -123,10 +123,7 @@ pub fn recipe() -> Recipe {
         dest: "{out}".into(),
     });
     steps.push(Step::Require {
-        paths: vec![
-            "{out}/bzImage".into(),
-            "{out}/outer-initramfs.cpio".into(),
-        ],
+        paths: vec!["{out}/bzImage".into(), "{out}/outer-initramfs.cpio".into()],
         exec: false,
     });
 

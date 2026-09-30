@@ -16,7 +16,15 @@
 //! match on one would surface as a references mismatch in the differential,
 //! red and diagnosable, never silently dropped.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
@@ -188,7 +196,10 @@ mod tests {
     fn finds_a_contained_reference() {
         let cand = vec![path(HASH_A, "dep"), path(HASH_B, "other")];
         let data = format!("prefix {} suffix", path(HASH_A, "dep"));
-        assert_eq!(scan_chunks(&cand, &[data.as_bytes()]), vec![path(HASH_A, "dep")]);
+        assert_eq!(
+            scan_chunks(&cand, &[data.as_bytes()]),
+            vec![path(HASH_A, "dep")]
+        );
     }
 
     #[test]
@@ -243,7 +254,10 @@ mod tests {
         let (h, n, refs) = s.finish();
         let mut plain = Sha256::new();
         plain.update(b"hello world");
-        assert_eq!(h, format!("sha256:{}", crate::sha256::to_base16(&plain.finalize())));
+        assert_eq!(
+            h,
+            format!("sha256:{}", crate::sha256::to_base16(&plain.finalize()))
+        );
         assert_eq!(n, 11);
         assert!(refs.is_empty());
     }

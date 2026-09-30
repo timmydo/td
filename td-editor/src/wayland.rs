@@ -5,10 +5,6 @@ use crate::dialog::{Close, Closed, Conflict, Scope, Target};
 use crate::font::Font;
 use crate::keys::Profile;
 use crate::render::{Geometry, Label};
-use td_ui::raster::Raster;
-use td_ui::client::{run, App, Client, ClipboardEvent, Handled, KeyboardEvent, Tag};
-use td_ui::data::{PLAIN, UTF8};
-use td_ui::wayland::{connect, endpoint};
 use crate::ui::{Controller, Event, Outcome};
 use crate::wire::Message;
 use std::collections::VecDeque;
@@ -16,6 +12,10 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
+use td_ui::client::{run, App, Client, ClipboardEvent, Handled, KeyboardEvent, Tag};
+use td_ui::data::{PLAIN, UTF8};
+use td_ui::raster::Raster;
+use td_ui::wayland::{connect, endpoint};
 
 type Result<T> = std::result::Result<T, String>;
 const CONTROL_JOBS_PER_TURN: usize = 2;
@@ -799,7 +799,11 @@ impl Window {
             } else {
                 "Keymap ready. Scratch only: no Save."
             }),
-            KeyboardEvent::Key { serial, key, stroke } => {
+            KeyboardEvent::Key {
+                serial,
+                key,
+                stroke,
+            } => {
                 self.activation_serial = Some(serial);
                 if self.chord(&stroke.chord, false)? && stroke.repeat {
                     self.client.arm(key, self.clock);
@@ -890,7 +894,10 @@ impl Window {
         let directory = doc.directory();
         if directory
             && !self.ui.keys().pending()
-            && matches!(chord, "w" | "s" | "S" | "R" | "C" | "d" | "u" | "x" | "+" | "q")
+            && matches!(
+                chord,
+                "w" | "s" | "S" | "R" | "C" | "d" | "u" | "x" | "+" | "q"
+            )
         {
             if !repeated {
                 if chord == "q" {
@@ -1219,7 +1226,10 @@ impl Window {
         self.client.connection().set_wait(wait);
         if self.clipboard.incoming.is_some()
             || self.clipboard.outgoing.is_some()
-            || self.path_completion.as_ref().is_some_and(|worker| worker.pending())
+            || self
+                .path_completion
+                .as_ref()
+                .is_some_and(|worker| worker.pending())
         {
             let connection = self.client.connection();
             connection.set_wait(connection.wait().min(Duration::from_millis(10)));
@@ -1330,7 +1340,11 @@ impl Window {
         if request.is_mutating() && matches!(response.split('\t').nth(2), Some("ok" | "pending")) {
             if let Err(detail) = self.sync_prompt_layout() {
                 self.control_input_error = Some(detail);
-                return crate::control::Refusal { id: request.id, error: crate::Error::Unavailable }.response();
+                return crate::control::Refusal {
+                    id: request.id,
+                    error: crate::Error::Unavailable,
+                }
+                .response();
             }
         }
         response
@@ -2183,7 +2197,10 @@ impl Window {
         self.ui
             .editor()
             .revision_point(target.tab, target.revision)?;
-        self.ui.generation().checked_add(2).ok_or(crate::Error::Exhausted)?;
+        self.ui
+            .generation()
+            .checked_add(2)
+            .ok_or(crate::Error::Exhausted)?;
         let files = self.files.as_mut().ok_or(crate::Error::Unavailable)?;
         let id = self
             .control_jobs
@@ -2381,7 +2398,10 @@ impl Window {
         if current.revision != target.revision {
             return Err(crate::Error::StaleRevision);
         }
-        self.ui.generation().checked_add(2).ok_or(crate::Error::Exhausted)?;
+        self.ui
+            .generation()
+            .checked_add(2)
+            .ok_or(crate::Error::Exhausted)?;
         if matches!(answer, crate::control::DialogAnswer::Cancel) {
             self.cancel_conflict()?;
             self.control_mutation_accepted();
@@ -2786,12 +2806,20 @@ impl Window {
     }
 
     fn sync_prompt_layout(&mut self) -> Result<()> {
-        let rows = if let Some(PathPrompt { completion: crate::path_completion::State::Ready(matches), .. }) = &self.prompt {
+        let rows = if let Some(PathPrompt {
+            completion: crate::path_completion::State::Ready(matches),
+            ..
+        }) = &self.prompt
+        {
             3 + matches.count().min(self.completion_rows())
         } else if self.pointer_modal() {
             6
-        } else { 0 };
-        if self.ui.geometry().prompt_rows() == rows { return Ok(()); }
+        } else {
+            0
+        };
+        if self.ui.geometry().prompt_rows() == rows {
+            return Ok(());
+        }
         let before = self.ui.generation();
         self.ui.dispatch(Event::PromptRows(rows)).map_err(error)?;
         self.frames.invalidate(before != self.ui.generation());
@@ -3642,7 +3670,9 @@ impl Window {
         let prompt = self.prompt.as_ref()?;
         if let PathAction::Delete(review) = &prompt.action {
             if !self.deletion_question_visible() {
-                return Some("Deletion paused: enlarge window.\nEscape cancels; files unchanged.".into());
+                return Some(
+                    "Deletion paused: enlarge window.\nEscape cancels; files unchanged.".into(),
+                );
             }
             return Some(review.notice(&prompt.text, self.path_columns()));
         }
@@ -3654,13 +3684,19 @@ impl Window {
             } else {
                 ""
             };
-            return Some(prompt.completion_notice(
-                self.ui.geometry().dimensions().0.saturating_sub(16 * self.ui.geometry().scale().value())
-                    / (8 * self.ui.geometry().scale().value()),
-                self.completion_rows(),
-                paused,
-                self.closing.is_some(),
-            ));
+            return Some(
+                prompt.completion_notice(
+                    self.ui
+                        .geometry()
+                        .dimensions()
+                        .0
+                        .saturating_sub(16 * self.ui.geometry().scale().value())
+                        / (8 * self.ui.geometry().scale().value()),
+                    self.completion_rows(),
+                    paused,
+                    self.closing.is_some(),
+                ),
+            );
         }
         let readiness = if self.client.keyboard().is_none() || self.client.input().map.is_none() {
             "Path entry paused: keyboard unavailable; restore the seat/keymap.\n"
@@ -3953,16 +3989,27 @@ impl Window {
         }
     }
 
-    fn sort_directory(&mut self, tab: crate::model::TabId, revision: u64,
-        sort: crate::directory::Sort, reverse: bool) {
-        let result = self.files.as_mut().ok_or_else(|| "Not a file window".to_string())
+    fn sort_directory(
+        &mut self,
+        tab: crate::model::TabId,
+        revision: u64,
+        sort: crate::directory::Sort,
+        reverse: bool,
+    ) {
+        let result = self
+            .files
+            .as_mut()
+            .ok_or_else(|| "Not a file window".to_string())
             .and_then(|files| files.sort_directory(&mut self.ui, tab, revision, sort, reverse));
         match result {
             Ok(()) => {
                 self.stop_pointer();
                 self.client.cancel_repeat();
-                self.notify(format!("Directory sort: {}{}; directories first; dates UTC", sort.label(),
-                    if reverse { " (reversed)" } else { "" }));
+                self.notify(format!(
+                    "Directory sort: {}{}; directories first; dates UTC",
+                    sort.label(),
+                    if reverse { " (reversed)" } else { "" }
+                ));
             }
             Err(detail) => self.notify(format!("Sort refused: {detail}")),
         }
@@ -4117,7 +4164,8 @@ impl Window {
                     return;
                 }
                 if let PathAction::Copy(source) = &prompt.action {
-                    if let Err(detail) = source.copy_destination(std::ffi::OsStr::new(&prompt.text)) {
+                    if let Err(detail) = source.copy_destination(std::ffi::OsStr::new(&prompt.text))
+                    {
                         self.prompt = Some(prompt);
                         self.notify(format!("Copy refused: {detail}; name retained"));
                         return;
@@ -4173,7 +4221,8 @@ impl Window {
                     return;
                 }
                 if let PathAction::Rename(source) = &prompt.action {
-                    if let Err(detail) = source.copy_destination(std::ffi::OsStr::new(&prompt.text)) {
+                    if let Err(detail) = source.copy_destination(std::ffi::OsStr::new(&prompt.text))
+                    {
                         self.prompt = Some(prompt);
                         self.notify(format!("Rename refused: {detail}; name retained"));
                         return;
@@ -4800,13 +4849,22 @@ impl Window {
                 self.notify("Copy path refused: document changed.");
                 return Ok(());
             }
-            let entry = if name == "copy-entry-path" { self.directory_entry_path(tab) } else { None };
-            let path = if name == "copy-entry-path" { entry.as_deref() }
-                else { self.files.as_ref().and_then(|files| files.path(tab)) };
+            let entry = if name == "copy-entry-path" {
+                self.directory_entry_path(tab)
+            } else {
+                None
+            };
+            let path = if name == "copy-entry-path" {
+                entry.as_deref()
+            } else {
+                self.files.as_ref().and_then(|files| files.path(tab))
+            };
             let Some(path) = path else {
                 self.notify(if name == "copy-entry-path" {
                     "Copy entry path unavailable: no directory entry selected."
-                } else { "Copy path unavailable: this tab has no file path." });
+                } else {
+                    "Copy path unavailable: this tab has no file path."
+                });
                 return Ok(());
             };
             let Some(text) = path
@@ -4822,7 +4880,11 @@ impl Window {
         }
         if name == "cut"
             && self.ui.editor().revision_point(tab, revision).is_ok()
-            && self.ui.editor().document(tab).is_ok_and(|doc| doc.viewing())
+            && self
+                .ui
+                .editor()
+                .document(tab)
+                .is_ok_and(|doc| doc.viewing())
         {
             self.notify("Cut unavailable in this view.");
             return Ok(());
@@ -4838,7 +4900,10 @@ impl Window {
                 return Ok(());
             }
             Err(e) => {
-                self.notify(format!("{} refused: {e}", if name == "cut" { "Cut" } else { "Copy" }));
+                self.notify(format!(
+                    "{} refused: {e}",
+                    if name == "cut" { "Cut" } else { "Copy" }
+                ));
                 return Ok(());
             }
         };
@@ -5875,7 +5940,8 @@ mod tests {
     /// seat: `(window, peer, keyboard, device)`, focused with the US map.
     fn clipboard_fixture() -> (Window, UnixStream, u32, u32) {
         let (a, peer) = UnixStream::pair().unwrap();
-        peer.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
         let mut w = Window::new(a, std::env::temp_dir()).unwrap();
         for event in [
             global(1, "wl_compositor", 4),
@@ -5926,7 +5992,11 @@ mod tests {
         let mut path = directory.0.clone();
         while path.as_os_str().as_encoded_bytes().len() < 4090 {
             let remaining = 4090 - path.as_os_str().as_encoded_bytes().len();
-            let length = if remaining == 257 { 254 } else { (remaining - 1).min(255) };
+            let length = if remaining == 257 {
+                254
+            } else {
+                (remaining - 1).min(255)
+            };
             path.push("a".repeat(length));
             std::fs::create_dir(&path).unwrap();
         }
@@ -5934,15 +6004,21 @@ mod tests {
         let (mut w, _peer) = file_dialog_fixture();
         w.ui = Controller::default();
         for _ in 0..64 {
-            w.files.as_mut().unwrap().initial_open(&mut w.ui, path.clone()).unwrap();
+            w.files
+                .as_mut()
+                .unwrap()
+                .initial_open(&mut w.ui, path.clone())
+                .unwrap();
         }
         let request = crate::control::Request::parse(b"1\t0\tstate").unwrap();
         let state = w.control_response(&request);
         assert!(state.len() < crate::control::MAX_FRAME, "{}", state.len());
         assert_eq!(state.matches("\tdirectory=").count(), 64);
         assert_eq!(state.matches("\tdirectory-entry=").count(), 1);
-        assert!(state.contains(&format!("directory-entry=64,{}",
-            crate::control::hex(path.join("x").as_os_str().as_encoded_bytes()))));
+        assert!(state.contains(&format!(
+            "directory-entry=64,{}",
+            crate::control::hex(path.join("x").as_os_str().as_encoded_bytes())
+        )));
     }
 
     #[test]
@@ -6120,11 +6196,13 @@ mod tests {
         configure(&mut w, 800, 600);
         let before = format!("{:?}", w.ui.editor());
         w.open_menu(crate::menu::Group::File).unwrap();
-        w.menu.as_mut().unwrap().select(crate::menu::Group::File
-            .items()
-            .iter()
-            .position(|item| *item == crate::menu::Item::CopyPath)
-            .unwrap());
+        w.menu.as_mut().unwrap().select(
+            crate::menu::Group::File
+                .items()
+                .iter()
+                .position(|item| *item == crate::menu::Item::CopyPath)
+                .unwrap(),
+        );
         key(&mut w, keyboard, 28);
         assert_eq!(w.clipboard.text.as_deref().unwrap(), path.to_str().unwrap());
         assert!(w.activation_serial.is_none());
@@ -6165,11 +6243,13 @@ mod tests {
         w.event(message(keyboard, 4, &[0, 0, 0, 0, 0])).unwrap();
         configure(&mut w, 800, 600);
         w.open_menu(crate::menu::Group::File).unwrap();
-        w.menu.as_mut().unwrap().select(crate::menu::Group::File
-            .items()
-            .iter()
-            .position(|item| *item == crate::menu::Item::CopyPath)
-            .unwrap());
+        w.menu.as_mut().unwrap().select(
+            crate::menu::Group::File
+                .items()
+                .iter()
+                .position(|item| *item == crate::menu::Item::CopyPath)
+                .unwrap(),
+        );
         drain(&peer);
         key(&mut w, keyboard, 28);
         assert!(w.notice.as_deref().unwrap().contains("UTF-8"));
@@ -6246,9 +6326,7 @@ mod tests {
         assert_eq!(w.clipboard.text.as_deref(), Some("é abc\n"));
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "");
         assert_eq!(w.ui.editor().document(1).unwrap().history_depth(), (1, 0));
-        assert!(drain(&peer)
-            .0
-            .contains(&message(device, 1, &[source, 1])));
+        assert!(drain(&peer).0.contains(&message(device, 1, &[source, 1])));
         w.ui.dispatch(Event::Edit {
             tab: 1,
             revision: 1,
@@ -6384,12 +6462,7 @@ mod tests {
     #[test]
     fn clipboard_paste_prefers_utf8_waits_for_eof_and_is_one_undo_transaction() {
         let (mut w, peer, _keyboard, device) = clipboard_fixture();
-        selection_offer(
-            &mut w,
-            device,
-            0xff00_0010,
-            &[PLAIN, UTF8],
-        );
+        selection_offer(&mut w, device, 0xff00_0010, &[PLAIN, UTF8]);
         w.clipboard_request("paste", 1, 0).unwrap();
         let (requests, mut files) = drain(&peer);
         assert_eq!(requests, [text_event(0xff00_0010, 1, UTF8)]);
@@ -6495,10 +6568,7 @@ mod tests {
         key(&mut w, keyboard, 46);
         assert_eq!(w.client.source().unwrap(), source);
         assert!(drain(&peer).0.is_empty());
-        for (index, mime) in [UTF8, "image/png", PLAIN]
-            .into_iter()
-            .enumerate()
-        {
+        for (index, mime) in [UTF8, "image/png", PLAIN].into_iter().enumerate() {
             if index == 2 {
                 w.event(message(source, 2, &[])).unwrap();
             }
@@ -6581,8 +6651,11 @@ mod tests {
             command: crate::model::Command::Select(crate::model::Selection::default()),
         })
         .unwrap();
-        w.ui.dispatch(Event::ReadOnly { tab: 1, enabled: true })
-            .unwrap();
+        w.ui.dispatch(Event::ReadOnly {
+            tab: 1,
+            enabled: true,
+        })
+        .unwrap();
         key(&mut w, keyboard, 45);
         assert!(w.notice.as_ref().unwrap().contains("Cut unavailable"));
         assert_eq!(w.client.source(), Some(line_source));
@@ -6604,8 +6677,11 @@ mod tests {
         assert_eq!(w.client.source().unwrap(), line_source);
         assert_eq!(w.clipboard.text.as_deref(), Some("é abc\n"));
         assert!(drain(&peer).0.is_empty());
-        w.ui.dispatch(Event::ReadOnly { tab: 2, enabled: true })
-            .unwrap();
+        w.ui.dispatch(Event::ReadOnly {
+            tab: 2,
+            enabled: true,
+        })
+        .unwrap();
         key(&mut w, keyboard, 45);
         assert!(w.notice.as_ref().unwrap().contains("Cut unavailable"));
         assert_eq!(w.client.source(), Some(line_source));
@@ -7231,12 +7307,7 @@ mod tests {
             selection_offer(&mut w, device, 0xff00_0010 + index as u32, &[mime]);
             assert!(clipboard_snapshot(&mut w).contains(&format!("\tselection={expected}\t")));
         }
-        selection_offer(
-            &mut w,
-            device,
-            0xff00_0013,
-            &[PLAIN, UTF8],
-        );
+        selection_offer(&mut w, device, 0xff00_0013, &[PLAIN, UTF8]);
         assert!(clipboard_snapshot(&mut w).contains("\tselection=utf8\t"));
         // The device's release retires the selection and drops the text
         // behind the source; the query reports what remains, unread.
@@ -7328,8 +7399,15 @@ mod tests {
             }
             let before = crate::control::state(&w.ui).unwrap();
             let response = w.control_response(&query);
-            let code = if exhausted { "exhausted" } else { "unavailable" };
-            assert!(response.contains(&format!("\terror\t{code}\t")), "{response}");
+            let code = if exhausted {
+                "exhausted"
+            } else {
+                "unavailable"
+            };
+            assert!(
+                response.contains(&format!("\terror\t{code}\t")),
+                "{response}"
+            );
             assert_eq!(crate::control::state(&w.ui).unwrap(), before);
         }
     }
@@ -8919,7 +8997,11 @@ mod tests {
         assert!(w.control_file_job.is_none());
         assert!(w.notice.as_ref().unwrap().contains("open directory"));
         assert!(dir.path("child").is_dir());
-        assert!(w.control_jobs.fields().unwrap().contains("job=1,delete,3,1,0,error,unavailable"));
+        assert!(w
+            .control_jobs
+            .fields()
+            .unwrap()
+            .contains("job=1,delete,3,1,0,error,unavailable"));
 
         let dir = DialogDirectory::new();
         let mut browse = dir.0.clone();
@@ -8927,7 +9009,9 @@ mod tests {
             browse.push("p".repeat(180));
             std::fs::create_dir(&browse).unwrap();
         }
-        for name in ["a", "z"] { std::fs::write(browse.join(name), b"disk").unwrap(); }
+        for name in ["a", "z"] {
+            std::fs::write(browse.join(name), b"disk").unwrap();
+        }
         let (mut w, _peer) = file_dialog_fixture();
         configure(&mut w, 800, 600);
         w.files.as_mut().unwrap().open(browse.clone()).unwrap();
@@ -8936,15 +9020,31 @@ mod tests {
         w.chord("d", false).unwrap();
         w.chord("x", false).unwrap();
         std::fs::write(browse.join("z"), b"changed").unwrap();
-        w.control_path_answer(w.last_dialog_id, Target { tab: 2, revision: 2 }, &crate::control::DialogAnswer::Path("DELETE".into())).unwrap();
+        w.control_path_answer(
+            w.last_dialog_id,
+            Target {
+                tab: 2,
+                revision: 2,
+            },
+            &crate::control::DialogAnswer::Path("DELETE".into()),
+        )
+        .unwrap();
         finish_file(&mut w);
         assert!(!browse.join("a").exists());
         assert_eq!(std::fs::read(browse.join("z")).unwrap(), b"changed");
         assert!(w.notice.as_ref().unwrap().contains("Removed 1/2"));
-        assert!(w.notice.as_ref().unwrap().contains("directory entry changed"));
+        assert!(w
+            .notice
+            .as_ref()
+            .unwrap()
+            .contains("directory entry changed"));
         assert!(w.notice.as_ref().unwrap().contains("entry 2/2"));
         assert!(w.notice.as_ref().unwrap().contains("name \"z\""));
-        assert!(w.control_jobs.fields().unwrap().contains("job=1,delete,2,2,0,error,unavailable"));
+        assert!(w
+            .control_jobs
+            .fields()
+            .unwrap()
+            .contains("job=1,delete,2,2,0,error,unavailable"));
         let doc = w.ui.editor().document(2).unwrap();
         assert_eq!(doc.revision(), 3);
         assert!(doc.text().starts_with("  "));
@@ -8958,12 +9058,25 @@ mod tests {
         let mut raw = vec![b'/'];
         raw.extend(std::iter::repeat_n(0xff, 4088));
         let parent = PathBuf::from(std::ffi::OsString::from_vec(raw));
-        let sources = (0..64).map(|i| crate::files::RenameSource::observed(
-            parent.join(format!("{i:02}")), (0, 0), stamp.clone())).collect();
-        let mut review = DeletePrompt { plan: crate::files::DeletePlan::new(sources).unwrap(), page: 1000 };
+        let sources = (0..64)
+            .map(|i| {
+                crate::files::RenameSource::observed(
+                    parent.join(format!("{i:02}")),
+                    (0, 0),
+                    stamp.clone(),
+                )
+            })
+            .collect();
+        let mut review = DeletePrompt {
+            plan: crate::files::DeletePlan::new(sources).unwrap(),
+            page: 1000,
+        };
         let notice = review.notice("DELETE", 32);
         assert_eq!(notice.lines().count(), 6);
-        assert!(notice.lines().all(|line| line.chars().count() <= 32), "{notice}");
+        assert!(
+            notice.lines().all(|line| line.chars().count() <= 32),
+            "{notice}"
+        );
         let narrow_last = review.lines(32, 0).0.saturating_sub(1) / 2;
         let wide_last = review.lines(64, 0).0.saturating_sub(1) / 2;
         review.page = narrow_last;
@@ -8973,13 +9086,23 @@ mod tests {
         configure(&mut w, 272, 168);
         let tab = w.ui.editor().active().unwrap();
         let revision = w.ui.editor().document(tab).unwrap().revision();
-        w.prompt = Some(PathPrompt { action: PathAction::Delete(review), text: "DELETE".into(),
-            identity: Some(PathIdentity { id: 1, point: w.ui.editor().revision_point(tab, revision).unwrap() }),
-            completion: crate::path_completion::State::Idle });
+        w.prompt = Some(PathPrompt {
+            action: PathAction::Delete(review),
+            text: "DELETE".into(),
+            identity: Some(PathIdentity {
+                id: 1,
+                point: w.ui.editor().revision_point(tab, revision).unwrap(),
+            }),
+            completion: crate::path_completion::State::Idle,
+        });
         w.sync_prompt_layout().unwrap();
         assert!(w.deletion_question_visible());
         assert_eq!(w.ui.geometry().prompt_rows(), 6);
-        assert!(w.path_notice().unwrap().lines().all(|line| line.chars().count() <= 32));
+        assert!(w
+            .path_notice()
+            .unwrap()
+            .lines()
+            .all(|line| line.chars().count() <= 32));
         let state = w.control_prompt_state().unwrap();
         assert_eq!(state.matches("\tdelete-entry=").count(), 64);
         assert!(state.len() < 1024 * 1024 - 100);
@@ -9001,7 +9124,11 @@ mod tests {
         assert_eq!(snapshot.marked(), 64);
         assert!(snapshot.text.lines().next().unwrap().starts_with("  "));
         let review = DeletePrompt {
-            plan: crate::files::DeletePlan::new(vec![snapshot.rename_source(1).unwrap(), snapshot.rename_source(2).unwrap()]).unwrap(),
+            plan: crate::files::DeletePlan::new(vec![
+                snapshot.rename_source(1).unwrap(),
+                snapshot.rename_source(2).unwrap(),
+            ])
+            .unwrap(),
             page: 0,
         };
         let expected: String = review
@@ -9485,7 +9612,10 @@ mod tests {
             w.control_file_job = Some(ControlFile::Rename(99));
             w.path_chord("Return", false);
             assert_eq!(w.prompt.as_ref().unwrap().text, "n");
-            assert_eq!(w.prompt.as_ref().unwrap().identity.as_ref().unwrap().id, w.last_dialog_id);
+            assert_eq!(
+                w.prompt.as_ref().unwrap().identity.as_ref().unwrap().id,
+                w.last_dialog_id
+            );
             assert!(!dir.path("n").exists());
             w.control_file_job = None;
             w.path_chord("Return", false);
@@ -9922,7 +10052,9 @@ mod tests {
         for action in ["open", "save-as", "dictionary"] {
             let directory = DialogDirectory::new();
             let file = directory.path("chosen");
-            if action != "save-as" { std::fs::write(&file, b"word\n").unwrap(); }
+            if action != "save-as" {
+                std::fs::write(&file, b"word\n").unwrap();
+            }
             let (mut w, _peer) = file_dialog_fixture();
             configure(&mut w, 800, 600);
             pointer_enter(&mut w);
@@ -9931,10 +10063,14 @@ mod tests {
             w.sync_prompt_layout().unwrap();
             assert_eq!(w.ui.geometry().prompt_rows(), 6);
             let generation = w.frames.input_generation().unwrap();
-            let answer = crate::control::Request::parse(format!(
-                "1\t1\tdialog-answer\t1\t1\t1\tpath\t{}",
-                crate::control::hex(file.as_os_str().as_encoded_bytes())
-            ).as_bytes()).unwrap();
+            let answer = crate::control::Request::parse(
+                format!(
+                    "1\t1\tdialog-answer\t1\t1\t1\tpath\t{}",
+                    crate::control::hex(file.as_os_str().as_encoded_bytes())
+                )
+                .as_bytes(),
+            )
+            .unwrap();
             assert_eq!(w.control_response(&answer), "1\t1\tpending\t1");
             // No event, tick or draw may repair the state before these checks.
             assert!(w.prompt.is_none());
@@ -9952,14 +10088,19 @@ mod tests {
     fn remote_dialog_layout_headroom_refusals_preserve_prompts_and_documents() {
         for kind in ["path", "close"] {
             for remaining in [0, 1] {
-                for answer in if kind == "path" { ["cancel", "path\t61"] }
-                    else { ["cancel", "discard"] }
-                {
+                for answer in if kind == "path" {
+                    ["cancel", "path\t61"]
+                } else {
+                    ["cancel", "discard"]
+                } {
                     let (mut w, _peer) = file_dialog_fixture();
                     configure(&mut w, 800, 600);
                     w.chord("a", false).unwrap();
-                    if kind == "path" { w.chord("C-o", false).unwrap(); }
-                    else { w.close_tab(1, 1); }
+                    if kind == "path" {
+                        w.chord("C-o", false).unwrap();
+                    } else {
+                        w.close_tab(1, 1);
+                    }
                     w.sync_prompt_layout().unwrap();
                     assert_eq!(w.ui.geometry().prompt_rows(), 6);
                     w.ui.generation_for_test(u64::MAX - remaining);
@@ -9967,10 +10108,13 @@ mod tests {
                     let before = w.control_response(&state);
                     let notice = w.notice.clone();
                     let generation = w.frames.input_generation().unwrap();
-                    let request = crate::control::Request::parse(format!(
-                        "1\t1\tdialog-answer\t1\t1\t1\t{answer}"
-                    ).as_bytes()).unwrap();
-                    assert!(w.control_response(&request).contains("\terror\texhausted\t"));
+                    let request = crate::control::Request::parse(
+                        format!("1\t1\tdialog-answer\t1\t1\t1\t{answer}").as_bytes(),
+                    )
+                    .unwrap();
+                    assert!(w
+                        .control_response(&request)
+                        .contains("\terror\texhausted\t"));
                     assert_eq!(w.control_response(&state), before);
                     assert_eq!(w.notice, notice);
                     assert_eq!(w.frames.input_generation().unwrap(), generation);
@@ -12981,7 +13125,7 @@ mod tests {
 
     #[test]
     fn completion_results_cannot_revive_edited_cancelled_replaced_or_stale_prompts() {
-        use crate::path_completion::{State, scan};
+        use crate::path_completion::{scan, State};
         let directory = DialogDirectory::new();
         std::fs::write(directory.path("file"), b"keep").unwrap();
         let prefix = directory.path("fi").to_str().unwrap().to_string();
@@ -13003,16 +13147,24 @@ mod tests {
                     w.prompt.as_mut().unwrap().completion = State::Pending(12);
                 }
                 _ => {
-                    w.ui.dispatch(Event::Edit { tab: 1, revision: 0,
-                        command: crate::model::Command::Insert("changed".into()) }).unwrap();
+                    w.ui.dispatch(Event::Edit {
+                        tab: 1,
+                        revision: 0,
+                        command: crate::model::Command::Insert("changed".into()),
+                    })
+                    .unwrap();
                 }
             }
             w.completed_path(11, scan(&prefix));
             if let Some(prompt) = &w.prompt {
                 assert_eq!(prompt.text, prefix);
                 assert!(!matches!(prompt.completion, State::Ready(_)));
-                if change == "stale" { assert!(matches!(prompt.completion, State::Failed(_))); }
-            } else { assert_eq!(change, "cancel"); }
+                if change == "stale" {
+                    assert!(matches!(prompt.completion, State::Failed(_)));
+                }
+            } else {
+                assert_eq!(change, "cancel");
+            }
             assert!(!w.files.as_ref().unwrap().busy());
         }
     }
@@ -13023,10 +13175,13 @@ mod tests {
         let font = crate::font::pinned().unwrap();
         let draw = |scale: u8| {
             let s = usize::from(scale);
-            let geometry = Geometry::new(320 * s, 200 * s, Scale::new(scale).unwrap()).unwrap()
-                .with_prompt_rows(6).unwrap();
+            let geometry = Geometry::new(320 * s, 200 * s, Scale::new(scale).unwrap())
+                .unwrap()
+                .with_prompt_rows(6)
+                .unwrap();
             let mut pixels = vec![0; 320 * 200 * 4 * s * s];
-            let mut raster = Raster::new(&mut pixels, &font, geometry.surface(), 320 * 4 * s).unwrap();
+            let mut raster =
+                Raster::new(&mut pixels, &font, geometry.surface(), 320 * 4 * s).unwrap();
             paint_prompt(&mut raster, geometry, "A\nB\nC\nD\nE\nF");
             pixels
         };
@@ -13038,8 +13193,11 @@ mod tests {
                 for x in 0..320 * s {
                     let source = ((y / s) * 320 + x / s) * 4;
                     let target = (y * 320 * s + x) * 4;
-                    assert_eq!(&actual[target..target + 4], &base[source..source + 4],
-                        "scale={scale}, x={x}, y={y}");
+                    assert_eq!(
+                        &actual[target..target + 4],
+                        &base[source..source + 4],
+                        "scale={scale}, x={x}, y={y}"
+                    );
                 }
             }
         }
@@ -13057,12 +13215,17 @@ mod tests {
         assert!(prompt.completion.fields(3).contains("completion=error"));
         for columns in 1..=100 {
             let notice = prompt.completion_notice(columns, 3, "Paused: restore keyboard", false);
-            assert!(notice.lines().all(|line| line.chars().count() <= columns.min(72)));
+            assert!(notice
+                .lines()
+                .all(|line| line.chars().count() <= columns.min(72)));
             assert!(notice.chars().count() < 512);
             assert!(notice.lines().nth(1).unwrap().ends_with('|'));
         }
         w.path_chord("C-u", false);
-        assert!(matches!(w.prompt.as_ref().unwrap().completion, crate::path_completion::State::Idle));
+        assert!(matches!(
+            w.prompt.as_ref().unwrap().completion,
+            crate::path_completion::State::Idle
+        ));
         assert!(w.prompt.as_ref().unwrap().text.is_empty());
         w.path_chord("Escape", false);
         assert!(!w.files.as_ref().unwrap().busy());

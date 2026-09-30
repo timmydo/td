@@ -110,7 +110,10 @@ fn patch_one_shebang(path: &Path, bash: &str, store_prefix: &str) -> Result<(), 
         _ => return Ok(()), // unreadable, empty, or not a script — leave it
     }
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    let nl = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
+    let nl = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(bytes.len());
     let line = match std::str::from_utf8(bytes.get(..nl).unwrap_or_default()) {
         Ok(s) => s,
         Err(_) => return Ok(()), // binary first line — skip
@@ -154,7 +157,11 @@ fn patch_one_shebang(path: &Path, bash: &str, store_prefix: &str) -> Result<(), 
     if let Some(meta) = meta.as_ref() {
         if let (Ok(accessed), Ok(modified)) = (meta.accessed(), meta.modified()) {
             if let Ok(f) = fs::File::options().write(true).open(path) {
-                let _ = f.set_times(fs::FileTimes::new().set_accessed(accessed).set_modified(modified));
+                let _ = f.set_times(
+                    fs::FileTimes::new()
+                        .set_accessed(accessed)
+                        .set_modified(modified),
+                );
             }
         }
     }
@@ -405,7 +412,12 @@ fn account_line(
 /// A repeating line must arrive a full window after the last changed line on
 /// EITHER stream. Two constant streams still trip; varied output is progress.
 /// This is a same-line heuristic, not detection of arbitrary repeating cycles.
-fn duration_reason(st: &mut StreamWatch, progress_ms: u64, repeat_ms: u64, stream: &str) -> Option<String> {
+fn duration_reason(
+    st: &mut StreamWatch,
+    progress_ms: u64,
+    repeat_ms: u64,
+    stream: &str,
+) -> Option<String> {
     if repeat_ms == 0 {
         return None;
     }
@@ -415,8 +427,8 @@ fn duration_reason(st: &mut StreamWatch, progress_ms: u64, repeat_ms: u64, strea
             // Old warnings cannot span progress on the other stream. Start a
             // fresh window at the first post-progress observation, even when
             // that warning arrives after a long, quiet compilation.
-            st.duration_start_ms = (st.repeats > 0 && st.last_line_ms >= progress_ms)
-                .then_some(st.last_line_ms);
+            st.duration_start_ms =
+                (st.repeats > 0 && st.last_line_ms >= progress_ms).then_some(st.last_line_ms);
             return None;
         }
     };
@@ -480,10 +492,26 @@ fn tee_stream(
                 while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
                     let line = rest.get(..nl).unwrap_or_default();
                     if pending.is_empty() {
-                        account_line(&mut st, line, count_limit, elapsed, keep_tail, stream, &sup.why);
+                        account_line(
+                            &mut st,
+                            line,
+                            count_limit,
+                            elapsed,
+                            keep_tail,
+                            stream,
+                            &sup.why,
+                        );
                     } else {
                         pending.extend_from_slice(line);
-                        account_line(&mut st, &pending, count_limit, elapsed, keep_tail, stream, &sup.why);
+                        account_line(
+                            &mut st,
+                            &pending,
+                            count_limit,
+                            elapsed,
+                            keep_tail,
+                            stream,
+                            &sup.why,
+                        );
                         pending.clear();
                     }
                     rest = rest.get(nl.saturating_add(1)..).unwrap_or_default();
@@ -549,8 +577,14 @@ fn run_cmd(
     }
     let mut child = cmd.spawn().map_err(|e| format!("spawn {prog}: {e}"))?;
     let pgid = child.id();
-    let child_out = child.stdout.take().ok_or_else(|| format!("{prog}: no stdout pipe"))?;
-    let child_err = child.stderr.take().ok_or_else(|| format!("{prog}: no stderr pipe"))?;
+    let child_out = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{prog}: no stdout pipe"))?;
+    let child_err = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{prog}: no stderr pipe"))?;
 
     let sup = std::sync::Arc::new(Supervise {
         start: Instant::now(),
@@ -630,8 +664,7 @@ fn run_cmd(
                 }
             }
         }
-        let drained =
-            sup.out_done.load(Ordering::Relaxed) && sup.err_done.load(Ordering::Relaxed);
+        let drained = sup.out_done.load(Ordering::Relaxed) && sup.err_done.load(Ordering::Relaxed);
         match exit {
             Some(_) if drained => break,
             Some(_) => {
@@ -726,10 +759,19 @@ fn run_cmd(
         let tail = sup
             .err_watch
             .lock()
-            .map(|st| st.tail.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n"))
+            .map(|st| {
+                st.tail
+                    .iter()
+                    .map(|l| format!("  {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
             .unwrap_or_default();
-        let tail =
-            if tail.is_empty() { String::new() } else { format!("; last stderr lines:\n{tail}") };
+        let tail = if tail.is_empty() {
+            String::new()
+        } else {
+            format!("; last stderr lines:\n{tail}")
+        };
         return Err(format!(
             "td-build watchdog KILLED `{prog} {}` after {}s — {why}{tail}",
             args.join(" "),
@@ -774,7 +816,11 @@ fn escape_sed_repl(s: &str) -> String {
 /// One `RefPart`/replacement atom → its sed-replacement text. `bindings` maps a
 /// `let`-`which` name to the resolved program path; a `{var}` not in it is a
 /// match variable (the whole match → `&`).
-fn resolve_part(p: &Json, bindings: &BTreeMap<String, String>, search_path: &str) -> Result<String, String> {
+fn resolve_part(
+    p: &Json,
+    bindings: &BTreeMap<String, String>,
+    search_path: &str,
+) -> Result<String, String> {
     if let Some(s) = p.as_str() {
         return Ok(escape_sed_repl(s));
     }
@@ -785,11 +831,14 @@ fn resolve_part(p: &Json, bindings: &BTreeMap<String, String>, search_path: &str
         });
     }
     if let Some(n) = p.get("output").and_then(Json::as_str) {
-        let v = env::var(n).map_err(|_| format!("phase references output `{n}' which is not set"))?;
+        let v =
+            env::var(n).map_err(|_| format!("phase references output `{n}' which is not set"))?;
         return Ok(escape_sed_repl(&v));
     }
     if let Some(n) = p.get("input").and_then(Json::as_str) {
-        return Ok(escape_sed_repl(bindings.get(n).map(String::as_str).unwrap_or(n)));
+        return Ok(escape_sed_repl(
+            bindings.get(n).map(String::as_str).unwrap_or(n),
+        ));
     }
     if let Some(prog) = p.get("which").and_then(Json::as_str) {
         let abs = find_in_path(search_path, prog)
@@ -800,7 +849,11 @@ fn resolve_part(p: &Json, bindings: &BTreeMap<String, String>, search_path: &str
 }
 
 /// A substitution's `to` → its sed-replacement text.
-fn resolve_to(to: &Json, bindings: &BTreeMap<String, String>, search_path: &str) -> Result<String, String> {
+fn resolve_to(
+    to: &Json,
+    bindings: &BTreeMap<String, String>,
+    search_path: &str,
+) -> Result<String, String> {
     if let Some(parts) = to.get("stringAppend").and_then(Json::as_arr) {
         let mut o = String::new();
         for p in parts {
@@ -810,7 +863,10 @@ fn resolve_to(to: &Json, bindings: &BTreeMap<String, String>, search_path: &str)
     }
     if let Some(fmtargs) = to.get("format").and_then(Json::as_arr) {
         // (format #f FMT ARG…): substitute each `~a` in FMT with the next ARG.
-        let fmt = fmtargs.first().and_then(Json::as_str).ok_or("format: missing format string")?;
+        let fmt = fmtargs
+            .first()
+            .and_then(Json::as_str)
+            .ok_or("format: missing format string")?;
         let mut o = String::new();
         let mut args = fmtargs.get(1..).unwrap_or_default().iter();
         let mut rest = fmt;
@@ -834,18 +890,33 @@ fn resolve_files(fa: &Json, srcdir: &str, search_path: &str) -> Result<Vec<PathB
         return Ok(vec![Path::new(srcdir).join(s)]);
     }
     if let Some(list) = fa.get("list").and_then(Json::as_arr) {
-        return list.iter()
-            .map(|f| f.as_str().map(|s| Path::new(srcdir).join(s)).ok_or("file list entry is not a string".to_string()))
+        return list
+            .iter()
+            .map(|f| {
+                f.as_str()
+                    .map(|s| Path::new(srcdir).join(s))
+                    .ok_or("file list entry is not a string".to_string())
+            })
             .collect();
     }
     if let Some(ff) = fa.get("findFiles").and_then(Json::as_arr) {
-        let dir = ff.first().and_then(Json::as_str).ok_or("findFiles: missing dir")?;
-        let re = ff.get(1).and_then(Json::as_str).ok_or("findFiles: missing regex")?;
+        let dir = ff
+            .first()
+            .and_then(Json::as_str)
+            .ok_or("findFiles: missing dir")?;
+        let re = ff
+            .get(1)
+            .and_then(Json::as_str)
+            .ok_or("findFiles: missing regex")?;
         return find_files(srcdir, dir, re, search_path);
     }
     if let Some(c) = fa.get("cons").and_then(Json::as_arr) {
         let mut v = resolve_files(c.first().ok_or("cons: missing head")?, srcdir, search_path)?;
-        v.extend(resolve_files(c.get(1).ok_or("cons: missing tail")?, srcdir, search_path)?);
+        v.extend(resolve_files(
+            c.get(1).ok_or("cons: missing tail")?,
+            srcdir,
+            search_path,
+        )?);
         return Ok(v);
     }
     Err(format!("unsupported substitute* file argument: {fa:?}"))
@@ -854,7 +925,12 @@ fn resolve_files(fa: &Json, srcdir: &str, search_path: &str) -> Result<Vec<PathB
 /// `(find-files DIR REGEX)` — files under `srcdir/DIR` whose BASENAME matches the
 /// POSIX-ERE `regex` (`find` + `grep -E`, the toolchain's regex). Missing dir →
 /// empty (these phases patch test files, absent in some trees — a no-op).
-fn find_files(srcdir: &str, dir: &str, regex: &str, search_path: &str) -> Result<Vec<PathBuf>, String> {
+fn find_files(
+    srcdir: &str,
+    dir: &str,
+    regex: &str,
+    search_path: &str,
+) -> Result<Vec<PathBuf>, String> {
     let full = Path::new(srcdir).join(dir);
     if !full.is_dir() {
         return Ok(Vec::new());
@@ -903,13 +979,23 @@ fn apply_substitute(
     // corpus patterns never contain, so `/` in paths needs no escaping.
     let mut exprs: Vec<String> = Vec::new();
     for c in clauses {
-        let from = c.get("from").and_then(Json::as_str).ok_or("clause: missing from")?;
-        let to = resolve_to(c.get("to").ok_or("clause: missing to")?, bindings, search_path)?;
+        let from = c
+            .get("from")
+            .and_then(Json::as_str)
+            .ok_or("clause: missing from")?;
+        let to = resolve_to(
+            c.get("to").ok_or("clause: missing to")?,
+            bindings,
+            search_path,
+        )?;
         exprs.push(format!("s\u{1}{from}\u{1}{to}\u{1}g"));
     }
     for f in &files {
         if !f.exists() {
-            return Err(format!("substitute* target does not exist: {}", f.display()));
+            return Err(format!(
+                "substitute* target does not exist: {}",
+                f.display()
+            ));
         }
         let mut args: Vec<String> = vec!["-E".into(), "-i".into()];
         for e in &exprs {
@@ -938,21 +1024,40 @@ fn apply_body(
 ) -> Result<(), String> {
     for s in stmts {
         if let Some(fa) = s.get("substitute") {
-            let clauses = s.get("clauses").and_then(Json::as_arr).ok_or("substitute: no clauses")?;
+            let clauses = s
+                .get("clauses")
+                .and_then(Json::as_arr)
+                .ok_or("substitute: no clauses")?;
             apply_substitute(fa, clauses, srcdir, sed, bindings, search_path, envs)?;
         } else if let Some(binds) = s.get("letWhich").and_then(Json::as_arr) {
             let mut extended = bindings.clone();
             for b in binds {
-                let name = b.get("name").and_then(Json::as_str).ok_or("letWhich: no name")?;
-                let prog = b.get("prog").and_then(Json::as_str).ok_or("letWhich: no prog")?;
+                let name = b
+                    .get("name")
+                    .and_then(Json::as_str)
+                    .ok_or("letWhich: no name")?;
+                let prog = b
+                    .get("prog")
+                    .and_then(Json::as_str)
+                    .ok_or("letWhich: no prog")?;
                 let abs = find_in_path(search_path, prog)
                     .ok_or_else(|| format!("letWhich `{prog}': not found in TD_INPUTS"))?;
                 extended.insert(name.to_string(), abs);
             }
-            let body = s.get("body").and_then(Json::as_arr).ok_or("letWhich: no body")?;
+            let body = s
+                .get("body")
+                .and_then(Json::as_arr)
+                .ok_or("letWhich: no body")?;
             apply_body(body, srcdir, sed, &extended, search_path, envs)?;
-        } else if s.get("withDefaultPortEncodingFalse").map(Json::is_true).unwrap_or(false) {
-            let body = s.get("body").and_then(Json::as_arr).ok_or("withFluids: no body")?;
+        } else if s
+            .get("withDefaultPortEncodingFalse")
+            .map(Json::is_true)
+            .unwrap_or(false)
+        {
+            let body = s
+                .get("body")
+                .and_then(Json::as_arr)
+                .ok_or("withFluids: no body")?;
             apply_body(body, srcdir, sed, bindings, search_path, envs)?;
         } else {
             return Err(format!("unsupported phase-body statement: {s:?}"));
@@ -972,7 +1077,10 @@ fn apply_phases(srcdir: &str, search_path: &str, envs: &[(String, String)]) -> R
     let phases = j.as_arr().ok_or("TD_PHASES is not a JSON array")?;
     let bindings: BTreeMap<String, String> = BTreeMap::new();
     for phase in phases {
-        let name = phase.get("name").and_then(Json::as_str).unwrap_or("<phase>");
+        let name = phase
+            .get("name")
+            .and_then(Json::as_str)
+            .unwrap_or("<phase>");
         println!(">> td-build: phase `{name}' (td's own runner)");
         if let Some(body) = phase.get("body").and_then(Json::as_arr) {
             // Rich nested body (gettext-minimal et al.).
@@ -981,10 +1089,21 @@ fn apply_phases(srcdir: &str, search_path: &str, envs: &[(String, String)]) -> R
             // Flat form: each entry is a single-clause substitute* {file, from, to}.
             for sub in subs {
                 let fa = sub.get("file").ok_or("substitution: missing file")?;
-                let from = sub.get("from").cloned().ok_or("substitution: missing from")?;
+                let from = sub
+                    .get("from")
+                    .cloned()
+                    .ok_or("substitution: missing from")?;
                 let to = sub.get("to").cloned().ok_or("substitution: missing to")?;
                 let clause = vec![("from".to_string(), from), ("to".to_string(), to)];
-                apply_substitute(fa, &[Json::Obj(clause)], srcdir, &sed, &bindings, search_path, envs)?;
+                apply_substitute(
+                    fa,
+                    &[Json::Obj(clause)],
+                    srcdir,
+                    &sed,
+                    &bindings,
+                    search_path,
+                    envs,
+                )?;
             }
         } else {
             return Err(format!("phase `{name}' has neither body nor substitutions"));
@@ -1004,8 +1123,7 @@ fn find_config_logs(root: &Path, max: usize) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
     // BFS by (dir, depth): shallow dirs are visited first, so the top-level
     // config.log — the one a gnulib probe like socklen_t writes — leads.
-    let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
-        std::collections::VecDeque::new();
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> = std::collections::VecDeque::new();
     queue.push_back((root.to_path_buf(), 0));
     while let Some((dir, depth)) = queue.pop_front() {
         if found.len() >= max {
@@ -1382,7 +1500,10 @@ fn collect_vendor_crates(
     for c in vendor_crates.split(':').filter(|s| !s.is_empty()) {
         let nv_crate = crate::store::name_from_store_path(c)
             .ok_or_else(|| format!("vendor crate not a store path: {c}"))?;
-        let nv = nv_crate.strip_suffix(".crate").unwrap_or(&nv_crate).to_string();
+        let nv = nv_crate
+            .strip_suffix(".crate")
+            .unwrap_or(&nv_crate)
+            .to_string();
         out.push((c.to_string(), nv));
     }
     if !vendor_dir.is_empty() {
@@ -1418,7 +1539,9 @@ pub(crate) fn valid_cargo_subdir(subdir: &str) -> bool {
 
 pub(crate) fn valid_cargo_package_name(package: &str) -> bool {
     let mut bytes = package.bytes();
-    bytes.next().is_some_and(|byte| byte.is_ascii_alphanumeric())
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
@@ -1483,18 +1606,18 @@ fn exact_object_fields(value: &Json, expected: &[&str], label: &str) -> Result<(
 
 pub(crate) fn cargo_git_input_is_name(input: &str) -> bool {
     let mut bytes = input.bytes();
-    bytes.next().is_some_and(|byte| byte.is_ascii_alphanumeric())
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
         && input.len() <= 128
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 pub(crate) fn cargo_git_input_is_store_path(input: &str) -> bool {
     let store_prefix = format!("{}/", crate::store::store_dir().trim_end_matches('/'));
-    input
-        .strip_prefix(&store_prefix)
-        .is_some_and(|basename| {
-            !basename.contains('/') && crate::store::hash_from_store_path(input).is_some()
-        })
+    input.strip_prefix(&store_prefix).is_some_and(|basename| {
+        !basename.contains('/') && crate::store::hash_from_store_path(input).is_some()
+    })
 }
 
 fn valid_cargo_git_input(input: &str) -> bool {
@@ -1504,9 +1627,9 @@ fn valid_cargo_git_input(input: &str) -> bool {
 fn valid_cargo_git_version(version: &str) -> bool {
     !version.is_empty()
         && version.len() <= 128
-        && version.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_')
-        })
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'))
 }
 
 fn valid_cargo_git_package_path(path: &str) -> bool {
@@ -1563,9 +1686,7 @@ pub(crate) fn cargo_git_source_parts(source: &str) -> Result<(String, String, St
 /// The `input` is a recipe input name before assembly and its resolved store
 /// path afterwards; callers decide which of those two forms they require.
 pub(crate) fn parse_cargo_git_sources(value: &Json) -> Result<Vec<CargoGitSource>, String> {
-    let sources = value
-        .as_arr()
-        .ok_or("`cargoGitSources' must be an array")?;
+    let sources = value.as_arr().ok_or("`cargoGitSources' must be an array")?;
     if sources.is_empty() || sources.len() > MAX_CARGO_GIT_SOURCES {
         return Err(format!(
             "`cargoGitSources' must contain 1 through {MAX_CARGO_GIT_SOURCES} sources"
@@ -1665,9 +1786,7 @@ pub(crate) fn parse_cargo_git_sources(value: &Json) -> Result<Vec<CargoGitSource
     Ok(parsed)
 }
 
-pub(crate) fn parse_cargo_source_patches(
-    value: &Json,
-) -> Result<Vec<CargoSourcePatch>, String> {
+pub(crate) fn parse_cargo_source_patches(value: &Json) -> Result<Vec<CargoSourcePatch>, String> {
     let patches = value
         .as_arr()
         .ok_or("`cargoSourcePatches' must be an array")?;
@@ -1851,14 +1970,7 @@ fn account_cargo_lock_package(
     found_git: &mut std::collections::BTreeSet<(String, String, String)>,
     counts: &mut CargoLockSourceCounts,
 ) -> Result<(), String> {
-    let kind = check_cargo_lock_package(
-        name,
-        version,
-        source,
-        checksum,
-        declared_git,
-        found_git,
-    )?;
+    let kind = check_cargo_lock_package(name, version, source, checksum, declared_git, found_git)?;
     let count = match kind {
         CargoLockPackageSource::Path => return Ok(()),
         CargoLockPackageSource::Registry => &mut counts.registry,
@@ -2172,16 +2284,12 @@ pub fn run_rust() -> Result<(), String> {
             Some(value)
         }
         Err(env::VarError::NotPresent) => None,
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err("TD_RUST_PROTOC is not valid UTF-8".into())
-        }
+        Err(env::VarError::NotUnicode(_)) => return Err("TD_RUST_PROTOC is not valid UTF-8".into()),
     };
     let vendor_input_dir = match env::var("TD_VENDOR_DIR") {
         Ok(value) => value,
         Err(env::VarError::NotPresent) => String::new(),
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err("TD_VENDOR_DIR is not valid UTF-8".into())
-        }
+        Err(env::VarError::NotUnicode(_)) => return Err("TD_VENDOR_DIR is not valid UTF-8".into()),
     };
     let bins: Vec<&str> = bins_spec.split_whitespace().collect();
     if bins.is_empty() {
@@ -2241,7 +2349,9 @@ pub fn run_rust() -> Result<(), String> {
     if let Ok(extra) = env::var("TD_RUST_STORE_INCLUDE") {
         for dir in extra.split(':').filter(|p| !p.is_empty()) {
             if !Path::new(dir).is_dir() {
-                return Err(format!("native Rust include directory does not exist: {dir}"));
+                return Err(format!(
+                    "native Rust include directory does not exist: {dir}"
+                ));
             }
             cinc.push(dir.to_string());
         }
@@ -2260,7 +2370,13 @@ pub fn run_rust() -> Result<(), String> {
         run_cmd(&cp, &["-aT", &sub, build_dir], ".", &path_env, &WATCH_PHASE)?;
     }
     // store copies are read-only; make the tree writable for cargo's target/.
-    run_cmd(&chmod, &["-R", "u+w", build_dir], ".", &path_env, &WATCH_PHASE)?;
+    run_cmd(
+        &chmod,
+        &["-R", "u+w", build_dir],
+        ".",
+        &path_env,
+        &WATCH_PHASE,
+    )?;
 
     let cwd = env::current_dir().map_err(|e| e.to_string())?;
     // TD_RUST_STATIC=1 ⇒ the named binaries link as static position-independent
@@ -2344,7 +2460,10 @@ pub fn run_rust() -> Result<(), String> {
         .to_string();
     let build_abs = build_abs.to_str().ok_or("non-utf8 build path")?.to_string();
     let cargo_home = cwd.join("td-cargo-home");
-    let cargo_home = cargo_home.to_str().ok_or("non-utf8 cargo-home")?.to_string();
+    let cargo_home = cargo_home
+        .to_str()
+        .ok_or("non-utf8 cargo-home")?
+        .to_string();
     let vendor_dir = cwd.join("td-rust-vendor");
     let vendor_abs = vendor_dir
         .to_str()
@@ -2383,7 +2502,11 @@ pub fn run_rust() -> Result<(), String> {
         // must not acquire an undeclared shared libgcc runtime edge.
         rustflags.push_str(" -Clink-arg=-static-libgcc");
         if !static_link {
-            for rp in env::var("TD_RUST_STORE_RPATH").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
+            for rp in env::var("TD_RUST_STORE_RPATH")
+                .unwrap_or_default()
+                .split(':')
+                .filter(|s| !s.is_empty())
+            {
                 rustflags.push_str(&format!(" -Clink-arg=-Wl,-rpath,{rp}"));
             }
         }
@@ -2431,7 +2554,9 @@ pub fn run_rust() -> Result<(), String> {
             ));
         }
         if !Path::new(&libgcc).is_file() {
-            return Err(format!("static Rust link: libgcc.a is not a file: {libgcc}"));
+            return Err(format!(
+                "static Rust link: libgcc.a is not a file: {libgcc}"
+            ));
         }
         let eh_dir = cwd.join("td-rust-eh");
         std::fs::create_dir_all(&eh_dir)
@@ -2441,7 +2566,13 @@ pub fn run_rust() -> Result<(), String> {
             .ok_or("static Rust link: scratch path is not UTF-8")?
             .to_string();
         let libgcc_eh = format!("{eh_dir}/libgcc_eh.a");
-        run_cmd(&objcopy, &[&libgcc, &libgcc_eh], ".", &path_env, &WATCH_PHASE)?;
+        run_cmd(
+            &objcopy,
+            &[&libgcc, &libgcc_eh],
+            ".",
+            &path_env,
+            &WATCH_PHASE,
+        )?;
         run_cmd(&ranlib, &[&libgcc_eh], ".", &path_env, &WATCH_PHASE)?;
         rustflags.push_str(&format!(" -Clink-arg=-L{eh_dir}"));
     }
@@ -2465,7 +2596,11 @@ pub fn run_rust() -> Result<(), String> {
     let mut ldflags = String::from("-Wl,--build-id=sha1");
     if let Some(interp) = &store_interp {
         ldflags.push_str(&format!(" -Wl,--dynamic-linker,{interp}"));
-        for rp in env::var("TD_RUST_STORE_RPATH").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
+        for rp in env::var("TD_RUST_STORE_RPATH")
+            .unwrap_or_default()
+            .split(':')
+            .filter(|s| !s.is_empty())
+        {
             ldflags.push_str(&format!(" -Wl,-rpath,{rp}"));
         }
     }
@@ -2509,7 +2644,13 @@ pub fn run_rust() -> Result<(), String> {
         fs::create_dir_all(&vendor_dir).map_err(|e| format!("mkdir vendor: {e}"))?;
         for (c, nv) in &crate_files {
             // a cargo `.crate` tarball unpacks to exactly the single `<name>-<version>/` dir.
-            run_cmd(&tar, &["xf", c.as_str(), "-C", &vendor_abs], ".", &path_env, &WATCH_PHASE)?;
+            run_cmd(
+                &tar,
+                &["xf", c.as_str(), "-C", &vendor_abs],
+                ".",
+                &path_env,
+                &WATCH_PHASE,
+            )?;
             let cdir = vendor_dir.join(nv);
             if !cdir.is_dir() {
                 return Err(format!("crate {c} did not unpack to {}/", cdir.display()));
@@ -2520,14 +2661,20 @@ pub fn run_rust() -> Result<(), String> {
             let mut h = crate::sha256::Sha256::new();
             h.update(&bytes);
             let sha = crate::sha256::to_base16(&h.finalize());
-            fs::write(cdir.join(".cargo-checksum.json"), format!("{{\"files\":{{}},\"package\":\"{sha}\"}}"))
-                .map_err(|e| format!("write checksum for {nv}: {e}"))?;
+            fs::write(
+                cdir.join(".cargo-checksum.json"),
+                format!("{{\"files\":{{}},\"package\":\"{sha}\"}}"),
+            )
+            .map_err(|e| format!("write checksum for {nv}: {e}"))?;
         }
         let git_unpack = cwd.join("td-rust-git-sources");
         for (index, source) in cargo_git_sources.iter().enumerate() {
             let archive = Path::new(&source.input);
             let metadata = fs::symlink_metadata(archive).map_err(|error| {
-                format!("inspect Cargo Git source archive {}: {error}", archive.display())
+                format!(
+                    "inspect Cargo Git source archive {}: {error}",
+                    archive.display()
+                )
             })?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(format!(
@@ -2550,7 +2697,10 @@ pub fn run_rust() -> Result<(), String> {
             )?;
             let archive_root = PathBuf::from(single_subdir(unpack_text)?);
             let root_metadata = fs::symlink_metadata(&archive_root).map_err(|error| {
-                format!("inspect Cargo Git archive root {}: {error}", archive_root.display())
+                format!(
+                    "inspect Cargo Git archive root {}: {error}",
+                    archive_root.display()
+                )
             })?;
             if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
                 return Err(format!(
@@ -2562,7 +2712,10 @@ pub fn run_rust() -> Result<(), String> {
                 let package_root = cargo_git_package_root(&archive_root, &package.path)?;
                 let manifest = package_root.join("Cargo.toml");
                 let manifest_metadata = fs::symlink_metadata(&manifest).map_err(|error| {
-                    format!("inspect Cargo Git package manifest {}: {error}", manifest.display())
+                    format!(
+                        "inspect Cargo Git package manifest {}: {error}",
+                        manifest.display()
+                    )
                 })?;
                 if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
                     return Err(format!(
@@ -2570,8 +2723,7 @@ pub fn run_rust() -> Result<(), String> {
                         manifest.display()
                     ));
                 }
-                let destination =
-                    vendor_dir.join(format!("{}-{}", package.name, package.version));
+                let destination = vendor_dir.join(format!("{}-{}", package.name, package.version));
                 if destination.exists() {
                     return Err(format!(
                         "duplicate Cargo vendor destination: {}",
@@ -2594,19 +2746,18 @@ pub fn run_rust() -> Result<(), String> {
 
         let cargo_config =
             cargo_vendor_config(!crate_files.is_empty(), &cargo_git_sources, &vendor_abs)?;
-        fs::write(
-            format!("{cargo_home}/config.toml"),
-            cargo_config,
-        )
-        .map_err(|e| format!("write cargo config: {e}"))?;
+        fs::write(format!("{cargo_home}/config.toml"), cargo_config)
+            .map_err(|e| format!("write cargo config: {e}"))?;
     }
 
     // build (offline, frozen, release) in the writable tree. Optional cargo feature
     // selection from the recipe: TD_CARGO_NO_DEFAULT=1 ⇒ --no-default-features (drop the
     // crate's defaults, e.g. a C-building jemalloc), TD_CARGO_FEATURES=a,b ⇒ --features a,b.
     // Absent ⇒ the plain default build, unchanged.
-    let mut cargo_args: Vec<String> =
-        ["build", "--release", "--offline", "--frozen"].iter().map(|s| s.to_string()).collect();
+    let mut cargo_args: Vec<String> = ["build", "--release", "--offline", "--frozen"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let (selection_args, cargo_release_dir) = cargo_selection(
         &cargo_dir,
         &bins,
@@ -2785,7 +2936,10 @@ fn cargo_workspace_dir(source_root: &Path, subdir: Option<&str>) -> Result<PathB
             };
             workspace.push(component);
             let metadata = fs::symlink_metadata(&workspace).map_err(|error| {
-                format!("inspect Cargo workspace component {}: {error}", workspace.display())
+                format!(
+                    "inspect Cargo workspace component {}: {error}",
+                    workspace.display()
+                )
             })?;
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 return Err(format!(
@@ -2828,8 +2982,12 @@ fn cargo_workspace_dir(source_root: &Path, subdir: Option<&str>) -> Result<PathB
         }
     }
     let manifest = workspace.join("Cargo.toml");
-    let metadata = fs::symlink_metadata(&manifest)
-        .map_err(|error| format!("inspect Cargo workspace manifest {}: {error}", manifest.display()))?;
+    let metadata = fs::symlink_metadata(&manifest).map_err(|error| {
+        format!(
+            "inspect Cargo workspace manifest {}: {error}",
+            manifest.display()
+        )
+    })?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(format!(
             "Cargo workspace has no regular Cargo.toml: {}",
@@ -2851,7 +3009,12 @@ fn require_selected_cargo_workspace(
         .envs(envs.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .output()
-        .map_err(|error| format!("run cargo locate-project in {}: {error}", selected.display()))?;
+        .map_err(|error| {
+            format!(
+                "run cargo locate-project in {}: {error}",
+                selected.display()
+            )
+        })?;
     if !output.status.success() {
         return Err(format!(
             "cargo could not resolve the selected workspace {}: {}",
@@ -3105,8 +3268,8 @@ pub(crate) fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
             // kernel-header overlay after `make install`), so remove a colliding dest first —
             // otherwise symlink() reds EEXIST where the regular-file arm below would overwrite.
             let _ = fs::remove_file(&to);
-            let target = fs::read_link(&from)
-                .map_err(|e| format!("readlink {}: {e}", from.display()))?;
+            let target =
+                fs::read_link(&from).map_err(|e| format!("readlink {}: {e}", from.display()))?;
             std::os::unix::fs::symlink(&target, &to)
                 .map_err(|e| format!("symlink {}: {e}", to.display()))?;
         } else {
@@ -3218,9 +3381,9 @@ fn validate_static_application(out: &Path, entry: &str, runtime: &Path) -> Resul
         .map_err(|_| format!("application entry {entry:?} is not an absolute child of /app"))?;
     let mut entry_path = files.clone();
     let mut components = relative.components();
-    let first = components.next().ok_or_else(|| {
-        format!("application entry {entry:?} is not an absolute child of /app")
-    })?;
+    let first = components
+        .next()
+        .ok_or_else(|| format!("application entry {entry:?} is not an absolute child of /app"))?;
     let std::path::Component::Normal(name) = first else {
         return Err(format!(
             "application entry {entry:?} escapes or aliases the /app tree"
@@ -3263,8 +3426,7 @@ fn require_no_gnu_store(dir: &Path) -> Result<(), String> {
             require_no_gnu_store(&p)?;
             false
         } else if ft.is_symlink() {
-            let target =
-                fs::read_link(&p).map_err(|e| format!("readlink {}: {e}", p.display()))?;
+            let target = fs::read_link(&p).map_err(|e| format!("readlink {}: {e}", p.display()))?;
             target.to_string_lossy().contains("/gnu/store")
         } else if ft.is_file() {
             crate::bootstrap::contains_gnu_store(&p)
@@ -3299,7 +3461,9 @@ pub fn run_stage0() -> Result<(), String> {
     let out = env::var("out").map_err(|_| "out not set".to_string())?;
     let src = env::var("TD_SRC").map_err(|_| "TD_SRC not set".to_string())?;
     if !Path::new(&src).is_dir() {
-        return Err(format!("TD_SRC {src} is not a directory (want the interned unpacked stage0 seed tree)"));
+        return Err(format!(
+            "TD_SRC {src} is not a directory (want the interned unpacked stage0 seed tree)"
+        ));
     }
 
     // Writable working copy — the kaem build writes artifacts INTO its tree.
@@ -3345,7 +3509,10 @@ pub fn run_stage0() -> Result<(), String> {
     // sha256sum) with M2-Mesoplanet — the tools the mes/tcc rungs need so
     // their build scripts stop depending on host coreutils (re #469).
     let env_kv = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
     };
     let full_env = env_kv(&[
         ("ARCH", "amd64"),
@@ -3356,7 +3523,12 @@ pub fn run_stage0() -> Result<(), String> {
     ]);
     run_cmd(
         "./AMD64/bin/kaem",
-        &["--verbose", "--strict", "--file", "AMD64/mescc-tools-full-kaem.kaem"],
+        &[
+            "--verbose",
+            "--strict",
+            "--file",
+            "AMD64/mescc-tools-full-kaem.kaem",
+        ],
         &cwd,
         &full_env,
         &WATCH_PHASE,
@@ -3483,8 +3655,8 @@ impl StepCtx {
             Some(i) => pat.get(..i).unwrap_or("."),
             None => ".",
         };
-        let resolved = fs::canonicalize(dir)
-            .map_err(|e| format!("glob:{pat}: resolve {dir}: {e}"))?;
+        let resolved =
+            fs::canonicalize(dir).map_err(|e| format!("glob:{pat}: resolve {dir}: {e}"))?;
         for allowed in [&self.root, &self.out] {
             let base = fs::canonicalize(allowed)
                 .map_err(|e| format!("glob:{pat}: resolve {allowed}: {e}"))?;
@@ -3624,11 +3796,7 @@ type TextEdit = (String, String, usize);
 /// not survive the recipe→engine round-trip intact — a non-ASCII `to` would write
 /// mangled bytes. ASCII is byte-identical through that path; anything else fails
 /// closed here rather than silently corrupting the patched output.
-fn apply_text_edits(
-    file: &str,
-    content: String,
-    edits: &[TextEdit],
-) -> Result<String, String> {
+fn apply_text_edits(file: &str, content: String, edits: &[TextEdit]) -> Result<String, String> {
     apply_named_text_edits("substituteText", file, content, edits)
 }
 
@@ -3644,10 +3812,14 @@ fn apply_named_text_edits(
             return Err(at("empty `from' string".into()));
         }
         if !from.is_ascii() || !to.is_ascii() {
-            return Err(at("`from'/`to' must be ASCII (the build-JSON reader is Latin-1)".into()));
+            return Err(at(
+                "`from'/`to' must be ASCII (the build-JSON reader is Latin-1)".into(),
+            ));
         }
         if *expect == 0 {
-            return Err(at("`expect' is 0 — every edit must change at least one occurrence".into()));
+            return Err(at(
+                "`expect' is 0 — every edit must change at least one occurrence".into(),
+            ));
         }
         let n = content.matches(from.as_str()).count();
         if n != *expect {
@@ -3735,12 +3907,8 @@ fn apply_cargo_source_patches(
         let path = cargo_source_patch_path(workspace, &patch.file)?;
         let content = fs::read_to_string(&path)
             .map_err(|error| format!("read Cargo source patch {}: {error}", path.display()))?;
-        let edited = apply_named_text_edits(
-            "cargoSourcePatches",
-            &patch.file,
-            content,
-            &patch.edits,
-        )?;
+        let edited =
+            apply_named_text_edits("cargoSourcePatches", &patch.file, content, &patch.edits)?;
         write_preserving_mode(&path, edited.as_bytes())
             .map_err(|error| format!("write Cargo source patch {}: {error}", path.display()))?;
     }
@@ -3752,10 +3920,7 @@ fn apply_cargo_source_patches(
 /// source text — a `{in:…}`/`{src}` inside a patched hunk must survive verbatim,
 /// so they are NEVER template-expanded (only `file` is). Returns the expanded
 /// path and the literal edits (validated for content by `apply_text_edits`).
-fn parse_substitute_edits(
-    ctx: &StepCtx,
-    o: &Json,
-) -> Result<(String, Vec<TextEdit>), String> {
+fn parse_substitute_edits(ctx: &StepCtx, o: &Json) -> Result<(String, Vec<TextEdit>), String> {
     let file = ctx.expand(
         o.get("file")
             .and_then(Json::as_str)
@@ -3797,7 +3962,9 @@ fn glob_one_star(pat: &str) -> Result<Vec<String>, String> {
         .split_once('*')
         .ok_or_else(|| format!("glob pattern has no `*': {pat}"))?;
     if suf.contains('*') || dir.contains('*') {
-        return Err(format!("glob supports exactly one `*' in the basename: {pat}"));
+        return Err(format!(
+            "glob supports exactly one `*' in the basename: {pat}"
+        ));
     }
     let mut hits = Vec::new();
     let rd = fs::read_dir(dir).map_err(|e| format!("glob {pat}: read {dir}: {e}"))?;
@@ -3871,8 +4038,7 @@ fn copy_file_writable(from: &Path, dest_dir: &Path) -> Result<(), String> {
     let metadata = regular_file_without_symlink_components("copyFiles", from)?;
     fs::create_dir_all(dest_dir).map_err(|e| format!("mkdir {}: {e}", dest_dir.display()))?;
     let to = dest_dir.join(base);
-    fs::copy(from, &to)
-        .map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))?;
+    fs::copy(from, &to).map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))?;
     let mode = metadata.permissions().mode();
     fs::set_permissions(&to, fs::Permissions::from_mode((mode & 0o777) | 0o200))
         .map_err(|e| format!("chmod {}: {e}", to.display()))
@@ -3892,7 +4058,11 @@ fn confined_destination(out: &Path, to: &Path) -> Result<(), String> {
             std::path::Component::RootDir | std::path::Component::Normal(_)
         )
     });
-    let Some(below) = to.strip_prefix(out).ok().filter(|_| plain && !to.is_relative()) else {
+    let Some(below) = to
+        .strip_prefix(out)
+        .ok()
+        .filter(|_| plain && !to.is_relative())
+    else {
         return Err(format!(
             "copyFile: destination {} is not a plain path inside the build output {} \
              (APPLICATIONS.md section B.8)",
@@ -3952,9 +4122,7 @@ fn copy_single_file(out: &Path, file: &Path, to: &Path, exec: bool) -> Result<()
     while let Some(dir) = ancestor.filter(|dir| *dir != out) {
         match fs::symlink_metadata(dir) {
             Ok(_) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(dir.to_path_buf())
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push(dir.to_path_buf()),
             Err(e) => return Err(format!("stat {}: {e}", dir.display())),
         }
         ancestor = dir.parent();
@@ -3966,8 +4134,8 @@ fn copy_single_file(out: &Path, file: &Path, to: &Path, exec: bool) -> Result<()
     }
     // `create_new` makes "never overwritten" the kernel's promise rather than a
     // preceding stat's: an existing file, or a link of any kind, fails the open.
-    let mut source = fs::File::open(file)
-        .map_err(|e| format!("copyFile: open {}: {e}", file.display()))?;
+    let mut source =
+        fs::File::open(file).map_err(|e| format!("copyFile: open {}: {e}", file.display()))?;
     let mut destination = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3996,12 +4164,8 @@ fn runtime_candidate_index(
     }
     let mut by_hash: BTreeMap<String, (String, String)> = BTreeMap::new();
     for dir in store_dirs {
-        let entries = fs::read_dir(&dir).map_err(|e| {
-            format!(
-                "stageRuntimeClosure: read store {}: {e}",
-                dir.display()
-            )
-        })?;
+        let entries = fs::read_dir(&dir)
+            .map_err(|e| format!("stageRuntimeClosure: read store {}: {e}", dir.display()))?;
         for entry in entries {
             let entry = entry.map_err(|e| {
                 format!(
@@ -4240,12 +4404,7 @@ fn scan_runtime_fragment(
     }
     std::io::Write::write_all(scanner, fragment)
         .and_then(|()| std::io::Write::write_all(scanner, b"\0"))
-        .map_err(|e| {
-            format!(
-                "stageRuntimeClosure: scan {kind} {}: {e}",
-                path.display()
-            )
-        })
+        .map_err(|e| format!("stageRuntimeClosure: scan {kind} {}: {e}", path.display()))
 }
 
 fn absolute_store_reference(fragment: &[u8], store_dir: &Path) -> Option<String> {
@@ -4254,8 +4413,7 @@ fn absolute_store_reference(fragment: &[u8], store_dir: &Path) -> Option<String>
     let component_len = rest
         .iter()
         .take_while(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'+' | b'-' | b'.' | b'_' | b'?' | b'=')
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.' | b'_' | b'?' | b'=')
         })
         .count();
     let component = std::str::from_utf8(rest.get(..component_len)?).ok()?;
@@ -4274,10 +4432,7 @@ fn copy_store_item_writable(from: &Path, to: &Path) -> Result<(), String> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            return Err(format!(
-                "stageRuntimeClosure: stat {}: {e}",
-                to.display()
-            ));
+            return Err(format!("stageRuntimeClosure: stat {}: {e}", to.display()));
         }
     }
     let metadata = fs::symlink_metadata(from)
@@ -4299,8 +4454,13 @@ fn copy_store_item_writable(from: &Path, to: &Path) -> Result<(), String> {
         return std::os::unix::fs::symlink(target, to)
             .map_err(|e| format!("stageRuntimeClosure: symlink {}: {e}", to.display()));
     }
-    fs::copy(from, to)
-        .map_err(|e| format!("stageRuntimeClosure: copy {} -> {}: {e}", from.display(), to.display()))?;
+    fs::copy(from, to).map_err(|e| {
+        format!(
+            "stageRuntimeClosure: copy {} -> {}: {e}",
+            from.display(),
+            to.display()
+        )
+    })?;
     let mode = metadata.permissions().mode();
     fs::set_permissions(to, fs::Permissions::from_mode((mode & 0o777) | 0o200))
         .map_err(|e| format!("stageRuntimeClosure: chmod {}: {e}", to.display()))
@@ -4676,7 +4836,8 @@ fn relocate_ld_scripts(dir: &Path, prefix: &str) -> Result<(), String> {
     };
     let needle = format!("{prefix}/lib/");
     for entry in rd {
-        let entry = entry.map_err(|e| format!("relocate ld scripts: read {}: {e}", dir.display()))?;
+        let entry =
+            entry.map_err(|e| format!("relocate ld scripts: read {}: {e}", dir.display()))?;
         let path = entry.path();
         let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
         if ext != "so" && ext != "a" {
@@ -4705,8 +4866,7 @@ fn pack_erofs(root: &Path, output: &Path) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|e| format!("pack erofs: mkdir {}: {e}", parent.display()))?;
     }
-    fs::write(output, image)
-        .map_err(|e| format!("pack erofs: write {}: {e}", output.display()))
+    fs::write(output, image).map_err(|e| format!("pack erofs: write {}: {e}", output.display()))
 }
 
 fn valid_artifact_label(label: &str) -> bool {
@@ -4718,10 +4878,7 @@ fn valid_artifact_label(label: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-fn write_sha256_manifest(
-    output: &Path,
-    mut entries: Vec<(String, String)>,
-) -> Result<(), String> {
+fn write_sha256_manifest(output: &Path, mut entries: Vec<(String, String)>) -> Result<(), String> {
     if entries.is_empty() {
         return Err("sha256 manifest: no artifacts".into());
     }
@@ -4733,7 +4890,9 @@ fn write_sha256_manifest(
             return Err(format!("sha256 manifest: invalid artifact label `{label}'"));
         }
         if previous == Some(label.as_str()) {
-            return Err(format!("sha256 manifest: duplicate artifact label `{label}'"));
+            return Err(format!(
+                "sha256 manifest: duplicate artifact label `{label}'"
+            ));
         }
         let digest = crate::sha256::sha256_file(Path::new(path))
             .map_err(|e| format!("sha256 manifest: hash {path}: {e}"))?;
@@ -4763,8 +4922,7 @@ pub(crate) fn consume_mesboot_steps_file(path: &Path) -> Result<String, String> 
 }
 
 fn create_tool_farm_link(tools: &Path, name: &str, target: &Path) -> Result<(), String> {
-    fs::metadata(target)
-        .map_err(|e| format!("toolFarm target {}: {e}", target.display()))?;
+    fs::metadata(target).map_err(|e| format!("toolFarm target {}: {e}", target.display()))?;
     let link = tools.join(name);
     let _ = fs::remove_file(&link);
     std::os::unix::fs::symlink(target, &link)
@@ -4881,7 +5039,9 @@ fn assert_debug_size(root: &Path, report: &Path, scope: &str, ceiling: u64) -> R
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     {
-        return Err(format!("debug-size scope is not a lowercase label: {scope:?}"));
+        return Err(format!(
+            "debug-size scope is not a lowercase label: {scope:?}"
+        ));
     }
     let mut seen = std::collections::HashSet::new();
     let mut bytes = 0u64;
@@ -4904,9 +5064,8 @@ fn assert_debug_size(root: &Path, report: &Path, scope: &str, ceiling: u64) -> R
         fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir debug-size report {}: {e}", parent.display()))?;
     }
-    let content = format!(
-        "format=1\nscope={scope}\ndebug_bytes={bytes}\nceiling_bytes={ceiling}\n"
-    );
+    let content =
+        format!("format=1\nscope={scope}\ndebug_bytes={bytes}\nceiling_bytes={ceiling}\n");
     fs::write(report, content)
         .map_err(|e| format!("write debug-size report {}: {e}", report.display()))?;
     fs::set_permissions(report, fs::Permissions::from_mode(0o644))
@@ -4916,10 +5075,10 @@ fn assert_debug_size(root: &Path, report: &Path, scope: &str, ceiling: u64) -> R
 }
 
 fn compare_files(left: &Path, right: &Path) -> Result<(), String> {
-    let left_meta = fs::metadata(left)
-        .map_err(|e| format!("compare stat {}: {e}", left.display()))?;
-    let right_meta = fs::metadata(right)
-        .map_err(|e| format!("compare stat {}: {e}", right.display()))?;
+    let left_meta =
+        fs::metadata(left).map_err(|e| format!("compare stat {}: {e}", left.display()))?;
+    let right_meta =
+        fs::metadata(right).map_err(|e| format!("compare stat {}: {e}", right.display()))?;
     if !left_meta.is_file() || !right_meta.is_file() {
         return Err(format!(
             "compare requires two regular files: {} {}",
@@ -4936,10 +5095,10 @@ fn compare_files(left: &Path, right: &Path) -> Result<(), String> {
             right_meta.len()
         ));
     }
-    let mut left_file = fs::File::open(left)
-        .map_err(|e| format!("compare open {}: {e}", left.display()))?;
-    let mut right_file = fs::File::open(right)
-        .map_err(|e| format!("compare open {}: {e}", right.display()))?;
+    let mut left_file =
+        fs::File::open(left).map_err(|e| format!("compare open {}: {e}", left.display()))?;
+    let mut right_file =
+        fs::File::open(right).map_err(|e| format!("compare open {}: {e}", right.display()))?;
     let mut left_buf = vec![0u8; 64 * 1024];
     let mut right_buf = vec![0u8; 64 * 1024];
     let mut offset = 0u64;
@@ -5091,8 +5250,8 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
         let relative_text = relative
             .to_str()
             .ok_or_else(|| format!("non-UTF-8 installed ELF path: {}", relative.display()))?;
-        let runtime_line_exception = line_exception
-            .filter(|exception| exception.runtime_relative_path == relative_text);
+        let runtime_line_exception =
+            line_exception.filter(|exception| exception.runtime_relative_path == relative_text);
         let debug = debug_root.join(format!("{relative_text}.debug"));
         let parent = debug
             .parent()
@@ -5185,14 +5344,12 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
         if !stripped_inodes.insert(*original_inode) {
             continue;
         }
-        let runtime_text = canonical_runtime
-            .to_str()
-            .ok_or_else(|| {
-                format!(
-                    "non-UTF-8 installed ELF path: {}",
-                    canonical_runtime.display()
-                )
-            })?;
+        let runtime_text = canonical_runtime.to_str().ok_or_else(|| {
+            format!(
+                "non-UTF-8 installed ELF path: {}",
+                canonical_runtime.display()
+            )
+        })?;
         run_cmd(
             objcopy,
             &["--strip-all", runtime_text],
@@ -5209,8 +5366,12 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
         if runtime == canonical_runtime {
             continue;
         }
-        fs::remove_file(runtime)
-            .map_err(|e| format!("remove pre-strip hard-link alias {}: {e}", runtime.display()))?;
+        fs::remove_file(runtime).map_err(|e| {
+            format!(
+                "remove pre-strip hard-link alias {}: {e}",
+                runtime.display()
+            )
+        })?;
         fs::hard_link(canonical_runtime, runtime).map_err(|e| {
             format!(
                 "restore runtime hard link {} from {}: {e}",
@@ -5337,11 +5498,20 @@ pub fn run_mesboot() -> Result<(), String> {
             .ok_or_else(|| format!("mesboot step: missing/non-string `{k}'"))
     };
     let pairs = |o: &Json, k: &str| -> Result<Vec<(String, String)>, String> {
-        let a = o.get(k).and_then(Json::as_arr).ok_or_else(|| format!("mesboot step: `{k}' not an array"))?;
+        let a = o
+            .get(k)
+            .and_then(Json::as_arr)
+            .ok_or_else(|| format!("mesboot step: `{k}' not an array"))?;
         a.iter()
             .map(|p| {
-                let pa = p.as_arr().filter(|pa| pa.len() == 2).ok_or("mesboot step: pair is not a 2-array")?;
-                match (pa.first().and_then(Json::as_str), pa.get(1).and_then(Json::as_str)) {
+                let pa = p
+                    .as_arr()
+                    .filter(|pa| pa.len() == 2)
+                    .ok_or("mesboot step: pair is not a 2-array")?;
+                match (
+                    pa.first().and_then(Json::as_str),
+                    pa.get(1).and_then(Json::as_str),
+                ) {
                     (Some(a), Some(b)) => Ok((a.to_string(), b.to_string())),
                     _ => Err("mesboot step: non-string pair".to_string()),
                 }
@@ -5388,8 +5558,14 @@ pub fn run_mesboot() -> Result<(), String> {
                 .as_arr()
                 .ok_or_else(|| err("toolFarm: not an array".into()))?;
             for p in links {
-                let pa = p.as_arr().filter(|pa| pa.len() == 2).ok_or_else(|| err("toolFarm: pair".into()))?;
-                let (name, target) = match (pa.first().and_then(Json::as_str), pa.get(1).and_then(Json::as_str)) {
+                let pa = p
+                    .as_arr()
+                    .filter(|pa| pa.len() == 2)
+                    .ok_or_else(|| err("toolFarm: pair".into()))?;
+                let (name, target) = match (
+                    pa.first().and_then(Json::as_str),
+                    pa.get(1).and_then(Json::as_str),
+                ) {
                     (Some(a), Some(b)) => (a.to_string(), ctx.expand(b).map_err(err)?),
                     _ => return Err(err("toolFarm: non-string pair".into())),
                 };
@@ -5401,7 +5577,8 @@ pub fn run_mesboot() -> Result<(), String> {
             let content = ctx.expand(&field(o, "content")?).map_err(err)?;
             let exec = o.get("exec").is_some_and(Json::is_true);
             if let Some(parent) = Path::new(&path).parent() {
-                fs::create_dir_all(parent).map_err(|e| err(format!("mkdir {}: {e}", parent.display())))?;
+                fs::create_dir_all(parent)
+                    .map_err(|e| err(format!("mkdir {}: {e}", parent.display())))?;
             }
             fs::write(&path, content).map_err(|e| err(format!("write {path}: {e}")))?;
             let mode = if exec { 0o755 } else { 0o644 };
@@ -5494,7 +5671,7 @@ pub fn run_mesboot() -> Result<(), String> {
                 Path::new(&registry),
                 Path::new(&launcher),
             )
-                .map_err(err)?;
+            .map_err(err)?;
         } else if let Some(o) = step.get("packErofs") {
             let root = ctx.expand(&field(o, "root")?).map_err(err)?;
             let output = ctx.expand(&field(o, "output")?).map_err(err)?;
@@ -5512,14 +5689,18 @@ pub fn run_mesboot() -> Result<(), String> {
             // Create the link's parent (every sibling step does), so a symlink into a
             // not-yet-made dir does not red ENOENT; then replace any existing entry.
             if let Some(parent) = Path::new(&link).parent() {
-                fs::create_dir_all(parent).map_err(|e| err(format!("mkdir {}: {e}", parent.display())))?;
+                fs::create_dir_all(parent)
+                    .map_err(|e| err(format!("mkdir {}: {e}", parent.display())))?;
             }
             let _ = fs::remove_file(&link);
             std::os::unix::fs::symlink(&target, &link)
                 .map_err(|e| err(format!("symlink {link} -> {target}: {e}")))?;
         } else if let Some(p) = step.get("mkDir") {
             let path = ctx
-                .expand(p.as_str().ok_or_else(|| err("mkDir: not a string".into()))?)
+                .expand(
+                    p.as_str()
+                        .ok_or_else(|| err("mkDir: not a string".into()))?,
+                )
                 .map_err(err)?;
             fs::create_dir_all(&path).map_err(|e| err(format!("mkdir {path}: {e}")))?;
         } else if let Some(o) = step.get("truncate") {
@@ -5561,8 +5742,8 @@ pub fn run_mesboot() -> Result<(), String> {
                 .expand_all(&string_array(o, "paths").map_err(err)?)
                 .map_err(err)?
             {
-                let meta = fs::metadata(&p)
-                    .map_err(|_| err(format!("required product missing: {p}")))?;
+                let meta =
+                    fs::metadata(&p).map_err(|_| err(format!("required product missing: {p}")))?;
                 if exec && (!meta.is_file() || meta.permissions().mode() & 0o111 == 0) {
                     return Err(err(format!("required product not an executable file: {p}")));
                 }
@@ -5655,9 +5836,7 @@ mod tests {
 
     fn cargo_git_fixture() -> (String, Vec<CargoGitSource>) {
         let commit = "0123456789abcdef0123456789abcdef01234567";
-        let source = format!(
-            "git+https://example.invalid/example?rev={commit}#{commit}"
-        );
+        let source = format!("git+https://example.invalid/example?rev={commit}#{commit}");
         let declaration = crate::json::parse(&format!(
             r#"[{{"source":"{source}","input":"example-git-source","packages":[{{"name":"gitdep","version":"1.2.3","path":"crate"}}]}}]"#
         ))
@@ -5699,8 +5878,7 @@ mod tests {
         let lock = format!(
             "version = 4\n\n[[package]]\nname = \"gitdep\"\nversion = \"1.2.3\"\nsource = \"{source}\"\n"
         );
-        let error = validate_runner_cargo_lock_sources(Some(lock.as_bytes()), &[])
-            .unwrap_err();
+        let error = validate_runner_cargo_lock_sources(Some(lock.as_bytes()), &[]).unwrap_err();
         assert!(error.contains("undeclared Git dependency"), "{error}");
         validate_runner_cargo_lock_sources(Some(lock.as_bytes()), &declared).unwrap();
         assert!(validate_runner_cargo_lock_sources(None, &declared).is_err());
@@ -5708,10 +5886,7 @@ mod tests {
 
     #[test]
     fn cargo_git_package_paths_refuse_symlink_traversal() {
-        let base = std::env::temp_dir().join(format!(
-            "td-cargo-git-path-{}",
-            std::process::id()
-        ));
+        let base = std::env::temp_dir().join(format!("td-cargo-git-path-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let root = base.join("root");
         let outside = base.join("outside");
@@ -5756,7 +5931,10 @@ mod tests {
         let entry = out.join("files/bin/claude");
         copy_single_file(&out, &payload, &entry, true).unwrap();
         assert_eq!(fs::read(&entry).unwrap(), b"\x7fELF-bytes");
-        assert_eq!(fs::metadata(&entry).unwrap().permissions().mode() & 0o7777, 0o755);
+        assert_eq!(
+            fs::metadata(&entry).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
         // Every directory the step created is world-traversable whatever the
         // umask, which the application validators require of a package tree.
         for dir in ["out/files", "out/files/bin"] {
@@ -5769,10 +5947,16 @@ mod tests {
 
         let data = out.join("files/share/notes");
         copy_single_file(&out, &payload, &data, false).unwrap();
-        assert_eq!(fs::metadata(&data).unwrap().permissions().mode() & 0o7777, 0o644);
+        assert_eq!(
+            fs::metadata(&data).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
 
         let occupied = copy_single_file(&out, &payload, &entry, true).unwrap_err();
-        assert!(occupied.contains("create") && occupied.contains("exists"), "{occupied}");
+        assert!(
+            occupied.contains("create") && occupied.contains("exists"),
+            "{occupied}"
+        );
         // A regular file where a parent should be is refused by the confinement
         // walk's own stat of the path beneath it (ENOTDIR is not NotFound), so
         // nothing is created beside it and no `mkdir` is attempted.
@@ -5783,8 +5967,7 @@ mod tests {
 
         let link = base.join("store/link");
         std::os::unix::fs::symlink(&payload, &link).unwrap();
-        let linked =
-            copy_single_file(&out, &link, &out.join("files/bin/other"), true).unwrap_err();
+        let linked = copy_single_file(&out, &link, &out.join("files/bin/other"), true).unwrap_err();
         assert!(linked.contains("symlink"), "{linked}");
 
         // The destination side: the three spellings that would let a data step
@@ -5912,10 +6095,7 @@ mod tests {
 
     #[test]
     fn line_exception_runtime_is_present_and_not_an_ordinary_alias() {
-        let base = std::env::temp_dir().join(format!(
-            "td-line-exception-{}",
-            std::process::id()
-        ));
+        let base = std::env::temp_dir().join(format!("td-line-exception-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("bin")).unwrap();
         let codex = base.join("bin/codex");
@@ -5928,18 +6108,15 @@ mod tests {
 
         let alias = base.join("bin/codex-alias");
         fs::hard_link(&codex, &alias).unwrap();
-        let aliased = validate_line_exception_runtime(&base, &[codex, alias], exception)
-            .unwrap_err();
+        let aliased =
+            validate_line_exception_runtime(&base, &[codex, alias], exception).unwrap_err();
         assert!(aliased.contains("aliases ordinary runtime"), "{aliased}");
         let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn cargo_git_vendor_config_resolves_offline_without_a_git_checkout() {
-        let base = std::env::temp_dir().join(format!(
-            "td-cargo-git-vendor-{}",
-            std::process::id()
-        ));
+        let base = std::env::temp_dir().join(format!("td-cargo-git-vendor-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let root = base.join("consumer");
         let cargo_home = base.join("cargo-home");
@@ -5954,7 +6131,11 @@ mod tests {
             "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ngitdep = { git = \"https://example.invalid/example\", rev = \"0123456789abcdef0123456789abcdef01234567\" }\n",
         )
         .unwrap();
-        fs::write(root.join("src/main.rs"), "fn main() { gitdep::called(); }\n").unwrap();
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() { gitdep::called(); }\n",
+        )
+        .unwrap();
         fs::write(
             root.join("Cargo.lock"),
             format!(
@@ -5997,10 +6178,7 @@ mod tests {
 
     #[test]
     fn cargo_workspace_selection_stays_below_the_source_root() {
-        let base = std::env::temp_dir().join(format!(
-            "td-cargo-workspace-{}",
-            std::process::id()
-        ));
+        let base = std::env::temp_dir().join(format!("td-cargo-workspace-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("codex-rs")).unwrap();
         fs::create_dir_all(base.join("nested")).unwrap();
@@ -6016,7 +6194,10 @@ mod tests {
             base.join("codex-rs")
         );
         for subdir in ["", ".", "../escape", "/absolute", "nested/../escape"] {
-            assert!(cargo_workspace_dir(&base, Some(subdir)).is_err(), "{subdir}");
+            assert!(
+                cargo_workspace_dir(&base, Some(subdir)).is_err(),
+                "{subdir}"
+            );
         }
 
         let real = base.join("real-workspace");
@@ -6072,17 +6253,19 @@ mod tests {
         let error = require_selected_cargo_workspace(&cargo, &cargo_dir, &envs).unwrap_err();
         assert!(error.contains("Cargo.lock Cargo will not use"), "{error}");
 
-        fs::write(selected.join("Cargo.toml"), "[workspace]\nresolver = \"2\"\n").unwrap();
+        fs::write(
+            selected.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\n",
+        )
+        .unwrap();
         require_selected_cargo_workspace(&cargo, &cargo_dir, &envs).unwrap();
         let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn committed_cargo_lock_is_verified_or_explicitly_replaced() {
-        let base = std::env::temp_dir().join(format!(
-            "td-cargo-lock-enforcement-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("td-cargo-lock-enforcement-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let cargo_dir = base.join("workspace");
         let vendor_dir = base.join("vendor");
@@ -6123,10 +6306,8 @@ mod tests {
 
     #[test]
     fn committed_cargo_lock_refuses_symlinks_and_non_files() {
-        let base = std::env::temp_dir().join(format!(
-            "td-cargo-lock-node-types-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("td-cargo-lock-node-types-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let cargo_dir = base.join("workspace");
         let vendor_dir = base.join("vendor");
@@ -6344,7 +6525,10 @@ mod tests {
 
         let error = copy_file_writable(&archive_entry, &dest)
             .expect_err("copyFiles must not dereference a foreign archive symlink");
-        assert!(error.contains("symlinks") && error.contains("refused"), "{error}");
+        assert!(
+            error.contains("symlinks") && error.contains("refused"),
+            "{error}"
+        );
         assert!(!dest.join("rg").exists());
 
         let nested = unpacked.join("nested");
@@ -6372,14 +6556,21 @@ mod tests {
         let entry = out.join("files/bin/app");
         fs::set_permissions(&entry, fs::Permissions::from_mode(0o644)).unwrap();
         let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
-        assert!(error.contains("not a world-executable regular file"), "{error}");
+        assert!(
+            error.contains("not a world-executable regular file"),
+            "{error}"
+        );
         fs::set_permissions(&entry, fs::Permissions::from_mode(0o100)).unwrap();
         let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
-        assert!(error.contains("not a world-executable regular file"), "{error}");
+        assert!(
+            error.contains("not a world-executable regular file"),
+            "{error}"
+        );
         fs::set_permissions(&entry, fs::Permissions::from_mode(0o755)).unwrap();
 
         let missing_runtime = directory.join("missing-runtime");
-        let error = validate_static_application(&out, "/app/bin/app", &missing_runtime).unwrap_err();
+        let error =
+            validate_static_application(&out, "/app/bin/app", &missing_runtime).unwrap_err();
         assert!(error.contains("has no files directory"), "{error}");
 
         fs::write(&entry, b"not an ELF").unwrap();
@@ -6406,18 +6597,27 @@ mod tests {
         let files = out.join("files");
         fs::set_permissions(&files, fs::Permissions::from_mode(0o2755)).unwrap();
         let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
-        assert!(error.contains("files root") && error.contains("mode bits"), "{error}");
+        assert!(
+            error.contains("files root") && error.contains("mode bits"),
+            "{error}"
+        );
         fs::set_permissions(&files, fs::Permissions::from_mode(0o755)).unwrap();
 
         fs::set_permissions(&files, fs::Permissions::from_mode(0o700)).unwrap();
         let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
-        assert!(error.contains("files root") && error.contains("not traversable"), "{error}");
+        assert!(
+            error.contains("files root") && error.contains("not traversable"),
+            "{error}"
+        );
         fs::set_permissions(&files, fs::Permissions::from_mode(0o755)).unwrap();
 
         let bin = files.join("bin");
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
         let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
-        assert!(error.contains("application directory") && error.contains("not traversable"), "{error}");
+        assert!(
+            error.contains("application directory") && error.contains("not traversable"),
+            "{error}"
+        );
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
 
         let data = files.join("data");
@@ -6440,7 +6640,10 @@ mod tests {
         let escaping = files.join("bin/link");
         std::os::unix::fs::symlink("../data", &escaping).unwrap();
         let error = validate_static_application(&out, "/app/bin/app", &runtime).unwrap_err();
-        assert!(error.contains("is a symlink") && error.contains("regular files"), "{error}");
+        assert!(
+            error.contains("is a symlink") && error.contains("regular files"),
+            "{error}"
+        );
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -6507,11 +6710,16 @@ mod tests {
     #[test]
     fn text_edits_fail_closed_on_count_mismatch() {
         // Pinned source drifted (0 matches) — must red, not silently no-op.
-        let e = apply_text_edits("main.c", "nothing here".to_string(), &[edit("mkstemp", "mktemp", 1)])
-            .unwrap_err();
+        let e = apply_text_edits(
+            "main.c",
+            "nothing here".to_string(),
+            &[edit("mkstemp", "mktemp", 1)],
+        )
+        .unwrap_err();
         assert!(e.contains("occurs 0×") && e.contains("expected 1"), "{e}");
         // Under-counted expectation (2 present, said 1) also reds.
-        let e2 = apply_text_edits("main.c", "fd fd".to_string(), &[edit("fd", "fname", 1)]).unwrap_err();
+        let e2 =
+            apply_text_edits("main.c", "fd fd".to_string(), &[edit("fd", "fname", 1)]).unwrap_err();
         assert!(e2.contains("occurs 2×"), "{e2}");
     }
 
@@ -6534,11 +6742,11 @@ mod tests {
     fn text_edits_reject_non_ascii() {
         // The build-JSON reader is Latin-1, so a non-ASCII edit can't round-trip:
         // a non-ASCII `to` would write mangled bytes. Fail closed, don't corrupt.
-        let e_to = apply_text_edits("f", "cafe".to_string(), &[edit("cafe", "café", 1)])
-            .unwrap_err();
+        let e_to =
+            apply_text_edits("f", "cafe".to_string(), &[edit("cafe", "café", 1)]).unwrap_err();
         assert!(e_to.contains("must be ASCII"), "{e_to}");
-        let e_from = apply_text_edits("f", "x".to_string(), &[edit("café", "cafe", 1)])
-            .unwrap_err();
+        let e_from =
+            apply_text_edits("f", "x".to_string(), &[edit("café", "cafe", 1)]).unwrap_err();
         assert!(e_from.contains("must be ASCII"), "{e_from}");
     }
 
@@ -6613,11 +6821,8 @@ mod tests {
         let path = artifact.to_string_lossy().into_owned();
 
         for label in ["../escape", ".", ".."] {
-            let bad = write_sha256_manifest(
-                &d.join("bad"),
-                vec![(label.into(), path.clone())],
-            )
-            .unwrap_err();
+            let bad = write_sha256_manifest(&d.join("bad"), vec![(label.into(), path.clone())])
+                .unwrap_err();
             assert!(bad.contains("invalid artifact label"), "{bad}");
         }
         let duplicate = write_sha256_manifest(
@@ -6625,7 +6830,10 @@ mod tests {
             vec![("same".into(), path.clone()), ("same".into(), path)],
         )
         .unwrap_err();
-        assert!(duplicate.contains("duplicate artifact label"), "{duplicate}");
+        assert!(
+            duplicate.contains("duplicate artifact label"),
+            "{duplicate}"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -6672,7 +6880,11 @@ mod tests {
 
         write_preserving_mode(&f, b"after").unwrap();
 
-        assert_eq!(fs::read_to_string(&f).unwrap(), "after", "read-only file rewritten");
+        assert_eq!(
+            fs::read_to_string(&f).unwrap(),
+            "after",
+            "read-only file rewritten"
+        );
         assert_eq!(
             fs::metadata(&f).unwrap().permissions().mode() & 0o777,
             0o444,
@@ -6685,7 +6897,10 @@ mod tests {
         fs::set_permissions(&w, fs::Permissions::from_mode(0o644)).unwrap();
         write_preserving_mode(&w, b"y").unwrap();
         assert_eq!(fs::read_to_string(&w).unwrap(), "y");
-        assert_eq!(fs::metadata(&w).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(
+            fs::metadata(&w).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -6704,7 +6919,11 @@ mod tests {
         let e = write_preserving_mode(&link, b"clobber").unwrap_err();
 
         assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
-        assert_eq!(fs::read_to_string(&real).unwrap(), "keep", "real file untouched");
+        assert_eq!(
+            fs::read_to_string(&real).unwrap(),
+            "keep",
+            "real file untouched"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -7066,10 +7285,7 @@ mod tests {
             .split_whitespace()
             .collect();
         assert!(!compact.contains("ctx.expand_data"), "{compact}");
-        assert_eq!(
-            compact,
-            "string_array(o,\"roots\").map_err(err)?;"
-        );
+        assert_eq!(compact, "string_array(o,\"roots\").map_err(err)?;");
     }
 
     #[test]
@@ -7198,7 +7414,10 @@ mod tests {
         let e = refuse_aliased_payloads(&aliased, &payloads)
             .expect_err("the same path under two names must refuse");
         assert!(e.contains("firefox"), "names the payload: {e}");
-        assert!(e.contains("alias"), "names the input it was reachable as: {e}");
+        assert!(
+            e.contains("alias"),
+            "names the input it was reachable as: {e}"
+        );
     }
 
     /// Both map guards are functions a test can call directly, which is what
@@ -7218,7 +7437,10 @@ mod tests {
             .find("pub fn run_mesboot()")
             .and_then(|at| shipped.get(at..))
             .expect("run_mesboot is in this file");
-        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} is not called by run_mesboot"));
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{needle} is not called by run_mesboot"))
+        };
         let parse = at("parse_payload_map(&text)");
         let alias = at("refuse_aliased_payloads(&inputs, &payloads)");
         let steps = at("for (i, step) in steps.iter().enumerate()");
@@ -7229,7 +7451,10 @@ mod tests {
         // gates, or it reports on matches already spliced into argv.
         let check = at("ctx.check_glob_dir(pat).map_err(err)?;");
         let expand = at("glob_one_star(pat).map_err(err)?;");
-        assert!(steps < check && check < expand, "the glob is gated before it reads");
+        assert!(
+            steps < check && check < expand,
+            "the glob is gated before it reads"
+        );
     }
 
     /// The data expander's CALLERS are pinned, because the channel is only as
@@ -7307,7 +7532,9 @@ mod tests {
         assert!(err.contains("is a payloadInput"), "{err}");
         // ...and the same refusal from the data expander, which may resolve
         // `{payload:}` but must not launder a payload through `{in:}` either.
-        let err = ctx.expand_data("{in:firefox}/lib").expect_err("still refused");
+        let err = ctx
+            .expand_data("{in:firefox}/lib")
+            .expect_err("still refused");
         assert!(err.contains("is a payloadInput"), "{err}");
         // An ordinary input is unaffected in both, or the assertions above would
         // pass for an expander that refused everything.
@@ -7315,7 +7542,9 @@ mod tests {
             assert_eq!(got.unwrap(), "/td/store/abc-mes");
         }
         // A payload NAME that is not declared reds rather than resolving to nothing.
-        let err = ctx.expand_data("{payload:nope}").expect_err("unknown payload");
+        let err = ctx
+            .expand_data("{payload:nope}")
+            .expect_err("unknown payload");
         assert!(err.contains("TD_PAYLOAD_MAP"), "{err}");
     }
 
@@ -7330,7 +7559,10 @@ mod tests {
         let mut hits = glob_one_star(&pat).unwrap();
         hits.sort();
         assert_eq!(hits.len(), 2, "{hits:?}");
-        assert!(hits[0].ends_with("/a.o") && hits[1].ends_with("/b.o"), "{hits:?}");
+        assert!(
+            hits[0].ends_with("/a.o") && hits[1].ends_with("/b.o"),
+            "{hits:?}"
+        );
         assert!(glob_one_star("no-star-here").is_err());
         assert!(glob_one_star("two/*st*ars").is_err());
         fs::remove_dir_all(&d).unwrap();
@@ -7343,28 +7575,55 @@ mod tests {
         fs::create_dir_all(&lib).unwrap();
         let script = "/* GNU ld script */\nGROUP ( /td/store/glibc-test/lib/libc.so.6 /td/store/glibc-test/lib/libc_nonshared.a )\n";
         fs::write(lib.join("libc.so"), script).unwrap();
-        fs::write(lib.join("libextra.so"), b"not a linker script /td/store/glibc-test/lib/keep").unwrap();
+        fs::write(
+            lib.join("libextra.so"),
+            b"not a linker script /td/store/glibc-test/lib/keep",
+        )
+        .unwrap();
         // A `.a` that IS a GNU ld script (glibc's libm.a) — must be relocated too,
         // matching the busybox static-link fixup that this typed step replaces.
         let marchive = "/* GNU ld script */\nGROUP ( /td/store/glibc-test/lib/libm.so.6 /td/store/glibc-test/lib/libmvec.a )\n";
         fs::write(lib.join("libm.a"), marchive).unwrap();
         // A `.a` that is a genuine `ar` archive — the "GNU ld script" content guard
         // must leave it byte-for-byte untouched even though the extension matches.
-        fs::write(lib.join("libreal.a"), b"!<arch>\n/td/store/glibc-test/lib/keep").unwrap();
-        fs::write(lib.join("libc.so.6"), b"\x7fELF /td/store/glibc-test/lib/keep").unwrap();
+        fs::write(
+            lib.join("libreal.a"),
+            b"!<arch>\n/td/store/glibc-test/lib/keep",
+        )
+        .unwrap();
+        fs::write(
+            lib.join("libc.so.6"),
+            b"\x7fELF /td/store/glibc-test/lib/keep",
+        )
+        .unwrap();
 
         relocate_ld_scripts(&lib, "/td/store/glibc-test").unwrap();
 
         let got = fs::read_to_string(lib.join("libc.so")).unwrap();
-        assert!(got.contains("GROUP ( libc.so.6 libc_nonshared.a )"), "got: {got}");
-        assert!(!got.contains("/td/store/glibc-test/lib/"), "prefix not stripped: {got}");
+        assert!(
+            got.contains("GROUP ( libc.so.6 libc_nonshared.a )"),
+            "got: {got}"
+        );
+        assert!(
+            !got.contains("/td/store/glibc-test/lib/"),
+            "prefix not stripped: {got}"
+        );
         let mgot = fs::read_to_string(lib.join("libm.a")).unwrap();
-        assert!(mgot.contains("GROUP ( libm.so.6 libmvec.a )"), "got: {mgot}");
-        assert!(!mgot.contains("/td/store/glibc-test/lib/"), "prefix not stripped: {mgot}");
+        assert!(
+            mgot.contains("GROUP ( libm.so.6 libmvec.a )"),
+            "got: {mgot}"
+        );
+        assert!(
+            !mgot.contains("/td/store/glibc-test/lib/"),
+            "prefix not stripped: {mgot}"
+        );
         let unmarked = fs::read(lib.join("libextra.so")).unwrap();
         assert!(bytes_contains(&unmarked, b"/td/store/glibc-test/lib/keep"));
         let real = fs::read(lib.join("libreal.a")).unwrap();
-        assert!(bytes_contains(&real, b"/td/store/glibc-test/lib/keep"), "real ar archive was rewritten");
+        assert!(
+            bytes_contains(&real, b"/td/store/glibc-test/lib/keep"),
+            "real ar archive was rewritten"
+        );
         let versioned = fs::read(lib.join("libc.so.6")).unwrap();
         assert!(bytes_contains(&versioned, b"/td/store/glibc-test/lib/keep"));
         fs::remove_dir_all(&d).unwrap();
@@ -7384,14 +7643,20 @@ mod tests {
         // Red 1: a /gnu/store byte in file CONTENTS.
         fs::write(sub.join("kaem"), b"oops /gnu/store/abc-glibc leak").unwrap();
         let err = require_no_gnu_store(&d).expect_err("a /gnu/store byte must red");
-        assert!(err.contains("/gnu/store"), "diagnostic names the leak: {err}");
+        assert!(
+            err.contains("/gnu/store"),
+            "diagnostic names the leak: {err}"
+        );
         fs::remove_file(sub.join("kaem")).unwrap();
         // Red 2: a symlink whose TARGET points into /gnu/store — invisible to a
         // grep -r content walk, so the engine scan must catch it itself.
         std::os::unix::fs::symlink("/gnu/store/abc-glibc/lib/ld.so", sub.join("leak-link"))
             .unwrap();
         let err = require_no_gnu_store(&d).expect_err("a /gnu/store symlink target must red");
-        assert!(err.contains("leak-link"), "diagnostic names the symlink: {err}");
+        assert!(
+            err.contains("leak-link"),
+            "diagnostic names the symlink: {err}"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -7599,7 +7864,10 @@ mod tests {
             "/td/store",
         )
         .unwrap_err();
-        assert!(error.contains("root") && error.contains("not a declared recipe input"), "{error}");
+        assert!(
+            error.contains("root") && error.contains("not a declared recipe input"),
+            "{error}"
+        );
     }
 
     /// The two gates differ by exactly the payloads, and the difference is the
@@ -7700,7 +7968,10 @@ mod tests {
         let closure =
             runtime_store_closure(&candidates, &roots, &refs, &[pay_path.clone()], "/td/store")
                 .expect("a payload may name its runtime and itself");
-        assert!(closure.contains(&pay_path) && closure.contains(&rt_path), "{closure:?}");
+        assert!(
+            closure.contains(&pay_path) && closure.contains(&rt_path),
+            "{closure:?}"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -7741,9 +8012,18 @@ mod tests {
         let t0 = Instant::now();
         let err = run_cmd(&sh, &["-c", loop_forever], ".", &envs, &w(0, 25, 0))
             .expect_err("a persistently-failing tool loop must red");
-        assert!(t0.elapsed() < Duration::from_secs(30), "must red promptly, not spin: {err}");
-        assert!(err.contains("td-build watchdog KILLED"), "names the watchdog: {err}");
-        assert!(err.contains("repeated 25x"), "names the repeat bound: {err}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "must red promptly, not spin: {err}"
+        );
+        assert!(
+            err.contains("td-build watchdog KILLED"),
+            "names the watchdog: {err}"
+        );
+        assert!(
+            err.contains("repeated 25x"),
+            "names the repeat bound: {err}"
+        );
         assert!(
             err.contains("expr: error while loading shared libraries"),
             "quotes the failing tool's stderr: {err}"
@@ -7759,14 +8039,23 @@ mod tests {
         let t0 = Instant::now();
         let err = run_cmd(
             &sh,
-            &["-c", "while :; do echo 'configure: retrying tool probe'; done"],
+            &[
+                "-c",
+                "while :; do echo 'configure: retrying tool probe'; done",
+            ],
             ".",
             &envs,
             &w(0, 25, 0),
         )
         .expect_err("a stdout-spinning loop must red");
-        assert!(t0.elapsed() < Duration::from_secs(30), "must red promptly: {err}");
-        assert!(err.contains("stdout line repeated 25x"), "names the stream: {err}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "must red promptly: {err}"
+        );
+        assert!(
+            err.contains("stdout line repeated 25x"),
+            "names the stream: {err}"
+        );
     }
 
     #[test]
@@ -7779,9 +8068,18 @@ mod tests {
         let t0 = Instant::now();
         let err = run_cmd(&sh, &["-c", "exec sleep 300"], ".", &envs, &w(1, 0, 0))
             .expect_err("a silent wedged phase must red");
-        assert!(t0.elapsed() < Duration::from_secs(30), "must red at the bound: {err}");
-        assert!(err.contains("no output for 1s"), "names the silence bound: {err}");
-        assert!(err.contains("td-build watchdog KILLED"), "names the watchdog: {err}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "must red at the bound: {err}"
+        );
+        assert!(
+            err.contains("no output for 1s"),
+            "names the silence bound: {err}"
+        );
+        assert!(
+            err.contains("td-build watchdog KILLED"),
+            "names the watchdog: {err}"
+        );
     }
 
     #[test]
@@ -7803,9 +8101,18 @@ mod tests {
         let t0 = Instant::now();
         let err = run_cmd(&sh, &["-c", make_nested_spin], ".", &envs, &w(0, 0, 500))
             .expect_err("a chatty make-nested spin must red on the duration bound");
-        assert!(t0.elapsed() < Duration::from_secs(30), "must red at the window, not spin: {err}");
-        assert!(err.contains("td-build watchdog KILLED"), "names the watchdog: {err}");
-        assert!(err.contains("kept arriving for 500ms"), "names the duration bound: {err}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "must red at the window, not spin: {err}"
+        );
+        assert!(
+            err.contains("td-build watchdog KILLED"),
+            "names the watchdog: {err}"
+        );
+        assert!(
+            err.contains("kept arriving for 500ms"),
+            "names the duration bound: {err}"
+        );
         assert!(err.contains("stdout"), "names the spinning stream: {err}");
         assert!(
             err.contains("configure: error: cannot run C compiled programs"),
@@ -7839,7 +8146,10 @@ mod tests {
             .expect_err("two constant streams must trip once progress stops");
         assert!(start.elapsed() < Duration::from_secs(30), "{err}");
         assert!(err.contains("kept arriving for 400ms"), "{err}");
-        assert!(err.contains("without changed lines on either stream"), "{err}");
+        assert!(
+            err.contains("without changed lines on either stream"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -7858,7 +8168,10 @@ mod tests {
         account_line(&mut err, b"warning", 0, 1199, true, "stderr", &why);
         assert!(duration_reason(&mut err, 600, 300, "stderr").is_some());
         assert!(duration_reason(&mut err, 600, 0, "stderr").is_none());
-        assert!(why.lock().unwrap().is_none(), "readers must not latch duration trips");
+        assert!(
+            why.lock().unwrap().is_none(),
+            "readers must not latch duration trips"
+        );
     }
 
     #[test]
@@ -7939,11 +8252,18 @@ mod tests {
         let mut sout = StreamWatch::new();
         account_line(&mut sout, b"line-a", 0, 0, false, "stdout", &why2);
         account_line(&mut sout, b"line-b", 0, 0, false, "stdout", &why2);
-        assert!(sout.tail.is_empty(), "keep_tail=false keeps no diagnostic tail");
+        assert!(
+            sout.tail.is_empty(),
+            "keep_tail=false keeps no diagnostic tail"
+        );
         let mut serr = StreamWatch::new();
         account_line(&mut serr, b"e-a", 0, 0, true, "stderr", &why2);
         account_line(&mut serr, b"e-b", 0, 0, true, "stderr", &why2);
-        assert_eq!(serr.tail.len(), 2, "keep_tail=true records the distinct-line tail");
+        assert_eq!(
+            serr.tail.len(),
+            2,
+            "keep_tail=true records the distinct-line tail"
+        );
     }
 
     #[test]
@@ -8019,8 +8339,14 @@ mod tests {
         // the supervisor changes HOW output is carried, not the pass/fail
         // contract.
         let (sh, envs) = sh_and_env();
-        let err = run_cmd(&sh, &["-c", "echo out; echo err >&2; exit 3"], ".", &envs, &WATCH_PHASE)
-            .expect_err("exit 3 must red");
+        let err = run_cmd(
+            &sh,
+            &["-c", "echo out; echo err >&2; exit 3"],
+            ".",
+            &envs,
+            &WATCH_PHASE,
+        )
+        .expect_err("exit 3 must red");
         assert!(err.contains("failed"), "plain failure message kept: {err}");
         run_cmd(&sh, &["-c", "true"], ".", &envs, &WATCH_PHASE).expect("true is green");
     }
@@ -8039,7 +8365,9 @@ mod tests {
         let nvs: Vec<&str> = got.iter().map(|(_, nv)| nv.as_str()).collect();
         assert_eq!(nvs, vec!["adler2-2.0.0", "aho-corasick-1.1.2"]);
         // the collected path is the real crate file (so vendoring can untar + sha it).
-        assert!(got.iter().all(|(p, _)| p.ends_with(".crate") && Path::new(p).exists()));
+        assert!(got
+            .iter()
+            .all(|(p, _)| p.ends_with(".crate") && Path::new(p).exists()));
         // neither source set ⇒ empty (the dependency-free self-host path).
         assert!(collect_vendor_crates("", "").unwrap().is_empty());
         let _ = fs::remove_dir_all(&tmp);
@@ -8067,7 +8395,9 @@ mod tests {
         // review caught: a blind `tail 40` shows only the `#define` spam below).
         let mut top = String::from("ANCIENT-PREAMBLE-SENTINEL must be dropped by the tail\n");
         for i in 0..200 {
-            top.push_str(&format!("configure:{i}: checking a harmless earlier probe\n"));
+            top.push_str(&format!(
+                "configure:{i}: checking a harmless earlier probe\n"
+            ));
         }
         top.push_str("configure:4033: checking for socklen_t\n");
         top.push_str("configure:4041: gcc -c -O2 conftest.c >&5\n");
@@ -8090,8 +8420,11 @@ mod tests {
 
         // A sub-configure (AC_CONFIG_SUBDIRS) log, one level deeper, must ALSO be
         // surfaced — the failure may be in a bundled sub-package's configure.
-        fs::write(srcdir.join("lib").join("config.log"), "sub-configure: a different failure\n")
-            .unwrap();
+        fs::write(
+            srcdir.join("lib").join("config.log"),
+            "sub-configure: a different failure\n",
+        )
+        .unwrap();
 
         let out = configure_log_tails(&srcdir);
 
@@ -8124,14 +8457,23 @@ mod tests {
         // Both logs surface, and the top-level leads the deeper sub-configure's.
         let top_at = out.find("sed-4.9/config.log").expect("top-level log named");
         let sub_at = out.find("lib/config.log").expect("sub-configure log named");
-        assert!(top_at < sub_at, "the top-level config.log must lead the sub-configure's: {out}");
-        assert!(out.contains("sub-configure: a different failure"), "sub log surfaced: {out}");
+        assert!(
+            top_at < sub_at,
+            "the top-level config.log must lead the sub-configure's: {out}"
+        );
+        assert!(
+            out.contains("sub-configure: a different failure"),
+            "sub log surfaced: {out}"
+        );
 
         // No config.log anywhere ⇒ empty addendum (the configure error is left
         // exactly as it was — the diagnostic only ADDS, never rewrites).
         let empty = base.join("empty");
         fs::create_dir_all(&empty).unwrap();
-        assert!(configure_log_tails(&empty).is_empty(), "no logs ⇒ no addendum");
+        assert!(
+            configure_log_tails(&empty).is_empty(),
+            "no logs ⇒ no addendum"
+        );
 
         // The count bound is load-bearing (a tree of sub-configures cannot flood
         // the log): five logs, asked for at most two, yields two.
@@ -8140,7 +8482,11 @@ mod tests {
             fs::create_dir_all(&sub).unwrap();
             fs::write(sub.join("config.log"), "x\n").unwrap();
         }
-        assert_eq!(find_config_logs(&base.join("many"), 2).len(), 2, "MAX_LOGS bound holds");
+        assert_eq!(
+            find_config_logs(&base.join("many"), 2).len(),
+            2,
+            "MAX_LOGS bound holds"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -8182,12 +8528,28 @@ mod tests {
 
         patch_shebangs(&base, bash).unwrap();
 
-        assert_eq!(fs::read_to_string(&sh).unwrap(), format!("#!{bash} -e\necho install\n"));
-        assert_eq!(fs::metadata(&sh).unwrap().permissions().mode() & 0o111, 0o111);
-        assert_eq!(fs::metadata(&sh).unwrap().modified().unwrap(), old, "mtime preserved");
-        assert_eq!(fs::read_to_string(&bsh).unwrap(), format!("#!{bash}\nexit 0\n"));
+        assert_eq!(
+            fs::read_to_string(&sh).unwrap(),
+            format!("#!{bash} -e\necho install\n")
+        );
+        assert_eq!(
+            fs::metadata(&sh).unwrap().permissions().mode() & 0o111,
+            0o111
+        );
+        assert_eq!(
+            fs::metadata(&sh).unwrap().modified().unwrap(),
+            old,
+            "mtime preserved"
+        );
+        assert_eq!(
+            fs::read_to_string(&bsh).unwrap(),
+            format!("#!{bash}\nexit 0\n")
+        );
         assert_eq!(fs::read_to_string(&store).unwrap(), store_orig);
-        assert_eq!(fs::read_to_string(&perl).unwrap(), "#!/usr/bin/perl\nprint 1;\n");
+        assert_eq!(
+            fs::read_to_string(&perl).unwrap(),
+            "#!/usr/bin/perl\nprint 1;\n"
+        );
         assert_eq!(fs::read(&data).unwrap(), b"\x7fELF\x00bytes");
 
         let _ = fs::remove_dir_all(&base);
@@ -8208,7 +8570,10 @@ mod tests {
 
         patch_shebangs(&base, bash).unwrap();
 
-        assert_eq!(fs::read_to_string(&ro).unwrap(), format!("#!{bash}\nexit 0\n"));
+        assert_eq!(
+            fs::read_to_string(&ro).unwrap(),
+            format!("#!{bash}\nexit 0\n")
+        );
         assert_eq!(
             fs::metadata(&ro).unwrap().permissions().mode() & 0o777,
             0o444,

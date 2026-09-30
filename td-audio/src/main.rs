@@ -680,7 +680,10 @@ mod tests {
     fn sources() -> Vec<(&'static str, &'static str)> {
         vec![
             ("main.rs", include_str!("main.rs")),
-            ("app_policy.rs", include_str!("../../td-busd/src/app_policy.rs")),
+            (
+                "app_policy.rs",
+                include_str!("../../td-busd/src/app_policy.rs"),
+            ),
             ("alsa.rs", include_str!("alsa.rs")),
             ("device.rs", include_str!("device.rs")),
             ("mixer.rs", include_str!("mixer.rs")),
@@ -807,7 +810,9 @@ mod tests {
         // One shared source is inventoried above and staged by the recipe.
         let shared = concat!("#[pa", "th=\"../../td-busd/src/app_policy.rs\"]");
         assert_eq!(squeezed().matches(shared).count(), 1);
-        assert!(!squeezed().replacen(shared, "", 1).contains(concat!("#[pa", "th")));
+        assert!(!squeezed()
+            .replacen(shared, "", 1)
+            .contains(concat!("#[pa", "th")));
     }
 
     /// The list this module scans is every `.rs` file on disk, and there are

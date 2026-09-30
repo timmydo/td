@@ -130,11 +130,9 @@ impl FieldCode {
     pub fn signature(self) -> &'static str {
         match self {
             Self::Path => "o",
-            Self::Interface
-            | Self::Member
-            | Self::ErrorName
-            | Self::Destination
-            | Self::Sender => "s",
+            Self::Interface | Self::Member | Self::ErrorName | Self::Destination | Self::Sender => {
+                "s"
+            }
             Self::ReplySerial | Self::UnixFds => "u",
             Self::Signature => "g",
         }
@@ -270,9 +268,7 @@ impl<'a> Message<'a> {
         if self.fields.sender.is_some() {
             return Err(MessageError::SenderFromClient);
         }
-        if self.fields.path == Some(LOCAL_PATH)
-            || self.fields.interface == Some(LOCAL_INTERFACE)
-        {
+        if self.fields.path == Some(LOCAL_PATH) || self.fields.interface == Some(LOCAL_INTERFACE) {
             return Err(MessageError::ReservedLocalName);
         }
         Ok(())
@@ -349,7 +345,8 @@ pub fn decode(bytes: &[u8], received_fds: u32) -> Result<(Message<'_>, usize), M
     let endian = endian_of(bytes)?;
     let kind = MessageType::from_code(*bytes.get(1).ok_or(MessageError::ShortHeader)?)?;
     let flags = *bytes.get(2).ok_or(MessageError::ShortHeader)?;
-    let body_len = usize::try_from(read_u32(bytes, 4, endian)?).map_err(|_| MessageError::BodyTooLarge)?;
+    let body_len =
+        usize::try_from(read_u32(bytes, 4, endian)?).map_err(|_| MessageError::BodyTooLarge)?;
     let serial = read_u32(bytes, 8, endian)?;
     if serial == 0 {
         return Err(MessageError::ZeroSerial);
@@ -387,7 +384,9 @@ pub fn decode(bytes: &[u8], received_fds: u32) -> Result<(Message<'_>, usize), M
     let body_end = body_start
         .checked_add(body_len)
         .ok_or(MessageError::Wire(WireError::Overflow))?;
-    let body = bytes.get(body_start..body_end).ok_or(MessageError::Truncated)?;
+    let body = bytes
+        .get(body_start..body_end)
+        .ok_or(MessageError::Truncated)?;
 
     let declared_fds = fields.unix_fds.unwrap_or(0);
     if declared_fds > MAX_FDS_PER_MESSAGE {
@@ -692,8 +691,7 @@ impl<'a> Builder<'a> {
         if self.serial == 0 {
             return Err(MessageError::ZeroSerial);
         }
-        let body_len =
-            u32::try_from(self.body.len()).map_err(|_| MessageError::BodyTooLarge)?;
+        let body_len = u32::try_from(self.body.len()).map_err(|_| MessageError::BodyTooLarge)?;
         if body_len > MAX_BODY_BYTES {
             return Err(MessageError::BodyTooLarge);
         }
@@ -771,12 +769,18 @@ fn write_fields(writer: &mut Writer, fields: &Fields<'_>) -> Result<(), WireErro
         (FieldCode::Path, fields.path.map(FieldValue::Text)),
         (FieldCode::Interface, fields.interface.map(FieldValue::Text)),
         (FieldCode::Member, fields.member.map(FieldValue::Text)),
-        (FieldCode::ErrorName, fields.error_name.map(FieldValue::Text)),
+        (
+            FieldCode::ErrorName,
+            fields.error_name.map(FieldValue::Text),
+        ),
         (
             FieldCode::ReplySerial,
             fields.reply_serial.map(FieldValue::Number),
         ),
-        (FieldCode::Destination, fields.destination.map(FieldValue::Text)),
+        (
+            FieldCode::Destination,
+            fields.destination.map(FieldValue::Text),
+        ),
         (FieldCode::Sender, fields.sender.map(FieldValue::Text)),
         (FieldCode::Signature, fields.signature.map(FieldValue::Text)),
         (FieldCode::UnixFds, fields.unix_fds.map(FieldValue::Number)),
@@ -831,7 +835,10 @@ mod tests {
         let mut signal = Builder::new(endian, MessageType::Signal).serial(1);
         signal.fields.path = Some("/a");
         signal.fields.member = Some("M");
-        assert_eq!(signal.encode(), Err(MessageError::MissingField("INTERFACE")));
+        assert_eq!(
+            signal.encode(),
+            Err(MessageError::MissingField("INTERFACE"))
+        );
     }
 
     /// An unknown type is ignored rather than refused, so it must decode; type
@@ -997,7 +1004,8 @@ mod tests {
         // the 8-aligned body, so it is derived rather than guessed at: the byte
         // below it is the last field's NUL, which is a zero and is not padding.
         let fields_end = HEADER_LEN
-            + usize::try_from(read_u32(&bytes, 12, Endian::Little).expect("fields_len")).expect("fits");
+            + usize::try_from(read_u32(&bytes, 12, Endian::Little).expect("fields_len"))
+                .expect("fits");
         let body_start = pad8(fields_end).expect("body start");
         assert!(body_start > fields_end, "no pre-body padding to test");
         for at in fields_end..body_start {

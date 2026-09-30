@@ -18,8 +18,8 @@ pub mod fill;
 pub use td_ui::font;
 pub mod keys;
 pub mod layout;
-pub mod model;
 mod menu;
+pub mod model;
 mod number;
 mod path_completion;
 pub mod render;
@@ -27,10 +27,10 @@ mod replace;
 pub mod replay;
 mod search;
 mod session;
-#[cfg(feature = "test-file-barrier")]
-mod test_file_barrier;
 pub mod spelling;
 mod sys;
+#[cfg(feature = "test-file-barrier")]
+mod test_file_barrier;
 pub mod text;
 pub mod transfer;
 pub mod ui;

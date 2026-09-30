@@ -82,8 +82,11 @@ pub(crate) fn prepare(arguments: &[String]) -> Result<(), String> {
     let homes = portal_files::child(&var, "home", 0, true)?;
     let account = crate::primary_account::load().map_err(|error| error.to_string())?;
     let human = portal_files::child(&homes, account.name(), crate::primary_account::UID, true)?;
-    let source_path = format!("/proc/self/fd/{}/{}",
-        std::os::fd::AsRawFd::as_raw_fd(&human), grant.component());
+    let source_path = format!(
+        "/proc/self/fd/{}/{}",
+        std::os::fd::AsRawFd::as_raw_fd(&human),
+        grant.component()
+    );
     match fs::DirBuilder::new().mode(0o700).create(&source_path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -93,15 +96,21 @@ pub(crate) fn prepare(arguments: &[String]) -> Result<(), String> {
     if metadata.uid() == 0 {
         let created = portal_files::child(&human, grant.component(), 0, true)?;
         let mode = created.metadata().map_err(|e| e.to_string())?.mode() & 0o7777;
-        if mode & !0o700 != 0 || fs::read_dir(format!("/proc/self/fd/{}",
-            std::os::fd::AsRawFd::as_raw_fd(&created)))
-            .map_err(|e| e.to_string())?.next().is_some() {
+        if mode & !0o700 != 0
+            || fs::read_dir(format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&created)
+            ))
+            .map_err(|e| e.to_string())?
+            .next()
+            .is_some()
+        {
             return Err("interrupted human grant directory must be empty and private".into());
         }
-        created.set_permissions(fs::Permissions::from_mode(0o700))
+        created
+            .set_permissions(fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
-        std::os::unix::fs::fchown(&created, Some(1000), Some(1000))
-            .map_err(|e| e.to_string())?;
+        std::os::unix::fs::fchown(&created, Some(1000), Some(1000)).map_err(|e| e.to_string())?;
     }
     let source = portal_files::child(&human, grant.component(), 1000, true)?;
     if source.metadata().map_err(|e| e.to_string())?.mode() & 0o7777 != 0o700 {
@@ -184,8 +193,12 @@ mod tests {
             assert!(require_options(&required.join(",")).is_ok());
             assert!(require_options("nodev,noexec,rw,nosuid,relatime").is_ok());
             for absent in required {
-                let options = required.iter().copied().filter(|value| *value != absent)
-                    .collect::<Vec<_>>().join(",");
+                let options = required
+                    .iter()
+                    .copied()
+                    .filter(|value| *value != absent)
+                    .collect::<Vec<_>>()
+                    .join(",");
                 assert!(require_options(&options).is_err());
                 assert!(require_options(&format!("{options},{absent}-suffix")).is_err());
             }

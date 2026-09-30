@@ -282,7 +282,8 @@ fn owner_closed(input: &mut impl Read) -> Result<(), String> {
 }
 
 pub(crate) fn clipboard_lifetime(
-    runtime: &Mutex<Runtime>, outcome: mpsc::Receiver<Result<(), String>>,
+    runtime: &Mutex<Runtime>,
+    outcome: mpsc::Receiver<Result<(), String>>,
 ) -> Result<(), String> {
     loop {
         match outcome.recv_timeout(std::time::Duration::from_millis(50)) {
@@ -291,7 +292,9 @@ pub(crate) fn clipboard_lifetime(
                 return Err("headless lifecycle observers departed".into());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                runtime.lock().map_err(|_| "headless runtime is poisoned")?
+                runtime
+                    .lock()
+                    .map_err(|_| "headless runtime is poisoned")?
                     .expire_clipboard_hold(std::time::Instant::now());
             }
         }
@@ -323,7 +326,10 @@ pub(crate) fn run(args: &[String], mut input: impl Read + Send + 'static) -> Res
             ended.clone(),
         )?;
         control::serve_headless(
-            control, Arc::clone(&runtime), options.input_control, options.capture_control,
+            control,
+            Arc::clone(&runtime),
+            options.input_control,
+            options.capture_control,
             ended.clone(),
         )?;
         let completion = Completion::new(ended, "owner");
@@ -343,7 +349,8 @@ pub(crate) fn run(args: &[String], mut input: impl Read + Send + 'static) -> Res
         .map_err(|error| format!("announce headless readiness: {error}"))?;
         drop(out);
         if !options.clipboard_control {
-            return outcome.recv()
+            return outcome
+                .recv()
                 .map_err(|_| "headless lifecycle observers departed".to_string())?;
         }
         clipboard_lifetime(&runtime, outcome)
@@ -442,8 +449,12 @@ mod tests {
         let options = Options::parse(&values).unwrap();
         assert!(options.clipboard_control);
         assert!(!options.input_control && !options.capture_control);
-        values.extend(["--input-control".into(), "enabled".into(),
-            "--capture-control".into(), "enabled".into()]);
+        values.extend([
+            "--input-control".into(),
+            "enabled".into(),
+            "--capture-control".into(),
+            "enabled".into(),
+        ]);
         let options = Options::parse(&values).unwrap();
         assert!(options.clipboard_control && options.input_control && options.capture_control);
         let mut values = args("800", "600");
@@ -504,8 +515,12 @@ mod tests {
         assert!(source.contains("control::serve_headless("));
         assert!(source.contains("Runtime::headless(framebuffer, identity)"));
         let run = source.split_once("pub(crate) fn run(").unwrap().1;
-        assert!(run.contains("if options.clipboard_control {\n            runtime.enable_clipboard_control()?;"));
-        assert!(run.contains("if !options.clipboard_control {\n            return outcome.recv()"));
+        assert!(run.contains(
+            "if options.clipboard_control {\n            runtime.enable_clipboard_control()?;"
+        ));
+        assert!(run.contains(
+            "if !options.clipboard_control {\n            return outcome\n                .recv()"
+        ));
         assert!(run.contains("clipboard_lifetime(&runtime, outcome)"));
         let identity = source.find("let identity = session_identity()?").unwrap();
         let paint = source.find("runtime.repaint()?").unwrap();

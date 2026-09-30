@@ -1377,7 +1377,11 @@ mod tests {
             .unwrap();
         assert_eq!(resource_policy.unhonoured_request(), None);
         assert_eq!(
-            admitted.clone().with_pids_max(8).unwrap().unhonoured_request(),
+            admitted
+                .clone()
+                .with_pids_max(8)
+                .unwrap()
+                .unhonoured_request(),
             None
         );
 
@@ -1425,9 +1429,7 @@ mod tests {
                     .unwrap()
                     .unhonoured_request()
                     .as_deref(),
-                Some(
-                    format!("`{spelling}\' access to org.freedesktop.FileManager1").as_str()
-                )
+                Some(format!("`{spelling}\' access to org.freedesktop.FileManager1").as_str())
             );
         }
     }
@@ -1509,8 +1511,7 @@ mod tests {
             [PermissionSocket::Fetch]
         );
         assert_eq!(parsed.to_keyfile(), alone);
-        assert!(error("format=1\n\n[Context]\nsockets=fetch;fetch\n")
-            .contains("duplicate value"));
+        assert!(error("format=1\n\n[Context]\nsockets=fetch;fetch\n").contains("duplicate value"));
     }
 
     #[test]

@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
-use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -41,13 +41,20 @@ struct HarnessTimer {
 impl Drop for HarnessTimer {
     fn drop(&mut self) {
         if timing_on() {
-            eprintln!("[timing] {} {}ms", self.label, self.start.elapsed().as_millis());
+            eprintln!(
+                "[timing] {} {}ms",
+                self.label,
+                self.start.elapsed().as_millis()
+            );
         }
     }
 }
 
 fn timed_phase(label: &'static str) -> HarnessTimer {
-    HarnessTimer { label, start: std::time::Instant::now() }
+    HarnessTimer {
+        label,
+        start: std::time::Instant::now(),
+    }
 }
 
 /// The stable in-crate marker for a planning-time provenance rejection.
@@ -516,7 +523,10 @@ fn clear_ladder(lw: &Path) -> Result<(), String> {
         remove_path_if_exists(&tomb)?;
         println!("clear-store: reset ladder work dir {}", lw.display());
     } else {
-        println!("clear-store: ladder work dir {} was already absent", lw.display());
+        println!(
+            "clear-store: ladder work dir {} was already absent",
+            lw.display()
+        );
     }
     Ok(())
 }
@@ -619,17 +629,32 @@ pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
 
 /// Cold host-firmware oracle; no direct kernel or initrd injection.
 pub fn qemu_boot_uefi_cli(args: &[String]) -> Result<(), String> {
-    qemu_kernel_cli(args, "qemu-boot-uefi", &["td-install"], crate::checks::qemu_boot::efi::run)
+    qemu_kernel_cli(
+        args,
+        "qemu-boot-uefi",
+        &["td-install"],
+        crate::checks::qemu_boot::efi::run,
+    )
 }
 
 /// Boot one unchanged ISO through optical and USB firmware discovery.
 pub fn qemu_boot_media_cli(args: &[String]) -> Result<(), String> {
-    qemu_kernel_cli(args, "qemu-boot-media", &[], crate::checks::qemu_boot::media::run)
+    qemu_kernel_cli(
+        args,
+        "qemu-boot-media",
+        &[],
+        crate::checks::qemu_boot::media::run,
+    )
 }
 
 /// Install a signed tiny fixture inside QEMU, then boot without its media.
 pub fn qemu_install_cli(args: &[String]) -> Result<(), String> {
-    qemu_kernel_cli(args, "qemu-install", &["td-install-qemu-test"], crate::checks::qemu_boot::install::run)
+    qemu_kernel_cli(
+        args,
+        "qemu-install",
+        &["td-install-qemu-test"],
+        crate::checks::qemu_boot::install::run,
+    )
 }
 
 /// Install the production system from an ISO inside a disposable QEMU machine.
@@ -644,7 +669,8 @@ pub fn qemu_install_system_cli(args: &[String]) -> Result<(), String> {
     let name = scratch_name("qemu-install-system", &[STEM]);
     let runner = RecipeCheckRunner::new(root, &name)?.with_streamed_progress();
     // Warm before unattended builds too; recipe admission remains authoritative.
-    if let Err(error) = crate::warm::preflight(&runner, &targets, crate::warm::WarmMode::Automatic) {
+    if let Err(error) = crate::warm::preflight(&runner, &targets, crate::warm::WarmMode::Automatic)
+    {
         eprintln!("   [warm] {error} — continuing; the build reports what it cannot resolve");
     }
     let _lock = lock_ladder_for_run(&runner)?;
@@ -733,11 +759,7 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
-    let targets = [
-        stem,
-        "btrfs-progs-x86-64",
-        "td-jail-seccomp-probe",
-    ];
+    let targets = [stem, "btrfs-progs-x86-64", "td-jail-seccomp-probe"];
     ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
@@ -785,11 +807,7 @@ pub fn qemu_boot_net_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
-    let targets = [
-        stem,
-        "btrfs-progs-x86-64",
-        "td-jail-seccomp-probe",
-    ];
+    let targets = [stem, "btrfs-progs-x86-64", "td-jail-seccomp-probe"];
     ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
@@ -980,8 +998,14 @@ fn parse_bundle_args(args: &[String]) -> Result<crate::checks::bundle::BundleOpt
             "--force" => force = true,
             "--installation" => installation = true,
             "--source-origin" | "--source-branch" => {
-                let value = rest.next().ok_or_else(|| format!("{argument} needs a value"))?;
-                let slot = if argument == "--source-origin" { &mut source_origin } else { &mut source_branch };
+                let value = rest
+                    .next()
+                    .ok_or_else(|| format!("{argument} needs a value"))?;
+                let slot = if argument == "--source-origin" {
+                    &mut source_origin
+                } else {
+                    &mut source_branch
+                };
                 if slot.replace(value.as_str()).is_some() {
                     return Err(format!("{argument} given twice"));
                 }
@@ -1016,8 +1040,10 @@ fn parse_bundle_args(args: &[String]) -> Result<crate::checks::bundle::BundleOpt
         );
     }
     use crate::checks::release_source::{upstream::Upstream, DEFAULT_BRANCH, DEFAULT_ORIGIN};
-    let source_upstream = Upstream::new(source_origin.unwrap_or(DEFAULT_ORIGIN),
-        source_branch.unwrap_or(DEFAULT_BRANCH))?;
+    let source_upstream = Upstream::new(
+        source_origin.unwrap_or(DEFAULT_ORIGIN),
+        source_branch.unwrap_or(DEFAULT_BRANCH),
+    )?;
     Ok(crate::checks::bundle::BundleOptions {
         out: out.unwrap_or_else(|| PathBuf::from(crate::checks::bundle::DEFAULT_OUT)),
         raw,
@@ -1152,7 +1178,11 @@ fn catalog_seed_universe() -> Result<Vec<SeedInput>, String> {
     let mut seeds = Vec::new();
     for (_, recipe) in catalog::all() {
         if let Some(key) = &recipe.source_input {
-            push_seed_input(&mut seeds, &mut seen, seed_input_for_recipe_source(key, &recipe)?);
+            push_seed_input(
+                &mut seeds,
+                &mut seen,
+                seed_input_for_recipe_source(key, &recipe)?,
+            );
         }
         // `payload_inputs` walks with the other two: a payload declared as an
         // external pinned input needs its compiled digest row like any seed, and
@@ -1295,7 +1325,11 @@ pub fn local_source_roster_cli(check: bool) -> Result<(), String> {
                         )
                     })
                     .collect();
-                for key in rows.keys().chain(committed_map.keys()).collect::<BTreeSet<_>>() {
+                for key in rows
+                    .keys()
+                    .chain(committed_map.keys())
+                    .collect::<BTreeSet<_>>()
+                {
                     match (committed_map.get(key), rows.get(key)) {
                         (None, Some(_)) => {
                             detail.push_str(&format!(
@@ -1318,7 +1352,9 @@ pub fn local_source_roster_cli(check: bool) -> Result<(), String> {
                 }
             }
             Err(e) => {
-                detail.push_str(&format!("\n  - the committed file itself fails to parse: {e}"));
+                detail.push_str(&format!(
+                    "\n  - the committed file itself fails to parse: {e}"
+                ));
             }
         }
         if detail.is_empty() {
@@ -1553,9 +1589,7 @@ fn exact_regular_file_equals(path: &Path, expected: &[u8], max_bytes: u64) -> bo
         return false;
     };
     let mut bytes = Vec::new();
-    if file.take(max_bytes + 1).read_to_end(&mut bytes).is_err()
-        || bytes.len() as u64 > max_bytes
-    {
+    if file.take(max_bytes + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > max_bytes {
         return false;
     }
     bytes == expected
@@ -1761,8 +1795,8 @@ fn hash_repo_inputs(
         Ok(rd) => {
             let mut v = Vec::new();
             for entry in rd {
-                let entry = entry
-                    .map_err(|e| format!("read_dir entry {}: {e}", patches_dir.display()))?;
+                let entry =
+                    entry.map_err(|e| format!("read_dir entry {}: {e}", patches_dir.display()))?;
                 // Skip a directory that happens to be named `*.patch`: `fs::read`
                 // on it below would fail the whole fingerprint (and thus the
                 // build). A file_type() error still fails closed.
@@ -1794,8 +1828,8 @@ fn hash_repo_inputs(
     }
     for rel in cargo_locks {
         let p = repo_root.join(rel);
-        let bytes = fs::read(&p)
-            .map_err(|e| format!("read committed cargoLock {}: {e}", p.display()))?;
+        let bytes =
+            fs::read(&p).map_err(|e| format!("read committed cargoLock {}: {e}", p.display()))?;
         h.update(&(rel.len() as u64).to_le_bytes());
         h.update(rel.as_bytes());
         h.update(&(bytes.len() as u64).to_le_bytes());
@@ -2247,11 +2281,25 @@ fn store_path_recursive_with(
 
 #[derive(Debug)]
 pub(crate) enum SeedInput {
-    Stage0 { key: String },
-    Source { key: String, pin: SourcePin },
-    Ostree { key: String, pin: OstreePin },
-    LinuxHeaders { key: String, arch: &'static str },
-    Patch { key: String, patch: String },
+    Stage0 {
+        key: String,
+    },
+    Source {
+        key: String,
+        pin: SourcePin,
+    },
+    Ostree {
+        key: String,
+        pin: OstreePin,
+    },
+    LinuxHeaders {
+        key: String,
+        arch: &'static str,
+    },
+    Patch {
+        key: String,
+        patch: String,
+    },
     /// An IN-TREE source directory (#469 local-source provenance): `path` is the
     /// repo-relative dir the recipe's `local_source` names, `trees` the sibling
     /// dirs its `local_source_trees` stage beside it. Interned by copying the
@@ -2469,7 +2517,11 @@ impl RecipeCheckRunner {
             reap_stale_records(&build_run_memos, ".map", cutoff, opts.dry_run)?;
         let (passes, stale_passes) =
             reap_stale_records(&check_memos, ".pass", cutoff, opts.dry_run)?;
-        let verb = if opts.dry_run { "would remove" } else { "removed" };
+        let verb = if opts.dry_run {
+            "would remove"
+        } else {
+            "removed"
+        };
         println!(
             "gc-store: {maps} build-run memos, {stale_maps} unused {verb}; \
              {passes} check verdict memos, {stale_passes} unused {verb}"
@@ -2511,14 +2563,19 @@ impl RecipeCheckRunner {
     /// lock (see `verify_store_cli`) so a concurrent build/clear can't race the scan.
     fn store_verify_pair(&self, db: &Path, store: &Path) -> Result<(), String> {
         let mut cmd = self.builder_command();
-        cmd.arg("store-verify").arg(path_str(db)?).arg(path_str(store)?);
+        cmd.arg("store-verify")
+            .arg(path_str(db)?)
+            .arg(path_str(store)?);
         let status = cmd
             .status()
             .map_err(|e| format!("spawn td-builder store-verify: {e}"))?;
         if status.success() {
             Ok(())
         } else {
-            Err(format!("td-builder store-verify {} failed ({status})", db.display()))
+            Err(format!(
+                "td-builder store-verify {} failed ({status})",
+                db.display()
+            ))
         }
     }
 
@@ -2864,12 +2921,7 @@ impl RecipeCheckRunner {
         self.store_add_recursive_into(intern_name, &file, db)
     }
 
-    fn intern_patch(
-        &self,
-        intern_name: &str,
-        patch: &str,
-        db: &Path,
-    ) -> Result<String, String> {
+    fn intern_patch(&self, intern_name: &str, patch: &str, db: &Path) -> Result<String, String> {
         let file = self
             .root
             .join("seed")
@@ -2961,7 +3013,12 @@ impl RecipeCheckRunner {
     /// have caught at commit time; this is the run-time backstop, naming the
     /// key and both declarations rather than silently staging whichever one
     /// the caller happened to pass.
-    fn ensure_local_source(&self, key: &str, rel: &str, trees: &[String]) -> Result<String, String> {
+    fn ensure_local_source(
+        &self,
+        key: &str,
+        rel: &str,
+        trees: &[String],
+    ) -> Result<String, String> {
         match crate::local_source_roster::expected(key)? {
             Some((roster_path, roster_trees))
                 if roster_path == rel
@@ -3178,8 +3235,7 @@ impl RecipeCheckRunner {
     /// per-invocation derived state, never a persisted authority.
     fn ensure_graph_inputs(&self, target: &str, nodes: &[RecipeNode]) -> Result<(), String> {
         let tdstore = self.scratch.join("tdstore");
-        fs::create_dir_all(&tdstore)
-            .map_err(|e| format!("mkdir {}: {e}", tdstore.display()))?;
+        fs::create_dir_all(&tdstore).map_err(|e| format!("mkdir {}: {e}", tdstore.display()))?;
         let mut entries: Vec<(String, String)> = Vec::new();
         for input in classify_graph_inputs(nodes)? {
             let derived = self.ensure_seed_input(&input)?;
@@ -3452,8 +3508,7 @@ impl RecipeCheckRunner {
         // return the same (status, stdout, stderr) triple, so the file/tail/scan below is shared.
         let stream = self.stream_progress && !quiet_requested();
         let (status, stdout_bytes, stderr_bytes) = if stream {
-            spawn_capture_tee(&mut cmd)
-                .map_err(|e| format!("build-plan --auto {target}: {e}"))?
+            spawn_capture_tee(&mut cmd).map_err(|e| format!("build-plan --auto {target}: {e}"))?
         } else {
             let out = cmd
                 .output()
@@ -4143,7 +4198,10 @@ pub(crate) fn checks_reaching(dirs: &[&str]) -> Result<BTreeSet<String>, String>
         }
         let under = format!("{dir}/");
         for (stem, recipe) in &all {
-            let local = recipe.local_source.as_deref().map(|s| s.trim_start_matches("./"));
+            let local = recipe
+                .local_source
+                .as_deref()
+                .map(|s| s.trim_start_matches("./"));
             let reads = catalog::named_dirs(stem).contains(&dir)
                 || local.is_some_and(|s| s == dir || s.starts_with(&under))
                 || recipe.local_source_trees.iter().flatten().any(|s| {
@@ -4165,7 +4223,13 @@ pub(crate) fn checks_reaching(dirs: &[&str]) -> Result<BTreeSet<String>, String>
             continue;
         }
         let mut closure = Vec::new();
-        visit_recipe(stem, &catalog, &mut HashSet::new(), &mut HashSet::new(), &mut closure)?;
+        visit_recipe(
+            stem,
+            &catalog,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut closure,
+        )?;
         if closure.iter().any(|n| reached.contains(n.stem.as_str())) {
             out.insert((*stem).to_string());
         }
@@ -4284,9 +4348,9 @@ fn check_payload_template(
     payloads_visible: bool,
 ) -> Result<(), String> {
     let reject = |name: &str, at: usize, reason: &str| {
-        let line = text
-            .get(..at)
-            .map_or(1, |prefix| prefix.bytes().filter(|byte| *byte == b'\n').count() + 1);
+        let line = text.get(..at).map_or(1, |prefix| {
+            prefix.bytes().filter(|byte| *byte == b'\n').count() + 1
+        });
         let excerpt = text.lines().nth(line.saturating_sub(1)).unwrap_or(text);
         format!(
             "{PROVENANCE_REJECTED}recipe {stem}: step {step} `{field}' line {line} names \
@@ -4382,7 +4446,11 @@ fn visit_step_templates(
             visit("unpack.input", input, true)?;
             visit("unpack.dest", dest, false)?;
         }
-        Step::MesBoot { source, nyacc, stage0 } => {
+        Step::MesBoot {
+            source,
+            nyacc,
+            stage0,
+        } => {
             visit("mesBoot.source", source, false)?;
             visit("mesBoot.nyacc", nyacc, false)?;
             visit("mesBoot.stage0", stage0, false)?;
@@ -4480,8 +4548,7 @@ fn visit_step_templates(
         }
         // These are validated manifest values, not templates. The builder
         // resolves `runtime` only through TD_PAYLOAD_MAP.
-        Step::ValidateStaticApplication { .. }
-        | Step::ValidateDynamicApplication { .. } => {}
+        Step::ValidateStaticApplication { .. } | Step::ValidateDynamicApplication { .. } => {}
     }
     Ok(())
 }
@@ -5023,9 +5090,7 @@ fn ensure_targets_provenance(targets: &[&str]) -> Result<(), String> {
 /// no inputs at all.
 fn warm_operator_inputs(runner: &RecipeCheckRunner, targets: &[&str]) {
     if io::stdin().is_terminal() {
-        if let Err(e) =
-            crate::warm::preflight(runner, targets, crate::warm::WarmMode::Automatic)
-        {
+        if let Err(e) = crate::warm::preflight(runner, targets, crate::warm::WarmMode::Automatic) {
             eprintln!("   [warm] {e} — continuing; the build reports what it cannot resolve");
         }
     }
@@ -5096,8 +5161,10 @@ fn validate_ostree_pin(pin: &OstreePin) -> Result<(), String> {
         ));
     }
     let mut cache_components = Path::new(&pin.cache).components();
-    if !matches!(cache_components.next(), Some(std::path::Component::Normal(_)))
-        || cache_components.next().is_some()
+    if !matches!(
+        cache_components.next(),
+        Some(std::path::Component::Normal(_))
+    ) || cache_components.next().is_some()
     {
         return Err(format!(
             "OSTree pin `{}` has non-basename cache {:?}",
@@ -5106,7 +5173,10 @@ fn validate_ostree_pin(pin: &OstreePin) -> Result<(), String> {
     }
     if !pin.repository.starts_with("https://")
         || pin.repository.trim() != pin.repository
-        || pin.repository.bytes().any(|byte| byte.is_ascii_whitespace())
+        || pin
+            .repository
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace())
     {
         return Err(format!(
             "OSTree pin `{}` repository must be one exact HTTPS URL",
@@ -5395,7 +5465,10 @@ fn runs_here(exe: &Path) -> Result<(), String> {
                 .code()
                 .map_or_else(|| "killed by a signal".to_string(), |c| format!("exit {c}"))
         )),
-        Err(e) => Err(format!("{} was built but does not run here: {e}", exe.display())),
+        Err(e) => Err(format!(
+            "{} was built but does not run here: {e}",
+            exe.display()
+        )),
     }
 }
 
@@ -5548,7 +5621,10 @@ fn seed_reset_hint(lw: &Path, err: &str) -> String {
 /// compiled table has no row for. Keying the db per table makes it unreachable from a
 /// peer branch; it survives as a detector because a stale TABLE still reaches it.
 fn unpinned_seed_in(bytes: &[u8]) -> bool {
-    contains_subslice(bytes, b"is not a basename the compiled seed-digest table pins")
+    contains_subslice(
+        bytes,
+        b"is not a basename the compiled seed-digest table pins",
+    )
 }
 
 /// A retained-seed failure marker — a plan-seed-db authentication red
@@ -5604,9 +5680,7 @@ fn quiet_requested() -> bool {
 /// build-plan interleaves per-rung `STEP` lines on stdout with progress on stderr, and
 /// draining one to EOF before touching the other could deadlock once a long build fills
 /// the unread pipe's buffer.
-fn spawn_capture_tee(
-    cmd: &mut Command,
-) -> Result<(process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+fn spawn_capture_tee(cmd: &mut Command) -> Result<(process::ExitStatus, Vec<u8>, Vec<u8>), String> {
     let mut child = cmd
         // Null stdin, matching `Command::output`: the build-plan child is non-interactive,
         // and inheriting the parent's stdin (a terminal on the interactive `run` path) would
@@ -5863,8 +5937,8 @@ fn remove_materialized_deploy_if_exists(path: &Path) -> Result<(), String> {
 }
 
 fn make_directories_user_writable(path: &Path) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("stat {}: {error}", path.display()))?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
     if !metadata.file_type().is_dir() {
         return Err(format!(
             "materialized deploy {} is not a directory",
@@ -5993,20 +6067,50 @@ mod tests {
     /// artifact to the wrong place after a long build.
     #[test]
     fn source_upstream_options_are_explicit_and_bounded() {
-        let parse = |args: &[&str]| parse_bundle_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let parse = |args: &[&str]| {
+            parse_bundle_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
         let built_in = parse(&[]).unwrap().source_upstream;
         assert_eq!(built_in.origin, "https://github.com/timmydo/td.git");
         assert_eq!(built_in.branch, "main");
-        assert_eq!(parse(&["--source-branch", "release/stable"]).unwrap().source_upstream.branch, "release/stable");
-        let default = parse(&["--source-origin", "https://example.invalid/td.git"]).unwrap().source_upstream;
+        assert_eq!(
+            parse(&["--source-branch", "release/stable"])
+                .unwrap()
+                .source_upstream
+                .branch,
+            "release/stable"
+        );
+        let default = parse(&["--source-origin", "https://example.invalid/td.git"])
+            .unwrap()
+            .source_upstream;
         assert_eq!(default.branch, "main");
-        let selected = parse(&["--source-origin", "https://example.invalid/td.git", "--source-branch", "release/rolling"]).unwrap().source_upstream;
+        let selected = parse(&[
+            "--source-origin",
+            "https://example.invalid/td.git",
+            "--source-branch",
+            "release/rolling",
+        ])
+        .unwrap()
+        .source_upstream;
         assert_eq!(selected.branch, "release/rolling");
         for args in [
-            vec!["--source-origin"], vec!["--source-branch"],
+            vec!["--source-origin"],
+            vec!["--source-branch"],
             vec!["--source-origin", "/srv/git/td.git"],
-            vec!["--source-origin", "https://example.invalid/td.git", "--source-origin", "https://example.invalid/other.git"],
-            vec!["--source-origin", "https://example.invalid/td.git", "--source-branch", "main", "--source-branch", "other"],
+            vec![
+                "--source-origin",
+                "https://example.invalid/td.git",
+                "--source-origin",
+                "https://example.invalid/other.git",
+            ],
+            vec![
+                "--source-origin",
+                "https://example.invalid/td.git",
+                "--source-branch",
+                "main",
+                "--source-branch",
+                "other",
+            ],
         ] {
             assert!(parse(&args).is_err(), "{args:?}");
         }
@@ -6135,9 +6239,7 @@ mod tests {
                 "object-limit" => {
                     bad.expected.objects = td_engine::ostree::GRAPH_LIMITS.objects + 1
                 }
-                _ => {
-                    bad.expected.decoded_bytes = td_engine::ostree::GRAPH_LIMITS.decoded_bytes + 1
-                }
+                _ => bad.expected.decoded_bytes = td_engine::ostree::GRAPH_LIMITS.decoded_bytes + 1,
             }
             assert!(validate_ostree_pin(&bad).is_err(), "{damage}");
         }
@@ -6175,9 +6277,7 @@ mod tests {
         ] {
             assert_eq!(net.matches(declaration).count(), 1, "{declaration}");
         }
-        assert!(net.contains(
-            "\"format=1\\nrepository={}\\nref={}\\ncommit={}\\ncontent={}\\n\""
-        ));
+        assert!(net.contains("\"format=1\\nrepository={}\\nref={}\\ncommit={}\\ncontent={}\\n\""));
         let pin = ostree_pins::by_key("firefox-154-source").expect("reviewed Firefox pin");
         assert_eq!(
             render_ostree_owner(&pin),
@@ -6210,10 +6310,7 @@ mod tests {
         );
         assert_eq!(
             closure.pins,
-            vec![
-                "firefox-154-source",
-                "freedesktop-platform-25-08-source"
-            ]
+            vec!["firefox-154-source", "freedesktop-platform-25-08-source"]
         );
     }
 
@@ -6235,45 +6332,288 @@ mod tests {
         const BAD: &str = "{payload:firefox}";
         let bad = |s: &str| s.to_string();
         let cases = vec![
-            ("run.argv", Step::Run { argv: vec![bad(BAD)], env: Vec::new(), dir: "{root}".into() }),
-            ("run.env value", Step::Run { argv: vec!["true".into()], env: vec![("PATH".into(), bad(BAD))], dir: "{root}".into() }),
-            ("run.dir", Step::Run { argv: vec!["true".into()], env: Vec::new(), dir: bad(BAD) }),
-            ("toolFarm target", Step::ToolFarm { links: vec![("tool".into(), bad(BAD))] }),
-            ("writeFile.path", Step::WriteFile { path: bad(BAD), content: "ok".into(), exec: false }),
-            ("writeFile.content", Step::WriteFile { path: "{out}/x".into(), content: bad(BAD), exec: false }),
-            ("unpack.dest", Step::Unpack { input: "{src}".into(), dest: bad(BAD), keep_top: false }),
-            ("mesBoot.source", Step::MesBoot { source: bad(BAD), nyacc: "{in:nyacc}".into(), stage0: "{in:stage0}".into() }),
-            ("mesBoot.nyacc", Step::MesBoot { source: "{src}".into(), nyacc: bad(BAD), stage0: "{in:stage0}".into() }),
-            ("mesBoot.stage0", Step::MesBoot { source: "{src}".into(), nyacc: "{in:nyacc}".into(), stage0: bad(BAD) }),
-            ("copyFiles.files", Step::CopyFiles { files: vec![bad(BAD)], dest: "{root}".into() }),
-            ("copyFiles.dest", Step::CopyFiles { files: vec!["{src}/x".into()], dest: bad(BAD) }),
-            ("copyTree.dest", Step::CopyTree { from: "{src}".into(), dest: bad(BAD) }),
-            ("copyFile.to", Step::CopyFile { file: "{src}/x".into(), to: bad(BAD), exec: true }),
-            ("splitDebugTree.root", Step::SplitDebugTree { root: bad(BAD), objcopy: "{in:binutils}/bin/objcopy".into() }),
-            ("splitDebugTree.objcopy", Step::SplitDebugTree { root: "{out}".into(), objcopy: bad(BAD) }),
-            ("assertDebugSize.root", Step::AssertDebugSize { root: bad(BAD), report: "{out}/debug-size".into(), scope: "fixture".into(), ceiling: 1 }),
-            ("assertDebugSize.report", Step::AssertDebugSize { root: "{out}".into(), report: bad(BAD), scope: "fixture".into(), ceiling: 1 }),
-            ("compareFiles.left", Step::CompareFiles { left: bad(BAD), right: "{out}/two".into() }),
-            ("compareFiles.right", Step::CompareFiles { left: "{out}/one".into(), right: bad(BAD) }),
-            ("stageRuntimeClosure.dest", Step::StageRuntimeClosure { roots: vec!["{in:glibc}".into()], dest: bad(BAD) }),
-            ("compileApplicationTables.registry", Step::CompileApplicationTables { names: vec!["firefox".into()], packages: vec!["{payload:firefox}".into()], runtimes: vec!["{payload:runtime}".into()], registry: bad(BAD), launcher: "{out}/launcher.tsv".into() }),
-            ("compileApplicationTables.launcher", Step::CompileApplicationTables { names: vec!["firefox".into()], packages: vec!["{payload:firefox}".into()], runtimes: vec!["{payload:runtime}".into()], registry: "{out}/registry.tsv".into(), launcher: bad(BAD) }),
-            ("packErofs.root", Step::PackErofs { root: bad(BAD), output: "{out}/root.erofs".into() }),
-            ("packErofs.output", Step::PackErofs { root: "{root}".into(), output: bad(BAD) }),
-            ("sha256Manifest.output", Step::Sha256Manifest { output: bad(BAD), entries: Vec::new() }),
-            ("sha256Manifest entry path", Step::Sha256Manifest { output: "{out}/manifest".into(), entries: vec![("item".into(), bad(BAD))] }),
-            ("symlink.target", Step::Symlink { target: bad(BAD), link: "{out}/link".into() }),
-            ("symlink.link", Step::Symlink { target: "target".into(), link: bad(BAD) }),
+            (
+                "run.argv",
+                Step::Run {
+                    argv: vec![bad(BAD)],
+                    env: Vec::new(),
+                    dir: "{root}".into(),
+                },
+            ),
+            (
+                "run.env value",
+                Step::Run {
+                    argv: vec!["true".into()],
+                    env: vec![("PATH".into(), bad(BAD))],
+                    dir: "{root}".into(),
+                },
+            ),
+            (
+                "run.dir",
+                Step::Run {
+                    argv: vec!["true".into()],
+                    env: Vec::new(),
+                    dir: bad(BAD),
+                },
+            ),
+            (
+                "toolFarm target",
+                Step::ToolFarm {
+                    links: vec![("tool".into(), bad(BAD))],
+                },
+            ),
+            (
+                "writeFile.path",
+                Step::WriteFile {
+                    path: bad(BAD),
+                    content: "ok".into(),
+                    exec: false,
+                },
+            ),
+            (
+                "writeFile.content",
+                Step::WriteFile {
+                    path: "{out}/x".into(),
+                    content: bad(BAD),
+                    exec: false,
+                },
+            ),
+            (
+                "unpack.dest",
+                Step::Unpack {
+                    input: "{src}".into(),
+                    dest: bad(BAD),
+                    keep_top: false,
+                },
+            ),
+            (
+                "mesBoot.source",
+                Step::MesBoot {
+                    source: bad(BAD),
+                    nyacc: "{in:nyacc}".into(),
+                    stage0: "{in:stage0}".into(),
+                },
+            ),
+            (
+                "mesBoot.nyacc",
+                Step::MesBoot {
+                    source: "{src}".into(),
+                    nyacc: bad(BAD),
+                    stage0: "{in:stage0}".into(),
+                },
+            ),
+            (
+                "mesBoot.stage0",
+                Step::MesBoot {
+                    source: "{src}".into(),
+                    nyacc: "{in:nyacc}".into(),
+                    stage0: bad(BAD),
+                },
+            ),
+            (
+                "copyFiles.files",
+                Step::CopyFiles {
+                    files: vec![bad(BAD)],
+                    dest: "{root}".into(),
+                },
+            ),
+            (
+                "copyFiles.dest",
+                Step::CopyFiles {
+                    files: vec!["{src}/x".into()],
+                    dest: bad(BAD),
+                },
+            ),
+            (
+                "copyTree.dest",
+                Step::CopyTree {
+                    from: "{src}".into(),
+                    dest: bad(BAD),
+                },
+            ),
+            (
+                "copyFile.to",
+                Step::CopyFile {
+                    file: "{src}/x".into(),
+                    to: bad(BAD),
+                    exec: true,
+                },
+            ),
+            (
+                "splitDebugTree.root",
+                Step::SplitDebugTree {
+                    root: bad(BAD),
+                    objcopy: "{in:binutils}/bin/objcopy".into(),
+                },
+            ),
+            (
+                "splitDebugTree.objcopy",
+                Step::SplitDebugTree {
+                    root: "{out}".into(),
+                    objcopy: bad(BAD),
+                },
+            ),
+            (
+                "assertDebugSize.root",
+                Step::AssertDebugSize {
+                    root: bad(BAD),
+                    report: "{out}/debug-size".into(),
+                    scope: "fixture".into(),
+                    ceiling: 1,
+                },
+            ),
+            (
+                "assertDebugSize.report",
+                Step::AssertDebugSize {
+                    root: "{out}".into(),
+                    report: bad(BAD),
+                    scope: "fixture".into(),
+                    ceiling: 1,
+                },
+            ),
+            (
+                "compareFiles.left",
+                Step::CompareFiles {
+                    left: bad(BAD),
+                    right: "{out}/two".into(),
+                },
+            ),
+            (
+                "compareFiles.right",
+                Step::CompareFiles {
+                    left: "{out}/one".into(),
+                    right: bad(BAD),
+                },
+            ),
+            (
+                "stageRuntimeClosure.dest",
+                Step::StageRuntimeClosure {
+                    roots: vec!["{in:glibc}".into()],
+                    dest: bad(BAD),
+                },
+            ),
+            (
+                "compileApplicationTables.registry",
+                Step::CompileApplicationTables {
+                    names: vec!["firefox".into()],
+                    packages: vec!["{payload:firefox}".into()],
+                    runtimes: vec!["{payload:runtime}".into()],
+                    registry: bad(BAD),
+                    launcher: "{out}/launcher.tsv".into(),
+                },
+            ),
+            (
+                "compileApplicationTables.launcher",
+                Step::CompileApplicationTables {
+                    names: vec!["firefox".into()],
+                    packages: vec!["{payload:firefox}".into()],
+                    runtimes: vec!["{payload:runtime}".into()],
+                    registry: "{out}/registry.tsv".into(),
+                    launcher: bad(BAD),
+                },
+            ),
+            (
+                "packErofs.root",
+                Step::PackErofs {
+                    root: bad(BAD),
+                    output: "{out}/root.erofs".into(),
+                },
+            ),
+            (
+                "packErofs.output",
+                Step::PackErofs {
+                    root: "{root}".into(),
+                    output: bad(BAD),
+                },
+            ),
+            (
+                "sha256Manifest.output",
+                Step::Sha256Manifest {
+                    output: bad(BAD),
+                    entries: Vec::new(),
+                },
+            ),
+            (
+                "sha256Manifest entry path",
+                Step::Sha256Manifest {
+                    output: "{out}/manifest".into(),
+                    entries: vec![("item".into(), bad(BAD))],
+                },
+            ),
+            (
+                "symlink.target",
+                Step::Symlink {
+                    target: bad(BAD),
+                    link: "{out}/link".into(),
+                },
+            ),
+            (
+                "symlink.link",
+                Step::Symlink {
+                    target: "target".into(),
+                    link: bad(BAD),
+                },
+            ),
             ("mkDir.path", Step::MkDir { path: bad(BAD) }),
-            ("truncate.path", Step::Truncate { path: bad(BAD), bytes: 1 }),
-            ("patchShebangs.dir", Step::PatchShebangs { dir: bad(BAD), shell: "{in:bash}/bin/bash".into() }),
-            ("patchShebangs.shell", Step::PatchShebangs { dir: "{src}".into(), shell: bad(BAD) }),
-            ("relocateLdScripts.dir", Step::RelocateLdScripts { dir: bad(BAD), prefix: "{out}".into() }),
-            ("relocateLdScripts.prefix", Step::RelocateLdScripts { dir: "{out}/lib".into(), prefix: bad(BAD) }),
-            ("require.paths", Step::Require { paths: vec![bad(BAD)], exec: true }),
-            ("substituteText.file", Step::SubstituteText { file: bad(BAD), edits: Vec::new() }),
-            ("assertStatic.paths", Step::AssertStatic { paths: vec![bad(BAD)] }),
-            ("assertEfiApplication.path", Step::AssertEfiApplication { path: bad(BAD) }),
+            (
+                "truncate.path",
+                Step::Truncate {
+                    path: bad(BAD),
+                    bytes: 1,
+                },
+            ),
+            (
+                "patchShebangs.dir",
+                Step::PatchShebangs {
+                    dir: bad(BAD),
+                    shell: "{in:bash}/bin/bash".into(),
+                },
+            ),
+            (
+                "patchShebangs.shell",
+                Step::PatchShebangs {
+                    dir: "{src}".into(),
+                    shell: bad(BAD),
+                },
+            ),
+            (
+                "relocateLdScripts.dir",
+                Step::RelocateLdScripts {
+                    dir: bad(BAD),
+                    prefix: "{out}".into(),
+                },
+            ),
+            (
+                "relocateLdScripts.prefix",
+                Step::RelocateLdScripts {
+                    dir: "{out}/lib".into(),
+                    prefix: bad(BAD),
+                },
+            ),
+            (
+                "require.paths",
+                Step::Require {
+                    paths: vec![bad(BAD)],
+                    exec: true,
+                },
+            ),
+            (
+                "substituteText.file",
+                Step::SubstituteText {
+                    file: bad(BAD),
+                    edits: Vec::new(),
+                },
+            ),
+            (
+                "assertStatic.paths",
+                Step::AssertStatic {
+                    paths: vec![bad(BAD)],
+                },
+            ),
+            (
+                "assertEfiApplication.path",
+                Step::AssertEfiApplication { path: bad(BAD) },
+            ),
         ];
         assert_eq!(cases.len(), 39, "every expanded, non-data field is listed");
         let mut expected: HashSet<(&'static str, bool)> =
@@ -6377,20 +6717,60 @@ mod tests {
     #[test]
     fn only_typed_data_sources_see_payload_templates() {
         for step in [
-            Step::Unpack { input: "{payload:firefox}".into(), dest: "{src}".into(), keep_top: false },
-            Step::CopyTree { from: "{payload:firefox}".into(), dest: "{out}/app".into() },
-            Step::CopyFile { file: "{payload:firefox}".into(), to: "{out}/app/bin/x".into(), exec: true },
-            Step::StageRuntimeClosure { roots: vec!["{payload:firefox}".into()], dest: "{out}/root".into() },
-            Step::CompileApplicationTables { names: vec!["firefox".into()], packages: vec!["{payload:firefox}".into()], runtimes: vec!["{payload:runtime}".into()], registry: "{out}/registry".into(), launcher: "{out}/launcher".into() },
+            Step::Unpack {
+                input: "{payload:firefox}".into(),
+                dest: "{src}".into(),
+                keep_top: false,
+            },
+            Step::CopyTree {
+                from: "{payload:firefox}".into(),
+                dest: "{out}/app".into(),
+            },
+            Step::CopyFile {
+                file: "{payload:firefox}".into(),
+                to: "{out}/app/bin/x".into(),
+                exec: true,
+            },
+            Step::StageRuntimeClosure {
+                roots: vec!["{payload:firefox}".into()],
+                dest: "{out}/root".into(),
+            },
+            Step::CompileApplicationTables {
+                names: vec!["firefox".into()],
+                packages: vec!["{payload:firefox}".into()],
+                runtimes: vec!["{payload:runtime}".into()],
+                registry: "{out}/registry".into(),
+                launcher: "{out}/launcher".into(),
+            },
         ] {
             assert!(refuse_payload_templates("image", &payload_template_recipe(step)).is_ok());
         }
         for step in [
-            Step::Unpack { input: "{in:firefox}".into(), dest: "{src}".into(), keep_top: false },
-            Step::CopyTree { from: "{in:firefox}".into(), dest: "{out}/app".into() },
-            Step::CopyFile { file: "{in:firefox}".into(), to: "{out}/app/bin/x".into(), exec: true },
-            Step::StageRuntimeClosure { roots: vec!["{in:firefox}".into()], dest: "{out}/root".into() },
-            Step::CompileApplicationTables { names: vec!["firefox".into()], packages: vec!["{in:firefox}".into()], runtimes: vec!["{payload:runtime}".into()], registry: "{out}/registry".into(), launcher: "{out}/launcher".into() },
+            Step::Unpack {
+                input: "{in:firefox}".into(),
+                dest: "{src}".into(),
+                keep_top: false,
+            },
+            Step::CopyTree {
+                from: "{in:firefox}".into(),
+                dest: "{out}/app".into(),
+            },
+            Step::CopyFile {
+                file: "{in:firefox}".into(),
+                to: "{out}/app/bin/x".into(),
+                exec: true,
+            },
+            Step::StageRuntimeClosure {
+                roots: vec!["{in:firefox}".into()],
+                dest: "{out}/root".into(),
+            },
+            Step::CompileApplicationTables {
+                names: vec!["firefox".into()],
+                packages: vec!["{in:firefox}".into()],
+                runtimes: vec!["{payload:runtime}".into()],
+                registry: "{out}/registry".into(),
+                launcher: "{out}/launcher".into(),
+            },
         ] {
             let error = payload_template_error(step);
             assert!(error.contains("`{in:NAME}' is the tool channel"), "{error}");
@@ -6404,7 +6784,10 @@ mod tests {
         let error = refuse_payload_templates("image", &unknown)
             .expect_err("an undeclared payload template must refuse during planning");
         assert!(error.contains("thunderbird"), "{error}");
-        assert!(error.contains("absent from this recipe's DATA inputs"), "{error}");
+        assert!(
+            error.contains("absent from this recipe's DATA inputs"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -6431,16 +6814,20 @@ mod tests {
             .expect_err("the marked source must not cross onto the command channel");
         assert!(error.contains("`{in:NAME}' is the tool channel"), "{error}");
 
-        let pin_spelling = Recipe::mesboot("seed", "1")
-            .source_input(pin)
-            .steps(vec![Step::Unpack {
-                input: format!("{{payload:{pin}}}"),
-                dest: "{src}".into(),
-                keep_top: false,
-            }]);
+        let pin_spelling =
+            Recipe::mesboot("seed", "1")
+                .source_input(pin)
+                .steps(vec![Step::Unpack {
+                    input: format!("{{payload:{pin}}}"),
+                    dest: "{src}".into(),
+                    keep_top: false,
+                }]);
         let error = refuse_payload_templates("seed", &pin_spelling)
             .expect_err("the pin key is not the local source entry name");
-        assert!(error.contains("absent from this recipe's DATA inputs"), "{error}");
+        assert!(
+            error.contains("absent from this recipe's DATA inputs"),
+            "{error}"
+        );
     }
 
     /// Labels and literal edit text are not template-expanded by the builder,
@@ -6449,10 +6836,22 @@ mod tests {
     fn literal_step_fields_are_not_scanned_as_templates() {
         const LITERAL: &str = "{payload:firefox}";
         for step in [
-            Step::Run { argv: vec!["true".into()], env: vec![(LITERAL.into(), "ok".into())], dir: "{root}".into() },
-            Step::ToolFarm { links: vec![(LITERAL.into(), "{in:gcc}/bin/gcc".into())] },
-            Step::Sha256Manifest { output: "{out}/manifest".into(), entries: vec![(LITERAL.into(), "{out}/file".into())] },
-            Step::SubstituteText { file: "{src}/file".into(), edits: vec![td_recipe::types::TextEdit::new(LITERAL, LITERAL, 1)] },
+            Step::Run {
+                argv: vec!["true".into()],
+                env: vec![(LITERAL.into(), "ok".into())],
+                dir: "{root}".into(),
+            },
+            Step::ToolFarm {
+                links: vec![(LITERAL.into(), "{in:gcc}/bin/gcc".into())],
+            },
+            Step::Sha256Manifest {
+                output: "{out}/manifest".into(),
+                entries: vec![(LITERAL.into(), "{out}/file".into())],
+            },
+            Step::SubstituteText {
+                file: "{src}/file".into(),
+                edits: vec![td_recipe::types::TextEdit::new(LITERAL, LITERAL, 1)],
+            },
         ] {
             assert!(refuse_payload_templates("image", &payload_template_recipe(step)).is_ok());
         }
@@ -6554,7 +6953,9 @@ mod tests {
             // `pins.filter(|pin| pin.foreign())` is still caught.
             .filter(|l| !l.starts_with("//"))
             .filter(|l| {
-                l.contains("is_foreign()") || l.contains(".foreign()") || l.contains("foreign_names()")
+                l.contains("is_foreign()")
+                    || l.contains(".foreign()")
+                    || l.contains("foreign_names()")
             })
             .collect();
         assert_eq!(
@@ -6639,7 +7040,12 @@ mod tests {
         // red. A made-up name would be rejected anyway, for a different reason,
         // and the test would pass with the refusal deleted.
         const MARKED: &str = "gcc-mesboot0";
-        let clean = || node("clean", Recipe::mesboot("clean", "0").inputs(&["binutils-mesboot0"]));
+        let clean = || {
+            node(
+                "clean",
+                Recipe::mesboot("clean", "0").inputs(&["binutils-mesboot0"]),
+            )
+        };
         let dirty = || node("dirty", Recipe::mesboot("dirty", "0").inputs(&[MARKED]));
         let marked = |n: &str| n == MARKED;
         let unmarked = |_: &str| false;
@@ -6755,7 +7161,10 @@ mod tests {
         let clean = contains_payloads(&nodes(), 0, |_| false);
         assert!(clean.pins.is_empty() && clean.foreign_members.is_empty());
         assert_eq!(clean.unmarked(), 2);
-        assert_eq!(clean.report(), "members\t2\nunmarked\t2\naudited-seeds\t0\n");
+        assert_eq!(
+            clean.report(),
+            "members\t2\nunmarked\t2\naudited-seeds\t0\n"
+        );
 
         // A closure MEMBER is classified by its OWN recipe, never by the name
         // question: the two namespaces are unioned, so a stem that collided
@@ -6808,7 +7217,10 @@ mod tests {
                 pin.cache
             );
         }
-        assert!(names > 40, "{names} pins — the sweep must have something to do");
+        assert!(
+            names > 40,
+            "{names} pins — the sweep must have something to do"
+        );
         // The ALIASES too, since `by_key` resolves one to the pin and
         // `foreign_names` marks it.
         for alias in ["linux-headers", "linux-headers-x86-64"] {
@@ -6830,8 +7242,18 @@ mod tests {
         // Real catalog stems, so the graph classifies cleanly and the refusal
         // is the only thing that can red it. A made-up name reds anyway.
         const MARKED: &str = "gcc-mesboot0";
-        let clean = || node("clean", Recipe::mesboot("clean", "0").inputs(&["binutils-mesboot0"]));
-        let dirty = || node("consumer", Recipe::mesboot("consumer", "0").inputs(&[MARKED]));
+        let clean = || {
+            node(
+                "clean",
+                Recipe::mesboot("clean", "0").inputs(&["binutils-mesboot0"]),
+            )
+        };
+        let dirty = || {
+            node(
+                "consumer",
+                Recipe::mesboot("consumer", "0").inputs(&[MARKED]),
+            )
+        };
         for nodes in [vec![clean(), dirty()], vec![dirty(), clean()]] {
             let e = payload_closure_of(&nodes, |name| name == MARKED)
                 .expect_err("a marked path on the tool channel must refuse");
@@ -6865,7 +7287,10 @@ mod tests {
         assert_eq!(answer.pins, vec![PIN.to_string()]);
         assert_eq!(answer.members, 1);
         // Unmarked, the same real pin is ordinary source and is not reported.
-        assert!(payload_closure_of(&nodes, |_| false).unwrap().pins.is_empty());
+        assert!(payload_closure_of(&nodes, |_| false)
+            .unwrap()
+            .pins
+            .is_empty());
     }
 
     #[test]
@@ -6994,15 +7419,19 @@ mod tests {
     #[test]
     fn application_store_command_requires_exactly_one_application_target() {
         let error = application_closure_cli(&[]).unwrap_err();
-        assert!(error.contains("usage: application-closure TARGET"), "{error}");
+        assert!(
+            error.contains("usage: application-closure TARGET"),
+            "{error}"
+        );
         let error = application_closure_cli(&["empty-runtime".to_string()]).unwrap_err();
         assert!(error.contains("is not an application"), "{error}");
-        let error = application_closure_cli(&[
-            "ripgrep-seed".to_string(),
-            "empty-runtime".to_string(),
-        ])
-        .unwrap_err();
-        assert!(error.contains("usage: application-closure TARGET"), "{error}");
+        let error =
+            application_closure_cli(&["ripgrep-seed".to_string(), "empty-runtime".to_string()])
+                .unwrap_err();
+        assert!(
+            error.contains("usage: application-closure TARGET"),
+            "{error}"
+        );
     }
 
     /// The shipped COMMAND, which review gutted to `Ok(())` and pointed at a
@@ -7109,14 +7538,21 @@ mod tests {
         // test thread holds our write fd until it execs, and this script is exec'd by
         // the code under test. Prove it runs before handing it over.
         for _ in 0..400 {
-            match Command::new(path).arg("--td-fixture-probe").stdin(Stdio::null()).output() {
+            match Command::new(path)
+                .arg("--td-fixture-probe")
+                .stdin(Stdio::null())
+                .output()
+            {
                 Err(e) if e.raw_os_error() == Some(26) => {
                     std::thread::sleep(std::time::Duration::from_millis(5))
                 }
                 _ => return,
             }
         }
-        panic!("fixture {} never stopped being Text-file-busy", path.display());
+        panic!(
+            "fixture {} never stopped being Text-file-busy",
+            path.display()
+        );
     }
 
     /// The auto-build's three outcomes. `find_td_builder_self` runs a real host
@@ -7181,7 +7617,10 @@ mod tests {
             ),
         );
         assert_eq!(build_td_builder(&cargo, &d, &guessed).unwrap(), actual);
-        assert!(!guessed.exists(), "the guessed path must not be what answered");
+        assert!(
+            !guessed.exists(),
+            "the guessed path must not be what answered"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -7386,7 +7825,10 @@ chmod 755 '{}'
         // No db at all — a pin table that has never run on this ladder.
         assert!(!runner.db.exists());
         assert!(
-            !runner.db_vouches(&format!("{TD_STORE_DIR}/{}", pinned_basename("stage0-source"))),
+            !runner.db_vouches(&format!(
+                "{TD_STORE_DIR}/{}",
+                pinned_basename("stage0-source")
+            )),
             "an absent db vouches nothing, which is the fail-closed direction"
         );
 
@@ -7437,7 +7879,10 @@ chmod 755 '{}'
         fs::create_dir_all(&runner.scratch).unwrap();
         fs::create_dir_all(runner.db.parent().unwrap()).unwrap();
 
-        assert!(!runner.db.exists(), "this table starts with no authority rows");
+        assert!(
+            !runner.db.exists(),
+            "this table starts with no authority rows"
+        );
         let authorized = runner
             .ensure_seed_input(&SeedInput::Patch {
                 key: "patch-binutils-boot-2.20.1a".into(),
@@ -7491,13 +7936,12 @@ chmod 755 '{}'
             .expect("seed db has a parent")
             .join("aaaaaaaaaaaaaaaa.db");
         let reused = runner
-            .store_add_recursive_into(
-                key,
-                &runner.store.join(candidate),
-                &a_table_db,
-            )
+            .store_add_recursive_into(key, &runner.store.join(candidate), &a_table_db)
             .expect("A's later table can authorize the already-shared bytes");
-        assert!(reused.ends_with(candidate), "reused {reused}, candidate {candidate}");
+        assert!(
+            reused.ends_with(candidate),
+            "reused {reused}, candidate {candidate}"
+        );
         assert_eq!(
             dir_listing(&runner.store),
             shared_items,
@@ -7751,7 +8195,11 @@ chmod 755 '{}'
         ] {
             fs::create_dir_all(root.join(dir)).unwrap();
         }
-        fs::write(root.join("net/Cargo.toml"), b"[package]\nname = \"td-net\"\n").unwrap();
+        fs::write(
+            root.join("net/Cargo.toml"),
+            b"[package]\nname = \"td-net\"\n",
+        )
+        .unwrap();
         fs::write(root.join("net/Cargo.lock"), b"version = 4\n").unwrap();
         fs::write(root.join("net/src/main.rs"), b"fn main() {}\n").unwrap();
         fs::write(root.join("net/target/junk"), b"x").unwrap();
@@ -7785,15 +8233,22 @@ chmod 755 '{}'
         assert_eq!(listing.len(), 3, "{listing:?}");
 
         for (roster, reason) in [
-            (trees(&["engine", "other/engine"]), "two trees named `engine'"),
+            (
+                trees(&["engine", "other/engine"]),
+                "two trees named `engine'",
+            ),
             (trees(&["missing"]), "is not a directory"),
             (trees(&["escape"]), "resolves outside the checkout"),
             (trees(&["../root/engine"]), "plain repo-relative path"),
         ] {
-            let err = stage_local_source_at(&root, "td-net-source", "net", &roster, &dest)
-                .unwrap_err();
+            let err =
+                stage_local_source_at(&root, "td-net-source", "net", &roster, &dest).unwrap_err();
             assert!(err.contains(reason), "{roster:?}: {err}");
-            assert_eq!(dir_listing(&dest), listing, "a refused roster stages nothing");
+            assert_eq!(
+                dir_listing(&dest),
+                listing,
+                "a refused roster stages nothing"
+            );
         }
 
         let alone = stage_local_source_at(&root, "td-net-source", "net", &[], &dest).unwrap();
@@ -7915,7 +8370,10 @@ chmod 755 '{}'
     #[test]
     fn sanitize_target_keeps_recipe_stems_and_neutralizes_path_bytes() {
         // A normal recipe stem passes through unchanged (dots kept for versions).
-        assert_eq!(sanitize_target_for_filename("system-x86-64"), "system-x86-64");
+        assert_eq!(
+            sanitize_target_for_filename("system-x86-64"),
+            "system-x86-64"
+        );
         assert_eq!(sanitize_target_for_filename("gcc.14_2"), "gcc.14_2");
         // Every separator becomes `_`, so no `/` survives to form a traversal — the result
         // is always a single flat filename component (kept dots can't traverse alone).
@@ -8223,7 +8681,10 @@ chmod 755 '{}'
             .join("rung-sentinel")
             .is_file());
         assert!(seed_store_dir(&lw).join("seed-item").is_file());
-        assert!(runner.db.is_file(), "the seed db for this pin table survives");
+        assert!(
+            runner.db.is_file(),
+            "the seed db for this pin table survives"
+        );
         // The per-invocation scratch is freshly created.
         assert!(runner.scratch.is_dir());
         let _ = fs::remove_dir_all(&lw);
@@ -8282,15 +8743,21 @@ chmod 755 '{}'
         let store = root.join("store-file");
         fs::create_dir_all(deploy.join("nested")).unwrap();
         fs::write(deploy.join("nested/file"), b"payload").unwrap();
-        fs::set_permissions(deploy.join("nested/file"), fs::Permissions::from_mode(0o444))
-            .unwrap();
+        fs::set_permissions(
+            deploy.join("nested/file"),
+            fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
         fs::hard_link(deploy.join("nested/file"), &store).unwrap();
         fs::set_permissions(deploy.join("nested"), fs::Permissions::from_mode(0o555)).unwrap();
         fs::set_permissions(&deploy, fs::Permissions::from_mode(0o555)).unwrap();
 
         remove_materialized_deploy_if_exists(&deploy).unwrap();
         assert!(!deploy.exists());
-        assert_eq!(fs::metadata(&store).unwrap().permissions().mode() & 0o777, 0o444);
+        assert_eq!(
+            fs::metadata(&store).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -8361,7 +8828,8 @@ chmod 755 '{}'
         assert!(!store.exists());
         // The too-shallow guard still fires (a bare `$HOME` is not a substitute store).
         assert!(clear_subst_store(Path::new("/a")).is_err());
-        let _ = fs::remove_dir_all(env::temp_dir().join(format!("td-subst-clear-{}", process::id())));
+        let _ =
+            fs::remove_dir_all(env::temp_dir().join(format!("td-subst-clear-{}", process::id())));
     }
 
     // The coarse GC evicts the whole build-cache when it exceeds the cap, and does so
@@ -8445,7 +8913,10 @@ chmod 755 '{}'
             .write(true)
             .open(&lock_path)
             .unwrap();
-        assert!(contender.try_lock().is_err(), "commit lock is exclusive while held");
+        assert!(
+            contender.try_lock().is_err(),
+            "commit lock is exclusive while held"
+        );
         drop(held);
         // Not instantly: a sibling test's `Command::spawn` forks a child that
         // holds a duplicate of this descriptor until it execs, and an flock
@@ -8495,7 +8966,10 @@ chmod 755 '{}'
         let wiper = lock_ladder(&lock, LadderLock::Exclusive).unwrap();
         let build = open_lock_file(&lock).unwrap();
         assert!(
-            matches!(build.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock)),
+            matches!(
+                build.try_lock_shared(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ),
             "a build must not join a ladder held exclusively"
         );
         drop(wiper);
@@ -8533,7 +9007,10 @@ chmod 755 '{}'
         let held = lock_ladder_for_run_with_cache_cap(&runner, None).unwrap();
 
         // setup() ran under that same hold: this invocation's private scratch exists.
-        assert!(runner.scratch.is_dir(), "setup() ran while the ladder was held");
+        assert!(
+            runner.scratch.is_dir(),
+            "setup() ran while the ladder was held"
+        );
         // A peer build joins it.
         let peer = lock_ladder(&runner.lock_path(), LadderLock::Shared).unwrap();
         drop(peer);
@@ -8551,8 +9028,14 @@ chmod 755 '{}'
     fn ladder_lock_mode_is_shared_unless_eviction_is_armed() {
         assert_eq!(ladder_lock_mode(None), LadderLock::Shared);
         assert_eq!(ladder_lock_mode(Some(1)), LadderLock::Exclusive);
-        assert_eq!(ladder_lock_mode(parse_cache_cap(Some("0"))), LadderLock::Shared);
-        assert_eq!(ladder_lock_mode(parse_cache_cap(Some("4096"))), LadderLock::Exclusive);
+        assert_eq!(
+            ladder_lock_mode(parse_cache_cap(Some("0"))),
+            LadderLock::Shared
+        );
+        assert_eq!(
+            ladder_lock_mode(parse_cache_cap(Some("4096"))),
+            LadderLock::Exclusive
+        );
     }
 
     /// Which entries may hold the ladder EXCLUSIVELY, pinned in source because the
@@ -8657,11 +9140,20 @@ chmod 755 '{}'
         }
         assert_eq!(
             kernel_delegates,
-            ["qemu_boot_cli", "qemu_boot_uefi_cli", "qemu_boot_media_cli", "qemu_install_cli"].into_iter().collect()
+            [
+                "qemu_boot_cli",
+                "qemu_boot_uefi_cli",
+                "qemu_boot_media_cli",
+                "qemu_install_cli"
+            ]
+            .into_iter()
+            .collect()
         );
         for delegate in kernel_delegates {
-            assert!(!direct.contains(delegate) && !through_run.contains(delegate),
-                "{delegate} must leave the single ladder acquisition to qemu_kernel_cli");
+            assert!(
+                !direct.contains(delegate) && !through_run.contains(delegate),
+                "{delegate} must leave the single ladder acquisition to qemu_kernel_cli"
+            );
         }
     }
 
@@ -8705,8 +9197,14 @@ chmod 755 '{}'
         fs::write(dir.join("notes.txt"), b"not a db").unwrap();
 
         let found = runner.seed_dbs().unwrap();
-        assert!(found.contains(&runner.db), "our own db must be fscked: {found:?}");
-        assert!(found.contains(&peer), "a peer table's db must be fscked too: {found:?}");
+        assert!(
+            found.contains(&runner.db),
+            "our own db must be fscked: {found:?}"
+        );
+        assert!(
+            found.contains(&peer),
+            "a peer table's db must be fscked too: {found:?}"
+        );
         assert_eq!(found.len(), 2, "only the authoritative dbs: {found:?}");
         // Sorted, so a failure names the same db run to run.
         let mut sorted = found.clone();
@@ -8728,12 +9226,32 @@ chmod 755 '{}'
         let generator = generator_db_path(lw, "seed-digests-4242");
         let candidate = candidate_db_path(lw, "check-demo-4242");
         let local = local_seed_db_path(lw, "check-demo-4242");
-        assert_ne!(generator, keyed, "the generator must not write the keyed db");
-        assert_ne!(candidate, keyed, "a cold candidate must not write the keyed db");
-        assert_ne!(local, keyed, "local-source registrations must not write the keyed db");
-        assert_ne!(local, candidate, "the local-source db is its own file, not the candidate's");
-        assert_eq!(generator.parent(), keyed.parent(), "same commit-lock parent");
-        assert_eq!(candidate.parent(), keyed.parent(), "same commit-lock parent");
+        assert_ne!(
+            generator, keyed,
+            "the generator must not write the keyed db"
+        );
+        assert_ne!(
+            candidate, keyed,
+            "a cold candidate must not write the keyed db"
+        );
+        assert_ne!(
+            local, keyed,
+            "local-source registrations must not write the keyed db"
+        );
+        assert_ne!(
+            local, candidate,
+            "the local-source db is its own file, not the candidate's"
+        );
+        assert_eq!(
+            generator.parent(),
+            keyed.parent(),
+            "same commit-lock parent"
+        );
+        assert_eq!(
+            candidate.parent(),
+            keyed.parent(),
+            "same commit-lock parent"
+        );
         assert_eq!(local.parent(), keyed.parent(), "same commit-lock parent");
         // Distinct per run, so two generators (or two runs' local-source dbs)
         // cannot merge into one file (re #469 local-source-roster blocker fix).
@@ -8768,7 +9286,9 @@ chmod 755 '{}'
         assert_eq!(db, seed_db_path(lw).unwrap());
         let digest = crate::seed_digests::table_digest().unwrap();
         assert_eq!(digest.len(), 64, "a sha256 hex digest");
-        assert!(db.to_string_lossy().contains(digest.get(..16).unwrap_or("")));
+        assert!(db
+            .to_string_lossy()
+            .contains(digest.get(..16).unwrap_or("")));
         // The STORE is deliberately NOT keyed — content-addressed items are shared.
         assert_eq!(seed_store_dir(lw), shared_test_runner(lw).store);
     }
@@ -8788,7 +9308,11 @@ chmod 755 '{}'
 
         runner.setup().unwrap();
 
-        assert!(!stale.exists(), "{} must be swept by setup()", stale.display());
+        assert!(
+            !stale.exists(),
+            "{} must be swept by setup()",
+            stale.display()
+        );
         let _ = fs::remove_dir_all(&lw);
     }
 
@@ -8902,7 +9426,10 @@ chmod 755 '{}'
     #[test]
     fn clear_store_rejects_unsafe_targets() {
         // Real ladders (>=3 deep) pass.
-        assert!(reject_unsafe_clear_target(Path::new("/home/u/.td/build-daemon/ladder-shared-v1")).is_ok());
+        assert!(
+            reject_unsafe_clear_target(Path::new("/home/u/.td/build-daemon/ladder-shared-v1"))
+                .is_ok()
+        );
         assert!(reject_unsafe_clear_target(Path::new("/a/b/c")).is_ok());
         // Too shallow: root, a system dir, and a bare $HOME (`/home/user`, depth two) are refused.
         assert!(reject_unsafe_clear_target(Path::new("/")).is_err());
@@ -9141,7 +9668,11 @@ chmod 755 '{}'
                         && (r.local_source.as_deref().is_some_and(|l| {
                             let l = l.trim_start_matches("./");
                             l == "td-compositor" || l.starts_with("td-compositor/")
-                        }) || r.local_source_trees.iter().flatten().any(|s| s == "td-compositor"))
+                        }) || r
+                            .local_source_trees
+                            .iter()
+                            .flatten()
+                            .any(|s| s == "td-compositor"))
                 })
         };
         for (stem, recipe) in &all {
@@ -9183,8 +9714,14 @@ chmod 755 '{}'
         let text = serialize_check_verdict_memo("deadbeef");
         assert!(parse_check_verdict_memo(&text, "deadbeef"));
         assert!(!parse_check_verdict_memo(&text, "cafef00d"));
-        assert!(!parse_check_verdict_memo("fingerprint deadbeef\nverdict fail\n", "deadbeef"));
-        assert!(!parse_check_verdict_memo("fingerprint deadbeef\n", "deadbeef"));
+        assert!(!parse_check_verdict_memo(
+            "fingerprint deadbeef\nverdict fail\n",
+            "deadbeef"
+        ));
+        assert!(!parse_check_verdict_memo(
+            "fingerprint deadbeef\n",
+            "deadbeef"
+        ));
         assert!(!parse_check_verdict_memo("", "deadbeef"));
     }
 
@@ -9217,18 +9754,36 @@ chmod 755 '{}'
     fn gc_store_args_require_a_positive_window() {
         assert_eq!(
             gc_args(&["--unused-for", "14"]).unwrap(),
-            GcStoreArgs { unused_for_days: 14, dry_run: false }
+            GcStoreArgs {
+                unused_for_days: 14,
+                dry_run: false
+            }
         );
         assert_eq!(
             gc_args(&["--dry-run", "--unused-for", "1"]).unwrap(),
-            GcStoreArgs { unused_for_days: 1, dry_run: true }
+            GcStoreArgs {
+                unused_for_days: 1,
+                dry_run: true
+            }
         );
-        assert!(gc_args(&[]).unwrap_err().contains("--unused-for DAYS is required"));
-        assert!(gc_args(&["--unused-for"]).unwrap_err().contains("needs DAYS"));
-        assert!(gc_args(&["--unused-for", "0"]).unwrap_err().contains("clear-store"));
-        assert!(gc_args(&["--unused-for", "1.5"]).unwrap_err().contains("whole number"));
-        assert!(gc_args(&["--unused-for", "2", "--unused-for", "3"]).unwrap_err().contains("twice"));
-        assert!(gc_args(&["--unused-for", "2", "--force"]).unwrap_err().contains("unknown argument"));
+        assert!(gc_args(&[])
+            .unwrap_err()
+            .contains("--unused-for DAYS is required"));
+        assert!(gc_args(&["--unused-for"])
+            .unwrap_err()
+            .contains("needs DAYS"));
+        assert!(gc_args(&["--unused-for", "0"])
+            .unwrap_err()
+            .contains("clear-store"));
+        assert!(gc_args(&["--unused-for", "1.5"])
+            .unwrap_err()
+            .contains("whole number"));
+        assert!(gc_args(&["--unused-for", "2", "--unused-for", "3"])
+            .unwrap_err()
+            .contains("twice"));
+        assert!(gc_args(&["--unused-for", "2", "--force"])
+            .unwrap_err()
+            .contains("unknown argument"));
     }
 
     fn set_times(path: &Path, accessed: std::time::SystemTime, modified: std::time::SystemTime) {
@@ -9260,18 +9815,53 @@ chmod 755 '{}'
             fs::write(&p, text).unwrap();
             set_times(&p, atime, mtime);
         };
-        write("system-x86-64.aaaa.map", b"fingerprint aaaa\ngcc xxx-gcc\nglibc yyy-glibc\n", old, now);
-        write("td-sh-test.bbbb.map", b"fingerprint bbbb\ntd-sh zzz-td-sh\n", now, old);
-        write("system-x86-64.cccc.map", b"fingerprint cccc\ngcc old-gcc\n", old, old);
-        write("system-x86-64.dddd.map", b"fingerprint mismatch\ngcc lie-gcc\n", now, now);
+        write(
+            "system-x86-64.aaaa.map",
+            b"fingerprint aaaa\ngcc xxx-gcc\nglibc yyy-glibc\n",
+            old,
+            now,
+        );
+        write(
+            "td-sh-test.bbbb.map",
+            b"fingerprint bbbb\ntd-sh zzz-td-sh\n",
+            now,
+            old,
+        );
+        write(
+            "system-x86-64.cccc.map",
+            b"fingerprint cccc\ngcc old-gcc\n",
+            old,
+            old,
+        );
+        write(
+            "system-x86-64.dddd.map",
+            b"fingerprint mismatch\ngcc lie-gcc\n",
+            now,
+            now,
+        );
         // Fresh, but old enough that a plain read would refresh the atime (relatime
         // does once atime trails mtime or a day): the read fails on the bytes, and a
         // failed read must leave no more of a trace than a successful one.
         let recent = now - std::time::Duration::from_secs(2 * 86_400);
-        write("system-x86-64.eeee.map", b"fingerprint eeee\ngcc \xff\xfe-gcc\n", recent, recent);
-        write(".system-x86-64.ffff.run-1.tmp", b"fingerprint ffff\ngcc tmp-gcc\n", now, now);
+        write(
+            "system-x86-64.eeee.map",
+            b"fingerprint eeee\ngcc \xff\xfe-gcc\n",
+            recent,
+            recent,
+        );
+        write(
+            ".system-x86-64.ffff.run-1.tmp",
+            b"fingerprint ffff\ngcc tmp-gcc\n",
+            now,
+            now,
+        );
         write("noise.txt", b"gcc noise-gcc\n", now, now);
-        write("custom.map", b"fingerprint custom\ngcc custom-gcc\n", now, now);
+        write(
+            "custom.map",
+            b"fingerprint custom\ngcc custom-gcc\n",
+            now,
+            now,
+        );
         fs::create_dir_all(d.join("system-x86-64.gggg.map")).unwrap();
         let judged = [
             "system-x86-64.aaaa.map",
@@ -9279,15 +9869,35 @@ chmod 755 '{}'
             "system-x86-64.cccc.map",
             "system-x86-64.eeee.map",
         ];
-        let before: Vec<_> = judged.iter().map(|n| last_used(&d.join(n)).unwrap()).collect();
+        let before: Vec<_> = judged
+            .iter()
+            .map(|n| last_used(&d.join(n)).unwrap())
+            .collect();
         assert_eq!(
             fresh_build_run_memo_roots(&d, cutoff).unwrap(),
-            vec!["xxx-gcc".to_string(), "yyy-glibc".to_string(), "zzz-td-sh".to_string()]
+            vec![
+                "xxx-gcc".to_string(),
+                "yyy-glibc".to_string(),
+                "zzz-td-sh".to_string()
+            ]
         );
-        let after: Vec<_> = judged.iter().map(|n| last_used(&d.join(n)).unwrap()).collect();
-        assert_eq!(before, after, "judging and reading the memos was not a use of them");
-        assert_eq!(after.get(3), Some(&Some(recent)), "the unreadable memo's last use stands");
-        assert_eq!(fresh_build_run_memo_roots(&d.join("absent"), cutoff).unwrap(), Vec::<String>::new());
+        let after: Vec<_> = judged
+            .iter()
+            .map(|n| last_used(&d.join(n)).unwrap())
+            .collect();
+        assert_eq!(
+            before, after,
+            "judging and reading the memos was not a use of them"
+        );
+        assert_eq!(
+            after.get(3),
+            Some(&Some(recent)),
+            "the unreadable memo's last use stands"
+        );
+        assert_eq!(
+            fresh_build_run_memo_roots(&d.join("absent"), cutoff).unwrap(),
+            Vec::<String>::new()
+        );
         fs::remove_dir_all(&d).ok();
     }
 
@@ -9318,21 +9928,54 @@ chmod 755 '{}'
             set_times(&p, atime, mtime);
         }
         symlink(d.join("td-sh-test.1.stale.pass"), d.join("link.pass")).unwrap();
-        assert_eq!(reap_stale_records(&d, ".pass", cutoff, true).unwrap(), (3, 1));
-        assert!(d.join("td-sh-test.1.stale.pass").exists(), "dry run removes nothing");
+        assert_eq!(
+            reap_stale_records(&d, ".pass", cutoff, true).unwrap(),
+            (3, 1)
+        );
+        assert!(
+            d.join("td-sh-test.1.stale.pass").exists(),
+            "dry run removes nothing"
+        );
         assert!(d.join(".td-sh-test.1.stale.run-1.tmp").exists());
-        assert_eq!(reap_stale_records(&d, ".pass", cutoff, false).unwrap(), (3, 1));
+        assert_eq!(
+            reap_stale_records(&d, ".pass", cutoff, false).unwrap(),
+            (3, 1)
+        );
         assert!(d.join("td-sh-test.1.fresh.pass").exists());
-        assert!(d.join("td-sh-test.1.read.pass").exists(), "an atime is a use");
+        assert!(
+            d.join("td-sh-test.1.read.pass").exists(),
+            "an atime is a use"
+        );
         assert!(!d.join("td-sh-test.1.stale.pass").exists());
-        assert!(!d.join(".td-sh-test.1.stale.run-1.tmp").exists(), "a crashed run's temp goes");
-        assert!(d.join(".td-sh-test.1.fresh.run-2.tmp").exists(), "a fresh temp may be live");
-        assert!(d.join("README").exists() && d.join("other.map").exists(), "not this dir's memos");
-        assert!(d.join("notes.pass").exists(), "no key before the suffix: not a memo either");
+        assert!(
+            !d.join(".td-sh-test.1.stale.run-1.tmp").exists(),
+            "a crashed run's temp goes"
+        );
+        assert!(
+            d.join(".td-sh-test.1.fresh.run-2.tmp").exists(),
+            "a fresh temp may be live"
+        );
+        assert!(
+            d.join("README").exists() && d.join("other.map").exists(),
+            "not this dir's memos"
+        );
+        assert!(
+            d.join("notes.pass").exists(),
+            "no key before the suffix: not a memo either"
+        );
         assert!(d.join("subdir.pass").is_dir());
-        assert!(fs::symlink_metadata(d.join("link.pass")).is_ok(), "a symlink is not a memo");
-        assert_eq!(reap_stale_records(&d, ".pass", cutoff, false).unwrap(), (2, 0));
-        assert_eq!(reap_stale_records(&d.join("absent"), ".pass", cutoff, false).unwrap(), (0, 0));
+        assert!(
+            fs::symlink_metadata(d.join("link.pass")).is_ok(),
+            "a symlink is not a memo"
+        );
+        assert_eq!(
+            reap_stale_records(&d, ".pass", cutoff, false).unwrap(),
+            (2, 0)
+        );
+        assert_eq!(
+            reap_stale_records(&d.join("absent"), ".pass", cutoff, false).unwrap(),
+            (0, 0)
+        );
         fs::remove_dir_all(&d).ok();
     }
 
@@ -9343,16 +9986,24 @@ chmod 755 '{}'
         let lw = env::temp_dir().join(format!("td-verdict-stamp-{}", process::id()));
         let _ = fs::remove_dir_all(&lw);
         let runner = shared_test_runner(&lw);
-        runner.write_check_verdict_memo("td-sh-test", 1, "k1").unwrap();
+        runner
+            .write_check_verdict_memo("td-sh-test", 1, "k1")
+            .unwrap();
         let memo = runner.check_verdict_memo_path("td-sh-test", 1, "k1");
         let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         set_times(&memo, old, old);
         let mtime = |p: &Path| fs::symlink_metadata(p).unwrap().modified().unwrap();
-        assert!(!runner.check_verdict_memoized("td-sh-test", 1, "k2"), "another key: a miss");
+        assert!(
+            !runner.check_verdict_memoized("td-sh-test", 1, "k2"),
+            "another key: a miss"
+        );
         assert_eq!(mtime(&memo), old, "a miss is not a use");
         assert!(runner.check_verdict_memoized("td-sh-test", 1, "k1"));
         assert!(mtime(&memo) > old, "a hit stamps the memo it read");
-        assert_eq!(fs::read_to_string(&memo).unwrap(), serialize_check_verdict_memo("k1"));
+        assert_eq!(
+            fs::read_to_string(&memo).unwrap(),
+            serialize_check_verdict_memo("k1")
+        );
         let _ = fs::remove_dir_all(&lw);
     }
 
@@ -9498,7 +10149,11 @@ chmod 755 '{}'
             // test thread holds our write fd until it execs, and the code under
             // test execs this script. Prove it runs before handing it over.
             for _ in 0..400 {
-                match Command::new(&p).arg("--td-fixture-probe").stdin(Stdio::null()).output() {
+                match Command::new(&p)
+                    .arg("--td-fixture-probe")
+                    .stdin(Stdio::null())
+                    .output()
+                {
                     Err(e) if e.raw_os_error() == Some(26) => {
                         std::thread::sleep(std::time::Duration::from_millis(5))
                     }
@@ -9525,7 +10180,10 @@ chmod 755 '{}'
         ] {
             let p = script(name, body);
             let err = builder_engine_fingerprint(&p).unwrap_err();
-            assert!(err.contains("reports no engine fingerprint"), "{name}: {err}");
+            assert!(
+                err.contains("reports no engine fingerprint"),
+                "{name}: {err}"
+            );
         }
         assert!(builder_engine_fingerprint(&tmp.join("absent")).is_err());
         let _ = fs::remove_dir_all(&tmp);
@@ -9570,9 +10228,15 @@ chmod 755 '{}'
             staged,
             vec![tdstore.join("aaa-system"), tdstore.join("bbb-linux")]
         );
-        assert!(mtime(&memo) > long_ago, "a hit stamps the memo it staged from");
+        assert!(
+            mtime(&memo) > long_ago,
+            "a hit stamps the memo it staged from"
+        );
         set_times(&memo, long_ago, long_ago);
-        assert_eq!(fs::read(tdstore.join("aaa-system").join("file")).unwrap(), b"SYS");
+        assert_eq!(
+            fs::read(tdstore.join("aaa-system").join("file")).unwrap(),
+            b"SYS"
+        );
         fs::write(tdstore.join("aaa-system").join("file"), b"TAMPERED").unwrap();
         assert_eq!(
             fs::read(cache_store.join("aaa-system").join("file")).unwrap(),
@@ -9597,7 +10261,11 @@ chmod 755 '{}'
             .reuse_build_run("system-x86-64", "fp1", &["linux-x86-64"])
             .unwrap()
             .is_none());
-        assert_eq!(mtime(&memo), long_ago, "an evicted tree is a miss, not a use");
+        assert_eq!(
+            mtime(&memo),
+            long_ago,
+            "an evicted tree is a miss, not a use"
+        );
         // MISS: a non-directory squats the recorded basename (corruption) — a bare
         // `exists()` would accept it; the real-dir gate rejects it and rebuilds.
         fs::write(cache_store.join("bbb-linux"), b"not-a-dir").unwrap();
@@ -9631,9 +10299,15 @@ chmod 755 '{}'
         let mut steps = BTreeMap::new();
         steps.insert("system-x86-64".to_string(), "aaa-system".to_string());
 
-        runner.write_build_run_memo("system-x86-64", "aaa", &steps).unwrap();
-        runner.write_build_run_memo("system-x86-64", "bbb", &steps).unwrap();
-        runner.write_build_run_memo("busybox-x86-64", "ccc", &steps).unwrap();
+        runner
+            .write_build_run_memo("system-x86-64", "aaa", &steps)
+            .unwrap();
+        runner
+            .write_build_run_memo("system-x86-64", "bbb", &steps)
+            .unwrap();
+        runner
+            .write_build_run_memo("busybox-x86-64", "ccc", &steps)
+            .unwrap();
 
         assert!(
             dir.join("system-x86-64.aaa.map").exists(),
@@ -9663,7 +10337,9 @@ chmod 755 '{}'
                 scope.spawn(move || {
                     let mut steps = BTreeMap::new();
                     steps.insert("system-x86-64".to_string(), format!("out-{fp}"));
-                    runner.write_build_run_memo("system-x86-64", fp, &steps).unwrap();
+                    runner
+                        .write_build_run_memo("system-x86-64", fp, &steps)
+                        .unwrap();
                 });
             }
         });
@@ -9676,7 +10352,10 @@ chmod 755 '{}'
             let text = fs::read_to_string(&map).unwrap();
             let parsed = parse_build_run_memo(&text, fp)
                 .unwrap_or_else(|| panic!("{fp}: memo does not read back for its fingerprint"));
-            assert_eq!(parsed.get("system-x86-64").map(String::as_str), Some(&*format!("out-{fp}")));
+            assert_eq!(
+                parsed.get("system-x86-64").map(String::as_str),
+                Some(&*format!("out-{fp}"))
+            );
         }
         let _ = fs::remove_dir_all(&lw);
     }

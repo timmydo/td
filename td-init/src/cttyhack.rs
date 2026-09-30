@@ -66,7 +66,11 @@ fn stdin_precondition(is_terminal: bool) -> Result<(), String> {
 /// `/dev/tty` opens only for a process that HAS a controlling terminal, so this
 /// is the test itself, not an approximation of one.
 fn has_controlling_tty() -> bool {
-    OpenOptions::new().read(true).write(true).open(DEV_TTY).is_ok()
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEV_TTY)
+        .is_ok()
 }
 
 /// The console device to claim. The kernel lists every registered console in
@@ -275,7 +279,10 @@ mod tests {
     fn the_stdin_mode_refuses_a_descriptor_that_is_not_a_terminal() {
         assert!(stdin_precondition(true).is_ok());
         let error = stdin_precondition(false).unwrap_err();
-        assert!(error.contains("descriptor zero is not a terminal"), "{error}");
+        assert!(
+            error.contains("descriptor zero is not a terminal"),
+            "{error}"
+        );
     }
 
     /// There is no outcome that takes a terminal from whoever holds it. EPERM

@@ -88,7 +88,10 @@ fn main() -> std::process::ExitCode {
     }
 
     if !errors.is_empty() {
-        eprintln!("gen_expectations: {} case(s) could not be run:", errors.len());
+        eprintln!(
+            "gen_expectations: {} case(s) could not be run:",
+            errors.len()
+        );
         for e in &errors {
             eprintln!("  {e}");
         }

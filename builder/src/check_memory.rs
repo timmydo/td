@@ -15,7 +15,9 @@ use std::time::Duration;
 /// job budget is divided over. Engine-side, since a build's hosted job count
 /// is one caller (see `engine_set`); the gate runner is the other.
 pub(crate) fn nproc() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 pub const GIB: u64 = 1024 * 1024 * 1024;

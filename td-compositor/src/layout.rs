@@ -643,10 +643,7 @@ impl Workspace {
                 next = Node::Split {
                     axis: FIRST_SPLIT,
                     children: vec![next, Node::Leaf(key)],
-                    presentation: std::mem::replace(
-                        &mut self.presentation,
-                        Presentation::Split,
-                    ),
+                    presentation: std::mem::replace(&mut self.presentation, Presentation::Split),
                 };
             } else {
                 self.root = Some(unchanged);
@@ -1142,8 +1139,8 @@ impl Layout {
                 .is_some_and(|root| root.contains(parent))
                 .then_some(*number)
         });
-        let Some(parent_workspace) = tiled_parent_workspace
-            .or_else(|| self.homes.get(&parent).copied())
+        let Some(parent_workspace) =
+            tiled_parent_workspace.or_else(|| self.homes.get(&parent).copied())
         else {
             return false;
         };
@@ -1162,7 +1159,9 @@ impl Layout {
             }
         }
         if tiled_parent_workspace.is_some() {
-            changed |= self.workspace_mut(parent_workspace).place_after(key, parent);
+            changed |= self
+                .workspace_mut(parent_workspace)
+                .place_after(key, parent);
         } else if child_workspace != Some(parent_workspace) {
             self.workspace_mut(parent_workspace).map(key);
             changed = true;
@@ -3185,10 +3184,7 @@ mod tests {
         layout.apply(Command::SwitchWorkspace(1));
 
         assert_eq!(layout.workspace_bar([key(2)]), (vec![1, 2], Some(3)));
-        assert_eq!(
-            layout.workspace_bar(std::iter::empty()),
-            (vec![1], Some(2))
-        );
+        assert_eq!(layout.workspace_bar(std::iter::empty()), (vec![1], Some(2)));
         layout.check_invariants().unwrap();
     }
 

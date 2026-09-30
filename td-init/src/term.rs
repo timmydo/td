@@ -196,11 +196,7 @@ pub fn configure(fd: RawFd, speed: u32, local: bool) -> Result<Speed, String> {
 }
 
 /// `before` with exactly the named bits and control bytes applied.
-fn patched(
-    before: &[u8; sys::TERMIOS_LEN],
-    speed: u32,
-    local: bool,
-) -> [u8; sys::TERMIOS_LEN] {
+fn patched(before: &[u8; sys::TERMIOS_LEN], speed: u32, local: bool) -> [u8; sys::TERMIOS_LEN] {
     let mut out = *before;
     // CLOCAL is CLEARED before `-L` may set it, so every bit this patch names
     // ends up deterministic. Leaving it to be inherited would make the one flag
@@ -324,7 +320,10 @@ mod tests {
     fn the_termios_layout_is_pinned() {
         assert_eq!((IFLAG_AT, OFLAG_AT, CFLAG_AT, LFLAG_AT), (0, 4, 8, 12));
         assert_eq!(CC_AT, 17);
-        assert_eq!((VINTR, VERASE, VKILL, VEOF, VTIME, VMIN), (0, 2, 3, 4, 5, 6));
+        assert_eq!(
+            (VINTR, VERASE, VKILL, VEOF, VTIME, VMIN),
+            (0, 2, 3, 4, 5, 6)
+        );
         assert_eq!(sys::TERMIOS_LEN, 36);
     }
 
@@ -364,10 +363,17 @@ mod tests {
         raw[CC_AT + VMIN] = 0;
         let out = patched(&raw, 0x1002, true);
         let lflag = read_u32(&out, LFLAG_AT);
-        assert_eq!(lflag & (ISIG | ICANON | ECHO | ECHOE), ISIG | ICANON | ECHO | ECHOE);
+        assert_eq!(
+            lflag & (ISIG | ICANON | ECHO | ECHOE),
+            ISIG | ICANON | ECHO | ECHOE
+        );
         assert_eq!(read_u32(&out, OFLAG_AT) & (OPOST | ONLCR), OPOST | ONLCR);
         assert_eq!(read_u32(&out, IFLAG_AT) & ICRNL, ICRNL);
-        assert_eq!(read_u32(&out, IFLAG_AT) & IGNCR, 0, "IGNCR would discard Enter");
+        assert_eq!(
+            read_u32(&out, IFLAG_AT) & IGNCR,
+            0,
+            "IGNCR would discard Enter"
+        );
         assert_eq!(out[CC_AT + VMIN], 1);
     }
 
@@ -381,9 +387,17 @@ mod tests {
         write_u32(&mut before, CFLAG_AT, 0xd | PARENB | CSTOPB);
         let out = patched(&before, 0x1002, false);
         let cflag = read_u32(&out, CFLAG_AT);
-        assert_eq!(cflag & CBAUD, 0x1002, "the speed did not replace the old one");
+        assert_eq!(
+            cflag & CBAUD,
+            0x1002,
+            "the speed did not replace the old one"
+        );
         assert_eq!(cflag & CSIZE, CS8);
-        assert_eq!(cflag & (PARENB | CSTOPB), 0, "8N1 means parity and stop bits off");
+        assert_eq!(
+            cflag & (PARENB | CSTOPB),
+            0,
+            "8N1 means parity and stop bits off"
+        );
         assert_eq!(cflag & CREAD, CREAD);
         assert_eq!(cflag & CLOCAL, 0, "CLOCAL is -L's, and -L was not given");
     }
@@ -401,8 +415,16 @@ mod tests {
         write_u32(&mut before, IFLAG_AT, ISTRIP | INLCR | IUCLC);
         write_u32(&mut before, OFLAG_AT, OCRNL | ONLRET | OLCUC);
         let out = patched(&before, 0x1002, true);
-        assert_eq!(read_u32(&out, CFLAG_AT) & CRTSCTS, 0, "flow control would hang login");
-        assert_eq!(read_u32(&out, LFLAG_AT) & EXTPROC, 0, "ICANON would read on and do nothing");
+        assert_eq!(
+            read_u32(&out, CFLAG_AT) & CRTSCTS,
+            0,
+            "flow control would hang login"
+        );
+        assert_eq!(
+            read_u32(&out, LFLAG_AT) & EXTPROC,
+            0,
+            "ICANON would read on and do nothing"
+        );
         assert_eq!(read_u32(&out, IFLAG_AT) & (ISTRIP | INLCR | IUCLC), 0);
         assert_eq!(read_u32(&out, OFLAG_AT) & (OCRNL | ONLRET | OLCUC), 0);
         // ...and the bits it does set are still set alongside.
@@ -420,7 +442,11 @@ mod tests {
         let mut before = [0u8; sys::TERMIOS_LEN];
         write_u32(&mut before, CFLAG_AT, 0xd | (0xd << 16));
         let out = patched(&before, 0x1002, true);
-        assert_eq!(read_u32(&out, CFLAG_AT) & CIBAUD, 0, "input speed must follow output");
+        assert_eq!(
+            read_u32(&out, CFLAG_AT) & CIBAUD,
+            0,
+            "input speed must follow output"
+        );
         assert_eq!(read_u32(&out, CFLAG_AT) & CBAUD, 0x1002);
     }
 
@@ -432,8 +458,14 @@ mod tests {
     fn a_stale_clocal_does_not_survive_an_omitted_dash_l() {
         let mut before = [0u8; sys::TERMIOS_LEN];
         write_u32(&mut before, CFLAG_AT, CLOCAL);
-        assert_eq!(read_u32(&patched(&before, 0xd, false), CFLAG_AT) & CLOCAL, 0);
-        assert_eq!(read_u32(&patched(&before, 0xd, true), CFLAG_AT) & CLOCAL, CLOCAL);
+        assert_eq!(
+            read_u32(&patched(&before, 0xd, false), CFLAG_AT) & CLOCAL,
+            0
+        );
+        assert_eq!(
+            read_u32(&patched(&before, 0xd, true), CFLAG_AT) & CLOCAL,
+            CLOCAL
+        );
     }
 
     /// `-L` is the only thing that sets CLOCAL, and it sets nothing else.
@@ -442,7 +474,10 @@ mod tests {
         let before = [0u8; sys::TERMIOS_LEN];
         let with = patched(&before, 0xd, true);
         let without = patched(&before, 0xd, false);
-        assert_eq!(read_u32(&with, CFLAG_AT) ^ read_u32(&without, CFLAG_AT), CLOCAL);
+        assert_eq!(
+            read_u32(&with, CFLAG_AT) ^ read_u32(&without, CFLAG_AT),
+            CLOCAL
+        );
         for at in [IFLAG_AT, OFLAG_AT, LFLAG_AT] {
             assert_eq!(read_u32(&with, at), read_u32(&without, at));
         }
@@ -491,11 +526,18 @@ mod tests {
         let mut declined_both = want_both;
         let kept_both = (read_u32(&want_both, CFLAG_AT) & !(CBAUD | CIBAUD)) | 0xf | (0xd << 16);
         write_u32(&mut declined_both, CFLAG_AT, kept_both);
-        assert_eq!(verify(&both, &want_both, &declined_both), Ok(Speed::Ignored));
+        assert_eq!(
+            verify(&both, &want_both, &declined_both),
+            Ok(Speed::Ignored)
+        );
 
         // A THIRD speed is nobody's request and is refused.
         let mut altered = want;
-        write_u32(&mut altered, CFLAG_AT, (read_u32(&want, CFLAG_AT) & !CBAUD) | 0xd);
+        write_u32(
+            &mut altered,
+            CFLAG_AT,
+            (read_u32(&want, CFLAG_AT) & !CBAUD) | 0xd,
+        );
         assert!(verify(&before, &want, &altered).is_err());
     }
 

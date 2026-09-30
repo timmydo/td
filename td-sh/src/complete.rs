@@ -59,7 +59,10 @@ pub struct Completion {
 /// plus the operator characters a command word cannot contain — so `echo a|gr`
 /// completes `gr` as a COMMAND, which is what it is.
 fn breaks(c: char) -> bool {
-    matches!(c, ' ' | '\t' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '\n')
+    matches!(
+        c,
+        ' ' | '\t' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '\n'
+    )
 }
 
 /// The word under the cursor: back to the nearest unescaped break. A `\ ` is
@@ -170,7 +173,10 @@ fn is_redirection(word: &str) -> bool {
 /// `case` take a name or a word list, and `fi`/`done`/`esac` end a command
 /// rather than introduce one.
 fn introduces_command(word: &str) -> bool {
-    matches!(word, "!" | "{" | "do" | "elif" | "else" | "if" | "then" | "until" | "while")
+    matches!(
+        word,
+        "!" | "{" | "do" | "elif" | "else" | "if" | "then" | "until" | "while"
+    )
 }
 
 /// Whether `pos` sits inside an unclosed quote. Completion DECLINES there:
@@ -249,7 +255,10 @@ fn escape(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
         if breaks(c)
-            || matches!(c, '\\' | '\'' | '"' | '#' | '$' | '~' | '`' | '?' | '*' | '[' | '{')
+            || matches!(
+                c,
+                '\\' | '\'' | '"' | '#' | '$' | '~' | '`' | '?' | '*' | '[' | '{'
+            )
         {
             out.push('\\');
         }
@@ -321,7 +330,10 @@ pub fn complete(buf: &str, pos: usize, src: &Source<'_>) -> Option<Completion> {
         // word this shell reads, and escaping it again would turn a `~/` the
         // shell expands into a `\~/` it does not.
         let (dir_raw, leaf_raw) = match word.rfind('/') {
-            Some(i) => (word.get(..i + 1).unwrap_or(""), word.get(i + 1..).unwrap_or("")),
+            Some(i) => (
+                word.get(..i + 1).unwrap_or(""),
+                word.get(i + 1..).unwrap_or(""),
+            ),
             None => ("", word),
         };
         let dir = unescape(dir_raw);
@@ -351,7 +363,12 @@ pub fn complete(buf: &str, pos: usize, src: &Source<'_>) -> Option<Completion> {
     if unique {
         insert.push(if is_dir { '/' } else { ' ' });
     }
-    Some(Completion { start, end: pos, insert, matches: names })
+    Some(Completion {
+        start,
+        end: pos,
+        insert,
+        matches: names,
+    })
 }
 
 /// Lay the matches out for what a second Tab prints, as ash's `showfiles`
@@ -505,13 +522,19 @@ mod tests {
     fn src<'a>(
         cmds: &'a [&'a str],
         files: &'a [(&'a str, &'a str, bool)],
-    ) -> (impl Fn(&str) -> Vec<String> + 'a, impl Fn(&str, &str) -> Entries + 'a) {
+    ) -> (
+        impl Fn(&str) -> Vec<String> + 'a,
+        impl Fn(&str, &str) -> Entries + 'a,
+    ) {
         // Both FILTER by the prefix rather than ignoring it, even though the
         // policy filters again: a policy that asked for the wrong prefix --
         // the whole word where the leaf was due -- gets nothing back here
         // instead of an answer that quietly agrees.
         let c = move |p: &str| {
-            cmds.iter().filter(|s| s.starts_with(p)).map(|s| (*s).to_string()).collect()
+            cmds.iter()
+                .filter(|s| s.starts_with(p))
+                .map(|s| (*s).to_string())
+                .collect()
         };
         let e = move |dir: &str, p: &str| {
             let mut out = Vec::new();
@@ -527,7 +550,14 @@ mod tests {
 
     fn run(buf: &str, cmds: &[&str], files: &[(&str, &str, bool)]) -> Option<Completion> {
         let (c, e) = src(cmds, files);
-        complete(buf, buf.len(), &Source { commands: &c, entries: &e })
+        complete(
+            buf,
+            buf.len(),
+            &Source {
+                commands: &c,
+                entries: &e,
+            },
+        )
     }
 
     /// The first word of a command completes against the command names and the
@@ -555,8 +585,11 @@ mod tests {
     /// rather than replaced.
     #[test]
     fn a_directory_completes_into_itself() {
-        let files =
-            [("", "src", true), ("src/", "line.rs", false), ("src/", "lineedit.rs", false)];
+        let files = [
+            ("", "src", true),
+            ("src/", "line.rs", false),
+            ("src/", "lineedit.rs", false),
+        ];
         assert_eq!(run("cat sr", &[], &files).unwrap().insert, "src/");
         let got = run("cat src/l", &[], &files).unwrap();
         assert_eq!(got.matches, ["line.rs", "lineedit.rs"]);
@@ -569,8 +602,14 @@ mod tests {
     #[test]
     fn nothing_to_complete_is_none() {
         assert!(run("", &["echo"], &[]).is_none());
-        assert!(run("echo ", &["echo"], &[]).is_none(), "no entries: still nothing");
-        assert!(run("zz", &["echo"], &[]).is_none(), "no match is not a completion");
+        assert!(
+            run("echo ", &["echo"], &[]).is_none(),
+            "no entries: still nothing"
+        );
+        assert!(
+            run("zz", &["echo"], &[]).is_none(),
+            "no match is not a completion"
+        );
         // ...but an empty word PAST the command completes the directory, which
         // is the useful half of the same case.
         let got = run("cat ", &[], &[("", "a", false), ("", "b", false)]).unwrap();
@@ -618,21 +657,34 @@ mod tests {
     /// re-reads is two.
     #[test]
     fn dotfiles_are_offered_and_spaces_come_back_escaped() {
-        let files = [("", ".bashrc", false), ("", "bin", true), ("", "my file", false)];
-        assert_eq!(run("cat ", &[], &files).unwrap().matches, [".bashrc", "bin", "my file"]);
+        let files = [
+            ("", ".bashrc", false),
+            ("", "bin", true),
+            ("", "my file", false),
+        ];
+        assert_eq!(
+            run("cat ", &[], &files).unwrap().matches,
+            [".bashrc", "bin", "my file"]
+        );
         assert_eq!(run("cat .", &[], &files).unwrap().insert, ".bashrc ");
         assert_eq!(run("cat my", &[], &files).unwrap().insert, "my\\ file ");
         // ...and the escaped form is still the same word on the way back in,
         // so a second Tab does not complete `file` on its own.
         let got = run("cat my\\ fil", &[], &files).unwrap();
         assert_eq!(got.matches, ["my file"]);
-        assert_eq!(got.start, 4, "the word starts at `my`, not after the escape");
+        assert_eq!(
+            got.start, 4,
+            "the word starts at `my`, not after the escape"
+        );
         // The directory prefix is the operator's own text, put back verbatim
         // rather than re-escaped: a `~/` the shell expands must not come back
         // as a `\~/` it does not.
         let nested = [("~/", "notes", false), ("my dir/", "f", false)];
         assert_eq!(run("cat ~/no", &[], &nested).unwrap().insert, "~/notes ");
-        assert_eq!(run("cat my\\ dir/", &[], &nested).unwrap().insert, "my\\ dir/f ");
+        assert_eq!(
+            run("cat my\\ dir/", &[], &nested).unwrap().insert,
+            "my\\ dir/f "
+        );
     }
 
     /// A word with a `/` is a pathname even in command position, and command
@@ -668,7 +720,10 @@ mod tests {
         // already a boundary, so a byte-wise answer passes; `日本`/`日暮`
         // share FOUR -- all of `日` plus the first byte of the next character
         // -- and that is what a byte-wise answer cuts in half.
-        assert_eq!(common_prefix(&["日本".to_string(), "日暮".to_string()]), "日");
+        assert_eq!(
+            common_prefix(&["日本".to_string(), "日暮".to_string()]),
+            "日"
+        );
         assert_eq!(common_prefix(&["ab".to_string(), "abc".to_string()]), "ab");
         assert_eq!(common_prefix(&["ab".to_string(), "cd".to_string()]), "");
         assert_eq!(common_prefix(&[]), "");
@@ -681,8 +736,10 @@ mod tests {
     /// rather than a division by zero.
     #[test]
     fn the_listing_fills_columns_downwards() {
-        let names: Vec<String> =
-            ["a", "bb", "ccc", "d", "e"].iter().map(|s| (*s).to_string()).collect();
+        let names: Vec<String> = ["a", "bb", "ccc", "d", "e"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         // Column width is 3+2 = 5, so 20 columns hold four of them; five names
         // over four columns is two rows, filled down.
         assert_eq!(listing(&names, 20), "a    ccc  e\nbb   d\n");
@@ -694,7 +751,10 @@ mod tests {
         // A double-width name is two COLUMNS wide, not one character -- and
         // the OTHER name has to be the wider one, or the padding is `colw - w`
         // with the same `w` on both sides and the measurement cancels out.
-        assert_eq!(listing(&["日".to_string(), "xxxx".to_string()], 80), "日    xxxx\n");
+        assert_eq!(
+            listing(&["日".to_string(), "xxxx".to_string()], 80),
+            "日    xxxx\n"
+        );
     }
 
     /// The impure half: what the shell actually offers. Checked against a real
@@ -709,7 +769,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let f = std::fs::File::open(base.join("runme")).unwrap();
-            f.set_permissions(std::fs::Permissions::from_mode(0o755)).unwrap();
+            f.set_permissions(std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         }
         let dir = base.to_string_lossy().into_owned();
         let mut sh = crate::exec::Shell::new();
@@ -731,9 +792,18 @@ mod tests {
         sh.set_var("PATH", &dir).unwrap();
         sh.aliases.insert("myalias".to_string(), "echo".to_string());
         let cmds = commands(&sh, "");
-        assert!(cmds.contains(&"runme".to_string()), "an executable on PATH is a command");
-        assert!(!cmds.contains(&"plain".to_string()), "a file nothing can run is not");
-        assert!(!cmds.contains(&"sub".to_string()), "a directory on PATH is not");
+        assert!(
+            cmds.contains(&"runme".to_string()),
+            "an executable on PATH is a command"
+        );
+        assert!(
+            !cmds.contains(&"plain".to_string()),
+            "a file nothing can run is not"
+        );
+        assert!(
+            !cmds.contains(&"sub".to_string()),
+            "a directory on PATH is not"
+        );
         assert!(cmds.contains(&"myalias".to_string()), "an alias is");
         assert!(cmds.contains(&"umask".to_string()), "and every builtin is");
         assert_eq!(commands(&sh, "myal"), ["myalias"], "and the prefix narrows");
@@ -757,14 +827,21 @@ mod tests {
         // `~/` reaches HOME on `tilde_split`'s rule, so `~/<Tab>` is not a
         // failed `read_dir` -- which would be a literal tab drawn as a space,
         // nothing the operator can see went wrong.
-        sh.set_var("HOME", &base.join("here").to_string_lossy()).unwrap();
-        assert_eq!(entries(&sh, "~/", ""), [("moved-marker".to_string(), false)]);
+        sh.set_var("HOME", &base.join("here").to_string_lossy())
+            .unwrap();
+        assert_eq!(
+            entries(&sh, "~/", ""),
+            [("moved-marker".to_string(), false)]
+        );
         assert_eq!(entries(&sh, "~", ""), [("moved-marker".to_string(), false)]);
         // `~user` is NOT expanded, as `tilde_split` does not expand it either.
         assert!(entries(&sh, "~nobody/", "").is_empty());
         // And an empty `PATH` element, which means the same directory.
         sh.set_var("PATH", "").unwrap();
-        assert!(!commands(&sh, "moved").contains(&"moved-marker".to_string()), "not executable");
+        assert!(
+            !commands(&sh, "moved").contains(&"moved-marker".to_string()),
+            "not executable"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -774,7 +851,11 @@ mod tests {
     /// an escape sequence the terminal obeys.
     #[test]
     fn a_control_character_in_a_name_is_never_offered() {
-        let files = [("", "safe.txt", false), ("", "ev\u{1b}[2Jil", false), ("", "nl\nname", false)];
+        let files = [
+            ("", "safe.txt", false),
+            ("", "ev\u{1b}[2Jil", false),
+            ("", "nl\nname", false),
+        ];
         let got = run("cat ", &[], &files).unwrap();
         assert_eq!(got.matches, ["safe.txt"]);
         // ...and it is not offered as a command either.
@@ -794,7 +875,11 @@ mod tests {
         // A CLOSED quote is not inside one, so the word after it completes.
         assert_eq!(run("cat 'x' ba", &[], &files).unwrap().insert, "bar ");
         // An escaped quote opens nothing.
-        assert_eq!(run("cat \\'ba", &[], &files), None, "the word is `'ba`, which matches none");
+        assert_eq!(
+            run("cat \\'ba", &[], &files),
+            None,
+            "the word is `'ba`, which matches none"
+        );
         assert_eq!(run("echo \\' ba", &[], &files).unwrap().insert, "bar ");
         // A backslash inside `'…'` is an ordinary character, so the quote that
         // follows it still CLOSES.
@@ -822,12 +907,20 @@ mod tests {
             "! ec",
             "A=1 >out ec",
         ] {
-            assert_eq!(run(line, &cmds, &files).unwrap().matches, ["echo"], "{line}");
+            assert_eq!(
+                run(line, &cmds, &files).unwrap().matches,
+                ["echo"],
+                "{line}"
+            );
         }
         // ...and does NOT follow a bare operator, an ordinary word, or a
         // reserved word that is itself an argument.
         for line in ["x > ec", "x >> ec", "x ec", "echo then ec", "for ec"] {
-            assert_eq!(run(line, &cmds, &files).unwrap().matches, ["ec.txt"], "{line}");
+            assert_eq!(
+                run(line, &cmds, &files).unwrap().matches,
+                ["ec.txt"],
+                "{line}"
+            );
         }
     }
 }

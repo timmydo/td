@@ -1,8 +1,7 @@
 use crate::{
     authority::{
-        self, decode_mountinfo_path, mount_identity_for_path, path_is_same_or_child,
-        paths_overlap, FilesystemGrant, FilesystemSourceKind, LaunchPlan, ResolvedFile,
-        ResolvedResourceLimits,
+        self, decode_mountinfo_path, mount_identity_for_path, path_is_same_or_child, paths_overlap,
+        FilesystemGrant, FilesystemSourceKind, LaunchPlan, ResolvedFile, ResolvedResourceLimits,
     },
     cgroup, firefox, seccomp, sys,
 };
@@ -25,8 +24,7 @@ pub const PROCESS_TOKEN_PROBE_ARG: &str = "--probe-process-token";
 pub const FIREFOX_SUPPORT_PROBE_ARG: &str = "--probe-firefox-support";
 pub const FIREFOX_NETWORK_PROBE_ARG: &str = "--probe-firefox-network";
 pub const FIREFOX_SOAK_PROBE_ARG: &str = "--probe-firefox-soak";
-pub const FIREFOX_SECCOMP_AUDIT_PROBE_ARG: &str =
-    "--probe-firefox-seccomp-audit";
+pub const FIREFOX_SECCOMP_AUDIT_PROBE_ARG: &str = "--probe-firefox-seccomp-audit";
 pub const FIREFOX_INPUT_PROBE_ARG: &str = "--probe-firefox-input";
 pub const FIREFOX_DOWNLOAD_PROBE_ARG: &str = "--probe-firefox-download";
 const FILTER_ARG: &str = "--internal-write-seccomp-filter";
@@ -40,10 +38,8 @@ const STAGE2_LAUNCH_ARG: &str = "--launch";
 const STAGE2_RESOLV_CONF_ARG: &str = "--resolv-conf";
 const STAGE2_MACHINE_ID_ARG: &str = "--machine-id";
 const STAGE2_TIMEZONE_ARG: &str = "--timezone";
-const STAGE2_FIREFOX_AUTOTEST_POLICY_ARG: &str =
-    "--firefox-autotest-policy";
-const STAGE2_FIREFOX_SECCOMP_PROBE_ARG: &str =
-    "--firefox-seccomp-probe";
+const STAGE2_FIREFOX_AUTOTEST_POLICY_ARG: &str = "--firefox-autotest-policy";
+const STAGE2_FIREFOX_SECCOMP_PROBE_ARG: &str = "--firefox-seccomp-probe";
 const STAGE2_FETCH_SOCKET_ARG: &str = "--fetch-socket";
 const STAGE2_LOADER_LIBRARY_PATH_ARG: &str = "--loader-library-path";
 const STAGE2_RUNTIME_ALIASES_ARG: &str = "--runtime-aliases";
@@ -689,9 +685,7 @@ where
             return Err(usage_error());
         }
         cgroup::validate_expected_membership(&cgroup_membership)?;
-        return Ok(Stage2Action::KillHold {
-            cgroup_membership,
-        });
+        return Ok(Stage2Action::KillHold { cgroup_membership });
     }
     if action == STAGE2_LAUNCH_ARG {
         let entry = args
@@ -727,28 +721,22 @@ where
             Ok(value) if authority::valid_timezone_name(&value) => Some(value),
             _ => return Err(usage_error()),
         };
-        if args.next().as_deref()
-            != Some(STAGE2_FIREFOX_AUTOTEST_POLICY_ARG.as_ref())
-        {
+        if args.next().as_deref() != Some(STAGE2_FIREFOX_AUTOTEST_POLICY_ARG.as_ref()) {
             return Err(usage_error());
         }
-        let firefox_autotest_policy =
-            match args.next().as_deref().and_then(OsStr::to_str) {
-                Some("present") => true,
-                Some("absent") => false,
-                _ => return Err(usage_error()),
-            };
-        if args.next().as_deref()
-            != Some(STAGE2_FIREFOX_SECCOMP_PROBE_ARG.as_ref())
-        {
+        let firefox_autotest_policy = match args.next().as_deref().and_then(OsStr::to_str) {
+            Some("present") => true,
+            Some("absent") => false,
+            _ => return Err(usage_error()),
+        };
+        if args.next().as_deref() != Some(STAGE2_FIREFOX_SECCOMP_PROBE_ARG.as_ref()) {
             return Err(usage_error());
         }
-        let firefox_seccomp_probe =
-            match args.next().as_deref().and_then(OsStr::to_str) {
-                Some("present") => true,
-                Some("absent") => false,
-                _ => return Err(usage_error()),
-            };
+        let firefox_seccomp_probe = match args.next().as_deref().and_then(OsStr::to_str) {
+            Some("present") => true,
+            Some("absent") => false,
+            _ => return Err(usage_error()),
+        };
         if args.next().as_deref() != Some(STAGE2_FETCH_SOCKET_ARG.as_ref()) {
             return Err(usage_error());
         }
@@ -1410,7 +1398,10 @@ fn create_dir(path: &str, mode: u32) -> io::Result<()> {
     fs::create_dir(path)
         .map_err(|error| io::Error::new(error.kind(), format!("create {path}: {error}")))?;
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| {
-        io::Error::new(error.kind(), format!("set mode {mode:#o} on {path}: {error}"))
+        io::Error::new(
+            error.kind(),
+            format!("set mode {mode:#o} on {path}: {error}"),
+        )
     })
 }
 
@@ -1888,9 +1879,7 @@ nobody:x:65534:\n",
 }
 
 fn hosts(hostname: &str) -> String {
-    format!(
-        "127.0.0.1 localhost {hostname}\n::1 localhost ip6-localhost ip6-loopback {hostname}\n"
-    )
+    format!("127.0.0.1 localhost {hostname}\n::1 localhost ip6-localhost ip6-loopback {hostname}\n")
 }
 
 fn require_resolved_file_identity(file: &ResolvedFile, label: &str) -> io::Result<()> {
@@ -1990,11 +1979,7 @@ fn mount_resolved_file(file: &ResolvedFile, target: &Path, label: &str) -> io::R
     )
 }
 
-fn mount_resolved_executable(
-    file: &ResolvedFile,
-    target: &Path,
-    label: &str,
-) -> io::Result<()> {
+fn mount_resolved_executable(file: &ResolvedFile, target: &Path, label: &str) -> io::Result<()> {
     require_resolved_file_identity(file, label)?;
     create_file(target, b"", 0o555)?;
     let target_text = target
@@ -2106,10 +2091,7 @@ fn prepare_etc(application: &LaunchPlan) -> io::Result<()> {
     for entry in selected_runtime_etc(&application.runtime_files)? {
         mount_runtime_etc_entry(&entry, &etc)?;
     }
-    remount_read_only(
-        etc_text,
-        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
-    )
+    remount_read_only(etc_text, sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC)
 }
 
 fn prepare_mount_plan(
@@ -2259,10 +2241,7 @@ fn prepare_mount_plan(
                 &pulse.config_target,
                 crate::permissions::APPLICATION_PULSE_CONFIG,
             )?;
-            fs::set_permissions(
-                &pulse.config_target,
-                fs::Permissions::from_mode(0o444),
-            )?;
+            fs::set_permissions(&pulse.config_target, fs::Permissions::from_mode(0o444))?;
             // The tmpfs is made by the mapped application identity, so 0444
             // alone is not immutable. Make the highest private ancestor a
             // read-only mountpoint before adding the server child mount. That
@@ -2321,14 +2300,8 @@ fn prepare_mount_plan(
         }
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
         let mut mounted = vec![
-            (
-                application.package_files.clone(),
-                format!("{NEW_ROOT}/app"),
-            ),
-            (
-                application.runtime_files.clone(),
-                format!("{NEW_ROOT}/usr"),
-            ),
+            (application.package_files.clone(), format!("{NEW_ROOT}/app")),
+            (application.runtime_files.clone(), format!("{NEW_ROOT}/usr")),
             (
                 application.state.home.clone(),
                 format!("{NEW_ROOT}/home/td"),
@@ -2411,12 +2384,14 @@ fn mount_reaper_probe(executable: &Path) -> io::Result<()> {
     if fs::symlink_metadata(&target).is_ok() {
         return Err(io::Error::other("fresh reaper-probe path already exists"));
     }
-    drop(OpenOptions::new().write(true).create_new(true).open(&target)?);
+    drop(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)?,
+    );
     mount_bind(executable, &target)?;
-    remount_read_only(
-        &target,
-        sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV,
-    )?;
+    remount_read_only(&target, sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV)?;
     let metadata = fs::metadata(&target)?;
     if !metadata.file_type().is_file() || metadata.mode() & 0o111 == 0 {
         return Err(io::Error::other(
@@ -2907,10 +2882,12 @@ fn grant_scaffold_names(
     filesystems: &[Stage2Filesystem],
 ) -> io::Result<BTreeMap<PathBuf, BTreeSet<String>>> {
     let mut root = if application {
-        ["app", "dev", "etc", "home", "proc", "run", "tmp", "usr", "var"]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<BTreeSet<_>>()
+        [
+            "app", "dev", "etc", "home", "proc", "run", "tmp", "usr", "var",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
     } else {
         ["dev", "proc", "tmp", "var"]
             .into_iter()
@@ -2918,11 +2895,7 @@ fn grant_scaffold_names(
             .collect::<BTreeSet<_>>()
     };
     if runtime_aliases {
-        root.extend(
-            RUNTIME_ALIASES
-                .iter()
-                .map(|(name, _)| (*name).to_string()),
-        );
+        root.extend(RUNTIME_ALIASES.iter().map(|(name, _)| (*name).to_string()));
     }
     if firefox_seccomp_probe {
         root.insert("opt".to_string());
@@ -2932,10 +2905,7 @@ fn grant_scaffold_names(
         (PathBuf::from("/var"), BTreeSet::from(["tmp".to_string()])),
     ]);
     if application {
-        expected.insert(
-            PathBuf::from("/home"),
-            BTreeSet::from(["td".to_string()]),
-        );
+        expected.insert(PathBuf::from("/home"), BTreeSet::from(["td".to_string()]));
     }
     for filesystem in filesystems {
         let mut parent = PathBuf::from("/");
@@ -3079,11 +3049,7 @@ fn require_bound_terminfo_at(database: &str, name: &str) -> io::Result<String> {
 /// DIFFERENT rule that neither implies nor is implied by stage 1's, and a
 /// runtime whose `share` is a link to a sibling inside itself would pass
 /// outside and abort a fully-built jail here.
-fn require_bound_zone_at(
-    localtime: &Path,
-    runtime_root: &Path,
-    zone: &str,
-) -> io::Result<()> {
+fn require_bound_zone_at(localtime: &Path, runtime_root: &Path, zone: &str) -> io::Result<()> {
     if !authority::valid_timezone_name(zone) {
         return Err(io::Error::other(
             "stage-2 zone name is outside the compiled grammar",
@@ -3165,8 +3131,8 @@ fn require_etc_plan(
         machine_id,
         terminal,
     } = etc;
-    let expected_machine_id = machine_id
-        .ok_or_else(|| io::Error::other("application mount plan has no machine id"))?;
+    let expected_machine_id =
+        machine_id.ok_or_else(|| io::Error::other("application mount plan has no machine id"))?;
     let runtime_etc = selected_runtime_etc(Path::new("/usr"))?;
     let expected = expected_etc_names(&runtime_etc, etc)?;
     let actual = read_dir_names("/etc")?;
@@ -3189,14 +3155,9 @@ fn require_etc_plan(
         require_mode("/etc/firefox", 0o555)?;
         require_mode("/etc/firefox/policies", 0o555)?;
         require_mode("/etc/firefox/policies/policies.json", 0o444)?;
-        require_mode(
-            "/etc/firefox/policies/td-firefox-autotest-ca.pem",
-            0o444,
-        )?;
-        if read_bounded_text(
-            Path::new("/etc/firefox/policies/policies.json"),
-            1024,
-        )? != authority::FIREFOX_AUTOTEST_POLICY
+        require_mode("/etc/firefox/policies/td-firefox-autotest-ca.pem", 0o444)?;
+        if read_bounded_text(Path::new("/etc/firefox/policies/policies.json"), 1024)?
+            != authority::FIREFOX_AUTOTEST_POLICY
         {
             return Err(io::Error::other(
                 "Firefox autotest policy is not the compiled certificate policy",
@@ -3326,8 +3287,7 @@ fn require_etc_plan(
             || metadata.ino() != entry.source_inode
             || (metadata.file_type().is_dir()
                 != (entry.source_kind == FilesystemSourceKind::Directory))
-            || (metadata.file_type().is_file()
-                != (entry.source_kind == FilesystemSourceKind::File))
+            || (metadata.file_type().is_file() != (entry.source_kind == FilesystemSourceKind::File))
         {
             return Err(io::Error::other(format!(
                 "runtime configuration {} does not retain its source identity",
@@ -3714,16 +3674,15 @@ fn require_runtime_aliases() -> io::Result<()> {
                 ),
             )
         };
-        let metadata = fs::symlink_metadata(&alias)
-            .map_err(|error| alias_error("inspect", error))?;
+        let metadata =
+            fs::symlink_metadata(&alias).map_err(|error| alias_error("inspect", error))?;
         if !metadata.file_type().is_symlink() {
             return Err(io::Error::other(format!(
                 "runtime alias {} is not a symbolic link to {expected_target}",
                 alias.display()
             )));
         }
-        let actual_target = fs::read_link(&alias)
-            .map_err(|error| alias_error("read", error))?;
+        let actual_target = fs::read_link(&alias).map_err(|error| alias_error("read", error))?;
         if actual_target.as_os_str() != OsStr::new(expected_target) {
             return Err(io::Error::other(format!(
                 "runtime alias {} points to {}, expected {expected_target}",
@@ -4237,12 +4196,7 @@ pub fn probe_kill_reaps() -> io::Result<()> {
             "kill-reaps stage-1 stdout pipe was not created",
         ));
     };
-    let observed = observe_kill_reaps(
-        &mut stage1,
-        &mut reports,
-        &membership,
-        &watchdog,
-    );
+    let observed = observe_kill_reaps(&mut stage1, &mut reports, &membership, &watchdog);
     // For the paths that failed BEFORE the kill: the stage-1 role holds its
     // instance open on purpose, so an early return that left it running
     // would leak a held jail into the rest of the boot. `Child::kill` after
@@ -4338,7 +4292,11 @@ fn observe_kill_reaps(
                  {KILL_REAPS_TIMEOUT:?}: stage 2 ({stage2}) is {}, its jailed descendant \
                  ({descendant}) is {}",
                 if stage2_gone { "gone" } else { "still live" },
-                if descendant_gone { "gone" } else { "still live" },
+                if descendant_gone {
+                    "gone"
+                } else {
+                    "still live"
+                },
             )));
         }
         std::thread::sleep(KILL_REAPS_POLL);
@@ -4594,8 +4552,7 @@ pub fn run_kill_reaps_stage_1(expected_parent: u32, instance: &str) -> io::Resul
         crate::permissions::DEFAULT_CPU_QUOTA_USEC,
         crate::permissions::DEFAULT_CPU_PERIOD_USEC,
     )?;
-    let application_cgroup =
-        ManagedCgroup::create(&executable, instance, limits, identity, false)?;
+    let application_cgroup = ManagedCgroup::create(&executable, instance, limits, identity, false)?;
     let ProbeInstance {
         child,
         proof_writer,
@@ -4634,7 +4591,9 @@ pub fn run_kill_reaps_stage_1(expected_parent: u32, instance: &str) -> io::Resul
 fn parse_stage2_hold(line: &str) -> io::Result<u32> {
     let prefix = format!("{STAGE2_HOLD_MARKER} descendant=");
     let namespace_pid = line.strip_prefix(&prefix).ok_or_else(|| {
-        io::Error::other(format!("the held stage 2 reported {line:?}, not {prefix:?}"))
+        io::Error::other(format!(
+            "the held stage 2 reported {line:?}, not {prefix:?}"
+        ))
     })?;
     if namespace_pid.is_empty() || !namespace_pid.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(io::Error::other(format!(
@@ -4642,7 +4601,9 @@ fn parse_stage2_hold(line: &str) -> io::Result<u32> {
         )));
     }
     namespace_pid.parse::<u32>().map_err(|error| {
-        io::Error::other(format!("the held stage 2 descendant pid is invalid: {error}"))
+        io::Error::other(format!(
+            "the held stage 2 descendant pid is invalid: {error}"
+        ))
     })
 }
 
@@ -4771,9 +4732,9 @@ struct ProbeWatchdog {
 
 impl ProbeWatchdog {
     fn begin_teardown(&self) -> io::Result<()> {
-        self.begin.send(()).map_err(|_| {
-            io::Error::other("the kill-reaps watchdog ended before teardown began")
-        })
+        self.begin
+            .send(())
+            .map_err(|_| io::Error::other("the kill-reaps watchdog ended before teardown began"))
     }
 }
 
@@ -4927,7 +4888,10 @@ pub fn probe_firefox_seccomp_audit(firefox_pid: u32) -> io::Result<()> {
     })?;
     let policy = crate::app_policy::load().map_err(io::Error::other)?;
     let firefox = policy.for_name("firefox").ok_or_else(|| {
-        io::Error::new(io::ErrorKind::PermissionDenied, "Firefox has no application assignment")
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Firefox has no application assignment",
+        )
     })?;
     seccomp::verify_firefox_audit(&log, firefox_pid, firefox.uid)?;
     writeln!(io::stdout(), "{}", seccomp::FIREFOX_AUDIT_MARKER)
@@ -5182,54 +5146,48 @@ pub fn run_stage2(
         &action,
         Stage2Action::Launch(launch) if launch.cgroup_membership == NO_CGROUP_MEMBERSHIP
     );
-    let (
-        filesystems,
-        etc,
-        runtime_aliases,
-        pulse,
-        firefox_seccomp_probe,
-        fetch_socket,
-    ) = match &action {
-        Stage2Action::Probe | Stage2Action::KillHold { .. } => (
-            None,
-            EtcBinding {
-                resolv_conf: false,
-                timezone: None,
-                firefox_autotest_policy: false,
-                machine_id: None,
-                terminal: None,
-            },
-            false,
-            false,
-            false,
-            false,
-        ),
-        Stage2Action::Launch(launch) => (
-            Some(launch.filesystems.as_slice()),
-            EtcBinding {
-                resolv_conf: launch.resolv_conf,
-                timezone: launch.timezone.as_deref(),
-                firefox_autotest_policy: launch.firefox_autotest_policy,
-                machine_id: Some(launch.machine_id.as_str()),
-                // The wire-format validator required this name under the
-                // grant, so its absence here is the grant's absence.
-                terminal: launch
-                    .terminal
-                    .then(|| environment_value(&launch.environment, "TERM"))
-                    .flatten(),
-            },
-            launch.runtime_aliases,
-            // Stage 1 already authenticated the permission-to-environment
-            // derivation. This bit checks only that the corresponding private
-            // mount survived the stage-2 transition.
-            launch
-                .environment
-                .iter()
-                .any(|(key, _)| key == "PULSE_SERVER"),
-            launch.firefox_seccomp_probe,
-            launch.fetch_socket,
-        ),
-    };
+    let (filesystems, etc, runtime_aliases, pulse, firefox_seccomp_probe, fetch_socket) =
+        match &action {
+            Stage2Action::Probe | Stage2Action::KillHold { .. } => (
+                None,
+                EtcBinding {
+                    resolv_conf: false,
+                    timezone: None,
+                    firefox_autotest_policy: false,
+                    machine_id: None,
+                    terminal: None,
+                },
+                false,
+                false,
+                false,
+                false,
+            ),
+            Stage2Action::Launch(launch) => (
+                Some(launch.filesystems.as_slice()),
+                EtcBinding {
+                    resolv_conf: launch.resolv_conf,
+                    timezone: launch.timezone.as_deref(),
+                    firefox_autotest_policy: launch.firefox_autotest_policy,
+                    machine_id: Some(launch.machine_id.as_str()),
+                    // The wire-format validator required this name under the
+                    // grant, so its absence here is the grant's absence.
+                    terminal: launch
+                        .terminal
+                        .then(|| environment_value(&launch.environment, "TERM"))
+                        .flatten(),
+                },
+                launch.runtime_aliases,
+                // Stage 1 already authenticated the permission-to-environment
+                // derivation. This bit checks only that the corresponding private
+                // mount survived the stage-2 transition.
+                launch
+                    .environment
+                    .iter()
+                    .any(|(key, _)| key == "PULSE_SERVER"),
+                launch.firefox_seccomp_probe,
+                launch.fetch_socket,
+            ),
+        };
     require_mount_plan(
         Stage2MountExpectation {
             filesystems,
@@ -5434,7 +5392,10 @@ fn clone_terminal_descriptor() -> io::Result<std::os::fd::OwnedFd> {
 fn acquire_fresh_terminal() -> io::Result<()> {
     let stdin = descriptor_terminal(io::stdin().as_fd())
         .map_err(|error| io::Error::other(format!("terminal grant: launcher stdin: {error}")))?;
-    for (name, descriptor) in [("stdout", io::stdout().as_fd()), ("stderr", io::stderr().as_fd())] {
+    for (name, descriptor) in [
+        ("stdout", io::stdout().as_fd()),
+        ("stderr", io::stderr().as_fd()),
+    ] {
         let terminal = descriptor_terminal(descriptor).map_err(|error| {
             io::Error::other(format!("terminal grant: launcher {name}: {error}"))
         })?;
@@ -5725,18 +5686,16 @@ impl CgroupCleanup {
             .map_err(|error| io::Error::other(format!("spawn cgroup cleanup helper: {error}")))?;
         drop(command);
         let mut readiness = [0_u8; 1];
-        let armed = ready_reader
-            .read_exact(&mut readiness)
-            .and_then(|()| {
-                if readiness == CGROUP_CLEANUP_READY {
-                    Ok(())
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "cgroup cleanup helper returned an invalid readiness byte",
-                    ))
-                }
-            });
+        let armed = ready_reader.read_exact(&mut readiness).and_then(|()| {
+            if readiness == CGROUP_CLEANUP_READY {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cgroup cleanup helper returned an invalid readiness byte",
+                ))
+            }
+        });
         drop(ready_reader);
         if let Err(error) = armed {
             drop(writer);
@@ -6067,11 +6026,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
                 error
             }
         })?;
-        install_launch_identity_maps(
-            inside_identity,
-            outside_identity,
-            application.host_mode,
-        )?;
+        install_launch_identity_maps(inside_identity, outside_identity, application.host_mode)?;
         NamespaceSnapshot::read()?
             .require_application_change(&before, application.isolate_network)?;
         if application.isolate_network {
@@ -6096,16 +6051,9 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
                 filesystems: &application.filesystems,
                 resolv_conf: application.resolv_conf.is_some(),
                 machine_id: &application.state.machine_id,
-                timezone: application
-                    .timezone
-                    .as_ref()
-                    .map(|zone| zone.name.as_str()),
-                firefox_autotest_policy: application
-                    .firefox_autotest_policy
-                    .is_some(),
-                firefox_seccomp_probe: application
-                    .firefox_seccomp_probe
-                    .is_some(),
+                timezone: application.timezone.as_ref().map(|zone| zone.name.as_str()),
+                firefox_autotest_policy: application.firefox_autotest_policy.is_some(),
+                firefox_seccomp_probe: application.firefox_seccomp_probe.is_some(),
                 fetch_socket: application.fetch_socket.is_some(),
                 loader_library_path: application.loader_library_path.as_deref(),
                 runtime_aliases: application.runtime_aliases,
@@ -6291,11 +6239,7 @@ pub fn write_standard_filter() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::indexing_slicing,
-        clippy::panic,
-        clippy::unwrap_used
-    )]
+    #![allow(clippy::indexing_slicing, clippy::panic, clippy::unwrap_used)]
 
     use super::*;
     use crate::authority::{
@@ -6332,12 +6276,7 @@ mod tests {
             .into_iter()
     }
 
-    fn namespace_snapshot(
-        user: &str,
-        mount: &str,
-        uts: &str,
-        network: &str,
-    ) -> NamespaceSnapshot {
+    fn namespace_snapshot(user: &str, mount: &str, uts: &str, network: &str) -> NamespaceSnapshot {
         NamespaceSnapshot {
             user: PathBuf::from(user),
             mount: PathBuf::from(mount),
@@ -6356,18 +6295,14 @@ mod tests {
         isolated.require_application_change(&before, true).unwrap();
         shared.require_application_change(&before, false).unwrap();
         assert!(shared.require_application_change(&before, true).is_err());
-        assert!(isolated
-            .require_application_change(&before, false)
-            .is_err());
+        assert!(isolated.require_application_change(&before, false).is_err());
 
         for unchanged in [
             namespace_snapshot("user:[1]", "mnt:[2]", "uts:[2]", "net:[2]"),
             namespace_snapshot("user:[2]", "mnt:[1]", "uts:[2]", "net:[2]"),
             namespace_snapshot("user:[2]", "mnt:[2]", "uts:[1]", "net:[2]"),
         ] {
-            assert!(unchanged
-                .require_application_change(&before, true)
-                .is_err());
+            assert!(unchanged.require_application_change(&before, true).is_err());
         }
     }
 
@@ -6562,17 +6497,8 @@ mod tests {
             }
         );
         assert!(parse_mode(args(&[CGROUP_CLEANUP_WATCH_ARG])).is_err());
-        assert!(parse_mode(args(&[
-            CGROUP_CLEANUP_WATCH_ARG,
-            "/elsewhere/app"
-        ]))
-        .is_err());
-        assert!(parse_mode(args(&[
-            CGROUP_CLEANUP_WATCH_ARG,
-            membership,
-            "extra"
-        ]))
-        .is_err());
+        assert!(parse_mode(args(&[CGROUP_CLEANUP_WATCH_ARG, "/elsewhere/app"])).is_err());
+        assert!(parse_mode(args(&[CGROUP_CLEANUP_WATCH_ARG, membership, "extra"])).is_err());
         assert_eq!(
             parse_mode(args(&[REAPER_CHILD_ARG])).unwrap(),
             Mode::ReaperChild
@@ -7469,9 +7395,14 @@ mod tests {
         // bits at 20-31. Both decode through `device_numbers` exactly as
         // `st_rdev` does for these majors.
         assert_eq!(device_numbers(0x8803), (136, 3));
-        assert_eq!(device_numbers((136 << 8) | 0x11 | (0x3 << 20)), (136, 0x311));
+        assert_eq!(
+            device_numbers((136 << 8) | 0x11 | (0x3 << 20)),
+            (136, 0x311)
+        );
         assert!(require_terminal_numbers("x", (136, 3), 0x8803).is_ok());
-        assert!(require_terminal_numbers("x", (143, 0x311), (143 << 8) | 0x11 | (0x3 << 20)).is_ok());
+        assert!(
+            require_terminal_numbers("x", (143, 0x311), (143 << 8) | 0x11 | (0x3 << 20)).is_ok()
+        );
         // No terminal, a different terminal, a console, a serial line, and
         // a negative field are each refused.
         assert!(require_terminal_numbers("x", (136, 3), 0).is_err());
@@ -7541,12 +7472,7 @@ mod tests {
         );
         assert!(parse_mode(args(&[FIREFOX_SECCOMP_AUDIT_PROBE_ARG])).is_err());
         assert!(parse_mode(args(&[FIREFOX_SECCOMP_AUDIT_PROBE_ARG, "0"])).is_err());
-        assert!(parse_mode(args(&[
-            FIREFOX_SECCOMP_AUDIT_PROBE_ARG,
-            "8123",
-            "extra"
-        ]))
-        .is_err());
+        assert!(parse_mode(args(&[FIREFOX_SECCOMP_AUDIT_PROBE_ARG, "8123", "extra"])).is_err());
         for (name, stage) in [
             ("arm", firefox::InputStage::Arm),
             ("focus", firefox::InputStage::Focus),
@@ -7556,17 +7482,11 @@ mod tests {
                 "clipboard-refocus-arm",
                 firefox::InputStage::ClipboardRefocusArm,
             ),
-            (
-                "clipboard-refocus",
-                firefox::InputStage::ClipboardRefocus,
-            ),
+            ("clipboard-refocus", firefox::InputStage::ClipboardRefocus),
             ("clipboard", firefox::InputStage::Clipboard),
             ("download", firefox::InputStage::Download),
             ("file-chooser", firefox::InputStage::FileChooser),
-            (
-                "file-chooser-focus",
-                firefox::InputStage::FileChooserFocus,
-            ),
+            ("file-chooser-focus", firefox::InputStage::FileChooserFocus),
             (
                 "file-chooser-result",
                 firefox::InputStage::FileChooserResult,
@@ -7637,7 +7557,10 @@ mod tests {
     #[test]
     fn launch_diagnostics_are_bounded_utf8() {
         let mut valid = &b"stage failed\n"[..];
-        assert_eq!(read_launch_diagnostic(&mut valid).unwrap(), "stage failed\n");
+        assert_eq!(
+            read_launch_diagnostic(&mut valid).unwrap(),
+            "stage failed\n"
+        );
 
         let mut invalid = &[0xff_u8][..];
         assert!(read_launch_diagnostic(&mut invalid).is_err());
@@ -7702,13 +7625,7 @@ mod tests {
         assert!(validate_single_map("uid_map", map, 1000, Some(1000)).is_err());
         assert!(validate_single_map("uid_map", map, 1234, Some(1000)).is_err());
         assert!(validate_single_map("uid_map", "1000 1234 2\n", 1000, None).is_err());
-        assert!(validate_single_map(
-            "uid_map",
-            "1000 1234 1\n2000 2234 1\n",
-            1000,
-            None,
-        )
-        .is_err());
+        assert!(validate_single_map("uid_map", "1000 1234 1\n2000 2234 1\n", 1000, None,).is_err());
     }
 
     #[test]
@@ -8182,7 +8099,9 @@ mod tests {
     fn the_kill_reaps_report_admits_a_host_pid_and_a_namespace_pid() {
         assert_eq!(parse_kill_reaps_report("41 42").unwrap(), (41, 42));
         assert_eq!(parse_kill_reaps_report("41 41").unwrap(), (41, 41));
-        for refused in ["41", "41 42 43", "41 1", "41 0", "41  42", " 41 42", "41 x", ""] {
+        for refused in [
+            "41", "41 42 43", "41 1", "41 0", "41  42", " 41 42", "41 x", "",
+        ] {
             assert!(
                 parse_kill_reaps_report(refused).is_err(),
                 "{refused:?} must not parse as a kill-reaps report"
@@ -8491,12 +8410,9 @@ mod tests {
         let escaped = "1 0 0:1 / / rw - tmpfs root rw\n\
                        2 1 0:3 /path\\040with\\134slash /source\\040dir rw - tmpfs tmpfs rw\n\
                        3 1 0:3 /path\\040with\\134slash /target rw - tmpfs tmpfs rw\n";
-        assert!(require_bind_source(
-            escaped,
-            Path::new("/source dir"),
-            Path::new("/target"),
-        )
-        .is_ok());
+        assert!(
+            require_bind_source(escaped, Path::new("/source dir"), Path::new("/target"),).is_ok()
+        );
         assert!(decode_mountinfo_path("/bad\\777").is_err());
 
         let shadowed = "1 0 0:1 / / rw - tmpfs root rw\n\
@@ -8509,9 +8425,7 @@ mod tests {
                 root: PathBuf::from("/b/file"),
             }
         );
-        let visible_child = format!(
-            "{shadowed}4 3 0:4 /child /a/b rw - tmpfs child rw\n"
-        );
+        let visible_child = format!("{shadowed}4 3 0:4 /child /a/b rw - tmpfs child rw\n");
         assert_eq!(
             mount_identity_for_path(&visible_child, Path::new("/a/b/file")).unwrap(),
             MountIdentity {
@@ -8540,17 +8454,12 @@ mod tests {
                 &mount_identity_for_path(mountinfo, allowed_home).unwrap(),
                 &mount_tree_identities(mountinfo, Path::new("/home")).unwrap(),
                 &mount_tree_identities(mountinfo, allowed_home).unwrap(),
-                &mount_identities_outside_allowed_home(
-                    mountinfo,
-                    &home_roots,
-                    allowed_home,
-                )
-                .unwrap(),
+                &mount_identities_outside_allowed_home(mountinfo, &home_roots, allowed_home)
+                    .unwrap(),
             )
         };
 
-        let reserved_alias =
-            format!("{base}6 1 0:3 / /mnt/grant/nested rw - tmpfs shm rw\n");
+        let reserved_alias = format!("{base}6 1 0:3 / /mnt/grant/nested rw - tmpfs shm rw\n");
         assert!(require_grant_mount_identities(
             source,
             &mount_tree_identities(&reserved_alias, source).unwrap(),
@@ -8558,19 +8467,14 @@ mod tests {
             &mount_identity_for_path(&reserved_alias, allowed_home).unwrap(),
             &mount_tree_identities(&reserved_alias, Path::new("/home")).unwrap(),
             &mount_tree_identities(&reserved_alias, allowed_home).unwrap(),
-            &mount_identities_outside_allowed_home(
-                &reserved_alias,
-                &home_roots,
-                allowed_home,
-            )
-            .unwrap(),
+            &mount_identities_outside_allowed_home(&reserved_alias, &home_roots, allowed_home,)
+                .unwrap(),
         )
         .unwrap_err()
         .to_string()
         .contains("aliases a reserved mount"));
 
-        let other_home =
-            format!("{base}6 1 0:4 / /mnt/grant/nested rw - btrfs other rw\n");
+        let other_home = format!("{base}6 1 0:4 / /mnt/grant/nested rw - btrfs other rw\n");
         assert!(check(&other_home)
             .unwrap_err()
             .to_string()
@@ -8625,12 +8529,8 @@ mod tests {
                 &mount_identity_for_path(mountinfo, allowed_home).unwrap(),
                 &mount_tree_identities(mountinfo, Path::new("/var/home")).unwrap(),
                 &mount_tree_identities(mountinfo, allowed_home).unwrap(),
-                &mount_identities_outside_allowed_home(
-                    mountinfo,
-                    &home_roots,
-                    allowed_home,
-                )
-                .unwrap(),
+                &mount_identities_outside_allowed_home(mountinfo, &home_roots, allowed_home)
+                    .unwrap(),
             )
         };
 
@@ -8658,12 +8558,8 @@ mod tests {
             &mount_identity_for_path(&other_home_nested, allowed_home).unwrap(),
             &mount_tree_identities(&other_home_nested, Path::new("/var/home")).unwrap(),
             &mount_tree_identities(&other_home_nested, allowed_home).unwrap(),
-            &mount_identities_outside_allowed_home(
-                &other_home_nested,
-                &home_roots,
-                allowed_home,
-            )
-            .unwrap(),
+            &mount_identities_outside_allowed_home(&other_home_nested, &home_roots, allowed_home,)
+                .unwrap(),
         )
         .unwrap_err()
         .to_string()
@@ -8732,11 +8628,9 @@ mod tests {
                                 6 4 0:18 /@var/home/tester \
                                 /var/home/tester/homelink rw - btrfs volume rw\n";
         let alias = Path::new("/var/home/tester/homelink");
-        let mut reserved =
-            mount_tree_identities(whole_home_alias, Path::new("/run")).unwrap();
+        let mut reserved = mount_tree_identities(whole_home_alias, Path::new("/run")).unwrap();
         reserved.extend(
-            mount_tree_identities(whole_home_alias, Path::new("/var/home/tester/.td/app"))
-                .unwrap(),
+            mount_tree_identities(whole_home_alias, Path::new("/var/home/tester/.td/app")).unwrap(),
         );
         let whole_home_error = require_grant_mount_identities(
             alias,
@@ -8749,9 +8643,8 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(whole_home_error.contains(
-            "identity 0:18:/@var/home/tester aliases a reserved mount identity 0:18:/"
-        ));
+        assert!(whole_home_error
+            .contains("identity 0:18:/@var/home/tester aliases a reserved mount identity 0:18:/"));
     }
 
     #[test]
@@ -8786,11 +8679,8 @@ mod tests {
 
     #[test]
     fn grant_mount_policy_flags_are_exact() {
-        let hardened = sys::MS_REMOUNT
-            | sys::MS_BIND
-            | sys::MS_NOSUID
-            | sys::MS_NODEV
-            | sys::MS_NOEXEC;
+        let hardened =
+            sys::MS_REMOUNT | sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC;
         assert_eq!(grant_mount_policy_flags(false), hardened);
         assert_eq!(grant_mount_policy_flags(true), hardened | sys::MS_RDONLY);
     }
@@ -9009,7 +8899,10 @@ mod tests {
         let refusal = require_bound_terminfo_at(db, "td-term")
             .unwrap_err()
             .to_string();
-        assert!(refusal.ends_with("mode is 0o644, expected 0o444"), "{refusal}");
+        assert!(
+            refusal.ends_with("mode is 0o644, expected 0o444"),
+            "{refusal}"
+        );
         set(&entry, 0o444);
 
         // A name the database does not describe, and one outside the grammar.
@@ -9055,7 +8948,11 @@ mod tests {
         let runtime = directory.join("runtime");
         let etc = runtime.join("etc");
         fs::create_dir_all(etc.join("fonts")).unwrap();
-        fs::write(etc.join("ld.so.conf"), b"include /etc/ld.so.conf.d/*.conf\n").unwrap();
+        fs::write(
+            etc.join("ld.so.conf"),
+            b"include /etc/ld.so.conf.d/*.conf\n",
+        )
+        .unwrap();
         fs::write(etc.join("unknown"), b"not selected\n").unwrap();
         let fonts = fs::symlink_metadata(etc.join("fonts")).unwrap();
         let ld_so_conf = fs::symlink_metadata(etc.join("ld.so.conf")).unwrap();

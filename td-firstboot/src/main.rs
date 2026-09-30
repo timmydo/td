@@ -18,23 +18,38 @@
 mod application_runtime;
 mod application_state;
 mod credentials;
-#[path = "../../td-secret/src/fido_cbor.rs"]
-#[allow(dead_code, reason = "shared token-protected store format and trusted release") ]
-mod fido_cbor;
-#[path = "../../td-secret/src/fido_ctap.rs"]
-#[allow(dead_code, reason = "shared token-protected store format and trusted release") ]
-mod fido_ctap;
-#[path = "../../td-secret/src/fido_enroll.rs"]
-#[allow(dead_code, reason = "shared token-protected store format and trusted release") ]
-mod fido_enroll;
-#[path = "../../td-secret/src/fido_hid.rs"]
-#[allow(dead_code, reason = "shared token-protected store format and trusted release") ]
-mod fido_hid;
-#[path = "../../td-secret/src/fido_metadata.rs"]
-#[allow(dead_code, reason = "shared token-protected store format and trusted release") ]
-mod fido_metadata;
 #[path = "../../td-secret/src/crypto.rs"]
 mod crypto;
+#[path = "../../td-secret/src/fido_cbor.rs"]
+#[allow(
+    dead_code,
+    reason = "shared token-protected store format and trusted release"
+)]
+mod fido_cbor;
+#[path = "../../td-secret/src/fido_ctap.rs"]
+#[allow(
+    dead_code,
+    reason = "shared token-protected store format and trusted release"
+)]
+mod fido_ctap;
+#[path = "../../td-secret/src/fido_enroll.rs"]
+#[allow(
+    dead_code,
+    reason = "shared token-protected store format and trusted release"
+)]
+mod fido_enroll;
+#[path = "../../td-secret/src/fido_hid.rs"]
+#[allow(
+    dead_code,
+    reason = "shared token-protected store format and trusted release"
+)]
+mod fido_hid;
+#[path = "../../td-secret/src/fido_metadata.rs"]
+#[allow(
+    dead_code,
+    reason = "shared token-protected store format and trusted release"
+)]
+mod fido_metadata;
 mod hostname;
 mod machineid;
 mod mounts;
@@ -42,12 +57,15 @@ mod primary_home;
 mod primary_profile;
 mod principal_store;
 mod principals;
-mod ssh_policy;
 #[path = "../../td-secret/src/store.rs"]
 #[allow(dead_code, reason = "the console and portal share store entry points")]
 mod secret_store;
+mod ssh_policy;
 #[path = "../../td-secret/src/tpm.rs"]
-#[allow(dead_code, reason = "shared sealed-store format and root enrollment entry points")]
+#[allow(
+    dead_code,
+    reason = "shared sealed-store format and root enrollment entry points"
+)]
 mod tpm;
 
 use std::io::{Read, Write};
@@ -352,18 +370,34 @@ fn run_with_primary(
         principal_store::prepare_portal_runtimes(&desired).map_err(Failure::Failed)?;
         credentials::isolate_stores(&config.state, &desired)?;
         for application in desired.active_applications().map_err(Failure::Failed)? {
-            let former = applications.as_ref().filter(|home| home.uid == application.owner)
-                .ok_or_else(|| Failure::Failed("active application lacks its configured human migration home".into()))?;
+            let former = applications
+                .as_ref()
+                .filter(|home| home.uid == application.owner)
+                .ok_or_else(|| {
+                    Failure::Failed(
+                        "active application lacks its configured human migration home".into(),
+                    )
+                })?;
             let home = application_state::prepare(former, &application.name, application.uid)
                 .map_err(Failure::Failed)?;
             application_runtime::prepare(application.uid).map_err(Failure::Failed)?;
-            emit(&format!("TD-APPLICATION-STATE-READY owner={} app={} uid={}\n",
-                application.owner, application.name, application.uid)).map_err(Failure::Failed)?;
+            emit(&format!(
+                "TD-APPLICATION-STATE-READY owner={} app={} uid={}\n",
+                application.owner, application.name, application.uid
+            ))
+            .map_err(Failure::Failed)?;
             active_homes.insert(application.name, home);
         }
         if let Some(home) = &applications {
-            credential_owner = Some(desired.sessions().find(|session| session.owner == home.uid)
-                .ok_or_else(|| Failure::Failed("credential owner has no configured session".into()))?.portal);
+            credential_owner = Some(
+                desired
+                    .sessions()
+                    .find(|session| session.owner == home.uid)
+                    .ok_or_else(|| {
+                        Failure::Failed("credential owner has no configured session".into())
+                    })?
+                    .portal,
+            );
         }
         emit(&format!("{PRINCIPALS_MARKER}\n")).map_err(Failure::Failed)?;
     }
@@ -397,8 +431,14 @@ fn run_with_primary(
     // Active-account ownership preparation above must succeed before enrollment
     // is reported; template provisioning does not substitute for that boundary.
     if let Some(applications) = &applications {
-        let credential_owner = credential_owner.ok_or_else(|| Failure::Failed("credential owner is missing".into()))?;
-        match provision_application_homes(applications, &config.state, credential_owner, &active_homes) {
+        let credential_owner = credential_owner
+            .ok_or_else(|| Failure::Failed("credential owner is missing".into()))?;
+        match provision_application_homes(
+            applications,
+            &config.state,
+            credential_owner,
+            &active_homes,
+        ) {
             Ok(outcomes) => {
                 for (application, outcome) in outcomes {
                     emit_err(&format!(
@@ -430,33 +470,61 @@ enum Invocation {
 }
 
 fn parse(args: &[String]) -> Result<Invocation, Failure> {
-    if args.first().is_some_and(|verb| verb == "render-primary-sshd") {
+    if args
+        .first()
+        .is_some_and(|verb| verb == "render-primary-sshd")
+    {
         let [_, root] = args else {
             return Err(Failure::Usage("render-primary-sshd requires ROOT".into()));
         };
         return Ok(Invocation::RenderPrimarySshd(PathBuf::from(root)));
     }
-    if args.first().is_some_and(|verb| verb == "prepare-primary-profile") {
+    if args
+        .first()
+        .is_some_and(|verb| verb == "prepare-primary-profile")
+    {
         let [_, root] = args else {
-            return Err(Failure::Usage("prepare-primary-profile requires ROOT".into()));
+            return Err(Failure::Usage(
+                "prepare-primary-profile requires ROOT".into(),
+            ));
         };
         return Ok(Invocation::PreparePrimaryProfile(PathBuf::from(root)));
     }
-    if args.first().is_some_and(|verb| verb == "stage-primary-name") {
+    if args
+        .first()
+        .is_some_and(|verb| verb == "stage-primary-name")
+    {
         let [_, root, name, output] = args else {
-            return Err(Failure::Usage("stage-primary-name requires ROOT NAME OUT".into()));
+            return Err(Failure::Usage(
+                "stage-primary-name requires ROOT NAME OUT".into(),
+            ));
         };
-        return Ok(Invocation::StagePrimaryName(PathBuf::from(root), name.clone(), PathBuf::from(output)));
+        return Ok(Invocation::StagePrimaryName(
+            PathBuf::from(root),
+            name.clone(),
+            PathBuf::from(output),
+        ));
     }
-    if args.first().is_some_and(|verb| verb == "check-primary-name") {
+    if args
+        .first()
+        .is_some_and(|verb| verb == "check-primary-name")
+    {
         let [_, root, name] = args else {
-            return Err(Failure::Usage("check-primary-name requires ROOT NAME".into()));
+            return Err(Failure::Usage(
+                "check-primary-name requires ROOT NAME".into(),
+            ));
         };
-        return Ok(Invocation::CheckPrimaryName(PathBuf::from(root), name.clone()));
+        return Ok(Invocation::CheckPrimaryName(
+            PathBuf::from(root),
+            name.clone(),
+        ));
     }
     if args.first().is_some_and(|arg| arg == "hostname") {
-        return if args.len() == 1 { Ok(Invocation::Hostname) }
-            else { Err(Failure::Usage("hostname takes no operands".into())) };
+        return if args.len() == 1 {
+            Ok(Invocation::Hostname)
+        } else {
+            Err(Failure::Usage("hostname takes no operands".into()))
+        };
     }
     if args
         .first()
@@ -579,7 +647,8 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
     }
     if application_primary && (application_home.is_some() || application_owner.is_some()) {
         return Err(Failure::Usage(
-            "--application-primary cannot mix with --application-home or --application-owner".into(),
+            "--application-primary cannot mix with --application-home or --application-owner"
+                .into(),
         ));
     }
     // The pair is one fact — whose applications, and where — so half of it is
@@ -602,7 +671,9 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
                 home.display()
             )))
         }
-        (Some(home), Some((uid, gid))) => ApplicationSelection::Explicit(ApplicationHome { home, uid, gid }),
+        (Some(home), Some((uid, gid))) => {
+            ApplicationSelection::Explicit(ApplicationHome { home, uid, gid })
+        }
         (None, None) if application_primary => ApplicationSelection::Primary,
         (None, None) => ApplicationSelection::None,
         _ => {
@@ -677,7 +748,13 @@ fn provision_applications(
     state_dir: &Path,
     credential_owner: u32,
 ) -> Result<Vec<(&'static str, Outcome)>, Failure> {
-    provision_selected(owner, state_dir, credential_owner, owner.uid, APPLICATION_CONFIGS)
+    provision_selected(
+        owner,
+        state_dir,
+        credential_owner,
+        owner.uid,
+        APPLICATION_CONFIGS,
+    )
 }
 
 fn provision_application_homes(
@@ -692,8 +769,13 @@ fn provision_application_homes(
     let mut outcomes = Vec::new();
     for config in APPLICATION_CONFIGS {
         let filesystem_owner = homes.get(config.application).unwrap_or(owner);
-        outcomes.extend(provision_selected(filesystem_owner, state_dir, credential_owner,
-            owner.uid, std::slice::from_ref(config))?);
+        outcomes.extend(provision_selected(
+            filesystem_owner,
+            state_dir,
+            credential_owner,
+            owner.uid,
+            std::slice::from_ref(config),
+        )?);
     }
     Ok(outcomes)
 }
@@ -761,10 +843,16 @@ fn provision_selected(
         directory.push(config.program);
         let program_dir = owned_dir(&directory, owner, &configuration)?;
         if config.application == "mail" {
-            if let Err(Failure::Failed(reason) | Failure::Usage(reason)) =
-                credentials::provision(state_dir, owner, &program_dir, credential_owner, logical_uid)
-            {
-                emit_err(&format!("td-firstboot: mail credential/configuration not provisioned: {reason}\n"));
+            if let Err(Failure::Failed(reason) | Failure::Usage(reason)) = credentials::provision(
+                state_dir,
+                owner,
+                &program_dir,
+                credential_owner,
+                logical_uid,
+            ) {
+                emit_err(&format!(
+                    "td-firstboot: mail credential/configuration not provisioned: {reason}\n"
+                ));
                 continue;
             }
         }
@@ -1720,30 +1808,49 @@ mod tests {
 
     #[test]
     fn primary_application_selection_loads_the_account_and_preserves_explicit_configuration() {
-        let selected = config(&["provision", "--application-primary", "--enroll-principals"]).unwrap();
+        let selected =
+            config(&["provision", "--application-primary", "--enroll-principals"]).unwrap();
         assert_eq!(selected.applications, ApplicationSelection::Primary);
         assert!(selected.require_persistent);
         assert!(selected.enroll_principals);
         for home in ["/home/alice", "/var/home/alice"] {
             let mut loads = 0;
-            let resolved = selected.applications.resolve(|| {
-                loads += 1;
-                principals::primary_account::parse(&format!(
-                    "alice:x:1000:1000:Alice:{home}:/bin/sh\n"
-                ))
-            }).unwrap();
+            let resolved = selected
+                .applications
+                .resolve(|| {
+                    loads += 1;
+                    principals::primary_account::parse(&format!(
+                        "alice:x:1000:1000:Alice:{home}:/bin/sh\n"
+                    ))
+                })
+                .unwrap();
             assert_eq!(loads, 1);
-            assert_eq!(resolved, Some(ApplicationHome {
-                home: PathBuf::from("/home/alice"), uid: 1000, gid: 1000,
-            }));
+            assert_eq!(
+                resolved,
+                Some(ApplicationHome {
+                    home: PathBuf::from("/home/alice"),
+                    uid: 1000,
+                    gid: 1000,
+                })
+            );
         }
-        let explicit = config(&["--application-home", "/srv/human", "--application-owner", "1001:1002"]).unwrap();
+        let explicit = config(&[
+            "--application-home",
+            "/srv/human",
+            "--application-owner",
+            "1001:1002",
+        ])
+        .unwrap();
         let mut loads = 0;
         for selection in [&explicit.applications, &ApplicationSelection::None] {
-            let resolved = selection.resolve(|| {
-                loads += 1;
-                Err(std::io::Error::other("explicit configuration must not load passwd"))
-            }).unwrap();
+            let resolved = selection
+                .resolve(|| {
+                    loads += 1;
+                    Err(std::io::Error::other(
+                        "explicit configuration must not load passwd",
+                    ))
+                })
+                .unwrap();
             match selection {
                 ApplicationSelection::Explicit(home) => assert_eq!(resolved.as_ref(), Some(home)),
                 ApplicationSelection::None => assert_eq!(resolved, None),
@@ -1759,9 +1866,20 @@ mod tests {
             vec!["--application-primary", "--application-primary"],
             vec!["--application-primary", "--application-home", "/home/alice"],
             vec!["--application-owner", "1000:1000", "--application-primary"],
-            vec!["--application-primary", "--application-home", "/home/alice", "--application-owner", "1000:1000"],
+            vec![
+                "--application-primary",
+                "--application-home",
+                "/home/alice",
+                "--application-owner",
+                "1000:1000",
+            ],
             vec!["--application-primary", "alice"],
-            vec!["--application-primary", "--enroll-principals", "--state-dir", "/tmp/state"],
+            vec![
+                "--application-primary",
+                "--enroll-principals",
+                "--state-dir",
+                "/tmp/state",
+            ],
         ] {
             assert!(matches!(config(&args), Err(Failure::Usage(_))), "{args:?}");
         }
@@ -1770,17 +1888,31 @@ mod tests {
     #[test]
     fn invalid_primary_account_refuses_before_any_provisioning_write() {
         let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir().join(format!("td-firstboot-primary-refusal-{}-{stamp}", std::process::id()));
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "td-firstboot-primary-refusal-{}-{stamp}",
+            std::process::id()
+        ));
         std::fs::create_dir(&root).unwrap();
         struct Cleanup(PathBuf);
         impl Drop for Cleanup {
-            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
         let _cleanup = Cleanup(root.clone());
         let state = root.join("state");
-        let args = ["provision", "--application-primary", "--state-dir", state.to_str().unwrap(),
-            "--keygen", "/must-not-run-keygen"].map(String::from);
+        let args = [
+            "provision",
+            "--application-primary",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--keygen",
+            "/must-not-run-keygen",
+        ]
+        .map(String::from);
         for passwd in [
             "root:x:0:0:Root:/root:/bin/sh\n",
             "alice:x:1000:1000:Alice:/home/alice:/bin/sh\nalias:x:1000:1000:Alias:/home/alias:/bin/sh\n",
@@ -1791,7 +1923,9 @@ mod tests {
             assert!(matches!(result, Err(Failure::Failed(error)) if error == expected));
             assert!(!state.exists(), "invalid primary created state");
         }
-        let result = run_with_primary(&args, || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        let result = run_with_primary(&args, || {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
         assert!(matches!(result, Err(Failure::Failed(_))));
         assert!(!state.exists());
     }
@@ -1818,7 +1952,10 @@ mod tests {
             paired.require_persistent,
             "the pair does not relax the mount check"
         );
-        assert_eq!(config(&[]).unwrap().applications, ApplicationSelection::None);
+        assert_eq!(
+            config(&[]).unwrap().applications,
+            ApplicationSelection::None
+        );
         for argv in [
             vec!["--application-home", "/home/tester"],
             vec!["--application-owner", "1000:1000"],
@@ -1898,26 +2035,35 @@ mod tests {
     /// which is what lets the ownership path execute here at all.
     #[test]
     fn active_application_configs_use_private_homes_and_the_human_secret_identity() {
-        let root = std::env::temp_dir().join(format!("td-firstboot-active-apps-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("td-firstboot-active-apps-{}", std::process::id()));
         std::fs::create_dir(&root).unwrap();
         struct Cleanup(PathBuf);
         impl Drop for Cleanup {
-            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
         let _cleanup = Cleanup(root.clone());
         let metadata = std::fs::metadata(&root).unwrap();
         let uid = metadata.uid();
         let gid = metadata.gid();
         let logical = uid.checked_add(1).unwrap();
-        let human = ApplicationHome { home: root.join("human"), uid: logical, gid: logical };
+        let human = ApplicationHome {
+            home: root.join("human"),
+            uid: logical,
+            gid: logical,
+        };
         let mut homes = std::collections::BTreeMap::new();
         for name in ["mail", "news"] {
             let home = root.join(name);
             std::fs::create_dir(&home).unwrap();
             homes.insert(name.into(), ApplicationHome { home, uid, gid });
         }
-        assert_eq!(provision_application_homes(&human, &root, uid, &homes).unwrap(),
-            vec![("mail", Outcome::Created), ("news", Outcome::Created)]);
+        assert_eq!(
+            provision_application_homes(&human, &root, uid, &homes).unwrap(),
+            vec![("mail", Outcome::Created), ("news", Outcome::Created)]
+        );
         assert!(!human.home.exists());
         for name in ["mail", "news"] {
             let directory = root.join(name).join(APPLICATION_STATE_ROOT);
@@ -1925,7 +2071,13 @@ mod tests {
             let other = if name == "mail" { "news" } else { "mail" };
             assert!(!directory.join(other).exists());
         }
-        let store = secret_store::Store::open_owned(&root.join("secrets").join(logical.to_string()), logical, uid, false).unwrap();
+        let store = secret_store::Store::open_owned(
+            &root.join("secrets").join(logical.to_string()),
+            logical,
+            uid,
+            false,
+        )
+        .unwrap();
         assert_eq!(store.get("mail", "main").unwrap().unwrap(), b"replace-me\n");
         assert!(!root.join("secrets").join(uid.to_string()).exists());
     }
@@ -2001,7 +2153,10 @@ mod tests {
         // A mail credential failure does not withhold another application's configuration.
         std::fs::set_permissions(&mail, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::remove_file(&news).unwrap();
-        assert_eq!(provision_applications(&owner, &root, owner.uid).unwrap(), vec![("news", Outcome::Created)]);
+        assert_eq!(
+            provision_applications(&owner, &root, owner.uid).unwrap(),
+            vec![("news", Outcome::Created)]
+        );
         assert_eq!(std::fs::read_to_string(&news).unwrap(), NEWS_CONFIG);
         assert_eq!(std::fs::read_to_string(&mail).unwrap(), "edited\n");
 
@@ -2010,12 +2165,18 @@ mod tests {
             uid: owner.uid.wrapping_add(1),
             ..owner.clone()
         };
-        assert_eq!(provision_applications(&foreign, &root, foreign.uid).unwrap(), Vec::new());
+        assert_eq!(
+            provision_applications(&foreign, &root, foreign.uid).unwrap(),
+            Vec::new()
+        );
         let absent = ApplicationHome {
             home: root.join("nobody"),
             ..owner.clone()
         };
-        assert_eq!(provision_applications(&absent, &root, absent.uid).unwrap(), Vec::new());
+        assert_eq!(
+            provision_applications(&absent, &root, absent.uid).unwrap(),
+            Vec::new()
+        );
         // A symlink where a state directory should be is refused outright.
         let linked_home = root.join("linked");
         std::fs::create_dir_all(&linked_home).unwrap();
@@ -2043,7 +2204,10 @@ mod tests {
                 home: root.join(odd),
                 ..owner.clone()
             };
-            assert_eq!(provision_applications(&odd, &root, odd.uid).unwrap(), Vec::new());
+            assert_eq!(
+                provision_applications(&odd, &root, odd.uid).unwrap(),
+                Vec::new()
+            );
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2098,9 +2262,14 @@ mod principal_arguments {
     #[test]
     fn server_policy_requires_only_the_verified_root() {
         let args = ["render-primary-sshd", "/sysroot"].map(str::to_owned);
-        assert!(matches!(parse(&args), Ok(Invocation::RenderPrimarySshd(root))
-            if root == Path::new("/sysroot")));
-        for args in [vec!["render-primary-sshd"], vec!["render-primary-sshd", "/sysroot", "root"]] {
+        assert!(
+            matches!(parse(&args), Ok(Invocation::RenderPrimarySshd(root))
+            if root == Path::new("/sysroot"))
+        );
+        for args in [
+            vec!["render-primary-sshd"],
+            vec!["render-primary-sshd", "/sysroot", "root"],
+        ] {
             let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
             assert!(matches!(parse(&args), Err(Failure::Usage(_))));
         }
@@ -2111,9 +2280,16 @@ mod principal_arguments {
     #[test]
     fn primary_profile_preparation_requires_only_the_staged_root() {
         let args: Vec<String> = ["prepare-primary-profile", "/sysroot"]
-            .into_iter().map(str::to_owned).collect();
-        assert!(matches!(parse(&args), Ok(Invocation::PreparePrimaryProfile(root)) if root == Path::new("/sysroot")));
-        for args in [vec!["prepare-primary-profile"], vec!["prepare-primary-profile", "/sysroot", "alice"]] {
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            matches!(parse(&args), Ok(Invocation::PreparePrimaryProfile(root)) if root == Path::new("/sysroot"))
+        );
+        for args in [
+            vec!["prepare-primary-profile"],
+            vec!["prepare-primary-profile", "/sysroot", "alice"],
+        ] {
             let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
             assert!(matches!(parse(&args), Err(Failure::Usage(_))));
         }
@@ -2122,9 +2298,12 @@ mod principal_arguments {
     #[test]
     fn primary_name_staging_requires_one_new_output_root() {
         let args: Vec<String> = ["stage-primary-name", "/staged", "alice", "/prepared"]
-            .map(str::to_owned).into();
-        assert!(matches!(parse(&args), Ok(Invocation::StagePrimaryName(root, name, output))
-            if root == Path::new("/staged") && name == "alice" && output == Path::new("/prepared")));
+            .map(str::to_owned)
+            .into();
+        assert!(
+            matches!(parse(&args), Ok(Invocation::StagePrimaryName(root, name, output))
+            if root == Path::new("/staged") && name == "alice" && output == Path::new("/prepared"))
+        );
         for length in 1..args.len() {
             assert!(parse(&args[..length]).is_err());
         }
@@ -2135,9 +2314,13 @@ mod principal_arguments {
 
     #[test]
     fn primary_name_check_takes_exactly_a_root_and_name() {
-        let args: Vec<String> = ["check-primary-name", "/staged", "alice"].map(str::to_owned).into();
-        assert!(matches!(parse(&args), Ok(Invocation::CheckPrimaryName(root, name))
-            if root == Path::new("/staged") && name == "alice"));
+        let args: Vec<String> = ["check-primary-name", "/staged", "alice"]
+            .map(str::to_owned)
+            .into();
+        assert!(
+            matches!(parse(&args), Ok(Invocation::CheckPrimaryName(root, name))
+            if root == Path::new("/staged") && name == "alice")
+        );
         assert!(parse(&args[..1]).is_err());
         assert!(parse(&args[..2]).is_err());
         let mut extra = args;

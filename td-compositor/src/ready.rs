@@ -79,7 +79,9 @@ fn field(value: Option<&str>, name: &str) -> Result<u16, String> {
         || !digits.bytes().all(|byte| byte.is_ascii_digit())
         || (digits.len() > 1 && digits.starts_with('0'))
     {
-        return Err(format!("readiness {name} '{digits}' is not how a grid is written"));
+        return Err(format!(
+            "readiness {name} '{digits}' is not how a grid is written"
+        ));
     }
     digits
         .parse()
@@ -142,9 +144,7 @@ fn answer(path: &Path, deadline: Duration) -> Result<String, String> {
         let left = deadline
             .checked_sub(started.elapsed())
             .filter(|left| !left.is_zero())
-            .ok_or_else(|| {
-                format!("readiness socket {} did not answer in time", path.display())
-            })?;
+            .ok_or_else(|| format!("readiness socket {} did not answer in time", path.display()))?;
         stream
             .set_read_timeout(Some(left))
             .map_err(|e| format!("bound the readiness read: {e}"))?;
@@ -278,7 +278,10 @@ mod tests {
         assert_eq!(marker(24, 80), "TD-TERM-READY rows=24 columns=80\n");
         assert_eq!(parse(&marker(24, 80)).unwrap(), (24, 80));
         assert_eq!(parse(&marker(1, 1)).unwrap(), (1, 1));
-        assert_eq!(parse(&marker(u16::MAX, u16::MAX)).unwrap(), (u16::MAX, u16::MAX));
+        assert_eq!(
+            parse(&marker(u16::MAX, u16::MAX)).unwrap(),
+            (u16::MAX, u16::MAX)
+        );
     }
 
     #[test]

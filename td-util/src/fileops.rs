@@ -193,7 +193,10 @@ mod tests {
             ln(&args(&["/run", &d.join("h").to_string_lossy()])).is_err(),
             "ln without -s must refuse rather than hard-link"
         );
-        assert!(ln(&args(&["-s", "/run"])).is_err(), "one operand is a usage error");
+        assert!(
+            ln(&args(&["-s", "/run"])).is_err(),
+            "one operand is a usage error"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -204,8 +207,16 @@ mod tests {
         let nested = d.join("a/b/c");
         assert_eq!(mkdir(&args(&["-p", &nested.to_string_lossy()])), Ok(0));
         assert!(nested.is_dir());
-        assert_eq!(mkdir(&args(&["-p", &nested.to_string_lossy()])), Ok(0), "-p must be idempotent");
-        assert_eq!(mkdir(&args(&[&nested.to_string_lossy()])), Ok(1), "without -p it exists");
+        assert_eq!(
+            mkdir(&args(&["-p", &nested.to_string_lossy()])),
+            Ok(0),
+            "-p must be idempotent"
+        );
+        assert_eq!(
+            mkdir(&args(&[&nested.to_string_lossy()])),
+            Ok(1),
+            "without -p it exists"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -299,7 +310,10 @@ mod tests {
         let missing = format!("/nonexistent/td-util-{}", std::process::id());
         assert_eq!(rm(&args(&["-f", &missing])), Ok(0));
         assert_eq!(rm(&args(&[&missing])), Ok(1));
-        assert!(rm(&args(&[])).is_err(), "no operand and no -f is a usage error");
+        assert!(
+            rm(&args(&[])).is_err(),
+            "no operand and no -f is a usage error"
+        );
         assert_eq!(rm(&args(&["-f"])), Ok(0));
     }
 
@@ -309,7 +323,11 @@ mod tests {
         let d = scratch("rmdir");
         let sub = d.join("sub");
         std::fs::create_dir_all(sub.join("inner")).unwrap();
-        assert_eq!(rm(&args(&["-f", &sub.to_string_lossy()])), Ok(1), "-f alone must not recurse");
+        assert_eq!(
+            rm(&args(&["-f", &sub.to_string_lossy()])),
+            Ok(1),
+            "-f alone must not recurse"
+        );
         assert!(sub.is_dir(), "the directory was removed without -r");
         assert_eq!(rm(&args(&["-rf", &sub.to_string_lossy()])), Ok(0));
         assert!(!sub.exists());

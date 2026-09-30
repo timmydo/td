@@ -1,4 +1,4 @@
-use crate::ladder::{SH, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
+use crate::ladder::{link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH};
 use crate::types::{Recipe, Step};
 
 // GNU Make 3.82 — rung 11 (#378, guix's make-mesboot): gcc-mesboot0 rebuilds

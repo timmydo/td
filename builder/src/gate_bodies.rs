@@ -147,7 +147,10 @@ fn tb_out_env(
         let err = String::from_utf8_lossy(&out.stderr);
         let sout = String::from_utf8_lossy(&out.stdout);
         let body = format!("{sout}{err}");
-        let msg = format!("FAIL: {ctx}: td-builder {args:?} exited {}\n{body}", out.status);
+        let msg = format!(
+            "FAIL: {ctx}: td-builder {args:?} exited {}\n{body}",
+            out.status
+        );
         return Err(tag_if_unprovisioned(&out.status, &body, msg));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -212,7 +215,10 @@ fn run_out_env(
         let err = String::from_utf8_lossy(&out.stderr);
         let sout = String::from_utf8_lossy(&out.stdout);
         let body = format!("{sout}{err}");
-        let msg = format!("FAIL: {ctx}: {program} {args:?} exited {}\n{body}", out.status);
+        let msg = format!(
+            "FAIL: {ctx}: {program} {args:?} exited {}\n{body}",
+            out.status
+        );
         return Err(tag_if_unprovisioned(&out.status, &body, msg));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -1705,7 +1711,9 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
     // NAMED, in the report too, so a scoped run never reads as a full one.
     let scope = crate::check_loop::check_scope(
         std::env::var_os("TD_CHECK_FULL").is_some(),
-        std::env::var(crate::check_loop::CHECK_SCOPE_ENV).ok().as_deref(),
+        std::env::var(crate::check_loop::CHECK_SCOPE_ENV)
+            .ok()
+            .as_deref(),
     );
     let mut unreached: Vec<String> = Vec::new();
     let checks = match &scope {
@@ -1713,7 +1721,12 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
         Some(dirs) => {
             let mut args: Vec<&str> = vec!["check-list", "--reaching"];
             args.extend(dirs.iter().map(String::as_str));
-            let raw = run_out_env(&eval_s, &args, &envs, "td-recipe-eval check-list --reaching")?;
+            let raw = run_out_env(
+                &eval_s,
+                &args,
+                &envs,
+                "td-recipe-eval check-list --reaching",
+            )?;
             let (notes, stems) = split_check_list(&raw);
             let listed = stems.join(" ");
             unreached = every
@@ -1870,7 +1883,11 @@ fn recipe_checks_verdict(
     });
     if failures != 0 {
         return (
-            caveat.into_iter().chain(memo_note).chain(unreached_note).collect(),
+            caveat
+                .into_iter()
+                .chain(memo_note)
+                .chain(unreached_note)
+                .collect(),
             Err(format!(
                 "FAIL: recipe-checks - {failures} of {ran} recipe-owned check(s) failed"
             )),
@@ -2063,7 +2080,9 @@ fn report_finished_check(spec: &str, index: usize, done: Result<&FinishedCheck, 
         }
         // A check that could not be RUN at all (spawn/wait failed). The run is
         // about to fail on it; say which one here so the log names it in place.
-        Err(e) => eprintln!("================ recipe-check {spec}#{index}: ERROR {e} ================"),
+        Err(e) => {
+            eprintln!("================ recipe-check {spec}#{index}: ERROR {e} ================")
+        }
     }
     let _ = std::io::stdout().flush();
 }
@@ -2118,14 +2137,7 @@ fn run_recipe_checks_concurrently(
                 let Some((spec, index)) = work.get(i) else {
                     return;
                 };
-                let done = run_recipe_check(
-                    eval,
-                    spec,
-                    *index,
-                    eval_s,
-                    stage0_base,
-                    worker_budget,
-                );
+                let done = run_recipe_check(eval, spec, *index, eval_s, stage0_base, worker_budget);
                 // Printed HERE, as each check lands, rather than after the whole
                 // set: a gate that shows nothing for ten minutes is one nobody can
                 // tell from a hung one, and the run this replaced streamed. The
@@ -2157,10 +2169,7 @@ fn run_recipe_checks_concurrently(
 
     let mut out = Vec::with_capacity(work.len());
     for (i, cell) in slots.iter().enumerate() {
-        let taken = cell
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let taken = cell.lock().unwrap_or_else(|e| e.into_inner()).take();
         match taken {
             Some(Ok(done)) => out.push(done),
             Some(Err(e)) => return Err(e),
@@ -2170,7 +2179,10 @@ fn run_recipe_checks_concurrently(
             // so this should be unreachable — it is spelled as an error anyway
             // because "should be" is what the verdict must not rest on.
             None => {
-                let (spec, index) = work.get(i).map(|(s, n)| (s.as_str(), *n)).unwrap_or(("?", 0));
+                let (spec, index) = work
+                    .get(i)
+                    .map(|(s, n)| (s.as_str(), *n))
+                    .unwrap_or(("?", 0));
                 return Err(format!(
                     "FAIL: recipe-check {spec}#{index} produced no result"
                 ));
@@ -2348,8 +2360,8 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     let cc_s = path_str(&cc_bin)?;
     // The host build scripts / proc-macros link with the provisioned cc; the
     // selected target links statically with its provisioned configuration.
-    let host_triple = crate::stage0::rustc_host_triple(&rustc_bin)
-        .map_err(|e| format!("FAIL: {e}"))?;
+    let host_triple =
+        crate::stage0::rustc_host_triple(&rustc_bin).map_err(|e| format!("FAIL: {e}"))?;
     let host_linker_var = crate::stage0::target_linker_var(&host_triple);
 
     let scratch = fresh_scratch(root, ".recipe-rs-scratch")?;
@@ -2418,9 +2430,7 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
         "cargo build recipes",
     )?;
 
-    let eval = cargo_target
-        .join(target)
-        .join("release/td-recipe-eval");
+    let eval = cargo_target.join(target).join("release/td-recipe-eval");
     if !eval.is_file() {
         return Err(format!(
             "FAIL: td-recipe-eval was not built at {}",
@@ -2454,7 +2464,9 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     println!("   ok: list/emit {first} produced JSON via the release binary");
 
     let mut smoke = Command::new(&eval);
-    smoke.args(["build-run", "not-a-recipe"]).stdin(Stdio::null());
+    smoke
+        .args(["build-run", "not-a-recipe"])
+        .stdin(Stdio::null());
     let bad_build = crate::spawn::past_a_busy_program(|| smoke.output())
         .map_err(|e| format!("FAIL: cannot spawn td-recipe-eval build-run smoke: {e}"))?;
     if bad_build.status.success() {
@@ -2507,11 +2519,12 @@ fn which_canon(bin: &str) -> Option<PathBuf> {
 /// assumed here.
 fn which_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find(|dir| {
-        let p = dir.join(bin);
-        p.is_file() && file_mode(&p).ok().is_some_and(|m| m & 0o111 != 0)
-    })
-    .map(|dir| dir.join(bin))
+    std::env::split_paths(&path)
+        .find(|dir| {
+            let p = dir.join(bin);
+            p.is_file() && file_mode(&p).ok().is_some_and(|m| m & 0o111 != 0)
+        })
+        .map(|dir| dir.join(bin))
 }
 
 /// The store root `/td/store` of a `/<first>/store/...` path (the shell's
@@ -2586,7 +2599,10 @@ fn proc_cmdlines() -> Vec<(i64, Vec<u8>)> {
 /// built from a Rust string — a silent permanent zero.
 fn has_marker(cmdline: &[u8], marker: &str) -> bool {
     // `windows(0)` panics, and an empty marker would match every process.
-    !marker.is_empty() && cmdline.windows(marker.len()).any(|w| w == marker.as_bytes())
+    !marker.is_empty()
+        && cmdline
+            .windows(marker.len())
+            .any(|w| w == marker.as_bytes())
 }
 
 /// Count the processes whose cmdline carries `marker`.
@@ -2735,8 +2751,8 @@ fn perturb_glibc_pin(lock_text: &str) -> Option<String> {
     let mut seen = false;
     let mut out = String::new();
     for line in lock_text.lines() {
-        let is_glibc_input = line.split_whitespace().next() == Some("input")
-            && line.ends_with(" glibc-2.41.tar.xz");
+        let is_glibc_input =
+            line.split_whitespace().next() == Some("input") && line.ends_with(" glibc-2.41.tar.xz");
         if is_glibc_input {
             out.push_str(&format!("input {zeros} glibc-2.41.tar.xz\n"));
             seen = true;
@@ -2904,7 +2920,14 @@ fn run_input_addressed_shell(
     let db_s = path_str(&work.join("store.db"))?;
     let runp = tb_out_env(
         tb,
-        &["store-add-input-addressed", name_stem, key, bs, &store_s, &db_s],
+        &[
+            "store-add-input-addressed",
+            name_stem,
+            key,
+            bs,
+            &store_s,
+            &db_s,
+        ],
         &[("TD_STORE_DIR", "/td/store")],
         &format!("store-add-input-addressed {name_stem}"),
     )?;
@@ -2974,7 +2997,13 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
     let db_s = path_str(&work.join("db.sqlite"))?;
     let pkg = tb_out_env(
         &tb,
-        &["store-add-recursive", "busybox-x86-64", &bs_s, &store_s, &db_s],
+        &[
+            "store-add-recursive",
+            "busybox-x86-64",
+            &bs_s,
+            &store_s,
+            &db_s,
+        ],
         &[("TD_STORE_DIR", "/td/store")],
         "store-add-recursive busybox-x86-64",
     )?;
@@ -3007,8 +3036,8 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
     // check both retarget logically.
     for t in ["sh", "busybox"] {
         let link = prof.join("bin").join(t);
-        let tgt = std::fs::read_link(&link)
-            .map_err(|_| format!("FAIL: no profile entry for {t}"))?;
+        let tgt =
+            std::fs::read_link(&link).map_err(|_| format!("FAIL: no profile entry for {t}"))?;
         let tgt_s = tgt.to_string_lossy();
         let want = format!("-busybox-x86-64/bin/{t}");
         if !(tgt_s.starts_with("/td/store/") && tgt_s.ends_with(&want)) {
@@ -3064,7 +3093,9 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
             "FAIL: /gnu/store is PRESENT in the own-root — mixed with the guix install".into(),
         );
     }
-    println!("   [structural] /gnu/store is ABSENT in the own-root (unmixed from the guix install)");
+    println!(
+        "   [structural] /gnu/store is ABSENT in the own-root (unmixed from the guix install)"
+    );
 
     let _ = chmod_r_uw(&work);
     let _ = std::fs::remove_dir_all(&work);
@@ -3112,8 +3143,7 @@ fn sandbox_hardening(_root: &Path) -> Result<(), String> {
     let sh_canon_s = path_str(&sh_canon)?;
     let sleep_exec = which_path("sleep").ok_or_else(|| String::from("FAIL: no sleep on PATH"))?;
     let sleep_exec_s = path_str(&sleep_exec)?;
-    let sleep_canon =
-        which_canon("sleep").ok_or_else(|| String::from("FAIL: no sleep on PATH"))?;
+    let sleep_canon = which_canon("sleep").ok_or_else(|| String::from("FAIL: no sleep on PATH"))?;
     let sleep_canon_s = path_str(&sleep_canon)?;
     let sroot = store_root_for(&sh_canon_s)?;
     let item_of = |canon: &str| -> Result<String, String> {
@@ -3147,9 +3177,7 @@ fn sandbox_hardening(_root: &Path) -> Result<(), String> {
     // (A) minimal /dev: standard nodes present, host kmsg/kvm/disks/mem/input
     // absent. The nested sandbox binds ONLY the probes' own item(s) — the
     // same per-item input-only model the loop itself uses.
-    println!(
-        ">> (A) minimal /dev: standard nodes present, host kmsg/kvm/disks/mem/input absent"
-    );
+    println!(">> (A) minimal /dev: standard nodes present, host kmsg/kvm/disks/mem/input absent");
     let dev_probe = "\
 [ -e /dev/null ] && [ -w /dev/null ]    || { echo \"  no writable /dev/null\";   exit 11; }
 [ -e /dev/zero ] && [ -e /dev/urandom ] || { echo \"  missing /dev/zero|urandom\"; exit 12; }
@@ -3193,9 +3221,7 @@ exit 0
             probe.display()
         ));
     }
-    println!(
-        "   {sroot} exposes {entries} bound items; the sh package rejects writes"
-    );
+    println!("   {sroot} exposes {entries} bound items; the sh package rejects writes");
     // (B) orphan reaping: killing td-builder reaps the whole inner sandbox tree.
     println!(">> (B) orphan reaping: killing td-builder reaps the whole inner sandbox tree");
     // A distinctive token carried in every inner cmdline. It doubles as the sleep
@@ -3288,7 +3314,9 @@ exit 0
     ) {
         sweep_marker_procs(&marker);
         let _ = child.wait();
-        return Err(format!("FAIL: cannot SIGTERM the top td-builder ({top}): {e}"));
+        return Err(format!(
+            "FAIL: cannot SIGTERM the top td-builder ({top}): {e}"
+        ));
     }
     // Reap the TOP before judging its descendants, and judge nothing at all
     // while it is still up: a live top CARRIES the marker, so it would be
@@ -3384,7 +3412,11 @@ exit 0
         args.extend_from_slice(&bind_flags);
         args.extend_from_slice(&["--", &sh_exec_s, "-c", &inner]);
         let mut probe = Command::new(&tb);
-        probe.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        probe
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         let mut child = crate::spawn::past_a_busy_program(|| probe.spawn())
             .map_err(|e| format!("FAIL: cannot spawn construction-window probe {i}: {e}"))?;
         let top = i64::from(child.id());
@@ -3438,7 +3470,9 @@ exit 0
                 &format!("SIGTERM to the top td-builder failed in cycle {i}: {e}"),
             );
             let _ = child.wait();
-            return Err(format!("FAIL: cannot SIGTERM the top td-builder ({top}) in cycle {i}: {e}"));
+            return Err(format!(
+                "FAIL: cannot SIGTERM the top td-builder ({top}) in cycle {i}: {e}"
+            ));
         }
         let mut top_exited = false;
         for _ in 0..FINE_TICKS {
@@ -3496,7 +3530,9 @@ exit 0
         // samples the window every time — the leg going quietly useless, which
         // is the failure this whole leg exists to prevent for the sandbox.
         if at_kill > 2 {
-            println!("   note: cycle {i} killed at {at_kill} marker procs, past the earliest point");
+            println!(
+                "   note: cycle {i} killed at {at_kill} marker procs, past the earliest point"
+            );
         }
     }
     println!("   {CYCLES} construction-window kills, no survivors");
@@ -3540,7 +3576,12 @@ fn toolchain_input_addressed(root: &Path) -> Result<(), String> {
 
     // [stable-key] the key + component paths are deterministic and distinct.
     let k1 = tb_out_env(&tb, &["toolchain-key", &lock_s], &env, "toolchain-key")?;
-    let k2 = tb_out_env(&tb, &["toolchain-key", &lock_s], &env, "toolchain-key (repeat)")?;
+    let k2 = tb_out_env(
+        &tb,
+        &["toolchain-key", &lock_s],
+        &env,
+        "toolchain-key (repeat)",
+    )?;
     if k1 != k2 {
         return Err(format!(
             "FAIL: [stable-key] toolchain-key not deterministic ({k1} vs {k2})"
@@ -3549,16 +3590,35 @@ fn toolchain_input_addressed(root: &Path) -> Result<(), String> {
     if k1.is_empty() || !k1.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("FAIL: [stable-key] key is not a hex digest: {k1}"));
     }
-    let gccp = tb_out_env(&tb, &["toolchain-path", &lock_s, "gcc-14.3.0"], &env, "toolchain-path gcc")?;
-    let bup = tb_out_env(&tb, &["toolchain-path", &lock_s, "binutils-2.44"], &env, "toolchain-path binutils")?;
-    let glp = tb_out_env(&tb, &["toolchain-path", &lock_s, "glibc-2.41"], &env, "toolchain-path glibc")?;
+    let gccp = tb_out_env(
+        &tb,
+        &["toolchain-path", &lock_s, "gcc-14.3.0"],
+        &env,
+        "toolchain-path gcc",
+    )?;
+    let bup = tb_out_env(
+        &tb,
+        &["toolchain-path", &lock_s, "binutils-2.44"],
+        &env,
+        "toolchain-path binutils",
+    )?;
+    let glp = tb_out_env(
+        &tb,
+        &["toolchain-path", &lock_s, "glibc-2.41"],
+        &env,
+        "toolchain-path glibc",
+    )?;
     for p in [&gccp, &bup, &glp] {
         if !p.starts_with("/td/store/") {
             return Err(format!("FAIL: [stable-key] not a /td/store path: {p}"));
         }
     }
-    let gccp_again =
-        tb_out_env(&tb, &["toolchain-path", &lock_s, "gcc-14.3.0"], &env, "toolchain-path gcc (repeat)")?;
+    let gccp_again = tb_out_env(
+        &tb,
+        &["toolchain-path", &lock_s, "gcc-14.3.0"],
+        &env,
+        "toolchain-path gcc (repeat)",
+    )?;
     if gccp_again != gccp {
         return Err("FAIL: [stable-key] toolchain-path not deterministic".into());
     }
@@ -3586,13 +3646,27 @@ fn toolchain_input_addressed(root: &Path) -> Result<(), String> {
     let iab_db = path_str(&work.join("iaB.db"))?;
     let ia1 = tb_out_env(
         &tb,
-        &["store-add-input-addressed", "glibc-2.41", &k1, &v1_s, &iaa, &iaa_db],
+        &[
+            "store-add-input-addressed",
+            "glibc-2.41",
+            &k1,
+            &v1_s,
+            &iaa,
+            &iaa_db,
+        ],
         &env,
         "store-add-input-addressed v1",
     )?;
     let ia2 = tb_out_env(
         &tb,
-        &["store-add-input-addressed", "glibc-2.41", &k1, &v2_s, &iab, &iab_db],
+        &[
+            "store-add-input-addressed",
+            "glibc-2.41",
+            &k1,
+            &v2_s,
+            &iab,
+            &iab_db,
+        ],
         &env,
         "store-add-input-addressed v2",
     )?;
@@ -3629,7 +3703,10 @@ fn toolchain_input_addressed(root: &Path) -> Result<(), String> {
                 .into(),
         );
     }
-    let (ha, hb) = match (registered_hash(&tb, &iaa_db, &ia1)?, registered_hash(&tb, &iab_db, &ia2)?) {
+    let (ha, hb) = match (
+        registered_hash(&tb, &iaa_db, &ia1)?,
+        registered_hash(&tb, &iab_db, &ia2)?,
+    ) {
         (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => (a, b),
         _ => {
             return Err(
@@ -3650,13 +3727,19 @@ fn toolchain_input_addressed(root: &Path) -> Result<(), String> {
 
     // [load-bearing] perturbing one input pin moves the path.
     let pert_text = perturb_glibc_pin(&lock_text).ok_or_else(|| {
-        String::from("FAIL: [load-bearing] could not perturb the lock (glibc-2.41 input line not found)")
+        String::from(
+            "FAIL: [load-bearing] could not perturb the lock (glibc-2.41 input line not found)",
+        )
     })?;
     let pert = work.join("perturbed.lock");
     writef(&pert, &pert_text)?;
     let pert_s = path_str(&pert)?;
-    let glp_p =
-        tb_out_env(&tb, &["toolchain-path", &pert_s, "glibc-2.41"], &env, "toolchain-path (perturbed)")?;
+    let glp_p = tb_out_env(
+        &tb,
+        &["toolchain-path", &pert_s, "glibc-2.41"],
+        &env,
+        "toolchain-path (perturbed)",
+    )?;
     if glp_p == glp {
         return Err("FAIL: [load-bearing] perturbing an input pin did NOT change the path".into());
     }
@@ -3749,8 +3832,18 @@ fn toolchain_x86_64_input_addressed(root: &Path) -> Result<(), String> {
     );
 
     // [distinct-key] ARCH is the discriminator: distinct key, no path collision.
-    let kx = tb_out_env(&tb, &["toolchain-key", &lock_s], &env, "toolchain-key x86_64")?;
-    let ki = tb_out_env(&tb, &["toolchain-key", &ilock_s], &env, "toolchain-key i686")?;
+    let kx = tb_out_env(
+        &tb,
+        &["toolchain-key", &lock_s],
+        &env,
+        "toolchain-key x86_64",
+    )?;
+    let ki = tb_out_env(
+        &tb,
+        &["toolchain-key", &ilock_s],
+        &env,
+        "toolchain-key i686",
+    )?;
     if kx == ki {
         return Err(format!(
             "FAIL: [distinct-key] x86_64 key collides with i686 ({kx}) — arch did not re-key"
@@ -3762,7 +3855,12 @@ fn toolchain_x86_64_input_addressed(root: &Path) -> Result<(), String> {
     );
 
     // [stable-key] deterministic, distinct, x86_64-suffixed /td/store paths.
-    let k2 = tb_out_env(&tb, &["toolchain-key", &lock_s], &env, "toolchain-key x86_64 (repeat)")?;
+    let k2 = tb_out_env(
+        &tb,
+        &["toolchain-key", &lock_s],
+        &env,
+        "toolchain-key x86_64 (repeat)",
+    )?;
     if kx != k2 {
         return Err(format!(
             "FAIL: [stable-key] toolchain-key not deterministic ({kx} vs {k2})"
@@ -3771,12 +3869,29 @@ fn toolchain_x86_64_input_addressed(root: &Path) -> Result<(), String> {
     if kx.is_empty() || !kx.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("FAIL: [stable-key] key is not a hex digest: {kx}"));
     }
-    let bup = tb_out_env(&tb, &["toolchain-path", &lock_s, "binutils-2.44-x86_64"], &env, "toolchain-path binutils x86_64")?;
-    let gccp = tb_out_env(&tb, &["toolchain-path", &lock_s, "gcc-14.3.0-x86_64"], &env, "toolchain-path gcc x86_64")?;
-    let glp = tb_out_env(&tb, &["toolchain-path", &lock_s, "glibc-2.41-x86_64"], &env, "toolchain-path glibc x86_64")?;
+    let bup = tb_out_env(
+        &tb,
+        &["toolchain-path", &lock_s, "binutils-2.44-x86_64"],
+        &env,
+        "toolchain-path binutils x86_64",
+    )?;
+    let gccp = tb_out_env(
+        &tb,
+        &["toolchain-path", &lock_s, "gcc-14.3.0-x86_64"],
+        &env,
+        "toolchain-path gcc x86_64",
+    )?;
+    let glp = tb_out_env(
+        &tb,
+        &["toolchain-path", &lock_s, "glibc-2.41-x86_64"],
+        &env,
+        "toolchain-path glibc x86_64",
+    )?;
     for p in [&bup, &gccp, &glp] {
         if !(p.starts_with("/td/store/") && p.ends_with("-x86_64")) {
-            return Err(format!("FAIL: [stable-key] not an x86_64 /td/store path: {p}"));
+            return Err(format!(
+                "FAIL: [stable-key] not an x86_64 /td/store path: {p}"
+            ));
         }
     }
     let gccp_again = tb_out_env(
@@ -3791,7 +3906,12 @@ fn toolchain_x86_64_input_addressed(root: &Path) -> Result<(), String> {
     if gccp == bup || gccp == glp || bup == glp {
         return Err("FAIL: [stable-key] components collide".into());
     }
-    let i_gcc = tb_out_env(&tb, &["toolchain-path", &ilock_s, "gcc-14.3.0"], &env, "toolchain-path i686 gcc")?;
+    let i_gcc = tb_out_env(
+        &tb,
+        &["toolchain-path", &ilock_s, "gcc-14.3.0"],
+        &env,
+        "toolchain-path i686 gcc",
+    )?;
     if gccp == i_gcc {
         return Err("FAIL: [distinct-key] x86_64 gcc path == i686 gcc path".into());
     }
@@ -3806,7 +3926,12 @@ fn toolchain_x86_64_input_addressed(root: &Path) -> Result<(), String> {
     let rr = work.join("rr.lock");
     writef(&rr, &rr_text)?;
     let rr_s = path_str(&rr)?;
-    let kr = tb_out_env(&tb, &["toolchain-key", &rr_s], &env, "toolchain-key (recipe-rev bumped)")?;
+    let kr = tb_out_env(
+        &tb,
+        &["toolchain-key", &rr_s],
+        &env,
+        "toolchain-key (recipe-rev bumped)",
+    )?;
     if kr == kx {
         return Err("FAIL: [load-bearing] bumping recipe-rev did NOT move the key".into());
     }
@@ -3921,18 +4046,36 @@ mod tests {
 
     #[test]
     fn recipe_check_width_is_bounded_by_the_work_and_never_zero() {
-        assert_eq!(recipe_check_width_for_budget(Some(16 * crate::check_memory::GIB), 1), 1);
-        assert_eq!(recipe_check_width_for_budget(Some(16 * crate::check_memory::GIB), 2), 2);
-        assert_eq!(recipe_check_width_for_budget(Some(16 * crate::check_memory::GIB), 26), 4);
+        assert_eq!(
+            recipe_check_width_for_budget(Some(16 * crate::check_memory::GIB), 1),
+            1
+        );
+        assert_eq!(
+            recipe_check_width_for_budget(Some(16 * crate::check_memory::GIB), 2),
+            2
+        );
+        assert_eq!(
+            recipe_check_width_for_budget(Some(16 * crate::check_memory::GIB), 26),
+            4
+        );
         assert_eq!(recipe_check_width_for_budget(None, 26), 1);
         assert_eq!(recipe_check_width_for_budget(Some(1), 0), 1);
     }
 
     #[test]
     fn recipe_check_width_is_capped_by_the_gates_memory_budget() {
-        assert_eq!(recipe_check_width_for_budget(Some(8 * crate::check_memory::GIB), 26), 2);
-        assert_eq!(recipe_check_width_for_budget(Some(4 * crate::check_memory::GIB), 26), 1);
-        assert_eq!(recipe_check_width_for_budget(Some(512 * 1024 * 1024), 26), 1);
+        assert_eq!(
+            recipe_check_width_for_budget(Some(8 * crate::check_memory::GIB), 26),
+            2
+        );
+        assert_eq!(
+            recipe_check_width_for_budget(Some(4 * crate::check_memory::GIB), 26),
+            1
+        );
+        assert_eq!(
+            recipe_check_width_for_budget(Some(512 * 1024 * 1024), 26),
+            1
+        );
     }
 
     #[test]
@@ -4068,16 +4211,25 @@ mod tests {
         let (lines, v) = recipe_checks_verdict(9, 0, &[], 0, &s(&["x#1", "y#2"]));
         assert!(v.is_ok());
         assert!(
-            lines.iter().any(|l| l.contains("2 check(s) not reached") && l.contains("x#1 y#2")),
+            lines
+                .iter()
+                .any(|l| l.contains("2 check(s) not reached") && l.contains("x#1 y#2")),
             "{lines:?}"
         );
-        assert!(lines.last().is_some_and(|l| l.starts_with("PASS: recipe-checks - ran 9 of 9")));
+        assert!(lines
+            .last()
+            .is_some_and(|l| l.starts_with("PASS: recipe-checks - ran 9 of 9")));
         let (lines, _) = recipe_checks_verdict(9, 0, &[], 0, &[]);
-        assert!(!lines.iter().any(|l| l.contains("not reached")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("not reached")),
+            "{lines:?}"
+        );
         let (lines, v) = recipe_checks_verdict(9, 1, &[], 0, &s(&["x#1"]));
         assert!(v.is_err());
         assert!(
-            lines.iter().any(|l| l.contains("1 check(s) not reached") && l.contains("x#1")),
+            lines
+                .iter()
+                .any(|l| l.contains("1 check(s) not reached") && l.contains("x#1")),
             "a failure still names what the scope left out: {lines:?}"
         );
         let (notes, stems) = split_check_list("# scope miss: no recipe reads x\na\nb c\n");
@@ -4099,18 +4251,29 @@ mod tests {
         // All memoized is still green: every check has a pass on record for
         // exactly these inputs.
         let (lines, v) = recipe_checks_verdict(3, 0, &[], 3, &[]);
-        assert!(v.is_ok() && lines[1].contains("ran 0 of 3 (3 memoized)"), "{lines:?}");
+        assert!(
+            v.is_ok() && lines[1].contains("ran 0 of 3 (3 memoized)"),
+            "{lines:?}"
+        );
         // A failure still outranks it, and the count of what ran is honest
         // beside a skip.
         let (lines, v) = recipe_checks_verdict(3, 1, &[], 2, &[]);
         assert!(
-            lines.iter().any(|l| l.contains("2 of 3 check(s) answered from the verdict memo")),
+            lines
+                .iter()
+                .any(|l| l.contains("2 of 3 check(s) answered from the verdict memo")),
             "a failure beside memoized passes still counts them: {lines:?}"
         );
         assert!(v.is_err());
         let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
         let (lines, v) = recipe_checks_verdict(4, 0, &s(&["a#1"]), 2, &[]);
-        assert!(v.is_ok() && lines.last().is_some_and(|l| l.contains("ran 1 of 4 (2 memoized)")), "{lines:?}");
+        assert!(
+            v.is_ok()
+                && lines
+                    .last()
+                    .is_some_and(|l| l.contains("ran 1 of 4 (2 memoized)")),
+            "{lines:?}"
+        );
     }
 
     /// The memo sentinel on stdout marks a memoized pass, and only on a pass:
@@ -4136,7 +4299,10 @@ mod tests {
                 .outcome
         };
         assert!(matches!(
-            run(&write("memo", &format!("echo '{memo} spec#1: passed before'; exit 0"))),
+            run(&write(
+                "memo",
+                &format!("echo '{memo} spec#1: passed before'; exit 0")
+            )),
             CheckOutcome::Memoized
         ));
         assert!(matches!(
@@ -4147,7 +4313,10 @@ mod tests {
             run(&write("memoerr", &format!("echo '{memo}' >&2; exit 0"))),
             CheckOutcome::Passed
         ));
-        assert!(matches!(run(&write("plain", "echo PASS; exit 0")), CheckOutcome::Passed));
+        assert!(matches!(
+            run(&write("plain", "echo PASS; exit 0")),
+            CheckOutcome::Passed
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4179,11 +4348,17 @@ mod tests {
 
         assert!(matches!(run(&write("ok", "exit 0")), CheckOutcome::Passed));
         assert!(matches!(
-            run(&write("gap", &format!("echo '{sentinel}' >&2; exit {code}"))),
+            run(&write(
+                "gap",
+                &format!("echo '{sentinel}' >&2; exit {code}")
+            )),
             CheckOutcome::HostGap
         ));
         assert!(
-            matches!(run(&write("bare", &format!("exit {code}"))), CheckOutcome::Failed),
+            matches!(
+                run(&write("bare", &format!("exit {code}"))),
+                CheckOutcome::Failed
+            ),
             "a bare 69 is not proof of a host gap"
         );
         assert!(
@@ -4231,7 +4406,11 @@ mod tests {
         let child = format!("no rustc\n{sentinel}\n");
         let tagged = tag_if_unprovisioned(&unprov, &child, "FAIL: m".into());
         // Tagged, and the FAIL: lead-in dropped — it is reported as a skip.
-        assert_eq!(tagged.strip_prefix(UNPROVISIONED_TAG), Some("m"), "{tagged:?}");
+        assert_eq!(
+            tagged.strip_prefix(UNPROVISIONED_TAG),
+            Some("m"),
+            "{tagged:?}"
+        );
         // A bare 69 with no sentinel is not td's provisioning path.
         assert_eq!(
             tag_if_unprovisioned(&unprov, "boom\n", "FAIL: m".into()),
@@ -4339,14 +4518,19 @@ patch cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc glibc-boo
             "name x\nrecipe-rev 1\ncomponent c\ninput dddd glibc-2.41.tar.xz # trailing note\n",
         )
         .expect("well-formed lock");
-        assert_eq!(lock.inputs, vec!["dddd glibc-2.41.tar.xz # trailing note".to_string()]);
+        assert_eq!(
+            lock.inputs,
+            vec!["dddd glibc-2.41.tar.xz # trailing note".to_string()]
+        );
     }
 
     #[test]
     fn filter_pin_lines_keeps_raw_pin_lines_for_set_compare() {
         let raw = filter_pin_lines(LOCK_FIXTURE);
         assert_eq!(raw.len(), 3);
-        assert!(raw.iter().all(|l| l.starts_with("input ") || l.starts_with("patch ")));
+        assert!(raw
+            .iter()
+            .all(|l| l.starts_with("input ") || l.starts_with("patch ")));
         // Reordering the SAME pins yields an equal sorted set (arch-parity's crux).
         let reordered = "\
 patch cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc glibc-boot-2.16.0.patch
@@ -4389,16 +4573,28 @@ input aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa gcc-14.3.
     fn source_pin_sha_matches_on_the_file_field() {
         let pins = "gcc\thttps://x/gcc.tar.xz\tdeadbeef\tgcc-14.3.0.tar.xz\n\
                     glibc\thttps://x/glibc.tar.xz\tfeedface\tglibc-2.41.tar.xz\n";
-        assert_eq!(source_pin_sha(pins, "glibc-2.41.tar.xz").as_deref(), Some("feedface"));
-        assert_eq!(source_pin_sha(pins, "gcc-14.3.0.tar.xz").as_deref(), Some("deadbeef"));
+        assert_eq!(
+            source_pin_sha(pins, "glibc-2.41.tar.xz").as_deref(),
+            Some("feedface")
+        );
+        assert_eq!(
+            source_pin_sha(pins, "gcc-14.3.0.tar.xz").as_deref(),
+            Some("deadbeef")
+        );
         assert_eq!(source_pin_sha(pins, "not-there.tar.xz"), None);
     }
 
     #[test]
     fn store_root_for_takes_the_first_component_store() {
-        assert_eq!(store_root_for("/td/store/abc-bash/bin/bash").unwrap(), "/td/store");
+        assert_eq!(
+            store_root_for("/td/store/abc-bash/bin/bash").unwrap(),
+            "/td/store"
+        );
         // First-component agnostic: any /<x>/store root derives, none is hardcoded.
-        assert_eq!(store_root_for("/seed/store/abc-sleep/bin/sleep").unwrap(), "/seed/store");
+        assert_eq!(
+            store_root_for("/seed/store/abc-sleep/bin/sleep").unwrap(),
+            "/seed/store"
+        );
         assert!(store_root_for("/not-a-store-path").is_err());
         assert!(store_root_for("relative/store/x").is_err());
     }

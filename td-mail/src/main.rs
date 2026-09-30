@@ -105,13 +105,19 @@ fn read_portal_credential_from(helper: &str, name: &str) -> Result<String, Strin
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
         return Err(if stderr.is_empty() {
-            format!("credential portal: {} get {} failed with {}", helper, name, output.status)
+            format!(
+                "credential portal: {} get {} failed with {}",
+                helper, name, output.status
+            )
         } else {
             format!("credential portal: {} get {}: {}", helper, name, stderr)
         });
     }
     let mut password = String::from_utf8(output.stdout).map_err(|_| {
-        format!("credential portal: {} get {}: the credential is not valid UTF-8", helper, name)
+        format!(
+            "credential portal: {} get {}: the credential is not valid UTF-8",
+            helper, name
+        )
     })?;
     // Trimmed in place: one buffer holds the secret, not a second copy.
     let kept = password.trim_end_matches('\n').len();
@@ -138,8 +144,14 @@ mod portal_tests {
     #[test]
     fn the_helper_is_run_as_the_portal_expects_and_its_failures_are_named() {
         let dir = crate::testing::tempdir().unwrap();
-        let echo = helper(dir.path(), "printf '%s:%s:%s\\n\\n' \"$1\" \"$2\" \"$(readlink /proc/self/fd/0)\"");
-        assert_eq!(read_portal_credential_from(&echo, "main").unwrap(), "get:main:/dev/null");
+        let echo = helper(
+            dir.path(),
+            "printf '%s:%s:%s\\n\\n' \"$1\" \"$2\" \"$(readlink /proc/self/fd/0)\"",
+        );
+        assert_eq!(
+            read_portal_credential_from(&echo, "main").unwrap(),
+            "get:main:/dev/null"
+        );
 
         let refused = helper(dir.path(), "echo 'no such credential' >&2; exit 3");
         let err = read_portal_credential_from(&refused, "main").unwrap_err();
@@ -152,7 +164,10 @@ mod portal_tests {
 
         let bytes = helper(dir.path(), "printf '\\377'");
         let err = read_portal_credential_from(&bytes, "main").unwrap_err();
-        assert!(err.contains("get main: the credential is not valid UTF-8"), "{err}");
+        assert!(
+            err.contains("get main: the credential is not valid UTF-8"),
+            "{err}"
+        );
         assert!(!err.contains('\u{fffd}'), "{err}");
 
         let absent = dir.path().join("missing").to_string_lossy().into_owned();
@@ -457,7 +472,9 @@ fn print_help_config() {
     println!("  folder = \"Archive\"            # Mailbox name to apply retention (required)");
     println!("  days = 365                   # Expire mail older than this many days (required)");
     println!();
-    println!("# `scrolloff` under [ui] and a [theme] section were the terminal's: accepted, ignored.");
+    println!(
+        "# `scrolloff` under [ui] and a [theme] section were the terminal's: accepted, ignored."
+    );
     println!();
     println!(
         "Legacy: [jmap] section with well_known_url, username, password_command is also supported."

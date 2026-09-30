@@ -13,7 +13,15 @@
 //! exact (no f64 round-trip); recipe and phase JSON today carry only strings,
 //! bools, arrays and objects.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Json {
@@ -237,7 +245,10 @@ impl<'a> Parser<'a> {
             self.i += 1;
         }
         while self.i < self.b.len()
-            && matches!(self.b[self.i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+            && matches!(
+                self.b[self.i],
+                b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'
+            )
         {
             self.i += 1;
         }
@@ -471,19 +482,35 @@ mod tests {
     #[test]
     fn accepts_well_formed_numbers() {
         for s in [
-            "0", "-0", "1", "-1", "42", "1.5", "-3.14", "1e10", "1E10", "1e+10",
-            "1e-10", "0.5", "-2.5e-3", "123456789",
+            "0",
+            "-0",
+            "1",
+            "-1",
+            "42",
+            "1.5",
+            "-3.14",
+            "1e10",
+            "1E10",
+            "1e+10",
+            "1e-10",
+            "0.5",
+            "-2.5e-3",
+            "123456789",
         ] {
             let v = parse(s).unwrap_or_else(|e| panic!("{s} should parse: {e}"));
-            assert_eq!(v.to_canonical(), s, "number lexeme must round-trip verbatim");
+            assert_eq!(
+                v.to_canonical(),
+                s,
+                "number lexeme must round-trip verbatim"
+            );
         }
     }
 
     #[test]
     fn rejects_malformed_numbers() {
         for s in [
-            "-", "1e", "1E+", "1..2", "1+2", "01", "-01", ".5", "1.", "1e1.0",
-            "--1", "0x1", "1e--1",
+            "-", "1e", "1E+", "1..2", "1+2", "01", "-01", ".5", "1.", "1e1.0", "--1", "0x1",
+            "1e--1",
         ] {
             assert!(parse(s).is_err(), "{s} is not a valid JSON number");
         }

@@ -793,7 +793,11 @@ pub fn recipe() -> Recipe {
                    'CONFIG_SND_PCI=y' \
                    'CONFIG_SND_HDA_INTEL=y' \
                    'CONFIG_SND_HDA_GENERIC=y' \
-                   'CONFIG_SND_ALOOP=y' >> .config".replace("@EFI_CMDLINE@", &format!("{:?}", crate::ladder::efi_default_cmdline())),
+                   'CONFIG_SND_ALOOP=y' >> .config"
+                    .replace(
+                        "@EFI_CMDLINE@",
+                        &format!("{:?}", crate::ladder::efi_default_cmdline()),
+                    ),
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -1189,8 +1193,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         for symbol in [
-            "SCSI", "BLK_DEV_SD", "BLK_DEV_SR", "ATA", "SATA_AHCI",
-            "USB_STORAGE", "ISO9660_FS", "BLK_DEV_NVME", "NVME_CORE", "PCI_MSI",
+            "SCSI",
+            "BLK_DEV_SD",
+            "BLK_DEV_SR",
+            "ATA",
+            "SATA_AHCI",
+            "USB_STORAGE",
+            "ISO9660_FS",
+            "BLK_DEV_NVME",
+            "NVME_CORE",
+            "PCI_MSI",
         ] {
             assert!(text.contains(&format!("'CONFIG_{symbol}=y'")));
             assert!(text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")));

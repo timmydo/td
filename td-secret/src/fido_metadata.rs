@@ -245,7 +245,8 @@ impl Protection {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, String> {
-        self.key.require_binding(self.uid(), &self.metadata.binding()?)?;
+        self.key
+            .require_binding(self.uid(), &self.metadata.binding()?)?;
         let metadata = self.metadata.encode()?;
         let key = self.key.encode()?;
         let mut bytes = PROTECTION_MAGIC.to_vec();
@@ -334,7 +335,11 @@ impl BoundRelease {
 struct Reader<'a>(&'a [u8]);
 impl<'a> Reader<'a> {
     fn field(&mut self) -> Result<&'a [u8], String> {
-        let length = u16::from_be_bytes(self.take(2)?.try_into().map_err(|_| "short protection field")?);
+        let length = u16::from_be_bytes(
+            self.take(2)?
+                .try_into()
+                .map_err(|_| "short protection field")?,
+        );
         self.take(usize::from(length))
     }
 
@@ -437,8 +442,14 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn release_fixture(protection: &Protection, role: Role) -> (BoundRelease, Vec<u8>) {
-        let signature = match role { Role::Primary => PRIMARY_SIGNATURE, Role::Recovery => SECOND_SIGNATURE };
-        (protection.request(role, challenge(), &info()).unwrap(), signed(signature))
+        let signature = match role {
+            Role::Primary => PRIMARY_SIGNATURE,
+            Role::Recovery => SECOND_SIGNATURE,
+        };
+        (
+            protection.request(role, challenge(), &info()).unwrap(),
+            signed(signature),
+        )
     }
 
     #[test]
@@ -451,15 +462,27 @@ pub(crate) mod tests {
             assert_eq!(decoded.has_recovery(), recovery);
             assert!(Protection::decode(&encoded, 1001).is_err());
             for size in 0..encoded.len() {
-                assert!(Protection::decode(&encoded[..size], 1000).is_err(), "length {size}");
+                assert!(
+                    Protection::decode(&encoded[..size], 1000).is_err(),
+                    "length {size}"
+                );
             }
-            let mut trailing = encoded.clone(); trailing.push(0);
+            let mut trailing = encoded.clone();
+            trailing.push(0);
             assert!(Protection::decode(&trailing, 1000).is_err());
-            let mut changed = encoded.clone();changed[0] ^= 1;
+            let mut changed = encoded.clone();
+            changed[0] ^= 1;
             assert!(Protection::decode(&changed, 1000).is_err());
-            let primary = decoded.request(Role::Primary, challenge(), &info()).unwrap();
+            let primary = decoded
+                .request(Role::Primary, challenge(), &info())
+                .unwrap();
             assert_eq!(primary.protection_id(), &crypto::digest(&encoded));
-            assert_eq!(decoded.request(Role::Recovery, challenge(), &info()).is_ok(), recovery);
+            assert_eq!(
+                decoded
+                    .request(Role::Recovery, challenge(), &info())
+                    .is_ok(),
+                recovery
+            );
         }
         let protection = protection_fixture(1000, false);
         let wrong_policy = metadata_fixture(1000, true);

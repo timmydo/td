@@ -1,4 +1,4 @@
-use crate::ladder::{SH, mesboot0_inputs, mesboot0_path, unpack_into};
+use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, SH};
 use crate::types::{Recipe, Step};
 
 // CPython 3.11.1 — the python3 glibc 2.41's configure requires (>= 3.4,
@@ -132,7 +132,12 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("python-mesboot", "3.11.1")
         .source_input("python-mesboot-source")
-        .native_inputs(&["gcc-14", "glibc-mesboot-shared", "binutils-244", "make-mesboot"])
+        .native_inputs(&[
+            "gcc-14",
+            "glibc-mesboot-shared",
+            "binutils-244",
+            "make-mesboot",
+        ])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
 }

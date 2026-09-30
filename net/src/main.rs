@@ -69,20 +69,20 @@ mod realfile;
 // time, reported under td-net. That is duplication of RUNS, not of code — a
 // red named `ed25519::tests::*` in this crate belongs to engine/src.
 #[cfg(test)]
-#[path = "../../engine/src/sha512.rs"]
-mod sha512;
-#[cfg(test)]
 #[path = "../../engine/src/ed25519.rs"]
 mod ed25519;
+#[cfg(test)]
+#[path = "../../engine/src/sha512.rs"]
+mod sha512;
 // The engine's SIGNER, test-only here for one purpose: `ed25519_cross.rs`
 // checks it against `ring` in both directions. It is not part of td-net's
 // shipped build — `ring` is the signer this crate uses — and td-boot includes
 // neither this file nor anything that reaches it.
 #[cfg(test)]
+mod ed25519_cross;
+#[cfg(test)]
 #[path = "../../engine/src/ed25519_sign.rs"]
 mod ed25519_sign;
-#[cfg(test)]
-mod ed25519_cross;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

@@ -1,7 +1,10 @@
 #![deny(unsafe_code)]
 
 #[allow(dead_code, reason = "shared immutable application policy")]
-#[cfg_attr(not(feature = "target-recipe"), path = "../../td-busd/src/app_policy.rs")]
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../td-busd/src/app_policy.rs"
+)]
 mod app_policy;
 
 mod attention;
@@ -132,9 +135,10 @@ fn split_term_command(args: &[OsString]) -> Result<(Vec<String>, Vec<OsString>),
 fn utf8_args(args: &[OsString]) -> Result<Vec<String>, String> {
     args.iter()
         .map(|argument| {
-            argument.clone().into_string().map_err(|raw| {
-                format!("argument '{}' is not UTF-8", raw.to_string_lossy())
-            })
+            argument
+                .clone()
+                .into_string()
+                .map_err(|raw| format!("argument '{}' is not UTF-8", raw.to_string_lossy()))
         })
         .collect()
 }
@@ -397,7 +401,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         return Err(
             "--application-ready-socket, --application-app-id, and both \
              --application-content-rgb arguments must be supplied together"
-                .into()
+                .into(),
         );
     }
     if application_ready_socket.is_some() != launcher_application.is_some() {
@@ -474,8 +478,12 @@ fn resolve_socket_endpoint(path: &Path, label: &str) -> Result<PathBuf, String> 
     let parent = path
         .parent()
         .ok_or_else(|| format!("{label} socket path has no parent directory"))?;
-    let parent = std::fs::canonicalize(parent)
-        .map_err(|error| format!("resolve {label} socket parent {}: {error}", parent.display()))?;
+    let parent = std::fs::canonicalize(parent).map_err(|error| {
+        format!(
+            "resolve {label} socket parent {}: {error}",
+            parent.display()
+        )
+    })?;
     Ok(parent.join(name))
 }
 
@@ -654,7 +662,10 @@ fn write_marker(out: &mut impl Write, line: &str) -> Result<(), String> {
 /// The first page flip the runtime accepted as on glass, printed once. The
 /// cookie is the completion's own `user_data`, carried back by the kernel.
 fn announce_first_flip(out: &mut impl Write, frame: output::FrameId) -> Result<(), String> {
-    let line = format!("\nTD-COMPOSITOR-FLIP-OK cookie={:#x} flip=ok\n", frame.cookie());
+    let line = format!(
+        "\nTD-COMPOSITOR-FLIP-OK cookie={:#x} flip=ok\n",
+        frame.cookie()
+    );
     write_marker(out, &line)
 }
 
@@ -766,7 +777,8 @@ fn selftest() -> Result<(), String> {
         return Err("renderer selftest did not copy its surface".into());
     }
     let mut out = std::io::stdout().lock();
-    writeln!(out, "TD-COMPOSITOR-SELFTEST-OK").map_err(|e| format!("write compositor selftest marker: {e}"))?;
+    writeln!(out, "TD-COMPOSITOR-SELFTEST-OK")
+        .map_err(|e| format!("write compositor selftest marker: {e}"))?;
     Ok(())
 }
 
@@ -869,9 +881,7 @@ fn parse_run_flags(args: &[String]) -> Result<(PathBuf, PathBuf), String> {
     ))
 }
 
-fn parse_term_run_flags(
-    args: &[String],
-) -> Result<(PathBuf, PathBuf, Option<PathBuf>), String> {
+fn parse_term_run_flags(args: &[String]) -> Result<(PathBuf, PathBuf, Option<PathBuf>), String> {
     let mut common = Vec::new();
     let mut working_directory = None;
     let mut index = 0;
@@ -947,8 +957,7 @@ fn run_control(args: &[String]) -> Result<(), control::ControlFailure> {
     // Refused rather than unreachable: the request is wrong wherever it was
     // read, and a script branching on the status wants "fix the command"
     // separated from "there is no compositor".
-    let request =
-        control::Request::parse(&line).map_err(control::ControlFailure::Refused)?;
+    let request = control::Request::parse(&line).map_err(control::ControlFailure::Refused)?;
     let socket = match socket {
         Some(socket) => socket,
         None => env::var_os(CONTROL_SOCKET_ENV)
@@ -1105,7 +1114,9 @@ mod tests {
         }
         assert!(Personality::of("/bin/td-ctl", false) == Personality::Control);
         assert!(Personality::of("td-ctl", false) == Personality::Control);
-        assert!(Personality::of("/td/store/x-td-compositor/bin/td-ctl", false) == Personality::Control);
+        assert!(
+            Personality::of("/td/store/x-td-compositor/bin/td-ctl", false) == Personality::Control
+        );
         assert!(Personality::of("/bin/td-ctl", true) == Personality::Control);
         // A name that merely contains one is not that one, here as elsewhere:
         // the control client must not be selected by `td-ctlx` or by a
@@ -1114,7 +1125,9 @@ mod tests {
         assert!(Personality::of("/bin/xtd-ctl", false) == Personality::Compositor);
         assert!(Personality::of("/bin/td-term", false) == Personality::Term);
         assert!(Personality::of("td-term", false) == Personality::Term);
-        assert!(Personality::of("/td/store/x-td-compositor/bin/td-term", false) == Personality::Term);
+        assert!(
+            Personality::of("/td/store/x-td-compositor/bin/td-term", false) == Personality::Term
+        );
         assert!(Personality::of("/bin/td-ui-demo", false) == Personality::Demo);
         assert!(Personality::of("/bin/td-compositor", false) == Personality::Compositor);
         assert!(Personality::of(client::JAIL_FIXTURE_ENTRY, true) == Personality::Demo);
@@ -1201,7 +1214,10 @@ mod tests {
             invocation.extend(tail.iter().map(OsString::from));
             let error = run_term(&invocation).unwrap_err();
             assert!(!error.contains("/s"), "{error}");
-            assert!(error.contains("--command") || error.contains("not absolute"), "{error}");
+            assert!(
+                error.contains("--command") || error.contains("not absolute"),
+                "{error}"
+            );
         }
         assert!(term_usage().contains("[--working-directory PATH]"));
         assert!(term_usage().contains("[--command PROGRAM [ARG...]]"));
@@ -1248,10 +1264,7 @@ mod tests {
             parsed.ready_socket.parent(),
             Some(Path::new("/run/user/1000"))
         );
-        assert_eq!(
-            ready_socket.parent(),
-            Some(Path::new("/run/user/1000"))
-        );
+        assert_eq!(ready_socket.parent(), Some(Path::new("/run/user/1000")));
         let ready_name = parsed.ready_socket.file_name().unwrap().to_string_lossy();
         assert!(ready_name.starts_with("td-launcher-"));
         assert!(ready_name.ends_with("-7.ready"));
@@ -1269,12 +1282,8 @@ mod tests {
         let parsed = parse_client_run(arguments.get(1..).unwrap()).unwrap();
         assert_eq!(parsed.socket, launch.socket);
         assert_eq!(parsed.ready_socket, ready_socket);
-        let (program, arguments, task_ready) = launcher::launch_command(
-            &launch,
-            launcher::LaunchRequest::TaskTerminal,
-            9,
-        )
-        .unwrap();
+        let (program, arguments, task_ready) =
+            launcher::launch_command(&launch, launcher::LaunchRequest::TaskTerminal, 9).unwrap();
         assert_eq!(program, launch.terminal);
         let arguments: Vec<String> = arguments
             .into_iter()
@@ -1283,7 +1292,10 @@ mod tests {
         let parsed = parse_term_run_flags(arguments.get(1..).unwrap()).unwrap();
         assert_eq!(parsed.0, launch.socket);
         assert_eq!(parsed.1, task_ready);
-        assert_eq!(parsed.2.as_deref(), Some(Path::new(launcher::TASK_DIRECTORY)));
+        assert_eq!(
+            parsed.2.as_deref(),
+            Some(Path::new(launcher::TASK_DIRECTORY))
+        );
         // The two usage strings are hand-written and the parser is not, so the
         // thing that can drift is what each TELLS an operator. Both must spell
         // the shared flags identically, or one personality documents a
@@ -1298,8 +1310,14 @@ mod tests {
 #[cfg(not(feature = "target-recipe"))]
 mod confinement {
     const IMPORTERS: &[(&str, &str)] = &[
-        ("import-libvterm.rs", include_str!("../tools/import-libvterm.rs")),
-        ("import-unifont.rs", include_str!("../tools/import-unifont.rs")),
+        (
+            "import-libvterm.rs",
+            include_str!("../tools/import-libvterm.rs"),
+        ),
+        (
+            "import-unifont.rs",
+            include_str!("../tools/import-unifont.rs"),
+        ),
     ];
     const MAIN: &str = include_str!("main.rs");
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
@@ -1313,7 +1331,10 @@ mod confinement {
     const AUTH_SYS: &str = include_str!("../../td-authd/src/sys.rs");
 
     const OTHER: &[(&str, &str)] = &[
-        ("app_policy.rs", include_str!("../../td-busd/src/app_policy.rs")),
+        (
+            "app_policy.rs",
+            include_str!("../../td-busd/src/app_policy.rs"),
+        ),
         ("attention.rs", include_str!("attention.rs")),
         ("authority.rs", AUTHORITY),
         ("bar.rs", include_str!("bar.rs")),
@@ -1422,7 +1443,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("../../td-authd/src/consent.rs")),
-            0x60d62ec39aea1d04,
+            0xadb03ad6a8495644,
             "shared consent changed: reconcile td-secret/src/main.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
@@ -1705,7 +1726,10 @@ unsafe impl Send for MappedRegion {}"#;
         assert_eq!(occurrences(SYS, guard), 1);
         assert_eq!(occurrences(SYS, entry), 1);
         assert_eq!(occurrences(SYS, "fn fcntl("), 1);
-        assert_eq!(occurrences(production(SYS), "fcntl(file.as_raw_fd(), F_GETFL, 0"), 1);
+        assert_eq!(
+            occurrences(production(SYS), "fcntl(file.as_raw_fd(), F_GETFL, 0"),
+            1
+        );
         assert_eq!(
             occurrences(
                 production(SYS),
@@ -1720,10 +1744,7 @@ unsafe impl Send for MappedRegion {}"#;
             ),
             1
         );
-        for wrapper in [
-            "pub fn make_nonblocking(",
-            "pub fn restore_status_flags(",
-        ] {
+        for wrapper in ["pub fn make_nonblocking(", "pub fn restore_status_flags("] {
             assert_eq!(occurrences(SYS, wrapper), 1, "{wrapper}");
         }
     }
@@ -2044,8 +2065,12 @@ unsafe impl Send for MappedRegion {}"#;
             .find("pub struct SwapChain<C, M> {")
             .and_then(|start| drm.get(start..))
             .expect("drm.rs no longer declares SwapChain");
-        let chain = chain.get(..chain.find("\n}").unwrap_or(chain.len())).unwrap_or_default();
-        let crtc_field = chain.find("    crtc: C,").expect("SwapChain lost its CRTC field");
+        let chain = chain
+            .get(..chain.find("\n}").unwrap_or(chain.len()))
+            .unwrap_or_default();
+        let crtc_field = chain
+            .find("    crtc: C,")
+            .expect("SwapChain lost its CRTC field");
         let buffers_field = chain
             .find("    buffers: [Slot<M>; 2],")
             .expect("SwapChain lost its buffers field");
@@ -2059,7 +2084,9 @@ unsafe impl Send for MappedRegion {}"#;
             .find("impl Drop for CardCrtc {")
             .and_then(|start| drm.get(start..))
             .expect("CardCrtc no longer releases in a Drop");
-        let teardown = teardown.get(..teardown.find("\n}").unwrap_or(teardown.len())).unwrap_or_default();
+        let teardown = teardown
+            .get(..teardown.find("\n}").unwrap_or(teardown.len()))
+            .unwrap_or_default();
         let restore_call = teardown
             .find("sys::drm_set_crtc(&*self.card, &self.saved, &mut self.routed)")
             .expect("CardCrtc no longer restores its saved state");
@@ -2108,7 +2135,9 @@ unsafe impl Send for MappedRegion {}"#;
             .find("pub struct ScanoutBuffer {")
             .and_then(|start| drm.get(start..))
             .expect("drm.rs no longer declares ScanoutBuffer");
-        let owned = owned.get(..owned.find('}').unwrap_or(owned.len())).unwrap_or_default();
+        let owned = owned
+            .get(..owned.find('}').unwrap_or(owned.len()))
+            .unwrap_or_default();
         let owned_region = owned
             .find("region: sys::MappedRegion,")
             .expect("ScanoutBuffer no longer holds its mapping by that name");
@@ -2123,7 +2152,9 @@ unsafe impl Send for MappedRegion {}"#;
             .find("impl Drop for Registration {")
             .and_then(|start| drm.get(start..))
             .expect("Registration no longer releases in a Drop");
-        let released = released.get(..released.find("\n}").unwrap_or(released.len())).unwrap_or_default();
+        let released = released
+            .get(..released.find("\n}").unwrap_or(released.len()))
+            .unwrap_or_default();
         let unregister = released
             .find("sys::drm_rm_fb(&*self.card, self.fb_id)")
             .expect("Registration no longer unregisters its framebuffer");
@@ -2354,7 +2385,7 @@ pub struct MappedRegion {
         let drm = production(DRM);
         for call in [
             "let driver = sys::drm_driver_name(card)?;",
-            "let resources = sys::drm_resources(card)",
+            "let resources =\n        sys::drm_resources(card).map_err(|error| format!(\"{error} (driver {driver})\"))?;",
             "let Ok(connector) = sys::drm_connector(card, *connector_id) else {",
             "if let Ok(encoder) = sys::drm_encoder(card, connector.encoder_id) {",
             "let Ok(encoder) = sys::drm_encoder(card, *encoder_id) else {",
@@ -2466,8 +2497,11 @@ pub struct MappedRegion {
             }
             let mut source = squeezed(source);
             if name == "vm_bridge.rs" {
-                assert_eq!(source.matches("conn::write_clipboard(").count(), 1,
-                    "VM clipboard writes must have one bounded transport entry");
+                assert_eq!(
+                    source.matches("conn::write_clipboard(").count(),
+                    1,
+                    "VM clipboard writes must have one bounded transport entry"
+                );
                 source = source.replace("conn::write_clipboard(", "");
             }
             for form in [concat!("conn", "::"), concat!("conn", "as")] {
@@ -2498,8 +2532,8 @@ pub struct MappedRegion {
             "private listener peer authentication must have one kernel query"
         );
         assert!(production(server).contains("static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1)"));
-        for (name, source) in std::iter::once(("main.rs", production_main))
-            .chain(OTHER.iter().copied())
+        for (name, source) in
+            std::iter::once(("main.rs", production_main)).chain(OTHER.iter().copied())
         {
             // This roster includes generated modules without test sections.
             let source = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
@@ -2539,10 +2573,16 @@ pub struct MappedRegion {
             1,
             "client selection endpoints must have one exact conversion site"
         );
-        assert_eq!(occurrences(production(client), "sys::ReceivedFd::into_file("), 0,
-            "exact endpoint conversion escaped the client transport module");
-        assert_eq!(occurrences(production(server), "sys::ReceivedFd::into_file("), 1,
-            "server clipboard endpoints must have one exact conversion site");
+        assert_eq!(
+            occurrences(production(client), "sys::ReceivedFd::into_file("),
+            0,
+            "exact endpoint conversion escaped the client transport module"
+        );
+        assert_eq!(
+            occurrences(production(server), "sys::ReceivedFd::into_file("),
+            1,
+            "server clipboard endpoints must have one exact conversion site"
+        );
         assert_eq!(
             occurrences(
                 production(conn),
@@ -2902,7 +2942,10 @@ pub struct MappedRegion {
             .err()
             .is_some_and(|error| error.contains("--card or --framebuffer is required")));
         assert_eq!(options.launcher_client, None);
-        assert_eq!(options.launcher_application.as_deref(), Some("td-jail-fixture"));
+        assert_eq!(
+            options.launcher_application.as_deref(),
+            Some("td-jail-fixture")
+        );
         assert_eq!(
             options.terminal_client,
             Some(std::path::PathBuf::from("/bin/td-term"))
@@ -2916,14 +2959,8 @@ pub struct MappedRegion {
             options.application_ready_socket,
             Some(resolved_parent.join("firefox-window-ready"))
         );
-        assert_eq!(
-            options.application_content_rgb_a.as_deref(),
-            Some("ff00ff")
-        );
-        assert_eq!(
-            options.application_content_rgb_b.as_deref(),
-            Some("00ff00")
-        );
+        assert_eq!(options.application_content_rgb_a.as_deref(), Some("ff00ff"));
+        assert_eq!(options.application_content_rgb_b.as_deref(), Some("00ff00"));
         let mut activation_without_observer = valid(&wayland, &portal, &ready);
         activation_without_observer.truncate(activation_without_observer.len() - 8);
         assert!(super::parse_run(&activation_without_observer).is_err());
@@ -2953,12 +2990,7 @@ pub struct MappedRegion {
             &actual.join(".").join("wayland-0")
         ))
         .is_err());
-        assert!(super::parse_run(&valid(
-            &wayland,
-            &portal,
-            &alias.join("wayland-0")
-        ))
-        .is_err());
+        assert!(super::parse_run(&valid(&wayland, &portal, &alias.join("wayland-0"))).is_err());
         assert!(super::parse_run(&valid(&wayland, &wayland, &ready)).is_err());
         assert!(super::parse_run(&valid(&wayland, &ready, &ready)).is_err());
         // The observer is meaningful only as one exact argument set around a
@@ -3011,10 +3043,7 @@ pub struct MappedRegion {
         // The activation-only application mode cannot also retain a dead
         // direct launcher client.
         let mut both_modes = valid(&wayland, &portal, &ready);
-        both_modes.extend([
-            "--launcher-client".into(),
-            "/bin/td-ui-demo".into(),
-        ]);
+        both_modes.extend(["--launcher-client".into(), "/bin/td-ui-demo".into()]);
         assert!(super::parse_run(&both_modes).is_err());
         assert!(super::parse_run(&[
             "--framebuffer".into(),

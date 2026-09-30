@@ -1,4 +1,4 @@
-use crate::ladder::{SH, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
+use crate::ladder::{link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH};
 use crate::types::{Recipe, Step};
 
 // GNU awk 3.1.8 — rung 14 (#378, guix's gawk-mesboot): gcc-mesboot1 builds the

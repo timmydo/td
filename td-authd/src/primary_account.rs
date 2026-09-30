@@ -49,9 +49,9 @@ fn number(value: &str) -> io::Result<u32> {
 pub(crate) fn validate_name(name: &str) -> io::Result<()> {
     if name.len() > 32
         || !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-        || !name.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
-        })
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte))
     {
         return Err(invalid("primary name requires 1-32 lowercase ASCII letters, digits, underscores or hyphens, starting with a letter"));
     }

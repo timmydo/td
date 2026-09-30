@@ -182,8 +182,12 @@ pub fn build(entries: &[Entry]) -> Result<Vec<u8>, String> {
             // header: it is what keeps `maybe_link` out of the path entirely.
             Kind::File(data) => (S_IFREG | entry.mode, 1u32, *data),
         };
-        let size = u32::try_from(data.len())
-            .map_err(|_| format!("cpio: {} is too large for a newc filesize field", entry.name))?;
+        let size = u32::try_from(data.len()).map_err(|_| {
+            format!(
+                "cpio: {} is too large for a newc filesize field",
+                entry.name
+            )
+        })?;
         push_header(
             &mut out, ino, mode, nlink, MTIME, size, entry.name, DEV_MAJOR, DEV_MINOR,
         )?;
@@ -244,7 +248,9 @@ fn check_name(name: &str) -> Result<(), String> {
     // one the caller wrote down.
     for component in name.split('/') {
         if component == "." || component == ".." {
-            return Err(format!("cpio: entry name {name:?} contains a {component:?} component"));
+            return Err(format!(
+                "cpio: entry name {name:?} contains a {component:?} component"
+            ));
         }
         if component.is_empty() {
             return Err(format!("cpio: entry name {name:?} has an empty component"));
@@ -277,19 +283,11 @@ fn push_header(
     let before = out.len();
     out.extend_from_slice(MAGIC);
     for field in [
-        ino,
-        mode,
-        0,          // uid
-        0,          // gid
-        nlink,
-        mtime,
-        size,
-        dev_major,
-        dev_minor,
-        0,          // rdevmajor
-        0,          // rdevminor
-        namesize,
-        0,          // chksum: zero, and only honest because the magic is 070701
+        ino, mode, 0, // uid
+        0, // gid
+        nlink, mtime, size, dev_major, dev_minor, 0, // rdevmajor
+        0, // rdevminor
+        namesize, 0, // chksum: zero, and only honest because the magic is 070701
     ] {
         out.extend_from_slice(&hex8(field));
     }
@@ -306,7 +304,11 @@ fn push_header(
 }
 
 fn pad_to(out: &mut Vec<u8>, align: usize) {
-    let padding = if align == 0 { 0 } else { (align - (out.len() % align)) % align };
+    let padding = if align == 0 {
+        0
+    } else {
+        (align - (out.len() % align)) % align
+    };
     out.resize(out.len().saturating_add(padding), 0);
 }
 
@@ -316,9 +318,7 @@ fn hex8(value: u32) -> [u8; 8] {
     let mut out = [b'0'; 8];
     let mut remaining = value;
     for slot in out.iter_mut().rev() {
-        *slot = *DIGITS
-            .get((remaining & 0xf) as usize)
-            .unwrap_or(&b'0');
+        *slot = *DIGITS.get((remaining & 0xf) as usize).unwrap_or(&b'0');
         remaining >>= 4;
     }
     out
@@ -360,9 +360,17 @@ mod tests {
         }])
         .unwrap();
 
-        assert_eq!(&archive[..6], b"070701", "magic: 070702 would demand a real chksum");
+        assert_eq!(
+            &archive[..6],
+            b"070701",
+            "magic: 070702 would demand a real chksum"
+        );
         assert_eq!(field(&archive, 0, 0), 721, "ino");
-        assert_eq!(field(&archive, 0, 1), 0o100644, "mode: S_IFREG, not a symlink or a device");
+        assert_eq!(
+            field(&archive, 0, 1),
+            0o100644,
+            "mode: S_IFREG, not a symlink or a device"
+        );
         assert_eq!(field(&archive, 0, 2), 0, "uid");
         assert_eq!(field(&archive, 0, 3), 0, "gid");
         assert_eq!(field(&archive, 0, 4), 1, "nlink");
@@ -400,7 +408,11 @@ mod tests {
             kind: Kind::Directory,
         }])
         .unwrap();
-        assert_eq!(field(&archive, 0, 1), 0o040755, "mode: S_IFDIR, not a block device");
+        assert_eq!(
+            field(&archive, 0, 1),
+            0o040755,
+            "mode: S_IFDIR, not a block device"
+        );
         assert_eq!(field(&archive, 0, 4), 2, "nlink");
         assert_eq!(field(&archive, 0, 6), 0, "filesize");
     }
@@ -417,19 +429,39 @@ mod tests {
     #[test]
     fn every_header_starts_four_aligned_and_every_pad_byte_is_nul() {
         let archive = build(&[
-            Entry { name: "etc", mode: 0o755, kind: Kind::Directory },
+            Entry {
+                name: "etc",
+                mode: 0o755,
+                kind: Kind::Directory,
+            },
             // Deliberately awkward: a name and a body whose lengths are not
             // multiples of four, so both padding rules have to be right.
-            Entry { name: "etc/a", mode: 0o644, kind: Kind::File(b"12345") },
-            Entry { name: "etc/bb", mode: 0o644, kind: Kind::File(b"1") },
-            Entry { name: "etc/ccc", mode: 0o600, kind: Kind::File(&[]) },
+            Entry {
+                name: "etc/a",
+                mode: 0o644,
+                kind: Kind::File(b"12345"),
+            },
+            Entry {
+                name: "etc/bb",
+                mode: 0o644,
+                kind: Kind::File(b"1"),
+            },
+            Entry {
+                name: "etc/ccc",
+                mode: 0o600,
+                kind: Kind::File(&[]),
+            },
         ])
         .unwrap();
 
         let mut at = 0usize;
         let mut seen = 0;
         loop {
-            assert_eq!(at % 4, 0, "header {seen} starts at {at}, which is not 4-aligned");
+            assert_eq!(
+                at % 4,
+                0,
+                "header {seen} starts at {at}, which is not 4-aligned"
+            );
             assert_eq!(&archive[at..at + 6], b"070701", "header {seen} magic");
             let namesize = field(&archive, at, 11) as usize;
             let filesize = field(&archive, at, 6) as usize;
@@ -438,9 +470,10 @@ mod tests {
             let padded_name = after_name.next_multiple_of(4);
             let after_data = padded_name + filesize;
             let next = after_data.next_multiple_of(4);
-            for (label, range) in
-                [("name", after_name..padded_name), ("data", after_data..next)]
-            {
+            for (label, range) in [
+                ("name", after_name..padded_name),
+                ("data", after_data..next),
+            ] {
                 for offset in range {
                     assert_eq!(
                         archive.get(offset).copied(),
@@ -457,7 +490,11 @@ mod tests {
             assert!(seen < 16, "walked off the end without finding a trailer");
         }
         assert_eq!(seen, 5, "four entries and the trailer");
-        assert_eq!(at, archive.len(), "the walk must consume the archive exactly");
+        assert_eq!(
+            at,
+            archive.len(),
+            "the walk must consume the archive exactly"
+        );
     }
 
     /// The trailer's device numbers are 0 where a real entry's are 3 and 1
@@ -477,7 +514,7 @@ mod tests {
         // named.
         for index in 0..13 {
             let expected = match index {
-                4 => 1,  // nlink
+                4 => 1,   // nlink
                 11 => 11, // namesize, counting the NUL
                 _ => 0,
             };
@@ -490,8 +527,17 @@ mod tests {
         }
         assert_eq!(name_at(&archive, 0, 11), TRAILER_NAME);
         // And the contrast that makes those three meaningful.
-        let entry = build(&[Entry { name: "x", mode: 0o644, kind: Kind::File(b"y") }]).unwrap();
-        assert_eq!(field(&entry, 0, 5), 1, "a real entry's mtime is not the trailer's");
+        let entry = build(&[Entry {
+            name: "x",
+            mode: 0o644,
+            kind: Kind::File(b"y"),
+        }])
+        .unwrap();
+        assert_eq!(
+            field(&entry, 0, 5),
+            1,
+            "a real entry's mtime is not the trailer's"
+        );
         assert_eq!(field(&entry, 0, 7), 3, "devmajor");
         assert_eq!(field(&entry, 0, 8), 1, "devminor");
     }
@@ -503,7 +549,10 @@ mod tests {
     fn alignment_padding_is_the_least_that_lands_the_next_magic_on_four() {
         for length in 0..16usize {
             let padding = alignment_padding(length);
-            assert!(padding < 4, "length {length} asked for {padding} bytes of padding");
+            assert!(
+                padding < 4,
+                "length {length} asked for {padding} bytes of padding"
+            );
             assert_eq!((length + padding) % 4, 0, "length {length}");
         }
     }
@@ -515,8 +564,16 @@ mod tests {
     fn building_the_same_entries_twice_gives_the_same_bytes() {
         let entries = || {
             vec![
-                Entry { name: "etc", mode: 0o755, kind: Kind::Directory },
-                Entry { name: "etc/deployment.pub", mode: 0o644, kind: Kind::File(b"abc\n") },
+                Entry {
+                    name: "etc",
+                    mode: 0o755,
+                    kind: Kind::Directory,
+                },
+                Entry {
+                    name: "etc/deployment.pub",
+                    mode: 0o644,
+                    kind: Kind::File(b"abc\n"),
+                },
             ]
         };
         assert_eq!(build(&entries()).unwrap(), build(&entries()).unwrap());
@@ -549,8 +606,12 @@ mod tests {
             // and install nothing.
             (&"a".repeat(PATH_MAX), "over PATH_MAX"),
         ] {
-            let error = build(&[Entry { name, mode: 0o644, kind: Kind::File(b"x") }])
-                .expect_err(&format!("{name:?} must be refused"));
+            let error = build(&[Entry {
+                name,
+                mode: 0o644,
+                kind: Kind::File(b"x"),
+            }])
+            .expect_err(&format!("{name:?} must be refused"));
             assert!(
                 error.contains(reason),
                 "{name:?} must be refused for {reason:?}, got {error:?}"
@@ -566,7 +627,12 @@ mod tests {
             kind: Kind::File(b"x"),
         }])
         .is_err());
-        assert!(build(&[Entry { name: "x", mode: 0o7777, kind: Kind::Directory }]).is_ok());
+        assert!(build(&[Entry {
+            name: "x",
+            mode: 0o7777,
+            kind: Kind::Directory
+        }])
+        .is_ok());
     }
 
     /// The other side of the PATH_MAX boundary, so the refusal is a boundary

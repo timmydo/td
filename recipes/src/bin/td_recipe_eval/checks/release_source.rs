@@ -173,7 +173,12 @@ impl ReleaseSource {
         self.stage_with_upstream(root, directory, None)
     }
 
-    pub(crate) fn stage_with_upstream(&self, root: &Path, directory: &Path, upstream: Option<&upstream::Upstream>) -> Result<(), String> {
+    pub(crate) fn stage_with_upstream(
+        &self,
+        root: &Path,
+        directory: &Path,
+        upstream: Option<&upstream::Upstream>,
+    ) -> Result<(), String> {
         self.verify_checkout(root)?;
         fs::create_dir(directory)
             .map_err(|e| format!("create release source {}: {e}", directory.display()))?;
@@ -275,12 +280,19 @@ mod tests {
     #[ignore = "requires host Git; run release_source tests with --ignored"]
     fn explicit_upstream_survives_export_and_volume_copy() {
         let repository = Fixture::new();
-        output(git(&repository.0).args(["remote", "add", "origin", "/publisher/private"]), "fixture remote").unwrap();
+        output(
+            git(&repository.0).args(["remote", "add", "origin", "/publisher/private"]),
+            "fixture remote",
+        )
+        .unwrap();
         let source = ReleaseSource::inspect(&repository.0).unwrap();
         let scratch = Fixture::directory();
         let export = scratch.0.join("export");
-        let settings = upstream::Upstream::new("https://example.invalid/td.git", "release/rolling").unwrap();
-        source.stage_with_upstream(&repository.0, &export, Some(&settings)).unwrap();
+        let settings =
+            upstream::Upstream::new("https://example.invalid/td.git", "release/rolling").unwrap();
+        source
+            .stage_with_upstream(&repository.0, &export, Some(&settings))
+            .unwrap();
         assert_eq!(upstream::read(&export).unwrap(), Some(settings.clone()));
         let volume = scratch.0.join("volume");
         fs::create_dir_all(volume.join("td")).unwrap();
@@ -288,10 +300,19 @@ mod tests {
         let installed = volume.join(VOLUME_DIRECTORY);
         assert_eq!(upstream::read(&installed).unwrap(), Some(settings));
         assert_eq!(fs::read_dir(&installed).unwrap().count(), 3);
-        let expected: u64 = [BUNDLE_NAME, REVISION_NAME, upstream::NAME].iter()
-            .map(|name| fs::metadata(export.join(name)).unwrap().len()).sum();
+        let expected: u64 = [BUNDLE_NAME, REVISION_NAME, upstream::NAME]
+            .iter()
+            .map(|name| fs::metadata(export.join(name)).unwrap().len())
+            .sum();
         assert_eq!(payload_bytes(&export).unwrap(), expected);
-        assert_eq!(fs::metadata(installed.join(upstream::NAME)).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(
+            fs::metadata(installed.join(upstream::NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
     }
 
     #[test]

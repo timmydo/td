@@ -84,9 +84,15 @@ fn observation(reply: &[u8], session: &str, window: &str) -> Result<Observation>
     let body = text
         .strip_prefix(&prefix)
         .ok_or("compositor observation identity")?;
-    let (client, body) = body.split_once(" commit=").ok_or("compositor client field")?;
-    let (commit, body) = body.split_once(" output=").ok_or("compositor commit field")?;
-    let (output, current) = body.split_once(" current=").ok_or("compositor output field")?;
+    let (client, body) = body
+        .split_once(" commit=")
+        .ok_or("compositor client field")?;
+    let (commit, body) = body
+        .split_once(" output=")
+        .ok_or("compositor commit field")?;
+    let (output, current) = body
+        .split_once(" current=")
+        .ok_or("compositor output field")?;
     let observation = Observation {
         client: number(client)?,
         commit: number(commit)?,
@@ -299,11 +305,19 @@ struct ChooserClient {
 }
 
 impl ChooserClient {
-    fn new(stream: UnixStream, temporary: PathBuf, chooser: Chooser, stop: Arc<AtomicBool>) -> Self {
+    fn new(
+        stream: UnixStream,
+        temporary: PathBuf,
+        chooser: Chooser,
+        stop: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             client: Client::new(stream, temporary).unwrap(),
             chooser,
-            size: (td_portal::file_chooser::WIDTH, td_portal::file_chooser::HEIGHT),
+            size: (
+                td_portal::file_chooser::WIDTH,
+                td_portal::file_chooser::HEIGHT,
+            ),
             dirty: true,
             stop,
         }
@@ -339,8 +353,16 @@ impl App for ChooserClient {
                 if let Some((width, height)) = size {
                     let (current_w, current_h) = self.size;
                     self.size = (
-                        if width <= 0 { current_w } else { width as usize },
-                        if height <= 0 { current_h } else { height as usize },
+                        if width <= 0 {
+                            current_w
+                        } else {
+                            width as usize
+                        },
+                        if height <= 0 {
+                            current_h
+                        } else {
+                            height as usize
+                        },
                     );
                     self.dirty = true;
                 }
@@ -378,7 +400,9 @@ impl App for ChooserClient {
             return Ok(());
         }
         let (width, height) = self.size;
-        let Self { client, chooser, .. } = self;
+        let Self {
+            client, chooser, ..
+        } = self;
         let presented = client.present(width, height, &mut |pixels| {
             let frame = chooser.render_sized(width, height)?;
             if frame.len() != pixels.len() {
@@ -429,7 +453,8 @@ fn chooser_presents_over_the_native_compositor() {
     let client_runtime = client_directory.0.clone();
     let client_root = root.clone();
     let client = std::thread::spawn(move || -> Result<()> {
-        let stream = UnixStream::connect(&socket).map_err(|e| format!("connect compositor: {e}"))?;
+        let stream =
+            UnixStream::connect(&socket).map_err(|e| format!("connect compositor: {e}"))?;
         let chooser = open_chooser(&client_root);
         let mut app = ChooserClient::new(stream, client_runtime, chooser, client_stop);
         run(&mut app)

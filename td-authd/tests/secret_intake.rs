@@ -46,10 +46,19 @@ fn capture_retains_exact_bytes_and_selection_is_one_shot() {
     assert_eq!(reply, [ADMITTED]);
     pending.poll().unwrap();
     client.set_nonblocking(true).unwrap();
-    assert_eq!(client.read(&mut reply).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(
+        client.read(&mut reply).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
     assert!(file.write_all(b"replacement").is_err());
     let (operation, captured) = pending.capture().unwrap();
-    assert_eq!(operation, Target::parse("mail/main", Role::Recovery).unwrap().operation(1000, 65537).unwrap());
+    assert_eq!(
+        operation,
+        Target::parse("mail/main", Role::Recovery)
+            .unwrap()
+            .operation(1000, 65537)
+            .unwrap()
+    );
     assert_eq!(captured.0, vec![0xa5; MAX_SECRET]);
     assert!(pending.capture().is_err());
     drop(client);
@@ -67,11 +76,17 @@ fn descriptor_validation_precedes_application_admission() {
         let file = match mode {
             0 => credential(&[]),
             1 => credential(&vec![42; MAX_SECRET + 1]),
-            2 => { let mut file = sys::create_credential().unwrap(); file.write_all(b"mutable").unwrap(); file },
+            2 => {
+                let mut file = sys::create_credential().unwrap();
+                file.write_all(b"mutable").unwrap();
+                file
+            }
             _ => File::open("/dev/null").unwrap(),
         };
         sys::send_descriptor(&client, &frame(), &file).unwrap();
-        assert!(pending.poll_with(|_, _| panic!("admitted invalid descriptor")).is_err());
+        assert!(pending
+            .poll_with(|_, _| panic!("admitted invalid descriptor"))
+            .is_err());
         assert!(pending.operation.is_none());
     }
 }
@@ -80,14 +95,18 @@ fn descriptor_validation_precedes_application_admission() {
 fn missing_multiple_and_late_descriptors_are_refused() {
     let (mut client, mut pending) = pair();
     client.write_all(&frame()).unwrap();
-    assert!(pending.poll_with(|_, _| panic!("admitted missing descriptor")).is_err());
+    assert!(pending
+        .poll_with(|_, _| panic!("admitted missing descriptor"))
+        .is_err());
 
     let (client, mut pending) = pair();
     let frame = frame();
     let file = credential(b"secret");
     sys::send_descriptor(&client, &frame[..2], &file).unwrap();
     sys::send_descriptor(&client, &frame[2..], &file).unwrap();
-    assert!(pending.poll_with(|_, _| panic!("admitted multiple descriptors")).is_err());
+    assert!(pending
+        .poll_with(|_, _| panic!("admitted multiple descriptors"))
+        .is_err());
 
     let (client, mut pending) = pair();
     sys::send_descriptor(&client, &frame, &file).unwrap();
@@ -101,7 +120,9 @@ fn identity_and_expiration_are_checked_before_capture() {
     let (client, mut pending) = pair();
     sys::send_descriptor(&client, &frame(), &credential(b"secret")).unwrap();
     pending.owner = pending.owner.saturating_add(1);
-    assert!(pending.poll_with(|_, _| panic!("admitted wrong sender")).is_err());
+    assert!(pending
+        .poll_with(|_, _| panic!("admitted wrong sender"))
+        .is_err());
 
     let (client, mut pending) = pair();
     sys::send_descriptor(&client, &frame(), &credential(b"secret")).unwrap();
@@ -116,7 +137,9 @@ fn identity_and_expiration_are_checked_before_capture() {
 #[ignore = "exec-only delegated sender fixture"]
 fn delegated_sender() {
     let mut stream = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned().unwrap());
-    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
     stream.write_all(&frame()[2..]).unwrap();
     let _ = stream.read(&mut [0]);
 }
@@ -130,13 +153,27 @@ fn inherited_connection_cannot_replace_the_pinned_requester() {
     pending.poll_with(admit).unwrap();
     assert!(pending.peer.is_some());
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "secret_intake::tests::delegated_sender", "--ignored"])
-        .stdin(Stdio::from(OwnedFd::from(client))).stdout(Stdio::null()).stderr(Stdio::null())
-        .spawn().unwrap();
+        .args([
+            "--exact",
+            "secret_intake::tests::delegated_sender",
+            "--ignored",
+        ])
+        .stdin(Stdio::from(OwnedFd::from(client)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
     let until = Instant::now() + Duration::from_secs(2);
     let refused = loop {
-        if pending.poll_with(|_, _| panic!("admitted delegated sender")).is_err() { break true; }
-        if Instant::now() >= until { break false; }
+        if pending
+            .poll_with(|_, _| panic!("admitted delegated sender"))
+            .is_err()
+        {
+            break true;
+        }
+        if Instant::now() >= until {
+            break false;
+        }
         std::thread::sleep(Duration::from_millis(1));
     };
     let _ = child.kill();
@@ -150,7 +187,9 @@ fn inherited_connection_cannot_replace_the_pinned_requester() {
 fn root_public_client_uses_the_human_identity_and_immutable_descriptor() {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    assert!(fs::read_to_string("/proc/cmdline").unwrap().split_whitespace()
+    assert!(fs::read_to_string("/proc/cmdline")
+        .unwrap()
+        .split_whitespace()
         .any(|word| word == "td.write-intake-fixture=1"));
     assert!(!std::path::Path::new("/etc/passwd").exists());
     fs::create_dir_all("/etc").unwrap();
@@ -168,13 +207,27 @@ fn root_public_client_uses_the_human_identity_and_immutable_descriptor() {
     let mut intake = Intake::bind(1000).unwrap();
     assert!(intake.select().is_err());
     let metadata = fs::symlink_metadata(SOCKET).unwrap();
-    assert_eq!((metadata.uid(), metadata.gid(), metadata.mode() & 0o7777), (1000, 1000, 0o600));
+    assert_eq!(
+        (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777),
+        (1000, 1000, 0o600)
+    );
     for (uid, recovery) in [(1000, false), (1000, true), (65537, false), (0, false)] {
         let mut command = Command::new("/bin/td-secret");
         command.arg("set");
-        if recovery { command.arg("--recovery"); }
-        let mut child = command.arg("mail/main").uid(uid).gid(uid).env_clear().current_dir("/")
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::from(File::create("/run/intake-client.log").unwrap())).spawn().unwrap();
+        if recovery {
+            command.arg("--recovery");
+        }
+        let mut child = command
+            .arg("mail/main")
+            .uid(uid)
+            .gid(uid)
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(File::create("/run/intake-client.log").unwrap()))
+            .spawn()
+            .unwrap();
         let mut stdin = child.stdin.take().unwrap();
         let _ = stdin.write_all(b"exact credential\nbytes\0");
         drop(stdin);
@@ -183,36 +236,63 @@ fn root_public_client_uses_the_human_identity_and_immutable_descriptor() {
         let mut admission_seen = false;
         loop {
             intake.tick();
-            if intake.pending.as_ref().is_some_and(|pending| pending.operation.is_some() && !pending.acknowledged) {
+            if intake
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.operation.is_some() && !pending.acknowledged)
+            {
                 admission_seen = true;
                 assert!(intake.pending.as_mut().unwrap().capture().is_err());
-                assert!(!fs::read_to_string("/run/intake-client.log").unwrap().contains("then W"));
+                assert!(!fs::read_to_string("/run/intake-client.log")
+                    .unwrap()
+                    .contains("then W"));
             }
             let log = fs::read_to_string("/run/intake-client.log").unwrap();
             if log.contains("then W") && !captured {
                 assert!(admission_seen);
-                assert!(intake.pending.as_ref().is_some_and(|pending| pending.acknowledged));
+                assert!(intake
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.acknowledged));
                 assert_eq!(uid, 1000, "nonhuman requester reached admission");
                 assert!(!captured);
                 let (operation, credential) = intake.select().unwrap();
                 assert_eq!(credential.0, b"exact credential\nbytes\0");
-                let role = if recovery { Role::Recovery } else { Role::Primary };
-                assert_eq!(operation, Target::parse("mail/main", role).unwrap().operation(1000, 65537).unwrap());
+                let role = if recovery {
+                    Role::Recovery
+                } else {
+                    Role::Primary
+                };
+                assert_eq!(
+                    operation,
+                    Target::parse("mail/main", role)
+                        .unwrap()
+                        .operation(1000, 65537)
+                        .unwrap()
+                );
                 assert!(intake.select().is_err());
                 captured = true;
                 // Transport fixture only: no store write or hardware claim.
                 intake.finish(true);
             }
-            if child.try_wait().unwrap().is_some() { break; }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
             if Instant::now() >= until {
-                child.kill().unwrap(); child.wait().unwrap(); panic!("public client stalled");
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("public client stalled");
             }
             std::thread::sleep(Duration::from_millis(1));
         }
         let output = child.wait_with_output().unwrap();
         let log = fs::read_to_string("/run/intake-client.log").unwrap();
         assert_eq!(captured, uid == 1000, "client uid {uid}: {log}");
-        assert_eq!(output.status.success(), uid == 1000, "client uid {uid}: {log}");
+        assert_eq!(
+            output.status.success(),
+            uid == 1000,
+            "client uid {uid}: {log}"
+        );
         assert!(output.stdout.is_empty());
         assert!(!log.contains("exact credential"));
         assert_eq!(log.contains("then W"), uid == 1000);
@@ -232,7 +312,10 @@ fn admission_acknowledgement_is_bounded_and_follows_validation() {
     let mut filled = 0;
     loop {
         match pending.stream.write(&bytes) {
-            Ok(n) => { filled += n; assert!(filled < 4 * 1024 * 1024); }
+            Ok(n) => {
+                filled += n;
+                assert!(filled < 4 * 1024 * 1024);
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             other => panic!("fill send buffer: {other:?}"),
         }
@@ -246,7 +329,10 @@ fn admission_acknowledgement_is_bounded_and_follows_validation() {
     let mut drained = 0;
     loop {
         match client.read(&mut bytes) {
-            Ok(n) => { assert!(n > 0); drained += n; }
+            Ok(n) => {
+                assert!(n > 0);
+                drained += n;
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             other => panic!("drain send buffer: {other:?}"),
         }
@@ -261,9 +347,14 @@ fn admission_acknowledgement_is_bounded_and_follows_validation() {
 
     let (mut client, mut pending) = pair();
     sys::send_descriptor(&client, &frame(), &credential(b"secret")).unwrap();
-    assert!(pending.poll_with(|_, _| Err(io::Error::other("not installed"))).is_err());
+    assert!(pending
+        .poll_with(|_, _| Err(io::Error::other("not installed")))
+        .is_err());
     assert!(pending.operation.is_none());
     client.set_nonblocking(true).unwrap();
-    assert_eq!(client.read(&mut ack).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(
+        client.read(&mut ack).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
     assert!(pending.capture().is_err());
 }

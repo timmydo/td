@@ -10,7 +10,15 @@
 //! The serialization streams into any Write — the nar-hash CLI wires it to
 //! the SHA-256 hasher so file contents are never buffered whole.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 #![allow(unsafe_code)] // confined raw-syscall / low-level layer (UNSAFE.md)
 
 use std::fs;
@@ -49,7 +57,12 @@ fn write_contents(out: &mut impl Write, path: &Path, len: u64) -> io::Result<()>
     if copied != len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{}: size changed during read ({} != {})", path.display(), copied, len),
+            format!(
+                "{}: size changed during read ({} != {})",
+                path.display(),
+                copied,
+                len
+            ),
         ));
     }
     let pad = (8 - (len % 8) as usize) % 8;
@@ -207,12 +220,7 @@ fn create_regular(path: &Path) -> io::Result<fs::File> {
 /// Restore one node at PATH. Sets CREATED once PATH itself exists, which is what tells
 /// `read_nar` whether a failure left work of its own to remove; DEPTH counts directory
 /// nesting against `MAX_NAR_DEPTH`.
-fn read_node(
-    input: &mut impl Read,
-    path: &Path,
-    created: &mut bool,
-    depth: u32,
-) -> io::Result<()> {
+fn read_node(input: &mut impl Read, path: &Path, created: &mut bool, depth: u32) -> io::Result<()> {
     if depth > MAX_NAR_DEPTH {
         return Err(invalid(format!("NAR nested deeper than {MAX_NAR_DEPTH}")));
     }
@@ -303,7 +311,8 @@ fn read_node(
                     }
                 }
                 expect(input, "node")?;
-                let child = path.join(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&name) });
+                let child =
+                    path.join(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&name) });
                 // A child's own flag: this node's CREATED is already true, and what the
                 // caller needs to know is whether PATH exists, not how much is under it.
                 let mut child_created = false;
@@ -467,9 +476,15 @@ mod tests {
         assert_eq!(fs::read(dst.join("a")).unwrap(), b"plain\n");
         assert_eq!(fs::read(dst.join("sub").join("nested")).unwrap(), b"deep\n");
         assert_eq!(fs::read_link(dst.join("lnk")).unwrap(), Path::new("a"));
-        let run_mode = fs::symlink_metadata(dst.join("run")).unwrap().permissions().mode();
+        let run_mode = fs::symlink_metadata(dst.join("run"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert!(run_mode & 0o100 != 0, "executable bit lost on restore");
-        let a_mode = fs::symlink_metadata(dst.join("a")).unwrap().permissions().mode();
+        let a_mode = fs::symlink_metadata(dst.join("a"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert!(a_mode & 0o100 == 0, "plain file restored executable");
 
         fs::remove_dir_all(&base).unwrap();
@@ -528,8 +543,12 @@ mod tests {
         let mut nar = Vec::new();
         write_nar(&mut nar, &dir).unwrap();
         // A framed 1-byte name is the byte plus 7 zeros of padding.
-        let pos_b = nar.windows(8).position(|w| w == b"B\0\0\0\0\0\0\0"[..].as_ref());
-        let pos_a = nar.windows(8).position(|w| w == b"a\0\0\0\0\0\0\0"[..].as_ref());
+        let pos_b = nar
+            .windows(8)
+            .position(|w| w == b"B\0\0\0\0\0\0\0"[..].as_ref());
+        let pos_a = nar
+            .windows(8)
+            .position(|w| w == b"a\0\0\0\0\0\0\0"[..].as_ref());
         assert!(pos_b.unwrap() < pos_a.unwrap());
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -621,8 +640,20 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         for (leg, entries) in [
-            ("descending", vec![(&b"b"[..], node_regular(b"2")), (&b"a"[..], node_regular(b"1"))]),
-            ("equal", vec![(&b"a"[..], node_regular(b"1")), (&b"a"[..], node_regular(b"2"))]),
+            (
+                "descending",
+                vec![
+                    (&b"b"[..], node_regular(b"2")),
+                    (&b"a"[..], node_regular(b"1")),
+                ],
+            ),
+            (
+                "equal",
+                vec![
+                    (&b"a"[..], node_regular(b"1")),
+                    (&b"a"[..], node_regular(b"2")),
+                ],
+            ),
         ] {
             let dst = base.join(leg);
             assert!(
@@ -636,7 +667,10 @@ mod tests {
         }
         // The same entries in increasing order are accepted — so the leg above rejects
         // the ORDER and not the archive.
-        let ok = nar_of_dir(&[(&b"a"[..], node_regular(b"1")), (&b"b"[..], node_regular(b"2"))]);
+        let ok = nar_of_dir(&[
+            (&b"a"[..], node_regular(b"1")),
+            (&b"b"[..], node_regular(b"2")),
+        ]);
         let dst = base.join("sorted");
         read_nar(&mut ok.as_slice(), &dst).unwrap();
         assert_eq!(fs::read(dst.join("b")).unwrap(), b"2");
@@ -663,12 +697,23 @@ mod tests {
         let link = base.join("link");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         assert!(create_regular(&link).is_err(), "created through a symlink");
-        assert_eq!(fs::read(&outside).unwrap(), b"original\n", "wrote through a symlink");
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            b"original\n",
+            "wrote through a symlink"
+        );
 
         let file = base.join("file");
         fs::write(&file, b"mine\n").unwrap();
-        assert!(create_regular(&file).is_err(), "created over an existing file");
-        assert_eq!(fs::read(&file).unwrap(), b"mine\n", "truncated an existing file");
+        assert!(
+            create_regular(&file).is_err(),
+            "created over an existing file"
+        );
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            b"mine\n",
+            "truncated an existing file"
+        );
 
         // And it does create where nothing is, so the refusals above are the belt rather
         // than the call being broken.
@@ -699,7 +744,12 @@ mod tests {
         assert_eq!(e.raw_os_error(), Some(ELOOP), "expected ELOOP, got {e:?}");
         // Without the flag the same open follows the link — so the leg above is the flag
         // and not something about the path.
-        fs::OpenOptions::new().write(true).create(true).truncate(false).open(&link).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&link)
+            .unwrap();
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -732,7 +782,10 @@ mod tests {
         nar.extend_from_slice(b"\0\0\0\0\0\0\0\0");
 
         let dst = base.join("dst");
-        assert!(read_nar(&mut nar.as_slice(), &dst).is_err(), "read_nar accepted trailing bytes");
+        assert!(
+            read_nar(&mut nar.as_slice(), &dst).is_err(),
+            "read_nar accepted trailing bytes"
+        );
         assert!(
             fs::symlink_metadata(&dst).is_err(),
             "a rejected NAR left its tree at dest"
@@ -771,9 +824,13 @@ mod tests {
         nar.extend(node);
 
         let dst = base.join("dst");
-        let e = read_nar(&mut nar.as_slice(), &dst).expect_err("read_nar accepted unbounded nesting");
+        let e =
+            read_nar(&mut nar.as_slice(), &dst).expect_err("read_nar accepted unbounded nesting");
         assert!(e.to_string().contains("nested deeper than"), "{e}");
-        assert!(fs::symlink_metadata(&dst).is_err(), "a rejected NAR left its tree at dest");
+        assert!(
+            fs::symlink_metadata(&dst).is_err(),
+            "a rejected NAR left its tree at dest"
+        );
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -810,7 +867,10 @@ mod tests {
 
         let mut nar = framed(b"nix-archive-1");
         nar.extend(node_regular(b"pwned\n"));
-        assert!(read_nar(&mut nar.as_slice(), &dst).is_err(), "read_nar accepted an existing dest");
+        assert!(
+            read_nar(&mut nar.as_slice(), &dst).is_err(),
+            "read_nar accepted an existing dest"
+        );
         assert_eq!(
             fs::read(&outside).unwrap(),
             b"original\n",

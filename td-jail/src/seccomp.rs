@@ -12,13 +12,10 @@ const EPERM: u32 = 1;
 const ENOSYS: u32 = 38;
 const EAFNOSUPPORT: u32 = 97;
 
-pub(crate) const FIREFOX_AUDIT_MARKER: &str =
-    "TD-FIREFOX-SECCOMP-OK probes=17";
-pub(crate) const FIREFOX_PROBE_PATH: &str =
-    "/opt/td-firefox-seccomp-probe";
+pub(crate) const FIREFOX_AUDIT_MARKER: &str = "TD-FIREFOX-SECCOMP-OK probes=17";
+pub(crate) const FIREFOX_PROBE_PATH: &str = "/opt/td-firefox-seccomp-probe";
 const FIREFOX_PROBE_EXE: &str = "\"/opt/td-firefox-seccomp-probe\"";
-const FIREFOX_AUDIT_PROBE_EXE: &str =
-    "\"/var/lib/td-test/td-jail-seccomp-probe\"";
+const FIREFOX_AUDIT_PROBE_EXE: &str = "\"/var/lib/td-test/td-jail-seccomp-probe\"";
 // Must match td-util's dmesg producer; the image source test binds them.
 const DMESG_INCOMPLETE_MARKER: &str = "TD-DMESG-INCOMPLETE";
 const AUDIT_SECCOMP_TYPE: &str = "type=1326";
@@ -259,7 +256,10 @@ fn expected_audit_action(syscall: u32) -> Option<AuditAction> {
         });
     }
     if syscall == SYS_SOCKET
-        || matches!(syscall, SYS_PERSONALITY | SYS_IOCTL | SYS_CLONE | SYS_CLONE3)
+        || matches!(
+            syscall,
+            SYS_PERSONALITY | SYS_IOCTL | SYS_CLONE | SYS_CLONE3
+        )
         || DENIED_SYSCALLS.contains(&syscall)
     {
         // Audit records omit SECCOMP_RET_DATA, so the helper proves the exact
@@ -354,7 +354,11 @@ fn parse_hex_field(line: &str, name: &str) -> io::Result<u32> {
     })
 }
 
-pub(crate) fn verify_firefox_audit(log: &str, firefox_pid: u32, firefox_uid: u32) -> io::Result<usize> {
+pub(crate) fn verify_firefox_audit(
+    log: &str,
+    firefox_pid: u32,
+    firefox_uid: u32,
+) -> io::Result<usize> {
     if firefox_pid == 0 || firefox_uid == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -375,8 +379,7 @@ pub(crate) fn verify_firefox_audit(log: &str, firefox_pid: u32, firefox_uid: u32
         if line.contains("audit_lost=")
             || line.contains("audit: rate limit exceeded")
             || (line.contains("audit:") && line.contains("callbacks suppressed"))
-            || (line.contains("kauditd_printk_skb:")
-                && line.contains("callbacks suppressed"))
+            || (line.contains("kauditd_printk_skb:") && line.contains("callbacks suppressed"))
             || line.contains("audit: kauditd")
         {
             return Err(io::Error::new(
@@ -410,7 +413,10 @@ pub(crate) fn verify_firefox_audit(log: &str, firefox_pid: u32, firefox_uid: u32
                 "Firefox seccomp audit line exceeds 4096 bytes",
             ));
         }
-        if !line.split_ascii_whitespace().any(|field| field == AUDIT_SECCOMP_TYPE) {
+        if !line
+            .split_ascii_whitespace()
+            .any(|field| field == AUDIT_SECCOMP_TYPE)
+        {
             continue;
         }
         records = records.saturating_add(1);
@@ -432,8 +438,7 @@ pub(crate) fn verify_firefox_audit(log: &str, firefox_pid: u32, firefox_uid: u32
         if uid == 1000
             && pid != 0
             && pid != firefox_pid
-            && ((arch == AUDIT_ARCH_X86_64 && compat == 0
-                && syscall == X32_SYSCALL_BIT | 1)
+            && ((arch == AUDIT_ARCH_X86_64 && compat == 0 && syscall == X32_SYSCALL_BIT | 1)
                 || (arch == AUDIT_ARCH_I386 && compat == 1 && syscall == 1))
             && signal == 31
             && code == SECCOMP_RET_KILL_PROCESS
@@ -474,9 +479,7 @@ pub(crate) fn verify_firefox_audit(log: &str, firefox_pid: u32, firefox_uid: u32
                     ),
                 ));
             }
-            for (slot, (wanted_syscall, _)) in
-                FIREFOX_REQUIRED_AUDIT_SYSCALLS.iter().enumerate()
-            {
+            for (slot, (wanted_syscall, _)) in FIREFOX_REQUIRED_AUDIT_SYSCALLS.iter().enumerate() {
                 if syscall == *wanted_syscall {
                     if let Some(count) = observed.get_mut(slot) {
                         *count = count.saturating_add(1);
@@ -491,9 +494,7 @@ pub(crate) fn verify_firefox_audit(log: &str, firefox_pid: u32, firefox_uid: u32
             "Firefox seccomp audit has no complete ordered barrier pair",
         ));
     }
-    for (slot, (syscall, minimum)) in
-        FIREFOX_REQUIRED_AUDIT_SYSCALLS.iter().enumerate()
-    {
+    for (slot, (syscall, minimum)) in FIREFOX_REQUIRED_AUDIT_SYSCALLS.iter().enumerate() {
         if observed.get(slot).copied().unwrap_or_default() < *minimum {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -823,13 +824,7 @@ mod tests {
         }
     }
 
-    fn audit_line(
-        uid: u32,
-        syscall: u32,
-        code: u32,
-        signal: u32,
-        executable: &str,
-    ) -> String {
+    fn audit_line(uid: u32, syscall: u32, code: u32, signal: u32, executable: &str) -> String {
         let pid = if syscall & X32_SYSCALL_MASK == X32_SYSCALL_BIT {
             X32_CHILD_PID
         } else {
@@ -893,7 +888,13 @@ mod tests {
             (310, SECCOMP_RET_ERRNO, 0),
             (X32_SYSCALL_BIT | 1, SECCOMP_RET_KILL_PROCESS, 31),
         ] {
-            log.push_str(&audit_line(65536, syscall, code, signal, FIREFOX_PROBE_PATH));
+            log.push_str(&audit_line(
+                65536,
+                syscall,
+                code,
+                signal,
+                FIREFOX_PROBE_PATH,
+            ));
         }
         log.push_str(&barrier(AuditBarrier::End));
         log
@@ -918,13 +919,16 @@ mod tests {
                     .sum::<usize>()
             )
         );
-        let log = before_end(complete_audit(), &audit_line(
-            65536,
-            SYS_CLONE3,
-            SECCOMP_RET_ERRNO,
-            0,
-            "/app/lib/firefox/firefox",
-        ));
+        let log = before_end(
+            complete_audit(),
+            &audit_line(
+                65536,
+                SYS_CLONE3,
+                SECCOMP_RET_ERRNO,
+                0,
+                "/app/lib/firefox/firefox",
+            ),
+        );
         assert_eq!(verify_firefox_audit(&log).unwrap(), 18);
 
         let missing = complete_audit().replacen(
@@ -937,12 +941,28 @@ mod tests {
 
     #[test]
     fn firefox_audit_does_not_count_the_parallel_standalone_probe() {
-        let standalone = audit_line_for_pid(1000, FIREFOX_PID + 200,
-            X32_SYSCALL_BIT | 1, SECCOMP_RET_KILL_PROCESS, 31,
-            "/run/td-jail-seccomp-probe/probe");
-        assert_eq!(verify_firefox_audit(&before_end(complete_audit(), &standalone)).unwrap(), 18);
+        let standalone = audit_line_for_pid(
+            1000,
+            FIREFOX_PID + 200,
+            X32_SYSCALL_BIT | 1,
+            SECCOMP_RET_KILL_PROCESS,
+            31,
+            "/run/td-jail-seccomp-probe/probe",
+        );
+        assert_eq!(
+            verify_firefox_audit(&before_end(complete_audit(), &standalone)).unwrap(),
+            18
+        );
         let missing = complete_audit().replace(
-            &audit_line(65536, X32_SYSCALL_BIT | 1, SECCOMP_RET_KILL_PROCESS, 31, FIREFOX_PROBE_PATH), "");
+            &audit_line(
+                65536,
+                X32_SYSCALL_BIT | 1,
+                SECCOMP_RET_KILL_PROCESS,
+                31,
+                FIREFOX_PROBE_PATH,
+            ),
+            "",
+        );
         assert!(verify_firefox_audit(&before_end(missing, &standalone)).is_err());
         for bad in [
             standalone.replace("uid=1000", "uid=65537"),
@@ -958,20 +978,39 @@ mod tests {
 
     #[test]
     fn firefox_audit_excludes_only_the_exact_standalone_i386_exit_kill() {
-        let standalone = audit_line_for_pid(1000, FIREFOX_PID + 200,
-            1, SECCOMP_RET_KILL_PROCESS, 31,
-            "/run/td-jail-seccomp-probe/probe")
-            .replace("arch=c000003e", "arch=40000003")
-            .replace("compat=0", "compat=1");
-        assert_eq!(verify_firefox_audit(&before_end(complete_audit(), &standalone)).unwrap(), 18);
+        let standalone = audit_line_for_pid(
+            1000,
+            FIREFOX_PID + 200,
+            1,
+            SECCOMP_RET_KILL_PROCESS,
+            31,
+            "/run/td-jail-seccomp-probe/probe",
+        )
+        .replace("arch=c000003e", "arch=40000003")
+        .replace("compat=0", "compat=1");
+        assert_eq!(
+            verify_firefox_audit(&before_end(complete_audit(), &standalone)).unwrap(),
+            18
+        );
         let missing = complete_audit().replace(
-            &audit_line(65536, X32_SYSCALL_BIT | 1, SECCOMP_RET_KILL_PROCESS, 31, FIREFOX_PROBE_PATH), "");
+            &audit_line(
+                65536,
+                X32_SYSCALL_BIT | 1,
+                SECCOMP_RET_KILL_PROCESS,
+                31,
+                FIREFOX_PROBE_PATH,
+            ),
+            "",
+        );
         assert!(verify_firefox_audit(&before_end(missing, &standalone)).is_err());
         for bad in [
             standalone.replace("uid=1000", "uid=65536"),
             standalone.replace("uid=1000", "uid=0"),
             standalone.replace(&format!("pid={}", FIREFOX_PID + 200), "pid=0"),
-            standalone.replace(&format!("pid={}", FIREFOX_PID + 200), &format!("pid={FIREFOX_PID}")),
+            standalone.replace(
+                &format!("pid={}", FIREFOX_PID + 200),
+                &format!("pid={FIREFOX_PID}"),
+            ),
             standalone.replace("/run/td-jail-seccomp-probe/probe", FIREFOX_PROBE_PATH),
             standalone.replace("sig=31", "sig=0"),
             standalone.replace("syscall=1 ", "syscall=2 "),
@@ -979,30 +1018,24 @@ mod tests {
             standalone.replace("arch=40000003", "arch=c000003e"),
             standalone.replace("0x80000000", "0x50000"),
         ] {
-            assert!(verify_firefox_audit(&before_end(complete_audit(), &bad)).is_err(), "{bad}");
+            assert!(
+                verify_firefox_audit(&before_end(complete_audit(), &bad)).is_err(),
+                "{bad}"
+            );
         }
     }
 
     #[test]
     fn firefox_audit_refuses_unrostered_malformed_or_lost_records() {
         let good = complete_audit();
-        assert!(verify_firefox_audit(&good.replacen(
-            &barrier(AuditBarrier::Begin),
-            "",
-            1,
-        ))
-        .is_err());
-        assert!(verify_firefox_audit(&good.replacen(
-            &barrier(AuditBarrier::End),
-            "",
-            1,
-        ))
-        .is_err());
-        assert!(verify_firefox_audit(&before_end(
-            good.clone(),
-            "[  13.0] audit: audit_lost=1\n",
-        ))
-        .is_err());
+        assert!(
+            verify_firefox_audit(&good.replacen(&barrier(AuditBarrier::Begin), "", 1,)).is_err()
+        );
+        assert!(verify_firefox_audit(&good.replacen(&barrier(AuditBarrier::End), "", 1,)).is_err());
+        assert!(
+            verify_firefox_audit(&before_end(good.clone(), "[  13.0] audit: audit_lost=1\n",))
+                .is_err()
+        );
         for loss in [
             "audit: audit_lost=1",
             "audit: rate limit exceeded",
@@ -1015,28 +1048,20 @@ mod tests {
                 "pre-barrier loss indicator passed: {loss}"
             );
         }
-        assert!(verify_firefox_audit(&format!(
-            "net_ratelimit: callbacks suppressed\n{good}"
-        ))
-        .is_ok());
-        assert!(verify_firefox_audit(&good.replace(
-            "comm=\"probe\"",
-            "comm=\"kauditd\""
-        ))
-        .is_ok());
+        assert!(
+            verify_firefox_audit(&format!("net_ratelimit: callbacks suppressed\n{good}")).is_ok()
+        );
+        assert!(verify_firefox_audit(&good.replace("comm=\"probe\"", "comm=\"kauditd\"")).is_ok());
         assert!(verify_firefox_audit(&before_end(
             good.clone(),
-            &audit_line(
-                65536,
-                400,
-                SECCOMP_RET_ERRNO,
-                0,
-                "/app/lib/firefox/firefox",
-            ),
+            &audit_line(65536, 400, SECCOMP_RET_ERRNO, 0, "/app/lib/firefox/firefox",),
         ))
         .is_err());
         for uid in [0, 1000, 65537, 65538, 65539] {
-            assert!(verify_firefox_audit(&good.replacen("uid=65536", &format!("uid={uid}"), 1)).is_err());
+            assert!(
+                verify_firefox_audit(&good.replacen("uid=65536", &format!("uid={uid}"), 1))
+                    .is_err()
+            );
         }
         assert!(super::verify_firefox_audit(&good, FIREFOX_PID, 0).is_err());
         assert!(verify_firefox_audit(&good.replacen(
@@ -1098,10 +1123,7 @@ mod tests {
             0,
             "/app/lib/firefox/firefox",
         );
-        let accepted = before_end(
-            good,
-            &runtime.repeat(MAX_AUDIT_RECORDS.saturating_sub(17)),
-        );
+        let accepted = before_end(good, &runtime.repeat(MAX_AUDIT_RECORDS.saturating_sub(17)));
         assert_eq!(verify_firefox_audit(&accepted).unwrap(), MAX_AUDIT_RECORDS);
         assert!(verify_firefox_audit(&before_end(accepted, &runtime)).is_err());
     }

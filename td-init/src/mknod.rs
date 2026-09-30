@@ -50,7 +50,11 @@ fn parse(args: &[String]) -> Result<(String, u32, u32), String> {
             usage()
         ));
     }
-    Ok((path.clone(), number(major, "major")?, number(minor, "minor")?))
+    Ok((
+        path.clone(),
+        number(major, "major")?,
+        number(minor, "minor")?,
+    ))
 }
 
 fn number(text: &str, which: &str) -> Result<u32, String> {
@@ -99,7 +103,6 @@ fn create_with(
     }
 }
 
-
 fn verify(path: &str, major: u32, minor: u32) -> Result<(), String> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let meta = std::fs::symlink_metadata(path)
@@ -143,13 +146,22 @@ mod tests {
             let e = parse(&args(&["/dev/x", kind, "7", "0"])).unwrap_err();
             assert!(e.contains("BLOCK nodes only"), "{kind}: {e}");
         }
-        assert!(parse(&args(&["/dev/x", "b", "7"])).is_err(), "too few operands");
+        assert!(
+            parse(&args(&["/dev/x", "b", "7"])).is_err(),
+            "too few operands"
+        );
         assert!(
             parse(&args(&["/dev/x", "b", "7", "0", "extra"])).is_err(),
             "a trailing operand must not be ignored"
         );
-        assert!(parse(&args(&["/dev/x", "b", "x", "0"])).is_err(), "major must be a number");
-        assert!(parse(&args(&["/dev/x", "b", "7", "y"])).is_err(), "minor must be a number");
+        assert!(
+            parse(&args(&["/dev/x", "b", "x", "0"])).is_err(),
+            "major must be a number"
+        );
+        assert!(
+            parse(&args(&["/dev/x", "b", "7", "y"])).is_err(),
+            "minor must be a number"
+        );
     }
 
     /// The readback itself, against nodes that already exist.
@@ -185,14 +197,20 @@ mod tests {
             return;
         };
         let (ma, mi) = (devt::major(rdev) as u32, devt::minor(rdev) as u32);
-        assert!(verify(&path, ma, mi).is_ok(), "{path}: the true numbers must pass");
+        assert!(
+            verify(&path, ma, mi).is_ok(),
+            "{path}: the true numbers must pass"
+        );
         // ...and a node whose numbers are NOT what was asked for is refused. The
         // node exists, is a block device, and points somewhere else — there is no
         // other symptom of this at all.
         let e = verify(&path, ma + 1, mi).unwrap_err();
         assert!(e.contains("kernel reports"), "{e}");
         assert!(e.contains(&path), "the refusal must name the node: {e}");
-        assert!(verify(&path, ma, mi + 1).is_err(), "a wrong MINOR is refused too");
+        assert!(
+            verify(&path, ma, mi + 1).is_err(),
+            "a wrong MINOR is refused too"
+        );
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -254,7 +272,10 @@ mod tests {
         })
         .unwrap_err();
         assert!(e.contains("does not fit"), "{e}");
-        assert!(!called, "the refusal must happen before the syscall, not after");
+        assert!(
+            !called,
+            "the refusal must happen before the syscall, not after"
+        );
     }
 
     /// `create` must reach the verifying path with the REAL syscall.
@@ -284,5 +305,4 @@ mod tests {
     fn a_node_that_vanished_is_an_error() {
         assert!(verify("/dev/td-no-such-node", 7, 0).is_err());
     }
-
 }

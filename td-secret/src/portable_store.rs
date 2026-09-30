@@ -544,7 +544,8 @@ mod tests {
         for existing in [true, false] {
             write_private(&directory.0.join(LOCK), &[]);
             let lock = File::open(directory.0.join(LOCK)).unwrap();
-            lock.set_permissions(fs::Permissions::from_mode(0o0)).unwrap();
+            lock.set_permissions(fs::Permissions::from_mode(0o0))
+                .unwrap();
             assert!(admit_lock(&parent, &lock, directory.owner(), !existing).is_err());
             assert_eq!(directory.0.join(LOCK).exists(), existing);
             if existing {

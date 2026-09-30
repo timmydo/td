@@ -20,8 +20,7 @@ pub fn recipe() -> Recipe {
     let Ok(declaration) = ApplicationDeclaration::new("static-runtime", APPLICATION_ENTRY) else {
         return invalid_recipe("declaration");
     };
-    let Ok(launcher) =
-        LauncherDeclaration::new(APPLICATION_DISPLAY_NAME, APPLICATION_SEARCH_TERMS)
+    let Ok(launcher) = LauncherDeclaration::new(APPLICATION_DISPLAY_NAME, APPLICATION_SEARCH_TERMS)
     else {
         return invalid_recipe("launcher");
     };
@@ -120,7 +119,10 @@ mod tests {
             launcher.search_terms().collect::<Vec<_>>(),
             APPLICATION_SEARCH_TERMS
         );
-        let permissions = recipe.application_permissions.as_ref().expect("permissions");
+        let permissions = recipe
+            .application_permissions
+            .as_ref()
+            .expect("permissions");
         // The fetch grant, not the network: the keyfile below says which.
         assert!(!permissions.network());
         // No terminal: the reader is a Wayland client of its own window.
@@ -153,7 +155,9 @@ mod tests {
                     && dest == "{out}/lib/debug"
         )));
         assert!(
-            !steps.iter().any(|step| matches!(step, Step::CopyTree { .. })),
+            !steps
+                .iter()
+                .any(|step| matches!(step, Step::CopyTree { .. })),
             "a tree copy may not precede the static validator"
         );
         assert!(matches!(

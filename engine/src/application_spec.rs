@@ -67,10 +67,7 @@ pub const DYNAMIC_APPLICATION_POLICIES: &[(&str, &str, DynamicApplicationPolicy)
     ),
 ];
 
-pub fn dynamic_application_policy(
-    name: &str,
-    runtime: &str,
-) -> Option<DynamicApplicationPolicy> {
+pub fn dynamic_application_policy(name: &str, runtime: &str) -> Option<DynamicApplicationPolicy> {
     DYNAMIC_APPLICATION_POLICIES
         .iter()
         .find(|(policy_name, policy_runtime, _)| *policy_name == name && *policy_runtime == runtime)
@@ -439,7 +436,8 @@ impl ApplicationSpec {
             .permissions
             .sockets()
             .any(|socket| socket == crate::permissions::PermissionSocket::PulseAudio);
-        let expected_server = pulse_requested.then_some(crate::permissions::APPLICATION_PULSE_SERVER);
+        let expected_server =
+            pulse_requested.then_some(crate::permissions::APPLICATION_PULSE_SERVER);
         let expected_config =
             pulse_requested.then_some(crate::permissions::APPLICATION_PULSE_CONFIG_PATH);
         if self.environment.get("PULSE_SERVER").map(String::as_str) != expected_server
@@ -471,9 +469,7 @@ impl ApplicationSpec {
             }
             (None, None) => {}
             (None, Some(_)) => {
-                return Err(
-                    "application spec carries an unreviewed LD_LIBRARY_PATH policy".into(),
-                );
+                return Err("application spec carries an unreviewed LD_LIBRARY_PATH policy".into());
             }
         }
         self.permissions.resources().complete_or_default()?;
@@ -489,14 +485,18 @@ impl ApplicationSpec {
 
 fn runtime_recipe_name(path: &str) -> Option<&str> {
     let package = runtime_store_name(path).ok()?;
-    ["freedesktop-platform-25-08", "empty-runtime", "static-runtime"]
-        .into_iter()
-        .find(|name| {
-            package == *name
-                || package
-                    .strip_prefix(*name)
-                    .is_some_and(|suffix| suffix.starts_with('-'))
-        })
+    [
+        "freedesktop-platform-25-08",
+        "empty-runtime",
+        "static-runtime",
+    ]
+    .into_iter()
+    .find(|name| {
+        package == *name
+            || package
+                .strip_prefix(*name)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    })
 }
 
 fn runtime_store_name(path: &str) -> Result<&str, String> {
@@ -509,9 +509,7 @@ fn runtime_store_name(path: &str) -> Result<&str, String> {
         .as_bytes()
         .get(..32)
         .ok_or("application runtime path has no 32-character store digest")?;
-    if !digest
-        .iter()
-        .all(|byte| STORE_HASH_ALPHABET.contains(byte))
+    if !digest.iter().all(|byte| STORE_HASH_ALPHABET.contains(byte))
         || basename.as_bytes().get(32) != Some(&b'-')
     {
         return Err("application runtime path has a malformed store basename".into());
@@ -643,7 +641,8 @@ mod tests {
             &unreviewed,
             &runtime.replace("-static-runtime-1", "-unreviewed-runtime-1"),
             PermissionPolicy::new(),
-        ).is_err());
+        )
+        .is_err());
     }
 
     #[test]
@@ -733,7 +732,10 @@ mod tests {
                 PermissionPolicy::new(),
             )
             .unwrap_err();
-            assert!(error.contains("fixed by the jail contract"), "{name}: {error}");
+            assert!(
+                error.contains("fixed by the jail contract"),
+                "{name}: {error}"
+            );
         }
     }
 
@@ -756,9 +758,12 @@ mod tests {
                 PermissionPolicy::new().with_terminal().unwrap(),
             )
             .unwrap_err();
-            assert!(error.contains("supplied by the devices=tty grant"), "{name}: {error}");
-            let spec = ApplicationSpec::compile(&manifest, runtime, PermissionPolicy::new())
-                .unwrap();
+            assert!(
+                error.contains("supplied by the devices=tty grant"),
+                "{name}: {error}"
+            );
+            let spec =
+                ApplicationSpec::compile(&manifest, runtime, PermissionPolicy::new()).unwrap();
             assert_eq!(spec.environment.get(name).map(String::as_str), Some("dumb"));
         }
     }
@@ -790,10 +795,8 @@ mod tests {
         let manifest = declaration
             .manifest("firefox", "154.0", ApplicationProvenance::Foreign)
             .unwrap();
-        let runtime =
-            "/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08";
-        let spec =
-            ApplicationSpec::compile(&manifest, runtime, PermissionPolicy::new()).unwrap();
+        let runtime = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08";
+        let spec = ApplicationSpec::compile(&manifest, runtime, PermissionPolicy::new()).unwrap();
         let environment = spec.environment().collect::<BTreeMap<_, _>>();
         assert_eq!(environment.get("LIBGL_ALWAYS_SOFTWARE"), Some(&"1"));
         assert_eq!(
@@ -822,7 +825,10 @@ mod tests {
                 .unwrap();
         let error =
             ApplicationSpec::compile(&overridden, runtime, PermissionPolicy::new()).unwrap_err();
-        assert!(error.contains("Freedesktop 25.08 runtime policy"), "{error}");
+        assert!(
+            error.contains("Freedesktop 25.08 runtime policy"),
+            "{error}"
+        );
     }
 
     /// A reviewed policy without a package library root compiles to NO loader
@@ -836,10 +842,8 @@ mod tests {
             .unwrap()
             .manifest("claude", "2.1.260", ApplicationProvenance::Foreign)
             .unwrap();
-        let runtime =
-            "/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08";
-        let spec =
-            ApplicationSpec::compile(&manifest, runtime, PermissionPolicy::new()).unwrap();
+        let runtime = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08";
+        let spec = ApplicationSpec::compile(&manifest, runtime, PermissionPolicy::new()).unwrap();
         let environment = spec.environment().collect::<BTreeMap<_, _>>();
         assert_eq!(environment.get("LD_LIBRARY_PATH"), None);
         assert_eq!(environment.get("LIBGL_ALWAYS_SOFTWARE"), Some(&"1"));
@@ -890,8 +894,10 @@ mod tests {
                 .next()
                 .unwrap_or_default()
                 .trim();
-            let definition =
-                format!("const {constant}: &str = \"{}\";", policy.library_paths().join(":"));
+            let definition = format!(
+                "const {constant}: &str = \"{}\";",
+                policy.library_paths().join(":")
+            );
             assert!(
                 jail.contains(&definition),
                 "td-jail's arm for {name} returns {constant}, which is not defined as this \
@@ -925,15 +931,13 @@ mod tests {
                 crate::permissions::APPLICATION_PULSE_CONFIG_PATH
             ))
         );
-        let without = spec
-            .to_keyfile()
-            .replace(
-                &format!(
-                    "PULSE_SERVER={}\n",
-                    crate::permissions::APPLICATION_PULSE_SERVER
-                ),
-                "",
-            );
+        let without = spec.to_keyfile().replace(
+            &format!(
+                "PULSE_SERVER={}\n",
+                crate::permissions::APPLICATION_PULSE_SERVER
+            ),
+            "",
+        );
         assert!(ApplicationSpec::parse(&without).is_err());
         let without_config = spec.to_keyfile().replace(
             &format!(
@@ -989,14 +993,13 @@ mod tests {
             &text.replace("runtime=/td/store/", "runtime=/td/store/../")
         )
         .is_err());
-        assert!(ApplicationSpec::parse(
-            &text.replace("runtime=/td/store/", "runtime=/gnu/store/")
-        )
-        .is_err());
-        assert!(ApplicationSpec::parse(
-            &text.replace("-empty-runtime-1", "/nested-runtime")
-        )
-        .is_err());
+        assert!(
+            ApplicationSpec::parse(&text.replace("runtime=/td/store/", "runtime=/gnu/store/"))
+                .is_err()
+        );
+        assert!(
+            ApplicationSpec::parse(&text.replace("-empty-runtime-1", "/nested-runtime")).is_err()
+        );
         assert!(ApplicationSpec::parse(&format!("{text}[Unknown]\nx=y\n")).is_err());
     }
 }

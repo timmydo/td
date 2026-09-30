@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use crate::ast::{
-    is_name, AndOr, ArithCmp, Assign, CaseItem, Cmd, CondExpr, CondOp, Conn, IfArm, List, Pipeline, Redir,
-    RedirKind, Seg, Sep, Stage, Syn, SynErr, Word,
+    is_name, AndOr, ArithCmp, Assign, CaseItem, Cmd, CondExpr, CondOp, Conn, IfArm, List, Pipeline,
+    Redir, RedirKind, Seg, Sep, Stage, Syn, SynErr, Word,
 };
 use crate::lexer::{tokenize, Op, Placed, Scan, Tok};
 
@@ -116,8 +116,9 @@ fn is_cond_unary(w: &str) -> bool {
 /// refuses rather than running: `while :; do fi; done` is a syntax error there
 /// and an ENDLESS `fi: not found` without this. `case`/`if`/`for`/`while`/
 /// `until`/`{` are absent because each does start one.
-const CANNOT_START_COMMAND: &[&str] =
-    &["then", "else", "elif", "fi", "do", "done", "esac", "in", "}"];
+const CANNOT_START_COMMAND: &[&str] = &[
+    "then", "else", "elif", "fi", "do", "done", "esac", "in", "}",
+];
 
 /// ash's `tokendlist` (ash.c:8643) restricted to its reserved WORDS: the ones
 /// that END a list where a list item may start, rather than being refused
@@ -476,7 +477,8 @@ impl Units {
             return None;
         };
         let name = w.plain()?;
-        if (chk == Chk::Command && is_reserved(name)) || self.active.iter().any(|r| r.name == name) {
+        if (chk == Chk::Command && is_reserved(name)) || self.active.iter().any(|r| r.name == name)
+        {
             return None;
         }
         let value = self.aliases.get(name)?.clone();
@@ -523,7 +525,10 @@ impl Units {
             // Renumber onto the end of this source's table so a here-document
             // written inside an alias still resolves.
             .map(|p| match p.tok {
-                Tok::Op(Op::DLess(id)) => Placed { line: p.line, tok: Tok::Op(Op::DLess(id + base)) },
+                Tok::Op(Op::DLess(id)) => Placed {
+                    line: p.line,
+                    tok: Tok::Op(Op::DLess(id + base)),
+                },
                 tok => Placed { line: p.line, tok },
             })
             .collect();
@@ -1132,7 +1137,8 @@ impl Units {
             _ => Err(format!(
                 "syntax error: expected an operand inside `[[`, found {}",
                 self.describe()
-            ).into()),
+            )
+            .into()),
         }
     }
 
@@ -1692,7 +1698,10 @@ mod tests {
     #[test]
     fn a_word_that_ends_a_list_is_a_strict_subset_of_the_words_that_cannot_start_one() {
         for w in ENDS_A_LIST {
-            assert!(CANNOT_START_COMMAND.contains(w), "{w} ends a list but may start a command");
+            assert!(
+                CANNOT_START_COMMAND.contains(w),
+                "{w} ends a list but may start a command"
+            );
             assert!(is_reserved(w), "{w} is not a reserved word");
         }
         let extra: Vec<_> = CANNOT_START_COMMAND
@@ -1722,7 +1731,10 @@ mod tests {
             ("until do :; done", "do"),
         ] {
             let e = parse(src).unwrap_err();
-            assert!(e.msg.contains(&format!("unexpected \"{want}\"")), "{src:?}: {e}");
+            assert!(
+                e.msg.contains(&format!("unexpected \"{want}\"")),
+                "{src:?}: {e}"
+            );
             assert!(!e.is_incomplete(), "{src:?}: more input cannot fix it");
         }
         // The same shapes with one command in them parse, so the refusal is
@@ -1767,7 +1779,9 @@ mod tests {
     #[test]
     fn a_name_that_no_line_can_repair_never_holds_the_prompt() {
         let a = Aliases::new();
-        assert!(!parse_probe("function a=1\n", &a).unwrap_err().is_incomplete());
+        assert!(!parse_probe("function a=1\n", &a)
+            .unwrap_err()
+            .is_incomplete());
         assert!(!parse_probe("function ;\n", &a).unwrap_err().is_incomplete());
         // A construct that another line really does finish still asks, so this
         // is about THIS shape rather than about newline-ended probes at large.
@@ -1781,7 +1795,13 @@ mod tests {
     fn only_a_name_that_never_arrived_is_incomplete() {
         let ended = parse("function").unwrap_err();
         assert!(ended.is_incomplete(), "{ended}");
-        for src in ["function ;", "function |", "function (", "function <f", "function\n"] {
+        for src in [
+            "function ;",
+            "function |",
+            "function (",
+            "function <f",
+            "function\n",
+        ] {
             let e = parse(src).unwrap_err();
             assert!(!e.is_incomplete(), "{src:?}: {e}");
         }
@@ -1874,7 +1894,10 @@ mod tests {
         // A `<<` whose DELIMITER never arrived is still unfinished to both: the
         // body was never opened, and ash refuses `cat <<` at end of input too.
         for src in ["if true; then", "echo 'abc", "echo x |", "cat <<"] {
-            for got in [parse_probe(src, &aliases), parse_aliased_at(src, &aliases, 1)] {
+            for got in [
+                parse_probe(src, &aliases),
+                parse_aliased_at(src, &aliases, 1),
+            ] {
                 match got {
                     Err(e) => assert!(e.is_incomplete(), "{src:?}: {e}"),
                     Ok(_) => return Err(format!("{src:?}: expected incomplete input").into()),

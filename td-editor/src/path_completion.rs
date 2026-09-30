@@ -59,13 +59,18 @@ impl Matches {
         let rows = rows.clamp(1, PAGE_ROWS);
         let last = self.paths.len().checked_sub(1)?;
         let current = self.selected.unwrap_or(0);
-        let next = if backward { current.saturating_sub(rows) }
-            else { current.saturating_add(rows).min(last) };
+        let next = if backward {
+            current.saturating_sub(rows)
+        } else {
+            current.saturating_add(rows).min(last)
+        };
         self.selected = Some(next);
         self.paths.get(next).map(String::as_str)
     }
 
-    pub(crate) fn count(&self) -> usize { self.paths.len() }
+    pub(crate) fn count(&self) -> usize {
+        self.paths.len()
+    }
 
     fn page(&self, rows: usize) -> impl Iterator<Item = (usize, &str)> {
         let rows = rows.clamp(1, PAGE_ROWS);
@@ -138,7 +143,10 @@ impl State {
             Self::Ready(matches) => {
                 let mut fields = format!("completion=ready\tcompletion-count={}\tcompletion-skipped={}\tcompletion-selected={}",
                     matches.paths.len(), matches.skipped, matches.selected.map_or_else(|| "-".into(), |i| i.to_string()));
-                fields.push_str(&format!("\tcompletion-page-size={}", rows.clamp(1, PAGE_ROWS)));
+                fields.push_str(&format!(
+                    "\tcompletion-page-size={}",
+                    rows.clamp(1, PAGE_ROWS)
+                ));
                 for (index, path) in matches.page(rows) {
                     fields.push_str(&format!(
                         "\tcompletion-item={index},{}",
@@ -358,12 +366,26 @@ mod tests {
         let mut matches = scan(&directory.prefix("item")).unwrap();
         assert_eq!(matches.count(), 129);
         assert_eq!(matches.page(12).count(), 12);
-        assert_eq!(matches.page_by(false, 12), Some(directory.prefix("item0012").as_str()));
+        assert_eq!(
+            matches.page_by(false, 12),
+            Some(directory.prefix("item0012").as_str())
+        );
         assert_eq!(matches.page(12).next().unwrap().0, 12);
-        assert_eq!(matches.page_by(true, 12), Some(directory.prefix("item0000").as_str()));
-        assert_eq!(matches.page_by(false, usize::MAX), Some(directory.prefix("item0012").as_str()));
-        assert_eq!(matches.page_by(true, 0), Some(directory.prefix("item0011").as_str()));
-        for _ in 0..12 { matches.page_by(false, 12); }
+        assert_eq!(
+            matches.page_by(true, 12),
+            Some(directory.prefix("item0000").as_str())
+        );
+        assert_eq!(
+            matches.page_by(false, usize::MAX),
+            Some(directory.prefix("item0012").as_str())
+        );
+        assert_eq!(
+            matches.page_by(true, 0),
+            Some(directory.prefix("item0011").as_str())
+        );
+        for _ in 0..12 {
+            matches.page_by(false, 12);
+        }
         assert_eq!(matches.selected, Some(128));
         assert_eq!(matches.page(12).last().unwrap().0, 128);
         assert_eq!(scan(&directory.prefix("item0000")).unwrap().paths.len(), 1);

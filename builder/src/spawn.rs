@@ -227,7 +227,10 @@ mod tests {
         };
         let mut offenders = Vec::new();
         for path in entries.flatten().map(|e| e.path()) {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
             if !name.ends_with(".rs") || name == "spawn.rs" {
                 continue;
             }

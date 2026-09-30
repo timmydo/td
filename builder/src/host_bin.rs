@@ -91,7 +91,9 @@ fn extract_vendor(root: &Path, destination: &str, lock_path: &str) -> Result<Nat
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     if !vendor_is_complete(root, destination, Some(lock_path)) {
-        return Err(format!("{destination} vendor is incomplete or stale; prepare its locked sources first"));
+        return Err(format!(
+            "{destination} vendor is incomplete or stale; prepare its locked sources first"
+        ));
     }
     let scratch = root.join(".td-build-cache").join(format!(
         "native-vendor-{}-{}",
@@ -109,7 +111,10 @@ fn extract_vendor(root: &Path, destination: &str, lock_path: &str) -> Result<Nat
     let archives = prepared.0.join("archives");
     // td-feed publishes archives. Verify private copies before extraction.
     crate::stage_verified_vendor(
-        &root.join(".td-build-cache/crate-vendor").join(destination).join("vendor"),
+        &root
+            .join(".td-build-cache/crate-vendor")
+            .join(destination)
+            .join("vendor"),
         &lock,
         &archives,
         false,
@@ -167,7 +172,10 @@ fn prepare_native_vendor(root: &Path) -> Result<PathBuf, String> {
 }
 
 pub(crate) fn prepare_crypto_vendor(root: &Path) -> Result<PathBuf, String> {
-    prepare_vendor(root, extract_vendor(root, "td-crypto", "td-crypto/Cargo.lock")?)
+    prepare_vendor(
+        root,
+        extract_vendor(root, "td-crypto", "td-crypto/Cargo.lock")?,
+    )
 }
 
 fn prepare_vendor(root: &Path, prepared: NativeVendor) -> Result<PathBuf, String> {
@@ -507,15 +515,20 @@ mod native_vendor_tests {
         let fixture = fixture("crypto");
         assert!(prepare_crypto_vendor(&fixture.0).is_err());
         fs::rename(fixture.0.join("net"), fixture.0.join("td-crypto")).unwrap();
-        fs::rename(fixture.0.join(".td-build-cache/crate-vendor/td-net"),
-            fixture.0.join(".td-build-cache/crate-vendor/td-crypto")).unwrap();
+        fs::rename(
+            fixture.0.join(".td-build-cache/crate-vendor/td-net"),
+            fixture.0.join(".td-build-cache/crate-vendor/td-crypto"),
+        )
+        .unwrap();
         let prepared = prepare_crypto_vendor(&fixture.0).unwrap();
         assert!(prepared.join("tinydep-0.1.0/src/lib.rs").is_file());
         assert!(prepare_native_vendor(&fixture.0).is_err());
         fs::write(prepared.join("tinydep-0.1.0/src/lib.rs"), "changed").unwrap();
         assert!(prepare_crypto_vendor(&fixture.0).is_err());
         fs::remove_dir_all(prepared).unwrap();
-        let archive = fixture.0.join(".td-build-cache/crate-vendor/td-crypto/vendor/tinydep-0.1.0.crate");
+        let archive = fixture
+            .0
+            .join(".td-build-cache/crate-vendor/td-crypto/vendor/tinydep-0.1.0.crate");
         fs::write(&archive, "corrupt").unwrap();
         assert!(prepare_crypto_vendor(&fixture.0).is_err());
         fs::remove_file(archive).unwrap();

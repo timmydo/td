@@ -105,16 +105,13 @@ fn require_layout(
 ) -> Result<()> {
     let expected_home = account.persistent_home();
     let expected_work = expected_home.join("src/td-vm/work");
-    if home != expected_home
-        || work != expected_work
-        || store != Path::new("/td/store")
-    {
+    if home != expected_home || work != expected_work || store != Path::new("/td/store") {
         return Err("development paths do not resolve into the standard persistent home".into());
     }
     let mounts = parse_mounts(mounts).ok_or("development mount table is malformed")?;
     let home_text = expected_home.to_str().ok_or("non-UTF-8 primary home")?;
-    let persistent = covering(&mounts, home_text)
-        .ok_or("no filesystem covers the private development home")?;
+    let persistent =
+        covering(&mounts, home_text).ok_or("no filesystem covers the private development home")?;
     if persistent.point != "/var"
         || persistent.fstype != "btrfs"
         || !persistent.has("rw")
@@ -127,7 +124,10 @@ fn require_layout(
                 .into(),
         );
     }
-    for root in [expected_home.join(".td"), expected_work.join(".td-build-cache")] {
+    for root in [
+        expected_home.join(".td"),
+        expected_work.join(".td-build-cache"),
+    ] {
         let root = root.to_str().ok_or("non-UTF-8 development state")?;
         if covering(&mounts, root).as_ref() != Some(&persistent)
             || mounts.iter().any(|mount| covers(root, &mount.point))
@@ -213,7 +213,10 @@ fn prepare_directories(home: &Path, work: &Path, uid: u32) -> Result<()> {
 pub fn prepare(home: &Path, work: &Path, uid: u32) -> Result<()> {
     #[cfg(feature = "target-recipe")]
     {
-        let account = io(super::primary_account::load(), "resolve primary development account")?;
+        let account = io(
+            super::primary_account::load(),
+            "resolve primary development account",
+        )?;
         if uid != super::primary_account::UID
             || home != account.home()
             || work != account.home().join("src/td-vm/work")
@@ -227,7 +230,13 @@ pub fn prepare(home: &Path, work: &Path, uid: u32) -> Result<()> {
             fs::read_to_string("/proc/mounts"),
             "read development mounts",
         )?;
-        require_layout(&account, &mounts, &canonical_home, &canonical_work, &canonical_store)?;
+        require_layout(
+            &account,
+            &mounts,
+            &canonical_home,
+            &canonical_work,
+            &canonical_store,
+        )?;
     }
     prepare_directories(home, work, uid)
 }
@@ -246,7 +255,8 @@ mod tests {
     fn account(name: &str) -> super::super::primary_account::PrimaryAccount {
         super::super::primary_account::parse(&format!(
             "{name}:x:1000:1000:Human:/home/{name}:/bin/sh\n"
-        )).unwrap()
+        ))
+        .unwrap()
     }
 
     const IMAGE: &str = "\
@@ -354,15 +364,35 @@ tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n\
                 (account.home(), work.clone()),
                 (home.clone(), home.join("other-work")),
             ] {
-                assert!(require_layout(&account, IMAGE, &bad_home, &bad_work, Path::new("/td/store")).is_err());
+                assert!(require_layout(
+                    &account,
+                    IMAGE,
+                    &bad_home,
+                    &bad_work,
+                    Path::new("/td/store")
+                )
+                .is_err());
             }
-            for point in [home.clone(), home.join(".td"), work.join(".td-build-cache"), home.join("src")] {
-                let mounts = format!("{IMAGE}tmpfs {} tmpfs rw,nodev,nosuid 0 0\n", point.display());
-                assert!(require_layout(&account, &mounts, &home, &work, Path::new("/td/store")).is_err());
+            for point in [
+                home.clone(),
+                home.join(".td"),
+                work.join(".td-build-cache"),
+                home.join("src"),
+            ] {
+                let mounts = format!(
+                    "{IMAGE}tmpfs {} tmpfs rw,nodev,nosuid 0 0\n",
+                    point.display()
+                );
+                assert!(
+                    require_layout(&account, &mounts, &home, &work, Path::new("/td/store"))
+                        .is_err()
+                );
             }
             // An unrelated user's mount cannot redirect this account's state.
             let mounts = format!("{IMAGE}tmpfs /var/home/tester/.td tmpfs rw,nodev,nosuid 0 0\n");
-            assert!(require_layout(&account, &mounts, &home, &work, Path::new("/td/store")).is_ok());
+            assert!(
+                require_layout(&account, &mounts, &home, &work, Path::new("/td/store")).is_ok()
+            );
         }
     }
 

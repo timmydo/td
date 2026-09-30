@@ -9,10 +9,18 @@ use std::os::fd::AsFd;
 use std::thread;
 
 fn write_request() -> Request {
-    Request::new([42; 32], 1000, Operation::Set {
-        application: "mail".into(), name: "main".into(), application_uid: 65537,
-        requester: 1000, role: Role::Recovery,
-    }).unwrap()
+    Request::new(
+        [42; 32],
+        1000,
+        Operation::Set {
+            application: "mail".into(),
+            name: "main".into(),
+            application_uid: 65537,
+            requester: 1000,
+            role: Role::Recovery,
+        },
+    )
+    .unwrap()
 }
 
 #[test]
@@ -36,23 +44,41 @@ fn write_child() {
 fn write_input_requires_both_receipts_and_cancellation_never_locks_prior_release() {
     for stop in 0..3 {
         let request = write_request();
-        assert_eq!(operation_verb(request.operation()).unwrap(), "write-operation");
+        assert_eq!(
+            operation_verb(request.operation()).unwrap(),
+            "write-operation"
+        );
         let mut worker = Unlock::spawn(request.clone(), fixture("write_child")).unwrap();
         worker.credential = Some(Credential(vec![0xa5; MAX_SECRET]));
         worker.phase = Phase::CredentialInput;
-        assert_eq!(advance(&mut worker).unwrap(), Event::Present(request.clone()));
+        assert_eq!(
+            advance(&mut worker).unwrap(),
+            Event::Present(request.clone())
+        );
         if stop > 0 {
             worker.presented(&request).unwrap();
-            assert_eq!(advance(&mut worker).unwrap(), Event::Commit(request.clone()));
+            assert_eq!(
+                advance(&mut worker).unwrap(),
+                Event::Commit(request.clone())
+            );
         }
-        if stop == 2 { worker.commit(&request).unwrap(); }
-        else { worker.cancel("cancel write").unwrap(); }
+        if stop == 2 {
+            worker.commit(&request).unwrap();
+        } else {
+            worker.cancel("cancel write").unwrap();
+        }
         let until = Instant::now() + Duration::from_secs(3);
         loop {
-            match worker.poll_with(|_| panic!("write cancellation revoked prior runtime release")).unwrap() {
+            match worker
+                .poll_with(|_| panic!("write cancellation revoked prior runtime release"))
+                .unwrap()
+            {
                 Event::Waiting => (),
                 Event::Complete if stop == 2 => break,
-                Event::Failed(reason) if stop < 2 => { assert_eq!(reason, "cancel write"); break; }
+                Event::Failed(reason) if stop < 2 => {
+                    assert_eq!(reason, "cancel write");
+                    break;
+                }
                 event => panic!("unexpected write event {event:?}"),
             }
             assert!(Instant::now() < until);

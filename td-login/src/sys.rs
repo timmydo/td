@@ -99,11 +99,7 @@ pub fn setgroups(list: &[u32]) -> io::Result<()> {
             "supplementary group list exceeds NGROUPS_MAX",
         ));
     }
-    check(syscall2(
-        SYS_SETGROUPS,
-        list.len(),
-        list.as_ptr() as usize,
-    ))
+    check(syscall2(SYS_SETGROUPS, list.len(), list.as_ptr() as usize))
 }
 
 /// `setgid(2)` — the primary group. SECOND: still privileged, and still before

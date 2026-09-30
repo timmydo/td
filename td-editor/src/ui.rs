@@ -5,9 +5,9 @@ use crate::keys::{Action, Keymap, Profile};
 use crate::layout::{Affinity, Caret, Metrics, Viewport, CELL_HEIGHT, CELL_WIDTH};
 use crate::model::{Command, Editor, Selection, TabId};
 use crate::render::{Geometry, Label, Scene, View};
-use td_ui::raster::{Rect, Scale, Scrollbar, Surface};
 use crate::{text, Error, Result};
 use std::collections::BTreeMap;
+use td_ui::raster::{Rect, Scale, Scrollbar, Surface};
 
 const MULTI_CLICK_MILLIS: u64 = 500;
 const MULTI_CLICK_SLOP: u64 = 4;
@@ -673,9 +673,7 @@ impl Controller {
                 })
             }
             Event::CancelInput => {
-                let changed = self.keys.pending()
-                    || self.mark.is_some()
-                    || self.drag.is_some();
+                let changed = self.keys.pending() || self.mark.is_some() || self.drag.is_some();
                 self.reset_input();
                 Ok(if changed {
                     Outcome::Changed
@@ -734,9 +732,7 @@ impl Controller {
             // as a reader's typing is nothing; motion and selection stay,
             // and as for any ignored input the keymap, drag, click
             // sequence and caret phase are left as they were.
-            Action::Edit(command)
-                if self.editor.document(tab)?.read_only() && !command.views() =>
-            {
+            Action::Edit(command) if self.editor.document(tab)?.read_only() && !command.views() => {
                 return Ok(Outcome::Ignored);
             }
             // The host of a pane loads, selects and closes its documents
@@ -1042,8 +1038,7 @@ impl Controller {
         }
         // All cell midpoints are integral font pixels. Ceiling preserves the
         // strict "past midpoint" decision for scaled subpixel coordinates.
-        let physical_x =
-            x.saturating_sub(area.x).clamp(0, i64::from(area.width) - 1) as usize;
+        let physical_x = x.saturating_sub(area.x).clamp(0, i64::from(area.width) - 1) as usize;
         let cell_physical_x = cell_x
             .saturating_sub(area.x)
             .clamp(0, i64::from(area.width) - 1) as usize;
@@ -1085,7 +1080,10 @@ impl Controller {
                         && self.clock.saturating_sub(click.at) <= MULTI_CLICK_MILLIS
                         && click.near(pointer_x, pointer_y, scale)
                 })
-                .map_or(1, |click| if click.count == 3 { 1 } else { click.count + 1 });
+                .map_or(
+                    1,
+                    |click| if click.count == 3 { 1 } else { click.count + 1 },
+                );
             self.click = Some(Click {
                 tab,
                 revision,
@@ -1190,7 +1188,10 @@ fn word_selection(text: &str, at: usize) -> Result<Selection> {
             .and_then(|byte| byte.checked_add(scalar.len_utf8()))
             .ok_or(Error::Exhausted)?;
     }
-    Ok(Selection { anchor: start, caret: end })
+    Ok(Selection {
+        anchor: start,
+        caret: end,
+    })
 }
 
 fn line_selection(text: &str, at: usize) -> Result<Selection> {

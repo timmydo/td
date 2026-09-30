@@ -54,8 +54,7 @@ const INPUT_FILE_CHOOSER_OK: &str = "TD-FIREFOX-FILE-CHOOSER-CONTENT-OK";
 const INPUT_FILE_CHOOSER_PUBLIC_OK: &str = "TD-FIREFOX-FILE-CHOOSER-OK bytes=23";
 const FIREFOX_NETWORK_TEST_URL: &str = "https://git.kernel.org/";
 const FIREFOX_NETWORK_CONTENT_OK: &str = "TD-FIREFOX-NETWORK-CONTENT-OK";
-pub(crate) const FIREFOX_NETWORK_RUNTIME_MARKER: &str =
-    "TD-FIREFOX-NETWORK-HTTPS-OK";
+pub(crate) const FIREFOX_NETWORK_RUNTIME_MARKER: &str = "TD-FIREFOX-NETWORK-HTTPS-OK";
 pub(crate) const FIREFOX_SOAK_RUNTIME_MARKER: &str =
     "TD-FIREFOX-SOAK-OK minimum-seconds=300 navigations=31";
 const FIREFOX_SOAK_CONTENT_OK: &str = "TD-FIREFOX-SOAK-CONTENT-OK";
@@ -904,8 +903,8 @@ fn validate_download(directory: &Path, expected: &[u8], uid: u32, gid: u32) -> i
     let path = directory.join(DOWNLOAD_NAME);
     let path_before = fs::symlink_metadata(&path)
         .map_err(|error| contextual("inspect Firefox download path", error))?;
-    let mut file = File::open(&path)
-        .map_err(|error| contextual("open Firefox download path", error))?;
+    let mut file =
+        File::open(&path).map_err(|error| contextual("open Firefox download path", error))?;
     let opened = file
         .metadata()
         .map_err(|error| contextual("inspect open Firefox download", error))?;
@@ -1265,12 +1264,7 @@ fn run_network_probe<S: Read + Write>(stream: &mut S) -> io::Result<()> {
     set_context(stream, 2, "content")?;
     navigate(stream, 3, FIREFOX_NETWORK_TEST_URL)?;
     let script = network_document_script();
-    require_script_value(
-        stream,
-        4,
-        &script,
-        FIREFOX_NETWORK_CONTENT_OK,
-    )
+    require_script_value(stream, 4, &script, FIREFOX_NETWORK_CONTENT_OK)
 }
 
 fn run_soak_probe<S: Read + Write, C: SoakClock>(stream: &mut S, clock: &mut C) -> io::Result<()> {
@@ -2324,9 +2318,7 @@ mod tests {
                     responses.push(format!("[1,{id},null,{{\"value\":\"{value}\"}}]"));
                 }
             }
-            InputStage::Download
-            | InputStage::FileChooser
-            | InputStage::FileChooserResult => {
+            InputStage::Download | InputStage::FileChooser | InputStage::FileChooserResult => {
                 responses.push(r#"[1,2,null,{"value":null}]"#.to_string());
                 for (index, value) in values.iter().enumerate() {
                     let id = index + 3;
@@ -2694,13 +2686,17 @@ mod tests {
         assert_eq!(CONTENT_ARM_SCRIPT.matches("oscillator.start(").count(), 1);
         assert_eq!(CONTENT_ARM_SCRIPT.matches("oscillator.stop(").count(), 1);
         let trusted = CONTENT_ARM_SCRIPT.find("if (!event.isTrusted").unwrap();
-        let context = CONTENT_ARM_SCRIPT.find("new AudioContext({ sampleRate: 48000 })").unwrap();
+        let context = CONTENT_ARM_SCRIPT
+            .find("new AudioContext({ sampleRate: 48000 })")
+            .unwrap();
         let scheduled_tail = r#"const toneStart = context.currentTime;
       gain.gain.setValueAtTime(0.25, toneStart);
       gain.gain.setValueAtTime(0.001, toneStart + 1.2);
       oscillator.connect(gain).connect(context.destination);"#;
         assert!(CONTENT_ARM_SCRIPT.contains(scheduled_tail));
-        let start = CONTENT_ARM_SCRIPT.find("oscillator.start(toneStart)").unwrap();
+        let start = CONTENT_ARM_SCRIPT
+            .find("oscillator.start(toneStart)")
+            .unwrap();
         let stop = CONTENT_ARM_SCRIPT
             .find("oscillator.stop(toneStart + 1.7)")
             .unwrap();
@@ -2724,12 +2720,9 @@ mod tests {
       state.focusMoves++;
     }"#;
         assert!(CONTENT_ARM_SCRIPT.contains(trusted_focus_move));
-        assert!(CONTENT_FOCUS_SCRIPT.contains(
-            "state.focusMoves > 0 && state.focusMoves <= 4"
-        ));
-        assert!(CONTENT_FOCUS_SCRIPT.contains(
-            "document.hasFocus() && document.activeElement === input"
-        ));
+        assert!(CONTENT_FOCUS_SCRIPT.contains("state.focusMoves > 0 && state.focusMoves <= 4"));
+        assert!(CONTENT_FOCUS_SCRIPT
+            .contains("document.hasFocus() && document.activeElement === input"));
         assert!(CONTENT_FOCUS_SCRIPT.contains("Date.now() + 10000"));
         assert!(CONTENT_FOCUS_SCRIPT.contains("setTimeout(check, 50)"));
         assert!(CONTENT_MENU_SCRIPT.contains("input.value.length <= 4"));
@@ -2747,16 +2740,12 @@ mod tests {
         assert!(CHROME_FINAL_SCRIPT.contains("popup.state === \"closed\""));
         assert!(CONTENT_CLIPBOARD_REFOCUS_ARM_SCRIPT.contains("mousedown"));
         assert!(CONTENT_CLIPBOARD_REFOCUS_ARM_SCRIPT.contains("once: true"));
-        assert!(
-            CONTENT_CLIPBOARD_REFOCUS_ARM_SCRIPT.contains(INPUT_CLIPBOARD_REFOCUS_ARMED)
-        );
+        assert!(CONTENT_CLIPBOARD_REFOCUS_ARM_SCRIPT.contains(INPUT_CLIPBOARD_REFOCUS_ARMED));
         assert!(CONTENT_CLIPBOARD_REFOCUS_SCRIPT.contains("state.down === 1"));
         assert!(CONTENT_CLIPBOARD_REFOCUS_SCRIPT.contains(INPUT_CLIPBOARD_WINDOW_ARMED));
         assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains("urlbar.focused"));
         assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains("event.ctrlKey && event.key === \"v\""));
-        assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains(
-            "event.clipboardData.getData(\"text/plain\")"
-        ));
+        assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains("event.clipboardData.getData(\"text/plain\")"));
         assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains(INPUT_CLIPBOARD_ARMED));
         assert!(CHROME_CLIPBOARD_SCRIPT.contains("win.gURLBar.value"));
         assert!(CHROME_CLIPBOARD_SCRIPT.contains("state.shortcuts >= 1"));
@@ -2772,9 +2761,8 @@ mod tests {
         assert!(CHROME_CLIPBOARD_SCRIPT.contains("valueRepeats <= state.pastes"));
         assert!(CHROME_CLIPBOARD_SCRIPT.contains("state.exactPastes <= valueRepeats"));
         assert!(CHROME_CLIPBOARD_SCRIPT.contains("!state.unexpected"));
-        assert!(CHROME_CLIPBOARD_SCRIPT.contains(
-            "value === \"Welcome\".repeat(value.length / \"Welcome\".length)"
-        ));
+        assert!(CHROME_CLIPBOARD_SCRIPT
+            .contains("value === \"Welcome\".repeat(value.length / \"Welcome\".length)"));
         assert!(CHROME_CLIPBOARD_SCRIPT.contains(INPUT_CLIPBOARD_RETRY));
         assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains("!focused || !selected"));
         assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains("event.key === \"Shift\""));
@@ -2814,8 +2802,7 @@ mod tests {
         assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains(INPUT_FILE_CHOOSER_FOCUSED));
         assert!(CONTENT_FILE_CHOOSER_SCRIPT
             .contains("file:///home/td/Downloads/td-firefox-download.txt"));
-        assert!(CONTENT_FILE_CHOOSER_SCRIPT
-            .contains("document.contentType === \"text/plain\""));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("document.contentType === \"text/plain\""));
         assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("document.body.textContent"));
         assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("TD-FIREFOX-DOWNLOAD-V1\\n"));
         assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("Date.now() + 20000"));

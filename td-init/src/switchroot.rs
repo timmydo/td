@@ -511,9 +511,7 @@ fn free_old_root(mounts: Option<&str>) {
     let fstype = match mounts.and_then(root_fstype) {
         Some(t) => t,
         None => {
-            crate::emit_err(
-                "switch_root: no mount table; leaving the old root's memory in use\n",
-            );
+            crate::emit_err("switch_root: no mount table; leaving the old root's memory in use\n");
             return;
         }
     };
@@ -544,9 +542,8 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     // INIT is named as it will be AFTER the chroot, so it is resolved with the
     // new root as "/" — see `resolve_in_root`. Refusing here is the difference
     // between an error message and a panicked kernel.
-    let staged_init = resolve_in_root(root, init).ok_or_else(|| {
-        format!("{init}: does not resolve inside {newroot} — refusing to switch")
-    })?;
+    let staged_init = resolve_in_root(root, init)
+        .ok_or_else(|| format!("{init}: does not resolve inside {newroot} — refusing to switch"))?;
     is_runnable(root, &staged_init, 0, Loader::Any)?;
     let argv0 = exec_argv0(init);
     // The same file named from inside the new root, for the exec below.
@@ -582,9 +579,7 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     // relocated into it by then — a half-switched system with /dev and /proc
     // buried in a subdirectory of a root that never became one.
     if !is_mount_point(root, mounts.as_deref()) {
-        return Err(format!(
-            "{newroot}: not a mount point — refusing to switch"
-        ));
+        return Err(format!("{newroot}: not a mount point — refusing to switch"));
     }
     let moves = match mounts.as_deref() {
         Some(text) => api_moves(text, newroot),
@@ -599,13 +594,7 @@ pub fn run(args: &[String]) -> Result<u8, String> {
             ));
             continue;
         }
-        if let Err(e) = sys::mount(
-            &cpath(source)?,
-            &cpath(target)?,
-            None,
-            sys::MS_MOVE,
-            None,
-        ) {
+        if let Err(e) = sys::mount(&cpath(source)?, &cpath(target)?, None, sys::MS_MOVE, None) {
             crate::emit_err(&format!("switch_root: moving {source} to {target}: {e}\n"));
         }
     }
@@ -680,7 +669,10 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
     #[test]
     fn a_trailing_slash_on_the_new_root_is_normalised() {
         let moves = api_moves("proc /proc proc rw 0 0\n", "/mnt/root/");
-        assert_eq!(moves, vec![("/proc".to_string(), "/mnt/root/proc".to_string())]);
+        assert_eq!(
+            moves,
+            vec![("/proc".to_string(), "/mnt/root/proc".to_string())]
+        );
     }
 
     #[test]
@@ -771,7 +763,10 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
         // climb out of the new root.
         std::os::unix::fs::symlink("../td/store/abc-td-init/bin/td-init", root.join("sbin/rel"))
             .unwrap();
-        assert_eq!(resolve_in_root(&root, "/sbin/rel"), Some(store.join("td-init")));
+        assert_eq!(
+            resolve_in_root(&root, "/sbin/rel"),
+            Some(store.join("td-init"))
+        );
         std::fs::create_dir_all(root.join("etc")).unwrap();
         assert_eq!(resolve_in_root(&root, "/../../etc"), Some(root.join("etc")));
 
@@ -816,9 +811,8 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
         let root = std::env::temp_dir().join(format!("td-init-exec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("bin")).unwrap();
-        let exec = |p: &Path| {
-            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap()
-        };
+        let exec =
+            |p: &Path| std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // A static ELF is loadable.
         let elf = root.join("bin/elf");
@@ -1134,12 +1128,18 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
     fn the_shebang_line_is_parsed_the_way_the_kernel_parses_it() {
         assert_eq!(shebang_interpreter(b"#!/bin/sh\n"), Some("/bin/sh".into()));
         // Leading blanks are skipped and arguments are not part of the program.
-        assert_eq!(shebang_interpreter(b"#!  /bin/sh -x\n"), Some("/bin/sh".into()));
+        assert_eq!(
+            shebang_interpreter(b"#!  /bin/sh -x\n"),
+            Some("/bin/sh".into())
+        );
         // A file shorter than the buffer needs no newline: the kernel's buffer
         // is zero-filled, so the padding ends the line and the file runs.
         assert_eq!(shebang_interpreter(b"#!/bin/sh"), Some("/bin/sh".into()));
         // A NUL ends the line exactly as a newline does.
-        assert_eq!(shebang_interpreter(b"#!/bin/sh\0junk"), Some("/bin/sh".into()));
+        assert_eq!(
+            shebang_interpreter(b"#!/bin/sh\0junk"),
+            Some("/bin/sh".into())
+        );
         assert_eq!(shebang_interpreter(b"\x7fELF"), None);
         assert_eq!(shebang_interpreter(b"#!\n"), None);
         assert_eq!(shebang_interpreter(b""), None);
@@ -1172,15 +1172,14 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
         // A plain file with no execute bit: it RESOLVES, so this exercises the
         // executability test rather than the resolution one.
         std::fs::write(root.join("sbin/init"), "not a program").unwrap();
-        let argv = vec![
-            root.display().to_string(),
-            "/sbin/init".to_string(),
-        ];
+        let argv = vec![root.display().to_string(), "/sbin/init".to_string()];
         let err = run(&argv).unwrap_err();
         assert!(err.contains("not an executable file"), "{err}");
         // An INIT that is not there at all is refused by name.
         let absent = vec![root.display().to_string(), "/sbin/absent".to_string()];
-        assert!(run(&absent).unwrap_err().contains("does not resolve inside"));
+        assert!(run(&absent)
+            .unwrap_err()
+            .contains("does not resolve inside"));
         // ...and a NEWROOT that is not a directory at all.
         let missing = vec![
             root.join("nope").display().to_string(),

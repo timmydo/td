@@ -24,9 +24,9 @@ pub fn recipe() -> Recipe {
     steps.push(Step::ToolFarm {
         links: [
             "awk", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "diff", "dirname",
-            "echo", "env", "expr", "false", "find", "grep", "head", "install", "ln", "ls",
-            "mkdir", "mktemp", "mv", "printf", "pwd", "rm", "rmdir", "sed", "sort", "tail",
-            "tee", "test", "touch", "tr", "true", "uname", "wc", "which", "xargs",
+            "echo", "env", "expr", "false", "find", "grep", "head", "install", "ln", "ls", "mkdir",
+            "mktemp", "mv", "printf", "pwd", "rm", "rmdir", "sed", "sort", "tail", "tee", "test",
+            "touch", "tr", "true", "uname", "wc", "which", "xargs",
         ]
         .iter()
         .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
@@ -195,7 +195,10 @@ mod tests {
             "-ffile-prefix-map=\"{src}\"=/td-build",
             "-Wl,--build-id=sha1",
         ] {
-            assert!(wrapper.contains(required), "missing target policy {required}");
+            assert!(
+                wrapper.contains(required),
+                "missing target policy {required}"
+            );
         }
         assert!(steps.iter().any(|step| matches!(
             step,
@@ -211,9 +214,7 @@ mod tests {
         let configure = steps
             .iter()
             .find_map(|step| match step {
-                Step::Run { argv, .. } if argv.iter().any(|arg| arg == "./configure") => {
-                    Some(argv)
-                }
+                Step::Run { argv, .. } if argv.iter().any(|arg| arg == "./configure") => Some(argv),
                 _ => None,
             })
             .expect("configure step");

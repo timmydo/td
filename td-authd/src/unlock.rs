@@ -143,7 +143,9 @@ impl Wire {
 }
 
 impl Drop for Wire {
-    fn drop(&mut self) { self.output.fill(0); }
+    fn drop(&mut self) {
+        self.output.fill(0);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -227,8 +229,15 @@ impl Unlock {
         )
     }
 
-    pub fn start_write(owner: u32, operation: Operation, credential: Credential) -> Result<Self, String> {
-        if !matches!(operation, Operation::Set { .. }) || credential.0.is_empty() || credential.0.len() > MAX_SECRET {
+    pub fn start_write(
+        owner: u32,
+        operation: Operation,
+        credential: Credential,
+    ) -> Result<Self, String> {
+        if !matches!(operation, Operation::Set { .. })
+            || credential.0.is_empty()
+            || credential.0.len() > MAX_SECRET
+        {
             return Err("invalid private credential write".into());
         }
         let mut worker = Self::start_operation(owner, operation)?;
@@ -387,7 +396,9 @@ impl Unlock {
     fn poll_active(&mut self) -> Result<Event, String> {
         if self.phase == Phase::CredentialInput {
             let wire = self.wire.as_mut().ok_or("missing write endpoint")?;
-            if wire.poll()?.is_some() { return Err("write child answered before credential input".into()); }
+            if wire.poll()?.is_some() {
+                return Err("write child answered before credential input".into());
+            }
             if wire.output.is_empty() {
                 let credential = self.credential.take().ok_or("missing write input")?;
                 wire.queue_bounded(&credential.0, MAX_SECRET)?;
@@ -481,8 +492,13 @@ impl Unlock {
             return Ok(Event::Waiting);
         };
         self.child = None;
-        if self.phase == Phase::Stopping && matches!(self.request.operation(), Operation::Set { .. }) {
-            let reason = self.failure.take().unwrap_or_else(|| "credential write cancelled".into());
+        if self.phase == Phase::Stopping
+            && matches!(self.request.operation(), Operation::Set { .. })
+        {
+            let reason = self
+                .failure
+                .take()
+                .unwrap_or_else(|| "credential write cancelled".into());
             return self.finish(Ok(Event::Failed(reason)));
         }
         if self.phase == Phase::Stopping {

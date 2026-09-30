@@ -26,7 +26,8 @@ fn parse(spec: &str) -> Result<u64, String> {
             "invalid interval '{spec}' (whole seconds, no suffix)\nusage: sleep SECONDS"
         ));
     }
-    spec.parse().map_err(|e| format!("invalid interval '{spec}': {e}"))
+    spec.parse()
+        .map_err(|e| format!("invalid interval '{spec}': {e}"))
 }
 
 #[cfg(test)]

@@ -24,7 +24,10 @@ fn report(mut output: impl Write, message: std::fmt::Arguments<'_>) -> Result<()
 
 fn report_refusal(output: impl Write, error: &str) -> Result<(), String> {
     // Serial transmission can split even one write; the last record fences it.
-    report(output, format_args!("{REFUSED_PREFIX} {error}\n{REFUSAL_COMPLETE_MARKER}"))
+    report(
+        output,
+        format_args!("{REFUSED_PREFIX} {error}\n{REFUSAL_COMPLETE_MARKER}"),
+    )
 }
 
 fn command(program: &str, args: &[&str]) -> Result<(), String> {
@@ -381,7 +384,12 @@ fn diagnostic(marker: &str, args: &[&str], limit: usize, label: &str) -> Result<
 }
 
 fn candidates(marker: &str) -> Result<(), String> {
-    diagnostic(marker, &["destinations"], MAX_INVENTORY_BYTES, "destination candidates")
+    diagnostic(
+        marker,
+        &["destinations"],
+        MAX_INVENTORY_BYTES,
+        "destination candidates",
+    )
 }
 
 fn check_candidate_record(device: &str) -> Result<(), String> {
@@ -393,7 +401,9 @@ fn check_candidate_record(device: &str) -> Result<(), String> {
         "binary destination candidates",
     )?;
     if observed != expected {
-        return Err("binary candidate record differs from the independent target observation".into());
+        return Err(
+            "binary candidate record differs from the independent target observation".into(),
+        );
     }
     report(std::io::stdout(), format_args!("{CANDIDATE_RECORD_MARKER}"))
 }
@@ -447,18 +457,26 @@ fn observed_destination(device: &str) -> Result<Vec<u8>, String> {
     let name = device.strip_prefix("/dev/").ok_or("invalid target path")?;
     let base = Path::new("/sys/class/block").join(name);
     let number = required_attribute(&base.join("dev"))?;
-    let (major, minor) = number.split_once(':').ok_or("invalid target device number")?;
+    let (major, minor) = number
+        .split_once(':')
+        .ok_or("invalid target device number")?;
     let major = major.parse::<u32>().map_err(|_| "invalid target major")?;
     let minor = minor.parse::<u32>().map_err(|_| "invalid target minor")?;
-    let sequence = required_attribute(&base.join("diskseq"))?.parse::<u64>()
+    let sequence = required_attribute(&base.join("diskseq"))?
+        .parse::<u64>()
         .map_err(|_| "invalid target disk sequence")?;
-    let capacity = required_attribute(&base.join("size"))?.parse::<u64>()
-        .map_err(|_| "invalid target capacity")?.checked_mul(512)
+    let capacity = required_attribute(&base.join("size"))?
+        .parse::<u64>()
+        .map_err(|_| "invalid target capacity")?
+        .checked_mul(512)
         .ok_or("target capacity overflow")?;
-    let sector = required_attribute(&base.join("queue/logical_block_size"))?.parse::<u32>()
+    let sector = required_attribute(&base.join("queue/logical_block_size"))?
+        .parse::<u32>()
         .map_err(|_| "invalid target sector size")?;
     let removable = match required_attribute(&base.join("removable"))?.as_str() {
-        "0" => 0, "1" => 1, _ => return Err("invalid target removable flag".into()),
+        "0" => 0,
+        "1" => 1,
+        _ => return Err("invalid target removable flag".into()),
     };
     let model = attribute(&base.join("device/model"), true)?;
     let serial = match attribute(&base.join("serial"), true)? {
@@ -510,9 +528,14 @@ fn plan_observation(args: &[&str], plan: &[u8]) -> Result<std::process::Output, 
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("start plan observation: {error}"))?;
-    let fed = child.stdin.take().ok_or("plan observation stdin is unavailable")?
-        .write_all(plan).map_err(|error| format!("feed plan observation: {error}"));
-    let result = child.wait_with_output()
+    let fed = child
+        .stdin
+        .take()
+        .ok_or("plan observation stdin is unavailable")?
+        .write_all(plan)
+        .map_err(|error| format!("feed plan observation: {error}"));
+    let result = child
+        .wait_with_output()
         .map_err(|error| format!("finish plan observation: {error}"));
     fed?;
     result
@@ -520,12 +543,16 @@ fn plan_observation(args: &[&str], plan: &[u8]) -> Result<std::process::Output, 
 
 fn canaries(device: &str) -> Result<Vec<u8>, String> {
     let mut file = File::open(device).map_err(|error| error.to_string())?;
-    let len = file.seek(SeekFrom::End(0)).map_err(|error| error.to_string())?;
+    let len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|error| error.to_string())?;
     let mut bytes = Vec::with_capacity(96);
     for offset in [0, len / 2, len.saturating_sub(32)] {
-        file.seek(SeekFrom::Start(offset)).map_err(|error| error.to_string())?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| error.to_string())?;
         let mut sample = [0; 32];
-        file.read_exact(&mut sample).map_err(|error| error.to_string())?;
+        file.read_exact(&mut sample)
+            .map_err(|error| error.to_string())?;
         bytes.extend_from_slice(&sample);
     }
     Ok(bytes)
@@ -534,13 +561,24 @@ fn canaries(device: &str) -> Result<Vec<u8>, String> {
 fn source_deployment() -> Result<([u8; 32], String), String> {
     let result = Command::new("/bin/td-boot")
         .args(["validate-source", "/source", "/trusted.pub"])
-        .output().map_err(|error| format!("validate source: {error}"))?;
+        .output()
+        .map_err(|error| format!("validate source: {error}"))?;
     if !result.status.success() {
-        return Err(format!("source validation failed: {}: {}", result.status,
-            String::from_utf8_lossy(&result.stderr).trim_end()));
+        return Err(format!(
+            "source validation failed: {}: {}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr).trim_end()
+        ));
     }
-    let id = result.stdout.strip_suffix(b"\n").ok_or("source ID lacks newline")?;
-    if id.len() != 64 || !id.iter().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
+    let id = result
+        .stdout
+        .strip_suffix(b"\n")
+        .ok_or("source ID lacks newline")?;
+    if id.len() != 64
+        || !id
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return Err("source ID is not canonical lowercase SHA-256".into());
     }
     let mut digest = [0; 32];
@@ -558,24 +596,43 @@ fn check_plan_observation(device: &str) -> Result<(), String> {
     let plan = observed_plan(device, [0; 32])?;
     let response = plan_observation(&["observe-plan"], &plan)?;
     if !response.status.success() {
-        return Err(format!("current plan observation failed: {}", response.status));
+        return Err(format!(
+            "current plan observation failed: {}",
+            response.status
+        ));
     }
     let name = device.strip_prefix("/dev/").ok_or("invalid target path")?;
-    let expected = format!("{{\"version\":1,\"scope\":\"plan-observation-only\",\"destination\":\"{name}\"}}\n");
+    let expected = format!(
+        "{{\"version\":1,\"scope\":\"plan-observation-only\",\"destination\":\"{name}\"}}\n"
+    );
     if response.stdout != expected.as_bytes() {
         return Err("current plan observation returned a different report".into());
     }
-    report(std::io::stdout(), format_args!("{PLAN_OBSERVATION_MARKER} {} {}", expected.trim_end().len(), expected.trim_end()))?;
+    report(
+        std::io::stdout(),
+        format_args!(
+            "{PLAN_OBSERVATION_MARKER} {} {}",
+            expected.trim_end().len(),
+            expected.trim_end()
+        ),
+    )?;
     let sequence = required_attribute(&Path::new("/sys/class/block").join(name).join("diskseq"))?
-        .parse::<u64>().map_err(|_| "invalid target disk sequence")?;
-    let changed = sequence.checked_add(1).ok_or("fixture disk sequence overflow")?;
+        .parse::<u64>()
+        .map_err(|_| "invalid target disk sequence")?;
+    let changed = sequence
+        .checked_add(1)
+        .ok_or("fixture disk sequence overflow")?;
     let mut stale = plan;
-    stale.get_mut(96..104).ok_or("fixture plan lacks disk sequence")?
+    stale
+        .get_mut(96..104)
+        .ok_or("fixture plan lacks disk sequence")?
         .copy_from_slice(&changed.to_be_bytes());
     let response = plan_observation(&["observe-plan"], &stale)?;
     let diagnostic = String::from_utf8_lossy(&response.stderr);
-    if response.status.success() || !response.stdout.is_empty()
-        || !diagnostic.contains("reviewed destination is no longer an unchanged candidate") {
+    if response.status.success()
+        || !response.stdout.is_empty()
+        || !diagnostic.contains("reviewed destination is no longer an unchanged candidate")
+    {
         return Err("stale plan observation was accepted or reported success".into());
     }
     if before != canaries(device)? {
@@ -584,47 +641,94 @@ fn check_plan_observation(device: &str) -> Result<(), String> {
     report(std::io::stdout(), format_args!("{PLAN_STALE_MARKER}"))
 }
 
-fn check_source_plan_observation(device: &str, deployment: [u8; 32], id: &str) -> Result<(), String> {
+fn check_source_plan_observation(
+    device: &str,
+    deployment: [u8; 32],
+    id: &str,
+) -> Result<(), String> {
     let before = canaries(device)?;
     let plan = observed_plan(device, deployment)?;
-    let source = plan_observation(&["observe-source-plan", "/bin/td-boot", "/source", "/trusted.pub"], &plan)?;
+    let source = plan_observation(
+        &[
+            "observe-source-plan",
+            "/bin/td-boot",
+            "/source",
+            "/trusted.pub",
+        ],
+        &plan,
+    )?;
     let name = device.strip_prefix("/dev/").ok_or("invalid target path")?;
     let expected_source = format!("{{\"version\":1,\"scope\":\"held-source-plan-observation-only\",\"destination\":\"{name}\",\"deployment\":\"{id}\"}}\n");
     if !source.status.success() || source.stdout != expected_source.as_bytes() {
         return Err(format!("current source plan observation failed or returned a different report: status {}; stderr {}",
             source.status, String::from_utf8_lossy(&source.stderr).trim_end()));
     }
-    report(std::io::stdout(), format_args!("{SOURCE_PLAN_OBSERVATION_MARKER} {} {}", expected_source.trim_end().len(), expected_source.trim_end()))?;
+    report(
+        std::io::stdout(),
+        format_args!(
+            "{SOURCE_PLAN_OBSERVATION_MARKER} {} {}",
+            expected_source.trim_end().len(),
+            expected_source.trim_end()
+        ),
+    )?;
     let probe = Path::new("/scratch/source-claim-probe");
     fs::create_dir_all(probe).map_err(|error| format!("create source claim probe: {error}"))?;
-    fs::write(probe.join("device"), device).map_err(|error| format!("write source claim probe device: {error}"))?;
-    fs::write(probe.join("id"), id).map_err(|error| format!("write source claim probe ID: {error}"))?;
+    fs::write(probe.join("device"), device)
+        .map_err(|error| format!("write source claim probe device: {error}"))?;
+    fs::write(probe.join("id"), id)
+        .map_err(|error| format!("write source claim probe ID: {error}"))?;
     let overlap = plan_observation(
-        &["observe-source-plan", "/init", "/scratch/source-claim-probe", "/trusted.pub"],
+        &[
+            "observe-source-plan",
+            "/init",
+            "/scratch/source-claim-probe",
+            "/trusted.pub",
+        ],
         &plan,
     )?;
     if !overlap.status.success() || overlap.stdout != expected_source.as_bytes() {
-        return Err(format!("source validator did not observe the held disk claim: status {}; stderr {}",
-            overlap.status, String::from_utf8_lossy(&overlap.stderr).trim_end()));
+        return Err(format!(
+            "source validator did not observe the held disk claim: status {}; stderr {}",
+            overlap.status,
+            String::from_utf8_lossy(&overlap.stderr).trim_end()
+        ));
     }
     if before != canaries(device)? {
         return Err("overlapping source validation changed target disk canaries".into());
     }
-    report(std::io::stdout(), format_args!("{SOURCE_PLAN_CLAIM_MARKER}"))?;
+    report(
+        std::io::stdout(),
+        format_args!("{SOURCE_PLAN_CLAIM_MARKER}"),
+    )?;
     let mut stale_source = plan;
-    let digest_first = stale_source.get_mut(40).ok_or("fixture plan lacks deployment digest")?;
+    let digest_first = stale_source
+        .get_mut(40)
+        .ok_or("fixture plan lacks deployment digest")?;
     *digest_first ^= 1;
-    let refused = plan_observation(&["observe-source-plan", "/bin/td-boot", "/source", "/trusted.pub"], &stale_source)?;
+    let refused = plan_observation(
+        &[
+            "observe-source-plan",
+            "/bin/td-boot",
+            "/source",
+            "/trusted.pub",
+        ],
+        &stale_source,
+    )?;
     let diagnostic = String::from_utf8_lossy(&refused.stderr);
-    if refused.status.success() || !refused.stdout.is_empty()
-        || !diagnostic.contains("reviewed deployment differs from authenticated source") {
+    if refused.status.success()
+        || !refused.stdout.is_empty()
+        || !diagnostic.contains("reviewed deployment differs from authenticated source")
+    {
         return Err(format!("changed source plan was accepted or refused for another reason: status {}; stderr {diagnostic}",
             refused.status));
     }
     if before != canaries(device)? {
         return Err("source plan observation changed target disk canaries".into());
     }
-    report(std::io::stdout(), format_args!("{SOURCE_PLAN_STALE_MARKER}"))
+    report(
+        std::io::stdout(),
+        format_args!("{SOURCE_PLAN_STALE_MARKER}"),
+    )
 }
 
 fn claim_probe_validator(source: &Path, key: &Path) -> Result<(), String> {
@@ -635,12 +739,25 @@ fn claim_probe_validator(source: &Path, key: &Path) -> Result<(), String> {
         .map_err(|error| format!("read source claim probe device: {error}"))?;
     let id = fs::read_to_string(source.join("id"))
         .map_err(|error| format!("read source claim probe ID: {error}"))?;
-    match fs::OpenOptions::new().read(true).write(true).custom_flags(0x80).open(&device) {
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(0x80)
+        .open(&device)
+    {
         Err(error) if error.raw_os_error() == Some(16) => {}
-        Err(error) => return Err(format!("source claim probe got wrong open failure: {error}")),
+        Err(error) => {
+            return Err(format!(
+                "source claim probe got wrong open failure: {error}"
+            ))
+        }
         Ok(_) => return Err("source validator opened an unclaimed destination".into()),
     }
-    if id.len() != 64 || !id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
+    if id.len() != 64
+        || !id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return Err("source claim probe received a noncanonical ID".into());
     }
     report(std::io::stdout(), format_args!("{id}"))
@@ -708,7 +825,8 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
     )?;
     let sysfs = Path::new("/sys/class/block").join(name);
     let writable = required_attribute(&sysfs.join("ro"))? == "0";
-    let sectors = required_attribute(&sysfs.join("size"))?.parse::<u64>()
+    let sectors = required_attribute(&sysfs.join("size"))?
+        .parse::<u64>()
         .map_err(|_| "invalid target sector count")?;
     if writable && sectors >= PLAN_PROBE_MINIMUM_SECTORS {
         check_candidate_record(device)?;
@@ -725,21 +843,54 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
             applet(&["mknod", "/dev/loop0", "b", "7", "0"])?;
         }
         command("/bin/losetup", &["-r", "/dev/loop0", "/source/root.erofs"])?;
-        applet(&["mount", "-t", "erofs", "-o", "ro,nodev,nosuid,noexec",
-            "/dev/loop0", "/root-image"])?;
-        command("/bin/td-firstboot", &["check-primary-name", "/root-image", USERNAME])?;
+        applet(&[
+            "mount",
+            "-t",
+            "erofs",
+            "-o",
+            "ro,nodev,nosuid,noexec",
+            "/dev/loop0",
+            "/root-image",
+        ])?;
+        command(
+            "/bin/td-firstboot",
+            &["check-primary-name", "/root-image", USERNAME],
+        )?;
     }
     let uuid = command_line(&["new-volume-uuid"], 37, "new volume identity")?;
     if !is_v4_volume_uuid(&uuid) {
         return Err("generated volume identity is not a canonical version-4 UUID".into());
     }
-    command("/bin/td-install", &["prepare-selector", "/selector.cpio", &uuid, "/prepared-selector.cpio"])?;
-    let mut format_arguments = vec!["format", "/source/bzImage", "/prepared-selector.cpio", "--uuid", &uuid,
-        "--timezone", TIMEZONE_ID, "--hostname", HOSTNAME];
+    command(
+        "/bin/td-install",
+        &[
+            "prepare-selector",
+            "/selector.cpio",
+            &uuid,
+            "/prepared-selector.cpio",
+        ],
+    )?;
+    let mut format_arguments = vec![
+        "format",
+        "/source/bzImage",
+        "/prepared-selector.cpio",
+        "--uuid",
+        &uuid,
+        "--timezone",
+        TIMEZONE_ID,
+        "--hostname",
+        HOSTNAME,
+    ];
     if system_autotest {
         format_arguments.extend(["--username", USERNAME, "/root-image", "/bin/td-firstboot"]);
     }
-    format_arguments.extend([device, "/bin/mkfs.btrfs", "/scratch", "--trusted-key", "/trusted.pub"]);
+    format_arguments.extend([
+        device,
+        "/bin/mkfs.btrfs",
+        "/scratch",
+        "--trusted-key",
+        "/trusted.pub",
+    ]);
     command("/bin/td-install", &format_arguments)?;
     // The real writer must refuse bad targets before the diagnostic preview.
     preview(name, geometry)?;
@@ -753,7 +904,14 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
     for (directory, expected) in [
         ("@var", &["lib"][..]),
         ("@var/lib", &["td"][..]),
-        ("@var/lib/td", if system_autotest { &["hostname", "timezone", "username"][..] } else { &["hostname", "timezone"][..] }),
+        (
+            "@var/lib/td",
+            if system_autotest {
+                &["hostname", "timezone", "username"][..]
+            } else {
+                &["hostname", "timezone"][..]
+            },
+        ),
     ] {
         let staged = Path::new("/scratch/td-volume-root").join(directory);
         let mut names = fs::read_dir(&staged)
@@ -762,7 +920,12 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("read {}: {error}", staged.display()))?;
         names.sort();
-        if names != expected.iter().map(std::ffi::OsString::from).collect::<Vec<_>>() {
+        if names
+            != expected
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        {
             return Err(format!(
                 "unexpected staged settings in {}",
                 staged.display()
@@ -961,29 +1124,43 @@ fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
     candidates(CANDIDATES_MOUNTED_MARKER)?;
     let name = device.strip_prefix("/dev/").ok_or("invalid target path")?;
     let sectors = required_attribute(&Path::new("/sys/class/block").join(name).join("size"))?
-        .parse::<u64>().map_err(|_| "invalid target sector count")?;
+        .parse::<u64>()
+        .map_err(|_| "invalid target sector count")?;
     if sectors >= PLAN_PROBE_MINIMUM_SECTORS {
         let before = canaries(device)?;
         let refused = plan_observation(&["observe-plan"], &observed_plan(device, [0; 32])?)?;
         let diagnostic = String::from_utf8_lossy(&refused.stderr);
-        if refused.status.success() || !refused.stdout.is_empty()
+        if refused.status.success()
+            || !refused.stdout.is_empty()
             || !diagnostic.contains(&format!("{device}:"))
-            || !diagnostic.contains("(os error 16)") {
-            return Err(format!("mounted target plan observation did not refuse as busy: {diagnostic}"));
+            || !diagnostic.contains("(os error 16)")
+        {
+            return Err(format!(
+                "mounted target plan observation did not refuse as busy: {diagnostic}"
+            ));
         }
         if before != canaries(device)? {
             return Err("busy plan observation changed target disk canaries".into());
         }
         report(std::io::stdout(), format_args!("{PLAN_BUSY_MARKER}"))?;
         let refused = plan_observation(
-            &["observe-source-plan", "/bin/td-boot", "/source", "/trusted.pub"],
+            &[
+                "observe-source-plan",
+                "/bin/td-boot",
+                "/source",
+                "/trusted.pub",
+            ],
             &observed_plan(device, [0; 32])?,
         )?;
         let diagnostic = String::from_utf8_lossy(&refused.stderr);
-        if refused.status.success() || !refused.stdout.is_empty()
+        if refused.status.success()
+            || !refused.stdout.is_empty()
             || !diagnostic.contains(&format!("{device}:"))
-            || !diagnostic.contains("(os error 16)") {
-            return Err(format!("mounted target source-plan observation did not refuse as busy: {diagnostic}"));
+            || !diagnostic.contains("(os error 16)")
+        {
+            return Err(format!(
+                "mounted target source-plan observation did not refuse as busy: {diagnostic}"
+            ));
         }
         if before != canaries(device)? {
             return Err("busy source-plan observation changed target disk canaries".into());
@@ -1040,7 +1217,9 @@ fn claim_fixture_disk(device: &str) -> Result<File, String> {
         .file_type()
         .is_block_device()
     {
-        return Err(format!("claimed fixture disk {device} is not a block device"));
+        return Err(format!(
+            "claimed fixture disk {device} is not a block device"
+        ));
     }
     Ok(claim)
 }
@@ -1074,7 +1253,14 @@ fn reject_busy_formatters(device: &str, state: &str) -> Result<(), String> {
     let commands: &[&[&str]] = &[
         &["layout", device],
         &["volume", device, "/bin/mkfs.btrfs", "/scratch"],
-        &["format", "/source/bzImage", "/selector.cpio", device, "/bin/mkfs.btrfs", "/scratch"],
+        &[
+            "format",
+            "/source/bzImage",
+            "/selector.cpio",
+            device,
+            "/bin/mkfs.btrfs",
+            "/scratch",
+        ],
     ];
     for arguments in commands {
         let refused = Command::new("/bin/td-install")
@@ -1262,13 +1448,19 @@ fn protect_writable_media(target: &str) -> Result<(), String> {
     let device = mount_source(target)?;
     if device != "/dev/sda"
         || read(Path::new("/sys/class/block/sda/ro"), 2)? != b"0\n"
-        || read(Path::new("/sys/class/block/sda/queue/logical_block_size"), 16)? != b"512\n"
+        || read(
+            Path::new("/sys/class/block/sda/queue/logical_block_size"),
+            16,
+        )? != b"512\n"
     {
         return Err("media-claim fixture requires writable 512-byte USB media".into());
     }
     inventory(INVENTORY_BEFORE_MARKER)?;
     candidates(CANDIDATES_BEFORE_MARKER)?;
-    command("/bin/td-boot", &["validate-source", "/source", "/trusted.pub"])?;
+    command(
+        "/bin/td-boot",
+        &["validate-source", "/source", "/trusted.pub"],
+    )?;
     reject_busy_formatters(device, "mounted installer medium")?;
     report(std::io::stdout(), format_args!("{MEDIA_BUSY_MARKER}"))?;
     // Every file bind also retains the ISO filesystem's block-device claim.
@@ -1365,8 +1557,9 @@ fn main() -> ExitCode {
     if std::process::id() != 1 {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         let result = match args.as_slice() {
-            [verb, source, key] if verb == "validate-source" =>
-                claim_probe_validator(Path::new(source), Path::new(key)),
+            [verb, source, key] if verb == "validate-source" => {
+                claim_probe_validator(Path::new(source), Path::new(key))
+            }
             _ => Err("invalid source claim probe arguments".into()),
         };
         return match result {
@@ -1420,10 +1613,15 @@ mod tests {
         let good = "20 1 0:20 / /scratch rw,nosuid,nodev - tmpfs tmpfs rw,size=64k,mode=700\n";
         require_scratch_mount(good.as_bytes()).unwrap();
         for bad in [
-            String::new(), good.repeat(2), good.replace("size=64k", "size=64m"),
-            good.replace("size=64k", "size=65536k"), good.replace("size=64k,", ""),
-            good.replace(" - tmpfs ", " - ext4 "), good.replace("/scratch", "/other"),
-            good.replace(" - ", " "), format!("{good}20 1 0:20 / /scratch rw - ext4 /dev/vda2 rw\n"),
+            String::new(),
+            good.repeat(2),
+            good.replace("size=64k", "size=64m"),
+            good.replace("size=64k", "size=65536k"),
+            good.replace("size=64k,", ""),
+            good.replace(" - tmpfs ", " - ext4 "),
+            good.replace("/scratch", "/other"),
+            good.replace(" - ", " "),
+            format!("{good}20 1 0:20 / /scratch rw - ext4 /dev/vda2 rw\n"),
         ] {
             assert!(require_scratch_mount(bad.as_bytes()).is_err(), "{bad:?}");
         }
@@ -1472,14 +1670,22 @@ mod tests {
     #[test]
     fn cold_boot_settings_refuse_absence_wrong_names_and_links() {
         for (relative, expected, check) in [
-            ("hostname", HOSTNAME, check_hostname as fn(&Path) -> Result<(), String>),
+            (
+                "hostname",
+                HOSTNAME,
+                check_hostname as fn(&Path) -> Result<(), String>,
+            ),
             ("timezone", TIMEZONE_ID, check_timezone),
         ] {
             let scratch = Scratch::new();
             let path = scratch.0.join("lib/td").join(relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             assert!(check(&scratch.0).is_err());
-            for value in ["wrong\n".into(), expected.into(), format!("{expected}\nextra\n")] {
+            for value in [
+                "wrong\n".into(),
+                expected.into(),
+                format!("{expected}\nextra\n"),
+            ] {
                 fs::write(&path, value).unwrap();
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
                 assert!(check(&scratch.0).is_err());

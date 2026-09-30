@@ -104,11 +104,8 @@ pub fn recipe() -> Recipe {
     steps.push(Step::AssertEfiApplication {
         path: bzimage.into(),
     });
-    let initramfs_check =
-        initramfs_cpio_shape_check(initramfs, "{in:busybox-x86-64}/bin/busybox");
-    steps.push(
-        Step::run("{root}", &[SH, "-c", &initramfs_check]).env("PATH", &mesboot0_path()),
-    );
+    let initramfs_check = initramfs_cpio_shape_check(initramfs, "{in:busybox-x86-64}/bin/busybox");
+    steps.push(Step::run("{root}", &[SH, "-c", &initramfs_check]).env("PATH", &mesboot0_path()));
 
     steps.push(Step::MkDir {
         path: "{out}".into(),

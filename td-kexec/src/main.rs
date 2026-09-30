@@ -186,7 +186,10 @@ mod tests {
     use super::*;
 
     fn args(xs: &[&str]) -> std::vec::IntoIter<OsString> {
-        xs.iter().map(|s| OsString::from(*s)).collect::<Vec<_>>().into_iter()
+        xs.iter()
+            .map(|s| OsString::from(*s))
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     #[test]

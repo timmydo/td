@@ -58,7 +58,11 @@ mod tests {
         // Bit 44 set is a major of 0x1000 in glibc's packing — above what the
         // kernel can represent, and exactly what the wrong mask would fold in.
         let rdev: u64 = 1 << 44;
-        assert_eq!(minor(rdev), 0, "the minor must not absorb the major's high bits");
+        assert_eq!(
+            minor(rdev),
+            0,
+            "the minor must not absorb the major's high bits"
+        );
     }
 
     /// Decoding, against the pairs these applets actually meet.
@@ -89,7 +93,11 @@ mod tests {
     fn encode_and_decode_are_inverses() {
         for (ma, mi) in [(7, 0), (1, 3), (8, 16), (259, 1024), (0xfff, 0xf_ffff)] {
             let d = encode(ma, mi).unwrap_or_default() as u64;
-            assert_eq!((major(d), minor(d)), (u64::from(ma), u64::from(mi)), "{ma}:{mi}");
+            assert_eq!(
+                (major(d), minor(d)),
+                (u64::from(ma), u64::from(mi)),
+                "{ma}:{mi}"
+            );
         }
     }
 
@@ -98,7 +106,10 @@ mod tests {
     fn an_unencodable_device_number_is_an_error() {
         assert!(encode(0x1000, 0).is_err(), "major overflows its 12 bits");
         assert!(encode(0, 0x10_0000).is_err(), "minor overflows its 20 bits");
-        assert!(encode(0xfff, 0xf_ffff).is_ok(), "the largest encodable pair");
+        assert!(
+            encode(0xfff, 0xf_ffff).is_ok(),
+            "the largest encodable pair"
+        );
     }
 
     /// Decoding checked against nodes the KERNEL created.
@@ -119,6 +130,9 @@ mod tests {
             assert_eq!((major(rdev), minor(rdev)), want, "{path}");
             checked += 1;
         }
-        assert!(checked > 0, "no /dev node available to check the decode against");
+        assert!(
+            checked > 0,
+            "no /dev node available to check the decode against"
+        );
     }
 }

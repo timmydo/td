@@ -1,4 +1,4 @@
-use crate::ladder::{SH, apply_patch, link_bins, mesboot0_inputs, mesboot0_path, unpack_into};
+use crate::ladder::{apply_patch, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, SH};
 use crate::types::{Recipe, Step, TextEdit};
 
 // GCC 2.95.3 — bootstrap rung 7 (#378, guix's gcc-core-mesboot0): tcc + the
@@ -106,7 +106,11 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     steps.push(
-        Step::run("{src}", &["{in:coreutils-mesboot0}/bin/rm", "-rf", "texinfo"]).env("PATH", &path),
+        Step::run(
+            "{src}",
+            &["{in:coreutils-mesboot0}/bin/rm", "-rf", "texinfo"],
+        )
+        .env("PATH", &path),
     );
     steps.push(Step::MkDir {
         path: "{src}/gcc".into(),
@@ -162,7 +166,9 @@ pub fn recipe() -> Recipe {
     );
     // install2 (guix gcc-core-mesboot0): libgcc.a = libgcc2.a ∪ libtcc1.a and
     // libc.a = libc.o ∪ libtcc1.o, assembled with binutils' ar into gcc-lib.
-    steps.push(Step::MkDir { path: gccdir.into() });
+    steps.push(Step::MkDir {
+        path: gccdir.into(),
+    });
     for d in ["{root}/tg", "{root}/tc2"] {
         steps.push(Step::MkDir { path: d.into() });
     }
@@ -170,15 +176,24 @@ pub fn recipe() -> Recipe {
     steps.push(Step::run("{root}/tg", &[ar, "x", "{src}/gcc/libgcc2.a"]).env("PATH", &path));
     steps.push(Step::run("{root}/tg", &[ar, "x", "{in:tcc}/lib/libtcc1.a"]).env("PATH", &path));
     steps.push(
-        Step::run("{root}/tg", &[ar, "r", &format!("{gccdir}/libgcc.a"), "glob:{root}/tg/*.o"])
-            .env("PATH", &path),
+        Step::run(
+            "{root}/tg",
+            &[ar, "r", &format!("{gccdir}/libgcc.a"), "glob:{root}/tg/*.o"],
+        )
+        .env("PATH", &path),
     );
     steps.push(Step::run("{root}/tc2", &[ar, "x", "{in:tcc}/lib/libtcc1.a"]).env("PATH", &path));
     steps.push(Step::run("{root}/tc2", &[ar, "x", "{in:tcc}/lib/libc.a"]).env("PATH", &path));
     steps.push(
         Step::run(
             "{root}/tc2",
-            &[ar, "r", &format!("{gccdir}/libc.a"), "{root}/tc2/libc.o", "{root}/tc2/libtcc1.o"],
+            &[
+                ar,
+                "r",
+                &format!("{gccdir}/libc.a"),
+                "{root}/tc2/libc.o",
+                "{root}/tc2/libtcc1.o",
+            ],
         )
         .env("PATH", &path),
     );

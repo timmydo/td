@@ -1,4 +1,4 @@
-use crate::ladder::{SH, mesboot0_inputs, mesboot0_path, unpack_into};
+use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, SH};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.44 — rung 19 (#378): the modern binutils glibc 2.41 needs
@@ -89,7 +89,12 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("binutils-244", "2.44")
         .source_input("binutils-244-source")
-        .native_inputs(&["gcc-mesboot1", "glibc-mesboot", "binutils-mesboot", "make-mesboot"])
+        .native_inputs(&[
+            "gcc-mesboot1",
+            "glibc-mesboot",
+            "binutils-mesboot",
+            "make-mesboot",
+        ])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
 }

@@ -18,17 +18,17 @@ mod sha256;
 pub use sha256::Sha256;
 mod entropy;
 pub use entropy::SystemEntropy;
-mod pkcs8;
 mod pem;
+mod pkcs8;
 pub use pem::{PemCertificates, CERTIFICATE_DER_CAPACITY};
 mod provider;
 pub use provider::{P256Key, Provider, P256_PKCS8_CAPACITY};
-mod der;
 mod certificate;
 mod certificate_algorithms;
+mod der;
+mod tls_error;
 mod tls_policy;
 mod tls_signer;
-mod tls_error;
 pub use tls_error::{TlsError, VerificationFailure};
 mod identity;
 pub use identity::ServerIdentity;
@@ -135,7 +135,12 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(dead_code, clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    dead_code,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 #[path = "../../td-secret/src/fido_p256.rs"]
 mod p256_oracle;
 

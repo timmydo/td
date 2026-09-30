@@ -233,7 +233,11 @@ fn cat<W: Write>(args: &[std::ffi::OsString], out: &mut W) -> Done {
             // without needing a disposition this crate cannot set safely. Stop
             // at once: the remaining operands have nowhere to go.
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                return Done { out: Vec::new(), err, status: 141 };
+                return Done {
+                    out: Vec::new(),
+                    err,
+                    status: 141,
+                };
             }
             Err(e) => {
                 err.extend_from_slice(
@@ -243,7 +247,11 @@ fn cat<W: Write>(args: &[std::ffi::OsString], out: &mut W) -> Done {
             }
         }
     }
-    Done { out: Vec::new(), err, status }
+    Done {
+        out: Vec::new(),
+        err,
+        status,
+    }
 }
 
 /// `mkdir [-p]`. 94 of its 106 uses pass `-p`, which is the whole reason a case
@@ -283,7 +291,11 @@ fn mkdir(args: &[std::ffi::OsString]) -> Done {
             status = 1;
         }
     }
-    Done { out: Vec::new(), err, status }
+    Done {
+        out: Vec::new(),
+        err,
+        status,
+    }
 }
 
 /// `touch`: create the operands if absent. All 124 bare uses want existence and
@@ -325,7 +337,10 @@ fn touch(args: &[std::ffi::OsString]) -> Done {
             // Append rather than create-truncate: `touch` must never empty a
             // file, and this is the arm that would if the check above and the
             // filesystem ever disagreed.
-            false => std::fs::OpenOptions::new().append(true).create(true).open(file),
+            false => std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(file),
         };
         let touched = opened.and_then(|f| {
             f.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
@@ -337,7 +352,11 @@ fn touch(args: &[std::ffi::OsString]) -> Done {
             status = 1;
         }
     }
-    Done { out: Vec::new(), err, status }
+    Done {
+        out: Vec::new(),
+        err,
+        status,
+    }
 }
 
 /// The directory a removal may not leave. `run_case` stages the case's `cwd`,
@@ -357,7 +376,11 @@ fn workspace_root(tmp: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
         .map(std::path::Path::new)
         .and_then(std::path::Path::parent)
         .and_then(|root| std::fs::canonicalize(root).ok());
-    let cwd = || std::env::current_dir().ok().and_then(|c| std::fs::canonicalize(c).ok());
+    let cwd = || {
+        std::env::current_dir()
+            .ok()
+            .and_then(|c| std::fs::canonicalize(c).ok())
+    };
     let root = from_tmp.or_else(cwd)?;
     // `/` is NOT a workspace. It would admit every path on the host while every
     // refusal below still appeared to fire -- a confinement that silently
@@ -467,7 +490,11 @@ fn rm(args: &[std::ffi::OsString], root: Option<&std::path::Path>) -> Done {
             }
         }
     }
-    Done { out: Vec::new(), err, status }
+    Done {
+        out: Vec::new(),
+        err,
+        status,
+    }
 }
 
 /// The three counts `wc` reports, tallied as the bytes arrive rather than over a
@@ -579,7 +606,9 @@ fn wc(args: &[std::ffi::OsString]) -> Done {
     let counts = match counted {
         Ok(c) => c,
         Err(e) => {
-            let what = files.first().map(|f| std::path::Path::new(f).display().to_string());
+            let what = files
+                .first()
+                .map(|f| std::path::Path::new(f).display().to_string());
             let what = what.unwrap_or_else(|| "-".to_string());
             return Done {
                 out: Vec::new(),
@@ -589,7 +618,11 @@ fn wc(args: &[std::ffi::OsString]) -> Done {
         }
     };
     let mut fields: Vec<String> = Vec::new();
-    for (wanted, n) in [(lines, counts.lines), (words, counts.words), (bytes, counts.bytes)] {
+    for (wanted, n) in [
+        (lines, counts.lines),
+        (words, counts.words),
+        (bytes, counts.bytes),
+    ] {
         if wanted {
             fields.push(n.to_string());
         }
@@ -706,7 +739,11 @@ fn seq(args: &[std::ffi::OsString]) -> Done {
 enum ModeChange {
     Octal(u32),
     /// `op` is one of `+-=`, which is how `parse` finds the clause at all.
-    Symbolic { op: u8, mask: u32, perms: u32 },
+    Symbolic {
+        op: u8,
+        mask: u32,
+        perms: u32,
+    },
 }
 
 impl ModeChange {
@@ -845,7 +882,11 @@ fn chmod(args: &[std::ffi::OsString], root: Option<&std::path::Path>) -> Done {
             status = status.max(1);
         }
     }
-    Done { out: Vec::new(), err, status }
+    Done {
+        out: Vec::new(),
+        err,
+        status,
+    }
 }
 
 /// A numeric option value: the rest of the option word (`-c4`), or the next
@@ -887,7 +928,10 @@ fn number<'a>(
     if !text.iter().all(u8::is_ascii_digit) {
         return Err(blamed);
     }
-    match std::str::from_utf8(text).ok().and_then(|t| t.parse::<usize>().ok()) {
+    match std::str::from_utf8(text)
+        .ok()
+        .and_then(|t| t.parse::<usize>().ok())
+    {
         Some(n) => Ok(n),
         None => Err(blamed),
     }
@@ -1212,8 +1256,11 @@ fn tail(args: &[std::ffi::OsString]) -> Done {
         Ok(out) => Done::ok(out),
         Err(e) => Done {
             out: Vec::new(),
-            err: format!("tail: cannot open '{}' for reading: {e}\n",
-                String::from_utf8_lossy(label(name))).into_bytes(),
+            err: format!(
+                "tail: cannot open '{}' for reading: {e}\n",
+                String::from_utf8_lossy(label(name))
+            )
+            .into_bytes(),
             status: 1,
         },
     }
@@ -1243,9 +1290,11 @@ fn tac(args: &[std::ffi::OsString]) -> Done {
         Err(e) => {
             return Done {
                 out: Vec::new(),
-                err: format!("tac: failed to open '{}' for reading: {e}\n",
-                    String::from_utf8_lossy(label(name)))
-                    .into_bytes(),
+                err: format!(
+                    "tac: failed to open '{}' for reading: {e}\n",
+                    String::from_utf8_lossy(label(name))
+                )
+                .into_bytes(),
                 status: 1,
             }
         }
@@ -1452,7 +1501,10 @@ fn od(args: &[std::ffi::OsString]) -> Done {
         // it, and a second operand here is far more likely a typo.
         return unsupported("od", operands.get(1).copied().unwrap_or_default());
     }
-    let name = operands.first().copied().unwrap_or(std::ffi::OsStr::new("-"));
+    let name = operands
+        .first()
+        .copied()
+        .unwrap_or(std::ffi::OsStr::new("-"));
     let mut src = match open(name) {
         Ok(src) => src,
         Err(e) => {
@@ -1528,7 +1580,10 @@ fn od_over<R: std::io::Read>(
                 }
                 for byte in cur {
                     ty.render(*byte, &mut cell);
-                    out.resize(out.len().saturating_add(width.saturating_sub(cell.len())), b' ');
+                    out.resize(
+                        out.len().saturating_add(width.saturating_sub(cell.len())),
+                        b' ',
+                    );
                     out.extend_from_slice(cell.as_bytes());
                 }
                 out.push(b'\n');
@@ -1739,7 +1794,11 @@ fn grep_over(
         }
         hits += 1;
         if quiet {
-            return Done { out: Vec::new(), err: Vec::new(), status: 0 };
+            return Done {
+                out: Vec::new(),
+                err: Vec::new(),
+                status: 0,
+            };
         }
         // The window is CLAMPED to the last line: `n..=n + after` with `after`
         // near `usize::MAX` iterates past the end of `wanted` for as long as
@@ -1841,8 +1900,25 @@ struct Subst {
 /// leave a bare `&` this expands. The corpus spells `/`, `:` and `;`.
 fn sed_delim_ok(d: u8) -> bool {
     !d.is_ascii_alphanumeric()
-        && !matches!(d, b'\\' | b'\n' | b'&' | b'.' | b'*' | b'[' | b']' | b'^' | b'$' | b'+'
-                        | b'?' | b'(' | b')' | b'{' | b'}' | b'|')
+        && !matches!(
+            d,
+            b'\\'
+                | b'\n'
+                | b'&'
+                | b'.'
+                | b'*'
+                | b'['
+                | b']'
+                | b'^'
+                | b'$'
+                | b'+'
+                | b'?'
+                | b'('
+                | b')'
+                | b'{'
+                | b'}'
+                | b'|'
+        )
 }
 
 /// GNU's `\xHH`: ONE or two hex digits, and a literal `x` where there are none.
@@ -2237,8 +2313,10 @@ fn sed(args: &[std::ffi::OsString]) -> Done {
             // files that read, so one bad name cost the whole run.
             Err(e) => {
                 err.extend_from_slice(
-                    format!("sed: can't read {}: {e}\n",
-                            String::from_utf8_lossy(label(name)))
+                    format!(
+                        "sed: can't read {}: {e}\n",
+                        String::from_utf8_lossy(label(name))
+                    )
                     .as_bytes(),
                 );
                 status = 2;
@@ -2409,7 +2487,10 @@ impl Pattern {
                     let next = *src.get(i + 1)?;
                     if let Some(set) = escape_class(next) {
                         i += 2;
-                        terms.push(Term { atom: Atom::Class(set), rep: repeat(src, &mut i, ere)? });
+                        terms.push(Term {
+                            atom: Atom::Class(set),
+                            rep: repeat(src, &mut i, ere)?,
+                        });
                         continue;
                     }
                     if matches!(next, b'b' | b'B')
@@ -2443,7 +2524,10 @@ impl Pattern {
                     Atom::Lit(other)
                 }
             };
-            terms.push(Term { atom: fold(atom, icase), rep: repeat(src, &mut i, ere)? });
+            terms.push(Term {
+                atom: fold(atom, icase),
+                rep: repeat(src, &mut i, ere)?,
+            });
         }
         Some(Pattern { terms, start, end })
     }
@@ -2458,9 +2542,16 @@ impl Pattern {
         }
         let terms = src
             .iter()
-            .map(|b| Term { atom: fold(Atom::Lit(*b), icase), rep: Rep::One })
+            .map(|b| Term {
+                atom: fold(Atom::Lit(*b), icase),
+                rep: Rep::One,
+            })
             .collect();
-        Some(Pattern { terms, start: false, end: false })
+        Some(Pattern {
+            terms,
+            start: false,
+            end: false,
+        })
     }
 
     /// The leftmost match in `hay` at or after `from`, as a byte range.
@@ -2781,9 +2872,7 @@ fn match_here(
         if take < min {
             return give_up(failed);
         }
-        if let Some(end) =
-            match_here(terms, ti + 1, hay, pos + take, anchored_end, failed, width)
-        {
+        if let Some(end) = match_here(terms, ti + 1, hay, pos + take, anchored_end, failed, width) {
             return Some(end);
         }
         if take == 0 {
@@ -2827,7 +2916,11 @@ struct Done {
 
 impl Done {
     fn ok(out: Vec<u8>) -> Self {
-        Done { out, err: Vec::new(), status: 0 }
+        Done {
+            out,
+            err: Vec::new(),
+            status: 0,
+        }
     }
 }
 
@@ -2921,7 +3014,8 @@ mod tests {
 
     impl Dir {
         fn new(tag: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("spec-helpers-{tag}-{}", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("spec-helpers-{tag}-{}", std::process::id()));
             // Only a directory this test could have left is cleared, and
             // `create_dir` must then SUCCEED: the name is predictable and in
             // shared `/tmp`, so adopting whatever is already there -- a planted
@@ -2966,7 +3060,10 @@ mod tests {
         assert_eq!(opts.len(), 2);
         // `-b` after an operand is an OPERAND, not an option: these applets do
         // not permute as GNU does.
-        assert_eq!(rest, vec![std::ffi::OsStr::new("a"), std::ffi::OsStr::new("-b")]);
+        assert_eq!(
+            rest,
+            vec![std::ffi::OsStr::new("a"), std::ffi::OsStr::new("-b")]
+        );
         let args = [os("--"), os("-foo.txt")];
         let (opts, rest) = split_options(&args);
         assert!(opts.is_empty());
@@ -3008,7 +3105,11 @@ mod tests {
         assert_eq!(done.status, 141);
         // The unopened second operand must NOT have reported: stopping is the
         // point, and a diagnostic here would mean it carried on.
-        assert!(done.err.is_empty(), "kept going past the closed pipe: {:?}", done.err);
+        assert!(
+            done.err.is_empty(),
+            "kept going past the closed pipe: {:?}",
+            done.err
+        );
     }
 
     /// An option nobody implemented is loud and 2, never a plausible guess.
@@ -3111,14 +3212,20 @@ mod tests {
         let outside = out.0.clone();
         std::fs::create_dir_all(outside.join("keep")).unwrap();
         std::fs::write(outside.join("keep/f"), b"x").unwrap();
-        let name = outside.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let name = outside
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         std::fs::create_dir_all(dir.0.join("sub")).unwrap();
         for escape in [
-            outside.join("keep").into_os_string(),                       // absolute
-            dir.0.join(format!("../{name}/keep")).into_os_string(),      // `..` above the root
-            dir.0.join(format!("sub/../../{name}/keep")).into_os_string(), // `..` mid-path
-            std::ffi::OsString::from("/"),                               // the root of all
-            dir.0.join("..").into_os_string(),                           // no final name
+            outside.join("keep").into_os_string(), // absolute
+            dir.0.join(format!("../{name}/keep")).into_os_string(), // `..` above the root
+            dir.0
+                .join(format!("sub/../../{name}/keep"))
+                .into_os_string(), // `..` mid-path
+            std::ffi::OsString::from("/"),         // the root of all
+            dir.0.join("..").into_os_string(),     // no final name
         ] {
             let done = rm(&[os("-rf"), escape.clone()], root);
             assert_eq!(done.status, 2, "not refused: {escape:?}");
@@ -3128,13 +3235,19 @@ mod tests {
                 String::from_utf8_lossy(&done.err).contains("refusing"),
                 "silent refusal for {escape:?}"
             );
-            assert!(outside.join("keep/f").is_file(), "removed through {escape:?}");
+            assert!(
+                outside.join("keep/f").is_file(),
+                "removed through {escape:?}"
+            );
         }
         // A symlink pointing out is followed for the CHECK -- `keep` is reached
         // through it -- while the link itself lives inside and may be removed.
         let link = dir.0.join("out");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
-        assert_eq!(rm(&[os("-rf"), link.join("keep").into_os_string()], root).status, 2);
+        assert_eq!(
+            rm(&[os("-rf"), link.join("keep").into_os_string()], root).status,
+            2
+        );
         assert!(outside.join("keep/f").is_file());
         // WITHOUT `-r`, which is what tells a symlink-to-a-directory from a
         // directory: `rm link` removes the link and needs no recursion, where
@@ -3150,7 +3263,11 @@ mod tests {
         // so `-f` silences it exactly as it does a missing file. Refusing here
         // would turn every `rm -f` after a failed `mkdir` into a hard error.
         let done = rm(&[os("-f"), dir.at("no-such-dir/f")], root);
-        assert_eq!(done.status, 0, "an absent parent was refused: {:?}", done.err);
+        assert_eq!(
+            done.status, 0,
+            "an absent parent was refused: {:?}",
+            done.err
+        );
         assert!(done.err.is_empty());
         // `rm -f` with nothing to remove is success and silence, as GNU's is.
         let done = rm(&[os("-f")], root);
@@ -3175,7 +3292,10 @@ mod tests {
         // A `$TMP` with no usable parent -- bare and relative, or naming a
         // directory that is not there -- falls back to the cwd rather than to
         // `""`, which resolves to nothing and would refuse every removal.
-        assert_eq!(workspace_root(Some(std::ffi::OsStr::new("tmp"))), Some(cwd.clone()));
+        assert_eq!(
+            workspace_root(Some(std::ffi::OsStr::new("tmp"))),
+            Some(cwd.clone())
+        );
         assert_eq!(workspace_root(Some(&dir.at("nope/tmp"))), Some(cwd));
         // The one root that must be refused outright: `/` admits every path on
         // the host, so a `$TMP` of `/tmp` -- what anyone running this helper by
@@ -3189,20 +3309,31 @@ mod tests {
     fn touch_leaves_what_is_already_there_alone() {
         let dir = Dir::new("touch-exists");
         std::fs::create_dir(dir.0.join("d")).unwrap();
-        assert_eq!(touch(&[dir.at("d")]).status, 0, "a directory reported a failure");
+        assert_eq!(
+            touch(&[dir.at("d")]).status,
+            0,
+            "a directory reported a failure"
+        );
         assert!(dir.0.join("d").is_dir());
         let ro = dir.0.join("ro");
         std::fs::write(&ro, b"keep\n").unwrap();
         let mut perms = std::fs::metadata(&ro).unwrap().permissions();
         perms.set_readonly(true);
         std::fs::set_permissions(&ro, perms).unwrap();
-        assert_eq!(touch(&[ro.clone().into_os_string()]).status, 0, "read-only reported a failure");
+        assert_eq!(
+            touch(&[ro.clone().into_os_string()]).status,
+            0,
+            "read-only reported a failure"
+        );
         assert_eq!(std::fs::read(&ro).unwrap(), b"keep\n");
         // A DANGLING symlink is a name whose target does not exist, and real
         // `touch` creates it -- so it must not be mistaken for present.
         std::os::unix::fs::symlink(dir.0.join("target"), dir.0.join("link")).unwrap();
         assert_eq!(touch(&[dir.at("link")]).status, 0);
-        assert!(dir.0.join("target").is_file(), "the dangling link was taken for a file");
+        assert!(
+            dir.0.join("target").is_file(),
+            "the dangling link was taken for a file"
+        );
     }
 
     /// A writer that ACCEPTS every write and fails only on flush, which is what
@@ -3226,7 +3357,11 @@ mod tests {
         assert_eq!(finish(&mut Broken, &Done::ok(b"out".to_vec())), 141);
         // An applet that already failed keeps ITS status: the reader going away
         // is not what went wrong, and 141 would name the wrong cause.
-        let failed = Done { out: b"out".to_vec(), err: Vec::new(), status: 1 };
+        let failed = Done {
+            out: b"out".to_vec(),
+            err: Vec::new(),
+            status: 1,
+        };
         assert_eq!(finish(&mut BrokenFlush, &failed), 1);
         // An intact writer is the applet's own status, untouched.
         assert_eq!(finish(&mut Vec::new(), &Done::ok(b"out".to_vec())), 0);
@@ -3240,12 +3375,24 @@ mod tests {
         std::fs::write(dir.0.join("f"), b"a bb\nccc\n").unwrap();
         let out = |d: Done| String::from_utf8_lossy(&d.out).into_owned();
         // Bare is lines, words, bytes IN THAT ORDER.
-        assert_eq!(out(wc(&[dir.at("f")])), format!("2 3 9 {}\n", dir.0.join("f").display()));
-        assert_eq!(out(wc(&[os("-l"), dir.at("f")])), format!("2 {}\n", dir.0.join("f").display()));
-        assert_eq!(out(wc(&[os("-w"), dir.at("f")])), format!("3 {}\n", dir.0.join("f").display()));
+        assert_eq!(
+            out(wc(&[dir.at("f")])),
+            format!("2 3 9 {}\n", dir.0.join("f").display())
+        );
+        assert_eq!(
+            out(wc(&[os("-l"), dir.at("f")])),
+            format!("2 {}\n", dir.0.join("f").display())
+        );
+        assert_eq!(
+            out(wc(&[os("-w"), dir.at("f")])),
+            format!("3 {}\n", dir.0.join("f").display())
+        );
         // `-c` and `--bytes` are the same question, and a long option is ONE
         // word rather than a cluster of letters.
-        assert_eq!(out(wc(&[os("-c"), dir.at("f")])), format!("9 {}\n", dir.0.join("f").display()));
+        assert_eq!(
+            out(wc(&[os("-c"), dir.at("f")])),
+            format!("9 {}\n", dir.0.join("f").display())
+        );
         assert_eq!(
             out(wc(&[os("--bytes"), dir.at("f")])),
             format!("9 {}\n", dir.0.join("f").display())
@@ -3258,7 +3405,10 @@ mod tests {
         // `-m`/`--chars` count CHARACTERS to GNU and bytes here, which is the
         // same answer for the ASCII the corpus counts and a divergence for
         // anything else. Pinned so it is a decision rather than an accident.
-        assert_eq!(out(wc(&[os("-m"), dir.at("f")])), format!("9 {}\n", dir.0.join("f").display()));
+        assert_eq!(
+            out(wc(&[os("-m"), dir.at("f")])),
+            format!("9 {}\n", dir.0.join("f").display())
+        );
         assert_eq!(
             out(wc(&[os("--chars"), dir.at("f")])),
             format!("9 {}\n", dir.0.join("f").display())
@@ -3318,17 +3468,29 @@ mod tests {
                         None => b"",
                     },
                 };
-                let room = buf.get_mut(..bytes.len()).ok_or(std::io::ErrorKind::Other)?;
+                let room = buf
+                    .get_mut(..bytes.len())
+                    .ok_or(std::io::ErrorKind::Other)?;
                 room.copy_from_slice(bytes);
                 Ok(bytes.len())
             }
         }
-        let counts = Counts::tally(Flaky { step: 0, last: None }).unwrap();
+        let counts = Counts::tally(Flaky {
+            step: 0,
+            last: None,
+        })
+        .unwrap();
         assert_eq!((counts.lines, counts.words, counts.bytes), (1, 3, 14));
         // The interrupt is retried; anything else is reported rather than read
         // as an end of file, which would print a count for a failed read.
-        let err = Counts::tally(Flaky { step: 0, last: Some(std::io::ErrorKind::PermissionDenied) });
-        assert_eq!(err.map(|c| c.bytes).map_err(|e| e.kind()), Err(std::io::ErrorKind::PermissionDenied));
+        let err = Counts::tally(Flaky {
+            step: 0,
+            last: Some(std::io::ErrorKind::PermissionDenied),
+        });
+        assert_eq!(
+            err.map(|c| c.bytes).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied)
+        );
     }
 
     #[test]
@@ -3364,8 +3526,14 @@ mod tests {
     fn sleep_takes_a_fraction_and_refuses_a_suffix() {
         let start = std::time::Instant::now();
         assert_eq!(sleep(&[os("0.05")]).status, 0);
-        assert!(start.elapsed() >= std::time::Duration::from_millis(45), "did not sleep");
-        assert!(start.elapsed() < std::time::Duration::from_secs(5), "slept far too long");
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(45),
+            "did not sleep"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "slept far too long"
+        );
         // A suffix is GNU's, and reading `1s` as its leading number would sleep
         // a second where the case asked for something else entirely.
         assert_eq!(sleep(&[os("1s")]).status, 2);
@@ -3375,7 +3543,11 @@ mod tests {
         // bare, `-1` is an option word and is refused as one, which is a
         // different arm and would leave this one pinned by nothing.
         assert_eq!(sleep(&[os("-1")]).status, 2, "not refused as an option");
-        assert_eq!(sleep(&[os("--"), os("-1")]).status, 2, "a negative duration was taken");
+        assert_eq!(
+            sleep(&[os("--"), os("-1")]).status,
+            2,
+            "a negative duration was taken"
+        );
         // The two remaining shapes `try_from_secs_f64` is the sole check for.
         assert_eq!(sleep(&[os("inf")]).status, 2);
         assert_eq!(sleep(&[os("--"), os("-inf")]).status, 2);
@@ -3383,7 +3555,10 @@ mod tests {
         // here, which is inside the tolerance of every timing assertion above.
         let start = std::time::Instant::now();
         assert_eq!(sleep(&[os("0.01"), os("0.05")]).status, 0);
-        assert!(start.elapsed() >= std::time::Duration::from_millis(55), "operands did not sum");
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(55),
+            "operands did not sum"
+        );
         // One bad operand refuses the whole call rather than sleeping the rest.
         let start = std::time::Instant::now();
         assert_eq!(sleep(&[os("0.01"), os("1s")]).status, 2);
@@ -3413,14 +3588,21 @@ mod tests {
             }
             let want = buf.len().min(self.step).min(self.data.len() - self.at);
             let from = self.data.get(self.at..self.at + want).unwrap_or_default();
-            buf.get_mut(..want).unwrap_or_default().copy_from_slice(from);
+            buf.get_mut(..want)
+                .unwrap_or_default()
+                .copy_from_slice(from);
             self.at += want;
             Ok(want)
         }
     }
 
     fn trickle(data: &[u8], step: usize) -> Trickle<'_> {
-        Trickle { data, at: 0, step, stop: usize::MAX }
+        Trickle {
+            data,
+            at: 0,
+            step,
+            stop: usize::MAX,
+        }
     }
 
     /// `head` and `tail` answer the same question about opposite ends of one
@@ -3435,17 +3617,29 @@ mod tests {
         };
         let text = b"one\ntwo\nthree\n";
         let (h, t) = take(Amount::Bytes(4), text);
-        assert_eq!((h.as_slice(), t.as_slice()), (b"one\n".as_slice(), b"ree\n".as_slice()));
+        assert_eq!(
+            (h.as_slice(), t.as_slice()),
+            (b"one\n".as_slice(), b"ree\n".as_slice())
+        );
         let (h, t) = take(Amount::Lines(1), text);
-        assert_eq!((h.as_slice(), t.as_slice()), (b"one\n".as_slice(), b"three\n".as_slice()));
+        assert_eq!(
+            (h.as_slice(), t.as_slice()),
+            (b"one\n".as_slice(), b"three\n".as_slice())
+        );
         let (h, t) = take(Amount::Lines(2), text);
         assert_eq!(h.as_slice(), b"one\ntwo\n".as_slice());
         assert_eq!(t.as_slice(), b"two\nthree\n".as_slice());
         // Asking for more than there is takes all of it rather than failing.
         let (h, t) = take(Amount::Lines(99), text);
-        assert_eq!((h.as_slice(), t.as_slice()), (text.as_slice(), text.as_slice()));
+        assert_eq!(
+            (h.as_slice(), t.as_slice()),
+            (text.as_slice(), text.as_slice())
+        );
         let (h, t) = take(Amount::Bytes(99), text);
-        assert_eq!((h.as_slice(), t.as_slice()), (text.as_slice(), text.as_slice()));
+        assert_eq!(
+            (h.as_slice(), t.as_slice()),
+            (text.as_slice(), text.as_slice())
+        );
         // Zero of either is nothing, which is not the same as "no option given".
         let (h, t) = take(Amount::Bytes(0), text);
         assert!(h.is_empty() && t.is_empty());
@@ -3454,9 +3648,15 @@ mod tests {
         // A record ENDS at its newline, so a final line carrying none is still a
         // line -- and `tail` must not invent the newline it never saw.
         let (h, t) = take(Amount::Lines(1), b"a\nb");
-        assert_eq!((h.as_slice(), t.as_slice()), (b"a\n".as_slice(), b"b".as_slice()));
+        assert_eq!(
+            (h.as_slice(), t.as_slice()),
+            (b"a\n".as_slice(), b"b".as_slice())
+        );
         let (h, t) = take(Amount::Lines(2), b"a\nb");
-        assert_eq!((h.as_slice(), t.as_slice()), (b"a\nb".as_slice(), b"a\nb".as_slice()));
+        assert_eq!(
+            (h.as_slice(), t.as_slice()),
+            (b"a\nb".as_slice(), b"a\nb".as_slice())
+        );
         // An empty stream is empty at both ends.
         let (h, t) = take(Amount::Lines(3), b"");
         assert!(h.is_empty() && t.is_empty());
@@ -3465,8 +3665,14 @@ mod tests {
         let mut out = Vec::new();
         head_from(trickle(b"one\ntwo\nthree\n", 3), Amount::Lines(2), &mut out).unwrap();
         assert_eq!(out.as_slice(), b"one\ntwo\n".as_slice());
-        assert_eq!(tail_from(trickle(b"one\ntwo\nthree\n", 3), Amount::Lines(1)).unwrap(), b"three\n");
-        assert_eq!(tail_from(trickle(b"abcdefgh", 3), Amount::Bytes(3)).unwrap(), b"fgh");
+        assert_eq!(
+            tail_from(trickle(b"one\ntwo\nthree\n", 3), Amount::Lines(1)).unwrap(),
+            b"three\n"
+        );
+        assert_eq!(
+            tail_from(trickle(b"abcdefgh", 3), Amount::Bytes(3)).unwrap(),
+            b"fgh"
+        );
     }
 
     /// `head` stops at what it was ASKED for rather than at end of input -- the
@@ -3477,24 +3683,44 @@ mod tests {
         // Reading past the fifth byte is an error, so a `head -c 4` that got
         // there would report one.
         let mut out = Vec::new();
-        let src = Trickle { data: endless, at: 0, step: 2, stop: 5 };
+        let src = Trickle {
+            data: endless,
+            at: 0,
+            step: 2,
+            stop: 5,
+        };
         head_from(src, Amount::Bytes(4), &mut out).unwrap();
         assert_eq!(out.as_slice(), b"aaaa".as_slice());
         // …and the same for a line count, which stops mid-chunk.
         let mut out = Vec::new();
-        let src = Trickle { data: endless, at: 0, step: 5, stop: 10 };
+        let src = Trickle {
+            data: endless,
+            at: 0,
+            step: 5,
+            stop: 10,
+        };
         head_from(src, Amount::Lines(1), &mut out).unwrap();
         assert_eq!(out.as_slice(), b"aaaa\n".as_slice());
         // Zero reads NOTHING, so it cannot block on a stream with nothing to
         // give -- checked by making the very first read fail.
         let mut out = Vec::new();
-        let src = Trickle { data: endless, at: 0, step: 4, stop: 0 };
+        let src = Trickle {
+            data: endless,
+            at: 0,
+            step: 4,
+            stop: 0,
+        };
         head_from(src, Amount::Bytes(0), &mut out).unwrap();
         assert!(out.is_empty());
         // A real read error is still an error, or the two cases above would be
         // satisfied by an applet that never read at all.
         let mut out = Vec::new();
-        let src = Trickle { data: endless, at: 0, step: 4, stop: 8 };
+        let src = Trickle {
+            data: endless,
+            at: 0,
+            step: 4,
+            stop: 8,
+        };
         assert!(head_from(src, Amount::Bytes(16), &mut out).is_err());
     }
 
@@ -3506,7 +3732,11 @@ mod tests {
         let dir = Dir::new("tail-zero");
         for zero in [os("-c"), os("-n")] {
             let done = tail(&[zero.clone(), os("0"), dir.at("gone")]);
-            assert_eq!((done.status, done.err.is_empty()), (0, true), "{zero:?} opened the file");
+            assert_eq!(
+                (done.status, done.err.is_empty()),
+                (0, true),
+                "{zero:?} opened the file"
+            );
             assert!(done.out.is_empty());
         }
         // A NON-zero count on the same missing file does report, or the above
@@ -3521,7 +3751,11 @@ mod tests {
         // A second operand would need `head`'s banner and is refused.
         std::fs::write(dir.0.join("f"), b"x\n").unwrap();
         assert_eq!(tail(&[dir.at("f")]).status, 0);
-        assert_eq!(tail(&[dir.at("f"), dir.at("f")]).status, 2, "a second operand was served");
+        assert_eq!(
+            tail(&[dir.at("f"), dir.at("f")]).status,
+            2,
+            "a second operand was served"
+        );
     }
 
     /// The option pair itself: four spellings each, and a refusal for everything
@@ -3531,7 +3765,13 @@ mod tests {
         let parse = |args: &[&str]| {
             let owned: Vec<std::ffi::OsString> = args.iter().map(|a| os(a)).collect();
             head_tail_args("head", &owned).map(|(amount, files)| {
-                (amount, files.iter().map(|f| f.to_string_lossy().into_owned()).collect::<Vec<_>>())
+                (
+                    amount,
+                    files
+                        .iter()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>(),
+                )
             })
         };
         assert_eq!(parse(&[]).unwrap().0, Amount::Lines(10));
@@ -3541,10 +3781,23 @@ mod tests {
             vec!["--bytes", "4"],
             vec!["--bytes=4"],
         ] {
-            assert_eq!(parse(&spelling).unwrap().0, Amount::Bytes(4), "{spelling:?}");
+            assert_eq!(
+                parse(&spelling).unwrap().0,
+                Amount::Bytes(4),
+                "{spelling:?}"
+            );
         }
-        for spelling in [vec!["-n", "2"], vec!["-n2"], vec!["--lines", "2"], vec!["--lines=2"]] {
-            assert_eq!(parse(&spelling).unwrap().0, Amount::Lines(2), "{spelling:?}");
+        for spelling in [
+            vec!["-n", "2"],
+            vec!["-n2"],
+            vec!["--lines", "2"],
+            vec!["--lines=2"],
+        ] {
+            assert_eq!(
+                parse(&spelling).unwrap().0,
+                Amount::Lines(2),
+                "{spelling:?}"
+            );
         }
         // The LAST one given wins, as GNU's does.
         assert_eq!(parse(&["-c", "4", "-n", "2"]).unwrap().0, Amount::Lines(2));
@@ -3578,10 +3831,16 @@ mod tests {
         // and it needs the following word to show that, since `--bytes=` alone
         // is refused by running out of arguments whether the guard is there or
         // not.
-        assert!(parse(&["--bytes=", "4"]).is_err(), "an empty attached value was taken");
+        assert!(
+            parse(&["--bytes=", "4"]).is_err(),
+            "an empty attached value was taken"
+        );
         // The refusal NAMES the value rather than the option that took it.
         let done = parse(&["-c", "+3"]).err().unwrap();
-        assert!(String::from_utf8_lossy(&done.err).contains("+3"), "the refusal named the option");
+        assert!(
+            String::from_utf8_lossy(&done.err).contains("+3"),
+            "the refusal named the option"
+        );
     }
 
     /// The `s` command over the shapes the corpus writes, and the ones GNU sed
@@ -3589,8 +3848,7 @@ mod tests {
     #[test]
     fn sed_substitutes_as_gnu_does() {
         let run = |args: &[&str], input: &[u8]| -> Done {
-            let argv: Vec<std::ffi::OsString> =
-                args.iter().map(std::ffi::OsString::from).collect();
+            let argv: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
             // Through a FILE operand rather than stdin: the applet reads the
             // real stdin otherwise, which a test harness owns.
             let dir = Dir::new("sed");
@@ -3609,7 +3867,10 @@ mod tests {
         // `\t` is a TAB to sed where the shared matcher's grep dialect reads a
         // stray backslash and a `t` -- so this squeezed runs of the LETTER and
         // came back `"quo ed" ex ` before `sed_escapes` existed.
-        assert_eq!(out(&["s/[ \\t]\\+/ /g"], b"\"quoted\" text\n"), "\"quoted\" text\n");
+        assert_eq!(
+            out(&["s/[ \\t]\\+/ /g"], b"\"quoted\" text\n"),
+            "\"quoted\" text\n"
+        );
         assert_eq!(out(&["s/[ \\t]\\+/ /g"], b"a\t\tb\n"), "a b\n");
         // An empty match ABUTTING the previous one is not replaced, which is
         // what keeps `s/x*/-/g` from putting two dashes where the `x` was.
@@ -3633,13 +3894,34 @@ mod tests {
         assert_eq!(out(&["s/:$//"], b"a:\nb:\n"), "a\nb\n");
         // …and `-E` is the extended dialect, where `+` is an operator.
         assert_eq!(out(&["-E", "s/a+/X/"], b"aaa\n"), "X\n");
-        assert_eq!(out(&["s/a+/X/"], b"a+\n"), "X\n", "a BRE reads `+` literally");
+        assert_eq!(
+            out(&["s/a+/X/"], b"a+\n"),
+            "X\n",
+            "a BRE reads `+` literally"
+        );
 
         // Everything else is REFUSED rather than approximated: a command this
         // does not serve would otherwise print text nobody asked for.
-        for script in ["d", "p", "/x/d", "1d", "y/a/b/", "q", "s/a/b/p", "s/a/b/2",
-                       "s/a/b/w f", "s/\\(a\\)/\\1/", "s/a/\\1/", "s/a/\\Ux/", "s//x/",
-                       "s.a.b.", "s/a", "s", "s/a\\|b/x/", "s/\\ba/x/"] {
+        for script in [
+            "d",
+            "p",
+            "/x/d",
+            "1d",
+            "y/a/b/",
+            "q",
+            "s/a/b/p",
+            "s/a/b/2",
+            "s/a/b/w f",
+            "s/\\(a\\)/\\1/",
+            "s/a/\\1/",
+            "s/a/\\Ux/",
+            "s//x/",
+            "s.a.b.",
+            "s/a",
+            "s",
+            "s/a\\|b/x/",
+            "s/\\ba/x/",
+        ] {
             let done = run(&[script], b"abc\n");
             assert_eq!(done.status, 2, "served {script:?}");
             assert!(!done.err.is_empty(), "refused {script:?} silently");
@@ -3652,18 +3934,29 @@ mod tests {
         // than about "some escape working": a mutant reading `\v` as the
         // letter `v` passed the whole suite, and it is what GNU resolves in
         // BOTH fields.
-        for (escape, byte) in [("\\n", b'\n'), ("\\t", b'\t'), ("\\r", b'\r'),
-                               ("\\f", 0x0c), ("\\v", 0x0b), ("\\a", 0x07)] {
-            assert_eq!(out(&[&format!("s/a/{escape}/")], b"a\n"),
-                       String::from_utf8_lossy(&[byte, b'\n']),
-                       "replacement {escape}");
+        for (escape, byte) in [
+            ("\\n", b'\n'),
+            ("\\t", b'\t'),
+            ("\\r", b'\r'),
+            ("\\f", 0x0c),
+            ("\\v", 0x0b),
+            ("\\a", 0x07),
+        ] {
+            assert_eq!(
+                out(&[&format!("s/a/{escape}/")], b"a\n"),
+                String::from_utf8_lossy(&[byte, b'\n']),
+                "replacement {escape}"
+            );
             // …and on the pattern side for all but `\n`, which no line can
             // contain: sed matches a pattern space with its newline stripped,
             // so `s/\n/X/` never fires, in GNU too.
             if byte != b'\n' {
                 let subject = [byte, b'\n'];
-                assert_eq!(out(&[&format!("s/{escape}/X/")], &subject), "X\n",
-                           "pattern {escape}");
+                assert_eq!(
+                    out(&[&format!("s/{escape}/X/")], &subject),
+                    "X\n",
+                    "pattern {escape}"
+                );
             }
         }
         // `\xHH` takes ONE or two hex digits, and a bare `\x` is the letter --
@@ -3675,8 +3968,14 @@ mod tests {
         assert_eq!(out(&["s/\\x41/Q/"], b"A\n"), "Q\n");
         // …and the numeric/control escapes GNU gives a meaning this cannot
         // serve are refused rather than read as their letter.
-        for script in ["s/a/\\d65/", "s/a/\\o101/", "s/a/\\cA/",
-                       "s/\\d65/X/", "s/\\o101/X/", "s/\\cA/X/"] {
+        for script in [
+            "s/a/\\d65/",
+            "s/a/\\o101/",
+            "s/a/\\cA/",
+            "s/\\d65/X/",
+            "s/\\o101/X/",
+            "s/\\cA/X/",
+        ] {
             assert_eq!(run(&[script], b"a\n").status, 2, "served {script:?}");
         }
         // Every spelling of the extended dialect is the same switch, and each
@@ -3692,14 +3991,28 @@ mod tests {
         // matcher costs a stack frame per term and this crate aborts on
         // overflow.
         let huge = format!("s/{}/X/", "a".repeat(MAX_PATTERN + 1));
-        assert_eq!(run(&[&huge], b"a\n").status, 2, "an oversized pattern parsed");
+        assert_eq!(
+            run(&[&huge], b"a\n").status,
+            2,
+            "an oversized pattern parsed"
+        );
 
         // Whitespace FOLLOWS a command but does not separate two of them, and
         // a flag cannot repeat -- both were silent, running scripts GNU
         // rejects.
-        assert_eq!(out(&["s/a/b/ "], b"a\n"), "b\n", "trailing space is allowed");
-        for script in ["s/a/b/ s/b/c/", "s/a/b/gg", "s/a/x\ny/", "s/a\nb/x/",
-                       "s&a&x&", "s&a&x\\&y&"] {
+        assert_eq!(
+            out(&["s/a/b/ "], b"a\n"),
+            "b\n",
+            "trailing space is allowed"
+        );
+        for script in [
+            "s/a/b/ s/b/c/",
+            "s/a/b/gg",
+            "s/a/x\ny/",
+            "s/a\nb/x/",
+            "s&a&x&",
+            "s&a&x\\&y&",
+        ] {
             assert_eq!(run(&[script], b"a\n").status, 2, "served {script:?}");
         }
 
@@ -3713,23 +4026,43 @@ mod tests {
         std::fs::write(&f1, b"a").unwrap();
         std::fs::write(&f2, b"b\n").unwrap();
         let two = sed(&["s/^/>/".into(), f1.clone(), f2.clone()]);
-        assert_eq!(String::from_utf8_lossy(&two.out), ">a\n>b\n", "the files ran together");
+        assert_eq!(
+            String::from_utf8_lossy(&two.out),
+            ">a\n>b\n",
+            "the files ran together"
+        );
         assert_eq!(two.status, 0);
         let dashed = sed(&["s/^/>/".into(), "--".into(), f1.clone(), f2.clone()]);
-        assert_eq!(String::from_utf8_lossy(&dashed.out), ">a\n>b\n", "`--` was not an end");
+        assert_eq!(
+            String::from_utf8_lossy(&dashed.out),
+            ">a\n>b\n",
+            "`--` was not an end"
+        );
         // A last source without a trailing newline keeps none, and an empty
         // one cannot drop the newline an earlier file ended with.
         let empty = dir.at("empty");
         std::fs::write(&empty, b"").unwrap();
         let trailing = sed(&["s/^/>/".into(), f2.clone(), empty]);
-        assert_eq!(String::from_utf8_lossy(&trailing.out), ">b\n", "a trailing empty file");
+        assert_eq!(
+            String::from_utf8_lossy(&trailing.out),
+            ">b\n",
+            "a trailing empty file"
+        );
         let unterminated = sed(&["s/^/>/".into(), f2.clone(), f1.clone()]);
-        assert_eq!(String::from_utf8_lossy(&unterminated.out), ">b\n>a", "a newline was added");
+        assert_eq!(
+            String::from_utf8_lossy(&unterminated.out),
+            ">b\n>a",
+            "a newline was added"
+        );
         // An unreadable operand is DIAGNOSED and the rest still run: bailing
         // cost the output of every file that read.
         let missing = dir.at("nope");
         let partial = sed(&["s/^/>/".into(), f1.clone(), missing, f2.clone()]);
-        assert_eq!(String::from_utf8_lossy(&partial.out), ">a\n>b\n", "output was dropped");
+        assert_eq!(
+            String::from_utf8_lossy(&partial.out),
+            ">a\n>b\n",
+            "output was dropped"
+        );
         assert_eq!(partial.status, 2);
         assert!(!partial.err.is_empty(), "the bad operand was not named");
         // With an `-e` anywhere, NO operand is the script: GNU's getopt
@@ -3785,7 +4118,10 @@ mod tests {
         // newline on the second, which is why `head -c 2` still gets exactly one
         // even though its output ended mid-line.
         let done = head(&[dir.at("a"), dir.at("b")]);
-        assert_eq!(text(&done), format!("==> {a} <==\nA1\nA2\n\n==> {b} <==\nB1\n"));
+        assert_eq!(
+            text(&done),
+            format!("==> {a} <==\nA1\nA2\n\n==> {b} <==\nB1\n")
+        );
         let done = head(&[os("-c"), os("2"), dir.at("a"), dir.at("b")]);
         assert_eq!(text(&done), format!("==> {a} <==\nA1\n==> {b} <==\nB1"));
         // A file that cannot be opened is reported, the others are still read,
@@ -3794,7 +4130,10 @@ mod tests {
         let done = head(&[dir.at("gone"), dir.at("a"), dir.at("b")]);
         assert_eq!(done.status, 1);
         assert!(!done.err.is_empty(), "a failed open said nothing");
-        assert_eq!(text(&done), format!("==> {a} <==\nA1\nA2\n\n==> {b} <==\nB1\n"));
+        assert_eq!(
+            text(&done),
+            format!("==> {a} <==\nA1\nA2\n\n==> {b} <==\nB1\n")
+        );
         // The banner is STDOUT, so the name reaches it as BYTES. A path need not
         // be UTF-8, and passing one through `from_utf8_lossy` would print
         // replacement characters where GNU prints what it was given.
@@ -3806,7 +4145,10 @@ mod tests {
         let done = head(&[odd, dir.at("b")]);
         assert_eq!(done.status, 0, "{:?}", String::from_utf8_lossy(&done.err));
         let banner: Vec<u8> = b"==> ".iter().copied().chain(raw).collect();
-        assert!(done.out.starts_with(&banner), "the name was not passed through");
+        assert!(
+            done.out.starts_with(&banner),
+            "the name was not passed through"
+        );
     }
 
     /// `od`'s layout: the column width, the row, the address margin and the `*`
@@ -3831,21 +4173,43 @@ mod tests {
         // Every escape `-c` names, and the printable range around them. A
         // BACKSLASH is not doubled, which looks like an oversight and is GNU's.
         assert_eq!(
-            render(b"\x00\x07\x08\x09\x0a\x0b\x0c\x0d\\ ~\x7f\x80", OdAddr::None, chars),
+            render(
+                b"\x00\x07\x08\x09\x0a\x0b\x0c\x0d\\ ~\x7f\x80",
+                OdAddr::None,
+                chars
+            ),
             "  \\0  \\a  \\b  \\t  \\n  \\v  \\f  \\r   \\       ~ 177 200\n"
         );
         // An octal byte is padded to THREE digits, which only a byte below 0o100
         // can show -- and none of the escapes above is one.
-        assert_eq!(render(b"\x01\x1f\x02", OdAddr::None, chars), " 001 037 002\n");
+        assert_eq!(
+            render(b"\x01\x1f\x02", OdAddr::None, chars),
+            " 001 037 002\n"
+        );
         // The address margin, in each radix, with the closing offset line.
-        assert_eq!(render(b"abc", OdAddr::Oct, hex), "0000000 61 62 63\n0000003\n");
-        assert_eq!(render(b"abc", OdAddr::Dec, hex), "0000000 61 62 63\n0000003\n");
-        assert_eq!(render(b"abc", OdAddr::Hex, hex), "000000 61 62 63\n000003\n");
+        assert_eq!(
+            render(b"abc", OdAddr::Oct, hex),
+            "0000000 61 62 63\n0000003\n"
+        );
+        assert_eq!(
+            render(b"abc", OdAddr::Dec, hex),
+            "0000000 61 62 63\n0000003\n"
+        );
+        assert_eq!(
+            render(b"abc", OdAddr::Hex, hex),
+            "000000 61 62 63\n000003\n"
+        );
         // …and a length the radixes DISAGREE about, since below eight they all
         // print the same digit and the decimal margin could be octal unnoticed.
         let ten = b"0123456789";
-        assert_eq!(render(ten, OdAddr::Dec, hex).lines().last(), Some("0000010"));
-        assert_eq!(render(ten, OdAddr::Oct, hex).lines().last(), Some("0000012"));
+        assert_eq!(
+            render(ten, OdAddr::Dec, hex).lines().last(),
+            Some("0000010")
+        );
+        assert_eq!(
+            render(ten, OdAddr::Oct, hex).lines().last(),
+            Some("0000012")
+        );
         assert_eq!(render(ten, OdAddr::Hex, hex).lines().last(), Some("00000a"));
         // An empty input still has an offset -- and under `-A n`, where there is
         // no offset line at all, it prints NOTHING.
@@ -3881,11 +4245,17 @@ mod tests {
         let row = " 61".repeat(16);
         // Three identical rows and a partial fourth: the run is one `*`, and the
         // partial row cannot join it because a short row is a different row.
-        assert_eq!(render(&[b'a'; 49], OdAddr::None), format!("{row}\n*\n 61\n"));
+        assert_eq!(
+            render(&[b'a'; 49], OdAddr::None),
+            format!("{row}\n*\n 61\n")
+        );
         // Exactly two identical rows still ends at the `*` under `-A n`, where
         // no closing offset follows it.
         assert_eq!(render(&[b'a'; 32], OdAddr::None), format!("{row}\n*\n"));
-        assert_eq!(render(&[b'a'; 32], OdAddr::Oct), format!("0000000{row}\n*\n0000040\n"));
+        assert_eq!(
+            render(&[b'a'; 32], OdAddr::Oct),
+            format!("0000000{row}\n*\n0000040\n")
+        );
         // Only the row BEFORE is compared, so an alternation repeats nothing.
         let mut alternating = Vec::new();
         alternating.extend_from_slice(&[b'a'; 16]);
@@ -3899,7 +4269,11 @@ mod tests {
         two_runs.extend_from_slice(&[b'a'; 32]);
         two_runs.extend_from_slice(&[b'b'; 32]);
         let out = render(&two_runs, OdAddr::None);
-        assert_eq!(out.matches('*').count(), 2, "the second run lost its star: {out:?}");
+        assert_eq!(
+            out.matches('*').count(),
+            2,
+            "the second run lost its star: {out:?}"
+        );
         assert_eq!(out.lines().count(), 4, "{out:?}");
         // A row arriving in pieces is still one row: a pipe hands over what it
         // has, and a three-byte read must not become a three-byte row.
@@ -3938,7 +4312,10 @@ mod tests {
         // The refusal names the VALUE, not the option that took it: `-t o2`
         // reporting `-t` would say nothing about what cannot be served.
         let done = od(&[os("-t"), os("o2")]);
-        assert!(String::from_utf8_lossy(&done.err).contains("o2"), "the refusal named the option");
+        assert!(
+            String::from_utf8_lossy(&done.err).contains("o2"),
+            "the refusal named the option"
+        );
     }
 
     /// A read that fails part of the way through keeps what was already decoded,
@@ -3959,7 +4336,12 @@ mod tests {
         // …and bytes that DID arrive are kept, with the offset naming how far
         // it got rather than how far it was asked to go.
         let mut out = Vec::new();
-        let src = Trickle { data: b"abcdefghij", at: 0, step: 4, stop: 8 };
+        let src = Trickle {
+            data: b"abcdefghij",
+            at: 0,
+            step: 4,
+            stop: 8,
+        };
         let mut src = src;
         assert!(od_over(&mut src, OdAddr::Oct, &[OdType::Hex1], &mut out).is_err());
         assert_eq!(
@@ -4044,7 +4426,10 @@ mod tests {
         let hay = "a".repeat(30);
         let started = std::time::Instant::now();
         assert_eq!(ere(&pathological, &hay), None);
-        assert!(started.elapsed() < std::time::Duration::from_secs(2), "matching blew up");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "matching blew up"
+        );
         assert_eq!(hit("a+b", "a+b"), Some((0, 3)));
         assert_eq!(hit("a?b", "a?b"), Some((0, 3)));
     }
@@ -4239,14 +4624,32 @@ mod tests {
         // byte AFTER the dash is what decides, and these stay served. So does a
         // `[` that opens no class: it is an ordinary byte, and `[A-[]` is the
         // range it looks like.
-        for pat in ["[[:digit:]-]", "[-[:digit:]]", "[a[:digit:]-]", "[[:digit:]a]",
-                    "[A-[]", "[!-[]", "[ -[]"] {
-            assert!(Pattern::parse(pat.as_bytes(), false, false).is_some(), "refused {pat:?}");
+        for pat in [
+            "[[:digit:]-]",
+            "[-[:digit:]]",
+            "[a[:digit:]-]",
+            "[[:digit:]a]",
+            "[A-[]",
+            "[!-[]",
+            "[ -[]",
+        ] {
+            assert!(
+                Pattern::parse(pat.as_bytes(), false, false).is_some(),
+                "refused {pat:?}"
+            );
         }
         let bracket = Pattern::parse(b"[A-[]", false, false);
-        assert_eq!(bracket.and_then(|p| p.find_from(b"zQ", 0)), Some((1, 2)), "not the range");
+        assert_eq!(
+            bracket.and_then(|p| p.find_from(b"zQ", 0)),
+            Some((1, 2)),
+            "not the range"
+        );
         let dash = Pattern::parse(b"[[:digit:]-]", false, false);
-        assert_eq!(dash.and_then(|p| p.find_from(b"a-b", 0)), Some((1, 2)), "not the plain dash");
+        assert_eq!(
+            dash.and_then(|p| p.find_from(b"a-b", 0)),
+            Some((1, 2)),
+            "not the plain dash"
+        );
         // …and the SINGLE-bracket typo stays refused, which is the spelling that
         // actually turns up. As a plain class it means `{:,a,l,p,h}` -- a set
         // that matches, so nothing downstream can tell it went wrong.
@@ -4263,10 +4666,29 @@ mod tests {
         // (`[::]`), a `-` that makes GNU read a RANGE and diagnose nothing
         // (`[:-:]`, `[:a-b:]`), a `:` that does not close the class
         // (`[:ab:c]`), and a colon that is not first.
-        for pat in ["[:]", "[a:b]", "[:a]", "[a-z:]", "[a:alpha:]", "[x:digit:]", "[ab:]",
-                    "[::]", "[:a-b:]", "[:ab:c]", "[:a-]", "[:ab]", "[:-:]", "[:-a:]",
-                    "[:a:x]", "[x:a:]", "[:::]"] {
-            assert!(Pattern::parse(pat.as_bytes(), false, false).is_some(), "refused {pat:?}");
+        for pat in [
+            "[:]",
+            "[a:b]",
+            "[:a]",
+            "[a-z:]",
+            "[a:alpha:]",
+            "[x:digit:]",
+            "[ab:]",
+            "[::]",
+            "[:a-b:]",
+            "[:ab:c]",
+            "[:a-]",
+            "[:ab]",
+            "[:-:]",
+            "[:-a:]",
+            "[:a:x]",
+            "[x:a:]",
+            "[:::]",
+        ] {
+            assert!(
+                Pattern::parse(pat.as_bytes(), false, false).is_some(),
+                "refused {pat:?}"
+            );
         }
         // …and the name need not be a REAL class name for the diagnosis to
         // fire, nor even alphanumeric: GNU refuses `[:/:]` and `[: :]` as
@@ -4283,9 +4705,17 @@ mod tests {
         bad("[^:/:]", false);
         bad("[:/:]", true);
         let named = Pattern::parse(b"[a:alpha:]", false, false);
-        assert_eq!(named.and_then(|p| p.find_from(b"qla", 0)), Some((1, 2)), "not the plain set");
+        assert_eq!(
+            named.and_then(|p| p.find_from(b"qla", 0)),
+            Some((1, 2)),
+            "not the plain set"
+        );
         let colons = Pattern::parse(b"[::]", false, false);
-        assert_eq!(colons.and_then(|p| p.find_from(b"x:y", 0)), Some((1, 2)), "`[::]` is a colon");
+        assert_eq!(
+            colons.and_then(|p| p.find_from(b"x:y", 0)),
+            Some((1, 2)),
+            "`[::]` is a colon"
+        );
         // A range whose end opens another range: GNU calls it an invalid range
         // end, and reading it as a literal `-` widens the class silently.
         bad("[a-b-c]", false);
@@ -4305,14 +4735,34 @@ mod tests {
         // refused, being ZERO-WIDTH or a backreference rather than a set --
         // `\s` and `\w` moved to the served side, which is the whole line this
         // list draws.
-        for pat in ["\\bfoo\\b", "\\B", "\\<foo", "foo\\>", "\\`a", "a\\'", "\\1"] {
+        for pat in [
+            "\\bfoo\\b",
+            "\\B",
+            "\\<foo",
+            "foo\\>",
+            "\\`a",
+            "a\\'",
+            "\\1",
+        ] {
             bad(pat, false);
             bad(pat, true);
         }
         // …while an escape GNU calls a "stray backslash" stays the literal it
         // reads it as. The corpus spells `\C-o\C-s\C-h` eight times.
-        for pat in ["\\C-o\\C-s\\C-h", "\\.", "\\*", "\\[", "\\-", "\\$", "\\^", "\\\\"] {
-            assert!(Pattern::parse(pat.as_bytes(), false, false).is_some(), "refused {pat:?}");
+        for pat in [
+            "\\C-o\\C-s\\C-h",
+            "\\.",
+            "\\*",
+            "\\[",
+            "\\-",
+            "\\$",
+            "\\^",
+            "\\\\",
+        ] {
+            assert!(
+                Pattern::parse(pat.as_bytes(), false, false).is_some(),
+                "refused {pat:?}"
+            );
         }
         // Malformed: unterminated, reversed range, trailing backslash.
         bad("[abc", false);
@@ -4326,8 +4776,16 @@ mod tests {
         bad("a+*", true);
         bad("a?+", true);
         // …and the shapes just inside the line still parse.
-        for (pat, ere) in [("a+b", false), ("a{2}", false), ("[0-9]+", true), ("a*", false)] {
-            assert!(Pattern::parse(pat.as_bytes(), ere, false).is_some(), "refused {pat:?}");
+        for (pat, ere) in [
+            ("a+b", false),
+            ("a{2}", false),
+            ("[0-9]+", true),
+            ("a*", false),
+        ] {
+            assert!(
+                Pattern::parse(pat.as_bytes(), ere, false).is_some(),
+                "refused {pat:?}"
+            );
         }
     }
 
@@ -4359,8 +4817,7 @@ mod tests {
     #[test]
     fn grep_reports_its_status_and_prints_what_was_asked_for() {
         let run = |args: &[&std::ffi::OsStr], data: &str| {
-            let owned: Vec<std::ffi::OsString> =
-                args.iter().map(|a| (*a).to_os_string()).collect();
+            let owned: Vec<std::ffi::OsString> = args.iter().map(|a| (*a).to_os_string()).collect();
             let pat_args = owned;
             let dir = Dir::new("grep");
             let f = dir.0.join("in");
@@ -4371,11 +4828,20 @@ mod tests {
             (done.status, String::from_utf8_lossy(&done.out).into_owned())
         };
         // Status is the point: 0 when something matched, 1 when nothing did.
-        assert_eq!(run(&[os("foo").as_os_str()], "foo\nbar\n"), (0, "foo\n".into()));
+        assert_eq!(
+            run(&[os("foo").as_os_str()], "foo\nbar\n"),
+            (0, "foo\n".into())
+        );
         assert_eq!(run(&[os("nope").as_os_str()], "foo\n"), (1, String::new()));
         // `-q` prints nothing and still answers.
-        assert_eq!(run(&[os("-q").as_os_str(), os("foo").as_os_str()], "foo\n"), (0, String::new()));
-        assert_eq!(run(&[os("-q").as_os_str(), os("no").as_os_str()], "foo\n"), (1, String::new()));
+        assert_eq!(
+            run(&[os("-q").as_os_str(), os("foo").as_os_str()], "foo\n"),
+            (0, String::new())
+        );
+        assert_eq!(
+            run(&[os("-q").as_os_str(), os("no").as_os_str()], "foo\n"),
+            (1, String::new())
+        );
         // Non-adjacent matching lines print with NOTHING between them: the
         // `--` separator belongs to context groups, and emitting it without a
         // context option was a divergence from GNU.
@@ -4386,60 +4852,122 @@ mod tests {
         // …and WITH one it appears, including at `-A 0`, which asks for a
         // context of no extra lines rather than for no context.
         assert_eq!(
-            run(&[os("-A").as_os_str(), os("0").as_os_str(), os("foo").as_os_str()],
-                "foo\nbar\nfoobar\n"),
+            run(
+                &[
+                    os("-A").as_os_str(),
+                    os("0").as_os_str(),
+                    os("foo").as_os_str()
+                ],
+                "foo\nbar\nfoobar\n"
+            ),
             (0, "foo\n--\nfoobar\n".into())
         );
         assert_eq!(
-            run(&[os("-A1").as_os_str(), os("foo").as_os_str()], "foo\nbar\nbaz\n"),
+            run(
+                &[os("-A1").as_os_str(), os("foo").as_os_str()],
+                "foo\nbar\nbaz\n"
+            ),
             (0, "foo\nbar\n".into())
         );
         // `-v` inverts the selection, not the status.
-        assert_eq!(run(&[os("-v").as_os_str(), os("foo").as_os_str()], "foo\nbar\n"), (0, "bar\n".into()));
-        assert_eq!(run(&[os("-v").as_os_str(), os("x").as_os_str()], "x\n"), (1, String::new()));
-        // `-o` prints each match, and an anchored pattern can match only once.
-        assert_eq!(run(&[os("-o").as_os_str(), os("o").as_os_str()], "foo\n"), (0, "o\no\n".into()));
-        assert_eq!(run(&[os("-o").as_os_str(), os("^z").as_os_str()], "zz=2\n"), (0, "z\n".into()));
         assert_eq!(
-            run(&[os("-o").as_os_str(), os("-i").as_os_str(), os("o").as_os_str()], "FOO\n"),
+            run(&[os("-v").as_os_str(), os("foo").as_os_str()], "foo\nbar\n"),
+            (0, "bar\n".into())
+        );
+        assert_eq!(
+            run(&[os("-v").as_os_str(), os("x").as_os_str()], "x\n"),
+            (1, String::new())
+        );
+        // `-o` prints each match, and an anchored pattern can match only once.
+        assert_eq!(
+            run(&[os("-o").as_os_str(), os("o").as_os_str()], "foo\n"),
+            (0, "o\no\n".into())
+        );
+        assert_eq!(
+            run(&[os("-o").as_os_str(), os("^z").as_os_str()], "zz=2\n"),
+            (0, "z\n".into())
+        );
+        assert_eq!(
+            run(
+                &[
+                    os("-o").as_os_str(),
+                    os("-i").as_os_str(),
+                    os("o").as_os_str()
+                ],
+                "FOO\n"
+            ),
             (0, "O\nO\n".into()),
         );
         // A pattern that can match NOTHING is why the `-o` loop advances past
         // an empty match rather than to its end: `a*` matches the empty string
         // at every position, so a loop that trusted the match to move forward
         // would never terminate. GNU prints only the non-empty ones.
-        assert_eq!(run(&[os("-o").as_os_str(), os("a*").as_os_str()], "b\nab\n"), (0, "a\n".into()));
-        assert_eq!(run(&[os("-o").as_os_str(), os("x*").as_os_str()], "b\n"), (0, String::new()));
+        assert_eq!(
+            run(&[os("-o").as_os_str(), os("a*").as_os_str()], "b\nab\n"),
+            (0, "a\n".into())
+        );
+        assert_eq!(
+            run(&[os("-o").as_os_str(), os("x*").as_os_str()], "b\n"),
+            (0, String::new())
+        );
         // `-o` and a CONTEXT option compose, which they did not while `-o`
         // printed as it scanned: selection and printing are separate questions,
         // so `-A` selects a line's neighbours and `-o` then prints whatever
         // matches on each SELECTED line, separators included. This lost both.
         assert_eq!(
-            run(&[os("-o").as_os_str(), os("-A1").as_os_str(), os("a").as_os_str()],
-                "a\nb\nc\na\n"),
+            run(
+                &[
+                    os("-o").as_os_str(),
+                    os("-A1").as_os_str(),
+                    os("a").as_os_str()
+                ],
+                "a\nb\nc\na\n"
+            ),
             (0, "a\n--\na\n".into())
         );
         // A context line that matches is printed even though `-v` did not
         // select it -- `-o` prints the line's matches, not the selection.
         assert_eq!(
-            run(&[os("-o").as_os_str(), os("-A1").as_os_str(), os("-v").as_os_str(),
-                  os("a").as_os_str()],
-                "aX\nbb\ncc\naY\n"),
+            run(
+                &[
+                    os("-o").as_os_str(),
+                    os("-A1").as_os_str(),
+                    os("-v").as_os_str(),
+                    os("a").as_os_str()
+                ],
+                "aX\nbb\ncc\naY\n"
+            ),
             (0, "a\n".into())
         );
         // A context window is CLAMPED to the last line. Unclamped, `-A` with a
         // huge count iterated to `usize::MAX` and never returned.
         let huge = format!("-A{}", usize::MAX);
         let started = std::time::Instant::now();
-        assert_eq!(run(&[os(&huge).as_os_str(), os("x").as_os_str()], "x\n"), (0, "x\n".into()));
-        assert!(started.elapsed() < std::time::Duration::from_secs(5), "the context window hung");
+        assert_eq!(
+            run(&[os(&huge).as_os_str(), os("x").as_os_str()], "x\n"),
+            (0, "x\n".into())
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the context window hung"
+        );
         // `-m` stops after that many matching lines.
         assert_eq!(
-            run(&[os("-m").as_os_str(), os("1").as_os_str(), os("a").as_os_str()], "a\na\na\n"),
+            run(
+                &[
+                    os("-m").as_os_str(),
+                    os("1").as_os_str(),
+                    os("a").as_os_str()
+                ],
+                "a\na\na\n"
+            ),
             (0, "a\n".into())
         );
         // A file with no trailing newline still has a last line.
-        assert_eq!(run(&[os("bar").as_os_str()], "foo\nbar"), (0, "bar\n".into()));
+        assert_eq!(
+            run(&[os("bar").as_os_str()], "foo\nbar"),
+            (0, "bar\n".into())
+        );
         // Empty input matches nothing rather than matching an empty line.
         assert_eq!(run(&[os("^$").as_os_str()], ""), (1, String::new()));
     }
@@ -4453,7 +4981,10 @@ mod tests {
         std::fs::write(&f, "foo\n").unwrap();
         let arg = |s: &str| os(s);
         // An option nobody implemented.
-        assert_eq!(grep(&[arg("-c"), arg("foo"), f.clone().into_os_string()], None).status, 2);
+        assert_eq!(
+            grep(&[arg("-c"), arg("foo"), f.clone().into_os_string()], None).status,
+            2
+        );
         assert_eq!(grep(&[arg("--colour"), arg("foo")], None).status, 2);
         // A pattern outside the subset, which is the important one.
         let done = grep(&[arg("-E"), arg("a|b"), f.clone().into_os_string()], None);
@@ -4463,7 +4994,11 @@ mod tests {
         assert_eq!(grep(&[], None).status, 2);
         assert_eq!(grep(&[arg("foo"), dir.at("nope")], None).status, 2);
         // Several files would need GNU's `file:` prefixes, which nothing grades.
-        let two = [arg("foo"), f.clone().into_os_string(), f.clone().into_os_string()];
+        let two = [
+            arg("foo"),
+            f.clone().into_os_string(),
+            f.clone().into_os_string(),
+        ];
         assert_eq!(grep(&two, None).status, 2);
         // `--` ends the options, so a pattern that looks like one still works.
         let done = grep(&[arg("--"), arg("-v"), f.clone().into_os_string()], None);
@@ -4477,11 +5012,22 @@ mod tests {
             vec![arg("-EF"), arg("a.b")],
         ] {
             let done = grep(&argv, None);
-            assert_eq!(done.status, 2, "conflicting matchers were resolved silently");
+            assert_eq!(
+                done.status, 2,
+                "conflicting matchers were resolved silently"
+            );
             assert!(String::from_utf8_lossy(&done.err).contains("conflicting"));
         }
-        assert_eq!(grep(&[arg("-F"), arg("a.b")], Some(b'E')).status, 2, "egrep -F");
-        assert_eq!(grep(&[arg("-E"), arg("a.b")], Some(b'F')).status, 2, "fgrep -E");
+        assert_eq!(
+            grep(&[arg("-F"), arg("a.b")], Some(b'E')).status,
+            2,
+            "egrep -F"
+        );
+        assert_eq!(
+            grep(&[arg("-E"), arg("a.b")], Some(b'F')).status,
+            2,
+            "fgrep -E"
+        );
         // The long-option table, which nothing else reaches: each arm sets a
         // DIFFERENT flag, so a table wired to the wrong one would otherwise be
         // invisible. Asked against an input where each answers distinctly.
@@ -4499,8 +5045,16 @@ mod tests {
         assert_eq!(long("--fixed-strings", "o+"), (1, String::new()));
         assert_eq!(long("--max-count=1", "foo"), (0, "foo\n".into()));
         assert_eq!(
-            grep(&[arg("--max-count"), arg("1"), arg("foo"), f.clone().into_os_string()], None)
-                .status,
+            grep(
+                &[
+                    arg("--max-count"),
+                    arg("1"),
+                    arg("foo"),
+                    f.clone().into_os_string()
+                ],
+                None
+            )
+            .status,
             0
         );
         // …and the two spellings GNU refuses: a prefix that is not the option,
@@ -4581,12 +5135,19 @@ mod tests {
         std::fs::write(&f, b"x").unwrap();
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
         let root = Some(dir.0.as_path());
-        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(chmod(&[os("+x"), f.clone().into_os_string()], root).status, 0);
+        let mode =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            chmod(&[os("+x"), f.clone().into_os_string()], root).status,
+            0
+        );
         assert_eq!(mode(&f), 0o755);
         // `-w` is a MODE, not an option word. Splitting options first would
         // refuse it, which is why this applet parses its own arguments.
-        assert_eq!(chmod(&[os("-w"), f.clone().into_os_string()], root).status, 0);
+        assert_eq!(
+            chmod(&[os("-w"), f.clone().into_os_string()], root).status,
+            0
+        );
         assert_eq!(mode(&f), 0o555);
         // Several operands, each read from its OWN current mode: one parse
         // applied to two files that start differently must land differently.
@@ -4594,7 +5155,11 @@ mod tests {
         std::fs::write(&g, b"x").unwrap();
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(&g, std::fs::Permissions::from_mode(0o640)).unwrap();
-        let both = [os("+x"), f.clone().into_os_string(), g.clone().into_os_string()];
+        let both = [
+            os("+x"),
+            f.clone().into_os_string(),
+            g.clone().into_os_string(),
+        ];
         assert_eq!(chmod(&both, root).status, 0);
         assert_eq!((mode(&f), mode(&g)), (0o711, 0o751));
         // A symlink is FOLLOWED, as GNU chmod is without `-h`: the mode lands
@@ -4622,7 +5187,10 @@ mod tests {
         // POSIX's way of spelling a mode that looks like an option. Reading
         // `--` AS the mode would fail with "unsupported mode".
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(chmod(&[os("--"), os("-w"), f.clone().into_os_string()], root).status, 0);
+        assert_eq!(
+            chmod(&[os("--"), os("-w"), f.clone().into_os_string()], root).status,
+            0
+        );
         assert_eq!(mode(&f), 0o444);
     }
 
@@ -4639,7 +5207,12 @@ mod tests {
         let victim = out.0.join("cat");
         std::fs::write(&victim, b"x").unwrap();
         std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let name = out.0.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let name = out
+            .0
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         std::fs::create_dir_all(dir.0.join("sub")).unwrap();
         for escape in [
             victim.clone().into_os_string(),
@@ -4658,12 +5231,21 @@ mod tests {
         let left = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o7777;
         assert_eq!(left, 0o755, "a mode was changed outside the workdir");
         // With no root known at all, nothing is changed: the applet fails shut.
-        assert_eq!(chmod(&[os("000"), victim.clone().into_os_string()], None).status, 2);
+        assert_eq!(
+            chmod(&[os("000"), victim.clone().into_os_string()], None).status,
+            2
+        );
         // And the confinement does not cost the ordinary case.
         let ok = dir.0.join("f");
         std::fs::write(&ok, b"x").unwrap();
-        assert_eq!(chmod(&[os("600"), ok.clone().into_os_string()], root).status, 0);
-        assert_eq!(std::fs::metadata(&ok).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert_eq!(
+            chmod(&[os("600"), ok.clone().into_os_string()], root).status,
+            0
+        );
+        assert_eq!(
+            std::fs::metadata(&ok).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
     }
 
     /// All three states the goldens distinguish, including the two a shell can
@@ -4697,9 +5279,7 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let raw = vec![0xffu8, 0xfe, b'a', 0x80];
         let value = std::ffi::OsString::from_vec(raw.clone());
-        let env = |name: &std::ffi::OsStr| {
-            (name.to_str() == Some("RAW")).then(|| value.clone())
-        };
+        let env = |name: &std::ffi::OsStr| (name.to_str() == Some("RAW")).then(|| value.clone());
         let mut want = raw.clone();
         want.push(b'\n');
         assert_eq!(printenv_with(&[os("RAW")], env), want);
