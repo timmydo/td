@@ -101,13 +101,11 @@ fn scratch_dir(tag: &str) -> Res<PathBuf> {
 /// An executable `mkfs.btrfs` stand-in that CHATTERS on stdout. No host is
 /// required to have the real one, and what is under test is the plumbing.
 fn noisy_mkfs(dir: &Path) -> Res<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     let fake = dir.join("mkfs.btrfs");
-    std::fs::write(
+    scratch::executable(
         &fake,
         "#!/bin/sh\necho 'btrfs-progs v7.0'\necho 'Label: td-system'\n",
     )?;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
     Ok(fake)
 }
 
@@ -120,9 +118,7 @@ fn key_file(dir: &Path) -> Res<PathBuf> {
 }
 
 fn script(path: &Path, body: &str) -> Res<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, body)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    scratch::executable(path, body)?;
     Ok(())
 }
 

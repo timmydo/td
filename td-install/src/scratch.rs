@@ -69,6 +69,30 @@ pub fn path(tag: &str) -> PathBuf {
     root().join(format!("{tag}-{}", NEXT.fetch_add(1, Ordering::Relaxed)))
 }
 
+/// An executable at `path`, created or replaced, holding `body`, for a
+/// stand-in a test runs.
+///
+/// A child shell writes it, not this process. A descriptor open for writing
+/// here is copied into any child a sibling test thread is spawning, and until
+/// that child execs, running the script fails with ETXTBSY.
+pub fn executable(path: &Path, body: &str) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let written = std::process::Command::new("/bin/sh")
+        .args(["-c", "printf '%s' \"$2\" > \"$1\"", "sh"])
+        .arg(path)
+        .arg(body)
+        .output()?;
+    if !written.status.success() {
+        return Err(io::Error::other(format!(
+            "cannot write {}: {}: {}",
+            path.display(),
+            written.status,
+            String::from_utf8_lossy(&written.stderr).trim()
+        )));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+}
+
 fn root() -> &'static Path {
     static ROOT: OnceLock<ScratchRoot> = OnceLock::new();
     ROOT.get_or_init(|| {
@@ -144,13 +168,11 @@ fn claim_root(dir: &Path) -> io::Result<ScratchRoot> {
 
 /// Whether `base` can hold a run's fixtures and run a script from them.
 fn suits(base: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
     let Ok(dir) = private_dir(base) else {
         return false;
     };
     let script = dir.path.join("probe.sh");
-    let ok = std::fs::write(&script, "#!/bin/sh\nexit 0\n").is_ok()
-        && std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).is_ok()
+    let ok = executable(&script, "#!/bin/sh\nexit 0\n").is_ok()
         && std::process::Command::new(&script)
             .status()
             .is_ok_and(|status| status.success())
@@ -279,6 +301,23 @@ mod tests {
         sweep(&base.path, owner);
         assert_eq!(fs::read(incomplete.join("evidence"))?, b"not published");
         assert!(fs::symlink_metadata(alias)?.is_symlink());
+        fs::remove_dir_all(&base.path)
+    }
+
+    /// The shell writes the body verbatim: no format directive, escape,
+    /// expansion or trailing newline of it is interpreted or lost.
+    #[test]
+    fn an_executable_holds_its_body_byte_for_byte() -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let base = private_dir(&std::env::temp_dir())?;
+        let script = base.path.join("stand-in");
+        let body = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/argv\"\n\
+                    echo 100% \\t `x` 'q' \"$HOME\"\n\n\n";
+        executable(&script, body)?;
+        assert_eq!(fs::read(&script)?, body.as_bytes());
+        assert_eq!(fs::metadata(&script)?.permissions().mode() & 0o7777, 0o755);
+        executable(&script, "#!/bin/sh\nexit 0\n")?;
+        assert_eq!(fs::read(&script)?, b"#!/bin/sh\nexit 0\n");
         fs::remove_dir_all(&base.path)
     }
 }

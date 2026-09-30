@@ -2675,7 +2675,6 @@ mod tests {
 
     #[test]
     fn source_plan_reports_only_a_matching_validated_id() {
-        use std::os::unix::fs::PermissionsExt;
         let directory = scratch::path("source-plan-validator");
         std::fs::create_dir(&directory).unwrap();
         let _cleanup = ScratchDirectory(directory.clone());
@@ -2714,8 +2713,7 @@ mod tests {
                 Some("invalid source"),
             ),
         ] {
-            std::fs::write(&validator, format!("#!/bin/sh\n[ \"$1\" = validate-source ] || exit 2\n[ \"$2\" = \"{}\" ] || exit 3\n[ \"$3\" = \"{}\" ] || exit 4\n{body}", source.display(), key.display())).unwrap();
-            std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o755)).unwrap();
+            scratch::executable(&validator, &format!("#!/bin/sh\n[ \"$1\" = validate-source ] || exit 2\n[ \"$2\" = \"{}\" ] || exit 3\n[ \"$3\" = \"{}\" ] || exit 4\n{body}", source.display(), key.display())).unwrap();
             let result = validate_source_plan(&plan, &validator, &source, &key);
             if let Some(reason) = reason {
                 assert!(result.unwrap_err().to_string().contains(reason));
@@ -3428,12 +3426,9 @@ mod tests {
 
     /// A directory holding an executable `mkfs.btrfs` stand-in with `body`.
     fn fake_mkfs(body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let dir = scratch::path("mkfs");
         std::fs::create_dir(&dir).unwrap();
-        let fake = dir.join("mkfs.btrfs");
-        std::fs::write(&fake, body).unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        scratch::executable(&dir.join("mkfs.btrfs"), body).unwrap();
         dir
     }
 
@@ -4597,16 +4592,14 @@ mod tests {
     /// things `seed_into` reads back — creates `td/deployments/<id>` and
     /// prints that id.
     fn publishing_td_boot(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(
+        scratch::executable(
             path,
-            format!(
+            &format!(
                 "#!/bin/sh\n{body}mkdir -p \"$2/{}/{STAND_IN_ID}\"\necho {STAND_IN_ID}\n",
                 protocol::DEPLOYMENTS_DIR
             ),
         )
         .unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// The publish runs BEFORE mkfs, into the tree `--rootdir` bakes in, and
@@ -6433,11 +6426,7 @@ mod tests {
             run_layout(&scratch.path, &mut Vec::new()).unwrap();
             let dir = fake_mkfs(RECORDING_MKFS);
             let td_boot = dir.join("td-boot");
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::write(&td_boot, body).unwrap();
-                std::fs::set_permissions(&td_boot, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            scratch::executable(&td_boot, body).unwrap();
             let publish = Publish {
                 td_boot,
                 deployment: PathBuf::from("/media/deployment"),
@@ -6482,20 +6471,16 @@ mod tests {
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs(RECORDING_MKFS);
         let td_boot = dir.join("td-boot");
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // The staging root is `$2`. td-install created `td/deployments` as
-            // a directory before this ran; putting a FILE there is ENOTDIR on
-            // the join below, which needs no ownership games to arrange and so
-            // behaves the same for a test run as root.
-            std::fs::write(
-                &td_boot,
-                "#!/bin/sh\nrmdir \"$2/td/deployments\"\n: > \"$2/td/deployments\"\n\
-                 echo 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(&td_boot, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        // The staging root is `$2`. td-install created `td/deployments` as
+        // a directory before this ran; putting a FILE there is ENOTDIR on
+        // the join below, which needs no ownership games to arrange and so
+        // behaves the same for a test run as root.
+        scratch::executable(
+            &td_boot,
+            "#!/bin/sh\nrmdir \"$2/td/deployments\"\n: > \"$2/td/deployments\"\n\
+             echo 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        )
+        .unwrap();
         let publish = Publish {
             td_boot,
             deployment: PathBuf::from("/media/deployment"),
@@ -6536,14 +6521,10 @@ mod tests {
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs(RECORDING_MKFS);
         let td_boot = dir.join("td-boot");
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // `..` resolves to the staging tree itself, which IS a directory —
-            // so a readback that joined first and asked afterwards would accept
-            // this and report a deployment that was never written.
-            std::fs::write(&td_boot, "#!/bin/sh\necho ../..\n").unwrap();
-            std::fs::set_permissions(&td_boot, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        // `..` resolves to the staging tree itself, which IS a directory —
+        // so a readback that joined first and asked afterwards would accept
+        // this and report a deployment that was never written.
+        scratch::executable(&td_boot, "#!/bin/sh\necho ../..\n").unwrap();
         let publish = Publish {
             td_boot,
             deployment: PathBuf::from("/media/deployment"),
@@ -6574,11 +6555,7 @@ mod tests {
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs(RECORDING_MKFS);
         let td_boot = dir.join("td-boot");
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::write(&td_boot, "#!/bin/sh\nexit 7\n").unwrap();
-            std::fs::set_permissions(&td_boot, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        scratch::executable(&td_boot, "#!/bin/sh\nexit 7\n").unwrap();
         let publish = Publish {
             td_boot,
             deployment: PathBuf::from("/media/deployment"),
@@ -7399,7 +7376,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(
             completed,
-            "formatter did not observe the held inode and complete its mutation"
+            "formatter did not observe the held inode and complete its mutation: {result:?}"
         );
         let error = result.expect_err("invalid prepared image was accepted");
         assert_eq!(
