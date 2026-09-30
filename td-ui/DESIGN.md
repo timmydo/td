@@ -112,6 +112,11 @@ offers text as the selection at the press it is answering and asks the
 selection for its text, which the window delivers as `Input::Paste`. The
 editor's window keeps its own clipboard half over the moved writer.
 
+Newly built (increment 17): the outline reader `sfnt` and its coverage
+rasterizer `coverage`, the first half of "Outline faces and the glyph
+atlas" below. No consumer uses them yet: the atlas executor that paints
+their masks is increment 18.
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
@@ -193,6 +198,21 @@ of its own files may name each module.
   scrollbar proportions and drag rounding) is the one td-editor/DESIGN.md
   records under "Implemented reference-renderer contract"; that text moves here
   with the documentation increment.
+- `sfnt`: `Font` (`parse` over a caller's bytes, `units_per_em`,
+  `ascender`, `descender`, `line_gap`, `glyph_count`, `glyph` for a
+  scalar, `advance` and `outline`), `Outline` (`new`, `clear`,
+  `is_empty`, `points`, `contours`, `push_contour`, and `overlap` with
+  `set_overlap` for the font's overlap flags), `Point` in font
+  units with its on-curve bit, `Error` (`Truncated`, `Missing`,
+  `Unsupported`, `Malformed`, `Limit`, each naming its item) and the
+  budgets `MAX_FONT_BYTES`, `MAX_TABLES`, `MAX_POINTS`, `MAX_CONTOURS`,
+  `MAX_COMPONENTS` and `MAX_DEPTH`; the bounded TrueType reader under
+  "Outline faces and the glyph atlas".
+- `coverage`: `Rasterizer` (`new`, `rasterize` an outline at a scale in
+  pixels per font unit), `Mask` (its `width`, `height`, `left`, `top`
+  and row-major `alpha`, with `clear` and a bounded `get`) and
+  `MAX_MASK_AXIS` and `MAX_OVERSAMPLED_AXIS`; refusals are the raster's
+  `Error`.
 - `hint`: the hint face, a hand-authored 4x5 glyph (`WIDTH`, `HEIGHT`,
   `ADVANCE` 5) per printable ASCII scalar, `glyph` and the pixel `width`
   of a text; a scalar it lacks is a box. It is the small lighter text a
@@ -941,6 +961,13 @@ not frames, and stays its own).
   lists the version-1 exclusions, antialiasing among them. Draw-stream
   oracles are the portable contract every backend keeps; the exact-pixel
   oracles and the `--preview` checksum pin the current software backend.
+- The outline reader and its coverage are bounded before they allocate
+  or recurse: a 32 MiB font, 64 tables each inside the file, a glyph's
+  range inside `glyf`, 8192 points and 1024 contours per outline with
+  composites included, a composite depth of 8 and 256 components per
+  glyph at every depth together, and a mask of at most 512 pixels on an
+  axis. A refused glyph leaves an empty outline, a refused mask the
+  caller's mask as it was. Hinting bytecode is skipped, never run.
 - Every budget carries over from td-editor unchanged: 1 MiB keymaps, the
   parser's token, depth, keycode, type, virtual-modifier, level,
   interpretation and modifier-map ceilings, and a 768-key held set.
@@ -984,6 +1011,29 @@ composition for another surface refused unpainted, and scrollbar
 proportions along both axes. td-editor's render suite keeps the
 scene-level oracles and the `--preview` checksum, which is byte-identical
 across the move.
+
+`tests/sfnt.rs` encodes its own fonts, with every compact coordinate form,
+flag runs, both loca formats, both character-map formats and composites,
+and holds the reader to them: metrics, format 4 through deltas and the
+glyph array, format 12 across planes and preferred over format 4,
+advances past the long metrics, every coordinate decoded exactly, empty
+glyphs, composite offsets, the three scale forms, scaled offsets, nesting
+and point matching, and every directory, fixed-field, loca and glyph
+refusal by the item it names, a glyph header under ten bytes among them;
+the point budget admitted exactly, the component budget admitted at 256
+and refused at 257 in one glyph and crossed by a fan-out, both offset
+flags together taking the unscaled one, a broken format 12 passed over
+for the format 4 beside it and refused when alone, and both overlap flags
+read and cleared with the outline.
+`tests/coverage.rs` holds the rasterizer's oracles over hand-built
+outlines: an aligned square exactly covered and placed, half-pixel edges
+at half coverage, direction independence, a hole and a clamped overlap, a
+triangle pixel by pixel against a 64x64 point-sampled reference with its
+area, a curve and an all-off-curve contour against their closed-form
+areas, start-point independence, empty and degenerate outlines, every
+refusal leaving the mask untouched, reuse across sizes, flagged overlaps
+resolving to their union on the finer grid (and past its axis covered
+unrefined), and a mask reading zero outside itself.
 
 `tests/chrome.rs` holds the band oracles, draw-stream checks that read each
 band's fills and glyphs: the menu bar's fill, its labels from cell
@@ -1893,23 +1943,36 @@ reads:
 - `loca`: each glyph's range, with the start no later than the end and
   the range inside `glyf`;
 - `cmap`: format 12 is preferred over format 4, and Windows full repertoire
-  over Unicode platform over Windows BMP.
+  over Unicode platform over Windows BMP. A malformed subtable is passed
+  over; the font is refused, with its error, only when no Unicode
+  subtable is usable.
 
-Simple glyphs decode every flag and coordinate form. Composite glyphs
+A non-empty glyph has at least its ten-byte header. Simple glyphs decode
+every flag and coordinate form. Composite glyphs
 decode offsets, the scale forms (uniform, x and y, and two-by-two), scaled
 and unscaled offsets, and point matching. Composites are held to a depth of
 8 and 256 components per glyph at every depth together, so a fan-out
 cannot multiply through the depth bound. The whole outline is held to 8192
 points and 1024 contours. Every refusal names its item, and a refused glyph
-leaves an empty outline behind.
+leaves an empty outline behind. The outline carries the font's overlap
+flags (`OVERLAP_SIMPLE` on a simple glyph's first flag, `OVERLAP_COMPOUND`
+on a component).
 
 `coverage` is also pure, and it turns an outline into an alpha mask. For
 each pixel it accumulates the exact signed area of the outline's edges per
-row, and flattens curves to within 1/32 of a pixel. The fill rule is
-nonzero for same-direction overlaps and clamps at full. The resulting mask
-is at most 512 pixels on an axis and carries its bearing from the pen and
-the baseline. A refusal leaves the caller's mask untouched. Both the
-rasterizer and the outline are reused, so a steady state allocates nothing.
+row, and flattens curves to within 1/32 of a pixel (a quadratic's chords
+after n steps stray a quarter of its second difference over n squared,
+and 128 steps hold the bound for any curve inside a mask). The fill is
+nonzero: inside any winding a pixel is covered whole. An edge pixel two
+overlapping contours share sums their areas and reads darker than their
+union, as FreeType's smooth rasterizer does, and as there an outline the
+font flags as overlapping is covered on a grid four times finer each
+way, where each grid pixel clamps before the mask pixel averages them;
+masks past 128 pixels on an axis stay unrefined. The Mono Regular and
+Bold faces flag no glyph. The resulting mask is at most 512 pixels on an
+axis and carries its bearing from the pen and the baseline. A refusal
+leaves the caller's mask untouched. Both the rasterizer and the outline
+are reused, so a steady state allocates nothing.
 
 ### The atlas executor
 
@@ -2177,7 +2240,7 @@ regressions. Those increments extend the original sequence below.
     (APPLICATIONS.md §W.8, "Reworked again" and "Composing in place").
 17. Outline reader and coverage: `sfnt` and `coverage` under "Outline
     faces and the glyph atlas", pure, proven against fonts the tests
-    encode, with pixel and closed-form area oracles.
+    encode, with pixel and closed-form area oracles. Landed.
 18. The atlas executor: `atlas` with its page, shelf packing, epochs and
     dirty band; the face's `Cell` at a pixel size; and `Raster` executing
     `Glyph` through an outline face, opt-in, with the Unifont fallback

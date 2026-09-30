@@ -24,8 +24,10 @@
 //! chords, button phases, wheel travel in surface pixels and the
 //! clipboard), and the clipboard's transfer owners (`clipboard`: the
 //! bounded nonblocking writer of an offered text over the send's right and
-//! the reader of the selection's text). Outside `wayland`, `client`,
-//! `clipboard`, the private raw module beneath them, the driving adapters
+//! the reader of the selection's text), and the outline face's bounded
+//! TrueType reader (`sfnt`) with its antialiased coverage (`coverage`).
+//! Outside `wayland`, `client`, `clipboard`, the private raw module
+//! beneath them, the driving adapters
 //! `control_socket`, `control_worker` and `replay`, and the widget window
 //! `window`, nothing reads the environment, a clock, a descriptor or the
 //! filesystem: adapters supply explicit inputs, and `notices` embeds the
@@ -45,6 +47,7 @@ pub mod confirmations;
 pub mod control;
 pub mod control_socket;
 pub mod control_worker;
+pub mod coverage;
 pub mod data;
 pub mod driven;
 #[path = "../../td-compositor/src/filter.rs"]
@@ -62,6 +65,7 @@ pub mod pointer;
 pub mod raster;
 pub mod repeat;
 pub mod replay;
+pub mod sfnt;
 pub mod split;
 mod sys;
 pub mod tree_table;
