@@ -445,4 +445,4 @@ impl<T: Transport, B: TlsWireStorage> Drop for TlsIo<T, B> {
 
 #[cfg(test)]
 #[path = "tls_io_tests.rs"]
-mod tests;
+pub(crate) mod tests;

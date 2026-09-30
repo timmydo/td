@@ -755,10 +755,21 @@ Implement the remaining work as independently reviewable increments:
       and refusal cleanup.
       This reserves only the count; it does not couple session buffers, policy
       generations or protocol transitions and does not enable service.
-    - **M07d3b — policy and resource binding:** couple the global permit,
-      reserved wire/session storage and immutable authorized generation in the
-      admitting factory. Refusal returns all owners; hold the permit across
-      queued/Pending progress and release only on completion or teardown.
+    - **M07d3b — policy and resource binding:**
+      - **M07d3b1 — immutable gateway policy:** implemented cold private-CA
+        admission, mandatory client-auth server configuration and owned
+        pin/CIDR constraints. Canonical fingerprints compare configured client
+        authority independently of PEM/order/spelling and server renewal.
+        Matching supplied values is a predicate, never an admission proof.
+        Host and portable fixtures cover equivalence/change, maximum bounds,
+        pin/address refusal and required client authentication. Generation
+        publication and successful authenticated transport remain below.
+      - **M07d3b2 — generation and resource coupling:** couple the global
+        permit, reserved wire/session storage and immutable authorized
+        generation in the admitting factory. Refusal returns all owners;
+        hold the permit across queued/Pending progress and release only on
+        completion or teardown. Apply current-policy revocation using the
+        canonical policy comparison plus listener binding checks.
     - **M07d3c — protocol integration:** complete STARTTLS flush/tail/reset,
       gateway pin/address authorization and local HTTPS/SMTP transition cases.
 - **M07e — resource/service admission:** qualify complete generation overlap,

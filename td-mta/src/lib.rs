@@ -6,6 +6,7 @@ pub mod bounded;
 pub mod clock;
 pub mod config;
 pub mod format;
+pub mod gateway_policy;
 pub mod ids;
 pub mod limits;
 pub mod observability;

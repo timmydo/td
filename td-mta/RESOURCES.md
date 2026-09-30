@@ -132,6 +132,13 @@ configured memory budget does not preserve the default RSS claim.
   relay/ACME/gateway trust object, retained raw bytes and allocation overhead.
   SCHEMA.md's per-input caps do not enlarge this aggregate. Renew a complete
   generation, retaining at most old and replacement; no per-profile side cache.
+  M07d3b1's immutable gateway policies, owned names/pins/prefixes and shared
+  server configurations belong to this same entry. The temporary TrustStore
+  drops after configuration construction; no second persistent trust cache is
+  retained. Fingerprinting uses fixed cold scratch (16 KiB certificate decode,
+  4 KiB anchor digests and eight canonical prefixes) on the existing control
+  stack. Its complete stack/native allocation peak remains unqualified until
+  M07e; input count caps do not prove the generation or stack allowance.
 - Certificate overlap, reload overlap, allocator bookkeeping, executable
   pages and main/worker stacks all count at peak coexistence. RSS tests must
   validate the allowances; this ledger is not an OS memory limiter.

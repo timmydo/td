@@ -262,6 +262,61 @@ all configured capacities, saturation/reuse, overlapping reservation/release,
 worker return and cleanup after refusal or public-pool destruction. These are
 ownership/capacity observations, not whole-process allocation measurements.
 
+### 1.5 Immutable gateway client policy
+
+M07d3b1 supplies `gateway_policy::GatewayPolicy`. Cold construction consumes
+borrowed validated gateway settings, the protected CA file's contents, an
+admitted server identity and the shared crypto clock. It owns the profile
+name, current/optional next leaf pins, one through eight canonical peer
+prefixes and an opaque server configuration. It admits the explicit private
+CA bundle through td-crypto, then selects SMTP, MatchPresentName and mandatory
+client-certificate authentication. Invalid material publishes no policy;
+there is no public-root fallback. The caller binds these inputs to the
+validated listener and charges all material to its certificate generation.
+
+`new_session` creates a raw handshaking session from that configuration.
+The runtime must reserve session/handshake resources first. `matches` is a
+bounded predicate over a supplied address and leaf digest, using the shared
+constant-time digest comparison for both configured pins and SCHEMA.md's
+mapped-peer CIDR rules. Neither construction, matching nor session creation
+grants mail authority. The admitting transport must obtain verified client
+leaf evidence from its completed TLS session, pair it with the actual socket
+peer, and recheck the current authorized policy before mutation. Generation
+retention/revocation, resource coupling and the TlsFactory/TlsTransport
+implementations remain M07d3b2/M07d3c.
+
+`GatewayFingerprint` identifies the canonical client policy for later reload
+comparison. It is SHA-256 of the following concatenation; lengths/counts are
+unsigned and multibyte integers are big-endian:
+
+| Field | Encoding |
+| --- | --- |
+| Domain separator | ASCII `td-mta/gateway-policy/v1` followed by one zero byte |
+| Profile name | u16 byte length, then the validated ASCII bytes |
+| Private CA material | u16 count, then sorted 32-byte SHA-256 digests of each complete decoded certificate DER |
+| Accepted leaf pins | u8 count, then the one or two sorted 32-byte pins |
+| Peer prefixes | u8 count, then sorted entries of family u8 (4 or 6), prefix bits u8, address 16 bytes |
+
+Sort byte arrays lexicographically; sort prefix entries by family, bits, then
+address. An IPv4 address occupies the first four bytes in network order and
+has twelve trailing zero bytes; IPv6 uses all sixteen network-order bytes.
+Duplicate trust material/pins/prefixes are refused by their admission layers.
+PEM whitespace/wrapping, CA order, pin position and equivalent prefix
+spelling/order do not change the result. Different complete CA DER counts as
+a material change even when a reissued certificate reuses the same key.
+Adding/removing even a redundant prefix changes the configured set. The CA
+file path and server identity are excluded: moving identical CA material or
+renewing the server certificate alone does not revoke client authority.
+Listener binding changes are checked separately; this digest does not replace
+a generation lease or identify a persistent storage format. Debug omits pins
+and fingerprint bytes. Hashing uses only the public td-crypto facade.
+
+Host and portable fixtures cover canonical equivalence, meaningful changes,
+pin/CIDR refusals, private material bounds and missing client authentication
+against the same server that succeeds with authentication disabled. This is
+not a successful authenticated-gateway transport fixture; that integration
+and resource qualification remain pending.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

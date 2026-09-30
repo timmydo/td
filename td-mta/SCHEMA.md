@@ -741,8 +741,15 @@ submission or mark an uncertain delivery safe to repeat. Any semantic change
 to the selected gateway policy's trust material, accepted pins or prefix set
 invalidates that connection's admission proof, even if a change only broadens
 access. Removing/changing its binding also invalidates it. Unrelated policy
-changes and mere equivalent prefix spelling/order do not. Refuse an affected
-in-progress DATA transaction temporarily before commit, then close with 421 at
+changes and mere equivalent prefix spelling/order do not. API.md §1.5 fixes
+client-policy comparison: profile name, decoded complete CA certificate DER
+sets, accepted pin sets and canonical prefix sets. CA bundle order, PEM
+formatting, pin
+position and CA file relocation with identical material do not change that
+policy; different reissued CA DER does. Server-certificate renewal alone does
+not change client authority. Listener binding is checked separately.
+Refuse an affected in-progress DATA transaction temporarily before commit,
+then close with 421 at
 the next legal SMTP reply boundary (never inject a reply into DATA bytes). The
 peer reconnects and completes a new TLS handshake under the current policy;
 STARTTLS cannot be repeated on an already-TLS connection. This revocation

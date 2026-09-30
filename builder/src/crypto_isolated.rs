@@ -790,6 +790,9 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-mta-format-smoke", "provider_hashes_import_snapshot_fixtures", false),
         ("td-mta-config-smoke", "portable_loader_stack", true),
         ("td-mta-config-smoke", "portable_materialized_stack", true),
+        ("td-mta-transport-smoke", "gateway_policy::tests::canonical_gateway_policy_ignores_only_representation_and_server_material", false),
+        ("td-mta-transport-smoke", "gateway_policy::tests::gateway_filters_and_material_limits_refuse_without_fallback", false),
+        ("td-mta-transport-smoke", "gateway_policy::tests::gateway_tls_requires_a_client_certificate_on_the_same_valid_server", false),
         ("td-mta-transport-smoke", "tls_admission::tests::capacities_saturate_and_reuse_without_losing_live_reservations", false),
         ("td-mta-transport-smoke", "tls_admission::tests::concurrent_reservations_and_worker_returns_preserve_the_global_cap", false),
         ("td-mta-transport-smoke", "tls_admission::tests::overlapping_release_and_reservation_never_over_admit_or_leak_capacity", false),
@@ -847,7 +850,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
-    println!("portable runtime: twenty mail admission/clock/TCP/TLS cases passed without toolchain mounts");
+    println!("portable runtime: twenty-three mail gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
     Ok(())
 }
 

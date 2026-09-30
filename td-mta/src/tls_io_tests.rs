@@ -16,13 +16,13 @@ use td_crypto::{
     ServerConfig, ServerIdentity, TlsProtocol, TrustStore, P256_PKCS8_CAPACITY,
 };
 
-struct TestClock {
+pub(crate) struct TestClock {
     utc: AtomicI64,
     tick: AtomicU64,
     fail: AtomicBool,
 }
 impl TestClock {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             utc: AtomicI64::new(1_800_000_000_000),
             tick: AtomicU64::new(0),
@@ -87,7 +87,15 @@ fn integer(bytes: &[u8]) -> Vec<u8> {
     }
     der(2, &value)
 }
-fn certificate(key: &P256Key, signer: &P256Key, ca: bool) -> Vec<u8> {
+pub(crate) fn certificate(key: &P256Key, signer: &P256Key, ca: bool) -> Vec<u8> {
+    certificate_with_serial(key, signer, ca, if ca { 1 } else { 2 })
+}
+pub(crate) fn certificate_with_serial(
+    key: &P256Key,
+    signer: &P256Key,
+    ca: bool,
+    serial: u8,
+) -> Vec<u8> {
     let provider = Provider;
     let mut public = [0; 65];
     provider.p256_public(key, &mut public).unwrap();
@@ -121,7 +129,7 @@ fn certificate(key: &P256Key, signer: &P256Key, ca: bool) -> Vec<u8> {
     }
     let body = seq(&[
         der(0xa0, &der(2, &[2])),
-        der(2, &[if ca { 1 } else { 2 }]),
+        der(2, &[serial]),
         algorithm.clone(),
         name(b"local-test-root"),
         seq(&[der(0x17, b"250101000000Z"), der(0x17, b"350101000000Z")]),
@@ -134,7 +142,7 @@ fn certificate(key: &P256Key, signer: &P256Key, ca: bool) -> Vec<u8> {
     let signature = seq(&[integer(&signature[..32]), integer(&signature[32..])]);
     seq(&[body, algorithm, der(3, &[&[0][..], &signature].concat())])
 }
-fn pem(label: &str, bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn pem(label: &str, bytes: &[u8]) -> Vec<u8> {
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = format!("-----BEGIN {label}-----\n").into_bytes();
     let mut count = 0;
@@ -160,7 +168,7 @@ fn pem(label: &str, bytes: &[u8]) -> Vec<u8> {
     output.extend_from_slice(format!("-----END {label}-----\n").as_bytes());
     output
 }
-fn configs(clock: &Arc<TestClock>) -> (Arc<ClientConfig>, Arc<ServerConfig>) {
+pub(crate) fn identity_material() -> (Arc<ServerIdentity>, Vec<u8>) {
     let provider = Provider;
     let mut raw = [0; P256_PKCS8_CAPACITY];
     let count = provider.generate_p256(&mut raw).unwrap();
@@ -178,6 +186,11 @@ fn configs(clock: &Arc<TestClock>) -> (Arc<ClientConfig>, Arc<ServerConfig>) {
         )
         .unwrap(),
     );
+    (identity, ca)
+}
+
+fn configs(clock: &Arc<TestClock>) -> (Arc<ClientConfig>, Arc<ServerConfig>) {
+    let (identity, ca) = identity_material();
     let roots = TrustStore::from_pem(&ca).unwrap();
     let clock = Arc::new(ClockHandle::new(TlsClockSource::new(clock.clone())));
     (
@@ -284,7 +297,7 @@ impl Transport for Peer {
 fn deadline() -> Deadline {
     Deadline::after(Tick(0), 1000).unwrap()
 }
-fn handshakes<L: Transport, R: Transport, B: TlsWireStorage, C: TlsWireStorage>(
+pub(crate) fn handshakes<L: Transport, R: Transport, B: TlsWireStorage, C: TlsWireStorage>(
     client: &mut TlsIo<L, B>,
     server: &mut TlsIo<R, C>,
 ) {

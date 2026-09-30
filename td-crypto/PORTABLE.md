@@ -278,9 +278,11 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   test-target/profile, static ELF and isolated-runtime checks as the other
   qualification binaries; it is not an installed service dependency.
 - `td-mta-transport-smoke`: the `--lib --no-run` td-mta test executable,
-  selected by its `td_mta` library target and test profile. Twenty exact
-  admission/clock/TCP/TLS cases execute individually under the existing
-  deadline and positive-one-test verdict requirement. They cover handshake
+  selected by its `td_mta` library target and test profile. Twenty-three exact
+  gateway/admission/clock/TCP/TLS cases execute individually under the existing
+  deadline and positive-one-test verdict requirement. They cover canonical
+  gateway policy equivalence/change, pin/CIDR and material refusals, mandatory
+  client authentication against a positive no-client-auth control, handshake
   count limits, concurrent reservation and release, worker returns and
   refusal cleanup, clock conversion, bounded TCP/half-close/failure, TLS
   1.3 duplex progress and framing, backpressure, publication deadlines,
