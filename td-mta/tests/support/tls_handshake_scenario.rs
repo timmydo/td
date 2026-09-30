@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 #[path = "tls_certificate_fixture.rs"]
 mod certificate_fixture;
-use certificate_fixture::{certificate_names, pem};
+use certificate_fixture::{certificate_names, certificate_with, pem, Certificate};
 use std::{
     hint::black_box,
     io::Cursor,
@@ -110,6 +110,67 @@ fn material() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         ca,
     )
 }
+
+fn large_material() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut raw = [0; P256_PKCS8_CAPACITY];
+    let n = Provider.generate_p256(&mut raw).unwrap();
+    let root = Provider.load_p256(&raw[..n]).unwrap();
+    let n = Provider.generate_p256(&mut raw).unwrap();
+    let issuer = Provider.load_p256(&raw[..n]).unwrap();
+    let n = Provider.generate_p256(&mut raw).unwrap();
+    let leaf = Provider.load_p256(&raw[..n]).unwrap();
+    let key = pem("PRIVATE KEY", &raw[..n]);
+    let mut chain = Vec::new();
+    let mut ca = Vec::new();
+    for (key, signer, ca_flag, serial, subject, issuer_name) in [
+        (
+            &leaf,
+            &issuer,
+            false,
+            3,
+            b"localhost".as_slice(),
+            b"local-test-issuer".as_slice(),
+        ),
+        (
+            &issuer,
+            &root,
+            true,
+            2,
+            b"local-test-issuer".as_slice(),
+            b"local-test-root".as_slice(),
+        ),
+        (
+            &root,
+            &root,
+            true,
+            1,
+            b"local-test-root".as_slice(),
+            b"local-test-root".as_slice(),
+        ),
+    ] {
+        let der = certificate_with(
+            key,
+            signer,
+            &Certificate {
+                ca: ca_flag,
+                serial,
+                names: &["localhost"],
+                client: false,
+                issuer: issuer_name,
+                subject,
+                padding: 15_000,
+            },
+        );
+        assert!(der.len() > 15_000 && der.len() <= 16 * 1024);
+        let encoded = pem("CERTIFICATE", &der);
+        chain.extend_from_slice(&encoded);
+        if serial == 1 {
+            ca = encoded;
+        }
+    }
+    assert!(chain.len() > 60 * 1024 && chain.len() <= 64 * 1024);
+    (chain, key, ca)
+}
 fn transfer(from: &mut TlsConnection<Buffer>, to: &mut TlsConnection<Buffer>, byte: u8) {
     let input = [byte; 16_384];
     let mut output = [0; 16_384];
@@ -140,9 +201,17 @@ fn transfer(from: &mut TlsConnection<Buffer>, to: &mut TlsConnection<Buffer>, by
 }
 
 pub fn run(mut observe: impl FnMut()) {
+    run_profile(false, &mut observe);
+}
+
+pub fn run_large(mut observe: impl FnMut()) {
+    run_profile(true, &mut observe);
+}
+
+fn run_profile(large: bool, mut observe: impl FnMut()) {
     observe();
     {
-        let (chain, key, ca) = material();
+        let (chain, key, ca) = if large { large_material() } else { material() };
         observe();
         let mut scratch = vec![0; stream::SCRATCH_BYTES];
         let loaded = load::read(

@@ -835,3 +835,11 @@ decoding/capacity refusals, repeated cycles and teardown. The pending snapshot
 precedes the final record and does not isolate a transient peak. All rows and
 completion markers must match their domain/scenario schema before logging.
 This is an untrusted-input diagnostic, not a complete TLS/session/RSS bound.
+
+The fresh `--tls-large-chain` processes reuse the local authenticated TLS 1.3
+scenario with a signed leaf/intermediate/root chain above 60 KiB of PEM but
+within the local loader's 64 KiB limit. Each padded certificate remains within
+16 KiB DER. Eleven ordered observations and exact completion use a separate
+large-chain schema and log per domain. Both endpoints and retained fixture
+material are included; successful large-chain traffic is not a total service,
+maximum-profile or RSS qualification.

@@ -899,6 +899,12 @@ Implement the remaining work as independently reviewable increments:
     and check retention across repeated construction/refusal. Valid maximal
     chains, complete concurrent sessions and RSS remain unqualified.
 
+  - **M07e3e — large admitted local chain observations:** reuse the local
+    handshake/record scenario with a signed three-certificate chain above
+    60 KiB of PEM and within the 64 KiB loader ceiling. Both counter domains
+    observe completed authentication and repeated records; maximal profile
+    counts, remote chains, other TLS versions and whole-service bounds remain.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,

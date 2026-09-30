@@ -855,3 +855,23 @@ concurrent handshake slots or whole-process RSS accounting. It measures a
 specific untrusted-input allocation path, not every adversarial handshake or
 a total session bound. Provider state can survive session teardown; the two
 counter domains remain overlapping observations.
+
+## Large local certificate-chain observations
+
+The `--tls-large-chain` modes reuse the local TLS 1.3 handshake/record scenario
+with a synthetic leaf, intermediate and root. Unique issuer/subject names bind
+the signed chain. Each certificate carries 15000 bytes in an unknown
+noncritical extension and must remain within the facade's 16 KiB DER ceiling.
+The complete PEM chain must exceed 60 KiB and fit the loader's 64 KiB input
+ceiling; this tests a large admitted chain, not every maximum encoding.
+Ordinary fixtures retain their original certificate shape without padding.
+
+The eleven phases and columns match the ordinary handshake scenario, with
+`tls-rust-large-chain` and `tls-native-large-chain` prefixes. Require
+authenticated server name, TLS 1.3, returned handshake permits, verified
+bidirectional 16 KiB
+traffic and no additional retained bytes/blocks across repeated records.
+Fixture material, its source PEM bytes and both endpoints remain charged in
+these observations; they are not isolated per-session or per-generation costs.
+Lifetime peaks include earlier controls. No ledger limit, production trust
+policy, generation admission or whole-service RSS claim changes.

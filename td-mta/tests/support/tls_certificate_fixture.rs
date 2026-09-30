@@ -56,6 +56,45 @@ pub(crate) fn certificate_names(
     names: &[&str],
     client: bool,
 ) -> Vec<u8> {
+    certificate_with(
+        key,
+        signer,
+        &Certificate {
+            ca,
+            serial,
+            names,
+            client,
+            issuer: b"local-test-root",
+            subject: if ca { b"local-test-root" } else { b"localhost" },
+            padding: 0,
+        },
+    )
+}
+
+pub(crate) struct Certificate<'a> {
+    pub ca: bool,
+    pub serial: u8,
+    pub names: &'a [&'a str],
+    pub client: bool,
+    pub issuer: &'a [u8],
+    pub subject: &'a [u8],
+    pub padding: usize,
+}
+
+pub(crate) fn certificate_with(
+    key: &P256Key,
+    signer: &P256Key,
+    certificate: &Certificate<'_>,
+) -> Vec<u8> {
+    let Certificate {
+        ca,
+        serial,
+        names,
+        client,
+        issuer,
+        subject,
+        padding,
+    } = *certificate;
     let provider = Provider;
     let mut public = [0; 65];
     provider.p256_public(key, &mut public).unwrap();
@@ -94,13 +133,17 @@ pub(crate) fn certificate_names(
             seq(&[oid(&[0x2b, 6, 1, 5, 5, 7, 3, if client { 2 } else { 1 }])]),
         ));
     }
+    if padding != 0 {
+        // An unknown noncritical extension carries bounded fixture padding.
+        extensions.push(seq(&[oid(&[0x2a, 3, 4]), der(4, &vec![0; padding])]));
+    }
     let body = seq(&[
         der(0xa0, &der(2, &[2])),
         der(2, &[serial]),
         algorithm.clone(),
-        name(b"local-test-root"),
+        name(issuer),
         seq(&[der(0x17, b"250101000000Z"), der(0x17, b"350101000000Z")]),
-        name(if ca { b"local-test-root" } else { b"localhost" }),
+        name(subject),
         spki,
         der(0xa3, &seq(&extensions)),
     ]);
