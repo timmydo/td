@@ -385,12 +385,26 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "format-digest-build", &mut receipt)?;
     let output = bounded_output(&mut command, "format-digest-build", 8 * 1024 * 1024, 1200)?;
     let format = executable(&output, "format_rows", ArtifactKind::IntegrationTest)?;
+    let mut command = cargo("test", "td-mta");
+    command.args([
+        "--release",
+        "--lib",
+        "--no-run",
+        "--message-format=json-render-diagnostics",
+    ]);
+    command_record(&command, "mail-transport-build", &mut receipt)?;
+    let output = bounded_output(&mut command, "mail-transport-build", 8 * 1024 * 1024, 1200)?;
+    let transport = executable(&output, "td_mta", ArtifactKind::LibraryTest)?;
     refuse_decoy(Path::new("/output"))?;
     fs::create_dir("/output/artifacts").map_err(|e| format!("portable artifacts: {e}"))?;
     copy_binary(&mail, Path::new("/output/artifacts/td-mta"))?;
     copy_binary(&crypto, Path::new("/output/artifacts/td-crypto-smoke"))?;
     copy_binary(&config, Path::new("/output/artifacts/td-mta-config-smoke"))?;
     copy_binary(&format, Path::new("/output/artifacts/td-mta-format-smoke"))?;
+    copy_binary(
+        &transport,
+        Path::new("/output/artifacts/td-mta-transport-smoke"),
+    )?;
     crate::crypto_api::qualify(&mut receipt)?;
     refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
@@ -445,6 +459,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
         "td-crypto-smoke",
         "td-mta-config-smoke",
         "td-mta-format-smoke",
+        "td-mta-transport-smoke",
     ]
     .map(std::ffi::OsString::from)
     .into_iter()
@@ -459,6 +474,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
         "td-crypto-smoke",
         "td-mta-config-smoke",
         "td-mta-format-smoke",
+        "td-mta-transport-smoke",
     ] {
         copy_binary(&source.join(name), &destination.join(name))?;
     }
@@ -640,6 +656,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         "/artifacts/td-crypto-smoke",
         "/artifacts/td-mta-config-smoke",
         "/artifacts/td-mta-format-smoke",
+        "/artifacts/td-mta-transport-smoke",
         "/output",
     ])?;
     let mut command = Command::new("/artifacts/td-mta");
@@ -773,6 +790,22 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-mta-format-smoke", "provider_hashes_import_snapshot_fixtures", false),
         ("td-mta-config-smoke", "portable_loader_stack", true),
         ("td-mta-config-smoke", "portable_materialized_stack", true),
+        ("td-mta-transport-smoke", "clock::tests::runtime_clock_keeps_utc_and_monotonic_domains_separate", false),
+        ("td-mta-transport-smoke", "clock::tests::tls_clock_conversion_never_falls_back_after_refusal", false),
+        ("td-mta-transport-smoke", "transport::tests::tcp_bounded_io_actual_peer_and_unbuffered_flush", false),
+        ("td-mta-transport-smoke", "transport::tests::tcp_peer_eof_preserves_write_half_and_local_close_preserves_read_half", false),
+        ("td-mta-transport-smoke", "transport::tests::tcp_abort_drop_and_errors_fence_both_directions", false),
+        ("td-mta-transport-smoke", "tls_io::tests::final_handshake_write_cannot_publish_past_its_deadline", false),
+        ("td-mta-transport-smoke", "tls_io::tests::flush_backpressure_withholds_finished_and_bad_transport_counts_abort", false),
+        ("td-mta-transport-smoke", "tls_io::tests::public_tls_round_trip_with_tiny_pipes_and_independent_close", false),
+        ("td-mta-transport-smoke", "tls_io::tests::simultaneous_full_chunks_progress_without_growing_wire_storage", false),
+        ("td-mta-transport-smoke", "tls_io::tests::deadlines_and_missing_tls_time_discard_evidence_and_never_revive", false),
+        ("td-mta-transport-smoke", "tls_io::tests::malformed_records_truncation_and_constructor_refusal_close_the_transport", false),
+        ("td-mta-transport-smoke", "tls_io::tests::public_crypto_sessions_exchange_mail_bytes_over_local_tcp", false),
+        ("td-mta-transport-smoke", "tls_io::tests::established_sessions_outlive_handshake_deadline_and_preserve_backpressure", false),
+        ("td-mta-transport-smoke", "tls_io::tests::established_tcp_eof_without_tls_close_is_terminal_even_at_record_boundary", false),
+        ("td-mta-transport-smoke", "tls_io::tests::returned_buffers_are_reused_and_close_paths_keep_exclusive_ownership", false),
+        ("td-mta-transport-smoke", "tls_io::tests::constructor_refusals_return_moved_pool_buffers_without_logging_them", false),
     ]
     .iter()
     .enumerate()
@@ -810,6 +843,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
+    println!("portable runtime: sixteen mail clock/TCP/TLS transport cases passed without toolchain mounts");
     Ok(())
 }
 
@@ -880,6 +914,7 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
         "td-crypto-smoke",
         "td-mta-config-smoke",
         "td-mta-format-smoke",
+        "td-mta-transport-smoke",
     ] {
         qualify_binary(&artifacts.join(binary))?;
     }
@@ -1013,6 +1048,7 @@ mod tests {
             "td-crypto-smoke",
             "td-mta-config-smoke",
             "td-mta-format-smoke",
+            "td-mta-transport-smoke",
             "COMMANDS",
         ] {
             fs::write(source.join(name), name).unwrap();
@@ -1020,9 +1056,20 @@ mod tests {
         fs::remove_file(source.join("td-mta-format-smoke")).unwrap();
         assert!(collect_artifacts(&output, &scratch.0.join("missing-format")).is_err());
         fs::write(source.join("td-mta-format-smoke"), b"td-mta-format-smoke").unwrap();
+        fs::remove_file(source.join("td-mta-transport-smoke")).unwrap();
+        assert!(collect_artifacts(&output, &scratch.0.join("missing-transport")).is_err());
+        fs::write(
+            source.join("td-mta-transport-smoke"),
+            b"td-mta-transport-smoke",
+        )
+        .unwrap();
         let good = scratch.0.join("good");
         assert_eq!(collect_artifacts(&output, &good).unwrap(), "COMMANDS");
         assert_eq!(fs::read(good.join("td-mta")).unwrap(), b"td-mta");
+        assert_eq!(
+            fs::read(good.join("td-mta-transport-smoke")).unwrap(),
+            b"td-mta-transport-smoke"
+        );
         let outside = scratch.0.join("outside");
         fs::write(&outside, b"untouched").unwrap();
         fs::remove_file(source.join("COMMANDS")).unwrap();

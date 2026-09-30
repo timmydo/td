@@ -230,12 +230,13 @@ image's whole-closure profiling qualification. Debug information remains in
 the executables; distribution debug-companion integration is not claimed.
 
 Cargo's selected normal/build graphs must match admission. Its artifact records
-must select exactly one expected binary/test profile. All four results must be
+must select exactly one expected binary/test profile. All five results must be
 x86-64 static PIEs with an executable entry point and no ELF interpreter,
 DT_NEEDED or runtime search path. A second fresh namespace mounts only the
 result and static test supervisor, then runs the installed name's version command
-and each SHA-256, mail-format, PEM/identity/trust, entropy, provider-construction, TLS and
-configuration-stack smoke case in its own process.
+and each SHA-256, mail-format, PEM/identity/trust, entropy, provider-construction,
+TLS, mail clock/TCP/TLS transport and configuration-stack smoke case in its own
+process.
 It has no compiler, root-data file, loader or library mounts. Each runtime command has a
 30-second deadline; each Cargo command has a 20-minute deadline. Parsed Cargo
 stdout is limited to 8 MiB (graphs to 256 KiB); each JSON record is limited to
@@ -244,7 +245,7 @@ output quota. M07 owns native/TLS allocation and entropy-failure qualification;
 a Result wrapper cannot contain provider aborts.
 
 After the compile namespace exits and its descendants are reaped, the host
-requires an exact regular-file output inventory: four binaries and the inner
+requires an exact regular-file output inventory: five binaries and the inner
 command record. It rejects output directory/file symlinks and additional files,
 then copies these checked inputs into a fresh private directory outside the
 compiler's writable mount. Only this directory receives host-written metadata
@@ -276,6 +277,17 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   for the two exact provider hash-coverage cases below. It has the same
   test-target/profile, static ELF and isolated-runtime checks as the other
   qualification binaries; it is not an installed service dependency.
+- `td-mta-transport-smoke`: the `--lib --no-run` td-mta test executable,
+  selected by its `td_mta` library target and test profile. Sixteen exact
+  clock/TCP/TLS cases execute individually under the existing deadline and
+  positive-one-test verdict requirement. They cover clock conversion,
+  bounded TCP/half-close/failure, TLS 1.3 duplex progress and framing,
+  backpressure, publication deadlines, closure and truncation, and buffer
+  recovery after success or constructor refusal. Socket fixtures bind only
+  ephemeral IPv4 loopback ports; certificates are generated locally through
+  the public crypto facade. No provider, CA or deployment server is contacted.
+  This qualifies those adapter behaviors on musl, not full service admission,
+  native allocation/stack/RSS, or mail-specific TLS 1.2 integration.
 - `BUILD-INPUTS`: staged source, vendor, reconstructed Rust kit, headers and
   helper NAR hashes, native recipe identities/NARs, target and actual inner
   Cargo argument/environment records.

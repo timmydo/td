@@ -215,8 +215,12 @@ the kernel. Callers discard output on error, and queue effect fences must
 precede writes; no error proves that already accepted output was undelivered.
 Local public-facade TLS 1.3 fixtures cover tiny duplex pipes, fragmented I/O,
 simultaneous full chunks, flush backpressure, close/EOF, invalid counts,
-deadline/time refusal, repeated buffer reuse and a TCP loopback exchange. Shared td-crypto fixtures
-qualify TLS 1.2 as well; mail-specific TLS 1.2 and service/resource acceptance
+deadline/time refusal, repeated buffer reuse and a TCP loopback exchange.
+The portable harness also selects these eleven TLS cases and the five
+clock/TCP cases from td-mta's library test executable under isolated musl.
+Each must report one passing test; missing or renamed cases refuse artifact
+publication. This adds target behavioral coverage, not resource admission.
+Shared td-crypto fixtures qualify TLS 1.2 as well; mail-specific TLS 1.2 and service/resource acceptance
 remain part of M07d3/M07e.
 
 ## 2. Read views and change history

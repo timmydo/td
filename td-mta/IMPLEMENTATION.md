@@ -737,6 +737,8 @@ Implement the remaining work as independently reviewable increments:
     flush backpressure, error/close semantics, publication deadline fences and
     TCP loopback. Consuming connection/refusal returns recover both buffers
     for pool reuse, including constructor failure before admission.
+    The portable harness executes all eleven pump and five clock/TCP cases
+    from a separately selected static musl library test artifact.
     No mail authorization is constructed from raw TLS evidence.
     TLS 1.2 mail fixtures and complete resource qualification remain below.
   - **M07d3 — admitted upgrades:** bind immutable policy generations and slot
