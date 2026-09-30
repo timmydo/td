@@ -764,12 +764,21 @@ Implement the remaining work as independently reviewable increments:
         Host and portable fixtures cover equivalence/change, maximum bounds,
         pin/address refusal and required client authentication. Generation
         publication and successful authenticated transport remain below.
-      - **M07d3b2 — generation and resource coupling:** couple the global
-        permit, reserved wire/session storage and immutable authorized
-        generation in the admitting factory. Refusal returns all owners;
-        hold the permit across queued/Pending progress and release only on
-        completion or teardown. Apply current-policy revocation using the
-        canonical policy comparison plus listener binding checks.
+      - **M07d3b2 — generation and resource coupling:**
+        - **M07d3b2a — retained ownership:** implemented two-slot generation
+          ownership with detached reservation before cold boxed construction,
+          process-unique IDs, stale/foreign publication refusal and movable
+          shared leases. Explicit startup has no Default; publication returns
+          a must-use retired owner for control-worker disposal. Current,
+          reserved, candidate and retired payloads share capacity; final drop
+          destroys the boxed payload before releasing its reservation. Host
+          and portable cases exercise limits, failure, concurrency and drop
+          order. This generic owner does not validate TLS policy or bytes.
+        - **M07d3b2b — admitted factory:** couple the global handshake permit,
+          reserved wire/session storage and immutable authorized generation.
+          Refusal returns all owners; hold the permit across queued/Pending
+          progress and release only on completion or teardown. Apply current
+          policy revocation using canonical comparison plus listener binding.
     - **M07d3c — protocol integration:** complete STARTTLS flush/tail/reset,
       gateway pin/address authorization and local HTTPS/SMTP transition cases.
 - **M07e — resource/service admission:** qualify complete generation overlap,

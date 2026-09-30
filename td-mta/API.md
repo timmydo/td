@@ -281,9 +281,10 @@ constant-time digest comparison for both configured pins and SCHEMA.md's
 mapped-peer CIDR rules. Neither construction, matching nor session creation
 grants mail authority. The admitting transport must obtain verified client
 leaf evidence from its completed TLS session, pair it with the actual socket
-peer, and recheck the current authorized policy before mutation. Generation
-retention/revocation, resource coupling and the TlsFactory/TlsTransport
-implementations remain M07d3b2/M07d3c.
+peer, and recheck the current authorized policy before mutation. Generic
+retained ownership is described in §1.6; material-specific generation binding,
+revocation, resource coupling and the TlsFactory/TlsTransport implementations
+remain M07d3b2b/M07d3c.
 
 `GatewayFingerprint` identifies the canonical client policy for later reload
 comparison. It is SHA-256 of the following concatenation; lengths/counts are
@@ -316,6 +317,72 @@ pin/CIDR refusals, private material bounds and missing client authentication
 against the same server that succeeds with authentication disabled. This is
 not a successful authenticated-gateway transport fixture; that integration
 and resource qualification remain pending.
+
+### 1.6 Retained generation ownership
+
+M07d3b2a supplies `generations::GenerationSet<T>`, one cold retention domain
+for at most two payload generations. Create the service's certificate domain
+explicitly with `at_startup` and keep it while any candidate/session retains
+its material. There is no Default implementation that could silently replace
+a live domain through `mem::take` or a containing service's derived default.
+A new set is a separate domain, never a way to bypass an old live set. The
+loader must supply a bounded, valid payload and preserve its immutability;
+this generic owner does not validate configuration or grant TLS authority.
+Resources extracted/cloned from a payload must retain the associated lease.
+
+`reserve` returns a non-clonable GenerationConstruction, capturing its active
+base and retaining capacity without borrowing the set. It allocates nothing.
+Move that owner through the runtime's control slot before calling `construct`
+on the cold worker. Its loader returns Box<T>, so the API does not pass the
+whole payload through the control stack; loaders must still bound their own
+stack and temporaries. The cold `prepare` convenience combines both steps for
+a control worker that already owns the set. Main must not hold a lock across
+that loader callback. Dropping an unused reservation returns capacity.
+
+Current, retired, reserved and prepared owners share two slots. Saturation or
+a racing reservation returns Busy without spinning or calling a loader.
+ID issuance makes a second, single atomic attempt on a process-wide counter;
+a concurrent reservation in another domain can also return Busy. Retry either
+transient refusal on a later turn, never by spinning. IDs are nonzero u64,
+never reset/reused or wrapped; exhaustion refuses before a loader runs.
+Returned loader failure releases capacity. IDs are local lookup identities,
+not persistent or remote authority.
+
+A non-clonable PreparedGeneration captures its active base. `publish` requires
+exclusive coordinator ownership, the original retention domain and that same
+active base. Foreign/stale publication returns a fixed refusal plus the whole
+candidate and leaves the active generation unchanged. Success returns the
+former active lease inside a must-use RetiredGeneration wrapper; it does not
+destroy a payload inside publication. The coordinator may be main, and must
+move that owner to the control worker before disposal. Refused candidates
+also retain their owners for control-worker disposal or recovery. Explicit
+Drop still runs on the caller's thread; the helper performs no automatic
+handoff. `into_lease` explicitly recovers the optional former active lease. Pending-candidate supersession/deadlines and
+complete loader validation remain the runtime's responsibility. The helper
+alone neither limits outstanding reload commands nor implements M19.
+
+`current` and lease cloning retain existing backing storage without allocation.
+The runtime bounds the number of leases through its slots/jobs. A lease can
+outlive the public set, and its last owner destroys the payload before returning
+capacity. The payload is separately boxed so its allocation is freed before
+the reservation is released; only the small shared ownership header remains
+until the enclosing Arc finishes dropping. Charge that transient metadata and
+allocator bookkeeping to the same existing ledger. Acquire/release reservation
+ordering fences destruction before slot reuse, but does not synchronize
+mutable payload access or publish application authorization.
+
+Construction uses cold allocations for the bitmap, loader-supplied boxed
+payload and shared owner; std allocation failure and unexpected
+loader/destructor panic follow
+the existing process-failure contract. This is a retained-payload count, not a
+byte or whole-process bound. Debug omits payload contents. Host and portable
+cases cover two-generation saturation before construction, stale/foreign
+publication without losing owners, returned construction failure, ID exhaustion,
+worker construction/retention/drop order and racing construction/release. A
+boxed 1 MiB fixture is constructed on a thread with 256 KiB requested stack;
+this is not complete control-worker or TLS stack qualification. Material-specific
+TLS tables, slot/session ownership and current-policy revocation remain
+M07d3b2b/M07d3c; this helper enables no service endpoint.
 
 ## 2. Read views and change history
 

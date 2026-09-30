@@ -790,6 +790,10 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-mta-format-smoke", "provider_hashes_import_snapshot_fixtures", false),
         ("td-mta-config-smoke", "portable_loader_stack", true),
         ("td-mta-config-smoke", "portable_materialized_stack", true),
+        ("td-mta-transport-smoke", "generations::tests::current_retired_and_candidate_share_two_slots_before_construction", false),
+        ("td-mta-transport-smoke", "generations::tests::failed_stale_and_foreign_candidates_preserve_active_state_and_owners", false),
+        ("td-mta-transport-smoke", "generations::tests::final_worker_release_destroys_payload_before_returning_capacity", false),
+        ("td-mta-transport-smoke", "generations::tests::racing_preparation_and_release_never_construct_a_third_live_payload", false),
         ("td-mta-transport-smoke", "gateway_policy::tests::canonical_gateway_policy_ignores_only_representation_and_server_material", false),
         ("td-mta-transport-smoke", "gateway_policy::tests::gateway_filters_and_material_limits_refuse_without_fallback", false),
         ("td-mta-transport-smoke", "gateway_policy::tests::gateway_tls_requires_a_client_certificate_on_the_same_valid_server", false),
@@ -850,7 +854,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
-    println!("portable runtime: twenty-three mail gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
+    println!("portable runtime: twenty-seven mail generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
     Ok(())
 }
 

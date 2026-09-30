@@ -139,6 +139,18 @@ configured memory budget does not preserve the default RSS claim.
   4 KiB anchor digests and eight canonical prefixes) on the existing control
   stack. Its complete stack/native allocation peak remains unqualified until
   M07e; input count caps do not prove the generation or stack allowance.
+  M07d3b2a's explicit-startup GenerationSet counts current, reserved, candidate
+  and retained old owners against two shared slots before invoking a loader.
+  The detached reservation permits control-worker construction without holding
+  a main-thread lock. The loader returns Box<T>, avoiding a by-value T handoff
+  through that worker's stack; its own stack use remains bounded by the loader.
+  Boxed payloads are freed
+  before their slot is released. Charge the cold bitmap, payload/shared-owner
+  allocations, leases and briefly overlapping final-drop ownership headers to
+  this same ledger, including allocator overhead; no new allowance is added.
+  The runtime bounds lease counts and destruction concurrency with its fixed
+  slots/workers. GenerationSet cannot bound T's contents, loader temporaries,
+  extracted resources or native allocations; M07e still proves their aggregate.
 - Certificate overlap, reload overlap, allocator bookkeeping, executable
   pages and main/worker stacks all count at peak coexistence. RSS tests must
   validate the allowances; this ledger is not an OS memory limiter.
