@@ -1740,9 +1740,7 @@ mod tests {
     // These independent target artifacts and checks deliberately run before
     // self-hosting but are not ancestors of rust-toolchain. New recipes default
     // to the far side of the boundary and must not grow this list silently.
-    const BOOTSTRAP_SIDE_CONSUMERS: [&str; 18] = [
-        "btrfs-progs-x86-64",
-        "btrfs-progs-x86-64-test",
+    const BOOTSTRAP_SIDE_CONSUMERS: [&str; 15] = [
         "busybox-test",
         "elfutils-x86-64",
         "elfutils-x86-64-test",
@@ -1758,11 +1756,10 @@ mod tests {
         "linux-x86-64-test",
         "make-test",
         "sed-mesboot",
-        "util-linux-libs-x86-64",
     ];
     const SELF_HOSTED_PHASE_MARKERS: [&str; 3] =
         ["rust-toolchain", "gcc-x86-64-self", "binutils-x86-64-self"];
-    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: [(&str, &str); 10] = [
+    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: [(&str, &str); 8] = [
         // Identity/codegen audits deliberately look back across the boundary.
         ("rust-userland-auto-test", "rust-stage0"),
         ("gcc-x86-64-self-test", "gcc-x86-64-native"),
@@ -1771,18 +1768,9 @@ mod tests {
         ("kexec-spike-x86-64", "linux-x86-64"),
         ("system-x86-64", "linux-x86-64"),
         ("system-secret-vm-test", "linux-x86-64"),
-        // ...and the installer consumes the pre-self FILESYSTEM tool, for the
-        // same reason: `td-install/DESIGN.md`'s D7 approves `mkfs.btrfs` as the
-        // one third-party program on the install path, because writing a Btrfs
-        // formatter in Rust would produce a volume that mounts and then loses
-        // data. btrfs-progs is a C program built by the GNU toolchain and
-        // belongs on the bootstrap side; nothing about it moves post-boundary,
-        // so the consumer declares the edge instead.
-        ("td-install-test", "btrfs-progs-x86-64"),
-        // The native installation oracle boots this kernel and exercises the
-        // same approved formatter inside its disposable guest.
+        // The native installation oracle boots this kernel in its disposable
+        // guest.
         ("td-install-qemu-test", "linux-x86-64"),
-        ("td-install-qemu-test", "btrfs-progs-x86-64"),
         // Rebuild GNU Make once with the final compiler. The preceding Make is
         // only the build driver; later packages consume make-x86-64-self.
         // The frozen UAPI input is a fixed-output source governed by the seed
