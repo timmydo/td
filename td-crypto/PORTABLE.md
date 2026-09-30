@@ -827,3 +827,11 @@ cold RNG work must produce a positive malloc/calloc observation. Domain and
 scenario logs are distinct and completion records are exact. Requested
 bytes/blocks can remain after all workers exit. These diagnostics do not
 measure worker stack mappings or RSS and do not change service admission.
+
+Fresh `--tls-fragments` processes additionally exercise the socket-free facade's
+existing malformed-handshake reassembly boundaries with 16384-byte and 4096-byte
+fragments. Twelve ordered rows distinguish setup, retained incomplete input,
+decoding/capacity refusals, repeated cycles and teardown. The pending snapshot
+precedes the final record and does not isolate a transient peak. All rows and
+completion markers must match their domain/scenario schema before logging.
+This is an untrusted-input diagnostic, not a complete TLS/session/RSS bound.

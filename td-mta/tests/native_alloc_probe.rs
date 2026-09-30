@@ -87,6 +87,37 @@ fn tls_handshake() {
 }
 
 #[cfg(td_native_alloc_probe)]
+#[path = "support/tls_fragment_scenario.rs"]
+mod tls_fragment_scenario;
+
+#[cfg(td_native_alloc_probe)]
+fn tls_fragments() {
+    use native_allocator_bridge::{calls, TD_MTA_NATIVE_REGISTRY as REGISTRY};
+    let mut samples = [(calls(), REGISTRY.snapshot()); tls_fragment_scenario::PHASES.len()];
+    let mut slots = samples.iter_mut();
+    tls_fragment_scenario::run(|| *slots.next().unwrap() = (calls(), REGISTRY.snapshot()));
+    assert!(slots.next().is_none());
+    for (_, snapshot) in &samples {
+        assert!(!snapshot.invalid);
+    }
+    assert_eq!(
+        samples.get(9).unwrap().1.bytes,
+        samples.get(10).unwrap().1.bytes,
+        "repeated refusals retained C boundary bytes"
+    );
+    assert_eq!(
+        samples.get(9).unwrap().1.blocks,
+        samples.get(10).unwrap().1.blocks,
+        "repeated refusals retained C boundary blocks"
+    );
+    for (phase, (c, s)) in tls_fragment_scenario::PHASES.into_iter().zip(samples) {
+        let [malloc, calloc, realloc, free, posix, aligned] = c;
+        println!("tls-native-fragment {phase} {malloc} {calloc} {realloc} {free} {posix} {aligned} {} {} {}", s.blocks, s.bytes, s.peak);
+    }
+    println!("tls-fragment-allocation-v1: native passed");
+}
+
+#[cfg(td_native_alloc_probe)]
 #[path = "support/entropy_worker_scenario.rs"]
 mod entropy_worker_scenario;
 
@@ -149,6 +180,13 @@ fn main() {
         .is_some_and(|arg| arg == "--entropy-workers")
     {
         entropy_workers();
+        return;
+    }
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|arg| arg == "--tls-fragments")
+    {
+        tls_fragments();
         return;
     }
     // Retain actual provider allocation/RNG code for the final symbol audit.

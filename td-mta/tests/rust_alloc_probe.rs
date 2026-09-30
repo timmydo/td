@@ -138,6 +138,31 @@ fn tls_handshake() {
     println!("tls-handshake-allocation-v1: rust passed");
 }
 
+#[path = "support/tls_fragment_scenario.rs"]
+mod tls_fragment_scenario;
+
+fn tls_fragments() {
+    let mut samples = [COUNTERS.snapshot(); tls_fragment_scenario::PHASES.len()];
+    let mut slots = samples.iter_mut();
+    tls_fragment_scenario::run(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    for sample in &samples {
+        assert!(!sample.invalid);
+    }
+    assert_eq!(
+        samples.get(9).unwrap().live,
+        samples.get(10).unwrap().live,
+        "repeated refusals retained Rust bytes"
+    );
+    for (phase, s) in tls_fragment_scenario::PHASES.into_iter().zip(samples) {
+        println!(
+            "tls-rust-fragment {phase} {} {} {} {} {} {} {}",
+            s.alloc, s.zeroed, s.realloc, s.free, s.failed, s.live, s.peak
+        );
+    }
+    println!("tls-fragment-allocation-v1: rust passed");
+}
+
 #[path = "support/entropy_worker_scenario.rs"]
 mod entropy_worker_scenario;
 
@@ -181,6 +206,13 @@ fn main() {
         .is_some_and(|arg| arg == "--entropy-workers")
     {
         entropy_workers();
+        return;
+    }
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|arg| arg == "--tls-fragments")
+    {
+        tls_fragments();
         return;
     }
     hot_paths();

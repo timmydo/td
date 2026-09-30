@@ -893,6 +893,12 @@ Implement the remaining work as independently reviewable increments:
     retention, stack mappings and whole-process RSS remain separate; this
     diagnostic does not activate production workers or amend the ledger.
 
+  - **M07e3d — fragmented handshake refusal observations:** both counter
+    domains exercise the existing 16 KiB/4 KiB fragment reassembly boundaries,
+    distinguish decoding refusal from one-byte-over-limit capacity refusal,
+    and check retention across repeated construction/refusal. Valid maximal
+    chains, complete concurrent sessions and RSS remain unqualified.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,

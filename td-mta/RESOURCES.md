@@ -825,3 +825,33 @@ The requested test stack size is not measured stack/RSS evidence. Different
 crypto operations, reseeding, maximum concurrency workloads and production
 worker integration still require qualification. No ledger or service worker
 count changes; Rust and C observations continue to overlap.
+
+## Fragmented handshake refusal observations
+
+The fresh-process `--tls-fragments` modes drive the socket-free crypto facade
+with deliberately malformed ServerHello payloads. A reusable 16389-byte wire
+buffer generates records directly, without retaining a second handshake copy.
+With 16384-byte fragments, a 65511-byte payload reaches decoding and fails
+Protocol; with 4096-byte fragments the corresponding payload is 65451 bytes.
+Retained record headers consume the rest of the backend's 65535-byte limit.
+For each shape, one extra payload byte must fail Capacity instead. These are
+the existing reassembly boundary cases, observed through public APIs.
+
+Twelve snapshots cover baseline, a public-root outbound policy, wire storage,
+construction/pending input/refusal for each shape, both over-limit refusals,
+32 repetitions of all four cases, and complete teardown. The pending snapshot
+precedes the final record; it is not a snapshot at the exact transient peak.
+The `large_refused` and `small_refused` snapshots follow explicit session drop;
+they cannot distinguish release at refusal from release during drop. Refusal
+must retire handshake evidence, and the fixture then drops the session.
+Repeated cycles must retain no additional requested Rust bytes or tracked
+C bytes/blocks. Counter
+rows use `tls-rust-fragment` and `tls-native-fragment` with the established
+columns. Lifetime peaks still include controls and policy setup.
+
+This fixture generates no valid peer certificate chain, successful handshake
+or established traffic. It does not add mail pump buffers, service admission,
+concurrent handshake slots or whole-process RSS accounting. It measures a
+specific untrusted-input allocation path, not every adversarial handshake or
+a total session bound. Provider state can survive session teardown; the two
+counter domains remain overlapping observations.
