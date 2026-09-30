@@ -98,11 +98,19 @@ configured memory budget does not preserve the default RSS claim.
   M07d2's record pump retains two distinct 18437-byte reservations per
   connection (36874 bytes total), one input frame and one output/tail frame.
   These count against the existing 128 KiB session target, not extra headroom.
-  The current independent facade maxima (83973 ciphertext plus 16384
-  plaintext bytes) and the pump buffers total 137231 bytes before handles,
-  native state and allocator overhead: that conservative sum exceeds the
-  target. This is a known M07e admission blocker, not a qualified bound.
-  M07e must reduce effective native queue limits and measure coexistence
+  Before the final handshake flight drains, the facade permits 83973
+  ciphertext bytes. Its conservative sum with 16384 plaintext bytes and
+  36874 pump bytes remains 137231, exceeding the 128 KiB session target by
+  6159 bytes. This window can extend past authenticated Finished. The mail
+  owner retains its handshake permit until facade and socket output drain;
+  the corresponding additional handshake memory reservation must cover the
+  whole pre-drain window before activation. After authenticated Finished and
+  complete facade output drain, its permanent ciphertext ceiling is 36874 bytes. That established
+  ceiling plus 16384 plaintext bytes and the pump buffers totals 90132 bytes,
+  leaving 40940 of the 128 KiB session target before handles, retained input,
+  peer chains, native state and allocator overhead. Post-operation output
+  refusal does not bound temporary allocation or Vec capacity. Complete
+  session accounting remains an M07e admission blocker. Measure coexistence
   within 128 KiB, or amend the ledger before serving. The runtime must reserve
   the wire buffers before admission and recover both through into_buffers on
   teardown or constructor refusal, for either representation. The pump accepts

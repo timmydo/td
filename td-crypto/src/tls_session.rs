@@ -10,7 +10,8 @@ use std::{
     sync::Arc,
 };
 const PROTOCOL_OUTPUT_LIMIT: usize = 65_536;
-const OUTPUT_LIMIT: usize = PROTOCOL_OUTPUT_LIMIT + 18_437;
+const HANDSHAKE_OUTPUT_LIMIT: usize = PROTOCOL_OUTPUT_LIMIT + 18_437;
+const ESTABLISHED_OUTPUT_LIMIT: usize = 2 * 18_437;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TlsVersion {
     V12,
@@ -78,6 +79,7 @@ struct Live {
     clock: Arc<SessionClock>,
     config: Role,
     protection: Protection,
+    finished_flight_drained: bool,
     status: TlsStatus,
 }
 impl TlsSession {
@@ -306,6 +308,7 @@ impl Live {
             clock,
             config: Role::Client(config),
             protection: Protection::Plain,
+            finished_flight_drained: false,
             status: TlsStatus {
                 phase: TlsPhase::Handshaking,
                 plaintext_pending: 0,
@@ -353,7 +356,12 @@ impl Live {
         if self.status.write_closed && io.tls_bytes_to_write() > self.status.ciphertext_pending {
             return Err(TlsError::Protocol);
         }
-        if io.tls_bytes_to_write() > OUTPUT_LIMIT || io.plaintext_bytes_to_read() > PLAINTEXT_LIMIT
+        let output_limit = if self.finished_flight_drained {
+            ESTABLISHED_OUTPUT_LIMIT
+        } else {
+            HANDSHAKE_OUTPUT_LIMIT
+        };
+        if io.tls_bytes_to_write() > output_limit || io.plaintext_bytes_to_read() > PLAINTEXT_LIMIT
         {
             return Err(TlsError::Capacity);
         }
@@ -469,6 +477,9 @@ impl Live {
             let peer = self.peer_evidence()?;
             self.status.handshake = Some(HandshakeInfo { version, peer });
         }
+        // Finished may still leave a large final handshake flight to drain.
+        self.finished_flight_drained |=
+            self.status.handshake.is_some() && self.status.ciphertext_pending == 0;
         self.status.wants_input = !self.status.read_closed
             && self.status.plaintext_pending == 0
             && (self.status.handshake.is_some() || self.status.ciphertext_pending == 0);

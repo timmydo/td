@@ -365,8 +365,15 @@ that outstanding suffix to intake. Never regenerate drained bytes.
 
 Pin the exact internal plaintext/ciphertext queue and protocol-output
 reserve limits in implementation and memory qualification. The client sets
-its native application buffer limit to 32 KiB and caps drainable output at
-65536 protocol bytes plus one 18437-byte application wire reservation.
+its native application buffer limit to 32 KiB. Both roles initially cap
+drainable output at 65536 protocol bytes plus one 18437-byte application wire
+reservation. Once Finished is authenticated and the final local handshake
+flight has completely drained from the facade, permanently reduce that output
+ceiling to 36874 bytes: one application wire reservation and one protocol
+wire reservation. A caller-owned socket tail remains separately charged to
+the pump. Handshake success alone does not retire the larger allowance while
+its final flight remains queued; later application/protocol output cannot
+restore it. Overflow is terminal Capacity, never an additional wait cycle.
 These post-operation refusals are not preallocation or whole-memory bounds;
 M07e must qualify retained and temporary backend work as well. Buffer settings
 do not cap certificates, handshake state, native contexts or allocator

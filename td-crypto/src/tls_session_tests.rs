@@ -244,6 +244,83 @@ impl Driver {
     }
 }
 #[test]
+fn client_session_retires_handshake_output_reserve_and_refuses_backend_growth() {
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        for excessive in [false, true] {
+            let mut d = Driver::new(version);
+            assert!(!d.client.live.as_ref().unwrap().finished_flight_drained);
+            let mut pending_finished = false;
+            for _ in 0..100_000 {
+                d.step(false).unwrap();
+                let state = d.client.status();
+                if state.handshake.is_some() && state.ciphertext_pending != 0 {
+                    pending_finished = true;
+                    assert!(!d.client.live.as_ref().unwrap().finished_flight_drained);
+                }
+                if d.client.live.as_ref().unwrap().finished_flight_drained {
+                    assert!(state.handshake.is_some());
+                    assert_eq!(state.ciphertext_pending, 0);
+                    break;
+                }
+            }
+            if version == &rustls::version::TLS13 {
+                assert!(pending_finished);
+            }
+            d.handshake(false).unwrap();
+            assert!(d.client.live.as_ref().unwrap().finished_flight_drained);
+            let config = d.client.live.as_ref().unwrap().client_config();
+            let clock = Arc::downgrade(&d.client.live.as_ref().unwrap().clock);
+            // Deliberately bypass the facade's one-application-record rule.
+            d.client
+                .run(|live| {
+                    live.backend(|connection| {
+                        connection.set_buffer_limit(None);
+                        connection
+                            .writer()
+                            .write_all(&[0x51; 2 * 16_384])
+                            .map_err(|_| TlsError::Crypto)
+                    })?;
+                    live.process()
+                })
+                .unwrap();
+            let queued = d.client.status().ciphertext_pending;
+            let framing = queued - 2 * 16_384;
+            assert!(framing > 0 && framing.is_multiple_of(2));
+            let overhead = framing / 2;
+            let remaining = 36_874 - queued - overhead;
+            assert!(remaining > 0 && remaining < 4096);
+            assert!(d.client.live.as_ref().unwrap().finished_flight_drained);
+            let bytes = [0x52; 4096];
+            let result = d.client.run(|live| {
+                live.backend(|connection| {
+                    connection
+                        .writer()
+                        .write_all(&bytes[..remaining + usize::from(excessive)])
+                        .map_err(|_| TlsError::Crypto)
+                })?;
+                live.process()
+            });
+            if excessive {
+                assert_eq!(result, Err(TlsError::Capacity));
+                assert!(clock.upgrade().is_none());
+                assert_eq!(d.client.status().phase, TlsPhase::Failed);
+                assert_eq!(d.client.status().ciphertext_pending, 0);
+                assert_eq!(d.client.status().handshake, None);
+                assert_eq!(
+                    d.client.drain_ciphertext(&mut [0; 128]),
+                    Err(TlsError::Capacity)
+                );
+            } else {
+                assert_eq!(result, Ok(()));
+                assert_eq!(d.client.status().ciphertext_pending, 36_874);
+                assert!(d.client.live.as_ref().unwrap().finished_flight_drained);
+            }
+            assert!(TlsSession::client(config, "localhost").is_ok());
+        }
+    }
+}
+
+#[test]
 fn client_session_fragmented_handshake_and_simultaneous_writes() {
     for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
         let mut d = Driver::new(version);

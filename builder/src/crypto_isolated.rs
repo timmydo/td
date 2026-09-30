@@ -1149,6 +1149,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "tls_server::tests::server_configuration_omits_oversized_ca_hint_lists", false),
         ("td-crypto-smoke", "tls_server::tests::server_configuration_refuses_offered_resumption", false),
         ("td-crypto-smoke", "tls_session::tests::client_session_fragmented_handshake_and_simultaneous_writes", false),
+        ("td-crypto-smoke", "tls_session::tests::client_session_retires_handshake_output_reserve_and_refuses_backend_growth", false),
         ("td-crypto-smoke", "tls_session::tests::client_session_retains_ignored_tls12_clock_failure", false),
         ("td-crypto-smoke", "tls_session::tests::client_session_checks_time_without_native_time_requests", false),
         ("td-crypto-smoke", "tls_session::tests::client_session_close_halves_and_transport_eof", false),

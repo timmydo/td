@@ -59,6 +59,7 @@ impl Live {
             clock,
             config: Role::Server(config),
             protection: Protection::Plain,
+            finished_flight_drained: false,
             status: TlsStatus {
                 phase: TlsPhase::Handshaking,
                 plaintext_pending: 0,

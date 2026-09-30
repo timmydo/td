@@ -849,10 +849,15 @@ output is pending, so simultaneous writers can make progress.
 
 At most 16384 plaintext bytes may be queued per call, with one outstanding
 application record. Incoming plaintext is bounded to the same size. The native
-application buffer setting is 32 KiB; drainable ciphertext is capped at 65536
-protocol bytes plus the 18437-byte application wire reservation. These are
-queue refusals, not a preallocation or total-memory guarantee. Handshake,
-certificate and native allocations remain separate qualification work. The
+application buffer setting is 32 KiB. Drainable ciphertext initially permits
+65536 protocol bytes plus the 18437-byte application wire reservation. After
+successful Finished and complete facade drain of the final local handshake
+flight, both roles permanently reduce the ciphertext ceiling to 36874 bytes,
+one application and one protocol wire reservation. A later pending record
+cannot restore the handshake allowance. A caller socket tail belongs to its
+separate pump buffer. These are queue refusals, not a preallocation or
+total-memory guarantee. Handshake, certificate and native allocations remain
+separate qualification work. The
 65535-byte deframer limit includes retained record headers: with 16384-byte
 plaintext fragments, a deliberately malformed 65511-byte handshake payload
 reaches decoding while one extra byte exhausts capacity. With 4096-byte

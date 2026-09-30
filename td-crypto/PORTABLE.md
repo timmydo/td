@@ -724,7 +724,13 @@ Close cases cover each version's independent halves, TLS 1.2 pending-output
 alert refusal, caller-owned write tails, local-close bad MACs, peer-close
 discard, truncated transport and writes after close. A requested TLS 1.3
 KeyUpdate produces its response without application activity, preserving
-previously queued ciphertext and subsequent key ordering. The native deframer
+previously queued ciphertext and subsequent key ordering. Both roles retire
+the larger handshake output allowance only after Finished
+and local flight drain. TLS 1.2/1.3 fixtures exercise the transition and a
+synthetic backend-growth refusal using real encrypted records; healthy
+configuration reuse must remain possible. Established ciphertext is capped
+at 36874 bytes. This is a post-operation queue check, not an allocation bound.
+The native deframer
 retains record headers: a 65511-byte malformed handshake payload fits with
 16384-byte fragments, while one extra byte exhausts capacity; 4096-byte
 fragments lower that boundary to 65451. These fixtures qualify progress and

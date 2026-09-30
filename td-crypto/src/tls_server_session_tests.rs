@@ -596,6 +596,7 @@ fn server_session_public_pair_tiny_pipes_simultaneous_writes_and_close() {
         .unwrap();
         let mut outward = Pipe::new();
         let mut inward = Pipe::new();
+        let mut server_finished_pending = false;
         for _ in 0..100_000 {
             let a = outward
                 .step(&mut client, &mut server, inward.unwritten())
@@ -603,6 +604,10 @@ fn server_session_public_pair_tiny_pipes_simultaneous_writes_and_close() {
             let b = inward
                 .step(&mut server, &mut client, outward.unwritten())
                 .unwrap();
+            if server.status().handshake.is_some() && server.status().ciphertext_pending != 0 {
+                server_finished_pending = true;
+                assert!(!server.live.as_ref().unwrap().finished_flight_drained);
+            }
             if client.status().handshake.is_some()
                 && server.status().handshake.is_some()
                 && outward.empty()
@@ -614,7 +619,12 @@ fn server_session_public_pair_tiny_pipes_simultaneous_writes_and_close() {
             }
             assert!(a || b, "public pair handshake deadlock");
         }
+        if version == &rustls::version::TLS12 {
+            assert!(server_finished_pending);
+        }
         assert!(client.status().handshake.is_some() && server.status().handshake.is_some());
+        assert!(client.live.as_ref().unwrap().finished_flight_drained);
+        assert!(server.live.as_ref().unwrap().finished_flight_drained);
         assert_eq!(
             client.queue_plaintext(&[0x51; 16384]),
             Ok(TlsProgress::Bytes(16384))

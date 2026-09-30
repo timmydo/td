@@ -911,6 +911,13 @@ Implement the remaining work as independently reviewable increments:
     ordered KiB samples. They include fixture/observer overhead and do not
     establish transient peaks, whole-service bounds or per-session charges.
 
+  - **M07e4a — established output allowance:** the shared facade permanently
+    retires its larger handshake ciphertext allowance only after Finished and
+    complete local flight drain. Both roles then cap pending ciphertext at
+    two wire reservations, preserving read/write progress and terminal
+    capacity refusal. This narrows one queue bound; retained and temporary
+    memory, complete generations and total session admission remain pending.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,
