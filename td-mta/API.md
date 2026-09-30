@@ -625,7 +625,7 @@ drains any other plaintext output, retains no other plaintext input, and
 supplies a still-authorized retained generation. This owner does not prove
 that caller context or implement an actual-current mutation fence. Full
 SMTP parser, EHLO/extension, authentication and transaction-state reset after
-successful TLS remains M10/M13 integration. Outbound STARTTLS remains M17.
+successful TLS remains M10/M13 integration. The outbound boundary follows.
 Tests cover short writes/flush backpressure, clock/deadline/refusal cleanup,
 real direct SMTP handoff and private gateway client-certificate peers under
 TLS 1.2/1.3. These fixtures start at the STARTTLS command boundary; they do not
@@ -633,6 +633,48 @@ implement the initial SMTP greeting/EHLO or the complete mail protocol.
 Existing session/wire reservations are retained; no worker, allocation or
 resource allowance is added. M07e still gates whole native/session resource
 qualification before service activation.
+
+### 1.11 Outbound STARTTLS reply ownership
+
+`smtp_wire::EhloReader` borrows a 512-byte reply reservation and retains only
+whether a non-greeting 250 extension advertises parameterless STARTTLS.
+It uses the same strict framing, aggregate ceiling and local malformed
+extension skipping as ReplyReader. Consuming a complete successful reply with
+an empty exact tail yields an opaque, non-copyable StartTlsOffer. Partial,
+failed, tailed or unadvertised replies cannot produce one. The offer is syntax
+evidence; the trusted driver binds it to the actual socket and EHLO exchange.
+
+`tls_policy::ClientStartTls` consumes that offer, the exclusive TcpTransport
+and a prepared session whose retained relay policy requires STARTTLS. Implicit
+relay and server policies refuse before any output. UpgradeScratch borrows two
+distinct existing reservations, using 512 bytes of each for socket input and
+reply assembly; insufficient space refuses. Construction and each consuming
+advance check fixed whole/handshake deadlines. Each advance performs at most
+one socket operation and parses at most one reply line. It writes and flushes
+STARTTLS, then requires a complete, bounded 220 reply with consistent multiline
+codes and no buffered tail before consuming ownership into TlsConnection.
+Only subsequent TLS handshake progress may send ClientHello. No credentials
+are emitted and no plaintext fallback occurs.
+The lower-level SessionReservation::handoff remains available to protocol
+adapters. Its callers must enforce the configured STARTTLS exchange themselves;
+a retained policy role alone does not prove command sequencing.
+
+Reply framing/capacity errors, non-220 replies, EOF, clock or transport errors
+and expiry abort the socket/native session and return SessionRefusal with the
+original wire buffers. Explicit cancellation does the same cleanup without an
+error. The caller regains its borrowed scratch when the owner ends; neither
+scratch nor consumed EHLO state has a secure-erasure guarantee. An unread tail
+means bytes already read into these buffers; later socket bytes are handled by
+the TLS record parser, never by a resumed plaintext parser.
+
+The trusted driver drains previous output and retains no other plaintext
+input or capabilities. The offer does not prove socket identity, command
+sequencing or current-generation authority. Tests supply the EHLO capability
+boundary, then exercise real local command/reply exchange and both upgrade
+owners through verified TLS. Complete greeting/EHLO dispatch, fresh post-TLS
+EHLO, AUTH and transaction reset remain M17. M07e must account for these
+borrowed reservations within the complete outbound session ledger before
+activation; this API grants no new resource allowance.
 
 ## 2. Read views and change history
 

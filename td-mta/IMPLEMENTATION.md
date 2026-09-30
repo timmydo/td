@@ -832,8 +832,17 @@ Implement the remaining work as independently reviewable increments:
         recover both wire reservations and release native/generation/count owners.
         Direct local and private gateway process fixtures qualify the boundary,
         including TLS 1.2/1.3 pin acceptance/refusal. Full command sequencing,
-        SMTP state reset, actual-current fencing and outbound STARTTLS remain
-        protocol integration work.
+        SMTP state reset and actual-current fencing remain protocol integration
+        work.
+      - **Outbound reply ownership:** implemented EhloReader/StartTlsOffer and
+        ClientStartTls for required-STARTTLS relay policies. Consume the complete
+        advertisement and prepared session, write/flush STARTTLS, then require
+        a complete bounded 220 without buffered tail before native handoff.
+        Two borrowed 512-byte reservations retain fragmented input and reply
+        state; refusal/cancellation return native wire buffers and permits.
+        Local fixtures cover both owners through verified TLS, malformed/tailed
+        replies and admission cleanup. Full greeting/EHLO/AUTH dispatch and
+        post-TLS state reset remain M17; M07e owns whole-session accounting.
 - **M07e — resource/service admission:** qualify complete generation overlap,
   session/handshake peaks, worker entropy and Rust/native stack/allocation/RSS
   on the portable artifact before activating the adapters. Amend the checked

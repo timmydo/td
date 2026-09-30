@@ -1,6 +1,73 @@
 #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 use super::*;
 
+fn offer(bytes: &[u8]) -> Result<StartTlsOffer, Error> {
+    let mut scratch = [0; LINE_BYTES];
+    let mut reader = EhloReader::new(&mut scratch)?;
+    let mut consumed = 0;
+    while consumed < bytes.len() {
+        let progress = reader.feed(&bytes[consumed..])?;
+        consumed += progress.consumed;
+        if reader.complete() {
+            break;
+        }
+        if progress.complete {
+            reader.advance()?;
+        }
+        assert!(progress.consumed > 0);
+    }
+    reader.into_starttls_offer(&bytes[consumed..])
+}
+
+#[test]
+fn ehlo_offer_requires_a_complete_advertisement_and_no_tail() {
+    assert!(offer(b"250-localhost\r\n250 sTaRtTlS\r\n").is_ok());
+    for bytes in [
+        b"250 STARTTLS\r\n".as_slice(),
+        b"250-localhost\r\n250 STARTTLS ARG\r\n",
+        b"250-localhost\r\n250 AUTH PLAIN\r\n",
+        b"550 not available\r\n",
+    ] {
+        assert_eq!(offer(bytes).err(), Some(Error::Tls));
+    }
+    assert_eq!(
+        offer(b"250-localhost\r\n250-STARTTLS\r\n").err(),
+        Some(Error::Conflict)
+    );
+    assert_eq!(
+        offer(b"250-localhost\r\n250-STARTTLS\r\n550 fail\r\n").err(),
+        Some(Error::Invalid)
+    );
+    for tail in [b"220 injected\r\n".as_slice(), b"\x16\x03\x03"] {
+        let bytes = [b"250-localhost\r\n250 STARTTLS\r\n".as_slice(), tail].concat();
+        assert_eq!(offer(&bytes).err(), Some(Error::Invalid));
+    }
+}
+
+#[test]
+fn ehlo_offer_handles_fragmentation_and_skips_malformed_extensions() {
+    let mut failed_scratch = [0; LINE_BYTES];
+    let mut failed = EhloReader::new(&mut failed_scratch).unwrap();
+    assert_eq!(failed.feed(b"250 bad\n"), Err(Error::Invalid));
+    assert_eq!(failed.into_starttls_offer(&[]).err(), Some(Error::Invalid));
+
+    let bytes = b"250-localhost\r\n250-AUTH=PLAIN LOGIN\r\n250-STARTTLS \r\n250-STARTTLS\r\n250 SIZE 1000\r\n";
+    let mut scratch = [0; LINE_BYTES];
+    let mut reader = EhloReader::new(&mut scratch).unwrap();
+    for &byte in bytes {
+        let progress = reader.feed(&[byte]).unwrap();
+        assert_eq!(progress.consumed, 1);
+        if progress.complete && !reader.complete() {
+            reader.advance().unwrap();
+        }
+    }
+    assert!(reader.into_starttls_offer(&[]).is_ok());
+    assert_eq!(
+        offer(b"250-localhost\r\n250 STARTTLS \r\n").err(),
+        Some(Error::Tls)
+    );
+}
+
 #[test]
 fn line_split_at_every_boundary_retains_exact_tail() {
     let command = b"STARTTLS\r\n";

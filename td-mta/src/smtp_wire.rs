@@ -251,6 +251,63 @@ pub struct EhloExtension<'a> {
     pub parameters: &'a [u8],
 }
 
+/// A complete 250 EHLO reply advertised parameterless STARTTLS. This is syntax
+/// evidence only; the trusted driver binds the reader and tail to its socket.
+pub struct StartTlsOffer {
+    _private: (),
+}
+
+/// Retains only the STARTTLS capability, never credentials or other EHLO state.
+pub struct EhloReader<'a> {
+    reply: ReplyReader<'a>,
+    offered: bool,
+}
+impl<'a> EhloReader<'a> {
+    pub fn new(storage: &'a mut [u8]) -> Result<Self, Error> {
+        Ok(Self {
+            reply: ReplyReader::new(storage)?,
+            offered: false,
+        })
+    }
+
+    pub fn feed(&mut self, input: &[u8]) -> Result<Progress, Error> {
+        let progress = self.reply.feed(input)?;
+        if let Some(line) = self.reply.line() {
+            if let Ok(Some(extension)) = ehlo_extension(line, self.reply.first_line()) {
+                self.offered |= extension.keyword.eq_ignore_ascii_case(b"STARTTLS")
+                    && extension.parameters.is_empty();
+            }
+        }
+        Ok(progress)
+    }
+
+    pub fn advance(&mut self) -> Result<(), Error> {
+        self.reply.advance()
+    }
+
+    pub fn complete(&self) -> bool {
+        self.reply.complete()
+    }
+
+    /// Consume pre-TLS capability state. A greeting, partial reply, malformed
+    /// capability or unread plaintext tail cannot mint an offer.
+    pub fn into_starttls_offer(self, tail: &[u8]) -> Result<StartTlsOffer, Error> {
+        if let Some(error) = self.reply.failure {
+            return Err(error);
+        }
+        if !tail.is_empty() {
+            return Err(Error::Invalid);
+        }
+        if !self.reply.complete() {
+            return Err(Error::Conflict);
+        }
+        if !self.offered || self.reply.line().is_none_or(|line| line.code != 250) {
+            return Err(Error::Tls);
+        }
+        Ok(StartTlsOffer { _private: () })
+    }
+}
+
 /// EHLO extension syntax from RFC 5321. The first greeting line is not an
 /// extension. Callers retain recognized extensions only after the full 250 reply.
 /// Invalid extension syntax is local to this line: skip it as unadvertised.

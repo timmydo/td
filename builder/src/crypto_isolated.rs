@@ -821,6 +821,11 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-mta-transport-smoke", "tls_policy::tests::starttls_tests::server_starttls_refuses_unframed_parameterized_tailed_and_wrong_role_commands", false),
         ("td-mta-transport-smoke", "tls_policy::tests::starttls_tests::server_starttls_deadlines_clock_refusal_and_cancel_release_reservations", false),
         ("td-mta-transport-smoke", "tls_policy::tests::gateway_process_tests::gateway_starttls_process_requires_verified_pin_after_plaintext_reply", false),
+        ("td-mta-transport-smoke", "smtp_wire::tests::ehlo_offer_requires_a_complete_advertisement_and_no_tail", false),
+        ("td-mta-transport-smoke", "smtp_wire::tests::ehlo_offer_handles_fragmentation_and_skips_malformed_extensions", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::client_starttls_tests::client_starttls_and_server_upgrade_verify_real_tls", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::client_starttls_tests::client_starttls_refuses_bad_replies_and_accepts_fragmented_220", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::client_starttls_tests::client_starttls_roles_scratch_deadlines_and_cancel_return_buffers", false),
         ("td-mta-transport-smoke", "smtp_wire::tests::line_split_at_every_boundary_retains_exact_tail", false),
         ("td-mta-transport-smoke", "smtp_wire::tests::strict_line_framing_is_terminal_after_failure", false),
         ("td-mta-transport-smoke", "smtp_wire::tests::control_line_counts_crlf_and_clears_only_its_reservation", false),
@@ -894,7 +899,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
-    println!("portable runtime: fifty-nine mail SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
+    println!("portable runtime: sixty-four mail SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
     Ok(())
 }
 

@@ -23,6 +23,10 @@ pub use io::TlsConnection;
 mod starttls;
 pub use starttls::{ServerStartTls, ServerUpgradeProgress};
 
+#[path = "tls_policy_client_starttls.rs"]
+mod client_starttls;
+pub use client_starttls::{ClientStartTls, ClientUpgradeProgress, UpgradeScratch};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaterialKind {
     Chain,
