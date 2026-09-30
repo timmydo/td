@@ -196,11 +196,23 @@ td-recipe-eval qemu-boot-system      # install/update/recovery boot sequence
 td-recipe-eval qemu-install          # disposable offline ISO installation test
 ```
 
-To compose a retained optical/USB ISO from prepared boot files and optional
+To build a bootable live ISO of the system, signed with a key made for that
+ISO alone:
+
+```sh
+./build-iso                          # writes dist/td-install-x86-64.iso
+./build-iso --out /tmp/td.iso --force
+```
+
+It boots from optical media or a USB stick and runs the system from the
+medium, with all writes in RAM; see "Live boot" in
+[the media contract](td-install/MEDIA.md). The graphical installer and
+installation onto a disk are still in progress.
+
+To compose a retained optical/USB ISO from other prepared boot files and
 payloads, use `td-recipe-eval compose-iso OUTPUT KERNEL INITRAMFS
-[ISO-NAME=FILE ...]`. See [the media contract](td-install/MEDIA.md) for its
-input and publication rules. The command assembles bytes; the complete live
-installer profile and physical-device installation flow are still in progress.
+[ISO-NAME=FILE ...]`. See the media contract for its input and publication
+rules.
 
 To boot a retained ISO interactively with a disposable destination disk:
 
@@ -217,8 +229,7 @@ sessions manually; QEMU exit status alone does not prove installation worked.
 The disk is removed when the command exits normally. Scratch files default to
 `target/`; set `TMPDIR` to choose another host filesystem with room for the
 disk's written contents. After Ctrl-C, remove any leftover `target/td-test-iso-*`
-directory from that run. The current `compose-iso` command does not yet produce
-a graphical installer image.
+directory from that run.
 Set `TD_QEMU_ACCEL=tcg` to force software emulation when KVM is available.
 
 ## License

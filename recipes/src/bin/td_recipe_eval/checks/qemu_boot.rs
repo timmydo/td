@@ -28,6 +28,7 @@
 //! host-side TEST tool — it never enters the target artifact graph. If host qemu
 //! is absent the tool FAILS loudly rather than silently passing, so a green result
 //! always means a real boot happened.
+pub(crate) mod build_iso;
 pub(crate) mod efi;
 pub(crate) mod install;
 pub(crate) mod media;
@@ -3082,10 +3083,11 @@ pub(crate) fn verify_selector(boot: &Path) -> Result<VerifiedSelector, String> {
 /// A selector initramfs straight from the store, verified against its own
 /// manifest — and NOT yet bootable.
 ///
-/// The path is private on purpose. Both provisioning helpers append the run's
-/// trusted key: `provision_selector` also binds a volume, while
-/// `provision_selector_template` leaves that identity for the live installer.
-/// Neither exposes the unprovisioned original to a caller.
+/// The path is private on purpose. Every provisioning helper appends the run's
+/// trusted key: `provision_selector` also binds a volume,
+/// `provision_selector_template` leaves that identity for the live installer,
+/// and `provision_live_selector` marks a live selector instead. None exposes
+/// the unprovisioned original to a caller.
 /// That mistake has no symptom: the machine comes up with no trust root and
 /// nothing on either side reports it. A review found four mutations of exactly
 /// that shape surviving the whole suite, which is why this is a type rather
@@ -3769,11 +3771,11 @@ pub(crate) fn provision_selector(
     destination_dir: &Path,
     trust: &RunTrust,
 ) -> Result<PathBuf, String> {
-    provision_selector_with_uuid(
+    provision_selector_as(
         selector,
         destination_dir,
         trust,
-        Some(&installation_uuid(&trust.public)),
+        SelectorRole::Installed(&installation_uuid(&trust.public)),
     )
 }
 
@@ -3783,19 +3785,40 @@ pub(crate) fn provision_selector_template(
     destination_dir: &Path,
     trust: &RunTrust,
 ) -> Result<PathBuf, String> {
-    provision_selector_with_uuid(selector, destination_dir, trust, None)
+    provision_selector_as(selector, destination_dir, trust, SelectorRole::Template)
 }
 
-fn provision_selector_with_uuid(
+/// Install media boot the deployment they carry (td-install/MEDIA.md "Live
+/// boot"): the key and the live marker, and no volume identity.
+pub(crate) fn provision_live_selector(
     selector: &VerifiedSelector,
     destination_dir: &Path,
     trust: &RunTrust,
-    uuid: Option<&str>,
 ) -> Result<PathBuf, String> {
-    let filename = if uuid.is_some() {
-        "selector-initramfs-trusted.cpio"
-    } else {
-        "selector-initramfs-template.cpio"
+    provision_selector_as(selector, destination_dir, trust, SelectorRole::Live)
+}
+
+/// What a provisioned selector boots, beyond the key every one carries.
+#[derive(Clone, Copy)]
+enum SelectorRole<'a> {
+    /// The installed volume with this UUID.
+    Installed(&'a str),
+    /// A volume td-install names when it writes the selector.
+    Template,
+    /// The deployment on the install medium it booted from.
+    Live,
+}
+
+fn provision_selector_as(
+    selector: &VerifiedSelector,
+    destination_dir: &Path,
+    trust: &RunTrust,
+    role: SelectorRole,
+) -> Result<PathBuf, String> {
+    let filename = match role {
+        SelectorRole::Installed(_) => "selector-initramfs-trusted.cpio",
+        SelectorRole::Template => "selector-initramfs-template.cpio",
+        SelectorRole::Live => "selector-initramfs-live.cpio",
     };
     let provisioned = destination_dir.join(filename);
     match fs::remove_file(&provisioned) {
@@ -3815,7 +3838,7 @@ fn provision_selector_with_uuid(
             provisioned.display()
         )
     })?;
-    append_selector_identity(&provisioned, &trust.trusted_key_line(), uuid)?;
+    append_selector_identity(&provisioned, &trust.trusted_key_line(), role)?;
     Ok(provisioned)
 }
 
@@ -3837,7 +3860,7 @@ fn provision_selector_with_uuid(
 fn append_selector_identity(
     initramfs: &Path,
     key: &[u8],
-    uuid: Option<&str>,
+    role: SelectorRole,
 ) -> Result<(), String> {
     use td_engine::cpio::{Entry, Kind};
 
@@ -3878,12 +3901,22 @@ fn append_selector_identity(
         kind: Kind::File(key),
     });
 
-    let uuid_line = uuid.map(|uuid| format!("{uuid}\n"));
+    let uuid_line = match role {
+        SelectorRole::Installed(uuid) => Some(format!("{uuid}\n")),
+        SelectorRole::Template | SelectorRole::Live => None,
+    };
     if let Some(uuid) = &uuid_line {
         entries.push(Entry {
             name: td_boot_protocol::VOLUME_UUID_PATH,
             mode: 0o644,
             kind: Kind::File(uuid.as_bytes()),
+        });
+    }
+    if matches!(role, SelectorRole::Live) {
+        entries.push(Entry {
+            name: td_boot_protocol::LIVE_MEDIA_MARKER_PATH,
+            mode: 0o644,
+            kind: Kind::File(td_boot_protocol::LIVE_MEDIA_MARKER),
         });
     }
 
@@ -9557,7 +9590,12 @@ mod tests {
         fs::set_permissions(&initramfs, fs::Permissions::from_mode(0o444)).unwrap();
 
         let trust = RunTrust::generate().unwrap();
-        append_selector_identity(&initramfs, &trust.trusted_key_line(), None).unwrap();
+        append_selector_identity(
+            &initramfs,
+            &trust.trusted_key_line(),
+            SelectorRole::Template,
+        )
+        .unwrap();
         let bytes = fs::read(&initramfs).unwrap();
 
         let members = appendix_members(&bytes, BASE_LEN);
@@ -9598,6 +9636,55 @@ mod tests {
             .expect("the key member");
         assert_eq!(key, &trust.trusted_key_line());
         assert_eq!(decode_hex_fixture::<32>(key), trust.public);
+    }
+
+    /// A live selector carries the exact marker td-boot requires and no volume
+    /// identity, which td-boot refuses in one (td-install/MEDIA.md "Live
+    /// boot"); an installed one carries the identity and no marker.
+    #[test]
+    fn only_a_live_selector_carries_the_live_marker() {
+        let seq = AtomicU64::new(2071);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        const BASE: &[u8] = b"070701selector";
+        let trust = RunTrust::generate().unwrap();
+        let uuid = installation_uuid(&trust.public);
+        for (role, wanted) in [
+            (
+                SelectorRole::Live,
+                vec![
+                    "etc",
+                    "etc/td",
+                    "etc/td/deployment.pub",
+                    "etc/td/live-media",
+                ],
+            ),
+            (
+                SelectorRole::Installed(&uuid),
+                vec![
+                    "etc",
+                    "etc/td",
+                    "etc/td/deployment.pub",
+                    "etc/td/volume-uuid",
+                ],
+            ),
+        ] {
+            let initramfs = dir.join("selector.cpio");
+            fs::write(&initramfs, BASE).unwrap();
+            append_selector_identity(&initramfs, &trust.trusted_key_line(), role).unwrap();
+            let members = appendix_members(&fs::read(&initramfs).unwrap(), BASE.len());
+            let names: Vec<&str> = members.iter().map(|(n, _, _)| n.as_str()).collect();
+            assert_eq!(names, wanted);
+            if let Some((_, _, marker)) = members.iter().find(|(n, _, _)| n == "etc/td/live-media")
+            {
+                assert_eq!(marker.as_slice(), td_boot_protocol::LIVE_MEDIA_MARKER);
+            }
+            fs::remove_file(&initramfs).unwrap();
+        }
+        assert_eq!(
+            td_boot_protocol::LIVE_MEDIA_MARKER_PATH,
+            "etc/td/live-media"
+        );
     }
 
     /// The wire format DESIGN.md §6 fixes: lowercase hex and one trailing

@@ -959,6 +959,27 @@ pub fn bundle_cli(args: &[String]) -> Result<(), String> {
     crate::checks::bundle::run(&runner, lock, &options, &source, private_out)
 }
 
+/// `build-iso`: the signed system deployment on a bootable installation ISO
+/// (td-install/MEDIA.md "Live boot").
+pub fn build_iso_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    let options = crate::checks::qemu_boot::build_iso::parse_args(args)?;
+    ensure_targets_provenance(&[STEM])?;
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let scratch_name = scratch_name("build-iso", &[STEM]);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
+    // Settled before the build, as `bundle` does: a refused destination is
+    // knowable now, and learning it after the climb is the expensive way.
+    // The ladder guard before `check_out` creates the parent directory, and
+    // again after, when a `..` beneath a new directory resolves.
+    crate::checks::bundle::check_outside_ladder(&options.out, runner.ladder_work_dir())?;
+    let admitted = crate::checks::qemu_boot::build_iso::check_out(&options)?;
+    crate::checks::bundle::check_outside_ladder(&options.out, runner.ladder_work_dir())?;
+    crate::warm::preflight(&runner, &[STEM], crate::warm::WarmMode::Explicit)?;
+    let lock = lock_ladder_for_run(&runner)?;
+    crate::checks::qemu_boot::build_iso::run(&runner, lock, &options, admitted)
+}
+
 fn bundle_usage() -> String {
     format!(
         "usage: bundle [--out DIR] [--raw] [--zlib] [--force] [--installation] [--source-origin URL] [--source-branch BRANCH]\n       \

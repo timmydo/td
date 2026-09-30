@@ -118,6 +118,45 @@ identities. Identical stable inputs produce identical ISO contents. Firmware
 and filesystem hardware compatibility still require the v2 device tests,
 including simultaneous attachment of two media with these template GUIDs.
 
+## Live installation media
+
+`./build-iso [--out FILE] [--force]`, the wrapper for `td-recipe-eval
+build-iso`, is the live profile's producer. It builds `system-x86-64`,
+verifies the deployment and selector against their build manifests, and
+generates a signing key for this run only, as `bundle` does; the medium
+carries its public half and nothing retains the seed. It signs a copy of the
+deployment manifest and writes, through the same writer as `compose-iso`:
+
+- `EFI/BOOT/BOOTX64.EFI`: the deployment's kernel;
+- `EFI/BOOT/INITRD`: the live selector, which is the stock selector with the
+  public key at `etc/td/deployment.pub` and the marker `etc/td/live-media`
+  appended, and no `etc/td/volume-uuid`;
+- the ISO root: `BZIMAGE`, `INITRAMFS.CPIO` and `ROOT.EROFS` streamed from
+  the verified store deployment, the manifest, and its new signature.
+
+The default output is `dist/td-install-x86-64.iso` in the checkout; `--out`
+names another file, relative to the caller, outside the ladder work tree
+(which `clear-store` deletes). An existing file is refused. `--force` admits
+only a regular file whose primary volume descriptor identifies a td
+installation medium, as td-boot identifies one. The image is staged as a
+hidden sibling, `.NAME.PID.partial`, which process death or a refused
+publication can leave behind; a run whose staged name is taken is refused
+before its build and never removes that file. A destination that was absent
+is published with a no-replacement hard link, so a file created there during
+the build is kept and the run fails. An admitted ISO is replaced by a rename,
+checked immediately before to be still the same file and still a td
+installation medium, under an exclusive lock on the directory that other
+build-iso runs take; if it is gone the image is linked as for an absent one,
+and otherwise it is kept. A process that ignores the lock can still replace
+the file between the check and the rename. A refused publication keeps the
+staged image and the error names it. The directory is synced after
+publication.
+
+Firmware boots the selector, which takes the "Live boot" path below. Each ISO
+has its own key, so a deployment signed for one medium does not authenticate
+under another, and an installed system's key is unrelated to the medium's.
+The medium holds no private key, no volume identity and no operator data.
+
 ## Interactive QEMU run
 
 `./test-iso ISO [--usb]` boots an existing nonempty regular ISO through OVMF
@@ -295,4 +334,4 @@ nothing on the live volume authenticates it again. A live session has no
 `td/trusted.pub` and no bundled `td/source`, so it offers no updates, and
 everything it writes is lost at power-off.
 
-Nothing provisions a live selector until the install media producer lands.
+`build-iso` ("Live installation media") provisions the live selector.

@@ -384,6 +384,47 @@ mod tests {
         }
     }
 
+    /// td-boot finds and reads an install medium by these protocol constants;
+    /// a writer that drifted from them would surface only as a live boot that
+    /// never finds its medium.
+    #[test]
+    fn the_writer_labels_and_names_what_live_boot_looks_for() {
+        use td_recipe::td_boot_protocol::{MEDIA_DEPLOYMENT_FILES, MEDIA_VOLUME_ID};
+        let image = iso9660::build(&iso9660::Volume {
+            disk_guid: gpt::Guid([0x41; 16]),
+            esp_guid: gpt::Guid([0x42; 16]),
+            esp_bytes: ESP_BYTES,
+            files: MEDIA_DEPLOYMENT_FILES
+                .iter()
+                .map(|(name, _)| iso9660::FileSpec {
+                    name: (*name).into(),
+                    len: 1,
+                })
+                .collect(),
+        })
+        .unwrap();
+        let mut names: Vec<_> = image.placements.iter().map(|p| p.name.as_str()).collect();
+        names.sort_unstable();
+        let mut expected: Vec<_> = MEDIA_DEPLOYMENT_FILES.iter().map(|(n, _)| *n).collect();
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+
+        let pvd_offset = 16 * iso9660::BLOCK;
+        let pvd = image
+            .extents
+            .iter()
+            .find(|extent| {
+                extent.offset <= pvd_offset
+                    && pvd_offset + iso9660::BLOCK <= extent.offset + extent.bytes.len() as u64
+            })
+            .unwrap();
+        let at = (pvd_offset - pvd.offset) as usize;
+        let mut label = [b' '; 32];
+        label[..MEDIA_VOLUME_ID.len()].copy_from_slice(MEDIA_VOLUME_ID.as_bytes());
+        assert_eq!(&pvd.bytes[at..at + 7], b"\x01CD001\x01");
+        assert_eq!(&pvd.bytes[at + 40..at + 72], &label);
+    }
+
     #[test]
     fn invalid_or_missing_payload_refuses_before_output_creation() {
         let scratch = Scratch::new();

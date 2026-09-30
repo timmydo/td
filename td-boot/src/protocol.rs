@@ -115,7 +115,8 @@ pub const LIVE_CMDLINE_PREFIX: &str = "td.live=";
 #[allow(dead_code)]
 pub const RAM_DISK_SIZE_PREFIX: &str = "brd.rd_size=";
 // The ISO-9660 primary volume identifier of install media. The media writer's
-// fixed label (`engine/src/iso9660.rs`) must equal it.
+// fixed label (`engine/src/iso9660.rs`) must equal it; td-recipe-eval's
+// `the_writer_labels_and_names_what_live_boot_looks_for` holds the two together.
 #[allow(dead_code)]
 pub const MEDIA_VOLUME_ID: &str = "TD_INSTALL";
 // The signed deployment's ISO root names, each paired with the deployment name

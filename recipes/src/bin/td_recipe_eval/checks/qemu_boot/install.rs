@@ -1953,8 +1953,12 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             if installations.is_empty() {
                 // Firmware cannot inject autotest tokens. Keep both stock firmware
                 // boots above and add one direct selector boot of that SAME disk.
-                let provisioned =
-                    provision_selector_with_uuid(&selector, &scratch.dir, &trust, Some(&uuid))?;
+                let provisioned = provision_selector_as(
+                    &selector,
+                    &scratch.dir,
+                    &trust,
+                    SelectorRole::Installed(&uuid),
+                )?;
                 let app_timeout = boot_timeout();
                 let tokens = format!(
                     "{AUTOTEST_CMDLINE_TOKEN} {}",

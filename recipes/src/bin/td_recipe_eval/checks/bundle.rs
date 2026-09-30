@@ -515,7 +515,7 @@ fn ensure_out_dir_under(out: &Path, force: bool, ladder_work_dir: &Path) -> Resu
     Ok(())
 }
 
-fn check_outside_ladder(out: &Path, ladder_work_dir: &Path) -> Result<(), String> {
+pub(crate) fn check_outside_ladder(out: &Path, ladder_work_dir: &Path) -> Result<(), String> {
     // A bundle inside the ladder work tree is deleted by the next
     // `clear-store`, which is a surprising way to lose a finished release
     // artifact. The same guard `run.rs` puts on its private image dir, for the
@@ -543,8 +543,8 @@ fn check_outside_ladder(out: &Path, ladder_work_dir: &Path) -> Result<(), String
     if let Some(ladder) = ladder {
         if candidate == ladder || candidate.starts_with(&ladder) {
             return Err(format!(
-                "{} is inside the ladder work tree ({}); a `clear-store` would delete the \
-                 bundle. Choose an --out outside it.",
+                "{} is inside the ladder work tree ({}); a `clear-store` would delete it. \
+                 Choose an --out outside it.",
                 out.display(),
                 ladder.display()
             ));

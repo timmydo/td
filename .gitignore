@@ -52,6 +52,7 @@ target/
 # Claude Code session runtime state — session-specific, never versioned.
 .claude/scheduled_tasks.lock
 
-# Release bundles from `./build-qcow` — host-local build output, several hundred
-# MiB of images, never versioned. Upload them to a release page instead.
+# Release bundles from `./build-qcow` and ISOs from `./build-iso` — host-local
+# build output, hundreds of MiB to GiB of images, never versioned. Upload them
+# to a release page instead.
 /dist/

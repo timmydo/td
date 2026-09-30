@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+
+case "$0" in
+    */*) start_dir=${0%/*} ;;
+    *) start_dir=. ;;
+esac
+case "${1-}" in
+    -h|--help)
+        echo 'usage: ./build-iso [--out FILE] [--force]'
+        exit 0
+        ;;
+esac
+# `--out` names a file relative to the caller, not to the checkout this enters.
+caller=$(pwd -P)
+count=$#
+out_next=
+for arg do
+    if [ -n "$out_next" ]; then
+        case "$arg" in
+            /*) ;;
+            *) arg="$caller/$arg" ;;
+        esac
+        out_next=
+    fi
+    [ "$arg" = --out ] && out_next=1
+    set -- "$@" "$arg"
+done
+shift "$count"
+cd "$start_dir"
+
+. ./host-preflight.sh
+
+exec cargo run --release --manifest-path recipes/Cargo.toml --bin td-recipe-eval -- build-iso "$@"
