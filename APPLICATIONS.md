@@ -9527,9 +9527,11 @@ compositor embeds and `td-ui`, the shared UI toolkit (`td-ui/DESIGN.md`),
 mounts once for every program that depends on it by path — the editor first
 (the way `engine/src/permissions.rs` is shared with td-jail) — and paints
 with td-ui's raster, the editor's bounded glyph painter moved into the
-toolkit, so every td-ui consumer renders the same cells from one face with
-one painter. No second font; the compositor keeps its own painters over
-that face (the terminal renderer and the attention sheet), td-ui's raster
+toolkit, so every td-ui consumer renders the same cells with one
+painter. The one face besides Unifont is td-ui's pinned outline face,
+fitted to those cells for live windows (td-ui/DESIGN.md, "The grid fit");
+the compositor keeps its own painters over the bitmap face (the terminal
+renderer and the attention sheet), td-ui's raster
 is the one every toolkit consumer shares, and td-portal's private copy
 goes when its chooser moves to td-ui.
 

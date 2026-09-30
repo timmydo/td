@@ -807,10 +807,8 @@ impl<H: Handler> App for Window<'_, H> {
         } = self;
         let presented = client.present(surface.width, surface.height, &mut |pixels| {
             let mut raster = Raster::new(pixels, font, surface, surface.width * 4)
-                .map_err(|why| why.to_string())?;
-            if let Some(face) = typeface.as_mut().and_then(|t| t.face(surface.scale)) {
-                raster = raster.with_face(face);
-            }
+                .map_err(|why| why.to_string())?
+                .with_typeface(typeface.as_mut());
             handler.paint(&mut raster, surface)
         })?;
         if presented {

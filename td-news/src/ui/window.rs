@@ -147,6 +147,9 @@ pub fn run(
         cmd_tx,
         resp_rx,
     };
-    let typeface = td_ui::pinned_face::load_or_note("td-news");
+    let typeface = td_ui::pinned_face::load_or_note(
+        "td-news",
+        std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
+    );
     td_ui::window::run(&mut session, stream, std::env::temp_dir(), typeface)
 }

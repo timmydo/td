@@ -22,9 +22,13 @@ section records the completed delivery and the scope of its evidence.
 Version 1 is one self-contained Rust executable for Linux x86-64 Wayland,
 on td and other distributions, including Guix. It uses std and the sibling
 td-ui crate, with a standalone Cargo.lock and no registry or git crates.
-The font and toolkit are compiled in. It requires no td daemon, systemd,
-external commands, libwayland, shell, runtime asset lookup, or fixed store
-prefix. A host build uses the host Rust toolchain and declared linker;
+The bitmap font and toolkit are compiled in. Its one runtime asset is
+optional: the live window reads td-ui's pinned outline face from
+`/etc/fonts/jetbrains-mono-nerd` and, where that is absent (as on a
+distribution that does not ship it) or `TD_UI_FACE=bitmap`, draws with the
+compiled font. It requires no td daemon, systemd, external commands,
+libwayland, shell, or fixed store prefix. A host build uses the host Rust
+toolchain and declared linker;
 a shipped td build follows the source-built target graph. Self-contained
 does not promise that a dynamically linked host build works with another
 distribution's dynamic loader: host packaging may build for its own libc.
@@ -38,7 +42,8 @@ cargo build --offline --release --manifest-path td-taskmgr/Cargo.toml
 Build from a checkout containing td-ui and its declared shared source and
 font trees. The installed executable does not need that checkout. The
 application reads WAYLAND_SOCKET, WAYLAND_DISPLAY and XDG_RUNTIME_DIR and
-passes their values to td-ui's endpoint resolver; td-ui reads no environment.
+passes their values to td-ui's endpoint resolver, and TD_UI_FACE and passes
+its value to td-ui's `pinned_face`; td-ui reads no environment.
 The user runs the program
 as their desktop identity. Missing display support produces a useful startup
 diagnostic; unavailable metrics leave a usable window with field-level
@@ -464,8 +469,8 @@ The dependency-free crate currently offers `--sample [COUNT]` with
 unavailable first-interval rates are printed explicitly. The command is a
 read-only backend probe. It does not open a window, send signals or claim td
 image integration. The default invocation opens the Wayland window using
-td-ui and its compiled font. Process controls use the desktop caller's
-existing authority.
+td-ui, in its pinned outline face or its compiled font. Process controls
+use the desktop caller's existing authority.
 
 `parsers` takes bounded bytes and explicit units. `linux_read` owns one
 charged reusable source buffer, descriptor-relative process-file reads and
@@ -578,7 +583,7 @@ and inspections older than the plot. F10/Shift+F10 and the Process actions
 button open the selected process menu. Right-clicking a tree row first
 selects that captured row, then opens its menu.
 
-`window` owns the Wayland transport, compiled font, collection worker and
+`window` owns the Wayland transport, the fonts, collection worker and
 optional control transport. It polls the latest collection handoff at most
 once per 50 ms dispatch interval, independently of presentation callbacks;
 one dirty flag coalesces paints and td-ui enforces buffer/frame bounds.

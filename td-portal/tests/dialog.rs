@@ -405,6 +405,7 @@ fn dialog_presents_pixels_and_accepts_a_physical_return() {
         accept_label: None,
         filter: None,
         connector: Arc::new(AtomicBool::new(false)),
+        typeface: None,
     };
     spawn(config, move |notice| {
         sender

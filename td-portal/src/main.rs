@@ -1187,6 +1187,10 @@ fn serve(
         .map_err(|error| io::Error::other(format!("start portal owner audit: {error}")))?;
     let mut state = ServiceState {
         application_policy: Some(application_policy),
+        typeface: td_ui::pinned_face::load_or_note(
+            "td-portal",
+            std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
+        ),
         ..ServiceState::default()
     };
     // Calls can precede the reply that grants our public name.
@@ -1264,6 +1268,9 @@ struct ServiceState {
     pending_audits: BTreeMap<u32, String>,
     active: BTreeMap<String, ActiveDialog>,
     connector: Arc<AtomicBool>,
+    /// The outline face, read once at startup; each dialog draws with its
+    /// own copy.
+    typeface: Option<td_ui::typeface::Typeface>,
 }
 
 fn consume_bus_frame(
@@ -1656,6 +1663,7 @@ fn consume_identity_reply(
         accept_label: pending.accept_label,
         filter: pending.filter,
         connector: state.connector.clone(),
+        typeface: state.typeface.clone(),
     };
     let event_sender = events.clone();
     let event_path = path.clone();

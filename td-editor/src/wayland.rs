@@ -61,6 +61,9 @@ struct Window {
     client: Client<Object>,
     ui: Controller,
     font: Font,
+    /// The outline face a live window draws its text in; `None` draws the
+    /// bitmap face, as every test and preview does.
+    typeface: Option<td_ui::typeface::Typeface>,
     labels: Vec<(crate::model::TabId, &'static str)>,
     pointer: Pointer,
     control_pointer: Option<crate::model::RevisionPoint>,
@@ -299,6 +302,7 @@ impl Window {
             client: Client::new(stream, temporary)?,
             ui,
             font: crate::font::pinned()?,
+            typeface: None,
             labels: vec![(first, "Scratch (no save)"), (second, "Second tab")],
             pointer: Pointer::default(),
             control_pointer: None,
@@ -2916,13 +2920,15 @@ impl Window {
             client,
             ui,
             font,
+            typeface,
             spelling,
             menu,
             ..
         } = self;
         let presented = client.present(width, height, &mut |pixels| {
-            let mut raster =
-                Raster::new(pixels, font, geometry.surface(), width * 4).map_err(error)?;
+            let mut raster = Raster::new(pixels, font, geometry.surface(), width * 4)
+                .map_err(error)?
+                .with_typeface(typeface.as_mut());
             raster
                 .paint(
                     &ui.scene(&labels)
@@ -5062,6 +5068,10 @@ pub fn preview_with_profile(profile: Profile) -> io::Result<()> {
         )?;
         let stream = connect(endpoint)?;
         let mut window = Window::new(stream, std::env::temp_dir())?;
+        window.typeface = td_ui::pinned_face::load_or_note(
+            "td-editor",
+            std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
+        );
         window.ui.dispatch(Event::Profile(profile)).map_err(error)?;
         run(&mut window)
     };
@@ -5128,6 +5138,10 @@ pub fn file_window(options: FileWindowOptions) -> io::Result<()> {
             std::env::var_os("XDG_RUNTIME_DIR"),
         )?;
         let mut window = Window::new(connect(endpoint)?, std::env::temp_dir())?;
+        window.typeface = td_ui::pinned_face::load_or_note(
+            "td-editor",
+            std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
+        );
         window.ui = ui;
         window.labels.clear();
         let dictionary_notice = spelling.dictionary_entries().map_or_else(

@@ -26,6 +26,8 @@ impl Tag for Object {
 struct Window {
     client: Client<Object>,
     font: Font,
+    /// The outline face the live window draws its text in.
+    typeface: Option<td_ui::typeface::Typeface>,
     state: State,
     worker: Option<Worker>,
     actions: Option<td_taskmgr::action_worker::Worker>,
@@ -66,6 +68,7 @@ impl Window {
         Ok(Self {
             client: Client::new(stream, temporary)?,
             font: td_ui::font::pinned()?,
+            typeface: None,
             state,
             worker,
             actions,
@@ -331,11 +334,13 @@ impl App for Window {
         let surface = self.state.surface();
         let state = &self.state;
         let font = &self.font;
+        let typeface = &mut self.typeface;
         if self
             .client
             .present(surface.width, surface.height, &mut |pixels| {
-                let mut raster =
-                    Raster::new(pixels, font, surface, surface.width * 4).map_err(error)?;
+                let mut raster = Raster::new(pixels, font, surface, surface.width * 4)
+                    .map_err(error)?
+                    .with_typeface(typeface.as_mut());
                 state.emit(surface.bounds(), &mut |draw| raster.draw(draw));
                 Ok(())
             })?
@@ -363,6 +368,10 @@ pub fn open(control_path: Option<PathBuf>) -> io::Result<()> {
         )?;
         let stream = td_ui::wayland::connect(endpoint)?;
         let mut window = Window::new(stream, std::env::temp_dir(), control)?;
+        window.typeface = td_ui::pinned_face::load_or_note(
+            "td-taskmgr",
+            std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
+        );
         td_ui::client::run(&mut window)
     };
     work().map_err(io::Error::other)

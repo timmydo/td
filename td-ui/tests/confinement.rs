@@ -227,7 +227,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
         }
         if name == "notices.rs" {
             // Data, not code: three embedded texts from the assets directory
-            // beside the face, and nothing else.
+            // beside the face, the outline face's pointer, and nothing else.
             let items: Vec<&str> = text
                 .lines()
                 .filter(|line| !line.is_empty() && !line.starts_with("//"))
@@ -239,8 +239,9 @@ fn source_inventory_and_shared_mounts_are_closed() {
                     format!("pub const FONT_PROVENANCE: &str = {assets}PROVENANCE\");"),
                     format!("pub const FONT_COPYING: &str = {assets}unifont-COPYING\");"),
                     format!("pub const FONT_LICENSE: &str = {assets}unifont-OFL-1.1.txt\");"),
+                    "pub const OUTLINE_FACE: &str = \"The outline face is JetBrains Mono Nerd Font Mono from the Nerd Fonts v3.5.1 release, read from /etc/fonts/jetbrains-mono-nerd, where its licences ship beside it: OFL.txt, README.md (each merged icon set and its licence) and licenses/.\\n\";".to_string(),
                 ],
-                "notices carry the three texts beside the face and nothing else"
+                "notices carry the three texts beside the face, the outline pointer and nothing else"
             );
         }
         if name == "finder.rs" {

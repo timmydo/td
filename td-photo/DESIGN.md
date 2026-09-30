@@ -54,7 +54,8 @@ publishing the finished temporary by a hard link so a name that appeared
 meanwhile is not replaced either; the sidecar is the one file td-photo
 replaces, and only through its own temporary. The crate depends on
 td-ui, by path, for the driven seam, the raster and bands the scene is laid out
-with and the Wayland client the window runs on; the window's develop mode
+with, the pinned outline face the live window draws its text in and the
+Wayland client the window runs on; the window's develop mode
 lands over its own slices: the mode, its keys and the develop edits over the
 seam and the socket are in, as are the developed preview and the crop drag
 with its edge and corner handles and the look palette; the `export` verb and

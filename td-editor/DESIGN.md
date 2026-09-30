@@ -962,8 +962,13 @@ without usable GPU access; it does not satisfy the GPU-acceleration objective
 by itself. Layout emits clipped solid rectangles and bitmap-glyph draws with
 integer coordinates, foreground/background colors and scale 1, 2, 3 or 4.
 Font scale defaults to 1 and is user-selectable. Each backend consumes those
-same operations. No font discovery, outline rasterization, subpixel
-antialiasing or fractional scaling is part of version 1. The fixed medium
+same operations. No font discovery, subpixel antialiasing or fractional
+scaling is part of version 1. The live windows draw their text through
+td-ui's pinned outline face fitted to the same grid (td-ui/DESIGN.md,
+"The grid fit"), falling back to Unifont; the reference backend, its
+oracles and the still-image `--preview` stay on Unifont, and so does a
+window started with `TD_UI_FACE=bitmap`, as the native harness starts
+it. The fixed medium
 bitmap weight below adds one explicitly shaded edge; it does not smooth or
 resample the original glyph. A frame uses one scale throughout.
 
@@ -1025,8 +1030,10 @@ The backend accepts only 8x16 fonts and integer scales 1–4. The
 font is decoded once by the caller and borrowed; the production face and
 parser are the compositor's existing source modules, reached through td-ui.
 `--font-license` prints the provenance, COPYING and OFL notices
-`td_ui::notices` embeds from the same assets directory. No host font search
-or new font input is introduced. The source recipe must stage these five
+`td_ui::notices` embeds from the same assets directory, then where the
+outline face and its notices ship. No host font search is introduced; the
+live window's one runtime font input is that pinned file, read by td-ui's
+`pinned_face`. The source recipe must stage these five
 repository-relative inputs, keeping their paths exactly as in the checkout —
 all five relative to `td-ui/src`, where td-ui mounts the two sources and
 embeds the three notices:
@@ -3085,7 +3092,8 @@ snapshots must name the expected tab/revision and dimensions. Capture is
 bracketed by a stable positive client publication newer than the pre-input
 snapshot, with matching session/window/client and completed-output bounds.
 The document prefix at output (8,72) must match Aone, Abone, then Aone
-painted with the pinned Unifont and existing editor raster, excluding only
+painted with the pinned Unifont and existing editor raster (the harness
+starts the editor with `TD_UI_FACE=bitmap`), excluding only
 the one-pixel blinking caret column when it falls within that prefix.
 This is a shared-font/raster oracle
 for actual transported pixels, not an independent test of the font painter.

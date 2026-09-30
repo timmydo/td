@@ -88,6 +88,7 @@ fn source_inventory_and_parser_boundary_are_closed() {
             "td_ui::client",
             "td_ui::control_socket",
             "td_ui::control_worker",
+            "td_ui::pinned_face",
         ] {
             assert!(!source.contains(denied), "{name}: {denied}");
         }

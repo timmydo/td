@@ -127,8 +127,15 @@ Newly built (increment 20): `Face::fit`, which fits an outline face to the
 bitmap grid's cell; `typeface`, the style bytes and a face fitted at the
 current scale; `pinned_face`, which reads the pinned face; and the widget
 window's typeface, through which td-news and td-mail draw their text
-(see "The grid fit" below). The programs with their own windows follow
-in increment 21.
+(see "The grid fit" below).
+
+Newly built (increment 21): the programs with their own windows take the
+face for their live windows too, through `Raster::with_typeface`:
+td-editor's file window and window preview, td-setup, the portal's file
+chooser (`DialogConfig::typeface`, read once when the service starts),
+td-photo and the task manager. Their still-image `--preview` output,
+`--render-check` and in-process tests stay on the bitmap face, and each
+`--font-license` output names where the outline face's notices ship.
 
 ## Purpose and trust position
 
@@ -216,7 +223,9 @@ of its own files may name each module.
   inside a damage rectangle; `Raster::new` validates surface, font, stride and
   buffer before any write, and `Raster::paint` refuses a composition laid out
   for another surface. `Raster::with_face` lends the raster an outline
-  `face::Face`, through which it executes every `Glyph` from then on.
+  `face::Face`, through which it executes every `Glyph` from then on;
+  `Raster::with_typeface` lends it a `typeface::Typeface`'s face at the
+  raster's scale, or leaves the bitmap face when it has none.
   The behavioural contract (clipping, the medium fringe,
   scrollbar proportions and drag rounding) is the one td-editor/DESIGN.md
   records under "Implemented reference-renderer contract"; that text moves here
@@ -251,8 +260,11 @@ of its own files may name each module.
   optional bold style's, refused as a face fitted to the grid's cell at
   scale one is; `face` at a `Scale`, refitted when the scale changes).
 - `pinned_face`: `DIR` and `REGULAR`, where the pinned face is; `load`
-  and `load_from` a directory, and `load_or_note`, which says on
-  standard error why a program draws with Unifont instead.
+  and `load_from` a directory; `SETTING` (`TD_UI_FACE`), the variable
+  whose value a consumer passes; and `load_or_note` and
+  `load_from_or_note` a directory, which take that value, draw with
+  Unifont without reading anything when it is `bitmap`, and otherwise
+  say on standard error why a program draws with Unifont instead.
 - `hint`: the hint face, a hand-authored 4x5 glyph (`WIDTH`, `HEIGHT`,
   `ADVANCE` 5) per printable ASCII scalar, `glyph` and the pixel `width`
   of a text; a scalar it lacks is a box. It is the small lighter text a
@@ -316,7 +328,8 @@ of its own files may name each module.
   and its `--preview` stays byte-identical.
 - `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
   texts beside the face in `td-compositor/assets`, embedded at compile
-  time for a program's `--font-license` output.
+  time for a program's `--font-license` output, and `OUTLINE_FACE`, one
+  literal naming the outline face and where its notices ship.
 - `open`: `link`, which starts the browser on one whole link,
   `link_on`, the same on a display the caller names, `url`, the same on
   a URL a program lists from markup, and `file`, the same on a local
@@ -837,8 +850,9 @@ not frames, and stays its own).
 
 - Pure modules read no environment, clock, descriptor or filesystem.
   Adapters pass explicit ticks in milliseconds and explicit byte inputs.
-  Outside the pure set are `notices` (three `include_str!` constants and
-  nothing else), the transport pair `wayland` and `sys`, which own the
+  Outside the pure set are `notices` (three `include_str!` constants, one
+  literal, and nothing else), the transport pair `wayland` and `sys`, which
+  own the
   stream, its deadlines and the pool files in the directory a consumer
   names, `client`, whose `run` reads the monotonic clock for the
   consumer's ticks and whose buffers are those pool files, and the three
@@ -1141,10 +1155,13 @@ between two cells, an integral advance centred to the pixel, a tall line
 box leaning up centred with its baseline below the cell, and a scalar the
 face lacks equal to the bitmap raster's own draw at scales one to four.
 `tests/typeface.rs` holds the face fitted at each scale, kept while the
-scale holds and replaced when it changes, the typeface's refusals, and the
-loader over a directory the test writes: the regular style read, and a
-missing file, a file past the reader's bound (refused before it is read),
-a refused font and a directory each an error naming the path.
+scale holds and replaced when it changes, the typeface's refusals, a
+raster given a typeface drawing exactly as one given the face fitted at
+its scale, at two scales in turn, the `notices` literal naming the
+directory the loader reads, and the loader over a directory the test
+writes: the regular style read, and a missing file, a file past the
+reader's bound (refused before it is read), a refused font and a
+directory each an error naming the path.
 
 `tests/chrome.rs` holds the band oracles, draw-stream checks that read each
 band's fills and glyphs: the menu bar's fill, its labels from cell
@@ -1234,21 +1251,21 @@ editor keeps its transfer, request and control coverage and its reactions to
 the client's device and clipboard outcomes.
 
 `tests/confinement.rs` pins the source inventory, the exact three shared
-source mounts, the absence of ambient I/O in pure modules, that `notices` is
-three embedded texts and nothing else, the absence of `include!`, `cfg_attr`
-and any dependency declaration, that the shared sources bind no input
-interface, and the raw layer: the complete fingerprint of `sys.rs`, its
-syscall and flag values, its two function-only allowances, the single
-instruction and adoption sites, that the crate root denies `unsafe` and
-declares the module private, that `wayland` and `clipboard` are its only
-callers, the transport through exactly five wrapper calls (the poll
-over two readable-only entries among them) and the
-clipboard's destination owner through exactly five status calls, that no
-production module calls the client's
+source mounts, the absence of ambient I/O in pure modules, that `notices`
+is three embedded texts and the outline face's literal and nothing else,
+the absence of `include!`, `cfg_attr` and any dependency declaration, that
+the shared sources bind no input interface, and the raw layer: the
+complete fingerprint of `sys.rs`, its syscall and flag values, its two
+function-only allowances, the single instruction and adoption sites, that
+the crate root denies `unsafe` and declares the module private, that
+`wayland` and `clipboard` are its only callers, the transport through
+exactly five wrapper calls (the poll over two readable-only entries among
+them) and the clipboard's destination owner through exactly five status
+calls, that no production module calls the client's
 test support (`unconfigure`, `input_mut`), and that the client is the
-toolkit's one consumer of a received right, through the pinned keymap reader
-with its format, size and regular-file checks and the send that hands its
-right on.
+toolkit's one consumer of a received right, through the pinned keymap
+reader with its format, size and regular-file checks and the send that
+hands its right on.
 
 `control`'s in-file tests are td-editor's framing tests moved: every frame
 split and single-byte delivery, truncation, zero/oversized/trailing frames,
@@ -2032,10 +2049,11 @@ copy of a widget is an acceptable completion of this work.
 
 ## Outline faces and the glyph atlas
 
-Every td-ui consumer and td-term draw text from one bitmap face: Unifont's
-8x16 cells, pixel-doubled at scales above one. This section adds a second
-kind of face, a TrueType outline covered with antialiasing at the
-surface's own pixel size. The first such face is JetBrains Mono Nerd Font.
+Before this section every td-ui consumer and td-term drew text from one
+bitmap face: Unifont's 8x16 cells, pixel-doubled at scales above one. This
+section adds a second kind of face, a TrueType outline covered with
+antialiasing at the surface's own pixel size. The first such face is
+JetBrains Mono Nerd Font.
 The bitmap face stays as the fallback and as the face of the compositor's
 own chrome. The work is ordered so that a GPU backend, when td has one,
 reuses the same model as the CPU raster (see "The GPU path" below).
@@ -2240,11 +2258,17 @@ at the scale asked for, refitting when it changes, so one atlas is held.
 `pinned_face::load` reads the regular style from
 `/etc/fonts/jetbrains-mono-nerd`, the only one the draw stream selects;
 the bold file ships for td-term's bold weight. A program calls
-`load_or_note` at startup: on any failure it says once on standard error
-that the program draws with Unifont, and the program starts. Tests and
-previews never load it. The face reaches a window only when handed to it
-(`window::run`'s typeface, `Window::with_typeface`), so every existing
-oracle and `--preview` checksum stays on the bitmap face.
+`load_or_note` at startup with the value of `TD_UI_FACE`, which it reads
+as it reads the Wayland endpoint's variables: `bitmap` keeps it on
+Unifont without reading anything; otherwise, on any failure it says once
+on standard error that the program draws with Unifont, and the program
+starts. In-process tests and still-image previews never load it. The
+face reaches a window only when handed to it (`window::run`'s typeface,
+`Window::with_typeface`), so every in-process oracle and `--preview`
+checksum stays on the bitmap face, and each native-compositor harness
+starts its live window with `TD_UI_FACE=bitmap`, so its captured frames
+match those oracles on a machine that has the face as on one that does
+not.
 
 ### Runtime cells
 
@@ -2499,7 +2523,7 @@ regressions. Those increments extend the original sequence below.
 21. The other consumers on the grid fit: td-editor's window, td-setup,
     the file chooser, td-photo and the task manager load the pinned face
     for their live windows, and their `--font-license` output names
-    where its notices are.
+    where its notices are. Landed.
 22. td-term on td-ui: the compositor's recipe stages td-ui, and td-term's
     cell painter moves onto a face fitted to its grid, with the
     attribute mapping above. Its PPM oracles stay on the bitmap face.

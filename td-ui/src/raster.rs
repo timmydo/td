@@ -12,6 +12,7 @@ use crate::atlas::{Entry, Slot, Style, PAGE_WIDTH};
 use crate::face::Face;
 use crate::font::Font;
 use crate::hint;
+use crate::typeface::Typeface;
 use crate::{CELL_HEIGHT, CELL_WIDTH};
 
 pub const MAX_AXIS: usize = 8192;
@@ -507,6 +508,17 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
     pub fn with_face(mut self, face: &'font mut Face) -> Self {
         self.face = Some(face);
         self
+    }
+
+    /// `with_face` through `typeface`'s face fitted to the grid at this
+    /// raster's scale; the bitmap face still draws when there is no
+    /// typeface or the fit is refused.
+    pub fn with_typeface(self, typeface: Option<&'font mut Typeface>) -> Self {
+        let scale = self.surface.scale;
+        match typeface.and_then(|typeface| typeface.face(scale)) {
+            Some(face) => self.with_face(face),
+            None => self,
+        }
     }
 
     /// Paints a composition laid out for this exact surface; a mismatch is

@@ -17,9 +17,10 @@ use crate::{CELL_HEIGHT, CELL_WIDTH};
 pub struct Typeface {
     regular: Arc<[u8]>,
     bold: Option<Arc<[u8]>>,
-    /// The face fitted at the scale last asked for, and that scale; another
-    /// scale's replaces it, so one atlas is held.
-    face: (usize, Face),
+    /// The face fitted at the scale last asked for, or its refusal, and
+    /// that scale; another scale's replaces it, so one atlas is held and a
+    /// refused fit is not retried until the scale changes.
+    face: (usize, Option<Face>),
 }
 
 impl Typeface {
@@ -32,7 +33,7 @@ impl Typeface {
         Ok(Self {
             regular,
             bold,
-            face: (1, face),
+            face: (1, Some(face)),
         })
     }
 
@@ -47,9 +48,9 @@ impl Typeface {
                 CELL_WIDTH.saturating_mul(scale),
                 CELL_HEIGHT.saturating_mul(scale),
             )
-            .ok()?;
+            .ok();
             self.face = (scale, face);
         }
-        Some(&mut self.face.1)
+        self.face.1.as_mut()
     }
 }

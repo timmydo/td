@@ -42,10 +42,11 @@ fn source_inventory_and_toolkit_access_are_closed() {
         assert!(entry.file_type().unwrap().is_file(), "no nested source");
         let name = entry.file_name().into_string().unwrap();
         let text = std::fs::read_to_string(entry.path()).unwrap();
-        // Only `window` reaches the live client; every other file, the pages
-        // included, stays off the transport and the turn loop.
+        // Only `window` reaches the live client and reads the outline
+        // face; every other file, the pages included, stays off the
+        // transport, the turn loop and the filesystem.
         if name != "window.rs" {
-            for module in ["td_ui::wayland", "td_ui::client"] {
+            for module in ["td_ui::wayland", "td_ui::client", "td_ui::pinned_face"] {
                 assert!(
                     !text.contains(module),
                     "{name} names {module}; only window may"

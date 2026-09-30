@@ -100,6 +100,10 @@ pub fn open(rest: &[OsString]) -> Result<()> {
     let stream = connect(endpoint).map_err(|why| format!("Wayland {name}: {why}; see --help"))?;
     let control = socket.map(Worker::start).transpose().map_err(error)?;
     let mut window = Window::new(stream, std::env::temp_dir(), session, control)?;
+    window.typeface = td_ui::pinned_face::load_or_note(
+        "td-photo",
+        std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
+    );
     let result = run(&mut window);
     window.finish(result)
 }
@@ -1445,6 +1449,8 @@ impl Memo {
 struct Window {
     client: Client<Object>,
     font: Font,
+    /// The outline face the live window draws its text in.
+    typeface: Option<td_ui::typeface::Typeface>,
     session: Session,
     pool: Pool,
     /// The roll and the scale the held thumbnails are for: another roll's,
@@ -1541,6 +1547,7 @@ impl Window {
         Ok(Window {
             client: Client::new(stream, temporary)?,
             font: td_ui::font::pinned()?,
+            typeface: None,
             session,
             pool: Pool::start(threads())?,
             held: None,
@@ -2451,6 +2458,7 @@ impl Window {
         let Window {
             client,
             font,
+            typeface,
             session,
             thumbs,
             developed,
@@ -2480,6 +2488,7 @@ impl Window {
         let submitted = client.present(surface.width, surface.height, &mut |pixels| {
             Raster::new(pixels, font, surface, stride)
                 .map_err(error)?
+                .with_typeface(typeface.as_mut())
                 .paint(&scene, surface.bounds())
                 .map_err(error)?;
             for (index, r#box) in &visible {
@@ -2511,12 +2520,14 @@ impl Window {
             // badge that runs under it.
             Raster::new(pixels, font, surface, stride)
                 .map_err(error)?
+                .with_typeface(typeface.as_mut())
                 .paint(&badges, area)
                 .map_err(error)?;
             // The crop marquee over the develop image, as the badges are
             // painted over the thumbnails.
             Raster::new(pixels, font, surface, stride)
                 .map_err(error)?
+                .with_typeface(typeface.as_mut())
                 .paint(&marquee, area)
                 .map_err(error)
         })?;

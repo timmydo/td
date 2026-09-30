@@ -33,12 +33,13 @@ fn run() -> io::Result<()> {
         if args.next().is_some() {
             return Err(io::Error::other("unexpected argument"));
         }
-        return writeln!(
+        return write!(
             io::stdout().lock(),
-            "{}\n{}\n{}",
+            "{}\n{}\n{}\n{}",
             td_ui::notices::FONT_PROVENANCE,
             td_ui::notices::FONT_COPYING,
-            td_ui::notices::FONT_LICENSE
+            td_ui::notices::FONT_LICENSE,
+            td_ui::notices::OUTLINE_FACE
         );
     }
     if command.as_deref() == Some("--preview") {

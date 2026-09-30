@@ -309,8 +309,10 @@ fn the_toolkit_is_named_only_where_the_design_says() {
             "driven",
             "font",
             "keyboard",
+            "pinned_face",
             "pointer",
             "raster",
+            "typeface",
             "wayland",
             "wire",
         ])

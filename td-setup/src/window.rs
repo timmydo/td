@@ -38,6 +38,8 @@ impl Tag for Object {
 struct Window {
     client: Client<Object>,
     font: Font,
+    /// The outline face the live window draws its text in.
+    typeface: Option<td_ui::typeface::Typeface>,
     size: (usize, usize),
     dirty: bool,
     page: Page,
@@ -72,6 +74,7 @@ impl Window {
         Ok(Self {
             client: Client::new(stream, temporary)?,
             font: td_ui::font::pinned()?,
+            typeface: None,
             size: DEFAULT_SIZE,
             dirty: true,
             page: Page::Welcome,
@@ -148,10 +151,16 @@ impl Window {
         let (width, height) = self.size;
         let surface = Surface::new(width, height, Scale::new(1).map_err(error)?).map_err(error)?;
         let Window {
-            client, font, page, ..
+            client,
+            font,
+            typeface,
+            page,
+            ..
         } = self;
         let presented = client.present(width, height, &mut |pixels| {
-            let mut raster = Raster::new(pixels, font, surface, width * 4).map_err(error)?;
+            let mut raster = Raster::new(pixels, font, surface, width * 4)
+                .map_err(error)?
+                .with_typeface(typeface.as_mut());
             let painted = match page {
                 Page::Welcome => Welcome::new(surface)
                     .map(|view| raster.paint(&view, surface.bounds()).map_err(error)),
@@ -222,6 +231,10 @@ pub fn run_window() -> std::io::Result<()> {
         )?;
         let stream = connect(endpoint)?;
         let mut window = Window::new(stream, std::env::temp_dir())?;
+        window.typeface = td_ui::pinned_face::load_or_note(
+            "td-setup",
+            std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
+        );
         run(&mut window)
     };
     work().map_err(std::io::Error::other)

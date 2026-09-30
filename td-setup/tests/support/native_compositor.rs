@@ -294,6 +294,7 @@ impl SetupProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap())
+            .env("TD_UI_FACE", "bitmap")
             .spawn()
             .unwrap();
         Self { child, log }

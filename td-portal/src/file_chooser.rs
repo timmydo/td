@@ -339,6 +339,17 @@ impl Chooser {
     /// when it is not the configured one; a viewport under the minimum is
     /// painted on the padded surface and clipped to its top-left corner.
     pub fn render_sized(&mut self, width: usize, height: usize) -> Result<Vec<u8>, String> {
+        self.render_in(width, height, None)
+    }
+
+    /// `render_sized` with its text through `typeface`'s outline face when
+    /// given one, as the live dialog draws it.
+    pub fn render_in(
+        &mut self,
+        width: usize,
+        height: usize,
+        mut typeface: Option<&mut td_ui::typeface::Typeface>,
+    ) -> Result<Vec<u8>, String> {
         if (width, height) != self.viewport {
             self.set_viewport(width, height)?;
         }
@@ -356,6 +367,7 @@ impl Chooser {
                 width.saturating_mul(BYTES_PER_PIXEL),
             )
             .map_err(|error| format!("file chooser raster: {error}"))?
+            .with_typeface(typeface.as_deref_mut())
             .paint(&view, surface.bounds())
             .map_err(|error| format!("file chooser paint: {error}"))?;
             return Ok(pixels);
@@ -364,6 +376,7 @@ impl Chooser {
         let mut padded = vec![0u8; padded_stride.saturating_mul(surface.height)];
         Raster::new(&mut padded, &self.font, surface, padded_stride)
             .map_err(|error| format!("file chooser raster: {error}"))?
+            .with_typeface(typeface)
             .paint(&view, surface.bounds())
             .map_err(|error| format!("file chooser paint: {error}"))?;
         let stride = width.saturating_mul(BYTES_PER_PIXEL);

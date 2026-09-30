@@ -650,6 +650,7 @@ fn native_minibuffer_keeps_document_visible_and_pages_large_completions() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .env("TD_UI_FACE", "bitmap")
             .spawn()
             .unwrap();
         let mut editor = EditorProcess {
@@ -890,6 +891,7 @@ fn native_path_completion_lists_cycles_and_opens_literal_relative_file() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .env("TD_UI_FACE", "bitmap")
             .spawn()
             .unwrap();
         let mut editor = EditorProcess {
@@ -1012,6 +1014,7 @@ fn ordinary_invocation_keeps_foreground_lifetime_and_inherited_stdin() {
         .stdin(Stdio::from(inherited.try_clone().unwrap()))
         .stdout(Stdio::from(std::fs::File::create(&output).unwrap()))
         .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+        .env("TD_UI_FACE", "bitmap")
         .spawn()
         .unwrap();
     let mut editor = EditorProcess {

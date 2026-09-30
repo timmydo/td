@@ -717,6 +717,7 @@ fn the_real_binary_exposes_a_deterministic_preview_and_its_font_notices() {
     let notices = String::from_utf8(output.stdout).unwrap();
     assert!(notices.contains("SIL OPEN FONT LICENSE Version 1.1"));
     assert!(notices.contains("64019ab811067e03a8de5990d2e6f23dcec5418e5a90caa5e5666b0524156732"));
+    assert!(notices.contains("/etc/fonts/jetbrains-mono-nerd"));
 }
 
 #[test]

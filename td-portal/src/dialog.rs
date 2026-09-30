@@ -99,6 +99,9 @@ pub struct DialogConfig {
     pub accept_label: Option<String>,
     pub filter: Option<FileFilter>,
     pub connector: Arc<AtomicBool>,
+    /// The outline face the dialog draws its text in; `None` draws the
+    /// bitmap face.
+    pub typeface: Option<td_ui::typeface::Typeface>,
 }
 
 /// The dialog's own objects in the shared client's table: the privileged
@@ -126,6 +129,7 @@ impl Tag for Object {
 struct Dialog<'a, F: Fn(Notice) -> Result<()>> {
     client: Client<Object>,
     chooser: Chooser,
+    typeface: Option<td_ui::typeface::Typeface>,
     window_title: String,
     parent_handle: String,
     notice: &'a F,
@@ -183,6 +187,7 @@ impl<'a, F: Fn(Notice) -> Result<()>> Dialog<'a, F> {
         Ok(Self {
             client,
             chooser,
+            typeface: config.typeface,
             window_title,
             parent_handle: config.parent_handle,
             notice,
@@ -337,10 +342,13 @@ impl<'a, F: Fn(Notice) -> Result<()>> Dialog<'a, F> {
         let (width, height) = self.size;
         let mut checksum = 0u64;
         let Dialog {
-            client, chooser, ..
+            client,
+            chooser,
+            typeface,
+            ..
         } = self;
         let presented = client.present(width, height, &mut |pixels| {
-            let frame = chooser.render_sized(width, height)?;
+            let frame = chooser.render_in(width, height, typeface.as_mut())?;
             if frame.len() != pixels.len() {
                 return Err(format!(
                     "chooser rendered {} bytes for a {}-byte {width}x{height} surface",
@@ -799,6 +807,7 @@ mod tests {
             accept_label: None,
             filter: None,
             connector: Arc::new(AtomicBool::new(false)),
+            typeface: None,
         }
     }
 

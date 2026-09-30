@@ -560,6 +560,7 @@ impl EditorProcess {
             .env("WAYLAND_DISPLAY", display)
             .env("XDG_RUNTIME_DIR", &directory.0)
             .env("TMPDIR", &directory.0)
+            .env("TD_UI_FACE", "bitmap")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap());
