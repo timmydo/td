@@ -886,6 +886,13 @@ Implement the remaining work as independently reviewable increments:
     both ways. Warm retention is checked while allocation calls remain visible.
     Other versions, mTLS, adversarial/maximal inputs and RSS remain pending.
 
+  - **M07e3c — entropy worker lifetime observations:** separate counter
+    processes observe eight test workers before RNG use, after warming one
+    then all workers, after repeated fills, and after explicit joins and
+    scope teardown. Warm fills require unchanged counters. Shared provider
+    retention, stack mappings and whole-process RSS remain separate; this
+    diagnostic does not activate production workers or amend the ledger.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,

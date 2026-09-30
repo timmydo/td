@@ -796,3 +796,32 @@ peak reset, and no attempt to sum overlapping counter domains. The fixture does
 not cover TLS 1.2, mTLS, maximal certificate chains, maximum configuration,
 concurrent workers, malicious peers, stalled sockets, process RSS or stack
 ceilings. It neither changes the resource ledger nor activates the service.
+
+## Entropy worker lifetime observations
+
+Each counter domain also runs `--entropy-workers` in a fresh process after
+its forwarding controls. Eight test workers request 240 KiB stacks, announce
+startup, and wait without allocating. One worker initializes SystemEntropy
+and fills 32 bytes; the remaining seven then do the same. All workers perform
+64 further fills before waiting again. The observer requires every counter
+to remain unchanged across those warmed fills. Native cold initialization
+must increase malloc or calloc calls. Only after taking the repeated snapshot
+does the main thread release and explicitly join every worker, including
+thread-local destructors. A final snapshot follows scope teardown.
+
+The seven phases are baseline, spawned, first_warm, all_warm, repeated, joined
+and dropped. Fixed snapshot arrays are formatted after teardown; prefixes are
+`tls-rust-entropy` and `tls-native-entropy`, with the same columns and lifetime
+peak semantics as the TLS observations. Release/acquire checkpoints establish
+that workers have finished each operation before the observer reads counters.
+A drop guard releases waiting workers on a parent failure, checkpoint waits
+have deadlines, and the portable runner enforces its process deadline.
+
+These observations distinguish cold shared/worker costs and memory remaining
+after worker exit without assigning each allocation to a provider subsystem.
+They neither assert that process-lifetime provider state returns to baseline
+nor include stack mappings, allocator overhead or all libc internal paths.
+The requested test stack size is not measured stack/RSS evidence. Different
+crypto operations, reseeding, maximum concurrency workloads and production
+worker integration still require qualification. No ledger or service worker
+count changes; Rust and C observations continue to overlap.

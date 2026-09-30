@@ -532,6 +532,24 @@ fn tls_handshake_evidence(output: &str, native: bool) -> Result<()> {
     )
 }
 
+fn entropy_worker_evidence(output: &str, native: bool) -> Result<()> {
+    tls_phase_evidence(
+        output,
+        native,
+        "-entropy",
+        "entropy",
+        &[
+            "baseline",
+            "spawned",
+            "first_warm",
+            "all_warm",
+            "repeated",
+            "joined",
+            "dropped",
+        ],
+    )
+}
+
 fn tls_phase_evidence(
     output: &str,
     native: bool,
@@ -1193,6 +1211,18 @@ pub(crate) fn runtime_inner() -> Result<()> {
         for line in output.lines() {
             println!("portable allocation diagnostic: {line}");
         }
+        let mut command = Command::new(path);
+        command
+            .arg("--entropy-workers")
+            .env_clear()
+            .stdin(Stdio::null());
+        crate::host_bin::arm_check_child(&mut command);
+        let name = format!("tls-entropy-allocation-{domain}");
+        let output = bounded_output(&mut command, &name, 8192, 30)?;
+        entropy_worker_evidence(&output, native)?;
+        for line in output.lines() {
+            println!("portable allocation diagnostic: {line}");
+        }
     }
 
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
@@ -1352,6 +1382,44 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn entropy_worker_records_require_teardown_and_distinct_phases() {
+        for native in [false, true] {
+            let domain = if native { "native" } else { "rust" };
+            let values = if native {
+                "1 2 3 4 5 6 7 8 9"
+            } else {
+                "1 2 3 4 5 6 7"
+            };
+            let mut output = String::new();
+            for phase in [
+                "baseline",
+                "spawned",
+                "first_warm",
+                "all_warm",
+                "repeated",
+                "joined",
+                "dropped",
+            ] {
+                output.push_str(&format!("tls-{domain}-entropy {phase} {values}\n"));
+            }
+            output.push_str(&format!("tls-entropy-allocation-v1: {domain} passed\n"));
+            assert!(entropy_worker_evidence(&output, native).is_ok());
+            assert!(entropy_worker_evidence(&output, !native).is_err());
+            assert!(tls_handshake_evidence(&output, native).is_err());
+            assert!(tls_allocation_evidence(&output, native).is_err());
+            for bad in [
+                output.replace("joined", "repeated"),
+                output.replace(" 1 2", " 1"),
+                output.replace(" 1 2", " -1 2"),
+                output.replace("passed", "failed"),
+                format!("{output}extra\n"),
+            ] {
+                assert!(entropy_worker_evidence(&bad, native).is_err());
+            }
+        }
+    }
 
     #[test]
     fn tls_handshake_records_are_distinct_from_client_construction() {

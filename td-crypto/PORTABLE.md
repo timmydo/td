@@ -818,3 +818,12 @@ an admitted loopback pair, transfers verified 16 KiB records in both directions,
 and requires stable retained requested bytes across repeated transfers. All
 eleven ordered rows are validated before logging. These representative requested
 allocation observations do not establish TLS memory ceilings or RSS bounds.
+
+Each domain additionally runs `--entropy-workers` in a fresh process. Seven
+ordered rows record startup of eight test workers, cold RNG work on one then
+all workers, repeated warmed fills, explicit joins including TLS destructors,
+and final scope teardown. Warm fills must leave counters unchanged; native
+cold RNG work must produce a positive malloc/calloc observation. Domain and
+scenario logs are distinct and completion records are exact. Requested
+bytes/blocks can remain after all workers exit. These diagnostics do not
+measure worker stack mappings or RSS and do not change service admission.
