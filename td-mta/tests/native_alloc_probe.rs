@@ -56,6 +56,37 @@ fn tls_clients() {
 }
 
 #[cfg(td_native_alloc_probe)]
+#[path = "support/tls_handshake_scenario.rs"]
+mod tls_handshake_scenario;
+
+#[cfg(td_native_alloc_probe)]
+fn tls_handshake() {
+    use native_allocator_bridge::{calls, TD_MTA_NATIVE_REGISTRY as REGISTRY};
+    let mut samples = [(calls(), REGISTRY.snapshot()); tls_handshake_scenario::PHASES.len()];
+    let mut slots = samples.iter_mut();
+    tls_handshake_scenario::run(|| *slots.next().unwrap() = (calls(), REGISTRY.snapshot()));
+    assert!(slots.next().is_none());
+    for (_, snapshot) in &samples {
+        assert!(!snapshot.invalid);
+    }
+    assert_eq!(
+        samples.get(7).unwrap().1.bytes,
+        samples.get(8).unwrap().1.bytes,
+        "warm records retained C boundary bytes"
+    );
+    assert_eq!(
+        samples.get(7).unwrap().1.blocks,
+        samples.get(8).unwrap().1.blocks,
+        "warm records retained C boundary blocks"
+    );
+    for (phase, (c, s)) in tls_handshake_scenario::PHASES.into_iter().zip(samples) {
+        let [malloc, calloc, realloc, free, posix, aligned] = c;
+        println!("tls-native-handshake {phase} {malloc} {calloc} {realloc} {free} {posix} {aligned} {} {} {}", s.blocks, s.bytes, s.peak);
+    }
+    println!("tls-handshake-allocation-v1: native passed");
+}
+
+#[cfg(td_native_alloc_probe)]
 fn main() {
     use td_crypto::Entropy;
     let zero_resize = std::env::args()
@@ -71,6 +102,13 @@ fn main() {
         .is_some_and(|arg| arg == "--tls-clients")
     {
         tls_clients();
+        return;
+    }
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|arg| arg == "--tls-handshake")
+    {
+        tls_handshake();
         return;
     }
     // Retain actual provider allocation/RNG code for the final symbol audit.

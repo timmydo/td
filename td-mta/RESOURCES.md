@@ -766,3 +766,33 @@ phases; subtracting snapshots does not produce a phase peak. Native counts
 overlap Rust System allocations, so the separate runs cannot be summed.
 Neither observation includes allocator overhead, all internal libc paths,
 RSS, or stack storage. Instrumentation storage remains separately reported.
+
+## Local handshake and record observations
+
+Each allocation probe also has a fresh-process `--tls-handshake` mode. It
+reuses the transport tests' synthetic P-256 certificate encoder, generates
+private test keys, and compiles one complete SMTP/HTTPS/relay policy generation.
+Only an ephemeral loopback socket pair is opened; configured production ports,
+external services and certificate files are never opened. The default policies
+must negotiate TLS 1.3, authenticate the relay's server name, leave the inbound
+SMTP peer unauthenticated, and release both handshake permits upon completion.
+One thread drives both endpoints with bounded progress loops and fixed time.
+
+Eleven snapshots cover baseline, generated material, resolved configuration,
+compiled generation, four reserved buffers and socket setup, constructed
+connections, handshake completion, one 16 KiB transfer in each direction,
+32 additional transfers in each direction, released connections retaining their
+returned buffers, and complete owner destruction. Each transfer verifies all
+plaintext bytes. Snapshot storage is fixed and output follows owner destruction.
+The columns match the outbound lifecycle observations; row prefixes are
+`tls-rust-handshake` and `tls-native-handshake`. The builder accepts only the
+ordered handshake schema and gives each process a distinct command log.
+
+Warm repeated records must retain no additional requested Rust bytes or tracked
+C boundary bytes/blocks. This is a retention check, not a zero-call assertion:
+TLS record operations can allocate and resize buffers. Requested lifetime peaks
+include fixture material generation and prior controls. There is no per-phase
+peak reset, and no attempt to sum overlapping counter domains. The fixture does
+not cover TLS 1.2, mTLS, maximal certificate chains, maximum configuration,
+concurrent workers, malicious peers, stalled sockets, process RSS or stack
+ceilings. It neither changes the resource ledger nor activates the service.

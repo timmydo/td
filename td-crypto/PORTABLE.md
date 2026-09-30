@@ -811,3 +811,10 @@ public-root outbound policy generations and pending client construction through
 the mail facade, without sockets. RESOURCES.md in td-mta defines columns,
 positive controls and the limits of those diagnostic observations; they do not
 qualify TLS session ceilings or whole-service RSS.
+
+A separate `--tls-handshake` process per counter domain additionally qualifies
+the local TLS 1.3 observation path. It generates synthetic material, completes
+an admitted loopback pair, transfers verified 16 KiB records in both directions,
+and requires stable retained requested bytes across repeated transfers. All
+eleven ordered rows are validated before logging. These representative requested
+allocation observations do not establish TLS memory ceilings or RSS bounds.

@@ -113,6 +113,31 @@ fn tls_clients() {
     println!("tls-client-allocation-v1: rust passed");
 }
 
+#[path = "support/tls_handshake_scenario.rs"]
+mod tls_handshake_scenario;
+
+fn tls_handshake() {
+    let mut samples = [COUNTERS.snapshot(); tls_handshake_scenario::PHASES.len()];
+    let mut slots = samples.iter_mut();
+    tls_handshake_scenario::run(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    for sample in &samples {
+        assert!(!sample.invalid);
+    }
+    assert_eq!(
+        samples.get(7).unwrap().live,
+        samples.get(8).unwrap().live,
+        "warm records retained Rust bytes"
+    );
+    for (phase, s) in tls_handshake_scenario::PHASES.into_iter().zip(samples) {
+        println!(
+            "tls-rust-handshake {phase} {} {} {} {} {} {} {}",
+            s.alloc, s.zeroed, s.realloc, s.free, s.failed, s.live, s.peak
+        );
+    }
+    println!("tls-handshake-allocation-v1: rust passed");
+}
+
 fn main() {
     allocation_counter::Counters::verify_model();
     forwarding();
@@ -121,6 +146,13 @@ fn main() {
         .is_some_and(|arg| arg == "--tls-clients")
     {
         tls_clients();
+        return;
+    }
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|arg| arg == "--tls-handshake")
+    {
+        tls_handshake();
         return;
     }
     hot_paths();

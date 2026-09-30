@@ -880,6 +880,12 @@ Implement the remaining work as independently reviewable increments:
     live bytes and lifetime peaks remain diagnostics; server/maximal inputs,
     completed handshakes, record traffic and RSS qualification remain pending.
 
+  - **M07e3b — local handshake/record observations:** separate Rust and native
+    processes share synthetic certificates with existing transport fixtures,
+    complete an admitted local TLS 1.3 pair and verify repeated 16 KiB traffic
+    both ways. Warm retention is checked while allocation calls remain visible.
+    Other versions, mTLS, adversarial/maximal inputs and RSS remain pending.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,

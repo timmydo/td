@@ -493,7 +493,6 @@ const NATIVE_WRAPPERS: [&str; 6] = [
 const NATIVE_SUCCESS: &str = "native-allocation-probe-v1: forwarding provider diagnostic passed\n";
 
 fn tls_allocation_evidence(output: &str, native: bool) -> Result<()> {
-    let domain = if native { "native" } else { "rust" };
     let phases = [
         "baseline",
         "config",
@@ -508,10 +507,43 @@ fn tls_allocation_evidence(output: &str, native: bool) -> Result<()> {
         "repeated",
         "dropped",
     ];
+    tls_phase_evidence(output, native, "", "client", &phases)
+}
+
+fn tls_handshake_evidence(output: &str, native: bool) -> Result<()> {
+    tls_phase_evidence(
+        output,
+        native,
+        "-handshake",
+        "handshake",
+        &[
+            "baseline",
+            "material",
+            "config",
+            "generation",
+            "buffers",
+            "constructed",
+            "handshake",
+            "record",
+            "repeated",
+            "released",
+            "dropped",
+        ],
+    )
+}
+
+fn tls_phase_evidence(
+    output: &str,
+    native: bool,
+    suffix: &str,
+    scenario: &str,
+    phases: &[&str],
+) -> Result<()> {
+    let domain = if native { "native" } else { "rust" };
     let width = if native { 9 } else { 7 };
     let mut lines = output.lines();
     for phase in phases {
-        let prefix = format!("tls-{domain} {phase} ");
+        let prefix = format!("tls-{domain}{suffix} {phase} ");
         let row = lines
             .next()
             .and_then(|line| line.strip_prefix(&prefix))
@@ -530,7 +562,7 @@ fn tls_allocation_evidence(output: &str, native: bool) -> Result<()> {
             return Err("wrong TLS allocation measurement width".into());
         }
     }
-    let success = format!("tls-client-allocation-v1: {domain} passed");
+    let success = format!("tls-{scenario}-allocation-v1: {domain} passed");
     if lines.next() != Some(success.as_str()) || lines.next().is_some() || !output.ends_with('\n') {
         return Err("invalid TLS allocation completion".into());
     }
@@ -1149,6 +1181,18 @@ pub(crate) fn runtime_inner() -> Result<()> {
         for line in output.lines() {
             println!("portable allocation diagnostic: {line}");
         }
+        let mut command = Command::new(path);
+        command
+            .arg("--tls-handshake")
+            .env_clear()
+            .stdin(Stdio::null());
+        crate::host_bin::arm_check_child(&mut command);
+        let name = format!("tls-handshake-allocation-{domain}");
+        let output = bounded_output(&mut command, &name, 8192, 30)?;
+        tls_handshake_evidence(&output, native)?;
+        for line in output.lines() {
+            println!("portable allocation diagnostic: {line}");
+        }
     }
 
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
@@ -1308,6 +1352,47 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn tls_handshake_records_are_distinct_from_client_construction() {
+        for native in [false, true] {
+            let domain = if native { "native" } else { "rust" };
+            let values = if native {
+                "1 2 3 4 5 6 7 8 9"
+            } else {
+                "1 2 3 4 5 6 7"
+            };
+            let mut output = String::new();
+            for phase in [
+                "baseline",
+                "material",
+                "config",
+                "generation",
+                "buffers",
+                "constructed",
+                "handshake",
+                "record",
+                "repeated",
+                "released",
+                "dropped",
+            ] {
+                output.push_str(&format!("tls-{domain}-handshake {phase} {values}\n"));
+            }
+            output.push_str(&format!("tls-handshake-allocation-v1: {domain} passed\n"));
+            assert!(tls_handshake_evidence(&output, native).is_ok());
+            assert!(tls_handshake_evidence(&output, !native).is_err());
+            assert!(tls_allocation_evidence(&output, native).is_err());
+            for bad in [
+                output.replace("material", "config"),
+                output.replace(" 1 2", " 1"),
+                output.replace(" 1 2", " x 2"),
+                output.replace("passed", "failed"),
+                format!("{output}extra\n"),
+            ] {
+                assert!(tls_handshake_evidence(&bad, native).is_err());
+            }
+        }
+    }
 
     #[test]
     fn tls_allocation_records_require_all_ordered_phases_and_exact_width() {
