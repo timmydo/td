@@ -410,13 +410,37 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "rust-allocation-build", &mut receipt)?;
     let output = bounded_output(&mut command, "rust-allocation-build", 8 * 1024 * 1024, 1200)?;
     let allocation = executable(&output, "rust_alloc_probe", ArtifactKind::IntegrationTest)?;
-    for (index, (binary, probe)) in [
-        (&mail, false),
-        (&crypto, false),
-        (&config, false),
-        (&format, false),
-        (&transport, false),
-        (&allocation, true),
+    let mut command = cargo("rustc", "td-mta");
+    command.args([
+        "--release",
+        "--test",
+        "native_alloc_probe",
+        "--message-format=json-render-diagnostics",
+        "--",
+        "--cfg",
+        "td_native_alloc_probe",
+        "-D",
+        "warnings",
+    ]);
+    for symbol in NATIVE_WRAPPERS {
+        command.args(["-C", &format!("link-arg=--wrap={symbol}")]);
+    }
+    command_record(&command, "native-allocation-build", &mut receipt)?;
+    let output = bounded_output(
+        &mut command,
+        "native-allocation-build",
+        8 * 1024 * 1024,
+        1200,
+    )?;
+    let native = executable(&output, "native_alloc_probe", ArtifactKind::IntegrationTest)?;
+    for (index, (binary, probe, native_probe)) in [
+        (&mail, false, false),
+        (&crypto, false, false),
+        (&config, false, false),
+        (&format, false, false),
+        (&transport, false, false),
+        (&allocation, true, false),
+        (&native, false, true),
     ]
     .into_iter()
     .enumerate()
@@ -432,6 +456,7 @@ pub(crate) fn build_inner() -> Result<()> {
         command_record(&command, &name, &mut receipt)?;
         let symbols = bounded_output(&mut command, &name, 8 * 1024 * 1024, 30)?;
         allocation_symbols(&symbols, probe)?;
+        native_allocation_symbols(&symbols, native_probe)?;
     }
     refuse_decoy(Path::new("/output"))?;
     fs::create_dir("/output/artifacts").map_err(|e| format!("portable artifacts: {e}"))?;
@@ -447,9 +472,79 @@ pub(crate) fn build_inner() -> Result<()> {
         &allocation,
         Path::new("/output/artifacts/td-mta-rust-allocation-probe"),
     )?;
+    copy_binary(
+        &native,
+        Path::new("/output/artifacts/td-mta-native-allocation-probe"),
+    )?;
     crate::crypto_api::qualify(&mut receipt)?;
     refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
+    Ok(())
+}
+
+const NATIVE_WRAPPERS: [&str; 6] = [
+    "malloc",
+    "calloc",
+    "realloc",
+    "free",
+    "posix_memalign",
+    "aligned_alloc",
+];
+const NATIVE_SUCCESS: &str = "native-allocation-probe-v1: forwarding provider diagnostic passed\n";
+
+fn native_allocation_evidence(output: &str, zero_resize: bool) -> Result<()> {
+    if zero_resize {
+        if output != "native-allocation-probe-v1: zero-resize invalidated\n" {
+            return Err("portable native zero-resize control did not complete exactly".into());
+        }
+        return Ok(());
+    }
+    if output.lines().count() != 4 || !output.ends_with(NATIVE_SUCCESS) {
+        return Err("portable native allocation probe did not complete exactly".into());
+    }
+    for (prefix, ceiling) in [
+        ("native_registry_storage_bytes=", 2 * 1024 * 1024),
+        ("native_counter_storage_bytes=", 4096),
+        ("native_thread_flag_bytes=", 64),
+    ] {
+        stack_evidence(output, prefix, ceiling)?;
+    }
+    Ok(())
+}
+
+fn native_allocation_symbols(symbols: &str, probe: bool) -> Result<()> {
+    let names: std::collections::BTreeSet<_> = symbols
+        .lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .collect();
+    let has_registry = symbols.contains("TD_MTA_NATIVE_REGISTRY");
+    let has_probe = symbols.contains("native_alloc_probe");
+    if symbols.trim().is_empty() || has_registry != probe || has_probe != probe {
+        return Err("portable native allocation probe sentinel boundary failed".into());
+    }
+    for name in NATIVE_WRAPPERS {
+        if names.contains(format!("__wrap_{name}").as_str()) != probe {
+            return Err("portable native allocation wrapper symbol boundary failed".into());
+        }
+    }
+    if names.iter().any(|name| {
+        name.starts_with("__wrap_")
+            && (!probe
+                || !NATIVE_WRAPPERS
+                    .iter()
+                    .any(|allowed| *name == format!("__wrap_{allowed}")))
+    }) {
+        return Err("portable executable contains an unadmitted allocation wrapper".into());
+    }
+    if probe
+        && names.iter().any(|name| {
+            *name == "sdallocx"
+                || name.starts_with("OPENSSL_memory_")
+                || matches!(*name, "memalign" | "valloc" | "pvalloc" | "reallocarray")
+        })
+    {
+        return Err("portable native allocation probe resolves an alternate allocator hook".into());
+    }
     Ok(())
 }
 
@@ -528,6 +623,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
         "td-mta-format-smoke",
         "td-mta-transport-smoke",
         "td-mta-rust-allocation-probe",
+        "td-mta-native-allocation-probe",
     ]
     .map(std::ffi::OsString::from)
     .into_iter()
@@ -544,6 +640,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
         "td-mta-format-smoke",
         "td-mta-transport-smoke",
         "td-mta-rust-allocation-probe",
+        "td-mta-native-allocation-probe",
     ] {
         copy_binary(&source.join(name), &destination.join(name))?;
     }
@@ -727,6 +824,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         "/artifacts/td-mta-format-smoke",
         "/artifacts/td-mta-transport-smoke",
         "/artifacts/td-mta-rust-allocation-probe",
+        "/artifacts/td-mta-native-allocation-probe",
         "/output",
     ])?;
     let mut command = Command::new("/artifacts/td-mta");
@@ -972,6 +1070,24 @@ pub(crate) fn runtime_inner() -> Result<()> {
     let output = bounded_output(&mut command, "rust-allocation-probe", 4096, 30)?;
     allocation_evidence(&output)?;
     println!("portable runtime: Rust allocation counter model, forwarding and digest/SMTP hot paths passed");
+    let mut command = Command::new("/artifacts/td-mta-native-allocation-probe");
+    command.env_clear().stdin(Stdio::null());
+    crate::host_bin::arm_check_child(&mut command);
+    let output = bounded_output(&mut command, "native-allocation-probe", 4096, 30)?;
+    native_allocation_evidence(&output, false)?;
+    for line in output.lines().take(3) {
+        println!("portable native diagnostic: {line}");
+    }
+    let mut command = Command::new("/artifacts/td-mta-native-allocation-probe");
+    command
+        .arg("--zero-resize")
+        .env_clear()
+        .stdin(Stdio::null());
+    crate::host_bin::arm_check_child(&mut command);
+    let output = bounded_output(&mut command, "native-allocation-zero-resize", 4096, 30)?;
+    native_allocation_evidence(&output, true)?;
+    println!("portable runtime: native allocator forwarding/provider diagnostics passed");
+
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
     println!("portable runtime: sixty-five mail SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
     Ok(())
@@ -1046,6 +1162,7 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
         "td-mta-format-smoke",
         "td-mta-transport-smoke",
         "td-mta-rust-allocation-probe",
+        "td-mta-native-allocation-probe",
     ] {
         qualify_binary(&artifacts.join(binary))?;
     }
@@ -1201,6 +1318,70 @@ mod tests {
     }
 
     #[test]
+    fn native_allocation_probe_requires_exact_wrappers_and_rejects_hooks() {
+        let mut symbols = String::from("000 b native_alloc_probe_TD_MTA_NATIVE_REGISTRY\n");
+        for name in NATIVE_WRAPPERS {
+            symbols.push_str(&format!("000 T __wrap_{name}\n"));
+        }
+        assert!(native_allocation_symbols(&symbols, true).is_ok());
+        assert!(native_allocation_symbols(&symbols, false).is_err());
+        assert!(native_allocation_symbols("000 t ordinary_main", false).is_ok());
+        assert!(native_allocation_symbols("", false).is_err());
+        for name in NATIVE_WRAPPERS {
+            assert!(native_allocation_symbols(
+                &symbols.replace(&format!("000 T __wrap_{name}\n"), ""),
+                true
+            )
+            .is_err());
+        }
+        for name in [
+            "sdallocx",
+            "OPENSSL_memory_alloc",
+            "OPENSSL_memory_free",
+            "__wrap_memalign",
+            "memalign",
+            "valloc",
+            "pvalloc",
+            "reallocarray",
+        ] {
+            assert!(native_allocation_symbols(&format!("{symbols}000 T {name}\n"), true).is_err());
+        }
+        assert!(native_allocation_symbols("000 T __wrap_memalign", false).is_err());
+        assert!(!rust_flags().contains("--wrap"));
+        assert!(!NATIVE_FLAGS.contains("--wrap"));
+        let measured = format!("native_registry_storage_bytes=1048608\nnative_counter_storage_bytes=56\nnative_thread_flag_bytes=1\n{NATIVE_SUCCESS}");
+        assert!(native_allocation_evidence(&measured, false).is_ok());
+        assert!(native_allocation_evidence(&measured.replace("=56", "=0"), false).is_err());
+        assert!(native_allocation_evidence(&measured.replace("=56", "=4097"), false).is_err());
+        assert!(native_allocation_evidence(
+            &measured.replace(
+                "native_thread_flag_bytes=1",
+                "native_counter_storage_bytes=1"
+            ),
+            false
+        )
+        .is_err());
+        assert!(native_allocation_evidence(NATIVE_SUCCESS, false).is_err());
+        assert!(native_allocation_evidence(NATIVE_SUCCESS, true).is_err());
+        let zero = "native-allocation-probe-v1: zero-resize invalidated\n";
+        assert!(native_allocation_evidence(zero, true).is_ok());
+        assert!(native_allocation_evidence(zero, false).is_err());
+        for bad in [
+            "",
+            NATIVE_SUCCESS.trim_end(),
+            "test result: ok. 0 passed; 0 failed;\n",
+            "native allocation probe unqualified: use the isolated musl build\n",
+        ] {
+            assert!(native_allocation_evidence(bad, false).is_err());
+            assert!(native_allocation_evidence(bad, true).is_err());
+        }
+        assert!(
+            native_allocation_evidence(&format!("{NATIVE_SUCCESS}{NATIVE_SUCCESS}"), false)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn host_collection_refuses_missing_outputs_links_extras_and_oversized_receipts() {
         let scratch = Scratch::create(&std::env::temp_dir(), "td-crypto-test").unwrap();
         let output = scratch.0.join("output");
@@ -1213,6 +1394,7 @@ mod tests {
             "td-mta-format-smoke",
             "td-mta-transport-smoke",
             "td-mta-rust-allocation-probe",
+            "td-mta-native-allocation-probe",
             "COMMANDS",
         ] {
             fs::write(source.join(name), name).unwrap();

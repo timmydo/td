@@ -18,6 +18,13 @@ td-crypto = { path = "../td-crypto" }
 name = "rust_alloc_probe"
 harness = false
 
+[[test]]
+name = "native_alloc_probe"
+harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(td_native_alloc_probe)"] }
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

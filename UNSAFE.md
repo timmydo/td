@@ -61,9 +61,9 @@ registrar root uses `deny` with its one function-scoped allowance. The
 separate `td-review` package forbids unsafe code package-wide and contains
 no VM binaries or services.
 
-The test-only allocation probe in `td-mta` has the separately recorded T1
-surface below. It is absent from shipped binaries and libraries and does not
-add a target syscall exception to the numbered roster.
+The test-only allocation probes in `td-mta` have the separately recorded T1
+and T2 surfaces below. They are absent from shipped binaries and libraries
+and do not add a target syscall exception to the numbered roster.
 
 Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
 amendment recorded HERE. A new syscall in an existing surface, a new
@@ -2932,5 +2932,70 @@ builder admits one additional qualification artifact, validates its static
 ELF, and uses its declared binutils nm to require the counter symbol only in
 that executable and refuse probe symbols in all other retained executables.
 No linker flags or production allocator change. C/native wrappers are not
-part of T1 yet; they require their own reviewed amendment. Rust counts exclude
+part of T1; T2 records their separate reviewed boundary. Rust counts exclude
 direct AWS-LC/libc calls and must not certify the complete service ledger.
+
+
+## T2. td-mta — test-only native allocation observation
+
+The approved allocation instrumentation exception also admits a separate
+`tests/native_alloc_probe.rs` executable. Its native modules compile only
+with `cfg(td_native_alloc_probe)`, applied by the isolated builder to this
+final test target for Linux x86-64 musl. Ordinary host tests run an explicit
+unqualified stub. Production roots retain `forbid(unsafe_code)`; the test
+root denies it. No Cargo feature or common compiler flag enables wrapping.
+
+`tests/support/native_allocator_bridge.rs` declares the six real libc entry
+points and exports exactly `__wrap_malloc`, `__wrap_calloc`, `__wrap_realloc`,
+`__wrap_free`, `__wrap_posix_memalign` and `__wrap_aligned_alloc`. One scoped
+allowance on the foreign block and one on each exported function admit this
+surface: twenty keyword occurrences and seven scoped allowances. Each
+forwards the same arguments exactly once and returns the real
+result unchanged. Only successful posix_memalign dereferences its caller's
+output pointer; the caller's C contract supplies valid writable storage.
+
+The separate `native_allocation_controls.rs` has one foreign block and one
+control function allowance (ten keyword occurrences, two allowances) for
+direct positive controls through the normal
+six libc names plus `__errno_location`. Nonnull successful allocations alone
+may be read/written within their requested extents; each live pointer is freed
+once or transferred through successful realloc. Failure preserves old storage.
+Assertions may terminate this test process but never execute inside wrappers.
+Positive controls call black-boxed C function pointers to resist allocator
+call elimination. Exact positive call deltas must establish that the pinned
+compiled failure/alignment controls actually executed; optimization behavior
+is never a memory-safety assumption.
+Four scoped workers also exercise independent malloc/resize/free ownership.
+
+A const, drop-free thread-local Cell suppresses nested libc allocation calls;
+only the outermost boundary owns registry entries and call counts. A scoped
+guard releases this recursion flag after accounting; it never owns the
+registry lock across libc. Failed TLS access invalidates evidence and forwards
+without accounting. Startup TLS availability and absence of allocator calls
+in guard access require final artifact verification.
+
+All bookkeeping is fixed atomic state and a preallocated address/size table.
+Never allocate, format, call another allocator, or unwind while wrapping;
+never hold the registry guard across real libc calls. Remove before real
+free/realloc to permit concurrent reuse; restore on failed nonzero realloc.
+Null free/realloc arguments bypass removal. Nonnull zero-size results retain
+ownership. Realloc of a nonnull pointer to zero is forwarded but marks the
+observation invalid because null does not establish portable ownership.
+Overflow, unknown ownership, saturation and unsupported paths invalidate
+evidence without changing real allocator behavior. A valid calloc overflow
+failure is a null return, not a bookkeeping arithmetic error.
+
+Counters observe C boundary calls and requested live/peak bytes, including
+Rust System allocations that cross these symbols. They are not disjoint
+native totals, allocator footprint or RSS. Snapshot only at quiescent points;
+no reset, sampling switch, fork, signals or callback while a guard is held.
+Link wrapping redirects undefined symbol references only. Hidden/local libc
+calls, startup and alternate allocators are outside this observation. Until
+final artifact coverage is established, native observations are diagnostic.
+
+Confinement pins both foreign-code files and inventories scoped allowances,
+entry points and import roots. The portable builder passes six --wrap flags
+only to this final test link, checks all retained executables for stray wrapper
+symbols, refuses resolved alternate AWS-LC allocator hooks, and runs positive
+controls in a fresh process. No direct aws-lc-sys dependency, new C source,
+production allocator or production unsafe permission is introduced.

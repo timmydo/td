@@ -185,6 +185,10 @@ requested Rust bytes; native allocation and RSS need separate measurements.
 The probe has its own main and no libtest workers. It is never a library
 module, runtime feature or installed executable. Source confinement and the
 portable artifact inventory/symbol check enforce this boundary.
+A separate native allocation qualification executable uses the approved
+UNSAFE.md T2 boundary: six libc forwarding wrappers linked only into that
+static musl test. Its observations remain diagnostic C boundary counts, may
+include Rust System calls, and do not establish whole-service memory.
 Any further platform or test instrumentation surface must amend UNSAFE.md and
 this design, name each operation, and add confinement tests before landing.
 

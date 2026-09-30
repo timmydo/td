@@ -644,7 +644,7 @@ the fresh static executable and requires its exact completion record.
 
 ## Native allocation ownership table
 
-M07e2b adds test-only, fixed-capacity address/size bookkeeping for the future
+M07e2b adds test-only, fixed-capacity address/size bookkeeping for the
 C boundary probe. Entries contain integer addresses, never dereferenceable
 borrowed pointers. Zero marks an empty slot and one remains a reserved invalid
 address; real allocator results must be checked before insertion. Null
@@ -676,8 +676,8 @@ A failed nonzero realloc must restore its old address/size. If another thread
 occupied the vacant slot, restoration may fail with full capacity; this also
 invalidates evidence without changing the real allocator result. Table bytes/peak
 track bookkeeping instants, excluding storage inside the real allocator during
-that call. Zero-size realloc behavior needs the later libc-specific wrapper
-contract; no generic null-result ownership assumption is provided here.
+that call. The wrapper contract below handles zero-size resizes explicitly;
+a generic null result does not establish ownership.
 
 Host tests exercise collisions, closed-gap reuse, saturation, zero-size
 ownership, arithmetic overflow, duplicate/unknown addresses, failed/moved
@@ -685,10 +685,10 @@ resize ownership and concurrent independent owners. Snapshots are coherent by
 construction through the shared guard; the concurrent test is a smoke check,
 not deterministic coverage of every interleaving. The Rust allocation probe
 also exercises table insert/remove/snapshot in its no-call interval. Its
-unchanged v1 success record intentionally includes these added table checks. No native
-allocation is intercepted yet, no libc coverage claim is made, and no runtime
-memory allowance changes. Fixed table storage will be reported separately as
-instrumentation overhead when the C probe is connected.
+unchanged v1 success record intentionally includes these added table checks.
+This table alone intercepts no native allocation, makes no libc coverage claim
+and changes no runtime memory allowance. The C probe below reports fixed table
+storage separately as instrumentation overhead.
 
 The gap-closing tests include wrapped clusters, a slot-at-home that must not
 move, complete return to empty slots under churn, and deterministic operation
@@ -699,3 +699,38 @@ Mixed traces choose operations from a high generator bit; their invalid flag
 becomes sticky after the first error. Separate valid-only traces compare
 200000 operations and require evidence to remain valid throughout. Immediate
 error-path assertions pin duplicate and arithmetic-failure invalidation.
+
+## Native allocator diagnostic executable
+
+M07e2c adds a separate static musl test executable behind UNSAFE.md T2. Six
+final-link wrappers preserve libc results, arguments, alignment and failure
+behavior. A const, drop-free thread-local recursion guard makes nested calls
+part of their outer operation; registry locks cover only bookkeeping and are
+released before real allocator calls. The fixed 65536-slot table and counters
+are instrumentation overhead, excluded from service memory evidence.
+
+Null free/realloc arguments bypass removal. Nonnull zero-size results own an
+entry with zero requested bytes. A failed nonzero realloc restores ownership;
+a nonnull-pointer zero-size realloc is forwarded but invalidates evidence.
+Overflow, table saturation, unknown ownership and failed TLS access also
+retire the observation. No fork, signal-handler or asynchronous cancellation
+use is qualified. Native snapshots are read only at quiescent control
+boundaries. Four concurrent workers exercise forwarding and release; a
+separate fresh process verifies that zero-size resize invalidates evidence.
+
+The initial positive controls qualify forwarding and outer-call accounting;
+provider RNG initialization requires a positive boundary call and keeps actual
+native allocation paths in the link. Successful output separately reports
+registry bytes, fixed counter bytes and per-thread flag bytes. TLS-block and
+runtime thread overhead are outside those instrumentation figures.
+Link wrapping covers undefined references only. Hidden/local libc calls,
+startup paths and unqualified alternate allocators remain outside the counts.
+Thus these are diagnostic C boundary observations, potentially overlapping
+Rust System calls, not exact native heap or whole-service RSS measurements.
+Service activation still requires the complete memory qualification in M07e.
+
+Positive controls use opaque C function pointers and require exact nonzero
+call deltas. Direct allocator calls used only in null checks can disappear
+under compiler optimization; black-boxing the size arguments alone does not
+establish that libc executed. These are checks of the pinned compiled
+execution, never memory-safety assumptions about source allocation calls.

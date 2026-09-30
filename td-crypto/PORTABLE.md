@@ -230,7 +230,7 @@ image's whole-closure profiling qualification. Debug information remains in
 the executables; distribution debug-companion integration is not claimed.
 
 Cargo's selected normal/build graphs must match admission. Its artifact records
-must select exactly one expected binary/test profile. All six results must be
+must select exactly one expected binary/test profile. All seven results must be
 x86-64 static PIEs with an executable entry point and no ELF interpreter,
 DT_NEEDED or runtime search path. A second fresh namespace mounts only the
 result and static test supervisor, then runs the installed name's version command
@@ -245,7 +245,7 @@ output quota. M07 owns native/TLS allocation and entropy-failure qualification;
 a Result wrapper cannot contain provider aborts.
 
 After the compile namespace exits and its descendants are reaped, the host
-requires an exact regular-file output inventory: six binaries and the inner
+requires an exact regular-file output inventory: seven binaries and the inner
 command record. It rejects output directory/file symlinks and additional files,
 then copies these checked inputs into a fresh private directory outside the
 compiler's writable mount. Only this directory receives host-written metadata
@@ -256,6 +256,8 @@ their environment; namespace entry remains the isolation boundary.
 
 Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
 
+- `td-mta-native-allocation-probe`: separate libc forwarding diagnostic with
+  explicit registry/counter/per-thread-flag storage evidence and no service use.
 - `td-mta-rust-allocation-probe`: dedicated System-forwarding allocation
   qualification process; never an installed executable or service dependency.
 - `td-mta`: the installed executable name, currently only `--version`/`--help`;
@@ -770,3 +772,34 @@ changes. The runtime runs it once in a fresh process, requiring its exact
 success line after model, forwarding and digest/SMTP checks. UNSAFE.md T1 and
 td-mta/RESOURCES.md define the scope: requested Rust bytes only; no native,
 RSS, whole-service or allocation-elimination guarantee is inferred.
+
+
+## Mail native allocation diagnostic artifact
+
+`td-mta-native-allocation-probe` is a seventh, separate integration executable.
+Only its final Cargo rustc invocation receives `td_native_alloc_probe` and six
+rust-lld `--wrap` arguments: malloc, calloc, realloc, free, posix_memalign and
+aligned_alloc. Shared Rust/native flags and the installed executable are
+unchanged. The normal host target prints an unqualified stub record; only the
+portable run can produce the accepted forwarding/provider diagnostic record.
+
+A const, drop-free native TLS guard suppresses nested libc calls, so requested
+size and ownership follow the outermost call. Fixed state has 65536 registry
+slots; its storage is test overhead, not service memory. Positive controls
+exercise the six entry points, null arguments, successful zero-size ownership,
+failed growth preserving storage, zeroing, alignment and output-pointer
+preservation and four concurrent allocation/resize/free workers. A separate
+process requires zero-size resize to invalidate evidence. RNG initialization
+requires a positive provider boundary call and links native code for inspection.
+Successful output reports registry bytes, fixed counter bytes and one thread
+flag separately; thread TLS-block/runtime overhead is outside these figures.
+The builder requires positive bounded values plus the exact completion record.
+It requires wrapper/registry sentinels in this executable, refuses
+any wrapper in the other six executables and refuses resolved sdallocx or
+OPENSSL_memory allocator hooks and unqualified aligned/array entry points. These checks do not classify all allocation
+machinery or cover hidden/local references; counts remain diagnostic.
+
+UNSAFE.md T2 and td-mta/RESOURCES.md define this observation. It does not replace
+independent RSS/stack checks, establish TLS generation/session peak memory or
+change the ledger. C boundary counts may include Rust System calls and must
+never be added to Rust counts as disjoint native memory.

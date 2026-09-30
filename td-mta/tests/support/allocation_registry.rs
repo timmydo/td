@@ -73,8 +73,12 @@ impl<const N: usize> Registry<N> {
         Guard(self)
     }
 
-    fn fail<T>(&self, error: Error) -> Result<T, Error> {
+    pub fn invalidate(&self) {
         self.invalid.store(true, Ordering::Relaxed);
+    }
+
+    fn fail<T>(&self, error: Error) -> Result<T, Error> {
+        self.invalidate();
         Err(error)
     }
 

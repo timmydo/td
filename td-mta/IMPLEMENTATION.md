@@ -867,6 +867,11 @@ Implement the remaining work as independently reviewable increments:
     shared guard. Deletion closes probe-chain gaps without accumulating
     tombstones; model traces cover wrapped and full tables. Libc interception
     remains pending.
+  - **M07e2c — native allocator diagnostic foundation:** a separate musl
+    executable wraps six libc entry points only at its final link. Positive
+    controls, recursion suppression and symbol confinement precede any TLS
+    memory interpretation. Counts remain diagnostic, not whole-native/RSS
+    qualification; generation/session limits and admission remain pending.
 
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
