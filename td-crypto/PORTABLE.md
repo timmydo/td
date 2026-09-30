@@ -626,3 +626,33 @@ selected material and shared clock/key state before signing and after Finished,
 and enforce the per-connection time-failure observation specified in TLS.md.
 The configuration fixtures do not supply public session progress, gateway
 leaf-pin/address policy, listener activation or complete resource bounds.
+
+## Socket-free client session qualification
+
+The runner uses the public client facade against local peers under TLS 1.2
+and TLS 1.3. Two seven-byte pipes, one-byte reads and a 37-byte output tail
+exercise fragmented handshakes, simultaneous 16384-byte writes and plaintext
+backpressure. Fixtures cover exact complete-record and handshake-reassembly
+limits, fixed redacted errors, no pre-Finished application/evidence, terminal
+unwind consumption and healthy configuration reuse. The clock observer catches
+an ignored TLS 1.2 post-Finished save failure and a TLS 1.3 ticket failure after
+Finished, even when the source immediately recovers. Shared clock panic retires
+other existing and new sessions; ordinary missing time remains per connection.
+
+Close cases cover each version's independent halves, TLS 1.2 pending-output
+alert refusal, caller-owned write tails, local-close bad MACs, peer-close
+discard, truncated transport and writes after close. A requested TLS 1.3
+KeyUpdate produces its response without application activity, preserving
+previously queued ciphertext and subsequent key ordering. The native deframer
+retains record headers: a 65511-byte malformed handshake payload fits with
+16384-byte fragments, while one extra byte exhausts capacity; 4096-byte
+fragments lower that boundary to 65451. These fixtures qualify progress and
+refusal semantics, not preallocation, server admission or service memory/RSS.
+
+An independently encrypted TLS 1.2 HelloRequest has a valid open-connection
+warning-response baseline. After local close, with close ciphertext pending,
+partially drained or fully drained, the same request instead retires the
+session without drainable output. Test-only extraction is enabled on that
+remote peer; facade configurations still disable extraction. Separate cases
+pin the conservative simultaneous-close refusal when TLS 1.2 output remains
+inside the facade or in the caller's socket-write tail.

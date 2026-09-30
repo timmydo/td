@@ -26,6 +26,15 @@ impl ClockHandle {
         }
     }
 
+    pub(super) fn health(&self) -> Result<(), TlsError> {
+        let slot = self.source.lock().map_err(|_| TlsError::Crypto)?;
+        if slot.is_some() {
+            Ok(())
+        } else {
+            Err(TlsError::Crypto)
+        }
+    }
+
     /// Query the shared source. None maps to Clock; a caught unwind or poisoned
     /// source maps to Crypto and permanently refuses further callbacks.
     pub fn now(&self) -> Result<u64, TlsError> {

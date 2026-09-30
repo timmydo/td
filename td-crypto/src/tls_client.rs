@@ -22,7 +22,7 @@ pub enum TlsProtocol {
 pub struct ClientConfig {
     pub(super) native: Arc<rustls::ClientConfig>,
     pub(super) clock: Arc<ClockHandle>,
-    protocol: TlsProtocol,
+    pub(super) protocol: TlsProtocol,
 }
 impl ClientConfig {
     /// Cold construction from exactly one admitted trust store. Explicit roots

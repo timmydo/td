@@ -3,9 +3,10 @@
 ## Status and ownership
 
 This is the M07 contract for the public TLS facade. ClientConfig,
-ServerConfig and the shared ClockHandle are implemented; public sessions
-remain future work. Bounded PEM syntax, P-256 PEM key loading, local
-ServerIdentity admission and TrustStore construction are implemented.
+ServerConfig, the shared ClockHandle and socket-free client sessions are
+implemented; server session admission remains M07c2. Bounded PEM syntax,
+P-256 PEM key loading, local ServerIdentity admission and TrustStore
+construction are implemented.
 Admitted identities retain a private TLS signer sharing the same owned
 key and retirement state. The private algorithm provider implements the
 fixed suite/group/signature lists below; configurations apply their
@@ -249,7 +250,8 @@ results. A transient None followed by a successful re-poll must still retire
 the affected session with Clock. A callback panic retires the shared source
 and requires Crypto, even if the backend reports Finished success. Also check
 time on operations where the backend does not request it. The configuration
-fixtures pin this backend hazard; session enforcement remains M07c work.
+fixtures pin this backend hazard; client sessions enforce this observation.
+Server session enforcement remains M07c2 work.
 
 ## Session progress and buffers
 
@@ -273,6 +275,41 @@ writes fail. Status inspection is always available and never runs backend
 work. Implementation freezes concrete signatures with its compiling
 interface tests; these operation semantics cannot change silently when
 signatures are added.
+
+The implemented client interface is:
+
+```rust
+TlsSession::client(Arc<ClientConfig>, &str) -> Result<TlsSession, TlsError>
+status(&self) -> TlsStatus
+receive_record(&mut self, &[u8], socket_unwritten: bool) -> Result<TlsProgress, TlsError>
+drain_ciphertext(&mut self, &mut [u8]) -> Result<usize, TlsError>
+read_plaintext(&mut self, &mut [u8]) -> Result<TlsProgress, TlsError>
+queue_plaintext(&mut self, &[u8]) -> Result<TlsProgress, TlsError>
+close(&mut self) -> Result<(), TlsError>
+transport_eof(&mut self) -> Result<(), TlsError>
+abort(&mut self)
+```
+
+TlsProgress is Bytes(count), Blocked(reason) or Eof; Eof is read-only.
+BlockedOn identifies PeerInput, DrainPlaintext or DrainCiphertext. TlsStatus
+contains phase, pending plaintext/ciphertext counts, wants_input, write_ready,
+read_closed, write_closed, optional HandshakeInfo and optional fixed error.
+HandshakeInfo contains TlsVersion (V12/V13) and PeerEvidence; only
+VerifiedServerName is currently implemented. Server evidence follows M07c2.
+Status is cached from the last successful operation, or fixed on terminal
+failure; it is not a fresh clock-health or authorization query. A shared
+clock fault is observed on the next operational call. Readiness describes
+facade buffers: the caller also tracks its socket-write tail, flushes it
+before handshake intake and retains it before draining further ciphertext.
+Application Blocked results cannot account for that external tail. The
+caller must combine both states when choosing its next socket operation.
+
+Every returned error invalidates the entire output slice and previously
+obtained evidence; callers discard these and all retained socket-write tails.
+A clean close before Finished is terminal Invalid. Abort sets terminal Invalid
+unless an earlier failure already fixed another error. Closed describes both
+halves closed with facade output drained; transport completion still requires
+the caller's retained output to finish draining.
 
 The caller assembles the five-byte record header and its declared body in a
 preallocated wire buffer. `receive_record` accepts exactly one record or
@@ -324,7 +361,11 @@ caller retains any socket-unwritten suffix before draining again and reports
 that outstanding suffix to intake. Never regenerate drained bytes.
 
 Pin the exact internal plaintext/ciphertext queue and protocol-output
-reserve limits in implementation and memory qualification. Buffer settings
+reserve limits in implementation and memory qualification. The client sets
+its native application buffer limit to 32 KiB and caps drainable output at
+65536 protocol bytes plus one 18437-byte application wire reservation.
+These post-operation refusals are not preallocation or whole-memory bounds;
+M07e must qualify retained and temporary backend work as well. Buffer settings
 do not cap certificates, handshake state, native contexts or allocator
 overhead. Permit at most one pending application record per direction;
 unread plaintext blocks intake until drained. Available handshake work must
@@ -407,6 +448,10 @@ record with pending encrypted output returns Protocol and aborts, whether that
 output remains inside the facade or in a caller socket-write tail. Otherwise
 process the alert normally and queue the close response when appropriate.
 Never splice a close alert after omitted or partially transmitted ciphertext.
+This conservative refusal also applies when the local write half is already
+closed: simultaneous close_notify with local output still pending is Protocol.
+It does not discard already delivered application success; the adapter records
+TLS close failure separately from completed mail transactions.
 The version-specific rules are in [RFC 5246 §7.2.1](https://www.rfc-editor.org/rfc/rfc5246.html#section-7.2.1)
 and [RFC 8446 §6.1](https://www.rfc-editor.org/rfc/rfc8446.html#section-6.1).
 
@@ -424,6 +469,10 @@ local close_notify. The pinned backend can hit a debug assertion on this path
 in host builds while release queues an alert. Exercise malformed/oversized and
 bad-MAC records after local close in both profiles: no unwind escapes, no
 subsequent alert/application output is emitted, and the session is retired.
+After appending local close_notify, retain the drainable output count as a
+baseline and reduce it as bytes drain. Any later native output growth is
+terminal Protocol, even if native processing reports success: a TLS 1.2
+HelloRequest can otherwise append a no_renegotiation warning after close.
 A caught session-state debug assertion maps to Crypto; ordinary protocol
 refusal maps to Protocol. Neither implies a shared key failure.
 

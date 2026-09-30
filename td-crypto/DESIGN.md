@@ -15,7 +15,8 @@ identity. M07b2b adds explicit private CA bundles and the pinned public
 server root set. M07b3a supplies the explicit private TLS algorithm
 provider. M07b3b retains owned keys for TLS signing; M07b3c1 adds the
 shared clock and outbound ClientConfig. M07b3c2 adds ServerConfig and
-immutable identity routing. Public sessions remain unimplemented.
+immutable identity routing. M07c1 adds socket-free client sessions; server
+session admission remains M07c2.
 Test-only backend qualification covers explicit provider construction,
 SHA-256, local TLS 1.2/1.3 data exchange, certificate verification and
 malformed/tampered-record refusals in the isolated static executable. Mocks
@@ -671,8 +672,8 @@ contention belong in qualification.
 
 The backend time trait can express only missing time, so its private adapter
 returns None for either ordinary unavailability or a retired source. The
-future session facade must retain a private per-connection observation of
-every callback failure and inspect it after every backend call, even a
+session facade retains a private per-connection observation of
+every callback failure and inspects it after every backend call, even a
 successful call. It must also check shared retirement without another
 callback before publishing results, and check time on operations for which
 the backend requests none. Re-polling alone misses a transient None followed
@@ -703,8 +704,9 @@ failure, disjoint trust replacement, wrong names, absent/known ALPN, server
 refusal of non-overlapping ALPN and certificate-boundary enforcement. The
 client's unoffered-ALPN check has inventory coverage only. Repeated connections
 to a resumption-enabled remote server remain full handshakes in both versions.
-No server role/SNI routing, mandatory client authentication, public session,
-mail adapter or service listener is supplied by this increment. Those layers
+These outbound configuration fixtures alone supply no server routing,
+mandatory client authentication, public session, mail adapter or listener.
+Those layers
 must enforce their remaining TLS.md contracts before service admission.
 
 ### Inbound configuration and identity routing
@@ -783,6 +785,105 @@ verification time and the raw-IP SNI hazard. Backend connections in these
 fixtures do not substitute for public session enforcement. Constructors and
 provider work allocate within the still-unqualified TLS allowance; no service
 is enabled until M07c/M07d/M07e complete their remaining contracts.
+
+### Socket-free client sessions
+
+`TlsSession::client` retains one ClientConfig and one owned, checked DNS name
+inside a private backend connection. It supplies only client sessions; server
+Acceptor admission and verified-client evidence remain M07c2. No socket, DNS,
+mail policy or listener is created. The caller assembles one complete TLS
+record in its bounded wire buffer, retains socket-write tails, and aborts its
+transport on every session error.
+
+Public progress uses fixed td-owned TlsVersion, TlsPhase, TlsStatus,
+HandshakeInfo, PeerEvidence, BlockedOn and TlsProgress values. Status is the
+cached result of the last completed operation, with phase, separate read/write
+closure, drainable byte counts, input/write readiness, optional handshake and
+fixed failure. Inspecting it runs no backend work or clock callback; it is not
+a fresh authorization or clock-health query. A shared-clock fault is observed
+by the next operational call. Handshake evidence is published only after full
+backend Finished success, fixed ALPN checks and the operation's clock fences.
+Only VerifiedServerName is currently exposed, bound to the constructor's DNS
+name and configuration. Copies never become independent authorization tokens.
+
+Each connection gets a private native configuration clone with one fresh
+SessionClock observer. Provider/verifier/trust state remains shared; account
+for configuration vectors/headers, retained name and observer allocations in
+M07e. Ordinary missing time is sticky only for that connection, even if a later
+query succeeds. Shared source retirement overrides that local failure with
+Crypto. No mutable transient error cell lives on the reusable configuration.
+The observer checks ClockHandle health without invoking its callback, so it
+cannot lose a transient failure by re-polling. Health waits for an in-flight
+serialized callback before inspecting the source slot.
+
+Every operational call samples supplied time even when the backend does not
+request it. Every mutable backend call checks the observer afterward, including
+successful calls; publication checks again. The TLS 1.2 ignored session-save
+failure is therefore terminal before exposing Finished. A consuming unwind
+boundary temporarily removes the whole live connection and restores it only
+after successful work and fences. Error/unwind drops that state, invalidates
+cached evidence, discards all pending output and fixes the error permanently.
+Caller output buffers can have been touched: discard them and retained socket
+write tails on error. Native abort/OOM, hooks, destructor failures and blocking
+retain the earlier limits. Dropping native buffers is not a secret-erasure
+claim, and the backend is never operated again after an unwind to attempt
+cleanup.
+
+Record framing checks the complete header/body, exact length and protection
+state before backend intake. TLS 1.2 protection begins only after an accepted
+ChangeCipherSpec; TLS 1.3 encrypted outer application-data records have their
+separate limit. Visible pre-Finished alerts are refused. Partial native reads
+loop over the one caller record with positive progress and an observer check
+at each step. Unread plaintext blocks another record without consumption;
+handshake output must drain first. Established sessions accept input while
+output is pending, so simultaneous writers can make progress.
+
+At most 16384 plaintext bytes may be queued per call, with one outstanding
+application record. Incoming plaintext is bounded to the same size. The native
+application buffer setting is 32 KiB; drainable ciphertext is capped at 65536
+protocol bytes plus the 18437-byte application wire reservation. These are
+queue refusals, not a preallocation or total-memory guarantee. Handshake,
+certificate and native allocations remain separate qualification work. The
+65535-byte deframer limit includes retained record headers: with 16384-byte
+plaintext fragments, a deliberately malformed 65511-byte handshake payload
+reaches decoding while one extra byte exhausts capacity. With 4096-byte
+fragments that payload boundary is 65451. No 65535-byte payload promise follows
+from the deframer size.
+
+While the local write half remains open after Finished, an internal empty
+native write flushes a deferred TLS 1.3 KeyUpdate response without accepting
+application bytes; its output then enters the same accounting and clock
+checks. This avoids waiting for application activity to send the response.
+After local close, suppress that flush: no new control record may follow
+close_notify. After appending the locally requested close, the remaining
+output count becomes a decreasing baseline. Refuse any subsequent native
+output growth, including successful TLS 1.2 HelloRequest processing that
+would append a no_renegotiation warning. A backend-held deferred update in
+that state still belongs in
+M07e allocation accounting and is dropped when the connection retires.
+
+Read/write operations before Finished return Blocked with no consumption.
+Empty buffers otherwise return zero progress, except a fully drained closed
+read reports Eof. Read and write closure are independent for TLS 1.3; TLS 1.2
+receiving an alert with pending ciphertext or a caller write tail is terminal
+Protocol, including simultaneous close when local writes are already closed.
+Otherwise close_notify closes writes and queues its response.
+Local close appends after pending output and is idempotent. Closing before
+Finished is terminal Invalid; abort cancels handshakes. Writing after local
+close is terminal Invalid and discards even a queued close. Transport EOF
+without received close_notify fails Protocol. Framed input after peer close
+is explicitly discarded; malformed framing still retires the session. Closed
+means both halves closed and facade output drained; the caller must still
+flush its own retained tail before completing transport close.
+
+Tests use the public client session against local backend peers, including
+seven-byte pipes, one-byte reads, short output tails, simultaneous full-size
+writes, unread-plaintext backpressure, exact record/reassembly bounds, clock
+failures, fixed redacted errors, key updates and version-specific closure.
+Synthetic session unwinds prove state consumption and independent reuse of a
+healthy configuration. Post-local-close malformed/bad-MAC cases qualify both
+host and portable behavior without emitting a later alert. M07d/M07e must
+still qualify mail adapters, resource leases and complete service bounds.
 
 ### Mutual TLS backend qualification
 

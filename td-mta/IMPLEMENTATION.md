@@ -635,10 +635,10 @@ do not complete M07 or enable service.
 The future TLS contract is specified in td-crypto/TLS.md, including explicit
 algorithm sets, local P-256 PEM identity admission, trust/SNI/time policy,
 bounded record progress and failure/close behavior. Material admission and
-immutable client/server configuration interfaces are implemented; public
-session progress and its qualification remain pending. Direct Crypto/Entropy
-operations are implemented inside td-crypto; incoming/outgoing session
-operations follow. Rustls provider/configuration/verifier/key types never leave
+immutable client/server configuration interfaces and client session progress
+are implemented; server sessions and complete resource qualification remain
+pending. Direct Crypto/Entropy operations are implemented inside td-crypto;
+incoming session and mail transport operations follow. Rustls provider/configuration/verifier/key types never leave
 that crate. Implement the conformance, explicit-provider confinement, algorithm
 baseline, key compatibility and native allocation/failure qualification in
 `td-crypto/DESIGN.md`, retaining its independent fixtures for F04.
@@ -707,6 +707,16 @@ Implement the remaining work as independently reviewable increments:
   tests cover the complete resolved public API. Local peers exercise one-byte
   fragmentation, short buffers, backpressure, truncation, exact authenticated
   evidence and permanent retirement after returned errors/Rust unwinds.
+  - **M07c1 — client session:** implemented socket-free client progress with
+    whole-record bounds, per-connection sticky clock failure, consuming unwind
+    boundaries, fixed errors/evidence and TLS-version-specific close behavior.
+    Local peers exercise tiny bounded pipes, simultaneous writes, KeyUpdate,
+    post-handshake ticket time failures and exact reassembly limits. Portable
+    qualification covers the same cases. This does not enable mail transport.
+  - **M07c2 — server session:** pending bounded raw ClientHello/SNI validation,
+    including fragmented/retry hellos before backend loss; selected-identity
+    health/date checks before signing and after Finished; mandatory-client
+    leaf evidence and all shared lifecycle fences through the common facade.
 - **M07d — mail transport:** implement existing ports through that facade,
   with socket/lease/deadline handling, implicit client TLS, STARTTLS transition
   fixtures and gateway pin plus address authorization. No provider type or
