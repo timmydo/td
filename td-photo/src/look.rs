@@ -220,6 +220,17 @@ fn tone(contrast: f32, toe: f32, shoulder: f32) -> impl Fn(f64) -> f64 {
     }
 }
 
+/// The per-photo contrast's curve over a value in `0..=1`, the one
+/// `Look::contrast` tabulates: the tone at `2^(hundredths / 100)`, clamped
+/// to the tone's range, with no toe or shoulder; the identity at zero.
+pub fn contrast_curve(hundredths: i32) -> impl Fn(f64) -> f64 {
+    tone(
+        2f32.powf(hundredths as f32 / 100.0).clamp(0.5, 3.0),
+        0.0,
+        0.0,
+    )
+}
+
 /// A monotone cubic through `points` (x strictly increasing), Fritsch and
 /// Carlson's tangents, holding the end values outside the first and last.
 /// In f64: the admitted knots can put a secant near 1e22 beside one near
@@ -495,8 +506,7 @@ impl Look {
         if hundredths == 0 {
             return None;
         }
-        let c = 2f32.powf(hundredths as f32 / 100.0).clamp(0.5, 3.0);
-        let table = Table::build(tone(c, 0.0, 0.0))?;
+        let table = Table::build(contrast_curve(hundredths))?;
         Some(Look {
             name: None,
             ops: vec![Op::Curve {

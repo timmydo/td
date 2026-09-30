@@ -809,6 +809,50 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
         "the developed frame after the contrast"
     );
 
+    // Auto is measured on the window's pool, off its turn: `wait-idle`
+    // holds until the measure has landed and its step is written, the one
+    // `edit FILE auto` writes after the same steps, and the frame is the
+    // roll's preview as the sidecar now is.
+    let apart = client_directory.0.join("apart");
+    std::fs::create_dir_all(&apart).unwrap();
+    std::fs::copy(roll.join("DSC_0001.NEF"), apart.join("DSC_0001.NEF")).unwrap();
+    std::fs::copy(
+        roll.join("DSC_0001.NEF.edit"),
+        apart.join("DSC_0001.NEF.edit"),
+    )
+    .unwrap();
+    let edited = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+        .arg("edit")
+        .arg(apart.join("DSC_0001.NEF"))
+        .arg("auto")
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(
+        edited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&edited.stderr)
+    );
+    let expected = std::fs::read_to_string(apart.join("DSC_0001.NEF.edit")).unwrap();
+    assert!(expected.contains("\nstep-3 on auto "), "{expected}");
+    assert_eq!(client.request(15, &["action", "auto"]), ["ok", "changed"]);
+    client.settle(16);
+    assert_eq!(
+        std::fs::read_to_string(roll.join("DSC_0001.NEF.edit")).unwrap(),
+        expected
+    );
+    let automatic = super::preview_develop(&client_directory, place.width, place.height, &roll, 0);
+    assert_ne!(
+        super::box_pixels(&steeper, place.width, r#box),
+        super::box_pixels(&automatic, place.width, r#box),
+        "auto did not reach the developed pixels"
+    );
+    assert_eq!(
+        compositor.tile(&place),
+        automatic,
+        "the developed frame after auto"
+    );
+
     // A look the sidecar names but no file provides makes the develop for the
     // same photo fail: the box is redrawn to the neutral placeholder, not left
     // showing the last exposure's pixels, and `wait-idle` still settles.

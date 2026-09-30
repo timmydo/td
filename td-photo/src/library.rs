@@ -32,6 +32,8 @@ pub const MAX_KEY: usize = 32;
 pub const STEP_PREFIX: &str = "step-";
 /// A history holds at most this many steps.
 pub const MAX_STEPS: usize = 128;
+/// The step key of an auto step, which sets exposure and contrast at once.
+pub const AUTO: &str = "auto";
 /// The folder an import files a photo under when it has no date.
 pub const UNDATED: &str = "undated";
 /// The folder under a roll that rejects are moved into.
@@ -121,12 +123,15 @@ impl Key {
     }
 }
 
-/// What a history step sets: a develop key this version knows, or a key
-/// a later version wrote, kept by its name with its value as written and
-/// left out of the fold, so that version's edits survive this one's.
+/// What a history step sets: a develop key this version knows; `auto`,
+/// exposure and contrast at once, its value `E C` in their grammars, so
+/// one undo takes both back; or a key a later version wrote, kept by its
+/// name with its value as written and left out of the fold, so that
+/// version's edits survive this one's.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StepKey {
     Known(Key),
+    Auto,
     Later(String),
 }
 
@@ -134,9 +139,21 @@ impl StepKey {
     pub fn name(&self) -> &str {
         match self {
             Self::Known(key) => key.name(),
+            Self::Auto => AUTO,
             Self::Later(name) => name,
         }
     }
+}
+
+/// An auto step's value, `E C`, as exposure and contrast hundredths.
+pub fn auto(text: &str) -> Option<(i32, i32)> {
+    let (e, c) = text.split_once(' ')?;
+    Some((exposure(e).ok()?, contrast(c).ok()?))
+}
+
+/// The value an auto step writes.
+pub fn auto_text(exposure: i32, contrast: i32) -> String {
+    format!("{} {}", exposure_text(exposure), contrast_text(contrast))
 }
 
 /// One step of a photo's develop history: a develop key set to a value or
@@ -161,8 +178,9 @@ impl Step {
     }
 
     /// The step a line's value spells, or `None` when it is not one: a
-    /// known develop key's value held to its grammar, an unknown key's
-    /// (a later version's) kept as it is. The flag is never a step.
+    /// known develop key's value held to its grammar, an auto step's to
+    /// `E C` (never a clear), an unknown key's (a later version's) kept as
+    /// it is. The flag is never a step.
     fn parse(text: &str) -> Option<Step> {
         let (state, rest) = text.split_once(' ')?;
         let on = match state {
@@ -174,20 +192,45 @@ impl Step {
         let key = match Key::parse(name) {
             Some(key) if key.develops() => StepKey::Known(key),
             Some(_) => return None,
+            None if name == AUTO => StepKey::Auto,
             None if valid_key(name) && !name.starts_with(STEP_PREFIX) => {
                 StepKey::Later(name.to_string())
             }
             None => return None,
         };
         let value = if value == "-" {
+            if key == StepKey::Auto {
+                return None;
+            }
             None
         } else {
-            if let StepKey::Known(key) = key {
-                check(key, value).ok()?;
+            match &key {
+                StepKey::Known(key) => check(*key, value).ok()?,
+                StepKey::Auto => {
+                    auto(value)?;
+                }
+                StepKey::Later(_) => {}
             }
             Some(value.to_string())
         };
         Some(Step { on, key, value })
+    }
+
+    /// What the step gives `key` when it is on: `None` when it does not
+    /// set that key, `Some(None)` for a clear.
+    fn sets(&self, key: Key) -> Option<Option<String>> {
+        match &self.key {
+            StepKey::Known(known) if *known == key => Some(self.value.clone()),
+            StepKey::Auto => {
+                let (exposure, contrast) = auto(self.value.as_deref()?)?;
+                match key {
+                    Key::Exposure => Some(Some(exposure_text(exposure))),
+                    Key::Contrast => Some(Some(contrast_text(contrast))),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 }
 
@@ -384,15 +427,15 @@ fn check(key: Key, value: &str) -> Result<(), Error> {
     }
 }
 
-/// One photo's edits: the header, then `key value` lines in the order the
-/// file had them, then the develop history's `step-N` lines. Known keys
-/// are validated; any other line is kept verbatim and rewritten in place,
-/// so a later version's values survive this one's edit. The develop keys
-/// (exposure, contrast, crop, look) are the history's summary: what its steps that
-/// are on fold to, rewritten from it whenever it changes, so a reader
-/// that knows only the keys sees the settings in force. A file with a
-/// history is read by it; one without and with develop keys (an earlier
-/// write) seeds a step per key, so every edit from then on is a step.
+/// One photo's edits: the header, then `key value` lines in the order the file
+/// had them, then the develop history's `step-N` lines. Known keys are
+/// validated; any other line is kept verbatim and rewritten in place, so a
+/// later version's values survive this one's edit. The develop keys (exposure,
+/// contrast, crop, look) are the history's summary: what its steps that are on
+/// fold to, rewritten from it whenever it changes, so a reader that knows only
+/// the keys sees the settings in force. A file with a history is read by it;
+/// one without and with develop keys (an earlier write) seeds a step per key,
+/// so every edit from then on is a step.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Sidecar {
     lines: Vec<(String, String)>,
@@ -465,16 +508,18 @@ impl Sidecar {
     }
 
     /// Rewrites the develop keys from the history: each the last value a
-    /// step that is on gives it, set in place or appended, or dropped when
-    /// no step sets it.
+    /// step that is on gives it (an auto step giving exposure and
+    /// contrast), set in place or appended, or dropped when no step sets
+    /// it.
     fn derive(&mut self) {
         for key in Key::ALL.into_iter().filter(|key| key.develops()) {
             let value = self
                 .steps
                 .iter()
                 .rev()
-                .find(|step| step.on && step.key == StepKey::Known(key))
-                .and_then(|step| step.value.clone());
+                .filter(|step| step.on)
+                .find_map(|step| step.sets(key))
+                .flatten();
             self.set_line(key, value.as_deref());
         }
     }
@@ -659,9 +704,45 @@ impl Sidecar {
         self.set(key, Some(&text(next)))
     }
 
+    /// Sets exposure and contrast at once as one auto step, undone as
+    /// one: when the last step is an auto step that is on it takes the
+    /// new values (auto run again, say after a crop), otherwise one is
+    /// added, and a full history refuses it. Values the keys already hold
+    /// (an absent key holding zero) are no step. Each is held to its
+    /// key's range.
+    pub fn auto(&mut self, exposure: i32, contrast: i32) -> Result<(), Error> {
+        let text = auto_text(exposure, contrast);
+        if auto(&text).is_none() {
+            let key = if self::exposure(&exposure_text(exposure)).is_err() {
+                Key::Exposure
+            } else {
+                Key::Contrast
+            };
+            return Err(Error::Value(key));
+        }
+        if self.exposure().unwrap_or(0) == exposure && self.contrast().unwrap_or(0) == contrast {
+            return Ok(());
+        }
+        match self.steps.last_mut() {
+            Some(last) if last.on && last.key == StepKey::Auto => last.value = Some(text),
+            _ => {
+                if self.steps.len() >= MAX_STEPS {
+                    return Err(Error::HistoryFull);
+                }
+                self.steps.push(Step {
+                    on: true,
+                    key: StepKey::Auto,
+                    value: Some(text),
+                });
+            }
+        }
+        self.derive();
+        Ok(())
+    }
+
     /// Back to the camera's defaults: the history cleared, and with it
-    /// exposure, contrast, crop and look; the flag, a cull decision, and any unknown
-    /// line kept.
+    /// exposure, contrast, crop and look; the flag, a cull decision, and
+    /// any unknown line kept.
     pub fn reset(&mut self) {
         self.steps.clear();
         self.lines

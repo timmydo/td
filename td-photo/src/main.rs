@@ -24,6 +24,7 @@ use td_ui::driven::{self, Binding, Input, Outcome};
 use td_ui::finder;
 use td_ui::raster::{Composition, Scale, Surface};
 
+use td_photo::auto::{self, Auto};
 use td_photo::color::{camera_color, CameraColor, Transfer};
 use td_photo::develop::{self, Params, MAX_THREADS};
 use td_photo::image::{self, read_ppm, write_ppm, Rgb8};
@@ -108,13 +109,15 @@ const HELP: &str = concat!(
     "  when only the sidecar's move failed; the run fails after the rest\n",
     "  when any was kept or split. Each file is linked into rejected/ before\n",
     "  its old name is dropped, so no name is replaced and no file is lost.\n",
-    "td-photo edit FILE [KEY VALUE ... | reset | undo]\n",
+    "td-photo edit FILE [KEY VALUE ... | auto | reset | undo]\n",
     "  Prints FILE's sidecar, or sets exposure STOPS (-5.00 to 5.00),\n",
     "  contrast C (-1.00 to 1.00), crop X Y W H (fractions to four\n",
     "  decimals), look STEM or flag pick|reject;\n",
     "  a VALUE of - clears the key. A develop key set is a step of the\n",
-    "  sidecar's history (step-N lines, the keys their summary); undo takes\n",
-    "  the last step back and reset clears all but the flag. The sidecar\n",
+    "  sidecar's history (step-N lines, the keys their summary); auto\n",
+    "  chooses exposure and contrast from the photo's tones over its crop\n",
+    "  as one step, undo takes the last step back and reset clears all\n",
+    "  but the flag. The sidecar\n",
     "  is written through NAME.edit.tmp and renamed into place, the one\n",
     "  file td-photo replaces, since it is its own.\n",
     "td-photo [open [ROLL] [--control-socket PATH]]\n",
@@ -941,11 +944,11 @@ const EXPORT_BAND_ROWS: usize = 64;
 /// Numbered names tried for one export before it gives up.
 const MAX_EXPORT_NAMES: u32 = 1000;
 
-/// One export as asked for: the original and its sidecar's exposure,
-/// contrast, crop and look as the file held them when the export was asked for, and the
-/// settings it is written with, so the verb, the replay and the window's
-/// pool job develop the same thing. The look is a stem here and resolved
-/// where the export runs.
+/// One export as asked for: the original and its sidecar's exposure, contrast,
+/// crop and look as the file held them when the export was asked for, and the
+/// settings it is written with, so the verb, the replay and the window's pool
+/// job develop the same thing. The look is a stem here and resolved where the
+/// export runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExportRequest {
     pub(crate) path: PathBuf,
@@ -957,6 +960,71 @@ pub(crate) struct ExportRequest {
     /// One of the picks' batch, counted in the batch's note as it lands,
     /// rather than an export of its own.
     pub(crate) batch: bool,
+}
+
+/// An auto measure: the photo, the crop its sidecar held when auto was
+/// asked for (the region measured) and its history then. The step is
+/// written on the file as it is when the measure lands, and only while
+/// that history is the file's: a step written after an edit made
+/// meanwhile would shadow the edit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AutoRequest {
+    pub(crate) path: PathBuf,
+    pub(crate) crop: Option<library::Crop>,
+    pub(crate) steps: Vec<library::Step>,
+}
+
+/// The auto measure `path` asks for, from its sidecar as the file holds
+/// it now; a sidecar the reader refuses refuses it, as it would the
+/// write.
+pub(crate) fn auto_request(path: &Path) -> Result<AutoRequest, String> {
+    original(path)?;
+    let sidecar = read_sidecar(path)?;
+    Ok(AutoRequest {
+        path: path.to_path_buf(),
+        crop: sidecar.crop(),
+        steps: sidecar.steps().to_vec(),
+    })
+}
+
+/// Measures `request`: the photo developed at 0 EV with no contrast or
+/// look over its crop, `auto::EDGE` on the long side, from `raw` when the
+/// caller holds the frame, and the exposure and contrast `auto::choose`
+/// gives it, with the frame it decoded when the caller held none (for the
+/// window's raw cache).
+pub(crate) fn auto_measure(
+    request: &AutoRequest,
+    raw: Option<&RawFrame>,
+    threads: usize,
+) -> Result<(Auto, Option<RawFrame>), String> {
+    let decoded = match raw {
+        Some(_) => None,
+        None => Some(decode_raw(&request.path)?.0),
+    };
+    let Some(raw) = raw.or(decoded.as_ref()) else {
+        return Err(format!("{}: no frame to measure", request.path.display()));
+    };
+    let level1 = raw_level1(raw, threads)?;
+    let params = Params {
+        exposure: 0.0,
+        contrast: None,
+        threads,
+        look: None,
+    };
+    let image = develop::render(
+        &level1,
+        request.crop.map(crop_fractions),
+        auto::EDGE,
+        raw.meta.orientation,
+        raw.meta.wb,
+        &raw.meta.color,
+        &Transfer::srgb(),
+        &params,
+    )
+    .map_err(|e| format!("{}: {e}", request.path.display()))?;
+    let chosen = auto::choose(&image)
+        .ok_or_else(|| format!("{}: nothing to measure", request.path.display()))?;
+    Ok((chosen, decoded))
 }
 
 /// The picks' export as it goes, for the status row's note: the roll it
@@ -2438,6 +2506,27 @@ fn edit(path: &Path, rest: &[OsString]) -> Result<(), String> {
         sidecar.undo();
         return write_sidecar(path, &sidecar);
     }
+    if words == ["auto"] {
+        let request = AutoRequest {
+            path: path.to_path_buf(),
+            crop: sidecar.crop(),
+            steps: sidecar.steps().to_vec(),
+        };
+        let (chosen, _) = auto_measure(&request, None, threads())?;
+        // Read again: the measure takes a decode, and the window may have
+        // written the file meanwhile.
+        let mut sidecar = read_sidecar(path)?;
+        if sidecar.steps() != request.steps.as_slice() {
+            return Err(format!(
+                "{}: the history changed while auto measured; nothing written",
+                path.display()
+            ));
+        }
+        sidecar
+            .auto(chosen.exposure, chosen.contrast)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        return write_sidecar(path, &sidecar);
+    }
     let mut words = words.as_slice();
     while let Some((name, tail)) = words.split_first() {
         let key = Key::parse(name).ok_or_else(|| {
@@ -2805,6 +2894,10 @@ struct Session {
     /// replay does; the window sets `Some` and drains the requests to its
     /// pool each turn, so no decode runs on its thread.
     exports: Option<Vec<ExportRequest>>,
+    /// Where an `Auto` effect's measure goes, as `exports` does: `None`
+    /// measures and writes on the request; the window sets `Some`, its
+    /// pool measures, and it writes the step as the measure lands.
+    autos: Option<Vec<AutoRequest>>,
     /// The picks' export the window has queued and not seen land whole,
     /// for the status row's note; the replay runs a batch within the turn
     /// and keeps none. Of one roll: a roll opening leaves it to finish on
@@ -2864,6 +2957,7 @@ impl Session {
             idle: true,
             quit: false,
             exports: None,
+            autos: None,
             batch: None,
         }
     }
@@ -2939,6 +3033,7 @@ impl Session {
                     key,
                     delta,
                 } => outcome = self.edit(index, name, |sidecar| sidecar.nudge(key, delta))?,
+                Effect::Auto { index, name } => outcome = self.auto(index, name)?,
                 Effect::Reset { index, name } => {
                     outcome = self.edit(index, name, |sidecar| {
                         sidecar.reset();
@@ -3016,6 +3111,105 @@ impl Session {
         self.ui
             .set_listing(path.into_os_string().into_vec(), listing, select.as_deref())
             .inspect_err(|_| note(&format!("{display}: the window cannot show a chooser")))
+    }
+
+    /// Chooses `name`'s exposure and contrast over the crop its sidecar
+    /// holds now: the request is read here, on the dispatch, so a refused
+    /// sidecar refuses the action; the measure runs on the request, and
+    /// the step is written, when nothing defers it (the replay), or is
+    /// queued for the window's pool, `changed` as it is queued, the step
+    /// written as it lands (`auto_landed`). A measure that fails is
+    /// `refused` with its reason on stderr.
+    fn auto(&mut self, index: usize, name: String) -> Result<Outcome, ui::Error> {
+        let roll = self.ui.roll().ok_or(ui::Error::NoRoll)?;
+        let original = PathBuf::from(OsStr::from_bytes(roll)).join(&name);
+        let request = match auto_request(&original) {
+            Ok(request) => request,
+            Err(why) => {
+                note(&why);
+                return Err(ui::Error::Refused);
+            }
+        };
+        match self.autos.as_mut() {
+            Some(queue) => {
+                queue.push(request);
+                Ok(Outcome::Changed)
+            }
+            None => match auto_measure(&request, None, threads()) {
+                Ok((chosen, _)) => self.write_auto(index, name, &request, chosen),
+                Err(why) => {
+                    note(&why);
+                    Err(ui::Error::Refused)
+                }
+            },
+        }
+    }
+
+    /// Writes `chosen` as an auto step on the file as it is now, unless its
+    /// history moved since `request` was read (an edit made meanwhile,
+    /// which the step would shadow): then nothing is written, the status
+    /// row's note says the measure was superseded, and the file settles
+    /// the model, as any edit's.
+    fn write_auto(
+        &mut self,
+        index: usize,
+        name: String,
+        request: &AutoRequest,
+        chosen: Auto,
+    ) -> Result<Outcome, ui::Error> {
+        let mut superseded = false;
+        let outcome = self.edit(index, name.clone(), |sidecar| {
+            if sidecar.steps() != request.steps.as_slice() {
+                superseded = true;
+                return Ok(());
+            }
+            sidecar.auto(chosen.exposure, chosen.contrast)
+        });
+        if superseded {
+            self.ui
+                .set_export(Some(format!("auto of {name} superseded")));
+        }
+        outcome
+    }
+
+    /// A measure the window's pool made for `request` landed: the step is
+    /// written on the file as it is now when the photo is still in the
+    /// open roll, by its name, since the model's indices may have moved
+    /// since it was asked for; one of another roll, or of a photo moved
+    /// out, is dropped. A failed measure, or a step the file refuses (a
+    /// full history, say), is the status row's note, its reason on stderr.
+    fn auto_landed(&mut self, request: &AutoRequest, result: Result<Auto, String>) {
+        let (Some(roll), Some(name)) = (
+            request.path.parent(),
+            request.path.file_name().and_then(OsStr::to_str),
+        ) else {
+            return;
+        };
+        let held = self
+            .ui
+            .roll()
+            .is_some_and(|open| Path::new(OsStr::from_bytes(open)) == roll);
+        if !held {
+            return;
+        }
+        let chosen = match result {
+            Ok(chosen) => chosen,
+            Err(_) => {
+                self.ui.set_export(Some(format!("auto of {name} failed")));
+                return;
+            }
+        };
+        let Some(index) = self.ui.photos().iter().position(|photo| photo.name == name) else {
+            return;
+        };
+        // A write the file refuses is noted on stderr and settles the
+        // model from the file, as any edit's.
+        if self
+            .write_auto(index, name.to_string(), request, chosen)
+            .is_err()
+        {
+            self.ui.set_export(Some(format!("auto of {name} refused")));
+        }
     }
 
     /// Exports `name` through its sidecar as the file holds it now: the
@@ -3373,6 +3567,89 @@ mod tests {
         let none = Batch::default();
         assert!(none.finished());
         assert_eq!(none.note(), "exported 0 of 0 picks");
+    }
+
+    /// A measure that lands writes its step on the photo by name; one that
+    /// failed, or whose step the file refuses, is the status row's note;
+    /// one whose photo's history moved since it was asked for writes
+    /// nothing, superseded; one of another roll is dropped with the files
+    /// untouched.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_landed_measure_writes_its_step_or_says_why_not() {
+        let roll = std::env::temp_dir().join(format!("td-photo-landed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&roll);
+        fs::create_dir_all(&roll).unwrap();
+        for name in ["DSC_0001.NEF", "DSC_0002.NEF"] {
+            fs::write(roll.join(name), name).unwrap();
+        }
+        // A full history: the step is refused.
+        let mut full = String::from("td-photo edit 1\n");
+        for n in 1..=library::MAX_STEPS {
+            full.push_str(&format!("step-{n} on look mono\n"));
+        }
+        fs::write(roll.join("DSC_0002.NEF.edit"), &full).unwrap();
+        let mut session = Session::new(Surface::new(800, 600, Scale::default()).unwrap());
+        session.open(roll.as_os_str().as_bytes()).unwrap();
+        let chosen = Auto {
+            exposure: 112,
+            contrast: 60,
+        };
+        let request = |name: &str| auto_request(&roll.join(name)).unwrap();
+        let first = request("DSC_0001.NEF");
+        session.auto_landed(&first, Ok(chosen));
+        let written = "td-photo edit 1\nexposure 1.12\ncontrast 0.60\nstep-1 on auto 1.12 0.60\n";
+        assert_eq!(
+            fs::read_to_string(roll.join("DSC_0001.NEF.edit")).unwrap(),
+            written
+        );
+        assert_eq!(session.ui.export_note(), None);
+        session.auto_landed(&request("DSC_0002.NEF"), Ok(chosen));
+        assert_eq!(
+            fs::read_to_string(roll.join("DSC_0002.NEF.edit")).unwrap(),
+            full
+        );
+        assert_eq!(
+            session.ui.export_note(),
+            Some("auto of DSC_0002.NEF refused")
+        );
+        session.auto_landed(&first, Err("why".to_string()));
+        assert_eq!(
+            session.ui.export_note(),
+            Some("auto of DSC_0001.NEF failed")
+        );
+        // Asked for before the step above was written: the history moved,
+        // so the measure is superseded and nothing is written.
+        let later = Auto {
+            exposure: 50,
+            contrast: 40,
+        };
+        session.auto_landed(&first, Ok(later));
+        assert_eq!(
+            fs::read_to_string(roll.join("DSC_0001.NEF.edit")).unwrap(),
+            written
+        );
+        assert_eq!(
+            session.ui.export_note(),
+            Some("auto of DSC_0001.NEF superseded")
+        );
+        // Another roll's photo of the same name is another photo.
+        let other = AutoRequest {
+            path: std::env::temp_dir().join("td-photo-elsewhere/DSC_0001.NEF"),
+            crop: None,
+            steps: first.steps.clone(),
+        };
+        session.auto_landed(&other, Ok(later));
+        session.auto_landed(&other, Err("why".to_string()));
+        assert_eq!(
+            fs::read_to_string(roll.join("DSC_0001.NEF.edit")).unwrap(),
+            written
+        );
+        assert_eq!(
+            session.ui.export_note(),
+            Some("auto of DSC_0001.NEF superseded")
+        );
+        let _ = fs::remove_dir_all(&roll);
     }
 
     /// A reject whose sidecar cannot follow its original is reported as

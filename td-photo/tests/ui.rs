@@ -481,13 +481,18 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     );
 }
 
+/// What `apply` takes an auto measure to choose: exposure and contrast
+/// hundredths.
+const AUTO_STAND_IN: (i32, i32) = (112, 60);
+
 /// The binary's adapter over the in-process model, for the tests that
 /// carry effects by hand: each effect mutates the photo's sidecar as it
 /// stands (the model's copy here stands in for the file), then settles it.
 /// A refused sidecar is never rewritten; a mutation that leaves the sidecar
 /// as it was writes nothing and is `Ignored` unless the settle itself
 /// brought a change; anything else is `Changed`. A nudge's delta and
-/// clamp are `Sidecar::nudge`'s, as they are in the binary.
+/// clamp are `Sidecar::nudge`'s, as they are in the binary; an auto
+/// measure, the binary's, is `AUTO_STAND_IN` here.
 fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
     let mut outcome = Outcome::Changed;
     for effect in effects {
@@ -495,6 +500,7 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
             Effect::Flag { index, name, .. }
             | Effect::Edit { index, name, .. }
             | Effect::Nudge { index, name, .. }
+            | Effect::Auto { index, name }
             | Effect::Reset { index, name }
             | Effect::Undo { index, name }
             | Effect::StepToggle { index, name, .. }
@@ -555,6 +561,7 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
             Effect::Flag { flag, .. } => sidecar.set(Key::Flag, flag.map(Flag::word)).unwrap(),
             Effect::Edit { key, value, .. } => sidecar.set(*key, value.as_deref()).unwrap(),
             Effect::Nudge { key, delta, .. } => sidecar.nudge(*key, *delta).unwrap(),
+            Effect::Auto { .. } => sidecar.auto(AUTO_STAND_IN.0, AUTO_STAND_IN.1).unwrap(),
             Effect::Reset { .. } => sidecar.reset(),
             Effect::Undo { .. } => {
                 sidecar.undo();
@@ -878,6 +885,50 @@ fn contrast_is_nudged_and_set_in_develop_mode() {
         .collect();
     assert_eq!(labels, ["contrast -0.40"]);
     assert!(c.photo(0).unwrap().ends_with("\t-0.40"));
+}
+
+/// `auto` and its key ask the adapter to measure the cursor photo and
+/// write one auto step, in develop mode only; the history lists it as one
+/// step and one undo takes both values back.
+#[test]
+fn auto_is_measured_at_the_adapter_in_develop_mode() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    assert_eq!(act(&mut c, "auto", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "next", &[]), Outcome::Changed);
+    let (outcome, effects) = c.action("auto", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Auto {
+            index: 1,
+            name: file(1),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[EXPOSURE], "1.12");
+    assert_eq!(fields(&c)[CONTRAST], "0.60");
+    let (_, effects) = c.input(Input::Key { chord: "a" }).unwrap();
+    assert!(
+        matches!(effects.as_slice(), [Effect::Auto { index: 1, .. }]),
+        "{effects:?}"
+    );
+    // The same values again are no step.
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Ignored);
+    let labels: Vec<String> = c
+        .photos()
+        .get(1)
+        .and_then(|photo| photo.sidecar.as_ref())
+        .unwrap()
+        .steps()
+        .iter()
+        .map(ui::step_label)
+        .collect();
+    assert_eq!(labels, ["auto 1.12 0.60"]);
+    assert_eq!(carry(&mut c, "undo", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[EXPOSURE], "-");
+    assert_eq!(fields(&c)[CONTRAST], "-");
 }
 
 #[test]
@@ -1412,7 +1463,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "61"]);
+    assert_eq!(&reply(2)[..2], ["ok", "62"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(
         reply(4),
@@ -4267,6 +4318,83 @@ fn the_binary_deletes_the_rejects_over_the_replay() {
     assert!(ok, "{err}");
     assert!(
         err.contains("DSC_0002.NEF") && err.contains("already exists"),
+        "{err}"
+    );
+}
+
+/// The replay measures an auto over the sidecar's crop on the request and
+/// writes its step, the one `edit FILE auto` writes for the same file; a
+/// frame that cannot be decoded, or a sidecar the reader refuses, is
+/// `refused` with nothing written.
+#[test]
+fn the_binary_writes_auto_over_the_replay() {
+    let temp = Temp::new("auto");
+    let roll = temp.0.join("roll");
+    let apart = temp.0.join("apart");
+    let whole = temp.0.join("whole");
+    for dir in [&roll, &apart, &whole] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let (w, h) = (64usize, 48usize);
+    let samples: Vec<u16> = (0..w * h).map(|i| 1008 + (i as u16 % 4000)).collect();
+    let nef = synth_nef::uncompressed_nef(w, h, &samples);
+    let cropped = "td-photo edit 1\ncrop 0.5000 0.0000 0.5000 1.0000\n";
+    for dir in [&roll, &apart, &whole] {
+        fs::write(dir.join("DSC_0001.NEF"), &nef).unwrap();
+    }
+    for dir in [&roll, &apart] {
+        fs::write(dir.join("DSC_0001.NEF.edit"), cropped).unwrap();
+    }
+    fs::write(roll.join("DSC_0002.NEF"), b"not really a nef").unwrap();
+    fs::write(roll.join("DSC_0003.NEF"), &nef).unwrap();
+    fs::write(
+        roll.join("DSC_0003.NEF.edit"),
+        "td-photo edit 1\nflag maybe\n",
+    )
+    .unwrap();
+    let auto_step = |dir: &Path| {
+        let edited = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+            .arg("edit")
+            .arg(dir.join("DSC_0001.NEF"))
+            .arg("auto")
+            .output()
+            .unwrap();
+        assert!(edited.status.success());
+        let text = fs::read_to_string(dir.join("DSC_0001.NEF.edit")).unwrap();
+        let step = text.lines().last().unwrap().to_string();
+        (text, step)
+    };
+    let (expected, step) = auto_step(&apart);
+    assert!(step.starts_with("step-2 on auto "), "{expected}");
+    // The crop is what is measured: the whole frame chooses otherwise.
+    let (_, whole_step) = auto_step(&whole);
+    assert_ne!(whole_step.split_once(" auto "), step.split_once(" auto "));
+
+    let mut session = Replay::start(&[roll.to_str().unwrap()]);
+    let a = session.send(&[
+        request(1, &["action", "develop"]),
+        request(2, &["key", &hex(b"a")]),
+        request(3, &["action", "next"]),
+        request(4, &["action", "auto"]),
+        request(5, &["action", "next"]),
+        request(6, &["action", "auto"]),
+    ]);
+    assert_eq!(&a[1][1..], ["ok", "changed"]);
+    assert_eq!(
+        fs::read_to_string(roll.join("DSC_0001.NEF.edit")).unwrap(),
+        expected
+    );
+    assert_eq!(a[3][1..3], ["error", "refused"]);
+    assert!(!roll.join("DSC_0002.NEF.edit").exists());
+    assert_eq!(a[5][1..3], ["error", "refused"]);
+    assert_eq!(
+        fs::read_to_string(roll.join("DSC_0003.NEF.edit")).unwrap(),
+        "td-photo edit 1\nflag maybe\n"
+    );
+    let (ok, _, err) = session.finish();
+    assert!(ok, "{err}");
+    assert!(
+        err.contains("DSC_0002.NEF") && err.contains("DSC_0003.NEF.edit"),
         "{err}"
     );
 }

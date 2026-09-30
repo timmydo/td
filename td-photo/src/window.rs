@@ -267,11 +267,11 @@ fn enter_view(session: &mut Session, position: usize, single: bool) -> Result<()
     Ok(())
 }
 
-/// The developed preview for a `--preview --develop` or `--single`
-/// session: the develop box (the single view's) and the cursor photo
-/// developed to fit it, or to the model's zoom, at the sidecar's exposure,
-/// contrast and look, made on the calling thread; `None` without a box or when the
-/// develop cannot be made, leaving the box its placeholder.
+/// The developed preview for a `--preview --develop` or `--single` session: the
+/// develop box (the single view's) and the cursor photo developed to fit it, or
+/// to the model's zoom, at the sidecar's exposure, contrast and look, made on
+/// the calling thread; `None` without a box or when the develop cannot be made,
+/// leaving the box its placeholder.
 fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb8)> {
     let r#box = session.ui.develop_box()?;
     let index = session.ui.cursor()?;
@@ -353,12 +353,12 @@ impl Preview {
 }
 
 /// The level a develop starts from, and the cached levels it reuses: an
-/// exposure, contrast or look edit starts at `Level3` (level 2 reused), a resize at
-/// `Level2` (level 1 reused), a photo whose level 0 is cached at `Level1`,
-/// and a new photo at `Decode`; a zoomed develop of the current photo
+/// exposure, contrast or look edit starts at `Level3` (level 2 reused), a
+/// resize at `Level2` (level 1 reused), a photo whose level 0 is cached at
+/// `Level1`, and a new photo at `Decode`; a zoomed develop of the current photo
 /// starts at `Zoom` (level 1 reused, and the cached level 0 with it past
-/// `HALF_ZOOM`). The window plans it from what its memo holds; the worker
-/// runs from here forward.
+/// `HALF_ZOOM`). The window plans it from what its memo holds; the worker runs
+/// from here forward.
 enum Start {
     Decode,
     Level1 {
@@ -445,9 +445,10 @@ enum Made {
 
 /// What a worker finished: a thumbnail for a key (`None` when it could not
 /// be made, said on stderr, which leaves the box its placeholder), the
-/// developed preview for a request, carrying what it made, or an export,
+/// developed preview for a request, carrying what it made, an export,
 /// carrying the file's path and the frame it decoded (for the raw cache)
-/// or why it failed (said on stderr).
+/// or why it failed (said on stderr), or an auto measure, carrying what
+/// it chose or why it failed (said on stderr).
 enum Done {
     Thumb {
         key: Key,
@@ -461,6 +462,10 @@ enum Done {
         request: crate::ExportRequest,
         result: std::result::Result<(PathBuf, Option<crate::RawFrame>), String>,
     },
+    Auto {
+        request: crate::AutoRequest,
+        result: std::result::Result<(td_photo::auto::Auto, Option<crate::RawFrame>), String>,
+    },
     /// A neighbour's level 0 decoded ahead of its develop, for the raw
     /// cache; `None` when it could not be (said on stderr).
     Prefetched {
@@ -469,14 +474,16 @@ enum Done {
     },
 }
 
-/// What a worker takes off the queue: an export carries the cached level 0
-/// when the window held it at submission, so a photo just developed exports
-/// without the codec; weakly, so the queue keeps no frame the raw cache has
-/// let go, and one evicted while queued is decoded again. A prefetch is a
-/// neighbour's decode alone.
+/// What a worker takes off the queue: an export or an auto measure carries
+/// the cached level 0 when the window held it at submission, so a photo
+/// just developed is measured or exported without the codec; weakly, so
+/// the queue keeps no frame the raw cache has let go, and one evicted
+/// while queued is decoded again. A prefetch is a neighbour's decode
+/// alone.
 enum Task {
     Thumb(Key),
     Develop(Preview, Start),
+    Auto(crate::AutoRequest, Option<Weak<crate::RawFrame>>),
     Export(crate::ExportRequest, Option<Weak<crate::RawFrame>>),
     Prefetch(PhotoKey),
 }
@@ -502,6 +509,13 @@ struct Queue {
     /// it sends, so a closing pool drains its exports with no window to
     /// collect them.
     exporting: Option<crate::ExportRequest>,
+    /// Auto measures asked for and not yet taken, in order, and the one a
+    /// worker is measuring or the window has not yet collected: at most
+    /// one, so one raw decode of theirs at a time. Never dropped by a
+    /// replacement of the wants, but dropped at close, the files
+    /// untouched: the step is written by the window as the measure lands.
+    autos: VecDeque<(crate::AutoRequest, Option<Weak<crate::RawFrame>>)>,
+    measuring: Option<crate::AutoRequest>,
     /// The neighbours whose level 0 the window would have decoded ahead, in
     /// order, and the one a worker is decoding or the window has not yet
     /// collected: the lowest class of work, taken only when nothing wanted
@@ -563,16 +577,19 @@ impl Queue {
             + usize::from(self.developing.is_some())
             + self.exports.len()
             + usize::from(self.exporting.is_some())
+            + self.autos.len()
+            + usize::from(self.measuring.is_some())
     }
 
     /// The next task for a worker, or `None` to wait: a thumbnail first,
     /// then the develop when no develop is already in flight, so the one
     /// raw decode is never run twice at once (and not while a prefetch
     /// decodes its photo: that frame arrives and the develop is replanned
-    /// from it), then an export when none is in flight, then, with nothing
-    /// wanted pending and no prefetch in flight, a prefetch. A closing
-    /// queue hands out exports alone, so what was asked for is written
-    /// before the pool is joined.
+    /// from it), then an auto measure when none is in flight, then an
+    /// export when none is in flight, then, with nothing wanted pending
+    /// and no prefetch in flight, a prefetch. A closing queue hands out
+    /// exports alone, so what was asked for is written before the pool is
+    /// joined.
     fn take(&mut self) -> Option<Task> {
         if !self.closing {
             if let Some(key) = self.pending.pop_front() {
@@ -583,6 +600,12 @@ impl Queue {
                 if let Some((preview, start)) = self.preview.take() {
                     self.developing = Some(preview.clone());
                     return Some(Task::Develop(preview, start));
+                }
+            }
+            if self.measuring.is_none() {
+                if let Some((request, raw)) = self.autos.pop_front() {
+                    self.measuring = Some(request.clone());
+                    return Some(Task::Auto(request, raw));
                 }
             }
         }
@@ -598,11 +621,13 @@ impl Queue {
             && self.pending.is_empty()
             && self.preview.is_none()
             && self.exports.is_empty()
+            && self.autos.is_empty()
         {
             while let Some(key) = self.prefetch.pop_front() {
-                // The develop or the export in flight may be decoding this
-                // very photo; its frame will be cached as it lands, so the
-                // prefetch is dropped rather than decoded twice at once.
+                // The develop, the export or the measure in flight may be
+                // decoding this very photo; its frame will be cached as it
+                // lands, so the prefetch is dropped rather than decoded
+                // twice at once.
                 if self.decoding(&key) {
                     continue;
                 }
@@ -613,14 +638,20 @@ impl Queue {
         None
     }
 
-    /// Whether the develop or the export in flight is of `key`'s photo.
+    /// Whether the develop, the export or the auto measure in flight is of
+    /// `key`'s photo.
     fn decoding(&self, key: &PhotoKey) -> bool {
         self.developing.as_ref().is_some_and(|p| key.is(p))
             || self
                 .exporting
                 .as_ref()
-                .and_then(export_key)
+                .and_then(|request| path_key(&request.path))
                 .is_some_and(|exporting| exporting == *key)
+            || self
+                .measuring
+                .as_ref()
+                .and_then(|request| path_key(&request.path))
+                .is_some_and(|measuring| measuring == *key)
     }
 
     /// A prefetch was collected: it leaves its slot, and a pending develop
@@ -747,8 +778,26 @@ impl Pool {
         Ok(outstanding)
     }
 
+    /// Queues an auto measure behind those already asked for, with the
+    /// cached level 0 when the window holds it, and says how many jobs are
+    /// outstanding.
+    fn auto(
+        &self,
+        request: crate::AutoRequest,
+        raw: Option<Weak<crate::RawFrame>>,
+    ) -> Result<usize> {
+        let outstanding = {
+            let mut queue = self.lock()?;
+            queue.autos.push_back((request, raw));
+            queue.outstanding()
+        };
+        self.queue.1.notify_all();
+        Ok(outstanding)
+    }
+
     /// Takes what the workers made, each leaving the running set, the
-    /// develop-in-flight slot or the prefetch slot as it is taken, under
+    /// develop-in-flight slot, the measuring slot or the prefetch slot as
+    /// it is taken, under
     /// the one lock, so what `outstanding` counts next is exactly what the
     /// window does not hold and no develop is planned to decode a frame
     /// on its way. An export left its slot as the worker sent it, under
@@ -756,6 +805,7 @@ impl Pool {
     fn collect(&self) -> Result<Vec<Done>> {
         let mut queue = self.lock()?;
         let done: Vec<Done> = std::iter::from_fn(|| self.done.try_recv().ok()).collect();
+        let mut measured = false;
         for item in &done {
             match item {
                 Done::Thumb { key, .. } => {
@@ -763,8 +813,19 @@ impl Pool {
                 }
                 Done::Develop { .. } => queue.develop_done(),
                 Done::Prefetched { .. } => queue.prefetch_done(),
+                Done::Auto { .. } => {
+                    queue.measuring = None;
+                    measured = true;
+                }
                 Done::Export { .. } => {}
             }
+        }
+        drop(queue);
+        // The measuring slot is free for the next measure queued, which
+        // nothing else may wake a worker for: a measure that changes no
+        // file moves no generation, so the wants are not replaced.
+        if measured {
+            self.queue.1.notify_all();
         }
         Ok(done)
     }
@@ -777,6 +838,7 @@ impl Drop for Pool {
             queue.pending.clear();
             queue.preview = None;
             queue.prefetch.clear();
+            queue.autos.clear();
         }
         self.queue.1.notify_all();
         for thread in self.threads.drain(..) {
@@ -818,6 +880,14 @@ fn work(queue: &(Mutex<Queue>, Condvar), done: &Sender<Done>) {
             Task::Develop(preview, start) => {
                 let made = develop_task(&preview, start);
                 Done::Develop { preview, made }
+            }
+            Task::Auto(request, raw) => {
+                let raw = raw.as_ref().and_then(Weak::upgrade);
+                let result = crate::auto_measure(&request, raw.as_deref(), threads());
+                if let Err(why) = &result {
+                    note(why);
+                }
+                Done::Auto { request, result }
             }
             Task::Export(request, raw) => {
                 // A frame the raw cache let go while this waited is decoded
@@ -1049,19 +1119,24 @@ impl PhotoKey {
     }
 }
 
-/// The photo an export is of, keyed as the memo keys it: the request's
-/// path is the roll's directory and the name in it.
-fn export_key(request: &crate::ExportRequest) -> Option<PhotoKey> {
+/// The photo at `path`, keyed as the memo keys it: the roll's directory
+/// and the name in it.
+fn path_key(path: &Path) -> Option<PhotoKey> {
     Some(PhotoKey {
-        roll: request.path.parent()?.to_path_buf(),
-        name: request.path.file_name()?.to_str()?.to_string(),
+        roll: path.parent()?.to_path_buf(),
+        name: path.file_name()?.to_str()?.to_string(),
     })
+}
+
+/// The photo an export is of.
+fn export_key(request: &crate::ExportRequest) -> Option<PhotoKey> {
+    path_key(&request.path)
 }
 
 /// The current photo's levels above 0: level 1 (the demosaic, reused across
 /// resizes) and the level 2 for the box's current long edge and crop (reused
-/// across exposure, contrast and look edits), with the metadata level 3 applies. Let go
-/// with the thumbnails when the roll or scale changes.
+/// across exposure, contrast and look edits), with the metadata level 3
+/// applies. Let go with the thumbnails when the roll or scale changes.
 struct Current {
     key: PhotoKey,
     meta: crate::Meta,
@@ -1385,9 +1460,9 @@ struct Window {
     /// one lands. Let go with the thumbnails when the roll or scale changes.
     developed: Option<(Preview, Option<Rgb8>)>,
     /// The develop memo: the current photo's cached levels above 0 (so an
-    /// exposure, contrast or look edit reruns level 3 alone and a resize reruns level
-    /// 2) and the level-0 raw cache (so returning to a photo reruns level 1
-    /// rather than the codec). Let go with the thumbnails when the roll or
+    /// exposure, contrast or look edit reruns level 3 alone and a resize reruns
+    /// level 2) and the level-0 raw cache (so returning to a photo reruns level
+    /// 1 rather than the codec). Let go with the thumbnails when the roll or
     /// scale changes.
     memo: Memo,
     /// The pointer's last position on the surface, in the protocol's 24.8
@@ -1458,9 +1533,11 @@ impl Window {
         mut session: Session,
         control: Option<Worker<Payload>>,
     ) -> Result<Self> {
-        // The session queues exports for the pool rather than running them
-        // on the turn thread; `submit_exports` drains it each turn.
+        // The session queues exports and auto measures for the pool rather
+        // than running them on the turn thread; `submit_exports` drains
+        // them each turn.
         session.exports = Some(Vec::new());
+        session.autos = Some(Vec::new());
         Ok(Window {
             client: Client::new(stream, temporary)?,
             font: td_ui::font::pinned()?,
@@ -1764,10 +1841,23 @@ impl Window {
         Ok(())
     }
 
-    /// Hands the exports the session queued this turn to the pool, each with
-    /// the photo's cached level 0 when the memo holds it, so a photo just
-    /// developed exports without the codec.
+    /// Hands the exports and auto measures the session queued this turn to
+    /// the pool, each with the photo's cached level 0 when the memo holds
+    /// it, so a photo just developed is exported or measured without the
+    /// codec.
     fn submit_exports(&mut self) -> Result<()> {
+        let autos: Vec<crate::AutoRequest> = self
+            .session
+            .autos
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default();
+        for request in autos {
+            let raw = path_key(&request.path)
+                .and_then(|key| self.memo.raw_frame(&key))
+                .map(|frame| Arc::downgrade(&frame));
+            self.pool.auto(request, raw)?;
+        }
         let requests: Vec<crate::ExportRequest> = self
             .session
             .exports
@@ -1821,13 +1911,13 @@ impl Window {
     }
 
     /// How far the held zoomed image's window lies from the one the model
-    /// wants, in surface pixels, while the develop at a moved centre is on
-    /// its way: the held image is blitted shifted by it, so a pan's release
-    /// leaves the image where the pointer left it until the new frame
-    /// lands, rather than snapping back and then jumping. Zero unless the
-    /// held develop differs from the wanted one only by its centre (an
-    /// exposure, contrast or look edit racing the release shifts the same), and zero
-    /// for a centre the model only normalized (`centre_shift`).
+    /// wants, in surface pixels, while the develop at a moved centre is on its
+    /// way: the held image is blitted shifted by it, so a pan's release leaves
+    /// the image where the pointer left it until the new frame lands, rather
+    /// than snapping back and then jumping. Zero unless the held develop
+    /// differs from the wanted one only by its centre (an exposure, contrast or
+    /// look edit racing the release shifts the same), and zero for a centre the
+    /// model only normalized (`centre_shift`).
     fn held_shift(&self) -> (i64, i64) {
         let none = (0, 0);
         let Some(wanted) = self.wanted_preview() else {
@@ -1920,6 +2010,7 @@ impl Window {
                 // Only the newest develop matters; earlier ones are stale.
                 Done::Develop { preview, made } => developed = Some((preview, made)),
                 Done::Export { request, result } => self.exported(request, result),
+                Done::Auto { request, result } => self.measured(request, result),
                 Done::Prefetched { key, frame } => {
                     // The frame joins the cache when its roll is still held
                     // and there is room; either way the wants are recomputed,
@@ -2002,6 +2093,30 @@ impl Window {
             self.session.ui.touch();
         }
         Ok(())
+    }
+
+    /// A measure finished: the frame it decoded joins the raw cache when
+    /// the roll is still the held one, as an export's does, and the session
+    /// writes its step on the file as it is now, the model settled from it,
+    /// a new generation when that changed it.
+    fn measured(
+        &mut self,
+        request: crate::AutoRequest,
+        result: std::result::Result<(td_photo::auto::Auto, Option<crate::RawFrame>), String>,
+    ) {
+        let key = path_key(&request.path);
+        let held = self
+            .held
+            .as_ref()
+            .zip(key.as_ref())
+            .is_some_and(|((roll, _), key)| *roll == key.roll);
+        let result = result.map(|(chosen, raw)| {
+            if let (Some(raw), true, Some(key)) = (raw, held, key) {
+                self.memo.cache_raw(key, Arc::new(raw), self.clock);
+            }
+            chosen
+        });
+        self.session.auto_landed(&request, result);
     }
 
     /// An export finished: the status row's note says which name it took or
@@ -2300,7 +2415,11 @@ impl Window {
     fn finish(mut self, result: Result<()>) -> Result<()> {
         // The exports a key or a request asked for in the closing turn
         // reach the pool before it is joined, so a `quit` waits for them
-        // too, whichever way the window closed.
+        // too, whichever way the window closed; the measures asked for do
+        // not, since a closing pool drops them.
+        if let Some(autos) = self.session.autos.as_mut() {
+            autos.clear();
+        }
         let result = match (result, self.submit_exports()) {
             (Ok(()), Err(why)) => Err(format!("exports not queued at close: {why}")),
             (result, _) => result,
@@ -2346,10 +2465,10 @@ impl Window {
         let marquee = ui.marquee();
         let photos = ui.photos();
         // The develop box and the image to fill it: the held develop of the
-        // cursor's photo, so an exposure, contrast or look edit shows the last frame of
-        // that photo rather than a placeholder while the new one is made, but
-        // a move to another photo shows the placeholder until its own develop
-        // lands, not the previous photo's pixels.
+        // cursor's photo, so an exposure, contrast or look edit shows the last
+        // frame of that photo rather than a placeholder while the new one is
+        // made, but a move to another photo shows the placeholder until its own
+        // develop lands, not the previous photo's pixels.
         let develop = ui.develop_box().and_then(|r#box| {
             let name = &photos.get(ui.cursor()?)?.name;
             developed
@@ -2631,6 +2750,136 @@ mod tests {
         assert!(queue.drained());
     }
 
+    fn auto(name: &str) -> crate::AutoRequest {
+        crate::AutoRequest {
+            path: PathBuf::from("/td-photo/none").join(name),
+            crop: None,
+            steps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn autos_survive_the_wants_run_one_at_a_time_before_exports_and_drop_at_close() {
+        let mut queue = Queue::default();
+        queue.exports.push_back((export("e.NEF"), None));
+        queue.autos.push_back((auto("a.NEF"), None));
+        queue.autos.push_back((auto("b.NEF"), None));
+        assert_eq!(
+            queue.replace(vec![key("t")], Some((preview("p"), Start::Decode))),
+            5
+        );
+        // A thumbnail and the develop go first, then one measure before the
+        // export, and not the second measure while it is in flight.
+        assert!(matches!(queue.take(), Some(Task::Thumb(_))));
+        assert!(matches!(queue.take(), Some(Task::Develop(..))));
+        match queue.take() {
+            Some(Task::Auto(request, None)) => {
+                assert_eq!(request.path.file_name().unwrap(), "a.NEF")
+            }
+            _ => panic!("expected the first measure"),
+        }
+        assert!(matches!(queue.take(), Some(Task::Export(..))));
+        assert!(queue.take().is_none());
+        // In flight, it is outstanding until the window collects it.
+        assert_eq!(queue.outstanding(), 5);
+        queue.measuring = None;
+        match queue.take() {
+            Some(Task::Auto(request, _)) => {
+                assert_eq!(request.path.file_name().unwrap(), "b.NEF")
+            }
+            _ => panic!("expected the second measure"),
+        }
+        // A closing queue hands out no measure and is drained without one.
+        queue.measuring = None;
+        queue.exporting = None;
+        queue.autos.push_back((auto("c.NEF"), None));
+        queue.closing = true;
+        assert!(queue.take().is_none());
+        assert!(queue.drained());
+    }
+
+    #[test]
+    fn no_prefetch_goes_ahead_of_a_measure_or_decodes_the_measured_photo() {
+        let neighbour = |name: &str| PhotoKey {
+            roll: PathBuf::from("/td-photo/none"),
+            name: name.to_string(),
+        };
+        // A measure waits for the one in flight; the prefetch waits for it.
+        let mut queue = Queue {
+            measuring: Some(auto("z.NEF")),
+            ..Queue::default()
+        };
+        queue.autos.push_back((auto("a.NEF"), None));
+        queue.replace_prefetch(vec![neighbour("b.NEF")]);
+        assert!(queue.take().is_none());
+        // The photo being measured is not prefetched; another is.
+        let mut queue = Queue {
+            measuring: Some(auto("b.NEF")),
+            ..Queue::default()
+        };
+        queue.replace_prefetch(vec![neighbour("b.NEF"), neighbour("c.NEF")]);
+        match queue.take() {
+            Some(Task::Prefetch(key)) => assert_eq!(key.name, "c.NEF"),
+            _ => panic!("expected the other neighbour"),
+        }
+    }
+
+    #[test]
+    fn the_pool_keeps_an_auto_outstanding_until_the_window_collects_it() {
+        let pool = Pool::start(1).unwrap();
+        // A file that is not there fails on the worker; the measure stays
+        // in the count, so `wait-idle` holds, until the window takes the
+        // result that writes the step.
+        assert_eq!(pool.auto(auto("a.NEF"), None).unwrap(), 1);
+        let mut done = Vec::new();
+        for _ in 0..2000 {
+            assert_eq!(pool.outstanding().unwrap(), 1);
+            done = pool.collect().unwrap();
+            if !done.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        match done.as_slice() {
+            [Done::Auto { request, result }] => {
+                assert_eq!(request.path.file_name().unwrap(), "a.NEF");
+                assert!(result.is_err());
+            }
+            _ => panic!("expected one measure"),
+        }
+        assert_eq!(pool.outstanding().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_collected_auto_hands_the_next_to_a_waiting_worker() {
+        // One worker, two measures: the second waits for the first's slot,
+        // which the window's collect frees; nothing else moves the queue,
+        // so the collect must wake the worker.
+        let pool = Pool::start(1).unwrap();
+        assert_eq!(pool.auto(auto("a.NEF"), None).unwrap(), 1);
+        assert_eq!(pool.auto(auto("b.NEF"), None).unwrap(), 2);
+        let mut names = Vec::new();
+        for _ in 0..2000 {
+            for done in pool.collect().unwrap() {
+                if let Done::Auto { request, .. } = done {
+                    names.push(request.path);
+                }
+            }
+            if names.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            names,
+            [
+                PathBuf::from("/td-photo/none/a.NEF"),
+                PathBuf::from("/td-photo/none/b.NEF")
+            ]
+        );
+        assert_eq!(pool.outstanding().unwrap(), 0);
+    }
+
     #[test]
     fn the_pool_runs_an_export_and_reports_what_came_of_it() {
         let pool = Pool::start(1).unwrap();
@@ -2755,7 +3004,10 @@ mod tests {
             .iter()
             .filter_map(|done| match done {
                 Done::Thumb { key, .. } => Some(key.name.clone()),
-                Done::Develop { .. } | Done::Export { .. } | Done::Prefetched { .. } => None,
+                Done::Develop { .. }
+                | Done::Export { .. }
+                | Done::Auto { .. }
+                | Done::Prefetched { .. } => None,
             })
             .collect();
         names.sort_unstable();

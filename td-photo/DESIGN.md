@@ -112,7 +112,8 @@ modes are the photographer's order of work.
 3. **Develop** shows one photo developed from its raw data, entered with `d`
    on the cursor's photo and left with `Escape`. `=`/`-` move exposure by a
    third of a stop and their shifted pair `+`/`_` by a tenth, `.`/`,` move
-   contrast by a tenth, `0` resets to camera defaults, and the crop and the
+   contrast by a tenth, `a` chooses both from the photo's tones (Auto), `0`
+   resets to camera defaults, and the crop and the
    look are set by the `crop` and `look` actions, taking the box's four
    fractions or a look's stem, and the crop
    also over the preview: a marquee tightens it to a sub-region, and a
@@ -174,7 +175,7 @@ window, all speaking the toolkit's one vocabulary.
   in `ui` (open a roll, choose one, the cursor moves, select, pick, reject,
   unflag, the four filters, the single view and back, scroll, quit, enter
   develop and its exposure nudges and absolute `exposure`, its contrast
-  nudges and absolute `contrast`, look and the
+  nudges and absolute `contrast`, `auto`, look and the
   look shortcuts `look-1`..`look-9`, crop and `uncrop`, crop-adjust, aspect,
   the look palette (`looks`), reset, undo and the history's step toggle and
   delete, the zoom (`zoom-fit`, `zoom-100`, `zoom-in`, `zoom-out`), export,
@@ -372,7 +373,19 @@ window, all speaking the toolkit's one vocabulary.
   release over a band are `Ignored`, and never start a crop drag. The
   `exposure` action takes the sidecar's own spelling (`-1.25`), bad-argument
   otherwise, and sets it through an `Edit` like a look; so does `contrast`
-  (`-0.40`). The slider: a
+  (`-0.40`). `auto` (`a`) asks for an `Auto` effect: the adapter reads the
+  crop and the history from the sidecar as the file holds it (a sidecar the
+  reader refuses is `refused`), measures the photo (Auto) and writes one auto
+  step on the file as it is then, but only while its history is the one read:
+  a step written after an edit made meanwhile (`a` then `=` before the
+  measure lands) would shadow that edit, so such a measure is superseded,
+  nothing written and the status row's note saying so. The replay measures
+  within the request, a frame that cannot be decoded `refused`; the window
+  hands the measure to its pool, `changed` as it is queued, and writes the
+  step as the measure lands, a measure that failed or a step the file refuses
+  (a full history) the status row's note. `edit FILE auto` reads the file
+  again after measuring and fails, writing nothing, when its history moved.
+  The slider: a
   press on it moves the knob to the pointer's step and starts a drag that
   follows the pointer's column wherever it goes, each step it crosses a
   frame change and no write; its release commits the step it rests on as
@@ -751,16 +764,26 @@ The library is folders of originals; there is no database.
   keys survive an earlier one's edit; a known key given twice, a blank line, or
   a line that is not `key value` is a fault. The develop history follows the
   lines as `step-N on|off KEY VALUE` (`N` from 1 in order without a leading
-  zero, `KEY` a develop key, `VALUE` in its grammar or `-` for a clear). A
-  step whose `KEY` this version does not know, in the key grammar and not the
-  flag, is a later version's (`StepKey::Later`): kept with its value as
+  zero, `KEY` a develop key, `VALUE` in its grammar or `-` for a clear), or
+  `step-N on|off auto E C`, an auto step (Auto): `E` an exposure and `C` a
+  contrast in their grammars, never a clear, setting both keys as one step,
+  so one undo, toggle or delete takes both. A step whose `KEY` this version
+  does not know, in the key grammar and neither the flag nor `step-`
+  prefixed, is a later version's (`StepKey::Later`): kept with its value as
   written and in its place, left out of the fold and written back, and
   undone, turned off or deleted as any step, so that version's history
-  survives this one's edit. Versions before `contrast` refused such a step,
+  survives this one's edit; its summary line is an unknown line here, so it
+  outlives a history this version empties (an undo of its last step, a
+  reset). Versions before `contrast` refused such a step,
   and with it the whole sidecar, so a photo whose history has a contrast
   step cannot be read by them (a deployment rolled back past it shows the
   photo at camera defaults with the error, and its flag and edits cannot be
-  changed or exported there until it is rolled forward):
+  changed or exported there until it is rolled forward); versions before
+  `auto` read an auto step as a later version's, so its exposure and contrast
+  are not in force there, and a write there (a flag, say) drops their lines
+  from the file, which this version derives again from the history. The auto
+  step's value is held to `E C`, so a later version that adds to it takes a
+  new key rather than widening `auto`, which this one would refuse:
 
   ```text
   step-1 on exposure -0.33
@@ -1122,6 +1145,39 @@ per matrix, six loads and a few multiplies per tone or three-channel curve, and
 a few multiplies (one division for a luminance curve) per mix or luminance
 step; which is what makes the preview redraw at frame cadence over a whole
 canvas on one core and in a few milliseconds across the pool.
+
+### Auto
+
+`auto` (`a` in develop mode; `edit FILE auto` headless) chooses a photo's
+exposure and contrast from its tones as one step of its history (Files,
+Sidecar). The measure is the photo developed at 0 EV with no contrast or look
+over the crop its sidecar holds, at `auto::EDGE` (600) pixels on the long
+side, from the cached level 0 when the window holds it; its luminance per
+pixel is `LUMA` over the sRGB decode of the frame. `auto::choose` then takes:
+
+- the exposure: one stop, plus half the photo's distance in stops below a key
+  of 0.06 (a photo above it given that much less), the key the mean of the
+  luminance's base-2 logarithm (each luminance floored at 1e-5); no more than
+  puts the luminance at the 99.5th percentile a stop past white; then within
+  -1.00..=2.50 and rounded to hundredths;
+- the contrast: of 0.40..=0.90, the first whose curve
+  (`look::contrast_curve`), after that exposure, puts the sRGB-encoded tenth
+  and ninetieth percentiles of the luminance closest to 0.60 apart.
+
+The constants are fitted on a 140-frame Z 8 roll against the owner's
+darktable exports of 33 of its frames and hand exposures of 7. Matching
+darktable's display tenth, fiftieth and ninetieth percentiles frame by frame
+put its exports at a median +1.00 stop and 0.68 contrast over td-photo's 0 EV,
+the exposure barely following the key (the camera had metered the frames;
+darktable's scene-referred default adds most of that stop); the hand
+exposures followed it closely. Half the distance sits between them: the rule
+lands a mean 0.054 from darktable's display percentiles (a fixed +1.00 and
+0.65 is 0.043, the whole distance 0.065) and 0.21 of a stop from the hand
+exposures (the fixed 0.29). The spread is darktable's median, and its range
+keeps a flat or a contrasty frame off the tone's extremes. The pipeline has no
+shoulder past white (Pipeline), so the highlight bound is what keeps a dark
+frame around a bright part from clipping that part for the key's sake. Auto
+is a starting point, not a verdict: a nudge after it is a step of its own.
 
 ### Levels and memoization
 
@@ -1578,8 +1634,7 @@ than shows none, and the grid scrolls by rows, keeping the cursor's row shown.
 The single view shows the name, the facts and the largest 3:2 box under them,
 the cursor's photo developed into the box as develop's is (its sidecar's
 crop, exposure, contrast and look applied, at the fit: the zoom, the crop drag
-and
-the bands are develop's), so `develop_box` is that box there and the
+and the bands are develop's), so `develop_box` is that box there and the
 window's develop path, its memo and the neighbours' prefetch serve both
 views; develop mode shows the name row and the box (no facts row: the
 bands take the
@@ -1732,24 +1787,35 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   jobs are `Thumbnail`, `Preview` — the develop preview, at most one at a
   time, run from the level an edit invalidates (`Decode`, `Level1`, `Level2` or
   `Level3`, planned from the window's memo, so an exposure or look edit reruns
-  level 3 alone and a resize level 2) — and `Export`, the verb's runner over
-  the request the session read on the dispatch, with the cached level 0 when
-  the window held one at submission. Exports are not wants: a replacement of
-  the wants leaves them queued, they run in order one at a time beside the
-  develop (a thumbnail and the develop are taken first), and a closing pool
-  hands out the exports alone until none is left queued or in flight, so a
-  `quit` waits for the exports asked for rather than dropping them. A
-  thumbnail in the running set and the develop in its in-flight slot stay
+  level 3 alone and a resize level 2) — `Auto`, the measure over the crop the
+  session read on the dispatch, and `Export`, the verb's runner over the request
+  the session read on the dispatch, each with the cached level 0 when the window
+  held one at submission. A measure is not a want: a replacement of the wants
+  leaves it queued; measures run one at a time, after a thumbnail and the
+  develop and before an export, and stay outstanding until the turn loop
+  collects the result, so `wait-idle` holds until the step is written, and the
+  frame it decoded joins the raw cache as an export's does (the collect frees
+  the slot and wakes the workers for the next, which a measure that changed no
+  file would otherwise leave waiting, no generation moving); the turn writes it
+  on the file as it is then, the photo found by name in the roll still held (its
+  index may have moved, and another roll's or a moved photo's measure is
+  dropped); a closing window hands the pool no measure asked for in its last
+  turn, and a closing pool drops the measures queued and the one in flight
+  writes nothing, the files untouched. Exports are not wants either: a
+  replacement of the wants leaves them queued, they run in order one at a time
+  beside the develop (a thumbnail and the develop are taken first), and a
+  closing pool hands out the exports alone until none is left queued or in
+  flight, so a `quit` waits for the exports asked for rather than dropping them.
+  A thumbnail in the running set and the develop in its in-flight slot stay
   outstanding until the turn loop collects the result; an export, queued or in
   its slot, until the worker sends the result, which it does under the queue's
-  lock as it leaves the slot and wakes the workers waiting for it, so the
-  window never counts an export it holds the result of nor misses one whose
-  result is unsent, and a closing pool, with no turn loop to collect, still
-  drains its exports. The worker notes a failed export's reason on stderr, so
-  one that fails after the window closed is reported. The count never reads
-  zero with a result made and not yet sent. A finished thumbnail is
-  kept whichever wants asked for it, since it is the file's; the later jobs'
-  results the turn loop
+  lock as it leaves the slot and wakes the workers waiting for it, so the window
+  never counts an export it holds the result of nor misses one whose result is
+  unsent, and a closing pool, with no turn loop to collect, still drains its
+  exports. The worker notes a failed export's reason on stderr, so one that
+  fails after the window closed is reported. The count never reads zero with a
+  result made and not yet sent. A finished thumbnail is kept whichever wants
+  asked for it, since it is the file's; the later jobs' results the turn loop
   compares before applying. Thumbnails are held in memory by name for the roll
   that is open at the surface's scale (a job is keyed by roll, name and scale,
   so another roll's file of the same name is another thumbnail; the held set is
@@ -1767,8 +1833,9 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   is being prefetched or waiting to be collected, so it is never taken ahead
   of what is asked for (a decode once begun runs to its end, so a develop
   asked for meanwhile takes another worker), and never of the photo the
-  develop or the export in flight is decoding (that frame is cached as it
-  lands); asked for only while the pool has a worker to spare
+  develop, the export or the measure in flight is decoding (each caches that
+  frame as it lands), nor while a measure is queued; asked for only while the
+  pool has a worker to spare
   (`MIN_PREFETCH_WORKERS`, 2: on one worker it would hold the develop up)
   and the raw cache has room for a frame the size of its largest without an
   eviction. It is not a job: the count and `wait-idle` leave it out, since
@@ -1942,6 +2009,17 @@ and `0.80` to another, and refuses `--contrast 1.50`, and
 `tests/control_process.rs`'s `--preview --develop` case holds a sidecar's
 contrast to the develop box's pixels.
 
+`tests/auto.rs` holds the rule on grey frames: nothing to measure no choice, a
+frame at the key given a stop and one two stops darker half their distance more,
+black and white at the exposure's ends, a dark frame around a white part held a
+stop past white at the 99.5th percentile and a smaller part not binding, the
+luminance weighing a red and a green frame by `LUMA`, and a narrow, a middle and
+a wide frame given the most, a middling and the least contrast, each the one in
+range whose spread is nearest the target. `tests/nef.rs`'s `edit FILE auto` case
+holds the step to the rule over `develop`'s frame at the measure's edge, whole
+and cropped, the same choice again no step, undone step by step, and a sidecar
+the reader refuses refusing the measure with the file kept.
+
 `tests/jpeg.rs` carries a synthetic baseline JPEG writer (fixed complete
 DC and incomplete AC tables, byte stuffing, restart markers, 8- and
 16-bit quantisers) and an in-test reference of the decoder's arithmetic
@@ -2042,13 +2120,19 @@ unchanged.
 Unit tests in `settings` pin the file's grammar: the text reading back, a
 key left out at its default, every refusal by name, and the actions'
 words; in `image` the shrink's sizes, shares, means, bands and refusals
-as above; and in `main` the batch note's counts.
+as above; and in `main` the batch note's counts and a landed measure
+writing its step by name, noted when it failed or the file refused the step
+(a full history), superseded with nothing written when the history moved
+since it was asked for, and dropped for another roll.
 
 `tests/library.rs` holds the sidecar grammar to its refusals by name and to
 in-place rewriting around an unknown line, the canonical value spellings,
 contrast's range and its nudges and exposure's clamped as one step a run, a
 later version's step kept in place and written back, taken by undo, toggle
-and delete, beside a flag step and a known key's bad value refused, and
+and delete, beside a flag step and a known key's bad value refused, an auto
+step setting both keys, taken up when last and on (one turned off not), no
+step for the values held, refused by a full history, undone, toggled and
+deleted as one, a nudge after it its own, its grammar and its refusals, and
 the roll and dating rules with a two-IFD TIFF carrying only a capture time; and
 runs the built binary over a temporary library: an import dated and undated,
 eight folders deep and not nine, through a linked source and past a linked
@@ -2168,7 +2252,13 @@ judged, `--preview` equal to the seam's frame of the empty window and of a roll
 and refused for a bad size or roll, `develop_box` the preview box only in
 develop mode, contrast nudged by `.` and `,` and set by `contrast` (ignored
 outside develop, a bad spelling `bad-argument`, a run of nudges one step,
-the value last in `state` and `photo`), the crop set over the develop preview (a
+the value last in `state` and `photo`), `auto` and `a` asking the adapter
+for the cursor photo's measure (ignored outside develop, one step labelled
+`auto E C`, the same values no step, one undo taking both), the replay
+writing the step `edit FILE auto` writes over the sidecar's crop (the whole
+frame choosing otherwise) and refusing a frame it cannot decode and a refused
+sidecar over a decodable one with nothing written, the crop set over the
+develop preview (a
 marquee armed,
 rubber-banded and committed as a sub-region of the current crop, a click, a
 sub-minimum marquee and an off-canvas press refused, the develop box the
@@ -2284,6 +2374,11 @@ current, and a zoom of a cached photo not current from level 1), untouched by a
 failed develop, caching but not becoming current for a develop that finishes off
 the cursor, the raw cache evicting the least recently shown under
 `RAW_CACHE_BYTES`, an export keyed by its own path as the memo keys it, and the
+measures surviving a replacement of the wants, run one at a time after a
+thumbnail and the develop and before an export, outstanding until collected in
+the queue and in the pool, the next handed to a waiting worker by the collect,
+no prefetch ahead of a queued one nor of the photo being measured, and handed
+out by no closing queue, and the
 exports surviving a replacement of the wants, running in order one at a time
 after a thumbnail and the develop, draining alone from a closing queue once none
 is in flight, coming back from the pool with why one failed and leaving the
@@ -2304,7 +2399,9 @@ NEF, develops the cursor photo over the socket and holds the captured tile to
 `--preview --develop` of the roll before and after an exposure edit, zooms
 to 100% over the socket (the tile `--preview --develop --zoom`, the box
 changed) and back to the fit (the tile the fitted frame again), and holds
-it again after a contrast edit (`contrast-in`, the box changed), then
+it again after a contrast edit (`contrast-in`, the box changed) and after
+`auto` (the step the one `edit FILE auto` writes after the same steps,
+written by the time `wait-idle` answers, the box changed), then
 exports over the socket: with the sidecar naming a look no file provides the
 export fails and the row says so with nothing written, and with the look cleared
 `wait-idle` waits for the pool's export, the JPEG is in `exported/` and the row

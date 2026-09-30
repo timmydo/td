@@ -29,6 +29,7 @@ fn names(dir: &str, extension: &str) -> BTreeSet<String> {
 }
 
 const PURE: &[&str] = &[
+    "auto.rs",
     "av1.rs",
     "avif.rs",
     "camera.rs",
@@ -58,6 +59,7 @@ fn source_inventory_is_closed() {
         .collect();
     assert_eq!(names("src", "rs"), expected);
     let tests: BTreeSet<String> = [
+        "auto.rs",
         "av1.rs",
         "confinement.rs",
         "control_process.rs",

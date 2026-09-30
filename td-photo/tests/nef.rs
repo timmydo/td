@@ -1669,6 +1669,93 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `edit FILE auto` measures the photo developed at 0 EV with no
+/// contrast or look over its crop, as `develop` renders it at the measure's
+/// long edge, writes what `auto::choose` gives it as one step, takes that
+/// step up when run again, and is undone as one.
+#[test]
+fn the_edit_verb_chooses_exposure_and_contrast_from_the_tones() {
+    use std::ffi::OsStr;
+    let dir = scratch("auto");
+    let (w, h) = (64, 32);
+    let file = dir.join("DSC_0001.NEF");
+    std::fs::write(
+        &file,
+        Synth::lossless(w, h, &wandering_frame(w, h, 14, 900, 5)).build(),
+    )
+    .unwrap();
+    let sidecar = dir.join("DSC_0001.NEF.edit");
+    // The measure's frame, rendered by the verb and chosen from here.
+    let expected = |name: &str, crop: Option<&str>| {
+        let out = dir.join(name);
+        let edge = td_photo::auto::EDGE.to_string();
+        let mut args = vec![
+            OsStr::new("develop"),
+            file.as_os_str(),
+            out.as_os_str(),
+            OsStr::new("--long-edge"),
+            OsStr::new(&edge),
+        ];
+        if let Some(crop) = crop {
+            args.extend([OsStr::new("--crop"), OsStr::new(crop)]);
+        }
+        let (ok, _, stderr) = run(&args);
+        assert!(ok, "{stderr}");
+        let ppm = std::fs::read(&out).unwrap();
+        let image = td_photo::image::read_ppm(&ppm).unwrap();
+        td_photo::auto::choose(&image).unwrap()
+    };
+    let edit = |words: &[&str]| {
+        let mut args = vec![OsStr::new("edit"), file.as_os_str()];
+        args.extend(words.iter().map(OsStr::new));
+        let (ok, stdout, stderr) = run(&args);
+        assert!(ok, "{stderr}");
+        stdout
+    };
+    let whole = expected("whole.ppm", None);
+    edit(&["exposure", "0.33"]);
+    edit(&["auto"]);
+    let text = std::fs::read_to_string(&sidecar).unwrap();
+    let step = format!(
+        "step-2 on auto {}\n",
+        td_photo::library::auto_text(whole.exposure, whole.contrast)
+    );
+    assert!(text.ends_with(&step), "{text}");
+    // Again, over the same frame: the same step, not another.
+    edit(&["auto"]);
+    assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), text);
+    // Over a crop, the cropped region is measured, a step after the crop.
+    let crop = "0.5000 0.0000 0.5000 1.0000";
+    let cropped = expected("cropped.ppm", Some(crop));
+    assert_ne!(cropped, whole);
+    edit(&["crop", "0.5000", "0.0000", "0.5000", "1.0000"]);
+    edit(&["auto"]);
+    let text = std::fs::read_to_string(&sidecar).unwrap();
+    let step = format!(
+        "step-4 on auto {}\n",
+        td_photo::library::auto_text(cropped.exposure, cropped.contrast)
+    );
+    assert!(text.ends_with(&step), "{text}");
+    // Each undo takes one step back, an auto step its exposure and
+    // contrast together.
+    edit(&["undo"]);
+    edit(&["undo"]);
+    edit(&["undo"]);
+    let text = std::fs::read_to_string(&sidecar).unwrap();
+    assert_eq!(
+        text,
+        "td-photo edit 1\nexposure 0.33\nstep-1 on exposure 0.33\n"
+    );
+    // A sidecar the reader refuses refuses the measure, the file kept.
+    std::fs::write(&sidecar, "td-photo edit 1\nflag maybe\n").unwrap();
+    let (ok, _, _) = run(&[OsStr::new("edit"), file.as_os_str(), OsStr::new("auto")]);
+    assert!(!ok);
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).unwrap(),
+        "td-photo edit 1\nflag maybe\n"
+    );
+}
+
 #[test]
 fn the_command_line_exports_into_the_rolls_folder() {
     use std::ffi::OsStr;

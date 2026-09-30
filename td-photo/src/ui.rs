@@ -196,6 +196,12 @@ pub enum Effect {
         key: Key,
         delta: i32,
     },
+    /// Choose this photo's exposure and contrast from its tones, over the
+    /// crop its sidecar holds then, as one auto step, and settle the
+    /// model: the replay measures and writes within the request, the
+    /// window hands the measure to its pool and writes the step on the
+    /// file as it is when the measure lands.
+    Auto { index: usize, name: String },
     /// Reset this photo's develop keys to camera defaults, keeping the
     /// flag, on the file as it is then, and settle the model.
     Reset { index: usize, name: String },
@@ -294,6 +300,7 @@ pub enum Action {
     ContrastIn,
     ContrastOut,
     Contrast,
+    Auto,
     /// The Nth (from 1) of the available looks, `F1`..`F9`.
     LookAt(u8),
     ZoomFit,
@@ -312,7 +319,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 61] = [
+    pub const ALL: [Action; 62] = [
         Action::Open,
         Action::Choose,
         Action::Next,
@@ -352,6 +359,7 @@ impl Action {
         Action::ContrastIn,
         Action::ContrastOut,
         Action::Contrast,
+        Action::Auto,
         Action::LookAt(1),
         Action::LookAt(2),
         Action::LookAt(3),
@@ -417,6 +425,7 @@ impl Action {
             Self::ContrastIn => "contrast-in",
             Self::ContrastOut => "contrast-out",
             Self::Contrast => "contrast",
+            Self::Auto => "auto",
             Self::LookAt(1) => "look-1",
             Self::LookAt(2) => "look-2",
             Self::LookAt(3) => "look-3",
@@ -463,7 +472,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 61] = [
+pub const BINDINGS: [Binding; 62] = [
     Binding {
         name: "open",
         chord: None,
@@ -697,6 +706,12 @@ pub const BINDINGS: [Binding; 61] = [
         chord: None,
         arguments: "VALUE",
         help: "Set the contrast to VALUE, two decimals in -1.00..1.00, the tone's steepness about grey 2^VALUE (develop mode).",
+    },
+    Binding {
+        name: "auto",
+        chord: Some("a"),
+        arguments: "",
+        help: "Choose the exposure and contrast from the photo's tones, one step (develop mode).",
     },
     Binding {
         name: "look-1",
@@ -3549,6 +3564,7 @@ impl Controller {
             (Action::ContrastIn, []) => return self.nudge(Key::Contrast, CONTRAST_STEP, effects),
             (Action::ContrastOut, []) => return self.nudge(Key::Contrast, -CONTRAST_STEP, effects),
             (Action::Contrast, [value]) => return self.set_contrast(value, effects),
+            (Action::Auto, []) => return self.auto(effects),
             (Action::Look, [stem]) => return self.set_look(stem, effects),
             (Action::Crop, [x, y, w, h]) => return self.set_crop(x, y, w, h, effects),
             (Action::AdjustCrop, []) => self.toggle_adjust()?,
@@ -4251,6 +4267,15 @@ impl Controller {
         )
     }
 
+    /// Asks for the cursor photo's auto exposure and contrast, measured and
+    /// written at the adapter.
+    fn auto(&mut self, effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        self.develop_effect(index, |index, name| Effect::Auto { index, name }, effects)
+    }
+
     /// Sets the look to the `n`th (from 1) of the available looks, the
     /// look strip's order; `Ignored` when there is no such look.
     fn look_at(&mut self, n: usize, effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
@@ -4835,8 +4860,7 @@ impl Controller {
     }
 
     /// Adjusts the cursor photo's exposure or contrast by `delta`
-    /// hundredths.
-    /// The delta is applied to the file's exposure at the adapter, not the
+    /// hundredths, applied to the file's value at the adapter, not the
     /// model's copy, so a value changed meanwhile is added to, and a delta
     /// that clamps to no change settles as `Ignored`.
     fn nudge(

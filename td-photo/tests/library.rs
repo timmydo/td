@@ -807,6 +807,98 @@ fn a_later_versions_steps_survive_this_ones_edit() {
     }
 }
 
+/// An auto step sets exposure and contrast at once and is undone,
+/// turned off and deleted as one; auto again takes up the last auto step
+/// and values the keys hold are no step; a nudge after it is its own
+/// step; the step's value is held to both grammars and is never a clear.
+#[test]
+fn an_auto_step_sets_exposure_and_contrast_as_one() {
+    assert_eq!(library::auto("1.12 0.60"), Some((112, 60)));
+    assert_eq!(library::auto_text(-50, 40), "-0.50 0.40");
+    for bad in [
+        "1.12",
+        "1.12 0.60 0.10",
+        "9.00 0.60",
+        "1.12 1.50",
+        "1.12  0.60",
+    ] {
+        assert_eq!(library::auto(bad), None, "{bad}");
+    }
+    let mut sidecar = Sidecar::default();
+    sidecar.set(Key::Exposure, Some("0.33")).unwrap();
+    sidecar.auto(112, 60).unwrap();
+    assert_eq!(sidecar.exposure(), Some(112));
+    assert_eq!(sidecar.contrast(), Some(60));
+    assert_eq!(sidecar.steps().len(), 2);
+    assert_eq!(sidecar.steps()[1].key, StepKey::Auto);
+    assert_eq!(
+        sidecar.text(),
+        "td-photo edit 1\nexposure 1.12\ncontrast 0.60\nstep-1 on exposure 0.33\nstep-2 on auto 1.12 0.60\n"
+    );
+    // Auto again takes up the last auto step; the same values are none.
+    sidecar.auto(90, 45).unwrap();
+    assert_eq!(sidecar.steps().len(), 2);
+    assert_eq!(sidecar.steps()[1].text(), "on auto 0.90 0.45");
+    let before = sidecar.clone();
+    sidecar.auto(90, 45).unwrap();
+    assert_eq!(sidecar, before);
+    // One undo takes both back.
+    assert!(sidecar.undo());
+    assert_eq!(sidecar.exposure(), Some(33));
+    assert_eq!(sidecar.contrast(), None);
+    // A nudge after an auto step is a step of its own; turning the auto
+    // step off leaves the nudged exposure over the one before it.
+    sidecar.auto(112, 60).unwrap();
+    sidecar.nudge(Key::Exposure, 10).unwrap();
+    assert_eq!(sidecar.steps().len(), 3);
+    assert_eq!(sidecar.exposure(), Some(122));
+    assert!(sidecar.toggle_step(1));
+    assert_eq!(sidecar.exposure(), Some(122));
+    assert_eq!(sidecar.contrast(), None);
+    assert!(sidecar.toggle_step(1));
+    assert_eq!(sidecar.contrast(), Some(60));
+    assert!(sidecar.delete_step(1));
+    assert_eq!(sidecar.contrast(), None);
+    // An auto step turned off is not taken up: auto again is a new step.
+    let mut off = Sidecar::default();
+    off.auto(112, 60).unwrap();
+    assert!(off.toggle_step(0));
+    off.auto(90, 45).unwrap();
+    assert_eq!(off.steps().len(), 2);
+    assert_eq!(off.steps()[0].text(), "off auto 1.12 0.60");
+    // A full history refuses it, as any step.
+    let mut text = String::from("td-photo edit 1\n");
+    for n in 1..=library::MAX_STEPS {
+        text.push_str(&format!("step-{n} on look mono\n"));
+    }
+    let mut full = Sidecar::parse(text.as_bytes()).unwrap();
+    assert_eq!(full.auto(112, 60), Err(Error::HistoryFull));
+    // An absent key holds zero, so auto choosing zero for both is no step.
+    let mut empty = Sidecar::default();
+    empty.auto(0, 0).unwrap();
+    assert_eq!(empty, Sidecar::default());
+    assert_eq!(empty.auto(600, 60), Err(Error::Value(Key::Exposure)));
+    assert_eq!(empty.auto(100, 150), Err(Error::Value(Key::Contrast)));
+    // A file's auto step folds as it was written.
+    let text = "td-photo edit 1\nexposure 1.12\ncontrast 0.60\nstep-1 on auto 1.12 0.60\n";
+    let parsed = Sidecar::parse(text.as_bytes()).unwrap();
+    assert_eq!(parsed.text(), text);
+    assert_eq!(
+        (parsed.exposure(), parsed.contrast()),
+        (Some(112), Some(60))
+    );
+    for bad in [
+        "step-1 on auto -\n",
+        "step-1 on auto 1.12\n",
+        "step-1 on auto 1.12 2.00\n",
+    ] {
+        assert!(
+            Sidecar::parse(format!("td-photo edit 1\n{bad}").as_bytes()).is_err(),
+            "{bad}"
+        );
+    }
+}
+
 #[test]
 fn contrast_goes_through_edit_and_list() {
     let temp = Temp::new("contrast");
