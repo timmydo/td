@@ -89,10 +89,19 @@ fn buffer() -> Buffer {
         .unwrap()
 }
 pub fn label() -> &'static str {
-    match std::env::var("TD_MTA_TEST_PEER_VERSION").unwrap().as_str() {
-        "1.2" => "remote12",
-        "1.3" => "remote13",
-        _ => panic!("invalid fixture version"),
+    let large = match std::env::var("TD_MTA_TEST_PEER_LARGE_TICKET").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => panic!("invalid fixture ticket mode"),
+    };
+    match (
+        std::env::var("TD_MTA_TEST_PEER_VERSION").unwrap().as_str(),
+        large,
+    ) {
+        ("1.2", false) => "remote12",
+        ("1.3", false) => "remote13",
+        ("1.3", true) => "remote13large",
+        _ => panic!("invalid fixture version/ticket combination"),
     }
 }
 fn exchange(client: &mut TlsConnection<Buffer>, value: u8) {

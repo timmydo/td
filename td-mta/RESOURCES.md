@@ -919,10 +919,10 @@ claim. Those controls run separately so they do not warm scenario processes.
 
 The existing phase names are retained. Rows have `rss SCENARIO PHASE KIB`,
 where SCENARIO is client, handshake, entropy, fragment, large-chain, generation,
-remote12 or remote13. The `rss-observation-v2: SCENARIO passed` record
-closes each output. Samples use fixed arrays and are formatted after scenario
-teardown. Positive controls use the control scenario with baseline, touched
-and dropped phases.
+remote12, remote13 or remote13large. The completion record is
+`rss-observation-v2: SCENARIO passed`. Samples use fixed arrays and are
+formatted after scenario teardown. Positive controls use the control scenario
+with baseline, touched and dropped phases.
 
 RSS includes resident code, stacks, shared pages, allocator overhead, fixture
 material and the observer itself. It is neither a disjoint native-allocation
@@ -977,34 +977,37 @@ more than 63 KiB but at most 65000 bytes. A private td-crypto process peer loads
 those DER files directly; this remote fixture can exceed the local 64 KiB PEM
 input ceiling without changing that ceiling. It restricts each connection to
 TLS 1.2 or TLS 1.3. Its private TLS 1.3 ticketer emits two opaque 16000-byte
-test payloads and counts both emissions; it performs no encryption and refuses
-all resumption. Keys, peer allocations and controller work are outside the
-observed process. All sockets are loopback, all material is private temporary
-test data, and children have bounded waits with owned cleanup. Instrumented
-processes never spawn children. Cleanup runs on normal return and unwinding;
-an outer hard kill can leave children and temporary material until runtime
-namespace cleanup.
+test payloads and counts both emissions. The additional
+`remote_large_ticket_observations` controller case emits one 65000-byte ticket
+under TLS 1.3, identified as remote13large. Neither mode performs encryption
+or accepts resumption. Keys, peer allocations and controller work are outside
+the observed process. All sockets are loopback, all material is private
+temporary test data, and children have bounded waits with owned cleanup.
+Instrumented processes never spawn children. Cleanup runs on normal return and
+unwinding; an outer hard kill can leave children and temporary material until
+runtime namespace cleanup.
 
-For each version, the runner starts three fresh controllers. Each controller
-starts one Rust, native or unwrapped RSS observer with an explicit peer address
-and root. Eleven snapshots cover baseline, loaded configuration/root, client
-generation,
-reserved wire buffers/socket, session construction, authenticated handshake,
-one echoed 16 KiB record, thirty-two further verified echoes, client release,
-returned-buffer release and final owner teardown. Both counter domains require
-stable requested bytes across repeated records; native also checks blocks.
-Dropping the returned pair must release exactly 36874 requested bytes and two
-native blocks. The handshake must report the requested version and server-name
-verification. Record processing includes any queued tickets; it does not
-isolate their transient peak. Fixture configuration and trust remain alive
-through client and buffer release.
+For each version/ticket mode, the runner starts three fresh controllers. Each
+controller starts one Rust, native or unwrapped RSS observer with an explicit
+peer address and root. Eleven snapshots cover baseline, loaded
+configuration/root, client generation, reserved wire buffers/socket, session
+construction, authenticated handshake, one echoed 16 KiB record, thirty-two
+further verified echoes, client release, returned-buffer release and final
+owner teardown. Both counter domains require stable requested bytes across
+repeated records; native also checks blocks. Dropping the returned pair must
+release exactly 36874 requested bytes and two native blocks. The handshake
+must report the requested version and server-name verification. Record
+processing includes any queued tickets; it does not isolate their transient
+peak. Fixture configuration and trust remain alive through client and buffer
+release.
 
 The portable runner requires a successful controller test, unique observation
-boundaries, exact domain/version completion and every ordered inner row before
-printing measurements. Allocation records use distinct remote12/remote13 v1
-schemas; RSS uses v2. Each controller has a separate bounded output log and
-thirty-second outer deadline. These are test-only environment channels, not
-service configuration or a public backend interface.
+boundaries, exact v2 domain/scenario completion and every ordered inner row
+before printing measurements. Allocation records use distinct remote12,
+remote13 and remote13large v1 schemas; RSS uses v2. Earlier controller
+completion versions are refused. Each controller has a separate bounded output
+log and thirty-second outer deadline. These are test-only environment
+channels, not service configuration or a public backend interface.
 
 The repeated-to-released delta exposes client-owned requested heap; adding the
 separately released wire pair counts each once. It still excludes shared
@@ -1012,8 +1015,10 @@ configuration, fixed objects, stacks and allocator overhead. In host and
 qualified musl runs this subtotal already exceeds the 128 KiB session target.
 Complete worst-case accounting must precede a ledger revision. Retained bytes,
 lifetime high-water observations and sampled RSS remain distinct, and the
-Rust/native domains overlap. This fixture is not maximum simultaneous queued traffic,
-maximum tickets, mTLS or complete service qualification. Larger fragmented
-tickets require separate progress/refusal and memory qualification. It leaves
-the known session-admission blocker explicit rather than treating configured
-queue limits as a whole-memory bound.
+Rust/native domains overlap. This fixture is not maximum simultaneous queued
+traffic, maximum tickets, mTLS or complete service qualification. The
+large-ticket case covers one near-ceiling fragmented ticket. Socket-free
+crypto fixtures also qualify selected accepted flights and terminal refusal
+of two 48000-byte tickets in one flight; they do not establish an exact
+threshold or refusal-memory peak. The known session-admission blocker remains
+explicit; configured queue limits are not a whole-memory bound.

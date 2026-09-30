@@ -98,12 +98,29 @@ fn wait(peer: &mut Peer, start: Instant, log: &std::path::Path) {
 #[test]
 #[ignore = "invoked by the isolated runner with explicit peer and observer paths"]
 fn remote_chain_observations() {
+    observe(false);
+}
+
+#[test]
+#[ignore = "invoked by the isolated runner with explicit peer and observer paths"]
+fn remote_large_ticket_observations() {
+    observe(true);
+}
+
+fn observe(large_ticket: bool) {
     let domain = std::env::var("TD_MTA_TEST_MEMORY_DOMAIN").unwrap();
     assert!(matches!(domain.as_str(), "rust" | "native" | "rss"));
     let version = std::env::var("TD_MTA_TEST_PEER_VERSION").unwrap();
     assert!(matches!(version.as_str(), "1.2" | "1.3"));
+    let scenario = match (version.as_str(), large_ticket) {
+        ("1.2", false) => "remote12",
+        ("1.3", false) => "remote13",
+        ("1.3", true) => "remote13large",
+        _ => panic!("invalid fixture protocol/ticket combination"),
+    };
+    let ticket_mode = if large_ticket { "1" } else { "0" };
     let path = std::env::temp_dir().join(format!(
-        "td-mta-remote-chain-{}-{domain}-{version}",
+        "td-mta-remote-chain-{}-{domain}-{scenario}",
         std::process::id()
     ));
     std::fs::DirBuilder::new()
@@ -124,6 +141,7 @@ fn remote_chain_observations() {
             .env_clear()
             .env("TD_MTA_TEST_PEER_MATERIAL", &directory.0)
             .env("TD_MTA_TEST_PEER_VERSION", &version)
+            .env("TD_MTA_TEST_PEER_LARGE_TICKET", ticket_mode)
             .stdin(Stdio::null())
             .stdout(peer_log.try_clone().unwrap())
             .stderr(peer_log)
@@ -157,6 +175,7 @@ fn remote_chain_observations() {
             .env("TD_MTA_TEST_PEER_ADDRESS", address)
             .env("TD_MTA_TEST_PEER_MATERIAL", &directory.0)
             .env("TD_MTA_TEST_PEER_VERSION", &version)
+            .env("TD_MTA_TEST_PEER_LARGE_TICKET", ticket_mode)
             .stdin(Stdio::null())
             .stdout(output_file.try_clone().unwrap())
             .stderr(output_file)
@@ -173,5 +192,5 @@ fn remote_chain_observations() {
         .unwrap();
     assert!(text.len() <= 8192);
     println!("\nremote-chain-output-begin\n{text}remote-chain-output-end");
-    println!("remote-chain-controller-v1: {domain} {version} passed");
+    println!("remote-chain-controller-v2: {domain} {scenario} passed");
 }

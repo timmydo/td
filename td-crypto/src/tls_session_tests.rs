@@ -73,6 +73,27 @@ fn fixture() -> (Arc<ServerIdentity>, TrustStore) {
         TrustStore::from_pem(&pem("CERTIFICATE", &root)).unwrap(),
     )
 }
+// Opaque remote test payloads only; no encryption or resumption acceptance.
+#[derive(Debug)]
+struct TicketPayload {
+    bytes: usize,
+    calls: Arc<AtomicUsize>,
+}
+impl rustls::server::ProducesTickets for TicketPayload {
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn lifetime(&self) -> u32 {
+        3600
+    }
+    fn encrypt(&self, _: &[u8]) -> Option<Vec<u8>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Some(vec![0x5a; self.bytes])
+    }
+    fn decrypt(&self, _: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+}
 struct Driver {
     client: TlsSession,
     server: rustls::Connection,
@@ -98,6 +119,14 @@ impl Driver {
         version: &'static rustls::SupportedProtocolVersion,
         name: &str,
         tickets: usize,
+    ) -> Self {
+        Self::with_ticket_payload(version, name, tickets, None)
+    }
+    fn with_ticket_payload(
+        version: &'static rustls::SupportedProtocolVersion,
+        name: &str,
+        tickets: usize,
+        payload: Option<Arc<TicketPayload>>,
     ) -> Self {
         let (identity, roots) = fixture();
         let clock = ClockControl::new();
@@ -125,6 +154,9 @@ impl Driver {
         // Assign a TLS 1.2 ID so the client exercises its ignored save-time path.
         selected.session_storage = rustls::server::ServerSessionMemoryCache::new(32);
         selected.ticketer = native.ticketer.clone();
+        if let Some(payload) = payload {
+            selected.ticketer = payload;
+        }
         selected.send_tls13_tickets = tickets;
         selected.require_ems = true;
         // Test peer only: synthesize authenticated post-close control records.
@@ -983,3 +1015,76 @@ impl Live {
 
 #[path = "tls_server_session_tests.rs"]
 mod server;
+
+#[test]
+fn client_session_ticket_flight_capacity_is_terminal_after_finished() {
+    for (bytes, count, refused) in [
+        (16_000, 2, false),
+        (32_000, 2, false),
+        (48_000, 1, false),
+        (65_000, 1, false),
+        (48_000, 2, true),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut d = Driver::with_ticket_payload(
+            &rustls::version::TLS13,
+            "localhost",
+            count,
+            Some(Arc::new(TicketPayload {
+                bytes,
+                calls: calls.clone(),
+            })),
+        );
+        let config = d.client.live.as_ref().unwrap().client_config();
+        let clock = Arc::downgrade(&d.client.live.as_ref().unwrap().clock);
+        for _ in 0..10_000 {
+            d.step(false).unwrap();
+            if d.client.status().phase == TlsPhase::Open && !d.server.is_handshaking() {
+                break;
+            }
+        }
+        assert_eq!(d.client.status().phase, TlsPhase::Open);
+        assert!(!d.server.is_handshaking());
+        assert!(d.client.status().handshake.is_some());
+        assert_eq!(calls.load(Ordering::Relaxed), count);
+        let result = d.handshake(false);
+        if refused {
+            assert_eq!(result, Err(TlsError::Capacity));
+            assert_eq!(d.client.status().phase, TlsPhase::Failed);
+            assert_eq!(d.client.status().handshake, None);
+            assert_eq!(d.client.status().ciphertext_pending, 0);
+            assert_eq!(d.client.status().plaintext_pending, 0);
+            assert!(d.client.live.is_none());
+            assert!(clock.upgrade().is_none());
+            assert_eq!(
+                d.client.read_plaintext(&mut [0; 32]),
+                Err(TlsError::Capacity)
+            );
+            assert_eq!(
+                d.client.queue_plaintext(b"retired"),
+                Err(TlsError::Capacity)
+            );
+            assert_eq!(
+                d.client.drain_ciphertext(&mut [0; 32]),
+                Err(TlsError::Capacity)
+            );
+            assert!(TlsSession::client(config, "localhost").is_ok());
+        } else {
+            assert_eq!(result, Ok(()));
+            assert_eq!(d.client.status().phase, TlsPhase::Open);
+            assert!(d.client.status().handshake.is_some());
+            assert_eq!(
+                d.client.queue_plaintext(b"after tickets"),
+                Ok(TlsProgress::Bytes(13))
+            );
+            for _ in 0..1_000 {
+                if !d.step(false).unwrap() {
+                    break;
+                }
+            }
+            let mut bytes = [0; 13];
+            d.server.reader().read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"after tickets");
+        }
+    }
+}

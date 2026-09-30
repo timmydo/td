@@ -139,11 +139,21 @@ fn large_chain_server_process() {
     .with_no_client_auth()
     .with_single_cert(chain, key.into())
     .unwrap();
-    config.send_tls13_tickets = 2;
+    let large_ticket = match std::env::var("TD_MTA_TEST_PEER_LARGE_TICKET").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => panic!("invalid fixture ticket mode"),
+    };
+    let ticket_count = if large_ticket { 1 } else { 2 };
+    config.send_tls13_tickets = ticket_count;
     let tickets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let tls13 = version.version == rustls::ProtocolVersion::TLSv1_3;
+    assert!(!large_ticket || tls13);
     if tls13 {
-        config.ticketer = Arc::new(LargeOpaqueTickets(tickets.clone()));
+        config.ticketer = Arc::new(LargeOpaqueTickets {
+            calls: tickets.clone(),
+            bytes: if large_ticket { 65_000 } else { 16_000 },
+        });
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -183,7 +193,7 @@ fn large_chain_server_process() {
         stream.read_exact(&mut bytes).unwrap();
         assert_eq!(
             tickets.load(std::sync::atomic::Ordering::Relaxed),
-            if tls13 { 2 } else { 0 }
+            if tls13 { ticket_count } else { 0 }
         );
         assert!(bytes.iter().all(|&byte| byte == value));
         stream.write_all(&bytes).unwrap();
@@ -194,7 +204,10 @@ fn large_chain_server_process() {
 }
 
 #[derive(Debug)]
-struct LargeOpaqueTickets(Arc<std::sync::atomic::AtomicUsize>);
+struct LargeOpaqueTickets {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    bytes: usize,
+}
 impl rustls::server::ProducesTickets for LargeOpaqueTickets {
     fn enabled(&self) -> bool {
         true
@@ -204,8 +217,9 @@ impl rustls::server::ProducesTickets for LargeOpaqueTickets {
     }
     fn encrypt(&self, _: &[u8]) -> Option<Vec<u8>> {
         // Opaque test payload, not encryption and never accepted for resumption.
-        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(vec![0x5a; 16_000])
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(vec![0x5a; self.bytes])
     }
     fn decrypt(&self, _: &[u8]) -> Option<Vec<u8>> {
         None

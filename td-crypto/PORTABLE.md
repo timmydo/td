@@ -736,6 +736,16 @@ retains record headers: a 65511-byte malformed handshake payload fits with
 fragments lower that boundary to 65451. These fixtures qualify progress and
 refusal semantics, not preallocation, server admission or service memory/RSS.
 
+A TLS 1.3 ticket-flight case reaches authenticated Open state before consuming
+opaque synthetic tickets with resumption disabled. Two 16000-byte or two
+32000-byte tickets and single 48000-byte or 65000-byte tickets complete;
+subsequent application bytes still decrypt at the peer. Two 48000-byte tickets
+in the same backend flight exhaust retained intake capacity and permanently
+retire the session, its clock owner, evidence and output. A healthy shared
+configuration remains constructible. The backend retains completed-message
+prefixes while the flight has an incomplete handshake message. These fixed
+cases qualify progress/refusal, not an exact size boundary or memory peak.
+
 An independently encrypted TLS 1.2 HelloRequest has a valid open-connection
 warning-response baseline. After local close, with close ciphertext pending,
 partially drained or fully drained, the same request instead retires the
@@ -895,22 +905,22 @@ allocation delta.
 
 ## Remote peer-chain memory observations
 
-The existing unwrapped mail test executable additionally controls six local
-process fixtures: TLS 1.2 and TLS 1.3, each with a fresh Rust, native or RSS
-observer. A private test-only crypto server reads four synthetic DER objects
-whose total exceeds 63 KiB and fits 65000 bytes, independently of the local PEM
-loader ceiling. TLS 1.3 emits two counted opaque 16000-byte test tickets; the
-private ticketer refuses resumption and performs no encryption. Controller and
-peer allocations are outside each observer; native instrumentation never
+The existing unwrapped mail test executable additionally controls nine local
+process fixtures: TLS 1.2, TLS 1.3 with two tickets, and TLS 1.3 with one large
+ticket, each with a fresh Rust, native or RSS observer. A private test-only
+crypto server reads four synthetic DER objects whose total exceeds 63 KiB and
+fits 65000 bytes, independently of the local PEM loader ceiling. TLS 1.3 emits
+either two counted opaque 16000-byte test tickets or one 65000-byte ticket;
+the private ticketer refuses resumption and performs no encryption. Controller
+and peer allocations are outside each observer; native instrumentation never
 crosses a fork. Explicit paths select only the existing qualification
 executables, and no artifact, link flag or API is added.
 
 Each controller requires the complete authenticated handshake, verified record
 exchange and bounded child completion. Owned guards clean up on normal return
 and unwinding; outer hard kills rely on runtime namespace cleanup. The runtime
-validates unique observation markers, domain/version completion, successful test
-summary
-and eleven ordered inner rows. It refuses missing, duplicate or wrong-version
-records before printing diagnostics. RESOURCES.md defines attribution and
-limits: this is remote-chain coverage, not total session admission or an
-isolated maximum ticket-processing peak.
+validates unique observation markers, v2 domain/scenario completion, one
+successful test summary and eleven ordered inner rows. It refuses missing,
+duplicate or wrong-version records before printing diagnostics. RESOURCES.md
+defines attribution and limits: this is remote-chain coverage, not total
+session admission or an isolated maximum ticket-processing peak.

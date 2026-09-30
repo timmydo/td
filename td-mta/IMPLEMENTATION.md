@@ -940,6 +940,13 @@ Implement the remaining work as independently reviewable increments:
     TLS 1.3 tickets; complete transient, concurrency and session admission work
     remains pending.
 
+  - **M07e4e — large incoming-ticket observations:** the remote-chain fixture
+    additionally processes one 65000-byte TLS 1.3 ticket in each observation
+    domain. Separate socket-free cases qualify accepted single/paired tickets
+    and terminal capacity refusal of a larger combined flight after Finished.
+    These fixed cases leave complete simultaneous-traffic and service memory
+    admission pending; resumption remains disabled.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,
