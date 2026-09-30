@@ -821,6 +821,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-mta-transport-smoke", "tls_policy::tests::starttls_tests::server_starttls_refuses_unframed_parameterized_tailed_and_wrong_role_commands", false),
         ("td-mta-transport-smoke", "tls_policy::tests::starttls_tests::server_starttls_deadlines_clock_refusal_and_cancel_release_reservations", false),
         ("td-mta-transport-smoke", "tls_policy::tests::gateway_process_tests::gateway_starttls_process_requires_verified_pin_after_plaintext_reply", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::stack_tests::portable_tls_policy_transport_stack", true),
         ("td-mta-transport-smoke", "smtp_wire::tests::ehlo_offer_requires_a_complete_advertisement_and_no_tail", false),
         ("td-mta-transport-smoke", "smtp_wire::tests::ehlo_offer_handles_fragmentation_and_skips_malformed_extensions", false),
         ("td-mta-transport-smoke", "tls_policy::tests::client_starttls_tests::client_starttls_and_server_upgrade_verify_real_tls", false),
@@ -892,6 +893,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             let (prefix, ceiling) = match *case {
                 "portable_loader_stack" => ("config_stack_mapping_bytes=", 176 * 1024),
                 "portable_materialized_stack" => ("config_materialized_stack_mapping_bytes=", 256 * 1024),
+                "tls_policy::tests::stack_tests::portable_tls_policy_transport_stack" => ("tls_policy_transport_stack_mapping_bytes=", 256 * 1024),
                 _ => return Err("unknown portable stack qualification case".into()),
             };
             let bytes = stack_evidence(&output, prefix, ceiling)?;
@@ -899,7 +901,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
-    println!("portable runtime: sixty-four mail SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
+    println!("portable runtime: sixty-five mail SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
     Ok(())
 }
 
@@ -1058,6 +1060,11 @@ mod tests {
     fn stack_measurement_requires_one_bounded_decimal_observation() {
         for (prefix, ceiling, size) in [
             ("config_stack_mapping_bytes=", 176 * 1024, 167936),
+            (
+                "tls_policy_transport_stack_mapping_bytes=",
+                256 * 1024,
+                249856,
+            ),
             (
                 "config_materialized_stack_mapping_bytes=",
                 256 * 1024,

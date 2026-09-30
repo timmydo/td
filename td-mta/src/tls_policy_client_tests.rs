@@ -17,7 +17,7 @@ bind = "127.0.0.1:80"
 }
 
 #[test]
-fn client_only_acme_bootstrap_never_opens_server_material() {
+pub(super) fn client_only_acme_bootstrap_never_opens_server_material() {
     let _serial = serial();
     let material = Material::new();
     let configuration = resolved(&acme_source());
@@ -87,7 +87,7 @@ impl Clock for FutureClock {
 }
 
 #[test]
-fn expired_server_does_not_block_clients_but_invalid_client_trust_still_refuses() {
+pub(super) fn expired_server_does_not_block_clients_but_invalid_client_trust_still_refuses() {
     let _serial = serial();
     let mut material = Material::new();
     material.clock = Arc::new(ClockHandle::new(TlsClockSource::new(Arc::new(FutureClock))));
@@ -148,7 +148,7 @@ fn expired_server_does_not_block_clients_but_invalid_client_trust_still_refuses(
 }
 
 #[test]
-fn client_generation_transitions_to_complete_within_the_same_two_slots() {
+pub(super) fn client_generation_transitions_to_complete_within_the_same_two_slots() {
     use crate::transport::TcpTransport;
     use std::net::{TcpListener, TcpStream};
     let _serial = serial();

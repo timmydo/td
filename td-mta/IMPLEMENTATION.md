@@ -849,6 +849,12 @@ Implement the remaining work as independently reviewable increments:
   ledger if measurements cannot fit; never infer a bound from buffer limits.
   Resolve RESOURCES.md's known session-cap sum above the 128 KiB target and
   account for separate header/body polling calls before service admission.
+  - **M07e1 — representative worker stack:** a portable-only release fixture
+    runs twenty-five policy/transport scenarios on one guarded non-growing mapping
+    capped at the existing 256 KiB worker allowance. It covers representative
+    construction/refusal, retained generations, TLS/STARTTLS and gateway paths.
+    RESOURCES.md scopes the evidence; complete allocation/native/RSS accounting,
+    maximum inputs, CPU paths and production caller stacks remain pending.
 
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.

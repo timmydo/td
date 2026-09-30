@@ -7,6 +7,8 @@ mod client_tests;
 mod gateway_process_tests;
 #[path = "tls_policy_io_tests.rs"]
 mod io_tests;
+#[path = "tls_stack_tests.rs"]
+mod stack_tests;
 #[path = "tls_policy_starttls_tests.rs"]
 mod starttls_tests;
 use super::*;
@@ -203,6 +205,18 @@ fn buffers() -> (Box<[u8; TLS_WIRE_BYTES]>, Box<[u8; TLS_WIRE_BYTES]>) {
 
 #[test]
 fn compiled_policy_roles_bind_names_trust_and_generation_ids() {
+    compiled_policy_roles_with(|pending| {
+        std::thread::spawn(move || pending.construct().unwrap())
+            .join()
+            .unwrap()
+    });
+}
+
+fn compiled_policy_roles_with(
+    construct: impl Fn(
+        SessionPreparation<Box<[u8; TLS_WIRE_BYTES]>>,
+    ) -> SessionReservation<Box<[u8; TLS_WIRE_BYTES]>>,
+) {
     let _serial = serial();
     let material = Material::new();
     let source = source(true) + "[listener \"fixture\"]\nkind = \"loopback_smtp_fixture\"\nbind = \"127.0.0.1:2526\"\nsession_limit = 1\nper_peer_limit = 1\n";
@@ -229,8 +243,7 @@ fn compiled_policy_roles_bind_names_trust_and_generation_ids() {
         let pending =
             TlsPolicies::reserve_session(lease.clone(), id, &pool, input, output).unwrap();
         assert_eq!(pool.available(), 0);
-        let worker = std::thread::spawn(move || pending.construct().unwrap());
-        let reservation = worker.join().unwrap();
+        let reservation = construct(pending);
         assert_eq!(reservation.role(), Ok(role));
         assert_eq!(reservation.policy_id(), id);
         assert_eq!(reservation.status().phase, TlsPhase::Handshaking);

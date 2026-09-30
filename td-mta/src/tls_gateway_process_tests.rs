@@ -261,14 +261,14 @@ fn exercise(version: &str, next: bool, bad_pin: bool, bad_peer: bool, starttls: 
 }
 
 #[test]
-fn gateway_mutual_tls_accepts_current_and_next_verified_leaf_pins() {
+pub(super) fn gateway_mutual_tls_accepts_current_and_next_verified_leaf_pins() {
     for version in ["1.2", "1.3"] {
         exercise(version, false, false, false, false);
         exercise(version, true, false, false, false);
     }
 }
 #[test]
-fn gateway_mutual_tls_refuses_verified_leaf_with_wrong_pin_or_actual_peer() {
+pub(super) fn gateway_mutual_tls_refuses_verified_leaf_with_wrong_pin_or_actual_peer() {
     for version in ["1.2", "1.3"] {
         exercise(version, false, true, false, false);
         exercise(version, false, false, true, false);
@@ -276,7 +276,7 @@ fn gateway_mutual_tls_refuses_verified_leaf_with_wrong_pin_or_actual_peer() {
 }
 
 #[test]
-fn gateway_starttls_process_requires_verified_pin_after_plaintext_reply() {
+pub(super) fn gateway_starttls_process_requires_verified_pin_after_plaintext_reply() {
     for version in ["1.2", "1.3"] {
         exercise(version, false, false, false, true);
         exercise(version, false, true, false, true);

@@ -70,7 +70,7 @@ fn waiting<'a>(
 }
 
 #[test]
-fn client_starttls_and_server_upgrade_verify_real_tls() {
+pub(super) fn client_starttls_and_server_upgrade_verify_real_tls() {
     let _serial = serial();
     let material = Material::new();
     let lease = material.published(&configuration());
@@ -156,7 +156,7 @@ fn client_starttls_and_server_upgrade_verify_real_tls() {
 }
 
 #[test]
-fn client_starttls_refuses_bad_replies_and_accepts_fragmented_220() {
+pub(super) fn client_starttls_refuses_bad_replies_and_accepts_fragmented_220() {
     let _serial = serial();
     let material = Material::new();
     let lease = material.published(&configuration());
@@ -300,7 +300,7 @@ fn client_starttls_refuses_bad_replies_and_accepts_fragmented_220() {
 }
 
 #[test]
-fn client_starttls_roles_scratch_deadlines_and_cancel_return_buffers() {
+pub(super) fn client_starttls_roles_scratch_deadlines_and_cancel_return_buffers() {
     let _serial = serial();
     let material = Material::new();
     let pool = HandshakePool::new(1).unwrap();

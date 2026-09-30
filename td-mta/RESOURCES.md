@@ -447,6 +447,37 @@ Future M05/M07 adapters and installed service callers require their own
 qualification. Neither fixture measures hot-path allocation or service RSS.
 No ledger entry or worker count changes.
 
+M07e's first stack fixture runs twenty-five existing compiled-policy and retained
+transport scenarios sequentially on one requested 240 KiB worker stack. The
+portable release artifact must observe a read/write mapping no larger than
+256 KiB, preceded by a contiguous inaccessible guard of at least one page and
+without Linux's grow-down flag. This includes policy construction/refusal,
+client-only to complete generation replacement, direct and gateway TLS, both
+STARTTLS owners, deadlines, tails and cancellation. The gateway peer is a
+separate synthetic process and its own stack is outside this observation.
+The role scenario uses inline construction on this checked worker; its ordinary
+unit test separately retains the cross-thread ownership check.
+A non-ignored host test runs the same complete scenario set to detect fixture
+drift, including inline construction; its host stack is not target evidence.
+
+This checks those test-compiled paths against the existing worker allowance;
+it neither measures peak used stack bytes nor qualifies every provider/CPU
+path, maximum configuration/certificate layout, production opener, scheduler
+frame or simultaneous worker. Initial and later RNG work for this one worker
+is included in its exercised paths; per-worker native heap state is not
+measured. Rust/native allocation, complete generation/session coexistence,
+whole-process RSS and the known session-cap sum remain admission blockers.
+The retained-connection scenarios also exercise implicit handoff tails, tightened
+handshake deadlines, sticky failure, gateway reload refusal, established clock
+failure and authorization/permit release. Successful execution on the observed
+mapping does not prove native stack probing: the pinned native flags do not
+enable stack-clash protection. This fixture cannot establish that every native
+overflow would fault on the guard. Native-frame auditing/probing remains required
+before claiming an enforced end-to-end stack bound.
+The fixture adds no runtime thread or reservation, dependency or unsafe code.
+The existing configuration fixtures share the exact mapping parser so their
+guard/growth rules cannot drift; their labels and ceilings remain unchanged.
+
 M04c1's `admission.rs` validates the separate u64 disk/work plan and capacity
 relationships in ADMISSION.md. It consumes an already validated ResourcePlan
 without changing this RAM ledger. Logical upload/queue quotas may be smaller

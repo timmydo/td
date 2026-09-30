@@ -66,7 +66,7 @@ fn complete(client: &mut Connection, server: &mut Connection) -> Result<(), Erro
 }
 
 #[test]
-fn handoff_refuses_plaintext_tails_and_deadlines_and_returns_original_buffers() {
+pub(super) fn handoff_refuses_plaintext_tails_and_deadlines_and_returns_original_buffers() {
     let _serial = serial();
     let material = Material::new();
     let lease = material.published(&source(false));
@@ -126,7 +126,8 @@ fn handoff_refuses_plaintext_tails_and_deadlines_and_returns_original_buffers() 
 }
 
 #[test]
-fn authorized_connections_release_handshake_capacity_and_retain_generation_until_teardown() {
+pub(super) fn authorized_connections_release_handshake_capacity_and_retain_generation_until_teardown(
+) {
     let _serial = serial();
     let material = Material::new();
     let mut set = GenerationSet::at_startup();
@@ -201,7 +202,7 @@ fn authorized_connections_release_handshake_capacity_and_retain_generation_until
 }
 
 #[test]
-fn gateway_without_client_certificate_never_exposes_mail_proof_and_recovers_permits() {
+pub(super) fn gateway_without_client_certificate_never_exposes_mail_proof_and_recovers_permits() {
     let _serial = serial();
     let material = Material::new();
     let lease = material.published(&source(true));
@@ -228,7 +229,7 @@ impl Clock for AdvancingClock {
 }
 
 #[test]
-fn handshake_deadline_can_only_tighten_and_failure_is_sticky() {
+pub(super) fn handshake_deadline_can_only_tighten_and_failure_is_sticky() {
     let _serial = serial();
     let mut material = Material::new();
     let clock = Arc::new(AdvancingClock(AtomicU64::new(0)));
@@ -255,7 +256,7 @@ fn handshake_deadline_can_only_tighten_and_failure_is_sticky() {
 }
 
 #[test]
-fn changed_gateway_policy_aborts_pending_connection_and_releases_capacity() {
+pub(super) fn changed_gateway_policy_aborts_pending_connection_and_releases_capacity() {
     let _serial = serial();
     let material = Material::new();
     let mut set = GenerationSet::at_startup();
@@ -288,7 +289,7 @@ fn changed_gateway_policy_aborts_pending_connection_and_releases_capacity() {
 }
 
 #[test]
-fn established_clock_failure_clears_cached_authorization_and_aborts_socket() {
+pub(super) fn established_clock_failure_clears_cached_authorization_and_aborts_socket() {
     let _serial = serial();
     let material = Material::new();
     let lease = material.published(&source(false));

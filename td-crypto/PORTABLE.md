@@ -278,7 +278,7 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   test-target/profile, static ELF and isolated-runtime checks as the other
   qualification binaries; it is not an installed service dependency.
 - `td-mta-transport-smoke`: the `--lib --no-run` td-mta test executable,
-  selected by its `td_mta` library target and test profile. Sixty-four
+  selected by its `td_mta` library target and test profile. Sixty-five
   exact SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases execute
   individually under the existing deadline and positive-one-test verdict
   requirement. Six inbound STARTTLS cases cover reserved-session ownership,
@@ -287,6 +287,18 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   TLS 1.2/1.3 pin acceptance/refusal. The private peer waits for the exact
   plaintext 220 before starting TLS. These start at the STARTTLS command
   boundary; complete greeting/EHLO/transaction/reset semantics remain pending.
+  One ignored release-only stack case reruns twenty-five policy/transport
+  scenarios sequentially on a requested 240 KiB worker. The bounded smaps
+  reader requires a guarded, non-growing mapping within 256 KiB and emits
+  `tls_policy_transport_stack_mapping_bytes`; the portable driver requires
+  exactly one bounded decimal observation. This qualifies only those exercised
+  test-compiled paths. It excludes the separate gateway peer's stack and does
+  not establish native heap, maximum-input/CPU-path coverage or service RSS.
+  The same combined scenario set runs in an ordinary host test for fixture
+  drift only; host execution provides no target stack bound.
+  Native C/assembly stack probing is not qualified: a native frame could skip
+  the guard. Successful execution and an observed mapping do not prove every
+  native overflow would fault. RESOURCES.md retains that admission obligation.
   Five outbound additions cover complete EHLO offers, malformed extension
   skipping, fragmented/multiline 220, buffered-tail refusal, role/scratch/time
   admission, cancellation and both upgrade owners through verified local TLS.

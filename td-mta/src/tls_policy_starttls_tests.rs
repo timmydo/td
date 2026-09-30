@@ -36,7 +36,7 @@ fn held(
 }
 
 #[test]
-fn server_starttls_flushes_220_before_handoff_and_verifies_real_tls() {
+pub(super) fn server_starttls_flushes_220_before_handoff_and_verifies_real_tls() {
     let _serial = serial();
     let material = Material::new();
     let lease = material.published(&source(false));
@@ -130,7 +130,7 @@ fn server_starttls_flushes_220_before_handoff_and_verifies_real_tls() {
 }
 
 #[test]
-fn server_starttls_refuses_unframed_parameterized_tailed_and_wrong_role_commands() {
+pub(super) fn server_starttls_refuses_unframed_parameterized_tailed_and_wrong_role_commands() {
     let _serial = serial();
     let material = Material::new();
     let lease = material.published(&source(false));
@@ -215,7 +215,7 @@ impl Clock for StepClock {
 }
 
 #[test]
-fn server_starttls_deadlines_clock_refusal_and_cancel_release_reservations() {
+pub(super) fn server_starttls_deadlines_clock_refusal_and_cancel_release_reservations() {
     let _serial = serial();
     let material = Material::new();
     let lease = material.published(&source(false));
