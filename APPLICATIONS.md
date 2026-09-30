@@ -6650,8 +6650,11 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   first boot leaves it untouched and updates retain it. No selection
   leaves it absent. A post-install setter is still pending. The static
   mail and news packages use `static-runtime`, containing only the
-  approved source-built tzdata zones and license under `files/share`.
-  It has no executable, loader, or rendering override. Their launcher
+  approved source-built tzdata zones and license under `files/share`
+  and td-ui's pinned outline face and its notices in one directory
+  under `files/etc/fonts` (AGENTS.md, pinned upstream data), with no
+  fontconfig configuration. It has no executable, loader, or rendering
+  override. Their launcher
   can therefore answer a named zone with the runtime's own file.
   The bar reads the saved name and source-built TZif rules at startup,
   including future DST recurrence, and displays the active UTC offset.

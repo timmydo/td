@@ -383,6 +383,81 @@ const PINS: &[PinDef] = &[
         file: "hello-2.10.tar.gz",
     },
     PinDef {
+        key: "jetbrains-mono-nerd-font-source",
+        aliases: &[],
+        // Pinned upstream data (AGENTS.md): the Nerd Fonts release archive of
+        // JetBrains Mono, compiled TrueType faces td-ui parses and never runs.
+        url: "https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.1/JetBrainsMono.tar.xz",
+        sha256: "04d5e8f903693f9dd13e16f867e994834e681eb3c72c0d337a770dcda09010cf",
+        file: "jetbrains-mono-nerd-font-3.5.1.tar.xz",
+    },
+    PinDef {
+        key: "nerd-fonts-nerd-fonts-license-source",
+        aliases: &[],
+        // The notices the Nerd Fonts repository carries at the release's tag
+        // for the face's own licence and each merged icon set that has one;
+        // jetbrains-mono-nerd-font ships them beside the faces.
+        url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/LICENSE",
+        sha256: "1f6ad4edae6479aaace3112ede5279a23284ae54b2a34db66357aef5f64df160",
+        file: "nerd-fonts-3.5.1-nerd-fonts-LICENSE",
+    },
+    PinDef {
+        key: "nerd-fonts-codicons-license-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/codicons/LICENSE.txt",
+        sha256: "d6239afa918961b465b07bf7411cbe34ff6685854f58553db7966f4881a0211f",
+        file: "nerd-fonts-3.5.1-codicons-LICENSE.txt",
+    },
+    PinDef {
+        key: "nerd-fonts-font-awesome-license-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/font-awesome/LICENSE.txt",
+        sha256: "de784a808496d49f5f80dd9d1d6e9a51cff712cfbc339e7c25155631ae3cdb5d",
+        file: "nerd-fonts-3.5.1-font-awesome-LICENSE.txt",
+    },
+    PinDef {
+        key: "nerd-fonts-materialdesign-license-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/materialdesign/LICENSE",
+        sha256: "3bae6305bcaa6d10219b999f65c342034c2d40b1c0e8567fa08605e73ccba829",
+        file: "nerd-fonts-3.5.1-materialdesign-LICENSE",
+    },
+    PinDef {
+        key: "nerd-fonts-octicons-license-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/octicons/LICENSE",
+        sha256: "4f886642f9e8d99eeadd484acdac011c3fde8a338faf52f5ca1408c13b9a9b63",
+        file: "nerd-fonts-3.5.1-octicons-LICENSE",
+    },
+    PinDef {
+        key: "nerd-fonts-pomicons-license-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/pomicons/LICENSE",
+        sha256: "cb4797a9745683f287c28833db596e9d68ec43082d59359b3a49c504f0f610ce",
+        file: "nerd-fonts-3.5.1-pomicons-LICENSE",
+    },
+    PinDef {
+        key: "nerd-fonts-powerline-extra-license-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/powerline-extra/LICENSE",
+        sha256: "544307a58e6826c24145b2af1c3578b53e2e21ae0e6c67ab4c6abd544304d26a",
+        file: "nerd-fonts-3.5.1-powerline-extra-LICENSE",
+    },
+    PinDef {
+        key: "nerd-fonts-powerline-symbols-license-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/powerline-symbols/LICENSE.txt",
+        sha256: "46d5355e4734468135d8e4a30d0916292cc4df2b3ec30aa68c866f82497933be",
+        file: "nerd-fonts-3.5.1-powerline-symbols-LICENSE.txt",
+    },
+    PinDef {
+        key: "nerd-fonts-weather-icons-license-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.5.1/src/glyphs/weather-icons/OFL.txt",
+        sha256: "69cdedc8a4f57a30d68e4f045af8b9cce0ec3b1a6e7eec1ad41737c894f26790",
+        file: "nerd-fonts-3.5.1-weather-icons-OFL.txt",
+    },
+    PinDef {
         key: "libcap-x86-64-source",
         aliases: &[],
         // libcap 2.78 is the small static capability-name library required by
@@ -780,8 +855,10 @@ mod tests {
         // the second reviewed foreign application seed, the Claude Code
         // 2.1.260 native release. The terminal applications are td's own
         // trees (APPLICATIONS.md §W.8) and pin nothing here.
-        // IANA timezone data 2026d adds one source-data pin.
-        assert_eq!(all().len(), 73);
+        // IANA timezone data 2026d adds one source-data pin, and the Nerd
+        // Fonts v3.5.1 JetBrains Mono release ten pinned upstream data pins:
+        // the archive and nine licence notices.
+        assert_eq!(all().len(), 83);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

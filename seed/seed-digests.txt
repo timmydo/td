@@ -49,6 +49,7 @@ gmp kb9mnqdvrr77gcgsc746pa1xmpaiazc0-gmp
 gmp63 a1sfm9d525pjz2if348xssl3wprnr21f-gmp63
 grep-mesboot0-source 664n3hm5dz2hyn5py2frds5cc3r4nid4-grep-mesboot0-source
 hello-source r2gr5vy54san8vw8ry4mmjm93ivybbpv-hello-source
+jetbrains-mono-nerd-font-source 632myin1d84lnr23d9ma4f4iwgs13bk2-jetbrains-mono-nerd-font-source
 libcap-x86-64-source 14mkpjichrq0gzqyz5nrg4l0yq9hd3dw-libcap-x86-64-source
 libressl-x86-64-source vmx5274krlcs393la52x3iggv4kparn4-libressl-x86-64-source
 linux-headers hg590f1sggdwv8z3yvs4yz90cr0vnvfd-linux-headers
@@ -63,6 +64,15 @@ mpc 0yri90zk0l2pf6g3id2bji6mbmxf8clv-mpc
 mpc131 n09rmavjm1bn6gdc1s22n98g9hi10yah-mpc131
 mpfr fmix8a94cf9k1pljgqbaxd2xb2826k72-mpfr
 mpfr421 q1q1frz86nxa7p76pl3r8lb01hv51b6v-mpfr421
+nerd-fonts-codicons-license-source ma6jj9n0qgmk2p4nr8r9x2axnbf2wkip-nerd-fonts-codicons-license-source
+nerd-fonts-font-awesome-license-source 933m2kl6wlld9mma2bwcxvqyjd4wfqbh-nerd-fonts-font-awesome-license-source
+nerd-fonts-materialdesign-license-source 49m2lxkz674w3g0f5lx8zfhyskn7jm9a-nerd-fonts-materialdesign-license-source
+nerd-fonts-nerd-fonts-license-source y5a6iw112rwp72jzg7savinx1qwdrcvc-nerd-fonts-nerd-fonts-license-source
+nerd-fonts-octicons-license-source 4ar49p1zn7fqp8ysgfxigw2nvkqh73rf-nerd-fonts-octicons-license-source
+nerd-fonts-pomicons-license-source 070xshvd1kg9i2nbhf7f5ca4pjjb4dxb-nerd-fonts-pomicons-license-source
+nerd-fonts-powerline-extra-license-source rqafa2h34k4pcd02p46256hcm2bg9l9m-nerd-fonts-powerline-extra-license-source
+nerd-fonts-powerline-symbols-license-source l6byrv5ddn1xvnysn7lrpjmr53pfzlna-nerd-fonts-powerline-symbols-license-source
+nerd-fonts-weather-icons-license-source jsmpd2zdj5zkna7diqcrzyirzngh7rdm-nerd-fonts-weather-icons-license-source
 nyacc 6rs0scnal207ixn5sd1li8r8yk7cyp6i-nyacc
 openssh-x86-64-source 3dvyp8vnz1xmmn740czhzz0db92jhwr5-openssh-x86-64-source
 oyacc-source w5c2ziy1z8hnrbnylnyi8b19916fi32i-oyacc-source

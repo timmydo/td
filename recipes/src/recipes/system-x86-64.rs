@@ -3577,6 +3577,13 @@ const IMMUTABLE_ETC: &[ImmutableEtc] = &[
         why: "The static curl transport used by Git needs this CA bundle path, \
               while the pinned Mozilla extract remains immutable store content",
     },
+    ImmutableEtc {
+        etc: "fonts/jetbrains-mono-nerd",
+        target: "{in:jetbrains-mono-nerd-font}/share/fonts/jetbrains-mono-nerd",
+        why: "td-ui programs read their outline face by a fixed name, which a \
+              jailed program under static-runtime spells the same way; a \
+              content-addressed store path is neither",
+    },
 ];
 
 const MUTABLE_ETC: &[MutableEtc] = &[
@@ -4327,6 +4334,11 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     steps.push(Step::CopyTree {
         from: "{in:ca-certificates}".into(),
         dest: "{root}/real-root{in:ca-certificates}".into(),
+    });
+    // The outline face is pinned upstream data with no ELF runtime closure.
+    steps.push(Step::CopyTree {
+        from: "{in:jetbrains-mono-nerd-font}".into(),
+        dest: "{root}/real-root{in:jetbrains-mono-nerd-font}".into(),
     });
     // Timezone data is an immutable package with no ELF runtime closure.
     steps.push(Step::CopyTree {
@@ -5276,6 +5288,8 @@ pub fn recipe() -> Recipe {
         // Codex: the source-built dynamic CLI plus its source-built static Bubblewrap helper.
         // ca-certificates: immutable Mozilla trust data at curl's conventional path.
         // tzdata: immutable compiled zones and geographic tables at /etc/zoneinfo.
+        // jetbrains-mono-nerd-font: the pinned outline face at
+        //   /etc/fonts/jetbrains-mono-nerd.
         // OpenSSH: the source-built client, key generator, daemon, and mandatory split
         //   helpers. Its deliberately libcrypto-free closure is reached by
         //   StageRuntimeClosure.
@@ -5321,6 +5335,7 @@ pub fn recipe() -> Recipe {
             "codex-bwrap",
             "ca-certificates",
             "tzdata",
+            "jetbrains-mono-nerd-font",
             "libressl-x86-64",
             "glibc-x86-64",
             "openssh-x86-64",

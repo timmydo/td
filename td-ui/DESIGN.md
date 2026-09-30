@@ -117,8 +117,12 @@ coverage rasterizer `coverage`, and the atlas executor over them: the
 coverage page `atlas`, the outline face `face` at one pixel size with its
 `Cell`, and `Raster::with_face`, which executes the unchanged draw
 stream's glyphs through that face (see "Outline faces and the glyph
-atlas" below). No consumer opts in yet: the face pin is increment 19 and
-runtime cells increment 20.
+atlas" below).
+
+Pinned (increment 19): the JetBrains Mono Nerd Font as pinned upstream
+data, at `/etc/fonts/jetbrains-mono-nerd` in the image and in the jail of
+a program on `static-runtime`. No consumer reads it yet; that is
+increment 20.
 
 ## Purpose and trust position
 
@@ -2035,7 +2039,8 @@ The Unifont face is committed as generated Rust source (see
 face. Each style is 2.5 MiB, about 5 MiB of hex per style as source. Target
 recipes stage sources as strings, so `include_bytes!` of a binary is not an
 option either. The face is therefore data. A recipe fetches the release
-archive as a fixed-output source by its upstream URL and SHA-256:
+archive as a fixed-output source by its upstream URL and SHA-256 (the
+recipe `jetbrains-mono-nerd-font`):
 
 ```text
 https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.1/JetBrainsMono.tar.xz
@@ -2046,32 +2051,45 @@ OFL.txt
 sha256 30f0c136e3c88e422d0791acd97238870f9054a9729bc34cf2ff0d4ed8cac4ad
 ```
 
-The recipe extracts the four Mono styles and `OFL.txt` into a data output,
-and the image carries that output read-only. A consumer reads a style's
-bytes once at startup, from the path the image names, and hands them to
-`sfnt::Font::parse`. The pure modules never open a file. A missing or
-refused face falls back to Unifont and says so once; a program never fails
-to start because the face is missing.
+The recipe copies the four Mono styles, `OFL.txt`, the release's
+`README.md` and the notices below into `share/fonts/jetbrains-mono-nerd`
+of its output, and builds nothing. The image carries that output read-only
+and names it `/etc/fonts/jetbrains-mono-nerd`, an immutable `/etc` link
+into the store. `static-runtime` carries a copy at
+`files/etc/fonts/jetbrains-mono-nerd`, and td-jail binds the runtime's
+`files/etc/fonts` at `/etc/fonts`, so a jailed program reads the face at
+the path an unjailed one does. A consumer reads a style's bytes once at
+startup from that path and hands them to `sfnt::Font::parse`. The pure
+modules never open a file. A missing or refused face falls back to Unifont
+and says so once; a program never fails to start because the face is
+missing.
 
-The trust question is new, and it needs sign-off before the pin lands. A
-compiled TTF is not source: JetBrains builds it with fontmake from
+A compiled TTF is not source: JetBrains builds it with fontmake from
 `.glyphs` sources, and Nerd Fonts patches it with FontForge. Neither
-toolchain is in td's graph, so td cannot rebuild the face. It is also not
-an executable. td never runs its bytecode, and no program but td-ui's
-reader parses it. It is not a compilation input either: it is read at
-runtime, never embedded. It fits none of the input classes AGENTS.md names
-today (bootstrap seeds, source, and marked foreign application payloads).
-So the pin landing either amends AGENTS.md with a fourth class, pinned
-upstream data, or carries the face as a marked payload on the
-`payload_inputs` channel. The first option is recommended: a font is
-read-only data for td-owned programs, not an application run under
-confinement.
+toolchain is in td's graph, so td cannot rebuild the face. It is not an
+executable either: td never runs its bytecode, and no program but td-ui's
+reader parses it. It is read at runtime, never embedded, so it is not a
+compilation input. AGENTS.md names it pinned upstream data: unmarked,
+because nothing executes, links or loads it as code, and reached only as
+bytes a td-built program parses under its own bounds.
 
 Licences: JetBrains Mono and the patched faces are under the SIL Open Font
-License 1.1 (`OFL.txt` in the archive). The pin also records the licences
-of the icon sets Nerd Fonts merges in, taken from that repository's
-`LICENSE` at the pinned tag. Programs expose all of these beside the
-Unifont texts in their `--font-license` output.
+License 1.1 (`OFL.txt`). The release's `README.md` names each icon set
+Nerd Fonts merges in, with its upstream, version and licence. Both ship
+beside the faces. The release archive carries no icon-set notices, so the
+recipe also pins, each by its URL at the `v3.5.1` tag and SHA-256, the
+notices the Nerd Fonts repository carries there, and ships them under
+`licenses/`: the repository's own `LICENSE` and those of Codicons and
+Font Awesome (CC BY 4.0 for the icons), MaterialDesign (the Pictogrammers
+licence, naming Apache 2.0), Octicons, Powerline Extra and Powerline
+Symbols (MIT), and Pomicons and Weather Icons (OFL). The repository
+carries no notice text for Devicons, Font Awesome Extension, Seti, the
+IEC power symbols or Hack's extra glyphs (each MIT upstream), for Font
+Logos, which the README lists as unlicensed, or for the Apache 2.0 text
+MaterialDesign's names by URL; for those the README's attribution and
+that URL are what ship, and pinning the texts from their own upstreams
+is a separate reviewed change. Programs expose the notices beside the
+Unifont texts in their `--font-license` output once they read the face.
 
 ### Reader and coverage
 
@@ -2402,9 +2420,10 @@ regressions. Those increments extend the original sequence below.
     fonts. The draw stream is unchanged. Landed.
 19. The face pin: a data recipe fetching the Nerd Fonts v3.5.1
     `JetBrainsMono.tar.xz` by URL and SHA-256, extracting the four Mono
-    styles and the licences into an output the image carries read-only,
-    with the AGENTS.md amendment naming pinned upstream data. Requires
-    sign-off (see "Delivery and trust position").
+    styles and the notices into an output the image carries read-only at
+    `/etc/fonts/jetbrains-mono-nerd`, with a copy in `static-runtime`
+    for jailed programs, and the AGENTS.md amendment naming pinned
+    upstream data. Landed.
 20. Runtime cells: `Cell` replaces the constants in layout, hit testing
     and painting, and the consumer reads the pinned face and falls back to
     Unifont. td-editor goes first, since the other consumers lay out over

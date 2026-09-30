@@ -102,7 +102,8 @@ dependency.
 ## Foreign application payloads
 
 td's bootstrap graph contains no foreign binary other than its declared
-bootstrap seeds. A third-party application is a marked foreign prebuilt
+bootstrap seeds and the non-executable pinned upstream data below. A
+third-party application is a marked foreign prebuilt
 payload in `/td/store`, not a bootstrap seed. The mark is load-bearing:
 
 - ordinary input channels refuse it; only `payload_inputs` may carry it as
@@ -125,6 +126,20 @@ and Wayland boundaries. See `APPLICATIONS.md` §B.8.
 
 Applications currently ship inside the system image, so independent
 side-by-side application retention is deferred (`APPLICATIONS.md` §W.2).
+
+## Pinned upstream data
+
+Some data td takes as upstream built rather than rebuilding it from
+source: curl's rendering of Mozilla's trust store, and the Nerd Fonts
+JetBrains Mono release, whose compiled TrueType faces td-ui parses. Such
+a pin carries a reviewed URL and SHA-256 like any source, and stays
+unmarked because nothing executes, links, or loads it as code: td's
+builder copies it into zone-one outputs, and td-built programs parse it
+under their own bounds. td-ui's font reader runs no hinting bytecode. It
+is data inside the target graph, not source-built: a source-bootstrap
+claim names it as upstream data. Adding a pin of this class is a
+reviewed pin; data a td program would execute or load as code belongs to
+no class here and needs an amendment to this file.
 
 ## Rust bridge and dependencies
 
