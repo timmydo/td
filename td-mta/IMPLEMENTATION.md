@@ -860,6 +860,10 @@ Implement the remaining work as independently reviewable increments:
     Checked counters and positive controls qualify the probe before measuring
     repeated digest and SMTP success/refusal paths. Native heap accounting,
     TLS generation/session measurements and whole-service RSS remain pending.
+  - **M07e2b — bounded native bookkeeping:** a test-only fixed address/size
+    table tracks ownership and coherent requested-byte snapshots without heap
+    storage or pointer access. Collision, saturation, resize ownership and
+    concurrent tests qualify the table; libc interception remains pending.
 
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.

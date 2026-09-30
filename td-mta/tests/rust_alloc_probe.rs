@@ -5,6 +5,8 @@
 
 #[path = "support/allocation_counter.rs"]
 mod allocation_counter;
+#[path = "support/allocation_registry.rs"]
+mod allocation_registry;
 #[path = "support/allocation_shim.rs"]
 mod allocation_shim;
 
@@ -55,8 +57,15 @@ fn forwarding() {
 fn hot_paths() {
     let mut scratch = [0; 512];
     let data = [0x5a; 4096];
+    let registry = allocation_registry::Registry::<4>::new();
     let before = COUNTERS.snapshot();
     for _ in 0..64 {
+        registry.insert(64, 0).unwrap();
+        registry.insert(128, 17).unwrap();
+        assert_eq!(registry.remove(64), Ok(0));
+        assert_eq!(registry.remove(128), Ok(17));
+        assert_eq!(registry.snapshot().bytes, 0);
+        assert!(!registry.snapshot().invalid);
         let mut digest = td_crypto::Sha256::try_new().unwrap();
         digest.update(black_box(&data)).unwrap();
         black_box(digest.finish().unwrap());

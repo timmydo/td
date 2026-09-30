@@ -641,3 +641,50 @@ logging inside the interval. It does not qualify TLS generations, sessions,
 parallel workers, maximum inputs or whole-service memory, and it changes no
 ledger allowance or service admission condition. Portable qualification runs
 the fresh static executable and requires its exact completion record.
+
+## Native allocation ownership table
+
+M07e2b adds test-only, fixed-capacity address/size bookkeeping for the future
+C boundary probe. Entries contain integer addresses, never dereferenceable
+borrowed pointers. Zero and one are reserved as empty/deleted tags; real
+allocator results must be checked before insertion. Null arguments to
+`free(NULL)` and `realloc(NULL, n)` must bypass removal. A zero-size allocation
+with a nonnull address retains ownership until removal. Tombstones preserve
+colliding lookup chains, including a fully occupied/deleted table.
+
+Each operation holds one atomic spin guard only while reading/updating fixed
+entries and counters. No allocation, formatting, pointer access or callback
+occurs under the guard. Snapshots acquire the same guard and are coherent
+for table bookkeeping. Each lookup visits at most the table capacity; lock
+contention itself has no elapsed-time or fairness bound. This test machinery
+is not a service scheduling primitive or an async-signal-safe allocator. It
+is also not fork-safe: a child could inherit another thread's locked guard.
+The probe must not fork while tracking allocations.
+
+Tombstones never become empty again. After enough address churn, every new
+address can scan the entire table under the guard, even with few live blocks.
+This bounded but expensive behavior must be addressed before connecting the
+C wrappers; peak live-block capacity alone does not bound this slowdown.
+
+Duplicate insertion, missing removal, reserved address, full capacity or
+arithmetic failure leaves ownership unchanged and marks all evidence invalid.
+The bit remains set while later successful operations can retire live entries.
+Remove an old address before calling real free/realloc, with the guard already
+released; a moved allocation can then safely race reuse of its former address.
+A failed nonzero realloc must restore its old address/size. If another thread
+occupied the vacant slot, restoration may fail with full capacity; this also
+invalidates evidence without changing the real allocator result. Table bytes/peak
+track bookkeeping instants, excluding storage inside the real allocator during
+that call. Zero-size realloc behavior needs the later libc-specific wrapper
+contract; no generic null-result ownership assumption is provided here.
+
+Host tests exercise collisions, deleted-slot reuse, saturation, zero-size
+ownership, arithmetic overflow, duplicate/unknown addresses, failed/moved
+resize ownership and concurrent independent owners. Snapshots are coherent by
+construction through the shared guard; the concurrent test is a smoke check,
+not deterministic coverage of every interleaving. The Rust allocation probe
+also exercises table insert/remove/snapshot in its no-call interval. Its
+unchanged v1 success record intentionally includes these added table checks. No native
+allocation is intercepted yet, no libc coverage claim is made, and no runtime
+memory allowance changes. Fixed table storage will be reported separately as
+instrumentation overhead when the C probe is connected.

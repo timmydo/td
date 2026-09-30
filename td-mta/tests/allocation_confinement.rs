@@ -62,6 +62,9 @@ fn scan(root: &Path, path: &Path) {
                 "14e2ef08d8dea85709f5d86e2a60e0b2e965903f5c001e9a46fa9bdecfe9e7d1",
             );
         }
+        if relative.starts_with("src/") {
+            assert!(!source.contains("allocation_registry"), "{relative}");
+        }
         if !matches!(
             relative,
             "tests/rust_alloc_probe.rs"
