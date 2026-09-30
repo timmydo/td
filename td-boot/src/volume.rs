@@ -48,6 +48,20 @@ impl Uuid {
         }
         Ok(Self(bytes))
     }
+
+    /// A fresh version-4 UUID for one live boot's volatile volume.
+    pub(crate) fn random() -> io::Result<Self> {
+        let mut bytes = [0; 16];
+        File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        Ok(Self::from_random(bytes))
+    }
+
+    fn from_random(mut bytes: [u8; 16]) -> Self {
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        // The version bits make it nonzero.
+        Self(bytes)
+    }
 }
 
 impl std::fmt::Display for Uuid {
@@ -116,6 +130,10 @@ fn identify(bytes: &[u8]) -> io::Result<Option<Uuid>> {
 }
 
 fn supported_name(name: &str) -> bool {
+    // brd's device, where a live boot keeps its volatile volume.
+    if let Some(number) = name.strip_prefix("ram") {
+        return !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
+    }
     if let Some(rest) = name.strip_prefix("vd").or_else(|| name.strip_prefix("sd")) {
         let letters = rest.bytes().take_while(u8::is_ascii_lowercase).count();
         return letters > 0
@@ -351,6 +369,199 @@ pub(crate) fn resolve(expected: Option<&Uuid>) -> io::Result<(Uuid, PathBuf)> {
     }
 }
 
+// Install media: the ISO-9660 primary volume descriptor at sector 16, whose
+// identifier `engine/src/iso9660.rs` writes. A hybrid image carries it at the
+// same offset whether firmware reads it as optical media or as a whole USB disk.
+const ISO_SECTOR_BYTES: usize = 2048;
+const ISO_PVD_OFFSET: u64 = 16 * ISO_SECTOR_BYTES as u64;
+const ISO_VOLUME_ID: std::ops::Range<usize> = 40..72;
+const ENOMEDIUM: i32 = 123;
+const MEDIA_WAIT: Duration = Duration::from_secs(30);
+
+/// Whole devices a hybrid image can be attached as: optical, and SCSI-named,
+/// virtio or NVMe disks. Partitions are excluded because the descriptor is at
+/// the start of the whole device.
+fn media_device_name(name: &str) -> bool {
+    let digits = |value: &str| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+    if let Some(number) = name.strip_prefix("sr") {
+        return digits(number);
+    }
+    if let Some(letters) = name.strip_prefix("sd").or_else(|| name.strip_prefix("vd")) {
+        return !letters.is_empty() && letters.bytes().all(|b| b.is_ascii_lowercase());
+    }
+    name.strip_prefix("nvme")
+        .and_then(|rest| rest.split_once('n'))
+        .is_some_and(|(controller, namespace)| digits(controller) && digits(namespace))
+}
+
+fn identify_media(bytes: &[u8]) -> bool {
+    let mut expected = [b' '; ISO_VOLUME_ID.end - ISO_VOLUME_ID.start];
+    let label = protocol::MEDIA_VOLUME_ID.as_bytes();
+    if let Some(prefix) = expected.get_mut(..label.len()) {
+        prefix.copy_from_slice(label);
+    }
+    bytes.get(..7) == Some(b"\x01CD001\x01".as_slice())
+        && bytes.get(ISO_VOLUME_ID) == Some(expected.as_slice())
+}
+
+/// One opened install medium, pinned for the mount that follows.
+pub(crate) struct Medium {
+    file: File,
+    pub(crate) device: PathBuf,
+}
+
+impl Medium {
+    pub(crate) fn path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.file.as_raw_fd()
+        ))
+    }
+}
+
+/// `Ok(None)` for a device that is not install media or holds no medium.
+fn probe_media(sys: &Path, path: &Path) -> io::Result<Option<File>> {
+    let expected = device_number(&text(&sys.join("dev"))?)?;
+    let sectors: u64 = text(&sys.join("size"))?
+        .trim_end()
+        .parse()
+        .map_err(|_| invalid("invalid block capacity"))?;
+    if sectors < (ISO_PVD_OFFSET + ISO_SECTOR_BYTES as u64) / 512 {
+        return Ok(None);
+    }
+    let before = fs::symlink_metadata(path)?;
+    if !matches_device(&before, expected) {
+        return Err(invalid("media path disagrees with sysfs block identity"));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_FLAGS)
+        .open(path)?;
+    let opened = file.metadata()?;
+    if !matches_device(&opened, expected)
+        || before.dev() != opened.dev()
+        || before.ino() != opened.ino()
+    {
+        return Err(invalid("media device changed during open"));
+    }
+    let mut bytes = [0; ISO_SECTOR_BYTES];
+    match file.read_exact_at(&mut bytes, ISO_PVD_OFFSET) {
+        // An empty optical drive can publish a placeholder capacity.
+        Err(error) if error.raw_os_error() == Some(ENOMEDIUM) => return Ok(None),
+        other => other?,
+    }
+    let after = fs::symlink_metadata(path)?;
+    if !matches_device(&after, expected)
+        || after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+    {
+        return Err(invalid("media device changed during probe"));
+    }
+    Ok(identify_media(&bytes).then_some(file))
+}
+
+enum MediaScan {
+    Found(Medium),
+    None(Vec<String>),
+}
+
+fn select_media(
+    entries: impl IntoIterator<Item = (PathBuf, io::Result<Option<File>>)>,
+) -> io::Result<MediaScan> {
+    let mut found: Option<Medium> = None;
+    let mut skipped = Vec::new();
+    let mut incomplete = false;
+    for (device, probed) in entries {
+        match probed {
+            Ok(Some(file)) => {
+                if let Some(first) = &found {
+                    return Err(invalid(format!(
+                        "more than one td installation medium: {} and {}; \
+                         attach only the one to boot",
+                        first.device.display(),
+                        device.display()
+                    )));
+                }
+                found = Some(Medium { file, device });
+            }
+            Ok(None) => {}
+            // A node or sysfs value still being published makes the whole
+            // scan incomplete, as it does for volume discovery: that device
+            // may be a second medium, so nothing is selected until it reads.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                incomplete = true;
+                skipped.push(format!("{}: still appearing ({error})", device.display()));
+            }
+            // A device that cannot be read is not the medium, and a card
+            // reader or a failing disk must not stop a live boot. Its reason
+            // is kept in case no medium is found at all.
+            Err(error) => skipped.push(format!("{}: {error}", device.display())),
+        }
+    }
+    Ok(match found {
+        Some(medium) if !incomplete => MediaScan::Found(medium),
+        Some(medium) => {
+            skipped.insert(
+                0,
+                format!(
+                    "{} holds a td installation medium, held back until every device reads",
+                    medium.device.display()
+                ),
+            );
+            MediaScan::None(skipped)
+        }
+        None => MediaScan::None(skipped),
+    })
+}
+
+fn scan_media() -> io::Result<MediaScan> {
+    let mut entries = Vec::new();
+    for (index, entry) in fs::read_dir("/sys/class/block")?.enumerate() {
+        if index >= MAX_DEVICES {
+            return Err(invalid("too many block devices for media discovery"));
+        }
+        let entry = match entry {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(MediaScan::None(vec![format!(
+                    "the block device list changed during the scan ({error})"
+                )]));
+            }
+            other => other?,
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|name| media_device_name(name)) else {
+            continue;
+        };
+        let path = Path::new("/dev").join(name);
+        let probed = probe_media(&entry.path(), &path);
+        entries.push((path, probed));
+    }
+    select_media(entries)
+}
+
+/// The one attached td installation medium, waiting for slow USB enumeration.
+pub(crate) fn find_medium() -> io::Result<Medium> {
+    let started = Instant::now();
+    loop {
+        match scan_media()? {
+            MediaScan::Found(medium) => return Ok(medium),
+            MediaScan::None(skipped) if started.elapsed() >= MEDIA_WAIT => {
+                let mut message = format!(
+                    "no td installation medium (ISO volume {}) could be selected",
+                    protocol::MEDIA_VOLUME_ID
+                );
+                for reason in skipped {
+                    message.push_str("; skipped ");
+                    message.push_str(&reason);
+                }
+                return Err(io::Error::new(io::ErrorKind::NotFound, message));
+            }
+            MediaScan::None(_) => std::thread::sleep(Duration::from_millis(250)),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -515,11 +726,23 @@ mod tests {
 
     #[test]
     fn names_admit_direct_disks_and_partitions_without_paths() {
-        for name in ["vda", "vdb2", "sdaa", "sda2", "nvme0n1", "nvme12n34p5"] {
+        for name in [
+            "vda",
+            "vdb2",
+            "sdaa",
+            "sda2",
+            "nvme0n1",
+            "nvme12n34p5",
+            "ram0",
+            "ram15",
+        ] {
             assert!(supported_name(name), "{name}");
         }
         for name in [
             "",
+            "ram",
+            "ram0p1",
+            "zram0",
             "vd",
             "sda/../../x",
             "sda2junk",
@@ -592,6 +815,106 @@ mod tests {
         ]))
         .is_err());
     }
+    #[test]
+    fn random_uuids_carry_version_four_and_the_rfc_variant() {
+        for seed in [[0u8; 16], [0xff; 16]] {
+            let text = Uuid::from_random(seed).to_string();
+            assert_eq!(text.as_bytes()[14], b'4', "{text}");
+            assert!(matches!(text.as_bytes()[19], b'8'..=b'b'), "{text}");
+            assert_eq!(Uuid::parse(&text).unwrap().to_string(), text);
+        }
+        assert_ne!(Uuid::random().unwrap(), Uuid::random().unwrap());
+    }
+
+    #[test]
+    fn media_names_are_whole_optical_and_disk_devices() {
+        for name in ["sr0", "sr12", "sda", "sdab", "vda", "nvme0n1", "nvme3n12"] {
+            assert!(media_device_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "sr",
+            "sra",
+            "sda1",
+            "vda2",
+            "nvme0n1p1",
+            "nvme0n",
+            "nvmen1",
+            "ram0",
+            "loop0",
+            "dm-0",
+            "mmcblk0",
+        ] {
+            assert!(!media_device_name(name), "{name}");
+        }
+    }
+
+    fn descriptor(label: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; ISO_SECTOR_BYTES];
+        bytes[..7].copy_from_slice(b"\x01CD001\x01");
+        bytes[40..72].fill(b' ');
+        bytes[40..40 + label.len()].copy_from_slice(label);
+        bytes
+    }
+
+    #[test]
+    fn only_a_primary_descriptor_with_the_exact_label_is_media() {
+        assert!(identify_media(&descriptor(b"TD_INSTALL")));
+        for label in [b"TD_INSTAL".as_slice(), b"TD_INSTALLX", b"td_install", b""] {
+            assert!(!identify_media(&descriptor(label)), "{label:?}");
+        }
+        let mut unpadded = descriptor(b"TD_INSTALL");
+        unpadded[50] = 0;
+        assert!(!identify_media(&unpadded));
+        for (offset, value) in [(0, 2), (1, b'X'), (6, 2)] {
+            let mut bad = descriptor(b"TD_INSTALL");
+            bad[offset] = value;
+            assert!(!identify_media(&bad), "offset {offset}");
+        }
+        assert!(!identify_media(&descriptor(b"TD_INSTALL")[..71]));
+    }
+
+    #[test]
+    fn media_selection_requires_one_medium_and_skips_unreadable_devices() {
+        let file = || Ok(Some(File::open("/dev/null").unwrap()));
+        let failed = || Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        let scan = |entries: Vec<(&str, io::Result<Option<File>>)>| {
+            select_media(
+                entries
+                    .into_iter()
+                    .map(|(name, probed)| (name.into(), probed)),
+            )
+        };
+        let found = scan(vec![
+            ("/dev/sr1", Ok(None)),
+            ("/dev/sr0", file()),
+            ("/dev/sdb", failed()),
+        ]);
+        assert!(matches!(
+            found,
+            Ok(MediaScan::Found(ref medium)) if medium.device == Path::new("/dev/sr0")
+        ));
+        let none = scan(vec![("/dev/sdb", failed()), ("/dev/sr1", Ok(None))]);
+        assert!(matches!(none, Ok(MediaScan::None(ref skipped)) if skipped.len() == 1));
+        let error = scan(vec![("/dev/sr0", file()), ("/dev/sda", file())])
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("more than one"), "{error}");
+        // A device still appearing may be a second medium: select nothing yet.
+        let appearing = || Err(io::Error::from(io::ErrorKind::NotFound));
+        for order in [false, true] {
+            let mut entries = vec![("/dev/sr0", file()), ("/dev/sdb", appearing())];
+            if order {
+                entries.reverse();
+            }
+            let Ok(MediaScan::None(skipped)) = scan(entries) else {
+                panic!("order {order}: a medium was selected from an incomplete scan");
+            };
+            assert_eq!(skipped.len(), 2, "order {order}");
+            assert!(skipped[0].starts_with("/dev/sr0 holds"), "{skipped:?}");
+        }
+    }
+
     #[test]
     fn an_incomplete_scan_cannot_select_a_partial_match() {
         let good = || Ok(Some((Uuid([0x12; 16]), PathBuf::from("/dev/vda2"))));

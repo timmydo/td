@@ -467,13 +467,16 @@ authenticate a deployment or authorize a write.
 
 The resolver refuses more than 4096 `/sys/class/block` entries and probes only
 direct virtio, SCSI/SATA and NVMe disk/partition names (`vd*`, `sd*`, and
-`nvme*n*`, with their numeric partition suffixes). Loop, device-mapper,
-mdraid and optical devices are outside this primitive. Each candidate's
-bounded sysfs device number must match its real block node before and after
-a read-only `O_NOFOLLOW|O_NONBLOCK` open, including inode identity across
-the open. The same device and inode checks follow the read. Unreadable
-candidates or malformed sysfs values refuse; small devices cannot contain
-a primary superblock and are skipped.
+`nvme*n*`, with their numeric partition suffixes), and `ram<N>`, where a live
+boot keeps its volatile volume (MEDIA.md "Live boot"). An installed system's
+unused RAM disk carries no td volume and is ignored like any other disk.
+Loop, device-mapper, mdraid and optical devices are outside this primitive.
+Install media are found by a separate descriptor probe, not this one. Each
+candidate's bounded sysfs device number must match its real block node
+before and after a read-only `O_NOFOLLOW|O_NONBLOCK` open, including inode
+identity across the open. The same device and inode checks follow the read.
+Unreadable candidates or malformed sysfs values refuse; small devices cannot
+contain a primary superblock and are skipped.
 
 One 4096-byte primary superblock at byte 65536 is read through the held
 descriptor. The layout follows btrfs-progs v7.0's

@@ -175,6 +175,21 @@ enum Mode {
         directory: PathBuf,
         trusted_key: PathBuf,
     },
+    /// The live selector: authenticate the deployment on the attached install
+    /// medium under this rootfs's trust root and kexec it with a fresh
+    /// volatile volume identity (td-install/MEDIA.md "Live boot").
+    LiveBoot {
+        mountpoint: PathBuf,
+        cmdline: OsString,
+    },
+    /// The live deployment's root: bind the medium's `root.erofs` to a
+    /// read-only loop after checking it against the handed-off deployment id,
+    /// leaving the medium mounted.
+    LiveRoot {
+        mountpoint: PathBuf,
+        deployment_id: String,
+        loop_device: PathBuf,
+    },
 }
 
 struct Manifest {
@@ -249,7 +264,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>",
+        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>",
     )
 }
 
@@ -354,6 +369,30 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
             Ok(Mode::ValidateSource {
                 directory: PathBuf::from(directory),
                 trusted_key: PathBuf::from(trusted_key),
+            })
+        }
+        Some(mode) if mode == OsStr::new("live-boot") => {
+            let mountpoint = args.next().ok_or_else(usage_error)?;
+            let cmdline = args.next().ok_or_else(usage_error)?;
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::LiveBoot {
+                mountpoint: PathBuf::from(mountpoint),
+                cmdline,
+            })
+        }
+        Some(mode) if mode == OsStr::new("live-root") => {
+            let mountpoint = args.next().ok_or_else(usage_error)?;
+            let deployment_id = parse_deployment_id(args.next().ok_or_else(usage_error)?)?;
+            let loop_device = args.next().ok_or_else(usage_error)?;
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::LiveRoot {
+                mountpoint: PathBuf::from(mountpoint),
+                deployment_id,
+                loop_device: PathBuf::from(loop_device),
             })
         }
         Some(mode) if mode == OsStr::new("root-loop") => {
@@ -2088,6 +2127,18 @@ fn kernel_cmdline(
     deployment_id: &str,
     bookkeeping_unavailable: bool,
 ) -> io::Result<OsString> {
+    handoff_cmdline(base, deployment_id, bookkeeping_unavailable, "")
+}
+
+/// `kernel_cmdline` plus tokens only td-boot may add (`extra`, for the live
+/// handoff). The live tokens are reserved in every base line, so neither an
+/// installed selector's command line nor firmware can request the live branch.
+fn handoff_cmdline(
+    base: &OsStr,
+    deployment_id: &str,
+    bookkeeping_unavailable: bool,
+    extra: &str,
+) -> io::Result<OsString> {
     let bytes = base.as_bytes();
     if !bytes
         .iter()
@@ -2102,6 +2153,8 @@ fn kernel_cmdline(
     for reserved in [
         SELECTOR,
         protocol::BOOKKEEPING_UNAVAILABLE_CMDLINE_TOKEN.as_bytes(),
+        protocol::LIVE_CMDLINE_PREFIX.as_bytes(),
+        protocol::RAM_DISK_SIZE_PREFIX.as_bytes(),
     ] {
         if bytes
             .windows(reserved.len())
@@ -2117,10 +2170,22 @@ fn kernel_cmdline(
         }
     }
 
+    // After a bare `--` the kernel hands every word to init, so a live RAM
+    // disk size appended past one would never reach brd.
+    if !extra.is_empty() && bytes.split(|byte| *byte == b' ').any(|word| word == b"--") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "kernel cmdline ends kernel parameters with --; the live handoff cannot follow it",
+        ));
+    }
     let mut token = format!("td.deployment={deployment_id}");
     if bookkeeping_unavailable {
         token.push(' ');
         token.push_str(protocol::BOOKKEEPING_UNAVAILABLE_CMDLINE_TOKEN);
+    }
+    if !extra.is_empty() {
+        token.push(' ');
+        token.push_str(extra);
     }
     let separator = usize::from(!bytes.is_empty());
     if bytes.len() + separator + token.len() + 1 > MAX_CMDLINE_BYTES {
@@ -3255,6 +3320,249 @@ fn run_validate_source(
     writeln!(out, "{}", bundle.id)
 }
 
+/// The smallest volatile volume a live boot accepts. Btrfs itself needs far
+/// less; this leaves room for firstboot state and a session's writes.
+const LIVE_MIN_VOLUME_KIB: u64 = 512 * 1024;
+
+/// Half of `MemTotal`, in KiB, for the live volume on /dev/ram0. brd holds
+/// only written pages, so this is a ceiling rather than a reservation.
+fn live_ram_disk_kib(meminfo: &[u8]) -> io::Result<u64> {
+    let text = std::str::from_utf8(meminfo).map_err(|_| invalid("/proc/meminfo is not UTF-8"))?;
+    let total = text
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|rest| rest.trim().strip_suffix(" kB"))
+        .and_then(|kib| kib.trim_end().parse::<u64>().ok())
+        .ok_or_else(|| invalid("/proc/meminfo has no MemTotal in kB"))?;
+    let half = total / 2;
+    if half < LIVE_MIN_VOLUME_KIB {
+        return Err(invalid(format!(
+            "a live boot needs at least {} MiB of memory, found {} MiB",
+            LIVE_MIN_VOLUME_KIB * 2 / 1024,
+            total / 1024
+        )));
+    }
+    Ok(half)
+}
+
+/// The live handoff: the fresh volume identity, the live token and the RAM
+/// disk size, in that order after the selector's own tokens.
+fn live_cmdline(
+    base: &OsStr,
+    uuid: &volume::Uuid,
+    ram_disk_kib: u64,
+    deployment_id: &str,
+) -> io::Result<OsString> {
+    let with_volume = volume::command_line(base.as_bytes(), uuid)?;
+    handoff_cmdline(
+        &with_volume,
+        deployment_id,
+        false,
+        &format!(
+            "{} {}{ram_disk_kib}",
+            protocol::LIVE_CMDLINE_TOKEN,
+            protocol::RAM_DISK_SIZE_PREFIX
+        ),
+    )
+}
+
+/// The name a deployment file has on a mounted install medium.
+fn media_name(deployment_name: &str) -> io::Result<String> {
+    protocol::MEDIA_DEPLOYMENT_FILES
+        .iter()
+        .find(|(_, name)| *name == deployment_name)
+        .map(|(iso, _)| iso.to_ascii_lowercase())
+        .ok_or_else(|| invalid(format!("{deployment_name} is not an install media file")))
+}
+
+fn media_manifest(medium: &Path) -> io::Result<Vec<u8>> {
+    read_bounded_real_file(
+        &medium.join(media_name(protocol::MANIFEST_NAME)?),
+        "install medium manifest",
+        protocol::MAX_MANIFEST_BYTES,
+    )
+}
+
+/// The medium's deployment, authenticated before its manifest is parsed.
+///
+/// `root.erofs` is not hashed here: `live-root` hashes it after kexec, at the
+/// descriptor it binds to the loop. A live boot has no previous deployment to
+/// fall back to, so checking it twice would only double the time spent
+/// reading the largest file on the medium.
+fn authenticated_media_deployment(medium: &Path, key: &TrustRoot) -> io::Result<Deployment> {
+    require_real_directory(medium, "install medium")?;
+    let manifest = media_manifest(medium)?;
+    let signature = read_optional_signature(medium.join(media_name(protocol::MANIFEST_SIG_NAME)?))?
+        .ok_or_else(|| invalid("install medium carries no deployment signature"))?;
+    authenticate_manifest(&manifest, &signature, key)?;
+    let parsed = parse_manifest(&manifest)?;
+    let kernel = verify_payload(medium, &media_name("bzImage")?, &parsed.kernel)?;
+    let initramfs = verify_payload(medium, &media_name("initramfs.cpio")?, &parsed.initramfs)?;
+    Ok(Deployment {
+        id: sha256::hex_digest(&manifest),
+        kernel,
+        initramfs,
+    })
+}
+
+fn media_mount_command(device: &Path, mountpoint: &Path) -> Command {
+    let mut command = Command::new(TD_MOUNT);
+    command.args([
+        OsStr::new("-t"),
+        OsStr::new("iso9660"),
+        OsStr::new("-o"),
+        OsStr::new("ro,nodev,nosuid,noexec,map=normal"),
+        device.as_os_str(),
+        mountpoint.as_os_str(),
+    ]);
+    command
+}
+
+/// Find the one install medium and mount it read-only at `mountpoint`.
+fn mount_medium(mountpoint: &Path) -> io::Result<()> {
+    require_absolute(mountpoint, "mountpoint")?;
+    match fs::DirBuilder::new().mode(0o700).create(mountpoint) {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+        _ => require_real_directory(mountpoint, "mountpoint")?,
+    }
+    let medium = volume::find_medium()?;
+    writeln!(
+        io::stderr(),
+        "td-boot: install medium {}",
+        medium.device.display()
+    )?;
+    run_command(
+        &mut media_mount_command(&medium.path(), mountpoint),
+        "read-only install medium mount",
+    )
+}
+
+/// The live selector's trust root, after its provisioning is checked.
+///
+/// A live selector boots whatever signed deployment a medium carries, so it
+/// must be exactly that: the marker, no volume identity (which would name an
+/// installed volume it never reads) and no measurement policy (which it never
+/// applies). A selector carrying either was built wrong, and says so here
+/// rather than booting with a policy silently ignored.
+fn live_trust_root(rootfs: &Path) -> io::Result<TrustRoot> {
+    let marker = read_bounded_real_file(
+        &rootfs.join(protocol::LIVE_MEDIA_MARKER_PATH),
+        "live media marker",
+        64,
+    )?;
+    if marker != protocol::LIVE_MEDIA_MARKER {
+        return Err(invalid("live media marker is malformed"));
+    }
+    for (path, what) in [
+        (protocol::VOLUME_UUID_PATH, "an installed volume identity"),
+        (measurement::POLICY_PATH, "a boot measurement policy"),
+    ] {
+        match fs::symlink_metadata(rootfs.join(path)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(invalid(format!(
+                    "live selector carries {what} ({path}); a live boot applies neither"
+                )));
+            }
+        }
+    }
+    read_boot_trust_root(rootfs)
+}
+
+fn run_live_boot(mountpoint: &Path, base_cmdline: &OsStr) -> io::Result<()> {
+    let key = live_trust_root(Path::new(BOOT_ROOTFS))?;
+    let ram_disk_kib = live_ram_disk_kib(&read_bounded_real_file(
+        Path::new("/proc/meminfo"),
+        "memory summary",
+        64 * 1024,
+    )?)?;
+    let uuid = volume::Uuid::random()?;
+    mount_medium(mountpoint)?;
+    let result = (|| {
+        let deployment = authenticated_media_deployment(mountpoint, &key)?;
+        let cmdline = live_cmdline(base_cmdline, &uuid, ram_disk_kib, &deployment.id)?;
+        writeln!(
+            io::stderr(),
+            "td-boot: live deployment {} volume {uuid} ram-disk-kib {ram_disk_kib}",
+            deployment.id
+        )?;
+        let Deployment {
+            kernel, initramfs, ..
+        } = deployment;
+        run_command(
+            &mut kexec_command(kernel, initramfs, cmdline.as_os_str()),
+            "td-kexec",
+        )?;
+        Err(io::Error::other(
+            "td-kexec returned without booting the live deployment",
+        ))
+    })();
+    best_effort_unmount(mountpoint);
+    result
+}
+
+/// The live handoff must name the deployment `live-root` was given.
+///
+/// The deployment init reads its id from the same line, so this is defence in
+/// depth: an argv id the selector did not authenticate is refused.
+fn require_live_handoff(cmdline: &[u8], deployment_id: &str) -> io::Result<()> {
+    if !cmdline_has_token(cmdline, protocol::LIVE_CMDLINE_TOKEN.as_bytes()) {
+        return Err(invalid(format!(
+            "live-root requires the live selector's {} handoff",
+            protocol::LIVE_CMDLINE_TOKEN
+        )));
+    }
+    if !cmdline_has_token(cmdline, format!("td.deployment={deployment_id}").as_bytes()) {
+        return Err(invalid(format!(
+            "live-root was given deployment {deployment_id}, which the handoff does not name"
+        )));
+    }
+    Ok(())
+}
+
+/// The medium's `root.erofs`, open and hashed, if the medium holds exactly
+/// the deployment the selector authenticated.
+///
+/// The id is the manifest's hash, so a match binds this medium's manifest,
+/// and so its root digest, to what was authenticated before kexec.
+fn live_root_payload(medium: &Path, deployment_id: &str) -> io::Result<File> {
+    require_real_directory(medium, "install medium")?;
+    let manifest = media_manifest(medium)?;
+    let id = sha256::hex_digest(&manifest);
+    if id != deployment_id {
+        return Err(invalid(format!(
+            "install medium holds deployment {id}, not the selected {deployment_id}"
+        )));
+    }
+    let parsed = parse_manifest(&manifest)?;
+    verify_payload(medium, &media_name("root.erofs")?, &parsed.root)
+}
+
+/// Leaves the medium mounted: the loop holds its `root.erofs` open.
+fn run_live_root(mountpoint: &Path, deployment_id: &str, loop_device: &Path) -> io::Result<()> {
+    require_absolute(loop_device, "loop device")?;
+    require_live_handoff(
+        &read_bounded_real_file(
+            Path::new("/proc/cmdline"),
+            "kernel command line",
+            MAX_CMDLINE_BYTES as u64,
+        )?,
+        deployment_id,
+    )?;
+    mount_medium(mountpoint)?;
+    let result = live_root_payload(mountpoint, deployment_id).and_then(|root| {
+        run_command(
+            &mut loop_command(root, loop_device),
+            "read-only live root loop setup",
+        )
+    });
+    if result.is_err() {
+        best_effort_unmount(mountpoint);
+    }
+    result
+}
+
 fn run() -> io::Result<()> {
     dispatch(parse_args(std::env::args_os().skip(1))?)
 }
@@ -3366,6 +3674,15 @@ fn dispatch(mode: Mode) -> io::Result<()> {
             directory,
             trusted_key,
         } => run_validate_source(&directory, &trusted_key, &mut io::stdout()),
+        Mode::LiveBoot {
+            mountpoint,
+            cmdline,
+        } => run_live_boot(&mountpoint, &cmdline),
+        Mode::LiveRoot {
+            mountpoint,
+            deployment_id,
+            loop_device,
+        } => run_live_root(&mountpoint, &deployment_id, &loop_device),
     }
 }
 
@@ -7098,5 +7415,300 @@ mod tests {
             decode_hex::<1>(b"+f", "x", fixture_path()).is_err(),
             "a signed nibble is not hex"
         );
+    }
+
+    #[test]
+    fn live_verbs_take_exact_operands_and_a_canonical_id() {
+        let id = "a".repeat(64);
+        assert!(matches!(
+            parse_args(args(&["live-boot", "/media", "quiet"])).unwrap(),
+            Mode::LiveBoot { .. }
+        ));
+        assert!(matches!(
+            parse_args(args(&["live-root", "/media", &id, "/dev/loop0"])).unwrap(),
+            Mode::LiveRoot { .. }
+        ));
+        for bad in [
+            vec!["live-boot", "/media"],
+            vec!["live-boot", "/media", "quiet", "extra"],
+            vec!["live-root", "/media", &id],
+            vec!["live-root", "/media", "not-an-id", "/dev/loop0"],
+            vec!["live-root", "/media", &id, "/dev/loop0", "extra"],
+            vec!["on-volume", "live-boot", "/media", "quiet"],
+        ] {
+            assert!(parse_args(args(&bad)).is_err(), "{bad:?}");
+        }
+        let usage = usage_error().to_string();
+        assert!(usage.contains("td-boot live-boot <mountpoint> <cmdline>"));
+        assert!(usage.contains("td-boot live-root <mountpoint> <deployment-id> <loop-device>"));
+    }
+
+    #[test]
+    fn the_live_ram_disk_is_half_of_memory_with_a_floor() {
+        let meminfo = |total: &str| format!("MemTotal:       {total} kB\nMemFree:  1 kB\n");
+        assert_eq!(
+            live_ram_disk_kib(meminfo("4194304").as_bytes()).unwrap(),
+            2097152
+        );
+        assert_eq!(
+            live_ram_disk_kib(meminfo("1048576").as_bytes()).unwrap(),
+            LIVE_MIN_VOLUME_KIB
+        );
+        assert!(live_ram_disk_kib(meminfo("1048574").as_bytes()).is_err());
+        for bad in [
+            "",
+            "MemFree: 4194304 kB\n",
+            "MemTotal: 4194304 MB\n",
+            "MemTotal: -1 kB\n",
+        ] {
+            assert!(live_ram_disk_kib(bad.as_bytes()).is_err(), "{bad}");
+        }
+        assert!(live_ram_disk_kib(b"MemTotal: \xff kB\n").is_err());
+    }
+
+    #[test]
+    fn the_live_handoff_adds_its_tokens_once_and_no_base_line_can_carry_them() {
+        let id = "b".repeat(64);
+        let uuid = volume::Uuid::parse("12345678-90ab-4def-8234-567890abcdef").unwrap();
+        let line =
+            live_cmdline(OsStr::new("console=ttyS0 rdinit=/init"), &uuid, 2048, &id).unwrap();
+        assert_eq!(
+            line.to_str().unwrap(),
+            format!(
+                "console=ttyS0 rdinit=/init td.volume={uuid} td.deployment={id} \
+                 td.live=1 brd.rd_size=2048"
+            )
+        );
+        assert_eq!(volume::handoff(line.as_bytes()).unwrap(), uuid);
+        assert!(cmdline_has_token(line.as_bytes(), b"td.live=1"));
+        for reserved in [
+            "td.live=1",
+            "td.live=0",
+            "brd.rd_size=1",
+            "td.deployment=x",
+            "td.volume=12345678-90ab-4def-8234-567890abcdef",
+        ] {
+            let base = format!("quiet {reserved}");
+            assert!(
+                live_cmdline(OsStr::new(&base), &uuid, 2048, &id).is_err(),
+                "{reserved}"
+            );
+        }
+        // An installed selector's line is refused the same live tokens.
+        for reserved in ["td.live=1", "brd.rd_size=4096"] {
+            let base = format!("quiet {reserved}");
+            assert!(
+                kernel_cmdline(OsStr::new(&base), &id, false).is_err(),
+                "{reserved}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_names_are_the_lowercased_iso_names_of_every_deployment_file() {
+        assert_eq!(media_name("bzImage").unwrap(), "bzimage");
+        for name in [
+            protocol::MANIFEST_NAME,
+            protocol::MANIFEST_SIG_NAME,
+            "initramfs.cpio",
+            "root.erofs",
+        ] {
+            assert_eq!(media_name(name).unwrap(), name);
+        }
+        for (iso, name) in protocol::MEDIA_DEPLOYMENT_FILES {
+            assert_eq!(media_name(name).unwrap(), iso.to_ascii_lowercase());
+        }
+        for bad in ["bzimage", "BZIMAGE", "selector.cpio", ""] {
+            assert!(media_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// A fixture deployment laid out the way a mounted install medium shows it.
+    fn media_bundle(fixture: &Fixture) -> (PathBuf, String) {
+        let (directory, id) = fixture.source_bundle("medium", "");
+        fs::rename(directory.join("bzImage"), directory.join("bzimage")).unwrap();
+        (directory, id)
+    }
+
+    #[test]
+    fn a_live_medium_is_authenticated_before_its_boot_payloads_are_trusted() {
+        let fixture = Fixture::new();
+        let (medium, id) = media_bundle(&fixture);
+        let deployment = authenticated_media_deployment(&medium, &fixture.key()).unwrap();
+        assert_eq!(deployment.id, id);
+
+        let error = authenticated_media_deployment(&medium, &fixture.wrong_key())
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains(protocol::MANIFEST_UNAUTHENTICATED),
+            "{error}"
+        );
+
+        for name in ["bzimage", "initramfs.cpio"] {
+            let path = medium.join(name);
+            let original = fs::read(&path).unwrap();
+            fs::write(&path, b"tampered").unwrap();
+            let error = authenticated_media_deployment(&medium, &fixture.key())
+                .err()
+                .unwrap();
+            assert!(
+                error.to_string().contains("hash mismatch"),
+                "{name}: {error}"
+            );
+            fs::write(&path, original).unwrap();
+        }
+        // The root is hashed by live-root, at the descriptor it binds.
+        fs::write(medium.join("root.erofs"), b"checked after kexec").unwrap();
+        assert!(authenticated_media_deployment(&medium, &fixture.key()).is_ok());
+
+        fs::remove_file(medium.join("manifest.sig")).unwrap();
+        let error = authenticated_media_deployment(&medium, &fixture.key())
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("no deployment signature"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_kernel_under_its_deployment_spelling_is_not_the_media_kernel() {
+        let fixture = Fixture::new();
+        let (directory, _) = fixture.source_bundle("unmapped", "");
+        let error = authenticated_media_deployment(&directory, &fixture.key())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("bzimage"), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_media_manifest_is_refused_as_unauthenticated_not_parsed() {
+        let fixture = Fixture::new();
+        let (medium, _) = media_bundle(&fixture);
+        fs::write(medium.join("manifest"), b"not a manifest\n").unwrap();
+        let error = authenticated_media_deployment(&medium, &fixture.key())
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains(protocol::MANIFEST_UNAUTHENTICATED),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn live_root_binds_only_the_selected_medium_and_an_intact_root() {
+        let fixture = Fixture::new();
+        let (medium, id) = media_bundle(&fixture);
+        assert!(live_root_payload(&medium, &id).is_ok());
+
+        let error = live_root_payload(&medium, &"c".repeat(64)).err().unwrap();
+        assert!(error.to_string().contains("not the selected"), "{error}");
+
+        let (other, other_id) = fixture.source_bundle("other-medium", "next");
+        assert_ne!(other_id, id);
+        let error = live_root_payload(&other, &id).err().unwrap();
+        assert!(
+            error.to_string().contains("not the selected"),
+            "a medium holding another signed deployment: {error}"
+        );
+
+        fs::write(medium.join("root.erofs"), b"tampered").unwrap();
+        let error = live_root_payload(&medium, &id).err().unwrap();
+        assert!(error.to_string().contains("hash mismatch"), "{error}");
+    }
+
+    #[test]
+    fn live_root_requires_the_live_handoff_naming_its_deployment() {
+        let id = "d".repeat(64);
+        let line = format!("quiet td.deployment={id} td.live=1 brd.rd_size=4");
+        assert!(require_live_handoff(line.as_bytes(), &id).is_ok());
+        for bad in [
+            format!("quiet td.deployment={id}"),
+            format!("quiet td.deployment={id} td.live=0"),
+            format!("quiet td.deployment={id} td.live=1x"),
+            format!("quiet td.deployment={} td.live=1", "e".repeat(64)),
+            "quiet td.live=1".to_string(),
+        ] {
+            assert!(require_live_handoff(bad.as_bytes(), &id).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_live_handoff_refuses_a_line_that_ends_kernel_parameters() {
+        let id = "b".repeat(64);
+        let uuid = volume::Uuid::parse("12345678-90ab-4def-8234-567890abcdef").unwrap();
+        assert!(live_cmdline(OsStr::new("quiet -- single"), &uuid, 2048, &id).is_err());
+        assert!(live_cmdline(OsStr::new("quiet --"), &uuid, 2048, &id).is_err());
+        assert!(live_cmdline(OsStr::new("quiet a--b --x"), &uuid, 2048, &id).is_ok());
+        // An installed handoff appends nothing brd must see, so it is unchanged.
+        assert!(kernel_cmdline(OsStr::new("quiet -- single"), &id, false).is_ok());
+    }
+
+    #[test]
+    fn the_live_handoff_is_bounded_by_the_kernel_command_line() {
+        let id = "b".repeat(64);
+        let uuid = volume::Uuid::parse("12345678-90ab-4def-8234-567890abcdef").unwrap();
+        let fits = |base: &str| live_cmdline(OsStr::new(base), &uuid, 2048, &id);
+        let appended = fits("x").unwrap().len() - 1;
+        let longest = "x".repeat(MAX_CMDLINE_BYTES - appended - 1);
+        assert_eq!(fits(&longest).unwrap().len() + 1, MAX_CMDLINE_BYTES);
+        assert!(fits(&format!("{longest}x")).is_err());
+    }
+
+    #[test]
+    fn a_live_selector_is_provisioned_as_exactly_that() {
+        let fixture = Fixture::new();
+        let rootfs = &fixture.root;
+        let marker = rootfs.join(protocol::LIVE_MEDIA_MARKER_PATH);
+        let key = rootfs.join(protocol::TRUSTED_KEY_PATH);
+        fs::create_dir_all(key.parent().unwrap()).unwrap();
+        fs::write(&key, format!("{FIXTURE_PUBLIC_KEY}\n")).unwrap();
+
+        assert!(live_trust_root(rootfs).is_err(), "no marker");
+        fs::write(&marker, protocol::LIVE_MEDIA_MARKER).unwrap();
+        assert_eq!(live_trust_root(rootfs).unwrap(), fixture.key());
+
+        for wrong in [&b"td-live-media-v1"[..], b"td-live-media-v2\n", b""] {
+            fs::write(&marker, wrong).unwrap();
+            assert!(live_trust_root(rootfs).is_err(), "{wrong:?}");
+        }
+        // A symlink to the exact bytes is still refused: the marker is part of
+        // the selector's own rootfs, never a pointer elsewhere.
+        let elsewhere = fixture.root.join("marker-elsewhere");
+        fs::write(&elsewhere, protocol::LIVE_MEDIA_MARKER).unwrap();
+        fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &marker).unwrap();
+        assert!(live_trust_root(rootfs).is_err(), "a symlinked marker");
+        fs::remove_file(&marker).unwrap();
+        fs::write(&marker, protocol::LIVE_MEDIA_MARKER).unwrap();
+
+        for path in [protocol::VOLUME_UUID_PATH, measurement::POLICY_PATH] {
+            let extra = rootfs.join(path);
+            fs::write(&extra, b"x").unwrap();
+            let error = live_trust_root(rootfs).err().unwrap();
+            assert!(error.to_string().contains(path), "{error}");
+            fs::remove_file(&extra).unwrap();
+        }
+        fs::remove_file(&key).unwrap();
+        assert!(live_trust_root(rootfs).is_err(), "no trust root");
+    }
+
+    /// What production passes, stated as a literal; the parameter is for the
+    /// test above.
+    #[test]
+    fn the_live_selector_is_checked_on_its_own_rootfs() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split_once("\nfn run_live_boot(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert!(body.contains("live_trust_root(Path::new(BOOT_ROOTFS))?"));
+        assert!(!body.contains("read_boot_trust_root("));
     }
 }

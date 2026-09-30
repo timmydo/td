@@ -182,10 +182,10 @@ and USB mass-storage support as built-ins. The recipe checks the resolved
 configuration so media access needs no modules from the media it must read.
 It also builds in the RAM block driver with one device, `/dev/ram0`, created
 at boot for the live profile's volatile volume. The device allocates pages
-only when written and frees them on discard. The live selector is to size it
-with `brd.rd_size=` (KiB) on the command line it hands the deployment; no
-selector does so yet. An installed boot passes no size and keeps an unused
-device of the default size, which holds no memory. Destination discovery
+only when written and frees them on discard. The live selector sizes it with
+`brd.rd_size=` (KiB) on the command line it hands the deployment (see "Live
+boot"). An installed boot passes no size and keeps an unused device of the
+default size, which holds no memory. Destination discovery
 never offers it, because its allow-list admits only virtio, SCSI-named and
 NVMe disks.
 The native `qemu-install` diagnostic extends the firmware evidence by
@@ -193,3 +193,90 @@ mounting the ISO read-only in Linux and installing its signed payload files.
 It exercises both attachments with the same image and then boots the
 destination with media detached. Its exact bounds and fixture-only device
 conventions are specified in [the fixture design](../td-install-qemu-test/DESIGN.md).
+
+## Live boot
+
+A live boot runs the signed system deployment from the medium, with the root
+image read-only and all writable state in RAM. It reuses the installed boot
+chain: a selector authenticates and kexecs, and the deployment initramfs
+mounts a td volume named by `td.volume=` and loop-mounts `root.erofs`. The
+differences are where the selector finds the deployment, where the root image
+stays, and what backs the volume.
+
+Install media carry the signed deployment in the ISO root as `BZIMAGE`,
+`INITRAMFS.CPIO`, `ROOT.EROFS`, `MANIFEST` and `MANIFEST.SIG`
+(`td-boot/src/protocol.rs` `MEDIA_DEPLOYMENT_FILES`). Linux mounts the medium
+`ro,nodev,nosuid,noexec` with ISO-9660 `map=normal`, which shows those names in
+lowercase. td-boot reads the lowercase names, so `bzImage` is `bzimage` on the
+medium; nothing copies or renames a payload.
+
+td-boot identifies the medium by its primary volume descriptor: type 1,
+`CD001`, version 1 and the space-padded volume identifier `TD_INSTALL`, at
+2048-byte sector 16 of a whole optical, SCSI-named, virtio or NVMe device.
+Partitions are not candidates. It opens each candidate read-only by its
+sysfs-verified device number and mounts the held descriptor, so a renamed
+node cannot substitute another device; the device and inode checks are
+repeated after the read, as the volume probe does. An empty drive
+(`ENOMEDIUM`) is not a medium, and a device that cannot be read is skipped
+with its reason kept for the not-found error, so a card reader or failing
+disk cannot stop a live boot. A node or sysfs value that is still appearing
+makes the whole scan incomplete: nothing is selected, because that device
+may be a second medium, and the scan is repeated. Discovery waits up to 30
+seconds for slow USB enumeration. More than one medium is refused rather
+than chosen between: attach only the one to boot. Probes run one device at a
+time with the same bound as volume discovery: a read that stalls is ended by
+the kernel's command timeout, not by td-boot. The descriptor is an identity,
+not a credential; authenticity comes from the signature below.
+
+The live selector is the stock selector initramfs with two appended entries:
+the trust root at `etc/td/deployment.pub`, as for an installed selector, and
+the marker `etc/td/live-media` holding `td-live-media-v1`. It has no
+`etc/td/volume-uuid` and no `etc/td/boot-measurement` policy. `td-boot
+live-boot MOUNTPOINT CMDLINE` refuses without the exact marker, and refuses a
+selector carrying either of those files, since it would apply neither. Then
+it:
+
+1. reads the trust root and takes half of `MemTotal` as the RAM disk size,
+   refusing less than 512 MiB;
+2. draws a fresh version-4 volume UUID from `/dev/urandom`;
+3. finds and mounts the medium;
+4. authenticates the manifest under the trust root before parsing it, and
+   verifies `bzImage` and `initramfs.cpio` against it;
+5. kexecs them with the base command line plus `td.volume=UUID`,
+   `td.deployment=ID`, `td.live=1` and `brd.rd_size=KIB`.
+
+It does not hash `root.erofs`: with no previous deployment to fall back to,
+`live-root`'s hash after kexec is the one that decides. Every payload hash
+has the residual `root-loop` has: the medium is read again after it is
+hashed (by kexec, and by the loop through the page cache), so a hostile
+device controller can serve different bytes later.
+
+It does not extend PCR 11, which stays zero in a live session. Root there can
+therefore reproduce an installed selector's PCR 11 value by extending the
+same event. No protector binds PCR 11 alone (`ENCRYPTION.md`), so this grants
+nothing today; a protector that ever did would need the live selector to cap
+PCR 11 first.
+
+The base command line may not carry the literal tokens `td.volume=`,
+`td.deployment=`, `td.live=` or `brd.rd_size=`. The last two are refused in an
+installed selector's base line too, so firmware cannot steer an installed
+boot into the live branch. Only those spellings are refused: the kernel also
+accepts `brd.rd-size=` and `ramdisk_size=`, but td-boot's token comes last
+and wins. A live base line may not contain a bare `--`, after which the
+kernel hands every word to init and `brd.rd_size=` would never reach brd.
+Whoever writes the base line can already choose `rdinit=`, so these checks
+keep the handoff well formed rather than defend against its author.
+
+In the deployment initramfs, `td-boot live-root MOUNTPOINT ID LOOP` requires
+`td.live=1` and `td.deployment=ID` in `/proc/cmdline`, finds and mounts the
+medium again, and
+requires its manifest to hash to the handed-off id, which the selector
+authenticated. A different medium carrying the same signed deployment is
+therefore acceptable and any other is refused. It hashes `root.erofs` against
+that manifest and attaches the verified descriptor to a read-only loop, as
+`root-loop` does for an installed volume, and leaves the medium mounted
+because the loop holds its file. On failure it unmounts.
+
+The volatile volume, its layout and the deployment initramfs's live branch are
+separate increments. Until they land nothing provisions a live selector or
+calls these verbs.

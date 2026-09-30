@@ -96,6 +96,40 @@ pub const VOLUME_CMDLINE_PREFIX: &str = "td.volume=";
 #[allow(dead_code)]
 pub const EFI_INITRD_PATH: &str = "\\EFI\\BOOT\\INITRD";
 
+// The live installation profile (td-install/MEDIA.md "Live boot"). A selector
+// provisioned for install media carries this marker where an installed one
+// carries `VOLUME_UUID_PATH`; its init takes the live branch only when the
+// marker is present and td-boot refuses `live-boot` without it.
+#[allow(dead_code)]
+pub const LIVE_MEDIA_MARKER_PATH: &str = "etc/td/live-media";
+#[allow(dead_code)]
+pub const LIVE_MEDIA_MARKER: &[u8] = b"td-live-media-v1\n";
+// Handed to the deployment only by the live selector. Reserved in every base
+// command line, so an installed boot cannot be steered into the live branch.
+#[allow(dead_code)]
+pub const LIVE_CMDLINE_TOKEN: &str = "td.live=1";
+// Every value is reserved, not only the one td-boot writes.
+#[allow(dead_code)]
+pub const LIVE_CMDLINE_PREFIX: &str = "td.live=";
+// brd's size parameter, in KiB, for the volatile volume on /dev/ram0.
+#[allow(dead_code)]
+pub const RAM_DISK_SIZE_PREFIX: &str = "brd.rd_size=";
+// The ISO-9660 primary volume identifier of install media. The media writer's
+// fixed label (`engine/src/iso9660.rs`) must equal it.
+#[allow(dead_code)]
+pub const MEDIA_VOLUME_ID: &str = "TD_INSTALL";
+// The signed deployment's ISO root names, each paired with the deployment name
+// it carries. Linux mounts ISO-9660 with `map=normal`, which lowercases names,
+// so a mounted medium shows the lowercase form of the first column.
+#[allow(dead_code)]
+pub const MEDIA_DEPLOYMENT_FILES: [(&str, &str); 5] = [
+    ("BZIMAGE", "bzImage"),
+    ("INITRAMFS.CPIO", "initramfs.cpio"),
+    ("ROOT.EROFS", "root.erofs"),
+    ("MANIFEST", "manifest"),
+    ("MANIFEST.SIG", "manifest.sig"),
+];
+
 // The DISK layout, stated here for D1's reason: `td-install` writes it and
 // td-boot reads what sits inside it, and a layout stated twice is a layout that
 // can disagree with itself — at the first boot after an install rather than at
