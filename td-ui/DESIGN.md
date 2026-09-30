@@ -300,9 +300,10 @@ of its own files may name each module.
 - `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
   texts beside the face in `td-compositor/assets`, embedded at compile
   time for a program's `--font-license` output.
-- `open`: `link`, which starts the browser on one whole link, and
-  `link_on`, the same on a display the caller names; under "Following
-  links" below.
+- `open`: `link`, which starts the browser on one whole link,
+  `link_on`, the same on a display the caller names, `url`, the same on
+  a URL a program lists from markup, and `file`, the same on a local
+  file the program wrote; under "Following links" below.
 - `wayland`: `Endpoint` and `endpoint` (from the `WAYLAND_SOCKET`,
   `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` values a consumer passes),
   `connect`, `Connection` (`new`, `send` with at most one borrowed file,
@@ -1826,9 +1827,10 @@ time, coordinate extremes, explicit cancellation and consumed pairs.
 ## Following links
 
 A Control-press on a link opens it in the browser in td-editor's
-documents, in td-mail's messages, which td-mail shows in the editor's
-pane, and in td-term's grid; td-news does not follow links yet. The
-rule and the launch are the toolkit's so the programs agree.
+documents, in td-mail's messages and in td-news's articles and help,
+which each shows in the editor's pane (td-news's log cuts its lines at
+the pane's width, so it follows none), and in td-term's grid. The rule
+and the launch are the toolkit's so the programs agree.
 `links::at` finds the link over the byte under the pointer: an
 `http://` or `https://` scheme with at least one byte after it, running
 to the next ASCII whitespace or `<>])"'` backtick, trailing `.,;:!?`
@@ -1849,12 +1851,22 @@ the next press is a first click.
 `open::link` refuses anything that is not one link whole
 (`links::whole`, the same rule without the press's bound, so a link
 found at any byte opens), so no option, whitespace or other scheme
-reaches the browser's arguments. The
-browser is the program's configured command, else `BROWSER`, else
+reaches the browser's arguments. `open::url` takes a URL a program lists
+from markup or a feed rather than finds in shown text (td-news's links
+and an article's own link), whose ends the markup gives, so a `)`, a
+quote or a trailing `.` the text rule leaves out is kept: it must be an
+`http://` or `https://` scheme, in any case, with at least one byte
+after it and hold no whitespace or control character, so it too is one
+word and no option. `open::file` is the one other target: a local file
+the program wrote (td-news's digest), which must be an absolute UTF-8
+path and is given as a `file://` URL with every byte but an unreserved
+one or `/` percent-encoded. The portal's `OpenURI` refuses `file`
+(APPLICATIONS.md §W.6), so a program in a jail cannot open one this way.
+The browser is the program's configured command, else `BROWSER`, else
 `xdg-open`, split on whitespace and run directly, never through a shell:
-a word holding `{url}` has it replaced by the link (quotes put around the
-bare placeholder are taken off), and a command without one gets the link
-as its last word. The child's standard streams are `/dev/null`, its
+a word holding `{url}` has it replaced by the link (quotes put around
+the bare placeholder are taken off), and a command without one gets the
+link as its last word. The child's standard streams are `/dev/null`, its
 environment is the program's without `WAYLAND_SOCKET` (so the browser
 cannot speak on the program's display connection) and, through
 `open::link_on`, with `WAYLAND_DISPLAY` set to a path the caller names

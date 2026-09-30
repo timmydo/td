@@ -503,8 +503,15 @@ impl App {
                 x,
                 y,
                 extend,
-                ..
-            } if self.mouse_config => self.pointer(phase, x, y, extend, cache, cmd_tx),
+                follow,
+            } if self.mouse_config => {
+                // A Control-press over a link in the pane opens it and is no
+                // press of the pane's; its release finds no drag.
+                let followed = follow && phase == PointerPhase::Press && self.follow_link(x, y);
+                if !followed {
+                    self.pointer(phase, x, y, extend, cache, cmd_tx);
+                }
+            }
             Input::CancelPointer => {
                 if self.pane_drag {
                     self.pane_drag = false;
@@ -921,8 +928,8 @@ impl App {
     /// Opens link `index` of the article's, leaving the picker.
     fn open_url(&mut self, index: usize) {
         if let Some(url) = self.article_urls.get(index).cloned() {
-            self.status = match open_in_browser(&url, self.browser.as_deref()) {
-                Ok(()) => format!("Opened [{}]", index + 1),
+            self.status = match td_ui::open::url(&url, self.browser.as_deref()) {
+                Ok(_) => format!("Opened [{}]", index + 1),
                 Err(e) => format!("Failed to open browser: {}", e),
             };
             self.url_picking = false;
@@ -1092,6 +1099,46 @@ impl App {
                 Outcome::Ignored
             }
         }
+    }
+
+    /// A Control-press over a link (`td_ui::links`) in the pane's text
+    /// opens it in the browser and is no press of the pane's, so the caret,
+    /// the selection and a drag are untouched: whether it was over one.
+    fn follow_link(&mut self, x: i64, y: i64) -> bool {
+        // The log's lines are cut at the pane's width, which can cut a link
+        // short: only an article's and the help's text is whole.
+        if !matches!(self.view, View::Article | View::Help) {
+            return false;
+        }
+        let layout = self.layout();
+        if !layout.pane.is_some_and(|rect| rect.contains(x, y)) {
+            return false;
+        }
+        self.place_pane(&layout);
+        let Some((tab, revision)) = self.pane_target() else {
+            return false;
+        };
+        let Ok(Some(range)) = self.pane.link_at(tab, revision, x, y) else {
+            return false;
+        };
+        let Some(link) = self
+            .pane
+            .editor()
+            .document(tab)
+            .ok()
+            .and_then(|document| document.text().get(range).map(str::to_owned))
+        else {
+            return false;
+        };
+        self.status = match td_ui::open::link(&link, self.browser.as_deref()) {
+            Ok(program) => format!("Opened {link} with {program}"),
+            Err(e) => format!("Failed to open browser: {e}"),
+        };
+        // The followed press is no click: the next press starts anew.
+        self.pane_drag = false;
+        self.pane_event(Event::CancelPointer);
+        self.pending_redraw = true;
+        true
     }
 
     fn pane_target(&self) -> Option<(TabId, u64)> {
@@ -1665,8 +1712,8 @@ impl App {
     fn open_current_article(&mut self) {
         if let Some(article) = self.current_article() {
             let link = article.link.clone();
-            self.status = match open_in_browser(&link, self.browser.as_deref()) {
-                Ok(()) => "Opened in browser".to_string(),
+            self.status = match td_ui::open::url(&link, self.browser.as_deref()) {
+                Ok(_) => "Opened in browser".to_string(),
                 Err(e) => format!("Failed to open browser: {}", e),
             };
             self.pending_redraw = true;
@@ -1763,9 +1810,12 @@ impl App {
         let path = dir.join("td-news-digest.html");
         match std::fs::write(&path, &html) {
             Ok(()) => {
-                let url = format!("file://{}", path.display());
-                self.status = match open_in_browser(&url, self.browser.as_deref()) {
-                    Ok(()) => format!("Opened digest ({} articles)", visible.len()),
+                // Absolute: a relative TMPDIR would make a relative path.
+                let opened = std::path::absolute(&path)
+                    .map_err(|e| format!("{}: {e}", path.display()))
+                    .and_then(|path| td_ui::open::file(&path, self.browser.as_deref()));
+                self.status = match opened {
+                    Ok(_) => format!("Opened digest ({} articles)", visible.len()),
                     Err(e) => format!("Failed to open browser: {}", e),
                 };
             }
@@ -2302,65 +2352,6 @@ fn help_text() -> String {
     text
 }
 
-/// The shell script that runs the configured browser command with the URL
-/// as its `$1`. The URL is not written into the script, so nothing a link
-/// carries is read as shell, however the command is written: a `{url}`
-/// becomes `"$1"` (quotes a person put around the placeholder are taken
-/// off first, since inside them the expansion would be unquoted); without
-/// a placeholder the URL is appended as one word. The caller runs it as
-/// `sh -f -c <script> sh <url>`, `-f` so a `?` or `*` in the link is not a
-/// pattern either.
-fn browser_script(cmd: &str) -> String {
-    let cmd = cmd
-        .replace("\"{url}\"", "{url}")
-        .replace("'{url}'", "{url}");
-    if cmd.contains("{url}") {
-        cmd.replace("{url}", "\"$1\"")
-    } else {
-        format!("{cmd} \"$1\"")
-    }
-}
-
-fn open_in_browser(url: &str, browser_config: Option<&str>) -> Result<(), String> {
-    // 1. Config browser command (supports {url} template, executed via sh -c)
-    if let Some(cmd) = browser_config {
-        let status = std::process::Command::new("sh")
-            .arg("-f")
-            .arg("-c")
-            .arg(browser_script(cmd))
-            .arg("sh")
-            .arg(url)
-            .status()
-            .map_err(|e| e.to_string())?;
-        if status.success() {
-            return Ok(());
-        }
-        return Err(format!("non-zero exit status: {}", status));
-    }
-
-    // 2. $BROWSER env var
-    if let Ok(browser) = std::env::var("BROWSER") {
-        let status = std::process::Command::new(browser)
-            .arg(url)
-            .status()
-            .map_err(|e| e.to_string())?;
-        if status.success() {
-            return Ok(());
-        }
-        return Err(format!("non-zero exit status: {}", status));
-    }
-
-    // 3. Fallback openers
-    for opener in ["xdg-open", "open"] {
-        match std::process::Command::new(opener).arg(url).status() {
-            Ok(status) if status.success() => return Ok(()),
-            _ => continue,
-        }
-    }
-
-    Err("no browser opener available".to_string())
-}
-
 /// Detect markdown reference link definitions like `[1]: https://example.com`
 /// the renderer emits, so we can strip them from rendered output.
 fn is_reference_link_def(line: &str) -> bool {
@@ -2625,42 +2616,6 @@ fn finish_log_line(line: &mut Vec<u8>, width: usize) -> String {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-
-    /// A link reaches the browser as one argument whichever way the command
-    /// is written, and none of it is read as shell: the script is run
-    /// through sh here, with a link that would print INJECTED if it were.
-    #[test]
-    fn a_link_reaches_the_browser_as_one_argument_however_the_command_is_written() {
-        let link = "https://x/$(printf INJECTED);'a\"b?*&c";
-        for (cmd, expected) in [
-            ("printf '%s\\n' {url}", link.to_string()),
-            ("printf '%s\\n' \"{url}\"", link.to_string()),
-            ("printf '%s\\n' '{url}'", link.to_string()),
-            ("printf '%s\\n' --url={url}", format!("--url={link}")),
-            ("printf '%s\\n'", link.to_string()),
-        ] {
-            let script = browser_script(cmd);
-            assert!(!script.contains("INJECTED"), "{cmd}: {script}");
-            let out = std::process::Command::new("sh")
-                .arg("-f")
-                .arg("-c")
-                .arg(&script)
-                .arg("sh")
-                .arg(link)
-                .output()
-                .expect("sh");
-            assert!(
-                out.status.success(),
-                "{cmd}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout).trim_end(),
-                expected,
-                "{cmd}"
-            );
-        }
-    }
 
     use crate::cache::Cache;
     use crate::config::{Config, FeedConfig, UiConfig};
@@ -2953,6 +2908,139 @@ pub(super) mod tests {
         app.mouse_config = false;
         press(&mut app, 10, row(0).y + 3);
         assert_eq!(app.selected_feed, last, "the mouse off");
+    }
+
+    /// A Control-press on a link in an opened article opens it through the
+    /// configured browser, the status saying what the opener answered, and
+    /// is no press of the pane's: the caret stays, and the next press is a
+    /// first click. Off a link it is a plain press, as it is in the log,
+    /// whose lines are cut at the pane's width; with the mouse off in the
+    /// configuration it is nothing.
+    #[test]
+    fn a_control_press_on_a_link_opens_it_and_elsewhere_is_a_plain_press() {
+        let dir = tempdir().expect("tempdir");
+        let cache = Cache::open_at(dir.path().join("test.tdkv")).expect("cache");
+        seed_cache(&cache, false);
+        let config = test_config();
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let mut app = App::new(&config, &cache, true).expect("app");
+        // A browser that cannot start: the test opens nothing.
+        let browser = "/nonexistent/td-news-browser";
+        app.browser = Some(browser.to_string());
+        for chord in ["Down", "Down", "Return", "Return"] {
+            let input = Input::Key {
+                chord,
+                repeat: false,
+            };
+            app.input(input, &cache, &cmd_tx);
+        }
+        assert_eq!(app.view, View::Article);
+        app.prepare_frame();
+        let pointer = |app: &mut App, x: i64, y: i64, follow: bool| {
+            for phase in [PointerPhase::Press, PointerPhase::Release] {
+                let input = Input::Pointer {
+                    phase,
+                    x,
+                    y,
+                    extend: false,
+                    follow: follow && phase == PointerPhase::Press,
+                };
+                app.input(input, &cache, &cmd_tx);
+            }
+        };
+        let rect = app.layout().pane.expect("a pane");
+        let (tab, revision) = app.pane_target().expect("the article");
+        let text = app.pane.editor().document(tab).unwrap().text().to_string();
+        let mut on = Vec::new();
+        let mut off = Vec::new();
+        for dy in (0..i64::from(rect.height)).step_by(4) {
+            for dx in (0..i64::from(rect.width)).step_by(4) {
+                let (x, y) = (rect.x + dx, rect.y + dy);
+                match app.pane.link_at(tab, revision, x, y).unwrap() {
+                    Some(range) => {
+                        assert_eq!(&text[range], "https://example.com/1");
+                        on.push((x, y));
+                    }
+                    None => off.push((x, y)),
+                }
+            }
+        }
+        let first = *on.first().expect("the link is shown");
+        let row: Vec<_> = on.iter().filter(|point| point.1 == first.1).collect();
+        let middle = *row[row.len() / 2];
+        let off = *off
+            .iter()
+            .find(|point| point.1 == first.1 && point.0 > row[row.len() - 1].0)
+            .expect("the row goes on past the link");
+        let selection = |app: &App| {
+            let tab = app.pane_tab.expect("a document in the pane");
+            app.pane.editor().document(tab).unwrap().selection()
+        };
+        // Without Control a press on the link is the pane's.
+        pointer(&mut app, middle.0, middle.1, false);
+        let placed = selection(&app);
+        assert!(placed.caret > text.find("https://").unwrap(), "{placed:?}");
+        // With Control it opens the link, and the caret stays.
+        app.status.clear();
+        pointer(&mut app, first.0, first.1, true);
+        assert!(
+            app.status
+                .starts_with(&format!("Failed to open browser: {browser}: ")),
+            "{}",
+            app.status
+        );
+        assert_eq!(selection(&app), placed, "the press was not the pane's");
+        assert!(!app.pane_drag);
+        // A plain press on the link just after the followed one is a first
+        // click, not the second of a pair with the press before it.
+        pointer(&mut app, middle.0, middle.1, false);
+        assert_eq!(selection(&app), placed, "a first click, not a word");
+        // With Control off a link it is a plain press.
+        app.status.clear();
+        pointer(&mut app, off.0, off.1, true);
+        assert_ne!(selection(&app), placed);
+        assert!(app.status.is_empty(), "{}", app.status);
+        // With the mouse off nothing opens.
+        app.mouse_config = false;
+        pointer(&mut app, first.0, first.1, true);
+        assert!(app.status.is_empty(), "{}", app.status);
+        // A listed link is opened however it ends: its ends are the
+        // markup's, not the text rule's; its scheme in any case.
+        for listed in [
+            "https://en.wikipedia.org/wiki/Rust_(language)",
+            "HTTPS://example.com/article",
+        ] {
+            app.article_urls = vec![listed.to_string()];
+            app.open_url(0);
+            assert!(
+                app.status
+                    .starts_with(&format!("Failed to open browser: {browser}: ")),
+                "{listed}: {}",
+                app.status
+            );
+        }
+        // In the log a Control-press on a link is a plain press.
+        app.mouse_config = true;
+        app.view = View::Log;
+        app.set_pane_text(PaneText::NoArticle, "fetch https://e.example/log\n");
+        let layout = app.layout();
+        app.place_pane(&layout);
+        let rect = layout.pane.expect("the log's pane");
+        let (tab, revision) = app.pane_target().expect("the log");
+        let at = (0..i64::from(rect.height))
+            .step_by(4)
+            .flat_map(|dy| {
+                (0..i64::from(rect.width))
+                    .step_by(4)
+                    .map(move |dx| (rect.x + dx, rect.y + dy))
+            })
+            .find(|&(x, y)| matches!(app.pane.link_at(tab, revision, x, y), Ok(Some(_))))
+            .expect("the log's link is shown");
+        let before = selection(&app);
+        app.status.clear();
+        pointer(&mut app, at.0, at.1, true);
+        assert!(app.status.is_empty(), "{}", app.status);
+        assert_ne!(selection(&app), before, "a plain press");
     }
 
     /// `[ui].scrolloff` keeps that many rows shown past the selection as it

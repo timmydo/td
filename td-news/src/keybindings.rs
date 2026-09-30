@@ -56,4 +56,5 @@ pub const MOUSE: &[&str] = &[
     "click on an article: open it",
     "wheel: move the selection, or scroll the article",
     "drag in the article: select text",
+    "Ctrl-click a link in the article or help: open it in the browser",
 ];

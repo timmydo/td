@@ -132,33 +132,11 @@ fn render(html: &[u8], width: usize, decor: Decor) -> Vec<Vec<Span>> {
     lines
 }
 
-/// Emit `[n]: url`, hard-wrapping the target rather than breaking after the
-/// marker, so the whole reference stays recognisable on its first line.
+/// Emit `[n]: url` on one line at any width, so the whole reference is
+/// recognisable on its line and its link, which a Control-press follows
+/// whole, is never split.
 fn push_footnote(out: &mut Out, index: usize, url: &str) {
-    let prefix = format!("[{}]: ", index);
-    let width = out.width;
-    if width == 0 {
-        out.push_line(vec![Span::plain(format!("{prefix}{url}"))]);
-        return;
-    }
-    let mut room = width.saturating_sub(str_width(&prefix));
-    let mut line = prefix;
-    let mut chunk = String::new();
-    for c in url.chars() {
-        let cw = char_width(c);
-        if cw > room {
-            line.push_str(&chunk);
-            out.push_line(vec![Span::plain(std::mem::take(&mut line))]);
-            chunk.clear();
-            room = width;
-        }
-        chunk.push(c);
-        room -= cw.min(room);
-    }
-    line.push_str(&chunk);
-    if !line.is_empty() {
-        out.push_line(vec![Span::plain(line)]);
-    }
+    out.push_line(vec![Span::plain(format!("[{index}]: {url}"))]);
 }
 
 fn line_has_content(line: &[Span]) -> bool {
@@ -1988,8 +1966,9 @@ fn materialise(pieces: Vec<Piece>, spans: &[Span]) -> Vec<Span> {
         .collect()
 }
 
-/// Greedy word wrapping. Words longer than the width are split; a width of 0
-/// means no wrapping.
+/// Greedy word wrapping. Words longer than the width are split, but for one
+/// holding a link, which a Control-press follows whole; a width of 0 means
+/// no wrapping.
 fn wrap(spans: Vec<Span>, width: usize) -> Vec<Vec<Span>> {
     let mut lines: Vec<Vec<Span>> = Vec::new();
     let mut cur: Vec<Piece> = Vec::new();
@@ -2072,7 +2051,7 @@ fn flush_word(
         *cur_w = 0;
     }
     // The word starts a fresh line; split it if it still does not fit.
-    if width > 0 && *word_w > width {
+    if width > 0 && *word_w > width && !holds_link(word) {
         let (full, rest, rest_w) = split_word(std::mem::take(word), width);
         for line in full {
             lines.push(materialise(line, spans));
@@ -2085,6 +2064,13 @@ fn flush_word(
     }
     *word_w = 0;
     *space = None;
+}
+
+/// Whether a word holds a link's scheme: a link split across lines would
+/// be followed as its first line's part.
+fn holds_link(word: &[Piece]) -> bool {
+    let text: String = word.iter().map(|piece| piece.text.as_str()).collect();
+    text.contains("https://") || text.contains("http://")
 }
 
 /// Break an over-long word into width-sized lines, returning the completed
@@ -3201,10 +3187,15 @@ mod tests {
     }
 
     #[test]
-    fn long_link_targets_wrap() {
+    fn long_links_are_not_split() {
         assert_eq!(
             text("<a href=\"http://www.example.com/\">Hello</a>", 10),
-            "[Hello][1]\n\n[1]: http:\n//www.exam\nple.com/\n"
+            "[Hello][1]\n\n[1]: http://www.example.com/\n"
+        );
+        let link = format!("https://e.example/{}", "a".repeat(100));
+        assert_eq!(
+            text(&format!("see {link} and ({link}). then"), 20),
+            format!("see\n{link}\nand\n({link}).\nthen\n")
         );
     }
 

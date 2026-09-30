@@ -58,7 +58,7 @@ Example:
 [ui]
 mouse = true
 sync_interval_secs = 300   # at least 30; 0 turns the automatic refresh off
-browser = "firefox {url}"  # optional; else $BROWSER, then xdg-open
+browser = "firefox {url}"  # optional; else $BROWSER, xdg-open; no shell
 
 [[feed]]
 name = "Hacker News"
@@ -98,6 +98,8 @@ shows and draw in the toolkit's palette.
 - The action bar's labels are the view's keys
 - The wheel moves the selection, or scrolls the article
 - A drag in the article selects text, and `Ctrl-C` copies it
+- A Ctrl-click on a link in the article or the help opens it in the
+  browser
 
 ## Cache
 

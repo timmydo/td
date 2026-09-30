@@ -314,7 +314,7 @@ fn print_help_config() {
     );
     eprintln!("                               # if no {{url}}, URL is appended as argument");
     eprintln!(
-        "                               # executed via sh -c; falls back to $BROWSER, xdg-open"
+        "                               # run directly, no shell; falls back to $BROWSER, xdg-open"
     );
     eprintln!("  scrolloff = 0                # rows kept shown past the selection on each side (default: 0)");
     eprintln!("  # page_size and a [theme] table are the terminal reader's:");

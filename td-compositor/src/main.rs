@@ -8,8 +8,8 @@
 mod app_policy;
 
 // td-ui's link rule and opener, shared so td-term follows a link as
-// td-editor and td-mail do; `around` is td-mail's wrap's alone, and
-// `open::link` is theirs.
+// td-editor, td-mail and td-news do; `around` is td-mail's wrap's alone,
+// `open::link` theirs, and `open::url` and `open::file` td-news's.
 #[allow(dead_code, reason = "shared link rule")]
 #[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/links.rs")]
 mod links;
