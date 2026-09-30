@@ -125,6 +125,15 @@ impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
         })
     }
 
+    /// A caller may shorten the original absolute cap, never renew it.
+    pub(crate) fn handshake_before(
+        &mut self,
+        deadline: Deadline,
+    ) -> Result<Option<HandshakeInfo>, Error> {
+        self.handshake_deadline = self.handshake_deadline.min(deadline);
+        self.handshake()
+    }
+
     /// Cached cryptographic evidence, cleared on local failure. The admitting
     /// owner must separately check current policy, gateway pins and peer address.
     pub fn evidence(&self) -> Option<HandshakeInfo> {

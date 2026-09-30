@@ -166,6 +166,12 @@ configured memory budget does not preserve the default RSS claim.
   preallocated buffers without allocating; native construction runs later on a
   fixed TLS worker. The runtime must still supply/retain the complete session
   slot and native byte allowance; a pair of arrays alone is not that admission.
+  Socket handoff moves those same owners into TlsConnection without another
+  wire allocation. It holds the count permit through queued/Pending native
+  progress, releasing it only after mail handshake authorization or abort.
+  The generation remains retained until native pump destruction, including
+  after a failed connection awaiting buffer recovery. Charge wrapper fields
+  and optional-permit bookkeeping to the same session/slot reservations.
 - Certificate overlap, reload overlap, allocator bookkeeping, executable
   pages and main/worker stacks all count at peak coexistence. RSS tests must
   validate the allowances; this ledger is not an OS memory limiter.

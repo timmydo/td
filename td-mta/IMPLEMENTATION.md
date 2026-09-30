@@ -644,13 +644,13 @@ that crate. Implement the conformance, explicit-provider confinement, algorithm
 baseline, key compatibility and native allocation/failure qualification in
 `td-crypto/DESIGN.md`, retaining its independent fixtures for F04.
 
-The mail adapters implement TlsFactory/TlsTransport through that facade. They
-own implicit-TLS and STARTTLS handoff, socket/deadline progress, generation/slot
-leases and gateway allowlist authorization. td-crypto owns chain/time/name and
-client-certificate verification. Preserve SNI, private CA override, bounded
-certificate generations and verified peer semantics. Disable unneeded
-resumption/early data. No authentication credentials reach a peer before
-verified TLS.
+The mail adapters implement a staged factory and TlsTransport through that
+facade. They own implicit-TLS and STARTTLS handoff, socket/deadline
+progress, generation/slot leases and gateway allowlist authorization.
+td-crypto owns chain/time/name and client-certificate verification. Preserve
+SNI, private CA override, bounded certificate generations and verified peer
+semantics. Disable unneeded resumption/early data. No authentication
+credentials reach a peer before verified TLS.
 
 Implement the remaining work as independently reviewable increments:
 
@@ -794,12 +794,19 @@ Implement the remaining work as independently reviewable increments:
             initial ACME issuance and expired-certificate recovery can use
             ACME/relay TLS while unavailable server roles remain disabled.
             Keep both paths within the existing generation/resource ledger.
-          - **Socket handoff:** next consume prepared native sessions into the
-            bounded transport pump, retain owners through handshake/completion,
-            authorize verified gateway evidence against the actual socket peer,
-            and enforce current-policy checks at runtime mutation boundaries.
+          - **Socket handoff:** implemented consuming TCP handoff with fixed
+            deadlines, plaintext-tail refusal and exact buffer recovery. The
+            bounded pump retains generation/count owners, publishes role-checked
+            mail evidence only after handshake completion, and releases count
+            capacity on completion/abort. Gateway evidence additionally matches
+            the actual socket peer and configured leaf pins. A supplied-current
+            comparison aborts on canonical policy/binding changes; runtime
+            serialization and durable mutation fencing remain M11/M13. Host and
+            portable cases cover deadlines, refusal, encrypted delivery, close,
+            retention, clock failure and missing-client-certificate denial.
+            Positive gateway mTLS and exact STARTTLS transitions remain M07d3c.
     - **M07d3c — protocol integration:** complete STARTTLS flush/tail/reset,
-      gateway pin/address authorization and local HTTPS/SMTP transition cases.
+      positive gateway mTLS pin/address fixtures and local HTTPS/SMTP transitions.
 - **M07e — resource/service admission:** qualify complete generation overlap,
   session/handshake peaks, worker entropy and Rust/native stack/allocation/RSS
   on the portable artifact before activating the adapters. Amend the checked

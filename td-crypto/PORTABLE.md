@@ -278,32 +278,33 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   test-target/profile, static ELF and isolated-runtime checks as the other
   qualification binaries; it is not an installed service dependency.
 - `td-mta-transport-smoke`: the `--lib --no-run` td-mta test executable,
-  selected by its `td_mta` library target and test profile. Thirty-four exact
-  policy/generation/gateway/admission/clock/TCP/TLS cases execute individually
-  under the existing
-  deadline and positive-one-test verdict requirement. They cover complete TLS
-  policy compilation and HTTPS name subsets, reader caps/refusals,
-  generation-bound IDs, queued/native
-  session ownership, exact buffer recovery and gateway policy/binding comparison;
+  selected by its `td_mta` library target and test profile. Forty exact
+  policy/generation/gateway/admission/clock/TCP/TLS cases execute
+  individually under the existing deadline and positive-one-test verdict
+  requirement. They cover complete TLS policy compilation and HTTPS name
+  subsets, reader caps/refusals, generation-bound IDs, queued/native session
+  ownership, exact buffer recovery and gateway policy/binding comparison;
   local compiled-policy peers verify relay trust, name routing and mandatory
-  client
-  authentication. They also cover generation
-  saturation before construction, stale/foreign publication, detached worker
+  client authentication. Retained TCP handoff cases cover plaintext tails,
+  exact buffer recovery, fixed/tightened deadlines, encrypted
+  delivery/close, generation and handshake capacity, clock failure and
+  changed-policy abort. Positive gateway mTLS transport remains a
+  protocol-integration requirement. They also cover generation saturation
+  before construction, stale/foreign publication, detached worker
   construction/retention, boxed payload handoff on a small requested stack,
   final payload drop order and construction/release races; canonical gateway
   policy equivalence/change, pin/CIDR and material refusals, mandatory
   client authentication against a positive no-client-auth control, handshake
   count limits, concurrent reservation and release, worker returns and
-  refusal cleanup, clock conversion, bounded TCP/half-close/failure, TLS
-  1.3 duplex progress and framing, backpressure, publication deadlines,
-  closure and truncation, and buffer recovery after success or constructor
-  refusal, with both borrowed and owned reservations, including owned
-  connection transfer through a worker thread. Socket fixtures bind only
-  ephemeral IPv4 loopback ports; certificates are generated locally
-  through the public crypto facade. No provider, CA or deployment server
-  is contacted. This qualifies those adapter behaviors on musl, not full
-  service admission, native allocation/stack/RSS, or mail-specific TLS 1.2
-  integration.
+  refusal cleanup, clock conversion, bounded TCP/half-close/failure, TLS 1.3
+  duplex progress and framing, backpressure, publication deadlines, closure
+  and truncation, and buffer recovery after success or constructor refusal,
+  with both borrowed and owned reservations, including owned connection
+  transfer through a worker thread. Socket fixtures bind only ephemeral IPv4
+  loopback ports; certificates are generated locally through the public
+  crypto facade. No provider, CA or deployment server is contacted. This
+  qualifies those adapter behaviors on musl, not full service admission,
+  native allocation/stack/RSS, or mail-specific TLS 1.2 integration.
 - `BUILD-INPUTS`: staged source, vendor, reconstructed Rust kit, headers and
   helper NAR hashes, native recipe identities/NARs, target and actual inner
   Cargo argument/environment records.

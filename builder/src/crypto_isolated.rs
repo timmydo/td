@@ -802,6 +802,12 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-mta-transport-smoke", "tls_policy::tests::material_reader_caps_bytes_eof_and_interrupted_work", false),
         ("td-mta-transport-smoke", "tls_policy::tests::compiled_configs_enforce_relay_trust_protocol_and_gateway_client_auth", false),
         ("td-mta-transport-smoke", "tls_policy::tests::https_profiles_narrow_shared_smtp_names_before_native_routing", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::io_tests::handoff_refuses_plaintext_tails_and_deadlines_and_returns_original_buffers", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::io_tests::authorized_connections_release_handshake_capacity_and_retain_generation_until_teardown", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::io_tests::gateway_without_client_certificate_never_exposes_mail_proof_and_recovers_permits", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::io_tests::handshake_deadline_can_only_tighten_and_failure_is_sticky", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::io_tests::changed_gateway_policy_aborts_pending_connection_and_releases_capacity", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::io_tests::established_clock_failure_clears_cached_authorization_and_aborts_socket", false),
         ("td-mta-transport-smoke", "gateway_policy::tests::canonical_gateway_policy_ignores_only_representation_and_server_material", false),
         ("td-mta-transport-smoke", "gateway_policy::tests::gateway_filters_and_material_limits_refuse_without_fallback", false),
         ("td-mta-transport-smoke", "gateway_policy::tests::gateway_tls_requires_a_client_certificate_on_the_same_valid_server", false),
@@ -862,7 +868,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
-    println!("portable runtime: thirty-four mail policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
+    println!("portable runtime: forty mail policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
     Ok(())
 }
 

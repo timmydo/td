@@ -494,9 +494,9 @@ records; the adapter also closes the socket. Close/abort are idempotent.
 3. Implement the opaque socket-free session and progress/error/close semantics.
    Exercise fragmented records, short buffers, blocked writes, malicious
    handshake lengths, no premature evidence and terminal failure injection.
-4. Integrate td-mta's TlsFactory/TlsTransport with leases, deadlines and explicit
-   STARTTLS flush/tail refusal/reset; test implicit client TLS and gateway
-   pin/IP admission through the public facade only.
+4. Integrate td-mta's staged TLS factory/TlsTransport with leases, deadlines and
+   explicit STARTTLS flush/tail refusal/reset; test implicit client TLS and
+   gateway pin/IP admission through the public facade only.
 5. Measure Rust/native allocations, stack and whole-process RSS for complete
    generations, all admitted sessions and worker warm-up/reseeds. Qualify
    normal and refused peers on the isolated musl artifact, then enable service.

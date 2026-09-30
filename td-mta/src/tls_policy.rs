@@ -15,6 +15,10 @@ use td_crypto::{
 
 const MAX_POLICIES: usize = listener::MAX_LISTENERS + 2;
 
+#[path = "tls_policy_io.rs"]
+mod io;
+pub use io::TlsConnection;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaterialKind {
     Chain,

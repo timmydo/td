@@ -43,9 +43,10 @@ authorization must also match configured gateway policy. A certificate alone
 never enables arbitrary SMTP relay. Endpoint creation/configuration is a
 cold runtime concern, not caller-supplied network input to these traits.
 
-TlsFactory::upgrade consumes a plain transport under a cold-registered policy
-generation/index, leases an existing handshake slot, and returns a handshaking
-transport. It is used immediately for implicit TLS and after the exact
+The concrete TLS factory uses three stages: reserve_session retains policy,
+handshake capacity and wire buffers; construct creates native state on a TLS
+worker; SessionReservation::handoff consumes TCP and returns TlsConnection.
+It is used immediately for implicit TLS and after the exact
 STARTTLS exchange for SMTP. Before replying 220, reserve the upgrade capacity;
 flush that reply completely before the handoff. Reject/abort if any plaintext
 bytes remain after the STARTTLS command or outbound 220 response. Never carry
@@ -82,21 +83,22 @@ are implemented; service/resource qualification remains M07 work. Shared backend
 fixtures live in td-crypto; service integration tests reach it through the same
 public facade as production.
 
-Mail transport adapters implement TlsFactory/TlsTransport above using td-crypto's
-opaque configuration/session interfaces. td-mta owns policy-generation/slot
-leases, sockets, deadlines and STARTTLS handoff/reset. td-crypto performs TLS
-handshakes and generic certificate validation; the mail adapter additionally
-checks gateway allowlist policy before constructing Gateway proof. A raw peer
-certificate or digest is not proof of that authorization. HTTPS/ACME and the
-smart-host client use this same boundary. Map shared TLS progress into the
-existing transport progress, including Pending for empty caller slices. The
-adapter assembles one bounded wire record, retains short socket-write tails,
-reports whether such a tail remains to each shared record-intake call,
-and distinguishes read EOF from write closure. It maps terminal facade errors
-to the mail Tls error, while its own lease/deadline failures keep their existing
-mail error. Any failed handshake or session aborts its socket. Shared TLS clock
-seconds come from checked conversion of the injected mail UTC milliseconds;
-negative time or Clock failure is unavailable time, never a system fallback.
+Mail transport adapters implement the staged factory and TlsTransport using
+td-crypto's opaque configuration/session interfaces. td-mta owns
+policy-generation/slot leases, sockets, deadlines and STARTTLS
+handoff/reset. td-crypto performs TLS handshakes and generic certificate
+validation; the mail adapter additionally checks gateway allowlist policy
+before constructing Gateway proof. A raw peer certificate or digest is not
+proof of that authorization. HTTPS/ACME and the smart-host client use this
+same boundary. Map shared TLS progress into the existing transport progress,
+including Pending for empty caller slices. The adapter assembles one bounded
+wire record, retains short socket-write tails, reports whether such a tail
+remains to each shared record-intake call, and distinguishes read EOF from
+write closure. It maps terminal facade errors to the mail Tls error, while
+its own lease/deadline failures keep their existing mail error. Any failed
+handshake or session aborts its socket. Shared TLS clock seconds come from
+checked conversion of the injected mail UTC milliseconds; negative time or
+Clock failure is unavailable time, never a system fallback.
 
 Shared configurations/keys and their backend allocations count in the existing
 RESOURCES.md generations and leases, including cold overlap. Moving their code
@@ -208,8 +210,9 @@ Only an explicit successful `handshake()` permits application bytes. It
 requires verified Finished, drained native/output buffers and a completed
 underlying flush. `evidence()` returns cached raw cryptographic evidence,
 not a fresh policy authorization. This foundation implements Transport, not
-TlsTransport: generation/slot leases, STARTTLS handoff and gateway pin/address
-authorization remain M07d3. No service entry point uses it yet.
+TlsTransport: the retained mail wrapper in §1.8 adds generation/count leases,
+socket handoff and gateway checks. Complete runtime slots and protocol reset
+remain M07d3/M07e. No service entry point uses it yet.
 
 Flush drives record output through the underlying transport and does not
 prove peer receipt or handshake completion. Close queues close_notify, drains
@@ -282,9 +285,9 @@ mapped-peer CIDR rules. Neither construction, matching nor session creation
 grants mail authority. The admitting transport must obtain verified client
 leaf evidence from its completed TLS session, pair it with the actual socket
 peer, and recheck the current authorized policy before mutation. Generic
-retained ownership is described in §1.6; material-specific generation binding,
-revocation, resource coupling and the TlsFactory/TlsTransport implementations
-remain M07d3b2b/M07d3c.
+retained ownership is described in §1.6; policy compilation and retained
+transport ownership are in §1.7–1.8. Current-generation mutation fencing and
+protocol integration remain M07d3c/M11/M13.
 
 `GatewayFingerprint` identifies the canonical client policy for later reload
 comparison. It is SHA-256 of the following concatenation; lengths/counts are
@@ -380,9 +383,10 @@ cases cover two-generation saturation before construction, stale/foreign
 publication without losing owners, returned construction failure, ID exhaustion,
 worker construction/retention/drop order and racing construction/release. A
 boxed 1 MiB fixture is constructed on a thread with 256 KiB requested stack;
-this is not complete control-worker or TLS stack qualification. Material-specific
-TLS tables, slot/session ownership and current-policy revocation remain
-M07d3b2b/M07d3c; this helper enables no service endpoint.
+this is not complete control-worker or TLS stack qualification. Sections
+1.7–1.8 add TLS tables and retained session/count ownership. Complete runtime
+slots, protocol transitions and current-policy mutation fencing remain pending;
+this helper enables no service endpoint.
 
 ### 1.7 Compiled TLS policy generations and queued session preparation
 
@@ -463,10 +467,63 @@ Refusal returns a fixed error and both arrays, releasing permit and generation.
 
 The runtime separately owns the complete session slot, native byte allowance,
 queue/completion credit and bounded generation lifetime. Construction is not
-whole-resource qualification. Socket handoff, permit release after a completed
-handshake, current-policy fencing, STARTTLS transitions and mail TlsTransport
-remain the next M07d3 increments. No listener or service entry point uses these
-owners yet; M07e still gates native allocation/stack/RSS and aggregate admission.
+whole-resource qualification. Socket handoff and completed-handshake permit
+release are described below; current-policy mutation fencing and STARTTLS
+protocol transitions remain later increments. No listener or service entry
+point uses these owners yet; M07e still gates native allocation/stack/RSS and
+aggregate admission.
+
+### 1.8 Retained TCP/TLS connection
+
+SessionReservation::handoff consumes an exclusively owned TcpTransport, the
+injected runtime Clock and fixed whole-connection/handshake deadlines. It
+captures the actual socket peer; no caller-supplied IP can replace it. Use the
+same clock source/origin as policy preparation. Reject nonempty plaintext tails
+before TLS progress, abort both handles on refusal, and return the two original
+wire arrays. Constructor deadline/clock refusal has the same recovery path.
+The runtime must reserve before SMTP 220, flush that reply completely before
+handoff and bound the queued job lifetime. The adapter cannot prove protocol
+framing or flush from an empty slice; those transitions remain M07d3c.
+
+TlsConnection implements TlsTransport and Transport, with private native state,
+a retained generation, handshake permit and two preallocated wire reservations.
+It neither allocates another wire buffer nor exposes a socket/native handle.
+Native teardown occurs before releasing the generation. Pending handshakes
+retain their permit, including progress driven by read/write/flush. Explicit
+handshake completion requires verified Finished and a drained local flight,
+then maps evidence according to the retained role: ordinary inbound is None,
+relay/ACME require VerifiedServerName, and gateway requires VerifiedClientLeaf
+plus the configured current/next leaf pin and CIDR match on this actual peer.
+Any role/evidence mismatch refuses. Gateway matching never trusts a presented
+unverified digest. Positive gateway mTLS transport fixtures remain M07d3c.
+
+Only that successful mapping publishes cached TlsInfo and releases the
+handshake permit. Before it, nonempty read/write may progress bounded TLS work
+but return Pending without touching application bytes. Empty slices return
+Pending even after failure. Every progressing I/O call uses the record pump's
+clock/health checks and fixed deadline. handshake's deadline may tighten the
+original handshake cap, never extend it; the shortened cap persists across
+calls. Established sessions retain the original whole deadline and may outlive
+the handshake deadline. Cached info is neither a fresh health sample nor
+current-generation authority. Failures clear it, abort native/socket state,
+release a pending permit and preserve the first error. Orderly close retains
+the read half and follows the pump's idempotent close semantics.
+
+Call check_gateway_policy only for gateway connections: on another role it
+returns Invalid and aborts the connection. It compares retained canonical
+policy and the complete listener binding with the caller-supplied current
+table. Removal or any semantic change, including broadening, aborts and
+clears cached authority. This method requires the trusted runtime to supply
+its actual current generation and serialize check/publication/mutation;
+passing an old retained table does not prove freshness. It is not a
+standalone mutation fence. Current-generation ownership and durable mutation
+integration remain M11/M13.
+
+into_buffers aborts and destroys the native pump before releasing its generation
+and any remaining permit, then returns both original arrays for explicit pool
+reuse. Ordinary Drop aborts through the pump, releases owners and frees owned
+arrays. Complete runtime session/byte slots, return queues and aggregate
+qualification remain required before service activation. No listener is enabled.
 
 ## 2. Read views and change history
 

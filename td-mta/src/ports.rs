@@ -145,19 +145,6 @@ pub struct TlsPolicyId {
     pub generation: u64,
     pub index: u16,
 }
-pub trait TlsFactory: Send {
-    type Plain: Transport;
-    type Secure: TlsTransport;
-    /// Consumes and closes plaintext on refusal. Unconsumed plaintext must be
-    /// empty; the caller completes STARTTLS framing before handing off.
-    fn upgrade(
-        &mut self,
-        plain: Self::Plain,
-        unconsumed_plaintext: &[u8],
-        policy: TlsPolicyId,
-        deadline: Deadline,
-    ) -> Result<Self::Secure, Error>;
-}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Resolution {
     pub count: usize,
