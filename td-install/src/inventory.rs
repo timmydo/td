@@ -698,6 +698,8 @@ mod tests {
             ("sdc", "8:32", 512, "size", "100"),
             ("sdd", "8:48", 1024, "ro", "0"),
             ("loop0", "7:0", 512, "ro", "0"),
+            // The live profile's volatile volume device.
+            ("ram0", "1:0", 512, "ro", "0"),
             ("nvme0c1n1", "259:1", 512, "ro", "0"),
             ("sr0", "11:0", 512, "ro", "0"),
         ] {

@@ -78,14 +78,16 @@
 //!   which archive it came from, and td's SELECTOR initramfs — the one this
 //!   appendix rides, and the one firmware loads — is an INITRD
 //!   (`CONFIG_INITRAMFS_SOURCE=""`, qemu `-initrd`) rather than the built-in
-//!   one: it takes `:726-733`, not the `panic_show_mem` at `:714-716`. With
-//!   `CONFIG_BLK_DEV_RAM` off — allnoconfig leaves it off and the recipe's
-//!   delta list does not turn it on — that arm is a lone `printk(KERN_EMERG
-//!   "Initramfs unpacking failed: %s\n")` and THE BOOT CONTINUES, base archive
-//!   extracted, key absent. So `alignment_padding` is not belt-and-braces over
-//!   a kernel check that would catch a mistake here; it is the only thing
-//!   between a misaligned appendix and a machine that boots without its trust
-//!   root.
+//!   one: it takes `:726-733`, not the `panic_show_mem` at `:714-716`. The
+//!   recipe builds in `CONFIG_BLK_DEV_RAM` for the live volume, so that arm
+//!   is `populate_initrd_image`: a `KERN_INFO` "looks like an initrd" line and
+//!   a copy of the whole initrd written to rootfs as `/initrd.image`. The base
+//!   archive's `/init` exists, so `prepare_namespace` never runs and THE BOOT
+//!   CONTINUES, base archive extracted, key absent. (With `BLK_DEV_RAM` off
+//!   the arm is a `KERN_EMERG` printk with the same outcome.) So
+//!   `alignment_padding` is not belt-and-braces over a kernel check that would
+//!   catch a mistake here; it is the only thing between a misaligned appendix
+//!   and a machine that boots without its trust root.
 //! - A later regular file REPLACES an earlier one: `clean_path` then
 //!   `filp_open(..., O_TRUNC)` (`:378-395`). `O_TRUNC` is applied whenever
 //!   `maybe_link` did not report an existing link, and `maybe_link` engages only

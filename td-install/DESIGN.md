@@ -1121,16 +1121,20 @@ driver loop is `while (!message && len)`. And td's selector initramfs — the
 one this appendix rides — is an
 **initrd** (`CONFIG_INITRAMFS_SOURCE=""`, qemu `-initrd`), so it takes
 `:726-733` rather than the `panic_show_mem` the built-in archive gets at
-`:714-716`; with `CONFIG_BLK_DEV_RAM` off — allnoconfig leaves it off and the
-recipe's delta list does not add it — that arm is one
-`printk(KERN_EMERG "Initramfs unpacking failed: %s\n")` and **the boot
-continues**, base archive extracted and the key absent. That is precisely the
-"a missing key becomes a runtime branch" hazard named three paragraphs above
-— whose tempting branch is the fail-open D2 forbids — arriving through the
-very mechanism meant to avoid it. So the harness's own padding is the entire
-defence, and item 6's fail-closed flip is what turned a keyless boot from a
-silent one into a refusal: `run_boot` reads the trust root before it touches
-the volume, so the missing key is what gets named.
+`:714-716`. The recipe builds in `CONFIG_BLK_DEV_RAM` for the live volume
+(MEDIA.md), so that arm is `populate_initrd_image`: a `KERN_INFO` "rootfs
+image is not initramfs ... looks like an initrd" line and a copy of the whole
+initrd written into rootfs as `/initrd.image`. The base archive's `/init`
+still exists, so `prepare_namespace` and its legacy initrd loader never run
+(`init/main.c:1715-1722`) and **the boot continues**, base archive
+extracted and the key absent. Without `CONFIG_BLK_DEV_RAM` the same arm is a
+`KERN_EMERG` "Initramfs unpacking failed" line, with the same outcome. That
+is precisely the "a missing key becomes a runtime branch" hazard named three
+paragraphs above — whose tempting branch is the fail-open D2 forbids —
+arriving through the very mechanism meant to avoid it. So the harness's own
+padding is the entire defence, and item 6's fail-closed flip is what turned a
+keyless boot from a silent one into a refusal: `run_boot` reads the trust
+root before it touches the volume, so the missing key is what gets named.
 
 One tension in the list above is worth naming rather than leaving to be
 noticed: D5 calls the ESP the least trustworthy surface on the disk —

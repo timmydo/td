@@ -3823,9 +3823,11 @@ fn provision_selector_with_uuid(
 ///
 /// The alignment is the whole of this function's correctness and is NOT
 /// backstopped by the kernel. A misaligned appendix makes `do_reset` error
-/// `broken padding`, and because td's initramfs is an initrd built with
-/// `CONFIG_BLK_DEV_RAM` off, that error is a lone `printk` and the boot
-/// CONTINUES with the key absent (`init/initramfs.c:726-733`). Nothing
+/// `broken padding`, and because td's initramfs is an initrd whose base
+/// archive carries `/init`, that error only logs (`KERN_INFO`, with a copy of
+/// the initrd left in rootfs as `/initrd.image`, since `CONFIG_BLK_DEV_RAM` is
+/// on) and the boot CONTINUES with the key absent
+/// (`init/initramfs.c:726-733`, `init/main.c:1715-1722`). Nothing
 /// downstream reports it, so the padding here is the only thing between a run
 /// and a machine that boots without its trust root.
 ///

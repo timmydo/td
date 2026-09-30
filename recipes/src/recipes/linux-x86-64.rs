@@ -418,6 +418,15 @@ pub fn recipe() -> Recipe {
     //    BLK_DEV_LOOP under `menuconfig BLK_DEV` (already =y), so no new menuconfig
     //    parent is required.
     //
+    //    BLK_DEV_RAM (live media, td-install/MEDIA.md): a live boot's volatile
+    //    volume is a Btrfs filesystem on /dev/ram0, which allocates pages only as
+    //    they are written and frees them on discard. BLK_DEV_RAM_COUNT=1 creates
+    //    that one device at boot; the live selector sizes it with a
+    //    `brd.rd_size=` token, so an installed boot keeps an unused
+    //    default-size device holding no memory. Also under `menuconfig BLK_DEV`.
+    //    Enabling it changes how an initrd that fails to unpack is logged; see
+    //    td-install/DESIGN.md §6 on appended cpio archives.
+    //
     //    FIDO USB: explicit prompted parents survive allnoconfig. xHCI PCI
     //    support has no prompt and is checked only after resolution. hidraw
     //    stays root-owned; the token worker validates the FIDO report profile.
@@ -561,6 +570,8 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_RELOCATABLE[ =]/d; \
                   /^#? *CONFIG_RANDOMIZE_BASE[ =]/d; \
                   /^#? *CONFIG_BLK_DEV_LOOP[ =]/d; \
+                  /^#? *CONFIG_BLK_DEV_RAM[ =]/d; \
+                  /^#? *CONFIG_BLK_DEV_RAM_COUNT[ =]/d; \
                   /^#? *CONFIG_BTRFS_FS[ =]/d; \
                   /^#? *CONFIG_SCSI[ =]/d; \
                   /^#? *CONFIG_BLK_DEV_SD[ =]/d; \
@@ -698,6 +709,8 @@ pub fn recipe() -> Recipe {
                    'CONFIG_RELOCATABLE=y' \
                    '# CONFIG_RANDOMIZE_BASE is not set' \
                    'CONFIG_BLK_DEV_LOOP=y' \
+                   'CONFIG_BLK_DEV_RAM=y' \
+                   'CONFIG_BLK_DEV_RAM_COUNT=1' \
                    'CONFIG_BTRFS_FS=y' \
                    'CONFIG_SCSI=y' \
                    'CONFIG_BLK_DEV_SD=y' \
@@ -841,6 +854,8 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_RELOCATABLE=y' .config || { echo 'RELOCATABLE off — a non-relocatable bzImage is rejected by the x86 kexec_file_load loader (boots via -kernel, fails via kexec)' >&2; exit 1; }; \
                  grep -q '^CONFIG_BTRFS_FS=y' .config || { echo 'BTRFS_FS off — the persistent volume is one btrfs filesystem (@var plus the loop-mounted EROFS root blobs)' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_LOOP=y' .config || { echo 'BLK_DEV_LOOP off — the immutable EROFS root is a file inside btrfs, loop-mounted read-only' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BLK_DEV_RAM=y' .config || { echo 'BLK_DEV_RAM off - a live boot keeps its volatile volume on /dev/ram0' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BLK_DEV_RAM_COUNT=1$' .config || { echo 'BLK_DEV_RAM_COUNT is not 1 - the live profile uses exactly /dev/ram0' >&2; exit 1; }; \
                  grep -q '^CONFIG_SCSI=y' .config || { echo 'SCSI off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_SD=y' .config || { echo 'BLK_DEV_SD off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_SR=y' .config || { echo 'BLK_DEV_SR off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
@@ -1209,6 +1224,29 @@ mod tests {
         }
         assert!(text.contains("'# CONFIG_NVME_MULTIPATH is not set'"));
         assert!(text.contains("grep -q '^# CONFIG_NVME_MULTIPATH is not set' .config"));
+    }
+
+    #[test]
+    fn exactly_one_builtin_ram_disk_is_pinned_and_checked_after_resolution() {
+        let text = recipe()
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for pin in ["'CONFIG_BLK_DEV_RAM=y'", "'CONFIG_BLK_DEV_RAM_COUNT=1'"] {
+            assert!(text.contains(pin), "{pin} missing");
+        }
+        for stale in ["CONFIG_BLK_DEV_RAM[ =]/d", "CONFIG_BLK_DEV_RAM_COUNT[ =]/d"] {
+            assert!(text.contains(stale), "{stale} missing");
+        }
+        assert!(text.contains("grep -q '^CONFIG_BLK_DEV_RAM=y' .config"));
+        // Anchored, so a resolved count of 10 or 16 cannot satisfy it.
+        assert!(text.contains("grep -q '^CONFIG_BLK_DEV_RAM_COUNT=1$' .config"));
     }
 
     #[test]

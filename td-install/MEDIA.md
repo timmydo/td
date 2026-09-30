@@ -180,6 +180,14 @@ directory are removed on completion.
 The source-built kernel enables ISO9660, SCSI disk and CD-ROM, AHCI SATA,
 and USB mass-storage support as built-ins. The recipe checks the resolved
 configuration so media access needs no modules from the media it must read.
+It also builds in the RAM block driver with one device, `/dev/ram0`, created
+at boot for the live profile's volatile volume. The device allocates pages
+only when written and frees them on discard. The live selector is to size it
+with `brd.rd_size=` (KiB) on the command line it hands the deployment; no
+selector does so yet. An installed boot passes no size and keeps an unused
+device of the default size, which holds no memory. Destination discovery
+never offers it, because its allow-list admits only virtio, SCSI-named and
+NVMe disks.
 The native `qemu-install` diagnostic extends the firmware evidence by
 mounting the ISO read-only in Linux and installing its signed payload files.
 It exercises both attachments with the same image and then boots the
