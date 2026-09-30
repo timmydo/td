@@ -72,6 +72,12 @@ const HELP: &str = concat!(
     "  Export view does the same with the settings it keeps in\n",
     "  $XDG_CONFIG_HOME/td-photo/export (~/.config/td-photo/export when\n",
     "  that is not absolute); the verbs take theirs on the command line.\n",
+    "td-photo auto-picks ROLL\n",
+    "  Gives every pick in ROLL whose sidecar sets neither exposure nor\n",
+    "  contrast the step edit FILE auto writes, in name order, one line\n",
+    "  each: auto NAME: E C, kept NAME: exposure or contrast set, or\n",
+    "  failed NAME: why, then a count; the run fails after the rest when\n",
+    "  any failed. The window's A does the same in the background.\n",
     "td-photo thumb FILE OUT.ppm [--long-edge N] [--cache]\n",
     "  Writes the thumbnail: the smallest embedded preview that covers N\n",
     "  pixels on the long side (default 400), decoded at the coarsest\n",
@@ -169,6 +175,8 @@ fn main() -> ExitCode {
         [verb] if verb == "export" => Err("export needs FILE; see --help".to_string()),
         [verb, roll, rest @ ..] if verb == "export-picks" => export_picks(Path::new(roll), rest),
         [verb] if verb == "export-picks" => Err("export-picks needs ROLL; see --help".to_string()),
+        [verb, roll, rest @ ..] if verb == "auto-picks" => auto_picks(Path::new(roll), rest),
+        [verb] if verb == "auto-picks" => Err("auto-picks needs ROLL; see --help".to_string()),
         [verb, file, out, rest @ ..] if verb == "thumb" => {
             thumb_file(Path::new(file), Path::new(out), rest)
         }
@@ -972,6 +980,9 @@ pub(crate) struct AutoRequest {
     pub(crate) path: PathBuf,
     pub(crate) crop: Option<library::Crop>,
     pub(crate) steps: Vec<library::Step>,
+    /// One of the picks' batch, counted in the batch's note as it lands,
+    /// rather than a measure of its own.
+    pub(crate) batch: bool,
 }
 
 /// The auto measure `path` asks for, from its sidecar as the file holds
@@ -984,7 +995,65 @@ pub(crate) fn auto_request(path: &Path) -> Result<AutoRequest, String> {
         path: path.to_path_buf(),
         crop: sidecar.crop(),
         steps: sidecar.steps().to_vec(),
+        batch: false,
     })
+}
+
+/// The auto measure a pick asks for as one of the picks' batch, or `None`
+/// when its sidecar sets exposure or contrast already: a pick given either
+/// by hand, or by auto before, is kept as it is.
+pub(crate) fn auto_pick_request(path: &Path) -> Result<Option<AutoRequest>, String> {
+    original(path)?;
+    let sidecar = read_sidecar(path)?;
+    if sidecar.exposure().is_some() || sidecar.contrast().is_some() {
+        return Ok(None);
+    }
+    Ok(Some(AutoRequest {
+        path: path.to_path_buf(),
+        crop: sidecar.crop(),
+        steps: sidecar.steps().to_vec(),
+        batch: true,
+    }))
+}
+
+/// Writes `chosen` as an auto step on `request`'s file as it is now, read
+/// again, unless its history moved since the request was read, and says
+/// what came of it; the write of the verbs and of a measure whose roll the
+/// window no longer holds, where the open roll's is `Session::write_auto`.
+fn write_auto_file(request: &AutoRequest, chosen: Auto) -> Result<Landing, String> {
+    let path = &request.path;
+    let mut sidecar = read_sidecar(path)?;
+    if sidecar.steps() != request.steps.as_slice() {
+        return Ok(moved(&sidecar, chosen));
+    }
+    sidecar
+        .auto(chosen.exposure, chosen.contrast)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    write_sidecar(path, &sidecar)?;
+    Ok(Landing::Written)
+}
+
+/// What came of a measure whose photo's history moved since it was asked
+/// for, so nothing is written: its values there already (`a` twice before
+/// the first landed), or superseded by the edit made meanwhile.
+fn moved(sidecar: &Sidecar, chosen: Auto) -> Landing {
+    if (sidecar.exposure(), sidecar.contrast()) == (Some(chosen.exposure), Some(chosen.contrast)) {
+        Landing::Present
+    } else {
+        Landing::Superseded
+    }
+}
+
+/// The verbs' reading of a file's auto write: a measure superseded by an
+/// edit made while it was measured is an error.
+fn auto_written(request: &AutoRequest, landing: Landing) -> Result<(), String> {
+    if landing == Landing::Superseded {
+        return Err(format!(
+            "{}: the history changed while auto measured; nothing written",
+            request.path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Measures `request`: the photo developed at 0 EV with no contrast or
@@ -1027,39 +1096,70 @@ pub(crate) fn auto_measure(
     Ok((chosen, decoded))
 }
 
-/// The picks' export as it goes, for the status row's note: the roll it
-/// is of, how many were asked for, how many have landed (the refused
-/// counted at once) and how many of those failed. A batch of another
-/// roll is another batch: one still landing when a roll opens is counted
-/// on stderr, not into the next.
+/// The picks' export or auto as it goes, for the status row's note: the
+/// roll it is of, how many were asked for, how many have landed (the
+/// refused and, for auto, the kept counted at once) and how many of those
+/// failed or were kept. A batch of another roll is another batch: one
+/// still landing when a roll opens is counted on stderr, not into the
+/// next.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Batch {
     pub(crate) roll: PathBuf,
+    pub(crate) kind: BatchKind,
     pub(crate) total: usize,
     pub(crate) done: usize,
     pub(crate) failed: usize,
+    /// Picks auto kept as they were: edited already, or while measured.
+    pub(crate) kept: usize,
+}
+
+/// What a batch does to each pick.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum BatchKind {
+    #[default]
+    Export,
+    Auto,
 }
 
 impl Batch {
-    /// The status row's note for the batch: which pick is being written,
-    /// or once all have landed how many were exported and how many
-    /// failed.
+    /// The status row's note for the batch: which pick is being written or
+    /// measured, or once all have landed how many were exported or given
+    /// auto, how many were kept and how many failed.
     pub(crate) fn note(&self) -> String {
+        let (going, gone) = match self.kind {
+            BatchKind::Export => ("exporting pick", "exported"),
+            BatchKind::Auto => ("measuring pick", "auto on"),
+        };
         if self.done < self.total {
-            return format!("exporting pick {} of {}", self.done + 1, self.total);
+            return format!("{going} {} of {}", self.done + 1, self.total);
         }
         let mut note = format!(
-            "exported {} of {} picks",
-            self.total - self.failed.min(self.total),
+            "{gone} {} of {} picks",
+            self.total
+                .saturating_sub(self.failed)
+                .saturating_sub(self.kept),
             self.total
         );
+        if self.kept > 0 {
+            note.push_str(&format!(", {} kept", self.kept));
+        }
         if self.failed > 0 {
             note.push_str(&format!(", {} failed", self.failed));
         }
         note
     }
 
-    /// Whether every export asked for has landed.
+    /// Counts a pick's landing: written as given auto, there already or
+    /// superseded as kept, and the rest as failed.
+    fn count(&mut self, landing: Landing) {
+        match landing {
+            Landing::Written => {}
+            Landing::Present | Landing::Superseded => self.kept += 1,
+            Landing::Refused | Landing::Failed | Landing::Dropped => self.failed += 1,
+        }
+    }
+
+    /// Whether every pick asked for has landed.
     pub(crate) fn finished(&self) -> bool {
         self.done >= self.total
     }
@@ -1403,6 +1503,56 @@ fn export_picks(roll: &Path, rest: &[OsString]) -> Result<(), String> {
         picks.len()
     )
     .map_err(|e| e.to_string())?;
+    if failed > 0 {
+        return Err(format!("{failed} of {} picks failed", picks.len()));
+    }
+    Ok(())
+}
+
+/// `td-photo auto-picks ROLL`: every pick that sets neither exposure nor
+/// contrast given auto as `edit FILE auto` gives it, in order, each
+/// reported on its own line, and the run failing after the rest when any
+/// did.
+fn auto_picks(roll: &Path, rest: &[OsString]) -> Result<(), String> {
+    check_flags(rest, &[], &[])?;
+    let picks = read_picks(roll)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let (mut failed, mut kept) = (0usize, 0usize);
+    for name in &picks {
+        let measured = auto_pick_request(&roll.join(name)).and_then(|request| match request {
+            None => Ok(None),
+            Some(request) => {
+                let (chosen, _) = auto_measure(&request, None, threads())?;
+                let landing = write_auto_file(&request, chosen)?;
+                auto_written(&request, landing).map(|()| Some(chosen))
+            }
+        });
+        let line = match measured {
+            Ok(Some(chosen)) => format!(
+                "auto {name}: {}",
+                library::auto_text(chosen.exposure, chosen.contrast)
+            ),
+            Ok(None) => {
+                kept += 1;
+                format!("kept {name}: exposure or contrast set")
+            }
+            Err(why) => {
+                failed += 1;
+                format!("failed {name}: {why}")
+            }
+        };
+        writeln!(out, "{line}").map_err(|e| e.to_string())?;
+    }
+    let batch = Batch {
+        roll: roll.to_path_buf(),
+        kind: BatchKind::Auto,
+        total: picks.len(),
+        done: picks.len(),
+        failed,
+        kept,
+    };
+    writeln!(out, "{}", batch.note()).map_err(|e| e.to_string())?;
     if failed > 0 {
         return Err(format!("{failed} of {} picks failed", picks.len()));
     }
@@ -2511,21 +2661,13 @@ fn edit(path: &Path, rest: &[OsString]) -> Result<(), String> {
             path: path.to_path_buf(),
             crop: sidecar.crop(),
             steps: sidecar.steps().to_vec(),
+            batch: false,
         };
         let (chosen, _) = auto_measure(&request, None, threads())?;
         // Read again: the measure takes a decode, and the window may have
         // written the file meanwhile.
-        let mut sidecar = read_sidecar(path)?;
-        if sidecar.steps() != request.steps.as_slice() {
-            return Err(format!(
-                "{}: the history changed while auto measured; nothing written",
-                path.display()
-            ));
-        }
-        sidecar
-            .auto(chosen.exposure, chosen.contrast)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        return write_sidecar(path, &sidecar);
+        let landing = write_auto_file(&request, chosen)?;
+        return auto_written(&request, landing);
     }
     let mut words = words.as_slice();
     while let Some((name, tail)) = words.split_first() {
@@ -2898,11 +3040,33 @@ struct Session {
     /// measures and writes on the request; the window sets `Some`, its
     /// pool measures, and it writes the step as the measure lands.
     autos: Option<Vec<AutoRequest>>,
+    /// The picks' auto the window has queued and not seen land whole, by
+    /// roll, as `batch` is the picks' export: another roll's measures go on
+    /// landing on its files, counted into its own batch.
+    auto_batches: BTreeMap<PathBuf, Batch>,
+    /// The picks' measures the window has queued and not seen land, so a
+    /// second `auto-picks` while they are out neither queues nor counts
+    /// them again.
+    pending: BTreeSet<PathBuf>,
     /// The picks' export the window has queued and not seen land whole,
     /// for the status row's note; the replay runs a batch within the turn
     /// and keeps none. Of one roll: a roll opening leaves it to finish on
     /// stderr, and the next batch is that roll's own.
     batch: Option<Batch>,
+}
+
+/// What came of a measure's step: written; there already (the same
+/// values written since it was asked for); superseded by an edit made
+/// while it was measured; refused by the file; the measure failed; or
+/// dropped, the photo not in its roll as the window opened it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Landing {
+    Written,
+    Present,
+    Superseded,
+    Refused,
+    Failed,
+    Dropped,
 }
 
 /// One photo as the model takes it, from a sidecar as found.
@@ -2958,6 +3122,8 @@ impl Session {
             quit: false,
             exports: None,
             autos: None,
+            auto_batches: BTreeMap::new(),
+            pending: BTreeSet::new(),
             batch: None,
         }
     }
@@ -3034,6 +3200,7 @@ impl Session {
                     delta,
                 } => outcome = self.edit(index, name, |sidecar| sidecar.nudge(key, delta))?,
                 Effect::Auto { index, name } => outcome = self.auto(index, name)?,
+                Effect::AutoPicks => outcome = self.auto_picks()?,
                 Effect::Reset { index, name } => {
                     outcome = self.edit(index, name, |sidecar| {
                         sidecar.reset();
@@ -3130,54 +3297,188 @@ impl Session {
                 return Err(ui::Error::Refused);
             }
         };
-        match self.autos.as_mut() {
-            Some(queue) => {
-                queue.push(request);
-                Ok(Outcome::Changed)
+        if let Some(queue) = self.autos.as_mut() {
+            queue.push(request);
+            return Ok(Outcome::Changed);
+        }
+        match auto_measure(&request, None, threads()) {
+            Ok((chosen, _)) => match self.write_auto(index, name.clone(), &request, chosen)? {
+                (outcome, Landing::Superseded) => {
+                    self.ui
+                        .set_export(Some(format!("auto of {name} superseded")));
+                    Ok(outcome)
+                }
+                (outcome, _) => Ok(outcome),
+            },
+            Err(why) => {
+                note(&why);
+                Err(ui::Error::Refused)
             }
-            None => match auto_measure(&request, None, threads()) {
-                Ok((chosen, _)) => self.write_auto(index, name, &request, chosen),
+        }
+    }
+
+    /// Gives every pick of the roll, as the files flag them now, that sets
+    /// neither exposure nor contrast its auto step, as `export_picks`
+    /// exports them: the replay measures and writes them in turn within
+    /// the request, `changed` with the batch's note set, `refused` when any
+    /// failed (each reason on stderr); the window queues them to its pool
+    /// behind any measure already asked for, `changed` as they are queued,
+    /// the note counting them as they land (a pick kept, or whose sidecar
+    /// the reader refuses, counted at once). `ignored` when the files hold
+    /// no pick.
+    fn auto_picks(&mut self) -> Result<Outcome, ui::Error> {
+        let roll = self.ui.roll().ok_or(ui::Error::NoRoll)?;
+        let roll = PathBuf::from(OsStr::from_bytes(roll));
+        let picks = match read_picks(&roll) {
+            Ok(picks) => picks,
+            Err(why) => {
+                note(&why);
+                return Err(ui::Error::Refused);
+            }
+        };
+        if picks.is_empty() {
+            return Ok(Outcome::Ignored);
+        }
+        let deferred = self.autos.is_some();
+        // A pick whose measure is out already is counted in the batch it
+        // was queued with.
+        let requests: Vec<(String, Result<Option<AutoRequest>, String>)> = picks
+            .into_iter()
+            .filter(|name| !(deferred && self.pending.contains(&roll.join(name))))
+            .map(|name| {
+                let request = auto_pick_request(&roll.join(&name));
+                (name, request)
+            })
+            .collect();
+        // Behind the roll's own batch still landing, the counts adding up.
+        let mut batch = self
+            .auto_batches
+            .remove(&roll)
+            .filter(|_| deferred)
+            .unwrap_or_else(|| Batch {
+                roll: roll.clone(),
+                kind: BatchKind::Auto,
+                ..Batch::default()
+            });
+        batch.total += requests.len();
+        for (name, request) in requests {
+            let request = match request {
+                Ok(Some(request)) => request,
+                Ok(None) => {
+                    batch.done += 1;
+                    batch.kept += 1;
+                    continue;
+                }
                 Err(why) => {
                     note(&why);
-                    Err(ui::Error::Refused)
+                    batch.done += 1;
+                    batch.failed += 1;
+                    continue;
                 }
-            },
+            };
+            if let Some(queue) = self.autos.as_mut() {
+                self.pending.insert(request.path.clone());
+                queue.push(request);
+                continue;
+            }
+            batch.done += 1;
+            let landing = self.measure_and_write(&name, &request);
+            batch.count(landing);
         }
+        self.ui.set_export(Some(batch.note()));
+        if deferred {
+            if !batch.finished() {
+                self.auto_batches.insert(roll, batch);
+            }
+            return Ok(Outcome::Changed);
+        }
+        if batch.failed > 0 {
+            return Err(ui::Error::Refused);
+        }
+        Ok(Outcome::Changed)
+    }
+
+    /// Measures `request` on the request and writes its step on the photo
+    /// named `name`: the replay's path for one of the picks' batch.
+    fn measure_and_write(&mut self, name: &str, request: &AutoRequest) -> Landing {
+        match auto_measure(request, None, threads()) {
+            Ok((chosen, _)) => self.land(name, request, Ok(chosen)),
+            Err(why) => {
+                note(&why);
+                Landing::Failed
+            }
+        }
+    }
+
+    /// Writes a measure's step on the photo named `name` in the open roll,
+    /// found by name since the model's indices may have moved since it was
+    /// asked for, and says what came of it.
+    fn land(&mut self, name: &str, request: &AutoRequest, result: Result<Auto, String>) -> Landing {
+        let chosen = match result {
+            Ok(chosen) => chosen,
+            Err(_) => return Landing::Failed,
+        };
+        let Some(index) = self.ui.photos().iter().position(|photo| photo.name == name) else {
+            note(&format!(
+                "{}: not in the roll as it is open; auto not written",
+                request.path.display()
+            ));
+            return Landing::Dropped;
+        };
+        // A write the file refuses is noted on stderr and settles the
+        // model from the file, as any edit's.
+        match self.write_auto(index, name.to_string(), request, chosen) {
+            Ok((_, landing)) => landing,
+            Err(_) => Landing::Refused,
+        }
+    }
+
+    /// Writes a measure's step on the file of a roll the window no longer
+    /// holds, as the verbs do: the model is another roll's.
+    fn land_file(request: &AutoRequest, result: Result<Auto, String>) -> Landing {
+        let chosen = match result {
+            Ok(chosen) => chosen,
+            Err(_) => return Landing::Failed,
+        };
+        write_auto_file(request, chosen).unwrap_or_else(|why| {
+            note(&why);
+            Landing::Refused
+        })
     }
 
     /// Writes `chosen` as an auto step on the file as it is now, unless its
     /// history moved since `request` was read (an edit made meanwhile,
-    /// which the step would shadow): then nothing is written, the status
-    /// row's note says the measure was superseded, and the file settles
-    /// the model, as any edit's.
+    /// which the step would shadow): then nothing is written and the file
+    /// settles the model, as any edit's. The outcome, and whether the step
+    /// was written, superseded, or is there already (`a` twice before the
+    /// first landed: the same values, which no note should call
+    /// superseded).
     fn write_auto(
         &mut self,
         index: usize,
         name: String,
         request: &AutoRequest,
         chosen: Auto,
-    ) -> Result<Outcome, ui::Error> {
-        let mut superseded = false;
-        let outcome = self.edit(index, name.clone(), |sidecar| {
+    ) -> Result<(Outcome, Landing), ui::Error> {
+        let mut landing = Landing::Written;
+        let outcome = self.edit(index, name, |sidecar| {
             if sidecar.steps() != request.steps.as_slice() {
-                superseded = true;
+                landing = moved(sidecar, chosen);
                 return Ok(());
             }
             sidecar.auto(chosen.exposure, chosen.contrast)
-        });
-        if superseded {
-            self.ui
-                .set_export(Some(format!("auto of {name} superseded")));
-        }
-        outcome
+        })?;
+        Ok((outcome, landing))
     }
 
     /// A measure the window's pool made for `request` landed: the step is
-    /// written on the file as it is now when the photo is still in the
-    /// open roll, by its name, since the model's indices may have moved
-    /// since it was asked for; one of another roll, or of a photo moved
-    /// out, is dropped. A failed measure, or a step the file refuses (a
-    /// full history, say), is the status row's note, its reason on stderr.
+    /// written on the file as it is now, through the model when its roll
+    /// is the open one (`land`) and through the file alone when it is not
+    /// (`land_file`). One of the picks' batch is counted into its roll's
+    /// batch, whose note is the status row's while that roll is held and
+    /// stderr's once another is; one of its own is the row's note when it
+    /// failed, was refused (a full history, say) or was superseded, its
+    /// reason on stderr, and silent when its roll is not held.
     fn auto_landed(&mut self, request: &AutoRequest, result: Result<Auto, String>) {
         let (Some(roll), Some(name)) = (
             request.path.parent(),
@@ -3189,27 +3490,39 @@ impl Session {
             .ui
             .roll()
             .is_some_and(|open| Path::new(OsStr::from_bytes(open)) == roll);
+        let landing = if held {
+            self.land(name, request, result)
+        } else {
+            Self::land_file(request, result)
+        };
+        if request.batch {
+            self.pending.remove(&request.path);
+            let Some(batch) = self.auto_batches.get_mut(roll) else {
+                return;
+            };
+            batch.done += 1;
+            batch.count(landing);
+            let text = batch.note();
+            if batch.finished() {
+                self.auto_batches.remove(roll);
+            }
+            if held {
+                self.ui.set_export(Some(text));
+            } else {
+                note(&text);
+            }
+            return;
+        }
         if !held {
             return;
         }
-        let chosen = match result {
-            Ok(chosen) => chosen,
-            Err(_) => {
-                self.ui.set_export(Some(format!("auto of {name} failed")));
-                return;
-            }
+        let word = match landing {
+            Landing::Written | Landing::Present | Landing::Dropped => return,
+            Landing::Superseded => "superseded",
+            Landing::Refused => "refused",
+            Landing::Failed => "failed",
         };
-        let Some(index) = self.ui.photos().iter().position(|photo| photo.name == name) else {
-            return;
-        };
-        // A write the file refuses is noted on stderr and settles the
-        // model from the file, as any edit's.
-        if self
-            .write_auto(index, name.to_string(), request, chosen)
-            .is_err()
-        {
-            self.ui.set_export(Some(format!("auto of {name} refused")));
-        }
+        self.ui.set_export(Some(format!("auto of {name} {word}")));
     }
 
     /// Exports `name` through its sidecar as the file holds it now: the
@@ -3567,6 +3880,92 @@ mod tests {
         let none = Batch::default();
         assert!(none.finished());
         assert_eq!(none.note(), "exported 0 of 0 picks");
+        let mut auto = Batch {
+            kind: BatchKind::Auto,
+            total: 4,
+            done: 1,
+            kept: 1,
+            ..Batch::default()
+        };
+        assert_eq!(auto.note(), "measuring pick 2 of 4");
+        auto.done = 4;
+        auto.failed = 1;
+        assert_eq!(auto.note(), "auto on 2 of 4 picks, 1 kept, 1 failed");
+    }
+
+    /// The window's picks' auto: the picks that set neither key queued,
+    /// the others kept and counted at once, each landing counted into the
+    /// batch's note, and the batch let go once all have landed.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn the_picks_auto_counts_as_the_measures_land() {
+        let roll = std::env::temp_dir().join(format!("td-photo-picks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&roll);
+        fs::create_dir_all(&roll).unwrap();
+        for name in ["DSC_0001.NEF", "DSC_0002.NEF", "DSC_0003.NEF"] {
+            fs::write(roll.join(name), name).unwrap();
+        }
+        let pick = "td-photo edit 1\nflag pick\n";
+        fs::write(roll.join("DSC_0001.NEF.edit"), pick).unwrap();
+        fs::write(
+            roll.join("DSC_0002.NEF.edit"),
+            "td-photo edit 1\nflag pick\nexposure 0.33\n",
+        )
+        .unwrap();
+        let mut session = Session::new(Surface::new(800, 600, Scale::default()).unwrap());
+        session.autos = Some(Vec::new());
+        session.open(roll.as_os_str().as_bytes()).unwrap();
+        assert_eq!(session.auto_picks(), Ok(Outcome::Changed));
+        let queued = session.autos.replace(Vec::new()).unwrap();
+        assert_eq!(queued.len(), 1);
+        let request = &queued[0];
+        assert!(request.batch);
+        assert!(request.path.ends_with("DSC_0001.NEF"));
+        assert_eq!(session.ui.export_note(), Some("measuring pick 2 of 2"));
+        // Asked for again while its measure is out: not queued or counted
+        // again; the kept pick is counted again, as each run counts it.
+        assert_eq!(session.auto_picks(), Ok(Outcome::Changed));
+        assert!(session.autos.as_ref().unwrap().is_empty());
+        assert_eq!(session.ui.export_note(), Some("measuring pick 3 of 3"));
+        let chosen = Auto {
+            exposure: 112,
+            contrast: 60,
+        };
+        session.auto_landed(request, Ok(chosen));
+        assert_eq!(
+            session.ui.export_note(),
+            Some("auto on 1 of 3 picks, 2 kept")
+        );
+        assert!(session.auto_batches.is_empty());
+        assert!(fs::read_to_string(roll.join("DSC_0001.NEF.edit"))
+            .unwrap()
+            .ends_with("step-1 on auto 1.12 0.60\n"));
+        // Again: both are kept now, the batch finished as it is asked for.
+        assert_eq!(session.auto_picks(), Ok(Outcome::Changed));
+        assert!(session.autos.as_ref().unwrap().is_empty());
+        assert_eq!(
+            session.ui.export_note(),
+            Some("auto on 0 of 2 picks, 2 kept")
+        );
+        // A failed measure is counted failed.
+        fs::write(roll.join("DSC_0001.NEF.edit"), pick).unwrap();
+        assert_eq!(session.auto_picks(), Ok(Outcome::Changed));
+        let queued = session.autos.replace(Vec::new()).unwrap();
+        session.auto_landed(&queued[0], Err("why".to_string()));
+        assert_eq!(
+            session.ui.export_note(),
+            Some("auto on 0 of 2 picks, 1 kept, 1 failed")
+        );
+        // A roll with no pick asks for nothing.
+        for name in ["DSC_0001.NEF", "DSC_0002.NEF"] {
+            fs::write(roll.join(library::sidecar_name(name)), "td-photo edit 1\n").unwrap();
+        }
+        session.open(roll.as_os_str().as_bytes()).unwrap();
+        session.ui.set_export(None);
+        assert_eq!(session.auto_picks(), Ok(Outcome::Ignored));
+        assert!(session.autos.as_ref().unwrap().is_empty());
+        assert_eq!(session.ui.export_note(), None);
+        let _ = fs::remove_dir_all(&roll);
     }
 
     /// A measure that lands writes its step on the photo by name; one that
@@ -3618,8 +4017,26 @@ mod tests {
             session.ui.export_note(),
             Some("auto of DSC_0001.NEF failed")
         );
-        // Asked for before the step above was written: the history moved,
-        // so the measure is superseded and nothing is written.
+        // Asked for before the step above was written, with its values:
+        // the step is there, nothing is written and nothing noted.
+        session.ui.set_export(None);
+        session.auto_landed(&first, Ok(chosen));
+        assert_eq!(
+            fs::read_to_string(roll.join("DSC_0001.NEF.edit")).unwrap(),
+            written
+        );
+        assert_eq!(session.ui.export_note(), None);
+        // With one of the values there and not the other: superseded.
+        for (exposure, contrast) in [(112, 70), (50, 60)] {
+            session.auto_landed(&first, Ok(Auto { exposure, contrast }));
+            assert_eq!(
+                session.ui.export_note(),
+                Some("auto of DSC_0001.NEF superseded")
+            );
+            session.ui.set_export(None);
+        }
+        // With others: the history moved, so the measure is superseded and
+        // nothing is written.
         let later = Auto {
             exposure: 50,
             contrast: 40,
@@ -3633,23 +4050,128 @@ mod tests {
             session.ui.export_note(),
             Some("auto of DSC_0001.NEF superseded")
         );
-        // Another roll's photo of the same name is another photo.
-        let other = AutoRequest {
-            path: std::env::temp_dir().join("td-photo-elsewhere/DSC_0001.NEF"),
-            crop: None,
-            steps: first.steps.clone(),
-        };
-        session.auto_landed(&other, Ok(later));
+        // Another roll's photo of the same name is another photo: its step
+        // is written on its own file, and the row's note is the open roll's.
+        let elsewhere = roll.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("DSC_0001.NEF"), "DSC_0001.NEF").unwrap();
+        let other = auto_request(&elsewhere.join("DSC_0001.NEF")).unwrap();
         session.auto_landed(&other, Err("why".to_string()));
+        session.auto_landed(&other, Ok(later));
         assert_eq!(
             fs::read_to_string(roll.join("DSC_0001.NEF.edit")).unwrap(),
             written
         );
+        assert!(fs::read_to_string(elsewhere.join("DSC_0001.NEF.edit"))
+            .unwrap()
+            .ends_with("step-1 on auto 0.50 0.40\n"));
         assert_eq!(
             session.ui.export_note(),
             Some("auto of DSC_0001.NEF superseded")
         );
         let _ = fs::remove_dir_all(&roll);
+    }
+
+    /// Each roll's picks' batch counts its own landings: superseded by an
+    /// edit as kept, a pick not in the roll as opened as failed, a full
+    /// history as failed. A roll opened meanwhile leaves the batch landing
+    /// on its files, counted on, and a batch asked for there is its own.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn each_rolls_batch_counts_its_own_landings() {
+        let base = std::env::temp_dir().join(format!("td-photo-batches-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (first, second) = (base.join("first"), base.join("second"));
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let pick = "td-photo edit 1\nflag pick\n";
+        for name in ["DSC_0001.NEF", "DSC_0002.NEF", "DSC_0003.NEF"] {
+            fs::write(first.join(name), name).unwrap();
+            fs::write(first.join(library::sidecar_name(name)), pick).unwrap();
+        }
+        // A pick with a full history: its step is refused.
+        let mut full = String::from(pick);
+        for n in 1..=library::MAX_STEPS {
+            full.push_str(&format!("step-{n} on look mono\n"));
+        }
+        fs::write(second.join("DSC_0001.NEF"), "DSC_0001.NEF").unwrap();
+        fs::write(second.join("DSC_0001.NEF.edit"), &full).unwrap();
+        let mut session = Session::new(Surface::new(800, 600, Scale::default()).unwrap());
+        session.autos = Some(Vec::new());
+        session.open(first.as_os_str().as_bytes()).unwrap();
+        // A pick the roll did not hold as it opened.
+        fs::write(first.join("DSC_0004.NEF"), "DSC_0004.NEF").unwrap();
+        fs::write(first.join("DSC_0004.NEF.edit"), pick).unwrap();
+        assert_eq!(session.auto_picks(), Ok(Outcome::Changed));
+        let queued = session.autos.replace(Vec::new()).unwrap();
+        assert_eq!(queued.len(), 4);
+        let chosen = Auto {
+            exposure: 112,
+            contrast: 60,
+        };
+        let moved = "td-photo edit 1\nflag pick\nexposure 0.50\nstep-1 on exposure 0.50\n";
+        // Superseded by a hand edit: kept.
+        fs::write(first.join("DSC_0001.NEF.edit"), moved).unwrap();
+        session.auto_landed(&queued[0], Ok(chosen));
+        assert_eq!(
+            fs::read_to_string(first.join("DSC_0001.NEF.edit")).unwrap(),
+            moved
+        );
+        assert_eq!(session.ui.export_note(), Some("measuring pick 2 of 4"));
+        // Not in the roll as it opened: dropped, failed.
+        session.auto_landed(&queued[3], Ok(chosen));
+        assert_eq!(
+            fs::read_to_string(first.join("DSC_0004.NEF.edit")).unwrap(),
+            pick
+        );
+        assert_eq!(session.ui.export_note(), Some("measuring pick 3 of 4"));
+        // Another roll opened and its picks asked for: the first's batch
+        // goes on, the second's is its own.
+        session.open(second.as_os_str().as_bytes()).unwrap();
+        assert_eq!(session.auto_picks(), Ok(Outcome::Changed));
+        let later = session.autos.replace(Vec::new()).unwrap();
+        assert_eq!(later.len(), 1);
+        assert_eq!(session.ui.export_note(), Some("measuring pick 1 of 1"));
+        // The full history's step refused: failed, on the row, and counted
+        // into the second roll's batch alone.
+        session.auto_landed(&later[0], Ok(chosen));
+        assert_eq!(
+            fs::read_to_string(second.join("DSC_0001.NEF.edit")).unwrap(),
+            full
+        );
+        assert_eq!(
+            session.ui.export_note(),
+            Some("auto on 0 of 1 picks, 1 failed")
+        );
+        assert!(!session.auto_batches.contains_key(&second));
+        // The first roll's land on its files, the row the open roll's: the
+        // values there already (written meanwhile) kept.
+        let present =
+            "td-photo edit 1\nflag pick\nexposure 1.12\ncontrast 0.60\nstep-1 on auto 1.12 0.60\n";
+        fs::write(first.join("DSC_0002.NEF.edit"), present).unwrap();
+        session.auto_landed(&queued[1], Ok(chosen));
+        assert_eq!(
+            fs::read_to_string(first.join("DSC_0002.NEF.edit")).unwrap(),
+            present
+        );
+        assert_eq!(
+            session
+                .auto_batches
+                .get(&first)
+                .map(|b| (b.done, b.kept, b.failed)),
+            Some((3, 2, 1))
+        );
+        session.auto_landed(&queued[2], Ok(chosen));
+        assert!(fs::read_to_string(first.join("DSC_0003.NEF.edit"))
+            .unwrap()
+            .ends_with("step-1 on auto 1.12 0.60\n"));
+        assert_eq!(
+            session.ui.export_note(),
+            Some("auto on 0 of 1 picks, 1 failed")
+        );
+        assert!(session.auto_batches.is_empty());
+        assert!(session.pending.is_empty());
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// A reject whose sidecar cannot follow its original is reported as

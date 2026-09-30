@@ -39,7 +39,8 @@ and develop controller over td-ui's driven seam with its action table and scene
 (`ui`), the
 window over it with its thumbnail pool and control socket (`window`), and the
 command line `td-photo probe FILE`, `td-photo develop FILE OUT.ppm`, `td-photo
-export FILE`, `td-photo thumb FILE OUT.ppm`, `td-photo cache`, `td-photo
+export FILE`, `td-photo auto-picks ROLL`, `td-photo thumb FILE OUT.ppm`,
+`td-photo cache`, `td-photo
 looks`, `td-photo import SRC DEST`, `td-photo list ROLL`, `td-photo flag
 FILE`, `td-photo edit FILE`, `td-photo open [ROLL]` (a bare `td-photo` is
 `open`), `td-photo --replay`, `td-photo --preview` and `td-photo --help
@@ -112,7 +113,9 @@ modes are the photographer's order of work.
 3. **Develop** shows one photo developed from its raw data, entered with `d`
    on the cursor's photo and left with `Escape`. `=`/`-` move exposure by a
    third of a stop and their shifted pair `+`/`_` by a tenth, `.`/`,` move
-   contrast by a tenth, `a` chooses both from the photo's tones (Auto), `0`
+   contrast by a tenth, `a` chooses both from the photo's tones (Auto) and
+   `A` (in any mode) does so for every pick that has neither yet, in the
+   background (`td-photo auto-picks ROLL` headless), `0`
    resets to camera defaults, and the crop and the
    look are set by the `crop` and `look` actions, taking the box's four
    fractions or a look's stem, and the crop
@@ -175,7 +178,7 @@ window, all speaking the toolkit's one vocabulary.
   in `ui` (open a roll, choose one, the cursor moves, select, pick, reject,
   unflag, the four filters, the single view and back, scroll, quit, enter
   develop and its exposure nudges and absolute `exposure`, its contrast
-  nudges and absolute `contrast`, `auto`, look and the
+  nudges and absolute `contrast`, `auto` and `auto-picks`, look and the
   look shortcuts `look-1`..`look-9`, crop and `uncrop`, crop-adjust, aspect,
   the look palette (`looks`), reset, undo and the history's step toggle and
   delete, the zoom (`zoom-fit`, `zoom-100`, `zoom-in`, `zoom-out`), export,
@@ -188,8 +191,9 @@ window, all speaking the toolkit's one vocabulary.
   action to it and return the outcome and the `Effect`s the adapter carries out
   (`Open` this folder, `List` it for the chooser, `Flag` that photo, `Expose`
   by a delta, `Edit` a crop or look, `Reset` to camera defaults, `Undo` the
-  last step, `StepToggle` and `StepDelete` a step, `Export` that photo,
-  `ExportPicks` every pick, `Settings` the export settings).
+  last step, `StepToggle` and `StepDelete` a step, `Auto` that photo,
+  `AutoPicks` every pick, `Export` that photo, `ExportPicks` every pick,
+  `Settings` the export settings).
   The keyboard bindings, the pointer hit-testing, the replay stream and the
   control socket are four adapters over that one dispatcher, and nothing
   reaches the model around it. The cursor is
@@ -383,8 +387,32 @@ window, all speaking the toolkit's one vocabulary.
   within the request, a frame that cannot be decoded `refused`; the window
   hands the measure to its pool, `changed` as it is queued, and writes the
   step as the measure lands, a measure that failed or a step the file refuses
-  (a full history) the status row's note. `edit FILE auto` reads the file
-  again after measuring and fails, writing nothing, when its history moved.
+  (a full history) the status row's note; a measure of a roll no longer
+  open is written on its file alone, as the verbs write, its failure on
+  stderr alone. `edit FILE auto` reads the file again after measuring and
+  fails, writing nothing, when its history moved to other values.
+  `auto-picks` (`A`) asks, as `export-picks` does, in any mode with a roll,
+  for an `AutoPicks` effect: the adapter reads the roll's picks as their
+  sidecars flag them (`read_picks`), keeps each whose sidecar sets exposure
+  or contrast already (a hand edit, or auto's before, so a second run
+  changes nothing), and measures the rest as `auto` does, each its own
+  step, in the roll's order: the replay in turn within the request,
+  `refused` when any failed; the window on its pool behind any measure
+  asked for, `changed` as they are queued, counted as they land (`Batch`,
+  of kind auto, one a roll): `measuring pick N of M` while any is
+  outstanding, then `auto on K of M picks` with `, J kept` and `, F
+  failed` when there are. A pick kept, or whose sidecar the reader
+  refuses between the listing and its request, is counted at once; a
+  pick whose measure is still out is not queued or counted again (a
+  kept one is counted by each run that asks); a
+  measure superseded by an edit made meanwhile, or by the same values
+  (`a` pressed twice before the first lands: no supersession, the step it
+  would write is there), is counted kept; one whose photo is not in the
+  roll as the window opened it, failed. Another roll opened meanwhile
+  leaves the batch landing on its files and counted on, its note on
+  stderr, and a batch asked for there is that roll's own. The status row
+  holds one note, the picks' auto's or their export's, whichever landed
+  last; each failure's reason is on stderr.
   The slider: a
   press on it moves the knob to the pointer's step and starts a drag that
   follows the pointer's column wherever it goes, each step it crosses a
@@ -580,9 +608,10 @@ window, all speaking the toolkit's one vocabulary.
 - **A headless verb for every durable effect.** Whatever an action does to
   files is also a command-line verb: `import`, `list`, `flag`, `edit`
   (get and set of a sidecar's values), `delete-rejected`, `develop`,
-  `export`, `export-picks` (both taking `--format`, `--quality` and
-  `--long-edge` on the command line, at their defaults without; the
-  settings file is the window's), `thumb`, `looks` and `cache clear`.
+  `auto-picks`, `export`, `export-picks` (both taking `--format`,
+  `--quality` and `--long-edge` on the command line, at their defaults
+  without; the settings file is the window's), `thumb`, `looks` and `cache
+  clear`.
   Verbs are the batch face: they read the same sidecars and write them
   the same way, and an agent that does not need to see pixels never
   opens a window.
@@ -1148,7 +1177,8 @@ canvas on one core and in a few milliseconds across the pool.
 
 ### Auto
 
-`auto` (`a` in develop mode; `edit FILE auto` headless) chooses a photo's
+`auto` (`a` in develop mode; `edit FILE auto` headless; for every pick
+setting neither key, `A` and `td-photo auto-picks ROLL`) chooses a photo's
 exposure and contrast from its tones as one step of its history (Files,
 Sidecar). The measure is the photo developed at 0 EV with no contrast or look
 over the crop its sidecar holds, at `auto::EDGE` (600) pixels on the long
@@ -1798,31 +1828,31 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   the slot and wakes the workers for the next, which a measure that changed no
   file would otherwise leave waiting, no generation moving); the turn writes it
   on the file as it is then, the photo found by name in the roll still held (its
-  index may have moved, and another roll's or a moved photo's measure is
-  dropped); a closing window hands the pool no measure asked for in its last
-  turn, and a closing pool drops the measures queued and the one in flight
-  writes nothing, the files untouched. Exports are not wants either: a
-  replacement of the wants leaves them queued, they run in order one at a time
-  beside the develop (a thumbnail and the develop are taken first), and a
-  closing pool hands out the exports alone until none is left queued or in
-  flight, so a `quit` waits for the exports asked for rather than dropping them.
-  A thumbnail in the running set and the develop in its in-flight slot stay
-  outstanding until the turn loop collects the result; an export, queued or in
-  its slot, until the worker sends the result, which it does under the queue's
-  lock as it leaves the slot and wakes the workers waiting for it, so the window
-  never counts an export it holds the result of nor misses one whose result is
-  unsent, and a closing pool, with no turn loop to collect, still drains its
-  exports. The worker notes a failed export's reason on stderr, so one that
-  fails after the window closed is reported. The count never reads zero with a
-  result made and not yet sent. A finished thumbnail is kept whichever wants
-  asked for it, since it is the file's; the later jobs' results the turn loop
-  compares before applying. Thumbnails are held in memory by name for the roll
-  that is open at the surface's scale (a job is keyed by roll, name and scale,
-  so another roll's file of the same name is another thumbnail; the held set is
-  let go when either changes), `THUMB_CACHE_BYTES` between them, one that could
-  not be made charged its name and slot alone, the least recently shown that is
-  not on screen evicted first; an eviction recomputes the wants, so a thumbnail
-  let go while still wanted off screen is asked for again.
+  index may have moved, and a photo not in the roll as opened is dropped) or,
+  for a roll no longer held, on the file alone; a closing window hands the pool
+  no measure asked for in its last turn, and a closing pool drops the measures
+  queued and the one in flight writes nothing, the files untouched. Exports are
+  not wants either: a replacement of the wants leaves them queued, they run in
+  order one at a time beside the develop (a thumbnail and the develop are taken
+  first), and a closing pool hands out the exports alone until none is left
+  queued or in flight, so a `quit` waits for the exports asked for rather than
+  dropping them. A thumbnail in the running set and the develop in its in-flight
+  slot stay outstanding until the turn loop collects the result; an export,
+  queued or in its slot, until the worker sends the result, which it does under
+  the queue's lock as it leaves the slot and wakes the workers waiting for it,
+  so the window never counts an export it holds the result of nor misses one
+  whose result is unsent, and a closing pool, with no turn loop to collect,
+  still drains its exports. The worker notes a failed export's reason on stderr,
+  so one that fails after the window closed is reported. The count never reads
+  zero with a result made and not yet sent. A finished thumbnail is kept
+  whichever wants asked for it, since it is the file's; the later jobs' results
+  the turn loop compares before applying. Thumbnails are held in memory by name
+  for the roll that is open at the surface's scale (a job is keyed by roll, name
+  and scale, so another roll's file of the same name is another thumbnail; the
+  held set is let go when either changes), `THUMB_CACHE_BYTES` between them, one
+  that could not be made charged its name and slot alone, the least recently
+  shown that is not on screen evicted first; an eviction recomputes the wants,
+  so a thumbnail let go while still wanted off screen is asked for again.
 - At most one develop, and so one raw decode of its own, runs at a time (the
   codec is sequential): the pool hands a worker the develop only when none is
   in flight. Beside it, at most one prefetch: the level-0 decode of a shown
@@ -2123,7 +2153,16 @@ words; in `image` the shrink's sizes, shares, means, bands and refusals
 as above; and in `main` the batch note's counts and a landed measure
 writing its step by name, noted when it failed or the file refused the step
 (a full history), superseded with nothing written when the history moved
-since it was asked for, and dropped for another roll.
+since it was asked for (not when the step it would write is there, but
+when only one of its values is), and for another roll written on its
+own file with the row untouched; the picks' auto queued with the kept
+counted at once, counted into its batch's note as each lands, a pick
+whose measure is out not queued or counted again, a second run keeping
+all, a failed measure counted failed and a roll with no pick `ignored`;
+and each roll's batch counting its own landings, superseded and present
+kept, a pick not in the roll as opened and a full history failed, the
+second roll's landing counted into its own batch alone, and the first's
+landing on its files and counted on after the second opened.
 
 `tests/library.rs` holds the sidecar grammar to its refusals by name and to
 in-place rewriting around an unknown line, the canonical value spellings,
@@ -2257,7 +2296,13 @@ for the cursor photo's measure (ignored outside develop, one step labelled
 `auto E C`, the same values no step, one undo taking both), the replay
 writing the step `edit FILE auto` writes over the sidecar's crop (the whole
 frame choosing otherwise) and refusing a frame it cannot decode and a refused
-sidecar over a decodable one with nothing written, the crop set over the
+sidecar over a decodable one with nothing written, `auto-picks` and `A`
+asking for every pick's measure in any mode with a roll (the picks with
+neither key taking the step, the others kept), the picks' auto over the
+replay and as the verb (a pick with neither key given the step `edit FILE
+auto` writes, one with either kept, an unflagged photo untouched, an
+undecodable pick failed, the run refused after the rest, the row and the
+verb's lines counting them), the crop set over the
 develop preview (a
 marquee armed,
 rubber-banded and committed as a sub-region of the current crop, a click, a
@@ -2405,8 +2450,10 @@ written by the time `wait-idle` answers, the box changed), then
 exports over the socket: with the sidecar naming a look no file provides the
 export fails and the row says so with nothing written, and with the look cleared
 `wait-idle` waits for the pool's export, the JPEG is in `exported/` and the row
-names it, and an export asked for and quit at once is written, numbered, by the
-time the process has exited; a headless case (no compositor) holds `--preview
+names it; `auto-picks` over a pick with neither key writes the same step by the
+time `wait-idle` answers, the box as after `auto` and the row counting it; and
+an export asked for and quit at once is written, numbered, by the time the
+process has exited; a headless case (no compositor) holds `--preview
 --develop` to a develop box that carries a developed image and changes with the
 sidecar's exposure, and `--preview --single` to the single view's box the
 same way (`--zoom` refused there, and the two flags together).
@@ -2567,7 +2614,12 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    (e) The zoom: Fit and 100% on the tool band, `Z`, `f`, `]` and `[`, the
    wheel stepping 25, 50 and 100 percent from the fit, a pan over the
    zoomed box, the zoomed level 2 from level 1 through half zoom and from
-   level 0 past it, and `--preview --zoom`. Landed.
+   level 0 past it, and `--preview --zoom`. Landed. (f) The photo's contrast:
+   a develop key before the look, `.` and `,`, `contrast`. Landed. (g) Auto:
+   the rule (`auto`), one step setting exposure and contrast, `a` and `edit
+   FILE auto`, measured on the pool. Landed. The picks' auto: `A`,
+   `auto-picks`, `AutoPicks`, the batch note and `td-photo auto-picks ROLL`.
+   Landed.
 9. Later: DNG and JPEG rolls, the Nikon High
    Efficiency codec, a better full-resolution demosaic, highlight
    reconstruction, the `.dtstyle` translator, and ratings.

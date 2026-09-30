@@ -2755,6 +2755,7 @@ mod tests {
             path: PathBuf::from("/td-photo/none").join(name),
             crop: None,
             steps: Vec::new(),
+            batch: false,
         }
     }
 

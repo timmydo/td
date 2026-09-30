@@ -522,6 +522,42 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
                 };
                 continue;
             }
+            Effect::AutoPicks => {
+                // The adapter measures the picks the files flag that set
+                // neither key; here the model's copies stand in, each given
+                // `AUTO_STAND_IN`.
+                let picks: Vec<usize> = c
+                    .photos()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, photo)| {
+                        photo.error.is_none()
+                            && photo.flag() == Some(Flag::Pick)
+                            && photo.sidecar.as_ref().is_none_or(|sidecar| {
+                                sidecar.exposure().is_none() && sidecar.contrast().is_none()
+                            })
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                for index in &picks {
+                    let photo = c.photos()[*index].clone();
+                    let mut sidecar = photo.sidecar.clone().unwrap_or_default();
+                    sidecar.auto(AUTO_STAND_IN.0, AUTO_STAND_IN.1).unwrap();
+                    c.settle(
+                        *index,
+                        Photo {
+                            sidecar: Some(sidecar),
+                            ..photo
+                        },
+                    );
+                }
+                outcome = if picks.is_empty() {
+                    Outcome::Ignored
+                } else {
+                    Outcome::Changed
+                };
+                continue;
+            }
             Effect::ExportPicks => {
                 // The adapter exports the picks the files flag; here the
                 // model's copies stand in, and the note counts them.
@@ -575,6 +611,7 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
             Effect::Open(_)
             | Effect::Export { .. }
             | Effect::ExportPicks
+            | Effect::AutoPicks
             | Effect::Settings(_)
             | Effect::DeleteRejected
             | Effect::List { .. } => {
@@ -929,6 +966,33 @@ fn auto_is_measured_at_the_adapter_in_develop_mode() {
     assert_eq!(carry(&mut c, "undo", &[]), Outcome::Changed);
     assert_eq!(fields(&c)[EXPOSURE], "-");
     assert_eq!(fields(&c)[CONTRAST], "-");
+}
+
+/// `auto-picks` and `A` ask the adapter for every pick's measure in any
+/// mode with a roll open; the picks with neither key take the step, the
+/// others are kept.
+#[test]
+fn auto_picks_asks_for_every_picks_measure() {
+    let mut c = Controller::new(surface(800, 600));
+    assert_eq!(c.action("auto-picks", &[]).unwrap_err(), ui::Error::NoRoll);
+    let mut photos = photos(3);
+    photos[0].sidecar = Some(edits("td-photo edit 1\nflag pick\n"));
+    photos[1].sidecar = Some(edits("td-photo edit 1\nflag pick\nexposure 0.33\n"));
+    c.open("roll", b"/r", photos).unwrap();
+    let (outcome, effects) = c.input(Input::Key { chord: "A" }).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(effects, [Effect::AutoPicks]);
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    let values = |index: usize| {
+        let photo = c.photo(index).unwrap();
+        photo.split('\t').rev().take(1).collect::<Vec<_>>().join("")
+    };
+    assert_eq!(values(0), "0.60");
+    assert_eq!(values(1), "-");
+    assert_eq!(values(2), "-");
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let (_, effects) = c.action("auto-picks", &[]).unwrap();
+    assert_eq!(effects, [Effect::AutoPicks]);
 }
 
 #[test]
@@ -1463,7 +1527,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "62"]);
+    assert_eq!(&reply(2)[..2], ["ok", "63"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(
         reply(4),
@@ -4397,6 +4461,97 @@ fn the_binary_writes_auto_over_the_replay() {
         err.contains("DSC_0002.NEF") && err.contains("DSC_0003.NEF.edit"),
         "{err}"
     );
+}
+
+/// The picks' auto, over the replay and as the verb: each pick that sets
+/// neither exposure nor contrast given the step `edit FILE auto` writes, a
+/// pick with either kept, an unflagged photo untouched, a pick that cannot
+/// be decoded failed, and the run refused (the verb failing) after the
+/// rest, the status row counting them.
+#[test]
+fn the_picks_get_auto_over_the_replay_and_the_verb() {
+    let temp = Temp::new("auto-picks");
+    let (w, h) = (64usize, 48usize);
+    let samples: Vec<u16> = (0..w * h).map(|i| 1008 + (i as u16 % 4000)).collect();
+    let nef = synth_nef::uncompressed_nef(w, h, &samples);
+    let pick = "td-photo edit 1\nflag pick\n";
+    let edited = "td-photo edit 1\nflag pick\ncontrast 0.20\n";
+    let lay_out = |dir: &Path| {
+        fs::create_dir_all(dir).unwrap();
+        for name in ["DSC_0001.NEF", "DSC_0002.NEF", "DSC_0004.NEF"] {
+            fs::write(dir.join(name), &nef).unwrap();
+        }
+        fs::write(dir.join("DSC_0003.NEF"), b"not really a nef").unwrap();
+        fs::write(dir.join("DSC_0001.NEF.edit"), pick).unwrap();
+        fs::write(dir.join("DSC_0002.NEF.edit"), edited).unwrap();
+        fs::write(dir.join("DSC_0003.NEF.edit"), pick).unwrap();
+    };
+    let apart = temp.0.join("apart");
+    fs::create_dir_all(&apart).unwrap();
+    fs::write(apart.join("DSC_0001.NEF"), &nef).unwrap();
+    fs::write(apart.join("DSC_0001.NEF.edit"), pick).unwrap();
+    let one = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+        .arg("edit")
+        .arg(apart.join("DSC_0001.NEF"))
+        .arg("auto")
+        .output()
+        .unwrap();
+    assert!(one.status.success());
+    let expected = fs::read_to_string(apart.join("DSC_0001.NEF.edit")).unwrap();
+    let step = expected.lines().last().unwrap().to_string();
+    let settled = |dir: &Path| {
+        assert_eq!(
+            fs::read_to_string(dir.join("DSC_0001.NEF.edit")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("DSC_0002.NEF.edit")).unwrap(),
+            edited
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("DSC_0003.NEF.edit")).unwrap(),
+            pick
+        );
+        assert!(!dir.join("DSC_0004.NEF.edit").exists());
+    };
+
+    let roll = temp.0.join("roll");
+    lay_out(&roll);
+    let text_of = |reply: &[String]| -> String {
+        String::from_utf8(td_ui::control::unhex(&reply[3]).unwrap()).unwrap()
+    };
+    let mut session = Replay::start(&["--size", "1100x300", roll.to_str().unwrap()]);
+    let a = session.send(&[request(1, &["key", &hex(b"A")]), request(2, &["text"])]);
+    assert_eq!(a[0][1..3], ["error", "refused"]);
+    assert!(
+        text_of(&a[1][1..]).ends_with("| auto on 1 of 3 picks, 1 kept, 1 failed"),
+        "{}",
+        text_of(&a[1][1..])
+    );
+    settled(&roll);
+    let (ok, _, err) = session.finish();
+    assert!(ok, "{err}");
+    assert!(err.contains("DSC_0003.NEF"), "{err}");
+
+    let verb = temp.0.join("verb");
+    lay_out(&verb);
+    let output = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+        .arg("auto-picks")
+        .arg(&verb)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    let values = step.split_once(" auto ").unwrap().1;
+    assert_eq!(lines.len(), 4, "{stdout}");
+    assert_eq!(lines[0], format!("auto DSC_0001.NEF: {values}"));
+    assert_eq!(lines[1], "kept DSC_0002.NEF: exposure or contrast set");
+    assert!(lines[2].starts_with("failed DSC_0003.NEF: "), "{stdout}");
+    assert_eq!(lines[3], "auto on 1 of 3 picks, 1 kept, 1 failed");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("1 of 3 picks failed"), "{stderr}");
+    settled(&verb);
 }
 
 #[test]

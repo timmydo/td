@@ -202,6 +202,12 @@ pub enum Effect {
     /// window hands the measure to its pool and writes the step on the
     /// file as it is when the measure lands.
     Auto { index: usize, name: String },
+    /// Choose the exposure and contrast of every pick of the roll, as the
+    /// files flag them then, whose sidecar sets neither yet, each as
+    /// `Auto` does, in the roll's order: the replay runs them in turn, the
+    /// window queues them; either says how the batch goes through
+    /// `set_export`, and `ignored` when the files hold no pick.
+    AutoPicks,
     /// Reset this photo's develop keys to camera defaults, keeping the
     /// flag, on the file as it is then, and settle the model.
     Reset { index: usize, name: String },
@@ -301,6 +307,7 @@ pub enum Action {
     ContrastOut,
     Contrast,
     Auto,
+    AutoPicks,
     /// The Nth (from 1) of the available looks, `F1`..`F9`.
     LookAt(u8),
     ZoomFit,
@@ -319,7 +326,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 62] = [
+    pub const ALL: [Action; 63] = [
         Action::Open,
         Action::Choose,
         Action::Next,
@@ -360,6 +367,7 @@ impl Action {
         Action::ContrastOut,
         Action::Contrast,
         Action::Auto,
+        Action::AutoPicks,
         Action::LookAt(1),
         Action::LookAt(2),
         Action::LookAt(3),
@@ -426,6 +434,7 @@ impl Action {
             Self::ContrastOut => "contrast-out",
             Self::Contrast => "contrast",
             Self::Auto => "auto",
+            Self::AutoPicks => "auto-picks",
             Self::LookAt(1) => "look-1",
             Self::LookAt(2) => "look-2",
             Self::LookAt(3) => "look-3",
@@ -472,7 +481,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 62] = [
+pub const BINDINGS: [Binding; 63] = [
     Binding {
         name: "open",
         chord: None,
@@ -712,6 +721,12 @@ pub const BINDINGS: [Binding; 62] = [
         chord: Some("a"),
         arguments: "",
         help: "Choose the exposure and contrast from the photo's tones, one step (develop mode).",
+    },
+    Binding {
+        name: "auto-picks",
+        chord: Some("A"),
+        arguments: "",
+        help: "Choose the exposure and contrast of every pick that has neither yet, each one step, in the background.",
     },
     Binding {
         name: "look-1",
@@ -3565,6 +3580,7 @@ impl Controller {
             (Action::ContrastOut, []) => return self.nudge(Key::Contrast, -CONTRAST_STEP, effects),
             (Action::Contrast, [value]) => return self.set_contrast(value, effects),
             (Action::Auto, []) => return self.auto(effects),
+            (Action::AutoPicks, []) => return self.auto_picks(effects),
             (Action::Look, [stem]) => return self.set_look(stem, effects),
             (Action::Crop, [x, y, w, h]) => return self.set_crop(x, y, w, h, effects),
             (Action::AdjustCrop, []) => self.toggle_adjust()?,
@@ -5002,6 +5018,15 @@ impl Controller {
     fn export_picks(&mut self, mut effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
         self.need_roll()?;
         effects.push(Effect::ExportPicks);
+        Ok((Outcome::Changed, effects))
+    }
+
+    /// Asks for every pick's auto measure, as `export_picks` asks for
+    /// their exports: the files say which photos are picks and which are
+    /// edited already.
+    fn auto_picks(&mut self, mut effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
+        self.need_roll()?;
+        effects.push(Effect::AutoPicks);
         Ok((Outcome::Changed, effects))
     }
 

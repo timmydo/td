@@ -912,6 +912,42 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
     let head = td_photo::jpeg::header(&jpeg).unwrap();
     assert_eq!((head.width, head.height), (60, 44));
 
+    // The picks' auto on the pool: a pick with neither key, written on
+    // disk behind the window's back, is measured and given the same step,
+    // written by the time `wait-idle` answers.
+    let values = expected
+        .lines()
+        .last()
+        .and_then(|line| line.split_once(" auto "))
+        .map(|(_, values)| values.to_string())
+        .unwrap();
+    std::fs::write(
+        roll.join("DSC_0001.NEF.edit"),
+        "td-photo edit 1\nflag pick\n",
+    )
+    .unwrap();
+    assert_eq!(
+        client.request(30, &["action", "auto-picks"]),
+        ["ok", "changed"]
+    );
+    client.settle(31);
+    let (exposure, contrast) = values.split_once(' ').unwrap();
+    assert_eq!(
+        std::fs::read_to_string(roll.join("DSC_0001.NEF.edit")).unwrap(),
+        format!(
+            "td-photo edit 1\nflag pick\nexposure {exposure}\ncontrast {contrast}\nstep-1 on auto {values}\n"
+        )
+    );
+    // The same pixels as after `auto`, the status row counting the pick.
+    assert_eq!(
+        super::box_pixels(&compositor.tile(&place), place.width, r#box),
+        super::box_pixels(&automatic, place.width, r#box),
+        "the developed frame after the picks' auto"
+    );
+    let text = client.request(32, &["text"]);
+    let row = String::from_utf8(td_ui::control::unhex(&text[3]).unwrap()).unwrap();
+    assert!(row.contains("| auto on 1 of 1 picks"), "{row}");
+
     // An export asked for and not waited for: `quit` closes the window,
     // which exits well and takes its socket away, once the pool has
     // written the export (the second of the name, numbered).
