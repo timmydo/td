@@ -734,3 +734,35 @@ call deltas. Direct allocator calls used only in null checks can disappear
 under compiler optimization; black-boxing the size arguments alone does not
 establish that libc executed. These are checks of the pinned compiled
 execution, never memory-safety assumptions about source allocation calls.
+
+## Outbound lifecycle allocation observations
+
+The dedicated Rust and native probes can each run the same socket-free
+outbound scenario in a fresh process. Twelve ordered snapshots cover the
+initial baseline, materialized configuration, first relay/ACME generation,
+four allocated wire buffers plus handshake pool, reservation, native client
+construction, a second published generation retaining the first through its
+session, two pending sessions, capacity refusals, session release, 32 repeated
+constructions using returned buffers, and final owner destruction. No server
+material is opened and no network traffic occurs. Both roles use compiled
+public roots. These are representative client paths, not maximum generations,
+completed handshakes, established record traffic or service admission.
+
+Each process first qualifies allocator forwarding with its existing positive
+controls. It then stores observations in a fixed stack array and formats them
+only after all measured owners are dropped. The supplied clock and
+single-threaded scenario make snapshots quiescent. Reservation and saturation
+must not change any counter; repeated warm construction must not retain
+additional requested bytes. Cold provider initialization and its retained
+state are included in observations, without assuming final totals return to
+zero. The native controls' worker threads finish before measurement begins.
+
+Rows start with `tls-rust` or `tls-native` and an ordered phase name. Rust
+columns are cumulative alloc, zeroed, realloc, free, failed calls, requested
+live bytes and lifetime peak. Native columns are cumulative malloc, calloc,
+realloc, free, posix_memalign, aligned_alloc calls, live tracked blocks,
+requested live bytes and lifetime peak. Peaks include controls and earlier
+phases; subtracting snapshots does not produce a phase peak. Native counts
+overlap Rust System allocations, so the separate runs cannot be summed.
+Neither observation includes allocator overhead, all internal libc paths,
+RSS, or stack storage. Instrumentation storage remains separately reported.

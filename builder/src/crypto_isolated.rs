@@ -492,6 +492,51 @@ const NATIVE_WRAPPERS: [&str; 6] = [
 ];
 const NATIVE_SUCCESS: &str = "native-allocation-probe-v1: forwarding provider diagnostic passed\n";
 
+fn tls_allocation_evidence(output: &str, native: bool) -> Result<()> {
+    let domain = if native { "native" } else { "rust" };
+    let phases = [
+        "baseline",
+        "config",
+        "generation",
+        "buffers",
+        "reserved",
+        "constructed",
+        "overlap",
+        "two_sessions",
+        "refused",
+        "released",
+        "repeated",
+        "dropped",
+    ];
+    let width = if native { 9 } else { 7 };
+    let mut lines = output.lines();
+    for phase in phases {
+        let prefix = format!("tls-{domain} {phase} ");
+        let row = lines
+            .next()
+            .and_then(|line| line.strip_prefix(&prefix))
+            .ok_or("missing or reordered TLS allocation phase")?;
+        let mut columns = 0usize;
+        for value in row.split(' ') {
+            if value.is_empty()
+                || !value.bytes().all(|b| b.is_ascii_digit())
+                || value.parse::<usize>().is_err()
+            {
+                return Err("invalid TLS allocation measurement".into());
+            }
+            columns += 1;
+        }
+        if columns != width {
+            return Err("wrong TLS allocation measurement width".into());
+        }
+    }
+    let success = format!("tls-client-allocation-v1: {domain} passed");
+    if lines.next() != Some(success.as_str()) || lines.next().is_some() || !output.ends_with('\n') {
+        return Err("invalid TLS allocation completion".into());
+    }
+    Ok(())
+}
+
 fn native_allocation_evidence(output: &str, zero_resize: bool) -> Result<()> {
     if zero_resize {
         if output != "native-allocation-probe-v1: zero-resize invalidated\n" {
@@ -1087,6 +1132,24 @@ pub(crate) fn runtime_inner() -> Result<()> {
     let output = bounded_output(&mut command, "native-allocation-zero-resize", 4096, 30)?;
     native_allocation_evidence(&output, true)?;
     println!("portable runtime: native allocator forwarding/provider diagnostics passed");
+    for (native, path) in [
+        (false, "/artifacts/td-mta-rust-allocation-probe"),
+        (true, "/artifacts/td-mta-native-allocation-probe"),
+    ] {
+        let mut command = Command::new(path);
+        command
+            .arg("--tls-clients")
+            .env_clear()
+            .stdin(Stdio::null());
+        crate::host_bin::arm_check_child(&mut command);
+        let domain = if native { "native" } else { "rust" };
+        let name = format!("tls-client-allocation-{domain}");
+        let output = bounded_output(&mut command, &name, 8192, 30)?;
+        tls_allocation_evidence(&output, native)?;
+        for line in output.lines() {
+            println!("portable allocation diagnostic: {line}");
+        }
+    }
 
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
     println!("portable runtime: sixty-five mail SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
@@ -1245,6 +1308,50 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn tls_allocation_records_require_all_ordered_phases_and_exact_width() {
+        for native in [false, true] {
+            let domain = if native { "native" } else { "rust" };
+            let values = if native {
+                "1 2 3 4 5 6 7 8 9"
+            } else {
+                "1 2 3 4 5 6 7"
+            };
+            let mut output = String::new();
+            for phase in [
+                "baseline",
+                "config",
+                "generation",
+                "buffers",
+                "reserved",
+                "constructed",
+                "overlap",
+                "two_sessions",
+                "refused",
+                "released",
+                "repeated",
+                "dropped",
+            ] {
+                output.push_str(&format!("tls-{domain} {phase} {values}\n"));
+            }
+            output.push_str(&format!("tls-client-allocation-v1: {domain} passed\n"));
+            assert!(tls_allocation_evidence(&output, native).is_ok());
+            for bad in [
+                output.replace("baseline", "config"),
+                output.replace(" 1 2", "  1 2"),
+                output.replace(" 1 2", " -1 2"),
+                output.replace(" 1 2", " 999999999999999999999999999999 2"),
+                output.replace(" 1 2", " 1"),
+                output.replace("passed", "failed"),
+                format!("{output}extra\n"),
+                output.trim_end().to_owned(),
+            ] {
+                assert!(tls_allocation_evidence(&bad, native).is_err());
+            }
+            assert!(tls_allocation_evidence(&output, !native).is_err());
+        }
+    }
 
     #[test]
     fn stack_measurement_requires_one_bounded_decimal_observation() {

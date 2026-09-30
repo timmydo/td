@@ -768,8 +768,8 @@ in this test and refuse these sentinels in every other retained executable.
 These are checks for the named probe, not exhaustive classification of all
 allocator machinery; source confinement enforces its import boundary. The artifact inventory, static ELF checks and runtime
 namespace include this executable explicitly. No common compiler/linker flag
-changes. The runtime runs it once in a fresh process, requiring its exact
-success line after model, forwarding and digest/SMTP checks. UNSAFE.md T1 and
+changes. The runtime runs each mode in a fresh process. The default requires
+its exact success line after model, forwarding and digest/SMTP checks. UNSAFE.md T1 and
 td-mta/RESOURCES.md define the scope: requested Rust bytes only; no native,
 RSS, whole-service or allocation-elimination guarantee is inferred.
 
@@ -803,3 +803,11 @@ UNSAFE.md T2 and td-mta/RESOURCES.md define this observation. It does not replac
 independent RSS/stack checks, establish TLS generation/session peak memory or
 change the ledger. C boundary counts may include Rust System calls and must
 never be added to Rust counts as disjoint native memory.
+
+The two allocation executables also run `--tls-clients` in independent fresh
+processes. The runtime validates all twelve ordered snapshot rows and their
+completion records before printing observations. This exercises representative
+public-root outbound policy generations and pending client construction through
+the mail facade, without sockets. RESOURCES.md in td-mta defines columns,
+positive controls and the limits of those diagnostic observations; they do not
+qualify TLS session ceilings or whole-service RSS.

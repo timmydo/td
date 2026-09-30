@@ -873,6 +873,13 @@ Implement the remaining work as independently reviewable increments:
     memory interpretation. Counts remain diagnostic, not whole-native/RSS
     qualification; generation/session limits and admission remain pending.
 
+  - **M07e3a — outbound lifecycle observations:** separate Rust and native
+    processes record representative public-root relay/ACME generations,
+    overlapping owners, two pending clients and repeated buffer reuse.
+    Reservation and capacity refusal require unchanged counters. Requested
+    live bytes and lifetime peaks remain diagnostics; server/maximal inputs,
+    completed handshakes, record traffic and RSS qualification remain pending.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,

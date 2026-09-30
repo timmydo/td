@@ -10,6 +10,9 @@ mod allocation_registry;
 #[path = "support/allocation_shim.rs"]
 mod allocation_shim;
 
+#[path = "support/tls_allocation_scenario.rs"]
+mod tls_allocation_scenario;
+
 use allocation_shim::TD_MTA_ALLOCATION_COUNTERS as COUNTERS;
 use std::hint::black_box;
 use td_crypto::Digest;
@@ -86,9 +89,40 @@ fn hot_paths() {
     );
 }
 
+fn tls_clients() {
+    let mut samples = [COUNTERS.snapshot(); tls_allocation_scenario::PHASES.len()];
+    let mut slots = samples.iter_mut();
+    tls_allocation_scenario::run(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    for sample in &samples {
+        assert!(!sample.invalid);
+    }
+    assert_eq!(samples.get(3), samples.get(4), "reservation allocated");
+    assert_eq!(samples.get(7), samples.get(8), "capacity refusal allocated");
+    assert_eq!(
+        samples.get(9).unwrap().live,
+        samples.get(10).unwrap().live,
+        "warm construction retained Rust bytes"
+    );
+    for (phase, s) in tls_allocation_scenario::PHASES.into_iter().zip(samples) {
+        println!(
+            "tls-rust {phase} {} {} {} {} {} {} {}",
+            s.alloc, s.zeroed, s.realloc, s.free, s.failed, s.live, s.peak
+        );
+    }
+    println!("tls-client-allocation-v1: rust passed");
+}
+
 fn main() {
     allocation_counter::Counters::verify_model();
     forwarding();
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|arg| arg == "--tls-clients")
+    {
+        tls_clients();
+        return;
+    }
     hot_paths();
     println!("rust-allocation-probe-v1: counter-model forwarding hot-paths passed");
 }
