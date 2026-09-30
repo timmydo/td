@@ -2,7 +2,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const EMPTY: usize = 0;
-const DELETED: usize = 1;
+const RESERVED: usize = 1;
 
 struct Entry {
     address: AtomicUsize,
@@ -78,33 +78,82 @@ impl<const N: usize> Registry<N> {
         Err(error)
     }
 
-    // Returns an existing entry or a vacancy; deletion must retain probe chains.
+    // Returns an existing entry or a vacancy; deletion closes gaps in probe chains.
     fn locate(&self, address: usize) -> Result<(Option<usize>, Option<usize>), Error> {
-        if address <= DELETED {
+        if address <= RESERVED {
             return Err(Error::InvalidAddress);
         }
         if N == 0 {
             return Err(Error::Full);
         }
         let mut index = address.rotate_right(4) % N;
-        let mut vacancy = None;
         for _ in 0..N {
             let entry = self.entries.get(index).ok_or(Error::Arithmetic)?;
             match entry.address.load(Ordering::Relaxed) {
-                current if current == address => return Ok((Some(index), vacancy)),
-                EMPTY => return Ok((None, vacancy.or(Some(index)))),
-                DELETED => {
-                    vacancy = vacancy.or(Some(index));
-                }
+                current if current == address => return Ok((Some(index), None)),
+                EMPTY => return Ok((None, Some(index))),
                 _ => {}
             }
-            index = if index == N.saturating_sub(1) {
-                0
-            } else {
-                index.saturating_add(1)
-            };
+            index = Self::next(index);
         }
-        Ok((None, vacancy))
+        Ok((None, None))
+    }
+
+    fn next(index: usize) -> usize {
+        if index == N.saturating_sub(1) {
+            0
+        } else {
+            index.saturating_add(1)
+        }
+    }
+
+    fn distance(start: usize, end: usize) -> usize {
+        if end >= start {
+            end - start
+        } else {
+            N - (start - end)
+        }
+    }
+
+    // Moving later entries backward leaves a genuine empty slot without breaking
+    // searches whose home bucket lies before the removed entry, including wrap.
+    fn close_gap(&self, mut hole: usize) {
+        if N == 0 {
+            self.invalid.store(true, Ordering::Relaxed);
+            return;
+        }
+        // A reachable full table filled a last empty slot that no probe chain
+        // crossed; one traversal of the other N-1 slots therefore suffices.
+        let mut scan = Self::next(hole);
+        for _ in 0..N.saturating_sub(1) {
+            let Some(entry) = self.entries.get(scan) else {
+                self.invalid.store(true, Ordering::Relaxed);
+                return;
+            };
+            let address = entry.address.load(Ordering::Relaxed);
+            if address == EMPTY {
+                break;
+            }
+            let home = address.rotate_right(4) % N;
+            if Self::distance(home, hole) < Self::distance(home, scan) {
+                let Some(target) = self.entries.get(hole) else {
+                    self.invalid.store(true, Ordering::Relaxed);
+                    return;
+                };
+                target.address.store(address, Ordering::Relaxed);
+                target
+                    .bytes
+                    .store(entry.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+                hole = scan;
+            }
+            scan = Self::next(scan);
+        }
+        if let Some(entry) = self.entries.get(hole) {
+            entry.address.store(EMPTY, Ordering::Relaxed);
+            entry.bytes.store(0, Ordering::Relaxed);
+        } else {
+            self.invalid.store(true, Ordering::Relaxed);
+        }
     }
 
     pub fn insert(&self, address: usize, size: usize) -> Result<(), Error> {
@@ -144,10 +193,8 @@ impl<const N: usize> Registry<N> {
         let _guard = self.lock();
         let result = (|| {
             let (found, _) = self.locate(address)?;
-            let entry = self
-                .entries
-                .get(found.ok_or(Error::Unknown)?)
-                .ok_or(Error::Arithmetic)?;
+            let index = found.ok_or(Error::Unknown)?;
+            let entry = self.entries.get(index).ok_or(Error::Arithmetic)?;
             let size = entry.bytes.load(Ordering::Relaxed);
             let blocks = self
                 .blocks
@@ -159,8 +206,7 @@ impl<const N: usize> Registry<N> {
                 .load(Ordering::Relaxed)
                 .checked_sub(size)
                 .ok_or(Error::Arithmetic)?;
-            entry.address.store(DELETED, Ordering::Relaxed);
-            entry.bytes.store(0, Ordering::Relaxed);
+            self.close_gap(index);
             self.blocks.store(blocks, Ordering::Relaxed);
             self.bytes.store(bytes, Ordering::Relaxed);
             Ok(size)
@@ -176,5 +222,35 @@ impl<const N: usize> Registry<N> {
             peak: self.peak.load(Ordering::Relaxed),
             invalid: self.invalid.load(Ordering::Relaxed),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn churn_returns_every_slot_to_empty() {
+        use super::*;
+        let r = Registry::<17>::new();
+        for address in 2..4096 {
+            assert_eq!(r.insert(address, 13), Ok(()));
+            assert_eq!(r.remove(address), Ok(13));
+            assert!(r
+                .entries
+                .iter()
+                .all(|entry| entry.address.load(Ordering::Relaxed) == EMPTY));
+            assert_eq!(
+                r.locate(address),
+                Ok((None, Some(address.rotate_right(4) % 17)))
+            );
+        }
+        assert_eq!(
+            r.snapshot(),
+            Snapshot {
+                blocks: 0,
+                bytes: 0,
+                peak: 13,
+                invalid: false
+            }
+        );
     }
 }

@@ -646,11 +646,12 @@ the fresh static executable and requires its exact completion record.
 
 M07e2b adds test-only, fixed-capacity address/size bookkeeping for the future
 C boundary probe. Entries contain integer addresses, never dereferenceable
-borrowed pointers. Zero and one are reserved as empty/deleted tags; real
-allocator results must be checked before insertion. Null arguments to
-`free(NULL)` and `realloc(NULL, n)` must bypass removal. A zero-size allocation
-with a nonnull address retains ownership until removal. Tombstones preserve
-colliding lookup chains, including a fully occupied/deleted table.
+borrowed pointers. Zero marks an empty slot and one remains a reserved invalid
+address; real allocator results must be checked before insertion. Null
+arguments to `free(NULL)` and `realloc(NULL, n)` must bypass removal. A zero-
+size allocation with a nonnull address retains ownership until removal.
+Deletion shifts displaced entries backward across the vacated slot while
+preserving their lookup chains, including wraparound and a full table.
 
 Each operation holds one atomic spin guard only while reading/updating fixed
 entries and counters. No allocation, formatting, pointer access or callback
@@ -661,10 +662,10 @@ is not a service scheduling primitive or an async-signal-safe allocator. It
 is also not fork-safe: a child could inherit another thread's locked guard.
 The probe must not fork while tracking allocations.
 
-Tombstones never become empty again. After enough address churn, every new
-address can scan the entire table under the guard, even with few live blocks.
-This bounded but expensive behavior must be addressed before connecting the
-C wrappers; peak live-block capacity alone does not bound this slowdown.
+Each deletion scans at most capacity minus one following entries and leaves
+a real empty slot; no permanent tombstones accumulate with address churn.
+Clustering and high occupancy can still require a full-capacity scan. No
+constant-time or wall-clock bound is claimed.
 
 Duplicate insertion, missing removal, reserved address, full capacity or
 arithmetic failure leaves ownership unchanged and marks all evidence invalid.
@@ -678,7 +679,7 @@ track bookkeeping instants, excluding storage inside the real allocator during
 that call. Zero-size realloc behavior needs the later libc-specific wrapper
 contract; no generic null-result ownership assumption is provided here.
 
-Host tests exercise collisions, deleted-slot reuse, saturation, zero-size
+Host tests exercise collisions, closed-gap reuse, saturation, zero-size
 ownership, arithmetic overflow, duplicate/unknown addresses, failed/moved
 resize ownership and concurrent independent owners. Snapshots are coherent by
 construction through the shared guard; the concurrent test is a smoke check,
@@ -688,3 +689,13 @@ unchanged v1 success record intentionally includes these added table checks. No 
 allocation is intercepted yet, no libc coverage claim is made, and no runtime
 memory allowance changes. Fixed table storage will be reported separately as
 instrumentation overhead when the C probe is connected.
+
+The gap-closing tests include wrapped clusters, a slot-at-home that must not
+move, complete return to empty slots under churn, and deterministic operation
+traces checked against an independent ordered map at capacities 0, 1, 3, 4 and
+7. They cover ownership/error/peak state as well as successful lookups.
+
+Mixed traces choose operations from a high generator bit; their invalid flag
+becomes sticky after the first error. Separate valid-only traces compare
+200000 operations and require evidence to remain valid throughout. Immediate
+error-path assertions pin duplicate and arithmetic-failure invalidation.

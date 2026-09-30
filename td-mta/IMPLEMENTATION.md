@@ -863,7 +863,10 @@ Implement the remaining work as independently reviewable increments:
   - **M07e2b — bounded native bookkeeping:** a test-only fixed address/size
     table tracks ownership and coherent requested-byte snapshots without heap
     storage or pointer access. Collision, saturation, resize ownership and
-    concurrent tests qualify the table; libc interception remains pending.
+    concurrent tests exercise the table; snapshots are coherent through its
+    shared guard. Deletion closes probe-chain gaps without accumulating
+    tombstones; model traces cover wrapped and full tables. Libc interception
+    remains pending.
 
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
