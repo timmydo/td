@@ -892,3 +892,25 @@ RSS completion records use v2 for every scenario, with the same additional
 handshake release phases. The runner rejects earlier completion versions and
 missing/reordered phases. An RSS delta is not required to match a requested
 allocation delta.
+
+## Remote peer-chain memory observations
+
+The existing unwrapped mail test executable additionally controls six local
+process fixtures: TLS 1.2 and TLS 1.3, each with a fresh Rust, native or RSS
+observer. A private test-only crypto server reads four synthetic DER objects
+whose total exceeds 63 KiB and fits 65000 bytes, independently of the local PEM
+loader ceiling. TLS 1.3 emits two counted opaque 16000-byte test tickets; the
+private ticketer refuses resumption and performs no encryption. Controller and
+peer allocations are outside each observer; native instrumentation never
+crosses a fork. Explicit paths select only the existing qualification
+executables, and no artifact, link flag or API is added.
+
+Each controller requires the complete authenticated handshake, verified record
+exchange and bounded child completion. Owned guards clean up on normal return
+and unwinding; outer hard kills rely on runtime namespace cleanup. The runtime
+validates unique observation markers, domain/version completion, successful test
+summary
+and eleven ordered inner rows. It refuses missing, duplicate or wrong-version
+records before printing diagnostics. RESOURCES.md defines attribution and
+limits: this is remote-chain coverage, not total session admission or an
+isolated maximum ticket-processing peak.

@@ -53,6 +53,9 @@ impl std::fmt::Display for UnsupportedConfigVersion {
 impl std::error::Error for UnsupportedConfigVersion {}
 
 #[cfg(test)]
+mod tls_memory_process_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

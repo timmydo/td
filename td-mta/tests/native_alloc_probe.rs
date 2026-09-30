@@ -258,6 +258,13 @@ fn main() {
     }
     if std::env::args()
         .nth(1)
+        .is_some_and(|arg| arg == "--tls-remote-chain")
+    {
+        tls_remote_chain();
+        return;
+    }
+    if std::env::args()
+        .nth(1)
         .is_some_and(|arg| arg == "--tls-generations")
     {
         tls_generations();
@@ -335,4 +342,52 @@ fn tls_generations() {
         println!("tls-native-generation {phase} {malloc} {calloc} {realloc} {free} {posix} {aligned} {} {} {}", s.blocks, s.bytes, s.peak);
     }
     println!("tls-generation-allocation-v1: native passed");
+}
+
+#[cfg(td_native_alloc_probe)]
+#[path = "support/tls_remote_chain_scenario.rs"]
+mod tls_remote_chain_scenario;
+
+#[cfg(td_native_alloc_probe)]
+fn tls_remote_chain() {
+    use native_allocator_bridge::{calls, TD_MTA_NATIVE_REGISTRY as REGISTRY};
+    let mut samples = [(calls(), REGISTRY.snapshot()); tls_remote_chain_scenario::PHASES.len()];
+    let mut slots = samples.iter_mut();
+    tls_remote_chain_scenario::run(|| *slots.next().unwrap() = (calls(), REGISTRY.snapshot()));
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|(_, s)| !s.invalid));
+    assert_eq!(
+        samples.get(6).unwrap().1.bytes,
+        samples.get(7).unwrap().1.bytes,
+        "remote records retained C boundary bytes"
+    );
+    assert_eq!(
+        samples.get(6).unwrap().1.blocks,
+        samples.get(7).unwrap().1.blocks,
+        "remote records retained C boundary blocks"
+    );
+    assert_eq!(
+        samples
+            .get(8)
+            .unwrap()
+            .1
+            .bytes
+            .checked_sub(samples.get(9).unwrap().1.bytes),
+        Some(2 * td_mta::tls_io::TLS_WIRE_BYTES)
+    );
+    assert_eq!(
+        samples
+            .get(8)
+            .unwrap()
+            .1
+            .blocks
+            .checked_sub(samples.get(9).unwrap().1.blocks),
+        Some(2)
+    );
+    let scenario = tls_remote_chain_scenario::label();
+    for (phase, (c, s)) in tls_remote_chain_scenario::PHASES.into_iter().zip(samples) {
+        let [malloc, calloc, realloc, free, posix, aligned] = c;
+        println!("tls-native-{scenario} {phase} {malloc} {calloc} {realloc} {free} {posix} {aligned} {} {} {}", s.blocks, s.bytes, s.peak);
+    }
+    println!("tls-{scenario}-allocation-v1: native passed");
 }

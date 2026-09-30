@@ -257,6 +257,13 @@ fn main() {
     }
     if std::env::args()
         .nth(1)
+        .is_some_and(|arg| arg == "--tls-remote-chain")
+    {
+        tls_remote_chain();
+        return;
+    }
+    if std::env::args()
+        .nth(1)
         .is_some_and(|arg| arg == "--tls-generations")
     {
         tls_generations();
@@ -304,4 +311,36 @@ fn tls_generations() {
         );
     }
     println!("tls-generation-allocation-v1: rust passed");
+}
+
+#[path = "support/tls_remote_chain_scenario.rs"]
+mod tls_remote_chain_scenario;
+
+fn tls_remote_chain() {
+    let mut samples = [COUNTERS.snapshot(); tls_remote_chain_scenario::PHASES.len()];
+    let mut slots = samples.iter_mut();
+    tls_remote_chain_scenario::run(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|s| !s.invalid));
+    assert_eq!(
+        samples.get(6).unwrap().live,
+        samples.get(7).unwrap().live,
+        "remote records retained Rust bytes"
+    );
+    assert_eq!(
+        samples
+            .get(8)
+            .unwrap()
+            .live
+            .checked_sub(samples.get(9).unwrap().live),
+        Some(2 * td_mta::tls_io::TLS_WIRE_BYTES)
+    );
+    let scenario = tls_remote_chain_scenario::label();
+    for (phase, s) in tls_remote_chain_scenario::PHASES.into_iter().zip(samples) {
+        println!(
+            "tls-rust-{scenario} {phase} {} {} {} {} {} {} {}",
+            s.alloc, s.zeroed, s.realloc, s.free, s.failed, s.live, s.peak
+        );
+    }
+    println!("tls-{scenario}-allocation-v1: rust passed");
 }

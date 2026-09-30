@@ -548,6 +548,59 @@ fn tls_handshake_evidence(output: &str, native: bool) -> Result<()> {
     )
 }
 
+const REMOTE_CHAIN_PHASES: &[&str] = &[
+    "baseline",
+    "config",
+    "generation",
+    "buffers",
+    "constructed",
+    "handshake",
+    "record",
+    "repeated",
+    "released",
+    "buffers_released",
+    "dropped",
+];
+
+fn remote_chain_evidence<'a>(output: &'a str, domain: &str, version: &str) -> Result<&'a str> {
+    let scenario = match version {
+        "1.2" => "remote12",
+        "1.3" => "remote13",
+        _ => return Err("unknown remote chain version".into()),
+    };
+    let begin = "remote-chain-output-begin\n";
+    let end = "remote-chain-output-end\n";
+    if output.matches(begin).count() != 1 || output.matches(end).count() != 1 {
+        return Err("ambiguous remote chain observation boundaries".into());
+    }
+    let (_, body) = output
+        .split_once(begin)
+        .ok_or("missing remote chain output")?;
+    let (body, tail) = body
+        .split_once(end)
+        .ok_or("unterminated remote chain output")?;
+    let completion = format!("remote-chain-controller-v1: {domain} {version} passed\n");
+    let mut summaries = tail.lines().filter(|line| line.starts_with("test result:"));
+    let passed = summaries
+        .next()
+        .is_some_and(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+    if !tail.starts_with(&completion) || !passed || summaries.next().is_some() {
+        return Err("remote chain controller did not complete".into());
+    }
+    match domain {
+        "rust" | "native" => tls_phase_evidence(
+            body,
+            domain == "native",
+            &format!("-{scenario}"),
+            scenario,
+            REMOTE_CHAIN_PHASES,
+        )?,
+        "rss" => rss_evidence(body, scenario)?,
+        _ => return Err("unknown remote chain observation domain".into()),
+    }
+    Ok(body)
+}
+
 fn tls_generation_evidence(output: &str, native: bool) -> Result<()> {
     tls_phase_evidence(
         output,
@@ -701,6 +754,7 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
             "repeated",
             "dropped",
         ],
+        "remote12" | "remote13" => REMOTE_CHAIN_PHASES,
         "generation" => &[
             "baseline",
             "material",
@@ -1479,6 +1533,42 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
 
+    for version in ["1.2", "1.3"] {
+        for (domain, binary) in [
+            ("rust", "td-mta-rust-allocation-probe"),
+            ("native", "td-mta-native-allocation-probe"),
+            ("rss", "td-mta-rss-probe"),
+        ] {
+            let mut command = Command::new("/artifacts/td-mta-transport-smoke");
+            command
+                .args([
+                    "--exact",
+                    "tls_memory_process_tests::remote_chain_observations",
+                    "--ignored",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("TD_MTA_TEST_TLS_PEER", "/artifacts/td-crypto-smoke")
+                .env("TD_MTA_TEST_MEMORY_PROBE", format!("/artifacts/{binary}"))
+                .env("TD_MTA_TEST_MEMORY_DOMAIN", domain)
+                .env("TD_MTA_TEST_PEER_VERSION", version)
+                .stdin(Stdio::null());
+            crate::host_bin::arm_check_child(&mut command);
+            let name = format!("remote-chain-{domain}-{version}");
+            let output = bounded_output(&mut command, &name, 64 * 1024, 30).inspect_err(|_| {
+                let path = Path::new("/output").join(format!("{name}.log"));
+                if let Ok(log) = read_output(&path, &name, 64 * 1024) {
+                    eprintln!("portable remote-chain failure in {name}:\n{log}");
+                }
+            })?;
+            let observations = remote_chain_evidence(&output, domain, version)?;
+            for line in observations.lines() {
+                println!("portable remote-chain diagnostic: {line}");
+            }
+        }
+    }
+
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
     println!("portable runtime: sixty-five mail SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
     Ok(())
@@ -1829,6 +1919,67 @@ mod tests {
                 format!("{output}extra\n"),
             ] {
                 assert!(tls_handshake_evidence(&bad, native).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn remote_chain_records_require_the_controller_and_inner_schema() {
+        for version in ["1.2", "1.3"] {
+            let scenario = if version == "1.2" {
+                "remote12"
+            } else {
+                "remote13"
+            };
+            for domain in ["rust", "native", "rss"] {
+                let mut body = String::new();
+                for phase in REMOTE_CHAIN_PHASES {
+                    if domain == "rss" {
+                        body.push_str(&format!("rss {scenario} {phase} 100\n"));
+                    } else {
+                        let values = if domain == "native" {
+                            "1 2 3 4 5 6 7 8 9"
+                        } else {
+                            "1 2 3 4 5 6 7"
+                        };
+                        body.push_str(&format!("tls-{domain}-{scenario} {phase} {values}\n"));
+                    }
+                }
+                if domain == "rss" {
+                    body.push_str(&format!("rss-observation-v2: {scenario} passed\n"));
+                } else {
+                    body.push_str(&format!("tls-{scenario}-allocation-v1: {domain} passed\n"));
+                }
+                let output = format!("running 1 test\n\nremote-chain-output-begin\n{body}remote-chain-output-end\nremote-chain-controller-v1: {domain} {version} passed\nok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.1s\n");
+                assert_eq!(
+                    remote_chain_evidence(&output, domain, version).unwrap(),
+                    body
+                );
+                assert!(remote_chain_evidence(&output, "unknown", version).is_err());
+                assert!(remote_chain_evidence(&output, domain, "1.1").is_err());
+                for bad in [
+                    output.replace("remote-chain-output-begin", "missing"),
+                    output.replace("remote-chain-output-end", "missing"),
+                    output.replace(
+                        "remote-chain-output-begin\n",
+                        "remote-chain-output-begin\nremote-chain-output-begin\n",
+                    ),
+                    output.replace("buffers_released", "released"),
+                    output.replace("controller-v1", "controller-v2"),
+                    output.replace("1 passed;", "0 passed;"),
+                    output.replace("0 failed;", "1 failed;"),
+                    format!("{output}test result: ok. 0 passed; 0 failed; 0 ignored;\n"),
+                    format!("{output}test result: FAILED. 0 passed; 1 failed;\n"),
+                    output.replace(
+                        "remote-chain-output-end\n",
+                        "remote-chain-output-end\nremote-chain-output-end\n",
+                    ),
+                    output
+                        .replace("remote12", "other12")
+                        .replace("remote13", "other13"),
+                ] {
+                    assert!(remote_chain_evidence(&bad, domain, version).is_err());
+                }
             }
         }
     }

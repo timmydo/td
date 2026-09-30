@@ -43,7 +43,7 @@ impl Clock for TestClock {
 }
 
 #[path = "../tests/support/tls_certificate_fixture.rs"]
-mod certificate_fixture;
+pub(crate) mod certificate_fixture;
 use certificate_fixture::certificate_names;
 pub(crate) use certificate_fixture::pem;
 

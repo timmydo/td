@@ -933,6 +933,13 @@ Implement the remaining work as independently reviewable increments:
     retention checks run in both counter domains and unwrapped RSS. Maximum
     trust/name/listener combinations and aggregate admission remain pending.
 
+  - **M07e4d — large remote-chain observations:** an unwrapped controller owns
+    synthetic material and a private test peer. Separate Rust/native/RSS
+    processes authenticate TLS 1.2/1.3 chains above 63 KiB DER and verify repeated
+    records. Endpoint and wire-buffer release remain separate. The peer enables
+    TLS 1.3 tickets; complete transient, concurrency and session admission work
+    remains pending.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,

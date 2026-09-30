@@ -127,9 +127,17 @@ fn main() {
         Some("--tls-generations") => observe("generation", tls_generation_scenario::PHASES, |f| {
             tls_generation_scenario::run(f)
         }),
+        Some("--tls-remote-chain") => observe(
+            tls_remote_chain_scenario::label(),
+            tls_remote_chain_scenario::PHASES,
+            |f| tls_remote_chain_scenario::run(f),
+        ),
         _ => controls(),
     }
 }
 
 #[path = "support/tls_generation_scenario.rs"]
 mod tls_generation_scenario;
+
+#[path = "support/tls_remote_chain_scenario.rs"]
+mod tls_remote_chain_scenario;
