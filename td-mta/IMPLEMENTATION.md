@@ -789,11 +789,15 @@ Implement the remaining work as independently reviewable increments:
             construction; refusal/teardown recover both buffers. Exact gateway
             comparison covers canonical policy and the full listener binding.
             This is not current-generation authority or a mutation fence.
-            **M18 integration blocker before service:** split client-role
-            preparation/retention from complete server identity admission, so
-            initial ACME issuance and expired-certificate recovery can use
-            ACME/relay TLS while unavailable server roles remain disabled.
-            Keep both paths within the existing generation/resource ledger.
+            **Client startup/recovery:** implemented explicit prepare_clients
+            for relay and optional ACME trust without opening server/gateway
+            material. A coverage tag distinguishes it from complete compilation;
+            no server policy can be resolved. Both modes share one two-slot
+            generation domain. Local fixtures cover absent/expired identities,
+            strict client trust refusal and an old outbound session completing
+            across publication of a complete table. M18/M19 must still integrate
+            issuance, health gates, expiry and atomic runtime publication before
+            service; constructors alone never issue certificates.
           - **Socket handoff:** implemented consuming TCP handoff with fixed
             deadlines, plaintext-tail refusal and exact buffer recovery. The
             bounded pump retains generation/count owners, publishes role-checked

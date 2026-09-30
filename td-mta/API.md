@@ -402,17 +402,33 @@ no TLS policy. No native configuration or identity handle escapes the table.
 The trusted opener receives a redacted MaterialRequest with an explicit kind,
 optional profile and optional path. Files-mode identities use configured paths;
 ACME chain/key requests name the profile and have no operator path. They load
-existing service-managed material, never initiate issuance. This complete table
-currently requires every server identity to be present and valid, so it cannot
-bootstrap initial ACME issuance or recover after expiry on its own. Before
-service activation, M18 must independently prepare and retain relay/ACME client
-policies while unavailable server roles stay disabled, within the same resource
-ledger. This is an explicit integration blocker, not a startup design change.
-Explicit CA requests
-retain their exact configured role. Missing relay/ACME overrides select pinned
-public roots; malformed or unreadable explicit input never falls back. Every
-staged gateway CA is checked, even without a listener. Each used gateway bundle
-is read once and supplies all of that gateway's listeners in this generation.
+existing service-managed material, never initiate issuance. Complete preparation
+requires every server identity to be present and valid. Explicit prepare_clients
+supplies the earlier startup/recovery stage: it compiles only relay and optional
+ACME policies, opening only their explicit CA inputs. It does not open or admit
+server identities or gateway trust. Missing/expired local server material cannot
+block these outbound roles. Both modes still require a structurally closed,
+text-resolved configuration and refuse invalid/unreadable explicit client trust
+without fallback. This is not an automatic fallback on complete-table failure.
+PolicyCoverage reports ClientsOnly or Complete as compilation metadata; it is
+not a service-health or runtime-publication claim. Client-only listener lookup
+returns NotFound, and a different generation's saved listener ID is refused.
+
+Use the same GenerationSet for both modes. Publish the client-only generation,
+perform issuance/recovery on the outbound slot, then prepare and publish a
+complete replacement after usable server material exists. Retained outbound
+sessions can finish on the old generation; both tables share the same two-slot
+limit. Failed complete preparation leaves clients selected. A client-only table
+may also replace a complete table when runtime expiry policy disables inbound
+service; no stale gateway binding remains in the selected table. M18/M19 must
+still wire startup/expiry health, issuance, retry and atomic runtime publication
+before service activation. These constructors perform no ACME network operation.
+
+Explicit CA requests retain their configured role. Missing relay/ACME overrides
+select pinned public roots; malformed or unreadable explicit input never falls
+back. Complete preparation checks every staged gateway CA, even without a
+listener, and reads each used gateway bundle once for all of its listeners in
+this generation. Client-only preparation never opens gateway material.
 
 Readers must implement truthful Read/EOF and bounded, deadlined I/O with M05's
 protected-file and secret/public inode checks. The compiler itself performs no

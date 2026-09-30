@@ -278,13 +278,15 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   test-target/profile, static ELF and isolated-runtime checks as the other
   qualification binaries; it is not an installed service dependency.
 - `td-mta-transport-smoke`: the `--lib --no-run` td-mta test executable,
-  selected by its `td_mta` library target and test profile. Forty exact
-  policy/generation/gateway/admission/clock/TCP/TLS cases execute
+  selected by its `td_mta` library target and test profile. Forty-three
+  exact policy/generation/gateway/admission/clock/TCP/TLS cases execute
   individually under the existing deadline and positive-one-test verdict
   requirement. They cover complete TLS policy compilation and HTTPS name
-  subsets, reader caps/refusals, generation-bound IDs, queued/native session
-  ownership, exact buffer recovery and gateway policy/binding comparison;
-  local compiled-policy peers verify relay trust, name routing and mandatory
+  subsets, reader caps/refusals, client-only startup/expiry admission,
+  strict client trust and complete-table replacement within the same
+  generation budget, generation-bound IDs, queued/native session ownership,
+  exact buffer recovery and gateway policy/binding comparison; local
+  compiled-policy peers verify relay trust, name routing and mandatory
   client authentication. Retained TCP handoff cases cover plaintext tails,
   exact buffer recovery, fixed/tightened deadlines, encrypted
   delivery/close, generation and handshake capacity, clock failure and

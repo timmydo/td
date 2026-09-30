@@ -808,6 +808,9 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-mta-transport-smoke", "tls_policy::tests::io_tests::handshake_deadline_can_only_tighten_and_failure_is_sticky", false),
         ("td-mta-transport-smoke", "tls_policy::tests::io_tests::changed_gateway_policy_aborts_pending_connection_and_releases_capacity", false),
         ("td-mta-transport-smoke", "tls_policy::tests::io_tests::established_clock_failure_clears_cached_authorization_and_aborts_socket", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::client_tests::client_only_acme_bootstrap_never_opens_server_material", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::client_tests::expired_server_does_not_block_clients_but_invalid_client_trust_still_refuses", false),
+        ("td-mta-transport-smoke", "tls_policy::tests::client_tests::client_generation_transitions_to_complete_within_the_same_two_slots", false),
         ("td-mta-transport-smoke", "gateway_policy::tests::canonical_gateway_policy_ignores_only_representation_and_server_material", false),
         ("td-mta-transport-smoke", "gateway_policy::tests::gateway_filters_and_material_limits_refuse_without_fallback", false),
         ("td-mta-transport-smoke", "gateway_policy::tests::gateway_tls_requires_a_client_certificate_on_the_same_valid_server", false),
@@ -868,7 +871,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
     println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
-    println!("portable runtime: forty mail policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
+    println!("portable runtime: forty-three mail policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
     Ok(())
 }
 

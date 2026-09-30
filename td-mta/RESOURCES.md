@@ -160,7 +160,11 @@ configured memory budget does not preserve the default RSS claim.
   coexist during identity admission, and one CA buffer coexists with its parsed
   configuration. Raw input windows are cleared on drop without a secure-erasure
   claim. Table vectors, strings, boxed gateway policies, native objects and all
-  temporaries remain charged to this same generation allowance. The compiler
+  temporaries remain charged to this same generation allowance. Explicit
+  client-only preparation reserves at most two table entries and opens only
+  relay/ACME trust. It occupies one of the same two generation slots; complete
+  replacement and retained client sessions cannot create a third slot or
+  independent trust-cache allowance. The compiler
   does not yet measure/enforce the 1 MiB native aggregate and cannot activate
   serving. SessionPreparation retains the handshake count, generation and two
   preallocated buffers without allocating; native construction runs later on a

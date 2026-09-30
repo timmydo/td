@@ -130,10 +130,18 @@ impl Policy {
     }
 }
 
-/// A complete immutable TLS table. Construct only inside a reserved generation.
+/// An immutable TLS table. Construct only inside a reserved generation.
 /// Counts/input caps are not a native allocation or aggregate byte qualification.
 pub struct TlsPolicies {
     policies: Vec<Policy>,
+    coverage: PolicyCoverage,
+}
+
+/// Which configured roles were compiled, not runtime health or publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PolicyCoverage {
+    ClientsOnly,
+    Complete,
 }
 
 impl std::fmt::Debug for TlsPolicies {
@@ -152,14 +160,48 @@ impl TlsPolicies {
         reserved: GenerationConstruction<Self>,
         configuration: &ResolvedText,
         clock: Arc<ClockHandle>,
+        open: impl FnMut(MaterialRequest<'_>) -> Result<R, Error>,
+    ) -> Result<PreparedGeneration<Self>, Error> {
+        Self::prepare_coverage(
+            reserved,
+            configuration,
+            clock,
+            open,
+            PolicyCoverage::Complete,
+        )
+    }
+
+    /// Explicit startup/recovery stage: compile relay and optional ACME trust
+    /// without opening any server identity or gateway material. No server role
+    /// is admitted. Use the same generation domain as subsequent complete tables.
+    pub fn prepare_clients<R: Read>(
+        reserved: GenerationConstruction<Self>,
+        configuration: &ResolvedText,
+        clock: Arc<ClockHandle>,
+        open: impl FnMut(MaterialRequest<'_>) -> Result<R, Error>,
+    ) -> Result<PreparedGeneration<Self>, Error> {
+        Self::prepare_coverage(
+            reserved,
+            configuration,
+            clock,
+            open,
+            PolicyCoverage::ClientsOnly,
+        )
+    }
+
+    fn prepare_coverage<R: Read>(
+        reserved: GenerationConstruction<Self>,
+        configuration: &ResolvedText,
+        clock: Arc<ClockHandle>,
         mut open: impl FnMut(MaterialRequest<'_>) -> Result<R, Error>,
+        coverage: PolicyCoverage,
     ) -> Result<PreparedGeneration<Self>, Error> {
         reserved.construct(|| {
             configuration
                 .candidate()
                 .with_graph(|records, text| {
                     let graph = records.view(text).map_err(|_| Error::Invalid)?;
-                    build(configuration, graph, clock, &mut open).map(Box::new)
+                    build(configuration, graph, clock, &mut open, coverage).map(Box::new)
                 })
                 .map_err(|_| Error::Invalid)?
         })
@@ -167,6 +209,10 @@ impl TlsPolicies {
 
     fn policy(&self, index: u16) -> Result<&Policy, Error> {
         self.policies.get(usize::from(index)).ok_or(Error::NotFound)
+    }
+
+    pub const fn coverage(&self) -> PolicyCoverage {
+        self.coverage
     }
 
     pub fn len(&self) -> usize {
@@ -519,8 +565,21 @@ fn build<R: Read>(
     graph: graph::View<'_, '_>,
     clock: Arc<ClockHandle>,
     open: &mut impl FnMut(MaterialRequest<'_>) -> Result<R, Error>,
+    coverage: PolicyCoverage,
 ) -> Result<TlsPolicies, Error> {
     let profiles = graph.certificates().map_err(|_| Error::Invalid)?;
+    let mut policies = Vec::new();
+    let capacity = match coverage {
+        PolicyCoverage::ClientsOnly => 2,
+        PolicyCoverage::Complete => MAX_POLICIES,
+    };
+    policies
+        .try_reserve_exact(capacity)
+        .map_err(|_| Error::Capacity)?;
+    if coverage == PolicyCoverage::ClientsOnly {
+        append_clients(&mut policies, configuration, profiles, &clock, open)?;
+        return Ok(TlsPolicies { policies, coverage });
+    }
     let mut identities = Vec::new();
     identities
         .try_reserve_exact(profiles.len())
@@ -576,10 +635,6 @@ fn build<R: Read>(
             .map(|(_, value)| value.clone())
             .ok_or(Error::Invalid)
     };
-    let mut policies = Vec::new();
-    policies
-        .try_reserve_exact(MAX_POLICIES)
-        .map_err(|_| Error::Capacity)?;
     let listeners = graph.listeners().map_err(|_| Error::Invalid)?;
     for index in 0..listeners.len() {
         let row = listeners
@@ -716,6 +771,20 @@ fn build<R: Read>(
             TrustStore::from_pem(&ca.0).map_err(|_| Error::Tls)?;
         }
     }
+    append_clients(&mut policies, configuration, profiles, &clock, open)?;
+    if policies.len() > MAX_POLICIES {
+        return Err(Error::Capacity);
+    }
+    Ok(TlsPolicies { policies, coverage })
+}
+
+fn append_clients<R: Read>(
+    policies: &mut Vec<Policy>,
+    configuration: &ResolvedText,
+    profiles: certificate::View<'_, '_>,
+    clock: &Arc<ClockHandle>,
+    open: &mut impl FnMut(MaterialRequest<'_>) -> Result<R, Error>,
+) -> Result<(), Error> {
     let relay = configuration
         .candidate()
         .outbound()
@@ -723,7 +792,7 @@ fn build<R: Read>(
         .relay()
         .map_err(|_| Error::Invalid)?;
     push(
-        &mut policies,
+        policies,
         Policy {
             binding: Binding::Relay {
                 host: owned(relay.host)?,
@@ -734,14 +803,14 @@ fn build<R: Read>(
                 relay.ca_file,
                 MaterialKind::RelayCa,
                 TlsProtocol::Smtp,
-                &clock,
+                clock,
                 open,
             )?,
         },
     )?;
     if let Some(acme) = profiles.acme().map_err(|_| Error::Invalid)? {
         push(
-            &mut policies,
+            policies,
             Policy {
                 binding: Binding::Acme {
                     host: owned(acme.directory.host())?,
@@ -751,16 +820,13 @@ fn build<R: Read>(
                     acme.ca_file,
                     MaterialKind::AcmeCa,
                     TlsProtocol::Http1,
-                    &clock,
+                    clock,
                     open,
                 )?,
             },
         )?;
     }
-    if policies.len() > MAX_POLICIES {
-        return Err(Error::Capacity);
-    }
-    Ok(TlsPolicies { policies })
+    Ok(())
 }
 
 #[cfg(test)]
