@@ -104,6 +104,22 @@ fn crypto_error(error: Error) -> TlsError {
     }
 }
 
+pub(super) fn validate_name(name: &str) -> Result<(), TlsError> {
+    if name.is_empty()
+        || name.len() > 253
+        || !name.is_ascii()
+        || name.ends_with('.')
+        || name.parse::<std::net::IpAddr>().is_ok()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return Err(TlsError::Invalid);
+    }
+    rustls::pki_types::DnsName::try_from(name).map_err(|_| TlsError::Invalid)?;
+    Ok(())
+}
+
 fn names(input: &[&str]) -> Result<Vec<String>, TlsError> {
     if input.is_empty() || input.len() > 32 {
         return Err(TlsError::Invalid);
@@ -113,18 +129,7 @@ fn names(input: &[&str]) -> Result<Vec<String>, TlsError> {
         .try_reserve_exact(input.len())
         .map_err(|_| TlsError::Capacity)?;
     for &name in input {
-        if name.is_empty()
-            || name.len() > 253
-            || !name.is_ascii()
-            || name.ends_with('.')
-            || name.parse::<std::net::IpAddr>().is_ok()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
-        {
-            return Err(TlsError::Invalid);
-        }
-        rustls::pki_types::DnsName::try_from(name).map_err(|_| TlsError::Invalid)?;
+        validate_name(name)?;
         let mut folded = String::new();
         folded
             .try_reserve_exact(name.len())

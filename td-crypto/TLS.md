@@ -2,18 +2,18 @@
 
 ## Status and ownership
 
-This is the M07 contract for the public TLS facade. Outbound ClientConfig
-and the shared ClockHandle are implemented; ServerConfig and sessions remain
-future work. Bounded PEM syntax, P-256 PEM key loading, local ServerIdentity
-admission and TrustStore
-construction are implemented. Admitted identities retain a private TLS
-signer sharing the same owned key and retirement state. The private
-algorithm provider implements the fixed suite/group/signature lists below;
-outbound configuration applies its fixed client policy. DESIGN.md records
-implemented acceptance and output contracts. The existing private TLS
-fixtures qualify selected backend behavior only. Implementations must
-satisfy this contract and the resource/failure qualification in DESIGN.md
-before td-mta enables a listener or an outgoing connection through them.
+This is the M07 contract for the public TLS facade. ClientConfig,
+ServerConfig and the shared ClockHandle are implemented; public sessions
+remain future work. Bounded PEM syntax, P-256 PEM key loading, local
+ServerIdentity admission and TrustStore construction are implemented.
+Admitted identities retain a private TLS signer sharing the same owned
+key and retirement state. The private algorithm provider implements the
+fixed suite/group/signature lists below; configurations apply their
+fixed policies and immutable name routing. DESIGN.md records implemented
+acceptance and output contracts. The existing private TLS fixtures
+qualify selected backend behavior only. Implementations must satisfy
+this contract and the resource/failure qualification in DESIGN.md before
+td-mta enables a listener or an outgoing connection through them.
 
 All public types are td-owned and expose only std or td-crypto types.
 Backend configuration, certificate, verifier, error and connection objects
@@ -167,31 +167,39 @@ Selection policy is explicit and cold-selected by the adapter. HTTPS
 requires matching SNI and refuses missing/unknown SNI. A direct-SMTP
 configuration has one identity and uses it for absent, matching or
 unrecognized well-formed SNI; an unnecessary SNI refusal could drive
-opportunistic senders to retry in plaintext. A gateway-SMTP configuration
-also has one identity and permits absent SNI, but refuses present SNI that
-does not match a configured name. Malformed SNI remains a protocol error.
-These are generic selection modes in the facade, not imported mail-role
-types. SNI is a routing claim, not client authentication. The mail adapter
-also validates HTTP authority against its listener/name policy. Neither SNI
-nor a certificate authorizes JMAP.
+opportunistic senders to retry in plaintext. A gateway-SMTP
+configuration also has one identity and permits absent SNI, but refuses
+present SNI that does not match a configured name. Malformed SNI remains
+a protocol error. The pinned backend converts raw IP-literal SNI to
+absence before lookup. The session facade must validate raw SNI before
+that information is lost, including fragmented and retry hellos; the
+configuration resolver alone cannot enforce this refusal. These are
+generic selection modes in the facade, not imported mail-role types. The
+concrete IdentitySelection modes are RequiredName for Http1,
+DefaultIdentity or MatchPresentName for Smtp. Other combinations are
+refused. SNI is a routing claim, not client authentication. The mail
+adapter also validates HTTP authority against its listener/name policy.
+Neither SNI nor a certificate authorizes JMAP.
 
 Server client authentication is either disabled or mandatory with an
-explicit private trust bundle. There is no optional mode. With mandatory
-authentication, verify chain, dates and client-auth usage before accepting
-Finished; no public root fallback is allowed. No AIA, CRL or OCSP network
-fetch is performed; v1 does not claim online revocation checking. Gateway
-revocation is applied by td-mta's current pin/address policy and
-configuration-generation rules. Client configurations use either the pinned
-public root set or one explicit bundle that replaces it completely.
-Invalid/empty explicit trust is an error. Initial explicit stores admit the
-CA-only, unconstrained-anchor subset specified in DESIGN.md; they refuse
-anchor EKU, path length and name constraints rather than silently discarding
-them. Public roots retain their upstream anchor constraints. Verify server
-chain, dates, usage
-and the supplied DNS name; send that name as SNI. V1 outbound mail/ACME has
-no client identity. The facade need not expose client-certificate signing
-until a real consumer requires it; test-only mutual peers are not public API
-consumers.
+explicit private trust bundle. There is no optional mode.
+CertificateRequest omits CA-subject hints to bound its length; the
+complete configured anchor set still verifies every client. With
+mandatory authentication, verify chain, dates and client-auth usage
+before accepting Finished; no public root fallback is allowed. No AIA,
+CRL or OCSP network fetch is performed; v1 does not claim online
+revocation checking. Gateway revocation is applied by td-mta's current
+pin/address policy and configuration-generation rules. Client
+configurations use either the pinned public root set or one explicit
+bundle that replaces it completely. Invalid/empty explicit trust is an
+error. Initial explicit stores admit the CA-only, unconstrained-anchor
+subset specified in DESIGN.md; they refuse anchor EKU, path length and
+name constraints rather than silently discarding them. Public roots
+retain their upstream anchor constraints. Verify server chain, dates,
+usage and the supplied DNS name; send that name as SNI. V1 outbound
+mail/ACME has no client identity. The facade need not expose
+client-certificate signing until a real consumer requires it; test-only
+mutual peers are not public API consumers.
 
 HTTP/1.1 clients offer only `http/1.1` ALPN, and HTTPS servers select only
 it; absence is accepted for HTTP/1.1 compatibility. Refuse a negotiated
@@ -212,8 +220,13 @@ Missing/unrepresentable time fails Clock, including on an open connection.
 td-mta owns monotonic deadlines and clock-health policy. Check local server
 material at identity selection and handshake completion, when the selected
 identity is known; do not let an expired unrelated SNI identity block
-another valid identity. Single-identity configurations can also check at
-session creation. Peer verification checks peer dates. Configuration
+another valid identity within an already admitted configuration. Cold
+configuration construction still requires every included identity to be
+valid; a candidate with expired or retired material is refused atomically.
+Replace or explicitly remove that material before publication; do not silently
+omit configured identities. An existing configuration can continue serving
+its other valid identities while a candidate is refused. Single-identity
+configurations can also check at session creation. Peer verification checks peer dates. Configuration
 construction is not a permanent validity grant. Established policy and
 publication/revocation remain with td-mta.
 

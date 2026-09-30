@@ -596,3 +596,33 @@ ceilings before path work. Backend parsing occurs earlier and may allocate;
 these are not whole-session memory bounds. Constructors, root copies, clocks,
 verifiers and native connections remain subject to M07e allocation/stack/RSS
 qualification. No listener or live network service is used.
+
+## Inbound TLS configuration qualification
+
+The portable runner constructs ServerConfig through admitted owned identities,
+private trust and the shared clock. Fixtures pin accepted protocol/selection
+combinations, identity/name limits (including 16 identities and 512 names),
+global duplicate refusal, public-root refusal for client authentication and
+fixed disabled backend features. Local TLS 1.2/1.3 peers prove distinct
+certificate selection, required/default/match-present name policy, HTTP ALPN
+absence/selection and full repeated handshakes against a resumption-enabled
+client. A resumption-enabled server first seeds real client state and proves
+a resumed baseline; a captured nonempty TLS 1.2 session ID or TLS 1.3 PSK
+extension then reaches the td configuration and yields a fresh full handshake.
+HTTP rejects an h2-only offer; SMTP selects no ALPN even when offered protocols.
+No backend key reload or external network endpoint is used.
+
+Mandatory client authentication accepts a valid private client and refuses
+missing/foreign/expired/wrong-purpose/bad-signature certificates and excessive
+certificate count/size. Supplied time controls cold local material and peer
+verification. A configured CA bundle with more than 65535 bytes of encoded
+subject hints still sends an empty hint list under both versions and still
+requires a client certificate; omitted hints do not omit trust verification.
+
+A raw ClientHello mutation pins the backend's conversion of an IP-literal SNI
+into absence before resolver lookup. This is a known integration hazard, not
+an accepted facade input: M07c must validate raw SNI before that loss, check
+selected material and shared clock/key state before signing and after Finished,
+and enforce the per-connection time-failure observation specified in TLS.md.
+The configuration fixtures do not supply public session progress, gateway
+leaf-pin/address policy, listener activation or complete resource bounds.

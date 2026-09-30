@@ -634,10 +634,11 @@ do not complete M07 or enable service.
 
 The future TLS contract is specified in td-crypto/TLS.md, including explicit
 algorithm sets, local P-256 PEM identity admission, trust/SNI/time policy,
-bounded record progress and failure/close behavior. Concrete compiling TLS
-interfaces and their qualification are still pending. Implement direct
-Crypto/Entropy operations and incoming/outgoing TLS
-inside td-crypto. Rustls provider/configuration/verifier/key types never leave
+bounded record progress and failure/close behavior. Material admission and
+immutable client/server configuration interfaces are implemented; public
+session progress and its qualification remain pending. Direct Crypto/Entropy
+operations are implemented inside td-crypto; incoming/outgoing session
+operations follow. Rustls provider/configuration/verifier/key types never leave
 that crate. Implement the conformance, explicit-provider confinement, algorithm
 baseline, key compatibility and native allocation/failure qualification in
 `td-crypto/DESIGN.md`, retaining its independent fixtures for F04.
@@ -689,15 +690,18 @@ Implement the remaining work as independently reviewable increments:
   - **M07b3b — local signing bridge:** implemented private retained-identity
     signing through the existing owned key lifecycle. Portable fixtures cover
     canonical DER, hash-once signing, shared retirement and local handshakes.
-  - **M07b3c — configuration handles:** implement immutable role selection,
-    bounded identity routing, ALPN, supplied clock and resumption refusal.
+  - **M07b3c — configuration handles:** implemented immutable role selection,
+    bounded identity routing, ALPN, supplied clock and disabled resumption.
     - **M07b3c1 — outbound configuration:** implemented owned ClientConfig,
       fixed HTTP/SMTP protocol selection, bounded verifier and shared injected
       clock with callback-unwind retirement. Portable local peers qualify
       independent client resumption refusal, trust/name/ALPN policy and time
       failure through incoming post-handshake tickets. Sessions remain separate.
-    - **M07b3c2 — server configuration:** implement immutable role selection,
-      bounded identity routing and private mandatory client authentication.
+    - **M07b3c2 — server configuration:** implemented immutable protocol/name
+      selection, bounded shared identities and mandatory private-client
+      verification. Portable peers qualify routing, disabled resumption and
+      mutual authentication. M07c still enforces raw SNI, selected-material
+      lifetime and complete clock/error fences before public session success.
 - **M07c — opaque sessions:** implement and pin concrete public signatures
   for TLS.md's record/plaintext/output/status/close operations. Confinement
   tests cover the complete resolved public API. Local peers exercise one-byte

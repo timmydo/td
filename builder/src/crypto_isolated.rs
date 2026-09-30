@@ -710,6 +710,15 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "tls_client::tests::client_configuration_clock_errors_reach_handshake_and_open_tickets", false),
         ("td-crypto-smoke", "tls_client::tests::client_verifier_checks_chain_bounds_before_path_work", false),
         ("td-crypto-smoke", "tls_client::tests::tls12_session_save_can_ignore_transient_clock_failure", false),
+        ("td-crypto-smoke", "tls_server::tests::server_configuration_bounds_bindings_roles_and_private_trust", false),
+        ("td-crypto-smoke", "tls_server::tests::server_configuration_routes_names_and_refuses_resumption", false),
+        ("td-crypto-smoke", "tls_server::tests::server_configuration_pins_disabled_backend_features", false),
+        ("td-crypto-smoke", "tls_server::tests::server_configuration_requires_private_client_certificates", false),
+        ("td-crypto-smoke", "tls_server::tests::server_configuration_checks_cold_material_and_supplied_verifier_time", false),
+        ("td-crypto-smoke", "tls_server::tests::backend_acceptor_discards_ip_literal_sni_before_routing", false),
+        ("td-crypto-smoke", "tls_server::tests::server_configuration_selects_distinct_owned_identities", false),
+        ("td-crypto-smoke", "tls_server::tests::server_configuration_omits_oversized_ca_hint_lists", false),
+        ("td-crypto-smoke", "tls_server::tests::server_configuration_refuses_offered_resumption", false),
         ("td-crypto-smoke", "tls_policy::tests::exact_tls_algorithm_inventory", false),
         ("td-crypto-smoke", "tls_policy::tests::handshake_mapping_drift_is_refused", false),
         ("td-crypto-smoke", "tls_policy::tests::excluded_certificate_signature_has_a_valid_baseline", false),
@@ -771,7 +780,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             println!("portable runtime: {prefix}{bytes}");
         }
     }
-    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
+    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
     Ok(())
 }
 

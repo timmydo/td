@@ -95,7 +95,7 @@ impl std::fmt::Debug for BoundedVerifier {
         f.write_str("TlsServerVerifier(<redacted>)")
     }
 }
-fn chain_bounds(
+pub(super) fn chain_bounds(
     leaf: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
 ) -> Result<(), rustls::Error> {

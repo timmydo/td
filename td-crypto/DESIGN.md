@@ -14,8 +14,8 @@ P-256 PEM key loader. M07b2a adds cold admission of an owned local server
 identity. M07b2b adds explicit private CA bundles and the pinned public
 server root set. M07b3a supplies the explicit private TLS algorithm
 provider. M07b3b retains owned keys for TLS signing; M07b3c1 adds the
-shared clock and outbound ClientConfig. Server configurations and sessions
-remain unimplemented.
+shared clock and outbound ClientConfig. M07b3c2 adds ServerConfig and
+immutable identity routing. Public sessions remain unimplemented.
 Test-only backend qualification covers explicit provider construction,
 SHA-256, local TLS 1.2/1.3 data exchange, certificate verification and
 malformed/tampered-record refusals in the isolated static executable. Mocks
@@ -706,6 +706,83 @@ to a resumption-enabled remote server remain full handshakes in both versions.
 No server role/SNI routing, mandatory client authentication, public session,
 mail adapter or service listener is supplied by this increment. Those layers
 must enforce their remaining TLS.md contracts before service admission.
+
+### Inbound configuration and identity routing
+
+ServerConfig constructs one immutable backend policy shared by up to sixteen
+admitted ServerIdentity handles. It retains those same identities and their
+owned signing keys; no private key is exported or reparsed. The native
+certificate resolver and the td configuration share one immutable routing
+object. It never references its parent configuration, so there is no cycle.
+One policy avoids duplicating cipher/trust/verifier state for each identity.
+
+TlsProtocol and IdentitySelection admit three combinations: Http1 with
+RequiredName, Smtp with DefaultIdentity, and Smtp with MatchPresentName.
+HTTP requires matching SNI. Both SMTP policies require exactly one identity;
+DefaultIdentity accepts absent or unknown well-formed SNI, whereas
+MatchPresentName accepts absent SNI but refuses present unknown names. These
+are TLS selection policies, not mail roles or authorization. The constructor
+refuses every other combination, empty/over-limit identity lists and duplicate
+bindings across identities. At most 512 exact names are retained in the already
+admitted identities; the routing table copies only their Arc handles. Pure
+lookup scans at most 512 names with ASCII-insensitive comparison and allocates
+nothing. The constructor rechecks all identities' time and key health once.
+A cold candidate containing any invalid material is refused atomically. TLS.md
+distinguishes that publication rule from continuing to serve other valid
+identities in an already admitted configuration.
+
+The resolver repeats the same pure lookup used by the future session facade's
+typed preselection. It does not call the clock or grant ongoing validity.
+M07c must inspect the initial ClientHello, select an identity, check that
+identity's dates/key against the shared clock before backend signing, retain
+that selection and recheck it before publishing Finished evidence. An unrelated
+expired identity must not prevent a valid identity from serving. The native
+configuration alone does not enforce those session boundaries.
+
+The pinned backend intentionally treats an IP literal in raw SNI as absent.
+Acceptor::client_hello therefore loses information needed by the facade's
+malformed-SNI refusal policy. A fixture replaces the native client's DNS bytes
+with an equal-length IP literal and proves that loss. This is a backend hazard,
+not admissible facade behavior. The same accepted hello selects the default
+identity in both SMTP configurations and is refused by the HTTP configuration.
+It does not complete a handshake: the mutation changes the transcript. M07c
+must perform bounded raw ClientHello/SNI validation before that information is discarded, including fragmented and
+retry hellos. The pure routing helper rejects malformed names it receives,
+but cannot reject a raw name already converted to absence. No public session
+or listener bypasses this requirement in the configuration increment.
+
+Client authentication is disabled with None or mandatory with Some private
+TrustStore. Public-root-marked stores are refused. The verifier uses exactly
+the admitted anchors and the explicit classical provider, enforces the same
+eight-certificate/16 KiB each/64 KiB aggregate limits before path work, and
+checks client-auth usage, time and handshake signatures. It has no optional
+or permissive verification mode. As for the outbound verifier, native message
+parsing precedes that callback and must be included in session memory bounds.
+
+CertificateRequest carries no CA-subject hints. Clear the backend hint list
+explicitly: a maximum-size configured bundle can otherwise yield an oversized
+16-bit hint vector. An empty list permits the peer to choose a certificate;
+mandatory path verification still applies every configured trust restriction.
+This avoids transmitting a list too large for the handshake length field.
+The initial bounded builder copy still belongs in M07e accounting. No gateway
+leaf pin or socket-address authorization is performed by this crate.
+
+Set the explicit TLS versions/provider, server cipher-order preference, TLS
+1.2 EMS and 16384-byte plaintext fragment limit. Disable session storage,
+stateless tickets, initial and requested TLS 1.3 tickets, early and half-RTT
+data, key logging, secret extraction, certificate compression lists/cache.
+Http1 selects only http/1.1, accepting absence; Smtp selects no ALPN. Native
+configuration/verifier/ticket/routing types remain private and their Debug
+output discloses no keys, certificate bytes, names or callback state.
+
+Tests cover cold roles/counts/duplicate bindings, 512-name routing, selection
+between distinct owned keys, missing/unknown SNI, HTTP ALPN absence/selection,
+full repeated TLS 1.2/1.3 handshakes against a resumption-enabled client,
+mandatory-client proof and typed certificate/count/size refusals, supplied
+verification time and the raw-IP SNI hazard. Backend connections in these
+fixtures do not substitute for public session enforcement. Constructors and
+provider work allocate within the still-unqualified TLS allowance; no service
+is enabled until M07c/M07d/M07e complete their remaining contracts.
 
 ### Mutual TLS backend qualification
 
