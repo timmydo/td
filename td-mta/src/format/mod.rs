@@ -1,4 +1,4 @@
-//! Format-v1 scalar/key/row and fixed-container codecs.
+//! Format-v1 scalar/key/row, fixed-container and table-record codecs.
 //! FORMAT.md owns the layout; selected-store validation and persistence remain M05.
 use std::fmt;
 
@@ -6,6 +6,7 @@ pub mod container;
 pub mod key;
 pub mod row;
 pub mod scalar;
+pub mod table;
 
 pub const CONTAINER_VERSION: u16 = 1;
 pub const SCHEMA_VERSION: u16 = 1;

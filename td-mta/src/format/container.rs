@@ -41,12 +41,11 @@ fn hash(crypto: &impl Crypto, bytes: &[u8]) -> Result<[u8; 32], Error> {
     Ok(digest.finish()?)
 }
 
-fn read<'a>(
+pub(super) fn checked_preimage<'a>(
     crypto: &impl Crypto,
     bytes: &'a [u8],
     length: usize,
-    magic: &[u8; 8],
-) -> Result<Reader<'a>, Error> {
+) -> Result<&'a [u8], Error> {
     match bytes.len().cmp(&length) {
         std::cmp::Ordering::Less => return Err(FormatError::Truncated.into()),
         std::cmp::Ordering::Greater => return Err(FormatError::TrailingBytes.into()),
@@ -58,7 +57,16 @@ fn read<'a>(
     if !crypto.equal_digest(&hash(crypto, preimage)?, &checksum) {
         return Err(Error::Checksum);
     }
-    let mut reader = Reader::new(preimage);
+    Ok(preimage)
+}
+
+fn read<'a>(
+    crypto: &impl Crypto,
+    bytes: &'a [u8],
+    length: usize,
+    magic: &[u8; 8],
+) -> Result<Reader<'a>, Error> {
+    let mut reader = Reader::new(checked_preimage(crypto, bytes, length)?);
     if reader.fixed::<8>()? != *magic
         || reader.u16()? != super::CONTAINER_VERSION
         || reader.u16()? != super::SCHEMA_VERSION
@@ -76,7 +84,11 @@ fn prefix(writer: &mut Writer<'_>, magic: &[u8; 8]) -> Result<(), FormatError> {
     writer.u32(0)
 }
 
-fn publish(crypto: &impl Crypto, scratch: &mut [u8], output: &mut [u8]) -> Result<usize, Error> {
+pub(super) fn publish(
+    crypto: &impl Crypto,
+    scratch: &mut [u8],
+    output: &mut [u8],
+) -> Result<usize, Error> {
     let length = scratch.len();
     let end = length.checked_sub(32).ok_or(FormatError::InvalidValue)?;
     let (preimage, checksum) = scratch
@@ -91,7 +103,7 @@ fn publish(crypto: &impl Crypto, scratch: &mut [u8], output: &mut [u8]) -> Resul
     Ok(length)
 }
 
-fn capacity(output: &[u8], length: usize) -> Result<(), FormatError> {
+pub(super) fn capacity(output: &[u8], length: usize) -> Result<(), FormatError> {
     output
         .get(..length)
         .map(|_| ())

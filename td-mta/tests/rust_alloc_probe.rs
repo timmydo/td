@@ -73,6 +73,7 @@ fn hot_paths() {
         digest.update(black_box(&data)).unwrap();
         black_box(digest.finish().unwrap());
         store_containers();
+        store_table_records();
         let mut line = td_mta::smtp_wire::LineReader::new(&mut scratch).unwrap();
         assert!(!line.feed(black_box(b"EHLO example")).unwrap().complete);
         assert!(line.feed(black_box(b".test\r\n")).unwrap().complete);
@@ -143,6 +144,65 @@ fn store_containers() {
     assert_eq!(
         JournalHeader::decode(&crypto, bytes.get(..n).unwrap()),
         Err(ContainerError::Checksum)
+    );
+}
+
+fn store_table_records() {
+    use td_mta::{
+        format::{
+            container::Error,
+            row::{BlobKind, BlobRow, Row},
+            table::{Record, TableHeader},
+            Error as FormatError, Sequence, Table,
+        },
+        ids::{AccountId, StoreEpoch},
+    };
+    let crypto = td_crypto::Provider;
+    let through = Sequence::from_u64(1);
+    let header = TableHeader {
+        table: Table::Blobs,
+        account: AccountId::from_bytes([0x33; 16]),
+        epoch: StoreEpoch::from_bytes([0x22; 16]),
+        generation: 2,
+        through,
+        record_count: 1,
+        payload_bytes: 113,
+    };
+    let mut bytes = [0; 120];
+    let n = header.encode(&crypto, black_box(&mut bytes)).unwrap();
+    assert_eq!(
+        TableHeader::decode(&crypto, bytes.get(..n).unwrap()),
+        Ok(header)
+    );
+    let mut value = [0; 49];
+    let row = Row::Blob(BlobRow {
+        kind: BlobKind::Message,
+        length: 3,
+        digest: [0; 32],
+        created_at: 0,
+    });
+    assert_eq!(row.encode(&mut value), Ok(value.len()));
+    let key = [0x44; 16];
+    let record = Record::new(Table::Blobs, through, &key, &value).unwrap();
+    let n = record
+        .encode(&crypto, through, black_box(&mut bytes))
+        .unwrap();
+    assert_eq!(
+        Record::decode(&crypto, Table::Blobs, through, bytes.get(..n).unwrap()).unwrap(),
+        record
+    );
+    assert_eq!(
+        record.encode(&crypto, through, bytes.get_mut(..n - 1).unwrap()),
+        Err(Error::Format(FormatError::OutputFull))
+    );
+    assert_eq!(
+        Record::decode(&crypto, Table::Blobs, through, bytes.get(..n - 1).unwrap()),
+        Err(Error::Format(FormatError::Truncated))
+    );
+    *bytes.get_mut(n - 1).unwrap() ^= 1;
+    assert_eq!(
+        Record::decode(&crypto, Table::Blobs, through, bytes.get(..n).unwrap()),
+        Err(Error::Checksum)
     );
 }
 

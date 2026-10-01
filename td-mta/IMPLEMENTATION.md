@@ -576,6 +576,18 @@ service activation. Each part lands independently:
   codecs, full row validation, digest coverage and cross-file identity/length
   bindings. Stream tables; keep only bounded manifest descriptors. Exercise
   duplicate/out-of-order keys, mismatched descriptors and selected history.
+  - **M05a2a — table header and record codecs:** exact fixed table headers and
+    individually checksummed borrowed records. Bound prefix lengths before
+    hashing, validate full local key/row grammar and checkpoint sequence, and
+    stage digest work before changing output. Test literal empty/populated
+    tables, malformed/rehashed fields, arithmetic exhaustion, every truncated
+    record prefix and failures in all three streaming digest updates. These
+    codecs do not verify a whole table or select any persistent state.
+  - **M05a2b — table validation and manifests:** bounded sorted-record traversal,
+    exact count/extent and whole-file digest, manifest descriptor codecs and
+    cross-file account/epoch/generation/sequence/hash checks. Carry failure
+    state through streaming completion; never accept a valid header as proof
+    that the table payload is complete. Persistence consumers wait for this.
 - **M05a3 — transaction frames:** exact bounded operation/header/footer codecs
   and validated sequential frame iteration. Validate header digest before using
   lengths; distinguish a short physical tail from full-length corrupt data.

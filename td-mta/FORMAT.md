@@ -3,8 +3,9 @@
 This is the normative byte-layout companion to [STORAGE.md](STORAGE.md).
 M02a and M02b implement allocation-free scalar, primary-key and row codecs in
 `src/format/`, with literal row/container fixtures. M05a1 adds fixed FORMAT,
-CURRENT and journal-header integrity codecs. Remaining containers, cross-file
-validation, publication and recovery are unimplemented. M02c freezes semantic
+CURRENT and journal-header integrity codecs. M05a2a adds table headers and
+individual record envelopes. Manifest/whole-table validation, cross-file
+bindings, publication and recovery are unimplemented. M02c freezes semantic
 APIs. Production persistence waits for those contracts
 and the M05 store implementation. Nothing here advertises a usable store.
 
@@ -190,6 +191,30 @@ and then must satisfy its table's stricter key grammar; value length is
 0..65536 subject to the row schema. Last-change is 1..C. An empty initial
 table has C=0, count=0 and payload length=0. Duplicate/out-of-order keys fail
 verification. The 48-byte record overhead is independent of its row kind.
+
+`format::table` implements `TableHeader` and a borrowed `Record`. The header
+checks its exact extent/digest, tag/schema/flags, nonzero generation, empty
+table consistency and checked file-size arithmetic. Generic record bounds
+(64..66608 bytes each) reject impossible count/payload combinations without
+allocating or iterating the count. They do not prove that actual records exist,
+match the count, are sorted, or fit their table-specific grammar.
+
+Record prefix lengths are untrusted until the whole checksum passes. They may
+only establish the bounded input extent: key 16..1024, value 0..65536 and checked
+48-byte overhead. Decoding requires that exact extent, checks the digest, then
+uses `row::decode_record` and requires `1 <= last_change <= through`. A record
+borrows the original key/value bytes and exposes the corresponding typed
+`ports::Record`; no row-sized copy or allocation is made. Its constructor checks
+local row/key rules and a nonzero sequence; encode additionally checks the
+checkpoint sequence supplied by the caller. Live references remain separate.
+
+Encoding a header uses 112 local bytes. Record encoding hashes a 16-byte prefix,
+borrowed key and borrowed value before writing anything to caller storage.
+Returned errors leave output unchanged and a successful encode preserves its
+suffix. SHA-256 factory/update/finish failures remain distinct from encoding and
+checksum errors. These are individual codecs: whole-table extent/count/order,
+manifest hashes and selected-store binding validation remain subsequent M05
+work. No decoder treats immutable-table truncation as a recoverable journal tail.
 
 ### Journal header: 96 bytes
 
@@ -449,9 +474,12 @@ existing container, cross-file binding, blob and import snapshot fixtures
 through the real td-crypto facade, with fragmented updates and changed-byte
 comparisons. These host and portable tests qualify literal hash coverage;
 they do not implement production container validation or crash durability.
-M05a1's `tests/format_containers.rs` uses five existing literal artifacts in both
-directions, every truncated prefix and changed byte, extra bytes and rehashed
-invalid fields. Provider construction/update/finish failures preserve output.
+`tests/format_containers.rs` covers M05a1's five fixed-container artifacts and
+M05a2a's initial table headers, later empty/populated headers and blob record.
+It checks both directions, every truncated prefix, one bit flip per byte
+position, extra bytes and rehashed invalid fields. Provider construction, each
+update and finish failures preserve output. Earlier record sequences and exact
+generic header bounds remain accepted.
 M02c supplies state, queue and API meanings. Remaining M05 work implements
 the other exact container encoders/decoders, validates
 cross-file bindings and exercises fault I/O. The M07a2 tests compare against
