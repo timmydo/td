@@ -1,7 +1,7 @@
 //! Bounded numeric entry for logical lines and per-document fill columns.
 
-use crate::model::{Command, Editor, RevisionPoint, Selection, TabId};
 use crate::{Error, Result};
+use td_ui::editor_model::{Command, Editor, RevisionPoint, Selection, TabId};
 
 pub(crate) const DIGITS: usize = 20;
 
@@ -60,14 +60,14 @@ impl Prompt {
 
     pub fn target(&self, editor: &Editor) -> Result<(TabId, u64)> {
         editor.check_revision(&self.point)?;
-        let doc = editor.document(self.point.tab)?;
-        if editor.active() != Some(self.point.tab)
+        let doc = editor.document(self.point.tab())?;
+        if editor.active() != Some(self.point.tab())
             || doc.selection() != self.selection
             || (self.kind == Kind::FillColumn && doc.fill_column() != self.column)
         {
             return Err(Error::StaleRevision);
         }
-        Ok((self.point.tab, self.point.revision))
+        Ok((self.point.tab(), self.point.revision()))
     }
 
     pub fn entry(&self) -> (&str, bool) {
@@ -142,8 +142,8 @@ impl Prompt {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::model::Command;
-    use crate::ui::{Controller, Event};
+    use td_ui::editor::{Controller, Event};
+    use td_ui::editor_model::Command;
 
     #[test]
     fn numeric_fill_validation_matches_model_admission_at_the_bounds() {

@@ -1,8 +1,8 @@
 //! Literal search history and explicit end-before-wrap admission.
 
-use crate::model::{Command, Editor, RevisionPoint, Selection, TabId};
-use crate::ui::{Controller, Event};
 use crate::{Error, Result};
+use td_ui::editor::{Controller, Event};
+use td_ui::editor_model::{Command, Editor, RevisionPoint, Selection, TabId};
 
 pub(crate) const QUERY_BYTES: usize = 4096;
 
@@ -31,9 +31,9 @@ impl Intent {
 
     fn matches_target(&self, editor: &Editor) -> bool {
         editor.check_revision(&self.point).is_ok()
-            && editor.active() == Some(self.point.tab)
+            && editor.active() == Some(self.point.tab())
             && editor
-                .document(self.point.tab)
+                .document(self.point.tab())
                 .is_ok_and(|doc| doc.selection() == self.selection)
     }
 }
@@ -68,7 +68,7 @@ impl Prompt {
         if !self.intent.matches_target(editor) {
             return Err(Error::StaleRevision);
         }
-        Ok((self.intent.point.tab, self.intent.point.revision))
+        Ok((self.intent.point.tab(), self.intent.point.revision()))
     }
 
     pub fn notice(&self) -> String {

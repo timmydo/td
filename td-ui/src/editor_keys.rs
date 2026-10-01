@@ -1,8 +1,8 @@
 //! Logical keys after layout translation. No evdev positions or XKB masks
 //! enter this layer. UI requests are explicit and are not successful edits.
 
-use crate::model::{Command, Motion};
-use crate::{Error, Result};
+use crate::editor_error::{Error, Result};
+use crate::editor_model::{Command, Motion};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Profile {

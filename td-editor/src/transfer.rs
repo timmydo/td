@@ -10,12 +10,12 @@
 //! UNSAFE.md §19; `Incoming` stays here because it admits the paste into
 //! the editor's `Paste` as the bytes arrive.
 
-use crate::clipboard::Paste;
-use crate::model::{Editor, Selection, TabId};
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
+use td_ui::editor_clipboard::Paste;
+use td_ui::editor_model::{Editor, Selection, TabId};
 
 pub use td_ui::clipboard::Outgoing;
 
@@ -147,9 +147,9 @@ impl Incoming {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::ui::{Controller, Event};
     use std::io::Write;
     use std::sync::Arc;
+    use td_ui::editor::{Controller, Event};
 
     fn ui() -> Controller {
         let mut ui = Controller::default();
@@ -192,7 +192,7 @@ mod tests {
         ui.dispatch(Event::Edit {
             tab: 1,
             revision: 0,
-            command: crate::model::Command::Select(Selection {
+            command: td_ui::editor_model::Command::Select(Selection {
                 anchor: 1,
                 caret: 1,
             }),
@@ -210,7 +210,7 @@ mod tests {
         let (mut incoming, peer) = Incoming::begin(ui.editor(), 1, 0, 0).unwrap();
         let mut outgoing = Outgoing::begin(
             OwnedFd::from(peer),
-            Arc::from("x".repeat(crate::clipboard::MAX_BYTES)),
+            Arc::from("x".repeat(td_ui::editor_clipboard::MAX_BYTES)),
             0,
         )
         .unwrap();
@@ -228,12 +228,12 @@ mod tests {
                 ui.dispatch(Event::Paste(incoming.finish().unwrap()))
                     .unwrap();
                 let text = ui.editor().document(1).unwrap().text();
-                assert_eq!(text.len(), crate::clipboard::MAX_BYTES + 4);
+                assert_eq!(text.len(), td_ui::editor_clipboard::MAX_BYTES + 4);
                 assert!(text
                     .bytes()
-                    .take(crate::clipboard::MAX_BYTES)
+                    .take(td_ui::editor_clipboard::MAX_BYTES)
                     .all(|byte| byte == b'x'));
-                assert_eq!(text.get(crate::clipboard::MAX_BYTES..), Some("keep"));
+                assert_eq!(text.get(td_ui::editor_clipboard::MAX_BYTES..), Some("keep"));
                 return;
             }
         }
@@ -242,7 +242,10 @@ mod tests {
 
     #[test]
     fn the_writer_is_the_toolkits_under_the_same_ceiling() {
-        assert_eq!(crate::clipboard::MAX_BYTES, td_ui::clipboard::MAX_BYTES);
+        assert_eq!(
+            td_ui::editor_clipboard::MAX_BYTES,
+            td_ui::clipboard::MAX_BYTES
+        );
     }
 
     #[test]
@@ -281,7 +284,7 @@ mod tests {
     #[test]
     fn oversized_or_malformed_input_never_changes_the_document() {
         for text in [
-            vec![b'x'; crate::clipboard::MAX_BYTES + 1],
+            vec![b'x'; td_ui::editor_clipboard::MAX_BYTES + 1],
             vec![0xc3],
             vec![0],
         ] {

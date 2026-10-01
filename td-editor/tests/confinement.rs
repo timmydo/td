@@ -40,24 +40,18 @@ fn source_inventory_and_allowances_are_closed() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(!root.join("build.rs").exists());
     let expected: BTreeSet<_> = [
-        "clipboard.rs",
         "command.rs",
         "control.rs",
         "control_frame.rs",
         "control_jobs.rs",
-        "dialog.rs",
         "directory.rs",
         "files.rs",
-        "fill.rs",
-        "keys.rs",
-        "layout.rs",
         "lib.rs",
         "main.rs",
         "menu.rs",
-        "model.rs",
         "number.rs",
         "path_completion.rs",
-        "render.rs",
+        "preview.rs",
         "replace.rs",
         "replay.rs",
         "search.rs",
@@ -65,9 +59,7 @@ fn source_inventory_and_allowances_are_closed() {
         "spelling.rs",
         "sys.rs",
         "test_file_barrier.rs",
-        "text.rs",
         "transfer.rs",
-        "ui.rs",
         "wayland.rs",
     ]
     .into_iter()
@@ -121,47 +113,54 @@ fn source_inventory_and_allowances_are_closed() {
                 );
             }
         }
-        // The crate reaches the toolkit in a closed set of files: the input
-        // adapter, which also paints the minibuffer through `td_ui::chrome`
-        // and publishes the control socket and its worker; `layout`, which
-        // re-exports the shared cell constants; the crate root, which
-        // re-exports the shared font and wire modules and maps the raster's
-        // and the transport's errors; the scene, controller and menu, which
-        // compose `td_ui::raster`, the scene and menu also `td_ui::chrome`;
-        // `control`, whose requests ride the toolkit's framing and envelope
-        // and specialise its worker; `replay`, on the toolkit's frame runner;
-        // `main`, which prints `td_ui::notices`; and `transfer`, which
-        // re-exports the toolkit's clipboard writer beside its own
-        // receiver.
+        // The document core is td-ui's (`td_ui::editor*`), so any module
+        // may name it. The rest of the toolkit is reached in a closed set
+        // of files: the input adapter, which also paints the minibuffer
+        // through `td_ui::chrome` and publishes the control socket and its
+        // worker; the crate root, which re-exports the shared font and wire
+        // modules; the menu, which composes `td_ui::chrome`; `control`,
+        // whose requests ride the toolkit's framing and envelope and
+        // specialise its worker; `replay`, on the toolkit's frame runner;
+        // `main`, which prints `td_ui::notices`; `preview`, which paints
+        // through `td_ui::raster`; and `transfer`, which re-exports the
+        // toolkit's clipboard writer beside its own receiver. A grouped
+        // `td_ui::{` counts as the rest of the toolkit, as does an alias.
+        let toolkit = identifier_count(&text, "td_ui") - text.matches("td_ui::editor").count();
         assert!(
-            identifier_count(&text, "td_ui") == 0
+            toolkit == 0
                 || matches!(
                     name.as_str(),
                     "wayland.rs"
-                        | "layout.rs"
                         | "lib.rs"
-                        | "render.rs"
-                        | "ui.rs"
                         | "menu.rs"
                         | "main.rs"
                         | "control.rs"
                         | "replay.rs"
+                        | "preview.rs"
                         | "transfer.rs"
                 ),
             "toolkit access outside its roster: {name}"
         );
-        // Naming the toolkit is one thing; re-exporting it is the crate
-        // root's (font, wire), `layout`'s (the cell constants),
-        // `control`'s (the framing and codecs its tests and replay share,
-        // public and crate-private) and `transfer`'s (the clipboard
-        // writer) alone, so every other file names `td_ui::` paths
-        // directly.
+        // The core's test support moves the staleness counter; only a
+        // file's tail `mod tests` may call it.
+        let production = text
+            .rsplit_once("\nmod tests {")
+            .map_or(text.as_str(), |(code, _)| code);
+        assert_eq!(
+            production.matches(".generation_for_test(").count(),
+            0,
+            "test support in production: {name}"
+        );
+        // Re-exporting the toolkit is the crate root's (the
+        // core's error, font, wire), `control`'s (the framing and codecs its
+        // tests and replay share, public and crate-private) and
+        // `transfer`'s (the clipboard writer) alone, so every other file
+        // names `td_ui::` paths directly.
         let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
             compact.matches("pubusetd_ui").count() + compact.matches(")usetd_ui").count(),
             match name.as_str() {
-                "lib.rs" => 2,
-                "layout.rs" => 1,
+                "lib.rs" => 3,
                 "control.rs" => 2,
                 "transfer.rs" => 1,
                 _ => 0,
@@ -197,6 +196,10 @@ fn source_inventory_and_allowances_are_closed() {
             assert!(
                 compact.contains("pub(crate)usetd_ui::wire;"),
                 "wire through td-ui"
+            );
+            assert!(
+                compact.contains("pubusetd_ui::editor_error::{Error,Result};"),
+                "the core's refusals through td-ui"
             );
         }
         assert_eq!(
@@ -336,6 +339,7 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     );
     assert_eq!(production.matches(".unconfigure(").count(), 0);
     assert_eq!(production.matches(".input_mut(").count(), 0);
+    assert_eq!(production.matches(".generation_for_test(").count(), 0);
     assert_eq!(
         production
             .matches("self.client.handle(&message, self.clock)?")
@@ -607,23 +611,8 @@ fn remote_wheel_reuses_native_scroll_after_all_input_guards() {
 
 #[test]
 fn only_native_caret_ticks_bypass_the_input_context_fence() {
-    let ui = include_str!("../src/ui.rs");
-    assert!(ui.contains(concat!(
-        "Event::Tick(now) => {\n",
-        "                if now < self.clock {\n",
-        "                    return Err(Error::InvalidArgument);\n",
-        "                }\n",
-        "                let visible = self.focused && ((now - self.blink_start) / 500).is_multiple_of(2);\n",
-        "                self.clock = now;\n",
-        "                let changed = visible != self.caret_visible;\n",
-        "                self.caret_visible = visible;\n",
-        "                Ok(if changed {\n",
-        "                    Outcome::Changed\n",
-        "                } else {\n",
-        "                    Outcome::Ignored\n",
-        "                })\n",
-        "            }"
-    )));
+    // The controller's half, a tick that only moves the clock and the
+    // caret's visibility, is pinned in td-ui's confinement test.
     let source = include_str!("../src/wayland.rs");
     let production = source.split("#[cfg(test)]").next().unwrap();
     assert_eq!(
@@ -914,7 +903,7 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     assert!(
         handoff.find("check_revision(&point)").unwrap()
             < handoff
-                .find(".save(ui, point.tab, point.revision, path)")
+                .find(".save(ui, point.tab(), point.revision(), path)")
                 .unwrap()
     );
     assert!(session.contains("self.pending = Some(Pending::QueuedSave { point, path })"));
@@ -971,8 +960,8 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
         .next()
         .unwrap();
     assert!(path.contains("dialog != identity.id"));
-    assert!(path.contains("target.tab != identity.point.tab"));
-    assert!(path.contains("target.revision != identity.point.revision"));
+    assert!(path.contains("target.tab != identity.point.tab()"));
+    assert!(path.contains("target.revision != identity.point.revision()"));
     assert!(
         path.find("check_revision(&identity.point)").unwrap()
             < path.find("self.control_open_job(path)").unwrap()

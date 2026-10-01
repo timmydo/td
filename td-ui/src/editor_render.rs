@@ -1,14 +1,17 @@
 //! The editor's scene: its geometry over td-ui's raster primitives, and
-//! the deterministic draw stream a `td_ui::raster::Raster` paints.
+//! the deterministic draw stream a `crate::raster::Raster` paints.
 
-use crate::keys::Profile;
-use crate::layout::{Affinity, Break, Caret, Layout, Metrics, Position, CELL_HEIGHT, CELL_WIDTH};
-use crate::model::{Editor, Limits, TabId};
-use crate::{text, Error, Result};
-use td_ui::chrome::{self, Bar, Block, Status, Strip};
-use td_ui::raster::{
-    text_run, Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Scrollbar, Surface,
-    BORDER, CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED,
+use crate::chrome::{self, Bar, Block, Status, Strip};
+use crate::editor_error::{Error, Result};
+use crate::editor_keys::Profile;
+use crate::editor_layout::{
+    Affinity, Break, Caret, Layout, Metrics, Position, CELL_HEIGHT, CELL_WIDTH,
+};
+use crate::editor_model::{Editor, Limits, TabId};
+use crate::editor_text as text;
+use crate::raster::{
+    text_run, Composition, Draw, GlyphStyle, Primitive, Rect, Scale, Scrollbar, Surface, BORDER,
+    CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,7 +36,8 @@ pub struct Geometry {
 
 pub const MAX_PROMPT_ROWS: usize = chrome::BLOCK_ROWS;
 
-pub(crate) const MENU_LABELS: [&str; 5] = ["File", "Edit", "Format", "Help", "Directory"];
+/// The editor window's menu bar, left to right; a pane draws none.
+pub const MENU_LABELS: [&str; 5] = ["File", "Edit", "Format", "Help", "Directory"];
 
 impl Default for Geometry {
     fn default() -> Self {
@@ -148,7 +152,8 @@ impl Geometry {
             height: (rows * 16 * scale) as u32,
         }
     }
-    pub(crate) fn with_line_numbers(mut self, lines: Option<usize>) -> Self {
+    /// A gutter wide enough for `lines` line numbers, or none.
+    pub fn with_line_numbers(mut self, lines: Option<usize>) -> Self {
         self.gutter_columns = lines.map_or(0, |n| n.to_string().len().max(2) + 1);
         self
     }
@@ -322,7 +327,7 @@ pub struct Scene<'a> {
     status: String,
     caret: Option<Position>,
     spelling: &'a [std::ops::Range<usize>],
-    spelling_status: Option<String>,
+    spelling_status: Option<&'a str>,
     link: Option<std::ops::Range<usize>>,
     notice: Option<&'a str>,
     scrollbars: [Option<Scrollbar>; 2],
@@ -339,7 +344,8 @@ impl<'a> Scene<'a> {
         Self::with_metrics(editor, geometry, view, labels, profile, None)
     }
 
-    pub(crate) fn with_metrics(
+    /// `new` reusing the controller's cached layout metrics when given.
+    pub fn with_metrics(
         editor: &'a Editor,
         geometry: Geometry,
         view: View,
@@ -426,11 +432,12 @@ impl<'a> Scene<'a> {
         })
     }
 
-    pub(crate) fn spelling(mut self, state: &'a crate::spelling::WindowState) -> Self {
+    /// A spelling checker's status for the status row and its marks, byte
+    /// ranges of the active document underlined; nothing without one.
+    pub fn spelling(mut self, status: &'a str, marks: &'a [std::ops::Range<usize>]) -> Self {
         if self.editor.active().is_none() {
             return self;
         }
-        let (status, marks) = state.view(self.editor);
         self.spelling_status = Some(status);
         self.spelling = marks;
         self
@@ -438,7 +445,7 @@ impl<'a> Scene<'a> {
 
     /// The link a Control-press would follow, in the active document's
     /// bytes, underlined in the ink of its glyphs.
-    pub(crate) fn link(mut self, link: Option<std::ops::Range<usize>>) -> Self {
+    pub fn link(mut self, link: Option<std::ops::Range<usize>>) -> Self {
         self.link = link;
         self
     }
@@ -514,9 +521,7 @@ impl<'a> Scene<'a> {
             return;
         }
         let spelling = if self.editor.active().is_some() {
-            self.spelling_status
-                .as_deref()
-                .unwrap_or("Spelling: not checked")
+            self.spelling_status.unwrap_or("Spelling: not checked")
         } else {
             ""
         };
@@ -798,53 +803,4 @@ impl Composition for Scene<'_> {
     fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
         Scene::emit(self, damage, sink);
     }
-}
-
-/// Fixed demonstration, not file input or a window. Output is binary P6 PPM.
-pub fn preview(output: &mut impl std::io::Write) -> std::io::Result<()> {
-    use crate::model::{Command, Selection};
-    let font = crate::font::pinned().map_err(std::io::Error::other)?;
-    let fixture = || -> Result<Vec<u8>> {
-        let mut editor = Editor::default();
-        let notes = editor.new_tab()?;
-        editor.dispatch(notes, 0, Command::Insert(
-            "A small text editor\n\nBitmap text, tabs, and a plain document area.\n\nWindows and Emacs key profiles share the same commands.\nParagraph filling inserts real line breaks; soft wrapping does not.\n\nUnicode scalars: café, naïve, λ.\n\tTabs advance to eight-column stops.\n\nThis is the reference-renderer preview, not a Wayland window.\nOpen, Save, clipboard and spelling adapters come next.\n".into()))?;
-        let readme = editor.load_bytes(b"td-editor\n")?;
-        editor.select_tab(notes)?;
-        let revision = editor.document(notes)?.revision();
-        editor.dispatch(
-            notes,
-            revision,
-            Command::Select(Selection {
-                anchor: 2,
-                caret: 7,
-            }),
-        )?;
-        let geometry = Geometry::new(800, 600, Scale::new(1)?)?;
-        let labels = [
-            Label {
-                tab: notes,
-                title: "notes.txt",
-            },
-            Label {
-                tab: readme,
-                title: "README.md",
-            },
-        ];
-        let scene = Scene::new(
-            &editor,
-            geometry,
-            View::default(),
-            &labels,
-            Profile::Windows,
-        )?;
-        let mut pixels = vec![0; 800 * 600 * 4];
-        Raster::new(&mut pixels, &font, geometry.surface(), 800 * 4)?
-            .paint(&scene, geometry.bounds())?;
-        let rgb = td_ui::raster::rgb(&pixels, geometry.surface(), 800 * 4)?;
-        Ok(td_ui::raster::ppm(geometry.surface(), &rgb))
-    };
-    let ppm = fixture().map_err(std::io::Error::other)?;
-    output.write_all(&ppm)?;
-    Ok(())
 }

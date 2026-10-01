@@ -1,17 +1,36 @@
 //! Editor-owned transactions. Validation finishes before document/history
 //! mutation, including global budgets and undo replay admission.
 
-use crate::{fill, text, Error, Result};
+use crate::editor_error::{Error, Result};
+use crate::{editor_fill as fill, editor_text as text};
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 
 pub type TabId = u64;
 
-pub(crate) struct RevisionPoint {
+/// A tab at one revision, bound to the `Editor` that minted it. Its fields
+/// are read-only outside this crate, so a point cannot be retargeted:
+/// ```compile_fail,E0616
+/// fn retarget(point: &mut td_ui::editor_model::RevisionPoint) {
+///     point.revision = 1;
+/// }
+/// ```
+pub struct RevisionPoint {
     owner: Arc<()>,
     pub(crate) tab: TabId,
     pub(crate) revision: u64,
+}
+
+impl RevisionPoint {
+    /// The tab this point names.
+    pub fn tab(&self) -> TabId {
+        self.tab
+    }
+    /// The revision this point was minted at.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,11 +155,17 @@ impl Document {
 /// Worker completion. Only directory views can authorize in-place navigation;
 /// an editable document can never be replaced through this path.
 pub struct Open<'a> {
-    pub(crate) source: Option<RevisionPoint>,
-    pub(crate) bytes: &'a [u8],
-    pub(crate) directory: bool,
-    pub(crate) missing: bool,
-    pub(crate) existing: Option<TabId>,
+    /// The directory tab navigated from, replaced in place; none opens a
+    /// new tab.
+    pub source: Option<RevisionPoint>,
+    /// The file's bytes, or the directory's listing.
+    pub bytes: &'a [u8],
+    /// Whether the result is a directory view, read-only.
+    pub directory: bool,
+    /// Whether the path names no file yet: an empty, unsaved document.
+    pub missing: bool,
+    /// A tab already showing the path, switched to instead of a load.
+    pub existing: Option<TabId>,
 }
 
 /// A save adapter captures this alongside bytes, then acknowledges only
@@ -352,7 +377,9 @@ impl Editor {
         Ok(())
     }
 
-    pub(crate) fn revision_point(&self, tab: TabId, revision: u64) -> Result<RevisionPoint> {
+    /// A point binding this editor, `tab` and `revision`, refused unless
+    /// the tab is at that revision now.
+    pub fn revision_point(&self, tab: TabId, revision: u64) -> Result<RevisionPoint> {
         self.checked(tab, revision)?;
         Ok(RevisionPoint {
             owner: self.identity.clone(),
@@ -361,7 +388,9 @@ impl Editor {
         })
     }
 
-    pub(crate) fn check_revision(&self, point: &RevisionPoint) -> Result<()> {
+    /// Whether `point` was minted by this editor and its tab is still at
+    /// its revision.
+    pub fn check_revision(&self, point: &RevisionPoint) -> Result<()> {
         if !Arc::ptr_eq(&self.identity, &point.owner) {
             return Err(Error::InvalidArgument);
         }
@@ -927,7 +956,7 @@ fn destination(text: &str, at: usize, motion: Motion) -> Result<usize> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod reload_tests {
+mod tests {
     use super::*;
 
     #[test]

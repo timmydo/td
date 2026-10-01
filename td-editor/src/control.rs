@@ -1,12 +1,12 @@
 //! The editor's control requests over td-ui's framing and envelope: queries
 //! and revision-checked edits. No listener or I/O.
 
-use crate::model::{Command, Selection, TabId};
-use crate::ui::{Controller, Event};
 use crate::{Error, Result};
 use std::fmt::Write;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
+use td_ui::editor::{Controller, Event};
+use td_ui::editor_model::{Command, Selection, TabId};
 
 pub(crate) use td_ui::control::{boolean, decimal, size, Envelope};
 pub use td_ui::control::{frame, hex, unhex, Decoder, MAX_FRAME};
@@ -112,7 +112,7 @@ pub enum Operation {
         tab: TabId,
         revision: u64,
         generation: u64,
-        phase: crate::ui::PointerPhase,
+        phase: td_ui::editor::PointerPhase,
         x: u32,
         y: u32,
         extend: bool,
@@ -417,7 +417,7 @@ pub enum Edit {
     AutoFill(bool),
     FillColumn(usize),
     GoToLine(usize),
-    Profile(crate::keys::Profile),
+    Profile(td_ui::editor_keys::Profile),
     LineNumbers(bool),
     Find {
         expected: Selection,
@@ -601,9 +601,9 @@ impl Request {
                     revision: decimal(args.next().ok_or(Error::Protocol)?)?,
                     generation: decimal(args.next().ok_or(Error::Protocol)?)?,
                     phase: match args.next().ok_or(Error::Protocol)? {
-                        "press" => crate::ui::PointerPhase::Press,
-                        "move" => crate::ui::PointerPhase::Move,
-                        "release" => crate::ui::PointerPhase::Release,
+                        "press" => td_ui::editor::PointerPhase::Press,
+                        "move" => td_ui::editor::PointerPhase::Move,
+                        "release" => td_ui::editor::PointerPhase::Release,
                         _ => return Err(Error::InvalidArgument),
                     },
                     x: pointer_pixel(args.next().ok_or(Error::Protocol)?)?,
@@ -668,8 +668,8 @@ impl Request {
                         }
                         "set-key-profile" => {
                             Edit::Profile(match args.next().ok_or(Error::Protocol)? {
-                                "windows" => crate::keys::Profile::Windows,
-                                "emacs" => crate::keys::Profile::Emacs,
+                                "windows" => td_ui::editor_keys::Profile::Windows,
+                                "emacs" => td_ui::editor_keys::Profile::Emacs,
                                 _ => return Err(Error::InvalidArgument),
                             })
                         }
@@ -1021,8 +1021,8 @@ pub(crate) fn state(ui: &Controller) -> Result<String> {
         "active={}\tkeys={}\tprefix={}",
         ui.editor().active().unwrap_or(0),
         match ui.keys().profile() {
-            crate::keys::Profile::Windows => "windows",
-            crate::keys::Profile::Emacs => "emacs",
+            td_ui::editor_keys::Profile::Windows => "windows",
+            td_ui::editor_keys::Profile::Emacs => "emacs",
         },
         u8::from(ui.keys().pending())
     );
@@ -1049,8 +1049,8 @@ pub(crate) fn state(ui: &Controller) -> Result<String> {
             doc.fill_column(),
             u8::from(doc.format().bom),
             match doc.format().ending {
-                crate::text::LineEnding::Lf => "lf",
-                crate::text::LineEnding::CrLf => "crlf",
+                td_ui::editor_text::LineEnding::Lf => "lf",
+                td_ui::editor_text::LineEnding::CrLf => "crlf",
             }
         ));
     }
@@ -1072,8 +1072,8 @@ pub(crate) fn state(ui: &Controller) -> Result<String> {
             origin.column,
             u8::from(view.soft_wrap),
             match view.affinity {
-                crate::layout::Affinity::Upstream => "upstream",
-                crate::layout::Affinity::Downstream => "downstream",
+                td_ui::editor_layout::Affinity::Upstream => "upstream",
+                td_ui::editor_layout::Affinity::Downstream => "downstream",
             },
             view.desired_column
                 .map_or_else(|| "-".into(), |value| value.to_string())
@@ -1115,8 +1115,8 @@ pub(crate) fn page(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::model::{Command, Selection};
-    use crate::ui::Event;
+    use td_ui::editor::Event;
+    use td_ui::editor_model::{Command, Selection};
 
     #[test]
     fn line_number_mode_is_default_on_revision_checked_and_nonediting() {
@@ -1425,7 +1425,7 @@ mod tests {
                 tab: 2,
                 revision: 3,
                 generation: 4,
-                phase: crate::ui::PointerPhase::Press,
+                phase: td_ui::editor::PointerPhase::Press,
                 x: 12,
                 y: 34,
                 extend: true,
@@ -1784,7 +1784,7 @@ mod tests {
     fn remote_mode_refusals_preserve_modes_prefix_and_selection() {
         let mut ui = Controller::default();
         ui.dispatch(Event::Load("é\nsecond\n".as_bytes())).unwrap();
-        ui.dispatch(Event::Profile(crate::keys::Profile::Emacs))
+        ui.dispatch(Event::Profile(td_ui::editor_keys::Profile::Emacs))
             .unwrap();
         ui.dispatch(Event::Key {
             tab: 1,
@@ -2413,7 +2413,7 @@ mod tests {
         ui.dispatch(Event::Load("λ λ".as_bytes())).unwrap();
         ui.dispatch(Event::New).unwrap();
         ui.dispatch(Event::SelectTab(1)).unwrap();
-        ui.dispatch(Event::Profile(crate::keys::Profile::Emacs))
+        ui.dispatch(Event::Profile(td_ui::editor_keys::Profile::Emacs))
             .unwrap();
         ui.dispatch(Event::Key {
             tab: 1,
@@ -2635,7 +2635,7 @@ mod tests {
         let mut ui = Controller::default();
         ui.dispatch(Event::New).unwrap();
         ui.dispatch(Event::Load("aλ".as_bytes())).unwrap();
-        ui.dispatch(Event::Profile(crate::keys::Profile::Emacs))
+        ui.dispatch(Event::Profile(td_ui::editor_keys::Profile::Emacs))
             .unwrap();
         ui.dispatch(Event::Key {
             tab: 2,

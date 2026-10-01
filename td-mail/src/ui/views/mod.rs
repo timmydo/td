@@ -4,7 +4,7 @@
 //! what it shows as a `Scene`: the window's title, an action bar whose
 //! labels stand for keys, an optional text entry, a body that is a list of
 //! rows, a text or a draft to edit, and the status row. The session
-//! (`super`) lays the scene out with the toolkit's widgets and td-editor's
+//! (`super`) lays the scene out with the toolkit's widgets and its editor
 //! document pane, and hands the view its keys, a press on a row and the
 //! wheel's travel over a list; scrolling a text is the pane's, which a
 //! view asks for with `ViewAction::Scroll`. A draft's pane takes every

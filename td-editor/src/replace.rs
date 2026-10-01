@@ -1,9 +1,9 @@
 //! Bounded literal replacement entry; edits use the ordinary controller.
 
-use crate::model::{Command, Editor, RevisionPoint, Selection, TabId};
 use crate::search::{Found, History, QUERY_BYTES};
-use crate::ui::{Controller, Event};
 use crate::{Error, Result};
+use td_ui::editor::{Controller, Event};
+use td_ui::editor_model::{Command, Editor, RevisionPoint, Selection, TabId};
 
 #[derive(Clone, Copy)]
 pub(crate) enum Action {
@@ -49,12 +49,12 @@ impl Prompt {
 
     pub fn target(&self, editor: &Editor) -> Result<(TabId, u64)> {
         editor.check_revision(&self.point)?;
-        if editor.active() != Some(self.point.tab)
-            || editor.document(self.point.tab)?.selection() != self.selection
+        if editor.active() != Some(self.point.tab())
+            || editor.document(self.point.tab())?.selection() != self.selection
         {
             return Err(Error::StaleRevision);
         }
-        Ok((self.point.tab, self.point.revision))
+        Ok((self.point.tab(), self.point.revision()))
     }
 
     pub fn entry(&self) -> (&str, &str, bool, &str) {

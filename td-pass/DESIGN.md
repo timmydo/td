@@ -50,12 +50,14 @@ of compiler or compositor copies.
 ## Reuse and authority
 
 Use td-ui's Wayland client, font, raster, chrome, keyboard, pointer and
-clipboard lifecycle. Move reusable editing/model/viewport behavior from
-td-editor into shared components with both consumers updated atomically.
-Complete the planned text-entry and list widgets in td-ui; do not fork the
-editor or add another Wayland transport or renderer. No plaintext file-save
-adapter, arbitrary Open/Save As path, spelling worker, external editor,
-editor control socket, plugin or shell command reaches vault contents.
+clipboard lifecycle. The editing, model and viewport behavior is td-ui's
+editor core (`td-ui/DESIGN.md`, "Editor core"), moved there whole from
+td-editor with its consumers updated atomically; the notebook's editor
+pane is that core, never a copy. Complete the planned text-entry and list
+widgets in td-ui; do not fork the editor or add another Wayland transport
+or renderer. No plaintext file-save adapter, arbitrary Open/Save As path,
+spelling worker, external editor, editor control socket, plugin or shell
+command reaches vault contents.
 
 The notebook speaks only td-secret's entry and lifecycle API. On td it uses
 the admitted service and holds no vault key. Standalone mode runs the same

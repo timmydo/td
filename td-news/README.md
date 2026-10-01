@@ -3,19 +3,18 @@
 `td-news` (Timmy's News) is a Rust news reader for RSS/Atom feeds. It fetches
 feeds, caches articles in a small key/value store, and shows them in a
 keyboard/mouse-first window of its own: the feeds and the articles in
-td-ui's lists, and an article in td-editor's document view, read-only.
+td-ui's lists, and an article in td-ui's editor pane, read-only.
 
 ## Dependencies
 
-td-ui, td's dependency-free UI toolkit, and td-editor, whose document
-view shows an article, both by path, and the Rust standard library: JSON,
-TOML, XML, HTML rendering, the cache and dates are td's shared `std`
-modules under `src/`, copied whole from one master each, and the window
-is td-ui's widget window. Fetching is not done here at all —
-`td-news` asks td's fetch service over the unix socket at
-`$XDG_RUNTIME_DIR/td-fetch/socket`, which holds the TLS, the resolver and
-the timeouts, and without it no feed can be fetched. The window needs a
-Wayland compositor: `WAYLAND_SOCKET`, or `WAYLAND_DISPLAY` under
+td-ui, td's dependency-free UI toolkit, whose editor pane shows an article,
+by path, and the Rust standard library: JSON, TOML, XML, HTML rendering,
+the cache and dates are td's shared `std` modules under `src/`, copied whole
+from one master each, and the window is td-ui's widget window. Fetching
+is not done here at all — `td-news` asks td's fetch service over the
+unix socket at `$XDG_RUNTIME_DIR/td-fetch/socket`, which holds the TLS, the
+resolver and the timeouts, and without it no feed can be fetched. The window
+needs a Wayland compositor: `WAYLAND_SOCKET`, or `WAYLAND_DISPLAY` under
 `XDG_RUNTIME_DIR`, as td-ui's clients find it.
 
 ## Build / Run

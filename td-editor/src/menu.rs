@@ -1,9 +1,9 @@
 //! Bounded menu descriptions and geometry, independent of display and files.
 
-use crate::dialog::Target;
-use crate::keys::Profile;
-use crate::render::{Geometry, MENU_LABELS};
 use td_ui::chrome::{self, Bar};
+use td_ui::editor_dialog::Target;
+use td_ui::editor_keys::Profile;
+use td_ui::editor_render::{Geometry, MENU_LABELS};
 use td_ui::menus;
 use td_ui::raster::Raster;
 #[cfg(test)]

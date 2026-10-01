@@ -1,8 +1,8 @@
 //! Bounded, selection-bound clipboard transactions. No transport or clock.
 
-use crate::model::{Command, Document, Editor, RevisionPoint, Selection, TabId};
-use crate::text;
-use crate::{Error, Result};
+use crate::editor_error::{Error, Result};
+use crate::editor_model::{Command, Document, Editor, RevisionPoint, Selection, TabId};
+use crate::editor_text as text;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -41,9 +41,9 @@ impl Anchor {
 /// Capture does not edit or claim system ownership. An empty final line
 /// returns None and leaves existing clipboard ownership untouched.
 /// A snapshot cannot authorize discarding a dirty tab:
-/// ```compile_fail
-/// fn cannot_discard(snapshot: td_editor::clipboard::Snapshot) {
-///     let _ = td_editor::ui::Event::Discard(snapshot);
+/// ```compile_fail,E0308
+/// fn cannot_discard(snapshot: td_ui::editor_clipboard::Snapshot) {
+///     let _ = td_ui::editor::Event::Discard(snapshot);
 /// }
 /// ```
 pub struct Snapshot {
@@ -53,7 +53,9 @@ pub struct Snapshot {
     text: Arc<str>,
 }
 
-pub(crate) fn capture_range(doc: &Document) -> Result<Range<usize>> {
+/// The range a copy or cut takes: the selection, or with none the caret's
+/// logical line and its newline.
+pub fn capture_range(doc: &Document) -> Result<Range<usize>> {
     let selection = doc.selection();
     let range = selection.range();
     if !range.is_empty() {
@@ -99,7 +101,9 @@ impl Snapshot {
         self.line
     }
 
-    pub(crate) fn cut(self, editor: &Editor) -> Result<(TabId, u64, Command)> {
+    /// The deletion that cuts this snapshot's range, refused once the tab
+    /// has moved past the captured revision or selection.
+    pub fn cut(self, editor: &Editor) -> Result<(TabId, u64, Command)> {
         self.anchor.check(editor)?;
         Ok((
             self.anchor.point.tab,
@@ -149,7 +153,9 @@ impl Paste {
         Ok(())
     }
 
-    pub(crate) fn finish(self, editor: &Editor) -> Result<Option<(TabId, u64, Command)>> {
+    /// The insertion the transfer's text makes, refused when oversized,
+    /// stale or not UTF-8; nothing for an empty transfer.
+    pub fn finish(self, editor: &Editor) -> Result<Option<(TabId, u64, Command)>> {
         if self.oversized {
             return Err(Error::Limit);
         }

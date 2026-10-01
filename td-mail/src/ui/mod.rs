@@ -2,7 +2,7 @@
 //! with the keys it reads from its chords, a press on a row, and the
 //! wheel's travel; polls the backend's channel each turn; and presents
 //! the frame the top view's scene lays out (`frame`): the toolkit's
-//! action bar, text entry and list, and td-editor's document pane,
+//! action bar, text entry and list, and the editor core's document pane,
 //! read-only for a message and editable for a draft. The window owns
 //! the Wayland connection; the session owns the views, the pane, the
 //! backend and the account, and the finder a draft's Attach opens over
@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use td_editor::model::TabId;
-use td_editor::ui::Outcome;
+use td_ui::editor::Outcome;
+use td_ui::editor_model::TabId;
 use td_ui::finder;
 use td_ui::menus;
 use td_ui::raster::{Raster, Surface};

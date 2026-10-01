@@ -413,11 +413,11 @@ impl SentView {
     /// The sent draft at `path`; one past the pane's ceiling is refused,
     /// as the compose view refuses a draft, rather than shown short.
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let bytes = crate::submit::read_bounded(path, td_editor::text::MAX_FILE_BYTES)?;
-        if bytes.len() > td_editor::text::MAX_FILE_BYTES {
+        let bytes = crate::submit::read_bounded(path, td_ui::editor_text::MAX_FILE_BYTES)?;
+        if bytes.len() > td_ui::editor_text::MAX_FILE_BYTES {
             return Err(std::io::Error::other(format!(
                 "the sent draft is larger than the pane's ceiling of {} bytes",
-                td_editor::text::MAX_FILE_BYTES
+                td_ui::editor_text::MAX_FILE_BYTES
             )));
         }
         let name = path

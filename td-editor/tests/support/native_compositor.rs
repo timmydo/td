@@ -867,7 +867,7 @@ fn native_directory_tabs_reuse_shift_open_refresh_and_copy_path() {
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
 fn native_path_completion_lists_cycles_and_opens_literal_relative_file() {
-    use td_editor::render::Geometry;
+    use td_ui::editor_render::Geometry;
     use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Scale, CHROME, INK};
     for profile in ["windows", "emacs"] {
         let compositor_directory = Directory::new();
@@ -1495,7 +1495,7 @@ fn text_pixels(text: &str) -> Vec<u8> {
 }
 
 fn text_pixels_on(text: &str, background: u32) -> Vec<u8> {
-    use td_editor::render::Geometry;
+    use td_ui::editor_render::Geometry;
     use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Scale, INK};
     assert!(text.is_ascii() && !text.is_empty() && text.len() <= 98);
     let font = td_editor::font::pinned().unwrap();
@@ -1524,7 +1524,7 @@ fn numbered_pixels(
     after: Observation,
     enabled: bool,
 ) {
-    use td_editor::render::Geometry;
+    use td_ui::editor_render::Geometry;
     use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Scale, INK, LINE_NUMBER, PAPER};
     let state = editor.ok("state");
     let frame = editor.ok(&format!(

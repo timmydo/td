@@ -57,6 +57,16 @@ pub mod control_worker;
 pub mod coverage;
 pub mod data;
 pub mod driven;
+pub mod editor;
+pub mod editor_clipboard;
+pub mod editor_dialog;
+pub mod editor_error;
+pub mod editor_fill;
+pub mod editor_keys;
+pub mod editor_layout;
+pub mod editor_model;
+pub mod editor_render;
+pub mod editor_text;
 pub mod face;
 pub mod face_file;
 #[path = "../../td-compositor/src/filter.rs"]

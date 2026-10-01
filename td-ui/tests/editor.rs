@@ -4,11 +4,12 @@
     reason = "asserted test fixtures"
 )]
 
-use td_editor::keys::Profile;
-use td_editor::layout::{Affinity, Caret};
-use td_editor::model::{Command, Selection};
-use td_editor::ui::{Controller, Event, Outcome, PointerPhase};
-use td_editor::{font, replay, Error};
+use td_ui::editor::{Controller, Event, Outcome, PointerPhase};
+use td_ui::editor_error::Error;
+use td_ui::editor_keys::Profile;
+use td_ui::editor_layout::{Affinity, Caret};
+use td_ui::editor_model::{Command, Selection};
+use td_ui::font;
 use td_ui::raster::{Raster, Rect, Scale, Surface};
 
 fn loaded(text: &str) -> Controller {
@@ -1072,8 +1073,8 @@ fn clamped_scroll_does_not_cancel_a_selection_drag() {
 
 #[test]
 fn every_admitted_width_and_maximum_height_fit_the_layout_limits() {
-    use td_editor::layout::{Viewport, MAX_COLUMNS, MAX_ROWS};
-    use td_editor::render::Geometry;
+    use td_ui::editor_layout::{Viewport, MAX_COLUMNS, MAX_ROWS};
+    use td_ui::editor_render::Geometry;
     use td_ui::raster::{Scale, MAX_AXIS, MAX_FRAME_BYTES};
     let ui = loaded("a\nb");
     let doc = ui.editor().document(1).unwrap();
@@ -1261,106 +1262,6 @@ fn explicit_clock_and_focus_drive_pixels_without_document_edits() {
 }
 
 #[test]
-fn replay_and_typed_events_produce_identical_state_and_pixels() {
-    let mut session = replay::Session::default();
-    let mut direct = Controller::default();
-    let source = "abcde\nx\nabcde";
-    let commands = [
-        format!("load\t{}", replay::hex(source.as_bytes())),
-        "resize\t64\t104\t1".into(),
-        "select-range\t1\t0\t4\t4".into(),
-        format!("key\t1\t0\t{}", replay::hex(b"Down")),
-        "pointer\t1\t0\tpress\t8\t49\t0".into(),
-        "pointer\t1\t0\trelease\t32\t65\t0".into(),
-        "pointer\t1\t0\tpress\t24\t49\t0".into(),
-        "pointer\t1\t0\trelease\t0\t0\t0".into(),
-        "set-soft-wrap\t1\t0\t0".into(),
-        "scroll\t1\t0\trows\tforward\t2".into(),
-        "tick\t500".into(),
-    ];
-    let events = [
-        Event::Load(source.as_bytes()),
-        Event::Resize {
-            width: 64,
-            height: 104,
-            scale: 1,
-        },
-        Event::Edit {
-            tab: 1,
-            revision: 0,
-            command: Command::Select(Selection {
-                anchor: 4,
-                caret: 4,
-            }),
-        },
-        Event::Key {
-            tab: 1,
-            revision: 0,
-            chord: "Down",
-        },
-        Event::Pointer {
-            tab: 1,
-            revision: 0,
-            phase: PointerPhase::Press,
-            x: 8,
-            cell_x: 8,
-            y: 49,
-            extend: false,
-        },
-        Event::Pointer {
-            tab: 1,
-            revision: 0,
-            phase: PointerPhase::Release,
-            x: 32,
-            cell_x: 32,
-            y: 65,
-            extend: false,
-        },
-        Event::Pointer {
-            tab: 1,
-            revision: 0,
-            phase: PointerPhase::Press,
-            x: 24,
-            cell_x: 24,
-            y: 49,
-            extend: false,
-        },
-        Event::Pointer {
-            tab: 1,
-            revision: 0,
-            phase: PointerPhase::Release,
-            x: i64::MIN,
-            cell_x: i64::MIN,
-            y: i64::MIN,
-            extend: false,
-        },
-        Event::Wrap {
-            tab: 1,
-            revision: 0,
-            enabled: false,
-        },
-        Event::Scroll {
-            tab: 1,
-            revision: 0,
-            rows: 2,
-            columns: 0,
-        },
-        Event::Tick(500),
-    ];
-    assert_eq!(commands.len(), events.len());
-    for (command, event) in commands.iter().zip(events) {
-        assert!(!session
-            .request(format!("1\t7\t{command}").as_bytes())
-            .contains("error"));
-        direct.dispatch(event).unwrap();
-        assert_eq!(session.ui.generation(), direct.generation());
-        assert_eq!(session.ui.tab_view(1).unwrap(), direct.tab_view(1).unwrap());
-        assert_eq!(selection(&session.ui), selection(&direct));
-        assert_eq!(pixels(&session.ui), pixels(&direct));
-    }
-}
-
-#[test]
 fn generated_events_keep_view_metrics_clamped_and_model_valid() {
     let mut ui = loaded("éλ\n0123456789\na\tb\nlast");
     let mut random = 73u32;
@@ -1453,71 +1354,6 @@ fn generated_events_keep_view_metrics_clamped_and_model_valid() {
             );
         }
     }
-}
-
-#[test]
-fn malformed_ui_wire_commands_do_not_change_state() {
-    let mut session = replay::Session::default();
-    session.request(b"1\t0\tload\t616263");
-    let before = session.request(b"1\t0\tstate");
-    for command in [
-        "resize\t0\t600\t1",
-        "resize\t800\t600\t256",
-        "focus\t2",
-        "tick\t-1",
-        "tick\t18446744073709551616",
-        "pointer\t1\t0\tclick\t8\t49\t0",
-        "pointer\t1\t0\tpress\t18446744073709551615\t49\t0",
-        "pointer\t1\t0\tpress\t8\t49\t0\textra",
-        "set-soft-wrap\t1\t0\t2",
-        "scroll\t1\t0\trows\tnegative\t1",
-        "scroll\t1\t0\trows\tforward\t18446744073709551615",
-    ] {
-        assert!(
-            session
-                .request(format!("1\t0\t{command}").as_bytes())
-                .contains("error"),
-            "{command}"
-        );
-        assert_eq!(session.request(b"1\t0\tstate"), before, "{command}");
-    }
-}
-
-#[test]
-fn the_real_replay_binary_accepts_ui_events_without_a_display() {
-    use std::io::Write;
-    use std::process::{Command as Process, Stdio};
-    let requests = [
-        "1\t1\tload\t6162630a78797a",
-        "1\t2\tresize\t64\t104\t1",
-        "1\t3\tkey\t1\t0\t446f776e",
-        "1\t4\tpointer\t1\t0\tpress\t8\t49\t0",
-        "1\t5\ttick\t500",
-        "1\t6\tstate",
-    ];
-    let mut wire = Vec::new();
-    let mut expected = Vec::new();
-    let mut session = replay::Session::default();
-    for request in requests {
-        wire.extend_from_slice(&(request.len() as u32).to_be_bytes());
-        wire.extend_from_slice(request.as_bytes());
-        let response = session.request(request.as_bytes());
-        assert!(!response.contains("error"));
-        expected.extend_from_slice(&(response.len() as u32).to_be_bytes());
-        expected.extend_from_slice(response.as_bytes());
-    }
-    let mut child = Process::new(env!("CARGO_BIN_EXE_td-editor"))
-        .arg("--replay")
-        .env_remove("WAYLAND_DISPLAY")
-        .env_remove("DISPLAY")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(&wire).unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    assert_eq!(output.stdout, expected);
 }
 
 #[test]

@@ -79,11 +79,11 @@ impl ComposeView {
         attachment_dir: Option<PathBuf>,
         cmd_tx: Sender<BackendCommand>,
     ) -> io::Result<Self> {
-        let bytes = crate::submit::read_bounded(&path, td_editor::text::MAX_FILE_BYTES)?;
-        if bytes.len() > td_editor::text::MAX_FILE_BYTES {
+        let bytes = crate::submit::read_bounded(&path, td_ui::editor_text::MAX_FILE_BYTES)?;
+        if bytes.len() > td_ui::editor_text::MAX_FILE_BYTES {
             return Err(io::Error::other(format!(
                 "the draft is larger than the pane's ceiling of {} bytes",
-                td_editor::text::MAX_FILE_BYTES
+                td_ui::editor_text::MAX_FILE_BYTES
             )));
         }
         let text = String::from_utf8(bytes)

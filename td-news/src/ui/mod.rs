@@ -1,5 +1,5 @@
 //! The reader's views over the widget window: the toolkit's lists for
-//! the feeds, the articles and an article's links, td-editor's read-only
+//! the feeds, the articles and an article's links, td-ui's read-only editor
 //! document pane for an article, a log window and the help, a search
 //! field, an action bar and a status row, laid out over the surface each
 //! frame. The window owns the Wayland connection; the app owns every view
@@ -19,10 +19,10 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use td_editor::clipboard::Snapshot;
-use td_editor::model::TabId;
-use td_editor::ui::{Controller, Event, Outcome, PointerPhase as PanePhase};
 use td_ui::chrome::{Bar, Field, Item, List, Status, Strip, TabHit, TextEntry, ROW};
+use td_ui::editor::{Controller, Event, Outcome, PointerPhase as PanePhase};
+use td_ui::editor_clipboard::Snapshot;
+use td_ui::editor_model::TabId;
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Rect, Surface, PAPER};
 use td_ui::window::{Clipboard, Input, PointerPhase};
 
@@ -574,10 +574,10 @@ impl App {
                 self.note = Some("Nothing selected to copy".to_string());
                 self.pending_redraw = true;
             }
-            Err(td_editor::Error::Limit) => {
+            Err(td_ui::editor_error::Error::Limit) => {
                 self.note = Some(format!(
                     "Copy refused: the selection is past the clipboard's {} KiB ceiling",
-                    td_editor::clipboard::MAX_BYTES / 1024
+                    td_ui::editor_clipboard::MAX_BYTES / 1024
                 ));
                 self.pending_redraw = true;
             }
@@ -1260,7 +1260,7 @@ impl App {
     }
 
     /// The document rows and text columns the pane shows once placed
-    /// for the layout, as td-editor lays its document out in the rect.
+    /// for the layout, as the editor core lays its document out in the rect.
     fn pane_grid(&mut self, layout: &Layout) -> (usize, usize) {
         self.place_pane(layout);
         let (columns, rows) = self.pane.geometry().grid();
@@ -2218,7 +2218,7 @@ fn pane_source(text: &str) -> String {
             c if c <= '\u{1f}' || c == '\u{7f}' => '\u{fffd}',
             c => c,
         };
-        if source.len() + shown.len_utf8() > td_editor::text::MAX_FILE_BYTES {
+        if source.len() + shown.len_utf8() > td_ui::editor_text::MAX_FILE_BYTES {
             break;
         }
         source.push(shown);
@@ -3432,7 +3432,7 @@ pub(super) mod tests {
         assert_eq!(app.view, View::Help);
         app.set_pane_text(
             PaneText::NoArticle,
-            &"x".repeat(td_editor::clipboard::MAX_BYTES + 1),
+            &"x".repeat(td_ui::editor_clipboard::MAX_BYTES + 1),
         );
         key(&mut app, "C-a");
         key(&mut app, "C-c");

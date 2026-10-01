@@ -1,8 +1,8 @@
 //! Paragraph reflow. Only two endpoints are mapped; there is no per-scalar
 //! offset table or word vector proportional to the document size.
 
-use crate::text::{self, MAX_FILE_BYTES};
-use crate::{Error, Result};
+use crate::editor_error::{Error, Result};
+use crate::editor_text::{self as text, MAX_FILE_BYTES};
 use std::ops::Range;
 
 #[derive(Debug, Eq, PartialEq)]

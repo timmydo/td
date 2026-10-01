@@ -1,10 +1,10 @@
 //! Explicit, bounded English word-list checking. No I/O, clocks or triggers.
 
-use crate::model::{Editor, RevisionPoint, TabId};
 use crate::{Error, Result};
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
+use td_ui::editor_model::{Editor, RevisionPoint, TabId};
 
 pub const DICTIONARY_BYTES: usize = 16 * 1024 * 1024;
 pub const DICTIONARY_ENTRIES: usize = 250_000;
@@ -110,10 +110,10 @@ impl Report {
     }
 
     pub fn tab(&self) -> TabId {
-        self.point.tab
+        self.point.tab()
     }
     pub fn revision(&self) -> u64 {
-        self.point.revision
+        self.point.revision()
     }
 
     /// No stale marks or counts may be reused after an edit or list replacement.
@@ -253,7 +253,7 @@ impl Scan {
         if self.state == State::Complete {
             return Ok(true);
         }
-        let text = editor.document(self.report.point.tab)?.text();
+        let text = editor.document(self.report.point.tab())?.text();
         let remaining = text.get(self.offset..).ok_or(Error::InvalidPosition)?;
         let base = self.offset;
         let mut chars = remaining.char_indices().peekable();
@@ -531,8 +531,8 @@ impl WindowState {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::model::{Command, Selection};
-    use crate::ui::{Controller, Event};
+    use td_ui::editor::{Controller, Event};
+    use td_ui::editor_model::{Command, Selection};
 
     fn document(text: &str) -> Controller {
         let mut ui = Controller::default();

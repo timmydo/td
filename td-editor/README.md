@@ -129,10 +129,11 @@ cargo build --release --frozen --manifest-path td-editor/Cargo.toml
 td-editor/target/release/td-editor --help
 ```
 
-`src/model.rs` owns state and transaction admission; `text.rs` owns the
-lossless file codec; `fill.rs` plans bounded reflow; `keys.rs` translates
-logical chords; `ui.rs` owns input/view state; and `replay.rs` feeds that same
-controller with framed commands.
+The document core is td-ui's: `td-ui/src/editor_model.rs` owns state and
+transaction admission; `editor_text.rs` owns the lossless file codec;
+`editor_fill.rs` plans bounded reflow; `editor_keys.rs` translates logical
+chords; `editor.rs` owns input/view state; and this crate's `replay.rs`
+feeds that same controller with framed commands.
 The native `clipboard-state` query reports device/focus, supported-offer
 type, retained source byte count and transfer-presence flags without
 reading text or advancing transfers. It is inspection, not a clipboard
@@ -240,17 +241,19 @@ A lost reply means an unknown outcome: inspect state/text before retrying.
 Normal shutdown removes only the owned endpoint, not its parent directory.
 After abnormal termination, inspect any stale endpoint before removing it.
 
-`tests/core.rs` covers byte round trips, stale/invalid commands, limits,
-save completion after intervening edits, global history eviction, reflow
-mapping, key-profile conflicts and generated edits against a scalar-vector
-reference. It also launches the real replay executable without a display.
+`td-ui/tests/editor_core.rs` covers byte round trips, stale/invalid
+commands, limits, save completion after intervening edits, global history
+eviction, reflow mapping, key-profile conflicts and generated edits against
+a scalar-vector reference. This crate's `tests/replay.rs` covers the replay
+wire and launches the real replay executable without a display.
 
-`clipboard.rs` supplies tested, display-independent copy snapshots and
-selection-bound Cut/Paste admission through the controller. With no selection,
-Copy and Cut take the current logical line and its terminating newline.
-Paste collects at most 1 MiB of raw bytes; oversized, malformed or stale
-transfers cannot partially edit a document. The experimental native window
-connects these operations to core Wayland data-device v3 when supplied.
+td-ui's `editor_clipboard.rs` supplies tested, display-independent
+copy snapshots and selection-bound Cut/Paste admission through the
+controller. With no selection, Copy and Cut take the current logical line
+and its terminating newline. Paste collects at most 1 MiB of raw bytes;
+oversized, malformed or stale transfers cannot partially edit a document. The
+experimental native window connects these operations to core Wayland
+data-device v3 when supplied.
 
 `spelling.rs` supplies strict English word-list parsing and chunked,
 revision-bound whole-document scans. `files::read_dictionary` reads only a
@@ -360,27 +363,29 @@ without a writer both for an initial FIFO and a regular file replaced by
 one between inspection and open. The ordinary suite also checks devices,
 directories, symlinks and sockets. Neither fixture is needed by default.
 
-`src/layout.rs` adds an allocation-free visual-row and scalar-cell map:
-soft wrapping, tab widths, caret affinity, pixel hit testing, vertical/page
-motion calculation, and independent viewport scrolling. `tests/layout.rs`
-compares generated rows with an exhaustive scalar-vector reference, checks
-every interior cell pixel, and round-trips every caret boundary through hit
-testing. Use `Viewport::layout` to borrow validated model text with matching
-wrap geometry. The controller caches metrics and retains per-tab scrolling,
-caret affinity and desired vertical column. `tests/ui.rs` exercises keyboard,
-drag, resize, focus and clock sequences, including identical pixels from
-typed events and replay. No display is needed for those interaction tests.
+`td-ui/src/editor_layout.rs` adds an allocation-free visual-row and
+scalar-cell map: soft wrapping, tab widths, caret affinity, pixel hit
+testing, vertical/page motion calculation, and independent viewport
+scrolling. `td-ui/tests/editor_layout.rs` compares generated rows with an
+exhaustive scalar-vector reference, checks every interior cell pixel, and
+round-trips every caret boundary through hit testing. Use `Viewport::layout`
+to borrow validated model text with matching wrap geometry. The controller
+caches metrics and retains per-tab scrolling, caret affinity and desired
+vertical column. `td-ui/tests/editor.rs` exercises keyboard, drag, resize,
+focus and clock sequences; `tests/replay.rs` here checks identical pixels
+from typed events and replay. No display is needed for those interaction
+tests.
 
-`src/render.rs` supplies the safe software reference backend over td-ui's
-raster. A borrowed `Scene` streams clipped rectangle/glyph operations;
-td-ui's `Raster` writes them into a caller-owned, stride-checked XRGB8888
-buffer. The renderer uses the existing compositor Unifont data and decoder
-through td-ui, with no copied font or new external dependency. It draws
-tabs, bounded display labels, menu/status chrome, selection, and a caret, at
-integer scales 1–4. Pixel-oracle tests cover clipping, damage, padding,
-fallback glyphs, scrolling and extreme geometry. Menus remain drawing only.
-Tab presses select tabs; close marks emit typed requests for the clicked tab
-without discarding it.
+`td-ui/src/editor_render.rs` supplies the safe software reference backend
+over td-ui's raster. A borrowed `Scene` streams clipped rectangle/glyph
+operations; td-ui's `Raster` writes them into a caller-owned, stride-checked
+XRGB8888 buffer. The renderer uses the existing compositor Unifont data and
+decoder through td-ui, with no copied font or new external dependency. It
+draws tabs, bounded display labels, menu/status chrome, selection, and a
+caret, at integer scales 1–4. Pixel-oracle tests cover clipping, damage,
+padding, fallback glyphs, scrolling and extreme geometry. Menus remain
+drawing only. Tab presses select tabs; close marks emit typed requests for
+the clicked tab without discarding it.
 
 The default appearance uses warm off-white paper and charcoal text, with
 muted chrome and blue-grey selection. A synthetic medium bitmap weight adds

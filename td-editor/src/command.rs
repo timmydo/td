@@ -1,8 +1,8 @@
 //! Exact named editor actions and bounded prefix completion; never evaluation.
 
 use crate::menu::Item;
-use crate::model::{Editor, RevisionPoint, Selection, TabId};
 use crate::{Error, Result};
+use td_ui::editor_model::{Editor, RevisionPoint, Selection, TabId};
 
 pub(crate) const BYTES: usize = 64;
 const NAMES: &[(&str, Item)] = &[
@@ -39,12 +39,12 @@ impl Prompt {
 
     pub fn target(&self, editor: &Editor) -> Result<(TabId, u64)> {
         editor.check_revision(&self.point)?;
-        if editor.active() != Some(self.point.tab)
-            || editor.document(self.point.tab)?.selection() != self.selection
+        if editor.active() != Some(self.point.tab())
+            || editor.document(self.point.tab())?.selection() != self.selection
         {
             return Err(Error::StaleRevision);
         }
-        Ok((self.point.tab, self.point.revision))
+        Ok((self.point.tab(), self.point.revision()))
     }
 
     pub fn entry(&self) -> (&str, bool) {
@@ -146,8 +146,8 @@ impl Prompt {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::model::Command;
-    use crate::ui::{Controller, Event};
+    use td_ui::editor::{Controller, Event};
+    use td_ui::editor_model::Command;
 
     fn controller() -> Controller {
         let mut ui = Controller::default();
@@ -177,11 +177,11 @@ mod tests {
             directory_entry: false,
             directory_sort: crate::directory::Sort::Name,
             directory_reverse: false,
-            target: crate::dialog::Target {
+            target: td_ui::editor_dialog::Target {
                 tab: 1,
                 revision: 0,
             },
-            profile: crate::keys::Profile::Windows,
+            profile: td_ui::editor_keys::Profile::Windows,
             file_window: false,
             undo: false,
             redo: false,

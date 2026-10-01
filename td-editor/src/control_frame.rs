@@ -1,8 +1,8 @@
 //! Native input/redraw generations and immutable submitted/callback snapshots.
 
-use crate::render::Geometry;
-use crate::ui::Controller;
 use crate::{Error, Result};
+use td_ui::editor::Controller;
+use td_ui::editor_render::Geometry;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Stamp {
@@ -150,8 +150,8 @@ impl Frames {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::model::Command;
-    use crate::ui::Event;
+    use td_ui::editor::Event;
+    use td_ui::editor_model::Command;
 
     #[test]
     fn callbacks_retain_rendered_revision_not_the_newer_controller() {

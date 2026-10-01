@@ -1,13 +1,14 @@
 //! Display-independent input controller. Adapters supply events, never mutable
 //! model access; replay and the future Wayland adapter share this dispatcher.
 
-use crate::keys::{Action, Keymap, Profile};
-use crate::layout::{Affinity, Caret, Metrics, Viewport, CELL_HEIGHT, CELL_WIDTH};
-use crate::model::{Command, Editor, Selection, TabId};
-use crate::render::{Geometry, Label, Scene, View};
-use crate::{text, Error, Result};
+use crate::editor_error::{Error, Result};
+use crate::editor_keys::{Action, Keymap, Profile};
+use crate::editor_layout::{Affinity, Caret, Metrics, Viewport, CELL_HEIGHT, CELL_WIDTH};
+use crate::editor_model::{Command, Editor, Selection, TabId};
+use crate::editor_render::{Geometry, Label, Scene, View};
+use crate::editor_text as text;
+use crate::raster::{Rect, Scale, Scrollbar, Surface};
 use std::collections::BTreeMap;
-use td_ui::raster::{Rect, Scale, Scrollbar, Surface};
 
 const MULTI_CLICK_MILLIS: u64 = 500;
 const MULTI_CLICK_SLOP: u64 = 4;
@@ -24,15 +25,15 @@ pub enum Event<'a> {
     /// Byte fixture or already-authorized file-adapter completion, not a path.
     Load(&'a [u8]),
     /// Authorized file/directory completion, including directory navigation.
-    Open(crate::model::Open<'a>),
+    Open(crate::editor_model::Open<'a>),
     /// Authorized file completion: an absent file must not appear saved.
     MissingFile,
     /// Opaque token for the exact state successfully published by the adapter.
-    Saved(crate::model::SavePoint),
+    Saved(crate::editor_model::SavePoint),
     /// Single-use, editor/revision-bound approval from the dialog coordinator.
-    Discard(crate::Discard),
+    Discard(crate::editor_dialog::Discard),
     Reload {
-        permit: crate::Reload,
+        permit: crate::editor_dialog::Reload,
         bytes: &'a [u8],
         missing: bool,
     },
@@ -47,9 +48,9 @@ pub enum Event<'a> {
         command: Command,
     },
     /// Complete a successful EOF transfer; admission rechecks its selection.
-    Paste(crate::clipboard::Paste),
+    Paste(crate::editor_clipboard::Paste),
     /// Delete the captured selection or line after the adapter retains its copy.
-    Cut(crate::clipboard::Snapshot),
+    Cut(crate::editor_clipboard::Snapshot),
     Key {
         tab: TabId,
         revision: u64,
@@ -255,7 +256,7 @@ impl Controller {
     pub fn tab_view(&self, tab: TabId) -> Result<TabView> {
         self.tabs.get(&tab).copied().ok_or(Error::MissingTab)
     }
-    /// The link (`td_ui::links`) over the glyph under the surface pixel
+    /// The link (`crate::links`) over the glyph under the surface pixel
     /// `x`, `y` in the active tab's text, which a Control-press follows;
     /// none over anything else, a directory listing or a scrollbar.
     pub fn link_at(
@@ -314,7 +315,7 @@ impl Controller {
                 .saturating_mul(CELL_WIDTH);
             cell_x >= left && cell_x < right
         });
-        Ok(cell.and_then(|cell| td_ui::links::at(doc.text(), cell.bytes.start)))
+        Ok(cell.and_then(|cell| crate::links::at(doc.text(), cell.bytes.start)))
     }
     /// Points the underline at the link under the surface pixel `x`, `y`
     /// in the active tab's text, or at none: the host's pointer while
@@ -394,9 +395,9 @@ impl Controller {
 
     /// Incidental listing replacement must not switch geometry or reset input
     /// belonging to an unrelated tab while a filesystem job was running.
-    pub(crate) fn refresh_directory(
+    pub fn refresh_directory(
         &mut self,
-        point: crate::model::RevisionPoint,
+        point: crate::editor_model::RevisionPoint,
         bytes: &[u8],
         caret: usize,
     ) -> Result<()> {
@@ -409,7 +410,7 @@ impl Controller {
         if !bytes.is_ascii() || bytes.contains(&b'\r') || caret > bytes.len() {
             return Err(Error::InvalidArgument);
         }
-        self.editor.open(crate::model::Open {
+        self.editor.open(crate::editor_model::Open {
             source: Some(point),
             bytes,
             missing: false,
@@ -453,7 +454,8 @@ impl Controller {
         Ok(Outcome::Changed)
     }
 
-    pub(crate) fn pointer_drag(&self) -> Option<TabId> {
+    /// The tab a text or scrollbar drag in progress belongs to.
+    pub fn pointer_drag(&self) -> Option<TabId> {
         self.drag.map(|drag| match drag {
             Drag::Text(tab, _) | Drag::Scrollbar { tab, .. } => tab,
         })
@@ -468,7 +470,8 @@ impl Controller {
         self.mark = None;
         self.drag = None;
     }
-    pub(crate) fn scrollbar_drag(&self) -> bool {
+    /// Whether the drag in progress is a scrollbar's.
+    pub fn scrollbar_drag(&self) -> bool {
         matches!(self.drag, Some(Drag::Scrollbar { .. }))
     }
     fn wake_caret(&mut self) {
@@ -1322,18 +1325,21 @@ fn line_selection(text: &str, at: usize) -> Result<Selection> {
     })
 }
 
-#[cfg(test)]
 impl Controller {
-    pub(crate) fn generation_for_test(&mut self, value: u64) {
+    /// Test support, public because a consumer's tests are another crate:
+    /// sets the generation counter so a consumer can reach its exhaustion.
+    /// Production advances it only through `dispatch`.
+    #[doc(hidden)]
+    pub fn generation_for_test(&mut self, value: u64) {
         self.generation = value;
     }
 }
 
 #[cfg(test)]
-mod clipboard_admission_tests {
+mod tests {
     use super::*;
-    use crate::clipboard::{Paste, Snapshot};
-    use crate::model::Limits;
+    use crate::editor_clipboard::{Paste, Snapshot};
+    use crate::editor_model::Limits;
 
     #[test]
     fn incidental_directory_refresh_preserves_other_view_input_and_refuses_atomically() {
@@ -1346,7 +1352,7 @@ mod clipboard_admission_tests {
         .unwrap();
         ui.dispatch(Event::Load("x".repeat(200).as_bytes()))
             .unwrap();
-        ui.dispatch(Event::Open(crate::model::Open {
+        ui.dispatch(Event::Open(crate::editor_model::Open {
             source: None,
             bytes: b"old",
             missing: false,

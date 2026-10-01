@@ -1,6 +1,6 @@
 //! Byte-preserving file codec and the shared scalar/column conventions.
 
-use crate::{Error, Result};
+use crate::editor_error::{Error, Result};
 
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const TAB_WIDTH: usize = 8;

@@ -4,8 +4,8 @@
 //! `$XDG_CONFIG_HOME/td-mail/config.toml`, which
 //! td-firstboot provisions once under the login user's jail state. Saved
 //! attachments land in the `xdg-download` grant, the directory Firefox shares.
-//! Composing is in td-mail's own window, in td-editor's document pane
-//! the crate embeds (APPLICATIONS.md §W.8, "Composing in place"), so the
+//! Composing is in td-mail's own window, in td-ui's editor pane the
+//! crate embeds (APPLICATIONS.md §W.8, "Composing in place"), so the
 //! package ships no editor and its manifest names none.
 use crate::application::ApplicationDeclaration;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};

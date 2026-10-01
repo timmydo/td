@@ -1,11 +1,7 @@
 //! Wayland presentation and input, with an optional asynchronous file session.
 
 use crate::control_jobs::ReloadOutcome;
-use crate::dialog::{Close, Closed, Conflict, Scope, Target};
 use crate::font::Font;
-use crate::keys::Profile;
-use crate::render::{Geometry, Label};
-use crate::ui::{Controller, Event, Outcome};
 use crate::wire::Message;
 use std::collections::VecDeque;
 use std::io;
@@ -14,6 +10,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 use td_ui::client::{run, App, Client, ClipboardEvent, Handled, KeyboardEvent, Tag};
 use td_ui::data::{PLAIN, UTF8};
+use td_ui::editor::{Controller, Event, Outcome};
+use td_ui::editor_dialog::{Close, Closed, Conflict, Scope, Target};
+use td_ui::editor_keys::Profile;
+use td_ui::editor_render::{Geometry, Label};
 use td_ui::raster::Raster;
 use td_ui::wayland::{connect, endpoint};
 
@@ -41,7 +41,11 @@ impl Tag for Object {
 struct Clipboard {
     text: Option<std::sync::Arc<str>>,
     incoming: Option<crate::transfer::Incoming>,
-    incoming_target: Option<(crate::model::TabId, u64, crate::model::Selection)>,
+    incoming_target: Option<(
+        td_ui::editor_model::TabId,
+        u64,
+        td_ui::editor_model::Selection,
+    )>,
     outgoing: Option<crate::transfer::Outgoing>,
 }
 
@@ -64,9 +68,9 @@ struct Window {
     /// The outline face a live window draws its text in; `None` draws the
     /// bitmap face, as every test and preview does.
     typeface: Option<td_ui::typeface::Typeface>,
-    labels: Vec<(crate::model::TabId, &'static str)>,
+    labels: Vec<(td_ui::editor_model::TabId, &'static str)>,
     pointer: Pointer,
-    control_pointer: Option<crate::model::RevisionPoint>,
+    control_pointer: Option<td_ui::editor_model::RevisionPoint>,
     frames: crate::control_frame::Frames,
     clock: u64,
     notice: Option<String>,
@@ -125,7 +129,7 @@ enum PathAction {
     Dictionary,
     Rename(crate::files::RenameSource),
     Save {
-        tab: crate::model::TabId,
+        tab: td_ui::editor_model::TabId,
         revision: u64,
     },
 }
@@ -137,7 +141,7 @@ struct PathPrompt {
 }
 struct PathIdentity {
     id: u64,
-    point: crate::model::RevisionPoint,
+    point: td_ui::editor_model::RevisionPoint,
 }
 
 struct DeletePrompt {
@@ -574,7 +578,7 @@ impl Window {
                 self.pointer.x = x;
                 self.pointer.y = y;
                 if !self.menu_hover(x, y) {
-                    self.pointer_action(crate::ui::PointerPhase::Move)?;
+                    self.pointer_action(td_ui::editor::PointerPhase::Move)?;
                 }
             }
             P::Button {
@@ -586,9 +590,9 @@ impl Window {
                     self.pointer.held = pressed;
                     self.activation_serial = pressed.then_some(serial);
                     self.pointer_action(if pressed {
-                        crate::ui::PointerPhase::Press
+                        td_ui::editor::PointerPhase::Press
                     } else {
-                        crate::ui::PointerPhase::Release
+                        td_ui::editor::PointerPhase::Release
                     })?;
                     self.activation_serial = None;
                 }
@@ -631,7 +635,7 @@ impl Window {
 
     fn decoded_scroll(
         &mut self,
-        tab: crate::model::TabId,
+        tab: td_ui::editor_model::TabId,
         revision: u64,
         rows: isize,
         columns: isize,
@@ -664,10 +668,10 @@ impl Window {
         true
     }
 
-    fn pointer_action(&mut self, phase: crate::ui::PointerPhase) -> Result<()> {
+    fn pointer_action(&mut self, phase: td_ui::editor::PointerPhase) -> Result<()> {
         let held = self.client.input().held();
         if held.control
-            && phase == crate::ui::PointerPhase::Press
+            && phase == td_ui::editor::PointerPhase::Press
             && self.menu.is_none()
             && self.follow_link()
         {
@@ -723,14 +727,14 @@ impl Window {
 
     fn decoded_pointer_action(
         &mut self,
-        phase: crate::ui::PointerPhase,
+        phase: td_ui::editor::PointerPhase,
         fixed_x: i32,
         fixed_y: i32,
         extend: bool,
     ) -> Result<()> {
         let raw_x = i64::from(fixed_x).div_euclid(256);
         let raw_y = i64::from(fixed_y).div_euclid(256);
-        if phase == crate::ui::PointerPhase::Press && self.menu_pointer(raw_x, raw_y)? {
+        if phase == td_ui::editor::PointerPhase::Press && self.menu_pointer(raw_x, raw_y)? {
             self.pointer.held = false;
             return Ok(());
         }
@@ -752,7 +756,7 @@ impl Window {
             && y >= area.y
             && y < area.y + i64::from(area.height);
         if text
-            && phase == crate::ui::PointerPhase::Press
+            && phase == td_ui::editor::PointerPhase::Press
             && self.ui.editor().document(tab).map_err(error)?.directory()
         {
             let (columns, rows) = geometry.grid();
@@ -772,16 +776,17 @@ impl Window {
             }
             return Ok(());
         }
-        let x = if !self.ui.scrollbar_drag() && (text || phase != crate::ui::PointerPhase::Press) {
-            let ceil = x + i64::from(fixed_x.rem_euclid(256) != 0);
-            if text {
-                ceil.min(area.x + i64::from(area.width) - 1)
+        let x =
+            if !self.ui.scrollbar_drag() && (text || phase != td_ui::editor::PointerPhase::Press) {
+                let ceil = x + i64::from(fixed_x.rem_euclid(256) != 0);
+                if text {
+                    ceil.min(area.x + i64::from(area.width) - 1)
+                } else {
+                    ceil
+                }
             } else {
-                ceil
-            }
-        } else {
-            x
-        };
+                x
+            };
         let before = self.ui.generation();
         let outcome = match self.ui.dispatch(Event::Pointer {
             tab,
@@ -1786,7 +1791,7 @@ impl Window {
         &mut self,
         operation: &crate::control::Operation,
     ) -> crate::Result<()> {
-        use crate::ui::PointerPhase;
+        use td_ui::editor::PointerPhase;
         let crate::control::Operation::Pointer {
             tab,
             revision,
@@ -1821,7 +1826,7 @@ impl Window {
                 .as_ref()
                 .ok_or(crate::Error::Unavailable)?;
             self.ui.editor().check_revision(gesture)?;
-            if gesture.tab != tab || self.ui.pointer_drag() != Some(tab) {
+            if gesture.tab() != tab || self.ui.pointer_drag() != Some(tab) {
                 return Err(crate::Error::Unavailable);
             }
         }
@@ -2380,10 +2385,10 @@ impl Window {
     ) -> crate::Result<ControlAnswer> {
         let prompt = self.prompt.as_ref().ok_or(crate::Error::Unavailable)?;
         let identity = prompt.identity.as_ref().ok_or(crate::Error::Unavailable)?;
-        if dialog == 0 || dialog != identity.id || target.tab != identity.point.tab {
+        if dialog == 0 || dialog != identity.id || target.tab != identity.point.tab() {
             return Err(crate::Error::InvalidArgument);
         }
-        if target.revision != identity.point.revision {
+        if target.revision != identity.point.revision() {
             return Err(crate::Error::StaleRevision);
         }
         self.ui.editor().check_revision(&identity.point)?;
@@ -2585,7 +2590,9 @@ impl Window {
                     if self.ui.editor().check_revision(&identity.point).is_ok() {
                         fields.push_str(&format!(
                             "{},{scope},path,{},{},cancel+path",
-                            identity.id, identity.point.tab, identity.point.revision
+                            identity.id,
+                            identity.point.tab(),
+                            identity.point.revision()
                         ));
                     } else {
                         fields.push_str(&format!("{},{scope},invalid,-,-,-", identity.id));
@@ -2676,7 +2683,7 @@ impl Window {
                 self.ui
                     .editor()
                     .check_revision(&identity.point)
-                    .map(|()| (identity.point.tab, identity.point.revision))
+                    .map(|()| (identity.point.tab(), identity.point.revision()))
             } else {
                 self.closing
                     .as_ref()
@@ -2793,10 +2800,10 @@ impl Window {
                 flag(self.control_pointer_available()),
                 flag(self.control_wheel_available()),
                 self.control_pointer.as_ref().filter(|point| {
-                    self.ui.pointer_drag() == Some(point.tab)
-                        && self.ui.editor().active() == Some(point.tab)
+                    self.ui.pointer_drag() == Some(point.tab())
+                        && self.ui.editor().active() == Some(point.tab())
                         && self.ui.editor().check_revision(point).is_ok()
-                }).map_or_else(|| "-".into(), |point| format!("{},{}", point.tab, point.revision)),
+                }).map_or_else(|| "-".into(), |point| format!("{},{}", point.tab(), point.revision())),
                 flag(self.client.configured()),
                 flag(self.files.is_some()),
                 flag(self.files.as_ref().is_some_and(|files| files.busy())),
@@ -2946,6 +2953,7 @@ impl Window {
             menu,
             ..
         } = self;
+        let (spelling_status, spelling_marks) = spelling.view(ui.editor());
         let presented = client.present(width, height, &mut |pixels| {
             let mut raster = Raster::new(pixels, font, geometry.surface(), width * 4)
                 .map_err(error)?
@@ -2954,7 +2962,7 @@ impl Window {
                 .paint(
                     &ui.scene(&labels)
                         .map_err(error)?
-                        .spelling(spelling)
+                        .spelling(&spelling_status, spelling_marks)
                         .notice(status_notice),
                     geometry.bounds(),
                 )
@@ -3017,7 +3025,7 @@ impl Window {
         let can_copy = self.client.input().focused
             && self.client.clipboard()
             && self.clipboard.outgoing.is_none()
-            && crate::clipboard::capture_range(doc).is_ok_and(|range| !range.is_empty());
+            && td_ui::editor_clipboard::capture_range(doc).is_ok_and(|range| !range.is_empty());
         let data = crate::menu::Data {
             target: Target {
                 tab,
@@ -3274,17 +3282,17 @@ impl Window {
             Item::Undo => Event::Edit {
                 tab,
                 revision,
-                command: crate::model::Command::Undo,
+                command: td_ui::editor_model::Command::Undo,
             },
             Item::Redo => Event::Edit {
                 tab,
                 revision,
-                command: crate::model::Command::Redo,
+                command: td_ui::editor_model::Command::Redo,
             },
             Item::SelectAll => Event::Edit {
                 tab,
                 revision,
-                command: crate::model::Command::Select(crate::model::Selection {
+                command: td_ui::editor_model::Command::Select(td_ui::editor_model::Selection {
                     anchor: 0,
                     caret: self.ui.editor().document(tab).map_err(error)?.text().len(),
                 }),
@@ -3300,12 +3308,12 @@ impl Window {
             Item::AutoFill => Event::Edit {
                 tab,
                 revision,
-                command: crate::model::Command::AutoFill(!auto_fill),
+                command: td_ui::editor_model::Command::AutoFill(!auto_fill),
             },
             Item::Fill => Event::Edit {
                 tab,
                 revision,
-                command: crate::model::Command::FillParagraph,
+                command: td_ui::editor_model::Command::FillParagraph,
             },
             Item::About => {
                 self.notify("td-editor: experimental Wayland text editor. Pure std Rust; bitmap Unifont, warm palette. UTF-8 clipboard needs data-device v3. F7 checks spelling with an explicit local word list. No crash recovery or mail integration. F10 opens menus.");
@@ -3355,7 +3363,7 @@ impl Window {
         Ok(())
     }
 
-    fn close_tab(&mut self, tab: crate::model::TabId, revision: u64) {
+    fn close_tab(&mut self, tab: td_ui::editor_model::TabId, revision: u64) {
         if self.files.is_some() {
             let _ = self.start_close(Scope::Tab { tab, revision });
             return;
@@ -3568,7 +3576,7 @@ impl Window {
         }
     }
 
-    fn start_reload(&mut self, target: Target, permit: crate::Reload) -> bool {
+    fn start_reload(&mut self, target: Target, permit: td_ui::editor_dialog::Reload) -> bool {
         self.conflict = None;
         let result = self
             .files
@@ -3775,7 +3783,7 @@ impl Window {
 
     fn spelling_request(
         &mut self,
-        tab: crate::model::TabId,
+        tab: td_ui::editor_model::TabId,
         revision: u64,
     ) -> crate::Result<Option<u64>> {
         if self.ui.editor().document(tab)?.directory() {
@@ -3830,7 +3838,7 @@ impl Window {
             .dispatch(Event::Edit {
                 tab,
                 revision,
-                command: crate::model::Command::Select(crate::model::Selection {
+                command: td_ui::editor_model::Command::Select(td_ui::editor_model::Selection {
                     anchor: range.start,
                     caret: range.end,
                 }),
@@ -3841,7 +3849,7 @@ impl Window {
         Ok(())
     }
 
-    fn directory_entry_path(&self, tab: crate::model::TabId) -> Option<PathBuf> {
+    fn directory_entry_path(&self, tab: td_ui::editor_model::TabId) -> Option<PathBuf> {
         let doc = self.ui.editor().document(tab).ok()?;
         let row = doc
             .text()
@@ -3852,7 +3860,7 @@ impl Window {
         self.files.as_ref()?.directory(tab)?.entry(row)
     }
 
-    fn mark_directory(&mut self, tab: crate::model::TabId, revision: u64, delete: bool) {
+    fn mark_directory(&mut self, tab: td_ui::editor_model::TabId, revision: u64, delete: bool) {
         let result = self
             .files
             .as_mut()
@@ -3873,7 +3881,7 @@ impl Window {
         }
     }
 
-    fn delete_request(&mut self, tab: crate::model::TabId, revision: u64) {
+    fn delete_request(&mut self, tab: td_ui::editor_model::TabId, revision: u64) {
         let prepared = (|| -> Result<(crate::files::DeletePlan, PathIdentity)> {
             let files = self.files.as_ref().ok_or("Not a file window")?;
             if files.busy() {
@@ -3913,7 +3921,7 @@ impl Window {
         }
     }
 
-    fn copy_request(&mut self, tab: crate::model::TabId, revision: u64) {
+    fn copy_request(&mut self, tab: td_ui::editor_model::TabId, revision: u64) {
         let prepared = (|| -> Result<(crate::files::RenameSource, PathIdentity)> {
             let files = self.files.as_ref().ok_or("Not a file window")?;
             if files.busy() {
@@ -3961,7 +3969,7 @@ impl Window {
         }
     }
 
-    fn mkdir_request(&mut self, tab: crate::model::TabId, revision: u64) {
+    fn mkdir_request(&mut self, tab: td_ui::editor_model::TabId, revision: u64) {
         let prepared = (|| -> Result<(crate::files::DirectorySource, PathIdentity)> {
             let files = self.files.as_ref().ok_or("Not a file window")?;
             if files.busy() {
@@ -4001,7 +4009,7 @@ impl Window {
         }
     }
 
-    fn rename_request(&mut self, tab: crate::model::TabId, revision: u64) {
+    fn rename_request(&mut self, tab: td_ui::editor_model::TabId, revision: u64) {
         let prepared = (|| -> Result<(crate::files::RenameSource, PathIdentity)> {
             let files = self.files.as_ref().ok_or("Not a file window")?;
             if files.busy() {
@@ -4051,7 +4059,7 @@ impl Window {
 
     fn sort_directory(
         &mut self,
-        tab: crate::model::TabId,
+        tab: td_ui::editor_model::TabId,
         revision: u64,
         sort: crate::directory::Sort,
         reverse: bool,
@@ -4077,7 +4085,7 @@ impl Window {
 
     fn browse_directory(
         &mut self,
-        tab: crate::model::TabId,
+        tab: td_ui::editor_model::TabId,
         revision: u64,
         path: std::path::PathBuf,
         new_tab: bool,
@@ -4095,7 +4103,7 @@ impl Window {
         });
     }
 
-    fn file_request(&mut self, name: &str, tab: crate::model::TabId, revision: u64) -> bool {
+    fn file_request(&mut self, name: &str, tab: td_ui::editor_model::TabId, revision: u64) -> bool {
         if matches!(name, "save" | "save-as")
             && self
                 .ui
@@ -4212,8 +4220,8 @@ impl Window {
                             self.ui.editor().check_revision(&identity.point)?;
                             self.control_delete_job(
                                 Target {
-                                    tab: identity.point.tab,
-                                    revision: identity.point.revision,
+                                    tab: identity.point.tab(),
+                                    revision: identity.point.revision(),
                                 },
                                 review.plan.clone(),
                             )
@@ -4247,8 +4255,8 @@ impl Window {
                             self.ui.editor().check_revision(&identity.point)?;
                             self.control_copy_job(
                                 Target {
-                                    tab: identity.point.tab,
-                                    revision: identity.point.revision,
+                                    tab: identity.point.tab(),
+                                    revision: identity.point.revision(),
                                 },
                                 source.clone(),
                                 std::ffi::OsString::from(&prompt.text),
@@ -4268,8 +4276,8 @@ impl Window {
                             self.ui.editor().check_revision(&identity.point)?;
                             self.control_mkdir_job(
                                 Target {
-                                    tab: identity.point.tab,
-                                    revision: identity.point.revision,
+                                    tab: identity.point.tab(),
+                                    revision: identity.point.revision(),
                                 },
                                 source.clone(),
                                 std::ffi::OsString::from(&prompt.text),
@@ -4304,8 +4312,8 @@ impl Window {
                             self.ui.editor().check_revision(&identity.point)?;
                             self.control_rename_job(
                                 Target {
-                                    tab: identity.point.tab,
-                                    revision: identity.point.revision,
+                                    tab: identity.point.tab(),
+                                    revision: identity.point.revision(),
                                 },
                                 source.clone(),
                                 std::ffi::OsString::from(&prompt.text),
@@ -4497,7 +4505,7 @@ impl Window {
         })
     }
 
-    fn replace_request(&mut self, tab: crate::model::TabId, revision: u64) -> Result<()> {
+    fn replace_request(&mut self, tab: td_ui::editor_model::TabId, revision: u64) -> Result<()> {
         let prompt =
             match crate::replace::Prompt::new(self.ui.editor(), tab, revision, &self.searches) {
                 Ok(prompt) => prompt,
@@ -4556,7 +4564,7 @@ impl Window {
         Ok(())
     }
 
-    fn command_request(&mut self, tab: crate::model::TabId, revision: u64) -> Result<()> {
+    fn command_request(&mut self, tab: td_ui::editor_model::TabId, revision: u64) -> Result<()> {
         let prompt = match crate::command::Prompt::new(self.ui.editor(), tab, revision) {
             Ok(prompt) => prompt,
             Err(detail) => {
@@ -4638,7 +4646,7 @@ impl Window {
 
     fn number_request(
         &mut self,
-        tab: crate::model::TabId,
+        tab: td_ui::editor_model::TabId,
         revision: u64,
         kind: crate::number::Kind,
     ) -> Result<()> {
@@ -4732,7 +4740,7 @@ impl Window {
     fn search_request(
         &mut self,
         name: &str,
-        tab: crate::model::TabId,
+        tab: td_ui::editor_model::TabId,
         revision: u64,
     ) -> Result<()> {
         self.menu = None;
@@ -4776,7 +4784,13 @@ impl Window {
         Ok(())
     }
 
-    fn find(&mut self, tab: crate::model::TabId, revision: u64, query: &str, backward: bool) {
+    fn find(
+        &mut self,
+        tab: td_ui::editor_model::TabId,
+        revision: u64,
+        query: &str,
+        backward: bool,
+    ) {
         use crate::search::Found;
         let result = self
             .searches
@@ -4858,7 +4872,7 @@ impl Window {
     fn clipboard_request(
         &mut self,
         name: &str,
-        tab: crate::model::TabId,
+        tab: td_ui::editor_model::TabId,
         revision: u64,
     ) -> Result<()> {
         if !self.client.input().focused || self.pointer_modal() || !self.client.clipboard() {
@@ -4929,7 +4943,7 @@ impl Window {
             };
             let Some(text) = path
                 .to_str()
-                .filter(|text| text.len() <= crate::clipboard::MAX_BYTES)
+                .filter(|text| text.len() <= td_ui::editor_clipboard::MAX_BYTES)
             else {
                 self.notify("Copy path refused: path is not bounded UTF-8 clipboard text.");
                 return Ok(());
@@ -4949,24 +4963,25 @@ impl Window {
             self.notify("Cut unavailable in this view.");
             return Ok(());
         }
-        let snapshot = match crate::clipboard::Snapshot::capture(self.ui.editor(), tab, revision) {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
-                self.notify(if name == "cut" {
-                    "Nothing to cut."
-                } else {
-                    "Nothing to copy."
-                });
-                return Ok(());
-            }
-            Err(e) => {
-                self.notify(format!(
-                    "{} refused: {e}",
-                    if name == "cut" { "Cut" } else { "Copy" }
-                ));
-                return Ok(());
-            }
-        };
+        let snapshot =
+            match td_ui::editor_clipboard::Snapshot::capture(self.ui.editor(), tab, revision) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => {
+                    self.notify(if name == "cut" {
+                        "Nothing to cut."
+                    } else {
+                        "Nothing to copy."
+                    });
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.notify(format!(
+                        "{} refused: {e}",
+                        if name == "cut" { "Cut" } else { "Copy" }
+                    ));
+                    return Ok(());
+                }
+            };
         self.offer_clipboard(snapshot.text(), serial)?;
         if name == "cut" {
             match self.ui.dispatch(Event::Cut(snapshot)) {
@@ -5069,7 +5084,8 @@ impl Window {
 
 fn paint_prompt(raster: &mut Raster<'_, '_>, geometry: Geometry, text: &str) {
     let prompt = geometry.prompt();
-    let rows = prompt.height as usize / (crate::layout::CELL_HEIGHT * geometry.scale().value());
+    let rows =
+        prompt.height as usize / (td_ui::editor_layout::CELL_HEIGHT * geometry.scale().value());
     if let Some(block) = td_ui::chrome::Block::new(geometry.surface(), prompt.y, rows) {
         block.emit(text, geometry.bounds(), &mut |draw| raster.draw(draw));
     }
@@ -5200,7 +5216,6 @@ mod tests {
     }
     use super::*;
     type Kind = td_ui::client::Kind<Object>;
-    use crate::layout::CELL_WIDTH;
     use crate::wire::{self, Builder, Cursor};
     use std::fs::File;
     use std::io::{Read, Write};
@@ -5214,6 +5229,7 @@ mod tests {
         XDG_SURFACE,
     };
     use td_ui::data::Board;
+    use td_ui::editor_layout::CELL_WIDTH;
     use td_ui::wayland::{backing_file, Connection, Endpoint};
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
@@ -5404,7 +5420,7 @@ mod tests {
         pointer_button(&mut w, false);
         assert_eq!(
             caret(&w),
-            crate::model::Selection {
+            td_ui::editor_model::Selection {
                 anchor: 15,
                 caret: 15
             },
@@ -5523,7 +5539,7 @@ mod tests {
         pointer_move(&mut w, area.x + 24, area.y);
         assert_eq!(
             w.ui.editor().document(tab).unwrap().selection(),
-            crate::model::Selection {
+            td_ui::editor_model::Selection {
                 anchor: 1,
                 caret: 4
             }
@@ -5533,7 +5549,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             w.ui.editor().document(tab).unwrap().selection(),
-            crate::model::Selection {
+            td_ui::editor_model::Selection {
                 anchor: 1,
                 caret: 0
             }
@@ -5578,7 +5594,7 @@ mod tests {
         pointer_button(&mut w, true);
         assert_eq!(
             w.ui.editor().document(tab).unwrap().selection(),
-            crate::model::Selection {
+            td_ui::editor_model::Selection {
                 anchor: text.len().saturating_sub(1),
                 caret: text.len()
             }
@@ -5638,7 +5654,7 @@ mod tests {
         pointer_button(&mut w, true);
         assert_eq!(
             w.ui.editor().document(tab).unwrap().selection(),
-            crate::model::Selection {
+            td_ui::editor_model::Selection {
                 anchor: 1,
                 caret: 4
             }
@@ -5664,7 +5680,7 @@ mod tests {
         pointer_button(&mut w, true);
         assert_eq!(
             w.ui.editor().document(tab).unwrap().selection(),
-            crate::model::Selection {
+            td_ui::editor_model::Selection {
                 anchor: 2,
                 caret: 2
             }
@@ -5679,7 +5695,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab: active,
             revision: 0,
-            command: crate::model::Command::Insert("keep".into()),
+            command: td_ui::editor_model::Command::Insert("keep".into()),
         })
         .unwrap();
         pointer_enter(&mut w);
@@ -5717,7 +5733,7 @@ mod tests {
             w.ui.dispatch(Event::Pointer {
                 tab,
                 revision,
-                phase: crate::ui::PointerPhase::Move,
+                phase: td_ui::editor::PointerPhase::Move,
                 x: 799,
                 cell_x: 799,
                 y: 599,
@@ -5947,10 +5963,12 @@ mod tests {
                         w.ui.dispatch(Event::Edit {
                             tab: 1,
                             revision: 0,
-                            command: crate::model::Command::Select(crate::model::Selection {
-                                anchor: at,
-                                caret: at,
-                            }),
+                            command: td_ui::editor_model::Command::Select(
+                                td_ui::editor_model::Selection {
+                                    anchor: at,
+                                    caret: at,
+                                },
+                            ),
                         })
                         .unwrap();
                         w.tick(now, false).unwrap();
@@ -6034,7 +6052,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab: 2,
             revision: 0,
-            command: crate::model::Command::Select(crate::model::Selection {
+            command: td_ui::editor_model::Command::Select(td_ui::editor_model::Selection {
                 anchor: 0,
                 caret: 7,
             }),
@@ -6185,7 +6203,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab: 1,
             revision: 0,
-            command: crate::model::Command::Select(crate::model::Selection {
+            command: td_ui::editor_model::Command::Select(td_ui::editor_model::Selection {
                 anchor: 2,
                 caret: 0,
             }),
@@ -6318,7 +6336,7 @@ mod tests {
             assert!(!w.file_request("save-as", 1, 0));
             assert!(w.prompt.is_none());
             w.decoded_pointer_action(
-                crate::ui::PointerPhase::Press,
+                td_ui::editor::PointerPhase::Press,
                 (40 * scale * 256) as i32,
                 (56 * scale * 256) as i32,
                 true,
@@ -6332,7 +6350,7 @@ mod tests {
                 Some(directory.0.as_path())
             );
             w.decoded_pointer_action(
-                crate::ui::PointerPhase::Press,
+                td_ui::editor::PointerPhase::Press,
                 (40 * scale * 256) as i32,
                 (56 * scale * 256) as i32,
                 false,
@@ -6526,7 +6544,7 @@ mod tests {
             w.ui.dispatch(Event::Edit {
                 tab: 1,
                 revision: 1,
-                command: crate::model::Command::Undo,
+                command: td_ui::editor_model::Command::Undo,
             })
             .unwrap();
             assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
@@ -6539,7 +6557,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab: 1,
             revision: 0,
-            command: crate::model::Command::Select(crate::model::Selection::default()),
+            command: td_ui::editor_model::Command::Select(td_ui::editor_model::Selection::default()),
         })
         .unwrap();
         w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
@@ -6552,7 +6570,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab: 1,
             revision: 1,
-            command: crate::model::Command::Undo,
+            command: td_ui::editor_model::Command::Undo,
         })
         .unwrap();
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
@@ -6592,7 +6610,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab: 1,
             revision: 0,
-            command: crate::model::Command::Insert("changed".into()),
+            command: td_ui::editor_model::Command::Insert("changed".into()),
         })
         .unwrap();
         let (mut reader, writer) = UnixStream::pair().unwrap();
@@ -6701,7 +6719,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab: 1,
             revision: 1,
-            command: crate::model::Command::Undo,
+            command: td_ui::editor_model::Command::Undo,
         })
         .unwrap();
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
@@ -6729,10 +6747,12 @@ mod tests {
                     w.ui.dispatch(Event::Edit {
                         tab: 1,
                         revision: 0,
-                        command: crate::model::Command::Select(crate::model::Selection {
-                            anchor: 2,
-                            caret: 0,
-                        }),
+                        command: td_ui::editor_model::Command::Select(
+                            td_ui::editor_model::Selection {
+                                anchor: 2,
+                                caret: 0,
+                            },
+                        ),
                     })
                     .unwrap();
                 }
@@ -6841,7 +6861,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab: 1,
             revision: 0,
-            command: crate::model::Command::Select(crate::model::Selection::default()),
+            command: td_ui::editor_model::Command::Select(td_ui::editor_model::Selection::default()),
         })
         .unwrap();
         key(&mut w, keyboard, 46);
@@ -6853,7 +6873,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab: 1,
             revision: 0,
-            command: crate::model::Command::Select(crate::model::Selection {
+            command: td_ui::editor_model::Command::Select(td_ui::editor_model::Selection {
                 anchor: "é abc\n".len(),
                 caret: "é abc\n".len(),
             }),
@@ -6870,7 +6890,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab: 1,
             revision: 0,
-            command: crate::model::Command::Select(crate::model::Selection::default()),
+            command: td_ui::editor_model::Command::Select(td_ui::editor_model::Selection::default()),
         })
         .unwrap();
         w.ui.dispatch(Event::ReadOnly {
@@ -6883,12 +6903,12 @@ mod tests {
         assert_eq!(w.client.source(), Some(line_source));
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
         assert!(drain(&peer).0.is_empty());
-        let large = vec![b'x'; crate::clipboard::MAX_BYTES + 1];
+        let large = vec![b'x'; td_ui::editor_clipboard::MAX_BYTES + 1];
         w.ui.dispatch(Event::Load(&large)).unwrap();
         w.ui.dispatch(Event::Edit {
             tab: 2,
             revision: 0,
-            command: crate::model::Command::Select(crate::model::Selection {
+            command: td_ui::editor_model::Command::Select(td_ui::editor_model::Selection {
                 anchor: 0,
                 caret: large.len(),
             }),
@@ -7275,9 +7295,9 @@ mod tests {
                 tab: 2,
                 revision: 0,
                 command: if kind == K::FillColumn {
-                    crate::model::Command::FillColumn(80)
+                    td_ui::editor_model::Command::FillColumn(80)
                 } else {
-                    crate::model::Command::Select(crate::model::Selection {
+                    td_ui::editor_model::Command::Select(td_ui::editor_model::Selection {
                         anchor: 0,
                         caret: 1,
                     })
@@ -7797,7 +7817,7 @@ mod tests {
             w.ui.dispatch(Event::Edit {
                 tab: 1,
                 revision: 1,
-                command: crate::model::Command::Insert("z".into()),
+                command: td_ui::editor_model::Command::Insert("z".into()),
             })
             .unwrap();
             let answer = prompt_snapshot(&mut w);
@@ -7818,7 +7838,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab: 2,
             revision: 0,
-            command: crate::model::Command::Select(crate::model::Selection {
+            command: td_ui::editor_model::Command::Select(td_ui::editor_model::Selection {
                 anchor: 0,
                 caret: 1,
             }),
@@ -8378,9 +8398,9 @@ mod tests {
         let x = (bar.thumb.x as i32 + 2) * 256 + 128;
         let y = (bar.thumb.y as i32 + 2) * 256 + 128;
         for phase in [
-            crate::ui::PointerPhase::Press,
-            crate::ui::PointerPhase::Move,
-            crate::ui::PointerPhase::Release,
+            td_ui::editor::PointerPhase::Press,
+            td_ui::editor::PointerPhase::Move,
+            td_ui::editor::PointerPhase::Release,
         ] {
             w.decoded_pointer_action(phase, x, y, false).unwrap();
             assert_eq!(w.ui.tab_view(2).unwrap().viewport.origin().column, 137);
@@ -8620,7 +8640,7 @@ mod tests {
                 w.ui.dispatch(Event::Edit {
                     tab: 1,
                     revision: 0,
-                    command: crate::model::Command::Insert("x".into()),
+                    command: td_ui::editor_model::Command::Insert("x".into()),
                 })
                 .unwrap();
             } else {
@@ -8727,14 +8747,14 @@ mod tests {
         let owner = w
             .control_pointer
             .as_ref()
-            .map(|point| (point.tab, point.revision));
+            .map(|point| (point.tab(), point.revision()));
         w.tick(500, false).unwrap();
         assert_eq!(w.frames.input_generation(), Ok(input));
         assert_eq!(w.frames.generation(), Ok(redraw + 1));
         assert_eq!(
             w.control_pointer
                 .as_ref()
-                .map(|point| (point.tab, point.revision)),
+                .map(|point| (point.tab(), point.revision())),
             owner
         );
         w.ui.editor()
@@ -8780,8 +8800,8 @@ mod tests {
                 configure(w, 800, 600);
                 w.ui.dispatch(Event::Profile(profile)).unwrap();
                 for command in [
-                    crate::model::Command::FillColumn(20),
-                    crate::model::Command::AutoFill(true),
+                    td_ui::editor_model::Command::FillColumn(20),
+                    td_ui::editor_model::Command::AutoFill(true),
                 ] {
                     w.ui.dispatch(Event::Edit {
                         tab: 1,
@@ -10524,7 +10544,7 @@ mod tests {
                     w.ui.dispatch(Event::Edit {
                         tab: 1,
                         revision: 0,
-                        command: crate::model::Command::Insert("x".into()),
+                        command: td_ui::editor_model::Command::Insert("x".into()),
                     })
                     .unwrap();
                 }
@@ -11635,13 +11655,13 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab: 1,
             revision: 1,
-            command: crate::model::Command::Insert("b".into()),
+            command: td_ui::editor_model::Command::Insert("b".into()),
         })
         .unwrap();
         w.ui.dispatch(Event::Edit {
             tab: 1,
             revision: 2,
-            command: crate::model::Command::Undo,
+            command: td_ui::editor_model::Command::Undo,
         })
         .unwrap();
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "a");
@@ -11727,7 +11747,7 @@ mod tests {
         assert_eq!(new.revision(), 0);
         assert_eq!(
             new.selection(),
-            crate::model::Selection {
+            td_ui::editor_model::Selection {
                 anchor: 0,
                 caret: 0
             }
@@ -12277,7 +12297,7 @@ mod tests {
         assert_eq!(doc.fill_column(), 20);
         assert_eq!(
             doc.selection(),
-            crate::model::Selection {
+            td_ui::editor_model::Selection {
                 anchor: 24,
                 caret: 24
             }
@@ -12297,7 +12317,7 @@ mod tests {
         w.chord("C-a", false).unwrap(); // Emacs: logical line beginning.
         assert_eq!(
             w.ui.editor().document(tab).unwrap().selection(),
-            crate::model::Selection {
+            td_ui::editor_model::Selection {
                 anchor: 24,
                 caret: 24
             }
@@ -12317,7 +12337,7 @@ mod tests {
         w.chord("C-a", false).unwrap(); // Windows: select all.
         assert_eq!(
             w.ui.editor().document(tab).unwrap().selection(),
-            crate::model::Selection {
+            td_ui::editor_model::Selection {
                 anchor: 0,
                 caret: text.len()
             }
@@ -12430,7 +12450,7 @@ mod tests {
         assert_eq!(doc.text(), "λ good λ good");
         assert_eq!(
             doc.selection(),
-            crate::model::Selection {
+            td_ui::editor_model::Selection {
                 anchor: 15,
                 caret: 15
             }
@@ -12820,7 +12840,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab,
             revision: 0,
-            command: crate::model::Command::Insert("a".repeat(256 * 1024)),
+            command: td_ui::editor_model::Command::Insert("a".repeat(256 * 1024)),
         })
         .unwrap();
         let revision = w.ui.editor().document(tab).unwrap().revision();
@@ -13003,7 +13023,7 @@ mod tests {
             w.chord("Return", false).unwrap();
             assert_eq!(
                 w.ui.editor().document(tab).unwrap().selection(),
-                crate::model::Selection {
+                td_ui::editor_model::Selection {
                     anchor: 0,
                     caret: 1
                 }
@@ -13020,13 +13040,13 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab,
             revision: 0,
-            command: crate::model::Command::Insert("one two three four five six".into()),
+            command: td_ui::editor_model::Command::Insert("one two three four five six".into()),
         })
         .unwrap();
         w.ui.dispatch(Event::Edit {
             tab,
             revision: 1,
-            command: crate::model::Command::FillColumn(20),
+            command: td_ui::editor_model::Command::FillColumn(20),
         })
         .unwrap();
         menu_click(&mut w, Group::Edit, 7);
@@ -13090,7 +13110,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab,
             revision: 1,
-            command: crate::model::Command::Insert("y".into()),
+            command: td_ui::editor_model::Command::Insert("y".into()),
         })
         .unwrap();
         let before = format!("{:?}", w.ui.editor());
@@ -13372,7 +13392,7 @@ mod tests {
                     w.ui.dispatch(Event::Edit {
                         tab: 1,
                         revision: 0,
-                        command: crate::model::Command::Insert("changed".into()),
+                        command: td_ui::editor_model::Command::Insert("changed".into()),
                     })
                     .unwrap();
                 }
@@ -14284,7 +14304,7 @@ mod tests {
         w.ui.dispatch(Event::Edit {
             tab,
             revision: 1,
-            command: crate::model::Command::Insert("b".into()),
+            command: td_ui::editor_model::Command::Insert("b".into()),
         })
         .unwrap();
         caption(&w);
@@ -14595,7 +14615,7 @@ mod tests {
 
     #[test]
     fn modal_cancel_preserves_selection_prefix_and_next_input() {
-        use crate::model::{Command, Selection};
+        use td_ui::editor_model::{Command, Selection};
         for profile in [Profile::Windows, Profile::Emacs] {
             for cancel in ["Escape", "C-g"] {
                 let (mut w, peer, device) = seat_fixture();

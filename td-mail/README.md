@@ -1,11 +1,11 @@
 # td-mail (Timmy's Mail Console)
 
-`td-mail` is a Rust mail client (MUA) for reading and triaging email over JMAP, in a td-ui window: mailboxes, messages and threads as lists, a message read in td-editor's document view.
+`td-mail` is a Rust mail client (MUA) for reading and triaging email over JMAP, in a td-ui window: mailboxes, messages and threads as lists, a message read in td-ui's editor pane.
 
 ## Goals
 
 - Fast, keyboard-first email workflow in a window on td's compositor: lists to move through, a document view to read in, an action bar for the pointer.
-- Composition in place: a draft is edited in the window, in td-editor's document view, and retained as a file.
+- Composition in place: a draft is edited in the window, in td-ui's editor pane, and retained as a file.
 - Clear separation of concerns: `td-mail` reads/manages mail; message submission is the server's, through JMAP, so td-mail encodes no MIME and speaks no SMTP.
 - Scriptable automation through a JSON-over-stdin/stdout CLI mode.
 
@@ -29,8 +29,8 @@ Missing directories are created private; an existing draft directory must
 already be private and must not itself be a symlink. Files are mode 0600.
 These checks are not protection against a hostile ancestor-directory owner.
 
-The retained file is then opened in the window, in td-editor's document
-view, editable, with paragraphs filled as they are typed: Ctrl-S writes
+The retained file is then opened in the window, in td-ui's editor
+pane, editable, with paragraphs filled as they are typed: Ctrl-S writes
 what is in the window over the file, whole or not at all (a private
 sibling is written and renamed over the draft, so a write that fails
 leaves the draft as it was, and a symlink put at the path is replaced

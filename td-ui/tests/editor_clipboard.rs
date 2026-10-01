@@ -4,11 +4,11 @@
     reason = "asserted fixtures"
 )]
 
-use td_editor::clipboard::{Paste, Snapshot, MAX_BYTES};
-use td_editor::keys::Profile;
-use td_editor::model::{Command, Selection};
-use td_editor::ui::{Controller, Event, Outcome};
-use td_editor::Error;
+use td_ui::editor::{Controller, Event, Outcome};
+use td_ui::editor_clipboard::{Paste, Snapshot, MAX_BYTES};
+use td_ui::editor_error::Error;
+use td_ui::editor_keys::Profile;
+use td_ui::editor_model::{Command, Selection};
 
 fn loaded(bytes: &[u8]) -> Controller {
     let mut ui = Controller::default();

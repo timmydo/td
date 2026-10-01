@@ -2535,7 +2535,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // the headless modes are proven by td-editor-test on recipe-checks.
     assert_no_preflight!("td-editor/src/main.rs", "local-source-roster");
     assert_no_preflight!("td-editor/Cargo.lock", "local-source-roster");
-    assert_no_preflight!("td-editor/tests/core.rs", "local-source-roster");
+    assert_no_preflight!("td-editor/tests/replay.rs", "local-source-roster");
     assert_no_preflight!("td-editor/DESIGN.md", "local-source-roster");
     assert_preflight!("td-editor/src/main.rs", "cargo-test");
     assert_target!("td-editor/src/main.rs", "check");
@@ -5720,8 +5720,9 @@ mod tests {
         // td-authd compiles td-install's consent codec by `#[path]`.
         assert_eq!(readers_of("td-install"), ["td-authd", "td-setup"]);
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
-        // td-mail and td-news depend on the editor for their document pane.
-        assert_eq!(readers_of("td-editor"), ["td-mail", "td-news"]);
+        // td-mail and td-news take their document pane from td-ui's editor
+        // core; nothing reads td-editor.
+        assert!(readers_of("td-editor").is_empty(), "{readers:?}");
         // Public VM retention-ref and guest workspace paths also spell td-vm/.
         // Authd's fixed task-terminal directory joins the compositor and guest
         // helper as a conservative textual reader of the VM crate.
@@ -8390,9 +8391,9 @@ mod tests {
             "td-editor/Cargo.lock",
             "td-editor/.gitignore",
             "td-editor/clippy.toml",
-            "td-editor/src/model.rs",
+            "td-editor/src/session.rs",
             "td-editor/src/io/file.rs",
-            "td-editor/tests/core.rs",
+            "td-editor/tests/replay.rs",
         ];
         // The editor's own commands ride beside the workspace suite, as
         // td-review's do: the builder's tests read every roster lock and
@@ -8424,18 +8425,16 @@ mod tests {
         for target in ["check", "recipe-checks"] {
             assert!(targets.contains(&target.to_string()), "{targets:?}");
         }
-        // td-news reads the editor for its document pane, so the editor's
-        // commands bring td-news's and, through td-news's own readers, the
-        // rest of the compositor's reader closure, as a toolkit edit does.
+        // The document pane td-mail and td-news embed is td-ui's editor
+        // core, so nothing reads the editor: its change runs its own
+        // commands, its native case and the workspace's, and no other
+        // crate's.
         let commands = cargo_test_cmds(&root, &paths).unwrap();
-        assert!(commands.len() > 5, "{commands:?}");
-        for name in ["td-editor", "td-news"] {
-            let manifest = format!("--manifest-path {name}/Cargo.toml");
-            assert!(
-                commands.iter().any(|c| c.contains(&manifest)),
-                "{commands:?}"
-            );
-        }
+        assert_eq!(commands.len(), 6, "{commands:?}");
+        assert!(commands
+            .iter()
+            .filter_map(|c| c.split("--manifest-path ").nth(1))
+            .all(|rest| rest.starts_with("td-editor/Cargo.toml")));
         assert!(commands
             .iter()
             .any(|c| c.starts_with("cargo test --frozen ")));

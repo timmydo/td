@@ -173,6 +173,12 @@ pinned face, verified, where that search looks (see "Delivery and trust
 position" below). A program that draws with Unifont for want of the face
 says to run it.
 
+Moved (increment 27): the editor core. td-editor's document model and
+the controller, key profiles, layout, scene, clipboard capture, filling,
+text bounds and dialog permits over it are `editor` and the `editor_*`
+modules, so a program embeds the document pane through the toolkit alone
+(see "Editor core" below).
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
@@ -532,6 +538,18 @@ of its own files may name each module.
   `with_typeface`, `handler`, `handler_mut`, `surface`), the `App` over a
   handler it borrows; and `run` with an optional `Typeface`, under
   "Widget window" below.
+- The editor core, under "Editor core" below: `editor_text`, the text
+  bounds and lossless codec; `editor_model`, the `Editor` with its
+  documents, transactions and `RevisionPoint`s; `editor_fill`, the fill
+  planner; `editor_keys`, the key profiles; `editor_layout`, the
+  visual-row map and viewport; `editor_clipboard`, the bounded capture
+  and paste; `editor_dialog`, the permits (`Discard`, `Reload`) and the
+  conflict and close flows; `editor`, the `Controller` (`default` for a
+  window, `pane` for an embedded pane) with its `Event` and `Outcome`;
+  `editor_render`, the `Geometry` and the `Scene` that implements
+  `Composition`; and `editor_error`, their `Error` and `Result`.
+  `Controller::generation_for_test` is test support, public because a
+  consumer's tests are another crate.
 - `vt`: `Terminal`, the terminal model with its byte-stream parser (`new`
   at a grid, `feed`, `resize`, the `cell`, `row_text`, `cursor` and `mode`
   reads, `take_replies` one reply at a time and `replies`, `ring` and
@@ -1576,7 +1594,7 @@ each consumer's manifest names the crate.
 ## Widget window
 
 A program that lays the toolkit's widgets out over its surface, td-news
-and td-mail with their lists and td-editor's document pane, has no grid
+and td-mail with their lists and the editor core's document pane, has no grid
 to draw in: it paints compositions into a raster over the surface and
 reads its input in surface pixels. `window` is the window over the
 client for such a program. Its `Handler` names the toplevel and its
@@ -2319,6 +2337,54 @@ scales, clipped/narrow surfaces, focus loss and stale consumer data. Extend
 shared primitives atomically where necessary; no temporary application
 copy of a widget is an acceptable completion of this work.
 
+## Editor core
+
+The document pane td-mail and td-news embed, and the td-pass notebook
+window is to embed, is td-editor's own editing core, moved here whole so
+no consumer depends on the editor crate: the text bounds and lossless
+codec, the model and its transactions, the fill planner, the key
+profiles, the layout, the clipboard capture, the dialog permits, the
+controller and the scene, as `editor_text`, `editor_model`,
+`editor_fill`, `editor_keys`, `editor_layout`, `editor_clipboard`,
+`editor_dialog`, `editor` and `editor_render`, with their refusals in
+`editor_error`. Their behavior did not change in the move, and
+`td-editor/DESIGN.md` remains the normative contract for it: the
+document model and file safety, the input-controller contract, filling,
+the reference renderer and "Embedding the document view". This section
+holds the toolkit's side.
+
+- All ten modules are pure in the confinement test's sense: no
+  environment, filesystem, network, process, clock or I/O access, and at
+  most one test module, at the file's tail. Files, the clock, spelling,
+  the control socket, replay and the reference preview stay td-editor's.
+  The scene takes a spelling checker's status and marks as borrowed
+  values, not td-editor's spelling state.
+- Permits bind an editor and a revision across the crate boundary. A
+  `RevisionPoint` carries a private owner token only its `Editor` mints,
+  and its tab and revision are read through accessors, so a consumer
+  cannot retarget one; a compile-fail example pins that. `Discard` and
+  `Reload` are made only through the dialog flows here, `Close` and
+  `Conflict`, and their `apply` stays crate-private, so a consumer can
+  hold, check and hand back a permit but never forge or apply one. The
+  flows record a decision; the user's consent behind it is the
+  embedder's to ask for, as it was td-editor's window's before the move.
+  What td-editor reached as crate-private before the move is public now
+  because it is another crate, except the model's `open` and
+  `missing_file`, which consumers reach through the controller's events
+  and which stay crate-private.
+- The crate root re-exports nothing of the core; consumers name the
+  `td_ui::editor*` paths. td-editor alone re-exports `Error` as its own.
+- `Controller::generation_for_test`, `cfg(test)` before the move, is
+  test support, public because a consumer's tests are another crate: it
+  sets the staleness counter so they can reach its exhaustion. The
+  confinement tests here and in td-editor hold both crates' production
+  sources to never calling it.
+- The core's tests are `tests/editor_core.rs`, `editor_layout.rs`,
+  `editor_render.rs`, `editor.rs` and `editor_clipboard.rs`, moved with
+  it, and the controller's half of td-editor's caret-tick fence in
+  `tests/confinement.rs`. td-editor keeps the replay wire's, the real
+  binary's and its window's.
+
 ## Outline faces and the glyph atlas
 
 Before this section every td-ui consumer and td-term drew text from one
@@ -2876,8 +2942,15 @@ regressions. Those increments extend the original sequence below.
     under the XDG data home; and the Unifont note naming it. Landed.
 25. Runtime cells: `Cell` replaces the constants in layout, hit testing
     and painting, so a face is drawn at a size the grid does not fix.
-    td-editor goes first, since the other consumers lay out over its
-    pane.
+    The editor core goes first, since the other consumers lay out over
+    its pane.
 26. The GPU path, gated on the sign-offs "The GPU path" lists: the
     compositor's GPU composition first, then client dmabufs, then td-ui's
     GPU backend held to the CPU raster's oracles.
+27. The editor core: td-editor's text bounds, model, fill planner, key
+    profiles, layout, clipboard capture, dialog permits, controller and
+    scene moved here as `editor` and the `editor_*` modules, with their
+    refusals as `editor_error` and their tests; td-mail and td-news
+    embed the pane through the toolkit alone and drop td-editor, which
+    keeps its window, file session, control socket, replay, spelling,
+    prompts and preview. Landed.

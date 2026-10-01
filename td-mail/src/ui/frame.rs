@@ -1,5 +1,5 @@
 //! The frame over the widget window: the top view's scene laid out as the
-//! toolkit's action bar, an optional text entry, a list or td-editor's
+//! toolkit's action bar, an optional text entry, a list or td-ui's editor
 //! document pane, read-only for a text and editable for a draft, and the
 //! status row; and the pane itself, which holds a document per stacked
 //! view that shows a text or a draft, so a view's text is its own and
@@ -10,10 +10,10 @@
 //! finder a draft's Attach opens is painted over the body in its place.
 
 use std::sync::Arc;
-use td_editor::clipboard::{Paste, Snapshot};
-use td_editor::model::{Command, SavePoint, Selection, TabId};
-use td_editor::ui::{Controller, Event, Outcome, PointerPhase as PanePhase};
 use td_ui::chrome::{Bar, Field, Item, List, Status, TextEntry, ROW};
+use td_ui::editor::{Controller, Event, Outcome, PointerPhase as PanePhase};
+use td_ui::editor_clipboard::{Paste, Snapshot};
+use td_ui::editor_model::{Command, SavePoint, Selection, TabId};
 use td_ui::finder;
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Rect, Surface, PAPER};
 use td_ui::window::PointerPhase;
@@ -31,11 +31,11 @@ pub const PAGE_ROWS: usize = 15;
 
 /// The editor's clipboard error as a status row says it: its ceiling is
 /// the one a person can act on, the rest are the editor's own words.
-fn describe(error: td_editor::Error, what: &str) -> String {
+fn describe(error: td_ui::editor_error::Error, what: &str) -> String {
     match error {
-        td_editor::Error::Limit => format!(
+        td_ui::editor_error::Error::Limit => format!(
             "{what} is past the clipboard's {} KiB ceiling",
-            td_editor::clipboard::MAX_BYTES / 1024
+            td_ui::editor_clipboard::MAX_BYTES / 1024
         ),
         other => other.to_string(),
     }
@@ -133,7 +133,7 @@ impl Shown {
     }
 }
 
-/// td-editor's document pane, holding a document per stacked view that
+/// td-ui's editor pane, holding a document per stacked view that
 /// shows a text or a draft; the active one is the top view's.
 pub struct Pane {
     controller: Controller,
@@ -156,7 +156,7 @@ impl Pane {
     }
 
     #[cfg(test)]
-    pub fn editor(&self) -> &td_editor::model::Editor {
+    pub fn editor(&self) -> &td_ui::editor_model::Editor {
         self.controller.editor()
     }
 
@@ -200,7 +200,7 @@ impl Pane {
     }
 
     /// The document rows and text columns the pane shows once placed, as
-    /// td-editor lays its document out in the rect.
+    /// the editor core lays its document out in the rect.
     pub fn grid(&self) -> (usize, usize) {
         let (columns, rows) = self.controller.geometry().grid();
         (rows, columns)
@@ -748,14 +748,14 @@ pub fn draft_source(text: &str) -> Option<String> {
 
 fn admit(text: &str, truncate: bool) -> Option<String> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut source = String::with_capacity(text.len().min(td_editor::text::MAX_FILE_BYTES));
+    let mut source = String::with_capacity(text.len().min(td_ui::editor_text::MAX_FILE_BYTES));
     for c in text.replace("\r\n", "\n").chars() {
         let shown = match c {
             '\n' | '\t' => c,
             c if c <= '\u{1f}' || c == '\u{7f}' => '\u{fffd}',
             c => c,
         };
-        if source.len() + shown.len_utf8() > td_editor::text::MAX_FILE_BYTES {
+        if source.len() + shown.len_utf8() > td_ui::editor_text::MAX_FILE_BYTES {
             if truncate {
                 break;
             }
@@ -1077,7 +1077,7 @@ mod tests {
         // reason, and the kill ring keeps what it had.
         let mut big = None;
         pane.show(&mut big, "big", 40, || {
-            "x".repeat(td_editor::clipboard::MAX_BYTES + 1)
+            "x".repeat(td_ui::editor_clipboard::MAX_BYTES + 1)
         });
         assert_eq!(pane.chord("C-a"), Outcome::Changed);
         let refused = pane.copy().unwrap_err();
@@ -1104,9 +1104,9 @@ mod tests {
         Draft::new(&mut pane, Some(tab)).discard();
         assert!(!Draft::new(&mut pane, Some(tab)).dirty());
         // A draft past the ceiling is refused whole; a text is cut to it.
-        let long = "x".repeat(td_editor::text::MAX_FILE_BYTES + 1);
+        let long = "x".repeat(td_ui::editor_text::MAX_FILE_BYTES + 1);
         assert_eq!(draft_source(&long), None);
-        assert_eq!(pane_source(&long).len(), td_editor::text::MAX_FILE_BYTES);
+        assert_eq!(pane_source(&long).len(), td_ui::editor_text::MAX_FILE_BYTES);
         assert_eq!(
             draft_source("a\r\nb\u{1}"),
             Some("a\nb\u{fffd}".to_string())

@@ -1,10 +1,10 @@
 //! Bounded remote job outcomes. No text, filesystem, clocks or transport.
 
-use crate::model::{Editor, TabId};
 use crate::spelling::{ScanStatus, WindowState};
 use crate::{Error, Result};
 use std::collections::VecDeque;
 use std::fmt::Write;
+use td_ui::editor_model::{Editor, TabId};
 
 const RECORDS: usize = 64;
 
@@ -242,7 +242,11 @@ impl Jobs {
         Ok(())
     }
 
-    pub(crate) fn opened(&mut self, id: u64, result: Result<crate::dialog::Target>) -> Result<()> {
+    pub(crate) fn opened(
+        &mut self,
+        id: u64,
+        result: Result<td_ui::editor_dialog::Target>,
+    ) -> Result<()> {
         let record = self
             .records
             .iter_mut()
@@ -348,9 +352,9 @@ impl Jobs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Command, Selection};
     use crate::spelling::Dictionary;
-    use crate::ui::{Controller, Event};
+    use td_ui::editor::{Controller, Event};
+    use td_ui::editor_model::{Command, Selection};
 
     #[test]
     fn dictionary_jobs_are_global_historical_and_kind_bound() {
@@ -421,7 +425,7 @@ mod tests {
         assert_eq!(
             jobs.opened(
                 save,
-                Ok(crate::dialog::Target {
+                Ok(td_ui::editor_dialog::Target {
                     tab: 4,
                     revision: 8
                 })
@@ -462,7 +466,7 @@ mod tests {
         assert!(!jobs.observe(&Editor::default(), &WindowState::default()));
         jobs.opened(
             open,
-            Ok(crate::dialog::Target {
+            Ok(td_ui::editor_dialog::Target {
                 tab: 7,
                 revision: 8,
             }),

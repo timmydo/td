@@ -1,9 +1,9 @@
 //! Close decisions are explicit, editor/revision-bound and deferred until the
 //! entire close request is resolved. Dropping a request is cancellation.
 
-use crate::model::{Editor, RevisionPoint, TabId};
-use crate::ui::{Controller, Event};
-use crate::{Error, Result};
+use crate::editor::{Controller, Event};
+use crate::editor_error::{Error, Result};
+use crate::editor_model::{Editor, RevisionPoint, TabId};
 use std::collections::BTreeSet;
 
 /// No public constructor: only a completed close dialog can approve discard.
@@ -21,10 +21,12 @@ pub struct Reload {
     point: RevisionPoint,
 }
 impl Reload {
-    pub(crate) fn check(&self, editor: &Editor) -> Result<()> {
+    /// Whether the permit's tab is still at the revision it was granted for.
+    pub fn check(&self, editor: &Editor) -> Result<()> {
         editor.check_revision(&self.point)
     }
-    pub(crate) fn tab(&self) -> TabId {
+    /// The tab whose replacement this permit authorizes.
+    pub fn tab(&self) -> TabId {
         self.point.tab
     }
     pub(crate) fn apply(self, editor: &mut Editor, bytes: &[u8], missing: bool) -> Result<()> {
@@ -32,18 +34,23 @@ impl Reload {
     }
 }
 
-pub(crate) struct Conflict {
+/// A reload offered for one tab at one revision, answered once: a clean tab
+/// yields its `Reload` at once, a dirty one only after a second, discarding
+/// answer. Any edit in between makes it stale.
+pub struct Conflict {
     point: Option<RevisionPoint>,
     discard: bool,
 }
 impl Conflict {
-    pub(crate) fn new(editor: &Editor, target: Target) -> Result<Self> {
+    /// A conflict over `target`, refused unless it is current.
+    pub fn new(editor: &Editor, target: Target) -> Result<Self> {
         Ok(Self {
             point: Some(editor.revision_point(target.tab, target.revision)?),
             discard: false,
         })
     }
-    pub(crate) fn target(&self, editor: &Editor) -> Result<Target> {
+    /// The tab and revision asked about, refused once stale or answered.
+    pub fn target(&self, editor: &Editor) -> Result<Target> {
         let point = self.point.as_ref().ok_or(Error::InvalidArgument)?;
         editor.check_revision(point)?;
         Ok(Target {
@@ -51,10 +58,13 @@ impl Conflict {
             revision: point.revision,
         })
     }
-    pub(crate) fn needs_discard(&self) -> bool {
+    /// Whether the dirty tab's discard is now the question.
+    pub fn needs_discard(&self) -> bool {
         self.discard
     }
-    pub(crate) fn answer(&mut self, editor: &Editor, discard: bool) -> Result<Option<Reload>> {
+    /// The answer to the question asked: `discard` only once
+    /// `needs_discard` says so. The permit, when the answer grants it.
+    pub fn answer(&mut self, editor: &Editor, discard: bool) -> Result<Option<Reload>> {
         let target = self.target(editor)?;
         if discard && !self.discard {
             return Err(Error::InvalidArgument);
@@ -70,33 +80,41 @@ impl Conflict {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum Scope {
+/// What a close request covers: one tab at a revision, or every tab.
+pub enum Scope {
     Tab { tab: TabId, revision: u64 },
     Window,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Target {
+/// A tab at a revision a dialog asks about.
+pub struct Target {
     pub tab: TabId,
     pub revision: u64,
 }
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum Closed {
+/// What a completed close request closed.
+pub enum Closed {
     Tab(TabId),
     Window,
 }
 
-pub(crate) struct Close {
+/// A close request: the dirty tabs it covers are asked about one at a
+/// time, the active one first, and nothing closes until every one is
+/// approved. Any edit to a covered tab makes it stale.
+pub struct Close {
     scope: Scope,
     points: Vec<RevisionPoint>,
     discarded: BTreeSet<TabId>,
 }
 
 impl Close {
-    pub(crate) fn scope(&self) -> Scope {
+    /// What the request covers.
+    pub fn scope(&self) -> Scope {
         self.scope
     }
 
-    pub(crate) fn new(editor: &Editor, scope: Scope) -> Result<Self> {
+    /// A request over `scope`, binding each covered tab's revision.
+    pub fn new(editor: &Editor, scope: Scope) -> Result<Self> {
         let mut points = match scope {
             Scope::Tab { tab, revision } => vec![editor.revision_point(tab, revision)?],
             Scope::Window => editor
@@ -126,7 +144,8 @@ impl Close {
         Ok(())
     }
 
-    pub(crate) fn next(&self, editor: &Editor) -> Result<Option<Target>> {
+    /// The next dirty tab to ask about, or none once all are approved.
+    pub fn next(&self, editor: &Editor) -> Result<Option<Target>> {
         self.validate(editor)?;
         for point in &self.points {
             if editor.document(point.tab)?.dirty() && !self.discarded.contains(&point.tab) {
@@ -139,7 +158,8 @@ impl Close {
         Ok(None)
     }
 
-    pub(crate) fn discard(&mut self, editor: &Editor, target: Target) -> Result<()> {
+    /// Approves discarding `target`, which must be the one `next` names.
+    pub fn discard(&mut self, editor: &Editor, target: Target) -> Result<()> {
         if self.next(editor)? != Some(target) {
             return Err(Error::StaleRevision);
         }
@@ -147,7 +167,8 @@ impl Close {
         Ok(())
     }
 
-    pub(crate) fn complete(self, ui: &mut Controller) -> Result<Closed> {
+    /// Closes what was approved, refused while a dirty tab is unanswered.
+    pub fn complete(self, ui: &mut Controller) -> Result<Closed> {
         if self.next(ui.editor())?.is_some() {
             return Err(Error::Dirty);
         }
@@ -172,7 +193,7 @@ impl Close {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::model::Command;
+    use crate::editor_model::Command;
 
     fn dirty(ui: &mut Controller) -> TabId {
         ui.dispatch(Event::New).unwrap();
@@ -260,7 +281,7 @@ mod tests {
         assert!(!view.soft_wrap);
         assert_eq!(
             view.viewport.origin(),
-            crate::layout::Position { row: 0, column: 0 }
+            crate::editor_layout::Position { row: 0, column: 0 }
         );
         assert_eq!(ui.editor().active(), Some(other));
         assert_eq!(ui.tab_view(other).unwrap(), other_view);

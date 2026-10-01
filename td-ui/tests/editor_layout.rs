@@ -1,5 +1,8 @@
-use td_editor::layout::{Affinity, Break, Caret, Layout, Metrics, Position, Viewport, CELL_WIDTH};
-use td_editor::{text, Error};
+use td_ui::editor_error::Error;
+use td_ui::editor_layout::{
+    Affinity, Break, Caret, Layout, Metrics, Position, Viewport, CELL_WIDTH,
+};
+use td_ui::editor_text as text;
 
 fn caret(byte: usize) -> Caret {
     Caret {
@@ -342,7 +345,7 @@ fn generated_rows_match_reference_and_every_boundary_roundtrips() {
 
 #[test]
 fn model_layout_uses_viewport_width_and_metrics_are_cacheable() {
-    let mut editor = td_editor::model::Editor::default();
+    let mut editor = td_ui::editor_model::Editor::default();
     let tab = editor.load_bytes(b"abcde\n\tq").unwrap();
     let view = Viewport::new(4, 2).unwrap();
     let layout = view.layout(editor.document(tab).unwrap(), true).unwrap();

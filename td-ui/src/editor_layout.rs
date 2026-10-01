@@ -1,11 +1,12 @@
 //! Allocation-free visual rows and the shared glyph/caret position map.
 
-use crate::{text, Error, Result};
+use crate::editor_error::{Error, Result};
+use crate::editor_text as text;
 use std::ops::Range;
 
 /// Unscaled bitmap-cell geometry, td-ui's: the pointer decoder and the
 /// pinned face agree on it there, and layout lays rows out on the same grid.
-pub use td_ui::{CELL_HEIGHT, CELL_WIDTH};
+pub use crate::{CELL_HEIGHT, CELL_WIDTH};
 pub const MAX_COLUMNS: usize = 1024;
 pub const MAX_ROWS: usize = 512;
 
@@ -141,7 +142,7 @@ impl<'a> Layout<'a> {
 
     /// The model already validated text. Borrowing prevents concurrent edits.
     pub fn for_document(
-        document: &'a crate::model::Document,
+        document: &'a crate::editor_model::Document,
         columns: usize,
         soft_wrap: bool,
     ) -> Result<Self> {
@@ -313,7 +314,7 @@ impl Viewport {
     /// Use this to keep the document wrap width equal to the viewport width.
     pub fn layout<'a>(
         &self,
-        document: &'a crate::model::Document,
+        document: &'a crate::editor_model::Document,
         soft_wrap: bool,
     ) -> Result<Layout<'a>> {
         Layout::for_document(document, self.columns, soft_wrap)

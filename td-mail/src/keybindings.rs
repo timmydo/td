@@ -542,7 +542,7 @@ pub fn all_keybindings() -> Vec<KeyBinding> {
             description: "Back to the mailbox list",
         },
         // Compose: the draft in the editable pane, whose keys are
-        // td-editor's default profile; the rest of the keyboard types.
+        // the editor core's default profile; the rest of the keyboard types.
         KeyBinding {
             view: "compose",
             key: "Ctrl-Enter",

@@ -2,12 +2,12 @@
 //! completions enter the same controller as ordinary editing commands.
 
 use crate::files::{FileId, Session as Files};
-use crate::model::{SavePoint, TabId};
-use crate::ui::{Controller, Event, Outcome};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use td_ui::editor::{Controller, Event, Outcome};
+use td_ui::editor_model::{SavePoint, TabId};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -91,16 +91,16 @@ enum Pending {
     Dictionary,
     Open,
     Rename,
-    Browse(crate::model::RevisionPoint),
+    Browse(td_ui::editor_model::RevisionPoint),
     Reload {
-        permit: Option<crate::Reload>,
+        permit: Option<td_ui::editor_dialog::Reload>,
     },
     Save {
         tab: TabId,
         point: SavePoint,
     },
     QueuedSave {
-        point: crate::model::RevisionPoint,
+        point: td_ui::editor_model::RevisionPoint,
         path: Option<PathBuf>,
     },
 }
@@ -119,7 +119,7 @@ pub(crate) struct Session {
     associations: BTreeMap<TabId, Association>,
     directories: BTreeMap<TabId, crate::directory::Snapshot>,
     failed: bool,
-    conflict: Option<crate::dialog::Target>,
+    conflict: Option<td_ui::editor_dialog::Target>,
     dictionary: Option<crate::spelling::Dictionary>,
 }
 
@@ -419,7 +419,7 @@ impl Session {
         let mut snapshot = old.clone();
         snapshot.arrange(sort, reverse);
         let caret = selected.as_ref().map_or(0, |path| snapshot.offset(path));
-        ui.dispatch(Event::Open(crate::model::Open {
+        ui.dispatch(Event::Open(td_ui::editor_model::Open {
             source: Some(point),
             bytes: snapshot.text.as_bytes(),
             missing: false,
@@ -432,7 +432,7 @@ impl Session {
         ui.dispatch(Event::Edit {
             tab,
             revision: next,
-            command: crate::model::Command::Select(crate::model::Selection {
+            command: td_ui::editor_model::Command::Select(td_ui::editor_model::Selection {
                 anchor: caret,
                 caret,
             }),
@@ -483,11 +483,15 @@ impl Session {
             .map(|a| a.path.as_path())
             .or_else(|| self.directories.get(&tab).map(|d| d.path.as_path()))
     }
-    pub(crate) fn take_conflict(&mut self) -> Option<crate::dialog::Target> {
+    pub(crate) fn take_conflict(&mut self) -> Option<td_ui::editor_dialog::Target> {
         self.conflict.take()
     }
 
-    pub(crate) fn reload(&mut self, ui: &Controller, permit: crate::Reload) -> Result<()> {
+    pub(crate) fn reload(
+        &mut self,
+        ui: &Controller,
+        permit: td_ui::editor_dialog::Reload,
+    ) -> Result<()> {
         self.available()?;
         permit.check(ui.editor()).map_err(|e| e.to_string())?;
         let file = self
@@ -617,7 +621,7 @@ impl Session {
             // This is the handoff boundary: validate before capturing bytes.
             // Later edits cannot change the immutable ordinary Save snapshot.
             return self
-                .save(ui, point.tab, point.revision, path)
+                .save(ui, point.tab(), point.revision(), path)
                 .err()
                 .map(|detail| Err(PollFailure::unavailable(detail)));
         }
@@ -835,7 +839,7 @@ impl Session {
             }
             (Some(Pending::Save { tab, .. }), Completion::Conflict(detail)) => {
                 if let Ok(doc) = ui.editor().document(tab) {
-                    self.conflict = Some(crate::dialog::Target {
+                    self.conflict = Some(td_ui::editor_dialog::Target {
                         tab,
                         revision: doc.revision(),
                     });
@@ -874,7 +878,7 @@ impl Session {
                     }
                     _ => None,
                 };
-                let replaced = source.as_ref().map(|point| point.tab);
+                let replaced = source.as_ref().map(|point| point.tab());
                 if let (Some(tab), Completion::Directory(snapshot)) = (replaced, &mut completion) {
                     if let Some(old) = self.directory(tab) {
                         snapshot.arrange(old.sort, old.reverse);
@@ -896,7 +900,7 @@ impl Session {
                     _ => return Err("Invalid Open completion".into()),
                 };
                 let Outcome::Created(tab) = ui
-                    .dispatch(Event::Open(crate::model::Open {
+                    .dispatch(Event::Open(td_ui::editor_model::Open {
                         source,
                         bytes,
                         missing,
@@ -1257,9 +1261,9 @@ impl Session {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::model::Command;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use td_ui::editor_model::Command;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
     struct Directory(PathBuf);
@@ -1354,8 +1358,8 @@ mod tests {
             session.save(&ui, tab, 1, None).unwrap();
             assert!(finish_worker(&mut session, &mut ui).is_err());
             let target = session.take_conflict().unwrap();
-            assert_eq!(target, crate::dialog::Target { tab, revision: 1 });
-            let mut conflict = crate::dialog::Conflict::new(ui.editor(), target).unwrap();
+            assert_eq!(target, td_ui::editor_dialog::Target { tab, revision: 1 });
+            let mut conflict = td_ui::editor_dialog::Conflict::new(ui.editor(), target).unwrap();
             assert!(conflict.answer(ui.editor(), false).unwrap().is_none());
             let permit = conflict.answer(ui.editor(), true).unwrap().unwrap();
             let original_file = session.associations.get(&tab).unwrap().file;
@@ -1411,9 +1415,11 @@ mod tests {
         let mut ui = Controller::default();
         session.initial_open(&mut ui, path.clone()).unwrap();
         let tab = ui.editor().active().unwrap();
-        let mut conflict =
-            crate::dialog::Conflict::new(ui.editor(), crate::dialog::Target { tab, revision: 0 })
-                .unwrap();
+        let mut conflict = td_ui::editor_dialog::Conflict::new(
+            ui.editor(),
+            td_ui::editor_dialog::Target { tab, revision: 0 },
+        )
+        .unwrap();
         let permit = conflict.answer(ui.editor(), false).unwrap().unwrap();
         fs::write(&path, b"\xff").unwrap();
         session.reload(&ui, permit).unwrap();
@@ -1580,7 +1586,7 @@ mod tests {
                 .unwrap();
         let source = Some(h.ui.editor().revision_point(editable, 0).unwrap());
         assert_eq!(
-            h.ui.dispatch(Event::Open(crate::model::Open {
+            h.ui.dispatch(Event::Open(td_ui::editor_model::Open {
                 source,
                 bytes: b"replacement",
                 directory: true,
@@ -1674,7 +1680,7 @@ mod tests {
             h.ui.dispatch(Event::Edit {
                 tab: source_tab,
                 revision,
-                command: Command::Select(crate::model::Selection {
+                command: Command::Select(td_ui::editor_model::Selection {
                     anchor: caret,
                     caret,
                 }),
@@ -1823,7 +1829,7 @@ mod tests {
         h.ui.dispatch(Event::Edit {
             tab,
             revision: 0,
-            command: Command::Select(crate::model::Selection {
+            command: Command::Select(td_ui::editor_model::Selection {
                 anchor: caret,
                 caret,
             }),
@@ -2121,9 +2127,9 @@ mod tests {
             let tab = h.open(path.clone());
             h.edit(tab, Command::Insert("edit".into()));
             let original = h.session.associations.get(&tab).unwrap().file;
-            let mut conflict = crate::dialog::Conflict::new(
+            let mut conflict = td_ui::editor_dialog::Conflict::new(
                 h.ui.editor(),
-                crate::dialog::Target { tab, revision: 1 },
+                td_ui::editor_dialog::Target { tab, revision: 1 },
             )
             .unwrap();
             assert!(conflict.answer(h.ui.editor(), false).unwrap().is_none());
@@ -2223,7 +2229,7 @@ mod tests {
                 "Conflict"
             }));
             let mut conflict =
-                crate::dialog::Conflict::new(ui.editor(), session.take_conflict().unwrap())
+                td_ui::editor_dialog::Conflict::new(ui.editor(), session.take_conflict().unwrap())
                     .unwrap();
             assert!(conflict.answer(ui.editor(), false).unwrap().is_none());
             session
@@ -2420,7 +2426,7 @@ mod tests {
         fs::write(directory.path("invalid"), b"\xff").unwrap();
         fs::File::create(directory.path("large"))
             .unwrap()
-            .set_len(crate::text::MAX_FILE_BYTES as u64 + 1)
+            .set_len(td_ui::editor_text::MAX_FILE_BYTES as u64 + 1)
             .unwrap();
         let mut h = Harness::new();
         h.ui.dispatch(Event::New).unwrap();
@@ -2440,7 +2446,7 @@ mod tests {
         assert_eq!(fs::read(directory.path("invalid")).unwrap(), b"\xff");
         assert_eq!(
             fs::metadata(directory.path("large")).unwrap().len(),
-            crate::text::MAX_FILE_BYTES as u64 + 1
+            td_ui::editor_text::MAX_FILE_BYTES as u64 + 1
         );
     }
 }

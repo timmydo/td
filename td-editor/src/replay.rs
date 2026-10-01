@@ -1,11 +1,11 @@
 //! Bounded headless adapter for the editor dispatcher, on td-ui's
 //! consecutive-frame runner: the control transport's framing until EOF.
 
-use crate::keys::Profile;
-use crate::model::{Command, Selection};
-use crate::ui::{Controller, Event, Outcome, PointerPhase};
 use crate::{Error, Result};
 use std::io::{self, Read, Write};
+use td_ui::editor::{Controller, Event, Outcome, PointerPhase};
+use td_ui::editor_keys::Profile;
+use td_ui::editor_model::{Command, Selection};
 
 use crate::control::{boolean, decimal as number, size};
 pub use crate::control::{hex, unhex, MAX_FRAME, PAGE_BYTES};

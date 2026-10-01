@@ -65,10 +65,10 @@ fn main() -> ExitCode {
         [arg] if arg == "--replay" => {
             td_editor::replay::run(&mut io::stdin().lock(), &mut io::stdout().lock())
         }
-        [arg] if arg == "--preview" => td_editor::render::preview(&mut io::stdout().lock()),
+        [arg] if arg == "--preview" => td_editor::preview::write(&mut io::stdout().lock()),
         [arg] if arg == "--window-preview" => td_editor::wayland::preview(),
         [arg, keys] if arg == "--window-preview" && keys == "--keys=emacs" => {
-            td_editor::wayland::preview_with_profile(td_editor::keys::Profile::Emacs)
+            td_editor::wayland::preview_with_profile(td_ui::editor_keys::Profile::Emacs)
         }
         [arg, keys] if arg == "--window-preview" && keys == "--keys=windows" => {
             td_editor::wayland::preview()
@@ -101,7 +101,7 @@ type WindowArgs = td_editor::wayland::FileWindowOptions;
 
 fn window_args(args: &[std::ffi::OsString]) -> io::Result<WindowArgs> {
     use std::os::unix::ffi::OsStrExt;
-    let mut profile = td_editor::keys::Profile::Windows;
+    let mut profile = td_ui::editor_keys::Profile::Windows;
     let mut literal = false;
     let mut paths = Vec::new();
     let mut dictionary = None;
@@ -111,9 +111,9 @@ fn window_args(args: &[std::ffi::OsString]) -> io::Result<WindowArgs> {
         if !literal && arg == "--" {
             literal = true;
         } else if !literal && arg == "--keys=emacs" {
-            profile = td_editor::keys::Profile::Emacs;
+            profile = td_ui::editor_keys::Profile::Emacs;
         } else if !literal && arg == "--keys=windows" {
-            profile = td_editor::keys::Profile::Windows;
+            profile = td_ui::editor_keys::Profile::Windows;
         } else if !literal && arg == "--control-socket" {
             if control.is_some() {
                 return Err(io::Error::other(
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn help_describes_foreground_invocation_without_claiming_mail_integration() {
-        assert_eq!(td_editor::clipboard::MAX_BYTES, 1024 * 1024);
+        assert_eq!(td_ui::editor_clipboard::MAX_BYTES, 1024 * 1024);
         for feature in [
             "data-device v3",
             "limit 1 MiB",
@@ -273,7 +273,7 @@ mod tests {
         } = window_args(&args).unwrap();
         assert!(dictionary.is_none());
         assert!(control.is_none());
-        assert_eq!(profile, td_editor::keys::Profile::Emacs);
+        assert_eq!(profile, td_ui::editor_keys::Profile::Emacs);
         assert_eq!(paths, vec![std::path::PathBuf::from("-file"), raw.into()]);
         assert!(window_args(&["--keys=other".into()]).is_err());
         assert!(window_args(&vec!["file".into(); 65]).is_err());
@@ -296,7 +296,7 @@ mod tests {
         .unwrap();
         assert_eq!(args.control, Some(raw.into()));
         assert_eq!(args.dictionary, Some("words".into()));
-        assert_eq!(args.profile, td_editor::keys::Profile::Emacs);
+        assert_eq!(args.profile, td_ui::editor_keys::Profile::Emacs);
         assert_eq!(
             args.paths,
             vec![

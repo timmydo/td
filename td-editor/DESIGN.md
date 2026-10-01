@@ -161,15 +161,15 @@ rate and delay with explicit time inputs for deterministic tests.
 
 ### Implemented input-controller contract
 
-`ui::Controller` owns the document model, key profile/prefix, mark, drag and
-per-tab view state. It exposes immutable model/view access and one typed
-`Event` dispatcher. `replay::Session` owns a controller rather than a second
-key dispatcher. Model commands, translated keys, pointer press/move/release,
-scroll, resize, soft-wrap changes, focus and explicit clock ticks all use this
-path. File, clipboard, spelling and prompt actions still return typed requests
-with the target tab and revision; they are not completed I/O or visible dialogs.
-Direct Close refuses dirty documents. No discard or save acknowledgement is
-added to replay by this controller.
+td-ui's `editor::Controller` owns the document model, key profile/prefix,
+mark, drag and per-tab view state. It exposes immutable model/view access
+and one typed `Event` dispatcher. `replay::Session` owns a controller rather
+than a second key dispatcher. Model commands, translated keys, pointer
+press/move/release, scroll, resize, soft-wrap changes, focus and explicit
+clock ticks all use this path. File, clipboard, spelling and prompt actions
+still return typed requests with the target tab and revision; they are not
+completed I/O or visible dialogs. Direct Close refuses dirty documents. No
+discard or save acknowledgement is added to replay by this controller.
 
 Each tab retains its viewport, soft-wrap flag, affinity, desired vertical
 column, and metrics cache. Metrics are refreshed when its text revision, wrap
@@ -991,18 +991,18 @@ with a diagnostic. Rendering failures must not mark any document saved.
 
 ### Implemented reference-renderer contract
 
-`render::Scene` borrows the editor and display-only `Label` values. Labels
-are not file associations: each names an existing tab, duplicates are refused,
-and there are at most 64 labels of at most 4096 UTF-8 bytes each. Missing
-labels display `Untitled`; dirty tabs prefix `*`. Labels use whole bitmap
-cells, truncate without ellipsis and substitute U+FFFD for control scalars.
-The caller owns the selected key profile and `View` (scroll origin, soft
-wrap, caret affinity, focus and blink visibility). Rendering never mutates
-documents or acknowledges a save. Scrolling is measured in visual rows and
-columns; soft wrap ignores the horizontal origin. Origins are admitted up to
-16 Mi rows and 128 Mi columns. The adapter must clamp them with `Viewport`
-when the document or geometry changes; an admitted origin beyond the text
-draws a blank document area.
+`editor_render::Scene` borrows the editor and display-only `Label`
+values. Labels are not file associations: each names an existing tab,
+duplicates are refused, and there are at most 64 labels of at most 4096 UTF-8
+bytes each. Missing labels display `Untitled`; dirty tabs prefix `*`. Labels
+use whole bitmap cells, truncate without ellipsis and substitute U+FFFD for
+control scalars. The caller owns the selected key profile and `View` (scroll
+origin, soft wrap, caret affinity, focus and blink visibility). Rendering
+never mutates documents or acknowledges a save. Scrolling is measured in
+visual rows and columns; soft wrap ignores the horizontal origin. Origins are
+admitted up to 16 Mi rows and 128 Mi columns. The adapter must clamp them
+with `Viewport` when the document or geometry changes; an admitted origin
+beyond the text draws a blank document area.
 
 `Geometry` admits nonzero axes through 8192 and at most 32 MiB of tight
 four-byte pixels; those ceilings are td-ui's `raster::Surface`, which
@@ -1254,25 +1254,34 @@ its own. The keymap compiler, the held-key repeat policy and the pointer
 decoder moved there with them and are used as `td_ui::keyboard`,
 `td_ui::repeat` and `td_ui::pointer`; the raster primitives, scrollbar
 geometry, text-run painter, palette and font notices followed and are used
-as `td_ui::raster` and `td_ui::notices`, while `render.rs` keeps the
-editor's `Geometry` and `Scene`, which implements
-`td_ui::raster::Composition`; the Wayland connection (endpoint resolution,
-connect, request framing, the received-right FIFO, pool files and the
-pointer image's pixels) followed with its syscall module and is used as
-`td_ui::wayland`; the client over it (object table, registry, toplevel
-surface with its buffers and frame callback, the seat with its keyboard and
-pointer, the pointer image's surface and the turn loop) followed and is used
-as `td_ui::client`, while `wayland.rs` keeps the editor's clipboard device,
-its `App` implementation, its gestures over the client's devices and the
-editor state. The source bundle is the td git checkout; `cargo build
---manifest-path td-editor/Cargo.toml` builds the standalone binary without
-an installed td system, resolving td-ui offline from the checkout. The
-target recipe must stage the td-ui tree beside this one (the cargo
-`local_source_trees` shape td-net uses; a flat direct-rustc staging cannot
-link a second crate) with the shared sources and licenses td-ui mounts, and
-td-ui and shared-source changes must select editor tests in affected-checks,
-which they do through the reader graph. A future move of a shared file
-updates staging, check mappings and all consumers atomically.
+as `td_ui::raster` and `td_ui::notices`; the Wayland connection (endpoint
+resolution, connect, request framing, the received-right FIFO, pool files
+and the pointer image's pixels) followed with its syscall module and is
+used as `td_ui::wayland`; the client over it (object table, registry,
+toplevel surface with its buffers and frame callback, the seat with its
+keyboard and pointer, the pointer image's surface and the turn loop)
+followed and is used as `td_ui::client`, while `wayland.rs` keeps the
+editor's clipboard device, its `App` implementation, its gestures over the
+client's devices and the editor state. The document core followed last,
+so td-mail and td-news embed it, as the td-pass window (`td-pass/DESIGN.md`)
+is to, without depending on this crate: the text bounds, model, keys, layout,
+filling, clipboard capture, dialog permits, controller and scene (with
+`Geometry` and the `Scene` that implements `td_ui::raster::Composition`)
+are `td_ui::editor_text`, `editor_model`, `editor_keys`, `editor_layout`,
+`editor_fill`, `editor_clipboard`, `editor_dialog`, `td_ui::editor` and
+`editor_render`, and their refusals `td_ui::editor_error::Error`, which
+the crate root re-exports as its own `Error`. Their behavior is
+unchanged by the move; this crate keeps the window, the file session,
+the control socket, replay, spelling, the prompts and `preview`, the fixed
+reference-renderer frame over the shared scene. The source bundle is the td
+git checkout; `cargo build --manifest-path td-editor/Cargo.toml` builds the
+standalone binary without an installed td system, resolving td-ui offline
+from the checkout. The target recipe must stage the td-ui tree beside this
+one (the cargo `local_source_trees` shape td-net uses; a flat direct-rustc
+staging cannot link a second crate) with the shared sources and licenses
+td-ui mounts, and td-ui and shared-source changes must select editor tests
+in affected-checks, which they do through the reader graph. A future move of
+a shared file updates staging, check mappings and all consumers atomically.
 
 ## Wayland and host compatibility
 
@@ -1849,16 +1858,16 @@ Remote conflict Save As takes an explicit literal OS-byte path and reuses
 the queued revision-pinned Save As job without a keyboard path entry.
 CONTROL.md pins the exact phases, errors and reply/job formats.
 
-`dialog::Conflict` pins editor identity, tab and revision. Only a live answer
-can mint the opaque, single-use `Reload` permit; a dirty permit additionally
-requires the second discard answer. The file coordinator checks the permit
-before submitting one read job. While reading, the modal consumes ordinary
-keys, but protocol handling and redraw continue. Cancel drops the pending
-permit, not the read syscall: the eventual result is ignored and its prepared
-baseline rejected. The user may edit again after Cancel. A new close during
-the pending read is refused like other unrelated I/O. A stale completion,
-invalid file, exhausted counter or failed budget admission leaves text,
-history, selection, saved state and old file association unchanged.
+`editor_dialog::Conflict` pins editor identity, tab and revision. Only a
+live answer can mint the opaque, single-use `Reload` permit; a dirty permit
+additionally requires the second discard answer. The file coordinator checks
+the permit before submitting one read job. While reading, the modal consumes
+ordinary keys, but protocol handling and redraw continue. Cancel drops the
+pending permit, not the read syscall: the eventual result is ignored and
+its prepared baseline rejected. The user may edit again after Cancel. A new
+close during the pending read is refused like other unrelated I/O. A stale
+completion, invalid file, exhausted counter or failed budget admission leaves
+text, history, selection, saved state and old file association unchanged.
 
 Remote Reload shares the same permit, submission, prepared-candidate and
 replacement path. Its bounded historical job row retains the requested
@@ -1920,24 +1929,24 @@ prompt explicitly says cancellation cancels the whole close request. Any
 save refusal or failure explicitly reports that closing was cancelled and
 tabs were retained, alongside the file diagnostic.
 
-`dialog::Close` is a display-independent coordinator. Its model points bind
-the originating editor, tab IDs and text revisions; another editor, changed
-revision, removed tab or a new tab in a window-close request invalidates the
-request before any discard. Direct model/replay dirty close still refuses.
-Only this coordinator can construct the opaque `Discard` permit consumed
-by `Event::Discard`, which rechecks its editor/revision binding before
-removing a tab. The controller's generation admission still precedes mutation.
-The window's single-threaded dispatcher supplies explicit choices; there is
-no wire shortcut for minting a permit. Remote Close Tab, Quit and
-Cancel/Discard/Save/path use this coordinator with a checked window-local
-dialog ID plus current question tab/revision. A trusted control client may
-answer while unfocused, without a synchronized seat/keymap, or with a clipped
-prompt: its explicit
-live-token answer is the authority, not synthetic physical input. Physical
-confirmation retains its visibility/input requirements. This approved remote
-policy governs Save/path answers too. They queue the same revision-pinned
-remote Save jobs; untitled Save first asks for a literal path with the same
-dialog ID. CONTROL.md defines refusal, phase, handoff and shutdown semantics.
+`editor_dialog::Close` is a display-independent coordinator. Its model
+points bind the originating editor, tab IDs and text revisions; another
+editor, changed revision, removed tab or a new tab in a window-close request
+invalidates the request before any discard. Direct model/replay dirty close
+still refuses. Only this coordinator can construct the opaque `Discard`
+permit consumed by `Event::Discard`, which rechecks its editor/revision
+binding before removing a tab. The controller's generation admission still
+precedes mutation. The window's single-threaded dispatcher supplies explicit
+choices; there is no wire shortcut for minting a permit. Remote Close
+Tab, Quit and Cancel/Discard/Save/path use this coordinator with a checked
+window-local dialog ID plus current question tab/revision. A trusted control
+client may answer while unfocused, without a synchronized seat/keymap, or
+with a clipped prompt: its explicit live-token answer is the authority, not
+synthetic physical input. Physical confirmation retains its visibility/input
+requirements. This approved remote policy governs Save/path answers too. They
+queue the same revision-pinned remote Save jobs; untitled Save first asks for
+a literal path with the same dialog ID. CONTROL.md defines refusal, phase,
+handoff and shutdown semantics.
 
 Window-close discard approvals are deferred: no tab is removed and no dirty
 state is cleared while further decisions remain. Cancel drops the approvals
@@ -1988,7 +1997,7 @@ The replay protocol remains filesystem-free and cannot forge save completion.
 
 `--window-preview` is an explicit scratch milestone, not the usable-editor
 milestone below. It opens one 800x600 scale-1 xdg toplevel and two initially
-clean fixture tabs through `ui::Controller` and the reference renderer.
+clean fixture tabs through `editor::Controller` and the reference renderer.
 `--window-preview --keys=windows|emacs` selects the profile (Windows default).
 The title and fixture say NO SAVE. Typing, selection, visual motion, undo,
 tab switching, native pointer input, menus and core commands are connected.
@@ -2295,9 +2304,10 @@ does not create a clipboard authority shortcut in remote control. Native
 compositor tests use the real File-menu pointer path and paste into a second
 editor in both profiles; exact saved bytes prove the transferred value.
 
-The safe `clipboard` module captures clipboard intent independently of any
-display, descriptor, clock or worker. It does not claim system clipboard
-ownership; the native adapter below supplies protocol and descriptor policy.
+td-ui's safe `editor_clipboard` module captures clipboard intent
+independently of any display, descriptor, clock or worker. It does not claim
+system clipboard ownership; the native adapter below supplies protocol and
+descriptor policy.
 
 `Snapshot::capture` requires the active tab and expected text revision.
 It captures the directed selection, editor-instance identity and at most
@@ -2880,33 +2890,34 @@ module is imported. These fixtures do not replace the live Weston test.
 
 ## Embedding the document view
 
-td-news shows an article in a read-only document pane, td-mail shows a
-message in one and composes a draft in an editable one, in their own
-windows beside the toolkit's lists, instead of calling out to an editor
-process. Each depends on the `td-editor` library crate by path, as a
-standalone target crate may on a `td-*` roster crate, with its recipe
-staging the `td-editor` tree beside `td-ui` and `td-compositor`; the
-landings are APPLICATIONS.md §W.8, "Reworked again", and "Composing in
-place". The host owns the window, the surface, the event loop and every
-widget around the pane; the pane is a `ui::Controller` from
-`Controller::pane`, placed by `Event::Frame` with the pane's rectangle
-and the host's surface on each configure, and repainted through
-`Controller::scene` into a raster over the host's surface with
-`Geometry::bounds` as the clip. The host translates its keyboard and
-pointer input into the controller's existing `Event::Key` chords and
-`Event::Pointer` physical pixels; ticks, focus and scroll are the same
-events the editor's own adapter sends. Requests the controller returns
-(files, clipboard, prompts) are the host's to serve or ignore: a reader
-ignores them all; td-mail's composer serves `save` by writing the
-document's `save_snapshot` bytes over the retained draft, whole or not
-at all, and answering `Event::Saved`, `close-tab` by popping a clean
-draft or asking about a dirty one (the window's own close request puts
-the same question), and `cut`, `copy` and `paste` with a kill ring of
-its own, a `clipboard::Snapshot` captured into memory and returned
-through `clipboard::Paste`, so the document's bounds hold and the
-editor's own `Event::Cut`/`Event::Paste` apply; the toolkit's data path,
-for the system clipboard, is a later increment. A pane the host loads
-without `ReadOnly` is editable, and the host sets
+td-news shows an article in a read-only document pane, td-mail shows
+a message in one and composes a draft in an editable one, in their
+own windows beside the toolkit's lists, instead of calling out to
+an editor process. The pane is td-ui's editor core (`td_ui::editor`
+and its `editor_*` siblings, `td-ui/DESIGN.md`, "Editor core"), the
+document model, controller, keys, layout, scene and clipboard capture
+this editor's own window drives, so each host depends on `td-ui` alone
+and its recipe stages no editor tree; the landings are APPLICATIONS.md
+§W.8, "Reworked again", and "Composing in place". The host owns the
+window, the surface, the event loop and every widget around the pane;
+the pane is a `td_ui::editor::Controller` from `Controller::pane`, placed
+by `Event::Frame` with the pane's rectangle and the host's surface on
+each configure, and repainted through `Controller::scene` into a raster
+over the host's surface with `Geometry::bounds` as the clip. The host
+translates its keyboard and pointer input into the controller's existing
+`Event::Key` chords and `Event::Pointer` physical pixels; ticks, focus
+and scroll are the same events the editor's own adapter sends. Requests
+the controller returns (files, clipboard, prompts) are the host's to
+serve or ignore: a reader ignores them all; td-mail's composer serves
+`save` by writing the document's `save_snapshot` bytes over the retained
+draft, whole or not at all, and answering `Event::Saved`, `close-tab`
+by popping a clean draft or asking about a dirty one (the window's own
+close request puts the same question), and `cut`, `copy` and `paste` with
+a kill ring of its own, an `editor_clipboard::Snapshot` captured into
+memory and returned through `editor_clipboard::Paste`, so the document's
+bounds hold and the editor's own `Event::Cut`/`Event::Paste` apply; the
+toolkit's data path, for the system clipboard, is a later increment. A
+pane the host loads without `ReadOnly` is editable, and the host sets
 `Command::AutoFill(true)` on a mail draft as the editor's own window
 does.
 

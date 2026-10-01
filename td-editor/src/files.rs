@@ -1,6 +1,5 @@
 //! Synchronous, worker-owned file transactions. No document mutation or UI.
 
-use crate::text;
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Write};
@@ -10,6 +9,7 @@ use std::os::unix::fs::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use td_ui::editor_text as text;
 
 const O_NOFOLLOW: i32 = 0o400000;
 const O_NONBLOCK: i32 = 0o4000;
@@ -1608,9 +1608,9 @@ fn check_temporary(temporary: &Temporary) -> Result<()> {
 )]
 mod tests {
     use super::*;
-    use crate::model::{Command, Editor};
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::symlink;
+    use td_ui::editor_model::{Command, Editor};
 
     #[test]
     fn file_copy_permission_probe_refuses_parent_attributes_and_query_errors() {

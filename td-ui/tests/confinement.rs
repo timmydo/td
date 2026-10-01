@@ -23,7 +23,7 @@ fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-const PURE: [&str; 30] = [
+const PURE: [&str; 40] = [
     "atlas.rs",
     "charts.rs",
     "chrome.rs",
@@ -32,6 +32,16 @@ const PURE: [&str; 30] = [
     "coverage.rs",
     "data.rs",
     "driven.rs",
+    "editor.rs",
+    "editor_clipboard.rs",
+    "editor_dialog.rs",
+    "editor_error.rs",
+    "editor_fill.rs",
+    "editor_keys.rs",
+    "editor_layout.rs",
+    "editor_model.rs",
+    "editor_render.rs",
+    "editor_text.rs",
     "face.rs",
     "finder.rs",
     "hint.rs",
@@ -240,7 +250,12 @@ fn source_inventory_and_shared_mounts_are_closed() {
             },
             "pops: the transport's own test, the client's accessor, keymap reader and send: {name}"
         );
-        for support in [".unconfigure(", ".input_mut(", ".take_for_test("] {
+        for support in [
+            ".unconfigure(",
+            ".input_mut(",
+            ".take_for_test(",
+            ".generation_for_test(",
+        ] {
             assert_eq!(
                 text.matches(support).count(),
                 0,
@@ -874,4 +889,28 @@ fn the_crate_depends_on_nothing_and_declares_its_gate() {
         "the leaf's lock lists only itself"
     );
     assert!(!lock.contains("source ="));
+}
+
+/// The editor core's half of td-editor's caret-tick fence: a tick is
+/// clock-checked and changes only the clock and the caret's visibility, so
+/// a host may send it outside the input context fence.
+#[test]
+fn an_editor_tick_moves_only_the_clock_and_the_caret() {
+    let ui = include_str!("../src/editor.rs");
+    assert!(ui.contains(concat!(
+        "Event::Tick(now) => {\n",
+        "                if now < self.clock {\n",
+        "                    return Err(Error::InvalidArgument);\n",
+        "                }\n",
+        "                let visible = self.focused && ((now - self.blink_start) / 500).is_multiple_of(2);\n",
+        "                self.clock = now;\n",
+        "                let changed = visible != self.caret_visible;\n",
+        "                self.caret_visible = visible;\n",
+        "                Ok(if changed {\n",
+        "                    Outcome::Changed\n",
+        "                } else {\n",
+        "                    Outcome::Ignored\n",
+        "                })\n",
+        "            }"
+    )));
 }
