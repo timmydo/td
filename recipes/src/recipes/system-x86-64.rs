@@ -9731,6 +9731,11 @@ mod tests {
                 super::super::jetbrains_mono_nerd_font::DIR
             )
         );
+        // A host's copy, where install-fonts puts it.
+        assert_eq!(
+            constant("INSTALLED"),
+            Some(super::super::jetbrains_mono_nerd_font::DATA_DIR)
+        );
         // The regular style for every consumer and the other three for
         // td-term.
         for name in ["REGULAR", "BOLD", "ITALIC", "BOLD_ITALIC"] {

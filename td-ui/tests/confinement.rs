@@ -248,20 +248,67 @@ fn source_inventory_and_shared_mounts_are_closed() {
             );
         }
         if name == "face_file.rs" {
-            // One file, named by the one constant directory, checked and
-            // bounded before it is read; nothing else on the filesystem
-            // and no environment.
+            // One file opened, checked and bounded before it is read; a
+            // search that only lists directories and looks at the regular
+            // style's name, over places built from the image's directory,
+            // the installed one and the XDG font roots; three environment
+            // values; nothing written.
             assert!(text.contains("pub const DIR: &str = \"/etc/fonts/jetbrains-mono-nerd\";"));
-            assert_eq!(compact.matches("File::open(").count(), 1);
-            assert_eq!(compact.matches("fs::metadata(").count(), 1);
-            assert_eq!(compact.matches(".join(").count(), 1);
+            assert!(text.contains("pub const INSTALLED: &str = \"fonts/jetbrains-mono-nerd\";"));
+            assert_eq!(compact.matches(".open(&path)").count(), 1);
+            assert!(compact
+                .contains("OpenOptions::new().read(true).custom_flags(O_NONBLOCK).open(&path)"));
+            assert!(text.contains("const O_NONBLOCK: i32 = 0o4000;"));
+            assert_eq!(compact.matches("file.metadata()").count(), 1);
+            assert_eq!(compact.matches("fs::metadata(").count(), 2);
+            assert_eq!(
+                compact.matches("fs::metadata(dir.join(REGULAR))").count(),
+                1
+            );
+            assert_eq!(compact.matches("fs::read_dir(").count(), 1);
             assert!(compact.contains(".take(MAX_FONT_BYTESasu64+1)"));
+            let joined: BTreeSet<&str> = compact
+                .match_indices(".join(")
+                .filter_map(|(at, _)| compact.get(at + ".join(".len()..)?.split(')').next())
+                .collect();
+            assert_eq!(
+                joined,
+                BTreeSet::from([
+                    "\",\"", // the error's list of places, a string join
+                    "\".fonts\"",
+                    "\".local/share\"",
+                    "\"fonts\"",
+                    "INSTALLED",
+                    "REGULAR",
+                    "name",
+                ]),
+                "the paths face_file builds"
+            );
+            assert_eq!(compact.matches("env::").count(), 4);
+            for read in ["HOME", "XDG_DATA_HOME", "XDG_DATA_DIRS"] {
+                assert_eq!(
+                    compact
+                        .matches(&format!("std::env::var_os(\"{read}\")"))
+                        .count(),
+                    1,
+                    "{read}"
+                );
+            }
+            assert_eq!(compact.matches("std::env::split_paths(").count(), 1);
             for absent in [
-                "env::",
-                "read_dir",
                 "canonicalize",
                 "eprintln!",
-                "OpenOptions",
+                "File::open(",
+                ".write(",
+                ".append(",
+                ".create(",
+                ".truncate(",
+                "fs::write",
+                "fs::remove",
+                "fs::create",
+                "fs::rename",
+                "File::create",
+                "set_var",
             ] {
                 assert!(!compact.contains(absent), "{absent} in face_file.rs");
             }
@@ -348,7 +395,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
                     format!("pub const FONT_PROVENANCE: &str = {assets}PROVENANCE\");"),
                     format!("pub const FONT_COPYING: &str = {assets}unifont-COPYING\");"),
                     format!("pub const FONT_LICENSE: &str = {assets}unifont-OFL-1.1.txt\");"),
-                    "pub const OUTLINE_FACE: &str = \"The outline face is JetBrains Mono Nerd Font Mono from the Nerd Fonts v3.5.1 release, read from /etc/fonts/jetbrains-mono-nerd, where its licences ship beside it: OFL.txt, README.md (each merged icon set and its licence) and licenses/.\\n\";".to_string(),
+                    "pub const OUTLINE_FACE: &str = \"The outline face is JetBrains Mono Nerd Font Mono from the Nerd Fonts v3.5.1 release, read from /etc/fonts/jetbrains-mono-nerd, where its licences ship beside it: OFL.txt, README.md (each merged icon set and its licence) and licenses/. Run elsewhere, a program reads the same files from the user's font directory, where ./install-fonts puts them, or else a copy the host packaged, which may be another release and keep its licences elsewhere.\\n\";".to_string(),
                 ],
                 "notices carry the three texts beside the face, the outline pointer and nothing else"
             );
@@ -372,12 +419,17 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 );
             }
         }
-        // Outside tests the environment is read in one place: the
-        // opener's `BROWSER`.
+        // Outside tests the environment is read in two places: the
+        // opener's `BROWSER`, and the face search's three directory
+        // values and their list's split, pinned above.
         let production = text.split("#[cfg(test)]").next().unwrap_or_default();
         assert_eq!(
             production.matches("std::env").count(),
-            usize::from(name == "open.rs"),
+            match name.as_str() {
+                "open.rs" => 1,
+                "face_file.rs" => 4,
+                _ => 0,
+            },
             "environment access in {name}"
         );
         if name == "open.rs" {

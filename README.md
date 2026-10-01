@@ -80,6 +80,12 @@ sequence, and proves automatic rollback on the next boot. An explicitly
 read-only disk pass exercises selector-side bookkeeping recovery; a separate
 fixture proves corrupted-current fallback.
 
+`./install-fonts`, with the same tools as `./news`, installs the pinned
+JetBrains Mono Nerd Font that td-ui and td-term draw with in
+`~/.local/share/fonts/jetbrains-mono-nerd` (under `$XDG_DATA_HOME` when
+that is set), so td programs run on this host draw with it rather than
+Unifont (`td-builder install-fonts`).
+
 ### Hand it to somebody who has not built td
 
 ```sh

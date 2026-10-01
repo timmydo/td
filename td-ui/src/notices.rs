@@ -7,4 +7,4 @@
 pub const FONT_PROVENANCE: &str = include_str!("../../td-compositor/assets/PROVENANCE");
 pub const FONT_COPYING: &str = include_str!("../../td-compositor/assets/unifont-COPYING");
 pub const FONT_LICENSE: &str = include_str!("../../td-compositor/assets/unifont-OFL-1.1.txt");
-pub const OUTLINE_FACE: &str = "The outline face is JetBrains Mono Nerd Font Mono from the Nerd Fonts v3.5.1 release, read from /etc/fonts/jetbrains-mono-nerd, where its licences ship beside it: OFL.txt, README.md (each merged icon set and its licence) and licenses/.\n";
+pub const OUTLINE_FACE: &str = "The outline face is JetBrains Mono Nerd Font Mono from the Nerd Fonts v3.5.1 release, read from /etc/fonts/jetbrains-mono-nerd, where its licences ship beside it: OFL.txt, README.md (each merged icon set and its licence) and licenses/. Run elsewhere, a program reads the same files from the user's font directory, where ./install-fonts puts them, or else a copy the host packaged, which may be another release and keep its licences elsewhere.\n";

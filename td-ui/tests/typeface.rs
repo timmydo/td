@@ -9,21 +9,26 @@
 //! The typeface over fonts `fonts` encodes: a face fitted to the grid's
 //! cell at each scale, made once, and the refusal of a face no grid cell
 //! fits; a raster given a typeface drawing through the face fitted at its
-//! scale; and the pinned face's loaders, the regular style and a
-//! terminal's four, over a directory the test writes.
+//! scale; the pinned face's loaders, the regular style and a terminal's
+//! four, over a directory the test writes; and the search for that
+//! directory over trees the test writes.
 
 mod fonts;
 
+use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fonts::{Builder, Glyph, Segment};
 use td_ui::atlas::{Slot, Style};
 use td_ui::face::Face;
-use td_ui::face_file::{BOLD, BOLD_ITALIC, DIR, ITALIC, REGULAR};
+use td_ui::face_file::{
+    find, places, Place, BOLD, BOLD_ITALIC, DIR, INSTALLED, INSTALL_HINT, ITALIC, REGULAR,
+    SEARCH_DEPTH, SEARCH_ENTRIES,
+};
 use td_ui::font::pinned;
 use td_ui::notices::OUTLINE_FACE;
-use td_ui::pinned_face::{load_from, load_from_or_note, styles_from_or_note, SETTING};
+use td_ui::pinned_face::{load_from, load_in, load_in_or_note, styles_in_or_note, SETTING};
 use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, Weight};
 use td_ui::sfnt::{Error, MAX_FONT_BYTES};
 use td_ui::typeface::Typeface;
@@ -128,12 +133,13 @@ fn the_bitmap_setting_keeps_a_program_on_the_bitmap_face() {
     let dir = scratch("setting");
     fs::write(dir.join(REGULAR), font()).unwrap();
     let setting = |value: &str| Some(std::ffi::OsString::from(value));
-    assert!(load_from_or_note(&dir, "test", None).is_some());
-    assert!(load_from_or_note(&dir, "test", setting("outline").as_deref()).is_some());
-    assert!(load_from_or_note(&dir, "test", setting("bitmap").as_deref()).is_none());
+    let places = [exact(&dir)];
+    assert!(load_in_or_note(&places, "test", None).is_some());
+    assert!(load_in_or_note(&places, "test", setting("outline").as_deref()).is_some());
+    assert!(load_in_or_note(&places, "test", setting("bitmap").as_deref()).is_none());
     // Without the face the note is written and the program still starts.
     fs::remove_file(dir.join(REGULAR)).unwrap();
-    assert!(load_from_or_note(&dir, "test", None).is_none());
+    assert!(load_in_or_note(&places, "test", None).is_none());
     fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -169,7 +175,13 @@ fn a_terminal_loads_four_styles_unless_the_setting_asks_for_the_bitmap_face() {
     }
     let load = |setting: Option<&str>| {
         let setting = setting.map(std::ffi::OsString::from);
-        styles_from_or_note(&dir, "test", CELL_WIDTH, CELL_HEIGHT, setting.as_deref())
+        styles_in_or_note(
+            &[exact(&dir)],
+            "test",
+            CELL_WIDTH,
+            CELL_HEIGHT,
+            setting.as_deref(),
+        )
     };
     let loaded = load(None).expect("the four styles load");
     assert_eq!(
@@ -180,9 +192,201 @@ fn a_terminal_loads_four_styles_unless_the_setting_asks_for_the_bitmap_face() {
     assert_eq!(loaded.style(false, true), Style::Italic);
     assert!(load(Some("outline")).is_some());
     assert!(load(Some("bitmap")).is_none());
+    // Every style is read from the directory the search finds the regular
+    // style in: an earlier-named one at the same depth holding only that
+    // refuses the face.
+    let base = dir
+        .parent()
+        .unwrap()
+        .join(format!("styles-walk-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    std::os::unix::fs::symlink(&dir, base.join("face")).unwrap();
+    let walked = [Place {
+        dir: base.clone(),
+        depth: 1,
+    }];
+    let find_styles = || styles_in_or_note(&walked, "test", CELL_WIDTH, CELL_HEIGHT, None);
+    assert!(find_styles().is_some());
+    fs::create_dir_all(base.join("bare")).unwrap();
+    fs::write(base.join("bare").join(REGULAR), style(0, 0, 500, 500)).unwrap();
+    assert!(find_styles().is_none());
+    fs::remove_dir_all(&base).unwrap();
     fs::remove_file(dir.join(ITALIC)).unwrap();
     assert!(load(None).is_none());
     fs::remove_dir_all(&dir).unwrap();
+}
+
+fn exact(dir: &Path) -> Place {
+    Place {
+        dir: dir.to_path_buf(),
+        depth: 0,
+    }
+}
+
+fn walked(dir: &Path) -> Place {
+    Place {
+        dir: dir.to_path_buf(),
+        depth: SEARCH_DEPTH,
+    }
+}
+
+fn face_in(dir: &Path) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join(REGULAR), font()).unwrap();
+    dir.to_path_buf()
+}
+
+#[test]
+fn the_places_are_the_image_the_install_and_the_font_roots_in_order() {
+    fn os(value: &str) -> Option<&OsStr> {
+        Some(OsStr::new(value))
+    }
+    let place = |dir: &str, depth: usize| Place {
+        dir: dir.into(),
+        depth,
+    };
+    assert_eq!(INSTALLED, "fonts/jetbrains-mono-nerd");
+    assert_eq!(
+        places(os("/h"), None, None),
+        [
+            place(DIR, 0),
+            place("/h/.local/share/fonts/jetbrains-mono-nerd", 0),
+            place("/h/.local/share/fonts", SEARCH_DEPTH),
+            place("/h/.fonts", SEARCH_DEPTH),
+            place("/usr/local/share/fonts", SEARCH_DEPTH),
+            place("/usr/share/fonts", SEARCH_DEPTH),
+        ]
+    );
+    // The XDG values when absolute, a repeat kept once.
+    assert_eq!(
+        places(os("/h"), os("/d"), os("/p/share:rel:/d:/usr/share")),
+        [
+            place(DIR, 0),
+            place("/d/fonts/jetbrains-mono-nerd", 0),
+            place("/d/fonts", SEARCH_DEPTH),
+            place("/h/.fonts", SEARCH_DEPTH),
+            place("/p/share/fonts", SEARCH_DEPTH),
+            place("/usr/share/fonts", SEARCH_DEPTH),
+        ]
+    );
+    // Relative or empty values are ignored; with no home only the image
+    // and the system roots remain.
+    assert_eq!(
+        places(os("rel"), os("rel"), os("")),
+        [
+            place(DIR, 0),
+            place("/usr/local/share/fonts", SEARCH_DEPTH),
+            place("/usr/share/fonts", SEARCH_DEPTH),
+        ]
+    );
+    assert_eq!(
+        places(None, os("/d"), None),
+        places(os("rel"), os("/d"), None)
+    );
+}
+
+#[test]
+fn the_search_takes_the_first_place_and_its_shallowest_first_named_face() {
+    let base = scratch("search");
+    let image = base.join("image");
+    let installed = base.join("data/fonts/jetbrains-mono-nerd");
+    let root = base.join("data/fonts");
+    let system = base.join("system");
+    // Nothing yet: the error names every place.
+    fs::create_dir_all(&image).unwrap();
+    fs::create_dir_all(&system).unwrap();
+    let order = [
+        exact(&image),
+        exact(&installed),
+        walked(&root),
+        walked(&system),
+    ];
+    let missing = find(&order).unwrap_err();
+    for place in &order {
+        assert!(
+            missing.contains(&place.dir.display().to_string()),
+            "{missing}"
+        );
+    }
+    assert!(missing.starts_with(REGULAR), "{missing}");
+    // Under a root, the shallowest at any depth within bound, then the
+    // first in name order, whatever order a directory lists them in.
+    let deep = face_in(&system.join("b/c/d/e"));
+    assert_eq!(find(&order).unwrap(), deep);
+    let shallow = face_in(&system.join("z/x"));
+    assert_eq!(find(&order).unwrap(), shallow);
+    let named = face_in(&system.join("a/x"));
+    assert_eq!(find(&order).unwrap(), named);
+    let top = face_in(&system.join("y"));
+    assert_eq!(find(&order).unwrap(), top);
+    // A later place loses to an earlier one, a walked root to an exact
+    // directory.
+    let user = face_in(&root.join("TTF"));
+    assert_eq!(find(&order).unwrap(), user);
+    face_in(&installed);
+    assert_eq!(find(&order).unwrap(), installed);
+    face_in(&image);
+    assert_eq!(find(&order).unwrap(), image);
+    let typeface = load_in(&order);
+    assert!(typeface.is_ok());
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn the_search_skips_hidden_and_too_deep_names_and_follows_a_linked_directory() {
+    let base = scratch("bounds");
+    let root = base.join("root");
+    face_in(&root.join(".stage"));
+    face_in(&root.join("1/2/3/4/5"));
+    assert!(find(&[walked(&root)]).is_err());
+    // A profile's linked font directory is followed, and a cycle is
+    // bounded by the depth.
+    let store = face_in(&base.join("store/font"));
+    std::os::unix::fs::symlink(base.join("store"), root.join("profile")).unwrap();
+    std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+    assert_eq!(find(&[walked(&root)]).unwrap(), root.join("profile/font"));
+    assert!(store.join(REGULAR).is_file());
+    // A face name that is not a regular file is not the face.
+    let named = base.join("named");
+    fs::create_dir_all(named.join(REGULAR)).unwrap();
+    assert!(find(&[exact(&named)]).is_err());
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn the_search_stops_after_its_entry_budget_wherever_the_entries_are() {
+    let base = scratch("budget");
+    let wide = base.join("wide");
+    fs::create_dir_all(&wide).unwrap();
+    for n in 0..SEARCH_ENTRIES {
+        fs::File::create(wide.join(format!("f{n:05}"))).unwrap();
+    }
+    let after = face_in(&base.join("after/x"));
+    // The budget is spent on the wide root: a later root is not walked,
+    // though an exact directory is still looked in.
+    let stopped = find(&[walked(&wide), walked(&base.join("after"))]).unwrap_err();
+    assert!(stopped.contains("stopped after"), "{stopped}");
+    assert_eq!(
+        find(&[walked(&wide), exact(&after)]).unwrap(),
+        after,
+        "an exact place costs no entry"
+    );
+    // One entry fewer and the later root is reached.
+    fs::remove_file(wide.join("f00000")).unwrap();
+    assert_eq!(
+        find(&[walked(&wide), walked(&base.join("after"))]).unwrap(),
+        after
+    );
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn a_program_without_the_face_is_told_to_install_it() {
+    assert_eq!(
+        INSTALL_HINT,
+        "run ./install-fonts from a td checkout to install it"
+    );
 }
 
 #[test]

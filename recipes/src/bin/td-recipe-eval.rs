@@ -59,6 +59,9 @@
 //!                         \t<key fingerprint>\t<cache> followed by the
 //!                         reviewed graph counts as name=value fields
 //!   ostree-pin STEM       print the exact deploy pin(s) owned by STEM
+//!   install-fonts-plan    print what `td-builder install-fonts` installs:
+//!                         the outline face recipe's archive pin, members
+//!                         and notice pins, tab-separated
 //! This is the loop tool the `recipe-rs` gate drives AND the corpus consumer
 //! entry (replacing `ts-emit` on the boa path). (The system-spec subcommands —
 //! list-specs/emit-spec/verify-spec — were retired with the guix-system museum
@@ -478,6 +481,19 @@ fn main() {
                 die("usage: source-pin STEM");
             }
             print_recipe_source_pins(stem);
+        }
+        Some("install-fonts-plan") => {
+            if args.get(2).is_some() {
+                die("usage: install-fonts-plan");
+            }
+            match catalog::outline_face::install_plan() {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                Err(e) => die(&e),
+            }
         }
         Some("ostree-pins") => {
             if args.get(2).is_some() {

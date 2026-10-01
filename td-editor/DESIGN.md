@@ -1031,9 +1031,11 @@ font is decoded once by the caller and borrowed; the production face and
 parser are the compositor's existing source modules, reached through td-ui.
 `--font-license` prints the provenance, COPYING and OFL notices
 `td_ui::notices` embeds from the same assets directory, then where the
-outline face and its notices ship. No host font search is introduced; the
-live window's one runtime font input is that pinned file, read by td-ui's
-`pinned_face`. The source recipe must stage these five
+outline face and its notices ship. The live window's one runtime font
+input is the pinned face's regular style, read by td-ui's `pinned_face`
+from the image's directory or, run on another host, from the first of the
+user's or the host's font directories that holds it (td-ui/DESIGN.md,
+"Delivery and trust position"). The source recipe must stage these five
 repository-relative inputs, keeping their paths exactly as in the checkout —
 all five relative to `td-ui/src`, where td-ui mounts the two sources and
 embeds the three notices:

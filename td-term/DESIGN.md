@@ -285,14 +285,18 @@ validity, and all pixel arithmetic before use.
 
 td-term also draws in td-ui's pinned outline face (td-ui/DESIGN.md,
 "td-term"). At startup it loads JetBrains Mono Nerd Font's four styles
-from `/etc/fonts/jetbrains-mono-nerd` through td-ui's
-`pinned_face::styles_or_note`, fitted to Unifont's 8x16 cell, so the grid, the `TIOCSWINSZ` pixel
-size and every rule stay Unifont's. A scalar the outline face lacks, a
-missing or refused face, and `TD_UI_FACE=bitmap` all draw from Unifont
-as below; a missing or refused face is one `td-term: outline face
-unavailable` line on stderr. No test reads the pinned outline face: the
-outline painter's oracles use fonts the tests encode, and every other
-oracle renders from Unifont.
+through td-ui's `pinned_face::styles_or_note` from the first directory
+td-ui's bounded search finds: `/etc/fonts/jetbrains-mono-nerd` on td's
+image, and on another host the user's or the host's font directories,
+where `./install-fonts` puts the pinned face (td-ui/DESIGN.md, "Delivery
+and trust position"). It fits them to Unifont's 8x16 cell, so the grid,
+the `TIOCSWINSZ` pixel size and every rule stay Unifont's. A scalar the
+outline face lacks, a missing or refused face, and `TD_UI_FACE=bitmap`
+all draw from Unifont as below; a missing or refused face is one
+`td-term: outline face unavailable` line on stderr, which names
+`./install-fonts`. The Unifont bytes above take no part in that search.
+No test reads the pinned outline face: the outline painter's oracles use
+fonts the tests encode, and every other oracle renders from Unifont.
 
 The renderer gives every claimed rendition a deterministic presentation from
 the bitmap face; through the outline face, bold, italic and bold italic
@@ -1330,10 +1334,12 @@ desktop's terminal must:
   `td-term: terminfo:` line says why, the inherited `TERMINFO` stands, and
   the child finds `td-term` only where the host installed it (`td-term
   terminfo PATH`, §4);
-- the outline face is read from the same `/etc/fonts/jetbrains-mono-nerd`
-  as in td's image (§3); a host without it draws in Unifont after one
-  `td-term: outline face unavailable` line, which `TD_UI_FACE=bitmap`
-  avoids by reading nothing;
+- the outline face is read from `/etc/fonts/jetbrains-mono-nerd` as in
+  td's image, or else from the user's or the host's font directories,
+  where `./install-fonts` puts it (§3); a host with none draws in Unifont
+  after one `td-term: outline face unavailable` line naming
+  `./install-fonts`, which `TD_UI_FACE=bitmap` avoids by reading
+  nothing;
 - td-term ends with its child: its status is td-term's (its code, or 128 and
   the signal that ended it) with no last-screen report, and the window does
   not wait for the output to drain, so a background job still holding the

@@ -160,7 +160,7 @@ fn sweep(base: &Path) {
 /// the seed provisioning resolves it (`TD_CC_HOME`, else `cc` or `gcc` on
 /// PATH), which also links, and the archiver beside it when there is one,
 /// since a provided toolchain's `ar` may be the only one.
-struct Tools {
+pub(crate) struct Tools {
     cargo: PathBuf,
     rustc: PathBuf,
     cc: PathBuf,
@@ -168,7 +168,7 @@ struct Tools {
     linker_var: String,
 }
 
-fn tools(root: &Path) -> Result<Tools, String> {
+pub(crate) fn tools(root: &Path) -> Result<Tools, String> {
     let penv = crate::stage0::ProvisionEnv::from_env(root);
     let cargo = crate::stage0::find_in_path(&penv.search_path, "cargo")
         .ok_or_else(|| "no cargo on PATH: install Rust (cargo and rustc)".to_string())?;
@@ -204,7 +204,7 @@ fn tools(root: &Path) -> Result<Tools, String> {
 /// pinned as compiler and linker (a host without `cc` on PATH, Guix among
 /// them, has `gcc`) and rustc as found; the binary where cargo reports it,
 /// which a configured target or target directory may have moved.
-fn build(root: &Path, tools: &Tools, dir: &str, bin: &str) -> Result<PathBuf, String> {
+pub(crate) fn build(root: &Path, tools: &Tools, dir: &str, bin: &str) -> Result<PathBuf, String> {
     eprintln!("host-run: building {dir}");
     let mut command = Command::new(&tools.cargo);
     command

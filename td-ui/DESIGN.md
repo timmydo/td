@@ -166,6 +166,13 @@ byte for byte; and the client's `activated`, `presented` and
 `td-term/DESIGN.md` is the normative contract for all of it; this
 document records only the toolkit's side.
 
+Newly built (increment 24): a program run outside the image finds the
+face on its host. `face_file::find` searches the user's and the host's
+font directories after the image's, and `./install-fonts` installs the
+pinned face, verified, where that search looks (see "Delivery and trust
+position" below). A program that draws with Unifont for want of the face
+says to run it.
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
@@ -304,20 +311,26 @@ of its own files may name each module.
 - `typeface`: `Typeface` (`new` over the regular style's bytes and an
   optional bold style's, refused as a face fitted to the grid's cell at
   scale one is; `face` at a `Scale`, refitted when the scale changes).
-- `face_file`: `DIR` and the four styles' file names (`REGULAR`,
-  `BOLD`, `ITALIC`, `BOLD_ITALIC`); `SETTING` (`TD_UI_FACE`), the
-  variable whose value a program passes, and `wanted`, whether that value
-  asks for the face (all but `bitmap` do); and `read`, the bounded read
-  of one file. td-term reads the four styles through it.
-- `pinned_face`: `load` and `load_from` a directory, the regular style
-  through `face_file::read`; `SETTING`, re-exported; and `load_or_note` and
-  `load_from_or_note` a directory, which take that value, draw with
-  Unifont without reading anything when it is `bitmap`, and otherwise
-  say on standard error why a program draws with Unifont instead; and,
-  for a terminal, `styles_from` a directory, the four styles as one
-  `Face` fitted to a cell, refused whole if a style is missing or
-  refused, with `styles_or_note` and `styles_from_or_note` taking the
-  setting and saying so as the regular loaders do.
+- `face_file`: `DIR`, `INSTALLED` (the same directory under the XDG
+  data home) and the four styles' file names (`REGULAR`, `BOLD`,
+  `ITALIC`, `BOLD_ITALIC`); `SETTING` (`TD_UI_FACE`), the variable whose
+  value a program passes, and `wanted`, whether that value asks for the
+  face (all but `bitmap` do); `Place`, `places` and `host_places`, where
+  the face is looked for, and `find`, the bounded search of them
+  (`SEARCH_DEPTH`, `SEARCH_ENTRIES`); `INSTALL_HINT`, what a program
+  without the face says to do; and `read`, the bounded read of one file.
+  td-term reads the four styles through it.
+- `pinned_face`: `load` from `host_places`, `load_in` given places and
+  `load_from` a directory, the regular style through `face_file::read`;
+  `SETTING`, re-exported; and `load_or_note` and `load_in_or_note` given
+  places, which take that value, draw with Unifont without reading
+  anything when it is `bitmap`, and otherwise say on standard error why
+  a program draws with Unifont instead and `INSTALL_HINT`; and, for a
+  terminal, `styles_from` a directory and `styles_in` given places, the
+  four styles as one `Face` fitted to a cell, read from the one
+  directory that holds the regular style and refused whole if a style
+  is missing or refused, with `styles_or_note` and `styles_in_or_note`
+  taking the setting and saying so as the regular loaders do.
 - `hint`: the hint face, a hand-authored 4x5 glyph (`WIDTH`, `HEIGHT`,
   `ADVANCE` 5) per printable ASCII scalar, `glyph` and the pixel `width`
   of a text; a scalar it lacks is a box. It is the small lighter text a
@@ -964,16 +977,20 @@ not frames, and stays its own).
   widget window `window`, whose `Window::new` reads the embedded face and
   whose loop is `client::run`; `open`, which reads `BROWSER`, starts
   the browser as a child process with its streams closed and reaps it on
-  a thread of its own; `face_file`, which reads one of the outline face's
-  files from the one directory it names, a regular file within the
-  reader's bound, checked before it is opened; `pinned_face`, which
-  reads only through it; and `pty`, which opens `/dev/ptmx`, spawns the
-  caller's command and owns the threads around it. Apart from `open`'s
-  `BROWSER` they read no environment variable, taking the display
-  values, the socket path, the face setting and a child's whole
-  environment as explicit arguments. The terminal's pure modules are
-  `vt`, `vt_render`, `vt_terminfo` and `vt_keys`: bytes, sizes, chords
-  and snapshots in; cells, replies, pixels and byte sequences out.
+  a thread of its own; `face_file`, which reads `HOME`, `XDG_DATA_HOME`
+  and `XDG_DATA_DIRS` for the places it searches, lists directories
+  within its depth and entry bounds to find the outline face, and reads
+  one of its files, a regular file within the reader's bound, checked
+  before it is opened and again on the open file, which it opens without
+  waiting, writing nothing; `pinned_face`, which reads only
+  through it; and `pty`, which opens `/dev/ptmx`, spawns the caller's
+  command and owns the threads around it. Apart from `open`'s `BROWSER`
+  and `face_file`'s three directory values they read no environment
+  variable, taking the display values, the socket path, the face setting
+  and a child's whole environment as explicit arguments. The terminal's
+  pure modules are `vt`, `vt_render`, `vt_terminfo` and `vt_keys`: bytes,
+  sizes, chords and snapshots in; cells, replies, pixels and byte
+  sequences out.
 - `control` and `driven` are pure: the frame, envelope and codecs touch
   no descriptor, and the seam reads only the composition it is handed
   and the embedded face. The decoder allocates at most one frame, after
@@ -1148,7 +1165,7 @@ not frames, and stays its own).
   face's cell, so it keeps the cell model only for a composition laid
   out on that cell; the widgets lay out on the bitmap grid, so a
   consumer opts in with a face fitted to that grid (`Face::fit`) until
-  runtime cells (increment 24).
+  runtime cells (increment 25).
 - The atlas is one 1024 by 1024 page (1 MiB) of at most 8192 keys, placed
   and missing together, with a pixel of gutter right of and below each
   entry, zeroed when it is placed and inside the dirty band; a full page
@@ -1401,7 +1418,9 @@ source mounts, the absence of ambient I/O in pure modules, that `notices` is
 three embedded texts and the outline face's literal and nothing else, the
 absence of `include!`, `cfg_attr` and any dependency declaration, that the
 shared sources bind no input interface, that `face_file` opens one file
-under its one directory after checking it and bounding the read and
+after checking it and bounding the read, lists directories in one place,
+builds its paths from its own names alone, reads exactly its three
+directory values from the environment and writes nothing, and that
 `pinned_face` reads only through it, and the raw layer: the complete
 fingerprint of `sys.rs`, its syscall and flag values, its three
 function-only allowances, the single instruction and adoption sites, that
@@ -2268,8 +2287,48 @@ into the store. `static-runtime` carries a copy at
 the path an unjailed one does. A consumer reads a style's bytes once at
 startup from that path and hands them to `sfnt::Font::parse`. The pure
 modules never open a file. A missing or refused face falls back to Unifont
-and says so once; a program never fails to start because the face is
-missing.
+and says so once, naming `./install-fonts`; a program never fails to
+start because the face is missing.
+
+A program run on another host, from a checkout, has no such path. So
+`face_file::find` looks in order in `/etc/fonts/jetbrains-mono-nerd`,
+then in `fonts/jetbrains-mono-nerd` under the XDG data home
+(`$XDG_DATA_HOME`, else `~/.local/share`), and then under the font
+roots: the data home's `fonts`, `~/.fonts`, and `fonts` under each XDG
+data directory (`$XDG_DATA_DIRS`, else `/usr/local/share` and
+`/usr/share`). It takes the first directory holding the regular style as
+a regular file. Each root is walked a level at a time to depth 4, each
+level in name order, so the answer does not depend on the order a
+directory lists its entries in. Hidden names are skipped, so a staged
+install is never taken. A symbolic link to a directory is followed,
+since a Guix or Nix profile's font directories are links, and the depth
+bounds a cycle. The whole search reads at most 16384 directory entries,
+and the one entry read past that stops this walk and every later one.
+The search lists directories and looks for the one name; it opens only
+the files the consumer then reads, under the reader's bounds. Those are
+host paths, so `read` checks a file is regular and within bound both
+before it opens it and on the opened descriptor, and opens it without
+waiting: a pipe swapped in between the two can neither hold a program's
+start nor be read. On the image and in a jail the first place answers.
+
+`./install-fonts` (`td-builder install-fonts`) puts the pinned face in
+the data-home directory. It builds `td-recipe-eval` with the host's
+cargo and has it print the font recipe's plan: the directory, the
+archive's pin, the members and each notice's pin and path. A pin found
+in the shared sources cache (`~/.td/sources`) with its digest is used as
+is. A cold one is fetched by the checkout's td-net, verified and moved
+into the cache. Every pin is verified again before it is read. The
+archive is unpacked by the reader the recipe's `unpack` step uses, and
+the members, regular files only, and the notices are staged beside the
+directory and put in its place. The installed directory is the recipe's
+output directory, notices included. Scratch, staged and replaced
+directories are hidden and named for the installing process, and those
+of an install that was killed are swept by the next.
+
+A face found under a host font root is whatever the host packaged under
+the regular style's name, not the pinned bytes. It is parsed under the
+same bounds as any other input, so it can only change what a glyph looks
+like; nothing executes it.
 
 A compiled TTF is not source: JetBrains builds it with fontmake from
 `.glyphs` sources, and Nerd Fonts patches it with FontForge. Neither
@@ -2414,13 +2473,14 @@ cells coincide.
 
 `typeface::Typeface` holds the style bytes once, shared, and fits a face
 at the scale asked for, refitting when it changes, so one atlas is held.
-`pinned_face::load` reads the regular style from
-`/etc/fonts/jetbrains-mono-nerd`, the only one the draw stream selects;
-the other three styles ship for td-term. A program calls
-`load_or_note` at startup with the value of `TD_UI_FACE`, which it reads
-as it reads the Wayland endpoint's variables: `bitmap` keeps it on
-Unifont without reading anything; otherwise, on any failure it says once
-on standard error that the program draws with Unifont, and the program
+`pinned_face::load` reads the regular style from the directory
+`face_file::find` finds (see "Delivery and trust position"), the only
+style the draw stream selects; the other three styles ship for td-term.
+A program calls `load_or_note` at startup with the value of
+`TD_UI_FACE`, which it reads as it reads the Wayland endpoint's
+variables: `bitmap` keeps it on Unifont without reading anything;
+otherwise, on any failure it says once on standard error that the
+program draws with Unifont and to run `./install-fonts`, and the program
 starts. In-process tests and still-image previews never load it. The
 face reaches a window only when handed to it (`window::run`'s typeface,
 `Window::with_typeface`), so every in-process oracle and `--preview`
@@ -2432,7 +2492,7 @@ not.
 ### Runtime cells
 
 `CELL_WIDTH` and `CELL_HEIGHT` are constants because the bitmap face fixes
-them. Runtime cells (increment 24) make them a `Cell` value derived from
+them. Runtime cells (increment 25) make them a `Cell` value derived from
 the face at the surface's pixel size, so a face can be drawn at a size
 the grid does not fix:
 
@@ -2458,9 +2518,10 @@ that font's cell:
 
 1. At startup td-term loads the four styles through
    `pinned_face::styles_or_note` unless `TD_UI_FACE` is `bitmap`, which
-   reads them through `face_file` and fits them to the 8x16 cell with
-   `Face::fit` and `with_slant`; on any failure it says so once and
-   td-term draws with Unifont.
+   reads them through `face_file` from the directory its search finds
+   and fits them to the 8x16 cell with `Face::fit` and `with_slant`; on
+   any failure it says so once, naming `./install-fonts`, and td-term
+   draws with Unifont.
 2. `vt_render::render_with` draws a cell through the face when the face
    has its scalar: the cell's ground, then the glyph's coverage from the
    atlas page blended from the ground toward the ink and clipped to the
@@ -2710,10 +2771,15 @@ regressions. Those increments extend the original sequence below.
     and `proc_status` mounted; td-term's window, session policy and
     readiness socket in its own crate, which forbids `unsafe`; the
     `td-term`, `td-term-terminfo` and `td-term-test` recipes. Landed.
-24. Runtime cells: `Cell` replaces the constants in layout, hit testing
+24. The host face: `face_file`'s bounded search of the user's and the
+    host's font directories after the image's, used by every consumer
+    and td-term; `td-builder install-fonts` and its `./install-fonts`
+    entry, installing the font recipe's files from its verified pins
+    under the XDG data home; and the Unifont note naming it. Landed.
+25. Runtime cells: `Cell` replaces the constants in layout, hit testing
     and painting, so a face is drawn at a size the grid does not fix.
     td-editor goes first, since the other consumers lay out over its
     pane.
-25. The GPU path, gated on the sign-offs "The GPU path" lists: the
+26. The GPU path, gated on the sign-offs "The GPU path" lists: the
     compositor's GPU composition first, then client dmabufs, then td-ui's
     GPU backend held to the CPU raster's oracles.

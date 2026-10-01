@@ -4,6 +4,10 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 /// `/etc/fonts/jetbrains-mono-nerd`.
 pub const DIR: &str = "share/fonts/jetbrains-mono-nerd";
 
+/// The same directory under a host user's XDG data home, where
+/// `install-fonts` puts it and td-ui looks.
+pub const DATA_DIR: &str = "fonts/jetbrains-mono-nerd";
+
 /// The four Mono styles td-ui reads, and the notices the release carries:
 /// the SIL Open Font License, and the README naming each merged icon set
 /// with its upstream and licence.
@@ -31,14 +35,17 @@ pub const NOTICES: &[(&str, &str)] = &[
     ("weather-icons", "OFL.txt"),
 ];
 
+/// The release archive's pin.
+const SOURCE: &str = "jetbrains-mono-nerd-font-source";
+
 // Pinned upstream data (AGENTS.md): compiled TrueType bytes td parses with
 // td-ui's bounded reader and never executes, and the notices beside them.
 // The recipe copies the pinned files and builds nothing.
 pub fn recipe() -> Recipe {
-    let notice = |set: &str, file: &str| format!("{{out}}/{DIR}/licenses/{set}/{file}");
+    let notice = |set: &str, file: &str| format!("{{out}}/{DIR}/{}", notice_path(set, file));
     let mut steps = vec![
         Step::Unpack {
-            input: "{in:jetbrains-mono-nerd-font-source}".into(),
+            input: format!("{{in:{SOURCE}}}"),
             dest: "{src}".into(),
             keep_top: true,
         },
@@ -66,7 +73,7 @@ pub fn recipe() -> Recipe {
     let pins: Vec<String> = NOTICES.iter().map(|(set, _)| notice_pin(set)).collect();
     let pins: Vec<&str> = pins.iter().map(String::as_str).collect();
     Recipe::mesboot("jetbrains-mono-nerd-font", "3.5.1")
-        .source_input("jetbrains-mono-nerd-font-source")
+        .source_input(SOURCE)
         .inputs(&pins)
         .steps(steps)
         .checks(vec![RecipeCheck::new(
@@ -77,6 +84,41 @@ pub fn recipe() -> Recipe {
 
 fn notice_pin(set: &str) -> String {
     format!("nerd-fonts-{set}-license-source")
+}
+
+/// Where a notice ships, relative to the face's directory.
+fn notice_path(set: &str, file: &str) -> String {
+    format!("licenses/{set}/{file}")
+}
+
+/// What `td-builder install-fonts` puts in a host user's font directory,
+/// the directory this recipe's output holds, one tab-separated line each:
+/// `dir DATA_DIR`; `archive URL SHA256 FILE`, the release's pin; `member NAME`, each of
+/// `FILES` copied from it; and `notice URL SHA256 FILE PATH`, each notice's
+/// pin and where it goes.
+pub fn install_plan() -> Result<Vec<String>, String> {
+    let pin =
+        |key: &str| crate::source_pins::by_key(key).ok_or_else(|| format!("{key} is not pinned"));
+    let archive = pin(SOURCE)?;
+    let mut lines = vec![
+        format!("dir\t{DATA_DIR}"),
+        format!(
+            "archive\t{}\t{}\t{}",
+            archive.url, archive.sha256, archive.file
+        ),
+    ];
+    lines.extend(FILES.iter().map(|name| format!("member\t{name}")));
+    for (set, file) in NOTICES {
+        let notice = pin(&notice_pin(set))?;
+        lines.push(format!(
+            "notice\t{}\t{}\t{}\t{}",
+            notice.url,
+            notice.sha256,
+            notice.file,
+            notice_path(set, file)
+        ));
+    }
+    Ok(lines)
 }
 
 #[cfg(test)]
@@ -137,5 +179,36 @@ mod tests {
                 | Step::CopyFile { .. }
                 | Step::Require { .. }
         )));
+    }
+
+    #[test]
+    fn the_install_plan_is_the_recipes_pins_members_and_notices() {
+        let plan = install_plan().unwrap();
+        let pin = |key: &str| crate::source_pins::by_key(key).unwrap();
+        let archive = pin(SOURCE);
+        let mut want = vec![
+            "dir\tfonts/jetbrains-mono-nerd".to_string(),
+            format!(
+                "archive\t{}\t{}\t{}",
+                archive.url, archive.sha256, archive.file
+            ),
+        ];
+        assert_eq!(DIR, format!("share/{DATA_DIR}"));
+        for name in FILES {
+            want.push(format!("member\t{name}"));
+        }
+        for (set, file) in NOTICES {
+            let notice = pin(&notice_pin(set));
+            want.push(format!(
+                "notice\t{}\t{}\t{}\tlicenses/{set}/{file}",
+                notice.url, notice.sha256, notice.file
+            ));
+        }
+        assert_eq!(plan, want);
+        // Every field is one nonempty token: no tab or newline in a value.
+        for line in &plan {
+            assert!(!line.contains('\n'));
+            assert!(line.split('\t').all(|field| !field.is_empty()), "{line}");
+        }
     }
 }

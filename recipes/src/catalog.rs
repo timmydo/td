@@ -37,6 +37,10 @@ pub fn named_dirs(stem: &str) -> &'static [&'static str] {
         .map_or(&[][..], |(_, dirs)| dirs)
 }
 
+/// The outline face's recipe, whose install plan `install-fonts-plan`
+/// prints.
+pub use registry::jetbrains_mono_nerd_font as outline_face;
+
 mod registry {
     include!(concat!(env!("OUT_DIR"), "/registry.rs"));
 }
