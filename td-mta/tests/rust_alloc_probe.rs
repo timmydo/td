@@ -691,6 +691,32 @@ fn entropy_workers() {
     println!("tls-entropy-allocation-v1: rust passed");
 }
 
+fn store_directories() {
+    use td_mta::{
+        store_fs::Directory,
+        store_paths::{Name, RootEntry},
+    };
+    let path = std::env::temp_dir().join(format!("td-mta-dir-alloc-{}", std::process::id()));
+    std::fs::create_dir(&path).unwrap();
+    std::fs::create_dir(path.join("accounts")).unwrap();
+    let root = Directory::from_file(std::fs::File::open(&path).unwrap()).unwrap();
+    let present = Name::root(RootEntry::Accounts).unwrap();
+    let missing = Name::root(RootEntry::Lock).unwrap();
+    let before = COUNTERS.snapshot();
+    for _ in 0..64 {
+        let directory = root.open(black_box(&present)).unwrap();
+        assert!(directory.metadata().unwrap().is_dir());
+        drop(directory);
+        assert_eq!(
+            root.open(black_box(&missing)).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+    assert_eq!(COUNTERS.snapshot(), before, "directory lookup allocated");
+    drop(root);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 fn main() {
     allocation_counter::Counters::verify_model();
     forwarding();
@@ -764,6 +790,7 @@ fn main() {
         tls_large_chain();
         return;
     }
+    store_directories();
     hot_paths();
     println!("rust-allocation-probe-v1: counter-model forwarding hot-paths passed");
 }

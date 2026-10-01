@@ -101,10 +101,33 @@ thread assignment or submission result. Copying just `.eml` files salvages
 content but does not restore the account. Configuration, devices and ACME state
 have their own lifetimes; an account checkpoint does not claim to snapshot them.
 
-Use trusted private roots on local ext4/Btrfs, tested for rename/file/directory
+Require Linux 5.6 or newer with openat2 available; refusal or unavailability
+fails closed without a path-walking fallback. Use trusted private roots on
+local ext4/Btrfs, tested for rename/file/directory
 sync behavior. NFS and external live writers are unsupported. Filenames,
 permissions and safe path construction obey DESIGN section 6. New-format files
 are refused rather than interpreted as an older schema.
+
+### Descriptor boundary
+
+`store_fs::Directory` pins a caller-opened directory File and checks its type.
+Its `open` takes only a generated Name, resolves relative to the retained
+handle using openat2, and accepts only directories. Every path component must
+remain beneath that handle and no symbolic or magic link may be resolved.
+New handles are close-on-exec and owned immediately; std closes them on drop.
+Metadata reads use the retained handle. Renaming/replacing its old pathname
+does not retarget a handle. Lookup uses fixed stack storage and does not retry
+kernel errors, including EAGAIN, ENOSYS or policy denial.
+
+This is a lookup primitive, not an admitted store root. The caller supplies
+the initial File; its path may have followed links before reaching this API.
+No ownership, mode, ancestor, filesystem or writer-lock claim follows from
+construction or successful relative lookup. Mount crossings remain possible.
+M05b2b must establish trusted roots before any service consumer uses this
+primitive for storage. File I/O, exclusive locking, durable mutation and
+fault injection remain pending. The current raw ABI supports x86-64 only;
+additional architectures need their own reviewed mapping. UNSAFE section 22
+owns the exact syscall, flags, descriptor ownership and confinement tests.
 
 ## 3. Metadata records
 

@@ -22,7 +22,7 @@ fn fingerprint(source: &str, expected: &str) {
     }
     assert_eq!(
         hex, expected,
-        "review the full allocator surface before repinning"
+        "review the full confined surface before repinning"
     );
 }
 
@@ -67,6 +67,16 @@ fn scan(root: &Path, path: &Path) {
                 &source,
                 "668320d1f8caf82018331e0325571b16f69423794d4bff888a410a2c416d3702",
             );
+        } else if relative == "src/store_fs_sys.rs" {
+            assert_eq!(words(&source, "unsafe"), 2);
+            assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 1);
+            assert_eq!(source.matches("std::arch::asm!").count(), 1);
+            assert_eq!(source.matches("File::from_raw_fd").count(), 1);
+            assert!(!source.contains("global_allocator"));
+            fingerprint(
+                &source,
+                "1de05bf44b98d258ec8144d4fd6eaf5e18d192bf341b068dc15a1f25a103bd5e",
+            );
         } else {
             assert_eq!(words(&source, "unsafe"), 0, "{relative}");
             assert!(!source.contains("allow(unsafe_code"), "{relative}");
@@ -103,6 +113,9 @@ fn scan(root: &Path, path: &Path) {
         }
         if relative.starts_with("src/") {
             assert!(!source.contains("allocation_registry"), "{relative}");
+            if !matches!(relative, "src/lib.rs" | "src/store_fs.rs") {
+                assert!(!source.contains("store_fs_sys"), "{relative}");
+            }
         }
         if !matches!(
             relative,
@@ -125,10 +138,24 @@ fn scan(root: &Path, path: &Path) {
 #[test]
 fn allocation_surface_is_separate_and_exact() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for source in ["src/lib.rs", "src/main.rs"] {
-        let source = std::fs::read_to_string(root.join(source)).unwrap();
-        assert_eq!(source.matches("#![forbid(unsafe_code)]").count(), 1);
-    }
+    let library = include_str!("../src/lib.rs");
+    fingerprint(
+        library,
+        "c704c38107cb1f8fe70939ae4c046dc3c4072c966ac33b00ffa82f603544a5e3",
+    );
+    assert_eq!(library.matches("#![deny(unsafe_code)]").count(), 1);
+    assert_eq!(library.matches("mod store_fs_sys;").count(), 1);
+    assert!(!library.contains("pub mod store_fs_sys"));
+    assert_eq!(
+        include_str!("../src/main.rs")
+            .matches("#![forbid(unsafe_code)]")
+            .count(),
+        1
+    );
+    fingerprint(
+        include_str!("../src/store_fs.rs"),
+        "9857354831b2599afb8cb6d43a32cab8901e4c7b765f24df6ab2da009c3202c5",
+    );
     let probe = include_str!("rust_alloc_probe.rs");
     assert_eq!(probe.matches("#![cfg(test)]").count(), 1);
     assert_eq!(probe.matches("#![deny(unsafe_code)]").count(), 1);

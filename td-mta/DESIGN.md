@@ -67,8 +67,8 @@ The service receives Internet SMTP for local recipients, stores and serves
 mail through JMAP, and submits outgoing messages through a configured smart
 host. It also supports receiving from an upstream gateway MX. It ships as
 one executable with all executable dependencies statically linked against
-musl for x86-64 Linux. Files for configuration, secrets, trust, and mail remain
-external. Data formats and interfaces must permit a future aarch64 build.
+musl for x86-64 Linux 5.6 or newer, with openat2 available. Files for
+configuration, secrets, trust, and mail remain external. Data formats and interfaces must permit a future aarch64 build.
 
 Included in v1:
 
@@ -189,7 +189,9 @@ Replacing only the direct digest/signing operations does not replace TLS's
 cryptography. Retaining Rustls means td-crypto still has an external TLS
 implementation even after AWS-LC is removed.
 
-Production code retains `forbid(unsafe_code)`. The separate test executable
+The production library denies `unsafe_code`, with only the confined directory
+lookup and descriptor adoption in UNSAFE.md section 22 allowed. The binary
+retains `forbid(unsafe_code)`. The separate test executable
 `tests/rust_alloc_probe.rs` has the user-approved allocation instrumentation
 exception specified in UNSAFE.md T1. Its single scoped GlobalAlloc
 implementation forwards all four operations to System without changing
@@ -419,6 +421,9 @@ the service does not support a data root with an untrusted concurrent writer.
 Create secret/mail files as 0600 and private directories as 0700, without a
 permissive creation window. Never derive a filesystem pathname from a mailbox
 name, address, attachment filename, or arbitrary client ID.
+The implemented descriptor-only directory lookup and its remaining root
+admission requirements are specified in STORAGE.md; its narrow Linux syscall
+and immediate descriptor adoption are recorded in UNSAFE.md section 22.
 
 Planned commands, with stable JSON output and exit codes:
 

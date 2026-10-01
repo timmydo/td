@@ -1,25 +1,48 @@
 //! Service foundations only: no listeners, protocol handlers or capabilities.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+#[forbid(unsafe_code)]
 pub mod admission;
+#[forbid(unsafe_code)]
 pub mod bounded;
+#[forbid(unsafe_code)]
 pub mod clock;
+#[forbid(unsafe_code)]
 pub mod config;
+#[forbid(unsafe_code)]
 pub mod format;
+#[forbid(unsafe_code)]
 pub mod gateway_policy;
+#[forbid(unsafe_code)]
 pub mod generations;
+#[forbid(unsafe_code)]
 pub mod ids;
+#[forbid(unsafe_code)]
 pub mod limits;
+#[forbid(unsafe_code)]
 pub mod observability;
+#[forbid(unsafe_code)]
 pub mod ownership;
+#[forbid(unsafe_code)]
 pub mod ports;
+#[forbid(unsafe_code)]
 pub mod smtp_wire;
+#[forbid(unsafe_code)]
+pub mod store_fs;
+mod store_fs_sys;
+#[forbid(unsafe_code)]
 pub mod store_paths;
+#[forbid(unsafe_code)]
 pub mod sync;
+#[forbid(unsafe_code)]
 pub mod tls_admission;
+#[forbid(unsafe_code)]
 pub mod tls_io;
+#[forbid(unsafe_code)]
 pub mod tls_policy;
+#[forbid(unsafe_code)]
 pub mod transport;
+#[forbid(unsafe_code)]
 pub mod wire;
 
 /// Operator configuration schema, independent of the future storage format.
@@ -54,9 +77,11 @@ impl std::fmt::Display for UnsupportedConfigVersion {
 impl std::error::Error for UnsupportedConfigVersion {}
 
 #[cfg(test)]
+#[forbid(unsafe_code)]
 mod tls_memory_process_tests;
 
 #[cfg(test)]
+#[forbid(unsafe_code)]
 mod tests {
     use super::*;
 

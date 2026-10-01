@@ -640,6 +640,17 @@ service activation. Each part lands independently:
     operations, process-scoped exclusive lock, ownership/mode/type validation
     and non-replacing publication with file/directory sync. Own fault injection
     and process-death tests; names alone do not complete this adapter.
+    - **M05b2a — directory lookup:** implemented Linux x86-64 openat2 with
+      directory-only, beneath/no-symlink and close-on-exec flags. Retain an
+      owned descriptor independently of pathname changes. Kernel rejection,
+      ownership/exec cleanup and allocation observations cover the primitive.
+      Linux 5.6+ is required; no older-kernel fallback is planned.
+    - **M05b2b — root admission and lock:** pending trusted ancestry, owner/
+      mode/filesystem admission and exclusive persistent LOCK lifetime.
+      A caller-provided directory descriptor alone is not a trusted root.
+    - **M05b2c — durable operations:** pending confined file creation/read/
+      write, non-replacing publication, sync and deterministic fault model.
+      Process-death tests and later VM power-loss evidence remain required.
 - **M05c — immutable blobs:** admitted streamed temporary bodies, inline SHA-256,
   exact size accounting and durable non-replacing publication. Couple effect
   tickets and completion reserves; inject failures at each filesystem step.

@@ -14,8 +14,8 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
 no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-ONE
-numbered target-side exceptions, NINETEEN of them live, each a standalone
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-TWO
+numbered target-side exceptions, TWENTY of them live, each a standalone
 crate OUTSIDE the `builder`/`recipes`/`engine` workspace with a scoped
 `#[allow]` around its recorded raw Linux boundary (the crate itself
 `#![deny(unsafe_code)]`s); the seventeenth and eighteenth are retired and
@@ -51,12 +51,14 @@ value-pinned requests, and `poll(2)` — recorded twice because the
 one-package locks the gate required of a root crate when the two were
 imported left no shared crate to put it in; both now draw in a td-ui
 window and forbid `unsafe` crate-wide, so §17 and §18 are retired and the
-roster counts nineteen live surfaces in twenty-one numbered entries. The
+roster counts twenty live surfaces in twenty-two numbered entries. The
 twentieth, `td-taskmgr`, has one function-scoped instruction for
 process-directed signals through retained procfs directory descriptors.
 The twenty-first, `td-install`, has one function-scoped instruction for two
 value-pinned loop-device requests, which reach a freshly formatted volume
 through the disk claim the installer already holds.
+The twenty-second, `td-mta`, opens confined directories with one scoped
+instruction and adoption function; its test allocators remain separate.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -120,6 +122,7 @@ own entry.
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 | 21 | `td-install` | `ioctl(2)` with two value-pinned loop requests, `LOOP_CTL_GET_FREE` and `LOOP_CONFIGURE` — see [§21](#21-td-install--publishing-through-a-loop-over-the-claim) |
+| 22 | `td-mta` | `openat2(2)`, directory-only beneath a borrowed parent with no symlink resolution; one newly returned descriptor adoption |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -3001,6 +3004,43 @@ detached it; the read-back reports that case rather than hiding it. Any
 further syscall, request, configured field or flag, caller, or allowance
 amends this section and `td-install/DESIGN.md`.
 
+## 22. `td-mta` — confined storage directory lookup
+
+`store_fs_sys.rs` has one function-scoped allowance containing one Linux
+x86-64 syscall instruction and one `File::from_raw_fd` adoption. Its only
+syscall is openat2 (437). The complete 24-byte repr(C) open_how consists of
+three initialized u64 fields: flags are O_RDONLY (0) | O_DIRECTORY (0o200000)
+| O_CLOEXEC (0o2000000), mode is zero, and resolve is RESOLVE_BENEATH (8) |
+RESOLVE_NO_SYMLINKS (4). The latter also refuses magic links. The request
+size is exactly 24. No caller chooses a flag, mode, syscall or raw fd.
+The safe wrapper borrows a live File and terminated CStr through return.
+Its assembly uses rax/rdi/rsi/rdx/r10, clobbers rcx/r11 and declares neither
+nomem nor readonly. Negative kernel errno returns become std I/O errors;
+each successful nonnegative int descriptor, including zero, is immediately
+adopted exactly once before any fallible operation. Std owns every close.
+No pointer dereference, mapping, foreign function or raw close is added.
+
+Only `store_fs::Directory::open` calls the wrapper in production, with a
+retained directory and a canonical `store_paths::Name`. `from_file` accepts
+a caller-opened directory and checks only type: it does not certify the
+anchor's ancestry, ownership, permissions, filesystem, or lock. Generated
+names and lookup confinement do not establish those properties either.
+Directory handles survive path renames; mount crossings remain allowed.
+The service still cannot open or activate a store. Root admission, file
+I/O, locking and durable mutations remain separate increments.
+
+Linux 5.6+ is the deployment minimum. Unsupported or denied openat2 fails
+without a fallback or retry loop. The initial ABI is x86-64 only; future
+architectures must supply their own reviewed register and flag mapping.
+Confinement inventories all mail source and pins this entire raw file,
+its allowance/adoption/instruction counts, library denial and caller set.
+Kernel tests refuse absolute and escaping raw names, final/intermediate
+symlinks, wrong types and missing entries, and check retained-inode identity,
+close-on-exec and drop cleanup. The allocation probe observes successful
+and failing directory lookup without Rust allocations. Any new operation,
+flag profile, caller, architecture or allowance amends this section and
+STORAGE.md; the two test-only allocation exceptions below are unchanged.
+
 ## H1. `td-vm-registrar` — host Git account enrollment
 
 The host-only registrar in `td-vm` has exactly one x86-64 Linux syscall:
@@ -3037,8 +3077,9 @@ The human-approved test instrumentation exception is confined to
 `td-mta/tests/support/allocation_shim.rs`, included only by the separate
 `tests/rust_alloc_probe.rs` integration executable. Cargo marks this target
 `harness = false`: one main runs each observation sequentially without libtest
-workers. The root is `cfg(test)` and denies unsafe code. Production library
-and binary roots retain their prohibition; no runtime feature enables a probe.
+workers. The root is `cfg(test)` and denies unsafe code. The production
+library denies the keyword with only section 22 allowed; the binary forbids
+it. No runtime feature enables a probe.
 
 One impl-scoped allowance covers `unsafe impl GlobalAlloc` and exactly four
 methods (`alloc`, `alloc_zeroed`, `dealloc`, `realloc`). Each has exactly one
@@ -3085,8 +3126,9 @@ The approved allocation instrumentation exception also admits a separate
 `tests/native_alloc_probe.rs` executable. Its native modules compile only
 with `cfg(td_native_alloc_probe)`, applied by the isolated builder to this
 final test target for Linux x86-64 musl. Ordinary host tests run an explicit
-unqualified stub. Production roots retain `forbid(unsafe_code)`; the test
-root denies it. No Cargo feature or common compiler flag enables wrapping.
+unqualified stub. The production library permits only section 22; the binary
+retains `forbid(unsafe_code)` and the test root denies it. No Cargo feature
+or common compiler flag enables wrapping.
 
 `tests/support/native_allocator_bridge.rs` declares the six real libc entry
 points and exports exactly `__wrap_malloc`, `__wrap_calloc`, `__wrap_realloc`,
