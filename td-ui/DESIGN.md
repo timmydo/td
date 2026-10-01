@@ -402,6 +402,48 @@ of its own files may name each module.
   each, and the status band, the list and the text entry are rasterized
   whole to pixels. td-editor's `Geometry` and `Scene` compose the bands
   and its `--preview` stays byte-identical.
+- `entry_model`: `EntryModel`, the editing state a `TextEntry` paints:
+  text bounded at a byte `limit`, at most `MAX_LIMIT` (1 MiB) and
+  reserved by `new`, so no edit reallocates, with the caret, the
+  selection anchor and the first shown column in character columns.
+  `act` takes an `Action` (`Move` by a `Motion` with `extend`,
+  `SelectAll`, `Backspace`, `Delete`, `DeleteWordLeft`,
+  `DeleteWordRight`, `Insert`) and answers `Changed`, `Moved` when the
+  caret or the shown selection moved, or `Ignored`; `Action::from_chord`
+  is the default binding set (arrows, `C-` words, `S-` extends, Home,
+  End, Backspace and Delete with `C-` for words, `C-a`, one printable
+  character), and clipboard chords stay with the consumer. `paste` and
+  `set_text` take text whole or refuse it, a control character or a
+  line or paragraph separator as `Control` and a result past the limit
+  as `Limit`, so the entry holds one line without a tab; `set_text`
+  leaves the caret at the end with no selection, also for the same
+  text. `copy` and `cut` hand the selection out as the clipboard's
+  `Arc<str>`; `set_masked` makes them refuse with `Masked` and the word
+  motions and deletes go to the ends. `place` maps a pointer point
+  through `TextEntry::hit`; `drag` extends to any point, one column
+  past a field edge, so a `reveal` after each drag event scrolls;
+  `reveal` scrolls, an edit keeps the first shown column inside the
+  text, and `field` gives the painter its `Field`. The bytes an edit
+  leaves past the new end are zeroed in place, `clear` zeroes the whole
+  text and drop the buffer, best effort as the editor core's is; a
+  key's chord, a paste's source and the copies `copy` and `cut` return
+  are outside the model. `Debug` shows the length, never the text. The
+  masked mode is still no trust boundary (see "Invariants").
+- `list_model`: `ListModel`, a `List`'s count, selection and first shown
+  item, the geometry passed in on each call. The selection is a
+  position: `set_items` takes a new count from a filter or a reload
+  together with the position the selected item now holds, or none, so
+  the consumer re-selects by its own identity. `step` takes a `Step`
+  (`Up`, `Down`, `PageUp`, `PageDown` by the shown rows, `Home`, `End`;
+  `Step::from_chord` the defaults) without wrapping; it, `select` and
+  `press` through `List::hit` show the selection even when it is
+  unchanged, and `scroll` moves the window alone. Each answers a
+  `Change` naming whether the selection, the window or both changed.
+  `relayout` follows a resize, and `with_margin` keeps rows shown
+  around the selection through `reveal_within`. `window` names the item
+  range a consumer hands `emit`, which paints through `List::emit` with
+  no row highlighted when nothing is selected. Activation, a double
+  press and filtering stay with the consumer.
 - `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
   texts beside the face in `td-compositor/assets`, embedded at compile
   time for a program's `--font-license` output, and `OUTLINE_FACE`, one
@@ -1274,7 +1316,10 @@ not frames, and stays its own).
   consumer's: a field collecting a secret must be presented only within
   the compositor's secure-attention and trusted-input path, which
   `td-install/ENCRYPTION.md` and Principle 7 require. td-ui provides the
-  primitive; the consumer verifies it is used appropriately.
+  primitive; the consumer verifies it is used appropriately. A masked
+  `EntryModel` adds only that it never hands its text to the clipboard
+  and that its word motions do not show where words break; that is no
+  trust boundary either.
 
 ## Test contract
 
@@ -2995,3 +3040,9 @@ regressions. Those increments extend the original sequence below.
     td-editor as `editor_search`, with their tests in
     `tests/editor_policy.rs`; the codec's line-ending policy written
     down. td-pass's notebook pane is their first user. Landed.
+29. The entry and list controllers: `entry_model` and `list_model`, the
+    editing and selection state over the `TextEntry` and `List`
+    painters, for td-pass's search field and title list first. The
+    hand-rolled entries and lists in td-taskmgr, td-setup, td-mail,
+    td-news, `finder` and `confirmations` may adopt them, each in its
+    own landing. Landed.

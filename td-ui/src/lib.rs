@@ -11,7 +11,9 @@
 //! clipboard, and the turn loop that drives a consumer's `App`), and the
 //! chrome bands over the raster (`chrome`: the menu bar and its panel, the
 //! wrapped text block, the tab strip, the button strip, the slider, the
-//! status row, the paged list and the single-line text entry), and the
+//! status row, the paged list and the single-line text entry) with the
+//! editing and selection state over the last two (`entry_model`,
+//! `list_model`), and the
 //! driving layer an agent or a test operates a consumer through (`control`:
 //! the frame, envelope, codecs and response lines; `control_socket`:
 //! private listener publication; `control_worker`: the bounded transport
@@ -68,6 +70,7 @@ pub mod editor_model;
 pub mod editor_render;
 pub mod editor_search;
 pub mod editor_text;
+pub mod entry_model;
 pub mod face;
 pub mod face_file;
 #[path = "../../td-compositor/src/filter.rs"]
@@ -80,6 +83,7 @@ mod font_data;
 pub mod hint;
 pub mod keyboard;
 pub mod links;
+pub mod list_model;
 pub mod menus;
 pub mod notices;
 pub mod open;
