@@ -264,16 +264,23 @@ fn main() {
     }
     if std::env::args()
         .nth(1)
+        .is_some_and(|arg| arg == "--tls-generation-trust")
+    {
+        tls_generations(tls_generation_scenario::Scenario::Trust);
+        return;
+    }
+    if std::env::args()
+        .nth(1)
         .is_some_and(|arg| arg == "--tls-generation-routing")
     {
-        tls_generations(true);
+        tls_generations(tls_generation_scenario::Scenario::Routing);
         return;
     }
     if std::env::args()
         .nth(1)
         .is_some_and(|arg| arg == "--tls-generations")
     {
-        tls_generations(false);
+        tls_generations(tls_generation_scenario::Scenario::Ordinary);
         return;
     }
     if std::env::args()
@@ -290,18 +297,14 @@ fn main() {
 #[path = "support/tls_generation_scenario.rs"]
 mod tls_generation_scenario;
 
-fn tls_generations(routing: bool) {
-    let label = if routing {
-        "generation-routing"
-    } else {
-        "generation"
-    };
+fn tls_generations(scenario: tls_generation_scenario::Scenario) {
+    let label = scenario.label();
     let mut samples = [COUNTERS.snapshot(); tls_generation_scenario::PHASES.len()];
     let mut slots = samples.iter_mut();
-    tls_generation_scenario::run(routing, || *slots.next().unwrap() = COUNTERS.snapshot());
+    tls_generation_scenario::run(scenario, || *slots.next().unwrap() = COUNTERS.snapshot());
     assert!(slots.next().is_none());
     assert!(samples.iter().all(|s| !s.invalid));
-    if routing {
+    if scenario == tls_generation_scenario::Scenario::Routing {
         let retained = samples
             .get(4)
             .unwrap()

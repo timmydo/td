@@ -182,7 +182,6 @@ this command does not sweep shared evaluator scratch. Service memory budgets
 do not describe build-time resource use. ARM host and target support requires
 a separate manifest/layout qualification.
 
-
 ## Isolated compilation and artifact
 
 ```text
@@ -791,7 +790,6 @@ its exact success line after model, forwarding and digest/SMTP checks. UNSAFE.md
 td-mta/RESOURCES.md define the scope: requested Rust bytes only; no native,
 RSS, whole-service or allocation-elimination guarantee is inferred.
 
-
 ## Mail native allocation diagnostic artifact
 
 `td-mta-native-allocation-probe` is a seventh, separate integration executable.
@@ -886,11 +884,12 @@ and refuse the Rust/native probe sentinels there. The exact artifact inventory,
 static ELF validation and fresh runtime namespace include it explicitly.
 
 The default process checks the bounded rollup parser and observes a positive
-resident increase after touching a 16 MiB allocation. Seven independent
+resident increase after touching a 16 MiB allocation. Eight independent
 fresh processes run the client, local handshake, entropy worker, fragmented
-handshake, large-chain, sixteen-profile generation and large
-generation-routing scenarios. The runtime requires exact ordered rows,
-positive decimal KiB values and the scenario completion record before
+handshake, large-chain, sixteen-profile generation, large
+generation-routing and gateway-trust generation scenarios. The runtime
+requires exact ordered rows, positive decimal KiB values and the scenario
+completion record before
 logging. Every mode has its own bounded log and 30-second deadline. Missing
 procfs support or malformed/truncated rollup output fails qualification.
 
@@ -936,3 +935,20 @@ still obeys the PEM/DER ceilings. The runtime requires distinct ordered
 the smaller generation case. No new executable, unsafe surface or link flag
 is introduced. RESOURCES.md defines retained fixture attribution, checked
 release/refusal invariants and the remaining aggregate-admission limits.
+
+## Gateway trust generation observations
+
+Both allocation executables and the unwrapped RSS executable additionally run
+`--tls-generation-trust` in fresh processes. It constructs sixteen admitted
+large file profiles, fifteen gateway policies with full 128-anchor private
+bundles, one HTTPS listener and relay trust. The fixture's explicit fifteen
+SMTP slots and 80 MiB planner budget do not change shipped defaults. Its
+external MX configuration needs no direct SMTP listener. This measures cold
+configuration retention without claiming peer authentication.
+
+The runtime requires exact eleven-phase `generation-trust` records and the
+v1 allocation or v2 RSS completion before printing diagnostics. Other scenario
+records cannot satisfy this evidence. Stable old-generation release and
+repeated replacement remain allocation oracles. No executable, unsafe surface
+or link flag is added. td-mta/RESOURCES.md defines the observed allowance
+overrun and pending aggregate admission work.

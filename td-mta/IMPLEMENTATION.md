@@ -962,6 +962,14 @@ Implement the remaining work as independently reviewable increments:
     retained requested bytes against 1 MiB; full generation/session admission
     and allocator/RSS bounds remain pending.
 
+  - **M07e4h — gateway trust generation observations:** a separate scenario
+    constructs sixteen large profiles, fifteen gateway policies with full
+    128-anchor private bundles, one HTTPS listener and relay trust. Fresh
+    Rust/native/RSS processes cover the two-generation lifecycle, unchanged
+    third-slot refusal and stable replacement. Its explicit fifteen-session,
+    80 MiB configuration is fixture-only. Retained trust duplication still
+    requires accounting or reduction before service activation.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,

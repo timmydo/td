@@ -124,14 +124,21 @@ fn main() {
         Some("--tls-large-chain") => observe("large-chain", tls_handshake_scenario::PHASES, |f| {
             tls_handshake_scenario::run_large(f)
         }),
-        Some("--tls-generations") => observe("generation", tls_generation_scenario::PHASES, |f| {
-            tls_generation_scenario::run(false, f)
-        }),
-        Some("--tls-generation-routing") => {
-            observe("generation-routing", tls_generation_scenario::PHASES, |f| {
-                tls_generation_scenario::run(true, f)
-            })
-        }
+        Some("--tls-generations") => observe(
+            tls_generation_scenario::Scenario::Ordinary.label(),
+            tls_generation_scenario::PHASES,
+            |f| tls_generation_scenario::run(tls_generation_scenario::Scenario::Ordinary, f),
+        ),
+        Some("--tls-generation-trust") => observe(
+            tls_generation_scenario::Scenario::Trust.label(),
+            tls_generation_scenario::PHASES,
+            |f| tls_generation_scenario::run(tls_generation_scenario::Scenario::Trust, f),
+        ),
+        Some("--tls-generation-routing") => observe(
+            tls_generation_scenario::Scenario::Routing.label(),
+            tls_generation_scenario::PHASES,
+            |f| tls_generation_scenario::run(tls_generation_scenario::Scenario::Routing, f),
+        ),
         Some("--tls-remote-chain") => observe(
             tls_remote_chain_scenario::label(),
             tls_remote_chain_scenario::PHASES,

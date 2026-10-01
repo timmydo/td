@@ -324,3 +324,34 @@ fn run_profile(large: bool, mut observe: impl FnMut()) {
     }
     observe();
 }
+
+/// Many distinct subjects keep substantial anchor data after DER is discarded.
+pub(crate) fn large_trust_bundle() -> Vec<u8> {
+    let mut raw = [0; P256_PKCS8_CAPACITY];
+    let n = Provider.generate_p256(&mut raw).unwrap();
+    let key = Provider.load_p256(&raw[..n]).unwrap();
+    let mut bundle = Vec::new();
+    for serial in 1..=128 {
+        let subject = format!("{}-{serial:03}", "r".repeat(56));
+        let cert = certificate_with(
+            &key,
+            &key,
+            &Certificate {
+                ca: true,
+                // Keep a one-byte DER serial positive; issuers differ.
+                serial: if serial == 128 { 1 } else { serial },
+                names: &[],
+                client: false,
+                issuer: subject.as_bytes(),
+                subject: subject.as_bytes(),
+                padding: 220,
+            },
+        );
+        bundle.extend_from_slice(&pem("CERTIFICATE", &cert));
+    }
+    assert!(bundle.len() > 112 * 1024);
+    assert!(bundle.len() <= td_mta::config::inputs::MAX_CA_BYTES);
+    let trust = td_crypto::TrustStore::from_pem(&bundle).unwrap();
+    assert_eq!(trust.anchor_count(), 128);
+    bundle
+}

@@ -907,7 +907,7 @@ policy, generation admission or whole-service RSS claim changes.
 
 ## Sampled process RSS observations
 
-A separate unwrapped `rss_probe` integration executable reuses the five shared
+A separate unwrapped `rss_probe` integration executable reuses the shared
 allocation scenarios. Each mode runs in a fresh process without either
 allocation counter or the native registry. An observer opened before the
 scenario rewinds `/proc/self/smaps_rollup` into a fixed 4096-byte buffer and
@@ -926,8 +926,9 @@ claim. Those controls run separately so they do not warm scenario processes.
 
 The existing phase names are retained. Rows have `rss SCENARIO PHASE KIB`,
 where SCENARIO is client, handshake, entropy, fragment, large-chain, generation,
-generation-routing, remote12, remote13 or remote13large. The completion record is
-`rss-observation-v2: SCENARIO passed`. Samples use fixed arrays and are
+generation-routing, generation-trust, remote12, remote13 or remote13large.
+The completion record is `rss-observation-v2: SCENARIO passed`. Samples use
+fixed arrays and are
 formatted after scenario teardown. Positive controls use the control scenario
 with baseline, touched and dropped phases.
 
@@ -1000,6 +1001,38 @@ metadata. The allocation case uses one common JMAP-primary profile; it does
 not measure all possible primary-role combinations or prove an aggregate upper
 bound for all configurations;
 complete concurrent session and generation qualification remains M07e.
+
+## Gateway trust generation observations
+
+The existing diagnostic artifacts also accept `--tls-generation-trust`.
+This cold configuration case retains sixteen admitted large certificate
+profiles, fifteen gateway listeners and one HTTPS listener. Each gateway
+references its own declared policy and the same synthetic private CA bundle
+contents. The relay also uses that bundle. It contains 128 distinct anchors
+with different bounded subjects, one P-256 key and noncritical padding; its
+PEM size is greater than 112 KiB and at most the admitted 128 KiB. Every load
+parses the complete bundle. No peer handshake or successful authentication is
+claimed by this configuration-only fixture.
+
+The fixture explicitly declares fifteen SMTP slots and an 80 MiB planner
+budget so the fifteen one-slot gateway listeners are admitted. It supplies an
+external MX for every domain, with no direct SMTP listener. These settings
+belong to the fixture; shipped defaults and the 1 MiB generation ledger entry
+are unchanged. Assertions check the decoded profile/listener/gateway counts,
+material-open counts and complete seventeen-entry policy table.
+
+Rust/native allocation processes enforce the same unchanged third-slot
+refusal, old-generation release and four stable replacements as the other
+generation cases. RSS is sampled in its own process. Exact
+`generation-trust` schema labels distinguish all eleven lifecycle phases,
+with allocation completion `tls-generation-trust-allocation-v1: DOMAIN passed`
+and RSS completion `rss-observation-v2: generation-trust passed`. Other
+scenario output cannot supply its evidence. Host observations exceed the
+planned 1 MiB generation allowance. Its single HTTPS listener has no views to
+share across listeners. Reducing retained
+trust data, revising the allowance or narrowing admitted configuration remains
+required before service activation. The case does not establish a maximum for
+arbitrary subjects, mixed algorithms, ACME trust or concurrent sessions.
 
 ## Large remote-chain observations
 

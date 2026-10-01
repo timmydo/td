@@ -1,7 +1,9 @@
 //! Sixteen large files profiles; sampled owners are not aggregate admission.
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::panic)]
-use super::tls_handshake_scenario::{large_material_names, large_routing_material};
+use super::tls_handshake_scenario::{
+    large_material_names, large_routing_material, large_trust_bundle,
+};
 use std::{fmt::Write, hint::black_box, io::Cursor, sync::Arc};
 use td_crypto::{ClockHandle, UtcClock};
 use td_mta::{
@@ -53,13 +55,31 @@ impl UtcClock for FixedClock {
     }
 }
 
-pub fn run(routing: bool, mut observe: impl FnMut()) {
+#[derive(Clone, Copy, PartialEq)]
+pub enum Scenario {
+    Ordinary,
+    Routing,
+    Trust,
+}
+impl Scenario {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ordinary => "generation",
+            Self::Routing => "generation-routing",
+            Self::Trust => "generation-trust",
+        }
+    }
+}
+
+pub fn run(scenario: Scenario, mut observe: impl FnMut()) {
+    let routing = scenario == Scenario::Routing;
+    let trust = scenario == Scenario::Trust;
     observe();
     {
-        let (materials, text) = if routing {
-            routing_inputs()
-        } else {
-            ordinary_inputs()
+        let (materials, text) = match scenario {
+            Scenario::Ordinary => ordinary_inputs(),
+            Scenario::Routing => routing_inputs(),
+            Scenario::Trust => trust_inputs(),
         };
         observe();
         let mut scratch = vec![0; stream::SCRATCH_BYTES];
@@ -96,13 +116,24 @@ pub fn run(routing: bool, mut observe: impl FnMut()) {
                 })
                 .unwrap();
         }
+        if trust {
+            config
+                .candidate()
+                .with_graph(|records, text| {
+                    let view = records.view(text).unwrap();
+                    assert_eq!(view.certificates().unwrap().len(), 16);
+                    assert_eq!(view.listeners().unwrap().len(), 16);
+                    assert_eq!(view.gateways().unwrap().len(), 15);
+                })
+                .unwrap();
+        }
         drop(text);
         drop(scratch);
         let clock = Arc::new(ClockHandle::new(FixedClock));
         let mut set = GenerationSet::at_startup();
         observe();
         let prepare = |set: &GenerationSet<TlsPolicies>| {
-            let (mut chains, mut keys, mut roots) = (0, 0, 0);
+            let (mut chains, mut keys, mut roots, mut gateways) = (0, 0, 0, 0);
             let prepared =
                 TlsPolicies::prepare(set.reserve().unwrap(), &config, clock.clone(), |request| {
                     let index = if routing
@@ -132,17 +163,22 @@ pub fn run(routing: bool, mut observe: impl FnMut()) {
                             roots += 1;
                             ca
                         }
+                        MaterialKind::GatewayCa if trust => {
+                            gateways += 1;
+                            ca
+                        }
                         _ => panic!("unexpected material role"),
                     };
                     Ok::<_, Error>(Cursor::new(bytes.as_slice()))
                 })
                 .unwrap();
             assert_eq!((chains, keys, roots), (16, 16, 1));
+            assert_eq!(gateways, if trust { 15 } else { 0 });
             prepared
         };
         drop(set.publish(prepare(&set)).unwrap());
         let old = set.current().unwrap();
-        assert_eq!(old.value().len(), if routing { 17 } else { 3 });
+        assert_eq!(old.value().len(), if routing || trust { 17 } else { 3 });
         assert_eq!(old.value().coverage(), PolicyCoverage::Complete);
         observe();
         let candidate = prepare(&set);
@@ -229,5 +265,26 @@ fn routing_inputs() -> (Vec<Material>, String) {
     }
     assert_eq!(materials.len(), 16);
     assert_eq!(names.iter().map(Vec::len).sum::<usize>(), 257);
+    (materials, text)
+}
+
+fn trust_inputs() -> (Vec<Material>, String) {
+    let (mut materials, mut text) = ordinary_inputs();
+    let start = text.find("[listener \"smtp\"]").unwrap();
+    let end = text[start..].find("[listener \"https\"]").unwrap() + start;
+    text.replace_range(start..end, "");
+    // Explicit MX allows a gateway-only receiver with no direct SMTP listener.
+    text = text.lines().fold(String::new(), |mut out, line| {
+        writeln!(out, "{line}").unwrap();
+        if line.starts_with("[domain ") {
+            out.push_str("mx_host = \"mx.gateway.test\"\n");
+        }
+        out
+    });
+    for i in 0..15 {
+        writeln!(text, "[gateway \"upstream{i}\"]\nca_file = \"/gateway-ca{i}\"\nclient_cert_sha256 = \"{}\"\n[gateway_peer \"upstream{i}\"]\nnetwork = \"192.0.2.0/24\"\n[listener \"gateway{i}\"]\nkind = \"gateway_smtp\"\nbind = \"127.0.0.{}:2525\"\nserver_name = \"localhost\"\ncertificate = \"profile0\"\ngateway = \"upstream{i}\"\nsession_limit = 1\nper_peer_limit = 1", "11".repeat(32), i + 1).unwrap();
+    }
+    text.push_str("[limits]\nsmtp_sessions = 15\nmemory_budget_bytes = 83886080\n");
+    materials.get_mut(0).unwrap().2 = large_trust_bundle();
     (materials, text)
 }

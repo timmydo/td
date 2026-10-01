@@ -599,12 +599,13 @@ fn remote_chain_evidence<'a>(output: &'a str, domain: &str, scenario: &str) -> R
     Ok(body)
 }
 
-fn tls_generation_evidence(output: &str, native: bool, routing: bool) -> Result<()> {
-    let scenario = if routing {
-        "generation-routing"
-    } else {
-        "generation"
-    };
+fn tls_generation_evidence(output: &str, native: bool, scenario: &str) -> Result<()> {
+    if !matches!(
+        scenario,
+        "generation" | "generation-routing" | "generation-trust"
+    ) {
+        return Err("unknown generation observation scenario".into());
+    }
     tls_phase_evidence(
         output,
         native,
@@ -758,7 +759,7 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
             "dropped",
         ],
         "remote12" | "remote13" | "remote13large" => REMOTE_CHAIN_PHASES,
-        "generation" | "generation-routing" => &[
+        "generation" | "generation-routing" | "generation-trust" => &[
             "baseline",
             "material",
             "config",
@@ -1500,21 +1501,17 @@ pub(crate) fn runtime_inner() -> Result<()> {
         for line in output.lines() {
             println!("portable allocation diagnostic: {line}");
         }
-        for (routing, argument) in [
-            (false, "--tls-generations"),
-            (true, "--tls-generation-routing"),
+        for (scenario, argument) in [
+            ("generation", "--tls-generations"),
+            ("generation-routing", "--tls-generation-routing"),
+            ("generation-trust", "--tls-generation-trust"),
         ] {
             let mut command = Command::new(path);
             command.arg(argument).env_clear().stdin(Stdio::null());
             crate::host_bin::arm_check_child(&mut command);
-            let scenario = if routing {
-                "generation-routing"
-            } else {
-                "generation"
-            };
             let name = format!("tls-{scenario}-allocation-{domain}");
             let output = bounded_output(&mut command, &name, 8192, 30)?;
-            tls_generation_evidence(&output, native, routing)?;
+            tls_generation_evidence(&output, native, scenario)?;
             for line in output.lines() {
                 println!("portable allocation diagnostic: {line}");
             }
@@ -1530,6 +1527,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("large-chain", Some("--tls-large-chain")),
         ("generation", Some("--tls-generations")),
         ("generation-routing", Some("--tls-generation-routing")),
+        ("generation-trust", Some("--tls-generation-trust")),
     ] {
         let mut command = Command::new("/artifacts/td-mta-rss-probe");
         command.env_clear().stdin(Stdio::null());
@@ -2022,12 +2020,7 @@ mod tests {
 
     #[test]
     fn generation_records_require_complete_ordered_owners_and_domains() {
-        for routing in [false, true] {
-            let scenario = if routing {
-                "generation-routing"
-            } else {
-                "generation"
-            };
+        for scenario in ["generation", "generation-routing", "generation-trust"] {
             for native in [false, true] {
                 let domain = if native { "native" } else { "rust" };
                 let values = if native {
@@ -2055,16 +2048,23 @@ mod tests {
                 }
                 output.push_str(&format!("tls-{scenario}-allocation-v1: {domain} passed\n"));
                 rss.push_str(&format!("rss-observation-v2: {scenario} passed\n"));
-                assert!(tls_generation_evidence(&output, native, routing).is_ok());
+                assert!(tls_generation_evidence(&output, native, scenario).is_ok());
+                let unknown = output.replace(scenario, "unknown");
+                assert!(tls_generation_evidence(&unknown, native, "unknown").is_err());
+                assert!(rss_evidence(&rss.replace(scenario, "unknown"), "unknown").is_err());
                 assert!(rss_evidence(&rss, scenario).is_ok());
-                assert!(tls_generation_evidence(&output, !native, routing).is_err());
-                assert!(tls_generation_evidence(&output, native, !routing).is_err());
-                let other = if routing {
-                    "generation"
-                } else {
-                    "generation-routing"
-                };
-                assert!(rss_evidence(&rss, other).is_err());
+                assert!(tls_generation_evidence(&output, !native, scenario).is_err());
+                for other in [
+                    "generation",
+                    "generation-routing",
+                    "generation-trust",
+                    "unknown",
+                ] {
+                    if other != scenario {
+                        assert!(tls_generation_evidence(&output, native, other).is_err());
+                        assert!(rss_evidence(&rss, other).is_err());
+                    }
+                }
                 assert!(tls_large_chain_evidence(&output, native).is_err());
                 for bad in [
                     output.replace("candidate", "overlap"),
@@ -2074,7 +2074,7 @@ mod tests {
                     format!("{output}extra\n"),
                     output.trim_end().to_owned(),
                 ] {
-                    assert!(tls_generation_evidence(&bad, native, routing).is_err());
+                    assert!(tls_generation_evidence(&bad, native, scenario).is_err());
                 }
                 for bad in [
                     rss.replace("candidate", "overlap"),
