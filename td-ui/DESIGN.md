@@ -527,8 +527,9 @@ of its own files may name each module.
   `take_bell` for the coalesced bell, the history reads and `scrollback`),
   `Cell`, `Attributes`, `Color`, `MAX_DIMENSION`, and `selftest`. Pure; its
   specification, `vt_spec.rs`, runs the native corpus under `spec/vt`.
-- `vt_render`: `Palette` (`pinned`, xterm's), `Snapshot` (`new` with focus
-  and bell, `with_cursor`, `scrolled_back`, `with_selection`, and its reads),
+- `vt_render`: `Palette` (`pinned`, foot's with its own default ink),
+  `Snapshot` (`new` with focus and bell, `with_cursor`, `scrolled_back`,
+  `with_selection`, and its reads),
   `Cursor`, `Selection`, `render` of a snapshot into a tight XRGB8888
   surface over the bitmap `font::Font`, `render_with`, the same with an
   optional outline `Face` fitted to that font's cell, `ppm` and `from_ppm`,

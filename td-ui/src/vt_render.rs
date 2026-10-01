@@ -15,25 +15,26 @@ use crate::vt::{Attributes, Cell, Color, Terminal};
 
 pub const BYTES_PER_PIXEL: usize = 4;
 
-/// xterm's default first sixteen. Only these are a table: 16..232 is the
-/// 6x6x6 cube and 232..256 the grey ramp, both computed from the
-/// arithmetic that defines them so the entries cannot drift from it.
+/// foot's default first sixteen (1.15 and later: starlight). Only these
+/// are a table: 16..232 is xterm's 6x6x6 cube and 232..256 its grey ramp,
+/// which foot keeps too, both computed from the arithmetic that defines
+/// them so the entries cannot drift from it.
 const BASE: [[u8; 3]; 16] = [
-    [0x00, 0x00, 0x00],
-    [0xcd, 0x00, 0x00],
-    [0x00, 0xcd, 0x00],
-    [0xcd, 0xcd, 0x00],
-    [0x00, 0x00, 0xee],
-    [0xcd, 0x00, 0xcd],
-    [0x00, 0xcd, 0xcd],
-    [0xe5, 0xe5, 0xe5],
-    [0x7f, 0x7f, 0x7f],
-    [0xff, 0x00, 0x00],
-    [0x00, 0xff, 0x00],
-    [0xff, 0xff, 0x00],
-    [0x5c, 0x5c, 0xff],
-    [0xff, 0x00, 0xff],
-    [0x00, 0xff, 0xff],
+    [0x24, 0x24, 0x24],
+    [0xf6, 0x2b, 0x5a],
+    [0x47, 0xb4, 0x13],
+    [0xe3, 0xc4, 0x01],
+    [0x24, 0xac, 0xd4],
+    [0xf2, 0xaf, 0xfd],
+    [0x13, 0xc2, 0x99],
+    [0xe6, 0xe6, 0xe6],
+    [0x61, 0x61, 0x61],
+    [0xff, 0x4d, 0x51],
+    [0x35, 0xd4, 0x50],
+    [0xe9, 0xe8, 0x36],
+    [0x5d, 0xc5, 0xf8],
+    [0xfe, 0xab, 0xf2],
+    [0x24, 0xdf, 0xc4],
     [0xff, 0xff, 0xff],
 ];
 const CUBE_START: usize = 16;
@@ -42,10 +43,10 @@ const RAMP_START: usize = 232;
 const RAMP_BASE: u8 = 8;
 const RAMP_STEP: u8 = 10;
 
-/// Default ink is entry 7 on entry 0 rather than a seventeenth colour, so
-/// `SGR 39`/`49` land back on the palette the child can also name.
-const DEFAULT_FOREGROUND: usize = 7;
-const DEFAULT_BACKGROUND: usize = 0;
+/// Default ink is its own pair, as foot's is, so `SGR 39`/`49` restore it
+/// rather than a palette entry: the foot.ini td-term replaces sets this.
+const DEFAULT_FOREGROUND: [u8; 3] = [0xdc, 0xdc, 0xcc];
+const DEFAULT_BACKGROUND: [u8; 3] = [0x22, 0x22, 0x22];
 
 /// Underline sits two rows above the cell's bottom edge and strike at its
 /// middle. Both are fixed, so a rendition's presentation is a property of
@@ -95,18 +96,10 @@ impl Palette {
                 [grey, grey, grey]
             };
         }
-        let foreground = entries
-            .get(DEFAULT_FOREGROUND)
-            .copied()
-            .unwrap_or([0xff, 0xff, 0xff]);
-        let background = entries
-            .get(DEFAULT_BACKGROUND)
-            .copied()
-            .unwrap_or([0, 0, 0]);
         Self {
             entries,
-            foreground,
-            background,
+            foreground: DEFAULT_FOREGROUND,
+            background: DEFAULT_BACKGROUND,
         }
     }
 
@@ -807,8 +800,9 @@ pub fn selftest() -> Result<(), String> {
         .ok_or_else(|| "selftest surface overflows a byte count".to_string())?;
     let mut pixels = vec![0; bytes];
     render(&snapshot, &palette, &font, &mut pixels, width, height)?;
-    let (chunks, _) = pixels.as_chunks::<BYTES_PER_PIXEL>();
-    if !chunks.iter().any(|pixel| *pixel != [0, 0, 0, 0]) {
+    // The 'h' in the first cell must leave ink; the cursor rests in the
+    // second, so it cannot.
+    if !first_cell_inked(&pixels, width, font.width(), palette.background())? {
         return Err("render selftest drew no glyph pixels".into());
     }
     let encoded = ppm(&pixels, width, height)?;
@@ -817,6 +811,33 @@ pub fn selftest() -> Result<(), String> {
         return Err("render selftest did not round-trip through P6".into());
     }
     Ok(())
+}
+
+/// Whether the first `cell` columns of a `width`-wide XRGB8888 frame hold
+/// any pixel unlike `background`, the colour the frame was cleared to.
+fn first_cell_inked(
+    pixels: &[u8],
+    width: usize,
+    cell: usize,
+    background: [u8; 3],
+) -> Result<bool, String> {
+    let [red, green, blue] = background;
+    let cleared = [blue, green, red, 0];
+    let row_bytes = width
+        .checked_mul(BYTES_PER_PIXEL)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| "selftest row overflows a byte count".to_string())?;
+    let cell_bytes = cell
+        .checked_mul(BYTES_PER_PIXEL)
+        .ok_or_else(|| "selftest cell overflows a byte count".to_string())?;
+    Ok(pixels.chunks_exact(row_bytes).any(|row| {
+        let (first, _) = row.split_at(cell_bytes.min(row.len()));
+        first
+            .as_chunks::<BYTES_PER_PIXEL>()
+            .0
+            .iter()
+            .any(|pixel| *pixel != cleared)
+    }))
 }
 
 #[cfg(test)]

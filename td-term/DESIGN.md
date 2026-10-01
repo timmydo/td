@@ -308,12 +308,17 @@ Underline and strike draw fixed clipped cell rows, and inverse exchanges
 foreground and background. Blocking PPM cases prove that each claimed
 attribute differs from an otherwise identical normal cell.
 
-The fixed palette is xterm's: its sixteen base entries are a table, and the
-remaining 240 are computed from the arithmetic that defines them -- the
-six-level cube on 0, 95, 135, 175, 215, 255, then the grey ramp from 8 in
-steps of 10 -- so those entries cannot drift from their own definition.
-Default ink is entry 7 on entry 0 rather than a seventeenth colour, so
-`SGR 39` and `SGR 49` land back on a palette the child can also name.
+The fixed palette is what foot, which td-term replaces, draws: foot's
+own sixteen base entries since 1.15, the starlight table (`242424`, `f62b5a`,
+`47b413`, `e3c401`, `24acd4`, `f2affd`, `13c299`, `e6e6e6`, then `616161`,
+`ff4d51`, `35d450`, `e9e836`, `5dc5f8`, `feabf2`, `24dfc4`, `ffffff`),
+and the remaining 240 xterm's, as foot's are, computed from the
+arithmetic that defines them -- the six-level cube on 0, 95, 135, 175,
+215, 255, then the grey ramp from 8 in steps of 10 -- so those entries
+cannot drift from their own definition. Default ink is a seventeenth and
+eighteenth colour, `dcdccc` on `222222`, the foreground and background
+the user's foot.ini sets; like foot's, neither is a palette entry, so
+`SGR 39` and `SGR 49` restore them and no index names them.
 Faint follows inverse rather than preceding it: after the exchange the
 drawn foreground is the one to dim, and blending before it would brighten
 an inverse-and-faint cell instead.

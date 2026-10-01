@@ -71,15 +71,19 @@ fn set_pixels(pixels: &[u8], width: usize, ink: [u8; 3]) -> Vec<(usize, usize)> 
 // ---------------------------------------------------------------- palette
 
 #[test]
-fn the_palette_pins_xterms_sixteen_base_entries() {
+fn the_palette_pins_foots_sixteen_base_entries() {
     let palette = palette();
-    assert_eq!(palette.entry(0), [0x00, 0x00, 0x00]);
-    assert_eq!(palette.entry(1), [0xcd, 0x00, 0x00]);
-    assert_eq!(palette.entry(4), [0x00, 0x00, 0xee]);
-    assert_eq!(palette.entry(7), [0xe5, 0xe5, 0xe5]);
-    assert_eq!(palette.entry(8), [0x7f, 0x7f, 0x7f]);
-    assert_eq!(palette.entry(12), [0x5c, 0x5c, 0xff]);
-    assert_eq!(palette.entry(15), [0xff, 0xff, 0xff]);
+    let base = [
+        0x242424, 0xf62b5a, 0x47b413, 0xe3c401, 0x24acd4, 0xf2affd, 0x13c299, 0xe6e6e6, 0x616161,
+        0xff4d51, 0x35d450, 0xe9e836, 0x5dc5f8, 0xfeabf2, 0x24dfc4, 0xffffff,
+    ];
+    for (index, rgb) in base.into_iter().enumerate() {
+        let [_, red, green, blue] = u32::to_be_bytes(rgb);
+        assert_eq!(
+            palette.entry(u8::try_from(index).unwrap()),
+            [red, green, blue]
+        );
+    }
 }
 
 #[test]
@@ -130,17 +134,24 @@ fn the_palette_grey_ramp_runs_from_eight_to_two_hundred_thirty_eight() {
 }
 
 #[test]
-fn default_ink_is_palette_entry_seven_on_entry_zero() {
+fn default_ink_is_its_own_pair_not_a_palette_entry() {
     let palette = palette();
-    assert_eq!(palette.foreground(), palette.entry(7));
-    assert_eq!(palette.background(), palette.entry(0));
+    assert_eq!(palette.foreground(), [0xdc, 0xdc, 0xcc]);
+    assert_eq!(palette.background(), [0x22, 0x22, 0x22]);
+    for index in 0..=u8::MAX {
+        assert_ne!(palette.entry(index), palette.foreground());
+        assert_ne!(palette.entry(index), palette.background());
+    }
 }
 
 #[test]
 fn the_palette_resolves_every_color_form() {
     let palette = palette();
     assert_eq!(palette.resolve(Color::Default, [1, 2, 3]), [1, 2, 3]);
-    assert_eq!(palette.resolve(Color::Indexed(9), [1, 2, 3]), [0xff, 0, 0]);
+    assert_eq!(
+        palette.resolve(Color::Indexed(9), [1, 2, 3]),
+        [0xff, 0x4d, 0x51]
+    );
     assert_eq!(palette.resolve(Color::Rgb(4, 5, 6), [1, 2, 3]), [4, 5, 6]);
 }
 
@@ -1186,6 +1197,25 @@ fn the_diff_marks_a_truncated_frame_rather_than_reading_past_it() {
 #[test]
 fn selftest_renders_the_pinned_face_and_round_trips_through_p6() {
     super::selftest().unwrap();
+}
+
+/// The selftest's ink check reads the first cell against the background,
+/// which is not black: a frame of background alone, or one inked only in
+/// a later cell, where the cursor rests, is not ink.
+#[test]
+fn the_selftest_finds_ink_only_in_the_first_cell() {
+    let background = palette().background();
+    let (width, cell, height) = (16, 8, 2);
+    let mut pixels = vec![0; width * height * BYTES_PER_PIXEL];
+    fill(&mut pixels, background);
+    assert!(!first_cell_inked(&pixels, width, cell, background).unwrap());
+    let later = (width + cell) * BYTES_PER_PIXEL;
+    pixels[later..later + 4].copy_from_slice(&[0xff, 0xff, 0xff, 0]);
+    assert!(!first_cell_inked(&pixels, width, cell, background).unwrap());
+    let first = (width + cell - 1) * BYTES_PER_PIXEL;
+    pixels[first..first + 4].copy_from_slice(&[0xff, 0xff, 0xff, 0]);
+    assert!(first_cell_inked(&pixels, width, cell, background).unwrap());
+    assert!(first_cell_inked(&pixels, 0, cell, background).is_err());
 }
 
 // ---------------------------------------------------------- outline face
