@@ -305,13 +305,16 @@ fn from_waited(waited: pty::Waited) -> Event {
     }
 }
 
-/// What a frame was drawn FOR: the size, and the activation that decides
-/// how the cursor is drawn, so a configure that only takes focus away
-/// still needs a new picture.
+/// What a frame was drawn FOR: the size, the activation that decides how
+/// the cursor is drawn, so a configure that only takes focus away still
+/// needs a new picture, and the link Control-hover underlines, so holding
+/// or letting go of Control, or moving off the link, does too without the
+/// model having changed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Drawn {
     size: Size,
     activated: bool,
+    link: Option<render::LinkSpan>,
 }
 
 /// The frame in flight: complete once the compositor released its buffer
@@ -319,6 +322,11 @@ struct Drawn {
 struct Frame {
     buffer: u32,
     presented: bool,
+    /// The screen shows the model as it stands: this frame's callback
+    /// said it reached the screen, or it was drawn for the same model as
+    /// one that had (only the hovered link or the focus changed), so
+    /// the screen showed that model before it and after.
+    shows_model: bool,
 }
 
 /// The child, from the loop's side. The terminal ends when its output has
@@ -389,6 +397,8 @@ fn named(board: data::Board) -> &'static str {
 #[derive(Default)]
 struct Drag {
     position: (i32, i32),
+    /// The pointer is over the surface, between its enter and leave.
+    inside: bool,
     left_down: bool,
     anchor: Option<(i32, i32)>,
     extent: Option<(i32, i32)>,
@@ -1145,7 +1155,10 @@ impl Window {
             return Ok(());
         }
         match event {
-            pointer::Event::Enter { x, y, .. } => self.drag.position = (x, y),
+            pointer::Event::Enter { x, y, .. } => {
+                self.drag.position = (x, y);
+                self.drag.inside = true;
+            }
             pointer::Event::Motion(x, y) => {
                 self.drag.position = (x, y);
                 if self.drag.left_down {
@@ -1162,6 +1175,7 @@ impl Window {
                 }
                 self.drag.left_down = false;
                 self.drag.last_press = None;
+                self.drag.inside = false;
             }
             pointer::Event::Button {
                 button: LEFT_BUTTON,
@@ -1251,20 +1265,40 @@ impl Window {
 
     /// The link under a Control-press, from the screen as the person saw
     /// it: a model changed since the last committed frame (`stale`, which a
-    /// resize's reflow sets), or a committed frame whose callback has not
-    /// said it reached the screen, is not what was on screen, and the press
-    /// is then a plain one.
+    /// resize's reflow sets), or a committed frame for a changed model whose
+    /// callback has not said it reached the screen (`shows_model`), is not
+    /// what was on screen, and the press is then a plain one.
     fn shown_link(&self, fixed: (i32, i32)) -> Option<String> {
-        let shown = !self.stale && self.frame.as_ref().is_some_and(|frame| frame.presented);
+        let shown = !self.stale && self.frame.as_ref().is_some_and(|frame| frame.shows_model);
         shown.then(|| self.link_at(fixed)).flatten()
     }
 
-    /// The link under a pointer position in the viewport's row, as td-ui's
-    /// rule finds it; none past the drawn grid, whose edge cells a
-    /// selection's clamp would reach. A cell holds one scalar, so the row's
-    /// text is its cells in order; a link the terminal wrapped onto the next
-    /// row is found only up to the row's end.
     fn link_at(&self, fixed: (i32, i32)) -> Option<String> {
+        self.link_span(fixed).map(|(_, link)| link)
+    }
+
+    /// The link Control-hover rules: the one a Control-press at the
+    /// pointer would follow, while the pointer is over the surface and
+    /// Control alone is held (Caps and Num Lock aside). None while the
+    /// child takes the press as a report, or a search the press would
+    /// end is open.
+    fn hovered_link(&self) -> Option<render::LinkSpan> {
+        let held = self.client.input().held();
+        if !self.drag.inside || !held.control || held.alt || held.shift {
+            return None;
+        }
+        if self.mouse_mode().is_some() || self.search.is_some() {
+            return None;
+        }
+        self.link_span(self.drag.position).map(|(span, _)| span)
+    }
+
+    /// The link under a pointer position in the viewport's row, as td-ui's
+    /// rule finds it, and the cells it covers; none past the drawn grid,
+    /// whose edge cells a selection's clamp would reach. A cell holds one
+    /// scalar, so the row's text is its cells in order; a link the terminal
+    /// wrapped onto the next row is found only up to the row's end.
+    fn link_span(&self, fixed: (i32, i32)) -> Option<(render::LinkSpan, String)> {
         let (rows, columns) = self.cells?;
         let inside = |value: i32, cells: u16, cell: usize| {
             usize::try_from(value.div_euclid(256))
@@ -1278,16 +1312,21 @@ impl Window {
         let viewport = self.viewport.offset(terminal.scrollback());
         let snapshot = render::Snapshot::new(terminal, false, false).scrolled_back(viewport);
         let mut text = String::new();
-        let mut at = None;
+        // Where each cell's scalar starts in the text.
+        let mut starts = Vec::new();
         // Only the drawn columns: a model wider than the surface is clipped.
         for cell in 0..snapshot.columns().min(usize::from(columns)) {
-            if cell == column {
-                at = Some(text.len());
-            }
+            starts.push(text.len());
             text.push(snapshot.cell(row, cell).scalar);
         }
-        let range = td_ui::links::at(&text, at?)?;
-        text.get(range).map(str::to_owned)
+        let range = td_ui::links::at(&text, *starts.get(column)?)?;
+        let start = starts.iter().position(|&at| at == range.start)?;
+        let end = starts
+            .iter()
+            .position(|&at| at >= range.end)
+            .unwrap_or(starts.len());
+        let link = text.get(range)?.to_owned();
+        Some((render::LinkSpan { row, start, end }, link))
     }
 
     /// Opens a followed link on the display the terminal is on; one that
@@ -1729,6 +1768,7 @@ impl Window {
         self.current.map(|size| Drawn {
             size,
             activated: self.client.activated(),
+            link: self.hovered_link(),
         })
     }
 
@@ -2090,6 +2130,7 @@ impl App for Window {
             Handled::FrameDone => {
                 if let Some(frame) = self.frame.as_mut() {
                     frame.presented = true;
+                    frame.shows_model = true;
                 }
             }
             Handled::Keyboard(event) => match event {
@@ -2201,7 +2242,7 @@ impl App for Window {
     }
 
     fn draw(&mut self) -> Result<()> {
-        let Some(wanted) = self.wanted() else {
+        let Some(mut wanted) = self.wanted() else {
             return Ok(());
         };
         // Throttled on the frame in flight: only the latest state is drawn,
@@ -2209,8 +2250,12 @@ impl App for Window {
         // allocated for it.
         let resize = self.adopted != Some(wanted.size);
         if self.client.can_present() && (self.drawn != Some(wanted) || self.stale || resize) {
+            // Drawn for the model the screen already shows, or not.
+            let same_model = !self.stale && !resize;
             if resize {
                 self.adopt(wanted.size)?;
+                // The reflow moved the cells the link was on.
+                wanted.link = self.hovered_link();
             }
             // A frame that takes the model's bell rings it, and so does
             // every frame until the flash is over. The flash starts when
@@ -2227,6 +2272,7 @@ impl App for Window {
             let snapshot = render::Snapshot::new(terminal, wanted.activated, ringing)
                 .scrolled_back(viewport)
                 .with_selection(self.shown_selection())
+                .with_link(wanted.link)
                 .with_status(
                     status.as_ref().map(|(text, _)| text.as_str()),
                     status
@@ -2246,9 +2292,12 @@ impl App for Window {
                 self.drawn = Some(wanted);
                 self.stale = false;
                 self.needs_commit = false;
+                let shows_model =
+                    same_model && self.frame.as_ref().is_some_and(|frame| frame.shows_model);
                 self.frame = self.client.presented().map(|buffer| Frame {
                     buffer,
                     presented: false,
+                    shows_model,
                 });
                 return Ok(());
             }
@@ -3968,6 +4017,150 @@ mod tests {
         assert!(window.flash.is_none() && window.stale);
         shown(&mut window);
         assert_eq!(edge(&window), plain, "the flash over");
+    }
+
+    /// Control alone over a link rules it, and nothing else does: the
+    /// frame wanted carries the link's cells, so holding Control, letting
+    /// it go, or moving off the link needs a frame though the model is
+    /// unchanged. The drawn frame rules exactly those cells. No link is
+    /// ruled where a press would not follow it: under mouse reporting, or
+    /// with a search open.
+    #[test]
+    fn control_over_a_link_rules_it() {
+        const NUM_LOCK: u32 = 16;
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        let mut text = String::from("see https://e.example/x now\r\n");
+        text.push_str(&"x".repeat(60));
+        text.push_str(" https://e.example/yz");
+        window.output(text.as_bytes()).unwrap();
+        shown(&mut window);
+        let link = Some(render::LinkSpan {
+            row: 0,
+            start: 4,
+            end: 23,
+        });
+        let hovered = |window: &Window| window.wanted().and_then(|drawn| drawn.link);
+        assert_eq!(hovered(&window), None, "not over the surface");
+        window
+            .event(message(POINTER, 0, &[1, SURFACE, 10 * 8 * 256 + 128, 128]))
+            .unwrap();
+        assert_eq!(hovered(&window), None, "no Control");
+        modifiers(&mut window, CONTROL | NUM_LOCK);
+        assert_eq!(hovered(&window), link);
+        assert!(!window.stale, "the model is unchanged");
+        assert_ne!(window.drawn, window.wanted(), "but the frame is not");
+        shown(&mut window);
+        let (width, height) = window.cell;
+        let row = height - 2;
+        let lit = |window: &Window, column: usize| {
+            (0..width).all(|x| {
+                let at = (row * 640 + column * width + x) * 4;
+                window
+                    .client
+                    .pixels()
+                    .get(at..at + 3)
+                    .is_some_and(|pixel| pixel == [255, 255, 255])
+            })
+        };
+        assert!(lit(&window, 4) && lit(&window, 22));
+        assert!(!lit(&window, 3) && !lit(&window, 23));
+        for other in [SHIFT, ALT] {
+            modifiers(&mut window, CONTROL | other);
+            assert_eq!(hovered(&window), None, "Control alone");
+        }
+        modifiers(&mut window, CONTROL);
+        point(&mut window, 2);
+        assert_eq!(hovered(&window), None, "off the link");
+        // A link that runs to the row's end.
+        window
+            .event(message(
+                POINTER,
+                2,
+                &[0, 70 * 8 * 256 + 128, 16 * 256 + 128],
+            ))
+            .unwrap();
+        assert_eq!(
+            hovered(&window),
+            Some(render::LinkSpan {
+                row: 1,
+                start: 61,
+                end: 80,
+            })
+        );
+        point(&mut window, 22);
+        assert_eq!(hovered(&window), link);
+        window.output(b"\x1b[?1000h").unwrap();
+        assert_eq!(hovered(&window), None, "the child takes the press");
+        window.output(b"\x1b[?1000l").unwrap();
+        chord(&mut window, CONTROL | SHIFT, 19);
+        modifiers(&mut window, CONTROL);
+        assert_eq!(hovered(&window), None, "a search is open");
+        modifiers(&mut window, 0);
+        press(&mut window, 1);
+        modifiers(&mut window, CONTROL);
+        assert_eq!(hovered(&window), link);
+        window.event(message(KEYBOARD, 2, &[6, SURFACE])).unwrap();
+        assert_eq!(hovered(&window), None, "focus went");
+        focus(&mut window, 7);
+        modifiers(&mut window, CONTROL);
+        window.event(message(POINTER, 1, &[2, SURFACE])).unwrap();
+        assert_eq!(hovered(&window), None, "left the surface");
+        modifiers(&mut window, 0);
+    }
+
+    /// A resize reflows the cells under the pointer: the frame it draws
+    /// rules the link as the reflowed row holds it.
+    #[test]
+    fn a_resize_rules_the_link_where_the_reflow_put_it() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.output(b"see https://e.example/x now").unwrap();
+        shown(&mut window);
+        window
+            .event(message(POINTER, 0, &[1, SURFACE, 10 * 8 * 256 + 128, 128]))
+            .unwrap();
+        modifiers(&mut window, CONTROL);
+        shown(&mut window);
+        configure(&mut window, 16 * 8, 320, true);
+        window.draw().unwrap();
+        assert_eq!(
+            window.drawn.and_then(|drawn| drawn.link),
+            Some(render::LinkSpan {
+                row: 0,
+                start: 4,
+                end: 16,
+            })
+        );
+        modifiers(&mut window, 0);
+    }
+
+    /// A frame drawn only because the hovered link changed shows the same
+    /// model: a Control-press before its callback still follows the link.
+    #[test]
+    fn a_control_press_follows_a_link_while_its_rule_is_in_flight() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.browser = Some("/nonexistent/td-term-browser".into());
+        window.output(b"see https://e.example/x now").unwrap();
+        shown(&mut window);
+        window
+            .event(message(POINTER, 0, &[1, SURFACE, 10 * 8 * 256 + 128, 128]))
+            .unwrap();
+        modifiers(&mut window, CONTROL);
+        window.draw().unwrap();
+        assert!(window.frame.as_ref().is_some_and(|frame| !frame.presented));
+        click(&mut window, true);
+        assert!(bell(&mut window), "followed, and no browser rang");
+        click(&mut window, false);
+        // A frame for a changed model is not what the screen showed.
+        complete(&mut window);
+        window.output(b"!").unwrap();
+        window.draw().unwrap();
+        click(&mut window, true);
+        click(&mut window, false);
+        assert!(!bell(&mut window), "a plain press");
+        modifiers(&mut window, 0);
     }
 
     /// A frame that could not be submitted, every buffer held, leaves

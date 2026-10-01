@@ -612,7 +612,9 @@ of its own files may name each module.
   `vt_spec.rs`, runs the native corpus under `spec/vt`.
 - `vt_render`: `Palette` (`pinned`, foot's with its own default ink),
   `Snapshot` (`new` with focus and bell, `with_cursor`, `scrolled_back`,
-  `with_selection`, `with_status`, a line over the row at an `Edge`, its
+  `with_selection`, `with_link`, a `LinkSpan` of a row ruled in black or
+  white against each cell's ground (`linked`),
+  `with_status`, a line over the row at an `Edge`, its
   reads, `wrapped`, whether a row of the view goes on at the next, and
   `span` and `select`, a pointer gesture's unit at a cell and its
   selection from an anchor to an extent, carried across wraps), `Edge`

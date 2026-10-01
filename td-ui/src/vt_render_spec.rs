@@ -593,6 +593,42 @@ fn each_underline_style_draws_its_own_pattern() {
     assert!(lit(b"\x1b[4:0m").is_empty());
 }
 
+/// A hovered link's cells, and only those, are ruled, black on a light
+/// ground and white on a dark one, whatever the cell's own colors: a link
+/// colored like its ground still shows its extent. The status line
+/// covers it.
+#[test]
+fn a_hovered_link_is_ruled_to_stand_out_from_its_ground() {
+    let terminal = terminal(2, 4, b"\x1b[30;40mab\x1b[47mcd\r\nef");
+    let link = LinkSpan {
+        row: 0,
+        start: 1,
+        end: 3,
+    };
+    let snapshot = Snapshot::new(&terminal, false, false).with_link(Some(link));
+    let linked: Vec<bool> = (0..4).map(|column| snapshot.linked(0, column)).collect();
+    assert_eq!(linked, [false, true, true, false]);
+    assert!(!snapshot.linked(1, 1));
+    let (pixels, width, _) = draw_grid(&snapshot);
+    let (cell_width, row) = (face().width(), face().height() - 2);
+    let rule = |column: usize| -> Vec<[u8; 3]> {
+        (0..cell_width)
+            .map(|x| rgb_at(&pixels, width, column * cell_width + x, row))
+            .collect()
+    };
+    assert_eq!(
+        rule(1),
+        vec![[255, 255, 255]; cell_width],
+        "on the dark ground"
+    );
+    assert_eq!(rule(2), vec![[0, 0, 0]; cell_width], "on the light ground");
+    assert_eq!(rule(0), vec![palette().entry(0); cell_width], "not linked");
+    let covered = Snapshot::new(&terminal, false, false)
+        .with_link(Some(link))
+        .with_status(Some("search"), Edge::Top);
+    assert!(!covered.linked(0, 1));
+}
+
 /// The wave's rise and period and the dots' length are units of the
 /// cell's height, so a tall cell's are wider; a narrow cell's dash still
 /// has its gap.

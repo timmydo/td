@@ -630,27 +630,43 @@ A range that trims to no bytes is a no-op: it neither replaces the seat
 clipboard nor emits a zero-byte success marker.
 
 A left-button press with Control and no other modifier (Caps and Num Lock
-ignored), read from the keyboard's synchronized modifiers while td-term
-has focus (td-ui's held roles), reads the link under it as soon as it is
+ignored), read from the keyboard's synchronized modifiers while td-term has
+focus (td-ui's held roles), reads the link under it as soon as it is
 dispatched, from the viewport's row by td-ui's rule (`links`), and only
 while the screen shows the model: a model changed since the last committed
-frame, a resize's reflow among the changes, or a committed frame whose
-callback has not yet said it reached the screen, is not what the person
-saw, and the press is then a plain one. A screen under continuous output
-never shows its model unchanged, so there a Control-press is always plain.
-Output or a wheel later in the same frame cannot change the link read. A
-press past the drawn grid reads none, though a selection's clamp would
-reach the edge cell. The frame that closes the press decides: with a link
-it opens through td-ui's opener (`open`) and the press selects nothing,
-its drag and release ignored, so the selection a copy would take stays
-unless output clears it, as output clears any selection; without one it is
-a plain press. The link is read from the cells, not from what they look
-like, so text whose foreground is the colour of its background is part of
-it: what opens is what the row holds, which may be more than the person
+frame, a resize's reflow among the changes, or a committed frame for a
+changed model whose callback has not yet said it reached the screen, is not
+what the person saw, and the press is then a plain one. A screen under
+continuous output never shows its model unchanged, so there a Control-press
+is always plain. Output or a wheel later in the same frame cannot change the
+link read. A press past the drawn grid reads none, though a selection's
+clamp would reach the edge cell. The frame that closes the press decides:
+with a link it opens through td-ui's opener (`open`) and the press selects
+nothing, its drag and release ignored, so the selection a copy would take
+stays unless output clears it, as output clears any selection; without one
+it is a plain press. The link is read from the cells, not from what they
+look like, so text whose foreground is the colour of its background is part
+of it: what opens is what the row holds, which may be more than the person
 can read. A link that cannot be opened is a `td-term: open link:` line on
-stderr and rings the visual bell (§3). A cell
-holds one scalar, so the row's text is its cells in order; a link the
-terminal wrapped onto the next row is found only up to the row's end.
+stderr and rings the visual bell (§3). A cell holds one scalar, so the row's
+text is its cells in order; a link the terminal wrapped onto the next row is
+found only up to the row's end.
+
+While the pointer is over the surface and Control alone is held, the
+link a press there would follow is ruled (`Snapshot::with_link`): a
+one-pixel line on the underline's row across each of its cells, black on
+a light ground and white on a dark one, whatever the cells' own colors,
+so the person sees how far the link runs before following it, the cells
+they cannot read included. Nothing is ruled where a press would not
+follow a link: while the child takes presses as reports, or while a
+search, which the press would end, is open. The link's cells are part of
+the frame td-term wants, beside its size and activation, not a change to
+the model, and a frame drawn for the model the screen already shows
+(nothing marked stale, no resize) is taken as showing it before its
+callback comes: holding Control, letting it go, or moving onto or off a
+link draws a frame, and a Control-press meanwhile still reads the link.
+A resize reflows the cells, and its frame rules the link where the
+reflow put it.
 
 The browser is td-term's one child outside the session child's rules
 (§4): it is `BROWSER`, else `xdg-open`, found on td-term's own `PATH`, run
@@ -1468,8 +1484,13 @@ terminal, and td-term's prove the program:
   keys through td's keymap and the encoder to the child; moves and returns
   the viewport by key and by wheel; selects by drag and offers the selection;
   selects nothing on a click, a word on a double press and a row on a
-  triple, dragging by them, a row being its whole wrapped line; copies a
-  wrapped line without the wrap's newline; makes a release's selection
+  triple, dragging by them, a row being its whole wrapped line; rules
+  exactly the link under the pointer while Control alone is held over
+  the surface, and none under reporting, in a search or once focus or
+  the pointer has gone, drawing a frame for it with the model unchanged
+  in which a Control-press still follows the link, and after a resize
+  ruling it where the reflow put it; copies a wrapped line without the
+  wrap's newline; makes a release's selection
   the primary selection and writes its sends; pastes the primary
   selection on a middle press and does nothing without one; opens a
   search on `C-S-r` that takes every key, finds and steps between

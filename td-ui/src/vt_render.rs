@@ -149,6 +149,21 @@ pub struct Cursor {
     pub visible: bool,
 }
 
+/// A link's cells on one row of the view, `start..end`, which td-term
+/// rules while Control alone is held over it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkSpan {
+    pub row: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl LinkSpan {
+    fn contains(&self, row: usize, column: usize) -> bool {
+        row == self.row && (self.start..self.end).contains(&column)
+    }
+}
+
 /// An inclusive row-major terminal selection in viewport coordinates.
 /// Keeping the range in cells makes rendering independent of pixel geometry
 /// and gives extraction and highlighting one exact pair of endpoints.
@@ -219,6 +234,7 @@ pub struct Snapshot<'a> {
     bell: bool,
     selection: Option<Selection>,
     status: Option<(Vec<char>, Edge)>,
+    link: Option<LinkSpan>,
 }
 
 impl<'a> Snapshot<'a> {
@@ -239,6 +255,7 @@ impl<'a> Snapshot<'a> {
             bell,
             selection: None,
             status: None,
+            link: None,
         }
     }
 
@@ -261,6 +278,12 @@ impl<'a> Snapshot<'a> {
 
     pub fn with_selection(mut self, selection: Option<Selection>) -> Self {
         self.selection = selection;
+        self
+    }
+
+    /// Rules `link`'s cells (`linked`).
+    pub fn with_link(mut self, link: Option<LinkSpan>) -> Self {
+        self.link = link;
         self
     }
 
@@ -294,6 +317,20 @@ impl<'a> Snapshot<'a> {
         self.viewport
     }
 
+    /// Whether `row` is the one the status line covers.
+    fn status_row(&self, row: usize) -> bool {
+        self.status.as_ref().is_some_and(|(_, edge)| match edge {
+            Edge::Top => row == 0,
+            Edge::Bottom => row.saturating_add(1) == self.rows(),
+        })
+    }
+
+    /// Whether the cell is one of the hovered link's, ruled over whatever
+    /// it holds; none on the status line's row, which covers them.
+    pub fn linked(&self, row: usize, column: usize) -> bool {
+        !self.status_row(row) && self.link.is_some_and(|link| link.contains(row, column))
+    }
+
     /// Infallible so the cell loop has no error path: anything the model
     /// cannot answer for — a short history line, an out-of-range row — is
     /// blank rather than a failure that would abandon the frame.
@@ -304,10 +341,7 @@ impl<'a> Snapshot<'a> {
     /// program holds the alternate screen — two unrelated scroll regions
     /// in one frame.
     pub fn cell(&self, row: usize, column: usize) -> Cell {
-        if let Some((status, _)) = self.status.as_ref().filter(|(_, edge)| match edge {
-            Edge::Top => row == 0,
-            Edge::Bottom => row.saturating_add(1) == self.rows(),
-        }) {
+        if let Some((status, _)) = self.status.as_ref().filter(|_| self.status_row(row)) {
             let mut cell = BLANK;
             cell.scalar = status.get(column).copied().unwrap_or(' ');
             cell.attributes.inverse = true;
@@ -673,6 +707,16 @@ pub fn render_with(
                 &cell,
                 (origin_x, origin_y),
             );
+            if snapshot.linked(row, column) {
+                let ground = Ink::new(&cell.attributes, palette).background;
+                paint_link_rule(
+                    pixels,
+                    (width, height),
+                    ground,
+                    (origin_x, origin_y),
+                    (cell_width, cell_height),
+                );
+            }
         }
     }
 
@@ -796,6 +840,35 @@ fn paint_cell(
             };
             put_pixel(pixels, width, height, x, y, color);
         }
+    }
+}
+
+/// A hovered link's rule, on the underline's row across the cell: black
+/// or white, whichever stands out from the cell's drawn `ground`, so a
+/// link in its background's color, which an underline in its own ink
+/// would leave unseen, still shows how far it runs.
+fn paint_link_rule(
+    pixels: &mut [u8],
+    (width, height): (usize, usize),
+    ground: [u8; 3],
+    (origin_x, origin_y): (usize, usize),
+    (cell_width, cell_height): (usize, usize),
+) {
+    let [red, green, blue] = ground.map(u32::from);
+    let luma = (red * 299 + green * 587 + blue * 114) / 1000;
+    let rule = if luma > 127 {
+        [0, 0, 0]
+    } else {
+        [255, 255, 255]
+    };
+    let Some(y) = origin_y.checked_add(cell_height.saturating_sub(UNDERLINE_INSET)) else {
+        return;
+    };
+    for column in 0..cell_width {
+        let Some(x) = origin_x.checked_add(column) else {
+            break;
+        };
+        put_pixel(pixels, width, height, x, y, rule);
     }
 }
 
