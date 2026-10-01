@@ -301,6 +301,18 @@ fn tls_generations(routing: bool) {
     tls_generation_scenario::run(routing, || *slots.next().unwrap() = COUNTERS.snapshot());
     assert!(slots.next().is_none());
     assert!(samples.iter().all(|s| !s.invalid));
+    if routing {
+        let retained = samples
+            .get(4)
+            .unwrap()
+            .live
+            .checked_sub(samples.get(3).unwrap().live)
+            .unwrap();
+        assert!(
+            retained <= 1024 * 1024,
+            "large routing candidate exceeds retained-byte fixture allowance"
+        );
+    }
     assert_eq!(
         samples.get(5),
         samples.get(6),

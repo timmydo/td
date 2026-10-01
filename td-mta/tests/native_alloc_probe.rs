@@ -326,6 +326,19 @@ fn tls_generations(routing: bool) {
     });
     assert!(slots.next().is_none());
     assert!(samples.iter().all(|(_, s)| !s.invalid));
+    if routing {
+        let retained = samples
+            .get(4)
+            .unwrap()
+            .1
+            .bytes
+            .checked_sub(samples.get(3).unwrap().1.bytes)
+            .unwrap();
+        assert!(
+            retained <= 1024 * 1024,
+            "large routing candidate exceeds retained-byte fixture allowance"
+        );
+    }
     assert_eq!(
         samples.get(5),
         samples.get(6),

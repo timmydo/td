@@ -951,10 +951,16 @@ Implement the remaining work as independently reviewable increments:
     certificate profiles, sixteen listeners and 256 MTA-STS domains with long
     derived names. Separate Rust/native/RSS processes observe the same
     two-generation and repeated-replacement lifecycle as the smaller case.
-    The case exceeds the planned 1 MiB generation allowance, so reducing its
-    retained memory, revising the ledger or narrowing admitted configuration is
-    required before serving. Sixteen-HTTPS, mixed trust/gateway inputs and
-    complete session coexistence remain pending.
+    Sixteen-HTTPS, mixed trust/gateway inputs and complete session coexistence
+    remain pending; the fixture alone does not prove the generation allowance.
+
+  - **M07e4g — shared HTTPS identity views:** the cold compiler shares narrowed
+    certificate-name lists by profile and JMAP-primary role across listeners in
+    one generation. Listener bindings and native configurations stay distinct.
+    Real TLS fixtures cover equal/different primary selections and SMTP-name
+    exclusion. Both allocation probes check the large-routing candidate's
+    retained requested bytes against 1 MiB; full generation/session admission
+    and allocator/RSS bounds remain pending.
 
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.

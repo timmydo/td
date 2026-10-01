@@ -104,6 +104,12 @@ enum Configuration {
     Client(Arc<ClientConfig>),
 }
 
+struct HttpsIdentity<'a> {
+    profile: &'a str,
+    owns_origin: bool,
+    identity: Option<Arc<ServerIdentity>>,
+}
+
 struct Policy {
     binding: Binding,
     configuration: Configuration,
@@ -643,6 +649,12 @@ fn build<R: Read>(
             .map(|(_, value)| value.clone())
             .ok_or(Error::Invalid)
     };
+    // Within this graph a profile has only two HTTPS views: with/without JMAP.
+    let mut https_identities: Vec<HttpsIdentity<'_>> = Vec::new();
+    let https_capacity = certificate::MAX_PROFILES * 2;
+    https_identities
+        .try_reserve_exact(https_capacity)
+        .map_err(|_| Error::Capacity)?;
     let listeners = graph.listeners().map_err(|_| Error::Invalid)?;
     for index in 0..listeners.len() {
         let row = listeners
@@ -677,11 +689,20 @@ fn build<R: Read>(
                 let origin = graph.origin().map_err(|_| Error::Invalid)?;
                 let domains = graph.domains().map_err(|_| Error::Invalid)?;
                 for (profile, full) in &identities {
+                    let owns_origin = Some(*profile) == row.certificate;
+                    if let Some(cached) = https_identities.iter().find(|cached| {
+                        cached.profile == *profile && cached.owns_origin == owns_origin
+                    }) {
+                        if let Some(identity) = &cached.identity {
+                            selected.push(identity.clone());
+                        }
+                        continue;
+                    }
                     let mut names = Vec::new();
                     names
                         .try_reserve_exact(graph::MAX_NAMES_PER_CERTIFICATE)
                         .map_err(|_| Error::Capacity)?;
-                    if Some(*profile) == row.certificate {
+                    if owns_origin {
                         names.push(origin.host());
                     }
                     // Borrow canonical names already checked by identity admission.
@@ -704,10 +725,23 @@ fn build<R: Read>(
                             names.push(name);
                         }
                     }
-                    if !names.is_empty() {
-                        selected.push(Arc::new(
+                    let identity = if names.is_empty() {
+                        None
+                    } else {
+                        Some(Arc::new(
                             full.restrict_names(&names).map_err(|_| Error::Tls)?,
-                        ));
+                        ))
+                    };
+                    if https_identities.len() >= https_capacity {
+                        return Err(Error::Capacity);
+                    }
+                    https_identities.push(HttpsIdentity {
+                        profile,
+                        owns_origin,
+                        identity: identity.clone(),
+                    });
+                    if let Some(identity) = identity {
+                        selected.push(identity);
                     }
                 }
                 Configuration::Server(Arc::new(

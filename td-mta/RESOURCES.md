@@ -160,7 +160,14 @@ configured memory budget does not preserve the default RSS claim.
   slots/workers. GenerationSet cannot bound T's contents, loader temporaries,
   extracted resources or native allocations; M07e still proves their aggregate.
   The TLS policy compiler reserves at most 18 table entries (16 listeners,
-  relay and ACME). It constructs each identity once, shares it among native
+  relay and ACME). Within one complete compilation it reserves at most 32
+  temporary HTTPS identity cache entries: one per certificate profile with and
+  without the JMAP origin binding. Equal views share the same narrowed identity
+  across listeners; empty views are cached too. The cache is dropped before
+  publication, while each server configuration retains its selected shared
+  identities. Listener policy bindings remain distinct. This cache belongs to
+  the existing generation/cold construction allowance, never a separate pool.
+  The compiler constructs each full identity once and shares it among native
   configurations (HTTPS/gateway subsets share admitted keys and chains),
   reads one gateway bundle for all its listeners, and validates
   unused staged gateway bundles without retaining a trust cache. Per-input
@@ -985,11 +992,14 @@ listener and domain counts with long derived names. It does not maximize every
 profile's name count, certificate-name length, gateway policies, trust bundles
 or mixed key algorithms. A configuration with explicit MX on every domain can
 use sixteen HTTPS listeners without direct SMTP; this case has only fifteen
-HTTPS tables. The routing case already exceeds the planned 1 MiB generation
-entry in host and musl observations. M07e must reduce retained memory, revise
-the allowance or narrow admitted configuration before activating service.
-Neither case establishes an aggregate upper bound; complete concurrent
-session and generation qualification remains M07e.
+HTTPS tables. The allocation probes additionally require this routing case's
+first-to-candidate requested-byte increase to fit the planned 1 MiB generation
+entry. Shared HTTPS identity views avoid retaining another copy of the same
+names for every listener. This fixture-specific check excludes allocator
+metadata. The allocation case uses one common JMAP-primary profile; it does
+not measure all possible primary-role combinations or prove an aggregate upper
+bound for all configurations;
+complete concurrent session and generation qualification remains M07e.
 
 ## Large remote-chain observations
 

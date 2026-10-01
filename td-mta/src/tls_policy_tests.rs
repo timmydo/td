@@ -637,6 +637,8 @@ fn https_profiles_narrow_shared_smtp_names_before_native_routing() {
     let _serial = serial();
     let material =
         Material::with_names(&["localhost", "smtp.example.test", "mta-sts.example.test"]);
+    let alternate =
+        Material::with_names(&["localhost", "smtp.example.test", "mta-sts.example.test"]);
     let source = source(false)
         .replace(
             "hostname = \"localhost\"",
@@ -661,23 +663,86 @@ server_name = "smtp.example.test"
 certificate = "sts"
 session_limit = 1
 per_peer_limit = 1
+[listener "https-copy"]
+kind = "https"
+bind = "127.0.0.2:443"
+certificate = "public"
+[listener "https-sts"]
+kind = "https"
+bind = "127.0.0.3:443"
+certificate = "sts"
+[listener "https-sts-copy"]
+kind = "https"
+bind = "127.0.0.4:443"
+certificate = "sts"
 "#;
-    let lease = material.published(&source);
-    let https = TlsPolicies::listener(&lease, "https").unwrap();
-    let Configuration::Server(config) = &TlsPolicies::resolve(&lease, https).unwrap().configuration
-    else {
-        panic!("not HTTPS")
+    let published = |source: &str, trust: &Material| {
+        let mut set = GenerationSet::at_startup();
+        let prepared = TlsPolicies::prepare(
+            set.reserve().unwrap(),
+            &resolved(source),
+            material.clock.clone(),
+            |request| match request.kind() {
+                MaterialKind::Chain | MaterialKind::Key => {
+                    if request.profile() == Some("sts") {
+                        alternate.open(request)
+                    } else {
+                        material.open(request)
+                    }
+                }
+                MaterialKind::RelayCa => trust.open(request),
+                _ => panic!("unexpected HTTPS fixture material"),
+            },
+        )
+        .unwrap();
+        drop(set.publish(prepared).unwrap());
+        set.current().unwrap()
     };
-    assert_eq!(config.identity_count(), 2);
-    assert_eq!(config.binding_count(), 2);
-    exchange(&lease, "https", material.source.clone()).unwrap();
-    // The relay sends localhost SNI, which is a valid SAN but not a binding
-    // of the sts profile. Direct SMTP still serves its default identity.
-    exchange(&lease, "smtp2", material.source.clone()).unwrap();
-    let smtp_name =
-        material.published(&source.replace("host = \"localhost\"", "host = \"smtp.example.test\""));
-    assert_eq!(
-        exchange(&smtp_name, "https", material.source.clone()),
-        Err(Error::Tls)
-    );
+    for (trust, trusts_sts) in [(&material, false), (&alternate, true)] {
+        let lease = published(&source, trust);
+        for (listener, identities, serves_sts) in [
+            ("https", 2, false),
+            ("https-copy", 2, false),
+            ("https-sts", 1, true),
+            ("https-sts-copy", 1, true),
+        ] {
+            let id = TlsPolicies::listener(&lease, listener).unwrap();
+            let Configuration::Server(config) =
+                &TlsPolicies::resolve(&lease, id).unwrap().configuration
+            else {
+                panic!("not HTTPS");
+            };
+            assert_eq!(config.identity_count(), identities);
+            assert_eq!(config.binding_count(), 2);
+            assert_eq!(
+                exchange(&lease, listener, material.source.clone()),
+                if trusts_sts == serves_sts {
+                    Ok(())
+                } else {
+                    Err(Error::Tls)
+                }
+            );
+        }
+        // SMTP's default identity still serves without a localhost binding.
+        assert_eq!(
+            exchange(&lease, "smtp2", material.source.clone()),
+            if trusts_sts { Ok(()) } else { Err(Error::Tls) }
+        );
+        for (name, allowed) in [("smtp.example.test", false), ("mta-sts.example.test", true)] {
+            let named = published(
+                &source.replace("host = \"localhost\"", &format!("host = \"{name}\"")),
+                trust,
+            );
+            for listener in ["https", "https-copy", "https-sts", "https-sts-copy"] {
+                assert_eq!(
+                    exchange(&named, listener, material.source.clone()),
+                    if allowed && trusts_sts {
+                        Ok(())
+                    } else {
+                        Err(Error::Tls)
+                    }
+                );
+            }
+        }
+    }
 }
