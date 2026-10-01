@@ -584,36 +584,47 @@ service responsibilities; retrying this command chooses a different value.
 
 ## Preparing the installed selector
 
-`td-install prepare-selector TEMPLATE VOLUME-UUID OUTPUT` makes a private
-selector copy bound to the chosen volume. The UUID must be canonical,
+`td-install prepare-selector TEMPLATE TRUSTED-KEY VOLUME-UUID OUTPUT` makes
+a private selector copy that trusts the given key and is bound to the
+chosen volume. The UUID must be canonical,
 nonzero lowercase text, using the same admission as `format --uuid`.
 The future service chooses it once for its plan and passes the same value
 to this operation and formatting. This command neither generates an
 identity nor authorizes a disk operation.
 
-The caller supplies an already verified selector template and trusted,
-stable source/output ancestors. The template already contains the trusted
-public key; this operation preserves all its bytes and does not choose,
-replace or authenticate a key. It must never be used to modify the
-manifest-covered deployment initramfs. No archive parser or selector
-signature verifier is added: ordinary nonempty files pass byte admission,
-so the caller must establish that TEMPLATE is the correct boot artifact.
+The caller supplies an already verified selector template, the trusted
+public key the installation's deployment was authenticated under, and
+trusted, stable source/output ancestors. The template is the stock
+selector, which carries neither a key nor an identity (td-boot's
+`SELECTOR_TEMPLATE_PATH`); this operation preserves all its bytes and
+appends the key as given, read by the same real-file reader and bound as
+`format --trusted-key` and refused unless it is the 64 hexadecimal digits
+td-boot decodes, since a key the selector cannot read makes an unbootable
+disk. It chooses and authenticates no key: the caller
+passes the one it authenticated the source under. A template that did
+carry a key would have it replaced, since the kernel takes the later file.
+It must never be used to modify the manifest-covered deployment
+initramfs. No archive parser or selector signature verifier is added:
+ordinary nonempty files pass byte admission, so the caller must establish
+that TEMPLATE is the correct boot artifact.
 
-Template admission uses the same descriptor-pinned regular-file reader as
-EFI inputs. Symlinks and non-regular inputs refuse. The complete prepared
-file, including padding and appendix, must fit the formatter's 256 MiB EFI
-input bound. All admission and appendix construction precedes exclusive
-output creation; existing files, links and device nodes refuse without
-being changed. The held template is streamed through the existing bounded
-EFI copier, which rejects length changes. Same-sized concurrent mutation
-remains outside the trusted, stable-source contract.
+The key is admitted first. The template is then admitted through the same
+descriptor-pinned regular-file reader as EFI inputs. Symlinks and
+non-regular inputs refuse. The complete prepared file, including padding
+and appendix, must fit the formatter's 256 MiB EFI input bound. All
+admission and appendix construction precedes exclusive output creation;
+existing files, links and device nodes refuse without being changed. The
+held template is streamed through the existing bounded EFI copier, which
+rejects length changes. Same-sized concurrent mutation remains outside the
+trusted, stable-source contract.
 
 The copy gets zero padding to a four-byte boundary and a deterministic
-newc archive containing root-owned mode-0755 parent directories and a
-mode-0644 `etc/td/volume-uuid` with the UUID and one newline. The shared
+newc archive containing root-owned mode-0755 parent directories, a
+mode-0644 `etc/td/deployment.pub` with the key's bytes and a mode-0644
+`etc/td/volume-uuid` with the UUID and one newline. The shared
 engine writer supplies the header and trailer rules. The pinned kernel
-reads concatenated archives and replaces an earlier regular UUID file;
-the public key in the base archive is unchanged.
+reads concatenated archives and replaces an earlier regular file of the
+same name, so the appended key and UUID are the ones the selector reads.
 
 Success has no stdout and requires the complete output, exact mode 0600
 and file sync. Output is temporary preparation data, not a published
@@ -624,14 +635,16 @@ this prepared file into the ESP and owns destination sync. Preparation
 writes no block device and performs no source deployment publication.
 
 The small and full-system installation fixtures carry a trusted selector
-template without a host-provisioned volume UUID. In the live guest, after
-source validation, they prepare the selector with the fixture's chosen
-UUID and pass that copy to `format`. Each live installation calls
-`new-volume-uuid`; the ISO carries no destination UUID. The host validates
-one canonical identity report against the primary Btrfs fsid in its private
-disk image and rejects reuse across successful installs and interrupted
-reinstalls. Detached boots must bind that exact UUID across every existing
-bus/media case. Immutable plans and trusted consent remain separate work.
+template without a host-provisioned trust root or volume UUID, as the
+stock selector is. In the live guest, after source validation, they
+prepare the selector with the run's key and the fixture's chosen UUID and
+pass that copy to `format`, so the installed boots depend on the appended
+key. Each live installation calls `new-volume-uuid`; the ISO carries no
+destination UUID. The host validates one canonical identity report against
+the primary Btrfs fsid in its private disk image and rejects reuse across
+successful installs and interrupted reinstalls. Detached boots must bind
+that exact UUID across every existing bus/media case. Immutable plans and
+trusted consent remain separate work.
 
 ## Media, boot and persistence
 

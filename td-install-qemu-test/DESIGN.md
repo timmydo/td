@@ -67,15 +67,18 @@ before layout; no initramfs copy is available as a fallback. The formatter
 stages only a trust layout and sparse Btrfs metadata image in RAM; the
 deployment is published directly onto the mounted disk.
 
-The host provisions the run's throwaway public key before assembling the
-ISO, but neither the live configuration nor the selector template contains
-a volume UUID. After source validation, the live fixture invokes production
+The host provisions the run's throwaway public key into the live
+configuration as `/trusted.pub`, but the selector template contains
+neither a key nor a volume UUID, like the stock template a live system
+carries. After source validation, the live fixture invokes production
 `td-install new-volume-uuid`, requires successful bounded output with the
 canonical version-4 shape, and invokes `prepare-selector` to copy the
-read-only template to `/prepared-selector.cpio` with that identity.
+read-only template to `/prepared-selector.cpio` with `/trusted.pub` and
+that identity.
 It passes the same value to `format --uuid`. The copy remains volatile.
 Detached boots therefore depend on live preparation; copying the ISO
-template directly would leave volume discovery unbound.
+template directly would leave the selector with no trust root and volume
+discovery unbound.
 
 The host requires one exact partition-refresh identity report for its
 expected device and independently reads the UUID field and magic from the

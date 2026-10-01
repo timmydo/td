@@ -342,13 +342,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     verify_deployment(&deployment)?;
     let id = crate::sha256::sha256_file(&deployment.join("manifest"))
         .map_err(|e| format!("hash manifest: {e}"))?;
-    let key = trust.trusted_key_line();
-    let selector = initramfs(
-        &base,
-        &common,
-        "selector\n",
-        &[(td_boot_protocol::TRUSTED_KEY_PATH.into(), 0o644, key)],
-    )?;
+    // No key, as the stock template carries none: the guest's
+    // `prepare-selector` appends it, and the installed boots read it.
+    let selector = initramfs(&base, &common, "selector\n", &[])?;
     write(&scratch.dir.join("selector.cpio"), &selector)?;
     let payloads: Vec<_> = protocol::MEDIA_FILES
         .iter()
@@ -1820,8 +1816,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     verify_deployment(&deployment)?;
     let id = crate::sha256::sha256_file(&deployment.join("manifest"))
         .map_err(|error| format!("hash system manifest: {error}"))?;
-    let template = provision_selector_template(&selector, &scratch.dir, &trust)?;
-    efi::copy_input(&template, &scratch.dir.join("selector.cpio"))?;
+    stage_stock_selector_template(&selector, &scratch.dir.join("selector.cpio"))?;
     let payloads: Vec<_> = protocol::MEDIA_FILES
         .iter()
         .map(|(iso_name, name)| (*iso_name, scratch.dir.join(name)))

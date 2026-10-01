@@ -676,17 +676,22 @@ its later capacity or publication failures cannot preserve old contents.
 
 ### Selector identity preparation
 
-`td-install prepare-selector TEMPLATE VOLUME-UUID OUTPUT` creates the
-private selector copy described in INSTALLER.md. It appends only the
-validated volume identity, using `engine/src/cpio.rs`, and leaves the
-trusted public key in the verified base template unchanged. The shared
+`td-install prepare-selector TEMPLATE TRUSTED-KEY VOLUME-UUID OUTPUT`
+creates the private selector copy described in INSTALLER.md. It appends the
+trusted public key, admitted by the same reader as `format --trusted-key`
+and refused unless it is the 64 hexadecimal digits td-boot decodes (a
+stricter rule than `format` applies, since a key the selector cannot
+read makes an unbootable disk), and the validated volume identity, using `engine/src/cpio.rs`, and leaves
+the verified base template's bytes unchanged. The shared
 EFI copier pins the input and rejects size changes; exclusive output
 creation cannot overwrite an existing destination. This preparation
 belongs before raw formatting and supplies no destructive authority.
 The live QEMU installer uses `new-volume-uuid` to draw one version-4 identity
 through the formatter's existing random-device reader before preparing the
-copy. Neither its live configuration nor its ISO selector template carries
-a preselected destination UUID. The host checks the reported identity
+copy. Its live configuration carries the run's key as `/trusted.pub` and no
+destination UUID; its ISO selector template carries neither, as the stock
+selector does not, so the installed boots read the key `prepare-selector`
+appended from `/trusted.pub`. The host checks the reported identity
 against the private image's primary Btrfs fsid and refuses reuse across
 installations, then requires the same binding on detached boots. The direct
 application-evidence boot uses the first installed volume's observed UUID;
@@ -698,12 +703,10 @@ The system's root image carries the stock selector at
 `SELECTOR_TEMPLATE_PATH`) and `td-install` at `/bin/td-install`, so a live
 installer finds both in the root image `live-root` hashed against the
 authenticated manifest rather than on the medium's unauthenticated ESP.
-That template carries neither a trust root nor a volume identity, so as
-shipped it does not meet `prepare-selector`'s precondition of a template
-that already holds the trusted key (INSTALLER.md): its caller must append
-the trust root first, and `prepare-selector` still appends only the
-identity. A selector built from it without a key refuses to boot. Nothing
-uses them yet.
+That template carries neither a trust root nor a volume identity, and
+`prepare-selector` appends both, so it is that command's template as
+shipped. A selector built from it without a key refuses to boot. No live
+installation uses them yet.
 
 ### Refreshing partitions after formatting
 
@@ -1098,7 +1101,9 @@ consumer must declare **both** modules at its crate root; they are a pair.
 ### Where the trusted public key lives — SETTLED
 
 **In the SELECTOR initramfs** (`boot/selector-initramfs.cpio`), in a cpio
-archive the harness appends, at `TRUSTED_KEY_PATH` — `etc/td/deployment.pub`,
+archive appended after the stock one — by the harness for its provisioned
+selectors, by `td-install prepare-selector` for an installation — at
+`TRUSTED_KEY_PATH` — `etc/td/deployment.pub`,
 declared in `td-boot/src/protocol.rs` so the writer and the reader cannot
 disagree about the spelling.
 
@@ -1842,8 +1847,10 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    the whole ladder. What stands in for it is that nothing can boot an
    unprovisioned selector: `VerifiedSelector` keeps its path private and
    both provisioning exits append the trusted key through the same helper.
-   `provision_selector` also binds the volume; `provision_selector_template`
-   leaves that identity for the live installer before the ESP is written.
+   `provision_selector` also binds the volume. The one bare copy,
+   `stage_stock_selector_template`, writes only the live installer's media
+   input and returns no path; the guest's `td-install prepare-selector`
+   appends the key and the identity before the ESP is written.
 7. **`td-install`**, a standalone crate outside the workspace (D9): GPT +
    FAT32 ESP + Btrfs volume onto a device or a regular file,
    sharing the GPT, FAT, CPIO, checksum, boot protocol, real-file and

@@ -3084,10 +3084,11 @@ pub(crate) fn verify_selector(boot: &Path) -> Result<VerifiedSelector, String> {
 /// manifest — and NOT yet bootable.
 ///
 /// The path is private on purpose. Every provisioning helper appends the run's
-/// trusted key: `provision_selector` also binds a volume,
-/// `provision_selector_template` leaves that identity for the live installer,
-/// and `provision_live_selector` marks a live selector instead. None exposes
-/// the unprovisioned original to a caller.
+/// trusted key: `provision_selector` also binds a volume, and
+/// `provision_live_selector` marks a live selector instead. The one exception
+/// is `stage_stock_selector_template`, the live installer's media input,
+/// whose key that installer appends; no other helper exposes the
+/// unprovisioned original.
 /// That mistake has no symptom: the machine comes up with no trust root and
 /// nothing on either side reports it. A review found four mutations of exactly
 /// that shape surviving the whole suite, which is why this is a type rather
@@ -3779,13 +3780,18 @@ pub(crate) fn provision_selector(
     )
 }
 
-/// The live installer supplies the destination identity after booting the ISO.
-pub(crate) fn provision_selector_template(
+/// Stage the stock selector, as root.erofs carries it at
+/// `SELECTOR_TEMPLATE_PATH`, at `media_input`: no trust root and no volume
+/// identity. The live installer's `td-install prepare-selector` appends both,
+/// so an installed boot proves the key that command appended rather than one
+/// this host baked in. The one sanctioned bare copy, and written only where
+/// the media writer reads its inputs: no path to it is returned, so it cannot
+/// be handed to a boot.
+pub(crate) fn stage_stock_selector_template(
     selector: &VerifiedSelector,
-    destination_dir: &Path,
-    trust: &RunTrust,
-) -> Result<PathBuf, String> {
-    provision_selector_as(selector, destination_dir, trust, SelectorRole::Template)
+    media_input: &Path,
+) -> Result<(), String> {
+    efi::copy_input(&selector.0, media_input)
 }
 
 /// Install media boot the deployment they carry (td-install/MEDIA.md "Live
@@ -3803,8 +3809,6 @@ pub(crate) fn provision_live_selector(
 enum SelectorRole<'a> {
     /// The installed volume with this UUID.
     Installed(&'a str),
-    /// A volume td-install names when it writes the selector.
-    Template,
     /// The deployment on the install medium it booted from.
     Live,
 }
@@ -3817,7 +3821,6 @@ fn provision_selector_as(
 ) -> Result<PathBuf, String> {
     let filename = match role {
         SelectorRole::Installed(_) => "selector-initramfs-trusted.cpio",
-        SelectorRole::Template => "selector-initramfs-template.cpio",
         SelectorRole::Live => "selector-initramfs-live.cpio",
     };
     let provisioned = destination_dir.join(filename);
@@ -3903,7 +3906,7 @@ fn append_selector_identity(
 
     let uuid_line = match role {
         SelectorRole::Installed(uuid) => Some(format!("{uuid}\n")),
-        SelectorRole::Template | SelectorRole::Live => None,
+        SelectorRole::Live => None,
     };
     if let Some(uuid) = &uuid_line {
         entries.push(Entry {
@@ -9590,19 +9593,20 @@ mod tests {
         fs::set_permissions(&initramfs, fs::Permissions::from_mode(0o444)).unwrap();
 
         let trust = RunTrust::generate().unwrap();
-        append_selector_identity(
-            &initramfs,
-            &trust.trusted_key_line(),
-            SelectorRole::Template,
-        )
-        .unwrap();
+        append_selector_identity(&initramfs, &trust.trusted_key_line(), SelectorRole::Live)
+            .unwrap();
         let bytes = fs::read(&initramfs).unwrap();
 
         let members = appendix_members(&bytes, BASE_LEN);
         let names: Vec<&str> = members.iter().map(|(n, _, _)| n.as_str()).collect();
         assert_eq!(
             names,
-            vec!["etc", "etc/td", "etc/td/deployment.pub"],
+            vec![
+                "etc",
+                "etc/td",
+                "etc/td/deployment.pub",
+                "etc/td/live-media"
+            ],
             "the literal path td-boot will open, and every parent of it"
         );
         assert_eq!(
@@ -9615,7 +9619,7 @@ mod tests {
         const S_IFDIR: u32 = 0o040000;
         const S_IFREG: u32 = 0o100000;
         for (name, mode, _) in &members {
-            let expected = if name == "etc/td/deployment.pub" {
+            let expected = if name.starts_with("etc/td/") {
                 S_IFREG
             } else {
                 S_IFDIR
@@ -9789,20 +9793,12 @@ mod tests {
         assert_eq!(decode_hex_fixture::<32>(key), trust.public);
 
         let bound_bytes = bytes;
-        let template =
-            provision_selector_template(&VerifiedSelector(store.clone()), &out, &trust).unwrap();
-        assert_ne!(template, booted);
+        let template = out.join("selector.cpio");
+        stage_stock_selector_template(&VerifiedSelector(store.clone()), &template).unwrap();
         assert_eq!(fs::read(&booted).unwrap(), bound_bytes);
-        let bytes = fs::read(&template).unwrap();
-        assert!(bytes.starts_with(BASE));
-        let members = appendix_members(&bytes, BASE_LEN);
-        let names: Vec<&str> = members.iter().map(|(name, _, _)| name.as_str()).collect();
-        assert_eq!(names, ["etc", "etc/td", "etc/td/deployment.pub"]);
-        let (_, _, key) = members
-            .iter()
-            .find(|(name, _, _)| name == "etc/td/deployment.pub")
-            .unwrap();
-        assert_eq!(decode_hex_fixture::<32>(key), trust.public);
+        // The template is the stock bytes, with nothing appended: the live
+        // installer appends the key and the volume identity.
+        assert_eq!(fs::read(&template).unwrap(), BASE);
         assert_eq!(fs::read(&store).unwrap(), BASE);
     }
 

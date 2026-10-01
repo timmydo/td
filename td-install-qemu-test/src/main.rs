@@ -866,6 +866,7 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
         &[
             "prepare-selector",
             "/selector.cpio",
+            "/trusted.pub",
             &uuid,
             "/prepared-selector.cpio",
         ],

@@ -90,7 +90,7 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install serve <td-boot> <deployment-directory> <trusted-key> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install serve <td-boot> <deployment-directory> <trusted-key> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <trusted-key> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]\n       \
                      td-install format ... --trusted-key <trusted-key> --publish <td-boot> <deployment> <mountpoint>";
@@ -121,6 +121,7 @@ enum Mode {
     Serve(LiveHost),
     PrepareSelector {
         template: PathBuf,
+        trusted_key: PathBuf,
         uuid: VolumeUuid,
         output: PathBuf,
     },
@@ -323,37 +324,60 @@ fn selector_join_padding(len: u64, appendix_bytes: usize) -> io::Result<usize> {
     Ok(padding)
 }
 
-/// Prepare only the selector copy; its template already owns the trust root.
-fn prepare_selector(template: &Path, uuid: &VolumeUuid, output: &Path) -> io::Result<()> {
+/// Prepare the selector copy: the template, which carries neither, then the
+/// trust root and the volume identity it boots.
+fn prepare_selector(
+    template: &Path,
+    trusted_key: &Path,
+    uuid: &VolumeUuid,
+    output: &Path,
+) -> io::Result<()> {
+    let key = read_trusted_key(trusted_key)?;
+    // A key the booted selector could not decode makes an unbootable disk,
+    // found only after the destructive write, so its shape is refused here
+    // by td-boot's rule: 64 hex digits once surrounding whitespace is gone.
+    let digits = key.trim_ascii();
+    if digits.len() != 64 || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return Err(invalid(format!(
+            "trusted deployment key {} is not 64 hexadecimal digits",
+            trusted_key.display()
+        )));
+    }
     let (file, metadata) = realfile::open_real_file(template, "selector template")?;
     let len = metadata.len();
     let uuid_line = format!("{}\n", uuid.0);
-    let mut entries = Vec::new();
-    let mut end = 0usize;
-    while let Some(slash) = protocol::VOLUME_UUID_PATH
-        .get(end..)
-        .and_then(|tail| tail.find('/'))
-    {
-        end = end
-            .checked_add(slash)
-            .ok_or_else(|| invalid("selector parent offset overflow".into()))?;
-        let parent = protocol::VOLUME_UUID_PATH
-            .get(..end)
-            .ok_or_else(|| invalid("invalid selector parent".into()))?;
+    let mut entries: Vec<cpio::Entry> = Vec::new();
+    for (path, bytes) in [
+        (protocol::TRUSTED_KEY_PATH, key.as_slice()),
+        (protocol::VOLUME_UUID_PATH, uuid_line.as_bytes()),
+    ] {
+        // Every proper directory prefix, shallowest first and once: the
+        // kernel creates nothing under a parent the archive does not name.
+        let mut end = 0usize;
+        while let Some(slash) = path.get(end..).and_then(|tail| tail.find('/')) {
+            end = end
+                .checked_add(slash)
+                .ok_or_else(|| invalid("selector parent offset overflow".into()))?;
+            let parent = path
+                .get(..end)
+                .ok_or_else(|| invalid("invalid selector parent".into()))?;
+            if !entries.iter().any(|entry| entry.name == parent) {
+                entries.push(cpio::Entry {
+                    name: parent,
+                    mode: 0o755,
+                    kind: cpio::Kind::Directory,
+                });
+            }
+            end = end
+                .checked_add(1)
+                .ok_or_else(|| invalid("selector parent offset overflow".into()))?;
+        }
         entries.push(cpio::Entry {
-            name: parent,
-            mode: 0o755,
-            kind: cpio::Kind::Directory,
+            name: path,
+            mode: 0o644,
+            kind: cpio::Kind::File(bytes),
         });
-        end = end
-            .checked_add(1)
-            .ok_or_else(|| invalid("selector parent offset overflow".into()))?;
     }
-    entries.push(cpio::Entry {
-        name: protocol::VOLUME_UUID_PATH,
-        mode: 0o644,
-        kind: cpio::Kind::File(uuid_line.as_bytes()),
-    });
     let appendix = cpio::build(&entries).map_err(invalid)?;
     let padding = selector_join_padding(len, appendix.len())
         .map_err(|error| invalid(format!("{}: {error}", template.display())))?;
@@ -688,14 +712,17 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
             Ok(Mode::Serve(host))
         }
         (Some("new-volume-uuid"), []) => Ok(Mode::NewVolumeUuid),
-        (Some("prepare-selector"), [template, uuid, output]) => Ok(Mode::PrepareSelector {
-            template: template.clone(),
-            uuid: VolumeUuid::parse(
-                uuid.to_str()
-                    .ok_or_else(|| invalid("volume UUID must be UTF-8".into()))?,
-            )?,
-            output: output.clone(),
-        }),
+        (Some("prepare-selector"), [template, trusted_key, uuid, output]) => {
+            Ok(Mode::PrepareSelector {
+                template: template.clone(),
+                trusted_key: trusted_key.clone(),
+                uuid: VolumeUuid::parse(
+                    uuid.to_str()
+                        .ok_or_else(|| invalid("volume UUID must be UTF-8".into()))?,
+                )?,
+                output: output.clone(),
+            })
+        }
         (Some("timezones"), []) => Ok(Mode::Timezones),
         (Some("layout-preview"), [sector, capacity]) => Ok(Mode::LayoutPreview {
             sector_bytes: preview_number(sector.as_os_str(), "logical sector bytes")?,
@@ -1188,8 +1215,9 @@ fn preview_number(value: &OsStr, label: &str) -> io::Result<u64> {
 ///
 /// `seek` to the end rather than `metadata().len()`, which reports 0 for a
 /// block device: seeking answers for both destinations, in safe `std`, and D8
-/// keeps this crate's syscall surface empty — a `BLKGETSIZE64` ioctl would be
-/// an amendment to `UNSAFE.md` for something ordinary file I/O already does.
+/// keeps this crate's syscalls to its one recorded loop surface — a
+/// `BLKGETSIZE64` ioctl would be an amendment to `UNSAFE.md` for something
+/// ordinary file I/O already does.
 fn destination_bytes(file: &mut File) -> io::Result<u64> {
     let size = file.seek(SeekFrom::End(0))?;
     file.rewind()?;
@@ -3011,9 +3039,10 @@ fn main() -> ExitCode {
         }
         Mode::PrepareSelector {
             template,
+            trusted_key,
             uuid,
             output,
-        } => prepare_selector(&template, &uuid, &output),
+        } => prepare_selector(&template, &trusted_key, &uuid, &output),
         Mode::Destinations => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
@@ -3608,26 +3637,29 @@ mod tests {
                 .into_iter()
         };
         assert!(matches!(
-            parse_args(args(&["prepare-selector", "template", good, "out"])).unwrap(),
+            parse_args(args(&["prepare-selector", "template", "key", good, "out"])).unwrap(),
             Mode::PrepareSelector { .. }
         ));
         for parts in [
             vec!["prepare-selector"],
-            vec!["prepare-selector", "template", good],
-            vec!["prepare-selector", "template", good, "out", "extra"],
+            vec!["prepare-selector", "template", good, "out"],
+            vec!["prepare-selector", "template", "key", good],
+            vec!["prepare-selector", "template", "key", good, "out", "extra"],
             vec![
                 "prepare-selector",
                 "template",
+                "key",
                 "00000000-0000-0000-0000-000000000000",
                 "out",
             ],
             vec![
                 "prepare-selector",
                 "template",
+                "key",
                 "12345678-1234-4234-8234-123456789ABC",
                 "out",
             ],
-            vec!["prepare-selector", "template", "../../state", "out"],
+            vec!["prepare-selector", "template", "key", "../../state", "out"],
         ] {
             assert!(parse_args(args(&parts)).is_err());
         }
@@ -3639,12 +3671,14 @@ mod tests {
         let dir = ScratchDirectory(scratch::path("selector-copy"));
         std::fs::create_dir_all(&dir.0).unwrap();
         let template = dir.0.join("template");
+        let key = key_file(&dir.0);
+        let key_bytes = std::fs::read(&key).unwrap();
         let uuid = VolumeUuid::parse("12345678-1234-4234-8234-123456789abc").unwrap();
         for length in 1..=8usize {
             let base = vec![b'k'; length];
             std::fs::write(&template, &base).unwrap();
             let output = dir.0.join(format!("out-{length}"));
-            prepare_selector(&template, &uuid, &output).unwrap();
+            prepare_selector(&template, &key, &uuid, &output).unwrap();
             assert_eq!(std::fs::read(&template).unwrap(), base);
             let bytes = std::fs::read(&output).unwrap();
             assert_eq!(&bytes[..length], base);
@@ -3655,7 +3689,7 @@ mod tests {
             let mut at = (length + 3) & !3;
             assert_eq!(
                 bytes.len() - at,
-                532,
+                532 + 132 + key_bytes.len().next_multiple_of(4),
                 "keep the exact-limit accounting tied to the real appendix"
             );
             assert!(bytes[length..at].iter().all(|b| *b == 0));
@@ -3689,6 +3723,10 @@ mod tests {
                         &bytes[data..data + size],
                         format!("{}\n", uuid.0).as_bytes()
                     );
+                } else if name == "etc/td/deployment.pub" {
+                    assert_eq!(mode, 0o100644);
+                    assert_eq!(field(4), 1);
+                    assert_eq!(&bytes[data..data + size], key_bytes);
                 } else {
                     assert_eq!(mode, 0o040755);
                     assert_eq!(field(4), 2);
@@ -3696,7 +3734,15 @@ mod tests {
                 }
                 at = (data + size + 3) & !3;
             }
-            assert_eq!(names, ["etc", "etc/td", "etc/td/volume-uuid"]);
+            assert_eq!(
+                names,
+                [
+                    "etc",
+                    "etc/td",
+                    "etc/td/deployment.pub",
+                    "etc/td/volume-uuid"
+                ]
+            );
         }
     }
 
@@ -3705,10 +3751,14 @@ mod tests {
         let dir = ScratchDirectory(scratch::path("selector-limit"));
         std::fs::create_dir_all(&dir.0).unwrap();
         let template = dir.0.join("template");
+        let key = key_file(&dir.0);
+        let key_len = std::fs::read(&key).unwrap().len();
         let uuid = VolumeUuid::parse("12345678-1234-4234-8234-123456789abc").unwrap();
-        // Four newc records: two directories, UUID file, and trailer.
-        // Independently account for each aligned header/name and file body.
-        let appendix_bytes = 116 + 120 + 132 + 40 + 124;
+        // Five newc records: two directories, key file, UUID file, and
+        // trailer. Independently account for each aligned header/name and
+        // file body.
+        let appendix_bytes =
+            116 + 120 + (132 + key_len.next_multiple_of(4) as u64) + 132 + 40 + 124;
         let maximum_template = MAX_BOOT_FILE - appendix_bytes;
         // Test the real admission helper without allocating a dense 256 MiB
         // output on the fixture tmpfs; small copies exercise the same writer.
@@ -3723,7 +3773,7 @@ mod tests {
             .unwrap()
             .set_len(maximum_template + 1)
             .unwrap();
-        assert!(prepare_selector(&template, &uuid, &too_large).is_err());
+        assert!(prepare_selector(&template, &key, &uuid, &too_large).is_err());
         assert!(!too_large.exists());
     }
 
@@ -3734,10 +3784,11 @@ mod tests {
         std::fs::create_dir_all(&dir.0).unwrap();
         let template = dir.0.join("template");
         let output = dir.0.join("output");
+        let key = key_file(&dir.0);
         let uuid = VolumeUuid::parse("12345678-1234-4234-8234-123456789abc").unwrap();
         for size in [0, MAX_BOOT_FILE, MAX_BOOT_FILE + 1] {
             File::create(&template).unwrap().set_len(size).unwrap();
-            assert!(prepare_selector(&template, &uuid, &output).is_err());
+            assert!(prepare_selector(&template, &key, &uuid, &output).is_err());
             assert!(!output.exists());
             assert_eq!(std::fs::metadata(&template).unwrap().len(), size);
         }
@@ -3745,18 +3796,47 @@ mod tests {
         let link = dir.0.join("link");
         symlink(&template, &link).unwrap();
         for input in [&link, &dir.0, &dir.0.join("missing")] {
-            assert!(prepare_selector(input, &uuid, &output).is_err());
+            assert!(prepare_selector(input, &key, &uuid, &output).is_err());
             assert!(!output.exists());
         }
+        // A key the trusted-key reader or td-boot's decoder would refuse is
+        // refused before any output, and before the template is read: a
+        // missing template would refuse too, for the wrong reason.
+        let key_link = dir.0.join("key-link");
+        symlink(&key, &key_link).unwrap();
+        let mut bad_keys = vec![key_link, dir.0.clone(), dir.0.join("missing")];
+        for (name, text) in [
+            ("short", "ab".repeat(31)),
+            ("long", "ab".repeat(33)),
+            ("not-hex", format!("{}zz", "ab".repeat(31))),
+            ("empty", String::new()),
+        ] {
+            let path = dir.0.join(name);
+            std::fs::write(&path, text).unwrap();
+            bad_keys.push(path);
+        }
+        let absent = dir.0.join("absent-template");
+        for bad_key in &bad_keys {
+            let refused = prepare_selector(&absent, bad_key, &uuid, &output)
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("trusted deployment key"), "{refused}");
+            assert!(!output.exists());
+        }
+        // td-boot trims surrounding whitespace and reads either case.
+        let spaced = dir.0.join("spaced");
+        std::fs::write(&spaced, format!("  {}\r\n", "AB".repeat(32))).unwrap();
+        prepare_selector(&template, &spaced, &uuid, &output).unwrap();
+        std::fs::remove_file(&output).unwrap();
         for existing in [&template, &link, &dir.0] {
-            assert!(prepare_selector(&template, &uuid, existing).is_err());
+            assert!(prepare_selector(&template, &key, &uuid, existing).is_err());
             assert_eq!(
                 std::fs::read(&template).unwrap(),
                 b"verified template bytes"
             );
         }
         std::fs::write(&output, b"preserve existing output").unwrap();
-        assert!(prepare_selector(&template, &uuid, &output).is_err());
+        assert!(prepare_selector(&template, &key, &uuid, &output).is_err());
         assert_eq!(std::fs::read(&output).unwrap(), b"preserve existing output");
     }
 

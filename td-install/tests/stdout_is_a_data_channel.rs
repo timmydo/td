@@ -59,10 +59,13 @@ fn selector_preparation_is_silent_and_refusal_preserves_the_output() -> Res<()> 
     let template = dir.join("template");
     let output = dir.join("selector");
     std::fs::write(&template, b"verified selector template")?;
+    let key = dir.join("key.pub");
+    std::fs::write(&key, format!("{}\n", "ab".repeat(32)))?;
     let invoke = || {
         Command::new(BIN)
             .arg("prepare-selector")
             .arg(&template)
+            .arg(&key)
             .arg("12345678-1234-4234-8234-123456789abc")
             .arg(&output)
             .output()
