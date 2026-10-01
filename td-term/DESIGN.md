@@ -274,7 +274,7 @@ extended section (a child that sends the forms anyway has them drawn), and
 `blink`/`invis` because it has no SGR for either -- an entry that claimed them
 would be describing a terminal td-term is not. `bel` is absent for a different
 reason: BEL sets the model's coalesced visual-bell bit, which no corpus
-observation can see until a frame presents it (§3), and a capability whose
+observation can see; only a frame shows it (§3), and a capability whose
 case would be a fiction is worse than a missing one.
 
 An outer `TERM=foot`, `TERM=linux`, or other value describes the parent
@@ -417,11 +417,15 @@ are visited, and a surface smaller than the grid renders its visible corner.
 C0 BEL, an atomically dropped keyboard event, or an atomically dropped reply
 sets one coalesced visual-bell bit in the model. The renderer presents that
 bit as the inverted one-pixel ring inside the surface, and a blocking PPM
-case pins that presentation. Handing the bit to a frame is not landed: td-term
-draws every snapshot with the bell off and never takes the bit, so the bell
-is recorded but not yet shown. The target is that the next submitted frame
-inverts the ring and the bit clears after release, repeated notifications
-before that release queueing no additional frames.
+case pins that presentation. Setting the bit marks the picture stale; the
+next frame td-term submits takes the bit and inverts the ring, and every
+frame for 100 ms after it keeps the ring, a bell taken meanwhile putting
+that end forward. A frame that cannot be submitted, every buffer held,
+puts the bit back for the next. When the flash is over, each turn's wait
+from the ring frame's on having been cut to end there, the next frame is
+drawn without it. Bells between two frames are one bell, and a frame
+waits for the one in flight as any frame does, so a ringing child queues
+no frames of its own.
 
 Keyboard input goes through td-ui's keymap rather than through a td-term
 key table. td-ui's client binds the lowest `wl_seat` of version 5 or newer,
@@ -644,7 +648,7 @@ a plain press. The link is read from the cells, not from what they look
 like, so text whose foreground is the colour of its background is part of
 it: what opens is what the row holds, which may be more than the person
 can read. A link that cannot be opened is a `td-term: open link:` line on
-stderr and marks the visual bell (recorded, not yet shown: §3). A cell
+stderr and rings the visual bell (§3). A cell
 holds one scalar, so the row's text is its cells in order; a link the
 terminal wrapped onto the next row is found only up to the row's end.
 
@@ -1478,6 +1482,8 @@ terminal, and td-term's prove the program:
   where the view is, puts the view and selection back on `Escape`, `C-g`
   or `C-c`, and on `Return` or keypad Enter selects its match and makes
   it the primary selection, or keeps the selection with no match;
+  rings the visual bell in the next frame and in every frame until its
+  flash, which a later bell puts forward, is over;
   waits for the proof's sync on the live source; rings for a paste with
   nothing offered and receives a selected offer over a fresh endpoint;
   reports presses, releases, the wheel in carried, bounded notches and

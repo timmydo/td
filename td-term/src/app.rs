@@ -82,6 +82,9 @@ const APP_ID: &str = "td-term";
 /// saying why; it is set below the supervisor's 30.
 const HANDSHAKE_MS: u64 = 20_000;
 
+/// How long a bell's ring stays on screen after the frame that took it.
+const BELL_FLASH_MS: u64 = 100;
+
 /// Where the session's own identity is read from: the uid from the first,
 /// everything else from the second.
 const PROC_STATUS: &str = "/proc/self/status";
@@ -478,6 +481,9 @@ pub struct Window {
     needs_commit: bool,
     drawn: Option<Drawn>,
     frame: Option<Frame>,
+    /// Until when frames ring the visual bell: set when a frame that took
+    /// the model's bell is submitted, and put forward by every later one.
+    flash: Option<u64>,
     /// The grid the PTY was last set to and verified at.
     cells: Option<(u16, u16)>,
     /// The surface size the PTY and the model were last adopted for, which a
@@ -546,6 +552,7 @@ impl Window {
             needs_commit: false,
             drawn: None,
             frame: None,
+            flash: None,
             cells: None,
             adopted: None,
             backlog: false,
@@ -1620,6 +1627,15 @@ impl Window {
         Ok(())
     }
 
+    /// A flash that is over leaves the next frame to be drawn without
+    /// its ring.
+    fn end_flash(&mut self, now: u64) {
+        if self.flash.is_some_and(|until| now >= until) {
+            self.flash = None;
+            self.stale = true;
+        }
+    }
+
     /// How long the next turn may wait for an event, in milliseconds, never
     /// zero: until a repeat is due, a transfer steps, the handshake expires,
     /// or at once while the child's output is still queued.
@@ -1636,6 +1652,9 @@ impl Window {
         }
         if self.child.is_none() {
             wait = wait.min(HANDSHAKE_MS.saturating_sub(now).max(1));
+        }
+        if let Some(until) = self.flash {
+            wait = wait.min(until.saturating_sub(now));
         }
         wait.max(1)
     }
@@ -2173,6 +2192,7 @@ impl App for Window {
             }
         }
         self.markers()?;
+        self.end_flash(now);
         let wait = self.next_wait(now);
         self.client
             .connection()
@@ -2192,13 +2212,19 @@ impl App for Window {
             if resize {
                 self.adopt(wanted.size)?;
             }
+            // A frame that takes the model's bell rings it, and so does
+            // every frame until the flash is over. The flash starts when
+            // the frame is submitted; one that is not puts the bell back.
+            let took = self.model.as_mut().is_some_and(Terminal::take_bell);
+            let clock = self.clock;
+            let ringing = took || self.flash.is_some_and(|until| clock < until);
             let terminal = self
                 .model
                 .as_ref()
                 .ok_or("the terminal has no model to draw")?;
             let viewport = self.viewport.offset(terminal.scrollback());
             let status = self.search_status();
-            let snapshot = render::Snapshot::new(terminal, wanted.activated, false)
+            let snapshot = render::Snapshot::new(terminal, wanted.activated, ringing)
                 .scrolled_back(viewport)
                 .with_selection(self.shown_selection())
                 .with_status(
@@ -2214,6 +2240,9 @@ impl App for Window {
                 render::render_with(&snapshot, palette, font, outline, pixels, width, height)
             })?;
             if presented {
+                if took {
+                    self.flash = Some(clock.saturating_add(BELL_FLASH_MS));
+                }
                 self.drawn = Some(wanted);
                 self.stale = false;
                 self.needs_commit = false;
@@ -2222,6 +2251,11 @@ impl App for Window {
                     presented: false,
                 });
                 return Ok(());
+            }
+            if took {
+                if let Some(terminal) = self.model.as_mut() {
+                    terminal.ring();
+                }
             }
         }
         // An acknowledged configure is applied by the commit that follows
@@ -3895,6 +3929,74 @@ mod tests {
     fn shown(window: &mut Window) {
         window.draw().unwrap();
         complete(window);
+    }
+
+    /// A bell is drawn: the next frame inverts the ring at the surface's
+    /// edge and takes the bell, frames until the flash is over keep the
+    /// ring, a bell meanwhile puts the end forward, and the first frame
+    /// after it is drawn without.
+    #[test]
+    fn a_bell_rings_in_the_frames_until_its_flash_is_over() {
+        let (mut window, _peer) = presented();
+        // A pixel on the top edge, over a blank cell in every frame here.
+        let edge = |window: &Window| window.client.pixels().get(1280..1284).map(<[u8]>::to_vec);
+        let plain = edge(&window);
+        window.clock = 1000;
+        window.output(b"\x07").unwrap();
+        shown(&mut window);
+        let rung = edge(&window);
+        assert_ne!(rung, plain, "the next frame rings");
+        assert!(!bell(&mut window), "and took the bell");
+        assert_eq!(
+            window.next_wait(1000 + BELL_FLASH_MS - 10),
+            10,
+            "the turn wakes as the flash ends"
+        );
+        window.clock = 1040;
+        window.end_flash(1040);
+        window.output(b"y").unwrap();
+        shown(&mut window);
+        assert_eq!(edge(&window), rung, "a frame in the flash keeps the ring");
+        window.clock = 1050;
+        window.end_flash(1050);
+        window.output(b"\x07x").unwrap();
+        shown(&mut window);
+        assert_eq!(edge(&window), rung, "a bell in the flash");
+        window.end_flash(1000 + BELL_FLASH_MS);
+        assert!(window.flash.is_some(), "put forward");
+        window.end_flash(1050 + BELL_FLASH_MS);
+        assert!(window.flash.is_none() && window.stale);
+        shown(&mut window);
+        assert_eq!(edge(&window), plain, "the flash over");
+    }
+
+    /// A frame that could not be submitted, every buffer held, leaves
+    /// the bell for the first that is, however long that takes.
+    #[test]
+    fn a_bell_waits_for_a_frame_that_presents() {
+        let (mut window, _peer) = presented();
+        let edge = |window: &Window| window.client.pixels().get(1280..1284).map(<[u8]>::to_vec);
+        let plain = edge(&window);
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            window.stale = true;
+            window.draw().unwrap();
+            let callback = window.client.frame_callback().unwrap();
+            window.event(message(callback, 0, &[0])).unwrap();
+            window.event(message(DISPLAY, 1, &[callback])).unwrap();
+            held.push(window.client.presented().unwrap());
+        }
+        window.clock = 1000;
+        window.output(b"\x07").unwrap();
+        window.draw().unwrap();
+        assert!(window.flash.is_none(), "no frame, no flash");
+        window.end_flash(1000 + BELL_FLASH_MS);
+        window.event(message(held[0], 0, &[])).unwrap();
+        window.clock = 2000;
+        window.draw().unwrap();
+        assert_ne!(edge(&window), plain, "the frame that presents rings");
+        assert_eq!(window.flash, Some(2000 + BELL_FLASH_MS));
+        assert!(!bell(&mut window));
     }
 
     fn bell(window: &mut Window) -> bool {
