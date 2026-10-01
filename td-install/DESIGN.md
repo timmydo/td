@@ -1096,6 +1096,13 @@ missing key becomes a runtime branch, where the tempting branch is the
 fail-open D2 forbids, so absence must be a refusal; and the trust root
 becomes per-machine state that the reproducible artifact does not record.
 
+A live boot from install media hands the live selector's key to the
+deployment it authenticated, as the reserved `td.trust=` command-line token,
+and `live-seed` stages it as the RAM volume's `td/trusted.pub` after checking
+the deployment's signature under it again (MEDIA.md "Live boot"). That is the
+update-time key above, on a volume only live root can write, so the
+installer can authenticate its source under the key that booted it.
+
 An installation can carry two copies of this key: the selector initramfs's
 `etc/td/deployment.pub` and the volume's `td/trusted.pub`. The layout and
 volume primitives do not check their agreement. Layout treats the selector

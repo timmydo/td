@@ -2174,6 +2174,7 @@ fn handoff_cmdline(
         SELECTOR,
         protocol::BOOKKEEPING_UNAVAILABLE_CMDLINE_TOKEN.as_bytes(),
         protocol::LIVE_CMDLINE_PREFIX.as_bytes(),
+        protocol::LIVE_TRUST_PREFIX.as_bytes(),
         protocol::RAM_DISK_SIZE_PREFIX.as_bytes(),
     ] {
         if bytes
@@ -3365,13 +3366,14 @@ fn live_ram_disk_kib(meminfo: &[u8]) -> io::Result<u64> {
     Ok(half)
 }
 
-/// The live handoff: the fresh volume identity, the live token and the RAM
-/// disk size, in that order after the selector's own tokens.
+/// The live handoff: the fresh volume identity, the live token, the trust
+/// root and the RAM disk size, in that order after the selector's own tokens.
 fn live_cmdline(
     base: &OsStr,
     uuid: &volume::Uuid,
     ram_disk_kib: u64,
     deployment_id: &str,
+    key: &TrustRoot,
 ) -> io::Result<OsString> {
     let with_volume = volume::command_line(base.as_bytes(), uuid)?;
     handoff_cmdline(
@@ -3379,11 +3381,35 @@ fn live_cmdline(
         deployment_id,
         false,
         &format!(
-            "{} {}{ram_disk_kib}",
+            "{} {}{} {}{ram_disk_kib}",
             protocol::LIVE_CMDLINE_TOKEN,
+            protocol::LIVE_TRUST_PREFIX,
+            sha256::to_base16(key),
             protocol::RAM_DISK_SIZE_PREFIX
         ),
     )
+}
+
+/// The trust root the live selector handed over: exactly one `td.trust=`
+/// token of 64 hex digits, in either case as a trusted key file may be; it is
+/// written back lowercase. Read only beside `require_live_handoff`, so only a
+/// live boot, whose selector writes every handoff token, consults it.
+fn live_handoff_key(cmdline: &[u8]) -> io::Result<TrustRoot> {
+    let prefix = protocol::LIVE_TRUST_PREFIX.as_bytes();
+    let mut values = cmdline
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter_map(|field| field.strip_prefix(prefix));
+    match (values.next(), values.next()) {
+        (Some(value), None) => decode_hex(value, "live trust handoff", Path::new("/proc/cmdline")),
+        (None, _) => Err(invalid(format!(
+            "the live handoff carries no {}",
+            protocol::LIVE_TRUST_PREFIX
+        ))),
+        (Some(_), Some(_)) => Err(invalid(format!(
+            "the live handoff carries {} more than once",
+            protocol::LIVE_TRUST_PREFIX
+        ))),
+    }
 }
 
 /// The name a deployment file has on a mounted install medium.
@@ -3501,7 +3527,7 @@ fn run_live_boot(mountpoint: &Path, base_cmdline: &OsStr) -> io::Result<()> {
     mount_medium(mountpoint)?;
     let result = (|| {
         let deployment = authenticated_media_deployment(mountpoint, &key)?;
-        let cmdline = live_cmdline(base_cmdline, &uuid, ram_disk_kib, &deployment.id)?;
+        let cmdline = live_cmdline(base_cmdline, &uuid, ram_disk_kib, &deployment.id, &key)?;
         writeln!(
             io::stderr(),
             "td-boot: live deployment {} volume {uuid} ram-disk-kib {ram_disk_kib}",
@@ -3586,16 +3612,19 @@ fn run_live_root(mountpoint: &Path, deployment_id: &str, loop_device: &Path) -> 
 /// The live volume's contents, staged for `mkfs.btrfs --rootdir`.
 ///
 /// Only what the booted system reads from its volume: `current` naming the
-/// running deployment, that deployment's manifest and signature, an empty
-/// update channel and the `@var` directory. The payloads stay on the medium,
-/// which `live-root` has already bound. Modes are set rather than masked, as
-/// td-install's seed does, because `--rootdir` copies them verbatim.
+/// running deployment, that deployment's manifest and signature, the trust
+/// root as `td/trusted.pub`, an empty update channel and the `@var`
+/// directory. The payloads stay on the medium, which `live-root` has already
+/// bound. Modes are set rather than masked, as td-install's seed does,
+/// because `--rootdir` copies them verbatim.
 ///
-/// The signature is copied, not checked: only the manifest is bound to the
-/// id, and nothing on a live volume authenticates it again. Everything is read
-/// before anything is created, and `/init` has no retry, so a failed write
-/// leaving part of a tree is not a case to recover from.
-fn live_seed(medium: &Path, deployment_id: &str, seed: &Path) -> io::Result<()> {
+/// The manifest is authenticated again under `key`, the selector's handed-off
+/// trust root, which then becomes the volume's `td/trusted.pub`: a live system
+/// holds the key it booted under, and a handoff naming any other key is
+/// refused. Everything is read and checked before anything is created, and
+/// `/init` has no retry, so a failed write leaving part of a tree is not a
+/// case to recover from.
+fn live_seed(medium: &Path, deployment_id: &str, seed: &Path, key: &TrustRoot) -> io::Result<()> {
     require_absolute(seed, "live seed")?;
     require_real_directory(medium, "install medium")?;
     let manifest = media_manifest(medium)?;
@@ -3605,11 +3634,10 @@ fn live_seed(medium: &Path, deployment_id: &str, seed: &Path) -> io::Result<()> 
             "install medium holds deployment {id}, not the selected {deployment_id}"
         )));
     }
-    let signature = read_bounded_real_file(
-        &medium.join(media_name(protocol::MANIFEST_SIG_NAME)?),
-        "install medium deployment signature",
-        protocol::MAX_SIGNATURE_BYTES,
-    )?;
+    let signature = read_optional_signature(medium.join(media_name(protocol::MANIFEST_SIG_NAME)?))?
+        .ok_or_else(|| invalid("install medium carries no deployment signature"))?;
+    authenticate_manifest(&manifest, &signature, key)?;
+    let signature = signature.into_bytes();
     let deployment = format!("{}/{id}", protocol::DEPLOYMENTS_DIR);
     // `seed` first and alone may not exist yet: a stale tree would otherwise
     // become the volume's contents.
@@ -3627,15 +3655,20 @@ fn live_seed(medium: &Path, deployment_id: &str, seed: &Path) -> io::Result<()> 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
     }
     let directory = seed.join(&deployment);
-    for (name, bytes) in [
-        (protocol::MANIFEST_NAME, manifest.as_slice()),
-        (protocol::MANIFEST_SIG_NAME, signature.as_slice()),
+    let trusted = format!("{}\n", sha256::to_base16(key));
+    for (path, bytes) in [
+        (directory.join(protocol::MANIFEST_NAME), manifest.as_slice()),
+        (
+            directory.join(protocol::MANIFEST_SIG_NAME),
+            signature.as_slice(),
+        ),
+        (seed.join(protocol::VOLUME_TRUSTED_KEY), trusted.as_bytes()),
     ] {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(directory.join(name))?;
+            .open(path)?;
         file.write_all(bytes)?;
         file.set_permissions(fs::Permissions::from_mode(0o644))?;
     }
@@ -3646,15 +3679,18 @@ fn live_seed(medium: &Path, deployment_id: &str, seed: &Path) -> io::Result<()> 
 }
 
 fn run_live_seed(mountpoint: &Path, deployment_id: &str, seed: &Path) -> io::Result<()> {
-    require_live_handoff(
-        &read_bounded_real_file(
-            Path::new("/proc/cmdline"),
-            "kernel command line",
-            MAX_CMDLINE_BYTES as u64,
-        )?,
-        deployment_id,
+    let cmdline = read_bounded_real_file(
+        Path::new("/proc/cmdline"),
+        "kernel command line",
+        MAX_CMDLINE_BYTES as u64,
     )?;
-    live_seed(mountpoint, deployment_id, seed)
+    require_live_handoff(&cmdline, deployment_id)?;
+    live_seed(
+        mountpoint,
+        deployment_id,
+        seed,
+        &live_handoff_key(&cmdline)?,
+    )
 }
 
 fn run() -> io::Result<()> {
@@ -7569,32 +7605,43 @@ mod tests {
     fn the_live_handoff_adds_its_tokens_once_and_no_base_line_can_carry_them() {
         let id = "b".repeat(64);
         let uuid = volume::Uuid::parse("12345678-90ab-4def-8234-567890abcdef").unwrap();
-        let line =
-            live_cmdline(OsStr::new("console=ttyS0 rdinit=/init"), &uuid, 2048, &id).unwrap();
+        let key = [0xa5; 32];
+        let line = live_cmdline(
+            OsStr::new("console=ttyS0 rdinit=/init"),
+            &uuid,
+            2048,
+            &id,
+            &key,
+        )
+        .unwrap();
         assert_eq!(
             line.to_str().unwrap(),
             format!(
                 "console=ttyS0 rdinit=/init td.volume={uuid} td.deployment={id} \
-                 td.live=1 brd.rd_size=2048"
+                 td.live=1 td.trust={} brd.rd_size=2048",
+                "a5".repeat(32)
             )
         );
         assert_eq!(volume::handoff(line.as_bytes()).unwrap(), uuid);
         assert!(cmdline_has_token(line.as_bytes(), b"td.live=1"));
+        assert_eq!(live_handoff_key(line.as_bytes()).unwrap(), key);
         for reserved in [
             "td.live=1",
             "td.live=0",
+            "td.trust=00",
+            "td.trust=",
             "brd.rd_size=1",
             "td.deployment=x",
             "td.volume=12345678-90ab-4def-8234-567890abcdef",
         ] {
             let base = format!("quiet {reserved}");
             assert!(
-                live_cmdline(OsStr::new(&base), &uuid, 2048, &id).is_err(),
+                live_cmdline(OsStr::new(&base), &uuid, 2048, &id, &key).is_err(),
                 "{reserved}"
             );
         }
         // An installed selector's line is refused the same live tokens.
-        for reserved in ["td.live=1", "brd.rd_size=4096"] {
+        for reserved in ["td.live=1", "td.trust=a5", "td.trust=", "brd.rd_size=4096"] {
             let base = format!("quiet {reserved}");
             assert!(
                 kernel_cmdline(OsStr::new(&base), &id, false).is_err(),
@@ -7738,12 +7785,33 @@ mod tests {
     }
 
     #[test]
+    fn the_live_trust_root_is_exactly_one_handed_off_key() {
+        let key = "0f".repeat(32);
+        let line = format!("quiet td.live=1 td.trust={key} brd.rd_size=4");
+        assert_eq!(live_handoff_key(line.as_bytes()).unwrap(), [0x0f; 32]);
+        let upper = format!("td.trust={}", "0F".repeat(32));
+        assert_eq!(live_handoff_key(upper.as_bytes()).unwrap(), [0x0f; 32]);
+        for bad in [
+            "quiet td.live=1".to_string(),
+            format!("quiet td.trust={key} td.trust={key}"),
+            format!("quiet td.trust={}", "0f".repeat(31)),
+            format!("quiet td.trust={key}0"),
+            format!("quiet td.trust={}", "0f".repeat(33)),
+            format!("quiet td.trust={}", "zz".repeat(32)),
+            "quiet td.trust=".to_string(),
+        ] {
+            assert!(live_handoff_key(bad.as_bytes()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn the_live_handoff_refuses_a_line_that_ends_kernel_parameters() {
         let id = "b".repeat(64);
         let uuid = volume::Uuid::parse("12345678-90ab-4def-8234-567890abcdef").unwrap();
-        assert!(live_cmdline(OsStr::new("quiet -- single"), &uuid, 2048, &id).is_err());
-        assert!(live_cmdline(OsStr::new("quiet --"), &uuid, 2048, &id).is_err());
-        assert!(live_cmdline(OsStr::new("quiet a--b --x"), &uuid, 2048, &id).is_ok());
+        let key = [0; 32];
+        assert!(live_cmdline(OsStr::new("quiet -- single"), &uuid, 2048, &id, &key).is_err());
+        assert!(live_cmdline(OsStr::new("quiet --"), &uuid, 2048, &id, &key).is_err());
+        assert!(live_cmdline(OsStr::new("quiet a--b --x"), &uuid, 2048, &id, &key).is_ok());
         // An installed handoff appends nothing brd must see, so it is unchanged.
         assert!(kernel_cmdline(OsStr::new("quiet -- single"), &id, false).is_ok());
     }
@@ -7752,7 +7820,7 @@ mod tests {
     fn the_live_handoff_is_bounded_by_the_kernel_command_line() {
         let id = "b".repeat(64);
         let uuid = volume::Uuid::parse("12345678-90ab-4def-8234-567890abcdef").unwrap();
-        let fits = |base: &str| live_cmdline(OsStr::new(base), &uuid, 2048, &id);
+        let fits = |base: &str| live_cmdline(OsStr::new(base), &uuid, 2048, &id, &[0; 32]);
         let appended = fits("x").unwrap().len() - 1;
         let longest = "x".repeat(MAX_CMDLINE_BYTES - appended - 1);
         assert_eq!(fits(&longest).unwrap().len() + 1, MAX_CMDLINE_BYTES);
@@ -7811,13 +7879,31 @@ mod tests {
         assert!(!body.contains("read_boot_trust_root("));
     }
 
+    /// What production passes, stated as a literal: the key is the handoff's,
+    /// parsed from the same line `require_live_handoff` checked first.
+    #[test]
+    fn the_live_seed_takes_its_key_from_the_checked_handoff() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split_once("\nfn run_live_seed(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        let checked = body
+            .find("require_live_handoff(&cmdline, deployment_id)?;")
+            .unwrap();
+        let keyed = body.find("&live_handoff_key(&cmdline)?,").unwrap();
+        assert!(checked < keyed, "{body}");
+        assert_eq!(body.matches("/proc/cmdline").count(), 1, "{body}");
+    }
+
     #[test]
     fn a_live_seed_holds_only_what_the_booted_system_reads_from_its_volume() {
         use std::os::unix::fs::PermissionsExt;
         let fixture = Fixture::new();
         let (medium, id) = media_bundle(&fixture);
         let seed = fixture.root.join("seed");
-        live_seed(&medium, &id, &seed).unwrap();
+        live_seed(&medium, &id, &seed, &fixture.key()).unwrap();
 
         let mut found = Vec::new();
         let mut pending = vec![seed.clone()];
@@ -7844,6 +7930,7 @@ mod tests {
             (format!("{deployment}/manifest"), 0o644),
             (format!("{deployment}/manifest.sig"), 0o644),
             ("td/incoming".to_string(), 0o755),
+            ("td/trusted.pub".to_string(), 0o644),
         ];
         expected.sort();
         assert_eq!(found, expected);
@@ -7857,13 +7944,47 @@ mod tests {
             fs::read(medium.join("manifest.sig")).unwrap()
         );
 
+        // The volume holds the key the deployment authenticated under, in the
+        // form td-boot reads a trusted key back.
+        let trusted = seed.join(protocol::VOLUME_TRUSTED_KEY);
+        assert_eq!(read_trusted_key(&trusted).unwrap(), fixture.key());
+        assert_eq!(
+            fs::read(&trusted).unwrap(),
+            format!("{FIXTURE_PUBLIC_KEY}\n").into_bytes()
+        );
+
         // A stale tree is never reused as a volume's contents.
-        assert!(live_seed(&medium, &id, &seed).is_err());
+        assert!(live_seed(&medium, &id, &seed, &fixture.key()).is_err());
         let other = fixture.root.join("other-seed");
-        let error = live_seed(&medium, &"c".repeat(64), &other).err().unwrap();
+        let error = live_seed(&medium, &"c".repeat(64), &other, &fixture.key())
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("not the selected"), "{error}");
         assert!(!other.exists(), "a refused seed left a tree behind");
-        assert!(live_seed(&medium, &id, Path::new("relative")).is_err());
+        // A handoff naming another key is refused before anything is created.
+        let error = live_seed(&medium, &id, &other, &fixture.wrong_key())
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains(protocol::MANIFEST_UNAUTHENTICATED),
+            "{error}"
+        );
+        assert!(
+            !other.exists(),
+            "an unauthenticated seed left a tree behind"
+        );
+        assert!(live_seed(&medium, &id, Path::new("relative"), &fixture.key()).is_err());
+        fs::remove_file(medium.join("manifest.sig")).unwrap();
+        let error = live_seed(&medium, &id, &other, &fixture.key())
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("no deployment signature"),
+            "{error}"
+        );
+        assert!(!other.exists());
     }
 
     #[test]

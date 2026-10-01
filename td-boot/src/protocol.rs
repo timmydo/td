@@ -111,6 +111,11 @@ pub const LIVE_CMDLINE_TOKEN: &str = "td.live=1";
 // Every value is reserved, not only the one td-boot writes.
 #[allow(dead_code)]
 pub const LIVE_CMDLINE_PREFIX: &str = "td.live=";
+// The live selector's trust root, handed over as its 64 hex digits so the live
+// system holds the key its deployment was authenticated under. Reserved in
+// every base line, as the live token is.
+#[allow(dead_code)]
+pub const LIVE_TRUST_PREFIX: &str = "td.trust=";
 // brd's size parameter, in KiB, for the volatile volume on /dev/ram0.
 #[allow(dead_code)]
 pub const RAM_DISK_SIZE_PREFIX: &str = "brd.rd_size=";

@@ -282,7 +282,8 @@ it:
 4. authenticates the manifest under the trust root before parsing it, and
    verifies `bzImage` and `initramfs.cpio` against it;
 5. kexecs them with the base command line plus `td.volume=UUID`,
-   `td.deployment=ID`, `td.live=1` and `brd.rd_size=KIB`.
+   `td.deployment=ID`, `td.live=1`, `td.trust=KEY` (the trust root as 64
+   hex digits) and `brd.rd_size=KIB`.
 
 It does not hash `root.erofs`: with no previous deployment to fall back to,
 `live-root`'s hash after kexec is the one that decides. Every payload hash
@@ -297,14 +298,15 @@ nothing today; a protector that ever did would need the live selector to cap
 PCR 11 first.
 
 The base command line may not carry the literal tokens `td.volume=`,
-`td.deployment=`, `td.live=` or `brd.rd_size=`. The last two are refused in an
-installed selector's base line too, so firmware cannot steer an installed
-boot into the live branch. Only those spellings are refused: the kernel also
-accepts `brd.rd-size=` and `ramdisk_size=`, but td-boot's token comes last
-and wins. A live base line may not contain a bare `--`, after which the
-kernel hands every word to init and `brd.rd_size=` would never reach brd.
-Whoever writes the base line can already choose `rdinit=`, so these checks
-keep the handoff well formed rather than defend against its author.
+`td.deployment=`, `td.live=`, `td.trust=` or `brd.rd_size=`. The last three
+are refused in an installed selector's base line too, so firmware cannot
+steer an installed boot into the live branch or hand it a key. Only those
+spellings are refused: the kernel also accepts `brd.rd-size=` and
+`ramdisk_size=`, but td-boot's token comes last and wins. A live base line
+may not contain a bare `--`, after which the kernel hands every word to init
+and `brd.rd_size=` would never reach brd. Whoever writes the base line can
+already choose `rdinit=`, so these checks keep the handoff well formed
+rather than defend against its author.
 
 In the deployment initramfs, `td-boot live-root MOUNTPOINT ID LOOP` requires
 `td.live=1` and `td.deployment=ID` in `/proc/cmdline`, finds and mounts the
@@ -319,19 +321,23 @@ because the loop holds its file. On failure it unmounts.
 The deployment initramfs takes the live branch only on `td.live=1`, which
 only `live-boot` hands over, and requires `td.volume=` with it. It runs
 `live-root`, then `td-boot live-seed MOUNTPOINT ID SEED`, which requires the
-same handoff, rechecks that the mounted medium's manifest hashes to the id,
-and stages only what the booted system reads from its volume in a directory
-that must not already exist: `td/boot/current` naming the deployment, its
-`manifest` and `manifest.sig`, an empty `td/incoming` and `@var`, with
-directories 0755 and files 0644. `mkfs.btrfs` formats `/dev/ram0` from that
-tree with the handed-off UUID, the `td-system` label and a writable `@var`
-subvolume, as td-install formats an installed volume. From `on-volume
+same handoff and exactly one well-formed `td.trust=`, rechecks that the
+mounted medium's manifest hashes to the id, authenticates it again under the
+handed-off key, and stages only what the booted system reads from its volume
+in a directory that must not already exist: `td/boot/current` naming the
+deployment, its `manifest` and `manifest.sig`, `td/trusted.pub` holding the
+handed-off key as an installed volume holds its key, an empty `td/incoming`
+and `@var`, with directories 0755 and files 0644. A medium without a
+signature, or a handoff naming a key the deployment was not signed under, is
+refused before anything is staged. `mkfs.btrfs` formats `/dev/ram0` from
+that tree with the handed-off UUID, the `td-system` label and a writable
+`@var` subvolume, as td-install formats an installed volume. From `on-volume
 mount-root` on, the boot is the installed one: the volume is found by UUID,
-the root loop is already bound, `@var` is mounted, and the medium is moved to
-`/run/td-media` so it stays mounted under the loop. The seed's
-`manifest.sig` is copied unchecked; only the manifest is bound to the id, and
-nothing on the live volume authenticates it again. A live session has no
-`td/trusted.pub` and no bundled `td/source`, so it offers no updates, and
-everything it writes is lost at power-off.
+the root loop is already bound, `@var` is mounted, and the medium is moved
+to `/run/td-media` so it stays mounted under the loop. The live volume's
+`td/trusted.pub` is the key the running deployment was authenticated under,
+both before kexec and in `live-seed`, so a live installer can authenticate
+its source under the key that booted it. A live session has no bundled
+`td/source`, and everything it writes is lost at power-off.
 
 `build-iso` ("Live installation media") provisions the live selector.
