@@ -870,7 +870,7 @@ manifest. The execution asks the volume fit again of the source as it is
 before anything is staged, and refuses as insufficient space with the disk
 untouched. Past that point the payloads td-boot publishes are bound only
 by their digests; a source that changes size afterwards meets ENOSPC
-during publication. Source retention is still owed (INSTALLER.md).
+during publication.
 
 Scratch is not sized here. The execution's workspace under `/run` holds
 the kernel copy, the selector and a sparse volume image whose blocks are
@@ -946,10 +946,8 @@ the outcome as it was.
 
 Production constructs this execution, but `run_serve` still opens no
 consent channel, so execute is refused as consent unavailable and nothing
-runs. Independent retention of the source's backing storage remains owed
-before the channel opens (INSTALLER.md). The kernel
-check binds the ESP to the authenticated manifest; the remaining payloads
-are td-boot's to verify as it publishes them.
+runs. The kernel check binds the ESP to the authenticated manifest; the
+remaining payloads are td-boot's to verify as it publishes them.
 
 ### Full-system volume consumers
 

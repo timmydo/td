@@ -310,21 +310,21 @@ authority generates them.
 
 Before a service presents this value to an operator for consent, it must
 authenticate and retain its source, validate all choices against that
-source, establish destination eligibility and layout and payload fit,
-and retain the exact proposed value. Scratch shortage is refused before
-the first write instead (DESIGN.md "Payload fit"). The service core below
-already authenticates the source under its claim, refuses a disk that
-cannot hold its payloads and retains the value, but does not yet retain
-the source and validates choices against caller-bound roots (the verified
-root and the running system's timezone catalog) rather than that source,
-so its review is not yet presentable; td-authd starts it on a live boot
-but it opens no consent channel. Execution must require fresh trusted
-consent bound to that whole value and revalidate the selected disk under
-a retained exclusive claim. Neither matching plan
-bytes nor possession of the nonce grants consent. No public request,
-reconnect or service restart may silently retry erasure. This increment
-does not connect the value to the existing update-only consent operation
-or activate a whole-disk service or wizard action.
+source, establish destination eligibility and layout and payload fit, and
+retain the exact proposed value. Scratch shortage is refused before the
+first write instead (DESIGN.md "Payload fit"). The service core below does
+each of these: it retains the source and excludes the disk it is stored on,
+authenticates it under its claim, requires it to be the deployment the
+running root was authenticated as, so that the choices it checks against
+that root and its time zone catalog are checked against the source, refuses
+a disk that cannot hold its payloads and retains the value. td-authd starts
+it on a live boot, but it opens no consent channel yet. Execution must
+require fresh trusted consent bound to that whole value and revalidate the
+selected disk under a retained exclusive claim. Neither matching plan bytes
+nor possession of the nonce grants consent. No public request, reconnect or
+service restart may silently retry erasure. This increment does not connect
+the value to the existing update-only consent operation or activate a
+whole-disk service or wizard action.
 
 ## Installation service protocol
 
@@ -460,11 +460,16 @@ checks, in order: busy; the settings (the username through `td-firstboot
 check-primary-name` against the verified root, the hostname grammar, the
 keyboard layout, which admits only `us` until a keyboard catalog exists, and
 the running system's timezone catalog, as volume formatting uses); a fresh
-candidate discovery, which must contain the proposed destination exactly,
-and whose observation the review then carries; the read-write exclusive
-claim of DESIGN.md (a disk held elsewhere is refused as busy; any other
-failure to claim a disk discovery just listed, as changed); source
-authentication through `td-boot validate-source` while that claim is held;
+candidate discovery, less the disk the source is stored on (resolved from
+the source's device number through the kernel's block inventory, a partition
+to its disk; a source whose disk is not a whole `sd`, `vd`, `nvme` or `sr`
+disk standing on no other device, or one it cannot resolve, refuses
+discovery), which must contain the proposed destination exactly, and whose
+observation the review then carries; the read-write exclusive claim of
+DESIGN.md (a disk held elsewhere is refused as busy; any other failure to
+claim a disk discovery just listed, as changed); source authentication
+through `td-boot validate-source` while that claim is held, whose manifest
+digest must be the one `/run/td-deployment` records for the running root;
 the nonce and version-4 volume UUID from `/dev/urandom`; payload fit
 (DESIGN.md "Payload fit": a volume short of the deployment is insufficient
 space, a source the fixed ESP or the kernel bound refuses is source
@@ -500,14 +505,17 @@ will, which the caller that starts the service bounds.
 
 The service has an execution (DESIGN.md "Executing a consented
 installation"), but production opens no consent channel, so execute is
-refused as consent unavailable: it writes no disk byte and cannot start
-an installation. Tests drive the core's two ends with fakes and the
-execution on a regular-file disk. Exclusion of the medium
-backing the deployment source currently rests on discovery: a mounted
-medium's exclusive claim keeps it out. Independent retention and exclusion
-of source backing storage, validation of choices against that source
-rather than caller-bound roots, and trusted consent remain required
-before execution.
+refused as consent unavailable: it writes no disk byte and cannot start an
+installation. Tests drive the core's two ends with fakes and the execution
+on a regular-file disk. The service holds the source directory open for its
+life, so the medium's filesystem, and the kernel's exclusive claim on the
+disk under it, outlive even a lazy unmount, and that disk is never claimable
+as a destination; the live root, a loop over the medium's `root.erofs`,
+holds it too. The source itself is read by path, so a detached medium
+refuses: discovery first cannot place its disk, and a medium whose drive
+remains is no longer authenticated. Discovery also excludes that disk by
+name, as resolved, independently of the claim. Trusted consent remains
+required before execution.
 
 ## Installation consent channel
 
@@ -1174,8 +1182,8 @@ raw I/O or a privileged topology writer.
 The service must bind the reviewed identity and settings in its immutable
 plan, independently resolve source backing storage, revalidate the
 selected device and retain its claim through destructive execution;
-"Installation service core" does all but source resolution, short of
-execution.
+"Installation service core" does each, short of an opened consent
+channel.
 This advisory CLI does not activate the service or provide that admission,
 consent, source verification, scratch or payload-fit checks.
 
@@ -1218,8 +1226,8 @@ No write call is made. Success prints one JSON object with version 1, scope
 document. The claim closes after output, so this diagnostic grants no later
 write authority, does not authenticate the deployment or settings, and is
 not a replacement for the service's retained claim and trusted consent.
-An unmounted installation medium can pass the candidate filter; the future
-service must independently retain and exclude source backing storage.
+An unmounted installation medium can pass the candidate filter; the
+service retains and excludes source backing storage itself.
 The disposable optical/USB QEMU installer constructs a canonical plan from
 guest sysfs for its available target and runs the shipped command before
 formatting. It requires an exact success report, refusal of a changed disk

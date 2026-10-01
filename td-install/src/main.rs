@@ -770,6 +770,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 firstboot: firstboot.clone(),
                 timezones: PathBuf::from(TIMEZONE_ROOT),
                 catalog: None,
+                booted: PathBuf::from(BOOTED_DEPLOYMENT),
             };
             if [
                 &host.td_boot,
@@ -999,6 +1000,8 @@ struct LiveHost {
     /// The catalog, read once: it is immutable deployment data, so a
     /// repeated request costs root nothing and a broken one logs once.
     catalog: Option<Result<installation_plan::Zones, installation_protocol::Refusal>>,
+    /// Which deployment the running root was authenticated as.
+    booted: PathBuf,
 }
 
 // Whatever the catalog reader admits, the protocol's record carries.
@@ -1037,8 +1040,22 @@ impl installation_service::Host for LiveHost {
     fn candidates(
         &mut self,
     ) -> Result<installation_plan::Candidates, installation_protocol::Refusal> {
-        inventory::candidates()
-            .map_err(|error| refuse(installation_protocol::Refusal::DiscoveryFailed, error))
+        use installation_protocol::Refusal;
+        use std::os::unix::fs::MetadataExt;
+        // The disk the source is stored on is never a destination, whatever
+        // the claim probe finds: resolved from the kernel's inventory, and a
+        // source it cannot resolve refuses rather than guessing.
+        let source = paths::metadata(&self.source)
+            .and_then(|metadata| inventory::backing_disk(metadata.dev()))
+            .map_err(|error| {
+                refuse(
+                    Refusal::DiscoveryFailed,
+                    format!("the source's disk: {error}"),
+                )
+            })?;
+        let candidates =
+            inventory::candidates().map_err(|error| refuse(Refusal::DiscoveryFailed, error))?;
+        excluding(candidates, &source).map_err(|error| refuse(Refusal::DiscoveryFailed, error))
     }
 
     fn timezones(&mut self) -> Result<installation_plan::Zones, installation_protocol::Refusal> {
@@ -1093,8 +1110,13 @@ impl installation_service::Host for LiveHost {
     }
 
     fn authenticate_source(&mut self) -> Result<[u8; 32], installation_protocol::Refusal> {
+        // The settings are checked against the running root and its catalog;
+        // they are checked against this source only if that root is its.
         authenticate_source(&self.td_boot, &self.source, &self.trusted_key)
-            .and_then(|id| digest_bytes(&id))
+            .and_then(|id| {
+                booted_as(&self.booted, &id)?;
+                digest_bytes(&id)
+            })
             .map_err(|error| refuse(installation_protocol::Refusal::SourceUnavailable, error))
     }
 
@@ -1172,6 +1194,34 @@ struct LiveExecution {
 /// The live root's record of its deployment, written by its init.
 const BOOTED_DEPLOYMENT: &str = "/run/td-deployment";
 
+/// The running root was authenticated as `deployment`, by the record a live
+/// boot's init writes.
+fn booted_as(record: &Path, deployment: &str) -> io::Result<()> {
+    let booted = realfile::read_bounded_real_file(record, "booted deployment record", 65)?;
+    if booted.strip_suffix(b"\n") != Some(deployment.as_bytes()) {
+        return Err(invalid(format!(
+            "{} does not name deployment {deployment}",
+            record.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The candidates without the disk the source is stored on.
+fn excluding(
+    candidates: installation_plan::Candidates,
+    disk: &str,
+) -> Result<installation_plan::Candidates, String> {
+    installation_plan::Candidates::new(
+        candidates
+            .as_slice()
+            .iter()
+            .filter(|candidate| candidate.name() != disk)
+            .cloned()
+            .collect(),
+    )
+}
+
 /// Why an execution stopped, and the cause written to standard error.
 type Stopped = (installation_protocol::Failure, io::Error);
 
@@ -1198,7 +1248,7 @@ impl LiveExecution {
             root: host.root.clone(),
             firstboot: host.firstboot.clone(),
             timezones: host.timezones.clone(),
-            booted: PathBuf::from(BOOTED_DEPLOYMENT),
+            booted: host.booted.clone(),
             run: PathBuf::from("/run"),
         }
     }
@@ -1217,14 +1267,7 @@ impl LiveExecution {
         // Everything taken from the root below — the account and catalog
         // checks, the selector template, mkfs.btrfs — is the planned
         // deployment's only if the root is.
-        let booted = realfile::read_bounded_real_file(&self.booted, "booted deployment record", 65)
-            .map_err(&verification)?;
-        if booted.strip_suffix(b"\n") != Some(deployment.as_bytes()) {
-            return Err(verification(invalid(format!(
-                "{} does not name deployment {deployment}",
-                self.booted.display()
-            ))));
-        }
+        booted_as(&self.booted, &deployment).map_err(&verification)?;
         // The review's volume fit, asked again of the source as it is now
         // and before anything is staged; the layout's own refusal of a disk
         // too small for it is part of it.
@@ -1710,6 +1753,11 @@ fn run_serve(host: LiveHost) -> io::Result<()> {
             Some(_) => {}
         }
     }
+    // Held for the service's life: the source's filesystem, and with it the
+    // kernel's exclusive claim on the disk it is stored on, outlives even a
+    // lazy unmount, so that disk is never claimable as a destination. The
+    // source itself is read by path; detached, propose refuses it.
+    let _source = paths::open_read(&host.source)?;
     let euid = paths::open_read(Path::new("/proc/self"))?.metadata()?.uid();
     let stdin = File::from(io::stdin().as_fd().try_clone_to_owned()?);
     let stream = admit_serve(euid, stdin)?;
@@ -3852,6 +3900,7 @@ mod tests {
                 firstboot: PathBuf::from("/bin/td-firstboot"),
                 timezones: PathBuf::from(TIMEZONE_ROOT),
                 catalog: None,
+                booted: PathBuf::from(BOOTED_DEPLOYMENT),
             })
         );
         for count in 1..full.len() {
@@ -4030,6 +4079,7 @@ mod tests {
             firstboot,
             timezones: zones,
             catalog: None,
+            booted: PathBuf::from(BOOTED_DEPLOYMENT),
         };
         for (choice, expected) in [
             (["alice", "td-laptop", "us", "Europe/London"], Ok(())),
@@ -9972,6 +10022,7 @@ mod tests {
             firstboot: execution.firstboot.clone(),
             timezones: execution.timezones.clone(),
             catalog: None,
+            booted: execution.booted.clone(),
         };
         let fit = |host: &mut LiveHost| host.check_fit(&fixture.plan);
         assert_eq!(fit(&mut host), Ok(()));
@@ -10050,6 +10101,106 @@ mod tests {
         let output = execution.run.join("selector.cpio");
         prepare_selector(&template, &execution.trusted_key, &uuid, &output).unwrap();
         assert_eq!(std::fs::metadata(&output).unwrap().len(), total);
+    }
+
+    /// Proposal and execution both require the running root to be the
+    /// deployment they install, by the record init wrote.
+    #[test]
+    fn the_booted_record_names_exactly_one_deployment() {
+        let dir = ScratchDirectory(scratch::path("booted"));
+        std::fs::create_dir(&dir.0).unwrap();
+        let record = dir.0.join("td-deployment");
+        let id = "ab".repeat(32);
+        assert!(booted_as(&record, &id).is_err());
+        std::fs::write(&record, format!("{id}\n")).unwrap();
+        booted_as(&record, &id).unwrap();
+        assert!(booted_as(&record, &"cd".repeat(32)).is_err());
+        for written in [id.clone(), format!("{id}\n\n"), format!("{id} \n")] {
+            std::fs::write(&record, written.as_bytes()).unwrap();
+            assert!(booted_as(&record, &id).is_err(), "{written:?}");
+        }
+    }
+
+    /// A source td-boot authenticates is admitted only as the deployment
+    /// the running root is.
+    #[test]
+    fn a_source_is_admitted_only_as_the_booted_deployment() {
+        use installation_protocol::Refusal;
+        use installation_service::Host;
+        let fixture = ExecutionFixture::new(b"kernel", b"kernel");
+        let execution = &fixture.execution;
+        let id = sha256::to_base16(fixture.plan.deployment());
+        let validator = execution.run.join("td-boot-validator");
+        scratch::executable(&validator, &format!("#!/bin/sh\necho {id}\n")).unwrap();
+        let mut host = LiveHost {
+            td_boot: validator,
+            source: execution.source.clone(),
+            trusted_key: execution.trusted_key.clone(),
+            root: execution.root.clone(),
+            firstboot: execution.firstboot.clone(),
+            timezones: execution.timezones.clone(),
+            catalog: None,
+            booted: execution.booted.clone(),
+        };
+        assert_eq!(host.authenticate_source(), Ok(*fixture.plan.deployment()));
+        std::fs::write(&execution.booted, format!("{}\n", "cd".repeat(32))).unwrap();
+        assert_eq!(host.authenticate_source(), Err(Refusal::SourceUnavailable));
+        std::fs::remove_file(&execution.booted).unwrap();
+        assert_eq!(host.authenticate_source(), Err(Refusal::SourceUnavailable));
+    }
+
+    /// A source the kernel's block inventory cannot place, as a scratch
+    /// directory on tmpfs is, refuses discovery rather than listing every
+    /// disk. Scratch may be disk-backed, and unprivileged the claim probe
+    /// refuses discovery too, so this pins only the outcome; `disk_of`'s
+    /// test pins the resolution.
+    #[test]
+    fn an_unresolvable_source_refuses_discovery() {
+        use installation_protocol::Refusal;
+        use installation_service::Host;
+        let fixture = ExecutionFixture::new(b"kernel", b"kernel");
+        let execution = &fixture.execution;
+        let mut host = LiveHost {
+            td_boot: execution.td_boot.clone(),
+            source: execution.source.clone(),
+            trusted_key: execution.trusted_key.clone(),
+            root: execution.root.clone(),
+            firstboot: execution.firstboot.clone(),
+            timezones: execution.timezones.clone(),
+            catalog: None,
+            booted: execution.booted.clone(),
+        };
+        assert_eq!(host.candidates(), Err(Refusal::DiscoveryFailed));
+    }
+
+    /// The source's disk leaves the candidates and nothing else does.
+    #[test]
+    fn the_source_disk_is_never_a_candidate() {
+        let disk = |name: &'static str, minor: u32| {
+            installation_plan::Destination::new(installation_plan::DestinationObservation {
+                name,
+                major: 8,
+                minor,
+                sequence: u64::from(minor) + 1,
+                capacity: DISK,
+                sector: 512,
+                removable: false,
+                model: None,
+                serial: None,
+                wwid: None,
+            })
+            .unwrap()
+        };
+        let both =
+            || installation_plan::Candidates::new(vec![disk("sda", 0), disk("sdb", 16)]).unwrap();
+        assert_eq!(
+            excluding(both(), "sdb").unwrap().as_slice(),
+            [disk("sda", 0)]
+        );
+        assert_eq!(
+            excluding(both(), "sr0").unwrap().as_slice(),
+            both().as_slice()
+        );
     }
 
     #[test]

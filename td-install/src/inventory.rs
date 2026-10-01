@@ -569,6 +569,46 @@ pub fn candidate_record(output: &mut impl Write) -> io::Result<()> {
     record(|| collect(Path::new("/sys/class/block")), probe, output)
 }
 
+/// The whole disk a filesystem on device `number` ("major:minor") is stored
+/// on: that disk, or a partition's parent. Only a disk td-boot would mount a
+/// medium from (a supported destination name, or an optical `srN`) and that
+/// stands on no other device is admitted; anything else keeps its storage
+/// somewhere this does not follow.
+fn disk_of(devices: &[Device], number: &str) -> io::Result<String> {
+    let device = devices
+        .iter()
+        .find(|device| device.number == number)
+        .ok_or_else(|| invalid(format!("no block device is {number}")))?;
+    let disk = match &device.parent {
+        Some(parent) => devices
+            .iter()
+            .find(|peer| &peer.name == parent)
+            .ok_or_else(|| invalid(format!("{}: unresolved whole-disk parent", device.name)))?,
+        None => device,
+    };
+    let optical = disk
+        .name
+        .strip_prefix("sr")
+        .is_some_and(|unit| !unit.is_empty() && unit.bytes().all(|byte| byte.is_ascii_digit()));
+    if !(supported_disk_name(&disk.name) || optical) || !disk.slaves.is_empty() {
+        return Err(invalid(format!(
+            "block device {number} is on {}, not a whole disk a medium is mounted from",
+            disk.name
+        )));
+    }
+    Ok(disk.name.clone())
+}
+
+/// The whole disk backing the filesystem with device id `dev`, from the
+/// kernel's own inventory.
+pub fn backing_disk(dev: u64) -> io::Result<String> {
+    let (major, minor) = crate::device_numbers(dev);
+    disk_of(
+        &collect(Path::new("/sys/class/block"))?,
+        &format!("{major}:{minor}"),
+    )
+}
+
 /// The same discovery as `candidate_record`, as a value.
 pub fn candidates() -> io::Result<installation_plan::Candidates> {
     observe_candidates(|| collect(Path::new("/sys/class/block")), probe)
@@ -693,6 +733,40 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// A source's disk is the disk itself or a partition's parent; a loop or
+    /// stacked device, or a number the inventory lacks, refuses.
+    #[test]
+    fn a_source_resolves_to_its_whole_disk_or_refuses() {
+        let fixture = Fixture::new();
+        let sda = fixture.disk("sda", "8:0", 512);
+        fixture.partition(&sda, "sda1", "8:1");
+        fixture.disk("sr0", "11:0", 2048);
+        fixture.disk("loop0", "7:0", 512);
+        fixture.disk("nbd0", "43:0", 512);
+        fixture.disk("sra", "11:1", 512);
+        // A supported name standing on another disk.
+        let sdd = fixture.disk("sdd", "8:48", 512);
+        let sdc = fixture.disk("sdc", "8:32", 512);
+        symlink(&sdd, sdc.join("slaves/sdd")).unwrap();
+        symlink(&sdc, sdd.join("holders/sdc")).unwrap();
+        let nvme = fixture.disk("nvme0n1", "259:0", 512);
+        fixture.partition(&nvme, "nvme0n1p1", "259:1");
+        let sdb = fixture.disk("sdb", "8:16", 512);
+        let dm = fixture.disk("dm-0", "253:0", 512);
+        symlink(&sdb, dm.join("slaves/sdb")).unwrap();
+        symlink(&dm, sdb.join("holders/dm-0")).unwrap();
+        let devices = collect(&fixture.class).unwrap();
+        assert_eq!(disk_of(&devices, "8:1").unwrap(), "sda");
+        assert_eq!(disk_of(&devices, "8:0").unwrap(), "sda");
+        assert_eq!(disk_of(&devices, "11:0").unwrap(), "sr0");
+        assert_eq!(disk_of(&devices, "259:1").unwrap(), "nvme0n1");
+        // The disk under a stacked device is itself a disk.
+        assert_eq!(disk_of(&devices, "8:16").unwrap(), "sdb");
+        for number in ["7:0", "43:0", "11:1", "8:32", "253:0", "9:9"] {
+            assert!(disk_of(&devices, number).is_err(), "{number}");
         }
     }
 
