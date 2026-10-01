@@ -547,7 +547,8 @@ of its own files may name each module.
   conflict and close flows; `editor`, the `Controller` (`default` for a
   window, `pane` for an embedded pane) with its `Event` and `Outcome`;
   `editor_render`, the `Geometry` and the `Scene` that implements
-  `Composition`; and `editor_error`, their `Error` and `Result`.
+  `Composition`; `editor_search`, find's `History`, `Found` and
+  `Intent`; and `editor_error`, their `Error` and `Result`.
   `Controller::generation_for_test` is test support, public because a
   consumer's tests are another crate.
 - `vt`: `Terminal`, the terminal model with its byte-stream parser (`new`
@@ -2351,9 +2352,10 @@ controller and the scene, as `editor_text`, `editor_model`,
 `td-editor/DESIGN.md` remains the normative contract for it: the
 document model and file safety, the input-controller contract, filling,
 the reference renderer and "Embedding the document view". This section
-holds the toolkit's side.
+holds the toolkit's side. Find's history, `editor_search`, followed (see
+the vault-document bullet below).
 
-- All ten modules are pure in the confinement test's sense: no
+- All eleven modules are pure in the confinement test's sense: no
   environment, filesystem, network, process, clock or I/O access, and at
   most one test module, at the file's tail. Files, the clock, spelling,
   the control socket, replay and the reference preview stay td-editor's.
@@ -2368,8 +2370,11 @@ holds the toolkit's side.
   hold, check and hand back a permit but never forge or apply one. The
   flows record a decision; the user's consent behind it is the
   embedder's to ask for, as it was td-editor's window's before the move.
-  What td-editor reached as crate-private before the move is public now
-  because it is another crate, except the model's `open` and
+  The one discard without a permit is `Event::Clear`, a lock that forgets
+  every document, dirty or not, at once; it is for a host that locks,
+  td-pass, and td-editor's confinement test pins that the editor never
+  sends it. What td-editor reached as crate-private before the move is
+  public now because it is another crate, except the model's `open` and
   `missing_file`, which consumers reach through the controller's events
   and which stay crate-private.
 - The crate root re-exports nothing of the core; consumers name the
@@ -2379,11 +2384,42 @@ holds the toolkit's side.
   sets the staleness counter so they can reach its exhaustion. The
   confinement tests here and in td-editor hold both crates' production
   sources to never calling it.
+- A pane can hold a document whose text is its own, as a td-pass vault
+  entry's is (`td-pass/DESIGN.md`, "Notebook"). `Event::Fillable`
+  cleared refuses Fill Paragraph and turning Auto Fill on, turns Auto
+  Fill off, and ignores the fill chord as a read-only document ignores
+  an edit, so visual wrapping is the only wrapping and no newline is
+  inserted. `Snapshot::capture_selection` takes the selection alone,
+  never the caret's line, for a host whose copy and cut take exactly
+  what is selected. `editor_search`'s `History` gives the pane the
+  editor's find: literal, from the selection, stopping at the end
+  before a repeated find wraps; td-editor keeps only its minibuffer
+  prompt. Line endings are the codec's: a document keeps the one
+  ending it was loaded with, LF or CRLF, and mixed endings are
+  refused; inserted and pasted text is held with LF, its CRLF pairs
+  folded, and saved with the document's ending; any other control
+  character but tab, or invalid UTF-8, refuses a paste whole. A
+  selection capture carries the document's own ending, so a copy from a
+  CRLF entry is its stored bytes; the line capture the editor's window
+  uses keeps LF. `Event::Clear`, for a lock, forgets every document with
+  its undo and redo history, its views and the input state, leaves the
+  gutter and scrollbars as a fresh controller's, and gives the editor a
+  new identity, so every `RevisionPoint` and dialog flow held before is
+  stale; tab IDs and the generation keep counting. Whenever the model
+  frees a document's text or a history transaction's text (a close, a
+  discard, a reload's replacement, history eviction or redo truncation,
+  a clear, the editor's drop) it zeroes the buffer across its whole
+  capacity first, and a find `History` does the same with its query.
+  Buffers a growing string left behind earlier are out of reach, and so
+  are copies outside the model: a host's `Snapshot` and `Paste`, and
+  the transient strings an insertion passes through. This is best
+  effort, not erasure. Spelling was never the core's.
 - The core's tests are `tests/editor_core.rs`, `editor_layout.rs`,
   `editor_render.rs`, `editor.rs` and `editor_clipboard.rs`, moved with
-  it, and the controller's half of td-editor's caret-tick fence in
-  `tests/confinement.rs`. td-editor keeps the replay wire's, the real
-  binary's and its window's.
+  it, the controller's half of td-editor's caret-tick fence in
+  `tests/confinement.rs`, and `tests/editor_policy.rs` for the
+  vault-document policy. `editor_search` carries its history tests.
+  td-editor keeps the replay wire's, the real binary's and its window's.
 
 ## Outline faces and the glyph atlas
 
@@ -2954,3 +2990,8 @@ regressions. Those increments extend the original sequence below.
     embed the pane through the toolkit alone and drop td-editor, which
     keeps its window, file session, control socket, replay, spelling,
     prompts and preview. Landed.
+28. The vault-document policy: `Event::Fillable` and `Event::Clear`,
+    `Snapshot::capture_selection`, and find's history moved from
+    td-editor as `editor_search`, with their tests in
+    `tests/editor_policy.rs`; the codec's line-ending policy written
+    down. td-pass's notebook pane is their first user. Landed.

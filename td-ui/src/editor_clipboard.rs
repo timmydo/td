@@ -70,9 +70,29 @@ pub fn capture_range(doc: &Document) -> Result<Range<usize>> {
 
 impl Snapshot {
     pub fn capture(editor: &Editor, tab: TabId, revision: u64) -> Result<Option<Self>> {
+        Self::capture_from(editor, tab, revision, true)
+    }
+
+    /// The selection alone: none when it is empty, never the caret's line,
+    /// for a host whose copy and cut take exactly what is selected, in the
+    /// document's own line ending.
+    pub fn capture_selection(editor: &Editor, tab: TabId, revision: u64) -> Result<Option<Self>> {
+        Self::capture_from(editor, tab, revision, false)
+    }
+
+    fn capture_from(
+        editor: &Editor,
+        tab: TabId,
+        revision: u64,
+        line: bool,
+    ) -> Result<Option<Self>> {
         let anchor = Anchor::capture(editor, tab, revision)?;
         let doc = editor.document(tab)?;
-        let range = capture_range(doc)?;
+        let range = if line {
+            capture_range(doc)?
+        } else {
+            doc.selection().range()
+        };
         if range.is_empty() {
             return Ok(None);
         }
@@ -83,11 +103,23 @@ impl Snapshot {
             .text()
             .get(range.clone())
             .ok_or(Error::InvalidPosition)?;
+        // A selection copies the bytes the document stores: its CRLF, not
+        // the LF the model holds. Pasting it back folds them again.
+        let text: Arc<str> = if !line && doc.format().ending == crate::editor_text::LineEnding::CrLf
+        {
+            let stored = text.replace('\n', "\r\n");
+            if stored.len() > MAX_BYTES {
+                return Err(Error::Limit);
+            }
+            Arc::from(stored)
+        } else {
+            Arc::from(text)
+        };
         Ok(Some(Self {
             line: anchor.selection.range().is_empty(),
             anchor,
             range,
-            text: Arc::from(text),
+            text,
         }))
     }
 

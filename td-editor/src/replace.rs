@@ -1,9 +1,9 @@
 //! Bounded literal replacement entry; edits use the ordinary controller.
 
-use crate::search::{Found, History, QUERY_BYTES};
 use crate::{Error, Result};
 use td_ui::editor::{Controller, Event};
 use td_ui::editor_model::{Command, Editor, RevisionPoint, Selection, TabId};
+use td_ui::editor_search::{Found, History, QUERY_BYTES};
 
 #[derive(Clone, Copy)]
 pub(crate) enum Action {

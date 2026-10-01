@@ -66,6 +66,7 @@ pub mod editor_keys;
 pub mod editor_layout;
 pub mod editor_model;
 pub mod editor_render;
+pub mod editor_search;
 pub mod editor_text;
 pub mod face;
 pub mod face_file;

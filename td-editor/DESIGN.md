@@ -123,7 +123,10 @@ dirty and accessible.
 Closing a dirty tab or window asks Save / Discard / Cancel. Cancel preserves
 the complete session. Explicit discard is the only ordinary close path that
 may abandon edits. If saving one tab fails while quitting, quitting stops;
-successfully saved tabs stay saved and remaining tabs stay open.
+successfully saved tabs stay saved and remaining tabs stay open. A lock is
+no close path: td-ui's `Event::Clear` forgets dirty documents without a
+permit, for a host that locks (td-pass), and the editor, which has no
+lock, never sends it; its confinement test pins that.
 
 Windows-like is the default. `--keys=windows|emacs` selects the profile at
 startup and Edit > Key Bindings changes it for the whole window, cancelling
@@ -1270,8 +1273,9 @@ filling, clipboard capture, dialog permits, controller and scene (with
 are `td_ui::editor_text`, `editor_model`, `editor_keys`, `editor_layout`,
 `editor_fill`, `editor_clipboard`, `editor_dialog`, `td_ui::editor` and
 `editor_render`, and their refusals `td_ui::editor_error::Error`, which
-the crate root re-exports as its own `Error`. Their behavior is
-unchanged by the move; this crate keeps the window, the file session,
+the crate root re-exports as its own `Error`; find's history and its
+end-before-wrap admission followed as `td_ui::editor_search`. Their behavior
+is unchanged by the move; this crate keeps the window, the file session,
 the control socket, replay, spelling, the prompts and `preview`, the fixed
 reference-renderer frame over the shared scene. The source bundle is the td
 git checkout; `cargo build --manifest-path td-editor/Cargo.toml` builds the
@@ -1279,9 +1283,9 @@ standalone binary without an installed td system, resolving td-ui offline
 from the checkout. The target recipe must stage the td-ui tree beside this
 one (the cargo `local_source_trees` shape td-net uses; a flat direct-rustc
 staging cannot link a second crate) with the shared sources and licenses
-td-ui mounts, and td-ui and shared-source changes must select editor tests
-in affected-checks, which they do through the reader graph. A future move of
-a shared file updates staging, check mappings and all consumers atomically.
+td-ui mounts, and td-ui and shared-source changes must select editor tests in
+affected-checks, which they do through the reader graph. A future move of a
+shared file updates staging, check mappings and all consumers atomically.
 
 ## Wayland and host compatibility
 
@@ -2918,8 +2922,11 @@ memory and returned through `editor_clipboard::Paste`, so the document's
 bounds hold and the editor's own `Event::Cut`/`Event::Paste` apply; the
 toolkit's data path, for the system clipboard, is a later increment. A
 pane the host loads without `ReadOnly` is editable, and the host sets
-`Command::AutoFill(true)` on a mail draft as the editor's own window
-does.
+`Command::AutoFill(true)` on a mail draft as the editor's own window does. A
+host whose text is its own, td-pass's vault entries, clears `Event::Fillable`
+instead, copies and cuts through `Snapshot::capture_selection` rather than
+the whole-line capture, finds through `editor_search::History`, and sends
+`Event::Clear` on lock (`td-ui/DESIGN.md`, "Editor core").
 
 What the pane does not do: it draws no menu bar, tab strip, minibuffer or
 status row (so notices are the host's to show), owns no Wayland surface,

@@ -94,7 +94,7 @@ struct Window {
     number: Option<crate::number::Prompt>,
     command: Option<crate::command::Prompt>,
     replace: Option<crate::replace::Prompt>,
-    searches: crate::search::History,
+    searches: td_ui::editor_search::History,
     spelling: crate::spelling::WindowState,
     control_jobs: crate::control_jobs::Jobs,
     control_file_job: Option<ControlFile>,
@@ -331,7 +331,7 @@ impl Window {
             number: None,
             command: None,
             replace: None,
-            searches: crate::search::History::default(),
+            searches: td_ui::editor_search::History::default(),
             spelling: crate::spelling::WindowState::default(),
             control_jobs: crate::control_jobs::Jobs::default(),
             control_file_job: None,
@@ -4755,7 +4755,7 @@ impl Window {
         let doc = self.ui.editor().document(tab).map_err(error)?;
         let selected = doc.text().get(doc.selection().range()).unwrap_or_default();
         let query = if !selected.is_empty()
-            && selected.len() <= crate::search::QUERY_BYTES
+            && selected.len() <= td_ui::editor_search::QUERY_BYTES
             && !selected.chars().any(char::is_control)
         {
             selected.to_owned()
@@ -4791,7 +4791,7 @@ impl Window {
         query: &str,
         backward: bool,
     ) {
-        use crate::search::Found;
+        use td_ui::editor_search::Found;
         let result = self
             .searches
             .find(&mut self.ui, tab, revision, query, backward);
@@ -7228,7 +7228,7 @@ mod tests {
             (K::FindBackward, A::Entry("a\nb".into()), "invalid-argument"),
             (
                 K::FindBackward,
-                A::Entry("x".repeat(crate::search::QUERY_BYTES + 1)),
+                A::Entry("x".repeat(td_ui::editor_search::QUERY_BYTES + 1)),
                 "limit",
             ),
         ] {
@@ -7343,7 +7343,7 @@ mod tests {
         use crate::control::{PromptAnswer as A, PromptKind as K};
         let (mut w, _peer) = file_dialog_fixture();
         w.search_request("find", 1, 0).unwrap();
-        let full = "λ".repeat(crate::search::QUERY_BYTES / 2);
+        let full = "λ".repeat(td_ui::editor_search::QUERY_BYTES / 2);
         prompt_answer(&mut w, K::FindForward, A::Entry(full.clone()));
         assert_eq!(w.search.as_ref().unwrap().text, full);
         let (incoming, _producer) =

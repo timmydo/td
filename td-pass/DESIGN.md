@@ -18,10 +18,13 @@ failed operations. Failure text contains no password, PIN or token output.
 
 Contents are freeform text. No username/password schema, first-line password
 convention, pass CLI, browser extension or Git synchronization is required.
-Copy and paste operate on the selection, preserving bytes. Visual wrapping
-never inserts newlines. Disable Auto Fill and spelling for vault documents.
-Standard editor navigation, undo/redo, selection, find and keyboard profiles
-remain available. Only titles participate in sidebar search initially.
+Copy and paste operate on the selection, preserving bytes: a copy carries
+the entry's stored line endings, pasted text takes the entry's one ending,
+and a paste holding another control character but tab, or invalid UTF-8,
+is refused whole rather than altered. Visual wrapping never inserts
+newlines. Disable Auto Fill and spelling for vault documents. Standard
+editor navigation, undo/redo, selection, find and keyboard profiles remain
+available. Only titles participate in sidebar search initially.
 
 Unlock explicitly authorizes a bounded notebook browsing session. Entry
 selection and copy do not request repeated token touches. Saving and
@@ -53,11 +56,14 @@ Use td-ui's Wayland client, font, raster, chrome, keyboard, pointer and
 clipboard lifecycle. The editing, model and viewport behavior is td-ui's
 editor core (`td-ui/DESIGN.md`, "Editor core"), moved there whole from
 td-editor with its consumers updated atomically; the notebook's editor
-pane is that core, never a copy. Complete the planned text-entry and list
-widgets in td-ui; do not fork the editor or add another Wayland transport
-or renderer. No plaintext file-save adapter, arbitrary Open/Save As path,
-spelling worker, external editor, editor control socket, plugin or shell
-command reaches vault contents.
+pane is that core, never a copy. Its vault-document policy is the core's
+too: filling refused, copy and cut of the selection alone, the editor's
+find, line endings kept, and a lock that forgets every document and
+its history. Complete the planned text-entry and list widgets in td-ui;
+do not fork the editor or add another Wayland transport or renderer. No
+plaintext file-save adapter, arbitrary Open/Save As path, spelling worker,
+external editor, editor control socket, plugin or shell command reaches
+vault contents.
 
 The notebook speaks only td-secret's entry and lifecycle API. On td it uses
 the admitted service and holds no vault key. Standalone mode runs the same

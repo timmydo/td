@@ -75,6 +75,16 @@ pub enum Event<'a> {
         tab: TabId,
         enabled: bool,
     },
+    /// Let filling rewrap a document, or not: without it Fill Paragraph
+    /// and turning Auto Fill on are refused, and their keys ignored.
+    Fillable {
+        tab: TabId,
+        enabled: bool,
+    },
+    /// Forget every document with its history, views and input state, for
+    /// a host's lock: a host then loads afresh, and every revision point
+    /// and dialog it held is stale.
+    Clear,
     Profile(Profile),
     LineNumbers(bool),
     /// Native minibuffer space above the tabs, not a document overlay.
@@ -699,6 +709,28 @@ impl Controller {
                 self.reset_input();
                 Ok(Outcome::Changed)
             }
+            Event::Fillable { tab, enabled } => {
+                if self.editor.document(tab)?.fillable() == enabled {
+                    return Ok(Outcome::Ignored);
+                }
+                self.editor.set_fillable(tab, enabled)?;
+                Ok(Outcome::Changed)
+            }
+            Event::Clear => {
+                if self.editor.tabs().next().is_none() {
+                    return Ok(Outcome::Ignored);
+                }
+                self.editor.clear();
+                self.tabs.clear();
+                self.line_count = None;
+                self.hover = Hover::default();
+                self.reset_input();
+                // As after closing the last tab: the gutter and scrollbars
+                // carry nothing derived from the text forgotten.
+                self.refresh(None)?;
+                self.wake_caret();
+                Ok(Outcome::Changed)
+            }
             Event::Profile(profile) => {
                 self.reset_input();
                 self.keys.set_profile(profile);
@@ -851,6 +883,12 @@ impl Controller {
             // and as for any ignored input the keymap, drag, click
             // sequence and caret phase are left as they were.
             Action::Edit(command) if self.editor.document(tab)?.read_only() && !command.views() => {
+                return Ok(Outcome::Ignored);
+            }
+            // So is a fill key on a document filling may not rewrap.
+            Action::Edit(Command::FillParagraph | Command::AutoFill(true))
+                if !self.editor.document(tab)?.fillable() =>
+            {
                 return Ok(Outcome::Ignored);
             }
             // The host of a pane loads, selects and closes its documents

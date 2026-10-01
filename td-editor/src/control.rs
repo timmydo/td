@@ -19,7 +19,7 @@ pub type Job = td_ui::control_worker::Job<Request>;
 
 pub const PAGE_BYTES: usize = 256 * 1024;
 pub const INSERT_BYTES: usize = 256 * 1024;
-pub const SEARCH_BYTES: usize = crate::search::QUERY_BYTES;
+pub const SEARCH_BYTES: usize = td_ui::editor_search::QUERY_BYTES;
 pub const SPELLING_RANGES: usize = 256;
 pub const KEY_BYTES: usize = 32;
 pub const PROMPT_BYTES: usize = 8192;

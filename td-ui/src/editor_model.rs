@@ -102,6 +102,10 @@ pub struct Document {
     /// an article or a message sets it, and the dispatcher then admits
     /// only selection, motion, go-to-line and find, as for a directory.
     read_only: bool,
+    /// Whether filling may rewrap the text. A host holding text whose
+    /// line breaks are its own, a vault entry's, clears it, and the
+    /// dispatcher then refuses Fill Paragraph and turning Auto Fill on.
+    fillable: bool,
     text: String,
     format: text::Format,
     newlines: usize,
@@ -121,6 +125,10 @@ impl Document {
     }
     pub fn read_only(&self) -> bool {
         self.read_only
+    }
+    /// Whether filling may rewrap the text.
+    pub fn fillable(&self) -> bool {
+        self.fillable
     }
     /// Whether the dispatcher admits only the commands a reader needs.
     pub fn viewing(&self) -> bool {
@@ -150,6 +158,34 @@ impl Document {
     pub fn history_depth(&self) -> (usize, usize) {
         (self.undo.len(), self.redo.len())
     }
+}
+
+// A document's text and every transaction's text are zeroed whenever they
+// are freed: a close, a discard, a reload's replacement, history eviction
+// or redo truncation, a lock's clear, or the editor's own drop.
+impl Drop for Document {
+    fn drop(&mut self) {
+        wipe(&mut self.text);
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        wipe(&mut self.removed);
+        wipe(&mut self.inserted);
+    }
+}
+
+/// Zeroes a string's whole buffer, spare capacity included, and leaves it
+/// empty; `black_box` over the buffer keeps the stores from being elided as
+/// dead before the free. Buffers the string left behind as it grew are out
+/// of reach, so this is best effort, not erasure.
+pub(crate) fn wipe(text: &mut String) {
+    let mut bytes = std::mem::take(text).into_bytes();
+    let capacity = bytes.capacity();
+    bytes.clear();
+    bytes.resize(capacity, 0);
+    std::hint::black_box(bytes.as_slice());
 }
 
 /// Worker completion. Only directory views can authorize in-place navigation;
@@ -321,6 +357,7 @@ impl Editor {
             Document {
                 directory: false,
                 read_only: false,
+                fillable: true,
                 text: decoded.text,
                 format: decoded.format,
                 newlines,
@@ -368,6 +405,8 @@ impl Editor {
 
     /// Direct dirty close is refused. The dialog adapter owns explicit discard;
     /// there is deliberately no bool that lets a replay caller skip consent.
+    /// A lock's `Event::Clear` is the one permitless discard, and it closes
+    /// every document at once.
     pub fn close_tab(&mut self, id: TabId, revision: u64) -> Result<()> {
         let doc = self.checked(id, revision)?;
         if doc.dirty() {
@@ -429,6 +468,7 @@ impl Editor {
         let replacement = Document {
             directory: false,
             read_only: old.read_only,
+            fillable: old.fillable,
             text: decoded.text,
             format: decoded.format,
             newlines,
@@ -492,6 +532,25 @@ impl Editor {
         Ok(())
     }
 
+    /// Lets filling rewrap a document, or not; clearing it also turns Auto
+    /// Fill off. Its text, history and selection are untouched.
+    pub fn set_fillable(&mut self, id: TabId, fillable: bool) -> Result<()> {
+        let doc = self.document_mut(id)?;
+        doc.fillable = fillable;
+        doc.auto_fill &= fillable;
+        Ok(())
+    }
+
+    /// Forgets every document; dropping each zeroes its text and history
+    /// as far as their buffers reach. Tab IDs keep counting, and the editor
+    /// takes a new identity, so every `RevisionPoint` minted before is
+    /// stale.
+    pub(crate) fn clear(&mut self) {
+        self.tabs.clear();
+        self.active = None;
+        self.identity = Arc::new(());
+    }
+
     pub fn save_snapshot(&self, id: TabId) -> Result<(SavePoint, Vec<u8>)> {
         let doc = self.document(id)?;
         if doc.directory {
@@ -525,6 +584,9 @@ impl Editor {
     pub fn dispatch(&mut self, id: TabId, revision: u64, command: Command) -> Result<()> {
         let doc = self.checked(id, revision)?;
         if doc.viewing() && !command.views() {
+            return Err(Error::Unavailable);
+        }
+        if !doc.fillable && matches!(command, Command::FillParagraph | Command::AutoFill(true)) {
             return Err(Error::Unavailable);
         }
         match command {

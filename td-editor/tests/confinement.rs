@@ -151,6 +151,13 @@ fn source_inventory_and_allowances_are_closed() {
             0,
             "test support in production: {name}"
         );
+        // The core's lock forgets dirty documents without a discard permit;
+        // the editor has no lock, so it never sends it.
+        assert_eq!(
+            production.matches("Event::Clear").count(),
+            0,
+            "a permitless discard in {name}"
+        );
         // Re-exporting the toolkit is the crate root's (the
         // core's error, font, wire), `control`'s (the framing and codecs its
         // tests and replay share, public and crate-private) and
