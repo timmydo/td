@@ -302,10 +302,35 @@ impl<'a> Snapshot<'a> {
         cell
     }
 
-    /// The first and last columns of the unit at a cell in this view: the
+    /// Whether this view's `row` goes on at the start of the next: the
+    /// terminal wrapped it there rather than the child ending it. Read from
+    /// the same place `cell` reads the row, so history above the split and
+    /// the primary screen below it while scrolled back. Never for the
+    /// view's last row, which has no next row in view.
+    pub fn wrapped(&self, row: usize) -> bool {
+        if row.saturating_add(1) >= self.rows() {
+            return false;
+        }
+        if row < self.viewport {
+            self.viewport
+                .checked_sub(row)
+                .and_then(|back| self.terminal.history_lines().checked_sub(back))
+                .is_some_and(|line| self.terminal.history_wrapped(line))
+        } else {
+            row.checked_sub(self.viewport).is_some_and(|row| {
+                if self.viewport == 0 {
+                    self.terminal.wrapped(row)
+                } else {
+                    self.terminal.primary_wrapped(row)
+                }
+            })
+        }
+    }
+
+    /// The first and last columns of the unit at a cell on its row: the
     /// cell; the run of word, blank or delimiter cells around it, as
-    /// foot's word is; or the whole row. A row is the screen's, so a line
-    /// the terminal wrapped is selected a row at a time.
+    /// foot's word is; or the whole row. `select` carries a word or a row
+    /// on across the rows the terminal wrapped.
     pub fn span(&self, unit: Unit, row: usize, column: usize) -> (usize, usize) {
         let last = self.columns().saturating_sub(1);
         let column = column.min(last);
@@ -328,21 +353,56 @@ impl<'a> Snapshot<'a> {
         }
     }
 
+    /// The first and last cells of the unit at `at`: its `span`, carried
+    /// on across rows the terminal wrapped, as foot's word and row are. A
+    /// row unit is the whole wrapped line; a word goes on while the row it
+    /// reaches the edge of was wrapped and the next row starts with the
+    /// same kind of cell.
+    fn reach(&self, unit: Unit, at: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+        let (start, end) = self.span(unit, at.0, at.1);
+        let (mut first, mut last) = ((at.0, start), (at.0, end));
+        if unit == Unit::Cell {
+            return (first, last);
+        }
+        let edge = self.columns().saturating_sub(1);
+        let kind = (unit == Unit::Word).then(|| class(self.cell(at.0, at.1.min(edge)).scalar));
+        let joins = |row: usize, column: usize| {
+            kind.is_none_or(|kind| class(self.cell(row, column).scalar) == kind)
+        };
+        while first.1 == 0 {
+            let Some(row) = first.0.checked_sub(1) else {
+                break;
+            };
+            if !self.wrapped(row) || !joins(row, edge) {
+                break;
+            }
+            first = (row, self.span(unit, row, edge).0);
+        }
+        while last.1 == edge && self.wrapped(last.0) {
+            let row = last.0.saturating_add(1);
+            if !joins(row, 0) {
+                break;
+            }
+            last = (row, self.span(unit, row, 0).1);
+        }
+        (first, last)
+    }
+
     /// The selection a press at `anchor` dragged to `extent` makes by
     /// `unit`: from the anchor's unit to the extent's, whichever way the
     /// drag went, so the anchor's whole unit stays selected.
     pub fn select(&self, unit: Unit, anchor: (usize, usize), extent: (usize, usize)) -> Selection {
-        let (anchor_start, anchor_end) = self.span(unit, anchor.0, anchor.1);
-        let (extent_start, extent_end) = self.span(unit, extent.0, extent.1);
+        let (anchor_start, anchor_end) = self.reach(unit, anchor);
+        let (extent_start, extent_end) = self.reach(unit, extent);
         if anchor <= extent {
             Selection {
-                anchor: (anchor.0, anchor_start),
-                extent: (extent.0, extent_end),
+                anchor: anchor_start,
+                extent: extent_end,
             }
         } else {
             Selection {
-                anchor: (anchor.0, anchor_end),
-                extent: (extent.0, extent_start),
+                anchor: anchor_end,
+                extent: extent_start,
             }
         }
     }

@@ -568,9 +568,22 @@ starts over. A drag after either extends a word or a row at a time, the
 pressed one kept whole whichever way it goes. A word is a run of cells of one
 class -- blanks, foot's default `word-delimiters` (`` ,│`|:"'()[]{}<> ``), or
 cells that are neither -- so a run of delimiters is one word, as in foot. A
-row is the screen's, so a line the terminal wrapped is selected a row at a
-time. Both are td-ui's (`vt_render`'s `Snapshot::span` and
-`Snapshot::select`). A followed link (below) counts toward no gesture.
+row is the line: every row the terminal wrapped it across, so far as the
+view shows them, as foot's is. A word goes on across a wrap too, while
+the next row starts with a cell of its class. The model records which
+rows an autowrap ended, on the screen and in history, and the view reads
+the mark from where it reads the row (`Snapshot::wrapped`). A mark stands
+only while its row still reaches the edge as written into the row that
+follows: erasing to the last column, inserting or deleting characters,
+replacing the row it went on at (rows inserted, deleted or scrolled
+beneath it, or the row scrolled away from a region's last row) take it
+away, and so does a change of width, which without reflow pads or clips
+the row. The newest history line's mark goes when the screen's first
+row is cleared whole or replaced without being pushed to history, and a
+history line marks a wrap only at the width it was stored at. All of
+this
+is td-ui's (`vt_render`'s `Snapshot::span`, `Snapshot::select` and
+`Snapshot::wrapped`). A followed link (below) counts toward no gesture.
 Leaving the surface abandons a drag still held and forgets the press count; a
 drag released past the edge comes as release, leave and frame, and that frame
 still finishes it. Reverse drags normalize only when text is copied. The
@@ -579,11 +592,14 @@ movement, or a key press other than the copy and paste chords clears the
 range and schedules a repaint; a drag still held re-selects from its press
 point at its next motion, so the range it shows is over what is on screen
 then. A bare modifier is not a press the keymap reports, so the Control and
-Shift needed for the copy chord cannot erase it first. Each selected row
-loses trailing ASCII spaces, rows are joined with one newline, and the text
-is bounded at 64 KiB; a longer one rings rather than being cut. A range that
-trims to no bytes is a no-op: it neither replaces the seat clipboard nor
-emits a zero-byte success marker.
+Shift needed for the copy chord cannot erase it first. A selected row the
+terminal wrapped runs on into the next with nothing between them and its
+cells kept to the edge, so a wrapped line copies as the child wrote it;
+any other row loses trailing ASCII spaces and is followed by one newline,
+and the text ends with no trailing space.
+The text is bounded at 64 KiB; a longer one rings rather than being cut.
+A range that trims to no bytes is a no-op: it neither replaces the seat
+clipboard nor emits a zero-byte success marker.
 
 A left-button press with Control and no other modifier (Caps and Num Lock
 ignored), read from the keyboard's synchronized modifiers while td-term
@@ -1375,9 +1391,10 @@ terminal, and td-term's prove the program:
   keys through td's keymap and the encoder to the child; moves and returns
   the viewport by key and by wheel; selects by drag and offers the selection;
   selects nothing on a click, a word on a double press and a row on a
-  triple, dragging by them; makes a release's selection the primary
-  selection and writes its sends; pastes the primary selection on a middle
-  press and does nothing without one;
+  triple, dragging by them, a row being its whole wrapped line; copies a
+  wrapped line without the wrap's newline; makes a release's selection
+  the primary selection and writes its sends; pastes the primary
+  selection on a middle press and does nothing without one;
   waits for the proof's sync on the live source; rings for a paste with
   nothing offered and receives a selected offer over a fresh endpoint;
   reports presses, releases, the wheel in carried, bounded notches and

@@ -954,6 +954,241 @@ fn a_word_is_a_run_of_its_class() {
     assert_eq!(view.span(Unit::Word, 0, 5), (4, 6));
 }
 
+/// A row the terminal wrapped says so from wherever the view reads it:
+/// the live screen, history above a scrolled-back split, and the primary
+/// screen under it while the alternate screen is active. A row the child
+/// ended, the view's last row, and a row past the view do not.
+#[test]
+fn a_view_knows_which_rows_the_terminal_wrapped() {
+    let mut terminal = Terminal::new(3, 4).unwrap();
+    terminal.feed(b"abcdef\r\nxy");
+    let view = Snapshot::new(&terminal, false, false);
+    let wrapped = |view: &Snapshot| (0..4).map(|row| view.wrapped(row)).collect::<Vec<_>>();
+    assert_eq!(wrapped(&view), [true, false, false, false]);
+    // Scrolled into history, the wrap goes with its line.
+    terminal.feed(b"\r\n1");
+    assert_eq!(terminal.history_lines(), 1);
+    assert!(terminal.history_wrapped(0));
+    let view = Snapshot::new(&terminal, false, false).scrolled_back(1);
+    assert_eq!(wrapped(&view), [true, false, false, false]);
+    // The alternate screen's rows are its own; a scrolled-back view reads
+    // the primary's beneath the history.
+    let mut terminal = Terminal::new(3, 4).unwrap();
+    terminal.feed(b"abcdefghij\r\nk");
+    terminal.feed(b"\x1b[?1049h\x1b[Hlongword");
+    let live = Snapshot::new(&terminal, false, false);
+    assert_eq!(wrapped(&live), [true, false, false, false]);
+    terminal.feed(b"\x1b[2J");
+    let live = Snapshot::new(&terminal, false, false);
+    assert_eq!(wrapped(&live), [false, false, false, false]);
+    let back = Snapshot::new(&terminal, false, false).scrolled_back(1);
+    assert_eq!(wrapped(&back), [true, true, false, false]);
+}
+
+/// A mark stands only while its row still reaches the edge as the child
+/// wrote it into the row that follows: an erase to the last column, an
+/// insert or delete of characters, or a line inserted, deleted or
+/// scrolled beneath it takes it away, as does a change of width, which
+/// without reflow pads or clips the row. Erasing the row's start, or
+/// characters short of the edge, leaves it.
+#[test]
+fn a_wrap_mark_goes_when_the_row_no_longer_reaches_the_edge() {
+    let marks = |text: &[u8]| {
+        let mut terminal = Terminal::new(3, 4).unwrap();
+        terminal.feed(b"abcdefghij");
+        terminal.feed(text);
+        (0..3).map(|row| terminal.wrapped(row)).collect::<Vec<_>>()
+    };
+    assert_eq!(marks(b""), [true, true, false]);
+    assert_eq!(marks(b"\x1b[H\x1b[K"), [false, true, false], "EL 0");
+    assert_eq!(
+        marks(b"\x1b[1;3H\x1b[K"),
+        [false, true, false],
+        "EL 0 mid-row"
+    );
+    assert_eq!(marks(b"\x1b[1;2H\x1b[1K"), [true, true, false], "EL 1");
+    assert_eq!(marks(b"\x1b[1;3H\x1b[J"), [false, false, false], "ED 0");
+    assert_eq!(marks(b"\x1b[H\x1b[2X"), [true, true, false], "ECH short");
+    assert_eq!(
+        marks(b"\x1b[1;3H\x1b[5X"),
+        [false, true, false],
+        "ECH to the edge"
+    );
+    assert_eq!(marks(b"\x1b[H\x1b[@"), [false, true, false], "ICH");
+    assert_eq!(marks(b"\x1b[H\x1b[P"), [false, true, false], "DCH");
+    assert_eq!(marks(b"\x1b[3;1H\x1b[M"), [true, false, false], "DL");
+    assert_eq!(marks(b"\x1b[3;1H\x1b[L"), [true, false, false], "IL");
+    assert_eq!(
+        marks(b"\x1b[2;3r\x1b[3;1H\n"),
+        [false, false, false],
+        "a region scrolled beneath it"
+    );
+    // A region over a status line: a row scrolled to the region's last
+    // row, or away from it, no longer goes on below.
+    let region = |text: &[u8]| {
+        let mut terminal = Terminal::new(4, 4).unwrap();
+        terminal.feed(b"\x1b[4;1HSTAT\x1b[1;3r\x1b[2;1Habcdefgh");
+        terminal.feed(text);
+        (0..4).map(|row| terminal.wrapped(row)).collect::<Vec<_>>()
+    };
+    assert_eq!(region(b""), [false, true, false, false]);
+    assert_eq!(
+        region(b"\x1b[1;1H\x1bM"),
+        [false, false, false, false],
+        "RI"
+    );
+    assert_eq!(
+        region(b"\x1b[1;1H\x1b[L"),
+        [false, false, false, false],
+        "IL"
+    );
+    assert_eq!(region(b"\x1b[S"), [true, false, false, false], "SU");
+    assert_eq!(region(b"\x1b[2S"), [false, false, false, false], "SU twice");
+    // A line wrapped from the region's last row into the row below it
+    // before the margins were set: scrolled up, it no longer goes on.
+    let mut terminal = Terminal::new(4, 4).unwrap();
+    terminal.feed(b"\x1b[3;1Habcdefg\x1b[1;3r\x1b[S");
+    let marks: Vec<bool> = (0..4).map(|row| terminal.wrapped(row)).collect();
+    assert_eq!(marks, [false, false, false, false], "SU from the last row");
+    // Autowrap at the region's last row keeps the line whole as it
+    // scrolls, and at the screen's last row too.
+    assert_eq!(region(b"ijklmn"), [true, true, false, false]);
+    let mut terminal = Terminal::new(2, 4).unwrap();
+    terminal.feed(b"abcdefghij");
+    assert!(terminal.history_wrapped(0) && terminal.wrapped(0));
+    // The newest history line goes on at the first row only until that
+    // row is cleared or replaced without a push.
+    let newest = |text: &[u8]| {
+        let mut terminal = Terminal::new(3, 4).unwrap();
+        terminal.feed(b"yyyyzz\r\n\r\n");
+        terminal.feed(text);
+        let newest = terminal.history_lines().checked_sub(1).unwrap();
+        terminal.history_wrapped(newest)
+    };
+    assert!(newest(b""));
+    assert!(newest(b"\x1b[H\x1b[1K"), "EL 1 short of the edge");
+    assert!(!newest(b"\x1b[2J"), "ED 2");
+    assert!(!newest(b"\x1b[H\x1b[K"), "EL 0 from the first column");
+    assert!(!newest(b"\x1b[H\x1b[M"), "DL at the first row");
+    assert!(!newest(b"\x1b[H\x1bM"), "RI at the top");
+    assert!(
+        !newest(b"\x1b[1;2r\x1b[2;1H\n"),
+        "a region from the first row"
+    );
+    // A resize under the alternate screen drops the primary's first rows
+    // without pushing them.
+    let mut terminal = Terminal::new(3, 4).unwrap();
+    terminal.feed(b"yyyyzz\r\n\r\n\x1b[2;1HQQ\x1b[3;1H\x1b[?1049h");
+    terminal.resize(2, 4).unwrap();
+    terminal.feed(b"\x1b[?1049l");
+    assert_eq!(terminal.history_lines(), 1);
+    assert!(
+        !terminal.history_wrapped(0),
+        "a shrink under the alternate screen"
+    );
+    let mut terminal = Terminal::new(3, 4).unwrap();
+    terminal.feed(b"abcdef");
+    terminal.resize(4, 4).unwrap();
+    assert!(terminal.wrapped(0), "rows alone keep the width");
+    terminal.resize(4, 8).unwrap();
+    assert!(!terminal.wrapped(0), "widened");
+    let mut terminal = Terminal::new(3, 8).unwrap();
+    terminal.feed(b"abcdefghij");
+    terminal.resize(3, 4).unwrap();
+    assert!(!terminal.wrapped(0), "narrowed");
+    // History keeps the width a line was stored at.
+    let mut terminal = Terminal::new(2, 4).unwrap();
+    terminal.feed(b"abcdefghi");
+    assert!(terminal.history_wrapped(0));
+    terminal.resize(2, 6).unwrap();
+    assert!(!terminal.history_wrapped(0));
+    terminal.resize(2, 4).unwrap();
+    assert!(terminal.history_wrapped(0));
+}
+
+/// A word or a row the terminal wrapped is one unit across the wrap, in
+/// history and on the screen alike; a row the child ended is not joined
+/// to the next, nor is a word whose next row starts with another kind of
+/// cell.
+#[test]
+fn a_word_or_row_goes_on_across_a_wrap() {
+    // abcd   <- wrapped
+    // efgh   <- wrapped
+    // ij k
+    // lmno   <- ended by the child
+    // pq
+    let mut terminal = Terminal::new(5, 4).unwrap();
+    terminal.feed(b"abcdefghij k\r\nlmno\r\npq");
+    let view = Snapshot::new(&terminal, false, false);
+    let range = |anchor, extent| Selection { anchor, extent };
+    assert_eq!(
+        view.select(Unit::Word, (1, 1), (1, 1)),
+        range((0, 0), (2, 1)),
+        "a word over two wraps"
+    );
+    assert_eq!(
+        view.select(Unit::Row, (1, 2), (1, 2)),
+        range((0, 0), (2, 3))
+    );
+    assert_eq!(
+        view.select(Unit::Row, (2, 0), (3, 0)),
+        range((0, 0), (3, 3)),
+        "the drag's far row is its own line"
+    );
+    assert_eq!(
+        view.select(Unit::Row, (3, 1), (2, 0)),
+        range((3, 3), (0, 0)),
+        "backward too"
+    );
+    assert_eq!(
+        view.select(Unit::Word, (2, 3), (2, 3)),
+        range((2, 3), (2, 3))
+    );
+    assert_eq!(
+        view.select(Unit::Word, (3, 2), (3, 2)),
+        range((3, 0), (3, 3))
+    );
+    assert_eq!(
+        view.select(Unit::Cell, (1, 1), (1, 1)),
+        range((1, 1), (1, 1))
+    );
+    // A blank at the wrap: the word stops at it, though the row goes on.
+    let mut terminal = Terminal::new(3, 4).unwrap();
+    terminal.feed(b"abc def");
+    let view = Snapshot::new(&terminal, false, false);
+    assert_eq!(
+        view.select(Unit::Word, (0, 1), (0, 1)),
+        range((0, 0), (0, 2))
+    );
+    assert_eq!(
+        view.select(Unit::Word, (1, 1), (1, 1)),
+        range((1, 0), (1, 2))
+    );
+    assert_eq!(
+        view.select(Unit::Row, (1, 1), (1, 1)),
+        range((0, 0), (1, 3))
+    );
+    // Scrolled back, a word from history runs on into the screen.
+    let mut terminal = Terminal::new(2, 4).unwrap();
+    terminal.feed(b"abcdefgh\r\nx");
+    let view = Snapshot::new(&terminal, false, false).scrolled_back(1);
+    assert_eq!(
+        view.select(Unit::Word, (0, 2), (0, 2)),
+        range((0, 0), (1, 3))
+    );
+    // The view's last row is wrapped onto a row it does not show: the
+    // unit stops at the view's edge.
+    let mut terminal = Terminal::new(2, 4).unwrap();
+    terminal.feed(b"abcdefghi");
+    let view = Snapshot::new(&terminal, false, false).scrolled_back(1);
+    assert!(view.wrapped(0));
+    assert!(!view.wrapped(1));
+    assert_eq!(
+        view.select(Unit::Row, (0, 2), (0, 2)),
+        range((0, 0), (1, 3))
+    );
+}
+
 #[test]
 fn a_drag_by_unit_keeps_the_anchors_whole_unit_either_way() {
     // one two three

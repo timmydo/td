@@ -1080,8 +1080,9 @@ impl Window {
         }
     }
 
-    /// The selection's text, rows joined by newlines with each row's
-    /// trailing blanks dropped, bounded by the clipboard's ceiling.
+    /// The selection's text, bounded by the clipboard's ceiling: a row the
+    /// terminal wrapped runs on into the next whole, as the child wrote
+    /// it; any other ends in a newline with its trailing blanks dropped.
     fn selected_text(&self) -> Result<Option<String>> {
         let (Some(selection), Some(terminal)) = (self.selection, self.model.as_ref()) else {
             return Ok(None);
@@ -1096,9 +1097,6 @@ impl Window {
             render::Snapshot::new(terminal, self.client.activated(), false).scrolled_back(viewport);
         let mut selected = String::new();
         for row in start.0..=end.0 {
-            if row != start.0 {
-                selected.push('\n');
-            }
             let first = if row == start.0 { start.1 } else { 0 };
             let last = if row == end.0 {
                 end.1
@@ -1109,9 +1107,10 @@ impl Window {
             for column in first..=last {
                 selected.push(snapshot.cell(row, column).scalar);
             }
+            let joined = row != end.0 && snapshot.wrapped(row);
             // Bounded after the trim: the ceiling is on what is copied, and
             // one row past it is all the untrimmed text can overshoot by.
-            while selected.len() > line_start && selected.ends_with(' ') {
+            while !joined && selected.len() > line_start && selected.ends_with(' ') {
                 selected.pop();
             }
             if selected.len() > MAX_CLIPBOARD_BYTES {
@@ -1119,7 +1118,14 @@ impl Window {
                     "terminal selection exceeds {MAX_CLIPBOARD_BYTES} bytes"
                 ));
             }
+            if row != end.0 && !joined {
+                selected.push('\n');
+            }
         }
+        // A wrapped row's edge blanks are kept for the row that follows;
+        // with nothing after them they end the text, and go.
+        let kept = selected.trim_end_matches(' ').len();
+        selected.truncate(kept);
         Ok((!selected.is_empty()).then_some(selected))
     }
 
@@ -3110,6 +3116,87 @@ mod tests {
         window.event(message(POINTER, 5, &[])).unwrap();
         assert_eq!(window.viewport.offset(window.history()), 3);
         assert!(window.stale);
+    }
+
+    /// Copying a line the terminal wrapped gives it back as the child
+    /// wrote it: no newline at the wrap, and the blank the wrap fell on
+    /// kept; a line the child ended still ends in a newline, trimmed.
+    #[test]
+    fn a_wrapped_line_is_copied_whole() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        let columns = window.model.as_ref().unwrap().columns();
+        let mut text = "x".repeat(columns - 1);
+        text.push_str(" tail\r\nnext  ");
+        window.output(text.as_bytes()).unwrap();
+        window.selection = selection((0, 0), (2, 3));
+        let mut expected = "x".repeat(columns - 1);
+        expected.push_str(" tail\nnext");
+        assert_eq!(window.selected_text().unwrap(), Some(expected));
+        // A triple press takes the whole wrapped line.
+        window.selection = None;
+        window.clock = 10_000;
+        for _ in 0..3 {
+            let clock = window.clock;
+            press_at(&mut window, 2, clock, 9, true);
+            press_at(&mut window, 2, clock, 9, false);
+        }
+        let mut whole = "x".repeat(columns - 1);
+        whole.push_str(" tail");
+        assert_eq!(window.selected_text().unwrap(), Some(whole));
+        // A selection that ends on the wrapped row is trimmed there.
+        window.selection = selection((0, 0), (0, columns - 1));
+        assert_eq!(
+            window.selected_text().unwrap(),
+            Some("x".repeat(columns - 1))
+        );
+    }
+
+    /// Edge blanks kept for a wrapped row's sake do not end the text, and a
+    /// selection of wrapped blanks alone copies nothing.
+    #[test]
+    fn a_copy_ends_with_no_wrapped_blanks() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        let columns = window.model.as_ref().unwrap().columns();
+        let mut text = "x".repeat(columns - 2);
+        text.push_str(&" ".repeat(columns + 4));
+        text.push_str("end");
+        window.output(text.as_bytes()).unwrap();
+        window.selection = selection((0, 0), (1, 1));
+        assert_eq!(
+            window.selected_text().unwrap(),
+            Some("x".repeat(columns - 2))
+        );
+        window.selection = selection((0, columns - 1), (1, 2));
+        assert_eq!(window.selected_text().unwrap(), None);
+    }
+
+    /// Scrolled back, a line wrapped from history onto the screen copies
+    /// whole across the split.
+    #[test]
+    fn a_wrapped_line_across_the_history_split_is_copied_whole() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        let (rows, columns) = {
+            let model = window.model.as_ref().unwrap();
+            (model.rows(), model.columns())
+        };
+        let mut text = "y".repeat(columns);
+        text.push_str("zz");
+        text.push_str(&"\r\n".repeat(rows - 1));
+        window.output(text.as_bytes()).unwrap();
+        // The y row is the newest in history, its rest the screen's first.
+        modifiers(&mut window, SHIFT);
+        press(&mut window, 104);
+        modifiers(&mut window, 0);
+        let back = window.viewport.offset(window.history());
+        assert!(back > 0);
+        let split = back - 1;
+        window.selection = selection((split, 0), (split + 1, 1));
+        let mut expected = "y".repeat(columns);
+        expected.push_str("zz");
+        assert_eq!(window.selected_text().unwrap(), Some(expected));
     }
 
     #[test]

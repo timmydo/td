@@ -252,6 +252,22 @@ impl History {
             )
     }
 
+    /// The newest line no longer goes on at the screen's first row, which
+    /// was replaced or cleared without being pushed here.
+    fn unwrap_newest(&mut self) {
+        if let Some(line) = self.lines.back_mut() {
+            line.wrapped = false;
+        }
+    }
+
+    /// A line stored at another width than the screen's has no wrap at the
+    /// view's edge: there is no reflow, so it is padded or clipped there.
+    fn line_wrapped(&self, line: usize, columns: usize) -> bool {
+        self.lines
+            .get(line)
+            .is_some_and(|line| line.wrapped && line.length == columns)
+    }
+
     fn line_cell(&self, line: usize, column: usize) -> Option<Cell> {
         let line = self.lines.get(line)?;
         if column >= line.length || self.max_cells == 0 {
@@ -346,6 +362,18 @@ impl Screen {
             .copied()
     }
 
+    fn row_wrapped(&self, row: usize) -> bool {
+        self.wrapped_rows.get(row).copied().unwrap_or(false)
+    }
+
+    /// The row no longer goes on at the next: what reached the edge was
+    /// erased or shifted, or the row it went on at was replaced.
+    fn unwrap_row(&mut self, row: usize) {
+        if let Some(wrapped) = self.wrapped_rows.get_mut(row) {
+            *wrapped = false;
+        }
+    }
+
     fn set_cell(&mut self, row: usize, column: usize, cell: Cell) {
         if let Some(index) = self.index(row, column) {
             if let Some(target) = self.cells.get_mut(index) {
@@ -404,6 +432,9 @@ impl Screen {
         for column in 0..self.columns {
             self.set_cell(row, column, Cell::blank(attributes));
         }
+        if row == 0 {
+            self.history.unwrap_newest();
+        }
         if let Some(wrapped) = self.wrapped_rows.get_mut(row) {
             *wrapped = false;
         }
@@ -413,6 +444,12 @@ impl Screen {
         let bounded_end = end.min(self.columns);
         for column in start.min(bounded_end)..bounded_end {
             self.set_cell(row, column, Cell::blank(attributes));
+        }
+        if start < bounded_end && bounded_end == self.columns {
+            self.unwrap_row(row);
+            if start == 0 && row == 0 {
+                self.history.unwrap_newest();
+            }
         }
     }
 
@@ -435,6 +472,17 @@ impl Screen {
         }
         if record_history && top == 0 && bottom == self.rows {
             self.record_history_rows(top, count);
+        } else if top == 0 {
+            self.history.unwrap_newest();
+        }
+        // The rows at either edge of the region lose what they went on at:
+        // the one above sees its next row replaced, and the last moves up
+        // away from the row below the region.
+        if let Some(above) = top.checked_sub(1) {
+            self.unwrap_row(above);
+        }
+        if let Some(last) = bottom.checked_sub(1) {
+            self.unwrap_row(last);
         }
         let Some(source_start) = top.saturating_add(count).checked_mul(self.columns) else {
             return;
@@ -474,6 +522,11 @@ impl Screen {
         if count == 0 {
             return;
         }
+        if let Some(above) = top.checked_sub(1) {
+            self.unwrap_row(above);
+        } else {
+            self.history.unwrap_newest();
+        }
         let Some(source_start) = top.checked_mul(self.columns) else {
             return;
         };
@@ -493,6 +546,11 @@ impl Screen {
         if let Some(rows) = self.wrapped_rows.get_mut(top..top.saturating_add(count)) {
             rows.fill(false);
         }
+        // Moved down to the region's last row, a row went on at one the
+        // scroll dropped; the row below the region is not it.
+        if let Some(last) = bottom.checked_sub(1) {
+            self.unwrap_row(last);
+        }
         self.damage_range(top, bottom);
     }
 
@@ -510,6 +568,18 @@ impl Screen {
                     attributes,
                     record_history,
                 );
+                // The scroll ended the margin row's wrap, as for any row
+                // leaving a region's last row; this one goes on at the row
+                // the cursor now writes, so it is marked where it moved.
+                if let Some(moved) = self
+                    .cursor_row
+                    .checked_sub(1)
+                    .filter(|row| *row >= self.scroll_top)
+                {
+                    if let Some(marker) = self.wrapped_rows.get_mut(moved) {
+                        *marker = wrapped;
+                    }
+                }
             } else {
                 self.cursor_row += 1;
             }
@@ -549,6 +619,7 @@ impl Screen {
         if let Some(cells) = self.cells.get_mut(start..start.saturating_add(count)) {
             cells.fill(Cell::blank(attributes));
         }
+        self.unwrap_row(self.cursor_row);
         self.damage(self.cursor_row);
         self.pending_wrap = false;
     }
@@ -573,6 +644,7 @@ impl Screen {
         if let Some(cells) = self.cells.get_mut(end.saturating_sub(count)..end) {
             cells.fill(Cell::blank(attributes));
         }
+        self.unwrap_row(self.cursor_row);
         self.damage(self.cursor_row);
         self.pending_wrap = false;
     }
@@ -699,6 +771,8 @@ impl Screen {
             .min(old_rows.saturating_sub(rows));
         if record_history && row_offset > 0 {
             self.record_history_rows(0, row_offset);
+        } else if row_offset > 0 {
+            self.history.unwrap_newest();
         }
         let copy_rows = old_rows.saturating_sub(row_offset).min(rows);
         let copy_columns = self.columns.min(columns);
@@ -741,8 +815,10 @@ impl Screen {
             }
         }
         self.tabs = tabs;
+        // Without reflow a row of another width no longer wraps at the edge.
         let mut wrapped_rows = vec![false; rows];
-        for row in 0..copy_rows {
+        let marked_rows = if columns == old_columns { copy_rows } else { 0 };
+        for row in 0..marked_rows {
             let source_row = row.saturating_add(row_offset);
             if let (Some(source), Some(target)) =
                 (self.wrapped_rows.get(source_row), wrapped_rows.get_mut(row))
@@ -1200,6 +1276,33 @@ impl Terminal {
     /// than the current grid.
     pub fn history_cell(&self, line: usize, column: usize) -> Option<Cell> {
         self.primary.history.line_cell(line, column)
+    }
+
+    /// Whether the active screen's `row` was ended by an autowrap: its text
+    /// goes on at the start of the next row rather than having been ended
+    /// by the child. The mark goes when what reached the edge is erased or
+    /// shifted (an erase to the last column, ICH, DCH), when the row it went
+    /// on at is replaced (rows inserted, deleted or scrolled below it, or
+    /// it scrolled away from a region's last row), and when the width
+    /// changes.
+    pub fn wrapped(&self, row: usize) -> bool {
+        self.screen().row_wrapped(row)
+    }
+
+    /// `wrapped` for the primary screen whichever screen is active, as
+    /// `primary_cell` is.
+    pub fn primary_wrapped(&self, row: usize) -> bool {
+        self.primary.row_wrapped(row)
+    }
+
+    /// `wrapped` for a history line, numbered as `history_cell` numbers
+    /// them; the newest goes on at the primary screen's first row, until
+    /// that row is cleared whole or replaced without being pushed. Only a
+    /// line stored at the screen's present width can wrap at its edge.
+    pub fn history_wrapped(&self, line: usize) -> bool {
+        self.primary
+            .history
+            .line_wrapped(line, self.primary.columns)
     }
 
     /// The primary screen's cell whichever screen is active. An open
