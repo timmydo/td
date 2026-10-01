@@ -12,6 +12,8 @@ pub const MEDIA_RELEASED_MARKER: &str = "TD-INSTALL-MEDIA-CLAIM-RELEASED";
 
 pub const DIRECT_MARKER: &str = "TD-INSTALL-PUBLISHED-ON-DISK";
 pub const PARTITIONS_MARKER: &str = "TD-INSTALL-PARTITIONS-REFRESHED";
+/// The installation service installed onto the named disk under consent.
+pub const SERVED_MARKER: &str = "TD-INSTALL-SERVED";
 
 pub const MEDIA_MARKER: &str = "TD-INSTALL-MEDIA-READONLY";
 /// ISO names and fixture paths; Linux's normal ISO name map lowercases.

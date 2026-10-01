@@ -8,6 +8,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
+#[allow(dead_code, reason = "shared codec; this fixture is its consent end")]
+#[path = "../../td-install/src/installation_consent.rs"]
+mod installation_consent;
+#[allow(dead_code, reason = "shared codec; this fixture is its installer")]
+#[path = "../../td-install/src/installation_plan.rs"]
+mod installation_plan;
+#[allow(dead_code, reason = "shared codec; this fixture is its installer")]
+#[path = "../../td-install/src/installation_protocol.rs"]
+mod installation_protocol;
 mod protocol;
 use protocol::*;
 
@@ -799,7 +808,7 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
     // The ISO carries the signed payloads and the live initramfs's public key.
     // Every path is fixture-owned; no deployment-signing key enters the guest.
     // Only install-system carries the disposable SSH administrator test key.
-    mount_source(device)?;
+    let media = mount_source(device)?;
     inventory(INVENTORY_BEFORE_MARKER)?;
     candidates(CANDIDATES_BEFORE_MARKER)?;
     let name = device
@@ -857,6 +866,58 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
             &["check-primary-name", "/root-image", USERNAME],
         )?;
     }
+    let loops = bound_loops()?;
+    let uuid = if system_autotest {
+        // The root image's links name its store, as they do on a live root.
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create("/td/store")
+            .map_err(|error| format!("create /td/store: {error}"))?;
+        applet(&["mount", "-o", "bind", "/root-image/td/store", "/td/store"])?;
+        // The image view is noexec and the bind inherits it; a live root's
+        // store executes, mkfs.btrfs among it.
+        applet(&["mount", "-o", "remount,bind,ro,nodev,nosuid", "/td/store"])?;
+        let uuid = served_install(device, media, deployment, &id)?;
+        command("/bin/umount", &["/td/store"])?;
+        uuid
+    } else {
+        format_install(device, interrupt)?
+    };
+    if bound_loops()? != loops {
+        return Err("the installation left a loop device bound".into());
+    }
+    // The real writer must refuse bad targets before the diagnostic preview.
+    preview(name, geometry)?;
+    if system_autotest {
+        // The read-only loop binding lasts until this one-purpose VM ends.
+        command("/bin/umount", &["/root-image"])?;
+    }
+    let partition = refresh_partitions(device, &uuid)?;
+    inventory(INVENTORY_AFTER_MARKER)?;
+    fs::remove_dir_all("/scratch").map_err(|error| format!("remove formatter scratch: {error}"))?;
+    // The volume image contains metadata, trust layout and bounded settings;
+    // publication streamed from read-only media straight onto the disk.
+    if interrupt {
+        return interrupt_publication(&partition);
+    }
+    if system_autotest {
+        command("/bin/td-boot", &["mount-var", &partition, "/state"])?;
+        seed_system_autotest(Path::new("/"), Path::new("/state"))?;
+        check_timezone(Path::new("/state"))?;
+        check_hostname(Path::new("/state"))?;
+        check_username(Path::new("/state"))?;
+        command("/bin/umount", &["/state"])?;
+    }
+    applet(&["sync"])?;
+    report(std::io::stdout(), format_args!("{DIRECT_MARKER}"))?;
+    report(std::io::stdout(), format_args!("{INSTALL_MARKER}"))
+}
+
+/// The raw formatter's path, as the small oracle and the interrupted and
+/// scratch legs drive it: the fixture prepares the selector and runs
+/// `td-install format` itself.
+fn format_install(device: &str, interrupt: bool) -> Result<String, String> {
     let uuid = command_line(&["new-volume-uuid"], 37, "new volume identity")?;
     if !is_v4_volume_uuid(&uuid) {
         return Err("generated volume identity is not a canonical version-4 UUID".into());
@@ -881,48 +942,25 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
         TIMEZONE_ID,
         "--hostname",
         HOSTNAME,
-    ];
-    if system_autotest {
-        format_arguments.extend(["--username", USERNAME, "/root-image", "/bin/td-firstboot"]);
-    }
-    format_arguments.extend([
         device,
         "/bin/mkfs.btrfs",
         "/scratch",
         "--trusted-key",
         "/trusted.pub",
-    ]);
+    ];
     // Publication runs inside format, through a loop over its own claim on
     // the target. The interrupted leg keeps the mounted route, whose
     // publisher it can stop on its own.
     if !interrupt {
         format_arguments.extend(["--publish", "/bin/td-boot", "/source", "/volume"]);
     }
-    let loops = bound_loops()?;
     command("/bin/td-install", &format_arguments)?;
-    if bound_loops()? != loops {
-        return Err("format left a loop device bound".into());
-    }
-    // The real writer must refuse bad targets before the diagnostic preview.
-    preview(name, geometry)?;
-    if system_autotest {
-        check_username(Path::new("/scratch/td-volume-root/@var"))?;
-        // The read-only loop binding lasts until this one-purpose VM ends.
-        command("/bin/umount", &["/root-image"])?;
-    }
     check_timezone(Path::new("/scratch/td-volume-root/@var"))?;
     check_hostname(Path::new("/scratch/td-volume-root/@var"))?;
     for (directory, expected) in [
         ("@var", &["lib"][..]),
         ("@var/lib", &["td"][..]),
-        (
-            "@var/lib/td",
-            if system_autotest {
-                &["hostname", "timezone", "username"][..]
-            } else {
-                &["hostname", "timezone"][..]
-            },
-        ),
+        ("@var/lib/td", &["hostname", "timezone"][..]),
     ] {
         let staged = Path::new("/scratch/td-volume-root").join(directory);
         let mut names = fs::read_dir(&staged)
@@ -955,25 +993,253 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
             ));
         }
     }
-    let partition = refresh_partitions(device, &uuid)?;
-    inventory(INVENTORY_AFTER_MARKER)?;
-    fs::remove_dir_all("/scratch").map_err(|error| format!("remove formatter scratch: {error}"))?;
-    // The volume image contains metadata, trust layout and bounded settings;
-    // publication streamed from read-only media straight onto the disk.
-    if interrupt {
-        return interrupt_publication(&partition);
+    Ok(uuid)
+}
+
+/// The installation service as td-authd starts it on a live boot, with its
+/// operands and both channels: this fixture is the installer on stdin and
+/// td-authd's consent end on stdout, and consents to the review it is sent.
+/// Returns the reviewed volume UUID.
+fn served_install(
+    device: &str,
+    media: &str,
+    deployment: [u8; 32],
+    id: &str,
+) -> Result<String, String> {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    // A live boot's init records the deployment the root was
+    // authenticated as; the fixture's validation of the source stands in.
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open("/run/td-deployment")
+        .and_then(|mut record| record.write_all(format!("{id}\n").as_bytes()))
+        .map_err(|error| format!("record the booted deployment: {error}"))?;
+    let (installer, theirs) =
+        UnixStream::pair().map_err(|error| format!("installer channel: {error}"))?;
+    let (authority, channel) =
+        UnixStream::pair().map_err(|error| format!("consent channel: {error}"))?;
+    let mut child = Command::new("/bin/td-install")
+        .args([
+            "serve",
+            "/bin/td-boot",
+            "/media",
+            "/trusted.pub",
+            "/root-image",
+            "/bin/td-firstboot",
+        ])
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .stdout(Stdio::from(OwnedFd::from(channel)))
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("start the installation service: {error}"))?;
+    let served = drive_service(installer, authority, device, media, deployment);
+    // Closing the installer's channel ends a finished service.
+    if served.is_err() {
+        // The service may already have exited; it is reaped either way.
+        let _ = child.kill();
     }
-    if system_autotest {
-        command("/bin/td-boot", &["mount-var", &partition, "/state"])?;
-        seed_system_autotest(Path::new("/"), Path::new("/state"))?;
-        check_timezone(Path::new("/state"))?;
-        check_hostname(Path::new("/state"))?;
-        check_username(Path::new("/state"))?;
-        command("/bin/umount", &["/state"])?;
+    let status = child.wait();
+    let uuid = served?;
+    let status = status.map_err(|error| format!("wait for the installation service: {error}"))?;
+    if !status.success() {
+        return Err(format!("the installation service exited {status}"));
     }
-    applet(&["sync"])?;
-    report(std::io::stdout(), format_args!("{DIRECT_MARKER}"))?;
-    report(std::io::stdout(), format_args!("{INSTALL_MARKER}"))
+    for entry in fs::read_dir("/run").map_err(|error| format!("list /run: {error}"))? {
+        let entry = entry.map_err(|error| format!("read /run: {error}"))?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("td-install-")
+        {
+            return Err(format!(
+                "the service left its workspace {}",
+                entry.path().display()
+            ));
+        }
+    }
+    report(
+        std::io::stdout(),
+        format_args!("{SERVED_MARKER} {uuid} {device}"),
+    )?;
+    Ok(uuid)
+}
+
+/// One installation through the service's protocols, to its finished
+/// report; both channels close when it returns.
+fn drive_service(
+    mut installer: std::os::unix::net::UnixStream,
+    mut authority: std::os::unix::net::UnixStream,
+    device: &str,
+    media: &str,
+    deployment: [u8; 32],
+) -> Result<String, String> {
+    use installation_consent as consent;
+    use installation_protocol::{self as wire, Reply, Request, State};
+    let name = device
+        .strip_prefix("/dev/")
+        .ok_or("invalid target device")?;
+    let media = media.strip_prefix("/dev/").ok_or("invalid media device")?;
+    let mut greeting = [0; 8];
+    installer
+        .read_exact(&mut greeting)
+        .map_err(|error| format!("service greeting: {error}"))?;
+    wire::check_greeting(&greeting)?;
+    installer
+        .write_all(wire::GREETING)
+        .map_err(|error| format!("greet the service: {error}"))?;
+    authority
+        .read_exact(&mut greeting)
+        .map_err(|error| format!("consent greeting: {error}"))?;
+    consent::check_greeting(&greeting)?;
+    authority
+        .write_all(consent::GREETING)
+        .map_err(|error| format!("greet the consent channel: {error}"))?;
+
+    let Reply::Destinations(candidates) = exchange(&mut installer, &Request::Destinations)? else {
+        return Err("the service refused discovery".into());
+    };
+    if candidates
+        .as_slice()
+        .iter()
+        .any(|disk| disk.name() == media)
+    {
+        return Err(format!("the source disk {media} is a destination"));
+    }
+    let destination = candidates
+        .as_slice()
+        .iter()
+        .find(|disk| disk.name() == name)
+        .ok_or_else(|| format!("{name} is not a destination"))?
+        .clone();
+    let settings = installation_plan::Settings::new(USERNAME, HOSTNAME, "us", TIMEZONE_ID)?;
+    let plan = match exchange(
+        &mut installer,
+        &Request::Propose {
+            destination: destination.clone(),
+            settings,
+        },
+    )? {
+        Reply::Reviewed(plan) => *plan,
+        other => return Err(format!("the service did not review: {other:?}")),
+    };
+    if *plan.deployment() != deployment || *plan.destination() != destination {
+        return Err("the review is not of the source and disk proposed".into());
+    }
+    let nonce = *plan.nonce();
+    match exchange(&mut installer, &Request::Execute(plan.clone()))? {
+        Reply::Status(State::AwaitingConsent(review)) if *review.as_bytes() == nonce => {}
+        other => return Err(format!("execute did not await consent: {other:?}")),
+    }
+    let review = match consent_report(&mut authority)? {
+        consent::Report::Review(review) => review,
+        other => return Err(format!("consent was not asked: {other:?}")),
+    };
+    if *review.nonce() != nonce
+        || review.disk() != name
+        || review.capacity() != destination.capacity()
+        || review.hostname() != HOSTNAME
+        || review.username() != USERNAME
+        || *review.deployment() != deployment
+    {
+        return Err("the consent review is not the review held".into());
+    }
+    let answer = consent::frame(&consent::Answer::Consent(nonce).encode())?;
+    authority
+        .write_all(&answer)
+        .map_err(|error| format!("consent: {error}"))?;
+    match consent_report(&mut authority)? {
+        consent::Report::Started(started) if started == nonce => {}
+        other => return Err(format!("the installation did not start: {other:?}")),
+    }
+    let mut phases: Vec<wire::Phase> = Vec::new();
+    loop {
+        match exchange(&mut installer, &Request::Status)? {
+            Reply::Status(State::Running(running, phase)) if *running.as_bytes() == nonce => {
+                if phases.last() != Some(&phase) {
+                    phases.push(phase);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Reply::Status(State::Complete(done)) if *done.as_bytes() == nonce => break,
+            other => return Err(format!("the installation did not complete: {other:?}")),
+        }
+    }
+    // The phases run in order, so each one seen is later than the last.
+    let order = |phase: &wire::Phase| wire::Phase::ALL.iter().position(|each| each == phase);
+    if !phases.windows(2).all(|pair| match pair {
+        [one, other] => order(one) < order(other),
+        _ => false,
+    }) {
+        return Err(format!("installation phases out of order: {phases:?}"));
+    }
+    match consent_report(&mut authority)? {
+        consent::Report::Finished(finished, consent::Outcome::Complete) if finished == nonce => {}
+        other => return Err(format!("the installation did not finish: {other:?}")),
+    }
+    let uuid = plan
+        .volume_uuid()
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| {
+            let dash = if matches!(index, 4 | 6 | 8 | 10) {
+                "-"
+            } else {
+                ""
+            };
+            format!("{dash}{byte:02x}")
+        })
+        .collect::<String>();
+    if !is_v4_volume_uuid(&uuid) {
+        return Err("the reviewed volume identity is not a canonical version-4 UUID".into());
+    }
+    Ok(uuid)
+}
+
+/// One request and its reply on the installer's channel.
+fn exchange(
+    stream: &mut std::os::unix::net::UnixStream,
+    request: &installation_protocol::Request,
+) -> Result<installation_protocol::Reply, String> {
+    use installation_protocol as wire;
+    let bytes = wire::frame(&request.encode(), wire::MAX_REQUEST_BYTES)?;
+    stream
+        .write_all(&bytes)
+        .map_err(|error| format!("installer request: {error}"))?;
+    let mut header = [0; 4];
+    stream
+        .read_exact(&mut header)
+        .map_err(|error| format!("service reply: {error}"))?;
+    let mut payload = vec![0; wire::payload_len(header, wire::MAX_REPLY_BYTES)?];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|error| format!("service reply: {error}"))?;
+    let reply = wire::Reply::decode(&payload)?;
+    if !reply.answers(request) {
+        return Err(format!(
+            "the service's reply answers another request: {reply:?}"
+        ));
+    }
+    Ok(reply)
+}
+
+/// The service's next report on the consent channel.
+fn consent_report(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> Result<installation_consent::Report, String> {
+    let mut header = [0; 4];
+    stream
+        .read_exact(&mut header)
+        .map_err(|error| format!("consent report: {error}"))?;
+    let mut payload = vec![0; installation_consent::payload_len(header)?];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|error| format!("consent report: {error}"))?;
+    installation_consent::Report::decode(&payload)
 }
 
 /// The installed application oracle uses the standard VM's loopback-only SSH

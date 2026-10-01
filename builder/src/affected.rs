@@ -368,6 +368,10 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-firstboot/src", "recipes/src/recipes/td-firstboot.rs"),
     ("td-init/src", "recipes/src/recipes/td-init.rs"),
     ("td-install/src", "recipes/src/recipes/td-install.rs"),
+    (
+        "td-install-qemu-test/src",
+        "recipes/src/recipes/td-install-qemu-test.rs",
+    ),
     ("td-jail/src", "recipes/src/recipes/td-jail.rs"),
     ("td-kexec/src", "recipes/src/recipes/td-kexec.rs"),
     ("td-login/src", "recipes/src/recipes/td-login.rs"),
@@ -5717,8 +5721,12 @@ mod tests {
             ]
         );
         assert_eq!(readers_of("td-boot"), ["td-install", "td-update"]);
-        // td-authd compiles td-install's consent codec by `#[path]`.
-        assert_eq!(readers_of("td-install"), ["td-authd", "td-setup"]);
+        // td-authd compiles td-install's consent codec by `#[path]`, and the
+        // installation fixture its three protocol codecs.
+        assert_eq!(
+            readers_of("td-install"),
+            ["td-authd", "td-install-qemu-test", "td-setup"]
+        );
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
         // td-mail and td-news take their document pane from td-ui's editor
         // core; nothing reads td-editor.
@@ -5769,6 +5777,7 @@ mod tests {
                 "td-editor",
                 "td-firstboot",
                 "td-install",
+                "td-install-qemu-test",
                 "td-jail",
                 "td-login",
                 "td-mail",
@@ -8169,6 +8178,7 @@ mod tests {
                 "td-editor",
                 "td-firstboot",
                 "td-install",
+                "td-install-qemu-test",
                 "td-jail",
                 "td-login",
                 "td-mail",
@@ -8190,9 +8200,10 @@ mod tests {
         // td-photo's and td-mail's native cases make their commands three,
         // as td-setup's are; td-news, td-pass and td-term, toolkit consumers
         // with no native case, add two each. The test-only P-256 oracle connects
-        // td-secret to td-crypto and then td-mta, adding two commands each.
+        // td-secret to td-crypto and then td-mta, adding two commands each;
+        // the installation fixture, reading td-install's codecs, adds two.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 53, "{comp:?}");
+        assert_eq!(comp.len(), 55, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -8206,6 +8217,7 @@ mod tests {
                 "td-editor",
                 "td-firstboot",
                 "td-install",
+                "td-install-qemu-test",
                 "td-jail",
                 "td-login",
                 "td-mail",
@@ -8237,6 +8249,7 @@ mod tests {
                 "td-editor",
                 "td-firstboot",
                 "td-install",
+                "td-install-qemu-test",
                 "td-jail",
                 "td-login",
                 "td-mail",

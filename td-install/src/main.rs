@@ -1661,21 +1661,45 @@ fn claim_refusal(kind: io::ErrorKind) -> installation_protocol::Refusal {
     }
 }
 
-/// Serve only as uid 0, on a connected Unix socket; refuse before any byte.
-/// `euid` is this process's own: a sanity gate for a misplaced start, not
-/// proof of the caller's privilege (uid 0 in a user namespace passes).
-fn admit_serve(euid: u32, stdin: File) -> io::Result<std::os::unix::net::UnixStream> {
-    use std::os::unix::fs::FileTypeExt;
+/// Serve only as uid 0, with the installer's channel on stdin and
+/// td-authd's consent channel on stdout, each its own connected Unix stream
+/// socket; refuse before any byte. `euid` is this process's own: a sanity
+/// gate for a misplaced start, not proof of the caller's privilege (uid 0
+/// in a user namespace passes).
+fn admit_serve(
+    euid: u32,
+    stdin: File,
+    stdout: File,
+) -> io::Result<(
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+)> {
+    use std::os::unix::fs::MetadataExt;
     if euid != 0 {
         return Err(invalid("serve requires the installation authority".into()));
     }
+    let identity = |file: &File| file.metadata().map(|meta| (meta.dev(), meta.ino()));
+    let (one, other) = (identity(&stdin)?, identity(&stdout)?);
+    let installer = admit_channel(stdin, "serve requires its installer channel on stdin")?;
+    let consent = admit_channel(stdout, "serve requires its consent channel on stdout")?;
+    // One socket on both would interleave the two protocols.
+    if one == other {
+        return Err(invalid(
+            "serve requires distinct installer and consent channels".into(),
+        ));
+    }
+    Ok((installer, consent))
+}
+
+fn admit_channel(file: File, refusal: &str) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::MetadataExt;
-    let channel = || invalid("serve requires its installer channel on stdin".into());
-    let metadata = stdin.metadata()?;
+    let channel = || invalid(refusal.into());
+    let metadata = file.metadata()?;
     if !metadata.file_type().is_socket() {
         return Err(channel());
     }
-    let stream = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(stdin));
+    let stream = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(file));
     // Another socket family, or an unconnected socket, has no Unix peer.
     stream.peer_addr().map_err(|_| channel())?;
     // A datagram or sequenced-packet peer would truncate frames and never
@@ -1765,14 +1789,14 @@ fn run_serve(host: LiveHost) -> io::Result<()> {
     let _source = paths::open_read(&host.source)?;
     let euid = paths::open_read(Path::new("/proc/self"))?.metadata()?.uid();
     let stdin = File::from(io::stdin().as_fd().try_clone_to_owned()?);
-    let stream = admit_serve(euid, stdin)?;
-    // The execution exists, but no consent channel is opened yet, so execute
-    // is refused as consent unavailable and it never runs (INSTALLER.md).
+    // Nothing serve runs writes to stdout: every child's is piped or null.
+    let stdout = File::from(io::stdout().as_fd().try_clone_to_owned()?);
+    let (stream, consent) = admit_serve(euid, stdin, stdout)?;
     let execution = LiveExecution::for_host(&host);
     installation_service::serve(
         stream,
         installation_service::Service::with_execution(host, execution),
-        None,
+        Some(consent),
     )
 }
 
@@ -4094,11 +4118,18 @@ mod tests {
     }
 
     #[test]
-    fn serve_admits_only_a_root_caller_on_a_socket() {
+    fn serve_admits_only_a_root_caller_on_two_sockets() {
         let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let descriptor = || File::from(std::os::fd::OwnedFd::from(socket.try_clone().unwrap()));
+        let (consent, mut authority) = std::os::unix::net::UnixStream::pair().unwrap();
+        let descriptor = |socket: &std::os::unix::net::UnixStream| {
+            File::from(std::os::fd::OwnedFd::from(socket.try_clone().unwrap()))
+        };
+        let refusal =
+            |stdin: File, stdout: File| admit_serve(0, stdin, stdout).unwrap_err().to_string();
         assert_eq!(
-            admit_serve(1000, descriptor()).unwrap_err().to_string(),
+            admit_serve(1000, descriptor(&socket), descriptor(&consent))
+                .unwrap_err()
+                .to_string(),
             "serve requires the installation authority"
         );
         let directory = scratch::path("serve-admission");
@@ -4106,43 +4137,80 @@ mod tests {
         let _cleanup = ScratchDirectory(directory.clone());
         let regular = directory.join("stdin");
         std::fs::write(&regular, b"").unwrap();
-        assert_eq!(
-            admit_serve(0, paths::open_read(&regular).unwrap())
-                .unwrap_err()
-                .to_string(),
-            "serve requires its installer channel on stdin"
-        );
         let unconnected =
             std::os::unix::net::UnixListener::bind(directory.join("listener")).unwrap();
-        assert_eq!(
-            admit_serve(0, File::from(std::os::fd::OwnedFd::from(unconnected)))
-                .unwrap_err()
-                .to_string(),
-            "serve requires its installer channel on stdin"
-        );
+        let unconnected =
+            || File::from(std::os::fd::OwnedFd::from(unconnected.try_clone().unwrap()));
         let (datagram, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
-        assert_eq!(
-            admit_serve(0, File::from(std::os::fd::OwnedFd::from(datagram)))
-                .unwrap_err()
-                .to_string(),
-            "serve requires its installer channel on stdin"
-        );
-        // An inherited O_NONBLOCK is cleared: a read waits for a late peer.
+        let datagram = || File::from(std::os::fd::OwnedFd::from(datagram.try_clone().unwrap()));
+        let installer = "serve requires its installer channel on stdin";
+        let channel = "serve requires its consent channel on stdout";
+        for (stdin, stdout, expected) in [
+            (
+                paths::open_read(&regular).unwrap(),
+                descriptor(&consent),
+                installer,
+            ),
+            (unconnected(), descriptor(&consent), installer),
+            (datagram(), descriptor(&consent), installer),
+            (
+                descriptor(&socket),
+                paths::open_read(&regular).unwrap(),
+                channel,
+            ),
+            (descriptor(&socket), unconnected(), channel),
+            (descriptor(&socket), datagram(), channel),
+            (
+                descriptor(&socket),
+                descriptor(&socket),
+                "serve requires distinct installer and consent channels",
+            ),
+        ] {
+            assert_eq!(refusal(stdin, stdout), expected);
+        }
+        // An inherited O_NONBLOCK is cleared on both: a read waits for a
+        // late peer.
         socket.set_nonblocking(true).unwrap();
-        let mut admitted = admit_serve(0, descriptor()).unwrap();
-        let mut late = peer.try_clone().unwrap();
-        let writer = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            late.write_all(b"y").unwrap();
-        });
-        let mut byte = [0];
-        admitted.read_exact(&mut byte).unwrap();
-        assert_eq!(&byte, b"y");
-        writer.join().unwrap();
-        admitted.write_all(b"x").unwrap();
-        let mut byte = [0];
-        peer.read_exact(&mut byte).unwrap();
-        assert_eq!(&byte, b"x");
+        consent.set_nonblocking(true).unwrap();
+        let (admitted, answered) =
+            admit_serve(0, descriptor(&socket), descriptor(&consent)).unwrap();
+        for (mut admitted, peer) in [(admitted, &mut peer), (answered, &mut authority)] {
+            let mut late = peer.try_clone().unwrap();
+            let writer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                late.write_all(b"y").unwrap();
+            });
+            let mut byte = [0];
+            admitted.read_exact(&mut byte).unwrap();
+            assert_eq!(&byte, b"y");
+            writer.join().unwrap();
+            admitted.write_all(b"x").unwrap();
+            let mut byte = [0];
+            peer.read_exact(&mut byte).unwrap();
+            assert_eq!(&byte, b"x");
+        }
+    }
+
+    /// Under serve, standard input is the installer's channel and standard
+    /// output td-authd's, so no child may inherit either: each child this
+    /// file starts, and no other production module starts one, has its
+    /// output captured (and its input null), or sets both. A source check,
+    /// since no unprivileged test reaches them all.
+    #[test]
+    fn no_child_inherits_the_service_channels() {
+        let source = include_str!("main.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let mut children = 0;
+        for (at, _) in production.match_indices("process::Command::new(") {
+            let call = &production[at..];
+            let call = &call[..call.find(';').unwrap()];
+            assert!(
+                call.contains(".output()") || call.contains(".stdin(") && call.contains(".stdout("),
+                "{call}"
+            );
+            children += 1;
+        }
+        assert_eq!(children, 5);
     }
 
     #[test]

@@ -1880,6 +1880,17 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             );
             let uuid = record_volume_identity(&result, &target, &mut volume_ids)?;
             require_installation(&result, &uuid, source_device, &target)?;
+            // The installation service wrote this disk, under consent, with
+            // the volume identity of the review it held.
+            require(
+                &result,
+                &format!(
+                    "{} {uuid} /dev/{}",
+                    protocol::SERVED_MARKER,
+                    target.bus.name(false)
+                ),
+                "installation service",
+            )?;
             require_live_reports(
                 &result,
                 &target,

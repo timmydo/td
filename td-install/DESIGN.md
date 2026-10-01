@@ -966,10 +966,13 @@ and so a fresh name. Its mountpoint is removed only if empty, so a volume
 td-boot left mounted is never walked; that, like any other removal failure,
 is reported and leaves the outcome as it was.
 
-Production constructs this execution, but `run_serve` still opens no
-consent channel, so execute is refused as consent unavailable and nothing
-runs. The kernel check binds the ESP to the authenticated manifest; the
-remaining payloads are td-boot's to verify as it publishes them.
+Production constructs this execution and `run_serve` opens the consent
+channel, so it runs once td-authd answers a review with consent. The kernel
+check binds the ESP to the authenticated manifest; the remaining payloads
+are td-boot's to verify as it publishes them. The execution's own path past
+the loop attach, which unprivileged tests cannot reach, is
+`qemu-install-system`'s: the guest drives the service as root and boots the
+disk it installed.
 
 ### Full-system volume consumers
 

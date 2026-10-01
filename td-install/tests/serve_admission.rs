@@ -1,7 +1,7 @@
 //! `td-install serve` refuses a misplaced start before sending a byte.
 //!
 //! A SUBPROCESS test, because admission reads the real process's effective
-//! uid and descriptor 0; the unit tests inject both.
+//! uid and descriptors 0 and 1; the unit tests inject all three.
 
 use std::error::Error;
 use std::io::Read;
@@ -14,11 +14,12 @@ type Res<T> = Result<T, Box<dyn Error>>;
 
 const BIN: &str = env!("CARGO_BIN_EXE_td-install");
 
-/// Run `serve` with `stdin`; return its result and every byte it sent back
-/// on `peer`, once its side of the channel is closed.
+/// Run `serve` with `stdin` and `stdout`; return its result and every byte
+/// it sent back on `peer`, once its side of the channel is closed.
 fn serve(
     operands: &[String],
     stdin: Stdio,
+    stdout: Stdio,
     peer: Option<&mut UnixStream>,
 ) -> Res<(Output, Vec<u8>)> {
     let output = {
@@ -26,7 +27,7 @@ fn serve(
             .arg("serve")
             .args(operands)
             .stdin(stdin)
-            .stdout(Stdio::null())
+            .stdout(stdout)
             .stderr(Stdio::piped())
             .spawn()?;
         if let Some(peer) = &peer {
@@ -59,7 +60,7 @@ fn a_misplaced_serve_exits_without_a_byte() -> Res<()> {
 
     let mut misplaced = operands.clone();
     misplaced[4] = directory.clone();
-    let (output, _) = serve(&misplaced, Stdio::null(), None)?;
+    let (output, _) = serve(&misplaced, Stdio::null(), Stdio::null(), None)?;
     assert!(!output.status.success(), "{output:?}");
     assert!(
         String::from_utf8_lossy(&output.stderr)
@@ -73,6 +74,7 @@ fn a_misplaced_serve_exits_without_a_byte() -> Res<()> {
     let (output, sent) = serve(
         &missing,
         Stdio::from(OwnedFd::from(theirs)),
+        Stdio::null(),
         Some(&mut ours),
     )?;
     assert!(!output.status.success(), "{output:?}");
@@ -80,7 +82,7 @@ fn a_misplaced_serve_exits_without_a_byte() -> Res<()> {
     assert!(sent.is_empty());
 
     let root = std::fs::metadata("/proc/self")?.uid() == 0;
-    let (output, _) = serve(&operands, Stdio::null(), None)?;
+    let (output, _) = serve(&operands, Stdio::null(), Stdio::null(), None)?;
     assert!(!output.status.success(), "{output:?}");
     let expected = if root {
         "serve requires its installer channel on stdin"
@@ -92,10 +94,32 @@ fn a_misplaced_serve_exits_without_a_byte() -> Res<()> {
         "{output:?}"
     );
 
+    // A root start with no consent channel is refused before a byte.
     let (mut ours, theirs) = UnixStream::pair()?;
     let (output, sent) = serve(
         &operands,
         Stdio::from(OwnedFd::from(theirs)),
+        Stdio::null(),
+        Some(&mut ours),
+    )?;
+    assert!(!output.status.success(), "{output:?}");
+    assert!(sent.is_empty(), "{sent:?}");
+    let expected = if root {
+        "serve requires its consent channel on stdout"
+    } else {
+        "serve requires the installation authority"
+    };
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(expected),
+        "{output:?}"
+    );
+
+    let (mut ours, theirs) = UnixStream::pair()?;
+    let (_authority, consent) = UnixStream::pair()?;
+    let (output, sent) = serve(
+        &operands,
+        Stdio::from(OwnedFd::from(theirs)),
+        Stdio::from(OwnedFd::from(consent)),
         Some(&mut ours),
     )?;
     assert!(!output.status.success(), "{output:?}");

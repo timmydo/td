@@ -1461,14 +1461,12 @@ ended or finished-failed report, or the service retiring, fails it; without
 commit nothing completes it. Closing the screen after commit revokes
 nothing.
 
-On failed-generation teardown td-authd kills the service and any retired
-one and waits for each, before secret-session cleanup, and removes its
-socket; unlike an update helper's, a wait error goes unreported. A
-service stopped while writing leaves the disk incomplete; td-install's
-failure semantics and td-svc's authority cgroup containment apply as for
-an update. Until td-install opens the channel, the
-service never sends a review, so selection always answers 99 00 in
-production.
+On failed-generation teardown td-authd kills the service and any retired one
+and waits for each, before secret-session cleanup, and removes its socket;
+unlike an update helper's, a wait error goes unreported. A service stopped
+while writing leaves the disk incomplete; td-install's failure semantics and
+td-svc's authority cgroup containment apply as for an update. td-install
+opens the channel, so a review a live boot's installer holds is selectable.
 
 The host-only launch VM fixture also accepts `--run-taskmgr-vm`, followed
 by the ordinary kernel/authd/firstboot/login/busybox inputs, compositor,

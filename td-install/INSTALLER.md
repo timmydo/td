@@ -46,13 +46,15 @@ UNSAFE.md authorization. No browser, webview or HTTP service is required.
 The UI runs without disk-writing privileges. A root-owned installation
 service admits only typed installation operations over a private local
 channel. The UI cannot select executables, shell commands, arbitrary paths,
-mount options or a different deployment source. The live profile grants
-only the paired installer session access to this service. This authority
-does not depend on `su`, empty passwords, or a reusable elevation grant.
+mount options or a different deployment source. The live profile is to grant
+only the paired installer session access to this service; until the wizard
+ships (increment 6) td-authd admits any peer of the session's user
+(td-authd/DESIGN.md "Whole-disk installation intake"). This authority does
+not depend on `su`, empty passwords, or a reusable elevation grant.
 Compositor-owned trusted consent must bind destructive execution to the
 exact reviewed request under the existing elevation contract; ordinary
-client pixels or synthetic input are not authorization evidence. The
-typed operations are specified in "Installation service protocol".
+client pixels or synthetic input are not authorization evidence. The typed
+operations are specified in "Installation service protocol".
 
 The `td-setup` front end has a source-built static target recipe and
 `td-setup-test` realized-output check. The recipe stages its own tree with
@@ -209,15 +211,15 @@ boot artifacts, and settings publication. A queued request is not success.
 
 The raw `td-install format` command coordinates preparation and both
 filesystem writes through one held destination. Its exact interface and
-limits are in DESIGN.md's coordinated raw formatting contract. The QEMU
-fixture uses it after read-only source validation. Scratch preparation
-must succeed before the first GPT write. The optical/USB scratch-exhaustion
-oracle constrains the live formatter's private staging tmpfs to 64 KiB,
-verifies that mount size, requires a failed mkfs image-zeroing operation
-and an independent scratch ENOSPC probe, and checks every destination byte
-remains unchanged. This is a refusal test, not a scratch-size estimator.
-This command does not activate the service or provide the review/consent
-sequence.
+limits are in DESIGN.md's coordinated raw formatting contract. The small
+QEMU oracle uses it after read-only source validation; the full-system
+oracle installs through the service. Scratch preparation must succeed before
+the first GPT write. The optical/USB scratch-exhaustion oracle constrains
+the live formatter's private staging tmpfs to 64 KiB, verifies that mount
+size, requires a failed mkfs image-zeroing operation and an independent
+scratch ENOSPC probe, and checks every destination byte remains unchanged.
+This is a refusal test, not a scratch-size estimator. This command does not
+activate the service or provide the review/consent sequence.
 
 ## Immutable review data
 
@@ -318,13 +320,13 @@ authenticates it under its claim, requires it to be the deployment the
 running root was authenticated as, so that the choices it checks against
 that root and its time zone catalog are checked against the source, refuses
 a disk that cannot hold its payloads and retains the value. td-authd starts
-it on a live boot, but it opens no consent channel yet. Execution must
-require fresh trusted consent bound to that whole value and revalidate the
-selected disk under a retained exclusive claim. Neither matching plan bytes
-nor possession of the nonce grants consent. No public request, reconnect or
-service restart may silently retry erasure. This increment does not connect
-the value to the existing update-only consent operation or activate a
-whole-disk service or wizard action.
+it on a live boot and answers its consent channel. Execution requires fresh
+trusted consent bound to that whole value and revalidates the selected disk
+under a retained exclusive claim. Neither matching plan bytes nor possession
+of the nonce grants consent. No public request, reconnect or service restart
+may silently retry erasure. The live profile does not yet start the wizard
+(increment 6), so a live boot's installer is whatever UID-1000 peer td-authd
+admits, and erasure still needs the person's physical consent.
 
 ## Installation service protocol
 
@@ -439,21 +441,24 @@ destructive operation after a reconnect or restart.
 <verified-root> <td-firstboot>` is the service core for one installer. Its
 five operands are absolute control-plane inputs bound by its caller, never
 by the installer, and must be present and of their kind: `td-boot` and
-`td-firstboot` executable files, the deployment directory and verified
-root directories, the key a file. It requires effective uid 0 (a sanity
-gate against a misplaced start, not proof of privilege) and a connected
-Unix stream socket on standard input, found as such in `/proc/net/unix`,
-since a datagram or sequenced-packet peer would truncate frames and need
-not close. That table lists only serve's own network namespace, so its
-caller must create the socket there, and every row naming the socket must
-agree, since a bound name can forge one. It clears an inherited
-non-blocking flag, and refuses before sending a byte otherwise. It then
-speaks the installation service protocol on that socket until the peer
-closes between frames, and exits; a malformed frame or message ends it
-without a reply. Until an installation starts, the review and its claim
-end with the installer's channel; a started installation runs to its
-finished report first. td-authd starts it for each installer on a live
-boot (td-authd/DESIGN.md "Whole-disk installation intake").
+`td-firstboot` executable files, the deployment directory and verified root
+directories, the key a file. It requires effective uid 0 (a sanity gate
+against a misplaced start, not proof of privilege), the installer's channel
+on standard input and td-authd's consent channel on standard output: each a
+connected Unix stream socket, found as such in `/proc/net/unix`, since a
+datagram or sequenced-packet peer would truncate frames and need not close,
+and not one socket on both. That table lists only serve's own network
+namespace, so its caller must create the sockets there, and every row naming
+a socket must agree, since a bound name can forge one. It clears an
+inherited non-blocking flag on each, and refuses before sending a byte
+otherwise. Nothing it runs writes to standard output: every child's is
+captured or null. It then speaks the installation service protocol on
+standard input until the peer closes between frames, and exits; a malformed
+frame or message ends it without a reply. Until an installation starts, the
+review and its claim end with the installer's channel; a started
+installation runs to its finished report first. td-authd starts it for each
+installer on a live boot (td-authd/DESIGN.md "Whole-disk installation
+intake").
 
 It holds at most one review, under the admission rules above. Propose
 checks, in order: busy; the settings (the username through `td-firstboot
@@ -504,18 +509,19 @@ read cannot queue requests; it can still repeat source authentication at
 will, which the caller that starts the service bounds.
 
 The service has an execution (DESIGN.md "Executing a consented
-installation"), but production opens no consent channel, so execute is
-refused as consent unavailable: it writes no disk byte and cannot start an
-installation. Tests drive the core's two ends with fakes and the execution
-on a regular-file disk. The service holds the source directory open for its
-life, so the medium's filesystem, and the kernel's exclusive claim on the
-disk under it, outlive even a lazy unmount, and that disk is never claimable
-as a destination; the live root, a loop over the medium's `root.erofs`,
-holds it too. The source itself is read by path, so a detached medium
-refuses: discovery first cannot place its disk, and a medium whose drive
-remains is no longer authenticated. Discovery also excludes that disk by
-name, as resolved, independently of the claim. Trusted consent remains
-required before execution.
+installation") and opens the consent channel, so an execute td-authd answers
+with consent installs. Tests drive the core's two ends with fakes and the
+execution on a regular-file disk; `qemu-install-system` drives the service
+itself as root in a guest, as both of its peers, onto a disposable disk it
+then boots (td-install-qemu-test/DESIGN.md). The service holds the source
+directory open for its life, so the medium's filesystem, and the kernel's
+exclusive claim on the disk under it, outlive even a lazy unmount, and that
+disk is never claimable as a destination; the live root, a loop over the
+medium's `root.erofs`, holds it too. The source itself is read by path, so a
+detached medium refuses: discovery first cannot place its disk, and a medium
+whose drive remains is no longer authenticated. Discovery also excludes that
+disk by name, as resolved, independently of the claim. Trusted consent
+remains required before execution.
 
 ## Installation consent channel
 
@@ -526,8 +532,8 @@ only. Both ends are root and td-authd creates the channel, so decoding
 authenticates nothing; it refuses only bytes outside the grammar. The
 service core speaks it, and td-authd opens it for the service it starts on a
 live boot (td-authd/DESIGN.md "Whole-disk installation intake") as one end
-of a socketpair on the service's standard output, but the service opens no
-channel yet.
+of a socketpair on the service's standard output, where the service opens
+it.
 
 Both ends first send and require `TDINA01\n`, which changes with any message
 or its bytes. Each message then travels in one frame: a big-endian u32
@@ -1046,7 +1052,10 @@ not discover `/etc/zoneinfo` automatically.
 5. Add bounded device discovery, immutable plans, trusted destructive
    consent and the service's installation execution. Prove refusal of
    installation media, in-use targets, stale identities, unsupported
-   destinations and invalid plans without modifying their bytes.
+   destinations and invalid plans without modifying their bytes. The
+   service opens its consent channel within this increment, proven by the
+   full-system QEMU oracle driving it as both peers; td-authd's intake and
+   the compositor's presentation keep their own tests until increment 7.
 6. Add the native wizard, target recipe and live startup integration. Use
    native compositor tests for navigation, rendering, input, errors and
    progress; fixtures cannot grant ordinary clients trusted consent.
@@ -1182,8 +1191,7 @@ raw I/O or a privileged topology writer.
 The service must bind the reviewed identity and settings in its immutable
 plan, independently resolve source backing storage, revalidate the
 selected device and retain its claim through destructive execution;
-"Installation service core" does each, short of an opened consent
-channel.
+"Installation service core" does each.
 This advisory CLI does not activate the service or provide that admission,
 consent, source verification, scratch or payload-fit checks.
 

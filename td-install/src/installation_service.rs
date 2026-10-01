@@ -2,9 +2,8 @@
 //! answered under INSTALLER.md "Installation service protocol" over one
 //! stream, with consent sought over the channel of "Installation consent
 //! channel". Execution runs on its own thread through an `Execute`;
-//! production's is `main.rs`'s `LiveExecution`, but it opens no consent
-//! channel yet, and without one execute is refused as consent unavailable
-//! once the held disk rechecks.
+//! production's is `main.rs`'s `LiveExecution`. Without a consent channel
+//! execute is refused as consent unavailable once the held disk rechecks.
 
 use std::io::{self, Read, Write};
 use std::net::Shutdown;

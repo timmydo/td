@@ -4,7 +4,10 @@ This crate is a diagnostic PID-1 program for `td-recipe-eval qemu-install`
 and the live installation phase of `qemu-install-system`.
 It is built from source through the ordinary Rust ladder and is never packed
 in the system or graphical installer profile. It adds no user-facing device
-admission, destructive consent, account configuration or signing identity.
+admission, account configuration or signing identity. In
+`qemu-install-system` it is td-authd's end of the installation service's
+consent channel and consents to the review it is sent: a stand-in for a
+person's physical consent inside this disposable guest only.
 
 The host oracle exclusively creates each sparse target inside its private
 scratch directory and exposes it as a writable virtio, AHCI or NVMe disk
@@ -24,19 +27,25 @@ terminate the VM at the deadline.
 
 The complete crate tree is a `local_source` input, declaration-pinned by
 seed/local-source-roster.txt and re-derived live from the checkout on every
-run (`DEVELOPMENT.md` "Ready"). It is not a production system input.
+run (`DEVELOPMENT.md` "Ready"). It is not a production system input. The
+recipe writes td-install's three protocol codec files beside that tree, as
+td-authd's recipe writes the consent codec, and the fixture compiles them
+through `#[path]`, so it speaks the service's protocols with the service's
+own code.
 
 The live initramfs holds source-built tools and the public trust root. The
 tiny signed deployment and fixed selector are streamed into separate ISO
 files. Boot files and tools read into the fixture initramfs are bounded at
 256 MiB. The shared composer accepts larger ISO payloads under MEDIA.md,
 while the full-system diagnostic supplies the built system deployment. The
-private key remains on the host outside derivations. Ordinary installation
-calls the actual td-install format coordinator, which publishes through
-td-boot's verified install onto a loop over its own claim (td-install/DESIGN.md
-"Publishing through a loop over the claim"). Its success marker follows
-formatting and publication, a check that no loop device was left bound,
-partition refresh and sync.
+private key remains on the host outside derivations. The small oracle's
+installations call the actual td-install format coordinator, which
+publishes through td-boot's verified install onto a loop over its own claim
+(td-install/DESIGN.md "Publishing through a loop over the claim"); the
+full-system installation runs the installation service instead
+("Installation through the service"). Either success marker follows
+installation, a check that no loop device was left bound, partition refresh
+and sync.
 
 Before any layout write, the guest polls for thirty seconds among exactly
 three fixed candidate paths: /dev/sr0 (SATA optical) and /dev/sda or
@@ -156,26 +165,26 @@ evidence of a busy device.
 The live guest supplies `--trusted-key` to `td-install format` instead of
 the three staged-publishing operands, and on its ordinary legs `--publish
 /bin/td-boot /source /volume`. The formatter initializes the publication
-directories and key without staging a deployment or selector, then
-publishes through a loop over its claim with the same read-only live public
-key before it exits. The guest requires the set of bound loop devices to be
-the same before and after, so the loop cleared. The fixture requires empty
-staged boot, deployment and incoming directories, plus only the expected
-timezone, hostname and (for the full system) username settings beneath
-@var, then deletes its entire private scratch directory after partition
-refresh. The interrupted leg formats without `--publish` and, after
-partition refresh, calls `td-boot install` with the resolved partition,
-/source and the key, which it then interrupts. Successful publication and
-sync precede the direct-publication and installation markers; the host
-requires both. The full cold-boot oracle still proves the expected
-deployment is installed. The separate full-system diagnostic checks its
-installed desktop under a RAM ceiling. Neither diagnostic admits operator
-target capacity.
+directories and key without staging a deployment or selector, then publishes
+through a loop over its claim with the same read-only live public key before
+it exits. The guest requires the set of bound loop devices to be the same
+before and after, so the loop cleared. The fixture requires empty staged
+boot, deployment and incoming directories, plus only the expected timezone
+and hostname settings beneath @var, then deletes its entire private scratch
+directory after partition refresh. The interrupted leg formats without
+`--publish` and, after partition refresh, calls `td-boot install` with the
+resolved partition, /source and the key, which it then interrupts.
+Successful publication and sync precede the direct-publication and
+installation markers; the host requires both. The full cold-boot oracle
+still proves the expected deployment is installed. The separate full-system
+diagnostic checks its installed desktop under a RAM ceiling. Neither
+diagnostic admits operator target capacity.
 
 The fixture supplies `--timezone Europe/London --hostname td-qemu-installed`
-to the volume formatter. It checks exact mode-0644 regular saved files in
-the staged @var, again after mounting the published full-system volume,
-and on both small-fixture cold boots. The full-system host oracle requires
+to the volume formatter, and the same choices in the service's review. It
+checks exact mode-0644 regular saved files in the formatter's staged @var,
+after mounting the published full-system volume, and on both small-fixture
+cold boots. The full-system host oracle requires
 exactly one `TD-HOSTNAME-READY td-qemu-installed` line on every installed
 boot, including the additional application-evidence boot. That production
 marker follows setting and reading back the kernel hostname; merely
@@ -183,19 +192,51 @@ saving the file cannot satisfy it.
 
 The full-system profile also chooses `alice`. After authenticating all ISO
 payloads, it read-only loop-mounts the signed EROFS and runs the source-built
-`td-firstboot check-primary-name` before layout. Volume repeats admission
-through `--username alice /root-image /bin/td-firstboot`; the verified source
-remains stable on read-only media. The fixture checks the exact mode-0644
-saved file in staged and mounted @var. Every installed full-system boot must
+`td-firstboot check-primary-name` before layout. The service repeats
+admission against `/root-image` with the same td-firstboot; the verified
+source remains stable on read-only media. The fixture checks the exact
+mode-0644 saved file in the mounted @var. Every installed full-system boot must
 report exactly one `TD-PRIMARY-PROFILE-READY alice`, after production account
 publication and home preparation. The existing SSH, terminal, ownership and
 application probes then run as that account. The live fixture unmounts
-its temporary EROFS view after formatting, retaining the read-only loop
+its temporary EROFS view after installing, retaining the read-only loop
 binding until its VM ends. That phase neither reuses loop0 nor unmounts
 the source; installed boots start in a fresh kernel. The tiny sentinel
 deployment has no account database and keeps its existing settings and
 boot protocol.
 This is a fixed diagnostic choice, not an operator account-configuration UI.
+
+### Installation through the service
+
+The full-system installation is td-install's installation service as
+td-authd starts it on a live boot, run as root with an empty environment and
+`/` as its directory: `td-install serve /bin/td-boot /media /trusted.pub
+/root-image /bin/td-firstboot`, the installer's channel on its standard
+input and the consent channel on its standard output, each one end of a
+socketpair whose other end the fixture holds. The source is the ISO mount
+itself, in the medium's spelling, as `/run/td-media` is. The root is the
+signed EROFS mounted above, with its `/td/store` bound at `/td/store` so
+that its absolute links, `/bin/mkfs.btrfs` among them, resolve as on a live
+root. The fixture writes `/run/td-deployment`, mode 0600, with the ID it
+validated, standing in for the record a live boot's init leaves; the service
+admits only the deployment it names. The service's td-boot, td-install and
+td-firstboot, and the time zone catalog at `/etc/zoneinfo`, are the
+fixture's own, the same recipe outputs the image carries.
+
+The fixture greets both channels, then asks for destinations, which must
+list the target and not the media disk. It proposes the target with the
+fixed settings and the `us` keyboard. The review must be of the validated
+deployment and the proposed disk. Execute must answer awaiting consent, and
+the consent channel's review must carry the review's nonce, the disk's
+name and capacity, the hostname, the username and the deployment. The
+fixture consents and requires the started report, polls status every half
+second until complete, requiring the phases it sees in order, and requires
+the finished-complete report. It then closes both channels. The service
+must exit successfully, leave no `td-install-` workspace in `/run`, and
+leave the bound loops as they were. The fixture prints `TD-INSTALL-SERVED`
+with the review's volume UUID and the device, and the host requires that
+line for the identity it reads from the image. Partition refresh, the
+busy refusals, preview, settings and seeding follow as on the format path.
 
 The host then detaches media and cold-boots the destination through
 firmware. The selector emits read-only discovery evidence for its configured

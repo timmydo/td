@@ -228,12 +228,13 @@ pub fn split_target_debug(root: &str) -> Step {
 /// A td-owned program built by direct rustc from a `local_source` tree of the
 /// checkout named `name` (td-install-qemu-test; the two applications it once
 /// built draw through td-ui and are Cargo builds now, APPLICATIONS.md §W.8)
-/// and linked static exactly as td-sh is. The interned tree is copied under
-/// `{src}` before the compile so its paths remap to `/td-build` as every
-/// other direct recipe's do; rustc reads `src/main.rs` and resolves each
-/// `mod` from the tree beside it, so unlike the `include_str!` recipes this
-/// one carries no module roster to keep in step with the crate.
-pub fn static_local_source_program(name: &str) -> Recipe {
+/// and linked static exactly as td-sh is. The interned tree is copied to
+/// `{src}/<name>` before the compile so its paths remap to `/td-build` as
+/// every other direct recipe's do; rustc reads `src/main.rs` and resolves
+/// each `mod` from the tree beside it. `shared` is the other crates' source
+/// its `#[path]` modules name, as (`{src}/<repo-relative path>`, contents),
+/// staged where the include resolves as td-authd's are.
+pub fn static_local_source_program(name: &str, shared: &[(&str, &str)]) -> Recipe {
     // The self-hosted toolchains install under a nested stage/td/store/<pkg>
     // DESTDIR (re the /td/store prefix); rust-toolchain installs flat.
     let rustc = "{in:rust-toolchain}/bin/rustc";
@@ -254,15 +255,30 @@ pub fn static_local_source_program(name: &str) -> Recipe {
     let path = format!("{bbin}:{gccbin}");
     let source = format!("{{in:{name}-source}}");
     let binary = format!("{{out}}/bin/{name}");
+    let main = format!("{{src}}/{name}/src/main.rs");
 
-    let steps = vec![
+    let mut steps = vec![
         Step::MkDir {
             path: "{out}/bin".into(),
         },
         Step::CopyTree {
             from: source,
-            dest: "{src}".into(),
+            dest: format!("{{src}}/{name}"),
         },
+    ];
+    for (path, content) in shared {
+        if let Some((directory, _)) = path.rsplit_once('/') {
+            steps.push(Step::MkDir {
+                path: directory.into(),
+            });
+        }
+        steps.push(Step::WriteFile {
+            path: (*path).into(),
+            content: (*content).into(),
+            exec: false,
+        });
+    }
+    steps.extend([
         Step::MkDir {
             path: "{root}/eh".into(),
         },
@@ -296,7 +312,7 @@ pub fn static_local_source_program(name: &str) -> Recipe {
                 "-Clink-arg=-static-libgcc",
                 "-o",
                 &binary,
-                "{src}/src/main.rs",
+                &main,
             ],
         )
         .env("PATH", &path)
@@ -310,7 +326,7 @@ pub fn static_local_source_program(name: &str) -> Recipe {
         // nothing the jail shows.
         split_target_debug("{out}"),
         Step::assert_static(&[&binary]),
-    ];
+    ]);
 
     Recipe::mesboot(name, "0.1")
         .local_source(name)
