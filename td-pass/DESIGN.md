@@ -129,6 +129,23 @@ standalone. No refusal falls back to the other mode.
   revoked. The window refuses to revoke every key. It names keys by
   their place in the list the vault thread last gave it; the thread
   holds their credentials.
+- **Copies.** In the keys view Export (Ctrl+E) opens td-ui's finder on
+  folders, from `$HOME`; Ctrl+Return writes the notebook's encrypted
+  copy, the authenticated ciphertext of the revision the session holds,
+  into the listed folder as `td-pass-notebook-r<revision>.tdpass`: a
+  new file, mode 0600, never written over an existing file, synced, and
+  its folder synced where the folder allows it. A failed write empties
+  the partial copy and removes its name only while that name is still
+  the file made. On an account holding no notebook, Import (Ctrl+O)
+  opens the finder on files, offering only those no larger than a copy
+  can be. The vault thread checks that the chosen path is a file, opens
+  it without waiting on a FIFO, reads it to that bound and lists the
+  keys it opens with; the copy is imported with the one chosen, through
+  the prompt, and td-secret authenticates it whole before placing it.
+  Folders are listed on a thread of their own, to the finder's bounds,
+  so a slow folder never holds the window; Ctrl+L, or a press outside
+  the finder, closes it and acts. Only ciphertext and listings cross
+  `src/files.rs`.
 - **Prompt.** A presentation asks for the named key to be connected; a
   PIN request shows a masked field that refuses copy. The instruction
   names the key before the operation, so a narrow row cuts the
@@ -156,18 +173,26 @@ the refusal to revoke every key, marks that a held Space does not
 flicker, lock during a key operation, a failure's report kept past the
 view, the unsaved edits and focus kept under the view, the lists given
 their keys when the window grows, and painting the notebook, its keys
-view, its prompt and dialogs and each locked view. The vault thread's
-tests pin that a prompt takes only its operation's answer, that cancel
-declines once and that a key command without an open notebook is
-refused; the frame directory's, the mount table's rules. Confinement
+view, its prompt and dialogs and each locked view, export into the
+folder the finder accepts, import of a chosen copy with one of its keys,
+a copy given up or unread, the finder painted, filtered and closed by
+Ctrl+L or the strip's Lock, and a listing for a closed finder dropped.
+The vault thread's tests pin that a prompt takes only its operation's
+answer, that cancel declines once and that a key command without an open
+notebook is refused, as are a copy that cannot be read and an export or
+import without a notebook; the files' tests that a copy is written new
+and private, never over another, and read to its bound, and how folders
+are listed; the frame directory's, the mount table's rules. Confinement
 tests pin the source inventory, that pure files reach no system, vault
 or compositor and only the toolkit's drawing, widget and editor modules,
 that td-secret is named only by the vault thread and the worker
-dispatch, the two reads the window makes, and the vault-document policy.
+dispatch, the two reads the window makes itself, that it lists folders
+only through `src/files.rs`, that pure files call no path method that
+reaches the file system, that copies are written and read only through
+`src/files.rs` in those ways, and the vault-document policy.
 
-Not yet: encrypted import and export, the native compositor cases, host
-lock and suspend integration, td mode, and the recipe and image
-integration of increment 5.
+Not yet: the native compositor cases, host lock and suspend integration,
+td mode, and the recipe and image integration of increment 5.
 
 ## Delivery and proof
 

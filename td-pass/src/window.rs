@@ -3,7 +3,9 @@
 //! commands to the vault's thread and its answers back to the app.
 
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
 
+use td_ui::finder;
 use td_ui::raster::{Raster, Surface};
 use td_ui::window::{Clipboard, Flow, Handler, Input};
 
@@ -17,6 +19,54 @@ const POLL_MS: u64 = 50;
 struct Session {
     app: App,
     client: Client,
+    lister: Sender<Ask>,
+    listings: Receiver<Listed>,
+}
+
+/// A folder the finder asked for.
+struct Ask {
+    chooser: u64,
+    folder: Option<PathBuf>,
+    select: Option<String>,
+    files: bool,
+}
+
+/// The answer: the folder listed, its listing or why not, and the entry
+/// to select.
+struct Listed {
+    chooser: u64,
+    folder: PathBuf,
+    listing: Result<finder::Listing, String>,
+    select: Option<String>,
+}
+
+/// Lists folders for the finder on a thread of its own, so a folder slow
+/// to read (a network or automounted one) never holds the window: it can
+/// still lock. The thread ends when the window's end is dropped; one
+/// stuck in a read is left to the process's exit.
+fn start_lister() -> Result<(Sender<Ask>, Receiver<Listed>), String> {
+    let (asks, ask_rx) = mpsc::channel::<Ask>();
+    let (listed, listings) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("lister".to_owned())
+        .spawn(move || {
+            while let Ok(ask) = ask_rx.recv() {
+                let folder = ask.folder.unwrap_or_else(crate::files::start_folder);
+                let ceiling = ask.files.then_some(crate::protocol::MAX_COPY as u64);
+                let listing = crate::files::list_folder(&folder, ceiling);
+                let answer = Listed {
+                    chooser: ask.chooser,
+                    folder,
+                    listing,
+                    select: ask.select,
+                };
+                if listed.send(answer).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| format!("td-pass cannot start its folder lister: {error}"))?;
+    Ok((asks, listings))
 }
 
 impl Session {
@@ -26,6 +76,21 @@ impl Session {
                 Out::Send(command) => self.client.send(command),
                 Out::Answer(op, answer) => self.client.answer(op, answer),
                 Out::Cancel => self.client.cancel(),
+                Out::List {
+                    chooser,
+                    folder,
+                    select,
+                    files,
+                } => {
+                    // A lister that is gone answers nothing; the finder
+                    // shows what it has.
+                    let _ = self.lister.send(Ask {
+                        chooser,
+                        folder,
+                        select,
+                        files,
+                    });
+                }
             }
         }
         if self.app.quitting() {
@@ -55,6 +120,14 @@ impl Handler for Session {
     fn poll(&mut self, now: u64) -> Flow {
         while let Some(reply) = self.client.try_recv() {
             self.app.reply(reply);
+        }
+        while let Ok(listed) = self.listings.try_recv() {
+            self.app.listed(
+                listed.chooser,
+                listed.folder,
+                listed.listing,
+                listed.select.as_deref(),
+            );
         }
         self.app.tick(now);
         self.flush()
@@ -116,9 +189,12 @@ pub fn run() -> Result<(), String> {
         std::env::var_os("XDG_RUNTIME_DIR"),
     )?;
     let stream = td_ui::wayland::connect(endpoint)?;
+    let (lister, listings) = start_lister()?;
     let mut session = Session {
         app: App::new()?,
         client: crate::backend::start()?,
+        lister,
+        listings,
     };
     let typeface = td_ui::pinned_face::load_or_note(
         "td-pass",

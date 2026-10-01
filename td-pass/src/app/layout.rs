@@ -8,8 +8,16 @@ use td_ui::raster::{Rect, Surface};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
 pub const NOTEBOOK: [&str; 7] = ["New", "Rename", "Delete", "Save", "Find", "Keys", "Lock"];
-pub const KEYS: [&str; 5] = ["Notebook", "Use for saves", "Add backup", "Replace", "Lock"];
-pub const LOCKED: [&str; 2] = ["Unlock", "Create"];
+pub const KEYS: [&str; 6] = [
+    "Notebook",
+    "Use for saves",
+    "Add backup",
+    "Replace",
+    "Export",
+    "Lock",
+];
+pub const LOCKED: [&str; 3] = ["Unlock", "Create", "Import"];
+pub const IMPORT: [&str; 2] = ["Import", "Cancel"];
 pub const PRESENT: [&str; 2] = ["Continue", "Cancel"];
 pub const PIN: [&str; 2] = ["OK", "Cancel"];
 
@@ -105,6 +113,25 @@ pub fn keys(surface: Surface) -> Option<List> {
 /// The unlocked notebook's keys view, laid out as the locked view.
 pub fn enrolled(surface: Surface) -> Option<List> {
     listing(surface, &KEYS)
+}
+
+/// The keys an encrypted copy opens with, laid out as the locked view.
+pub fn copy_keys(surface: Surface) -> Option<List> {
+    listing(surface, &IMPORT)
+}
+
+/// The finder: the body under the strip it was opened from, the locked
+/// view's for an import and the keys view's for an export, a cell in
+/// from each side.
+pub fn finder(surface: Surface, import: bool) -> Rect {
+    let body = body(surface, if import { &LOCKED } else { &KEYS });
+    let cell = cell(surface);
+    rect(
+        cell,
+        body.y,
+        (surface.width as i64) - 2 * cell,
+        i64::from(body.height),
+    )
 }
 
 fn listing(surface: Surface, labels: &'static [&'static str]) -> Option<List> {

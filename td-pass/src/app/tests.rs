@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::protocol::Role;
+use std::path::PathBuf;
 use td_ui::window::Refusal;
 
 /// A clipboard that records what it is offered and answers pastes.
@@ -76,7 +77,10 @@ fn op_of(out: &[Out]) -> Op {
                 | Command::Apply { op, .. }
                 | Command::UseKey { op, .. }
                 | Command::AddKey { op }
-                | Command::ReplaceKeys { op, .. },
+                | Command::ReplaceKeys { op, .. }
+                | Command::Export { op, .. }
+                | Command::ReadCopy { op, .. }
+                | Command::Import { op, .. },
             ) => Some(*op),
             _ => None,
         })
@@ -1297,4 +1301,374 @@ fn an_operation_ending_under_the_keys_view_moves_the_focus_it_returns() {
     assert_eq!(app.focus, Focus::Keys, "the view keeps the keys");
     key(&mut app, &mut board, "Escape");
     assert_eq!(app.focus, Focus::List, "not the closed entry's pane");
+}
+
+/// A listing of `folders` then `files`, each file enabled.
+fn listing(path: &str, folders: &[&str], files: &[&str]) -> finder::Listing {
+    let entries = folders
+        .iter()
+        .map(|name| finder::Entry::new(name, "", finder::Kind::Folder, true).unwrap())
+        .chain(
+            files
+                .iter()
+                .map(|name| finder::Entry::new(name, "1 KiB", finder::Kind::File, true).unwrap()),
+        )
+        .collect();
+    finder::Listing::new(path, entries, false).unwrap()
+}
+
+/// The open finder's number, for its listings.
+fn chooser_id(app: &App) -> u64 {
+    app.chooser.as_ref().map_or(0, |chooser| chooser.id)
+}
+
+/// The one listing the app asks for, as (folder, select, files).
+fn asked(app: &mut App) -> (Option<PathBuf>, Option<String>, bool) {
+    match app.take_out().into_iter().next() {
+        Some(Out::List {
+            folder,
+            select,
+            files,
+            ..
+        }) => (folder, select, files),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn export_writes_into_the_folder_the_finder_accepts() {
+    let mut board = Board::default();
+    let mut app = keys_view(&mut board);
+    key(&mut app, &mut board, "C-e");
+    assert_eq!(asked(&mut app), (None, None, false));
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/home/u"),
+        Ok(listing("/home/u", &["docs"], &["notes.txt"])),
+        None,
+    );
+    assert!(app.chooser.as_ref().unwrap().finder.is_some());
+    // Return opens the selected folder; Alt+Up goes back, the folder
+    // left selected.
+    key(&mut app, &mut board, "Return");
+    assert_eq!(
+        asked(&mut app),
+        (Some(PathBuf::from("/home/u/docs")), None, false)
+    );
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/home/u/docs"),
+        Ok(listing("/home/u/docs", &[], &[])),
+        None,
+    );
+    key(&mut app, &mut board, "M-Up");
+    assert_eq!(
+        asked(&mut app),
+        (
+            Some(PathBuf::from("/home/u")),
+            Some("docs".to_owned()),
+            false
+        )
+    );
+    // A folder that cannot be read is noted and the finder stays.
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/home/u"),
+        Err("denied".to_owned()),
+        None,
+    );
+    assert!(app.chooser.is_some());
+    // Ctrl+Return exports into the listed folder.
+    key(&mut app, &mut board, "C-Return");
+    assert!(app.chooser.is_none());
+    let out = app.take_out();
+    let op = match &out[..] {
+        [Out::Send(Command::Export { op, folder })] => {
+            assert_eq!(folder, &PathBuf::from("/home/u/docs"));
+            *op
+        }
+        other => panic!("{other:?}"),
+    };
+    app.reply(Reply::Exported {
+        op,
+        path: "/home/u/docs/td-pass-notebook-r3.tdpass".to_owned(),
+    });
+    assert!(app.busy.is_none());
+    assert_eq!(
+        app.status,
+        "Exported an encrypted copy to /home/u/docs/td-pass-notebook-r3.tdpass"
+    );
+}
+
+/// An app whose account holds no notebook.
+fn empty() -> App {
+    let mut app = App::new().unwrap();
+    app.take_out();
+    app.reply(Reply::Opened { keys: None });
+    app
+}
+
+#[test]
+fn import_reads_the_chosen_copy_then_places_it_with_one_of_its_keys() {
+    let mut board = Board::default();
+    let mut app = empty();
+    key(&mut app, &mut board, "C-o");
+    assert_eq!(asked(&mut app), (None, None, true));
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/media/usb"),
+        Ok(listing("/media/usb", &[], &["copy.tdpass"])),
+        None,
+    );
+    key(&mut app, &mut board, "Return");
+    let out = app.take_out();
+    let op = match &out[..] {
+        [Out::Send(Command::ReadCopy { op, path })] => {
+            assert_eq!(path, &PathBuf::from("/media/usb/copy.tdpass"));
+            *op
+        }
+        other => panic!("{other:?}"),
+    };
+    app.reply(Reply::Copy {
+        op,
+        keys: two_keys().labels,
+    });
+    assert!(matches!(app.phase, Phase::Importing { .. }));
+    key(&mut app, &mut board, "Down");
+    key(&mut app, &mut board, "Return");
+    let out = app.take_out();
+    assert!(matches!(
+        out[..],
+        [Out::Send(Command::Import { key: 1, .. })]
+    ));
+    let op = op_of(&out);
+    app.reply(Reply::Ask {
+        op,
+        ask: Ask {
+            operation: "import a portable vault copy into this empty location",
+            role: Role::Backup,
+            key: Some("01020304".to_owned()),
+            pin: Some(PinUse::Authorize),
+        },
+    });
+    typed(&mut app, &mut board, "1234");
+    key(&mut app, &mut board, "Return");
+    assert!(matches!(app.take_out()[..], [Out::Answer(o, Answer::Pin(_))] if o == op));
+    app.reply(Reply::Unlocked {
+        op,
+        entries: vec![item(1, "Bank")],
+        keys: two_keys(),
+    });
+    assert!(matches!(app.phase, Phase::Unlocked(_)));
+    assert_eq!(notebook(&app).entries.len(), 1);
+}
+
+#[test]
+fn a_copy_given_up_or_unread_leaves_the_account_without_a_notebook() {
+    let mut board = Board::default();
+    let mut app = empty();
+    // Escape before any listing closes the finder.
+    key(&mut app, &mut board, "C-o");
+    app.take_out();
+    key(&mut app, &mut board, "Escape");
+    assert!(app.chooser.is_none());
+    // A start folder that cannot be read closes it with the reason.
+    key(&mut app, &mut board, "C-o");
+    app.take_out();
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/"),
+        Err("/: denied".to_owned()),
+        None,
+    );
+    assert!(app.chooser.is_none());
+    assert_eq!(app.status, "/: denied");
+    // A copy that cannot be read is reported; the account stays empty.
+    key(&mut app, &mut board, "C-o");
+    app.take_out();
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/m"),
+        Ok(listing("/m", &[], &["bad"])),
+        None,
+    );
+    key(&mut app, &mut board, "Return");
+    let op = op_of_read(&app.take_out());
+    app.reply(Reply::Failed {
+        op,
+        failure: Failure {
+            text: "not a portable vault".to_owned(),
+            stale: false,
+            uncertain: false,
+            cancelled: false,
+        },
+    });
+    assert!(matches!(app.phase, Phase::Locked { keys: None, .. }));
+    assert_eq!(app.status, "not a portable vault");
+    // A copy read and then given up goes back to the empty account.
+    key(&mut app, &mut board, "C-o");
+    app.take_out();
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/m"),
+        Ok(listing("/m", &[], &["good"])),
+        None,
+    );
+    key(&mut app, &mut board, "Return");
+    let op = op_of_read(&app.take_out());
+    app.reply(Reply::Copy {
+        op,
+        keys: two_keys().labels,
+    });
+    key(&mut app, &mut board, "Escape");
+    assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
+    app.reply(Reply::Locked { keys: None });
+    assert!(matches!(app.phase, Phase::Locked { keys: None, .. }));
+    // With a notebook, Import is not offered.
+    app.reply(Reply::Locked {
+        keys: Some(two_keys().labels),
+    });
+    key(&mut app, &mut board, "C-o");
+    assert!(app.chooser.is_none());
+    assert!(app.take_out().is_empty());
+}
+
+fn op_of_read(out: &[Out]) -> Op {
+    match out {
+        [Out::Send(Command::ReadCopy { op, .. })] => *op,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn lock_closes_the_finder_and_the_finder_paints() {
+    let font = td_ui::font::pinned().unwrap();
+    let surface = Surface::new(640, 480, td_ui::raster::Scale::default()).unwrap();
+    let mut pixels = vec![0u8; 640 * 480 * 4];
+    let mut board = Board::default();
+    let mut app = keys_view(&mut board);
+    app.input(Input::Resize(surface), &mut board);
+    let mut paint = |app: &mut App| {
+        let mut raster = Raster::new(&mut pixels, &font, surface, 640 * 4).unwrap();
+        app.paint(&mut raster, surface).unwrap();
+        pixels.clone()
+    };
+    let view = paint(&mut app);
+    key(&mut app, &mut board, "C-e");
+    app.take_out();
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/home/u"),
+        Ok(listing("/home/u", &["docs"], &[])),
+        None,
+    );
+    let chooser = paint(&mut app);
+    assert_ne!(view, chooser);
+    // The finder takes typed characters as its filter, not the view's.
+    key(&mut app, &mut board, "d");
+    assert_eq!(
+        app.chooser
+            .as_ref()
+            .unwrap()
+            .finder
+            .as_ref()
+            .unwrap()
+            .query(),
+        "d"
+    );
+    // Lock is not held back by the finder.
+    key(&mut app, &mut board, "C-l");
+    assert!(app.chooser.is_none());
+    assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
+    // A listing for a finder since closed is dropped, even under a new one.
+    let mut app = empty();
+    key(&mut app, &mut board, "C-o");
+    app.take_out();
+    let first = chooser_id(&app);
+    key(&mut app, &mut board, "Escape");
+    key(&mut app, &mut board, "C-o");
+    app.take_out();
+    assert_ne!(chooser_id(&app), first);
+    app.listed(
+        first,
+        PathBuf::from("/old"),
+        Ok(listing("/old", &[], &["c"])),
+        None,
+    );
+    assert!(app.chooser.as_ref().unwrap().finder.is_none());
+    // The copy's keys paint as their own view.
+    let mut app = empty();
+    app.input(Input::Resize(surface), &mut board);
+    let locked = paint(&mut app);
+    key(&mut app, &mut board, "C-o");
+    app.take_out();
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/m"),
+        Ok(listing("/m", &[], &["c"])),
+        None,
+    );
+    key(&mut app, &mut board, "Return");
+    let op = op_of_read(&app.take_out());
+    app.reply(Reply::Copy {
+        op,
+        keys: two_keys().labels,
+    });
+    assert_ne!(paint(&mut app), locked);
+}
+
+#[test]
+fn the_strips_lock_is_not_held_back_by_the_finder() {
+    let mut board = Board::default();
+    let mut app = keys_view(&mut board);
+    key(&mut app, &mut board, "C-e");
+    app.take_out();
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/home/u"),
+        Ok(listing("/home/u", &["docs"], &[])),
+        None,
+    );
+    // A press inside the finder is the finder's.
+    let inside = layout::finder(app.surface, false);
+    press(
+        &mut app,
+        &mut board,
+        (inside.x + 8, inside.y + i64::from(inside.height) / 2),
+        false,
+    );
+    assert!(app.chooser.is_some());
+    click_button(&mut app, &mut board, &layout::KEYS, 5);
+    assert!(app.chooser.is_none());
+    assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
+}
+
+#[test]
+fn an_export_that_finishes_during_a_lock_is_reported_with_the_locked_view() {
+    let mut board = Board::default();
+    let mut app = keys_view(&mut board);
+    key(&mut app, &mut board, "C-e");
+    app.take_out();
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/home/u"),
+        Ok(listing("/home/u", &[], &[])),
+        None,
+    );
+    key(&mut app, &mut board, "C-Return");
+    let op = op_of(&app.take_out());
+    key(&mut app, &mut board, "C-l");
+    // The thread serves the export before the lock.
+    app.reply(Reply::Exported {
+        op,
+        path: "/home/u/td-pass-notebook-r1.tdpass".to_owned(),
+    });
+    app.reply(Reply::Locked {
+        keys: Some(two_keys().labels),
+    });
+    assert_eq!(
+        app.status,
+        "Exported an encrypted copy to /home/u/td-pass-notebook-r1.tdpass. \
+         Locked: choose a key and press Unlock"
+    );
 }

@@ -1,5 +1,6 @@
-//! The frame: the action strip, the locked view, the notebook's panes or
-//! its keys, the status row, and the prompt or dialog over them. Titles
+//! The frame: the action strip, the locked view, a copy's keys, the
+//! notebook's panes or its keys, the status row, and the finder, prompt
+//! or dialog over them. Titles
 //! and entry text are painted only while unlocked; a lock clears what
 //! holds them before the next frame.
 
@@ -93,6 +94,7 @@ impl Composition for Frame<'_> {
                     [
                         (false, idle && keys.is_some()),
                         (false, idle && keys.is_none()),
+                        (false, idle && keys.is_none()),
                     ],
                     damage,
                     sink,
@@ -137,9 +139,51 @@ impl Composition for Frame<'_> {
                     );
                 }
             }
+            Phase::Importing { keys, list } => {
+                let idle = app.busy.is_none();
+                layout::strip(surface, &layout::IMPORT).emit(
+                    [(false, idle && list.selected().is_some()), (false, true)],
+                    damage,
+                    sink,
+                );
+                let body = layout::body(surface, &layout::IMPORT);
+                line(
+                    surface,
+                    Rect {
+                        height: layout::row(surface) as u32,
+                        ..body
+                    },
+                    "Import this encrypted copy as this account's notebook, with one of its keys:",
+                    PAPER,
+                    damage,
+                    sink,
+                );
+                if let Some(view) = layout::copy_keys(surface) {
+                    let labels: Vec<String> = keys
+                        .iter()
+                        .map(|key| format!("{} key {}", key.role.name(), key.fingerprint))
+                        .collect();
+                    let window = list.window(view);
+                    list.emit(
+                        view,
+                        labels
+                            .get(window)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|label| Item {
+                                label,
+                                meta: "",
+                                enabled: true,
+                                marked: false,
+                            }),
+                        damage,
+                        sink,
+                    );
+                }
+            }
             Phase::Opening | Phase::Locking | Phase::Refused(_) => {
                 layout::strip(surface, &layout::LOCKED).emit(
-                    [(false, false), (false, false)],
+                    [(false, false), (false, false), (false, false)],
                     damage,
                     sink,
                 );
@@ -158,6 +202,9 @@ impl Composition for Frame<'_> {
                     );
                 }
             }
+        }
+        if let Some(finder) = app.chooser.as_ref().and_then(|c| c.finder.as_ref()) {
+            finder.emit(damage, sink);
         }
         Status::new(surface).emit(app.status.chars(), damage, sink);
         if let Some(prompt) = &app.prompt {
@@ -221,6 +268,7 @@ impl Frame<'_> {
                 ),
                 (false, idle),
                 (false, idle && count > 1),
+                (false, idle),
                 (false, true),
             ],
             damage,

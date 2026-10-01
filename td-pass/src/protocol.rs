@@ -2,9 +2,15 @@
 //! names keys by their place in the list it was given and never holds a
 //! credential; every title and body travels in a clearing owner.
 
+use std::path::PathBuf;
+
 use crate::plain::{Bytes, Text};
 
 pub type EntryId = [u8; 16];
+
+/// The largest encrypted copy, td-secret's `pass::MAX_COPY`; a file
+/// larger is not offered for import.
+pub const MAX_COPY: usize = 4 * 1024 * 1024 + 16 + 65 + 8 * 1196;
 
 /// One operation the window may abandon: its prompts and its answer carry
 /// the same number, so a late answer is told from the current one.
@@ -122,7 +128,24 @@ pub enum Command {
         op: Op,
         revoked: Vec<usize>,
     },
-    /// Drop the unlocked vault.
+    /// Write the unlocked notebook's encrypted copy, as a new file, into
+    /// `folder`.
+    Export {
+        op: Op,
+        folder: PathBuf,
+    },
+    /// Read an encrypted copy for import and list the keys it opens with.
+    ReadCopy {
+        op: Op,
+        path: PathBuf,
+    },
+    /// Place the copy read, authenticated with its key `key`, into this
+    /// account, which holds no vault.
+    Import {
+        op: Op,
+        key: usize,
+    },
+    /// Drop the unlocked vault, and any copy read for import.
     Lock,
 }
 
@@ -185,6 +208,16 @@ pub enum Reply {
     Keys {
         op: Op,
         keys: Keys,
+    },
+    /// The encrypted copy is written, at `path`.
+    Exported {
+        op: Op,
+        path: String,
+    },
+    /// A copy is read; it opens with any of `keys`.
+    Copy {
+        op: Op,
+        keys: Vec<KeyLabel>,
     },
     /// The vault is dropped; the keys are listed again for the next unlock.
     Locked {

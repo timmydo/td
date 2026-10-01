@@ -1,13 +1,15 @@
 //! The notebook window's state: locked or unlocked, the open entry in
 //! td-ui's editor pane under the vault-document policy, the search field
-//! and title list, the keys view, the key prompt and the confirmation
-//! dialog. It reaches the vault only through `Out` commands and `Reply`
-//! answers, so it holds no key and runs in tests without a token.
+//! and title list, the keys view, the finder for an encrypted copy, the
+//! key prompt and the confirmation dialog. It reaches the vault only
+//! through `Out` commands and `Reply` answers, and folders only through
+//! `Out::List`, so it holds no key and runs in tests without a token.
 
 mod input;
 mod layout;
 mod paint;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use td_ui::confirmations::{self, Choice, Model};
@@ -16,6 +18,7 @@ use td_ui::editor_clipboard::{Paste, Snapshot};
 use td_ui::editor_model::{SavePoint, TabId};
 use td_ui::editor_search::{Found, History};
 use td_ui::entry_model::{Action, EntryModel, Outcome as Typed};
+use td_ui::finder;
 use td_ui::list_model::{ListModel, Step};
 use td_ui::raster::{Raster, Surface};
 use td_ui::window::{Clipboard, Input, PointerPhase};
@@ -43,6 +46,15 @@ pub enum Out {
     Answer(Op, Answer),
     /// Abandon the operation in flight.
     Cancel,
+    /// List `folder`, or the starting folder, for the finder `chooser`,
+    /// with files that may be chosen when `files`; answered with
+    /// `App::listed`.
+    List {
+        chooser: u64,
+        folder: Option<PathBuf>,
+        select: Option<String>,
+        files: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +96,12 @@ enum Phase {
     },
     /// The vault is being dropped; its keys come back with the answer.
     Locking,
+    /// An encrypted copy is read: the keys it opens with, one to import
+    /// it with.
+    Importing {
+        keys: Vec<KeyLabel>,
+        list: ListModel,
+    },
     Unlocked(Box<Notebook>),
 }
 
@@ -142,6 +160,27 @@ enum Busy {
         op: Op,
         what: KeyOp,
     },
+    Export(Op),
+    ReadCopy(Op),
+    Import(Op),
+}
+
+/// What the finder chooses for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Purpose {
+    /// A folder to write the encrypted copy into.
+    Export,
+    /// A copy to import.
+    Import,
+}
+
+/// The finder over the folder `folder`; `finder` is `None` until its
+/// first listing comes. `id` tells its listings from an earlier finder's.
+struct Chooser {
+    id: u64,
+    finder: Option<finder::Controller>,
+    folder: PathBuf,
+    purpose: Purpose,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,7 +193,11 @@ enum KeyOp {
 impl Busy {
     fn op(&self) -> Op {
         match self {
-            Self::Unlock(op) | Self::Create(op) => *op,
+            Self::Unlock(op)
+            | Self::Create(op)
+            | Self::Export(op)
+            | Self::ReadCopy(op)
+            | Self::Import(op) => *op,
             Self::Save { op, .. } | Self::Delete { op, .. } | Self::Keys { op, .. } => *op,
         }
     }
@@ -193,6 +236,11 @@ pub struct App {
     prompt: Option<Prompting>,
     dialog: Option<(Dialog, Option<Then>)>,
     dialog_revision: u64,
+    chooser: Option<Chooser>,
+    next_chooser: u64,
+    /// What an export that finished during a lock wrote, shown with the
+    /// locked view that follows.
+    exported: Option<String>,
     next_op: Op,
     status: String,
     drag: Option<Drag>,
@@ -225,6 +273,9 @@ impl App {
             prompt: None,
             dialog: None,
             dialog_revision: 0,
+            chooser: None,
+            next_chooser: 0,
+            exported: None,
             next_op: 0,
             status: "Opening the notebook".to_owned(),
             drag: None,
@@ -342,7 +393,10 @@ impl App {
                 }
             }
             Reply::Unlocked { op, entries, keys } => {
-                if !matches!(self.busy, Some(Busy::Unlock(o) | Busy::Create(o)) if o == op) {
+                if !matches!(
+                    self.busy,
+                    Some(Busy::Unlock(o) | Busy::Create(o) | Busy::Import(o)) if o == op
+                ) {
                     return;
                 }
                 self.busy = None;
@@ -393,6 +447,33 @@ impl App {
             Reply::Keys { op, keys } => {
                 self.keys_changed(op, keys);
                 self.reask();
+            }
+            Reply::Exported { op, path } => {
+                // An export cannot be called back: one that finished after
+                // a lock is still reported, since its file is there.
+                if matches!(self.busy, Some(Busy::Export(o)) if o == op) {
+                    self.busy = None;
+                }
+                let note = format!("Exported an encrypted copy to {path}");
+                if matches!(self.phase, Phase::Locking) {
+                    self.exported = Some(note);
+                } else {
+                    self.say(note);
+                }
+                self.reask();
+            }
+            Reply::Copy { op, keys } => {
+                if !matches!(self.busy, Some(Busy::ReadCopy(o)) if o == op) {
+                    return;
+                }
+                self.busy = None;
+                let mut list = ListModel::default();
+                if let Some(view) = layout::copy_keys(self.surface) {
+                    list.set_items(keys.len(), (!keys.is_empty()).then_some(0), view);
+                }
+                self.phase = Phase::Importing { keys, list };
+                self.focus = Focus::Keys;
+                self.say("Choose the key to import the copy with, then Import");
             }
         }
     }
@@ -451,10 +532,14 @@ impl App {
         if let (Some(keys), Some(view)) = (&keys, layout::keys(self.surface)) {
             list.set_items(keys.len(), (!keys.is_empty()).then_some(0), view);
         }
-        self.say(match &keys {
+        let status = match &keys {
             Some(_) => "Locked: choose a key and press Unlock",
             None => "No notebook yet: Create enrolls a primary and then a backup key",
-        });
+        };
+        match self.exported.take() {
+            Some(note) => self.say(format!("{note}. {status}")),
+            None => self.say(status),
+        }
         self.phase = Phase::Locked { keys, list };
         self.focus = Focus::Keys;
     }
@@ -760,6 +845,15 @@ impl App {
                     surface,
                 });
             }
+            Phase::Importing { keys, list } => {
+                if let Some(view) = layout::copy_keys(surface) {
+                    if list.count() == keys.len() {
+                        list.relayout(view);
+                    } else {
+                        list.set_items(keys.len(), (!keys.is_empty()).then_some(0), view);
+                    }
+                }
+            }
             Phase::Locked { keys, list } => {
                 if let Some(view) = layout::keys(surface) {
                     let count = keys.as_ref().map_or(0, Vec::len);
@@ -779,6 +873,17 @@ impl App {
     fn resize(&mut self, surface: Surface) {
         self.surface = surface;
         self.relayout();
+        // A finder the window can no longer hold closes.
+        if let Some(chooser) = self.chooser.as_mut() {
+            let rect = layout::finder(surface, chooser.purpose == Purpose::Import);
+            if let Some(finder) = chooser.finder.as_mut() {
+                if let finder::Outcome::Closed(_) =
+                    finder.event(finder::Event::Resize { surface, rect })
+                {
+                    self.close_chooser("The window is too small for the finder");
+                }
+            }
+        }
         let [rect, ..] = layout::dialog(surface);
         if let Some((dialog, _)) = &mut self.dialog {
             let outcome = dialog.event(
@@ -794,7 +899,8 @@ impl App {
         let focused = self.window_focused
             && self.focus == Focus::Editor
             && self.prompt.is_none()
-            && self.dialog.is_none();
+            && self.dialog.is_none()
+            && self.chooser.is_none();
         let _ = self.pane.dispatch(Event::Focus(focused));
     }
 
@@ -1310,6 +1416,227 @@ impl App {
         self.say("Replacing keys");
     }
 
+    // Encrypted copies.
+
+    /// Opens the finder on a folder to write the encrypted copy into.
+    fn start_export(&mut self) {
+        if self.busy.is_some() {
+            return self.say("Wait for the current operation to finish");
+        }
+        if !matches!(self.phase, Phase::Unlocked(_)) {
+            return;
+        }
+        self.open_chooser(Purpose::Export);
+        self.say("Choose a folder: Return opens one, Ctrl+Return exports into it, Escape cancels");
+    }
+
+    /// Opens the finder on a copy to import, when the account holds no
+    /// notebook.
+    fn start_import(&mut self) {
+        if self.busy.is_some() || !matches!(self.phase, Phase::Locked { keys: None, .. }) {
+            return;
+        }
+        self.open_chooser(Purpose::Import);
+        self.say("Choose an encrypted copy: Return opens a folder or reads the copy");
+    }
+
+    fn open_chooser(&mut self, purpose: Purpose) {
+        self.next_chooser += 1;
+        let id = self.next_chooser;
+        self.chooser = Some(Chooser {
+            id,
+            finder: None,
+            folder: PathBuf::new(),
+            purpose,
+        });
+        self.out.push(Out::List {
+            chooser: id,
+            folder: None,
+            select: None,
+            files: purpose == Purpose::Import,
+        });
+        self.sync_focus();
+        self.redraw = true;
+    }
+
+    /// Closes the finder, the focus back where the finder took it from.
+    fn close_chooser(&mut self, status: &str) {
+        self.chooser = None;
+        self.sync_focus();
+        self.say(status);
+    }
+
+    /// The listing `Out::List` asked for: installed in the finder, or,
+    /// when it could not be read, noted there; a first listing that
+    /// cannot be shown closes the finder. One for a finder since closed
+    /// is dropped.
+    pub fn listed(
+        &mut self,
+        chooser: u64,
+        folder: PathBuf,
+        listing: Result<finder::Listing, String>,
+        select: Option<&str>,
+    ) {
+        let surface = self.surface;
+        let Some(chooser) = self.chooser.as_mut().filter(|open| open.id == chooser) else {
+            return;
+        };
+        let choose = match chooser.purpose {
+            Purpose::Export => finder::Choose::Folder,
+            Purpose::Import => finder::Choose::File,
+        };
+        self.redraw = true;
+        let refused = match (listing, &mut chooser.finder) {
+            (Ok(listing), Some(finder)) => match finder.set_listing(listing, select) {
+                Ok(()) => {
+                    chooser.folder = folder;
+                    return;
+                }
+                Err(error) => error.to_string(),
+            },
+            (Ok(listing), None) => {
+                let rect = layout::finder(surface, chooser.purpose == Purpose::Import);
+                match finder::Controller::new(listing, choose, surface, rect, select) {
+                    Ok(finder) => {
+                        chooser.finder = Some(finder);
+                        chooser.folder = folder;
+                        return;
+                    }
+                    Err(finder::Error::NoRoom | finder::Error::InvalidSurface) => {
+                        return self.close_chooser("The window is too small for the finder");
+                    }
+                    Err(error) => {
+                        return self.close_chooser(&format!("The finder cannot open: {error}"));
+                    }
+                }
+            }
+            (Err(text), _) => text,
+        };
+        match chooser.finder.as_mut() {
+            Some(finder) => {
+                let _ = finder.set_note(&fitted(&refused));
+            }
+            None => self.close_chooser(&refused),
+        }
+    }
+
+    /// One finder event and what it asks: a folder listed, the export
+    /// written, or a copy read.
+    fn chooser_event(&mut self, event: finder::Event) {
+        let Some(chooser) = &mut self.chooser else {
+            return;
+        };
+        let Some(finder) = chooser.finder.as_mut() else {
+            if let finder::Event::Key {
+                key: finder::Key::Escape,
+                ..
+            } = event
+            {
+                self.close_chooser("");
+            }
+            return;
+        };
+        let files = chooser.purpose == Purpose::Import;
+        let id = chooser.id;
+        match finder.event(event) {
+            finder::Outcome::Ignored | finder::Outcome::Consumed => {}
+            finder::Outcome::Changed => self.redraw = true,
+            finder::Outcome::Descend(index) => {
+                if let Some(entry) = finder.listing().entries().get(index) {
+                    let folder = chooser.folder.join(entry.name());
+                    self.out.push(Out::List {
+                        chooser: id,
+                        folder: Some(folder),
+                        select: None,
+                        files,
+                    });
+                }
+            }
+            finder::Outcome::Ascend => {
+                if let Some(parent) = chooser.folder.parent() {
+                    let select = chooser
+                        .folder
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned);
+                    self.out.push(Out::List {
+                        chooser: id,
+                        folder: Some(parent.to_path_buf()),
+                        select,
+                        files,
+                    });
+                }
+            }
+            finder::Outcome::Closed(choice) => {
+                let name = match choice {
+                    finder::Choice::Entry(index) => finder
+                        .listing()
+                        .entries()
+                        .get(index)
+                        .map(|entry| entry.name().to_owned()),
+                    _ => None,
+                };
+                let Some(chooser) = self.chooser.take() else {
+                    return;
+                };
+                self.sync_focus();
+                self.redraw = true;
+                match (choice, chooser.purpose, name) {
+                    (finder::Choice::Here, Purpose::Export, _) => self.export(chooser.folder),
+                    (finder::Choice::Entry(_), Purpose::Import, Some(name)) => {
+                        self.read_copy(chooser.folder.join(name));
+                    }
+                    (finder::Choice::Unavailable(error), _, _) => self.say(error.to_string()),
+                    _ => self.say(""),
+                }
+            }
+        }
+    }
+
+    fn export(&mut self, folder: PathBuf) {
+        let op = self.op();
+        self.out.push(Out::Send(Command::Export { op, folder }));
+        self.busy = Some(Busy::Export(op));
+        self.say("Exporting");
+    }
+
+    fn read_copy(&mut self, path: PathBuf) {
+        let op = self.op();
+        self.out.push(Out::Send(Command::ReadCopy { op, path }));
+        self.busy = Some(Busy::ReadCopy(op));
+        self.say("Reading the copy");
+    }
+
+    /// Imports the copy read with the selected key.
+    fn import(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Phase::Importing { keys, list } = &self.phase else {
+            return;
+        };
+        let Some(key) = list.selected().filter(|&key| key < keys.len()) else {
+            return self.say("Choose a key to import the copy with");
+        };
+        let op = self.op();
+        self.out.push(Out::Send(Command::Import { op, key }));
+        self.busy = Some(Busy::Import(op));
+        self.say("Importing");
+    }
+
+    /// Gives the copy up: the thread drops it and lists the account's
+    /// keys again.
+    fn cancel_import(&mut self) {
+        if self.busy.is_some() {
+            self.out.push(Out::Cancel);
+            self.busy = None;
+            self.end_prompt();
+        }
+        self.out.push(Out::Send(Command::Lock));
+        self.phase = Phase::Locking;
+        self.say("");
+    }
+
     /// Gives up the open entry's unsaved changes: its document closes and
     /// the entry is no longer open, so no edit stays on screen as if it
     /// were saved; what follows opens whatever comes next.
@@ -1346,6 +1673,7 @@ impl App {
         self.busy = None;
         self.prompt = None;
         self.dialog = None;
+        self.chooser = None;
         self.paste = None;
         self.drag = None;
         self.deferred = None;
@@ -1378,6 +1706,23 @@ fn notebook(entries: Vec<Item>) -> Result<Notebook, String> {
         open: None,
         reading: None,
     })
+}
+
+/// A note cut to the finder's bound at a character, its tail kept.
+fn fitted(note: &str) -> String {
+    let flat: String = note
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if flat.len() <= finder::NOTE_BYTES {
+        return flat;
+    }
+    let keep = finder::NOTE_BYTES - '\u{2026}'.len_utf8();
+    let mut start = flat.len() - keep;
+    while !flat.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("\u{2026}{}", flat.get(start..).unwrap_or_default())
 }
 
 /// Of two pending follow-ons, the one that must not be lost: Quit over

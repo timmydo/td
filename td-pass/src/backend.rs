@@ -15,6 +15,9 @@ use crate::protocol::{
     Answer, Ask, Change, Command, Failure, Item, KeyLabel, Keys, Op, PinUse, Reply, Role,
 };
 
+// The window offers no copy larger than td-secret reads.
+const _: () = assert!(crate::protocol::MAX_COPY == pass::MAX_COPY);
+
 struct Job {
     command: Command,
     cancel: pass::Cancel,
@@ -55,7 +58,10 @@ impl Client {
         | Command::Apply { op, .. }
         | Command::UseKey { op, .. }
         | Command::AddKey { op }
-        | Command::ReplaceKeys { op, .. } = command
+        | Command::ReplaceKeys { op, .. }
+        | Command::Export { op, .. }
+        | Command::ReadCopy { op, .. }
+        | Command::Import { op, .. } = command
         {
             self.current = Some((op, cancel.clone()));
         }
@@ -104,6 +110,8 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
     // window names either by its place in the list it was given.
     let mut keys: Vec<pass::Key> = Vec::new();
     let mut enrolled: Vec<pass::Key> = Vec::new();
+    // A copy read for import, and the keys it opens with.
+    let mut copy: Option<(Vec<u8>, Vec<pass::Key>)> = None;
     while let Ok(Job { command, cancel }) = jobs.recv() {
         let reply = match command {
             Command::Open => match pass::Host::open().and_then(|opened| {
@@ -239,9 +247,65 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
                     _ => closed(op),
                 }
             }
+            Command::Export { op, folder } => match vault.as_ref() {
+                Some(vault) => match vault.export() {
+                    Ok(bytes) => {
+                        let name = format!("td-pass-notebook-r{}.tdpass", vault.revision());
+                        match crate::files::write_copy(&folder, &name, &bytes) {
+                            Ok(path) => Reply::Exported {
+                                op,
+                                path: path.display().to_string(),
+                            },
+                            Err(text) => refused(op, &text),
+                        }
+                    }
+                    Err(failure) => failed(op, &failure),
+                },
+                None => closed(op),
+            },
+            Command::ReadCopy { op, path } => {
+                copy = None;
+                match crate::files::read_copy(&path, pass::MAX_COPY) {
+                    Ok(bytes) => match pass::keys_of(&bytes) {
+                        Ok(opens) => {
+                            let keys = opens.iter().map(label).collect();
+                            copy = Some((bytes, opens));
+                            Reply::Copy { op, keys }
+                        }
+                        Err(failure) => failed(op, &failure),
+                    },
+                    Err(text) => refused(op, &text),
+                }
+            }
+            Command::Import { op, key } => {
+                let mut asker = Asker {
+                    op,
+                    replies,
+                    answers,
+                };
+                let chosen = copy.as_ref().map(|(bytes, opens)| (bytes, opens.get(key)));
+                match (host.as_mut(), chosen) {
+                    (Some(host), Some((bytes, Some(key)))) => {
+                        match host.import(bytes, key, &mut asker, &cancel) {
+                            Ok(imported) => {
+                                let entries = items(&imported);
+                                let keys = listing(&imported, &mut enrolled);
+                                vault = Some(imported);
+                                copy = None;
+                                Reply::Unlocked { op, entries, keys }
+                            }
+                            Err(failure) => failed(op, &failure),
+                        }
+                    }
+                    (Some(_), Some((_, None))) => refused(op, "that key is no longer listed"),
+                    (Some(_), None) => refused(op, "no copy is read for import"),
+                    (None, _) => closed(op),
+                }
+            }
             Command::Lock => {
                 vault = None;
                 enrolled.clear();
+                copy = None;
                 match host.as_ref().map(pass::Host::keys) {
                     Some(Ok(listed)) => Reply::Locked {
                         keys: labels(&mut keys, listed),
@@ -503,6 +567,52 @@ mod tests {
                 Ok(Reply::Failed { op, failure }) => {
                     assert_eq!(op, expected);
                     assert_eq!(failure.text, "the notebook is not open");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn copies_that_cannot_be_read_and_writes_without_a_notebook_are_refused() {
+        let (jobs, job_rx) = mpsc::channel();
+        let (_answers, answer_rx) = mpsc::channel();
+        let (reply_tx, replies) = mpsc::channel();
+        // A regular file that is no vault, and one that is not there.
+        let garbage = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        for command in [
+            Command::ReadCopy {
+                op: 1,
+                path: std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/absent")),
+            },
+            Command::ReadCopy {
+                op: 2,
+                path: garbage.clone(),
+            },
+            Command::Export {
+                op: 3,
+                folder: std::env::temp_dir(),
+            },
+            Command::Import { op: 4, key: 0 },
+        ] {
+            jobs.send(Job {
+                command,
+                cancel: pass::Cancel::new(),
+            })
+            .unwrap();
+        }
+        drop(jobs);
+        serve(&job_rx, &answer_rx, &reply_tx);
+        for expected in 1..=4 {
+            match replies.try_recv() {
+                Ok(Reply::Failed { op, failure }) => {
+                    assert_eq!(op, expected);
+                    match expected {
+                        1 => assert!(failure.text.contains("absent"), "{}", failure.text),
+                        // Read whole, then refused as no copy.
+                        2 => assert!(!failure.text.contains("Cargo.toml"), "{}", failure.text),
+                        _ => assert_eq!(failure.text, "the notebook is not open"),
+                    }
                 }
                 other => panic!("{other:?}"),
             }

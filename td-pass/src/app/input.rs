@@ -49,7 +49,7 @@ impl App {
                 if self.prompt.is_some() {
                     self.answer_prompt(false);
                 }
-                if self.dialog.take().is_some() {
+                if self.dialog.take().is_some() || self.chooser.take().is_some() {
                     self.sync_focus();
                 }
                 self.request(Then::Quit, None);
@@ -77,6 +77,9 @@ impl App {
         if self.prompt.is_some() {
             return self.prompt_key(chord, clipboard);
         }
+        if self.chooser.is_some() {
+            return self.chooser_key(chord, repeat);
+        }
         if let Some((dialog, _)) = &mut self.dialog {
             let event = match dialog_key(chord) {
                 Some(key) => confirmations::Event::Key {
@@ -93,6 +96,7 @@ impl App {
         }
         match self.phase {
             Phase::Locked { .. } => self.locked_key(chord),
+            Phase::Importing { .. } => self.importing_key(chord),
             Phase::Unlocked(_) => self.notebook_key(chord, repeat, clipboard),
             _ => {}
         }
@@ -109,9 +113,74 @@ impl App {
             }
             return;
         }
-        if chord == "Return" {
-            self.unlock();
+        match chord {
+            "Return" => self.unlock(),
+            "C-o" => self.start_import(),
+            _ => {}
         }
+    }
+
+    /// The keys of a copy read for import: the list's steps, Return to
+    /// import with the selected key, Escape or Ctrl+L to give it up.
+    fn importing_key(&mut self, chord: &str) {
+        match chord {
+            "Return" => return self.import(),
+            "Escape" | "C-l" => return self.cancel_import(),
+            _ => {}
+        }
+        let surface = self.surface;
+        let Phase::Importing { list, .. } = &mut self.phase else {
+            return;
+        };
+        if let (Some(step), Some(view)) = (Step::from_chord(chord), layout::copy_keys(surface)) {
+            if list.step(step, view).any() {
+                self.redraw = true;
+            }
+        }
+    }
+
+    /// A chord while the finder is open: its keys by their names,
+    /// Ctrl+Return its accept, Alt+Up its parent, and one printable
+    /// character its filter's; Ctrl+Q closes it and asks to quit.
+    fn chooser_key(&mut self, chord: &str, repeat: bool) {
+        let key = |key| finder::Event::Key {
+            key,
+            repeated: repeat,
+        };
+        let event = match chord {
+            "Up" => key(finder::Key::Up),
+            "Down" => key(finder::Key::Down),
+            "PageUp" => key(finder::Key::PageUp),
+            "PageDown" => key(finder::Key::PageDown),
+            "Home" => key(finder::Key::Home),
+            "End" => key(finder::Key::End),
+            "Return" => key(finder::Key::Activate),
+            "C-Return" => key(finder::Key::Accept),
+            "Backspace" => key(finder::Key::Backspace),
+            "M-Up" => key(finder::Key::Parent),
+            "Escape" => key(finder::Key::Escape),
+            "C-q" => {
+                self.close_chooser("");
+                return self.request(Then::Quit, None);
+            }
+            // Lock is not held back by the finder.
+            "C-l" => {
+                self.close_chooser("");
+                if matches!(self.phase, Phase::Unlocked(_)) {
+                    self.request(Then::Lock, None);
+                }
+                return;
+            }
+            "Space" => finder::Event::Insert(' '),
+            _ => {
+                let mut chars = chord.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) if !c.is_control() => finder::Event::Insert(c),
+                    _ => finder::Event::Other,
+                }
+            }
+        };
+        self.chooser_event(event);
     }
 
     fn notebook_key(&mut self, chord: &str, repeat: bool, clipboard: &mut dyn Clipboard) {
@@ -190,6 +259,7 @@ impl App {
             "Return" => return self.use_key(),
             "Insert" => return self.add_key(),
             "Delete" => return self.replace_keys(None),
+            "C-e" => return self.start_export(),
             _ => {}
         }
         let surface = self.surface;
@@ -598,6 +668,10 @@ impl App {
         }
         let surface = self.surface;
         let pointer = self.pointer;
+        if self.chooser.is_some() {
+            let (x, y) = pointer.unwrap_or_default();
+            return self.chooser_event(finder::Event::Wheel { x, y, rows });
+        }
         if let Some((dialog, _)) = &mut self.dialog {
             let (x, y) = pointer.unwrap_or_default();
             let outcome = dialog.event(
@@ -611,6 +685,13 @@ impl App {
             Phase::Unlocked(notebook) if notebook.keys.showing => {
                 if let Some(view) = layout::enrolled(surface) {
                     if notebook.keys.list.scroll(rows as i64, view).any() {
+                        self.redraw = true;
+                    }
+                }
+            }
+            Phase::Importing { list, .. } => {
+                if let Some(view) = layout::copy_keys(surface) {
+                    if list.scroll(rows as i64, view).any() {
                         self.redraw = true;
                     }
                 }
@@ -654,6 +735,20 @@ impl App {
         self.pointer = Some((x, y));
         if self.prompt.is_some() {
             return self.prompt_pointer(phase, x, y, extend);
+        }
+        if let Some(chooser) = &self.chooser {
+            // A press outside the finder closes it and acts there, so the
+            // strip's Lock is never held back by it.
+            let inside =
+                layout::finder(self.surface, chooser.purpose == Purpose::Import).contains(x, y);
+            if phase != PointerPhase::Press || inside {
+                return self.chooser_event(match phase {
+                    PointerPhase::Press => finder::Event::Press { x, y },
+                    PointerPhase::Move => finder::Event::Move { x, y },
+                    PointerPhase::Release => finder::Event::Release { x, y },
+                });
+            }
+            self.close_chooser("");
         }
         if let Some((dialog, _)) = &mut self.dialog {
             let event = match phase {
@@ -701,6 +796,7 @@ impl App {
                 match layout::strip(surface, &layout::LOCKED).hit(x, y) {
                     Some(0) => return self.unlock(),
                     Some(1) => return self.create(),
+                    Some(2) => return self.start_import(),
                     _ => {}
                 }
                 let Phase::Locked { list, .. } = &mut self.phase else {
@@ -712,13 +808,29 @@ impl App {
                     }
                 }
             }
+            Phase::Importing { .. } => {
+                match layout::strip(surface, &layout::IMPORT).hit(x, y) {
+                    Some(0) => return self.import(),
+                    Some(1) => return self.cancel_import(),
+                    _ => {}
+                }
+                let Phase::Importing { list, .. } = &mut self.phase else {
+                    return;
+                };
+                if let Some(view) = layout::copy_keys(surface) {
+                    if list.press(view, x, y).is_some() {
+                        self.redraw = true;
+                    }
+                }
+            }
             Phase::Unlocked(notebook) if notebook.keys.showing => {
                 match layout::strip(surface, &layout::KEYS).hit(x, y) {
                     Some(0) => return self.show_keys(false),
                     Some(1) => return self.use_key(),
                     Some(2) => return self.add_key(),
                     Some(3) => return self.replace_keys(opener),
-                    Some(4) => return self.request(Then::Lock, opener),
+                    Some(4) => return self.start_export(),
+                    Some(5) => return self.request(Then::Lock, opener),
                     _ => {}
                 }
                 let Some(notebook) = self.notebook() else {

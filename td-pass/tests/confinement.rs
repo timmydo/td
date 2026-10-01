@@ -21,13 +21,14 @@ fn production(name: &str) -> String {
     text.split("#[cfg(test)]").next().unwrap().to_owned()
 }
 
-const FILES: [&str; 12] = [
+const FILES: [&str; 13] = [
     "app/input.rs",
     "app/layout.rs",
     "app/mod.rs",
     "app/paint.rs",
     "app/tests.rs",
     "backend.rs",
+    "files.rs",
     "frames.rs",
     "main.rs",
     "mode.rs",
@@ -101,6 +102,17 @@ fn pure_files_reach_no_system_vault_or_compositor() {
             "println!",
             "td_ui as",
             "window::run(",
+            // A path's own methods that reach the file system.
+            ".exists(",
+            ".try_exists(",
+            ".is_dir(",
+            ".is_file(",
+            ".is_symlink(",
+            ".metadata(",
+            ".symlink_metadata(",
+            ".read_dir(",
+            ".read_link(",
+            ".canonicalize(",
         ] {
             assert!(!text.contains(denied), "{name} names {denied}");
         }
@@ -118,6 +130,7 @@ fn pure_files_reach_no_system_vault_or_compositor() {
                     "editor_model",
                     "editor_search",
                     "entry_model",
+                    "finder",
                     "list_model",
                     "raster",
                     "window",
@@ -182,7 +195,7 @@ fn only_the_backend_holds_the_vault_and_only_the_window_the_compositor() {
     assert!(window.contains("td_ui::window::run(&mut session, stream, frames, typeface)"));
     assert!(!window.contains("temp_dir"));
     for name in FILES {
-        if !matches!(name, "main.rs" | "window.rs") {
+        if !matches!(name, "main.rs" | "window.rs" | "files.rs") {
             assert!(!source(name).contains("std::fs"), "{name}");
         }
     }
@@ -192,6 +205,48 @@ fn only_the_backend_holds_the_vault_and_only_the_window_the_compositor() {
     assert!(backend.contains("use td_secret::pass;"));
     assert_eq!(backend.matches("td_secret").count(), 1);
     assert_eq!(backend.matches("pass::Host::open()").count(), 1);
+    // Beside the vault, files reach folder listings and encrypted copies
+    // alone: a copy is written as a new private file, never over another,
+    // and read to a bound; only a partial copy it made is removed.
+    let files = production("files.rs");
+    // Two opens: the one write, new and private, and the read, which
+    // does not wait on a FIFO.
+    assert_eq!(files.matches("OpenOptions::new()").count(), 2);
+    assert_eq!(files.matches(".write(true)").count(), 1);
+    assert_eq!(files.matches(".create_new(true)").count(), 1);
+    assert_eq!(files.matches(".mode(0o600)").count(), 1);
+    assert_eq!(files.matches(".custom_flags(NONBLOCK)").count(), 1);
+    assert_eq!(files.matches("remove_file(&path)").count(), 1);
+    assert!(files.contains(".take(ceiling as u64 + 1)"));
+    for denied in [
+        "fs::write",
+        "File::create",
+        "fs::copy",
+        "hard_link",
+        "unix::fs::symlink",
+        "rename(",
+        "remove_dir",
+        "set_permissions",
+        "create_dir",
+        "as fs",
+        "as OpenOptions",
+    ] {
+        assert!(!files.contains(denied), "files.rs names {denied}");
+    }
+    // The vault thread writes and reads copies only through them, and the
+    // window lists folders through them.
+    assert_eq!(backend.matches("files::").count(), 2);
+    assert!(backend.contains("crate::files::write_copy(&folder, &name, &bytes)"));
+    assert!(backend.contains("crate::files::read_copy(&path, pass::MAX_COPY)"));
+    let window = source("window.rs");
+    assert_eq!(window.matches("files::").count(), 2);
+    assert!(window.contains("crate::files::start_folder"));
+    assert!(window.contains("crate::files::list_folder(&folder, ceiling)"));
+    for name in FILES {
+        if !matches!(name, "backend.rs" | "window.rs" | "main.rs" | "files.rs") {
+            assert!(!source(name).contains("files::"), "{name}");
+        }
+    }
 }
 
 #[test]

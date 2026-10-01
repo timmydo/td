@@ -6,6 +6,7 @@
 
 mod app;
 mod backend;
+mod files;
 mod frames;
 mod mode;
 mod plain;
