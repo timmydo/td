@@ -1,8 +1,10 @@
-//! Bounded core data-device v3 decoding and the offer record the client
-//! keeps per server-created `wl_data_offer`: exact schemas for the device,
-//! source and offer events, the two text MIME spellings a consumer offers
-//! and accepts, and the budgets on offers and their announcements. No
-//! display, descriptor, environment or clock is accessed.
+//! Bounded decoding for the seat's two selections and the offer record
+//! the client keeps per server-created offer: exact schemas for the core
+//! data-device v3 and primary-selection v1 device, source and offer
+//! events, each board's request and event opcodes, the two text MIME
+//! spellings a consumer offers and accepts, and the budgets on offers and
+//! their announcements. No display, descriptor, environment or clock is
+//! accessed.
 
 use crate::wire::{Cursor, Message};
 
@@ -16,6 +18,116 @@ pub const OFFER_LIMIT: usize = 32;
 pub const ANNOUNCEMENTS: usize = 64;
 /// The longest MIME announcement retained.
 pub const MIME_BYTES: usize = 256;
+
+/// Which of the seat's two selections a data device serves. The two
+/// protocols share their shape -- a manager, one device per seat, server
+/// offers announcing MIMEs, and sources whose sends carry a right -- and
+/// differ in opcodes and in the core device's drag events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Board {
+    /// The core data device's selection, which copy and paste use.
+    Clipboard,
+    /// `zwp_primary_selection_device_manager_v1`'s, which selecting text
+    /// sets and a middle click pastes.
+    Primary,
+}
+
+impl Board {
+    /// The board's name in a diagnostic.
+    pub fn name(self) -> &'static str {
+        match self {
+            Board::Clipboard => "clipboard",
+            Board::Primary => "primary selection",
+        }
+    }
+
+    /// The other board, whose server offers share this one's id space.
+    pub fn other(self) -> Board {
+        match self {
+            Board::Clipboard => Board::Primary,
+            Board::Primary => Board::Clipboard,
+        }
+    }
+
+    /// The manager's interface and the version bound, the only one read.
+    pub fn global(self) -> (&'static str, u32) {
+        match self {
+            Board::Clipboard => ("wl_data_device_manager", 3),
+            Board::Primary => ("zwp_primary_selection_device_manager_v1", 1),
+        }
+    }
+
+    /// The device's `set_selection`.
+    pub fn set_selection(self) -> u16 {
+        match self {
+            Board::Clipboard => 1,
+            Board::Primary => 0,
+        }
+    }
+
+    /// The device's destructor: the core device's `release`, the primary
+    /// device's `destroy`.
+    pub fn release(self) -> u16 {
+        match self {
+            Board::Clipboard => 2,
+            Board::Primary => 1,
+        }
+    }
+
+    /// An offer's `receive`.
+    pub fn receive(self) -> u16 {
+        match self {
+            Board::Clipboard => 1,
+            Board::Primary => 0,
+        }
+    }
+
+    /// An offer's destructor.
+    pub fn destroy_offer(self) -> u16 {
+        match self {
+            Board::Clipboard => 2,
+            Board::Primary => 1,
+        }
+    }
+
+    /// A source's destructor, the same on both.
+    pub fn destroy_source(self) -> u16 {
+        1
+    }
+
+    /// A source's `send` event, the one that carries a right.
+    pub fn send(self) -> u16 {
+        match self {
+            Board::Clipboard => 1,
+            Board::Primary => 0,
+        }
+    }
+
+    /// A device event under this board's schema.
+    pub fn device(self, message: &Message) -> Result<DeviceEvent, String> {
+        match self {
+            Board::Clipboard => device(message),
+            Board::Primary => primary_device(message),
+        }
+    }
+
+    /// A source event under this board's schema.
+    pub fn source(self, message: &Message) -> Result<SourceEvent, String> {
+        match self {
+            Board::Clipboard => source(message),
+            Board::Primary => primary_source(message),
+        }
+    }
+
+    /// An offer event under this board's schema: its MIME, if it
+    /// announced one.
+    pub fn offer(self, message: &Message) -> Result<Option<String>, String> {
+        match self {
+            Board::Clipboard => offer(message),
+            Board::Primary => primary_offer(message),
+        }
+    }
+}
 
 /// One server-created offer: its generation, whether it was destroyed
 /// (and waits for its barrier), the exact spellings of the two supported
@@ -158,6 +270,41 @@ pub fn offer(message: &Message) -> Result<Option<String>, String> {
     Ok(result)
 }
 
+/// `zwp_primary_selection_device_v1`: an offer, then the selection.
+pub fn primary_device(message: &Message) -> Result<DeviceEvent, String> {
+    let mut c = Cursor::new(&message.payload);
+    let event = match message.opcode {
+        0 => DeviceEvent::Offer(c.u32()?),
+        1 => DeviceEvent::Selection(c.u32()?),
+        _ => return Err("unknown primary-selection device event".into()),
+    };
+    c.finish()?;
+    Ok(event)
+}
+
+/// `zwp_primary_selection_source_v1`: a send, or the cancel.
+pub fn primary_source(message: &Message) -> Result<SourceEvent, String> {
+    let mut c = Cursor::new(&message.payload);
+    let event = match message.opcode {
+        0 => SourceEvent::Send(mime(c.string()?)?),
+        1 => SourceEvent::Cancel,
+        _ => return Err("unknown primary-selection source event".into()),
+    };
+    c.finish()?;
+    Ok(event)
+}
+
+/// `zwp_primary_selection_offer_v1`: a MIME announcement, its only event.
+pub fn primary_offer(message: &Message) -> Result<Option<String>, String> {
+    let mut c = Cursor::new(&message.payload);
+    let result = match message.opcode {
+        0 => Some(mime(c.string()?)?),
+        _ => return Err("unknown primary-selection offer event".into()),
+    };
+    c.finish()?;
+    Ok(result)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -257,6 +404,69 @@ mod tests {
         }
         assert!(source(&text(1, &"x".repeat(257))).is_ok());
         assert!(offer(&text(0, &"x".repeat(257))).is_ok());
+    }
+
+    #[test]
+    fn every_primary_schema_rejects_truncation_extra_words_and_unknown_values() {
+        let board = Board::Primary;
+        let devices = [words(0, &[0xff00_0010]), words(1, &[0])];
+        for message in devices {
+            assert!(board.device(&message).is_ok());
+            let mut extra = copy(&message);
+            extra.payload.extend_from_slice(&[0; 4]);
+            assert!(board.device(&extra).is_err());
+            for length in 0..message.payload.len() {
+                let mut short = copy(&message);
+                short.payload.truncate(length);
+                assert!(board.device(&short).is_err());
+            }
+        }
+        assert_eq!(
+            board.device(&words(1, &[7])).unwrap(),
+            DeviceEvent::Selection(7)
+        );
+        for message in [text(0, UTF8), words(1, &[])] {
+            assert!(board.source(&message).is_ok());
+            let mut extra = copy(&message);
+            extra.payload.extend_from_slice(&[0; 4]);
+            assert!(board.source(&extra).is_err());
+            for length in 0..message.payload.len() {
+                let mut short = copy(&message);
+                short.payload.truncate(length);
+                assert!(board.source(&short).is_err());
+            }
+        }
+        assert_eq!(
+            board.source(&text(0, UTF8)).unwrap(),
+            SourceEvent::Send(UTF8.into())
+        );
+        assert_eq!(board.source(&words(1, &[])).unwrap(), SourceEvent::Cancel);
+        assert_eq!(board.offer(&text(0, PLAIN)).unwrap(), Some(PLAIN.into()));
+        for opcode in [2, 3, 5] {
+            assert!(board.device(&words(opcode, &[0])).is_err());
+            assert!(board.source(&words(opcode, &[])).is_err());
+        }
+        // The core offer's action events are not the primary offer's.
+        assert!(board.offer(&words(1, &[7])).is_err());
+        for value in ["", "x\0y", "x\ny"] {
+            assert!(board.source(&text(0, value)).is_err());
+            assert!(board.offer(&text(0, value)).is_err());
+        }
+        // The two boards' opcodes differ where their protocols do.
+        let opcodes = |b: Board| {
+            (
+                b.set_selection(),
+                b.release(),
+                b.receive(),
+                b.destroy_offer(),
+                b.destroy_source(),
+                b.send(),
+            )
+        };
+        assert_eq!(opcodes(Board::Clipboard), (1, 2, 1, 2, 1, 1));
+        assert_eq!(opcodes(Board::Primary), (0, 1, 0, 1, 1, 0));
+        assert_eq!(Board::Clipboard.other(), Board::Primary);
+        assert_eq!(Board::Primary.other(), Board::Clipboard);
     }
 
     #[test]

@@ -380,6 +380,7 @@ impl App for ChooserClient {
             | Handled::Keyboard(_)
             | Handled::Pointer(_)
             | Handled::Clipboard(_)
+            | Handled::Primary(_)
             | Handled::SeatRemoved => Ok(()),
             Handled::Unhandled => Err(format!(
                 "unexpected Wayland event {}:{}",

@@ -8,10 +8,10 @@
 
 //! The shared client against a scripted peer: the object table and
 //! registry, the toplevel's buffers and frame callback, the seat with its
-//! keyboard and pointer, the pointer image, the clipboard's device,
-//! offers and sources, and the turn loop, driven by the smallest
-//! consumer. The presentation, loop, device and clipboard lifecycle
-//! tests moved here from td-editor's window tests.
+//! keyboard and pointer, the pointer image, the clipboard's and the
+//! primary selection's devices, offers and sources, and the turn loop,
+//! driven by the smallest consumer. The presentation, loop, device and
+//! clipboard lifecycle tests moved here from td-editor's window tests.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -24,7 +24,7 @@ use td_ui::client::{
     DISPLAY, GLOBALS, INITIAL_DEADLINE, MESSAGES_PER_TURN, NAME_BYTES, OBJECTS, REGISTRY, SHM,
     SURFACE, SYNC, TOPLEVEL, WM, XDG_SURFACE,
 };
-use td_ui::data::{ANNOUNCEMENTS, OFFER_LIMIT, PLAIN, UTF8};
+use td_ui::data::{Board, ANNOUNCEMENTS, OFFER_LIMIT, PLAIN, UTF8};
 use td_ui::keyboard::Held;
 use td_ui::pointer;
 use td_ui::wayland::{backing_file, cursor_pixels, peer, Connection, IDLE_WAIT, WRITE_DEADLINE};
@@ -56,6 +56,7 @@ struct Probe {
     capabilities: Vec<(bool, bool)>,
     seat_removed: usize,
     clipboard: Vec<&'static str>,
+    primary: Vec<&'static str>,
     size: (usize, usize),
     dirty: bool,
     frames: usize,
@@ -81,6 +82,7 @@ impl Probe {
             capabilities: Vec::new(),
             seat_removed: 0,
             clipboard: Vec::new(),
+            primary: Vec::new(),
             size: (0, 0),
             dirty: false,
             frames: 0,
@@ -182,17 +184,11 @@ impl App for Probe {
                 Ok(())
             }
             Handled::Clipboard(event) => {
-                self.clipboard.push(match event {
-                    ClipboardEvent::Selection => "selection",
-                    ClipboardEvent::Send(right) => {
-                        File::from(right)
-                            .write_all(b"probe text")
-                            .map_err(|e| e.to_string())?;
-                        "send"
-                    }
-                    ClipboardEvent::Cancelled => "cancelled",
-                    ClipboardEvent::Released => "released",
-                });
+                self.clipboard.push(outcome(event)?);
+                Ok(())
+            }
+            Handled::Primary(event) => {
+                self.primary.push(outcome(event)?);
                 Ok(())
             }
             Handled::Done | Handled::GlobalRemoved { .. } => Ok(()),
@@ -226,6 +222,21 @@ impl App for Probe {
         }
         Ok(())
     }
+}
+
+/// A selection outcome by name; a send's right gets the probe's text.
+fn outcome(event: ClipboardEvent) -> Result<&'static str> {
+    Ok(match event {
+        ClipboardEvent::Selection => "selection",
+        ClipboardEvent::Send(right) => {
+            File::from(right)
+                .write_all(b"probe text")
+                .map_err(|e| e.to_string())?;
+            "send"
+        }
+        ClipboardEvent::Cancelled => "cancelled",
+        ClipboardEvent::Released => "released",
+    })
 }
 
 fn message(object: u32, opcode: u16, words: &[u32]) -> Message {
@@ -1342,10 +1353,22 @@ fn barrier_done(p: &mut Probe, id: u32) {
 
 /// `wl_data_source.send` for `mime` carrying `file`, across the socket.
 fn send_right(p: &mut Probe, peer: &UnixStream, source: u32, mime: &str, file: &File) {
+    send_right_at(p, peer, source, 1, mime, file);
+}
+
+/// A source's send at `opcode`, the board's, carrying `file`.
+fn send_right_at(
+    p: &mut Probe,
+    peer: &UnixStream,
+    source: u32,
+    opcode: u16,
+    mime: &str,
+    file: &File,
+) {
     let mut sender = Connection::new(peer.try_clone().unwrap()).unwrap();
     let mut body = Builder::new();
     body.string(mime).unwrap();
-    sender.send(source, 1, body, Some(file)).unwrap();
+    sender.send(source, opcode, body, Some(file)).unwrap();
     p.client.connection().read_more().unwrap();
     while let Some(event) = p.client.connection().take().unwrap() {
         assert!(p.client.needs_descriptor(&event).unwrap());
@@ -1587,7 +1610,10 @@ fn focus_loss_drags_and_a_retired_device_retire_offers_and_the_selection() {
     p.event(message(REGISTRY, 1, &[5])).unwrap();
     assert_eq!(p.clipboard.last(), Some(&"released"));
     assert!(!p.client.clipboard());
-    assert_eq!(p.client.kind(device).unwrap(), Kind::RetiredDataDevice);
+    assert_eq!(
+        p.client.kind(device).unwrap(),
+        Kind::RetiredDataDevice(Board::Clipboard)
+    );
     assert_eq!(drain(&peer).0, [message(device, 2, &[])]);
     p.event(message(device, 0, &[0xff00_0020])).unwrap();
     p.event(text_event(0xff00_0020, 0, PLAIN)).unwrap();
@@ -1678,7 +1704,10 @@ fn a_source_offers_both_text_mimes_sends_over_its_right_and_retires() {
     // it, and both ids wait for delete_id.
     let second = p.client.offer_selection(1235).unwrap();
     assert_ne!(second, source);
-    assert_eq!(p.client.kind(source).unwrap(), Kind::RetiredDataSource);
+    assert_eq!(
+        p.client.kind(source).unwrap(),
+        Kind::RetiredDataSource(Board::Clipboard)
+    );
     let (requests, _) = drain(&peer);
     assert_eq!(requests.len(), 5);
     assert_eq!(requests.last(), Some(&message(source, 1, &[])));
@@ -1692,7 +1721,10 @@ fn a_source_offers_both_text_mimes_sends_over_its_right_and_retires() {
     p.event(message(second, 2, &[])).unwrap();
     assert_eq!(p.clipboard, ["send", "send", "send", "cancelled"]);
     assert!(p.client.source().is_none());
-    assert_eq!(p.client.kind(second).unwrap(), Kind::RetiredDataSource);
+    assert_eq!(
+        p.client.kind(second).unwrap(),
+        Kind::RetiredDataSource(Board::Clipboard)
+    );
     assert_eq!(drain(&peer).0, [message(second, 1, &[])]);
     for id in [source, second] {
         p.event(message(DISPLAY, 1, &[id])).unwrap();
@@ -1754,7 +1786,10 @@ fn manager_and_seat_removal_release_the_source_and_device_in_order() {
     assert!(p.client.offer_selection(2).is_err());
     assert!(p.client.global_name(5).is_none() && !p.client.closed());
     // The manager has no destructor: its id stays taken and silent.
-    assert_eq!(p.client.kind(11).unwrap(), Kind::DataManager);
+    assert_eq!(
+        p.client.kind(11).unwrap(),
+        Kind::DataManager(Board::Clipboard)
+    );
     assert!(p.event(message(11, 0, &[])).is_err());
     // Seat removal: the keyboard, the pointer, the clipboard, the seat.
     let (mut p, peer, seat, keyboard, pointer, device) = clipboard_fixture();
@@ -1785,6 +1820,289 @@ fn manager_and_seat_removal_release_the_source_and_device_in_order() {
     }
     p.event(message(REGISTRY, 1, &[5])).unwrap();
     assert!(p.clipboard.iter().all(|e| *e == "selection"));
+}
+
+const PRIMARY: &str = "zwp_primary_selection_device_manager_v1";
+
+/// A bound probe that asked for the primary selection, whose compositor
+/// offers both managers: `(probe, peer, seat, keyboard, primary device)`.
+/// The clipboard takes ids 11 and 12, the primary selection 13 and 14.
+fn primary_fixture() -> (Probe, UnixStream, u32, u32, u32) {
+    let (a, b) = pair();
+    let mut p = Probe::new(a);
+    p.client.want_primary();
+    for event in [
+        global(1, "wl_compositor", 4),
+        global(2, "wl_shm", 1),
+        global(3, "xdg_wm_base", 1),
+        global(4, "wl_seat", 10),
+        global(5, "wl_data_device_manager", 3),
+        global(6, PRIMARY, 1),
+    ] {
+        p.event(event).unwrap();
+    }
+    p.event(message(SYNC, 0, &[0])).unwrap();
+    p.event(message(DISPLAY, 1, &[SYNC])).unwrap();
+    p.event(message(SHM, 0, &[1])).unwrap();
+    let seat = p.client.seat().unwrap();
+    let (requests, _) = drain(&b);
+    let binding = requests.iter().rfind(|m| m.object == REGISTRY).unwrap();
+    assert_eq!(
+        bind_target(binding),
+        (PRIMARY.into(), 1, 13),
+        "the primary manager follows the clipboard's at v1"
+    );
+    assert!(requests.contains(&message(11, 1, &[12, seat])));
+    assert!(
+        requests.contains(&message(13, 1, &[14, seat])),
+        "get_device"
+    );
+    assert!(p.client.clipboard() && p.client.primary() && !p.client.is_required(6));
+    assert_eq!(
+        (p.client.kind(13).unwrap(), p.client.kind(14).unwrap()),
+        (
+            Kind::DataManager(Board::Primary),
+            Kind::DataDevice(Board::Primary)
+        )
+    );
+    p.event(message(seat, 0, &[3])).unwrap();
+    let keyboard = p.client.keyboard().unwrap();
+    drain(&b);
+    (p, b, seat, keyboard, 14)
+}
+
+#[test]
+fn the_primary_selection_is_bound_only_when_asked_for() {
+    let (_p, _peer, _, _, _) = primary_fixture();
+    // Not asked for: the clipboard alone, at the same ids as ever.
+    let (a, b) = pair();
+    let mut p = Probe::new(a);
+    for event in [
+        global(1, "wl_compositor", 4),
+        global(2, "wl_shm", 1),
+        global(3, "xdg_wm_base", 1),
+        global(4, "wl_seat", 10),
+        global(5, "wl_data_device_manager", 3),
+        global(6, PRIMARY, 1),
+    ] {
+        p.event(event).unwrap();
+    }
+    p.event(message(SYNC, 0, &[0])).unwrap();
+    assert!(p.client.clipboard() && !p.client.primary());
+    assert!(p
+        .client
+        .offer_primary(1)
+        .unwrap_err()
+        .contains("no primary selection device"));
+    assert!(p.client.primary_mime().is_none() && p.client.primary_source().is_none());
+    assert!(!drain(&b)
+        .0
+        .iter()
+        .any(|m| m.object == REGISTRY && bind_target(m).0 == PRIMARY));
+    // Asked for, but not offered at the roundtrip: none, and a manager
+    // advertised later is not bound.
+    let (a, b) = pair();
+    let mut p = Probe::new(a);
+    p.client.want_primary();
+    for event in [
+        global(1, "wl_compositor", 4),
+        global(2, "wl_shm", 1),
+        global(3, "xdg_wm_base", 1),
+        global(4, "wl_seat", 10),
+    ] {
+        p.event(event).unwrap();
+    }
+    p.event(message(SYNC, 0, &[0])).unwrap();
+    drain(&b);
+    p.event(global(6, PRIMARY, 1)).unwrap();
+    assert!(!p.client.primary() && drain(&b).0.is_empty());
+}
+
+#[test]
+fn the_primary_selection_offers_receives_sends_and_releases_on_its_own_opcodes() {
+    let (mut p, peer, _, keyboard, device) = primary_fixture();
+    // An offer and its selection, under the primary device's schema.
+    p.event(message(device, 0, &[0xff00_0020])).unwrap();
+    p.event(text_event(0xff00_0020, 0, "image/png")).unwrap();
+    p.event(text_event(0xff00_0020, 0, PLAIN)).unwrap();
+    assert!(
+        p.event(message(0xff00_0020, 1, &[7])).is_err(),
+        "no actions"
+    );
+    p.event(message(device, 1, &[0xff00_0020])).unwrap();
+    assert_eq!(p.primary, ["selection"]);
+    assert!(p.clipboard.is_empty(), "the clipboard saw nothing");
+    assert_eq!(p.client.primary_mime(), Some(PLAIN));
+    assert!(p.client.selection_mime().is_none());
+    // Receive is the offer's opcode 0 and carries the consumer's endpoint.
+    let (mut reader, writer) = endpoint();
+    p.client.receive_primary(&writer).unwrap();
+    drop(writer);
+    let (requests, files) = drain(&peer);
+    assert_eq!(requests, [text_event(0xff00_0020, 0, PLAIN)]);
+    let mut file = files.into_iter().next().unwrap();
+    file.write_all(b"primary").unwrap();
+    drop(file);
+    let mut text = String::new();
+    reader.read_to_string(&mut text).unwrap();
+    assert_eq!(text, "primary");
+    // A new selection retires the old offer with destroy, opcode 1.
+    p.event(message(device, 0, &[0xff00_0021])).unwrap();
+    p.event(text_event(0xff00_0021, 0, UTF8)).unwrap();
+    p.event(message(device, 1, &[0xff00_0021])).unwrap();
+    let (requests, _) = drain(&peer);
+    let sync = barrier(&requests);
+    assert_eq!(
+        requests,
+        [message(0xff00_0020, 1, &[]), message(DISPLAY, 0, &[sync])]
+    );
+    barrier_done(&mut p, sync);
+    // Keyboard leave retires the primary selection with the clipboard's.
+    p.event(message(keyboard, 1, &[5, SURFACE, 0])).unwrap();
+    p.event(message(keyboard, 2, &[6, SURFACE])).unwrap();
+    assert!(p.client.primary_mime().is_none());
+    let (requests, _) = drain(&peer);
+    let sync = barrier(&requests);
+    assert_eq!(
+        requests,
+        [message(0xff00_0021, 1, &[]), message(DISPLAY, 0, &[sync])]
+    );
+    barrier_done(&mut p, sync);
+    // A source: both MIMEs, then set_selection at opcode 0.
+    let source = p.client.offer_primary(77).unwrap();
+    assert_eq!(p.client.primary_source(), Some(source));
+    assert!(p.client.source().is_none());
+    assert_eq!(
+        drain(&peer).0,
+        [
+            message(13, 0, &[source]),
+            text_event(source, 0, UTF8),
+            text_event(source, 0, PLAIN),
+            message(device, 0, &[source, 77]),
+        ]
+    );
+    // Its send is opcode 0 and carries the right; its cancel, opcode 1,
+    // carries none, nor does the clipboard source's opcode 0, `target`.
+    let send = text_event(source, 0, UTF8);
+    assert!(p.client.needs_descriptor(&send).unwrap());
+    assert!(!p.client.needs_descriptor(&message(source, 1, &[])).unwrap());
+    let clipboard = p.client.offer_selection(76).unwrap();
+    drain(&peer);
+    assert!(!p
+        .client
+        .needs_descriptor(&text_event(clipboard, 0, UTF8))
+        .unwrap());
+    let (mut reader, writer) = endpoint();
+    send_right_at(&mut p, &peer, source, 0, UTF8, &writer);
+    drop(writer);
+    assert_eq!(p.primary, ["selection", "selection", "send"]);
+    let mut text = String::new();
+    reader.read_to_string(&mut text).unwrap();
+    assert_eq!(text, "probe text");
+    let (mut reader, writer) = endpoint();
+    send_right_at(&mut p, &peer, source, 0, "image/png", &writer);
+    drop(writer);
+    assert_eq!(reader.read(&mut [0]).unwrap(), 0, "unsupported: dropped");
+    assert!(p.event(message(source, 2, &[])).is_err(), "unknown event");
+    p.event(message(source, 1, &[])).unwrap();
+    assert_eq!(p.primary, ["selection", "selection", "send", "cancelled"]);
+    assert!(p.client.primary_source().is_none());
+    assert_eq!(
+        p.client.kind(source).unwrap(),
+        Kind::RetiredDataSource(Board::Primary)
+    );
+    assert_eq!(drain(&peer).0, [message(source, 1, &[])]);
+    // The manager's removal releases the device with its destroy,
+    // opcode 1, and leaves the clipboard alone.
+    let source = p.client.offer_primary(78).unwrap();
+    drain(&peer);
+    p.event(message(REGISTRY, 1, &[6])).unwrap();
+    assert_eq!(p.primary.last(), Some(&"released"));
+    assert!(!p.client.primary() && p.client.clipboard());
+    assert_eq!(
+        drain(&peer).0,
+        [message(source, 1, &[]), message(device, 1, &[])]
+    );
+    assert_eq!(
+        p.client.kind(device).unwrap(),
+        Kind::RetiredDataDevice(Board::Primary)
+    );
+    assert!(!p.clipboard.contains(&"released"));
+}
+
+/// The boards share the server's id space. An id one board retired, its
+/// barrier still out, may come back on the other, which then owns it; an
+/// id one board holds live may not.
+#[test]
+fn an_offer_id_reused_across_the_boards_belongs_to_its_newest_board() {
+    let (mut p, peer, _, _, primary) = primary_fixture();
+    let clipboard = 12;
+    selection_offer(&mut p, clipboard, 0xff00_0030, &[PLAIN]);
+    selection_offer(&mut p, clipboard, 0xff00_0031, &[PLAIN]);
+    let (requests, _) = drain(&peer);
+    let sync = barrier(&requests);
+    // 0x30 is retired on the clipboard, its barrier outstanding.
+    p.event(message(primary, 0, &[0xff00_0030])).unwrap();
+    p.event(text_event(0xff00_0030, 0, UTF8)).unwrap();
+    p.event(message(primary, 1, &[0xff00_0030])).unwrap();
+    assert_eq!(p.client.primary_mime(), Some(UTF8));
+    assert_eq!(p.client.selection_mime(), Some(PLAIN));
+    barrier_done(&mut p, sync);
+    assert_eq!(p.client.primary_mime(), Some(UTF8), "the barrier spares it");
+    // 0x31 is the clipboard's live selection.
+    assert!(p
+        .event(message(primary, 0, &[0xff00_0031]))
+        .unwrap_err()
+        .contains("reuses a live offer id"));
+    // The other way: an id the primary selection retired comes back on
+    // the clipboard.
+    let (mut p, peer, _, _, primary) = primary_fixture();
+    for offer in [0xff00_0040, 0xff00_0041] {
+        p.event(message(primary, 0, &[offer])).unwrap();
+        p.event(text_event(offer, 0, UTF8)).unwrap();
+        p.event(message(primary, 1, &[offer])).unwrap();
+    }
+    let (requests, _) = drain(&peer);
+    let sync = barrier(&requests);
+    selection_offer(&mut p, clipboard, 0xff00_0040, &[PLAIN]);
+    assert_eq!(p.client.selection_mime(), Some(PLAIN));
+    barrier_done(&mut p, sync);
+    assert_eq!(p.client.selection_mime(), Some(PLAIN));
+    assert_eq!(p.client.primary_mime(), Some(UTF8));
+}
+
+/// Seat removal releases the keyboard, the pointer, the clipboard's
+/// source and device, the primary selection's, then the seat; each id
+/// waits for `delete_id`.
+#[test]
+fn seat_removal_releases_the_primary_selection_after_the_clipboard() {
+    let (mut p, peer, seat, keyboard, primary) = primary_fixture();
+    let pointer = p.client.pointer().unwrap();
+    let clipboard = p.client.offer_selection(1).unwrap();
+    let source = p.client.offer_primary(2).unwrap();
+    drain(&peer);
+    p.event(message(REGISTRY, 1, &[4])).unwrap();
+    assert!(!p.client.clipboard() && !p.client.primary());
+    assert_eq!(
+        drain(&peer).0,
+        [
+            message(keyboard, 0, &[]),
+            message(pointer, 1, &[]),
+            message(clipboard, 1, &[]),
+            message(12, 2, &[]),
+            message(source, 1, &[]),
+            message(primary, 1, &[]),
+            message(seat, 3, &[]),
+        ]
+    );
+    assert_eq!(
+        p.client.kind(primary).unwrap(),
+        Kind::RetiredDataDevice(Board::Primary)
+    );
+    for id in [source, primary] {
+        p.event(message(DISPLAY, 1, &[id])).unwrap();
+        assert_eq!(p.client.kind(id).unwrap(), Kind::Free);
+    }
 }
 
 #[test]

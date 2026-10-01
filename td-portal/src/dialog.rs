@@ -465,8 +465,12 @@ impl<'a, F: Fn(Notice) -> Result<()>> Dialog<'a, F> {
             Handled::Clipboard(ClipboardEvent::Released) => {
                 Err("private data device manager was withdrawn mid-dialog".into())
             }
-            // The portal reads neither the pointer nor the clipboard.
-            Handled::Capabilities { .. } | Handled::Pointer(_) | Handled::Clipboard(_) => Ok(()),
+            // The portal reads neither the pointer nor the clipboard, and never
+            // asks for the primary selection.
+            Handled::Capabilities { .. }
+            | Handled::Pointer(_)
+            | Handled::Clipboard(_)
+            | Handled::Primary(_) => Ok(()),
             Handled::Unhandled => {
                 if self.pulse == Some(message.object) && message.opcode == 0 {
                     // The keepalive round-trip closed; retire the callback so

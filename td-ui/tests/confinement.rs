@@ -627,8 +627,9 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
     assert!(clipboard.contains("const O_ACCMODE: usize = 3;"));
     // The client is the toolkit's one consumer of a received right, through
     // two pops: the keymap reader's, exactly one per `wl_keyboard.keymap`,
-    // reading a regular file positionally and compiling it whole, and the
-    // send's, handed on typed or dropped (UNSAFE.md §19).
+    // reading a regular file positionally and compiling it whole, and a
+    // source's send, either board's, handed on typed or dropped (UNSAFE.md
+    // §19).
     let client = include_str!("../src/client.rs");
     let client = client.split("#[cfg(test)]").next().unwrap();
     assert_eq!(
@@ -638,10 +639,11 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
     );
     assert_eq!(
         client
-            .matches("Handled::Clipboard(ClipboardEvent::Send(right))")
+            .matches("outcome(board, ClipboardEvent::Send(right))")
             .count(),
         1
     );
+    assert_eq!(client.matches("ClipboardEvent::Send(").count(), 1);
     assert_eq!(client.matches("read_keymap(fd, format, size)").count(), 1);
     assert_eq!(client.matches("File::from(fd)").count(), 1);
     assert_eq!(client.matches("Keymap::parse(source)").count(), 1);

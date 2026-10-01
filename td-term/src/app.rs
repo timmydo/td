@@ -1305,6 +1305,8 @@ impl App for Window {
             },
             Handled::Pointer(event) => self.pointer(event)?,
             Handled::Clipboard(event) => self.clipboard(event),
+            // td-term does not ask for the primary selection.
+            Handled::Primary(_) => {}
             Handled::Capabilities { keyboard, pointer } => {
                 if !keyboard {
                     self.keymap_ready = false;

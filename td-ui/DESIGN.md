@@ -255,7 +255,11 @@ of its own files may name each module.
   bytes that end one, and `MAX_BYTES`, the bound either side of a byte;
   under "Following links" below.
 - `data`: `DeviceEvent`, `SourceEvent`, `device`, `source` and `offer`, the
-  exact core data-device v3 schemas; `Offer`, the record the client keeps
+  exact core data-device v3 schemas, and `primary_device`,
+  `primary_source` and `primary_offer`, primary-selection v1's; `Board`,
+  which of the seat's two selections a device serves, with its manager
+  global and version, its request and send opcodes, and its schemas by
+  board; `Offer`, the record the client keeps
   per server offer, with `mime`, its preferred supported text type, and
   `announce` under the budgets; `UTF8` and `PLAIN`, the two text MIMEs a
   consumer offers and accepts; `OFFER_LIMIT`, `ANNOUNCEMENTS` and
@@ -425,8 +429,9 @@ of its own files may name each module.
   object kinds as `T: Tag` (`retired` says which of them wait for
   `delete_id`) inside `Kind<T>`, beside the client's own (the fixed slots,
   pools, buffers, frames, the pointer image's, the seat, keyboard and
-  pointer, and the data-device manager, device, sources and sync barriers,
-  with their retired states); the fixed ids `DISPLAY` through `TOPLEVEL` and
+  pointer, and each board's manager, device, sources and sync barriers,
+  with their retired states, each naming its `Board`); the fixed ids
+  `DISPLAY` through `TOPLEVEL` and
   the budgets `OBJECTS`, `GLOBALS`, `NAME_BYTES`, `BUFFERS`,
   `MESSAGES_PER_TURN` and `INITIAL_DEADLINE`; `new`, the table (`allocate`
   and `set_tag` for the consumer's own objects, `kind` for any slot), the
@@ -444,7 +449,10 @@ of its own files may name each module.
   (`clipboard` for a live data device, `selection` and `selection_mime` for
   the seat's selection and its preferred text type, `receive` to ask it for
   its text over a consumer's endpoint, `offer_selection` to offer text at a
-  serial, and `source` for the live source whose text the consumer keeps),
+  serial, and `source` for the live source whose text the consumer keeps;
+  `want_primary` before the initial roundtrip asks for the primary
+  selection too, read through `primary`, `primary_mime`,
+  `receive_primary`, `offer_primary` and `primary_source`),
   the pointer image's `cursor`, the state accessors `bound`, `configured`
   and `closed`, `activated` (whether the last applied toplevel configure
   carried the xdg `activated` state), `presented` (the buffer the last
@@ -460,7 +468,8 @@ of its own files may name each module.
   key and `Stroke`, `Refused`, `Held` with the roles a modifier snapshot
   holds), `Pointer` with the decoded `pointer::Event`,
   `Clipboard` with a `ClipboardEvent` (`Selection`, `Send` carrying the
-  right to write the offered text to, `Cancelled`, `Released`), or
+  right to write the offered text to, `Cancelled`, `Released`), `Primary`
+  with the same for the primary selection, or
   `Unhandled` for the consumer's own objects. `App` (`client`,
   `needs_descriptor` for the consumer's own rights, `descriptor_wait`,
   `tick`, `event`, `end_turn`, `draw`) is what `run` drives: the registry
@@ -1129,6 +1138,22 @@ not frames, and stays its own).
   and stays inert, and a retired device's events are schema-checked and
   drained until `delete_id`. Every event schema is checked whole before a
   right is waited for or consumed.
+- The primary selection: only for a consumer that called `want_primary`
+  before the initial roundtrip, one seat-bound
+  `zwp_primary_selection_device_manager_v1` device at v1, bound after the
+  clipboard's under the same rules and taking the next two ids, its
+  outcomes `Primary` rather than `Clipboard`. It is the clipboard's
+  machinery over a second board: the same offer budgets, selection,
+  retirement barriers (one outstanding per board), source with both text
+  MIMEs, send, cancel and release, and the same focus rule, keyboard leave
+  and loss retiring both boards' offers. Its protocol has no drag, no
+  actions and its own opcodes, which `Board` holds: `set_selection` 0,
+  device destroy 1, offer `receive` 0 and destroy 1, and the source's
+  `send` event 0. Its manager is left inert like the clipboard's, though
+  it has a destructor. The boards share the server's id space, so an offer
+  id one board holds live is an error on the other, and one it holds
+  retired, its barrier still out, is dropped there and owned by the newer
+  board.
 - The repeat policy (`repeat`): held keys up to the held-set budget;
   focus gain installs its held keys without typing or arming repeat, and
   presses wait for the modifier snapshot that follows; duplicate presses
@@ -1381,16 +1406,21 @@ by generation; focus loss, drags and a retired device retiring offers and
 the selection; a source offering both text MIMEs, its sends handed on or
 dropped with their rights, a malformed send leaving the FIFO alone, and its
 retirement on cancel or replacement; manager and seat removal releasing the
-source and device in order; the complete loop on a thread accepting split
-events and closing cleanly; and the loop parking an event until its right
-arrives, in wire order, with the idle wait restored. Sixteen of these moved
-from td-editor's window tests (the presentation nine, the pointer image, the
-seat binding, the keymap reader's shared-offset and bad-source oracle, the
-last a unit test beside `read_keymap`, and the clipboard lifecycle four:
-offer retirement and reuse, coalesced barriers, drag offers with the
-malformed-send FIFO oracle, and offer budgets with a retired device); the
-editor keeps its transfer, request and control coverage and its reactions to
-the client's device and clipboard outcomes.
+source and device in order; the primary selection bound only when asked for,
+after the clipboard, and its offers, selection, receive, source, send, cancel
+and release on its own opcodes, focus loss retiring it and its removal
+leaving the clipboard alone, an offer id reused across the boards owned by
+the newer, and seat removal releasing it after the clipboard; the complete
+loop on a thread accepting split events and closing cleanly; and the loop
+parking an event until its right arrives, in wire order, with the idle wait
+restored. Sixteen of these moved from td-editor's window tests (the
+presentation nine, the pointer image, the seat binding, the keymap reader's
+shared-offset and bad-source oracle, the last a unit test beside
+`read_keymap`, and the clipboard lifecycle four: offer retirement and reuse,
+coalesced barriers, drag offers with the malformed-send FIFO oracle, and
+offer budgets with a retired device); the editor keeps its transfer, request
+and control coverage and its reactions to the client's device and clipboard
+outcomes.
 
 The terminal's suites are its specification files and in-file tests,
 listed by obligation in `td-term/DESIGN.md` §6. `vt_spec.rs`, compiled
@@ -2766,6 +2796,9 @@ regressions. Those increments extend the original sequence below.
     its own raw module down to two syscalls. Landed. td-mail and
     td-news copy and paste through it in their own increment
     (APPLICATIONS.md §W.8, "Reworked again" and "Composing in place").
+    The primary selection, the client's second board under the same
+    rules, landed after for td-term, which sets it from a selection and
+    pastes it on a middle click.
 17. Outline reader and coverage: `sfnt` and `coverage` under "Outline
     faces and the glyph atlas", pure, proven against fonts the tests
     encode, with pixel and closed-form area oracles. Landed.

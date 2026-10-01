@@ -423,6 +423,8 @@ impl Window {
             Handled::Keyboard(event) => self.keyboard_event(event),
             Handled::Pointer(event) => self.pointer_event(event),
             Handled::Clipboard(event) => self.clipboard_event(event),
+            // The editor never asks for the primary selection.
+            Handled::Primary(_) => Ok(()),
             Handled::Unhandled => Err(format!(
                 "unexpected Wayland event {}:{}",
                 message.object, message.opcode
@@ -5211,6 +5213,7 @@ mod tests {
         COMPOSITOR, DISPLAY, INITIAL_DEADLINE, REGISTRY, SHM, SURFACE, SYNC, TOPLEVEL, WM,
         XDG_SURFACE,
     };
+    use td_ui::data::Board;
     use td_ui::wayland::{backing_file, Connection, Endpoint};
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
@@ -6515,7 +6518,10 @@ mod tests {
             );
             assert_eq!(w.ui.editor().document(1).unwrap().text(), " abc\n");
             assert_eq!(w.ui.editor().document(1).unwrap().history_depth(), (1, 0));
-            assert_eq!(w.client.kind(source).unwrap(), Kind::RetiredDataSource);
+            assert_eq!(
+                w.client.kind(source).unwrap(),
+                Kind::RetiredDataSource(Board::Clipboard)
+            );
             assert!(w.client.repeat(1000).unwrap().is_none());
             w.ui.dispatch(Event::Edit {
                 tab: 1,

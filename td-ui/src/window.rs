@@ -750,6 +750,8 @@ impl<H: Handler> App for Window<'_, H> {
             Handled::Keyboard(event) => self.keyboard(event)?,
             Handled::Pointer(event) => self.pointer(event)?,
             Handled::Clipboard(event) => self.clipboard(event),
+            // The widget window never asks for the primary selection.
+            Handled::Primary(_) => {}
             Handled::Capabilities { keyboard, pointer } => {
                 if !pointer {
                     self.wheel = Wheel::default();

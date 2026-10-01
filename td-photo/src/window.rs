@@ -1622,7 +1622,8 @@ impl Window {
             // nothing of the window's.
             Handled::GlobalRemoved { .. }
             | Handled::Capabilities { .. }
-            | Handled::Clipboard(_) => Ok(()),
+            | Handled::Clipboard(_)
+            | Handled::Primary(_) => Ok(()),
             Handled::Unhandled => Err(format!(
                 "unexpected Wayland event {}:{}",
                 message.object, message.opcode

@@ -2778,9 +2778,11 @@ complete bounded compiler must accept it before any press translates. No
 mapping or procfs reopen is used; a concurrent truncation returns an I/O
 error, not SIGBUS. Reads of an admitted regular file are synchronous; no
 hard latency claim is made for a stalled filesystem. A refused map leaves
-the keyboard without one until a later map succeeds. The other pop is
-`wl_data_source.send`: after the complete schema is checked, exactly one
-right is popped per send; for the live source and a supported text MIME it
+the keyboard without one until a later map succeeds. The other pop is a
+source's send, `wl_data_source.send` or, for a consumer that asked for the
+primary selection, `zwp_primary_selection_source_v1.send`, at one site for
+both: after the complete schema is checked, exactly one right is popped
+per send; for the live source and a supported text MIME it
 is handed to the consumer as an owned descriptor inside the typed outcome,
 otherwise it is dropped, closing the descriptor, and the consumer's use of a
 handed-on right is its own contract: the widget window and the editor's
