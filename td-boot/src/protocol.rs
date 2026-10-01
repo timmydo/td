@@ -111,6 +111,13 @@ pub const LIVE_CMDLINE_TOKEN: &str = "td.live=1";
 // Every value is reserved, not only the one td-boot writes.
 #[allow(dead_code)]
 pub const LIVE_CMDLINE_PREFIX: &str = "td.live=";
+// The stock selector initramfs, carried in the system's root image so a live
+// installer takes its template from root.erofs, which live-root has hashed,
+// rather than from the unauthenticated ESP image on the medium. Root-relative
+// for the reason TRUSTED_KEY_PATH is. It holds no trust root or volume
+// identity; an installation appends both.
+#[allow(dead_code)]
+pub const SELECTOR_TEMPLATE_PATH: &str = "lib/td-boot/selector-initramfs.cpio";
 // The live selector's trust root, handed over as its 64 hex digits so the live
 // system holds the key its deployment was authenticated under. Reserved in
 // every base line, as the live token is.

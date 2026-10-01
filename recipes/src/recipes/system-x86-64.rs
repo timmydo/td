@@ -4292,6 +4292,15 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-update}/bin/td-update".into(),
         link: "{root}/real-root/bin/td-update".into(),
     });
+    // The installer core a live boot serves from; nothing starts it yet.
+    steps.push(Step::CopyTree {
+        from: "{in:td-install}".into(),
+        dest: "{root}/real-root{in:td-install}".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-install}/bin/td-install".into(),
+        link: "{root}/real-root/bin/td-install".into(),
+    });
     // The software UI is static and owns no dynamic runtime closure.
     steps.push(Step::CopyTree {
         from: "{in:td-vm-guest}".into(),
@@ -5136,6 +5145,14 @@ fn invalid_system_policy(why: &str) -> Recipe {
     }])
 }
 
+/// The root-relative directory the selector template is copied into; its
+/// file name is the stock selector's own.
+fn selector_template_dir() -> &'static str {
+    td_boot_protocol::SELECTOR_TEMPLATE_PATH
+        .rsplit_once('/')
+        .map_or("", |(directory, _)| directory)
+}
+
 pub fn recipe() -> Recipe {
     let mut steps = Vec::new();
     steps.push(Step::MkDir {
@@ -5238,6 +5255,15 @@ pub fn recipe() -> Recipe {
     steps.push(Step::CopyFiles {
         files: vec!["{root}/selector-initramfs.cpio".into()],
         dest: "{out}/boot".into(),
+    });
+    // The live installer's selector template, inside the image live-root
+    // hashes rather than on the medium's unauthenticated ESP.
+    steps.push(Step::MkDir {
+        path: format!("{{root}}/real-root/{}", selector_template_dir()),
+    });
+    steps.push(Step::CopyFiles {
+        files: vec!["{root}/selector-initramfs.cpio".into()],
+        dest: format!("{{root}}/real-root/{}", selector_template_dir()),
     });
     steps.push(Step::Sha256Manifest {
         output: "{out}/boot/manifest".into(),
@@ -5370,6 +5396,7 @@ pub fn recipe() -> Recipe {
             "td-seatd",
             "td-vm-guest",
             "td-update",
+            "td-install",
             "td-audio",
             "td-compositor",
             "td-busd",
@@ -7423,6 +7450,72 @@ mod tests {
             .iter()
             .any(|step| matches!(step, Step::CopyTree { from, dest }
             if from == "{in:td-update}" && dest == "{root}/real-root{in:td-update}")));
+    }
+
+    #[test]
+    fn the_live_installer_and_its_selector_template_are_in_the_root_image() {
+        let recipe = recipe();
+        assert!(recipe
+            .native_inputs
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|input| input == "td-install"));
+        let steps = recipe.steps.unwrap();
+        assert!(steps.iter().any(|step| matches!(step, Step::Symlink { target, link }
+            if target == "{in:td-install}/bin/td-install" && link == "{root}/real-root/bin/td-install")));
+        assert!(steps
+            .iter()
+            .any(|step| matches!(step, Step::CopyTree { from, dest }
+            if from == "{in:td-install}" && dest == "{root}/real-root{in:td-install}")));
+        // The template is the stock selector, copied into the real root before
+        // it is packed, at the path the protocol names.
+        let dir = format!("{{root}}/real-root/{}", selector_template_dir());
+        assert_eq!(
+            format!("{dir}/selector-initramfs.cpio"),
+            format!(
+                "{{root}}/real-root/{}",
+                td_boot_protocol::SELECTOR_TEMPLATE_PATH
+            )
+        );
+        let copied = steps
+            .iter()
+            .position(|step| {
+                matches!(step, Step::CopyFiles { files, dest }
+                if files == &["{root}/selector-initramfs.cpio"] && dest == &dir)
+            })
+            .unwrap();
+        let packed = steps
+            .iter()
+            .position(
+                |step| matches!(step, Step::PackErofs { root, .. } if root == "{root}/real-root"),
+            )
+            .unwrap();
+        assert!(copied < packed);
+        let made = steps
+            .iter()
+            .position(|step| matches!(step, Step::MkDir { path } if path == &dir))
+            .unwrap();
+        assert!(made < copied);
+        // Before the profiler indexes the real root, so td-install's ELF and
+        // debug companion are covered as td-update's are.
+        let indexed = steps
+            .iter()
+            .position(|step| {
+                matches!(step, Step::Run { argv, .. }
+                    if argv.iter().any(|arg| arg == "{root}/real-root/etc/td-profiler-objects.tsv"))
+            })
+            .unwrap();
+        for installed in [
+            steps
+                .iter()
+                .position(|step| matches!(step, Step::CopyTree { from, .. } if from == "{in:td-install}")),
+            steps.iter().position(
+                |step| matches!(step, Step::Symlink { link, .. } if link == "{root}/real-root/bin/td-install"),
+            ),
+        ] {
+            assert!(installed.unwrap() < indexed && indexed < packed);
+        }
     }
 
     #[test]

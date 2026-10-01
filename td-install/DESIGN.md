@@ -688,6 +688,18 @@ application-evidence boot uses the first installed volume's observed UUID;
 other host-only boot oracles retain their existing provisioned selectors.
 INSTALLER.md owns the generator's output and future-plan boundary.
 
+The system's root image carries the stock selector at
+`/lib/td-boot/selector-initramfs.cpio` (td-boot's root-relative
+`SELECTOR_TEMPLATE_PATH`) and `td-install` at `/bin/td-install`, so a live
+installer finds both in the root image `live-root` hashed against the
+authenticated manifest rather than on the medium's unauthenticated ESP.
+That template carries neither a trust root nor a volume identity, so as
+shipped it does not meet `prepare-selector`'s precondition of a template
+that already holds the trusted key (INSTALLER.md): its caller must append
+the trust root first, and `prepare-selector` still appends only the
+identity. A selector built from it without a key refuses to boot. Nothing
+uses them yet.
+
 ### Refreshing partitions after formatting
 
 `td-init reread-partitions DEVICE` is the explicit kernel refresh between
