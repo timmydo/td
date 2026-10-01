@@ -1,0 +1,425 @@
+//! The vault's thread: it alone holds td-secret's standalone `Host`, the
+//! unlocked `Vault` and the enrolled keys' credentials, and serves the
+//! window's commands in order. A token operation blocks this thread, not
+//! the window; its prompts travel to the window and wait for the answer
+//! with the operation's number. The window abandons an operation through
+//! `Client::cancel`, which cancels its token session and declines the
+//! prompt it may be waiting on.
+
+use std::sync::mpsc::{self, Receiver, Sender};
+
+use td_secret::pass;
+
+use crate::plain::{Bytes, Text};
+use crate::protocol::{
+    Answer, Ask, Change, Command, Failure, Item, KeyLabel, Op, PinUse, Reply, Role,
+};
+
+struct Job {
+    command: Command,
+    cancel: pass::Cancel,
+}
+
+/// The window's end of the vault's thread. Dropping it ends the thread,
+/// and the vault with it.
+pub struct Client {
+    jobs: Sender<Job>,
+    answers: Sender<(Op, Answer)>,
+    replies: Receiver<Reply>,
+    current: Option<(Op, pass::Cancel)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+pub fn start() -> Result<Client, String> {
+    let (jobs, job_rx) = mpsc::channel();
+    let (answers, answer_rx) = mpsc::channel();
+    let (reply_tx, replies) = mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("vault".to_owned())
+        .spawn(move || serve(&job_rx, &answer_rx, &reply_tx))
+        .map_err(|error| format!("td-pass cannot start its vault thread: {error}"))?;
+    Ok(Client {
+        jobs,
+        answers,
+        replies,
+        current: None,
+        thread: Some(thread),
+    })
+}
+
+impl Client {
+    pub fn send(&mut self, command: Command) {
+        let cancel = pass::Cancel::new();
+        if let Command::Create { op } | Command::Unlock { op, .. } | Command::Apply { op, .. } =
+            command
+        {
+            self.current = Some((op, cancel.clone()));
+        }
+        // A thread that is gone answers nothing; the window stays on what
+        // it shows.
+        let _ = self.jobs.send(Job { command, cancel });
+    }
+
+    pub fn answer(&self, op: Op, answer: Answer) {
+        let _ = self.answers.send((op, answer));
+    }
+
+    /// Abandons the operation in flight, if any.
+    pub fn cancel(&mut self) {
+        if let Some((op, cancel)) = self.current.take() {
+            cancel.cancel();
+            self.answer(op, Answer::Decline);
+        }
+    }
+
+    pub fn try_recv(&self) -> Option<Reply> {
+        self.replies.try_recv().ok()
+    }
+}
+
+/// Closing the window ends the thread: the operation in flight is
+/// cancelled, the channels close, and the thread drops the vault and the
+/// host, whose token worker it stops, before the process exits.
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.cancel();
+        let (jobs, _) = mpsc::channel();
+        let (answers, _) = mpsc::channel();
+        drop(std::mem::replace(&mut self.jobs, jobs));
+        drop(std::mem::replace(&mut self.answers, answers));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sender<Reply>) {
+    let mut host: Option<pass::Host> = None;
+    let mut vault: Option<pass::Vault> = None;
+    let mut keys: Vec<pass::Key> = Vec::new();
+    while let Ok(Job { command, cancel }) = jobs.recv() {
+        let reply = match command {
+            Command::Open => match pass::Host::open().and_then(|opened| {
+                let listed = opened.keys()?;
+                Ok((opened, listed))
+            }) {
+                Ok((opened, listed)) => {
+                    host = Some(opened);
+                    Reply::Opened {
+                        keys: labels(&mut keys, listed),
+                    }
+                }
+                Err(failure) => Reply::Refused {
+                    text: failure.to_string(),
+                },
+            },
+            Command::Create { op } => {
+                let mut asker = Asker {
+                    op,
+                    replies,
+                    answers,
+                };
+                match host.as_mut() {
+                    Some(host) => match host.create(&mut asker, &cancel) {
+                        Ok(created) => {
+                            let entries = items(&created);
+                            vault = Some(created);
+                            Reply::Unlocked { op, entries }
+                        }
+                        Err(failure) => failed(op, &failure),
+                    },
+                    None => closed(op),
+                }
+            }
+            Command::Unlock { op, key } => {
+                let mut asker = Asker {
+                    op,
+                    replies,
+                    answers,
+                };
+                match (host.as_mut(), keys.get(key)) {
+                    (Some(host), Some(key)) => match host.unlock(key, &mut asker, &cancel) {
+                        Ok(unlocked) => {
+                            let entries = items(&unlocked);
+                            vault = Some(unlocked);
+                            Reply::Unlocked { op, entries }
+                        }
+                        Err(failure) => failed(op, &failure),
+                    },
+                    _ => closed(op),
+                }
+            }
+            Command::Read { id } => match vault.as_ref().and_then(|vault| vault.entry(&id)) {
+                Some(entry) => Reply::Entry {
+                    id,
+                    revision: entry.revision,
+                    title: Text::new(entry.title.to_owned()),
+                    body: Bytes::copy(entry.body),
+                },
+                None => Reply::Missing { id },
+            },
+            Command::Apply { op, change } => {
+                let mut asker = Asker {
+                    op,
+                    replies,
+                    answers,
+                };
+                match (host.as_mut(), vault.as_mut()) {
+                    (Some(host), Some(vault)) => {
+                        match host.apply(vault, convert(change), &mut asker, &cancel) {
+                            Ok(committed) => Reply::Committed {
+                                op,
+                                id: committed.id,
+                                revision: committed.revision,
+                            },
+                            Err(failure) => failed(op, &failure),
+                        }
+                    }
+                    _ => closed(op),
+                }
+            }
+            Command::Lock => {
+                vault = None;
+                match host.as_ref().map(pass::Host::keys) {
+                    Some(Ok(listed)) => Reply::Locked {
+                        keys: labels(&mut keys, listed),
+                    },
+                    Some(Err(failure)) => Reply::Refused {
+                        text: failure.to_string(),
+                    },
+                    None => Reply::Locked { keys: None },
+                }
+            }
+        };
+        // An answer that arrived after its operation ended is dropped
+        // now, clearing any PIN it carried, rather than at the next prompt.
+        while answers.try_recv().is_ok() {}
+        if replies.send(reply).is_err() {
+            break;
+        }
+    }
+}
+
+/// Keeps the credentials here and gives the window their labels.
+fn labels(keys: &mut Vec<pass::Key>, listed: Option<Vec<pass::Key>>) -> Option<Vec<KeyLabel>> {
+    *keys = listed?;
+    Some(keys.iter().map(label).collect())
+}
+
+fn label(key: &pass::Key) -> KeyLabel {
+    KeyLabel {
+        role: role(key.role()),
+        fingerprint: key.fingerprint().to_string(),
+    }
+}
+
+fn role(role: pass::KeyRole) -> Role {
+    match role {
+        pass::KeyRole::Primary => Role::Primary,
+        pass::KeyRole::Backup => Role::Backup,
+    }
+}
+
+fn items(vault: &pass::Vault) -> Vec<Item> {
+    vault
+        .entries()
+        .map(|summary| Item {
+            id: summary.id,
+            revision: summary.revision,
+            title: Text::new(summary.title.to_owned()),
+        })
+        .collect()
+}
+
+fn convert(change: Change) -> pass::Change {
+    match change {
+        Change::Create { title, body } => pass::Change::Create {
+            title: title.take(),
+            body: body.take(),
+        },
+        Change::Edit {
+            id,
+            base,
+            title,
+            body,
+        } => pass::Change::Edit {
+            id,
+            base,
+            title: title.take(),
+            body: body.take(),
+        },
+        Change::Rename { id, base, title } => pass::Change::Rename {
+            id,
+            base,
+            title: title.take(),
+        },
+        Change::Delete { id, base } => pass::Change::Delete { id, base },
+    }
+}
+
+fn failed(op: Op, failure: &pass::Failure) -> Reply {
+    Reply::Failed {
+        op,
+        failure: Failure {
+            text: failure.to_string(),
+            stale: failure.stale(),
+            uncertain: failure.uncertain(),
+            cancelled: failure.cancelled(),
+        },
+    }
+}
+
+/// An operation that needs a vault this thread does not hold.
+fn closed(op: Op) -> Reply {
+    Reply::Failed {
+        op,
+        failure: Failure {
+            text: "the notebook is not open".to_owned(),
+            stale: false,
+            uncertain: false,
+            cancelled: false,
+        },
+    }
+}
+
+/// The host authentication prompt over the window: each request goes to
+/// the window, and the answer for this operation comes back; an answer
+/// to an abandoned operation is dropped, clearing any PIN it carried.
+struct Asker<'a> {
+    op: Op,
+    replies: &'a Sender<Reply>,
+    answers: &'a Receiver<(Op, Answer)>,
+}
+
+impl Asker<'_> {
+    fn ask(&mut self, request: pass::Request, pin: Option<PinUse>) -> Result<Answer, String> {
+        let gone = || "the window is gone".to_owned();
+        let ask = Ask {
+            operation: request.operation,
+            role: role(request.role),
+            key: request.key.map(|key| key.to_string()),
+            pin,
+        };
+        self.replies
+            .send(Reply::Ask { op: self.op, ask })
+            .map_err(|_| gone())?;
+        loop {
+            let (op, answer) = self.answers.recv().map_err(|_| gone())?;
+            if op == self.op {
+                return Ok(answer);
+            }
+        }
+    }
+}
+
+impl pass::Prompt for Asker<'_> {
+    fn present(&mut self, request: pass::Request) -> Result<(), String> {
+        match self.ask(request, None)? {
+            Answer::Proceed => Ok(()),
+            _ => Err("declined".to_owned()),
+        }
+    }
+
+    fn pin(&mut self, request: pass::Request, purpose: pass::PinUse) -> Result<Box<[u8]>, String> {
+        let purpose = match purpose {
+            pass::PinUse::Authorize => PinUse::Authorize,
+            pass::PinUse::Enroll => PinUse::Enroll,
+            pass::PinUse::Proof => PinUse::Proof,
+        };
+        match self.ask(request, Some(purpose))? {
+            Answer::Pin(pin) => Ok(pin.take()),
+            _ => Err("declined".to_owned()),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use pass::Prompt;
+
+    fn request() -> pass::Request {
+        pass::Request {
+            operation: "unlock",
+            role: pass::KeyRole::Primary,
+            key: None,
+        }
+    }
+
+    #[test]
+    fn a_prompt_takes_only_its_own_operations_answer() {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let (answer_tx, answer_rx) = mpsc::channel();
+        // A late PIN for an ended operation, then this one's answers.
+        answer_tx
+            .send((1, Answer::Pin(Bytes::copy(b"9999"))))
+            .unwrap();
+        answer_tx
+            .send((2, Answer::Pin(Bytes::copy(b"1234"))))
+            .unwrap();
+        answer_tx.send((2, Answer::Decline)).unwrap();
+        let mut asker = Asker {
+            op: 2,
+            replies: &reply_tx,
+            answers: &answer_rx,
+        };
+        let pin = asker.pin(request(), pass::PinUse::Authorize).unwrap();
+        assert_eq!(&*pin, b"1234");
+        assert!(matches!(
+            reply_rx.try_recv(),
+            Ok(Reply::Ask {
+                op: 2,
+                ask: Ask {
+                    pin: Some(PinUse::Authorize),
+                    ..
+                }
+            })
+        ));
+        assert!(asker.present(request()).is_err());
+        drop(answer_tx);
+        assert!(asker.present(request()).is_err());
+    }
+
+    #[test]
+    fn answers_left_after_a_job_are_dropped_with_it() {
+        let (jobs, job_rx) = mpsc::channel();
+        let (answers, answer_rx) = mpsc::channel();
+        let (reply_tx, replies) = mpsc::channel();
+        answers
+            .send((3, Answer::Pin(Bytes::copy(b"1234"))))
+            .unwrap();
+        jobs.send(Job {
+            command: Command::Read { id: [0; 16] },
+            cancel: pass::Cancel::new(),
+        })
+        .unwrap();
+        drop(jobs);
+        serve(&job_rx, &answer_rx, &reply_tx);
+        assert!(matches!(replies.try_recv(), Ok(Reply::Missing { .. })));
+        assert!(answer_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cancel_declines_the_operation_in_flight_once() {
+        let (jobs, job_rx) = mpsc::channel();
+        let (answers, answer_rx) = mpsc::channel();
+        let (_reply_tx, replies) = mpsc::channel();
+        let mut client = Client {
+            jobs,
+            answers,
+            replies,
+            current: None,
+            thread: None,
+        };
+        client.send(Command::Read { id: [0; 16] });
+        client.cancel();
+        assert!(answer_rx.try_recv().is_err());
+        client.send(Command::Unlock { op: 7, key: 0 });
+        client.cancel();
+        client.cancel();
+        assert!(matches!(answer_rx.try_recv(), Ok((7, Answer::Decline))));
+        assert!(answer_rx.try_recv().is_err());
+        assert_eq!(job_rx.try_iter().count(), 2);
+    }
+}

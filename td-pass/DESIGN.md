@@ -2,8 +2,9 @@
 
 td-pass is a two-pane encrypted notebook for legacy passwords, account
 details and recovery notes. Its production target is one x86-64 Linux
-executable usable on td and Guix System with a Wayland desktop. This
-contract starts the workstream; no td-pass executable is implemented yet.
+executable usable on td and Guix System with a Wayland desktop. The
+window below is implemented in standalone mode; "Implemented window"
+states what it does and what remains.
 [td-secret/PORTABLE.md](../td-secret/PORTABLE.md) owns storage, primary and
 backup YubiKeys, authentication, migration and recovery.
 
@@ -77,6 +78,75 @@ is a distinct adapter: td uses its trusted attention path, while the host
 adapter states its host trust boundary. td-ui's ordinary editor is not a
 trusted authentication widget. Protocol state, device paths, key material
 and cryptographic details stay out of the notebook flow.
+
+## Implemented window
+
+`src/main.rs` dispatches td-secret's token worker before anything else,
+then admits a mode from os-release: an `ID` or `ID_LIKE` naming td is
+refused, since td mode's service is not reached by this build, and an
+unreadable or repeated identity admits nothing; any other system runs
+standalone. No refusal falls back to the other mode.
+
+- **Vault thread.** `src/backend.rs` alone holds td-secret's `pass::Host`,
+  the unlocked `Vault` and the enrolled keys' credentials, and serves the
+  window's commands in order. A token operation blocks it, never the
+  window. Each operation carries a number; its prompts reach the window
+  with it, and an answer for another number is dropped, clearing any PIN
+  it carried. Lock cancels the operation's `pass::Cancel` and declines
+  the prompt it may wait on, then drops the vault.
+- **Window state.** `src/app/` is the notebook as td-ui widgets: the
+  action strip (New, Rename, Delete, Save, Find, Lock), the search field
+  over the title list, the title field over the editor pane, and the
+  status row. It reaches the vault only through commands and replies, so
+  its tests run without a token. Titles and bodies travel in clearing
+  owners (`src/plain.rs`), and the window's title names no entry.
+- **Entries.** Every entry document is loaded through one function that
+  refuses filling first; copy and cut take the selection alone. Save
+  sends an edit, a creation or, for a title alone, a rename against the
+  entry revision read; it reports success only on the vault's commit,
+  and an edit made meanwhile stays dirty. Delete asks first.
+- **Unsaved changes.** Choosing another entry, New, Lock or closing the
+  window with unsaved changes asks Save, Discard or Cancel. While a save
+  is in flight another entry and New wait for it, and Lock or closing
+  offers only Discard; when the save ends the question is asked again
+  against what is then unsaved, so edits made while saving are never
+  given up unasked. Discard closes the entry's document. A failed save
+  keeps the entry dirty. A save is recorded for the document it saved
+  only while that document is open, no save starts while another entry
+  is being read, and a read answered after the open entry was edited
+  leaves that entry open.
+- **Prompt.** A presentation asks for the named key to be connected; a
+  PIN request shows a masked field that refuses copy. Escape or Cancel
+  declines, which the vault reports as cancelled.
+- **Lock.** Lock forgets every document and its history, the find query,
+  the titles, the fields and any pending paste, and withdraws the
+  window's clipboard offer. A paste lands only where it was asked: one
+  for a replaced entry or an ended prompt is dropped.
+- **Frames.** td-ui keeps each frame in a file in the directory it is
+  given. The window gives it `$XDG_RUNTIME_DIR` or `/dev/shm`, whichever
+  `/proc/self/mountinfo` shows on tmpfs or ramfs first, and refuses to
+  start when neither is, so a frame never reaches a disk.
+
+Tests drive the window state headless: unlock through both prompts,
+search, open, edit and save with the entry's line endings, a failed and
+a stale save, the unsaved-changes question, selection-only copy and cut,
+paste, creation, rename, delete, a declined prompt, lock during a save
+with its late replies ignored, the rules for a save in flight, a read
+answered after an edit, pastes bound to their place, the dialog's
+placement and painting the notebook, its prompt and dialog and each
+locked view. The vault thread's tests pin that a prompt takes only its
+operation's answer and that cancel declines once; the frame
+directory's, the mount table's rules. Confinement tests pin the source
+inventory, that pure files reach no system, vault or compositor and
+only the toolkit's drawing, widget and editor modules, that td-secret
+is named only by the vault thread and the worker dispatch, the two
+reads the window makes, and the vault-document policy.
+
+Not yet: clearing td-ui's retained frame buffers on lock (a frame
+showing entry text stays in a buffer the compositor released until it
+is reused), key management, encrypted import and export, the native
+compositor cases, host lock and suspend integration, td mode, and the
+recipe and image integration of increment 5.
 
 ## Delivery and proof
 

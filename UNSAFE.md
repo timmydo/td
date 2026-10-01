@@ -2376,10 +2376,12 @@ instruction/adoption allowances; it is absent from the production
 td-secret binary.
 
 td-secret is a library with a binary that only calls its `run`. The
-library's one other public module, `pass`, the notebook API a desktop
-program links (`td-secret/PORTABLE.md`), reaches these surfaces only
-through the portable host adapter's process protection and token
-worker; linking it adds no syscall, request or allowance.
+library's one other public module, `pass`, the notebook API td-pass
+links (`td-secret/PORTABLE.md`), reaches these surfaces only through
+the portable host adapter's process protection and token worker;
+linking it adds no syscall, request or allowance. td-pass itself
+forbids unsafe code, and its confinement test confines td-secret to
+its backend thread and its worker dispatch.
 
 The client compiles surface 12's `td-secret/src/sys.rs` directly: the same
 three-syscall instruction and exact descriptor-adoption allowance.

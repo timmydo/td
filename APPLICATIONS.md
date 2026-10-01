@@ -10079,7 +10079,7 @@ td-mail reads and composes in is td-editor's editing core moved whole
 into the toolkit (`td-ui/DESIGN.md`, "Editor core"), unchanged in
 behavior, so neither depends on td-editor any more: each names td-ui
 alone, its lock lists the crate and the toolkit, and its recipe stages
-no editor tree. The td-pass notebook window is to embed the same pane.
+no editor tree. The td-pass notebook window embeds the same pane.
 
 ## X. Host mode — development only
 
