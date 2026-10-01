@@ -14,6 +14,8 @@ const INSET: usize = CELL_WIDTH;
 const BODY_TOP: usize = 4 * ROW;
 const BODY_ROWS: usize = 15;
 const WARNING_TOP: usize = BODY_TOP + BODY_ROWS * CELL_HEIGHT + ROW;
+/// The row under the warnings that says what became of an install request.
+const NOTICE_TOP: usize = WARNING_TOP + WARNINGS.len() * ROW;
 const WARNINGS: [&str; 2] = [
     "All data on the selected disk will be lost after trusted consent.",
     "Storage is not encrypted. The account signs in automatically without a password or PIN.",
@@ -29,6 +31,7 @@ pub struct ReviewPage {
     pages: usize,
     status: String,
     footer: Status,
+    notice: Option<&'static str>,
 }
 
 impl ReviewPage {
@@ -37,8 +40,8 @@ impl ReviewPage {
         let scale = surface.scale.value();
         let body = Block::new(surface, (BODY_TOP * scale) as i64, BODY_ROWS)?;
         let footer = Status::new(surface);
-        let warning_end = WARNING_TOP + WARNINGS.len().saturating_sub(1) * ROW + CELL_HEIGHT;
-        if (warning_end * scale) as i64 > footer.rect().y {
+        // The notice row is the lowest, under the warnings.
+        if ((NOTICE_TOP + CELL_HEIGHT) * scale) as i64 > footer.rect().y {
             return None;
         }
         let columns = body
@@ -75,7 +78,7 @@ impl ReviewPage {
         let end = start.saturating_add(BODY_ROWS).min(lines.len());
         let detail = lines.get(start..end)?.join("\n");
         let status = format!(
-            "Review \u{b7} step 4 of 6 \u{b7} detail {}/{}",
+            "Review \u{b7} step 4 of 6 \u{b7} detail {}/{} \u{b7} Enter to install",
             page + 1,
             pages
         );
@@ -87,7 +90,15 @@ impl ReviewPage {
             pages,
             status,
             footer,
+            notice: None,
         })
+    }
+
+    /// Shows `notice`, the installer's own words, cut to the width under
+    /// the warnings.
+    pub fn with_notice(mut self, notice: Option<&'static str>) -> Self {
+        self.notice = notice;
+        self
     }
 
     /// The current zero-based page and total page count.
@@ -157,6 +168,22 @@ impl Composition for ReviewPage {
                 sink,
             );
         }
+        if let Some(notice) = self.notice {
+            let rect = Rect {
+                y: (NOTICE_TOP * scale.value()) as i64,
+                ..heading
+            };
+            let columns = (heading.width as usize) / (CELL_WIDTH * scale.value());
+            text_run(
+                scale,
+                notice.chars().take(columns),
+                (inset, rect.y),
+                rect,
+                GlyphStyle::medium(INK, CHROME),
+                damage,
+                sink,
+            );
+        }
         self.footer.emit(self.status.chars(), damage, sink);
     }
 }
@@ -167,6 +194,31 @@ mod tests {
     use super::*;
     use td_install::installation_plan::{Destination, DestinationObservation, Settings};
     use td_ui::raster::Scale;
+
+    #[test]
+    fn a_notice_is_drawn_under_the_warnings_within_the_width() {
+        let surface = td_ui::raster::Surface::new(
+            crate::MIN_PAGE_WIDTH,
+            crate::MIN_PAGE_HEIGHT,
+            td_ui::raster::Scale::new(1).unwrap(),
+        )
+        .unwrap();
+        let long: &'static str =
+            Box::leak("trusted consent is unavailable ".repeat(6).into_boxed_str());
+        let page = ReviewPage::new(surface, &plan("SERIAL"), 0)
+            .unwrap()
+            .with_notice(Some(long));
+        let mut row = String::new();
+        page.emit(surface.bounds(), &mut |draw| {
+            if let Primitive::Glyph { y, scalar, .. } = draw.primitive {
+                if y == NOTICE_TOP as i64 {
+                    row.push(scalar);
+                }
+            }
+        });
+        assert!(row.starts_with("trusted consent is unavailable"));
+        assert!(row.len() < long.len() && long.starts_with(&row));
+    }
 
     fn plan(serial: &str) -> Plan {
         let disk = Destination::new(DestinationObservation {

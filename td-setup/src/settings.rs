@@ -1,5 +1,6 @@
-//! The account and regional settings form. It renders bounded draft tokens;
-//! wire admission, policy checks, and catalog membership remain separate.
+//! The account and regional settings form: its drafts, edited by keys,
+//! and the page that renders them. Drafts are bounded tokens; wire
+//! admission, policy checks, and catalog membership remain the service's.
 
 use td_ui::chrome::{Field, Item, List, Status, TextEntry, ROW};
 use td_ui::raster::{
@@ -17,7 +18,223 @@ const PLACEHOLDERS: [&str; 4] = [
     "Select a layout",
     "Select a time zone",
 ];
-const FOOTER: &str = "Account and region \u{b7} step 3 of 6";
+const FOOTER: &str = "Account and region \u{b7} step 3 of 6 \u{b7} Enter on Time zone to review";
+/// The row under the last field that says what became of a review.
+const NOTICE_ROW: usize = 18;
+/// The one keyboard layout the installer offers.
+pub const KEYBOARD: &str = "us";
+/// The time zone chosen when the catalog has it and nothing else was.
+const DEFAULT_ZONE: &str = "Etc/UTC";
+/// The rows Page Up and Page Down move a time zone selection.
+const ZONE_PAGE: usize = 16;
+/// The time zone field, the last.
+pub const TIME_ZONE: usize = 3;
+
+/// The form's drafts, focus and carets, edited a key at a time. A draft
+/// is only typed text: the service checks every value it is proposed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Draft {
+    texts: [String; 2],
+    carets: [usize; 2],
+    focused: usize,
+    zones: Vec<String>,
+    zone: Option<usize>,
+    /// What has been typed toward a time zone since it was focused.
+    seek: String,
+}
+
+impl Draft {
+    /// The field that has focus: username, hostname, keyboard or time zone.
+    pub fn focused(&self) -> usize {
+        self.focused
+    }
+
+    /// The four values as the page shows them; an unchosen zone is empty.
+    pub fn values(&self) -> [&str; 4] {
+        let [username, hostname] = &self.texts;
+        let zone = self
+            .zone
+            .and_then(|index| self.zones.get(index))
+            .map_or("", String::as_str);
+        [username, hostname, KEYBOARD, zone]
+    }
+
+    /// The service's catalog. A zone already chosen stays chosen when the
+    /// catalog still has it; otherwise UTC, or nothing, is.
+    pub fn offer(&mut self, zones: Vec<String>) {
+        let [.., chosen] = self.values();
+        let zone = [chosen, DEFAULT_ZONE]
+            .iter()
+            .filter(|wanted| !wanted.is_empty())
+            .find_map(|wanted| zones.iter().position(|zone| zone == wanted));
+        self.zone = zone;
+        self.zones = zones;
+        self.seek.clear();
+    }
+
+    /// What must still be filled in before a review, if anything.
+    pub fn missing(&self) -> Option<&'static str> {
+        let [username, hostname, _, zone] = self.values();
+        if username.is_empty() {
+            Some("Enter a username before review.")
+        } else if hostname.is_empty() {
+            Some("Enter a hostname before review.")
+        } else if zone.is_empty() {
+            Some("Choose a time zone before review.")
+        } else {
+            None
+        }
+    }
+
+    /// Whether there is a catalog to choose from.
+    pub fn offered(&self) -> bool {
+        !self.zones.is_empty()
+    }
+
+    /// Applies one key chord, as td-ui names it; a key the focused field
+    /// does not take changes nothing. True when the draft changed.
+    pub fn key(&mut self, chord: &str) -> bool {
+        // The catalog is not edited by keys, so it is left out.
+        let before = (
+            self.texts.clone(),
+            self.carets,
+            self.focused,
+            self.zone,
+            self.seek.clone(),
+        );
+        let fields = LABELS.len();
+        match chord {
+            "Tab" => self.focus((self.focused + 1) % fields),
+            "S-Tab" => self.focus((self.focused + fields - 1) % fields),
+            _ if self.focused == TIME_ZONE => self.choose(chord),
+            "Down" | "Return" => self.focus(self.focused + 1),
+            "Up" => self.focus(self.focused.saturating_sub(1)),
+            _ => self.type_key(chord),
+        }
+        before
+            != (
+                self.texts.clone(),
+                self.carets,
+                self.focused,
+                self.zone,
+                self.seek.clone(),
+            )
+    }
+
+    fn focus(&mut self, field: usize) {
+        self.focused = field.min(TIME_ZONE);
+        self.seek.clear();
+    }
+
+    fn type_key(&mut self, chord: &str) {
+        let field = self.focused;
+        let (Some(text), Some(caret), Some(limit)) = (
+            self.texts.get_mut(field),
+            self.carets.get_mut(field),
+            LIMITS.get(field),
+        ) else {
+            return;
+        };
+        match chord {
+            "Left" => *caret = caret.saturating_sub(1),
+            "Right" => *caret = (*caret + 1).min(text.len()),
+            "Home" => *caret = 0,
+            "End" => *caret = text.len(),
+            "Backspace" if *caret > 0 => {
+                *caret -= 1;
+                text.remove(*caret);
+            }
+            "Delete" if *caret < text.len() => {
+                text.remove(*caret);
+            }
+            _ => {
+                if let Some(typed) = printable(chord) {
+                    if text.len() < *limit {
+                        text.insert(*caret, typed);
+                        *caret += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Moves through the catalog, or seeks the first zone beginning with
+    /// what was typed, ignoring case; a character that matches none is
+    /// not taken.
+    fn choose(&mut self, chord: &str) {
+        let last = self.zones.len().saturating_sub(1);
+        let at = self.zone;
+        let step = |by: usize, down: bool| match at {
+            Some(index) if down => index.saturating_add(by).min(last),
+            Some(index) => index.saturating_sub(by),
+            None => 0,
+        };
+        let moved = match chord {
+            "Down" => step(1, true),
+            "Up" => step(1, false),
+            "PageDown" => step(ZONE_PAGE, true),
+            "PageUp" => step(ZONE_PAGE, false),
+            "Home" => 0,
+            "End" => last,
+            "Backspace" => {
+                self.seek.pop();
+                return;
+            }
+            _ => {
+                if let Some(typed) = printable(chord) {
+                    self.seek_zone(typed);
+                }
+                return;
+            }
+        };
+        self.seek.clear();
+        if moved < self.zones.len() {
+            self.zone = Some(moved);
+        }
+    }
+
+    fn seek_zone(&mut self, typed: char) {
+        let mut seek = self.seek.clone();
+        seek.push(typed);
+        let found = self.zones.iter().position(|zone| {
+            zone.get(..seek.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(&seek))
+        });
+        if let Some(found) = found {
+            self.seek = seek;
+            self.zone = Some(found);
+        }
+    }
+
+    /// The page over these drafts; `hint` replaces the time zone row's
+    /// placeholder while there is no zone to show, and `notice` says what
+    /// became of a review.
+    pub fn page<'a>(
+        &'a self,
+        surface: Surface,
+        hint: Option<&'a str>,
+        notice: Option<&'a str>,
+    ) -> Option<SettingsPage<'a>> {
+        SettingsPage::new(
+            surface,
+            self.values(),
+            Some(self.focused),
+            self.carets,
+            true,
+        )
+        .map(|page| page.with_hint(hint).with_notice(notice))
+    }
+}
+
+/// The one character a chord types: printable, non-space ASCII, the only
+/// kind a draft token holds.
+fn printable(chord: &str) -> Option<char> {
+    let mut chars = chord.chars();
+    match (chars.next(), chars.next()) {
+        (Some(typed), None) if typed.is_ascii_graphic() => Some(typed),
+        _ => None,
+    }
+}
 
 /// A form view: the two account fields are editable, while keyboard and time
 /// zone are chooser rows for catalog selections. The caller owns the drafts,
@@ -32,6 +249,8 @@ pub struct SettingsPage<'a> {
     entries: [TextEntry; 2],
     choices: [List; 2],
     footer: Status,
+    hint: Option<&'a str>,
+    notice: Option<&'a str>,
 }
 
 impl<'a> SettingsPage<'a> {
@@ -92,7 +311,9 @@ impl<'a> SettingsPage<'a> {
             choice_at(*LABEL_ROWS.get(3)?)?,
         ];
         let footer = Status::new(surface);
-        if choices.last()?.rect().y + i64::from(choices.last()?.rect().height) > footer.rect().y {
+        if choices.last()?.rect().y + i64::from(choices.last()?.rect().height) > footer.rect().y
+            || ((NOTICE_ROW * ROW + CELL_HEIGHT) * scale) as i64 > footer.rect().y
+        {
             return None;
         }
         Some(Self {
@@ -104,10 +325,24 @@ impl<'a> SettingsPage<'a> {
             entries,
             choices,
             footer,
+            hint: None,
+            notice: None,
         })
     }
 
-    /// The currently focused field, if any, for the future turn loop.
+    /// Shows `hint` in place of an empty time zone's placeholder.
+    pub fn with_hint(mut self, hint: Option<&'a str>) -> Self {
+        self.hint = hint;
+        self
+    }
+
+    /// Shows `notice` on its own row under the fields, cut to the width.
+    pub fn with_notice(mut self, notice: Option<&'a str>) -> Self {
+        self.notice = notice;
+        self
+    }
+
+    /// The currently focused field, if any.
     pub fn focused(&self) -> Option<usize> {
         self.focused
     }
@@ -178,6 +413,10 @@ impl Composition for SettingsPage<'_> {
             let Some(placeholder) = PLACEHOLDERS.get(index) else {
                 continue;
             };
+            let placeholder = match self.hint {
+                Some(hint) if index == TIME_ZONE => hint,
+                _ => placeholder,
+            };
             if index < self.entries.len() {
                 let Some(entry) = self.entries.get(index) else {
                     continue;
@@ -223,6 +462,22 @@ impl Composition for SettingsPage<'_> {
                 );
             }
         }
+        if let Some(notice) = self.notice {
+            let rect = Rect {
+                y: (NOTICE_ROW * ROW * scale.value()) as i64,
+                ..heading
+            };
+            let columns = (heading.width as usize) / (CELL_WIDTH * scale.value());
+            text_run(
+                scale,
+                notice.chars().take(columns),
+                (inset, rect.y),
+                rect,
+                GlyphStyle::medium(INK, CHROME),
+                damage,
+                sink,
+            );
+        }
         self.footer.emit(FOOTER.chars(), damage, sink);
     }
 }
@@ -235,6 +490,169 @@ mod tests {
 
     fn surface(width: usize, height: usize) -> Surface {
         Surface::new(width, height, Scale::new(1).unwrap()).unwrap()
+    }
+
+    fn typed(draft: &mut Draft, chords: &[&str]) {
+        for chord in chords {
+            draft.key(chord);
+        }
+    }
+
+    #[test]
+    fn account_drafts_take_printable_characters_within_their_limits() {
+        let mut draft = Draft::default();
+        assert_eq!(draft.focused(), 0);
+        typed(
+            &mut draft,
+            // As td-ui names them: a shifted character is itself, and
+            // only a modified space is `Space`.
+            &["a", "A", "_", " ", "Space", "C-a", "M-b", "\u{e9}", "Tab"],
+        );
+        assert_eq!(draft.values()[0], "aA_");
+        assert_eq!(draft.focused(), 1);
+        typed(
+            &mut draft,
+            &["t", "d", "Left", "Left", "x", "End", "y", "Home", "Delete"],
+        );
+        assert_eq!(draft.values()[1], "tdy");
+        assert!(!draft.key("Backspace"), "nothing before the caret");
+        typed(&mut draft, &["Right", "Backspace", "End", "Delete"]);
+        assert_eq!(draft.values()[1], "dy");
+        // Each field stops at its token limit.
+        for (field, limit) in [(0, 32), (1, 63)] {
+            let mut draft = Draft {
+                focused: field,
+                ..Draft::default()
+            };
+            for _ in 0..limit + 5 {
+                draft.key("z");
+            }
+            assert_eq!(draft.values().get(field).unwrap().len(), limit);
+            assert!(!draft.key("z"));
+        }
+    }
+
+    #[test]
+    fn focus_moves_between_the_four_fields() {
+        let mut draft = Draft::default();
+        typed(&mut draft, &["S-Tab"]);
+        assert_eq!(draft.focused(), 3);
+        typed(&mut draft, &["Tab"]);
+        assert_eq!(draft.focused(), 0);
+        typed(&mut draft, &["Up", "Down", "Return", "Down"]);
+        assert_eq!(draft.focused(), 3);
+        // The time zone row keeps Up, Down and Return for its own.
+        typed(&mut draft, &["Down", "Return", "Up"]);
+        assert_eq!(draft.focused(), 3);
+        // The keyboard is fixed.
+        draft.focused = 2;
+        assert!(!draft.key("x"));
+        assert_eq!(draft.values()[2], KEYBOARD);
+    }
+
+    fn catalog() -> Vec<String> {
+        let mut zones: Vec<String> = (0..40).map(|n| format!("Area/Zone{n:02}")).collect();
+        zones.extend(["America/New_York", "Etc/UTC", "Europe/London"].map(String::from));
+        zones.sort();
+        zones
+    }
+
+    #[test]
+    fn the_time_zone_is_chosen_from_the_offered_catalog() {
+        let mut draft = Draft {
+            focused: 3,
+            ..Draft::default()
+        };
+        assert!(!draft.offered());
+        assert!(!draft.key("Down"), "nothing to choose from");
+        assert_eq!(draft.values()[3], "");
+        draft.offer(catalog());
+        assert!(draft.offered());
+        assert_eq!(draft.values()[3], "Etc/UTC");
+        typed(&mut draft, &["Home"]);
+        assert_eq!(draft.values()[3], "America/New_York");
+        typed(&mut draft, &["Up", "Down"]);
+        assert_eq!(draft.values()[3], "Area/Zone00");
+        typed(&mut draft, &["PageDown"]);
+        assert_eq!(draft.values()[3], "Area/Zone16");
+        typed(&mut draft, &["PageUp", "PageUp"]);
+        assert_eq!(draft.values()[3], "America/New_York");
+        typed(&mut draft, &["End", "Down"]);
+        assert_eq!(draft.values()[3], "Europe/London");
+        // Typing seeks, ignoring case; a character matching nothing is
+        // not taken, and Backspace takes back the last that was.
+        typed(&mut draft, &["e", "T", "q"]);
+        assert_eq!(draft.values()[3], "Etc/UTC");
+        assert_eq!(draft.seek, "eT");
+        typed(&mut draft, &["Backspace", "u"]);
+        assert_eq!(draft.values()[3], "Europe/London");
+        // Moving or leaving starts the seek over.
+        typed(&mut draft, &["Up", "a"]);
+        assert_eq!(draft.values()[3], "America/New_York");
+        // A new catalog keeps the choice it still has, else UTC, else none.
+        draft.offer(catalog());
+        assert_eq!(draft.values()[3], "America/New_York");
+        draft.offer(vec!["Etc/UTC".into(), "Europe/London".into()]);
+        assert_eq!(draft.values()[3], "Etc/UTC");
+        draft.offer(vec!["Europe/London".into()]);
+        assert_eq!(draft.values()[3], "");
+        // An empty entry is never taken for the empty choice.
+        draft.offer(vec![String::new(), "Europe/London".into()]);
+        assert_eq!(draft.zone, None);
+        draft.offer(vec!["Europe/London".into()]);
+        typed(&mut draft, &["Down"]);
+        assert_eq!(draft.values()[3], "Europe/London");
+    }
+
+    #[test]
+    fn the_draft_page_shows_the_hint_until_a_zone_is_chosen() {
+        let surface = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
+        let glyphs = |draft: &Draft, hint| {
+            let mut glyphs = String::new();
+            draft
+                .page(surface, hint, None)
+                .unwrap()
+                .emit(surface.bounds(), &mut |draw| {
+                    if let Primitive::Glyph { scalar, .. } = draw.primitive {
+                        glyphs.push(scalar);
+                    }
+                });
+            glyphs
+        };
+        let mut draft = Draft::default();
+        assert_eq!(draft.missing(), Some("Enter a username before review."));
+        let shown = glyphs(&draft, Some("the time zones could not be read"));
+        assert!(shown.contains("the time zones could not be read"));
+        assert!(!shown.contains("Select a time zone"));
+        draft.offer(catalog());
+        let shown = glyphs(&draft, Some("the time zones could not be read"));
+        assert!(shown.contains("Etc/UTC"));
+        assert!(!shown.contains("could not be read"));
+        typed(&mut draft, &["a", "Tab"]);
+        assert_eq!(draft.missing(), Some("Enter a hostname before review."));
+        typed(&mut draft, &["h"]);
+        assert_eq!(draft.missing(), None);
+        draft.offer(vec!["Europe/London".into()]);
+        assert_eq!(draft.missing(), Some("Choose a time zone before review."));
+    }
+
+    #[test]
+    fn a_notice_is_shown_under_the_fields_within_the_width() {
+        let surface = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
+        let long = "the review was refused ".repeat(10);
+        let draft = Draft::default();
+        let page = draft.page(surface, None, Some(&long)).unwrap();
+        let mut row = Vec::new();
+        page.emit(surface.bounds(), &mut |draw| {
+            if let Primitive::Glyph { y, scalar, .. } = draw.primitive {
+                if y == (NOTICE_ROW * ROW) as i64 {
+                    row.push(scalar);
+                }
+            }
+        });
+        let shown: String = row.into_iter().collect();
+        assert!(long.starts_with(&shown) && shown.starts_with("the review was refused"));
+        assert!(shown.len() < long.len());
     }
 
     #[test]

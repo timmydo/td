@@ -1,20 +1,30 @@
 //! The installer window: a `td_ui` client that presents the wizard's pages
-//! over a Wayland toplevel. It moves between welcome and the unavailable
-//! destination state while the installer service is absent. It owns no
-//! Wayland objects of its own, so its `Tag` is
-//! the empty `Object`; the seat and its devices are the client's.
+//! over a Wayland toplevel. From welcome it asks the installation service
+//! for eligible disks and lists them, or says why it cannot; a chosen disk
+//! leads to the settings form, whose time zones the service supplies, and
+//! the completed form to the service's review of it; from the review it asks
+//! the service to seek trusted consent and follows the installation's
+//! progress to its outcome. It owns no Wayland objects of its own, so its
+//! `Tag` is the empty `Object`; the seat and its devices are the client's.
 
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use td_install::installation_plan::{Destination, Plan, Settings};
 
 use td_ui::client::{run, App, Client, Handled, KeyboardEvent, Tag};
 use td_ui::font::Font;
-use td_ui::raster::{Draw, Primitive, Raster, Scale, Surface, CHROME};
+use td_ui::raster::{Composition, Draw, Primitive, Raster, Scale, Surface, CHROME};
 use td_ui::wayland::{connect, endpoint};
 use td_ui::wire::Message;
 
 use crate::destination::DestinationPage;
+use crate::outcome::{CompletionPage, Progress, ProgressPage};
+use crate::review::ReviewPage;
+use crate::service::{Answer, Service, Stage, Standing, SOCKET};
+use crate::settings::{Draft, TIME_ZONE};
 use crate::welcome::Welcome;
+use std::io::Write;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -42,30 +52,610 @@ struct Window {
     typeface: Option<td_ui::typeface::Typeface>,
     size: (usize, usize),
     dirty: bool,
-    page: Page,
+    front: Front,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Page {
     Welcome,
-    DestinationUnavailable,
+    /// Asked for disks; no answer yet.
+    Waiting,
+    /// No service, or the connection to it ended.
+    Unavailable,
+    Refused(&'static str),
+    Destinations,
+    /// Account and regional settings for the selected disk.
+    Settings,
+    /// The service's review of the proposal, which holds the disk's claim.
+    Review,
+    /// Consent, the installation's progress, or an outcome not known.
+    Progress(Progress),
+    /// The service reported the installation complete.
+    Complete,
 }
 
-impl Page {
-    fn key(self, chord: &str) -> Self {
-        match (self, chord) {
-            (Self::Welcome, "Return" | "KP_Enter") => Self::DestinationUnavailable,
-            (Self::DestinationUnavailable, "Escape") => Self::Welcome,
-            _ => self,
+/// A request sent to the service whose answer is awaited.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Asked {
+    Disks,
+    Zones,
+    Review,
+    Withdraw,
+    Execute,
+    Status,
+}
+
+/// What the wizard knows of the service's time zone catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Catalog {
+    Unasked,
+    Listed,
+    Refused(&'static str),
+}
+
+/// What a key asks of the window beyond the wizard's own state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Action {
+    None,
+    /// Stop waiting: the outstanding request, and its connection, go.
+    Abandon,
+}
+
+/// Shown on settings while a proposal is with the service.
+const REVIEWING: &str = "Asking the installer service for a review\u{2026}";
+/// Shown on review while execute is with the service.
+const SEEKING: &str = "Asking the installer service to seek consent\u{2026}";
+/// How often the service's state is asked for while consent is sought or
+/// the installation runs, in milliseconds.
+const POLL: u64 = 500;
+
+/// The wizard's navigation over the service's answers. A selected disk is
+/// a list index and a draft is typed text, not claims: the service
+/// rechecks everything it is sent, and only its review is shown for
+/// review.
+#[derive(Debug)]
+struct Wizard {
+    page: Page,
+    disks: Vec<Destination>,
+    selected: Option<usize>,
+    first: usize,
+    detail: usize,
+    asked: Option<Asked>,
+    catalog: Catalog,
+    draft: Draft,
+    /// A proposal not yet sent.
+    proposal: Option<(Destination, Settings)>,
+    /// Whether the review of the proposal last sent is still wanted. Only
+    /// a send sets it, so a review answers its own proposal, never one
+    /// made after it was given up.
+    awaited: bool,
+    /// What became of the last proposal, shown on settings.
+    notice: Option<&'static str>,
+    /// The review shown, and its detail page.
+    plan: Option<Box<Plan>>,
+    review_page: usize,
+    /// A review to release, by its nonce, once nothing is outstanding.
+    withdraw: Option<[u8; 32]>,
+    /// The review to execute, once nothing is outstanding.
+    execute: Option<Box<Plan>>,
+    /// The review execute was sent for, until its outcome is known or it
+    /// is withdrawn; while it is set a lost connection is an unknown
+    /// outcome, never merely an unavailable service.
+    executing: Option<[u8; 32]>,
+    /// What became of the last execute, shown on review.
+    review_notice: Option<&'static str>,
+    /// Whether the service's state is due to be asked for.
+    poll_due: bool,
+    /// The review the withdraw last sent names.
+    withdrawing: Option<[u8; 32]>,
+}
+
+impl Wizard {
+    fn new() -> Self {
+        Self {
+            page: Page::Welcome,
+            disks: Vec::new(),
+            selected: None,
+            first: 0,
+            detail: 0,
+            asked: None,
+            catalog: Catalog::Unasked,
+            draft: Draft::default(),
+            proposal: None,
+            awaited: false,
+            notice: None,
+            plan: None,
+            review_page: 0,
+            withdraw: None,
+            execute: None,
+            executing: None,
+            review_notice: None,
+            poll_due: false,
+            withdrawing: None,
+        }
+    }
+
+    fn key(&mut self, chord: &str) -> Action {
+        match (&self.page, chord) {
+            (Page::Welcome, "Return") => self.page = Page::Waiting,
+            (Page::Welcome, _) => {}
+            (Page::Waiting, "Escape") => {
+                // The connection goes, and with it any review it held. If an
+                // execute's outcome was not yet settled, it may be installing.
+                self.page = if self.executing.take().is_some() {
+                    Page::Progress(Progress::Unknown)
+                } else {
+                    Page::Welcome
+                };
+                self.asked = None;
+                self.withdraw = None;
+                self.withdrawing = None;
+                return Action::Abandon;
+            }
+            // Back keeps the drafts and the disk they were for; a review
+            // still coming is released when it comes.
+            (Page::Settings, "Escape") => {
+                self.page = Page::Destinations;
+                self.proposal = None;
+                self.awaited = false;
+                self.notice = None;
+            }
+            (Page::Settings, "Return") if self.draft.focused() == TIME_ZONE => self.propose(),
+            (Page::Settings, _) => {
+                if self.draft.key(chord) && !self.reviewing() {
+                    self.notice = None;
+                }
+            }
+            // Back from review releases it, and the disk's claim; an execute
+            // not yet sent goes, and one sent is answered before the release.
+            (Page::Review, "Escape") => {
+                self.withdraw = self.plan.take().map(|plan| *plan.nonce());
+                self.execute = None;
+                self.review_notice = None;
+                self.review_page = 0;
+                self.page = Page::Settings;
+            }
+            (Page::Review, "Return") => {
+                if self.execute.is_none() && self.executing.is_none() {
+                    self.execute = self.plan.clone();
+                    self.review_notice = Some(SEEKING);
+                }
+            }
+            // Leaving the secure prompt withdraws the review; until that is
+            // confirmed the outcome stays the execute's.
+            (Page::Progress(Progress::Consent), "Escape") => {
+                self.withdraw = self.executing;
+                self.plan = None;
+                self.review_page = 0;
+                self.page = Page::Settings;
+            }
+            // Nothing here undoes an installation or hides its outcome.
+            (Page::Progress(_) | Page::Complete, _) => {}
+            (Page::Review, "PageDown") => self.review_page = self.review_page.saturating_add(1),
+            (Page::Review, "PageUp") => self.review_page = self.review_page.saturating_sub(1),
+            (Page::Review, _) => {}
+            (_, "Escape") => self.page = Page::Welcome,
+            (Page::Destinations, "Return") if self.selected.is_some() => {
+                self.page = Page::Settings;
+                if matches!(self.catalog, Catalog::Refused(_)) {
+                    self.catalog = Catalog::Unasked;
+                }
+            }
+            (Page::Destinations, "Down") => {
+                self.select(self.selected.map_or(0, |index| index.saturating_add(1)));
+            }
+            (Page::Destinations, "Up") => {
+                self.select(self.selected.map_or(0, |index| index.saturating_sub(1)));
+            }
+            (Page::Destinations, "PageDown") => {
+                self.detail = self.detail.saturating_add(1);
+            }
+            (Page::Destinations, "PageUp") => {
+                self.detail = self.detail.saturating_sub(1);
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn select(&mut self, index: usize) {
+        if index < self.disks.len() && self.selected != Some(index) {
+            self.selected = Some(index);
+            self.detail = 0;
+        }
+    }
+
+    /// Whether a proposal is queued or its review still wanted.
+    fn reviewing(&self) -> bool {
+        self.proposal.is_some() || self.awaited
+    }
+
+    /// Proposes the selected disk with the drafts, once they are complete
+    /// and no proposal is pending. One given up but still with the service
+    /// is answered, and released, before this one is sent.
+    fn propose(&mut self) {
+        if self.reviewing() {
+            return;
+        }
+        if let Some(missing) = self.draft.missing() {
+            self.notice = Some(missing);
+            return;
+        }
+        let Some(disk) = self.selected.and_then(|index| self.disks.get(index)) else {
+            return;
+        };
+        let [username, hostname, keyboard, zone] = self.draft.values();
+        match Settings::new(username, hostname, keyboard, zone) {
+            Ok(settings) => {
+                self.proposal = Some((disk.clone(), settings));
+                self.notice = Some(REVIEWING);
+            }
+            Err(_) => self.notice = Some("These settings cannot be proposed."),
+        }
+    }
+
+    /// The request the wizard needs next, once nothing is outstanding: a
+    /// review to release first, then what the shown page waits on.
+    fn wanted(&self) -> Option<Asked> {
+        if self.asked.is_some() {
+            return None;
+        }
+        if self.withdraw.is_some() {
+            return Some(Asked::Withdraw);
+        }
+        match (&self.page, self.catalog) {
+            (Page::Waiting, _) => Some(Asked::Disks),
+            (Page::Settings, Catalog::Unasked) => Some(Asked::Zones),
+            (Page::Settings, _) if self.proposal.is_some() => Some(Asked::Review),
+            (Page::Review, _) if self.execute.is_some() => Some(Asked::Execute),
+            _ if self.poll_due && self.executing.is_some() && self.following() => {
+                Some(Asked::Status)
+            }
+            _ => None,
+        }
+    }
+
+    /// The service's answer to what was asked; disks the wizard no longer
+    /// waits for are dropped, a catalog is kept for when settings are
+    /// shown again, and a review no longer wanted is released.
+    fn answered(&mut self, answer: std::result::Result<Answer, String>) {
+        match (self.asked.take(), answer) {
+            (_, Err(_)) => self.lost(),
+            (Some(Asked::Disks), Ok(Answer::Destinations(disks))) if self.page == Page::Waiting => {
+                self.disks = disks;
+                self.selected = None;
+                self.first = 0;
+                self.detail = 0;
+                self.page = Page::Destinations;
+            }
+            (Some(Asked::Disks), Ok(Answer::Refused(reason))) if self.page == Page::Waiting => {
+                self.page = Page::Refused(reason);
+            }
+            (Some(Asked::Zones), Ok(Answer::Timezones(zones))) => {
+                self.draft.offer(zones);
+                self.catalog = Catalog::Listed;
+            }
+            (Some(Asked::Zones), Ok(Answer::Refused(reason))) => {
+                self.catalog = Catalog::Refused(reason);
+            }
+            (Some(Asked::Review), Ok(Answer::Reviewed(plan))) => {
+                if std::mem::take(&mut self.awaited) && self.page == Page::Settings {
+                    self.notice = None;
+                    self.plan = Some(plan);
+                    self.review_page = 0;
+                    self.page = Page::Review;
+                } else {
+                    self.withdraw = Some(*plan.nonce());
+                }
+            }
+            (Some(Asked::Review), Ok(Answer::Refused(reason))) if self.awaited => {
+                self.awaited = false;
+                self.notice = Some(reason);
+            }
+            // An execute answered after the review was left is the
+            // release's to settle.
+            (Some(Asked::Execute), Ok(Answer::Standing(standing))) if self.page == Page::Review => {
+                self.review_notice = None;
+                self.follow(standing);
+            }
+            // Abandoned before the release was sent: the claim is already
+            // released, and the release would find no review.
+            (
+                Some(Asked::Execute),
+                Ok(Answer::Standing(Standing::Review {
+                    nonce,
+                    stage: Stage::Abandoned(_),
+                })),
+            ) if self.executing == Some(nonce) => {
+                self.executing = None;
+                if self.withdraw == Some(nonce) {
+                    self.withdraw = None;
+                }
+            }
+            // Refused with the review still held: it may be executed again.
+            (Some(Asked::Execute), Ok(Answer::Refused(reason))) => {
+                self.executing = None;
+                if self.page == Page::Review {
+                    self.review_notice = Some(reason);
+                }
+            }
+            // The service holds no review: nothing to execute or release.
+            (Some(Asked::Execute), Ok(Answer::Unheld(reason))) => {
+                self.withdraw = None;
+                self.unheld(reason);
+            }
+            // It holds another review, with its claim: the review shown is
+            // released, and the release of a nonce it does not hold ends
+            // the connection, which ends that review.
+            (Some(Asked::Execute), Ok(Answer::Stale(reason))) => {
+                self.withdraw = self.withdraw.or(self.executing);
+                self.unheld(reason);
+            }
+            (Some(Asked::Status), Ok(Answer::Standing(standing))) if self.following() => {
+                self.follow(standing)
+            }
+            // A state asked for before the prompt was left does not bring it
+            // back; an end it reports for the executed review settles that.
+            (Some(Asked::Status), Ok(Answer::Standing(Standing::Review { nonce, stage })))
+                if self.executing == Some(nonce) =>
+            {
+                match stage {
+                    Stage::Abandoned(_) => {
+                        self.executing = None;
+                        if self.withdraw == Some(nonce) {
+                            self.withdraw = None;
+                        }
+                    }
+                    Stage::Complete | Stage::Failed(_) => {
+                        if self.withdraw == Some(nonce) {
+                            self.withdraw = None;
+                        }
+                        self.follow(Standing::Review { nonce, stage });
+                    }
+                    Stage::Reviewed | Stage::AwaitingConsent | Stage::Running(_) => {}
+                }
+            }
+            (Some(Asked::Withdraw), Ok(Answer::Withdrawn)) => {
+                let released = self.withdrawing.take();
+                if released.is_some() && self.executing == released {
+                    self.executing = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Execute found the review shown not held: back to settings, saying
+    /// why.
+    fn unheld(&mut self, reason: &'static str) {
+        self.executing = None;
+        self.plan = None;
+        self.review_notice = None;
+        if matches!(self.page, Page::Review | Page::Settings) {
+            self.notice = Some(reason);
+            self.page = Page::Settings;
+        }
+    }
+
+    /// Whether the shown page follows an installation's state.
+    fn following(&self) -> bool {
+        matches!(
+            self.page,
+            Page::Progress(Progress::Consent | Progress::Running(_))
+        )
+    }
+
+    /// Follows the state of the review execute was sent for. Only that
+    /// review's own report moves on; any other state, idle included, is
+    /// an outcome the installer cannot know.
+    fn follow(&mut self, standing: Standing) {
+        let stage = match standing {
+            Standing::Review { nonce, stage } if self.executing == Some(nonce) => stage,
+            _ => Stage::Reviewed,
+        };
+        let page = match stage {
+            Stage::AwaitingConsent => Page::Progress(Progress::Consent),
+            Stage::Running(phase) => Page::Progress(Progress::Running(phase)),
+            Stage::Complete => Page::Complete,
+            Stage::Failed(failure) => Page::Progress(Progress::Failed(failure)),
+            // Ended before any write: the claim is released, and a new
+            // review may be proposed.
+            Stage::Abandoned(reason) => {
+                self.notice = Some(reason);
+                Page::Settings
+            }
+            Stage::Reviewed => Page::Progress(Progress::Unknown),
+        };
+        if !matches!(stage, Stage::AwaitingConsent | Stage::Running(_)) {
+            self.executing = None;
+            self.plan = None;
+            self.review_page = 0;
+        }
+        self.page = page;
+    }
+
+    /// The service is gone; a listed disk was its observation, and a
+    /// review its claim, so they go too. The drafts stay, and so does a
+    /// catalog already listed.
+    fn lost(&mut self) {
+        self.disks.clear();
+        self.selected = None;
+        self.first = 0;
+        self.detail = 0;
+        self.asked = None;
+        self.proposal = None;
+        self.awaited = false;
+        self.notice = None;
+        self.plan = None;
+        self.review_page = 0;
+        self.withdraw = None;
+        self.execute = None;
+        self.review_notice = None;
+        self.poll_due = false;
+        if self.catalog != Catalog::Listed {
+            self.catalog = Catalog::Unasked;
+        }
+        self.withdrawing = None;
+        // After execute, or once progress is shown, the service may still
+        // be installing: the outcome is unknown, never merely unavailable.
+        // A reported completion or failure stands.
+        let reported = matches!(
+            self.page,
+            Page::Complete | Page::Progress(Progress::Failed(_))
+        );
+        if reported {
+            self.executing = None;
+        } else if self.executing.take().is_some() || matches!(self.page, Page::Progress(_)) {
+            self.page = Page::Progress(Progress::Unknown);
+        } else if self.page != Page::Welcome {
+            self.page = Page::Unavailable;
+        }
+    }
+
+    /// Records a request as sent.
+    fn sent(&mut self, asked: Asked) {
+        self.asked = Some(asked);
+        match asked {
+            Asked::Review => self.awaited = true,
+            Asked::Status => self.poll_due = false,
+            _ => {}
+        }
+    }
+
+    /// Shown in the time zone row while it has no zone.
+    fn zone_hint(&self) -> Option<&'static str> {
+        match self.catalog {
+            Catalog::Listed => None,
+            Catalog::Unasked => Some("Reading the time zones\u{2026}"),
+            Catalog::Refused(reason) => Some(reason),
         }
     }
 }
 
-fn keyboard_page(page: Page, event: KeyboardEvent) -> Result<Page> {
+/// The wizard and its connection: what keys and answers do to both.
+struct Front {
+    wizard: Wizard,
+    /// The connection to the installation service, once asked.
+    service: Option<Service>,
+    /// When the service's state may next be asked for, in turn-loop time.
+    next_poll: u64,
+    /// The turn loop's time at the last poll.
+    now: u64,
+}
+
+impl Front {
+    fn new() -> Self {
+        Self {
+            wizard: Wizard::new(),
+            service: None,
+            next_poll: 0,
+            now: 0,
+        }
+    }
+
+    /// While the wizard follows an installation, asks for the service's
+    /// state at most every `POLL` milliseconds, counted from each ask.
+    fn poll(&mut self, now: u64) {
+        self.now = now;
+        if self.wizard.following() && now >= self.next_poll {
+            self.wizard.poll_due = true;
+            self.request(None);
+        }
+    }
+
+    fn key(&mut self, chord: &str, intake: &Path) {
+        match self.wizard.key(chord) {
+            // A hung service cannot hold the window: the person leaves it.
+            Action::Abandon => self.service = None,
+            Action::None => self.request(Some(intake)),
+        }
+    }
+
+    /// Sends the request the wizard wants, connecting first for disks;
+    /// only welcome starts a connection, and every later request rides
+    /// the one that listed the disks.
+    fn request(&mut self, intake: Option<&Path>) {
+        let Some(asked) = self.wizard.wanted() else {
+            return;
+        };
+        let service = match (&mut self.service, intake) {
+            (Some(service), _) => service,
+            (None, Some(intake)) if asked == Asked::Disks => match Service::connect(intake) {
+                Ok(service) => self.service.insert(service),
+                Err(why) => return self.lost(&why),
+            },
+            (None, _) => return self.lost("the installer service connection ended"),
+        };
+        if service.pending() {
+            return;
+        }
+        // A review execute or withdraw names, recorded once the request is
+        // handed to the worker.
+        let mut names = None;
+        let sent = match asked {
+            Asked::Disks => service.destinations(),
+            Asked::Zones => service.timezones(),
+            Asked::Review => match self.wizard.proposal.take() {
+                Some((disk, settings)) => service.propose(disk, settings),
+                None => return,
+            },
+            Asked::Withdraw => match self.wizard.withdraw.take() {
+                Some(nonce) => {
+                    names = Some(nonce);
+                    service.withdraw(nonce)
+                }
+                None => return,
+            },
+            Asked::Execute => match self.wizard.execute.take() {
+                Some(plan) => {
+                    names = Some(*plan.nonce());
+                    service.execute(*plan)
+                }
+                None => return,
+            },
+            Asked::Status => service.status(),
+        };
+        match sent {
+            Ok(()) => {
+                match asked {
+                    Asked::Execute => self.wizard.executing = names,
+                    Asked::Withdraw => self.wizard.withdrawing = names,
+                    Asked::Status => self.next_poll = self.now.saturating_add(POLL),
+                    _ => {}
+                }
+                self.wizard.sent(asked);
+            }
+            Err(why) => self.lost(&why),
+        }
+    }
+
+    /// Takes the service's answer, if one arrived, and says whether it did.
+    fn receive(&mut self) -> bool {
+        let Some(answer) = self.service.as_mut().and_then(Service::poll) else {
+            return false;
+        };
+        match answer {
+            Err(why) => self.lost(&why),
+            answer => {
+                self.wizard.answered(answer);
+                self.request(None);
+            }
+        }
+        true
+    }
+
+    fn lost(&mut self, why: &str) {
+        let _ = writeln!(std::io::stderr(), "td-setup: installer service: {why}");
+        self.service = None;
+        self.wizard.lost();
+    }
+}
+
+fn keyboard_chord(event: KeyboardEvent) -> Result<Option<String>> {
     match event {
-        KeyboardEvent::Key { stroke, .. } => Ok(page.key(&stroke.chord)),
+        KeyboardEvent::Key { stroke, .. } => Ok(Some(stroke.chord)),
         KeyboardEvent::Keymap(Err(detail)) => Err(format!("keyboard keymap: {detail}")),
-        _ => Ok(page),
+        _ => Ok(None),
     }
 }
 
@@ -77,8 +667,15 @@ impl Window {
             typeface: None,
             size: DEFAULT_SIZE,
             dirty: true,
-            page: Page::Welcome,
+            front: Front::new(),
         })
+    }
+
+    /// Takes the service's answer, if one arrived.
+    fn receive(&mut self) {
+        if self.front.receive() {
+            self.dirty = true;
+        }
     }
 
     fn initialize(&mut self) -> Result<()> {
@@ -126,9 +723,8 @@ impl Window {
             | Handled::SeatRemoved => Err("installer keyboard is unavailable".into()),
             // Only translated keyboard presses navigate the live pages.
             Handled::Keyboard(event) => {
-                let next = keyboard_page(self.page, event)?;
-                if next != self.page {
-                    self.page = next;
+                if let Some(chord) = keyboard_chord(event)? {
+                    self.front.key(&chord, Path::new(SOCKET));
                     self.dirty = true;
                 }
                 Ok(())
@@ -151,22 +747,88 @@ impl Window {
         }
         let (width, height) = self.size;
         let surface = Surface::new(width, height, Scale::new(1).map_err(error)?).map_err(error)?;
+        let wizard = &mut self.front.wizard;
+        let settings = match &wizard.page {
+            Page::Settings => Some(
+                wizard
+                    .draft
+                    .page(surface, wizard.zone_hint(), wizard.notice),
+            ),
+            _ => None,
+        };
+        // A detail page past the last, as the surface lays it out, shows
+        // the last and is kept.
+        let review = match (&wizard.page, &wizard.plan) {
+            (Page::Review, Some(plan)) => {
+                let view = ReviewPage::new(surface, plan, wizard.review_page)
+                    .or_else(|| {
+                        let (_, pages) = ReviewPage::new(surface, plan, 0)?.position();
+                        ReviewPage::new(surface, plan, pages.checked_sub(1)?)
+                    })
+                    .map(|view| view.with_notice(wizard.review_notice));
+                if let Some(view) = &view {
+                    wizard.review_page = view.position().0;
+                }
+                Some(view)
+            }
+            _ => None,
+        };
+        // The destination step's page, built first so the list position
+        // it settles on is kept for the next turn.
+        let destination = match &wizard.page {
+            Page::Welcome | Page::Settings | Page::Review | Page::Progress(_) | Page::Complete => {
+                None
+            }
+            Page::Waiting => Some(DestinationPage::waiting(surface)),
+            Page::Unavailable => Some(DestinationPage::unavailable(surface)),
+            Page::Refused(reason) => Some(DestinationPage::refused(surface, reason)),
+            Page::Destinations => Some(DestinationPage::new_with_first(
+                surface,
+                &wizard.disks,
+                wizard.selected,
+                wizard.first,
+                wizard.detail,
+            )),
+        };
+        if let (Page::Destinations, Some(Some(view))) = (&wizard.page, &destination) {
+            wizard.first = view.first_visible();
+            wizard.detail = view.detail_position().0;
+        }
+        let outcome: Option<Option<Box<dyn Composition>>> = match wizard.page {
+            Page::Progress(progress) => Some(
+                ProgressPage::new(surface, progress)
+                    .map(|view| Box::new(view) as Box<dyn Composition>),
+            ),
+            Page::Complete => Some(
+                CompletionPage::new(surface).map(|view| Box::new(view) as Box<dyn Composition>),
+            ),
+            _ => None,
+        };
         let Window {
             client,
             font,
             typeface,
-            page,
             ..
         } = self;
         let presented = client.present(width, height, &mut |pixels| {
             let mut raster = Raster::new(pixels, font, surface, width * 4)
                 .map_err(error)?
                 .with_typeface(typeface.as_mut());
-            let painted = match page {
-                Page::Welcome => Welcome::new(surface)
+            let painted = match (&outcome, &settings, &review, &destination) {
+                (Some(view), _, _, _) => view
+                    .as_ref()
+                    .map(|view| raster.paint(view.as_ref(), surface.bounds()).map_err(error)),
+                (None, Some(view), _, _) => view
+                    .as_ref()
+                    .map(|view| raster.paint(view, surface.bounds()).map_err(error)),
+                (None, None, Some(view), _) => view
+                    .as_ref()
+                    .map(|view| raster.paint(view, surface.bounds()).map_err(error)),
+                (None, None, None, None) => Welcome::new(surface)
                     .map(|view| raster.paint(&view, surface.bounds()).map_err(error)),
-                Page::DestinationUnavailable => DestinationPage::unavailable(surface)
-                    .map(|view| raster.paint(&view, surface.bounds()).map_err(error)),
+                (None, None, None, Some(view)) => view
+                    .as_ref()
+                    .map(|view| raster.paint(view, surface.bounds()).map_err(error)),
             };
             match painted {
                 Some(result) => result,
@@ -204,6 +866,7 @@ impl App for Window {
     fn descriptor_wait(&mut self) {}
 
     fn tick(&mut self, _now: u64) -> Result<()> {
+        self.receive();
         Ok(())
     }
 
@@ -211,7 +874,15 @@ impl App for Window {
         Window::event(self, message)
     }
 
-    fn end_turn(&mut self, _now: u64, _idle: bool) -> Result<()> {
+    /// Every turn ends here, idle or not, so an answer arriving while
+    /// nothing else happens is still shown within a turn. A status sent
+    /// from an answer counts its interval from this turn.
+    fn end_turn(&mut self, now: u64, _idle: bool) -> Result<()> {
+        self.front.now = now;
+        self.receive();
+        if self.front.wizard.executing.is_some() {
+            self.front.poll(now);
+        }
         Ok(())
     }
 
@@ -221,8 +892,9 @@ impl App for Window {
 }
 
 /// Opens the installer window: resolves the display endpoint from the
-/// environment, connects, and runs the turn loop presenting the welcome
-/// page and the unavailable destination state.
+/// environment, connects, and runs the turn loop presenting welcome, the
+/// destination step, the settings step, the review, consent and the
+/// installation's progress and outcome.
 pub fn run_window() -> std::io::Result<()> {
     let work = || -> Result<()> {
         let endpoint = endpoint(
@@ -242,18 +914,925 @@ pub fn run_window() -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-#[test]
-fn navigation_stops_at_the_service_boundary_and_returns() {
-    assert_eq!(Page::Welcome.key("Return"), Page::DestinationUnavailable);
-    assert_eq!(Page::Welcome.key("KP_Enter"), Page::DestinationUnavailable);
-    assert_eq!(
-        Page::DestinationUnavailable.key("Return"),
-        Page::DestinationUnavailable
-    );
-    assert_eq!(Page::DestinationUnavailable.key("Escape"), Page::Welcome);
-    assert_eq!(Page::Welcome.key("Escape"), Page::Welcome);
-    assert_eq!(
-        keyboard_page(Page::Welcome, KeyboardEvent::Keymap(Err("bad map".into()))),
-        Err("keyboard keymap: bad map".into())
-    );
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::service::tests::{holding, installing, intake, listing, silent, slow_catalog};
+    use std::time::{Duration, Instant};
+    use td_install::installation_plan::DestinationObservation;
+
+    fn disk(name: &str) -> Destination {
+        Destination::new(DestinationObservation {
+            name,
+            major: 254,
+            minor: 0,
+            sequence: 7,
+            capacity: 16_000_000_000,
+            sector: 512,
+            removable: false,
+            model: None,
+            serial: None,
+            wwid: None,
+        })
+        .unwrap()
+    }
+
+    /// Takes answers, as the turn loop's ends do, until `page`.
+    fn settle(front: &mut Front, page: Page) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while front.wizard.page != page {
+            assert!(Instant::now() < deadline, "{:?}", front.wizard.page);
+            front.receive();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn enter_asks_the_service_and_escape_returns() {
+        let mut wizard = Wizard::new();
+        assert_eq!(wizard.key("Escape"), Action::None);
+        assert_eq!(wizard.page, Page::Welcome);
+        assert_eq!(wizard.wanted(), None);
+        assert_eq!(wizard.key("Return"), Action::None);
+        assert_eq!(wizard.page, Page::Waiting);
+        assert_eq!(wizard.wanted(), Some(Asked::Disks));
+        wizard.asked = Some(Asked::Disks);
+        assert_eq!(wizard.wanted(), None);
+        // Leaving the wait abandons the request.
+        assert_eq!(wizard.key("Escape"), Action::Abandon);
+        assert_eq!((&wizard.page, wizard.asked), (&Page::Welcome, None));
+        // An answer the wizard stopped waiting for is dropped.
+        wizard.answered(Ok(Answer::Destinations(vec![disk("vda")])));
+        assert_eq!(wizard.page, Page::Welcome);
+        wizard.key("Return");
+        wizard.asked = Some(Asked::Disks);
+        wizard.answered(Ok(Answer::Refused("the installer service is busy")));
+        assert_eq!(wizard.page, Page::Refused("the installer service is busy"));
+        assert_eq!(wizard.key("Escape"), Action::None);
+        assert_eq!(wizard.page, Page::Welcome);
+        assert_eq!(
+            keyboard_chord(KeyboardEvent::Keymap(Err("bad map".into()))),
+            Err("keyboard keymap: bad map".into())
+        );
+    }
+
+    /// A wizard listing `vda` and `vdb`.
+    fn listed() -> Wizard {
+        let mut wizard = Wizard::new();
+        wizard.key("Return");
+        wizard.asked = wizard.wanted();
+        wizard.answered(Ok(Answer::Destinations(vec![disk("vda"), disk("vdb")])));
+        wizard
+    }
+
+    #[test]
+    fn the_listed_disks_are_navigated_with_the_toolkit_chords() {
+        let mut wizard = listed();
+        assert_eq!(wizard.page, Page::Destinations);
+        assert_eq!(wizard.selected, None);
+        // Nothing selected, nothing to continue with.
+        wizard.key("Return");
+        assert_eq!(wizard.page, Page::Destinations);
+        wizard.key("Up");
+        assert_eq!(wizard.selected, Some(0));
+        wizard.key("Down");
+        wizard.key("Down");
+        assert_eq!(wizard.selected, Some(1));
+        wizard.key("PageDown");
+        wizard.key("PageDown");
+        assert_eq!(wizard.detail, 2);
+        wizard.key("PageUp");
+        assert_eq!(wizard.detail, 1);
+        // Past either end the selection, and its identity page, stay.
+        wizard.key("Down");
+        assert_eq!((wizard.selected, wizard.detail), (Some(1), 1));
+        // Moving the selection starts its identity at the first page.
+        wizard.key("Up");
+        assert_eq!((wizard.selected, wizard.detail), (Some(0), 0));
+        wizard.key("PageDown");
+        wizard.key("Up");
+        assert_eq!((wizard.selected, wizard.detail), (Some(0), 1));
+        // A lost service takes its observations with it.
+        wizard.answered(Err("the installer service connection ended".into()));
+        assert_eq!(wizard.page, Page::Unavailable);
+        assert!(wizard.disks.is_empty());
+        assert_eq!((wizard.selected, wizard.first, wizard.detail), (None, 0, 0));
+    }
+
+    #[test]
+    fn a_chosen_disk_leads_to_settings_which_ask_for_the_catalog_once() {
+        let mut wizard = listed();
+        wizard.key("Down");
+        wizard.key("Return");
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.wanted(), Some(Asked::Zones));
+        assert_eq!(wizard.zone_hint(), Some("Reading the time zones\u{2026}"));
+        wizard.asked = Some(Asked::Zones);
+        // Typing is the form's; Escape is back, keeping the drafts.
+        for chord in ["a", "l", "Escape"] {
+            wizard.key(chord);
+        }
+        assert_eq!(wizard.page, Page::Destinations);
+        assert_eq!(wizard.draft.values()[0], "al");
+        // The catalog that arrives meanwhile is kept and asked no more.
+        wizard.answered(Ok(Answer::Timezones(crate::service::tests::zones())));
+        assert_eq!(wizard.catalog, Catalog::Listed);
+        wizard.key("Return");
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.wanted(), None);
+        assert_eq!(wizard.zone_hint(), None);
+        assert_eq!(wizard.draft.values(), ["al", "", "us", "Etc/UTC"]);
+        // Losing the service keeps the drafts and the catalog.
+        wizard.answered(Err("the installer service connection ended".into()));
+        assert_eq!(wizard.page, Page::Unavailable);
+        assert_eq!(wizard.draft.values(), ["al", "", "us", "Etc/UTC"]);
+        assert_eq!(wizard.catalog, Catalog::Listed);
+    }
+
+    #[test]
+    fn a_catalog_refused_while_disks_wait_still_lets_them_be_asked() {
+        let mut wizard = listed();
+        wizard.key("Down");
+        wizard.key("Return");
+        wizard.asked = wizard.wanted();
+        for chord in ["Escape", "Escape", "Return"] {
+            wizard.key(chord);
+        }
+        assert_eq!(wizard.page, Page::Waiting);
+        assert_eq!(wizard.wanted(), None);
+        wizard.answered(Ok(Answer::Refused("the time zones could not be read")));
+        // The refusal is the catalog's, not the disks'.
+        assert_eq!(wizard.page, Page::Waiting);
+        assert_eq!(
+            wizard.catalog,
+            Catalog::Refused("the time zones could not be read")
+        );
+        assert_eq!(wizard.wanted(), Some(Asked::Disks));
+    }
+
+    #[test]
+    fn leaving_disks_queued_behind_the_catalog_abandons_both() {
+        let mut wizard = listed();
+        wizard.key("Down");
+        wizard.key("Return");
+        wizard.asked = wizard.wanted();
+        for chord in ["Escape", "Escape", "Return"] {
+            wizard.key(chord);
+        }
+        assert_eq!(wizard.key("Escape"), Action::Abandon);
+        assert_eq!((&wizard.page, wizard.asked), (&Page::Welcome, None));
+        assert_eq!(wizard.catalog, Catalog::Unasked);
+        // A new connection asks for disks first, then the catalog afresh.
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), Some(Asked::Disks));
+    }
+
+    /// A wizard on settings for `vdb` with every field filled and the
+    /// time zone focused.
+    fn filled() -> Wizard {
+        let mut wizard = listed();
+        wizard.key("Down");
+        wizard.key("Down");
+        wizard.key("Return");
+        wizard.asked = wizard.wanted();
+        wizard.answered(Ok(Answer::Timezones(crate::service::tests::zones())));
+        for chord in ["a", "l", "Tab", "h", "Tab", "Tab"] {
+            wizard.key(chord);
+        }
+        wizard
+    }
+
+    fn reviewed(wizard: &Wizard) -> Box<Plan> {
+        let (disk, settings) = wizard.proposal.as_ref().unwrap();
+        Box::new(crate::service::tests::plan(disk, settings))
+    }
+
+    #[test]
+    fn enter_on_the_time_zone_proposes_the_completed_form() {
+        let mut wizard = listed();
+        wizard.key("Down");
+        wizard.key("Return");
+        wizard.asked = wizard.wanted();
+        wizard.answered(Ok(Answer::Timezones(crate::service::tests::zones())));
+        // Enter elsewhere moves on; on the time zone it asks for what is
+        // missing first.
+        wizard.key("Return");
+        assert_eq!(wizard.draft.focused(), 1);
+        wizard.key("Tab");
+        wizard.key("Tab");
+        wizard.key("Return");
+        assert_eq!(wizard.notice, Some("Enter a username before review."));
+        assert_eq!(wizard.wanted(), None);
+        // An edit clears it.
+        wizard.key("Tab");
+        wizard.key("a");
+        assert_eq!(wizard.notice, None);
+        let mut wizard = filled();
+        wizard.key("Return");
+        assert_eq!(wizard.notice, Some(REVIEWING));
+        assert_eq!(wizard.wanted(), Some(Asked::Review));
+        let (disk, settings) = wizard.proposal.clone().unwrap();
+        assert_eq!(Some(&disk), wizard.disks.get(1));
+        assert_eq!(settings, Settings::new("al", "h", "us", "Etc/UTC").unwrap());
+        let plan = reviewed(&wizard);
+        wizard.proposal = None;
+        wizard.sent(Asked::Review);
+        // A second Enter while the service reviews proposes nothing more.
+        wizard.key("Return");
+        assert!(wizard.proposal.is_none());
+        wizard.answered(Ok(Answer::Reviewed(plan.clone())));
+        assert_eq!(wizard.page, Page::Review);
+        assert_eq!(wizard.plan, Some(plan.clone()));
+        assert_eq!(wizard.notice, None);
+        wizard.key("PageDown");
+        wizard.key("PageDown");
+        wizard.key("PageUp");
+        assert_eq!(wizard.review_page, 1);
+        // Enter asks to execute; back before it is sent drops that.
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), Some(Asked::Execute));
+        assert_eq!(wizard.review_notice, Some(SEEKING));
+        // Back releases the review and its claim.
+        wizard.key("Escape");
+        assert_eq!(wizard.execute, None);
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.plan, None);
+        assert_eq!(wizard.withdraw, Some(*plan.nonce()));
+        assert_eq!(wizard.wanted(), Some(Asked::Withdraw));
+        wizard.withdraw = None;
+        wizard.asked = Some(Asked::Withdraw);
+        wizard.answered(Ok(Answer::Withdrawn));
+        assert_eq!((&wizard.page, wizard.wanted()), (&Page::Settings, None));
+    }
+
+    #[test]
+    fn a_refused_proposal_is_said_on_settings() {
+        let mut wizard = filled();
+        wizard.key("Return");
+        wizard.proposal = None;
+        wizard.sent(Asked::Review);
+        // Typing while the service reviews keeps saying so.
+        wizard.key("Up");
+        assert_eq!(wizard.notice, Some(REVIEWING));
+        wizard.answered(Ok(Answer::Refused("the selected disk changed")));
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.notice, Some("the selected disk changed"));
+        assert!(!wizard.reviewing());
+        // It can be proposed again.
+        wizard.key("Down");
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), Some(Asked::Review));
+    }
+
+    #[test]
+    fn a_review_no_longer_wanted_is_released() {
+        // Left before it was sent: never sent.
+        let mut wizard = filled();
+        wizard.key("Return");
+        wizard.key("Escape");
+        assert_eq!(wizard.page, Page::Destinations);
+        assert!(wizard.proposal.is_none());
+        assert_eq!(wizard.wanted(), None);
+        // Left while the service reviewed: released when it comes, even
+        // after settings are shown again.
+        let mut wizard = filled();
+        wizard.key("Return");
+        let plan = reviewed(&wizard);
+        wizard.proposal = None;
+        wizard.sent(Asked::Review);
+        wizard.key("Escape");
+        wizard.key("Return");
+        assert_eq!(wizard.page, Page::Settings);
+        wizard.answered(Ok(Answer::Reviewed(plan.clone())));
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.plan, None);
+        assert_eq!(wizard.withdraw, Some(*plan.nonce()));
+        // The release goes before anything the page wants.
+        wizard.catalog = Catalog::Unasked;
+        assert_eq!(wizard.wanted(), Some(Asked::Withdraw));
+        // A lost service takes the review, and its claim, with it.
+        let mut wizard = filled();
+        wizard.key("Return");
+        let plan = reviewed(&wizard);
+        wizard.proposal = None;
+        wizard.sent(Asked::Review);
+        wizard.answered(Ok(Answer::Reviewed(plan)));
+        wizard.answered(Err("the installer service connection ended".into()));
+        assert_eq!(wizard.page, Page::Unavailable);
+        assert_eq!((wizard.plan.is_none(), wizard.withdraw), (true, None));
+        assert_eq!(wizard.draft.values(), ["al", "h", "us", "Etc/UTC"]);
+    }
+
+    #[test]
+    fn a_review_given_up_never_answers_a_later_proposal() {
+        let mut wizard = filled();
+        wizard.key("Return");
+        let first = reviewed(&wizard);
+        wizard.proposal = None;
+        wizard.sent(Asked::Review);
+        // Leave, choose the other disk, and propose again at once.
+        for chord in ["Escape", "Up", "Return", "Return"] {
+            wizard.key(chord);
+        }
+        assert_eq!(wizard.notice, Some(REVIEWING));
+        let (disk, _) = wizard.proposal.clone().unwrap();
+        assert_eq!(Some(&disk), wizard.disks.first());
+        assert_eq!(wizard.wanted(), None);
+        // The first review is released, not shown, and the second
+        // proposal goes after the release.
+        wizard.answered(Ok(Answer::Reviewed(first.clone())));
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.withdraw, Some(*first.nonce()));
+        assert_eq!(wizard.wanted(), Some(Asked::Withdraw));
+        wizard.withdraw = None;
+        wizard.sent(Asked::Withdraw);
+        wizard.answered(Ok(Answer::Withdrawn));
+        assert_eq!(wizard.wanted(), Some(Asked::Review));
+        let second = reviewed(&wizard);
+        wizard.proposal = None;
+        wizard.sent(Asked::Review);
+        wizard.answered(Ok(Answer::Reviewed(second.clone())));
+        assert_eq!(wizard.page, Page::Review);
+        assert_eq!(wizard.plan, Some(second));
+        // A refusal of a review given up is not said of a later proposal.
+        let mut wizard = filled();
+        wizard.key("Return");
+        wizard.proposal = None;
+        wizard.sent(Asked::Review);
+        for chord in ["Escape", "Return", "Return"] {
+            wizard.key(chord);
+        }
+        wizard.answered(Ok(Answer::Refused("the selected disk changed")));
+        assert_eq!(wizard.notice, Some(REVIEWING));
+        assert_eq!(wizard.wanted(), Some(Asked::Review));
+    }
+
+    /// A wizard showing the service's review of `filled`.
+    fn on_review() -> Wizard {
+        let mut wizard = filled();
+        wizard.key("Return");
+        let plan = reviewed(&wizard);
+        wizard.proposal = None;
+        wizard.sent(Asked::Review);
+        wizard.answered(Ok(Answer::Reviewed(plan)));
+        assert_eq!(wizard.page, Page::Review);
+        wizard
+    }
+
+    /// Sends the queued execute, as the front end does.
+    fn send_execute(wizard: &mut Wizard) -> [u8; 32] {
+        let plan = wizard.execute.take().unwrap();
+        wizard.executing = Some(*plan.nonce());
+        wizard.sent(Asked::Execute);
+        *plan.nonce()
+    }
+
+    fn state(nonce: [u8; 32], stage: Stage) -> Answer {
+        Answer::Standing(Standing::Review { nonce, stage })
+    }
+
+    /// Asks for and takes one state, as polling does.
+    fn polled(wizard: &mut Wizard, answer: Answer) {
+        wizard.poll_due = true;
+        assert_eq!(wizard.wanted(), Some(Asked::Status));
+        wizard.sent(Asked::Status);
+        wizard.answered(Ok(answer));
+    }
+
+    #[test]
+    fn an_executed_review_is_followed_from_consent_to_completion() {
+        let mut wizard = on_review();
+        wizard.key("Return");
+        // A second Enter asks nothing more.
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.key("Return");
+        assert_eq!(wizard.execute, None);
+        wizard.answered(Ok(state(nonce, Stage::AwaitingConsent)));
+        assert_eq!(wizard.page, Page::Progress(Progress::Consent));
+        // Only a due poll asks.
+        assert_eq!(wizard.wanted(), None);
+        polled(&mut wizard, state(nonce, Stage::AwaitingConsent));
+        assert_eq!(wizard.page, Page::Progress(Progress::Consent));
+        let running = Stage::Running(crate::outcome::Phase::WritingFilesystems);
+        polled(&mut wizard, state(nonce, running));
+        assert_eq!(
+            wizard.page,
+            Page::Progress(Progress::Running(crate::outcome::Phase::WritingFilesystems))
+        );
+        // Nothing a key does stops or leaves a running installation.
+        for chord in ["Escape", "Return", "PageUp"] {
+            wizard.key(chord);
+        }
+        assert_eq!((wizard.withdraw, wizard.executing), (None, Some(nonce)));
+        polled(&mut wizard, state(nonce, Stage::Complete));
+        assert_eq!(wizard.page, Page::Complete);
+        assert_eq!((wizard.executing, wizard.plan.is_none()), (None, true));
+        wizard.poll_due = true;
+        assert_eq!(wizard.wanted(), None);
+        // A completion reported stands when the service goes.
+        wizard.answered(Err("the installer service connection ended".into()));
+        assert_eq!(wizard.page, Page::Complete);
+    }
+
+    #[test]
+    fn only_the_executed_review_reports_its_outcome() {
+        type Report = fn([u8; 32]) -> Answer;
+        let cases: [(Report, Page); 4] = [
+            (
+                |nonce| state(nonce, Stage::Failed(crate::outcome::Failure::WriteFailed)),
+                Page::Progress(Progress::Failed(crate::outcome::Failure::WriteFailed)),
+            ),
+            (
+                |_| Answer::Standing(Standing::Idle),
+                Page::Progress(Progress::Unknown),
+            ),
+            (
+                |_| state([5; 32], Stage::Complete),
+                Page::Progress(Progress::Unknown),
+            ),
+            (
+                |nonce| state(nonce, Stage::Reviewed),
+                Page::Progress(Progress::Unknown),
+            ),
+        ];
+        for (answer, page) in cases {
+            let mut wizard = on_review();
+            wizard.key("Return");
+            let nonce = send_execute(&mut wizard);
+            wizard.answered(Ok(state(nonce, Stage::AwaitingConsent)));
+            polled(&mut wizard, answer(nonce));
+            assert_eq!(wizard.page, page);
+            assert_eq!(wizard.executing, None);
+            wizard.poll_due = true;
+            assert_eq!(wizard.wanted(), None);
+        }
+        // Declined at the prompt: the claim is released and settings say
+        // why, ready for a new review.
+        let mut wizard = on_review();
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.answered(Ok(state(nonce, Stage::AwaitingConsent)));
+        polled(&mut wizard, state(nonce, Stage::Abandoned("declined")));
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.notice, Some("declined"));
+        assert_eq!((wizard.plan.is_none(), wizard.executing), (true, None));
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), Some(Asked::Review));
+    }
+
+    #[test]
+    fn an_execute_refused_or_abandoned_at_once_is_said() {
+        let mut wizard = on_review();
+        wizard.key("Return");
+        send_execute(&mut wizard);
+        wizard.answered(Ok(Answer::Refused("trusted consent is unavailable")));
+        assert_eq!(wizard.page, Page::Review);
+        assert_eq!(wizard.review_notice, Some("trusted consent is unavailable"));
+        assert_eq!(wizard.executing, None);
+        // The review is still held: it may be executed again or left.
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), Some(Asked::Execute));
+        // The recheck found the disk changed: the claim is released.
+        let mut wizard = on_review();
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.answered(Ok(state(
+            nonce,
+            Stage::Abandoned("the selected disk changed"),
+        )));
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.notice, Some("the selected disk changed"));
+        assert_eq!(wizard.withdraw, None);
+        // Left while execute was with the service: the release follows,
+        // unless the execute already ended the review.
+        let mut wizard = on_review();
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.key("Escape");
+        assert_eq!(wizard.withdraw, Some(nonce));
+        wizard.answered(Ok(state(nonce, Stage::AwaitingConsent)));
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.wanted(), Some(Asked::Withdraw));
+        let mut wizard = on_review();
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.key("Escape");
+        wizard.answered(Ok(state(
+            nonce,
+            Stage::Abandoned("the selected disk changed"),
+        )));
+        assert_eq!((wizard.withdraw, wizard.executing), (None, None));
+        assert_eq!(wizard.page, Page::Settings);
+    }
+
+    #[test]
+    fn leaving_the_prompt_withdraws_and_keeps_the_outcome_until_released() {
+        let mut wizard = on_review();
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.answered(Ok(state(nonce, Stage::AwaitingConsent)));
+        // A state already asked for when the prompt is left.
+        wizard.poll_due = true;
+        wizard.sent(Asked::Status);
+        wizard.key("Escape");
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.withdraw, Some(nonce));
+        wizard.answered(Ok(state(nonce, Stage::AwaitingConsent)));
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.wanted(), Some(Asked::Withdraw));
+        // Consent given meanwhile: the release fails and the connection
+        // ends, so the outcome is unknown, not merely unavailable.
+        let mut lost = Wizard {
+            asked: None,
+            ..on_review()
+        };
+        lost.key("Return");
+        let nonce = send_execute(&mut lost);
+        lost.answered(Ok(state(nonce, Stage::AwaitingConsent)));
+        lost.key("Escape");
+        lost.withdraw = None;
+        lost.sent(Asked::Withdraw);
+        lost.answered(Err(
+            "the installer service did not release the review".into()
+        ));
+        assert_eq!(lost.page, Page::Progress(Progress::Unknown));
+        // Released: the outcome is settled.
+        wizard.withdrawing = wizard.withdraw.take();
+        wizard.sent(Asked::Withdraw);
+        wizard.answered(Ok(Answer::Withdrawn));
+        assert_eq!(wizard.executing, None);
+        wizard.answered(Err("the installer service connection ended".into()));
+        assert_eq!(wizard.page, Page::Unavailable);
+    }
+
+    #[test]
+    fn abandoning_a_connection_with_an_execute_unsettled_is_unknown() {
+        // Escape at the prompt, back to welcome and on to the disk wait
+        // while the release is still out; leaving that wait drops the
+        // connection, and consent may have won.
+        let mut wizard = on_review();
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.answered(Ok(state(nonce, Stage::AwaitingConsent)));
+        wizard.key("Escape");
+        wizard.withdrawing = wizard.withdraw.take();
+        wizard.sent(Asked::Withdraw);
+        for chord in ["Escape", "Escape", "Return"] {
+            wizard.key(chord);
+        }
+        assert_eq!(wizard.page, Page::Waiting);
+        assert_eq!(wizard.key("Escape"), Action::Abandon);
+        assert_eq!(wizard.page, Page::Progress(Progress::Unknown));
+        assert_eq!(wizard.executing, None);
+        // Without an execute out, leaving the wait is just leaving.
+        let mut wizard = listed();
+        wizard.key("Escape");
+        wizard.key("Return");
+        assert_eq!(wizard.key("Escape"), Action::Abandon);
+        assert_eq!(wizard.page, Page::Welcome);
+    }
+
+    #[test]
+    fn a_reported_failure_stands_when_the_service_goes() {
+        let mut wizard = on_review();
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.answered(Ok(state(nonce, Stage::AwaitingConsent)));
+        let failed = crate::outcome::Failure::VerificationFailed;
+        polled(&mut wizard, state(nonce, Stage::Failed(failed)));
+        wizard.answered(Err("the installer service connection ended".into()));
+        assert_eq!(wizard.page, Page::Progress(Progress::Failed(failed)));
+    }
+
+    #[test]
+    fn an_execute_for_a_review_not_held_returns_to_settings() {
+        let mut wizard = on_review();
+        wizard.key("Return");
+        send_execute(&mut wizard);
+        wizard.answered(Ok(Answer::Unheld("the review is out of date")));
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.notice, Some("the review is out of date"));
+        assert_eq!((wizard.plan.is_none(), wizard.executing), (true, None));
+        // Left meanwhile: there is no review to release either.
+        let mut wizard = on_review();
+        wizard.key("Return");
+        send_execute(&mut wizard);
+        wizard.key("Escape");
+        assert!(wizard.withdraw.is_some());
+        wizard.answered(Ok(Answer::Unheld("there is no review")));
+        assert_eq!((wizard.withdraw, wizard.executing), (None, None));
+        // Another review held: the one shown is released, so a claim
+        // cannot outlive what the window shows.
+        let mut wizard = on_review();
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.answered(Ok(Answer::Stale("the review is out of date")));
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!((wizard.withdraw, wizard.executing), (Some(nonce), None));
+        assert_eq!(wizard.wanted(), Some(Asked::Withdraw));
+    }
+
+    #[test]
+    fn an_end_reported_after_the_prompt_was_left_settles_it() {
+        // Declined or expired as the prompt was left: nothing to release.
+        let mut wizard = on_review();
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.answered(Ok(state(nonce, Stage::AwaitingConsent)));
+        wizard.poll_due = true;
+        wizard.sent(Asked::Status);
+        wizard.key("Escape");
+        wizard.answered(Ok(state(nonce, Stage::Abandoned("declined"))));
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!((wizard.withdraw, wizard.executing), (None, None));
+        assert_eq!(wizard.wanted(), None);
+        // Consent won and the installation ended: its outcome is shown.
+        let mut wizard = on_review();
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.answered(Ok(state(nonce, Stage::AwaitingConsent)));
+        wizard.poll_due = true;
+        wizard.sent(Asked::Status);
+        wizard.key("Escape");
+        wizard.answered(Ok(state(nonce, Stage::Complete)));
+        assert_eq!(wizard.page, Page::Complete);
+        assert_eq!((wizard.withdraw, wizard.executing), (None, None));
+    }
+
+    #[test]
+    fn a_service_lost_after_execute_leaves_the_outcome_unknown() {
+        let mut wizard = on_review();
+        wizard.key("Return");
+        send_execute(&mut wizard);
+        wizard.answered(Err("the installer service connection ended".into()));
+        assert_eq!(wizard.page, Page::Progress(Progress::Unknown));
+        assert_eq!(wizard.executing, None);
+    }
+
+    #[test]
+    fn a_refused_catalog_is_said_and_asked_again_on_return() {
+        let mut wizard = listed();
+        wizard.key("Down");
+        wizard.key("Return");
+        wizard.asked = wizard.wanted();
+        wizard.answered(Ok(Answer::Refused("the time zones could not be read")));
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.wanted(), None);
+        assert_eq!(wizard.zone_hint(), Some("the time zones could not be read"));
+        assert_eq!(wizard.draft.values()[3], "");
+        wizard.key("Escape");
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), Some(Asked::Zones));
+    }
+
+    #[test]
+    fn an_absent_intake_shows_the_service_unavailable_at_once() {
+        let mut front = Front::new();
+        front.key("Return", Path::new("/nonexistent/td-setup/setup"));
+        assert_eq!(front.wizard.page, Page::Unavailable);
+        assert!(front.service.is_none());
+        front.key("Escape", Path::new("/nonexistent/td-setup/setup"));
+        assert_eq!(front.wizard.page, Page::Welcome);
+    }
+
+    #[test]
+    fn the_window_lists_the_service_disks_and_asks_again_on_return() {
+        let intake = intake("front-list", usize::MAX, listing);
+        let mut front = Front::new();
+        front.key("Return", &intake);
+        assert_eq!(front.wizard.page, Page::Waiting);
+        settle(&mut front, Page::Destinations);
+        assert_eq!(front.wizard.disks, [crate::service::tests::disk()]);
+        // Escape keeps the connection; Enter asks it again.
+        front.key("Escape", &intake);
+        assert!(front.service.is_some());
+        front.key("Return", &intake);
+        assert!(front.service.as_ref().unwrap().pending());
+        settle(&mut front, Page::Destinations);
+        // A chosen disk's settings ask the same connection for time zones.
+        front.key("Down", &intake);
+        front.key("Return", &intake);
+        assert_eq!(front.wizard.page, Page::Settings);
+        assert_eq!(front.wizard.asked, Some(Asked::Zones));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while front.wizard.catalog != Catalog::Listed {
+            assert!(Instant::now() < deadline);
+            front.receive();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(front.wizard.draft.values()[3], "Etc/UTC");
+        assert_eq!(front.wizard.asked, None);
+    }
+
+    #[test]
+    fn the_window_shows_the_service_review_and_withdraws_it_on_escape() {
+        let intake = intake("front-review", usize::MAX, listing);
+        let mut front = Front::new();
+        front.key("Return", &intake);
+        settle(&mut front, Page::Destinations);
+        front.key("Down", &intake);
+        front.key("Return", &intake);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while front.wizard.catalog != Catalog::Listed {
+            assert!(Instant::now() < deadline);
+            front.receive();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for chord in ["a", "l", "Tab", "h", "Tab", "Tab", "Return"] {
+            front.key(chord, &intake);
+        }
+        assert_eq!(front.wizard.asked, Some(Asked::Review));
+        settle(&mut front, Page::Review);
+        let plan = front.wizard.plan.clone().unwrap();
+        assert_eq!(plan.destination(), &crate::service::tests::disk());
+        assert_eq!(plan.settings().username(), "al");
+        front.key("Escape", &intake);
+        assert_eq!(front.wizard.page, Page::Settings);
+        assert_eq!(front.wizard.asked, Some(Asked::Withdraw));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while front.wizard.asked.is_some() {
+            assert!(Instant::now() < deadline);
+            front.receive();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(front.service.is_some());
+        assert_eq!(front.wizard.page, Page::Settings);
+    }
+
+    #[test]
+    fn a_review_proposed_again_at_once_follows_the_release_of_the_last() {
+        // This service is busy while it holds a review, as the core is.
+        let intake = intake("front-hold", usize::MAX, holding());
+        let mut front = Front::new();
+        front.key("Return", &intake);
+        settle(&mut front, Page::Destinations);
+        front.key("Down", &intake);
+        front.key("Return", &intake);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while front.wizard.catalog != Catalog::Listed {
+            assert!(Instant::now() < deadline);
+            front.receive();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for chord in ["a", "l", "Tab", "h", "Tab", "Tab", "Return"] {
+            front.key(chord, &intake);
+        }
+        settle(&mut front, Page::Review);
+        // Back and straight on again: the release must go first.
+        front.key("Escape", &intake);
+        front.key("Return", &intake);
+        settle(&mut front, Page::Review);
+        assert_eq!(front.wizard.notice, None);
+    }
+
+    #[test]
+    fn the_window_follows_an_installation_to_its_completion() {
+        let intake = intake("front-install", usize::MAX, installing());
+        let mut front = Front::new();
+        front.key("Return", &intake);
+        settle(&mut front, Page::Destinations);
+        front.key("Down", &intake);
+        front.key("Return", &intake);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while front.wizard.catalog != Catalog::Listed {
+            assert!(Instant::now() < deadline);
+            front.receive();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for chord in ["a", "l", "Tab", "h", "Tab", "Tab", "Return"] {
+            front.key(chord, &intake);
+        }
+        settle(&mut front, Page::Review);
+        front.key("Return", &intake);
+        // The turn loop's clock drives polling.
+        let mut now = 0;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = Vec::new();
+        while front.wizard.page != Page::Complete {
+            assert!(Instant::now() < deadline, "{seen:?}");
+            front.receive();
+            if seen.last() != Some(&front.wizard.page) {
+                seen.push(front.wizard.page.clone());
+            }
+            if front.wizard.executing.is_some() {
+                front.poll(now);
+            }
+            now += POLL;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The execute may be answered before the first look.
+        seen.retain(|page| *page != Page::Review);
+        assert_eq!(
+            seen,
+            [
+                Page::Progress(Progress::Consent),
+                Page::Progress(Progress::Running(crate::outcome::Phase::PreparingDisk)),
+                Page::Complete,
+            ]
+        );
+    }
+
+    /// A front end at the consent view of an `installing` service.
+    fn at_consent(name: &str) -> (Front, PathBuf) {
+        let intake = intake(name, usize::MAX, installing());
+        let mut front = Front::new();
+        front.key("Return", &intake);
+        settle(&mut front, Page::Destinations);
+        front.key("Down", &intake);
+        front.key("Return", &intake);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while front.wizard.catalog != Catalog::Listed {
+            assert!(Instant::now() < deadline);
+            front.receive();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for chord in ["a", "l", "Tab", "h", "Tab", "Tab", "Return"] {
+            front.key(chord, &intake);
+        }
+        settle(&mut front, Page::Review);
+        front.key("Return", &intake);
+        settle(&mut front, Page::Progress(Progress::Consent));
+        (front, intake)
+    }
+
+    /// Takes the outstanding answer.
+    fn answer_taken(front: &mut Front) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while front.wizard.asked.is_some() {
+            assert!(Instant::now() < deadline);
+            front.receive();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn status_is_asked_at_most_every_poll_interval_from_each_ask() {
+        let (mut front, _intake) = at_consent("front-poll");
+        front.poll(10_000);
+        assert_eq!(front.wizard.asked, Some(Asked::Status));
+        answer_taken(&mut front);
+        // Answered at once: the next ask still waits out the interval.
+        front.poll(10_000 + POLL - 1);
+        assert_eq!(front.wizard.asked, None);
+        front.poll(10_000 + POLL);
+        assert_eq!(front.wizard.asked, Some(Asked::Status));
+    }
+
+    #[test]
+    fn the_window_withdraws_at_the_prompt_over_its_connection() {
+        let (mut front, intake) = at_consent("front-consent");
+        front.key("Escape", &intake);
+        assert_eq!(front.wizard.page, Page::Settings);
+        assert_eq!(front.wizard.asked, Some(Asked::Withdraw));
+        answer_taken(&mut front);
+        assert_eq!(front.wizard.executing, None);
+        assert!(front.service.is_some());
+        assert_eq!(front.wizard.page, Page::Settings);
+    }
+
+    #[test]
+    fn disks_asked_while_the_catalog_is_awaited_are_asked_after_it() {
+        let intake = intake("front-queue", usize::MAX, slow_catalog);
+        let mut front = Front::new();
+        front.key("Return", &intake);
+        settle(&mut front, Page::Destinations);
+        front.key("Down", &intake);
+        front.key("Return", &intake);
+        assert_eq!(front.wizard.asked, Some(Asked::Zones));
+        front.key("Escape", &intake);
+        front.key("Escape", &intake);
+        front.key("Return", &intake);
+        // Waiting on disks while the catalog is still outstanding: the
+        // disks are asked once it arrives, on the same connection.
+        assert_eq!(front.wizard.page, Page::Waiting);
+        assert_eq!(front.wizard.asked, Some(Asked::Zones));
+        settle(&mut front, Page::Destinations);
+        assert_eq!(front.wizard.catalog, Catalog::Listed);
+        assert_eq!(front.wizard.asked, None);
+    }
+
+    #[test]
+    fn leaving_a_silent_service_abandons_its_connection() {
+        let intake = intake("front-silent", usize::MAX, silent);
+        let mut front = Front::new();
+        front.key("Return", &intake);
+        assert!(front.service.as_ref().unwrap().pending());
+        front.key("Escape", &intake);
+        assert_eq!(front.wizard.page, Page::Welcome);
+        assert!(front.service.is_none());
+    }
+
+    #[test]
+    fn a_service_that_goes_while_listed_takes_its_disks() {
+        let intake = intake("front-gone", 1, listing);
+        let mut front = Front::new();
+        front.key("Return", &intake);
+        settle(&mut front, Page::Destinations);
+        front.key("Down", &intake);
+        // The fake closes after one reply; the idle worker notices.
+        settle(&mut front, Page::Unavailable);
+        assert!(front.wizard.disks.is_empty());
+        assert!(front.service.is_none());
+    }
 }

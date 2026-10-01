@@ -13,7 +13,8 @@ fn invalid(message: String) -> io::Error {
 const MAX_TABLE: u64 = 128 * 1024;
 const MAX_LINE: usize = 2048;
 const MAX_COUNTRIES: usize = 512;
-const MAX_ZONES: usize = 1024;
+pub(crate) const MAX_ZONES: usize = 1024;
+pub(crate) const MAX_ID_BYTES: usize = 64;
 const MAX_TZIF: u64 = 64 * 1024;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -75,7 +76,7 @@ fn countries(text: &str) -> io::Result<BTreeMap<String, String>> {
 }
 
 fn zone_id(id: &str) -> bool {
-    id.len() <= 64
+    id.len() <= MAX_ID_BYTES
         && id.contains('/')
         && id.split('/').count() <= 3
         && id.split('/').all(|part| {

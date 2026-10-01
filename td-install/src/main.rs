@@ -601,6 +601,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 root: root.clone(),
                 firstboot: firstboot.clone(),
                 timezones: PathBuf::from(TIMEZONE_ROOT),
+                catalog: None,
             };
             if [
                 &host.td_boot,
@@ -821,6 +822,31 @@ struct LiveHost {
     root: PathBuf,
     firstboot: PathBuf,
     timezones: PathBuf,
+    /// The catalog, read once: it is immutable deployment data, so a
+    /// repeated request costs root nothing and a broken one logs once.
+    catalog: Option<Result<installation_plan::Zones, installation_protocol::Refusal>>,
+}
+
+// Whatever the catalog reader admits, the protocol's record carries.
+const _: () = assert!(
+    timezones::MAX_ZONES <= installation_plan::MAX_ZONES
+        && timezones::MAX_ID_BYTES <= installation_plan::TIMEZONE_BYTES
+);
+
+impl LiveHost {
+    fn catalog(&mut self) -> Result<&installation_plan::Zones, installation_protocol::Refusal> {
+        use installation_protocol::Refusal;
+        let root = &self.timezones;
+        self.catalog
+            .get_or_insert_with(|| {
+                let catalog = timezones::Catalog::load(root)
+                    .map_err(|error| refuse(Refusal::TimezonesUnavailable, error))?;
+                installation_plan::Zones::new(catalog.ids().map(String::from).collect())
+                    .map_err(|error| refuse(Refusal::TimezonesUnavailable, error))
+            })
+            .as_ref()
+            .map_err(|refusal| *refusal)
+    }
 }
 
 fn refuse(
@@ -839,6 +865,10 @@ impl installation_service::Host for LiveHost {
     ) -> Result<installation_plan::Candidates, installation_protocol::Refusal> {
         inventory::candidates()
             .map_err(|error| refuse(installation_protocol::Refusal::DiscoveryFailed, error))
+    }
+
+    fn timezones(&mut self) -> Result<installation_plan::Zones, installation_protocol::Refusal> {
+        self.catalog().cloned()
     }
 
     fn check_settings(
@@ -864,8 +894,19 @@ impl installation_service::Host for LiveHost {
                 ),
             ));
         }
-        timezones::Selection::load(&self.timezones, settings.timezone())
-            .map_err(|error| refuse(Refusal::UnsupportedTimezone, error))?;
+        // The catalog the installer is offered is the one checked here.
+        let zone = settings.timezone();
+        if self
+            .catalog()?
+            .as_slice()
+            .binary_search_by(|id| id.as_str().cmp(zone))
+            .is_err()
+        {
+            return Err(refuse(
+                Refusal::UnsupportedTimezone,
+                format!("time zone {zone} is not in the catalog"),
+            ));
+        }
         Ok(())
     }
 
@@ -2945,6 +2986,7 @@ mod tests {
                 root: PathBuf::from("/root"),
                 firstboot: PathBuf::from("/bin/td-firstboot"),
                 timezones: PathBuf::from(TIMEZONE_ROOT),
+                catalog: None,
             })
         );
         for count in 1..full.len() {
@@ -3122,6 +3164,7 @@ mod tests {
             root: directory.clone(),
             firstboot,
             timezones: zones,
+            catalog: None,
         };
         for (choice, expected) in [
             (["alice", "td-laptop", "us", "Europe/London"], Ok(())),
@@ -3153,6 +3196,29 @@ mod tests {
         }
         // No source is present, so authentication refuses rather than guessing.
         assert_eq!(host.authenticate_source(), Err(Refusal::SourceUnavailable));
+        // Settings are offered exactly the catalog the check admits from.
+        let offered = host.timezones().unwrap();
+        assert_eq!(offered.as_slice(), ["Etc/UTC", "Europe/London"]);
+        for zone in offered.as_slice() {
+            let settings =
+                installation_plan::Settings::new("alice", "td-laptop", "us", zone).unwrap();
+            assert_eq!(host.check_settings(&settings), Ok(()), "{zone}");
+        }
+        // Read once: a later change does not reach this service.
+        std::fs::remove_file(host.timezones.join("Etc/UTC")).unwrap();
+        assert_eq!(host.timezones(), Ok(offered));
+        // A broken catalog refuses both the offer and the check, as such.
+        let mut broken = LiveHost {
+            catalog: None,
+            ..host
+        };
+        assert_eq!(broken.timezones(), Err(Refusal::TimezonesUnavailable));
+        let settings =
+            installation_plan::Settings::new("alice", "td-laptop", "us", "Europe/London").unwrap();
+        assert_eq!(
+            broken.check_settings(&settings),
+            Err(Refusal::TimezonesUnavailable)
+        );
     }
 
     #[test]

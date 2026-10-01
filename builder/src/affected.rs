@@ -5666,7 +5666,8 @@ mod tests {
                 "td-vm-guest"
             ]
         );
-        // Jail, login and the VM helper share the primary-account reader.
+        // Jail, login and the VM helper share the primary-account reader;
+        // td-setup spells td-authd's setup intake path.
         assert_eq!(
             readers_of("td-authd"),
             [
@@ -5675,6 +5676,7 @@ mod tests {
                 "td-jail",
                 "td-login",
                 "td-secret",
+                "td-setup",
                 "td-vm-guest"
             ]
         );

@@ -60,13 +60,39 @@ impl DestinationPage {
         first: usize,
         detail_page: usize,
     ) -> Option<Self> {
-        Self::build(surface, disks, selected, first, detail_page, false)
+        Self::build(surface, disks, selected, first, detail_page, None)
     }
 
     /// An absent service is distinct from a service reporting no eligible
     /// disks. This state offers no selectable destination.
     pub fn unavailable(surface: Surface) -> Option<Self> {
-        Self::build(surface, &[], None, 0, 0, true)
+        Self::notice(
+            surface,
+            "The installer service is unavailable. No disk can be selected. Press Escape to return.",
+        )
+    }
+
+    /// The service has been asked and has not yet answered.
+    pub fn waiting(surface: Surface) -> Option<Self> {
+        Self::notice(
+            surface,
+            "Asking the installer service for eligible disks. Press Escape to return.",
+        )
+    }
+
+    /// The service refused to list disks; `reason` is the installer's own
+    /// text for its refusal.
+    pub fn refused(surface: Surface, reason: &str) -> Option<Self> {
+        Self::notice(
+            surface,
+            &format!(
+                "The installer service refused to list disks: {reason}. No disk can be selected. Press Escape to return."
+            ),
+        )
+    }
+
+    fn notice(surface: Surface, text: &str) -> Option<Self> {
+        Self::build(surface, &[], None, 0, 0, Some(text))
     }
 
     fn build(
@@ -75,7 +101,7 @@ impl DestinationPage {
         selected: Option<usize>,
         first: usize,
         detail_page: usize,
-        unavailable: bool,
+        notice: Option<&str>,
     ) -> Option<Self> {
         crate::supported_page(surface)?;
         let scale = surface.scale.value();
@@ -122,12 +148,8 @@ impl DestinationPage {
             .columns()
             .min((BLOCK_SCALARS - (DETAIL_ROWS - 1)) / DETAIL_ROWS);
         let mut lines = Vec::new();
-        if unavailable {
-            push_lines(
-                &mut lines,
-                "The installer service is unavailable. No disk can be selected. Press Escape to return.",
-                columns,
-            );
+        if let Some(text) = notice {
+            push_lines(&mut lines, text, columns);
         } else if overflow {
             push_lines(
                 &mut lines,
@@ -489,6 +511,16 @@ mod tests {
         assert!(!unavailable
             .detail
             .contains("No eligible disks were reported"));
+        // Waiting and a refusal are notices too, never an empty list.
+        let waiting = DestinationPage::waiting(surface()).unwrap();
+        assert!(waiting.rows.is_empty());
+        assert!(waiting.detail.contains("Asking the installer service"));
+        let refused =
+            DestinationPage::refused(surface(), "the disks could not be examined").unwrap();
+        assert_eq!(refused.selected(), None);
+        assert!(refused.rows.is_empty());
+        assert!(refused.detail.contains("could not be"));
+        assert!(!refused.detail.contains("No eligible disks were reported"));
         assert!(DestinationPage::new(surface(), &[], Some(0), 0).is_none());
         let small = Surface::new(640, 480, Scale::new(1).unwrap()).unwrap();
         assert!(DestinationPage::new(small, &[], None, 0).is_none());

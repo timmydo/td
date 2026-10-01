@@ -8,6 +8,7 @@ use td_ui::raster::{
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
 const INSET: usize = CELL_WIDTH;
+const CONSENT_FOOTER: &str = "Consent \u{b7} step 5 of 6 \u{b7} Escape withdraws the review";
 const PROGRESS_FOOTER: &str = "Installation progress \u{b7} step 5 of 6";
 const FAILED_FOOTER: &str = "Installation stopped \u{b7} step 5 of 6";
 const UNKNOWN_FOOTER: &str = "Outcome unknown \u{b7} step 5 of 6";
@@ -67,16 +68,20 @@ impl Failure {
     }
 }
 
-/// Progress from the service, or local uncertainty when it is unavailable.
+/// Progress from the service, or local uncertainty when the installer
+/// cannot confirm what the service did.
 /// A failed operation does not claim old disk contents can be recovered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Progress {
+    /// The service seeks compositor-owned consent; nothing is written.
+    Consent,
     Running(Phase),
     Failed(Failure),
     Unknown,
 }
 
-/// One view of an in-progress, failed or unavailable installation service.
+/// One view of consent, an installation in progress or failed, or an
+/// outcome the installer cannot confirm.
 pub struct ProgressPage {
     surface: Surface,
     progress: Progress,
@@ -106,6 +111,31 @@ impl Composition for ProgressPage {
     fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
         fill(self.surface, damage, sink);
         let footer = match self.progress {
+            Progress::Consent => {
+                row(self.surface, 1, "Waiting for consent", damage, sink);
+                row(
+                    self.surface,
+                    4,
+                    "Confirm or decline the installation at the secure prompt.",
+                    damage,
+                    sink,
+                );
+                row(
+                    self.surface,
+                    6,
+                    "Nothing is written to the disk before consent is given there.",
+                    damage,
+                    sink,
+                );
+                row(
+                    self.surface,
+                    8,
+                    "This window cannot give consent.",
+                    damage,
+                    sink,
+                );
+                CONSENT_FOOTER
+            }
             Progress::Running(phase) => {
                 row(self.surface, 1, "Installing td", damage, sink);
                 row(self.surface, 4, phase.label(), damage, sink);
@@ -164,7 +194,7 @@ impl Composition for ProgressPage {
                 row(
                     self.surface,
                     4,
-                    "The installation service is unavailable.",
+                    "The installer cannot confirm what the service did.",
                     damage,
                     sink,
                 );
@@ -326,6 +356,9 @@ mod tests {
             assert!(painted.contains(FAILED_FOOTER));
             assert!(!painted.contains("service is working"));
         }
+        let consent = ProgressPage::new(screen, Progress::Consent).unwrap();
+        let painted = glyphs(&consent, screen);
+        assert!(painted.contains("secure prompt") && painted.contains(CONSENT_FOOTER));
         let unknown = ProgressPage::new(screen, Progress::Unknown).unwrap();
         let painted = glyphs(&unknown, screen);
         assert!(painted.contains("outcome unknown"));

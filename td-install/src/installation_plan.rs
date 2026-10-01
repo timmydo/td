@@ -5,13 +5,16 @@
 pub const MAX_BYTES: usize = 2048;
 const MAGIC: &[u8; 8] = b"TDPLAN01";
 const CANDIDATES_MAGIC: &[u8; 8] = b"TDCAND01";
+const ZONES_MAGIC: &[u8; 8] = b"TDZONE01";
 pub const MAX_CANDIDATES: usize = 64;
+/// The catalog reader's own ceiling, UTC included.
+pub const MAX_ZONES: usize = 1024;
 const NAME_BYTES: usize = 64;
 const LABEL_BYTES: usize = 256;
 const USERNAME_BYTES: usize = 32;
 const HOSTNAME_BYTES: usize = 63;
 const KEYBOARD_BYTES: usize = 64;
-const TIMEZONE_BYTES: usize = 64;
+pub const TIMEZONE_BYTES: usize = 64;
 const DESTINATION_BYTES: usize = 4 + 4 + 8 + 8 + 4 + 1 + 2 + NAME_BYTES + 3 * (1 + 2 + LABEL_BYTES);
 const ENCODED_BYTES: usize = 8
     + 32
@@ -24,6 +27,7 @@ const ENCODED_BYTES: usize = 8
     + KEYBOARD_BYTES
     + TIMEZONE_BYTES;
 pub const MAX_CANDIDATE_BYTES: usize = 8 + 1 + MAX_CANDIDATES * DESTINATION_BYTES;
+pub const MAX_ZONE_BYTES: usize = 8 + 2 + MAX_ZONES * (2 + TIMEZONE_BYTES);
 
 /// Unvalidated caller observations. Construction copies admitted values.
 #[derive(Debug)]
@@ -193,6 +197,67 @@ impl Candidates {
         }
         reader.finish()?;
         Self::new(disks)
+    }
+}
+
+/// The time zone choices the service's catalog offers, as identifiers in
+/// strictly ascending order. Each is a plan timezone token; whether it is
+/// in the catalog is the service's check, on the catalog, not on these
+/// bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Zones {
+    ids: Vec<String>,
+}
+
+impl Zones {
+    pub fn new(ids: Vec<String>) -> Result<Self, String> {
+        if ids.is_empty() || ids.len() > MAX_ZONES {
+            return Err("installation time zones outside their bound".into());
+        }
+        for id in &ids {
+            token(id, TIMEZONE_BYTES)?;
+        }
+        if ids.windows(2).any(|pair| pair.first() >= pair.get(1)) {
+            return Err("installation time zones are not strictly ascending".into());
+        }
+        Ok(Self { ids })
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.ids
+    }
+
+    /// Canonical bounded bytes for a read-only service reply.
+    pub fn encode(&self) -> Vec<u8> {
+        let length = self.ids.iter().map(|id| 2 + id.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(8 + 2 + length);
+        out.extend_from_slice(ZONES_MAGIC);
+        // Construction bounds the count to MAX_ZONES.
+        out.extend_from_slice(&(self.ids.len() as u16).to_be_bytes());
+        for id in &self.ids {
+            put(&mut out, id);
+        }
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_ZONE_BYTES {
+            return Err("installation time zones exceed wire bound".into());
+        }
+        let mut reader = Reader(bytes, "time zones");
+        if &reader.array::<8>()? != ZONES_MAGIC {
+            return Err("unsupported installation time zones version".into());
+        }
+        let count = usize::from(u16::from_be_bytes(reader.array()?));
+        if count == 0 || count > MAX_ZONES {
+            return Err("installation time zones outside their bound".into());
+        }
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            ids.push(reader.string(TIMEZONE_BYTES)?.to_string());
+        }
+        reader.finish()?;
+        Self::new(ids)
     }
 }
 

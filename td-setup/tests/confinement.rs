@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 //! Source-level contracts the compiler cannot express: the crate's file
 //! inventory, and which toolkit modules its files may name. td-ui/DESIGN.md
@@ -7,7 +12,8 @@
 //! `window` is the crate's only Wayland client: it alone names
 //! `td_ui::wayland` and `td_ui::client`, so the pages stay pure rendering
 //! over the raster and the chrome bands and cannot quietly reach the
-//! transport or the turn loop.
+//! transport or the turn loop. `service` is the crate's only installer
+//! client: it alone names the protocol, the setup intake and threads.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -29,6 +35,7 @@ fn source_inventory_and_toolkit_access_are_closed() {
         "main.rs",
         "outcome.rs",
         "review.rs",
+        "service.rs",
         "settings.rs",
         "welcome.rs",
         "window.rs",
@@ -77,13 +84,17 @@ fn source_inventory_and_toolkit_access_are_closed() {
         "main.rs",
         "outcome.rs",
         "review.rs",
+        "service.rs",
         "settings.rs",
         "welcome.rs",
         "window.rs",
     ] {
         let text = std::fs::read_to_string(root.join("src").join(name)).unwrap();
-        let allowed = if matches!(name, "destination.rs" | "review.rs") {
+        let allowed = if matches!(name, "destination.rs" | "review.rs" | "window.rs") {
             text.replace("td_install::installation_plan::", "")
+        } else if name == "service.rs" {
+            text.replace("td_install::installation_plan::", "")
+                .replace("td_install::installation_protocol::", "")
         } else if name == "lib.rs" {
             text.replacen(
                 "use td_install::installation_plan::{Destination, DestinationObservation, Plan, Settings};",
@@ -97,6 +108,8 @@ fn source_inventory_and_toolkit_access_are_closed() {
             !allowed.contains("td_install"),
             "{name} reaches another installer API"
         );
+        let found = client_violations(name, &text);
+        assert!(found.is_empty(), "{name}: {found:?}");
         let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
             !compact.contains("path=") && !compact.contains("include!("),
@@ -110,6 +123,161 @@ fn source_inventory_and_toolkit_access_are_closed() {
         window.contains("td_ui::wayland") && window.contains("td_ui::client"),
         "window is the crate's Wayland client boundary"
     );
+    // The installer client reaches exactly td-authd's setup intake, and
+    // the window connects only through it.
+    let service = std::fs::read_to_string(root.join("src/service.rs")).unwrap();
+    let service = production(&service).unwrap();
+    assert_eq!(service.matches("/run/").count(), 1);
+    assert!(service.contains("pub const SOCKET: &str = \"/run/td-authd/1000/setup\";"));
+    assert_eq!(service.matches("connect(").count(), 2);
+    assert_eq!(service.matches("UnixStream::connect(").count(), 1);
+    assert!(window.contains("self.front.key(&chord, Path::new(SOCKET));"));
+    // td-ui ticks only before an event; every turn, idle ones too, ends in
+    // `end_turn`, so the answer is taken there.
+    let end_turn: String = window
+        .split("fn end_turn(")
+        .nth(1)
+        .unwrap()
+        .chars()
+        .take(120)
+        .collect();
+    assert!(end_turn.contains("self.receive();"), "{end_turn}");
+}
+
+/// A file's production source: everything before its trailing test
+/// module, which is `mod tests` under `#[cfg(test)]` and must end the file.
+/// A file without one is all production, lone test items included.
+fn production(text: &str) -> Result<&str, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(header) = lines
+        .iter()
+        .position(|line| *line == "mod tests {" || *line == "pub(crate) mod tests {")
+    else {
+        return Ok(text);
+    };
+    let mut first = header;
+    while first > 0 && lines[first - 1].starts_with("#[") {
+        first -= 1;
+    }
+    if !lines[first..header].contains(&"#[cfg(test)]") {
+        return Err("a tests module outside #[cfg(test)]".into());
+    }
+    // Inside the module rustfmt indents everything; only its close sits at
+    // the margin, and nothing follows it.
+    let rest: Vec<&str> = lines[header + 1..]
+        .iter()
+        .copied()
+        .filter(|line| !line.is_empty() && !line.starts_with(' '))
+        .collect();
+    if rest != ["}"] {
+        return Err(format!("code after the tests module: {rest:?}"));
+    }
+    let offset: usize = lines[..first].iter().map(|line| line.len() + 1).sum();
+    Ok(text.get(..offset).unwrap_or(text))
+}
+
+/// Spellings by which a file other than `service` could reach the
+/// installer service, a socket or a thread, however it imports them: the
+/// bare names are refused, not only their usual paths. `window` keeps its
+/// Wayland stream and connects only as the toolkit and `service` do.
+fn client_violations(name: &str, text: &str) -> Vec<String> {
+    let mut code = match production(text) {
+        Ok(code) => code.to_string(),
+        Err(why) => return vec![why],
+    };
+    let forbidden: &[&str] = if name == "service.rs" {
+        // No re-export, alias or exported macro, at any visibility, hands
+        // another file a name.
+        if code.contains("macro_export")
+            || code.lines().any(|line| {
+                line.trim_start().starts_with("pub")
+                    && (line.contains(" use ") || line.contains(" type "))
+            })
+        {
+            return vec!["re-exports".into()];
+        }
+        &["pub use", "UnixListener", "UnixDatagram", "std::process"]
+    } else {
+        if name == "window.rs" {
+            for allowed in [
+                "use std::os::unix::net::UnixStream;",
+                "fn new(stream: UnixStream,",
+                "let stream = connect(endpoint)?;",
+                "use td_ui::wayland::{connect, endpoint};",
+                "Service::connect(intake)",
+            ] {
+                code = code.replacen(allowed, "", 1);
+            }
+        }
+        &[
+            "installation_protocol",
+            "/run/",
+            "thread",
+            "mpsc",
+            "sync",
+            "unix::net",
+            "UnixStream",
+            "UnixListener",
+            "UnixDatagram",
+            "std::net",
+            "connect(",
+        ]
+    };
+    forbidden
+        .iter()
+        .filter(|token| code.contains(**token))
+        .map(|token| format!("names {token}"))
+        .collect()
+}
+
+#[test]
+fn the_client_guard_refuses_grouped_imports_aliases_and_reexports() {
+    for (name, text) in [
+        ("welcome.rs", "use std::{sync::mpsc, thread};"),
+        ("destination.rs", "use std::os::unix::net::UnixStream as S;"),
+        ("review.rs", "fn f(p: &str) { let _ = S::connect(p); }"),
+        (
+            "window.rs",
+            "use std::{os::unix::net::UnixStream as Other};",
+        ),
+        ("window.rs", "let other = connect(somewhere)?;"),
+        (
+            "outcome.rs",
+            "const P: &str = \"/run/td-authd/1000/setup\";",
+        ),
+        (
+            "service.rs",
+            "pub use td_install::installation_protocol::Request;",
+        ),
+        ("service.rs", "pub(crate) use std::thread as worker;"),
+        (
+            "service.rs",
+            "pub(crate) type Builder = std::thread::Builder;",
+        ),
+        (
+            "service.rs",
+            "#[macro_export]\nmacro_rules! m { () => {}; }",
+        ),
+        // A lone test item does not end production.
+        (
+            "welcome.rs",
+            "#[cfg(test)]\n#[test]\nfn t() {}\nfn f() { std::thread::spawn(|| {}); }\n",
+        ),
+        // Nor does a module that production follows.
+        (
+            "welcome.rs",
+            "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nfn f() { std::thread::spawn(|| {}); }\n",
+        ),
+    ] {
+        assert!(!client_violations(name, text).is_empty(), "{name}: {text}");
+    }
+    // A trailing test module is not production.
+    assert!(client_violations(
+        "welcome.rs",
+        "fn f() {}\n\n#[cfg(test)]\n#[allow(clippy::unwrap_used)]\nmod tests {\n    use std::thread;\n}\n"
+    )
+    .is_empty());
+    assert!(client_violations("window.rs", "use std::os::unix::net::UnixStream;").is_empty());
 }
 
 /// The inventory above walks `src`; a test file could still mount a sibling

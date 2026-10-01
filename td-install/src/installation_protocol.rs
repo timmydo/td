@@ -5,26 +5,32 @@
 
 use crate::installation_plan::{
     put_destination, put_settings, read_destination, read_settings, Candidates, Destination, Plan,
-    Reader, Settings, MAX_BYTES, MAX_CANDIDATE_BYTES,
+    Reader, Settings, Zones, MAX_BYTES, MAX_CANDIDATE_BYTES, MAX_ZONE_BYTES,
 };
 
 /// Sent and required by both ends before the first frame. A change to any
 /// message or its bytes changes the greeting; there is no negotiation.
-pub const GREETING: &[u8; 8] = b"TDINS01\n";
+pub const GREETING: &[u8; 8] = b"TDINS02\n";
 /// Root admits only this much from the unprivileged side.
 pub const MAX_REQUEST_BYTES: usize = 1 + MAX_BYTES;
-pub const MAX_REPLY_BYTES: usize = 1 + MAX_CANDIDATE_BYTES;
+pub const MAX_REPLY_BYTES: usize = 1 + if MAX_CANDIDATE_BYTES > MAX_ZONE_BYTES {
+    MAX_CANDIDATE_BYTES
+} else {
+    MAX_ZONE_BYTES
+};
 
 const DESTINATIONS: u8 = 0x01;
 const PROPOSE: u8 = 0x02;
 const EXECUTE: u8 = 0x03;
 const STATUS: u8 = 0x04;
 const WITHDRAW: u8 = 0x05;
+const TIMEZONES: u8 = 0x06;
 // Replies set the high bit, so a reflected frame never decodes.
 const DESTINATIONS_REPLY: u8 = 0x81;
 const REVIEWED: u8 = 0x82;
 const STATUS_REPLY: u8 = 0x83;
 const REFUSED: u8 = 0x84;
+const TIMEZONES_REPLY: u8 = 0x85;
 
 pub fn check_greeting(received: &[u8; 8]) -> Result<(), String> {
     if received == GREETING {
@@ -227,6 +233,8 @@ pub enum Refusal {
     NoReview,
     /// No seat, compositor or trusted consent path can present the review.
     ConsentUnavailable,
+    /// The time zone catalog could not be read.
+    TimezonesUnavailable,
 }
 
 impl Refusal {
@@ -244,6 +252,7 @@ impl Refusal {
         Self::StaleReview,
         Self::NoReview,
         Self::ConsentUnavailable,
+        Self::TimezonesUnavailable,
     ];
 
     fn code(self) -> u8 {
@@ -261,6 +270,7 @@ impl Refusal {
             Self::StaleReview => 11,
             Self::NoReview => 12,
             Self::ConsentUnavailable => 13,
+            Self::TimezonesUnavailable => 14,
         }
     }
 
@@ -281,6 +291,7 @@ impl Refusal {
             11 => Ok(Self::StaleReview),
             12 => Ok(Self::NoReview),
             13 => Ok(Self::ConsentUnavailable),
+            14 => Ok(Self::TimezonesUnavailable),
             _ => Err("unknown installation refusal".into()),
         }
     }
@@ -304,6 +315,8 @@ pub enum Request {
     Status,
     /// Release a review that has not started, and its disk claim.
     Withdraw(ReviewNonce),
+    /// The time zones settings may choose, from the service's catalog.
+    Timezones,
 }
 
 impl Request {
@@ -328,6 +341,7 @@ impl Request {
                 out.push(WITHDRAW);
                 out.extend_from_slice(nonce.as_bytes());
             }
+            Self::Timezones => out.push(TIMEZONES),
         }
         out
     }
@@ -348,6 +362,7 @@ impl Request {
             EXECUTE => return Ok(Self::Execute(Plan::decode(body)?)),
             STATUS => Self::Status,
             WITHDRAW => Self::Withdraw(ReviewNonce::new(reader.array()?)?),
+            TIMEZONES => Self::Timezones,
             _ => return Err("unknown installation request".into()),
         };
         reader.finish()?;
@@ -393,6 +408,7 @@ pub enum Reply {
     Reviewed(Box<Plan>),
     Status(State),
     Refused(Refusal),
+    Timezones(Zones),
 }
 
 impl Reply {
@@ -428,6 +444,10 @@ impl Reply {
                 out.push(REFUSED);
                 out.push(refusal.code());
             }
+            Self::Timezones(zones) => {
+                out.push(TIMEZONES_REPLY);
+                out.extend_from_slice(&zones.encode());
+            }
         }
         out
     }
@@ -447,6 +467,7 @@ impl Reply {
                 reader.finish()?;
                 Self::Refused(Refusal::from_code(code)?)
             }
+            TIMEZONES_REPLY => Self::Timezones(Zones::decode(body)?),
             _ => return Err("unknown installation reply".into()),
         };
         Ok(reply)
@@ -462,6 +483,7 @@ impl Reply {
                 matches!(self, Self::Status(_) | Self::Refused(_))
             }
             Request::Status => matches!(self, Self::Status(_)),
+            Request::Timezones => matches!(self, Self::Timezones(_) | Self::Refused(_)),
         }
     }
 }

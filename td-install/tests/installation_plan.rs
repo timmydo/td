@@ -6,8 +6,8 @@
 )]
 
 use td_install::installation_plan::{
-    Candidates, Destination, DestinationObservation, Plan, Settings, MAX_BYTES, MAX_CANDIDATES,
-    MAX_CANDIDATE_BYTES,
+    Candidates, Destination, DestinationObservation, Plan, Settings, Zones, MAX_BYTES,
+    MAX_CANDIDATES, MAX_CANDIDATE_BYTES, MAX_ZONES, MAX_ZONE_BYTES,
 };
 
 fn observed_destination(
@@ -171,6 +171,56 @@ fn candidate_identity_is_unique_and_count_is_bounded() {
     assert_eq!(
         Candidates::decode(&oversized),
         Err("installation candidates exceed wire bound".into())
+    );
+}
+
+#[test]
+fn time_zones_are_ascending_tokens_and_their_wire_is_canonical() {
+    let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+    let zones = Zones::new(ids(&["America/Los_Angeles", "Etc/UTC"])).unwrap();
+    assert_eq!(zones.as_slice(), ["America/Los_Angeles", "Etc/UTC"]);
+    let bytes = zones.encode();
+    assert_eq!(
+        bytes,
+        b"TDZONE01\0\x02\0\x13America/Los_Angeles\0\x07Etc/UTC"
+    );
+    assert_eq!(Zones::decode(&bytes).unwrap(), zones);
+    for end in 0..bytes.len() {
+        assert!(Zones::decode(&bytes[..end]).is_err(), "{end}");
+    }
+    let mut extended = bytes.clone();
+    extended.push(0);
+    assert!(Zones::decode(&extended).is_err());
+    // Out of order, repeated, empty, spaced, too long or too many refuse,
+    // built or decoded.
+    for bad in [
+        ids(&["Etc/UTC", "America/Los_Angeles"]),
+        ids(&["Etc/UTC", "Etc/UTC"]),
+        ids(&[]),
+        ids(&["Etc/U TC"]),
+        ids(&[""]),
+        vec!["Z".repeat(65)],
+        (0..=MAX_ZONES).map(|i| format!("Zone/{i:04}")).collect(),
+    ] {
+        assert!(Zones::new(bad.clone()).is_err(), "{bad:?}");
+        let mut wire = b"TDZONE01".to_vec();
+        wire.extend((bad.len() as u16).to_be_bytes());
+        for id in &bad {
+            wire.extend((id.len() as u16).to_be_bytes());
+            wire.extend(id.as_bytes());
+        }
+        assert!(Zones::decode(&wire).is_err(), "{bad:?}");
+    }
+    let widest = (0..MAX_ZONES)
+        .map(|i| format!("Zone/{i:059}"))
+        .collect::<Vec<_>>();
+    let bytes = Zones::new(widest).unwrap().encode();
+    assert_eq!(bytes.len(), MAX_ZONE_BYTES);
+    let mut oversized = bytes;
+    oversized.push(0);
+    assert_eq!(
+        Zones::decode(&oversized),
+        Err("installation time zones exceed wire bound".into())
     );
 }
 

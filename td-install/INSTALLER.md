@@ -54,65 +54,135 @@ exact reviewed request under the existing elevation contract; ordinary
 client pixels or synthetic input are not authorization evidence. The
 typed operations are specified in "Installation service protocol".
 
-The `td-setup` front end has a source-built static target recipe
-and `td-setup-test` realized-output check. The recipe stages its own tree
-with `td-install`, `td-ui` and the compositor sources that the toolkit
-mounts, then builds with the target Rust toolchain. The check runs
-`--help`, `--font-license` and a headless render of every page type at the
-reference 800x600 size and the compositor's 752x508 tile, including all
-destination and review detail pages and every progress outcome, without
-emitting image bytes. The connected and pure views share a 752x480 minimum
-extent, while welcome keeps its own content-dependent layout. The render
-data is synthetic and grants no authority.
-This establishes an image-eligible executable whose window presents welcome
-and, on Enter, an explicit service-unavailable destination page. Escape
-returns to welcome. The destination page has no selectable disk and cannot
-advance until a paired service reports eligible destinations. Its library also has
-pure, unconnected settings, review, progress and completion views. The
+The `td-setup` front end has a source-built static target recipe and
+`td-setup-test` realized-output check. The recipe stages its own tree with
+`td-install`, `td-ui` and the compositor sources that the toolkit mounts,
+then builds with the target Rust toolchain. The check runs `--help`,
+`--font-license` and a headless render of every page type at the reference
+800x600 size and the compositor's 752x508 tile, including all destination
+and review detail pages and every progress outcome, without emitting image
+bytes. The connected and pure views share a 752x480 minimum extent, while
+welcome keeps its own content-dependent layout. The render data is synthetic
+and grants no authority. This establishes an image-eligible executable whose
+window presents welcome and, on Enter, connects to td-authd's setup intake
+(td-authd/DESIGN.md "Whole-disk installation intake") and asks the service
+it starts for destinations, showing a waiting notice until the answer, which
+the window takes at the end of every turn, idle or not. The service's list
+follows, or its refusal in the installer's own words, or, when the intake is
+absent or the connection ends, an explicit service-unavailable page; an
+ended connection discards the listed observations. An absent intake fails at
+once; otherwise a worker thread connects, requires the service's greeting
+within ten seconds and does the blocking exchange, one request at a time, so
+the window keeps drawing, and between requests it notices the service
+closing. A reply has no time limit. Up and Down move the list's navigation
+index, Page Up and Page Down page a disk's identity, and Escape returns to
+welcome. From the list Escape keeps the connection for the next request;
+while waiting it abandons the request and its connection, so a service that
+never answers cannot hold the window, and td-authd serves the next installer
+once it reaps that service. Disks the window stopped waiting for are
+dropped. With a disk selected, Enter continues to the settings step
+described below and Escape there goes back to the list, keeping the drafts.
+Its library also has pure, unconnected progress and completion views. The
 release live profile must wait for later navigation, its paired service,
 trusted consent, and end-to-end installation evidence.
 
 The destination page is a pure view over `Destination` values supplied by
-the future service. It shows capacity, model, kernel name, device number,
-sequence, serial and WWID where present, and escapes untrusted labels for
-display, including spaces. Long identifiers span numbered detail pages, so
-the full escaped identity remains inspectable; excess disk counts show an
-explicit refusal. The caller retains list position separately from choice.
-Supplied label values carry a `value:` prefix, and wrapped continuation
-lines carry `| ` and the field name, so they cannot impersonate the
-page's own field headings or missing and present-empty markers. A selected
-row is only a navigation index; the service must still
-authenticate the source, establish eligibility and retain the disk claim.
-The page uses the pure `td-install` library's plan module. Its target recipe
-stages that sibling source tree and its confinement test pins the library's
-two public modules and forbids td-setup sources from naming the protocol
-module. The live window uses only its service-unavailable
-state; it has no service connection or selected destination yet. All wizard
-views fit the compositor's 752-pixel tile within an 800-pixel headless output.
+the service. It shows capacity, model, kernel name, device number, sequence,
+serial and WWID where present, and escapes untrusted labels for display,
+including spaces. Long identifiers span numbered detail pages, so the full
+escaped identity remains inspectable; excess disk counts show an explicit
+refusal. The caller retains list position separately from choice. Supplied
+label values carry a `value:` prefix, and wrapped continuation lines carry
+`| ` and the field name, so they cannot impersonate the page's own field
+headings or missing and present-empty markers. A selected row is only a
+navigation index; the service must still authenticate the source, establish
+eligibility and retain the disk claim. The page uses the pure `td-install`
+library's plan module. Its target recipe stages that sibling source tree and
+its confinement test pins the library's two public modules; outside test
+modules only td-setup's `service` module names the protocol module, the
+setup intake, a socket connection or threads, by any std path, grouped
+import or alias, nor re-exports them, and the window connects only through
+it and the toolkit. The live window lists the service's destinations and
+proposes only what the settings step below completes. All wizard views fit
+the compositor's 752-pixel tile within an 800-pixel headless output.
 
-The account and regional settings page is also a pure view. Username and
-hostname are text entries; keyboard layout and time zone are chooser rows
-for catalog selections. It displays bounded tokens and focus without
-treating wire admission as policy or catalog approval. Empty values may
-be shown before completion. The page is not yet connected to the live
-window; the validation contract below applies before review.
+The account and regional settings page is a pure view over the window's
+drafts. Username and hostname are text entries taking printable, non-space
+ASCII up to their token limits, edited with Left, Right, Home, End,
+Backspace and Delete; keyboard layout is fixed at `us`; time zone is a
+chooser over the catalog the service's time zones reply carries, asked for
+over the connection that listed the disks the first time the step is shown.
+Up, Down, Page Up, Page Down, Home and End move through the catalog, and
+typed characters seek the first zone beginning with them, ignoring case; a
+character that would match none is not taken, and a movement key starts the
+seek over. `Etc/UTC` is chosen when the catalog has it and nothing else was;
+a later catalog keeps a choice it still has. Until the catalog arrives the
+row says it is being read, and a refusal is shown there in the installer's
+words and asked again when the step is next entered. A catalog that never
+comes holds no page: Escape leaves settings, and a disk list then asked
+waits behind it and is abandoned like any other. Tab and Shift+Tab move
+between fields; on the others Up, Down and Enter do. The drafts, and a
+catalog already received, outlive a lost connection. The page displays
+bounded tokens and focus without treating wire admission as policy or
+catalog approval, and empty values may be shown before completion; the
+validation contract below applies before review. Enter on the time zone row
+proposes the selected disk with the drafts, or says on the page's notice row
+which field is still empty; while the service reviews, the notice says so
+and a second Enter proposes nothing. The service's review opens the review
+page, and its refusal is shown on the notice row in the installer's words
+until a key changes the form. The fields stay editable while the service
+reviews; the review shows what was proposed. A review answers only the
+proposal last sent while it is still wanted: one given up is withdrawn when
+it arrives, even if settings were shown again and another proposal made,
+which is sent after that withdraw. Leaving settings before a review arrives
+drops a proposal not yet sent and releases one that arrives later.
 
 The pure review page renders one immutable `Plan` proposal. It shows the
 complete escaped disk identity and all four selected settings across bounded
 detail pages. The destructive-loss and unencrypted automatic-login notices
 remain visible on every page. It cannot authenticate the source, establish a
 disk claim or authorize execution; the service and compositor-owned trusted
-consent remain mandatory. It is not yet connected to the live window.
+consent remain mandatory. In the live window it shows the service's review,
+never the drafts: Page Up and Page Down move between its detail pages, Enter
+sends execute with the review exactly as the service returned it, once, and
+Escape returns to settings and sends withdraw with the review's nonce,
+releasing the review and its disk claim before anything else is asked; an
+execute already sent is answered first, and one that already ended the
+review cancels the release. An execute refused as consent unavailable is
+shown under the warnings and leaves the review held, so it may be executed
+again or left; one refused as no review returns to settings with nothing to
+release; one refused as a stale review returns to settings and withdraws the
+review shown, since the service still holds a review and its claim, and a
+withdraw it refuses ends the connection, which ends that review; one refused
+as busy ends the connection, since consent may be sought or an installation
+running. An execute that finds the disk changed returns to settings with
+that reason. A lost connection discards the review, which with its claim
+ends with the installer's channel until an installation starts.
 
 The pure progress view renders service-supplied phases and a bounded failure
-reason. It shows an unknown outcome when service status is unavailable, never
-infers success from a queued request, and warns that a failed disk may be
-incomplete and requires a new review before retry. The completion view
+reason. It shows an unknown outcome when service status is unavailable,
+never infers success from a queued request, and warns that a failed disk may
+be incomplete and requires a new review before retry. The completion view
 instructs the user to remove installation media and reboot; the caller may
 show it only after the service reports durable filesystem and deployment
 publication, verified boot artifacts, and settings publication. The orderly
-reboot offer still belongs to live navigation. Neither view is yet connected
-to the live window.
+reboot offer still belongs to live navigation. In the live window, execute
+answered awaiting consent shows a consent view: confirm or decline at the
+secure prompt, since this window cannot give consent. While consent is
+sought or the installation runs, the window asks for status over the same
+connection, at most every half second from each ask, and follows only the
+review it executed: awaiting consent, a running phase, failure and
+completion are shown as reported; a review abandoned before any write
+(declined, expired, unavailable or the disk changed) returns to settings
+with the reason; idle, another review's state, the review still merely
+reviewed, or a lost connection after execute shows the outcome as unknown,
+never success or a mere unavailable service. Escape at the consent view
+withdraws the review; until the release is confirmed a lost connection, or
+leaving the wait for disks on a new attempt, is still an unknown outcome,
+and a state already asked for that reports the review ended settles it:
+abandoned needs no release, and completion or failure is shown. No key
+leaves progress, failure, an unknown outcome or completion. A reported
+completion or failure stands when the connection ends.
 
 Disk enumeration is read-only and bounded. Show model, serial when supplied
 by the device, capacity and a distinguishing device identifier. These are
@@ -152,16 +222,15 @@ sequence.
 ## Immutable review data
 
 The `td-install` Rust library exports `installation_plan::{Plan,
-Destination, DestinationObservation, Settings, Candidates}` and the
+Destination, DestinationObservation, Settings, Candidates, Zones}` and the
 `installation_protocol` messages described below. Both are pure data
-prerequisites for the service and UI, with no CLI, device access,
-filesystem access, entropy generation, transport or installation
-execution. The Cargo library is also a target path dependency of td-setup;
-it exports exactly those two modules, as pinned by td-setup's confinement
-test, which still forbids every td-setup source file from naming
-`installation_protocol` until the service is wired. The formatter binary
-stages the plan and protocol modules separately through `#[path]`, for
-`observe-plan` and `serve`, with its recipe and compiled-file guard
+prerequisites for the service and UI, with no CLI, device access, filesystem
+access, entropy generation, transport or installation execution. The Cargo
+library is also a target path dependency of td-setup; it exports exactly
+those two modules, as pinned by td-setup's confinement test, which lets only
+td-setup's `service` module name `installation_protocol`. The formatter
+binary stages the plan and protocol modules separately through `#[path]`,
+for `observe-plan` and `serve`, with its recipe and compiled-file guard
 declaring the sources. Each further target consumer must declare its source
 and public API reach in its own recipe and confinement roster. A decoded
 plan conveys no authority.
@@ -172,11 +241,17 @@ eight-byte magic, one-byte count, then each destination in the same field
 order and bounds as the plan's destination. It admits at most 55,817 bytes
 before allocation and rejects trailing bytes, duplicate kernel names or
 device numbers, repeated disk sequence numbers, invalid fields and
-truncation. An empty list is valid.
-Encoding and decoding preserve the observations only: neither operation
-proves that a disk is eligible, that the installation medium is excluded,
-or that a privileged service supplied the bytes. The live window still has
-no service connection or selectable destination.
+truncation. An empty list is valid. Encoding and decoding preserve the
+observations only: neither operation proves that a disk is eligible, that
+the installation medium is excluded, or that a privileged service supplied
+the bytes. `Zones` carries the service catalog's time zone identifiers, 1 to
+1,024 plan timezone tokens in strictly ascending order. Its canonical
+`TDZONE01` record has an eight-byte magic, a big-endian u16 count, then each
+identifier as a u16 length and its bytes; it admits at most 67,594 bytes
+before allocation and refuses trailing bytes, disorder, repeats, invalid
+tokens and truncation. Like `Candidates` it proves nothing: the service
+checks a chosen zone against its catalog, not these bytes. The live window
+lists a service's destinations as navigation only.
 
 A plan owns a nonzero 32-byte proposal nonce, the complete destination
 observations, a 32-byte deployment manifest digest, a version-4 volume
@@ -255,18 +330,22 @@ or activate a whole-disk service or wizard action.
 `td_install::installation_protocol` defines the messages between the
 unprivileged installer and the root installation service. It is data and
 codec only, and decoding a message grants no authority. The service core
-below implements it; no public intake, consent operation or wizard wiring
-uses it yet.
+below implements it; td-authd's setup intake starts it for td-setup, which
+asks for destinations, time zones and status, proposes, executes and
+withdraws, and checks that a review carries exactly what it proposed and
+that a withdraw answers abandoned (withdrawn) for its nonce; any other
+answer ends its connection, and with it, until an installation starts, the
+review and claim.
 
-Both ends first send and require the eight bytes `TDINS01\n`. Any change to
-a message or its bytes changes this greeting; there is no negotiation.
-Each message then travels in one frame: a big-endian u32 length and that
-many payload bytes. `payload_len` admits a nonzero length within the
-direction's bound before the reader allocates. A request is at most 2049
-bytes, so root admits only a small bound from the unprivileged side; a
-reply is at most 55,818 bytes. A payload is one message: a tag byte and its
-body, with trailing bytes refused. A decode failure closes the channel
-without a reply.
+Both ends first send and require the eight bytes `TDINS02\n`. Any change to
+a message or its bytes changes this greeting; there is no negotiation. Each
+message then travels in one frame: a big-endian u32 length and that many
+payload bytes. `payload_len` admits a nonzero length within the direction's
+bound before the reader allocates. A request is at most 2049 bytes, so root
+admits only a small bound from the unprivileged side; a reply is at most
+67,595 bytes, the widest time zone catalog. A payload is one message: a tag
+byte and its body, with trailing bytes refused. A decode failure closes the
+channel without a reply.
 
 Requests carry no path, executable, mount option, source or consent:
 
@@ -287,6 +366,11 @@ Requests carry no path, executable, mount option, source or consent:
 - `0x04` status: no body.
 - `0x05` withdraw: a 32-byte review nonce. It releases a review, and its
   claim, before any destructive write.
+- `0x06` time zones: no body. The service reads the running system's
+  catalog once and keeps it, failure included; settings are checked
+  against that same record, so the installer offers exactly the zones the
+  service admits, and an unreadable catalog refuses a proposal as time
+  zones unavailable, not as an unsupported zone.
 
 Replies set the high bit, so no request decodes as a reply or the reverse:
 
@@ -298,29 +382,31 @@ Replies set the high bit, so no request decodes as a reply or the reverse:
   States are 0 idle, 1 reviewed, 2 awaiting consent, 3 running, 4 complete,
   5 failed and 6 abandoned.
 - `0x84` refused: one code. Nothing was written.
+- `0x85` time zones: a `TDZONE01` record.
 
-Running phases are 1 preparing the disk, 2 writing filesystems, 3
-publishing the deployment, 4 applying settings and 5 verifying boot.
-Failures, after which the disk may be incomplete and a retry needs a new
-review, are 1 destination changed, 2 insufficient space, 3 write failed, 4
-verification failed and 5 settings failed. Abandonment, which means no
-destructive write started, is 1 withdrawn, 2 consent declined, 3 consent
-expired, 4 consent unavailable (the trusted path could not show the
-review, or lost it while displayed) or 5 destination changed (the held
-disk changed or vanished, or a recheck refused it, before the first
-write). Refusals are 1 busy, 2 source unavailable, 3 discovery failed, 4
-destination changed, 5 destination busy, 6 insufficient space, 7 invalid
-username, 8 invalid hostname, 9 unsupported keyboard, 10 unsupported
-timezone, 11 stale review, 12 no review and 13 consent unavailable (no
-seat, compositor or trusted consent path can present the review, or the
-consent channel cannot carry it). Unassigned codes refuse, and a
+Running phases are 1 preparing the disk, 2 writing filesystems, 3 publishing
+the deployment, 4 applying settings and 5 verifying boot. Failures, after
+which the disk may be incomplete and a retry needs a new review, are 1
+destination changed, 2 insufficient space, 3 write failed, 4 verification
+failed and 5 settings failed. Abandonment, which means no destructive write
+started, is 1 withdrawn, 2 consent declined, 3 consent expired, 4 consent
+unavailable (the trusted path could not show the review, or lost it while
+displayed) or 5 destination changed (the held disk changed or vanished, or a
+recheck refused it, before the first write). Refusals are 1 busy, 2 source
+unavailable, 3 discovery failed, 4 destination changed, 5 destination busy,
+6 insufficient space, 7 invalid username, 8 invalid hostname, 9 unsupported
+keyboard, 10 unsupported timezone, 11 stale review, 12 no review, 13 consent
+unavailable (no seat, compositor or trusted consent path can present the
+review, or the consent channel cannot carry it) and 14 time zones
+unavailable (the catalog could not be read). Unassigned codes refuse, and a
 duplicated code does not compile.
 
 The service holds at most one review. A review is held while reviewed,
 awaiting consent or running, and not after complete, failed or abandoned.
 Where two refusals apply, busy wins. Each state admits:
 
-- destinations and status: in every state; both are read-only.
+- destinations, time zones and status: in every state; all are
+  read-only.
 - propose: while idle, failed or abandoned. While reviewed, awaiting
   consent or running it is refused as busy; the installer withdraws before
   proposing again, so no request replaces a review that is held or
@@ -371,43 +457,43 @@ boot (td-authd/DESIGN.md "Whole-disk installation intake").
 It holds at most one review, under the admission rules above. Propose
 checks, in order: busy; the settings (the username through `td-firstboot
 check-primary-name` against the verified root, the hostname grammar, the
-keyboard layout, which admits only `us` until a keyboard catalog exists,
-and the running system's timezone catalog, as volume formatting uses); a
-fresh candidate discovery, which must contain the proposed destination
-exactly, and whose observation the review then carries; the read-write
-exclusive claim of DESIGN.md (a disk held elsewhere is refused as busy;
-any other failure to claim a disk discovery just listed, as changed);
-source authentication through `td-boot validate-source` while that claim
-is held; the nonce and version-4 volume UUID from `/dev/urandom`; and a
-recheck of the claimed disk against two inventories. Any refusal releases
-the claim. Only then is the review held and returned. Execute rechecks the
-held disk; a disk that changed abandons the review. Without a consent
-channel, or for a review that channel cannot carry, it then answers
-consent unavailable and keeps the review. Otherwise it sends the review
-report, answers awaiting consent, and waits for td-authd's answer while it
-goes on serving the installer. A decline abandons the review as the
-consent channel section maps it. Consent rechecks the held disk once more
-(a change abandons the review as destination changed), then writes the
-started report before the execution exists (if td-authd cannot be told,
-the review is abandoned as consent unavailable and nothing is written),
-moves the claim to an execution on its own thread, and answers running,
-with the phase the execution last reported, until it reports finished and
-the service is complete or failed. Withdraw releases a review that has not
-started. A consent greeting that fails or stalls for ten seconds leaves
-the service without a channel. A malformed answer, a second answer to a
-started installation, a report that cannot be written or a closed consent
-channel ends only that channel: a displayed review is abandoned as consent
-unavailable, later executes are refused as consent unavailable, and a
-running installation continues. A reply whose write stalls for ten
-seconds, like any other lost reply, counts as losing the installer. The
-wire carries only a refusal's code, so the cause of each discovery,
-settings, claim, source or recheck failure is written to standard error.
+keyboard layout, which admits only `us` until a keyboard catalog exists, and
+the running system's timezone catalog, as volume formatting uses); a fresh
+candidate discovery, which must contain the proposed destination exactly,
+and whose observation the review then carries; the read-write exclusive
+claim of DESIGN.md (a disk held elsewhere is refused as busy; any other
+failure to claim a disk discovery just listed, as changed); source
+authentication through `td-boot validate-source` while that claim is held;
+the nonce and version-4 volume UUID from `/dev/urandom`; and a recheck of
+the claimed disk against two inventories. Any refusal releases the claim.
+Only then is the review held and returned. Execute rechecks the held disk; a
+disk that changed abandons the review. Without a consent channel, or for a
+review that channel cannot carry, it then answers consent unavailable and
+keeps the review. Otherwise it sends the review report, answers awaiting
+consent, and waits for td-authd's answer while it goes on serving the
+installer. A decline abandons the review as the consent channel section maps
+it. Consent rechecks the held disk once more (a change abandons the review
+as destination changed), then writes the started report before the execution
+exists (if td-authd cannot be told, the review is abandoned as consent
+unavailable and nothing is written), moves the claim to an execution on its
+own thread, and answers running, with the phase the execution last reported,
+until it reports finished and the service is complete or failed. Withdraw
+releases a review that has not started. A consent greeting that fails or
+stalls for ten seconds leaves the service without a channel. A malformed
+answer, a second answer to a started installation, a report that cannot be
+written or a closed consent channel ends only that channel: a displayed
+review is abandoned as consent unavailable, later executes are refused as
+consent unavailable, and a running installation continues. A reply whose
+write stalls for ten seconds, like any other lost reply, counts as losing
+the installer. The wire carries only a refusal's code, so the cause of each
+discovery, settings, claim, source or recheck failure is written to standard
+error; the time zone catalog's, kept with the catalog, is written once.
 While a review is held, its own claim keeps the held disk out of
 destinations replies; that omission is not a disk change. Each request is
 served in turn, and the next is not read until the reply to the last is
 written, so an installer that does not read cannot queue requests; it can
-still repeat source authentication at will, which the caller that starts
-the service bounds.
+still repeat source authentication at will, which the caller that starts the
+service bounds.
 
 The service has no execution of its own yet and production opens no
 consent channel, so it writes no disk byte and cannot start an
@@ -782,14 +868,16 @@ Keyboard and timezone choices must actually affect the installed session;
 only supported choices with available data may be offered.
 
 `td-install timezones` provides the read-only catalog for settings
-selection. It accepts no operands and reads only the deployment's
-`/etc/zoneinfo`: `zone1970.tab`, `iso3166.tab`, and referenced TZif files.
-Its JSON `version: 1` is a schema version, not a tzdata release. `source`
-is `zone1970.tab`; `timezones` is sorted by IANA `id`. Each entry carries
-`countries` with upstream `code` and `name`, and an upstream `comment`
-(empty when absent). Country order follows the upstream zone row.
-`Etc/UTC` is added with no countries and the comment `Coordinated Universal
-Time`. Backward aliases and fixed-offset alternatives are not enumerated.
+selection; the installation service's time zones reply carries the same
+catalog's identifiers, so the installer reads no files. It accepts no
+operands and reads only the deployment's `/etc/zoneinfo`: `zone1970.tab`,
+`iso3166.tab`, and referenced TZif files. Its JSON `version: 1` is a schema
+version, not a tzdata release. `source` is `zone1970.tab`; `timezones` is
+sorted by IANA `id`. Each entry carries `countries` with upstream `code` and
+`name`, and an upstream `comment` (empty when absent). Country order follows
+the upstream zone row. `Etc/UTC` is added with no countries and the comment
+`Coordinated Universal Time`. Backward aliases and fixed-offset alternatives
+are not enumerated.
 
 The catalog permits at most 512 countries and 1,024 zones including UTC.
 Each table is limited to 128 KiB, each line to 2,048 bytes, country

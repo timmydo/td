@@ -5,15 +5,19 @@
 //! wizard as a dependency-free Rust Wayland client over the shared
 //! toolkit's raster and chrome bands, following td-install/INSTALLER.md.
 //!
-//! The `window` turn loop presents welcome and a service-unavailable
-//! destination state. The pure settings, review and outcome views render
-//! bounded inputs but are not yet connected to that loop. The privileged
-//! disk writer stays in td-install; this front end holds no disk-writing
-//! authority (INSTALLER.md). Service wiring and later navigation follow.
+//! The `window` turn loop presents welcome, then asks the installation
+//! service (`service`, through td-authd's setup intake) for eligible disks
+//! and lists them, or shows why it cannot; a selected disk leads to the
+//! settings form, whose time zones the service supplies, and the completed
+//! form to the service's review of it; from the review it asks for trusted
+//! consent and follows the installation to its outcome. The privileged disk
+//! writer stays in td-install; this front end holds no disk-writing
+//! authority (INSTALLER.md). Later navigation follows.
 
 pub mod destination;
 pub mod outcome;
 pub mod review;
+pub mod service;
 pub mod settings;
 pub mod welcome;
 pub mod window;
@@ -97,6 +101,14 @@ fn render_check_surface(font: &td_ui::font::Font, surface: Surface) -> Result<()
             .ok_or("unavailable destination page did not fit")?,
     )?;
     paint(
+        &destination::DestinationPage::waiting(surface)
+            .ok_or("waiting destination page did not fit")?,
+    )?;
+    paint(
+        &destination::DestinationPage::refused(surface, "the disks could not be examined")
+            .ok_or("refused destination page did not fit")?,
+    )?;
+    paint(
         &destination::DestinationPage::new(surface, &[], None, 0)
             .ok_or("empty destination page did not fit")?,
     )?;
@@ -127,6 +139,15 @@ fn render_check_surface(font: &td_ui::font::Font, surface: Surface) -> Result<()
     paint(
         &settings::SettingsPage::new(surface, ["", "", "", ""], Some(2), [0, 0], true)
             .ok_or("draft settings page did not fit")?,
+    )?;
+    paint(
+        &settings::Draft::default()
+            .page(
+                surface,
+                Some("the time zones could not be read"),
+                Some("the selected disk changed"),
+            )
+            .ok_or("unlisted settings page did not fit")?,
     )?;
     let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC")?;
     let uuid = [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 0];
@@ -164,6 +185,10 @@ fn render_check_surface(font: &td_ui::font::Font, surface: Surface) -> Result<()
                 .ok_or("failure page did not fit")?,
         )?;
     }
+    paint(
+        &outcome::ProgressPage::new(surface, outcome::Progress::Consent)
+            .ok_or("consent page did not fit")?,
+    )?;
     paint(
         &outcome::ProgressPage::new(surface, outcome::Progress::Unknown)
             .ok_or("unknown outcome page did not fit")?,

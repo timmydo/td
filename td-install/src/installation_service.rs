@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::installation_consent::{self as consent, Answer, Ended, NoConsent, Outcome, Report};
-use crate::installation_plan::{Candidates, Destination, Plan, Settings};
+use crate::installation_plan::{Candidates, Destination, Plan, Settings, Zones};
 use crate::installation_protocol::{
     check_greeting, frame, payload_len, Abandon, Failure, Phase, Refusal, Reply, Request,
     ReviewNonce, State, GREETING, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
@@ -25,6 +25,8 @@ pub(crate) trait Host {
     /// Held until the review ends; dropping it releases the disk.
     type Claim;
     fn candidates(&mut self) -> Result<Candidates, Refusal>;
+    /// The catalog `check_settings` admits time zones from.
+    fn timezones(&mut self) -> Result<Zones, Refusal>;
     fn check_settings(&mut self, settings: &Settings) -> Result<(), Refusal>;
     fn claim(&mut self, destination: &Destination) -> Result<Self::Claim, Refusal>;
     /// The authenticated deployment manifest digest.
@@ -145,6 +147,10 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             },
             Request::Execute(plan) => self.execute(&plan),
             Request::Withdraw(nonce) => self.withdraw(nonce),
+            Request::Timezones => match self.host.timezones() {
+                Ok(zones) => Reply::Timezones(zones),
+                Err(refusal) => Reply::Refused(refusal),
+            },
         })
     }
 
@@ -753,6 +759,7 @@ mod tests {
         source: Result<[u8; 32], Refusal>,
         rechecks: Vec<bool>,
         entropy: bool,
+        zones: Result<(), Refusal>,
         /// Proposals so far; each draws its own nonce.
         drawn: u8,
     }
@@ -766,6 +773,7 @@ mod tests {
                 source: Ok([0xab; 32]),
                 rechecks: Vec::new(),
                 entropy: true,
+                zones: Ok(()),
                 drawn: 0,
             }
         }
@@ -778,6 +786,12 @@ mod tests {
         fn candidates(&mut self) -> Result<Candidates, Refusal> {
             self.call("candidates");
             Candidates::new(self.disks.clone()).map_err(|_| Refusal::DiscoveryFailed)
+        }
+        fn timezones(&mut self) -> Result<Zones, Refusal> {
+            self.call("timezones");
+            self.zones?;
+            Zones::new(vec!["America/Los_Angeles".into(), "Etc/UTC".into()])
+                .map_err(|_| Refusal::TimezonesUnavailable)
         }
         fn check_settings(&mut self, _: &Settings) -> Result<(), Refusal> {
             self.call("settings");
@@ -1097,6 +1111,16 @@ mod tests {
             let reply = service.answer(Request::Destinations).unwrap();
             assert!(matches!(reply, Reply::Destinations(_)), "{state:?}");
             assert_eq!(service.state(), state);
+            let reply = service.answer(Request::Timezones).unwrap();
+            assert!(matches!(reply, Reply::Timezones(_)), "{state:?}");
+            assert_eq!(service.state(), state);
+            // A catalog the host cannot read refuses, changing nothing.
+            service.host.zones = Err(Refusal::TimezonesUnavailable);
+            assert_eq!(
+                service.answer(Request::Timezones).unwrap(),
+                Reply::Refused(Refusal::TimezonesUnavailable)
+            );
+            assert_eq!(service.state(), state);
         }
     }
 
@@ -1165,7 +1189,7 @@ mod tests {
     #[test]
     fn a_bad_greeting_or_frame_ends_the_channel_without_a_reply() {
         let clients: [fn(&mut UnixStream); 5] = [
-            |s| s.write_all(b"TDINS02\n").unwrap(),
+            |s| s.write_all(b"TDINS01\n").unwrap(),
             |s| {
                 s.write_all(&[GREETING.as_slice(), &[0, 0, 0, 0]].concat())
                     .unwrap()
