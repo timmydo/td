@@ -8,7 +8,10 @@
 //! that. That frame must have come back with both its buffer release and
 //! its frame callback, and the seat must hold a keyboard whose keymap the
 //! toolkit compiled. Only then is the child started, the readiness socket
-//! published and the readiness line printed, in that order.
+//! published and the readiness line printed, in that order. The desktop
+//! profile (td-term/DESIGN.md §7) starts its child at its first committed
+//! frame, since a compositor may keep that buffer or never call back for a
+//! window it is not showing, and publishes nothing.
 //!
 //! The child's output, its exit and the reader's ending arrive from threads
 //! on one bounded channel; each producer wakes the turn loop after it sends,
@@ -41,10 +44,25 @@ use td_ui::wire::Message;
 
 type Result<T> = std::result::Result<T, String>;
 
+/// What a profile starts: the command, its directory and its whole
+/// environment.
+type Launch = (pty::ChildCommand, PathBuf, Vec<(OsString, OsString)>);
+
+/// Whose terminal this is (td-term/DESIGN.md §7).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Profile {
+    /// td's session program: supervised through its readiness socket, the
+    /// child's environment constructed for the verified account.
+    Td { ready_socket: PathBuf },
+    /// A terminal on a desktop: the inherited environment and the person's
+    /// shell, ending with the child's status.
+    Desktop,
+}
+
 pub struct Options {
     /// The compositor's socket, or `None` for the environment's endpoint.
     pub socket: Option<PathBuf>,
-    pub ready_socket: PathBuf,
+    pub profile: Profile,
     pub working_directory: Option<PathBuf>,
     /// The child's literal argv, or empty for the default shell. See
     /// `session::child_command` for what each means. Bytes rather than text:
@@ -227,7 +245,8 @@ struct Child {
     /// Never joined (see td-ui's `pty`); held so the handles are not dropped
     /// by accident into something that would.
     _threads: Vec<JoinHandle<Result<()>>>,
-    _ready: ready::Published,
+    /// td's readiness socket; the desktop profile publishes none.
+    _ready: Option<ready::Published>,
 }
 
 /// The clipboard's transfers and the text behind the live source.
@@ -311,6 +330,8 @@ pub struct Window {
     /// The browser command a link opens with; none, as in production, is
     /// `BROWSER` then `xdg-open` (td-ui's opener).
     browser: Option<String>,
+    /// The desktop profile's exit status, once the loop is closed.
+    exit: u8,
 }
 
 impl Window {
@@ -362,6 +383,7 @@ impl Window {
             proof: Proof::default(),
             outline: None,
             browser: None,
+            exit: 0,
         })
     }
 
@@ -920,7 +942,7 @@ impl Window {
     /// A frame the compositor released and presented, drawn for what the
     /// surface now holds, at a size the compositor chose.
     fn ready(&self) -> bool {
-        self.layout_configured
+        (self.layout_configured || self.options.profile == Profile::Desktop)
             && self.drawn == self.wanted()
             && self.adopted == self.current
             && self.frame_complete()
@@ -930,6 +952,17 @@ impl Window {
     /// type into is not a terminal.
     fn presented(&self) -> bool {
         self.ready() && self.client.keyboard().is_some() && self.keymap_ready
+    }
+
+    /// Whether the child may start: td's terminal once presented, its
+    /// readiness; a desktop's once its first frame is committed, since a
+    /// compositor may keep that buffer, or never call back for a window on
+    /// another workspace, and a keymap still to come only drops keys.
+    fn may_start(&self) -> bool {
+        match self.options.profile {
+            Profile::Td { .. } => self.presented(),
+            Profile::Desktop => self.drawn.is_some() && self.cells.is_some(),
+        }
     }
 
     /// The size changed: bound it, set the PTY and verify it took, then
@@ -957,23 +990,14 @@ impl Window {
     /// up on one whose shell never started was told something untrue.
     fn start(&mut self) -> Result<()> {
         let (rows, columns) = self.cells.ok_or("the terminal presented without a grid")?;
-        let account = session::current_account(Path::new(PROC_STATUS), Path::new(ETC_PASSWD))?;
-        let command =
-            session::child_command(Path::new(session::DEFAULT_SHELL), &self.options.command)?;
-        let program = launched_program_name(&self.options.command);
-        let directory = self
-            .options
-            .working_directory
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(&account.home));
+        let (command, directory, environment) = match &self.options.profile {
+            Profile::Td { .. } => self.td_child()?,
+            Profile::Desktop => self.desktop_child()?,
+        };
         if !directory.is_absolute() {
             return Err("terminal working directory is not absolute".into());
         }
-        let environment = session::environment(
-            &account,
-            std::env::var("TD_CONTROL_SOCKET").ok().as_deref(),
-            &self.wayland_display,
-        );
+        let program = launched_program_name(&self.options.command);
         let sender = self
             .sender
             .take()
@@ -1001,7 +1025,11 @@ impl Window {
             let _ = waker.wake();
         })?;
         let writer = pty::spawn_writer(sink, Arc::clone(&self.input))?;
-        let published = ready::publish(&self.options.ready_socket, rows, columns)?;
+        let published = match &self.options.profile {
+            Profile::Td { ready_socket } => Some(ready::publish(ready_socket, rows, columns)?),
+            Profile::Desktop => None,
+        };
+        let announce = published.is_some();
         self.child = Some(Child {
             drained: false,
             status: None,
@@ -1009,6 +1037,9 @@ impl Window {
             _threads: vec![waiter, reader, writer],
             _ready: published,
         });
+        if !announce {
+            return Ok(());
+        }
         // One locked write of one line, so a marker cannot interleave with
         // another thread's output and reach a reader as neither.
         let mut out = std::io::stdout().lock();
@@ -1017,16 +1048,83 @@ impl Window {
             .map_err(|e| format!("write terminal ready marker: {e}"))
     }
 
-    /// The child is gone and its output has run out: report, and end.
-    fn finished(&self) -> Option<String> {
-        let child = self.child.as_ref()?;
-        let status = child.status.filter(|_| child.drained)?;
+    /// td's child: the verified account's constructed session.
+    fn td_child(&self) -> Result<Launch> {
+        let account = session::current_account(Path::new(PROC_STATUS), Path::new(ETC_PASSWD))?;
+        let command =
+            session::child_command(Path::new(session::DEFAULT_SHELL), &self.options.command)?;
+        let directory = self
+            .options
+            .working_directory
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(&account.home));
+        let environment = session::environment(
+            &account,
+            std::env::var("TD_CONTROL_SOCKET").ok().as_deref(),
+            &self.wayland_display,
+        );
+        let environment = environment
+            .into_iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect();
+        Ok((command, directory, environment))
+    }
+
+    /// The desktop's child: td-term's own environment, directory and shell.
+    /// An entry that cannot be written is said on stderr, and the child
+    /// then finds td-term's entry only where the host installed one.
+    fn desktop_child(&self) -> Result<Launch> {
+        let shell = session::desktop_shell(std::env::var_os("SHELL"));
+        let command = session::desktop_command(shell, &self.options.command);
+        let directory = match &self.options.working_directory {
+            Some(directory) => directory.clone(),
+            None => std::env::current_dir().map_err(|e| format!("working directory: {e}"))?,
+        };
+        let terminfo = match std::env::var_os("XDG_RUNTIME_DIR") {
+            Some(runtime) => session::current_uid(Path::new(PROC_STATUS)).and_then(|uid| {
+                let entry = td_ui::vt_terminfo::entry()?;
+                session::install_runtime_terminfo(Path::new(&runtime), uid, &entry)
+            }),
+            None => Err("XDG_RUNTIME_DIR is not set".into()),
+        };
+        let terminfo = terminfo
+            .map_err(|error| {
+                let _ = writeln!(std::io::stderr().lock(), "td-term: terminfo: {error}");
+            })
+            .ok();
+        let environment = session::desktop_environment(
+            std::env::vars_os(),
+            &self.wayland_display,
+            terminfo.as_deref(),
+        );
+        Ok((command, directory, environment))
+    }
+
+    /// The child is gone and its output has run out: report, and end. td's
+    /// profile ends in error, which its supervisor reads; the desktop
+    /// closes, answering the child's status as its own.
+    fn finished(&mut self) -> Result<()> {
+        let Some(child) = self.child.as_ref() else {
+            return Ok(());
+        };
+        // A desktop's window closes with its child: a background job still
+        // holding the terminal keeps no window open, and no report waits on
+        // the last of the output.
+        let desktop = self.options.profile == Profile::Desktop;
+        let Some(status) = child.status.filter(|_| child.drained || desktop) else {
+            return Ok(());
+        };
+        if desktop {
+            self.exit = exit_code(status);
+            self.client.close();
+            return Ok(());
+        }
         if let Some(report) =
             last_screen_report(child.program.as_deref(), status, self.model.as_ref())
         {
             let _ = std::io::stderr().lock().write_all(report.as_bytes());
         }
-        Some(ended(status))
+        Err(ended(status))
     }
 
     fn markers(&mut self) -> Result<()> {
@@ -1170,7 +1268,11 @@ impl App for Window {
                 self.needs_commit = true;
             }
             Handled::CloseRequested => {
-                return Err("compositor requested that the terminal close".into())
+                if self.options.profile != Profile::Desktop {
+                    return Err("compositor requested that the terminal close".into());
+                }
+                // The child hears the hangup as the terminal's master closes.
+                self.client.close();
             }
             Handled::FrameDone => {
                 if let Some(frame) = self.frame.as_mut() {
@@ -1236,9 +1338,15 @@ impl App for Window {
 
     fn end_turn(&mut self, now: u64, idle: bool) -> Result<()> {
         self.clock = now;
+        // A close is the terminal's own ending: nothing drained after it
+        // changes the status it closed with.
+        if self.client.closed() {
+            return Ok(());
+        }
         self.drain()?;
-        if let Some(ended) = self.finished() {
-            return Err(ended);
+        self.finished()?;
+        if self.client.closed() {
+            return Ok(());
         }
         if idle {
             if let Some(stroke) = self.client.repeat(now)? {
@@ -1251,9 +1359,9 @@ impl App for Window {
         }
         self.transfers(now, idle)?;
         if self.child.is_none() {
-            if self.presented() {
+            if self.may_start() {
                 self.start()?;
-            } else if now > HANDSHAKE_MS {
+            } else if now > HANDSHAKE_MS && self.options.profile != Profile::Desktop {
                 return Err(format!(
                     "the terminal was not ready within {} s",
                     HANDSHAKE_MS / 1000
@@ -1373,7 +1481,17 @@ fn paste_input(bytes: Vec<u8>, bracketed: bool) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// A child ending ends the terminal; the words say which ending it was.
+/// A shell's convention for a status: the code, or 128 and the signal.
+fn exit_code(status: ExitStatus) -> u8 {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => u8::try_from(code & 0xff).unwrap_or(1),
+        (None, Some(signal)) => u8::try_from(128 + (signal & 0x7f)).unwrap_or(1),
+        (None, None) => 1,
+    }
+}
+
+/// A child ending ends td's terminal; the words say which ending it was.
 fn ended(status: ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("the terminal's child exited with status {code}"),
@@ -1505,9 +1623,20 @@ fn child_display(endpoint: &Endpoint) -> Result<String> {
         .ok_or_else(|| "Wayland socket path is not UTF-8".into())
 }
 
-pub fn run(options: Options) -> Result<()> {
+/// Runs the terminal; answers the desktop profile's exit status. td's
+/// profile ends only in error.
+pub fn run(options: Options) -> Result<u8> {
     let proof = clipboard_proof_enabled(Path::new(PROC_CMDLINE))?;
     let endpoint = match &options.socket {
+        // A desktop's relative socket is a display name, as WAYLAND_DISPLAY's.
+        Some(path) if options.profile == Profile::Desktop && path.is_relative() => {
+            td_ui::wayland::endpoint(
+                None,
+                Some(path.clone().into_os_string()),
+                std::env::var_os("XDG_RUNTIME_DIR"),
+            )
+            .map_err(|e| format!("--socket {}: {e}", path.display()))?
+        }
         Some(path) => Endpoint::Path(path.clone()),
         None => td_ui::wayland::endpoint(
             std::env::var_os("WAYLAND_SOCKET"),
@@ -1525,7 +1654,8 @@ pub fn run(options: Options) -> Result<()> {
     let (width, height) = (window.font.width(), window.font.height());
     window.outline =
         td_ui::pinned_face::styles_or_note("td-term", width, height, setting.as_deref());
-    td_ui::client::run(&mut window)
+    td_ui::client::run(&mut window)?;
+    Ok(window.exit)
 }
 
 pub fn selftest() -> Result<()> {
@@ -1604,13 +1734,19 @@ mod tests {
     /// A window bound to a scripted compositor offering a seat and a
     /// clipboard, both devices created: `(window, peer)`.
     fn fixture() -> (Window, UnixStream) {
+        fixture_for(Profile::Td {
+            ready_socket: std::env::temp_dir().join("td-term-unused-ready"),
+        })
+    }
+
+    fn fixture_for(profile: Profile) -> (Window, UnixStream) {
         let (ours, theirs) = UnixStream::pair().unwrap();
         theirs
             .set_read_timeout(Some(Duration::from_millis(10)))
             .unwrap();
         let options = Options {
             socket: None,
-            ready_socket: std::env::temp_dir().join("td-term-unused-ready"),
+            profile,
             working_directory: None,
             command: Vec::new(),
         };
@@ -1780,6 +1916,92 @@ mod tests {
         // A seat that withdraws its keyboard is no longer a terminal.
         window.event(message(SEAT, 0, &[1])).unwrap();
         assert!(!window.presented());
+    }
+
+    /// A desktop's floating window is never given a size, and a compositor
+    /// may keep its first buffer or never call back for it: the child
+    /// starts once that frame is committed. td's waits for its readiness.
+    #[test]
+    fn a_desktop_terminal_starts_at_its_first_committed_frame() {
+        let (mut window, _peer) = fixture_for(Profile::Desktop);
+        assert!(!window.may_start());
+        configure(&mut window, 0, 0, false);
+        window.draw().unwrap();
+        assert_eq!(window.cells, Some((24, 80)));
+        assert!(window.may_start(), "no callback, release or keymap asked");
+        let (mut window, _peer) = fixture();
+        configure(&mut window, 0, 0, false);
+        window.draw().unwrap();
+        complete(&mut window);
+        keymap(&mut window);
+        assert!(!window.may_start(), "td's waits for a chosen size");
+    }
+
+    /// The handshake bound is td's supervisor's; a desktop's window may wait
+    /// unshown on another workspace as long as it likes.
+    #[test]
+    fn only_tds_terminal_has_a_handshake_bound() {
+        let (mut window, _peer) = fixture_for(Profile::Desktop);
+        window.end_turn(HANDSHAKE_MS + 1, true).unwrap();
+        let (mut window, _peer) = fixture();
+        assert!(window
+            .end_turn(HANDSHAKE_MS + 1, true)
+            .unwrap_err()
+            .contains("not ready"));
+    }
+
+    fn ended_child(window: &mut Window, raw: i32) {
+        use std::os::unix::process::ExitStatusExt;
+        window.child = Some(Child {
+            drained: false,
+            status: Some(ExitStatus::from_raw(raw)),
+            program: None,
+            _threads: Vec::new(),
+            _ready: None,
+        });
+    }
+
+    /// The desktop closes with its child's status, a shell's convention for
+    /// a signal, without waiting for a background job to let go of the
+    /// terminal (the output undrained); td's profile ends in the error its
+    /// supervisor reads, once drained.
+    #[test]
+    fn a_desktop_terminal_ends_with_its_childs_status() {
+        for (raw, code) in [(0, 0), (3 << 8, 3), (9, 137)] {
+            let (mut window, _peer) = fixture_for(Profile::Desktop);
+            ended_child(&mut window, raw);
+            window.end_turn(0, true).unwrap();
+            assert!(window.client.closed());
+            assert_eq!(window.exit, code);
+        }
+        let (mut window, _peer) = fixture();
+        ended_child(&mut window, 3 << 8);
+        window.end_turn(0, true).unwrap();
+        assert!(!window.client.closed(), "td's waits for the output");
+        if let Some(child) = window.child.as_mut() {
+            child.drained = true;
+        }
+        assert_eq!(
+            window.end_turn(0, true).unwrap_err(),
+            "the terminal's child exited with status 3"
+        );
+        assert!(!window.client.closed());
+    }
+
+    /// Closing the window ends a desktop terminal, its child hung up as the
+    /// master closes; td's terminal treats it as an error.
+    #[test]
+    fn a_close_request_closes_a_desktop_terminal() {
+        let (mut window, _peer) = fixture_for(Profile::Desktop);
+        window.event(message(TOPLEVEL, 1, &[])).unwrap();
+        assert!(window.client.closed());
+        // The child's own ending, arriving in the same turn, is not the
+        // status the close said.
+        ended_child(&mut window, 3 << 8);
+        window.end_turn(0, true).unwrap();
+        assert_eq!(window.exit, 0);
+        let (mut window, _peer) = fixture();
+        assert!(window.event(message(TOPLEVEL, 1, &[])).is_err());
     }
 
     #[test]

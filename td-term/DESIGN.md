@@ -164,7 +164,8 @@ its supplied endpoint. Consumers must honor absolute-display semantics
 `TD_CONTROL_SOCKET` is passed on, last, only when td-term's own environment
 carries it, so a shell in the terminal can reach the compositor's control
 channel without naming the socket by hand. Nothing else is inherited:
-`pty::spawn` clears the environment, so the child gets exactly this list.
+`pty::spawn` clears the environment, so the child gets exactly this list
+(the desktop profile's child inherits instead, §7).
 Descriptors are another matter: td-term opens its own close-on-exec, but one
 its parent passed without it -- a `WAYLAND_SOCKET` that `--socket` overrode,
 say -- reaches the child as through any exec, and td-term, which forbids
@@ -802,9 +803,10 @@ another session holds is refused. This replaced
 td-term's use of td-init's `cttyhack --stdin`, which did the same from a
 second exec, because a terminal that runs on a host without td-init has no
 `/bin/cttyhack` to name. A `--command PROGRAM [ARG...]` on its own command
-line ends td-term's flags and is exec'd exactly as given and leads NO
-session: the slave is its stdio, and it starts in td-term's session with no
-controlling terminal. The session exists for a shell, which expects a
+line ends td-term's flags and is exec'd exactly as given and, under td's
+profile (the desktop's every child leads, §7), leads NO session: the slave
+is its stdio, and it starts in td-term's session with no controlling
+terminal. The session exists for a shell, which expects a
 controlling terminal it does not create; a program that wants one names
 `/bin/cttyhack --stdin` itself, as td-authd's launch does, and a td-jail
 terminal application must not, because the jail's terminal grant
@@ -1265,29 +1267,87 @@ terminal, and td-term's prove the program:
 ## 7. Running outside td
 
 td-term builds on any host with the pinned Rust toolchain, with no
-dependency but its sibling td-ui:
+dependency but its sibling td-ui, and runs under any Wayland compositor that
+offers `wl_seat` version 5 or later, `wl_shm` and `xdg_shell` -- sway, for
+one, in place of foot:
 
 ```text
 cargo build --release --manifest-path td-term/Cargo.toml
+install -m 0755 td-term/target/release/td-term ~/.local/bin/td-term
 ```
 
-It is not yet usable as a general terminal outside td. Nothing in the
-Wayland path is td-specific -- td-ui's client speaks core Wayland and
-`xdg_shell`, the keymap is whatever the compositor sends and td-ui's compiler
-accepts, and the environment's `WAYLAND_DISPLAY` is honored when `--socket`
-is absent -- but `run` is td's session program today:
+```text
+# ~/.config/sway/config
+set $term td-term
+bindsym $mod+Return exec $term
+```
 
-- `--ready-socket` is required, because readiness is how td-svc and the
-  compositor's authority supervise it;
-- the child's environment is td's: `TERM=td-term` with
-  `TERMINFO=/etc/terminfo`, which a foreign distribution lacks unless the
-  entry is installed there, and `PATH=/bin`;
-- the default child is `/bin/sh`, td's path; and
-- the account comes from `/etc/passwd` alone, under §2's whole-file rule.
+Invoked bare, or with a flag first, td-term is the desktop profile:
 
-The target is a desktop profile, a separate increment: `run` without a
-readiness socket, and a session policy for a foreign host -- a terminfo
-entry the child can find, and the host's shell and search path -- so that
-td-term can replace foot under a compositor such as sway. Until that lands,
-running td-term outside td's image is a development convenience, not a
-supported configuration.
+```text
+td-term [--socket PATH] [--working-directory PATH]
+        [-e|--command PROGRAM [ARG...]]
+```
+
+`run` stays td's session program, unchanged; the two differ only where a
+desktop's terminal must:
+
+- a flag may also be spelled `--flag=VALUE`, and `--` ends the flags as `-e`
+  does;
+- the display is `--socket` or the environment's `WAYLAND_DISPLAY`, a
+  relative one a name under `XDG_RUNTIME_DIR` either way, and an inherited
+  `WAYLAND_SOCKET` is refused as in td's (§2); a relative
+  `--working-directory` is taken from td-term's own directory;
+- the child starts once the first frame is committed, at the 80x24 fallback
+  when the compositor chooses no size, as it does not for a floating window.
+  It waits for no frame callback, buffer release or keymap: a compositor may
+  keep the one buffer it was given, or never call back for a window on a
+  workspace nobody is looking at, and keys before the keymap are only
+  dropped. There is no handshake bound, which is td's supervisor's (§4), no
+  readiness socket and no `TD-TERM-READY` line;
+- the child is `$SHELL`, else `/bin/sh`, or the program after `-e`,
+  `--command` or `--`, found on `PATH` when named without a slash, and it
+  starts in `--working-directory`, else td-term's own directory. Every child
+  leads its session on the terminal (§4), since a desktop's programs expect
+  the terminal's signals and no jail claims the terminal;
+- the child's environment is td-term's own less `WAYLAND_SOCKET`, `LINES`
+  and `COLUMNS`, with `TERM=td-term`, `COLORTERM=truecolor` and
+  `WAYLAND_DISPLAY` the dialled path made absolute. No account is read: the
+  person's `HOME`, `PATH` and the rest are what the desktop gave td-term, and
+  an outer terminal's own markers (`TMUX`, `TERM_PROGRAM` and the like) pass
+  through as they do under foot;
+- td-term writes its compiled terminfo entry under
+  `$XDG_RUNTIME_DIR/td-term/terminfo` and sets `TERMINFO` to that directory.
+  ncurses searches `TERMINFO` before `~/.terminfo` and `TERMINFO_DIRS` and
+  then goes on to them, so a stale `td-term` entry elsewhere cannot shadow
+  this one and every other entry is still found; an inherited
+  `TERMINFO_DIRS` is kept. The runtime directory must already exist, be the
+  person's and be closed to group and others; each directory below it is
+  made, or found, the same and not a link, so no other account chooses where
+  the entry goes or what ncurses reads. The entry is written to a new file
+  beside it and renamed over, so terminals starting together each leave a
+  whole one. With no `XDG_RUNTIME_DIR`, or one that fails those checks, a
+  `td-term: terminfo:` line says why, the inherited `TERMINFO` stands, and
+  the child finds `td-term` only where the host installed it (`td-term
+  terminfo PATH`, §4);
+- the outline face is read from the same `/etc/fonts/jetbrains-mono-nerd`
+  as in td's image (§3); a host without it draws in Unifont after one
+  `td-term: outline face unavailable` line, which `TD_UI_FACE=bitmap`
+  avoids by reading nothing;
+- td-term ends with its child: its status is td-term's (its code, or 128 and
+  the signal that ended it) with no last-screen report, and the window does
+  not wait for the output to drain, so a background job still holding the
+  terminal keeps no window open. A close request from the compositor ends
+  td-term with status zero, whatever the child does in the same turn, and
+  the child hears the hangup as the master closes. td-term's own failure is
+  a `td-term:` line on stderr and status 1, which a child's status 1 also
+  is.
+
+Another host does not know `td-term`: a program reached over ssh looks up
+`TERM` on the remote side, as it does for foot's own entry. The entry can be
+installed there (`td-term terminfo` writes it to a path ncurses reads), or
+the remote command run with a `TERM` its host has.
+
+Keymaps are the compositor's: td-ui compiles the XKB text it is sent and
+refuses what its compiler does not accept (`td-ui/DESIGN.md`), and a refusal
+before the child starts ends td-term with the reason.

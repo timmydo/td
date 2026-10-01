@@ -1,9 +1,12 @@
-//! What td-term runs in its PTY and as whom: the account the session belongs
-//! to, the child's constructed environment, and its literal argv. Pure
-//! functions over the process's own status and account files, tested
-//! without a device; td-ui's `pty` owns the device and the threads.
+//! What td-term runs in its PTY and as whom: under td's profile the account
+//! the session belongs to, the child's constructed environment and its
+//! literal argv; under the desktop profile the inherited environment, the
+//! person's shell and the terminfo entry written where the child finds it
+//! (td-term/DESIGN.md §7). Functions over the process's own status and
+//! account files, tested without a device; td-ui's `pty` owns the device
+//! and the threads.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -93,10 +96,17 @@ pub fn account(passwd: &str, uid: u32) -> Result<Account, String> {
     found.ok_or_else(|| format!("passwd has no entry for uid {uid}"))
 }
 
+/// The uid td-term runs as, from the live process's status.
+pub fn current_uid(status: &Path) -> Result<u32, String> {
+    effective_uid(&read_bounded(status, MAX_STATUS_BYTES)?)
+}
+
 /// The account td-term runs as, read from the live process and account files.
 pub fn current_account(status: &Path, passwd: &Path) -> Result<Account, String> {
-    let uid = effective_uid(&read_bounded(status, MAX_STATUS_BYTES)?)?;
-    account(&read_bounded(passwd, MAX_PASSWD_BYTES)?, uid)
+    account(
+        &read_bounded(passwd, MAX_PASSWD_BYTES)?,
+        current_uid(status)?,
+    )
 }
 
 /// The child's whole environment: `spawn` clears and sets exactly this, so a
@@ -178,6 +188,153 @@ pub fn child_command(shell: &Path, command: &[OsString]) -> Result<ChildCommand,
     })
 }
 
+/// What the desktop profile replaces in the environment it inherits: the
+/// outer terminal's description, the terminal's own display connection, a
+/// size the child must ask the terminal for, and the value it sets.
+const DESKTOP_REPLACED: [&str; 6] = [
+    "COLORTERM",
+    "COLUMNS",
+    "LINES",
+    "TERM",
+    "WAYLAND_DISPLAY",
+    "WAYLAND_SOCKET",
+];
+
+/// The desktop profile's shell: `$SHELL` when it names one, else `/bin/sh`.
+pub fn desktop_shell(shell: Option<OsString>) -> PathBuf {
+    shell
+        .filter(|shell| !shell.is_empty())
+        .map_or_else(|| PathBuf::from(DEFAULT_SHELL), PathBuf::from)
+}
+
+/// The desktop profile's child: the shell, or the command as given, either
+/// leading a session on the terminal, since a desktop's programs expect the
+/// terminal's signals and no jail claims it; a bare name is found on the
+/// child's `PATH`.
+pub fn desktop_command(shell: PathBuf, command: &[OsString]) -> ChildCommand {
+    match command.split_first() {
+        Some((program, arguments)) => ChildCommand {
+            program: PathBuf::from(program),
+            arguments: arguments.to_vec(),
+            leads_session: true,
+        },
+        None => ChildCommand {
+            program: shell,
+            arguments: Vec::new(),
+            leads_session: true,
+        },
+    }
+}
+
+/// The desktop profile's child environment: td-term's own, as a desktop
+/// terminal's child inherits it, less `DESKTOP_REPLACED`, with this
+/// terminal's description and the display it dialled. `terminfo`, the
+/// directory holding td-term's entry, is `TERMINFO`, which ncurses searches
+/// before `~/.terminfo` and `TERMINFO_DIRS` and then goes on to them, so a
+/// stale `td-term` there cannot shadow it and every other entry is still
+/// found; without one an inherited `TERMINFO` stands.
+pub fn desktop_environment(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    wayland_display: &str,
+    terminfo: Option<&Path>,
+) -> Vec<(OsString, OsString)> {
+    let mut environment: Vec<(OsString, OsString)> = inherited
+        .into_iter()
+        .filter(|(name, _)| {
+            !DESKTOP_REPLACED.iter().any(|replaced| name == replaced)
+                && !(terminfo.is_some() && name == "TERMINFO")
+        })
+        .collect();
+    let mut set = |name: &str, value: &OsStr| {
+        environment.push((OsString::from(name), value.to_os_string()));
+    };
+    set("COLORTERM", OsStr::new("truecolor"));
+    set("TERM", OsStr::new("td-term"));
+    set("WAYLAND_DISPLAY", OsStr::new(wayland_display));
+    if let Some(directory) = terminfo {
+        set("TERMINFO", directory.as_os_str());
+    }
+    environment
+}
+
+/// Refuses a directory anyone but `uid` could have put a name in: not a
+/// directory (`follow` decides whether a link to one counts), another
+/// owner's, or open to group or others.
+fn private_directory(path: &Path, uid: u32, follow: bool) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = if follow {
+        std::fs::metadata(path)
+    } else {
+        std::fs::symlink_metadata(path)
+    }
+    .map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} is not a directory private to uid {uid}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Writes td-term's compiled entry under `runtime` (the session's
+/// `XDG_RUNTIME_DIR`, which must already be private to `uid`) and answers
+/// the directory holding it. Each directory below is made, or found, private
+/// and no link, so no other account can choose where the entry or the
+/// directory ncurses searches goes. The entry is written to a new file
+/// beside it and renamed over, so terminals starting together each leave a
+/// whole one.
+pub fn install_runtime_terminfo(runtime: &Path, uid: u32, entry: &[u8]) -> Result<PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if !runtime.is_absolute() {
+        return Err(format!(
+            "XDG_RUNTIME_DIR '{}' is not absolute",
+            runtime.display()
+        ));
+    }
+    private_directory(runtime, uid, true)?;
+    let directory = runtime.join("td-term").join("terminfo");
+    let relative = td_ui::vt_terminfo::INSTALL_PATH
+        .strip_prefix("share/terminfo/")
+        .ok_or("the terminfo install path is not under share/terminfo")?;
+    let path = directory.join(relative);
+    let parent = path.parent().ok_or("the terminfo entry has no directory")?;
+    let mut made = runtime.to_path_buf();
+    let below = parent.strip_prefix(runtime).map_err(|e| e.to_string())?;
+    for component in below.components() {
+        made.push(component);
+        match std::fs::DirBuilder::new().mode(0o700).create(&made) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                return Err(format!("create {}: {e}", made.display()));
+            }
+            _ => private_directory(&made, uid, false)?,
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
+    let staging = parent.join(format!(".td-term.{}.{nanos}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&staging)
+        .map_err(|e| format!("create {}: {e}", staging.display()))?;
+    // Only a file this call made is removed: a name another writer holds
+    // failed the open above and is left to it.
+    let written = file
+        .write_all(entry)
+        .map_err(|e| format!("write {}: {e}", staging.display()))
+        .and_then(|()| {
+            std::fs::rename(&staging, &path).map_err(|e| format!("rename {}: {e}", path.display()))
+        });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    written.map(|()| directory)
+}
+
 /// The packaged binary's own check of the session policy. It reads no file,
 /// so it runs wherever the artifact does.
 pub fn selftest() -> Result<(), String> {
@@ -214,6 +371,17 @@ pub fn selftest() -> Result<(), String> {
         || !command.leads_session
     {
         return Err("session selftest composed the wrong child command".into());
+    }
+    let desktop = desktop_environment(
+        [("TERM".into(), "foot".into()), ("HOME".into(), "/h".into())],
+        "/run/user/1000/wayland-1",
+        Some(Path::new("/run/user/1000/td-term/terminfo")),
+    );
+    let term = desktop.iter().filter(|(name, _)| name == "TERM");
+    if term.map(|(_, value)| value.as_os_str()).collect::<Vec<_>>() != [OsStr::new("td-term")]
+        || desktop.len() != 5
+    {
+        return Err("session selftest built the wrong desktop environment".into());
     }
     Ok(())
 }
@@ -390,6 +558,124 @@ mod tests {
         std::fs::write(&status, "Uid:\t1000\t4242\t4242\t4242\n").unwrap();
         assert!(current_account(&status, &passwd).is_err());
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_desktop_child_inherits_all_but_another_terminals_description() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(vec![0xff]);
+        let pair = |name: &str, value: &str| (OsString::from(name), OsString::from(value));
+        let inherited = vec![
+            pair("HOME", "/home/p"),
+            pair("TERM", "foot"),
+            pair("COLORTERM", "24bit"),
+            pair("LINES", "40"),
+            pair("COLUMNS", "100"),
+            pair("WAYLAND_SOCKET", "5"),
+            pair("WAYLAND_DISPLAY", "wayland-1"),
+            pair("TERMINFO_DIRS", "/usr/local/share/terminfo"),
+            pair("TERMINFO", "/etc/terminfo"),
+            (OsString::from("RAW"), raw.clone()),
+        ];
+        let terminfo = Path::new("/run/user/1000/td-term/terminfo");
+        let environment = desktop_environment(
+            inherited.clone(),
+            "/run/user/1000/wayland-1",
+            Some(terminfo),
+        );
+        let value = |environment: &[(OsString, OsString)], name: &str| {
+            let values: Vec<OsString> = environment
+                .iter()
+                .filter(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .collect();
+            assert!(values.len() <= 1, "{name} twice");
+            values.into_iter().next()
+        };
+        assert_eq!(value(&environment, "HOME"), Some("/home/p".into()));
+        assert_eq!(value(&environment, "RAW"), Some(raw));
+        assert_eq!(value(&environment, "TERM"), Some("td-term".into()));
+        assert_eq!(value(&environment, "COLORTERM"), Some("truecolor".into()));
+        assert_eq!(
+            value(&environment, "WAYLAND_DISPLAY"),
+            Some("/run/user/1000/wayland-1".into())
+        );
+        for gone in ["LINES", "COLUMNS", "WAYLAND_SOCKET"] {
+            assert_eq!(value(&environment, gone), None, "{gone}");
+        }
+        // The entry written is searched first; the inherited list after it.
+        assert_eq!(
+            value(&environment, "TERMINFO"),
+            Some("/run/user/1000/td-term/terminfo".into())
+        );
+        assert_eq!(
+            value(&environment, "TERMINFO_DIRS"),
+            Some("/usr/local/share/terminfo".into())
+        );
+        assert_eq!(environment.len(), 7);
+        // Without an entry written, the inherited TERMINFO stands.
+        let kept = desktop_environment(inherited, "/w", None);
+        assert_eq!(value(&kept, "TERMINFO"), Some("/etc/terminfo".into()));
+        let none = desktop_environment([pair("HOME", "/h")], "/w", None);
+        assert_eq!(value(&none, "TERMINFO"), None);
+    }
+
+    #[test]
+    fn a_desktop_child_is_the_persons_shell_or_command_leading_a_session() {
+        assert_eq!(
+            desktop_shell(Some("/bin/zsh".into())),
+            Path::new("/bin/zsh")
+        );
+        assert_eq!(desktop_shell(Some("".into())), Path::new(DEFAULT_SHELL));
+        assert_eq!(desktop_shell(None), Path::new(DEFAULT_SHELL));
+        let shell = desktop_command(PathBuf::from("/bin/zsh"), &[]);
+        assert_eq!(shell.program, Path::new("/bin/zsh"));
+        assert!(shell.arguments.is_empty() && shell.leads_session);
+        let command = [OsString::from("htop"), OsString::from("-d")];
+        let explicit = desktop_command(PathBuf::from("/bin/zsh"), &command);
+        assert_eq!(explicit.program, Path::new("htop"));
+        assert_eq!(explicit.arguments, vec![OsString::from("-d")]);
+        assert!(explicit.leads_session);
+    }
+
+    #[test]
+    fn the_runtime_terminfo_entry_is_whole_where_ncurses_looks() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let uid = current_uid(Path::new("/proc/self/status")).unwrap();
+        let runtime = std::env::temp_dir().join(format!("td-term-runtime-{}", std::process::id()));
+        let entry = td_ui::vt_terminfo::entry().unwrap();
+        // A runtime directory that is missing, or open to others, is refused.
+        assert!(install_runtime_terminfo(&runtime, uid, &entry).is_err());
+        assert!(!runtime.exists(), "the runtime directory is not made");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&runtime)
+            .unwrap();
+        assert!(install_runtime_terminfo(&runtime, uid, &entry).is_err());
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(install_runtime_terminfo(&runtime, uid + 1, &entry).is_err());
+        // A link where a directory goes is refused, not followed.
+        let elsewhere = runtime.join("elsewhere");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&elsewhere)
+            .unwrap();
+        std::os::unix::fs::symlink(&elsewhere, runtime.join("td-term")).unwrap();
+        assert!(install_runtime_terminfo(&runtime, uid, &entry).is_err());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+        std::fs::remove_file(runtime.join("td-term")).unwrap();
+        for _ in 0..2 {
+            let directory = install_runtime_terminfo(&runtime, uid, &entry).unwrap();
+            assert_eq!(directory, runtime.join("td-term/terminfo"));
+            assert_eq!(std::fs::read(directory.join("t/td-term")).unwrap(), entry);
+            let names: Vec<_> = std::fs::read_dir(directory.join("t"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(names, vec![OsString::from("td-term")], "no staging left");
+        }
+        std::fs::remove_dir_all(&runtime).unwrap();
+        assert!(install_runtime_terminfo(Path::new("run/user"), uid, &entry).is_err());
     }
 
     #[test]

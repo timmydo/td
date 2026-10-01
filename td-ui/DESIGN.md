@@ -537,7 +537,9 @@ of its own files may name each module.
   and `resize`, which publishes a grid and reads it back before trusting
   it), `WindowSize` and `window_size`, `grid_size` and `grid_for_tile`,
   `ChildCommand` and `spawn` (a caller-composed command on the slave, the
-  environment cleared and set to the caller's list, leading a new session
+  environment cleared and set to the caller's list of OS-string pairs, a
+  program named without a slash found on that list's `PATH` by std's
+  rule, leading a new session
   whose controlling terminal is the slave exactly when `leads_session` is
   set), the threads
   `spawn_reader`, `spawn_writer` and `spawn_waiter` (named `pty-output`,

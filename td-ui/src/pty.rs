@@ -10,7 +10,7 @@
 //! caller's policy (td-term/DESIGN.md), not this module's.
 
 use crate::sys;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
@@ -197,7 +197,10 @@ pub fn grid_for_tile(
     Ok((rows, columns))
 }
 
-/// What a terminal execs: literal argv values, no shell, no PATH search.
+/// What a terminal execs: literal argv values and no shell. A program named
+/// without a slash is found on the `PATH` of the environment the child is
+/// given, by std's rule; a policy that names programs by absolute path, as
+/// td's does, never searches.
 ///
 /// `leads_session` makes the child lead a new session whose controlling
 /// terminal is the slave, as an interactive shell needs for job control and
@@ -218,9 +221,9 @@ pub struct ChildCommand {
 /// a fixed task directory. Setting `HOME` does not move the child, so without
 /// this the shell would start wherever td-svc left the graphical service. A
 /// directory the child cannot enter fails rather than silently landing in `/`.
-pub fn spawn(
+pub fn spawn<K: AsRef<OsStr>, V: AsRef<OsStr>>(
     command: &ChildCommand,
-    environment: &[(String, String)],
+    environment: &[(K, V)],
     directory: &Path,
     slave: File,
 ) -> Result<Child, String> {
