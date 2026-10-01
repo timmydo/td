@@ -9562,8 +9562,9 @@ child: it composes in td-editor's document view embedded in its own
 window (§W.8, "Composing in place"), so the `mail` package ships no
 `/app/bin/td-editor` and sets no `EDITOR`, and the in-jail `$EDITOR`
 acceptance test is moot. td-editor stays a shipped recipe and a
-library crate; the `$EDITOR` contract in `td-editor/DESIGN.md` stands
-for callers outside this tree.
+library crate, and the system image links it at `/bin/td-editor` as a
+system-tree program run from the terminal, like td-photo; the `$EDITOR`
+contract in `td-editor/DESIGN.md` stands for callers outside this tree.
 
 ### W.6 Opening links and attachments from a jailed terminal application
 

@@ -4278,6 +4278,16 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-photo}/bin/td-photo".into(),
         link: "{root}/real-root/bin/td-photo".into(),
     });
+    // td-editor, the text editor, a static system-tree program run from the
+    // terminal (td-editor/DESIGN.md).
+    steps.push(Step::CopyTree {
+        from: "{in:td-editor}".into(),
+        dest: "{root}/real-root{in:td-editor}".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-editor}/bin/td-editor".into(),
+        link: "{root}/real-root/bin/td-editor".into(),
+    });
     // td-jail is static so the running-kernel transition oracle does not depend
     // on the dynamic userland it helps confine.
     steps.push(Step::CopyTree {
@@ -5402,6 +5412,7 @@ pub fn recipe() -> Recipe {
             "td-term",
             "td-term-terminfo",
             "td-photo",
+            "td-editor",
             "td-jail",
             "td-seatd",
             "td-vm-guest",
@@ -7198,6 +7209,7 @@ mod tests {
             ("td-term", "td-term"),
             ("td-taskmgr", "td-taskmgr"),
             ("td-photo", "td-photo"),
+            ("td-editor", "td-editor"),
         ] {
             assert!(steps.iter().any(|step| matches!(step,
                 Step::Symlink { link, target }
@@ -13862,31 +13874,33 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     }
 
     #[test]
-    fn td_photo_is_packed_and_not_merely_symlinked() {
+    fn td_photo_and_td_editor_are_packed_and_not_merely_symlinked() {
         let steps = real_root_steps(&SYSTEM).unwrap();
-        assert!(
-            steps.iter().any(|step| matches!(
-                step,
-                Step::CopyTree { from, dest }
-                    if from == "{in:td-photo}"
-                        && dest == "{root}/real-root{in:td-photo}"
-            )),
-            "td-photo must be CopyTree'd into the immutable root"
-        );
-        assert!(
-            steps.iter().any(|step| matches!(
-                step,
-                Step::Symlink { target, link }
-                    if target == "{in:td-photo}/bin/td-photo"
-                        && link == "{root}/real-root/bin/td-photo"
-            )),
-            "/bin/td-photo must name the staged static package"
-        );
         let native_inputs = recipe().native_inputs.expect("system native inputs");
-        assert!(
-            native_inputs.iter().any(|input| input == "td-photo"),
-            "td-photo must be a declared native input"
-        );
+        for name in ["td-photo", "td-editor"] {
+            assert!(
+                steps.iter().any(|step| matches!(
+                    step,
+                    Step::CopyTree { from, dest }
+                        if from == &format!("{{in:{name}}}")
+                            && dest == &format!("{{root}}/real-root{{in:{name}}}")
+                )),
+                "{name} must be CopyTree'd into the immutable root"
+            );
+            assert!(
+                steps.iter().any(|step| matches!(
+                    step,
+                    Step::Symlink { target, link }
+                        if target == &format!("{{in:{name}}}/bin/{name}")
+                            && link == &format!("{{root}}/real-root/bin/{name}")
+                )),
+                "/bin/{name} must name the staged static package"
+            );
+            assert!(
+                native_inputs.iter().any(|input| input == name),
+                "{name} must be a declared native input"
+            );
+        }
     }
 
     #[test]

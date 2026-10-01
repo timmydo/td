@@ -1059,7 +1059,11 @@ The target recipe `td-editor` (`recipes/src/recipes/td-editor.rs`) builds
 the crate with cargo on the source-built toolchain, staging the `td-ui` and
 `td-compositor` trees beside it so those five files arrive as the sources
 above name them, links the binary fully static and splits its debug
-companion. Its realized-output check, `td-editor-test`, requires and asserts
+companion. The system image (`recipes/src/recipes/system-x86-64.rs`)
+copies the complete recipe output, companion included, into the immutable
+root and links `/bin/td-editor` to it, as it does td-photo's; the editor
+is run from the terminal and receives no authority, socket or credential
+of its own. Its realized-output check, `td-editor-test`, requires and asserts
 the static binary and runs `--help`, an empty `--replay` and
 `--font-license` on the target; that check is the target-artifact coverage
 an editor, toolkit or compositor edit selects, in place of the former
@@ -2987,9 +2991,10 @@ as `/app/bin/td-editor` and set `EDITOR=/app/bin/td-editor` in its
 manifest, for the child td-mail launched; it ships no editor now, and
 its manifest carries no environment. The static executable, its font and
 licence notices compiled in, remains the `td-editor` recipe's output,
-checked by td-editor-test, and available to a package that needs a
-`$EDITOR` the same way. The in-jail acceptance test this section used to
-owe, td-mail launching the editor inside its jail, is moot: the draft is
+checked by td-editor-test, linked at `/bin/td-editor` in the system
+image, and available to a package that needs a `$EDITOR` the same way.
+The in-jail acceptance test this section used to owe, td-mail launching
+the editor inside its jail, is moot: the draft is
 edited in td-mail's own window, and td-mail's session test proves the
 retained file, its edit, save and discard, and the window's close asking
 about an unsaved draft.
