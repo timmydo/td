@@ -2,8 +2,9 @@
 //! answered under INSTALLER.md "Installation service protocol" over one
 //! stream, with consent sought over the channel of "Installation consent
 //! channel". Execution runs on its own thread through an `Execute`;
-//! production has none yet, and without a consent channel execute is
-//! refused as consent unavailable once the held disk rechecks.
+//! production's is `main.rs`'s `LiveExecution`, but it opens no consent
+//! channel yet, and without one execute is refused as consent unavailable
+//! once the held disk rechecks.
 
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
@@ -47,9 +48,11 @@ pub(crate) trait Execute<C>: Send + Sync + 'static {
     ) -> Result<(), Failure>;
 }
 
-/// No execution exists yet, so production can name none.
+/// A service without an execution, for tests of its refusals.
+#[cfg(test)]
 pub(crate) enum NoExecution {}
 
+#[cfg(test)]
 impl<C> Execute<C> for NoExecution {
     fn execute(&self, _: &Plan, _: C, _: &mut dyn FnMut(Phase)) -> Result<(), Failure> {
         match *self {}
@@ -92,6 +95,7 @@ pub(crate) struct Service<H: Host, E> {
     reports: Vec<Report>,
 }
 
+#[cfg(test)]
 impl<H: Host> Service<H, NoExecution> {
     pub(crate) fn new(host: H) -> Self {
         Self {
@@ -105,7 +109,6 @@ impl<H: Host> Service<H, NoExecution> {
 }
 
 impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
-    #[cfg(test)]
     pub(crate) fn with_execution(host: H, execution: E) -> Self {
         Self {
             host,

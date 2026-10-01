@@ -1466,7 +1466,7 @@ one and waits for each, before secret-session cleanup, and removes its
 socket; unlike an update helper's, a wait error goes unreported. A
 service stopped while writing leaves the disk incomplete; td-install's
 failure semantics and td-svc's authority cgroup containment apply as for
-an update. Until td-install has an execution and opens the channel, the
+an update. Until td-install opens the channel, the
 service never sends a review, so selection always answers 99 00 in
 production.
 

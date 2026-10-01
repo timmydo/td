@@ -5,7 +5,8 @@ use crate::types::{Recipe, Step};
 // GPT and FAT32 writers and the on-disk shape td-boot declares, so the writer
 // and the reader of a td disk are built from one description of it. `gpt.rs`
 // reaches its checksum as `crate::crc32`, so those two arrive as a pair or the
-// build does not link.
+// build does not link. `sha256.rs` is the live installation's check of the ESP
+// kernel against the authenticated manifest.
 const MAIN_RS: &str = include_str!("../../../td-install/src/main.rs");
 const TIMEZONES_RS: &str = include_str!("../../../td-install/src/timezones.rs");
 const INVENTORY_RS: &str = include_str!("../../../td-install/src/inventory.rs");
@@ -24,6 +25,7 @@ const CRC32_RS: &str = include_str!("../../../engine/src/crc32.rs");
 const GPT_RS: &str = include_str!("../../../engine/src/gpt.rs");
 const CPIO_RS: &str = include_str!("../../../engine/src/cpio.rs");
 const FAT_RS: &str = include_str!("../../../engine/src/fat.rs");
+const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
 
 pub fn recipe() -> Recipe {
     let rustc = "{in:rust-toolchain}/bin/rustc";
@@ -127,6 +129,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/engine/src/gpt.rs".into(),
             content: GPT_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/engine/src/sha256.rs".into(),
+            content: SHA256_RS.into(),
             exec: false,
         },
         Step::WriteFile {

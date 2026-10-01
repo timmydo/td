@@ -495,9 +495,11 @@ written, so an installer that does not read cannot queue requests; it can
 still repeat source authentication at will, which the caller that starts the
 service bounds.
 
-The service has no execution of its own yet and production opens no
-consent channel, so it writes no disk byte and cannot start an
-installation; tests drive both ends with fakes. Exclusion of the medium
+The service has an execution (DESIGN.md "Executing a consented
+installation"), but production opens no consent channel, so execute is
+refused as consent unavailable: it writes no disk byte and cannot start
+an installation. Tests drive the core's two ends with fakes and the
+execution on a regular-file disk. Exclusion of the medium
 backing the deployment source currently rests on discovery: a mounted
 medium's exclusive claim keeps it out. Independent retention and exclusion
 of source backing storage, validation of choices against that source
@@ -514,7 +516,7 @@ authenticates nothing; it refuses only bytes outside the grammar. The
 service core speaks it, and td-authd opens it for the service it starts on a
 live boot (td-authd/DESIGN.md "Whole-disk installation intake") as one end
 of a socketpair on the service's standard output, but the service opens no
-channel until it has an execution.
+channel yet.
 
 Both ends first send and require `TDINA01\n`, which changes with any message
 or its bytes. Each message then travels in one frame: a big-endian u32

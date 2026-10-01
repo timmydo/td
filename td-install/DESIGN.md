@@ -258,16 +258,19 @@ here names as many as five paths — so `No such file or directory` alone is
 a diagnostic an operator cannot act on. This crate's SHIPPED source reaches
 the filesystem only through `mod paths`, whose wrappers each pair the
 operation with the path they were given; `realfile.rs`, which the crate
-compiles in, is the second such point and already named its own. ONE
+compiles in, is the second such point and already named its own, and
+`engine/src/sha256.rs`'s `sha256_file` is the third: the crate compiles
+that file for its digests, never calls the helper (a test pins that), and
+the helper names its path for every consumer. ONE
 wrapper is exempt from the naming and is named in the test that enforces
 it: `metadata_if_present` discards its error, because its caller asks only
 whether two files are the same and an unreadable path is not one of them.
 
 The COMPILER holds the first half of that. `clippy.toml` disallows every
 path-taking entry point into the filesystem and `Cargo.toml` denies the
-lint, so a call outside the two choke points fails CLIPPY — which is a
+lint, so a call outside the three choke points fails CLIPPY — which is a
 gate leg and not `cargo build`, and not the recipe that compiles the
-shipped binary with rustc directly. The three scoped `#[allow]`s are the
+shipped binary with rustc directly. The four scoped `#[allow]`s are the
 whole of the exception, and a test reads where they sit. What is left for
 a test is whether a wrapper puts its path in the message, which clippy has
 no opinion about. A source SCAN held the first half before this and lost
@@ -836,6 +839,79 @@ The caller still binds stable trusted sources, an absolute td-boot and a
 mountpoint nothing else uses. This is the one-process publication the
 installation service's execution needs; it does not activate that
 execution.
+
+### Executing a consented installation
+
+`td-install serve`'s execution installs onto the disk the service holds,
+on the service's own thread, once consent arrives and the held disk has
+rechecked. Its inputs are serve's five operands and the plan, never the
+installer's: the deployment directory, trusted key, `td-boot` and
+`td-firstboot` as bound, and from the verified root its stock selector
+template (`SELECTOR_TEMPLATE_PATH`) and `bin/mkfs.btrfs` (D7), and the
+running system's time zone catalog, re-read from the read-only root the
+settings were checked against. The root is `/` because td-authd binds the
+verified root there; the execution does not assert it. A live boot's
+init records the deployment its root was authenticated as in
+`/run/td-deployment`, and the execution reads it too.
+
+Before the destination is touched it checks the source. The booted record
+must name the plan's deployment, since the account and catalog checks, the
+selector template and `mkfs.btrfs` are all that root's. The source's
+manifest must hash to the plan's deployment digest, which source
+authentication produced; td-boot's manifest has a fixed line order, so its
+`bzImage` entry is then the digest the ESP kernel's bytes must have.
+td-boot's source naming applies to the kernel: the deployment's `bzImage`
+or the medium's `bzimage`, a real regular file, never both as two files.
+The kernel is copied into the workspace, which only root can write, and
+the formatter hashes that copy through the descriptor it pinned and
+rewinds it, so the bytes checked are the bytes copied; a mismatch refuses
+before the first write. The selector is the template with the bound key
+and the plan's volume identity appended (`prepare-selector`). The
+layout's own refusal of a disk too small for it is asked of the reviewed
+geometry before anything is staged.
+
+The execution works in a fresh root-only directory under `/run`, named by
+the first eight bytes of the plan's nonce: the kernel copy, the prepared
+selector, the formatter's scratch and td-boot's mountpoint. A directory of
+that name already present refuses and is left alone. It formats the held
+claim directly, the same `format` body without reopening anything, with
+the plan's time zone, hostname and account and publication through a loop
+over the claim (above). The service is told writing filesystems once the
+layout's and the volume's rechecks have passed, immediately before the
+first byte is written, and publishing the deployment as publication
+starts. The account and regional settings are staged into the volume
+image before any write, so no separate settings phase is reported.
+Verifying boot follows: td-boot's output must be one deployment id, and
+the plan's.
+
+Every failure is written to standard error and maps to one protocol
+failure, by the stage that met it. A source or layout check, preparing
+the selector from the template and trusted key, td-boot's output and the
+published id are verification failed; the time zone,
+hostname, account or seed operands are settings failed; a disk too small
+for the layout, or a workspace that cannot be created, is insufficient
+space; staging the volume image in scratch is write failed; and an
+error this process meets as a full filesystem or exceeded quota before
+the first write is insufficient space (mkfs.btrfs reports only its exit
+status, so its own shortage is write failed). After the first write every
+failure is write failed, and the disk may be incomplete. The failed
+status carries no phase, so a client cannot tell the two write failures
+apart and treats either as a disk that may be incomplete. The workspace
+is removed whatever the outcome, each part attempted even where another
+fails, and also on drop, which covers a partial creation and an
+unwinding panic. The shipped binary aborts on panic, and a killed process
+drops nothing, so there the workspace stays in `/run` until reboot; a
+later review draws a fresh nonce and so a fresh name. Its
+mountpoint is removed only if empty, so a volume td-boot left mounted is
+never walked; that, like any other removal failure, is reported and
+leaves the outcome as it was.
+
+Production constructs this execution, but `run_serve` still opens no
+consent channel, so execute is refused as consent unavailable and nothing
+runs. Payload fit and independent retention of the source's backing
+storage remain owed before the channel opens (INSTALLER.md). The kernel
+check binds the ESP to the authenticated manifest; the remaining payloads
+are td-boot's to verify as it publishes them.
 
 ### Full-system volume consumers
 
@@ -1481,7 +1557,7 @@ which ones is written down in `TARGET_INCLUDED_ENGINE_SOURCES`:
 | source | target consumer |
 |---|---|
 | `principals.rs` | td-firstboot identity parsing and reservations |
-| `sha256.rs` | td-boot, td-update, td-compositor corpus verifier |
+| `sha256.rs` | td-boot, td-update, td-install live ESP kernel check, td-authd, td-secret, td-firstboot, td-compositor corpus verifier, td-ui terminal corpus |
 | `crc32.rs` | td-install (via gpt) |
 | `gpt.rs` | td-install |
 | `cpio.rs` | td-install selector identity preparation |

@@ -35,6 +35,13 @@ mod fat;
 #[path = "../../engine/src/gpt.rs"]
 #[allow(dead_code)]
 mod gpt;
+// A live installation checks the kernel it copies to the ESP against the
+// manifest its plan names (DESIGN.md "Executing a consented installation").
+// Only the hasher and hex encoder are used here; `sha256_file` serves its other
+// consumers.
+#[path = "../../engine/src/sha256.rs"]
+#[allow(dead_code)]
+mod sha256;
 // Test-only, and declared with the same redundant `#[path]` as td-boot's own
 // files, so that `every_compiled_file_is_one_the_guards_read` counts it and
 // both guards read it: a file compiled only into the test binary ships in
@@ -300,6 +307,37 @@ impl BootInput {
         {
             return Err(invalid(format!(
                 "EFI input changed size: {}",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Require the pinned bytes to hash to `expected`, then rewind for the
+    /// copy, which still checks the length: one descriptor, read twice.
+    fn check_digest(&mut self, expected: &[u8; 32]) -> io::Result<()> {
+        let mut hasher = sha256::Sha256::new();
+        let mut buffer = vec![0; 64 * 1024];
+        let mut remaining = self.len;
+        while remaining > 0 {
+            let want = remaining.min(buffer.len() as u64);
+            let chunk = usize::try_from(want)
+                .ok()
+                .and_then(|want| buffer.get_mut(..want))
+                .ok_or_else(|| invalid("EFI digest buffer".into()))?;
+            self.file.read_exact(chunk).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("hash EFI input {}: {error}", self.path.display()),
+                )
+            })?;
+            hasher.update(chunk);
+            remaining -= want;
+        }
+        self.file.seek(SeekFrom::Start(0))?;
+        if hasher.finalize() != *expected {
+            return Err(invalid(format!(
+                "EFI kernel {} is not the one the authenticated manifest names",
                 self.path.display()
             )));
         }
@@ -1046,6 +1084,374 @@ impl installation_service::Host for LiveHost {
     }
 }
 
+/// A consented installation onto the held disk (DESIGN.md "Executing a
+/// consented installation"). Every path is serve's caller's or derived from
+/// the plan; the installer supplies none.
+struct LiveExecution {
+    td_boot: PathBuf,
+    source: PathBuf,
+    trusted_key: PathBuf,
+    root: PathBuf,
+    firstboot: PathBuf,
+    timezones: PathBuf,
+    /// The deployment id this boot's root was authenticated as.
+    booted: PathBuf,
+    /// Where the private workspace is made.
+    run: PathBuf,
+}
+
+/// The live root's record of its deployment, written by its init.
+const BOOTED_DEPLOYMENT: &str = "/run/td-deployment";
+
+/// Why an execution stopped, and the cause written to standard error.
+type Stopped = (installation_protocol::Failure, io::Error);
+
+/// `failure`, unless the cause is space: before the first write, a full
+/// filesystem is insufficient space whichever step met it.
+fn before_writing(failure: installation_protocol::Failure) -> impl Fn(io::Error) -> Stopped {
+    move |error| {
+        let failure = match error.kind() {
+            io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => {
+                installation_protocol::Failure::InsufficientSpace
+            }
+            _ => failure,
+        };
+        (failure, error)
+    }
+}
+
+impl LiveExecution {
+    fn for_host(host: &LiveHost) -> Self {
+        Self {
+            td_boot: host.td_boot.clone(),
+            source: host.source.clone(),
+            trusted_key: host.trusted_key.clone(),
+            root: host.root.clone(),
+            firstboot: host.firstboot.clone(),
+            timezones: host.timezones.clone(),
+            booted: PathBuf::from(BOOTED_DEPLOYMENT),
+            run: PathBuf::from("/run"),
+        }
+    }
+
+    fn install(
+        &self,
+        plan: &installation_plan::Plan,
+        claim: File,
+        workspace: &Workspace,
+        progress: &mut dyn FnMut(installation_protocol::Phase),
+    ) -> Result<(), Stopped> {
+        use installation_protocol::{Failure, Phase};
+        let verification = before_writing(Failure::VerificationFailed);
+        let settings_failed = before_writing(Failure::SettingsFailed);
+        let deployment = sha256::to_base16(plan.deployment());
+        // Everything taken from the root below — the account and catalog
+        // checks, the selector template, mkfs.btrfs — is the planned
+        // deployment's only if the root is.
+        let booted = realfile::read_bounded_real_file(&self.booted, "booted deployment record", 65)
+            .map_err(&verification)?;
+        if booted.strip_suffix(b"\n") != Some(deployment.as_bytes()) {
+            return Err(verification(invalid(format!(
+                "{} does not name deployment {deployment}",
+                self.booted.display()
+            ))));
+        }
+        // The layout's own refusal of a disk too small for it, asked of the
+        // reviewed geometry before anything is staged.
+        crate::plan(
+            u64::from(plan.destination().sector()),
+            plan.destination().capacity(),
+        )
+        .map_err(|error| (Failure::InsufficientSpace, invalid(error)))?;
+        let kernel_sha256 = self
+            .kernel_digest(plan.deployment())
+            .map_err(&verification)?;
+        // A private copy, so the bytes checked and the bytes copied to the
+        // ESP are one root-only file's whatever the source does meanwhile.
+        stage_kernel(&self.kernel()?, &workspace.kernel).map_err(&verification)?;
+        let uuid = VolumeUuid::parse(&canonical_uuid(plan.volume_uuid())).map_err(&verification)?;
+        prepare_selector(
+            &self.root.join(protocol::SELECTOR_TEMPLATE_PATH),
+            &self.trusted_key,
+            &uuid,
+            &workspace.selector,
+        )
+        .map_err(&verification)?;
+        let chosen = plan.settings();
+        let timezone = timezones::Selection::load(&self.timezones, chosen.timezone())
+            .map_err(&settings_failed)?;
+        let hostname = hostname::Hostname::parse(chosen.hostname())
+            .map_err(|error| settings_failed(invalid(error)))?;
+        let username = PrimarySelection {
+            name: chosen.username().to_owned(),
+            root: self.root.clone(),
+            firstboot: self.firstboot.clone(),
+        };
+        let seed = VolumeSeed::Loop(
+            self.trusted_key.clone(),
+            LoopPublish {
+                td_boot: self.td_boot.clone(),
+                deployment: self.source.clone(),
+                mountpoint: workspace.mountpoint.clone(),
+            },
+        );
+        let mkfs = self.root.join("bin").join(protocol::MKFS_BTRFS);
+        let settings = VolumeSettings {
+            timezone: Some(&timezone),
+            hostname: Some(&hostname),
+            username: Some(&username),
+        };
+        let prepared = prepare_volume(
+            settings,
+            Some(&uuid),
+            &mkfs,
+            &workspace.scratch,
+            Some(&seed),
+        )
+        .map_err(&settings_failed)?;
+        let mut destination = FormatDestination {
+            file: claim,
+            label: PathBuf::from(format!("/dev/{}", plan.destination().name())),
+        };
+        let boot = BootFiles {
+            kernel: workspace.kernel.clone(),
+            initramfs: workspace.selector.clone(),
+        };
+        let published = format_held(
+            prepared,
+            &mut destination,
+            &boot,
+            Some(&kernel_sha256),
+            &mut io::sink(),
+            &mut |step| {
+                progress(match step {
+                    FormatStep::Writing => Phase::WritingFilesystems,
+                    FormatStep::Publishing => Phase::PublishingDeployment,
+                })
+            },
+        )
+        .map_err(|failure| match failure {
+            HeldFailure::Layout(error) => verification(error),
+            // Writing the volume image in scratch: the disk is untouched,
+            // which the absent writing phase tells the client.
+            HeldFailure::Staging(error) => before_writing(Failure::WriteFailed)(error),
+            HeldFailure::Written(error) => (Failure::WriteFailed, error),
+        })?;
+        progress(Phase::VerifyingBoot);
+        let id = published.as_deref().and_then(published_id).ok_or_else(|| {
+            (
+                Failure::VerificationFailed,
+                invalid("td-boot printed no deployment id".into()),
+            )
+        })?;
+        if id != deployment {
+            return Err((
+                Failure::VerificationFailed,
+                invalid(format!(
+                    "td-boot published {id}, not deployment {deployment}"
+                )),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The `bzImage` digest the authenticated manifest names, once the
+    /// manifest is the one the plan names.
+    fn kernel_digest(&self, deployment: &[u8; 32]) -> io::Result<[u8; 32]> {
+        let path = self.source.join(protocol::MANIFEST_NAME);
+        let manifest = realfile::read_bounded_real_file(
+            &path,
+            "deployment manifest",
+            protocol::MAX_MANIFEST_BYTES,
+        )?;
+        let mut hasher = sha256::Sha256::new();
+        hasher.update(&manifest);
+        if hasher.finalize() != *deployment {
+            return Err(invalid(format!(
+                "{} is not the authenticated deployment's manifest",
+                path.display()
+            )));
+        }
+        // The bytes hashed are the bytes parsed. td-boot's four-line form
+        // puts `bzImage`'s entry straight after the header.
+        let mut lines = manifest.split(|byte| *byte == b'\n');
+        if lines.next() != Some(protocol::MANIFEST_HEADER) {
+            return Err(invalid(format!(
+                "{} lacks the td-deployment-v1 header",
+                path.display()
+            )));
+        }
+        lines
+            .next()
+            .and_then(|entry| entry.strip_suffix(b"  bzImage"))
+            .filter(|digest| protocol::valid_digest(digest))
+            .and_then(|digest| std::str::from_utf8(digest).ok())
+            .ok_or_else(|| invalid(format!("{} has no kernel entry", path.display())))
+            .and_then(digest_bytes)
+    }
+
+    /// The source's kernel under td-boot's rule for a source directory: the
+    /// deployment spelling, or the medium's `bzimage`, never two files, read
+    /// without following a link as td-boot reads it.
+    fn kernel(&self) -> Result<PathBuf, Stopped> {
+        use std::os::unix::fs::MetadataExt;
+        let verification = before_writing(installation_protocol::Failure::VerificationFailed);
+        let deployment = self.source.join("bzImage");
+        let medium = self.source.join("bzimage");
+        let identity = |path: &Path| match paths::symlink_metadata(path) {
+            Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(verification(error)),
+        };
+        match (identity(&deployment)?, identity(&medium)?) {
+            (Some(one), Some(other)) if one != other => Err(verification(invalid(format!(
+                "source directory {} holds both bzImage and bzimage",
+                self.source.display()
+            )))),
+            (None, None) => Err(verification(invalid(format!(
+                "source directory {} holds no kernel",
+                self.source.display()
+            )))),
+            (None, Some(_)) => Ok(medium),
+            _ => Ok(deployment),
+        }
+    }
+}
+
+/// Copy the source kernel, a real regular file of at most the EFI bound,
+/// to `private`, created fresh at mode 0600.
+fn stage_kernel(source: &Path, private: &Path) -> io::Result<()> {
+    let (file, metadata) = realfile::open_real_file(source, "EFI kernel")?;
+    let len = metadata.len();
+    if len == 0 || len > MAX_BOOT_FILE {
+        return Err(invalid(format!(
+            "EFI kernel must contain 1..={MAX_BOOT_FILE} bytes: {}",
+            source.display()
+        )));
+    }
+    let mut copy = paths::create_new_with_mode(private, 0o600)?;
+    let copied = io::copy(&mut file.take(len.saturating_add(1)), &mut copy).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "copy {} to {}: {error}",
+                source.display(),
+                private.display()
+            ),
+        )
+    })?;
+    if copied != len {
+        return Err(invalid(format!(
+            "EFI kernel {} changed size while it was copied",
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Canonical lowercase text of a UUID held in network byte order.
+fn canonical_uuid(bytes: &[u8; 16]) -> String {
+    let mut text = String::with_capacity(36);
+    for (at, byte) in bytes.iter().enumerate() {
+        if matches!(at, 4 | 6 | 8 | 10) {
+            text.push('-');
+        }
+        text.push_str(&format!("{byte:02x}"));
+    }
+    text
+}
+
+impl installation_service::Execute<File> for LiveExecution {
+    fn execute(
+        &self,
+        plan: &installation_plan::Plan,
+        claim: File,
+        progress: &mut dyn FnMut(installation_protocol::Phase),
+    ) -> Result<(), installation_protocol::Failure> {
+        let report = |(failure, error): Stopped| {
+            let _ = writeln!(io::stderr(), "td-install serve: {failure:?}: {error}");
+            failure
+        };
+        // Nothing is written yet; a workspace that cannot be made is space,
+        // or a name an earlier execution left.
+        let workspace = Workspace::create(&self.run, plan.nonce())
+            .map_err(|error| report((installation_protocol::Failure::InsufficientSpace, error)))?;
+        let outcome = self.install(plan, claim, &workspace, progress);
+        if let Err(error) = workspace.remove() {
+            let _ = writeln!(io::stderr(), "td-install serve: workspace: {error}");
+        }
+        outcome.map_err(report)
+    }
+}
+
+/// The execution's private directory under `/run`: the staged kernel, the
+/// prepared selector, the formatter's scratch and td-boot's mountpoint.
+/// Dropped without `remove`, as an unwinding panic drops it, it removes
+/// what it can.
+struct Workspace {
+    dir: PathBuf,
+    kernel: PathBuf,
+    selector: PathBuf,
+    scratch: PathBuf,
+    mountpoint: PathBuf,
+    removed: bool,
+}
+
+impl Workspace {
+    /// Named by the first eight bytes of the plan's nonce and made fresh:
+    /// one that exists refuses.
+    fn create(run: &Path, nonce: &[u8; 32]) -> io::Result<Self> {
+        let tag: String = nonce
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let dir = run.join(format!("td-install-{tag}"));
+        paths::create_dir_with_mode(&dir, 0o700)?;
+        // From here a failure drops it, which removes what was made.
+        let workspace = Self {
+            kernel: dir.join("bzImage"),
+            selector: dir.join("selector.cpio"),
+            scratch: dir.join("scratch"),
+            mountpoint: dir.join("volume"),
+            dir,
+            removed: false,
+        };
+        for directory in [&workspace.scratch, &workspace.mountpoint] {
+            paths::create_dir_with_mode(directory, 0o700)?;
+        }
+        Ok(workspace)
+    }
+
+    /// Remove what it holds, every part attempted, and report the first
+    /// failure. The mountpoint goes only if empty, so a volume td-boot left
+    /// mounted there is never walked.
+    fn remove(mut self) -> io::Result<()> {
+        self.removed = true;
+        self.clean()
+    }
+
+    fn clean(&self) -> io::Result<()> {
+        [
+            paths::remove_file_if_present(&self.kernel),
+            paths::remove_file_if_present(&self.selector),
+            paths::remove_dir_all_if_present(&self.scratch),
+            paths::remove_dir_if_present(&self.mountpoint),
+            paths::remove_dir_if_present(&self.dir),
+        ]
+        .into_iter()
+        .collect()
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        if !self.removed {
+            let _ = self.clean();
+        }
+    }
+}
+
 /// A proposal nonce and a version-4 volume UUID in network byte order, as
 /// the plan carries it (unlike `random_guid`'s GPT layout).
 fn plan_identity(bytes: [u8; 48]) -> ([u8; 32], [u8; 16]) {
@@ -1194,8 +1600,14 @@ fn run_serve(host: LiveHost) -> io::Result<()> {
     let euid = paths::open_read(Path::new("/proc/self"))?.metadata()?.uid();
     let stdin = File::from(io::stdin().as_fd().try_clone_to_owned()?);
     let stream = admit_serve(euid, stdin)?;
-    // No execution exists, so no consent channel is sought.
-    installation_service::serve(stream, installation_service::Service::new(host), None)
+    // The execution exists, but no consent channel is opened yet, so execute
+    // is refused as consent unavailable and it never runs (INSTALLER.md).
+    let execution = LiveExecution::for_host(&host);
+    installation_service::serve(
+        stream,
+        installation_service::Service::with_execution(host, execution),
+        None,
+    )
 }
 
 fn preview_number(value: &OsStr, label: &str) -> io::Result<u64> {
@@ -1716,6 +2128,14 @@ mod paths {
             _ => Ok(()),
         }
     }
+
+    /// The same for one directory, which must be empty.
+    pub fn remove_dir_if_present(path: &Path) -> io::Result<()> {
+        match std::fs::remove_dir(path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(named(error, path)),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Write `bytes` at `offset`, seeking first.
@@ -1809,7 +2229,7 @@ fn format_layout(
     boot: Option<&BootFiles>,
     out: &mut dyn Write,
 ) -> io::Result<()> {
-    prepare_layout(destination, boot)?.write_to(destination, out)
+    prepare_layout(destination, boot, None)?.write_to(destination, out)
 }
 
 struct PreparedLayout {
@@ -1820,9 +2240,12 @@ struct PreparedLayout {
     payloads: Vec<(BootInput, u64, u64, u64)>,
 }
 
+/// `kernel_sha256`, when given, is what the kernel's pinned bytes must hash to
+/// before anything is written.
 fn prepare_layout(
     destination: &mut FormatDestination,
     boot: Option<&BootFiles>,
+    kernel_sha256: Option<&[u8; 32]>,
 ) -> io::Result<PreparedLayout> {
     let file = &mut destination.file;
     let disk_bytes = destination_bytes(file)?;
@@ -1831,13 +2254,19 @@ fn prepare_layout(
 
     // Pin and size both sources before any destructive write. The caller owns
     // their content and must keep it stable throughout the operation.
-    let inputs = match boot {
+    let mut inputs = match boot {
         Some(boot) => Some((
             BootInput::open(&boot.kernel, file)?,
             BootInput::open(&boot.initramfs, file)?,
         )),
         None => None,
     };
+    if let Some(expected) = kernel_sha256 {
+        let (kernel, _) = inputs
+            .as_mut()
+            .ok_or_else(|| invalid("a kernel digest without a kernel".into()))?;
+        kernel.check_digest(expected)?;
+    }
     let initrd_name = protocol::EFI_INITRD_PATH
         .rsplit('\\')
         .next()
@@ -1986,24 +2415,17 @@ fn prepare_layout(
 }
 
 impl PreparedLayout {
-    fn write_to(self, destination: &mut FormatDestination, out: &mut dyn Write) -> io::Result<()> {
-        let Self {
-            plan: prepared_plan,
-            table,
-            esp,
-            metadata,
-            payloads,
-        } = self;
-        let file = &mut destination.file;
-        let label = destination.label.as_path();
-        let disk_bytes = destination_bytes(file)?;
-        let sector_size = logical_sector_size(file)?;
-        if plan(sector_size, disk_bytes).map_err(invalid)? != prepared_plan {
+    /// The refusals `write_to` makes before its first write: the destination's
+    /// geometry and the EFI inputs' lengths are still those prepared.
+    fn check_unchanged(&self, destination: &mut File) -> io::Result<()> {
+        let disk_bytes = destination_bytes(destination)?;
+        let sector_size = logical_sector_size(destination)?;
+        if plan(sector_size, disk_bytes).map_err(invalid)? != self.plan {
             return Err(invalid(
                 "destination geometry changed during format preparation".into(),
             ));
         }
-        for (input, _, _, _) in &payloads {
+        for (input, _, _, _) in &self.payloads {
             if input.file.metadata()?.len() != input.len {
                 return Err(invalid(format!(
                     "EFI input changed size before layout: {}",
@@ -2011,7 +2433,20 @@ impl PreparedLayout {
                 )));
             }
         }
-        let plan = prepared_plan;
+        Ok(())
+    }
+
+    fn write_to(self, destination: &mut FormatDestination, out: &mut dyn Write) -> io::Result<()> {
+        self.check_unchanged(&mut destination.file)?;
+        let Self {
+            plan,
+            table,
+            esp,
+            metadata,
+            payloads,
+        } = self;
+        let file = &mut destination.file;
+        let label = destination.label.as_path();
         let esp_offset = plan
             .esp_offset()
             .ok_or_else(|| invalid("the ESP offset overflowed".into()))?;
@@ -2551,28 +2986,88 @@ fn run_format(
     out: &mut dyn Write,
 ) -> io::Result<()> {
     let mut destination = FormatDestination::open(destination)?;
-    let layout = prepare_layout(&mut destination, Some(boot))?;
+    format_held(prepared, &mut destination, boot, None, out, &mut |_| {})
+        .map(drop)
+        .map_err(HeldFailure::into_error)
+}
+
+/// The step a held format is about to begin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormatStep {
+    /// The first destination write.
+    Writing,
+    /// Publication through the loop.
+    Publishing,
+}
+
+/// Where a held format stopped: laying out the disk or staging the volume,
+/// both before its first destination write, or after it.
+#[derive(Debug)]
+enum HeldFailure {
+    Layout(io::Error),
+    Staging(io::Error),
+    Written(io::Error),
+}
+
+impl HeldFailure {
+    fn into_error(self) -> io::Error {
+        match self {
+            Self::Layout(error) | Self::Staging(error) | Self::Written(error) => error,
+        }
+    }
+}
+
+/// Format the destination this process already holds, telling `step` as each
+/// step begins, and return td-boot's standard output when the seed publishes
+/// through the loop: the caller reads the deployment id out of it.
+fn format_held(
+    prepared: PreparedVolume<'_>,
+    destination: &mut FormatDestination,
+    boot: &BootFiles,
+    kernel_sha256: Option<&[u8; 32]>,
+    out: &mut dyn Write,
+    step: &mut dyn FnMut(FormatStep),
+) -> Result<Option<Vec<u8>>, HeldFailure> {
+    let layout =
+        prepare_layout(destination, Some(boot), kernel_sha256).map_err(HeldFailure::Layout)?;
     let len = layout
         .plan
         .volume_bytes()
-        .ok_or_else(|| invalid("planned volume length overflowed".into()))?;
+        .ok_or_else(|| HeldFailure::Layout(invalid("planned volume length overflowed".into())))?;
     let seed = prepared.seed;
-    let image = prepare_volume_image(prepared, &destination, len)?;
+    let image = prepare_volume_image(prepared, destination, len).map_err(HeldFailure::Staging)?;
     // Guard layout too; write_to keeps its own check for standalone volume use.
-    image.check_source(&destination.file)?;
-    layout.write_to(&mut destination, &mut io::sink())?;
+    image
+        .check_source(&destination.file)
+        .map_err(HeldFailure::Staging)?;
+    // Both refuse again inside their writes; asked here, a refusal is still
+    // before the step that reports writing.
+    layout
+        .check_unchanged(&mut destination.file)
+        .map_err(HeldFailure::Layout)?;
+    step(FormatStep::Writing);
+    layout
+        .write_to(destination, &mut io::sink())
+        .map_err(HeldFailure::Written)?;
     let Some((key, publish)) = seed.and_then(|seed| {
         seed.through_loop()
             .map(|publish| (seed.trusted_key(), publish))
     }) else {
-        return image.write_to(&mut destination, out);
+        return image
+            .write_to(destination, out)
+            .map(|()| None)
+            .map_err(HeldFailure::Written);
     };
     // The report waits for publication: a caller reading it has a published
     // disk.
     let mut report = Vec::new();
-    image.write_to(&mut destination, &mut report)?;
-    publish_through_loop(&mut destination, publish, key)?;
-    out.write_all(&report)
+    image
+        .write_to(destination, &mut report)
+        .map_err(HeldFailure::Written)?;
+    step(FormatStep::Publishing);
+    let stdout = publish_through_loop(destination, publish, key).map_err(HeldFailure::Written)?;
+    out.write_all(&report).map_err(HeldFailure::Written)?;
+    Ok(Some(stdout))
 }
 
 /// Publish onto the volume just written, through a loop over the destination
@@ -2584,7 +3079,7 @@ fn publish_through_loop(
     destination: &mut FormatDestination,
     publish: &LoopPublish,
     key: &Path,
-) -> io::Result<()> {
+) -> io::Result<Vec<u8>> {
     let sector_size = logical_sector_size(&destination.file)?;
     let (offset, len) = destination_volume(&mut destination.file)?;
     let device =
@@ -2621,7 +3116,16 @@ fn publish_through_loop(
     // td-boot has unmounted, so this is the last opener and the loop clears;
     // release confirms it did, so no loop outlives a reported success.
     device.release()?;
-    destination.file.sync_all()
+    destination.file.sync_all()?;
+    Ok(output.stdout)
+}
+
+/// td-boot's install output: one deployment id and a newline.
+fn published_id(stdout: &[u8]) -> Option<String> {
+    let id = stdout.strip_suffix(b"\n")?;
+    protocol::valid_digest(id)
+        .then(|| std::str::from_utf8(id).ok().map(str::to_owned))
+        .flatten()
 }
 
 struct PreparedVolume<'a> {
@@ -5845,7 +6349,7 @@ mod tests {
     ///
     /// `clippy.toml` disallows every path-taking entry point into the
     /// filesystem and `Cargo.toml` denies the lint, so such a call outside
-    /// the two choke points is a BUILD failure and not a test failure. That
+    /// the choke points is a BUILD failure and not a test failure. That
     /// pair IS the roster. What is left for a test is the attribute that
     /// opens a hole in it, and an attribute is text.
     ///
@@ -5893,7 +6397,7 @@ mod tests {
                 seen, expected,
                 "{label}: the allow sits on an item this test does not know — \
                  either an allow moved, or a choke point's signature changed \
-                 under MAIN_CHOKE/REALFILE_CHOKE"
+                 under MAIN_CHOKE/REALFILE_CHOKE/SHA256_CHOKE"
             );
         }
     }
@@ -6112,7 +6616,7 @@ mod tests {
     /// inventory uses paths; timezones uses the regular-file reader.
     type Compiled = (&'static str, &'static str, &'static [&'static str]);
 
-    fn compiled_files() -> [Compiled; 17] {
+    fn compiled_files() -> [Compiled; 18] {
         [
             ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
             (
@@ -6139,6 +6643,11 @@ mod tests {
                 "crc32.rs",
                 include_str!("../../engine/src/crc32.rs"),
                 [].as_slice(),
+            ),
+            (
+                "sha256.rs",
+                include_str!("../../engine/src/sha256.rs"),
+                SHA256_CHOKE.as_slice(),
             ),
             (
                 "protocol.rs",
@@ -6213,7 +6722,7 @@ mod tests {
         // include inside a `stringify!`, which satisfied the search while
         // `compiled_files` went on reading the original.
         let table_body = {
-            const HEAD: &str = "fn compiled_files() -> [Compiled; 17] {";
+            const HEAD: &str = "fn compiled_files() -> [Compiled; 18] {";
             let Some(at) = index_of(&text, HEAD) else {
                 panic!("the compiled-file table is not where this scan looks for it")
             };
@@ -6357,8 +6866,28 @@ mod tests {
         }
     }
 
+    /// `sha256_file` is admitted as a choke point because the file is
+    /// compiled, not because this crate opens through it: the kernel check
+    /// hashes the descriptor it pinned, and a path-taking hash would reopen.
+    #[test]
+    fn the_engine_path_hash_is_never_called() {
+        let needle = concat!("sha256", "_file");
+        for (label, source, _) in compiled_files() {
+            if label == "sha256.rs" {
+                continue;
+            }
+            let text = uncommented(source);
+            let shipped = text.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert!(!shipped.contains(needle), "{label} calls {needle}");
+        }
+    }
+
     /// `main.rs`'s one choke point, as the line under its allow reads.
     const MAIN_CHOKE: [&str; 1] = ["mod paths {"];
+
+    /// The engine hash's one, a path helper this crate compiles and never
+    /// calls; it names its path like every other choke wrapper.
+    const SHA256_CHOKE: [&str; 1] = ["pub fn sha256_file(p: &Path) -> std::io::Result<String> {"];
 
     /// `realfile.rs`'s two, which are functions rather than a module: td-boot
     /// compiles that file too and has no `clippy.toml`, so the allow there is
@@ -6394,7 +6923,7 @@ mod tests {
         }
         // A naming test that found nothing to check would pass whatever the
         // wrappers did.
-        assert_eq!(checked, 23, "{checked} wrappers were checked");
+        assert_eq!(checked, 25, "{checked} wrappers were checked");
     }
 
     /// The text of the item opened at `marker`, up to the next line that is a
@@ -6402,9 +6931,9 @@ mod tests {
     ///
     /// A brace WALK would have to know which braces are inside a string, and
     /// that lexer is what this commit deleted. Every item here closes at
-    /// column 0 — `mod paths` and both `realfile.rs` functions are top-level
-    /// — which is a property of the file's layout that a reader can check and
-    /// `rustfmt` keeps.
+    /// column 0 — `mod paths`, both `realfile.rs` functions and `sha256_file`
+    /// are top-level — which is a property of the file's layout that a reader
+    /// can check and `rustfmt` keeps.
     fn region<'a>(label: &str, source: &'a str, marker: &str) -> &'a str {
         let Some(at) = index_of(source, marker) else {
             panic!("{label}: the choke point {marker} is not there any more");
@@ -6650,7 +7179,7 @@ mod tests {
         out
     }
 
-    /// The three declarations the two choke points open, pinned whole. A
+    /// The three declarations `main.rs`'s choke point opens, pinned whole. A
     /// fourth is a decision someone makes on purpose.
     ///
     /// A `use` is not among the keywords that reach this, because `pub use`
@@ -8046,7 +8575,7 @@ mod tests {
     fn prepared_layout_refuses_changed_geometry_without_writes() {
         let (disk, _dir, boot) = combined_fixture(RECORDING_MKFS);
         let mut destination = FormatDestination::open(&disk.path).unwrap();
-        let layout = prepare_layout(&mut destination, Some(&boot)).unwrap();
+        let layout = prepare_layout(&mut destination, Some(&boot), None).unwrap();
         destination.file.set_len(DISK + MIB).unwrap();
         let before = volume_write_snapshot(&disk);
         let error = layout
@@ -8967,6 +9496,310 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(error.to_string().contains(refusal), "{error}");
+        }
+    }
+
+    // ── The consented installation's execution ────────────────────────────
+
+    /// Everything a `LiveExecution` reads, on a sparse disk.
+    struct ExecutionFixture {
+        _dir: ScratchDirectory,
+        disk: Scratch,
+        execution: LiveExecution,
+        plan: installation_plan::Plan,
+    }
+
+    impl ExecutionFixture {
+        /// `kernel` is what the source holds; the manifest names `named`.
+        fn new(kernel: &[u8], named: &[u8]) -> Self {
+            Self::reviewed_at(kernel, named, DISK)
+        }
+
+        /// The same, with the review having observed `capacity` bytes.
+        fn reviewed_at(kernel: &[u8], named: &[u8], capacity: u64) -> Self {
+            let dir = ScratchDirectory(fake_mkfs(RECORDING_MKFS));
+            let root = dir.0.join("root");
+            std::fs::create_dir_all(root.join("bin")).unwrap();
+            std::fs::rename(dir.0.join("mkfs.btrfs"), root.join("bin/mkfs.btrfs")).unwrap();
+            let template = root.join(protocol::SELECTOR_TEMPLATE_PATH);
+            std::fs::create_dir_all(template.parent().unwrap()).unwrap();
+            std::fs::write(&template, b"stock selector").unwrap();
+            let firstboot = dir.0.join("td-firstboot");
+            scratch::executable(&firstboot, "#!/bin/sh\nexit 0\n").unwrap();
+            let td_boot = dir.0.join("td-boot");
+            scratch::executable(&td_boot, "#!/bin/sh\nexit 1\n").unwrap();
+            let zones = dir.0.join("zoneinfo");
+            std::fs::create_dir_all(zones.join("Etc")).unwrap();
+            std::fs::write(zones.join("iso3166.tab"), b"GB\tBritain\n").unwrap();
+            std::fs::write(
+                zones.join("zone1970.tab"),
+                b"GB\t+5130-00007\tEurope/London\n",
+            )
+            .unwrap();
+            let mut header = vec![0; 44];
+            header[..5].copy_from_slice(b"TZif2");
+            std::fs::create_dir(zones.join("Europe")).unwrap();
+            for id in ["Europe/London", "Etc/UTC"] {
+                std::fs::write(zones.join(id), &header).unwrap();
+            }
+            let source = dir.0.join("source");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("bzImage"), kernel).unwrap();
+            let manifest = format!(
+                "td-deployment-v1\n{}  bzImage\n{}  initramfs.cpio\n{}  root.erofs\n",
+                sha256::hex_digest(named),
+                "11".repeat(32),
+                "22".repeat(32)
+            );
+            std::fs::write(source.join("manifest"), &manifest).unwrap();
+            let mut deployment = [0; 32];
+            let mut hasher = sha256::Sha256::new();
+            hasher.update(manifest.as_bytes());
+            deployment.copy_from_slice(&hasher.finalize());
+            let booted = dir.0.join("td-deployment");
+            std::fs::write(&booted, format!("{}\n", sha256::to_base16(&deployment))).unwrap();
+            let run = dir.0.join("run");
+            std::fs::create_dir(&run).unwrap();
+            let execution = LiveExecution {
+                td_boot,
+                source,
+                trusted_key: key_file(&dir.0),
+                root,
+                firstboot,
+                timezones: zones,
+                booted,
+                run,
+            };
+            let destination =
+                installation_plan::Destination::new(installation_plan::DestinationObservation {
+                    name: "vda",
+                    major: 253,
+                    minor: 0,
+                    sequence: 1,
+                    capacity,
+                    sector: 512,
+                    removable: false,
+                    model: None,
+                    serial: None,
+                    wwid: None,
+                })
+                .unwrap();
+            let settings =
+                installation_plan::Settings::new("tester", "td", "us", "Etc/UTC").unwrap();
+            let mut uuid = [0x5a; 16];
+            uuid[6] = 0x40;
+            uuid[8] = 0x80;
+            let plan =
+                installation_plan::Plan::new([7; 32], destination, deployment, uuid, settings)
+                    .unwrap();
+            Self {
+                _dir: dir,
+                disk: Scratch::disk(DISK),
+                execution,
+                plan,
+            }
+        }
+
+        /// The outcome and every phase reported, run on the held disk.
+        fn run(
+            &self,
+        ) -> (
+            Result<(), installation_protocol::Failure>,
+            Vec<installation_protocol::Phase>,
+        ) {
+            use installation_service::Execute;
+            let claim = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.disk.path)
+                .unwrap();
+            let mut phases = Vec::new();
+            let outcome = self
+                .execution
+                .execute(&self.plan, claim, &mut |phase| phases.push(phase));
+            (outcome, phases)
+        }
+
+        /// Nothing left in the run directory, whatever the outcome.
+        fn assert_workspace_gone(&self) {
+            assert_eq!(
+                std::fs::read_dir(&self.execution.run).unwrap().count(),
+                0,
+                "the workspace outlived its execution"
+            );
+        }
+
+        /// Stopped with `failure` before any phase began and any byte of the
+        /// disk was written.
+        fn assert_untouched(self, failure: installation_protocol::Failure) {
+            let (outcome, phases) = self.run();
+            assert_eq!(outcome, Err(failure));
+            assert!(phases.is_empty(), "{phases:?}");
+            assert!(self.disk.read_at(0, 1 << 20).iter().all(|b| *b == 0));
+            assert!(self
+                .disk
+                .read_at(DISK - (1 << 20), 1 << 20)
+                .iter()
+                .all(|b| *b == 0));
+            self.assert_workspace_gone();
+        }
+    }
+
+    /// The source is checked before the destination is touched: a root that
+    /// is not the planned deployment, a manifest that is not the planned one,
+    /// and a kernel the manifest does not name each fail verification with
+    /// no phase begun and every byte of the disk still zero.
+    #[test]
+    fn execution_verifies_its_source_before_any_write() {
+        use installation_protocol::Failure;
+        let another_root = ExecutionFixture::new(b"kernel", b"kernel");
+        std::fs::write(
+            &another_root.execution.booted,
+            format!("{}\n", "cd".repeat(32)),
+        )
+        .unwrap();
+        another_root.assert_untouched(Failure::VerificationFailed);
+        // Well formed and naming this kernel, but not the plan's manifest:
+        // only its digest tells it apart.
+        let another_manifest = ExecutionFixture::new(b"kernel", b"kernel");
+        std::fs::write(
+            another_manifest.execution.source.join("manifest"),
+            format!(
+                "td-deployment-v1\n{}  bzImage\n{}  initramfs.cpio\n{}  root.erofs\n",
+                sha256::hex_digest(b"kernel"),
+                "33".repeat(32),
+                "22".repeat(32)
+            ),
+        )
+        .unwrap();
+        another_manifest.assert_untouched(Failure::VerificationFailed);
+        // The manifest is the plan's; the kernel beside it is not its kernel.
+        ExecutionFixture::new(b"another kernel", b"kernel")
+            .assert_untouched(Failure::VerificationFailed);
+        // td-boot's source naming: no kernel, a link, or two files.
+        let none = ExecutionFixture::new(b"kernel", b"kernel");
+        std::fs::remove_file(none.execution.source.join("bzImage")).unwrap();
+        none.assert_untouched(Failure::VerificationFailed);
+        let linked = ExecutionFixture::new(b"kernel", b"kernel");
+        let source = linked.execution.source.clone();
+        std::fs::rename(source.join("bzImage"), source.join("real")).unwrap();
+        std::os::unix::fs::symlink(source.join("real"), source.join("bzImage")).unwrap();
+        linked.assert_untouched(Failure::VerificationFailed);
+        let both = ExecutionFixture::new(b"kernel", b"kernel");
+        std::fs::write(both.execution.source.join("bzimage"), b"kernel").unwrap();
+        both.assert_untouched(Failure::VerificationFailed);
+    }
+
+    /// The other refusals before any write, each by its own failure.
+    #[test]
+    fn execution_maps_each_refusal_before_writing() {
+        use installation_protocol::Failure;
+        // The plan's zone is gone from the catalog it is loaded from.
+        let zone = ExecutionFixture::new(b"kernel", b"kernel");
+        std::fs::remove_file(zone.execution.timezones.join("Etc/UTC")).unwrap();
+        zone.assert_untouched(Failure::SettingsFailed);
+        // A disk the layout cannot hold.
+        ExecutionFixture::reviewed_at(b"kernel", b"kernel", 1 << 20)
+            .assert_untouched(Failure::InsufficientSpace);
+        // A workspace of the plan's name is already there, and is not this
+        // execution's to remove.
+        let taken = ExecutionFixture::new(b"kernel", b"kernel");
+        let name = taken.execution.run.join("td-install-0707070707070707");
+        std::fs::create_dir(&name).unwrap();
+        let (outcome, phases) = taken.run();
+        assert_eq!(outcome, Err(Failure::InsufficientSpace));
+        assert!(phases.is_empty());
+        assert!(name.is_dir());
+        assert!(taken.disk.read_at(0, 1 << 20).iter().all(|b| *b == 0));
+    }
+
+    /// A source that verifies is written, with each phase reported as it
+    /// begins, and publication through the loop then fails here (unprivileged,
+    /// or a td-boot stand-in that exits 1): a write failure, the disk laid
+    /// out, and the workspace gone.
+    #[test]
+    fn execution_reports_each_phase_and_a_failed_publication() {
+        use installation_protocol::{Failure, Phase};
+        // Under either spelling td-boot reads a source's kernel by.
+        for spelling in ["bzImage", "bzimage"] {
+            let fixture = ExecutionFixture::new(b"kernel", b"kernel");
+            let source = &fixture.execution.source;
+            std::fs::rename(source.join("bzImage"), source.join(spelling)).unwrap();
+            let (outcome, phases) = fixture.run();
+            assert_eq!(outcome, Err(Failure::WriteFailed));
+            assert_eq!(
+                phases,
+                [Phase::WritingFilesystems, Phase::PublishingDeployment]
+            );
+            let table = fixture.disk.table(DISK);
+            assert_eq!(table.partitions.len(), 2);
+            fixture.assert_workspace_gone();
+        }
+    }
+
+    #[test]
+    fn a_workspace_is_made_fresh_and_removed_whole() {
+        let dir = ScratchDirectory(scratch::path("workspace"));
+        std::fs::create_dir(&dir.0).unwrap();
+        let workspace = Workspace::create(&dir.0, &[0xa5; 32]).unwrap();
+        assert_eq!(workspace.dir, dir.0.join("td-install-a5a5a5a5a5a5a5a5"));
+        assert_eq!(workspace.kernel, workspace.dir.join("bzImage"));
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&workspace.dir, &workspace.scratch, &workspace.mountpoint] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{}", path.display());
+        }
+        assert!(Workspace::create(&dir.0, &[0xa5; 32]).is_err());
+        std::fs::write(&workspace.kernel, b"kernel").unwrap();
+        std::fs::write(&workspace.selector, b"selector").unwrap();
+        std::fs::write(workspace.scratch.join("image"), b"image").unwrap();
+        workspace.remove().unwrap();
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+        // Dropped without `remove`, as an unwinding panic drops it.
+        let workspace = Workspace::create(&dir.0, &[0x11; 32]).unwrap();
+        std::fs::write(workspace.scratch.join("image"), b"image").unwrap();
+        drop(workspace);
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+        // A mountpoint that is not empty is a volume left mounted: refused,
+        // never walked.
+        let workspace = Workspace::create(&dir.0, &[0x5a; 32]).unwrap();
+        std::fs::write(workspace.mountpoint.join("installed"), b"x").unwrap();
+        let mountpoint = workspace.mountpoint.clone();
+        let scratch = workspace.scratch.clone();
+        assert!(workspace.remove().is_err());
+        assert!(mountpoint.join("installed").exists());
+        // ...and the parts beside it are still removed.
+        assert!(!scratch.exists());
+        // The first part refused does not stop the ones after it.
+        let workspace = Workspace::create(&dir.0, &[0x3c; 32]).unwrap();
+        std::fs::create_dir(&workspace.kernel).unwrap();
+        std::fs::write(workspace.kernel.join("held"), b"x").unwrap();
+        std::fs::write(&workspace.selector, b"selector").unwrap();
+        let (selector, scratch) = (workspace.selector.clone(), workspace.scratch.clone());
+        assert!(workspace.remove().is_err());
+        assert!(!selector.exists() && !scratch.exists());
+    }
+
+    #[test]
+    fn a_plan_uuid_and_a_published_id_read_canonically() {
+        let mut bytes = [0u8; 16];
+        for (at, byte) in bytes.iter_mut().enumerate() {
+            *byte = at as u8 * 17;
+        }
+        assert_eq!(
+            canonical_uuid(&bytes),
+            "00112233-4455-6677-8899-aabbccddeeff"
+        );
+        let id = "ab".repeat(32);
+        assert_eq!(published_id(format!("{id}\n").as_bytes()), Some(id.clone()));
+        for wrong in [
+            id.clone(),
+            format!("{id}\n\n"),
+            format!("{}\n", "AB".repeat(32)),
+            format!("{}\n", "ab".repeat(31)),
+            String::new(),
+        ] {
+            assert_eq!(published_id(wrong.as_bytes()), None, "{wrong:?}");
         }
     }
 

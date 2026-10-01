@@ -14,6 +14,8 @@
 //! no panics: the compression loops run on iterators and `split_at_mut` views)
 //! plus the builder's streaming `sha256_file` helper.
 
+use std::path::Path;
+
 /// SHA-256 round constants (fractional parts of cube roots of primes 2..311).
 const K: [u32; 64] = [
     0x428a_2f98,
@@ -250,8 +252,16 @@ pub fn sha256_reader(mut reader: impl std::io::Read) -> std::io::Result<String> 
 
 /// sha256 of a file's bytes. Bootstrap artifacts and warmed crates run
 /// multi-MB, so this delegates to the streaming reader helper.
-pub fn sha256_file(p: &std::path::Path) -> std::io::Result<String> {
-    sha256_reader(std::fs::File::open(p)?)
+///
+/// Every error names the file. td-install compiles this file under a clippy
+/// roster that admits an open by name only in a wrapper that does, and the
+/// allow is inert for the consumers without one.
+#[allow(clippy::disallowed_methods)]
+pub fn sha256_file(p: &Path) -> std::io::Result<String> {
+    let named = |error: std::io::Error| {
+        std::io::Error::new(error.kind(), format!("{}: {error}", p.display()))
+    };
+    sha256_reader(std::fs::File::open(p).map_err(named)?).map_err(named)
 }
 
 #[cfg(test)]

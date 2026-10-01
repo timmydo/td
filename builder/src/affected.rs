@@ -308,7 +308,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/sha256.rs",
-        "td-builder, td-recipe-eval, target-static td-boot and td-update, the td-compositor terminal corpus verifier/importer, and td-crypto's test-only ES256 oracle",
+        "td-builder, td-recipe-eval, target-static td-boot, td-update and td-install (its live installation's ESP kernel check), td-authd, td-secret, the td-firstboot recipe, host td-vm, the td-compositor and td-ui terminal corpus verifiers/importers, and td-crypto's test-only ES256 oracle",
     ),
     (
         "engine/src/crc32.rs",
@@ -2245,6 +2245,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_contains!("engine/src/gpt.rs", "target-static td-install");
     assert_contains!("engine/src/fat.rs", "target-static td-install");
     assert_contains!("engine/src/cpio.rs", "target-static td-install");
+    assert_contains!("engine/src/sha256.rs", "td-install (its live installation");
     assert_contains!("engine/src/ed25519.rs", "target-static td-boot");
     assert_contains!("engine/src/sha512.rs", "target-static td-boot");
     assert_contains!("engine/src/ed25519_sign.rs", "never td-boot");
