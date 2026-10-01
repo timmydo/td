@@ -388,3 +388,44 @@ expect viewport 0
 key shift+pageup
 expect viewport 1
 end
+
+# Mode 1000 reports presses and releases in X10's encoding: `CSI M`, then
+# the button, column and row each plus 32 in one byte, a release naming no
+# button. Nothing is reported before the mode is set or after it is reset.
+case input/pointer-reports-follow-the-mode
+source td
+tags core input mouse
+size 4 8
+pointer press left 0 0
+expect input b""
+write b"\e[?1000h"
+pointer press left 0 0
+pointer motion left 0 1
+pointer release left 0 1
+expect input b"\e[M !!\e[M#\"!"
+pointer press ctrl+right 3 7
+expect input b"\e[M !!\e[M#\"!\e[M2($"
+write b"\e[?1000l"
+pointer press left 0 0
+expect input b"\e[M !!\e[M#\"!\e[M2($"
+end
+
+# Mode 1002 adds motion with a button held, plus 32; 1003 all motion, a
+# buttonless one being 35. SGR's encoding spells them in decimal, a release
+# keeping its button and ending in `m`, and the wheel is 64 and 65.
+case input/pointer-motion-and-sgr-encoding
+source td
+tags core input mouse
+size 4 8
+write b"\e[?1002;1006h"
+pointer motion none 1 1
+pointer press left 1 1
+pointer motion left 1 2
+pointer release left 1 2
+expect input b"\e[<0;2;2M\e[<32;3;2M\e[<0;3;2m"
+write b"\e[?1003h"
+pointer motion none 2 3
+pointer press shift+alt+wheel-up 0 0
+pointer press wheel-down 0 0
+expect input b"\e[<0;2;2M\e[<32;3;2M\e[<0;3;2m\e[<35;4;3M\e[<76;1;1M\e[<65;1;1M"
+end

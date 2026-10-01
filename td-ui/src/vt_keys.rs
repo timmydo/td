@@ -1,7 +1,8 @@
 //! The terminal's keyboard encoder: a chord as td-ui's keymap spells it
 //! (`keyboard::Stroke`) in; a bounded terminal byte sequence, a move of the
-//! scrollback viewport, or nothing out. Beside it, the viewport and the
-//! bounded queue between the encoder and a PTY writer.
+//! scrollback viewport, or nothing out. Beside it, the pointer's report
+//! encoder, the viewport and the bounded queue between the encoders and a
+//! PTY writer.
 //!
 //! Chords are keymap-independent: the compositor's own keymap, td's or any
 //! other the toolkit compiles, has already chosen the character or named
@@ -10,6 +11,8 @@
 //! device, socket, clock or environment.
 
 use std::collections::VecDeque;
+
+use crate::vt::{MouseMode, MouseTracking};
 
 /// Room for the longest sequence this profile emits — an Alt prefix before
 /// `CSI 24 ~`, six bytes — with slack.
@@ -377,6 +380,148 @@ fn page_lines(rows: usize) -> usize {
     rows.saturating_sub(1).max(1)
 }
 
+/// Room for the longest pointer report on a `vt::MAX_DIMENSION` grid, SGR's
+/// `CSI < 93 ; 16384 ; 16384 M` (18 bytes), with slack.
+pub const MAX_REPORT: usize = 24;
+
+/// A pointer button as a terminal reports it; the wheel's two directions
+/// are buttons that are pressed and never released.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Button {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+}
+
+/// What the pointer did over a cell: a press, a release, or motion with
+/// the button held, if one is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Pointer {
+    Press(Button),
+    Release(Button),
+    Motion(Option<Button>),
+}
+
+/// The modifier roles held as the pointer acted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PointerModifiers {
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
+}
+
+/// One pointer report: a bounded byte string with no allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Report {
+    bytes: [u8; MAX_REPORT],
+    length: usize,
+}
+
+impl Report {
+    pub fn as_slice(&self) -> &[u8] {
+        self.bytes.get(..self.length).unwrap_or(&[])
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Option<()> {
+        let end = self.length.checked_add(bytes.len())?;
+        self.bytes.get_mut(self.length..end)?.copy_from_slice(bytes);
+        self.length = end;
+        Some(())
+    }
+
+    fn push_decimal(&mut self, value: usize) -> Option<()> {
+        let mut digits = [0u8; 20];
+        let mut start = digits.len();
+        let mut rest = value;
+        loop {
+            start = start.checked_sub(1)?;
+            *digits.get_mut(start)? = b'0' + u8::try_from(rest % 10).ok()?;
+            rest /= 10;
+            if rest == 0 {
+                break;
+            }
+        }
+        self.push(digits.get(start..)?)
+    }
+}
+
+/// The report `mode` asks for of `event` at the zero-based cell `at`, or
+/// none: when the mode does not report that kind of event (mode 9 reports
+/// no wheel, as in xterm), for a wheel's release or motion, and in X10's
+/// encoding for a cell past the 223rd row or column, which its one byte
+/// cannot carry.
+///
+/// The button is 0, 1 or 2 for left, middle and right, 64 and 65 for the
+/// wheel up and down, and 3 for motion with no button and for any release
+/// in X10's encoding, which does not say which button; motion adds 32,
+/// and Shift, Alt and Control add 4, 8 and 16, except under mode 9. X10's
+/// encoding is `CSI M` then the button, column and row each plus 32 in one
+/// byte, the cell one-based; SGR's is `CSI <` then the three in decimal,
+/// separated by `;`, ending `M`, or `m` for a release.
+pub fn report(
+    event: Pointer,
+    at: (usize, usize),
+    modifiers: PointerModifiers,
+    mode: MouseMode,
+) -> Option<Report> {
+    let (button, motion, release) = match event {
+        Pointer::Press(button) => (Some(button), false, false),
+        Pointer::Release(button) => (Some(button), false, true),
+        Pointer::Motion(button) => (button, true, false),
+    };
+    let reported = match mode.tracking {
+        MouseTracking::Off => false,
+        MouseTracking::Press => !motion && !release,
+        MouseTracking::Click => !motion,
+        MouseTracking::Drag => !motion || button.is_some(),
+        MouseTracking::Motion => true,
+    };
+    let wheel = matches!(button, Some(Button::WheelUp | Button::WheelDown));
+    if !reported || (wheel && (release || motion || mode.tracking == MouseTracking::Press)) {
+        return None;
+    }
+    let mut code: u32 = match button {
+        Some(Button::Left) => 0,
+        Some(Button::Middle) => 1,
+        Some(Button::Right) => 2,
+        Some(Button::WheelUp) => 64,
+        Some(Button::WheelDown) => 65,
+        None => 3,
+    };
+    if release && !mode.sgr {
+        code = 3;
+    }
+    if motion {
+        code += 32;
+    }
+    if mode.tracking != MouseTracking::Press {
+        code += u32::from(modifiers.shift) * 4
+            + u32::from(modifiers.alt) * 8
+            + u32::from(modifiers.control) * 16;
+    }
+    let (row, column) = (at.0.checked_add(1)?, at.1.checked_add(1)?);
+    let mut report = Report {
+        bytes: [0; MAX_REPORT],
+        length: 0,
+    };
+    if mode.sgr {
+        report.push(b"\x1b[<")?;
+        report.push_decimal(usize::try_from(code).ok()?)?;
+        report.push(b";")?;
+        report.push_decimal(column)?;
+        report.push(b";")?;
+        report.push_decimal(row)?;
+        report.push(if release { b"m" } else { b"M" })?;
+    } else {
+        let byte = |value: usize| u8::try_from(value.checked_add(32)?).ok();
+        let code = usize::try_from(code).ok()?;
+        report.push(&[ESC, b'[', b'M', byte(code)?, byte(column)?, byte(row)?])?;
+    }
+    Some(report)
+}
+
 /// What the model's primary history looks like right now. The three travel
 /// together because an offset means nothing without all of them: which
 /// numbering the lines are counted in, how many have been counted, and how
@@ -627,6 +772,117 @@ pub fn selftest() -> Result<(), String> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    fn reported(
+        event: Pointer,
+        at: (usize, usize),
+        modifiers: PointerModifiers,
+        tracking: MouseTracking,
+        sgr: bool,
+    ) -> Option<Vec<u8>> {
+        report(event, at, modifiers, MouseMode { tracking, sgr })
+            .map(|found| found.as_slice().to_vec())
+    }
+
+    #[test]
+    fn a_pointer_report_is_what_the_mode_asks_for_in_its_encoding() {
+        use Button::*;
+        use MouseTracking::*;
+        let none = PointerModifiers::default();
+        let all = PointerModifiers {
+            shift: true,
+            alt: true,
+            control: true,
+        };
+        let x10 = |event, at, modifiers, tracking| reported(event, at, modifiers, tracking, false);
+        let sgr = |event, at, modifiers, tracking| reported(event, at, modifiers, tracking, true);
+        // Off reports nothing.
+        for event in [
+            Pointer::Press(Left),
+            Pointer::Release(Left),
+            Pointer::Motion(None),
+        ] {
+            assert_eq!(x10(event, (0, 0), none, Off), None);
+        }
+        // Mode 9: presses only, with no modifiers.
+        assert_eq!(
+            x10(Pointer::Press(Middle), (0, 0), all, Press).as_deref(),
+            Some(&b"\x1b[M!!!"[..])
+        );
+        assert_eq!(x10(Pointer::Release(Middle), (0, 0), none, Press), None);
+        // Mode 1000: a release is button 3; modifiers add 4, 8 and 16.
+        assert_eq!(
+            x10(Pointer::Press(Right), (2, 4), all, Click).as_deref(),
+            Some(&b"\x1b[M>%#"[..])
+        );
+        assert_eq!(
+            x10(Pointer::Release(Right), (2, 4), none, Click).as_deref(),
+            Some(&b"\x1b[M#%#"[..])
+        );
+        assert_eq!(x10(Pointer::Motion(Some(Left)), (2, 4), none, Click), None);
+        // Mode 1002: motion with a button held, plus 32; none without.
+        assert_eq!(
+            x10(Pointer::Motion(Some(Left)), (2, 4), none, Drag).as_deref(),
+            Some(&b"\x1b[M@%#"[..])
+        );
+        assert_eq!(x10(Pointer::Motion(None), (2, 4), none, Drag), None);
+        // Mode 1003: motion with no button is 35.
+        assert_eq!(
+            x10(Pointer::Motion(None), (2, 4), none, Motion).as_deref(),
+            Some(&b"\x1b[MC%#"[..])
+        );
+        // The wheel presses and is never released or dragged.
+        assert_eq!(
+            x10(Pointer::Press(WheelDown), (0, 0), none, Click).as_deref(),
+            Some(&b"\x1b[Ma!!"[..])
+        );
+        assert_eq!(x10(Pointer::Release(WheelUp), (0, 0), none, Click), None);
+        assert_eq!(
+            x10(Pointer::Motion(Some(WheelUp)), (0, 0), none, Motion),
+            None
+        );
+        // X10's byte carries a cell up to the 223rd.
+        assert_eq!(
+            x10(Pointer::Press(Left), (222, 222), none, Click).as_deref(),
+            Some(&[0x1b, b'[', b'M', b' ', 255, 255][..])
+        );
+        assert_eq!(x10(Pointer::Press(Left), (0, 223), none, Click), None);
+        assert_eq!(x10(Pointer::Press(Left), (223, 0), none, Click), None);
+        // SGR spells any cell, keeps a release's button and ends it in m.
+        assert_eq!(
+            sgr(Pointer::Press(Right), (9, 99), all, Click).as_deref(),
+            Some(&b"\x1b[<30;100;10M"[..])
+        );
+        assert_eq!(
+            sgr(Pointer::Release(Right), (9, 99), none, Click).as_deref(),
+            Some(&b"\x1b[<2;100;10m"[..])
+        );
+        assert_eq!(
+            sgr(Pointer::Motion(Some(Middle)), (16_383, 16_383), all, Motion).as_deref(),
+            Some(&b"\x1b[<61;16384;16384M"[..])
+        );
+        assert_eq!(
+            sgr(Pointer::Press(WheelUp), (0, 0), none, Click).as_deref(),
+            Some(&b"\x1b[<64;1;1M"[..])
+        );
+        // Mode 9 reports no wheel, as in xterm.
+        assert_eq!(sgr(Pointer::Press(WheelUp), (0, 0), none, Press), None);
+        assert_eq!(x10(Pointer::Press(WheelDown), (0, 0), none, Press), None);
+        assert_eq!(
+            sgr(Pointer::Press(Left), (usize::MAX, 0), none, Click),
+            None
+        );
+        // A coordinate SGR cannot hold in MAX_REPORT is refused, not cut.
+        assert_eq!(
+            sgr(
+                Pointer::Press(Left),
+                (usize::MAX - 1, usize::MAX - 1),
+                none,
+                Click
+            ),
+            None
+        );
+    }
 
     fn normal(chord: &str) -> Option<Vec<u8>> {
         sequence(chord, Modes::default()).map(|found| found.as_slice().to_vec())

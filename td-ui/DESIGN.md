@@ -600,8 +600,10 @@ of its own files may name each module.
 - `vt`: `Terminal`, the terminal model with its byte-stream parser (`new`
   at a grid, `feed`, `resize`, the `cell`, `row_text`, `cursor` and `mode`
   reads, `take_replies` one reply at a time and `replies`, `ring` and
-  `take_bell` for the coalesced bell, the history reads and `scrollback`),
-  `Cell`, `Attributes`, `Color`, `MAX_DIMENSION`, and `selftest`. Pure; its
+  `take_bell` for the coalesced bell, the history reads and `scrollback`,
+  and `mouse`, the pointer reporting the child asked for), `MouseMode`
+  with `MouseTracking`, `Cell`, `Attributes`, `Color`, `MAX_DIMENSION`,
+  and `selftest`. Pure; its
   specification, `vt_spec.rs`, runs the native corpus under `spec/vt`.
 - `vt_render`: `Palette` (`pinned`, foot's with its own default ink),
   `Snapshot` (`new` with focus and bell, `with_cursor`, `scrolled_back`,
@@ -620,10 +622,14 @@ of its own files may name each module.
 - `vt_keys`: `action(chord, modes, viewing)`, which routes one chord as the
   keymap spells it to `Action::Bytes` with a bounded `Sequence`,
   `Action::Scroll` with a `Scroll`, or `Action::Silent`; `sequence`, the
-  bytes alone; `Modes`; `Viewport` with `Scrollback`, the scrollback view
-  anchored to a line; `InputQueue`, the whole-or-nothing keyboard queue;
-  `MAX_SEQUENCE`, `MAX_INPUT_BYTES`, and `selftest`. Pure and
-  keymap-independent: it knows chords, never keycodes.
+  bytes alone; `Modes`; `report`, the pointer's report of a `Pointer`
+  (a press, release or motion of a `Button`) at a cell with its
+  `PointerModifiers` under a `vt::MouseMode`, a bounded `Report` of at
+  most `MAX_REPORT` bytes in X10's or SGR's encoding; `Viewport` with
+  `Scrollback`, the scrollback view anchored to a line; `InputQueue`, the
+  whole-or-nothing queue both encoders feed; `MAX_SEQUENCE`,
+  `MAX_INPUT_BYTES`, and `selftest`. Pure and keymap-independent: it
+  knows chords, never keycodes, and cells, never pixels.
 - `vt_terminfo`: `parse` of the capability source into an `Entry` of
   `Capability` values, `compile` to the legacy binary format, `decode` back
   to `Decoded`, `entry` (the compiled `td-term` entry), `INSTALL_PATH`

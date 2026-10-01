@@ -924,6 +924,32 @@ impl Utf8Decoder {
     }
 }
 
+/// Which pointer events the child asked to have reported (DEC private modes
+/// 9, 1000, 1002 and 1003). Setting one replaces whichever was set; resetting
+/// the one that is set turns reporting off, and resetting another does
+/// nothing, as in foot; xterm turns reporting off on any such reset.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MouseTracking {
+    #[default]
+    Off,
+    /// Mode 9, X10's: presses only, with no modifiers.
+    Press,
+    /// Mode 1000: presses and releases.
+    Click,
+    /// Mode 1002: presses, releases, and motion while a button is held.
+    Drag,
+    /// Mode 1003: presses, releases, and all motion.
+    Motion,
+}
+
+/// The pointer reporting the child asked for: which events, and whether in
+/// SGR's encoding (mode 1006) rather than X10's single bytes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MouseMode {
+    pub tracking: MouseTracking,
+    pub sgr: bool,
+}
+
 /// What one boundary in `reply_ends` costs, charged against td-term/DESIGN.md §2's reply
 /// ceiling beside the bytes it delimits.
 const REPLY_OVERHEAD: usize = std::mem::size_of::<usize>();
@@ -941,6 +967,7 @@ pub struct Terminal {
     cursor_visible: bool,
     application_cursor: bool,
     bracketed_paste: bool,
+    mouse: MouseMode,
     g0: Charset,
     g1: Charset,
     use_g1: bool,
@@ -970,6 +997,7 @@ impl Terminal {
             cursor_visible: true,
             application_cursor: false,
             bracketed_paste: false,
+            mouse: MouseMode::default(),
             g0: Charset::Ascii,
             g1: Charset::Ascii,
             use_g1: false,
@@ -1082,11 +1110,21 @@ impl Terminal {
             "alternate-screen" => Some(self.alternate_active),
             "application-cursor" => Some(self.application_cursor),
             "bracketed-paste" => Some(self.bracketed_paste),
+            "mouse-press" => Some(self.mouse.tracking == MouseTracking::Press),
+            "mouse-click" => Some(self.mouse.tracking == MouseTracking::Click),
+            "mouse-drag" => Some(self.mouse.tracking == MouseTracking::Drag),
+            "mouse-motion" => Some(self.mouse.tracking == MouseTracking::Motion),
+            "mouse-sgr" => Some(self.mouse.sgr),
             "autowrap" => Some(self.auto_wrap),
             "cursor-visible" => Some(self.cursor_visible),
             "origin" => Some(self.origin_mode),
             _ => None,
         }
+    }
+
+    /// The pointer reporting the child asked for.
+    pub fn mouse(&self) -> MouseMode {
+        self.mouse
     }
 
     #[cfg(test)]
@@ -1785,6 +1823,11 @@ impl Terminal {
             match csi.value(index, 0) {
                 1 => self.application_cursor = enabled,
                 2004 => self.bracketed_paste = enabled,
+                9 => self.track_mouse(MouseTracking::Press, enabled),
+                1000 => self.track_mouse(MouseTracking::Click, enabled),
+                1002 => self.track_mouse(MouseTracking::Drag, enabled),
+                1003 => self.track_mouse(MouseTracking::Motion, enabled),
+                1006 => self.mouse.sgr = enabled,
                 6 => {
                     self.origin_mode = enabled;
                     let row = if enabled { self.screen().scroll_top } else { 0 };
@@ -1800,6 +1843,14 @@ impl Terminal {
                 1049 => self.set_alternate(enabled),
                 _ => {}
             }
+        }
+    }
+
+    fn track_mouse(&mut self, tracking: MouseTracking, enabled: bool) {
+        if enabled {
+            self.mouse.tracking = tracking;
+        } else if self.mouse.tracking == tracking {
+            self.mouse.tracking = MouseTracking::Off;
         }
     }
 
@@ -1877,6 +1928,7 @@ impl Terminal {
         self.cursor_visible = true;
         self.application_cursor = false;
         self.bracketed_paste = false;
+        self.mouse = MouseMode::default();
         self.g0 = Charset::Ascii;
         self.g1 = Charset::Ascii;
         self.use_g1 = false;

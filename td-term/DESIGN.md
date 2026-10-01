@@ -86,8 +86,12 @@ for td's shell and userland. It implements:
   the 16-color palette, indexed 256 colors, and 24-bit colors;
 - normal and application cursor keys, primary device attributes, cursor
   position reports, and the replies required by the claimed profile;
-- DEC cursor preservation for mode 1048 and alternate-screen mode 1049; and
-- bracketed-paste mode 2004, initially disabled and cleared by terminal reset.
+- DEC cursor preservation for mode 1048 and alternate-screen mode 1049;
+- bracketed-paste mode 2004, initially disabled and cleared by terminal
+  reset; and
+- pointer reporting: tracking modes 9, 1000, 1002 and 1003 and SGR's
+  encoding, mode 1006, each initially off and cleared by terminal reset,
+  reported as §3 says.
 
 UTF-8 scalars are initially single-cell glyphs. Wide cells, combining
 sequences, grapheme clustering, bidi, shaping, and emoji presentation require
@@ -104,10 +108,13 @@ The initial cursor is steady rather than clock-blinking. Shift+PageUp and
 Shift+PageDown navigate scrollback. Ordinary text input returns to the live
 bottom. An unmodified End key is consumed for the same purpose while viewing
 scrollback and is forwarded in the selected cursor-key mode at the live
-bottom. Mouse reporting, hyperlinks, images, sixel, ligatures, search, and
-shell integration are deferred. Pointer selection, the wheel, the core
-data-device clipboard and the primary selection are specified in §3. A
-protocol is not parsed merely because another terminal implements it.
+bottom. Hyperlinks, images, sixel, ligatures, search, and shell
+integration are deferred, as are the pointer's other encodings (UTF-8's
+1005 and urxvt's 1015), focus reports (1004) and the alternate screen's
+wheel as arrow keys (1007). Pointer selection and reporting, the wheel,
+the core data-device clipboard and the primary selection are specified in
+§3. A protocol is not parsed merely because another terminal implements
+it.
 
 Unsupported CSI operations are ignored as complete sequences. OSC, DCS, SOS,
 APC, and PM strings enter allocation-free streaming ignore states and cannot
@@ -615,6 +622,41 @@ exits, at the rate a person clicks. td-term's environment in the image
 carries no `BROWSER` and the image has no `xdg-open`, so until
 APPLICATIONS.md §W.6's `OpenURI` opener lands a followed link rings the
 bell there; in a session whose environment names a browser it opens.
+
+The child can ask for the pointer (§2). Setting tracking mode 9, 1000,
+1002 or 1003 replaces whichever was set, and resetting the one that is set
+turns reporting off; resetting another does nothing, as in foot (xterm
+turns reporting off on any such reset). While a mode is set and the view
+is the live screen -- a view scrolled back into history shows cells the
+child cannot address -- a press of the left, middle or right button is
+the child's, not a selection, a paste or a followed link, unless Shift is
+held or td-term's own drag is under way: Shift keeps a gesture td-term's,
+as foot's selection override does, so text can still be selected over a
+program that takes the pointer. A press the child took is its gesture to
+the end, so neither side sees a button stuck down: the release is the
+child's whatever is held or shown by then, or absorbed if the child has
+since stopped asking, and leaving the surface releases every button the
+child was told is down, at the last cell it was told of. Motion is
+reported once each cell the pointer enters, at the live screen: under
+mode 1002 or 1003 while a reported button is held, Shift or not, and
+under 1003 with none held, but not under Shift; never during td-term's
+own drag. A dropped motion report does not ring. The wheel is the
+child's too, unless Shift is held, the view is scrolled back, or mode 9
+is set, which reports presses alone and no wheel, as in xterm: a wheel
+press for every three rows, a smooth wheel's remainder carried to the
+next frame (and dropped when td-term keeps the wheel or the pointer
+leaves), at most ten a frame, rather than moving the view. Reports are
+`vt_keys::report`'s: the button 0, 1 or 2 for left, middle and right, 64
+and 65 for the wheel up and down, and 3 for motion with no button and
+for an X10 release, motion adding 32 and Shift, Alt and Control 4, 8 and
+16 (none under mode 9); X10's encoding is `CSI M` and the button, column
+and row each plus 32 in one byte, the cell one-based, which cannot name a
+cell past the 223rd and then sends nothing, as foot does; SGR's is
+`CSI <` and the three in decimal ending in `M`, or `m` for a release,
+which keeps its button. Every report takes the keyboard's queue, admitted
+whole or (but for motion) rung for. The entry's `kmous` is X10's prefix,
+`\E[M`, which is what tells ncurses the terminal reports the pointer as
+xterm does; ncurses then sets mode 1000 itself.
 
 `C-S-c` -- the chord exactly, so an added Alt makes it another chord -- is a
 td-term command, not PTY input and not a repeat candidate. With a selection
@@ -1174,7 +1216,7 @@ The native language has stable case identifiers and a deliberately small
 vocabulary:
 
 - `case`, `source`, `tags`, `size`, and `end`;
-- `write`, `resize`, and `key` operations; and
+- `write`, `resize`, `key`, and `pointer` operations; and
 - `expect` statements for rows, imported text and glyph observations, cells,
   cursor, modes, cumulative terminal replies, cumulative keyboard input,
   history, the scrollback viewport, and an optional rendered PPM -- the last
@@ -1221,8 +1263,22 @@ A `key` case therefore observes the whole path a press takes on td, keymap
 included, and a press the keymap refuses (Super held) or a key the encoder
 does not translate contributes no bytes rather than being a corpus error.
 
-Feature tags distinguish deliberate profile exclusions such as mouse or
-double-width cells from missing behavior inside the first profile. A generated
+A `pointer` operation names what the pointer did (`press`, `release` or
+`motion`), modifiers and a button joined as a key's are (`ctrl+left`,
+`wheel-up`, `none` for motion with nothing held), and the zero-based row
+and column, and runs `vt_keys::report` at the pointer reporting the case
+has reached. Its report joins the same input stream a `key`'s bytes do,
+so an `expect input` observes both, and a pointer event the mode does not
+report contributes nothing.
+
+Feature tags distinguish deliberate profile exclusions such as
+double-width cells from missing behavior inside the first profile. An
+exclusion's reason is the one the pinned migration report recorded, and a
+later landing does not rewrite it: the imported libvterm pointer cases
+still read "mouse input is outside the first profile", as its selection
+cases still read that selection is, because the importer does not convert
+libvterm's pointer calls to the `pointer` operation. td-authored `mouse`
+cases carry the pointer claim instead. A generated
 `expectations.txt` records in-profile known failures by case and expectation,
 so another observation cannot regress behind an existing failure. Every
 in-profile case still runs. An unlisted failure, unexpected pass, stale entry,
@@ -1291,9 +1347,11 @@ terminal, and td-term's prove the program:
 - exact model-renderer PPM goldens pass, beside the structural rendition,
   palette, cursor, selection, bell-ring, and viewport assertions
   (`vt_render_spec.rs`);
-- the encoder spells every chord in §3's table, the viewport moves, clamps,
-  and survives eviction and clears as specified, and the input queue admits
-  or drops a sequence whole (`vt_keys.rs`);
+- the encoder spells every chord in §3's table, the pointer's reports are
+  what each mode asks for in each encoding, bounded to what X10's byte
+  carries, the viewport moves, clamps, and survives eviction and clears as
+  specified, and the input queue admits or drops a sequence whole
+  (`vt_keys.rs`);
 - the compiled `td-term` terminfo entry decodes to exactly the capabilities
   exercised by the native corpus, its key capabilities are the encoder's
   bytes, and each capability that shares a case has an effect check
@@ -1322,6 +1380,13 @@ terminal, and td-term's prove the program:
   press and does nothing without one;
   waits for the proof's sync on the live source; rings for a paste with
   nothing offered and receives a selected offer over a fresh endpoint;
+  reports presses, releases, the wheel in carried, bounded notches and
+  motion once a cell to a child that asks, keeping presses, buttonless
+  motion and the wheel td-term's under Shift, a scrolled-back view or its
+  own drag, and the wheel under mode 9; sends a reported press's release
+  to the child wherever the view is, absorbs it once the child stops
+  asking, releases reported buttons at the last reported cell on leave,
+  and drops a motion report the full queue refuses without ringing;
   lays and hit-tests its grid on its cell, adopting a new one as a resize
   and keeping the scrolling margins when the grid is unchanged; bounds its
   fallback grid to the raster's ceilings; does nothing for a font chord

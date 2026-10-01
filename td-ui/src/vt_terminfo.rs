@@ -209,6 +209,10 @@ str kf9    \E[20~   input/function-keys
 str kf10   \E[21~   input/function-keys
 str kf11   \E[23~   input/function-keys
 str kf12   \E[24~   input/function-keys
+
+# The pointer: X10's report prefix, which tells ncurses the terminal reports
+# the mouse as xterm does; ncurses then sets mode 1000 itself.
+str kmous  \E[M     input/pointer-reports-follow-the-mode
 "#;
 
 /// The legacy binary format. The 32-bit-number format (`0o1036`) exists to
@@ -928,6 +932,25 @@ mod tests {
             );
         }
         assert_eq!(string(&entry, "kcbt"), send("S-Tab", plain));
+        // kmous is the prefix of every X10 report, which the pointer's
+        // encoder writes under mode 1000.
+        let mode = crate::vt::MouseMode {
+            tracking: crate::vt::MouseTracking::Click,
+            sgr: false,
+        };
+        for event in [
+            keys::Pointer::Press(keys::Button::Left),
+            keys::Pointer::Release(keys::Button::Right),
+            keys::Pointer::Press(keys::Button::WheelUp),
+        ] {
+            let report = keys::report(event, (4, 9), keys::PointerModifiers::default(), mode)
+                .expect("reported");
+            assert_eq!(
+                report.as_slice().get(..3),
+                Some(string(&entry, "kmous").as_slice()),
+                "{event:?}"
+            );
+        }
         for number in 1..=12 {
             let key = format!("F{number}");
             assert_eq!(

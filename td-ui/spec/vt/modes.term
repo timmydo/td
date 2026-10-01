@@ -78,3 +78,30 @@ write b"\e[?1049h\e[3J"
 expect mode alternate-screen on
 expect history 0
 end
+
+# The four tracking modes replace each other, and resetting one that is not
+# set leaves the one that is, as in foot (xterm turns reporting off on any
+# such reset); SGR's encoding is separate, and a reset clears both.
+case modes/mouse-tracking-replaces-and-resets
+source td
+tags core modes mouse
+size 1 4
+write b"\e[?1000h"
+expect mode mouse-click on
+write b"\e[?1002h"
+expect mode mouse-drag on
+expect mode mouse-click off
+write b"\e[?1000l"
+expect mode mouse-drag on
+write b"\e[?1002l"
+expect mode mouse-drag off
+write b"\e[?9;1006h"
+expect mode mouse-press on
+expect mode mouse-sgr on
+write b"\e[?1003h"
+expect mode mouse-motion on
+expect mode mouse-press off
+write b"\ec"
+expect mode mouse-motion off
+expect mode mouse-sgr off
+end

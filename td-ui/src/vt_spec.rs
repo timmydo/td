@@ -164,6 +164,59 @@ fn td_keymap() -> &'static Keymap {
     })
 }
 
+/// `press ctrl+left 2 5` and friends: what the pointer did (`press`,
+/// `release` or `motion`), modifiers then a button (`left`, `middle`,
+/// `right`, `wheel-up`, `wheel-down`, or `none` for motion with no button
+/// held), then the zero-based row and column it did it at.
+fn parse_pointer(text: &str) -> Result<Step, String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let [event, chord, row, column] = words.as_slice() else {
+        return Err(format!(
+            "pointer '{text}' needs an event, a button, a row and a column"
+        ));
+    };
+    let mut modifiers = keys::PointerModifiers::default();
+    let mut parts = chord.split('+').peekable();
+    let mut button = None;
+    while let Some(part) = parts.next() {
+        let slot = match part {
+            "shift" => &mut modifiers.shift,
+            "alt" => &mut modifiers.alt,
+            "ctrl" => &mut modifiers.control,
+            _ if parts.peek().is_none() => {
+                button = Some(part);
+                continue;
+            }
+            _ => return Err(format!("pointer chord '{chord}' has an unknown modifier")),
+        };
+        if *slot {
+            return Err(format!("pointer chord '{chord}' repeats a modifier"));
+        }
+        *slot = true;
+    }
+    let button = match button.ok_or_else(|| format!("pointer chord '{chord}' names no button"))? {
+        "left" => Some(keys::Button::Left),
+        "middle" => Some(keys::Button::Middle),
+        "right" => Some(keys::Button::Right),
+        "wheel-up" => Some(keys::Button::WheelUp),
+        "wheel-down" => Some(keys::Button::WheelDown),
+        "none" => None,
+        other => return Err(format!("unknown pointer button '{other}'")),
+    };
+    let pointer = match (*event, button) {
+        ("press", Some(button)) => keys::Pointer::Press(button),
+        ("release", Some(button)) => keys::Pointer::Release(button),
+        ("motion", button) => keys::Pointer::Motion(button),
+        _ => return Err(format!("pointer '{text}' is not an event a button has")),
+    };
+    let at = |value: &str| {
+        value
+            .parse::<usize>()
+            .map_err(|_| format!("pointer cell '{value}' is not a number"))
+    };
+    Ok(Step::Pointer(pointer, (at(row)?, at(column)?), modifiers))
+}
+
 /// `ctrl+alt+a` and friends: modifiers, then one key name.
 fn parse_key(text: &str) -> Result<(u32, u32), String> {
     let mut modifiers = 0u32;
@@ -227,6 +280,7 @@ const KNOWN_TAGS: &[&str] = &[
     "editing",
     "input",
     "modes",
+    "mouse",
     "replies",
     "resize",
     "scrollback",
@@ -251,6 +305,9 @@ enum Step {
     /// One key press through td's keymap and the encoder: evdev code and
     /// real modifier masks.
     Key(u32, u32),
+    /// What the pointer did at a zero-based cell, through the pointer's
+    /// report encoder at the mode the case has reached.
+    Pointer(keys::Pointer, (usize, usize), keys::PointerModifiers),
     Expect(Expectation),
 }
 
@@ -358,7 +415,7 @@ impl CaseBuilder {
                     validate_expectation_bounds(expectation, active_size.0, active_size.1)
                         .map_err(|error| at(file, line, &format!("case {}: {error}", self.id)))?;
                 }
-                Step::Write(_) | Step::Key(_, _) => {}
+                Step::Write(_) | Step::Key(_, _) | Step::Pointer(..) => {}
             }
         }
         Ok(Case {
@@ -780,6 +837,11 @@ fn parse_expectation(file: &str, line: usize, input: &str) -> Result<Expectation
                     | "autowrap"
                     | "cursor-visible"
                     | "origin"
+                    | "mouse-press"
+                    | "mouse-click"
+                    | "mouse-drag"
+                    | "mouse-motion"
+                    | "mouse-sgr"
             ) {
                 return Err(at(file, line, &format!("unknown mode {name:?}")));
             }
@@ -885,6 +947,13 @@ fn parse_file(file: &str, input: &str) -> Result<Vec<Case>, String> {
             let (code, modifiers) =
                 parse_key(chord.trim()).map_err(|error| at(file, line, &error))?;
             builder.steps.push(Step::Key(code, modifiers));
+            builder.operations += 1;
+        } else if let Some(pointer) = text.strip_prefix("pointer ") {
+            if builder.size.is_none() {
+                return Err(at(file, line, "pointer precedes size"));
+            }
+            let step = parse_pointer(pointer.trim()).map_err(|error| at(file, line, &error))?;
+            builder.steps.push(step);
             builder.operations += 1;
         } else if let Some(size) = text.strip_prefix("resize ") {
             if builder.size.is_none() {
@@ -1228,6 +1297,13 @@ fn run_case(case: &Case, chunking: Chunking) -> Result<CaseRun, String> {
                 viewport.apply(&action, terminal.rows(), history);
                 operation += 1;
             }
+            // Read at the mode the child last set, as the key's modes are.
+            Step::Pointer(event, at, modifiers) => {
+                if let Some(report) = keys::report(*event, *at, *modifiers, terminal.mouse()) {
+                    input.extend_from_slice(report.as_slice());
+                }
+                operation += 1;
+            }
             Step::Expect(expected) => {
                 expectation = expectation.saturating_add(1);
                 if let Err(error) = check_expectation(case, &terminal, &input, &viewport, expected)
@@ -1362,7 +1438,7 @@ fn operation_lengths(case: &Case) -> Vec<(usize, usize)> {
                 lengths.push((operation, bytes.len()));
                 operation += 1;
             }
-            Step::Resize(_, _) | Step::Key(_, _) => operation += 1,
+            Step::Resize(_, _) | Step::Key(_, _) | Step::Pointer(..) => operation += 1,
             Step::Expect(_) => {}
         }
     }
@@ -1485,7 +1561,7 @@ fn libvterm_migration_is_attributed_and_self_consistent() {
                     awaiting_reply_check = true;
                 }
                 Step::Expect(Expectation::Reply(_)) => awaiting_reply_check = false,
-                Step::Resize(_, _) | Step::Key(_, _) | Step::Expect(_) => {}
+                Step::Resize(_, _) | Step::Key(_, _) | Step::Pointer(..) | Step::Expect(_) => {}
             }
         }
         assert!(
@@ -1983,7 +2059,7 @@ fn literal_terminfo_capabilities_appear_in_the_case_they_name() {
     const KEYS: &[&str] = &[
         "kbs", "kcbt", "kcuu1", "kcud1", "kcuf1", "kcub1", "khome", "kend", "kpp", "knp", "kich1",
         "kdch1", "kf1", "kf2", "kf3", "kf4", "kf5", "kf6", "kf7", "kf8", "kf9", "kf10", "kf11",
-        "kf12",
+        "kf12", "kmous",
     ];
     const REPLIES: &[&str] = &["u6", "u8"];
     /// Finals whose parameter names the operation. `m` is here too, but as a

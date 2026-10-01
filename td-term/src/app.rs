@@ -91,7 +91,11 @@ const MAX_CMDLINE_BYTES: usize = 4096;
 const CLIPBOARD_PROOF_CMDLINE_TOKEN: &[u8] = b"td.firefox-input=1";
 
 const LEFT_BUTTON: u32 = 0x110;
+const RIGHT_BUTTON: u32 = 0x111;
 const MIDDLE_BUTTON: u32 = 0x112;
+/// The most wheel reports one pointer frame sends, so a flung trackpad
+/// cannot fill the child's input with them.
+const MAX_WHEEL_REPORTS: usize = 10;
 /// Presses at one cell this close together are one gesture: a second
 /// selects the word, a third the row.
 const MULTI_CLICK_MS: u64 = 500;
@@ -393,6 +397,27 @@ struct Drag {
     released: Option<u32>,
 }
 
+/// The pointer as the child sees it while it asks for reports: which
+/// buttons it was told were pressed, so their releases go to it too; the
+/// cell the last press or motion report named; and the wheel rows not yet
+/// a whole notch.
+#[derive(Default)]
+struct Reported {
+    held: [bool; 3],
+    cell: Option<(usize, usize)>,
+    wheel: isize,
+}
+
+/// A button the child can be told about, and its slot in `Reported::held`.
+fn reported_button(button: u32) -> Option<(keys::Button, usize)> {
+    match button {
+        LEFT_BUTTON => Some((keys::Button::Left, 0)),
+        MIDDLE_BUTTON => Some((keys::Button::Middle, 1)),
+        RIGHT_BUTTON => Some((keys::Button::Right, 2)),
+        _ => None,
+    }
+}
+
 /// The clipboard proof's markers, each said once per condition.
 #[derive(Default)]
 struct Proof {
@@ -443,6 +468,7 @@ pub struct Window {
     viewport: keys::Viewport,
     selection: Option<render::Selection>,
     drag: Drag,
+    reported: Reported,
     wheel: Wheel,
     board: Board,
     proof: Proof,
@@ -504,6 +530,7 @@ impl Window {
             viewport: keys::Viewport::new(),
             selection: None,
             drag: Drag::default(),
+            reported: Reported::default(),
             wheel: Wheel::default(),
             board: Board::default(),
             proof: Proof::default(),
@@ -633,7 +660,203 @@ impl Window {
         Ok(())
     }
 
+    /// The pointer reporting the child asked for, whatever the view.
+    fn asked_mouse_mode(&self) -> Option<td_ui::vt::MouseMode> {
+        let mode = self.model.as_ref()?.mouse();
+        (mode.tracking != td_ui::vt::MouseTracking::Off).then_some(mode)
+    }
+
+    /// The pointer reporting the child asked for, while the view is the
+    /// live screen the child's cells are on.
+    fn mouse_mode(&self) -> Option<td_ui::vt::MouseMode> {
+        let live = !self.viewport.viewing(self.history());
+        self.asked_mouse_mode().filter(|_| live)
+    }
+
+    fn pointer_modifiers(&self) -> keys::PointerModifiers {
+        let held = self.client.input().held();
+        keys::PointerModifiers {
+            shift: held.shift,
+            alt: held.alt,
+            control: held.control,
+        }
+    }
+
+    /// `event`'s report at `cell` under `mode`, if the mode has one.
+    fn report_at(
+        &self,
+        event: keys::Pointer,
+        cell: (usize, usize),
+        mode: td_ui::vt::MouseMode,
+    ) -> Option<keys::Report> {
+        keys::report(event, cell, self.pointer_modifiers(), mode)
+    }
+
+    /// The lowest-numbered button the child was told is down, as xterm
+    /// names the button a motion report carries.
+    fn reported_held(&self) -> Option<keys::Button> {
+        [
+            keys::Button::Left,
+            keys::Button::Middle,
+            keys::Button::Right,
+        ]
+        .into_iter()
+        .zip(self.reported.held)
+        .find_map(|(button, held)| held.then_some(button))
+    }
+
+    /// Releases every button the child was told is down, at the last cell
+    /// it was told of, unless it has since stopped asking; then forgets
+    /// them. A Leave does this, so a button whose release the compositor
+    /// sends elsewhere is not left down for the child, nor its next motion
+    /// taken for a drag.
+    fn release_reported(&mut self) -> Result<()> {
+        let held = std::mem::take(&mut self.reported.held);
+        let cell = self.reported.cell.take();
+        self.reported.wheel = 0;
+        let (Some(mode), Some(cell)) = (self.asked_mouse_mode(), cell) else {
+            return Ok(());
+        };
+        let buttons = [
+            keys::Button::Left,
+            keys::Button::Middle,
+            keys::Button::Right,
+        ];
+        for (button, held) in buttons.into_iter().zip(held) {
+            if let Some(report) = held
+                .then(|| self.report_at(keys::Pointer::Release(button), cell, mode))
+                .flatten()
+            {
+                self.send(report.as_slice())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The child's half of the pointer, and whether it took `event`. A
+    /// press is the child's while it asks for reports at the live screen,
+    /// unless Shift is held, which keeps the gesture td-term's, or
+    /// td-term's own drag is under way. A press the child took is its
+    /// gesture to the end: its release is the child's whatever is held or
+    /// shown by then, absorbed if the child has since stopped asking, and
+    /// motion while it is held is reported at the live screen under 1002
+    /// and 1003. Buttonless motion is reported under 1003 alone, not under
+    /// Shift. No motion is reported during td-term's own drag, and each
+    /// report names a cell once. Motion still moves the pointer td-term
+    /// tracks, and a Leave goes on to td-term's handler too.
+    fn report_pointer(&mut self, event: &pointer::Event) -> Result<bool> {
+        match *event {
+            pointer::Event::Button {
+                button, pressed, ..
+            } => {
+                let Some((button, slot)) = reported_button(button) else {
+                    return Ok(false);
+                };
+                if !pressed {
+                    let Some(held) = self.reported.held.get_mut(slot).filter(|held| **held) else {
+                        return Ok(false);
+                    };
+                    *held = false;
+                    let release = self
+                        .asked_mouse_mode()
+                        .zip(self.cell_at(self.drag.position))
+                        .and_then(|(mode, cell)| {
+                            self.report_at(keys::Pointer::Release(button), cell, mode)
+                        });
+                    if let Some(report) = release {
+                        self.send(report.as_slice())?;
+                    }
+                    return Ok(true);
+                }
+                let (Some(mode), Some(cell)) =
+                    (self.mouse_mode(), self.cell_at(self.drag.position))
+                else {
+                    return Ok(false);
+                };
+                if self.pointer_modifiers().shift || self.drag.left_down {
+                    return Ok(false);
+                }
+                if let Some(held) = self.reported.held.get_mut(slot) {
+                    *held = true;
+                }
+                self.reported.cell = Some(cell);
+                self.drag.last_press = None;
+                if let Some(report) = self.report_at(keys::Pointer::Press(button), cell, mode) {
+                    self.send(report.as_slice())?;
+                }
+                Ok(true)
+            }
+            pointer::Event::Motion(x, y) => {
+                self.drag.position = (x, y);
+                let (Some(mode), Some(cell)) = (self.mouse_mode(), self.cell_at((x, y))) else {
+                    return Ok(false);
+                };
+                let held = self.reported_held();
+                if self.drag.left_down
+                    || (held.is_none() && self.pointer_modifiers().shift)
+                    || Some(cell) == self.reported.cell
+                {
+                    return Ok(false);
+                }
+                if let Some(report) = self.report_at(keys::Pointer::Motion(held), cell, mode) {
+                    self.reported.cell = Some(cell);
+                    // Motion is not worth a bell: a child that is not
+                    // reading would ring it on every cell the pointer
+                    // crossed.
+                    self.input.push(report.as_slice())?;
+                }
+                Ok(false)
+            }
+            pointer::Event::Leave(_) => {
+                self.release_reported()?;
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// A frame's wheel rows as the child's wheel presses, one for every
+    /// three rows, the remainder carried to the next frame so a smooth
+    /// wheel reports at a notched one's rate, at most `MAX_WHEEL_REPORTS`
+    /// a frame. The wheel is td-term's under Shift, while the view is
+    /// scrolled back, and under mode 9, which reports presses alone.
+    fn report_wheel(&mut self, rows: isize) -> Result<bool> {
+        let taken = self
+            .mouse_mode()
+            .zip(self.cell_at(self.drag.position))
+            .filter(|(mode, _)| {
+                !self.pointer_modifiers().shift && mode.tracking != td_ui::vt::MouseTracking::Press
+            });
+        // A wheel td-term keeps ends the child's: its remainder is not
+        // carried into the next notch the child hears.
+        let Some((mode, cell)) = taken else {
+            self.reported.wheel = 0;
+            return Ok(false);
+        };
+        if self.reported.wheel.signum() != rows.signum() {
+            self.reported.wheel = 0;
+        }
+        self.reported.wheel = self.reported.wheel.saturating_add(rows);
+        let notches = self.reported.wheel / 3;
+        self.reported.wheel %= 3;
+        let button = if notches < 0 {
+            keys::Button::WheelUp
+        } else {
+            keys::Button::WheelDown
+        };
+        let Some(report) = self.report_at(keys::Pointer::Press(button), cell, mode) else {
+            return Ok(true);
+        };
+        for _ in 0..notches.unsigned_abs().min(MAX_WHEEL_REPORTS) {
+            self.send(report.as_slice())?;
+        }
+        Ok(true)
+    }
+
     fn pointer(&mut self, event: pointer::Event) -> Result<()> {
+        if self.report_pointer(&event)? {
+            return Ok(());
+        }
         match event {
             pointer::Event::Enter { x, y, .. } => self.drag.position = (x, y),
             pointer::Event::Motion(x, y) => {
@@ -717,7 +940,7 @@ impl Window {
                     }
                 }
                 let (rows, _) = self.wheel.frame();
-                if rows != 0 {
+                if rows != 0 && !self.report_wheel(rows)? {
                     // Positive is toward the live bottom, so it scrolls
                     // forward; a wheel turned away goes back into history.
                     let lines = i32::try_from(rows.saturating_neg()).unwrap_or(if rows < 0 {
@@ -1592,6 +1815,7 @@ impl App for Window {
                 }
                 if !pointer {
                     self.drag = Drag::default();
+                    self.reported = Reported::default();
                 }
             }
             Handled::SeatRemoved => {
@@ -2506,6 +2730,372 @@ mod tests {
         press(&mut window, 30);
         assert!(!window.viewport.viewing(window.history()));
         assert_eq!(window.input.take_for_test(), b"a");
+    }
+
+    /// The pointer at cell (row, column), a frame closing the move.
+    fn hover(window: &mut Window, row: u32, column: u32) {
+        window
+            .event(message(
+                POINTER,
+                2,
+                &[0, column * 8 * 256 + 128, row * 16 * 256 + 128],
+            ))
+            .unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+    }
+
+    /// One button's press or release, and its frame.
+    fn button(window: &mut Window, button: u32, pressed: bool) {
+        window
+            .event(message(POINTER, 3, &[7, 0, button, u32::from(pressed)]))
+            .unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+    }
+
+    /// While the child asks for reports, its presses and releases are
+    /// reported at the pointer's cell rather than selecting, pasting or
+    /// following a link, and the wheel is its wheel; once it stops asking
+    /// they are td-term's again.
+    #[test]
+    fn the_child_hears_the_pointer_while_it_asks_for_reports() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window
+            .output(b"see https://e.example/x\x1b[?1000h")
+            .unwrap();
+        hover(&mut window, 0, 0);
+        button(&mut window, LEFT_BUTTON, true);
+        hover(&mut window, 0, 6);
+        button(&mut window, LEFT_BUTTON, false);
+        assert_eq!(window.input.take_for_test(), b"\x1b[M !!\x1b[M#'!");
+        assert_eq!(window.selection, None);
+        // Middle and right, with Control over the link: reported, so
+        // nothing is pasted and no link opens.
+        modifiers(&mut window, CONTROL);
+        hover(&mut window, 0, 8);
+        button(&mut window, MIDDLE_BUTTON, true);
+        button(&mut window, MIDDLE_BUTTON, false);
+        button(&mut window, RIGHT_BUTTON, true);
+        button(&mut window, RIGHT_BUTTON, false);
+        modifiers(&mut window, 0);
+        assert_eq!(
+            window.input.take_for_test(),
+            b"\x1b[M1)!\x1b[M3)!\x1b[M2)!\x1b[M3)!"
+        );
+        assert!(!bell(&mut window), "no link was followed");
+        assert!(window.board.incoming.is_none(), "nothing was pasted");
+        // A notch of the wheel each way, the view unmoved.
+        history(&mut window);
+        window
+            .event(message(POINTER, 8, &[0, (-1i32) as u32]))
+            .unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        window.event(message(POINTER, 8, &[0, 2])).unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        assert_eq!(window.input.take_for_test(), b"\x1b[M`)!\x1b[Ma)!\x1b[Ma)!");
+        assert_eq!(window.viewport.offset(window.history()), 0);
+        // Reset: the press selects again and the wheel scrolls.
+        window.output(b"\x1b[?1000l").unwrap();
+        hover(&mut window, 0, 0);
+        button(&mut window, LEFT_BUTTON, true);
+        hover(&mut window, 0, 3);
+        button(&mut window, LEFT_BUTTON, false);
+        assert!(window.input.take_for_test().is_empty());
+        assert!(window.selection.is_some());
+        window
+            .event(message(POINTER, 8, &[0, (-1i32) as u32]))
+            .unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        assert_eq!(window.viewport.offset(window.history()), 3);
+    }
+
+    /// Shift keeps a gesture td-term's, as foot's selection override does,
+    /// and so does a view scrolled back off the child's screen; a reported
+    /// press's release is the child's whatever is held by then.
+    #[test]
+    fn shift_and_a_scrolled_view_keep_the_pointer_td_terms() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.output(b"Welcome\x1b[?1002h").unwrap();
+        modifiers(&mut window, SHIFT);
+        hover(&mut window, 0, 0);
+        button(&mut window, LEFT_BUTTON, true);
+        hover(&mut window, 0, 6);
+        button(&mut window, LEFT_BUTTON, false);
+        assert!(window.input.take_for_test().is_empty());
+        assert_eq!(window.selected_text().unwrap().as_deref(), Some("Welcome"));
+        modifiers(&mut window, 0);
+        // Pressed plainly, released with Shift: both the child's.
+        button(&mut window, LEFT_BUTTON, true);
+        modifiers(&mut window, SHIFT);
+        button(&mut window, LEFT_BUTTON, false);
+        modifiers(&mut window, 0);
+        assert_eq!(window.input.take_for_test(), b"\x1b[M '!\x1b[M''!");
+        // Scrolled back, a press selects rather than reports.
+        history(&mut window);
+        modifiers(&mut window, SHIFT);
+        press(&mut window, 104);
+        modifiers(&mut window, 0);
+        assert!(window.viewport.viewing(window.history()));
+        button(&mut window, LEFT_BUTTON, true);
+        button(&mut window, LEFT_BUTTON, false);
+        assert!(window.input.take_for_test().is_empty());
+    }
+
+    /// Mode 1002 reports motion with a reported button held, once a cell;
+    /// 1003 reports it with none held too, but not under Shift; neither
+    /// reports motion within a cell.
+    #[test]
+    fn motion_is_reported_once_a_cell_as_the_mode_asks() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.output(b"\x1b[?1002;1006h").unwrap();
+        hover(&mut window, 1, 1);
+        assert!(window.input.take_for_test().is_empty(), "no button held");
+        button(&mut window, LEFT_BUTTON, true);
+        window
+            .event(message(POINTER, 2, &[0, 8 * 256 + 200, 16 * 256 + 200]))
+            .unwrap();
+        hover(&mut window, 1, 2);
+        hover(&mut window, 2, 2);
+        button(&mut window, LEFT_BUTTON, false);
+        assert_eq!(
+            window.input.take_for_test(),
+            b"\x1b[<0;2;2M\x1b[<32;3;2M\x1b[<32;3;3M\x1b[<0;3;3m"
+        );
+        // Middle and right drag as themselves, Shift included: the gesture
+        // is the child's.
+        button(&mut window, MIDDLE_BUTTON, true);
+        modifiers(&mut window, SHIFT);
+        hover(&mut window, 2, 3);
+        modifiers(&mut window, 0);
+        button(&mut window, MIDDLE_BUTTON, false);
+        button(&mut window, RIGHT_BUTTON, true);
+        hover(&mut window, 2, 4);
+        button(&mut window, RIGHT_BUTTON, false);
+        assert_eq!(
+            window.input.take_for_test(),
+            b"\x1b[<1;3;3M\x1b[<37;4;3M\x1b[<1;4;3m\x1b[<2;4;3M\x1b[<34;5;3M\x1b[<2;5;3m"
+        );
+        window.output(b"\x1b[?1003h").unwrap();
+        hover(&mut window, 4, 5);
+        hover(&mut window, 4, 5);
+        modifiers(&mut window, SHIFT);
+        hover(&mut window, 5, 5);
+        modifiers(&mut window, 0);
+        assert_eq!(window.input.take_for_test(), b"\x1b[<35;6;5M");
+    }
+
+    /// A reported press is the child's gesture to its end: its release is
+    /// the child's though the view has scrolled back meanwhile, and is
+    /// absorbed, rather than ending a selection, once the child has
+    /// stopped asking.
+    #[test]
+    fn a_reported_press_is_released_to_the_child_wherever_the_view_is() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        history(&mut window);
+        window.output(b"\x1b[?1000h").unwrap();
+        hover(&mut window, 0, 0);
+        button(&mut window, LEFT_BUTTON, true);
+        modifiers(&mut window, SHIFT);
+        press(&mut window, 104);
+        modifiers(&mut window, 0);
+        assert!(window.viewport.viewing(window.history()));
+        button(&mut window, LEFT_BUTTON, false);
+        assert_eq!(window.input.take_for_test(), b"\x1b[M !!\x1b[M#!!");
+        // Back at the live screen: the child stops asking mid-press, and
+        // the release is absorbed, leaving a selection made since then
+        // untouched.
+        press(&mut window, 107);
+        assert!(!window.viewport.viewing(window.history()));
+        button(&mut window, LEFT_BUTTON, true);
+        assert_eq!(window.input.take_for_test(), b"\x1b[M !!");
+        window.output(b"\x1b[?1000l").unwrap();
+        let selected = selection((0, 0), (0, 1));
+        window.selection = selected;
+        hover(&mut window, 0, 4);
+        button(&mut window, LEFT_BUTTON, false);
+        assert!(window.input.take_for_test().is_empty());
+        assert_eq!(window.selection, selected);
+        assert!(!window.drag.left_down);
+    }
+
+    /// Leaving releases what the child was told is down, at the last cell
+    /// it was told of, so re-entering is not a drag and a selection after
+    /// it is td-term's.
+    #[test]
+    fn leaving_releases_the_reported_buttons() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.output(b"Welcome\x1b[?1002h").unwrap();
+        hover(&mut window, 0, 2);
+        button(&mut window, RIGHT_BUTTON, true);
+        window.event(message(POINTER, 1, &[8, SURFACE])).unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        assert_eq!(window.input.take_for_test(), b"\x1b[M\"#!\x1b[M##!");
+        window
+            .event(message(POINTER, 0, &[9, SURFACE, 128, 128]))
+            .unwrap();
+        hover(&mut window, 0, 5);
+        assert!(window.input.take_for_test().is_empty(), "not a drag");
+        modifiers(&mut window, SHIFT);
+        hover(&mut window, 0, 0);
+        button(&mut window, LEFT_BUTTON, true);
+        hover(&mut window, 0, 6);
+        button(&mut window, LEFT_BUTTON, false);
+        modifiers(&mut window, 0);
+        assert!(window.input.take_for_test().is_empty());
+        assert_eq!(window.selected_text().unwrap().as_deref(), Some("Welcome"));
+    }
+
+    /// Leaving releases at the cell the child last heard of, not where
+    /// unreported motion took the pointer since.
+    #[test]
+    fn leaving_releases_at_the_last_cell_the_child_was_told_of() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.output(b"\x1b[?1000h").unwrap();
+        hover(&mut window, 0, 2);
+        button(&mut window, LEFT_BUTTON, true);
+        hover(&mut window, 0, 5);
+        window.event(message(POINTER, 1, &[8, SURFACE])).unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        assert_eq!(window.input.take_for_test(), b"\x1b[M #!\x1b[M##!");
+    }
+
+    /// A motion that sends nothing names no cell: once the child asks for
+    /// drags, motion at the cell the pointer already crossed is reported.
+    /// And a motion report the full queue drops does not ring.
+    #[test]
+    fn unreported_motion_names_no_cell_and_dropped_motion_is_quiet() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.output(b"\x1b[?1000h").unwrap();
+        hover(&mut window, 0, 0);
+        button(&mut window, LEFT_BUTTON, true);
+        hover(&mut window, 0, 1);
+        window.output(b"\x1b[?1002h").unwrap();
+        window
+            .event(message(POINTER, 2, &[0, 8 * 256 + 200, 128]))
+            .unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        assert_eq!(window.input.take_for_test(), b"\x1b[M !!\x1b[M@\"!");
+        button(&mut window, LEFT_BUTTON, false);
+        window.input.take_for_test();
+        window.output(b"\x1b[?1003h").unwrap();
+        assert!(window
+            .input
+            .push(&vec![b'a'; keys::MAX_INPUT_BYTES])
+            .unwrap());
+        hover(&mut window, 3, 3);
+        assert!(!bell(&mut window), "a dropped motion report is quiet");
+    }
+
+    /// td-term's own drag keeps the pointer td-term's until it ends: a
+    /// press of another button is not reported, nor is motion under 1003,
+    /// nor under a mode the child set during it.
+    #[test]
+    fn td_terms_own_drag_keeps_the_pointer() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.output(b"Welcome").unwrap();
+        hover(&mut window, 0, 0);
+        button(&mut window, LEFT_BUTTON, true);
+        window.output(b"\x1b[?1003h").unwrap();
+        hover(&mut window, 0, 3);
+        button(&mut window, RIGHT_BUTTON, true);
+        button(&mut window, RIGHT_BUTTON, false);
+        hover(&mut window, 0, 6);
+        button(&mut window, LEFT_BUTTON, false);
+        assert!(window.input.take_for_test().is_empty());
+        assert_eq!(window.selected_text().unwrap().as_deref(), Some("Welcome"));
+        // The drag over, buttonless motion is the child's again.
+        hover(&mut window, 1, 0);
+        assert_eq!(window.input.take_for_test(), b"\x1b[MC!\"");
+    }
+
+    /// A reported press is no step towards a double click: Shift-clicks
+    /// either side of it at one cell are two single presses.
+    #[test]
+    fn a_reported_press_is_not_counted_towards_a_double_click() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.output(b"Welcome to td\x1b[?1000h").unwrap();
+        hover(&mut window, 0, 2);
+        modifiers(&mut window, SHIFT);
+        button(&mut window, LEFT_BUTTON, true);
+        button(&mut window, LEFT_BUTTON, false);
+        modifiers(&mut window, 0);
+        button(&mut window, LEFT_BUTTON, true);
+        button(&mut window, LEFT_BUTTON, false);
+        modifiers(&mut window, SHIFT);
+        button(&mut window, LEFT_BUTTON, true);
+        button(&mut window, LEFT_BUTTON, false);
+        modifiers(&mut window, 0);
+        assert_eq!(window.selected_text().unwrap(), None, "no word selected");
+    }
+
+    /// The wheel is the child's in notches of three rows, a smooth wheel's
+    /// remainder carried between frames, at most ten a frame; it is
+    /// td-term's under Shift and under mode 9.
+    #[test]
+    fn the_child_hears_the_wheel_in_bounded_notches() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        history(&mut window);
+        window.output(b"\x1b[?1000h").unwrap();
+        let row = 16 * 256;
+        for _ in 0..3 {
+            window.event(message(POINTER, 4, &[0, 0, row])).unwrap();
+            window.event(message(POINTER, 5, &[])).unwrap();
+        }
+        assert_eq!(window.input.take_for_test(), b"\x1b[Ma!!");
+        window.event(message(POINTER, 8, &[0, 20])).unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        assert_eq!(window.input.take_for_test(), b"\x1b[Ma!!".repeat(10));
+        assert_eq!(window.viewport.offset(window.history()), 0);
+        modifiers(&mut window, SHIFT);
+        window
+            .event(message(POINTER, 8, &[0, (-1i32) as u32]))
+            .unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        modifiers(&mut window, 0);
+        assert!(window.input.take_for_test().is_empty());
+        assert_eq!(window.viewport.offset(window.history()), 3);
+        press(&mut window, 107);
+        // Two rows towards a notch, then a Shift wheel td-term keeps: the
+        // next row starts a notch afresh. So does leaving.
+        let rows = |window: &mut Window, count: u32| {
+            window
+                .event(message(POINTER, 4, &[0, 0, count * row]))
+                .unwrap();
+            window.event(message(POINTER, 5, &[])).unwrap();
+        };
+        rows(&mut window, 2);
+        modifiers(&mut window, SHIFT);
+        rows(&mut window, 3);
+        modifiers(&mut window, 0);
+        assert!(!window.viewport.viewing(window.history()));
+        rows(&mut window, 1);
+        assert!(window.input.take_for_test().is_empty());
+        rows(&mut window, 1);
+        window.event(message(POINTER, 1, &[8, SURFACE])).unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        window
+            .event(message(POINTER, 0, &[9, SURFACE, 128, 128]))
+            .unwrap();
+        rows(&mut window, 1);
+        assert!(window.input.take_for_test().is_empty());
+        rows(&mut window, 2);
+        assert_eq!(window.input.take_for_test(), b"\x1b[Ma!!");
+        window.output(b"\x1b[?9h").unwrap();
+        window
+            .event(message(POINTER, 8, &[0, (-1i32) as u32]))
+            .unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        assert!(window.input.take_for_test().is_empty());
+        assert_eq!(window.viewport.offset(window.history()), 3);
     }
 
     #[test]
