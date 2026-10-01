@@ -1000,6 +1000,136 @@ impl Utf8Decoder {
     }
 }
 
+/// The longest query `Terminal::search` takes, in scalars.
+pub const MAX_QUERY: usize = 256;
+
+/// Which way `Terminal::search` looks from where it starts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Toward {
+    Older,
+    Newer,
+}
+
+/// A place in the text `Terminal::search` reads: a line, in a numbering
+/// output does not shift, and a column. Line `pushed - lines + n` is
+/// history line `n` and line `pushed + r` the screen's row `r`, so the
+/// row a view scrolled back `offset` lines shows at its row `v` is line
+/// `pushed - offset + v`.
+pub type Place = (u64, usize);
+
+/// One match, its first and last cells inclusive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Found {
+    pub start: Place,
+    pub end: Place,
+}
+
+/// A search's query: its scalars, folded when it has no uppercase letter.
+struct Query {
+    scalars: Vec<char>,
+    fold: bool,
+}
+
+impl Query {
+    fn new(query: &str) -> Option<Query> {
+        let scalars: Vec<char> = query.chars().take(MAX_QUERY.saturating_add(1)).collect();
+        if scalars.is_empty() || scalars.len() > MAX_QUERY {
+            return None;
+        }
+        let fold = !scalars.iter().any(|scalar| scalar.is_uppercase());
+        let mut query = Query {
+            scalars: Vec::new(),
+            fold,
+        };
+        query.scalars = scalars
+            .into_iter()
+            .map(|scalar| query.fold(scalar))
+            .collect();
+        Some(query)
+    }
+
+    fn fold(&self, scalar: char) -> char {
+        if self.fold {
+            scalar.to_lowercase().next().unwrap_or(scalar)
+        } else {
+            scalar
+        }
+    }
+}
+
+/// The text a search reads, as rows numbered from the oldest: history
+/// while the primary screen is active, then the active screen's rows, all
+/// as wide as the screen.
+struct Searched<'a> {
+    terminal: &'a Terminal,
+    history: usize,
+    first: u64,
+    rows: usize,
+    columns: usize,
+}
+
+impl<'a> Searched<'a> {
+    fn of(terminal: &'a Terminal) -> Self {
+        let history = if terminal.alternate_active {
+            0
+        } else {
+            terminal.history_lines()
+        };
+        Searched {
+            terminal,
+            history,
+            first: terminal
+                .history_pushed()
+                .saturating_sub(u64::try_from(history).unwrap_or(u64::MAX)),
+            rows: history.saturating_add(terminal.rows()),
+            columns: terminal.columns(),
+        }
+    }
+
+    fn place(&self, row: usize) -> u64 {
+        self.first
+            .saturating_add(u64::try_from(row).unwrap_or(u64::MAX))
+    }
+
+    fn row(&self, line: u64) -> Option<usize> {
+        usize::try_from(line.checked_sub(self.first)?)
+            .ok()
+            .filter(|row| *row < self.rows)
+    }
+
+    fn wrapped(&self, row: usize) -> bool {
+        if row < self.history {
+            self.terminal.history_wrapped(row)
+        } else {
+            self.terminal.wrapped(row.saturating_sub(self.history))
+        }
+    }
+
+    fn cell(&self, row: usize, column: usize) -> Option<Cell> {
+        if column >= self.columns {
+            return None;
+        }
+        if row < self.history {
+            self.terminal.history_cell(row, column)
+        } else {
+            self.terminal.cell(row.saturating_sub(self.history), column)
+        }
+    }
+
+    /// Lines as the child wrote them, each the rows a wrap joined.
+    fn lines(&self) -> Vec<(usize, usize)> {
+        let mut lines = Vec::new();
+        let mut start = 0;
+        for row in 0..self.rows {
+            if !self.wrapped(row) || row.saturating_add(1) == self.rows {
+                lines.push((start, row));
+                start = row.saturating_add(1);
+            }
+        }
+        lines
+    }
+}
+
 /// Which pointer events the child asked to have reported (DEC private modes
 /// 9, 1000, 1002 and 1003). Setting one replaces whichever was set; resetting
 /// the one that is set turns reporting off, and resetting another does
@@ -1311,6 +1441,110 @@ impl Terminal {
     /// split and a full-screen program's alternate rows below it.
     pub fn primary_cell(&self, row: usize, column: usize) -> Option<Cell> {
         self.primary.cell(row, column)
+    }
+
+    /// The match of `query` nearest `from` toward older or newer text, not
+    /// at `from` itself; from the newest (or oldest) end when `from` is
+    /// `None`. The text is the active screen and, while that is the
+    /// primary, its history, as wide as the screen: a line runs on across
+    /// the rows the terminal wrapped it over, so a match can span a wrap.
+    /// A query with no uppercase letter matches either case, each scalar
+    /// folded to one, as foot's `towlower` does. An empty query, or one
+    /// past `MAX_QUERY`, matches nothing.
+    pub fn search(&self, query: &str, from: Option<Place>, toward: Toward) -> Option<Found> {
+        let query = Query::new(query)?;
+        let text = Searched::of(self);
+        let lines = text.lines();
+        let width = text.columns.max(1);
+        let mut line_text: Vec<char> = Vec::new();
+        for step in 0..lines.len() {
+            let index = match toward {
+                Toward::Older => lines.len().saturating_sub(step.saturating_add(1)),
+                Toward::Newer => step,
+            };
+            let Some(&(top, bottom)) = lines.get(index) else {
+                continue;
+            };
+            let skip = match (toward, from) {
+                (Toward::Older, Some((line, _))) => text.place(top) > line,
+                (Toward::Newer, Some((line, _))) => text.place(bottom) < line,
+                (_, None) => false,
+            };
+            if skip {
+                continue;
+            }
+            line_text.clear();
+            for row in top..=bottom {
+                for column in 0..text.columns {
+                    let Some(cell) = text.cell(row, column) else {
+                        break;
+                    };
+                    line_text.push(query.fold(cell.scalar));
+                }
+            }
+            // Every row but a line's last is a whole row wide, which is
+            // what a wrap mark requires, so a scalar's place is arithmetic.
+            let place = |at: usize| (text.place(top.saturating_add(at / width)), at % width);
+            let length = query.scalars.len();
+            let mut best: Option<Found> = None;
+            for at in 0..line_text.len().saturating_sub(length.saturating_sub(1)) {
+                if line_text.get(at..at.saturating_add(length)) != Some(query.scalars.as_slice()) {
+                    continue;
+                }
+                let found = Found {
+                    start: place(at),
+                    end: place(at.saturating_add(length).saturating_sub(1)),
+                };
+                let beyond = match (toward, from) {
+                    (Toward::Older, Some(from)) => found.start < from,
+                    (Toward::Newer, Some(from)) => found.start > from,
+                    (_, None) => true,
+                };
+                let better = match (toward, best) {
+                    (_, None) => true,
+                    (Toward::Older, Some(best)) => found.start > best.start,
+                    (Toward::Newer, Some(best)) => found.start < best.start,
+                };
+                if beyond && better {
+                    best = Some(found);
+                }
+            }
+            if best.is_some() {
+                return best;
+            }
+        }
+        None
+    }
+
+    /// Whether `found` still spells `query` where it is: output since it
+    /// was found can have rewritten those cells, or ended the wrap a match
+    /// ran across.
+    pub fn still_matches(&self, query: &str, found: Found) -> bool {
+        let Some(query) = Query::new(query) else {
+            return false;
+        };
+        let text = Searched::of(self);
+        let Some(mut row) = text.row(found.start.0) else {
+            return false;
+        };
+        let mut column = found.start.1;
+        for (index, wanted) in query.scalars.iter().enumerate() {
+            if index > 0 {
+                column = column.saturating_add(1);
+                if column >= text.columns {
+                    if !text.wrapped(row) {
+                        return false;
+                    }
+                    row = row.saturating_add(1);
+                    column = 0;
+                }
+            }
+            match text.cell(row, column) {
+                Some(cell) if query.fold(cell.scalar) == *wanted => {}
+                _ => return false,
+            }
+        }
+        (text.place(row), column) == found.end
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {

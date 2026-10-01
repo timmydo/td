@@ -602,17 +602,20 @@ of its own files may name each module.
   reads, `take_replies` one reply at a time and `replies`, `ring` and
   `take_bell` for the coalesced bell, the history reads and `scrollback`,
   `wrapped`, `primary_wrapped` and `history_wrapped`, which rows an
-  autowrap ended, and `mouse`, the pointer reporting the child asked
-  for), `MouseMode`
-  with `MouseTracking`, `Cell`, `Attributes`, `Color`, `MAX_DIMENSION`,
-  and `selftest`. Pure; its
-  specification, `vt_spec.rs`, runs the native corpus under `spec/vt`.
+  autowrap ended, `search`, the nearest match of a query older or newer
+  than a `Place` as a `Found`, `still_matches`, whether a found match's
+  cells and wraps still spell its query, and `mouse`, the pointer
+  reporting the child asked for), `Toward`, `Place`, `Found`,
+  `MAX_QUERY`, `MouseMode` with `MouseTracking`, `Cell`, `Attributes`,
+  `Color`, `MAX_DIMENSION`, and `selftest`. Pure; its specification,
+  `vt_spec.rs`, runs the native corpus under `spec/vt`.
 - `vt_render`: `Palette` (`pinned`, foot's with its own default ink),
   `Snapshot` (`new` with focus and bell, `with_cursor`, `scrolled_back`,
-  `with_selection`, its reads, `wrapped`, whether a row of the view goes
-  on at the next, and `span` and `select`, a pointer gesture's unit at a
-  cell and its selection from an anchor to an extent, carried across
-  wraps),
+  `with_selection`, `with_status`, a line over the row at an `Edge`, its
+  reads, `wrapped`, whether a row of the view goes on at the next, and
+  `span` and `select`, a pointer gesture's unit at a cell and its
+  selection from an anchor to an extent, carried across wraps), `Edge`
+  (`Top` or `Bottom`),
   `Unit` (a cell, a word or a row) with `WORD_DELIMITERS`, foot's,
   `Cursor`, `Selection`, `render` of a snapshot into a tight XRGB8888
   surface over the bitmap `font::Font`, `render_with`, the same with an

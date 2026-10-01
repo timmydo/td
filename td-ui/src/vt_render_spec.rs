@@ -1189,6 +1189,129 @@ fn a_word_or_row_goes_on_across_a_wrap() {
     );
 }
 
+/// A search steps from match to match, older or newer, through history
+/// and the screen in one numbering; a lowercase query takes either case
+/// and one with a capital only its own; a match runs across a wrap; the
+/// alternate screen is searched alone.
+#[test]
+fn a_search_steps_through_history_and_the_screen() {
+    use crate::vt::{Found, Toward, MAX_QUERY};
+    let mut terminal = Terminal::new(4, 8).unwrap();
+    terminal.feed(b"one Foo\r\ntwo foo\r\nthree\r\nfour foo\r\nxxxxxxfoo");
+    // History: "one Foo", "two foo"; the screen: "three", "four foo",
+    // "xxxxxxfo" wrapped onto "o".
+    assert_eq!(terminal.history_lines(), 2);
+    let pushed = terminal.history_pushed();
+    let first = pushed - 2;
+    let at = |line: u64, column: usize, length: usize| {
+        let mut end = (line, column + length - 1);
+        if end.1 >= 8 {
+            end = (line + 1, end.1 - 8);
+        }
+        Found {
+            start: (line, column),
+            end,
+        }
+    };
+    let search = |query: &str, from, toward| terminal.search(query, from, toward);
+    let newest = search("foo", None, Toward::Older).unwrap();
+    assert_eq!(newest, at(pushed + 2, 6, 3), "across the wrap");
+    let older = search("foo", Some(newest.start), Toward::Older).unwrap();
+    assert_eq!(older, at(pushed + 1, 5, 3));
+    let older = search("foo", Some(older.start), Toward::Older).unwrap();
+    assert_eq!(older, at(first + 1, 4, 3));
+    let oldest = search("foo", Some(older.start), Toward::Older).unwrap();
+    assert_eq!(oldest, at(first, 4, 3), "either case");
+    assert_eq!(search("foo", Some(oldest.start), Toward::Older), None);
+    assert_eq!(
+        search("foo", Some(oldest.start), Toward::Newer),
+        Some(at(first + 1, 4, 3))
+    );
+    assert_eq!(search("foo", None, Toward::Newer), Some(oldest));
+    assert_eq!(search("Foo", None, Toward::Older), Some(oldest), "its case");
+    assert_eq!(search("FOO", None, Toward::Older), None);
+    assert_eq!(search("", None, Toward::Older), None);
+    assert_eq!(
+        search(&"o".repeat(MAX_QUERY + 1), None, Toward::Older),
+        None
+    );
+    // The match a search starts from is not found again, but one starting
+    // a column later is.
+    assert_eq!(
+        search("oo", Some((first, 6)), Toward::Older),
+        Some(at(first, 5, 2))
+    );
+    // The query's bound, on a line long enough to hold a longer one.
+    let mut long = Terminal::new(4, 8).unwrap();
+    long.feed(&[b'o'; 300]);
+    assert!(long
+        .search(&"o".repeat(MAX_QUERY), None, Toward::Older)
+        .is_some());
+    assert_eq!(
+        long.search(&"o".repeat(MAX_QUERY + 1), None, Toward::Older),
+        None
+    );
+    // A match still spells its query until its cells change, or the wrap
+    // it ran across goes.
+    assert!(terminal.still_matches("foo", newest));
+    assert!(!terminal.still_matches("fox", newest));
+    assert!(!terminal.still_matches("foo", at(pushed + 1, 4, 3)));
+    let mut rewritten = Terminal::new(4, 8).unwrap();
+    rewritten.feed(b"xxxxxxfoo");
+    let wrapped = rewritten.search("foo", None, Toward::Older).unwrap();
+    assert!(rewritten.still_matches("foo", wrapped));
+    // The same scalars, the wrap between them gone.
+    rewritten.feed(b"\x1b[2;1H\x1b[Lo");
+    assert_eq!(rewritten.cell(1, 0).map(|cell| cell.scalar), Some('o'));
+    assert!(!rewritten.still_matches("foo", wrapped));
+    // A history line wider than the screen is searched as wide as the
+    // screen shows it.
+    let mut wide = Terminal::new(2, 8).unwrap();
+    wide.feed(b"abcdefgh\r\n\r\n");
+    wide.resize(2, 4).unwrap();
+    assert!(wide.search("ab", None, Toward::Older).is_some());
+    assert_eq!(wide.search("gh", None, Toward::Older), None);
+    let line = wide.history_pushed() - wide.history_lines() as u64;
+    let beyond = Found {
+        start: (line, 6),
+        end: (line, 6),
+    };
+    assert!(!wide.still_matches("g", beyond));
+    // The alternate screen alone.
+    terminal.feed(b"\x1b[?1049h\x1b[Hfoo alt");
+    let search = |query: &str, from, toward| terminal.search(query, from, toward);
+    assert_eq!(
+        search("foo", None, Toward::Older),
+        Some(at(terminal.history_pushed(), 0, 3))
+    );
+    assert_eq!(search("two", None, Toward::Older), None);
+}
+
+/// A status line covers the view's last row, or its first, in inverse
+/// video, cut at its width, and hides the cursor.
+#[test]
+fn a_status_line_covers_the_last_row() {
+    let terminal = screen_of("hello", 6);
+    let view =
+        Snapshot::new(&terminal, true, false).with_status(Some("search: abcdef"), Edge::Bottom);
+    assert_eq!(view.cursor(), None);
+    let row: String = (0..6).map(|column| view.cell(1, column).scalar).collect();
+    assert_eq!(row, "search");
+    assert!(view.cell(1, 0).attributes.inverse);
+    assert_eq!(view.cell(0, 0).scalar, 'h');
+    let view = Snapshot::new(&terminal, true, false).with_status(Some("ab"), Edge::Bottom);
+    assert_eq!(view.cell(1, 4).scalar, ' ');
+    assert!(view.cell(1, 4).attributes.inverse, "to the edge");
+    let view = Snapshot::new(&terminal, true, false).with_status(None, Edge::Bottom);
+    assert!(view.cursor().is_some());
+    // At the top, over the first row, leaving the last.
+    let view = Snapshot::new(&terminal, true, false).with_status(Some("ab"), Edge::Top);
+    assert_eq!(view.cell(0, 0).scalar, 'a');
+    assert!(view.cell(0, 5).attributes.inverse);
+    assert_eq!(view.cell(1, 0).scalar, ' ');
+    assert!(!view.cell(1, 0).attributes.inverse);
+}
+
 #[test]
 fn a_drag_by_unit_keeps_the_anchors_whole_unit_either_way() {
     // one two three

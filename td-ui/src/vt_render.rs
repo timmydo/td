@@ -193,6 +193,13 @@ fn class(scalar: char) -> Class {
     }
 }
 
+/// Which row of the view a status line covers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Edge {
+    Top,
+    Bottom,
+}
+
 /// A complete screen as one frame sees it: the model, where the cursor is,
 /// how far back the scrollback viewport is scrolled, whether the surface
 /// holds the keyboard, and the one coalesced visual-bell bit.
@@ -203,6 +210,7 @@ pub struct Snapshot<'a> {
     focused: bool,
     bell: bool,
     selection: Option<Selection>,
+    status: Option<(Vec<char>, Edge)>,
 }
 
 impl<'a> Snapshot<'a> {
@@ -222,6 +230,7 @@ impl<'a> Snapshot<'a> {
             focused,
             bell,
             selection: None,
+            status: None,
         }
     }
 
@@ -244,6 +253,15 @@ impl<'a> Snapshot<'a> {
 
     pub fn with_selection(mut self, selection: Option<Selection>) -> Self {
         self.selection = selection;
+        self
+    }
+
+    /// Lays a status line over the view's first or last row: `text`, cut
+    /// at the row's width, in inverse video to the edge, with the cursor
+    /// hidden. td-term's search shows its query here, as foot's search box
+    /// does.
+    pub fn with_status(mut self, text: Option<&str>, edge: Edge) -> Self {
+        self.status = text.map(|text| (text.chars().take(self.columns()).collect(), edge));
         self
     }
 
@@ -278,6 +296,15 @@ impl<'a> Snapshot<'a> {
     /// program holds the alternate screen — two unrelated scroll regions
     /// in one frame.
     pub fn cell(&self, row: usize, column: usize) -> Cell {
+        if let Some((status, _)) = self.status.as_ref().filter(|(_, edge)| match edge {
+            Edge::Top => row == 0,
+            Edge::Bottom => row.saturating_add(1) == self.rows(),
+        }) {
+            let mut cell = BLANK;
+            cell.scalar = status.get(column).copied().unwrap_or(' ');
+            cell.attributes.inverse = true;
+            return cell;
+        }
         let found = if row < self.viewport {
             self.viewport
                 .checked_sub(row)
@@ -410,7 +437,7 @@ impl<'a> Snapshot<'a> {
     /// Where the cursor is drawn, or `None` when it is hidden or the
     /// viewport has scrolled it off the bottom of the surface.
     pub fn cursor(&self) -> Option<(usize, usize)> {
-        if !self.cursor.visible {
+        if !self.cursor.visible || self.status.is_some() {
             return None;
         }
         let row = self.cursor.row.checked_add(self.viewport)?;

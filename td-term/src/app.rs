@@ -102,6 +102,15 @@ const MULTI_CLICK_MS: u64 = 500;
 /// The two chords the terminal keeps for itself rather than sending.
 const COPY_CHORD: &str = "C-S-c";
 const PASTE_CHORD: &str = "C-S-v";
+/// foot's scrollback-search chord, which opens the search; inside it,
+/// foot's search chords.
+const SEARCH_CHORD: &str = "C-S-r";
+const SEARCH_OLDER_CHORDS: [&str; 2] = ["C-r", "C-S-r"];
+const SEARCH_NEWER_CHORDS: [&str; 2] = ["C-s", "C-S-s"];
+const SEARCH_CANCEL_CHORDS: [&str; 3] = ["Escape", "C-g", "C-c"];
+/// td-ui's keymap names keypad Enter `Return` too.
+const SEARCH_COMMIT_CHORD: &str = "Return";
+const SEARCH_ERASE_CHORD: &str = "Backspace";
 /// foot's font chords: Control with `+` or `=` grows the outline face a
 /// step, with `-` shrinks it, and with `0` restores the size td-term
 /// started at. Each is silent to the child (`vt_keys`), so none is taken
@@ -397,6 +406,20 @@ struct Drag {
     released: Option<u32>,
 }
 
+/// A scrollback search under way: its query; the match it shows and the
+/// start of the last it showed, both in the numbering of one history
+/// epoch on one screen; and what the view and selection were, put back if
+/// it is cancelled.
+struct Search {
+    query: String,
+    found: Option<td_ui::vt::Found>,
+    last: Option<td_ui::vt::Place>,
+    epoch: u64,
+    alternate: bool,
+    viewport: keys::Viewport,
+    selection: Option<render::Selection>,
+}
+
 /// The pointer as the child sees it while it asks for reports: which
 /// buttons it was told were pressed, so their releases go to it too; the
 /// cell the last press or motion report named; and the wheel rows not yet
@@ -468,6 +491,7 @@ pub struct Window {
     viewport: keys::Viewport,
     selection: Option<render::Selection>,
     drag: Drag,
+    search: Option<Search>,
     reported: Reported,
     wheel: Wheel,
     board: Board,
@@ -530,6 +554,7 @@ impl Window {
             viewport: keys::Viewport::new(),
             selection: None,
             drag: Drag::default(),
+            search: None,
             reported: Reported::default(),
             wheel: Wheel::default(),
             board: Board::default(),
@@ -638,6 +663,22 @@ impl Window {
 
     fn key(&mut self, serial: u32, key: u32, stroke: &Stroke) -> Result<()> {
         let chord = stroke.chord.as_str();
+        if self.search.is_some() {
+            return self.search_key(serial, key, stroke);
+        }
+        if chord == SEARCH_CHORD {
+            self.search = Some(Search {
+                query: String::new(),
+                found: None,
+                last: None,
+                epoch: self.history().epoch,
+                alternate: self.alternate(),
+                viewport: self.viewport,
+                selection: self.selection.take(),
+            });
+            self.stale = true;
+            return Ok(());
+        }
         if chord == COPY_CHORD {
             return self.copy(serial);
         }
@@ -658,6 +699,237 @@ impl Window {
             self.client.arm(key, self.clock);
         }
         Ok(())
+    }
+
+    fn alternate(&self) -> bool {
+        self.model
+            .as_ref()
+            .is_some_and(|model| model.mode("alternate-screen") == Some(true))
+    }
+
+    /// Drops a match the text under it no longer holds: a clear has
+    /// renumbered history, the other screen has come up, or output has
+    /// rewritten its cells. Its last place goes with a renumbering or a
+    /// screen change, since it names a line of what went.
+    fn check_search(&mut self) {
+        let alternate = self.alternate();
+        let epoch = self.history().epoch;
+        let (Some(search), Some(terminal)) = (self.search.as_mut(), self.model.as_ref()) else {
+            return;
+        };
+        if search.epoch != epoch || search.alternate != alternate {
+            search.epoch = epoch;
+            search.alternate = alternate;
+            search.found = None;
+            search.last = None;
+        }
+        if let Some(found) = search.found {
+            if !terminal.still_matches(&search.query, found) {
+                search.found = None;
+            }
+        }
+    }
+
+    /// One key while a search is open, which takes them all: text extends
+    /// the query, Backspace shortens it, the search chords step to an older
+    /// or newer match, Return ends the search with the match selected and
+    /// made the primary selection, and Escape (or C-g, C-c) puts the view
+    /// and selection back as they were. Nothing reaches the child. A key
+    /// that edits or steps repeats while held, as foot's do, its repeats
+    /// coming back here through `end_turn`, not to the child.
+    fn search_key(&mut self, serial: u32, key: u32, stroke: &Stroke) -> Result<()> {
+        let chord = stroke.chord.as_str();
+        self.check_search();
+        self.stale = true;
+        if SEARCH_CANCEL_CHORDS.contains(&chord) {
+            if let Some(search) = self.search.take() {
+                self.viewport = search.viewport;
+                self.selection = search.selection;
+            }
+            return Ok(());
+        }
+        if chord == SEARCH_COMMIT_CHORD {
+            let Some(search) = self.search.take() else {
+                return Ok(());
+            };
+            let Some(found) = search.found else {
+                // Nothing to select: the selection is as it was.
+                self.selection = search.selection;
+                return Ok(());
+            };
+            self.show_match(found);
+            self.search = Some(search);
+            self.selection = self.search_selection();
+            self.search = None;
+            if self.selection.is_some() {
+                self.own_primary(serial)?;
+            }
+            return Ok(());
+        }
+        if self.search_stroke(stroke) && stroke.repeat && !self.proof.enabled {
+            self.client.arm(key, self.clock);
+        }
+        Ok(())
+    }
+
+    /// A stroke that edits the query or steps between matches, pressed or
+    /// repeated. Returns whether it did either, which is what a repeat
+    /// asks; a ring, at a bound or a dead end, stops one.
+    fn search_stroke(&mut self, stroke: &Stroke) -> bool {
+        let chord = stroke.chord.as_str();
+        let Some(search) = self.search.as_mut() else {
+            return false;
+        };
+        let shown = search.found.map(|found| found.start).or(search.last);
+        let stepped = SEARCH_OLDER_CHORDS.contains(&chord) || SEARCH_NEWER_CHORDS.contains(&chord);
+        let (from, toward) = if SEARCH_OLDER_CHORDS.contains(&chord) {
+            (shown, td_ui::vt::Toward::Older)
+        } else if SEARCH_NEWER_CHORDS.contains(&chord) {
+            (shown, td_ui::vt::Toward::Newer)
+        } else {
+            if chord == SEARCH_ERASE_CHORD {
+                search.query.pop();
+            } else if let Some(text) = stroke
+                .text
+                .filter(|_| !chord.starts_with("C-") && !chord.starts_with("M-"))
+                .filter(|text| !text.is_control())
+            {
+                if search.query.chars().count() >= td_ui::vt::MAX_QUERY {
+                    self.ring();
+                    return false;
+                }
+                search.query.push(text);
+            } else {
+                return false;
+            }
+            // A changed query looks again from the match shown, or the last
+            // one, which stays if it still matches.
+            let from = shown.map(|(line, column)| (line, column.saturating_add(1)));
+            (from, td_ui::vt::Toward::Older)
+        };
+        let Some(terminal) = self.model.as_ref() else {
+            return false;
+        };
+        let found = terminal.search(&search.query, from, toward);
+        if found.is_none() && stepped && search.found.is_some() {
+            // No further match that way: the one shown stays.
+            self.ring();
+            return false;
+        }
+        search.found = found;
+        if let Some(found) = found {
+            search.last = Some(found.start);
+            self.show_match(found);
+        }
+        true
+    }
+
+    /// The first row of the view, in the search's numbering.
+    fn view_top(&self) -> Option<u64> {
+        let history = self.model.as_ref()?.scrollback();
+        let offset = u64::try_from(self.viewport.offset(history)).ok()?;
+        history.pushed.checked_sub(offset)
+    }
+
+    /// Scrolls the view so the whole of `found` is on it, its first row
+    /// about mid-view, unless it already is. On the alternate screen the
+    /// view returns to the live screen, the only one that shows it.
+    fn show_match(&mut self, found: td_ui::vt::Found) {
+        let alternate = self.alternate();
+        let Some(terminal) = self.model.as_ref() else {
+            return;
+        };
+        let history = terminal.scrollback();
+        if alternate {
+            self.viewport
+                .apply(&keys::Action::Scroll(keys::Scroll::Bottom), 0, history);
+            return;
+        }
+        let rows = u64::try_from(terminal.rows()).unwrap_or(u64::MAX);
+        let current = self.viewport.offset(history);
+        let shown = |offset: usize| {
+            let top = history
+                .pushed
+                .saturating_sub(u64::try_from(offset).unwrap_or(u64::MAX));
+            found.start.0 >= top && found.end.0 < top.saturating_add(rows)
+        };
+        if shown(current) {
+            return;
+        }
+        // Mid-view, or as low as lets the match's last row on.
+        let span = found.end.0.saturating_sub(found.start.0);
+        let row = (rows / 2).min(rows.saturating_sub(1).saturating_sub(span));
+        let target = history
+            .pushed
+            .saturating_add(row)
+            .saturating_sub(found.start.0);
+        let target = usize::try_from(target)
+            .unwrap_or(usize::MAX)
+            .min(history.lines);
+        let back =
+            i64::try_from(target).unwrap_or(i64::MAX) - i64::try_from(current).unwrap_or(i64::MAX);
+        self.viewport
+            .by_lines(i32::try_from(back).unwrap_or(0), history);
+    }
+
+    /// The search's match as a selection of the view, cut to the part of
+    /// it on the view, if any is. A match on the alternate screen is on
+    /// the live view only: scrolled back, the view shows the primary's
+    /// history.
+    fn search_selection(&self) -> Option<render::Selection> {
+        let found = self.search.as_ref()?.found?;
+        let terminal = self.model.as_ref()?;
+        if self.alternate() && self.viewport.offset(terminal.scrollback()) != 0 {
+            return None;
+        }
+        let top = self.view_top()?;
+        let rows = u64::try_from(terminal.rows()).ok()?;
+        let bottom = top.checked_add(rows)?.checked_sub(1)?;
+        if found.end.0 < top || found.start.0 > bottom {
+            return None;
+        }
+        let row = |line: u64| usize::try_from(line.saturating_sub(top)).ok();
+        let anchor = if found.start.0 < top {
+            (0, 0)
+        } else {
+            (row(found.start.0)?, found.start.1)
+        };
+        let extent = if found.end.0 > bottom {
+            (row(bottom)?, terminal.columns().saturating_sub(1))
+        } else {
+            (row(found.end.0)?, found.end.1)
+        };
+        Some(render::Selection { anchor, extent })
+    }
+
+    /// The search line, and the edge it covers: the last row, unless the
+    /// match is on it, then the first.
+    fn search_status(&self) -> Option<(String, render::Edge)> {
+        let search = self.search.as_ref()?;
+        let missing = !search.query.is_empty() && search.found.is_none();
+        let label = if missing {
+            "search (no match)"
+        } else {
+            "search"
+        };
+        let last = self.model.as_ref()?.rows().saturating_sub(1);
+        let edge = match self.search_selection() {
+            Some(selection) if selection.anchor.0.max(selection.extent.0) == last => {
+                render::Edge::Top
+            }
+            _ => render::Edge::Bottom,
+        };
+        Some((format!("{label}: {}", search.query), edge))
+    }
+
+    /// What the frame shows as selected: the search's match while one is
+    /// open, else td-term's selection.
+    fn shown_selection(&self) -> Option<render::Selection> {
+        if self.search.is_some() {
+            self.search_selection()
+        } else {
+            self.selection
+        }
     }
 
     /// The pointer reporting the child asked for, whatever the view.
@@ -854,6 +1126,14 @@ impl Window {
     }
 
     fn pointer(&mut self, event: pointer::Event) -> Result<()> {
+        // A press ends a search, leaving the view where it is, so the press
+        // acts on what it was made over.
+        if matches!(event, pointer::Event::Button { pressed: true, .. }) {
+            if let Some(search) = self.search.take() {
+                self.selection = search.selection;
+                self.stale = true;
+            }
+        }
         if self.report_pointer(&event)? {
             return Ok(());
         }
@@ -1408,6 +1688,10 @@ impl Window {
             .as_mut()
             .ok_or("the child wrote before the terminal had a model")?;
         terminal.feed(bytes);
+        self.check_search();
+        let Some(terminal) = self.model.as_mut() else {
+            return Ok(());
+        };
         // Answered one at a time: the queue's unit is a reply, and one that
         // does not fit rings rather than arriving in part.
         let mut refused = false;
@@ -1486,6 +1770,8 @@ impl Window {
             Some(terminal) => terminal.resize(rows, columns)?,
             None => self.model = Some(Terminal::new(rows, columns)?),
         }
+        // The reflow may have moved a match's cells.
+        self.check_search();
         self.cells = Some((window.rows, window.columns));
         self.adopted = Some(size);
         // Reflowed under the picture until a frame for it presents.
@@ -1861,8 +2147,16 @@ impl App for Window {
         if idle {
             if let Some(stroke) = self.client.repeat(now)? {
                 // Rerouted per repetition: the mode and the view it asks
-                // about may have changed since the press.
-                if !self.route(&stroke.chord, stroke.text)? {
+                // about may have changed since the press. A search takes
+                // a repeat as it takes the press.
+                let repeated = if self.search.is_some() {
+                    self.check_search();
+                    self.stale = true;
+                    self.search_stroke(&stroke)
+                } else {
+                    self.route(&stroke.chord, stroke.text)?
+                };
+                if !repeated {
                     self.client.cancel_repeat();
                 }
             }
@@ -1903,9 +2197,16 @@ impl App for Window {
                 .as_ref()
                 .ok_or("the terminal has no model to draw")?;
             let viewport = self.viewport.offset(terminal.scrollback());
+            let status = self.search_status();
             let snapshot = render::Snapshot::new(terminal, wanted.activated, false)
                 .scrolled_back(viewport)
-                .with_selection(self.selection);
+                .with_selection(self.shown_selection())
+                .with_status(
+                    status.as_ref().map(|(text, _)| text.as_str()),
+                    status
+                        .as_ref()
+                        .map_or(render::Edge::Bottom, |(_, edge)| *edge),
+                );
             let (palette, font, outline) = (&self.palette, &self.font, &mut self.outline);
             let (width, height) = (wanted.size.width, wanted.size.height);
             let presented = self.client.present(width, height, &mut |pixels| {
@@ -3197,6 +3498,332 @@ mod tests {
         let mut expected = "y".repeat(columns);
         expected.push_str("zz");
         assert_eq!(window.selected_text().unwrap(), Some(expected));
+    }
+
+    /// Types `text` as plain key presses (lowercase letters and spaces).
+    fn type_text(window: &mut Window, text: &str) {
+        for letter in text.chars() {
+            let key = match letter {
+                ' ' => 57,
+                'a' => 30,
+                'e' => 18,
+                'f' => 33,
+                'n' => 49,
+                'o' => 24,
+                'r' => 19,
+                't' => 20,
+                'w' => 17,
+                other => panic!("no key for {other:?}"),
+            };
+            press(window, key);
+        }
+    }
+
+    fn chord(window: &mut Window, mask: u32, key: u32) {
+        modifiers(window, mask);
+        press(window, key);
+        modifiers(window, 0);
+    }
+
+    /// C-S-r opens a search that takes every key: typing finds the newest
+    /// match and scrolls it into view, selected; C-r and C-s step older and
+    /// newer; Backspace shortens the query; nothing reaches the child.
+    /// Escape puts the view and selection back.
+    #[test]
+    fn a_search_finds_steps_and_cancels() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.output(b"one foo\r\n").unwrap();
+        history(&mut window);
+        window.output(b"two foo\r\n").unwrap();
+        let before = selection((0, 0), (0, 1));
+        window.selection = before;
+        chord(&mut window, CONTROL | SHIFT, 19);
+        assert!(window.search.is_some());
+        assert_eq!(window.selection, None, "the search shows its own");
+        type_text(&mut window, "foo");
+        assert!(window.input.take_for_test().is_empty());
+        let newest = window.search_selection().unwrap();
+        assert_eq!(status(&window).as_deref(), Some("search: foo"));
+        assert!(!window.viewport.viewing(window.history()));
+        chord(&mut window, CONTROL, 19);
+        assert!(window.viewport.viewing(window.history()), "scrolled to it");
+        let older = window.search_selection().unwrap();
+        assert_ne!(older, newest);
+        window.selection = Some(older);
+        assert_eq!(window.selected_text().unwrap().as_deref(), Some("foo"));
+        window.selection = None;
+        // No older match: the bell, and the match stays.
+        chord(&mut window, CONTROL, 19);
+        assert!(bell(&mut window));
+        assert_eq!(window.search_selection(), Some(older));
+        chord(&mut window, CONTROL, 31);
+        assert_eq!(window.search_selection(), Some(newest));
+        press(&mut window, 14);
+        assert_eq!(window.search.as_ref().unwrap().query, "fo");
+        assert_eq!(
+            window.search_selection().map(|found| found.anchor),
+            Some(newest.anchor),
+            "still matches where it was"
+        );
+        type_text(&mut window, "w");
+        assert_eq!(status(&window).as_deref(), Some("search (no match): fow"));
+        // A dead end, then Backspace: the search picks up from the last
+        // match it showed, here an older one, not the newest.
+        press(&mut window, 14);
+        chord(&mut window, CONTROL, 19);
+        let shown = window.search_selection().unwrap();
+        assert_ne!(shown.anchor, newest.anchor);
+        type_text(&mut window, "w");
+        assert!(window.search.as_ref().unwrap().found.is_none());
+        press(&mut window, 14);
+        assert_eq!(
+            window.search_selection().map(|found| found.anchor),
+            Some(shown.anchor)
+        );
+        press(&mut window, 1);
+        assert!(window.search.is_none());
+        assert_eq!(window.selection, before);
+        assert!(!window.viewport.viewing(window.history()));
+        assert!(window.input.take_for_test().is_empty());
+        // Cancelled while it shows an older match, the view goes back.
+        chord(&mut window, CONTROL | SHIFT, 19);
+        type_text(&mut window, "one");
+        assert!(window.viewport.viewing(window.history()));
+        chord(&mut window, CONTROL, 34);
+        assert!(window.search.is_none());
+        assert!(!window.viewport.viewing(window.history()));
+        // C-c cancels too.
+        chord(&mut window, CONTROL | SHIFT, 19);
+        chord(&mut window, CONTROL, 46);
+        assert!(window.search.is_none());
+        assert!(window.input.take_for_test().is_empty());
+    }
+
+    fn status(window: &Window) -> Option<String> {
+        window.search_status().map(|(text, _)| text)
+    }
+
+    /// A match on the view's last row is not under the search line, which
+    /// moves to the first row; one that wraps past the view's last row is
+    /// scrolled on whole; the frame shows the match, not the selection
+    /// the search began with.
+    #[test]
+    fn a_search_shows_its_whole_match() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        let (rows, columns) = {
+            let model = window.model.as_ref().unwrap();
+            (model.rows(), model.columns())
+        };
+        history(&mut window);
+        let mut text = "\r\n".repeat(rows);
+        text.push_str("$ foo");
+        window.output(text.as_bytes()).unwrap();
+        window.selection = selection((0, 0), (0, 1));
+        chord(&mut window, CONTROL | SHIFT, 19);
+        type_text(&mut window, "foo");
+        let found = window.search_selection().unwrap();
+        assert_eq!(found.anchor, (rows - 1, 2));
+        assert_eq!(window.shown_selection(), Some(found));
+        assert_eq!(
+            window.search_status().map(|(_, edge)| edge),
+            Some(render::Edge::Top)
+        );
+        press(&mut window, 1);
+        assert_eq!(window.shown_selection(), selection((0, 0), (0, 1)));
+        // Scrolled back so a wrapped match's first row is the view's last.
+        let mut text = "\r\n".to_string();
+        text.push_str(&"x".repeat(columns - 2));
+        text.push_str("fooo\r\n");
+        text.push_str(&"\r\n".repeat(rows));
+        window.output(text.as_bytes()).unwrap();
+        modifiers(&mut window, SHIFT);
+        press(&mut window, 104);
+        modifiers(&mut window, 0);
+        chord(&mut window, CONTROL | SHIFT, 19);
+        type_text(&mut window, "foo");
+        let found = window.search_selection().unwrap();
+        // With the match's first row the view's last, a refined query
+        // brings its second row on too.
+        let history = window.history();
+        window
+            .viewport
+            .by_lines((rows - 1 - found.anchor.0) as i32, history);
+        assert_eq!(window.search_selection().unwrap().anchor.0, rows - 1);
+        type_text(&mut window, "o");
+        let found = window.search_selection().unwrap();
+        assert_eq!(found.extent.0, found.anchor.0 + 1, "both rows on the view");
+        assert_eq!(status(&window).as_deref(), Some("search: fooo"));
+        // Moved so only its first row is on the view, the match is drawn
+        // cut at the view's edge; moved off, it is still found.
+        let history = window.history();
+        let back = rows - 1 - found.anchor.0;
+        window.viewport.by_lines(back as i32, history);
+        assert_eq!(
+            window.search_selection(),
+            selection((rows - 1, columns - 2), (rows - 1, columns - 1))
+        );
+        window.viewport.by_lines(rows as i32, history);
+        assert_eq!(window.search_selection(), None);
+        assert_eq!(status(&window).as_deref(), Some("search: fooo"));
+        // Committed, the whole match is brought back and selected.
+        press(&mut window, 96);
+        assert_eq!(window.selected_text().unwrap().as_deref(), Some("fooo"));
+    }
+
+    /// A match goes when its text does: a clear renumbering history, the
+    /// child rewriting its cells, or the other screen coming up. A press
+    /// ends a search where the view is.
+    #[test]
+    fn a_search_drops_a_match_the_text_no_longer_holds() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.output(b"foo\r\n").unwrap();
+        chord(&mut window, CONTROL | SHIFT, 19);
+        type_text(&mut window, "foo");
+        assert!(window.search_selection().is_some());
+        window.output(b"\x1b[Hbar").unwrap();
+        assert!(window.search_selection().is_none(), "rewritten");
+        assert_eq!(status(&window).as_deref(), Some("search (no match): foo"));
+        press(&mut window, 1);
+        window.output(b"\x1b[2J\x1b[Hfoo\r\n").unwrap();
+        history(&mut window);
+        chord(&mut window, CONTROL | SHIFT, 19);
+        type_text(&mut window, "foo");
+        assert!(window.search.as_ref().unwrap().found.is_some());
+        window.output(b"\x1b[3J").unwrap();
+        assert!(
+            window.search.as_ref().unwrap().found.is_none(),
+            "renumbered"
+        );
+        assert!(window.search.as_ref().unwrap().last.is_none());
+        press(&mut window, 1);
+        window.output(b"\x1b[2J\x1b[3J\x1b[Hfoo").unwrap();
+        chord(&mut window, CONTROL | SHIFT, 19);
+        type_text(&mut window, "foo");
+        assert!(window.search.as_ref().unwrap().found.is_some());
+        // The same text at the same place on the other screen is other text.
+        window.output(b"\x1b[?1049h\x1b[Hfoo").unwrap();
+        assert!(
+            window.search.as_ref().unwrap().found.is_none(),
+            "other screen"
+        );
+        assert!(window.search.as_ref().unwrap().last.is_none());
+        // On the alternate screen the match is shown at the live view.
+        window.output(b"\x1b[Hfoo").unwrap();
+        modifiers(&mut window, SHIFT);
+        window
+            .event(message(POINTER, 8, &[0, (-1i32) as u32]))
+            .unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        modifiers(&mut window, 0);
+        chord(&mut window, CONTROL, 19);
+        assert!(!window.viewport.viewing(window.history()));
+        assert_eq!(window.search_selection(), selection((0, 0), (0, 2)));
+        // A press ends it, the view staying.
+        hover(&mut window, 1, 1);
+        button(&mut window, LEFT_BUTTON, true);
+        assert!(window.search.is_none());
+        button(&mut window, LEFT_BUTTON, false);
+    }
+
+    /// A key held in a search repeats into the query, never to the child;
+    /// a dead end stops a held step.
+    #[test]
+    fn a_held_search_key_repeats_into_the_query() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.client.input_mut().timing(25, 600, 0).unwrap();
+        window.output(b"foo\r\nfoo\r\n").unwrap();
+        chord(&mut window, CONTROL | SHIFT, 19);
+        type_text(&mut window, "f");
+        // 'o' held: the press and one repeat.
+        window.event(message(KEYBOARD, 3, &[9, 0, 24, 1])).unwrap();
+        let now = window.clock;
+        window.end_turn(now + 700, true).unwrap();
+        assert_eq!(window.search.as_ref().unwrap().query, "foo");
+        assert!(window.input.take_for_test().is_empty());
+        window.event(message(KEYBOARD, 3, &[10, 0, 24, 0])).unwrap();
+        // C-r held: the press steps to the older match, the repeat finds
+        // none further, rings, and stops.
+        modifiers(&mut window, CONTROL);
+        window.event(message(KEYBOARD, 3, &[11, 0, 19, 1])).unwrap();
+        let newest = window.search.as_ref().unwrap().found;
+        let now = window.clock;
+        window.end_turn(now + 700, true).unwrap();
+        assert_eq!(window.search.as_ref().unwrap().found, newest);
+        assert!(bell(&mut window));
+        window.end_turn(now + 800, true).unwrap();
+        assert!(!bell(&mut window), "the repeat stopped");
+        assert!(window.input.take_for_test().is_empty());
+        assert_eq!(window.search.as_ref().unwrap().query, "foo");
+    }
+
+    /// On the alternate screen a match is shown only at the live view;
+    /// a resize that moves its cells drops it; Return with no match keeps
+    /// the selection the search began with.
+    #[test]
+    fn a_search_match_is_shown_only_where_it_is() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        history(&mut window);
+        window.output(b"\x1b[?1049h\x1b[Hfoo").unwrap();
+        chord(&mut window, CONTROL | SHIFT, 19);
+        type_text(&mut window, "foo");
+        assert_eq!(window.search_selection(), selection((0, 0), (0, 2)));
+        let history = window.history();
+        window.viewport.by_lines(3, history);
+        assert_eq!(window.search_selection(), None);
+        assert_eq!(
+            window.search_status().map(|(_, edge)| edge),
+            Some(render::Edge::Bottom)
+        );
+        press(&mut window, 1);
+        window.output(b"\x1b[?1049l\x1b[2J\x1b[Hxxxxxxfoo").unwrap();
+        chord(&mut window, CONTROL | SHIFT, 19);
+        type_text(&mut window, "foo");
+        assert!(window.search.as_ref().unwrap().found.is_some());
+        let (width, height) = (window.cell.0 * 8, window.cell.1 * 4);
+        window.adopt(Size { width, height }).unwrap();
+        assert!(window.search.as_ref().unwrap().found.is_none(), "reflowed");
+        let before = selection((1, 0), (1, 1));
+        window.search.as_mut().unwrap().selection = before;
+        press(&mut window, 28);
+        assert!(window.search.is_none());
+        assert_eq!(window.selection, before);
+    }
+
+    /// A query past its bound rings rather than growing.
+    #[test]
+    fn a_search_query_is_bounded() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        chord(&mut window, CONTROL | SHIFT, 19);
+        window.search.as_mut().unwrap().query = "o".repeat(td_ui::vt::MAX_QUERY);
+        type_text(&mut window, "o");
+        assert!(bell(&mut window));
+        assert_eq!(
+            window.search.as_ref().unwrap().query.len(),
+            td_ui::vt::MAX_QUERY
+        );
+    }
+
+    /// Return ends a search with its match selected and made the primary
+    /// selection; outside a search C-r is the child's.
+    #[test]
+    fn a_committed_search_selects_its_match() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.output(b"to an end\r\n").unwrap();
+        chord(&mut window, CONTROL | SHIFT, 19);
+        type_text(&mut window, "an e");
+        press(&mut window, 28);
+        assert!(window.search.is_none());
+        assert_eq!(window.selected_text().unwrap().as_deref(), Some("an e"));
+        assert_eq!(window.board.primary.text.as_deref(), Some("an e"));
+        chord(&mut window, CONTROL, 19);
+        assert_eq!(window.input.take_for_test(), b"\x12");
     }
 
     #[test]

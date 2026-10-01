@@ -108,13 +108,13 @@ The initial cursor is steady rather than clock-blinking. Shift+PageUp and
 Shift+PageDown navigate scrollback. Ordinary text input returns to the live
 bottom. An unmodified End key is consumed for the same purpose while viewing
 scrollback and is forwarded in the selected cursor-key mode at the live
-bottom. Hyperlinks, images, sixel, ligatures, search, and shell
-integration are deferred, as are the pointer's other encodings (UTF-8's
-1005 and urxvt's 1015), focus reports (1004) and the alternate screen's
-wheel as arrow keys (1007). Pointer selection and reporting, the wheel,
-the core data-device clipboard and the primary selection are specified in
-§3. A protocol is not parsed merely because another terminal implements
-it.
+bottom. Hyperlinks, images, sixel, ligatures, and shell integration are
+deferred, as are the pointer's other encodings (UTF-8's 1005 and urxvt's
+1015), focus reports (1004) and the alternate screen's wheel as arrow
+keys (1007). Pointer selection and reporting, the wheel, scrollback
+search, the core data-device clipboard and the primary selection are
+specified in §3. A protocol is not parsed merely because another
+terminal implements it.
 
 Unsupported CSI operations are ignored as complete sequences. OSC, DCS, SOS,
 APC, and PM strings enter allocation-free streaming ignore states and cannot
@@ -732,6 +732,46 @@ and without them does nothing, with no bell, as a middle click on nothing
 does elsewhere. A change of the primary selection cancels its paste and not
 the clipboard's, and the reverse; focus loss cancels either. `C-S-c` and
 `C-S-v` stay the clipboard's.
+
+`C-S-r`, foot's scrollback-search chord, opens a search, which takes
+every key until it ends and sends the child none; outside a search `C-r`
+is the child's as ever. The search line covers the view's last row in
+inverse video (`Snapshot::with_status`), or its first while the match is
+on the last, and shows `search: ` and the query, or `search (no match):
+` when a nonempty query has found nothing, and hides the cursor. Text
+without Control or Alt extends the query, to at most `vt::MAX_QUERY`
+(256) scalars, past which a key rings; `Backspace` shortens it. A
+changed query looks for the nearest match at or before the one shown, or
+the last one shown when a dead end left none, so a match that still fits
+stays where it is, and from the newest text when none was shown. `C-r`
+or `C-S-r` steps to the next older match and `C-s` or `C-S-s` to the
+next newer, ringing and keeping the one shown when there is none
+further. A key that edits or steps repeats while held, its repeats taken
+by the search as its press was, until a ring stops them. `Return`,
+keypad Enter's name too, ends the search with its match brought on the
+view, selected and made the primary selection, or with no match the
+selection as it was; `Escape`, `C-g` or `C-c` ends it with the view and
+the selection put back as they were. A pointer press ends it with the
+selection put back and the view where it is, so the press acts on what
+it was made over. The match shows as the selection does, inverted, cut
+to the part on the view; the frame shows it rather than the selection
+the search began with. A match on the alternate screen shows only at the
+live view, since a view scrolled back shows the primary's history. When
+the whole match is not on the view, the view scrolls its first row to
+about mid-view, or as low as still shows its last. The text searched
+(`Terminal::search`) is the active screen with, while that is the
+primary, its history: one line per line the child wrote, its wrapped
+rows joined by their marks, so a match can span a wrap, each row read
+only as wide as the screen. The alternate screen is searched alone, at
+the live view, as foot's has no scrollback. A query with no uppercase
+letter matches either case, each scalar folded on its own as foot's
+`towlower` does. Matches are placed in a line numbering output does not
+shift (history line `n` is `pushed - lines + n`, screen row `r` is
+`pushed + r`), so a match stays put as lines scroll. After output or a
+resize, a match whose cells no longer spell the query, or whose wrap has
+gone (`Terminal::still_matches`), is dropped; a clear that renumbers
+history or a switch of screen drops it and the last place too, since
+both name a line of text that went.
 
 The system image's input proof drives td-term's clipboard end to end, and
 td-term's half of it exists only when the exact `td.firefox-input=1` kernel
@@ -1378,6 +1418,12 @@ terminal, and td-term's prove the program:
   write, survives a child that never reads, reports its own death to the next
   push, and retires on close; and the waiter reports the child's exit and
   reaps a child no thread will wait for (`pty.rs`);
+- a search steps through history and the screen in one numbering, across
+  wraps, in either case for a lowercase query, the alternate screen
+  alone, as wide as the screen, within its query bound, and a match
+  still holds only while its cells and wraps do; and a status line
+  covers the last or the first row, inverted, and hides the cursor
+  (`vt_render_spec.rs`);
 - a face covered at a size of its own lays the grid on its cell, with the
   bitmap fallback centred or clipped about its middle in it and the rules
   and the cursor taking it, and a zoom steps half a point, passes a size whose
@@ -1394,7 +1440,17 @@ terminal, and td-term's prove the program:
   triple, dragging by them, a row being its whole wrapped line; copies a
   wrapped line without the wrap's newline; makes a release's selection
   the primary selection and writes its sends; pastes the primary
-  selection on a middle press and does nothing without one;
+  selection on a middle press and does nothing without one; opens a
+  search on `C-S-r` that takes every key, finds and steps between
+  matches older and newer, refines from the last one shown after a dead
+  end, scrolls the whole of the one shown on, moves its line off a match
+  on the last row, rings at the last match and past the query bound,
+  repeats a held key into the query and never to the child, stopping at
+  a dead end, drops a match its text no longer holds or a resize moved,
+  shows an alternate-screen match only at the live view, ends on a press
+  where the view is, puts the view and selection back on `Escape`, `C-g`
+  or `C-c`, and on `Return` or keypad Enter selects its match and makes
+  it the primary selection, or keeps the selection with no match;
   waits for the proof's sync on the live source; rings for a paste with
   nothing offered and receives a selected offer over a fresh endpoint;
   reports presses, releases, the wheel in carried, bounded notches and
