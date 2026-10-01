@@ -146,6 +146,10 @@ pub fn recipe() -> Recipe {
     }
     for (path, source) in [
         (
+            "{src}/td-secret/src/portable_lifecycle.rs",
+            include_str!("../../../td-secret/src/portable_lifecycle.rs"),
+        ),
+        (
             "{src}/td-secret/src/portable_store.rs",
             include_str!("../../../td-secret/src/portable_store.rs"),
         ),
@@ -321,6 +325,29 @@ mod tests {
                     !content.contains(token),
                     "embedded source {path} contains recipe substitution token {token}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn recipe_writes_every_sibling_path_module() {
+        let written: Vec<String> = recipe()
+            .steps
+            .iter()
+            .flatten()
+            .filter_map(|step| match step {
+                Step::WriteFile { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        for (name, source) in MODULES {
+            for attribute in source.split("#[path = \"").skip(1) {
+                let file = attribute.split('"').next().unwrap_or_default();
+                if file.contains('/') {
+                    continue;
+                }
+                let path = format!("{{src}}/td-secret/src/{file}");
+                assert!(written.contains(&path), "{name} declares {file}");
             }
         }
     }

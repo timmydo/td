@@ -1,5 +1,7 @@
 //! Bounded portable envelope. Token authorization and persistence are adapters.
 
+#[path = "portable_lifecycle.rs"]
+pub(super) mod lifecycle;
 #[path = "portable_store.rs"]
 pub(super) mod storage;
 
@@ -40,7 +42,7 @@ impl Drop for Plaintext {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Role {
     Primary = 1,
     Backup = 2,
@@ -219,6 +221,7 @@ impl VerificationKey {
 
 /// Bounded input to a token attempt, untrusted until the whole envelope opens.
 pub(super) struct UnlockHint<'a> {
+    pub role: Role,
     pub credential: &'a [u8],
     pub key: &'a VerificationKey,
     pub salt: &'a [u8; 32],
@@ -233,6 +236,8 @@ pub(super) struct Protector {
     pub secret: Secret32,
 }
 
+// Public metadata and ciphertext only; a copy exposes no vault key.
+#[derive(Clone)]
 struct Slot {
     role: Role,
     credential: Vec<u8>,
@@ -243,6 +248,45 @@ struct Slot {
 }
 
 impl Slot {
+    fn wrap(
+        id: &[u8; 32],
+        master: &Secret32,
+        protector: &Protector,
+        random: &mut impl Read,
+    ) -> Result<Self> {
+        let mut slot = Self {
+            role: protector.role,
+            credential: protector.credential.clone(),
+            key: protector.key.clone(),
+            salt: protector.salt,
+            nonce: random_array(random)?,
+            wrapped: [0; 48],
+        };
+        let key = Secret32(crypto::hkdf(&protector.secret.0, id, WRAP));
+        let wrapped = crypto::seal(&key.0, &slot.nonce, &slot.context(id)?, &master.0);
+        slot.wrapped = wrapped
+            .as_slice()
+            .try_into()
+            .map_err(|_| "invalid wrapped portable key length")?;
+        Ok(slot)
+    }
+
+    fn unwrap(&self, id: &[u8; 32], secret: &Secret32) -> Result<Secret32> {
+        let key = Secret32(crypto::hkdf(&secret.0, id, WRAP));
+        let raw = Plaintext(crypto::open(
+            &key.0,
+            &self.nonce,
+            &self.context(id)?,
+            &self.wrapped,
+        )?);
+        Ok(Secret32(
+            raw.0
+                .as_slice()
+                .try_into()
+                .map_err(|_| "invalid portable vault key length")?,
+        ))
+    }
+
     fn context(&self, id: &[u8; 32]) -> Result<Vec<u8>> {
         let mut out = SLOT.to_vec();
         out.extend_from_slice(id);
@@ -283,7 +327,7 @@ pub(super) struct OpenVault {
 impl LockedVault {
     pub fn create(
         notebook: &Notebook,
-        protectors: Vec<Protector>,
+        protectors: &[Protector],
         random: &mut impl Read,
     ) -> Result<Self> {
         // Complete cheap admission before entropy or cryptographic work.
@@ -297,24 +341,10 @@ impl LockedVault {
         validate_keys(ordered.iter().map(|p| (p.role, p.credential.as_slice())))?;
         let id = random_array(random)?;
         let master = Secret32(random_array(random)?);
-        let mut slots = Vec::new();
-        for protector in ordered {
-            let mut slot = Slot {
-                role: protector.role,
-                credential: protector.credential.clone(),
-                key: protector.key.clone(),
-                salt: protector.salt,
-                nonce: random_array(random)?,
-                wrapped: [0; 48],
-            };
-            let key = Secret32(crypto::hkdf(&protector.secret.0, &id, WRAP));
-            let wrapped = crypto::seal(&key.0, &slot.nonce, &slot.context(&id)?, &master.0);
-            slot.wrapped = wrapped
-                .as_slice()
-                .try_into()
-                .map_err(|_| "invalid wrapped portable key length")?;
-            slots.push(slot);
-        }
+        let slots = ordered
+            .into_iter()
+            .map(|protector| Slot::wrap(&id, &master, protector, random))
+            .collect::<Result<Vec<_>>>()?;
         Self::seal(&id, 1, &slots, &master, notebook, random)
     }
 
@@ -407,6 +437,7 @@ impl LockedVault {
     /// These public fields are hints, never authority for a protector change.
     pub fn unlock_hints(&self) -> impl ExactSizeIterator<Item = UnlockHint<'_>> {
         self.slots.iter().map(|slot| UnlockHint {
+            role: slot.role,
             credential: &slot.credential,
             key: &slot.key,
             salt: &slot.salt,
@@ -427,19 +458,7 @@ impl LockedVault {
             .iter()
             .find(|s| s.credential == credential)
             .ok_or("portable credential is not enrolled")?;
-        let key = Secret32(crypto::hkdf(&secret.0, &self.id, WRAP));
-        let raw = Plaintext(crypto::open(
-            &key.0,
-            &slot.nonce,
-            &slot.context(&self.id)?,
-            &slot.wrapped,
-        )?);
-        let master = Secret32(
-            raw.0
-                .as_slice()
-                .try_into()
-                .map_err(|_| "invalid portable vault key length")?,
-        );
+        let master = slot.unwrap(&self.id, secret)?;
         let key = Secret32(crypto::hkdf(&master.0, &self.id, BODY));
         let mut aad = BODY.to_vec();
         aad.extend_from_slice(
@@ -460,19 +479,49 @@ impl LockedVault {
         })
     }
 
+    pub fn id(&self) -> &[u8; 32] {
+        &self.id
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Whether `secret` unwraps this envelope's vault key to the key of
+    /// `opened`, an opening of these exact bytes, without decrypting the body.
+    pub fn unwraps_to(
+        &self,
+        credential: &[u8],
+        secret: &Secret32,
+        opened: &OpenVault,
+    ) -> Result<bool> {
+        if opened.fingerprint != crypto::digest(&self.bytes) {
+            return Err("portable session belongs to another vault revision".into());
+        }
+        let slot = self
+            .slots
+            .iter()
+            .find(|s| s.credential == credential)
+            .ok_or("portable credential is not enrolled")?;
+        Ok(equal32(&slot.unwrap(&self.id, secret)?, &opened.master))
+    }
+
+    fn current(&self, opened: &OpenVault) -> Result<u64> {
+        if opened.fingerprint != crypto::digest(&self.bytes) {
+            return Err("portable session belongs to another vault revision".into());
+        }
+        self.revision
+            .checked_add(1)
+            .ok_or_else(|| "portable revision exhausted".into())
+    }
+
     pub fn revise(
         &self,
         opened: &OpenVault,
         notebook: &Notebook,
         random: &mut impl Read,
     ) -> Result<Self> {
-        if opened.fingerprint != crypto::digest(&self.bytes) {
-            return Err("portable session belongs to another vault revision".into());
-        }
-        let revision = self
-            .revision
-            .checked_add(1)
-            .ok_or("portable revision exhausted")?;
+        let revision = self.current(opened)?;
         Self::seal(
             &self.id,
             revision,
@@ -482,6 +531,101 @@ impl LockedVault {
             random,
         )
     }
+
+    /// Keeps the vault key and every wrapper, adding one backup protector.
+    /// The backend must authorize the change and prove the new key first.
+    pub fn add_protector(
+        &self,
+        opened: &OpenVault,
+        protector: &Protector,
+        random: &mut impl Read,
+    ) -> Result<Self> {
+        let revision = self.current(opened)?;
+        if protector.role != Role::Backup || self.slots.len() >= MAX_SLOTS {
+            return Err("portable vault cannot accept another backup key".into());
+        }
+        let mut slots = self.slots.clone();
+        slots.push(Slot::wrap(&self.id, &opened.master, protector, random)?);
+        slots.sort_by(|a, b| a.credential.cmp(&b.credential));
+        validate_keys(slots.iter().map(|s| (s.role, s.credential.as_slice())))?;
+        Self::seal(
+            &self.id,
+            revision,
+            &slots,
+            &opened.master,
+            &opened.notebook,
+            random,
+        )
+    }
+
+    /// Replaces the vault key and rebuilds the complete protector table.
+    /// Each listed protector already in this vault must unwrap its current
+    /// key; omitted slots are revoked. Identity and contents are preserved.
+    pub fn rotate(
+        &self,
+        opened: &OpenVault,
+        protectors: &[Protector],
+        random: &mut impl Read,
+    ) -> Result<Self> {
+        let revision = self.current(opened)?;
+        if !(2..=MAX_SLOTS).contains(&protectors.len()) {
+            return Err("portable vault requires two through eight keys".into());
+        }
+        let mut ordered: Vec<&Protector> = protectors.iter().collect();
+        ordered.sort_by(|a, b| a.credential.cmp(&b.credential));
+        validate_keys(ordered.iter().map(|p| (p.role, p.credential.as_slice())))?;
+        let mut retained = 0usize;
+        for protector in &ordered {
+            let Some(slot) = self
+                .slots
+                .iter()
+                .find(|slot| slot.credential == protector.credential)
+            else {
+                continue;
+            };
+            if slot.role != protector.role
+                || slot.key.cose() != protector.key.cose()
+                || slot.salt != protector.salt
+            {
+                return Err("retained portable key metadata changed".into());
+            }
+            if !equal32(&slot.unwrap(&self.id, &protector.secret)?, &opened.master) {
+                return Err("retained portable key does not unwrap this vault".into());
+            }
+            retained += 1;
+        }
+        if retained == 0 {
+            return Err("portable key rotation must retain an enrolled key".into());
+        }
+        let master = Secret32(random_array(random)?);
+        let slots = ordered
+            .into_iter()
+            .map(|protector| Slot::wrap(&self.id, &master, protector, random))
+            .collect::<Result<Vec<_>>>()?;
+        Self::seal(
+            &self.id,
+            revision,
+            &slots,
+            &master,
+            &opened.notebook,
+            random,
+        )
+    }
+}
+
+impl OpenVault {
+    /// Whether two authenticated openings recovered the identical vault key.
+    pub fn same_key(&self, other: &Self) -> bool {
+        equal32(&self.master, &other.master)
+    }
+}
+
+pub(super) fn equal32(a: &Secret32, b: &Secret32) -> bool {
+    let difference =
+        a.0.iter()
+            .zip(&b.0)
+            .fold(0u8, |difference, (x, y)| difference | (x ^ y));
+    std::hint::black_box(difference) == 0
 }
 
 fn validate_keys<'a>(keys: impl Iterator<Item = (Role, &'a [u8])>) -> Result<()> {
@@ -632,7 +776,7 @@ mod tests {
     }
 
     pub(super) fn fixture() -> LockedVault {
-        LockedVault::create(&notebook(), protectors(), &mut random()).unwrap()
+        LockedVault::create(&notebook(), &protectors(), &mut random()).unwrap()
     }
 
     fn both_open(vault: &LockedVault, expected: &[u8]) {
@@ -670,6 +814,71 @@ mod tests {
         assert!(!exported.windows(8).any(|w| w == b"password"));
         assert!(imported.open(b"primary", &Secret32([0x22; 32])).is_err());
         assert!(imported.open(b"missing", &Secret32([0x11; 32])).is_err());
+    }
+
+    fn third(role: Role) -> Protector {
+        Protector {
+            role,
+            credential: b"third".to_vec(),
+            key: verification_key(true),
+            salt: [0xc3; 32],
+            secret: Secret32([0x33; 32]),
+        }
+    }
+
+    #[test]
+    fn protector_changes_refuse_unproved_retained_keys_and_stale_sessions() {
+        let vault = fixture();
+        let opened = vault.open(b"primary", &Secret32([0x11; 32])).unwrap();
+        assert!(vault
+            .add_protector(&opened, &third(Role::Primary), &mut random())
+            .is_err());
+        let mut keys = protectors();
+        keys[1].secret = Secret32([0x23; 32]);
+        assert!(vault.rotate(&opened, &keys, &mut random()).is_err());
+        let mut keys = protectors();
+        keys[1].salt = [0xb3; 32];
+        assert!(vault.rotate(&opened, &keys, &mut random()).is_err());
+        let mut keys = protectors();
+        keys[0].role = Role::Backup;
+        keys[1].role = Role::Primary;
+        assert!(vault.rotate(&opened, &keys, &mut random()).is_err());
+        assert!(vault
+            .unwraps_to(b"backup", &Secret32([0x22; 32]), &opened)
+            .unwrap());
+        assert!(!vault
+            .unwraps_to(b"backup", &Secret32([0x23; 32]), &opened)
+            .unwrap_or(false));
+        let fresh = [
+            third(Role::Primary),
+            Protector {
+                credential: b"fourth".to_vec(),
+                ..third(Role::Backup)
+            },
+        ];
+        assert!(vault.rotate(&opened, &fresh, &mut random()).is_err());
+        let added = vault
+            .add_protector(&opened, &third(Role::Backup), &mut random())
+            .unwrap();
+        assert!(added
+            .add_protector(&opened, &third(Role::Backup), &mut random())
+            .is_err());
+        assert!(added.rotate(&opened, &protectors(), &mut random()).is_err());
+        let reopened = added.open(b"third", &Secret32([0x33; 32])).unwrap();
+        assert!(reopened.same_key(&opened));
+        assert_eq!(added.revision(), 2);
+        assert_eq!(added.id(), vault.id());
+        let mut keys = protectors();
+        keys.pop();
+        keys.push(third(Role::Backup));
+        let rotated = vault.rotate(&opened, &keys, &mut random()).unwrap();
+        let rotated_open = rotated.open(b"third", &Secret32([0x33; 32])).unwrap();
+        assert!(!rotated_open.same_key(&opened));
+        assert!(rotated.open(b"backup", &Secret32([0x22; 32])).is_err());
+        assert_eq!(
+            rotated_open.notebook.entries[0].body(),
+            opened.notebook.entries[0].body()
+        );
     }
 
     #[test]
@@ -895,7 +1104,7 @@ mod tests {
         cases.push(empty);
         for keys in cases {
             let mut entropy = random();
-            assert!(LockedVault::create(&notebook(), keys, &mut entropy).is_err());
+            assert!(LockedVault::create(&notebook(), &keys, &mut entropy).is_err());
             assert_eq!(entropy.position(), 0);
         }
         assert!(validate_keys(
@@ -939,7 +1148,7 @@ mod tests {
         cases.push(n);
         for n in cases {
             let mut entropy = random();
-            assert!(LockedVault::create(&n, protectors(), &mut entropy).is_err());
+            assert!(LockedVault::create(&n, &protectors(), &mut entropy).is_err());
             assert_eq!(entropy.position(), 0);
         }
         let encoded = notebook().encode().unwrap();
@@ -976,7 +1185,7 @@ mod tests {
         assert!(revised.revise(&opened, &changed, &mut random()).is_err());
         let mut other_entropy = random();
         other_entropy.set_position(10);
-        let other = LockedVault::create(&notebook(), protectors(), &mut other_entropy).unwrap();
+        let other = LockedVault::create(&notebook(), &protectors(), &mut other_entropy).unwrap();
         assert!(other.revise(&opened, &changed, &mut random()).is_err());
         assert!(old
             .revise(&opened, &changed, &mut Cursor::new(Vec::<u8>::new()))
@@ -989,7 +1198,7 @@ mod tests {
         for count in 0..100 {
             let mut entropy = Cursor::new(vec![7; count]);
             assert!(
-                LockedVault::create(&notebook(), protectors(), &mut entropy).is_err(),
+                LockedVault::create(&notebook(), &protectors(), &mut entropy).is_err(),
                 "count {count}"
             );
         }
@@ -1000,7 +1209,7 @@ mod tests {
         let empty = Notebook {
             entries: Vec::new(),
         };
-        let vault = LockedVault::create(&empty, protectors(), &mut random()).unwrap();
+        let vault = LockedVault::create(&empty, &protectors(), &mut random()).unwrap();
         assert!(vault
             .open(b"backup", &Secret32([0x22; 32]))
             .unwrap()
@@ -1009,7 +1218,7 @@ mod tests {
             .is_empty());
         let mut n = notebook();
         n.entries[0].body.clear();
-        let vault = LockedVault::create(&n, protectors(), &mut random()).unwrap();
+        let vault = LockedVault::create(&n, &protectors(), &mut random()).unwrap();
         both_open(&vault, b"");
     }
 
@@ -1046,7 +1255,7 @@ mod tests {
         }
         keys[0].credential = vec![0; MAX_CREDENTIAL];
         keys[1].credential = vec![1; MAX_CREDENTIAL];
-        let vault = LockedVault::create(&n, keys, &mut random()).unwrap();
+        let vault = LockedVault::create(&n, &keys, &mut random()).unwrap();
         assert_eq!(vault.bytes().len(), MAX_ENVELOPE);
         let opened = vault
             .open(&vec![1; MAX_CREDENTIAL], &Secret32([0x22; 32]))
@@ -1104,7 +1313,7 @@ mod tests {
         let first = fixture();
         let mut entropy = random();
         entropy.set_position(10);
-        let second = LockedVault::create(&notebook(), protectors(), &mut entropy).unwrap();
+        let second = LockedVault::create(&notebook(), &protectors(), &mut entropy).unwrap();
         assert_ne!(first.id, second.id);
         let slot_size = 1 + 2 + b"backup".len() + KEY_BYTES + 32 + 12 + 48;
         let mut spliced = first.bytes().to_vec();

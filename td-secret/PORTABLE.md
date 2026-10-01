@@ -87,9 +87,10 @@ table, format version and revision as well as its contents. Unauthenticated meta
 unlock attempt, never authority to add or replace a protector.
 
 Initial enrollment proves a primary and a separately presented backup before
-publishing anything. Both must independently unwrap the identical vault key
-and authenticate the notebook. Exclude existing credential IDs during new
-credential creation and require the operator to use a separate physical key;
+publishing anything. Both must independently unwrap the identical vault key,
+and the notebook must authenticate under it. Exclude existing credential
+IDs during new credential creation and require the operator to use a
+separate physical key;
 this cannot prove distinct malicious or cloned hardware. An explicit
 unrecoverability profile is not part of this first production target.
 
@@ -170,6 +171,18 @@ The primitive permits competing proposals from the same snapshot; the
 backend must authorize and publish at most one against that baseline.
 A saved envelope needs a new open snapshot before a subsequent revision;
 this primitive does not advance the browsing session automatically.
+
+Protector changes are two further proposal primitives with the same
+snapshot pinning, vault identity and exact next revision. Adding a key
+keeps the vault key and every existing wrapper and inserts one backup slot.
+Rotation draws a fresh vault key and rebuilds the complete table from the
+supplied protectors; omitted slots are revoked. A supplied protector whose
+credential is already enrolled must keep its role, public key and salt and
+must unwrap the current vault key, and at least one must be retained. A
+slot-only check confirms that a secret unwraps an opened envelope's vault
+key without decrypting the notebook again. Neither
+primitive proves a new key or authorizes the change; the lifecycle below
+does both before publication.
 
 All wire integers are unsigned big-endian. Version 2 replaces the earlier
 synthetic-only version 1 prerequisite atomically; version 1 and unknown
@@ -816,6 +829,130 @@ Additional response tests cover none with an empty statement, a non-map
 packed statement, epAtt admission, and attestation-bearing responses above
 the command limit up to the exact local response ceiling.
 These remain offline codec tests, not YubiKey interoperability evidence.
+
+### Implemented vault lifecycle backend
+
+`src/portable_lifecycle.rs`, a private child of the envelope module,
+composes the envelope, the ciphertext store and the transaction runner into
+creation, unlock, save, add-key and key replacement. It has no command,
+prompt, device admission, path policy or notebook API; those are adapter
+duties. It is not yet reachable from any entry point.
+
+Token access is one private interface. Each call admits one fresh channel,
+presents one key and returns only a verified result: an enrollment's
+credential ID, canonical public key, salt, UV secret and counter, or an
+assertion's UV secret and counter. Every call names its operation purpose
+and the role of the key to present, and an assertion also names its
+enrolled credential, so a prompt can identify the exact token. The
+production adapter drives the transaction runner over a backend-supplied
+channel, PIN prompt and entropy source and passes that presentation to
+both; an unavailable channel sends nothing and prompts for nothing.
+Synthetic token implementations exist only in tests. Purpose labels
+describe the operation and never contain notebook content.
+
+Every client-data hash is SHA-256 over `td-secret/portable/operation/v1`
+and a zero byte, the purpose and phase bytes, a u32-length-prefixed
+operation binding, and 32 fresh bytes. Creation, proof, repeat and
+authorization phases are distinct. Bindings after creation start with the
+vault ID and baseline revision. Saves add the digest of the exact proposed
+envelope, binding consent to that ciphertext. Replacement adds an
+order-independent digest of the revoked credential set. Adding a key binds
+only the vault and revision, since the new key does not exist when the
+existing key authorizes it.
+
+Each newly enrolled key is created and proved in one transaction, then
+asserted again on a new channel. The repeat must recover the identical
+secret with an advancing counter, except that two zero counters are
+accepted. Creation refuses an existing vault before contacting a token,
+enrolls the primary, then enrolls the backup with the primary excluded.
+Both must open the proposed envelope to the identical vault key before
+revision one is published against the absent baseline. Six PIN prompts
+cover the complete ceremony. Any refusal publishes nothing.
+
+Unlock reads the committed envelope, uses the caller-selected credential's
+hint, and requires an assertion that opens the whole envelope. The caller
+chooses which enrolled key to present; this increment does not probe a
+token for its credentials, so a different token is refused only after its
+PIN. A session holds the authenticated baseline, the opened vault key and
+notebook, the identity of the directory it was opened from, its authorizing
+key and the verified counters observed during the session. The caller may
+switch the authorizing key to another enrolled key. Counters are not
+persisted, so they detect only regression within a session, not across
+restarts or copies. An operation checks its counters as it goes and
+records them only after it commits.
+
+Proving a proposal decrypts its notebook once, with the first key; every
+other key need only unwrap the identical vault key from its slot. An
+authorization likewise unwraps only its slot and compares the key with the
+session's.
+
+Every write first refuses, before any token, a directory other than the
+session's, by device and inode, so a copy holding identical bytes cannot
+receive the session's writes. It then takes a store snapshot and refuses,
+still before any token, when its bytes differ from the session's
+authenticated baseline; that vault changed under another writer and
+requires lock and unlock. Identical bytes at a new file, as a synchronizing
+tool's rename leaves them, are accepted. The write publishes against that
+snapshot, so the store's baseline check refuses a change made while a
+token is being presented.
+
+A save revises first, then requires a fresh assertion from the session key
+bound to that proposal. The assertion must unwrap the session's vault key
+and the proposal must open to it before publication. A refusal leaves the
+vault and the session's contents unchanged, and the session's next write
+takes a new snapshot. An uncertain publication is reported as such: if the
+new bytes were committed, every later write is refused until lock and
+unlock; if not, the session continues.
+
+Adding a key is refused at eight keys before any token. The session key
+authorizes it, the new key is enrolled with every existing credential
+excluded and repeated, and both keys must open the proposal to the
+unchanged vault key. Key replacement revokes a named set of keys together
+and enrolls one replacement. The set must be nonempty, distinct, enrolled,
+and leave at least one key retained; these checks happen before any token.
+Every retained key, and no revoked key, gives a fresh assertion bound to
+the set. Revoking a set, rather than one key at a time, lets the owner
+remove a stolen key together with any key its thief added, and recover
+when several keys are lost at once. The replacement is enrolled with every
+credential, including the revoked ones, excluded. It becomes primary when
+the primary is revoked and a backup otherwise. The cost is that every
+enrolled key, with its PIN, holds full authority: one key alone may revoke
+all the others and enroll a key of its holder's choosing. A thief holding
+any key and its PIN can therefore lock the owner out of the current file.
+The owner's remedies are to revoke first and to keep exported copies, which
+the revoked keys still open. Rotation must produce one
+new vault key, different from the old one, that every listed key opens, and
+no revoked credential may remain. A session whose key was revoked continues
+under the replacement.
+
+Revocation protects the current vault file only. Historical copies stay
+readable by the keys they enrolled. Nothing persists a revision floor:
+anyone able to write the vault directory can restore a pre-rotation copy.
+The retained keys still open it, unlock accepts it, and later saves would
+encrypt new contents under a vault key a revoked token can unwrap. The
+portable format provides no rollback protection, as stated above.
+
+Tests drive every operation through a simulated multi-token bench with
+real P-256 public keys and per-credential secrets. They cover:
+
+- the operator presenting the wrong token or the same token twice;
+- mismatched repeat secrets during creation, key addition and replacement;
+- stalled counters during creation and on a later write;
+- token refusal and unavailability on unlock, save and creation;
+- writes from a stale session and to another location holding the same
+  vault, refused before any token;
+- a vault replaced, or a store locked, while a token is presented, refused
+  at publication, followed by a successful write;
+- the eight-key limit and invalid revocation sets;
+- revocation of the primary, of the session key, and of a stolen key
+  together with the key its thief added;
+- the role and credential named at each presentation.
+
+Uncertain publication is exercised by the store's own fault tests; the
+lifecycle handles every publication failure the same way. The
+production adapter returns exactly the four public transcripts' credentials
+and outputs, and passes the presentation to its channel and prompt. This is
+not physical YubiKey, PIN-prompt, Guix access or recovery evidence.
 
 ## Independently landable increments
 

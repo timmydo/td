@@ -265,7 +265,7 @@ pub(crate) mod tests {
 
     const LABELS: [&str; 4] = ["p1-legacy", "p1-scoped", "p2-legacy", "p2-scoped"];
 
-    fn fixture(label: &str, name: &str) -> Vec<u8> {
+    pub(crate) fn fixture(label: &str, name: &str) -> Vec<u8> {
         let row = include_str!("../tests/pin_vectors.txt")
             .lines()
             .map(|line| line.split_whitespace().collect::<Vec<_>>())
@@ -279,7 +279,7 @@ pub(crate) mod tests {
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
     }
-    fn assertion(label: &str) -> Assertion<'static> {
+    pub(crate) fn assertion(label: &str) -> Assertion<'static> {
         Assertion {
             credential: b"fixture-id",
             key: PublicKey::from_coordinates(
@@ -291,7 +291,7 @@ pub(crate) mod tests {
             salt: fixture(label, "salt").try_into().unwrap(),
         }
     }
-    fn enrollment(label: &str) -> Enrollment<'static> {
+    pub(crate) fn enrollment(label: &str) -> Enrollment<'static> {
         Enrollment {
             challenge: fixture(label, "create_challenge").try_into().unwrap(),
             user: fixture(label, "user").try_into().unwrap(),
@@ -300,7 +300,10 @@ pub(crate) mod tests {
             excluded: &[],
         }
     }
-    fn entropy(label: &str, creation: bool) -> impl FnMut(&mut [u8]) -> Result<(), String> + '_ {
+    pub(crate) fn entropy(
+        label: &str,
+        creation: bool,
+    ) -> impl FnMut(&mut [u8]) -> Result<(), String> + '_ {
         let mut fields = VecDeque::new();
         if creation {
             fields.push_back("create_scalar");
@@ -413,21 +416,21 @@ pub(crate) mod tests {
     }
 
     #[derive(Default)]
-    struct Trace {
-        commands: Cell<usize>,
-        drops: Cell<usize>,
+    pub(crate) struct Trace {
+        pub(crate) commands: Cell<usize>,
+        pub(crate) drops: Cell<usize>,
         interrupted: Cell<Option<Interruption>>,
         final_checks: Cell<usize>,
         pins: RefCell<Vec<PinPurpose>>,
     }
-    struct Script {
+    pub(crate) struct Script {
         trace: Rc<Trace>,
         steps: VecDeque<(Vec<u8>, Vec<u8>)>,
         fail: Option<usize>,
         late: bool,
     }
     impl Script {
-        fn new(label: &str, creation: bool) -> (Self, Rc<Trace>) {
+        pub(crate) fn new(label: &str, creation: bool) -> (Self, Rc<Trace>) {
             let trace = Rc::new(Trace::default());
             (
                 Self {
