@@ -304,16 +304,16 @@ Failures, after which the disk may be incomplete and a retry needs a new
 review, are 1 destination changed, 2 insufficient space, 3 write failed, 4
 verification failed and 5 settings failed. Abandonment, which means no
 destructive write started, is 1 withdrawn, 2 consent declined, 3 consent
-expired, 4 consent unavailable (the compositor's consent path was lost
-while displayed) or 5 destination changed (the held disk changed or
-vanished, or a recheck refused it, before the first write). Refusals are
-1 busy, 2 source
-unavailable, 3 discovery failed, 4 destination changed, 5 destination
-busy, 6 insufficient space, 7 invalid username, 8 invalid hostname, 9
-unsupported keyboard, 10 unsupported timezone, 11 stale review, 12 no
-review and 13 consent unavailable (no seat, compositor or trusted consent
-path can present the review). Unassigned codes refuse, and a duplicated
-code does not compile.
+expired, 4 consent unavailable (the trusted path could not show the
+review, or lost it while displayed) or 5 destination changed (the held
+disk changed or vanished, or a recheck refused it, before the first
+write). Refusals are 1 busy, 2 source unavailable, 3 discovery failed, 4
+destination changed, 5 destination busy, 6 insufficient space, 7 invalid
+username, 8 invalid hostname, 9 unsupported keyboard, 10 unsupported
+timezone, 11 stale review, 12 no review and 13 consent unavailable (no
+seat, compositor or trusted consent path can present the review, or the
+consent channel cannot carry it). Unassigned codes refuse, and a
+duplicated code does not compile.
 
 The service holds at most one review. A review is held while reviewed,
 awaiting consent or running, and not after complete, failed or abandoned.
@@ -392,6 +392,65 @@ discovery: a mounted medium's exclusive claim keeps it out. Independent
 retention and exclusion of source backing storage, validation of choices
 against that source rather than caller-bound roots, payload and scratch
 fit, and trusted consent remain required before execution.
+
+## Installation consent channel
+
+`installation_consent.rs` defines the private channel by which td-authd,
+which will start the service, learns what to put before the person and
+answers with their decision. td-authd compiles the same file. It is data and
+codec only. Both ends are root and td-authd creates the channel, so decoding
+authenticates nothing; it refuses only bytes outside the grammar. Nothing
+sends or receives on it yet.
+
+Both ends first send and require `TDINA01\n`, which changes with any message
+or its bytes. Each message then travels in one frame: a big-endian u32
+length, nonzero and at most 1024, then that many payload bytes. A payload
+is a tag byte and its body, with trailing bytes refused. Every nonce is a
+review's 32-byte nonzero nonce.
+
+The service reports:
+
+- `0x01` review: the nonce, the disk's kernel name (a one-byte length, then
+  at most 31 ASCII letters, digits, `_` or `-`, the kernel's own bound), its
+  nonzero capacity in bytes as a big-endian u64, its model then serial
+  (each `0` for absent, or `1`, a big-endian u16 length and at most 256
+  UTF-8 bytes, possibly none), the hostname (at most 63 bytes) and username
+  (at most 32), each nonempty UTF-8 behind a one-byte length, and the
+  32-byte deployment manifest digest. It is at most 720 bytes. These are
+  the display facts of the held review, which asks for consent to it. The
+  requester is not on the channel: td-authd knows whom it started the
+  service for. td-authd escapes and narrows the facts for the prompt, and
+  declines as unavailable what it cannot show.
+- `0x02` ended: a nonce and a code, 1 withdrawn, 2 destination changed
+  (including a recheck of the held disk that failed after consent), 3
+  installer lost or 4 not consented. No destructive write started.
+- `0x03` started: a nonce. Consent arrived and the final recheck passed;
+  the first write follows.
+- `0x04` finished: a nonce and an outcome, 1 complete or 2 failed, after
+  which the disk may be incomplete.
+
+td-authd answers with a high-bit tag, so a reflected frame never decodes:
+`0x81` consent, meaning the person confirmed that review on the trusted
+path, or `0x82` declined with a code, 1 declined, 2 expired or 3
+unavailable (no trusted path could show the prompt, td-authd cannot show
+its facts, or the prompt was lost while shown). Unassigned codes and tags
+refuse, and a duplicated code does not compile.
+
+Order: one review is open at a time, from its review report until the
+service closes it with exactly one ended report, or with started and then
+finished. The service sends a review only when none is open, and started
+only after consent to the open review. td-authd answers an open review at
+most once, and never after reading its ended report; an answer never closes
+a review. After a decline the service closes the review as not consented,
+and records the matching abandonment: consent declined, consent expired or
+consent unavailable. Answers can cross ended reports in flight, so the
+service ignores an answer that names no open review; a second answer to
+the open review ends the channel. td-authd ends the channel on a report
+out of this order. Until started, losing the installer ends the review as
+installer lost; once started, an installation reports finished whether or
+not its installer remains. A held review the channel cannot carry, such as
+one whose disk name exceeds 31 bytes, is refused at execute as consent
+unavailable and kept.
 
 ## Choosing the volume identity
 

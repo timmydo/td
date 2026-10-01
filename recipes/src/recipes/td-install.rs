@@ -14,6 +14,8 @@ const INSTALLATION_PROTOCOL_RS: &str =
     include_str!("../../../td-install/src/installation_protocol.rs");
 const INSTALLATION_SERVICE_RS: &str =
     include_str!("../../../td-install/src/installation_service.rs");
+const INSTALLATION_CONSENT_RS: &str =
+    include_str!("../../../td-install/src/installation_consent.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
 const REALFILE_RS: &str = include_str!("../../../td-boot/src/realfile.rs");
 const CRC32_RS: &str = include_str!("../../../engine/src/crc32.rs");
@@ -88,6 +90,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-install/src/installation_service.rs".into(),
             content: INSTALLATION_SERVICE_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-install/src/installation_consent.rs".into(),
+            content: INSTALLATION_CONSENT_RS.into(),
             exec: false,
         },
         Step::WriteFile {

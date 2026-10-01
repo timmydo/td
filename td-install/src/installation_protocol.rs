@@ -170,7 +170,8 @@ pub enum Abandon {
     Withdrawn,
     ConsentDeclined,
     ConsentExpired,
-    /// The compositor's consent path was lost while it was displayed.
+    /// The trusted path could not show the review, or lost it while it
+    /// was displayed.
     ConsentUnavailable,
     /// The disk changed or vanished before the first write.
     DestinationChanged,

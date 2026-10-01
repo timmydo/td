@@ -55,6 +55,11 @@ mod installation_protocol;
 #[path = "installation_service.rs"]
 mod installation_service;
 
+// Nothing sends or receives consent yet.
+#[path = "installation_consent.rs"]
+#[allow(dead_code)]
+mod installation_consent;
+
 #[path = "timezones.rs"]
 mod timezones;
 
@@ -5787,7 +5792,7 @@ mod tests {
     /// inventory uses paths; timezones uses the regular-file reader.
     type Compiled = (&'static str, &'static str, &'static [&'static str]);
 
-    fn compiled_files() -> [Compiled; 14] {
+    fn compiled_files() -> [Compiled; 15] {
         [
             ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
             (
@@ -5837,6 +5842,11 @@ mod tests {
                 include_str!("installation_service.rs"),
                 [].as_slice(),
             ),
+            (
+                "installation_consent.rs",
+                include_str!("installation_consent.rs"),
+                [].as_slice(),
+            ),
             ("timezones.rs", include_str!("timezones.rs"), [].as_slice()),
             (
                 "hostname.rs",
@@ -5877,7 +5887,7 @@ mod tests {
         // include inside a `stringify!`, which satisfied the search while
         // `compiled_files` went on reading the original.
         let table_body = {
-            const HEAD: &str = "fn compiled_files() -> [Compiled; 14] {";
+            const HEAD: &str = "fn compiled_files() -> [Compiled; 15] {";
             let Some(at) = index_of(&text, HEAD) else {
                 panic!("the compiled-file table is not where this scan looks for it")
             };
