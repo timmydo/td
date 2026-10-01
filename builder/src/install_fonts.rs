@@ -156,9 +156,10 @@ fn sibling(path: &Path, tag: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Remove `parent`'s entries named `prefix` and a process id that `proc`
-/// does not list; nothing when `proc` is not there to ask.
-fn sweep(parent: &Path, prefix: &[u8], proc: &Path) {
+/// Remove `parent`'s entries, directories or files, named `prefix` and a
+/// process id that `proc` does not list; nothing when `proc` is not there
+/// to ask.
+pub(crate) fn sweep(parent: &Path, prefix: &[u8], proc: &Path) {
     if !proc.join("self").is_dir() {
         return;
     }
@@ -174,7 +175,11 @@ fn sweep(parent: &Path, prefix: &[u8], proc: &Path) {
             .filter(|pid| pid.parse::<u32>().is_ok());
         if let Some(pid) = pid {
             if !proc.join(pid).is_dir() {
-                let _ = fs::remove_dir_all(entry.path());
+                let path = entry.path();
+                let _ = match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => fs::remove_dir_all(path),
+                    _ => fs::remove_file(path),
+                };
             }
         }
     }

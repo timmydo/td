@@ -10429,6 +10429,17 @@ confinement holds here. This section's two-configuration rule reads the
 launch as availability: the applications run here as they run on td,
 the jail is what is absent, and a feature owes this launcher nothing.
 
+`./install-apps` (`td-builder install-apps`) installs host builds of the
+desktop programs for the caller, as unconfined as a launch. Those that
+need no service go in `~/.local/bin`. td-news and td-mail, the names
+`td-net launch --names` prints, go in `~/.local/lib/td` beside a host
+build of td-net, and their names in `~/.local/bin` are links to it:
+td-net invoked by one of those names is `td-net launch` of the program
+of that name beside the binary the link resolves to, so an installed
+td-news is served as `./news` serves the checkout's. The installed
+program finds no service of its own any other way, and the session's
+`td-fetch/socket` is still never touched.
+
 ## Z. No server infrastructure
 
 A constraint rather than a design, stated because several decisions above

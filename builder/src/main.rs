@@ -53,6 +53,7 @@ mod gates;
 use td_engine::gzip;
 mod host_bin;
 mod host_run;
+mod install_apps;
 mod install_fonts;
 mod kernel_headers;
 mod lock;
@@ -11855,6 +11856,10 @@ fn main() -> ExitCode {
         // installed under the XDG data home for td programs run on this
         // host; ./install-fonts execs this (install_fonts.rs).
         Some("install-fonts") => install_fonts::run(args.get(2..).unwrap_or(&[])),
+        // td-builder install-apps — the checkout's desktop programs, built
+        // in release mode with the host's cargo and installed in
+        // ~/.local/bin; ./install-apps execs this (install_apps.rs).
+        Some("install-apps") => install_apps::run(args.get(2..).unwrap_or(&[])),
         // td-builder assert-static PATH — verify a host-built control-plane binary
         // is FULLY static: no PT_INTERP, no DT_NEEDED, no run-path. The no-leakage
         // invariant enforced at every host build site (re #469) so a dynamically

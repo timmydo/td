@@ -25,6 +25,7 @@
 // this binary, it launches the program of that name beside the binary the
 // link resolves to, refusing one that is this binary.
 use std::ffi::OsStr;
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -46,13 +47,32 @@ const SELF: &str = "/proc/self/exe";
 
 /// `td-launch PROGRAM [ARG...]`, `args[0]` being the applet's name.
 pub fn run(args: &[String]) {
-    let code = match args.get(1) {
+    let code = match args.get(1).map(String::as_str) {
+        // The names a link to this binary launches, one per line, for
+        // `./install-apps` to link.
+        Some("--names") if args.len() == 2 => {
+            let mut out = std::io::stdout().lock();
+            let written = LAUNCHED
+                .iter()
+                .try_for_each(|name| writeln!(out, "{name}"))
+                .and_then(|()| out.flush());
+            match written {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("td-launch: --names: {e}");
+                    1
+                }
+            }
+        }
         Some(program) if program.contains('/') => {
             let rest = args.get(2..).unwrap_or(&[]);
             say(launch_here(Path::new(program), rest, true))
         }
         _ => {
-            eprintln!("usage: td-net launch PROGRAM [ARG...]  (PROGRAM a path)");
+            eprintln!(
+                "usage: td-net launch PROGRAM [ARG...]  (PROGRAM a path)
+       td-net launch --names"
+            );
             2
         }
     };

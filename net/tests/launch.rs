@@ -237,3 +237,16 @@ fn a_link_named_for_an_application_launches_it_from_beside_the_binary() {
     nothing_served(&runtime, &mark);
     std::fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+fn the_names_are_listed_for_the_installer() {
+    let output = Command::new(TD_NET)
+        .args(["launch", "--names"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "td-mail\ntd-news\n"
+    );
+}
