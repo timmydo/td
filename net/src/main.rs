@@ -35,6 +35,7 @@ mod feed;
 mod fetch;
 mod fetchd;
 mod http;
+mod launch;
 mod ostree;
 mod sig;
 mod subst;
@@ -97,6 +98,12 @@ fn main() {
         "td-subst" => subst::run(&args),
         "td-deploy" => deploy::run(&args),
         "td-fetchd" => fetchd::run(&args),
+        "td-launch" => launch::run(&args),
+        // An application's name, linked to this binary: that application,
+        // beside this binary, with a fetch service of its own (launch.rs).
+        _ if launch::launches(std::ffi::OsStr::new(base)).is_some() => {
+            launch::run_named(base, args.get(1..).unwrap_or(&[]))
+        }
         // Umbrella name (or an unknown link): the first real arg selects the applet.
         // Rebuild argv as the applet's own link would present it — argv[0] = the applet
         // name so each applet's basename/output is unchanged — then dispatch.
@@ -107,9 +114,10 @@ fn main() {
                 Some("subst") => "td-subst",
                 Some("deploy") => "td-deploy",
                 Some("fetchd") => "td-fetchd",
+                Some("launch") => "td-launch",
                 _ => {
                     eprintln!(
-                        "usage: td-net <fetch|feed|subst|deploy|fetchd> ...\n  \
+                        "usage: td-net <fetch|feed|subst|deploy|fetchd|launch> ...\n  \
                          (or invoke via the td-fetch / td-feed / td-subst / td-deploy / \
                          td-fetchd applet links)"
                     );
@@ -124,6 +132,7 @@ fn main() {
                 "td-feed" => feed::run(&argv),
                 "td-deploy" => deploy::run(&argv),
                 "td-fetchd" => fetchd::run(&argv),
+                "td-launch" => launch::run(&argv),
                 _ => subst::run(&argv),
             }
         }

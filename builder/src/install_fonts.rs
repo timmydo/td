@@ -133,7 +133,7 @@ fn verified(path: &Path, sha256: &str) -> bool {
 /// A fresh hidden directory of this process's beside `path`, named after
 /// it and `tag`. Those an install that was killed left, named for a
 /// process no longer running, are removed first, when `/proc` is there to
-/// say which are running, as `host-run` sweeps its runtime directories.
+/// say which are running, as `td-net launch` sweeps its runtime directories.
 /// `/proc` answers for this process's pid namespace, so two installs at
 /// once from namespaces that share the home (a container beside the host)
 /// can take each other's; a rerun repairs what that breaks.

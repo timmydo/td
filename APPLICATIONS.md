@@ -10389,19 +10389,39 @@ dependency-free Rust in the builder. The verb resolves the host's own
 cargo and C compiler the same way, with no static or musl requirement,
 since nothing it builds enters a build; builds the checkout's td-net and
 the application, taking each binary from cargo's own report of where it
-put it; and serves the application's fetch service itself, in a runtime
-directory of the launch's own under the session's
-(`$XDG_RUNTIME_DIR/td-host-run/PID`, mode 0700), which the application
-is given as its `XDG_RUNTIME_DIR` with the session's display made
-absolute: td-net's `fetchd` applet is started at `td-fetch/socket` there
-as a child, armed to die with the launcher, and stopped, its directory
-removed, when the application exits, whose exit code, or 128 plus its
-signal, is the launcher's. Two launches side by side are two services,
-neither the other's to take away; the session's own `td-fetch/socket` is
-never touched, so a direct `cargo run` still gets the application's
-named refusal, which now names the launcher; and a launch that is killed
-leaves no service, only a directory the next launch sweeps, judging by
-its own pid namespace, which is the session's. Every fetch
+put it; and becomes `td-net launch APP`, the multicall's `launch`
+applet, which serves the application's fetch service itself, in a
+runtime directory of the launch's own under the session's
+(`$XDG_RUNTIME_DIR/td-launch/PID`, mode 0700), and then becomes the
+application, by exec, with that directory as its `XDG_RUNTIME_DIR` and
+the session's display made absolute. The application keeps the launch's
+pid, terminal and exit status, so a shell's Ctrl-C and wait reach it as
+they reach any program. td-net's `fetchd` applet is started at
+`td-fetch/socket` there with `--exit-with-parent PID`, the launch's pid,
+in a process group of its own, so a terminal's signals pass it by: once
+its parent is no longer that pid, the application having ended however
+it ended, it removes the socket it bound, when that is still the one
+there, and the socket's directory when empty, and exits. td-net forbids
+`unsafe`, so that watch, not a parent-death signal, ties the service to
+the application. Invoked by the name `td-news` or `td-mail` through a
+link, td-net is `td-net launch` of the program of that name beside the
+binary the link resolves to, refusing one that is td-net itself by its
+device and inode; `launch` itself takes a path, never a name to look up
+on `PATH`. Two launches side by side are two services, neither the
+other's to take away; the session's own `td-fetch/socket` is never
+touched, so a direct `cargo run` still gets the application's named
+refusal, which now names the launcher; and a launch leaves only an empty
+directory named for its pid, which the next launch sweeps once that pid
+is no longer running, judging by its own pid namespace, which is the
+session's. A program the application starts (a browser for a link, a
+pager) inherits its runtime directory, which holds no session bus, audio
+or other socket of the session's and is swept once the application has
+ended; and a `WAYLAND_SOCKET` descriptor the launch inherited is held by
+the service as well, so the compositor sees it close only when both end.
+The service stays the application's child, unreaped should it end first;
+and, in a background process group of its own, it is stopped by a
+terminal set to `tostop` when it writes an error there, its fetches then
+waiting until the application ends. Every fetch
 the applications make goes through that service, as on td, since they
 carry no network client of their own; that is a property of the
 applications, not a boundary this launch enforces, and nothing of §W's

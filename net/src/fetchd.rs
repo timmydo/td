@@ -110,7 +110,7 @@ const PROBE_EXPECTED: &str = "error refused: loopback address";
 pub fn run(args: &[String]) {
     let code = match args.get(1).map(String::as_str) {
         Some("run") => match parse_run_args(args.get(2..).unwrap_or(&[])) {
-            Ok((socket, policy)) => match serve(Path::new(&socket), policy) {
+            Ok((socket, policy, parent)) => match serve(Path::new(&socket), policy, parent) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("td-fetchd: {e}");
@@ -140,7 +140,7 @@ pub fn run(args: &[String]) {
         },
         _ => {
             eprintln!(
-                "usage: td-fetchd run --socket PATH [--allow-loopback]\n       td-fetchd probe PATH"
+                "usage: td-fetchd run --socket PATH [--allow-loopback] [--exit-with-parent PID]\n       td-fetchd probe PATH"
             );
             2
         }
@@ -148,8 +148,9 @@ pub fn run(args: &[String]) {
     std::process::exit(code);
 }
 
-fn parse_run_args(args: &[String]) -> Result<(String, Policy), String> {
+fn parse_run_args(args: &[String]) -> Result<(String, Policy, Option<u32>), String> {
     let mut socket = None;
+    let mut parent = None;
     let mut policy = Policy {
         allow_loopback: false,
     };
@@ -166,12 +167,24 @@ fn parse_run_args(args: &[String]) -> Result<(String, Policy), String> {
             // For the recipe check and the unit tests, which serve on loopback:
             // never set by a unit.
             "--allow-loopback" => policy.allow_loopback = true,
+            // For td-launch, the service's only starter off td: it ends when
+            // the launched program, which holds this pid, does.
+            "--exit-with-parent" => {
+                let pid = it
+                    .next()
+                    .ok_or_else(|| "--exit-with-parent needs a pid".to_string())?;
+                parent = Some(
+                    pid.parse::<u32>()
+                        .map_err(|_| format!("--exit-with-parent {pid:?} is not a pid"))?,
+                );
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
     Ok((
         socket.ok_or_else(|| "--socket is required".to_string())?,
         policy,
+        parent,
     ))
 }
 
@@ -240,8 +253,15 @@ impl Fault {
     }
 }
 
-fn serve(socket: &Path, policy: Policy) -> Result<(), String> {
+/// How often a service started with `--exit-with-parent` looks at its
+/// parent.
+const PARENT_PACE: Duration = Duration::from_millis(250);
+
+fn serve(socket: &Path, policy: Policy, parent: Option<u32>) -> Result<(), String> {
     let listener = bind(socket)?;
+    if let Some(parent) = parent {
+        watch_parent(socket, parent)?;
+    }
     let active = Arc::new((Mutex::new(0usize), Condvar::new()));
     loop {
         let (stream, _) = match listener.accept() {
@@ -263,6 +283,36 @@ fn serve(socket: &Path, policy: Policy) -> Result<(), String> {
             eprintln!("td-fetchd: spawn worker: {e}");
         }
     }
+}
+
+/// Once this process's parent is no longer `parent`, the process that
+/// started it having exited and this one been adopted, remove the socket
+/// this service bound, when it is still the one at `socket`, and the
+/// directory it was made in, when that is empty, and exit. Watched only
+/// once bound, so a refused start removes nothing it did not make.
+fn watch_parent(socket: &Path, parent: u32) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let bound = std::fs::symlink_metadata(socket)
+        .map(|meta| (meta.dev(), meta.ino()))
+        .map_err(|e| format!("{}: {e}", socket.display()))?;
+    let socket = socket.to_path_buf();
+    std::thread::Builder::new()
+        .spawn(move || {
+            while std::os::unix::process::parent_id() == parent {
+                std::thread::sleep(PARENT_PACE);
+            }
+            let ours = std::fs::symlink_metadata(&socket)
+                .is_ok_and(|meta| (meta.dev(), meta.ino()) == bound);
+            if ours {
+                let _ = std::fs::remove_file(&socket);
+                if let Some(dir) = socket.parent() {
+                    let _ = std::fs::remove_dir(dir);
+                }
+            }
+            std::process::exit(0);
+        })
+        .map(drop)
+        .map_err(|e| format!("cannot watch the parent: {e}"))
 }
 
 /// One of the `WORKERS` places, given back when dropped, however the worker
@@ -826,9 +876,17 @@ fn bounded_line(text: &str) -> String {
 /// Connect, ask for the loopback URL, expect the policy's refusal: the
 /// socket is served, the framing is understood and the policy is on.
 fn probe(socket: &Path) -> Result<(), String> {
+    probe_within(socket, CLIENT_IO_TIMEOUT)
+}
+
+/// `probe`, each read and write given `budget`.
+pub(crate) fn probe_within(socket: &Path, budget: Duration) -> Result<(), String> {
     let mut stream = UnixStream::connect(socket).map_err(|e| format!("connect: {e}"))?;
     stream
-        .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+        .set_read_timeout(Some(budget))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(budget))
         .map_err(|e| e.to_string())?;
     stream
         .write_all(format!("{PROTOCOL}\nmethod GET\nurl {PROBE_URL}\n\n").as_bytes())
@@ -1010,11 +1068,28 @@ mod tests {
         assert!(check_scheme("https://h/p").is_ok());
         assert!(check_scheme("HTTP://h/p").is_ok());
         // The run arguments: the socket is required, the flag is off unless given.
-        let (socket, policy) = parse_run_args(&["--socket".into(), "/s".into()]).unwrap();
-        assert_eq!((socket.as_str(), policy.allow_loopback), ("/s", false));
-        let (_, policy) =
+        let (socket, policy, parent) = parse_run_args(&["--socket".into(), "/s".into()]).unwrap();
+        assert_eq!(
+            (socket.as_str(), policy.allow_loopback, parent),
+            ("/s", false, None)
+        );
+        let (_, policy, _) =
             parse_run_args(&["--socket".into(), "/s".into(), "--allow-loopback".into()]).unwrap();
         assert!(policy.allow_loopback);
+        let parent = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            parse_run_args(&args).map(|(_, _, parent)| parent)
+        };
+        assert_eq!(
+            parent(&["--exit-with-parent", "7", "--socket", "/s"]),
+            Ok(Some(7))
+        );
+        assert!(parent(&["--socket", "/s", "--exit-with-parent"])
+            .unwrap_err()
+            .contains("needs a pid"));
+        assert!(parent(&["--socket", "/s", "--exit-with-parent", "x"])
+            .unwrap_err()
+            .contains("not a pid"));
         assert!(parse_run_args(&["--allow-loopback".into()])
             .unwrap_err()
             .contains("required"));
