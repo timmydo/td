@@ -30,6 +30,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use td_ui::client::{App, Client, ClipboardEvent, Handled, KeyboardEvent, Tag, DISPLAY};
 use td_ui::clipboard::{Incoming, Outgoing};
+use td_ui::data;
 use td_ui::face::Face;
 use td_ui::font::Font;
 use td_ui::keyboard::Stroke;
@@ -88,6 +89,10 @@ const MAX_CMDLINE_BYTES: usize = 4096;
 const CLIPBOARD_PROOF_CMDLINE_TOKEN: &[u8] = b"td.firefox-input=1";
 
 const LEFT_BUTTON: u32 = 0x110;
+const MIDDLE_BUTTON: u32 = 0x112;
+/// Presses at one cell this close together are one gesture: a second
+/// selects the word, a third the row.
+const MULTI_CLICK_MS: u64 = 500;
 /// The two chords the terminal keeps for itself rather than sending.
 const COPY_CHORD: &str = "C-S-c";
 const PASTE_CHORD: &str = "C-S-v";
@@ -249,15 +254,52 @@ struct Child {
     _ready: Option<ready::Published>,
 }
 
-/// The clipboard's transfers and the text behind the live source.
+/// What td-term offered on one of the seat's selections: the text behind
+/// the live source, and the send in flight.
 #[derive(Default)]
-struct Board {
+struct Offered {
     text: Option<Arc<str>>,
     outgoing: Option<(Outgoing, Arc<str>)>,
-    incoming: Option<Incoming>,
+}
+
+/// The two selections' offers and the one paste in flight, with the
+/// selection it reads.
+#[derive(Default)]
+struct Board {
+    clipboard: Offered,
+    primary: Offered,
+    incoming: Option<(Incoming, data::Board)>,
     /// The proof's pending sync: its id, the source it confirms, and the
     /// length it will report.
     sync: Option<(u32, u32, usize)>,
+}
+
+impl Board {
+    fn offered(&mut self, board: data::Board) -> &mut Offered {
+        match board {
+            data::Board::Clipboard => &mut self.clipboard,
+            data::Board::Primary => &mut self.primary,
+        }
+    }
+
+    /// Drops the paste in flight if it reads `board`'s selection.
+    fn cancel_paste(&mut self, board: data::Board) {
+        if self
+            .incoming
+            .as_ref()
+            .is_some_and(|(_, from)| *from == board)
+        {
+            self.incoming = None;
+        }
+    }
+}
+
+/// A selection's name in what td-term says on stderr.
+fn named(board: data::Board) -> &'static str {
+    match board {
+        data::Board::Clipboard => "clipboard",
+        data::Board::Primary => "primary selection",
+    }
 }
 
 /// The pointer selection being made: the anchor and extent a frame closes.
@@ -272,6 +314,16 @@ struct Drag {
     link: Option<String>,
     /// A followed press is still held: its drag and release select nothing.
     following: bool,
+    /// What the press selects by, from how many came at its cell.
+    unit: render::Unit,
+    /// The last press: when, at which cell, and its count.
+    last_press: Option<(u64, (usize, usize), u8)>,
+    /// The drag has left its press's cell; until then a plain press
+    /// selects nothing.
+    moved: bool,
+    /// The serial of the release the next frame closes, at which the
+    /// selection becomes the primary selection.
+    released: Option<u32>,
 }
 
 /// The clipboard proof's markers, each said once per condition.
@@ -343,6 +395,7 @@ impl Window {
         let font = td_ui::font::pinned()?;
         let fallback = default_size(&font)?;
         let mut client = Client::new(stream, std::env::temp_dir())?;
+        client.want_primary();
         let waker = client.connection().waker()?;
         // Before the first frame: a machine whose devpts is missing should
         // fail without having drawn a window.
@@ -465,7 +518,10 @@ impl Window {
             return self.copy(serial);
         }
         if chord == PASTE_CHORD {
-            return self.paste();
+            if !self.paste(data::Board::Clipboard)? {
+                self.ring();
+            }
+            return Ok(());
         }
         self.clear_selection();
         if self.route(chord, stroke.text)? && stroke.repeat && !self.proof.enabled {
@@ -484,14 +540,20 @@ impl Window {
                 }
             }
             pointer::Event::Leave(_) => {
+                // A drag released outside the surface ends release, leave,
+                // frame: the frame still finishes it. One held is abandoned.
+                if self.drag.left_down || self.drag.released.is_none() {
+                    self.drag.anchor = None;
+                    self.drag.extent = None;
+                    self.drag.released = None;
+                }
                 self.drag.left_down = false;
-                self.drag.anchor = None;
-                self.drag.extent = None;
+                self.drag.last_press = None;
             }
             pointer::Event::Button {
                 button: LEFT_BUTTON,
                 pressed,
-                ..
+                serial,
             } => {
                 self.drag.left_down = pressed;
                 if pressed {
@@ -501,11 +563,28 @@ impl Window {
                         .then(|| self.shown_link(self.drag.position))
                         .flatten();
                     self.drag.anchor = Some(self.drag.position);
+                    self.drag.unit = self.count_press();
+                    self.drag.moved = false;
+                    self.drag.released = None;
                 } else if std::mem::take(&mut self.drag.following) {
                     return Ok(());
+                } else {
+                    self.drag.released = Some(serial);
                 }
                 self.drag.extent = Some(self.drag.position);
             }
+            // A middle press pastes the primary selection; with nothing
+            // to paste it does nothing, as foot's does.
+            pointer::Event::Button {
+                button: MIDDLE_BUTTON,
+                pressed: true,
+                ..
+            } => {
+                self.drag.last_press = None;
+                self.paste(data::Board::Primary)?;
+            }
+            // Another button's press ends a run of left presses.
+            pointer::Event::Button { pressed: true, .. } => self.drag.last_press = None,
             pointer::Event::Button { .. } => {}
             // A frame is the transaction: the selection and the wheel are
             // applied once when it closes.
@@ -513,6 +592,9 @@ impl Window {
                 if let Some(link) = self.drag.link.take() {
                     self.drag.anchor = None;
                     self.drag.extent = None;
+                    self.drag.released = None;
+                    // A followed press counts toward no word or row.
+                    self.drag.last_press = None;
                     // A release in the same frame already came and went.
                     self.drag.following = std::mem::take(&mut self.drag.left_down);
                     self.follow(&link);
@@ -525,6 +607,11 @@ impl Window {
                         self.drag.anchor.take()
                     };
                     self.select(anchor, extent);
+                    if !self.drag.left_down {
+                        if let Some(serial) = self.drag.released.take() {
+                            self.own_primary(serial)?;
+                        }
+                    }
                 }
                 let (rows, _) = self.wheel.frame();
                 if rows != 0 {
@@ -614,17 +701,55 @@ impl Window {
         Some((row, column))
     }
 
+    /// The press's unit from the presses that came at its cell in quick
+    /// succession: a second selects the word, a third the row, and a
+    /// fourth starts over at a cell.
+    fn count_press(&mut self) -> render::Unit {
+        let cell = self.cell_at(self.drag.position);
+        let count = match (self.drag.last_press, cell) {
+            (Some((at, previous, count)), Some(cell))
+                if previous == cell && self.clock.saturating_sub(at) <= MULTI_CLICK_MS =>
+            {
+                count % 3 + 1
+            }
+            _ => 1,
+        };
+        self.drag.last_press = cell.map(|cell| (self.clock, cell, count));
+        match count {
+            2 => render::Unit::Word,
+            3 => render::Unit::Row,
+            _ => render::Unit::Cell,
+        }
+    }
+
+    /// Selects from the press's anchor to `extent` by the press's unit. A
+    /// plain press selects nothing until its drag leaves its cell, so a
+    /// click clears the selection rather than taking one cell.
     fn select(&mut self, anchor: Option<(i32, i32)>, extent: (i32, i32)) {
         let Some(extent) = self.cell_at(extent) else {
             return;
         };
-        let next = match anchor.and_then(|anchor| self.cell_at(anchor)) {
-            Some(anchor) => Some(render::Selection { anchor, extent }),
-            None => self.selection.map(|selection| render::Selection {
-                anchor: selection.anchor,
-                extent,
-            }),
+        let pressed = anchor.and_then(|anchor| self.cell_at(anchor));
+        let (anchor, unit) = match (pressed, self.selection) {
+            (Some(anchor), _) => (anchor, self.drag.unit),
+            (None, Some(selection)) => (selection.anchor, render::Unit::Cell),
+            (None, None) => return,
         };
+        let unmoved =
+            pressed.is_some() && unit == render::Unit::Cell && !self.drag.moved && extent == anchor;
+        let next = if unmoved {
+            None
+        } else {
+            let Some(terminal) = self.model.as_ref() else {
+                return;
+            };
+            let viewport = self.viewport.offset(terminal.scrollback());
+            let snapshot = render::Snapshot::new(terminal, false, false).scrolled_back(viewport);
+            Some(snapshot.select(unit, anchor, extent))
+        };
+        if pressed.is_some() && !unmoved {
+            self.drag.moved = true;
+        }
         if next != self.selection {
             self.selection = next;
             self.stale = true;
@@ -693,8 +818,14 @@ impl Window {
         }
         let source = self.client.offer_selection(serial)?;
         let length = text.len();
-        self.board.text = Some(Arc::from(text));
-        if self.board.incoming.take().is_some() {
+        self.board.clipboard.text = Some(Arc::from(text));
+        if self
+            .board
+            .incoming
+            .as_ref()
+            .is_some_and(|(_, from)| *from == data::Board::Clipboard)
+        {
+            self.board.incoming = None;
             self.stale = true;
         }
         if self.proof.enabled {
@@ -707,30 +838,54 @@ impl Window {
         Ok(())
     }
 
-    fn paste(&mut self) -> Result<()> {
-        if !self.client.clipboard()
-            || !self.client.input().focused
-            || self.board.incoming.is_some()
-            || self.client.selection_mime().is_none()
-        {
-            self.ring();
+    /// Makes the selection a release finished the primary selection at
+    /// the release's serial, as foot does. Quietly: a seat without one, or
+    /// a selection over the bound, is nothing the person asked about.
+    fn own_primary(&mut self, serial: u32) -> Result<()> {
+        if !self.client.primary() {
             return Ok(());
+        }
+        let Ok(Some(text)) = self.selected_text() else {
+            return Ok(());
+        };
+        self.client.offer_primary(serial)?;
+        self.board.primary.text = Some(Arc::from(text));
+        Ok(())
+    }
+
+    /// Starts reading `board`'s selection for the child, and says whether
+    /// it could: the selection must be live and offer text, the terminal
+    /// focused, and no paste already in flight. An endpoint that cannot be
+    /// made rings, and counts as started.
+    fn paste(&mut self, board: data::Board) -> Result<bool> {
+        let offered = match board {
+            data::Board::Clipboard => {
+                self.client.clipboard() && self.client.selection_mime().is_some()
+            }
+            data::Board::Primary => self.client.primary() && self.client.primary_mime().is_some(),
+        };
+        if !offered || !self.client.input().focused || self.board.incoming.is_some() {
+            return Ok(false);
         }
         let (incoming, peer) = match Incoming::begin(self.clock) {
             Ok(pair) => pair,
             Err(error) => {
                 let _ = writeln!(
                     std::io::stderr().lock(),
-                    "td-term: paste refused: clipboard endpoint: {error}"
+                    "td-term: paste refused: {} endpoint: {error}",
+                    named(board)
                 );
                 self.ring();
-                return Ok(());
+                return Ok(true);
             }
         };
-        self.client.receive(&peer)?;
+        match board {
+            data::Board::Clipboard => self.client.receive(&peer)?,
+            data::Board::Primary => self.client.receive_primary(&peer)?,
+        }
         drop(peer);
-        self.board.incoming = Some(incoming);
-        Ok(())
+        self.board.incoming = Some((incoming, board));
+        Ok(true)
     }
 
     /// A whole paste reaches the child, bracketed when the child asked; one
@@ -757,36 +912,41 @@ impl Window {
         Ok(())
     }
 
-    fn clipboard(&mut self, event: ClipboardEvent) {
+    /// One selection's outcome: a change cancels the paste reading it, a
+    /// send writes what td-term offered there, and a cancel or the
+    /// manager's removal drops it.
+    fn selection_event(&mut self, board: data::Board, event: ClipboardEvent) {
+        let clock = self.clock;
         match event {
-            ClipboardEvent::Selection => {
-                self.board.incoming = None;
-            }
+            ClipboardEvent::Selection => self.board.cancel_paste(board),
             ClipboardEvent::Send(right) => {
+                let offered = self.board.offered(board);
                 // A busy send drops exactly its right.
-                if self.board.outgoing.is_some() {
+                if offered.outgoing.is_some() {
                     return;
                 }
-                let Some(text) = self.board.text.clone() else {
+                let Some(text) = offered.text.clone() else {
                     return;
                 };
-                match Outgoing::begin(right, Arc::clone(&text), self.clock) {
-                    Ok(transfer) => self.board.outgoing = Some((transfer, text)),
+                match Outgoing::begin(right, Arc::clone(&text), clock) {
+                    Ok(transfer) => offered.outgoing = Some((transfer, text)),
                     Err(error) => {
                         let _ = writeln!(
                             std::io::stderr().lock(),
-                            "td-term: clipboard send refused: {error}"
+                            "td-term: {} send refused: {error}",
+                            named(board)
                         );
                     }
                 }
             }
-            ClipboardEvent::Cancelled => self.board.text = None,
+            ClipboardEvent::Cancelled => self.board.offered(board).text = None,
             ClipboardEvent::Released => {
-                self.board.incoming = None;
-                if let Some((transfer, _)) = self.board.outgoing.take() {
+                self.board.cancel_paste(board);
+                let offered = self.board.offered(board);
+                if let Some((transfer, _)) = offered.outgoing.take() {
                     let _ = transfer.cancel();
                 }
-                self.board.text = None;
+                offered.text = None;
             }
         }
     }
@@ -800,11 +960,11 @@ impl Window {
             .board
             .incoming
             .as_ref()
-            .is_some_and(|incoming| due(incoming.expired(now)))
+            .is_some_and(|(incoming, _)| due(incoming.expired(now)))
         {
-            if let Some(mut incoming) = self.board.incoming.take() {
+            if let Some((mut incoming, board)) = self.board.incoming.take() {
                 match incoming.step(now) {
-                    Ok(false) => self.board.incoming = Some(incoming),
+                    Ok(false) => self.board.incoming = Some((incoming, board)),
                     Ok(true) => match incoming.finish() {
                         Ok(text) if self.client.input().focused => self.pasted(text)?,
                         Ok(_) => {}
@@ -814,28 +974,36 @@ impl Window {
                 }
             }
         }
-        if self
-            .board
-            .outgoing
-            .as_ref()
-            .is_some_and(|(outgoing, _)| due(outgoing.expired(now)))
-        {
-            if let Some((mut outgoing, text)) = self.board.outgoing.take() {
-                match outgoing.step(now) {
-                    Ok(false) => self.board.outgoing = Some((outgoing, text)),
-                    Ok(true) => {
-                        let mut report = format!("td-term: clipboard sent bytes={}\n", text.len());
-                        if let Some(marker) = clipboard_sent_marker(self.proof.enabled, &text) {
-                            report.push_str(&marker);
-                        }
-                        let _ = std::io::stderr().lock().write_all(report.as_bytes());
+        for board in [data::Board::Clipboard, data::Board::Primary] {
+            let offered = self.board.offered(board);
+            if !offered
+                .outgoing
+                .as_ref()
+                .is_some_and(|(outgoing, _)| due(outgoing.expired(now)))
+            {
+                continue;
+            }
+            let Some((mut outgoing, text)) = offered.outgoing.take() else {
+                continue;
+            };
+            match outgoing.step(now) {
+                Ok(false) => offered.outgoing = Some((outgoing, text)),
+                // The primary selection is read at every middle click
+                // anywhere, so only the clipboard's sends are reported.
+                Ok(true) if board == data::Board::Primary => {}
+                Ok(true) => {
+                    let mut report = format!("td-term: clipboard sent bytes={}\n", text.len());
+                    if let Some(marker) = clipboard_sent_marker(self.proof.enabled, &text) {
+                        report.push_str(&marker);
                     }
-                    Err(error) => {
-                        let _ = writeln!(
-                            std::io::stderr().lock(),
-                            "td-term: clipboard send failed: {error}"
-                        );
-                    }
+                    let _ = std::io::stderr().lock().write_all(report.as_bytes());
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "td-term: {} send failed: {error}",
+                        named(board)
+                    );
                 }
             }
         }
@@ -850,7 +1018,10 @@ impl Window {
             return 1;
         }
         let mut wait = self.client.wait_ms(now);
-        if self.board.incoming.is_some() || self.board.outgoing.is_some() {
+        if self.board.incoming.is_some()
+            || self.board.clipboard.outgoing.is_some()
+            || self.board.primary.outgoing.is_some()
+        {
             wait = wait.min(TRANSFER_WAIT_MS);
         }
         if self.child.is_none() {
@@ -1304,9 +1475,8 @@ impl App for Window {
                 KeyboardEvent::Focus(true) | KeyboardEvent::Ready | KeyboardEvent::Held(_) => {}
             },
             Handled::Pointer(event) => self.pointer(event)?,
-            Handled::Clipboard(event) => self.clipboard(event),
-            // td-term does not ask for the primary selection.
-            Handled::Primary(_) => {}
+            Handled::Clipboard(event) => self.selection_event(data::Board::Clipboard, event),
+            Handled::Primary(event) => self.selection_event(data::Board::Primary, event),
             Handled::Capabilities { keyboard, pointer } => {
                 if !keyboard {
                     self.keymap_ready = false;
@@ -1688,8 +1858,10 @@ mod tests {
 
     const SEAT: u32 = 10;
     const DEVICE: u32 = 12;
-    const POINTER: u32 = 13;
-    const KEYBOARD: u32 = 14;
+    const PRIMARY_MANAGER: u32 = 13;
+    const PRIMARY_DEVICE: u32 = 14;
+    const POINTER: u32 = 15;
+    const KEYBOARD: u32 = 16;
     const SHIFT: u32 = 1;
     const CONTROL: u32 = 4;
     const ALT: u32 = 8;
@@ -1733,8 +1905,9 @@ mod tests {
             .0
     }
 
-    /// A window bound to a scripted compositor offering a seat and a
-    /// clipboard, both devices created: `(window, peer)`.
+    /// A window bound to a scripted compositor offering a seat, a
+    /// clipboard and a primary selection, both devices created:
+    /// `(window, peer)`.
     fn fixture() -> (Window, UnixStream) {
         fixture_for(Profile::Td {
             ready_socket: std::env::temp_dir().join("td-term-unused-ready"),
@@ -1759,6 +1932,7 @@ mod tests {
             global(3, "xdg_wm_base", 1),
             global(4, "wl_seat", 7),
             global(5, "wl_data_device_manager", 3),
+            global(6, "zwp_primary_selection_device_manager_v1", 1),
         ] {
             window.event(event).unwrap();
         }
@@ -2152,7 +2326,7 @@ mod tests {
             requests.iter().any(|m| m.object == DEVICE && m.opcode == 1),
             "set_selection"
         );
-        assert_eq!(window.board.text.as_deref(), Some("Welcome"));
+        assert_eq!(window.board.clipboard.text.as_deref(), Some("Welcome"));
         assert!(window.selection.is_some(), "a copy keeps the selection");
         assert!(window.board.sync.is_none(), "no proof, no sync");
     }
@@ -2164,8 +2338,12 @@ mod tests {
             .unwrap();
     }
 
-    /// A left press, or release, and the frame that closes it.
+    /// A left press, or release, and the frame that closes it. Each press
+    /// comes after the last one's multi-click window, so it is a single.
     fn click(window: &mut Window, pressed: bool) {
+        if pressed {
+            window.clock += MULTI_CLICK_MS + 1;
+        }
         window
             .event(message(
                 POINTER,
@@ -2190,7 +2368,7 @@ mod tests {
     /// browser that cannot start, so the bell rings) and selects nothing:
     /// the selection stays through the press, its drag and its release.
     /// Control off a link, and a press without Control on one, are plain
-    /// presses that select their cell.
+    /// presses, which clear the selection.
     #[test]
     fn a_control_press_follows_a_link_and_is_otherwise_a_selection() {
         const NUM_LOCK: u32 = 16;
@@ -2222,29 +2400,25 @@ mod tests {
         point(&mut window, 1);
         click(&mut window, true);
         click(&mut window, false);
-        let cell = |column| {
-            Some(render::Selection {
-                anchor: (0, column),
-                extent: (0, column),
-            })
-        };
-        assert_eq!(window.selection, cell(1));
-        // Without Control a press on the link selects its cell.
+        assert_eq!(window.selection, None);
+        // Without Control a press on the link is plain.
         modifiers(&mut window, 0);
+        window.selection = before;
         shown(&mut window);
         point(&mut window, 10);
         click(&mut window, true);
         click(&mut window, false);
-        assert_eq!(window.selection, cell(10));
+        assert_eq!(window.selection, None);
         assert!(!bell(&mut window));
         // Nor with Shift or Alt beside Control: the press is Control's alone.
         for (other, column) in [(SHIFT, 11), (ALT, 12)] {
             modifiers(&mut window, CONTROL | other);
+            window.selection = before;
             shown(&mut window);
             point(&mut window, column);
             click(&mut window, true);
             click(&mut window, false);
-            assert_eq!(window.selection, cell(usize::try_from(column).unwrap()));
+            assert_eq!(window.selection, None);
             assert!(!bell(&mut window));
         }
         point(&mut window, 10);
@@ -2279,7 +2453,7 @@ mod tests {
         click(&mut window, true);
         click(&mut window, false);
         assert!(!bell(&mut window));
-        assert_eq!(window.selection, cell(10));
+        assert_eq!(window.selection, None);
 
         // Nor is one committed whose callback has not come: the old picture
         // may still be up. Once it has, the press follows.
@@ -2331,6 +2505,317 @@ mod tests {
         assert_eq!(window.link_at((-256, 128)), None);
     }
 
+    /// A left press or release at `serial` at a column of the first row,
+    /// at `clock`, and the frame that closes it.
+    fn press_at(window: &mut Window, column: u32, clock: u64, serial: u32, pressed: bool) {
+        window.clock = clock;
+        point(window, column);
+        window
+            .event(message(
+                POINTER,
+                3,
+                &[serial, 0, LEFT_BUTTON, u32::from(pressed)],
+            ))
+            .unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+    }
+
+    fn selection(anchor: (usize, usize), extent: (usize, usize)) -> Option<render::Selection> {
+        Some(render::Selection { anchor, extent })
+    }
+
+    /// A second press at a cell within the multi-click window selects the
+    /// word under it, a third its row, and a fourth starts over; a slow
+    /// press, or one at another cell, is a single.
+    #[test]
+    fn a_double_press_selects_the_word_and_a_triple_its_row() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.output(b"ls -la /tmp:foo").unwrap();
+        let columns = usize::from(window.cells.unwrap().1);
+        press_at(&mut window, 8, 1000, 2, true);
+        press_at(&mut window, 8, 1050, 3, false);
+        assert_eq!(window.selection, None, "a single selects nothing");
+        press_at(&mut window, 8, 1200, 4, true);
+        assert_eq!(window.selection, selection((0, 7), (0, 10)));
+        press_at(&mut window, 8, 1250, 5, false);
+        assert_eq!(window.selected_text().unwrap().as_deref(), Some("/tmp"));
+        press_at(&mut window, 8, 1400, 6, true);
+        press_at(&mut window, 8, 1450, 7, false);
+        assert_eq!(window.selection, selection((0, 0), (0, columns - 1)));
+        assert_eq!(
+            window.selected_text().unwrap().as_deref(),
+            Some("ls -la /tmp:foo")
+        );
+        press_at(&mut window, 8, 1600, 8, true);
+        press_at(&mut window, 8, 1650, 9, false);
+        assert_eq!(window.selection, None, "a fourth starts over");
+        // Too slow for a double.
+        press_at(&mut window, 8, 3000, 10, true);
+        press_at(&mut window, 8, 3050, 11, false);
+        press_at(&mut window, 8, 3600, 12, true);
+        press_at(&mut window, 8, 3650, 13, false);
+        assert_eq!(window.selection, None);
+        // Another cell is another gesture.
+        press_at(&mut window, 13, 3700, 14, true);
+        press_at(&mut window, 13, 3720, 15, false);
+        assert_eq!(window.selection, None);
+        press_at(&mut window, 13, 3800, 16, true);
+        press_at(&mut window, 13, 3820, 17, false);
+        assert_eq!(window.selection, selection((0, 12), (0, 14)));
+        // Another button's press between two ends the run.
+        press_at(&mut window, 13, 5000, 18, true);
+        press_at(&mut window, 13, 5020, 19, false);
+        window
+            .event(message(POINTER, 3, &[20, 0, MIDDLE_BUTTON, 1]))
+            .unwrap();
+        window
+            .event(message(POINTER, 3, &[21, 0, MIDDLE_BUTTON, 0]))
+            .unwrap();
+        press_at(&mut window, 13, 5100, 22, true);
+        press_at(&mut window, 13, 5120, 23, false);
+        assert_eq!(window.selection, None, "a single, not a double");
+    }
+
+    /// A followed link press counts toward no gesture: a plain press at
+    /// its cell right after is a single, not a double.
+    #[test]
+    fn a_followed_link_press_starts_no_gesture() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.browser = Some("/nonexistent/td-term-browser".into());
+        window.output(b"see https://e.example/x now").unwrap();
+        shown(&mut window);
+        modifiers(&mut window, CONTROL);
+        press_at(&mut window, 10, 1000, 2, true);
+        press_at(&mut window, 10, 1050, 3, false);
+        assert!(bell(&mut window), "followed");
+        modifiers(&mut window, 0);
+        shown(&mut window);
+        press_at(&mut window, 10, 1100, 4, true);
+        press_at(&mut window, 10, 1150, 5, false);
+        assert_eq!(window.selection, None);
+    }
+
+    /// td's own compositor offers no primary-selection manager: a drag's
+    /// release offers nothing and a middle press does nothing, and neither
+    /// ends the terminal.
+    #[test]
+    fn without_a_primary_selection_a_release_and_a_middle_press_do_nothing() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        theirs
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let options = Options {
+            socket: None,
+            profile: Profile::Desktop,
+            working_directory: None,
+            command: Vec::new(),
+        };
+        let mut window = Window::new(ours, options, "/run/wayland-test".into()).unwrap();
+        for event in [
+            global(1, "wl_compositor", 4),
+            global(2, "wl_shm", 1),
+            global(3, "xdg_wm_base", 1),
+            global(4, "wl_seat", 7),
+            global(5, "wl_data_device_manager", 3),
+        ] {
+            window.event(event).unwrap();
+        }
+        window.event(message(SYNC, 0, &[0])).unwrap();
+        window.event(message(DISPLAY, 1, &[SYNC])).unwrap();
+        window.event(message(SHM, 0, &[1])).unwrap();
+        window.event(message(SEAT, 0, &[3])).unwrap();
+        assert!(!window.client.primary());
+        let pointer = window.client.pointer().unwrap();
+        configure(&mut window, 640, 320, true);
+        window.draw().unwrap();
+        window.output(b"Welcome").unwrap();
+        peer::drain(&theirs).unwrap();
+        let at = |column: u32| column * 8 * 256 + 128;
+        for event in [
+            message(pointer, 0, &[1, SURFACE, at(0), 128]),
+            message(pointer, 3, &[2, 0, LEFT_BUTTON, 1]),
+            message(pointer, 5, &[]),
+            message(pointer, 2, &[0, at(6), 128]),
+            message(pointer, 3, &[3, 0, LEFT_BUTTON, 0]),
+            message(pointer, 5, &[]),
+            message(pointer, 3, &[4, 0, MIDDLE_BUTTON, 1]),
+            message(pointer, 5, &[]),
+        ] {
+            window.event(event).unwrap();
+        }
+        assert_eq!(window.selected_text().unwrap().as_deref(), Some("Welcome"));
+        assert!(window.board.primary.text.is_none());
+        assert!(window.board.incoming.is_none());
+        assert!(peer::drain(&theirs).unwrap().0.is_empty());
+    }
+
+    /// A drag after a double press extends a word at a time, and the
+    /// pressed word stays selected whichever way it goes.
+    #[test]
+    fn a_double_press_drags_by_words() {
+        let (mut window, _peer) = presented();
+        window.output(b"one two three").unwrap();
+        press_at(&mut window, 5, 1000, 2, true);
+        press_at(&mut window, 5, 1050, 3, false);
+        press_at(&mut window, 5, 1100, 4, true);
+        point(&mut window, 9);
+        window.event(message(POINTER, 5, &[])).unwrap();
+        assert_eq!(window.selection, selection((0, 4), (0, 12)));
+        point(&mut window, 1);
+        window.event(message(POINTER, 5, &[])).unwrap();
+        assert_eq!(window.selection, selection((0, 6), (0, 0)));
+        press_at(&mut window, 1, 1300, 5, false);
+        assert_eq!(window.selected_text().unwrap().as_deref(), Some("one two"));
+    }
+
+    /// The selection a release finishes becomes the primary selection at
+    /// the release's serial, and a send writes its text. A click, which
+    /// selects nothing, offers nothing.
+    #[test]
+    fn a_release_makes_the_selection_primary_and_its_send_writes_it() {
+        let (mut window, peer) = presented();
+        window.output(b"Welcome to td").unwrap();
+        press_at(&mut window, 2, 1000, 2, true);
+        press_at(&mut window, 2, 1050, 3, false);
+        let (requests, _) = peer::drain(&peer).unwrap();
+        assert!(!requests.iter().any(|m| m.object == PRIMARY_DEVICE));
+        press_at(&mut window, 0, 2000, 4, true);
+        point(&mut window, 6);
+        window.event(message(POINTER, 5, &[])).unwrap();
+        let (requests, _) = peer::drain(&peer).unwrap();
+        assert!(
+            !requests.iter().any(|m| m.object == PRIMARY_DEVICE),
+            "not while the button is held"
+        );
+        press_at(&mut window, 6, 2100, 77, false);
+        let (requests, _) = peer::drain(&peer).unwrap();
+        let source = window.client.primary_source().unwrap();
+        assert_eq!(
+            requests,
+            [
+                message(PRIMARY_MANAGER, 0, &[source]),
+                text(source, 0, td_ui::data::UTF8),
+                text(source, 0, td_ui::data::PLAIN),
+                message(PRIMARY_DEVICE, 0, &[source, 77]),
+            ]
+        );
+        assert_eq!(window.board.primary.text.as_deref(), Some("Welcome"));
+        assert!(
+            window.board.clipboard.text.is_none(),
+            "the clipboard is apart"
+        );
+        // The primary selection's send carries a right td-term writes to.
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        peer::push_descriptor(window.client.connection(), writer.into()).unwrap();
+        window.event(text(source, 0, td_ui::data::UTF8)).unwrap();
+        assert!(window.board.primary.outgoing.is_some());
+        window.transfers(window.clock, true).unwrap();
+        assert!(window.board.primary.outgoing.is_none());
+        let mut sent = String::new();
+        reader.read_to_string(&mut sent).unwrap();
+        assert_eq!(sent, "Welcome");
+        // Output clears what is shown; what was offered stays offered.
+        window.output(b"!").unwrap();
+        assert!(window.selection.is_none());
+        assert_eq!(window.client.primary_source(), Some(source));
+        // The compositor's cancel drops the text.
+        window.event(message(source, 1, &[])).unwrap();
+        assert!(window.board.primary.text.is_none());
+    }
+
+    /// A drag released past the surface's edge comes as release, leave,
+    /// frame; the frame still finishes it and offers it. A drag the
+    /// pointer leaves while held is abandoned.
+    #[test]
+    fn a_drag_released_outside_the_surface_still_becomes_primary() {
+        let (mut window, peer) = presented();
+        window.output(b"Welcome to td").unwrap();
+        press_at(&mut window, 0, 1000, 2, true);
+        point(&mut window, 6);
+        window.event(message(POINTER, 5, &[])).unwrap();
+        peer::drain(&peer).unwrap();
+        window
+            .event(message(POINTER, 3, &[3, 0, LEFT_BUTTON, 0]))
+            .unwrap();
+        window.event(message(POINTER, 1, &[4, SURFACE])).unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        assert_eq!(window.selected_text().unwrap().as_deref(), Some("Welcome"));
+        let source = window.client.primary_source().unwrap();
+        let (requests, _) = peer::drain(&peer).unwrap();
+        assert!(requests.contains(&message(PRIMARY_DEVICE, 0, &[source, 3])));
+        assert_eq!(window.drag.anchor, None);
+        // Held when the pointer leaves: nothing is finished or offered.
+        window
+            .event(message(POINTER, 0, &[5, SURFACE, 128, 128]))
+            .unwrap();
+        press_at(&mut window, 0, 3000, 6, true);
+        point(&mut window, 2);
+        window.event(message(POINTER, 5, &[])).unwrap();
+        peer::drain(&peer).unwrap();
+        window.event(message(POINTER, 1, &[7, SURFACE])).unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        assert_eq!(window.drag.anchor, None);
+        assert_eq!(window.client.primary_source(), Some(source));
+        assert!(peer::drain(&peer).unwrap().0.is_empty());
+    }
+
+    /// A middle press pastes the primary selection, read from its offer;
+    /// with nothing to paste it does nothing, bell included. A change of
+    /// the primary selection cancels its paste, the clipboard's does not.
+    #[test]
+    fn a_middle_press_pastes_the_primary_selection() {
+        let (mut window, peer) = presented();
+        focus(&mut window, 5);
+        window.stale = false;
+        let middle = |window: &mut Window| {
+            window
+                .event(message(POINTER, 3, &[9, 0, MIDDLE_BUTTON, 1]))
+                .unwrap();
+            window
+                .event(message(POINTER, 3, &[10, 0, MIDDLE_BUTTON, 0]))
+                .unwrap();
+            window.event(message(POINTER, 5, &[])).unwrap();
+        };
+        middle(&mut window);
+        assert!(window.board.incoming.is_none());
+        assert!(!window.stale, "no bell");
+        let offer = 0xff00_0002;
+        window.event(message(PRIMARY_DEVICE, 0, &[offer])).unwrap();
+        window.event(text(offer, 0, "text/plain")).unwrap();
+        window.event(message(PRIMARY_DEVICE, 1, &[offer])).unwrap();
+        peer::drain(&peer).unwrap();
+        middle(&mut window);
+        assert!(matches!(
+            window.board.incoming,
+            Some((_, td_ui::data::Board::Primary))
+        ));
+        let (requests, files) = peer::drain(&peer).unwrap();
+        assert_eq!(requests, [text(offer, 0, "text/plain")]);
+        // The clipboard's selection changing leaves it.
+        window.event(message(DEVICE, 5, &[0])).unwrap();
+        assert!(window.board.incoming.is_some());
+        let mut file = files.into_iter().next().unwrap();
+        file.write_all(b"echo hi").unwrap();
+        drop(file);
+        window.transfers(window.clock, true).unwrap();
+        assert!(window.board.incoming.is_none());
+        assert_eq!(window.input.take_for_test(), b"echo hi");
+        // A copy changes only the clipboard, so it leaves it too.
+        middle(&mut window);
+        assert!(window.board.incoming.is_some());
+        window.output(b"copied").unwrap();
+        window.selection = selection((0, 0), (0, 5));
+        modifiers(&mut window, SHIFT | CONTROL);
+        press(&mut window, 46);
+        assert_eq!(window.board.clipboard.text.as_deref(), Some("copied"));
+        assert!(window.board.incoming.is_some());
+        // Its own selection changing cancels it.
+        window.event(message(PRIMARY_DEVICE, 1, &[0])).unwrap();
+        assert!(window.board.incoming.is_none());
+    }
+
     #[test]
     fn the_copy_bound_is_on_the_trimmed_text() {
         let (mut window, _peer) = presented();
@@ -2372,6 +2857,11 @@ mod tests {
             .unwrap();
         window
             .event(message(POINTER, 3, &[2, 0, LEFT_BUTTON, 1]))
+            .unwrap();
+        window.event(message(POINTER, 5, &[])).unwrap();
+        assert!(window.selection.is_none(), "a press alone selects nothing");
+        window
+            .event(message(POINTER, 2, &[0, fixed(3, 8), fixed(0, 16)]))
             .unwrap();
         window.event(message(POINTER, 5, &[])).unwrap();
         assert!(window.selection.is_some());

@@ -911,6 +911,84 @@ fn the_viewport_renders_history_pixels_rather_than_the_live_screen() {
     assert_ne!(live, back);
 }
 
+// ------------------------------------------------------- selection units
+
+fn screen_of(text: &str, columns: usize) -> Terminal {
+    let mut terminal = Terminal::new(2, columns).unwrap();
+    terminal.feed(text.as_bytes());
+    terminal
+}
+
+#[test]
+fn a_word_is_a_run_of_its_class() {
+    // 0         1         2
+    // 0123456789012345678901
+    // ls -la /tmp:foo  (bar)
+    let terminal = screen_of("ls -la /tmp:foo  (bar)", 30);
+    let view = Snapshot::new(&terminal, false, false);
+    let word = |column| view.span(Unit::Word, 0, column);
+    assert_eq!(word(0), (0, 1));
+    assert_eq!(word(2), (2, 2), "one blank");
+    assert_eq!(word(4), (3, 5));
+    assert_eq!(word(8), (7, 10), "a slash is part of a word");
+    assert_eq!(word(11), (11, 11), "a colon is foot's delimiter");
+    assert_eq!(word(13), (12, 14));
+    assert_eq!(word(15), (15, 16), "blanks are a run of their own");
+    assert_eq!(word(17), (17, 17));
+    assert_eq!(word(19), (18, 20));
+    assert_eq!(word(21), (21, 21));
+    assert_eq!(word(25), (22, 29), "trailing blanks to the edge");
+    assert_eq!(word(99), (22, 29), "a column past the edge is the edge");
+    assert_eq!(view.span(Unit::Row, 0, 4), (0, 29));
+    assert_eq!(view.span(Unit::Cell, 0, 4), (4, 4));
+    let terminal = screen_of("a\u{2502}b", 4);
+    let view = Snapshot::new(&terminal, false, false);
+    assert_eq!(view.span(Unit::Word, 0, 0), (0, 0));
+    assert_eq!(view.span(Unit::Word, 0, 1), (1, 1), "box drawing too");
+    assert_eq!(view.span(Unit::Word, 0, 2), (2, 2));
+    // A run of delimiters is one unit, as foot's is.
+    let terminal = screen_of("f((x)):", 8);
+    let view = Snapshot::new(&terminal, false, false);
+    assert_eq!(view.span(Unit::Word, 0, 1), (1, 2));
+    assert_eq!(view.span(Unit::Word, 0, 3), (3, 3));
+    assert_eq!(view.span(Unit::Word, 0, 5), (4, 6));
+}
+
+#[test]
+fn a_drag_by_unit_keeps_the_anchors_whole_unit_either_way() {
+    // one two three
+    // four five
+    let terminal = screen_of("one two three\r\nfour five", 20);
+    let view = Snapshot::new(&terminal, false, false);
+    let range = |anchor, extent| Selection { anchor, extent };
+    assert_eq!(
+        view.select(Unit::Word, (0, 9), (0, 9)),
+        range((0, 8), (0, 12)),
+        "a press selects its word"
+    );
+    assert_eq!(
+        view.select(Unit::Word, (0, 5), (0, 9)),
+        range((0, 4), (0, 12))
+    );
+    assert_eq!(
+        view.select(Unit::Word, (0, 5), (0, 1)),
+        range((0, 6), (0, 0)),
+        "backward keeps the anchor's word"
+    );
+    assert_eq!(
+        view.select(Unit::Word, (0, 5), (1, 6)),
+        range((0, 4), (1, 8))
+    );
+    assert_eq!(
+        view.select(Unit::Row, (1, 3), (0, 2)),
+        range((1, 19), (0, 0))
+    );
+    assert_eq!(
+        view.select(Unit::Cell, (0, 5), (0, 1)),
+        range((0, 5), (0, 1))
+    );
+}
+
 // ------------------------------------------------------------------- ppm
 
 #[test]

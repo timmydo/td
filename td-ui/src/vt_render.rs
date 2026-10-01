@@ -162,6 +162,37 @@ impl Selection {
     }
 }
 
+/// What a press selects by: its cell, the word under it (a second press),
+/// or its row (a third), as foot's mouse bindings do.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Unit {
+    #[default]
+    Cell,
+    Word,
+    Row,
+}
+
+/// foot's default `word-delimiters`. A run of them is a unit of its own,
+/// as a run of blanks is, so a word stops at either.
+pub const WORD_DELIMITERS: &str = ",\u{2502}`|:\"'()[]{}<>";
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Class {
+    Blank,
+    Delimiter,
+    Word,
+}
+
+fn class(scalar: char) -> Class {
+    if scalar.is_whitespace() || scalar == '\0' {
+        Class::Blank
+    } else if WORD_DELIMITERS.contains(scalar) {
+        Class::Delimiter
+    } else {
+        Class::Word
+    }
+}
+
 /// A complete screen as one frame sees it: the model, where the cursor is,
 /// how far back the scrollback viewport is scrolled, whether the surface
 /// holds the keyboard, and the one coalesced visual-bell bit.
@@ -269,6 +300,51 @@ impl<'a> Snapshot<'a> {
             cell.attributes.inverse = !cell.attributes.inverse;
         }
         cell
+    }
+
+    /// The first and last columns of the unit at a cell in this view: the
+    /// cell; the run of word, blank or delimiter cells around it, as
+    /// foot's word is; or the whole row. A row is the screen's, so a line
+    /// the terminal wrapped is selected a row at a time.
+    pub fn span(&self, unit: Unit, row: usize, column: usize) -> (usize, usize) {
+        let last = self.columns().saturating_sub(1);
+        let column = column.min(last);
+        match unit {
+            Unit::Cell => (column, column),
+            Unit::Row => (0, last),
+            Unit::Word => {
+                let kind = class(self.cell(row, column).scalar);
+                let same = |at: usize| class(self.cell(row, at).scalar) == kind;
+                let mut start = column;
+                while start > 0 && same(start.saturating_sub(1)) {
+                    start = start.saturating_sub(1);
+                }
+                let mut end = column;
+                while end < last && same(end.saturating_add(1)) {
+                    end = end.saturating_add(1);
+                }
+                (start, end)
+            }
+        }
+    }
+
+    /// The selection a press at `anchor` dragged to `extent` makes by
+    /// `unit`: from the anchor's unit to the extent's, whichever way the
+    /// drag went, so the anchor's whole unit stays selected.
+    pub fn select(&self, unit: Unit, anchor: (usize, usize), extent: (usize, usize)) -> Selection {
+        let (anchor_start, anchor_end) = self.span(unit, anchor.0, anchor.1);
+        let (extent_start, extent_end) = self.span(unit, extent.0, extent.1);
+        if anchor <= extent {
+            Selection {
+                anchor: (anchor.0, anchor_start),
+                extent: (extent.0, extent_end),
+            }
+        } else {
+            Selection {
+                anchor: (anchor.0, anchor_end),
+                extent: (extent.0, extent_start),
+            }
+        }
     }
 
     /// Where the cursor is drawn, or `None` when it is hidden or the

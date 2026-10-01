@@ -538,7 +538,9 @@ of its own files may name each module.
   specification, `vt_spec.rs`, runs the native corpus under `spec/vt`.
 - `vt_render`: `Palette` (`pinned`, foot's with its own default ink),
   `Snapshot` (`new` with focus and bell, `with_cursor`, `scrolled_back`,
-  `with_selection`, and its reads),
+  `with_selection`, its reads, and `span` and `select`, a pointer
+  gesture's unit at a cell and its selection from an anchor to an extent),
+  `Unit` (a cell, a word or a row) with `WORD_DELIMITERS`, foot's,
   `Cursor`, `Selection`, `render` of a snapshot into a tight XRGB8888
   surface over the bitmap `font::Font`, `render_with`, the same with an
   optional outline `Face` fitted to that font's cell, `ppm` and `from_ppm`,

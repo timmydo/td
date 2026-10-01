@@ -105,9 +105,9 @@ Shift+PageDown navigate scrollback. Ordinary text input returns to the live
 bottom. An unmodified End key is consumed for the same purpose while viewing
 scrollback and is forwarded in the selected cursor-key mode at the live
 bottom. Mouse reporting, hyperlinks, images, sixel, ligatures, search, and
-shell integration are deferred. Pointer selection, the wheel, and the core
-data-device clipboard are specified in §3. A protocol is not parsed merely
-because another terminal implements it.
+shell integration are deferred. Pointer selection, the wheel, the core
+data-device clipboard and the primary selection are specified in §3. A
+protocol is not parsed merely because another terminal implements it.
 
 Unsupported CSI operations are ignored as complete sequences. OSC, DCS, SOS,
 APC, and PM strings enter allocation-free streaming ignore states and cannot
@@ -518,18 +518,31 @@ Pointer selection is an inclusive row-major range over the visible snapshot.
 A left-button press anchors it at the pointer, motion while the button is
 held extends it, and release retains it; `wl_pointer.frame` applies the
 accumulated transaction so one physical report causes at most one repaint. A
-click without motion selects its one cell. Leaving the surface abandons a
-drag in progress. Reverse drags normalize only when text is copied. The
-renderer inverts every selected cell. Resizing, new terminal output,
-viewport movement, or a key press other than the copy and paste chords
-clears the range and schedules a repaint; a drag still held re-selects from
-its press point at its next motion, so the range it shows is over what is
-on screen then. A bare modifier is not a press
-the keymap reports, so the Control and Shift needed for the copy chord
-cannot erase it first. Each selected row loses trailing ASCII spaces, rows
-are joined with one newline, and the text is bounded at 64 KiB; a longer one
-rings rather than being cut. A range that trims to no bytes is a no-op: it
-neither replaces the seat clipboard nor emits a zero-byte success marker.
+plain press selects nothing until its drag leaves the pressed cell, so a
+click without motion clears the selection, as foot's does. Left presses at
+one cell within 500 ms of each other, by td-term's clock as each is
+dispatched and with no other button's press between, are one gesture: the
+second selects the word under the pointer, the third its row, and a fourth
+starts over. A drag after either extends a word or a row at a time, the
+pressed one kept whole whichever way it goes. A word is a run of cells of one
+class -- blanks, foot's default `word-delimiters` (`` ,│`|:"'()[]{}<> ``), or
+cells that are neither -- so a run of delimiters is one word, as in foot. A
+row is the screen's, so a line the terminal wrapped is selected a row at a
+time. Both are td-ui's (`vt_render`'s `Snapshot::span` and
+`Snapshot::select`). A followed link (below) counts toward no gesture.
+Leaving the surface abandons a drag still held and forgets the press count; a
+drag released past the edge comes as release, leave and frame, and that frame
+still finishes it. Reverse drags normalize only when text is copied. The
+renderer inverts every selected cell. Resizing, new terminal output, viewport
+movement, or a key press other than the copy and paste chords clears the
+range and schedules a repaint; a drag still held re-selects from its press
+point at its next motion, so the range it shows is over what is on screen
+then. A bare modifier is not a press the keymap reports, so the Control and
+Shift needed for the copy chord cannot erase it first. Each selected row
+loses trailing ASCII spaces, rows are joined with one newline, and the text
+is bounded at 64 KiB; a longer one rings rather than being cut. A range that
+trims to no bytes is a no-op: it neither replaces the seat clipboard nor
+emits a zero-byte success marker.
 
 A left-button press with Control and no other modifier (Caps and Num Lock
 ignored), read from the keyboard's synchronized modifiers while td-term
@@ -610,6 +623,23 @@ is admitted and the terminal rings its visual bell. Empty text is a no-op.
 Successful nonempty paste clears the visual selection and returns to the live
 viewport. Transfer, encoding, and queue failures leave the terminal usable.
 No terminal escape sequence reads or writes the host clipboard.
+
+The primary selection is td-term's where the compositor offers
+`zwp_primary_selection_device_manager_v1`, as sway does and td's compositor
+does not; td-ui's client binds it beside the clipboard. When a release
+finishes a selection that holds text, that text becomes the primary
+selection at the release's serial, through a source advertising the same two
+MIMEs, and its sends are written as the clipboard's are, one at a time, and
+silently once written: other programs read the primary selection at every
+middle click. A click that selected nothing, a selection over the 64 KiB
+bound, and a drag still held offer nothing, and output that clears the shown
+selection leaves the offer standing. A middle press pastes the primary
+selection under the paste's rules above -- focus, a live device, a text
+offer and no paste in flight, the same bounds, admission and bracketing --
+and without them does nothing, with no bell, as a middle click on nothing
+does elsewhere. A change of the primary selection cancels its paste and not
+the clipboard's, and the reverse; focus loss cancels either. `C-S-c` and
+`C-S-v` stay the clipboard's.
 
 The system image's input proof drives td-term's clipboard end to end, and
 td-term's half of it exists only when the exact `td.firefox-input=1` kernel
@@ -1241,6 +1271,10 @@ terminal, and td-term's prove the program:
   lost activation; commits an acknowledged configure nothing redrew; carries
   keys through td's keymap and the encoder to the child; moves and returns
   the viewport by key and by wheel; selects by drag and offers the selection;
+  selects nothing on a click, a word on a double press and a row on a
+  triple, dragging by them; makes a release's selection the primary
+  selection and writes its sends; pastes the primary selection on a middle
+  press and does nothing without one;
   waits for the proof's sync on the live source; rings for a paste with
   nothing offered and receives a selected offer over a fresh endpoint; and
   feeds output to the model with its replies to the child (`app.rs`);
@@ -1339,6 +1373,9 @@ desktop's terminal must:
   `td-term: terminfo:` line says why, the inherited `TERMINFO` stands, and
   the child finds `td-term` only where the host installed it (`td-term
   terminfo PATH`, §4);
+- selecting text sets the primary selection and a middle click pastes it,
+  as under foot, wherever the compositor offers the primary-selection
+  protocol (§3);
 - the outline face is read from `/etc/fonts/jetbrains-mono-nerd` as in
   td's image, or else from the user's or the host's font directories,
   where `./install-fonts` puts it (§3); a host with none draws in Unifont
