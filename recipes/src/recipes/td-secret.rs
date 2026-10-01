@@ -150,6 +150,10 @@ pub fn recipe() -> Recipe {
             include_str!("../../../td-secret/src/portable_lifecycle.rs"),
         ),
         (
+            "{src}/td-secret/src/portable_notebook.rs",
+            include_str!("../../../td-secret/src/portable_notebook.rs"),
+        ),
+        (
             "{src}/td-secret/src/portable_store.rs",
             include_str!("../../../td-secret/src/portable_store.rs"),
         ),

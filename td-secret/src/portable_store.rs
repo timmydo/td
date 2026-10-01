@@ -241,21 +241,34 @@ impl Store {
         proposed: &LockedVault,
         random: &mut impl Read,
     ) -> std::result::Result<(), PublishError> {
-        self.publish_inner(snapshot, proposed, random, &mut |_| Ok(()))
+        self.publish_inner(snapshot, proposed, false, random, &mut |_| Ok(()))
+    }
+
+    /// Places an existing vault at its own revision into an absent baseline.
+    /// The backend must authenticate the imported bytes first.
+    pub fn adopt(
+        self,
+        snapshot: Snapshot,
+        imported: &LockedVault,
+        random: &mut impl Read,
+    ) -> std::result::Result<(), PublishError> {
+        self.publish_inner(snapshot, imported, true, random, &mut |_| Ok(()))
     }
 
     fn publish_inner(
         self,
         snapshot: Snapshot,
         proposed: &LockedVault,
+        adopt: bool,
         random: &mut impl Read,
         step: &mut impl FnMut(Stage) -> Result<()>,
     ) -> std::result::Result<(), PublishError> {
         self.baseline(&snapshot)?;
         match snapshot.vault() {
-            None if proposed.revision == 1 => {}
+            None if adopt || proposed.revision == 1 => {}
             Some(prior)
-                if proposed.id == prior.id
+                if !adopt
+                    && proposed.id == prior.id
                     && prior.revision.checked_add(1) == Some(proposed.revision) => {}
             _ => {
                 return Err(PublishError::Rejected(
@@ -401,6 +414,38 @@ mod tests {
                 .unwrap();
             assert_eq!(opened.notebook.entries[0].body(), body);
         }
+    }
+
+    #[test]
+    fn adoption_places_an_existing_revision_only_into_an_absent_baseline() {
+        let source = Directory::new();
+        source.seed();
+        let snapshot = source.read();
+        let next = revision(&snapshot, b'q');
+        source
+            .open()
+            .publish(snapshot, &next, &mut io::repeat(3))
+            .unwrap();
+        let target = Directory::new();
+        let absent = target.read();
+        assert!(target
+            .open()
+            .publish(absent, &next, &mut io::repeat(4))
+            .is_err());
+        let absent = target.read();
+        target
+            .open()
+            .adopt(absent, &next, &mut io::repeat(5))
+            .unwrap();
+        assert_eq!(fs::read(target.0.join(VAULT)).unwrap(), next.bytes());
+        // Adoption never replaces a committed vault, even with its successor.
+        let present = target.read();
+        let successor = revision(&present, b'r');
+        assert!(target
+            .open()
+            .adopt(present, &successor, &mut io::repeat(6))
+            .is_err());
+        assert_eq!(fs::read(target.0.join(VAULT)).unwrap(), next.bytes());
     }
 
     #[test]
@@ -655,6 +700,7 @@ mod tests {
                 let result = directory.open().publish_inner(
                     snapshot,
                     &proposed,
+                    false,
                     &mut io::repeat(7),
                     &mut |point| {
                         if point == stage {
@@ -727,6 +773,7 @@ mod tests {
             let result = directory.open().publish_inner(
                 snapshot,
                 &proposed,
+                false,
                 &mut io::repeat(8),
                 &mut |stage| {
                     if stage == Stage::FileSynced {
@@ -771,14 +818,20 @@ mod tests {
         let store = Store::open(directory, owner).unwrap();
         let snapshot = store.load().unwrap();
         let proposed = revision(&snapshot, b'c');
-        let _ = store.publish_inner(snapshot, &proposed, &mut io::repeat(9), &mut |point| {
-            if (stage == "synced" && point == Stage::FileSynced)
-                || (stage == "renamed" && point == Stage::Renamed)
-            {
-                std::process::exit(71);
-            }
-            Ok(())
-        });
+        let _ = store.publish_inner(
+            snapshot,
+            &proposed,
+            false,
+            &mut io::repeat(9),
+            &mut |point| {
+                if (stage == "synced" && point == Stage::FileSynced)
+                    || (stage == "renamed" && point == Stage::Renamed)
+                {
+                    std::process::exit(71);
+                }
+                Ok(())
+            },
+        );
         panic!("crash checkpoint was not reached");
     }
 

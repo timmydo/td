@@ -2,6 +2,8 @@
 
 #[path = "portable_lifecycle.rs"]
 pub(super) mod lifecycle;
+#[path = "portable_notebook.rs"]
+pub(super) mod notebook;
 #[path = "portable_store.rs"]
 pub(super) mod storage;
 
@@ -93,6 +95,9 @@ impl Entry {
         let mut title = std::mem::take(&mut self.title).into_bytes();
         title.fill(0);
         self.body.fill(0);
+        // Keeps the clearing from being removed as a dead store.
+        std::hint::black_box(&mut title);
+        std::hint::black_box(&mut self.body);
     }
 }
 

@@ -1,6 +1,7 @@
 //! Portable vault lifecycle over proved token results. Device admission,
 //! prompts and directory acquisition are adapter duties.
 
+use super::notebook::EntryError;
 use super::storage::{PublishError, Snapshot, Store};
 use super::{
     equal32, LockedVault, Notebook, OpenVault, Protector, Role, Secret32, UnlockHint,
@@ -28,6 +29,7 @@ pub(super) enum Purpose {
     AddKey = 6,
     AuthorizeReplaceKey = 7,
     ReplaceKey = 8,
+    Import = 9,
 }
 
 impl Purpose {
@@ -41,6 +43,7 @@ impl Purpose {
             Self::AddKey => "enroll the added key",
             Self::AuthorizeReplaceKey => "authorize key replacement with a retained key",
             Self::ReplaceKey => "enroll the replacement key",
+            Self::Import => "import a portable vault copy into this empty location",
         }
     }
 }
@@ -245,6 +248,8 @@ pub(super) enum Error {
     State(&'static str),
     /// Verification or structural refusal; nothing was published.
     Refused(String),
+    /// An entry change refused before any token was presented.
+    Entry(EntryError),
     /// Publication was attempted with an unknown result. Lock and unlock again.
     Uncertain,
 }
@@ -391,6 +396,8 @@ pub(super) struct Session {
     // The directory the session was opened from; writes refuse any other.
     place: (u64, u64),
     credential: Vec<u8>,
+    // Set by an uncertain publication; export is refused afterwards.
+    uncertain: bool,
     // Verified counters observed in this session; not persisted.
     counters: Vec<(Vec<u8>, u32)>,
 }
@@ -439,11 +446,12 @@ pub(super) fn create(
         .last()
         .map(|protector| protector.credential.clone())
         .ok_or(Error::State("portable enrollment produced no key"))?;
-    publish(directory, snapshot, &proposed, random)?;
+    publish(directory, snapshot, &proposed, false, random)?;
     Ok(Session {
         baseline: proposed,
         opened,
         place,
+        uncertain: false,
         credential,
         counters,
     })
@@ -486,15 +494,19 @@ fn publish(
     directory: &Directory,
     snapshot: Snapshot,
     proposed: &LockedVault,
+    adopt: bool,
     random: &mut impl Read,
 ) -> Result<(), Error> {
-    directory
-        .store()?
-        .publish(snapshot, proposed, random)
-        .map_err(|error| match error {
-            PublishError::Rejected(error) => Error::Refused(error),
-            PublishError::Uncertain(_) => Error::Uncertain,
-        })
+    let store = directory.store()?;
+    let result = if adopt {
+        store.adopt(snapshot, proposed, random)
+    } else {
+        store.publish(snapshot, proposed, random)
+    };
+    result.map_err(|error| match error {
+        PublishError::Rejected(error) => Error::Refused(error),
+        PublishError::Uncertain(_) => Error::Uncertain,
+    })
 }
 
 /// Authenticates one enrolled key against the committed vault for browsing.
@@ -541,6 +553,57 @@ pub(super) fn unlock(
         baseline,
         opened,
         place,
+        uncertain: false,
+        credential: credential.to_vec(),
+        counters: vec![(credential.to_vec(), asserted.counter)],
+    })
+}
+
+/// Authenticates an exported copy with one of its keys, then places it,
+/// identity and revision unchanged, into a location holding no vault.
+pub(super) fn import(
+    directory: &Directory,
+    bytes: &[u8],
+    credential: &[u8],
+    tokens: &mut impl Tokens,
+    random: &mut impl Read,
+) -> Result<Session, Error> {
+    let place = directory.place()?;
+    let snapshot = directory.snapshot()?;
+    if snapshot.vault().is_some() {
+        return Err(Error::State("a portable vault already exists here"));
+    }
+    let baseline = LockedVault::decode(bytes).map_err(Error::Refused)?;
+    let hint = baseline
+        .unlock_hint(credential)
+        .map_err(|_| Error::State("that key is not enrolled in this vault"))?;
+    let asserted = tokens.assert(
+        Presented {
+            purpose: Purpose::Import,
+            role: hint.role,
+            credential: Some(credential),
+        },
+        AssertRequest {
+            credential,
+            key: hint.key,
+            salt: hint.salt,
+            challenge: challenge(
+                Purpose::Import,
+                Phase::Assert,
+                &binding(&baseline, &crypto::digest(bytes)),
+                random,
+            )?,
+        },
+    )?;
+    let opened = baseline
+        .open(credential, &asserted.secret)
+        .map_err(Error::Refused)?;
+    publish(directory, snapshot, &baseline, true, random)?;
+    Ok(Session {
+        baseline,
+        opened,
+        place,
+        uncertain: false,
         credential: credential.to_vec(),
         counters: vec![(credential.to_vec(), asserted.counter)],
     })
@@ -549,6 +612,18 @@ pub(super) fn unlock(
 impl Session {
     pub fn notebook(&self) -> &Notebook {
         &self.opened.notebook
+    }
+
+    /// The session's authenticated baseline ciphertext, for export. Refused
+    /// after an uncertain publication, when the store may already hold a
+    /// newer revision than the session knows.
+    pub fn ciphertext(&self) -> Result<&[u8], Error> {
+        if self.uncertain {
+            return Err(Error::State(
+                "the last save's outcome is uncertain; lock and unlock again",
+            ));
+        }
+        Ok(self.baseline.bytes())
     }
 
     pub fn revision(&self) -> u64 {
@@ -678,7 +753,11 @@ impl Session {
         opened: OpenVault,
         random: &mut impl Read,
     ) -> Result<(), Error> {
-        publish(directory, snapshot, &proposed, random)?;
+        let published = publish(directory, snapshot, &proposed, false, random);
+        if published == Err(Error::Uncertain) {
+            self.uncertain = true;
+        }
+        published?;
         self.baseline = proposed;
         self.opened = opened;
         Ok(())
@@ -856,7 +935,7 @@ fn revocation(revoked: &[&[u8]]) -> [u8; 32] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::portable) mod tests {
     use super::*;
     use crate::fido_p256::SecretScalar;
     use crate::fido_transaction::Status;
@@ -867,7 +946,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    struct Random(u64);
+    pub(in crate::portable) struct Random(pub(in crate::portable) u64);
     impl Read for Random {
         fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
             for chunk in out.chunks_mut(32) {
@@ -879,9 +958,12 @@ mod tests {
         }
     }
 
-    struct Place(PathBuf, Directory);
+    pub(in crate::portable) struct Place(
+        pub(in crate::portable) PathBuf,
+        pub(in crate::portable) Directory,
+    );
     impl Place {
-        fn new() -> Self {
+        pub(in crate::portable) fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
                 "td-portable-lifecycle-{}-{}",
@@ -895,7 +977,7 @@ mod tests {
             };
             Self(path, directory)
         }
-        fn bytes(&self) -> Option<Vec<u8>> {
+        pub(in crate::portable) fn bytes(&self) -> Option<Vec<u8>> {
             fs::read(self.0.join("vault")).ok()
         }
     }
@@ -917,25 +999,25 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Call {
+    pub(in crate::portable) enum Call {
         Enroll(Purpose),
         Assert(Purpose),
     }
 
     /// Physical tokens; each call takes the next token the operator presents.
     #[derive(Default)]
-    struct Bench {
+    pub(in crate::portable) struct Bench {
         tokens: Vec<Token>,
-        present: VecDeque<usize>,
-        calls: Vec<Call>,
+        pub(in crate::portable) present: VecDeque<usize>,
+        // Runs while a token is presented, as another writer might.
+        during: Option<Box<dyn FnMut()>>,
+        pub(in crate::portable) calls: Vec<Call>,
         challenges: Vec<[u8; 32]>,
         excluded: Vec<Vec<Vec<u8>>>,
-        fail: Option<(usize, TokenError)>,
+        pub(in crate::portable) fail: Option<(usize, TokenError)>,
         corrupt: Option<usize>,
         frozen: bool,
         presented: Vec<(Role, Option<Vec<u8>>)>,
-        // Runs while a token is presented, as another writer might.
-        during: Option<Box<dyn FnMut()>>,
     }
 
     fn cose(seed: &[u8; 32]) -> VerificationKey {
@@ -949,7 +1031,7 @@ mod tests {
     }
 
     impl Bench {
-        fn new(count: u8) -> Self {
+        pub(in crate::portable) fn new(count: u8) -> Self {
             Self {
                 tokens: (0..count)
                     .map(|name| Token {
@@ -961,7 +1043,7 @@ mod tests {
                 ..Self::default()
             }
         }
-        fn present(&mut self, order: &[usize]) -> &mut Self {
+        pub(in crate::portable) fn present(&mut self, order: &[usize]) -> &mut Self {
             self.present.extend(order);
             self
         }
@@ -1077,11 +1159,15 @@ mod tests {
         }
     }
 
-    fn id(bench: &Bench, token: usize) -> Vec<u8> {
+    pub(in crate::portable) fn id(bench: &Bench, token: usize) -> Vec<u8> {
         bench.tokens[token].credentials[0].id.clone()
     }
 
-    fn created(place: &Place, bench: &mut Bench, random: &mut Random) -> Session {
+    pub(in crate::portable) fn created(
+        place: &Place,
+        bench: &mut Bench,
+        random: &mut Random,
+    ) -> Session {
         bench.present(&[0, 0, 1, 1]);
         create(&place.1, bench, random).unwrap()
     }
@@ -1092,7 +1178,7 @@ mod tests {
         }
     }
 
-    fn unlocked(place: &Place, bench: &mut Bench, token: usize) -> Session {
+    pub(in crate::portable) fn unlocked(place: &Place, bench: &mut Bench, token: usize) -> Session {
         let credential = id(bench, token);
         bench.present(&[token]);
         unlock(&place.1, &credential, bench, &mut Random(9000)).unwrap()
@@ -1745,6 +1831,88 @@ mod tests {
             unlock(&place.1, &primary, &mut bench, &mut Random(1)).err(),
             Some(Error::Token(TokenError::Unavailable))
         );
+    }
+
+    #[test]
+    fn export_is_refused_after_an_uncertain_publication() {
+        let place = Place::new();
+        let mut bench = Bench::new(2);
+        let mut random = Random(0);
+        let mut session = created(&place, &mut bench, &mut random);
+        assert!(session.ciphertext().is_ok());
+        session.uncertain = true;
+        assert_eq!(
+            session.ciphertext().err(),
+            Some(Error::State(
+                "the last save's outcome is uncertain; lock and unlock again",
+            ))
+        );
+    }
+
+    #[test]
+    fn an_exported_copy_recovers_on_a_fresh_machine_with_only_the_backup() {
+        let place = Place::new();
+        let mut bench = Bench::new(3);
+        let mut random = Random(0);
+        let mut session = created(&place, &mut bench, &mut random);
+        bench.present(&[1]);
+        session
+            .save(&place.1, &entry("Kept", b"body"), &mut bench, &mut random)
+            .unwrap();
+        let exported = session.ciphertext().unwrap().to_vec();
+        drop(session);
+        let fresh = Place::new();
+        let backup = id(&bench, 1);
+        let calls = bench.calls.len();
+        assert_eq!(
+            import(&fresh.1, &exported, b"unknown", &mut bench, &mut random).err(),
+            Some(Error::State("that key is not enrolled in this vault"))
+        );
+        assert!(matches!(
+            import(&fresh.1, &exported[..20], &backup, &mut bench, &mut random),
+            Err(Error::Refused(_))
+        ));
+        assert_eq!(bench.calls.len(), calls);
+        // A tampered body, and a tampered salt in the backup's own slot.
+        let mut body = exported.clone();
+        *body.last_mut().unwrap() ^= 1;
+        let decoded = LockedVault::decode(&exported).unwrap();
+        let salt = decoded.unlock_hint(&backup).unwrap().salt;
+        let at = exported.windows(32).position(|w| w == salt).unwrap();
+        let mut slot = exported.clone();
+        slot[at] ^= 1;
+        for tampered in [body, slot] {
+            bench.present(&[1]);
+            assert!(matches!(
+                import(&fresh.1, &tampered, &backup, &mut bench, &mut random),
+                Err(Error::Refused(_))
+            ));
+        }
+        bench.present(&[0]);
+        assert!(matches!(
+            import(&fresh.1, &exported, &backup, &mut bench, &mut random),
+            Err(Error::Token(_))
+        ));
+        assert_eq!(fresh.bytes(), None);
+        bench.present(&[1]);
+        let mut restored = import(&fresh.1, &exported, &backup, &mut bench, &mut random).unwrap();
+        assert_eq!(bench.calls.last(), Some(&Call::Assert(Purpose::Import)));
+        assert_eq!(fresh.bytes(), Some(exported.clone()));
+        assert_eq!(restored.revision(), 2);
+        assert_eq!(restored.notebook().entries[0].body(), b"body");
+        // The primary is lost: the backup and a new token replace it.
+        let lost = id(&bench, 0);
+        bench.present(&[1, 2, 2]);
+        restored
+            .replace_keys(&fresh.1, &[&lost], &mut bench, &mut random)
+            .unwrap();
+        assert_eq!(restored.revision(), 3);
+        let calls = bench.calls.len();
+        assert_eq!(
+            import(&fresh.1, &exported, &backup, &mut bench, &mut random).err(),
+            Some(Error::State("a portable vault already exists here"))
+        );
+        assert_eq!(bench.calls.len(), calls);
     }
 
     mod hardware {

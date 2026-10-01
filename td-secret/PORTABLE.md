@@ -254,9 +254,11 @@ plaintext parsing. Empty notebooks and bodies are valid. Secret owners
 implement neither Clone nor Debug and clear owned byte buffers on drop,
 including decode/error paths, with the existing best-effort limitation.
 Entry text fields expose read-only views and whole-buffer replacement;
-replacement clears the outgoing buffers before releasing them. Protector
-ordering sorts references, leaving secret owners in their original vector.
-These measures do not prevent compiler-elided clears or temporary copies.
+replacement clears the outgoing buffers before releasing them; each clear
+is followed by a `std::hint::black_box` barrier, as elsewhere in the crate.
+Protector ordering sorts references, leaving secret owners in their
+original vector. These measures do not prevent temporary copies, and the
+barrier is best effort rather than a guarantee against elided clears.
 Unicode label presentation, including bidi spoofing, needs separate UI
 policy and tests; the wire format rejects control characters only.
 
@@ -953,6 +955,58 @@ lifecycle handles every publication failure the same way. The
 production adapter returns exactly the four public transcripts' credentials
 and outputs, and passes the presentation to its channel and prompt. This is
 not physical YubiKey, PIN-prompt, Guix access or recovery evidence.
+
+### Implemented notebook entry API and encrypted export and import
+
+`src/portable_notebook.rs` expresses the notebook surface over an
+unlocked session: list, read, create, edit, rename and delete. Listing
+yields each entry's stable ID, revision and title in stored order; reading
+returns one entry. Every change names the entry revision its caller last
+read. A stale revision, a missing entry, an empty, oversized,
+control-bearing or duplicate title, an oversized body, the 1024-entry limit
+and the 4 MiB plaintext bound are refused with typed entry errors before any
+token is presented. Renaming an entry to its own title is not a duplicate.
+Entry revisions are relative to the session's notebook; a vault changed by
+another writer is refused by the lifecycle's own pre-token check.
+Caller text enters a change in a clearing owner, so a refused change clears
+it on drop as an accepted one clears its entry.
+
+Create draws a fresh random 16-byte ID and starts at entry revision one.
+Edit and rename advance the revision by exactly one; rename keeps the body.
+Delete removes the entry. Each accepted change builds the complete next
+notebook and runs one save, so it receives fresh authorization bound to the
+exact proposed ciphertext. A refused or failed save leaves the session's
+entry at its base revision with its old contents. Committed changes report
+the entry ID and its new revision, or none after deletion. The API never
+writes plaintext outside the session; body bytes are UTF-8 and stored
+exactly.
+
+Export is the session's authenticated baseline ciphertext, unchanged. After
+an uncertain publication the store may already hold a newer revision, so
+the session refuses export until lock and unlock; its reads still show its
+last authenticated notebook. The caller chooses where to write it. An
+adapter that reads a copy for import must bound the read to the maximum
+envelope size plus one byte, as the store does. Import requires a
+location holding no vault, parses the copy, and asks the selected
+enrolled key for a fresh assertion bound to the vault ID, revision and
+the digest of the imported bytes. The whole copy must open before the
+store places it. The store's adopt path accepts any revision of an
+authenticated copy, but only against an absent baseline; it never
+replaces a committed vault, even with its successor. The imported vault
+keeps its identity and revision, and the session continues from it.
+Import is therefore restore onto a fresh location, not synchronization
+or merge.
+
+Tests cover each entry operation and read the final notebook through the
+other key after unlock. They cover every typed refusal for each change kind
+before any token, a refused save keeping the base entry, and both notebook
+bounds, reached by creation, edit and rename. Export is refused after an
+uncertain publication. Import tests refuse an unenrolled key and an
+undecodable copy before any token, and refuse a tampered body or a
+tampered slot salt, and a wrongly presented token, without writing. A
+fresh-location restore with only the backup is followed by replacement
+of the lost primary. Store tests cover adoption into an absent baseline
+and its refusal over a committed vault.
 
 ## Independently landable increments
 
