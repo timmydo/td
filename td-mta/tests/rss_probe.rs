@@ -125,8 +125,13 @@ fn main() {
             tls_handshake_scenario::run_large(f)
         }),
         Some("--tls-generations") => observe("generation", tls_generation_scenario::PHASES, |f| {
-            tls_generation_scenario::run(f)
+            tls_generation_scenario::run(false, f)
         }),
+        Some("--tls-generation-routing") => {
+            observe("generation-routing", tls_generation_scenario::PHASES, |f| {
+                tls_generation_scenario::run(true, f)
+            })
+        }
         Some("--tls-remote-chain") => observe(
             tls_remote_chain_scenario::label(),
             tls_remote_chain_scenario::PHASES,

@@ -947,6 +947,15 @@ Implement the remaining work as independently reviewable increments:
     These fixed cases leave complete simultaneous-traffic and service memory
     admission pending; resumption remains disabled.
 
+  - **M07e4f — large generation routing observations:** combine sixteen
+    certificate profiles, sixteen listeners and 256 MTA-STS domains with long
+    derived names. Separate Rust/native/RSS processes observe the same
+    two-generation and repeated-replacement lifecycle as the smaller case.
+    The case exceeds the planned 1 MiB generation allowance, so reducing its
+    retained memory, revising the ledger or narrowing admitted configuration is
+    required before serving. Sixteen-HTTPS, mixed trust/gateway inputs and
+    complete session coexistence remain pending.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,

@@ -265,9 +265,16 @@ fn main() {
     }
     if std::env::args()
         .nth(1)
+        .is_some_and(|arg| arg == "--tls-generation-routing")
+    {
+        tls_generations(true);
+        return;
+    }
+    if std::env::args()
+        .nth(1)
         .is_some_and(|arg| arg == "--tls-generations")
     {
-        tls_generations();
+        tls_generations(false);
         return;
     }
     if std::env::args()
@@ -305,11 +312,18 @@ fn main() {
 mod tls_generation_scenario;
 
 #[cfg(td_native_alloc_probe)]
-fn tls_generations() {
+fn tls_generations(routing: bool) {
+    let label = if routing {
+        "generation-routing"
+    } else {
+        "generation"
+    };
     use native_allocator_bridge::{calls, TD_MTA_NATIVE_REGISTRY as REGISTRY};
     let mut samples = [(calls(), REGISTRY.snapshot()); tls_generation_scenario::PHASES.len()];
     let mut slots = samples.iter_mut();
-    tls_generation_scenario::run(|| *slots.next().unwrap() = (calls(), REGISTRY.snapshot()));
+    tls_generation_scenario::run(routing, || {
+        *slots.next().unwrap() = (calls(), REGISTRY.snapshot())
+    });
     assert!(slots.next().is_none());
     assert!(samples.iter().all(|(_, s)| !s.invalid));
     assert_eq!(
@@ -339,9 +353,9 @@ fn tls_generations() {
     );
     for (phase, (c, s)) in tls_generation_scenario::PHASES.into_iter().zip(samples) {
         let [malloc, calloc, realloc, free, posix, aligned] = c;
-        println!("tls-native-generation {phase} {malloc} {calloc} {realloc} {free} {posix} {aligned} {} {} {}", s.blocks, s.bytes, s.peak);
+        println!("tls-native-{label} {phase} {malloc} {calloc} {realloc} {free} {posix} {aligned} {} {} {}", s.blocks, s.bytes, s.peak);
     }
-    println!("tls-generation-allocation-v1: native passed");
+    println!("tls-{label}-allocation-v1: native passed");
 }
 
 #[cfg(td_native_alloc_probe)]

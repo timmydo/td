@@ -264,9 +264,16 @@ fn main() {
     }
     if std::env::args()
         .nth(1)
+        .is_some_and(|arg| arg == "--tls-generation-routing")
+    {
+        tls_generations(true);
+        return;
+    }
+    if std::env::args()
+        .nth(1)
         .is_some_and(|arg| arg == "--tls-generations")
     {
-        tls_generations();
+        tls_generations(false);
         return;
     }
     if std::env::args()
@@ -283,10 +290,15 @@ fn main() {
 #[path = "support/tls_generation_scenario.rs"]
 mod tls_generation_scenario;
 
-fn tls_generations() {
+fn tls_generations(routing: bool) {
+    let label = if routing {
+        "generation-routing"
+    } else {
+        "generation"
+    };
     let mut samples = [COUNTERS.snapshot(); tls_generation_scenario::PHASES.len()];
     let mut slots = samples.iter_mut();
-    tls_generation_scenario::run(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    tls_generation_scenario::run(routing, || *slots.next().unwrap() = COUNTERS.snapshot());
     assert!(slots.next().is_none());
     assert!(samples.iter().all(|s| !s.invalid));
     assert_eq!(
@@ -306,11 +318,11 @@ fn tls_generations() {
     );
     for (phase, s) in tls_generation_scenario::PHASES.into_iter().zip(samples) {
         println!(
-            "tls-rust-generation {phase} {} {} {} {} {} {} {}",
+            "tls-rust-{label} {phase} {} {} {} {} {} {} {}",
             s.alloc, s.zeroed, s.realloc, s.free, s.failed, s.live, s.peak
         );
     }
-    println!("tls-generation-allocation-v1: rust passed");
+    println!("tls-{label}-allocation-v1: rust passed");
 }
 
 #[path = "support/tls_remote_chain_scenario.rs"]

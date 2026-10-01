@@ -118,6 +118,15 @@ fn large_material() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 }
 
 pub(super) fn large_material_names(names: &[&str]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    large_material_padding(names, 15_000)
+}
+
+pub(super) fn large_routing_material(names: &[&str]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let name_bytes: usize = names.iter().map(|name| name.len() + 4).sum();
+    large_material_padding(names, 15_000usize.checked_sub(name_bytes).unwrap())
+}
+
+fn large_material_padding(names: &[&str], leaf_padding: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut raw = [0; P256_PKCS8_CAPACITY];
     let n = Provider.generate_p256(&mut raw).unwrap();
     let root = Provider.load_p256(&raw[..n]).unwrap();
@@ -164,7 +173,7 @@ pub(super) fn large_material_names(names: &[&str]) -> (Vec<u8>, Vec<u8>, Vec<u8>
                 client: false,
                 issuer: issuer_name,
                 subject,
-                padding: 15_000,
+                padding: if ca_flag { 15_000 } else { leaf_padding },
             },
         );
         assert!(der.len() > 15_000 && der.len() <= 16 * 1024);

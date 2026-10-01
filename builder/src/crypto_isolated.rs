@@ -599,12 +599,17 @@ fn remote_chain_evidence<'a>(output: &'a str, domain: &str, scenario: &str) -> R
     Ok(body)
 }
 
-fn tls_generation_evidence(output: &str, native: bool) -> Result<()> {
+fn tls_generation_evidence(output: &str, native: bool, routing: bool) -> Result<()> {
+    let scenario = if routing {
+        "generation-routing"
+    } else {
+        "generation"
+    };
     tls_phase_evidence(
         output,
         native,
-        "-generation",
-        "generation",
+        &format!("-{scenario}"),
+        scenario,
         &[
             "baseline",
             "material",
@@ -753,7 +758,7 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
             "dropped",
         ],
         "remote12" | "remote13" | "remote13large" => REMOTE_CHAIN_PHASES,
-        "generation" => &[
+        "generation" | "generation-routing" => &[
             "baseline",
             "material",
             "config",
@@ -1495,17 +1500,24 @@ pub(crate) fn runtime_inner() -> Result<()> {
         for line in output.lines() {
             println!("portable allocation diagnostic: {line}");
         }
-        let mut command = Command::new(path);
-        command
-            .arg("--tls-generations")
-            .env_clear()
-            .stdin(Stdio::null());
-        crate::host_bin::arm_check_child(&mut command);
-        let name = format!("tls-generation-allocation-{domain}");
-        let output = bounded_output(&mut command, &name, 8192, 30)?;
-        tls_generation_evidence(&output, native)?;
-        for line in output.lines() {
-            println!("portable allocation diagnostic: {line}");
+        for (routing, argument) in [
+            (false, "--tls-generations"),
+            (true, "--tls-generation-routing"),
+        ] {
+            let mut command = Command::new(path);
+            command.arg(argument).env_clear().stdin(Stdio::null());
+            crate::host_bin::arm_check_child(&mut command);
+            let scenario = if routing {
+                "generation-routing"
+            } else {
+                "generation"
+            };
+            let name = format!("tls-{scenario}-allocation-{domain}");
+            let output = bounded_output(&mut command, &name, 8192, 30)?;
+            tls_generation_evidence(&output, native, routing)?;
+            for line in output.lines() {
+                println!("portable allocation diagnostic: {line}");
+            }
         }
     }
 
@@ -1517,6 +1529,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("fragment", Some("--tls-fragments")),
         ("large-chain", Some("--tls-large-chain")),
         ("generation", Some("--tls-generations")),
+        ("generation-routing", Some("--tls-generation-routing")),
     ] {
         let mut command = Command::new("/artifacts/td-mta-rss-probe");
         command.env_clear().stdin(Stdio::null());
@@ -2009,54 +2022,68 @@ mod tests {
 
     #[test]
     fn generation_records_require_complete_ordered_owners_and_domains() {
-        for native in [false, true] {
-            let domain = if native { "native" } else { "rust" };
-            let values = if native {
-                "1 2 3 4 5 6 7 8 9"
+        for routing in [false, true] {
+            let scenario = if routing {
+                "generation-routing"
             } else {
-                "1 2 3 4 5 6 7"
+                "generation"
             };
-            let mut output = String::new();
-            let mut rss = String::new();
-            for phase in [
-                "baseline",
-                "material",
-                "config",
-                "first",
-                "candidate",
-                "overlap",
-                "refused",
-                "old_released",
-                "repeated",
-                "current_released",
-                "dropped",
-            ] {
-                output.push_str(&format!("tls-{domain}-generation {phase} {values}\n"));
-                rss.push_str(&format!("rss generation {phase} 100\n"));
-            }
-            output.push_str(&format!("tls-generation-allocation-v1: {domain} passed\n"));
-            rss.push_str("rss-observation-v2: generation passed\n");
-            assert!(tls_generation_evidence(&output, native).is_ok());
-            assert!(rss_evidence(&rss, "generation").is_ok());
-            assert!(tls_generation_evidence(&output, !native).is_err());
-            assert!(tls_large_chain_evidence(&output, native).is_err());
-            for bad in [
-                output.replace("candidate", "overlap"),
-                output.replace("current_released", "old_released"),
-                output.replace("-v1:", "-v2:"),
-                output.replace(&format!("tls-{domain}-generation refused {values}\n"), ""),
-                format!("{output}extra\n"),
-                output.trim_end().to_owned(),
-            ] {
-                assert!(tls_generation_evidence(&bad, native).is_err());
-            }
-            for bad in [
-                rss.replace("candidate", "overlap"),
-                rss.replace("rss generation refused 100\n", ""),
-                rss.replace("-v2:", "-v1:"),
-                format!("{rss}extra\n"),
-            ] {
-                assert!(rss_evidence(&bad, "generation").is_err());
+            for native in [false, true] {
+                let domain = if native { "native" } else { "rust" };
+                let values = if native {
+                    "1 2 3 4 5 6 7 8 9"
+                } else {
+                    "1 2 3 4 5 6 7"
+                };
+                let mut output = String::new();
+                let mut rss = String::new();
+                for phase in [
+                    "baseline",
+                    "material",
+                    "config",
+                    "first",
+                    "candidate",
+                    "overlap",
+                    "refused",
+                    "old_released",
+                    "repeated",
+                    "current_released",
+                    "dropped",
+                ] {
+                    output.push_str(&format!("tls-{domain}-{scenario} {phase} {values}\n"));
+                    rss.push_str(&format!("rss {scenario} {phase} 100\n"));
+                }
+                output.push_str(&format!("tls-{scenario}-allocation-v1: {domain} passed\n"));
+                rss.push_str(&format!("rss-observation-v2: {scenario} passed\n"));
+                assert!(tls_generation_evidence(&output, native, routing).is_ok());
+                assert!(rss_evidence(&rss, scenario).is_ok());
+                assert!(tls_generation_evidence(&output, !native, routing).is_err());
+                assert!(tls_generation_evidence(&output, native, !routing).is_err());
+                let other = if routing {
+                    "generation"
+                } else {
+                    "generation-routing"
+                };
+                assert!(rss_evidence(&rss, other).is_err());
+                assert!(tls_large_chain_evidence(&output, native).is_err());
+                for bad in [
+                    output.replace("candidate", "overlap"),
+                    output.replace("current_released", "old_released"),
+                    output.replace("-v1:", "-v2:"),
+                    output.replace(&format!("tls-{domain}-{scenario} refused {values}\n"), ""),
+                    format!("{output}extra\n"),
+                    output.trim_end().to_owned(),
+                ] {
+                    assert!(tls_generation_evidence(&bad, native, routing).is_err());
+                }
+                for bad in [
+                    rss.replace("candidate", "overlap"),
+                    rss.replace(&format!("rss {scenario} refused 100\n"), ""),
+                    rss.replace("-v2:", "-v1:"),
+                    format!("{rss}extra\n"),
+                ] {
+                    assert!(rss_evidence(&bad, scenario).is_err());
+                }
             }
         }
     }

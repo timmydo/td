@@ -886,13 +886,13 @@ and refuse the Rust/native probe sentinels there. The exact artifact inventory,
 static ELF validation and fresh runtime namespace include it explicitly.
 
 The default process checks the bounded rollup parser and observes a positive
-resident increase after touching a 16 MiB allocation. Six independent fresh
-processes run the client, local handshake, entropy worker, fragmented
-handshake, large-chain and sixteen-profile generation scenarios. The runtime
-requires exact ordered rows, positive decimal KiB values and the scenario
-completion record before logging.
-Every mode has its own bounded log and 30-second deadline. Missing procfs
-support or malformed/truncated rollup output fails qualification.
+resident increase after touching a 16 MiB allocation. Seven independent
+fresh processes run the client, local handshake, entropy worker, fragmented
+handshake, large-chain, sixteen-profile generation and large
+generation-routing scenarios. The runtime requires exact ordered rows,
+positive decimal KiB values and the scenario completion record before
+logging. Every mode has its own bounded log and 30-second deadline. Missing
+procfs support or malformed/truncated rollup output fails qualification.
 
 RESOURCES.md in td-mta defines the observation scope. These are sampled whole
 fixture process values, including stacks and observer state. They do not
@@ -924,3 +924,15 @@ successful test summary and eleven ordered inner rows. It refuses missing,
 duplicate or wrong-version records before printing diagnostics. RESOURCES.md
 defines attribution and limits: this is remote-chain coverage, not total
 session admission or an isolated maximum ticket-processing peak.
+
+## Large generation routing observations
+
+Both allocation executables and the unwrapped RSS executable additionally run
+`--tls-generation-routing` in fresh processes. It combines sixteen profiles,
+sixteen listeners and 256 MTA-STS domains, including 255 long derived names,
+while retaining two generations and repeating replacement. Every local chain
+still obeys the PEM/DER ceilings. The runtime requires distinct ordered
+`generation-routing` records and completion markers and rejects evidence from
+the smaller generation case. No new executable, unsafe surface or link flag
+is introduced. RESOURCES.md defines retained fixture attribution, checked
+release/refusal invariants and the remaining aggregate-admission limits.

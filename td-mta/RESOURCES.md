@@ -919,7 +919,7 @@ claim. Those controls run separately so they do not warm scenario processes.
 
 The existing phase names are retained. Rows have `rss SCENARIO PHASE KIB`,
 where SCENARIO is client, handshake, entropy, fragment, large-chain, generation,
-remote12, remote13 or remote13large. The completion record is
+generation-routing, remote12, remote13 or remote13large. The completion record is
 `rss-observation-v2: SCENARIO passed`. Samples use fixed arrays and are
 formatted after scenario teardown. Positive controls use the control scenario
 with baseline, touched and dropped phases.
@@ -946,28 +946,50 @@ within the 64 KiB local input ceiling; each certificate remains within 16 KiB
 DER. Reusing fixture bytes does not bypass per-profile admission. The test
 creates no service listener, ACME request or network connection.
 
-Eleven ordered checkpoints record baseline, retained material, materialized
-configuration, first published generation, replacement candidate, publication
-with the old lease retained, third-generation refusal, old-lease release, four
-further replacements, current-generation release and complete scope teardown.
-The capacity refusal must leave both counter snapshots unchanged. Releasing
-the old lease must return live requested bytes to the first-generation level;
-repeated replacements must preserve that level. Native tracking also checks
-live blocks at both boundaries. The raw material, configuration and
-clock remain alive at the current-generation-release checkpoint. Fixed arrays
-hold observations until all owners drop. Allocation records use the distinct
-`tls-generation-allocation-v1: DOMAIN passed` completion; RSS uses its existing
-v2 completion with the generation scenario. Missing, duplicate, reordered or
-wrong-version records fail the isolated reader.
+The additional `--tls-generation-routing` mode retains sixteen distinct large
+chains and covers sixteen listeners (one direct SMTP and fifteen HTTPS) with
+256 MTA-STS domains. Of these, 255 use the maximum admitted 243-byte domain
+length and derive 251-byte certificate names; one short existing domain and
+localhost bring the distinct per-profile bindings to 257. Distribute the
+bindings across sixteen profiles, preserving the 32-name per-profile ceiling.
+Each HTTPS table selects all sixteen profiles. All listeners use private
+loopback addresses as configuration data; none binds a socket. The compiled
+table must contain seventeen policy entries, including relay, and read the same
+sixteen-chain/sixteen-key/one-CA inventory. The original mode remains a
+separate observation.
+
+Eleven ordered checkpoints record baseline, retained material/configuration
+text, materialized configuration, first published generation, replacement
+candidate, publication with the old lease retained, third-generation
+refusal, old-lease release, four further replacements, current-generation
+release and complete scope teardown. The capacity refusal must leave both
+counter snapshots unchanged. Releasing the old lease must return live
+requested bytes to the first-generation level; repeated replacements must
+preserve that level. Native tracking also checks live blocks at both
+boundaries. The raw material, configuration and clock remain alive at the
+current-generation-release checkpoint. Fixed arrays hold observations until
+all owners drop. Allocation records use the distinct
+`tls-generation-allocation-v1: DOMAIN passed` completion; RSS uses its
+existing v2 completion with the generation scenario. The routing mode
+instead uses `tls-generation-routing-allocation-v1: DOMAIN passed` and the
+`generation-routing` RSS scenario. Both use the same checkpoints and
+oracles; the parser rejects crossed scenario names as well as missing,
+duplicate, reordered or wrong-version records.
 
 These requested-byte differences include the independently compiled identities
 and shared HTTPS routing objects, but exclude fixed caller state, stack and
 allocator overhead. Their lifetime peaks include fixture preparation and both
 generations. The domains overlap. RSS includes the entire fixture and observer
-and need not fall on release. Sixteen profiles do not maximize listener count,
-name count, gateway policies, trust bundles or mixed key algorithms. No
-aggregate 1 MiB generation admission or service activation follows from this
-case; complete concurrent session and generation qualification remains M07e.
+and need not fall on release. The routing case reaches the schema's profile,
+listener and domain counts with long derived names. It does not maximize every
+profile's name count, certificate-name length, gateway policies, trust bundles
+or mixed key algorithms. A configuration with explicit MX on every domain can
+use sixteen HTTPS listeners without direct SMTP; this case has only fifteen
+HTTPS tables. The routing case already exceeds the planned 1 MiB generation
+entry in host and musl observations. M07e must reduce retained memory, revise
+the allowance or narrow admitted configuration before activating service.
+Neither case establishes an aggregate upper bound; complete concurrent
+session and generation qualification remains M07e.
 
 ## Large remote-chain observations
 
