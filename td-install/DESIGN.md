@@ -700,9 +700,13 @@ INSTALLER.md owns the generator's output and future-plan boundary.
 
 The system's root image carries the stock selector at
 `/lib/td-boot/selector-initramfs.cpio` (td-boot's root-relative
-`SELECTOR_TEMPLATE_PATH`) and `td-install` at `/bin/td-install`, so a live
-installer finds both in the root image `live-root` hashed against the
+`SELECTOR_TEMPLATE_PATH`), `td-install` at `/bin/td-install` and the
+static `mkfs.btrfs` the deployment initramfs already carries, linked at
+`/bin/mkfs.btrfs` (the name D7's `MKFS_BTRFS` gives), so a live installer
+finds all three in the root image `live-root` hashed against the
 authenticated manifest rather than on the medium's unauthenticated ESP.
+The image build refuses a root whose `/bin/mkfs.btrfs` does not link
+exactly that executable static binary.
 That template carries neither a trust root nor a volume identity, and
 `prepare-selector` appends both, so it is that command's template as
 shipped. A selector built from it without a key refuses to boot. No live

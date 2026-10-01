@@ -4396,6 +4396,15 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             dest: format!("{{root}}/real-root{{in:btrfs-progs-x86-64}}/{child}"),
         });
     }
+    // A live installer formats the destination with the same static binary,
+    // bound at /bin in the hashed root rather than found through PATH (D7).
+    steps.push(Step::Symlink {
+        target: format!(
+            "{{in:btrfs-progs-x86-64}}/bin/{}.static",
+            td_boot_protocol::MKFS_BTRFS
+        ),
+        link: format!("{{root}}/real-root/bin/{}", td_boot_protocol::MKFS_BTRFS),
+    });
     // The QEMU HTTPS origin needs only LibreSSL's static command and its debug
     // companion. Keep the development archives and headers out of the image.
     steps.push(Step::MkDir {
@@ -4785,6 +4794,7 @@ fn shape_check() -> String {
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/mkfs.btrfs; then echo 'selector initramfs: mkfs.btrfs must be deployment-only - the selector formats nothing' >&2; exit 1; fi; \
      if printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/mkfs[.]btrfs[.]static$'; then echo 'selector initramfs: the mkfs.btrfs payload must be deployment-only' >&2; exit 1; fi; \
      for p in mkfs.btrfs btrfs; do [ -f \"$root{in:btrfs-progs-x86-64}/lib/debug/bin/$p.static.debug\" ] || { echo \"root tree: $p lacks its debug companion\" >&2; exit 1; }; done; \
+     [ \"$(readlink \"$root/bin/mkfs.btrfs\" 2>/dev/null)\" = \"{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static\" ] && [ -f \"$root{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static\" ] && [ -x \"$root{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static\" ] || { echo 'root tree: /bin/mkfs.btrfs must link the static mkfs.btrfs a live installer formats with' >&2; exit 1; }; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/losetup || { echo 'deployment initramfs: bin/losetup missing - td-boot root-loop could not bind the verified root and the boot would stop there' >&2; exit 1; }; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/losetup; then echo 'selector initramfs: losetup must be deployment-only - the selector kexecs, it never binds a root loop' >&2; exit 1; fi; \
      [ \"$(wc -l < \"$selector_manifest\")\" -eq 2 ] || { echo 'selector manifest: expected header plus one payload entry' >&2; exit 1; }; \
@@ -7450,6 +7460,36 @@ mod tests {
             .iter()
             .any(|step| matches!(step, Step::CopyTree { from, dest }
             if from == "{in:td-update}" && dest == "{root}/real-root{in:td-update}")));
+    }
+
+    #[test]
+    fn the_live_installer_formats_with_the_root_images_own_mkfs() {
+        let steps = recipe().steps.unwrap();
+        let copied = steps
+            .iter()
+            .position(|step| {
+                matches!(step, Step::CopyTree { from, dest }
+                if from == "{in:btrfs-progs-x86-64}/bin"
+                    && dest == "{root}/real-root{in:btrfs-progs-x86-64}/bin")
+            })
+            .unwrap();
+        let linked = steps
+            .iter()
+            .position(|step| {
+                matches!(step, Step::Symlink { target, link }
+                if target == "{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static"
+                    && link == "{root}/real-root/bin/mkfs.btrfs")
+            })
+            .unwrap();
+        let packed = steps
+            .iter()
+            .position(
+                |step| matches!(step, Step::PackErofs { root, .. } if root == "{root}/real-root"),
+            )
+            .unwrap();
+        assert!(copied < linked, "the link names a binary not yet copied");
+        assert!(linked < packed, "the link must be in the packed root");
+        assert_eq!(td_boot_protocol::MKFS_BTRFS, "mkfs.btrfs");
     }
 
     #[test]
