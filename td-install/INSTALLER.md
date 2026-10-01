@@ -361,8 +361,9 @@ agree, since a bound name can forge one. It clears an inherited
 non-blocking flag, and refuses before sending a byte otherwise. It then
 speaks the installation service protocol on that socket until the peer
 closes between frames, and exits; a malformed frame or message ends it
-without a reply. The review and its claim end with the process: no review
-outlives its installer. No trusted caller starts it yet.
+without a reply. Until an installation starts, the review and its claim
+end with the installer's channel; a started installation runs to its
+finished report first. No trusted caller starts it yet.
 
 It holds at most one review, under the admission rules above. Propose
 checks, in order: busy; the settings (the username through `td-firstboot
@@ -377,21 +378,42 @@ source authentication through `td-boot validate-source` while that claim
 is held; the nonce and version-4 volume UUID from `/dev/urandom`; and a
 recheck of the claimed disk against two inventories. Any refusal releases
 the claim. Only then is the review held and returned. Execute rechecks the
-held disk and, until compositor consent exists, answers consent
-unavailable and keeps the review; a disk that changed abandons it.
-Withdraw releases it. The wire carries only a refusal's code, so the cause
-of each discovery, settings, claim, source or recheck failure is written
-to standard error. While a review is held, its own claim keeps the held
-disk out of destinations replies; that omission is not a disk change. Each
-request is served in turn, so an installer can repeat source
-authentication at will; the caller that starts the service bounds that.
+held disk; a disk that changed abandons the review. Without a consent
+channel, or for a review that channel cannot carry, it then answers
+consent unavailable and keeps the review. Otherwise it sends the review
+report, answers awaiting consent, and waits for td-authd's answer while it
+goes on serving the installer. A decline abandons the review as the
+consent channel section maps it. Consent rechecks the held disk once more
+(a change abandons the review as destination changed), then writes the
+started report before the execution exists (if td-authd cannot be told,
+the review is abandoned as consent unavailable and nothing is written),
+moves the claim to an execution on its own thread, and answers running,
+with the phase the execution last reported, until it reports finished and
+the service is complete or failed. Withdraw releases a review that has not
+started. A consent greeting that fails or stalls for ten seconds leaves
+the service without a channel. A malformed answer, a second answer to a
+started installation, a report that cannot be written or a closed consent
+channel ends only that channel: a displayed review is abandoned as consent
+unavailable, later executes are refused as consent unavailable, and a
+running installation continues. A reply whose write stalls for ten
+seconds, like any other lost reply, counts as losing the installer. The
+wire carries only a refusal's code, so the cause of each discovery,
+settings, claim, source or recheck failure is written to standard error.
+While a review is held, its own claim keeps the held disk out of
+destinations replies; that omission is not a disk change. Each request is
+served in turn, and the next is not read until the reply to the last is
+written, so an installer that does not read cannot queue requests; it can
+still repeat source authentication at will, which the caller that starts
+the service bounds.
 
-The service writes no disk byte and cannot start an installation.
-Exclusion of the medium backing the deployment source currently rests on
-discovery: a mounted medium's exclusive claim keeps it out. Independent
-retention and exclusion of source backing storage, validation of choices
-against that source rather than caller-bound roots, payload and scratch
-fit, and trusted consent remain required before execution.
+The service has no execution of its own yet and production opens no
+consent channel, so it writes no disk byte and cannot start an
+installation; tests drive both ends with fakes. Exclusion of the medium
+backing the deployment source currently rests on discovery: a mounted
+medium's exclusive claim keeps it out. Independent retention and exclusion
+of source backing storage, validation of choices against that source
+rather than caller-bound roots, payload and scratch fit, and trusted
+consent remain required before execution.
 
 ## Installation consent channel
 
@@ -399,8 +421,8 @@ fit, and trusted consent remain required before execution.
 which will start the service, learns what to put before the person and
 answers with their decision. td-authd compiles the same file. It is data and
 codec only. Both ends are root and td-authd creates the channel, so decoding
-authenticates nothing; it refuses only bytes outside the grammar. Nothing
-sends or receives on it yet.
+authenticates nothing; it refuses only bytes outside the grammar. The
+service core speaks it; nothing opens it yet.
 
 Both ends first send and require `TDINA01\n`, which changes with any message
 or its bytes. Each message then travels in one frame: a big-endian u32

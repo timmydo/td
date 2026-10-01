@@ -55,7 +55,7 @@ mod installation_protocol;
 #[path = "installation_service.rs"]
 mod installation_service;
 
-// Nothing sends or receives consent yet.
+// The service speaks one direction; td-authd's half is unused here.
 #[path = "installation_consent.rs"]
 #[allow(dead_code)]
 mod installation_consent;
@@ -1052,8 +1052,9 @@ fn run_serve(host: LiveHost) -> io::Result<()> {
     }
     let euid = paths::open_read(Path::new("/proc/self"))?.metadata()?.uid();
     let stdin = File::from(io::stdin().as_fd().try_clone_to_owned()?);
-    let mut stream = admit_serve(euid, stdin)?;
-    installation_service::serve(&mut stream, installation_service::Service::new(host))
+    let stream = admit_serve(euid, stdin)?;
+    // No execution exists, so no consent channel is sought.
+    installation_service::serve(stream, installation_service::Service::new(host), None)
 }
 
 fn preview_number(value: &OsStr, label: &str) -> io::Result<u64> {
