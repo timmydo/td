@@ -958,7 +958,8 @@ impl Window {
     fn start(&mut self) -> Result<()> {
         let (rows, columns) = self.cells.ok_or("the terminal presented without a grid")?;
         let account = session::current_account(Path::new(PROC_STATUS), Path::new(ETC_PASSWD))?;
-        let command = session::child_command(Path::new(session::CTTYHACK), &self.options.command)?;
+        let command =
+            session::child_command(Path::new(session::DEFAULT_SHELL), &self.options.command)?;
         let program = launched_program_name(&self.options.command);
         let directory = self
             .options

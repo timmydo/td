@@ -339,4 +339,28 @@ mod tests {
             }
         }
     }
+
+    /// td-authd's terminal launch names an absolute path into a DIFFERENT
+    /// staged package plus a flag that package must parse. Neither crate
+    /// compiles against the other, so nothing but this would notice `--stdin`
+    /// being renamed on one side: the launch would build, ship, and fail at
+    /// the first spawn.
+    #[test]
+    fn the_launch_session_wrapper_matches_the_staged_td_init() {
+        const LAUNCH: &str = include_str!("../../../td-authd/src/launch.rs");
+        const CTTYHACK: &str = include_str!("../../../td-init/src/cttyhack.rs");
+        assert_eq!(
+            LAUNCH
+                .matches(r#""--command", "/bin/cttyhack", "--stdin", "#)
+                .count(),
+            2
+        );
+        assert!(CTTYHACK.contains(r#"const STDIN_FLAG: &str = "--stdin";"#));
+        // And that the applet still advertises it, so `cttyhack` alone tells an
+        // operator the mode exists.
+        assert!(CTTYHACK.contains("usage: cttyhack [--stdin] PROG [ARG...]"));
+        // `/bin/cttyhack` is td-init's own symlink name in the image roster.
+        const INIT_MAIN: &str = include_str!("../../../td-init/src/main.rs");
+        assert!(INIT_MAIN.contains(r#"("cttyhack", cttyhack::run)"#));
+    }
 }

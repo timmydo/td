@@ -737,18 +737,22 @@ tty group WRITE, which is how anything reaches a terminal it does not own,
 where the devpts default would be 0600 owned by group root.
 
 Stable Rust does not expose the required PTY operations. td-ui's raw module
-carries `ioctl(2)` pinned to exactly four requests, each at its own wrapper
+carries `ioctl(2)` pinned to exactly five requests, each at its own wrapper
 with the request never a parameter, and `UNSAFE.md` §19 is their normative
 record:
 
 - `TIOCSPTLCK=0x40045431`, to unlock the slave;
 - `TIOCGPTPEER=0x5441`, to obtain the slave as a new owned descriptor;
-- `TIOCSWINSZ=0x5414`, to publish rows and columns; and
+- `TIOCSWINSZ=0x5414`, to publish rows and columns;
 - `TIOCGWINSZ=0x5413`, to verify every published size before it becomes
-  visible to the child.
+  visible to the child; and
+- `TIOCSCTTY=0x540e`, with `setsid(2)`, in the pre-exec hook that makes the
+  default shell lead a session on the slave (below).
 
-td-ui's confinement tests pin the request values, the wrappers, and
-`td_ui::pty` as their only caller, each at one site. This setter applies only
+td-ui's confinement tests pin the request values and the wrappers, with
+`td_ui::pty` the only caller of the four device wrappers and of the session
+hook's installer, that only for a child that leads a session, each at one
+site. This setter applies only
 to the terminal's newly created PTY; it does not weaken the separate
 repository prohibition on resizing an operator's terminal. td-term forbids
 `unsafe` and names no raw layer: its confinement tests refuse `unsafe`,
@@ -783,22 +787,31 @@ pinned font's cell, since that is what a terminfo entry and anything drawing
 a box assume when they cannot ask. Each axis declines independently: a zero
 axis in a configure keeps the size the surface already has on that axis.
 
-Safe `Command` cannot call `setsid(2)`, and `pre_exec` would introduce a
-second unsafe surface. The declared td-init input therefore extends
-`cttyhack` with an explicit `--stdin` mode. That mode always creates a new
-session and claims descriptor zero without stealing a terminal, even when the
-wrapper inherited an outer controlling terminal. Unlike rescue mode,
-`--stdin` exits nonzero if `setsid(2)` or `TIOCSCTTY` fails. td-term invokes
-`/bin/cttyhack --stdin /bin/sh` by default. A `--command PROGRAM [ARG...]` on
-its own command line ends td-term's flags and is exec'd exactly as given,
-WITHOUT the wrapper: the slave is its stdio, and it starts in td-term's
-session with no controlling terminal. The wrapper exists for a shell, which
-expects a controlling terminal it does not create; a program that wants that
-behaviour names `/bin/cttyhack --stdin` itself, and a td-jail terminal
-application must not, because the jail's terminal grant (`devices=tty`, its
-own increment in APPLICATIONS.md §C) acquires the terminal inside stage 1's
-detached session, and the kernel refuses `TIOCSCTTY` for a terminal the
-wrapper has already made the launcher's. The consequence for a child that
+td-term's default child is `/bin/sh` leading a new session whose
+controlling terminal is the slave. Safe `Command` cannot call `setsid(2)`,
+so td-ui's `spawn` does it for a `ChildCommand` with `leads_session`: a
+pre-exec hook in the forked child, after `std` has put the slave on
+descriptors zero to two, issues `setsid(2)` and then `TIOCSCTTY` with
+argument zero on descriptor zero -- two raw syscalls on td-ui's raw surface
+(UNSAFE.md §19), nothing that allocates or locks -- and an error from either
+fails the spawn rather than starting a shell with no job control. That
+failure is td-term's, in `start` before readiness is published, and its
+message names the session; the wrapper it replaced failed inside a child
+already started, which then exited. The claim never steals: a terminal
+another session holds is refused. This replaced
+td-term's use of td-init's `cttyhack --stdin`, which did the same from a
+second exec, because a terminal that runs on a host without td-init has no
+`/bin/cttyhack` to name. A `--command PROGRAM [ARG...]` on its own command
+line ends td-term's flags and is exec'd exactly as given and leads NO
+session: the slave is its stdio, and it starts in td-term's session with no
+controlling terminal. The session exists for a shell, which expects a
+controlling terminal it does not create; a program that wants one names
+`/bin/cttyhack --stdin` itself, as td-authd's launch does, and a td-jail
+terminal application must not, because the jail's terminal grant
+(`devices=tty`, its own increment in APPLICATIONS.md §C) acquires the
+terminal inside stage 1's detached session, and the kernel refuses
+`TIOCSCTTY` for a terminal another session already holds. The consequence
+for a child that
 never acquires the slave is stated here because a unit author would
 otherwise discover it: the slave then belongs to no session and has no
 foreground process group, so the kernel generates NO terminal signals for
@@ -808,15 +821,11 @@ itself and notices the hangup only as `EIO` on the slave. A jailed terminal
 application is unaffected, which is the case `--command` exists for; an
 unjailed program that wants those signals names the wrapper. An explicit
 program is an absolute path, refused at argument parsing before td-term
-dials the compositor; the constant wrapper path is checked when the child
+dials the compositor; the constant shell path is checked when the child
 command is assembled. td-term has no PATH to search for it (the browser
 a followed link starts is the exception, §3), and its argv after
 `--command` is bytes rather than text, since a filename argument is whatever
-the filesystem holds. The td-term recipe's tests assert that td-init's
-`cttyhack` parses and advertises this exact flag and is dispatched under the
-applet name td-term's path uses, tying the absolute path to the declared
-runtime input.
-Ordinary rescue-console behavior remains unchanged.
+the filesystem holds.
 
 The child starts in the verified account home by default: setting `HOME` does
 not move a process, so without an explicit working directory the shell would
@@ -1225,8 +1234,10 @@ terminal, and td-term's prove the program:
   nothing offered and receives a selected offer over a fresh endpoint; and
   feeds output to the model with its replies to the child (`app.rs`);
 - the account, environment, and child command are the specified ones,
-  constructed rather than inherited, the default child is the shell through
-  `cttyhack` and an explicit command is literal argv without it (`session.rs`);
+  constructed rather than inherited, the default child is the shell leading
+  a session and an explicit command is literal argv leading none
+  (`session.rs`), and td-ui's spawn makes a child lead a session on the
+  slave exactly when asked;
 - a readiness line is refused for every way it can be wrong, a probe reads
   back exactly what was published, a live terminal is never displaced but a
   dead one is, and a silent, dripping, or over-long answer fails the probe
@@ -1271,13 +1282,12 @@ is absent -- but `run` is td's session program today:
 - the child's environment is td's: `TERM=td-term` with
   `TERMINFO=/etc/terminfo`, which a foreign distribution lacks unless the
   entry is installed there, and `PATH=/bin`;
-- the default child is `/bin/cttyhack --stdin /bin/sh`, td-init's wrapper at
-  td's path; and
+- the default child is `/bin/sh`, td's path; and
 - the account comes from `/etc/passwd` alone, under §2's whole-file rule.
 
 The target is a desktop profile, a separate increment: `run` without a
 readiness socket, and a session policy for a foreign host -- a terminfo
-entry the child can find, the host's shell and search path, and a
-controlling terminal without td's wrapper -- so that td-term can replace foot
-under a compositor such as sway. Until that lands, running td-term outside
-td's image is a development convenience, not a supported configuration.
+entry the child can find, and the host's shell and search path -- so that
+td-term can replace foot under a compositor such as sway. Until that lands,
+running td-term outside td's image is a development convenience, not a
+supported configuration.

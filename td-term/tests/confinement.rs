@@ -70,7 +70,11 @@ fn the_crate_forbids_unsafe_and_reaches_no_raw_layer() {
     let session = production("session.rs");
     assert!(!session.contains("Command::"), "spawning is td-ui's");
     assert!(session.contains("(\"TERM\".into(), \"td-term\".into()),"));
-    assert!(session.contains("pub const CTTYHACK: &str = \"/bin/cttyhack\";"));
+    assert!(session.contains("pub const DEFAULT_SHELL: &str = \"/bin/sh\";"));
+    assert!(
+        !session.contains("cttyhack\";"),
+        "the shell leads its session itself"
+    );
 }
 
 #[test]

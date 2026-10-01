@@ -537,7 +537,9 @@ of its own files may name each module.
   and `resize`, which publishes a grid and reads it back before trusting
   it), `WindowSize` and `window_size`, `grid_size` and `grid_for_tile`,
   `ChildCommand` and `spawn` (a caller-composed command on the slave, the
-  environment cleared and set to the caller's list), the threads
+  environment cleared and set to the caller's list, leading a new session
+  whose controlling terminal is the slave exactly when `leads_session` is
+  set), the threads
   `spawn_reader`, `spawn_writer` and `spawn_waiter` (named `pty-output`,
   `pty-input` and `pty-child`, each reporting its own ending on the
   caller's channel as `Output` or `Waited` and running the caller's
@@ -1171,16 +1173,18 @@ not frames, and stays its own).
 - Production code has no `unwrap`, `expect`, panics or panicking indexing;
   invalid input returns a diagnostic or error naming the item.
 - `unsafe` is confined to `sys`, the transport's raw module, under
-  `UNSAFE.md` §19: two function-scoped allowances, one syscall instruction
-  carrying `recvmsg`, `sendmsg`, `fcntl` pinned to `F_DUPFD_CLOEXEC`,
-  `F_GETFL` and `F_SETFL`, `poll` over the connection's stream and
-  its waker, and `ioctl` pinned to the four PTY requests `TIOCSPTLCK`,
-  `TIOCGPTPEER`, `TIOCSWINSZ` and `TIOCGWINSZ`, one wrapper each with the
-  request never a parameter, one descriptor adoption site, and a crate
-  root that denies it. Only `wayland`, `clipboard` and `pty` name the
-  module, the transport through its four wrappers, the clipboard's
-  destination owner through the two status ones, and the PTY through the
-  four ioctl ones, each at one site. Reusing it does not transfer
+  `UNSAFE.md` §19: three function-scoped allowances, one syscall
+  instruction carrying `recvmsg`, `sendmsg`, `fcntl` pinned to
+  `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `poll` over the connection's
+  stream and its waker, `ioctl` pinned to the five PTY requests
+  `TIOCSPTLCK`, `TIOCGPTPEER`, `TIOCSWINSZ`, `TIOCGWINSZ` and `TIOCSCTTY`,
+  one wrapper each with the request never a parameter, and `setsid`, one
+  descriptor adoption site, one pre-exec hook that makes a PTY child lead
+  a session on its slave, and a crate root that denies it. Only `wayland`,
+  `clipboard` and `pty` name the module, the transport through its four
+  wrappers, the clipboard's destination owner through the two status
+  ones, and the PTY through the four ioctl ones and the session hook, each
+  at one site. Reusing it does not transfer
   authorization to a new consumer, which gets its own roster entry;
   td-term reaches the PTY only through `pty::Pty` and forbids `unsafe`.
 - The terminal modules keep the bounds `td-term/DESIGN.md` §2 states
@@ -1397,28 +1401,29 @@ absence of `include!`, `cfg_attr` and any dependency declaration, that the
 shared sources bind no input interface, that `face_file` opens one file
 under its one directory after checking it and bounding the read and
 `pinned_face` reads only through it, and the raw layer: the complete
-fingerprint of `sys.rs`, its syscall and flag values, its two function-only
-allowances, the single instruction and adoption sites, that the crate root
-denies `unsafe` and declares the module private, that `wayland`, `clipboard`
-and `pty` are its only callers, the transport through exactly five wrapper
-calls (the poll over two readable-only entries among them), the clipboard's
-destination owner through exactly five status calls, and the PTY through
-exactly its four ioctl wrappers, each at one site, with `SYS_IOCTL` named
-only at its definition and those wrappers and each request constant and the
-peer flags only at their definition and their one use, the master opened
-with `O_NOCTTY`, every published size read back, and the child's environment
-cleared, that no production module calls the test support (the client's
-`unconfigure` and `input_mut`, `pty::Input::take_for_test`), and that the
-client is the toolkit's one consumer of a received right, through the pinned
-keymap reader with its format, size and regular-file checks and the send
-that hands its right on. For the terminal it pins `pty`, `vt`, `vt_keys`,
-`vt_render` and `vt_terminfo` as public modules, `vt_keys` among the pure
-set, and `vt`, `vt_render` and `vt_terminfo` as pure production text -- no
-environment, filesystem, network, process, time, I/O, embedded file, path
-mount or nested module before the test tail -- whose tails are exactly their
-specification mounts (`vt_terminfo`'s two test modules), with the
-specifications test code throughout and `vt_spec.rs` mounting only the
-engine's SHA-256.
+fingerprint of `sys.rs`, its syscall and flag values, its three
+function-only allowances, the single instruction and adoption sites, that
+the crate root denies `unsafe` and declares the module private, that
+`wayland`, `clipboard` and `pty` are its only callers, the transport through
+exactly five wrapper calls (the poll over two readable-only entries among
+them), the clipboard's destination owner through exactly five status calls,
+and the PTY through exactly its four ioctl wrappers and its session hook,
+each at one site, with `SYS_IOCTL` named only at its definition and its five
+wrappers, `SYS_SETSID` and the pre-exec hook each at one site, and each
+request constant and the peer flags only at their definition and their one
+use, the master opened with `O_NOCTTY`, every published size read back, and
+the child's environment cleared, that no production module calls the test
+support (the client's `unconfigure` and `input_mut`,
+`pty::Input::take_for_test`), and that the client is the toolkit's one
+consumer of a received right, through the pinned keymap reader with its
+format, size and regular-file checks and the send that hands its right on.
+For the terminal it pins `pty`, `vt`, `vt_keys`, `vt_render` and
+`vt_terminfo` as public modules, `vt_keys` among the pure set, and `vt`,
+`vt_render` and `vt_terminfo` as pure production text -- no environment,
+filesystem, network, process, time, I/O, embedded file, path mount or nested
+module before the test tail -- whose tails are exactly their specification
+mounts (`vt_terminfo`'s two test modules), with the specifications test code
+throughout and `vt_spec.rs` mounting only the engine's SHA-256.
 
 `control`'s in-file tests are td-editor's framing tests moved: every frame
 split and single-byte delivery, truncation, zero/oversized/trailing frames,

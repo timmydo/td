@@ -24,8 +24,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 
-/// `O_NOCTTY` — the child claims the terminal, through cttyhack. td-term must
-/// not acquire it by opening the master or the peer.
+/// `O_NOCTTY` — the child claims the terminal as it starts (`spawn`). This
+/// process must not acquire it by opening the master or the peer.
 const O_NOCTTY: i32 = 0o400;
 
 /// The kernel's hangup once the last slave descriptor is gone.
@@ -198,10 +198,16 @@ pub fn grid_for_tile(
 }
 
 /// What a terminal execs: literal argv values, no shell, no PATH search.
+///
+/// `leads_session` makes the child lead a new session whose controlling
+/// terminal is the slave, as an interactive shell needs for job control and
+/// the line discipline's signals. A child that leads none leaves the slave
+/// unowned, for a program that takes a terminal in a session of its own.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChildCommand {
     pub program: PathBuf,
     pub arguments: Vec<OsString>,
+    pub leads_session: bool,
 }
 
 /// Start the child on the slave. The slave and all three parent-side clones are
@@ -235,10 +241,18 @@ pub fn spawn(
     for (name, value) in environment {
         process.env(name, value);
     }
+    if command.leads_session {
+        sys::lead_session(&mut process);
+    }
     process.spawn().map_err(|e| {
         format!(
-            "spawn {} in {}: {e}",
+            "spawn {}{} in {}: {e}",
             command.program.display(),
+            if command.leads_session {
+                " (as a session leader on the terminal)"
+            } else {
+                ""
+            },
             directory.display()
         )
     })
@@ -267,13 +281,12 @@ pub fn output_channel<T>() -> (SyncSender<T>, Receiver<T>) {
 /// That is sound only because td-term is one process per terminal (td-term/DESIGN.md §1): closing
 /// "the terminal" IS exiting, process exit closes this descriptor, and the
 /// kernel then sends `SIGHUP` to the session that holds the slave as its
-/// controlling terminal — the default shell's, through cttyhack, or the one a
-/// td-jail terminal application acquires for itself. A bare `--command` child
-/// holds no such session and learns of the hangup only as `EIO` on its next
-/// read or write of the slave, so its retirement is its own exit. The caller
-/// must therefore NOT join this handle on a teardown path — a detached thread
-/// cannot delay process exit, but a join would wait for a read that never
-/// returns. Interrupting the reader for any other reason needs a separately
+/// controlling terminal, which a child `spawn` started with `leads_session`
+/// leads. A child that leads none learns of the hangup only as `EIO` on its
+/// next read or write of the slave, so its retirement is its own exit. The
+/// caller must therefore NOT join this handle on a teardown path — a detached
+/// thread cannot delay process exit, but a join would wait for a read that
+/// never returns. Interrupting the reader for any other reason needs a separately
 /// reviewed wakeup surface.
 ///
 /// `notify` runs after every send, so a loop that waits on something other
@@ -643,6 +656,7 @@ mod tests {
 
     use super::*;
     use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
     use std::time::Duration;
 
     /// A constructed environment, as a terminal's own policy would pass:
@@ -770,11 +784,23 @@ mod tests {
     /// master published, and receives exactly the constructed environment.
     #[test]
     fn a_spawned_child_inherits_the_slave_and_the_published_grid() {
+        spawn_fixture(true, "leader slave");
+    }
+
+    /// A child told to lead no session leaves the slave unowned, for a
+    /// program that takes a terminal in a session of its own.
+    #[test]
+    fn a_child_that_leads_no_session_leaves_the_terminal_unowned() {
+        spawn_fixture(false, "member not-slave");
+    }
+
+    fn spawn_fixture(leads_session: bool, observed: &str) {
         let pty = open_pty();
         pty.resize(31, 97).unwrap();
         let slave = pty.peer().unwrap();
         let command = ChildCommand {
             program: std::env::current_exe().unwrap(),
+            leads_session,
             arguments: vec![
                 "--exact".into(),
                 "pty::tests::pty_child_fixture".into(),
@@ -813,12 +839,16 @@ mod tests {
                 Err(error) => panic!("no fixture marker in {seen:?}: {error}"),
             }
         };
-        // rows, columns, TERM, environment size, and working directory, all as
-        // the child itself observed them. The directory is the one passed to
+        // rows, columns, TERM, environment size, whether it leads its session
+        // and holds a controlling terminal, and working directory, all as the
+        // child itself observed them. The directory is the one passed to
         // `spawn`: setting HOME does not move a child, so this is what proves
         // the shell starts where its own environment says it does.
         let home = home.canonicalize().unwrap();
-        assert_eq!(marker, format!("31 97 td-term 3 {}", home.display()));
+        assert_eq!(
+            marker,
+            format!("31 97 td-term 3 {observed} {}", home.display())
+        );
         let status = child.wait().unwrap();
         assert!(
             status.success(),
@@ -845,12 +875,68 @@ mod tests {
         let term = std::env::var("TERM").unwrap_or_default();
         let count = std::env::vars_os().count();
         let directory = std::env::current_dir().unwrap();
+        // `/proc/self/stat` after the command name: state, parent, group,
+        // session, controlling terminal. The terminal is compared with the
+        // slave on stdin rather than asked of `/dev/tty`, which opens for
+        // whatever terminal the test runner's own session holds.
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let fields: Vec<&str> = stat.rsplit_once(") ").unwrap().1.split(' ').collect();
+        let leader = if fields[3] == std::process::id().to_string() {
+            "leader"
+        } else {
+            "member"
+        };
+        let tty_nr: u64 = fields[4].parse().unwrap();
+        let rdev = std::fs::metadata("/proc/self/fd/0").unwrap().rdev();
+        let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+        let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+        let slave = (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12);
+        let tty = if tty_nr == slave {
+            "slave"
+        } else {
+            "not-slave"
+        };
         println!(
-            "TD-TERM-FIXTURE {} {} {term} {count} {}",
+            "TD-TERM-FIXTURE {} {} {term} {count} {leader} {tty} {}",
             size.rows,
             size.columns,
             directory.display()
         );
+    }
+
+    /// A terminal another session already holds is not taken: the claim uses
+    /// argument zero, which never steals, and its refusal fails the spawn
+    /// rather than starting a child without the session it asked for.
+    #[test]
+    fn a_session_is_not_claimed_on_a_terminal_another_session_holds() {
+        let pty = open_pty();
+        let command = |millis: &str| {
+            let mut environment = fixture_environment();
+            environment.push((SILENT_FIXTURE.into(), millis.into()));
+            let command = ChildCommand {
+                program: std::env::current_exe().unwrap(),
+                leads_session: true,
+                arguments: vec![
+                    "--exact".into(),
+                    "pty::tests::pty_silent_child_fixture".into(),
+                    "--ignored".into(),
+                    "--nocapture".into(),
+                ],
+            };
+            (command, environment)
+        };
+        let (first, environment) = command("30000");
+        let slave = pty.peer().unwrap();
+        let mut holder = spawn(&first, &environment, &std::env::temp_dir(), slave).unwrap();
+        let (second, environment) = command("0");
+        let slave = pty.peer().unwrap();
+        let refused = spawn(&second, &environment, &std::env::temp_dir(), slave);
+        // Reaped before anything is asserted, so a failure leaves no holder.
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        let refused = refused.unwrap_err();
+        assert!(refused.contains("(as a session leader"), "{refused}");
+        assert!(refused.contains("os error 1"), "EPERM: {refused}");
     }
 
     /// A child that holds the terminal and never reads a byte of it, so a
@@ -931,6 +1017,7 @@ mod tests {
         let slave = pty.peer().unwrap();
         let command = ChildCommand {
             program: std::env::current_exe().unwrap(),
+            leads_session: false,
             arguments: vec![
                 "--exact".into(),
                 "pty::tests::pty_silent_child_fixture".into(),
@@ -1217,6 +1304,7 @@ mod tests {
         let slave = pty.peer().unwrap();
         let command = ChildCommand {
             program: std::env::current_exe().unwrap(),
+            leads_session: false,
             arguments: vec![
                 "--exact".into(),
                 "pty::tests::pty_child_fixture".into(),
@@ -1268,6 +1356,7 @@ mod tests {
         let slave = pty.peer().unwrap();
         let command = ChildCommand {
             program: std::env::current_exe().unwrap(),
+            leads_session: false,
             arguments: vec![
                 "--exact".into(),
                 "pty::tests::pty_silent_child_fixture".into(),

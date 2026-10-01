@@ -12,8 +12,9 @@
 //! If the console cannot be claimed the program is exec'd anyway, on inherited
 //! stdio. cttyhack must never be the reason a rescue shell fails to start.
 //!
-//! `--stdin` is the exception, and it is td-term's: the caller has already put a
-//! PTY slave on descriptor zero and needs the child to LEAD a session on it.
+//! `--stdin` is the exception, and it is td-authd's terminal launch's: the caller
+//! has already put a PTY slave on descriptor zero and needs the child to LEAD a
+//! session on it.
 //! That mode always makes a new session — even when an outer terminal was
 //! inherited — and fails rather than degrading, because a terminal emulator
 //! whose child has no controlling terminal has no job control and no ^C, and

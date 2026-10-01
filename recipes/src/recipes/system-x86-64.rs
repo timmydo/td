@@ -713,9 +713,9 @@ const TD_INIT_FARM: &[(&str, Probe)] = &[
     // That normally EPERMs (getty holds ttyS0 by then), but `::once:` jobs start before the
     // respawned tty session, so there is a window where the claim succeeds and the probe —
     // exiting immediately as a session leader — vhangups it. That cost stands whatever
-    // else uses the applet, and since the terminal became the boot's first client its
-    // success path IS on the boot path: td-term execs `cttyhack --stdin /bin/sh` for
-    // every session. The usage refusal still pins the packed name and its dispatch.
+    // else uses the applet, and its success path IS on a launch path: td-authd's terminal
+    // launch execs `cttyhack --stdin` for its CLI. The usage refusal still pins the
+    // packed name and its dispatch.
     ("cttyhack", Probe::Refuses("", "usage: cttyhack")),
     // Probed by REFUSAL for `mount`'s reason, which is its own: with no arguments this
     // MOUNTS, and the greeter is unprivileged so a real run would EPERM anyway. The

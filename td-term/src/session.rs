@@ -10,10 +10,7 @@ use std::path::{Path, PathBuf};
 use td_ui::proc_status::effective_uid;
 use td_ui::pty::ChildCommand;
 
-/// The declared td-init input that gives the child a session and a controlling
-/// terminal; safe `Command` reaches neither.
-pub const CTTYHACK: &str = "/bin/cttyhack";
-pub const CTTYHACK_STDIN: &str = "--stdin";
+/// The shell td's session runs when no command is given.
 pub const DEFAULT_SHELL: &str = "/bin/sh";
 
 /// Bounded reads of the two small files the child environment is derived from.
@@ -140,33 +137,32 @@ pub fn environment(
     environment
 }
 
-/// `/bin/cttyhack --stdin /bin/sh` by default, or exactly the command supplied
-/// on td-term's own command line.
+/// `shell`, leading a session on the terminal, by default, or exactly the
+/// command supplied on td-term's own command line.
 ///
-/// The default shell is wrapped because a shell expects a controlling terminal
-/// it does not create, and safe `Command` cannot make one. An explicit command
-/// is NOT wrapped: it is exec'd as given, with the slave on its stdio and no
-/// session or controlling terminal of its own. A program that wants cttyhack's
-/// behaviour names the wrapper itself; td-jail's terminal grant (its own
-/// increment, `devices=tty` in APPLICATIONS.md) instead acquires the terminal
-/// inside its own detached session, which the kernel refuses for a terminal
-/// the wrapper has already made the launcher's. Both paths must be absolute:
-/// a relative program would be resolved against an ambient PATH this adapter
+/// The shell leads a session whose controlling terminal is the slave, because
+/// a shell expects job control and the line discipline's signals and creates
+/// neither; td-ui's `spawn` makes it so as it starts the child. An explicit
+/// command does NOT: it is exec'd as given, with the slave on its stdio and no
+/// session or controlling terminal of its own. A program that wants one says
+/// so, as td-authd's launch does through `/bin/cttyhack --stdin`; td-jail's
+/// terminal grant (`devices=tty` in APPLICATIONS.md) instead acquires the
+/// terminal inside its own detached session, which the kernel refuses for a
+/// terminal another session already holds. Both paths must be absolute: a
+/// relative program would be resolved against an ambient PATH this adapter
 /// deliberately does not have.
-pub fn child_command(wrapper: &Path, command: &[OsString]) -> Result<ChildCommand, String> {
-    if !wrapper.is_absolute() {
+pub fn child_command(shell: &Path, command: &[OsString]) -> Result<ChildCommand, String> {
+    if !shell.is_absolute() {
         return Err(format!(
-            "terminal session wrapper '{}' is not absolute",
-            wrapper.display()
+            "terminal shell '{}' is not absolute",
+            shell.display()
         ));
     }
     let Some(program) = command.first() else {
         return Ok(ChildCommand {
-            program: wrapper.to_path_buf(),
-            arguments: vec![
-                OsString::from(CTTYHACK_STDIN),
-                OsString::from(DEFAULT_SHELL),
-            ],
+            program: shell.to_path_buf(),
+            arguments: Vec::new(),
+            leads_session: true,
         });
     };
     if !Path::new(program).is_absolute() {
@@ -178,6 +174,7 @@ pub fn child_command(wrapper: &Path, command: &[OsString]) -> Result<ChildComman
     Ok(ChildCommand {
         program: PathBuf::from(program),
         arguments: command.iter().skip(1).cloned().collect(),
+        leads_session: false,
     })
 }
 
@@ -211,13 +208,10 @@ pub fn selftest() -> Result<(), String> {
     {
         return Err("session selftest built the wrong child environment".into());
     }
-    let command = child_command(Path::new(CTTYHACK), &[])?;
-    if command.program != Path::new(CTTYHACK)
-        || command.arguments
-            != vec![
-                OsString::from(CTTYHACK_STDIN),
-                OsString::from(DEFAULT_SHELL),
-            ]
+    let command = child_command(Path::new(DEFAULT_SHELL), &[])?;
+    if command.program != Path::new(DEFAULT_SHELL)
+        || !command.arguments.is_empty()
+        || !command.leads_session
     {
         return Err("session selftest composed the wrong child command".into());
     }
@@ -340,11 +334,12 @@ mod tests {
     }
 
     #[test]
-    fn the_default_child_is_the_shell_through_cttyhack() {
-        let default = child_command(Path::new(CTTYHACK), &[]).unwrap();
-        assert_eq!(default.program, PathBuf::from("/bin/cttyhack"));
-        assert_eq!(default.arguments, vec!["--stdin", "/bin/sh"]);
-        assert!(child_command(Path::new("cttyhack"), &[]).is_err());
+    fn the_default_child_is_the_shell_leading_a_session() {
+        let default = child_command(Path::new(DEFAULT_SHELL), &[]).unwrap();
+        assert_eq!(default.program, PathBuf::from("/bin/sh"));
+        assert!(default.arguments.is_empty());
+        assert!(default.leads_session);
+        assert!(child_command(Path::new("sh"), &[]).is_err());
     }
 
     #[test]
@@ -352,31 +347,34 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let words = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
         let explicit = child_command(
-            Path::new(CTTYHACK),
+            Path::new(DEFAULT_SHELL),
             &words(&["/bin/mail", "--cli", "echo hi"]),
         )
         .unwrap();
         assert_eq!(explicit.program, PathBuf::from("/bin/mail"));
         assert_eq!(explicit.arguments, vec!["--cli", "echo hi"]);
-        // A caller that wants the wrapper spells it out and gets exactly that.
+        assert!(!explicit.leads_session, "the terminal is left unowned");
+        // A caller that wants a session spells out the wrapper and gets
+        // exactly that.
         let wrapped = child_command(
-            Path::new(CTTYHACK),
-            &words(&[CTTYHACK, CTTYHACK_STDIN, "/bin/sh"]),
+            Path::new(DEFAULT_SHELL),
+            &words(&["/bin/cttyhack", "--stdin", "/bin/sh"]),
         )
         .unwrap();
-        assert_eq!(wrapped.program, PathBuf::from(CTTYHACK));
+        assert_eq!(wrapped.program, PathBuf::from("/bin/cttyhack"));
         assert_eq!(wrapped.arguments, vec!["--stdin", "/bin/sh"]);
+        assert!(!wrapped.leads_session);
         // Literal means bytes: an argument that is not UTF-8 is carried as-is.
         let raw = OsString::from_vec(vec![0x2f, 0x74, 0x6d, 0x70, 0x2f, 0xff]);
         let bytes = child_command(
-            Path::new(CTTYHACK),
+            Path::new(DEFAULT_SHELL),
             &[OsString::from("/bin/mail"), raw.clone()],
         )
         .unwrap();
         assert_eq!(bytes.arguments, vec![raw]);
-        assert!(child_command(Path::new(CTTYHACK), &words(&["sh"])).is_err());
-        // The wrapper's own path is checked even when the command does not use it.
-        assert!(child_command(Path::new("cttyhack"), &words(&["/bin/mail"])).is_err());
+        assert!(child_command(Path::new(DEFAULT_SHELL), &words(&["sh"])).is_err());
+        // The shell's path is checked even when the command does not use it.
+        assert!(child_command(Path::new("sh"), &words(&["/bin/mail"])).is_err());
     }
 
     #[test]

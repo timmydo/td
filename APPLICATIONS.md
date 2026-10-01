@@ -3054,11 +3054,11 @@ that its session and process group are unchanged and its
 controlling-terminal field decodes to that device. What the kernel enforces
 for the zero argument is exact: a terminal *some session owns* is refused,
 and stage 1 never steals. A shell's terminal is owned because td-term's
-default child is `cttyhack`, which takes it; so `claude` typed at a td-term
+default shell leads a session on it; so `claude` typed at a td-term
 prompt fails with a diagnostic naming td-term's `--command`, the path that
 produces a session-less pty for exactly this purpose
 (`td-term/DESIGN.md` §4). "Never the operator's" therefore rests on
-that wrapper: a shell started with `--command /bin/sh` leads no session, its
+that session: a shell started with `--command /bin/sh` leads no session, its
 pty is unowned, and an application launched from it would acquire and share
 that terminal. Terminal stdin always selects the new-session path, even
 when inherited from a supervisor group. It happens before registration, namespaces and the

@@ -60,24 +60,4 @@ mod tests {
             "pub const MARKER: &str = \"{TD_TERM_RUNTIME_MARKER}\";"
         )));
     }
-
-    /// td-term's child command is an absolute path into a DIFFERENT staged
-    /// package plus a flag that package must parse. Neither crate compiles
-    /// against the other, so nothing but this would notice `--stdin` being
-    /// renamed on one side: the terminal would build, ship, and fail at the
-    /// first spawn.
-    #[test]
-    fn the_terminals_session_wrapper_matches_the_staged_td_init() {
-        const SESSION: &str = include_str!("../../../td-term/src/session.rs");
-        const CTTYHACK: &str = include_str!("../../../td-init/src/cttyhack.rs");
-        assert!(SESSION.contains(r#"pub const CTTYHACK: &str = "/bin/cttyhack";"#));
-        assert!(SESSION.contains(r#"pub const CTTYHACK_STDIN: &str = "--stdin";"#));
-        assert!(CTTYHACK.contains(r#"const STDIN_FLAG: &str = "--stdin";"#));
-        // And that the applet still advertises it, so `cttyhack` alone tells an
-        // operator the mode exists.
-        assert!(CTTYHACK.contains("usage: cttyhack [--stdin] PROG [ARG...]"));
-        // `/bin/cttyhack` is td-init's own symlink name in the image roster.
-        const INIT_MAIN: &str = include_str!("../../../td-init/src/main.rs");
-        assert!(INIT_MAIN.contains(r#"("cttyhack", cttyhack::run)"#));
-    }
 }

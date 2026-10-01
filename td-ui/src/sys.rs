@@ -3,9 +3,11 @@
 //! UNSAFE.md section 19. One function-scoped syscall instruction carries
 //! `recvmsg`, `sendmsg`, `fcntl` pinned to `F_DUPFD_CLOEXEC` for the
 //! transport and to `F_GETFL` and `F_SETFL` for the destination owner,
-//! `poll` over exactly the connection's stream and its waker, and `ioctl`
-//! pinned to the four PTY requests; one function-scoped adoption site
-//! owns freshly installed descriptors. Safe `std` owns connection setup,
+//! `poll` over exactly the connection's stream and its waker, `ioctl`
+//! pinned to the five PTY requests, and `setsid` for a PTY child; one
+//! function-scoped adoption site owns freshly installed descriptors, and
+//! one function-scoped pre-exec hook makes a PTY child lead a session on
+//! its terminal. Safe `std` owns connection setup,
 //! byte-only sends, timeouts, file creation and every close. Nothing here
 //! is reachable from another crate: the connection in `wayland`, the
 //! destination owner in `clipboard` and the terminal in `pty` are the
@@ -16,6 +18,8 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixDatagram, UnixStream};
+use std::os::unix::process::CommandExt;
+use std::process::Command;
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("the td-ui Wayland transport requires Linux x86-64");
@@ -25,11 +29,13 @@ const SYS_RECVMSG: usize = 47;
 const SYS_FCNTL: usize = 72;
 const SYS_POLL: usize = 7;
 const SYS_IOCTL: usize = 16;
+const SYS_SETSID: usize = 112;
 const POLLIN: i16 = 1;
 const TIOCSPTLCK: usize = 0x4004_5431;
 const TIOCGPTPEER: usize = 0x5441;
 const TIOCSWINSZ: usize = 0x5414;
 const TIOCGWINSZ: usize = 0x5413;
+const TIOCSCTTY: usize = 0x540e;
 /// `O_RDWR | O_NOCTTY | O_CLOEXEC`: the slave belongs to the child, never
 /// to this process, and does not leak across an unrelated exec.
 const PTY_PEER_FLAGS: usize = 0o2 | 0o400 | 0o2_000_000;
@@ -218,6 +224,29 @@ pub(crate) fn set_window_size(terminal: &File, words: [u16; 4]) -> io::Result<()
         (&words as *const [u16; 4]) as usize,
     ))
     .map(|_| ())
+}
+
+/// In the child `spawn` is starting, between fork and exec: lead a new
+/// session, then take descriptor zero -- the PTY slave, which `std` has
+/// already put there -- as its controlling terminal, argument zero because
+/// this session holds none yet. Two raw syscalls and nothing that allocates
+/// or locks, which is all a pre-exec hook may do. An error fails the spawn.
+fn lead_session_on_stdin() -> io::Result<()> {
+    result(syscall3(SYS_SETSID, 0, 0, 0))?;
+    result(syscall3(SYS_IOCTL, 0, TIOCSCTTY, 0)).map(|_| ())
+}
+
+/// Make `command`'s child lead a session on the terminal at its standard
+/// input, so the line discipline's signals and job control reach it. The
+/// caller has put that terminal on the command's stdin: the hook claims
+/// descriptor zero, whatever it holds.
+#[allow(unsafe_code)]
+pub(crate) fn lead_session(command: &mut Command) {
+    // SAFETY: the hook runs in the forked child before exec and makes only
+    // the two raw syscalls above: no allocation, lock or shared state.
+    unsafe {
+        command.pre_exec(lead_session_on_stdin);
+    }
 }
 
 /// Read a terminal's `struct winsize` back into four words.

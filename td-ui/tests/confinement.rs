@@ -125,15 +125,16 @@ fn source_inventory_and_shared_mounts_are_closed() {
             text.matches("unsafe").count(),
             match name.as_str() {
                 "lib.rs" => 1,
-                "sys.rs" => 4,
+                "sys.rs" => 6,
                 _ => 0,
             },
             "unsafe keyword in {name}"
         );
         // The raw module is named by the crate root's private declaration,
         // by the transport's two imports and five wrapper calls, by the
-        // clipboard's import and five status calls and by the PTY's import
-        // and four ioctl wrapper calls; no other module, shared source or
+        // clipboard's import and five status calls and by the PTY's import,
+        // four ioctl wrapper calls and its spawn's session hook; no other
+        // module, shared source or
         // test-support reader reaches it.
         // The socket's pinned procfs pathname has a `sys` segment that is
         // not raw-module access.
@@ -150,7 +151,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "lib.rs" => 1,
                 "wayland.rs" => 7,
                 "clipboard.rs" => 6,
-                "pty.rs" => 5,
+                "pty.rs" => 6,
                 _ => 0,
             },
             "raw-module access in {name}"
@@ -440,7 +441,7 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0x3295d19065593dfe,
+        hash, 0x392769aeae75189f,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
@@ -449,11 +450,13 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         "const SYS_FCNTL: usize = 72;",
         "const SYS_POLL: usize = 7;",
         "const SYS_IOCTL: usize = 16;",
+        "const SYS_SETSID: usize = 112;",
         "const POLLIN: i16 = 1;",
         "const TIOCSPTLCK: usize = 0x4004_5431;",
         "const TIOCGPTPEER: usize = 0x5441;",
         "const TIOCSWINSZ: usize = 0x5414;",
         "const TIOCGWINSZ: usize = 0x5413;",
+        "const TIOCSCTTY: usize = 0x540e;",
         "const PTY_PEER_FLAGS: usize = 0o2 | 0o400 | 0o2_000_000;",
         "const F_DUPFD_CLOEXEC: usize = 1030;",
         "const F_GETFL: usize = 3;",
@@ -492,15 +495,29 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         "pub(crate) fn window_size(terminal: &File) -> io::Result<[u16; 4]>",
         "let mut words = [0u16; 4];",
         "SYS_IOCTL,\n        terminal.as_raw_fd() as usize,\n        TIOCGWINSZ,\n        (&mut words as *mut [u16; 4]) as usize,",
+        "fn lead_session_on_stdin() -> io::Result<()> {\n    result(syscall3(SYS_SETSID, 0, 0, 0))?;\n    result(syscall3(SYS_IOCTL, 0, TIOCSCTTY, 0)).map(|_| ())\n}",
+        "#[allow(unsafe_code)]\npub(crate) fn lead_session(command: &mut Command) {",
+        "unsafe {\n        command.pre_exec(lead_session_on_stdin);\n    }",
     ] {
         assert!(raw.contains(pin), "{pin}");
     }
-    // ioctl(2) is exactly the four PTY requests, each at its one wrapper:
-    // the request is never a parameter.
-    assert_eq!(raw.matches("SYS_IOCTL").count(), 5);
-    for request in ["TIOCSPTLCK", "TIOCGPTPEER", "TIOCSWINSZ", "TIOCGWINSZ"] {
+    // ioctl(2) is exactly the five PTY requests, each at its one wrapper:
+    // the request is never a parameter. setsid(2) is the pre-exec hook's
+    // alone, and the hook is installed at one site.
+    assert_eq!(raw.matches("SYS_IOCTL").count(), 6);
+    for request in [
+        "TIOCSPTLCK",
+        "TIOCGPTPEER",
+        "TIOCSWINSZ",
+        "TIOCGWINSZ",
+        "TIOCSCTTY",
+    ] {
         assert_eq!(raw.matches(request).count(), 2, "{request}");
     }
+    assert_eq!(raw.matches("SYS_SETSID").count(), 2);
+    assert_eq!(raw.matches("pre_exec").count(), 1);
+    assert_eq!(raw.matches("lead_session_on_stdin").count(), 2);
+    assert_eq!(raw.matches("#[allow(unsafe_code)]").count(), 3);
     assert_eq!(raw.matches("PTY_PEER_FLAGS").count(), 2);
     assert_eq!(
         raw.matches("adopt(").count(),
@@ -581,18 +598,21 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
     assert!(client.contains("!metadata.is_file() || metadata.len() < u64::from(size)"));
     assert!(!client.contains("from_raw_fd") && !client.contains("as_raw_fd"));
     assert!(!client.contains("mmap"));
-    // The PTY is the ioctls' one caller, each at one site: the master is
+    // The PTY is the only caller of the four device ioctls and of the
+    // session hook's installer, each at one site: the master is
     // opened without acquiring it and unlocked, its slave taken from it by
-    // descriptor, and every published size read back before it is trusted.
+    // descriptor, every published size read back before it is trusted, and
+    // a child made to lead a session on the slave exactly when it asks.
     let pty = include_str!("../src/pty.rs");
     let pty = pty.split("\n#[cfg(test)]\n#[allow(").next().unwrap();
-    assert_eq!(pty.matches("sys::").count(), 4);
+    assert_eq!(pty.matches("sys::").count(), 5);
     assert_eq!(pty.matches("use crate::sys;").count(), 1);
     for call in [
         "sys::unlock_pty(&master)",
         "sys::pty_peer(&self.master)",
         "sys::set_window_size(&self.master, winsize_words(requested))",
         "sys::window_size(&terminal)",
+        "    if command.leads_session {\n        sys::lead_session(&mut process);\n    }",
     ] {
         assert_eq!(pty.matches(call).count(), 1, "{call}");
     }
