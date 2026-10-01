@@ -117,7 +117,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
         0xdb0370689e65a509,
-        "shared consent changed: reconcile td-secret/src/main.rs, compositor confinement and this pin"
+        "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
         fingerprint(

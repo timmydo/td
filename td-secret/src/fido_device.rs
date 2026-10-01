@@ -332,6 +332,9 @@ impl Cancellation {
     pub(crate) fn cancel(&self) {
         self.0.store(true, Ordering::Release);
     }
+    pub(crate) fn cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

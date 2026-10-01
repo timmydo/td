@@ -1,5 +1,6 @@
 use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
+const LIB_RS: &str = include_str!("../../../td-secret/src/lib.rs");
 const MAIN_RS: &str = include_str!("../../../td-secret/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
     (
@@ -122,11 +123,16 @@ pub fn recipe() -> Recipe {
     steps.push(Step::MkDir {
         path: "{out}/bin".into(),
     });
-    steps.push(Step::WriteFile {
-        path: "{src}/td-secret/src/main.rs".into(),
-        content: MAIN_RS.into(),
-        exec: false,
-    });
+    for (path, content) in [
+        ("{src}/td-secret/src/lib.rs", LIB_RS),
+        ("{src}/td-secret/src/main.rs", MAIN_RS),
+    ] {
+        steps.push(Step::WriteFile {
+            path: path.into(),
+            content: content.into(),
+            exec: false,
+        });
+    }
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
             path: match *name {
@@ -156,6 +162,10 @@ pub fn recipe() -> Recipe {
         (
             "{src}/td-secret/src/portable_notebook.rs",
             include_str!("../../../td-secret/src/portable_notebook.rs"),
+        ),
+        (
+            "{src}/td-secret/src/portable_pass.rs",
+            include_str!("../../../td-secret/src/portable_pass.rs"),
         ),
         (
             "{src}/td-secret/src/portable_store.rs",
@@ -224,6 +234,7 @@ pub fn recipe() -> Recipe {
         Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
     );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
+    // The library holds every module; the binary only calls its `run`.
     steps.push(
         target_rustc(
             "{src}",
@@ -231,6 +242,10 @@ pub fn recipe() -> Recipe {
             &[
                 "--edition",
                 "2021",
+                "--crate-type",
+                "rlib",
+                "--crate-name",
+                "td_secret",
                 "-C",
                 "opt-level=s",
                 "--target",
@@ -241,6 +256,35 @@ pub fn recipe() -> Recipe {
                 "relocation-model=static",
                 "-C",
                 "panic=abort",
+                "-o",
+                "{root}/libtd_secret.rlib",
+                "{src}/td-secret/src/lib.rs",
+            ],
+        )
+        .env("PATH", &path)
+        .env("SOURCE_DATE_EPOCH", "1"),
+    );
+    steps.push(
+        target_rustc(
+            "{src}",
+            rustc,
+            &[
+                "--edition",
+                "2021",
+                "--crate-name",
+                "td_secret",
+                "-C",
+                "opt-level=s",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                "-C",
+                "panic=abort",
+                "--extern",
+                "td_secret={root}/libtd_secret.rlib",
                 &linker,
                 "-L",
                 glib,
@@ -286,7 +330,7 @@ pub fn recipe() -> Recipe {
                 "-Clink-arg=-static-libgcc",
                 "-o",
                 "{root}/secret-tests",
-                "{src}/td-secret/src/main.rs",
+                "{src}/td-secret/src/lib.rs",
             ],
         )
         .env("PATH", &path)
@@ -362,7 +406,7 @@ mod tests {
 
     #[test]
     fn recipe_embeds_every_declared_module() {
-        let production = MAIN_RS.split("#[cfg(test)]").next().unwrap();
+        let production = LIB_RS.split("#[cfg(test)]").next().unwrap();
         let code = production
             .lines()
             .map(|line| line.split("//").next().unwrap())

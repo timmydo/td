@@ -395,8 +395,8 @@ mod tests {
 
     #[test]
     fn descriptor_transport_is_shared_and_disposal_is_owned() {
-        let main = include_str!("main.rs");
-        assert!(main.contains("mod sys;"));
+        let root = include_str!("lib.rs");
+        assert!(root.contains("mod sys;"));
         let source = include_str!("client.rs")
             .split("#[cfg(test)]")
             .next()

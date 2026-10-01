@@ -148,6 +148,22 @@ pub(super) trait Tokens {
         presented: Presented<'_>,
         request: AssertRequest<'_>,
     ) -> Result<Asserted, TokenError>;
+
+    /// Whether the owner revoked the operation after its last token
+    /// exchange, as a lock does; checked once more before publication. A
+    /// revocation after that check cannot stop the publication begun.
+    fn revoked(&self) -> bool {
+        false
+    }
+}
+
+fn check_revoked(tokens: &(impl Tokens + ?Sized)) -> Result<(), Error> {
+    if tokens.revoked() {
+        return Err(Error::Token(TokenError::Failed(
+            transaction::Error::Interrupted(crate::fido_device::Interruption::Cancelled),
+        )));
+    }
+    Ok(())
 }
 
 /// The production adapter over the owned transaction runner.
@@ -310,6 +326,11 @@ fn key_info(hint: UnlockHint<'_>) -> KeyInfo {
     }
 }
 
+/// Whether a vault is committed in `directory`.
+pub(super) fn exists(directory: &Directory) -> Result<bool, Error> {
+    Ok(directory.snapshot()?.vault().is_some())
+}
+
 /// Lists the keys of the committed vault without authenticating it.
 pub(super) fn keys(directory: &Directory) -> Result<Vec<KeyInfo>, Error> {
     let snapshot = directory.snapshot()?;
@@ -452,6 +473,7 @@ pub(super) fn create(
         .last()
         .map(|protector| protector.credential.clone())
         .ok_or(Error::State("portable enrollment produced no key"))?;
+    check_revoked(&*tokens)?;
     publish(directory, snapshot, &proposed, false, random)?;
     Ok(Session {
         baseline: proposed,
@@ -604,6 +626,7 @@ pub(super) fn import(
     let opened = baseline
         .open(credential, &asserted.secret)
         .map_err(Error::Refused)?;
+    check_revoked(&*tokens)?;
     publish(directory, snapshot, &baseline, true, random)?;
     Ok(Session {
         baseline,
@@ -790,6 +813,7 @@ impl Session {
         if !opened.same_key(&self.opened) {
             return Err(Error::Refused("portable revision changed its key".into()));
         }
+        check_revoked(&*tokens)?;
         self.commit(directory, snapshot, proposed, opened, random)?;
         self.record(vec![(credential, counter)]);
         Ok(())
@@ -832,6 +856,7 @@ impl Session {
         if !opened.same_key(&self.opened) {
             return Err(Error::Refused("adding a key changed the vault key".into()));
         }
+        check_revoked(&*tokens)?;
         self.commit(directory, snapshot, proposed, opened, random)?;
         self.record(vec![(credential, authorizing_counter), (added_id, counter)]);
         Ok(())
@@ -919,6 +944,7 @@ impl Session {
                 "revoked portable key remains enrolled".into(),
             ));
         }
+        check_revoked(&*tokens)?;
         self.commit(directory, snapshot, proposed, opened, random)?;
         self.credential = credential;
         self.counters
@@ -1024,6 +1050,8 @@ pub(in crate::portable) mod tests {
         corrupt: Option<usize>,
         frozen: bool,
         presented: Vec<(Role, Option<Vec<u8>>)>,
+        // Set as a lock would, after the token exchange.
+        pub(in crate::portable) revoked: bool,
     }
 
     fn cose(seed: &[u8; 32]) -> VerificationKey {
@@ -1162,6 +1190,10 @@ pub(in crate::portable) mod tests {
                 secret: self.secret(index, &seed, request.salt),
                 counter: self.tick(token),
             })
+        }
+
+        fn revoked(&self) -> bool {
+            self.revoked
         }
     }
 
@@ -1304,6 +1336,73 @@ pub(in crate::portable) mod tests {
             assert_eq!(session.notebook().entries[0].title(), "Bank");
             assert_eq!(session.notebook().entries[0].body(), b"second");
         }
+    }
+
+    #[test]
+    fn a_revocation_after_the_last_token_exchange_publishes_nothing() {
+        let cancelled = || {
+            Error::Token(TokenError::Failed(transaction::Error::Interrupted(
+                crate::fido_device::Interruption::Cancelled,
+            )))
+        };
+        let place = Place::new();
+        let mut bench = Bench::new(3);
+        let mut random = Random(0);
+        let mut session = created(&place, &mut bench, &mut random);
+        let stored = place.bytes().unwrap();
+        bench.present(&[1]);
+        bench.revoked = true;
+        let refused = session.save(&place.1, &entry("Bank", b"late"), &mut bench, &mut random);
+        assert_eq!(refused, Err(cancelled()));
+        // The token was asked; only publication was stopped.
+        assert_eq!(bench.calls.last(), Some(&Call::Assert(Purpose::Save)));
+        bench.present(&[1, 2, 2]);
+        assert_eq!(
+            session.add_key(&place.1, &mut bench, &mut random),
+            Err(cancelled())
+        );
+        assert_eq!(bench.calls.last(), Some(&Call::Assert(Purpose::AddKey)));
+        let lost = id(&bench, 0);
+        bench.present(&[1, 2, 2]);
+        assert_eq!(
+            session
+                .replace_keys(&place.1, &[&lost], &mut bench, &mut random)
+                .err(),
+            Some(cancelled())
+        );
+        assert_eq!(bench.calls.last(), Some(&Call::Assert(Purpose::ReplaceKey)));
+        assert_eq!(place.bytes(), Some(stored));
+        // The session is unchanged and still saves once nothing revokes.
+        bench.revoked = false;
+        assert_eq!(session.revision(), 1);
+        bench.present(&[1]);
+        session
+            .save(&place.1, &entry("Bank", b"kept"), &mut bench, &mut random)
+            .unwrap();
+        assert_eq!(unlocked(&place, &mut bench, 0).revision(), 2);
+        let exported = session.ciphertext().unwrap().to_vec();
+        drop(session);
+
+        let fresh = Place::new();
+        let backup = id(&bench, 1);
+        bench.present(&[1]);
+        bench.revoked = true;
+        assert_eq!(
+            import(&fresh.1, &exported, &backup, &mut bench, &mut random).err(),
+            Some(cancelled())
+        );
+        assert_eq!(bench.calls.last(), Some(&Call::Assert(Purpose::Import)));
+        assert_eq!(fresh.bytes(), None);
+
+        let fresh = Place::new();
+        let mut bench = Bench::new(2);
+        bench.present(&[0, 0, 1, 1]);
+        bench.revoked = true;
+        assert_eq!(
+            create(&fresh.1, &mut bench, &mut random).err(),
+            Some(cancelled())
+        );
+        assert!(!exists(&fresh.1).unwrap());
     }
 
     #[test]

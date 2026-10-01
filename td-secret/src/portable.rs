@@ -6,6 +6,8 @@ pub(super) mod host;
 pub(super) mod lifecycle;
 #[path = "portable_notebook.rs"]
 pub(super) mod notebook;
+#[path = "portable_pass.rs"]
+pub mod pass;
 #[path = "portable_store.rs"]
 pub(super) mod storage;
 

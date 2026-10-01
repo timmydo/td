@@ -1090,6 +1090,78 @@ protection is tested where it is set, in an owned child. Real desktop
 discovery, denial, cancellation and hotplug remain hardware evidence on
 the supported host.
 
+### Implemented notebook library API
+
+td-secret is a library crate with a binary that only calls its `run`.
+Its one other public module is `pass` (`src/portable_pass.rs`), the
+notebook API td-pass links for standalone mode; nothing else in the
+crate is public, `pass` re-exports nothing, and a confinement test pins
+both.
+
+- **Host.** `Host::open` applies the host adapter's process protection
+  and admits the account's vault directory, refusing a host that cannot
+  keep PINs and keys out of dumps and swap. `keys` lists the enrolled
+  keys, or none when no vault exists. `create`, `unlock`, `import`,
+  `apply`, `add_key` and `replace_keys` are the lifecycle and notebook
+  operations above, over the production token adapter. Choosing
+  standalone mode is the caller's: on td the notebook uses the admitted
+  service, and no failed service request may lead to a `Host`.
+- **Keys.** A `Key` is an enrolled key's role and public credential
+  identity, with a `Fingerprint`: the first four bytes of the
+  credential's SHA-256, so a person can tell backups apart. It holds no
+  secret. `keys_of` reads the keys of an exported copy without
+  authenticating it, so a person can choose the key to import with. A
+  caller reads a copy to at most `MAX_COPY` bytes plus one and refuses
+  one that reaches the extra byte.
+- **Vault.** An unlocked `Vault` lends entry summaries and entries (the
+  title and the stored body bytes), names its revision, its keys and the
+  key authorizing its saves, switches that key with `use_key`, and
+  exports its authenticated ciphertext. Dropping it is the lock.
+- **Changes.** `Change` carries owned text and clears it on drop,
+  whether it is applied, refused or never sent; applying moves the text
+  into the entry API's clearing owners.
+- **Prompt.** The caller supplies the host authentication adapter's
+  `Prompt`. Before each token is opened, `present` names the operation
+  label, the role and, for an enrolled key, its fingerprint; it returns
+  once the person has connected that one key. Creation therefore asks
+  for the primary and then the separate backup. `pin` returns the PIN
+  for the presented key, as the transaction's PIN owner zeroes it; its
+  `PinUse` is `Authorize` for every enrolled-key assertion, which
+  `Request::operation` names. An error from either is the person
+  declining, and the operation ends as cancelled; a PIN outside the
+  profile is refused as such. Neither is retried.
+- **Cancel.** A `Cancel` ends an operation from another thread, as a
+  lock, suspend or authority loss does: the token session in flight,
+  including its startup, which reports cancellation, not a missing key;
+  a presentation not yet asked for; and a publication not yet begun. The
+  lifecycle checks the token adapter's revocation once more after the
+  last token exchange, before every publication, so a save, key change,
+  creation or import cancelled then publishes nothing. A revocation
+  after that check cannot stop the publication already begun, which then
+  reports its result; a creation or import that returns its `Vault` so
+  is the caller's to drop when it has locked. An unlock cancelled before
+  it returns drops the session. A presentation or startup the cancel
+  interrupts reports cancellation, whatever startup then failed with. A
+  `Cancel` stays cancelled, so each cancellable operation takes a fresh
+  one.
+- **Failures.** A `Failure` names the stale-entry, uncertain-publication
+  and cancelled cases and displays a reason. Neither its text nor its
+  `Debug` carries a PIN, entry content or a token's protocol detail.
+- **Worker.** A presentation re-executes the running binary as the
+  desktop token worker. `worker` answers exactly that argument vector,
+  after the program name as `run` takes it, so a linking program calls
+  it first and exits with its result.
+
+Tests cover every failure's text and `Debug`, including that a protocol
+detail is not shown, and each failure predicate. They also cover the
+fingerprint, a presentation's request, the refusal of an undecodable
+copy, the worker's argument vector, the change conversion and the
+library's public surface. The lifecycle's tests add a revocation after
+the last token exchange: the token is asked, and neither a save nor a
+creation publishes. The operations themselves are the lifecycle's,
+tested above with synthetic tokens. Their production adapter path, from
+`present` to a real token, remains hardware evidence.
+
 ## Independently landable increments
 
 1. This contract, td-pass notebook/host scope, bounded authenticated portable

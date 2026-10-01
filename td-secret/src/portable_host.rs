@@ -3,7 +3,8 @@
 //! the host kernel, compositor and account.
 
 use super::lifecycle::{Directory, Error, Presented, TokenError};
-use crate::fido_device::{self, Cancellation, Device, Session, MAX_LIFETIME};
+use crate::fido_device::{self, Cancellation, Device, Interruption, Session, MAX_LIFETIME};
+use crate::fido_transaction::Error as Transaction;
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -265,9 +266,12 @@ pub(super) fn open(
     let deadline = Instant::now()
         .checked_add(MAX_LIFETIME)
         .ok_or(TokenError::Unavailable)?;
-    // The worker's open is the kernel's answer to the host's device policy.
+    // The worker's open is the kernel's answer to the host's device policy;
+    // a cancellation during startup stays a cancellation.
     Session::open_cancellable(device, deadline, cancellation.clone()).map_err(|error| {
-        if fido_device::denied(&error) {
+        if cancellation.cancelled() {
+            TokenError::Failed(Transaction::Interrupted(Interruption::Cancelled))
+        } else if fido_device::denied(&error) {
             TokenError::Denied
         } else {
             TokenError::Unavailable
@@ -427,16 +431,14 @@ mod tests {
         within(&root, &path, owner).unwrap();
         let upper = root.join("upper");
         fs::set_permissions(&upper, fs::Permissions::from_mode(0o777)).unwrap();
-        assert_eq!(
-            within(&root, &path, owner).err(),
-            Some(Error::State(
-                "every directory and link above the vault must be controlled by this account or root",
-            ))
-        );
+        assert_eq!(within(&root, &path, owner).err(), Some(UNCONTROLLED));
         // Reached through a link, the resolved path is what is checked.
         let link = root.join("link");
         std::os::unix::fs::symlink(root.join("upper/lower"), &link).unwrap();
-        assert!(within(&root, &link.join("td-pass"), owner).is_err());
+        assert_eq!(
+            within(&root, &link.join("td-pass"), owner).err(),
+            Some(UNCONTROLLED)
+        );
         fs::set_permissions(&upper, fs::Permissions::from_mode(0o1777)).unwrap();
         within(&root, &link.join("td-pass"), owner).unwrap();
         fs::remove_dir_all(root).unwrap();

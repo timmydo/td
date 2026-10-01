@@ -65,9 +65,10 @@ plaintext file-save adapter, arbitrary Open/Save As path, spelling worker,
 external editor, editor control socket, plugin or shell command reaches
 vault contents.
 
-The notebook speaks only td-secret's entry and lifecycle API. On td it uses
-the admitted service and holds no vault key. Standalone mode runs the same
-backend implementation privately, with its host authentication adapter.
+The notebook speaks only td-secret's entry and lifecycle API. On td it
+uses the admitted service and holds no vault key. Standalone mode runs
+the same backend implementation privately, through the td-secret
+library's `pass` module, with its host authentication adapter.
 No failed td service request can select standalone mode. Production builds
 do not contain a synthetic-token, file-key or test-authorization fallback.
 
