@@ -353,6 +353,10 @@ const RENDITIONS: &[(&str, &[u8])] = &[
     ("faint", b"\x1b[2m"),
     ("italic", b"\x1b[3m"),
     ("underline", b"\x1b[4m"),
+    ("double-underline", b"\x1b[4:2m"),
+    ("curly-underline", b"\x1b[4:3m"),
+    ("dotted-underline", b"\x1b[4:4m"),
+    ("dashed-underline", b"\x1b[4:5m"),
     ("inverse", b"\x1b[7m"),
     ("strike", b"\x1b[9m"),
 ];
@@ -397,22 +401,40 @@ fn the_rendition_matrix_covers_exactly_the_models_attribute_flags() {
         strike,
         foreground: _,
         background: _,
+        underline_color: _,
     } = attributes();
     let flags = [
         ("bold", bold),
         ("faint", faint),
         ("italic", italic),
-        ("underline", underline),
         ("inverse", inverse),
         ("strike", strike),
     ];
+    // Each underline style is a rendition: the match is exhaustive, so a
+    // new style is a compile error until it is named.
+    let style = |underline: Underline| match underline {
+        Underline::None => None,
+        Underline::Single => Some("underline"),
+        Underline::Double => Some("double-underline"),
+        Underline::Curly => Some("curly-underline"),
+        Underline::Dotted => Some("dotted-underline"),
+        Underline::Dashed => Some("dashed-underline"),
+    };
+    let styles = [
+        Underline::Single,
+        Underline::Double,
+        Underline::Curly,
+        Underline::Dotted,
+        Underline::Dashed,
+    ];
     let mut named: Vec<&str> = RENDITIONS.iter().map(|(name, _)| *name).collect();
     let mut declared: Vec<&str> = flags.iter().map(|(name, _)| *name).collect();
+    declared.extend(styles.into_iter().filter_map(style));
     named.sort_unstable();
     declared.sort_unstable();
     assert_eq!(named, declared);
     assert!(
-        flags.iter().all(|(_, set)| !*set),
+        flags.iter().all(|(_, set)| !*set) && style(underline).is_none(),
         "BLANK claims a rendition"
     );
 }
@@ -515,6 +537,121 @@ fn underline_and_strike_rule_fixed_full_width_cell_rows() {
             }
         }
     }
+}
+
+/// The rows each underline style lights, across two cells so the
+/// patterns that run on the surface's x are seen to meet.
+#[test]
+fn each_underline_style_draws_its_own_pattern() {
+    let (width, height) = (face().width(), face().height());
+    assert!(height < 32, "a unit of one pixel");
+    let ink = palette().foreground();
+    let lit = |select: &[u8]| {
+        let mut input = select.to_vec();
+        input.extend_from_slice(b"  ");
+        let terminal = terminal(1, 2, &input);
+        let snapshot = Snapshot::new(&terminal, false, false).with_cursor(Cursor {
+            row: 0,
+            column: 0,
+            visible: false,
+        });
+        let (pixels, surface, _) = draw_grid(&snapshot);
+        set_pixels(&pixels, surface, ink)
+    };
+    let all = |rule: &dyn Fn(usize) -> Vec<usize>| {
+        let mut expected: Vec<(usize, usize)> = (0..width * 2)
+            .flat_map(|x| rule(x).into_iter().map(move |y| (x, y)))
+            .collect();
+        expected.sort_unstable_by_key(|&(x, y)| (y, x));
+        expected
+    };
+    let base = height - 2;
+    assert_eq!(lit(b"\x1b[4:1m"), all(&|_| vec![base]));
+    assert_eq!(lit(b"\x1b[4:2m"), all(&|_| vec![base - 2, base]));
+    let wave = |x: usize| {
+        let phase = x % 4;
+        let rise = if phase <= 2 { phase } else { 4 - phase };
+        vec![height - 1 - rise]
+    };
+    assert_eq!(lit(b"\x1b[4:3m"), all(&wave));
+    let dots = |x: usize| {
+        if x.is_multiple_of(2) {
+            vec![base]
+        } else {
+            vec![]
+        }
+    };
+    assert_eq!(lit(b"\x1b[4:4m"), all(&dots));
+    let dashes = |x: usize| {
+        if x % width < width - width / 4 {
+            vec![base]
+        } else {
+            vec![]
+        }
+    };
+    assert_eq!(lit(b"\x1b[4:5m"), all(&dashes));
+    assert!(lit(b"\x1b[4:0m").is_empty());
+}
+
+/// The wave's rise and period and the dots' length are units of the
+/// cell's height, so a tall cell's are wider; a narrow cell's dash still
+/// has its gap.
+#[test]
+fn the_underline_patterns_scale_with_the_cell() {
+    let (width, height) = (24, 48);
+    let unit = 3;
+    let styled = |underline| Attributes {
+        underline,
+        ..Attributes::default()
+    };
+    let curly = styled(Underline::Curly);
+    let dotted = styled(Underline::Dotted);
+    for x in 0..width * 2 {
+        let phase = x % (4 * unit);
+        let rise = if phase <= 2 * unit {
+            phase
+        } else {
+            4 * unit - phase
+        };
+        let rows: Vec<usize> = (0..height)
+            .filter(|&row| rule(&curly, (width, height), x, x % width, row).is_some())
+            .collect();
+        assert_eq!(rows, vec![height - 1 - rise], "curly at {x}");
+        assert_eq!(
+            rule(&dotted, (width, height), x, x % width, height - 2).is_some(),
+            (x / unit) % 2 == 0,
+            "dotted at {x}"
+        );
+    }
+    let dashed = styled(Underline::Dashed);
+    let lit: Vec<bool> = (0..3)
+        .map(|column| rule(&dashed, (3, height), column, column, height - 2).is_some())
+        .collect();
+    assert_eq!(lit, [true, true, false]);
+}
+
+/// An underline color draws the underline alone; without one it is the
+/// ink, after inverse.
+#[test]
+fn an_underline_color_draws_the_underline() {
+    let (width, height) = (face().width(), face().height());
+    let base = height - 2;
+    for (select, expected) in [
+        (b"\x1b[4;58;2;1;2;3m".as_slice(), [1, 2, 3]),
+        (b"\x1b[4;58:5:1m", palette().entry(1)),
+        (b"\x1b[4;7;58;2;1;2;3m", [1, 2, 3]),
+        (b"\x1b[4;31m", palette().entry(1)),
+        (b"\x1b[4;31;58:5:2;59m", palette().entry(1)),
+        (b"\x1b[4;7;44m", palette().entry(4)),
+    ] {
+        let cell = cell_of(select, ' ');
+        for x in 0..width {
+            assert_eq!(rgb_at(&cell, width, x, base), expected, "{select:?} ({x})");
+        }
+    }
+    // The strike keeps the foreground.
+    let cell = cell_of(b"\x1b[9;58;2;1;2;3m", ' ');
+    assert_eq!(rgb_at(&cell, width, 0, height / 2), palette().foreground());
 }
 
 #[test]
@@ -1768,6 +1905,29 @@ fn an_outline_face_draws_each_rendition_from_its_own_style() {
             .count();
         assert_eq!(ground, face().width() * face().height() - expected.len());
     }
+}
+
+/// Through an outline face too, a curly underline in a color of its own
+/// is the wave on the surface's x, clear of the glyph rows above it.
+#[test]
+fn an_outline_face_draws_a_curly_underline_in_its_color() {
+    let terminal = terminal(1, 3, b"\x1b[4:3;58;2;1;2;3m00");
+    let (pixels, width) =
+        draw_outline(&Snapshot::new(&terminal, false, false), &mut outline_face());
+    let mut wave: Vec<(usize, usize)> = set_pixels(&pixels, width, [1, 2, 3])
+        .into_iter()
+        .filter(|&(x, _)| x < face().width() * 2)
+        .collect();
+    wave.sort_unstable();
+    let height = face().height();
+    let expected: Vec<(usize, usize)> = (0..face().width() * 2)
+        .map(|x| {
+            let phase = x % 4;
+            let rise = if phase <= 2 { phase } else { 4 - phase };
+            (x, height - 1 - rise)
+        })
+        .collect();
+    assert_eq!(wave, expected);
 }
 
 #[test]

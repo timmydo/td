@@ -691,11 +691,25 @@ fn parse_attributes(file: &str, line: usize, input: &str) -> Result<Attributes, 
         if !seen.insert(name) {
             return Err(at(file, line, &format!("duplicate attribute {name:?}")));
         }
+        let underline = match name {
+            "underline" => Some(Underline::Single),
+            "double-underline" => Some(Underline::Double),
+            "curly-underline" => Some(Underline::Curly),
+            "dotted-underline" => Some(Underline::Dotted),
+            "dashed-underline" => Some(Underline::Dashed),
+            _ => None,
+        };
+        if let Some(underline) = underline {
+            if attributes.underline != Underline::None {
+                return Err(at(file, line, "a cell has one underline style"));
+            }
+            attributes.underline = underline;
+            continue;
+        }
         match name {
             "bold" => attributes.bold = true,
             "faint" => attributes.faint = true,
             "italic" => attributes.italic = true,
-            "underline" => attributes.underline = true,
             "inverse" => attributes.inverse = true,
             "strike" => attributes.strike = true,
             _ => return Err(at(file, line, &format!("unknown attribute {name:?}"))),
@@ -722,6 +736,7 @@ fn parse_cell(file: &str, line: usize, input: &str) -> Result<Expectation, Strin
     }
     let mut foreground = None;
     let mut background = None;
+    let mut underline = None;
     let mut attributes = None;
     for option in trailing.split_whitespace() {
         if let Some(value) = option.strip_prefix("fg=") {
@@ -738,6 +753,10 @@ fn parse_cell(file: &str, line: usize, input: &str) -> Result<Expectation, Strin
             {
                 return Err(at(file, line, "cell repeats bg"));
             }
+        } else if let Some(value) = option.strip_prefix("ul=") {
+            if underline.replace(parse_color(file, line, value)?).is_some() {
+                return Err(at(file, line, "cell repeats ul"));
+            }
         } else if let Some(value) = option.strip_prefix("attrs=") {
             if attributes
                 .replace(parse_attributes(file, line, value)?)
@@ -752,6 +771,8 @@ fn parse_cell(file: &str, line: usize, input: &str) -> Result<Expectation, Strin
     let mut attributes = attributes.ok_or_else(|| at(file, line, "cell requires attrs="))?;
     attributes.foreground = foreground.ok_or_else(|| at(file, line, "cell requires fg="))?;
     attributes.background = background.ok_or_else(|| at(file, line, "cell requires bg="))?;
+    // Optional: most cases have no underline color to state.
+    attributes.underline_color = underline.unwrap_or(Color::Default);
     Ok(Expectation::Cell {
         row,
         column,

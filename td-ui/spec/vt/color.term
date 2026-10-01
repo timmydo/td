@@ -36,15 +36,79 @@ expect cell 0 0 " " fg=indexed:1 bg=indexed:4 attrs=none
 expect cell 0 1 " " fg=indexed:1 bg=indexed:4 attrs=none
 end
 
+# The underline color takes its operands and no other attribute's.
 case color/ignored-color-forms-do-not-leak-operands
 source td
 tags core color bounds
 size 1 4
-write b"\e[58;2;1;4;7mA\e[58;5;9mB\e[38;9mC\e[38:2::1:2:3mD"
-expect cell 0 0 "A" fg=default bg=default attrs=none
-expect cell 0 1 "B" fg=default bg=default attrs=none
+write b"\e[58;2;1;4;7mA\e[58;5;9mB\e[59;38;9mC\e[48;5mD"
+expect cell 0 0 "A" fg=default bg=default ul=rgb:010407 attrs=none
+expect cell 0 1 "B" fg=default bg=default ul=indexed:9 attrs=none
 expect cell 0 2 "C" fg=default bg=default attrs=none
 expect cell 0 3 "D" fg=default bg=default attrs=none
+end
+
+# Colon subparameters: direct colors with or without the color space id
+# (empty components are 0), indexed colors, the underline color, and an
+# underline's style among semicolon parameters.
+case color/colon-subparameters
+source td
+tags core color
+size 1 8
+write b"\e[38:2::1:2:3mA\e[38:2:4:5:6mB\e[48:5:9mC\e[58:2::7::9mD"
+expect cell 0 0 "A" fg=rgb:010203 bg=default attrs=none
+expect cell 0 1 "B" fg=rgb:040506 bg=default attrs=none
+expect cell 0 2 "C" fg=rgb:040506 bg=indexed:9 attrs=none
+expect cell 0 3 "D" fg=rgb:040506 bg=indexed:9 ul=rgb:070009 attrs=none
+write b"\e[0;1;4:3;31mE\e[59;4:0mF"
+expect cell 0 4 "E" fg=indexed:1 bg=default attrs=bold,curly-underline
+expect cell 0 5 "F" fg=indexed:1 bg=default attrs=bold
+end
+
+# Each style `4:n` names, `4` alone a single one; a style it does not
+# name changes nothing, and `24` ends any.
+case color/underline-styles
+source td
+tags core color
+size 1 8
+write b"\e[4:1mA\e[4:2mB\e[4:3mC\e[4:4mD\e[4:5mE\e[4:9mF\e[24mG\e[4mH"
+expect cell 0 0 "A" fg=default bg=default attrs=underline
+expect cell 0 1 "B" fg=default bg=default attrs=double-underline
+expect cell 0 2 "C" fg=default bg=default attrs=curly-underline
+expect cell 0 3 "D" fg=default bg=default attrs=dotted-underline
+expect cell 0 4 "E" fg=default bg=default attrs=dashed-underline
+expect cell 0 5 "F" fg=default bg=default attrs=dashed-underline
+expect cell 0 6 "G" fg=default bg=default attrs=none
+expect cell 0 7 "H" fg=default bg=default attrs=underline
+end
+
+# A form the profile does not know changes nothing and takes nothing
+# from the parameters after it: a parameter with subparameters it does
+# not take, a color with too few components or an out of range one, an
+# underline style with more than one or an empty one, a semicolon form
+# whose operands carry subparameters. A colon outside SGR drops its
+# sequence whole, as do parameters past the bound. A direct color's
+# fields after blue are ignored.
+case color/subparameter-forms-it-does-not-know
+source td
+tags core color bounds
+size 2 8
+write b"\e[1:2mA\e[38:2:1:2;3mB\e[38:2::1:2:3:4mC\e[38:5:256;4mD"
+expect cell 0 0 "A" fg=default bg=default attrs=none
+expect cell 0 1 "B" fg=default bg=default attrs=italic
+expect cell 0 2 "C" fg=rgb:010203 bg=default attrs=italic
+expect cell 0 3 "D" fg=rgb:010203 bg=default attrs=italic,underline
+write b"\e[0m\e[2:1HE"
+expect cell 0 4 "E" fg=default bg=default attrs=none
+write b"\e[1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1;4mF"
+expect cell 0 5 "F" fg=default bg=default attrs=none
+write b"\e[4m\e[4:3:1mG\e[4:mH"
+expect cell 0 6 "G" fg=default bg=default attrs=underline
+expect cell 0 7 "H" fg=default bg=default attrs=underline
+write b"\e[0m\r\n\e[38;5;4:3mI\e[38;2:1:2:3mJ\e[48;5;1;2:5mK"
+expect cell 1 0 "I" fg=default bg=default attrs=none
+expect cell 1 1 "J" fg=default bg=default attrs=none
+expect cell 1 2 "K" fg=default bg=indexed:1 attrs=none
 end
 
 # The rendition attributes and their individual resets. Bold and italic and

@@ -23,16 +23,44 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+/// An underline's style, `SGR 4:n`'s `n`: `4` alone is `Single`, `24`
+/// and `4:0` are `None`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Underline {
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+impl Underline {
+    fn from_style(style: u16) -> Option<Self> {
+        match style {
+            0 => Some(Self::None),
+            1 => Some(Self::Single),
+            2 => Some(Self::Double),
+            3 => Some(Self::Curly),
+            4 => Some(Self::Dotted),
+            5 => Some(Self::Dashed),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Attributes {
     pub bold: bool,
     pub faint: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub underline: Underline,
     pub inverse: bool,
     pub strike: bool,
     pub foreground: Color,
     pub background: Color,
+    /// `SGR 58`'s; `Default` draws the underline in the foreground.
+    pub underline_color: Color,
 }
 
 impl Default for Attributes {
@@ -41,11 +69,12 @@ impl Default for Attributes {
             bold: false,
             faint: false,
             italic: false,
-            underline: false,
+            underline: Underline::None,
             inverse: false,
             strike: false,
             foreground: Color::Default,
             background: Color::Default,
+            underline_color: Color::Default,
         }
     }
 }
@@ -860,6 +889,9 @@ enum StringKind {
 struct Csi {
     params: [u16; MAX_CSI_PARAMS],
     present: [bool; MAX_CSI_PARAMS],
+    /// Whether a colon began each parameter, making it a subparameter of
+    /// the one before.
+    sub: [bool; MAX_CSI_PARAMS],
     count: usize,
     private: bool,
     intermediate: bool,
@@ -871,6 +903,7 @@ impl Csi {
         Self {
             params: [0; MAX_CSI_PARAMS],
             present: [false; MAX_CSI_PARAMS],
+            sub: [false; MAX_CSI_PARAMS],
             count: 1,
             private: false,
             intermediate: false,
@@ -904,6 +937,21 @@ impl Csi {
         } else {
             self.count += 1;
         }
+    }
+
+    fn colon(&mut self) {
+        if let Some(sub) = self.sub.get_mut(self.count) {
+            *sub = true;
+        }
+        self.separator();
+    }
+
+    fn sub(&self, index: usize) -> bool {
+        self.sub.get(index).copied().unwrap_or(false)
+    }
+
+    fn subparameters(&self) -> bool {
+        self.sub.iter().take(self.count).any(|sub| *sub)
     }
 
     fn value(&self, index: usize, default: u16) -> u16 {
@@ -1836,6 +1884,10 @@ impl Terminal {
                 csi.separator();
                 self.parser = ParserState::Csi(csi);
             }
+            b':' if !csi.intermediate => {
+                csi.colon();
+                self.parser = ParserState::Csi(csi);
+            }
             b'?' if csi.count == 1
                 && !csi.present.first().copied().unwrap_or(false)
                 && !csi.private =>
@@ -1856,9 +1908,12 @@ impl Terminal {
                 self.parser = ParserState::Csi(csi);
             }
             0x40..=0x7e => {
+                // Subparameters are SGR's alone; elsewhere a colon is a
+                // sequence this profile does not know.
                 if !csi.overflow
                     && !csi.intermediate
                     && (!csi.private || matches!(byte, b'h' | b'l'))
+                    && (!csi.subparameters() || (byte == b'm' && !csi.private))
                 {
                     self.dispatch_csi(&csi, byte);
                 }
@@ -2068,13 +2123,30 @@ impl Terminal {
     fn apply_sgr(&mut self, csi: &Csi) {
         let mut index = 0;
         while index < csi.count {
+            // A subparameter no parameter took, after a form that changed
+            // nothing, is no parameter of its own.
+            if csi.sub(index) {
+                index = index.saturating_add(1);
+                continue;
+            }
             let code = csi.value(index, 0);
+            // A parameter's subparameters run to the next semicolon.
+            let first = index.saturating_add(1);
+            let mut end = first;
+            while end < csi.count && csi.sub(end) {
+                end = end.saturating_add(1);
+            }
+            if end > first {
+                self.apply_sgr_subparameters(csi, code, first, end);
+                index = end;
+                continue;
+            }
             match code {
                 0 => self.attributes = Attributes::default(),
                 1 => self.attributes.bold = true,
                 2 => self.attributes.faint = true,
                 3 => self.attributes.italic = true,
-                4 => self.attributes.underline = true,
+                4 => self.attributes.underline = Underline::Single,
                 7 => self.attributes.inverse = true,
                 9 => self.attributes.strike = true,
                 22 => {
@@ -2082,7 +2154,7 @@ impl Terminal {
                     self.attributes.faint = false;
                 }
                 23 => self.attributes.italic = false,
-                24 => self.attributes.underline = false,
+                24 => self.attributes.underline = Underline::None,
                 27 => self.attributes.inverse = false,
                 29 => self.attributes.strike = false,
                 30..=37 => self.attributes.foreground = Color::Indexed((code - 30) as u8),
@@ -2092,35 +2164,31 @@ impl Terminal {
                 90..=97 => self.attributes.foreground = Color::Indexed((code - 90 + 8) as u8),
                 100..=107 => self.attributes.background = Color::Indexed((code - 100 + 8) as u8),
                 38 | 48 | 58 => {
-                    let foreground = code == 38;
                     let selector = csi.value(index.saturating_add(1), u16::MAX);
                     let remaining = csi.count.saturating_sub(index.saturating_add(1));
+                    // Operands, or the parameter after them, with
+                    // subparameters mix the forms: a form it does not know.
+                    let mixed = |operands: usize| {
+                        (index.saturating_add(1)..=index.saturating_add(operands).saturating_add(1))
+                            .any(|at| csi.sub(at))
+                    };
                     if selector == 5 {
                         let operands = remaining.min(2);
-                        if code != 58 && operands == 2 {
+                        if operands == 2 && !mixed(operands) {
                             let value = csi.value(index.saturating_add(2), u16::MAX);
                             if let Ok(value) = u8::try_from(value) {
-                                if foreground {
-                                    self.attributes.foreground = Color::Indexed(value);
-                                } else {
-                                    self.attributes.background = Color::Indexed(value);
-                                }
+                                self.set_color(code, Color::Indexed(value));
                             }
                         }
                         index = index.saturating_add(operands);
                     } else if selector == 2 {
                         let operands = remaining.min(4);
-                        if code != 58 && operands == 4 {
+                        if operands == 4 && !mixed(operands) {
                             let red = u8::try_from(csi.value(index.saturating_add(2), u16::MAX));
                             let green = u8::try_from(csi.value(index.saturating_add(3), u16::MAX));
                             let blue = u8::try_from(csi.value(index.saturating_add(4), u16::MAX));
                             if let (Ok(red), Ok(green), Ok(blue)) = (red, green, blue) {
-                                let color = Color::Rgb(red, green, blue);
-                                if foreground {
-                                    self.attributes.foreground = color;
-                                } else {
-                                    self.attributes.background = color;
-                                }
+                                self.set_color(code, Color::Rgb(red, green, blue));
                             }
                         }
                         index = index.saturating_add(operands);
@@ -2128,10 +2196,58 @@ impl Terminal {
                         index = index.saturating_add(remaining);
                     }
                 }
-                59 => {}
+                59 => self.attributes.underline_color = Color::Default,
                 _ => {}
             }
             index += 1;
+        }
+    }
+
+    /// One SGR parameter with the subparameters `first..end` after it:
+    /// an underline's style (`4:n`), or a color, indexed (`38:5:n`) or
+    /// direct (`38:2:r:g:b`, or `38:2:id:r:g:b` with a color space id,
+    /// which is ignored, as foot ignores it and any fields after blue),
+    /// an empty component being 0.
+    /// Any other parameter with subparameters, or a form that is none of
+    /// these, changes nothing.
+    fn apply_sgr_subparameters(&mut self, csi: &Csi, code: u16, first: usize, end: usize) {
+        let count = end.saturating_sub(first);
+        let at = |offset: usize, default: u16| csi.value(first.saturating_add(offset), default);
+        match code {
+            4 if count == 1 => {
+                if let Some(style) = Underline::from_style(at(0, u16::MAX)) {
+                    self.attributes.underline = style;
+                }
+            }
+            38 | 48 | 58 => {
+                let rgb = |offset: usize| {
+                    let red = u8::try_from(at(offset, 0)).ok()?;
+                    let green = u8::try_from(at(offset.saturating_add(1), 0)).ok()?;
+                    let blue = u8::try_from(at(offset.saturating_add(2), 0)).ok()?;
+                    Some(Color::Rgb(red, green, blue))
+                };
+                let color = match (at(0, u16::MAX), count) {
+                    (5, 2) => u8::try_from(at(1, u16::MAX)).ok().map(Color::Indexed),
+                    (2, 4) => rgb(1),
+                    // T.416's fields after blue, as foot, are ignored.
+                    (2, count) if count >= 5 => rgb(2),
+                    _ => None,
+                };
+                if let Some(color) = color {
+                    self.set_color(code, color);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `38`, `48` or `58`'s color: the foreground, background or underline.
+    fn set_color(&mut self, code: u16, color: Color) {
+        match code {
+            38 => self.attributes.foreground = color,
+            48 => self.attributes.background = color,
+            58 => self.attributes.underline_color = color,
+            _ => {}
         }
     }
 

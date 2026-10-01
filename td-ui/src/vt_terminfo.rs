@@ -1415,7 +1415,9 @@ mod effects {
             setup: b"",
             concrete: b"\x1b[4mX",
             then: b"",
-            expect: |t| attributes(t).underline && !attributes(t).strike,
+            expect: |t| {
+                attributes(t).underline == crate::vt::Underline::Single && !attributes(t).strike
+            },
         },
         Effect {
             capability: "rmul",
@@ -1423,7 +1425,7 @@ mod effects {
             setup: b"\x1b[4m",
             concrete: b"\x1b[24mX",
             then: b"",
-            expect: |t| !attributes(t).underline,
+            expect: |t| attributes(t).underline == crate::vt::Underline::None,
         },
         Effect {
             capability: "rev",

@@ -606,8 +606,9 @@ of its own files may name each module.
   than a `Place` as a `Found`, `still_matches`, whether a found match's
   cells and wraps still spell its query, and `mouse`, the pointer
   reporting the child asked for), `Toward`, `Place`, `Found`,
-  `MAX_QUERY`, `MouseMode` with `MouseTracking`, `Cell`, `Attributes`,
-  `Color`, `MAX_DIMENSION`, and `selftest`. Pure; its specification,
+  `MAX_QUERY`, `MouseMode` with `MouseTracking`, `Cell`, `Attributes`
+  with its `Underline` style and underline color, `Color`,
+  `MAX_DIMENSION`, and `selftest`. Pure; its specification,
   `vt_spec.rs`, runs the native corpus under `spec/vt`.
 - `vt_render`: `Palette` (`pinned`, foot's with its own default ink),
   `Snapshot` (`new` with focus and bell, `with_cursor`, `scrolled_back`,

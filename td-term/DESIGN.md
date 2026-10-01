@@ -82,8 +82,10 @@ for td's shell and userland. It implements:
   operations, plus G0/G1 ASCII and DEC special-graphics designation;
 - cursor movement and position, erase in display and line, insert/delete/erase
   characters, insert/delete lines, scroll, margins, tab clearing, and repeat;
-- SGR reset, bold, faint, italic, underline, inverse, strike, default colors,
-  the 16-color palette, indexed 256 colors, and 24-bit colors;
+- SGR reset, bold, faint, italic, underline in five styles (single, double,
+  curly, dotted and dashed, `4:n`), inverse, strike, default colors, the
+  16-color palette, indexed 256 colors, 24-bit colors, and the underline
+  color (`58`, reset by `59`), each color in semicolon or colon form;
 - normal and application cursor keys, primary device attributes, cursor
   position reports, and the replies required by the claimed profile;
 - DEC cursor preservation for mode 1048 and alternate-screen mode 1049;
@@ -101,8 +103,19 @@ an accidental difference hidden by the test overlay.
 
 Ordinary C0 controls and DEL execute or are ignored without cancelling a
 partially received UTF-8 scalar; ESC, CAN, SUB, and malformed non-continuation
-bytes retain their parser recovery behavior. Color parameters use the
-semicolon forms in the native corpus; colon subparameter forms are deferred.
+bytes retain their parser recovery behavior. SGR parameters take colon
+subparameters as well as semicolons: `4:n` an underline style, `38`, `48`
+and `58` a color as `5:n` or `2:r:g:b`, or `2:id:r:g:b` with a color space
+id that is ignored, as foot ignores it and any fields after blue, an empty
+component being 0. A parameter with subparameters it does not take, or a
+form it does not know, changes nothing and takes nothing from the
+parameters after it; so does a semicolon color whose operands carry
+subparameters. Where foot guesses, td-term keeps to that rule: an unknown
+or empty `4:n` leaves the underline as it was (foot turns it off), as
+does more than one style, an out-of-range `5:n` changes nothing (foot
+clamps it to 255), and subparameters void any other parameter (foot
+applies it). A colon in any other control sequence drops the sequence
+whole.
 
 The initial cursor is steady rather than clock-blinking. Shift+PageUp and
 Shift+PageDown navigate scrollback. Ordinary text input returns to the live
@@ -254,12 +267,15 @@ runs that readback.
 What the entry omits is as deliberate as what it claims. `cols`/`lines` are
 absent because td-term sets and verifies the PTY winsize before the child
 starts, so the pre-winsize fallback they exist to serve is unreachable by
-construction. `smir`/`rmir` are absent because this profile implements no
-ANSI insert mode, and `blink`/`invis` because it has no SGR for either -- an
-entry that claimed them would be describing a terminal td-term is not. `bel`
-is absent for a different reason: BEL sets the model's coalesced visual-bell
-bit, which no corpus observation can see until a frame presents it (§3), and
-a capability whose case would be a fiction is worse than a missing one.
+construction. `smir`/`rmir` are absent because this profile implements no ANSI
+insert mode, `Smulx` and `Setulc`, which advertise the underline styles and
+color, because they are extended capabilities and td's compiler writes no
+extended section (a child that sends the forms anyway has them drawn), and
+`blink`/`invis` because it has no SGR for either -- an entry that claimed them
+would be describing a terminal td-term is not. `bel` is absent for a different
+reason: BEL sets the model's coalesced visual-bell bit, which no corpus
+observation can see until a frame presents it (§3), and a capability whose
+case would be a fiction is worse than a missing one.
 
 An outer `TERM=foot`, `TERM=linux`, or other value describes the parent
 terminal and is never an oracle or a capability claim for td-term. An
@@ -344,9 +360,17 @@ select those styles, and faint, inverse, underline and strike are as
 here. Bold adds a clipped one-pixel rightward copy of set glyph bits,
 faint blends foreground halfway toward background with integer channel
 arithmetic, and italic applies a bounded row-dependent one-pixel shear.
-Underline and strike draw fixed clipped cell rows, and inverse exchanges
-foreground and background. Blocking PPM cases prove that each claimed
-attribute differs from an otherwise identical normal cell.
+Strike and a single underline draw fixed clipped cell rows, and inverse
+exchanges foreground and background. A double underline adds a second
+rule two rows above the first; a curly one is a triangle wave from the
+cell's last row up two units and back, a unit being a sixteenth of the
+cell's height and at least a pixel; a dotted one alternates unit-long
+dots and gaps; a dashed one leaves the cell's last quarter bare. The
+wave and the dots run on the surface's x, so they meet across cells. An
+underline color draws the underline alone, as it is; without one the
+underline takes the drawn foreground, the strike always does. Blocking
+PPM cases prove that each claimed attribute differs from an otherwise
+identical normal cell.
 
 The fixed palette is what foot, which td-term replaces, draws: foot's
 own sixteen base entries since 1.15, the starlight table (`242424`, `f62b5a`,
@@ -1257,8 +1281,9 @@ Pinned cases are classified against the first-profile feature matrix:
 upstream-positive tests for deferred protocols are exclusions, not product
 xfails, excluded sections roll back to their last reset, and retained cases
 never replay deferred control sequences. Primary DA is normalized from
-libvterm's identity to td's. The first profile accepts semicolon-delimited
-SGR colors; colon-separated color subparameters remain an explicit exclusion.
+libvterm's identity to td's. The pinned report still excludes libvterm's
+two colon-separated color cases, as classified when they were imported,
+though td-term now takes the form; td-authored color cases pin it.
 
 The std-only importer remains a non-shipped developer provenance tool, not a
 runtime or build reader. Its unit tests and committed complete source
@@ -1371,9 +1396,10 @@ structural assertions beside them -- that each rendition differs from an
 otherwise identical normal cell, that bold only adds pixels and each added
 one is a step right of a set one, that italic's every top-half pixel is its
 normal neighbour shifted one column, that underline and strike are exactly
-one full row each. Those are what a wrong renderer fails; the goldens are
-what a CHANGED one fails. The committed set is exactly the set the cases
-render.
+one full row each, and that each underline style lights exactly its
+pattern, in its own color when it has one. Those are what a wrong renderer
+fails; the goldens are what a CHANGED one fails. The committed set is
+exactly the set the cases render.
 
 A compositor-level gallery -- td-term against a real td-compositor with a
 file-backed framebuffer, comparing the compositor's exact final XRGB8888
@@ -1401,8 +1427,9 @@ terminal, and td-term's prove the program:
   and admitted whole, the bell coalesces, and history evicts whole lines
   within its byte ceiling (`vt_spec.rs`);
 - exact model-renderer PPM goldens pass, beside the structural rendition,
-  palette, cursor, selection, bell-ring, and viewport assertions
-  (`vt_render_spec.rs`);
+  underline-style and underline-color, palette, cursor, selection,
+  bell-ring, and viewport assertions, through the bitmap face and the
+  outline face (`vt_render_spec.rs`);
 - the encoder spells every chord in §3's table, the pointer's reports are
   what each mode asks for in each encoding, bounded to what X10's byte
   carries, the viewport moves, clamps, and survives eviction and clears as

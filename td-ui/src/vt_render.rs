@@ -11,7 +11,7 @@ use crate::atlas::{Entry, Slot, PAGE_WIDTH};
 use crate::face::{Face, Sizing};
 use crate::font::Font;
 use crate::raster::{self, Scale, Surface};
-use crate::vt::{Attributes, Cell, Color, Terminal};
+use crate::vt::{Attributes, Cell, Color, Terminal, Underline};
 
 pub const BYTES_PER_PIXEL: usize = 4;
 
@@ -53,6 +53,13 @@ const DEFAULT_BACKGROUND: [u8; 3] = [0x22, 0x22, 0x22];
 /// the cell geometry rather than of the glyph in it.
 const UNDERLINE_INSET: usize = 2;
 
+/// A double underline's second rule, this many rows above the first.
+const DOUBLE_GAP: usize = 2;
+
+/// The unit of a curly underline's wave and a dotted one's dots: this
+/// fraction of the cell's height, and at least a pixel.
+const PATTERN_SCALE: usize = 16;
+
 /// What a row past the end of the model shows. Written out rather than
 /// `Attributes::default()` so adding a rendition is a compile error here,
 /// where the renderer has to decide what to do with it.
@@ -62,11 +69,12 @@ const BLANK: Cell = Cell {
         bold: false,
         faint: false,
         italic: false,
-        underline: false,
+        underline: Underline::None,
         inverse: false,
         strike: false,
         foreground: Color::Default,
         background: Color::Default,
+        underline_color: Color::Default,
     },
 };
 
@@ -454,6 +462,7 @@ impl<'a> Snapshot<'a> {
 struct Ink {
     foreground: [u8; 3],
     background: [u8; 3],
+    underline: [u8; 3],
 }
 
 impl Ink {
@@ -468,9 +477,13 @@ impl Ink {
         if attributes.faint {
             foreground = blend_half(foreground, background);
         }
+        // An underline color of its own is drawn as it is; without one the
+        // underline is the ink the glyph is drawn in.
+        let underline = palette.resolve(attributes.underline_color, foreground);
         Self {
             foreground,
             background,
+            underline,
         }
     }
 }
@@ -708,7 +721,6 @@ fn paint_cell(
         let slot = face.glyph(face.style(attributes.bold, attributes.italic), cell.scalar);
         if slot != Slot::Missing {
             let (x, y) = (origin_x, origin_y);
-            let rules = rules(attributes, cell_height);
             let coverage = |column: usize, row: usize| match slot {
                 Slot::Placed(entry) => covered(face, entry, column, row),
                 _ => 0,
@@ -717,15 +729,14 @@ fn paint_cell(
                 let Some(y) = y.checked_add(row).filter(|&y| y < height) else {
                     return;
                 };
-                let ruled = rules.contains(&Some(row));
                 for column in 0..cell_width {
                     let Some(x) = x.checked_add(column).filter(|&x| x < width) else {
                         break;
                     };
-                    let color = if ruled {
-                        ink.foreground
-                    } else {
-                        mix(ink.background, ink.foreground, coverage(column, row))
+                    let color = match rule(attributes, (cell_width, cell_height), x, column, row) {
+                        Some(Rule::Strike) => ink.foreground,
+                        Some(Rule::Underline) => ink.underline,
+                        None => mix(ink.background, ink.foreground, coverage(column, row)),
                     };
                     put_pixel(pixels, width, height, x, y, color);
                 }
@@ -734,7 +745,6 @@ fn paint_cell(
         }
     }
     let glyph = font.index(cell.scalar);
-    let rules = rules(attributes, cell_height);
     // Centred: a larger cell frames the glyph and a smaller one clips it
     // about its middle, an odd difference trimming the right column or the
     // bottom row once more, and the bitmap face's own cell holds it
@@ -760,7 +770,6 @@ fn paint_cell(
         if y >= height {
             return;
         }
-        let ruled = rules.contains(&Some(row));
         let glyph_row = within(row, inset_y, font.height());
         let lean = match glyph_row {
             Some(glyph_row) if attributes.italic => shear(glyph_row, font.height()),
@@ -779,26 +788,68 @@ fn paint_cell(
                 }
                 _ => false,
             };
-            let color = if ruled || inked {
-                ink.foreground
-            } else {
-                ink.background
+            let color = match rule(attributes, (cell_width, cell_height), x, column, row) {
+                Some(Rule::Strike) => ink.foreground,
+                Some(Rule::Underline) => ink.underline,
+                None if inked => ink.foreground,
+                None => ink.background,
             };
             put_pixel(pixels, width, height, x, y, color);
         }
     }
 }
 
-/// The rows the underline and the strike take in a cell `height` tall,
-/// each when the rendition asks for it: the cell's, not the glyph's, so a
-/// rule is where it is whichever face draws the cell.
-fn rules(attributes: &Attributes, height: usize) -> [Option<usize>; 2] {
-    [
-        attributes
-            .underline
-            .then(|| height.saturating_sub(UNDERLINE_INSET)),
-        attributes.strike.then_some(height / 2),
-    ]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Rule {
+    Strike,
+    Underline,
+}
+
+/// The rule, if any, over the pixel at `column` and `row` of a cell
+/// `width` by `height`, `x` across the surface: the strike at the cell's
+/// middle, else the underline in its style. The cell places them, not
+/// the glyph, so a rule is where it is whichever face draws the cell. A
+/// curly underline is a triangle wave up from the cell's last row two
+/// units and back, a dotted one alternates unit-long dots and gaps, both
+/// running on the surface's `x` so they meet across cells, and a dashed
+/// one leaves a gap of the cell's last quarter, at least a pixel.
+fn rule(
+    attributes: &Attributes,
+    (width, height): (usize, usize),
+    x: usize,
+    column: usize,
+    row: usize,
+) -> Option<Rule> {
+    if !attributes.strike && attributes.underline == Underline::None {
+        return None;
+    }
+    if attributes.strike && row == height / 2 {
+        return Some(Rule::Strike);
+    }
+    let base = height.saturating_sub(UNDERLINE_INSET);
+    let unit = (height / PATTERN_SCALE).max(1);
+    let under = match attributes.underline {
+        Underline::None => false,
+        Underline::Single => row == base,
+        Underline::Double => row == base || Some(row) == base.checked_sub(DOUBLE_GAP),
+        Underline::Curly => {
+            let crest = unit.saturating_mul(2);
+            let period = crest.saturating_mul(2);
+            let phase = x.checked_rem(period).unwrap_or(0);
+            let rise = if phase <= crest {
+                phase
+            } else {
+                period.saturating_sub(phase)
+            };
+            Some(row)
+                == height
+                    .checked_sub(1)
+                    .and_then(|last| last.checked_sub(rise))
+        }
+        Underline::Dotted => row == base && x.checked_div(unit).is_some_and(|dot| dot % 2 == 0),
+        Underline::Dashed => row == base && column < width.saturating_sub((width / 4).max(1)),
+    };
+    under.then_some(Rule::Underline)
 }
 
 /// The coverage `entry` puts at (`column`, `row`) of the cell: the glyph's
