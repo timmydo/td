@@ -24,7 +24,7 @@ path = "src/main.rs"
 # FAT32 and CRC-32 writers and td-boot's on-disk protocol directly with rustc.
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.clippy]
 unwrap_used = "deny"

@@ -8,7 +8,9 @@
 //! assumed from which of the two it is; both are asked of the destination.
 //!
 //! `td-install/DESIGN.md` is the normative specification for this path.
-#![forbid(unsafe_code)]
+//! `loop_sys.rs` holds its one `unsafe` surface (UNSAFE.md §21), which the
+//! `confinement` tests below pin.
+#![deny(unsafe_code)]
 
 #[path = "../../td-boot/src/protocol.rs"]
 #[allow(dead_code)]
@@ -66,6 +68,13 @@ mod timezones;
 #[path = "../../td-firstboot/src/hostname.rs"]
 mod hostname;
 
+// The one raw-syscall layer, and the one module that calls it.
+#[path = "loop_sys.rs"]
+mod loop_sys;
+
+#[path = "loop_device.rs"]
+mod loop_device;
+
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
@@ -83,7 +92,8 @@ fn invalid(message: String) -> io::Error {
 const USAGE: &str =
     "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install serve <td-boot> <deployment-directory> <trusted-key> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
-                     [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
+                     [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]\n       \
+                     td-install format ... --trusted-key <trusted-key> --publish <td-boot> <deployment> <mountpoint>";
 
 fn candidate_output_allowed(terminal: bool) -> io::Result<()> {
     if terminal {
@@ -411,25 +421,45 @@ struct Publish {
     trusted_key: PathBuf,
 }
 
-/// Formatting with a trust root alone prepares for a later mounted publish.
+/// Publication onto the volume just formatted, through a loop over the
+/// destination `format` still holds (DESIGN.md "Publishing through a loop
+/// over the claim"). Every path is absolute: td-boot requires its two, and a
+/// bare program name would resolve through `PATH`.
+#[derive(Debug, Eq, PartialEq)]
+struct LoopPublish {
+    td_boot: PathBuf,
+    deployment: PathBuf,
+    mountpoint: PathBuf,
+}
+
+/// Formatting with a trust root alone prepares for a later mounted publish;
+/// `Loop` is that publish, made before the destination is released.
 #[derive(Debug, Eq, PartialEq)]
 enum VolumeSeed {
     Publish(Publish),
     Trust(PathBuf),
+    Loop(PathBuf, LoopPublish),
 }
 
 impl VolumeSeed {
     fn trusted_key(&self) -> &Path {
         match self {
             Self::Publish(publish) => &publish.trusted_key,
-            Self::Trust(key) => key,
+            Self::Trust(key) | Self::Loop(key, _) => key,
         }
     }
 
     fn publish(&self) -> Option<&Publish> {
         match self {
             Self::Publish(publish) => Some(publish),
-            Self::Trust(_) => None,
+            Self::Trust(_) | Self::Loop(..) => None,
+        }
+    }
+
+    fn through_loop(&self) -> Option<&LoopPublish> {
+        match self {
+            Self::Loop(_, publish) => Some(publish),
+            Self::Publish(_) | Self::Trust(_) => None,
         }
     }
 }
@@ -563,6 +593,46 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
             "--uuid is only supported by volume".into()
         }));
     }
+    let (through_loop, rest) = match rest.iter().position(|arg| arg.as_os_str() == "--publish") {
+        None => (None, rest),
+        Some(at) => {
+            if boot.is_none() {
+                return Err(invalid("--publish is only supported by format".into()));
+            }
+            let (head, tail) = rest
+                .split_at_checked(at)
+                .ok_or_else(|| invalid(USAGE.into()))?;
+            let [_, td_boot, deployment, mountpoint] = tail else {
+                return Err(invalid(
+                    "--publish requires TD-BOOT DEPLOYMENT MOUNTPOINT and nothing after them"
+                        .into(),
+                ));
+            };
+            if head.len() != 5
+                || !head
+                    .get(3)
+                    .is_some_and(|arg| arg.as_os_str() == "--trusted-key")
+            {
+                return Err(invalid(
+                    "--publish follows the volume operands and --trusted-key KEY".into(),
+                ));
+            }
+            if [td_boot, deployment, mountpoint]
+                .iter()
+                .any(|path| !path.is_absolute())
+            {
+                return Err(invalid("--publish requires absolute paths".into()));
+            }
+            (
+                Some(LoopPublish {
+                    td_boot: td_boot.clone(),
+                    deployment: deployment.clone(),
+                    mountpoint: mountpoint.clone(),
+                }),
+                head,
+            )
+        }
+    };
     if rest.iter().any(|arg| arg.as_os_str() == "--trusted-key")
         && !(verb == "volume"
             && rest.len() == 5
@@ -654,7 +724,10 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 destination: destination.clone(),
                 mkfs: mkfs.clone(),
                 scratch: scratch.clone(),
-                seed: Some(VolumeSeed::Trust(trusted_key.clone())),
+                seed: Some(match through_loop {
+                    Some(publish) => VolumeSeed::Loop(trusted_key.clone(), publish),
+                    None => VolumeSeed::Trust(trusted_key.clone()),
+                }),
             })
         }
         (Some("volume"), [destination, mkfs, scratch, td_boot, deployment, trusted_key]) => {
@@ -1425,6 +1498,15 @@ mod paths {
         File::open(path).at(path)
     }
 
+    /// An existing node, for reading and writing; nothing is created.
+    pub fn open_read_write(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .at(path)
+    }
+
     /// Consume directory iteration here so late errors also name the path.
     pub fn read_dir_bounded(path: &Path, limit: usize) -> io::Result<Vec<PathBuf>> {
         let mut entries = Vec::new();
@@ -1532,6 +1614,11 @@ mod paths {
 
     pub fn symlink_metadata(path: &Path) -> io::Result<Metadata> {
         std::fs::symlink_metadata(path).at(path)
+    }
+
+    /// What is at `path`, symlinks followed.
+    pub fn metadata(path: &Path) -> io::Result<Metadata> {
+        std::fs::metadata(path).at(path)
     }
 
     /// What is at `path`, or nothing — the one call here whose error is
@@ -2441,11 +2528,72 @@ fn run_format(
         .plan
         .volume_bytes()
         .ok_or_else(|| invalid("planned volume length overflowed".into()))?;
+    let seed = prepared.seed;
     let image = prepare_volume_image(prepared, &destination, len)?;
     // Guard layout too; write_to keeps its own check for standalone volume use.
     image.check_source(&destination.file)?;
     layout.write_to(&mut destination, &mut io::sink())?;
-    image.write_to(&mut destination, out)
+    let Some((key, publish)) = seed.and_then(|seed| {
+        seed.through_loop()
+            .map(|publish| (seed.trusted_key(), publish))
+    }) else {
+        return image.write_to(&mut destination, out);
+    };
+    // The report waits for publication: a caller reading it has a published
+    // disk.
+    let mut report = Vec::new();
+    image.write_to(&mut destination, &mut report)?;
+    publish_through_loop(&mut destination, publish, key)?;
+    out.write_all(&report)
+}
+
+/// Publish onto the volume just written, through a loop over the destination
+/// this process holds. The kernel's partition table may still describe the
+/// disk as it was, and the claim refuses a mount of any partition node, so
+/// the volume is reached by its byte range instead; the loop holds the claim's
+/// own open file, so the claim lasts until the loop clears.
+fn publish_through_loop(
+    destination: &mut FormatDestination,
+    publish: &LoopPublish,
+    key: &Path,
+) -> io::Result<()> {
+    let sector_size = logical_sector_size(&destination.file)?;
+    let (offset, len) = destination_volume(&mut destination.file)?;
+    let device =
+        loop_device::attach(&destination.file, offset, len, sector_size).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{}: loop over the volume: {error}",
+                    destination.label.display()
+                ),
+            )
+        })?;
+    // td-boot's stdout is the deployment id; this program's is a report.
+    let output = std::process::Command::new(&publish.td_boot)
+        .arg("install")
+        .arg(device.path())
+        .arg(&publish.mountpoint)
+        .arg(&publish.deployment)
+        .arg(key)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|error| invalid(format!("cannot run {}: {error}", publish.td_boot.display())))?;
+    let _ = io::stderr().write_all(&output.stdout);
+    if !output.status.success() {
+        return Err(invalid(format!(
+            "{} install on {} failed ({})",
+            publish.td_boot.display(),
+            device.path().display(),
+            output.status
+        )));
+    }
+    // td-boot has unmounted, so this is the last opener and the loop clears;
+    // release confirms it did, so no loop outlives a reported success.
+    device.release()?;
+    destination.file.sync_all()
 }
 
 struct PreparedVolume<'a> {
@@ -2476,9 +2624,14 @@ fn prepare_volume<'a>(
     // the fourth argument therefore destroyed a directory before saying it did
     // not like the fourth argument.
     let publish = seed.and_then(VolumeSeed::publish);
+    let through_loop = seed.and_then(VolumeSeed::through_loop);
     for (label, program) in [
         ("mkfs.btrfs", Some(mkfs)),
         ("td-boot", publish.map(|publish| publish.td_boot.as_path())),
+        (
+            "td-boot",
+            through_loop.map(|publish| publish.td_boot.as_path()),
+        ),
         (
             "td-firstboot",
             settings
@@ -2498,6 +2651,26 @@ fn prepare_volume<'a>(
                     program.display()
                 )));
             }
+        }
+    }
+    // td-boot takes these two in another order than `--publish` does, so a
+    // swap is the likely mistake, and it would surface only after the disk
+    // was written. Both are refused here instead: the deployment must be a
+    // directory, and the mountpoint an empty one.
+    if let Some(publish) = through_loop {
+        if !paths::is_dir(&publish.deployment)? {
+            return Err(invalid(format!(
+                "deployment {} is not a directory",
+                publish.deployment.display()
+            )));
+        }
+        if !paths::is_dir(&publish.mountpoint)?
+            || paths::read_dir_bounded(&publish.mountpoint, 0).is_err()
+        {
+            return Err(invalid(format!(
+                "mountpoint {} is not an empty directory",
+                publish.mountpoint.display()
+            )));
         }
     }
     // The KEY is read here for the same reason and in the same place. It is an
@@ -5859,7 +6032,7 @@ mod tests {
     /// inventory uses paths; timezones uses the regular-file reader.
     type Compiled = (&'static str, &'static str, &'static [&'static str]);
 
-    fn compiled_files() -> [Compiled; 15] {
+    fn compiled_files() -> [Compiled; 17] {
         [
             ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
             (
@@ -5920,6 +6093,12 @@ mod tests {
                 include_str!("../../td-firstboot/src/hostname.rs"),
                 [].as_slice(),
             ),
+            ("loop_sys.rs", include_str!("loop_sys.rs"), [].as_slice()),
+            (
+                "loop_device.rs",
+                include_str!("loop_device.rs"),
+                [].as_slice(),
+            ),
         ]
     }
 
@@ -5954,7 +6133,7 @@ mod tests {
         // include inside a `stringify!`, which satisfied the search while
         // `compiled_files` went on reading the original.
         let table_body = {
-            const HEAD: &str = "fn compiled_files() -> [Compiled; 15] {";
+            const HEAD: &str = "fn compiled_files() -> [Compiled; 17] {";
             let Some(at) = index_of(&text, HEAD) else {
                 panic!("the compiled-file table is not where this scan looks for it")
             };
@@ -6135,7 +6314,7 @@ mod tests {
         }
         // A naming test that found nothing to check would pass whatever the
         // wrappers did.
-        assert_eq!(checked, 21, "{checked} wrappers were checked");
+        assert_eq!(checked, 23, "{checked} wrappers were checked");
     }
 
     /// The text of the item opened at `marker`, up to the next line that is a
@@ -8539,5 +8718,459 @@ mod tests {
             * 512;
         assert_eq!(metadata_bytes(&esp).unwrap(), expected);
         assert_eq!(u64::from(fat::NUM_FATS), 2, "two FATs is what that 2 is");
+    }
+
+    #[test]
+    fn loop_publication_follows_the_trusted_key_in_format_only() {
+        let publish = |tail: &[&str]| {
+            let mut all = vec![
+                "format",
+                "kernel",
+                "initrd",
+                "disk",
+                "/mkfs",
+                "scratch",
+                "--trusted-key",
+                "key",
+            ];
+            all.extend_from_slice(tail);
+            parse_args(args(&all))
+        };
+        assert_eq!(
+            publish(&["--publish", "/td-boot", "/source", "/volume"]).unwrap(),
+            Mode::Volume {
+                boot: Some(BootFiles {
+                    kernel: PathBuf::from("kernel"),
+                    initramfs: PathBuf::from("initrd"),
+                }),
+                uuid: None,
+                timezone: None,
+                hostname: None,
+                username: None,
+                destination: PathBuf::from("disk"),
+                mkfs: PathBuf::from("/mkfs"),
+                scratch: PathBuf::from("scratch"),
+                seed: Some(VolumeSeed::Loop(
+                    PathBuf::from("key"),
+                    LoopPublish {
+                        td_boot: PathBuf::from("/td-boot"),
+                        deployment: PathBuf::from("/source"),
+                        mountpoint: PathBuf::from("/volume"),
+                    }
+                )),
+            }
+        );
+        for tail in [
+            &["--publish", "/td-boot", "/source"][..],
+            &["--publish", "/td-boot", "/source", "/volume", "extra"],
+            &["--publish", "td-boot", "/source", "/volume"],
+            &["--publish", "/td-boot", "source", "/volume"],
+            &["--publish", "/td-boot", "/source", "volume"],
+            &["--publish", "/td-boot", "/source", "--publish"],
+        ] {
+            assert!(publish(tail).is_err(), "accepted {tail:?}");
+        }
+        for bad in [
+            vec![
+                "volume",
+                "disk",
+                "/mkfs",
+                "scratch",
+                "--trusted-key",
+                "key",
+                "--publish",
+                "/td-boot",
+                "/source",
+                "/volume",
+            ],
+            vec![
+                "format",
+                "kernel",
+                "initrd",
+                "disk",
+                "/mkfs",
+                "scratch",
+                "--publish",
+                "/td-boot",
+                "/source",
+                "/volume",
+            ],
+            vec![
+                "format",
+                "kernel",
+                "initrd",
+                "disk",
+                "/mkfs",
+                "scratch",
+                "--publish",
+                "/td-boot",
+                "/source",
+                "/volume",
+                "--trusted-key",
+                "key",
+            ],
+        ] {
+            assert!(parse_args(args(&bad)).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// The report says the disk is published, so a publication that fails
+    /// writes none, whether the loop cannot be bound (no privilege here) or
+    /// td-boot refuses on it.
+    #[test]
+    fn loop_publication_reports_nothing_until_it_publishes() {
+        let disk = Scratch::disk(DISK);
+        let dir = ScratchDirectory(fake_mkfs(RECORDING_MKFS));
+        let boot = BootFiles {
+            kernel: dir.0.join("kernel"),
+            initramfs: dir.0.join("initrd"),
+        };
+        std::fs::write(&boot.kernel, b"kernel").unwrap();
+        std::fs::write(&boot.initramfs, b"initrd").unwrap();
+        let td_boot = dir.0.join("td-boot");
+        std::fs::write(&td_boot, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(
+            &td_boot,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let mountpoint = dir.0.join("volume");
+        std::fs::create_dir(&mountpoint).unwrap();
+        let seed = VolumeSeed::Loop(
+            key_file(&dir.0),
+            LoopPublish {
+                td_boot,
+                deployment: dir.0.clone(),
+                mountpoint,
+            },
+        );
+        let mkfs = dir.0.join("mkfs.btrfs");
+        let prepared =
+            prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, Some(&seed)).unwrap();
+        let mut output = Vec::new();
+        let error = run_format(prepared, &disk.path, &boot, &mut output).unwrap_err();
+        assert!(
+            error.to_string().contains("loop over the volume")
+                || error.to_string().contains("install on /dev/loop"),
+            "{error}"
+        );
+        assert!(output.is_empty(), "reported before publication");
+        // The volume itself was written before publication was attempted.
+        assert!(destination_volume(&mut File::open(&disk.path).unwrap()).is_ok());
+    }
+
+    /// td-boot takes the deployment and mountpoint in the other order, so a
+    /// swap is refused before the destination is opened, not after layout.
+    #[test]
+    fn loop_publication_refuses_a_misplaced_operand_before_any_write() {
+        let dir = ScratchDirectory(fake_mkfs(RECORDING_MKFS));
+        let empty = dir.0.join("volume");
+        std::fs::create_dir(&empty).unwrap();
+        let file = dir.0.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let mkfs = dir.0.join("mkfs.btrfs");
+        for (deployment, mountpoint, refusal) in [
+            (&file, &empty, "is not a directory"),
+            (&dir.0, &dir.0, "is not an empty directory"),
+            (&dir.0, &file, "is not an empty directory"),
+            (&dir.0, &dir.0.join("absent"), "is not an empty directory"),
+        ] {
+            let seed = VolumeSeed::Loop(
+                key_file(&dir.0),
+                LoopPublish {
+                    td_boot: PathBuf::from("/td-boot"),
+                    deployment: deployment.clone(),
+                    mountpoint: mountpoint.clone(),
+                },
+            );
+            let error = prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, Some(&seed))
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains(refusal), "{error}");
+        }
+    }
+
+    // ── The unsafe surface (UNSAFE.md §21) ─────────────────────────────────
+    //
+    // The compiler checks that `unsafe` appears only where an allow permits
+    // it; it cannot check that there is ONE allow, that the assembly body and
+    // the two requests are the reviewed ones, or that only `loop_device.rs`
+    // reaches them. These do, over every file this binary compiles, which
+    // `every_compiled_file_is_one_the_guards_read` keeps complete. Names are
+    // assembled with `concat!` so this file does not match itself; the scans
+    // read code with its strings emptied.
+
+    /// A compiled file's code: comments and string contents gone.
+    fn plain_of(label: &str) -> String {
+        let Some((_, text, _)) = compiled_files()
+            .into_iter()
+            .find(|(name, _, _)| *name == label)
+        else {
+            panic!("{label} is not compiled into this binary")
+        };
+        let Some(plain) = plain_source(text) else {
+            panic!("{label} cannot be read as plain code")
+        };
+        plain
+    }
+
+    /// The same, whitespace gone too.
+    fn code_of(label: &str) -> String {
+        unspaced(&plain_of(label))
+    }
+
+    /// Occurrences of `word` as a whole identifier.
+    fn words(code: &str, word: &str) -> usize {
+        let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+        code.match_indices(word)
+            .filter(|(at, _)| {
+                let before = code.get(..*at).and_then(|head| head.chars().next_back());
+                let after = code
+                    .get(at.saturating_add(word.len())..)
+                    .and_then(|tail| tail.chars().next());
+                !before.is_some_and(ident) && !after.is_some_and(ident)
+            })
+            .count()
+    }
+
+    const UNSAFE: &str = concat!("un", "safe");
+    const LINT: &str = concat!("un", "safe_code");
+    const RAW: &str = concat!("sys", "call3");
+    const SURFACE: &str = concat!("loop", "_sys");
+
+    #[test]
+    fn the_one_unsafe_block_sits_under_the_one_scoped_allow() {
+        for (label, _, _) in compiled_files() {
+            let code = code_of(label);
+            let plain = plain_of(label);
+            let (blocks, lints) = match label {
+                "loop_sys.rs" => (1, 1),
+                "main.rs" => (0, 1),
+                _ => (0, 0),
+            };
+            assert_eq!(
+                words(&plain, UNSAFE),
+                blocks,
+                "{label}: the unsafe keyword appears outside the one block"
+            );
+            assert_eq!(
+                words(&plain, LINT),
+                lints,
+                "{label}: the unsafe lint is named outside the crate deny and \
+                 the one scoped allow"
+            );
+            for form in [
+                concat!("global_a", "sm!"),
+                concat!("naked_a", "sm!"),
+                concat!("a", "sm!"),
+            ] {
+                assert_eq!(
+                    code.matches(form).count(),
+                    usize::from(label == "loop_sys.rs" && form == concat!("a", "sm!")),
+                    "{label}: inline assembly outside the one pinned body: {form}"
+                );
+            }
+        }
+        let main = code_of("main.rs");
+        assert_eq!(main.matches(&format!("#![deny({LINT})]")).count(), 1);
+        let sys = code_of("loop_sys.rs");
+        assert_eq!(
+            sys.matches(&format!("#[inline]#[allow({LINT})]fn{RAW}("))
+                .count(),
+            1,
+            "the allow must sit on the raw entry point and nothing else"
+        );
+        assert_eq!(
+            sys.matches(&format!("{UNSAFE}{{")).count(),
+            1,
+            "the one unsafe item must be a block"
+        );
+        // The library compiles none of this and keeps the stronger lint.
+        assert!(unspaced(include_str!("lib.rs")).contains(&format!("#![forbid({LINT})]")));
+    }
+
+    /// The raw entry point is pinned WHOLE, from its attributes to its last
+    /// token: a second instruction in the same `asm!`, `in("rsi")` swapped
+    /// with `in("rdx")`, or a rebinding such as `let a2 = a2 ^ 1;` before the
+    /// block changes no count above. Read with its strings, which name the
+    /// registers. `options(nomem)` is absent by design: the kernel reads the
+    /// configuration through the pointer. Both wrappers are pinned whole
+    /// too, so nothing between building the configuration and the call can
+    /// change a byte of it, such as setting a flag at a literal offset.
+    #[test]
+    fn the_raw_entry_point_is_pinned_whole() {
+        const WRAPPERS: [&str; 2] = [
+            concat!(
+                "pubfnfree_loop(control:&File)->io::Result<usize>{",
+                "constLOOP_CTL_GET_FREE:usize=0x4c82;check(sys",
+                "call3(SYS_IOCTL,control.as_raw_fd()asusize,LOOP_CTL_GET_FREE,0,))}"
+            ),
+            concat!(
+                "pubfnconfigure(device:&File,backing:&File,offset:u64,len:u64,",
+                "block_size:u32,)->io::Result<()>{",
+                "constLOOP_CONFIGURE:usize=0x4c0a;",
+                "letconfig=config(backing,offset,len,block_size)?;check(sys",
+                "call3(SYS_IOCTL,device.as_raw_fd()asusize,LOOP_CONFIGURE,",
+                "config.as_ptr()asusize,)).map(drop)}"
+            ),
+        ];
+        let wrapped = unspaced(&uncommented(include_str!("loop_sys.rs")));
+        for wrapper in WRAPPERS {
+            assert_eq!(wrapped.matches(wrapper).count(), 1, "re-audit {wrapper}");
+        }
+        const FUNCTION: &str = concat!(
+            "#[inline]#[allow(un",
+            "safe_code)]fnsys",
+            "call3(n:usize,a1:usize,a2:usize,a3:usize)->isize{letret:isize;",
+            "un",
+            "safe{core::arch::a",
+            "sm!(\"syscall\",inlateout(\"rax\")nasisize=>ret,",
+            "in(\"rdi\")a1,in(\"rsi\")a2,in(\"rdx\")a3,",
+            "out(\"rcx\")_,out(\"r11\")_,options(nostack),);}ret}"
+        );
+        let sys = unspaced(&uncommented(include_str!("loop_sys.rs")));
+        assert_eq!(sys.matches(FUNCTION).count(), 1, "re-audit the function");
+    }
+
+    /// One syscall, two requests and the configuration's layout and flags,
+    /// by VALUE: `ioctl(2)`'s number says nothing about what it does, the
+    /// request does, and a field offset or flag is what the kernel is told.
+    /// Each constant is declared once and used only where counted, so none
+    /// can be shadowed or recomputed at its use.
+    #[test]
+    fn the_syscall_requests_and_layout_are_value_pinned() {
+        let sys = code_of("loop_sys.rs");
+        let plain = plain_of("loop_sys.rs");
+        let pinned = [
+            (concat!("SYS", "_IOCTL"), "usize=16", 3),
+            (concat!("LOOP_CTL", "_GET_FREE"), "usize=0x4c82", 2),
+            (concat!("LOOP", "_CONFIGURE"), "usize=0x4c0a", 2),
+            (concat!("LOOP", "_CONFIG_LEN"), "usize=304", 3),
+            (concat!("CONFIG", "_FD"), "usize=0", 2),
+            (concat!("CONFIG", "_BLOCK_SIZE"), "usize=4", 2),
+            (concat!("INFO", "_OFFSET"), "usize=8+24", 2),
+            (concat!("INFO", "_SIZELIMIT"), "usize=8+32", 2),
+            (concat!("INFO", "_FLAGS"), "usize=8+52", 2),
+            (concat!("LO_FLAGS", "_AUTOCLEAR"), "u32=4", 2),
+        ];
+        for (name, value, mentions) in pinned {
+            assert_eq!(
+                sys.matches(&format!("const{name}:{value};")).count(),
+                1,
+                "{name} must be declared once as {value}"
+            );
+            assert_eq!(words(&plain, name), mentions, "{name} is named elsewhere");
+        }
+        assert_eq!(
+            words(&plain, "const"),
+            pinned.len(),
+            "an undeclared constant"
+        );
+        for (label, _, _) in compiled_files() {
+            if label != "loop_sys.rs" {
+                assert!(
+                    !code_of(label).contains(concat!("const", "SYS_")),
+                    "{label} declares a syscall number"
+                );
+            }
+        }
+    }
+
+    /// Each call site whole, every argument in its register's place, and the
+    /// entry point named nowhere but its definition and those two calls.
+    #[test]
+    fn every_call_site_is_pinned_whole() {
+        let sys = unspaced(&uncommented(include_str!("loop_sys.rs")));
+        for arguments in [
+            "(SYS_IOCTL,control.as_raw_fd()asusize,LOOP_CTL_GET_FREE,0,)",
+            "(SYS_IOCTL,device.as_raw_fd()asusize,LOOP_CONFIGURE,config.as_ptr()asusize,)",
+        ] {
+            assert_eq!(
+                sys.matches(&format!("{RAW}{arguments}")).count(),
+                1,
+                "not the pinned call: {arguments}"
+            );
+        }
+        for (label, _, _) in compiled_files() {
+            let expected = if label == "loop_sys.rs" { 3 } else { 0 };
+            assert_eq!(
+                words(&plain_of(label), RAW),
+                expected,
+                "{label}: the raw entry point is named outside its definition \
+                 and two calls"
+            );
+        }
+        assert_eq!(
+            code_of("loop_sys.rs")
+                .matches(&format!("pubfn{RAW}("))
+                .count(),
+            0,
+            "module privacy is the entry point's confinement"
+        );
+    }
+
+    /// Only `loop_device.rs` reaches the wrappers, by one plain import, and
+    /// each wrapper is named, as a whole identifier, only at its definition,
+    /// its one call there and its test: an alias such as
+    /// `let call = free_loop;` is a mention without a parenthesis.
+    #[test]
+    fn only_the_loop_module_reaches_the_wrappers() {
+        for (label, _, _) in compiled_files() {
+            let plain = plain_of(label);
+            let expected = match label {
+                "main.rs" => 1,
+                "loop_device.rs" => 3,
+                _ => 0,
+            };
+            assert_eq!(
+                words(&plain, SURFACE),
+                expected,
+                "{label}: the syscall module is named where it should not be"
+            );
+        }
+        assert_eq!(
+            code_of("main.rs")
+                .matches(&format!("mod{SURFACE};"))
+                .count(),
+            1
+        );
+        let caller = code_of("loop_device.rs");
+        for form in [
+            format!("usecrate::{SURFACE};"),
+            format!("{SURFACE}::free_loop(&control)"),
+            format!("{SURFACE}::configure(&device,backing,offset,len,blocks)"),
+        ] {
+            assert_eq!(caller.matches(&form).count(), 1, "{form}");
+        }
+        for wrapper in [concat!("free", "_loop"), concat!("config", "ure")] {
+            for (label, _, _) in compiled_files() {
+                let expected = match label {
+                    "loop_sys.rs" => 2,
+                    "loop_device.rs" => 1,
+                    _ => 0,
+                };
+                assert_eq!(
+                    words(&plain_of(label), wrapper),
+                    expected,
+                    "{label} names {wrapper} beyond its definition, call and test"
+                );
+            }
+            // ...and of loop_sys.rs's two, the production one is the
+            // definition.
+            let sys = plain_of("loop_sys.rs");
+            let production = sys
+                .split(concat!("#[cfg(", "test)]"))
+                .next()
+                .unwrap_or_default();
+            assert_eq!(words(production, wrapper), 1, "{wrapper} in production");
+        }
+        // The configuration is built in one place, from the wrapper's own
+        // arguments, with the flags fixed there.
+        assert_eq!(
+            code_of("loop_sys.rs")
+                .matches("letconfig=config(backing,offset,len,block_size)?;")
+                .count(),
+            1
+        );
     }
 }

@@ -32,9 +32,11 @@ files. Boot files and tools read into the fixture initramfs are bounded at
 256 MiB. The shared composer accepts larger ISO payloads under MEDIA.md,
 while the full-system diagnostic supplies the built system deployment. The
 private key remains on the host outside derivations. Ordinary installation
-calls the actual td-install format coordinator, followed by td-boot's verified mounted
-publication. Its success marker follows formatting, partition refresh,
-mounted publication and sync.
+calls the actual td-install format coordinator, which publishes through
+td-boot's verified install onto a loop over its own claim (td-install/DESIGN.md
+"Publishing through a loop over the claim"). Its success marker follows
+formatting and publication, a check that no loop device was left bound,
+partition refresh and sync.
 
 Before any layout write, the guest polls for thirty seconds among exactly
 three fixed candidate paths: /dev/sr0 (SATA optical) and /dev/sda or
@@ -122,9 +124,9 @@ partition during a mount. The fixture closes the whole-disk claim and
 requires that same partition mount to succeed before continuing. This proves
 the competing-operation barrier and release behavior in the disposable
 topology; it does not implement an atomic claim transfer, hotplug admission
-or exclusion of arbitrary raw I/O by another privileged process. The future
-coordinator's transition from raw formatting to mounted publication still
-needs its own protocol.
+or exclusion of arbitrary raw I/O by another privileged process. Within one
+process, `format --publish` is the transition from raw formatting to
+mounted publication: it publishes through a loop over the claim it holds.
 
 Once the partition is mounted through td-boot, all three raw formatter commands
 must fail their destination open with exit status 1, EBUSY and no stdout. An
@@ -149,15 +151,20 @@ change must update the fixture rather than accepting any nonzero exit as
 evidence of a busy device.
 
 The live guest supplies `--trusted-key` to `td-install format` instead of
-the three publishing operands. The formatter initializes the publication
-directories and key without a deployment or selector. The fixture requires
-empty staged boot, deployment and incoming directories, plus only the
-expected timezone, hostname and (for the full system) username settings
-beneath @var, then deletes its entire private scratch directory after
-partition refresh, then calls `td-boot install` with the resolved partition,
-/source and the same read-only live public key. Successful mounted
-publication and sync precede the direct-publication and installation markers;
-the host requires both. The full cold-boot oracle still proves the expected
+the three staged-publishing operands, and on its ordinary legs `--publish
+/bin/td-boot /source /volume`. The formatter initializes the publication
+directories and key without staging a deployment or selector, then
+publishes through a loop over its claim with the same read-only live public
+key before it exits. The guest requires the set of bound loop devices to be
+the same before and after, so the loop cleared. The fixture requires empty
+staged boot, deployment and incoming directories, plus only the expected
+timezone, hostname and (for the full system) username settings beneath
+@var, then deletes its entire private scratch directory after partition
+refresh. The interrupted leg formats without `--publish` and, after
+partition refresh, calls `td-boot install` with the resolved partition,
+/source and the key, which it then interrupts. Successful publication and
+sync precede the direct-publication and installation markers; the host
+requires both. The full cold-boot oracle still proves the expected
 deployment is installed. The separate full-system diagnostic checks its
 installed desktop under a RAM ceiling. Neither diagnostic admits operator
 target capacity.

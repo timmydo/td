@@ -111,10 +111,12 @@ operation on the path and the one nobody watches.
 That writer has TWO ways in and one body, which is the distinction the rule
 is about: `td-boot install <device> <mountpoint> <source> [key]` mounts and
 then publishes, and the verb 7c adds publishes into a volume root that is
-already writable. The second exists because `td-install` cannot mount (D8) and a
+already writable. The second exists because staging needs no mount at all and a
 regular-file destination has no partition device to mount anyway (D9); the
-first is what a running machine and the update path use. Neither reimplements
-the other — `install` calls the same function once its mount has succeeded.
+first is what a running machine and the update path use, and what `format
+--publish` runs on a loop over the disk it holds (§5 "Publishing through a
+loop over the claim"). Neither reimplements the other — `install` calls the
+same function once its mount has succeeded.
 
 Consequently `td-install` shares `td-boot/src/protocol.rs`'s
 `DEPLOYMENTS_DIR`, `SELECTOR_PREFIX` and `BOOT_DIR` through the same `#[path]`
@@ -208,11 +210,13 @@ payload, and a selector initramfs with either. It is the static binary built
 under the shipped target profile, so its debug companion ships in the image
 with it.
 
-**D8. No new `unsafe`.** Everything here is ordinary file I/O: partition
-tables and filesystems are bytes at offsets, and efivarfs is a filesystem.
-`UNSAFE.md`'s roster is unchanged by this workstream. If some later increment
-appears to need a syscall, that is an amendment to `UNSAFE.md` and is
-reviewed as one — not a thing to discover in a diff.
+**D8. One recorded `unsafe` surface.** Everything here is ordinary file
+I/O: partition tables and filesystems are bytes at offsets, and efivarfs is a
+filesystem. The one exception is publication onto a disk this process holds,
+which binds a loop device over the volume with two value-pinned requests
+(`UNSAFE.md` §21, §5 "Publishing through a loop over the claim"). Any further
+syscall is an amendment to `UNSAFE.md` and is reviewed as one — not a thing
+to discover in a diff.
 
 **D9. The installer writes to a device OR to a regular file, and the file
 case is what the oracle exercises.** One code path, two destinations. This is
@@ -519,7 +523,8 @@ continues through the same wrapper.
 
 This guard does not implement the installation service's exclusive
 admission. Unclaimed raw I/O can still race a claim, image files have no
-block claim, and each command releases its descriptor when it finishes.
+block claim, and each command releases its descriptor when it finishes,
+except that `format --publish` keeps it until its loop clears.
 Media/backing-device exclusion, stable identity, the service's held
 operation descriptors through execution and trusted destructive consent
 remain required; `td-install serve` holds the claim through review only.
@@ -541,12 +546,12 @@ There is no descriptor-number CLI, claim transfer through /proc, or
 cross-process descriptor protocol. The service must own its formatting
 object in the process performing writes. `td-install serve` takes the same
 read-write exclusive claim at propose and holds that File until the review
-ends; its execution will wrap that File, in that process. Partition refresh
-and mounted deployment publication still need an explicit claim handoff
-design and kernel validation before service activation; borrowing a File
-across raw writes does not settle that phase. In particular, callers must
-not assume the current separate pathname-based refresh and mount commands
-can run while this exclusive claim is held.
+ends; its execution will wrap that File, in that process. Deployment
+publication under that claim goes through a loop over the held File
+("Publishing through a loop over the claim" below), which the QEMU fixture
+exercises. The separate pathname-based partition refresh and mount commands
+cannot run while this exclusive claim is held and remain only for the
+mounted route, after the claim is released.
 
 A regular-file regression replaces the destination name after opening,
 then formats both layout and volume through the retained object. It checks
@@ -748,20 +753,82 @@ bootable installation. The coordinator must authenticate its stable source
 before erasure, keep the selector and volume keys consistent, then complete
 verified publication through `td-boot install DEVICE MOUNTPOINT SOURCE KEY`.
 That command remains the single transaction writer and rechecks copied
-payloads. No dependency or syscall surface is added to the formatter.
+payloads. The formatter itself gains no dependency or syscall for this;
+the loop publication below is a separate route with its own surface.
 
-The diagnostic ISO uses this sequence after preflight and layout. After
-trust-only formatting it requires empty staged boot, deployment and incoming
-directories and only the selected timezone under `@var`, refreshes and checks
-the partition devices, deletes
-its entire owned scratch directory, then invokes `td-boot install` on the resolved partition. Publication
-streams from read-only media onto Btrfs. The host requires the direct
+The diagnostic ISO's interrupted-publication leg uses this sequence after
+preflight and layout. After trust-only formatting it requires empty staged
+boot, deployment and incoming directories and only the selected timezone
+under `@var`, refreshes and checks the partition devices, deletes its entire
+owned scratch directory, then invokes `td-boot install` on the resolved
+partition. Its ordinary legs publish through the loop below instead, before
+the same checks. Either way publication streams from read-only media onto
+Btrfs. The host requires the direct
 publication marker as well as successful detached boots from the expected
 deployment. Deployment-sized staging copies no longer consume guest RAM;
 the sparse formatter image still needs metadata space and scans the logical
 volume size. This small fixture alone does not establish full-system RAM
 or capacity bounds; the full-system diagnostic in §8 supplies a separate
 2 GiB guest execution check. Production capacity admission remains open.
+
+### Publishing through a loop over the claim
+
+`td-install format EFI-KERNEL SELECTOR-INITRAMFS [OPTIONS] DESTINATION MKFS
+SCRATCH --trusted-key KEY --publish TD-BOOT DEPLOYMENT MOUNTPOINT` formats
+exactly as the trust-only form does, then publishes the deployment before it
+releases the destination. Only `format` accepts `--publish`, only directly
+after `--trusted-key KEY`, and its three operands must be absolute: td-boot
+requires two of them, and a bare program name would resolve through `PATH`.
+
+After the volume copy and its sync barriers, the formatter rereads the
+volume extent from the table it just wrote through the held destination and
+binds a loop device over exactly that byte range, with the destination's
+logical sector size as the loop's block size. It then runs `TD-BOOT install
+/dev/loopN MOUNTPOINT DEPLOYMENT KEY`. The loop's backing file is the
+destination's own open file, so the exclusive claim, which refuses a mount
+of any partition of the disk, lasts while the loop is bound, and nothing
+names the disk by path. The kernel's partition table is neither read nor
+refreshed; it may still describe the disk as it was. td-boot mounts,
+publishes and unmounts as it does on any device, and its stdout, the
+deployment id, is copied to stderr. The formatter then closes the loop's
+last opener and requires the kernel to have cleared it within a second
+before it syncs the destination. The byte report is written only after
+publication succeeds and the loop has cleared, so a report means a
+published disk and no loop left behind.
+
+Before the destination is opened, the formatter requires the deployment to
+be a directory and the mountpoint an empty one. td-boot takes those two in
+the other order, so a swap is the likely mistake, and without the check it
+would surface only after the disk was written. td-install bakes the key
+bytes it read into the volume and td-boot reads the same key path again;
+the caller keeps that file stable, as with every other source.
+
+The loop is bound in one `LOOP_CONFIGURE` call and checked through sysfs
+before use, including that it is backed by the destination's own file;
+UNSAFE.md §21 owns that surface, its layout and its read-back.
+It is not read-only, not partition-scanned and not direct-I/O. The formatter
+then holds it only through a read-only descriptor, because the pinned kernel
+refuses to mount a device another descriptor holds open for writing. A
+regular-file destination takes the same path, a loop over a file, so D9's
+single implementation holds. Binding needs privilege, so the regular-file
+tests reach only the refusal, and no report is written. The QEMU fixture is
+the kernel evidence: its ordinary legs publish this way on virtio and NVMe
+targets at 512-byte and 4Kn sectors and on AHCI at 512-byte, including the
+reinstall over an interrupted publication, and require that no loop device
+is left bound afterwards. Its interrupted-publication leg keeps the mounted
+route, whose publisher it can stop on its own.
+
+A failure after the first write leaves the disk as the raw formatter does:
+a trust-only volume with no selector, or a partial publication whose
+recovery td-boot's transaction owns. Nothing retries. If td-boot leaves the
+loop mounted, the loop and the claim's file stay bound until it is
+unmounted, and the formatter reports the loop still bound rather than
+success. The residual is the claim's: a non-exclusive raw writer, or a
+privileged process that opens or detaches the bound loop, is not excluded.
+The caller still binds stable trusted sources, an absolute td-boot and a
+mountpoint nothing else uses. This is the one-process publication the
+installation service's execution needs; it does not activate that
+execution.
 
 ### Full-system volume consumers
 
@@ -1512,8 +1579,9 @@ below remain required.
 
 `td-recipe-eval qemu-install` adds a native guest installation fixture,
 [td-install-qemu-test](../td-install-qemu-test/DESIGN.md). Its source-built
-PID 1 runs td-install format and signed mounted publication on an exclusively
-created QEMU virtio or AHCI target. The same private ISO is exercised as optical and
+PID 1 runs td-install format, which publishes the signed deployment through
+a loop over its own claim, on an exclusively created QEMU virtio or AHCI
+target. The same private ISO is exercised as optical and
 USB media. After installation, the host detaches media and cold-boots only
 the destination, requiring authenticated selector kexec, a read from the
 installed EROFS payload, persistent Btrfs state across two boots, and
@@ -1845,7 +1913,8 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    has to exist regardless, and once it exists the ioctl buys a second code
    path for the one destination the tests cannot reach. D9 settles it — an
    installer whose tested path and shipped path differ is an installer tested
-   somewhere other than where it runs — and D8 survives intact.
+   somewhere other than where it runs — and D8 survived intact, until the
+   loop publication below gave it one recorded surface.
    A live coordinator can separately refresh partitions through td-init, as
    specified in §5, before direct publication; the formatter remains one path.
 
@@ -1940,7 +2009,12 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    the one destination the tests cannot reach. A loop device over the
    partition's byte range is the other, and it needs `LOOP_SET_STATUS64` for
    the offset — another ioctl, so it trades the surface rather than avoiding
-   it.
+   it. That loop was later adopted for PUBLICATION, not formatting: a
+   process holding the disk's exclusive claim cannot mount a partition of
+   it, so §5 "Publishing through a loop over the claim" binds one over the
+   held descriptor with `LOOP_CONFIGURE`, and `td-install` joined the roster
+   for that step alone (UNSAFE.md §21). The formatter still writes no
+   partition device.
 
    One tempting way out does not exist, and is written down because it reads
    like it should: the kernel does NOT rescan when the last writable
@@ -1971,8 +2045,9 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
 
    `td-install` then stages the deployment into the SAME `--rootdir` tree that
    already carries `@var`, and mkfs bakes the published result into the image
-   the sparse copy is about to write. Nothing mounts, nothing loops, no
-   partition device is needed, `UNSAFE.md` is untouched, and the oracle
+   the sparse copy is about to write. Nothing mounts, nothing loops (the
+   later loop publication is a separate route), no partition device is
+   needed, `UNSAFE.md` is untouched, and the oracle
    exercises the shipped code path rather than a cousin of it — which is D9,
    and the same argument that settled the `BLKRRPART` question above. It is
    also verifiable offline, which is what makes it a check rather than a

@@ -14,8 +14,8 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
 no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY
-numbered target-side exceptions, EIGHTEEN of them live, each a standalone
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-ONE
+numbered target-side exceptions, NINETEEN of them live, each a standalone
 crate OUTSIDE the `builder`/`recipes`/`engine` workspace with a scoped
 `#[allow]` around its recorded raw Linux boundary (the crate itself
 `#![deny(unsafe_code)]`s); the seventeenth and eighteenth are retired and
@@ -51,9 +51,12 @@ value-pinned requests, and `poll(2)` — recorded twice because the
 one-package locks the gate required of a root crate when the two were
 imported left no shared crate to put it in; both now draw in a td-ui
 window and forbid `unsafe` crate-wide, so §17 and §18 are retired and the
-roster counts eighteen live surfaces in twenty numbered entries. The
+roster counts nineteen live surfaces in twenty-one numbered entries. The
 twentieth, `td-taskmgr`, has one function-scoped instruction for
 process-directed signals through retained procfs directory descriptors.
+The twenty-first, `td-install`, has one function-scoped instruction for two
+value-pinned loop-device requests, which reach a freshly formatted volume
+through the disk claim the installer already holds.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -73,14 +76,13 @@ amendment to this file, and to the crate's own normative doc where it has
 one.
 
 Standalone crates that carry NO `unsafe` are not on the roster and do not
-need to be, but two of them are worth naming because they look like they
-would need one and do not: `td-boot` verifies a signature and kexecs
-through a helper, and `td-install` writes GPT and FAT32 onto a block
-device. Partition tables and filesystems are bytes at offsets, a device's
-size is a `seek`, and its sector size is a file under `/sys` — so
-`td-install/DESIGN.md`'s D8 asks for that to stay true, and where a later
-increment cannot keep it (rereading a partition table needs `BLKRRPART`,
-an ioctl) the amendment is made here first rather than found in a diff.
+need to be, but one is worth naming because it looks like it would need one
+and does not: `td-boot` verifies a signature and kexecs through a helper.
+`td-install` was the second until it had to publish onto a disk it holds
+(§21). Its partition tables and filesystems are still bytes at offsets, a
+device's size is a `seek`, and its sector size is a file under `/sys`;
+`td-install/DESIGN.md`'s D8 keeps it that way except for that one recorded
+surface.
 
 `td-ui`, the shared UI toolkit that td-editor depends on by path, joined
 the roster when the editor's Wayland transport moved into it (§19). It
@@ -117,6 +119,7 @@ own entry.
 | 18 | `td-news` | retired: the copy of `term_sys.rs` went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§18](#18-td-news--retired) |
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
+| 21 | `td-install` | `ioctl(2)` with two value-pinned loop requests, `LOOP_CTL_GET_FREE` and `LOOP_CONFIGURE` — see [§21](#21-td-install--publishing-through-a-loop-over-the-claim) |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -284,9 +287,10 @@ partition, mounts it, requires EBUSY on a second scan while mounted, then
 unmounts before a final successful scan. No host disk is used in these tests.
 Confinement pins the fifth request's value, zero argument, borrowed-file
 wrapper, sole caller and unchanged single instruction/allowance; harmless
-non-block kernel tests require ENOTTY. The td-install formatter remains safe
-and continues to write through its whole-disk descriptor for both destination
-kinds. This applet prepares the later direct-to-volume publication path.
+non-block kernel tests require ENOTTY. The td-install formatter continues
+to write through its whole-disk descriptor for both destination kinds;
+publication from inside the formatter goes through its own loop surface
+(§21), not this applet, which serves the separate mounted route.
 
 `TCGETS`/`TCSETS` arrived with the `getty` applet, which is what took the
 LAST busybox name off the image — the tty setup half of the login chain,
@@ -2877,6 +2881,99 @@ mapping, allowance and instruction counts, closed module inventory and
 production callers. Kernel tests use only child processes the fixture owns.
 Any additional syscall, raw caller, signal value, flags, queued information,
 allowance or authority channel amends this section and the component design.
+
+## 21. `td-install` — publishing through a loop over the claim
+
+`loop_sys.rs` carries exactly one x86-64 Linux syscall instruction, in a
+private `syscall3` under the crate's one function-scoped allowance: `ioctl`
+(16), with exactly two value-pinned requests. `LOOP_CTL_GET_FREE` (0x4c82)
+on `/dev/loop-control` returns the index of an unbound loop device, adding
+one if none is free. `LOOP_CONFIGURE` (0x4c0a) on that device binds a
+backing file at an offset and size limit in one call. The two wrappers
+borrow live `File`s and take typed values: `configure` accepts the loop
+device, the backing file, an offset, a length and a block size, never
+bytes, a raw descriptor, a request or a flags word. `loop_device.rs` is
+their only caller.
+
+The installer needs them because publication must reach a volume it has
+just written while it still holds the whole-disk claim (`td-install/DESIGN.md`
+"Publishing through a loop over the claim"). That claim is an `O_EXCL`
+block-device open, which refuses a mount of any partition of the disk, and
+the kernel's partition table may still describe the disk as it was. A loop
+over the volume's byte range, backed by the claim's own open file, is a
+device a mount can take without releasing the claim or naming the disk by
+path. The loop holds its own reference to that file, so the claim lasts until
+the loop clears.
+
+`LOOP_CONFIGURE` rather than `LOOP_SET_FD`, which td-init's read-only
+`losetup` uses: an offset needs `struct loop_info64` either way, and
+`LOOP_SET_FD` followed by `LOOP_SET_STATUS64` would expose the whole disk
+at offset zero, writable, between the two calls. So this surface lays out a
+304-byte `struct loop_config`, the risk td-init declined. `loop_sys.rs`
+alone knows the layout. It writes five fields — the backing descriptor
+taken from the borrowed file, the block size, `lo_offset`, `lo_sizelimit`
+and `lo_flags` fixed to `LO_FLAGS_AUTOCLEAR` — and leaves every other byte
+zero, so the loop is neither read-only nor partition-scanned nor direct-I/O.
+A unit test compares the bytes with the layout `linux/loop.h` gives, written
+out independently; that test, not the read-back below, is the evidence for
+the layout, since a misplaced block size can be masked by the kernel
+defaulting to the backing device's.
+
+After binding, `loop_device.rs` reads the kernel's own account back by the
+device number of the opened node: major 7, then `loop/offset`,
+`loop/sizelimit`, `loop/autoclear`, `loop/partscan`, `loop/dio`, `ro`,
+`size` and `queue/logical_block_size` under `/sys/dev/block/7:MINOR`, and
+the file `loop/backing_file` names, which must be the backing file by
+device number (or inode, for a regular file). It refuses any mismatch. The
+node is opened read-write for `LOOP_CONFIGURE`, since a loop configured
+through a read-only open is read-only, then held through a read-only
+descriptor of the same device number opened before the writer closes: the
+pinned kernel lacks `CONFIG_BLK_DEV_WRITE_MOUNTED`, so a mount of a device
+another descriptor holds open for writing fails with EBUSY, which the first
+QEMU run measured. After publication the formatter closes that descriptor
+and requires `/sys/dev/block/7:MINOR/loop` gone within a second before it
+syncs and reports, so no loop outlives a reported success.
+
+`LOOP_CLR_FD` is deliberately absent: the loop clears itself when its last
+opener closes. `LOOP_CTL_REMOVE`, `LOOP_SET_STATUS64`, `LOOP_CHANGE_FD`
+and every other request are absent. A free index is a hint rather than a
+reservation: another process binding or mounting it first makes the
+read-write open or `LOOP_CONFIGURE` fail with EBUSY, and binding is tried
+at most four times, each with a fresh index.
+
+The crate root denies unsafe code and the library root forbids it. The
+`asm!` block leaves out `options(nomem)` because the kernel reads the
+configuration through the pointer. Confinement tests in `main.rs`, over
+every file the binary compiles, pin: the keyword only in the one block and
+the lint only in the crate deny and the one allowance; the allowance on the
+private entry point; that entry point whole, from its attributes to its
+last token, registers included; the syscall number, both request values,
+the configuration length, every field offset and the flag, each declared
+once and named only where counted; both wrappers whole, so the
+configuration is built once from the wrapper's own arguments and nothing
+alters it before the call; each wrapper
+named, as a whole identifier, only at its definition, its one call in
+`loop_device.rs` and its test; and `loop_device.rs` as the only module
+naming the layer, through one plain import. Kernel tests issue both
+requests on a regular file and require ENOTTY. Binding a real loop needs
+privilege, so the QEMU installation fixture is the kernel validation: its
+ordinary legs publish through this path on optical and USB media to virtio
+and NVMe targets at 512-byte and 4Kn sectors and to AHCI at 512-byte,
+including a reinstall over an interrupted publication, and require the loop
+to have cleared afterwards. The full-system diagnostic, whose guest
+already holds a read-only root loop, runs the same fixture route.
+
+Residuals. The claim's: a non-exclusive raw writer, or a privileged process
+opening or detaching the loop device while it is bound, is not excluded.
+A process that rebinds the same minor while the release is polled makes
+it report the loop still bound, failing closed. A kernel booted with
+`loop.max_part` forces partition scanning, which the read-back refuses;
+td sets no such parameter. If
+the kernel ever took the configuration without autoclear, a refusal would
+leave the loop bound, holding the claim's file, until a privileged process
+detached it; the read-back reports that case rather than hiding it. Any
+further syscall, request, configured field or flag, caller, or allowance
+amends this section and `td-install/DESIGN.md`.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 

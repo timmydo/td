@@ -891,7 +891,17 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
         "--trusted-key",
         "/trusted.pub",
     ]);
+    // Publication runs inside format, through a loop over its own claim on
+    // the target. The interrupted leg keeps the mounted route, whose
+    // publisher it can stop on its own.
+    if !interrupt {
+        format_arguments.extend(["--publish", "/bin/td-boot", "/source", "/volume"]);
+    }
+    let loops = bound_loops()?;
     command("/bin/td-install", &format_arguments)?;
+    if bound_loops()? != loops {
+        return Err("format left a loop device bound".into());
+    }
     // The real writer must refuse bad targets before the diagnostic preview.
     preview(name, geometry)?;
     if system_autotest {
@@ -947,15 +957,11 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
     let partition = refresh_partitions(device, &uuid)?;
     inventory(INVENTORY_AFTER_MARKER)?;
     fs::remove_dir_all("/scratch").map_err(|error| format!("remove formatter scratch: {error}"))?;
-    // The volume image contains metadata, trust layout and bounded settings.
-    // Publication now streams from read-only media straight onto the disk.
+    // The volume image contains metadata, trust layout and bounded settings;
+    // publication streamed from read-only media straight onto the disk.
     if interrupt {
         return interrupt_publication(&partition);
     }
-    command(
-        "/bin/td-boot",
-        &["install", &partition, "/volume", "/source", "/trusted.pub"],
-    )?;
     if system_autotest {
         command("/bin/td-boot", &["mount-var", &partition, "/state"])?;
         seed_system_autotest(Path::new("/"), Path::new("/state"))?;
@@ -1065,6 +1071,22 @@ fn observe_partial(child: &mut std::process::Child, expected: u64) -> Result<Pat
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// The loop devices bound now, by name: a bound one has a `loop` directory.
+fn bound_loops() -> Result<Vec<String>, String> {
+    let mut bound = Vec::new();
+    let entries =
+        fs::read_dir("/sys/block").map_err(|error| format!("list /sys/block: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read /sys/block: {error}"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("loop") && entry.path().join("loop").is_dir() {
+            bound.push(name);
+        }
+    }
+    bound.sort();
+    Ok(bound)
 }
 
 fn interrupt_publication(partition: &str) -> Result<(), String> {
