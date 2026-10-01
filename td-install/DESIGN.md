@@ -828,17 +828,18 @@ reinstall over an interrupted publication, and require that no loop device
 is left bound afterwards. Its interrupted-publication leg keeps the mounted
 route, whose publisher it can stop on its own.
 
-A failure after the first write leaves the disk as the raw formatter does:
-a trust-only volume with no selector, or a partial publication whose
-recovery td-boot's transaction owns. Nothing retries. If td-boot leaves the
-loop mounted, the loop and the claim's file stay bound until it is
+A failure after the first write leaves the disk as the raw formatter does: a
+trust-only volume with no selector, or a partial publication whose recovery
+td-boot's transaction owns. The live execution adds one state: a fully
+written installation whose verification failed, with its table withdrawn
+("Executing a consented installation"). Nothing retries. If td-boot leaves
+the loop mounted, the loop and the claim's file stay bound until it is
 unmounted, and the formatter reports the loop still bound rather than
 success. The residual is the claim's: a non-exclusive raw writer, or a
 privileged process that opens or detaches the bound loop, is not excluded.
 The caller still binds stable trusted sources, an absolute td-boot and a
 mountpoint nothing else uses. This is the one-process publication the
-installation service's execution needs; it does not activate that
-execution.
+installation service's execution needs; it does not activate that execution.
 
 ### Payload fit
 
@@ -920,29 +921,50 @@ layout's and the volume's rechecks have passed, immediately before the
 first byte is written, and publishing the deployment as publication
 starts. The account and regional settings are staged into the volume
 image before any write, so no separate settings phase is reported.
+The selector, like the kernel, is hashed through the descriptor its copy
+reads before the first write: its digest is taken from the private copy
+prepared above, which only this execution writes.
+
 Verifying boot follows: td-boot's output must be one deployment id, and
-the plan's.
+the plan's, and the boot artifacts are read back off the disk through the
+claim against what was written: both copies of the table byte for byte,
+and with them the ESP's entry; the ESP's filesystem metadata byte for
+byte, the directories firmware resolves the files by among it; the ESP's
+kernel hashing to the manifest's `bzImage` digest and its initramfs to
+the prepared selector's, each with its last cluster's rest zeroed. Read
+through the claim, this checks what was placed where, not the medium: the
+reads may be served from the kernel's cache, and durability rests on the
+syncs before them. The deployment's payloads on the volume are td-boot's,
+verified by digest as it publishes them. Complete in INSTALLER.md's sense
+follows only this. An installation that fails verifying boot is withdrawn
+from firmware: its table is invalidated again, as the layout does before
+it writes, and the outcome is verification failed.
 
 Every failure is written to standard error and maps to one protocol failure,
 by the stage that met it. A source or layout check, preparing the selector
-from the template and trusted key, td-boot's output and the published id are
-verification failed; the time zone, hostname, account or seed operands are
-settings failed; a disk too small for the layout or a deployment the volume
-cannot hold, or a workspace that cannot be created, is insufficient space;
-staging the volume image in scratch is write failed; and an error this
-process meets as a full filesystem or exceeded quota before the first write
-is insufficient space (mkfs.btrfs reports only its exit status, so its own
-shortage is write failed). After the first write every failure is write
+from the template and trusted key, td-boot's output, the published id and
+the read-back of the boot artifacts are verification failed; the time zone,
+hostname, account or seed operands are settings failed; a disk too small for
+the layout or a deployment the volume cannot hold, or a workspace that
+cannot be created, is insufficient space; staging the volume image in
+scratch is write failed; and an error this process meets as a full
+filesystem or exceeded quota before the first write is insufficient space
+(mkfs.btrfs reports only its exit status, so its own shortage is write
+failed). After the first write every failure until verifying boot is write
 failed, and the disk may be incomplete. The failed status carries no phase,
 so a client cannot tell the two write failures apart and treats either as a
-disk that may be incomplete. The workspace is removed whatever the outcome,
-each part attempted even where another fails, and also on drop, which covers
-a partial creation and an unwinding panic. The shipped binary aborts on
-panic, and a killed process drops nothing, so there the workspace stays in
-`/run` until reboot; a later review draws a fresh nonce and so a fresh name.
-Its mountpoint is removed only if empty, so a volume td-boot left mounted is
-never walked; that, like any other removal failure, is reported and leaves
-the outcome as it was.
+disk that may be incomplete. A verification failure at verifying boot leaves
+a disk fully written but with its table withdrawn, which firmware does not
+boot; if withdrawing it also fails, the error says so, and the disk may keep
+a valid copy of the table, the backup, which firmware may boot from: the
+primary is zeroed first, and no order avoids that. The workspace is removed
+whatever the outcome, each part attempted even where another fails, and also
+on drop, which covers a partial creation and an unwinding panic. The shipped
+binary aborts on panic, and a killed process drops nothing, so there the
+workspace stays in `/run` until reboot; a later review draws a fresh nonce
+and so a fresh name. Its mountpoint is removed only if empty, so a volume
+td-boot left mounted is never walked; that, like any other removal failure,
+is reported and leaves the outcome as it was.
 
 Production constructs this execution, but `run_serve` still opens no
 consent channel, so execute is refused as consent unavailable and nothing

@@ -313,36 +313,44 @@ impl BootInput {
         Ok(())
     }
 
-    /// Require the pinned bytes to hash to `expected`, then rewind for the
-    /// copy, which still checks the length: one descriptor, read twice.
-    fn check_digest(&mut self, expected: &[u8; 32]) -> io::Result<()> {
-        let mut hasher = sha256::Sha256::new();
-        let mut buffer = vec![0; 64 * 1024];
-        let mut remaining = self.len;
-        while remaining > 0 {
-            let want = remaining.min(buffer.len() as u64);
-            let chunk = usize::try_from(want)
-                .ok()
-                .and_then(|want| buffer.get_mut(..want))
-                .ok_or_else(|| invalid("EFI digest buffer".into()))?;
-            self.file.read_exact(chunk).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("hash EFI input {}: {error}", self.path.display()),
-                )
-            })?;
-            hasher.update(chunk);
-            remaining -= want;
-        }
+    /// Require the pinned bytes to hash to `expected`, the digest of `what`,
+    /// then rewind for the copy, which still checks the length: one
+    /// descriptor, read twice.
+    fn check_digest(&mut self, expected: &[u8; 32], what: &str) -> io::Result<()> {
+        let digest = digest_range(&mut self.file, 0, self.len).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("hash EFI input {}: {error}", self.path.display()),
+            )
+        })?;
         self.file.seek(SeekFrom::Start(0))?;
-        if hasher.finalize() != *expected {
+        if digest != *expected {
             return Err(invalid(format!(
-                "EFI kernel {} is not the one the authenticated manifest names",
+                "EFI input {} is not {what}",
                 self.path.display()
             )));
         }
         Ok(())
     }
+}
+
+/// The SHA-256 of `len` bytes of `file` from `offset`.
+fn digest_range(file: &mut File, offset: u64, len: u64) -> io::Result<[u8; 32]> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut hasher = sha256::Sha256::new();
+    let mut buffer = vec![0; 64 * 1024];
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = remaining.min(buffer.len() as u64);
+        let chunk = usize::try_from(want)
+            .ok()
+            .and_then(|want| buffer.get_mut(..want))
+            .ok_or_else(|| invalid("digest buffer".into()))?;
+        file.read_exact(chunk)?;
+        hasher.update(chunk);
+        remaining -= want;
+    }
+    Ok(hasher.finalize())
 }
 
 /// Admit the complete EFI input before creating the selector copy.
@@ -1332,11 +1340,17 @@ impl LiveExecution {
             kernel: workspace.kernel.clone(),
             initramfs: workspace.selector.clone(),
         };
-        let published = format_held(
+        // What the selector copied to the ESP must be, through the descriptor
+        // the copy reads, and read back afterwards: the private copy prepared
+        // above, which nothing else writes.
+        let selector_sha256 = realfile::open_real_file(&workspace.selector, "prepared selector")
+            .and_then(|(mut file, metadata)| digest_range(&mut file, 0, metadata.len()))
+            .map_err(&verification)?;
+        let formatted = format_held(
             prepared,
             &mut destination,
             &boot,
-            Some(&kernel_sha256),
+            Some(&[kernel_sha256, selector_sha256]),
             &mut io::sink(),
             &mut |step| {
                 progress(match step {
@@ -1347,27 +1361,18 @@ impl LiveExecution {
         )
         .map_err(|failure| match failure {
             HeldFailure::Layout(error) => verification(error),
-            // Writing the volume image in scratch: the disk is untouched,
-            // which the absent writing phase tells the client.
+            // Writing the volume image in scratch: the disk is untouched.
             HeldFailure::Staging(error) => before_writing(Failure::WriteFailed)(error),
             HeldFailure::Written(error) => (Failure::WriteFailed, error),
         })?;
         progress(Phase::VerifyingBoot);
-        let id = published.as_deref().and_then(published_id).ok_or_else(|| {
-            (
-                Failure::VerificationFailed,
-                invalid("td-boot printed no deployment id".into()),
-            )
-        })?;
-        if id != deployment {
-            return Err((
-                Failure::VerificationFailed,
-                invalid(format!(
-                    "td-boot published {id}, not deployment {deployment}"
-                )),
-            ));
-        }
-        Ok(())
+        finish_installation(
+            &mut destination.file,
+            &formatted,
+            &deployment,
+            &[kernel_sha256, selector_sha256],
+        )
+        .map_err(|error| (Failure::VerificationFailed, error))
     }
 
     /// The `bzImage` digest the authenticated manifest names, once the
@@ -2401,12 +2406,12 @@ struct PreparedLayout {
     payloads: Vec<(BootInput, u64, u64, u64)>,
 }
 
-/// `kernel_sha256`, when given, is what the kernel's pinned bytes must hash to
-/// before anything is written.
+/// `digests`, when given, are what the kernel's and initramfs's pinned bytes
+/// must hash to before anything is written.
 fn prepare_layout(
     destination: &mut FormatDestination,
     boot: Option<&BootFiles>,
-    kernel_sha256: Option<&[u8; 32]>,
+    digests: Option<&[[u8; 32]; 2]>,
 ) -> io::Result<PreparedLayout> {
     let file = &mut destination.file;
     let disk_bytes = destination_bytes(file)?;
@@ -2422,11 +2427,12 @@ fn prepare_layout(
         )),
         None => None,
     };
-    if let Some(expected) = kernel_sha256 {
-        let (kernel, _) = inputs
+    if let Some([kernel_sha256, initramfs_sha256]) = digests {
+        let (kernel, initramfs) = inputs
             .as_mut()
-            .ok_or_else(|| invalid("a kernel digest without a kernel".into()))?;
-        kernel.check_digest(expected)?;
+            .ok_or_else(|| invalid("boot digests without boot files".into()))?;
+        kernel.check_digest(kernel_sha256, "the kernel the authenticated manifest names")?;
+        initramfs.check_digest(initramfs_sha256, "the selector this execution prepared")?;
     }
     let kernel_path = format!("\\EFI\\BOOT\\{}", protocol::EFI_BOOT_FILE);
     let layout = gpt::Layout {
@@ -2549,6 +2555,43 @@ fn prepare_layout(
 }
 
 impl PreparedLayout {
+    /// Where the kernel and initramfs go on the disk, in that order, as
+    /// `(offset, len, padding)`: the zeroed rest of a file's last cluster
+    /// follows it.
+    fn boot_extents(&self) -> io::Result<[(u64, u64, u64); 2]> {
+        match self.payloads.as_slice() {
+            [(kernel, kernel_at, _, kernel_padding), (initramfs, initramfs_at, _, initramfs_padding)] => {
+                Ok([
+                    (*kernel_at, kernel.len, *kernel_padding),
+                    (*initramfs_at, initramfs.len, *initramfs_padding),
+                ])
+            }
+            _ => Err(invalid("the layout carries no kernel and initramfs".into())),
+        }
+    }
+
+    /// The ESP's filesystem metadata as `write_to` leaves it: the region it
+    /// zeroes, with the FAT's extents written over it, at its disk offset.
+    fn metadata_image(&self) -> io::Result<(u64, Vec<u8>)> {
+        let at = self
+            .plan
+            .esp_offset()
+            .ok_or_else(|| invalid("the ESP offset overflowed".into()))?;
+        let len = usize::try_from(self.metadata)
+            .map_err(|_| invalid("the ESP metadata exceeds this address space".into()))?;
+        let mut image = vec![0u8; len];
+        for extent in &self.esp.extents {
+            let start = usize::try_from(extent.offset)
+                .map_err(|_| invalid("an ESP extent exceeds this address space".into()))?;
+            let slot = start
+                .checked_add(extent.bytes.len())
+                .and_then(|end| image.get_mut(start..end))
+                .ok_or_else(|| invalid("an ESP extent lies past its metadata".into()))?;
+            slot.copy_from_slice(&extent.bytes);
+        }
+        Ok((at, image))
+    }
+
     /// The refusals `write_to` makes before its first write: the destination's
     /// geometry and the EFI inputs' lengths are still those prepared.
     fn check_unchanged(&self, destination: &mut File) -> io::Result<()> {
@@ -3151,23 +3194,46 @@ impl HeldFailure {
     }
 }
 
+/// What a held format wrote, for a caller to read back.
+#[derive(Debug)]
+struct Formatted {
+    /// The volume's `(offset, len)` as the layout placed it.
+    volume: (u64, u64),
+    /// Both copies of the table, as written.
+    table: gpt::Image,
+    /// The ESP's filesystem metadata region, as written, at its offset.
+    metadata: (u64, Vec<u8>),
+    /// The kernel's and initramfs's `(offset, len, padding)` in the ESP.
+    boot: [(u64, u64, u64); 2],
+    /// td-boot's standard output, when the seed published through the loop:
+    /// the caller reads the deployment id out of it.
+    published: Option<Vec<u8>>,
+}
+
 /// Format the destination this process already holds, telling `step` as each
-/// step begins, and return td-boot's standard output when the seed publishes
-/// through the loop: the caller reads the deployment id out of it.
+/// step begins.
 fn format_held(
     prepared: PreparedVolume<'_>,
     destination: &mut FormatDestination,
     boot: &BootFiles,
-    kernel_sha256: Option<&[u8; 32]>,
+    digests: Option<&[[u8; 32]; 2]>,
     out: &mut dyn Write,
     step: &mut dyn FnMut(FormatStep),
-) -> Result<Option<Vec<u8>>, HeldFailure> {
-    let layout =
-        prepare_layout(destination, Some(boot), kernel_sha256).map_err(HeldFailure::Layout)?;
+) -> Result<Formatted, HeldFailure> {
+    let layout = prepare_layout(destination, Some(boot), digests).map_err(HeldFailure::Layout)?;
     let len = layout
         .plan
         .volume_bytes()
         .ok_or_else(|| HeldFailure::Layout(invalid("planned volume length overflowed".into())))?;
+    let volume = layout
+        .plan
+        .volume_start
+        .checked_mul(layout.plan.sector_size)
+        .map(|offset| (offset, len))
+        .ok_or_else(|| HeldFailure::Layout(invalid("planned volume offset overflowed".into())))?;
+    let boot_extents = layout.boot_extents().map_err(HeldFailure::Layout)?;
+    let metadata = layout.metadata_image().map_err(HeldFailure::Layout)?;
+    let table = layout.table.clone();
     let seed = prepared.seed;
     let image = prepare_volume_image(prepared, destination, len).map_err(HeldFailure::Staging)?;
     // Guard layout too; write_to keeps its own check for standalone volume use.
@@ -3189,7 +3255,13 @@ fn format_held(
     }) else {
         return image
             .write_to(destination, out)
-            .map(|()| None)
+            .map(|()| Formatted {
+                volume,
+                table,
+                metadata,
+                boot: boot_extents,
+                published: None,
+            })
             .map_err(HeldFailure::Written);
     };
     // The report waits for publication: a caller reading it has a published
@@ -3201,7 +3273,111 @@ fn format_held(
     step(FormatStep::Publishing);
     let stdout = publish_through_loop(destination, publish, key).map_err(HeldFailure::Written)?;
     out.write_all(&report).map_err(HeldFailure::Written)?;
-    Ok(Some(stdout))
+    Ok(Formatted {
+        volume,
+        table,
+        metadata,
+        boot: boot_extents,
+        published: Some(stdout),
+    })
+}
+
+/// The boot artifacts as the disk holds them once installed (INSTALLER.md
+/// "complete"), against what the layout wrote: both copies of the table
+/// byte for byte, so the ESP's entry with them; the ESP's filesystem
+/// metadata byte for byte, the directories firmware resolves the files by
+/// among it; each file hashing to `digests` and its cluster's rest zeroed.
+/// Read back through the claim, so this checks what was placed where, not
+/// the medium: the reads may be served from the kernel's cache, and
+/// durability rests on the syncs before them.
+fn verify_boot(file: &mut File, formatted: &Formatted, digests: &[[u8; 32]; 2]) -> io::Result<()> {
+    let table = &formatted.table;
+    for (copy, offset, bytes) in [
+        ("primary", table.primary_offset, &table.primary),
+        ("backup", table.backup_offset, &table.backup),
+    ] {
+        if read_at(file, offset, bytes.len() as u64)? != *bytes {
+            return Err(invalid(format!(
+                "the installed {copy} table is not the one written"
+            )));
+        }
+    }
+    if destination_volume(file)? != formatted.volume {
+        return Err(invalid(
+            "the installed table does not place the volume where the layout did".into(),
+        ));
+    }
+    let (at, metadata) = &formatted.metadata;
+    if read_at(file, *at, metadata.len() as u64)? != *metadata {
+        return Err(invalid(
+            "the installed ESP's filesystem metadata is not what was written".into(),
+        ));
+    }
+    for ((name, (offset, len, padding)), digest) in ["kernel", "initramfs"]
+        .into_iter()
+        .zip(formatted.boot)
+        .zip(digests)
+    {
+        let read = |error: io::Error| {
+            io::Error::new(error.kind(), format!("read back the ESP {name}: {error}"))
+        };
+        if digest_range(file, offset, len).map_err(read)? != *digest {
+            return Err(invalid(format!(
+                "the installed ESP {name} is not the one meant for it"
+            )));
+        }
+        let rest = offset
+            .checked_add(len)
+            .ok_or_else(|| invalid(format!("the ESP {name} overflowed")))?;
+        if read_at(file, rest, padding)
+            .map_err(read)?
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(invalid(format!(
+                "the rest of the installed ESP {name}'s last cluster is not zeroed"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Verifying boot (DESIGN.md "Executing a consented installation"): td-boot
+/// published the plan's `deployment`, and the boot artifacts read back as
+/// written. An installation that fails either is withdrawn from firmware by
+/// invalidating its table again, as `write_to` does before it writes: a
+/// table over a disk that cannot be trusted is worse than none.
+fn finish_installation(
+    file: &mut File,
+    formatted: &Formatted,
+    deployment: &str,
+    digests: &[[u8; 32]; 2],
+) -> io::Result<()> {
+    let verified = formatted
+        .published
+        .as_deref()
+        .and_then(published_id)
+        .ok_or_else(|| invalid("td-boot printed no deployment id".into()))
+        .and_then(|id| {
+            if id == deployment {
+                Ok(())
+            } else {
+                Err(invalid(format!(
+                    "td-boot published {id}, not deployment {deployment}"
+                )))
+            }
+        })
+        .and_then(|()| verify_boot(file, formatted, digests));
+    let Err(error) = verified else {
+        return Ok(());
+    };
+    match invalidate_table(file, &formatted.table).and_then(|()| file.sync_all()) {
+        Ok(()) => Err(error),
+        Err(withdrawal) => Err(io::Error::new(
+            error.kind(),
+            format!("{error}; and withdrawing its table failed: {withdrawal}"),
+        )),
+    }
 }
 
 /// Publish onto the volume just written, through a loop over the destination
@@ -8778,6 +8954,179 @@ mod tests {
         assert_eq!(offset, 537919488);
         assert_eq!(output, format!("{offset} {len} 0\n").as_bytes());
         assert_eq!(std::fs::metadata(&disk.path).unwrap().len(), DISK);
+    }
+
+    /// What a format wrote, with the digests of the combined fixture's
+    /// kernel and initramfs.
+    fn formatted_fixture() -> (
+        Scratch,
+        ScratchDirectory,
+        FormatDestination,
+        Formatted,
+        [[u8; 32]; 2],
+    ) {
+        let (disk, dir, boot) = combined_fixture(RECORDING_MKFS);
+        let mkfs = dir.0.join("mkfs.btrfs");
+        let prepared =
+            prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, None).unwrap();
+        let mut destination = FormatDestination::open(&disk.path).unwrap();
+        let digests = [
+            sha256::hex_digest(b"retained kernel"),
+            sha256::hex_digest(b"retained initrd"),
+        ]
+        .map(|hex| digest_bytes(&hex).unwrap());
+        let formatted = format_held(
+            prepared,
+            &mut destination,
+            &boot,
+            Some(&digests),
+            &mut io::sink(),
+            &mut |_| {},
+        )
+        .unwrap();
+        (disk, dir, destination, formatted, digests)
+    }
+
+    /// After an install the boot artifacts are read back off the disk
+    /// against what was written: both tables, the ESP's metadata, and each
+    /// file and its cluster's zeroed rest. A byte of difference anywhere in
+    /// them refuses.
+    #[test]
+    fn installed_boot_artifacts_are_read_back() {
+        let (_disk, _dir, mut destination, formatted, digests) = formatted_fixture();
+        let file = &mut destination.file;
+        assert!(formatted.published.is_none());
+        verify_boot(file, &formatted, &digests).unwrap();
+        let [kernel, initramfs] = digests;
+        assert!(verify_boot(file, &formatted, &[initramfs, kernel]).is_err());
+        let (metadata_at, metadata) = &formatted.metadata;
+        // The first and last bytes of every region the read-back covers, and
+        // the last written metadata byte, in \EFI\BOOT's entries.
+        let entries = metadata.iter().rposition(|byte| *byte != 0).unwrap() as u64;
+        let mut flipped = vec![
+            formatted.table.primary_offset,
+            formatted.table.primary_offset + formatted.table.primary.len() as u64 - 1,
+            formatted.table.backup_offset,
+            formatted.table.backup_offset + formatted.table.backup.len() as u64 - 1,
+            *metadata_at,
+            metadata_at + entries,
+            metadata_at + metadata.len() as u64 - 1,
+        ];
+        for (offset, len, padding) in formatted.boot {
+            assert!(padding > 0, "the fixture's files end mid-cluster");
+            flipped.extend([
+                offset,
+                offset + len - 1,
+                offset + len,
+                offset + len + padding - 1,
+            ]);
+        }
+        for at in flipped {
+            let byte = read_at(file, at, 1).unwrap();
+            write_at(file, at, &[byte[0] ^ 1]).unwrap();
+            assert!(
+                verify_boot(file, &formatted, &digests).is_err(),
+                "byte {at}"
+            );
+            write_at(file, at, &byte).unwrap();
+        }
+        verify_boot(file, &formatted, &digests).unwrap();
+        // A volume the tables do not place where the layout did.
+        let moved = Formatted {
+            volume: (formatted.volume.0 + 512, formatted.volume.1),
+            table: formatted.table.clone(),
+            metadata: formatted.metadata.clone(),
+            boot: formatted.boot,
+            published: None,
+        };
+        assert!(verify_boot(file, &moved, &digests).is_err());
+    }
+
+    /// Verifying boot passes only for the plan's published id and the boot
+    /// artifacts as written; any other outcome leaves the disk without a
+    /// table, so firmware does not try it.
+    #[test]
+    fn an_installation_that_does_not_verify_is_withdrawn() {
+        let id = "ab".repeat(32);
+        let published = |formatted: Formatted, stdout: &[u8]| Formatted {
+            published: Some(stdout.to_vec()),
+            ..formatted
+        };
+        let (_disk, _dir, mut destination, formatted, digests) = formatted_fixture();
+        let formatted = published(formatted, format!("{id}\n").as_bytes());
+        finish_installation(&mut destination.file, &formatted, &id, &digests).unwrap();
+        destination_volume(&mut destination.file).unwrap();
+        // Both copies, since firmware falls back to a valid backup.
+        let withdrawn = |destination: &mut FormatDestination, table: &gpt::Image| {
+            for (offset, len) in [
+                (table.primary_offset, table.primary.len()),
+                (table.backup_offset, table.backup.len()),
+            ] {
+                let bytes = read_at(&mut destination.file, offset, len as u64).unwrap();
+                assert!(bytes.iter().all(|byte| *byte == 0));
+            }
+            assert!(destination_volume(&mut destination.file).is_err());
+        };
+        // Nothing published, another id, or output that is no id.
+        for stdout in [
+            None,
+            Some(format!("{}\n", "cd".repeat(32))),
+            Some(id.clone()),
+        ] {
+            let (_disk, _dir, mut destination, formatted, digests) = formatted_fixture();
+            let formatted = Formatted {
+                published: stdout.map(String::into_bytes),
+                ..formatted
+            };
+            assert!(finish_installation(&mut destination.file, &formatted, &id, &digests).is_err());
+            withdrawn(&mut destination, &formatted.table);
+        }
+        // The plan's id, but a boot artifact that does not read back, or the
+        // digests in the other order.
+        let (_disk, _dir, mut destination, formatted, digests) = formatted_fixture();
+        let formatted = published(formatted, format!("{id}\n").as_bytes());
+        let (kernel_at, _, _) = formatted.boot[0];
+        write_at(&mut destination.file, kernel_at, b"X").unwrap();
+        assert!(finish_installation(&mut destination.file, &formatted, &id, &digests).is_err());
+        withdrawn(&mut destination, &formatted.table);
+        let (_disk, _dir, mut destination, formatted, [kernel, initramfs]) = formatted_fixture();
+        let formatted = published(formatted, format!("{id}\n").as_bytes());
+        assert!(
+            finish_installation(&mut destination.file, &formatted, &id, &[initramfs, kernel])
+                .is_err()
+        );
+        withdrawn(&mut destination, &formatted.table);
+    }
+
+    /// The selector, like the kernel, is checked through the descriptor the
+    /// copy reads before anything is written.
+    #[test]
+    fn either_boot_file_off_its_digest_refuses_before_writing() {
+        let (disk, _dir, boot) = combined_fixture(RECORDING_MKFS);
+        let digests = [
+            sha256::hex_digest(b"retained kernel"),
+            sha256::hex_digest(b"retained initrd"),
+        ]
+        .map(|hex| digest_bytes(&hex).unwrap());
+        let esp = plan(512, DISK).unwrap().esp_offset().unwrap();
+        let snapshot = |disk: &Scratch| {
+            let mut file = File::open(&disk.path).unwrap();
+            let mut regions = volume_write_snapshot(disk);
+            regions.push(read_at(&mut file, 0, MIB).unwrap());
+            regions.push(read_at(&mut file, esp, MIB).unwrap());
+            regions
+        };
+        let before = snapshot(&disk);
+        let mut destination = FormatDestination::open(&disk.path).unwrap();
+        prepare_layout(&mut destination, Some(&boot), Some(&digests)).unwrap();
+        let [kernel, initramfs] = digests;
+        for wrong in [[initramfs, initramfs], [kernel, kernel]] {
+            let error = prepare_layout(&mut destination, Some(&boot), Some(&wrong))
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("is not the"), "{error}");
+        }
+        assert!(snapshot(&disk) == before);
     }
 
     #[test]
