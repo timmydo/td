@@ -1734,6 +1734,30 @@ fn a_source_offers_both_text_mimes_sends_over_its_right_and_retires() {
 }
 
 #[test]
+fn withdrawing_destroys_the_live_source_once_without_a_serial() {
+    let (mut p, peer, _, _, _, _) = clipboard_fixture();
+    assert!(!p.client.withdraw_selection().unwrap(), "nothing offered");
+    assert!(drain(&peer).0.is_empty());
+    let source = p.client.offer_selection(1234).unwrap();
+    drain(&peer);
+    assert!(p.client.withdraw_selection().unwrap());
+    assert_eq!(drain(&peer).0, [message(source, 1, &[])]);
+    assert!(p.client.source().is_none());
+    assert_eq!(
+        p.client.kind(source).unwrap(),
+        Kind::RetiredDataSource(Board::Clipboard)
+    );
+    // A send for the retired source drops its right.
+    let (mut reader, writer) = endpoint();
+    send_right(&mut p, &peer, source, UTF8, &writer);
+    drop(writer);
+    assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+    assert!(p.clipboard.is_empty());
+    assert!(!p.client.withdraw_selection().unwrap(), "already withdrawn");
+    assert!(drain(&peer).0.is_empty());
+}
+
+#[test]
 fn receive_names_the_selections_preferred_spelling_over_the_consumers_endpoint() {
     let (mut p, peer, _, _, _, device) = clipboard_fixture();
     assert!(p.client.receive(&endpoint().1).is_err(), "no selection");

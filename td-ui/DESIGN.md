@@ -449,7 +449,8 @@ of its own files may name each module.
   (`clipboard` for a live data device, `selection` and `selection_mime` for
   the seat's selection and its preferred text type, `receive` to ask it for
   its text over a consumer's endpoint, `offer_selection` to offer text at a
-  serial, and `source` for the live source whose text the consumer keeps;
+  serial, `withdraw_selection` to destroy the live source without one, and
+  `source` for the live source whose text the consumer keeps;
   `want_primary` before the initial roundtrip asks for the primary
   selection too, read through `primary`, `primary_mime`,
   `receive_primary`, `offer_primary` and `primary_source`),
@@ -526,10 +527,11 @@ of its own files may name each module.
   reaches with each input, `WindowClipboard<'w>`, the window's, and
   `NoClipboard`, which refuses everything, for a test or a headless run;
   the `Handler` trait (`app_id`, `title`, `input` with a clipboard,
-  `poll`, `wait_ms`, `needs_redraw`, `paint`, `notice`); `Object`, the
-  empty tag; `Window<'h, H>` (`new`, `with_typeface`, `handler`,
-  `handler_mut`, `surface`), the `App` over a handler it borrows; and
-  `run` with an optional `Typeface`, under "Widget window" below.
+  `poll`, `wait_ms`, `needs_redraw`, `paint`, `notice`,
+  `take_withdrawal`); `Object`, the empty tag; `Window<'h, H>` (`new`,
+  `with_typeface`, `handler`, `handler_mut`, `surface`), the `App` over a
+  handler it borrows; and `run` with an optional `Typeface`, under
+  "Widget window" below.
 - `vt`: `Terminal`, the terminal model with its byte-stream parser (`new`
   at a grid, `feed`, `resize`, the `cell`, `row_text`, `cursor` and `mode`
   reads, `take_replies` one reply at a time and `replies`, `ring` and
@@ -1130,16 +1132,17 @@ not frames, and stays its own).
   survives it; retirements while one is outstanding coalesce behind the
   next. `offer_selection` creates a source advertising `UTF8` then `PLAIN`
   and sets the selection at the consumer's serial, destroying the previous
-  source; a send on the live source for either MIME, in any ASCII case, pops
-  its right and hands it on as `Send`, any other send (a retired source's,
-  another MIME's) pops and drops exactly its right, and the compositor's
-  cancel destroys the live source and is `Cancelled`. Removal of the
-  manager's global releases the source and device and is `Released`; seat
-  removal retires the offers with the keyboard, then releases the pointer,
-  the source and the device, then the seat; the manager has no destructor
-  and stays inert, and a retired device's events are schema-checked and
-  drained until `delete_id`. Every event schema is checked whole before a
-  right is waited for or consumed.
+  source; `withdraw_selection` destroys the live source, if any, and sends
+  nothing else; a send on the live source for either MIME, in any ASCII
+  case, pops its right and hands it on as `Send`, any other send (a
+  retired source's, another MIME's) pops and drops exactly its right, and
+  the compositor's cancel destroys the live source and is `Cancelled`.
+  Removal of the manager's global releases the source and device and
+  is `Released`; seat removal retires the offers with the keyboard,
+  then releases the pointer, the source and the device, then the seat;
+  the manager has no destructor and stays inert, and a retired device's
+  events are schema-checked and drained until `delete_id`. Every event
+  schema is checked whole before a right is waited for or consumed.
 - The primary selection: only for a consumer that called `want_primary`
   before the initial roundtrip, one seat-bound
   `zwp_primary_selection_device_manager_v1` device at v1, bound after the
@@ -1407,22 +1410,22 @@ v3 or not at all; offers budgeted, selected and retired behind one barrier
 by generation; focus loss, drags and a retired device retiring offers and
 the selection; a source offering both text MIMEs, its sends handed on or
 dropped with their rights, a malformed send leaving the FIFO alone, and its
-retirement on cancel or replacement; manager and seat removal releasing the
-source and device in order; the primary selection bound only when asked for,
-after the clipboard, and its offers, selection, receive, source, send, cancel
-and release on its own opcodes, focus loss retiring it and its removal
-leaving the clipboard alone, an offer id reused across the boards owned by
-the newer, and seat removal releasing it after the clipboard; the complete
-loop on a thread accepting split events and closing cleanly; and the loop
-parking an event until its right arrives, in wire order, with the idle wait
-restored. Sixteen of these moved from td-editor's window tests (the
-presentation nine, the pointer image, the seat binding, the keymap reader's
-shared-offset and bad-source oracle, the last a unit test beside
-`read_keymap`, and the clipboard lifecycle four: offer retirement and reuse,
-coalesced barriers, drag offers with the malformed-send FIFO oracle, and
-offer budgets with a retired device); the editor keeps its transfer, request
-and control coverage and its reactions to the client's device and clipboard
-outcomes.
+retirement on cancel, replacement or withdrawal, the last once and without a
+serial; manager and seat removal releasing the source and device in order;
+the primary selection bound only when asked for, after the clipboard, and
+its offers, selection, receive, source, send, cancel and release on its own
+opcodes, focus loss retiring it and its removal leaving the clipboard alone,
+an offer id reused across the boards owned by the newer, and seat removal
+releasing it after the clipboard; the complete loop on a thread accepting
+split events and closing cleanly; and the loop parking an event until
+its right arrives, in wire order, with the idle wait restored. Sixteen
+of these moved from td-editor's window tests (the presentation nine,
+the pointer image, the seat binding, the keymap reader's shared-offset
+and bad-source oracle, the last a unit test beside `read_keymap`, and the
+clipboard lifecycle four: offer retirement and reuse, coalesced barriers,
+drag offers with the malformed-send FIFO oracle, and offer budgets with a
+retired device); the editor keeps its transfer, request and control coverage
+and its reactions to the client's device and clipboard outcomes.
 
 The terminal's suites are its specification files and in-file tests,
 listed by obligation in `td-term/DESIGN.md` §6. `vt_spec.rs`, compiled
@@ -1624,24 +1627,27 @@ and the seat's removal, or the pointer capability's loss, ends a held
 button without a release and drops the wheel's accumulation. A press
 whose key repeats arms the client's repeat clock, and a turn that
 drained the queue with no event parked delivers the repeat that is due
-as a `Key` marked `repeat`, at most one a turn. Every turn ends with
-`poll` at the loop's clock, milliseconds since the loop began, and the
-connection then waits for the lesser of the client's wait (a hundred
-milliseconds, or the armed repeat's remainder) and the handler's
-`wait_ms`, floored at one millisecond; a closed window neither repeats
-nor polls. A handler that answers `Flow::Quit` hears nothing more: the
-window is closed, and the inputs that would have followed, a resize
-after the cancel it quit on or the focus loss after a seat's removal,
-are not delivered. The surface is presented when the handler says it
-needs a redraw or the window's own state changed, once a frame can be
-presented, into a raster over the pool file at the surface's own stride;
-the handler paints only into a buffer, so a frame refused by the client
-(every buffer busy) asks for no paint and leaves the window dirty until
-one is back. A paint that fails ends the loop with its error, as a
-program that cannot paint its surface has nothing to show; the refusals
-the loop absorbs are the extent's and the frame's. The title is read
-before every attempted present, which is when the window is dirty and a
-frame can be presented, and sent then when it changed, ahead of the
+as a `Key` marked `repeat`, at most one a turn. Every turn's end first
+polls the handler at the loop's clock, milliseconds since the loop
+began, and asks for a withdrawal; then it steps the clipboard transfers,
+which may deliver a paste, and delivers a due repeat. A paste or repeat
+delivered there reaches the handler's next poll a turn later, up to its
+`wait_ms` later. The connection then waits for the lesser of the
+client's wait (a hundred milliseconds, or the armed repeat's remainder)
+and the handler's `wait_ms`, floored at one millisecond; a closed window
+neither repeats nor polls. A handler that answers `Flow::Quit` hears
+nothing more: the window is closed, and the inputs that would have
+followed, a resize after the cancel it quit on or the focus loss after
+a seat's removal, are not delivered. The surface is presented when the
+handler says it needs a redraw or the window's own state changed, once a
+frame can be presented, into a raster over the pool file at the surface's
+own stride; the handler paints only into a buffer, so a frame refused by
+the client (every buffer busy) asks for no paint and leaves the window
+dirty until one is back. A paint that fails ends the loop with its
+error, as a program that cannot paint its surface has nothing to show;
+the refusals the loop absorbs are the extent's and the frame's. The title
+is read before every attempted present, which is when the window is dirty
+and a frame can be presented, and sent then when it changed, ahead of the
 frame's commit when a frame follows and alone when none can; a retitle
 made while painting rides the next attempt.
 
@@ -1657,29 +1663,44 @@ the live source: each `wl_data_source.send` the client hands on begins
 an `Outgoing` over its right, a send arriving while one is pending
 drops exactly its right, the source's cancellation drops the text (a
 send already begun keeps its own), and the device's release with its
-seat or its manager cancels the send and drops the text. `paste` asks
-the selection for its text over a fresh private endpoint when the
-device is live, the window focused, the selection offers text and no
-paste is pending; the text arrives whole as `Input::Paste`, delivered
-from the end of an idle turn, one whose queue was drained, so a focus
-loss, a selection change or a close request still queued behind it is
-seen first. A paste in flight is dropped, with a notice, when the
-selection changes, when focus is lost, when the device goes, when a
-copy replaces the selection, or when the compositor asks the window to
-close (a handler that keeps the window asks again). Both transfers are
-stepped at the end of every idle turn under their own bounds, and at any
-turn once expired, the loop's wait capped at ten milliseconds while one
-is pending; a transfer that fails or expires is a notice, never a
-partial text. A request the connection refuses (the source's requests,
-the receive) is refused to the handler as no device and ends the loop
-with the connection's error once the input is handled, as the editor's
-window ends on it; a paste's private endpoint the process cannot make
-is a refusal with a notice, and the window goes on, as the editor's
-does. The tests pin the copy's requests and its text crossing the
-send's right, the paste's request and its text arriving as an input,
+seat or its manager cancels the send and drops the text. A handler takes
+its copy back through `Handler::take_withdrawal`, an edge asked after
+every input and after every poll. Each turn polls the handler, and asks,
+before it steps a transfer, so a lock decided by a timer withdraws a
+copy before that turn writes any of it; a quit in the same poll
+withdraws before the window closes, and a closed window is not asked.
+On a request the window cancels a send in flight, drops the text and
+destroys the live source, which clears the selection while it still
+names that source. Destroying needs no serial, so a poll can withdraw.
+Bytes a send already wrote cannot be recalled; a paste in flight is
+untouched, and the compositor's later sends to the retired source drop
+their rights. `paste` asks the selection for its text over a fresh
+private endpoint when the device is live, the window focused, the
+selection offers text and no paste is pending; the text arrives whole as
+`Input::Paste`, delivered from the end of an idle turn, one whose queue
+was drained, so a focus loss, a selection change or a close request
+still queued behind it is seen first. A paste in flight is dropped, with
+a notice, when the selection changes, when focus is lost, when the device
+goes, when a copy replaces the selection, or when the compositor asks
+the window to close (a handler that keeps the window asks again). Both
+transfers are stepped at the end of every idle turn under their own
+bounds, and at any turn once expired, the loop's wait capped at ten
+milliseconds while one is pending; a transfer that fails or expires is
+a notice, never a partial text. A request the connection refuses (the
+source's requests, the receive) is refused to the handler as no device
+and ends the loop with the connection's error once the input is handled,
+as the editor's window ends on it; a paste's private endpoint the process
+cannot make is a refusal with a notice, and the window goes on, as the
+editor's does. The tests pin the copy's requests and its text crossing
+the send's right, the paste's request and its text arriving as an input,
 each refusal but the endpoint's (which needs the process's descriptors
 exhausted), the idle-turn admission, the cancellations, the seat's
-removal, and the refused request ending the loop.
+removal, and the refused request ending the loop. Withdrawal tests cancel
+a send short of its text from a poll and destroy the source, leaving
+the window no copy of the text; destroy it at once from the input that
+copied; write none of a short secret whose send is pending when an idle
+turn's poll locks; withdraw before closing when that poll also quits;
+send nothing with nothing offered; and do not ask a closed window.
 
 ## Shared action button
 

@@ -314,6 +314,17 @@ pub trait Handler {
     /// the raster refused, a clipboard transfer that failed or was
     /// cancelled.
     fn notice(&mut self, _message: &str) {}
+    /// Takes a request to withdraw the text the handler copied, asked
+    /// after every input and after every poll before that turn steps a
+    /// send, so a lock or a timer can take a secret back. An edge, not a
+    /// state: answer true once per request, as by taking a flag, since
+    /// true while locked would withdraw every later copy too. The window
+    /// cancels a send in flight, drops the text it kept and destroys its
+    /// source, which clears the selection if it still names it. Bytes a
+    /// send already wrote are the requester's; a paste is not touched.
+    fn take_withdrawal(&mut self) -> bool {
+        false
+    }
 }
 
 /// The window owns no Wayland objects of its own.
@@ -420,6 +431,7 @@ impl<'h, H: Handler> Window<'h, H> {
         if let Some(error) = self.board.error.take() {
             return Err(error);
         }
+        self.withdraw()?;
         if flow == Flow::Quit {
             self.client.close();
         }
@@ -624,7 +636,7 @@ impl<'h, H: Handler> Window<'h, H> {
                     return;
                 }
                 // The live source and the text are set together by `copy`
-                // and cleared together on cancel and release.
+                // and cleared together on cancel, release and withdrawal.
                 let Some(text) = self.board.text.clone() else {
                     self.handler
                         .notice("clipboard send: no text behind the source");
@@ -639,6 +651,24 @@ impl<'h, H: Handler> Window<'h, H> {
             ClipboardEvent::Cancelled => self.board.text = None,
             ClipboardEvent::Released => self.release_clipboard(),
         }
+    }
+
+    /// Takes back what the handler copied when it asks: the send in
+    /// flight, the text kept for later sends, and the live source. A
+    /// closed window is not asked; its source goes with its connection.
+    /// A connection that refuses the destroy ends the loop.
+    fn withdraw(&mut self) -> Result<()> {
+        if self.client.closed() || !self.handler.take_withdrawal() {
+            return Ok(());
+        }
+        if let Some(transfer) = self.board.outgoing.take() {
+            if let Err(e) = transfer.cancel() {
+                self.handler
+                    .notice(&format!("clipboard send cancellation failed: {e}"));
+            }
+        }
+        self.board.text = None;
+        self.client.withdraw_selection().map(drop)
     }
 
     /// The data device went with its seat or its manager: the transfers
@@ -785,6 +815,15 @@ impl<H: Handler> App for Window<'_, H> {
 
     fn end_turn(&mut self, now: u64, idle: bool) -> Result<()> {
         self.clock = now;
+        // Polled first, so a lock its timers decide withdraws a copy
+        // before this turn steps a send of it.
+        if !self.client.closed() {
+            let flow = self.handler.poll(now);
+            self.withdraw()?;
+            if flow == Flow::Quit {
+                self.client.close();
+            }
+        }
         self.transfers(now, idle)?;
         if idle && !self.client.closed() {
             if let Some(stroke) = self.client.repeat(now)? {
@@ -793,9 +832,6 @@ impl<H: Handler> App for Window<'_, H> {
                     repeat: true,
                 })?;
             }
-        }
-        if !self.client.closed() && self.handler.poll(now) == Flow::Quit {
-            self.client.close();
         }
         let mut wait = self.client.wait_ms(now).min(self.handler.wait_ms(now));
         if self.board.incoming.is_some() || self.board.outgoing.is_some() {

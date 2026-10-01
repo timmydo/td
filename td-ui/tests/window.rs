@@ -94,6 +94,8 @@ struct Recorder {
     paste_on: Option<String>,
     outcomes: Vec<Result<(), Refusal>>,
     states: Vec<(bool, bool, bool)>,
+    /// Asks the window to withdraw what it copied, answered once.
+    withdraw: bool,
 }
 
 impl Recorder {
@@ -113,6 +115,7 @@ impl Recorder {
             paste_on: None,
             outcomes: Vec::new(),
             states: Vec::new(),
+            withdraw: false,
         }
     }
     fn paints(&self) -> usize {
@@ -233,6 +236,9 @@ impl Handler for Recorder {
     }
     fn notice(&mut self, message: &str) {
         self.notices.push(message.to_string());
+    }
+    fn take_withdrawal(&mut self) -> bool {
+        std::mem::take(&mut self.withdraw)
     }
 }
 
@@ -1273,6 +1279,89 @@ fn a_release_and_an_unfocused_window_have_no_clipboard_authority() {
     );
     assert_eq!(w.handler().outcomes.last(), Some(&Err(Refusal::NoSerial)));
     assert!(drain(&peer).0.is_empty());
+}
+
+#[test]
+fn a_withdrawal_after_a_poll_or_an_input_takes_back_the_copy() {
+    let secret: Arc<str> = Arc::from("x".repeat(MAX_BYTES));
+    let mut handler = Recorder::new();
+    handler.copy_on = Some(("a".into(), secret.clone()));
+    let (mut w, peer, keyboard, _, _) = clipboard_fixture(&mut handler);
+    w.tick(100).unwrap();
+    focus_with_map(&mut w, &peer, keyboard);
+    drain(&peer);
+    // Nothing offered: a withdrawal destroys nothing.
+    w.handler_mut().withdraw = true;
+    w.end_turn(110, true).unwrap();
+    assert!(drain(&peer).0.is_empty());
+    press(&mut w, keyboard, 12, 30);
+    release(&mut w, keyboard, 13, 30);
+    let (requests, _) = drain(&peer);
+    let source = Cursor::new(&requests[0].payload).u32().unwrap();
+    // A send begun but not finished, its text far past one step.
+    let (mut pending, writer) = endpoint();
+    send_right(&mut w, &peer, source, UTF8, &writer);
+    drop(writer);
+    w.end_turn(150, true).unwrap();
+    // Ours, the recorder's, the window's kept text and the send's.
+    assert_eq!(Arc::strong_count(&secret), 4);
+    // A poll's withdrawal cancels the send short of the text and
+    // destroys the source, with no serial; the window keeps no copy of
+    // the text, and the retired source drops a later send's right.
+    w.handler_mut().withdraw = true;
+    w.end_turn(160, false).unwrap();
+    assert_eq!(drain(&peer).0, [message(source, 1, &[])]);
+    assert_eq!(Arc::strong_count(&secret), 2);
+    let mut prefix = Vec::new();
+    pending.read_to_end(&mut prefix).unwrap();
+    assert!(prefix.len() < MAX_BYTES, "cancelled short of the text");
+    let (mut other, writer) = endpoint();
+    send_right(&mut w, &peer, source, UTF8, &writer);
+    drop(writer);
+    assert_eq!(other.read(&mut [0]).unwrap(), 0, "retired: dropped");
+    w.end_turn(170, true).unwrap();
+    assert_eq!(w.client().connection().wait(), IDLE_WAIT, "nothing pending");
+    // Asked during the input that copied, the window withdraws as soon
+    // as the input is handled.
+    w.handler_mut().copy_on = Some(("a".into(), Arc::from("short")));
+    w.handler_mut().withdraw = true;
+    press(&mut w, keyboard, 14, 30);
+    let (requests, _) = drain(&peer);
+    let second = Cursor::new(&requests[0].payload).u32().unwrap();
+    assert_eq!(requests.last(), Some(&message(second, 1, &[])));
+    assert!(w.client().source().is_none());
+    release(&mut w, keyboard, 15, 30);
+    // A short secret whose send is pending when an idle turn's poll
+    // locks: withdrawn before that turn steps the send, so none of it
+    // is written.
+    w.handler_mut().copy_on = Some(("a".into(), Arc::from("hunter2")));
+    press(&mut w, keyboard, 16, 30);
+    release(&mut w, keyboard, 17, 30);
+    let (requests, _) = drain(&peer);
+    let third = Cursor::new(&requests[0].payload).u32().unwrap();
+    let (mut short, writer) = endpoint();
+    send_right(&mut w, &peer, third, UTF8, &writer);
+    drop(writer);
+    w.handler_mut().withdraw = true;
+    w.end_turn(200, true).unwrap();
+    let mut written = Vec::new();
+    short.read_to_end(&mut written).unwrap();
+    assert!(written.is_empty(), "{written:?}");
+    assert_eq!(drain(&peer).0, [message(third, 1, &[])]);
+    // Locking and quitting in one poll still withdraws before closing.
+    press(&mut w, keyboard, 18, 30);
+    let (requests, _) = drain(&peer);
+    let fourth = Cursor::new(&requests[0].payload).u32().unwrap();
+    w.handler_mut().withdraw = true;
+    w.handler_mut().quit_at_poll = Some(0);
+    w.end_turn(300, true).unwrap();
+    assert!(w.client().closed());
+    assert_eq!(drain(&peer).0, [message(fourth, 1, &[])]);
+    // A closed window is not asked.
+    w.handler_mut().withdraw = true;
+    w.end_turn(310, true).unwrap();
+    assert!(w.handler().withdraw);
+    assert!(w.handler().notices.is_empty(), "{:?}", w.handler().notices);
 }
 
 #[test]

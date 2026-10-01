@@ -814,6 +814,18 @@ impl<T: Tag> Client<T> {
         Ok(source)
     }
 
+    /// Destroys the clipboard's live source, whose destruction clears the
+    /// seat's selection if it still names it; unlike setting one, this
+    /// needs no serial, so a timer may withdraw. Whether there was a live
+    /// source. The primary selection has none: the widget window never
+    /// offers it.
+    pub fn withdraw_selection(&mut self) -> Result<bool> {
+        match self.data.as_mut().and_then(|d| d.source.take()) {
+            Some(source) => self.destroy_source(Board::Clipboard, source).map(|()| true),
+            None => Ok(false),
+        }
+    }
+
     /// Destroys a source; its id waits for `delete_id`.
     fn destroy_source(&mut self, board: Board, id: u32) -> Result<()> {
         self.connection.words(id, board.destroy_source(), &[])?;
