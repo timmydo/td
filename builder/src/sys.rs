@@ -44,9 +44,7 @@ const SYS_WRITE: usize = 1;
 const SYS_PRCTL: usize = 157;
 const SYS_GETPPID: usize = 110;
 const SYS_SETPRIORITY: usize = 141;
-const SYS_GETPRIORITY: usize = 140;
 const SYS_PRLIMIT64: usize = 302;
-const SYS_MMAP: usize = 9;
 const SYS_RENAMEAT2: usize = 316;
 
 const AT_FDCWD: isize = -100;
@@ -61,15 +59,6 @@ const PRIO_PROCESS: usize = 0;
 /// address-space reservations Go/Rust make (so it false-trips far less than
 /// RLIMIT_AS would). Scope of the resource arg to prlimit64(2).
 pub const RLIMIT_DATA: usize = 2;
-
-/// prlimit64 sentinel for "leave this limit unchanged" — RLIM64_INFINITY is
-/// only used as a comparison value here; a cap is always finite.
-pub const RLIM_INFINITY: u64 = u64::MAX;
-
-/// mmap(2) prot/flags for a private anonymous read/write mapping — what the
-/// rlimit behavioral test allocates to prove the cap is load-bearing.
-const PROT_READ_WRITE: usize = 0x1 | 0x2;
-const MAP_PRIVATE_ANON: usize = 0x2 | 0x20;
 
 const PR_SET_PDEATHSIG: usize = 1;
 /// SIGKILL — the parent-death signal the host-sandbox arms (uncatchable, so a
@@ -120,36 +109,6 @@ unsafe fn syscall5(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usi
         in("rdx") a3,
         in("r10") a4,
         in("r8") a5,
-        out("rcx") _,
-        out("r11") _,
-        options(nostack)
-    );
-    ret
-}
-
-/// Six-argument variant (adds the 6th arg in r9) — needed by mmap(2), whose
-/// last arg is the file offset. x86_64 `sys_mmap` rejects a non-page-aligned
-/// offset with EINVAL even for an anonymous mapping, so the offset register
-/// must be set explicitly (syscall5 would leave r9 holding garbage).
-unsafe fn syscall6(
-    n: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-    a5: usize,
-    a6: usize,
-) -> isize {
-    let ret: isize;
-    core::arch::asm!(
-        "syscall",
-        inlateout("rax") n as isize => ret,
-        in("rdi") a1,
-        in("rsi") a2,
-        in("rdx") a3,
-        in("r10") a4,
-        in("r8") a5,
-        in("r9") a6,
         out("rcx") _,
         out("r11") _,
         options(nostack)
@@ -936,18 +895,6 @@ pub fn set_self_priority(prio: i32) -> io::Result<()> {
     })
 }
 
-/// getpriority(2) for the calling process, as the nice value (-20..=19). The raw
-/// syscall returns `20 - nice` to keep the success range non-negative (a real
-/// error is the usual `-errno`); we undo that bias.
-pub fn get_self_priority() -> io::Result<i32> {
-    let ret = unsafe { syscall5(SYS_GETPRIORITY, PRIO_PROCESS, 0, 0, 0, 0) };
-    if ret < 0 {
-        Err(io::Error::from_raw_os_error(-ret as i32))
-    } else {
-        Ok(20 - ret as i32)
-    }
-}
-
 /// prlimit64(2) on the calling process (`pid=0`) for `resource`, reading the
 /// current (soft, hard) pair. Always available (the modern resource-limit
 /// syscall), so no setrlimit/getrlimit split.
@@ -969,28 +916,6 @@ pub fn set_rlimit(resource: usize, soft: u64, hard: u64) -> io::Result<()> {
     check(unsafe { syscall5(SYS_PRLIMIT64, 0, resource, new.as_ptr() as usize, 0, 0) })
 }
 
-/// mmap(2) a private anonymous read/write region of `len` bytes. Returns the
-/// raw syscall result: a valid address (≥ 0 as isize) on success, or `-errno`
-/// (e.g. `-ENOMEM` when an rlimit blocks the mapping) on failure. Offset is
-/// passed as 0 (x86_64 `sys_mmap` EINVALs a non-page-aligned offset even for an
-/// anonymous mapping, so it cannot be left as register garbage — syscall6).
-/// Async-signal-safe (no allocator), which is why the rlimit behavioral test
-/// probes the cap with this rather than a heap allocation in a forked child.
-pub fn mmap_anon(len: usize) -> isize {
-    // fd = -1 (usize::MAX) for an anonymous mapping; offset 0.
-    unsafe {
-        syscall6(
-            SYS_MMAP,
-            0,
-            len,
-            PROT_READ_WRITE,
-            MAP_PRIVATE_ANON,
-            usize::MAX,
-            0,
-        )
-    }
-}
-
 pub fn exit_group(code: i32) -> ! {
     unsafe {
         syscall5(SYS_EXIT_GROUP, code as usize, 0, 0, 0, 0);
@@ -1001,6 +926,83 @@ pub fn exit_group(code: i32) -> ! {
 
 #[cfg(test)]
 mod tests {
+    // Probes only the tests issue: the shipped builder neither reads its own
+    // priority nor maps memory, so these stay out of its syscall surface.
+    const SYS_GETPRIORITY: usize = 140;
+    const SYS_MMAP: usize = 9;
+
+    /// prlimit64's RLIM64_INFINITY, as a comparison value only.
+    const RLIM_INFINITY: u64 = u64::MAX;
+
+    /// mmap(2) prot/flags for a private anonymous read/write mapping — what the
+    /// rlimit behavioral test allocates to prove the cap is load-bearing.
+    const PROT_READ_WRITE: usize = 0x1 | 0x2;
+    const MAP_PRIVATE_ANON: usize = 0x2 | 0x20;
+
+    /// Six-argument variant (adds the 6th arg in r9) — needed by mmap(2), whose
+    /// last arg is the file offset. x86_64 `sys_mmap` rejects a non-page-aligned
+    /// offset with EINVAL even for an anonymous mapping, so the offset register
+    /// must be set explicitly (syscall5 would leave r9 holding garbage).
+    unsafe fn syscall6(
+        n: usize,
+        a1: usize,
+        a2: usize,
+        a3: usize,
+        a4: usize,
+        a5: usize,
+        a6: usize,
+    ) -> isize {
+        let ret: isize;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") n as isize => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("r10") a4,
+            in("r8") a5,
+            in("r9") a6,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack)
+        );
+        ret
+    }
+
+    /// getpriority(2) for the calling process, as the nice value (-20..=19). The raw
+    /// syscall returns `20 - nice` to keep the success range non-negative (a real
+    /// error is the usual `-errno`); we undo that bias.
+    fn get_self_priority() -> io::Result<i32> {
+        let ret = unsafe { syscall5(SYS_GETPRIORITY, PRIO_PROCESS, 0, 0, 0, 0) };
+        if ret < 0 {
+            Err(io::Error::from_raw_os_error(-ret as i32))
+        } else {
+            Ok(20 - ret as i32)
+        }
+    }
+
+    /// mmap(2) a private anonymous read/write region of `len` bytes. Returns the
+    /// raw syscall result: a valid address (≥ 0 as isize) on success, or `-errno`
+    /// (e.g. `-ENOMEM` when an rlimit blocks the mapping) on failure. Offset is
+    /// passed as 0 (x86_64 `sys_mmap` EINVALs a non-page-aligned offset even for an
+    /// anonymous mapping, so it cannot be left as register garbage — syscall6).
+    /// Async-signal-safe (no allocator), which is why the rlimit behavioral test
+    /// probes the cap with this rather than a heap allocation in a forked child.
+    fn mmap_anon(len: usize) -> isize {
+        // fd = -1 (usize::MAX) for an anonymous mapping; offset 0.
+        unsafe {
+            syscall6(
+                SYS_MMAP,
+                0,
+                len,
+                PROT_READ_WRITE,
+                MAP_PRIVATE_ANON,
+                usize::MAX,
+                0,
+            )
+        }
+    }
+
     #[test]
     fn descriptor_exec_boundary_is_value_pinned() {
         assert_eq!(super::SYS_CLOSE_RANGE, 436);

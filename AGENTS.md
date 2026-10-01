@@ -310,6 +310,11 @@ message.
   indices. Inline `#[cfg(test)]` code may opt out locally. Existing
   grandfathered production allowances are migration debt: do not widen them
   or use them as precedent.
+- Code must build without rustc's `unused` warnings (dead code, unused
+  imports, variables, `#[must_use]` results). The clippy legs deny them
+  (`-D unused`; `-D warnings` for the crypto crates) in shipped targets, and
+  in test targets of crates declaring `clippy-all-targets`. Keep a
+  test-only helper inside its `#[cfg(test)]` module.
 - `unsafe` is confined to the syscall surfaces and the separately recorded
   test-only allocation instrumentation in `UNSAFE.md`. A new
   surface, syscall, value-pinned request, or scoped allow requires an amendment

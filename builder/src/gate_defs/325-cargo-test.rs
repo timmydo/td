@@ -22,7 +22,12 @@
 //! td-compositor's own confinement tests
 //! additionally pin their scoped-allow counts and syscall rosters, and td-login's the
 //! ORDER its three credential syscalls are issued in, none of which the compiler
-//! checks).
+//! checks). Every clippy leg also passes `-D unused` (the crypto legs
+//! `-D warnings`), so dead code, unused imports and the rest of rustc's
+//! `unused` group red here though a plain build only warns; clippy's own
+//! warn-level lints stay warnings. It reaches test code only in the crypto
+//! crates and the crates declaring `clippy-all-targets`; the workspace's and
+//! the other roster crates' test targets are held to it only by review.
 //! Existing code is grandfathered (per-file `#![allow]` in modules; per-item `#[allow]` on the
 //! crate root's own fns/impls — a crate-root inner `#![allow]` is crate-GLOBAL and
 //! would silently exempt everything), so a denied lint reds ONLY on NEW code. Also

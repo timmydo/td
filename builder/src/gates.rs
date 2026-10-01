@@ -2409,7 +2409,7 @@ mod tests {
                     for (at, _) in line.match_indices(tok) {
                         let rest = line.get(at + tok.len()..).unwrap_or("");
                         let cmd = rest.split_once(';').map_or(rest, |(c, _)| c);
-                        resolvers.insert(stem.clone());
+                        resolvers.insert(stem);
                         assert!(
                             cmd.contains("|| exit $?"),
                             "src/gate_defs/{stem}.rs resolves td-recipe-eval without \

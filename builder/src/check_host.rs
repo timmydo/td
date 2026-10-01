@@ -2683,7 +2683,7 @@ mod tests {
     #[test]
     fn a_slow_client_is_waited_for_rather_than_buried() {
         let (mut client, host) = UnixStream::pair().unwrap();
-        let mut clone = host.try_clone().unwrap();
+        let clone = host.try_clone().unwrap();
         let writer = FrameWriter::new(host).unwrap();
         // Wake often, so the timeout path is taken many times over the pause
         // below without the test having to wait five seconds for each.
@@ -2767,7 +2767,7 @@ mod tests {
     #[test]
     fn cancelling_releases_a_write_already_parked_on_a_stalled_client() {
         let (client, host) = UnixStream::pair().unwrap();
-        let mut clone = host.try_clone().unwrap();
+        let clone = host.try_clone().unwrap();
         // The production budget: nothing here may depend on it expiring.
         let writer = FrameWriter::with_budget(host, STALL_BUDGET).unwrap();
         clone

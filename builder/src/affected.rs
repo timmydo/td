@@ -4767,11 +4767,31 @@ fn cargo_test_cmds_all(root: &Path) -> Result<Vec<String>, String> {
             out.push(native_compositor_command(k)?);
         }
     }
-    out.push("cargo clippy --frozen --workspace".to_string());
-    for k in &crates {
+    out.extend(clippy_cmds(&crates)?);
+    Ok(out)
+}
+
+/// What the non-crypto clippy legs append: rustc's `unused` group (dead
+/// code, unused imports, variables, `mut`, `#[must_use]` results,
+/// unreachable code) is an error in the checks though an ordinary build only
+/// warns. Clippy's own warn-level lints are not raised with it; their set
+/// moves with each toolchain.
+const CLIPPY_LINT_ARGS: &str = "-- -D unused";
+
+/// The clippy legs both tiers run, workspace first. The admitted crypto
+/// crates go through `crypto-cargo`, which denies every warning itself.
+fn clippy_cmds(crates: &[GateCrate]) -> Result<Vec<String>, String> {
+    let mut out = vec![format!(
+        "cargo clippy --frozen --workspace {CLIPPY_LINT_ARGS}"
+    )];
+    for k in crates {
         let mut cmd = crate_cargo_command(k, "clippy")?;
-        if k.clippy_all_targets && !crate::crypto_policy::admitted(&k.name) {
-            cmd.push_str(" --all-targets");
+        if !crate::crypto_policy::admitted(&k.name) {
+            if k.clippy_all_targets {
+                cmd.push_str(" --all-targets");
+            }
+            cmd.push(' ');
+            cmd.push_str(CLIPPY_LINT_ARGS);
         }
         out.push(cmd);
     }
@@ -4932,20 +4952,13 @@ fn check_format(root: &Path, write: bool) -> Result<(), String> {
 /// roster as the host preflight's. The format check is not among them: that
 /// gate's provisioned toolchain promises rustc, cargo and clippy, not rustfmt.
 ///
-/// Kept apart from `cargo_test_cmds_all` rather than shared: the two legs run
-/// deliberately different suites (see `GateCrate::gate_test_args`), and the
-/// gate lints before it tests so a coding-rules violation reds before a long
-/// test run rather than after it.
+/// Its test legs are kept apart from `cargo_test_cmds_all`'s, sharing only
+/// `clippy_cmds`: the two run deliberately different suites (see
+/// `GateCrate::gate_test_args`), and the gate lints before it tests so a
+/// coding-rules violation reds before a long test run rather than after it.
 pub(crate) fn gate_cargo_cmds(root: &Path) -> Result<Vec<String>, String> {
     let crates = discover_gate_crates(root)?;
-    let mut out = vec!["cargo clippy --frozen --workspace".to_string()];
-    for k in &crates {
-        let mut cmd = crate_cargo_command(k, "clippy")?;
-        if k.clippy_all_targets && !crate::crypto_policy::admitted(&k.name) {
-            cmd.push_str(" --all-targets");
-        }
-        out.push(cmd);
-    }
+    let mut out = clippy_cmds(&crates)?;
     out.push("cargo test --frozen --workspace".to_string());
     for k in &crates {
         let mut cmd = crate_test_command(k)?;
@@ -8638,7 +8651,7 @@ mod tests {
             }
         }
         for driver in [
-            "cargo clippy --frozen --workspace",
+            "cargo clippy --frozen --workspace -- -D unused",
             "cargo test --frozen --workspace",
         ] {
             assert!(
@@ -8671,8 +8684,9 @@ mod tests {
                 })
                 .map(String::as_str)
                 .unwrap_or_default();
+            let flags = clippy.strip_suffix(" -- -D unused").unwrap_or(clippy);
             assert_eq!(
-                clippy.ends_with(" --all-targets")
+                flags.ends_with(" --all-targets")
                     || clippy.contains(" gate-crates crypto-cargo clippy "),
                 k.clippy_all_targets,
                 "{}: --all-targets does not follow its declaration: `{clippy}`",
@@ -8701,6 +8715,36 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// A plain build only warns about dead code; the lint legs must red on it,
+    /// in the host preflight and gate 325 alike. The crypto crates' leg denies
+    /// every warning inside `crypto-cargo` instead.
+    #[test]
+    fn every_clippy_leg_denies_unused_code() {
+        let root = repo_root();
+        let host = cargo_test_cmds_all(&root).expect("the preflight list derives");
+        let gate = gate_cargo_cmds(&root).expect("the gate command list derives");
+        for (tier, cmds) in [("cargo-test preflight", &host), ("gate 325", &gate)] {
+            let clippy: Vec<&String> = cmds
+                .iter()
+                .filter(|c| cargo_driver(c, "cargo clippy"))
+                .collect();
+            assert!(!clippy.is_empty(), "{tier} runs no clippy");
+            for cmd in clippy {
+                assert!(
+                    cmd.ends_with(" -- -D unused")
+                        || cmd.contains(" gate-crates crypto-cargo clippy "),
+                    "{tier}: `{cmd}` lets unused code through"
+                );
+            }
+        }
+        let crypto: String = include_str!("crypto_build.rs")
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(crypto
+            .contains(r#"ifaction=="clippy"{cmd.args(["--all-targets","--","-D","warnings"]);}"#));
     }
 
     /// The gate leg and the host preflight run deliberately DIFFERENT suites for

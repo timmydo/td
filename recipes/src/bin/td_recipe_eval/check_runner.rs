@@ -2235,7 +2235,7 @@ pub(crate) struct RecipeCheckRunner {
     /// The exclusive claim on `scratch`, held for this runner's whole life: it is what
     /// tells a peer's reaper that this tree is live (see `claim_scratch`). `None` only
     /// in tests, which construct the struct directly and share no ladder.
-    scratch_lock: Option<File>,
+    _scratch_lock: Option<File>,
 }
 
 pub(crate) struct RecipeNode {
@@ -2402,7 +2402,7 @@ impl RecipeCheckRunner {
             daemon_dir,
             stream_progress: false,
             vouched: std::sync::Mutex::new(None),
-            scratch_lock: Some(scratch_lock),
+            _scratch_lock: Some(scratch_lock),
         })
     }
 
@@ -8662,7 +8662,7 @@ chmod 755 '{}'
             stream_progress: false,
             vouched: std::sync::Mutex::new(None),
             // Not claimed: this runner shares no ladder with anything.
-            scratch_lock: None,
+            _scratch_lock: None,
         }
     }
 
@@ -9641,7 +9641,7 @@ chmod 755 '{}'
             daemon_dir: None,
             stream_progress: false,
             vouched: std::sync::Mutex::new(None),
-            scratch_lock: None,
+            _scratch_lock: None,
         };
 
         let got = runner.ladder_out_from(&current, "rust-toolchain").unwrap();
