@@ -118,6 +118,11 @@ fn main() {
         Some("--entropy-workers") => observe("entropy", entropy_worker_scenario::PHASES, |f| {
             entropy_worker_scenario::run(f)
         }),
+        Some("--tls-certificate-list") => observe(
+            "certificate-list",
+            tls_fragment_scenario::CERTIFICATE_LIST_PHASES,
+            |f| tls_fragment_scenario::run_certificate_list(f),
+        ),
         Some("--tls-fragments") => observe("fragment", tls_fragment_scenario::PHASES, |f| {
             tls_fragment_scenario::run(f)
         }),

@@ -884,12 +884,12 @@ and refuse the Rust/native probe sentinels there. The exact artifact inventory,
 static ELF validation and fresh runtime namespace include it explicitly.
 
 The default process checks the bounded rollup parser and observes a positive
-resident increase after touching a 16 MiB allocation. Eight independent
+resident increase after touching a 16 MiB allocation. Nine independent
 fresh processes run the client, local handshake, entropy worker, fragmented
-handshake, large-chain, sixteen-profile generation, large
-generation-routing and gateway-trust generation scenarios. The runtime
-requires exact ordered rows, positive decimal KiB values and the scenario
-completion record before
+handshake, large-chain, sixteen-profile generation, large generation-routing,
+gateway-trust generation and decoded certificate-list refusal scenarios. The
+runtime requires exact ordered rows, positive decimal KiB values and the
+scenario completion record before
 logging. Every mode has its own bounded log and 30-second deadline. Missing
 procfs support or malformed/truncated rollup output fails qualification.
 
@@ -952,3 +952,23 @@ records cannot satisfy this evidence. Stable old-generation release and
 repeated replacement remain allocation oracles. No executable, unsafe surface
 or link flag is added. td-mta/RESOURCES.md defines the observed allowance
 overrun and pending aggregate admission work.
+
+## Certificate-list refusal observations
+
+Fresh `--tls-certificate-list` modes in the existing Rust/native/RSS
+artifacts send an unexpected plaintext Certificate message in the TLS 1.2
+format before ServerHello. Its 21800 empty DER entries fit in a bounded
+65403-byte body, delivered as either 16 KiB or 4 KiB record fragments. The
+pinned backend decodes the list before refusing the unexpected message. No
+certificate or peer is authenticated.
+
+Eleven exact `certificate-list` phase records and allocation v1/RSS v2
+completions distinguish these observations from malformed ServerHello tests.
+Allocation probes require the first final-record step to exercise at least
+512 KiB of additional requested-byte peak above its pending peak snapshot;
+this qualifies the current pinned decoder path and is not a desired minimum
+for a future implementation. It relies on the pin's vector growth and spare
+capacity. Repeated refusals must retain no extra requested bytes or native
+blocks. Terminal failure must discard output and refuse further operations.
+No executable, unsafe surface or link flag is introduced. RESOURCES.md
+defines the attribution limits and remaining admission work.

@@ -674,6 +674,28 @@ fn tls_fragment_evidence(output: &str, native: bool) -> Result<()> {
     )
 }
 
+fn tls_certificate_list_evidence(output: &str, native: bool) -> Result<()> {
+    tls_phase_evidence(
+        output,
+        native,
+        "-certificate-list",
+        "certificate-list",
+        &[
+            "baseline",
+            "policy",
+            "storage",
+            "large_constructed",
+            "large_pending",
+            "large_refused",
+            "small_constructed",
+            "small_pending",
+            "small_refused",
+            "repeated",
+            "dropped",
+        ],
+    )
+}
+
 fn entropy_worker_evidence(output: &str, native: bool) -> Result<()> {
     tls_phase_evidence(
         output,
@@ -807,6 +829,19 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
             "small_pending",
             "small_refused",
             "over_limit",
+            "repeated",
+            "dropped",
+        ],
+        "certificate-list" => &[
+            "baseline",
+            "policy",
+            "storage",
+            "large_constructed",
+            "large_pending",
+            "large_refused",
+            "small_constructed",
+            "small_pending",
+            "small_refused",
             "repeated",
             "dropped",
         ],
@@ -1491,6 +1526,18 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
         let mut command = Command::new(path);
         command
+            .arg("--tls-certificate-list")
+            .env_clear()
+            .stdin(Stdio::null());
+        crate::host_bin::arm_check_child(&mut command);
+        let name = format!("tls-certificate-list-allocation-{domain}");
+        let output = bounded_output(&mut command, &name, 8192, 30)?;
+        tls_certificate_list_evidence(&output, native)?;
+        for line in output.lines() {
+            println!("portable allocation diagnostic: {line}");
+        }
+        let mut command = Command::new(path);
+        command
             .arg("--tls-large-chain")
             .env_clear()
             .stdin(Stdio::null());
@@ -1524,6 +1571,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("handshake", Some("--tls-handshake")),
         ("entropy", Some("--entropy-workers")),
         ("fragment", Some("--tls-fragments")),
+        ("certificate-list", Some("--tls-certificate-list")),
         ("large-chain", Some("--tls-large-chain")),
         ("generation", Some("--tls-generations")),
         ("generation-routing", Some("--tls-generation-routing")),
@@ -1863,6 +1911,86 @@ mod tests {
                 format!("{output}extra\n"),
             ] {
                 assert!(tls_fragment_evidence(&bad, native).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn certificate_list_records_require_pending_refusal_and_repetition() {
+        for native in [false, true] {
+            let domain = if native { "native" } else { "rust" };
+            let values = if native {
+                "1 2 3 4 5 6 7 8 9"
+            } else {
+                "1 2 3 4 5 6 7"
+            };
+            let mut output = String::new();
+            for phase in [
+                "baseline",
+                "policy",
+                "storage",
+                "large_constructed",
+                "large_pending",
+                "large_refused",
+                "small_constructed",
+                "small_pending",
+                "small_refused",
+                "repeated",
+                "dropped",
+            ] {
+                output.push_str(&format!("tls-{domain}-certificate-list {phase} {values}\n"));
+            }
+            output.push_str(&format!(
+                "tls-certificate-list-allocation-v1: {domain} passed\n"
+            ));
+            assert!(tls_certificate_list_evidence(&output, native).is_ok());
+            let mut rss = String::new();
+            for phase in [
+                "baseline",
+                "policy",
+                "storage",
+                "large_constructed",
+                "large_pending",
+                "large_refused",
+                "small_constructed",
+                "small_pending",
+                "small_refused",
+                "repeated",
+                "dropped",
+            ] {
+                rss.push_str(&format!("rss certificate-list {phase} 100\n"));
+            }
+            rss.push_str("rss-observation-v2: certificate-list passed\n");
+            assert!(rss_evidence(&rss, "certificate-list").is_ok());
+            assert!(rss_evidence(&rss, "fragment").is_err());
+            for bad in [
+                rss.replace("certificate-list", "fragment"),
+                rss.replace("large_pending", "large_refused"),
+                rss.replace("-v2:", "-v1:"),
+                rss.trim_end().to_owned(),
+            ] {
+                assert!(rss_evidence(&bad, "certificate-list").is_err());
+            }
+
+            assert!(tls_certificate_list_evidence(&output, !native).is_err());
+            assert!(tls_handshake_evidence(&output, native).is_err());
+            assert!(tls_fragment_evidence(&output, native).is_err());
+            assert!(tls_certificate_list_evidence(
+                &output.replace("certificate-list", "fragment"),
+                native
+            )
+            .is_err());
+            assert!(entropy_worker_evidence(&output, native).is_err());
+            for bad in [
+                output.replace("large_pending", "large_refused"),
+                output.replace(" 1 2", " 1"),
+                output.replace(" 1 2", " x 2"),
+                output.replace("passed", "failed"),
+                output.replace("-v1:", "-v2:"),
+                output.trim_end().to_owned(),
+                format!("{output}extra\n"),
+            ] {
+                assert!(tls_certificate_list_evidence(&bad, native).is_err());
             }
         }
     }

@@ -925,7 +925,8 @@ The large margin is a positive observation control, not an exact page-count
 claim. Those controls run separately so they do not warm scenario processes.
 
 The existing phase names are retained. Rows have `rss SCENARIO PHASE KIB`,
-where SCENARIO is client, handshake, entropy, fragment, large-chain, generation,
+where SCENARIO is client, handshake, entropy, fragment, certificate-list,
+large-chain, generation,
 generation-routing, generation-trust, remote12, remote13 or remote13large.
 The completion record is `rss-observation-v2: SCENARIO passed`. Samples use
 fixed arrays and are
@@ -1087,3 +1088,38 @@ crypto fixtures also qualify selected accepted flights and terminal refusal
 of two 48000-byte tickets in one flight; they do not establish an exact
 threshold or refusal-memory peak. The known session-admission blocker remains
 explicit; configured queue limits are not a whole-memory bound.
+
+## Decoded certificate-list refusal observations
+
+The existing diagnostic artifacts accept `--tls-certificate-list` in
+separate fresh Rust/native/RSS processes. This untrusted outbound-client
+case sends an unexpected plaintext Certificate message in the TLS 1.2 format
+before ServerHello, carrying 21800 empty DER entries. Its three-byte list
+length plus entries form a 65403-byte body; records fragment it at 16 KiB
+and 4 KiB. All wire storage is allocated before driving the sessions. The
+pinned backend constructs its entry vector before protocol-state validation
+refuses the message. This measures rejection of malformed traffic, never
+peer authentication.
+
+Eleven phases cover baseline, retained client policy, wire storage, each
+fragmentation case's constructed/pending/refused states, 32 repetitions of
+both cases and final teardown. Rows use `tls-DOMAIN-certificate-list` with
+completion `tls-certificate-list-allocation-v1: DOMAIN passed`, or the
+independent RSS schema. Both allocation probes require at least 512 KiB of
+additional lifetime requested-byte peak above the first pending peak
+snapshot, proving this pin exercises decoded-entry allocation. This is a
+qualification control, not a required allocation floor for future backends:
+it relies on this pin's vector growth, including spare capacity. After the
+second refusal, all repetitions must leave retained requested bytes
+unchanged; native live block counts must also stay fixed. Refusal consumes
+the session, discards queued output and refuses later reads, writes and
+records.
+
+The input is bounded but decoded storage can be much larger than its wire
+body. Counter peaks do not include allocator metadata or every realloc
+transient; Rust/native domains overlap. RSS samples occur between calls and
+can miss allocations already freed by a refused call. This single TLS 1.2
+pre-ServerHello case does not bound encrypted TLS 1.3 certificate lists,
+post-handshake messages, concurrent sessions or total service memory. M07e
+retains the aggregate admission requirement and the current ledger
+unchanged.

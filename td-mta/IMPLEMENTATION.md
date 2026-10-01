@@ -970,6 +970,13 @@ Implement the remaining work as independently reviewable increments:
     80 MiB configuration is fixture-only. Retained trust duplication still
     requires accounting or reduction before service activation.
 
+  - **M07e4i — decoded certificate-list refusal observations:** fresh
+    Rust/native/RSS processes feed unexpected TLS 1.2 certificate lists with
+    21800 empty entries through the client facade. Two fragmentation sizes,
+    terminal refusal and stable repeated teardown qualify decoded allocation
+    separately from bounded wire storage. Encrypted TLS 1.3 and concurrent
+    session accounting remain pending.
+
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.
 Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,
