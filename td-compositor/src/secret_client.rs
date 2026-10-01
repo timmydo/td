@@ -254,9 +254,14 @@ impl Client {
                         ..
                     }
                 ),
+                // An update on an installed system; a whole disk on a live
+                // boot.
                 Selection::Install => matches!(
                     request.operation(),
                     Operation::Install {
+                        requester: 1000,
+                        ..
+                    } | Operation::InstallDisk {
                         requester: 1000,
                         ..
                     }
@@ -475,6 +480,41 @@ mod tests {
             replies: replies.into(),
             calls: Vec::new(),
         }
+    }
+
+    #[test]
+    fn install_also_admits_a_whole_disk_installation_for_the_session_owner() {
+        let disk = |owner: u32| {
+            Request::new(
+                [42; 32],
+                owner,
+                Operation::InstallDisk {
+                    requester: owner,
+                    disk: "vda".into(),
+                    capacity: 8 << 30,
+                    model: Some(crate::authority::consent::Label::model(b"QEMU HARDDISK")),
+                    serial: None,
+                    hostname: "td".into(),
+                    username: "alice".into(),
+                    deployment: [0xab; 8],
+                },
+            )
+            .unwrap()
+        };
+        let mut screen = Screen::new();
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+        let mut client = Client::default();
+        let reply = [&[0x92][..], disk(1000).encode().as_slice()].concat();
+        client
+            .start(&mut wire(vec![reply]), Arc::clone(&screen.attempt))
+            .unwrap();
+        assert_eq!(client.pending.as_ref().unwrap().request, disk(1000));
+        let mut screen = Screen::new();
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+        let reply = [&[0x92][..], disk(1001).encode().as_slice()].concat();
+        assert!(Client::default()
+            .start(&mut wire(vec![reply]), Arc::clone(&screen.attempt))
+            .is_err());
     }
 
     #[test]

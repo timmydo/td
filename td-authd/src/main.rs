@@ -10,7 +10,11 @@ mod channel;
 )]
 mod consent;
 mod deployment;
+mod disk_install;
 mod inspection;
+#[allow(dead_code, reason = "shared codec; the service sends the other half")]
+#[path = "../../td-install/src/installation_consent.rs"]
+mod installation_consent;
 mod launch;
 mod mount_sys;
 mod portal_files;

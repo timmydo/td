@@ -66,42 +66,50 @@ impl Start {
 enum Active {
     Secret(Box<Unlock>),
     Install(Box<crate::deployment::Installation>),
+    DiskInstall(Box<crate::disk_install::Installation>),
 }
 impl Active {
     fn request(&self) -> &Description {
         match self {
             Self::Secret(op) => op.request(),
             Self::Install(op) => op.request(),
+            Self::DiskInstall(op) => op.request(),
         }
     }
     fn presented(&mut self, request: &Description) -> Result<(), String> {
         match self {
             Self::Secret(op) => op.presented(request),
             Self::Install(op) => op.presented(request),
+            Self::DiskInstall(op) => op.presented(request),
         }
     }
     fn commit(&mut self, request: &Description) -> Result<(), String> {
         match self {
             Self::Secret(op) => op.commit(request),
             Self::Install(op) => op.commit(request),
+            Self::DiskInstall(op) => op.commit(request),
         }
     }
     fn cancel(&mut self, reason: &str) -> Result<(), String> {
         match self {
             Self::Secret(op) => op.cancel(reason),
             Self::Install(op) => op.cancel(reason),
+            Self::DiskInstall(op) => op.cancel(reason),
         }
     }
     fn poll(&mut self) -> Result<Event, String> {
         match self {
             Self::Secret(op) => op.poll(),
             Self::Install(op) => op.poll(),
+            Self::DiskInstall(op) => op.poll(),
         }
     }
     fn reap_for_teardown(self) -> Result<(), String> {
         match self {
             Self::Secret(op) => op.reap_for_teardown(),
             Self::Install(op) => op.reap_for_teardown(),
+            // The setup intake owns the service and stops it at teardown.
+            Self::DiskInstall(_) => Ok(()),
         }
     }
 }
@@ -184,6 +192,8 @@ pub(crate) struct Session {
     writing: bool,
     installations: Option<crate::deployment::Intake>,
     installing: bool,
+    /// On a live boot, in place of the update intake.
+    setup: Option<crate::disk_install::Intake>,
     activated: bool,
     prepared: bool,
     cleanup: Option<Cleanup>,
@@ -205,6 +215,7 @@ impl Session {
             writing: false,
             installations: None,
             installing: false,
+            setup: None,
             activated: false,
             prepared: false,
             cleanup: None,
@@ -221,9 +232,29 @@ impl Session {
                 return Err("secret session already prepared or preparing".into());
             }
             self.intake = Some(crate::secret_intake::Intake::bind(self.owner)?);
-            self.installations = Some(crate::deployment::Intake::bind(self.owner)?);
+            // A live boot installs disks, never updates itself.
+            if crate::disk_install::live_boot()? {
+                self.setup = Some(crate::disk_install::Intake::bind(self.owner)?);
+            } else {
+                self.installations = Some(crate::deployment::Intake::bind(self.owner)?);
+            }
         }
-        self.answer_with(request, cleanup_command, Start::begin)
+        let answer = self.answer_with(request, cleanup_command, Start::begin);
+        self.send_disk_answer();
+        answer
+    }
+
+    /// Forwards the disk installation's answer to its service.
+    fn send_disk_answer(&mut self) {
+        if let (Some(Active::DiskInstall(operation)), Some(setup)) =
+            (&mut self.operation, &mut self.setup)
+        {
+            if let Some(answer) = operation.take_answer() {
+                if setup.answer(answer).is_err() {
+                    operation.fate(answer.nonce(), crate::disk_install::Fate::Ended);
+                }
+            }
+        }
     }
 
     fn answer_with(
@@ -260,6 +291,23 @@ impl Session {
                 Ok(vec![0x93])
             }
             Request::Commit(description) => {
+                if let Some(Active::DiskInstall(operation)) = &mut self.operation {
+                    // The installer may have left, or the service ended the
+                    // review, while the prompt waited for Enter: commit
+                    // consents to nothing. A duplicate commit still refuses.
+                    if let Some(setup) = &mut self.setup {
+                        for (nonce, fate) in setup.tick() {
+                            operation.fate(&nonce, fate);
+                        }
+                    }
+                    if operation.ended() {
+                        if operation.request() != &description {
+                            return Err("stale installation consent".into());
+                        }
+                        self.event = Some(operation.poll()?);
+                        return Ok(vec![0x94]);
+                    }
+                }
                 if self.installing {
                     let intake = self
                         .installations
@@ -331,6 +379,27 @@ impl Session {
             || self.inspection.is_some()
         {
             return Ok(vec![0x99, 0]);
+        }
+        if let Some(setup) = &mut self.setup {
+            let Ok(request) = setup.select() else {
+                return Ok(vec![0x99, 0]);
+            };
+            let nonce = *request.nonce();
+            let operation = match crate::disk_install::Installation::start(request) {
+                Ok(operation) => operation,
+                Err(_) => {
+                    let _ = setup.answer(crate::installation_consent::Answer::Declined(
+                        nonce,
+                        crate::installation_consent::NoConsent::Unavailable,
+                    ));
+                    return Ok(vec![0x99, 0]);
+                }
+            };
+            let mut answer = vec![0x92];
+            answer.extend_from_slice(&operation.request().encode());
+            self.operation = Some(Active::DiskInstall(Box::new(operation)));
+            self.event = Some(Event::Waiting);
+            return Ok(answer);
         }
         let intake = self
             .installations
@@ -427,6 +496,13 @@ impl Session {
         if let Some(intake) = &mut self.installations {
             intake.tick();
         }
+        if let Some(setup) = &mut self.setup {
+            for (nonce, fate) in setup.tick() {
+                if let Some(Active::DiskInstall(operation)) = &mut self.operation {
+                    operation.fate(&nonce, fate);
+                }
+            }
+        }
         if self.installing
             && !self
                 .installations
@@ -456,6 +532,7 @@ impl Session {
         if let Some(operation) = &mut self.operation {
             self.event = Some(operation.poll()?);
         }
+        self.send_disk_answer();
         if let Some(inspection) = &mut self.inspection {
             self.inspection_event = Some(inspection.poll()?);
         }
@@ -536,6 +613,8 @@ impl Session {
         }
         self.intake = None;
         self.installations = None;
+        // Stops the installation service, as an update helper is stopped.
+        self.setup = None;
         self.inspection = None;
         self.inspection_event = None;
         // Dropping pending generation cleanup also reaps before replacement.

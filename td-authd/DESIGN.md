@@ -938,8 +938,8 @@ summary is display only and does not bind the installation plan: the
 operation that presents it must bind the plan itself. The plan admits
 longer disk names (64 bytes) and backslashes in names, which this summary
 refuses, so the producer must narrow those or refuse the plan before
-consent; a kernel disk name is at most 31 bytes. Nothing presents it
-yet. All consumers pin the codec source and its
+consent; a kernel disk name is at most 31 bytes. "Whole-disk installation
+intake" below presents it. All consumers pin the codec source and its
 tests assert the complete public argument display.
 
 These are structural checks, not caller admission or proof of
@@ -1343,12 +1343,14 @@ additional tests do not replace the authority's token-consent boundary.
 
 ## Consent for a locally built system
 
-`deployment.rs` owns the sole stock installation intake at
-`/run/td-authd/1000/install`. Prepare creates it after the credential intake
-has checked the root-owned runtime parents. It has the same protected-parent,
-mode-0600 human socket, per-fragment UID and live sender-pidfd policy, but
-refuses every incoming SCM_RIGHTS descriptor. It uses the unchanged named
-transport in UNSAFE.md section 16. No public message grants consent.
+`deployment.rs` owns the stock update intake at
+`/run/td-authd/1000/install`. On an installed system Prepare creates it
+after the credential intake has checked the root-owned runtime parents; a
+live boot binds "Whole-disk installation intake" instead. It has the same
+protected-parent, mode-0600 human socket, per-fragment UID and live
+sender-pidfd policy, but refuses every incoming SCM_RIGHTS descriptor. It
+uses the unchanged named transport in UNSAFE.md section 16. No public
+message grants consent.
 
 The client `td-authd request-update SOURCE DEPLOYMENT-ID` requires a root
 peer and the exact eight-byte `TDUPD01` newline greeting. Its u16 big-endian
@@ -1398,6 +1400,75 @@ cgroup owns every descendant and forbids a replacement generation until the
 entire previous cgroup is empty; helpers never detach from that containment.
 The boot transaction owns recovery of interrupted publication. No privileged
 shell, setuid entry, remembered consent or new credential switch is added.
+
+## Whole-disk installation intake
+
+On a live boot td-authd installs disks and never updates itself. Prepare
+reads `/proc/cmdline` (a longer one than 4096 bytes fails Prepare): exactly
+one `td.live=` token, `td.live=1`, marks a live boot; none marks an
+installed system; any other spelling or a repeated token is ambiguous and
+fails Prepare, as does a live boot whose handed-off trust root
+`/run/td-volume/td/trusted.pub` is not a root-owned regular file without
+group or other write. A live boot binds `disk_install.rs`'s setup intake at
+`/run/td-authd/1000/setup` in place of the update intake; an installed
+system binds only the update intake. Both use one binder: protected
+root-owned parents, a stale socket of root or the owner replaced, mode 0600,
+owned by UID 1000, nonblocking, and on failure or teardown the inode this
+generation created removed and no other.
+
+The setup intake accepts one connection per heartbeat. While no service runs
+or awaits reaping and no installation has completed this generation, a peer
+of UID 1000 (the fixed peer-UID query) gets a service; any other connection
+is closed unanswered. The service is `/bin/td-install serve /bin/td-boot
+/run/td-media /run/td-volume/td/trusted.pub / /bin/td-firstboot`, with an
+empty environment, cwd `/`, the accepted socket as stdin, one end of a new
+socketpair as stdout and authority stderr: td-install/INSTALLER.md
+"Installation service core" says what it admits. td-authd keeps the other
+end, nonblocking, and speaks td-install/INSTALLER.md "Installation consent
+channel" on it, compiling the service's own codec, with at most four reads
+and four writes per heartbeat. It sends its greeting, requires the
+service's, and holds at most one open review from its review report to the
+service's ended or finished report, admitting started only after it sent
+consent, finished only after started, and ended only before started. Reports
+read before the channel ends count. A report out of that order or a
+malformed frame breaks the channel, as does a failed write (owed bytes mean
+the service has not started), and td-authd kills the service. The service
+closing the channel, or having exited, once everything it sent before
+exiting is read, retires it unsignalled, so a started installation is not
+interrupted. Either way its open review ends then (a started one fails, its
+outcome unknown), and nonblocking polls reap the retired child; a hung one
+keeps the intake busy until teardown. A finished-complete report marks the
+generation complete and its intake starts no further service. A later
+generation's intake starts afresh: each installation still needs its own
+review and physical consent.
+
+Only private request 19 selects the open review, once; with none, or a busy
+operation slot, it answers 99 00. Selection makes the review's consent
+summary, the disk installation description of "Immutable consent description
+prerequisite", with the review's nonce, the session owner as requester, the
+escaped model and serial and the deployment digest's first eight bytes. A
+review it cannot show (a name consent refuses), or whose operation cannot
+start, is declined as unavailable at once and answers 99 00. Otherwise it
+answers 92 DESCRIPTION and holds the slot. Presentation (13), then one
+commit (14) after a fresh physical Enter, within 120 seconds, as for an
+update. Commit sends consent naming the review; Escape before commit sends
+declined, and expiry sends expired. If the service ended the review first
+(the installer withdrew or left, or the service stopped), Enter consents to
+nothing: presentation changes nothing, and commit of the same description
+answers 94 without sending and the operation fails. After commit only the
+service's reports end the operation: finished-complete completes it, and an
+ended or finished-failed report, or the service retiring, fails it; without
+commit nothing completes it. Closing the screen after commit revokes
+nothing.
+
+On failed-generation teardown td-authd kills the service and any retired
+one and waits for each, before secret-session cleanup, and removes its
+socket; unlike an update helper's, a wait error goes unreported. A
+service stopped while writing leaves the disk incomplete; td-install's
+failure semantics and td-svc's authority cgroup containment apply as for
+an update. Until td-install has an execution and opens the channel, the
+service never sends a review, so selection always answers 99 00 in
+production.
 
 The host-only launch VM fixture also accepts `--run-taskmgr-vm`, followed
 by the ordinary kernel/authd/firstboot/login/busybox inputs, compositor,

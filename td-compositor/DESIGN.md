@@ -5575,11 +5575,14 @@ they never claim secure attention or use the trusted timestamp cutoff.
 
 ### Physical installation confirmation
 
-I selects the root installation request queued by `./update`. The returned
-description must be Install for requester and session owner 1000. No ready
-request displays a notice. The complete prompt names the full deployment ID,
-retention of the previous system and the need to restart, with Enter to
-install and Escape to cancel. The public requester cannot open this screen.
+I selects the root installation request: on an installed system the update
+queued by `./update`, on a live boot the installation service's open
+whole-disk review. The returned description must be Install or InstallDisk
+for requester and session owner 1000. No ready request displays NO
+INSTALLATION IS READY TO REVIEW. An update's complete prompt names the full
+deployment ID, retention of the previous system and the need to restart,
+with Enter to install and Escape to cancel; a disk installation's is its
+fixed summary. The public requester cannot open this screen.
 
 A completed presentation also carries a CLOCK_MONOTONIC sample taken after
 successful full-frame submission. Only the evdev adapter can offer a fresh

@@ -5673,7 +5673,8 @@ mod tests {
             ]
         );
         assert_eq!(readers_of("td-boot"), ["td-install", "td-update"]);
-        assert_eq!(readers_of("td-install"), ["td-setup"]);
+        // td-authd compiles td-install's consent codec by `#[path]`.
+        assert_eq!(readers_of("td-install"), ["td-authd", "td-setup"]);
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
         // td-mail and td-news depend on the editor for their document pane.
         assert_eq!(readers_of("td-editor"), ["td-mail", "td-news"]);
@@ -8175,9 +8176,34 @@ mod tests {
                 "td-vm-guest"
             ]
         );
+        // td-install's readers include td-authd, so td-boot's protocol
+        // reaches everything that reads td-authd too.
         assert_eq!(
             names(&one("td-boot/src/protocol.rs")),
-            ["td-boot", "td-install", "td-setup", "td-update"]
+            [
+                "td-authd",
+                "td-boot",
+                "td-compositor",
+                "td-crypto",
+                "td-editor",
+                "td-firstboot",
+                "td-install",
+                "td-jail",
+                "td-login",
+                "td-mail",
+                "td-mta",
+                "td-news",
+                "td-photo",
+                "td-portal",
+                "td-seatd",
+                "td-secret",
+                "td-setup",
+                "td-taskmgr",
+                "td-ui",
+                "td-update",
+                "td-vm",
+                "td-vm-guest"
+            ]
         );
         // The order holds within a narrowed list: the format check, then every
         // test before any clippy, the workspace first.

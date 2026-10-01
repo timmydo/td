@@ -2515,6 +2515,18 @@ helper's stdin. The private compositor channel still transfers no descriptors.
 The complete controller source and fixed child argv are pinned by confinement
 and behavioral tests. No instruction, syscall, option or allowance is added.
 
+### Whole-disk installation intake
+
+`td-authd/src/disk_install.rs` is a further safe consumer: it calls only the
+fixed peer-UID query, on each accepted setup connection, and receives
+nothing through the credentials/pidfd or SCM_RIGHTS wrappers. It passes the
+accepted socket and one end of a socketpair it creates as the fixed
+installation service's stdin and stdout through safe std `Stdio`, and
+forwards no other descriptor. The consent channel it speaks is a byte codec
+compiled from td-install, with no descriptors. The controller source, its
+fixed child argv and the codec's freedom from unsafe and I/O are pinned by
+confinement tests. No instruction, syscall, option or allowance is added.
+
 ### Claude shell terminal boundary
 
 The Claude shell launcher is another unprivileged consumer of the unchanged

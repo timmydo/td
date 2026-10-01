@@ -33,6 +33,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "channel.rs",
             "consent.rs",
             "deployment.rs",
+            "disk_install.rs",
             "inspection.rs",
             "launch.rs",
             "main.rs",
@@ -61,6 +62,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("channel.rs", 0),
         ("consent.rs", 0),
         ("deployment.rs", 0),
+        ("disk_install.rs", 0),
         ("sys.rs", 4),
         ("launch.rs", 0),
         ("unlock.rs", 0),
@@ -94,6 +96,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             let child_api = matches!(
                 name,
                 "deployment.rs"
+                    | "disk_install.rs"
                     | "launch.rs"
                     | "application.rs"
                     | "unlock.rs"
@@ -133,7 +136,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0xf6e7066d51c42587,
+        0xe12ed70b61fadfac,
         "paired secret controller changed"
     );
     assert_eq!(
@@ -168,6 +171,51 @@ fn the_production_source_and_raw_boundary_are_closed() {
             !installation.contains(forbidden),
             "installation: {forbidden}"
         );
+    }
+    // The live installer's service: one fixed program and operands, the
+    // installer's socket and td-authd's channel as its only descriptors.
+    let disk = include_str!("../src/disk_install.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(fingerprint(disk), DISK_INSTALL_FINGERPRINT);
+    assert_eq!(disk.matches("Command::new(").count(), 1);
+    assert!(disk.contains("Command::new(\"/bin/td-install\")"));
+    assert!(disk.contains(
+        "\"serve\",\n                \"/bin/td-boot\",\n                \"/run/td-media\",\n                TRUSTED_KEY,\n                \"/\",\n                \"/bin/td-firstboot\","
+    ));
+    assert!(disk.contains("sys::peer_uid(&installer).is_ok_and(|uid| uid == self.owner)"));
+    for forbidden in [
+        "send_descriptor(",
+        "sys::receive(",
+        "create_credential(",
+        "seal_credential(",
+        "pre_exec",
+        "CommandExt",
+        "setsid",
+        "process_group",
+    ] {
+        assert!(!disk.contains(forbidden), "disk installation: {forbidden}");
+    }
+    // The shared codec is data only, pinned as reviewed.
+    let codec = include_str!("../../td-install/src/installation_consent.rs");
+    assert_eq!(fingerprint(codec), CONSENT_CODEC_FINGERPRINT);
+    for forbidden in [
+        "unsafe",
+        "std::fs",
+        "std::io",
+        "std::process",
+        "std::net",
+        "std::os",
+        "std::thread",
+        "std::env",
+        "extern",
+        "asm!",
+        "include",
+        "#[path",
+        "print",
+    ] {
+        assert!(!codec.contains(forbidden), "consent codec: {forbidden}");
     }
     let intake_raw = include_str!("../src/secret_sys.rs")
         .split("#[cfg(test)]")
@@ -433,7 +481,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0xb4f66f43451ecc96,
+        0xe16cbaffe68dd300,
         "main.rs: production startup changed"
     );
     assert_eq!(
@@ -457,4 +505,6 @@ const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;
 const WRITE_REQUEST_FINGERPRINT: u64 = 0x188c619caba6ceb8;
 
-const INSTALLATION_FINGERPRINT: u64 = 0xc43ac63c23006af1;
+const INSTALLATION_FINGERPRINT: u64 = 0x2a5bd0095530413b;
+const DISK_INSTALL_FINGERPRINT: u64 = 0x9774acfc388054e7;
+const CONSENT_CODEC_FINGERPRINT: u64 = 0x301196fb4b04f347;

@@ -755,3 +755,115 @@ fn root_inspection_observes_file_state_without_publishing_or_repairing() {
     assert_eq!(fs::read(path.join("master")).unwrap(), [42; 32]);
     session.close().unwrap();
 }
+
+/// A prepared session on a live boot, serving through a fake service.
+fn live_session() -> (Session, UnixStream) {
+    let mut session = Session::new(1000).unwrap();
+    prepare(&mut session);
+    let (setup, mut service) = crate::disk_install::tests::served();
+    session.setup = Some(setup);
+    assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
+    let mut greeting = [0; 8];
+    service.read_exact(&mut greeting).unwrap();
+    assert_eq!(&greeting, crate::installation_consent::GREETING);
+    service
+        .write_all(crate::installation_consent::GREETING)
+        .unwrap();
+    (session, service)
+}
+
+fn select_disk(session: &mut Session) -> Description {
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        let answer = session.answer(Request::Install).unwrap();
+        if answer != [0x99, 0] {
+            assert_eq!(answer[0], 0x92);
+            return Description::decode(&answer[1..]).unwrap();
+        }
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn a_live_session_shows_the_service_review_and_forwards_consent() {
+    use crate::disk_install::tests::{answer, report, review};
+    use crate::installation_consent::{Answer, Outcome, Report};
+    let (mut session, mut service) = live_session();
+    // No review yet: nothing to select.
+    assert_eq!(session.answer(Request::Install).unwrap(), [0x99, 0]);
+    report(&mut service, Report::Review(Box::new(review(4, "vda"))));
+    let description = select_disk(&mut session);
+    assert!(matches!(
+        description.operation(),
+        Operation::InstallDisk { .. }
+    ));
+    assert_eq!(poll_until(&mut session, 4)[2..], description.encode());
+    assert_eq!(
+        session
+            .answer(Request::Presented(description.clone()))
+            .unwrap(),
+        [0x93]
+    );
+    poll_until(&mut session, 5);
+    assert_eq!(
+        session
+            .answer(Request::Commit(description.clone()))
+            .unwrap(),
+        [0x94]
+    );
+    assert_eq!(answer(&mut service), Answer::Consent([4; 32]));
+    report(&mut service, Report::Started([4; 32]));
+    report(&mut service, Report::Finished([4; 32], Outcome::Complete));
+    // A duplicate commit after the outcome refuses rather than answering.
+    assert!(session.answer(Request::Commit(description)).is_err());
+    poll_until(&mut session, 6);
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+#[test]
+fn escape_before_enter_declines_the_review_over_the_channel() {
+    use crate::disk_install::tests::{answer, report, review};
+    use crate::installation_consent::{Answer, NoConsent, Report};
+    let (mut session, mut service) = live_session();
+    report(&mut service, Report::Review(Box::new(review(6, "vda"))));
+    let description = select_disk(&mut session);
+    poll_until(&mut session, 4);
+    session
+        .answer(Request::Presented(description.clone()))
+        .unwrap();
+    assert_eq!(session.answer(Request::Cancel([6; 32])).unwrap(), [0x95, 0]);
+    assert_eq!(
+        answer(&mut service),
+        Answer::Declined([6; 32], NoConsent::Declined)
+    );
+    poll_until(&mut session, 7);
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+#[test]
+fn an_installer_lost_before_enter_fails_the_prompt_not_the_generation() {
+    use crate::disk_install::tests::{report, review};
+    use crate::installation_consent::{Ended, Report};
+    let (mut session, mut service) = live_session();
+    report(&mut service, Report::Review(Box::new(review(5, "vda"))));
+    let description = select_disk(&mut session);
+    poll_until(&mut session, 4);
+    session
+        .answer(Request::Presented(description.clone()))
+        .unwrap();
+    report(&mut service, Report::Ended([5; 32], Ended::InstallerLost));
+    // Enter arrives after the service ended the review: commit reads the
+    // report first, sends no consent, and the session survives.
+    assert_eq!(
+        session.answer(Request::Commit(description)).unwrap(),
+        [0x94]
+    );
+    assert_eq!(session.answer(Request::Poll).unwrap()[1], 7);
+    service
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut rest = [0; 1];
+    assert!(service.read(&mut rest).is_err());
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}

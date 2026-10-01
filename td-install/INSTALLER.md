@@ -241,7 +241,8 @@ authenticates the source under its claim and retains the value, but does
 not yet retain the source, validates choices against caller-bound roots
 (the verified root and the running system's timezone catalog) rather than
 that source, and does not check payload and scratch fit, so its review is
-not yet presentable; no trusted caller starts it. Execution must require
+not yet presentable; td-authd starts it on a live boot but it opens no
+consent channel. Execution must require
 fresh trusted consent bound to that whole value and revalidate the
 selected disk under a retained exclusive claim. Neither matching plan
 bytes nor possession of the nonce grants consent. No public request,
@@ -323,7 +324,8 @@ Where two refusals apply, busy wins. Each state admits:
 - propose: while idle, failed or abandoned. While reviewed, awaiting
   consent or running it is refused as busy; the installer withdraws before
   proposing again, so no request replaces a review that is held or
-  displayed. After complete it is refused as busy: one boot installs once.
+  displayed. After complete it is refused as busy: one service installs
+  once, and td-authd starts no further service that generation.
 - execute: only while reviewed, and only with a record equal to that
   review. The service rechecks the held disk, then answers awaiting
   consent, abandoned (destination changed) or refused as consent
@@ -363,7 +365,8 @@ speaks the installation service protocol on that socket until the peer
 closes between frames, and exits; a malformed frame or message ends it
 without a reply. Until an installation starts, the review and its claim
 end with the installer's channel; a started installation runs to its
-finished report first. No trusted caller starts it yet.
+finished report first. td-authd starts it for each installer on a live
+boot (td-authd/DESIGN.md "Whole-disk installation intake").
 
 It holds at most one review, under the admission rules above. Propose
 checks, in order: busy; the settings (the username through `td-firstboot
@@ -418,11 +421,14 @@ consent remain required before execution.
 ## Installation consent channel
 
 `installation_consent.rs` defines the private channel by which td-authd,
-which will start the service, learns what to put before the person and
-answers with their decision. td-authd compiles the same file. It is data and
-codec only. Both ends are root and td-authd creates the channel, so decoding
+which starts the service, learns what to put before the person and answers
+with their decision. td-authd compiles the same file. It is data and codec
+only. Both ends are root and td-authd creates the channel, so decoding
 authenticates nothing; it refuses only bytes outside the grammar. The
-service core speaks it; nothing opens it yet.
+service core speaks it, and td-authd opens it for the service it starts on a
+live boot (td-authd/DESIGN.md "Whole-disk installation intake") as one end
+of a socketpair on the service's standard output, but the service opens no
+channel until it has an execution.
 
 Both ends first send and require `TDINA01\n`, which changes with any message
 or its bytes. Each message then travels in one frame: a big-endian u32

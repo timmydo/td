@@ -181,7 +181,7 @@ pub(crate) fn paint(
             match notice {
                 Notice::Menu => "U: UNLOCK  R: RECOVERY TOKEN",
                 Notice::Pending => "PREPARING REQUEST",
-                Notice::NoInstall => "NO READY UPDATE - RUN ./UPDATE FIRST",
+                Notice::NoInstall => "NO INSTALLATION IS READY TO REVIEW",
                 Notice::Installed => "SYSTEM INSTALLED - RESTART TO BOOT IT",
                 Notice::Stored => "CREDENTIAL STORED",
                 Notice::NoWrite => "NO READY CREDENTIAL WRITE - RUN TD-SECRET SET FIRST",

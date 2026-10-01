@@ -15,6 +15,14 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/src/deployment.rs"),
     ),
     (
+        "src/disk_install.rs",
+        include_str!("../../../td-authd/src/disk_install.rs"),
+    ),
+    (
+        "tests/disk_install.rs",
+        include_str!("../../../td-authd/tests/disk_install.rs"),
+    ),
+    (
         "tests/secret_intake.rs",
         include_str!("../../../td-authd/tests/secret_intake.rs"),
     ),
@@ -164,7 +172,11 @@ pub fn recipe() -> Recipe {
             exec: false,
         });
     }
-    for directory in ["{src}/td-firstboot/src", "{src}/engine/src"] {
+    for directory in [
+        "{src}/td-firstboot/src",
+        "{src}/engine/src",
+        "{src}/td-install/src",
+    ] {
         steps.push(Step::MkDir {
             path: directory.into(),
         });
@@ -185,6 +197,11 @@ pub fn recipe() -> Recipe {
         (
             "{src}/engine/src/principals.rs",
             include_str!("../../../engine/src/principals.rs"),
+        ),
+        // The consent channel's codec, shared with the service it supervises.
+        (
+            "{src}/td-install/src/installation_consent.rs",
+            include_str!("../../../td-install/src/installation_consent.rs"),
         ),
     ] {
         steps.push(Step::WriteFile {

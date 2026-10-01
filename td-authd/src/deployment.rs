@@ -263,48 +263,67 @@ pub(crate) struct Intake {
     in_flight: bool,
     identity: (u64, u64),
 }
+/// Binds a nonblocking owner-only intake socket at `path` under the
+/// protected per-user runtime directory, replacing a stale socket there.
+/// Returns the listener and the identity of the inode it created.
+pub(crate) fn bind_intake(path: &str, owner: u32) -> Result<(UnixListener, (u64, u64)), String> {
+    for parent in ["/run", "/run/td-authd", "/run/td-authd/1000"] {
+        let metadata = fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+        if !metadata.is_dir()
+            || metadata.uid() != 0
+            || metadata.gid() != 0
+            || metadata.mode() & 0o7022 != 0
+        {
+            return Err("intake parent is not protected".into());
+        }
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() && matches!(metadata.uid(), 0 | 1000) => {
+            fs::remove_file(path).map_err(|e| e.to_string())?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        _ => return Err("unexpected intake endpoint".into()),
+    }
+    let listener = UnixListener::bind(path).map_err(|e| e.to_string())?;
+    let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    let identity = (metadata.dev(), metadata.ino());
+    // Created, so removed on any failure below.
+    let admitted = (|| {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        chown(path, Some(owner), Some(owner))?;
+        listener.set_nonblocking(true)
+    })();
+    if let Err(e) = admitted {
+        unlink_intake(path, identity);
+        return Err(e.to_string());
+    }
+    Ok((listener, identity))
+}
+
+/// Removes the intake socket at `path` only if it is still the inode this
+/// generation created.
+pub(crate) fn unlink_intake(path: &str, identity: (u64, u64)) {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_socket() && (metadata.dev(), metadata.ino()) == identity
+    }) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 impl Intake {
     /// Credential preparation has already admitted these root-owned parents.
     pub fn bind(owner: u32) -> Result<Self, String> {
         if owner != 1000 {
             return Err("unsupported update requester".into());
         }
-        for path in ["/run", "/run/td-authd", "/run/td-authd/1000"] {
-            let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-            if !metadata.is_dir()
-                || metadata.uid() != 0
-                || metadata.gid() != 0
-                || metadata.mode() & 0o7022 != 0
-            {
-                return Err("update intake parent is not protected".into());
-            }
-        }
-        match fs::symlink_metadata(SOCKET) {
-            Ok(metadata)
-                if metadata.file_type().is_socket() && matches!(metadata.uid(), 0 | 1000) =>
-            {
-                fs::remove_file(SOCKET).map_err(|e| e.to_string())?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            _ => return Err("unexpected update intake endpoint".into()),
-        }
-        let listener = UnixListener::bind(SOCKET).map_err(|e| e.to_string())?;
-        let metadata = fs::symlink_metadata(SOCKET).map_err(|e| e.to_string())?;
-        let intake = Self {
+        let (listener, identity) = bind_intake(SOCKET, owner)?;
+        Ok(Self {
             listener,
             owner,
             pending: None,
             in_flight: false,
-            identity: (metadata.dev(), metadata.ino()),
-        };
-        fs::set_permissions(SOCKET, fs::Permissions::from_mode(0o600))
-            .map_err(|e| e.to_string())?;
-        chown(SOCKET, Some(owner), Some(owner)).map_err(|e| e.to_string())?;
-        intake
-            .listener
-            .set_nonblocking(true)
-            .map_err(|e| e.to_string())?;
-        Ok(intake)
+            identity,
+        })
     }
     pub fn tick(&mut self) {
         if let Ok((stream, _)) = self.listener.accept() {
@@ -356,11 +375,7 @@ impl Intake {
 }
 impl Drop for Intake {
     fn drop(&mut self) {
-        if fs::symlink_metadata(SOCKET).is_ok_and(|metadata| {
-            metadata.file_type().is_socket() && (metadata.dev(), metadata.ino()) == self.identity
-        }) {
-            let _ = fs::remove_file(SOCKET);
-        }
+        unlink_intake(SOCKET, self.identity);
     }
 }
 
