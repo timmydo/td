@@ -113,7 +113,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0xadb03ad6a8495644,
+        0xdb0370689e65a509,
         "shared consent changed: reconcile td-secret/src/main.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -133,7 +133,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0x406f4b4077f136c6,
+        0xf6e7066d51c42587,
         "paired secret controller changed"
     );
     assert_eq!(

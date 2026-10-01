@@ -65,7 +65,7 @@ impl Start {
 
 enum Active {
     Secret(Box<Unlock>),
-    Install(crate::deployment::Installation),
+    Install(Box<crate::deployment::Installation>),
 }
 impl Active {
     fn request(&self) -> &Description {
@@ -349,7 +349,7 @@ impl Session {
         };
         let mut answer = vec![0x92];
         answer.extend_from_slice(&operation.request().encode());
-        self.operation = Some(Active::Install(operation));
+        self.operation = Some(Active::Install(Box::new(operation)));
         self.installing = true;
         self.event = Some(Event::Waiting);
         Ok(answer)

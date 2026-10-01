@@ -275,4 +275,50 @@ mod tests {
         assert!(!upper.paint(&mut display, 799, 600, 3200));
         assert_eq!(display, before);
     }
+
+    /// The widest disk installation summary, every field at its bound and a
+    /// time line, is shown whole from 1024x768; smaller outputs that cannot
+    /// hold it refuse rather than clip.
+    #[test]
+    fn the_widest_disk_installation_prompt_fits_a_1024_by_768_output() {
+        use crate::authority::consent::{Label, DISK_NAME_BYTES, HOSTNAME_BYTES, USERNAME_BYTES};
+        let widest = Request::new(
+            [1; 32],
+            1000,
+            Operation::InstallDisk {
+                requester: 1000,
+                disk: "d".repeat(DISK_NAME_BYTES),
+                capacity: u64::MAX,
+                model: Some(Label::model(&[0xff; 64])),
+                serial: Some(Label::serial(&[0xff; 64])),
+                hostname: "h".repeat(HOSTNAME_BYTES),
+                username: "u".repeat(USERNAME_BYTES),
+                deployment: [0xff; 8],
+            },
+        )
+        .unwrap();
+        assert!(Prepared::with_time(widest.clone(), 1024, 768, 4096, Some(120)).is_ok());
+        assert_eq!(
+            Prepared::with_time(widest, 800, 600, 3200, Some(120))
+                .err()
+                .unwrap(),
+            "output cannot hold every trusted prompt argument"
+        );
+        let typical = Request::new(
+            [1; 32],
+            1000,
+            Operation::InstallDisk {
+                requester: 1000,
+                disk: "nvme0n1".into(),
+                capacity: 512_110_190_592,
+                model: Some(Label::model(b"Samsung SSD 980 PRO 1TB")),
+                serial: Some(Label::serial(b"S5GXNX0T123456A")),
+                hostname: "td-laptop".into(),
+                username: "tester".into(),
+                deployment: [0xab; 8],
+            },
+        )
+        .unwrap();
+        assert!(Prepared::with_time(typical, 800, 600, 3200, Some(120)).is_ok());
+    }
 }

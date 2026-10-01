@@ -885,17 +885,30 @@ and protected mounts at or below it are refused.
 
 ## Immutable consent description prerequisite
 
-`consent.rs` supplies a bounded, immutable public description for the trusted
-renderer. The canonical wire value is `TDCONS01`, a nonzero 32-byte operation
-nonce, a big-endian u32 human UID, and a one-byte operation. Enrollment (1)
-adds platform profile 1 (TPM PCR 7), the recovery policy (1 second token,
-0 explicitly unrecoverable, matching TDENROL1) and
-step (1 create primary, 2 prove primary, 3 create recovery, 4 prove recovery).
-An unrecoverable request refuses either recovery-token step. Unlock (2) adds
-role 1 primary or 2 recovery. Credential write (4) adds role 1 primary
-or 2 recovery, then big-endian u32 application and requester UIDs, then a one-byte length and ASCII bytes for
-each application and credential name. The whole value is at most 256 bytes;
-unknown tags, truncation and trailing bytes refuse.
+`consent.rs` supplies a bounded, immutable public description for the
+trusted renderer. The canonical wire value is `TDCONS01`, a nonzero 32-byte
+operation nonce, a big-endian u32 human UID, and a one-byte operation.
+Enrollment (1) adds platform profile 1 (TPM PCR 7), the recovery policy (1
+second token, 0 explicitly unrecoverable, matching TDENROL1) and step (1
+create primary, 2 prove primary, 3 create recovery, 4 prove recovery). An
+unrecoverable request refuses either recovery-token step. Unlock (2) adds
+role 1 primary or 2 recovery. Credential write (4) adds role 1 primary or 2
+recovery, then big-endian u32 application and requester UIDs, then a
+one-byte length and ASCII bytes for each application and credential name.
+Whole-disk installation (6) adds a big-endian u32 requester and u64 capacity
+in bytes, then one-byte-length fields for the disk's kernel name (1 to 31
+ASCII alphanumerics, hyphen or underscore), its model and serial labels, the
+hostname (1 to 63 bytes) and the username (1 to 32), then the first eight
+bytes of the deployment ID. A label's length byte is 0xFF when the disk
+reported none, and otherwise its length (at most 32 for the model, 24 for
+the serial) with bit 7 set when it was cut. Its bytes are the canonical
+escape of what the disk reported: printable ASCII other than space and
+backslash as itself, backslash as `\\`, space as `\s`, every other byte as
+`\xNN` in lowercase hex, cut before the first escape that would pass the
+width; a cut label has no room left for another escape. Hostname and
+username are printable ASCII without space or backslash, and the requester
+must equal the owner. The widest value is 252 bytes. The whole value is at
+most 256 bytes; unknown tags, truncation and trailing bytes refuse.
 
 The human UID is 1000 through 65533; the external application UID is 65536
 through 2147483647. A write's requester must equal its human owner. Names are
@@ -909,8 +922,24 @@ This means exactly SHA-256 PCR selection `7` (mask bit 7 alone); the
 store's other supported PCR selections are deliberately unencodable in
 this prompt profile. The authority must refuse those selections, never
 map a different mask onto this label. Spaces and dots are excluded from
-credential names: indented continuation text cannot imitate the fixed
-labels or token instructions. All consumers pin the codec source and its
+credential names, and spaces and backslashes are escaped or excluded in a
+disk installation's labels and names: indented continuation text cannot
+imitate the fixed labels or token instructions.
+
+A disk installation shows its disk name, size in decimal GB and exact
+bytes, model and serial (`NOT REPORTED`, `REPORTED EMPTY` or `(TRUNCATED)`
+where they apply; each marker holds a space, which a label always escapes),
+that all data on the disk will be lost, the hostname, user and deployment
+ID prefix, that storage is unencrypted and login automatic (the v1 plan's
+fixed policies), and `ENTER: ERASE AND INSTALL   ESC: CANCEL`. The
+widest summary, with its time line, is shown whole on a 1024x768 output; a
+smaller output that cannot hold every row refuses, as for any request. The
+summary is display only and does not bind the installation plan: the
+operation that presents it must bind the plan itself. The plan admits
+longer disk names (64 bytes) and backslashes in names, which this summary
+refuses, so the producer must narrow those or refuse the plan before
+consent; a kernel disk name is at most 31 bytes. Nothing presents it
+yet. All consumers pin the codec source and its
 tests assert the complete public argument display.
 
 These are structural checks, not caller admission or proof of

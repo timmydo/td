@@ -5602,13 +5602,15 @@ rotate a signing key. The installation protocol is in td-authd/DESIGN.md.
 ### Immutable prompt presentation
 
 The shared `td-authd/src/consent.rs` value describes one session and one
-operation: enrollment with an encoded platform profile, explicit recovery policy and proof step,
-session unlock with a token role, or one credential write with the exact
-application name, credential name, external application UID and requester
-UID. Its private fields preserve construction checks. Decoding validates
-bounded canonical framing and identities; it does not authenticate a sender,
-prove nonce freshness or admit an operation. The authority must supply fresh
-entropy and independently admitted identities over its private channel.
+operation: enrollment with an encoded platform profile, explicit recovery
+policy and proof step, session unlock with a token role, one credential write
+with the exact application name, credential name, external application UID and
+requester UID, or a whole-disk installation's fixed summary with escaped disk
+labels (td-authd/DESIGN.md). Its private fields preserve construction checks.
+Decoding validates bounded canonical framing and identities; it does not
+authenticate a sender, prove nonce freshness or admit an operation. The
+authority must supply fresh entropy and independently admitted identities over
+its private channel.
 
 The private renderer rasterizes every human-relevant operation argument once with the
 pinned case-sensitive font and retains the exact immutable request beside
