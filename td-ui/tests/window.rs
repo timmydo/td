@@ -96,6 +96,8 @@ struct Recorder {
     states: Vec<(bool, bool, bool)>,
     /// Asks the window to withdraw what it copied, answered once.
     withdraw: bool,
+    /// Asks the window to clear its frames, answered once.
+    scrub: bool,
 }
 
 impl Recorder {
@@ -116,6 +118,7 @@ impl Recorder {
             outcomes: Vec::new(),
             states: Vec::new(),
             withdraw: false,
+            scrub: false,
         }
     }
     fn paints(&self) -> usize {
@@ -239,6 +242,9 @@ impl Handler for Recorder {
     }
     fn take_withdrawal(&mut self) -> bool {
         std::mem::take(&mut self.withdraw)
+    }
+    fn take_scrub(&mut self) -> bool {
+        std::mem::take(&mut self.scrub)
     }
 }
 
@@ -971,6 +977,84 @@ fn the_loop_runs_a_handler_over_a_socket_until_it_quits() {
         ]
     );
     assert!(!handler.polls.is_empty());
+}
+
+#[test]
+fn a_scrub_zeroes_released_frames_now_and_an_attached_one_on_release() {
+    let mut handler = Recorder::new();
+    let (mut w, peer, _, _) = fixture(&mut handler);
+    configure(&mut w, 83, 35);
+    drain(&peer);
+    w.draw().unwrap();
+    let (_, files) = drain(&peer);
+    let file = &files[0];
+    let size = 83 * 35 * 4;
+    let read = |file: &File| {
+        let mut bytes = vec![0; size];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        bytes
+    };
+    let blank = vec![0; size];
+    assert_ne!(read(file), blank, "the frame is in the buffer");
+    // Attached: the scrub waits for the compositor's release.
+    w.handler_mut().scrub = true;
+    w.end_turn(10, true).unwrap();
+    assert!(!w.handler().scrub, "asked once");
+    assert!(
+        w.client().pixels().iter().all(|&b| b == 0),
+        "the raster's pixels"
+    );
+    assert_ne!(read(file), blank, "an attached buffer is the compositor's");
+    let buffer = w.client().buffers()[0].id();
+    w.event(message(buffer, 0, &[])).unwrap();
+    assert_eq!(read(file), blank, "zeroed on release");
+    // Released: zeroed at once, and the next frame paints as usual.
+    done(&mut w);
+    w.handler_mut().redraw = true;
+    w.draw().unwrap();
+    assert_ne!(read(file), blank);
+    w.event(message(buffer, 0, &[])).unwrap();
+    assert_ne!(read(file), blank, "no scrub asked, none done");
+    w.handler_mut().scrub = true;
+    w.end_turn(20, true).unwrap();
+    assert_eq!(read(file), blank);
+    // A closed window is not asked.
+    w.handler_mut().quit_at_poll = Some(30);
+    w.end_turn(30, true).unwrap();
+    w.handler_mut().scrub = true;
+    w.end_turn(40, true).unwrap();
+    assert!(w.handler().scrub);
+}
+
+#[test]
+fn an_input_asks_a_scrub_and_closing_zeroes_the_attached_buffer() {
+    let mut handler = Recorder::new();
+    let (mut w, peer, keyboard, _) = fixture(&mut handler);
+    focus_with_map(&mut w, &peer, keyboard);
+    configure(&mut w, 83, 35);
+    drain(&peer);
+    w.draw().unwrap();
+    let (_, files) = drain(&peer);
+    let file = &files[0];
+    let size = 83 * 35 * 4;
+    let read = |file: &File| {
+        let mut bytes = vec![0; size];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        bytes
+    };
+    let blank = vec![0; size];
+    assert_ne!(read(file), blank);
+    // An input's turn asks as a poll's does.
+    w.handler_mut().scrub = true;
+    press(&mut w, keyboard, 9, 30);
+    assert!(!w.handler().scrub, "asked after the input");
+    assert!(w.client().pixels().iter().all(|&b| b == 0));
+    assert_ne!(read(file), blank, "still attached");
+    // Closing with the buffer still attached zeroes it: no release follows.
+    w.handler_mut().quit_on = Some(Record::Close);
+    w.event(message(TOPLEVEL, 1, &[])).unwrap();
+    assert!(w.client().closed());
+    assert_eq!(read(file), blank, "zeroed at close");
 }
 
 /// Completes the outstanding frame callback.

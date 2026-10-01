@@ -76,6 +76,10 @@ impl Handler for Session {
         self.app.take_withdrawal()
     }
 
+    fn take_scrub(&mut self) -> bool {
+        self.app.take_scrub()
+    }
+
     fn notice(&mut self, message: &str) {
         eprintln!("td-pass: window: {message}");
     }

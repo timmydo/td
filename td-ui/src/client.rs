@@ -95,7 +95,11 @@ pub struct Buffer {
     file: File,
     width: usize,
     height: usize,
+    /// The backing file's length.
+    bytes: usize,
     busy: bool,
+    /// Zeroed when the compositor releases it: a scrub found it attached.
+    scrub: bool,
 }
 
 impl Buffer {
@@ -1243,8 +1247,15 @@ impl<T: Tag> Client<T> {
         self.closed
     }
 
+    /// Ends the window. A buffer a scrub left for its release is zeroed
+    /// now: no release will come, and the window no longer shows it.
     pub fn close(&mut self) {
         self.closed = true;
+        for buffer in &mut self.buffers {
+            if buffer.scrub && zero(&buffer.file, buffer.bytes).is_ok() {
+                buffer.scrub = false;
+            }
+        }
     }
 
     /// The outstanding frame callback, if a presented frame awaits it.
@@ -1386,6 +1397,27 @@ impl<T: Tag> Client<T> {
         Ok(true)
     }
 
+    /// Zeroes the frames kept, as a lock asks: the raster's pixels with
+    /// their spare capacity, and every buffer the compositor has released,
+    /// now; a buffer still attached is zeroed when it is released. Copies
+    /// the compositor made of a frame are its own.
+    pub fn scrub_frames(&mut self) -> Result<()> {
+        self.pixels.fill(0);
+        for byte in self.pixels.spare_capacity_mut() {
+            byte.write(0);
+        }
+        std::hint::black_box(self.pixels.as_mut_slice());
+        std::hint::black_box(self.pixels.spare_capacity_mut());
+        for buffer in &mut self.buffers {
+            if buffer.busy {
+                buffer.scrub = true;
+            } else {
+                zero(&buffer.file, buffer.bytes)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Creates the pool and buffer for one `width` by `height` frame of
     /// `size` bytes, which `present` validated.
     fn create_buffer(&mut self, width: usize, height: usize, size: usize) -> Result<usize> {
@@ -1416,7 +1448,9 @@ impl<T: Tag> Client<T> {
             file,
             width,
             height,
+            bytes: size,
             busy: false,
+            scrub: false,
         });
         Ok(index)
     }
@@ -1580,6 +1614,10 @@ impl<T: Tag> Client<T> {
                     return Err("duplicate buffer release".into());
                 }
                 buffer.busy = false;
+                if buffer.scrub {
+                    zero(&buffer.file, buffer.bytes)?;
+                    buffer.scrub = false;
+                }
                 Handled::Done
             }
             (id, 0) if self.kind(id)? == Kind::RetiredBuffer => Handled::Done,
@@ -1830,6 +1868,20 @@ pub fn run<A: App>(app: &mut A) -> Result<()> {
             }
             app.client().connection.read_more()?;
         }
+    }
+    Ok(())
+}
+
+/// Writes `size` zero bytes over a buffer's backing file.
+fn zero(file: &File, size: usize) -> Result<()> {
+    static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
+    let mut at = 0;
+    while at < size {
+        let n = (size - at).min(ZEROS.len());
+        let chunk = ZEROS.get(..n).ok_or("zero chunk")?;
+        file.write_all_at(chunk, at as u64)
+            .map_err(|e| format!("zero frame buffer: {e}"))?;
+        at += n;
     }
     Ok(())
 }

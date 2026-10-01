@@ -119,8 +119,10 @@ standalone. No refusal falls back to the other mode.
   PIN request shows a masked field that refuses copy. Escape or Cancel
   declines, which the vault reports as cancelled.
 - **Lock.** Lock forgets every document and its history, the find query,
-  the titles, the fields and any pending paste, and withdraws the
-  window's clipboard offer. A paste lands only where it was asked: one
+  the titles, the fields and any pending paste, withdraws the window's
+  clipboard offer, and has td-ui zero the frames it keeps: its pixels
+  and every buffer the compositor has released at once, one still
+  attached when released. A paste lands only where it was asked: one
   for a replaced entry or an ended prompt is dropped.
 - **Frames.** td-ui keeps each frame in a file in the directory it is
   given. The window gives it `$XDG_RUNTIME_DIR` or `/dev/shm`, whichever
@@ -142,9 +144,7 @@ only the toolkit's drawing, widget and editor modules, that td-secret
 is named only by the vault thread and the worker dispatch, the two
 reads the window makes, and the vault-document policy.
 
-Not yet: clearing td-ui's retained frame buffers on lock (a frame
-showing entry text stays in a buffer the compositor released until it
-is reused), key management, encrypted import and export, the native
+Not yet: key management, encrypted import and export, the native
 compositor cases, host lock and suspend integration, td mode, and the
 recipe and image integration of increment 5.
 

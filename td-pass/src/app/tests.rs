@@ -320,6 +320,8 @@ fn lock_forgets_every_title_body_and_query_and_withdraws_the_clipboard() {
     assert_eq!(app.pane.editor().tabs().count(), 0);
     assert!(app.take_withdrawal());
     assert!(!app.take_withdrawal());
+    assert!(app.take_scrub());
+    assert!(!app.take_scrub());
     app.reply(Reply::Locked {
         keys: Some(vec![label(Role::Primary, "0a0b0c0d")]),
     });

@@ -325,6 +325,15 @@ pub trait Handler {
     fn take_withdrawal(&mut self) -> bool {
         false
     }
+    /// Takes a request to clear the frames the window keeps, asked with
+    /// `take_withdrawal` and, like it, an edge answered once per request,
+    /// as a lock does. The window zeroes the raster's pixels and every
+    /// buffer the compositor has released at once, and a buffer still
+    /// attached when it is released; the next frame is painted as usual.
+    /// What the compositor copied of a frame is beyond the window.
+    fn take_scrub(&mut self) -> bool {
+        false
+    }
 }
 
 /// The window owns no Wayland objects of its own.
@@ -431,7 +440,11 @@ impl<'h, H: Handler> Window<'h, H> {
         if let Some(error) = self.board.error.take() {
             return Err(error);
         }
-        self.withdraw()?;
+        // A refused withdrawal ends the loop, but not before the frames
+        // are cleared.
+        let withdrawn = self.withdraw();
+        self.scrub()?;
+        withdrawn?;
         if flow == Flow::Quit {
             self.client.close();
         }
@@ -671,6 +684,15 @@ impl<'h, H: Handler> Window<'h, H> {
         self.client.withdraw_selection().map(drop)
     }
 
+    /// Clears the frames kept when the handler asks. A closed window is
+    /// not asked.
+    fn scrub(&mut self) -> Result<()> {
+        if self.client.closed() || !self.handler.take_scrub() {
+            return Ok(());
+        }
+        self.client.scrub_frames()
+    }
+
     /// The data device went with its seat or its manager: the transfers
     /// end and the text behind the source is dropped.
     fn release_clipboard(&mut self) {
@@ -819,7 +841,9 @@ impl<H: Handler> App for Window<'_, H> {
         // before this turn steps a send of it.
         if !self.client.closed() {
             let flow = self.handler.poll(now);
-            self.withdraw()?;
+            let withdrawn = self.withdraw();
+            self.scrub()?;
+            withdrawn?;
             if flow == Flow::Quit {
                 self.client.close();
             }

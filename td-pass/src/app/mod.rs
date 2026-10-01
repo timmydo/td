@@ -174,6 +174,8 @@ pub struct App {
     caret_visible: bool,
     redraw: bool,
     withdraw: bool,
+    /// The window's kept frames are to be cleared, asked once per lock.
+    scrub: bool,
     /// What a question asked during an operation was for, kept until the
     /// operation ends and the question can be asked again.
     deferred: Option<Then>,
@@ -204,6 +206,7 @@ impl App {
             caret_visible: true,
             redraw: true,
             withdraw: false,
+            scrub: false,
             deferred: None,
             quit: false,
             out: vec![Out::Send(Command::Open)],
@@ -226,6 +229,12 @@ impl App {
     /// answered once per lock.
     pub fn take_withdrawal(&mut self) -> bool {
         std::mem::take(&mut self.withdraw)
+    }
+
+    /// Whether the frames the window keeps must be cleared; answered once
+    /// per lock.
+    pub fn take_scrub(&mut self) -> bool {
+        std::mem::take(&mut self.scrub)
     }
 
     pub fn paint(&mut self, raster: &mut Raster<'_, '_>, surface: Surface) -> Result<(), String> {
@@ -1038,6 +1047,7 @@ impl App {
         self.drag = None;
         self.deferred = None;
         self.withdraw = true;
+        self.scrub = true;
         self.phase = Phase::Locking;
         self.focus = Focus::Keys;
         self.redraw = true;

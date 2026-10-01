@@ -490,14 +490,15 @@ of its own files may name each module.
   `acknowledge`, `close`), presentation (`can_present` and `present`, which
   refuses an extent the raster could not paint, then paints through the
   caller's closure into the reused raster and submits under the three-buffer
-  rule; `buffers`, `pixels`, `frame_callback`), the devices (`seat`,
-  `keyboard`, `pointer`, `entered` for the pointer's enter serial, `input`
-  for the keyboard's state, and the repeat half of that state a consumer
-  drives: `cancel_repeat`, `arm`, `repeat` and `wait_ms`), the clipboard
-  (`clipboard` for a live data device, `selection` and `selection_mime` for
-  the seat's selection and its preferred text type, `receive` to ask it for
-  its text over a consumer's endpoint, `offer_selection` to offer text at a
-  serial, `withdraw_selection` to destroy the live source without one, and
+  rule; `buffers`, `pixels`, `frame_callback`, and `scrub_frames`), the
+  devices (`seat`, `keyboard`, `pointer`, `entered` for the pointer's enter
+  serial, `input` for the keyboard's state, and the repeat half of that
+  state a consumer drives: `cancel_repeat`, `arm`, `repeat` and
+  `wait_ms`), the clipboard (`clipboard` for a live data device,
+  `selection` and `selection_mime` for the seat's selection and its
+  preferred text type, `receive` to ask it for its text over a consumer's
+  endpoint, `offer_selection` to offer text at a serial,
+  `withdraw_selection` to destroy the live source without one, and
   `source` for the live source whose text the consumer keeps;
   `want_primary` before the initial roundtrip asks for the primary
   selection too, read through `primary`, `primary_mime`,
@@ -576,10 +577,10 @@ of its own files may name each module.
   `NoClipboard`, which refuses everything, for a test or a headless run;
   the `Handler` trait (`app_id`, `title`, `input` with a clipboard,
   `poll`, `wait_ms`, `needs_redraw`, `paint`, `notice`,
-  `take_withdrawal`); `Object`, the empty tag; `Window<'h, H>` (`new`,
-  `with_typeface`, `handler`, `handler_mut`, `surface`), the `App` over a
-  handler it borrows; and `run` with an optional `Typeface`, under
-  "Widget window" below.
+  `take_withdrawal`, `take_scrub`); `Object`, the empty tag;
+  `Window<'h, H>` (`new`, `with_typeface`, `handler`, `handler_mut`,
+  `surface`), the `App` over a handler it borrows; and `run` with an
+  optional `Typeface`, under "Widget window" below.
 - The editor core, under "Editor core" below: `editor_text`, the text
   bounds and lossless codec; `editor_model`, the `Editor` with its
   documents, transactions and `RevisionPoint`s; `editor_fill`, the fill
@@ -1765,6 +1766,28 @@ the window no copy of the text; destroy it at once from the input that
 copied; write none of a short secret whose send is pending when an idle
 turn's poll locks; withdraw before closing when that poll also quits;
 send nothing with nothing offered; and do not ask a closed window.
+
+A handler clears the frames the window keeps through
+`Handler::take_scrub`, an edge asked with `take_withdrawal` after every
+input and every poll, as a lock does. The client zeroes the raster's
+pixels with their spare capacity and every buffer the compositor has
+released at once, and a buffer still attached when the compositor
+releases it; nothing is presented for it, and the next frame is painted
+as usual over a zeroed buffer. The request does not repaint: an
+attached frame is released, and so zeroed, once the handler's next
+frame replaces it, so a handler clearing what it shows also asks a
+redraw. A buffer still awaiting its release when the window closes is
+zeroed then, as best it can be, since a closing window reports no
+error. A refused withdrawal ends the loop only after the scrub. The
+backing files are the consumer's
+directory's: a consumer showing secrets gives a memory-backed one. What
+the compositor copied of a frame, a buffer retired by a resize before
+the request, and the pixel vector's earlier allocations, freed when a
+larger frame grew it, are beyond the window. The scrub tests check a
+released buffer zeroed at the request, an attached one only at its
+release, the pixels zeroed, nothing done unasked, a request made by an
+input as well as by a poll, a pending buffer zeroed when the window
+closes, and a closed window not asked.
 
 ## Shared action button
 

@@ -244,6 +244,7 @@ fn every_entry_document_is_held_to_the_vault_policy() {
         "Event::Clear",
         "History::default()",
         "self.withdraw = true",
+        "self.scrub = true",
         "self.prompt = None",
         "self.paste = None",
     ] {
