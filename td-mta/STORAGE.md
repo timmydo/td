@@ -123,11 +123,37 @@ This is a lookup primitive, not an admitted store root. The caller supplies
 the initial File; its path may have followed links before reaching this API.
 No ownership, mode, ancestor, filesystem or writer-lock claim follows from
 construction or successful relative lookup. Mount crossings remain possible.
-M05b2b must establish trusted roots before any service consumer uses this
-primitive for storage. File I/O, exclusive locking, durable mutation and
-fault injection remain pending. The current raw ABI supports x86-64 only;
-additional architectures need their own reviewed mapping. UNSAFE section 22
-owns the exact syscall, flags, descriptor ownership and confinement tests.
+
+`PrivateRoot::open` separately validates the absolute configuration path and
+walks it from an opened `/` descriptor, retaining each parent through the
+next openat2 call. Each actual ancestor must belong to root or the service
+UID, with no group/other write bits; sticky shared directories are refused.
+The current O_RDONLY directory walk requires ancestors to be readable as well
+as searchable by the service. Search-only ancestors fail with an I/O error;
+supporting them would require a separately reviewed O_PATH profile.
+The final data directory must belong to the service UID and have exact 0700
+permissions with no special bits. The UID comes from geteuid, never an
+operator-provided owner number; UID zero is refused. Startup must retain its
+unprivileged deployment credentials. Deployment must map both UID 0 and the
+service UID in the current user namespace and keep `kernel.overflowuid`
+different from both. Otherwise unmapped file owners can appear to match a
+trusted owner. The dedicated service identity must not be the overflow UID
+(default 65534). These are deployment preconditions: this path check does not
+validate UID mappings or the overflow sysctl, inspect capabilities, or
+authorize later identity switching. Root and the service UID, and the
+mount namespace they control, are trusted. No untrusted concurrent writer is
+supported. Only the final handle is retained after this startup walk; later
+trusted-owner renames do not retarget it.
+
+The separate type certifies only these directory owner/mode/lookup checks.
+Its child Directory accessor retains ordinary confinement guarantees and does
+not grant checked ownership to descendants. Filesystem qualification, the
+persistent exclusive LOCK and store-format validation must still complete
+before activation. No files or directories are created here. File I/O,
+durable mutation and fault injection remain pending. The current raw ABI
+supports x86-64 only; additional architectures need their own reviewed
+mapping. UNSAFE section 22 owns the exact syscall, flags, descriptor ownership
+and confinement tests.
 
 ## 3. Metadata records
 

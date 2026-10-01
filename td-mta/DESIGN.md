@@ -25,8 +25,11 @@ validates complete frames and supplied journal streams with bounded counters,
 sequence continuity and sticky failure; it seals caller-built payloads in place.
 M05a3c binds history summaries to selected descriptors and active summaries to
 the caller's pinned committed prefix.
-Physical EOF, selected-graph validation, complete final-view semantics and
-persistent I/O remain unimplemented.
+M05b1 generates canonical storage paths. M05b2a opens directories relative
+to retained descriptors; M05b2b1 separately checks private data-root ancestry,
+ownership and permissions. Filesystem qualification, the writer lock,
+physical EOF, selected-graph validation, complete final-view semantics and
+persistent file I/O remain unimplemented.
 [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.
 [API.md](API.md) defines the compiling M02c2 adapter contracts and implemented
@@ -190,8 +193,8 @@ cryptography. Retaining Rustls means td-crypto still has an external TLS
 implementation even after AWS-LC is removed.
 
 The production library denies `unsafe_code`, with only the confined directory
-lookup and descriptor adoption in UNSAFE.md section 22 allowed. The binary
-retains `forbid(unsafe_code)`. The separate test executable
+lookup, effective-UID query and descriptor adoption in UNSAFE.md section 22
+allowed. The binary retains `forbid(unsafe_code)`. The separate test executable
 `tests/rust_alloc_probe.rs` has the user-approved allocation instrumentation
 exception specified in UNSAFE.md T1. Its single scoped GlobalAlloc
 implementation forwards all four operations to System without changing
@@ -421,9 +424,10 @@ the service does not support a data root with an untrusted concurrent writer.
 Create secret/mail files as 0600 and private directories as 0700, without a
 permissive creation window. Never derive a filesystem pathname from a mailbox
 name, address, attachment filename, or arbitrary client ID.
-The implemented descriptor-only directory lookup and its remaining root
-admission requirements are specified in STORAGE.md; its narrow Linux syscall
-and immediate descriptor adoption are recorded in UNSAFE.md section 22.
+The implemented descriptor directory lookup and private-root owner/mode walk
+are specified in STORAGE.md. Filesystem qualification and the writer lock
+remain pending. The narrow Linux syscalls and immediate descriptor adoption
+are recorded in UNSAFE.md section 22.
 
 Planned commands, with stable JSON output and exit codes:
 

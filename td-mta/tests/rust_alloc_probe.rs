@@ -692,14 +692,24 @@ fn entropy_workers() {
 }
 
 fn store_directories() {
+    use std::os::unix::fs::MetadataExt;
     use td_mta::{
-        store_fs::Directory,
+        store_fs::{Directory, PrivateRoot, RootError},
         store_paths::{Name, RootEntry},
     };
     let path = std::env::temp_dir().join(format!("td-mta-dir-alloc-{}", std::process::id()));
     std::fs::create_dir(&path).unwrap();
     std::fs::create_dir(path.join("accounts")).unwrap();
     let root = Directory::from_file(std::fs::File::open(&path).unwrap()).unwrap();
+    let expected_uid = root.metadata().unwrap().uid();
+    // Exercise the effective-UID boundary in the portable runtime too. This
+    // does not certify the fixture's entire host ancestry as an admitted root.
+    match PrivateRoot::open("/") {
+        Ok(admitted) => assert_eq!(admitted.service_uid(), expected_uid),
+        Err(RootError::ServiceIdentity) => assert_eq!(expected_uid, 0),
+        Err(RootError::Owner | RootError::PrivateMode) => assert_ne!(expected_uid, 0),
+        Err(error) => panic!("root admission probe: {error}"),
+    }
     let present = Name::root(RootEntry::Accounts).unwrap();
     let missing = Name::root(RootEntry::Lock).unwrap();
     let before = COUNTERS.snapshot();

@@ -645,9 +645,16 @@ service activation. Each part lands independently:
       owned descriptor independently of pathname changes. Kernel rejection,
       ownership/exec cleanup and allocation observations cover the primitive.
       Linux 5.6+ is required; no older-kernel fallback is planned.
-    - **M05b2b — root admission and lock:** pending trusted ancestry, owner/
-      mode/filesystem admission and exclusive persistent LOCK lifetime.
+    - **M05b2b — root admission and lock:** private-root path checks are
+      implemented; filesystem admission and persistent LOCK remain pending.
       A caller-provided directory descriptor alone is not a trusted root.
+      - **M05b2b1 — private-root path:** implemented an actual-effective-UID
+        check and descriptor walk from `/`, refusing untrusted owners, writable
+        ancestors (including sticky directories), symlinks and nonprivate data
+        roots. Keep this distinct from filesystem admission and LOCK.
+      - **M05b2b2 — filesystem and LOCK:** pending local filesystem
+        qualification, persistent private lock inode, exclusive lifetime and
+        process-death tests.
     - **M05b2c — durable operations:** pending confined file creation/read/
       write, non-replacing publication, sync and deterministic fault model.
       Process-death tests and later VM power-loss evidence remain required.
