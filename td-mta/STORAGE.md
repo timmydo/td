@@ -71,6 +71,15 @@ get distinct email/blob IDs. V1 does not deduplicate message contents.
 
 Mail and upload shards use the first byte of the ID (two hex characters),
 distributing files over 256 directories without putting mailbox names in paths.
+Generation and segment numbers follow FORMAT section 1's fixed-width canonical
+encoding; the shortened paths above are illustrative. Journal filenames append
+exactly `.log` to the numeric component.
+`store_paths` generates root-relative account paths from typed IDs, checked
+numbers and known table/blob kinds in a fixed 128-byte buffer plus NUL. Its
+borrowed path/C-string views allocate nothing. Directory-entry blob parsing
+requires the exact lowercase ID, namespace suffix and expected shard. This
+establishes only canonical names, not trusted roots, descriptor confinement,
+account authorization, selected-file authority or permission to delete a blob.
 An `.eml` file contains headers, body and encoded MIME attachments, with no
 td-specific prefix or footer. SMTP decoding and locally added trace fields
 follow DESIGN section 9. Flagging, folder moves and folder renames do not

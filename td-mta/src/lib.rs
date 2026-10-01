@@ -14,6 +14,7 @@ pub mod observability;
 pub mod ownership;
 pub mod ports;
 pub mod smtp_wire;
+pub mod store_paths;
 pub mod sync;
 pub mod tls_admission;
 pub mod tls_io;

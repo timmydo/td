@@ -4,8 +4,12 @@ This is the normative byte-layout companion to [STORAGE.md](STORAGE.md).
 M02a and M02b implement allocation-free scalar, primary-key and row codecs in
 `src/format/`, with literal row/container fixtures. M05a1 adds fixed FORMAT,
 CURRENT and journal-header integrity codecs. M05a2a adds table headers and
-individual record envelopes. M05a2b1 validates supplied table streams. Manifest
-validation, cross-file bindings, publication and recovery are unimplemented.
+individual record envelopes. M05a2b1 validates supplied table streams. M05a2b2
+adds manifest structure codecs; M05a2b3 binds selected metadata, table summaries
+and journal headers. M05a3a adds transaction headers and individual operation
+codecs. M05a3b validates complete local frames and supplied journal streams.
+Selected-graph and complete final-view validation, publication and recovery
+are unimplemented.
 M02c freezes semantic
 APIs. Production persistence waits for those contracts
 and the M05 store implementation. Nothing here advertises a usable store.
@@ -306,6 +310,64 @@ stored ordinal order; the final
 operation wins. Byte/operation reservations include the entire frame and all
 descriptors, preventing apparently small metadata changes from exceeding caps.
 
+M05a3a implements `format::frame_header::Header` for exactly 64 bytes. The
+fixed header digest is checked before interpreting length/count/sequence.
+Length and count satisfy the bounds above; sequence is nonzero. Payload length
+must fit the declared count under the generic operation bounds of 28 through
+66572 bytes each. These arithmetic checks do not prove that an actual payload
+has that extent, valid operations or matching footer. Encoding stages only the
+64-byte header and preserves caller output on every returned error.
+
+`format::operation` implements bounded exact operation prefixes and borrowed
+local values. PUT validates a complete typed key/row; DELETE validates the whole
+key and refuses a value. CHANGE validates a known object tag, action, 16-byte
+ID and absent value. Its known Identity tag remains decodable wire syntax;
+v1 transaction validation must reject it. Operations have no own checksum or
+embedded sequence. `extent` grants only prefix framing, not row validity or
+integrity. Encoding prechecks the full output capacity; errors preserve output,
+and success preserves its suffix. Neither individual codec checks final-view references,
+CHANGE coalescing, complete frame integrity, continuity or recovery.
+
+M05a3b implements `format::frame::Frame`. Its `DecodeError::Incomplete` is
+reserved for fewer than 64 supplied header bytes, or fewer supplied bytes than
+the validated header's length after expected-sequence checks pass. A complete
+malformed operation or row is `Invalid`, even when its nested format error is `Truncated`. Missing supplied
+bytes grant no physical-tail repair authority; the I/O adapter establishes EOF.
+`Invalid` retains provider errors too; those do not prove on-disk corruption.
+Decoding verifies the fixed header and expected next sequence before using the
+declared extent. It then checks complete footer hash, end magic, exact operation
+count and every locally valid operation.
+Identity CHANGE is refused. Only after all checks pass can the caller iterate
+borrowed entries, with zero-based stored ordinals preserved. Repeated keys stay
+in wire order. This validates local bytes, not final-view references or CHANGE
+coalescing; M08 must validate those before recovered rows become visible.
+
+`frame::seal` takes an exact caller-owned frame buffer whose middle already
+contains encoded operations. It validates the complete payload, stages a
+64-byte header and computes the footer digest before changing the buffer.
+Returned errors preserve every byte. It uses no second frame-sized buffer.
+Successful sealing establishes local frame grammar and integrity, not sequence
+continuity relative to a journal, authorization or durable publication.
+
+`format::journal_stream::Verifier` hashes the exact journal header and supplied
+frames, enforces consecutive sequences and both the 4 MiB frame-byte and 8192
+operation caps, and retains only a digest, counters and identity. Before a short
+body is classified as incomplete, the verified header must fit both remaining
+journal budgets. Exhausted sequences and budgets that cannot admit even one
+minimum frame refuse any further push, including a short header. Journal-wide
+errors carry journal context separately from frame errors. Every push
+error permanently fails that verifier, including provider failures. Completion
+reports the supplied stream's header, through-sequence, extents, operation count
+and whole-file digest. Empty streams are allowed, including an exhausted base;
+no further frame is accepted after sequence exhaustion. Individual frames and
+the summary remain provisional until final-view and selected-file checks pass.
+The caller binds the expected extent/through-sequence using Selection's
+completed-stream checks in section 5. Completion does not prove that an omitted
+suffix is absent. M05d owns physical EOF, exact committed-prefix consumption,
+invoking the selected-file checks, incomplete physical-tail recovery and
+selected graph publication; the byte codecs do not truncate, scan ahead or
+perform I/O.
+
 The complete-header/short-body distinction and every sync boundary are owned
 by STORAGE sections 5-6. A checksum-invalid complete final frame is corruption,
 not a recoverable incomplete tail. No forward magic search is permitted.
@@ -347,6 +409,72 @@ hashes that complete file, including this digest. The active journal's changing
 extent is never given a fictitious immutable whole-file digest; read views
 capture its committed offset/sequence under the publication lock instead.
 
+`format::manifest` implements a borrowed `Manifest` view and an encoder taking
+a `Header`, exactly eleven typed table descriptors and a bounded history slice.
+Decode uses the untrusted history count only to bound the exact input extent
+before checking the trailing checksum. It then checks magic/schema/flags,
+nonzero generation/active segment, the repeated base sequence, exact ascending
+table tags, and each descriptor's count/file-size consistency using the table
+header rules. IDs and exhausted sequence/name values remain readable.
+
+History segments must be nonzero, unique and distinct from the active segment.
+Ranges are nonempty, contiguous and end at the checkpoint; an expired prefix
+may start after zero and no history is also permitted. For N = through - base, the declared
+file size minus the 96-byte journal header must fit N frames of 132..1048576
+bytes each. Minimum multiplication overflow refuses; an overflowing maximum
+cannot exclude a u64 payload. These checks do not prove actual frame contents
+or admission ceilings. Actual frame ranges and whole-file digests remain
+selected-file validation;
+parsing a descriptor does not establish that any referenced file exists.
+Segment numbers need not be numerically sorted; sequence ranges determine order.
+
+Encoding stages at most 4832 bytes before invoking the digest provider and
+copying to caller output. All returned errors preserve output and success
+preserves its suffix. Decoding retains only the borrowed bytes, small header
+and history count. Descriptor access returns checked values without allocation;
+out-of-range history indices refuse. Duplicate-segment checks perform at most
+2016 bounded pair comparisons. No filesystem path is supplied by a manifest,
+and neither encoder nor decoder grants CURRENT selection or storage authority.
+
+`format::bindings::Selection` checks exact FORMAT and CURRENT containers and
+requires the caller's expected account plus the FORMAT epoch. It decodes the
+manifest and matches account, epoch and generation, then compares CURRENT's
+digest against the entire manifest, including its footer. FORMAT's instance ID
+is retained for inspection; CURRENT and the manifest have no instance field.
+This establishes selected metadata consistency, not filesystem identity or trust.
+
+`check_table` takes an expected table tag from the requested file and a completed
+`table_stream::Summary`. It matches table/account/epoch/generation/checkpoint,
+record count, full length and digest to the selected descriptor. A file's decoded
+tag cannot choose which descriptor it is checked against. Summary generation
+must consume all physical file bytes; the storage adapter still owns EOF and
+immutable-file/pin enforcement.
+
+`check_active_header` and `check_history_header` accept exactly a 96-byte journal
+header and match its account, epoch, segment and base to the selected active
+segment or indexed history descriptor. They do not validate frames, history end
+sequence, whole-file length/digest or the active committed prefix. Those checks
+need the completed-stream checks below and M05d. Invalid history indices refuse
+before requesting a digest.
+
+M05a3c adds `check_history_journal` for a completed `journal_stream::Summary`.
+It checks the selected account/epoch and indexed descriptor's segment/base,
+final sequence,
+whole-file extent and digest, including the journal header and frame checksums.
+Invalid indices or metadata refuse before calling the injected digest comparison.
+`check_active_prefix` instead checks selected active identity/base and the
+caller's expected committed sequence and full prefix length. The caller obtains
+those values from its pinned read view under the publication lock; they are not
+new on-disk fields or a substitute for owning that pin. No fictitious immutable
+hash is assigned to the growing active journal. These methods bind already
+validated supplied bytes; physical EOF for history and exact committed-prefix
+consumption for active views remain M05d responsibilities.
+All checks use bounded caller input and fixed state through the injected Crypto
+facade. No path or filesystem operation is introduced. Checks are independent;
+Selection does not track a complete set or expose a whole-store readiness proof.
+Recovery must require every selected file and frame check to succeed before it
+permits reads or mutations under its storage contract.
+
 ## 6. Positional row values
 
 The table tag selects the row; values carry no repeated kind/schema tag.
@@ -354,8 +482,9 @@ Numbered fields below are concatenated in order without padding. `?T` means
 one 0/1 presence byte followed by T only when present. For example,
 `?bytes(N)` is 0 alone, or 1 followed by u32 length and payload. `Row::decode` checks
 local field rules and full consumption; `Row::validate_key` additionally checks
-matching table, canonical keywords, direct self-parenting, recipient ordinal
-below 1000, and the import-kind/blob-presence rule. The shared
+matching table, direct self-parenting, and the import-kind/blob-presence rule.
+It shares `Key::validate_local` with DELETE for canonical keywords and recipient
+ordinals below 1000. Key encode/decode alone checks structural grammar. The shared
 `decode_record(table, key, value)` entry point calls both; service, inspection,
 verification and migration use it for stored records and PUTs. Neither checks live references, authorization, complete SMTP
 address grammar, or queue transitions; those belong to the transaction/protocol

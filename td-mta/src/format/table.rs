@@ -26,7 +26,7 @@ pub struct TableHeader {
     pub payload_bytes: u64,
 }
 impl TableHeader {
-    fn validate(self) -> Result<Self, FormatError> {
+    pub(super) fn validate(self) -> Result<Self, FormatError> {
         if self.generation == 0
             || (self.record_count == 0) != (self.payload_bytes == 0)
             || (self.through.number() == 0 && self.record_count != 0)

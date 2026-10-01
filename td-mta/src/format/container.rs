@@ -35,7 +35,7 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
-fn hash(crypto: &impl Crypto, bytes: &[u8]) -> Result<[u8; 32], Error> {
+pub(super) fn hash(crypto: &impl Crypto, bytes: &[u8]) -> Result<[u8; 32], Error> {
     let mut digest = crypto.sha256()?;
     digest.update(bytes)?;
     Ok(digest.finish()?)
@@ -60,7 +60,7 @@ pub(super) fn checked_preimage<'a>(
     Ok(preimage)
 }
 
-fn read<'a>(
+pub(super) fn read<'a>(
     crypto: &impl Crypto,
     bytes: &'a [u8],
     length: usize,
@@ -77,7 +77,7 @@ fn read<'a>(
     Ok(reader)
 }
 
-fn prefix(writer: &mut Writer<'_>, magic: &[u8; 8]) -> Result<(), FormatError> {
+pub(super) fn prefix(writer: &mut Writer<'_>, magic: &[u8; 8]) -> Result<(), FormatError> {
     writer.put(magic)?;
     writer.u16(super::CONTAINER_VERSION)?;
     writer.u16(super::SCHEMA_VERSION)?;

@@ -312,21 +312,12 @@ impl Row<'_> {
     /// Checks local key/value rules, not live references or authorization.
     pub fn validate_key(self, key: super::key::Key<'_>) -> Result<(), Error> {
         use super::key::{Key, SourceKind};
-        key.encoded_len()?;
+        key.validate_local()?;
         self.encoded_len()?;
         if key.table() != self.table() {
             return Err(Error::InvalidValue);
         }
         match (key, self) {
-            (Key::Keyword(_, keyword), Self::Keyword) => {
-                if !keyword.bytes().all(|b| {
-                    (0x21..=0x7e).contains(&b)
-                        && !b.is_ascii_uppercase()
-                        && !matches!(b, b'(' | b')' | b'{' | b']' | b'%' | b'*' | b'"' | b'\\')
-                }) {
-                    return Err(Error::InvalidValue);
-                }
-            }
             (Key::Import { kind, .. }, Self::Import(row)) => {
                 if (kind == SourceKind::Email) != row.historical_blob.is_some() {
                     return Err(Error::InvalidValue);
@@ -334,9 +325,6 @@ impl Row<'_> {
             }
             (Key::Mailbox(id), Self::Mailbox(row)) if row.parent == Some(id) => {
                 return Err(Error::InvalidValue)
-            }
-            (Key::Recipient(_, ordinal), _) if ordinal >= MAX_RECIPIENTS => {
-                return Err(Error::Limit)
             }
             _ => {}
         }

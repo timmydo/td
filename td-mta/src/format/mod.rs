@@ -2,8 +2,14 @@
 //! FORMAT.md owns the layout; selected-store validation and persistence remain M05.
 use std::fmt;
 
+pub mod bindings;
 pub mod container;
+pub mod frame;
+pub mod frame_header;
+pub mod journal_stream;
 pub mod key;
+pub mod manifest;
+pub mod operation;
 pub mod row;
 pub mod scalar;
 pub mod table;
@@ -33,6 +39,8 @@ pub const MIN_FRAME_BYTES: usize =
     FRAME_HEADER_BYTES + FRAME_FOOTER_BYTES + OPERATION_HEADER_BYTES + MIN_KEY_BYTES;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_FRAME_OPERATIONS: usize = 4096;
+pub const MAX_JOURNAL_FRAME_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_JOURNAL_OPERATIONS: usize = 8192;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -210,6 +218,8 @@ mod tests {
         let limits = crate::limits::Limits::default();
         assert_eq!(limits.frame_bytes, MAX_FRAME_BYTES);
         assert_eq!(limits.frame_operations, MAX_FRAME_OPERATIONS);
+        assert_eq!(limits.journal_bytes, MAX_JOURNAL_FRAME_BYTES);
+        assert_eq!(limits.journal_operations, MAX_JOURNAL_OPERATIONS);
         assert_eq!(MIN_FRAME_BYTES, 132);
         assert_eq!(
             MAX_MANIFEST_BYTES,

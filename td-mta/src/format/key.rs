@@ -107,6 +107,27 @@ impl<'a> Key<'a> {
         }
     }
 
+    /// Checks key-only stored-value rules; live references remain unchecked.
+    pub fn validate_local(self) -> Result<(), Error> {
+        self.encoded_len()?;
+        match self {
+            Self::Keyword(_, keyword) => {
+                if !keyword.bytes().all(|b| {
+                    (0x21..=0x7e).contains(&b)
+                        && !b.is_ascii_uppercase()
+                        && !matches!(b, b'(' | b')' | b'{' | b']' | b'%' | b'*' | b'"' | b'\\')
+                }) {
+                    return Err(Error::InvalidValue);
+                }
+            }
+            Self::Recipient(_, ordinal) if ordinal >= super::row::MAX_RECIPIENTS => {
+                return Err(Error::Limit)
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Returns the occupied prefix length; caller output is unchanged on error.
     pub fn encode(self, output: &mut [u8]) -> Result<usize, Error> {
         let len = self.encoded_len()?;

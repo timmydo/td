@@ -18,7 +18,15 @@ encoders/decoders with checked digests. These codecs do not validate selected
 store bindings, replay transactions or perform filesystem I/O.
 M05a2a adds checked table headers and individually checksummed borrowed records;
 M05a2b1 checks supplied table streams for order/count/extent and computes
-their digest. Physical EOF, manifests and selected-file bindings remain unimplemented.
+their digest. M05a2b2 adds bounded manifest structure codecs. M05a2b3 binds
+selected metadata, completed table summaries and journal headers. M05a3a adds
+checked fixed transaction headers and local PUT/DELETE/CHANGE codecs. M05a3b
+validates complete frames and supplied journal streams with bounded counters,
+sequence continuity and sticky failure; it seals caller-built payloads in place.
+M05a3c binds history summaries to selected descriptors and active summaries to
+the caller's pinned committed prefix.
+Physical EOF, selected-graph validation, complete final-view semantics and
+persistent I/O remain unimplemented.
 [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.
 [API.md](API.md) defines the compiling M02c2 adapter contracts and implemented

@@ -3,6 +3,7 @@ use td_crypto::{Crypto, Digest, Error as CryptoError, Provider, Sha256};
 use td_mta::{
     format::{
         container::{Current, Error, JournalHeader, StoreIdentity},
+        frame_header::Header as FrameHeader,
         table::{Record, TableHeader},
         Error as FormatError, Sequence, Table,
     },
@@ -45,6 +46,7 @@ codec!(StoreIdentity);
 codec!(Current);
 codec!(JournalHeader);
 codec!(TableHeader);
+codec!(FrameHeader);
 
 fn check<T: Codec>(literal: &str, expected: T) {
     let bytes = hex(literal);
@@ -656,4 +658,486 @@ impl Crypto for FaultCrypto {
     fn sign_es256(&self, _: &(), _: &[u8], _: &mut [u8; 64]) -> Result<(), CryptoError> {
         Err(CryptoError::Invalid)
     }
+}
+
+fn manifest_parts(
+    bytes: &[u8],
+) -> (
+    td_mta::format::manifest::Header,
+    [td_mta::format::manifest::TableDescriptor; 11],
+    Vec<td_mta::format::manifest::HistoryDescriptor>,
+) {
+    use td_mta::format::manifest::Manifest;
+    let view = Manifest::decode(&Provider, bytes).unwrap();
+    let tables =
+        std::array::from_fn(|i| view.table(Table::from_tag(i as u16 + 1).unwrap()).unwrap());
+    let history = (0..view.history_count())
+        .map(|i| view.history(i).unwrap())
+        .collect();
+    (view.header(), tables, history)
+}
+
+#[test]
+fn manifests_use_literal_bytes_and_bounded_borrowed_descriptors() {
+    use td_mta::format::manifest::{self, Manifest};
+    for (literal, generation, through, segment, count) in [
+        (include_str!("fixtures/format-v1/manifest.hex"), 1, 0, 1, 0),
+        (
+            include_str!("fixtures/format-v1/manifest-history.hex"),
+            2,
+            1,
+            2,
+            1,
+        ),
+    ] {
+        let bytes = hex(literal);
+        let view = Manifest::decode(&Provider, &bytes).unwrap();
+        assert_eq!(view.header().account, AccountId::from_bytes([0x33; 16]));
+        assert_eq!(view.header().epoch, StoreEpoch::from_bytes([0x22; 16]));
+        assert_eq!(view.header().generation, generation);
+        assert_eq!(view.header().through.number(), through);
+        assert_eq!(view.header().active_segment, segment);
+        assert_eq!(view.history_count(), count);
+        assert_eq!(view.history(count), Err(FormatError::InvalidValue));
+        assert_eq!(view.history(usize::MAX), Err(FormatError::InvalidValue));
+        for tag in 1..=11 {
+            let table = Table::from_tag(tag).unwrap();
+            let descriptor = view.table(table).unwrap();
+            assert_eq!(descriptor.table, table);
+            let populated = generation == 2 && tag == 1;
+            assert_eq!(descriptor.record_count, u64::from(populated));
+            assert_eq!(descriptor.file_bytes, if populated { 225 } else { 112 });
+        }
+        if count != 0 {
+            let descriptor = view.history(0).unwrap();
+            assert_eq!(
+                (
+                    descriptor.segment,
+                    descriptor.base.number(),
+                    descriptor.through.number(),
+                    descriptor.file_bytes
+                ),
+                (1, 0, 1, 277)
+            );
+        }
+        let (header, tables, history) = manifest_parts(&bytes);
+        let mut output = vec![0xa5; bytes.len() + 7];
+        assert_eq!(
+            manifest::encode(&Provider, header, &tables, &history, &mut output),
+            Ok(bytes.len())
+        );
+        assert_eq!(&output[..bytes.len()], bytes);
+        assert_eq!(&output[bytes.len()..], &[0xa5; 7]);
+        for end in 0..bytes.len() {
+            assert_eq!(
+                Manifest::decode(&Provider, &bytes[..end]),
+                Err(Error::Format(FormatError::Truncated))
+            );
+            let mut short = vec![0xa5; end];
+            assert_eq!(
+                manifest::encode(&Provider, header, &tables, &history, &mut short),
+                Err(Error::Format(FormatError::OutputFull))
+            );
+            assert!(short.iter().all(|&b| b == 0xa5));
+        }
+        for offset in 0..bytes.len() {
+            let mut damaged = bytes.clone();
+            damaged[offset] ^= 1;
+            let result = Manifest::decode(&Provider, &damaged);
+            if (84..88).contains(&offset) {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result, Err(Error::Checksum));
+            }
+        }
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert_eq!(
+            Manifest::decode(&Provider, &extra),
+            Err(Error::Format(FormatError::TrailingBytes))
+        );
+        for fault in [Fault::Start, Fault::Update(1), Fault::Finish] {
+            output.fill(0xa5);
+            assert_eq!(
+                manifest::encode(&FaultCrypto(fault), header, &tables, &history, &mut output),
+                Err(Error::Crypto(CryptoError::Crypto))
+            );
+            assert!(output.iter().all(|&b| b == 0xa5));
+            assert_eq!(
+                Manifest::decode(&FaultCrypto(fault), &bytes),
+                Err(Error::Crypto(CryptoError::Crypto))
+            );
+        }
+        assert_eq!(
+            Manifest::decode(&FaultCrypto(Fault::Compare), &bytes),
+            Err(Error::Checksum)
+        );
+    }
+}
+
+#[test]
+fn checksum_valid_manifest_fields_and_history_must_be_consistent() {
+    use td_mta::format::manifest::{self, Manifest};
+    let bytes = hex(include_str!("fixtures/format-v1/manifest-history.hex"));
+    // Fixed magic/schema/flags, required names, base and descriptor invariants.
+    for (offset, value, error) in [
+        (0, 0, FormatError::InvalidTag),
+        (8, 2, FormatError::InvalidTag),
+        (10, 2, FormatError::InvalidTag),
+        (12, 1, FormatError::InvalidTag),
+        (48, 0, FormatError::InvalidValue),
+        (64, 0, FormatError::InvalidValue),
+        (72, 0, FormatError::InvalidValue),
+        (80, 10, FormatError::InvalidValue),
+        (88, 2, FormatError::InvalidValue),
+        (88, 0, FormatError::InvalidTag),
+        (88, 12, FormatError::InvalidTag),
+        (90, 2, FormatError::InvalidTag),
+        (92, 1, FormatError::InvalidTag),
+        (96, 0, FormatError::InvalidValue),
+        (104, 0, FormatError::InvalidValue),
+        (704, 0, FormatError::InvalidValue),
+        (704, 2, FormatError::InvalidValue),
+        (712, 1, FormatError::InvalidValue),
+        (720, 0, FormatError::InvalidValue),
+        (720, 2, FormatError::InvalidValue),
+        (729, 0, FormatError::InvalidValue),
+    ] {
+        let mut invalid = bytes.clone();
+        invalid[offset] = value;
+        rehash(&mut invalid);
+        assert_eq!(
+            Manifest::decode(&Provider, &invalid),
+            Err(Error::Format(error)),
+            "offset {offset}"
+        );
+    }
+    let (header, tables, history) = manifest_parts(&bytes);
+    let mut output = [0xa5; 4832];
+    for change in 0..5 {
+        let mut h = header;
+        let mut t = tables;
+        match change {
+            0 => h.generation = 0,
+            1 => h.active_segment = 0,
+            2 => t[0].file_bytes = 112,
+            3 => t[0].file_bytes = 111,
+            _ => t[0].record_count = 0,
+        }
+        assert_eq!(
+            manifest::encode(&FaultCrypto(Fault::Start), h, &t, &history, &mut output),
+            Err(Error::Format(FormatError::InvalidValue))
+        );
+        assert_eq!(output, [0xa5; 4832]);
+    }
+    let mut swapped = tables;
+    swapped.swap(0, 1);
+    assert_eq!(
+        manifest::encode(&Provider, header, &swapped, &history, &mut output),
+        Err(Error::Format(FormatError::InvalidValue))
+    );
+    assert_eq!(output, [0xa5; 4832]);
+    let mut invalid = bytes.clone();
+    invalid[84..88].copy_from_slice(&65u32.to_le_bytes());
+    assert_eq!(
+        Manifest::decode(&FaultCrypto(Fault::Start), &invalid),
+        Err(Error::Format(FormatError::Limit))
+    );
+    assert_eq!(
+        Manifest::decode(&FaultCrypto(Fault::Start), &[0; 4833]),
+        Err(Error::Format(FormatError::Limit))
+    );
+    assert_eq!(
+        manifest::encode(
+            &Provider,
+            header,
+            &tables,
+            &vec![history[0]; 65],
+            &mut output
+        ),
+        Err(Error::Format(FormatError::Limit))
+    );
+    assert_eq!(output, [0xa5; 4832]);
+}
+
+#[test]
+fn maximum_history_is_contiguous_unique_and_may_start_after_zero() {
+    use td_mta::format::manifest::{self, HistoryDescriptor, Manifest};
+    let bytes = hex(include_str!("fixtures/format-v1/manifest.hex"));
+    let (mut header, tables, _) = manifest_parts(&bytes);
+    header.through = Sequence::from_u64(164);
+    header.active_segment = u64::MAX;
+    let history: Vec<_> = (0..64)
+        .map(|i| HistoryDescriptor {
+            segment: 64 - i,
+            base: Sequence::from_u64(100 + i),
+            through: Sequence::from_u64(101 + i),
+            file_bytes: 228,
+            digest: [0x55; 32],
+        })
+        .collect();
+    let mut output = [0xa5; 4839];
+    assert_eq!(
+        manifest::encode(&Provider, header, &tables, &history, &mut output),
+        Ok(4832)
+    );
+    assert_eq!(&output[4832..], &[0xa5; 7]);
+    let view = Manifest::decode(&Provider, &output[..4832]).unwrap();
+    assert_eq!(view.history_count(), 64);
+    for (i, item) in history.iter().enumerate() {
+        assert_eq!(view.history(i), Ok(*item));
+    }
+    let good = output[..4832].to_vec();
+    for (offset, value) in [(768, 64), (776, 100), (704, 0), (720, 0)] {
+        let mut damaged = good.clone();
+        damaged[offset] = value;
+        if offset == 776 {
+            damaged[792..800].copy_from_slice(&360u64.to_le_bytes());
+        }
+        rehash(&mut damaged);
+        assert_eq!(
+            Manifest::decode(&Provider, &damaged),
+            Err(Error::Format(FormatError::InvalidValue))
+        );
+    }
+    let mut gap = good.clone();
+    gap[776..784].copy_from_slice(&103u64.to_le_bytes());
+    gap[784..792].copy_from_slice(&104u64.to_le_bytes());
+    rehash(&mut gap);
+    assert_eq!(
+        Manifest::decode(&Provider, &gap),
+        Err(Error::Format(FormatError::InvalidValue))
+    );
+    let mut later = header;
+    later.through = Sequence::from_u64(165);
+    output.fill(0xa5);
+    assert_eq!(
+        manifest::encode(&Provider, later, &tables, &history, &mut output),
+        Err(Error::Format(FormatError::InvalidValue))
+    );
+    assert_eq!(output, [0xa5; 4839]);
+    let mut wrong_end = good.clone();
+    wrong_end[56..64].copy_from_slice(&165u64.to_le_bytes());
+    wrong_end[72..80].copy_from_slice(&165u64.to_le_bytes());
+    rehash(&mut wrong_end);
+    assert_eq!(
+        Manifest::decode(&Provider, &wrong_end),
+        Err(Error::Format(FormatError::InvalidValue))
+    );
+    for change in 0..6 {
+        let mut bad = history.clone();
+        match change {
+            0 => bad[1].segment = bad[0].segment,
+            1 => {
+                bad[1].base = Sequence::from_u64(100);
+                bad[1].file_bytes = 360;
+            }
+            2 => bad[63].through = Sequence::from_u64(163),
+            3 => bad[0].segment = header.active_segment,
+            4 => bad[0].file_bytes = 227,
+            _ => {
+                bad[1].base = Sequence::from_u64(103);
+                bad[1].through = Sequence::from_u64(104);
+            }
+        }
+        output.fill(0xa5);
+        assert_eq!(
+            manifest::encode(&Provider, header, &tables, &bad, &mut output),
+            Err(Error::Format(FormatError::InvalidValue))
+        );
+        assert_eq!(output, [0xa5; 4839]);
+    }
+    // All history may expire even at an exhausted readable sequence.
+    header.through = Sequence::from_u64(u64::MAX);
+    header.generation = u64::MAX;
+    assert_eq!(
+        manifest::encode(&Provider, header, &tables, &[], &mut output),
+        Ok(736)
+    );
+    assert_eq!(
+        Manifest::decode(&Provider, &output[..736])
+            .unwrap()
+            .history_count(),
+        0
+    );
+}
+
+#[test]
+fn history_sizes_obey_frame_range_bounds_without_overflow() {
+    use td_mta::format::manifest::{self, Manifest};
+    let bytes = hex(include_str!("fixtures/format-v1/manifest-history.hex"));
+    let (header, tables, history) = manifest_parts(&bytes);
+    let large = u64::MAX / 132 - 2;
+    for (frames, file_bytes, error) in [
+        (1, 228, None),
+        (1, 1048672, None),
+        (2, 360, None),
+        (large, large * 132 + 96, None),
+        (1, 95, Some(FormatError::InvalidValue)),
+        (1, 227, Some(FormatError::InvalidValue)),
+        (1, 1048673, Some(FormatError::InvalidValue)),
+        (1, u64::MAX, Some(FormatError::InvalidValue)),
+        (2, 359, Some(FormatError::InvalidValue)),
+        (1_000_000, 228, Some(FormatError::InvalidValue)),
+        (u64::MAX, u64::MAX, Some(FormatError::Overflow)),
+    ] {
+        let mut h = header;
+        h.through = Sequence::from_u64(frames);
+        let mut d = history[0];
+        d.through = h.through;
+        d.file_bytes = file_bytes;
+        let mut raw = bytes.clone();
+        raw[56..64].copy_from_slice(&frames.to_le_bytes());
+        raw[72..80].copy_from_slice(&frames.to_le_bytes());
+        raw[720..728].copy_from_slice(&frames.to_le_bytes());
+        raw[728..736].copy_from_slice(&file_bytes.to_le_bytes());
+        rehash(&mut raw);
+        let mut output = [0xa5; 807];
+        if let Some(error) = error {
+            assert_eq!(
+                manifest::encode(&Provider, h, &tables, &[d], &mut output),
+                Err(Error::Format(error))
+            );
+            assert_eq!(output, [0xa5; 807]);
+            assert_eq!(Manifest::decode(&Provider, &raw), Err(Error::Format(error)));
+        } else {
+            assert_eq!(
+                manifest::encode(&Provider, h, &tables, &[d], &mut output),
+                Ok(800)
+            );
+            assert_eq!(&output[..800], raw);
+            assert_eq!(&output[800..], &[0xa5; 7]);
+            assert_eq!(Manifest::decode(&Provider, &raw).unwrap().history(0), Ok(d));
+        }
+    }
+}
+
+#[test]
+fn frame_headers_use_literal_hashes_before_interpreting_lengths() {
+    for (literal, length, count, sequence) in [
+        (
+            include_str!("fixtures/format-v1/frame-put-blob.hex"),
+            181,
+            1,
+            1,
+        ),
+        (
+            include_str!("fixtures/format-v1/frame-delete-change.hex"),
+            160,
+            2,
+            2,
+        ),
+    ] {
+        let digits: String = literal.split_whitespace().collect();
+        check(
+            &digits[..128],
+            FrameHeader {
+                frame_bytes: length,
+                operations: count,
+                sequence: Sequence::from_u64(sequence),
+            },
+        );
+    }
+}
+
+#[test]
+fn frame_header_bounds_are_consistent_and_exhausted_sequences_are_readable() {
+    use td_mta::format::{MAX_FRAME_BYTES, MAX_FRAME_OPERATIONS};
+    for (frame_bytes, operations) in [
+        (132, 1),
+        (104 + 4096 * 28, 4096),
+        (104 + 12 + 1024 + 65536, 1),
+        (MAX_FRAME_BYTES, MAX_FRAME_OPERATIONS),
+    ] {
+        let header = FrameHeader {
+            frame_bytes,
+            operations,
+            sequence: Sequence::from_u64(u64::MAX),
+        };
+        let mut bytes = [0; 64];
+        header.encode(&Provider, &mut bytes).unwrap();
+        assert_eq!(FrameHeader::decode(&Provider, &bytes), Ok(header));
+        assert_eq!(header.payload_bytes(), Ok(frame_bytes - 104));
+    }
+    let valid = FrameHeader {
+        frame_bytes: 132,
+        operations: 1,
+        sequence: Sequence::from_u64(1),
+    };
+    for (header, error) in [
+        (
+            FrameHeader {
+                frame_bytes: 131,
+                ..valid
+            },
+            FormatError::Limit,
+        ),
+        (
+            FrameHeader {
+                frame_bytes: MAX_FRAME_BYTES + 1,
+                ..valid
+            },
+            FormatError::Limit,
+        ),
+        (
+            FrameHeader {
+                operations: 0,
+                ..valid
+            },
+            FormatError::Limit,
+        ),
+        (
+            FrameHeader {
+                operations: MAX_FRAME_OPERATIONS + 1,
+                ..valid
+            },
+            FormatError::Limit,
+        ),
+        (
+            FrameHeader {
+                operations: 2,
+                ..valid
+            },
+            FormatError::InvalidValue,
+        ),
+        (
+            FrameHeader {
+                frame_bytes: 104 + 12 + 1024 + 65536 + 1,
+                ..valid
+            },
+            FormatError::InvalidValue,
+        ),
+        (
+            FrameHeader {
+                sequence: Sequence::default(),
+                ..valid
+            },
+            FormatError::InvalidValue,
+        ),
+    ] {
+        let mut output = [0xa5; 70];
+        assert_eq!(
+            header.encode(&FaultCrypto(Fault::Start), &mut output),
+            Err(Error::Format(error))
+        );
+        assert_eq!(output, [0xa5; 70]);
+        let mut bytes = [0; 64];
+        valid.encode(&Provider, &mut bytes).unwrap();
+        bytes[16..20].copy_from_slice(&(header.frame_bytes as u32).to_le_bytes());
+        bytes[20..24].copy_from_slice(&(header.operations as u32).to_le_bytes());
+        bytes[24..32].copy_from_slice(&header.sequence.number().to_le_bytes());
+        rehash(&mut bytes);
+        assert_eq!(
+            FrameHeader::decode(&Provider, &bytes),
+            Err(Error::Format(error))
+        );
+    }
+    assert_eq!(
+        FrameHeader {
+            frame_bytes: 0,
+            ..valid
+        }
+        .payload_bytes(),
+        Err(FormatError::InvalidValue)
+    );
 }

@@ -593,17 +593,53 @@ service activation. Each part lands independently:
       key order and declared count/extent, and compute the supplied-stream digest. Retain only the
       prior key, digest and counters; caller owns the record buffer. Completion
       describes the supplied stream, not filesystem EOF or manifest selection.
-    - **M05a2b2 — manifests and bindings:** bounded descriptor codecs and
-      complete selected-file identity, extent, digest and history bindings.
-      Persistence consumers require both parts.
+    - **M05a2b2 — manifest codec:** bounded borrowed manifest decoding and
+      atomic encoding, all eleven table descriptors and at most 64 contiguous
+      history descriptors. Validate local structural constraints; no path from
+      disk input or selected-file authority follows from a parsed descriptor.
+    - **M05a2b3 — checkpoint bindings:** match CURRENT, store identity, manifest,
+      validated table summaries and journal headers. Require the caller's
+      expected account/table, hash the entire manifest including its footer,
+      and keep partial header checks distinct from full-file verification.
+      History frame validation follows M05a3, and M05d validates the complete
+      selected graph with I/O.
+      Persistence consumers require all parts.
 - **M05a3 — transaction frames:** exact bounded operation/header/footer codecs
   and validated sequential frame iteration. Validate header digest before using
   lengths; distinguish a short physical tail from full-length corrupt data.
   Preserve operation ordinals and return no partial successful frame.
+  - **M05a3a — header and operation codecs:** fixed checked frame headers,
+    exact bounded operation prefixes and borrowed locally valid PUT/DELETE/
+    CHANGE values. Preserve output on encode failure; keep known Identity wire
+    syntax separate from its v1 transaction prohibition. These pieces grant
+    no full-frame validation or recovery authority.
+  - **M05a3b — complete frames and sequential validation:** validate complete
+    footer coverage, count, operation grammar and continuity before exposing
+    a frame. Preserve ordinals, reject v1 Identity changes and carry failure
+    through bounded sequential completion. Distinguish missing supplied header
+    or body bytes from invalid complete contents: classify by supplied extent
+    versus the checked header length, never by a row/operation error kind.
+    Seal caller-built payloads in place with fixed header/footer scratch and
+    preserve bytes on any returned error.
+    Hash complete supplied journals and enforce byte and operation caps.
+    Physical EOF remains with M05d;
+    complete final-view transaction/reference rules remain with M08.
+  - **M05a3c — selected journal summaries:** bind complete history streams to
+    the indexed manifest range, extent and digest. Match active stream identity
+    and the caller's pinned committed offset/sequence. Preserve independent
+    checks without claiming graph completeness, physical EOF or pin ownership.
 - **M05b — private storage adapter:** trusted roots, generated paths, exclusive
   lock, short/failing I/O, sync and non-replacing publication. Specify any new
   syscall surface under UNSAFE.md before introducing it. Own the deterministic
   fault-I/O model and process-death lock tests.
+  - **M05b1 — canonical names:** fixed-buffer relative paths from typed account/
+    blob IDs, positive canonical generation/segment numbers and known table
+    names. Validate directory-entry blob names against namespace and shard.
+    No filesystem access or authority follows from these names.
+  - **M05b2 — private filesystem boundary:** trusted-root and descriptor-relative
+    operations, process-scoped exclusive lock, ownership/mode/type validation
+    and non-replacing publication with file/directory sync. Own fault injection
+    and process-death tests; names alone do not complete this adapter.
 - **M05c — immutable blobs:** admitted streamed temporary bodies, inline SHA-256,
   exact size accounting and durable non-replacing publication. Couple effect
   tickets and completion reserves; inject failures at each filesystem step.

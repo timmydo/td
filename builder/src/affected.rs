@@ -1471,6 +1471,13 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // td-mta has no distribution recipe or downstream consumer. Its portable
+    // musl qualification is separate from distribution recipe checks.
+    if p.starts_with("td-mta/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     // The editor is a static target recipe with a realized-output check
     // (td-editor-test), so a source edit changes a target artifact: the host
     // preflight still holds its gate 325 lock/test/clippy obligations, and
@@ -4641,8 +4648,10 @@ const HOST_ONLY_ENGINE_SOURCES: [&str; 1] = ["builder/src/ready.rs"];
 /// The subset of the derived command list a diff over `changed` can actually
 /// invalidate.
 ///
-/// The workspace commands always run: `recipes` embeds every target crate's
-/// sources, so the workspace suite can be redded by a change to any of them,
+/// The workspace commands run unless only td-mta remains after reader closure
+/// with its reviewed outgoing edge to td-crypto. Mail source changes that alter
+/// that graph must still reach the workspace's exact graph assertions.
+/// Otherwise `recipes` embeds target crate sources and can be redded,
 /// and the builder's own tests name the one crate no recipe embeds. A path
 /// names the roster crate whose directory holds it; that crate's commands
 /// run, and so do those of every crate that READS it — closed transitively,
@@ -4657,11 +4666,23 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
     };
     let readers = crate_readers(root, &roster)?;
     close_over_readers(&mut selected, &readers);
+    let mail_only = selected.len() == 1 && selected.first().is_some_and(|c| c == "td-mta");
+    if mail_only {
+        let dependencies = readers.iter().filter_map(|(name, consumers)| {
+            consumers
+                .iter()
+                .any(|c| c == "td-mta")
+                .then_some(name.as_str())
+        });
+        if !dependencies.eq(["td-crypto"]) {
+            return Ok(all);
+        }
+    }
     let narrowed: Vec<String> = all
         .iter()
         .filter(|cmd| match cmd_manifest_crate(cmd) {
             Some(c) => selected.iter().any(|s| s == c),
-            None => true,
+            None => !mail_only || is_format_check(cmd),
         })
         .cloned()
         .collect();
@@ -8499,6 +8520,108 @@ mod tests {
             );
             assert!(path_output(&root, path).contains("td-builder check check"));
         }
+    }
+
+    #[test]
+    fn mail_only_changes_run_own_tests_and_lints_without_distro_checks() {
+        let root = repo_root();
+        let Ok(roster) = discover_gate_crates(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        if !roster.iter().any(|c| c.name == "td-mta") {
+            return;
+        }
+        for path in [
+            "td-mta/src/format/bindings.rs",
+            "td-mta/tests/rust_alloc_probe.rs",
+            "td-mta/Cargo.toml",
+            "td-mta/Cargo.lock",
+        ] {
+            let commands = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
+            assert_eq!(commands.len(), 3, "{path}: {commands:?}");
+            assert!(commands.first().is_some_and(|c| is_format_check(c)));
+            for action in ["test", "clippy"] {
+                assert!(commands.iter().any(|c| c.contains(&format!(
+                    " gate-crates crypto-cargo {action} --manifest-path td-mta/Cargo.toml"
+                ))));
+            }
+            let output = path_output(&root, path);
+            assert!(output.contains("--manifest-path td-mta/Cargo.toml"));
+            assert!(!output.contains("--workspace"), "{output}");
+            assert!(!output.contains("td-builder check"), "{output}");
+            assert!(!output.contains("discovered crate"), "{output}");
+        }
+        for path in ["td-mta-extra/src/main.rs", "td-mta/../td-sh/src/main.rs"] {
+            assert_eq!(
+                cargo_test_cmds(&root, &[path.to_string()]).unwrap(),
+                gate_cmds()
+            );
+            assert!(path_output(&root, path).contains("td-builder check"));
+        }
+        let mixed = cargo_test_cmds(
+            &root,
+            &[
+                "td-mta/src/lib.rs".to_string(),
+                "builder/src/crypto_isolated.rs".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(mixed, gate_cmds());
+        let crypto = cargo_test_cmds(&root, &["td-crypto/src/lib.rs".to_string()]).unwrap();
+        assert!(crypto.iter().any(|c| c.contains("--workspace")));
+        assert!(crypto
+            .iter()
+            .any(|c| cmd_manifest_crate(c) == Some("td-mta")));
+    }
+
+    #[test]
+    fn mail_source_graph_changes_restore_workspace_coverage() {
+        let root = std::env::temp_dir().join(format!("td-mail-graph-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        for name in ["td-mta", "td-crypto", "td-authd"] {
+            let base = root.join(name);
+            std::fs::create_dir_all(base.join("src")).unwrap();
+            let manifest = if crate::crypto_policy::admitted(name) {
+                std::fs::read(repo_root().join(name).join("Cargo.toml")).unwrap()
+            } else {
+                format!("[package]\nname = \"{name}\"\n").into_bytes()
+            };
+            std::fs::write(base.join("Cargo.toml"), manifest).unwrap();
+            std::fs::write(base.join("src/lib.rs"), "").unwrap();
+        }
+        let changed = ["td-mta/src/lib.rs".to_string()];
+        let all = cargo_test_cmds_all(&root).unwrap();
+        assert_eq!(cargo_test_cmds(&root, &changed).unwrap().len(), 3);
+        // A diagnostic string also counts as an edge in the conservative graph.
+        std::fs::write(
+            root.join("td-mta/src/lib.rs"),
+            "const DOMAIN: &[u8] = b\"td-authd/credential/v1\\0\";\n",
+        )
+        .unwrap();
+        assert_eq!(cargo_test_cmds(&root, &changed).unwrap(), all);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mail_gate_exemption_requires_no_distribution_recipe() {
+        let root = repo_root();
+        let mut recipes = Vec::new();
+        collect_rs_recursive(&root.join("recipes/src"), &mut recipes);
+        assert!(!recipes.is_empty());
+        for path in recipes {
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains("td-mta"),
+                "{} names td-mta; revisit its affected-check mapping",
+                path.display()
+            );
+        }
+        let roster = std::fs::read_to_string(root.join("seed/local-source-roster.txt")).unwrap();
+        assert!(
+            !roster.contains("td-mta"),
+            "td-mta now enters a recipe closure"
+        );
     }
 
     /// The rendered line and the executed list come from one call, so the dry
