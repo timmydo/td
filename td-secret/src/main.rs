@@ -265,6 +265,7 @@ mod confinement {
                 "portable_lifecycle.rs",
                 include_str!("portable_lifecycle.rs"),
             ),
+            ("portable_host.rs", include_str!("portable_host.rs")),
             ("portable_notebook.rs", include_str!("portable_notebook.rs")),
             ("portable_store.rs", include_str!("portable_store.rs")),
             ("fido_aes.rs", include_str!("fido_aes.rs")),
@@ -287,14 +288,17 @@ mod confinement {
         ];
         for (name, source) in sources {
             let production = source.split("#[cfg(test)]").next().unwrap();
-            for (operation, owner) in [
-                ("mode", "pin_terminal.rs"),
-                ("set_mode", "pin_terminal.rs"),
-                ("readable", "pin_terminal.rs"),
-                ("protect_process", "token_check.rs"),
+            for (operation, owners) in [
+                ("mode", &["pin_terminal.rs"][..]),
+                ("set_mode", &["pin_terminal.rs"]),
+                ("readable", &["pin_terminal.rs"]),
+                ("protect_process", &["token_check.rs", "portable_host.rs"]),
             ] {
                 if production.contains(&format!("pin_sys::{operation}(")) {
-                    assert_eq!(name, owner, "unexpected PIN syscall caller");
+                    assert!(
+                        owners.contains(&name),
+                        "unexpected PIN syscall caller {name}"
+                    );
                 }
             }
             let keyword = format!("un{}", "safe");
@@ -397,6 +401,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "pin_sys.rs",
                 "pin_terminal.rs",
                 "portable.rs",
+                "portable_host.rs",
                 "portable_lifecycle.rs",
                 "portable_notebook.rs",
                 "portable_store.rs",

@@ -62,6 +62,12 @@ impl Admission {
     }
 }
 
+/// The unprivileged desktop account this process runs as, by the same rule
+/// desktop admission applies.
+pub(crate) fn desktop_account() -> Result<u32, String> {
+    Admission::desktop_identity().map(|(uid, _)| uid)
+}
+
 fn node_admitted(admission: Admission, char_device: bool, uid: u32, gid: u32, mode: u32) -> bool {
     char_device
         && uid == 0
@@ -835,6 +841,17 @@ fn canonical<T: std::str::FromStr + ToString>(text: &str) -> Result<T, String> {
 pub(crate) mod tests {
     use super::*;
     const SYNC: &[u8] = b"TD-HID-TEST-READY\n";
+
+    impl Device {
+        pub(crate) fn synthetic(index: u8) -> Self {
+            Self {
+                index,
+                inode: u64::from(index),
+                rdev: 0,
+                admission: Admission::Desktop,
+            }
+        }
+    }
 
     fn descriptor_bytes() -> Vec<u8> {
         // CTAP 2.3 section 11.2.8's application collection, with 64-byte reports.

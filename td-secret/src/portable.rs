@@ -1,5 +1,7 @@
 //! Bounded portable envelope. Token authorization and persistence are adapters.
 
+#[path = "portable_host.rs"]
+pub(super) mod host;
 #[path = "portable_lifecycle.rs"]
 pub(super) mod lifecycle;
 #[path = "portable_notebook.rs"]

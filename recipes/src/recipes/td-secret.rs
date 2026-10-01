@@ -146,6 +146,10 @@ pub fn recipe() -> Recipe {
     }
     for (path, source) in [
         (
+            "{src}/td-secret/src/portable_host.rs",
+            include_str!("../../../td-secret/src/portable_host.rs"),
+        ),
+        (
             "{src}/td-secret/src/portable_lifecycle.rs",
             include_str!("../../../td-secret/src/portable_lifecycle.rs"),
         ),

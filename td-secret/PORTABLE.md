@@ -1010,6 +1010,86 @@ fresh-location restore with only the backup is followed by replacement
 of the lost primary. Store tests cover adoption into an absent baseline
 and its refusal over a committed vault.
 
+### Implemented standalone host adapter
+
+`src/portable_host.rs` supplies the standalone mode's host pieces; the
+notebook process composes them with its own host-authentication prompt.
+
+- **Process.** Protection requires the transport's desktop identity:
+  unchanged user and group IDs and a nonzero uid. It makes the process
+  non-dumpable. Swap must be off and the core-dump soft limit zero, the
+  manual diagnostic's policy; a desktop with active swap is refused, not
+  warned. Opening a token requires the evidence protection returns and
+  rechecks swap and the core limit first, since the notebook process is
+  long-lived. Swap enabled while a vault key is already held is not
+  detected until the next presentation.
+- **Location.** The vault directory is `$XDG_DATA_HOME/td-pass`, or
+  `$HOME/.local/share/td-pass` when that variable is unset, empty or
+  relative, as the XDG base directory specification requires. The adapter
+  walks that absolute path from `/` one component at a time, opening each
+  directory through the descriptor of the one before it without following
+  a link, so the directory it checks is the one it holds; no pathname is
+  checked and then reopened. Every directory on the walk, `/` included,
+  must be owned by the account or root and writable by no other user or
+  group unless sticky, so no other account can rename the vault, or a
+  directory above it, aside and later restore an older one. The path may
+  pass through links, but only links the account or root owns, since
+  another account may create one in a sticky directory; at most 40 are
+  followed, an absolute target restarts the walk at `/`, and `..` steps
+  back to the held parent. Missing directories are created with mode 0700
+  and their parent synced at once. Every held directory is synced on every
+  open, which also completes the record of a creation whose sync failed or
+  was interrupted; a directory on a filesystem that cannot sync one, as a
+  read-only mount, is passed over; the store's own sync fails there too,
+  so nothing is published through it. Group write is refused even for the
+  account's own private group: on a host whose umask 002 leaves
+  `~/.local/share` at 0775, the adapter refuses until the account runs
+  `chmod g-w` on it. The check reads mode bits only: an ACL granting
+  another account write is not seen, so a host that grants one has
+  stepped outside this policy. Inside a user namespace that shows `/` or
+  another directory on the walk under an unmapped owner, the adapter
+  fails closed. The vault directory is opened without following a link
+  and must be owned by the account with mode 0700. One this adapter
+  creates is set to exactly 0700, clearing a setgid bit inherited from
+  its parent, and an account-owned 2700 directory left by an interrupted
+  creation is repaired the same way. The store then applies its own
+  descriptor-relative policy.
+- **Tokens.** Each presentation discovers tokens under desktop admission
+  and opens one bounded transport session that the caller's cancellation
+  handle ends, so lock, suspend and authority loss can stop it. Discovery
+  reads node metadata only and requires exactly one connected FIDO node;
+  more than one is reported as several, and none as unavailable. The
+  kernel decides at the bounded worker's open whether the host grants the
+  account that node, and a refusal is reported as a host-policy denial.
+  Unprotected memory or a changed identity is a host refusal. These typed
+  reasons reach the caller unchanged, before any PIN prompt, so a
+  permission error stays distinct from a missing or unsupported token. Any
+  other transport failure, including a busy lock, is reported as
+  unavailable.
+- **Entropy.** The adapter opens `/dev/urandom`, requires character device
+  1:9, and reads directly into the caller's buffer.
+
+Tests cover the location rules, private creation of the directory and its
+ancestors, refusal of a foreign owner, a wider mode, a final link and a
+regular file as typed policy refusals, and acceptance of a linked prefix.
+They refuse a group- or world-writable parent or higher ancestor, also
+when reached through a link, and a parent owned by another account. They
+accept a sticky one, and repair a setgid inheritance and an interrupted
+one. They follow a relative link and a `..` step to the directory they
+name, and refuse a link loop, a relative path and an absolute link target
+outside the walk's base. They cover the ownership and link-owner rule
+tables, the token choice table, and the entropy device's refusal of
+another character device and a regular file. The directory tests start
+the walk at their scratch root's parent, since a build sandbox may show
+unmapped owners above it; links owned by another account cannot be made
+without privilege, so that rule is tested as a table. Neither the rename
+races the walk closes nor the durability retry is observable in a test.
+The lifecycle adapter's test passes each typed open failure through,
+without a prompt, for both enrollment and assertion. Process
+protection is tested where it is set, in an owned child. Real desktop
+discovery, denial, cancellation and hotplug remain hardware evidence on
+the supported host.
+
 ## Independently landable increments
 
 1. This contract, td-pass notebook/host scope, bounded authenticated portable

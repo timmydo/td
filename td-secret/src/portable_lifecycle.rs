@@ -117,6 +117,12 @@ pub(super) struct Asserted {
 pub(super) enum TokenError {
     /// No admitted device or channel; nothing was sent.
     Unavailable,
+    /// The host's device policy denies this account a connected token.
+    Denied,
+    /// More than one token is connected; nothing was sent.
+    Several,
+    /// The host adapter refused before discovering a token.
+    Host(&'static str),
     Failed(transaction::Error),
 }
 
@@ -154,7 +160,7 @@ pub(super) struct Hardware<O, P, E> {
 impl<C, O, P, E> Tokens for Hardware<O, P, E>
 where
     C: Channel,
-    O: FnMut(Presented<'_>) -> Result<C, String>,
+    O: FnMut(Presented<'_>) -> Result<C, TokenError>,
     P: FnMut(Presented<'_>, PinPurpose) -> Result<Pin, String>,
     E: FnMut(&mut [u8]) -> Result<(), String>,
 {
@@ -163,7 +169,7 @@ where
         presented: Presented<'_>,
         request: EnrollRequest<'_>,
     ) -> Result<Enrolled, TokenError> {
-        let channel = (self.open)(presented).map_err(|_| TokenError::Unavailable)?;
+        let channel = (self.open)(presented)?;
         let prompt = &mut self.prompt;
         let enrolled = Transaction::new(channel)
             .and_then(|transaction| {
@@ -205,7 +211,7 @@ where
             .key
             .public_key()
             .map_err(|error| TokenError::Failed(transaction::Error::Protocol(error)))?;
-        let channel = (self.open)(presented).map_err(|_| TokenError::Unavailable)?;
+        let channel = (self.open)(presented)?;
         let prompt = &mut self.prompt;
         let output = Transaction::new(channel)
             .and_then(|transaction| {
@@ -1928,7 +1934,7 @@ pub(in crate::portable) mod tests {
                 let mut channel = Some(script);
                 let mut purposes = Vec::new();
                 let mut adapter = Hardware {
-                    open: |_: Presented<'_>| channel.take().ok_or_else(|| "reopened".to_string()),
+                    open: |_: Presented<'_>| channel.take().ok_or(TokenError::Unavailable),
                     prompt: |presented: Presented<'_>, pin| {
                         purposes.push((presented.purpose, presented.role, pin));
                         Pin::new(fixture(label, "pin").into_boxed_slice())
@@ -1971,7 +1977,7 @@ pub(in crate::portable) mod tests {
                 let mut adapter = Hardware {
                     open: |presented: Presented<'_>| {
                         opened.push(presented.credential.map(<[u8]>::to_vec));
-                        channel.take().ok_or_else(|| "reopened".to_string())
+                        channel.take().ok_or(TokenError::Unavailable)
                     },
                     prompt: |_: Presented<'_>, _| {
                         Pin::new(fixture(label, "pin").into_boxed_slice())
@@ -2008,32 +2014,60 @@ pub(in crate::portable) mod tests {
         }
 
         #[test]
-        fn an_unavailable_channel_prompts_for_nothing() {
-            let mut prompted = false;
-            let mut adapter = Hardware {
-                open: |_: Presented<'_>| Err::<Script, _>("no admitted token".to_string()),
-                prompt: |_: Presented<'_>, _| {
-                    prompted = true;
-                    Err("unexpected".to_string())
-                },
-                entropy: |_: &mut [u8]| Ok(()),
-            };
+        fn an_unopened_channel_keeps_its_reason_and_prompts_for_nothing() {
             let key = cose(&[1; 32]);
-            let result = adapter.assert(
-                Presented {
-                    purpose: Purpose::Unlock,
-                    role: Role::Primary,
-                    credential: Some(b"id"),
-                },
-                AssertRequest {
-                    credential: b"id",
-                    key: &key,
-                    salt: &[0; 32],
-                    challenge: [0; 32],
-                },
-            );
-            assert!(matches!(result, Err(TokenError::Unavailable)));
-            assert!(!prompted);
+            let reasons: [fn() -> TokenError; 4] = [
+                || TokenError::Unavailable,
+                || TokenError::Denied,
+                || TokenError::Several,
+                || TokenError::Host("swap"),
+            ];
+            for reason in reasons {
+                let mut prompted = false;
+                let mut opened = 0;
+                let mut adapter = Hardware {
+                    open: |_: Presented<'_>| {
+                        opened += 1;
+                        Err::<Script, _>(reason())
+                    },
+                    prompt: |_: Presented<'_>, _| {
+                        prompted = true;
+                        Err("unexpected".to_string())
+                    },
+                    entropy: |_: &mut [u8]| Ok(()),
+                };
+                let enrolled = adapter.enroll(
+                    Presented {
+                        purpose: Purpose::CreatePrimary,
+                        role: Role::Primary,
+                        credential: None,
+                    },
+                    EnrollRequest {
+                        challenge: [0; 32],
+                        proof_challenge: [0; 32],
+                        user: [0; 32],
+                        salt: [0; 32],
+                        excluded: &[],
+                    },
+                );
+                assert_eq!(enrolled.err(), Some(reason()));
+                let result = adapter.assert(
+                    Presented {
+                        purpose: Purpose::Unlock,
+                        role: Role::Primary,
+                        credential: Some(b"id"),
+                    },
+                    AssertRequest {
+                        credential: b"id",
+                        key: &key,
+                        salt: &[0; 32],
+                        challenge: [0; 32],
+                    },
+                );
+                assert_eq!(result.err(), Some(reason()));
+                assert!(!prompted);
+                assert_eq!(opened, 2);
+            }
         }
     }
 }

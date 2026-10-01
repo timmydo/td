@@ -2358,18 +2358,22 @@ uses O_NONBLOCK and checks the original operation deadline around input;
 poll readiness alone grants no secret release. `prctl(157)` is fixed to
 PR_SET_DUMPABLE(4, 0), followed by PR_GET_DUMPABLE(3) requiring zero.
 Unused syscall argument registers are zero. There is no restore-to-dumpable
-API. The diagnostic alone calls this before PIN/crypto work and also
-requires no active swap and a zero core soft limit. A trusted host kernel,
-root and terminal are prerequisites; suspend/hibernation integration and
-ordinary-account Guix use are not admitted by this diagnostic.
+API. The diagnostic calls this before PIN/crypto work and also requires no
+active swap and a zero core soft limit. A trusted host kernel, root and
+terminal are prerequisites; suspend/hibernation integration and
+ordinary-account Guix use are not admitted by this diagnostic. The portable
+vault's standalone host adapter calls the same protection, under the same
+swap and core-limit requirements, before any PIN or vault key enters an
+ordinary desktop account's process; it adds no syscall or request.
 
 Only `pin_terminal.rs` calls the terminal wrappers; only `token_check.rs`
-calls process protection. No descriptor adoption, mapping, signal handler
-or general request interface is added. Tests pin the raw surface and use
-real PTYs for echo, cancellation, timeout and restoration. The existing
-`td-authd/src/terminal_sys.rs` PTY allocator is compiled only into those
-tests, with its already recorded instruction/adoption allowances; it is
-absent from the production td-secret binary.
+and `portable_host.rs` call process protection. No descriptor adoption,
+mapping, signal handler or general request interface is added. Tests pin
+the raw surface and use real PTYs for echo, cancellation, timeout and
+restoration. The existing `td-authd/src/terminal_sys.rs` PTY allocator is
+compiled only into those tests, with its already recorded
+instruction/adoption allowances; it is absent from the production
+td-secret binary.
 
 The client compiles surface 12's `td-secret/src/sys.rs` directly: the same
 three-syscall instruction and exact descriptor-adoption allowance.
