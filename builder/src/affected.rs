@@ -8190,7 +8190,8 @@ mod tests {
             ]
         );
         // td-install's readers include td-authd, so td-boot's protocol
-        // reaches everything that reads td-authd too.
+        // reaches everything that reads td-authd too: td-compositor among
+        // them, and so td-ui and its readers.
         assert_eq!(
             names(&one("td-boot/src/protocol.rs")),
             [
@@ -8212,6 +8213,7 @@ mod tests {
                 "td-secret",
                 "td-setup",
                 "td-taskmgr",
+                "td-term",
                 "td-ui",
                 "td-update",
                 "td-vm",
