@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use fonts::{Builder, Glyph, Segment};
 use td_ui::atlas::{Slot, Style};
-use td_ui::face::Face;
+use td_ui::face::{Face, Sizing};
 use td_ui::face_file::{
     find, places, Place, BOLD, BOLD_ITALIC, DIR, INSTALLED, INSTALL_HINT, ITALIC, REGULAR,
     SEARCH_DEPTH, SEARCH_ENTRIES,
@@ -33,6 +33,12 @@ use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, W
 use td_ui::sfnt::{Error, MAX_FONT_BYTES};
 use td_ui::typeface::Typeface;
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
+
+/// The bitmap grid's cell, as a terminal fits its face to it.
+const CELL: Sizing = Sizing::Cell {
+    width: CELL_WIDTH,
+    height: CELL_HEIGHT,
+};
 
 /// '0' a 500-unit square on the baseline.
 fn font() -> Vec<u8> {
@@ -175,13 +181,7 @@ fn a_terminal_loads_four_styles_unless_the_setting_asks_for_the_bitmap_face() {
     }
     let load = |setting: Option<&str>| {
         let setting = setting.map(std::ffi::OsString::from);
-        styles_in_or_note(
-            &[exact(&dir)],
-            "test",
-            CELL_WIDTH,
-            CELL_HEIGHT,
-            setting.as_deref(),
-        )
+        styles_in_or_note(&[exact(&dir)], "test", CELL, setting.as_deref())
     };
     let loaded = load(None).expect("the four styles load");
     assert_eq!(
@@ -206,7 +206,7 @@ fn a_terminal_loads_four_styles_unless_the_setting_asks_for_the_bitmap_face() {
         dir: base.clone(),
         depth: 1,
     }];
-    let find_styles = || styles_in_or_note(&walked, "test", CELL_WIDTH, CELL_HEIGHT, None);
+    let find_styles = || styles_in_or_note(&walked, "test", CELL, None);
     assert!(find_styles().is_some());
     fs::create_dir_all(base.join("bare")).unwrap();
     fs::write(base.join("bare").join(REGULAR), style(0, 0, 500, 500)).unwrap();

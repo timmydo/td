@@ -309,10 +309,13 @@ of its own files may name each module.
   `Entry` (its rectangle on the page and its bearing), `PAGE_WIDTH`,
   `PAGE_HEIGHT` and `MAX_KEYS`.
 - `face`: `Face` (`new` over the regular style's bytes, an optional bold
-  style's and a pixel size; `fit` over shared style bytes and a grid
-  cell's width and height; `with_slant` over an italic and a bold italic
-  style's shared bytes, covered at the face's size, which empties the
-  atlas; `cell`,
+  style's and a pixel size; `sized`, the same over shared style bytes at
+  a fractional size; `fit` over shared style bytes and a grid cell's
+  width and height; `with_sizing`, `fit` or `sized` as a `Sizing` (`Cell`
+  or `PixelsPerEm`) asks; `resized`, the face's styles again at another
+  sizing with an empty atlas; `with_slant` over an italic and a bold
+  italic style's shared bytes, covered at the face's size, which empties
+  the atlas; `cell`, `size` (unrounded),
   `pixels_per_em`, `atlas`, `take_dirty`, `style` (the style bold and
   italic ask for, as the face has it: bold italic falls to italic, then
   bold, and any style to regular) and `glyph`), `Cell` (`width`, `height`,
@@ -337,7 +340,7 @@ of its own files may name each module.
   anything when it is `bitmap`, and otherwise say on standard error why
   a program draws with Unifont instead and `INSTALL_HINT`; and, for a
   terminal, `styles_from` a directory and `styles_in` given places, the
-  four styles as one `Face` fitted to a cell, read from the one
+  four styles as one `Face` sized as a `Sizing` asks, read from the one
   directory that holds the regular style and refused whole if a style
   is missing or refused, with `styles_or_note` and `styles_in_or_note`
   taking the setting and saying so as the regular loaders do.
@@ -607,7 +610,11 @@ of its own files may name each module.
   `Unit` (a cell, a word or a row) with `WORD_DELIMITERS`, foot's,
   `Cursor`, `Selection`, `render` of a snapshot into a tight XRGB8888
   surface over the bitmap `font::Font`, `render_with`, the same with an
-  optional outline `Face` fitted to that font's cell, `ppm` and `from_ppm`,
+  optional outline `Face` on that face's cell, `cell_size` (the cell a
+  grid is laid on: the outline face's, else the bitmap font's), `Zoom`
+  (an outline face with the sizing it started at, stepped `ZoomTo::In`,
+  `Out` or back to `Start` by `ZOOM_STEP`, foot's half a point), `ppm`
+  and `from_ppm`,
   `BYTES_PER_PIXEL`, and `selftest`. Pure; its specification,
   `vt_render_spec.rs`, holds the goldens under `spec/vt_render`.
 - `vt_keys`: `action(chord, modes, viewing)`, which routes one chord as the
@@ -2720,8 +2727,10 @@ it.
 
 ### The grid fit
 
-Every consumer lays text out on the bitmap face's 8x16 cell, scaled.
-Runtime cells (below) would replace that grid; until they do, `Face::fit`
+Every widget consumer lays text out on the bitmap face's 8x16 cell,
+scaled (td-term, given a font size, lays its grid on the face's own cell:
+see "td-term"). Runtime cells (below) would replace that grid; until they
+do, `Face::fit`
 fits an outline face to it, so a consumer takes the face with no change
 to its layout, hit testing or draw stream. The fitted size is the
 largest, fractional, whose advance fits the cell's width and whose em
@@ -2778,15 +2787,19 @@ already excludes them from the terminal profile.
 td-term is its own crate over the toolkit (`td-term/DESIGN.md`). Its
 renderer is td-ui's `vt_render`, which paints cells straight into the
 XRGB buffer over the bitmap `Font` rather than as a `Composition`, and
-draws each glyph the pinned outline face has through a face fitted to
-that font's cell:
+draws each glyph the pinned outline face has through that face, on its
+cell (`vt_render::cell_size`): the bitmap font's when the face is fitted
+to it, the face's own when td-term is given a font size:
 
 1. At startup td-term loads the four styles through
    `pinned_face::styles_or_note` unless `TD_UI_FACE` is `bitmap`, which
    reads them through `face_file` from the directory its search finds
-   and fits them to the 8x16 cell with `Face::fit` and `with_slant`; on
-   any failure it says so once, naming `./install-fonts`, and td-term
-   draws with Unifont.
+   and fits them to the 8x16 cell with `Face::fit` and `with_slant`, or,
+   given a font size, covers them at it with `Face::sized` on the cell
+   the face's metrics give, as runtime cells (above) derive it; on any
+   failure it says so once, naming `./install-fonts`, and td-term draws
+   with Unifont. Its font chords step the face through `vt_render::Zoom`,
+   which resizes it from the bytes it holds.
 2. `vt_render::render_with` draws a cell through the face when the face
    has its scalar: the cell's ground, then the glyph's coverage from the
    atlas page blended from the ground toward the ink and clipped to the
@@ -2794,18 +2807,20 @@ that font's cell:
    - bold, italic and bold italic select those styles through
      `Face::style`, falling back to what the face has;
    - faint and inverse stay colour operations, applied before the blend;
-   - underline and strike keep the cell's rows, which the fitted face
-     shares with the bitmap one.
+   - underline and strike keep the cell's rows, at the same distances from
+     its bottom and middle whichever face draws it.
 
-A scalar the face lacks is the bitmap painter's own cell, its bold smear
-and italic shear included, and the cursor and the bell are unchanged.
+A scalar the face lacks is the bitmap painter's own glyph, its bold smear
+and italic shear included, centred in the face's cell as runtime cells
+centre it, and the cursor and the bell are unchanged; a fitted face's
+cell is the bitmap one, so there it is exactly the bitmap cell.
 The painter reads the atlas page directly rather than through a td-ui
 `Composition`: the page and its entries are what a GPU backend uploads
 and samples, so the GPU path takes the terminal's glyphs as it takes the
 raster's.
 
-The pixel size the terminal reports through `TIOCSWINSZ` follows the cell,
-which is the grid's until runtime cells.
+The terminal reports no pixel size through `TIOCSWINSZ`: its pixel
+fields are zero (`pty::grid_size`), whatever the cell.
 The compositor's own chrome keeps the bitmap face. td-term/DESIGN.md §3's
 rule that host tests and the target consume the same face bytes holds for
 Unifont. `vt_render_spec.rs`'s PPM oracles stay on `render` and the
@@ -3047,7 +3062,8 @@ regressions. Those increments extend the original sequence below.
 25. Runtime cells: `Cell` replaces the constants in layout, hit testing
     and painting, so a face is drawn at a size the grid does not fix.
     The editor core goes first, since the other consumers lay out over
-    its pane.
+    its pane; td-term already derives its cell this way when given a
+    font size.
 26. The GPU path, gated on the sign-offs "The GPU path" lists: the
     compositor's GPU composition first, then client dmabufs, then td-ui's
     GPU backend held to the CPU raster's oracles.

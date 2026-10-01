@@ -1307,7 +1307,8 @@ fn the_selftest_finds_ink_only_in_the_first_cell() {
 #[path = "../tests/fonts/mod.rs"]
 mod fonts;
 
-use crate::face::Face;
+use crate::atlas::Style;
+use crate::face::{Face, Sizing};
 use fonts::{Builder, Glyph, Segment};
 
 /// A face whose every glyph advances 500 of 1000 units, so fitted to the
@@ -1544,11 +1545,175 @@ fn a_partly_covered_pixel_blends_the_ground_toward_the_ink() {
     assert_eq!(rgb_at(&pixels, width, 3, 3), ground);
 }
 
+/// The outline face at `size` pixels per em on its own cell: at 20 the
+/// 500-unit advance is 10 px and the cell 10x22 (ascender 16, descender
+/// 4, gap 2), at 12 it is 6x13 (10, 2, 1).
+fn sized_outline(size: f32) -> Face {
+    Face::sized(outline_style(0, 0, 500, 500), None, size).unwrap()
+}
+
+/// `snapshot` drawn through `outline` on a surface of exactly its grid in
+/// the face's cell.
+fn draw_sized(snapshot: &Snapshot, outline: &mut Face) -> (Vec<u8>, usize) {
+    let (cell_width, cell_height) = cell_size(face(), Some(outline));
+    let (width, height) = (
+        snapshot.columns() * cell_width,
+        snapshot.rows() * cell_height,
+    );
+    let mut pixels = vec![0; width * height * BYTES_PER_PIXEL];
+    render_with(
+        snapshot,
+        palette(),
+        face(),
+        Some(outline),
+        &mut pixels,
+        width,
+        height,
+    )
+    .unwrap();
+    (pixels, width)
+}
+
 #[test]
-fn an_outline_face_fitted_to_another_cell_is_not_used() {
-    let mut outline = Face::fit(outline_style(0, 0, 500, 500), None, 16, 32).unwrap();
-    let terminal = terminal(1, 3, b"0");
-    let snapshot = Snapshot::new(&terminal, true, false);
-    let (bitmap, _, _) = draw_grid(&snapshot);
-    assert_eq!(draw_outline(&snapshot, &mut outline).0, bitmap);
+fn a_face_at_its_own_size_lays_the_grid_on_its_cell() {
+    let mut outline = sized_outline(20.0);
+    assert_eq!(cell_size(face(), Some(&outline)), (10, 22));
+    assert_eq!(cell_size(face(), None), (face().width(), face().height()));
+    // Each '0' is a 10 px square from the pen up from the baseline (row
+    // 16), one per 10-pixel column, on two rows of 22.
+    let terminal = terminal(2, 3, b"\x1b[?25l00\r\n 0");
+    let (pixels, width) = draw_sized(&Snapshot::new(&terminal, false, false), &mut outline);
+    let mut expected = square(0..10, 6..16);
+    expected.extend(square(10..20, 6..16));
+    expected.extend(square(10..20, 28..38));
+    expected.sort_by_key(|&(x, y)| (y, x));
+    let mut ink = set_pixels(&pixels, width, palette().foreground());
+    ink.sort_by_key(|&(x, y)| (y, x));
+    assert_eq!(ink, expected);
+}
+
+#[test]
+fn a_bitmap_glyph_is_centred_in_a_larger_cell_and_clipped_evenly_in_a_smaller() {
+    // 'A' is not in the outline face, so each cell draws Unifont's glyph:
+    // inset (1, 3) in the 10x22 cell and (-1, -1) in the 6x13 one, from
+    // the glyph's own cell drawn plainly.
+    let terminal = terminal(1, 1, b"\x1b[?25lA");
+    let snapshot = Snapshot::new(&terminal, false, false);
+    let (bitmap, bitmap_width, _) = draw_grid(&snapshot);
+    let glyph = set_pixels(&bitmap, bitmap_width, palette().foreground());
+    assert!(!glyph.is_empty());
+    for (size, inset, cell) in [(20.0, (1, 3), (10, 22)), (12.0, (-1, -1), (6, 13))] {
+        let (pixels, width) = draw_sized(&snapshot, &mut sized_outline(size));
+        let mut expected: Vec<(usize, usize)> = glyph
+            .iter()
+            .filter_map(|&(x, y)| {
+                let x = usize::try_from(x as i64 + inset.0).ok()?;
+                let y = usize::try_from(y as i64 + inset.1).ok()?;
+                (x < cell.0 && y < cell.1).then_some((x, y))
+            })
+            .collect();
+        expected.sort_by_key(|&(x, y)| (y, x));
+        let mut ink = set_pixels(&pixels, width, palette().foreground());
+        ink.sort_by_key(|&(x, y)| (y, x));
+        assert_eq!(ink, expected, "{size} px/em");
+        let ground = set_pixels(&pixels, width, palette().background()).len();
+        assert_eq!(ground + ink.len(), cell.0 * cell.1, "{size} px/em");
+    }
+}
+
+#[test]
+fn a_zoom_steps_the_size_keeps_the_styles_and_returns_to_its_start() {
+    let cell = Sizing::Cell {
+        width: face().width(),
+        height: face().height(),
+    };
+    // Fitted to the 8x16 cell, the 500-unit advance makes it 16 px/em.
+    let mut zoom = Zoom::new(outline_face(), cell);
+    let fitted = zoom.face().cell();
+    assert_eq!(zoom.face().size(), 16.0);
+    assert!(!zoom.zoom(ZoomTo::Start), "already at the start");
+    assert!(zoom.zoom(ZoomTo::In));
+    assert_eq!(zoom.face().size(), 16.0 + ZOOM_STEP);
+    // At 16.67 the face's own metrics: advance 8.3, ascender 13.3,
+    // descender 3.3 and a gap a hair under 1.5.
+    assert_eq!(cell_size(face(), Some(zoom.face())), (8, 17));
+    assert_eq!(zoom.face().style(true, true), Style::BoldItalic);
+    assert!(zoom.zoom(ZoomTo::Out));
+    assert!(zoom.zoom(ZoomTo::Out));
+    assert_eq!(zoom.face().size(), 16.0 - ZOOM_STEP);
+    // Back at the start the face is fitted again, not sized near it.
+    assert!(zoom.zoom(ZoomTo::Start));
+    assert_eq!(zoom.face().cell(), fitted);
+    assert_eq!(zoom.face().style(false, true), Style::Italic);
+    // Fitted to an 8x14 cell the face is 14 px/em; its own cell half a
+    // point smaller is 7x15, taller, so zooming out goes on to 6x14, and
+    // back in passes the fitted 8x14 (shorter than 7x15) for 7x16.
+    let mut short = Zoom::new(
+        Face::fit(outline_style(0, 0, 500, 500), None, 8, 14).unwrap(),
+        Sizing::Cell {
+            width: 8,
+            height: 14,
+        },
+    );
+    let cells = |zoom: &Zoom| cell_size(face(), Some(zoom.face()));
+    assert!(short.zoom(ZoomTo::Out));
+    assert_eq!(
+        (cells(&short), short.face().size()),
+        ((6, 14), 14.0 - 2.0 * ZOOM_STEP)
+    );
+    assert!(short.zoom(ZoomTo::In));
+    assert_eq!(cells(&short), (7, 15));
+    assert!(short.zoom(ZoomTo::In));
+    assert_eq!(
+        (cells(&short), short.face().size()),
+        ((7, 16), 14.0 + ZOOM_STEP)
+    );
+    // Out again passes the fitted start, wider than 7x16, for 7x15; the
+    // reset chord is what returns to it.
+    assert!(short.zoom(ZoomTo::Out));
+    assert_eq!(cells(&short), (7, 15));
+    assert!(short.zoom(ZoomTo::Start));
+    assert_eq!(cells(&short), (8, 14));
+    // Past the face's bounds a step leaves it as it was.
+    let mut largest = Zoom::new(
+        Face::sized(outline_style(0, 0, 500, 500), None, 256.0).unwrap(),
+        Sizing::PixelsPerEm(256.0),
+    );
+    assert!(!largest.zoom(ZoomTo::In));
+    assert_eq!(largest.face().size(), 256.0);
+    assert!(largest.zoom(ZoomTo::Out));
+    let mut smallest = Zoom::new(
+        Face::sized(outline_style(0, 0, 500, 500), None, 6.0).unwrap(),
+        Sizing::PixelsPerEm(6.0),
+    );
+    assert!(!smallest.zoom(ZoomTo::Out));
+    assert_eq!(smallest.face().size(), 6.0);
+}
+
+#[test]
+fn a_cells_rules_and_cursor_take_the_faces_cell() {
+    // Underline two rows above the 22-row cell's bottom and strike at its
+    // middle, across all 10 columns, under a blank the face draws.
+    let mut outline = sized_outline(20.0);
+    let ruled = terminal(1, 1, b"\x1b[?25l\x1b[4;9m ");
+    let (pixels, width) = draw_sized(&Snapshot::new(&ruled, false, false), &mut outline);
+    let mut ink = set_pixels(&pixels, width, palette().foreground());
+    ink.sort_by_key(|&(x, y)| (y, x));
+    let mut rules = square(0..10, 11..12);
+    rules.extend(square(0..10, 20..21));
+    rules.sort_by_key(|&(x, y)| (y, x));
+    assert_eq!(ink, rules);
+    // An unfocused cursor rings the whole 10x22 cell.
+    let blank = terminal(1, 2, b" ");
+    let snapshot = Snapshot::new(&blank, false, false).with_cursor(Cursor {
+        row: 0,
+        column: 1,
+        visible: true,
+    });
+    let (pixels, width) = draw_sized(&snapshot, &mut outline);
+    let ring = set_pixels(&pixels, width, palette().foreground());
+    assert_eq!(ring.len(), 2 * 10 + 2 * 20);
+    assert!(ring
+        .iter()
+        .all(|&(x, y)| (10..20).contains(&x) && (x == 10 || x == 19 || y == 0 || y == 21)));
 }

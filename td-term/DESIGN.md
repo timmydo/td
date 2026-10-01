@@ -289,14 +289,47 @@ through td-ui's `pinned_face::styles_or_note` from the first directory
 td-ui's bounded search finds: `/etc/fonts/jetbrains-mono-nerd` on td's
 image, and on another host the user's or the host's font directories,
 where `./install-fonts` puts the pinned face (td-ui/DESIGN.md, "Delivery
-and trust position"). It fits them to Unifont's 8x16 cell, so the grid,
-the `TIOCSWINSZ` pixel size and every rule stay Unifont's. A scalar the
-outline face lacks, a missing or refused face, and `TD_UI_FACE=bitmap`
-all draw from Unifont as below; a missing or refused face is one
-`td-term: outline face unavailable` line on stderr, which names
-`./install-fonts`. The Unifont bytes above take no part in that search.
-No test reads the pinned outline face: the outline painter's oracles use
-fonts the tests encode, and every other oracle renders from Unifont.
+and trust position"). By default it fits them to Unifont's 8x16 cell, so
+the grid and every rule stay Unifont's. The desktop profile's
+`--font-size POINTS` (§7) instead covers them at that size, in foot's
+points: 96 dots per inch at scale one, so `--font-size 9` is foot's
+`size=9`, 12 pixels per em. The face's own metrics then give the cell,
+as td-ui's `Face::sized` derives it -- the rounded advance wide, the
+rounded ascender, descender and line gap tall -- and the grid, the
+cursor, the rules, hit testing and the fallback grid are laid on that
+cell (`vt_render::cell_size`); JetBrains Mono at 9 points is a 7x16
+cell. A scalar the outline face lacks, a missing or refused face, and
+`TD_UI_FACE=bitmap` all draw from Unifont as below, Unifont's glyph
+centred in a cell of another size and clipped about its middle in a
+smaller one, an odd difference trimming the right column or bottom row
+once more; a missing or refused face is one `td-term: outline face
+unavailable` line on stderr, which names `./install-fonts`, and with
+`--font-size` a line says the size went unused, since the grid is then
+Unifont's (the only line under `TD_UI_FACE=bitmap`, which says nothing
+else). The Unifont bytes above take no part in that search. No test reads the
+pinned outline face: the outline painter's oracles use fonts the tests
+encode, and every other oracle renders from Unifont.
+
+foot's font chords zoom the outline face: Control with `+` or `=` covers
+it half a point larger, Control with `-` half a point smaller, and
+Control with `0` returns to the size td-term started at -- fitted to
+Unifont's cell again, when it started there. Each is the chord exactly,
+so an added Alt is another chord, and none is a repeat candidate. They
+are td-term's whether or not there is a face to zoom, and none was ever
+the child's: the encoder's table (below) sends nothing for Control on
+any of those characters, so taking them costs the child no byte, and
+like the copy chord none clears the selection. Without an outline face a
+font chord does nothing. A step goes on past a size whose cell would
+move against it in either axis, up to four half points: a face fitted
+to Unifont's cell clips its taller line box, so the face's own cell half
+a point smaller can be taller than the fitted one, and zooming out would
+show fewer rows. A size past the face's bounds (6 to 256 pixels per em)
+leaves the face as it is. A zoom resizes the face from the bytes it
+already holds, reading nothing, and lays its new cell's grid on the same
+surface: the next frame adopts it as it adopts a resize (§4), setting
+and verifying the PTY's winsize before the model reflows and the pixels
+move, or touching neither when the grid is the one they have. The
+window keeps its size, as a tiled one must.
 
 The renderer gives every claimed rendition a deterministic presentation from
 the bitmap face; through the outline face, bold, italic and bold italic
@@ -408,7 +441,8 @@ bytes. The table is exhaustive:
   `18`, `19`, `20`, `21`, `23` and `24 ~`;
 - `S-PageUp` and `S-PageDown` move the viewport back and forward and reach
   the child as nothing; End while the viewport shows scrollback returns it to
-  the live bottom; and
+  the live bottom (Control on `+`, `=`, `-` and `0`, also silent here, are
+  the font chords above, which td-term answers before the table); and
 - Control on any named key, Shift on a named key other than Escape,
   Backspace, Return and Tab (and the two paging chords), and every name the
   table does not list are silent.
@@ -823,8 +857,11 @@ slave clones to the child.
 
 When the compositor declines to choose a size, the terminal falls back to a
 grid rather than to a rectangle: 80 columns by 24 rows, multiplied out by the
-pinned font's cell, since that is what a terminfo entry and anything drawing
-a box assume when they cannot ask. Each axis declines independently: a zero
+cell the grid is laid on, since that is what a terminfo entry and anything
+drawing a box assume when they cannot ask. A cell so large that the grid
+would pass the raster's ceilings (8192 pixels an axis, 32 MiB a frame)
+falls back to as many columns, then rows, as fit within them, at least
+one of each. Each axis declines independently: a zero
 axis in a configure keeps the size the surface already has on that axis.
 
 td-term's default child is `/bin/sh` leading a new session whose
@@ -989,9 +1026,12 @@ a bare `wl_surface.commit`, since an `ack_configure` takes effect on the
 surface commit that follows it; a chosen tile equal to the fallback is
 exactly that case. Before painting at a new size td-term derives the exact
 cell grid, sets and verifies the PTY winsize, and then reflows the model, so
-the child learns the grid before the pixels move. A surface smaller than one
-font cell uses a logical 1-by-1 grid whose pixels remain clipped to the
-actual surface. Later configures preserve horizontal overlap without reflow.
+the child learns the grid before the pixels move. A new size whose grid is
+the one the PTY and model already have touches neither: a reflow resets
+the scrolling margins a child set, which nothing about the grid asked
+for. A surface smaller than one font cell uses a logical 1-by-1 grid
+whose pixels remain clipped to the actual surface. Later configures
+preserve horizontal overlap without reflow.
 On primary-screen vertical shrink, blank tail rows disappear first; otherwise
 top rows move to primary history so the lowest content and cursor survive.
 The alternate screen discards removed rows, and resizing the hidden grid
@@ -1264,6 +1304,11 @@ terminal, and td-term's prove the program:
   write, survives a child that never reads, reports its own death to the next
   push, and retires on close; and the waiter reports the child's exit and
   reaps a child no thread will wait for (`pty.rs`);
+- a face covered at a size of its own lays the grid on its cell, with the
+  bitmap fallback centred or clipped about its middle in it and the rules
+  and the cursor taking it, and a zoom steps half a point, passes a size whose
+  cell moves against it, keeps every style, stops at the face's bounds
+  and returns to a fitted start fitted (`vt_render_spec.rs`);
 - td-term's window, against a scripted compositor peer, reaches readiness
   only with a chosen size, a released and presented frame and a compiled
   keymap; applies a single chosen axis and keeps its size on a bare
@@ -1276,8 +1321,13 @@ terminal, and td-term's prove the program:
   selection and writes its sends; pastes the primary selection on a middle
   press and does nothing without one;
   waits for the proof's sync on the live source; rings for a paste with
-  nothing offered and receives a selected offer over a fresh endpoint; and
-  feeds output to the model with its replies to the child (`app.rs`);
+  nothing offered and receives a selected offer over a fresh endpoint;
+  lays and hit-tests its grid on its cell, adopting a new one as a resize
+  and keeping the scrolling margins when the grid is unchanged; bounds its
+  fallback grid to the raster's ceilings; does nothing for a font chord
+  with no outline face, keeping the selection; and feeds output
+  to the model with its replies to the child (`app.rs`); its flags take a
+  font size in points within the face's bounds (`main.rs`);
 - the account, environment, and child command are the specified ones,
   constructed rather than inherited, the default child is the shell leading
   a session and an explicit command is literal argv leading none
@@ -1328,7 +1378,7 @@ bindsym $mod+Return exec $term
 Invoked bare, or with a flag first, td-term is the desktop profile:
 
 ```text
-td-term [--socket PATH] [--working-directory PATH]
+td-term [--socket PATH] [--working-directory PATH] [--font-size POINTS]
         [-e|--command PROGRAM [ARG...]]
 ```
 
@@ -1382,6 +1432,10 @@ desktop's terminal must:
   after one `td-term: outline face unavailable` line naming
   `./install-fonts`, which `TD_UI_FACE=bitmap` avoids by reading
   nothing;
+- `--font-size POINTS` covers the outline face at that size, in foot's
+  points, from 4.5 to 192, on the cell its metrics give, and foot's font
+  chords zoom it (§3): `td-term --font-size 9` draws as foot's
+  `font=monospace:size=9` does at scale one;
 - td-term ends with its child: its status is td-term's (its code, or 128 and
   the signal that ended it) with no last-screen report, and the window does
   not wait for the output to drain, so a background job still holding the

@@ -5,15 +5,16 @@
 //! passes its `SETTING` value, as it passes the Wayland endpoint's, and
 //! `bitmap` keeps it on the bitmap face without reading anything. A widget
 //! program reads the regular style alone, since the draw stream has no bold
-//! weight; a terminal reads all four as one `Face` fitted to its cell
-//! (`styles_or_note`), which `vt_render::render_with` draws through.
+//! weight; a terminal reads all four as one `Face`, fitted to its cell or
+//! at a size of its own (`styles_or_note`), which `vt_render::render_with`
+//! draws through.
 
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::face::Face;
+use crate::face::{Face, Sizing};
 pub use crate::face_file::SETTING;
 use crate::face_file::{self, Place, BOLD, BOLD_ITALIC, INSTALL_HINT, ITALIC, REGULAR};
 use crate::typeface::Typeface;
@@ -59,16 +60,16 @@ pub fn load_in_or_note(
     load_in(places).map_err(|why| note(program, &why)).ok()
 }
 
-/// The pinned face's four styles from `dir`, fitted to a `width` by
-/// `height` cell; a refused face is an error naming the directory and the
-/// pair of styles the refusing step read.
-pub fn styles_from(dir: &Path, width: usize, height: usize) -> Result<Face, String> {
+/// The pinned face's four styles from `dir`, sized as `sizing` asks; a
+/// refused face is an error naming the directory and the pair of styles
+/// the refusing step read.
+pub fn styles_from(dir: &Path, sizing: Sizing) -> Result<Face, String> {
     let read = |name: &str| face_file::read(dir, name).map(Arc::<[u8]>::from);
     let refused = |styles: [&str; 2], why: crate::sfnt::Error| {
         let [first, second] = styles;
         format!("{} ({first} or {second}): {why}", dir.display())
     };
-    Face::fit(read(REGULAR)?, Some(read(BOLD)?), width, height)
+    Face::with_sizing(read(REGULAR)?, Some(read(BOLD)?), sizing)
         .map_err(|why| refused([REGULAR, BOLD], why))?
         .with_slant(Some(read(ITALIC)?), Some(read(BOLD_ITALIC)?))
         .map_err(|why| refused([ITALIC, BOLD_ITALIC], why))
@@ -76,8 +77,8 @@ pub fn styles_from(dir: &Path, width: usize, height: usize) -> Result<Face, Stri
 
 /// The four styles from the first of `places` that holds the regular
 /// style: every style is read from that one directory.
-pub fn styles_in(places: &[Place], width: usize, height: usize) -> Result<Face, String> {
-    styles_from(&face_file::find(places)?, width, height)
+pub fn styles_in(places: &[Place], sizing: Sizing) -> Result<Face, String> {
+    styles_from(&face_file::find(places)?, sizing)
 }
 
 /// `styles_in` `face_file::host_places`, or a line on standard error
@@ -86,30 +87,24 @@ pub fn styles_in(places: &[Place], width: usize, height: usize) -> Result<Face, 
 /// reads and says nothing. A missing style is the whole face refused: a
 /// terminal draws in Unifont rather than in a face that cannot draw every
 /// rendition.
-pub fn styles_or_note(
-    program: &str,
-    width: usize,
-    height: usize,
-    setting: Option<&OsStr>,
-) -> Option<Face> {
+pub fn styles_or_note(program: &str, sizing: Sizing, setting: Option<&OsStr>) -> Option<Face> {
     if !face_file::wanted(setting) {
         return None;
     }
-    styles_in_or_note(&face_file::host_places(), program, width, height, setting)
+    styles_in_or_note(&face_file::host_places(), program, sizing, setting)
 }
 
 /// `styles_or_note` from `places`.
 pub fn styles_in_or_note(
     places: &[Place],
     program: &str,
-    width: usize,
-    height: usize,
+    sizing: Sizing,
     setting: Option<&OsStr>,
 ) -> Option<Face> {
     if !face_file::wanted(setting) {
         return None;
     }
-    styles_in(places, width, height)
+    styles_in(places, sizing)
         .map_err(|why| note(program, &why))
         .ok()
 }

@@ -17,6 +17,15 @@ pub const MAX_PIXELS_PER_EM: u16 = 256;
 /// refused.
 pub const MAX_CELL_AXIS: usize = 512;
 
+/// How a face is sized: fitted to a fixed grid cell (`Face::fit`), or at
+/// a size in pixels per em, possibly fractional, on the cell its own
+/// metrics give (`Face::sized`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sizing {
+    Cell { width: usize, height: usize },
+    PixelsPerEm(f32),
+}
+
 /// The grid a face lays text on at its pixel size: the width of one
 /// advance, the height of one line, the baseline's distance from the
 /// cell's top, and the pen's from its left.
@@ -54,8 +63,22 @@ impl Face {
         if !(MIN_PIXELS_PER_EM..=MAX_PIXELS_PER_EM).contains(&pixels_per_em) {
             return Err(Error::Limit("pixels per em"));
         }
+        Self::sized(
+            regular.into(),
+            bold.map(Arc::from),
+            f32::from(pixels_per_em),
+        )
+    }
+
+    /// `new` over shared style bytes at `size` pixels per em, which may be
+    /// fractional: the cell is the size's rounded metrics, as `new`'s.
+    pub fn sized(regular: Arc<[u8]>, bold: Option<Arc<[u8]>>, size: f32) -> Result<Self, Error> {
+        let range = f32::from(MIN_PIXELS_PER_EM)..=f32::from(MAX_PIXELS_PER_EM);
+        if !range.contains(&size) {
+            return Err(Error::Limit("pixels per em"));
+        }
         let font = Font::parse(&regular)?;
-        let scale = f32::from(pixels_per_em) / f32::from(font.units_per_em());
+        let scale = size / f32::from(font.units_per_em());
         let pixels = |units: f32| (units * scale).round().max(0.0) as usize;
         let width = pixels(f32::from(advance(&font)?));
         let baseline = pixels(f32::from(font.ascender()));
@@ -70,12 +93,28 @@ impl Face {
             baseline,
             pen: 0,
         };
-        Self::build(
-            regular.into(),
-            bold.map(Arc::from),
-            f32::from(pixels_per_em),
-            cell,
-        )
+        Self::build(regular, bold, size, cell)
+    }
+
+    /// `fit` or `sized`, as `sizing` asks.
+    pub fn with_sizing(
+        regular: Arc<[u8]>,
+        bold: Option<Arc<[u8]>>,
+        sizing: Sizing,
+    ) -> Result<Self, Error> {
+        match sizing {
+            Sizing::Cell { width, height } => Self::fit(regular, bold, width, height),
+            Sizing::PixelsPerEm(size) => Self::sized(regular, bold, size),
+        }
+    }
+
+    /// This face's styles again at another sizing, with an empty atlas.
+    pub fn resized(&self, sizing: Sizing) -> Result<Self, Error> {
+        let [bold, italic, bold_italic] = &self.styles;
+        let bytes =
+            |style: &Option<(Arc<[u8]>, f32)>| style.as_ref().map(|(bytes, _)| bytes.clone());
+        Self::with_sizing(self.regular.clone(), bytes(bold), sizing)?
+            .with_slant(bytes(italic), bytes(bold_italic))
     }
 
     /// A face fitted to a fixed `width` by `height` grid cell, so text laid
@@ -182,6 +221,11 @@ impl Face {
     /// fractional.
     pub fn pixels_per_em(&self) -> u16 {
         self.pixels_per_em
+    }
+
+    /// The size glyphs are covered at, unrounded.
+    pub fn size(&self) -> f32 {
+        self.size
     }
 
     pub fn atlas(&self) -> &Atlas {

@@ -16,7 +16,7 @@ mod fonts;
 
 use fonts::{Builder, Glyph, Segment};
 use td_ui::atlas::{Slot, Style};
-use td_ui::face::{Cell, Face};
+use td_ui::face::{Cell, Face, Sizing};
 use td_ui::font::pinned;
 use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, Weight};
 use td_ui::sfnt::Error;
@@ -149,6 +149,64 @@ fn the_cell_comes_from_the_face_metrics() {
             pen: 0
         }
     );
+}
+
+#[test]
+fn a_fractional_size_takes_its_rounded_metrics_and_resizes_with_its_styles() {
+    let sized = |size: f32| Face::sized(face_bytes(false).into(), None, size);
+    // A whole size is `new`'s face.
+    assert_eq!(
+        sized(20.0).unwrap().cell(),
+        Face::new(face_bytes(false), None, 20).unwrap().cell()
+    );
+    // At 13.5: advance 6.76, ascender 10.8, descender 2.7, gap 1.215.
+    let face = sized(13.5).unwrap();
+    assert_eq!(
+        face.cell(),
+        Cell {
+            width: 7,
+            height: 15,
+            baseline: 11,
+            pen: 0
+        }
+    );
+    assert_eq!((face.size(), face.pixels_per_em()), (13.5, 14));
+    for refused in [5.9, 256.1, f32::NAN, f32::INFINITY, 0.0] {
+        assert_eq!(
+            sized(refused).unwrap_err(),
+            Error::Limit("pixels per em"),
+            "{refused}"
+        );
+    }
+    // A sizing names one or the other.
+    let cell = Sizing::Cell {
+        width: 8,
+        height: 16,
+    };
+    let with = |sizing| Face::with_sizing(face_bytes(false).into(), None, sizing);
+    assert_eq!(
+        with(cell).unwrap().cell(),
+        Face::fit(face_bytes(false).into(), None, 8, 16)
+            .unwrap()
+            .cell()
+    );
+    assert_eq!(with(Sizing::PixelsPerEm(13.5)).unwrap().cell(), face.cell());
+    // Resizing keeps every style, and empties the atlas.
+    let mut styled = Face::new(face_bytes(false), Some(face_bytes(true)), 20)
+        .unwrap()
+        .with_slant(Some(face_bytes(true).into()), Some(face_bytes(true).into()))
+        .unwrap();
+    assert!(matches!(styled.glyph(Style::Regular, 'a'), Slot::Placed(_)));
+    let resized = styled.resized(Sizing::PixelsPerEm(13.5)).unwrap();
+    assert_eq!(resized.cell(), face.cell());
+    assert_eq!(resized.style(true, false), Style::Bold);
+    assert_eq!(resized.style(false, true), Style::Italic);
+    assert_eq!(resized.style(true, true), Style::BoldItalic);
+    assert_eq!(resized.atlas().len(), 0);
+    let refit = resized.resized(cell).unwrap();
+    assert_eq!(refit.cell(), with(cell).unwrap().cell());
+    assert_eq!(refit.style(true, false), Style::Bold);
+    assert!(styled.resized(Sizing::PixelsPerEm(300.0)).is_err());
 }
 
 #[test]

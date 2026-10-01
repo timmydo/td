@@ -8,7 +8,7 @@
 //! process.
 
 use crate::atlas::{Entry, Slot, PAGE_WIDTH};
-use crate::face::Face;
+use crate::face::{Face, Sizing};
 use crate::font::Font;
 use crate::raster::{self, Scale, Surface};
 use crate::vt::{Attributes, Cell, Color, Terminal};
@@ -422,10 +422,108 @@ pub fn render(
     render_with(snapshot, palette, font, None, pixels, width, height)
 }
 
-/// `render`, drawing each glyph the `outline` face has through it: the face
-/// fitted to the bitmap face's cell, so the grid, the cursor and every
-/// rule are the same, and a scalar it lacks is drawn from the bitmap face.
-/// A face fitted to another cell is not used.
+/// The cell the grid is laid on: the outline face's when there is one,
+/// whether fitted to the bitmap face's cell or at a size of its own, and
+/// otherwise the bitmap face's. A program hit-tests and sizes its grid by
+/// the same cell it draws with.
+pub fn cell_size(font: &Font, outline: Option<&Face>) -> (usize, usize) {
+    outline.map_or((font.width(), font.height()), |face| {
+        let cell = face.cell();
+        (cell.width, cell.height)
+    })
+}
+
+/// A zoom step in pixels per em: foot's half a point at 96 dots per inch.
+pub const ZOOM_STEP: f32 = 2.0 / 3.0;
+/// The most steps one zoom takes looking for a cell that moves its way.
+const MAX_ZOOM_STEPS: usize = 4;
+
+/// Where a font chord moves a terminal's outline face: a step larger, a
+/// step smaller, or back to the size it started at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ZoomTo {
+    In,
+    Out,
+    Start,
+}
+
+/// A terminal's outline face and its zoom: the sizing it started at, the
+/// size in pixels per em that gave, and how many `ZOOM_STEP`s it has moved
+/// since. A step resizes the face from the bytes it holds
+/// (`Face::resized`), so zooming reads nothing.
+pub struct Zoom {
+    face: Face,
+    start: Sizing,
+    size: f32,
+    steps: i16,
+}
+
+impl Zoom {
+    pub fn new(face: Face, start: Sizing) -> Self {
+        let size = face.size();
+        Self {
+            face,
+            start,
+            size,
+            steps: 0,
+        }
+    }
+
+    pub fn face(&self) -> &Face {
+        &self.face
+    }
+
+    pub fn face_mut(&mut self) -> &mut Face {
+        &mut self.face
+    }
+
+    /// Moves the face `to`, and says whether it changed: not when it is
+    /// already there, and not past the face's bounds, which leave it as it
+    /// was. Back at the start is the start's own sizing, so a face fitted
+    /// to a cell is fitted again rather than sized near it. A step in or
+    /// out goes on past a size whose cell would move against it in either
+    /// axis, a few steps at most: a fitted face's cell clips its line box,
+    /// so the face's own cell a step smaller can be taller, and zooming
+    /// out would show fewer rows.
+    pub fn zoom(&mut self, to: ZoomTo) -> bool {
+        let current = self.face.cell();
+        let mut steps = self.steps;
+        for _ in 0..MAX_ZOOM_STEPS {
+            steps = match to {
+                ZoomTo::In => steps.saturating_add(1),
+                ZoomTo::Out => steps.saturating_sub(1),
+                ZoomTo::Start => 0,
+            };
+            if steps == self.steps {
+                return false;
+            }
+            let sizing = if steps == 0 {
+                self.start
+            } else {
+                Sizing::PixelsPerEm(self.size + f32::from(steps) * ZOOM_STEP)
+            };
+            let Ok(face) = self.face.resized(sizing) else {
+                return false;
+            };
+            let cell = face.cell();
+            let along = match to {
+                ZoomTo::In => cell.width >= current.width && cell.height >= current.height,
+                ZoomTo::Out => cell.width <= current.width && cell.height <= current.height,
+                ZoomTo::Start => true,
+            };
+            if along {
+                self.face = face;
+                self.steps = steps;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// `render`, drawing each glyph the `outline` face has through it, on the
+/// face's cell (`cell_size`): the cursor and every rule take that cell,
+/// and a scalar the face lacks is the bitmap face's glyph centred in it.
 pub fn render_with(
     snapshot: &Snapshot,
     palette: &Palette,
@@ -445,15 +543,9 @@ pub fn render_with(
             pixels.len()
         ));
     }
-    let (cell_width, cell_height) = (font.width(), font.height());
+    let (cell_width, cell_height) = cell_size(font, outline.as_deref());
     if cell_width == 0 || cell_height == 0 {
         return Err("font cells have no area".into());
-    }
-    if outline.as_ref().is_some_and(|face| {
-        let cell = face.cell();
-        (cell.width, cell.height) != (cell_width, cell_height)
-    }) {
-        outline = None;
     }
 
     fill(pixels, palette.background());
@@ -479,15 +571,21 @@ pub fn render_with(
                 outline.as_deref_mut(),
                 palette,
                 &cell,
-                origin_x,
-                origin_y,
+                (origin_x, origin_y),
             );
         }
     }
 
     if let Some((row, column)) = snapshot.cursor() {
         paint_cursor(
-            pixels, width, height, font, outline, palette, snapshot, row, column,
+            pixels,
+            width,
+            height,
+            font,
+            outline,
+            palette,
+            snapshot,
+            (row, column),
         );
     }
 
@@ -514,26 +612,26 @@ fn paint_cell(
     outline: Option<&mut Face>,
     palette: &Palette,
     cell: &Cell,
-    origin_x: usize,
-    origin_y: usize,
+    (origin_x, origin_y): (usize, usize),
 ) {
     let attributes = &cell.attributes;
     let ink = Ink::new(attributes, palette);
+    let (cell_width, cell_height) = cell_size(font, outline.as_deref());
     if let Some(face) = outline {
         let slot = face.glyph(face.style(attributes.bold, attributes.italic), cell.scalar);
         if slot != Slot::Missing {
             let (x, y) = (origin_x, origin_y);
-            let rules = rules(attributes, font.height());
+            let rules = rules(attributes, cell_height);
             let coverage = |column: usize, row: usize| match slot {
                 Slot::Placed(entry) => covered(face, entry, column, row),
                 _ => 0,
             };
-            for row in 0..font.height() {
+            for row in 0..cell_height {
                 let Some(y) = y.checked_add(row).filter(|&y| y < height) else {
                     return;
                 };
                 let ruled = rules.contains(&Some(row));
-                for column in 0..font.width() {
+                for column in 0..cell_width {
                     let Some(x) = x.checked_add(column).filter(|&x| x < width) else {
                         break;
                     };
@@ -549,29 +647,56 @@ fn paint_cell(
         }
     }
     let glyph = font.index(cell.scalar);
-    let rules = rules(attributes, font.height());
-    for glyph_row in 0..font.height() {
-        let Some(y) = origin_y.checked_add(glyph_row) else {
+    let rules = rules(attributes, cell_height);
+    // Centred: a larger cell frames the glyph and a smaller one clips it
+    // about its middle, an odd difference trimming the right column or the
+    // bottom row once more, and the bitmap face's own cell holds it
+    // exactly.
+    let inset = |cell: usize, glyph: usize| {
+        let signed = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+        (signed(cell).saturating_sub(signed(glyph))) / 2
+    };
+    let (inset_x, inset_y) = (
+        inset(cell_width, font.width()),
+        inset(cell_height, font.height()),
+    );
+    let within = |at: usize, inset: i64, glyph: usize| {
+        i64::try_from(at)
+            .ok()
+            .and_then(|at| usize::try_from(at.saturating_sub(inset)).ok())
+            .filter(|&at| at < glyph)
+    };
+    for row in 0..cell_height {
+        let Some(y) = origin_y.checked_add(row) else {
             return;
         };
         if y >= height {
             return;
         }
-        let ruled = rules.contains(&Some(glyph_row));
-        let lean = if attributes.italic {
-            shear(glyph_row, font.height())
-        } else {
-            0
+        let ruled = rules.contains(&Some(row));
+        let glyph_row = within(row, inset_y, font.height());
+        let lean = match glyph_row {
+            Some(glyph_row) if attributes.italic => shear(glyph_row, font.height()),
+            _ => 0,
         };
-        for glyph_column in 0..font.width() {
-            let Some(x) = origin_x.checked_add(glyph_column) else {
+        for column in 0..cell_width {
+            let Some(x) = origin_x.checked_add(column) else {
                 break;
             };
             if x >= width {
                 break;
             }
-            let set = ruled || lit(font, glyph, glyph_column, glyph_row, attributes.bold, lean);
-            let color = if set { ink.foreground } else { ink.background };
+            let inked = match (within(column, inset_x, font.width()), glyph_row) {
+                (Some(glyph_column), Some(glyph_row)) => {
+                    lit(font, glyph, glyph_column, glyph_row, attributes.bold, lean)
+                }
+                _ => false,
+            };
+            let color = if ruled || inked {
+                ink.foreground
+            } else {
+                ink.background
+            };
             put_pixel(pixels, width, height, x, y, color);
         }
     }
@@ -661,13 +786,12 @@ fn paint_cursor(
     outline: Option<&mut Face>,
     palette: &Palette,
     snapshot: &Snapshot,
-    row: usize,
-    column: usize,
+    (row, column): (usize, usize),
 ) {
-    let (Some(origin_x), Some(origin_y)) = (
-        column.checked_mul(font.width()),
-        row.checked_mul(font.height()),
-    ) else {
+    let (cell_width, cell_height) = cell_size(font, outline.as_deref());
+    let (Some(origin_x), Some(origin_y)) =
+        (column.checked_mul(cell_width), row.checked_mul(cell_height))
+    else {
         return;
     };
     let cell = snapshot.cell(row, column);
@@ -682,18 +806,25 @@ fn paint_cursor(
             attributes,
         };
         paint_cell(
-            pixels, width, height, font, outline, palette, &flipped, origin_x, origin_y,
+            pixels,
+            width,
+            height,
+            font,
+            outline,
+            palette,
+            &flipped,
+            (origin_x, origin_y),
         );
         return;
     }
     // Unfocused it is a hollow box: present, but not claiming the keyboard.
     let ink = Ink::new(&cell.attributes, palette);
-    for glyph_row in 0..font.height() {
-        for glyph_column in 0..font.width() {
+    for glyph_row in 0..cell_height {
+        for glyph_column in 0..cell_width {
             let edge = glyph_row == 0
                 || glyph_column == 0
-                || glyph_row.saturating_add(1) == font.height()
-                || glyph_column.saturating_add(1) == font.width();
+                || glyph_row.saturating_add(1) == cell_height
+                || glyph_column.saturating_add(1) == cell_width;
             if !edge {
                 continue;
             }

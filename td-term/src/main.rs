@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use td_ui::vt_terminfo as terminfo;
 
 fn usage() -> String {
-    "usage: td-term [--socket PATH] [--working-directory PATH] \
+    "usage: td-term [--socket PATH] [--working-directory PATH] [--font-size POINTS] \
      [-e|--command|-- PROGRAM [ARG...]] | td-term -h|--help | \
      td-term run [--socket PATH] --ready-socket PATH [--working-directory PATH] \
      [--command PROGRAM [ARG...]] | td-term probe READY_SOCKET | td-term terminfo PATH | \
@@ -100,20 +100,36 @@ fn utf8_args(args: &[OsString]) -> Result<Vec<String>, String> {
 
 /// The flags, each at most once and each taking a value: `run`'s under
 /// td's profile, a bare invocation's under the desktop's, which takes no
-/// readiness socket, also spells a flag `--flag=VALUE`, and takes a relative
-/// working directory from td-term's own and a relative socket as a display
-/// name under `XDG_RUNTIME_DIR`, as `WAYLAND_DISPLAY` is.
+/// readiness socket but takes a font size, also spells a flag
+/// `--flag=VALUE`, and takes a relative working directory from td-term's
+/// own and a relative socket as a display name under `XDG_RUNTIME_DIR`, as
+/// `WAYLAND_DISPLAY` is.
 fn parse_run(args: &[OsString], desktop: bool) -> Result<app::Options, String> {
     let (flags, command) = split_command(args, desktop)?;
     let mut socket = None;
     let mut ready_socket = None;
     let mut working_directory = None;
+    let mut font_size = None;
     let mut words = flags.iter();
     while let Some(word) = words.next() {
         let (flag, inline) = match word.split_once('=') {
             Some((flag, value)) if desktop && flag.starts_with("--") => (flag, Some(value)),
             _ => (word.as_str(), None),
         };
+        let mut value = || match inline {
+            Some(value) => Ok(value),
+            None => words
+                .next()
+                .map(String::as_str)
+                .ok_or_else(|| format!("{flag} requires a value")),
+        };
+        if flag == "--font-size" && desktop {
+            if font_size.is_some() {
+                return Err(format!("duplicate flag '{flag}'"));
+            }
+            font_size = Some(app::font_points(value()?)?);
+            continue;
+        }
         let slot = match flag {
             "--socket" => &mut socket,
             "--ready-socket" if !desktop => &mut ready_socket,
@@ -123,12 +139,7 @@ fn parse_run(args: &[OsString], desktop: bool) -> Result<app::Options, String> {
         if slot.is_some() {
             return Err(format!("duplicate flag '{flag}'"));
         }
-        let value = match inline {
-            Some(value) => value,
-            None => words
-                .next()
-                .ok_or_else(|| format!("{flag} requires a value"))?,
-        };
+        let value = value()?;
         let path = PathBuf::from(value);
         if desktop {
             *slot = Some(if flag == "--working-directory" {
@@ -155,6 +166,7 @@ fn parse_run(args: &[OsString], desktop: bool) -> Result<app::Options, String> {
         profile,
         working_directory,
         command,
+        font_size,
     })
 }
 
@@ -301,6 +313,26 @@ mod tests {
         ] {
             assert!(parse_run(&words(refused), true).is_err(), "{refused:?}");
         }
+        // A font size is the desktop's, in points, within the face's bounds.
+        assert_eq!(bare.font_size, None);
+        let sized = parse_run(&words(&["--font-size", "9", "-e", "vi"]), true).unwrap();
+        assert_eq!(sized.font_size, Some(9.0));
+        let joined = parse_run(&words(&["--font-size=10.5"]), true).unwrap();
+        assert_eq!(joined.font_size, Some(10.5));
+        for refused in [
+            &["--font-size"][..],
+            &["--font-size", "4"],
+            &["--font-size", "193"],
+            &["--font-size", "nine"],
+            &["--font-size", "NaN"],
+            &["--font-size", "inf"],
+            &["--font-size", "9", "--font-size=10"],
+        ] {
+            assert!(parse_run(&words(refused), true).is_err(), "{refused:?}");
+        }
+        assert!(parse_run(&words(&["--font-size", "4.5"]), true).is_ok());
+        assert!(parse_run(&words(&["--font-size", "192"]), true).is_ok());
+        assert!(parse_run(&words(&["--ready-socket", "/r", "--font-size", "9"]), false).is_err());
         for (alone, said) in [("-e", "-e"), ("--", "--"), ("--command", "--command")] {
             let error = parse_run(&words(&[alone]), true).err().unwrap();
             assert_eq!(error, format!("{said} requires a program"));

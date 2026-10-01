@@ -31,8 +31,7 @@ use std::time::Duration;
 use td_ui::client::{App, Client, ClipboardEvent, Handled, KeyboardEvent, Tag, DISPLAY};
 use td_ui::clipboard::{Incoming, Outgoing};
 use td_ui::data;
-use td_ui::face::Face;
-use td_ui::font::Font;
+use td_ui::face::{Face, Sizing, MAX_PIXELS_PER_EM, MIN_PIXELS_PER_EM};
 use td_ui::keyboard::Stroke;
 use td_ui::pointer::{self, Wheel};
 use td_ui::pty::{self, Pty};
@@ -69,6 +68,9 @@ pub struct Options {
     /// `session::child_command` for what each means. Bytes rather than text:
     /// a filename argument is whatever the filesystem holds.
     pub command: Vec<OsString>,
+    /// The outline face's size in points (`--font-size`), or `None` for
+    /// the face fitted to the bitmap face's cell.
+    pub font_size: Option<f32>,
 }
 
 /// What an operator sees in a title bar; td's compositor keeps it.
@@ -96,6 +98,16 @@ const MULTI_CLICK_MS: u64 = 500;
 /// The two chords the terminal keeps for itself rather than sending.
 const COPY_CHORD: &str = "C-S-c";
 const PASTE_CHORD: &str = "C-S-v";
+/// foot's font chords: Control with `+` or `=` grows the outline face a
+/// step, with `-` shrinks it, and with `0` restores the size td-term
+/// started at. Each is silent to the child (`vt_keys`), so none is taken
+/// from it.
+const ZOOM_IN_CHORDS: [&str; 2] = ["C-+", "C-="];
+const ZOOM_OUT_CHORD: &str = "C--";
+const ZOOM_RESET_CHORD: &str = "C-0";
+/// Pixels per em in a point, at the 96 dots per inch foot sizes its font
+/// by at scale one, so `--font-size 9` is foot's `size=9`.
+const PIXELS_PER_POINT: f32 = 4.0 / 3.0;
 const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
 const CLIPBOARD_PROOF_BYTES: &[u8; 7] = b"Welcome";
 const CLIPBOARD_TARGET_PREFIX: &str = "TD-TERM-CLIPBOARD-TARGET-READY";
@@ -126,24 +138,79 @@ pub struct Size {
     pub height: usize,
 }
 
-/// The pixel size of the fallback grid.
-pub fn default_size(font: &Font) -> Result<Size> {
-    let width = DEFAULT_COLUMNS
-        .checked_mul(font.width())
+/// The pixel size of the fallback grid in `cell`s: 80x24, or as much of
+/// it as a surface within the raster's ceilings holds, so a large font
+/// leaves a smaller window rather than one no frame can be drawn for.
+pub fn default_size((cell_width, cell_height): (usize, usize)) -> Result<Size> {
+    if cell_width == 0 || cell_height == 0 {
+        return Err("the cell has no area".into());
+    }
+    let columns = DEFAULT_COLUMNS.min(MAX_AXIS / cell_width).max(1);
+    let width = columns
+        .checked_mul(cell_width)
         .ok_or("the default column count overflows a pixel width")?;
-    let height = DEFAULT_ROWS
-        .checked_mul(font.height())
+    let row_bytes = width
+        .checked_mul(cell_height)
+        .and_then(|pixels| pixels.checked_mul(render::BYTES_PER_PIXEL))
+        .ok_or("a default row overflows a byte count")?;
+    let rows = DEFAULT_ROWS
+        .min(MAX_AXIS / cell_height)
+        .min(MAX_FRAME_BYTES / row_bytes)
+        .max(1);
+    let height = rows
+        .checked_mul(cell_height)
         .ok_or("the default row count overflows a pixel height")?;
     Ok(Size { width, height })
 }
 
-/// The cell grid a surface of this size holds: `grid_for_tile` is the
-/// division the renderer clips to, and `grid_size` the validity the winsize
-/// ioctl is held to, so a grid this refuses nothing downstream would take.
-pub fn grid(size: Size, font: &Font) -> Result<(u16, u16)> {
-    let (rows, columns) = pty::grid_for_tile(size.width, size.height, font.width(), font.height())?;
+/// The grid of `cell`s a surface of this size holds: `grid_for_tile` is
+/// the division the renderer clips to, and `grid_size` the validity the
+/// winsize ioctl is held to, so a grid this refuses nothing downstream
+/// would take.
+pub fn grid(size: Size, (cell_width, cell_height): (usize, usize)) -> Result<(u16, u16)> {
+    let (rows, columns) = pty::grid_for_tile(size.width, size.height, cell_width, cell_height)?;
     let window = pty::grid_size(rows, columns)?;
     Ok((window.rows, window.columns))
+}
+
+/// A `--font-size` in points, held to the sizes the outline face takes.
+pub fn font_points(value: &str) -> Result<f32> {
+    let refused = || {
+        let pixels = |limit: u16| f32::from(limit) / PIXELS_PER_POINT;
+        format!(
+            "--font-size '{value}' is not a size from {} to {} points",
+            pixels(MIN_PIXELS_PER_EM),
+            pixels(MAX_PIXELS_PER_EM)
+        )
+    };
+    let points: f32 = value.parse().map_err(|_| refused())?;
+    let range = f32::from(MIN_PIXELS_PER_EM)..=f32::from(MAX_PIXELS_PER_EM);
+    if !range.contains(&(points * PIXELS_PER_POINT)) {
+        return Err(refused());
+    }
+    Ok(points)
+}
+
+/// How the outline face is sized at startup: at `--font-size` points on
+/// its own cell, or fitted to the bitmap face's.
+fn start_sizing(font_size: Option<f32>, font: &td_ui::font::Font) -> Sizing {
+    match font_size {
+        Some(points) => Sizing::PixelsPerEm(points * PIXELS_PER_POINT),
+        None => Sizing::Cell {
+            width: font.width(),
+            height: font.height(),
+        },
+    }
+}
+
+/// Where a font chord moves the outline face, if `chord` is one.
+fn zoom_to(chord: &str) -> Option<render::ZoomTo> {
+    match chord {
+        ZOOM_OUT_CHORD => Some(render::ZoomTo::Out),
+        ZOOM_RESET_CHORD => Some(render::ZoomTo::Start),
+        _ if ZOOM_IN_CHORDS.contains(&chord) => Some(render::ZoomTo::In),
+        _ => None,
+    }
 }
 
 /// A compositor-supplied size, bounded before anything is allocated for it,
@@ -337,7 +404,10 @@ struct Proof {
 
 pub struct Window {
     client: Client<Object>,
-    font: Font,
+    font: td_ui::font::Font,
+    /// The cell the grid is laid on, the outline face's when there is one
+    /// (`vt_render::cell_size`).
+    cell: (usize, usize),
     palette: render::Palette,
     fallback: Size,
     clock: u64,
@@ -377,8 +447,9 @@ pub struct Window {
     board: Board,
     proof: Proof,
     /// The outline face the cells are drawn in, fitted to the bitmap face's
-    /// cell; `None` draws every cell from the bitmap face.
-    outline: Option<Face>,
+    /// cell or at a size of its own, with its zoom; `None` draws every cell
+    /// from the bitmap face.
+    outline: Option<render::Zoom>,
     /// The browser command a link opens with; none, as in production, is
     /// `BROWSER` then `xdg-open` (td-ui's opener).
     browser: Option<String>,
@@ -393,7 +464,8 @@ impl Window {
         display: String,
     ) -> Result<Self> {
         let font = td_ui::font::pinned()?;
-        let fallback = default_size(&font)?;
+        let cell = render::cell_size(&font, None);
+        let fallback = default_size(cell)?;
         let mut client = Client::new(stream, std::env::temp_dir())?;
         client.want_primary();
         let waker = client.connection().waker()?;
@@ -404,6 +476,7 @@ impl Window {
         Ok(Self {
             client,
             font,
+            cell,
             palette: render::Palette::pinned(),
             fallback,
             clock: 0,
@@ -438,6 +511,30 @@ impl Window {
             browser: None,
             exit: 0,
         })
+    }
+
+    /// Draws in `outline`, sized at startup by `start`: the grid is laid on
+    /// its cell, and the fallback grid is that cell's.
+    fn set_outline(&mut self, outline: Option<Face>, start: Sizing) -> Result<()> {
+        self.cell = render::cell_size(&self.font, outline.as_ref());
+        self.fallback = default_size(self.cell)?;
+        self.outline = outline.map(|face| render::Zoom::new(face, start));
+        Ok(())
+    }
+
+    /// Moves the outline face `to`. A new size's cell lays another grid on
+    /// the same surface, which the next draw adopts as it adopts a resize,
+    /// so the PTY learns the grid before the pixels move. With no outline
+    /// face there is no size to change.
+    fn zoom(&mut self, to: render::ZoomTo) {
+        let Some(outline) = self.outline.as_mut() else {
+            return;
+        };
+        if outline.zoom(to) {
+            self.cell = render::cell_size(&self.font, Some(outline.face()));
+            self.adopted = None;
+            self.stale = true;
+        }
     }
 
     fn modes(&self) -> keys::Modes {
@@ -521,6 +618,12 @@ impl Window {
             if !self.paste(data::Board::Clipboard)? {
                 self.ring();
             }
+            return Ok(());
+        }
+        // The font chords are td-term's whether or not there is a face to
+        // zoom: the child's table sends nothing for them.
+        if let Some(to) = zoom_to(chord) {
+            self.zoom(to);
             return Ok(());
         }
         self.clear_selection();
@@ -657,9 +760,7 @@ impl Window {
             usize::try_from(value.div_euclid(256))
                 .is_ok_and(|pixel| pixel < usize::from(cells).saturating_mul(cell))
         };
-        if !inside(fixed.0, columns, self.font.width())
-            || !inside(fixed.1, rows, self.font.height())
-        {
+        if !inside(fixed.0, columns, self.cell.0) || !inside(fixed.1, rows, self.cell.1) {
             return None;
         }
         let (row, column) = self.cell_at(fixed)?;
@@ -691,7 +792,7 @@ impl Window {
 
     fn cell_at(&self, fixed: (i32, i32)) -> Option<(usize, usize)> {
         let (rows, columns) = self.cells?;
-        let (width, height) = (self.font.width(), self.font.height());
+        let (width, height) = self.cell;
         if rows == 0 || columns == 0 || width == 0 || height == 0 {
             return None;
         }
@@ -1138,10 +1239,17 @@ impl Window {
 
     /// The size changed: bound it, set the PTY and verify it took, then
     /// reflow the model — the child learns the grid before the pixels move.
+    /// A grid the PTY and model already have touches neither, since a
+    /// reflow resets the scrolling margins a child set.
     fn adopt(&mut self, size: Size) -> Result<()> {
         frame_bytes(size)?;
-        let (rows, columns) = grid(size, &self.font)?;
+        let (rows, columns) = grid(size, self.cell)?;
         self.clear_selection();
+        if self.model.is_some() && self.cells == Some((rows, columns)) {
+            self.adopted = Some(size);
+            self.stale = true;
+            return Ok(());
+        }
         let window = self.pty.resize(usize::from(rows), usize::from(columns))?;
         let (rows, columns) = (usize::from(window.rows), usize::from(window.columns));
         match self.model.as_mut() {
@@ -1571,7 +1679,7 @@ impl App for Window {
             let (palette, font, outline) = (&self.palette, &self.font, &mut self.outline);
             let (width, height) = (wanted.size.width, wanted.size.height);
             let presented = self.client.present(width, height, &mut |pixels| {
-                let outline = outline.as_mut();
+                let outline = outline.as_mut().map(render::Zoom::face_mut);
                 render::render_with(&snapshot, palette, font, outline, pixels, width, height)
             })?;
             if presented {
@@ -1820,20 +1928,29 @@ pub fn run(options: Options) -> Result<u8> {
     let stream = td_ui::wayland::connect(endpoint)?;
     let mut window = Window::new(stream, options, display)?;
     window.proof.enabled = proof;
-    // The pinned outline face in four styles, fitted to the bitmap cell so
-    // the grid and every rule stay Unifont's; without it, Unifont.
+    // The pinned outline face in four styles, at `--font-size` on its own
+    // cell or fitted to the bitmap cell so the grid and every rule stay
+    // Unifont's; without it, Unifont.
     let setting = std::env::var_os(td_ui::pinned_face::SETTING);
-    let (width, height) = (window.font.width(), window.font.height());
-    window.outline =
-        td_ui::pinned_face::styles_or_note("td-term", width, height, setting.as_deref());
+    let font_size = window.options.font_size;
+    let start = start_sizing(font_size, &window.font);
+    let outline = td_ui::pinned_face::styles_or_note("td-term", start, setting.as_deref());
+    if outline.is_none() && font_size.is_some() {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "td-term: --font-size sizes the outline face; drawing in Unifont's cell"
+        );
+    }
+    window.set_outline(outline, start)?;
     td_ui::client::run(&mut window)?;
     Ok(window.exit)
 }
 
 pub fn selftest() -> Result<()> {
     let font = td_ui::font::pinned()?;
-    let fallback = default_size(&font)?;
-    let (rows, columns) = grid(fallback, &font)?;
+    let cell = render::cell_size(&font, None);
+    let fallback = default_size(cell)?;
+    let (rows, columns) = grid(fallback, cell)?;
     let expected = (
         u16::try_from(DEFAULT_ROWS).map_err(|_| "default rows escape a grid")?,
         u16::try_from(DEFAULT_COLUMNS).map_err(|_| "default columns escape a grid")?,
@@ -1924,6 +2041,7 @@ mod tests {
             profile,
             working_directory: None,
             command: Vec::new(),
+            font_size: None,
         };
         let mut window = Window::new(ours, options, "/run/wayland-test".into()).unwrap();
         for event in [
@@ -2255,6 +2373,121 @@ mod tests {
         window.output(b"\x1b[?1h").unwrap();
         press(&mut window, 103);
         assert_eq!(window.input.take_for_test(), b"\x1bOA");
+    }
+
+    /// foot's font chords are td-term's, and with no outline face, as
+    /// here, do nothing: the selection stays, and the encoder, which sends
+    /// the child nothing for any of them, never sees them.
+    #[test]
+    fn font_chords_without_an_outline_face_do_nothing() {
+        assert_eq!(zoom_to("C-="), Some(render::ZoomTo::In));
+        assert_eq!(zoom_to("C-+"), Some(render::ZoomTo::In));
+        assert_eq!(zoom_to("C--"), Some(render::ZoomTo::Out));
+        assert_eq!(zoom_to("C-0"), Some(render::ZoomTo::Start));
+        for other in ["C-M-=", "=", "C-S-0", "C-1"] {
+            assert_eq!(zoom_to(other), None, "{other}");
+        }
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.output(b"Welcome").unwrap();
+        let selection = Some(render::Selection {
+            anchor: (0, 0),
+            extent: (0, 6),
+        });
+        window.selection = selection;
+        // Equals, minus and zero with Control, and equals with Shift too.
+        modifiers(&mut window, CONTROL);
+        for key in [13, 12, 11] {
+            press(&mut window, key);
+        }
+        modifiers(&mut window, CONTROL | SHIFT);
+        press(&mut window, 13);
+        modifiers(&mut window, 0);
+        assert!(window.input.take_for_test().is_empty());
+        assert!(!bell(&mut window));
+        assert_eq!(window.cells, Some((20, 80)));
+        assert_eq!(window.selection, selection);
+        for chord in ["C-=", "C-+", "C--", "C-0"] {
+            assert_eq!(
+                keys::action(chord, None, keys::Modes::default(), false),
+                keys::Action::Silent,
+                "{chord}"
+            );
+        }
+    }
+
+    /// The grid is the surface divided by the window's cell, the outline
+    /// face's when there is one, and a new cell is adopted at the next
+    /// draw as a resize is: the PTY is set to its grid before the frame.
+    #[test]
+    fn the_grid_is_laid_on_the_windows_cell() {
+        let (mut window, _peer) = presented();
+        assert_eq!(window.cells, Some((20, 80)));
+        window.cell = (16, 32);
+        window.adopted = None;
+        window.draw().unwrap();
+        assert_eq!(window.cells, Some((10, 40)));
+        let winsize = window.pty.window().unwrap();
+        assert_eq!((winsize.rows, winsize.columns), (10, 40));
+        let model = window.model.as_ref().unwrap();
+        assert_eq!((model.rows(), model.columns()), (10, 40));
+        // A pointer is hit-tested by the same cell.
+        let fixed = |pixels: u32| i32::try_from(pixels * 256).unwrap();
+        assert_eq!(window.cell_at((fixed(33), fixed(40))), Some((1, 2)));
+        assert_eq!(
+            default_size((16, 32)).unwrap(),
+            Size {
+                width: 1280,
+                height: 768
+            }
+        );
+    }
+
+    /// Re-adopting a grid the PTY and model already have, as a zoom by half
+    /// a point often asks, touches neither: a reflow would reset the
+    /// scrolling margins a child set.
+    #[test]
+    fn re_adopting_the_same_grid_keeps_the_scrolling_margins() {
+        let (mut window, _peer) = presented();
+        // Margins on rows 2 to 5; a line feed at the bottom one scrolls
+        // only them, so the 'a' on row 2 scrolls out.
+        window.output(b"top\x1b[2;5r\x1b[2;1Ha\x1b[5;1H").unwrap();
+        window.cell = (8, 16);
+        window.adopted = None;
+        window.draw().unwrap();
+        assert_eq!(window.adopted, window.current);
+        window.output(b"\n").unwrap();
+        let model = window.model.as_ref().unwrap();
+        assert_eq!(model.cell(1, 0).map(|cell| cell.scalar), Some(' '));
+        assert_eq!(model.cell(0, 0).map(|cell| cell.scalar), Some('t'));
+    }
+
+    /// The fallback grid is 80x24 cells, or what of it a frame within the
+    /// raster's ceilings holds.
+    #[test]
+    fn the_fallback_grid_fits_the_raster_ceilings() {
+        assert_eq!(
+            default_size((8, 16)).unwrap(),
+            Size {
+                width: 640,
+                height: 384
+            }
+        );
+        // 192 points of the pinned face: a 154x338 cell.
+        for cell in [(48, 106), (154, 338), (512, 512)] {
+            let size = default_size(cell).unwrap();
+            assert!(frame_bytes(size).is_ok(), "{cell:?}: {size:?}");
+            assert_eq!(size.width % cell.0, 0);
+            assert_eq!(size.height % cell.1, 0);
+        }
+        assert_eq!(
+            default_size((48, 106)).unwrap(),
+            Size {
+                width: 3840,
+                height: 2120
+            }
+        );
+        assert!(default_size((0, 16)).is_err());
     }
 
     #[test]
@@ -2611,6 +2844,7 @@ mod tests {
             profile: Profile::Desktop,
             working_directory: None,
             command: Vec::new(),
+            font_size: None,
         };
         let mut window = Window::new(ours, options, "/run/wayland-test".into()).unwrap();
         for event in [
@@ -2986,7 +3220,7 @@ mod tests {
                     width: 3,
                     height: 3
                 },
-                &font
+                render::cell_size(&font, None)
             )
             .unwrap(),
             (1, 1),
