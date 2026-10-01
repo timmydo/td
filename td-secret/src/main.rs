@@ -115,6 +115,9 @@ fn run(args: &[String]) -> Result<(), String> {
         [command, index, inode, rdev] if command == "hid-worker" => {
             fido_device::worker(index, inode, rdev)
         }
+        [command, index, inode, rdev, runtime] if command == "hid-worker-desktop" => {
+            fido_device::desktop_worker(index, inode, rdev, runtime)
+        }
         [command, name] if command == "get" => {
             let mut secret = client::retrieve(name)?;
             use std::io::Write;

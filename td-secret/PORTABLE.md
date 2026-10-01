@@ -670,8 +670,10 @@ worker teardown and final consumer-check contract. The manual diagnostic
 connects the private portable flow to that transport. A notebook owner must route
 cancel, lock, suspend and authority loss to the handle, drop idle sessions and
 pending PIN state, and check authorization before accepting a result.
-The root-only device admission remains unchanged; standalone Guix device
-access is still a separate integration requirement.
+td keeps root-only device admission. Standalone mode uses the transport's
+explicit desktop admission, which the host's device policy grants; see
+`DESIGN.md` under USB token transport. Guix acceptance of that policy,
+including a denied open, remains hardware evidence.
 
 Key agreement requires exactly the public EC2/-25/P-256 COSE parameters,
 canonical 32-byte coordinates and curve membership. The entropy callback

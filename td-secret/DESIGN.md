@@ -307,15 +307,18 @@ their software authenticator framing inputs prove a physical token touch.
 
 ## USB token transport
 
-`fido_device.rs` discovers at most 256 fixed `/dev/hidrawN` names. It
-requires a root-owned, root-group, mode-0600 character device and the
-kernel's USB HID bus metadata. Discovery reads metadata without opening
-the device. The report descriptor must describe one FIDO usage-page
-0xf1d0/application-usage 1 collection with exactly one unnumbered 64-byte
-input and output report. Reports use byte-sized data/variable/absolute
-fields and the FIDO input/output usages. Numbered reports, features,
-nested/additional collections, push/pop and unsupported items refuse;
-this deliberately supports a narrower profile than general HID.
+`fido_device.rs` discovers at most 256 fixed `/dev/hidrawN` names. Root
+admission, the only mode on td, requires a root-owned, root-group,
+mode-0600 character device and the kernel's USB HID bus metadata, and its
+discovery reads metadata without opening the device. Desktop admission,
+below, differs in its node mode and group, its denial report, its
+process identity and its lock location. The report descriptor must
+describe one FIDO usage-page 0xf1d0/application-usage 1 collection with
+exactly one unnumbered 64-byte input and output report. Reports use
+byte-sized data/variable/absolute fields and the FIDO input/output
+usages. Numbered reports, features, nested/additional collections,
+push/pop and unsupported items refuse; this deliberately supports a
+narrower profile than general HID.
 Descriptor and uevent reads are bounded. The kernel and root-owned
 `/dev` and `/sys` are trusted; a device name or bus claim is never an
 enrolled token identity. The FIDO signature establishes that identity.
@@ -332,14 +335,15 @@ USB keyboard/pointer interfaces do enter the compositor's startup evdev
 roster; its trusted-device boundary is specified in
 `td-compositor/DESIGN.md` under Physical secure attention.
 
-One root-owned Session starts `/proc/self/exe hid-worker`, retaining the
+A root Session starts `/proc/self/exe hid-worker`, retaining the
 same executable version across deployment changes, with a cleared
 environment and private inherited Unix socket stdio. Its typed arguments
 contain only the bounded device index and
-expected inode/rdev; the helper reopens without symlink following and
+expected inode/rdev, plus the runtime directory for desktop admission's
+`hid-worker-desktop` role; the helper reopens without symlink following and
 revalidates the device and descriptor. It never reads credentials or
 store keys, changes device permissions, or spawns another process.
-Root-only helper access grants no elevation. It accepts only a complete
+Root admission's helper grants no elevation. It accepts only a complete
 report write or a request to read one report. Linux hidraw writes carry
 a leading zero report ID, making 65 bytes; reads must return exactly
 64 bytes, with a 65-byte receive buffer detecting oversized reports.
@@ -435,6 +439,33 @@ sessions, and bind a fresh assertion to each request. A transport lock is
 neither consent nor enrollment. Host fixtures prove cross-process exclusion,
 release after child exit and invalid metadata refusal; these do not claim
 root path admission or physical token presence.
+
+Desktop admission is a second, explicit mode fixed when a device is
+discovered, for the portable vault's standalone host adapter in
+[PORTABLE.md](PORTABLE.md). It requires an ordinary account whose four
+real, effective, saved and filesystem IDs are equal and nonzero, for both
+user and group, so neither may be root. A node must still be a root-owned
+character device with owner read/write and no execute, world or special
+mode bits; any group is accepted. The kernel's open decision, through the
+host's group or ACL policy, is the grant. Discovery reads metadata only,
+as root discovery does; no process opens a desktop node outside the
+bounded worker. A worker whose open the kernel refuses with a permission
+error writes a distinct initialization byte, and the parent reports the
+session as denied, distinct from a missing or busy token. Descriptor and
+bus checks are unchanged.
+
+A desktop Session refuses before spawning unless the parent's
+`XDG_RUNTIME_DIR` is absolute, and passes it to
+`/proc/self/exe hid-worker-desktop` with the device numbers. The worker
+rechecks its identity, requires an absolute runtime path owned by the
+account with mode 0700, and takes the same stable `td-fido/operation.lock`
+there, owned by the account in any group. This serializes only that
+account's td-owned workers on that host; it cannot exclude root, other
+accounts or other programs. The same-account worker can be inspected or
+signalled by the account's other processes, so desktop mode inherits the
+host account boundary stated for standalone mode. On td, root-console
+admission remains the only mode reaching a token, and raw nodes stay
+root-only.
 
 The trusted consumer must negotiate getInfo message limits before
 constructing requests, bind fresh challenges to presented operations,

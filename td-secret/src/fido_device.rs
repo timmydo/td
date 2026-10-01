@@ -16,18 +16,88 @@ use std::time::{Duration, Instant};
 const NOFOLLOW: i32 = 0o400000;
 const DIRECTORY: i32 = 0o200000;
 const NONBLOCK: i32 = 0o4000;
+const NOCTTY: i32 = 0o400;
 const LOCK_REFUSED: u8 = 1;
+const DEVICE_DENIED: u8 = 2;
 pub(crate) const MAX_LIFETIME: Duration = Duration::from_secs(120);
 const MAX_DESCRIPTOR: usize = 4096;
 const CANCEL_INTERVAL: Duration = Duration::from_millis(50);
 const WRITE: u8 = 1;
 const READ: u8 = 2;
 
+/// Who may open a token, fixed when a device is discovered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Admission {
+    /// td's root console: root-owned mode-0600 nodes, lock under `/run`.
+    Root,
+    /// A supported host's ordinary desktop account: root-owned nodes with no
+    /// world access whose group or ACL grants the account, as decided by the
+    /// kernel at open; the lock lives under the account's runtime directory.
+    Desktop,
+}
+
+impl Admission {
+    fn node(self, meta: &fs::Metadata) -> bool {
+        node_admitted(
+            self,
+            meta.file_type().is_char_device(),
+            meta.uid(),
+            meta.gid(),
+            meta.mode(),
+        )
+    }
+
+    // The desktop account's single uid and gid; it may not be root.
+    fn desktop_identity() -> Result<(u32, u32), String> {
+        let status =
+            fs::read_to_string("/proc/self/status").map_err(|_| "read process credentials")?;
+        desktop_identity(&status)
+    }
+
+    fn require(self) -> Result<(), String> {
+        match self {
+            Self::Root => store::require_root(),
+            Self::Desktop => Self::desktop_identity().map(|_| ()),
+        }
+    }
+}
+
+fn node_admitted(admission: Admission, char_device: bool, uid: u32, gid: u32, mode: u32) -> bool {
+    char_device
+        && uid == 0
+        && match admission {
+            Admission::Root => gid == 0 && mode & 0o7777 == 0o600,
+            Admission::Desktop => mode & 0o7117 == 0 && mode & 0o600 == 0o600,
+        }
+}
+
+fn desktop_identity(status: &str) -> Result<(u32, u32), String> {
+    let single = |name: &str| -> Result<u32, String> {
+        let ids = status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .ok_or("missing process credentials")?
+            .split_whitespace()
+            .map(canonical::<u32>)
+            .collect::<Result<Vec<_>, _>>()?;
+        match ids.as_slice() {
+            [id, rest @ ..] if rest.len() == 3 && rest.iter().all(|other| other == id) => Ok(*id),
+            _ => Err("desktop token access requires one unchanged process identity".into()),
+        }
+    };
+    let (uid, gid) = (single("Uid:")?, single("Gid:")?);
+    if uid == 0 || gid == 0 {
+        return Err("desktop token access refuses the root account and group".into());
+    }
+    Ok((uid, gid))
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Device {
     index: u8,
     inode: u64,
     rdev: u64,
+    admission: Admission,
 }
 
 impl Device {
@@ -39,7 +109,7 @@ impl Device {
         // unbounded directory walk and accepts no caller-selected path.
         for index in 0..=u8::MAX {
             if let Ok(meta) = fs::symlink_metadata(format!("/dev/hidraw{index}")) {
-                if let Ok(device) = Self::inspect(index, &meta) {
+                if let Ok(device) = Self::inspect(index, &meta, Admission::Root) {
                     found.push(device);
                 }
             }
@@ -47,24 +117,42 @@ impl Device {
         Ok(found)
     }
 
-    fn open(index: u8) -> Result<(Self, File), String> {
+    /// Desktop discovery over the same fixed names, reading metadata only.
+    /// Whether the host grants this account a node is the kernel's answer
+    /// to the bounded worker's open, reported as a denial.
+    pub(crate) fn discover_desktop() -> Result<Vec<Self>, String> {
+        Admission::Desktop.require()?;
+        let mut found = Vec::new();
+        for index in 0..=u8::MAX {
+            if let Ok(meta) = fs::symlink_metadata(format!("/dev/hidraw{index}")) {
+                if let Ok(device) = Self::inspect(index, &meta, Admission::Desktop) {
+                    found.push(device);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn open(index: u8, admission: Admission) -> Result<(Self, File), String> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(NOFOLLOW)
+            .custom_flags(NOFOLLOW | NOCTTY)
             .open(format!("/dev/hidraw{index}"))
-            .map_err(|_| "open token device")?;
+            .map_err(|error| open_failure(admission, error.kind()))?;
         let meta = file.metadata().map_err(|_| "read token device metadata")?;
-        Ok((Self::inspect(index, &meta)?, file))
+        Ok((Self::inspect(index, &meta, admission)?, file))
     }
 
-    fn inspect(index: u8, meta: &fs::Metadata) -> Result<Self, String> {
-        if !meta.file_type().is_char_device()
-            || meta.uid() != 0
-            || meta.gid() != 0
-            || meta.mode() & 0o7777 != 0o600
-        {
-            return Err("token device must be root-owned private character device".into());
+    fn inspect(index: u8, meta: &fs::Metadata, admission: Admission) -> Result<Self, String> {
+        if !admission.node(meta) {
+            return Err(match admission {
+                Admission::Root => "token device must be root-owned private character device",
+                Admission::Desktop => {
+                    "token device must be a root-owned character device without world access"
+                }
+            }
+            .into());
         }
         let (event_path, descriptor_path) = metadata_paths(meta.rdev());
         let event = bounded_file(&event_path, 4096)?;
@@ -81,8 +169,50 @@ impl Device {
             index,
             inode: meta.ino(),
             rdev: meta.rdev(),
+            admission,
         })
     }
+}
+
+const DENIED: &str = "this account may not open the token device";
+
+// Only desktop admission reports a denial; there the host's policy decides.
+fn open_failure(admission: Admission, kind: io::ErrorKind) -> &'static str {
+    match (admission, kind) {
+        (Admission::Desktop, io::ErrorKind::PermissionDenied) => DENIED,
+        _ => "open token device",
+    }
+}
+
+/// Whether a session failed because the host's device policy denies this
+/// account the token, as distinct from a missing or busy one.
+pub(crate) fn denied(error: &str) -> bool {
+    error == DENIED
+}
+
+// The worker's environment is cleared, so a desktop worker receives the
+// runtime directory as an argument and rechecks it.
+fn worker_command(
+    device: Device,
+    runtime: Option<String>,
+) -> Result<(&'static str, Vec<String>), String> {
+    let mut args = vec![
+        device.index.to_string(),
+        device.inode.to_string(),
+        device.rdev.to_string(),
+    ];
+    let role = match device.admission {
+        Admission::Root => "hid-worker",
+        Admission::Desktop => {
+            // The worker rechecks it; a relative path is refused before spawn.
+            let runtime = runtime
+                .filter(|path| path.starts_with('/'))
+                .ok_or("desktop runtime directory is unavailable")?;
+            args.push(runtime);
+            "hid-worker-desktop"
+        }
+    };
+    Ok((role, args))
 }
 
 fn bounded_file(path: &str, max: usize) -> Result<Vec<u8>, String> {
@@ -293,12 +423,17 @@ impl Session {
             deadline,
             cancellation,
         };
-        // Revocation refuses before any root or device setup is considered.
+        // Revocation refuses before any identity or device setup is considered.
         operation.remaining()?;
-        store::require_root()?;
+        device.admission.require()?;
         if deadline.saturating_duration_since(Instant::now()) > MAX_LIFETIME {
             return Err("token operation exceeds lifetime limit".into());
         }
+        let runtime = match device.admission {
+            Admission::Root => None,
+            Admission::Desktop => std::env::var("XDG_RUNTIME_DIR").ok(),
+        };
+        let (role, args) = worker_command(device, runtime)?;
         let (socket, child_socket) =
             UnixStream::pair().map_err(|_| "create token worker channel")?;
         let child_output: OwnedFd = child_socket
@@ -308,12 +443,8 @@ impl Session {
         let child_input: OwnedFd = child_socket.into();
         operation.remaining()?;
         let child = Command::new("/proc/self/exe")
-            .args([
-                "hid-worker",
-                &device.index.to_string(),
-                &device.inode.to_string(),
-                &device.rdev.to_string(),
-            ])
+            .arg(role)
+            .args(args)
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::from(child_input))
@@ -347,6 +478,9 @@ impl Session {
         receive(socket, &mut ready, operation)?;
         if ready == [LOCK_REFUSED] {
             return Err("token transport is busy or unavailable".into());
+        }
+        if ready == [DEVICE_DENIED] {
+            return Err(DENIED.into());
         }
         if ready != [0] {
             return Err("token worker refused initialization".into());
@@ -473,26 +607,54 @@ impl Drop for Report {
     }
 }
 
-fn operation_lock() -> Result<File, String> {
+/// Required lock ownership. A desktop account's runtime directory may carry
+/// any group, so its group is not part of the check.
+#[derive(Clone, Copy)]
+struct Owner {
+    uid: u32,
+    gid: Option<u32>,
+}
+
+fn operation_lock(admission: Admission, runtime: Option<&str>) -> Result<File, String> {
+    let (path, owner, mode) = match (admission, runtime) {
+        (Admission::Root, None) => (
+            "/run",
+            Owner {
+                uid: 0,
+                gid: Some(0),
+            },
+            0o755,
+        ),
+        (Admission::Desktop, Some(path)) if path.starts_with('/') => {
+            let (uid, _) = Admission::desktop_identity()?;
+            (path, Owner { uid, gid: None }, 0o700)
+        }
+        _ => return Err("invalid token runtime directory".into()),
+    };
     let run = OpenOptions::new()
         .read(true)
         .custom_flags(NOFOLLOW | DIRECTORY)
-        .open("/run")
+        .open(path)
         .map_err(|e| format!("open token runtime: {e}"))?;
-    operation_lock_in(&run, 0, 0)
+    operation_lock_in(&run, owner, mode)
 }
 
-fn checked_directory(file: &File, uid: u32, gid: u32, mode: u32, name: &str) -> Result<(), String> {
+fn checked_directory(file: &File, owner: Owner, mode: u32, name: &str) -> Result<(), String> {
     let meta = file.metadata().map_err(|e| e.to_string())?;
-    if !meta.is_dir() || meta.uid() != uid || meta.gid() != gid || meta.mode() & 0o7777 != mode {
+    if !meta.is_dir()
+        || meta.uid() != owner.uid
+        || owner.gid.is_some_and(|gid| meta.gid() != gid)
+        || meta.mode() & 0o7777 != mode
+    {
         return Err(format!("{name} has invalid ownership, mode or type"));
     }
     Ok(())
 }
 
-// The stable lock is never renamed or removed while /run exists.
-fn operation_lock_in(run: &File, uid: u32, gid: u32) -> Result<File, String> {
-    checked_directory(run, uid, gid, 0o755, "token /run")?;
+// The stable lock is never renamed or removed while its runtime exists.
+fn operation_lock_in(run: &File, owner: Owner, run_mode: u32) -> Result<File, String> {
+    let (uid, gid) = (owner.uid, owner.gid);
+    checked_directory(run, owner, run_mode, "token runtime")?;
     let path = format!("/proc/self/fd/{}/td-fido", run.as_raw_fd());
     let created = match fs::DirBuilder::new().mode(0o700).create(&path) {
         Ok(()) => true,
@@ -505,12 +667,12 @@ fn operation_lock_in(run: &File, uid: u32, gid: u32) -> Result<File, String> {
         .open(path)
         .map_err(|e| format!("open private token runtime: {e}"))?;
     if created {
-        std::os::unix::fs::fchown(&directory, Some(uid), Some(gid)).map_err(|e| e.to_string())?;
+        std::os::unix::fs::fchown(&directory, Some(uid), gid).map_err(|e| e.to_string())?;
         directory
             .set_permissions(fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
     }
-    checked_directory(&directory, uid, gid, 0o700, "token /run/td-fido")?;
+    checked_directory(&directory, owner, 0o700, "token runtime td-fido")?;
     let path = format!("/proc/self/fd/{}/operation.lock", directory.as_raw_fd());
     let mut options = OpenOptions::new();
     options
@@ -519,7 +681,7 @@ fn operation_lock_in(run: &File, uid: u32, gid: u32) -> Result<File, String> {
         .custom_flags(NOFOLLOW | NONBLOCK);
     let file = match options.create_new(true).mode(0o600).open(&path) {
         Ok(file) => {
-            std::os::unix::fs::fchown(&file, Some(uid), Some(gid)).map_err(|e| e.to_string())?;
+            std::os::unix::fs::fchown(&file, Some(uid), gid).map_err(|e| e.to_string())?;
             file.set_permissions(fs::Permissions::from_mode(0o600))
                 .map_err(|e| e.to_string())?;
             file
@@ -537,7 +699,7 @@ fn operation_lock_in(run: &File, uid: u32, gid: u32) -> Result<File, String> {
         || meta.nlink() != 1
         || meta.len() != 0
         || meta.uid() != uid
-        || meta.gid() != gid
+        || gid.is_some_and(|gid| meta.gid() != gid)
         || meta.mode() & 0o7777 != 0o600
     {
         return Err("token operation lock has invalid ownership, mode, type or contents".into());
@@ -562,13 +724,28 @@ fn arm_watchdog(lifetime: Duration) -> Result<(), String> {
 
 /// Root-only worker entry; the normal caller supplies private inherited stdio.
 pub fn worker(index: &str, inode: &str, rdev: &str) -> Result<(), String> {
-    store::require_root()?;
+    serve(Admission::Root, index, inode, rdev, None)
+}
+
+/// Desktop-account worker entry; `runtime` is the parent's runtime directory.
+pub fn desktop_worker(index: &str, inode: &str, rdev: &str, runtime: &str) -> Result<(), String> {
+    serve(Admission::Desktop, index, inode, rdev, Some(runtime))
+}
+
+fn serve(
+    admission: Admission,
+    index: &str,
+    inode: &str,
+    rdev: &str,
+    runtime: Option<&str>,
+) -> Result<(), String> {
+    admission.require()?;
     let index: u8 = canonical(index)?;
     let expected_inode: u64 = canonical(inode)?;
     let expected_rdev: u64 = canonical(rdev)?;
     let deadline = Instant::now() + MAX_LIFETIME;
     arm_watchdog(MAX_LIFETIME)?;
-    let _operation = match operation_lock() {
+    let _operation = match operation_lock(admission, runtime) {
         Ok(lock) => lock,
         Err(error) => {
             io::stdout()
@@ -578,7 +755,18 @@ pub fn worker(index: &str, inode: &str, rdev: &str) -> Result<(), String> {
             return Err(error);
         }
     };
-    let (device, mut file) = Device::open(index)?;
+    let (device, mut file) = match Device::open(index, admission) {
+        Ok(opened) => opened,
+        Err(error) => {
+            if denied(&error) {
+                io::stdout()
+                    .write_all(&[DEVICE_DENIED])
+                    .and_then(|()| io::stdout().flush())
+                    .map_err(|_| "report token device denial")?;
+            }
+            return Err(error);
+        }
+    };
     if device.inode != expected_inode || device.rdev != expected_rdev {
         return Err("token device changed before opening".into());
     }
@@ -740,7 +928,17 @@ pub(crate) mod tests {
         let _operation = if role == "lock" {
             let run = File::open(std::env::var("TD_HID_LOCK_ROOT").unwrap()).unwrap();
             let meta = run.metadata().unwrap();
-            Some(operation_lock_in(&run, meta.uid(), meta.gid()).unwrap())
+            Some(
+                operation_lock_in(
+                    &run,
+                    Owner {
+                        uid: meta.uid(),
+                        gid: Some(meta.gid()),
+                    },
+                    0o755,
+                )
+                .unwrap(),
+            )
         } else {
             None
         };
@@ -757,6 +955,11 @@ pub(crate) mod tests {
         }
         if role == "lock-refused" {
             output.write_all(&[LOCK_REFUSED]).unwrap();
+            output.flush().unwrap();
+            std::process::exit(0);
+        }
+        if role == "device-denied" {
+            output.write_all(&[DEVICE_DENIED]).unwrap();
             output.flush().unwrap();
             std::process::exit(0);
         }
@@ -891,6 +1094,7 @@ pub(crate) mod tests {
             index: 0,
             inode: 0,
             rdev: 0,
+            admission: Admission::Root,
         };
         assert_eq!(
             Session::open_cancellable(device, Instant::now() + MAX_LIFETIME, cancellation.clone())
@@ -1013,10 +1217,34 @@ pub(crate) mod tests {
                 }
             }
         }
+        fn acquire_desktop_after_release(&self) -> File {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let run = self.run();
+                let owner = Owner {
+                    uid: run.metadata().unwrap().uid(),
+                    gid: None,
+                };
+                match operation_lock_in(&run, owner, 0o700) {
+                    Ok(file) => return file,
+                    Err(error) => {
+                        assert!(Instant::now() < deadline, "lock did not release: {error}");
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+            }
+        }
         fn acquire(&self) -> Result<File, String> {
             let run = self.run();
             let meta = run.metadata().unwrap();
-            operation_lock_in(&run, meta.uid(), meta.gid())
+            operation_lock_in(
+                &run,
+                Owner {
+                    uid: meta.uid(),
+                    gid: Some(meta.gid()),
+                },
+                0o755,
+            )
         }
     }
     impl Drop for LockFixture {
@@ -1072,8 +1300,155 @@ pub(crate) mod tests {
         fs::rename(saved, &directory).unwrap();
         let run = fixture.run();
         let meta = run.metadata().unwrap();
-        assert!(operation_lock_in(&run, meta.uid().wrapping_add(1), meta.gid()).is_err());
-        assert!(operation_lock_in(&run, meta.uid(), meta.gid().wrapping_add(1)).is_err());
+        assert!(operation_lock_in(
+            &run,
+            Owner {
+                uid: meta.uid().wrapping_add(1),
+                gid: Some(meta.gid())
+            },
+            0o755
+        )
+        .is_err());
+        assert!(operation_lock_in(
+            &run,
+            Owner {
+                uid: meta.uid(),
+                gid: Some(meta.gid().wrapping_add(1))
+            },
+            0o755
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn admission_modes_accept_only_their_node_policy() {
+        use Admission::{Desktop, Root};
+        const CHAR: u32 = 0o020000;
+        for (admission, char_device, uid, gid, mode, admitted) in [
+            (Root, true, 0, 0, CHAR | 0o600, true),
+            (Root, true, 0, 46, CHAR | 0o600, false),
+            (Root, true, 0, 0, CHAR | 0o660, false),
+            (Root, false, 0, 0, 0o600, false),
+            // Guix-style plugdev group access, and a root-group node the kernel
+            // may still deny at open.
+            (Desktop, true, 0, 46, CHAR | 0o660, true),
+            (Desktop, true, 0, 0, CHAR | 0o600, true),
+            (Desktop, true, 0, 46, CHAR | 0o666, false),
+            (Desktop, true, 0, 46, CHAR | 0o662, false),
+            (Desktop, true, 1000, 46, CHAR | 0o660, false),
+            (Desktop, true, 0, 46, CHAR | 0o4660, false),
+            (Desktop, true, 0, 46, CHAR | 0o2660, false),
+            (Desktop, true, 0, 46, CHAR | 0o1660, false),
+            (Root, true, 0, 0, CHAR | 0o2600, false),
+            (Desktop, true, 0, 46, CHAR | 0o460, false),
+            (Desktop, true, 0, 46, CHAR | 0o760, false),
+            (Desktop, true, 0, 46, CHAR | 0o670, false),
+            (Desktop, false, 0, 46, 0o660, false),
+        ] {
+            assert_eq!(
+                node_admitted(admission, char_device, uid, gid, mode),
+                admitted,
+                "{admission:?} {uid} {gid} {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_desktop_open_denial_is_reported_as_denied() {
+        use io::ErrorKind::{NotFound, PermissionDenied};
+        assert_eq!(open_failure(Admission::Desktop, PermissionDenied), DENIED);
+        assert_ne!(open_failure(Admission::Root, PermissionDenied), DENIED);
+        assert_ne!(open_failure(Admission::Desktop, NotFound), DENIED);
+        assert!(denied(open_failure(Admission::Desktop, PermissionDenied)));
+        assert!(!denied("open token device"));
+        // The worker reports its denied open as its own initialization byte.
+        let mut refused = fixture("device-denied", Duration::from_secs(5));
+        assert!(denied(&refused.initialize().unwrap_err()));
+        let mut busy = fixture("lock-refused", Duration::from_secs(5));
+        assert!(!denied(&busy.initialize().unwrap_err()));
+    }
+
+    #[test]
+    fn desktop_workers_receive_the_runtime_directory_and_root_workers_do_not() {
+        let device = |admission| Device {
+            index: 3,
+            inode: 7,
+            rdev: 9,
+            admission,
+        };
+        let runtime = Some("/run/user/1000".to_string());
+        assert_eq!(
+            worker_command(device(Admission::Root), runtime.clone()),
+            Ok(("hid-worker", vec!["3".into(), "7".into(), "9".into()]))
+        );
+        assert_eq!(
+            worker_command(device(Admission::Desktop), runtime),
+            Ok((
+                "hid-worker-desktop",
+                vec!["3".into(), "7".into(), "9".into(), "/run/user/1000".into()]
+            ))
+        );
+        assert!(worker_command(device(Admission::Desktop), None).is_err());
+        let relative = Some("run/user/1000".to_string());
+        assert!(worker_command(device(Admission::Desktop), relative).is_err());
+    }
+
+    #[test]
+    fn desktop_identity_requires_one_unchanged_unprivileged_account() {
+        let status = |uid: &str, gid: &str| format!("Name:\ttd-pass\nUid:\t{uid}\nGid:\t{gid}\n");
+        assert_eq!(
+            desktop_identity(&status("1000\t1000\t1000\t1000", "998\t998\t998\t998")),
+            Ok((1000, 998))
+        );
+        for (uid, gid) in [
+            ("0\t0\t0\t0", "0\t0\t0\t0"),
+            ("1000\t0\t1000\t1000", "998\t998\t998\t998"),
+            ("1000\t1000\t1000\t1000", "998\t0\t998\t998"),
+            ("1000\t1000\t1000\t1000", "0\t0\t0\t0"),
+            ("1000\t1000\t1000", "998\t998\t998\t998"),
+            ("01000\t1000\t1000\t1000", "998\t998\t998\t998"),
+        ] {
+            assert!(desktop_identity(&status(uid, gid)).is_err(), "{uid} {gid}");
+        }
+        assert!(desktop_identity("Name:\tx\n").is_err());
+    }
+
+    #[test]
+    fn desktop_lock_lives_in_a_private_runtime_without_a_group_check() {
+        let fixture = LockFixture::new();
+        fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+        let run = fixture.run();
+        let uid = run.metadata().unwrap().uid();
+        let owner = Owner { uid, gid: None };
+        let lock = operation_lock_in(&run, owner, 0o700).unwrap();
+        assert!(operation_lock_in(&run, owner, 0o700).is_err());
+        drop(lock);
+        drop(fixture.acquire_desktop_after_release());
+        assert!(operation_lock_in(&run, owner, 0o755).is_err());
+        let other = Owner {
+            uid: uid.wrapping_add(1),
+            gid: None,
+        };
+        assert!(operation_lock_in(&run, other, 0o700).is_err());
+        fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(operation_lock_in(&run, owner, 0o700).is_err());
+        let path = fixture.0.to_str().unwrap();
+        assert!(operation_lock(Admission::Desktop, Some(path)).is_err());
+        fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+        // The whole desktop path, from identity to lock, where this test's
+        // own account qualifies; a root runner is refused instead.
+        match Admission::desktop_identity() {
+            Ok((account, _)) => {
+                assert_eq!(account, uid);
+                let lock = operation_lock(Admission::Desktop, Some(path)).unwrap();
+                assert!(operation_lock(Admission::Desktop, Some(path)).is_err());
+                drop(lock);
+            }
+            Err(_) => assert!(operation_lock(Admission::Desktop, Some(path)).is_err()),
+        }
+        assert!(operation_lock(Admission::Root, Some("/run")).is_err());
+        assert!(operation_lock(Admission::Desktop, Some("relative")).is_err());
+        assert!(operation_lock(Admission::Desktop, None).is_err());
     }
 
     #[test]
@@ -1082,20 +1457,40 @@ pub(crate) mod tests {
             .split("#[cfg(test)]")
             .next()
             .unwrap();
+        // Both worker entries share one body that locks before opening.
         let worker = source
-            .split("pub fn worker(")
+            .split("\nfn serve(")
             .nth(1)
             .unwrap()
             .split("fn canonical<")
             .next()
             .unwrap();
         let lock = worker
-            .find("let _operation = match operation_lock()")
+            .find("let _operation = match operation_lock(admission, runtime)")
             .unwrap();
-        let open = worker.find("Device::open(index)?").unwrap();
+        let open = worker.find("match Device::open(index, admission)").unwrap();
         assert!(lock < open);
         assert_eq!(worker.matches("_operation").count(), 1);
-        assert_eq!(source.matches("Device::open(").count(), 1);
+        assert!(worker.starts_with("\n    admission: Admission,"));
+        assert!(worker.contains(") -> Result<(), String> {\n    admission.require()?;"));
+        // Production opens a device only in the worker, through the one
+        // opener of a hidraw path; discovery reads metadata alone.
+        assert_eq!(source.matches(".open(format!(\"/dev/hidraw").count(), 1);
+        // Two metadata reads and that opener name a hidraw path at all.
+        assert_eq!(source.matches("\"/dev/hidraw").count(), 3);
+        assert_eq!(source.matches("open(index,").count(), 1);
+        assert_eq!(
+            source
+                .matches("match Device::open(index, admission)")
+                .count(),
+            1
+        );
+        for entry in [
+            "pub fn worker(index: &str, inode: &str, rdev: &str) -> Result<(), String> {\n    serve(Admission::Root, index, inode, rdev, None)\n}",
+            "-> Result<(), String> {\n    serve(Admission::Desktop, index, inode, rdev, Some(runtime))\n}",
+        ] {
+            assert!(source.contains(entry), "{entry}");
+        }
         let mut refused = fixture("lock-refused", Duration::from_secs(5));
         assert_eq!(
             refused.initialize().unwrap_err(),
