@@ -840,6 +840,45 @@ mountpoint nothing else uses. This is the one-process publication the
 installation service's execution needs; it does not activate that
 execution.
 
+### Payload fit
+
+A review is presented only for a disk that holds what installing its
+source writes. After authenticating the source under the claim, and with
+the plan's volume identity in hand, the service sizes the source's
+`bzImage`, `initramfs.cpio` and `root.erofs` under td-boot's source
+naming, each a real regular file, and the selector that preparing the
+stock template with the bound key and that identity yields.
+
+The system volume must hold one copy of the three payloads and 1 GiB, the
+share td-boot's `MIN_VOLUME_BYTES` reserves for Btrfs metadata and `@var`;
+a disk short of that is refused as insufficient space. That is what
+installing writes. Retaining further deployments through updates is
+`MIN_VOLUME_BYTES`'s floor, which the layout enforces, and beyond it an
+update that does not fit fails while staging without changing what boots
+(td-boot/src/protocol.rs). The stock deployment is about 3 GB, so a
+three-copy rule would refuse the stock 6 GiB install target.
+
+The kernel must be within the execution's 1..=256 MiB bound, and the ESP's
+FAT, built from the kernel's and selector's lengths alone, must hold both.
+The ESP is the same 512 MiB on every disk, its FAT capacity differing only
+by a sector size's reserved sectors, so either failure is the source's to
+remedy and refuses as source unavailable, as does a payload, key or template
+that cannot be sized. Any refusal releases the claim.
+
+The sizes are read from the source's files, which carry no length in the
+manifest. The execution asks the volume fit again of the source as it is
+before anything is staged, and refuses as insufficient space with the disk
+untouched. Past that point the payloads td-boot publishes are bound only
+by their digests; a source that changes size afterwards meets ENOSPC
+during publication. Source retention is still owed (INSTALLER.md).
+
+Scratch is not sized here. The execution's workspace under `/run` holds
+the kernel copy, the selector and a sparse volume image whose blocks are
+mkfs's metadata and the staged settings. A shortage there is met before
+the first write: as insufficient space where this process meets it, and
+as write failed where mkfs.btrfs reports only its status, with the disk
+untouched either way.
+
 ### Executing a consented installation
 
 `td-install serve`'s execution installs onto the disk the service holds,
@@ -867,8 +906,8 @@ the formatter hashes that copy through the descriptor it pinned and
 rewinds it, so the bytes checked are the bytes copied; a mismatch refuses
 before the first write. The selector is the template with the bound key
 and the plan's volume identity appended (`prepare-selector`). The
-layout's own refusal of a disk too small for it is asked of the reviewed
-geometry before anything is staged.
+review's volume fit, with the layout's own refusal of a disk too small for
+it, is asked again of the source's payloads before anything is staged.
 
 The execution works in a fresh root-only directory under `/run`, named by
 the first eight bytes of the plan's nonce: the kernel copy, the prepared
@@ -884,32 +923,31 @@ image before any write, so no separate settings phase is reported.
 Verifying boot follows: td-boot's output must be one deployment id, and
 the plan's.
 
-Every failure is written to standard error and maps to one protocol
-failure, by the stage that met it. A source or layout check, preparing
-the selector from the template and trusted key, td-boot's output and the
-published id are verification failed; the time zone,
-hostname, account or seed operands are settings failed; a disk too small
-for the layout, or a workspace that cannot be created, is insufficient
-space; staging the volume image in scratch is write failed; and an
-error this process meets as a full filesystem or exceeded quota before
-the first write is insufficient space (mkfs.btrfs reports only its exit
-status, so its own shortage is write failed). After the first write every
-failure is write failed, and the disk may be incomplete. The failed
-status carries no phase, so a client cannot tell the two write failures
-apart and treats either as a disk that may be incomplete. The workspace
-is removed whatever the outcome, each part attempted even where another
-fails, and also on drop, which covers a partial creation and an
-unwinding panic. The shipped binary aborts on panic, and a killed process
-drops nothing, so there the workspace stays in `/run` until reboot; a
-later review draws a fresh nonce and so a fresh name. Its
-mountpoint is removed only if empty, so a volume td-boot left mounted is
-never walked; that, like any other removal failure, is reported and
-leaves the outcome as it was.
+Every failure is written to standard error and maps to one protocol failure,
+by the stage that met it. A source or layout check, preparing the selector
+from the template and trusted key, td-boot's output and the published id are
+verification failed; the time zone, hostname, account or seed operands are
+settings failed; a disk too small for the layout or a deployment the volume
+cannot hold, or a workspace that cannot be created, is insufficient space;
+staging the volume image in scratch is write failed; and an error this
+process meets as a full filesystem or exceeded quota before the first write
+is insufficient space (mkfs.btrfs reports only its exit status, so its own
+shortage is write failed). After the first write every failure is write
+failed, and the disk may be incomplete. The failed status carries no phase,
+so a client cannot tell the two write failures apart and treats either as a
+disk that may be incomplete. The workspace is removed whatever the outcome,
+each part attempted even where another fails, and also on drop, which covers
+a partial creation and an unwinding panic. The shipped binary aborts on
+panic, and a killed process drops nothing, so there the workspace stays in
+`/run` until reboot; a later review draws a fresh nonce and so a fresh name.
+Its mountpoint is removed only if empty, so a volume td-boot left mounted is
+never walked; that, like any other removal failure, is reported and leaves
+the outcome as it was.
 
 Production constructs this execution, but `run_serve` still opens no
 consent channel, so execute is refused as consent unavailable and nothing
-runs. Payload fit and independent retention of the source's backing
-storage remain owed before the channel opens (INSTALLER.md). The kernel
+runs. Independent retention of the source's backing storage remains owed
+before the channel opens (INSTALLER.md). The kernel
 check binds the ESP to the authenticated manifest; the remaining payloads
 are td-boot's to verify as it publishes them.
 

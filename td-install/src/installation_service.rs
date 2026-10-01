@@ -32,6 +32,8 @@ pub(crate) trait Host {
     fn claim(&mut self, destination: &Destination) -> Result<Self::Claim, Refusal>;
     /// The authenticated deployment manifest digest.
     fn authenticate_source(&mut self) -> Result<[u8; 32], Refusal>;
+    /// Whether the plan's disk holds what installing its source writes.
+    fn check_fit(&mut self, plan: &Plan) -> Result<(), Refusal>;
     fn recheck(&mut self, destination: &Destination, claim: &mut Self::Claim) -> bool;
     /// A proposal nonce and volume UUID. Failure ends the service.
     fn entropy(&mut self) -> io::Result<([u8; 32], [u8; 16])>;
@@ -194,6 +196,11 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
         let (nonce, uuid) = self.host.entropy()?;
         let plan = Plan::new(nonce, destination, deployment, uuid, settings)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        // A review is only presented for a disk it fits, with the plan's own
+        // volume identity sizing the selector.
+        if let Err(refusal) = self.host.check_fit(&plan) {
+            return Ok(Err(refusal));
+        }
         // Source authentication can take a while; the disk must not have
         // changed under the claim meanwhile.
         if !self.host.recheck(plan.destination(), &mut claim) {
@@ -760,6 +767,7 @@ mod tests {
         settings: Result<(), Refusal>,
         claim: Result<(), Refusal>,
         source: Result<[u8; 32], Refusal>,
+        fit: Result<(), Refusal>,
         rechecks: Vec<bool>,
         entropy: bool,
         zones: Result<(), Refusal>,
@@ -774,6 +782,7 @@ mod tests {
                 settings: Ok(()),
                 claim: Ok(()),
                 source: Ok([0xab; 32]),
+                fit: Ok(()),
                 rechecks: Vec::new(),
                 entropy: true,
                 zones: Ok(()),
@@ -811,6 +820,12 @@ mod tests {
             // The source is authenticated while the disk is held.
             assert_eq!(self.log.lock().unwrap().live, 1);
             self.source
+        }
+        fn check_fit(&mut self, plan: &Plan) -> Result<(), Refusal> {
+            self.call("fit");
+            assert_eq!(plan.deployment(), &[0xab; 32]);
+            assert_eq!(self.log.lock().unwrap().live, 1);
+            self.fit
         }
         fn recheck(&mut self, _: &Destination, _: &mut Claim) -> bool {
             self.call("recheck");
@@ -874,6 +889,7 @@ mod tests {
                 "claim",
                 "source",
                 "entropy",
+                "fit",
                 "recheck"
             ]
         );
@@ -927,7 +943,7 @@ mod tests {
 
     #[test]
     fn each_refusal_stops_before_the_next_step_and_releases_the_claim() {
-        let cases: [(fn(&mut Fake), Refusal, &[&str]); 5] = [
+        let cases: [(fn(&mut Fake), Refusal, &[&str]); 6] = [
             (
                 |f| f.settings = Err(Refusal::InvalidUsername),
                 Refusal::InvalidUsername,
@@ -949,6 +965,18 @@ mod tests {
                 &["settings", "candidates", "claim", "source"],
             ),
             (
+                |f| f.fit = Err(Refusal::InsufficientSpace),
+                Refusal::InsufficientSpace,
+                &[
+                    "settings",
+                    "candidates",
+                    "claim",
+                    "source",
+                    "entropy",
+                    "fit",
+                ],
+            ),
+            (
                 |f| f.rechecks = vec![false],
                 Refusal::DestinationChanged,
                 &[
@@ -957,6 +985,7 @@ mod tests {
                     "claim",
                     "source",
                     "entropy",
+                    "fit",
                     "recheck",
                 ],
             ),

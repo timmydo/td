@@ -362,6 +362,23 @@ fn selector_join_padding(len: u64, appendix_bytes: usize) -> io::Result<usize> {
     Ok(padding)
 }
 
+/// The pinned template and what preparing a selector appends to it.
+struct SelectorParts {
+    file: File,
+    len: u64,
+    padding: usize,
+    appendix: Vec<u8>,
+}
+
+impl SelectorParts {
+    /// The prepared selector's length.
+    fn total(&self) -> Option<u64> {
+        self.len
+            .checked_add(u64::try_from(self.padding).ok()?)?
+            .checked_add(u64::try_from(self.appendix.len()).ok()?)
+    }
+}
+
 /// Prepare the selector copy: the template, which carries neither, then the
 /// trust root and the volume identity it boots.
 fn prepare_selector(
@@ -370,6 +387,67 @@ fn prepare_selector(
     uuid: &VolumeUuid,
     output: &Path,
 ) -> io::Result<()> {
+    let SelectorParts {
+        file,
+        len,
+        padding,
+        appendix,
+    } = selector_parts(template, trusted_key, uuid)?;
+    // Existing files, links and device nodes refuse before any output write.
+    let mut destination = paths::create_new_with_mode(output, 0o600)?;
+    let mut source = BootInput {
+        path: template.into(),
+        file,
+        len,
+    };
+    source.copy_to(&mut destination, output)?;
+    let output_error = |operation: &str, error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "{operation} prepared selector {}: {error}",
+                output.display()
+            ),
+        )
+    };
+    let zeros = [0u8; 3];
+    destination
+        .write_all(
+            zeros
+                .get(..padding)
+                .ok_or_else(|| invalid("invalid selector padding".into()))?,
+        )
+        .map_err(|error| output_error("write padding to", error))?;
+    destination
+        .write_all(&appendix)
+        .map_err(|error| output_error("append identity to", error))?;
+    use std::os::unix::fs::PermissionsExt;
+    destination
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| output_error("set permissions on", error))?;
+    if destination
+        .metadata()
+        .map_err(|error| output_error("stat", error))?
+        .permissions()
+        .mode()
+        & 0o7777
+        != 0o600
+    {
+        return Err(invalid(format!(
+            "{}: prepared selector did not retain mode 0600",
+            output.display()
+        )));
+    }
+    destination
+        .sync_all()
+        .map_err(|error| output_error("sync", error))
+}
+
+fn selector_parts(
+    template: &Path,
+    trusted_key: &Path,
+    uuid: &VolumeUuid,
+) -> io::Result<SelectorParts> {
     let key = read_trusted_key(trusted_key)?;
     // A key the booted selector could not decode makes an unbootable disk,
     // found only after the destructive write, so its shape is refused here
@@ -419,54 +497,12 @@ fn prepare_selector(
     let appendix = cpio::build(&entries).map_err(invalid)?;
     let padding = selector_join_padding(len, appendix.len())
         .map_err(|error| invalid(format!("{}: {error}", template.display())))?;
-    // Existing files, links and device nodes refuse before any output write.
-    let mut destination = paths::create_new_with_mode(output, 0o600)?;
-    let mut source = BootInput {
-        path: template.into(),
+    Ok(SelectorParts {
         file,
         len,
-    };
-    source.copy_to(&mut destination, output)?;
-    let output_error = |operation: &str, error: io::Error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "{operation} prepared selector {}: {error}",
-                output.display()
-            ),
-        )
-    };
-    let zeros = [0u8; 3];
-    destination
-        .write_all(
-            zeros
-                .get(..padding)
-                .ok_or_else(|| invalid("invalid selector padding".into()))?,
-        )
-        .map_err(|error| output_error("write padding to", error))?;
-    destination
-        .write_all(&appendix)
-        .map_err(|error| output_error("append identity to", error))?;
-    use std::os::unix::fs::PermissionsExt;
-    destination
-        .set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| output_error("set permissions on", error))?;
-    if destination
-        .metadata()
-        .map_err(|error| output_error("stat", error))?
-        .permissions()
-        .mode()
-        & 0o7777
-        != 0o600
-    {
-        return Err(invalid(format!(
-            "{}: prepared selector did not retain mode 0600",
-            output.display()
-        )));
-    }
-    destination
-        .sync_all()
-        .map_err(|error| output_error("sync", error))
+        padding,
+        appendix,
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1062,6 +1098,39 @@ impl installation_service::Host for LiveHost {
             .map_err(|error| refuse(installation_protocol::Refusal::SourceUnavailable, error))
     }
 
+    fn check_fit(
+        &mut self,
+        plan: &installation_plan::Plan,
+    ) -> Result<(), installation_protocol::Refusal> {
+        use installation_protocol::Refusal;
+        let unavailable = |error: io::Error| refuse(Refusal::SourceUnavailable, error);
+        let (kernel, payloads) = deployment_bytes(&self.source).map_err(unavailable)?;
+        // The execution's own bound on what it copies to the ESP.
+        if kernel == 0 || kernel > MAX_BOOT_FILE {
+            return Err(unavailable(invalid(format!(
+                "the source's kernel is {kernel} bytes, not 1..={MAX_BOOT_FILE}"
+            ))));
+        }
+        let uuid = VolumeUuid::parse(&canonical_uuid(plan.volume_uuid())).map_err(unavailable)?;
+        let selector = selector_parts(
+            &self.root.join(protocol::SELECTOR_TEMPLATE_PATH),
+            &self.trusted_key,
+            &uuid,
+        )
+        .map_err(unavailable)?
+        .total()
+        .ok_or_else(|| unavailable(invalid("the selector's length overflowed".into())))?;
+        let sector = u64::from(plan.destination().sector());
+        let capacity = plan.destination().capacity();
+        volume_fit(sector, capacity, payloads)
+            .map_err(|error| refuse(Refusal::InsufficientSpace, error))?;
+        // The ESP is the same size on every disk, its FAT capacity differing
+        // only by a sector size's reserved sectors: what it cannot hold is
+        // the source's to shrink.
+        esp_fit(sector, capacity, kernel, selector)
+            .map_err(|error| refuse(Refusal::SourceUnavailable, error))
+    }
+
     fn recheck(&mut self, destination: &installation_plan::Destination, claim: &mut File) -> bool {
         match inventory::recheck_claim_destination(destination, claim) {
             Ok(()) => true,
@@ -1156,11 +1225,14 @@ impl LiveExecution {
                 self.booted.display()
             ))));
         }
-        // The layout's own refusal of a disk too small for it, asked of the
-        // reviewed geometry before anything is staged.
-        crate::plan(
+        // The review's volume fit, asked again of the source as it is now
+        // and before anything is staged; the layout's own refusal of a disk
+        // too small for it is part of it.
+        let (_, payloads) = deployment_bytes(&self.source).map_err(&verification)?;
+        volume_fit(
             u64::from(plan.destination().sector()),
             plan.destination().capacity(),
+            payloads,
         )
         .map_err(|error| (Failure::InsufficientSpace, invalid(error)))?;
         let kernel_sha256 = self
@@ -1290,31 +1362,10 @@ impl LiveExecution {
             .and_then(digest_bytes)
     }
 
-    /// The source's kernel under td-boot's rule for a source directory: the
-    /// deployment spelling, or the medium's `bzimage`, never two files, read
-    /// without following a link as td-boot reads it.
     fn kernel(&self) -> Result<PathBuf, Stopped> {
-        use std::os::unix::fs::MetadataExt;
-        let verification = before_writing(installation_protocol::Failure::VerificationFailed);
-        let deployment = self.source.join("bzImage");
-        let medium = self.source.join("bzimage");
-        let identity = |path: &Path| match paths::symlink_metadata(path) {
-            Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(verification(error)),
-        };
-        match (identity(&deployment)?, identity(&medium)?) {
-            (Some(one), Some(other)) if one != other => Err(verification(invalid(format!(
-                "source directory {} holds both bzImage and bzimage",
-                self.source.display()
-            )))),
-            (None, None) => Err(verification(invalid(format!(
-                "source directory {} holds no kernel",
-                self.source.display()
-            )))),
-            (None, Some(_)) => Ok(medium),
-            _ => Ok(deployment),
-        }
+        source_payload(&self.source, "bzImage").map_err(before_writing(
+            installation_protocol::Failure::VerificationFailed,
+        ))
     }
 }
 
@@ -1382,6 +1433,68 @@ impl installation_service::Execute<File> for LiveExecution {
         }
         outcome.map_err(report)
     }
+}
+
+/// A source payload under td-boot's rule for a source directory: the
+/// deployment spelling, or the medium's where it differs, never two files,
+/// looked up without following a link as td-boot looks.
+fn source_payload(source: &Path, name: &str) -> io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let medium = protocol::MEDIA_DEPLOYMENT_FILES
+        .iter()
+        .find(|(_, deployment)| *deployment == name)
+        .map(|(iso, _)| iso.to_ascii_lowercase())
+        .ok_or_else(|| invalid(format!("{name} is not a deployment payload")))?;
+    let deployment = source.join(name);
+    if medium == name {
+        return Ok(deployment);
+    }
+    let spelling = medium;
+    let medium = source.join(&spelling);
+    let identity = |path: &Path| match paths::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    };
+    match (identity(&deployment)?, identity(&medium)?) {
+        (Some(one), Some(other)) if one != other => Err(invalid(format!(
+            "source directory {} holds both {name} and {spelling}",
+            source.display()
+        ))),
+        (None, None) => Err(invalid(format!(
+            "source directory {} holds no {name}",
+            source.display()
+        ))),
+        (None, Some(_)) => Ok(medium),
+        _ => Ok(deployment),
+    }
+}
+
+/// The source's kernel length and its three payloads' total, each a real
+/// regular file under td-boot's naming.
+fn deployment_bytes(source: &Path) -> io::Result<(u64, u64)> {
+    let mut total = 0u64;
+    let mut kernel = 0;
+    for name in ["bzImage", "initramfs.cpio", "root.erofs"] {
+        let len = payload_len(source, name)?;
+        if name == "bzImage" {
+            kernel = len;
+        }
+        total = total
+            .checked_add(len)
+            .ok_or_else(|| invalid("the deployment's size overflowed".into()))?;
+    }
+    Ok((kernel, total))
+}
+
+/// A source payload's length, as a real regular file.
+fn payload_len(source: &Path, name: &str) -> io::Result<u64> {
+    let path = source_payload(source, name)?;
+    let metadata = paths::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid(format!("{} is not a regular file", path.display())));
+    }
+    Ok(metadata.len())
 }
 
 /// The execution's private directory under `/run`: the staged kernel, the
@@ -2267,27 +2380,7 @@ fn prepare_layout(
             .ok_or_else(|| invalid("a kernel digest without a kernel".into()))?;
         kernel.check_digest(expected)?;
     }
-    let initrd_name = protocol::EFI_INITRD_PATH
-        .rsplit('\\')
-        .next()
-        .ok_or_else(|| invalid("missing EFI initrd filename".into()))?;
     let kernel_path = format!("\\EFI\\BOOT\\{}", protocol::EFI_BOOT_FILE);
-    let root = match &inputs {
-        Some((kernel, initramfs)) => vec![(
-            "EFI".into(),
-            fat::Node::Dir(vec![(
-                "BOOT".into(),
-                fat::Node::Dir(vec![
-                    (
-                        protocol::EFI_BOOT_FILE.into(),
-                        fat::Node::Stream(kernel.len),
-                    ),
-                    (initrd_name.into(), fat::Node::Stream(initramfs.len)),
-                ]),
-            )]),
-        )],
-        None => Vec::new(),
-    };
     let layout = gpt::Layout {
         sector_size,
         disk_sectors: plan.disk_sectors,
@@ -2317,23 +2410,16 @@ fn prepare_layout(
     let esp_offset = plan
         .esp_offset()
         .ok_or_else(|| invalid("the ESP offset overflowed".to_string()))?;
-    let esp_sectors = plan
-        .esp_sectors()
-        .ok_or_else(|| invalid("the ESP length overflowed".to_string()))?;
-    let esp_start_lba = u32::try_from(plan.esp_start)
-        .map_err(|_| invalid("the ESP starts past what a FAT32 BPB can record".to_string()))?;
-    let volume = fat::Volume {
-        bytes_per_sector: u32::try_from(sector_size)
-            .map_err(|_| invalid("sector size exceeds a FAT32 BPB".to_string()))?,
-        total_sectors: esp_sectors,
-        hidden_sectors: esp_start_lba,
-        // Derived from the ESP's own GUID rather than from a clock, so the same
-        // disk laid out twice differs only where GPT already says it does.
-        volume_id: volume_serial(&layout)?,
-        label: protocol::ESP_VOLUME_LABEL.to_string(),
-        sectors_per_cluster: None,
-        root,
-    };
+    // Derived from the ESP's own GUID rather than from a clock, so the same
+    // disk laid out twice differs only where GPT already says it does.
+    let volume = esp_volume(
+        sector_size,
+        &plan,
+        volume_serial(&layout)?,
+        inputs
+            .as_ref()
+            .map(|(kernel, initramfs)| (kernel.len, initramfs.len)),
+    )?;
     let esp = fat::build(&volume).map_err(invalid)?;
     // Clear the reserved sectors, FATs and every directory cluster, including
     // gaps between emitted metadata extents. Free data clusters stay untouched.
@@ -3501,6 +3587,79 @@ impl PreparedVolumeImage {
         // check with nothing to run on.
         writeln!(out, "{offset} {len} {written}")
     }
+}
+
+/// The ESP's FAT: empty, or the kernel and initramfs of these lengths where
+/// the firmware looks for them.
+fn esp_volume(
+    sector_size: u64,
+    plan: &Plan,
+    volume_id: u32,
+    boot: Option<(u64, u64)>,
+) -> io::Result<fat::Volume<'static>> {
+    let initrd_name = protocol::EFI_INITRD_PATH
+        .rsplit('\\')
+        .next()
+        .ok_or_else(|| invalid("missing EFI initrd filename".into()))?;
+    let root = match boot {
+        Some((kernel, initramfs)) => vec![(
+            "EFI".into(),
+            fat::Node::Dir(vec![(
+                "BOOT".into(),
+                fat::Node::Dir(vec![
+                    (protocol::EFI_BOOT_FILE.into(), fat::Node::Stream(kernel)),
+                    (initrd_name.into(), fat::Node::Stream(initramfs)),
+                ]),
+            )]),
+        )],
+        None => Vec::new(),
+    };
+    let esp_sectors = plan
+        .esp_sectors()
+        .ok_or_else(|| invalid("the ESP length overflowed".to_string()))?;
+    let esp_start_lba = u32::try_from(plan.esp_start)
+        .map_err(|_| invalid("the ESP starts past what a FAT32 BPB can record".to_string()))?;
+    Ok(fat::Volume {
+        bytes_per_sector: u32::try_from(sector_size)
+            .map_err(|_| invalid("sector size exceeds a FAT32 BPB".to_string()))?,
+        total_sectors: esp_sectors,
+        hidden_sectors: esp_start_lba,
+        volume_id,
+        label: protocol::ESP_VOLUME_LABEL.to_string(),
+        sectors_per_cluster: None,
+        root,
+    })
+}
+
+/// The system volume holds what installing writes (DESIGN.md "Payload
+/// fit"): one copy of the deployment's payloads, and the GiB td-boot's
+/// `MIN_VOLUME_BYTES` reserves for Btrfs metadata and `@var`. The layout's
+/// own refusal of a disk too small for it comes first.
+fn volume_fit(sector_size: u64, capacity: u64, payloads: u64) -> Result<(), String> {
+    const GIB: u64 = 1 << 30;
+    let volume = plan(sector_size, capacity)?
+        .volume_bytes()
+        .ok_or("the system volume's length overflowed")?;
+    let needed = payloads
+        .checked_add(GIB)
+        .ok_or("the deployment's size overflowed")?;
+    if volume < needed {
+        return Err(format!(
+            "the system volume holds {volume} bytes; this deployment's \
+             {payloads} bytes and 1 GiB need {needed}"
+        ));
+    }
+    Ok(())
+}
+
+/// The ESP's FAT, built from lengths alone, holds the kernel and selector.
+fn esp_fit(sector_size: u64, capacity: u64, kernel: u64, selector: u64) -> Result<(), String> {
+    let layout = plan(sector_size, capacity)?;
+    let esp = esp_volume(sector_size, &layout, 0, Some((kernel, selector)))
+        .map_err(|error| error.to_string())?;
+    fat::build(&esp)
+        .map(drop)
+        .map_err(|error| format!("the ESP cannot hold the kernel and selector: {error}"))
 }
 
 /// The FAT volume serial, taken from the ESP partition's own GUID.
@@ -9545,6 +9704,8 @@ mod tests {
             let source = dir.0.join("source");
             std::fs::create_dir(&source).unwrap();
             std::fs::write(source.join("bzImage"), kernel).unwrap();
+            std::fs::write(source.join("initramfs.cpio"), b"initramfs").unwrap();
+            std::fs::write(source.join("root.erofs"), b"root").unwrap();
             let manifest = format!(
                 "td-deployment-v1\n{}  bzImage\n{}  initramfs.cpio\n{}  root.erofs\n",
                 sha256::hex_digest(named),
@@ -9701,6 +9862,13 @@ mod tests {
         // A disk the layout cannot hold.
         ExecutionFixture::reviewed_at(b"kernel", b"kernel", 1 << 20)
             .assert_untouched(Failure::InsufficientSpace);
+        // A deployment grown since the review, which the volume cannot hold.
+        let grown = ExecutionFixture::new(b"kernel", b"kernel");
+        File::create(grown.execution.source.join("root.erofs"))
+            .unwrap()
+            .set_len(5 * GIB)
+            .unwrap();
+        grown.assert_untouched(Failure::InsufficientSpace);
         // A workspace of the plan's name is already there, and is not this
         // execution's to remove.
         let taken = ExecutionFixture::new(b"kernel", b"kernel");
@@ -9778,6 +9946,110 @@ mod tests {
         let (selector, scratch) = (workspace.selector.clone(), workspace.scratch.clone());
         assert!(workspace.remove().is_err());
         assert!(!selector.exists() && !scratch.exists());
+    }
+
+    /// The disk a review presents must hold what installing writes: the
+    /// kernel and selector in the ESP, one copy of the deployment and a GiB
+    /// in the volume. The source's sizes are its payloads' own, under
+    /// td-boot's naming; what no disk could hold is the source's fault.
+    #[test]
+    fn a_review_fits_its_deployment_to_its_disk() {
+        use installation_protocol::Refusal;
+        use installation_service::Host;
+        let fixture = ExecutionFixture::new(b"kernel", b"kernel");
+        let source = fixture.execution.source.clone();
+        let sized = |path: &Path, bytes: u64| File::create(path).unwrap().set_len(bytes).unwrap();
+        // The stock deployment's sizes, on the stock 6 GiB disk.
+        sized(&source.join("bzImage"), 6_337_536);
+        sized(&source.join("initramfs.cpio"), 9_629_184);
+        sized(&source.join("root.erofs"), 3_005_456_384);
+        let execution = &fixture.execution;
+        let mut host = LiveHost {
+            td_boot: execution.td_boot.clone(),
+            source: source.clone(),
+            trusted_key: execution.trusted_key.clone(),
+            root: execution.root.clone(),
+            firstboot: execution.firstboot.clone(),
+            timezones: execution.timezones.clone(),
+            catalog: None,
+        };
+        let fit = |host: &mut LiveHost| host.check_fit(&fixture.plan);
+        assert_eq!(fit(&mut host), Ok(()));
+        // The medium's spelling of the kernel is the same payload; both
+        // spellings as two files are refused.
+        std::fs::rename(source.join("bzImage"), source.join("bzimage")).unwrap();
+        assert_eq!(fit(&mut host), Ok(()));
+        sized(&source.join("bzImage"), 6_337_536);
+        assert_eq!(fit(&mut host), Err(Refusal::SourceUnavailable));
+        std::fs::remove_file(source.join("bzimage")).unwrap();
+        // The volume: about 5.5 GiB holds 3 GB and a GiB, not 5 GiB.
+        sized(&source.join("root.erofs"), 5 * GIB);
+        assert_eq!(fit(&mut host), Err(Refusal::InsufficientSpace));
+        sized(&source.join("root.erofs"), 3_005_456_384);
+        // The initramfs is a volume payload, not the ESP's: the selector is.
+        sized(&source.join("initramfs.cpio"), 500 << 20);
+        assert_eq!(fit(&mut host), Ok(()));
+        sized(&source.join("initramfs.cpio"), 9_629_184);
+        // The kernel's bound is the execution's, either side of it.
+        sized(&source.join("bzImage"), MAX_BOOT_FILE);
+        assert_eq!(fit(&mut host), Ok(()));
+        for bytes in [0, MAX_BOOT_FILE + 1] {
+            sized(&source.join("bzImage"), bytes);
+            assert_eq!(fit(&mut host), Err(Refusal::SourceUnavailable), "{bytes}");
+        }
+        // A kernel and selector each in bound but together more than the
+        // fixed ESP holds: no disk is bigger there.
+        sized(&source.join("bzImage"), MAX_BOOT_FILE);
+        let template = execution.root.join(protocol::SELECTOR_TEMPLATE_PATH);
+        let original = std::fs::read(&template).unwrap();
+        sized(&template, MAX_BOOT_FILE - 4096);
+        assert_eq!(fit(&mut host), Err(Refusal::SourceUnavailable));
+        std::fs::write(&template, &original).unwrap();
+        sized(&source.join("bzImage"), 6_337_536);
+        assert_eq!(fit(&mut host), Ok(()));
+        // A payload that is missing, or not a regular file, is the source's
+        // fault, not the disk's.
+        std::fs::remove_file(source.join("initramfs.cpio")).unwrap();
+        assert_eq!(fit(&mut host), Err(Refusal::SourceUnavailable));
+        std::fs::create_dir(source.join("initramfs.cpio")).unwrap();
+        assert_eq!(fit(&mut host), Err(Refusal::SourceUnavailable));
+        std::fs::remove_dir(source.join("initramfs.cpio")).unwrap();
+        sized(&source.join("initramfs.cpio"), 9_629_184);
+        // So is a key or selector template the root does not hold.
+        let key = std::fs::read(&execution.trusted_key).unwrap();
+        std::fs::remove_file(&execution.trusted_key).unwrap();
+        assert_eq!(fit(&mut host), Err(Refusal::SourceUnavailable));
+        std::fs::write(&execution.trusted_key, &key).unwrap();
+        std::fs::remove_file(&template).unwrap();
+        assert_eq!(fit(&mut host), Err(Refusal::SourceUnavailable));
+    }
+
+    /// The fit's arithmetic at its edges: the volume needs exactly one copy
+    /// and a GiB, and the selector's length is the one prepared.
+    #[test]
+    fn the_fit_is_one_copy_and_a_gib_and_the_prepared_selector() {
+        let volume = plan(512, DISK).unwrap().volume_bytes().unwrap();
+        let most = volume - GIB;
+        assert_eq!(volume_fit(512, DISK, most), Ok(()));
+        assert!(volume_fit(512, DISK, most + 1).is_err());
+        assert!(volume_fit(512, DISK, u64::MAX).is_err());
+        // A disk the layout refuses is refused as such.
+        assert!(volume_fit(512, 1 << 20, 1).is_err());
+        assert_eq!(esp_fit(512, DISK, 1 << 20, 1 << 20), Ok(()));
+        assert!(esp_fit(512, DISK, protocol::ESP_BYTES, 1).is_err());
+        assert!(esp_fit(512, DISK, 1, protocol::ESP_BYTES).is_err());
+
+        let fixture = ExecutionFixture::new(b"kernel", b"kernel");
+        let execution = &fixture.execution;
+        let template = execution.root.join(protocol::SELECTOR_TEMPLATE_PATH);
+        let uuid = VolumeUuid::parse(&canonical_uuid(fixture.plan.volume_uuid())).unwrap();
+        let total = selector_parts(&template, &execution.trusted_key, &uuid)
+            .unwrap()
+            .total()
+            .unwrap();
+        let output = execution.run.join("selector.cpio");
+        prepare_selector(&template, &execution.trusted_key, &uuid, &output).unwrap();
+        assert_eq!(std::fs::metadata(&output).unwrap().len(), total);
     }
 
     #[test]

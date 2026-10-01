@@ -310,16 +310,17 @@ authority generates them.
 
 Before a service presents this value to an operator for consent, it must
 authenticate and retain its source, validate all choices against that
-source, establish destination eligibility and layout/payload/scratch fit,
-and retain the exact proposed value. The service core below already
-authenticates the source under its claim and retains the value, but does
-not yet retain the source, validates choices against caller-bound roots
-(the verified root and the running system's timezone catalog) rather than
-that source, and does not check payload and scratch fit, so its review is
-not yet presentable; td-authd starts it on a live boot but it opens no
-consent channel. Execution must require
-fresh trusted consent bound to that whole value and revalidate the
-selected disk under a retained exclusive claim. Neither matching plan
+source, establish destination eligibility and layout and payload fit,
+and retain the exact proposed value. Scratch shortage is refused before
+the first write instead (DESIGN.md "Payload fit"). The service core below
+already authenticates the source under its claim, refuses a disk that
+cannot hold its payloads and retains the value, but does not yet retain
+the source and validates choices against caller-bound roots (the verified
+root and the running system's timezone catalog) rather than that source,
+so its review is not yet presentable; td-authd starts it on a live boot
+but it opens no consent channel. Execution must require fresh trusted
+consent bound to that whole value and revalidate the selected disk under
+a retained exclusive claim. Neither matching plan
 bytes nor possession of the nonce grants consent. No public request,
 reconnect or service restart may silently retry erasure. This increment
 does not connect the value to the existing update-only consent operation
@@ -356,8 +357,8 @@ Requests carry no path, executable, mount option, source or consent:
   labels included, the service's own fresh observation of an eligible
   candidate, and otherwise refuses with destination changed. The reviewed
   plan carries the service's observation, never UI-supplied values. The
-  service chooses the nonce and volume UUID, authenticates the source and
-  claims the disk.
+  service chooses the nonce and volume UUID, authenticates the source,
+  claims the disk and checks that the disk holds the deployment.
 - `0x03` execute: the complete `TDPLAN01` record the installer reviewed. It
   asks the service to seek consent for the review it retains, and is
   refused unless the record equals that review. Equality is a
@@ -464,36 +465,38 @@ and whose observation the review then carries; the read-write exclusive
 claim of DESIGN.md (a disk held elsewhere is refused as busy; any other
 failure to claim a disk discovery just listed, as changed); source
 authentication through `td-boot validate-source` while that claim is held;
-the nonce and version-4 volume UUID from `/dev/urandom`; and a recheck of
-the claimed disk against two inventories. Any refusal releases the claim.
-Only then is the review held and returned. Execute rechecks the held disk; a
-disk that changed abandons the review. Without a consent channel, or for a
-review that channel cannot carry, it then answers consent unavailable and
-keeps the review. Otherwise it sends the review report, answers awaiting
-consent, and waits for td-authd's answer while it goes on serving the
-installer. A decline abandons the review as the consent channel section maps
-it. Consent rechecks the held disk once more (a change abandons the review
-as destination changed), then writes the started report before the execution
-exists (if td-authd cannot be told, the review is abandoned as consent
-unavailable and nothing is written), moves the claim to an execution on its
-own thread, and answers running, with the phase the execution last reported,
-until it reports finished and the service is complete or failed. Withdraw
-releases a review that has not started. A consent greeting that fails or
-stalls for ten seconds leaves the service without a channel. A malformed
-answer, a second answer to a started installation, a report that cannot be
-written or a closed consent channel ends only that channel: a displayed
-review is abandoned as consent unavailable, later executes are refused as
-consent unavailable, and a running installation continues. A reply whose
-write stalls for ten seconds, like any other lost reply, counts as losing
-the installer. The wire carries only a refusal's code, so the cause of each
-discovery, settings, claim, source or recheck failure is written to standard
-error; the time zone catalog's, kept with the catalog, is written once.
-While a review is held, its own claim keeps the held disk out of
-destinations replies; that omission is not a disk change. Each request is
-served in turn, and the next is not read until the reply to the last is
-written, so an installer that does not read cannot queue requests; it can
-still repeat source authentication at will, which the caller that starts the
-service bounds.
+the nonce and version-4 volume UUID from `/dev/urandom`; payload fit
+(DESIGN.md "Payload fit": a volume short of the deployment is insufficient
+space, a source the fixed ESP or the kernel bound refuses is source
+unavailable); and a recheck of the claimed disk against two inventories. Any
+refusal releases the claim. Only then is the review held and returned.
+Execute rechecks the held disk; a disk that changed abandons the review.
+Without a consent channel, or for a review that channel cannot carry, it
+then answers consent unavailable and keeps the review. Otherwise it sends
+the review report, answers awaiting consent, and waits for td-authd's answer
+while it goes on serving the installer. A decline abandons the review as the
+consent channel section maps it. Consent rechecks the held disk once more (a
+change abandons the review as destination changed), then writes the started
+report before the execution exists (if td-authd cannot be told, the review
+is abandoned as consent unavailable and nothing is written), moves the claim
+to an execution on its own thread, and answers running, with the phase the
+execution last reported, until it reports finished and the service is
+complete or failed. Withdraw releases a review that has not started. A
+consent greeting that fails or stalls for ten seconds leaves the service
+without a channel. A malformed answer, a second answer to a started
+installation, a report that cannot be written or a closed consent channel
+ends only that channel: a displayed review is abandoned as consent
+unavailable, later executes are refused as consent unavailable, and a
+running installation continues. A reply whose write stalls for ten seconds,
+like any other lost reply, counts as losing the installer. The wire carries
+only a refusal's code, so the cause of each discovery, settings, claim,
+source, fit or recheck failure is written to standard error; the time zone
+catalog's, kept with the catalog, is written once. While a review is held,
+its own claim keeps the held disk out of destinations replies; that omission
+is not a disk change. Each request is served in turn, and the next is not
+read until the reply to the last is written, so an installer that does not
+read cannot queue requests; it can still repeat source authentication at
+will, which the caller that starts the service bounds.
 
 The service has an execution (DESIGN.md "Executing a consented
 installation"), but production opens no consent channel, so execute is
@@ -503,8 +506,8 @@ execution on a regular-file disk. Exclusion of the medium
 backing the deployment source currently rests on discovery: a mounted
 medium's exclusive claim keeps it out. Independent retention and exclusion
 of source backing storage, validation of choices against that source
-rather than caller-bound roots, payload and scratch fit, and trusted
-consent remain required before execution.
+rather than caller-bound roots, and trusted consent remain required
+before execution.
 
 ## Installation consent channel
 
