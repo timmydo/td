@@ -10,7 +10,7 @@ use crate::{
     ports::{Crypto, Digest, Record as RowRecord},
 };
 
-const RECORD_PREFIX_BYTES: usize = 16;
+pub const RECORD_PREFIX_BYTES: usize = 16;
 pub const MIN_RECORD_BYTES: usize = super::RECORD_OVERHEAD_BYTES + super::MIN_KEY_BYTES;
 pub const MAX_RECORD_BYTES: usize =
     super::RECORD_OVERHEAD_BYTES + super::MAX_KEY_BYTES + super::MAX_VALUE_BYTES;
@@ -109,6 +109,16 @@ fn record_bytes(key: usize, value: usize) -> Result<usize, FormatError> {
         .ok_or(FormatError::Overflow)
 }
 
+/// Bound one record from its exact 16-byte prefix; this grants no integrity.
+pub fn record_extent(prefix: &[u8]) -> Result<usize, FormatError> {
+    let mut reader = Reader::new(prefix);
+    let key = usize::try_from(reader.u32()?).map_err(|_| FormatError::Overflow)?;
+    let value = usize::try_from(reader.u32()?).map_err(|_| FormatError::Overflow)?;
+    reader.u64()?;
+    reader.finish()?;
+    record_bytes(key, value)
+}
+
 /// Locally valid row bytes; references, table ordering and file bindings remain unchecked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Record<'a> {
@@ -164,14 +174,15 @@ impl<'a> Record<'a> {
         through: Sequence,
         bytes: &'a [u8],
     ) -> Result<Self, Error> {
-        let mut prefix = Reader::new(bytes);
-        let key_len = usize::try_from(prefix.u32()?).map_err(|_| FormatError::Overflow)?;
-        let value_len = usize::try_from(prefix.u32()?).map_err(|_| FormatError::Overflow)?;
-        let changed = Sequence::from_u64(prefix.u64()?);
-        let length = record_bytes(key_len, value_len)?;
+        let prefix = bytes
+            .get(..RECORD_PREFIX_BYTES)
+            .ok_or(FormatError::Truncated)?;
+        let length = record_extent(prefix)?;
         let preimage = checked_preimage(crypto, bytes, length)?;
         let mut reader = Reader::new(preimage);
-        reader.take(RECORD_PREFIX_BYTES)?;
+        let key_len = usize::try_from(reader.u32()?).map_err(|_| FormatError::Overflow)?;
+        let value_len = usize::try_from(reader.u32()?).map_err(|_| FormatError::Overflow)?;
+        let changed = Sequence::from_u64(reader.u64()?);
         let key = reader.take(key_len)?;
         let value = reader.take(value_len)?;
         reader.finish()?;

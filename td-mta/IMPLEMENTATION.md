@@ -588,6 +588,14 @@ service activation. Each part lands independently:
     cross-file account/epoch/generation/sequence/hash checks. Carry failure
     state through streaming completion; never accept a valid header as proof
     that the table payload is complete. Persistence consumers wait for this.
+    - **M05a2b1 — streamed table validation:** share bounded prefix framing,
+      consume exact individual records with sticky failures, verify unsigned
+      key order and declared count/extent, and compute the supplied-stream digest. Retain only the
+      prior key, digest and counters; caller owns the record buffer. Completion
+      describes the supplied stream, not filesystem EOF or manifest selection.
+    - **M05a2b2 — manifests and bindings:** bounded descriptor codecs and
+      complete selected-file identity, extent, digest and history bindings.
+      Persistence consumers require both parts.
 - **M05a3 — transaction frames:** exact bounded operation/header/footer codecs
   and validated sequential frame iteration. Validate header digest before using
   lengths; distinguish a short physical tail from full-length corrupt data.

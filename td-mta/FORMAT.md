@@ -4,8 +4,9 @@ This is the normative byte-layout companion to [STORAGE.md](STORAGE.md).
 M02a and M02b implement allocation-free scalar, primary-key and row codecs in
 `src/format/`, with literal row/container fixtures. M05a1 adds fixed FORMAT,
 CURRENT and journal-header integrity codecs. M05a2a adds table headers and
-individual record envelopes. Manifest/whole-table validation, cross-file
-bindings, publication and recovery are unimplemented. M02c freezes semantic
+individual record envelopes. M05a2b1 validates supplied table streams. Manifest
+validation, cross-file bindings, publication and recovery are unimplemented.
+M02c freezes semantic
 APIs. Production persistence waits for those contracts
 and the M05 store implementation. Nothing here advertises a usable store.
 
@@ -212,9 +213,34 @@ Encoding a header uses 112 local bytes. Record encoding hashes a 16-byte prefix,
 borrowed key and borrowed value before writing anything to caller storage.
 Returned errors leave output unchanged and a successful encode preserves its
 suffix. SHA-256 factory/update/finish failures remain distinct from encoding and
-checksum errors. These are individual codecs: whole-table extent/count/order,
-manifest hashes and selected-store binding validation remain subsequent M05
-work. No decoder treats immutable-table truncation as a recoverable journal tail.
+checksum errors. These individual codecs do not establish whole-table
+validity; the stream verifier below checks the supplied record sequence, while
+manifest and selected-store binding validation remain subsequent M05 work.
+No decoder treats immutable-table truncation as a recoverable journal tail.
+
+`table::record_extent` accepts exactly the 16-byte record prefix and returns
+its bounded total length. It validates only lengths, not sequence, checksum or
+row grammar. The record decoder shares these bounds. One preallocated MAX_RECORD_BYTES
+(66608-byte) record buffer suffices; a caller must never allocate from an
+unchecked prefix.
+
+`table_stream::Verifier` accepts an exact validated header followed by exact
+record slices. It checks each full record, strictly increasing unsigned raw key
+order, and running count/payload against the declared ceilings. Its fixed state
+holds one 1024-byte prior key, counters and a digest; record memory belongs to
+the caller and may be reused after each returned borrow ends. A supplied record
+error permanently fails the stream, including provider failures; later pushes
+and finish return that same error without trying to resume after it.
+
+Finish consumes the verifier and requires exact count/payload agreement before
+returning the header and SHA-256 of all supplied bytes, including header and
+record digests. Per-record results remain provisional until completion and
+selected-file bindings pass. The verifier neither reads physical EOF nor proves
+that omitted suffix bytes do not exist; the storage adapter must check EOF and
+the manifest's identity, extent and whole-file digest before publishing a table.
+It provides no cross-row reference, account authorization or durability proof.
+Its state does not grow with the header's count; work is one bounded record per
+push, with future I/O consumers responsible for work/deadline admission.
 
 ### Journal header: 96 bytes
 

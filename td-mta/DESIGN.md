@@ -17,7 +17,8 @@ container registry. M05a1 adds exact FORMAT, CURRENT and journal-header
 encoders/decoders with checked digests. These codecs do not validate selected
 store bindings, replay transactions or perform filesystem I/O.
 M05a2a adds checked table headers and individually checksummed borrowed records;
-whole-table order/count/extent and manifest validation remain unimplemented.
+M05a2b1 checks supplied table streams for order/count/extent and computes
+their digest. Physical EOF, manifests and selected-file bindings remain unimplemented.
 [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.
 [API.md](API.md) defines the compiling M02c2 adapter contracts and implemented

@@ -7,6 +7,7 @@ pub mod key;
 pub mod row;
 pub mod scalar;
 pub mod table;
+pub mod table_stream;
 
 pub const CONTAINER_VERSION: u16 = 1;
 pub const SCHEMA_VERSION: u16 = 1;

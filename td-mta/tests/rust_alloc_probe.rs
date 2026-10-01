@@ -152,7 +152,8 @@ fn store_table_records() {
         format::{
             container::Error,
             row::{BlobKind, BlobRow, Row},
-            table::{Record, TableHeader},
+            table::{record_extent, Record, TableHeader},
+            table_stream::Verifier,
             Error as FormatError, Sequence, Table,
         },
         ids::{AccountId, StoreEpoch},
@@ -168,6 +169,9 @@ fn store_table_records() {
         record_count: 1,
         payload_bytes: 113,
     };
+    let mut header_bytes = [0; 112];
+    header.encode(&crypto, &mut header_bytes).unwrap();
+    let mut stream = Verifier::new(&crypto, &header_bytes).unwrap();
     let mut bytes = [0; 120];
     let n = header.encode(&crypto, black_box(&mut bytes)).unwrap();
     assert_eq!(
@@ -191,6 +195,19 @@ fn store_table_records() {
         Record::decode(&crypto, Table::Blobs, through, bytes.get(..n).unwrap()).unwrap(),
         record
     );
+    assert_eq!(record_extent(bytes.get(..16).unwrap()), Ok(n));
+    assert_eq!(stream.push(bytes.get(..n).unwrap()), Ok(record));
+    assert_eq!(stream.finish().unwrap().header(), header);
+    let mut failed = Verifier::new(&crypto, &header_bytes).unwrap();
+    assert_eq!(
+        failed.push(bytes.get(..n - 1).unwrap()),
+        Err(Error::Format(FormatError::Truncated))
+    );
+    assert_eq!(
+        failed.push(bytes.get(..n).unwrap()),
+        Err(Error::Format(FormatError::Truncated))
+    );
+    assert_eq!(failed.finish(), Err(Error::Format(FormatError::Truncated)));
     assert_eq!(
         record.encode(&crypto, through, bytes.get_mut(..n - 1).unwrap()),
         Err(Error::Format(FormatError::OutputFull))
