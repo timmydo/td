@@ -1,4 +1,4 @@
-//! Confined directory lookup and private-root path admission; no store activation.
+//! Confined directories, private-root path checks and space observations.
 use crate::{store_fs_sys, store_paths::Name};
 use std::{ffi::CStr, fmt, os::unix::fs::MetadataExt};
 use std::{fs::File, fs::Metadata, io};
@@ -118,6 +118,68 @@ fn trusted_ancestor_owner(owner: u32, service: u32) -> bool {
     owner == 0 || owner == service
 }
 
+/// A recognized magic value, not filesystem admission or backing identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilesystemFamily {
+    Xfs,
+    Btrfs,
+    /// Ext2/ext3/ext4 share this value; further qualification must select ext4.
+    ExtFamily,
+}
+
+/// One possibly stale observation. Identity, quota policy, probe-ticket matching
+/// and write admission are separate requirements, even on a writable mount.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilesystemSpace {
+    pub family: FilesystemFamily,
+    /// Statfs counting unit; qualification must establish allocation granularity.
+    pub counting_unit: u64,
+    /// Scaled f_bavail, not the service user's quota headroom.
+    pub available_bytes: u64,
+    pub inodes: crate::admission::space::Inodes,
+    pub read_only: bool,
+}
+
+const ST_RDONLY: i64 = 1;
+const ST_VALID: i64 = 0x20;
+
+fn filesystem_observation(raw: &store_fs_sys::StatFs) -> io::Result<FilesystemSpace> {
+    use crate::admission::space::Inodes;
+    let invalid = || io::Error::from(io::ErrorKind::InvalidData);
+    let counting_unit = u64::try_from(raw.fragment_size).map_err(|_| invalid())?;
+    if counting_unit == 0 || raw.block_size <= 0 || raw.flags & ST_VALID == 0 {
+        return Err(invalid());
+    }
+    let family = match raw.kind {
+        0x5846_5342 => FilesystemFamily::Xfs,
+        0x9123_683e => FilesystemFamily::Btrfs,
+        0xef53 => FilesystemFamily::ExtFamily,
+        _ => return Err(io::ErrorKind::Unsupported.into()),
+    };
+    let available_blocks = u64::try_from(raw.available_blocks).map_err(|_| invalid())?;
+    let available_bytes = available_blocks
+        .checked_mul(counting_unit)
+        .ok_or_else(invalid)?;
+    let inodes = match family {
+        FilesystemFamily::Btrfs => Inodes::Unsupported,
+        FilesystemFamily::Xfs | FilesystemFamily::ExtFamily => {
+            let files = u64::try_from(raw.files).map_err(|_| invalid())?;
+            let free = u64::try_from(raw.free_files).map_err(|_| invalid())?;
+            if free > files {
+                return Err(invalid());
+            }
+            Inodes::Available(free)
+        }
+    };
+    Ok(FilesystemSpace {
+        family,
+        counting_unit,
+        available_bytes,
+        inodes,
+        read_only: raw.flags & ST_RDONLY != 0,
+    })
+}
+
 /// Pins a directory inode independently of its pathname. This does not establish
 /// trusted ancestry, ownership, mode, filesystem suitability or a writer lock.
 #[derive(Debug)]
@@ -142,6 +204,12 @@ impl Directory {
             .as_c_str()
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         store_fs_sys::open_directory(&self.0, name).map(Self)
+    }
+
+    /// Observes this retained directory's filesystem without allocations.
+    /// This is not a backing-capacity identity or authorization to write.
+    pub fn filesystem_space(&self) -> io::Result<FilesystemSpace> {
+        filesystem_observation(&store_fs_sys::filesystem_space(&self.0)?)
     }
 
     /// Metadata is read from the retained descriptor, never by reopening a path.
@@ -269,6 +337,156 @@ mod tests {
         } else {
             assert!(matches!(outcome, Err(RootError::Owner)));
         }
+    }
+
+    fn stats(kind: i64) -> store_fs_sys::StatFs {
+        store_fs_sys::StatFs {
+            kind,
+            block_size: 4096,
+            fragment_size: 1024,
+            free_blocks: 100,
+            available_blocks: 7,
+            files: 9000,
+            free_files: 5000,
+            flags: ST_VALID,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn space_observation_uses_available_blocks_and_fragment_units() {
+        use crate::admission::space::Inodes;
+        for (kind, family) in [
+            (0x5846_5342, FilesystemFamily::Xfs),
+            (0xef53, FilesystemFamily::ExtFamily),
+            (0x9123_683e, FilesystemFamily::Btrfs),
+        ] {
+            let mut raw = stats(kind);
+            let observed = filesystem_observation(&raw).unwrap();
+            assert_eq!(observed.family, family);
+            assert_eq!(observed.counting_unit, 1024);
+            assert_eq!(observed.available_bytes, 7168);
+            assert_eq!(
+                observed.inodes,
+                if family == FilesystemFamily::Btrfs {
+                    Inodes::Unsupported
+                } else {
+                    Inodes::Available(5000)
+                }
+            );
+            assert!(!observed.read_only);
+            raw.flags = ST_VALID | ST_RDONLY;
+            raw.available_blocks = 0;
+            raw.free_files = 0;
+            let exhausted = filesystem_observation(&raw).unwrap();
+            assert!(exhausted.read_only);
+            assert_eq!(exhausted.available_bytes, 0);
+            if family != FilesystemFamily::Btrfs {
+                assert_eq!(exhausted.inodes, Inodes::Available(0));
+            }
+        }
+        assert_eq!(
+            filesystem_observation(&stats(0x9fa0)).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn space_observation_rejects_invalid_counts_units_and_overflow() {
+        for (unit, blocks, files, free) in [
+            (0, 7, 9000, 5000),
+            (-1, 7, 9000, 5000),
+            (1024, -1, 9000, 5000),
+            (1024, i64::MAX, 9000, 5000),
+            (1024, 7, -1, 0),
+            (1024, 7, 9000, -1),
+            (1024, 7, 0, 1),
+        ] {
+            let mut raw = stats(0x5846_5342);
+            raw.fragment_size = unit;
+            raw.available_blocks = blocks;
+            raw.files = files;
+            raw.free_files = free;
+            assert_eq!(
+                filesystem_observation(&raw).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        let mut raw = stats(0x5846_5342);
+        raw.block_size = 0;
+        assert_eq!(
+            filesystem_observation(&raw).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        raw.block_size = -1;
+        assert!(filesystem_observation(&raw).is_err());
+        raw.block_size = 4096;
+        raw.fragment_size = 1;
+        raw.available_blocks = i64::MAX;
+        assert_eq!(
+            filesystem_observation(&raw).unwrap().available_bytes,
+            i64::MAX as u64
+        );
+    }
+
+    #[test]
+    fn space_observation_requires_valid_kernel_flags() {
+        let mut raw = stats(0x5846_5342);
+        for flags in [0, ST_RDONLY, 0x10] {
+            raw.flags = flags;
+            assert_eq!(
+                filesystem_observation(&raw).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        raw.flags = ST_VALID;
+        assert!(!filesystem_observation(&raw).unwrap().read_only);
+        raw.flags = ST_VALID | ST_RDONLY;
+        assert!(filesystem_observation(&raw).unwrap().read_only);
+    }
+
+    #[test]
+    fn kernel_space_probe_checks_procfs_abi_and_refuses_unsupported_family() {
+        let proc = Directory::from_file(File::open("/proc").unwrap()).unwrap();
+        let raw = store_fs_sys::filesystem_space(&proc.0).unwrap();
+        assert_eq!(raw.kind, 0x9fa0);
+        assert!(raw.block_size > 0);
+        assert!(raw.fragment_size > 0);
+        assert_eq!(raw.name_length, 255);
+        assert_eq!(raw.flags & ST_VALID, ST_VALID);
+        assert_eq!(
+            proc.filesystem_space().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn space_probe_retains_directory_across_rename_and_path_replacement() {
+        let fixture = Fixture::new();
+        let original = fixture.0.join("data");
+        let moved = fixture.0.join("moved");
+        std::fs::create_dir(&original).unwrap();
+        let directory = Directory::from_file(File::open(&original).unwrap()).unwrap();
+        let before = store_fs_sys::filesystem_space(&directory.0).unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        std::os::unix::fs::symlink("/proc", &original).unwrap();
+        let replacement = store_fs_sys::filesystem_space(&File::open(&original).unwrap()).unwrap();
+        assert_eq!(replacement.kind, 0x9fa0);
+        assert_ne!(before.kind, replacement.kind);
+        let after = store_fs_sys::filesystem_space(&directory.0).unwrap();
+        assert_eq!(after.kind, before.kind);
+        assert_eq!(after.fsid, before.fsid);
+        assert_eq!(after.fragment_size, before.fragment_size);
+    }
+
+    #[test]
+    fn space_probe_requires_success_on_executable_filesystem() {
+        let executable = std::env::current_exe().unwrap();
+        let directory =
+            Directory::from_file(File::open(executable.parent().unwrap()).unwrap()).unwrap();
+        let raw = store_fs_sys::filesystem_space(&directory.0).unwrap();
+        let observed = directory.filesystem_space().unwrap();
+        assert_eq!(observed.counting_unit, raw.fragment_size as u64);
     }
 
     #[test]

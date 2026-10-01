@@ -18,9 +18,11 @@ in `src/admission/filesystems.rs`. M04c3b3b composes atomic admission and effect
 accounting in `src/admission/coordinator.rs`. M04c3b3c1 adds causal probe
 fences in the registry; M04c3b3c2 adds conditional checkpoint transfer and
 reopening in `src/admission/coordinator/checkpoint.rs`.
-M05/M08 supply physical probes, persistence and maintenance.
-M13 owns request retention. No running admission coordinator or filesystem
-probe is claimed.
+M05b2b2a supplies bounded descriptor-based space observations as specified
+in STORAGE.md. Filesystem qualification, shared-capacity identity and binding
+these observations to the coordinator remain pending. M05/M08 supply
+persistence and maintenance; M13 owns request retention. No running admission
+coordinator is claimed.
 
 ## 1. Disk accounting
 
@@ -288,10 +290,14 @@ space, remains distinct from exhausted monotonic counters.
 
 A free-space probe must use the actual open store/filesystem identity, not a
 shell utility or a client-supplied path. Safe std currently supplies no portable
-free-space/inode probe. M05 must implement a narrowly reviewed platform adapter
-and amend UNSAFE.md plus the component contract before adding any unsafe call;
-this design does not authorize an implementation or a new dependency. A fake
-probe drives exact-boundary and concurrent-reservation tests first.
+free-space/inode probe. M05b2b2a implements the narrow fstatfs observation
+surface recorded in UNSAFE.md section 22 and STORAGE.md. It allocates no Rust
+memory but does not establish backing identity, qualify filesystem policies,
+or bind a result to a coordinator ticket. Its counting unit is not yet an
+allocation granularity, and its returned fields are not an admission Sample.
+Those conversions and quota/feature policies remain M05b2b2b requirements.
+Injected samples still drive the coordinator's boundary and reservation tests;
+an arbitrary successful space snapshot is not an admission credential.
 
 Before admitting each mutation, preserve enough additional physical capacity
 to checkpoint its resulting state: the selected table lengths plus committed

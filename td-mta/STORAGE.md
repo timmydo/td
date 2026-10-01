@@ -103,9 +103,11 @@ have their own lifetimes; an account checkpoint does not claim to snapshot them.
 
 Require Linux 5.6 or newer with openat2 available; refusal or unavailability
 fails closed without a path-walking fallback. Use trusted private roots on
-local ext4/Btrfs, tested for rename/file/directory
-sync behavior. NFS and external live writers are unsupported. Filenames,
-permissions and safe path construction obey DESIGN section 6. New-format files
+local XFS, ext4 or Btrfs, qualified for rename/file/directory sync behavior.
+XFS is the primary deployment target. Support is a qualification requirement,
+not a claim that the current foundations have passed power-loss tests. NFS
+and external live writers are unsupported. Filenames, permissions and safe
+path construction obey DESIGN section 6. New-format files
 are refused rather than interpreted as an older schema.
 
 ### Descriptor boundary
@@ -154,6 +156,46 @@ durable mutation and fault injection remain pending. The current raw ABI
 supports x86-64 only; additional architectures need their own reviewed
 mapping. UNSAFE section 22 owns the exact syscall, flags, descriptor ownership
 and confinement tests.
+
+### Filesystem observations
+
+`Directory::filesystem_space` probes the retained directory with
+fstatfs, using fixed stack storage. It recognizes XFS, Btrfs and the
+ext-family magic; the latter cannot distinguish ext4 from ext2/ext3 and
+is not ext4 admission. Require ST_VALID before interpreting the read-
+only mount bit. Return the statfs counting unit, f_bavail scaled into
+bytes, explicit inode availability and that read-only bit. These are
+unqualified fields, not an admission Sample or a validated allocation
+granularity. Reject unknown families, nonpositive units, negative counts
+used by the conversion and byte-count overflow. Btrfs inode headroom is
+Unsupported; XFS/ext-family inode counts remain observations, not a
+promise that allocating that many files will succeed. Use available
+blocks, never privileged free blocks. Each observation can become stale.
+
+This probe does not establish a backing-capacity key, match a coordinator
+probe ticket, admit a filesystem or grant permission to write. Btrfs
+subvolumes share capacity despite differing device/statfs identifiers.
+XFS and ext4 project quotas can change the directory's reported values;
+user/group quota headroom is not supplied by these filesystem statistics.
+Qualification must establish the quota policy, deduplicate shared capacity,
+and select a conservative allocation granularity before constructing an
+admission Sample. Ext4 bigalloc clusters and XFS realtime/extent-size hints
+can exceed the counting unit. Unsupported quota or allocation profiles must
+refuse qualification. Read-only observations cannot authorize write admission.
+
+The kernel and zero-allocation fixtures require successful observations
+on the retained executable directory, which must use XFS, Btrfs or an
+ext-family filesystem; neither fixture writes there. Rename/lookup scratch
+may use tmpfs. Unsupported executable storage fails instead of certifying
+success. Procfs verifies the unsupported-family error path, including its
+zero-allocation behavior.
+
+Filesystem qualification also requires persistent-lock/process-death
+tests, short/failing I/O, file and parent-directory sync, non-replacing
+publication, and disposable-filesystem/VM crash recovery. Record
+filesystem and kernel versions, formatting features, mount and quota
+settings. Ordinary kernel probe tests on the development filesystem do
+not qualify XFS durability.
 
 ## 3. Metadata records
 

@@ -57,9 +57,9 @@ process-directed signals through retained procfs directory descriptors.
 The twenty-first, `td-install`, has one function-scoped instruction for two
 value-pinned loop-device requests, which reach a freshly formatted volume
 through the disk claim the installer already holds.
-The twenty-second, `td-mta`, opens confined directories and reads its effective
-UID through two scoped instruction functions, one also adopting its returned
-descriptor; its test allocators remain separate.
+The twenty-second, `td-mta`, opens confined directories, reads its effective
+UID and probes filesystem space through three scoped instruction functions.
+One also adopts its returned descriptor; its test allocators remain separate.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -123,7 +123,7 @@ own entry.
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 | 21 | `td-install` | `ioctl(2)` with two value-pinned loop requests, `LOOP_CTL_GET_FREE` and `LOOP_CONFIGURE` — see [§21](#21-td-install--publishing-through-a-loop-over-the-claim) |
-| 22 | `td-mta` | `openat2(2)`, directory-only beneath a borrowed parent with no symlink resolution; one newly returned descriptor adoption; `geteuid(2)` for root admission |
+| 22 | `td-mta` | `openat2(2)`, directory-only beneath a borrowed parent with no symlink resolution; one newly returned descriptor adoption; `geteuid(2)` for root admission; `fstatfs(2)` on a retained directory |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -3005,12 +3005,12 @@ detached it; the read-back reports that case rather than hiding it. Any
 further syscall, request, configured field or flag, caller, or allowance
 amends this section and `td-install/DESIGN.md`.
 
-## 22. `td-mta` — confined directories and service identity
+## 22. `td-mta` — confined directories, identity and space observations
 
-`store_fs_sys.rs` has two function-scoped allowances, each containing one
+`store_fs_sys.rs` has three function-scoped allowances, each containing one
 Linux x86-64 syscall instruction. The directory opener additionally owns
-one `File::from_raw_fd` adoption. The syscalls are openat2 (437) and
-geteuid (107). The complete 24-byte repr(C) open_how consists of
+one `File::from_raw_fd` adoption. The syscalls are openat2 (437),
+geteuid (107) and fstatfs (138). The complete 24-byte repr(C) open_how has
 three initialized u64 fields: flags are O_RDONLY (0) | O_DIRECTORY (0o200000)
 | O_CLOEXEC (0o2000000), mode is zero, and resolve is RESOLVE_BENEATH (8) |
 RESOLVE_NO_SYMLINKS (4). The latter also refuses magic links. The request
@@ -3043,6 +3043,20 @@ must fit u32. Only PrivateRoot::open calls it in production. A zero service
 UID is refused. The caller must retain the deployment credentials; this
 surface neither enumerates nor modifies process capabilities.
 
+The third instruction calls fstatfs on a borrowed live directory File.
+It uses rax/rdi/rsi with rcx/r11 clobbers and nostack, with neither
+nomem nor readonly. The kernel may write only the initialized 120-byte,
+8-byte-aligned repr(C) x86-64 statfs record, retained exclusively
+through return. Pin its field offsets and size: seven i64 words, two i32
+fsid words, three i64 words and four spare i64 words. Return data only
+for syscall result zero; negative errors use the total converter and
+unexpected positive results refuse. The wrapper allocates no Rust memory
+and adds no pointer dereference, new descriptor or retry loop. Only
+Directory::filesystem_space calls this wrapper in production. Its safe
+conversion and observation limits are specified in STORAGE.md's
+Filesystem observations section; kernel statistics alone grant no write
+authority.
+
 STORAGE.md's Descriptor boundary section owns PrivateRoot's owner/mode and
 readable-ancestor policy. The raw directory flags remain unchanged. This
 surface creates no file, qualifies no filesystem, holds no LOCK and enables
@@ -3062,8 +3076,12 @@ mode, ancestor owner refusal before child lookup, the root-owner exemption,
 and shared-write/sticky refusals. A scalar fixture covers every error-converter
 boundary including isize::MIN. The allocation probe invokes public root
 admission outside its measured region and observes successful and failing
-directory lookup without Rust allocations. Any new operation,
-flag profile, caller, architecture or allowance amends this section and
+directory lookup and space probes without Rust allocations. Scalar tests
+cover family classification, inode support, signed bounds and multiplication
+overflow; kernel tests pin procfs fields/unsupported-family refusal and
+continued observation after directory rename. These do not qualify XFS
+write durability. Any new operation, flag profile, caller, architecture or
+allowance amends this section and
 STORAGE.md; the two test-only allocation exceptions below are unchanged.
 
 ## H1. `td-vm-registrar` — host Git account enrollment

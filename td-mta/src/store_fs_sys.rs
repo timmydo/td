@@ -1,4 +1,4 @@
-//! Linux directory lookup and effective UID; raw requests are pinned by confinement.
+//! Linux directory, identity and space queries; raw requests are pinned by confinement.
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("td-mta storage currently requires Linux x86-64");
 
@@ -19,6 +19,7 @@ const _: () = assert!(std::mem::size_of::<OpenHow>() == 24);
 
 const OPENAT2: usize = 437;
 const GETEUID: usize = 107;
+const FSTATFS: usize = 138;
 const O_DIRECTORY: u64 = 0o200000;
 const O_CLOEXEC: u64 = 0o2000000;
 const RESOLVE_BENEATH: u64 = 0x08;
@@ -74,6 +75,66 @@ pub(super) fn effective_uid() -> io::Result<u32> {
         return Err(kernel_error(result));
     }
     u32::try_from(result).map_err(|_| io::ErrorKind::InvalidData.into())
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub(super) struct StatFs {
+    pub kind: i64,
+    pub block_size: i64,
+    pub blocks: i64,
+    pub free_blocks: i64,
+    pub available_blocks: i64,
+    pub files: i64,
+    pub free_files: i64,
+    pub fsid: [i32; 2],
+    pub name_length: i64,
+    pub fragment_size: i64,
+    pub flags: i64,
+    pub spare: [i64; 4],
+}
+const _: () = {
+    assert!(std::mem::size_of::<StatFs>() == 120);
+    assert!(std::mem::align_of::<StatFs>() == 8);
+    assert!(std::mem::offset_of!(StatFs, kind) == 0);
+    assert!(std::mem::offset_of!(StatFs, block_size) == 8);
+    assert!(std::mem::offset_of!(StatFs, blocks) == 16);
+    assert!(std::mem::offset_of!(StatFs, free_blocks) == 24);
+    assert!(std::mem::offset_of!(StatFs, available_blocks) == 32);
+    assert!(std::mem::offset_of!(StatFs, files) == 40);
+    assert!(std::mem::offset_of!(StatFs, free_files) == 48);
+    assert!(std::mem::offset_of!(StatFs, fsid) == 56);
+    assert!(std::mem::offset_of!(StatFs, name_length) == 64);
+    assert!(std::mem::offset_of!(StatFs, fragment_size) == 72);
+    assert!(std::mem::offset_of!(StatFs, flags) == 80);
+    assert!(std::mem::offset_of!(StatFs, spare) == 88);
+};
+
+/// Borrows the live descriptor; the kernel fills only this fixed owned record.
+#[allow(unsafe_code)]
+pub(super) fn filesystem_space(directory: &File) -> io::Result<StatFs> {
+    let mut stats = StatFs::default();
+    let result: isize;
+    // SAFETY: live fd and exclusive initialized statfs storage through return.
+    // Linux writes the x86-64 120-byte ABI; syscall clobbers rcx and r11.
+    unsafe {
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") FSTATFS => result,
+            in("rdi") directory.as_raw_fd(),
+            in("rsi") &mut stats,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    if result < 0 {
+        return Err(kernel_error(result));
+    }
+    if result != 0 {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(stats)
 }
 
 fn kernel_error(result: isize) -> io::Error {

@@ -710,19 +710,35 @@ fn store_directories() {
         Err(RootError::Owner | RootError::PrivateMode) => assert_ne!(expected_uid, 0),
         Err(error) => panic!("root admission probe: {error}"),
     }
+    // Portable runtime scratch is tmpfs; the executable is disk-backed.
+    // Observe its retained parent without creating or writing anything there.
+    let executable = std::env::current_exe().unwrap();
+    let space_directory =
+        Directory::from_file(std::fs::File::open(executable.parent().unwrap()).unwrap()).unwrap();
+    let unsupported = Directory::from_file(std::fs::File::open("/proc").unwrap()).unwrap();
     let present = Name::root(RootEntry::Accounts).unwrap();
     let missing = Name::root(RootEntry::Lock).unwrap();
     let before = COUNTERS.snapshot();
     for _ in 0..64 {
         let directory = root.open(black_box(&present)).unwrap();
         assert!(directory.metadata().unwrap().is_dir());
+        let observation = space_directory.filesystem_space().unwrap();
+        assert!(observation.counting_unit > 0);
+        assert_eq!(
+            unsupported.filesystem_space().unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
         drop(directory);
         assert_eq!(
             root.open(black_box(&missing)).unwrap_err().kind(),
             std::io::ErrorKind::NotFound
         );
     }
-    assert_eq!(COUNTERS.snapshot(), before, "directory lookup allocated");
+    assert_eq!(
+        COUNTERS.snapshot(),
+        before,
+        "directory lookup or space observation allocated"
+    );
     drop(root);
     std::fs::remove_dir_all(path).unwrap();
 }

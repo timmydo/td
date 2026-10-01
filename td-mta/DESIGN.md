@@ -27,7 +27,9 @@ M05a3c binds history summaries to selected descriptors and active summaries to
 the caller's pinned committed prefix.
 M05b1 generates canonical storage paths. M05b2a opens directories relative
 to retained descriptors; M05b2b1 separately checks private data-root ancestry,
-ownership and permissions. Filesystem qualification, the writer lock,
+ownership and permissions. M05b2b2a adds bounded descriptor-based filesystem
+space observations, including XFS as the primary deployment target.
+Filesystem qualification, shared-capacity identity, the writer lock,
 physical EOF, selected-graph validation, complete final-view semantics and
 persistent file I/O remain unimplemented.
 [WIRE.md](WIRE.md) pins implemented wire-ID and
@@ -193,8 +195,9 @@ cryptography. Retaining Rustls means td-crypto still has an external TLS
 implementation even after AWS-LC is removed.
 
 The production library denies `unsafe_code`, with only the confined directory
-lookup, effective-UID query and descriptor adoption in UNSAFE.md section 22
-allowed. The binary retains `forbid(unsafe_code)`. The separate test executable
+lookup, effective-UID/space queries and descriptor adoption in UNSAFE.md
+section 22 allowed. The binary retains `forbid(unsafe_code)`. The separate
+test executable
 `tests/rust_alloc_probe.rs` has the user-approved allocation instrumentation
 exception specified in UNSAFE.md T1. Its single scoped GlobalAlloc
 implementation forwards all four operations to System without changing

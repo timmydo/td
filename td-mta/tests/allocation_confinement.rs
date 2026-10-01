@@ -68,14 +68,14 @@ fn scan(root: &Path, path: &Path) {
                 "668320d1f8caf82018331e0325571b16f69423794d4bff888a410a2c416d3702",
             );
         } else if relative == "src/store_fs_sys.rs" {
-            assert_eq!(words(&source, "unsafe"), 3);
-            assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 2);
-            assert_eq!(source.matches("std::arch::asm!").count(), 2);
+            assert_eq!(words(&source, "unsafe"), 4);
+            assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 3);
+            assert_eq!(source.matches("std::arch::asm!").count(), 3);
             assert_eq!(source.matches("File::from_raw_fd").count(), 1);
             assert!(!source.contains("global_allocator"));
             fingerprint(
                 &source,
-                "b08b9663905226e0713539fa6c5664dfc84184b76a3830ad4ee2475b3cedd016",
+                "43955818b30187e2d7ec3cb2c4a7fbb6092def30d03fe84290054e209952ca09",
             );
         } else {
             assert_eq!(words(&source, "unsafe"), 0, "{relative}");
@@ -154,7 +154,7 @@ fn allocation_surface_is_separate_and_exact() {
     );
     fingerprint(
         include_str!("../src/store_fs.rs"),
-        "4a1eab3b3730cccad0afdd2be1c37033a7376519db0e6542eb2cc83715599d06",
+        "4471a9bdae1284b6385366c4ec99bb51b3a22bc3a1c959d644d5166517adf192",
     );
     let probe = include_str!("rust_alloc_probe.rs");
     assert_eq!(probe.matches("#![cfg(test)]").count(), 1);

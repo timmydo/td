@@ -652,9 +652,23 @@ service activation. Each part lands independently:
         check and descriptor walk from `/`, refusing untrusted owners, writable
         ancestors (including sticky directories), symlinks and nonprivate data
         roots. Keep this distinct from filesystem admission and LOCK.
-      - **M05b2b2 — filesystem and LOCK:** pending local filesystem
-        qualification, persistent private lock inode, exclusive lifetime and
-        process-death tests.
+      - **M05b2b2 — filesystem and LOCK:** local XFS (primary deployment),
+        ext4 and Btrfs qualification, persistent private lock inode, exclusive
+        lifetime and process-death tests remain required.
+        - **M05b2b2a — descriptor space observations:** implemented fstatfs with
+          fixed storage and checked byte/inode conversion. Recognize XFS,
+          Btrfs and the ambiguous ext-family magic without claiming filesystem
+          admission. Test allocation-free host and musl observations.
+        - **M05b2b2b — qualification/identity:** establish supported filesystem
+          features and project/user/group quota policy, deduplicate shared
+          backing capacity, and bind fresh observations to coordinator tickets.
+          Qualify allocation granularity separately from statfs counting units:
+          cover ext4 bigalloc and XFS realtime/extent-size hints. Qualify XFS
+          first; do not infer ext4 from the shared ext-family magic.
+        - **M05b2b2c — persistent LOCK:** validate/open the private regular
+          inode without opening a device/FIFO for I/O, retain its exclusive
+          lock for the writer lifetime, never unlink it, and prove independent
+          opens contend and process death releases the lock.
     - **M05b2c — durable operations:** pending confined file creation/read/
       write, non-replacing publication, sync and deterministic fault model.
       Process-death tests and later VM power-loss evidence remain required.
