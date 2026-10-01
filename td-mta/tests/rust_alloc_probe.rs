@@ -72,6 +72,7 @@ fn hot_paths() {
         let mut digest = td_crypto::Sha256::try_new().unwrap();
         digest.update(black_box(&data)).unwrap();
         black_box(digest.finish().unwrap());
+        store_containers();
         let mut line = td_mta::smtp_wire::LineReader::new(&mut scratch).unwrap();
         assert!(!line.feed(black_box(b"EHLO example")).unwrap().complete);
         assert!(line.feed(black_box(b".test\r\n")).unwrap().complete);
@@ -86,6 +87,62 @@ fn hot_paths() {
     assert_eq!(
         after, before,
         "Rust allocator activity in measured hot paths"
+    );
+}
+
+fn store_containers() {
+    use td_mta::{
+        format::{
+            container::{Current, Error as ContainerError, JournalHeader, StoreIdentity},
+            Error as FormatError, Sequence,
+        },
+        ids::{AccountId, InstanceId, StoreEpoch},
+    };
+    let crypto = td_crypto::Provider;
+    let mut bytes = [0; 120];
+    let identity = StoreIdentity {
+        instance: InstanceId::from_bytes([0x11; 16]),
+        epoch: StoreEpoch::from_bytes([0x22; 16]),
+    };
+    let n = identity.encode(&crypto, black_box(&mut bytes)).unwrap();
+    assert_eq!(
+        StoreIdentity::decode(&crypto, bytes.get(..n).unwrap()).unwrap(),
+        identity
+    );
+    let current = Current {
+        account: AccountId::from_bytes([0x33; 16]),
+        epoch: identity.epoch,
+        generation: 1,
+        manifest_digest: [0x44; 32],
+    };
+    let n = current.encode(&crypto, black_box(&mut bytes)).unwrap();
+    assert_eq!(
+        Current::decode(&crypto, bytes.get(..n).unwrap()).unwrap(),
+        current
+    );
+    assert_eq!(
+        current.encode(&crypto, bytes.get_mut(..n - 1).unwrap()),
+        Err(ContainerError::Format(FormatError::OutputFull))
+    );
+    let journal = JournalHeader {
+        account: current.account,
+        epoch: current.epoch,
+        segment: 1,
+        base: Sequence::default(),
+    };
+    let n = journal.encode(&crypto, black_box(&mut bytes)).unwrap();
+    assert_eq!(
+        JournalHeader::decode(&crypto, bytes.get(..n).unwrap()).unwrap(),
+        journal
+    );
+    assert_eq!(
+        JournalHeader::decode(&crypto, bytes.get(..n - 1).unwrap()),
+        Err(ContainerError::Format(FormatError::Truncated))
+    );
+    *bytes.get_mut(n - 1).unwrap() ^= 1;
+    assert_eq!(
+        JournalHeader::decode(&crypto, bytes.get(..n).unwrap()),
+        Err(ContainerError::Checksum)
     );
 }
 

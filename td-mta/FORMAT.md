@@ -2,7 +2,8 @@
 
 This is the normative byte-layout companion to [STORAGE.md](STORAGE.md).
 M02a and M02b implement allocation-free scalar, primary-key and row codecs in
-`src/format/`, with literal row/container fixtures. Container integrity
+`src/format/`, with literal row/container fixtures. M05a1 adds fixed FORMAT,
+CURRENT and journal-header integrity codecs. Remaining containers, cross-file
 validation, publication and recovery are unimplemented. M02c freezes semantic
 APIs. Production persistence waits for those contracts
 and the M05 store implementation. Nothing here advertises a usable store.
@@ -108,6 +109,23 @@ containing U+00E9. The core tests compare the literal bytes in both directions.
 They do not claim to test a cryptographic provider or durable filesystem I/O.
 
 ## 3. Fixed containers
+
+`format::container` implements `StoreIdentity`, `Current` and `JournalHeader`.
+Their decoders require exactly the stated extent, verify SHA-256 through the
+injected Crypto adapter, and reject wrong magic/version/schema/flags. CURRENT
+generations and journal segment numbers must be nonzero. Opaque IDs permit all
+bit patterns; an exhausted sequence remains readable. Callers pass only the
+96-byte header to `JournalHeader::decode`, not a file containing later frames.
+Successful decoding does not validate any referenced file or select a store.
+
+Encoding uses caller storage and a fixed local array no larger than 120 bytes;
+all returned errors leave caller output unchanged, and bytes after the encoded
+extent remain untouched. Digest construction/update/finish failures propagate
+separately from format errors and checksum mismatch. These codecs allocate no
+owned heap; a supplied Crypto implementation retains its own resource contract.
+The tests use the real facade plus failure injection. The existing Rust hot-path
+probe checks the concrete provider with successful codecs and capacity,
+truncation and checksum failures; whole-store resources remain unqualified.
 
 Every container starts with its listed eight-byte ASCII magic. Common fields
 at offsets 8, 10 and 12 are container version u16=1, schema u16=1, and flags
@@ -431,8 +449,11 @@ existing container, cross-file binding, blob and import snapshot fixtures
 through the real td-crypto facade, with fragmented updates and changed-byte
 comparisons. These host and portable tests qualify literal hash coverage;
 they do not implement production container validation or crash durability.
-M02c supplies state, queue and API meanings. M05 verifies SHA-256 through the
-reviewed provider, implements exact encoders/decoders for containers, validates
+M05a1's `tests/format_containers.rs` uses five existing literal artifacts in both
+directions, every truncated prefix and changed byte, extra bytes and rehashed
+invalid fields. Provider construction/update/finish failures preserve output.
+M02c supplies state, queue and API meanings. Remaining M05 work implements
+the other exact container encoders/decoders, validates
 cross-file bindings and exercises fault I/O. The M07a2 tests compare against
 the independently calculated golden digests. A successful row test must never
 be reported as a successful integrity, replay, synchronization or crash-recovery

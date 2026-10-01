@@ -560,6 +560,41 @@ UNSAFE.md amendment/confinement workflow; no new surface is preauthorized.
 **Depends on:** M02/M04/M07. **Own:** storage I/O adapter, blob files, journal codec,
 store locking and initial replay; no search index or protocol endpoints.
 
+Split this milestone before persistence consumers begin. Pure container codecs
+need committed M07a1/M07a2 digest primitives/oracles and M07a4
+Crypto::sha256/equal_digest factory operations; they do not depend on TLS
+service activation. Each part lands independently:
+
+- **M05a1 — fixed identity and journal headers:** exact FORMAT, CURRENT and
+  journal-header codecs through the injected Crypto adapter. Check fixed extent,
+  checksums, magic/schema/flags and nonzero generation/segment numbers before
+  returning typed fields. Encoders leave caller output unchanged on returned
+  errors. Use the existing literal fixtures, every truncated prefix, changed
+  bytes, rehashed invalid fields and injected digest failures. This implements
+  only these fixed containers, not referent validation, replay or disk I/O.
+- **M05a2 — checkpoint containers:** bounded table header/record and manifest
+  codecs, full row validation, digest coverage and cross-file identity/length
+  bindings. Stream tables; keep only bounded manifest descriptors. Exercise
+  duplicate/out-of-order keys, mismatched descriptors and selected history.
+- **M05a3 — transaction frames:** exact bounded operation/header/footer codecs
+  and validated sequential frame iteration. Validate header digest before using
+  lengths; distinguish a short physical tail from full-length corrupt data.
+  Preserve operation ordinals and return no partial successful frame.
+- **M05b — private storage adapter:** trusted roots, generated paths, exclusive
+  lock, short/failing I/O, sync and non-replacing publication. Specify any new
+  syscall surface under UNSAFE.md before introducing it. Own the deterministic
+  fault-I/O model and process-death lock tests.
+- **M05c — immutable blobs:** admitted streamed temporary bodies, inline SHA-256,
+  exact size accounting and durable non-replacing publication. Couple effect
+  tickets and completion reserves; inject failures at each filesystem step.
+- **M05d — selected-store recovery:** validate CURRENT's complete selected graph,
+  replay contiguous frames, fence corruption and repair only incomplete EOF
+  tails under the lock. Do not scan for a newer unselected generation or magic.
+- **M05e — serialized commit publication:** connect reservations, complete frame
+  append/sync and atomic sequence/offset visibility. Failed sync stops writes;
+  all crash boundaries preserve acknowledged state. M08 supplies the complete
+  object transaction/reference rules before protocol mutations are enabled.
+
 Implement exclusive store access, generated private paths, streamed temporary
 blobs, digesting through the adapter, file/directory sync and journal commit.
 Use STORAGE.md publication order, admission reservations and complete-frame

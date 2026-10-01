@@ -1,7 +1,8 @@
-//! Format-v1 scalar/key/row contracts. These codecs do not validate store integrity.
-//! FORMAT.md owns the byte layout; persistence and digest checks follow in M05.
+//! Format-v1 scalar/key/row and fixed-container codecs.
+//! FORMAT.md owns the layout; selected-store validation and persistence remain M05.
 use std::fmt;
 
+pub mod container;
 pub mod key;
 pub mod row;
 pub mod scalar;

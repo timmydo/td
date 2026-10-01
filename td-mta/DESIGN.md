@@ -13,8 +13,10 @@ byte ledger; [CONFORMANCE.md](CONFORMANCE.md) inventories the unimplemented JMAP
 contract and current client calls. There are no protocol handlers or listeners.
 The M02a/M02b format module adds checked scalar/key/row codecs and literal
 format fixtures. [FORMAT.md](FORMAT.md) fixes their byte layout and the
-container registry; persistence and the remaining M02 contracts are not
-implemented by those codecs. [WIRE.md](WIRE.md) pins implemented wire-ID and
+container registry. M05a1 adds exact FORMAT, CURRENT and journal-header
+encoders/decoders with checked digests. These codecs do not validate selected
+store bindings, replay transactions or perform filesystem I/O.
+[WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.
 [API.md](API.md) defines the compiling M02c2 adapter contracts and implemented
 state codecs; [QUEUE.md](QUEUE.md) freezes future queue/restart/JMAP semantics.
