@@ -654,10 +654,19 @@ fn verify_payload(directory: &Path, name: &str, expected: &str) -> io::Result<Fi
 /// writer could serve a signed manifest to the check and a different one to the
 /// parse.
 ///
-/// `None` is every OTHER caller: `existing_bundle` and the staged readback ask
-/// about deployments td itself already published, which is a question about
-/// integrity rather than authenticity.
-fn open_bundle(directory: &Path, trust: Option<&TrustRoot>) -> io::Result<VerifiedBundle> {
+/// `None` is an install onto a volume with no trust root, and the published
+/// reads: `existing_bundle` and the staged readback ask about deployments td
+/// itself already published, which is a question about integrity rather than
+/// authenticity.
+///
+/// `names` is therefore separate from `trust`: only a source may be a mounted
+/// medium, while a published deployment is held to the exact names the boot
+/// path opens.
+fn open_bundle(
+    directory: &Path,
+    trust: Option<&TrustRoot>,
+    names: Names,
+) -> io::Result<VerifiedBundle> {
     require_absolute(directory, "deployment directory")?;
     require_real_directory(directory, "deployment directory")?;
     let manifest_path = directory.join(protocol::MANIFEST_NAME);
@@ -677,9 +686,21 @@ fn open_bundle(directory: &Path, trust: Option<&TrustRoot>) -> io::Result<Verifi
     }
     let parsed = parse_manifest(&manifest)?;
     let id = sha256::hex_digest(&manifest);
-    let kernel = verify_payload(directory, "bzImage", &parsed.kernel)?;
-    let initramfs = verify_payload(directory, "initramfs.cpio", &parsed.initramfs)?;
-    let root = verify_payload(directory, "root.erofs", &parsed.root)?;
+    let kernel = verify_payload(
+        directory,
+        &bundle_name(directory, "bzImage", names)?,
+        &parsed.kernel,
+    )?;
+    let initramfs = verify_payload(
+        directory,
+        &bundle_name(directory, "initramfs.cpio", names)?,
+        &parsed.initramfs,
+    )?;
+    let root = verify_payload(
+        directory,
+        &bundle_name(directory, "root.erofs", names)?,
+        &parsed.root,
+    )?;
     Ok(VerifiedBundle {
         id,
         manifest,
@@ -688,6 +709,45 @@ fn open_bundle(directory: &Path, trust: Option<&TrustRoot>) -> io::Result<Verifi
         initramfs,
         root,
     })
+}
+
+/// Which payload names a bundle directory may use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Names {
+    /// A deployment td published: exactly the names the boot path opens.
+    Published,
+    /// An install or validation source, which may be a mounted medium.
+    Source,
+}
+
+/// A payload's name in a bundle directory: its deployment spelling, or, for a
+/// source, the install medium's, whose ISO 9660 mount shows `bzImage` as
+/// `bzimage` (MEDIA.md), so a mounted medium is a source directory as it
+/// stands. Publication writes the deployment spelling either way.
+///
+/// Either is safe to accept because the caller verifies the bytes against the
+/// manifest's digest; a directory holding both as different files is refused
+/// rather than chosen between, so one bundle has one spelling. One file under
+/// both, as a case-insensitive filesystem shows it, is that file.
+fn bundle_name(directory: &Path, name: &str, names: Names) -> io::Result<String> {
+    let medium = media_name(name)?;
+    if names == Names::Published || medium == name {
+        return Ok(name.to_string());
+    }
+    let identity = |name: &str| match fs::symlink_metadata(directory.join(name)) {
+        Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    };
+    match (identity(name)?, identity(&medium)?) {
+        (Some(deployment), Some(source)) if deployment != source => Err(invalid(format!(
+            "source directory {} holds both {name} and {medium}",
+            directory.display()
+        ))),
+        (None, Some(_)) => Ok(medium),
+        // Absent, the open below names the deployment spelling.
+        _ => Ok(name.to_string()),
+    }
 }
 
 /// Where a bundle's detached signature lives — the one join, so nothing can
@@ -1269,7 +1329,7 @@ enum Existing {
 }
 
 fn existing_bundle(directory: &Path, want: &VerifiedBundle) -> io::Result<Existing> {
-    let found = open_bundle(directory, None)?;
+    let found = open_bundle(directory, None, Names::Published)?;
     if found.id != want.id {
         return Ok(Existing::Different);
     }
@@ -1473,7 +1533,7 @@ fn publish_bundle(
     }
     sync_directory(&staging)?;
 
-    let staged = open_bundle(&staging, None)?;
+    let staged = open_bundle(&staging, None, Names::Published)?;
     if staged.id != bundle.id {
         return Err(invalid(format!(
             "staged deployment id {} changed from verified source {}",
@@ -1686,7 +1746,7 @@ fn install_deployment(root: &Path, source: &Path, trust: Option<&TrustRoot>) -> 
     // checking around the call is what satisfies both halves of DESIGN §10 item
     // 6 at once: refuse before anything interprets the bundle, and read the
     // manifest exactly ONCE.
-    let bundle = open_bundle(source, trust)?;
+    let bundle = open_bundle(source, trust, Names::Source)?;
     let candidate = bundle.id.clone();
     let selection = match select_deployment(root) {
         Ok(selection) => Some(selection),
@@ -3337,7 +3397,7 @@ fn run_validate_source(
     out: &mut dyn Write,
 ) -> io::Result<()> {
     let trust = read_trusted_key(trusted_key)?;
-    let bundle = open_bundle(directory, Some(&trust))?;
+    let bundle = open_bundle(directory, Some(&trust), Names::Source)?;
     writeln!(out, "{}", bundle.id)
 }
 
@@ -4463,7 +4523,11 @@ mod tests {
         // `VerifiedBundle` holds open files and is deliberately not `Debug`.
         let refusal = |r: io::Result<VerifiedBundle>| r.map(|_| ()).unwrap_err().to_string();
 
-        let error = refusal(open_bundle(&source, Some(&fixture.wrong_key())));
+        let error = refusal(open_bundle(
+            &source,
+            Some(&fixture.wrong_key()),
+            Names::Source,
+        ));
         assert!(
             error.contains(protocol::MANIFEST_UNAUTHENTICATED),
             "authenticity must be decided before the payloads are read: {error}"
@@ -4472,7 +4536,7 @@ mod tests {
         // The same source with no trust root gets as far as the payloads, which
         // is what proves the assertion above is about ORDER and not about the
         // payloads being unreachable anyway.
-        let untrusted = refusal(open_bundle(&source, None));
+        let untrusted = refusal(open_bundle(&source, None, Names::Source));
         assert!(
             untrusted.contains("bzImage"),
             "without a trust root the payloads are what fails: {untrusted}"
@@ -5449,7 +5513,7 @@ mod tests {
             "128 hex characters and a newline, with slack for a trailing CRLF"
         );
         fs::write(&path, vec![b'a'; 160]).unwrap();
-        let bundle = open_bundle(&source, None).unwrap();
+        let bundle = open_bundle(&source, None, Names::Source).unwrap();
         assert_eq!(
             bundle.signature.as_deref(),
             Some(&vec![b'a'; 160][..]),
@@ -5458,7 +5522,9 @@ mod tests {
         // And one byte more is not.
         fs::write(&path, vec![b'a'; 161]).unwrap();
         assert!(
-            open_bundle(&source, None).map(|_| ()).is_err(),
+            open_bundle(&source, None, Names::Source)
+                .map(|_| ())
+                .is_err(),
             "one past the bound"
         );
     }
@@ -5527,7 +5593,7 @@ mod tests {
             vec![b'a'; (protocol::MAX_SIGNATURE_BYTES + 1) as usize],
         )
         .unwrap();
-        let error = refusal(open_bundle(&source, None));
+        let error = refusal(open_bundle(&source, None, Names::Source));
         assert!(
             error.to_string().contains("deployment signature"),
             "{error}"
@@ -5535,7 +5601,7 @@ mod tests {
 
         fs::remove_file(&path).unwrap();
         symlink("manifest", &path).unwrap();
-        let error = refusal(open_bundle(&source, None));
+        let error = refusal(open_bundle(&source, None, Names::Source));
         assert!(
             error.to_string().contains("must be a real regular file"),
             "a symlinked signature must be refused, got {error}"
@@ -5543,7 +5609,7 @@ mod tests {
 
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
-        let error = refusal(open_bundle(&source, None));
+        let error = refusal(open_bundle(&source, None, Names::Source));
         assert!(
             error.to_string().contains("must be a real regular file"),
             "a directory must be refused, got {error}"
@@ -5557,7 +5623,7 @@ mod tests {
         fixture.selector("current", &current);
         fixture.selector("previous", &current);
         let (source, previous) = fixture.source_bundle("previous", "previous");
-        let bundle = open_bundle(&source, None).unwrap();
+        let bundle = open_bundle(&source, None, Names::Source).unwrap();
         publish_bundle(&fixture.root, bundle, false).unwrap();
         replace_selector(&fixture.root, "previous", &previous).unwrap();
         let attempts = attempts_directory(&fixture.root, true).unwrap().unwrap();
@@ -7718,6 +7784,82 @@ mod tests {
             error.to_string().contains("no deployment signature"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_mounted_medium_is_a_source_directory_as_it_stands() {
+        let fixture = Fixture::new();
+        let (medium, id) = media_bundle(&fixture);
+        let bundle = open_bundle(&medium, Some(&fixture.key()), Names::Source).unwrap();
+        assert_eq!(bundle.id, id);
+        assert!(open_bundle(&medium, Some(&fixture.wrong_key()), Names::Source).is_err());
+
+        // The medium's spelling is held to the manifest like the other.
+        let kernel = medium.join("bzimage");
+        let original = fs::read(&kernel).unwrap();
+        fs::write(&kernel, b"tampered").unwrap();
+        let error = open_bundle(&medium, Some(&fixture.key()), Names::Source)
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("bzimage hash mismatch"),
+            "{error}"
+        );
+        fs::write(&kernel, &original).unwrap();
+
+        // Both spellings as two files are refused, even both intact; one file
+        // under both names, as a case-insensitive filesystem shows it, is not.
+        fs::hard_link(&kernel, medium.join("bzImage")).unwrap();
+        assert_eq!(
+            open_bundle(&medium, Some(&fixture.key()), Names::Source)
+                .unwrap()
+                .id,
+            id
+        );
+        fs::remove_file(medium.join("bzImage")).unwrap();
+        fs::write(medium.join("bzImage"), &original).unwrap();
+        let error = open_bundle(&medium, Some(&fixture.key()), Names::Source)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("holds both"), "{error}");
+        fs::remove_file(&kernel).unwrap();
+        assert_eq!(
+            open_bundle(&medium, Some(&fixture.key()), Names::Source)
+                .unwrap()
+                .id,
+            id
+        );
+
+        // Neither: the refusal names the deployment spelling.
+        fs::remove_file(medium.join("bzImage")).unwrap();
+        let error = open_bundle(&medium, Some(&fixture.key()), Names::Source)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("bzImage"), "{error}");
+    }
+
+    #[test]
+    fn a_medium_source_publishes_under_the_names_the_boot_path_opens() {
+        let fixture = Fixture::new();
+        let (medium, id) = media_bundle(&fixture);
+        assert_eq!(
+            install_deployment(&fixture.root, &medium, Some(&fixture.key())).unwrap(),
+            id
+        );
+        let published = fixture.root.join(protocol::DEPLOYMENTS_DIR).join(&id);
+        assert!(published.join("bzImage").is_file());
+        assert!(!published.join("bzimage").exists());
+        assert_eq!(verify_deployment(&fixture.root, &id).unwrap().id, id);
+
+        // A published deployment is held to the boot path's names: one that
+        // holds only the medium's spelling is not the deployment to keep.
+        fs::rename(published.join("bzImage"), published.join("bzimage")).unwrap();
+        assert!(verify_deployment(&fixture.root, &id).is_err());
+        // Pinned at the classifier: as `current` it is refused earlier, but an
+        // inactive one would otherwise read as already published and be kept.
+        let want = open_bundle(&medium, Some(&fixture.key()), Names::Source).unwrap();
+        assert!(existing_bundle(&published, &want).is_err());
+        assert!(install_deployment(&fixture.root, &medium, Some(&fixture.key())).is_err());
     }
 
     #[test]

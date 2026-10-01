@@ -247,7 +247,13 @@ Install media carry the signed deployment in the ISO root as `BZIMAGE`,
 (`td-boot/src/protocol.rs` `MEDIA_DEPLOYMENT_FILES`). Linux mounts the medium
 `ro,nodev,nosuid,noexec` with ISO-9660 `map=normal`, which shows those names in
 lowercase. td-boot reads the lowercase names, so `bzImage` is `bzimage` on the
-medium; nothing copies or renames a payload.
+medium, and a live boot copies or renames no payload. Its source reader,
+behind `validate-source`, `install` and `publish`, also accepts `bzimage` for
+`bzImage` (the one name the mount changes) and refuses a directory holding
+both as different files, so the mounted medium is a source directory as it
+stands; the bytes are verified against the manifest whichever name they came
+from, and publication writes `bzImage`. A published deployment is still read
+only under its own names.
 
 td-boot identifies the medium by its primary volume descriptor: type 1,
 `CD001`, version 1 and the space-padded volume identifier `TD_INSTALL`, at

@@ -1211,6 +1211,8 @@ for an absolute deployment directory and an explicitly supplied public key.
 It uses the publisher's existing bundle verifier: require and authenticate
 the bounded manifest/signature, parse the same authenticated manifest bytes,
 then open and stream-hash `bzImage`, `initramfs.cpio` and `root.erofs`.
+A source may spell the kernel `bzimage`, as a mounted install medium does
+(MEDIA.md); a directory holding both spellings as different files refuses.
 Symlink and special-file payloads refuse. Stdout is exactly the manifest's
 deployment ID and a newline after every payload succeeds; validation failure
 emits no ID. The operation creates no staging tree, lock, selector or mount
