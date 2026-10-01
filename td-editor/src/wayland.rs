@@ -362,6 +362,7 @@ impl Window {
         self.frames
             .invalidate(self.spelling.observe(self.ui.editor()));
         self.observe_control_jobs();
+        self.underline_link();
         result
     }
 
@@ -675,6 +676,22 @@ impl Window {
         }
         let extend = held.shift;
         self.decoded_pointer_action(phase, self.pointer.x, self.pointer.y, extend)
+    }
+
+    /// Points the underline at the link under the pointer while Control
+    /// is held over the surface, the window focused, where a Control-press
+    /// would follow it: no menu open and no prompt taking the pointer.
+    fn underline_link(&mut self) {
+        let held = self.client.entered().is_some() && self.client.input().held().control;
+        let at = (held && self.menu.is_none() && !self.pointer_modal()).then(|| {
+            (
+                i64::from(self.pointer.x).div_euclid(256),
+                i64::from(self.pointer.y).div_euclid(256),
+            )
+        });
+        if self.ui.hover_link(at) {
+            self.frames.invalidate(true);
+        }
     }
 
     /// A Control-press over a link in the active document's text opens it
@@ -2865,6 +2882,8 @@ impl Window {
 
     fn draw(&mut self) -> Result<()> {
         self.sync_prompt_layout()?;
+        // A remote command or a timer may have opened what takes the press.
+        self.underline_link();
         self.control_input_health()?;
         self.frames.generation().map_err(error)?;
         if !self.frames.is_dirty() || !self.client.can_present() {
@@ -5388,6 +5407,83 @@ mod tests {
             },
             "a first click, not a word"
         );
+    }
+
+    /// The link a Control-press would follow is underlined while Control
+    /// is held over it, and not once Control, the pointer or the focus
+    /// goes, or a menu or a prompt takes the press. A change of the
+    /// underline is the window's input change, as other native ones are;
+    /// motion over the same link is none.
+    #[test]
+    fn control_held_over_a_link_underlines_it_where_a_press_would_follow() {
+        let (mut w, _peer, keyboard, _device) = clipboard_fixture();
+        w.ui = Controller::default();
+        // A link on every line: a prompt that moves the text down still
+        // leaves one under the point.
+        w.ui.dispatch(Event::Load(
+            "see https://e.example/x now\n".repeat(12).as_bytes(),
+        ))
+        .unwrap();
+        let area = w.ui.geometry().document();
+        let s = w.ui.geometry().scale().value() as i64;
+        let glyph = |column: i64| (area.x + (column * 8 + 3) * s, area.y + 8 * s);
+        let link = Some(4..23);
+        pointer_enter(&mut w);
+        let (x, y) = glyph(15);
+        pointer_move(&mut w, x, y);
+        assert_eq!(w.ui.hovered_link(), None, "Control is not held");
+        let generation = w.ui.generation();
+        let input = w.frames.input_generation().unwrap();
+        w.event(message(keyboard, 4, &[3, 4, 0, 0, 0])).unwrap();
+        assert_eq!(w.ui.hovered_link(), link);
+        assert!(w.frames.is_dirty());
+        let input = {
+            let after = w.frames.input_generation().unwrap();
+            assert!(after > input, "the underline moved the input generation");
+            after
+        };
+        pointer_move(&mut w, glyph(16).0, y);
+        assert_eq!(w.frames.input_generation().unwrap(), input, "the same link");
+        pointer_move(&mut w, glyph(1).0, y);
+        assert_eq!(w.ui.hovered_link(), None);
+        pointer_move(&mut w, glyph(10).0, y);
+        assert_eq!(w.ui.hovered_link(), link);
+        // A menu takes the press, so nothing is underlined under it.
+        w.open_menu(crate::menu::Group::Edit).unwrap();
+        pointer_move(&mut w, glyph(11).0, y);
+        assert_eq!(w.ui.hovered_link(), None);
+        w.menu = None;
+        pointer_move(&mut w, glyph(12).0, y);
+        assert_eq!(w.ui.hovered_link(), link);
+        // Underlining is not an edit of the controller's.
+        assert_eq!(w.ui.generation(), generation);
+        // A prompt opened by a key takes the press; the draw that follows
+        // finds it without another Wayland event, and its end restores.
+        let low = Some(10 * 28 + 4..10 * 28 + 23);
+        pointer_move(&mut w, x, area.y + (10 * 16 + 8) * s);
+        assert_eq!(w.ui.hovered_link(), low);
+        w.chord("C-f", false).unwrap();
+        assert!(w.search.is_some());
+        w.draw().unwrap();
+        assert_eq!(w.ui.hovered_link(), None);
+        w.chord("Escape", false).unwrap();
+        assert!(w.search.is_none());
+        w.draw().unwrap();
+        assert_eq!(w.ui.hovered_link(), low);
+        pointer_move(&mut w, x, y);
+        // Control let go, the pointer leaving and focus lost each end it.
+        w.event(message(keyboard, 4, &[4, 0, 0, 0, 0])).unwrap();
+        assert_eq!(w.ui.hovered_link(), None);
+        w.event(message(keyboard, 4, &[5, 4, 0, 0, 0])).unwrap();
+        assert_eq!(w.ui.hovered_link(), link);
+        let pointer = w.client.pointer().unwrap();
+        w.event(message(pointer, 1, &[20, SURFACE])).unwrap();
+        assert_eq!(w.ui.hovered_link(), None);
+        pointer_enter(&mut w);
+        pointer_move(&mut w, x, y);
+        assert_eq!(w.ui.hovered_link(), link);
+        w.event(message(keyboard, 2, &[6, SURFACE])).unwrap();
+        assert_eq!(w.ui.hovered_link(), None);
     }
 
     #[test]

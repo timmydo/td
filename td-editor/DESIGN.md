@@ -228,7 +228,14 @@ the controller's: the native adapter asks the read-only
 `Controller::link_at` for the link under the glyph (none under the
 status row or a scrollbar) and dispatches only `CancelPointer`, so caret,
 selection and drag stay and the next press is a first click; elsewhere
-it is a plain press. Remote control has no Control-press. A drag remains
+it is a plain press. While Control is held over the surface, the
+focused window hands `Controller::hover_link` the pointer where such a
+press would follow, none under a menu or a prompt, and the scene
+underlines the link `link_at` finds there; the point is not an edit and
+moves no controller generation. A change of the underline is the
+window's input and redraw change, as other native presentation changes
+are, so a remote request fenced on the input generation before it is
+refused as stale. Remote control has no Control-press. A drag remains
 anchored to its starting tab and byte,
 clamps out-of-surface motion to the viewport edges, and ends on release.
 There is no drag autoscroll yet. Blank rows below EOF select document end.

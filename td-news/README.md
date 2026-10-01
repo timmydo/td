@@ -99,7 +99,7 @@ shows and draw in the toolkit's palette.
 - The wheel moves the selection, or scrolls the article
 - A drag in the article selects text, and `Ctrl-C` copies it
 - A Ctrl-click on a link in the article or the help opens it in the
-  browser
+  browser; holding Ctrl over one underlines it
 
 ## Cache
 

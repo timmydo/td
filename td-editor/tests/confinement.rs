@@ -850,6 +850,17 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
         .unwrap();
     assert!(follow.contains("self.ui.link_at(") && follow.contains("td_ui::open::link("));
     assert!(!follow.contains("dispatch(") && !follow.contains("Event::"));
+    // The underline a held Control shows is no input of the controller's:
+    // it only points the scene at a pixel.
+    let underline = production
+        .split("fn underline_link(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
+    assert!(underline.contains("self.ui.hover_link(at)"));
+    assert!(!underline.contains("dispatch(") && !underline.contains("Event::"));
     assert!(
         dispatch.find("request.is_mutating()").unwrap()
             < dispatch.find("Operation::Open(path)").unwrap()

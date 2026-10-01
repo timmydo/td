@@ -575,6 +575,20 @@ impl Pane {
         document.text().get(range).map(str::to_owned)
     }
 
+    /// Points the underline at the link under the pointer's pixel, or at
+    /// none: whether the underlined link changed.
+    pub fn hover(&mut self, at: Option<(i64, i64)>) -> bool {
+        self.controller.hover_link(at)
+    }
+
+    /// The link underlined in the shown document.
+    #[cfg(test)]
+    pub fn hovered(&self) -> Option<String> {
+        let range = self.controller.hovered_link()?;
+        let document = self.controller.editor().document(self.tab?).ok()?;
+        document.text().get(range).map(str::to_owned)
+    }
+
     pub fn cancel_pointer(&mut self) {
         self.drag = false;
         self.event(Event::CancelPointer);

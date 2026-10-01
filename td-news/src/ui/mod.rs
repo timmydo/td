@@ -248,6 +248,9 @@ struct App {
     pane_text: PaneText,
     /// Whether a press in the pane began a drag the pane still receives.
     pane_drag: bool,
+    /// Where the window last said Control is held over: the pane
+    /// underlines the link a Control-press there would follow.
+    hover: Option<(i64, i64)>,
     /// The selection a copy chord asked to put on the window's
     /// clipboard, offered once the chord is handled, while it is still
     /// being delivered.
@@ -330,6 +333,7 @@ impl App {
             pane_tab: None,
             pane_text: PaneText::None,
             pane_drag: false,
+            hover: None,
             copy: None,
             note: None,
         })
@@ -521,10 +525,12 @@ impl App {
                 }
             }
             Input::Wheel { rows, .. } if self.mouse_config => self.wheel(rows),
+            Input::Hover(at) => self.hover = at,
             // Nothing here is editable: a paste has nowhere to go, and
             // the reader asks for none.
             Input::Pointer { .. } | Input::Wheel { .. } | Input::Paste(_) => {}
         }
+        self.underline_link();
         self.quitting
     }
 
@@ -1101,6 +1107,25 @@ impl App {
         }
     }
 
+    /// Points the pane's underline at the link under the hover point,
+    /// where a Control-press would follow it (`follow_link`): with the
+    /// mouse on, in an article's or the help's text in the pane.
+    fn underline_link(&mut self) {
+        let open = self.mouse_config && matches!(self.view, View::Article | View::Help);
+        let mut at = self.hover.filter(|_| open);
+        if let Some((x, y)) = at {
+            let layout = self.layout();
+            if layout.pane.is_some_and(|rect| rect.contains(x, y)) {
+                self.place_pane(&layout);
+            } else {
+                at = None;
+            }
+        }
+        if self.pane.hover_link(at) {
+            self.pending_redraw = true;
+        }
+    }
+
     /// A Control-press over a link (`td_ui::links`) in the pane's text
     /// opens it in the browser and is no press of the pane's, so the caret,
     /// the selection and a drag are untouched: whether it was over one.
@@ -1338,8 +1363,15 @@ impl App {
 
     /// Lays the frame out: the lists reveal their selections, with the
     /// configured rows kept shown past each, the pane is placed and holds
-    /// what the view shows. Before every paint and every read of the frame.
+    /// what the view shows, underlined where Control is held over a link.
+    /// Before every paint and every read of the frame.
     fn prepare_frame(&mut self) {
+        self.lay_out();
+        // The frame may show another view or layout than the input did.
+        self.underline_link();
+    }
+
+    fn lay_out(&mut self) {
         let layout = self.layout();
         if let Some(list) = layout.list {
             let margin = self.scrolloff;
@@ -3041,6 +3073,84 @@ pub(super) mod tests {
         pointer(&mut app, at.0, at.1, true);
         assert!(app.status.is_empty(), "{}", app.status);
         assert_ne!(selection(&app), before, "a plain press");
+    }
+
+    /// While Control is held over a link in an opened article the pane
+    /// underlines the link a Control-press there would follow, asking a
+    /// redraw only when what is underlined changes; off it, outside the
+    /// pane, with the mouse off or in the log, nothing is.
+    #[test]
+    fn control_held_over_a_link_underlines_it_where_a_press_would_follow() {
+        let dir = tempdir().expect("tempdir");
+        let cache = Cache::open_at(dir.path().join("test.tdkv")).expect("cache");
+        seed_cache(&cache, false);
+        let config = test_config();
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let mut app = App::new(&config, &cache, true).expect("app");
+        for chord in ["Down", "Down", "Return", "Return"] {
+            let input = Input::Key {
+                chord,
+                repeat: false,
+            };
+            app.input(input, &cache, &cmd_tx);
+        }
+        assert_eq!(app.view, View::Article);
+        app.prepare_frame();
+        let points = |app: &App| -> Vec<(i64, i64)> {
+            let rect = app.layout().pane.expect("a pane");
+            (0..i64::from(rect.height))
+                .step_by(4)
+                .flat_map(|dy| {
+                    (0..i64::from(rect.width))
+                        .step_by(4)
+                        .map(move |dx| (rect.x + dx, rect.y + dy))
+                })
+                .collect()
+        };
+        let (tab, revision) = app.pane_target().expect("the article");
+        let (on, off): (Vec<_>, Vec<_>) = points(&app)
+            .into_iter()
+            .partition(|&(x, y)| matches!(app.pane.link_at(tab, revision, x, y), Ok(Some(_))));
+        assert!(on.len() > 1, "the link is shown");
+        let link = app.pane.link_at(tab, revision, on[0].0, on[0].1).unwrap();
+        let hover = |app: &mut App, at: Option<(i64, i64)>| {
+            app.pending_redraw = false;
+            app.input(Input::Hover(at), &cache, &cmd_tx);
+            app.pending_redraw
+        };
+        assert!(hover(&mut app, Some(on[0])));
+        assert_eq!(app.pane.hovered_link(), link);
+        assert!(!hover(&mut app, Some(on[1])), "the same link");
+        assert!(hover(&mut app, Some(off[0])));
+        assert_eq!(app.pane.hovered_link(), None);
+        assert!(hover(&mut app, Some(on[0])));
+        let rect = app.layout().pane.expect("a pane");
+        assert!(hover(&mut app, Some((rect.x, rect.y - 1))));
+        assert_eq!(app.pane.hovered_link(), None, "outside the pane");
+        assert!(hover(&mut app, Some(on[0])));
+        assert!(hover(&mut app, None));
+        assert_eq!(app.pane.hovered_link(), None);
+        // With the mouse off a press follows nothing, so nothing shows.
+        app.mouse_config = false;
+        assert!(!hover(&mut app, Some(on[0])));
+        // Turned on between inputs, the frame finds the point again.
+        app.mouse_config = true;
+        app.prepare_frame();
+        assert_eq!(app.pane.hovered_link(), link);
+        // The log's lines are cut at the pane's width: none is followed,
+        // so none is underlined.
+        assert!(hover(&mut app, None));
+        app.view = View::Log;
+        app.set_pane_text(PaneText::NoArticle, "fetch https://e.example/log\n");
+        let layout = app.layout();
+        app.place_pane(&layout);
+        let (tab, revision) = app.pane_target().expect("the log");
+        let at = points(&app)
+            .into_iter()
+            .find(|&(x, y)| matches!(app.pane.link_at(tab, revision, x, y), Ok(Some(_))))
+            .expect("the log's link is shown");
+        assert!(!hover(&mut app, Some(at)));
+        assert_eq!(app.pane.hovered_link(), None);
     }
 
     /// `[ui].scrolloff` keeps that many rows shown past the selection as it

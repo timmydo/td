@@ -323,6 +323,7 @@ pub struct Scene<'a> {
     caret: Option<Position>,
     spelling: &'a [std::ops::Range<usize>],
     spelling_status: Option<String>,
+    link: Option<std::ops::Range<usize>>,
     notice: Option<&'a str>,
     scrollbars: [Option<Scrollbar>; 2],
 }
@@ -419,6 +420,7 @@ impl<'a> Scene<'a> {
             caret,
             spelling: &[],
             spelling_status: None,
+            link: None,
             notice: None,
             scrollbars,
         })
@@ -431,6 +433,13 @@ impl<'a> Scene<'a> {
         let (status, marks) = state.view(self.editor);
         self.spelling_status = Some(status);
         self.spelling = marks;
+        self
+    }
+
+    /// The link a Control-press would follow, in the active document's
+    /// bytes, underlined in the ink of its glyphs.
+    pub(crate) fn link(mut self, link: Option<std::ops::Range<usize>>) -> Self {
+        self.link = link;
         self
     }
 
@@ -672,6 +681,26 @@ impl<'a> Scene<'a> {
                                 PAPER
                             } else {
                                 MISSPELLED
+                            },
+                        },
+                    });
+                }
+                if self.link.as_ref().is_some_and(|range| {
+                    range.start <= cell.bytes.start && cell.bytes.end <= range.end
+                }) {
+                    sink(Draw {
+                        clip,
+                        primitive: Primitive::Fill {
+                            rect: Rect {
+                                x,
+                                y: y + ch as i64 - s as i64,
+                                width: (cell.width * cw) as u32,
+                                height: s as u32,
+                            },
+                            color: if selected && self.view.focused {
+                                PAPER
+                            } else {
+                                INK
                             },
                         },
                     });

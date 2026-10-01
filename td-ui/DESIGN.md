@@ -1563,12 +1563,17 @@ press, and `follow`, Control held at the press, as the keyboard's
 synchronized modifier state reports them while the window has focus;
 `CancelPointer` when the pointer leaves or the
 device goes while the button is held, so the handler ends a drag
-without a release; `Wheel` in cell rows and columns as `pointer::Wheel`
-accumulates a frame; `Resize` with the `Surface` the handler lays out
-for; `Focus` and `Close`. Motion is delivered only while the button is
-held, so a handler without drags sees no motion stream; a second press
-while held, a release without a press and every other button are
-nothing.
+without a release; `Hover` with the pointer's position while Control is
+held, by that same state, and the pointer has entered the surface (a
+held button's grab keeps it entered through travel past an edge), and
+`None` once either ends, delivered on a change only, button held or
+not, so a handler marks the link a Control-press there would follow;
+`Wheel` in cell rows and columns as `pointer::Wheel` accumulates a
+frame; `Resize` with the `Surface` the handler lays out for; `Focus`
+and `Close`. Motion is delivered as `Pointer` only while the button is
+held and as `Hover` only while Control is, so a handler without drags
+sees no motion stream until Control is held; a second press while held,
+a release without a press and every other button are nothing.
 
 The loop, turn by turn: on `Bound` the window sets the title and app id,
 commits, and hands the handler the default `Resize`; on `Configure` it
@@ -2095,6 +2100,29 @@ answers: a press over a link opens it and is not the document's press,
 so the caret, the selection and a drag are untouched; a press anywhere
 else is a plain press. A followed press also ends a click sequence, so
 the next press is a first click.
+
+While Control is held with the pointer over the window, the link a
+Control-press there would follow is underlined, so a person sees what
+will open before pressing. The widget window reports the pointer as
+`Input::Hover` and td-editor's native window reads its own; each program
+hands the controller the point (`Controller::hover_link`) only where a
+press would reach the pane and follow (no menu, finder or prompt taking
+the press, the mouse on in td-mail's and td-news's configuration, and in
+td-news an article or the help), and none otherwise. The controller
+keeps the point, not the link, and its scene underlines the link
+`link_at` finds there in the text it draws, a one-pixel-per-scale rule
+along the cells' last row in the glyphs' ink, so text that changes or
+scrolls under a still pointer is underlined as it now is. The point
+moves no caret, selection or controller generation; `hover_link`
+answers whether the link under the new point differs from the one under
+the old, both in the text as it is now, and only then does the program
+redraw (a change of the text is its own redraw). It keeps the link it
+found with the generation, tab and revision it found it at, so each
+point the pointer moves to walks the layout once, as a drag's motion
+does, and a scene of the same state walks it for none. The underline
+also shows while the button is held, where no press can begin until
+the release; hiding it there would flicker it off and on under every
+Control-click. td-term does not underline yet.
 
 `open::link` refuses anything that is not one link whole
 (`links::whole`, the same rule without the press's bound, so a link

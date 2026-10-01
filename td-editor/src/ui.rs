@@ -185,6 +185,18 @@ pub struct Controller {
     clock: u64,
     blink_start: u64,
     generation: u64,
+    /// The surface pixel whose link the scene underlines (`hover_link`).
+    hover: Hover,
+}
+
+/// The point `hover_link` was last given and the link `link_at` found
+/// under it at `key`: the generation, active tab and revision, so motion
+/// walks the layout once per point and a scene of the same state none.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Hover {
+    at: Option<(i64, i64)>,
+    key: Option<(u64, TabId, u64)>,
+    link: Option<std::ops::Range<usize>>,
 }
 
 impl Default for Controller {
@@ -204,6 +216,7 @@ impl Default for Controller {
             clock: 0,
             blink_start: 0,
             generation: 0,
+            hover: Hover::default(),
         }
     }
 }
@@ -303,6 +316,46 @@ impl Controller {
         });
         Ok(cell.and_then(|cell| td_ui::links::at(doc.text(), cell.bytes.start)))
     }
+    /// Points the underline at the link under the surface pixel `x`, `y`
+    /// in the active tab's text, or at none: the host's pointer while
+    /// Control is held, so the link a Control-press would follow shows
+    /// before the press. Whether the link under `at` differs from the one
+    /// under the point before, both in the text as it is now: a change
+    /// of the text under a still point is that change's own redraw. The
+    /// generation does not move.
+    pub fn hover_link(&mut self, at: Option<(i64, i64)>) -> bool {
+        if at == self.hover.at {
+            return false;
+        }
+        let before = self.hovered_link();
+        let link = self.link_under(at);
+        let changed = link != before;
+        self.hover = Hover {
+            at,
+            key: self.hover_key(),
+            link,
+        };
+        changed
+    }
+    /// The link `hover_link` points at, as `link_at` finds it in the
+    /// active tab's text now.
+    pub fn hovered_link(&self) -> Option<std::ops::Range<usize>> {
+        match self.hover_key() {
+            Some(key) if self.hover.key == Some(key) => self.hover.link.clone(),
+            _ => self.link_under(self.hover.at),
+        }
+    }
+    fn hover_key(&self) -> Option<(u64, TabId, u64)> {
+        let tab = self.editor.active()?;
+        let revision = self.editor.document(tab).ok()?.revision();
+        Some((self.generation, tab, revision))
+    }
+    fn link_under(&self, at: Option<(i64, i64)>) -> Option<std::ops::Range<usize>> {
+        let (x, y) = at?;
+        let tab = self.editor.active()?;
+        let revision = self.editor.document(tab).ok()?.revision();
+        self.link_at(tab, revision, x, y).ok().flatten()
+    }
     pub fn scene<'a>(&'a self, labels: &'a [Label<'a>]) -> Result<Scene<'a>> {
         let mut view = View {
             focused: self.focused,
@@ -317,14 +370,15 @@ impl Controller {
             view.affinity = state.affinity;
             cached_metrics = Some(state.metrics);
         }
-        Scene::with_metrics(
+        Ok(Scene::with_metrics(
             &self.editor,
             self.geometry,
             view,
             labels,
             self.keys.profile(),
             cached_metrics,
-        )
+        )?
+        .link(self.hovered_link()))
     }
 
     /// Successful commands conservatively dirty the window. Ignored input and

@@ -269,6 +269,9 @@ struct Session {
     /// Whether the finder lists names beginning `.`, Ctrl-H's toggle,
     /// kept for the next finder.
     attach_hidden: bool,
+    /// Where the window last said Control is held over: the pane
+    /// underlines the link a Control-press there would follow.
+    hover: Option<(i64, i64)>,
 }
 
 impl Session {
@@ -302,6 +305,7 @@ impl Session {
             chooser: None,
             attach_folder: None,
             attach_hidden: false,
+            hover: None,
         };
         // The window reads the title at binding, before any poll.
         session.refresh_title();
@@ -563,7 +567,9 @@ impl Session {
                 }
                 return false;
             }
-            Input::Focus(_) | Input::Paste(_) | Input::CancelPointer => return false,
+            Input::Focus(_) | Input::Paste(_) | Input::CancelPointer | Input::Hover(_) => {
+                return false
+            }
         };
         let pointed = matches!(input, Input::Pointer { .. } | Input::Wheel { .. });
         if pointed && !self.mouse {
@@ -1175,7 +1181,11 @@ impl Session {
             },
             Input::Focus(false) => menus::Event::FocusLost,
             Input::Resize(surface) => menus::Event::Resize(surface),
-            Input::Focus(true) | Input::Close | Input::Paste(_) | Input::CancelPointer => {
+            Input::Focus(true)
+            | Input::Close
+            | Input::Paste(_)
+            | Input::CancelPointer
+            | Input::Hover(_) => {
                 return false;
             }
         };
@@ -1229,6 +1239,30 @@ impl Session {
             Flow::Continue
         } else {
             Flow::Quit
+        }
+    }
+
+    /// Points the pane's underline at the link under the hover point,
+    /// where a Control-press would reach the pane and follow it: with the
+    /// mouse on, no dropdown or finder over the frame, and the pane not
+    /// asking about its draft.
+    fn underline_link(&mut self) {
+        let open = self.mouse && self.menu.is_none() && self.chooser.is_none();
+        let at = self.hover.filter(|_| open);
+        let rect = at.and_then(|(x, y)| {
+            let rect = self
+                .shape()?
+                .layout
+                .pane
+                .filter(|rect| rect.contains(x, y))?;
+            let asking = self.editing(true) && !self.editing(false);
+            (!asking).then_some(rect)
+        });
+        if let Some(rect) = rect {
+            self.pane.place(rect, self.surface);
+        }
+        if self.pane.hover(rect.and(at)) {
+            self.redraw();
         }
     }
 
@@ -1316,10 +1350,16 @@ impl Session {
     }
 
     /// Lays the frame out: the list reveals its selection, the entry its
-    /// caret, the pane is placed and shows the view's document, and the
-    /// title is the view's. Before every paint and every read of the
-    /// frame.
+    /// caret, the pane is placed and shows the view's document, underlined
+    /// where Control is held over a link, and the title is the view's.
+    /// Before every paint and every read of the frame.
     fn prepare_frame(&mut self) {
+        self.lay_out();
+        // The frame may show another view or layout than the input did.
+        self.underline_link();
+    }
+
+    fn lay_out(&mut self) {
         self.refresh_title();
         let surface = self.surface;
         let Some(slot) = self.stack.top_mut() else {
@@ -1479,6 +1519,7 @@ impl Handler for Session {
                     }
                 }
                 Input::CancelPointer => self.pane.cancel_pointer(),
+                Input::Hover(at) => self.hover = at,
                 Input::Wheel { rows, .. } => {
                     if self.mouse {
                         self.wheel(rows);
@@ -1493,6 +1534,7 @@ impl Handler for Session {
         self.serve(clipboard);
         self.settle_close();
         self.refresh_title();
+        self.underline_link();
         if self.quitting {
             Flow::Quit
         } else {
@@ -1894,18 +1936,9 @@ mod frame_tests {
         }
     }
 
-    /// A Control-press on a link in a message opens it through the
-    /// configured browser, the note saying what the opener answered, and
-    /// is no press of the pane's: the caret stays. Off a link it is a
-    /// plain press, as a press without Control on the link is.
-    #[test]
-    fn a_control_press_on_a_link_opens_it_and_elsewhere_is_a_plain_press() {
-        let (mut session, _cmd_rx, resp_tx) = session(true);
-        // A browser that cannot start: the test opens nothing.
-        let browser = "/nonexistent/td-mail-browser";
-        // Past the pane's columns: the wrap must not break it.
-        const LONG: &str = "https://e.example/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        session.setup.browser = Some(browser.to_string());
+    /// Pushes a message's view and answers its body with `preview`, so
+    /// the pane shows it.
+    fn show_message(session: &mut Session, resp_tx: &Sender<BackendResponse>, preview: String) {
         let view = views::email_view::EmailView::new(
             session.cmd_tx.clone(),
             "me@example.com".to_string(),
@@ -1929,7 +1962,7 @@ mod frame_tests {
             subject: Some("Hello".to_string()),
             received_at: Some("2025-01-01".to_string()),
             sent_at: None,
-            preview: Some(format!("see https://e.example/x now {LONG} end")),
+            preview: Some(preview),
             text_body: None,
             html_body: None,
             body_values: std::collections::HashMap::new(),
@@ -1947,6 +1980,25 @@ mod frame_tests {
             })
             .unwrap();
         session.poll(0);
+    }
+
+    /// A Control-press on a link in a message opens it through the
+    /// configured browser, the note saying what the opener answered, and
+    /// is no press of the pane's: the caret stays. Off a link it is a
+    /// plain press, as a press without Control on the link is.
+    #[test]
+    fn a_control_press_on_a_link_opens_it_and_elsewhere_is_a_plain_press() {
+        let (mut session, _cmd_rx, resp_tx) = session(true);
+        // A browser that cannot start: the test opens nothing.
+        let browser = "/nonexistent/td-mail-browser";
+        // Past the pane's columns: the wrap must not break it.
+        const LONG: &str = "https://e.example/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        session.setup.browser = Some(browser.to_string());
+        show_message(
+            &mut session,
+            &resp_tx,
+            format!("see https://e.example/x now {LONG} end"),
+        );
         let text = session.shown();
         assert!(text.contains("https://e.example/x"), "{text}");
         let rect = session.shape().unwrap().layout.pane.expect("a pane");
@@ -2035,6 +2087,112 @@ mod frame_tests {
         follow(&mut session, off.0, off.1);
         assert_ne!(selection(&session), placed);
         assert!(session.note.is_none());
+    }
+
+    /// While Control is held over a link in a message the pane underlines
+    /// the link a Control-press there would follow, asking a redraw only
+    /// when what is underlined changes; off the link, outside the pane,
+    /// with the mouse off or once Control is up, nothing is.
+    #[test]
+    fn control_held_over_a_link_underlines_it_in_the_pane() {
+        let (mut session, _cmd_rx, resp_tx) = session(true);
+        show_message(&mut session, &resp_tx, "see https://e.example/x now".into());
+        assert!(session.shown().contains("https://e.example/x"));
+        let rect = session.shape().unwrap().layout.pane.expect("a pane");
+        let points: Vec<_> = (0..i64::from(rect.height))
+            .step_by(4)
+            .flat_map(|dy| {
+                (0..i64::from(rect.width))
+                    .step_by(4)
+                    .map(move |dx| (rect.x + dx, rect.y + dy))
+            })
+            .collect();
+        let on: Vec<_> = points
+            .iter()
+            .copied()
+            .filter(|&(x, y)| session.pane.link(x, y).is_some())
+            .collect();
+        let off = points
+            .iter()
+            .copied()
+            .find(|&(x, y)| session.pane.link(x, y).is_none())
+            .expect("text off the link");
+        assert!(on.len() > 1, "the link is shown");
+        let hover = |session: &mut Session, at: Option<(i64, i64)>| {
+            session.dirty = false;
+            session.input(Input::Hover(at), &mut NoClipboard);
+            session.dirty
+        };
+        let link = Some("https://e.example/x".to_string());
+        assert!(hover(&mut session, Some(on[0])));
+        assert_eq!(session.pane.hovered(), link);
+        assert!(!hover(&mut session, Some(on[1])), "the same link");
+        assert!(hover(&mut session, Some(off)));
+        assert_eq!(session.pane.hovered(), None);
+        assert!(hover(&mut session, Some(on[0])));
+        assert!(hover(&mut session, Some((rect.x - 1, rect.y))));
+        assert_eq!(session.pane.hovered(), None, "outside the pane");
+        assert!(hover(&mut session, Some(on[0])));
+        assert!(hover(&mut session, None));
+        assert_eq!(session.pane.hovered(), None);
+        // With the mouse off a press follows nothing, so nothing shows.
+        session.mouse = false;
+        assert!(!hover(&mut session, Some(on[0])));
+        assert_eq!(session.pane.hovered(), None);
+        // Turned on again, the next input finds the point Control is over.
+        session.mouse = true;
+        assert!(hover(&mut session, Some(on[0])));
+        assert_eq!(session.pane.hovered(), link);
+    }
+
+    /// In a draft the underline keeps to where a Control-press would
+    /// follow: the finder over the body and the draft's save question
+    /// each take the press, so nothing is underlined under them, and the
+    /// frame finds a gate lifted without another input.
+    #[test]
+    fn a_draft_underlines_a_link_only_where_a_press_would_follow() {
+        let (mut session, _cmd_rx, _resp_tx) = session(true);
+        let folder = session.setup.draft_dir.clone().unwrap();
+        session.attach_folder = Some(folder);
+        key(&mut session, "c");
+        session.shown();
+        assert!(session
+            .pane
+            .insert("see https://e.example/x now\n")
+            .unwrap());
+        session.shown();
+        let rect = session.shape().unwrap().layout.pane.expect("a pane");
+        let on = (0..i64::from(rect.height))
+            .step_by(4)
+            .flat_map(|dy| {
+                (0..i64::from(rect.width))
+                    .step_by(4)
+                    .map(move |dx| (rect.x + dx, rect.y + dy))
+            })
+            .find(|&(x, y)| session.pane.link(x, y).is_some())
+            .expect("the link is shown");
+        let link = Some("https://e.example/x".to_string());
+        session.input(Input::Hover(Some(on)), &mut NoClipboard);
+        assert_eq!(session.pane.hovered(), link);
+        key(&mut session, "C-S-a");
+        assert!(session.chooser.is_some());
+        assert_eq!(session.pane.hovered(), None, "the finder takes the press");
+        key(&mut session, "Escape");
+        assert!(session.chooser.is_none());
+        assert_eq!(session.pane.hovered(), link);
+        key(&mut session, "C-w");
+        assert!(session.editing(true) && !session.editing(false), "asking");
+        assert_eq!(session.pane.hovered(), None, "the question takes the press");
+        key(&mut session, "Escape");
+        assert!(session.editing(false));
+        assert_eq!(session.pane.hovered(), link);
+        // The mouse turned on between inputs: the frame shows the link.
+        session.mouse = false;
+        session.input(Input::Hover(Some(on)), &mut NoClipboard);
+        assert_eq!(session.pane.hovered(), None);
+        session.mouse = true;
+        session.shown();
+        assert_eq!(session.pane.hovered(), link);
     }
 
     /// The frame reads back as text: the mailboxes with their counts,

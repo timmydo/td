@@ -2,8 +2,8 @@
 //! a raster over the surface and drives the program's [`Handler`] with
 //! what the window receives — keypresses as the keymap's chords, the left
 //! button's press, drag and release in surface pixels with Shift and
-//! Control, wheel travel in rows and columns, the surface laid out again
-//! on configure,
+//! Control, the pointer while Control is held, wheel travel in rows and
+//! columns, the surface laid out again on configure,
 //! focus, the close request and the text of a paste it asked for — and
 //! polls it each turn under the wait it asks for, so a program whose work
 //! arrives on a channel from another thread is served without a
@@ -74,6 +74,12 @@ pub enum Input<'a> {
     /// The pointer left, or the device went, while the button was held:
     /// the handler ends its drag without a release.
     CancelPointer,
+    /// The pointer's position while Control is held and the pointer has
+    /// entered the surface (a held button's grab keeps it entered past an
+    /// edge), the window focused, so a handler can mark the link a
+    /// Control-press there would follow; `None` once any of that ends.
+    /// Delivered on a change only, button held or not.
+    Hover(Option<(i64, i64)>),
     /// Wheel travel per frame in cell rows and columns.
     Wheel {
         rows: isize,
@@ -335,6 +341,8 @@ pub struct Window<'h, H: Handler> {
     pointer: (i64, i64),
     /// Whether the left button is held: motion is a drag until release.
     held: bool,
+    /// The position the handler was last told Control is held over.
+    hover: Option<(i64, i64)>,
     wheel: Wheel,
     dirty: bool,
     /// The title the toplevel was last given, re-read from the handler
@@ -359,6 +367,7 @@ impl<'h, H: Handler> Window<'h, H> {
             size: (DEFAULT_WIDTH, DEFAULT_HEIGHT),
             pointer: (0, 0),
             held: false,
+            hover: None,
             wheel: Wheel::default(),
             dirty: true,
             title: String::new(),
@@ -449,6 +458,19 @@ impl<'h, H: Handler> Window<'h, H> {
         Ok(())
     }
 
+    /// Tells the handler where the pointer is while Control is held over
+    /// the surface, as the keyboard's synchronized state reports it while
+    /// the window has focus, or that it no longer is: a change only.
+    fn hover(&mut self) -> Result<()> {
+        let at = (self.client.entered().is_some() && self.client.input().held().control)
+            .then_some(self.pointer);
+        if at == self.hover {
+            return Ok(());
+        }
+        self.hover = at;
+        self.deliver(Input::Hover(at))
+    }
+
     /// Lays the surface out for the configured extent, a zero axis keeping
     /// the current one; an extent the raster refuses keeps the last
     /// surface, is reported to the handler and delivers nothing. A
@@ -505,7 +527,7 @@ impl<'h, H: Handler> Window<'h, H> {
                 self.handler.notice(&format!("keyboard: {why}"));
             }
             // The widget window has no hint layer yet: held roles reach a
-            // handler only under a key.
+            // handler only under a key and a press, and Control as `hover`.
             KeyboardEvent::Keymap(Ok(())) | KeyboardEvent::Ready | KeyboardEvent::Held(_) => {}
         }
         Ok(())
@@ -755,7 +777,8 @@ impl<H: Handler> App for Window<'_, H> {
             }
             Handled::Done | Handled::FrameDone | Handled::GlobalRemoved { .. } => {}
         }
-        Ok(())
+        // Whatever moved the pointer, Control, focus or the devices.
+        self.hover()
     }
 
     fn end_turn(&mut self, now: u64, idle: bool) -> Result<()> {

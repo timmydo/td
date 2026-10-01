@@ -1782,6 +1782,77 @@ fn link_at_finds_the_link_under_a_glyph_and_nothing_elsewhere() {
 }
 
 #[test]
+fn hover_link_underlines_the_link_under_the_point_and_moves_nothing() {
+    let text = "see https://e.example/x now\nplain";
+    for scale in 1..=3u8 {
+        let mut ui = loaded(text);
+        resize(&mut ui, 400 * scale as usize, 240 * scale as usize, scale);
+        let s = i64::from(scale);
+        let area = ui.geometry().document();
+        let width = ui.geometry().surface().width;
+        let at =
+            |column: i64, row: i64| (area.x + (column * 8 + 3) * s, area.y + (row * 16 + 8) * s);
+        let plain = pixels(&ui);
+        let generation = ui.generation();
+        assert!(!ui.hover_link(Some(at(1, 0))), "no link under the point");
+        assert_eq!(ui.hovered_link(), None);
+        assert!(ui.hover_link(Some(at(6, 0))));
+        assert_eq!(ui.hovered_link(), Some(4..23));
+        assert!(!ui.hover_link(Some(at(20, 0))), "the same link");
+        let marked = pixels(&ui);
+        // The link's cells gain an ink rule along their last pixel row and
+        // nothing else changes.
+        let rule = Rect {
+            x: area.x + 4 * 8 * s,
+            y: area.y + 15 * s,
+            width: (19 * 8 * s) as u32,
+            height: s as u32,
+        };
+        let mut changed = 0;
+        for (index, (a, b)) in plain.chunks(4).zip(marked.chunks(4)).enumerate() {
+            let (x, y) = ((index % width) as i64, (index / width) as i64);
+            let ink = u32::from_le_bytes(b.try_into().unwrap()) & 0xff_ffff;
+            if rule.contains(x, y) {
+                assert_eq!(ink, td_ui::raster::INK, "{scale} {x} {y}");
+            } else {
+                assert_eq!(a, b, "{scale} {x} {y}");
+            }
+            changed += usize::from(a != b);
+        }
+        assert!(changed > 0);
+        assert_eq!(ui.generation(), generation);
+        assert_eq!(
+            selection(&ui),
+            Selection {
+                anchor: 0,
+                caret: 0
+            }
+        );
+        // Off the link, and with no point, the rule goes.
+        assert!(ui.hover_link(Some(at(1, 1))));
+        assert_eq!(pixels(&ui), plain);
+        assert!(ui.hover_link(Some(at(6, 0))));
+        assert!(ui.hover_link(None));
+        assert_eq!(pixels(&ui), plain);
+        assert!(!ui.hover_link(None));
+        // The point stays while the text moves under it: the link drawn is
+        // the one there now.
+        assert!(ui.hover_link(Some(at(6, 0))));
+        edit(
+            &mut ui,
+            Command::Select(Selection {
+                anchor: 0,
+                caret: 0,
+            }),
+        );
+        key(&mut ui, "Return");
+        assert_eq!(ui.hovered_link(), None);
+        assert!(ui.hover_link(Some(at(6, 1))));
+        assert_eq!(ui.hovered_link(), Some(5..24));
+    }
+}
+
+#[test]
 fn link_at_follows_a_link_wrapped_onto_the_next_row() {
     let mut ui = loaded("https://e.example/a/long/path/past/the/edge end");
     resize(&mut ui, 200, 240, 1);

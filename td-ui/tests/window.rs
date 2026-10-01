@@ -43,6 +43,7 @@ enum Record {
     /// Phase, position, `extend`, `follow`.
     Pointer(PointerPhase, i64, i64, bool, bool),
     CancelPointer,
+    Hover(Option<(i64, i64)>),
     Wheel(isize, isize),
     Resize(usize, usize),
     Focus(bool),
@@ -62,6 +63,7 @@ impl Record {
                 follow,
             } => Self::Pointer(phase, x, y, extend, follow),
             Input::CancelPointer => Self::CancelPointer,
+            Input::Hover(at) => Self::Hover(at),
             Input::Wheel { rows, columns } => Self::Wheel(rows, columns),
             Input::Resize(surface) => Self::Resize(surface.width, surface.height),
             Input::Focus(focused) => Self::Focus(focused),
@@ -71,9 +73,11 @@ impl Record {
     }
 }
 
-/// A handler that records what the window hands it and answers as told.
+/// A handler that records what the window hands it and answers as told;
+/// hovers apart from the other inputs.
 struct Recorder {
     inputs: Vec<Record>,
+    hovers: Vec<Option<(i64, i64)>>,
     polls: Vec<u64>,
     notices: Vec<String>,
     quit_on: Option<Record>,
@@ -96,6 +100,7 @@ impl Recorder {
     fn new() -> Self {
         Self {
             inputs: Vec::new(),
+            hovers: Vec::new(),
             polls: Vec::new(),
             notices: Vec::new(),
             quit_on: None,
@@ -166,6 +171,10 @@ impl Handler for Recorder {
     }
     fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) -> Flow {
         let record = Record::of(input);
+        if let Record::Hover(at) = record {
+            self.hovers.push(at);
+            return Flow::Continue;
+        }
         self.states.push((
             clipboard.available(),
             clipboard.has_text(),
@@ -755,6 +764,64 @@ fn the_left_button_presses_drags_and_releases_in_surface_pixels_with_shift() {
     w.event(message(keyboard, 2, &[19, SURFACE])).unwrap();
     w.event(message(TOPLEVEL, 1, &[])).unwrap();
     assert_eq!(w.handler().inputs.len(), seen + 1, "closed: nothing more");
+}
+
+#[test]
+fn control_held_over_the_surface_hands_the_handler_the_pointer_on_a_change() {
+    let mut handler = Recorder::new();
+    let (mut w, peer, keyboard, pointer) = fixture(&mut handler);
+    configure(&mut w, 800, 480);
+    w.event(message(pointer, 0, &[2, SURFACE, fixed(20), fixed(35)]))
+        .unwrap();
+    focus_with_map(&mut w, &peer, keyboard);
+    // Shift alone is no hover; Control, with Shift or without, is.
+    w.event(message(keyboard, 4, &[5, 1, 0, 0, 0])).unwrap();
+    assert!(w.handler().hovers.is_empty());
+    w.event(message(keyboard, 4, &[6, 5, 0, 0, 0])).unwrap();
+    assert_eq!(w.handler().hovers, [Some((20, 35))]);
+    w.event(message(keyboard, 4, &[7, 4, 0, 0, 0])).unwrap();
+    assert_eq!(w.handler().hovers.len(), 1, "Shift let go moves nothing");
+    // Motion to another pixel is one; within the pixel it is none.
+    w.event(message(pointer, 2, &[0, fixed(30), fixed(40)]))
+        .unwrap();
+    w.event(message(pointer, 2, &[0, fixed(30) + 128, fixed(40)]))
+        .unwrap();
+    assert_eq!(w.handler().hovers, [Some((20, 35)), Some((30, 40))]);
+    // A press and its drag leave it running; the press still follows.
+    w.event(message(pointer, 3, &[8, 0, 0x110, 1])).unwrap();
+    assert_eq!(
+        last(&w),
+        Some(&Record::Pointer(PointerPhase::Press, 30, 40, false, true))
+    );
+    w.event(message(pointer, 2, &[0, fixed(31), fixed(40)]))
+        .unwrap();
+    w.event(message(pointer, 3, &[9, 0, 0x110, 0])).unwrap();
+    assert_eq!(w.handler().hovers.last(), Some(&Some((31, 40))));
+    // Control let go ends it, and nothing more comes while it is up.
+    w.event(message(keyboard, 4, &[10, 0, 0, 0, 0])).unwrap();
+    w.event(message(pointer, 2, &[0, fixed(50), fixed(60)]))
+        .unwrap();
+    assert_eq!(w.handler().hovers.len(), 4);
+    assert_eq!(w.handler().hovers.last(), Some(&None));
+    // Leaving ends it; entering with Control held begins it again.
+    w.event(message(keyboard, 4, &[11, 4, 0, 0, 0])).unwrap();
+    w.event(message(pointer, 1, &[12, SURFACE])).unwrap();
+    assert_eq!(&w.handler().hovers[4..], [Some((50, 60)), None]);
+    w.event(message(pointer, 0, &[13, SURFACE, fixed(5), fixed(6)]))
+        .unwrap();
+    assert_eq!(w.handler().hovers.last(), Some(&Some((5, 6))));
+    // Focus lost ends it: an unfocused keyboard holds nothing. Focus
+    // back with Control in the snapshot begins it again.
+    w.event(message(keyboard, 2, &[14, SURFACE])).unwrap();
+    assert_eq!(w.handler().hovers.last(), Some(&None));
+    w.event(message(keyboard, 1, &[15, SURFACE, 0])).unwrap();
+    w.event(message(keyboard, 4, &[16, 4, 0, 0, 0])).unwrap();
+    assert_eq!(w.handler().hovers.last(), Some(&Some((5, 6))));
+    // The pointer capability going ends it.
+    let seat = w.client().seat().unwrap();
+    w.event(message(seat, 0, &[2])).unwrap();
+    assert_eq!(w.handler().hovers.last(), Some(&None));
+    assert_eq!(w.handler().hovers.len(), 10);
 }
 
 #[test]
