@@ -604,3 +604,180 @@ fn storage_accounting_includes_captured_text_and_wrapped_rows_after_resize() {
         "paint does not grow retained data"
     );
 }
+
+fn three_way(scale: u8) -> Controller<u32, u64, u32> {
+    let model = Model::new("Save changes?", "Save", &["entry: mail"], 1, 9)
+        .unwrap()
+        .with_alternate("Discard", 2)
+        .unwrap();
+    Controller::new(model, surface(scale), rect(scale), Some(42)).unwrap()
+}
+
+#[test]
+fn an_alternate_action_sits_between_cancel_and_confirm() {
+    for scale in 1..=4 {
+        let d = three_way(scale);
+        let rows = [Focus::Cancel, Focus::Alternate, Focus::Confirm]
+            .map(|focus| d.action_rect(focus).unwrap());
+        assert!(rows[0].y < rows[1].y && rows[1].y < rows[2].y, "{rows:?}");
+        for row in rows {
+            assert_eq!(row.intersection(d.rect()), Some(row));
+        }
+        assert!(d.details_rect().y + i64::from(d.details_rect().height) <= rows[0].y);
+        // Each row chooses its own action by press and release.
+        for (focus, choice) in [
+            (Focus::Cancel, Choice::Cancelled),
+            (Focus::Alternate, Choice::Confirmed(2)),
+            (Focus::Confirm, Choice::Confirmed(1)),
+        ] {
+            let mut d = three_way(scale);
+            let at = d.action_rect(focus).unwrap();
+            assert_eq!(event(&mut d, press(at)), Outcome::Changed);
+            assert_eq!(
+                event(&mut d, release(at)),
+                Outcome::Closed {
+                    choice,
+                    restore_focus: Some(42)
+                }
+            );
+        }
+    }
+    // Focus starts on Cancel and Tab visits the alternate in order.
+    let mut d = three_way(1);
+    assert_eq!(d.focus(), Focus::Cancel);
+    for expected in [
+        Focus::Alternate,
+        Focus::Confirm,
+        Focus::Details,
+        Focus::Cancel,
+    ] {
+        key(&mut d, Key::Tab);
+        assert_eq!(d.focus(), expected);
+    }
+    for expected in [
+        Focus::Details,
+        Focus::Confirm,
+        Focus::Alternate,
+        Focus::Cancel,
+    ] {
+        key(&mut d, Key::BackTab);
+        assert_eq!(d.focus(), expected);
+    }
+    key(&mut d, Key::Tab);
+    assert_eq!(
+        key(&mut d, Key::Activate),
+        Outcome::Closed {
+            choice: Choice::Confirmed(2),
+            restore_focus: Some(42)
+        }
+    );
+    // Without one, the alternate is never focused or placed.
+    let mut d = dialog(1);
+    assert_eq!(d.action_rect(Focus::Alternate), None);
+    for _ in 0..3 {
+        key(&mut d, Key::Tab);
+        assert_ne!(d.focus(), Focus::Alternate);
+    }
+}
+
+#[test]
+fn each_action_row_paints_its_own_label_and_the_focused_one_highlights() {
+    use td_ui::chrome::SELECTED_ROW;
+    use td_ui::raster::Primitive;
+    for scale in 1..=4 {
+        let mut d = three_way(scale);
+        for focused in [Focus::Cancel, Focus::Alternate, Focus::Confirm] {
+            let rows = [Focus::Cancel, Focus::Alternate, Focus::Confirm]
+                .map(|focus| d.action_rect(focus).unwrap());
+            let mut labels = [String::new(), String::new(), String::new()];
+            let mut highlighted = Vec::new();
+            d.emit(surface(scale).bounds(), &mut |draw| match draw.primitive {
+                Primitive::Glyph { x, y, scalar, .. } => {
+                    if let Some(at) = rows.iter().position(|row| row.contains(x, y)) {
+                        labels[at].push(scalar);
+                    }
+                }
+                Primitive::Fill { rect, color } if color == SELECTED_ROW => {
+                    highlighted.push(rect);
+                }
+                _ => {}
+            });
+            assert_eq!(
+                labels.map(|l| l.trim().to_string()),
+                ["Cancel", "Discard", "Save"]
+            );
+            let at = [Focus::Cancel, Focus::Alternate, Focus::Confirm]
+                .iter()
+                .position(|f| *f == focused)
+                .unwrap();
+            assert_eq!(highlighted, [rows[at]], "{focused:?} at scale {scale}");
+            key(&mut d, Key::Tab);
+        }
+    }
+}
+
+#[test]
+fn a_three_way_dialog_resized_below_five_rows_closes_unavailable() {
+    let mut d = three_way(1);
+    key(&mut d, Key::Tab);
+    assert_eq!(d.focus(), Focus::Alternate);
+    let taller = Rect {
+        height: 360,
+        ..rect(1)
+    };
+    let resize = |rect| Event::Resize {
+        surface: surface(1),
+        rect,
+    };
+    assert_eq!(event(&mut d, resize(taller)), Outcome::Changed);
+    assert_eq!(d.focus(), Focus::Cancel);
+    assert!(d.action_rect(Focus::Alternate).is_some());
+    let row = td_ui::chrome::ROW as u32;
+    let four = Rect {
+        height: 4 * row,
+        ..rect(1)
+    };
+    assert_eq!(
+        event(&mut d, resize(four)),
+        Outcome::Closed {
+            choice: Choice::Unavailable(Error::NoRoom),
+            restore_focus: Some(42)
+        }
+    );
+    assert!(!d.is_open());
+}
+
+#[test]
+fn an_alternate_label_is_bounded_and_needs_its_own_row() {
+    let model = || Model::new("Save changes?", "Save", &["entry"], 1u32, 9u64).unwrap();
+    assert_eq!(
+        model().with_alternate("", 2).unwrap_err(),
+        Error::InvalidText
+    );
+    assert_eq!(
+        model().with_alternate("Dis\ncard", 2).unwrap_err(),
+        Error::InvalidText
+    );
+    let long = "x".repeat(257);
+    assert_eq!(model().with_alternate(&long, 2).unwrap_err(), Error::Limit);
+    let plain = model().storage_bytes();
+    let three = model().with_alternate("Discard", 2).unwrap();
+    assert!(three.storage_bytes() >= plain + "Discard".len());
+    // Four rows hold a two-action dialog but not a three-action one.
+    let row = td_ui::chrome::ROW as u32;
+    let short = Rect {
+        height: 4 * row,
+        ..rect(1)
+    };
+    assert!(Controller::new(model(), surface(1), short, Some(42u32)).is_ok());
+    assert_eq!(
+        Controller::new(three, surface(1), short, Some(42u32)).unwrap_err(),
+        Error::NoRoom
+    );
+    let wide = "D".repeat(200);
+    let model = model().with_alternate(&wide, 2).unwrap();
+    assert_eq!(
+        Controller::new(model, surface(1), rect(1), Some(42u32)).unwrap_err(),
+        Error::NoRoom
+    );
+}

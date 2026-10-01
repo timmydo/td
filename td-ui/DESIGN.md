@@ -1879,33 +1879,39 @@ container and wrapped-row capacities for consumer accounting, excluding
 allocator bookkeeping. A consumer reserves its bound before construction
 and reconciles actual capacity before admitting the widget.
 The consumer owns any authority or descriptors behind the action ID.
+`with_alternate` adds a second action with its own label, validated as the
+confirmation label is, for a three-way choice such as Save, Discard or
+Cancel; either action closes as `Confirmed` with its own ID.
 
 `confirmations::Controller` composes a title panel, a scrolling detail list
-and fixed Cancel/Confirm rows inside a fully visible rectangle. Details
+and fixed action rows inside a fully visible rectangle: Cancel, the
+alternate when the model has one, then Confirm. Details
 wrap at scalar boundaries without loss; precomputed offsets into the
 captured strings avoid borrowed self-references and allocation while
 handling ordinary input or painting. Layout reserves at most 65,536
 wrapped rows. Insufficient width, height, label space or wrapping capacity
 refuses with `NoRoom`, without omitting an action or part of the request.
 A valid layout shows the complete title and action labels, at least one
-detail row, and both actions. Title and actions stay visible while details
+detail row, and every action. Title and actions stay visible while details
 scroll, separated from the fixed controls by visible rules. Resize
 retains the selected detail and scroll anchor by entry and byte offset,
-then reflows fallibly; a refusal closes with `Unavailable` and
-never leaves an old invisible confirmation target active.
+then reflows fallibly; a refusal closes with `Unavailable` and never
+leaves an old invisible confirmation target active.
 
 Focus starts on Cancel. Tab/BackTab cycle only through the detail list,
-Cancel and Confirm. Up/Down, PageUp/PageDown and Home/End navigate details;
-Activate acts only on the focused action. Escape cancels. Primary pointer
-press arms an action and release on that same action chooses it; moving
-away or any intervening keyboard input, including repeats, cancels the arm.
-Pointer actions preserve the keyboard focus choice; abandoning a pointer
-gesture cannot move the default keyboard action to Confirm. Blank detail
-rows do not select content. Outside
-input is consumed without closing or reaching underlying controls. Other
-unhandled input is consumed. Key repeat never activates. Focus loss
-cancels; resize cancels a pending gesture and returns focus to Cancel.
-A missing or changed revision closes stale without confirmation.
+Cancel, the alternate if any, and Confirm; without an alternate,
+`Focus::Alternate` is never focused and has no row. Up/Down,
+PageUp/PageDown and Home/End navigate details; Activate acts only on the
+focused action. Escape cancels. Primary pointer press arms an action and
+release on that same action chooses it; moving away or any intervening
+keyboard input, including repeats, cancels the arm. Pointer actions
+preserve the keyboard focus choice; abandoning a pointer gesture cannot
+move the default keyboard action to Confirm. Blank detail rows do not
+select content. Outside input is consumed without closing or reaching
+underlying controls. Other unhandled input is consumed. Key repeat
+never activates. Focus loss cancels; resize cancels a pending gesture
+and returns focus to Cancel. A missing or changed revision closes stale
+without confirmation.
 
 Confirmation, cancellation, stale data and an unavailable resized layout
 each produce one `Closed` outcome. Later events are ignored and a closed
@@ -1916,14 +1922,21 @@ resize failures are represented by `Closed` with `Unavailable`.
 A close returns that ID only when valid, for the adapter to restore focus.
 The adapter routes input through the modal controller while it is open
 and executes only the typed outcome; td-ui grants no process authority.
-The adapter must not position Confirm beneath the pointer that opened the
-dialog: a second click in a double-click is otherwise a fresh gesture.
+The adapter must not position Confirm, nor an alternate such as Discard,
+beneath the pointer that opened the dialog: a second click in a
+double-click is otherwise a fresh gesture.
 
 `tests/confirmations.rs` pins default cancellation, focus confinement,
 press/release pairing, duplicate/repeated input, outside input, stale data,
 focus loss, resize refusal and focus restoration. It covers capture
 independence, lossless Unicode wrapping and scrolling, the full one-MiB
-request bound, malformed input and unusable geometry. Draw-stream and
+request bound, malformed input and unusable geometry. A three-way dialog's
+rows stand in order inside it, each choosing its own action by press and
+release and the alternate by Tab and Activate, each painting its own
+label with only the focused row highlighted at scales one through four;
+its label is bounded and validated, counted in storage, and refused with
+`NoRoom` when too wide or when the height holds only two actions, and a
+resize to such a height closes it `Unavailable`. Draw-stream and
 pixel checks at scales one through four keep the controls within the
 dialog, preserve pixels outside it and respect partial damage.
 
