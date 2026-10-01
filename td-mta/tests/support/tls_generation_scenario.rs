@@ -284,7 +284,7 @@ fn trust_inputs() -> (Vec<Material>, String) {
     for i in 0..15 {
         writeln!(text, "[gateway \"upstream{i}\"]\nca_file = \"/gateway-ca{i}\"\nclient_cert_sha256 = \"{}\"\n[gateway_peer \"upstream{i}\"]\nnetwork = \"192.0.2.0/24\"\n[listener \"gateway{i}\"]\nkind = \"gateway_smtp\"\nbind = \"127.0.0.{}:2525\"\nserver_name = \"localhost\"\ncertificate = \"profile0\"\ngateway = \"upstream{i}\"\nsession_limit = 1\nper_peer_limit = 1", "11".repeat(32), i + 1).unwrap();
     }
-    text.push_str("[limits]\nsmtp_sessions = 15\nmemory_budget_bytes = 83886080\n");
+    text.push_str("[limits]\nsmtp_sessions = 15\nmemory_budget_bytes = 134217728\n");
     materials.get_mut(0).unwrap().2 = large_trust_bundle();
     (materials, text)
 }

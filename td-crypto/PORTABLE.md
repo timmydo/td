@@ -942,7 +942,7 @@ Both allocation executables and the unwrapped RSS executable additionally run
 `--tls-generation-trust` in fresh processes. It constructs sixteen admitted
 large file profiles, fifteen gateway policies with full 128-anchor private
 bundles, one HTTPS listener and relay trust. The fixture's explicit fifteen
-SMTP slots and 80 MiB planner budget do not change shipped defaults. Its
+SMTP slots and 128 MiB planner budget do not change shipped defaults. Its
 external MX configuration needs no direct SMTP listener. This measures cold
 configuration retention without claiming peer authentication.
 
@@ -950,8 +950,8 @@ The runtime requires exact eleven-phase `generation-trust` records and the
 v1 allocation or v2 RSS completion before printing diagnostics. Other scenario
 records cannot satisfy this evidence. Stable old-generation release and
 repeated replacement remain allocation oracles. No executable, unsafe surface
-or link flag is added. td-mta/RESOURCES.md defines the observed allowance
-overrun and pending aggregate admission work.
+or link flag is added. td-mta/RESOURCES.md defines the allocation guards,
+their attribution limits and pending aggregate admission work.
 
 ## Certificate-list refusal observations
 

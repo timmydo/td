@@ -31,17 +31,32 @@ the checked ledger and pass the budget gate before admission is enabled.
 | Slot queues and queue window | 1 | 131072 | 131072 |
 | Fixed worker stacks | 8 | 262144 | 2097152 |
 | Main stack allowance | 1 | 1048576 | 1048576 |
-| TLS session headroom | 17 | 131072 | 2228224 |
-| TLS handshake headroom | 2 | 1048576 | 2097152 |
-| Certificate generations | 2 | 1048576 | 2097152 |
+| TLS session headroom | 17 | 524288 | 8912896 |
+| TLS handshake headroom | 2 | 4194304 | 8388608 |
+| Established TLS processing | 1 | 4194304 | 4194304 |
+| Certificate generations | 2 | 8388608 | 16777216 |
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
-| **Total** | | | **64464128** |
+| **Total** | | | **96314624** |
 
-The total is approximately 61.48 MiB against a 64 MiB configured budget;
-the remaining 2644736 bytes are unassigned headroom, not another cache.
-The 128 MiB workload RSS release ceiling remains independent. Raising the
-configured memory budget does not preserve the default RSS claim.
+The total is approximately 91.85 MiB against a 96 MiB configured budget;
+the remaining 4348672 bytes are unassigned headroom, not another cache.
+The 64 MiB idle and 128 MiB workload RSS release ceilings remain independent
+and unverified. The TLS entries are demand headroom, not additional arenas to
+allocate and touch at startup. Idle retains its actual current generation;
+provider state for unused session/handshake slots, processing headroom and
+the replacement generation are not expected to be resident. Application arenas
+and owned TLS wire pools still must be allocated and touched before admission;
+those wire pools are already charged within the session entries. The ledger sum cannot establish either
+RSS result; nondefault pool sizes require separate qualification.
+
+The TLS entries are qualification ceilings. They give the measured fixtures
+room for retained peer chains, native caches, decoder expansion and complete
+generation overlap, but are not proven maxima for every admitted input.
+The current Rust/native counters constrain requested bytes in overlapping
+domains; they do not measure allocator overhead or every realloc transient.
+Increasing these entries does not qualify service admission or RSS. M07e must
+still account for those costs and concurrent owners within the ledger.
 
 ## Slot composition and ownership
 
@@ -97,21 +112,21 @@ configured memory budget does not preserve the default RSS claim.
   includes its bounded TLS overhead. It is not a 16 KiB wire-buffer promise.
   M07d2's record pump retains two distinct 18437-byte reservations per
   connection (36874 bytes total), one input frame and one output/tail frame.
-  These count against the existing 128 KiB session target, not extra headroom.
+  These count against the 512 KiB session target, not extra headroom.
   Before the final handshake flight drains, the facade permits 83973
   ciphertext bytes. Its conservative sum with 16384 plaintext bytes and
-  36874 pump bytes remains 137231, exceeding the 128 KiB session target by
-  6159 bytes. This window can extend past authenticated Finished. The mail
-  owner retains its handshake permit until facade and socket output drain;
+  36874 pump bytes is 137231. This window can extend past authenticated
+  Finished. The mail owner retains its handshake permit until facade and
+  socket output drain;
   the corresponding additional handshake memory reservation must cover the
   whole pre-drain window before activation. After authenticated Finished and
   complete facade output drain, its permanent ciphertext ceiling is 36874 bytes. That established
   ceiling plus 16384 plaintext bytes and the pump buffers totals 90132 bytes,
-  leaving 40940 of the 128 KiB session target before handles, retained input,
+  leaving 434156 of the 512 KiB session target before handles, retained input,
   peer chains, native state and allocator overhead. Post-operation output
   refusal does not bound temporary allocation or Vec capacity. Complete
   session accounting remains an M07e admission blocker. Measure coexistence
-  within 128 KiB, or amend the ledger before serving. The runtime must reserve
+  within 512 KiB, or amend the ledger before serving. The runtime must reserve
   the wire buffers before admission and recover both through into_buffers on
   teardown or constructor refusal, for either representation. The pump accepts
   borrowed references or Box-owned arrays allocated before admission; it never
@@ -134,9 +149,20 @@ configured memory budget does not preserve the default RSS claim.
   Incoming TLS 1.3 tickets still derive secrets, query the clock and copy peer
   chains before discard with resumption disabled. Include these temporary
   allocations and record work in established-session measurements.
+  Each admitted handshake has an additional 4 MiB allowance for provider
+  construction, processing and retained handshake state. The main thread has
+  one separate 4 MiB established-processing allowance: it executes only one
+  TLS operation at a time, including control-message decoding after Finished.
+  It can coexist with both handshake workers and both certificate generations.
+  Increasing connection counts does not multiply this serial allowance;
+  moving established TLS work to more threads requires a ledger amendment.
+  These allowances fund provider allocations, not extra td-owned wire pools.
+  Raw handshake byte caps do not bound decoded vector sizes. The decoded-list
+  fixture charges pre-Finished expansion to handshake headroom. Incoming
+  tickets demonstrate that provider processing also occurs after Finished.
   HTTP-01/administration must use the existing fixed control/I/O reservations;
   they cannot silently add another general connection pool.
-- Each 1 MiB certificate generation includes every server profile and parsed
+- Each 8 MiB certificate generation includes every server profile and parsed
   relay/ACME/gateway trust object, retained raw bytes and allocation overhead.
   SCHEMA.md's per-input caps do not enlarge this aggregate. Renew a complete
   generation, retaining at most old and replacement; no per-profile side cache.
@@ -180,7 +206,7 @@ configured memory budget does not preserve the default RSS claim.
   relay/ACME trust. It occupies one of the same two generation slots; complete
   replacement and retained client sessions cannot create a third slot or
   independent trust-cache allowance. The compiler
-  does not yet measure/enforce the 1 MiB native aggregate and cannot activate
+  does not yet measure/enforce the 8 MiB native aggregate and cannot activate
   serving. SessionPreparation retains the handshake count, generation and two
   preallocated buffers without allocating; native construction runs later on a
   fixed TLS worker. The runtime must still supply/retain the complete session
@@ -995,13 +1021,23 @@ profile's name count, certificate-name length, gateway policies, trust bundles
 or mixed key algorithms. A configuration with explicit MX on every domain can
 use sixteen HTTPS listeners without direct SMTP; this case has only fifteen
 HTTPS tables. The allocation probes additionally require this routing case's
-first-to-candidate requested-byte increase to fit the planned 1 MiB generation
-entry. Shared HTTPS identity views avoid retaining another copy of the same
+first-to-candidate requested-byte increase to fit a narrower 1 MiB regression
+guard. Shared HTTPS identity views avoid retaining another copy of the same
 names for every listener. This fixture-specific check excludes allocator
 metadata. The allocation case uses one common JMAP-primary profile; it does
 not measure all possible primary-role combinations or prove an aggregate upper
 bound for all configurations;
 complete concurrent session and generation qualification remains M07e.
+
+All three generation allocation modes check the first retained generation and
+the first-to-candidate retained delta against `TLS_GENERATION_BYTES`. The
+first construction peak minus pre-compilation retention must fit one entry.
+The candidate and final replacement peaks minus the first retained generation
+snapshot must each fit one entry, so construction cannot borrow the old
+generation's unused allowance. The final replacement peak minus the
+pre-compilation retained snapshot must also fit two entries. These lifetime
+peaks conservatively include earlier construction; they do not isolate
+attribution or prove every configuration fits.
 
 ## Gateway trust generation observations
 
@@ -1015,12 +1051,11 @@ PEM size is greater than 112 KiB and at most the admitted 128 KiB. Every load
 parses the complete bundle. No peer handshake or successful authentication is
 claimed by this configuration-only fixture.
 
-The fixture explicitly declares fifteen SMTP slots and an 80 MiB planner
+The fixture explicitly declares fifteen SMTP slots and a 128 MiB planner
 budget so the fifteen one-slot gateway listeners are admitted. It supplies an
 external MX for every domain, with no direct SMTP listener. These settings
-belong to the fixture; shipped defaults and the 1 MiB generation ledger entry
-are unchanged. Assertions check the decoded profile/listener/gateway counts,
-material-open counts and complete seventeen-entry policy table.
+belong to the fixture. Assertions check the decoded profile/listener/gateway
+counts, material-open counts and complete seventeen-entry policy table.
 
 Rust/native allocation processes enforce the same unchanged third-slot
 refusal, old-generation release and four stable replacements as the other
@@ -1028,12 +1063,12 @@ generation cases. RSS is sampled in its own process. Exact
 `generation-trust` schema labels distinguish all eleven lifecycle phases,
 with allocation completion `tls-generation-trust-allocation-v1: DOMAIN passed`
 and RSS completion `rss-observation-v2: generation-trust passed`. Other
-scenario output cannot supply its evidence. Host observations exceed the
-planned 1 MiB generation allowance. Its single HTTPS listener has no views to
-share across listeners. Reducing retained
-trust data, revising the allowance or narrowing admitted configuration remains
-required before service activation. The case does not establish a maximum for
-arbitrary subjects, mixed algorithms, ACME trust or concurrent sessions.
+scenario output cannot supply its evidence. The first-to-candidate retained
+delta is about 1.2 MiB in both counter domains and must fit the generation
+entry. Its single HTTPS listener has no views to share across listeners.
+Complete aggregate qualification remains required before service activation.
+The case does not establish a maximum for arbitrary subjects, mixed algorithms,
+ACME trust or concurrent sessions.
 
 ## Large remote-chain observations
 
@@ -1077,10 +1112,18 @@ channels, not service configuration or a public backend interface.
 
 The repeated-to-released delta exposes client-owned requested heap; adding the
 separately released wire pair counts each once. It still excludes shared
-configuration, fixed objects, stacks and allocator overhead. In host and
-qualified musl runs this subtotal already exceeds the 128 KiB session target.
-Complete worst-case accounting must precede a ledger revision. Retained bytes,
-lifetime high-water observations and sampled RSS remain distinct, and the
+configuration, fixed objects, stacks and allocator overhead. The allocation
+probes require the record checkpoint's retained bytes minus the retained
+generation checkpoint to fit `TLS_SESSION_BYTES`. This includes the wire pair
+and conservatively charges native caches initialized during session work.
+The repeated checkpoint's lifetime peak minus that generation baseline must
+fit the session entry plus the larger handshake/established-processing entry.
+A separate guard subtracts the retained authenticated-handshake snapshot
+from the repeated-record lifetime peak and checks only the established-
+processing entry. Earlier construction/handshake peaks are included, not
+isolated. These are guards on the measured cases, not worst-case accounting
+over all peer inputs. Retained bytes, lifetime high-water observations and
+sampled RSS remain distinct, and the
 Rust/native domains overlap. This fixture is not maximum simultaneous queued
 traffic, maximum tickets, mTLS or complete service qualification. The
 large-ticket case covers one near-ceiling fragmented ticket. Socket-free
@@ -1115,11 +1158,16 @@ unchanged; native live block counts must also stay fixed. Refusal consumes
 the session, discards queued output and refuses later reads, writes and
 records.
 
+The final repeated-refusal lifetime peak minus retained client policy must
+also fit the session plus handshake entries. This covers both fragmentations
+and all repetitions, conservatively including wire storage and prior peaks;
+it does not qualify post-Finished decoding against the separate established-
+processing entry.
+
 The input is bounded but decoded storage can be much larger than its wire
 body. Counter peaks do not include allocator metadata or every realloc
 transient; Rust/native domains overlap. RSS samples occur between calls and
 can miss allocations already freed by a refused call. This single TLS 1.2
 pre-ServerHello case does not bound encrypted TLS 1.3 certificate lists,
 post-handshake messages, concurrent sessions or total service memory. M07e
-retains the aggregate admission requirement and the current ledger
-unchanged.
+retains the aggregate admission requirement.

@@ -234,6 +234,11 @@ error even when the supplied value equals the constant.
 `upload_expiry_seconds`, `queue_disk_bytes`, `queue_submissions`,
 `sort_disk_bytes`, `log_file_bytes`, `retained_logs`, `memory_budget_bytes`.
 
+The default `memory_budget_bytes` is 100663296 (96 MiB). It funds the checked
+RESOURCES.md planning ledger, not a measured RSS limit. A smaller explicit
+budget is accepted only when the complete configured plan fits it; changing
+the budget alone does not change connection counts or the RSS release targets.
+
 ### `[disk]`
 
 `body_bytes`, `body_files`, `live_metadata_bytes`, `checkpoint_bytes`,

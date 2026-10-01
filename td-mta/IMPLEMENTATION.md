@@ -847,8 +847,8 @@ Implement the remaining work as independently reviewable increments:
   session/handshake peaks, worker entropy and Rust/native stack/allocation/RSS
   on the portable artifact before activating the adapters. Amend the checked
   ledger if measurements cannot fit; never infer a bound from buffer limits.
-  Resolve RESOURCES.md's known session-cap sum above the 128 KiB target and
-  account for separate header/body polling calls before service admission.
+  Account for retained peer state, decoded-message expansion and separate
+  header/body polling calls before service admission.
   - **M07e1 — representative worker stack:** a portable-only release fixture
     runs twenty-five policy/transport scenarios on one guarded non-growing mapping
     capped at the existing 256 KiB worker allowance. It covers representative
@@ -967,7 +967,7 @@ Implement the remaining work as independently reviewable increments:
     128-anchor private bundles, one HTTPS listener and relay trust. Fresh
     Rust/native/RSS processes cover the two-generation lifecycle, unchanged
     third-slot refusal and stable replacement. Its explicit fifteen-session,
-    80 MiB configuration is fixture-only. Retained trust duplication still
+    128 MiB configuration is fixture-only. Retained trust duplication still
     requires accounting or reduction before service activation.
 
   - **M07e4i — decoded certificate-list refusal observations:** fresh
@@ -976,6 +976,16 @@ Implement the remaining work as independently reviewable increments:
     terminal refusal and stable repeated teardown qualify decoded allocation
     separately from bounded wire storage. Encrypted TLS 1.3 and concurrent
     session accounting remain pending.
+
+  - **M07e4j — revised TLS planning ledger:** retain default connection counts
+    with a 96 MiB planning budget. Reserve 512 KiB per TLS session, 4 MiB per
+    admitted handshake, 8 MiB per certificate generation and one 4 MiB
+    established-processing allowance for the main thread. Generation,
+    remote-client and decoded-list allocation fixtures check their measured
+    requested-byte costs against these entries; keep the narrower routing
+    regression guard. The allowances do not prove
+    arbitrary-input, simultaneous-traffic, allocator or RSS bounds, and do not
+    activate serving.
 
 **Acceptance:** shared backend tests exercise known-answer/independent crypto
 oracles, malformed keys, explicit TLS policy and upstream API confinement.

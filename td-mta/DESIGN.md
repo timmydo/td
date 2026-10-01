@@ -345,10 +345,13 @@ arena ledger with byte counts, worker stack sizes, scratch reservations, and
 TLS headroom before committing a default profile. A larger configured pool
 cannot silently retain the default memory claim.
 
-The M02c3a ledger reserves 64464128 bytes under the default 64 MiB budget,
-including planned stack, TLS, reload and process allowances. It is not RSS
-evidence. M02/M07 must fit concrete structures and measured provider use within
-those reservations or amend the ledger before enabling service admission.
+The ledger reserves 96314624 bytes under the default 96 MiB planning budget,
+including planned stack, TLS, reload and process allowances. Default connection
+counts remain eight SMTP, eight HTTPS and one outbound delivery. Established
+TLS processing has a separate allowance for the single main thread, alongside
+the handshake and generation allowances. These are qualification targets, not
+RSS evidence or enforced provider allocation limits. M02/M07 must fit concrete
+structures and provider use within the ledger before enabling service admission.
 
 The no-allocation contract covers td-owned hot processing: SMTP parsing and
 streaming, MIME scanning, HTTP/JSON parsing, JMAP evaluation/serialization,

@@ -378,11 +378,11 @@ Bound each raw chain file/response to 64 KiB, private key to 16 KiB, and
 explicit CA bundle to 128 KiB. These are individual ceilings, not simultaneous
 allocation promises. One certificate generation, including all profiles,
 relay/ACME/gateway trust stores, raw material still retained, parsed provider
-objects and allocator overhead, must fit its existing 1 MiB reservation.
+objects and allocator overhead, must fit its RESOURCES.md ledger reservation.
 Public-root parsed objects are charged here too; immutable compiled root bytes
 belong to process/image allowance. Reject combined overflow even when every
 file meets its own bound. Renew one complete generation at a time: retain at
-most old and replacement 1 MiB generations, with no per-profile side
+most old and replacement generations, with no per-profile side
 generations or uncharged trust cache. M03/M07 must prove provider allocation
 bounds and old/new/session overlap before enabling material loading; bounded
 input alone is not that proof.

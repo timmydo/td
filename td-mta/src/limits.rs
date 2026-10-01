@@ -7,6 +7,14 @@ pub const MIB: usize = 1024 * KIB;
 pub const OUTBOUND_RECIPIENT_BATCH: usize = 100;
 /// Owned operation offsets/ordinal/type/kind, including Option layout.
 pub const OPERATION_SLOT_BYTES: usize = 32;
+/// Planned provider session ceiling, not a measured worst-case bound.
+pub const TLS_SESSION_BYTES: usize = 512 * KIB;
+/// Planned provider construction/handshake ceiling; qualification remains required.
+pub const TLS_HANDSHAKE_BYTES: usize = 4 * MIB;
+/// Planned complete-generation ceiling, including construction temporaries.
+pub const TLS_GENERATION_BYTES: usize = 8 * MIB;
+/// Main-thread TLS work can decode control messages after Finished.
+pub const TLS_ESTABLISHED_PROCESSING_BYTES: usize = 4 * MIB;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceError {
@@ -103,7 +111,7 @@ limits! {
         sort_disk_bytes: 64 * MIB, 1, 256 * MIB;
         log_file_bytes: 8 * MIB, 1, 64 * MIB;
         retained_logs: 4, 1, 16;
-        memory_budget_bytes: 64 * MIB, 1, 128 * MIB;
+        memory_budget_bytes: 96 * MIB, 1, 128 * MIB;
     }
     fixed {
         outbound_deliveries: 1;
@@ -134,7 +142,7 @@ impl Reservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourcePlan {
     limits: Limits,
-    reservations: [Reservation; 18],
+    reservations: [Reservation; 19],
     total_bytes: usize,
     log_disk_bytes: usize,
 }
@@ -333,17 +341,22 @@ impl Limits {
             Reservation {
                 name: "TLS sessions",
                 count: sessions,
-                bytes_each: 128 * KIB,
+                bytes_each: TLS_SESSION_BYTES,
             },
             Reservation {
                 name: "TLS handshakes",
                 count: self.tls_handshakes,
-                bytes_each: MIB,
+                bytes_each: TLS_HANDSHAKE_BYTES,
+            },
+            Reservation {
+                name: "established TLS processing",
+                count: 1,
+                bytes_each: TLS_ESTABLISHED_PROCESSING_BYTES,
             },
             Reservation {
                 name: "certificate generations",
                 count: 2,
-                bytes_each: MIB,
+                bytes_each: TLS_GENERATION_BYTES,
             },
             Reservation {
                 name: "cold reload overlap",
@@ -385,9 +398,81 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 64_464_128);
-        assert!(plan.total_bytes() < 64 * MIB);
+        assert_eq!(plan.total_bytes(), 96_314_624);
+        assert_eq!(plan.limits().memory_budget_bytes, 96 * MIB);
+        assert!(plan.total_bytes() < plan.limits().memory_budget_bytes);
         assert_eq!(plan.log_disk_bytes(), 40 * MIB);
+        Ok(())
+    }
+
+    #[test]
+    fn tls_budget_keeps_concurrency_and_refuses_an_underfunded_plan() -> Result<(), ResourceError> {
+        let defaults = Limits::default();
+        assert_eq!(defaults.smtp_sessions, 8);
+        assert_eq!(defaults.https_connections, 8);
+        assert_eq!(defaults.tls_handshakes, 2);
+        let required = defaults.plan()?.total_bytes();
+        for available in [64 * MIB, required - 1] {
+            assert_eq!(
+                Limits {
+                    memory_budget_bytes: available,
+                    ..defaults
+                }
+                .plan(),
+                Err(ResourceError::MemoryBudget {
+                    required,
+                    available,
+                })
+            );
+        }
+        assert!(Limits {
+            memory_budget_bytes: required,
+            ..defaults
+        }
+        .plan()
+        .is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn tls_slot_growth_does_not_multiply_serial_record_work() -> Result<(), ResourceError> {
+        let defaults = Limits::default();
+        let original = defaults.plan()?;
+        for (limits, extra) in [
+            (
+                Limits {
+                    smtp_sessions: 9,
+                    ..defaults
+                },
+                376_064 + 512 * KIB,
+            ),
+            (
+                Limits {
+                    https_connections: 9,
+                    ..defaults
+                },
+                1_703_936 + 512 * KIB,
+            ),
+            (
+                Limits {
+                    tls_handshakes: 3,
+                    ..defaults
+                },
+                4 * MIB,
+            ),
+        ] {
+            let plan = limits.plan()?;
+            assert_eq!(plan.total_bytes() - original.total_bytes(), extra);
+            let record = plan
+                .reservations()
+                .iter()
+                .find(|r| r.name == "established TLS processing")
+                .ok_or(ResourceError::Inconsistent(
+                    "missing TLS processing reservation",
+                ))?;
+            assert_eq!(record.count, 1);
+            assert_eq!(record.bytes_each, 4 * MIB);
+        }
         Ok(())
     }
 
@@ -563,7 +648,7 @@ mod tests {
     #[test]
     fn larger_pool_cannot_keep_default_memory_claim() -> Result<(), ResourceError> {
         let limits = Limits {
-            https_connections: 32,
+            https_connections: 24,
             ..Limits::default()
         };
         assert!(matches!(
@@ -575,7 +660,16 @@ mod tests {
             ..limits
         }
         .plan()?;
-        assert!(plan.total_bytes() > 64 * MIB);
+        assert!(plan.total_bytes() > Limits::default().memory_budget_bytes);
+        assert!(matches!(
+            Limits {
+                https_connections: 32,
+                memory_budget_bytes: 128 * MIB,
+                ..Limits::default()
+            }
+            .plan(),
+            Err(ResourceError::MemoryBudget { .. })
+        ));
         Ok(())
     }
 }

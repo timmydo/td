@@ -208,6 +208,17 @@ fn tls_certificate_list() {
             >= 512 * 1024,
         "certificate list did not exercise decoded-entry allocation"
     );
+    assert!(
+        samples
+            .get(9)
+            .unwrap()
+            .1
+            .peak
+            .checked_sub(samples.get(1).unwrap().1.bytes)
+            .unwrap()
+            <= td_mta::limits::TLS_SESSION_BYTES + td_mta::limits::TLS_HANDSHAKE_BYTES,
+        "certificate-list processing exceeds planned requested-byte allowance"
+    );
     assert_eq!(
         samples.get(8).unwrap().1.bytes,
         samples.get(9).unwrap().1.bytes,
@@ -380,14 +391,53 @@ fn tls_generations(scenario: tls_generation_scenario::Scenario) {
     });
     assert!(slots.next().is_none());
     assert!(samples.iter().all(|(_, s)| !s.invalid));
-    if scenario == tls_generation_scenario::Scenario::Routing {
-        let retained = samples
-            .get(4)
+    let retained = samples
+        .get(4)
+        .unwrap()
+        .1
+        .bytes
+        .checked_sub(samples.get(3).unwrap().1.bytes)
+        .unwrap();
+    assert!(
+        samples
+            .get(3)
             .unwrap()
             .1
             .bytes
-            .checked_sub(samples.get(3).unwrap().1.bytes)
-            .unwrap();
+            .checked_sub(samples.get(2).unwrap().1.bytes)
+            .unwrap()
+            <= td_mta::limits::TLS_GENERATION_BYTES,
+        "first generation exceeds planned requested-byte allowance"
+    );
+    assert!(
+        retained <= td_mta::limits::TLS_GENERATION_BYTES,
+        "candidate exceeds planned requested-byte allowance"
+    );
+    assert!(
+        samples
+            .get(8)
+            .unwrap()
+            .1
+            .peak
+            .checked_sub(samples.get(2).unwrap().1.bytes)
+            .unwrap()
+            <= 2 * td_mta::limits::TLS_GENERATION_BYTES,
+        "generation overlap exceeds planned requested-byte allowance"
+    );
+    for (peak, baseline) in [(3, 2), (4, 3), (8, 3)] {
+        assert!(
+            samples
+                .get(peak)
+                .unwrap()
+                .1
+                .peak
+                .checked_sub(samples.get(baseline).unwrap().1.bytes)
+                .unwrap()
+                <= td_mta::limits::TLS_GENERATION_BYTES,
+            "generation construction exceeds its own planned allowance"
+        );
+    }
+    if scenario == tls_generation_scenario::Scenario::Routing {
         assert!(
             retained <= 1024 * 1024,
             "large routing candidate exceeds retained-byte fixture allowance"
@@ -464,6 +514,41 @@ fn tls_remote_chain() {
             .blocks
             .checked_sub(samples.get(9).unwrap().1.blocks),
         Some(2)
+    );
+    assert!(
+        samples
+            .get(6)
+            .unwrap()
+            .1
+            .bytes
+            .checked_sub(samples.get(2).unwrap().1.bytes)
+            .unwrap()
+            <= td_mta::limits::TLS_SESSION_BYTES,
+        "remote session exceeds planned requested-byte allowance"
+    );
+    let processing =
+        td_mta::limits::TLS_HANDSHAKE_BYTES.max(td_mta::limits::TLS_ESTABLISHED_PROCESSING_BYTES);
+    assert!(
+        samples
+            .get(7)
+            .unwrap()
+            .1
+            .peak
+            .checked_sub(samples.get(2).unwrap().1.bytes)
+            .unwrap()
+            <= td_mta::limits::TLS_SESSION_BYTES + processing,
+        "remote processing exceeds planned requested-byte allowance"
+    );
+    assert!(
+        samples
+            .get(7)
+            .unwrap()
+            .1
+            .peak
+            .checked_sub(samples.get(5).unwrap().1.bytes)
+            .unwrap()
+            <= td_mta::limits::TLS_ESTABLISHED_PROCESSING_BYTES,
+        "established processing exceeds its own planned allowance"
     );
     let scenario = tls_remote_chain_scenario::label();
     for (phase, (c, s)) in tls_remote_chain_scenario::PHASES.into_iter().zip(samples) {
