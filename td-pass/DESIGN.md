@@ -95,9 +95,9 @@ standalone. No refusal falls back to the other mode.
   it carried. Lock cancels the operation's `pass::Cancel` and declines
   the prompt it may wait on, then drops the vault.
 - **Window state.** `src/app/` is the notebook as td-ui widgets: the
-  action strip (New, Rename, Delete, Save, Find, Lock), the search field
-  over the title list, the title field over the editor pane, and the
-  status row. It reaches the vault only through commands and replies, so
+  action strip (New, Rename, Delete, Save, Find, Keys, Lock), the search
+  field over the title list, the title field over the editor pane, and
+  the status row. It reaches the vault only through commands and replies, so
   its tests run without a token. Titles and bodies travel in clearing
   owners (`src/plain.rs`), and the window's title names no entry.
 - **Entries.** Every entry document is loaded through one function that
@@ -107,16 +107,32 @@ standalone. No refusal falls back to the other mode.
   and an edit made meanwhile stays dirty. Delete asks first.
 - **Unsaved changes.** Choosing another entry, New, Lock or closing the
   window with unsaved changes asks Save, Discard or Cancel. While a save
-  is in flight another entry and New wait for it, and Lock or closing
-  offers only Discard; when the save ends the question is asked again
-  against what is then unsaved, so edits made while saving are never
-  given up unasked. Discard closes the entry's document. A failed save
+  or a key operation is in flight another entry and New wait for it,
+  and Lock or closing offers only Discard; when it ends the question is
+  asked again against what is then unsaved, so edits made meanwhile are
+  never given up unasked. Discard closes the entry's document. A failed save
   keeps the entry dirty. A save is recorded for the document it saved
   only while that document is open, no save starts while another entry
   is being read, and a read answered after the open entry was edited
   leaves that entry open.
+- **Keys.** Keys (Ctrl+K) shows the notebook's enrolled keys in place
+  of the panes, naming the one that authorizes saves; the open entry
+  and its unsaved edits stay as they were, a paste asked for a pane is
+  dropped and a drag ends, and putting the view away returns the focus
+  it had, or the one an operation that ended under the view gave. Use for
+  saves (Return) picks another enrolled key for later saves, without a
+  token. Add backup (Insert) enrolls one more backup through the
+  prompt, authorized by the key that authorizes saves. Replace (Delete)
+  revokes the keys marked with Space or Shift and a press, or else the
+  selected one, after a question naming them: every kept key is asked
+  for, and one new key is enrolled, as the primary when a primary is
+  revoked. The window refuses to revoke every key. It names keys by
+  their place in the list the vault thread last gave it; the thread
+  holds their credentials.
 - **Prompt.** A presentation asks for the named key to be connected; a
-  PIN request shows a masked field that refuses copy. Escape or Cancel
+  PIN request shows a masked field that refuses copy. The instruction
+  names the key before the operation, so a narrow row cuts the
+  operation's words rather than which key. Escape or Cancel
   declines, which the vault reports as cancelled.
 - **Lock.** Lock forgets every document and its history, the find query,
   the titles, the fields and any pending paste, withdraws the window's
@@ -135,18 +151,23 @@ a stale save, the unsaved-changes question, selection-only copy and cut,
 paste, creation, rename, delete, a declined prompt, lock during a save
 with its late replies ignored, the rules for a save in flight, a read
 answered after an edit, pastes bound to their place, the dialog's
-placement and painting the notebook, its prompt and dialog and each
-locked view. The vault thread's tests pin that a prompt takes only its
-operation's answer and that cancel declines once; the frame
-directory's, the mount table's rules. Confinement tests pin the source
-inventory, that pure files reach no system, vault or compositor and
-only the toolkit's drawing, widget and editor modules, that td-secret
-is named only by the vault thread and the worker dispatch, the two
-reads the window makes, and the vault-document policy.
+placement, the keys view's use, add and replace by key and by pointer,
+the refusal to revoke every key, marks that a held Space does not
+flicker, lock during a key operation, a failure's report kept past the
+view, the unsaved edits and focus kept under the view, the lists given
+their keys when the window grows, and painting the notebook, its keys
+view, its prompt and dialogs and each locked view. The vault thread's
+tests pin that a prompt takes only its operation's answer, that cancel
+declines once and that a key command without an open notebook is
+refused; the frame directory's, the mount table's rules. Confinement
+tests pin the source inventory, that pure files reach no system, vault
+or compositor and only the toolkit's drawing, widget and editor modules,
+that td-secret is named only by the vault thread and the worker
+dispatch, the two reads the window makes, and the vault-document policy.
 
-Not yet: key management, encrypted import and export, the native
-compositor cases, host lock and suspend integration, td mode, and the
-recipe and image integration of increment 5.
+Not yet: encrypted import and export, the native compositor cases, host
+lock and suspend integration, td mode, and the recipe and image
+integration of increment 5.
 
 ## Delivery and proof
 

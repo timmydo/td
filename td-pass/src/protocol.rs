@@ -39,6 +39,14 @@ pub enum PinUse {
     Proof,
 }
 
+/// The keys an unlocked notebook holds, and which of them authorizes its
+/// saves.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Keys {
+    pub labels: Vec<KeyLabel>,
+    pub using: Option<usize>,
+}
+
 /// A token presentation the operation waits on: `pin` is `None` while it
 /// asks for the key to be connected, then the PIN's use.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +107,21 @@ pub enum Command {
         op: Op,
         change: Change,
     },
+    /// Authorize later saves with the unlocked notebook's key `key`.
+    UseKey {
+        op: Op,
+        key: usize,
+    },
+    /// Enroll another backup key.
+    AddKey {
+        op: Op,
+    },
+    /// Revoke the unlocked notebook's keys `revoked` and enroll one
+    /// replacement; the vault key rotates.
+    ReplaceKeys {
+        op: Op,
+        revoked: Vec<usize>,
+    },
     /// Drop the unlocked vault.
     Lock,
 }
@@ -137,6 +160,7 @@ pub enum Reply {
     Unlocked {
         op: Op,
         entries: Vec<Item>,
+        keys: Keys,
     },
     Entry {
         id: EntryId,
@@ -156,6 +180,11 @@ pub enum Reply {
     Failed {
         op: Op,
         failure: Failure,
+    },
+    /// A key operation committed; the unlocked notebook's keys now.
+    Keys {
+        op: Op,
+        keys: Keys,
     },
     /// The vault is dropped; the keys are listed again for the next unlock.
     Locked {

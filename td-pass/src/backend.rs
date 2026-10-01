@@ -12,7 +12,7 @@ use td_secret::pass;
 
 use crate::plain::{Bytes, Text};
 use crate::protocol::{
-    Answer, Ask, Change, Command, Failure, Item, KeyLabel, Op, PinUse, Reply, Role,
+    Answer, Ask, Change, Command, Failure, Item, KeyLabel, Keys, Op, PinUse, Reply, Role,
 };
 
 struct Job {
@@ -50,8 +50,12 @@ pub fn start() -> Result<Client, String> {
 impl Client {
     pub fn send(&mut self, command: Command) {
         let cancel = pass::Cancel::new();
-        if let Command::Create { op } | Command::Unlock { op, .. } | Command::Apply { op, .. } =
-            command
+        if let Command::Create { op }
+        | Command::Unlock { op, .. }
+        | Command::Apply { op, .. }
+        | Command::UseKey { op, .. }
+        | Command::AddKey { op }
+        | Command::ReplaceKeys { op, .. } = command
         {
             self.current = Some((op, cancel.clone()));
         }
@@ -96,7 +100,10 @@ impl Drop for Client {
 fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sender<Reply>) {
     let mut host: Option<pass::Host> = None;
     let mut vault: Option<pass::Vault> = None;
+    // The keys the locked view lists, and the unlocked notebook's: the
+    // window names either by its place in the list it was given.
     let mut keys: Vec<pass::Key> = Vec::new();
+    let mut enrolled: Vec<pass::Key> = Vec::new();
     while let Ok(Job { command, cancel }) = jobs.recv() {
         let reply = match command {
             Command::Open => match pass::Host::open().and_then(|opened| {
@@ -123,8 +130,9 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
                     Some(host) => match host.create(&mut asker, &cancel) {
                         Ok(created) => {
                             let entries = items(&created);
+                            let keys = listing(&created, &mut enrolled);
                             vault = Some(created);
-                            Reply::Unlocked { op, entries }
+                            Reply::Unlocked { op, entries, keys }
                         }
                         Err(failure) => failed(op, &failure),
                     },
@@ -141,8 +149,9 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
                     (Some(host), Some(key)) => match host.unlock(key, &mut asker, &cancel) {
                         Ok(unlocked) => {
                             let entries = items(&unlocked);
+                            let keys = listing(&unlocked, &mut enrolled);
                             vault = Some(unlocked);
-                            Reply::Unlocked { op, entries }
+                            Reply::Unlocked { op, entries, keys }
                         }
                         Err(failure) => failed(op, &failure),
                     },
@@ -178,8 +187,61 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
                     _ => closed(op),
                 }
             }
+            Command::UseKey { op, key } => match (vault.as_mut(), enrolled.get(key)) {
+                (Some(vault), Some(key)) => match vault.use_key(key) {
+                    Ok(()) => Reply::Keys {
+                        op,
+                        keys: listing(vault, &mut enrolled),
+                    },
+                    Err(failure) => failed(op, &failure),
+                },
+                (Some(_), None) => refused(op, "that key is no longer listed"),
+                (None, _) => closed(op),
+            },
+            Command::AddKey { op } => {
+                let mut asker = Asker {
+                    op,
+                    replies,
+                    answers,
+                };
+                match (host.as_mut(), vault.as_mut()) {
+                    (Some(host), Some(vault)) => match host.add_key(vault, &mut asker, &cancel) {
+                        Ok(()) => Reply::Keys {
+                            op,
+                            keys: listing(vault, &mut enrolled),
+                        },
+                        Err(failure) => failed(op, &failure),
+                    },
+                    _ => closed(op),
+                }
+            }
+            Command::ReplaceKeys { op, revoked } => {
+                let mut asker = Asker {
+                    op,
+                    replies,
+                    answers,
+                };
+                let revoked: Option<Vec<pass::Key>> = revoked
+                    .iter()
+                    .map(|&index| enrolled.get(index).cloned())
+                    .collect();
+                match (host.as_mut(), vault.as_mut(), revoked) {
+                    (Some(host), Some(vault), Some(revoked)) => {
+                        match host.replace_keys(vault, &revoked, &mut asker, &cancel) {
+                            Ok(()) => Reply::Keys {
+                                op,
+                                keys: listing(vault, &mut enrolled),
+                            },
+                            Err(failure) => failed(op, &failure),
+                        }
+                    }
+                    (Some(_), Some(_), None) => refused(op, "that key is no longer listed"),
+                    _ => closed(op),
+                }
+            }
             Command::Lock => {
                 vault = None;
+                enrolled.clear();
                 match host.as_ref().map(pass::Host::keys) {
                     Some(Ok(listed)) => Reply::Locked {
                         keys: labels(&mut keys, listed),
@@ -204,6 +266,17 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
 fn labels(keys: &mut Vec<pass::Key>, listed: Option<Vec<pass::Key>>) -> Option<Vec<KeyLabel>> {
     *keys = listed?;
     Some(keys.iter().map(label).collect())
+}
+
+/// Keeps the unlocked notebook's credentials here and gives the window
+/// their labels, with the one authorizing saves.
+fn listing(vault: &pass::Vault, enrolled: &mut Vec<pass::Key>) -> Keys {
+    *enrolled = vault.keys();
+    let using = vault.key();
+    Keys {
+        labels: enrolled.iter().map(label).collect(),
+        using: enrolled.iter().position(|key| Some(key) == using.as_ref()),
+    }
 }
 
 fn label(key: &pass::Key) -> KeyLabel {
@@ -271,10 +344,14 @@ fn failed(op: Op, failure: &pass::Failure) -> Reply {
 
 /// An operation that needs a vault this thread does not hold.
 fn closed(op: Op) -> Reply {
+    refused(op, "the notebook is not open")
+}
+
+fn refused(op: Op, text: &str) -> Reply {
     Reply::Failed {
         op,
         failure: Failure {
-            text: "the notebook is not open".to_owned(),
+            text: text.to_owned(),
             stale: false,
             uncertain: false,
             cancelled: false,
@@ -334,7 +411,7 @@ impl pass::Prompt for Asker<'_> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use pass::Prompt;
@@ -398,6 +475,38 @@ mod tests {
         serve(&job_rx, &answer_rx, &reply_tx);
         assert!(matches!(replies.try_recv(), Ok(Reply::Missing { .. })));
         assert!(answer_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn key_commands_without_an_open_notebook_are_refused() {
+        let (jobs, job_rx) = mpsc::channel();
+        let (_answers, answer_rx) = mpsc::channel();
+        let (reply_tx, replies) = mpsc::channel();
+        for command in [
+            Command::UseKey { op: 1, key: 0 },
+            Command::AddKey { op: 2 },
+            Command::ReplaceKeys {
+                op: 3,
+                revoked: vec![0],
+            },
+        ] {
+            jobs.send(Job {
+                command,
+                cancel: pass::Cancel::new(),
+            })
+            .unwrap();
+        }
+        drop(jobs);
+        serve(&job_rx, &answer_rx, &reply_tx);
+        for expected in 1..=3 {
+            match replies.try_recv() {
+                Ok(Reply::Failed { op, failure }) => {
+                    assert_eq!(op, expected);
+                    assert_eq!(failure.text, "the notebook is not open");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]

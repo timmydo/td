@@ -1,13 +1,14 @@
 //! Where each region of the window lies on the surface: the action strip
 //! across the top, the status row at the bottom, and between them the
-//! locked view or the notebook's two panes, with the key prompt and the
-//! confirmation dialog laid over the middle.
+//! locked view, the notebook's two panes or its keys, with the key prompt
+//! and the confirmation dialog laid over the middle.
 
 use td_ui::chrome::{Buttons, List, Status, TextEntry, ROW};
 use td_ui::raster::{Rect, Surface};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
-pub const NOTEBOOK: [&str; 6] = ["New", "Rename", "Delete", "Save", "Find", "Lock"];
+pub const NOTEBOOK: [&str; 7] = ["New", "Rename", "Delete", "Save", "Find", "Keys", "Lock"];
+pub const KEYS: [&str; 5] = ["Notebook", "Use for saves", "Add backup", "Replace", "Lock"];
 pub const LOCKED: [&str; 2] = ["Unlock", "Create"];
 pub const PRESENT: [&str; 2] = ["Continue", "Cancel"];
 pub const PIN: [&str; 2] = ["OK", "Cancel"];
@@ -98,7 +99,16 @@ pub fn panes(surface: Surface, finding: bool) -> Panes {
 
 /// The locked view: two message rows, then the enrolled keys.
 pub fn keys(surface: Surface) -> Option<List> {
-    let body = body(surface, &LOCKED);
+    listing(surface, &LOCKED)
+}
+
+/// The unlocked notebook's keys view, laid out as the locked view.
+pub fn enrolled(surface: Surface) -> Option<List> {
+    listing(surface, &KEYS)
+}
+
+fn listing(surface: Surface, labels: &'static [&'static str]) -> Option<List> {
+    let body = body(surface, labels);
     let row = row(surface);
     List::new(
         surface,

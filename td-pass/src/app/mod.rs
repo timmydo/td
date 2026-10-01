@@ -1,8 +1,8 @@
 //! The notebook window's state: locked or unlocked, the open entry in
 //! td-ui's editor pane under the vault-document policy, the search field
-//! and title list, the key prompt and the confirmation dialog. It reaches
-//! the vault only through `Out` commands and `Reply` answers, so it holds
-//! no key and runs in tests without a token.
+//! and title list, the keys view, the key prompt and the confirmation
+//! dialog. It reaches the vault only through `Out` commands and `Reply`
+//! answers, so it holds no key and runs in tests without a token.
 
 mod input;
 mod layout;
@@ -22,12 +22,15 @@ use td_ui::window::{Clipboard, Input, PointerPhase};
 
 use crate::plain::{self, Bytes, Text};
 use crate::protocol::{
-    Answer, Ask, Change, Command, EntryId, Failure, Item, KeyLabel, Op, PinUse, Reply,
+    Answer, Ask, Change, Command, EntryId, Failure, Item, KeyLabel, Keys, Op, PinUse, Reply,
 };
 
 /// The largest title, search or find text a field holds; td-secret
 /// refuses a longer title on save.
 const FIELD_BYTES: usize = 512;
+/// The status row while the keys view is up and idle.
+const KEYS_HINT: &str =
+    "Keys: Space or Shift+click marks keys; Insert adds a backup; Delete replaces";
 /// A PIN is at most 63 bytes.
 const PIN_BYTES: usize = 63;
 /// The caret's blink, as the editor pane's.
@@ -57,6 +60,7 @@ enum Act {
     Save,
     Discard,
     Delete,
+    Replace,
 }
 
 /// What a decision about unsaved changes was asked for.
@@ -92,7 +96,19 @@ struct Open {
     tab: Option<TabId>,
 }
 
+/// The unlocked notebook's keys, shown in place of the panes: `marked`
+/// are the keys a replacement revokes.
+struct KeyView {
+    keys: Keys,
+    list: ListModel,
+    marked: Vec<bool>,
+    showing: bool,
+    /// The focus to return to when the view is put away.
+    before: Focus,
+}
+
 struct Notebook {
+    keys: KeyView,
     entries: Vec<Item>,
     /// The entries the search shows, as indices into `entries`.
     shown: Vec<usize>,
@@ -122,13 +138,24 @@ enum Busy {
         id: EntryId,
         tab: Option<TabId>,
     },
+    Keys {
+        op: Op,
+        what: KeyOp,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeyOp {
+    Use,
+    Add,
+    Replace,
 }
 
 impl Busy {
     fn op(&self) -> Op {
         match self {
             Self::Unlock(op) | Self::Create(op) => *op,
-            Self::Save { op, .. } | Self::Delete { op, .. } => *op,
+            Self::Save { op, .. } | Self::Delete { op, .. } | Self::Keys { op, .. } => *op,
         }
     }
 }
@@ -314,7 +341,7 @@ impl App {
                     self.sync_focus();
                 }
             }
-            Reply::Unlocked { op, entries } => {
+            Reply::Unlocked { op, entries, keys } => {
                 if !matches!(self.busy, Some(Busy::Unlock(o) | Busy::Create(o)) if o == op) {
                     return;
                 }
@@ -325,6 +352,7 @@ impl App {
                     Ok(notebook) => {
                         self.phase = Phase::Unlocked(Box::new(notebook));
                         self.focus = Focus::Search;
+                        self.set_keys(keys);
                         self.refilter(None);
                         self.relayout();
                         self.say(match count {
@@ -362,7 +390,60 @@ impl App {
                 self.failed(op, &failure);
                 self.reask();
             }
+            Reply::Keys { op, keys } => {
+                self.keys_changed(op, keys);
+                self.reask();
+            }
         }
+    }
+
+    /// A key operation committed: the list shows the keys now.
+    fn keys_changed(&mut self, op: Op, keys: Keys) {
+        let what = match &self.busy {
+            Some(Busy::Keys { op: o, what }) if *o == op => *what,
+            _ => return,
+        };
+        self.busy = None;
+        self.end_prompt();
+        let added = self.notebook().and_then(|notebook| {
+            keys.labels
+                .iter()
+                .find(|label| !notebook.keys.keys.labels.contains(label))
+                .cloned()
+        });
+        let using = keys.using.and_then(|index| keys.labels.get(index)).cloned();
+        self.set_keys(keys);
+        self.say(match (what, added, using) {
+            (KeyOp::Use, _, Some(key)) => format!(
+                "Saves are now authorized by the {} key {}",
+                key.role.name(),
+                key.fingerprint
+            ),
+            (KeyOp::Add, Some(key), _) => {
+                format!("Added the {} key {}", key.role.name(), key.fingerprint)
+            }
+            (KeyOp::Replace, Some(key), _) => format!(
+                "Replaced: the new {} key is {}; revoked keys no longer open the notebook",
+                key.role.name(),
+                key.fingerprint
+            ),
+            _ => "The keys changed".to_owned(),
+        });
+    }
+
+    /// Shows `keys` in the keys view, selecting the one authorizing saves.
+    fn set_keys(&mut self, keys: Keys) {
+        let surface = self.surface;
+        let Some(notebook) = self.notebook() else {
+            return;
+        };
+        let view = &mut notebook.keys;
+        view.marked = vec![false; keys.labels.len()];
+        if let Some(list) = layout::enrolled(surface) {
+            view.list.set_items(keys.labels.len(), keys.using, list);
+        }
+        view.keys = keys;
+        self.redraw = true;
     }
 
     fn locked(&mut self, keys: Option<Vec<KeyLabel>>) {
@@ -403,14 +484,20 @@ impl App {
         if self.busy.as_ref().map(Busy::op) != Some(op) {
             return;
         }
+        let keys = matches!(self.busy, Some(Busy::Keys { .. }));
         self.busy = None;
         self.end_prompt();
         self.say(if failure.cancelled {
             "Cancelled".to_owned()
         } else if failure.uncertain {
             format!(
-                "{}: lock and unlock again to see what was saved",
-                failure.text
+                "{}: lock and unlock again to see what {}",
+                failure.text,
+                if keys {
+                    "keys the vault holds"
+                } else {
+                    "was saved"
+                }
             )
         } else {
             failure.text.clone()
@@ -478,7 +565,7 @@ impl App {
                     }
                 }
                 self.refilter(None);
-                self.focus = Focus::List;
+                self.set_focus(Focus::List);
                 self.say("Deleted");
             }
             other => self.busy = other,
@@ -646,6 +733,19 @@ impl App {
                 if let Some(list) = panes.list {
                     notebook.list.relayout(list);
                 }
+                if let Some(list) = layout::enrolled(surface) {
+                    // A list laid out while the window had no room for it
+                    // takes its count now.
+                    let count = notebook.keys.keys.labels.len();
+                    if notebook.keys.list.count() == count {
+                        notebook.keys.list.relayout(list);
+                    } else {
+                        notebook
+                            .keys
+                            .list
+                            .set_items(count, notebook.keys.keys.using, list);
+                    }
+                }
                 for (model, field) in [
                     (&mut notebook.search, panes.search),
                     (&mut notebook.title, panes.title),
@@ -660,9 +760,14 @@ impl App {
                     surface,
                 });
             }
-            Phase::Locked { list, .. } => {
+            Phase::Locked { keys, list } => {
                 if let Some(view) = layout::keys(surface) {
-                    list.relayout(view);
+                    let count = keys.as_ref().map_or(0, Vec::len);
+                    if list.count() == count {
+                        list.relayout(view);
+                    } else {
+                        list.set_items(count, (count > 0).then_some(0), view);
+                    }
                 }
             }
             _ => {}
@@ -694,6 +799,13 @@ impl App {
     }
 
     fn set_focus(&mut self, focus: Focus) {
+        // What finishes under the keys view moves the focus it returns to.
+        if focus != Focus::Keys {
+            if let Some(notebook) = self.notebook().filter(|notebook| notebook.keys.showing) {
+                notebook.keys.before = focus;
+                return;
+            }
+        }
         if self.focus != focus {
             self.focus = focus;
             self.sync_focus();
@@ -1007,6 +1119,197 @@ impl App {
         self.say("Deleting");
     }
 
+    // The keys view.
+
+    /// Puts the keys view up or away. While it is up the panes take no
+    /// input: a paste asked for them is dropped and a drag ends.
+    fn show_keys(&mut self, showing: bool) {
+        let focus = self.focus;
+        let Some(notebook) = self.notebook() else {
+            return;
+        };
+        if notebook.keys.showing == showing {
+            return;
+        }
+        notebook.keys.showing = showing;
+        let next = if showing {
+            notebook.keys.before = focus;
+            Focus::Keys
+        } else {
+            notebook.keys.marked.fill(false);
+            notebook.keys.before
+        };
+        if showing {
+            if matches!(self.paste, Some(Target::Pane | Target::Field(_))) {
+                self.paste = None;
+            }
+            if self.drag.take().is_some() {
+                let _ = self.pane.dispatch(Event::CancelPointer);
+            }
+        }
+        self.set_focus(next);
+        // The status row keeps what an operation reported.
+        if showing && self.busy.is_none() {
+            self.say(KEYS_HINT);
+        } else if !showing && self.status == KEYS_HINT {
+            self.say("");
+        }
+        self.redraw = true;
+    }
+
+    /// The selected key, when the keys view is up.
+    fn selected_key(&self) -> Option<usize> {
+        match &self.phase {
+            Phase::Unlocked(notebook) if notebook.keys.showing => notebook
+                .keys
+                .list
+                .selected()
+                .filter(|&index| index < notebook.keys.keys.labels.len()),
+            _ => None,
+        }
+    }
+
+    fn toggle_mark(&mut self) {
+        let Some(index) = self.selected_key() else {
+            return;
+        };
+        if let Some(mark) = self
+            .notebook()
+            .and_then(|notebook| notebook.keys.marked.get_mut(index))
+        {
+            *mark = !*mark;
+            self.redraw = true;
+        }
+    }
+
+    /// Authorizes later saves with the selected key; no token is asked.
+    fn use_key(&mut self) {
+        if self.busy.is_some() {
+            return self.say("Wait for the current operation to finish");
+        }
+        let Some(key) = self.selected_key() else {
+            return self.say("Choose a key to authorize saves with");
+        };
+        let using = self
+            .notebook()
+            .and_then(|notebook| notebook.keys.keys.using);
+        if using == Some(key) {
+            return self.say("That key already authorizes saves");
+        }
+        let op = self.op();
+        self.out.push(Out::Send(Command::UseKey { op, key }));
+        self.busy = Some(Busy::Keys {
+            op,
+            what: KeyOp::Use,
+        });
+        self.say("Choosing the key that authorizes saves");
+    }
+
+    fn add_key(&mut self) {
+        if self.busy.is_some() {
+            return self.say("Wait for the current operation to finish");
+        }
+        if !self
+            .notebook()
+            .is_some_and(|notebook| notebook.keys.showing)
+        {
+            return;
+        }
+        let op = self.op();
+        self.out.push(Out::Send(Command::AddKey { op }));
+        self.busy = Some(Busy::Keys {
+            op,
+            what: KeyOp::Add,
+        });
+        self.say("Adding a backup key");
+    }
+
+    /// The keys a replacement revokes: the marked ones, else the selected.
+    fn revoking(&self) -> Vec<usize> {
+        let Phase::Unlocked(notebook) = &self.phase else {
+            return Vec::new();
+        };
+        let marked: Vec<usize> = notebook
+            .keys
+            .marked
+            .iter()
+            .enumerate()
+            .filter(|(_, marked)| **marked)
+            .map(|(index, _)| index)
+            .filter(|&index| index < notebook.keys.keys.labels.len())
+            .collect();
+        if marked.is_empty() {
+            self.selected_key().into_iter().collect()
+        } else {
+            marked
+        }
+    }
+
+    /// Asks before revoking: a revoked key no longer opens the notebook.
+    fn replace_keys(&mut self, opener: Option<(i64, i64)>) {
+        if self.busy.is_some() {
+            return self.say("Wait for the current operation to finish");
+        }
+        let revoked = self.revoking();
+        let Phase::Unlocked(notebook) = &self.phase else {
+            return;
+        };
+        let labels = &notebook.keys.keys.labels;
+        if revoked.is_empty() {
+            return self.say("Choose or mark the keys to replace");
+        }
+        if revoked.len() >= labels.len() {
+            return self.say("Keep at least one key: the kept keys authorize the replacement");
+        }
+        let mut details: Vec<String> = revoked
+            .iter()
+            .filter_map(|&index| labels.get(index))
+            .map(|key| format!("Revoked: the {} key {}", key.role.name(), key.fingerprint))
+            .collect();
+        let primary = revoked.iter().any(|&index| {
+            labels
+                .get(index)
+                .is_some_and(|key| key.role == crate::protocol::Role::Primary)
+        });
+        details.push(format!(
+            "Each kept key is asked for, then one new key is enrolled as the {}.",
+            if primary { "primary" } else { "backup" }
+        ));
+        details.push(
+            "A revoked key no longer opens this notebook. Copies exported earlier still open with it."
+                .to_owned(),
+        );
+        let title = match revoked.len() {
+            1 => "Replace this key?".to_owned(),
+            count => format!("Replace these {count} keys?"),
+        };
+        self.dialog_revision += 1;
+        let revision = self.dialog_revision;
+        let model = move || {
+            let details: Vec<&str> = details.iter().map(String::as_str).collect();
+            Model::new(&title, "Replace", &details, Act::Replace, revision)
+        };
+        self.open_dialog(&model, None, opener);
+    }
+
+    fn replace_now(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let revoked = self.revoking();
+        if revoked.is_empty() {
+            return;
+        }
+        let op = self.op();
+        self.out
+            .push(Out::Send(Command::ReplaceKeys { op, revoked }));
+        self.busy = Some(Busy::Keys {
+            op,
+            what: KeyOp::Replace,
+        });
+        self.say("Replacing keys");
+    }
+
     /// Gives up the open entry's unsaved changes: its document closes and
     /// the entry is no longer open, so no edit stays on screen as if it
     /// were saved; what follows opens whatever comes next.
@@ -1058,6 +1361,13 @@ fn notebook(entries: Vec<Item>) -> Result<Notebook, String> {
     let field =
         || EntryModel::new(FIELD_BYTES).map_err(|_| "td-pass cannot hold a text field".to_owned());
     Ok(Notebook {
+        keys: KeyView {
+            keys: Keys::default(),
+            list: ListModel::default(),
+            marked: Vec::new(),
+            showing: false,
+            before: Focus::Search,
+        },
         shown: (0..entries.len()).collect(),
         entries,
         search: field()?,
@@ -1101,18 +1411,19 @@ fn matches_folded(title: &str, needle: &str) -> bool {
         })
 }
 
-/// The status line while a prompt waits.
+/// The prompt's instruction and the status line while it waits: the key
+/// first, so a narrow row cuts the operation's words, not which key.
 fn asking(ask: &Ask) -> String {
     let key = match &ask.key {
         Some(fingerprint) => format!("the {} key {fingerprint}", ask.role.name()),
         None => format!("the key to enroll as {}", ask.role.name()),
     };
-    match ask.pin {
-        None => format!("{}: connect {key}", ask.operation),
-        Some(PinUse::Authorize) => format!("{}: the PIN of {key}", ask.operation),
-        Some(PinUse::Enroll) => format!("{}: the PIN of {key}", ask.operation),
-        Some(PinUse::Proof) => format!("{}: the PIN of {key} again, to prove it", ask.operation),
-    }
+    let what = match ask.pin {
+        None => format!("Connect {key}"),
+        Some(PinUse::Authorize | PinUse::Enroll) => format!("Type the PIN of {key}"),
+        Some(PinUse::Proof) => format!("Type the PIN of {key} once more"),
+    };
+    format!("{what}, to {}", ask.operation)
 }
 
 #[cfg(test)]

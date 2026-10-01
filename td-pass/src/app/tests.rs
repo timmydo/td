@@ -71,7 +71,12 @@ fn op_of(out: &[Out]) -> Op {
     out.iter()
         .find_map(|out| match out {
             Out::Send(
-                Command::Unlock { op, .. } | Command::Create { op } | Command::Apply { op, .. },
+                Command::Unlock { op, .. }
+                | Command::Create { op }
+                | Command::Apply { op, .. }
+                | Command::UseKey { op, .. }
+                | Command::AddKey { op }
+                | Command::ReplaceKeys { op, .. },
             ) => Some(*op),
             _ => None,
         })
@@ -126,8 +131,33 @@ fn unlocked(board: &mut Board, entries: Vec<Item>) -> App {
         other => panic!("{other:?}"),
     }
     assert!(app.prompt.is_none());
-    app.reply(Reply::Unlocked { op, entries });
+    app.reply(Reply::Unlocked {
+        op,
+        entries,
+        keys: two_keys(),
+    });
     assert!(matches!(app.phase, Phase::Unlocked(_)));
+    app
+}
+
+/// The primary, authorizing saves, and one backup.
+fn two_keys() -> Keys {
+    Keys {
+        labels: vec![
+            label(Role::Primary, "0a0b0c0d"),
+            label(Role::Backup, "01020304"),
+        ],
+        using: Some(0),
+    }
+}
+
+/// Opens the keys view of an unlocked notebook.
+fn keys_view(board: &mut Board) -> App {
+    let mut app = unlocked(board, vec![item(1, "Bank")]);
+    key(&mut app, board, "C-k");
+    assert!(notebook(&app).keys.showing);
+    assert_eq!(app.focus, Focus::Keys);
+    assert_eq!(notebook(&app).keys.list.selected(), Some(0));
     app
 }
 
@@ -544,6 +574,18 @@ fn every_phase_paints() {
     // The notebook with its list, title, pane and find field.
     key(&mut app, &mut board, "C-f");
     paint(&mut app, &mut frames);
+    // The keys view, a key marked, and the question before replacing it.
+    key(&mut app, &mut board, "Escape");
+    key(&mut app, &mut board, "C-k");
+    key(&mut app, &mut board, "Space");
+    paint(&mut app, &mut frames);
+    key(&mut app, &mut board, "Delete");
+    assert!(app.dialog.is_some());
+    paint(&mut app, &mut frames);
+    key(&mut app, &mut board, "Escape");
+    key(&mut app, &mut board, "Escape");
+    assert!(!notebook(&app).keys.showing);
+    key(&mut app, &mut board, "C-f");
     // The unsaved-changes question over it.
     key(&mut app, &mut board, "Escape");
     typed(&mut app, &mut board, "x");
@@ -910,4 +952,349 @@ fn search_folds_case_without_copies() {
     assert!(matches_folded("abc", ""));
     assert!(!matches_folded("ab", "abc"));
     assert!(!matches_folded("", "a"));
+}
+
+#[test]
+fn the_keys_view_lists_the_keys_and_use_chooses_the_key_for_saves() {
+    let mut board = Board::default();
+    let mut app = keys_view(&mut board);
+    // The key already authorizing saves asks nothing.
+    key(&mut app, &mut board, "Return");
+    assert!(app.take_out().is_empty());
+    key(&mut app, &mut board, "Down");
+    key(&mut app, &mut board, "Return");
+    let out = app.take_out();
+    assert!(matches!(
+        out[..],
+        [Out::Send(Command::UseKey { key: 1, .. })]
+    ));
+    let op = op_of(&out);
+    // A key operation in flight holds the next.
+    key(&mut app, &mut board, "Return");
+    assert!(app.take_out().is_empty());
+    app.reply(Reply::Keys {
+        op,
+        keys: Keys {
+            using: Some(1),
+            ..two_keys()
+        },
+    });
+    assert!(app.busy.is_none());
+    assert_eq!(notebook(&app).keys.keys.using, Some(1));
+    assert_eq!(
+        app.status,
+        "Saves are now authorized by the backup key 01020304"
+    );
+    // A late or foreign answer changes nothing.
+    app.reply(Reply::Keys {
+        op,
+        keys: two_keys(),
+    });
+    assert_eq!(notebook(&app).keys.keys.using, Some(1));
+    key(&mut app, &mut board, "Escape");
+    assert!(!notebook(&app).keys.showing);
+    // Back to the field focused before the view.
+    assert_eq!(app.focus, Focus::Search);
+}
+
+#[test]
+fn adding_a_key_goes_through_the_prompt_and_lists_the_new_key() {
+    let mut board = Board::default();
+    let mut app = keys_view(&mut board);
+    key(&mut app, &mut board, "Insert");
+    let out = app.take_out();
+    assert!(matches!(out[..], [Out::Send(Command::AddKey { .. })]));
+    let op = op_of(&out);
+    app.reply(Reply::Ask {
+        op,
+        ask: Ask {
+            operation: "add a key",
+            role: Role::Backup,
+            key: None,
+            pin: Some(PinUse::Enroll),
+        },
+    });
+    assert!(app.prompt.is_some());
+    typed(&mut app, &mut board, "5678");
+    key(&mut app, &mut board, "Return");
+    assert!(matches!(app.take_out()[..], [Out::Answer(o, Answer::Pin(_))] if o == op));
+    let mut keys = two_keys();
+    keys.labels.push(label(Role::Backup, "0f0f0f0f"));
+    app.reply(Reply::Keys { op, keys });
+    assert!(app.prompt.is_none());
+    assert_eq!(notebook(&app).keys.keys.labels.len(), 3);
+    // A narrow prompt row cuts the operation's words, not the key.
+    assert!(asking(&Ask {
+        operation: "authorize key replacement with a retained key",
+        role: Role::Backup,
+        key: Some("01020304".to_owned()),
+        pin: None,
+    })
+    .starts_with("Connect the backup key 01020304, to "));
+    assert_eq!(notebook(&app).keys.marked, vec![false; 3]);
+    assert_eq!(app.status, "Added the backup key 0f0f0f0f");
+}
+
+#[test]
+fn replacing_asks_first_revokes_the_marked_keys_and_keeps_one() {
+    let mut board = Board::default();
+    let mut app = keys_view(&mut board);
+    // Every key marked leaves none to authorize the replacement.
+    key(&mut app, &mut board, "Space");
+    key(&mut app, &mut board, "Down");
+    key(&mut app, &mut board, "Space");
+    key(&mut app, &mut board, "Delete");
+    assert!(app.dialog.is_none());
+    assert!(app.status.starts_with("Keep at least one key"));
+    // The backup unmarked, the primary alone is revoked, after the question.
+    key(&mut app, &mut board, "Space");
+    assert_eq!(notebook(&app).keys.marked, vec![true, false]);
+    key(&mut app, &mut board, "Delete");
+    assert!(app.dialog.is_some());
+    assert!(app.take_out().is_empty());
+    key(&mut app, &mut board, "Tab");
+    key(&mut app, &mut board, "Return");
+    let out = app.take_out();
+    assert!(
+        matches!(&out[..], [Out::Send(Command::ReplaceKeys { revoked, .. })] if *revoked == [0]),
+        "{out:?}"
+    );
+    let op = op_of(&out);
+    app.reply(Reply::Keys {
+        op,
+        keys: Keys {
+            labels: vec![
+                label(Role::Backup, "01020304"),
+                label(Role::Primary, "0e0e0e0e"),
+            ],
+            using: Some(1),
+        },
+    });
+    assert_eq!(notebook(&app).keys.marked, vec![false, false]);
+    assert!(app
+        .status
+        .starts_with("Replaced: the new primary key is 0e0e0e0e"));
+    // With nothing marked, the selected key is the one asked about.
+    key(&mut app, &mut board, "Home");
+    key(&mut app, &mut board, "Delete");
+    assert!(app.dialog.is_some());
+    key(&mut app, &mut board, "Escape");
+    assert!(app.dialog.is_none());
+    assert!(app.take_out().is_empty());
+}
+
+#[test]
+fn lock_during_a_key_operation_cancels_it_and_keeps_no_view() {
+    let mut board = Board::default();
+    let mut app = keys_view(&mut board);
+    key(&mut app, &mut board, "Insert");
+    let op = op_of(&app.take_out());
+    key(&mut app, &mut board, "C-l");
+    let out = app.take_out();
+    assert!(
+        matches!(out[..], [Out::Cancel, Out::Send(Command::Lock)]),
+        "{out:?}"
+    );
+    app.reply(Reply::Keys {
+        op,
+        keys: two_keys(),
+    });
+    assert!(matches!(app.phase, Phase::Locking));
+    app.reply(Reply::Locked {
+        keys: Some(two_keys().labels),
+    });
+    assert!(matches!(app.phase, Phase::Locked { .. }));
+}
+
+#[test]
+fn the_keys_view_keeps_the_open_entrys_unsaved_edits() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    key(&mut app, &mut board, "Return");
+    open(&mut app, &mut board, "Down", "body");
+    key(&mut app, &mut board, "Return");
+    typed(&mut app, &mut board, "x");
+    // A paste asked for the pane is dropped when the view comes up.
+    key(&mut app, &mut board, "C-v");
+    key(&mut app, &mut board, "C-k");
+    assert!(notebook(&app).keys.showing);
+    app.input(Input::Paste("pasted"), &mut board);
+    // The editor does not take keys while the view is up.
+    typed(&mut app, &mut board, "y");
+    key(&mut app, &mut board, "Escape");
+    assert!(app.dirty());
+    assert_eq!(text(&app), "xbody");
+    // The focus goes back where it was.
+    assert_eq!(app.focus, Focus::Editor);
+}
+
+/// Presses at `(x, y)`, with Shift when `extend`.
+fn press(app: &mut App, board: &mut Board, (x, y): (i64, i64), extend: bool) {
+    for phase in [PointerPhase::Press, PointerPhase::Release] {
+        app.input(
+            Input::Pointer {
+                phase,
+                x,
+                y,
+                extend,
+                follow: false,
+            },
+            board,
+        );
+    }
+}
+
+fn click_button(app: &mut App, board: &mut Board, labels: &'static [&'static str], index: usize) {
+    let at = button(app, labels, index);
+    press(app, board, at, false);
+}
+
+fn click_row(app: &mut App, board: &mut Board, index: usize, extend: bool) {
+    let at = key_row(app, index);
+    press(app, board, at, extend);
+}
+
+/// A point on the strip's button `index`.
+fn button(app: &App, labels: &'static [&'static str], index: usize) -> (i64, i64) {
+    let strip = layout::strip(app.surface, labels);
+    let rect = strip.rect();
+    let y = rect.y + i64::from(rect.height) / 2;
+    let x = (rect.x..rect.x + i64::from(rect.width))
+        .find(|&x| strip.hit(x, y) == Some(index))
+        .expect("the button is on the strip");
+    (x, y)
+}
+
+/// A point on the keys view's row `index`.
+fn key_row(app: &App, index: usize) -> (i64, i64) {
+    let list = layout::enrolled(app.surface).unwrap().rect();
+    let row = layout::row(app.surface);
+    (
+        list.x + 4 * layout::cell(app.surface),
+        list.y + row * index as i64 + row / 2,
+    )
+}
+
+#[test]
+fn the_strips_buttons_reach_the_keys_view_and_its_actions() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    click_button(&mut app, &mut board, &layout::NOTEBOOK, 5);
+    assert!(notebook(&app).keys.showing);
+    // Shift and a press marks a row; a press alone selects it.
+    click_row(&mut app, &mut board, 1, true);
+    assert_eq!(notebook(&app).keys.marked, vec![false, true]);
+    assert_eq!(notebook(&app).keys.list.selected(), Some(1));
+    click_row(&mut app, &mut board, 0, false);
+    assert_eq!(notebook(&app).keys.marked, vec![false, true]);
+    // Replace asks about the marked key, not the selected one.
+    click_button(&mut app, &mut board, &layout::KEYS, 3);
+    assert!(app.dialog.is_some());
+    key(&mut app, &mut board, "Escape");
+    assert!(app.take_out().is_empty());
+    // Use for saves on the selected primary, which already authorizes.
+    click_button(&mut app, &mut board, &layout::KEYS, 1);
+    assert!(app.take_out().is_empty());
+    click_row(&mut app, &mut board, 1, false);
+    click_button(&mut app, &mut board, &layout::KEYS, 1);
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Send(Command::UseKey { key: 1, .. })]
+    ));
+    app.busy = None;
+    click_button(&mut app, &mut board, &layout::KEYS, 2);
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Send(Command::AddKey { .. })]
+    ));
+    app.busy = None;
+    click_button(&mut app, &mut board, &layout::KEYS, 0);
+    assert!(!notebook(&app).keys.showing);
+    assert_eq!(notebook(&app).keys.marked, vec![false, false]);
+    click_button(&mut app, &mut board, &layout::NOTEBOOK, 6);
+    assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
+}
+
+#[test]
+fn a_held_space_marks_once_and_the_hint_does_not_outlive_the_view() {
+    let mut board = Board::default();
+    let mut app = keys_view(&mut board);
+    assert_eq!(app.status, KEYS_HINT);
+    key(&mut app, &mut board, "Space");
+    app.input(
+        Input::Key {
+            chord: "Space",
+            repeat: true,
+        },
+        &mut board,
+    );
+    assert_eq!(notebook(&app).keys.marked, vec![true, false]);
+    key(&mut app, &mut board, "Escape");
+    assert_eq!(app.status, "");
+    // A failure's report stays when the view is put away.
+    key(&mut app, &mut board, "C-k");
+    key(&mut app, &mut board, "Insert");
+    let op = op_of(&app.take_out());
+    app.reply(Reply::Failed {
+        op,
+        failure: Failure {
+            text: "the vault store did not answer".to_owned(),
+            stale: false,
+            uncertain: true,
+            cancelled: false,
+        },
+    });
+    let report =
+        "the vault store did not answer: lock and unlock again to see what keys the vault holds";
+    assert_eq!(app.status, report);
+    key(&mut app, &mut board, "Escape");
+    assert_eq!(app.status, report);
+}
+
+#[test]
+fn a_list_laid_out_without_room_takes_its_keys_when_the_window_grows() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    let tiny = Surface::new(40, 30, td_ui::raster::Scale::default()).unwrap();
+    app.input(Input::Resize(tiny), &mut board);
+    let mut keys = two_keys();
+    keys.labels.push(label(Role::Backup, "0f0f0f0f"));
+    app.set_keys(keys);
+    let roomy = Surface::new(800, 600, td_ui::raster::Scale::default()).unwrap();
+    app.input(Input::Resize(roomy), &mut board);
+    assert_eq!(notebook(&app).keys.list.count(), 3);
+    // The locked list as well.
+    app.input(Input::Resize(tiny), &mut board);
+    key(&mut app, &mut board, "C-l");
+    app.reply(Reply::Locked {
+        keys: Some(two_keys().labels),
+    });
+    app.input(Input::Resize(roomy), &mut board);
+    let Phase::Locked { list, .. } = &app.phase else {
+        panic!("locked");
+    };
+    assert_eq!(list.count(), 2);
+}
+
+#[test]
+fn an_operation_ending_under_the_keys_view_moves_the_focus_it_returns() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    key(&mut app, &mut board, "Return");
+    open(&mut app, &mut board, "Down", "body");
+    key(&mut app, &mut board, "Return");
+    assert_eq!(app.focus, Focus::Editor);
+    app.delete(None);
+    key(&mut app, &mut board, "Tab");
+    key(&mut app, &mut board, "Return");
+    let op = op_of(&app.take_out());
+    key(&mut app, &mut board, "C-k");
+    app.reply(Reply::Committed {
+        op,
+        id: [1; 16],
+        revision: None,
+    });
+    assert_eq!(app.focus, Focus::Keys, "the view keeps the keys");
+    key(&mut app, &mut board, "Escape");
+    assert_eq!(app.focus, Focus::List, "not the closed entry's pane");
 }

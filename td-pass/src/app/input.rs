@@ -93,7 +93,7 @@ impl App {
         }
         match self.phase {
             Phase::Locked { .. } => self.locked_key(chord),
-            Phase::Unlocked(_) => self.notebook_key(chord, clipboard),
+            Phase::Unlocked(_) => self.notebook_key(chord, repeat, clipboard),
             _ => {}
         }
     }
@@ -114,8 +114,15 @@ impl App {
         }
     }
 
-    fn notebook_key(&mut self, chord: &str, clipboard: &mut dyn Clipboard) {
+    fn notebook_key(&mut self, chord: &str, repeat: bool, clipboard: &mut dyn Clipboard) {
+        if self
+            .notebook()
+            .is_some_and(|notebook| notebook.keys.showing)
+        {
+            return self.keys_key(chord, repeat);
+        }
         match chord {
+            "C-k" => return self.show_keys(true),
             "C-s" => return self.save(None),
             "C-n" => return self.request(Then::New, None),
             "C-l" => return self.request(Then::Lock, None),
@@ -166,6 +173,33 @@ impl App {
             },
             Focus::Editor => self.pane_key(chord, clipboard),
             Focus::Keys => {}
+        }
+    }
+
+    /// The keys view's keys: the list's steps, Space to mark a key for
+    /// replacement, Return to authorize saves with the selected key,
+    /// Insert to add a backup and Delete to replace.
+    fn keys_key(&mut self, chord: &str, repeat: bool) {
+        match chord {
+            "Escape" | "C-k" => return self.show_keys(false),
+            "C-l" => return self.request(Then::Lock, None),
+            // A held key acts once: Space would flicker a mark, and the
+            // rest would ask again over the operation they began.
+            "Space" | " " | "Return" | "Insert" | "Delete" if repeat => return,
+            "Space" | " " => return self.toggle_mark(),
+            "Return" => return self.use_key(),
+            "Insert" => return self.add_key(),
+            "Delete" => return self.replace_keys(None),
+            _ => {}
+        }
+        let surface = self.surface;
+        let Some(notebook) = self.notebook() else {
+            return;
+        };
+        if let (Some(step), Some(view)) = (Step::from_chord(chord), layout::enrolled(surface)) {
+            if notebook.keys.list.step(step, view).any() {
+                self.redraw = true;
+            }
         }
     }
 
@@ -545,6 +579,7 @@ impl App {
                 self.redraw = true;
                 match (choice, then) {
                     (Choice::Confirmed(Act::Delete), _) => self.delete_now(),
+                    (Choice::Confirmed(Act::Replace), _) => self.replace_now(),
                     (Choice::Confirmed(Act::Save), Some(then)) => self.save(Some(then)),
                     (Choice::Confirmed(Act::Discard), Some(then)) => {
                         self.discard();
@@ -573,6 +608,13 @@ impl App {
             return self.dialog_outcome(outcome);
         }
         match &mut self.phase {
+            Phase::Unlocked(notebook) if notebook.keys.showing => {
+                if let Some(view) = layout::enrolled(surface) {
+                    if notebook.keys.list.scroll(rows as i64, view).any() {
+                        self.redraw = true;
+                    }
+                }
+            }
             Phase::Unlocked(notebook) => {
                 let panes = layout::panes(surface, notebook.finding);
                 let over_list = pointer.is_some_and(|(x, y)| {
@@ -670,6 +712,28 @@ impl App {
                     }
                 }
             }
+            Phase::Unlocked(notebook) if notebook.keys.showing => {
+                match layout::strip(surface, &layout::KEYS).hit(x, y) {
+                    Some(0) => return self.show_keys(false),
+                    Some(1) => return self.use_key(),
+                    Some(2) => return self.add_key(),
+                    Some(3) => return self.replace_keys(opener),
+                    Some(4) => return self.request(Then::Lock, opener),
+                    _ => {}
+                }
+                let Some(notebook) = self.notebook() else {
+                    return;
+                };
+                if let Some(view) = layout::enrolled(surface) {
+                    if notebook.keys.list.press(view, x, y).is_some() {
+                        self.redraw = true;
+                        // Shift and a press marks the key, as Space does.
+                        if extend {
+                            self.toggle_mark();
+                        }
+                    }
+                }
+            }
             Phase::Unlocked(notebook) => {
                 match layout::strip(surface, &layout::NOTEBOOK).hit(x, y) {
                     Some(0) => return self.request(Then::New, opener),
@@ -677,7 +741,8 @@ impl App {
                     Some(2) => return self.delete(opener),
                     Some(3) => return self.save(None),
                     Some(4) => return self.open_find(),
-                    Some(5) => return self.request(Then::Lock, opener),
+                    Some(5) => return self.show_keys(true),
+                    Some(6) => return self.request(Then::Lock, opener),
                     _ => {}
                 }
                 let panes = layout::panes(surface, notebook.finding);

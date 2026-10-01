@@ -1,7 +1,7 @@
-//! The frame: the action strip, the locked view or the notebook's panes,
-//! the status row, and the prompt or dialog over them. Titles and entry
-//! text are painted only while unlocked; a lock clears what holds them
-//! before the next frame.
+//! The frame: the action strip, the locked view, the notebook's panes or
+//! its keys, the status row, and the prompt or dialog over them. Titles
+//! and entry text are painted only while unlocked; a lock clears what
+//! holds them before the next frame.
 
 use td_ui::chrome::{Item, Status};
 use td_ui::raster::{
@@ -64,6 +64,9 @@ impl Composition for Frame<'_> {
         let surface = app.surface;
         fill(surface.bounds(), PAPER, damage, sink);
         match &app.phase {
+            Phase::Unlocked(notebook) if notebook.keys.showing => {
+                self.keys(&notebook.keys, damage, sink);
+            }
             Phase::Unlocked(notebook) => {
                 let open = notebook.open.is_some();
                 let saved = notebook.open.as_ref().is_some_and(|open| open.id.is_some());
@@ -74,6 +77,7 @@ impl Composition for Frame<'_> {
                     idle && saved,
                     idle && open,
                     app.open_tab().is_some(),
+                    true,
                     true,
                 ];
                 layout::strip(surface, &layout::NOTEBOOK).emit(
@@ -202,6 +206,84 @@ impl Composition for Frame<'_> {
 }
 
 impl Frame<'_> {
+    fn keys(&self, view: &super::KeyView, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        let app = self.app;
+        let surface = app.surface;
+        let idle = app.busy.is_none();
+        let selected = view.list.selected();
+        let count = view.keys.labels.len();
+        layout::strip(surface, &layout::KEYS).emit(
+            [
+                (false, true),
+                (
+                    false,
+                    idle && selected.is_some() && selected != view.keys.using,
+                ),
+                (false, idle),
+                (false, idle && count > 1),
+                (false, true),
+            ],
+            damage,
+            sink,
+        );
+        let body = layout::body(surface, &layout::KEYS);
+        let row = layout::row(surface);
+        for (index, text) in [
+            "The keys that open this notebook. Each one can unlock it alone.",
+            "Space marks keys for Replace; Use for saves picks the key a save asks for.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            line(
+                surface,
+                Rect {
+                    y: body.y + index as i64 * row,
+                    height: row as u32,
+                    ..body
+                },
+                text,
+                PAPER,
+                damage,
+                sink,
+            );
+        }
+        let Some(list) = layout::enrolled(surface) else {
+            return;
+        };
+        let labels: Vec<String> = view
+            .keys
+            .labels
+            .iter()
+            .map(|key| format!("{} key {}", key.role.name(), key.fingerprint))
+            .collect();
+        let window = view.list.window(list);
+        let first = window.start;
+        view.list.emit(
+            list,
+            labels
+                .get(window)
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .map(|(offset, label)| {
+                    let index = first + offset;
+                    Item {
+                        label,
+                        meta: if view.keys.using == Some(index) {
+                            "authorizes saves"
+                        } else {
+                            ""
+                        },
+                        enabled: true,
+                        marked: view.marked.get(index).copied().unwrap_or(false),
+                    }
+                }),
+            damage,
+            sink,
+        );
+    }
+
     fn notebook(&self, notebook: &super::Notebook, damage: Rect, sink: &mut dyn FnMut(Draw)) {
         let app = self.app;
         let surface = app.surface;
