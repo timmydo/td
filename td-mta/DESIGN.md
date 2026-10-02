@@ -63,7 +63,9 @@ A bounded mailbox-parent walker now checks one supplied ReadView chain for
 missing targets and cycles without retaining a visited-node collection.
 Incremental frame validation now checks supplied operations and their final
 footer without retaining a complete frame; entries remain provisional until
-completion. Retained-history change cursors still need their I/O integration.
+completion. A frame-change collector copies compact descriptors into separate
+caller slots and exposes them only after checksum completion. Retained-history
+change cursors still need their I/O integration.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
@@ -401,7 +403,7 @@ arena ledger with byte counts, worker stack sizes, scratch reservations, and
 TLS headroom before committing a default profile. A larger configured pool
 cannot silently retain the default memory claim.
 
-The ledger reserves 96453888 bytes under the default 96 MiB planning budget,
+The ledger reserves 96650496 bytes under the default 96 MiB planning budget,
 including planned stack, TLS, reload and process allowances. Default connection
 counts remain eight SMTP, eight HTTPS and one outbound delivery. Established
 TLS processing has a separate allowance for the single main thread, alongside

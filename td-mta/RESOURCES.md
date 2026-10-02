@@ -21,7 +21,7 @@ the checked ledger and pass the budget gate before admission is enabled.
 | SMTP slots | 8 | 376064 | 3008512 |
 | HTTPS slots | 8 | 1703936 | 13631488 |
 | Body/search jobs | 2 | 425984 | 851968 |
-| Storage read views | 2 | 4657152 | 9314304 |
+| Storage read views | 2 | 4755456 | 9510912 |
 | Writer and checkpoint | 1 | 6946816 | 6946816 |
 | Resident index cache | 1 | 8388608 | 8388608 |
 | Outbound slots | 1 | 572672 | 572672 |
@@ -37,10 +37,13 @@ the checked ledger and pass the budget gate before admission is enabled.
 | Certificate generations | 2 | 8388608 | 16777216 |
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
-| **Total** | | | **96453888** |
+| **Total** | | | **96650496** |
 
-The total is approximately 91.99 MiB against a 96 MiB configured budget;
-the remaining 4209408 bytes are unassigned headroom, not another cache.
+The total is approximately 92.17 MiB against a 96 MiB configured budget;
+the remaining 4012800 bytes are unassigned headroom, not another cache.
+With all other defaults, three TLS handshake slots require 100844800 bytes;
+the default 96 MiB budget refuses that profile. Increase the configured memory
+budget explicitly when adding that third handshake slot.
 The 64 MiB idle and 128 MiB workload RSS release ceilings remain independent
 and unverified. The TLS entries are demand headroom, not additional arenas to
 allocate and touch at startup. Idle retains its actual current generation;
@@ -70,7 +73,7 @@ still account for those costs and concurrent owners within the ledger.
   without pinning storage views between emissions.
 - Body job: headers, 64 bytes per MIME descriptor, 96 KiB decode/work scratch.
   Nested parsing and transfer decoding share that reservation.
-- Read view: 4 MiB journal prefix, 32 bytes per journal operation, 196 KiB
+- Read view: 4 MiB journal prefix, 32 bytes per journal operation, 292 KiB
   cursor/value scratch. Backup consumes an existing view.
   The replay Overlay borrows the immutable frame arena and at most 8192
   caller-owned Cell values. Limits::plan checks each compiled Cell fits the
@@ -116,6 +119,17 @@ still account for those costs and concurrent owners within the ledger.
   No visited-ID collection, pool or additional result arena is created. The
   allocation probe covers a rooted chain, a cycle, a missing target and read
   exhaustion using a fixed view and caller buffer after cold preparation.
+  Frame-change collection has its own 4096 slots of at most 24 bytes each,
+  a separate 96 KiB reservation per view. Retained changes may coexist with
+  get/next result storage; their memory never aliases those partitions. This
+  adds 192 KiB for the default two views within the unchanged 96 MiB budget.
+  Limits::plan checks the compiled Cell layout. Collector retains only the
+  frame verifier, slot borrow and scalar progress; its compiled Provider layout
+  is capped at 1 KiB on the worker stack. Operations use the existing record
+  region, and copied CHANGE data survives reuse of that input. The allocation
+  interval covers maximum-capacity collection, repeated draining, corrupted
+  footer and short-slot failure after cold slot/input preparation. Runtime
+  cursor I/O, whole-worker stack/RSS and actual pin ownership remain pending.
 - Writer: one journal arena and descriptor array, one 1 MiB frame, and
   256 KiB table/manifest/value scratch, a separate 1 MiB input key/value
   arena and 4096 operation slots of 32 bytes. The latter bounds the actual
@@ -401,7 +415,7 @@ concrete structures require a ledger amendment before admission is enabled.
 | Reservation | Partition |
 | --- | --- |
 | Body work, 96 KiB/job | Six 8 KiB nested-decode rings (NestedPartId::MAX_STEPS); 16 KiB parser/boundary/locator state; 32 KiB conversion/output |
-| Read cursor/value, 196 KiB/view | 68 KiB table-record input; 64 KiB retained result value; 1 KiB key; 63 KiB cursors, history streaming, sparse-index lookups and checksums |
+| Read cursor/value, 292 KiB/view | 68 KiB table-record input; 64 KiB retained result value; 1 KiB key; 63 KiB cursors, history streaming, sparse-index lookups and checksums; 96 KiB retained frame changes |
 | Outbound scratch, 128 KiB | 64 KiB body transfer; 16 KiB reply assembly; 16 KiB SMTP/TLS handoff state; 32 KiB frame-planning/ID/diagnostic scratch |
 | DNS/control, 512 KiB | 128 KiB resolver + 384 KiB control as detailed below |
 | Log, 128 KiB | 384 queued fixed event cells of at most 256 bytes (96 KiB); 16 KiB encoder/output; 16 KiB rotation/drop counters and emergency status |

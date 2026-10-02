@@ -849,6 +849,16 @@ service activation. Each part lands independently:
     success and failure. This retains only digest/counters, enabling future
     retained-change input without another frame arena. File I/O, journal
     binding, change collection and ReadView integration remain separate work.
+  - **M05d14b — checked frame changes:** implemented caller-slot collection of
+    CHANGE type/ID/action and stored ordinal. Validate every supplied operation
+    and expose the compact sequence only after consuming frame completion.
+    Short capacity and malformed input retire the collector; row-only frames
+    need no change slots. Preserve duplicates and all v1 actions/types. Tests
+    compare mixed and maximum frames against the complete decoder, prove
+    copied ownership and exercise missing operations/corrupt footer/sticky
+    failure. Separate per-view change scratch permits interleaved row lookups;
+    the existing allocation probe covers bounded collection after preparation.
+    Physical history input, cursor policy and real ReadView pins remain future.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

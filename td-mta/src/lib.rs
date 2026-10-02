@@ -6,6 +6,7 @@ pub mod bounded;
 pub mod clock;
 pub mod config;
 pub mod format;
+pub mod frame_changes;
 pub mod gateway_policy;
 pub mod generations;
 pub mod ids;

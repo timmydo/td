@@ -8,8 +8,9 @@ pub const OUTBOUND_RECIPIENT_BATCH: usize = 100;
 /// Owned operation offsets/ordinal/type/kind, including Option layout.
 pub const OPERATION_SLOT_BYTES: usize = 32;
 pub const JOURNAL_SLOT_BYTES: usize = 32;
-/// Separate table record, retained result, key and cursor scratch.
-pub const READ_VIEW_SCRATCH_BYTES: usize = 196 * KIB;
+pub const CHANGE_SLOT_BYTES: usize = 24;
+/// Separate table record, retained result, key, cursor and retained frame changes.
+pub const READ_VIEW_SCRATCH_BYTES: usize = 292 * KIB;
 /// Planned provider session ceiling, not a measured worst-case bound.
 pub const TLS_SESSION_BYTES: usize = 512 * KIB;
 /// Planned provider construction/handshake ceiling; qualification remains required.
@@ -184,6 +185,10 @@ impl Limits {
     pub fn plan(self) -> Result<ResourcePlan, ResourceError> {
         self.validate_ranges()?;
         for (valid, rule) in [
+            (
+                std::mem::size_of::<crate::frame_changes::Cell>() <= CHANGE_SLOT_BYTES,
+                "retained change exceeds its scratch slot",
+            ),
             (
                 std::mem::size_of::<crate::overlay::Cell>() <= JOURNAL_SLOT_BYTES,
                 "journal index exceeds its operation slot",
@@ -413,11 +418,15 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 96_453_888);
+        assert_eq!(plan.total_bytes(), 96_650_496);
         const { assert!(crate::format::table::MAX_RECORD_BYTES <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
-            68 * KIB + crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 63 * KIB
+            68 * KIB
+                + crate::format::MAX_VALUE_BYTES
+                + crate::format::MAX_KEY_BYTES
+                + 63 * KIB
+                + CHANGE_SLOT_BYTES * crate::format::MAX_FRAME_OPERATIONS
         );
         assert_eq!(plan.limits().memory_budget_bytes, 96 * MIB);
         assert!(plan.total_bytes() < plan.limits().memory_budget_bytes);
@@ -451,12 +460,33 @@ mod tests {
         }
         .plan()
         .is_ok());
+        assert_eq!(
+            Limits {
+                tls_handshakes: 3,
+                ..defaults
+            }
+            .plan(),
+            Err(ResourceError::MemoryBudget {
+                required: 100_844_800,
+                available: 96 * MIB
+            })
+        );
+        assert!(Limits {
+            tls_handshakes: 3,
+            memory_budget_bytes: 100_844_800,
+            ..defaults
+        }
+        .plan()
+        .is_ok());
         Ok(())
     }
 
     #[test]
     fn tls_slot_growth_does_not_multiply_serial_record_work() -> Result<(), ResourceError> {
-        let defaults = Limits::default();
+        let defaults = Limits {
+            memory_budget_bytes: 128 * MIB,
+            ..Limits::default()
+        };
         let original = defaults.plan()?;
         for (limits, extra) in [
             (

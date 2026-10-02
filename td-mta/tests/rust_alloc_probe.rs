@@ -1047,6 +1047,7 @@ fn main() {
     journal_overlay();
     journal_merge();
     mailbox_parent_walks();
+    collected_frame_changes();
     hot_paths();
     println!("rust-allocation-probe-v1: counter-model forwarding hot-paths passed");
 }
@@ -1369,4 +1370,83 @@ fn mailbox_parent_walks() {
         assert_eq!(result.err(), expected);
     }
     assert_eq!(COUNTERS.snapshot(), before, "mailbox parent walk allocated");
+}
+
+fn collected_frame_changes() {
+    use td_mta::{
+        format::{frame, operation::Operation, ObjectType, Sequence, MAX_FRAME_OPERATIONS},
+        frame_changes::{Cell, Collector},
+        ports::ChangeAction,
+    };
+    let mut cells = vec![Cell::EMPTY; MAX_FRAME_OPERATIONS];
+    let mut bytes = vec![0; 104 + 28 * MAX_FRAME_OPERATIONS];
+    let operation = Operation::change(ObjectType::Email, ChangeAction::Updated, &[7; 16]);
+    let end = bytes.len() - 40;
+    for output in bytes.get_mut(64..end).unwrap().as_chunks_mut::<28>().0 {
+        operation.encode(output).unwrap();
+    }
+    frame::seal(
+        &td_crypto::Provider,
+        Sequence::from_u64(1),
+        MAX_FRAME_OPERATIONS,
+        &mut bytes,
+    )
+    .unwrap();
+    let mut bad_footer = [0; 40];
+    bad_footer.copy_from_slice(bytes.get(end..).unwrap());
+    *bad_footer.last_mut().unwrap() ^= 1;
+    let before = COUNTERS.snapshot();
+    for mode in [0, 1, 2, 0] {
+        let slots = if mode == 2 {
+            MAX_FRAME_OPERATIONS - 1
+        } else {
+            MAX_FRAME_OPERATIONS
+        };
+        let mut collector = Collector::new(
+            &td_crypto::Provider,
+            Sequence::default(),
+            bytes.get(..64).unwrap(),
+            cells.get_mut(..slots).unwrap(),
+        )
+        .unwrap();
+        for (index, input) in bytes
+            .get(64..end)
+            .unwrap()
+            .as_chunks::<28>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            let result = collector.push(black_box(input));
+            if mode == 2 && index == MAX_FRAME_OPERATIONS - 1 {
+                assert!(result.is_err());
+                assert!(collector.push(input).is_err());
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+        let footer = if mode == 1 {
+            &bad_footer
+        } else {
+            bytes.get(end..).unwrap()
+        };
+        let result = collector.finish(footer);
+        if mode == 0 {
+            let complete = result.unwrap();
+            assert_eq!(complete.len(), MAX_FRAME_OPERATIONS);
+            for _ in 0..2 {
+                for (index, record) in complete.records().enumerate() {
+                    assert_eq!(black_box(record).cursor.operation as usize, index);
+                    assert_eq!(record.change.id, [7; 16]);
+                }
+            }
+        } else {
+            assert!(result.is_err());
+        }
+    }
+    assert_eq!(
+        COUNTERS.snapshot(),
+        before,
+        "frame change collection allocated"
+    );
 }
