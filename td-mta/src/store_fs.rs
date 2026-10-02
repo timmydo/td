@@ -18,9 +18,9 @@ pub use input::{
 #[path = "store_fs/stopped.rs"]
 mod stopped;
 pub use stopped::{
-    CheckedData, CheckedFiles, DataError, DataLimits, DataStep, DataValidation, FileValidation,
-    ReadLimits, StoppedStore, ValidationError, ValidationLimits, ValidationReadRequest,
-    ValidationStep, ValidationView,
+    CaptureError, CaptureStep, CapturedJournal, CheckedData, CheckedFiles, DataError, DataLimits,
+    DataStep, DataValidation, FileValidation, JournalCapture, ReadLimits, StoppedStore,
+    ValidationError, ValidationLimits, ValidationReadRequest, ValidationStep, ValidationView,
 };
 #[path = "store_fs/selection.rs"]
 mod selection;

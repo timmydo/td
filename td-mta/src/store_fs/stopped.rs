@@ -12,6 +12,10 @@ use crate::{
     ports::{Crypto, ViewIdentity},
 };
 
+#[path = "stopped/capture.rs"]
+mod capture;
+pub use capture::{CaptureError, CaptureStep, CapturedJournal, JournalCapture};
+
 #[path = "stopped/validation.rs"]
 mod validation;
 pub use validation::{

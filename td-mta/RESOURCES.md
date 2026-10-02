@@ -184,6 +184,16 @@ still account for those costs and concurrent owners within the ledger.
   sweep, can create additional stack temporaries; whole-worker stack
   qualification remains pending. It transfers the existing record buffer from
   table to history work and returns the existing change slots, adding no arena.
+  JournalCapture and CapturedJournal each fit 2 KiB of provider state. Capture
+  borrows the existing 1 MiB whole-frame recovery scratch; its consuming finish
+  releases that borrow for reuse, with no new arena. Overlay loading still uses
+  the existing 4 MiB replay arena: the 1 MiB scratch suffices only for prefixes
+  whose frame bytes fit. Comparing the two prefix digests adds no I/O. Each
+  advance/finish still requires caller admission and deadline checks. The retained scan descriptor
+  overlaps the reopened prefix descriptor during overlay loading; release the
+  capture after handoff. No descriptor registry or serving lease is implied.
+  Tests allocate their frame storage before scanning; full-worker stack and
+  whole-process resource qualification remain separate.
   DataValidation retains one ValidationView, the four fixed sweep states and
   their scalar completion evidence. Provider state fits 8 KiB on the existing
   worker stack; only one sweep does I/O at a time. Construction/moves and inner

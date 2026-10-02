@@ -94,6 +94,9 @@ A retained-history sweep checks all selected immutable segments with shared
 record/change scratch and finite byte/frame admission.
 A stopped-store owner now retains the cooperative lock behind read-only
 validation operations; consuming it restores mutation access after borrows end.
+Its journal capture now derives the complete prefix and retained-history floor
+from a stopped scan, reports incomplete tails without repair, and loads the
+same prefix for replay using caller storage.
 A file-validation coordinator now couples that owner to the captured overlay,
 all selected table replays and retained history before returning borrowed
 physical-file evidence. An offline ReadView now connects this evidence to row

@@ -1006,6 +1006,16 @@ service activation. Each part lands independently:
     Real selected-file tests cover populated/empty success and errors in every
     phase, budgets, sticky failure and deadlines after blob reads/completion.
     Recovery repair/accounting, mutation policy and activation remain separate.
+  - **M05d27 — stopped journal capture:** implemented a read-only wrapper that
+    derives committed prefix identity/history floor from a completed bounded
+    scan and loads that same prefix into caller overlay storage. Keep repair
+    capability private, report incomplete tails, require End plus physical EOF
+    and release frame scratch at finish. Tests cover empty/complete/partial
+    input, corruption, capacity, premature finish, late size changes, history
+    floor derivation, unchanged tail bytes and downstream physical validation.
+    Compare reloaded prefix digests and test same-size valid replacement refusal
+    and dropping the capture before using the handed-off overlay.
+    Compile-fail cases pin owner retention and absence of a repair method.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

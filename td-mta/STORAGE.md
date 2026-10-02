@@ -489,6 +489,38 @@ same scratch after the failed view is dropped. An absolute deadline cannot
 interrupt a blocking std filesystem operation. Runtime view leases, service
 activation and complete logical validation remain separate.
 
+### Capturing a stopped journal prefix
+
+`StoppedStore::capture_journal` wraps the existing bounded whole-frame recovery
+scanner without exposing its repair-capable ScannedJournal. Supply selected
+metadata, a physical byte ceiling and the caller's 1 MiB frame buffer. For
+CURRENT authority, first load that metadata through the same stopped owner.
+Construction binds the selected journal header and retained-history floor;
+the floor is the first retained descriptor's base, or the checkpoint sequence
+when no history is retained.
+
+Each advance consumes at most one complete frame or observed incomplete tail,
+returning only sequence/operation counts. No borrowed frame or mutation handle
+escapes. End remains provisional: consuming finish requires End and verifies
+physical EOF before deriving ViewIdentity's committed sequence and prefix byte
+boundary from the scan summary. Any advance error retires the scan, and failed
+or unfinished scans cannot finish. Repeated End does no I/O; final size/EOF
+changes still refuse. The caller admits each whole-frame step and completion,
+including surrounding deadline checks; this wrapper adds no clock policy.
+
+CapturedJournal retains the stopped owner, selection and scanned read-only file.
+It reports physical bytes and incomplete-tail status without truncating anything.
+Its load_overlay method reopens only the captured valid prefix into the caller's
+replay storage, using the same owner/selection/identity and comparing the full
+prefix digest with the scan summary. Loading needs at least committed_offset
+minus the 96-byte journal header in the existing 4 MiB replay arena. The scan's
+1 MiB frame scratch is released at finish; it suffices for the replay only when
+the captured frame bytes fit. The scan descriptor and new prefix descriptor
+briefly coexist; drop CapturedJournal after handoff when its report is no
+longer needed. No repair method or raw ScannedJournal escapes.
+Table/history/blob/reference validation still follows before any service
+activation, and incomplete tails still require separately authorized repair.
+
 ### Validating final references and blob data
 
 `CheckedFiles::validate_data` borrows one ValidationView and the same stopped

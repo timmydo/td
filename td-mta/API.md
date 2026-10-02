@@ -808,6 +808,16 @@ This supplies offline validation reads, without service authorization, runtime
 pool leases, complete logical invariants or activation. The existing blocking
 std I/O duration limitation remains; a deadline check cannot interrupt a syscall.
 
+`StoppedStore::capture_journal` wraps a bounded stopped scan using caller frame
+scratch and a physical byte ceiling. Advances yield scalar frame progress or
+provisional End; finish verifies EOF and returns CapturedJournal with a derived
+ViewIdentity, selected metadata, byte totals and incomplete-tail status. Failed
+or unfinished scans cannot finish. The retained-history floor comes from the
+first descriptor or checkpoint. CapturedJournal can load that same prefix into
+caller overlay storage, checking its digest against the scan summary, but
+exposes no repair handle or mutation method. Caller
+admission/deadline checks and subsequent file/data validation remain required.
+
 `CheckedFiles::validate_data` drives direct references, recipient queue checks,
 mailbox parent chains and blob verification under the same stopped owner and
 ValidationView. DataLimits bounds total final rows, parent gets and blob bytes;
