@@ -180,6 +180,28 @@ fn private_root_checks_modes_ancestry_and_lexical_bounds() {
         if trusted {
             let root = PrivateRoot::open(path).unwrap();
             assert_eq!(root.directory().metadata().unwrap().uid(), owner);
+            let locked = root.try_lock().unwrap();
+            assert_eq!(locked.root().directory().metadata().unwrap().uid(), owner);
+            assert!(matches!(
+                PrivateRoot::open(path).unwrap().try_lock(),
+                Err(td_mta::store_fs::LockError::Busy)
+            ));
+            drop(locked);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match PrivateRoot::open(path).unwrap().try_lock() {
+                    Err(td_mta::store_fs::LockError::Busy)
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        // A parallel test's child can retain LOCK until exec.
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    result => {
+                        drop(result.unwrap());
+                        break;
+                    }
+                }
+            }
         } else {
             eprintln!("positive private-root case unavailable: untrusted fixture ancestry");
             assert!(PrivateRoot::open(path).is_err());

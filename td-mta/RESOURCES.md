@@ -549,6 +549,11 @@ controls. This qualifies the pinned host/musl implementation, not every std
 version. Recheck with compiler changes. Directory iteration and future mutable
 file operations need their own allocation evidence before hot-path use.
 
+The startup-only LOCK acquisition uses a typed generated name and fixed path
+buffer and retains one additional File inside LockedRoot. No per-request
+lock-file open or descriptor cloning is permitted. Cooperative
+process locking does not alter the request pool or worker ledger.
+
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
 buffers and atomic text formatting. They neither allocate backing storage nor
 grow it. Arena regions are disjoint Rust borrows; reuse requires their lifetimes

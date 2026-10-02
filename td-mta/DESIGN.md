@@ -28,7 +28,8 @@ the caller's pinned committed prefix.
 M05b1 generates canonical storage paths. The std filesystem adapter checks
 existing directory types, links and private-root permissions under an explicit
 operator-controlled stable-path contract. It performs no direct syscalls or
-free-space probes. The writer lock, physical EOF, selected-graph validation,
+free-space probes. A retained std file lock provides cooperative writer
+exclusion. Physical EOF, selected-graph validation,
 complete final-view semantics and durable file mutations remain unimplemented.
 [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.
@@ -419,7 +420,8 @@ Create secret/mail files as 0600 and private directories as 0700, without a
 permissive creation window. Never derive a filesystem pathname from a mailbox
 name, address, attachment filename, or arbitrary client ID.
 STORAGE.md defines the std path checks, deployment identity and stable-path
-assumptions. The writer lock and durable mutations remain pending. The service
+assumptions. Std writer locking is implemented; durable mutations remain
+pending. The service
 uses logical quotas and handles disk-full/write/sync failures; it does not
 measure or promise physical free space before admission.
 

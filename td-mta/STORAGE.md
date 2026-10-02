@@ -134,7 +134,7 @@ This adapter delegates process identity to deployment rather than reading
 procfs credentials. A successful path check is not proof of process identity. Deployments using user namespaces must keep
 root/service identities mapped and distinct from the overflow UID. Permissions
 and ownership are deployment checks, not authorization derived from mail input.
-The persistent writer lock and store recovery remain required before serving.
+The persistent writer lock below and store recovery remain required before serving.
 
 Directory-adapter paths are limited to 383 UTF-8 bytes; a private root is
 at most 254 bytes, leaving a separator and the 128-byte generated-name budget.
@@ -164,9 +164,37 @@ the destination directory before removing/syncing the temporary link. Source
 and destination must share a filesystem. CURRENT uses same-directory temporary
 creation, file sync, atomic `rename` replacement and parent-directory sync.
 Checkpoint generations use exclusive directory creation and are authoritative
-only after CURRENT selection. `File::try_lock` on the persistent LOCK inode
-provides cooperative writer exclusion; never unlink or replace that inode.
-These mutation/lock operations remain M05 implementation work.
+only after CURRENT selection. These mutation operations remain M05 implementation work.
+
+### Persistent writer lock
+
+`PrivateRoot::try_lock` consumes the checked root and returns `LockedRoot`.
+It opens or exclusively creates an empty mode-0600 LOCK file, validating type,
+owner, exact private mode, link count one, and final opened identity. Existing
+symlinks, directories, special files, nonempty files and hard links refuse before
+read/write open; no contents are truncated or rewritten. It uses std's
+nonblocking `File::try_lock`: contention is an explicit Busy result, other
+errors retain their I/O cause. Sync the locked file and root directory before
+returning success, including when the inode already exists.
+
+The returned owner retains the File without cloning or exposing unlock/raw-file
+access. Drop or process death releases the lock; neither removes the inode.
+Independent opens/processes must contend, and restarts reopen the same inode.
+This is cooperative exclusion among writers honoring LOCK. The stable-path and
+trusted-writer deployment assumptions still apply; the lock does not prevent
+privileged/noncooperating modification or replacement of its pathname. Root
+validation and file policy do not authenticate process credentials. Actual
+store-format validation/recovery must finish before service activation.
+
+Acquisition is startup-only and uses the typed LOCK name and fixed path buffer.
+A newly created file has owner permissions restored to 0600 after umask; shared
+permissions are never granted. Existing files are not chmodded. A failed
+creation-policy/permission/sync step can leave an empty, possibly invalid LOCK
+inode. Stop the service and correct its owner/mode before retrying; the helper
+never removes or replaces that inode to retry.
+Tests exercise the std lock primitive in private temporary directories even
+when the harness identity/ancestry cannot satisfy production root admission.
+These fixtures do not waive any production root policy.
 
 Any create/write/flush/sync/publication error must prevent a new acceptance
 acknowledgement. Keep already acknowledged state; never delete live mail to
@@ -585,12 +613,12 @@ merge fan-in and overlap charges come from ADMISSION.md. Sort exhaustion is an
 explicit failure and cannot authorize deleting a live blob. Abandoned runs are
 removed under LOCK at startup, separately from publication/checkpoint files.
 
-Disk reservations include temporary bodies, journal/history, active/retired
-checkpoints, backup pins and merge scratch. Free-space checks do not eliminate
-ENOSPC races with other host processes; every write/sync still handles errors.
-Admission counts inodes as well as bytes where the platform can report them;
-inode exhaustion must also give a defined temporary failure. Maintenance cannot
-consume the space reserved for completing an already admitted commit.
+Logical reservations include temporary bodies, journal/history, active/retired
+checkpoints, backup pins and merge scratch. Count logical bytes and files;
+physical free bytes/inodes are unavailable through this adapter. Every
+write/sync handles exhaustion errors. Maintenance cannot consume the logical
+completion budget held for an admitted commit, but this reserves no physical
+blocks or inodes and cannot ensure that commit can finish on a full disk.
 
 ## 9. Inspection, verification and backup
 

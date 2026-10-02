@@ -621,11 +621,15 @@ service activation. Each part lands independently:
       checks. Supervisor identity and stable roots/mounts are deployment
       preconditions. Tests distinguish retained-file identity from later
       pathname lookup and cover maximum-path allocation on host/musl.
-    - **M05b2b — persistent LOCK:** implement with std `File::try_lock`.
-      Open/create one private regular mode-0600 inode, validate metadata,
-      retain the lock for the writer lifetime and never unlink/replace it.
-      Test independent-process contention, process death, wrong type/mode,
-      missing permissions and cleanup without service activation.
+    - **M05b2b — persistent LOCK:** implemented std `File::try_lock` with
+      explicit contention, private empty single-link regular-file policy,
+      opened identity validation and file/root-directory sync. `LockedRoot`
+      consumes PrivateRoot and retains the lock without exposing clone/unlock.
+      Tests cover independent opens, independent-process contention, process
+      death, policy refusals and permission errors (where the harness identity
+      cannot bypass modes). Process tests bound their ready wait and support a
+      single CPU. The inode survives release/restart; no store
+      recovery or service activation follows from owning this lock alone.
     - **M05b2c — durable file operations:** implement exclusive temporary
       creation, bounded reads/writes, immutable publication via `hard_link`,
       same-directory CURRENT replacement via `rename`, and explicit file and

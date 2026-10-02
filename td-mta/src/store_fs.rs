@@ -80,6 +80,16 @@ impl PrivateRoot {
         }
         Ok(Self { directory })
     }
+    /// Startup-only acquisition. Retain the returned owner for the entire
+    /// writer lifetime; opening a checked root alone never excludes writers.
+    pub fn try_lock(self) -> Result<LockedRoot, LockError> {
+        let owner = self.directory.metadata()?.uid();
+        let lock = acquire_lock(&self.directory, owner)?;
+        Ok(LockedRoot {
+            root: self,
+            _lock: lock,
+        })
+    }
     pub fn directory(&self) -> &Directory {
         &self.directory
     }
@@ -127,7 +137,11 @@ impl Directory {
     /// stable while serving; this lookup does not follow the retained File.
     pub fn open(&self, name: &Name) -> io::Result<Self> {
         let mut path = [0; MAX_PATH_BYTES];
-        let mut output = crate::bounded::TextBuffer::new(&mut path);
+        let path = self.join(name, &mut path)?;
+        Self::from_path(path.to_str().ok_or(io::ErrorKind::InvalidInput)?)
+    }
+    fn join<'a>(&self, name: &Name, path: &'a mut [u8; MAX_PATH_BYTES]) -> io::Result<&'a Path> {
+        let mut output = crate::bounded::TextBuffer::new(path);
         let root = std::str::from_utf8(
             self.path
                 .get(..self.length)
@@ -139,12 +153,104 @@ impl Directory {
         output
             .format(format_args!("{root}{separator}{name}"))
             .map_err(|_| io::ErrorKind::InvalidInput)?;
-        Self::from_path(output.as_str().map_err(|_| io::ErrorKind::InvalidInput)?)
+        let length = output.len();
+        let text = std::str::from_utf8(path.get(..length).ok_or(io::ErrorKind::InvalidInput)?)
+            .map_err(|_| io::ErrorKind::InvalidInput)?;
+        Ok(Path::new(text))
     }
     pub fn metadata(&self) -> io::Result<Metadata> {
         self.file.metadata()
     }
 }
+/// Cooperative process exclusion only; store-format recovery is still required.
+#[derive(Debug)]
+pub struct LockedRoot {
+    root: PrivateRoot,
+    _lock: File,
+}
+impl LockedRoot {
+    pub fn root(&self) -> &PrivateRoot {
+        &self.root
+    }
+}
+#[derive(Debug)]
+pub enum LockError {
+    Busy,
+    Policy,
+    Io(io::Error),
+}
+impl std::fmt::Display for LockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("mail store writer lock is held"),
+            Self::Policy => f.write_str(
+                "LOCK must be a private empty regular file owned by the store owner with one link",
+            ),
+            Self::Io(error) => write!(f, "mail store writer lock: {error}"),
+        }
+    }
+}
+impl std::error::Error for LockError {}
+impl From<io::Error> for LockError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+fn check_lock(metadata: &Metadata, owner: u32) -> Result<(), LockError> {
+    if !metadata.is_file()
+        || metadata.uid() != owner
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+        || metadata.len() != 0
+    {
+        return Err(LockError::Policy);
+    }
+    Ok(())
+}
+fn acquire_lock(directory: &Directory, owner: u32) -> Result<File, LockError> {
+    use std::{
+        fs::OpenOptions,
+        os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
+    // Cold startup path. No clone or unlock operation escapes the lock owner.
+    let name = Name::root(crate::store_paths::RootEntry::Lock)
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut buffer = [0; MAX_PATH_BYTES];
+    let path = directory.join(&name, &mut buffer)?;
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(file) => {
+            // Restore owner bits filtered by umask, never grant shared access.
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let before = fs::symlink_metadata(path)?;
+            check_lock(&before, owner)?;
+            let file = OpenOptions::new().read(true).write(true).open(path)?;
+            if !same_file(&before, &file.metadata()?) {
+                return Err(LockError::Policy);
+            }
+            file
+        }
+        Err(error) => return Err(error.into()),
+    };
+    check_lock(&file.metadata()?, owner)?;
+    match file.try_lock() {
+        Ok(()) => (),
+        Err(fs::TryLockError::WouldBlock) => return Err(LockError::Busy),
+        Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
+    file.sync_all()?;
+    directory.file.sync_all()?;
+    Ok(file)
+}
+
 fn same_file(a: &Metadata, b: &Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino()
 }
@@ -160,7 +266,200 @@ fn trusted_owner(owner: u32, service: u32) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
+    use super::*;
+    use std::{
+        io::{BufRead, Write},
+        os::unix::fs::{DirBuilderExt, PermissionsExt},
+        path::PathBuf,
+        process::{Child, Command, Stdio},
+        sync::atomic::{AtomicU64, Ordering},
+        time::{Duration, Instant},
+    };
+
+    struct Fixture {
+        path: PathBuf,
+        directory: Directory,
+        owner: u32,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "td-mta-lock-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            let path = fs::canonicalize(path).unwrap();
+            let directory = Directory::from_path(path.to_str().unwrap()).unwrap();
+            let owner = directory.metadata().unwrap().uid();
+            Self {
+                path,
+                directory,
+                owner,
+            }
+        }
+        fn lock(&self) -> Result<File, LockError> {
+            acquire_lock(&self.directory, self.owner)
+        }
+        fn reacquire(&self) -> File {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match self.lock() {
+                    Err(LockError::Busy) if Instant::now() < deadline => {
+                        // A concurrent spawn can retain the file until exec.
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    result => return result.unwrap(),
+                }
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn persistent_lock_contends_and_reopens_same_inode() {
+        let fixture = Fixture::new();
+        let file = fixture.lock().unwrap();
+        let metadata = file.metadata().unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(metadata.len(), 0);
+        assert!(matches!(fixture.lock(), Err(LockError::Busy)));
+        drop(file);
+        let again = fixture.reacquire();
+        assert!(same_file(&metadata, &again.metadata().unwrap()));
+        assert!(fixture.path.join("LOCK").exists());
+    }
+
+    #[test]
+    fn lock_policy_refuses_existing_links_types_owners_modes_and_contents() {
+        let fixture = Fixture::new();
+        let path = fixture.path.join("LOCK");
+        let file = fixture.lock().unwrap();
+        let metadata = file.metadata().unwrap();
+        assert!(matches!(
+            check_lock(&metadata, fixture.owner ^ 1),
+            Err(LockError::Policy)
+        ));
+        drop(file);
+        for mode in [0o644, 0o660, 0o400, 0o1600, 0o2600, 0o4600] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(matches!(fixture.lock(), Err(LockError::Policy)));
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&path, b"not a lock file").unwrap();
+        assert!(matches!(fixture.lock(), Err(LockError::Policy)));
+        assert_eq!(fs::read(&path).unwrap(), b"not a lock file");
+        fs::write(&path, b"").unwrap();
+        let other = fixture.path.join("other");
+        fs::hard_link(&path, &other).unwrap();
+        assert!(matches!(fixture.lock(), Err(LockError::Policy)));
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&other, &path).unwrap();
+        assert!(matches!(fixture.lock(), Err(LockError::Policy)));
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(fixture.lock(), Err(LockError::Policy)));
+    }
+
+    #[test]
+    fn lock_creation_permission_failure_retains_io_cause() {
+        let fixture = Fixture::new();
+        fs::set_permissions(&fixture.path, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = fixture.lock();
+        fs::set_permissions(&fixture.path, fs::Permissions::from_mode(0o700)).unwrap();
+        match result {
+            Err(LockError::Io(error)) => assert_eq!(error.kind(), io::ErrorKind::PermissionDenied),
+            Ok(_) => {
+                eprintln!("permission-negative fixture unavailable: identity bypasses mode 0500")
+            }
+            other => assert!(matches!(other, Err(LockError::Io(_))), "{other:?}"),
+        }
+        let missing = Fixture::new();
+        fs::remove_dir(&missing.path).unwrap();
+        assert!(
+            matches!(missing.lock(), Err(LockError::Io(error)) if error.kind() == io::ErrorKind::NotFound)
+        );
+    }
+
+    #[test]
+    #[ignore = "child process helper; parent requires its explicit ready marker"]
+    fn lock_process_child() {
+        let path = std::env::var("TD_MTA_LOCK_FIXTURE").unwrap();
+        let directory = Directory::from_path(&path).unwrap();
+        let owner = directory.metadata().unwrap().uid();
+        let _lock = acquire_lock(&directory, owner).unwrap();
+        println!("td-mta-lock-ready");
+        std::io::stdout().flush().unwrap();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+    }
+
+    #[test]
+    fn independent_process_lock_is_released_after_process_death() {
+        let fixture = Fixture::new();
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store_fs::tests::lock_process_child",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("TD_MTA_LOCK_FIXTURE", &fixture.path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let output = child.0.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let mut output = std::io::BufReader::new(output);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match output.read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) if line.trim_end().ends_with("td-mta-lock-ready") => {
+                        let _ = sender.send(());
+                        return;
+                    }
+                    Ok(_) => (),
+                }
+            }
+        });
+        let ready = receiver.recv_timeout(Duration::from_secs(5));
+        if ready.is_err() {
+            // Unblock the pipe reader before joining it on this failure path.
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+        }
+        reader.join().unwrap();
+        ready.unwrap();
+        assert!(matches!(fixture.lock(), Err(LockError::Busy)));
+        let before = fs::metadata(fixture.path.join("LOCK")).unwrap();
+        child.0.kill().unwrap();
+        assert!(!child.0.wait().unwrap().success());
+        let acquired = fixture.reacquire();
+        assert!(same_file(&before, &acquired.metadata().unwrap()));
+    }
+
     #[test]
     fn ancestor_owner_policy_excludes_other_identities() {
         assert!(super::trusted_owner(0, 1000));
