@@ -558,9 +558,26 @@ Each live TemporaryFile/SyncedTemporary retains two Files (output and its
 parent directory), one generated Name, counters and
 a borrow of the existing LockedRoot. Writes and reads use caller slices without
 buffer growth; path assembly uses the directory adapter's fixed byte ceiling.
-These operations do not acquire quota or runtime pool slots. Their host/musl
-allocation measurements and admission integration are required before hot-path
-activation. Pending/failed files retain their logical charges until explicit
+These operations do not acquire quota or runtime pool slots. The dedicated
+Rust allocation probe compiles the same filesystem source with its cfg(test)
+fixture. That fixture supplies a root for the namespace-mapped test identity;
+it does not alter production root admission. It still takes the real writer
+lock and executes the actual creation, policy, I/O and sync paths. The imported
+module permits unused items in this second compilation, including omitted
+libtest helpers; normal library and unit-test builds remain the lint authority.
+
+At both short and maximum 254-byte root paths, the measured interval covers
+exclusive create/prepare, 4 KiB write/read/sync/drop, existing-name collision,
+byte-limit and read-offset refusal, missing ancestors, injected open/preparation
+and sync failures, Interrupted attempt exhaustion, retired output refusal and
+unexpected early EOF. It requires unchanged Rust allocation/deallocation
+counters after setup and before cleanup. No new allocator hook or production
+fixture constructor is introduced. Repeat on host and static musl when compiler
+or filesystem adapter code changes. This does not measure kernel page cache,
+native-library allocations, directory enumeration or the whole service RSS.
+Admission integration remains required before activation.
+
+Pending/failed files retain their logical charges until explicit
 cleanup, including when syncing consumed and closed their handles.
 
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire

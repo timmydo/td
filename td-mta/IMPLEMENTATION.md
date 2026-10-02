@@ -644,8 +644,10 @@ service activation. Each part lands independently:
         sync. Errors retain partial-output accounting; Drop never unlinks.
         Completed private output has bounded caller-buffer reads. Real-file
         tests and injected short/write/sync errors cover these primitives.
-        Logical admission, allocation qualification of these new operations,
-        directory creation, publication and cleanup remain separate work.
+        The dedicated allocation probe covers successful/failed operations at
+        short and maximum root paths on the pinned host/musl builds. Logical
+        admission, directory creation, publication and cleanup remain separate
+        work.
     - **M05b2d — input files:** std type/link/owner/mode checks under SCHEMA.md,
       bounded reading through EOF and opened-file identity checks. Deployment
       uses the data-root owner as its trusted expected service identity.

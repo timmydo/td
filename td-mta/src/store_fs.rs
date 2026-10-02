@@ -7,8 +7,12 @@ use std::{
     path::Path,
 };
 
+#[path = "store_fs/temporary.rs"]
 mod temporary;
 pub use temporary::{CreateError, SyncedTemporary, TemporaryFile, MAX_FILE_STEP_BYTES};
+
+#[cfg(test)]
+pub use temporary::probe::run as probe_temporary_io;
 
 /// Qualified by the host and portable allocation probes, including errors.
 /// This is a service limit, not a promise about every Rust implementation.

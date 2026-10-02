@@ -1,4 +1,8 @@
 //! Private output only; syncing a file does not publish or commit it.
+#[cfg(test)]
+#[path = "temporary/probe.rs"]
+pub mod probe;
+
 use super::{Directory, LockedRoot, MAX_PATH_BYTES};
 use crate::{
     ids::AccountId,

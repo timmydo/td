@@ -17,6 +17,13 @@ use allocation_shim::TD_MTA_ALLOCATION_COUNTERS as COUNTERS;
 use std::hint::black_box;
 use td_crypto::Digest;
 
+// Compile the same filesystem sources with their cfg(test) fixture so the
+// namespace-mapped test identity needs no production root-policy exception.
+use td_mta::{bounded, config, ids, store_paths};
+#[path = "../src/store_fs.rs"]
+#[allow(unused)] // Second compilation; the library build remains the lint authority.
+pub mod measured_store_fs;
+
 fn forwarding() {
     let before = COUNTERS.snapshot();
     let mut bytes = Vec::<u8>::with_capacity(black_box(16));
@@ -740,9 +747,30 @@ fn store_directories() {
     std::fs::remove_dir_all(path).unwrap();
 }
 
+fn store_temporary_files() {
+    let mut samples = [COUNTERS.snapshot(); 2];
+    let mut slots = samples.iter_mut();
+    measured_store_fs::probe_temporary_io(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|sample| !sample.invalid));
+    assert_eq!(
+        samples.first(),
+        samples.get(1),
+        "std temporary I/O allocated"
+    );
+}
+
 fn main() {
     allocation_counter::Counters::verify_model();
     forwarding();
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|arg| arg == "--store-files")
+    {
+        store_temporary_files();
+        println!("std-temporary-allocation-v1: passed");
+        return;
+    }
     if std::env::args()
         .nth(1)
         .is_some_and(|arg| arg == "--tls-clients")
@@ -814,6 +842,7 @@ fn main() {
         return;
     }
     store_directories();
+    store_temporary_files();
     hot_paths();
     println!("rust-allocation-probe-v1: counter-model forwarding hot-paths passed");
 }
