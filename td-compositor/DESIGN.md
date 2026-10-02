@@ -117,7 +117,21 @@ was indistinguishable from a failed one. The fallback is a box now, `.` and
 `?` are glyphs of their own, and both the bar's line and the help sheet's
 rows are held to a font that has every character they spell.
 
-Before any of those fields the strip names the WORKSPACES, which is the one
+The strip's first cell is the LAUNCHER'S BUTTON: a square as wide as the band
+is tall, marked with three bars drawn as fills rather than a glyph, so it needs
+nothing from the font. A free left press on it opens the launcher, which makes
+it the pointer's `Super+Enter`, and the button is inverted while the overlay is
+up, as the active workspace is. The press is taken where a press on a cell is
+— after the ownership check, so a press a client was given is never spent,
+and before the bands — and like a cell press it spends a wheel notch in the
+same report. The runtime only NOTES it, and the input adapter opens the
+overlay through the launcher's one door, the call a key takes, so the
+overlay's keyboard capture follows it whichever device opened it and any
+launch stays outside the scene lock. The adapter asks only after a report in
+which that device itself pressed a button. The button names no workspace: a
+drop on it is a cancelled drag.
+
+After the button the strip names the WORKSPACES, which is the one
 thing on it that is not a reading. A workspace switch is otherwise invisible:
 moving to an empty one leaves a bare desktop, and that is what the workspace
 just left looks like from behind a fullscreen window, so an operator who
@@ -467,10 +481,12 @@ binding is ONE chord on `Super`:
   — dismissing on the modifier would eat it and leave the chord's key to
   act alone, so reading the table would start a terminal;
 - `Super+Enter` — or `Super+KPEnter`, since the open overlay activates on
-  either — opens the launcher, from which everything else is reachable.
-  `Control+n` and `Control+p`, or Down and Up, move its selection; Enter
-  activates it; Escape and `Control+g` close it. ASCII letters, digits,
-  space, and hyphen filter its registry, and Backspace edits that filter.
+  either — opens the launcher, from which everything else is reachable, as
+  does a click on the button at the bar's left end. `Control+n` and
+  `Control+p`, or Down and Up, move its selection; Enter activates it;
+  Escape and `Control+g` close it. ASCII letters, digits, space, and hyphen
+  filter its registry, and Backspace edits that filter. A left press on a
+  row activates that row, and one off the card closes it.
 
 Shift is read only where the list says so: `Super+Shift+f` is fullscreen and
 `Ctrl+Super+t` is a terminal, since the letter chords and the launcher one
@@ -496,10 +512,10 @@ pressed, the action from the effect it produced — and it counts the rows, so
 one added without a probe fails rather than going unchecked. A binding that
 changes without this table changing is therefore a failing test rather than
 a screen that lies, which is the only guarantee available for painted text.
-Six rows no chord can drive — `HOVER`, `CLICK`, `DRAG A TITLE`, `DRAG TO THE
-BAR`, `CLICK THE BAR` and `SCROLL THE BAR` — are pinned by name and by an
-EFFECT that same table turns into words, so a mouse row cannot invent words of
-its own. The limit of THAT is worth stating beside
+Seven rows no chord can drive — `HOVER`, `CLICK`, `DRAG A TITLE`, `DRAG TO
+THE BAR`, `CLICK THE BAR`, `SCROLL THE BAR` and `CLICK THE BAR MENU` — are
+pinned by name and by an EFFECT that same table turns into words, so a mouse
+row cannot invent words of its own. The limit of THAT is worth stating beside
 the keymap one: a keyboard row derives its effect from the dispatch that just
 ran, and a mouse row has none to derive from, so a row and its probe changed
 together would agree about something untrue. What each gesture actually does
@@ -2508,11 +2524,25 @@ launcher model stores a bounded 64-byte ASCII filter, requires every
 whitespace-separated term to occur in an entry's search text, and resets
 selection to the first match after an edit. An empty result is explicit and
 Enter leaves it open; Backspace can recover it. Opening clears the previous
-filter. While the overlay is open, all non-modifier keys are consumed by the
-compositor, and modified keys that are not launcher commands do not become
-text. Activation with a match closes the overlay before native process creation
-or application surface activation; activation with no matches keeps both the
-overlay and input capture active. The input adapter updates its capture state
+filter. The pointer reaches the same model: while the overlay is up the
+adapter withholds every press from the runtime's report, as it always has,
+and asks the runtime what a LEFT one meant on the card; other buttons ask
+nothing. The press is the device's own transition in that report, never the
+seat's, since a withheld press never reaches the forwarded set and another
+device's release could otherwise read as one. A press in a row's highlight
+area is `Choose(row)`, a position in the FILTERED list that selects and
+activates it exactly as Enter would; a press off the card is Close; the title,
+the filter line and the air between rows ask nothing. The paint and the hit
+test share one card and row geometry, so a click lands on the row it was drawn
+over. A row is on the card only when its whole label fits, so on a short
+output a row the card cut off is not drawn and the pointer cannot choose it,
+even where a sliver of its highlight area would remain; the keyboard's
+selection still walks every match. While the overlay is open, all
+non-modifier keys are consumed by the compositor, and modified keys that are
+not launcher commands do not become text. Activation with a match closes the
+overlay before native process creation or application surface activation;
+activation with no matches keeps both the overlay and input capture
+active. The input adapter updates its capture state
 from the model's post-action visibility instead of guessing which action opened
 or closed it. It never enables capture before a successful open. An overlay
 action is transactional with its framebuffer paint: a failed paint restores the

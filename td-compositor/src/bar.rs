@@ -19,6 +19,18 @@ pub(crate) const INK: [u8; 4] = [0xd0, 0xc8, 0xe0, 0];
 /// rather than a fixed column — which matters, since the two share one strip
 /// and the clock is what gives way when they do not both fit.
 const DESK_PAD: usize = 4;
+/// The launcher's button, the strip's FIRST cell: a press on it opens the
+/// launcher, which is the pointer's `Super+Enter`. As wide as the band is
+/// tall, so the mark sits in a square of its own and the workspaces start
+/// after it rather than under it.
+pub const LAUNCHER_WIDTH: usize = BAR_HEIGHT;
+/// The button's mark: three bars, each `MARK_WIDTH` wide and `MARK_THICK`
+/// tall, `MARK_STEP` apart and centred in the button. Drawn as fills rather
+/// than a glyph, so it needs nothing from the font and lands on the same
+/// pixels at every size of output.
+const MARK_WIDTH: usize = 12;
+const MARK_THICK: usize = 2;
+const MARK_STEP: usize = 4;
 /// The clock shows seconds, so this is what makes it tick. The renderer
 /// writes only the rows that changed, so a second's repaint is the bar's own
 /// rows rather than the screen.
@@ -368,7 +380,7 @@ pub fn desks(mut occupied: Vec<u8>, active: u8, spare: Option<u8>) -> Vec<u8> {
 /// where a cell starts would put the window on the workspace NEXT to the one
 /// they were pointing at, with the ink saying otherwise.
 fn cells(desks: &[u8]) -> impl Iterator<Item = (u8, usize, usize)> + '_ {
-    let mut left = 0usize;
+    let mut left = LAUNCHER_WIDTH;
     desks.iter().map(move |number| {
         let width = desk_width(*number);
         let at = left;
@@ -396,6 +408,27 @@ pub fn desk_at(desks: &[u8], x: usize, y: usize) -> Option<u8> {
         }
     }
     None
+}
+
+/// Whether the point is on the launcher's button. Not a workspace, so
+/// `desk_at` answers `None` there and a drag released on it is cancelled.
+pub fn launcher_at(x: usize, y: usize) -> bool {
+    y < BAR_HEIGHT && x < LAUNCHER_WIDTH
+}
+
+/// The bars of the button's mark, as rectangles in the strip.
+fn launcher_mark() -> impl Iterator<Item = (usize, usize, usize, usize)> {
+    let left = LAUNCHER_WIDTH.saturating_sub(MARK_WIDTH) / 2;
+    let span = MARK_STEP.saturating_mul(2).saturating_add(MARK_THICK);
+    let top = BAR_HEIGHT.saturating_sub(span) / 2;
+    (0..3usize).map(move |bar| {
+        (
+            left,
+            top.saturating_add(bar.saturating_mul(MARK_STEP)),
+            MARK_WIDTH,
+            MARK_THICK,
+        )
+    })
 }
 
 /// The cell a workspace is drawn in, for a caller that has to draw something
@@ -465,10 +498,12 @@ fn label_inset(cell_width: usize, label: &str) -> usize {
 /// the text, so this never reads a clock, a file, or a layout — the same
 /// split the launcher and the sheet have.
 ///
-/// The workspaces are LEFTMOST and the status line follows them, which is
-/// where an operator looks for them and is also the order that survives a
-/// narrow output: the strip is clipped from the right, so what gives way
-/// first is the end of the status line rather than where the operator is.
+/// The launcher's button is LEFTMOST, the workspaces follow it and the
+/// status line follows them, which is where an operator looks for them and
+/// is also the order that survives a narrow output: the strip is clipped
+/// from the right, so what gives way first is the end of the status line
+/// rather than where the operator is.
+#[allow(clippy::too_many_arguments)]
 pub fn paint(
     frame: &mut [u8],
     width: usize,
@@ -476,13 +511,26 @@ pub fn paint(
     stride: usize,
     desks: &[u8],
     active: u8,
+    launcher_open: bool,
     text: &str,
 ) {
     // Not clamped to `height`: both primitives clip against it, and a second
     // clamp here would read as though they did not.
     let bar = (0, 0, width, BAR_HEIGHT);
     ui::fill(frame, width, height, stride, bar, BACKGROUND);
-    let mut left = 0usize;
+    // The button is inverted while the launcher is up, as the active
+    // workspace is: it says what the overlay came from.
+    let mark = if launcher_open {
+        let button = (0, 0, LAUNCHER_WIDTH, BAR_HEIGHT);
+        ui::fill(frame, width, height, stride, button, INK);
+        BACKGROUND
+    } else {
+        INK
+    };
+    for rect in launcher_mark() {
+        ui::fill(frame, width, height, stride, rect, mark);
+    }
+    let mut left = LAUNCHER_WIDTH;
     let mut label = [0u8; 3];
     for (number, at, cell_width) in cells(desks) {
         let cell = (at, 0, cell_width, BAR_HEIGHT);
@@ -1127,8 +1175,11 @@ Local:
     fn a_point_on_the_strip_names_the_workspace_under_it() {
         let desks = [1u8, 2, 3];
         // Every cell answers over its own span, and the walk that places them
-        // is the one `paint` draws with.
-        let mut left = 0usize;
+        // is the one `paint` draws with. The first starts after the button,
+        // which names no workspace.
+        assert_eq!(desk_at(&desks, 0, 0), None);
+        assert_eq!(desk_at(&desks, LAUNCHER_WIDTH - 1, BAR_HEIGHT - 1), None);
+        let mut left = LAUNCHER_WIDTH;
         for number in desks {
             let width = desk_width(number);
             assert_eq!(desk_at(&desks, left, 0), Some(number), "cell {number} left");
@@ -1158,10 +1209,19 @@ Local:
         // inverse and never could be.
         let cell_one = |active: u8| {
             let mut frame = vec![0u8; stride * height];
-            paint(&mut frame, width, height, stride, &[1, 2], active, "");
+            paint(
+                &mut frame,
+                width,
+                height,
+                stride,
+                &[1, 2],
+                active,
+                false,
+                "",
+            );
             let (mut ink, mut background) = (0usize, 0usize);
             for y in 0..BAR_HEIGHT {
-                for x in 0..desk_width(1) {
+                for x in LAUNCHER_WIDTH..LAUNCHER_WIDTH + desk_width(1) {
                     match frame.get(y * stride + x * 4..y * stride + x * 4 + 4) {
                         Some(pixel) if pixel == INK => ink += 1,
                         Some(pixel) if pixel == BACKGROUND => background += 1,
@@ -1198,24 +1258,28 @@ Local:
         let stride = width * 4;
         let ink_left = |desks: &[u8], text: &str| {
             let mut frame = vec![0u8; stride * height];
-            paint(&mut frame, width, height, stride, desks, 0, text);
+            paint(&mut frame, width, height, stride, desks, 0, false, text);
             // `position`, not the iterator method whose name is also a shell
             // command: this file is `include_str!`'d into the td-compositor
-            // recipe, so its text is scanned as a bootstrap step's. Over
-            // `0..width` the index it answers IS the column.
-            (0..width).position(|x| {
-                (0..BAR_HEIGHT).any(|y| {
-                    frame.get(y * stride + x * 4..y * stride + x * 4 + 4) == Some(&INK[..])
+            // recipe, so its text is scanned as a bootstrap step's. Scanned
+            // from the button's right edge, so the index it answers is the
+            // column less `LAUNCHER_WIDTH`.
+            (LAUNCHER_WIDTH..width)
+                .position(|x| {
+                    (0..BAR_HEIGHT).any(|y| {
+                        frame.get(y * stride + x * 4..y * stride + x * 4 + 4) == Some(&INK[..])
+                    })
                 })
-            })
+                .map(|x| x + LAUNCHER_WIDTH)
         };
         // Active 0 is no workspace, so every cell here is a plain number and
-        // the leftmost ink is the FIRST one — which is what says the strip
-        // starts with the workspaces rather than with the status line.
-        assert_eq!(ink_left(&[], "LOAD 0.42"), Some(TEXT_LEFT));
+        // the leftmost ink after the button is the FIRST one — which is what
+        // says the strip starts with the workspaces rather than with the
+        // status line.
+        assert_eq!(ink_left(&[], "LOAD 0.42"), Some(LAUNCHER_WIDTH + TEXT_LEFT));
         assert_eq!(
             ink_left(&[7], "LOAD 0.42"),
-            Some(label_inset(desk_width(7), "7"))
+            Some(LAUNCHER_WIDTH + label_inset(desk_width(7), "7"))
         );
 
         // The number is CENTRED in its cell, air equal either side. Padding
@@ -1223,9 +1287,10 @@ Local:
         // advance carries a column it never inks — and off-centre is what an
         // inverted cell, a block of ink around the number, makes visible.
         let mut alone = vec![0u8; stride * height];
-        paint(&mut alone, width, height, stride, &[7], 0, "");
+        paint(&mut alone, width, height, stride, &[7], 0, false, "");
         let inked: Vec<usize> = (0..desk_width(7))
             .filter(|x| {
+                let x = x + LAUNCHER_WIDTH;
                 (0..BAR_HEIGHT).any(|y| {
                     alone.get(y * stride + x * 4..y * stride + x * 4 + 4) == Some(&INK[..])
                 })
@@ -1250,10 +1315,19 @@ Local:
         let narrow = 64usize;
         let cell_pixels = |active: u8, text: &str| {
             let mut frame = vec![0u8; stride * height];
-            paint(&mut frame, narrow, height, stride, &[1], active, text);
+            paint(
+                &mut frame,
+                narrow,
+                height,
+                stride,
+                &[1],
+                active,
+                false,
+                text,
+            );
             let mut pixels = Vec::new();
             for y in 0..BAR_HEIGHT {
-                for x in 0..desk_width(1) {
+                for x in LAUNCHER_WIDTH..LAUNCHER_WIDTH + desk_width(1) {
                     pixels.push(
                         frame
                             .get(y * stride + x * 4..y * stride + x * 4 + 4)
@@ -1492,7 +1566,16 @@ Local:
         let (width, height) = (400usize, 200usize);
         let stride = width * 4;
         let mut frame = vec![0u8; stride * height];
-        paint(&mut frame, width, height, stride, &[1, 2], 1, "LOAD 0.42");
+        paint(
+            &mut frame,
+            width,
+            height,
+            stride,
+            &[1, 2],
+            1,
+            false,
+            "LOAD 0.42",
+        );
         for y in 0..height {
             for x in 0..width {
                 let offset = y * stride + x * 4;
@@ -1517,7 +1600,7 @@ Local:
         //
         // Scanned from where the STATUS starts, since the active workspace's
         // cell is a block of the same ink filling the band's full height.
-        let text_left = desk_width(1) + desk_width(2) + TEXT_LEFT;
+        let text_left = LAUNCHER_WIDTH + desk_width(1) + desk_width(2) + TEXT_LEFT;
         let rows: Vec<usize> = (0..height)
             .filter(|y| {
                 (text_left..width).any(|x| {
@@ -1553,6 +1636,7 @@ Local:
             stride,
             &[1],
             1,
+            false,
             "LOAD 0.42  MEM 2.7G/7.7G",
         );
         assert!(frame
@@ -1563,7 +1647,7 @@ Local:
         // bar's rows are while the tiling area is reserved for it anyway.
         // Read in the gap between the workspace cell and the status line,
         // which is the band's own colour whatever either of them draws.
-        let gap = desk_width(1) + TEXT_LEFT / 2;
+        let gap = LAUNCHER_WIDTH + desk_width(1) + TEXT_LEFT / 2;
         for y in 0..height {
             assert_eq!(
                 frame.get(y * stride + gap * 4..y * stride + gap * 4 + 4),
@@ -1571,5 +1655,69 @@ Local:
                 "row {y} is not the bar"
             );
         }
+    }
+
+    #[test]
+    fn the_launcher_button_is_the_strips_first_square() {
+        assert!(launcher_at(0, 0));
+        assert!(launcher_at(LAUNCHER_WIDTH - 1, BAR_HEIGHT - 1));
+        assert!(
+            !launcher_at(LAUNCHER_WIDTH, 0),
+            "the first cell is a workspace"
+        );
+        assert!(!launcher_at(0, BAR_HEIGHT), "below the bar is a window");
+        // And a workspace's cell is never the button, whatever the strip holds.
+        let desks = [1u8, 2, 3];
+        for number in desks {
+            let (left, width) = desk_cell(&desks, number).unwrap();
+            assert!(left >= LAUNCHER_WIDTH && !launcher_at(left, 0));
+            assert!(!launcher_at(left + width - 1, 0));
+        }
+    }
+
+    #[test]
+    fn the_launcher_mark_is_three_bars_inverted_while_the_launcher_is_up() {
+        let (width, height) = (400usize, BAR_HEIGHT);
+        let stride = width * 4;
+        let button = |open: bool| {
+            let mut frame = vec![0u8; stride * height];
+            paint(&mut frame, width, height, stride, &[1], 0, open, "");
+            let mut pixels = Vec::new();
+            for y in 0..BAR_HEIGHT {
+                for x in 0..LAUNCHER_WIDTH {
+                    let pixel = frame
+                        .get(y * stride + x * 4..y * stride + x * 4 + 4)
+                        .unwrap();
+                    pixels.push(if pixel == INK {
+                        1u8
+                    } else {
+                        assert_eq!(pixel, BACKGROUND, "({x}, {y}) is neither colour");
+                        0
+                    });
+                }
+            }
+            pixels
+        };
+        let idle = button(false);
+        // Exactly the three bars, and every one of them, in ink.
+        let mut expected = vec![0u8; LAUNCHER_WIDTH * BAR_HEIGHT];
+        for (left, top, w, h) in launcher_mark() {
+            for y in top..top + h {
+                for x in left..left + w {
+                    expected[y * LAUNCHER_WIDTH + x] = 1;
+                }
+            }
+        }
+        assert_eq!(idle, expected, "the idle button is not the mark");
+        let ink: usize = idle.iter().map(|p| usize::from(*p)).sum();
+        assert_eq!(ink, 3 * MARK_WIDTH * MARK_THICK);
+        // Centred in its square, so the air either side matches.
+        let (left, top, w, _) = launcher_mark().next().unwrap();
+        assert_eq!(left, LAUNCHER_WIDTH - left - w);
+        let (_, last_top, _, last_h) = launcher_mark().last().unwrap();
+        assert_eq!(top, BAR_HEIGHT - last_top - last_h);
+        // Open, it is the same picture's inverse, as the active workspace is.
+        let open: Vec<u8> = button(true);
+        assert_eq!(open, idle.iter().map(|p| 1 - p).collect::<Vec<_>>());
     }
 }

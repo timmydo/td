@@ -2612,6 +2612,25 @@ impl Scene {
         (number != self.layout.active_workspace()).then_some(number)
     }
 
+    /// Whether a press here is on the launcher's button, the strip's first
+    /// cell. Asked of the pointer as `desk_pressed` is, and for the same
+    /// reason the compositor's to answer: no client takes a press on the bar.
+    pub fn launcher_pressed(&self) -> bool {
+        self.pointer_at_usize()
+            .is_some_and(|(x, y)| bar::launcher_at(x, y))
+    }
+
+    /// What a press on the OPEN launcher asks of it, given where the pointer
+    /// is: a row activates its entry, anywhere off the card closes it, and
+    /// the card's own margins and title ask nothing.
+    pub fn launcher_press(&self, width: usize, height: usize) -> Option<LauncherAction> {
+        if !self.launcher.visible() {
+            return None;
+        }
+        let (x, y) = self.pointer_at_usize()?;
+        self.launcher.press_at(x, y, width, height)
+    }
+
     /// The workspace a WHEEL turned over the bar switches to, `notches` along
     /// from the active one.
     ///
@@ -3461,7 +3480,16 @@ impl Scene {
         }
         let active = self.layout.active_workspace();
         let desks = self.desks();
-        bar::paint(frame, width, height, stride, &desks, active, &self.status);
+        bar::paint(
+            frame,
+            width,
+            height,
+            stride,
+            &desks,
+            active,
+            self.launcher.visible(),
+            &self.status,
+        );
         // A workspace block is the one that goes OVER the bar rather than
         // under it. The rule above — a block must not hide the bar — is about
         // a block that would obscure something it is not talking about; this
@@ -6032,10 +6060,11 @@ mod tests {
         assert_eq!(tiled(&frame, stride, 60, 30), [0x30, 0x25, 0x20, 0]);
         assert_eq!(tiled(&frame, stride, 68, 30), [0xc0, 0x70, 0xf0, 0]);
         assert_eq!(tiled(&frame, stride, 20, 30), [0x70, 0x70, 0x70, 0]);
-        // The bar owns its own rows and the tiles start below them.
-        assert_eq!(pixel(&frame, stride, 24, 0), [0x18, 0x14, 0x20, 0]);
+        // The bar owns its own rows and the tiles start below them. Sampled
+        // at the launcher button's right edge, past its mark and the cursor.
+        assert_eq!(pixel(&frame, stride, 23, 0), [0x18, 0x14, 0x20, 0]);
         assert_eq!(
-            pixel(&frame, stride, 24, BAR_HEIGHT - 1),
+            pixel(&frame, stride, 23, BAR_HEIGHT - 1),
             [0x18, 0x14, 0x20, 0]
         );
 

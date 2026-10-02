@@ -622,6 +622,11 @@ pub struct Runtime {
     /// Nothing in the pointer model carries it: neither press a drag begins
     /// with is delivered, so no client is told any of this.
     dragging: Option<Drag>,
+    /// A free press landed on the bar's launcher button in the last pointer
+    /// report. The input adapter takes it and opens the overlay through the
+    /// same door `Super+Enter` uses, which is what keeps its keyboard capture
+    /// and any launch outside this lock.
+    launcher_button: bool,
 }
 
 #[derive(Default)]
@@ -808,6 +813,7 @@ impl Runtime {
             application_ready: None,
             client_resources: BTreeMap::new(),
             dragging: None,
+            launcher_button: false,
         }
     }
 
@@ -2997,6 +3003,24 @@ impl Runtime {
         self.scene.launcher_visible()
     }
 
+    #[cfg(test)]
+    pub fn launcher_query(&self) -> String {
+        self.scene.launcher_checkpoint().query().to_string()
+    }
+
+    /// What the last pointer report asked of the launcher. `pressed` says
+    /// the report carried a press the adapter withheld because the overlay
+    /// was up; that press is answered from the card under the pointer.
+    /// Otherwise the answer is whether a free press opened it from the bar.
+    pub fn pointer_launcher(&mut self, pressed: bool) -> Option<LauncherAction> {
+        let button = std::mem::take(&mut self.launcher_button);
+        if pressed {
+            let size = self.backend.dimensions();
+            return self.scene.launcher_press(size.width, size.height);
+        }
+        button.then_some(LauncherAction::Open)
+    }
+
     /// The cheat sheet has no model to restore, unlike the launcher: it is one
     /// bit. Both failures put that bit back and repaint what was there —
     /// `refresh_focus` as well as the paint, since a scene showing a modal
@@ -3097,6 +3121,9 @@ impl Runtime {
         buttons: &[PointerButtonInput],
         scroll: PointerScroll,
     ) -> Result<(), String> {
+        // One report's answer: whatever the adapter did not collect is
+        // cleared by the next report the runtime sees.
+        self.launcher_button = false;
         let size = self.backend.dimensions();
         let overlay_modal = self.scene.modal();
         let portal_modal = self.scene.portal_modal().is_some();
@@ -3416,6 +3443,18 @@ impl Runtime {
                         // press and then the releases that end an older grab
                         // leaves no grab behind, and the press it delivered
                         // would look free.
+                        continue;
+                    } else if self.scene.launcher_pressed() {
+                        // The launcher's button, the strip's first cell. As
+                        // with a cell, nothing is picked up and a client
+                        // never had the press. Only NOTED here: opening is
+                        // the input adapter's, through the keyboard's door.
+                        self.cancel_drag()?;
+                        self.launcher_button = true;
+                        // Spends a notch beside it, as a cell press does: the
+                        // press is the deliberate half, and a switch under the
+                        // opening overlay is not what it asked for.
+                        named_workspace = true;
                         continue;
                     } else if let Some(number) = self.scene.desk_pressed() {
                         // A press on a workspace CELL switches to it. Asked
@@ -8355,6 +8394,99 @@ mod tests {
     }
 
     #[test]
+    fn a_press_on_the_bars_launcher_button_asks_for_the_launcher_and_reaches_no_client() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-launcher-button-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let (width, height) = (640usize, 480usize);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, width, height, width * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime
+                .pointer_frame(1, dx, dy, buttons, PointerScroll::default())
+                .unwrap()
+        };
+        let button = (crate::bar::LAUNCHER_WIDTH / 2, crate::bar::BAR_HEIGHT / 2);
+
+        goto(&mut runtime, button.0, button.1, &[]);
+        assert_eq!(runtime.pointer_launcher(false), None, "motion asked");
+        let before = runtime.pointer_snapshot().revision;
+        goto(&mut runtime, button.0, button.1, &[press(1)]);
+        assert_eq!(
+            runtime.pointer_snapshot().revision,
+            before,
+            "the press on the button reached a client"
+        );
+        assert!(runtime.dragging.is_none(), "the button picked something up");
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+        // Asked for, not opened: the adapter opens it through its own door.
+        assert!(!runtime.launcher_visible());
+        assert_eq!(runtime.pointer_launcher(false), Some(LauncherAction::Open));
+        assert_eq!(runtime.pointer_launcher(false), None, "answered twice");
+        goto(&mut runtime, button.0, button.1, &[release(2)]);
+        assert_eq!(runtime.pointer_launcher(false), None, "the release asked");
+
+        // A press nobody collected is not carried into the next report. A
+        // notch in the same report is spent by the press, as beside a cell.
+        let (dx, dy) = (0, 0);
+        runtime
+            .pointer_frame(
+                1,
+                dx,
+                dy,
+                &[press(3)],
+                // Toward the operator, which would step to workspace 2.
+                PointerScroll {
+                    vertical: -1,
+                    horizontal: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(runtime.scene.layout().active_workspace(), 1, "notch spent");
+        goto(&mut runtime, button.0, button.1, &[release(4)]);
+        assert_eq!(runtime.pointer_launcher(false), None, "a stale press");
+
+        // A press on a workspace cell asks nothing of the launcher.
+        let desks = runtime.scene.desks();
+        let (left, cell) = crate::bar::desk_cell(&desks, 2).unwrap();
+        goto(&mut runtime, left + cell / 2, button.1, &[press(5)]);
+        assert_eq!(runtime.scene.layout().active_workspace(), 2);
+        assert_eq!(runtime.pointer_launcher(false), None);
+        goto(&mut runtime, left + cell / 2, button.1, &[release(6)]);
+
+        // Open, a press is the card's to answer: off the card closes it, and
+        // a row chooses that row. The overlay itself takes the press from
+        // the clients and the strip, so nothing switches under it.
+        runtime.launcher(LauncherAction::Open).unwrap();
+        goto(&mut runtime, button.0, button.1, &[press(7)]);
+        assert_eq!(runtime.scene.layout().active_workspace(), 2);
+        assert_eq!(runtime.pointer_launcher(true), Some(LauncherAction::Close));
+        goto(&mut runtime, button.0, button.1, &[release(8)]);
+        let (row_x, row_y) = crate::launcher::row_centre(width, height, 0);
+        goto(&mut runtime, row_x, row_y, &[]);
+        assert_eq!(
+            runtime.pointer_launcher(true),
+            Some(LauncherAction::Choose(0))
+        );
+        // And closed, a withheld press asks nothing of a card that is gone.
+        runtime.launcher(LauncherAction::Close).unwrap();
+        assert_eq!(runtime.pointer_launcher(true), None);
+    }
+
+    #[test]
     fn pressing_and_scrolling_the_strip_switches_the_workspace_in_view() {
         // Proved through the real driver, as the drop above is: what an
         // operator does is move a pointer onto a number and click it, and
@@ -8408,7 +8540,7 @@ mod tests {
         assert_eq!(runtime.scene.layout().active_workspace(), 1);
 
         // THE CLICK. The pointer starts at the output's corner, which is
-        // inside the first cell, so this is a journey to the second one.
+        // the launcher's button, so this is a journey to the second cell.
         let (x, y) = cell(&runtime, 2);
         let before = runtime.pointer_snapshot().revision;
         goto(&mut runtime, x, y, &[press(1)], still);

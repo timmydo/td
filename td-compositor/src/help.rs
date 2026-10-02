@@ -104,6 +104,12 @@ pub const ROWS: &[Row] = &[
         keys: "SCROLL THE BAR",
         action: "SWITCH WORKSPACE",
     },
+    // The button at the bar's left end: `Super+Enter` for the pointer, and
+    // named here for the reason the strip's gestures are.
+    Row {
+        keys: "CLICK THE BAR MENU",
+        action: "OPEN LAUNCHER",
+    },
 ];
 
 /// What the input layer asks of the sheet. `Close` is what a key press while

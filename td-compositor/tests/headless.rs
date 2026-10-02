@@ -720,9 +720,10 @@ fn pointer_control_hits_real_workspace_chrome_with_a_mapped_native_client() {
     client.ready();
     assert_eq!(request(&control, b"workspace 2\n"), "ok\n");
     assert!(request(&control, b"layout\n").contains("visible=false focused=false"));
-    // Workspace 1 holds the client and occupies the first top-bar cell.
+    // Workspace 1 holds the client and occupies the first top-bar cell,
+    // after the launcher's button.
     assert_eq!(
-        input_request(&control, identity, "pointer 1 1 1 1 0 0\n"),
+        input_request(&control, identity, "pointer 1 30 1 1 0 0\n"),
         input_receipt(identity, 1)
     );
     assert_eq!(

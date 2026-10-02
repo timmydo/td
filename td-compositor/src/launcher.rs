@@ -12,6 +12,17 @@ const MAX_APPLICATION_NAME_BYTES: usize = 32;
 const RESERVED_APPLICATION_NAMES: &[&str] = &["td-jail", "td-jail-reaper-probe"];
 const UI_ENTRY_INDEX: usize = 1;
 const ENTRY_COUNT: usize = 4;
+/// Where the first row's text starts below the card's top, how far apart
+/// rows are, and the highlight drawn behind the selected one. One set of
+/// numbers for the paint and the pointer, so a click lands on the row it
+/// was drawn over.
+const FIRST_ROW_TOP: usize = 92;
+const ROW_STEP: usize = 42;
+const ROW_INSET: usize = 14;
+const ROW_RISE: usize = 8;
+const ROW_HEIGHT: usize = 32;
+/// A row's label is two-times glyphs, so this tall.
+const LABEL_HEIGHT: usize = ui::GLYPH_HEIGHT * 2;
 pub(crate) const TASK_DIRECTORY: &str = "/home/tester/src/td-vm/work";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,6 +32,9 @@ pub enum LauncherAction {
     Previous,
     Close,
     Activate,
+    /// The pointer's Activate: the `n`th row SHOWN, which is a position in
+    /// the filtered list rather than in the registry.
+    Choose(usize),
     Insert(char),
     Backspace,
 }
@@ -89,6 +103,56 @@ fn entry_at(
         3 => Some(CLOSE_ENTRY),
         _ => None,
     }
+}
+
+/// The card, centred and shrunk to fit an output smaller than it.
+fn card(width: usize, height: usize) -> (usize, usize, usize, usize) {
+    let card_width = CARD_WIDTH.min(width.saturating_sub(CARD_PADDING.saturating_mul(2)));
+    let card_height = CARD_HEIGHT.min(height.saturating_sub(CARD_PADDING.saturating_mul(2)));
+    let left = width.saturating_sub(card_width) / 2;
+    let top = height.saturating_sub(card_height) / 2;
+    (left, top, card_width, card_height)
+}
+
+fn row_text_top(card_top: usize, row: usize) -> usize {
+    card_top
+        .saturating_add(FIRST_ROW_TOP)
+        .saturating_add(row.saturating_mul(ROW_STEP))
+}
+
+/// A row's highlight, which is also what a press must land in to choose
+/// it; clipped to the card, so a row the card cut off cannot be chosen.
+fn row_area(card: (usize, usize, usize, usize), row: usize) -> (usize, usize, usize, usize) {
+    let (left, top, card_width, _) = card;
+    intersect(
+        (
+            left.saturating_add(ROW_INSET),
+            row_text_top(top, row).saturating_sub(ROW_RISE),
+            card_width.saturating_sub(ROW_INSET.saturating_mul(2)),
+            ROW_HEIGHT,
+        ),
+        card,
+    )
+}
+
+/// The middle of a shown row's press area, for tests that drive a press.
+#[cfg(test)]
+pub(crate) fn row_centre(width: usize, height: usize, row: usize) -> (usize, usize) {
+    let (left, top, row_width, row_height) = row_area(card(width, height), row);
+    (left + row_width / 2, top + row_height / 2)
+}
+
+/// Whether a row is on the card at all: its whole label fits. A row the
+/// card cut off is not drawn and the pointer cannot choose it, so nothing
+/// the operator cannot read can be clicked.
+fn row_shown(card: (usize, usize, usize, usize), row: usize) -> bool {
+    let (_, top, _, height) = card;
+    row_text_top(top, row).saturating_add(LABEL_HEIGHT) <= top.saturating_add(height)
+}
+
+fn contains(rect: (usize, usize, usize, usize), x: usize, y: usize) -> bool {
+    let (left, top, width, height) = rect;
+    x >= left && x < left.saturating_add(width) && y >= top && y < top.saturating_add(height)
 }
 
 #[derive(Clone)]
@@ -289,6 +353,10 @@ impl Launcher {
                 };
             }
             LauncherAction::Close => self.visible = false,
+            LauncherAction::Choose(row) if self.visible && row < self.matches.len() => {
+                self.selected = row;
+                return self.apply(LauncherAction::Activate);
+            }
             LauncherAction::Activate if self.visible => {
                 let request = self
                     .matches
@@ -313,6 +381,7 @@ impl Launcher {
             LauncherAction::Next
             | LauncherAction::Previous
             | LauncherAction::Activate
+            | LauncherAction::Choose(_)
             | LauncherAction::Insert(_)
             | LauncherAction::Backspace => {}
         }
@@ -337,15 +406,34 @@ impl Launcher {
         self.query.get(start..).unwrap_or_default()
     }
 
+    /// What a press at `(x, y)` asks of the open overlay. A row's highlight
+    /// area chooses that row; a press off the card closes it, as Escape
+    /// does; the card's title, filter and the air between rows ask nothing.
+    pub fn press_at(
+        &self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> Option<LauncherAction> {
+        if !self.visible {
+            return None;
+        }
+        let card = card(width, height);
+        if !contains(card, x, y) {
+            return Some(LauncherAction::Close);
+        }
+        (0..self.matches.len())
+            .position(|row| row_shown(card, row) && contains(row_area(card, row), x, y))
+            .map(LauncherAction::Choose)
+    }
+
     pub fn paint(&self, frame: &mut [u8], width: usize, height: usize, stride: usize) {
         if !self.visible {
             return;
         }
-        let card_width = CARD_WIDTH.min(width.saturating_sub(CARD_PADDING.saturating_mul(2)));
-        let card_height = CARD_HEIGHT.min(height.saturating_sub(CARD_PADDING.saturating_mul(2)));
-        let left = width.saturating_sub(card_width) / 2;
-        let top = height.saturating_sub(card_height) / 2;
-        let card = (left, top, card_width, card_height);
+        let card = card(width, height);
+        let (left, top, card_width, _) = card;
         fill(frame, width, height, stride, card, [0x20, 0x18, 0x28, 0]);
         border(frame, width, height, stride, card, [0xc0, 0x70, 0xf0, 0]);
         ui::draw_text_clipped(
@@ -405,19 +493,12 @@ impl Launcher {
             else {
                 continue;
             };
-            let row_top = top
-                .saturating_add(92)
-                .saturating_add(match_index.saturating_mul(42));
+            if !row_shown(card, match_index) {
+                break;
+            }
+            let row_top = row_text_top(top, match_index);
             if match_index == self.selected {
-                let highlight = intersect(
-                    (
-                        left.saturating_add(14),
-                        row_top.saturating_sub(8),
-                        card_width.saturating_sub(28),
-                        32,
-                    ),
-                    card,
-                );
+                let highlight = row_area(card, match_index);
                 fill(
                     frame,
                     width,
@@ -732,6 +813,109 @@ mod tests {
     }
 
     #[test]
+    fn a_press_chooses_the_row_painted_under_it_and_off_the_card_closes() {
+        let (width, height) = (640usize, 480usize);
+        let stride = width * 4;
+        let highlight = [0x58, 0x30, 0x70, 0];
+        let mut launcher = Launcher::new();
+        assert_eq!(launcher.press_at(0, 0, width, height), None, "closed");
+        launcher.apply(LauncherAction::Open);
+        let card = card(width, height);
+        let rows = launcher.matches.len();
+        assert!(rows > 1);
+        for row in 0..rows {
+            let (x, y) = row_centre(width, height, row);
+            assert_eq!(
+                launcher.press_at(x, y, width, height),
+                Some(LauncherAction::Choose(row))
+            );
+            // The press area IS the highlight the paint draws behind the
+            // selected row: its corners are highlight, the rows just outside
+            // it are not.
+            launcher.selected = row;
+            let mut frame = vec![0u8; stride * height];
+            launcher.paint(&mut frame, width, height, stride);
+            let at = |x: usize, y: usize| frame.get(y * stride + x * 4..y * stride + x * 4 + 4);
+            let (left, top, w, h) = row_area(card, row);
+            assert_eq!(at(left, top), Some(&highlight[..]), "row {row}");
+            assert_eq!(at(left + w - 1, top + h - 1), Some(&highlight[..]));
+            assert_ne!(at(left, top - 1), Some(&highlight[..]));
+            assert_ne!(at(left, top + h), Some(&highlight[..]));
+            assert_eq!(launcher.press_at(left, top - 1, width, height), None);
+            assert_eq!(launcher.press_at(left, top + h, width, height), None);
+        }
+        // Off the card is Escape; the title on it asks nothing.
+        assert_eq!(
+            launcher.press_at(0, 0, width, height),
+            Some(LauncherAction::Close)
+        );
+        assert_eq!(
+            launcher.press_at(card.0 + card.2, card.1, width, height),
+            Some(LauncherAction::Close)
+        );
+        assert_eq!(
+            launcher.press_at(card.0 + 24, card.1 + 20, width, height),
+            None
+        );
+        // A row the filter took away is not there to press.
+        for character in "close".chars() {
+            launcher.apply(LauncherAction::Insert(character));
+        }
+        let (x, y) = row_centre(width, height, 1);
+        assert_eq!(launcher.press_at(x, y, width, height), None);
+
+        // An output too short for every row: a row the card cut off is off
+        // the card, so a press there closes rather than choosing it.
+        let short = 160usize;
+        launcher.apply(LauncherAction::Open);
+        let (x, y) = row_centre(width, short, 1);
+        assert_eq!(
+            launcher.press_at(x, y, width, short),
+            Some(LauncherAction::Close)
+        );
+        // Shorter still by the right amount, the card keeps a sliver of the
+        // next row's highlight below a label it cannot hold: that row is not
+        // drawn, and the sliver chooses nothing.
+        let sliver = 180usize;
+        let cut = super::card(width, sliver);
+        assert!(row_shown(cut, 0) && !row_shown(cut, 1));
+        let (left, top, w, h) = row_area(cut, 1);
+        assert!(h > 0, "no sliver to press: {:?}", row_area(cut, 1));
+        assert_eq!(launcher.press_at(left + w / 2, top, width, sliver), None);
+        launcher.selected = 1;
+        let mut frame = vec![0u8; stride * sliver];
+        launcher.paint(&mut frame, width, sliver, stride);
+        let at = |x: usize, y: usize| frame.get(y * stride + x * 4..y * stride + x * 4 + 4);
+        assert_ne!(at(left, top), Some(&highlight[..]), "a hidden row drawn");
+        assert!((top..top + h)
+            .all(|y| (left..left + w).all(|x| at(x, y) != Some(&[0xff, 0xff, 0xff, 0][..]))));
+    }
+
+    #[test]
+    fn choosing_a_row_activates_that_row_and_only_a_shown_one() {
+        let mut launcher = Launcher::new();
+        assert_eq!(launcher.apply(LauncherAction::Choose(0)), None);
+        assert!(!launcher.visible(), "a closed launcher opened");
+        launcher.apply(LauncherAction::Open);
+        assert_eq!(
+            launcher.apply(LauncherAction::Choose(0)),
+            Some(LaunchRequest::Terminal)
+        );
+        assert!(!launcher.visible());
+        // Past the rows shown asks nothing and leaves it up.
+        launcher.apply(LauncherAction::Open);
+        assert_eq!(launcher.apply(LauncherAction::Choose(9)), None);
+        assert!(launcher.visible());
+        // A position in the FILTERED list: the only row left is the close.
+        for character in "close".chars() {
+            launcher.apply(LauncherAction::Insert(character));
+        }
+        assert_eq!(launcher.matched_labels(), ["CLOSE LAUNCHER"]);
+        assert_eq!(launcher.apply(LauncherAction::Choose(0)), None);
+        assert!(!launcher.visible());
+    }
+
+    #[test]
     fn close_resets_visibility_and_open_resets_selection() {
         let mut launcher = Launcher::new();
         launcher.apply(LauncherAction::Open);
@@ -880,8 +1064,8 @@ mod tests {
     #[test]
     fn registry_entries_are_searchable_and_fit_the_card() {
         let glyph_height = ui::GLYPH_HEIGHT.saturating_mul(2);
-        let final_row = 92usize
-            .saturating_add(ENTRY_COUNT.saturating_sub(1).saturating_mul(42))
+        let final_row = FIRST_ROW_TOP
+            .saturating_add(ENTRY_COUNT.saturating_sub(1).saturating_mul(ROW_STEP))
             .saturating_add(glyph_height);
         assert!(final_row <= CARD_HEIGHT);
         for entry in [TERMINAL_ENTRY, CLOSE_ENTRY, DIRECT_UI_ENTRY] {

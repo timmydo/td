@@ -99,6 +99,8 @@ const KEY_DOWN: u16 = 108;
 const KEY_LEFTMETA: u16 = 125;
 const KEY_RIGHTMETA: u16 = 126;
 const BTN_MOUSE: u16 = 0x110;
+/// The first mouse button is the left one.
+const BTN_LEFT: u16 = BTN_MOUSE;
 const BTN_TASK: u16 = 0x117;
 const MAX_XKB_EVDEV_KEY: u16 = 247;
 const KEY_RELEASE: i32 = 0;
@@ -741,6 +743,13 @@ trait InputTarget {
     /// point. Separate from `launcher` because that one is about the overlay's
     /// model and returns its visibility, which this never changes.
     fn launch(&mut self, request: LaunchRequest) -> Result<(), String>;
+    /// What the pointer report just delivered asks of the launcher, which
+    /// the adapter then puts through `launcher` as it would a key's.
+    /// `pressed` is a left press withheld because the overlay is up. A
+    /// target with no launcher answers nothing.
+    fn pointer_launcher(&mut self, _pressed: bool) -> Result<Option<LauncherAction>, String> {
+        Ok(None)
+    }
     fn key(&mut self, input: KeyInput) -> Result<(), String>;
     fn modifiers(&mut self, modifiers: ModifierState) -> Result<(), String>;
     fn pointer_frame(
@@ -1135,6 +1144,14 @@ impl InputTarget for LiveInputTarget {
             self.spawn(request)?;
         }
         Ok(visible)
+    }
+
+    fn pointer_launcher(&mut self, pressed: bool) -> Result<Option<LauncherAction>, String> {
+        Ok(self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .pointer_launcher(pressed))
     }
 
     fn key(&mut self, input: KeyInput) -> Result<(), String> {
@@ -1594,6 +1611,22 @@ fn deliver_pointer_frame<T: InputTarget>(
         return finish_attention(runtime, bindings);
     }
     let mut buttons = bindings.pointer_device_changes(device, &frame.buttons, frame.time);
+    // The launcher is asked only about THIS device's own presses. The seat's
+    // changes are no guide while an overlay withholds presses: those never
+    // reach the forwarded set, so another device's release can read there
+    // as a press. A report that pressed nothing asks nothing, which also
+    // keeps plain motion off a second runtime lock.
+    let pressed_here = frame.buttons.iter().any(|button| button.pressed);
+    // A left press on the open launcher is the launcher's, answered below
+    // once the report has put the pointer where the press was made. Not
+    // while the sheet is up: that outranks the launcher, and it is never
+    // up beside it anyway.
+    let launcher_press = bindings.launcher_open
+        && !bindings.help_open
+        && frame
+            .buttons
+            .iter()
+            .any(|button| button.pressed && button.code == BTN_LEFT);
     if bindings.launcher_open || bindings.help_open {
         buttons.retain(|button| button.state == PointerButtonState::Released);
     }
@@ -1615,7 +1648,16 @@ fn deliver_pointer_frame<T: InputTarget>(
         }
     };
     bindings.commit_pointer_device(device, pressed, &buttons);
-    delivery
+    delivery?;
+    // The launcher's own door, the one a key takes, so its capture follows
+    // the overlay whichever device opened or closed it.
+    if pressed_here {
+        if let Some(action) = runtime.pointer_launcher(launcher_press)? {
+            let visible = runtime.launcher(action)?;
+            bindings.settle_launcher(Some(visible));
+        }
+    }
+    Ok(())
 }
 
 fn deliver_key_decision<T: InputTarget>(
@@ -3049,7 +3091,9 @@ mod tests {
             self.launcher_actions.push(action);
             match action {
                 LauncherAction::Open => self.launcher_visible = true,
-                LauncherAction::Close | LauncherAction::Activate => self.launcher_visible = false,
+                LauncherAction::Close | LauncherAction::Activate | LauncherAction::Choose(_) => {
+                    self.launcher_visible = false
+                }
                 LauncherAction::Next
                 | LauncherAction::Previous
                 | LauncherAction::Insert(_)
@@ -3123,6 +3167,9 @@ mod tests {
     struct LauncherModelTarget {
         launcher: crate::launcher::Launcher,
         recording: RecordingTarget,
+        /// What `pointer_launcher` answers, in order, and what it was asked.
+        pointer_answers: std::collections::VecDeque<Option<LauncherAction>>,
+        pointer_asks: Vec<bool>,
     }
 
     impl LauncherModelTarget {
@@ -3130,6 +3177,8 @@ mod tests {
             Self {
                 launcher: crate::launcher::Launcher::new(),
                 recording: RecordingTarget::default(),
+                pointer_answers: std::collections::VecDeque::new(),
+                pointer_asks: Vec::new(),
             }
         }
     }
@@ -3159,6 +3208,11 @@ mod tests {
             self.recording.launcher_actions.push(action);
             self.launcher.apply(action);
             Ok(self.launcher.visible())
+        }
+
+        fn pointer_launcher(&mut self, pressed: bool) -> Result<Option<LauncherAction>, String> {
+            self.pointer_asks.push(pressed);
+            Ok(self.pointer_answers.pop_front().flatten())
         }
 
         fn key(&mut self, input: KeyInput) -> Result<(), String> {
@@ -3795,6 +3849,7 @@ mod tests {
         Move,
         Send,
         Switch,
+        Launcher,
     }
 
     impl Bound {
@@ -3836,7 +3891,7 @@ mod tests {
                 Bound::Launch(LaunchRequest::TaskTerminal) => "NEW TERMINAL",
                 Bound::Launch(LaunchRequest::UiDemo) => "OPEN UI CLIENT",
                 Bound::Launch(LaunchRequest::TaskManager) => "TASK MANAGER",
-                Bound::Launcher(_) => "OPEN LAUNCHER",
+                Bound::Launcher(_) | Bound::Pointer(_, Pointing::Launcher) => "OPEN LAUNCHER",
                 Bound::Help(_) => "THIS HELP",
             }
         }
@@ -3935,6 +3990,11 @@ mod tests {
             (&[], 0, Bound::Pointer("DRAG TO THE BAR", Pointing::Send)),
             (&[], 0, Bound::Pointer("CLICK THE BAR", Pointing::Switch)),
             (&[], 0, Bound::Pointer("SCROLL THE BAR", Pointing::Switch)),
+            (
+                &[],
+                0,
+                Bound::Pointer("CLICK THE BAR MENU", Pointing::Launcher),
+            ),
         ];
         assert_eq!(
             probes.len(),
@@ -4060,6 +4120,174 @@ mod tests {
         assert!(slash.launcher.is_none());
         assert!(slash.forward.is_none());
         assert!(!bindings.help_open);
+    }
+
+    #[test]
+    fn the_pointer_opens_and_answers_the_launcher_through_the_keyboards_door() {
+        let target = Mutex::new(LauncherModelTarget::new());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        let feed = |pointer: &mut PointerMotion, events: &[Event]| {
+            for event in events {
+                apply(&target, *event, 0, &bindings, pointer, None).unwrap();
+            }
+        };
+
+        // A press the runtime says landed on the bar's button opens the
+        // overlay, and the capture follows it as `Super+Enter`'s does.
+        target
+            .lock()
+            .unwrap()
+            .pointer_answers
+            .push_back(Some(LauncherAction::Open));
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_PRESS), syn(1)]);
+        assert!(bindings.lock().unwrap().launcher_open);
+        {
+            let target = target.lock().unwrap();
+            assert_eq!(target.pointer_asks, [false], "closed, so not the card's");
+            assert_eq!(target.recording.launcher_actions, [LauncherAction::Open]);
+            assert!(target.launcher.visible());
+        }
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_RELEASE), syn(2)]);
+        // Now the keyboard types into it, as after the chord.
+        feed(
+            &mut pointer,
+            &[key(KEY_A, KEY_PRESS), key(KEY_A, KEY_RELEASE)],
+        );
+        assert_eq!(
+            target.lock().unwrap().recording.launcher_actions.last(),
+            Some(&LauncherAction::Insert('a'))
+        );
+
+        // While it is up a left press is the card's: withheld from the
+        // runtime's report and asked about instead.
+        target
+            .lock()
+            .unwrap()
+            .pointer_answers
+            .push_back(Some(LauncherAction::Close));
+        let frames_before = target.lock().unwrap().recording.pointer_frames.len();
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_PRESS), syn(3)]);
+        assert!(!bindings.lock().unwrap().launcher_open);
+        {
+            let target = target.lock().unwrap();
+            assert_eq!(target.pointer_asks, [false, true], "a release asked");
+            assert_eq!(
+                target.recording.launcher_actions.last(),
+                Some(&LauncherAction::Close)
+            );
+            assert!(target.recording.pointer_frames[frames_before..]
+                .iter()
+                .all(|(_, _, _, buttons)| buttons.is_empty()));
+        }
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_RELEASE), syn(4)]);
+
+        // Another button on the open card is not a choice.
+        target
+            .lock()
+            .unwrap()
+            .pointer_answers
+            .push_back(Some(LauncherAction::Open));
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_PRESS), syn(5)]);
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_RELEASE), syn(6)]);
+        feed(&mut pointer, &[key(BTN_MOUSE + 1, KEY_PRESS), syn(7)]);
+        assert_eq!(target.lock().unwrap().pointer_asks.last(), Some(&false));
+        assert!(bindings.lock().unwrap().launcher_open);
+        feed(&mut pointer, &[key(BTN_MOUSE + 1, KEY_RELEASE), syn(8)]);
+
+        // A row's answer goes through the same door and drops the capture.
+        target
+            .lock()
+            .unwrap()
+            .pointer_answers
+            .push_back(Some(LauncherAction::Choose(1)));
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_PRESS), syn(9)]);
+        assert!(!bindings.lock().unwrap().launcher_open);
+        assert_eq!(
+            target.lock().unwrap().recording.launcher_actions.last(),
+            Some(&LauncherAction::Choose(1))
+        );
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_RELEASE), syn(10)]);
+        // A report that pressed nothing asks nothing.
+        let asked = target.lock().unwrap().pointer_asks.len();
+        feed(
+            &mut pointer,
+            &[key(KEY_A, KEY_PRESS), key(KEY_A, KEY_RELEASE)],
+        );
+        let motion = Event {
+            timestamp: 0,
+            time: 0,
+            kind: EV_REL,
+            code: REL_X,
+            value: 5,
+        };
+        feed(&mut pointer, &[motion, syn(11)]);
+        assert_eq!(target.lock().unwrap().pointer_asks.len(), asked);
+    }
+
+    #[test]
+    fn another_devices_release_is_not_a_press_on_the_open_launcher() {
+        let target = Mutex::new(LauncherModelTarget::new());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointers = [PointerMotion::default(), PointerMotion::default()];
+        let mut feed = |device: usize, events: &[Event]| {
+            for event in events {
+                apply(
+                    &target,
+                    *event,
+                    device,
+                    &bindings,
+                    &mut pointers[device],
+                    None,
+                )
+                .unwrap();
+            }
+        };
+        target
+            .lock()
+            .unwrap()
+            .pointer_answers
+            .push_back(Some(LauncherAction::Open));
+        feed(0, &[key(BTN_LEFT, KEY_PRESS), syn(1)]);
+        feed(0, &[key(BTN_LEFT, KEY_RELEASE), syn(2)]);
+        assert!(bindings.lock().unwrap().launcher_open);
+        // Both mice hold left on the card's title, which answers nothing.
+        feed(0, &[key(BTN_LEFT, KEY_PRESS), syn(3)]);
+        feed(1, &[key(BTN_LEFT, KEY_PRESS), syn(4)]);
+        assert_eq!(target.lock().unwrap().pointer_asks, [false, true, true]);
+        // The second lets go over a row: that is no press, so nothing asks.
+        target
+            .lock()
+            .unwrap()
+            .pointer_answers
+            .push_back(Some(LauncherAction::Choose(0)));
+        feed(1, &[key(BTN_LEFT, KEY_RELEASE), syn(5)]);
+        assert_eq!(target.lock().unwrap().pointer_asks, [false, true, true]);
+        assert!(bindings.lock().unwrap().launcher_open);
+        assert_eq!(
+            target.lock().unwrap().recording.launcher_actions,
+            [LauncherAction::Open]
+        );
+        // The row's answer was never asked for; this press is on the title.
+        target.lock().unwrap().pointer_answers.clear();
+        // Both hold left again; the second lets go of left and presses its
+        // right button in one report. That report pressed something, so it
+        // is asked about, but its only LEFT transition is a release: not a
+        // press on the card, whatever the seat's changes make of it.
+        feed(1, &[key(BTN_LEFT, KEY_PRESS), syn(6)]);
+        feed(
+            1,
+            &[
+                key(BTN_LEFT, KEY_RELEASE),
+                key(BTN_MOUSE + 1, KEY_PRESS),
+                syn(7),
+            ],
+        );
+        assert_eq!(
+            target.lock().unwrap().pointer_asks,
+            [false, true, true, true, false]
+        );
+        assert!(bindings.lock().unwrap().launcher_open);
     }
 
     #[test]
@@ -5083,6 +5311,90 @@ mod tests {
     }
 
     #[test]
+    fn a_click_on_the_bars_button_opens_the_live_launcher_and_one_off_the_card_closes_it() {
+        let path = std::env::temp_dir().join(format!(
+            "td-input-launcher-button-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer =
+            crate::framebuffer::Framebuffer::test_file(&cleanup.0, 640, 480, 640 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        runtime.lock().unwrap().repaint().unwrap();
+        let launches = LaunchProcesses::new(LaunchOptions {
+            socket: PathBuf::from("/run/user/1000/wayland-0"),
+            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            terminal: PathBuf::from("/bin/td-term"),
+            application: None,
+        })
+        .unwrap();
+        let target = Mutex::new(LiveInputTarget {
+            runtime: Arc::clone(&runtime),
+            launches: LaunchBackend::Direct(launches),
+            secret_attempt: None,
+        });
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        let feed = |pointer: &mut PointerMotion, events: &[Event]| {
+            for event in events {
+                apply(&target, *event, 0, &bindings, pointer, None).unwrap();
+            }
+        };
+        let rel = |code: u16, value: i32| Event {
+            timestamp: 0,
+            time: 0,
+            kind: EV_REL,
+            code,
+            value,
+        };
+
+        // The pointer starts in the output's corner, which is the button.
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_PRESS), syn(1)]);
+        assert!(runtime.lock().unwrap().launcher_visible());
+        assert!(bindings.lock().unwrap().launcher_open);
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_RELEASE), syn(2)]);
+        assert!(runtime.lock().unwrap().launcher_visible());
+        // The keyboard is the overlay's, as after `Super+Enter`.
+        feed(
+            &mut pointer,
+            &[key(KEY_A, KEY_PRESS), key(KEY_A, KEY_RELEASE)],
+        );
+        assert_eq!(runtime.lock().unwrap().launcher_query(), "a");
+
+        // Down the left edge, off the centred card: the press closes it.
+        feed(
+            &mut pointer,
+            &[rel(REL_Y, 200), key(BTN_LEFT, KEY_PRESS), syn(3)],
+        );
+        assert!(!runtime.lock().unwrap().launcher_visible());
+        assert!(!bindings.lock().unwrap().launcher_open);
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_RELEASE), syn(4)]);
+        assert!(!runtime.lock().unwrap().launcher_visible());
+
+        // Back to the button, and then a click on a row: the development
+        // registry's third is the close entry, which launches nothing.
+        feed(
+            &mut pointer,
+            &[rel(REL_Y, -1000), key(BTN_LEFT, KEY_PRESS), syn(5)],
+        );
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_RELEASE), syn(6)]);
+        assert!(runtime.lock().unwrap().launcher_visible());
+        let (x, y) = crate::launcher::row_centre(640, 480, 2);
+        feed(
+            &mut pointer,
+            &[
+                rel(REL_X, i32::try_from(x).unwrap()),
+                rel(REL_Y, i32::try_from(y).unwrap()),
+                key(BTN_LEFT, KEY_PRESS),
+                syn(7),
+            ],
+        );
+        assert!(!runtime.lock().unwrap().launcher_visible());
+        assert!(!bindings.lock().unwrap().launcher_open);
+    }
+
+    #[test]
     fn failed_pointer_repaint_retains_state_for_device_cleanup() {
         let path = std::env::temp_dir().join(format!(
             "td-input-pointer-repaint-failure-{}-{}",
@@ -5117,6 +5429,9 @@ mod tests {
             None,
         )
         .unwrap();
+        // Along the bar to its status line, where a press acts on nothing:
+        // on the launcher's button or a workspace it would paint at once
+        // rather than owe the paint.
         apply(
             &target,
             Event {
@@ -5124,7 +5439,7 @@ mod tests {
                 time: 3,
                 kind: EV_REL,
                 code: REL_X,
-                value: 1,
+                value: 100,
             },
             0,
             &bindings,
