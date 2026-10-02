@@ -258,16 +258,35 @@ impl History {
             return;
         }
         let line_start = self.write;
-        for source in source_cells {
-            if self.arena.len() < self.max_cells {
-                self.arena.push(*source);
-            } else if let Some(target) = self.arena.get_mut(self.write) {
-                *target = *source;
+        // In runs up to the arena's end: appended while it grows, written
+        // over from `write` once it is full, wrapping to its start.
+        let mut rest = source_cells;
+        while !rest.is_empty() {
+            let room = self.max_cells.saturating_sub(self.write);
+            let growing = self.arena.len() < self.max_cells;
+            let run = if growing {
+                room.min(self.max_cells.saturating_sub(self.arena.len()))
+            } else {
+                room
             }
-            self.write = self.write.saturating_add(1);
-            if self.write == self.max_cells {
+            .min(rest.len());
+            if run == 0 {
+                break;
+            }
+            let (now, later) = rest.split_at(run);
+            if growing {
+                self.arena.extend_from_slice(now);
+            } else if let Some(target) = self
+                .arena
+                .get_mut(self.write..self.write.saturating_add(run))
+            {
+                target.copy_from_slice(now);
+            }
+            self.write = self.write.saturating_add(run);
+            if self.write >= self.max_cells {
                 self.write = 0;
             }
+            rest = later;
         }
         self.cells = self.cells.saturating_add(columns);
         self.lines.push_back(HistoryLine {
@@ -329,11 +348,15 @@ impl History {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The grid is a ring of rows: `origin` is the stored row the screen's
+/// first row is, so scrolling the whole screen moves `origin` and clears
+/// the rows it uncovers rather than copying every cell up or down.
+#[derive(Clone, Debug)]
 struct Screen {
     rows: usize,
     columns: usize,
     cells: Vec<Cell>,
+    origin: usize,
     cursor_row: usize,
     cursor_column: usize,
     pending_wrap: bool,
@@ -345,6 +368,45 @@ struct Screen {
     wrapped_rows: Vec<bool>,
     damaged_rows: Vec<bool>,
 }
+
+/// Two screens are equal when they show the same rows, wherever the ring
+/// has put them.
+impl PartialEq for Screen {
+    fn eq(&self, other: &Self) -> bool {
+        // Named in full, so a new field cannot be left out of equality.
+        let Self {
+            rows,
+            columns,
+            cells: _,
+            origin: _,
+            cursor_row,
+            cursor_column,
+            pending_wrap,
+            scroll_top,
+            scroll_bottom,
+            tabs,
+            history,
+            ansi_saved,
+            wrapped_rows,
+            damaged_rows,
+        } = self;
+        *rows == other.rows
+            && *columns == other.columns
+            && (0..*rows).all(|row| self.row(row) == other.row(row))
+            && *cursor_row == other.cursor_row
+            && *cursor_column == other.cursor_column
+            && *pending_wrap == other.pending_wrap
+            && *scroll_top == other.scroll_top
+            && *scroll_bottom == other.scroll_bottom
+            && *tabs == other.tabs
+            && *history == other.history
+            && *ansi_saved == other.ansi_saved
+            && *wrapped_rows == other.wrapped_rows
+            && *damaged_rows == other.damaged_rows
+    }
+}
+
+impl Eq for Screen {}
 
 fn checked_cell_count(rows: usize, columns: usize) -> Result<usize, String> {
     if rows == 0 || columns == 0 {
@@ -387,6 +449,7 @@ impl Screen {
             rows,
             columns,
             cells: vec![Cell::blank(attributes); count],
+            origin: 0,
             cursor_row: 0,
             cursor_column: 0,
             pending_wrap: false,
@@ -400,11 +463,51 @@ impl Screen {
         })
     }
 
-    fn index(&self, row: usize, column: usize) -> Option<usize> {
-        if row >= self.rows || column >= self.columns {
+    /// Where `row`'s cells start in `cells`.
+    fn row_start(&self, row: usize) -> Option<usize> {
+        if row >= self.rows {
             return None;
         }
-        row.checked_mul(self.columns)?.checked_add(column)
+        let stored = self.origin.checked_add(row)?.checked_rem(self.rows)?;
+        stored.checked_mul(self.columns)
+    }
+
+    fn row(&self, row: usize) -> Option<&[Cell]> {
+        let start = self.row_start(row)?;
+        self.cells.get(start..start.checked_add(self.columns)?)
+    }
+
+    fn row_mut(&mut self, row: usize) -> Option<&mut [Cell]> {
+        let start = self.row_start(row)?;
+        self.cells.get_mut(start..start.checked_add(self.columns)?)
+    }
+
+    /// Copies row `from` over row `to`, whole.
+    fn copy_row(&mut self, from: usize, to: usize) {
+        let (Some(source), Some(target)) = (self.row_start(from), self.row_start(to)) else {
+            return;
+        };
+        let Some(end) = source.checked_add(self.columns) else {
+            return;
+        };
+        if end <= self.cells.len() && target.saturating_add(self.columns) <= self.cells.len() {
+            self.cells.copy_within(source..end, target);
+        }
+    }
+
+    fn blank_rows(&mut self, rows: std::ops::Range<usize>, attributes: Attributes) {
+        for row in rows {
+            if let Some(cells) = self.row_mut(row) {
+                cells.fill(Cell::blank(attributes));
+            }
+        }
+    }
+
+    fn index(&self, row: usize, column: usize) -> Option<usize> {
+        if column >= self.columns {
+            return None;
+        }
+        self.row_start(row)?.checked_add(column)
     }
 
     fn cell(&self, row: usize, column: usize) -> Option<Cell> {
@@ -470,7 +573,7 @@ impl Screen {
     fn record_history_rows(&mut self, start: usize, count: usize) {
         let end = start.saturating_add(count).min(self.rows);
         for row in start..end {
-            let Some(cell_start) = row.checked_mul(self.columns) else {
+            let Some(cell_start) = self.row_start(row) else {
                 continue;
             };
             let wrapped = self.wrapped_rows.get(row).copied().unwrap_or(false);
@@ -535,23 +638,19 @@ impl Screen {
         if let Some(last) = bottom.checked_sub(1) {
             self.unwrap_row(last);
         }
-        let Some(source_start) = top.saturating_add(count).checked_mul(self.columns) else {
-            return;
-        };
-        let Some(source_end) = bottom.checked_mul(self.columns) else {
-            return;
-        };
-        let Some(destination) = top.checked_mul(self.columns) else {
-            return;
-        };
-        self.cells
-            .copy_within(source_start..source_end, destination);
-        let Some(clear_start) = bottom.saturating_sub(count).checked_mul(self.columns) else {
-            return;
-        };
-        if let Some(cells) = self.cells.get_mut(clear_start..source_end) {
-            cells.fill(Cell::blank(attributes));
+        if top == 0 && bottom == self.rows {
+            // The whole screen: its first `count` rows become its last.
+            self.origin = self
+                .origin
+                .saturating_add(count)
+                .checked_rem(self.rows)
+                .unwrap_or(0);
+        } else {
+            for row in top..bottom - count {
+                self.copy_row(row.saturating_add(count), row);
+            }
         }
+        self.blank_rows(bottom - count..bottom, attributes);
         self.wrapped_rows
             .copy_within(top.saturating_add(count)..bottom, top);
         if let Some(rows) = self
@@ -578,20 +677,19 @@ impl Screen {
         } else {
             self.history.unwrap_newest();
         }
-        let Some(source_start) = top.checked_mul(self.columns) else {
-            return;
-        };
-        let Some(source_end) = bottom.saturating_sub(count).checked_mul(self.columns) else {
-            return;
-        };
-        let Some(destination) = top.saturating_add(count).checked_mul(self.columns) else {
-            return;
-        };
-        self.cells
-            .copy_within(source_start..source_end, destination);
-        if let Some(cells) = self.cells.get_mut(source_start..destination) {
-            cells.fill(Cell::blank(attributes));
+        if top == 0 && bottom == self.rows {
+            // The whole screen: its last `count` rows become its first.
+            self.origin = self
+                .origin
+                .saturating_add(self.rows - count)
+                .checked_rem(self.rows)
+                .unwrap_or(0);
+        } else {
+            for row in (top + count..bottom).rev() {
+                self.copy_row(row - count, row);
+            }
         }
+        self.blank_rows(top..top + count, attributes);
         self.wrapped_rows
             .copy_within(top..bottom.saturating_sub(count), top.saturating_add(count));
         if let Some(rows) = self.wrapped_rows.get_mut(top..top.saturating_add(count)) {
@@ -654,7 +752,7 @@ impl Screen {
         if count == 0 {
             return;
         }
-        let Some(row_start) = self.cursor_row.checked_mul(self.columns) else {
+        let Some(row_start) = self.row_start(self.cursor_row) else {
             return;
         };
         let Some(start) = row_start.checked_add(self.cursor_column) else {
@@ -681,7 +779,7 @@ impl Screen {
         if count == 0 {
             return;
         }
-        let Some(row_start) = self.cursor_row.checked_mul(self.columns) else {
+        let Some(row_start) = self.row_start(self.cursor_row) else {
             return;
         };
         let Some(start) = row_start.checked_add(self.cursor_column) else {
@@ -845,6 +943,7 @@ impl Screen {
         self.rows = rows;
         self.columns = columns;
         self.cells = cells;
+        self.origin = 0;
         let cursor = SavedCursor {
             row: old_cursor_row,
             column: old_cursor_column,

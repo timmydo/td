@@ -2478,3 +2478,90 @@ fn osc0_and_osc2_set_the_title() {
     terminal.feed(b"\x1b]0;\x07");
     assert_eq!(terminal.title(), None, "empty clears it");
 }
+
+/// The screen is a ring of rows that a whole-screen scroll turns. Turned
+/// twice by output, its rows stay in order through scrolls down and up,
+/// a reverse index at the top, and a region's scrolls, which copy rows.
+#[test]
+fn a_turned_ring_keeps_its_rows_in_order() {
+    let mut terminal = Terminal::new(4, 3).unwrap();
+    let rows = |terminal: &Terminal| -> Vec<String> {
+        (0..4).map(|row| terminal.row_text(row).unwrap()).collect()
+    };
+    terminal.feed(b"a\r\nb\r\nc\r\nd\r\ne\r\nf");
+    assert_eq!(rows(&terminal), ["c  ", "d  ", "e  ", "f  "]);
+    terminal.feed(b"\x1b[2T");
+    assert_eq!(rows(&terminal), ["   ", "   ", "c  ", "d  "], "SD 2");
+    terminal.feed(b"\x1b[H\x1bM");
+    assert_eq!(
+        rows(&terminal),
+        ["   ", "   ", "   ", "c  "],
+        "RI at the top"
+    );
+    terminal.feed(b"\x1b[3S");
+    assert_eq!(rows(&terminal), ["c  ", "   ", "   ", "   "], "SU 3");
+    terminal.feed(b"\x1b[2;3r\x1b[2;1Hx\x1b[3;1Hy\x1b[4;1Hz");
+    assert_eq!(rows(&terminal), ["c  ", "x  ", "y  ", "z  "]);
+    terminal.feed(b"\x1b[S");
+    assert_eq!(
+        rows(&terminal),
+        ["c  ", "y  ", "   ", "z  "],
+        "SU in a region"
+    );
+    terminal.feed(b"\x1b[T");
+    assert_eq!(
+        rows(&terminal),
+        ["c  ", "   ", "y  ", "z  "],
+        "SD in a region"
+    );
+    // Counts past the region or the screen blank what they cover and no
+    // more.
+    terminal.feed(b"\x1b[9S");
+    assert_eq!(
+        rows(&terminal),
+        ["c  ", "   ", "   ", "z  "],
+        "SU 9 in a region"
+    );
+    terminal.feed(b"\x1b[3;1Hy\x1b[9T");
+    assert_eq!(
+        rows(&terminal),
+        ["c  ", "   ", "   ", "z  "],
+        "SD 9 in a region"
+    );
+    terminal.feed(b"\x1b[r\x1b[9T");
+    assert_eq!(rows(&terminal), ["   ", "   ", "   ", "   "], "SD 9");
+    terminal.feed(b"q\x1b[9S");
+    assert_eq!(rows(&terminal), ["   ", "   ", "   ", "   "], "SU 9");
+}
+
+/// Screens are equal by the rows they show, wherever the ring has put
+/// them.
+#[test]
+fn screens_showing_the_same_rows_are_equal_wherever_the_ring_turned() {
+    let attributes = Attributes::default();
+    let mut first = Screen::new(3, 2, attributes, false).unwrap();
+    let mut turned = first.clone();
+    turned.scroll_up(0, 3, 1, attributes, false);
+    assert_ne!(first.origin, turned.origin);
+    assert_eq!(first, turned);
+    for screen in [&mut first, &mut turned] {
+        screen.set_cell(
+            1,
+            1,
+            Cell {
+                scalar: 'x',
+                attributes,
+            },
+        );
+    }
+    assert_eq!(first, turned);
+    turned.set_cell(
+        2,
+        0,
+        Cell {
+            scalar: 'y',
+            attributes,
+        },
+    );
+    assert_ne!(first, turned);
+}
