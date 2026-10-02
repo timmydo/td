@@ -932,12 +932,41 @@ Source key bytes must remain valid until completion; target lookup uses a
 separate caller result buffer and releases borrowed target rows before the next
 advance. ReadView::next ties the returned Record's key and value lifetimes
 together. To reuse that value buffer for reference lookups, copy/re-derive the
-source key into independent existing cursor/key scratch and decode from that
-separate borrow before creating ReferenceCheck. The helper does not detach a
-Record's shared borrow or obtain another arena implicitly. A zero-target check still verifies identity on its first advance.
+source key into independent cursor/key scratch or separately charged stack
+storage and decode from that separate borrow before creating ReferenceCheck.
+The helper does not detach a Record's shared borrow or obtain another arena
+implicitly. A zero-target check still verifies identity on its first advance.
 Completed checks perform no more lookups but continue rejecting identity change;
 failed/unfinished checks cannot finish. At most two gets are performed, each
 subject to the view's work/scratch limits and caller deadline admission.
+
+`reference_sweep::Sweep` enumerates the supplied ReadView's final rows in all
+11 table kinds and runs ReferenceCheck for each. One advance performs one next
+and at most two gets. Validate view identity before and after next, with changed
+view taking precedence over row/absence/error; then require the requested table,
+strict canonical key progression, local source validity and sequence ceiling.
+Copy the source key into a fixed independent key buffer and decode it there,
+releasing next's shared key/value borrow before reusing the value output for
+target lookups. No source row or key borrow survives the advance.
+
+Local source/table/order/sequence errors precede resource refusal. A found row
+beyond the caller's finite max_rows limit then refuses before target lookups.
+Count only fully checked rows; checked counters and fixed per-table counts
+cannot wrap. An exhausted next reports TableComplete and moves to the
+next table on the following advance. After all tables, a separate identity-
+checked advance reports Complete. Zero allowed rows can still prove all tables
+empty. Failures permanently retire the sweep and forbid finish; repeated
+Complete performs no lookups but still rejects changed identity.
+
+Completion retains captured identity, the single UTC sample, total and per-table
+row counts. It proves direct checks over rows returned by the supplied view,
+not that the view enumerated physical files completely. Selected-file integrity,
+actual pins, blob byte verification, every mailbox parent chain and aggregate
+rules such as missing recipient rows remain separate coordinator work. Every
+step needs admission for the view's one-next-plus-two-get work and a deadline;
+these are logical lookup bounds, not a physical I/O or time bound. Identity
+movement during either next or a target get reports the same top-level
+ChangedView error; other reference failures retain their nested classification.
 
 Thread assignment does not depend on disposable indexes or rescanning every
 body. Store at most one anchor per email: its first syntactically valid

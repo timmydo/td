@@ -25,6 +25,10 @@ use td_mta::{
 #[path = "../src/row_references.rs"]
 #[allow(unused)]
 mod measured_row_references;
+use td_mta::row_references;
+#[path = "../src/reference_sweep.rs"]
+#[allow(unused)]
+mod measured_reference_sweep;
 #[path = "../src/store_fs.rs"]
 #[allow(unused)] // Second compilation; the library build remains the lint authority.
 pub mod measured_store_fs;
@@ -91,6 +95,7 @@ fn hot_paths() {
         store_complete_frames();
         store_paths();
         measured_row_references::tests::probe();
+        measured_reference_sweep::tests::probe();
         let mut line = td_mta::smtp_wire::LineReader::new(&mut scratch).unwrap();
         assert!(!line.feed(black_box(b"EHLO example")).unwrap().complete);
         assert!(line.feed(black_box(b".test\r\n")).unwrap().complete);

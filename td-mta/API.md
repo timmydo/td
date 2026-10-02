@@ -767,6 +767,13 @@ the caller's target-result scratch. A key from next's Record must first be
 detached/re-decoded into independent key scratch to end the shared key/value
 borrow before reusing that value buffer for target lookups.
 
+`reference_sweep::Sweep` enumerates all final tables through a supplied ReadView
+and applies those direct checks, one next and at most two gets per advance. It
+checks exact identity, table/key order and a finite row budget, detaches source
+key bytes before reusing value scratch, and reports row/table progress separately
+from completion. Completion carries row counts and the same UTC sample; full
+physical graph/aggregate validity, parent chains, blobs and pins stay external.
+
 `store_fs::ChangeRoute` selects the source for a NeedFrame sequence using
 selected manifest metadata and captured ViewIdentity. It validates retained
 coverage through the checkpoint, then returns a history descriptor index or

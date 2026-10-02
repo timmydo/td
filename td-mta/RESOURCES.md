@@ -124,12 +124,21 @@ still account for those costs and concurrent owners within the ledger.
   the source key uses the caller's existing key storage while each get borrows
   the separate result buffer. A key borrowed from next's Record also retains
   the shared value-buffer lifetime: the driver first detaches it into existing
-  independent cursor/key scratch and decodes from that borrow before reuse.
+  independent cursor/key scratch or charged stack storage, then decodes from
+  that borrow before reuse.
   That scratch remains separately charged; ReferenceCheck allocates none.
   Total lookup count is at most two. No collection
   or arena is added. Allocation instrumentation checks all source table kinds,
   live/expired leases, historical-ID omission, zero-target completion and sticky
   missing-target refusal using a fixed view and stack scratch.
+  Reference Sweep stores one fixed 1 KiB prior key, 11 counters and scalar
+  progress; compiled state fits 2 KiB. Each advance uses a separate 1 KiB stack
+  key copy to release next's shared key/value lifetime before reference gets.
+  The inline state, temporary key and ReferenceCheck fit the owning worker's
+  existing stack allowance; whole-worker qualification remains pending. Caller
+  key/value output partitions are reused without a new arena. A finite row
+  limit bounds successful enumeration; each step admits one next plus at most
+  two gets. Allocation probes cover populated and empty all-table sweeps.
   Frame-change collection has its own 4096 slots of at most 24 bytes each,
   a separate 96 KiB reservation per view. Retained changes may coexist with
   get/next result storage; their memory never aliases those partitions. This

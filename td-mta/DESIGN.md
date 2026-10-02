@@ -80,7 +80,9 @@ completion. A sequential scan now coordinates cursor draining and checked
 source transitions with the same arena. Actual view-pin integration remains
 separate.
 Direct owning references now have a bounded supplied-row checker with at most
-two lookups; whole-graph enumeration and physical blob verification remain.
+two lookups. A supplied-view sweep now enumerates direct checks in bounded
+steps with fixed counts; physical graph completeness, blob verification and
+aggregate invariants remain.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

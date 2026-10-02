@@ -926,6 +926,14 @@ service activation. Each part lands independently:
     boundary, incomplete/terminal state and fixed lookup counts. Existing
     allocation instrumentation covers the helper. Whole-graph enumeration,
     physical blob verification, parent cycles and real pins remain separate.
+  - **M05d16 — direct-reference sweep:** implemented bounded enumeration over a
+    supplied ReadView, one next plus at most two direct-reference gets per step.
+    Check table/key progression, identity around next and finite row admission;
+    detach source keys before value reuse and retain fixed per-table counts.
+    Tests cover populated/empty scans, logical work bounds, exact/short/zero row
+    budgets, order/type/sequence faults, lookup failures and changed-view
+    precedence. Allocation probes reuse fixed fixtures. Full physical graph,
+    blob bytes, parent cycles, aggregate invariants and runtime pins remain.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete
