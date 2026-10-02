@@ -64,6 +64,7 @@ get distinct email/blob IDs. V1 does not deduplicate message contents.
       000042/mailbox-order.idx
       000042/search.idx
     tmp/                         unpublished bodies/checkpoints/sort scratch
+      NNNNNNNNNNNNNNNNNNNN.tmp  exclusively created private output
       requests/REQUEST/          disposable private JMAP response/creation map
   devices/                       private device verifiers, separate schema
   acme/                          private keys, orders and certificate generations
@@ -195,6 +196,54 @@ never removes or replaces that inode to retry.
 Tests exercise the std lock primitive in private temporary directories even
 when the harness identity/ancestry cannot satisfy production root admission.
 These fixtures do not waive any production root policy.
+
+### Private temporary output
+
+`LockedRoot::create_temporary` exclusively creates
+`accounts/ACCOUNT/tmp/NNNNNNNNNNNNNNNNNNNN.tmp`, with the positive canonical
+twenty-digit Number codec. The serialized writer selects an unused number;
+an existing name refuses without truncation or replacement. Startup recovery
+must account for and clean abandoned output before reusing names. Parent
+directories must already exist, belong to the root owner and have exact mode
+0700. The adapter checks the root and every component below it. Creation uses
+mode 0600 and restores owner bits after umask; the opened file must be empty,
+regular, singly linked and owned by that same identity.
+
+This primitive borrows LockedRoot for its whole lifetime. Its caller must
+first acquire logical file/byte charges and account authorization; an arbitrary
+numeric limit or AccountId is not an admission token. Limits above the signed
+64-bit file-offset bound refuse before creation. `CreateError::Uncreated`
+means refusal before any create call (including an observed existing name).
+`Attempted` means an exclusive open was issued and failed: std retries and
+post-create filesystem errors can leave an inode even on failure, including
+AlreadyExists. Keep the pending charge until reconciliation. `Created` means
+open succeeded but preparation failed, so the new inode needs orphan accounting.
+No outcome authorizes deleting an existing collision based on its error kind.
+
+Sequential writes reject a chunk exceeding the remaining byte allowance or
+64 KiB before I/O and keep the handle usable after that refusal. Short writes
+advance only confirmed bytes; Interrupted is retried within a maximum of 64
+write attempts per call. Exhaustion returns WouldBlock and retires output,
+including after positive partial progress. A zero write or other I/O failure
+permanently retires the writable handle; its reported length is only a confirmed
+lower bound on possible disk effects. Do not replay that chunk or release its
+logical charge. Dropping a handle closes descriptors and leaves its pathname
+for explicit cleanup/recovery.
+
+After a write error, `is_failed()` is authoritative for retirement. InvalidInput
+can mean either a pre-I/O refusal or a filesystem error; error kind alone cannot
+authorize retry. A retired handle rejects all later writes and sync.
+
+Consuming `sync` checks the length, syncs the file, then syncs its existing
+temporary parent. Success yields a read-only `SyncedTemporary` which retains
+the lock borrow and reads into caller slices within the completed extent and
+64 KiB per call. The worker must check its meter/deadline between calls; these
+count/byte bounds cannot interrupt a blocking filesystem syscall. The reader
+reports unexpected early EOF and never treats a beyond-end offset as success.
+A sync error closes the handle and leaves the output charged. The type does
+not promise durable newly created ancestors, hash/content validity, immutable
+publication, journal commit or service readiness. Parent creation, publication,
+quota integration and cleanup are later M05 work. No unlink runs in Drop.
 
 Any create/write/flush/sync/publication error must prevent a new acceptance
 acknowledgement. Keep already acknowledged state; never delete live mail to

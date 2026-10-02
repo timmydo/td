@@ -638,6 +638,14 @@ service activation. Each part lands independently:
       through CURRENT. Same-filesystem publication is required; propagate
       cross-device errors. Inject failure before/after every operation and
       distinguish proven no effect, partial private output and uncertain commit.
+      - **M05b2c1 — private temporary output:** implemented typed exclusive
+        creation below pre-existing private account directories, lifetime-bound
+        LOCK ownership, bounded sequential writes and consuming file/parent
+        sync. Errors retain partial-output accounting; Drop never unlinks.
+        Completed private output has bounded caller-buffer reads. Real-file
+        tests and injected short/write/sync errors cover these primitives.
+        Logical admission, allocation qualification of these new operations,
+        directory creation, publication and cleanup remain separate work.
     - **M05b2d — input files:** std type/link/owner/mode checks under SCHEMA.md,
       bounded reading through EOF and opened-file identity checks. Deployment
       uses the data-root owner as its trusted expected service identity.

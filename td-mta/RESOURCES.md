@@ -554,6 +554,15 @@ buffer and retains one additional File inside LockedRoot. No per-request
 lock-file open or descriptor cloning is permitted. Cooperative
 process locking does not alter the request pool or worker ledger.
 
+Each live TemporaryFile/SyncedTemporary retains two Files (output and its
+parent directory), one generated Name, counters and
+a borrow of the existing LockedRoot. Writes and reads use caller slices without
+buffer growth; path assembly uses the directory adapter's fixed byte ceiling.
+These operations do not acquire quota or runtime pool slots. Their host/musl
+allocation measurements and admission integration are required before hot-path
+activation. Pending/failed files retain their logical charges until explicit
+cleanup, including when syncing consumed and closed their handles.
+
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
 buffers and atomic text formatting. They neither allocate backing storage nor
 grow it. Arena regions are disjoint Rust borrows; reuse requires their lifetimes

@@ -109,6 +109,10 @@ fn generated_layout_matches_literal_paths() {
         ),
         (AccountEntry::Cache, "/cache"),
         (AccountEntry::Temporary, "/tmp"),
+        (
+            AccountEntry::TemporaryFile(number),
+            "/tmp/00000000000000000042.tmp",
+        ),
     ] {
         check(
             &Name::account(account, entry).unwrap(),

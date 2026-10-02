@@ -7,6 +7,9 @@ use std::{
     path::Path,
 };
 
+mod temporary;
+pub use temporary::{CreateError, SyncedTemporary, TemporaryFile, MAX_FILE_STEP_BYTES};
+
 /// Qualified by the host and portable allocation probes, including errors.
 /// This is a service limit, not a promise about every Rust implementation.
 pub const MAX_PATH_BYTES: usize = 383;

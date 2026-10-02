@@ -86,6 +86,7 @@ pub enum AccountEntry {
     Journal(Number),
     Cache,
     Temporary,
+    TemporaryFile(Number),
     Shard(BlobKind, u8),
     Blob(BlobKind, BlobId),
 }
@@ -139,6 +140,9 @@ impl Name {
                 return Self::encode(format_args!(
                     "accounts/{account}/metadata/journal/{number}.log"
                 ))
+            }
+            AccountEntry::TemporaryFile(number) => {
+                return Self::encode(format_args!("accounts/{account}/tmp/{number}.tmp"))
             }
             AccountEntry::Shard(kind, shard) => {
                 return Self::encode(format_args!(
