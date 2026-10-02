@@ -5203,7 +5203,15 @@ mod tests {
         let mut file = files.into_iter().next().unwrap();
         file.write_all(b"echo hi").unwrap();
         drop(file);
+        // A parallel test's shell, spawned but not yet exec'd, holds a copy
+        // of every descriptor for a few milliseconds, so EOF can come a
+        // turn late here as it can in the event loop.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         window.transfers(window.clock, true).unwrap();
+        while window.board.incoming.is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+            window.transfers(window.clock, true).unwrap();
+        }
         assert!(window.board.incoming.is_none());
         assert_eq!(window.input.take_for_test(), b"echo hi");
         // A copy changes only the clipboard, so it leaves it too.

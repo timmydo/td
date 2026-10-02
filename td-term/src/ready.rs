@@ -338,6 +338,8 @@ mod tests {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
+        // A failed run under a pid since reused leaves its directory here.
+        let _ = fs::remove_dir_all(&path);
         fs::create_dir(&path).unwrap();
         path
     }
@@ -448,6 +450,21 @@ mod tests {
         // A socket nobody answers is stale, and gets replaced.
         drop(first);
         UnixListener::bind(&path).unwrap();
+        // A parallel test's child, spawned but not yet exec'd, holds a copy
+        // of every descriptor, so the dropped listener can answer a moment
+        // longer; a socket nobody answers is what comes after. Each answered
+        // connect waits in the listener's backlog, so the pause grows to keep
+        // the connects under the oldest kernels' 128, past which they block.
+        let deadline = std::time::Instant::now() + TEST_PROBE_TIMEOUT;
+        let mut pause = Duration::from_millis(1);
+        while UnixStream::connect(&path).is_ok() && std::time::Instant::now() < deadline {
+            thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(100));
+        }
+        assert!(
+            UnixStream::connect(&path).is_err(),
+            "the dropped listener still answers"
+        );
         let _second = publish(&path, 12, 40).unwrap();
         let mut printed = Vec::new();
         probe_to(&path, TEST_PROBE_TIMEOUT, &mut printed).unwrap();

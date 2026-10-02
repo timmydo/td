@@ -666,14 +666,15 @@ mod tests {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let uid = current_uid(Path::new("/proc/self/status")).unwrap();
         let runtime = std::env::temp_dir().join(format!("td-term-runtime-{}", std::process::id()));
+        // A failed run under a pid since reused leaves its directory here.
+        let _ = std::fs::remove_dir_all(&runtime);
         let entry = td_ui::vt_terminfo::entry().unwrap();
         // A runtime directory that is missing, or open to others, is refused.
         assert!(install_runtime_terminfo(&runtime, uid, &entry).is_err());
         assert!(!runtime.exists(), "the runtime directory is not made");
-        std::fs::DirBuilder::new()
-            .mode(0o755)
-            .create(&runtime)
-            .unwrap();
+        std::fs::create_dir(&runtime).unwrap();
+        // Set after creation, which the umask cannot narrow.
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(install_runtime_terminfo(&runtime, uid, &entry).is_err());
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(install_runtime_terminfo(&runtime, uid + 1, &entry).is_err());
