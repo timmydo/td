@@ -9,8 +9,15 @@ license = "GPL-3.0-or-later"
 # checkout's manifest; an empty workspace pins this crate as its root.
 [workspace]
 
+# The native compositor cases' synthetic vault (src/backend/fixture.rs).
+# No recipe enables it, and nothing does by default.
+[features]
+test-vault = []
+
 [package.metadata.td-gate]
 clippy-all-targets = true
+native-compositor-tests = true
+native-compositor-fixture-feature = "test-vault"
 
 [lints.clippy]
 unwrap_used = "deny"

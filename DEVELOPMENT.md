@@ -428,7 +428,8 @@ Build the release binary in whichever checkout supplies the config.
 A crate with `native-compositor-tests = true` may additionally declare one
 ASCII `native-compositor-fixture-feature` name in its gate metadata. The
 native gate first tests the default binary, then uses a fresh separate
-target directory for that feature's library tests, ignored
+target directory for that feature's library tests (a crate without a
+library: its binary's unit tests), ignored
 `native_compositor::fixture::` process cases, and strict all-target Clippy.
 Both process legs require positive passing summaries. This is a test-build
 declaration, not a shipping feature or a broader affected-path mapping.

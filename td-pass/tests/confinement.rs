@@ -21,13 +21,14 @@ fn production(name: &str) -> String {
     text.split("#[cfg(test)]").next().unwrap().to_owned()
 }
 
-const FILES: [&str; 13] = [
+const FILES: &[&str] = &[
     "app/input.rs",
     "app/layout.rs",
     "app/mod.rs",
     "app/paint.rs",
     "app/tests.rs",
     "backend.rs",
+    "backend/fixture.rs",
     "files.rs",
     "frames.rs",
     "main.rs",
@@ -69,7 +70,7 @@ fn the_source_inventory_is_closed() {
     walk(&root().join("src"), "", &mut found);
     assert_eq!(
         found.iter().map(String::as_str).collect::<BTreeSet<_>>(),
-        FILES.into_iter().collect()
+        FILES.iter().copied().collect()
     );
     assert!(!root().join("build.rs").exists());
     assert!(source("main.rs").contains("#![forbid(unsafe_code)]"));
@@ -165,7 +166,7 @@ fn td_ui_modules(text: &str) -> Vec<String> {
 
 #[test]
 fn only_the_backend_holds_the_vault_and_only_the_window_the_compositor() {
-    for name in FILES {
+    for &name in FILES {
         let text = source(name);
         if !matches!(name, "backend.rs" | "main.rs") {
             assert!(!text.contains("td_secret"), "{name}");
@@ -194,8 +195,11 @@ fn only_the_backend_holds_the_vault_and_only_the_window_the_compositor() {
     // The frames go only to the directory found memory-backed.
     assert!(window.contains("td_ui::window::run(&mut session, stream, frames, typeface)"));
     assert!(!window.contains("temp_dir"));
-    for name in FILES {
-        if !matches!(name, "main.rs" | "window.rs" | "files.rs") {
+    for &name in FILES {
+        if !matches!(
+            name,
+            "main.rs" | "window.rs" | "files.rs" | "backend/fixture.rs"
+        ) {
             assert!(!source(name).contains("std::fs"), "{name}");
         }
     }
@@ -242,7 +246,7 @@ fn only_the_backend_holds_the_vault_and_only_the_window_the_compositor() {
     assert_eq!(window.matches("files::").count(), 2);
     assert!(window.contains("crate::files::start_folder"));
     assert!(window.contains("crate::files::list_folder(&folder, ceiling)"));
-    for name in FILES {
+    for &name in FILES {
         if !matches!(name, "backend.rs" | "window.rs" | "main.rs" | "files.rs") {
             assert!(!source(name).contains("files::"), "{name}");
         }
@@ -271,14 +275,14 @@ fn every_entry_document_is_held_to_the_vault_policy() {
     );
     assert!(fillable.contains("enabled: false"), "{fillable}");
     assert!(!app.contains("enabled: true"));
-    for name in FILES {
+    for &name in FILES {
         if name != "app/mod.rs" {
             assert!(!production(name).contains("Event::Load("), "{name}");
         }
     }
     // Copy and cut take the selection alone.
     assert!(input.contains("Snapshot::capture_selection("));
-    for name in FILES {
+    for &name in FILES {
         let text = production(name);
         assert!(!text.contains("Snapshot::capture("), "{name}");
         assert!(!text.contains("generation_for_test"), "{name}");
@@ -305,4 +309,63 @@ fn every_entry_document_is_held_to_the_vault_policy() {
     ] {
         assert!(body.contains(step), "lock skips {step}");
     }
+}
+
+/// The test vault is built only with `test-vault`, which nothing enables
+/// by default: its one mount and both of its uses are behind the feature,
+/// no other file names it, and it reaches td-secret only through the
+/// backend's import and the file system only in its case directory.
+#[test]
+fn the_test_vault_is_built_only_by_its_feature() {
+    let backend = source("backend.rs");
+    let gated = |item: &str| {
+        assert!(
+            backend.contains(&format!("#[cfg(feature = \"test-vault\")]\n{item}\n")),
+            "{item}"
+        );
+        assert!(!backend.contains(&format!("#[cfg(not(feature = \"test-vault\"))]\n{item}\n")));
+    };
+    gated("mod fixture;");
+    gated("use fixture::serve as vault;");
+    gated("use fixture::watch;");
+    assert_eq!(backend.matches("fixture").count(), 3);
+    assert!(backend.contains("#[cfg(not(feature = \"test-vault\"))]\nuse serve as vault;\n"));
+    assert!(backend.contains(".spawn(move || vault(&job_rx, &answer_rx, &reply_tx))"));
+    assert!(backend.contains("let _ = started.send(watch());"));
+    for &name in FILES {
+        if !matches!(name, "backend.rs" | "backend/fixture.rs" | "main.rs") {
+            assert!(!source(name).contains("fixture"), "{name}");
+            assert!(!source(name).contains("test-vault"), "{name}");
+        }
+    }
+    // The binary admits its mode from a synthetic identity in the test
+    // vault's build alone.
+    let main = source("main.rs");
+    assert!(!main.contains("fixture"));
+    assert_eq!(main.matches("test-vault").count(), 3);
+    assert_eq!(main.matches("feature = \"test-vault\"").count(), 2);
+    assert!(main
+        .contains("#[cfg(not(feature = \"test-vault\"))]\nfn os_release() -> Option<String> {\n"));
+    assert!(main.contains(
+        "#[cfg(feature = \"test-vault\")]\nfn os_release() -> Option<String> {\n    Some(\"ID=td-pass-test-vault\\n\".to_owned())\n}\n"
+    ));
+    let manifest = std::fs::read_to_string(root().join("Cargo.toml")).unwrap();
+    assert!(manifest.contains("\n[features]\ntest-vault = []\n\n"));
+    assert!(!manifest.contains("default ="));
+    let fixture = source("backend/fixture.rs");
+    assert!(!fixture.contains("td_secret"));
+    assert!(fixture.contains("use super::{closed, pass, refused, Job};"));
+    assert_eq!(fixture.matches("pass::").count(), 1);
+    assert_eq!(fixture.matches("std::fs::").count(), 2);
+    for alias in [
+        "std::fs as",
+        "pass as",
+        "super::serve",
+        ".exists()",
+        "std::fs;",
+    ] {
+        assert!(!fixture.contains(alias), "{alias}");
+    }
+    assert!(fixture.contains(".open(self.directory.join(\"journal\"))"));
+    assert!(fixture.contains("std::fs::remove_file(self.directory.join(name))"));
 }

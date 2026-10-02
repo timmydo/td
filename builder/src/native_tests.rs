@@ -66,7 +66,7 @@ fn test_command(
     manifest: &str,
     binary: &Path,
     trusted: bool,
-    fixture: Option<(&str, &Path, bool)>,
+    fixture: Option<(&str, &Path, Option<&str>)>,
 ) -> Result<Command> {
     let tool = binary
         .to_str()
@@ -90,11 +90,11 @@ fn test_command(
         cmd.args(["--config", "env.TD_TEST_TRUSTED_ROOT.value=\"1\""])
             .args(["--config", "env.TD_TEST_TRUSTED_ROOT.force=true"]);
     }
-    if let Some((feature, target, library)) = fixture {
+    if let Some((feature, target, unit)) = fixture {
         cmd.args(["--features", feature, "--target-dir"])
             .arg(target);
-        if library {
-            cmd.arg("--lib");
+        if let Some(unit) = unit {
+            cmd.arg(unit);
         } else {
             cmd.args(["--test", "control_process", "native_compositor::fixture::"])
                 .args(["--", "--ignored", "--test-threads=2"]);
@@ -195,6 +195,17 @@ fn run_cases(mut cmd: Command) -> Result<()> {
     Ok(())
 }
 
+/// The fixture build's own unit tests: the library's, or the binary's for
+/// a crate without one, which Cargo finds by its `src/lib.rs`.
+fn unit_target(root: &Path, manifest: &str) -> &'static str {
+    let crate_dir = Path::new(manifest).parent().unwrap_or(Path::new(""));
+    if root.join(crate_dir).join("src/lib.rs").is_file() {
+        "--lib"
+    } else {
+        "--bins"
+    }
+}
+
 pub(crate) fn run(
     root: &Path,
     manifest: &str,
@@ -236,14 +247,14 @@ pub(crate) fn run(
             manifest,
             &binary,
             trusted,
-            Some((feature, &target, true)),
+            Some((feature, &target, Some(unit_target(&root, manifest)))),
         )?)?;
         run_cases(test_command(
             &root,
             manifest,
             &binary,
             trusted,
-            Some((feature, &target, false)),
+            Some((feature, &target, None)),
         )?)?;
         let status = Command::new("cargo")
             .current_dir(&root)
@@ -275,13 +286,13 @@ mod tests {
 
     #[test]
     fn native_command_pins_the_tool_and_only_runs_ignored_native_cases() {
-        for library in [true, false] {
+        for unit in [Some("--lib"), Some("--bins"), None] {
             let fixture = test_command(
                 Path::new("/repo"),
                 "td-editor/Cargo.toml",
                 Path::new("/repo/tool"),
                 true,
-                Some(("test-file-barrier", Path::new("/repo/private"), library)),
+                Some(("test-file-barrier", Path::new("/repo/private"), unit)),
             )
             .unwrap();
             let args: Vec<_> = fixture
@@ -295,8 +306,12 @@ mod tests {
                     "--target-dir",
                     "/repo/private"
                 ]));
-            assert_eq!(args.contains(&"--lib"), library);
-            assert_eq!(args.contains(&"native_compositor::fixture::"), !library);
+            assert_eq!(args.contains(&"--lib"), unit == Some("--lib"));
+            assert_eq!(args.contains(&"--bins"), unit == Some("--bins"));
+            assert_eq!(
+                args.contains(&"native_compositor::fixture::"),
+                unit.is_none()
+            );
             assert!(args.contains(&"env.TD_TEST_TRUSTED_ROOT.force=true"));
             assert!(fixture
                 .get_envs()
@@ -355,6 +370,15 @@ mod tests {
             toml_string("a\"b\\c\nd\té"),
             "\"a\\\"b\\\\c\\u000ad\\u0009é\""
         );
+    }
+
+    /// td-editor's fixture runs its library's tests; td-pass, a binary
+    /// alone, runs its binary's.
+    #[test]
+    fn the_fixture_unit_leg_follows_the_crate_s_targets() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        assert_eq!(unit_target(root, "td-editor/Cargo.toml"), "--lib");
+        assert_eq!(unit_target(root, "td-pass/Cargo.toml"), "--bins");
     }
 
     #[test]

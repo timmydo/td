@@ -52,6 +52,7 @@ fn main() -> ExitCode {
 /// The system's identity: `/etc/os-release`, or `/usr/lib/os-release`
 /// only when the first does not exist, as os-release specifies; any other
 /// failure reads as unknown.
+#[cfg(not(feature = "test-vault"))]
 fn os_release() -> Option<String> {
     let mut paths = ["/etc/os-release", "/usr/lib/os-release"].into_iter();
     loop {
@@ -62,6 +63,14 @@ fn os_release() -> Option<String> {
             Err(_) => return None,
         }
     }
+}
+
+/// The test vault's build holds nothing secret and reaches no td service,
+/// so mode admission sees a system of its own and runs it standalone on
+/// any host, td included.
+#[cfg(feature = "test-vault")]
+fn os_release() -> Option<String> {
+    Some("ID=td-pass-test-vault\n".to_owned())
 }
 
 fn exit(result: Result<(), String>) -> ExitCode {

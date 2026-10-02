@@ -219,13 +219,45 @@ named only by the vault thread's file, for the vault and the host's
 events, and the worker dispatch, the two reads the window makes itself,
 that it lists folders only through `src/files.rs`, that pure files call
 no path method that reaches the file system, that copies are written and
-read only through `src/files.rs` in those ways, and the vault-document
-policy.
+read only through `src/files.rs` in those ways, the vault-document
+policy, and that the test vault below is built only by its feature.
 
-Not yet: the native compositor cases, the host lock and sleep evidence
-on the supported host, td mode, the foreign-host acceptance of the same
-executable, and increment 5's independent recovery, migration and
-hardware evidence.
+Native compositor cases run the binary under a real headless
+td-compositor and type through its seat
+(`tests/support/native_compositor.rs`). With the shipped backend, the
+window maps, takes the keyboard and closes on Ctrl+Q, whatever the host
+lets its vault do, and on td it refuses with td mode's reason. The rest
+run over a test vault, `src/backend/fixture.rs`, which the `test-vault`
+feature mounts in place of the vault thread's td-secret calls and host
+watch, and which no recipe enables: two synthetic entries under one
+primary key whose PIN is 1234, unlocking and saving asking its presence
+and then its PIN in td-secret's words, a journal of what it was asked,
+and one-shot controls that refuse a save, save the entry elsewhere first
+so the save is stale, or hold a save in flight after its PIN until the
+window cancels it. Its build gives mode admission a synthetic identity,
+so it runs on td too. Over it they observe unlocking through both
+prompts, entry selection, select all and copy offered as the window's
+selection, a paste held by the compositor and released back to the
+window, an edit undone, the save, authorized through both prompts,
+carrying exactly the text against the revision read, a refused and a
+stale save, the closing question's Save meeting the stale revision and
+Discard closing, and a lock while a save is held asking only to discard,
+cancelling the save and saving nothing. After a lock the window shows
+the locked view it started on, the compositor's one arm finds no client
+selection, and no frame file the window keeps, read through `/proc`,
+holds any frame it kept while at rest unlocked, sampled over a second
+and a half. These observe the integrated result, and the frame check is
+not the scrub's oracle: td-compositor releases each buffer before the
+next frame, so the window repaints its one buffer and the first locked
+frame overwrites it whether or not the scrub ran. The check fails only
+if a second frame file survives the lock holding an unlocked frame;
+td-ui's own tests remain the scrub's oracle.
+
+Not yet: a native case that a missing frame scrub would fail, which
+needs a compositor that holds the window's buffers across frames; the
+host lock and sleep evidence on the supported host, td mode, the
+foreign-host acceptance of the same executable, and increment 5's
+independent recovery, migration and hardware evidence.
 
 ## Delivery and proof
 

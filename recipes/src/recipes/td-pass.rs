@@ -69,6 +69,10 @@ mod tests {
         assert_eq!(r.cargo_lock.as_deref(), Some("td-pass/Cargo.lock"));
         assert_eq!(r.static_link, Some(true));
         assert_eq!(r.bins, Some(vec!["td-pass".into()]));
+        // The test vault (td-pass/src/backend/fixture.rs) is a feature no
+        // build of the shipped binary enables.
+        assert_eq!(r.features, None);
+        assert_eq!(r.no_default_features, None);
         assert!(crate::source_pins::by_key("td-pass-source").is_none());
     }
 

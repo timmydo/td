@@ -18,6 +18,9 @@ use crate::protocol::{
     Answer, Ask, Change, Command, Failure, HostEvent, Item, KeyLabel, Keys, Op, PinUse, Reply, Role,
 };
 
+#[cfg(feature = "test-vault")]
+mod fixture;
+
 // The window offers no copy larger than td-secret reads.
 const _: () = assert!(crate::protocol::MAX_COPY == pass::MAX_COPY);
 
@@ -42,7 +45,7 @@ pub fn start() -> Result<Client, String> {
     let (reply_tx, replies) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("vault".to_owned())
-        .spawn(move || serve(&job_rx, &answer_rx, &reply_tx))
+        .spawn(move || vault(&job_rx, &answer_rx, &reply_tx))
         .map_err(|error| format!("td-pass cannot start its vault thread: {error}"))?;
     Ok(Client {
         jobs,
@@ -115,7 +118,7 @@ pub fn watch_host() -> Host {
     let _ = std::thread::Builder::new()
         .name("host-watch".to_owned())
         .spawn(move || {
-            let _ = started.send(pass::HostEvents::watch());
+            let _ = started.send(watch());
         });
     Host {
         starting: Some(starting),
@@ -194,6 +197,21 @@ impl Drop for Client {
     }
 }
 
+#[cfg(feature = "test-vault")]
+use fixture::serve as vault;
+#[cfg(not(feature = "test-vault"))]
+use serve as vault;
+
+#[cfg(not(feature = "test-vault"))]
+fn watch() -> Result<pass::HostEvents, String> {
+    pass::HostEvents::watch()
+}
+#[cfg(feature = "test-vault")]
+use fixture::watch;
+
+// The test vault serves in its place; kept compiled, with all it uses,
+// so its build checks the same thread.
+#[cfg_attr(feature = "test-vault", allow(dead_code))]
 fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sender<Reply>) {
     let mut host: Option<pass::Host> = None;
     let mut vault: Option<pass::Vault> = None;

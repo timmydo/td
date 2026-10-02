@@ -1527,7 +1527,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     }
 
     // The notebook the same way: td-pass-test runs the static binary's
-    // entry.
+    // entry, and its window's cases run under the native harness.
     if p.starts_with("td-pass/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
@@ -5711,6 +5711,7 @@ mod tests {
                 "td-editor",
                 "td-jail",
                 "td-mail",
+                "td-pass",
                 "td-photo",
                 "td-portal",
                 "td-seatd",
@@ -8233,14 +8234,14 @@ mod tests {
                 "td-vm-guest"
             ]
         );
-        // td-photo's and td-mail's native cases make their commands three,
-        // as td-setup's are; td-dua, td-news, td-pass, td-review and td-term,
-        // toolkit consumers with no native case, add two each. The test-only
-        // P-256 oracle connects td-secret to td-crypto and then td-mta, adding
-        // two commands each; the installation fixture, reading td-install's
-        // codecs, adds two.
+        // td-photo's, td-mail's and td-pass's native cases make their
+        // commands three, as td-setup's are; td-dua, td-news, td-review and
+        // td-term, toolkit consumers with no native case, add two each. The
+        // test-only P-256 oracle connects td-secret to td-crypto and then
+        // td-mta, adding two commands each; the installation fixture,
+        // reading td-install's codecs, adds two.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 59, "{comp:?}");
+        assert_eq!(comp.len(), 60, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
