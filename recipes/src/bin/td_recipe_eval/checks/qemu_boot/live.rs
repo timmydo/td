@@ -26,11 +26,22 @@
 //! the account and the deployment's prefix reviewed (Enter again while the
 //! prompt stays and nothing is written, since the compositor drops an Enter
 //! stamped before its receipt); then Escape from the installed notice, by
-//! which the target must have been written. The run ends once td-setup says
-//! the installation completed, and the target must then hold the
+//! which the target must have been written. The live phase ends once
+//! td-setup says the installation completed, and the target must then hold the
 //! installer's whole GPT layout.
+//!
+//! With the medium detached, the installed disk then cold-boots through
+//! firmware twice, alone and then renamed behind a decoy disk, and each boot
+//! must bind the volume the image holds and the medium's deployment, activate
+//! the account and host the wizard was given, report a healthy deployment and
+//! flip the compositor's pages, with a fresh machine identity the second
+//! boot keeps. The configured time zone and the session's home are not yet
+//! observed (increment 7).
 use super::build_iso::{live_medium, LiveMedium};
-use super::install::{system_target_capacity, TargetDisk};
+use super::install::{
+    cold_boots, image_volume_identity, installation_timeout, system_target_capacity, ColdBoots,
+    Firmware, Installed, TargetDisk,
+};
 use super::setup_input::{disk_prompt_rows, typed, Act, SetupStep, STEP_TIMEOUT};
 use super::*;
 
@@ -49,6 +60,8 @@ const DEFAULT_ZONE: &str = "Etc/UTC";
 
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
+    // Found before the long live run, which the cold boots follow.
+    let (code, vars) = efi::firmware(&qemu)?;
     let (kernel, selector, deployment) = build_system(runner)?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let scratch = Scratch {
@@ -122,6 +135,32 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     }
     require_live_session(&result)?;
     require_partitioned(&scratch.dir.join(target_name), capacity)?;
+    // The medium is detached: the disk the wizard installed boots alone
+    // through firmware, as the account and host it was given.
+    let uuid = image_volume_identity(&scratch.dir.join(target_name))?;
+    cold_boots(
+        &qemu,
+        &Firmware {
+            code: &code,
+            vars: &vars,
+        },
+        &target,
+        &Installed {
+            uuid: &uuid,
+            id: &id,
+            username: USERNAME,
+            hostname: HOSTNAME,
+        },
+        &ColdBoots {
+            scratch: &scratch.dir,
+            name: "wizard",
+            timeout: installation_timeout(
+                env::var("TD_QEMU_BOOT_TIMEOUT_SECS").ok().as_deref(),
+                900,
+            ),
+            label: "qemu-boot-live",
+        },
+    )?;
     println!(
         "PASS: the live medium booted its signed deployment into the graphical \
          session; the installer wizard, focused with td-authd's setup intake \
@@ -131,7 +170,10 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          through the compositor's secure attention prompt showing exactly that \
          disk, its size and serial, host, account and deployment prefix, \
          td-setup said the installation completed, and the target holds the \
-         installer's GPT layout"
+         installer's GPT layout; with the medium detached, the installed disk \
+         cold-booted through firmware twice, alone and renamed behind a decoy, \
+         as a healthy {USERNAME}@{HOSTNAME} with its volume {uuid} bound, a \
+         fresh machine identity kept across both, and compositor page flips"
     );
     Ok(())
 }

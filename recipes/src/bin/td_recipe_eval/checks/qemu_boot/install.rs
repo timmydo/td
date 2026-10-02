@@ -1900,62 +1900,27 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
                 InventoryBefore::Fresh,
                 Some(&id),
             )?;
-            let mut first = None;
-            for count in 1..=2 {
-                let decoy = if count == 2 {
-                    let mut decoy = TargetDisk::create(&scratch.dir, &format!("{name}-decoy.img"))?;
-                    decoy.bus = bus;
-                    Some(decoy)
-                } else {
-                    None
-                };
-                let vars = scratch.dir.join(format!("{name}-boot-{count}-vars.fd"));
-                efi::copy_input(&vars_template, &vars)?;
-                let mut boot_plan = target_plan(&target, SYSTEM_BOOT_SUCCESS_MARKER);
-                boot_plan.mem = INSTALLED_SYSTEM_MEMORY_MIB;
-                // Stock audio supervision needs the emulated sound device.
-                boot_plan.audio = true;
-                println!(
-                    "   [qemu-install-system] cold system boot {count}, {name} media detached"
-                );
-                let result = boot_source(
-                    &qemu,
-                    BootSource::Firmware {
-                        code: &code,
-                        vars: &vars,
-                        attachment: if count == 2 {
-                            FirmwareAttachment::InstalledFixtureReordered
-                        } else {
-                            FirmwareAttachment::InstalledFixture
-                        },
-                        installation_target: decoy.as_ref(),
-                    },
-                    boot_plan,
-                    &scratch.dir,
+            let first = cold_boots(
+                &qemu,
+                &Firmware {
+                    code: &code,
+                    vars: &vars_template,
+                },
+                &target,
+                &Installed {
+                    uuid: &uuid,
+                    id: &id,
+                    username: protocol::USERNAME,
+                    hostname: protocol::HOSTNAME,
+                },
+                &ColdBoots {
+                    scratch: &scratch.dir,
+                    name: &name,
                     timeout,
-                )?;
-                println!(
-                    "   [qemu-install-system] {name} cold boot {count} elapsed: {:.2}s",
-                    result.elapsed.as_secs_f64()
-                );
-                let device = format!("/dev/{}", partition_name(bus.name(count == 2), 2));
-                validate_installed_system(&result, &uuid, &device, &id, count == 1)?;
-                if let Some(first) = &first {
-                    require_same_identity(
-                        first,
-                        &result,
-                        &format!("{name} first boot"),
-                        &format!("{name} second boot"),
-                    )?;
-                } else {
-                    require_new_installation(&installations, &result, &name)?;
-                    first = Some(result);
-                }
-                if let Some(decoy) = decoy {
-                    fs::remove_file(&decoy.path)
-                        .map_err(|error| format!("remove {}: {error}", decoy.path.display()))?;
-                }
-            }
+                    label: "qemu-install-system",
+                },
+            )?;
+            require_new_installation(&installations, &first, &name)?;
             if installations.is_empty() {
                 // Firmware cannot inject autotest tokens. Keep both stock firmware
                 // boots above and add one direct selector boot of that SAME disk.
@@ -1988,7 +1953,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
                 validate_installed_system(&result, &uuid, &device, &id, false)?;
                 require_installed_applications(&result)?;
                 require_same_identity(
-                    first.as_ref().ok_or("missing firmware boot identity")?,
+                    &first,
                     &result,
                     "firmware installed boot",
                     "application evidence boot",
@@ -1996,12 +1961,110 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             }
             fs::remove_file(&target.path)
                 .map_err(|error| format!("remove {}: {error}", target.path.display()))?;
-            let first = first.ok_or("installed system has no first-boot evidence")?;
             installations.push((name, first));
         }
     }
     println!("PASS: stock system installed offline through optical/USB ISO firmware onto virtio/AHCI disks; immutable root, compositor page flips, acknowledged deployment and stable machine identity across reordered cold boots; all four jailed applications start in an additional direct selector boot of the timezone-configured installed disk");
     Ok(())
+}
+
+/// The firmware an installed disk is cold-booted with: its code, and the
+/// variable template each boot copies afresh.
+pub(super) struct Firmware<'a> {
+    pub(super) code: &'a Path,
+    pub(super) vars: &'a Path,
+}
+
+/// Where and how long an installed disk's cold boots run, and the names
+/// they report under.
+#[derive(Clone, Copy)]
+pub(super) struct ColdBoots<'a> {
+    pub(super) scratch: &'a Path,
+    pub(super) name: &'a str,
+    pub(super) timeout: Duration,
+    pub(super) label: &'a str,
+}
+
+/// What an installed disk must boot as: its volume, deployment, account
+/// and host.
+#[derive(Clone, Copy)]
+pub(super) struct Installed<'a> {
+    pub(super) uuid: &'a str,
+    pub(super) id: &'a str,
+    pub(super) username: &'a str,
+    pub(super) hostname: &'a str,
+}
+
+/// Cold-boots the installed `target` through firmware twice, its media
+/// detached: alone, then behind a decoy disk that renames it. Each boot must
+/// be the healthy `installed` system, with a fresh machine identity first
+/// and the same one after. Returns the first boot.
+pub(super) fn cold_boots(
+    qemu: &str,
+    firmware: &Firmware<'_>,
+    target: &TargetDisk,
+    installed: &Installed<'_>,
+    run: &ColdBoots<'_>,
+) -> Result<BootResult, String> {
+    let ColdBoots {
+        scratch,
+        name,
+        timeout,
+        label,
+    } = *run;
+    let mut first: Option<BootResult> = None;
+    for count in 1..=2 {
+        let decoy = if count == 2 {
+            let mut decoy = TargetDisk::create(scratch, &format!("{name}-decoy.img"))?;
+            decoy.bus = target.bus;
+            Some(decoy)
+        } else {
+            None
+        };
+        let vars = scratch.join(format!("{name}-boot-{count}-vars.fd"));
+        efi::copy_input(firmware.vars, &vars)?;
+        let mut boot_plan = target_plan(target, SYSTEM_BOOT_SUCCESS_MARKER);
+        boot_plan.mem = INSTALLED_SYSTEM_MEMORY_MIB;
+        // Stock audio supervision needs the emulated sound device.
+        boot_plan.audio = true;
+        println!("   [{label}] cold system boot {count}, {name} media detached");
+        let result = boot_source(
+            qemu,
+            BootSource::Firmware {
+                code: firmware.code,
+                vars: &vars,
+                attachment: if count == 2 {
+                    FirmwareAttachment::InstalledFixtureReordered
+                } else {
+                    FirmwareAttachment::InstalledFixture
+                },
+                installation_target: decoy.as_ref(),
+            },
+            boot_plan,
+            scratch,
+            timeout,
+        )?;
+        println!(
+            "   [{label}] {name} cold boot {count} elapsed: {:.2}s",
+            result.elapsed.as_secs_f64()
+        );
+        let device = format!("/dev/{}", partition_name(target.bus.name(count == 2), 2));
+        validate_installed_as(&result, &device, installed, count == 1)?;
+        match &first {
+            Some(first) => require_same_identity(
+                first,
+                &result,
+                &format!("{name} first boot"),
+                &format!("{name} second boot"),
+            )?,
+            None => first = Some(result),
+        }
+        if let Some(decoy) = decoy {
+            fs::remove_file(&decoy.path)
+                .map_err(|error| format!("remove {}: {error}", decoy.path.display()))?;
+        }
+    }
+    first.ok_or_else(|| "installed system has no first-boot evidence".into())
 }
 
 fn require_installed_applications(result: &BootResult) -> Result<(), String> {
@@ -2060,6 +2123,33 @@ fn validate_installed_system(
     id: &str,
     fresh: bool,
 ) -> Result<(), String> {
+    validate_installed_as(
+        result,
+        device,
+        &Installed {
+            uuid,
+            id,
+            username: protocol::USERNAME,
+            hostname: protocol::HOSTNAME,
+        },
+        fresh,
+    )
+}
+
+/// The healthy `installed` system, its volume on `device`, with a fresh
+/// machine identity when `fresh` and a kept one otherwise.
+fn validate_installed_as(
+    result: &BootResult,
+    device: &str,
+    installed: &Installed<'_>,
+    fresh: bool,
+) -> Result<(), String> {
+    let Installed {
+        uuid,
+        id,
+        username,
+        hostname,
+    } = *installed;
     require(
         result,
         SYSTEM_BOOT_SUCCESS_MARKER,
@@ -2084,8 +2174,8 @@ fn validate_installed_system(
             tail(&result.console, 100)
         ));
     }
-    require_primary_profile(result, protocol::USERNAME)?;
-    let expected_hostname = format!("TD-HOSTNAME-READY {}", protocol::HOSTNAME);
+    require_primary_profile(result, username)?;
+    let expected_hostname = format!("TD-HOSTNAME-READY {hostname}");
     let hostnames: Vec<_> = result
         .console
         .lines()
@@ -2127,7 +2217,38 @@ fn validate_installed_system(
     {
         return Err(format!("installed system identity: expected fresh={fresh}, new={}, stable={}, host key present={}\n{}", result.evidence.firstboot_new, result.evidence.firstboot_stable, result.evidence.host_key.is_some(), tail(&result.console, 100)));
     }
+    require_identity_files(result, fresh)?;
     validate_compositor_boot(result)
+}
+
+/// td-firstboot's word on the machine-id and the host key themselves: a
+/// fresh machine created both, and a kept one found both, the host key
+/// the one it reported. Its new-machine marker alone would also follow a
+/// created authorized_keys beside a copied host key.
+fn require_identity_files(result: &BootResult, fresh: bool) -> Result<(), String> {
+    let outcome = if fresh { "created" } else { "present" };
+    let fingerprint = result
+        .evidence
+        .host_key
+        .as_deref()
+        .ok_or("installed system reported no host key")?;
+    for expected in [
+        format!("td-firstboot: machine-id {outcome}"),
+        format!("td-firstboot: host key {outcome} {fingerprint}"),
+    ] {
+        let found = result
+            .console
+            .lines()
+            .filter(|line| line.trim_end() == expected)
+            .count();
+        if found != 1 {
+            return Err(format!(
+                "installed system reported {expected:?} {found} times, not once\n{}",
+                tail(&result.console, 100)
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Read one exact post-format identity report before trusting it as an oracle input.
@@ -2155,6 +2276,15 @@ fn reported_volume_identity(console: &str, device: &str) -> Result<String, Strin
 /// Independently spot-check the fsid in the private image's primary superblock.
 /// Detached td-boot boots perform the complete filesystem/profile admission.
 fn require_image_volume_identity(path: &Path, uuid: &str) -> Result<(), String> {
+    if image_volume_identity(path)? != uuid {
+        return Err("installed image UUID differs from guest report".into());
+    }
+    Ok(())
+}
+
+/// The volume UUID in the primary Btrfs superblock of an installed image's
+/// second partition, as the selector reports it.
+pub(super) fn image_volume_identity(path: &Path) -> Result<String, String> {
     use std::os::unix::fs::FileExt;
     let offset = td_boot_protocol::PARTITION_ALIGN_BYTES
         .checked_add(td_boot_protocol::ESP_BYTES)
@@ -2169,10 +2299,17 @@ fn require_image_volume_identity(path: &Path, uuid: &str) -> Result<(), String> 
     }
     let bytes = header.get(32..48).ok_or("short volume identity field")?;
     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    if hex != uuid.replace('-', "") {
-        return Err("installed image UUID differs from guest report".into());
+    let uuid = [0..8, 8..12, 12..16, 16..20, 20..32]
+        .into_iter()
+        .map(|range| hex.get(range).ok_or("short volume identity"))
+        .collect::<Result<Vec<_>, _>>()?
+        .join("-");
+    if !protocol::is_v4_volume_uuid(&uuid) {
+        return Err(format!(
+            "installed image has volume identity {uuid}, not a v4 UUID"
+        ));
     }
-    Ok(())
+    Ok(uuid)
 }
 
 fn record_volume_identity(
@@ -2232,7 +2369,7 @@ fn require_installation(
     Ok(())
 }
 
-fn installation_timeout(value: Option<&str>, default_secs: u64) -> Duration {
+pub(super) fn installation_timeout(value: Option<&str>, default_secs: u64) -> Duration {
     value
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
@@ -2415,7 +2552,7 @@ mod tests {
         BootResult {
             evidence, exited_clean: false, marker_killed: true,
             reason: "fixture".into(),
-            console: format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-BOOT-SELECTED-CURRENT deployment\nTD-HOSTNAME-READY {}\nTD-PRIMARY-PROFILE-READY {}\n{SYSTEM_BOOT_SUCCESS_MARKER}\n", protocol::HOSTNAME, protocol::USERNAME),
+            console: format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-BOOT-SELECTED-CURRENT deployment\ntd-firstboot: machine-id created\ntd-firstboot: host key created ssh-ed25519 AAAA\nTD-HOSTNAME-READY {}\nTD-PRIMARY-PROFILE-READY {}\n{SYSTEM_BOOT_SUCCESS_MARKER}\n", protocol::HOSTNAME, protocol::USERNAME),
             elapsed: Duration::ZERO, firefox_audio: FirefoxAudioCapture::NotRequested,
         }
     }
@@ -2466,13 +2603,57 @@ mod tests {
         }
     }
 
+    /// An installed system is held to the account and host it was given,
+    /// not the fixture's.
+    #[test]
+    fn installed_system_is_validated_as_its_given_account_and_host() {
+        let installed = Installed {
+            uuid: "uuid",
+            id: "deployment",
+            username: "dana",
+            hostname: "td-wizard",
+        };
+        let mut result = healthy_system();
+        assert!(validate_installed_as(&result, "/dev/vda2", &installed, true).is_err());
+        for (fixture, given) in [
+            (
+                format!("TD-HOSTNAME-READY {}\n", protocol::HOSTNAME),
+                "TD-HOSTNAME-READY td-wizard\n",
+            ),
+            (
+                format!("TD-PRIMARY-PROFILE-READY {}\n", protocol::USERNAME),
+                "TD-PRIMARY-PROFILE-READY dana\n",
+            ),
+        ] {
+            assert_eq!(result.console.matches(&fixture).count(), 1);
+            result.console = result.console.replace(&fixture, given);
+        }
+        assert!(validate_installed_as(&result, "/dev/vda2", &installed, true).is_ok());
+        assert!(
+            validate_installed_system(&result, "uuid", "/dev/vda2", "deployment", true).is_err()
+        );
+        for other in [
+            Installed {
+                username: "dano",
+                ..installed
+            },
+            Installed {
+                hostname: "td-wizarb",
+                ..installed
+            },
+        ] {
+            assert!(validate_installed_as(&result, "/dev/vda2", &other, true).is_err());
+        }
+    }
+
     #[test]
     fn volume_identity_is_read_from_the_private_image_and_cannot_repeat() {
         use std::os::unix::fs::FileExt;
         let dir = create_scratch_dir(&env::temp_dir(), &AtomicU64::new(0)).unwrap();
         let _guard = Scratch { dir: dir.clone() };
         let target = TargetDisk::create(&dir, "identity.img").unwrap();
-        let uuid = "12345678-1234-4234-8234-123456789abc";
+        // A byte under 0x10 keeps its leading zero.
+        let uuid = "02345678-1234-4234-8234-123456789abc";
         let mut result = interrupted_result();
         result.reason = "fixture timed out before formatting".into();
         result.console = "early source refusal\n".into();
@@ -2487,7 +2668,7 @@ mod tests {
         assert!(seen.is_empty());
         let mut header = [0u8; 80];
         header[32..48].copy_from_slice(&[
-            0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x42, 0x34, 0x82, 0x34, 0x12, 0x34, 0x56, 0x78,
+            0x02, 0x34, 0x56, 0x78, 0x12, 0x34, 0x42, 0x34, 0x82, 0x34, 0x12, 0x34, 0x56, 0x78,
             0x9a, 0xbc,
         ]);
         header[64..72].copy_from_slice(b"_BHRfS_M");
@@ -2502,6 +2683,19 @@ mod tests {
             uuid
         );
         assert!(record_volume_identity(&result, &target, &mut seen).is_err());
+        // Read from the image alone, it is the canonical form, and only a v4
+        // UUID is one.
+        assert_eq!(image_volume_identity(&target.path).unwrap(), uuid);
+        header[38] = 0x12;
+        file.write_all_at(&header, offset).unwrap();
+        assert!(image_volume_identity(&target.path).is_err());
+        header[38] = 0x42;
+        header[40] = 0x02;
+        file.write_all_at(&header, offset).unwrap();
+        assert!(image_volume_identity(&target.path).is_err());
+        header[40] = 0x82;
+        file.write_all_at(&header, offset).unwrap();
+        assert_eq!(image_volume_identity(&target.path).unwrap(), uuid);
         seen.clear();
         header[32] ^= 1;
         file.write_all_at(&header, offset).unwrap();
@@ -2964,9 +3158,34 @@ mod tests {
         );
         second.evidence.firstboot_new = false;
         second.evidence.firstboot_stable = true;
+        // The markers alone are not enough: the files must have been found.
+        assert!(
+            validate_installed_system(&second, "uuid", "/dev/vda2", "deployment", false).is_err()
+        );
+        second.console = second.console.replace(" created", " present");
         assert!(
             validate_installed_system(&second, "uuid", "/dev/vda2", "deployment", false).is_ok()
         );
+        // A fresh machine must have created both the machine-id and the host
+        // key, the one it reported, each said once.
+        let fresh = |console: &str| {
+            let mut result = healthy_system();
+            result.console = console.into();
+            validate_installed_system(&result, "uuid", "/dev/vda2", "deployment", true)
+        };
+        let created = healthy_system().console;
+        assert!(fresh(&created).is_ok());
+        for broken in [
+            created.replace("machine-id created", "machine-id present"),
+            created.replace("host key created", "host key present"),
+            created.replace("created ssh-ed25519 AAAA", "created ssh-ed25519 CCCC"),
+            created.replace(
+                "td-firstboot: machine-id created\n",
+                "td-firstboot: machine-id created\ntd-firstboot: machine-id created\n",
+            ),
+        ] {
+            assert!(fresh(&broken).is_err(), "{broken}");
+        }
         assert!(require_same_identity(&first, &second, "first", "second").is_ok());
         assert!(require_distinct_identity(&first, &second, "optical", "USB").is_err());
         second.evidence.host_key = Some("ssh-ed25519 BBBB".into());

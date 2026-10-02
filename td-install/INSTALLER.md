@@ -144,19 +144,26 @@ drops an Enter stamped before its prompt's receipt; then Escape once the
 menu's notice says the system is installed. QEMU's own count of changes to
 the target, writes, discards and zone appends alike, must be zero when the
 review is released, when consent is asked and at every Enter on the prompt,
-and must not be by the installed notice. The run ends once td-setup says
-the installation completed, and the target must then hold the installer's
-GPT layout, primary and backup whole. A lost or garbled evidence line fails
-the run as soon as a later line shows the gap, and a state that does not
-follow its act within five minutes, or an installed notice that does not
-follow consent within half an hour, fails it then; so does td-setup saying
-the installation failed. Under that token the session keeps the drive's
-keyboard: the autotest Claude terminal evidence, whose window would map on
-the wizard's workspace and take the keys, does not run, and the greeter
-parks rather than reboot the live boot when its health transaction settles.
-Booting the installed disk, and that medium, through firmware are still to
-be proven (increment 7); `./test-iso` boots the medium through firmware by
-hand.
+and must not be by the installed notice. The live phase ends once td-setup
+says the installation completed, and the target must then hold the
+installer's GPT layout, primary and backup whole. A lost or garbled
+evidence line fails the run as soon as a later line shows the gap, and a
+state that does not follow its act within five minutes, or an installed
+notice that does not follow consent within half an hour, fails it then; so
+does td-setup saying the installation failed. Under that token the session
+keeps the drive's keyboard: the autotest Claude terminal evidence, whose
+window would map on the wizard's workspace and take the keys, does not run,
+and the greeter parks rather than reboot the live boot when its health
+transaction settles. With the medium detached, the installed disk then
+cold-boots through firmware twice, alone and then renamed behind a decoy
+disk: each boot must bind the volume UUID read from the image's own
+superblock and the medium's deployment, activate the wizard's account and
+host (the primary profile and hostname reports), acknowledge a healthy
+deployment and flip the compositor's pages, with a machine-id and host key
+the first boot created and the second found. Observing the configured time
+zone and the session's persistent home in the compositor, and booting the
+medium itself through firmware, are still to be proven (increment 7);
+`./test-iso` boots the medium through firmware by hand.
 
 Starting the wizard grants it nothing a session program lacked: td-authd
 admits any UID-1000 peer at the intake, and on a live boot those include
@@ -1139,11 +1146,15 @@ not discover `/etc/zoneinfo` automatically.
    progress; fixtures cannot grant ordinary clients trusted consent. A live
    boot starts the wizard ("Live startup"), and `qemu-boot-live` drives it
    with physical keys through the service's review and the compositor's
-   consent to an installed disposable disk.
+   consent to an installed disposable disk, which then cold-boots through
+   firmware as the configured account and host.
 7. Activate the complete profile only after the end-to-end QEMU evidence:
    boot the ISO, complete the UI flow onto a disposable disk, detach the
    media, boot that disk through firmware, and observe the configured
    account in the compositor with its settings and persistent home.
+   Increment 6 proves the flow and the firmware boots with the account
+   and host reported; this adds booting the ISO through firmware and the
+   compositor-observed settings and home.
 
 Use per-run disposable disks and firmware variables. No test discovers or
 opens an operator's real disk for writing. Exercise both supported media
